@@ -5,10 +5,10 @@ use clap::{CommandFactory, Parser};
 #[derive(Parser)]
 #[command(about = "Command-line interface for clipboard operations. copy/paste text or images.")]
 struct Cli {
-    #[arg(short, long, help = "paste from clipboard")]
+    #[arg(short, long, num_args = 0..=1, default_missing_value = "", value_name = "FILE", help = "paste from clipboard to file (default: 'output')")]
     paste: Option<String>,
 
-    #[arg(short, long, help = "copy to clipboard")]
+    #[arg(short, long, num_args = 0..=1, default_missing_value = "", value_name = "FILE", help = "copy from file to clipboard (default: 'output')")]
     copy: Option<String>,
 }
 
