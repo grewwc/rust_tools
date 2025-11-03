@@ -1,0 +1,9 @@
+[package]
+name = "rust_tools"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arboard = "3.3"
+image = {version = "0.25.8", feature=["jpg", "png", "jif"]}
+clap = { version = "*", features = ["derive"] }
