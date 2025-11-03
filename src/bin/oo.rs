@@ -1,20 +1,15 @@
-use std::env;
-
 use rust_tools::{clipboard, strw::find::find_first_non_blank};
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(about = "Command-line interface for clipboard operations. copy/paste text or images.")]
 struct Cli {
-    /// Output file path (optional)
-    file: Option<String>,
+    #[arg(short, long, help = "paste from clipboard")]
+    paste: Option<String>,
 
-    #[arg(short, long, default_value = "", help = "paste from clipboard")]
-    paste: String,
-
-    #[arg(short, long, default_value = "", help = "copy to clipboard")]
-    copy: String,
+    #[arg(short, long, help = "copy to clipboard")]
+    copy: Option<String>,
 }
 
 fn handle_paste_to_file(fname: &str) -> bool {
@@ -38,24 +33,33 @@ fn handle_copy_from_file(fname: &str) -> bool {
     false
 }
 
+const DEFAULT_FILE_NAME: &'static str = "output";
+
 fn main() {
     let cli = Cli::parse();
-    let file = cli.file.unwrap_or("output".to_string());
-    let fname: Option<&str> = find_first_non_blank(&[cli.copy.as_str(), cli.paste.as_str()]);
 
+    let copy_str = cli.copy.as_deref().unwrap_or("");
+    let paste_str = cli.paste.as_deref().unwrap_or("");
+
+    let fname: Option<&str> = find_first_non_blank(&[copy_str, paste_str]);
     let fname = match fname {
-        None => file.as_str(),
+        None => DEFAULT_FILE_NAME,
         Some(val) => val,
     };
+
     let mut result = false;
-    if cli.copy != "" {
+    if cli.copy.is_some() {
         result = result || handle_copy_from_file(&fname);
-    } else {
+    } else if cli.paste.is_some() {
         // paste
         result = result || handle_paste_to_file(&fname);
+    } else {
+        Cli::command().print_help().unwrap();
+        return;
     }
 
     if !result {
         eprintln!("oo failed");
     }
 }
+
