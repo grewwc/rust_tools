@@ -1,11 +1,13 @@
-use std::{collections::HashMap, hash::Hash};
+use std::hash::Hash;
+
+use crate::common::types::FastMap;
 
 pub struct UF<'a, T>
 where
     T: Eq + Hash,
 {
-    id: HashMap<&'a T, &'a T>,
-    size: HashMap<&'a T, usize>,
+    id: FastMap<&'a T, &'a T>,
+    size: FastMap<&'a T, usize>,
 
     n_groups: usize,
 }
@@ -16,8 +18,8 @@ where
 {
     pub fn new() -> Self {
         Self {
-            id: HashMap::new(),
-            size: HashMap::new(),
+            id: FastMap::default(),
+            size: FastMap::default(),
             n_groups: 0,
         }
     }
@@ -108,4 +110,5 @@ mod tests {
         assert_eq!(1, uf.n_groups());
     }
 }
+
 

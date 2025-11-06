@@ -1,4 +1,7 @@
-use std::{collections::HashMap, ptr::null_mut};
+use std::ptr::null_mut;
+
+use crate::common::types::FastMap;
+
 
 /// A Trie (prefix tree) data structure for efficient string storage and retrieval.
 ///
@@ -21,7 +24,7 @@ use std::{collections::HashMap, ptr::null_mut};
 /// ```
 pub struct Trie {
     /// Maps each character to its corresponding child Trie node
-    children: HashMap<char, Box<Trie>>,
+    children: FastMap<char, Box<Trie>>,
 
     /// Number of times this node marks the end of a complete word
     end_count: usize,
@@ -46,7 +49,7 @@ impl Trie {
     /// ```
     pub fn new() -> Self {
         Self {
-            children: HashMap::new(),
+            children: FastMap::default(),
             end_count: 0,
             size: 0,
             valid_count: 0,
@@ -335,4 +338,5 @@ mod tests {
         // assert!(t.contains("hell"));
     }
 }
+
 
