@@ -1,34 +1,48 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, hash::BuildHasherDefault};
+
+use rustc_hash::FxHasher;
+
+use crate::common::types::FastSet;
 
 const COMMON_WHITESPACES: &str = " \t\n\r\x0B\x0C";
 
 /// Function that returns an iterator similar to std::str::Split
-pub fn split_keep_symbol<'a>(s: &'a str, split_chars: &'a str, symbols: &'a str) -> QuoteSplit<'a> {
-    QuoteSplit::new(s, split_chars, symbols)
+pub fn split_keep_symbol<'a>(
+    s: &'a str,
+    split_chars: &'a str,
+    symbol_set: &'a str,
+) -> QuoteSplit<'a> {
+    QuoteSplit::new(s, split_chars, symbol_set)
 }
 
-pub fn split_space_keep_symbol<'a>(s: &'a str, symbols: &'a str) -> QuoteSplit<'a> {
-    split_keep_symbol(s, COMMON_WHITESPACES, symbols)
+pub fn split_space_keep_symbol<'a>(s: &'a str, symbol_set: &'a str) -> QuoteSplit<'a> {
+    split_keep_symbol(s, COMMON_WHITESPACES, symbol_set)
 }
 
 /// Alternative implementation using a custom iterator that behaves more like Split
 pub struct QuoteSplit<'a> {
     text: &'a str,
     position: usize,
-    symbols: std::collections::HashSet<char>,
-    split_chars: std::collections::HashSet<char>,
+    symbols: FastSet<char>,
+    split_chars: FastSet<char>,
 }
 
 impl<'a> QuoteSplit<'a> {
     pub fn new(text: &'a str, split_chars: &'a str, symbols: &'a str) -> Self {
-        let mut symbol_set = HashSet::new();
-        symbol_set.reserve(symbols.len());
+        let mut symbol_set: HashSet<char, BuildHasherDefault<FxHasher>> =
+            HashSet::with_capacity_and_hasher(
+                symbols.len(),
+                BuildHasherDefault::<FxHasher>::default(),
+            );
+
         symbols.chars().for_each(|ch| {
             symbol_set.insert(ch);
         });
 
-        let mut split_chars_set = HashSet::new();
-        split_chars_set.reserve(split_chars.len());
+        let mut split_chars_set = HashSet::with_capacity_and_hasher(
+            split_chars.len(),
+            BuildHasherDefault::<FxHasher>::default(),
+        );
         split_chars.chars().for_each(|ch| {
             split_chars_set.insert(ch);
         });

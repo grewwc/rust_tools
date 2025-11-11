@@ -5,7 +5,6 @@ use regex::Regex;
 use rust_tools::{cmd::run::run_cmd, strw::split::split_space_keep_symbol};
 
 use colored::*;
-use once_cell::sync::Lazy;
 
 use _his::current_branch;
 const LOG_HISTORY_CMD: &'static str =
@@ -13,10 +12,10 @@ const LOG_HISTORY_CMD: &'static str =
 const BRANCH_CMD: &'static str = r#"git for-each-ref --sort=-committerdate --format="%(refname:short) %(committerdate:short) %(subject)" refs/heads/ "#;
 const DEFAULT_N: usize = 5;
 
-const MERGE_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r#"\w+\s.*\s\d{4}-\d{2}-\d{2}\sMerge.*"#).unwrap());
+const MERGE_PATTERN: LazyCell<Regex> =
+    LazyCell::new(|| Regex::new(r#"\w+\s.*\s\d{4}-\d{2}-\d{2}\sMerge.*"#).unwrap());
 
-const PURE_DIGITAL_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r#"^\-?(\d+)$"#).unwrap());
+const PURE_DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"^\-?(\d+)$"#).unwrap());
 
 const DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"-(\d+)"#).unwrap());
 
@@ -281,4 +280,5 @@ mod tests {
         println!("==> branch: {}", branch);
     }
 }
+
 
