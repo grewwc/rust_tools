@@ -1,4 +1,4 @@
-use std::usize;
+use std::{cell::LazyCell, usize};
 
 use clap::{ArgAction, Parser};
 use regex::Regex;
@@ -13,10 +13,12 @@ const LOG_HISTORY_CMD: &'static str =
 const BRANCH_CMD: &'static str = r#"git for-each-ref --sort=-committerdate --format="%(refname:short) %(committerdate:short) %(subject)" refs/heads/ "#;
 const DEFAULT_N: usize = 5;
 
-static MERGE_PATTERN: Lazy<Regex> =
+const MERGE_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"\w+\s.*\s\d{4}-\d{2}-\d{2}\sMerge.*"#).unwrap());
 
-static DIGIT_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r#"^\-?(\d+)$"#).unwrap());
+const PURE_DIGITAL_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r#"^\-?(\d+)$"#).unwrap());
+
+const DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"-(\d+)"#).unwrap());
 
 mod _his;
 
@@ -24,9 +26,6 @@ mod _his;
 struct UserInput {
     #[arg(help = "if get all histories", short, long, action = ArgAction::SetTrue)]
     all: bool,
-
-    #[arg(help = "number of histories to show", value_parser = clap::value_parser!(String))]
-    arg: Option<String>,
 
     #[arg(
         help = "branch name (default=current branch)",
@@ -40,8 +39,15 @@ struct UserInput {
     #[arg(help="verbose print", short, long, action=ArgAction::SetTrue)]
     v: bool,
 
+    #[arg(
+        help = "number of histories to show or other arguments",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    args: Vec<String>,
+
     #[arg(skip)]
-    n: i32
+    n: i32,
 }
 
 impl UserInput {
@@ -49,39 +55,41 @@ impl UserInput {
         self.v
     }
 
-    fn modify_by_first_arg(&mut self) {
-        if let Some(ref n) = self.arg {
-            let num = n.parse::<i32>();
-            if !num.is_ok() {
-                self.branch = self.arg.clone();
-                return;
+    fn modify_by_positional_args(&mut self) {
+        if self.args.is_empty() && self.branch.is_none() {
+            return;
+        }
+        let mut args = self.args.join(" ");
+        if let Some(cap) = DIGITAL_PATTERN.captures(args.as_str())
+            && let Some(m) = cap.get(1)
+            && let Ok(n) = m.as_str().parse::<usize>()
+        {
+            self.n = n as i32;
+            if self.branch.is_none() {
+                args.replace_range(cap.get(0).unwrap().range(), "");
+                let args = args.trim();
+                if !args.is_empty() {
+                    self.branch = Some(args.to_string());
+                }
             }
-            let mut n = num.unwrap();
+        }
+        if let Some(ref branch) = self.branch
+            && PURE_DIGITAL_PATTERN.is_match(branch)
+        {
+            let mut n = branch.parse::<i32>().unwrap();
             if n < 0 {
                 n *= -1;
             }
             self.n = n;
+            self.branch = Some("".to_string());
         }
     }
 
-    fn get_branch(&self) -> (Option<&str>, usize) {
-        let branch = self.branch.as_deref();
-        if branch.is_none() {
-            return (None, 0);
+    fn get_branch(&self) -> String {
+        if self.branch.is_none() {
+            return current_branch();
         }
-        let branch = branch.unwrap();
-        if let Some(cap) = DIGIT_PATTERN.captures(branch)
-            && cap.len() >= 2
-        {
-            if let Some(cap) = cap.get(1) {
-                let str = cap.as_str();
-                if let Ok(num) = str.parse::<usize>() {
-                    return (None, num as usize);
-                }
-            }
-            return (None, 0);
-        }
-        (Some(branch), 0)
+        self.branch.as_deref().unwrap_or("").to_string()
     }
 
     fn is_print_all(&self) -> bool {
@@ -92,19 +100,10 @@ impl UserInput {
         if self.is_print_all() {
             return usize::MAX;
         }
-        if let Some(ref n) = self.arg {
-            let num = n.parse::<i32>();
-            if !num.is_ok() {
-                return DEFAULT_N;
-            }
-            let mut n = num.unwrap();
-            if n < 0 {
-                n *= -1;
-            }
-            n as usize
-        } else {
-            DEFAULT_N
+        if self.n <= 0 {
+            return DEFAULT_N;
         }
+        self.n as usize
     }
 
     fn is_print_branch(&self) -> bool {
@@ -170,7 +169,7 @@ impl LogHistory {
     }
 }
 
-impl GitPrint for LogHistory{
+impl GitPrint for LogHistory {
     fn print(&self, content: &str) -> bool {
         let content = content.trim_matches('"');
         let is_merge_commit = MERGE_PATTERN.is_match(content);
@@ -187,7 +186,7 @@ impl GitPrint for LogHistory{
 
     fn before_print(&self) {
         let branch: &str = self.branch.as_ref();
-        if branch.is_empty(){
+        if branch.is_empty() {
             let b = current_branch();
             println!("{}", b.trim().green());
             return;
@@ -205,12 +204,9 @@ struct Handler {
 impl Handler {
     fn new(user_input: &UserInput) -> Self {
         // take mutable borrow only to parse and possibly mutate input, then drop it
-        let mut n_print = user_input.get_print_history();
-        let (branch, n_print_by_branch_arg) = user_input.get_branch();
-        if n_print_by_branch_arg != 0 {
-            n_print = n_print_by_branch_arg;
-        }
-        let branch = branch.unwrap_or("");
+        let n_print = user_input.get_print_history();
+        let branch = user_input.get_branch();
+        // println!("|{}|", branch);
 
         let mut cmd = LOG_HISTORY_CMD;
         if user_input.is_print_branch() && branch.is_empty() {
@@ -224,7 +220,7 @@ impl Handler {
             }
         } else {
             let handler = Box::new(LogHistory::new(user_input.is_verbose(), branch.to_string()));
-            let cmd = cmd.replace("$branch$", branch);
+            let cmd = cmd.replace("$branch$", &branch);
             Handler {
                 handler,
                 cmd: Box::new(cmd),
@@ -258,7 +254,7 @@ impl Handler {
 
 fn main() {
     let mut input = UserInput::parse();
-    input.modify_by_first_arg();
+    input.modify_by_positional_args();
     let handler = Handler::new(&input);
     handler.handle();
 }
@@ -274,14 +270,14 @@ mod tests {
 
     #[test]
     fn test_match() {
-        let result = DIGIT_PATTERN.captures("-23");
+        let result = PURE_DIGITAL_PATTERN.captures("-23");
 
         println!("{}", result.unwrap().get(1).unwrap().as_str());
     }
 
     #[test]
     fn test_get_current_branch() {
-        let branch = run_cmd("git branch | grep '*'").unwrap();
+        let branch = current_branch();
         println!("==> branch: {}", branch);
     }
 }
