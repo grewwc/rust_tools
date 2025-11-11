@@ -8,4 +8,8 @@ arboard = "3.3"
 image = {version = "0.25.8", features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico", "qoi"]}
 clap = { version = "*", features = ["derive"] }
 rustc-hash = "*"
+colored = "3.0.0"
+regex = "*"
+once_cell = "1.21.3"
+
 

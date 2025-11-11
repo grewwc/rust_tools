@@ -57,10 +57,13 @@ impl<'a> Iterator for QuoteSplit<'a> {
         }
 
         // Skip leading whitespace
-        while self.position < self.text.len()
-            && self.is_whitespace(self.text.chars().nth(self.position).unwrap())
-        {
-            self.position += 1;
+        let mut char_indices = self.text[self.position..].char_indices();
+        while let Some((_, ch)) = char_indices.next() {
+            if self.is_whitespace(ch) {
+                self.position += ch.len_utf8();
+            } else {
+                break;
+            }
         }
 
         if self.position >= self.text.len() {
@@ -69,21 +72,21 @@ impl<'a> Iterator for QuoteSplit<'a> {
 
         let start = self.position;
         let mut in_quotes = false;
+        let mut char_indices = self.text[self.position..].char_indices();
 
-        while self.position < self.text.len() {
+        while let Some((_, ch)) = char_indices.next() {
             if self.split_chars.is_empty() {
-                self.position += 1;
+                self.position += ch.len_utf8();
                 return Some(&self.text[start..self.position]);
             }
 
-            let ch = self.text.chars().nth(self.position).unwrap();
             if self.symbols.contains(&ch) {
                 in_quotes = !in_quotes;
-                self.position += 1;
+                self.position += ch.len_utf8();
             } else if !in_quotes && self.split_chars.contains(&ch) {
                 break;
             } else {
-                self.position += 1;
+                self.position += ch.len_utf8();
             }
         }
 
@@ -141,6 +144,15 @@ mod tests {
             result,
             vec!["h", "e", "l", "l", "o", " ", "w", "o", "r", "l", "d"]
         );
+    }
+
+    #[test]
+    fn test_split_chinese() {
+        let s = "feature/20251103_27134199_fix_console_count_invoke_1 2025-11-03 fix:控制台计量统计问题";
+        let s = "feature/20251030_27098361_fix_security_issues_1 2025-10-30 fix:校验是否是合法的ossendpoin";
+        let s = "feature/20251030_27098361_fix_security_issues_1 2025-10-30 fix:校验是否是合法的ossendpoint";
+        let result = split_space_keep_symbol(s, "\"");
+        println!("result, {}", result.collect::<String>());
     }
 }
 
