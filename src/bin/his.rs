@@ -6,6 +6,8 @@ use rust_tools::{cmd::run::run_cmd, strw::split::split_space_keep_symbol};
 
 use colored::*;
 use once_cell::sync::Lazy;
+
+use _his::current_branch;
 const LOG_HISTORY_CMD: &'static str =
     r#"git log $branch$ --oneline --format="%h %an %ad %s" --date=short"#;
 const BRANCH_CMD: &'static str = r#"git for-each-ref --sort=-committerdate --format="%(refname:short) %(committerdate:short) %(subject)" refs/heads/ "#;
@@ -16,13 +18,15 @@ static MERGE_PATTERN: Lazy<Regex> =
 
 static DIGIT_PATTERN: Lazy<Regex> = Lazy::new(|| Regex::new(r#"^\-?(\d+)$"#).unwrap());
 
+mod _his;
+
 #[derive(Parser)]
 struct UserInput {
     #[arg(help = "if get all histories", short, long, action = ArgAction::SetTrue)]
     all: bool,
 
-    #[arg(help = "number of histories to show", value_parser = clap::value_parser!(i32), allow_negative_numbers = true)]
-    n: Option<i32>,
+    #[arg(help = "number of histories to show", value_parser = clap::value_parser!(String))]
+    arg: Option<String>,
 
     #[arg(
         help = "branch name (default=current branch)",
@@ -35,11 +39,29 @@ struct UserInput {
 
     #[arg(help="verbose print", short, long, action=ArgAction::SetTrue)]
     v: bool,
+
+    #[arg(skip)]
+    n: i32
 }
 
 impl UserInput {
     fn is_verbose(&self) -> bool {
         self.v
+    }
+
+    fn modify_by_first_arg(&mut self) {
+        if let Some(ref n) = self.arg {
+            let num = n.parse::<i32>();
+            if !num.is_ok() {
+                self.branch = self.arg.clone();
+                return;
+            }
+            let mut n = num.unwrap();
+            if n < 0 {
+                n *= -1;
+            }
+            self.n = n;
+        }
     }
 
     fn get_branch(&self) -> (Option<&str>, usize) {
@@ -70,7 +92,12 @@ impl UserInput {
         if self.is_print_all() {
             return usize::MAX;
         }
-        if let Some(mut n) = self.n {
+        if let Some(ref n) = self.arg {
+            let num = n.parse::<i32>();
+            if !num.is_ok() {
+                return DEFAULT_N;
+            }
+            let mut n = num.unwrap();
             if n < 0 {
                 n *= -1;
             }
@@ -86,6 +113,7 @@ impl UserInput {
 }
 
 trait GitPrint {
+    fn before_print(&self) {}
     fn print(&self, content: &str) -> bool;
 }
 
@@ -134,14 +162,15 @@ impl BranchHistory {
 
 struct LogHistory {
     verbose: bool,
+    branch: String,
 }
 impl LogHistory {
-    fn new(verbose: bool) -> Self {
-        LogHistory { verbose }
+    fn new(verbose: bool, branch: String) -> Self {
+        LogHistory { verbose, branch }
     }
 }
 
-impl GitPrint for LogHistory {
+impl GitPrint for LogHistory{
     fn print(&self, content: &str) -> bool {
         let content = content.trim_matches('"');
         let is_merge_commit = MERGE_PATTERN.is_match(content);
@@ -154,6 +183,16 @@ impl GitPrint for LogHistory {
             println!("{}", content);
         }
         true
+    }
+
+    fn before_print(&self) {
+        let branch: &str = self.branch.as_ref();
+        if branch.is_empty(){
+            let b = current_branch();
+            println!("{}", b.trim().green());
+            return;
+        }
+        println!("{}\n{}", branch.green(), "--".repeat(8));
     }
 }
 
@@ -184,7 +223,7 @@ impl Handler {
                 n: n_print,
             }
         } else {
-            let handler = Box::new(LogHistory::new(user_input.is_verbose()));
+            let handler = Box::new(LogHistory::new(user_input.is_verbose(), branch.to_string()));
             let cmd = cmd.replace("$branch$", branch);
             Handler {
                 handler,
@@ -196,6 +235,7 @@ impl Handler {
 
     fn handle(&self) {
         let mut cnt: usize = 0;
+        self.handler.before_print();
         match run_cmd(self.cmd.as_ref().as_ref()) {
             Ok(output) => {
                 let lines = output.split("\n");
@@ -217,7 +257,8 @@ impl Handler {
 }
 
 fn main() {
-    let input = UserInput::parse();
+    let mut input = UserInput::parse();
+    input.modify_by_first_arg();
     let handler = Handler::new(&input);
     handler.handle();
 }
@@ -236,6 +277,12 @@ mod tests {
         let result = DIGIT_PATTERN.captures("-23");
 
         println!("{}", result.unwrap().get(1).unwrap().as_str());
+    }
+
+    #[test]
+    fn test_get_current_branch() {
+        let branch = run_cmd("git branch | grep '*'").unwrap();
+        println!("==> branch: {}", branch);
     }
 }
 
