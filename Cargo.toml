@@ -9,4 +9,6 @@ image = {version = "0.25.8", features = ["jpeg", "png", "gif", "webp", "bmp", "t
 clap = { version = "*", features = ["derive"] }
 rustc-hash = "*"
 colored = "3.0.0"
-regex = "*"
+regex = "1.12.2"
+base64 = "0.22.1"
+

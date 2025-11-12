@@ -23,3 +23,9 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     clipboard.set_text(text)?;
     Ok(())
 }
+
+pub fn get_clipboard_content() -> String {
+    let mut clipboard = arboard::Clipboard::new().unwrap();
+    clipboard.get_text().unwrap_or("".to_string())
+}
+

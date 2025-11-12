@@ -13,6 +13,9 @@ struct Cli {
 }
 
 fn handle_paste_to_file(fname: &str) -> bool {
+    if let Ok(_) = clipboard::binary_content::save_to_file(fname) {
+        return true;
+    }
     if let Ok(_) = clipboard::string_content::save_to_file(fname) {
         return true;
     }
@@ -28,6 +31,9 @@ fn handle_copy_from_file(fname: &str) -> bool {
     }
 
     if let Ok(_) = clipboard::image_content::copy_from_file(fname) {
+        return true;
+    }
+    if let Ok(_) = clipboard::binary_content::copy_from_file(fname) {
         return true;
     }
     false
@@ -62,4 +68,5 @@ fn main() {
         eprintln!("oo failed");
     }
 }
+
 

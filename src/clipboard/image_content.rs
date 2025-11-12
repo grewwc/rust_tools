@@ -100,9 +100,10 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Err(err) => {
-            eprintln!("{err:?}");
+            // eprintln!("{err:?}");
             Err(err)
         }
     }
 }
+
 
