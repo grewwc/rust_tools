@@ -28,8 +28,11 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-pub fn save_to_file(fname: &str) ->Result<(), Box<dyn std::error::Error>>{
+pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let content = crate::clipboard::string_content::get_clipboard_content();
+    if content.is_empty() {
+        return Err("clipboard empty".into());
+    }
     let res = match base64::engine::general_purpose::STANDARD.decode(content) {
         Ok(data) => {
             fs::write(fname, data)?;
@@ -41,4 +44,5 @@ pub fn save_to_file(fname: &str) ->Result<(), Box<dyn std::error::Error>>{
     };
     Ok(res?)
 }
+
 
