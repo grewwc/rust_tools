@@ -40,7 +40,7 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let text = match fs::read_to_string(fname) {
         Ok(text) => text, 
         Err(err) => {
-            eprintln!("{err:?");
+            eprintln!("{err:?}");
             "".to_string()
         }
     };
