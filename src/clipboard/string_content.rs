@@ -37,14 +37,20 @@ pub fn save_to_file(fname: &str) -> io::Result<()> {
 
 pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut clipboard = arboard::Clipboard::new().unwrap();
-    let text = fs::read_to_string(fname)?;
+    let text = match fs::read_to_string(fname) {
+        Ok(text) => text, 
+        Err(err) => {
+            eprintln!("{err:?");
+            "".to_string()
+        }
+    };
     if text.is_empty() {
         return Err(Box::new(NonTextErr::new(format!(
             "{} is not text file.",
             fname
         ))));
     }
-    println!("text:{}, len:{}", text, text.len());
+    // println!("text:{}, len:{}", text, text.len());
     clipboard.set_text(text)?;
     Ok(())
 }
