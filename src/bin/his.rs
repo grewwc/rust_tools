@@ -15,7 +15,8 @@ const DEFAULT_N: usize = 5;
 const MERGE_PATTERN: LazyCell<Regex> =
     LazyCell::new(|| Regex::new(r#"\w+\s.*\s\d{4}-\d{2}-\d{2}\sMerge.*"#).unwrap());
 
-const PURE_DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"^\-?(\d+)$"#).unwrap());
+const PURE_DIGITAL_PATTERN: LazyCell<Regex> =
+    LazyCell::new(|| Regex::new(r#"^\-?(\d+)$"#).unwrap());
 
 const DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"-?(\d*)"#).unwrap());
 
@@ -59,6 +60,7 @@ impl UserInput {
             return;
         }
         let mut args = self.args.join(" ");
+        let mut branch_is_modified = false;
         if let Some(cap) = DIGITAL_PATTERN.captures(args.as_str())
             && let Some(m) = cap.get(1)
         {
@@ -71,6 +73,7 @@ impl UserInput {
                 let args = args.trim();
                 if !args.is_empty() {
                     self.branch = Some(args.to_string());
+                    branch_is_modified = true;
                 }
             }
         }
@@ -83,6 +86,9 @@ impl UserInput {
             }
             self.n = n;
             self.branch = Some("".to_string());
+        }
+        if !branch_is_modified && self.branch.is_none() {
+            self.branch = Some(args);
         }
     }
 
@@ -282,6 +288,4 @@ mod tests {
         println!("==> branch: {}", branch);
     }
 }
-
-
 
