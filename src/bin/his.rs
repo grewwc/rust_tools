@@ -18,7 +18,7 @@ const MERGE_PATTERN: LazyCell<Regex> =
 const PURE_DIGITAL_PATTERN: LazyCell<Regex> =
     LazyCell::new(|| Regex::new(r#"^\-?(\d+)$"#).unwrap());
 
-const DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"-?(\d*)"#).unwrap());
+const DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"-?(\d+)"#).unwrap());
 
 mod _his;
 
@@ -77,20 +77,18 @@ impl UserInput {
                 }
             }
         }
-        // if let Some(ref branch) = self.branch
-        //     && PURE_DIGITAL_PATTERN.is_match(branch)
-        // {
-        //     let mut n = branch.parse::<i32>().unwrap();
-        //     if n < 0 {
-        //         n *= -1;
-        //     }
-        //     self.n = n;
-        //     self.branch = Some("".to_string());
-        //     branch_is_modified = true;
-        // }
         if !branch_is_modified && self.branch.is_none() && !args.trim().is_empty() {
             self.branch = Some(args);
         }
+        if let Some(b) = self.branch.as_deref()
+            && let Some(caps) = PURE_DIGITAL_PATTERN.captures(b)
+            && let Some(m) = caps.get(1) 
+            && let Ok(n)  =m.as_str().parse::<i32>() 
+        {
+            self.branch = Some("".to_string());
+            self.n = n;
+        }
+        // println!("branch:|{:?}|",self.branch);
     }
 
     fn get_branch(&self) -> String {
@@ -278,7 +276,7 @@ mod tests {
 
     #[test]
     fn test_match() {
-        let result = DIGITAL_PATTERN.captures("-23");
+        let result = DIGITAL_PATTERN.captures("-b -2");
 
         println!("{}", result.unwrap().get(1).unwrap().as_str());
     }
@@ -289,5 +287,4 @@ mod tests {
         println!("==> branch: {}", branch);
     }
 }
-
 
