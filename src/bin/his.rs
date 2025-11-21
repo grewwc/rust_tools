@@ -77,17 +77,18 @@ impl UserInput {
                 }
             }
         }
-        if let Some(ref branch) = self.branch
-            && PURE_DIGITAL_PATTERN.is_match(branch)
-        {
-            let mut n = branch.parse::<i32>().unwrap();
-            if n < 0 {
-                n *= -1;
-            }
-            self.n = n;
-            self.branch = Some("".to_string());
-        }
-        if !branch_is_modified && self.branch.is_none() {
+        // if let Some(ref branch) = self.branch
+        //     && PURE_DIGITAL_PATTERN.is_match(branch)
+        // {
+        //     let mut n = branch.parse::<i32>().unwrap();
+        //     if n < 0 {
+        //         n *= -1;
+        //     }
+        //     self.n = n;
+        //     self.branch = Some("".to_string());
+        //     branch_is_modified = true;
+        // }
+        if !branch_is_modified && self.branch.is_none() && !args.trim().is_empty() {
             self.branch = Some(args);
         }
     }
@@ -277,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_match() {
-        let result = PURE_DIGITAL_PATTERN.captures("-23");
+        let result = DIGITAL_PATTERN.captures("-23");
 
         println!("{}", result.unwrap().get(1).unwrap().as_str());
     }
@@ -288,4 +289,5 @@ mod tests {
         println!("==> branch: {}", branch);
     }
 }
+
 
