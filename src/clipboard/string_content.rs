@@ -39,8 +39,8 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut clipboard = arboard::Clipboard::new().unwrap();
     let text = match fs::read_to_string(fname) {
         Ok(text) => text, 
-        Err(err) => {
-            eprintln!("{err:?}");
+        Err(_) => {
+            // eprintln!("{err:?}");
             "".to_string()
         }
     };
