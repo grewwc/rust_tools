@@ -16,9 +16,9 @@ const MERGE_PATTERN: LazyCell<Regex> =
     LazyCell::new(|| Regex::new(r#"\w+\s.*\s\d{4}-\d{2}-\d{2}\sMerge.*"#).unwrap());
 
 const PURE_DIGITAL_PATTERN: LazyCell<Regex> =
-    LazyCell::new(|| Regex::new(r#"^\-?(\d+)$"#).unwrap());
+    LazyCell::new(|| Regex::new(r#"^\-(\d+)$"#).unwrap());
 
-const DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"-?(\d+)"#).unwrap());
+const DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"\s-(\d+)\s"#).unwrap());
 
 mod _his;
 
@@ -227,6 +227,7 @@ impl Handler {
         } else {
             let handler = Box::new(LogHistory::new(user_input.is_verbose(), branch.to_string()));
             let cmd = cmd.replace("$branch$", &branch);
+            // println!("cmd: {}", cmd);
             Handler {
                 handler,
                 cmd: Box::new(cmd),
