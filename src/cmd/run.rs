@@ -12,7 +12,12 @@ pub fn run_cmd(cmd: &str) -> std::io::Result<String> {
             .arg("-c")
             .arg(cmd)
             .output()?;
-        return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+        let mut result = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        if !stderr.is_empty() {
+            result.push_str(&stderr);
+        }
+        return Ok(result);
     }
     
     // For simple commands, parse and execute directly
@@ -22,8 +27,13 @@ pub fn run_cmd(cmd: &str) -> std::io::Result<String> {
     iter.for_each(|arg| {
         cmd.arg(arg);
     });
-    let output = cmd.output().map(|output| output.stdout)?;
-    Ok(String::from_utf8_lossy(output.as_ref()).to_string())
+    let output = cmd.output()?;
+    let mut result = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if !stderr.is_empty() {
+        result.push_str(&stderr);
+    }
+    Ok(result)
 }
 
 
