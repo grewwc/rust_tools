@@ -18,7 +18,7 @@ const MERGE_PATTERN: LazyCell<Regex> =
 const PURE_DIGITAL_PATTERN: LazyCell<Regex> =
     LazyCell::new(|| Regex::new(r#"^\-(\d+)$"#).unwrap());
 
-const DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"\s-(\d+)\s"#).unwrap());
+const DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"\s-(\d+)"#).unwrap());
 
 mod _his;
 
