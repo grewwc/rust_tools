@@ -6,7 +6,7 @@ pub fn run_cmd(cmd: &str) -> std::io::Result<String> {
     }
     
     // Check if the command contains shell operators like pipes
-    if cmd.contains('|') || cmd.contains('>') || cmd.contains('<') || cmd.contains('&') {
+    if cmd.contains('|') || cmd.contains('>') || cmd.contains('<') {
         // Use shell to execute the command
         let output = std::process::Command::new("sh")
             .arg("-c")
