@@ -60,6 +60,9 @@ impl UserInput {
             return;
         }
         let mut args = self.args.join(" ");
+        if self.args.len() == 1{
+            args.insert(0, ' ');
+        }
         let mut branch_is_modified = false;
         if let Some(cap) = DIGITAL_PATTERN.captures(args.as_str())
             && let Some(m) = cap.get(1)
