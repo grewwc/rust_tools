@@ -60,3 +60,8 @@ pub fn get_clipboard_content() -> String {
     clipboard.get_text().unwrap_or("".to_string())
 }
 
+pub fn set_clipboard_content(content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut clipboard = arboard::Clipboard::new().unwrap();
+    clipboard.set_text(content.to_string())?;
+    Ok(())
+}
