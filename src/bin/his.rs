@@ -15,8 +15,7 @@ const DEFAULT_N: usize = 5;
 const MERGE_PATTERN: LazyCell<Regex> =
     LazyCell::new(|| Regex::new(r#"\w+\s.*\s\d{4}-\d{2}-\d{2}\sMerge.*"#).unwrap());
 
-const PURE_DIGITAL_PATTERN: LazyCell<Regex> =
-    LazyCell::new(|| Regex::new(r#"^\-(\d+)$"#).unwrap());
+const PURE_DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"^\-(\d+)$"#).unwrap());
 
 const DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"\s-(\d+)"#).unwrap());
 
@@ -56,11 +55,17 @@ impl UserInput {
     }
 
     fn modify_by_positional_args(&mut self) {
+        // Check for -a or --all in args
+        if self.args.contains(&"-a".to_string()) || self.args.contains(&"--all".to_string()) {
+            self.all = true;
+            self.args.retain(|arg| arg != "-a" && arg != "--all");
+        }
+        
         if self.args.is_empty() && self.branch.is_none() {
             return;
         }
         let mut args = self.args.join(" ");
-        if self.args.len() == 1{
+        if self.args.len() == 1 {
             args.insert(0, ' ');
         }
         let mut branch_is_modified = false;
@@ -85,8 +90,8 @@ impl UserInput {
         }
         if let Some(b) = self.branch.as_deref()
             && let Some(caps) = PURE_DIGITAL_PATTERN.captures(b)
-            && let Some(m) = caps.get(1) 
-            && let Ok(n)  =m.as_str().parse::<i32>() 
+            && let Some(m) = caps.get(1)
+            && let Ok(n) = m.as_str().parse::<i32>()
         {
             self.branch = Some("".to_string());
             self.n = n;
@@ -291,4 +296,3 @@ mod tests {
         println!("==> branch: {}", branch);
     }
 }
-
