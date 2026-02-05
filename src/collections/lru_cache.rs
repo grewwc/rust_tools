@@ -1,10 +1,10 @@
 use std::{
     cell::RefCell,
-    collections::HashMap,
     fmt::Display,
     hash::Hash,
     rc::{Rc, Weak},
 };
+use rustc_hash::FxHashMap;
 
 struct Node<K, V>
 where
@@ -37,7 +37,7 @@ where
     K: Eq + Hash + Default + Clone,
     V: Default + Display,
 {
-    map: HashMap<K, Rc<RefCell<Node<K, V>>>>,
+    map: FxHashMap<K, Rc<RefCell<Node<K, V>>>>,
     head: Rc<RefCell<Node<K, V>>>,
     tail: Rc<RefCell<Node<K, V>>>,
     len: usize,
@@ -55,7 +55,7 @@ where
         dummy_head.borrow_mut().next = Some(dummy_tail.clone());
         dummy_tail.borrow_mut().prev = Some(Rc::downgrade(&dummy_head));
         Self {
-            map: HashMap::new(),
+            map: FxHashMap::default(),
             head: dummy_head,
             tail: dummy_tail,
             len: 0usize,
@@ -92,6 +92,20 @@ where
         None
     }
 
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+}
+
+impl<K, V> LruCache<K, V>
+where
+    K: Eq + Hash + Default + Clone,
+    V: Default + Display,
+{
     fn move_node_to_front(&mut self, node: Rc<RefCell<Node<K, V>>>) {
         let curr_head = self.head.borrow_mut().next.take().unwrap();
         if Rc::ptr_eq(&curr_head, &node) {
