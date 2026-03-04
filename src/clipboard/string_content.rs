@@ -1,7 +1,8 @@
 use std::{
     fmt::Display,
     fs,
-    io::{self, Error, Write},
+    io::{self, Error, Read, Write},
+    time::Duration,
 };
 
 use crate::common::filename::add_suffix;
@@ -43,6 +44,80 @@ fn set_clipboard_via_osc52(content: &str) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+fn get_clipboard_via_osc52() -> Option<String> {
+    use std::os::unix::io::AsRawFd;
+    
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    
+    stdout.write_all(b"\x1b]52;c;?\x07").ok()?;
+    stdout.flush().ok()?;
+    
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    
+    let fd = stdin.as_raw_fd();
+    let mut original_termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut original_termios) } != 0 {
+        return None;
+    }
+    
+    let mut new_termios = original_termios;
+    new_termios.c_lflag &= !(libc::ICANON | libc::ECHO);
+    new_termios.c_cc[libc::VMIN] = 0;
+    new_termios.c_cc[libc::VTIME] = 1;
+    
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &new_termios) } != 0 {
+        return None;
+    }
+    
+    let result = (|| {
+        let mut response = Vec::new();
+        let mut buf = [0u8; 1024];
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_millis(500);
+        
+        while start.elapsed() < timeout {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    response.extend_from_slice(&buf[..n]);
+                    if response.windows(2).any(|w| w == b"\x07" || w == b"\x1b\\") {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        
+        let response_str = String::from_utf8_lossy(&response);
+        if let Some(start_idx) = response_str.find("]52;c;") {
+            let data_start = start_idx + 6;
+            if let Some(end_idx) = response_str[data_start..].find('\x07') {
+                let base64_data = &response_str[data_start..data_start + end_idx];
+                use base64::engine::general_purpose;
+                use base64::Engine as _;
+                return general_purpose::STANDARD.decode(base64_data).ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+            }
+            if let Some(end_idx) = response_str[data_start..].find("\x1b\\") {
+                let base64_data = &response_str[data_start..data_start + end_idx];
+                use base64::engine::general_purpose;
+                use base64::Engine as _;
+                return general_purpose::STANDARD.decode(base64_data).ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok());
+            }
+        }
+        None
+    })();
+    
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original_termios) };
+    
+    result
+}
+
 pub fn save_to_file(fname: &str) -> io::Result<()> {
     let fname = add_suffix(fname, ".txt", || !fname.contains('.'));
     let text = get_clipboard_content();
@@ -73,27 +148,29 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 pub fn get_clipboard_content() -> String {
-    if is_ssh_session() {
-        "".to_string()
-    } else {
-        match arboard::Clipboard::new() {
-            Ok(mut clipboard) => clipboard.get_text().unwrap_or("".to_string()),
-            Err(_) => "".to_string()
+    match arboard::Clipboard::new() {
+        Ok(mut clipboard) => clipboard.get_text().unwrap_or_default(),
+        Err(_) => {
+            if is_ssh_session() {
+                get_clipboard_via_osc52().unwrap_or_default()
+            } else {
+                String::new()
+            }
         }
     }
 }
 
 pub fn set_clipboard_content(content: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if is_ssh_session() {
-        set_clipboard_via_osc52(content)
-    } else {
-        match arboard::Clipboard::new() {
-            Ok(mut clipboard) => {
-                clipboard.set_text(content.to_string())?;
-                Ok(())
-            },
-            Err(_) => {
+    match arboard::Clipboard::new() {
+        Ok(mut clipboard) => {
+            clipboard.set_text(content.to_string())?;
+            Ok(())
+        },
+        Err(_) => {
+            if is_ssh_session() {
                 set_clipboard_via_osc52(content)
+            } else {
+                Err("failed to set clipboard content".into())
             }
         }
     }

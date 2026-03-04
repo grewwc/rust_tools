@@ -43,12 +43,18 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     // encode as base64 to safely transport binary in clipboard text
     let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
 
-    if is_ssh_session() {
-        set_clipboard_via_osc52(&encoded)
-    } else {
-        let mut clipboard = Clipboard::new()?;
-        clipboard.set_text(encoded)?;
-        Ok(())
+    match Clipboard::new() {
+        Ok(mut clipboard) => {
+            clipboard.set_text(encoded)?;
+            Ok(())
+        },
+        Err(_) => {
+            if is_ssh_session() {
+                set_clipboard_via_osc52(&encoded)
+            } else {
+                Err("failed to set clipboard content".into())
+            }
+        }
     }
 }
 
