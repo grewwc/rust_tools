@@ -82,7 +82,7 @@ fn get_clipboard_via_osc52() -> Option<String> {
                 Ok(0) => break,
                 Ok(n) => {
                     response.extend_from_slice(&buf[..n]);
-                    if response.windows(2).any(|w| w == b"\x07" || w == b"\x1b\\") {
+                    if response.contains(&b'\x07') || response.windows(2).any(|w| w == b"\x1b\\") {
                         break;
                     }
                 }
