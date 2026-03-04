@@ -1,8 +1,28 @@
-use std::{fs, io::Read};
+use std::{fs, io::{self, Read, Write}};
 
 use arboard::Clipboard;
 use base64::Engine as _;
 
+
+fn is_ssh_session() -> bool {
+    std::env::var("SSH_CONNECTION").is_ok() || 
+    std::env::var("SSH_CLIENT").is_ok() ||
+    std::env::var("SSH_TTY").is_ok()
+}
+
+fn set_clipboard_via_osc52(content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use base64::engine::general_purpose;
+    use base64::Engine as _;
+    
+    let encoded = general_purpose::STANDARD.encode(content);
+    let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+    
+    let mut stdout = io::stdout();
+    stdout.write_all(osc52.as_bytes())?;
+    stdout.flush()?;
+    
+    Ok(())
+}
 
 // Copy any file as binary to clipboard.
 // Strategy:
@@ -23,9 +43,13 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     // encode as base64 to safely transport binary in clipboard text
     let encoded = base64::engine::general_purpose::STANDARD.encode(&buf);
 
-    let mut clipboard = Clipboard::new()?;
-    clipboard.set_text(encoded)?;
-    Ok(())
+    if is_ssh_session() {
+        set_clipboard_via_osc52(&encoded)
+    } else {
+        let mut clipboard = Clipboard::new()?;
+        clipboard.set_text(encoded)?;
+        Ok(())
+    }
 }
 
 pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {

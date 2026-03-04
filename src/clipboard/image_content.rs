@@ -8,8 +8,17 @@ use image::{ImageBuffer, ImageFormat, Rgb, Rgba, buffer::ConvertBuffer};
 
 use crate::common::filename::add_suffix;
 
+fn is_ssh_session() -> bool {
+    std::env::var("SSH_CONNECTION").is_ok() || 
+    std::env::var("SSH_CLIENT").is_ok() ||
+    std::env::var("SSH_TTY").is_ok()
+}
+
 pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut clipboard = Clipboard::new().unwrap();
+    if is_ssh_session() {
+        return Err(Box::new(io::Error::new(io::ErrorKind::Other, "saving image from clipboard not supported in SSH session")));
+    }
+    let mut clipboard = Clipboard::new()?;
     let fname: String = add_suffix(fname, ".jpg", || !fname.contains('.'));
     if let Ok(image) = clipboard.get_image() {
         let data = image.bytes;
@@ -81,6 +90,9 @@ fn open_by_content(path: &str) -> Result<image::DynamicImage, Box<dyn std::error
 }
 
 pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if is_ssh_session() {
+        return Err(Box::new(io::Error::new(io::ErrorKind::Other, "copying image to clipboard not supported in SSH session")));
+    }
     let mut clipboard = Clipboard::new()?;
     match open_by_content(fname) {
         Ok(img) => {
@@ -100,7 +112,6 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Err(err) => {
-            // eprintln!("{err:?}");
             Err(err)
         }
     }
