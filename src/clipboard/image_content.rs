@@ -50,9 +50,12 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
             return Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image in clipboard")));
         }
         
+        // Clean content just in case
+        let clean_content = content.replace('\n', "").replace('\r', "");
+        
         use base64::engine::general_purpose;
         use base64::Engine as _;
-        match general_purpose::STANDARD.decode(&content) {
+        match general_purpose::STANDARD.decode(&clean_content) {
             Ok(data) => {
                 let img = image::load_from_memory(&data).map_err(|e| {
                     let msg = format!("failed to load image from clipboard data: {}", e);

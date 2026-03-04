@@ -75,24 +75,44 @@ fn get_clipboard_via_osc52() -> Option<String> {
         let mut response = Vec::new();
         let mut buf = [0u8; 4096];
         let start = std::time::Instant::now();
-        // Increase timeout to 10s for large images, but stop quickly if we got the data
         let timeout = Duration::from_secs(10);
+        let mut found_start = false;
+        let mut start_pos = 0;
         
         while start.elapsed() < timeout {
             match stdin.read(&mut buf) {
                 Ok(0) => {
-                    // No data available right now, but we haven't timed out.
-                    // If we haven't received anything yet, or we're in the middle of a transfer, wait a bit.
-                    // Only break if we've waited too long without ANY data, or if the stream is closed.
-                    // With VMIN=0 VTIME=1, read returns 0 if no data in 0.1s.
-                    // We should continue looping unless total timeout reached.
                     std::thread::sleep(Duration::from_millis(10));
                 },
                 Ok(n) => {
+                    let old_len = response.len();
                     response.extend_from_slice(&buf[..n]);
-                    // Check for termination sequence: \x07 (BEL) or \x1b\ (ST)
-                    if response.contains(&b'\x07') || response.windows(2).any(|w| w == b"\x1b\\") {
-                        break;
+                    
+                    if !found_start {
+                        // Search for start sequence, potentially spanning the last read boundary
+                        // We search from old_len - 7 (to handle split start sequence)
+                        let search_start = if old_len > 7 { old_len - 7 } else { 0 };
+                        if let Some(pos) = response[search_start..].windows(7).position(|w| w == b"\x1b]52;c;") {
+                            found_start = true;
+                            start_pos = search_start + pos;
+                        } else if response.len() > 1024 * 1024 * 10 { // 10MB limit without start
+                            break;
+                        }
+                    }
+                    
+                    if found_start {
+                        // Check for end sequence in the newly added part
+                        // Be careful about \x1b\ splitting across read boundary
+                        // Also ensure we don't check before the payload starts
+                        let check_start = if old_len > 0 { old_len - 1 } else { start_pos + 7 };
+                        let check_start = std::cmp::max(check_start, start_pos + 7);
+                        
+                        if check_start < response.len() {
+                            let check_slice = &response[check_start..];
+                            if check_slice.contains(&b'\x07') || check_slice.windows(2).any(|w| w == b"\x1b\\") {
+                                break;
+                            }
+                        }
                     }
                 }
                 Err(_) => {
@@ -103,6 +123,11 @@ fn get_clipboard_via_osc52() -> Option<String> {
         
         // Try to decode as much as possible even if truncated or slightly malformed
         let response_str = String::from_utf8_lossy(&response);
+        // eprintln!("DEBUG: OSC52 raw response len: {}", response.len());
+        // if response.len() < 100 {
+        //    eprintln!("DEBUG: OSC52 raw response: {:?}", response_str);
+        // }
+
         if let Some(start_idx) = response_str.find("]52;c;") {
             let data_start = start_idx + 6;
             
@@ -117,9 +142,21 @@ fn get_clipboard_via_osc52() -> Option<String> {
                 
                 use base64::engine::general_purpose;
                 use base64::Engine as _;
-                return general_purpose::STANDARD.decode(clean_base64).ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                match general_purpose::STANDARD.decode(&clean_base64) {
+                    Ok(bytes) => {
+                         // eprintln!("DEBUG: decoded {} bytes", bytes.len());
+                         return String::from_utf8(bytes).ok();
+                    },
+                    Err(_e) => {
+                        // eprintln!("DEBUG: base64 decode failed: {}", _e);
+                        return None;
+                    }
+                }
+            } else {
+                // eprintln!("DEBUG: end terminator not found");
             }
+        } else {
+            // eprintln!("DEBUG: start sequence not found");
         }
         None
     })();
