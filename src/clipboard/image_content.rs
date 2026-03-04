@@ -1,6 +1,6 @@
 use std::{
     fs::File,
-    io::{self, BufReader, Read},
+    io::{self, BufReader, Read, Write},
 };
 
 use arboard::{Clipboard, ImageData};
@@ -14,26 +14,72 @@ fn is_ssh_session() -> bool {
     std::env::var("SSH_TTY").is_ok()
 }
 
+fn set_clipboard_via_osc52(content: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use base64::engine::general_purpose;
+    use base64::Engine as _;
+    
+    let encoded = general_purpose::STANDARD.encode(content);
+    let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+    
+    let mut stdout = io::stdout();
+    stdout.write_all(osc52.as_bytes())?;
+    stdout.flush()?;
+    
+    Ok(())
+}
+
+fn image_to_base64(img: &image::DynamicImage) -> Result<String, Box<dyn std::error::Error>> {
+    let mut buf = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
+    use base64::engine::general_purpose;
+    use base64::Engine as _;
+    Ok(general_purpose::STANDARD.encode(&buf))
+}
+
 pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if is_ssh_session() {
-        return Err(Box::new(io::Error::new(io::ErrorKind::Other, "saving image from clipboard not supported in SSH session")));
-    }
-    let mut clipboard = Clipboard::new()?;
     let fname: String = add_suffix(fname, ".jpg", || !fname.contains('.'));
-    if let Ok(image) = clipboard.get_image() {
-        let data = image.bytes;
-        let image = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
-            image.width as u32,
-            image.height as u32,
-            data.to_vec(),
-        )
-        .ok_or("failed to create image")?;
-        let image: ImageBuffer<Rgb<u8>, Vec<u8>> = image.convert();
-        image.save(fname.as_str())?;
-        println!("save to file: {fname}");
-        Ok(())
-    } else {
-        Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image")))
+    
+    match Clipboard::new() {
+        Ok(mut clipboard) => {
+            if let Ok(image) = clipboard.get_image() {
+                let data = image.bytes;
+                let image = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
+                    image.width as u32,
+                    image.height as u32,
+                    data.to_vec(),
+                )
+                .ok_or("failed to create image")?;
+                let image: ImageBuffer<Rgb<u8>, Vec<u8>> = image.convert();
+                image.save(fname.as_str())?;
+                println!("save to file: {fname}");
+                Ok(())
+            } else {
+                Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image")))
+            }
+        }
+        Err(_) => {
+            if is_ssh_session() {
+                let content = crate::clipboard::string_content::get_clipboard_content();
+                if content.is_empty() {
+                    return Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image in clipboard")));
+                }
+                use base64::engine::general_purpose;
+                use base64::Engine as _;
+                match general_purpose::STANDARD.decode(&content) {
+                    Ok(data) => {
+                        let img = image::load_from_memory(&data)?;
+                        img.save(&fname)?;
+                        println!("save to file: {fname}");
+                        Ok(())
+                    }
+                    Err(_) => {
+                        Err(Box::new(io::Error::new(io::ErrorKind::Other, "failed to decode image from clipboard")))
+                    }
+                }
+            } else {
+                Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image")))
+            }
+        }
     }
 }
 
@@ -90,12 +136,10 @@ fn open_by_content(path: &str) -> Result<image::DynamicImage, Box<dyn std::error
 }
 
 pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
-    if is_ssh_session() {
-        return Err(Box::new(io::Error::new(io::ErrorKind::Other, "copying image to clipboard not supported in SSH session")));
-    }
-    let mut clipboard = Clipboard::new()?;
-    match open_by_content(fname) {
-        Ok(img) => {
+    let img = open_by_content(fname)?;
+    
+    match Clipboard::new() {
+        Ok(mut clipboard) => {
             let img_rgba = img.to_rgba8();
             let width = img_rgba.width();
             let height = img_rgba.height();
@@ -108,11 +152,15 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
             };
 
             clipboard.set_image(image_data)?;
-
             Ok(())
         }
-        Err(err) => {
-            Err(err)
+        Err(_) => {
+            if is_ssh_session() {
+                let base64_data = image_to_base64(&img)?;
+                set_clipboard_via_osc52(&base64_data)
+            } else {
+                Err("failed to set clipboard content".into())
+            }
         }
     }
 }
