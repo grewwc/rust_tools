@@ -73,15 +73,24 @@ fn get_clipboard_via_osc52() -> Option<String> {
     
     let result = (|| {
         let mut response = Vec::new();
-        let mut buf = [0u8; 1024];
+        let mut buf = [0u8; 4096];
         let start = std::time::Instant::now();
-        let timeout = Duration::from_millis(500);
+        // Increase timeout to 10s for large images, but stop quickly if we got the data
+        let timeout = Duration::from_secs(10);
         
         while start.elapsed() < timeout {
             match stdin.read(&mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    // No data available right now, but we haven't timed out.
+                    // If we haven't received anything yet, or we're in the middle of a transfer, wait a bit.
+                    // Only break if we've waited too long without ANY data, or if the stream is closed.
+                    // With VMIN=0 VTIME=1, read returns 0 if no data in 0.1s.
+                    // We should continue looping unless total timeout reached.
+                    std::thread::sleep(Duration::from_millis(10));
+                },
                 Ok(n) => {
                     response.extend_from_slice(&buf[..n]);
+                    // Check for termination sequence: \x07 (BEL) or \x1b\ (ST)
                     if response.contains(&b'\x07') || response.windows(2).any(|w| w == b"\x1b\\") {
                         break;
                     }
@@ -92,21 +101,23 @@ fn get_clipboard_via_osc52() -> Option<String> {
             }
         }
         
+        // Try to decode as much as possible even if truncated or slightly malformed
         let response_str = String::from_utf8_lossy(&response);
         if let Some(start_idx) = response_str.find("]52;c;") {
             let data_start = start_idx + 6;
-            if let Some(end_idx) = response_str[data_start..].find('\x07') {
-                let base64_data = &response_str[data_start..data_start + end_idx];
+            
+            // Find end index, checking both terminators
+            let end_idx = response_str[data_start..].find('\x07')
+                .or_else(|| response_str[data_start..].find("\x1b\\"));
+                
+            if let Some(len) = end_idx {
+                let base64_data = &response_str[data_start..data_start + len];
+                // Remove newlines if present (some terminals split output)
+                let clean_base64 = base64_data.replace('\n', "").replace('\r', "");
+                
                 use base64::engine::general_purpose;
                 use base64::Engine as _;
-                return general_purpose::STANDARD.decode(base64_data).ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok());
-            }
-            if let Some(end_idx) = response_str[data_start..].find("\x1b\\") {
-                let base64_data = &response_str[data_start..data_start + end_idx];
-                use base64::engine::general_purpose;
-                use base64::Engine as _;
-                return general_purpose::STANDARD.decode(base64_data).ok()
+                return general_purpose::STANDARD.decode(clean_base64).ok()
                     .and_then(|bytes| String::from_utf8(bytes).ok());
             }
         }

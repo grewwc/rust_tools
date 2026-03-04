@@ -39,6 +39,36 @@ fn image_to_base64(img: &image::DynamicImage) -> Result<String, Box<dyn std::err
 pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let fname: String = add_suffix(fname, ".jpg", || !fname.contains('.'));
     
+    // Helper function to try saving from clipboard via OSC 52
+    fn try_osc52_save(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if !is_ssh_session() {
+            return Err(Box::new(io::Error::new(io::ErrorKind::Other, "not ssh session")));
+        }
+        
+        let content = crate::clipboard::string_content::get_clipboard_content();
+        if content.is_empty() {
+            return Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image in clipboard")));
+        }
+        
+        use base64::engine::general_purpose;
+        use base64::Engine as _;
+        match general_purpose::STANDARD.decode(&content) {
+            Ok(data) => {
+                let img = image::load_from_memory(&data).map_err(|e| {
+                    let msg = format!("failed to load image from clipboard data: {}", e);
+                    io::Error::new(io::ErrorKind::InvalidData, msg)
+                })?;
+                img.save(fname)?;
+                println!("save to file: {fname}");
+                Ok(())
+            }
+            Err(e) => {
+                let msg = format!("failed to decode image from clipboard: {}", e);
+                Err(Box::new(io::Error::new(io::ErrorKind::InvalidData, msg)))
+            }
+        }
+    }
+
     match Clipboard::new() {
         Ok(mut clipboard) => {
             if let Ok(image) = clipboard.get_image() {
@@ -54,30 +84,23 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
                 println!("save to file: {fname}");
                 Ok(())
             } else {
-                Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image")))
+                // Try fallback if arboard works but has no image
+                match try_osc52_save(&fname) {
+                    Ok(_) => Ok(()),
+                    Err(_) => Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image found (local or remote)"))),
+                }
             }
         }
         Err(_) => {
-            if is_ssh_session() {
-                let content = crate::clipboard::string_content::get_clipboard_content();
-                if content.is_empty() {
-                    return Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image in clipboard")));
-                }
-                use base64::engine::general_purpose;
-                use base64::Engine as _;
-                match general_purpose::STANDARD.decode(&content) {
-                    Ok(data) => {
-                        let img = image::load_from_memory(&data)?;
-                        img.save(&fname)?;
-                        println!("save to file: {fname}");
-                        Ok(())
-                    }
-                    Err(_) => {
-                        Err(Box::new(io::Error::new(io::ErrorKind::Other, "failed to decode image from clipboard")))
+            match try_osc52_save(&fname) {
+                Ok(_) => Ok(()),
+                Err(e) => {
+                    if is_ssh_session() {
+                        Err(e)
+                    } else {
+                        Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image")))
                     }
                 }
-            } else {
-                Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image")))
             }
         }
     }
