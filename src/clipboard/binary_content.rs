@@ -1,26 +1,28 @@
-use std::{fs, io::{self, Read, Write}};
+use std::{
+    fs,
+    io::{self, Read, Write},
+};
 
 use arboard::Clipboard;
 use base64::Engine as _;
 
-
 fn is_ssh_session() -> bool {
-    std::env::var("SSH_CONNECTION").is_ok() || 
-    std::env::var("SSH_CLIENT").is_ok() ||
-    std::env::var("SSH_TTY").is_ok()
+    std::env::var("SSH_CONNECTION").is_ok()
+        || std::env::var("SSH_CLIENT").is_ok()
+        || std::env::var("SSH_TTY").is_ok()
 }
 
 fn set_clipboard_via_osc52(content: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use base64::engine::general_purpose;
     use base64::Engine as _;
-    
+    use base64::engine::general_purpose;
+
     let encoded = general_purpose::STANDARD.encode(content);
     let osc52 = format!("\x1b]52;c;{}\x07", encoded);
-    
+
     let mut stdout = io::stdout();
     stdout.write_all(osc52.as_bytes())?;
     stdout.flush()?;
-    
+
     Ok(())
 }
 
@@ -47,7 +49,7 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
         Ok(mut clipboard) => {
             clipboard.set_text(encoded)?;
             Ok(())
-        },
+        }
         Err(_) => {
             if is_ssh_session() {
                 set_clipboard_via_osc52(&encoded)
@@ -67,12 +69,8 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
         Ok(data) => {
             fs::write(fname, data)?;
             Ok(())
-        },
-        Err(err) => {
-            Err(err)
         }
+        Err(err) => Err(err),
     };
     Ok(res?)
 }
-
-

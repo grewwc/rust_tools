@@ -9,52 +9,52 @@ use image::{ImageBuffer, ImageFormat, Rgb, Rgba, buffer::ConvertBuffer};
 use crate::common::filename::add_suffix;
 
 fn is_ssh_session() -> bool {
-    std::env::var("SSH_CONNECTION").is_ok() || 
-    std::env::var("SSH_CLIENT").is_ok() ||
-    std::env::var("SSH_TTY").is_ok()
+    std::env::var("SSH_CONNECTION").is_ok()
+        || std::env::var("SSH_CLIENT").is_ok()
+        || std::env::var("SSH_TTY").is_ok()
 }
 
 fn set_clipboard_via_osc52(content: &str) -> Result<(), Box<dyn std::error::Error>> {
-    use base64::engine::general_purpose;
     use base64::Engine as _;
-    
+    use base64::engine::general_purpose;
+
     let encoded = general_purpose::STANDARD.encode(content);
     let osc52 = format!("\x1b]52;c;{}\x07", encoded);
-    
+
     let mut stdout = io::stdout();
     stdout.write_all(osc52.as_bytes())?;
     stdout.flush()?;
-    
+
     Ok(())
 }
 
 fn image_to_base64(img: &image::DynamicImage) -> Result<String, Box<dyn std::error::Error>> {
     let mut buf = Vec::new();
     img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)?;
-    use base64::engine::general_purpose;
     use base64::Engine as _;
+    use base64::engine::general_purpose;
     Ok(general_purpose::STANDARD.encode(&buf))
 }
 
 pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let fname: String = add_suffix(fname, ".jpg", || !fname.contains('.'));
-    
+
     // Helper function to try saving from clipboard via OSC 52
     fn try_osc52_save(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
         if !is_ssh_session() {
-            return Err(Box::new(io::Error::new(io::ErrorKind::Other, "not ssh session")));
+            return Err(Box::new(io::Error::other("not ssh session")));
         }
-        
+
         let content = crate::clipboard::string_content::get_clipboard_content();
         if content.is_empty() {
-            return Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image in clipboard")));
+            return Err(Box::new(io::Error::other("no image in clipboard")));
         }
-        
+
         // Clean content just in case
-        let clean_content = content.replace('\n', "").replace('\r', "");
-        
-        use base64::engine::general_purpose;
+        let clean_content = content.replace(['\n', '\r'], "");
+
         use base64::Engine as _;
+        use base64::engine::general_purpose;
         match general_purpose::STANDARD.decode(&clean_content) {
             Ok(data) => {
                 let img = image::load_from_memory(&data).map_err(|e| {
@@ -90,22 +90,22 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
                 // Try fallback if arboard works but has no image
                 match try_osc52_save(&fname) {
                     Ok(_) => Ok(()),
-                    Err(_) => Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image found (local or remote)"))),
+                    Err(_) => Err(Box::new(io::Error::other(
+                        "no image found (local or remote)",
+                    ))),
                 }
             }
         }
-        Err(_) => {
-            match try_osc52_save(&fname) {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    if is_ssh_session() {
-                        Err(e)
-                    } else {
-                        Err(Box::new(io::Error::new(io::ErrorKind::Other, "no image")))
-                    }
+        Err(_) => match try_osc52_save(&fname) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if is_ssh_session() {
+                    Err(e)
+                } else {
+                    Err(Box::new(io::Error::other("no image")))
                 }
             }
-        }
+        },
     }
 }
 
@@ -123,19 +123,22 @@ fn open_by_content(path: &str) -> Result<image::DynamicImage, Box<dyn std::error
     } else if header.starts_with(&[0xFF, 0xD8, 0xFF]) {
         // JPEG magic bytes
         ImageFormat::Jpeg
-    } else if header.starts_with(&[0x47, 0x49, 0x46, 0x38, 0x37, 0x61]) || 
-              header.starts_with(&[0x47, 0x49, 0x46, 0x38, 0x39, 0x61]) {
+    } else if header.starts_with(&[0x47, 0x49, 0x46, 0x38, 0x37, 0x61])
+        || header.starts_with(&[0x47, 0x49, 0x46, 0x38, 0x39, 0x61])
+    {
         // GIF magic bytes (GIF87a or GIF89a)
         ImageFormat::Gif
-    } else if header.starts_with(&[0x52, 0x49, 0x46, 0x46]) && 
-              header[8..12] == [0x57, 0x45, 0x42, 0x50] {
+    } else if header.starts_with(&[0x52, 0x49, 0x46, 0x46])
+        && header[8..12] == [0x57, 0x45, 0x42, 0x50]
+    {
         // WebP magic bytes (RIFF....WEBP)
         ImageFormat::WebP
     } else if header.starts_with(&[0x42, 0x4D]) {
         // BMP magic bytes
         ImageFormat::Bmp
-    } else if header.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || 
-              header.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
+    } else if header.starts_with(&[0x49, 0x49, 0x2A, 0x00])
+        || header.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])
+    {
         // TIFF magic bytes (little-endian or big-endian)
         ImageFormat::Tiff
     } else if header.starts_with(&[0x00, 0x00, 0x01, 0x00]) {
@@ -163,7 +166,7 @@ fn open_by_content(path: &str) -> Result<image::DynamicImage, Box<dyn std::error
 
 pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let img = open_by_content(fname)?;
-    
+
     match Clipboard::new() {
         Ok(mut clipboard) => {
             let img_rgba = img.to_rgba8();
@@ -190,5 +193,3 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
-
-

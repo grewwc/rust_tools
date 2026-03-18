@@ -13,33 +13,33 @@ struct Cli {
 }
 
 fn handle_paste_to_file(fname: &str) -> bool {
-    if let Ok(_) = clipboard::binary_content::save_to_file(fname) {
+    if clipboard::binary_content::save_to_file(fname).is_ok() {
         return true;
     }
-    if let Ok(_) = clipboard::string_content::save_to_file(fname) {
+    if clipboard::string_content::save_to_file(fname).is_ok() {
         return true;
     }
-    if let Ok(_) = clipboard::image_content::save_to_file(fname) {
+    if clipboard::image_content::save_to_file(fname).is_ok() {
         return true;
     }
     false
 }
 
 fn handle_copy_from_file(fname: &str) -> bool {
-    if let Ok(_) = clipboard::string_content::copy_from_file(fname) {
+    if clipboard::string_content::copy_from_file(fname).is_ok() {
         return true;
     }
 
-    if let Ok(_) = clipboard::image_content::copy_from_file(fname) {
+    if clipboard::image_content::copy_from_file(fname).is_ok() {
         return true;
     }
-    if let Ok(_) = clipboard::binary_content::copy_from_file(fname) {
+    if clipboard::binary_content::copy_from_file(fname).is_ok() {
         return true;
     }
     false
 }
 
-const DEFAULT_FILE_NAME: &'static str = "output";
+const DEFAULT_FILE_NAME: &str = "output";
 
 fn main() {
     let cli = Cli::parse();
@@ -55,10 +55,10 @@ fn main() {
 
     let mut result = false;
     if cli.copy.is_some() {
-        result = result || handle_copy_from_file(&fname);
+        result = result || handle_copy_from_file(fname);
     } else if cli.paste.is_some() {
         // paste
-        result = result || handle_paste_to_file(&fname);
+        result = result || handle_paste_to_file(fname);
     } else {
         Cli::command().print_help().unwrap();
         return;
@@ -68,5 +68,3 @@ fn main() {
         eprintln!("oo failed");
     }
 }
-
-

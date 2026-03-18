@@ -1,4 +1,3 @@
-
 pub struct Stack<T> {
     data: std::collections::LinkedList<T>,
 }
@@ -7,6 +6,12 @@ impl<T> Stack<T> {
         Self {
             data: std::collections::LinkedList::new(),
         }
+    }
+}
+
+impl<T> Default for Stack<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -35,4 +40,3 @@ impl<T> Stack<T> {
         self.data.back()
     }
 }
-

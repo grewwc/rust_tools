@@ -1,4 +1,4 @@
-use std::{cell::LazyCell, usize};
+use std::sync::LazyLock;
 
 use clap::{ArgAction, Parser};
 use regex::Regex;
@@ -7,17 +7,17 @@ use rust_tools::{cmd::run::run_cmd, strw::split::split_space_keep_symbol};
 use colored::*;
 
 use _his::current_branch;
-const LOG_HISTORY_CMD: &'static str =
-    r#"git log $branch$ --oneline --format="%h %an %ad %s" --date=short"#;
-const BRANCH_CMD: &'static str = r#"git for-each-ref --sort=-committerdate --format="%(refname:short) %(committerdate:short) %(subject)" refs/heads/ "#;
+const LOG_HISTORY_CMD: &str = r#"git log $branch$ --oneline --format="%h %an %ad %s" --date=short"#;
+const BRANCH_CMD: &str = r#"git for-each-ref --sort=-committerdate --format="%(refname:short) %(committerdate:short) %(subject)" refs/heads/ "#;
 const DEFAULT_N: usize = 5;
 
-const MERGE_PATTERN: LazyCell<Regex> =
-    LazyCell::new(|| Regex::new(r#"\w+\s.*\s\d{4}-\d{2}-\d{2}\sMerge.*"#).unwrap());
+static MERGE_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\w+\s.*\s\d{4}-\d{2}-\d{2}\sMerge.*"#).unwrap());
 
-const PURE_DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"^\-(\d+)$"#).unwrap());
+static PURE_DIGITAL_PATTERN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"^\-(\d+)$"#).unwrap());
 
-const DIGITAL_PATTERN: LazyCell<Regex> = LazyCell::new(|| Regex::new(r#"\s-(\d+)"#).unwrap());
+static DIGITAL_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\s-(\d+)"#).unwrap());
 
 mod _his;
 
@@ -60,7 +60,7 @@ impl UserInput {
             self.all = true;
             self.args.retain(|arg| arg != "-a" && arg != "--all");
         }
-        
+
         if self.args.is_empty() && self.branch.is_none() {
             return;
         }
@@ -148,19 +148,11 @@ impl BranchHistory {
         // println!("|{}|", content);
         let mut iter = split_space_keep_symbol(content, "\"");
         // let mut iter = content.split("\"");
-        let name = iter.next();
-        if name.is_none() {
-            return None;
-        }
-        let name = name.unwrap().to_owned();
-        let date = iter.next();
-        if date.is_none() {
-            return None;
-        }
-        let date = date.unwrap().to_owned();
+        let name = iter.next()?.to_owned();
+        let date = iter.next()?.to_owned();
         let msg: String = iter.fold(String::new(), |mut acc, item| {
             if !acc.is_empty() {
-                acc.push_str(" ");
+                acc.push(' ');
             }
             acc.push_str(item);
             acc
@@ -250,8 +242,8 @@ impl Handler {
         match run_cmd(self.cmd.as_ref().as_ref()) {
             Ok(output) => {
                 let lines = output.split("\n");
-                let mut iter = lines.map(|line| line.trim());
-                while let Some(line) = iter.next() {
+                let iter = lines.map(|line| line.trim());
+                for line in iter {
                     if cnt >= self.n {
                         break;
                     }

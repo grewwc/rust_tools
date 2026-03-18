@@ -1,10 +1,10 @@
+use rustc_hash::FxHashMap;
 use std::{
     cell::RefCell,
     fmt::Display,
     hash::Hash,
     rc::{Rc, Weak},
 };
-use rustc_hash::FxHashMap;
 
 struct Node<K, V>
 where
@@ -59,7 +59,7 @@ where
             head: dummy_head,
             tail: dummy_tail,
             len: 0usize,
-            cap: cap,
+            cap,
         }
     }
 
@@ -70,11 +70,11 @@ where
             self.move_node_to_front(node.clone());
         } else {
             let new_node = Rc::new(RefCell::new(Node::new(k.clone(), v)));
-            if self.len == self.cap {
-                if let Some(removed) = self.remove_tail() {
-                    self.map.remove(&removed.borrow().key);
-                    self.len -= 1;
-                }
+            if self.len == self.cap
+                && let Some(removed) = self.remove_tail()
+            {
+                self.map.remove(&removed.borrow().key);
+                self.len -= 1;
             }
             self.add_to_front(new_node.clone());
             self.map.insert(k, new_node.clone());
@@ -94,6 +94,10 @@ where
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub fn cap(&self) -> usize {

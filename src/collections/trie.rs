@@ -1,7 +1,6 @@
-use std::ptr::null_mut;
+use std::{collections::hash_map::Entry, ptr::null_mut};
 
 use crate::common::types::FastMap;
-
 
 /// A Trie (prefix tree) data structure for efficient string storage and retrieval.
 ///
@@ -57,6 +56,12 @@ impl Trie {
     }
 }
 
+impl Default for Trie {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Trie {
     /// Inserts a string into the Trie.
     ///
@@ -82,14 +87,14 @@ impl Trie {
 
         // Traverse or create nodes for each character
         for ch in s.chars() {
-            if !curr.children.contains_key(&ch) {
-                curr.children.insert(ch, Box::new(Trie::new()));
-                inserted = true;
-            }
-            match curr.children.get_mut(&ch) {
-                Some(node) => curr = node,
-                None => return false,
-            }
+            let node = match curr.children.entry(ch) {
+                Entry::Vacant(e) => {
+                    inserted = true;
+                    e.insert(Box::new(Trie::new()))
+                }
+                Entry::Occupied(e) => e.into_mut(),
+            };
+            curr = node;
         }
 
         // Check if word already exists
@@ -128,7 +133,7 @@ impl Trie {
     /// assert!(!trie.contains("hel")); // Prefix, but not a complete word
     /// ```
     pub fn contains(&self, s: &str) -> bool {
-        let mut curr = &*self;
+        let mut curr = self;
 
         // Traverse the trie following the characters
         for (_, ch) in s.char_indices() {
@@ -164,7 +169,7 @@ impl Trie {
     /// assert!(!trie.has_prefix("world"));
     /// ```
     pub fn has_prefix(&self, prefix: &str) -> bool {
-        let mut curr = &*self;
+        let mut curr = self;
 
         // Traverse the trie following the characters
         for (_, ch) in prefix.char_indices() {
@@ -338,5 +343,3 @@ mod tests {
         // assert!(t.contains("hell"));
     }
 }
-
-

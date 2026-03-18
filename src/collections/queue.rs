@@ -12,6 +12,12 @@ impl<T> Queue<T> {
     }
 }
 
+impl<T> Default for Queue<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> Queue<T> {
     pub fn enqueue(&mut self, val: T) {
         self.data.push_back(val);
@@ -37,4 +43,3 @@ impl<T> Queue<T> {
         self.data.front()
     }
 }
-

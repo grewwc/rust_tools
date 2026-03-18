@@ -25,6 +25,15 @@ where
     }
 }
 
+impl<'a, T> Default for UF<'a, T>
+where
+    T: Eq + Hash,
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<'a, T: Eq + Hash> UF<'a, T> {
     pub fn union(&mut self, v1: &'a T, v2: &'a T) -> bool {
         if !self.id.contains_key(v1) {
@@ -59,7 +68,7 @@ impl<'a, T: Eq + Hash> UF<'a, T> {
     pub fn find_root(&mut self, v: &'a T) -> &'a T {
         let mut root = v;
         loop {
-            let parent = self.id.get(root).map(|x| *x).unwrap();
+            let parent = self.id.get(root).copied().unwrap();
             if root == parent {
                 break;
             }
@@ -73,7 +82,7 @@ impl<'a, T: Eq + Hash> UF<'a, T> {
                 root,
                 self.size.get(root).unwrap() + self.size.get(id).unwrap(),
             );
-            id = self.id.get(id).map(|x| *x).unwrap();
+            id = self.id.get(id).copied().unwrap();
         }
 
         root
@@ -110,5 +119,3 @@ mod tests {
         assert_eq!(1, uf.n_groups());
     }
 }
-
-

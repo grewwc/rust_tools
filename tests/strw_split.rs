@@ -1,6 +1,5 @@
 use rust_tools::strw::split::{split_keep_symbol, split_space_keep_symbol};
 
-
 #[test]
 fn test_split_keep_quotes_simple() {
     let input = r#"hello "world with spaces" test"#;
@@ -19,7 +18,10 @@ fn test_split_keep_symbol_iterator() {
 fn test_multiple_quotes() {
     let input = r#"command "arg one" "arg two" final"#;
     let result: Vec<&str> = split_keep_symbol(input, " ", r#"""#).collect();
-    assert_eq!(result, vec!["command", "\"arg one\"", "\"arg two\"", "final"]);
+    assert_eq!(
+        result,
+        vec!["command", "\"arg one\"", "\"arg two\"", "final"]
+    );
 }
 
 #[test]
@@ -40,13 +42,14 @@ fn test_empty_quotes() {
 fn test_empty_split_chars() {
     let input = "hello world";
     let result = split_keep_symbol(input, "", "").collect::<Vec<&str>>();
-    assert_eq!(result, vec!["h", "e", "l", "l", "o", " ", "w", "o", "r", "l", "d"]);
+    assert_eq!(
+        result,
+        vec!["h", "e", "l", "l", "o", " ", "w", "o", "r", "l", "d"]
+    );
 }
 
 #[test]
 fn test_split_chinese() {
-    let s = "feature/20251103_27134199_fix_console_count_invoke_1 2025-11-03 fix:控制台计量统计问题";
-    let s = "feature/20251030_27098361_fix_security_issues_1 2025-10-30 fix:校验是否是合法的ossendpoin";
     let s = "feature/20251030_27098361_fix_security_issues_1 2025-10-30 fix:校验是否是合法的ossendpoint";
     let result = split_space_keep_symbol(s, "\"");
     println!("result, {}", result.collect::<String>());
@@ -177,4 +180,3 @@ fn test_alternating_quotes() {
     let result: Vec<&str> = split_keep_symbol(input, " ", r#"""#).collect();
     assert_eq!(result, vec![r#""one""#, "two", r#""three""#, "four"]);
 }
-

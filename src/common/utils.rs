@@ -7,10 +7,9 @@ pub fn get_home_dir() -> Option<String> {
     None
 }
 
-
-pub fn expanduser(path_str: &str) -> Cow<'_, str>{
-    if let Some(home) = get_home_dir(){
-         return Cow::Owned(path_str.replace("~", &home));
+pub fn expanduser(path_str: &str) -> Cow<'_, str> {
+    if let Some(home) = get_home_dir() {
+        return Cow::Owned(path_str.replace("~", &home));
     }
     Cow::Borrowed(path_str)
 }

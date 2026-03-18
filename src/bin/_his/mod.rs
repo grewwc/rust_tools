@@ -1,4 +1,3 @@
-
 use rust_tools::cmd::run::run_cmd;
 
 pub fn current_branch() -> String {
@@ -10,4 +9,3 @@ pub fn current_branch() -> String {
     }
     s
 }
-

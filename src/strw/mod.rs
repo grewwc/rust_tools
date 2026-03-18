@@ -1,3 +1,9 @@
+pub mod calc;
+pub mod check;
 pub mod find;
+pub mod format;
+pub mod indices;
+pub mod r#move;
+pub mod search;
 pub mod split;
 pub mod trim;

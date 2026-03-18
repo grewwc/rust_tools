@@ -1,10 +1,10 @@
 use crate::strw::split::split_space_keep_symbol;
 
 pub fn run_cmd(cmd: &str) -> std::io::Result<String> {
-    if cmd.len() == 0 {
+    if cmd.is_empty() {
         return Ok("".to_owned());
     }
-    
+
     // Check if the command contains shell operators like pipes
     if cmd.contains('|') || cmd.contains('>') || cmd.contains('<') {
         // Use shell to execute the command
@@ -19,9 +19,9 @@ pub fn run_cmd(cmd: &str) -> std::io::Result<String> {
         }
         return Ok(result);
     }
-    
+
     // For simple commands, parse and execute directly
-    let mut iter = split_space_keep_symbol(cmd, r#"""#).into_iter();
+    let mut iter = split_space_keep_symbol(cmd, r#"""#);
     let program = iter.next().unwrap();
     let mut cmd = std::process::Command::new(program);
     iter.for_each(|arg| {
@@ -35,5 +35,3 @@ pub fn run_cmd(cmd: &str) -> std::io::Result<String> {
     }
     Ok(result)
 }
-
-
