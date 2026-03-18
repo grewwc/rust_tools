@@ -10,8 +10,15 @@ clap = { version = "*", features = ["derive"] }
 rustc-hash = "*"
 colored = "3.0.0"
 regex = "1.12.2"
+glob = "0.3"
 base64 = "0.22.1"
 fxhash = "0.2.1"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+uuid = { version = "1.18.1", features = ["v4"] }
+mongodb = "3.3.0"
+tokio = { version = "1.47.1", features = ["rt-multi-thread", "net", "time"] }
+futures-util = "0.3.31"
+chrono = { version = "0.4.41", features = ["clock"] }

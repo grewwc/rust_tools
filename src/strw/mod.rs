@@ -7,3 +7,13 @@ pub mod r#move;
 pub mod search;
 pub mod split;
 pub mod trim;
+
+pub use calc::*;
+pub use check::*;
+pub use find::*;
+pub use format::*;
+pub use indices::*;
+pub use r#move::*;
+pub use search::*;
+pub use split::*;
+pub use trim::*;

@@ -1,4 +1,4 @@
-use std::io::{BufRead, Read};
+use std::io::Read;
 use std::{collections::HashSet, hash::BuildHasherDefault};
 
 use rustc_hash::FxHasher;
@@ -164,74 +164,131 @@ where
     }
 }
 
-pub fn split_by_token<R: std::io::Read>(
+pub struct TokenSplit<R> {
     reader: R,
-    token: &str,
+    token: Vec<u8>,
+    lps: Vec<usize>,
     keep_token: bool,
-) -> std::io::Result<Vec<String>> {
-    if token.is_empty() {
-        return Err(std::io::Error::other("token should not be empty"));
+    buf: Vec<u8>,
+    matched: usize,
+    done: bool,
+    chunk: [u8; 8192],
+    chunk_len: usize,
+    chunk_pos: usize,
+}
+
+impl<R: Read> TokenSplit<R> {
+    pub fn new(reader: R, token: &str, keep_token: bool) -> Self {
+        if token.is_empty() {
+            return Self {
+                reader,
+                token: Vec::new(),
+                lps: Vec::new(),
+                keep_token,
+                buf: Vec::new(),
+                matched: 0,
+                done: false,
+                chunk: [0u8; 8192],
+                chunk_len: 0,
+                chunk_pos: 0,
+            };
+        }
+        let token_bytes = token.as_bytes().to_vec();
+        let lps = build_kmp_lps(&token_bytes);
+        Self {
+            reader,
+            token: token_bytes,
+            lps,
+            keep_token,
+            buf: Vec::new(),
+            matched: 0,
+            done: false,
+            chunk: [0u8; 8192],
+            chunk_len: 0,
+            chunk_pos: 0,
+        }
     }
-    let mut r = std::io::BufReader::new(reader);
-    let token_bytes = token.as_bytes();
-    let mut out: Vec<String> = Vec::new();
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk: Vec<u8> = Vec::new();
+}
 
-    loop {
-        if buf.len() >= token_bytes.len() && buf[buf.len() - token_bytes.len()..] == *token_bytes {
-            let mut s = buf.clone();
-            if !keep_token {
-                s.truncate(s.len() - token_bytes.len());
-            }
-            if !s.is_empty() {
-                out.push(String::from_utf8_lossy(&s).to_string());
-            }
-            buf.clear();
+impl<R: Read> Iterator for TokenSplit<R> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
         }
 
-        chunk.clear();
-        let n = {
-            let mut byte = [0u8; 1];
-            match r.read(&mut byte) {
-                Ok(0) => 0,
-                Ok(_) => {
-                    chunk.push(byte[0]);
-                    1
-                }
-                Err(e) => return Err(e),
-            }
-        };
-
-        if n == 0 {
-            break;
-        }
-
-        buf.extend_from_slice(&chunk);
-
-        if token_bytes.len() > 1 {
-            let mut rest = vec![0u8; token_bytes.len() - 1];
-            match r.fill_buf() {
-                Ok(avail) => {
-                    let take = rest.len().min(avail.len());
-                    rest[..take].copy_from_slice(&avail[..take]);
-                    if take < rest.len() {
-                        rest.truncate(take);
+        loop {
+            if self.chunk_pos >= self.chunk_len {
+                match self.reader.read(&mut self.chunk) {
+                    Ok(0) => {
+                        self.done = true;
+                        if self.buf.is_empty() {
+                            return None;
+                        }
+                        let s = String::from_utf8_lossy(&self.buf).to_string();
+                        self.buf.clear();
+                        return Some(s);
+                    }
+                    Ok(n) => {
+                        self.chunk_len = n;
+                        self.chunk_pos = 0;
+                    }
+                    Err(_e) => {
+                        self.done = true;
+                        return None;
                     }
                 }
-                Err(e) => return Err(e),
             }
-            if rest.len() == token_bytes.len() - 1 && rest == token_bytes[1..] {
-                buf.extend_from_slice(&rest);
-                r.consume(rest.len());
+
+            let b = self.chunk[self.chunk_pos];
+            self.chunk_pos += 1;
+            self.buf.push(b);
+
+            while self.matched > 0 && b != self.token[self.matched] {
+                self.matched = self.lps[self.matched - 1];
+            }
+            if b == self.token[self.matched] {
+                self.matched += 1;
+            }
+            if self.matched == self.token.len() {
+                let mut out = std::mem::take(&mut self.buf);
+                if !self.keep_token {
+                    let new_len = out.len().saturating_sub(self.token.len());
+                    out.truncate(new_len);
+                }
+                self.matched = 0;
+                if out.is_empty() {
+                    continue;
+                }
+                let s = String::from_utf8_lossy(&out).to_string();
+                return Some(s);
             }
         }
     }
+}
 
-    if !buf.is_empty() {
-        out.push(String::from_utf8_lossy(&buf).to_string());
+pub fn split_by_token<R: Read>(reader: R, token: &str, keep_token: bool) -> TokenSplit<R> {
+    TokenSplit::new(reader, token, keep_token)
+}
+
+fn build_kmp_lps(pattern: &[u8]) -> Vec<usize> {
+    let mut lps = vec![0usize; pattern.len()];
+    let mut len = 0usize;
+    let mut i = 1usize;
+    while i < pattern.len() {
+        if pattern[i] == pattern[len] {
+            len += 1;
+            lps[i] = len;
+            i += 1;
+        } else if len != 0 {
+            len = lps[len - 1];
+        } else {
+            lps[i] = 0;
+            i += 1;
+        }
     }
-    Ok(out)
+    lps
 }
 
 /// Alternative implementation using a custom iterator that behaves more like Split
@@ -389,9 +446,17 @@ mod tests {
     #[test]
     fn test_split_by_token() {
         let input = "a<END>b<END>c";
-        let parts = split_by_token(std::io::Cursor::new(input.as_bytes()), "<END>", false).unwrap();
-        assert_eq!(parts, vec!["a", "b", "c"]);
-        let parts = split_by_token(std::io::Cursor::new(input.as_bytes()), "<END>", true).unwrap();
-        assert_eq!(parts, vec!["a<END>", "b<END>", "c"]);
+        let parts = split_by_token(std::io::Cursor::new(input.as_bytes()), "<END>", false)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parts,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        let parts = split_by_token(std::io::Cursor::new(input.as_bytes()), "<END>", true)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parts,
+            vec!["a<END>".to_string(), "b<END>".to_string(), "c".to_string()]
+        );
     }
 }

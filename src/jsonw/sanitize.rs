@@ -6,11 +6,13 @@ pub fn sanitize_json_input(s: &str, options: ParseOptions) -> String {
         out = strip_line_comments(&out);
     }
     if options.remove_special_chars {
-        out = out
-            .bytes()
+        let bytes = out
+            .as_bytes()
+            .iter()
+            .copied()
             .filter(|b| *b > 31)
-            .map(|b| b as char)
-            .collect::<String>();
+            .collect::<Vec<u8>>();
+        out = String::from_utf8_lossy(&bytes).to_string();
     }
     out
 }
@@ -78,5 +80,13 @@ mod tests {
         let v: Value = serde_json::from_str(&sanitized).unwrap();
         assert_eq!(v["a"], "x//y");
         assert_eq!(v["b"], 1);
+    }
+
+    #[test]
+    fn test_sanitize_keeps_utf8_chinese() {
+        let s = "{\n\"msg\": \"你好，世界\"}\u{0001}";
+        let sanitized = sanitize_json_input(s, ParseOptions::default());
+        let v: Value = serde_json::from_str(&sanitized).unwrap();
+        assert_eq!(v["msg"], "你好，世界");
     }
 }
