@@ -5,6 +5,58 @@ use regex::Regex;
 static MULTI_MINUS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(--)+").unwrap());
 static POSITIVE_NUMBER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\+(\d+)").unwrap());
 
+pub trait CalcStrExt: AsRef<str> {
+    fn plus<S: AsRef<str>>(&self, rhs: S) -> String {
+        plus(self.as_ref(), rhs.as_ref())
+    }
+
+    fn plus_all<I, S>(&self, rhs: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut res = self.as_ref().to_string();
+        for x in rhs {
+            res = plus(&res, x.as_ref());
+        }
+        res
+    }
+
+    fn minus<S: AsRef<str>>(&self, rhs: S) -> String {
+        minus(self.as_ref(), rhs.as_ref())
+    }
+
+    fn neg(&self) -> String {
+        neg(self.as_ref())
+    }
+
+    fn mul<S: AsRef<str>>(&self, rhs: S) -> String {
+        mul(self.as_ref(), rhs.as_ref())
+    }
+
+    fn mul_all<I, S>(&self, rhs: I) -> String
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut res = self.as_ref().to_string();
+        for x in rhs {
+            res = mul(&res, x.as_ref());
+        }
+        res
+    }
+
+    fn div<S: AsRef<str>>(&self, rhs: S, num_digit_to_keep: i32) -> String {
+        div(self.as_ref(), rhs.as_ref(), num_digit_to_keep)
+    }
+
+    fn modulo<S: AsRef<str>>(&self, rhs: S) -> String {
+        modulo(self.as_ref(), rhs.as_ref())
+    }
+}
+
+impl<T: AsRef<str>> CalcStrExt for T {}
+
 pub fn plus(a: &str, b: &str) -> String {
     plus2(a, b)
 }
@@ -534,5 +586,18 @@ mod tests {
         assert_eq!(div("10", "4", 3), "2.5");
         assert_eq!(div("1", "8", 4), "0.125");
         assert_eq!(modulo("10", "3"), "1");
+    }
+
+    #[test]
+    fn test_calc_str_ext_methods() {
+        assert_eq!("1".plus("2"), "3");
+        assert_eq!("10".minus("3"), "7");
+        assert_eq!("0.3".mul("0.02"), "0.006");
+        assert_eq!("1".div("8", 4), "0.125");
+        assert_eq!("10".modulo("3"), "1");
+        assert_eq!("12".plus_all(["3", "4"]), "19");
+        assert_eq!("2".mul_all(["3", "4"]), "24");
+        assert_eq!("12".neg(), "-12");
+        assert_eq!("-12".neg(), "12");
     }
 }
