@@ -367,6 +367,7 @@ impl MemoDb {
         Ok(out)
     }
 
+    #[allow(dead_code)]
     pub fn search_by_tags(
         &self,
         tags: &[String],
@@ -393,6 +394,7 @@ impl MemoDb {
     }
 }
 
+#[allow(dead_code)]
 fn match_tags_exact(record_tags: &[String], filter_tags: &[String], use_and: bool) -> bool {
     if filter_tags.is_empty() {
         return true;

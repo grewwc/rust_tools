@@ -1993,31 +1993,32 @@ fn print_title_with_colored_separator(title: &str) -> String {
 
 fn normalize_title_for_display(title: &str) -> String {
     let normalized_newline = title.replace("\r\n", "\n").replace('\r', "\n");
-    let has_url = normalized_newline.contains("https://") || normalized_newline.contains("http://");
-    if !has_url {
-        return normalized_newline;
-    }
-
     let mut split_lines = Vec::new();
     for line in normalized_newline.lines() {
+        if line.trim().is_empty() {
+            split_lines.push(String::new());
+            continue;
+        }
         split_wrapped_numbered_line(line, &mut split_lines);
     }
 
     let mut merged: Vec<String> = Vec::new();
     for line in split_lines {
-        let line = line.trim();
+        let line = line.trim().to_string();
         if line.is_empty() {
+            merged.push(String::new());
             continue;
         }
-        let is_numbered_item = NUMBERED_ITEM_RE.is_match(line);
+        let is_numbered_item = NUMBERED_ITEM_RE.is_match(&line);
         if !is_numbered_item
             && let Some(prev) = merged.last_mut()
             && (prev.contains("https://") || prev.contains("http://"))
+            && looks_like_url_continuation_fragment(&line)
         {
-            prev.push_str(line);
+            prev.push_str(&line);
             continue;
         }
-        merged.push(line.to_string());
+        merged.push(line);
     }
 
     if merged.is_empty() {
@@ -2025,6 +2026,38 @@ fn normalize_title_for_display(title: &str) -> String {
     } else {
         merged.join("\n")
     }
+}
+
+fn looks_like_url_continuation_fragment(line: &str) -> bool {
+    let line = line.trim();
+    if line.is_empty() {
+        return false;
+    }
+    if line.contains("http://") || line.contains("https://") {
+        return false;
+    }
+    if line.contains('：') {
+        return false;
+    }
+    if line.starts_with('~') || line.starts_with('-') {
+        return false;
+    }
+    if let Some(idx) = line.find(':')
+        && idx <= 24
+    {
+        return false;
+    }
+    if line.chars().any(|ch| ch.is_whitespace()) {
+        return false;
+    }
+    line.chars().all(|ch| {
+        ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                '/' | '?' | '#' | '[' | ']' | '@' | '!' | '$' | '&' | '\'' | '(' | ')' | '*'
+                    | '+' | ',' | ';' | '=' | '%' | '-' | '.' | '_' | '~'
+            )
+    })
 }
 
 fn split_wrapped_numbered_line(line: &str, out: &mut Vec<String>) {
@@ -2121,6 +2154,13 @@ mod tests {
             wrapped,
             "1. 文档：\n    https://example.com/very/long/path/for/test?foo=bar&baz=qux"
         );
+    }
+
+    #[test]
+    fn normalize_title_preserves_newlines_after_url_lines() {
+        let original = "fabric数据集链接：\nhttps://example.com/a\n子数据集id：5130071\ntask_id：t#1770303001804771022\n~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\nfabric数据集ID：4333589";
+        let normalized = normalize_title_for_display(original);
+        assert_eq!(normalized, original);
     }
 }
 

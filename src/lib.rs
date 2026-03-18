@@ -4,4 +4,5 @@ pub mod cmd;
 pub mod collections;
 pub mod common;
 pub mod jsonw;
+pub mod sortw;
 pub mod strw;
