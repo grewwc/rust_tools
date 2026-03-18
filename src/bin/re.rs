@@ -1164,6 +1164,7 @@ fn add_or_del_tags_feature(db: &MemoBackend, cli: &Cli, add: bool) {
 fn push_single(db: &MemoBackend, push_ref: &str, cli_host: &str) {
     println!("pushing...");
     let host = resolve_host(cli_host);
+    println!("target: {}", sync::remote_sqlite_target_display(&host));
 
     let mut reference = push_ref.trim().to_string();
     if reference.is_empty() {
@@ -1181,16 +1182,16 @@ fn push_single(db: &MemoBackend, push_ref: &str, cli_host: &str) {
                 .list_records_by_tags(&tags, false, false, -1, true, true)
                 .unwrap_or_default();
             if !records.is_empty() {
-                for record in &records {
-                    println!("begin to sync {}...", record.id);
-                    sync::sync_record_to_host(db, &record.id, &host).unwrap_or_else(|e| {
-                        eprintln!("{e}");
-                        std::process::exit(1);
-                    });
-                    history::write_previous_operation(&record.id);
-                    println!("finished syncing");
+                let record_ids = records.iter().map(|record| record.id.clone()).collect::<Vec<_>>();
+                println!("begin to sync {} records...", record_ids.len());
+                let synced = sync::sync_records_to_host(db, &record_ids, &host).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                for record_id in &record_ids {
+                    history::write_previous_operation(record_id);
                 }
-                println!("finished push {} records", records.len());
+                println!("finished push {} records", synced);
                 return;
             }
         }
@@ -1226,6 +1227,7 @@ fn push_single(db: &MemoBackend, push_ref: &str, cli_host: &str) {
 fn pull_single(db: &MemoBackend, pull_ref: &str, cli_host: &str) {
     println!("pulling...");
     let host = resolve_host(cli_host);
+    println!("source: {}", sync::remote_sqlite_target_display(&host));
 
     let mut reference = pull_ref.trim().to_string();
     if reference.is_empty() {
@@ -1530,6 +1532,21 @@ fn list_by_tag_name_feature(
     if cli.pull.is_some() || cli.push.is_some() {
         let host = resolve_host(&cli.host);
         let push_mode = cli.push.is_some();
+        if push_mode {
+            let record_ids = records.iter().map(|record| record.id.clone()).collect::<Vec<_>>();
+            if !record_ids.is_empty() {
+                println!("begin to sync {} records...", record_ids.len());
+                let synced = sync::sync_records_to_host(db, &record_ids, &host).unwrap_or_else(|e| {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                });
+                for record_id in &record_ids {
+                    history::write_previous_operation(record_id);
+                }
+                println!("finished syncing {} records", synced);
+            }
+            return;
+        }
         for record in &records {
             println!("begin to sync {}...", record.id);
             let res = if push_mode {

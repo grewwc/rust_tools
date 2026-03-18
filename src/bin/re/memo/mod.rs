@@ -206,3 +206,30 @@ fn match_tags(record_tags: &[String], filter_tags: &[String], use_and: bool, pre
         filter_tags.iter().any(|t| matches_one(t))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::match_tags;
+
+    #[test]
+    fn match_tags_exact_mode_requires_exact_tag_name() {
+        assert!(match_tags(
+            &["links".to_string(), "read".to_string()],
+            &["links".to_string()],
+            false,
+            false,
+        ));
+        assert!(!match_tags(
+            &["links:archive".to_string()],
+            &["links".to_string()],
+            false,
+            false,
+        ));
+        assert!(match_tags(
+            &["links:archive".to_string()],
+            &["links".to_string()],
+            false,
+            true,
+        ));
+    }
+}

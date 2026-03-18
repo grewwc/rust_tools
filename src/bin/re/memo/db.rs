@@ -367,10 +367,42 @@ impl MemoDb {
         Ok(out)
     }
 
+    pub fn search_by_tags(
+        &self,
+        tags: &[String],
+        use_and: bool,
+        limit: i64,
+        include_finished: bool,
+    ) -> rusqlite::Result<Vec<MemoRecord>> {
+        if tags.is_empty() {
+            return self.list_records(limit, false, include_finished);
+        }
+
+        let mut records = self.list_records(-1, false, include_finished)?;
+        records.retain(|record| match_tags_exact(&record.tags, tags, use_and));
+        if limit > 0 && records.len() > limit as usize {
+            records.truncate(limit as usize);
+        }
+        Ok(records)
+    }
+
     fn connect(&self) -> rusqlite::Result<Connection> {
         let conn = Connection::open(&self.path)?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         Ok(conn)
+    }
+}
+
+fn match_tags_exact(record_tags: &[String], filter_tags: &[String], use_and: bool) -> bool {
+    if filter_tags.is_empty() {
+        return true;
+    }
+
+    let matches_one = |needle: &str| record_tags.iter().any(|tag| tag == needle);
+    if use_and {
+        filter_tags.iter().all(|tag| matches_one(tag))
+    } else {
+        filter_tags.iter().any(|tag| matches_one(tag))
     }
 }
 
