@@ -1790,31 +1790,28 @@ fn render_inline_md(s: &str, base: &str) -> String {
     let mut bold = false;
     let mut code = false;
 
+    fn apply_style(out: &mut String, base: &str, bold: bool, code: bool) {
+        out.push_str("\x1b[0m");
+        out.push_str(base);
+        if bold {
+            out.push_str("\x1b[1m");
+        }
+        if code {
+            out.push_str("\x1b[90m");
+        }
+    }
+
     while i < bytes.len() {
         if bytes[i] == b'`' {
             code = !code;
-            out.push_str("\x1b[0m");
-            out.push_str(base);
-            if bold {
-                out.push_str("\x1b[1m");
-            }
-            if code {
-                out.push_str("\x1b[7m");
-            }
+            apply_style(&mut out, base, bold, code);
             i += 1;
             continue;
         }
 
         if !code && bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
             bold = !bold;
-            out.push_str("\x1b[0m");
-            out.push_str(base);
-            if bold {
-                out.push_str("\x1b[1m");
-            }
-            if code {
-                out.push_str("\x1b[7m");
-            }
+            apply_style(&mut out, base, bold, code);
             i += 2;
             continue;
         }
