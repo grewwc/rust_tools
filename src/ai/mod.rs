@@ -1550,20 +1550,17 @@ impl MarkdownStreamRenderer {
             }
         }
 
-        let rendered = match &mut self.table_state {
+        let state = std::mem::replace(&mut self.table_state, TableState::None);
+        let rendered = match state {
             TableState::None => String::new(),
-            TableState::PendingHeader { indent, header_line } => {
-                let indent = std::mem::take(indent);
-                let header = std::mem::take(header_line);
-                self.table_state = TableState::None;
-                self.render_line_no_table(&format!("{indent}{header}"))
-            }
-            TableState::InTable { indent, widths, .. } => {
-                let indent = indent.clone();
-                let widths = std::mem::take(widths);
-                self.table_state = TableState::None;
-                render_table_bottom(&indent, &widths)
-            }
+            TableState::PendingHeader { .. } => String::new(),
+            TableState::InTable {
+                indent,
+                header,
+                align,
+                rows,
+                preview_height,
+            } => self.rewrite_table_preview(&indent, preview_height, &header, &align, &rows),
         };
         if !rendered.is_empty() {
             out.write_all(rendered.as_bytes())?;
@@ -1583,57 +1580,111 @@ impl MarkdownStreamRenderer {
                         self.bol = true;
                     }
                     let (indent, rest) = split_indent(line);
+                    let raw = format!("{indent}{}", rest.trim_end());
+                    out.push_str(&raw);
+                    out.push('\n');
+                    let mut preview_height = table_preview_height(&raw);
+                    if out.starts_with('\n') {
+                        preview_height += 1;
+                    }
                     self.table_state = TableState::PendingHeader {
                         indent: indent.to_string(),
                         header_line: rest.trim_end().to_string(),
+                        preview_height,
                     };
                     return out;
                 }
                 self.render_line_no_table(line)
             }
-            TableState::PendingHeader { indent, header_line } => {
+            TableState::PendingHeader {
+                indent,
+                header_line,
+                mut preview_height,
+            } => {
                 if is_table_separator(line) {
+                    let mut out = String::new();
+                    let raw = line.trim_end().to_string();
+                    out.push_str(&raw);
+                    out.push('\n');
+                    preview_height += table_preview_height(&raw);
+
                     let header_cells = parse_table_row(&header_line);
                     let align = parse_table_align(line, header_cells.len());
-                    let widths = compute_table_widths(&indent, &header_cells);
                     self.table_state = TableState::InTable {
-                        indent: indent.clone(),
-                        widths: widths.clone(),
-                        align: align.clone(),
+                        indent,
+                        header: header_cells,
+                        align,
+                        rows: Vec::new(),
+                        preview_height,
                     };
+                    return out;
+                }
+
+                let _ = preview_height;
+                let _ = indent;
+                let _ = header_line;
+                self.consume_line(line)
+            }
+            TableState::InTable {
+                indent,
+                header,
+                align,
+                mut rows,
+                mut preview_height,
+            } => {
+                if is_table_row(line) {
+                    rows.push(parse_table_row(line));
+                    let raw = line.trim_end().to_string();
                     let mut out = String::new();
-                    out.push_str(&render_table_top(&indent, &widths));
-                    out.push_str(&render_table_header(&indent, &header_cells, &align, &widths));
-                    out.push_str(&render_table_mid(&indent, &widths));
+                    out.push_str(&raw);
+                    out.push('\n');
+                    preview_height += table_preview_height(&raw);
+                    self.table_state = TableState::InTable {
+                        indent,
+                        header,
+                        align,
+                        rows,
+                        preview_height,
+                    };
                     return out;
                 }
 
                 let mut out = String::new();
-                out.push_str(&self.render_line_no_table(&format!("{indent}{header_line}")));
-                out.push_str(&self.consume_line(line));
-                out
-            }
-            TableState::InTable {
-                indent,
-                widths,
-                align,
-            } => {
-                if is_table_row(line) {
-                    let row = parse_table_row(line);
-                    self.table_state = TableState::InTable {
-                        indent: indent.clone(),
-                        widths: widths.clone(),
-                        align: align.clone(),
-                    };
-                    return render_table_row(&indent, &row, &align, &widths);
-                }
-
-                let mut out = String::new();
-                out.push_str(&render_table_bottom(&indent, &widths));
+                out.push_str(&self.rewrite_table_preview(&indent, preview_height, &header, &align, &rows));
                 out.push_str(&self.consume_line(line));
                 out
             }
         }
+    }
+
+    fn rewrite_table_preview(
+        &self,
+        indent: &str,
+        preview_height: usize,
+        header: &[String],
+        align: &[TableAlign],
+        rows: &[Vec<String>],
+    ) -> String {
+        let cols = header.len().max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+        if cols < 2 || preview_height == 0 {
+            return String::new();
+        }
+
+        let widths = compute_table_widths(indent, header, rows);
+        let mut final_table = String::new();
+        final_table.push_str(&render_table_top(indent, &widths));
+        final_table.push_str(&render_table_header(indent, header, align, &widths));
+        final_table.push_str(&render_table_mid(indent, &widths));
+        for row in rows {
+            let row_cells = row.iter().cloned().collect::<Vec<_>>();
+            final_table.push_str(&render_table_row(indent, &row_cells, align, &widths));
+        }
+        final_table.push_str(&render_table_bottom(indent, &widths));
+
+        let mut out = String::new();
+        out.push_str(&format!("\x1b[{preview_height}A\r\x1b[0J"));
+        out.push_str(&final_table);
+        out
     }
 
     fn render_line_no_table(&mut self, line: &str) -> String {
@@ -1699,11 +1750,17 @@ impl MarkdownStreamRenderer {
 
 enum TableState {
     None,
-    PendingHeader { indent: String, header_line: String },
+    PendingHeader {
+        indent: String,
+        header_line: String,
+        preview_height: usize,
+    },
     InTable {
         indent: String,
-        widths: Vec<usize>,
+        header: Vec<String>,
         align: Vec<TableAlign>,
+        rows: Vec<Vec<String>>,
+        preview_height: usize,
     },
 }
 
@@ -1712,6 +1769,13 @@ enum TableAlign {
     Left,
     Center,
     Right,
+}
+
+fn table_preview_height(line: &str) -> usize {
+    let cols = terminal_width().max(1);
+    let width = UnicodeWidthStr::width(line);
+    let width = width.max(1);
+    (width + cols - 1) / cols
 }
 
 fn split_indent(s: &str) -> (&str, &str) {
@@ -2014,8 +2078,10 @@ fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn compute_table_widths(indent: &str, header: &[String]) -> Vec<usize> {
-    let cols = header.len();
+fn compute_table_widths(indent: &str, header: &[String], rows: &[Vec<String>]) -> Vec<usize> {
+    let cols = header
+        .len()
+        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
     if cols == 0 {
         return Vec::new();
     }
@@ -2023,6 +2089,12 @@ fn compute_table_widths(indent: &str, header: &[String]) -> Vec<usize> {
     let mut widths = vec![3usize; cols];
     for (i, cell) in header.iter().enumerate() {
         widths[i] = widths[i].max(visible_width(cell));
+    }
+    for row in rows {
+        for i in 0..cols {
+            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            widths[i] = widths[i].max(visible_width(cell));
+        }
     }
     for w in &mut widths {
         *w = (*w).max(3);
