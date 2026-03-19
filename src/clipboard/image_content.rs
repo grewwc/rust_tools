@@ -14,6 +14,25 @@ fn is_ssh_session() -> bool {
         || std::env::var("SSH_TTY").is_ok()
 }
 
+fn stdout_is_tty() -> bool {
+    // OSC52 only makes sense on interactive terminals.
+    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
+fn prefer_osc52_image_bridge() -> bool {
+    // Default to OSC52 transport so local copy can be pasted from remote SSH sessions.
+    // Set OO_PREFER_NATIVE_IMAGE=1 to keep the previous native-image clipboard behavior.
+    match std::env::var("OO_PREFER_NATIVE_IMAGE") {
+        Ok(val) => {
+            !matches!(
+                val.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        }
+        Err(_) => true,
+    }
+}
+
 fn set_clipboard_via_osc52(content: &str) -> Result<(), Box<dyn std::error::Error>> {
     use base64::Engine as _;
     use base64::engine::general_purpose;
@@ -166,6 +185,13 @@ fn open_by_content(path: &str) -> Result<image::DynamicImage, Box<dyn std::error
 
 pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let img = open_by_content(fname)?;
+    let base64_data = image_to_base64(&img)?;
+
+    if stdout_is_tty() && prefer_osc52_image_bridge() {
+        if set_clipboard_via_osc52(&base64_data).is_ok() {
+            return Ok(());
+        }
+    }
 
     match Clipboard::new() {
         Ok(mut clipboard) => {
@@ -185,7 +211,6 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(_) => {
             if is_ssh_session() {
-                let base64_data = image_to_base64(&img)?;
                 set_clipboard_via_osc52(&base64_data)
             } else {
                 Err("failed to set clipboard content".into())

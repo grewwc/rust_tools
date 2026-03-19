@@ -44,8 +44,20 @@ fn set_clipboard_via_osc52(content: &str) -> Result<(), Box<dyn std::error::Erro
     Ok(())
 }
 
+fn stdin_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+}
+
+fn stdout_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
 fn get_clipboard_via_osc52() -> Option<String> {
     use std::os::unix::io::AsRawFd;
+
+    if !stdin_is_tty() || !stdout_is_tty() {
+        return None;
+    }
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
@@ -75,14 +87,14 @@ fn get_clipboard_via_osc52() -> Option<String> {
         let mut response = Vec::new();
         let mut buf = [0u8; 1024];
         let start = std::time::Instant::now();
-        let timeout = Duration::from_millis(500);
+        let timeout = Duration::from_millis(1500);
 
         while start.elapsed() < timeout {
             match stdin.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     response.extend_from_slice(&buf[..n]);
-                    if response.windows(2).any(|w| w == b"\x07" || w == b"\x1b\\") {
+                    if response.contains(&b'\x07') || response.windows(2).any(|w| w == b"\x1b\\") {
                         break;
                     }
                 }

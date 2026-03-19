@@ -449,10 +449,7 @@ impl PromptEditor {
     fn read_multi_line_tui(&mut self) -> io::Result<Option<String>> {
         use crossterm::{
             event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-            execute,
-            terminal::{
-                EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-            },
+            terminal::{disable_raw_mode, enable_raw_mode},
         };
         use ratatui::{
             Terminal,
@@ -460,11 +457,11 @@ impl PromptEditor {
             layout::{Constraint, Direction, Layout},
             style::{Color, Style},
             text::{Line, Span},
-            widgets::{Block, Borders, Paragraph},
+            widgets::{Block, Borders, Clear, Paragraph},
         };
         use tui_textarea::{CursorMove, Input, TextArea};
 
-        // Let the user read the previous output before switching to alternate screen.
+        // Let the user read the previous output before opening the compose viewport.
         {
             use crossterm::{
                 event::{self, Event, KeyCode, KeyEventKind},
@@ -512,14 +509,16 @@ impl PromptEditor {
 
         enable_raw_mode()?;
 
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen).map_err(|e| io::Error::other(e.to_string()))?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = match Terminal::new(backend) {
+        let backend = CrosstermBackend::new(io::stdout());
+        let mut terminal = match Terminal::with_options(
+            backend,
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Inline(18),
+            },
+        ) {
             Ok(terminal) => terminal,
             Err(err) => {
                 let _ = disable_raw_mode();
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
                 return Err(io::Error::other(err.to_string()));
             }
         };
@@ -532,10 +531,22 @@ impl PromptEditor {
                 terminal
                     .draw(|f| {
                         let area = f.area();
+                        let popup_height = area.height.saturating_sub(2).min(18).max(6).min(area.height);
+                        let popup_width = area.width.saturating_sub(4).min(110).max(40).min(area.width);
+                        let popup = centered_rect(area, popup_width, popup_height);
+
+                        let popup_block = Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(Color::DarkGray))
+                            .title(" Compose ");
+                        let inner = popup_block.inner(popup);
                         let chunks = Layout::default()
                             .direction(Direction::Vertical)
                             .constraints([Constraint::Min(3), Constraint::Length(2)])
-                            .split(area);
+                            .split(inner);
+
+                        f.render_widget(Clear, popup);
+                        f.render_widget(popup_block, popup);
 
                         let n = textarea.lines().len();
                         textarea.set_block(
@@ -648,9 +659,9 @@ impl PromptEditor {
             outcome
         })();
 
-        let _ = disable_raw_mode();
-        let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = terminal.clear();
         let _ = terminal.show_cursor();
+        let _ = disable_raw_mode();
 
         let result = result?;
         if let Some(content) = &result {
@@ -722,6 +733,14 @@ impl MultilineHistoryState {
 
 fn textarea_content(textarea: &tui_textarea::TextArea<'_>) -> String {
     textarea.lines().join("\n")
+}
+
+fn centered_rect(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    ratatui::layout::Rect::new(x, y, width, height)
 }
 
 fn replace_textarea_content(textarea: &mut tui_textarea::TextArea<'_>, content: &str) {

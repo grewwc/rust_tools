@@ -8,7 +8,7 @@ struct Cli {
     #[arg(short, long, num_args = 0..=1, default_missing_value = "", value_name = "FILE", help = "paste from clipboard to file (default: 'output')")]
     paste: Option<String>,
 
-    #[arg(short, long, num_args = 0..=1, default_missing_value = "", value_name = "FILE", help = "copy from file to clipboard (default: 'output')")]
+    #[arg(short, long, num_args = 0..=1, default_missing_value = "", value_name = "FILE", help = "copy from file to clipboard (default: 'output'). Image copy uses OSC52 bridge by default for SSH paste; set OO_PREFER_NATIVE_IMAGE=1 to disable")]
     copy: Option<String>,
 }
 
