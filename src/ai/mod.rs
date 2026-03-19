@@ -15,6 +15,7 @@ use reqwest::blocking::{Client, Response, multipart};
 use rustyline::{DefaultEditor, error::ReadlineError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use unicode_width::UnicodeWidthStr;
 
 use crate::{
     clipboard::string_content,
@@ -1427,6 +1428,8 @@ fn stream_response(
         current_history.push_str(text);
     }
 
+    markdown.flush_pending()?;
+
     if take_stream_cancelled(app) {
         return Ok(StreamOutcome::Cancelled);
     }
@@ -1486,7 +1489,9 @@ struct MarkdownStreamRenderer {
     tty: bool,
     enabled: bool,
     in_code_block: bool,
+    bol: bool,
     line_buf: String,
+    table_state: TableState,
 }
 
 impl MarkdownStreamRenderer {
@@ -1500,7 +1505,9 @@ impl MarkdownStreamRenderer {
             tty,
             enabled: true,
             in_code_block: false,
+            bol: false,
             line_buf: String::new(),
+            table_state: TableState::None,
         }
     }
 
@@ -1520,8 +1527,11 @@ impl MarkdownStreamRenderer {
         for ch in chunk.chars() {
             if ch == '\n' {
                 let line = std::mem::take(&mut self.line_buf);
-                let rendered = self.render_line(&line);
-                out.write_all(rendered.as_bytes())?;
+                let rendered = self.consume_line(&line);
+                if !rendered.is_empty() {
+                    out.write_all(rendered.as_bytes())?;
+                    self.bol = rendered.ends_with('\n');
+                }
                 continue;
             }
             self.line_buf.push(ch);
@@ -1529,7 +1539,118 @@ impl MarkdownStreamRenderer {
         Ok(())
     }
 
-    fn render_line(&mut self, line: &str) -> String {
+    fn flush_pending(&mut self) -> io::Result<()> {
+        let mut out = io::stdout();
+        if !self.line_buf.is_empty() {
+            let line = std::mem::take(&mut self.line_buf);
+            let rendered = self.consume_line(&line);
+            if !rendered.is_empty() {
+                out.write_all(rendered.as_bytes())?;
+                self.bol = rendered.ends_with('\n');
+            }
+        }
+
+        let rendered = match &mut self.table_state {
+            TableState::None => String::new(),
+            TableState::PendingHeader { indent, header_line } => {
+                let indent = std::mem::take(indent);
+                let header = std::mem::take(header_line);
+                self.table_state = TableState::None;
+                self.render_line_no_table(&format!("{indent}{header}"))
+            }
+            TableState::InTable {
+                indent,
+                header,
+                align,
+                rows,
+            } => {
+                let indent = indent.clone();
+                let header = std::mem::take(header);
+                let align = std::mem::take(align);
+                let rows = std::mem::take(rows);
+                self.table_state = TableState::None;
+                let mut out = String::new();
+                if !self.bol {
+                    out.push('\n');
+                    self.bol = true;
+                }
+                out.push_str(&render_table(&indent, &header, &align, &rows));
+                out
+            }
+        };
+        if !rendered.is_empty() {
+            out.write_all(rendered.as_bytes())?;
+            self.bol = rendered.ends_with('\n');
+        }
+        out.flush()
+    }
+
+    fn consume_line(&mut self, line: &str) -> String {
+        match &mut self.table_state {
+            TableState::None => {
+                if is_table_row_candidate(line) {
+                    let mut out = String::new();
+                    if !self.bol {
+                        out.push('\n');
+                        self.bol = true;
+                    }
+                    let (indent, rest) = split_indent(line);
+                    self.table_state = TableState::PendingHeader {
+                        indent: indent.to_string(),
+                        header_line: rest.trim_end().to_string(),
+                    };
+                    return out;
+                }
+                self.render_line_no_table(line)
+            }
+            TableState::PendingHeader { indent, header_line } => {
+                if is_table_separator(line) {
+                    let header_cells = parse_table_row(header_line);
+                    let align = parse_table_align(line, header_cells.len());
+                    self.table_state = TableState::InTable {
+                        indent: indent.clone(),
+                        header: header_cells,
+                        align,
+                        rows: Vec::new(),
+                    };
+                    return String::new();
+                }
+
+                let header = std::mem::take(header_line);
+                let header_indent = std::mem::take(indent);
+                self.table_state = TableState::None;
+
+                let mut out = String::new();
+                out.push_str(&self.render_line_no_table(&format!("{header_indent}{header}")));
+                out.push_str(&self.consume_line(line));
+                out
+            }
+            TableState::InTable {
+                indent,
+                header,
+                align,
+                rows,
+            } => {
+                if is_table_row(line) {
+                    rows.push(parse_table_row(line));
+                    return String::new();
+                }
+
+                let indent = indent.clone();
+                let header = std::mem::take(header);
+                let align = std::mem::take(align);
+                let rows = std::mem::take(rows);
+                self.table_state = TableState::None;
+
+                let mut out = String::new();
+                out.push_str(&render_table(&indent, &header, &align, &rows));
+                out.push_str(&self.consume_line(line));
+                out
+            }
+        }
+    }
+
+    fn render_line_no_table(&mut self, line: &str) -> String {
         let (indent, rest) = split_indent(line);
         let trimmed = rest.trim_start_matches([' ', '\t']);
 
@@ -1553,6 +1674,10 @@ impl MarkdownStreamRenderer {
                 _ => ("\x1b[1m\x1b[36m", None),
             };
             let mut out = String::new();
+            if !self.bol {
+                out.push('\n');
+                self.bol = true;
+            }
             out.push_str(indent);
             out.push_str(base);
             out.push_str(&render_inline_md(title, base));
@@ -1584,6 +1709,24 @@ impl MarkdownStreamRenderer {
         }
         format!("{}{}\n", indent, render_inline_md(rest, ""))
     }
+}
+
+enum TableState {
+    None,
+    PendingHeader { indent: String, header_line: String },
+    InTable {
+        indent: String,
+        header: Vec<String>,
+        align: Vec<TableAlign>,
+        rows: Vec<Vec<String>>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum TableAlign {
+    Left,
+    Center,
+    Right,
 }
 
 fn split_indent(s: &str) -> (&str, &str) {
@@ -1682,6 +1825,218 @@ fn render_inline_md(s: &str, base: &str) -> String {
     }
 
     out.push_str("\x1b[0m");
+    out
+}
+
+fn is_table_row_candidate(line: &str) -> bool {
+    if line.trim().is_empty() {
+        return false;
+    }
+    let (_, rest) = split_indent(line);
+    let s = rest.trim_end();
+    if !s.contains('|') {
+        return false;
+    }
+    if s.starts_with("```") || s.starts_with("~~~") {
+        return false;
+    }
+    let cells = parse_table_row(s);
+    cells.len() >= 2
+}
+
+fn is_table_row(line: &str) -> bool {
+    let (_, rest) = split_indent(line);
+    let s = rest.trim_end();
+    if s.trim().is_empty() {
+        return false;
+    }
+    if is_table_separator(s) {
+        return false;
+    }
+    let cells = parse_table_row(s);
+    cells.len() >= 2
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let (_, rest) = split_indent(line);
+    let mut s = rest.trim();
+    if s.starts_with('|') {
+        s = &s[1..];
+    }
+    if s.ends_with('|') && s.len() >= 1 {
+        s = &s[..s.len() - 1];
+    }
+    let parts = s.split('|').map(|p| p.trim()).filter(|p| !p.is_empty());
+    let mut count = 0usize;
+    for p in parts {
+        count += 1;
+        let p = p.trim_matches(' ');
+        let core = p.trim_matches(':');
+        if core.len() < 3 || !core.chars().all(|c| c == '-') {
+            return false;
+        }
+    }
+    count >= 2
+}
+
+fn parse_table_row(line: &str) -> Vec<String> {
+    let (_, rest) = split_indent(line);
+    let s = rest.trim();
+    let mut raw = s.split('|').map(|p| p.trim()).collect::<Vec<_>>();
+    if s.starts_with('|') && !raw.is_empty() {
+        if raw.first().is_some_and(|x| x.is_empty()) {
+            raw.remove(0);
+        }
+    }
+    if s.ends_with('|') && !raw.is_empty() {
+        if raw.last().is_some_and(|x| x.is_empty()) {
+            raw.pop();
+        }
+    }
+    raw.into_iter().map(|x| x.to_string()).collect()
+}
+
+fn parse_table_align(line: &str, cols: usize) -> Vec<TableAlign> {
+    let (_, rest) = split_indent(line);
+    let s = rest.trim();
+    let mut raw = s.split('|').map(|p| p.trim()).collect::<Vec<_>>();
+    if s.starts_with('|') && !raw.is_empty() {
+        if raw.first().is_some_and(|x| x.is_empty()) {
+            raw.remove(0);
+        }
+    }
+    if s.ends_with('|') && !raw.is_empty() {
+        if raw.last().is_some_and(|x| x.is_empty()) {
+            raw.pop();
+        }
+    }
+    let mut out = Vec::with_capacity(cols);
+    for i in 0..cols {
+        let seg = raw.get(i).copied().unwrap_or("");
+        let seg = seg.trim();
+        let left = seg.starts_with(':');
+        let right = seg.ends_with(':');
+        out.push(match (left, right) {
+            (true, true) => TableAlign::Center,
+            (false, true) => TableAlign::Right,
+            _ => TableAlign::Left,
+        });
+    }
+    out
+}
+
+fn strip_inline_md_markers(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn visible_width(s: &str) -> usize {
+    UnicodeWidthStr::width(strip_inline_md_markers(s).as_str())
+}
+
+fn pad_cell(s: &str, width: usize, align: TableAlign) -> String {
+    let w = visible_width(s);
+    let pad = width.saturating_sub(w);
+    match align {
+        TableAlign::Left => format!("{s}{}", " ".repeat(pad)),
+        TableAlign::Right => format!("{}{}", " ".repeat(pad), s),
+        TableAlign::Center => {
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
+        }
+    }
+}
+
+fn render_table(indent: &str, header: &[String], align: &[TableAlign], rows: &[Vec<String>]) -> String {
+    let cols = header.len().max(
+        rows.iter().map(|r| r.len()).max().unwrap_or(0)
+    );
+    if cols < 2 {
+        return String::new();
+    }
+
+    let mut widths = vec![0usize; cols];
+    for (i, cell) in header.iter().enumerate() {
+        widths[i] = widths[i].max(visible_width(cell));
+    }
+    for row in rows {
+        for i in 0..cols {
+            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            widths[i] = widths[i].max(visible_width(cell));
+        }
+    }
+    for w in &mut widths {
+        *w = (*w).max(3).min(60);
+    }
+
+    let mut out = String::new();
+    out.push_str(indent);
+    out.push('┌');
+    for i in 0..cols {
+        out.push_str(&"─".repeat(widths[i] + 2));
+        out.push(if i + 1 == cols { '┐' } else { '┬' });
+    }
+    out.push('\n');
+
+    out.push_str(indent);
+    out.push('│');
+    for i in 0..cols {
+        let cell = header.get(i).map(|s| s.as_str()).unwrap_or("");
+        let padded = pad_cell(cell, widths[i], align.get(i).copied().unwrap_or(TableAlign::Left));
+        out.push(' ');
+        out.push_str("\x1b[1m\x1b[36m");
+        out.push_str(&render_inline_md(&padded, "\x1b[1m\x1b[36m"));
+        out.push_str("\x1b[0m");
+        out.push(' ');
+        out.push('│');
+    }
+    out.push('\n');
+
+    out.push_str(indent);
+    out.push('├');
+    for i in 0..cols {
+        out.push_str(&"─".repeat(widths[i] + 2));
+        out.push(if i + 1 == cols { '┤' } else { '┼' });
+    }
+    out.push('\n');
+
+    for row in rows {
+        out.push_str(indent);
+        out.push('│');
+        for i in 0..cols {
+            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
+            let padded = pad_cell(cell, widths[i], align.get(i).copied().unwrap_or(TableAlign::Left));
+            out.push(' ');
+            out.push_str(&render_inline_md(&padded, ""));
+            out.push(' ');
+            out.push('│');
+        }
+        out.push('\n');
+    }
+
+    out.push_str(indent);
+    out.push('└');
+    for i in 0..cols {
+        out.push_str(&"─".repeat(widths[i] + 2));
+        out.push(if i + 1 == cols { '┘' } else { '┴' });
+    }
+    out.push('\n');
     out
 }
 
