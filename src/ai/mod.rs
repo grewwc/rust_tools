@@ -1558,24 +1558,11 @@ impl MarkdownStreamRenderer {
                 self.table_state = TableState::None;
                 self.render_line_no_table(&format!("{indent}{header}"))
             }
-            TableState::InTable {
-                indent,
-                header,
-                align,
-                rows,
-            } => {
+            TableState::InTable { indent, widths, .. } => {
                 let indent = indent.clone();
-                let header = std::mem::take(header);
-                let align = std::mem::take(align);
-                let rows = std::mem::take(rows);
+                let widths = std::mem::take(widths);
                 self.table_state = TableState::None;
-                let mut out = String::new();
-                if !self.bol {
-                    out.push('\n');
-                    self.bol = true;
-                }
-                out.push_str(&render_table(&indent, &header, &align, &rows));
-                out
+                render_table_bottom(&indent, &widths)
             }
         };
         if !rendered.is_empty() {
@@ -1586,7 +1573,8 @@ impl MarkdownStreamRenderer {
     }
 
     fn consume_line(&mut self, line: &str) -> String {
-        match &mut self.table_state {
+        let state = std::mem::replace(&mut self.table_state, TableState::None);
+        match state {
             TableState::None => {
                 if is_table_row_candidate(line) {
                     let mut out = String::new();
@@ -1605,45 +1593,43 @@ impl MarkdownStreamRenderer {
             }
             TableState::PendingHeader { indent, header_line } => {
                 if is_table_separator(line) {
-                    let header_cells = parse_table_row(header_line);
+                    let header_cells = parse_table_row(&header_line);
                     let align = parse_table_align(line, header_cells.len());
+                    let widths = compute_table_widths(&indent, &header_cells);
                     self.table_state = TableState::InTable {
                         indent: indent.clone(),
-                        header: header_cells,
-                        align,
-                        rows: Vec::new(),
+                        widths: widths.clone(),
+                        align: align.clone(),
                     };
-                    return String::new();
+                    let mut out = String::new();
+                    out.push_str(&render_table_top(&indent, &widths));
+                    out.push_str(&render_table_header(&indent, &header_cells, &align, &widths));
+                    out.push_str(&render_table_mid(&indent, &widths));
+                    return out;
                 }
 
-                let header = std::mem::take(header_line);
-                let header_indent = std::mem::take(indent);
-                self.table_state = TableState::None;
-
                 let mut out = String::new();
-                out.push_str(&self.render_line_no_table(&format!("{header_indent}{header}")));
+                out.push_str(&self.render_line_no_table(&format!("{indent}{header_line}")));
                 out.push_str(&self.consume_line(line));
                 out
             }
             TableState::InTable {
                 indent,
-                header,
+                widths,
                 align,
-                rows,
             } => {
                 if is_table_row(line) {
-                    rows.push(parse_table_row(line));
-                    return String::new();
+                    let row = parse_table_row(line);
+                    self.table_state = TableState::InTable {
+                        indent: indent.clone(),
+                        widths: widths.clone(),
+                        align: align.clone(),
+                    };
+                    return render_table_row(&indent, &row, &align, &widths);
                 }
 
-                let indent = indent.clone();
-                let header = std::mem::take(header);
-                let align = std::mem::take(align);
-                let rows = std::mem::take(rows);
-                self.table_state = TableState::None;
-
                 let mut out = String::new();
-                out.push_str(&render_table(&indent, &header, &align, &rows));
+                out.push_str(&render_table_bottom(&indent, &widths));
                 out.push_str(&self.consume_line(line));
                 out
             }
@@ -1716,9 +1702,8 @@ enum TableState {
     PendingHeader { indent: String, header_line: String },
     InTable {
         indent: String,
-        header: Vec<String>,
+        widths: Vec<usize>,
         align: Vec<TableAlign>,
-        rows: Vec<Vec<String>>,
     },
 }
 
@@ -2029,94 +2014,79 @@ fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn render_table(indent: &str, header: &[String], align: &[TableAlign], rows: &[Vec<String>]) -> String {
-    let cols = header.len().max(
-        rows.iter().map(|r| r.len()).max().unwrap_or(0)
-    );
-    if cols < 2 {
-        return String::new();
+fn compute_table_widths(indent: &str, header: &[String]) -> Vec<usize> {
+    let cols = header.len();
+    if cols == 0 {
+        return Vec::new();
     }
 
-    let mut widths = vec![0usize; cols];
+    let mut widths = vec![3usize; cols];
     for (i, cell) in header.iter().enumerate() {
         widths[i] = widths[i].max(visible_width(cell));
     }
-    for row in rows {
-        for i in 0..cols {
-            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-            widths[i] = widths[i].max(visible_width(cell));
-        }
-    }
     for w in &mut widths {
-        *w = (*w).max(3).min(60);
+        *w = (*w).max(3);
     }
 
     let term_cols = terminal_width();
     let indent_w = UnicodeWidthStr::width(indent);
     let max_total = term_cols.saturating_sub(indent_w).max(20);
     let avail = max_total.saturating_sub(3 * cols + 1);
-    if avail > 0 {
-        let min_w = 3usize;
-        let mut sum = widths.iter().sum::<usize>();
-        if avail < min_w * cols {
-            let base = (avail / cols).max(1);
-            let mut rem = avail.saturating_sub(base * cols);
-            for w in &mut widths {
-                *w = base;
-                if rem > 0 {
-                    *w += 1;
-                    rem -= 1;
+    if avail == 0 {
+        return widths;
+    }
+
+    let min_w = 3usize;
+    let mut sum = widths.iter().sum::<usize>();
+    if avail < min_w * cols {
+        let base = (avail / cols).max(1);
+        let mut rem = avail.saturating_sub(base * cols);
+        for w in &mut widths {
+            *w = base;
+            if rem > 0 {
+                *w += 1;
+                rem -= 1;
+            }
+        }
+        return widths;
+    }
+
+    if sum > avail {
+        let mut indices = (0..cols).collect::<Vec<_>>();
+        indices.sort_by_key(|&i| std::cmp::Reverse(widths[i]));
+        let mut excess = sum - avail;
+        while excess > 0 {
+            let mut changed = false;
+            for &i in &indices {
+                if excess == 0 {
+                    break;
+                }
+                if widths[i] > min_w {
+                    let reducible = widths[i] - min_w;
+                    let delta = reducible.min(excess);
+                    widths[i] -= delta;
+                    excess -= delta;
+                    changed = true;
                 }
             }
-        } else if sum > avail {
-            let mut indices = (0..cols).collect::<Vec<_>>();
-            indices.sort_by_key(|&i| std::cmp::Reverse(widths[i]));
-            let mut excess = sum - avail;
-            while excess > 0 {
-                let mut changed = false;
-                for &i in &indices {
-                    if excess == 0 {
-                        break;
-                    }
-                    if widths[i] > min_w {
-                        let reducible = widths[i] - min_w;
-                        let delta = reducible.min(excess);
-                        widths[i] -= delta;
-                        excess -= delta;
-                        changed = true;
-                    }
-                }
-                if !changed {
-                    break;
-                }
-                sum = widths.iter().sum::<usize>();
-                if sum <= avail {
-                    break;
-                }
+            if !changed {
+                break;
+            }
+            sum = widths.iter().sum::<usize>();
+            if sum <= avail {
+                break;
             }
         }
     }
 
-    let header_lines = header
-        .iter()
-        .enumerate()
-        .map(|(i, cell)| wrap_md_cell(cell, widths[i]))
-        .collect::<Vec<_>>();
-    let header_height = header_lines.iter().map(|c| c.len()).max().unwrap_or(1);
+    widths
+}
 
-    let rows_lines = rows
-        .iter()
-        .map(|row| {
-            (0..cols)
-                .map(|i| wrap_md_cell(row.get(i).map(|s| s.as_str()).unwrap_or(""), widths[i]))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-    let row_heights = rows_lines
-        .iter()
-        .map(|r| r.iter().map(|c| c.len()).max().unwrap_or(1))
-        .collect::<Vec<_>>();
-
+fn render_table_top(indent: &str, widths: &[usize]) -> String {
+    let cols = widths.len();
+    if cols < 2 {
+        return String::new();
+    }
     let mut out = String::new();
     out.push_str(indent);
     out.push('┌');
@@ -2125,7 +2095,55 @@ fn render_table(indent: &str, header: &[String], align: &[TableAlign], rows: &[V
         out.push(if i + 1 == cols { '┐' } else { '┬' });
     }
     out.push('\n');
+    out
+}
 
+fn render_table_mid(indent: &str, widths: &[usize]) -> String {
+    let cols = widths.len();
+    if cols < 2 {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str(indent);
+    out.push('├');
+    for i in 0..cols {
+        out.push_str(&"─".repeat(widths[i] + 2));
+        out.push(if i + 1 == cols { '┤' } else { '┼' });
+    }
+    out.push('\n');
+    out
+}
+
+fn render_table_bottom(indent: &str, widths: &[usize]) -> String {
+    let cols = widths.len();
+    if cols < 2 {
+        return String::new();
+    }
+    let mut out = String::new();
+    out.push_str(indent);
+    out.push('└');
+    for i in 0..cols {
+        out.push_str(&"─".repeat(widths[i] + 2));
+        out.push(if i + 1 == cols { '┘' } else { '┴' });
+    }
+    out.push('\n');
+    out
+}
+
+fn render_table_header(indent: &str, header: &[String], align: &[TableAlign], widths: &[usize]) -> String {
+    let cols = widths.len();
+    if cols < 2 {
+        return String::new();
+    }
+
+    let header_lines = header
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| wrap_md_cell(cell, *widths.get(i).unwrap_or(&3)))
+        .collect::<Vec<_>>();
+    let header_height = header_lines.iter().map(|c| c.len()).max().unwrap_or(1);
+
+    let mut out = String::new();
     for line_idx in 0..header_height {
         out.push_str(indent);
         out.push('│');
@@ -2135,8 +2153,11 @@ fn render_table(indent: &str, header: &[String], align: &[TableAlign], rows: &[V
                 .and_then(|ls| ls.get(line_idx))
                 .map(|s| s.as_str())
                 .unwrap_or("");
-            let padded =
-                pad_cell(cell_line, widths[i], align.get(i).copied().unwrap_or(TableAlign::Left));
+            let padded = pad_cell(
+                cell_line,
+                widths[i],
+                align.get(i).copied().unwrap_or(TableAlign::Left),
+            );
             out.push(' ');
             out.push_str("\x1b[1m\x1b[36m");
             out.push_str(&render_inline_md(&padded, "\x1b[1m\x1b[36m"));
@@ -2146,44 +2167,42 @@ fn render_table(indent: &str, header: &[String], align: &[TableAlign], rows: &[V
         }
         out.push('\n');
     }
+    out
+}
 
-    out.push_str(indent);
-    out.push('├');
-    for i in 0..cols {
-        out.push_str(&"─".repeat(widths[i] + 2));
-        out.push(if i + 1 == cols { '┤' } else { '┼' });
+fn render_table_row(indent: &str, row: &[String], align: &[TableAlign], widths: &[usize]) -> String {
+    let cols = widths.len();
+    if cols < 2 {
+        return String::new();
     }
-    out.push('\n');
 
-    for (row_idx, row) in rows_lines.iter().enumerate() {
-        let height = row_heights.get(row_idx).copied().unwrap_or(1);
-        for line_idx in 0..height {
-            out.push_str(indent);
+    let wrapped = (0..cols)
+        .map(|i| wrap_md_cell(row.get(i).map(|s| s.as_str()).unwrap_or(""), widths[i]))
+        .collect::<Vec<_>>();
+    let height = wrapped.iter().map(|c| c.len()).max().unwrap_or(1);
+
+    let mut out = String::new();
+    for line_idx in 0..height {
+        out.push_str(indent);
+        out.push('│');
+        for i in 0..cols {
+            let cell_line = wrapped
+                .get(i)
+                .and_then(|ls| ls.get(line_idx))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let padded = pad_cell(
+                cell_line,
+                widths[i],
+                align.get(i).copied().unwrap_or(TableAlign::Left),
+            );
+            out.push(' ');
+            out.push_str(&render_inline_md(&padded, ""));
+            out.push(' ');
             out.push('│');
-            for i in 0..cols {
-                let cell_line = row
-                    .get(i)
-                    .and_then(|ls| ls.get(line_idx))
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                let padded =
-                    pad_cell(cell_line, widths[i], align.get(i).copied().unwrap_or(TableAlign::Left));
-                out.push(' ');
-                out.push_str(&render_inline_md(&padded, ""));
-                out.push(' ');
-                out.push('│');
-            }
-            out.push('\n');
         }
+        out.push('\n');
     }
-
-    out.push_str(indent);
-    out.push('└');
-    for i in 0..cols {
-        out.push_str(&"─".repeat(widths[i] + 2));
-        out.push(if i + 1 == cols { '┘' } else { '┴' });
-    }
-    out.push('\n');
     out
 }
 
