@@ -55,6 +55,26 @@ fn image_to_base64(img: &image::DynamicImage) -> Result<String, Box<dyn std::err
     Ok(general_purpose::STANDARD.encode(&buf))
 }
 
+/// Bridge: read image from native clipboard, re-encode as base64 TEXT in clipboard.
+/// Run this on your LOCAL machine so that `oo -p` on a remote SSH server can
+/// retrieve the image via OSC52 (which only carries text).
+pub fn bridge_image_to_text_clipboard() -> Result<(), Box<dyn std::error::Error>> {
+    let mut clipboard = Clipboard::new()?;
+    let image = clipboard.get_image()?;
+    let data = image.bytes.to_vec();
+    let img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
+        image.width as u32,
+        image.height as u32,
+        data,
+    )
+    .ok_or("failed to create image buffer")?;
+    let dynamic = image::DynamicImage::ImageRgba8(img_buf);
+    let b64 = image_to_base64(&dynamic)?;
+    clipboard.set_text(b64)?;
+    println!("Image encoded as text in clipboard — ready for `oo -p` on remote.");
+    Ok(())
+}
+
 pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let fname: String = add_suffix(fname, ".jpg", || !fname.contains('.'));
 
