@@ -28,3 +28,4 @@ rustyline = "15.0.0"
 ratatui = "0.29"
 crossterm = "0.28"
 tui-textarea = { version = "0.7", features = ["crossterm"] }
+rust_decimal = "1"
