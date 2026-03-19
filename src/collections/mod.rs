@@ -1,5 +1,10 @@
+pub mod graph;
 pub mod lru_cache;
 pub mod queue;
+pub mod rb_tree;
 pub mod stack;
+pub mod tree_map;
+pub mod tree_set;
 pub mod trie;
 pub mod uf;
+pub mod zset;

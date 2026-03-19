@@ -1,4 +1,4 @@
-BINS = a configw his j oo re
+BINS = a configw his j ns oo re
 
 all:
 	cargo build --release $(addprefix --bin ,$(BINS))

@@ -165,14 +165,23 @@ struct App {
     attached_binary_files: Vec<String>,
     uploaded_file_ids: Vec<String>,
     shutdown: Arc<AtomicBool>,
+    streaming: Arc<AtomicBool>,
+    cancel_stream: Arc<AtomicBool>,
     raw_args: String,
     writer: Option<File>,
     prompt_editor: Option<PromptEditor>,
 }
 
 struct PromptEditor {
-    editor: DefaultEditor,
+    editor: Option<DefaultEditor>,
     history_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct MultilineHistoryState {
+    entries: Vec<String>,
+    index: Option<usize>,
+    draft: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,6 +201,12 @@ struct FileParseResult {
     text_files: Vec<String>,
     image_files: Vec<String>,
     binary_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    Completed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -236,8 +251,24 @@ struct UploadResponse {
     id: String,
 }
 
+fn normalize_single_dash_long_opts(args: impl Iterator<Item = String>) -> Vec<String> {
+    args.map(|arg| {
+        let bytes = arg.as_bytes();
+        if bytes.len() > 2
+            && bytes[0] == b'-'
+            && bytes[1] != b'-'
+            && bytes[1].is_ascii_alphabetic()
+        {
+            format!("-{arg}")
+        } else {
+            arg
+        }
+    })
+    .collect()
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(normalize_single_dash_long_opts(std::env::args()));
     let config = load_config()?;
 
     if cli.clear {
@@ -247,9 +278,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
+    let streaming = Arc::new(AtomicBool::new(false));
+    let cancel_stream = Arc::new(AtomicBool::new(false));
     let signal_flag = Arc::clone(&shutdown);
+    let streaming_flag = Arc::clone(&streaming);
+    let cancel_stream_flag = Arc::clone(&cancel_stream);
     ctrlc::set_handler(move || {
-        signal_flag.store(true, Ordering::SeqCst);
+        handle_sigint(
+            signal_flag.as_ref(),
+            streaming_flag.as_ref(),
+            cancel_stream_flag.as_ref(),
+        );
     })?;
 
     let writer = open_output_writer(cli.out.as_deref())?;
@@ -257,13 +296,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let client = Client::builder().build()?;
     let raw_args = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     let prompt_editor = if cli.args.is_empty() {
-        match PromptEditor::new() {
-            Ok(editor) => Some(editor),
-            Err(err) => {
-                eprintln!("line editor unavailable, fallback to stdin: {err}");
-                None
-            }
-        }
+        Some(PromptEditor::new())
     } else {
         None
     };
@@ -285,6 +318,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         attached_binary_files: Vec::new(),
         uploaded_file_ids: Vec::new(),
         shutdown,
+        streaming,
+        cancel_stream,
         writer,
         prompt_editor,
     };
@@ -331,20 +366,37 @@ fn open_output_writer(path: Option<&str>) -> io::Result<Option<File>> {
 }
 
 impl PromptEditor {
-    fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let mut editor = DefaultEditor::new()?;
+    fn new() -> Self {
+        let mut editor = DefaultEditor::new().ok();
         let history_path = PathBuf::from(expanduser(LINE_REPL_HISTORY_FILE).as_ref());
-        if history_path.exists() {
+        if history_path.exists()
+            && let Some(editor) = editor.as_mut()
+        {
             let _ = editor.load_history(&history_path);
         }
-        Ok(Self {
+        Self {
             editor,
             history_path,
-        })
+        }
     }
 
     fn read_single_line(&mut self) -> io::Result<Option<String>> {
-        match self.editor.readline("> ") {
+        let Some(editor) = self.editor.as_mut() else {
+            print!("> ");
+            io::stdout().flush()?;
+            let mut line = String::new();
+            match io::stdin().read_line(&mut line) {
+                Ok(0) => return Ok(None),
+                Ok(_) => return Ok(Some(trim_trailing_newline(line))),
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                    println!("Exit.");
+                    return Ok(None);
+                }
+                Err(err) => return Err(err),
+            }
+        };
+
+        match editor.readline("> ") {
             Ok(line) => {
                 self.save_history_entry(&line);
                 Ok(Some(line))
@@ -380,89 +432,236 @@ impl PromptEditor {
         Ok(Some(content))
     }
 
+    fn multiline_history_entries(&self) -> Vec<String> {
+        self.editor
+            .as_ref()
+            .map(|editor| {
+                editor
+                    .history()
+                    .iter()
+                    .filter(|entry| !entry.trim().is_empty())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn read_multi_line_tui(&mut self) -> io::Result<Option<String>> {
         use crossterm::{
-            event::{self, Event, KeyCode, KeyModifiers},
-            terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size},
+            event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+            execute,
+            terminal::{
+                EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+            },
         };
         use ratatui::{
-            Terminal, TerminalOptions, Viewport, backend::CrosstermBackend,
+            Terminal,
+            backend::CrosstermBackend,
             layout::{Constraint, Direction, Layout},
             style::{Color, Style},
             text::{Line, Span},
             widgets::{Block, Borders, Paragraph},
         };
-        use tui_textarea::{Input, TextArea};
+        use tui_textarea::{CursorMove, Input, TextArea};
 
-        // Render inline so the previous output above stays visible.
-        let term_height = terminal_size().map(|(_, h)| h).unwrap_or(24);
-        let inline_height = (term_height / 2).max(8).min(20);
-
-        enable_raw_mode()?;
-        let result: io::Result<Option<String>> = (|| {
-            let backend = CrosstermBackend::new(io::stdout());
-            let mut terminal = Terminal::with_options(
-                backend,
-                TerminalOptions { viewport: Viewport::Inline(inline_height) },
-            )
-            .map_err(|e| io::Error::other(e.to_string()))?;
-            let mut textarea: TextArea = TextArea::default();
+        // Let the user read the previous output before switching to alternate screen.
+        {
+            use crossterm::{
+                event::{self, Event, KeyCode, KeyEventKind},
+                terminal::{disable_raw_mode, enable_raw_mode},
+            };
+            print!("\x1b[2m[Press Enter to compose next message, Ctrl+D/Ctrl+C to quit]\x1b[0m ");
+            io::stdout().flush()?;
+            enable_raw_mode()?;
             loop {
-                terminal.draw(|f| {
-                    let area = f.area();
-                    let chunks = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([Constraint::Min(3), Constraint::Length(1)])
-                        .split(area);
-                    let n = textarea.lines().len();
-                    textarea.set_block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_style(Style::default().fg(Color::Cyan))
-                            .title(format!(" Message ({n} line{}) ", if n == 1 { "" } else { "s" })),
-                    );
-                    f.render_widget(&textarea, chunks[0]);
-                    f.render_widget(
-                        Paragraph::new(Line::from(vec![
-                            Span::raw("  "),
-                            Span::styled("Enter", Style::default().fg(Color::Blue)),
-                            Span::raw(" newline  ·  "),
-                            Span::styled("Ctrl+D", Style::default().fg(Color::Green)),
-                            Span::raw(" send  ·  "),
-                            Span::styled("Esc", Style::default().fg(Color::Yellow)),
-                            Span::raw(" cancel"),
-                        ])),
-                        chunks[1],
-                    );
-                })
-                .map_err(|e| io::Error::other(e.to_string()))?;
-
-                match event::read().map_err(|e| io::Error::other(e.to_string()))? {
-                    Event::Key(key) => match (key.code, key.modifiers) {
-                        (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
-                            let content = textarea.lines().join("\n");
-                            let trimmed = content.trim_end_matches('\n').to_string();
-                            let _ = terminal.clear();
-                            return Ok(if trimmed.trim().is_empty() { None } else { Some(trimmed) });
+                match event::read() {
+                    Ok(Event::Key(key))
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
+                        match key.code {
+                            KeyCode::Enter => break,
+                            KeyCode::Char('d')
+                                if key.modifiers
+                                    == crossterm::event::KeyModifiers::CONTROL =>
+                            {
+                                let _ = disable_raw_mode();
+                                println!();
+                                return Ok(None);
+                            }
+                            KeyCode::Char('c')
+                                if key.modifiers
+                                    == crossterm::event::KeyModifiers::CONTROL =>
+                            {
+                                let _ = disable_raw_mode();
+                                println!();
+                                return Ok(None);
+                            }
+                            _ => {}
                         }
-                        (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                            let _ = terminal.clear();
-                            return Ok(None);
-                        }
-                        _ => {
-                            textarea.input(Input::from(key));
-                        }
-                    },
-                    _ => {}
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        let _ = disable_raw_mode();
+                        return Err(io::Error::other(e.to_string()));
+                    }
                 }
             }
+            let _ = disable_raw_mode();
+            println!();
+        }
+
+        enable_raw_mode()?;
+
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen).map_err(|e| io::Error::other(e.to_string()))?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = match Terminal::new(backend) {
+            Ok(terminal) => terminal,
+            Err(err) => {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                return Err(io::Error::other(err.to_string()));
+            }
+        };
+
+        let result: io::Result<Option<String>> = (|| {
+            let mut textarea: TextArea = TextArea::default();
+            let mut history = MultilineHistoryState::new(self.multiline_history_entries());
+
+            let outcome = loop {
+                terminal
+                    .draw(|f| {
+                        let area = f.area();
+                        let chunks = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Min(3), Constraint::Length(2)])
+                            .split(area);
+
+                        let n = textarea.lines().len();
+                        textarea.set_block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(Color::Cyan))
+                                .title(format!(
+                                    " Message ({n} line{}) ",
+                                    if n == 1 { "" } else { "s" }
+                                )),
+                        );
+                        f.render_widget(&textarea, chunks[0]);
+                        f.render_widget(
+                            Paragraph::new(vec![
+                                Line::from(vec![
+                                    Span::raw("  "),
+                                    Span::styled("Enter", Style::default().fg(Color::Blue)),
+                                    Span::raw(" newline  ·  "),
+                                    Span::styled("Ctrl+D", Style::default().fg(Color::Green)),
+                                    Span::raw(" send  ·  "),
+                                    Span::styled("Ctrl+C/Esc", Style::default().fg(Color::Yellow)),
+                                    Span::raw(" cancel"),
+                                ]),
+                                Line::from(vec![
+                                    Span::raw("  "),
+                                    Span::styled("Up/Down edge", Style::default().fg(Color::Blue)),
+                                    Span::raw(" or "),
+                                    Span::styled("Ctrl+P/N", Style::default().fg(Color::Blue)),
+                                    Span::raw(" history  ·  "),
+                                    Span::styled("Backspace", Style::default().fg(Color::Blue)),
+                                    Span::raw(" edits previous lines"),
+                                ]),
+                            ]),
+                            chunks[1],
+                        );
+                    })
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+
+                match event::read().map_err(|e| io::Error::other(e.to_string()))? {
+                    Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                        match (key.code, key.modifiers) {
+                            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                                let content = textarea_content(&textarea);
+                                let trimmed = content.trim_end_matches('\n').to_string();
+                                break Ok(if trimmed.trim().is_empty() {
+                                    None
+                                } else {
+                                    Some(trimmed)
+                                });
+                            }
+                            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                                break Ok(None);
+                            }
+                            _ => {
+                                let handled = match (key.code, key.modifiers) {
+                                    (KeyCode::Up, modifiers)
+                                        if modifiers.is_empty() && textarea.cursor().0 == 0 =>
+                                    {
+                                        if let Some(content) = history.previous(&textarea_content(&textarea)) {
+                                            replace_textarea_content(&mut textarea, &content);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    (KeyCode::Down, modifiers)
+                                        if modifiers.is_empty()
+                                            && textarea.cursor().0 + 1 >= textarea.lines().len() =>
+                                    {
+                                        if let Some(content) = history.next() {
+                                            replace_textarea_content(&mut textarea, &content);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                                        if let Some(content) = history.previous(&textarea_content(&textarea)) {
+                                            replace_textarea_content(&mut textarea, &content);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                                        if let Some(content) = history.next() {
+                                            replace_textarea_content(&mut textarea, &content);
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    }
+                                    _ => false,
+                                };
+
+                                if handled {
+                                    textarea.move_cursor(CursorMove::Bottom);
+                                    textarea.move_cursor(CursorMove::End);
+                                    continue;
+                                }
+
+                                textarea.input(Input::from(key));
+                            }
+                        }
+                    }
+                    Event::Key(_) => {}
+                    _ => {}
+                }
+            };
+            outcome
         })();
 
         let _ = disable_raw_mode();
+        let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = terminal.show_cursor();
 
         let result = result?;
         if let Some(content) = &result {
             self.save_history_entry(content);
+            let mut lines = content.lines();
+            if let Some(first) = lines.next() {
+                println!("\x1b[2m> {first}\x1b[0m");
+            }
+            for line in lines {
+                println!("\x1b[2m  {line}\x1b[0m");
+            }
         }
         Ok(result)
     }
@@ -471,12 +670,72 @@ impl PromptEditor {
         if entry.trim().is_empty() {
             return;
         }
-        let _ = self.editor.add_history_entry(entry);
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+
+        let _ = editor.add_history_entry(entry);
         if let Some(parent) = self.history_path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = self.editor.save_history(&self.history_path);
+        let _ = editor.save_history(&self.history_path);
     }
+}
+
+impl MultilineHistoryState {
+    fn new(entries: Vec<String>) -> Self {
+        Self {
+            entries,
+            index: None,
+            draft: None,
+        }
+    }
+
+    fn previous(&mut self, current: &str) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+
+        let next_index = match self.index {
+            Some(0) => return None,
+            Some(index) => index - 1,
+            None => {
+                self.draft = Some(current.to_string());
+                self.entries.len() - 1
+            }
+        };
+        self.index = Some(next_index);
+        self.entries.get(next_index).cloned()
+    }
+
+    fn next(&mut self) -> Option<String> {
+        let index = self.index?;
+        if index + 1 < self.entries.len() {
+            self.index = Some(index + 1);
+            return self.entries.get(index + 1).cloned();
+        }
+
+        self.index = None;
+        Some(self.draft.take().unwrap_or_default())
+    }
+}
+
+fn textarea_content(textarea: &tui_textarea::TextArea<'_>) -> String {
+    textarea.lines().join("\n")
+}
+
+fn replace_textarea_content(textarea: &mut tui_textarea::TextArea<'_>, content: &str) {
+    let lines = content.split('\n').map(|line| line.to_string()).collect();
+    *textarea = tui_textarea::TextArea::new(lines);
+}
+
+fn handle_sigint(shutdown: &AtomicBool, streaming: &AtomicBool, cancel_stream: &AtomicBool) {
+    if streaming.load(Ordering::SeqCst) {
+        cancel_stream.store(true, Ordering::SeqCst);
+        return;
+    }
+
+    shutdown.store(true, Ordering::SeqCst);
 }
 
 fn initial_model(cli: &Cli) -> String {
@@ -603,10 +862,30 @@ fn run_loop(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         let next_model = resolve_model_for_input(app, &mut question);
         app.current_model = next_model.clone();
 
+        app.cancel_stream.store(false, Ordering::SeqCst);
         let mut current_history = format!("user{COLON}{question}{NEWLINE}assistant{COLON}");
         let mut response = do_request(app, &next_model, &question, ctx.history_count)?;
         print_info(&next_model);
-        stream_response(app, &mut response, &mut current_history)?;
+        app.streaming.store(true, Ordering::SeqCst);
+        let outcome = match stream_response(app, &mut response, &mut current_history) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                app.streaming.store(false, Ordering::SeqCst);
+                return Err(err);
+            }
+        };
+        app.streaming.store(false, Ordering::SeqCst);
+        if outcome == StreamOutcome::Cancelled {
+            println!("\nInterrupted.");
+            if should_quit {
+                return Ok(());
+            }
+            continue;
+        }
+        if app.shutdown.load(Ordering::SeqCst) {
+            println!();
+            return Ok(());
+        }
         response.copy_to(&mut io::sink())?;
         current_history.push(NEWLINE);
         append_history(&app.config.history_file, &current_history)?;
@@ -1054,7 +1333,7 @@ fn stream_response(
     app: &mut App,
     response: &mut Response,
     current_history: &mut String,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<StreamOutcome, Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let thinking_tag = "<thinking>".yellow().to_string();
     let end_thinking_tag = "<end thinking>".yellow().to_string();
@@ -1062,8 +1341,34 @@ fn stream_response(
     let mut line = String::new();
 
     while !app.shutdown.load(Ordering::SeqCst) {
+        if take_stream_cancelled(app) {
+            return Ok(StreamOutcome::Cancelled);
+        }
         line.clear();
-        let n = reader.read_line(&mut line)?;
+        let n = match reader.read_line(&mut line) {
+            Ok(n) => n,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                if take_stream_cancelled(app) {
+                    return Ok(StreamOutcome::Cancelled);
+                }
+                if app.shutdown.load(Ordering::SeqCst) {
+                    return Ok(StreamOutcome::Cancelled);
+                }
+                continue;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                if take_stream_cancelled(app) {
+                    return Ok(StreamOutcome::Cancelled);
+                }
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        };
         if n == 0 {
             break;
         }
@@ -1102,7 +1407,15 @@ fn stream_response(
         current_history.push_str(text);
     }
 
-    Ok(())
+    if take_stream_cancelled(app) {
+        return Ok(StreamOutcome::Cancelled);
+    }
+
+    Ok(StreamOutcome::Completed)
+}
+
+fn take_stream_cancelled(app: &App) -> bool {
+    app.cancel_stream.swap(false, Ordering::SeqCst)
 }
 
 fn extract_chunk_text(
@@ -1253,6 +1566,7 @@ fn levenshtein(left: &[u8], right: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn selector_mapping_matches_go() {
@@ -1364,5 +1678,44 @@ mod tests {
         let text = extract_chunk_text(&chunk, "<thinking>", "<end thinking>", &mut thinking_open);
         assert_eq!(text, "\n<end thinking>\nfinal");
         assert!(!thinking_open);
+    }
+
+    #[test]
+    fn multiline_history_navigation_restores_draft() {
+        let mut history = MultilineHistoryState::new(vec![
+            "first".to_string(),
+            "second\nline".to_string(),
+        ]);
+
+        assert_eq!(history.previous("draft"), Some("second\nline".to_string()));
+        assert_eq!(history.previous("ignored"), Some("first".to_string()));
+        assert_eq!(history.previous("ignored"), None);
+        assert_eq!(history.next(), Some("second\nline".to_string()));
+        assert_eq!(history.next(), Some("draft".to_string()));
+        assert_eq!(history.next(), None);
+    }
+
+    #[test]
+    fn sigint_during_stream_only_cancels_current_reply() {
+        let shutdown = AtomicBool::new(false);
+        let streaming = AtomicBool::new(true);
+        let cancel_stream = AtomicBool::new(false);
+
+        handle_sigint(&shutdown, &streaming, &cancel_stream);
+
+        assert!(!shutdown.load(Ordering::SeqCst));
+        assert!(cancel_stream.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn sigint_while_idle_requests_shutdown() {
+        let shutdown = AtomicBool::new(false);
+        let streaming = AtomicBool::new(false);
+        let cancel_stream = AtomicBool::new(false);
+
+        handle_sigint(&shutdown, &streaming, &cancel_stream);
+
+        assert!(shutdown.load(Ordering::SeqCst));
+        assert!(!cancel_stream.load(Ordering::SeqCst));
     }
 }
