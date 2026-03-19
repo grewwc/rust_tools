@@ -15,7 +15,7 @@ use reqwest::blocking::{Client, Response, multipart};
 use rustyline::{DefaultEditor, error::ReadlineError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::{
     clipboard::string_content,
@@ -1960,6 +1960,75 @@ fn pad_cell(s: &str, width: usize, align: TableAlign) -> String {
     }
 }
 
+fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![String::new()];
+    }
+    if s.trim().is_empty() {
+        return vec![String::new()];
+    }
+
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    let mut bold = false;
+    let mut code = false;
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    let mut lines: Vec<String> = Vec::new();
+
+    let start_new_line = |cur: &mut String, cur_w: &mut usize, bold: bool, code: bool| {
+        if bold {
+            cur.push_str("**");
+        }
+        if code {
+            cur.push('`');
+        }
+        *cur_w = 0;
+    };
+
+    let close_line = |lines: &mut Vec<String>, cur: &mut String, bold: bool, code: bool| {
+        if code {
+            cur.push('`');
+        }
+        if bold {
+            cur.push_str("**");
+        }
+        lines.push(std::mem::take(cur));
+    };
+
+    start_new_line(&mut cur, &mut cur_w, bold, code);
+
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            code = !code;
+            cur.push('`');
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            bold = !bold;
+            cur.push_str("**");
+            i += 2;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap();
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cur_w > 0 && cur_w + w > width {
+            close_line(&mut lines, &mut cur, bold, code);
+            start_new_line(&mut cur, &mut cur_w, bold, code);
+        }
+        cur.push(ch);
+        cur_w += w;
+        i += ch.len_utf8();
+    }
+
+    close_line(&mut lines, &mut cur, bold, code);
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 fn render_table(indent: &str, header: &[String], align: &[TableAlign], rows: &[Vec<String>]) -> String {
     let cols = header.len().max(
         rows.iter().map(|r| r.len()).max().unwrap_or(0)
@@ -1982,6 +2051,72 @@ fn render_table(indent: &str, header: &[String], align: &[TableAlign], rows: &[V
         *w = (*w).max(3).min(60);
     }
 
+    let term_cols = terminal_width();
+    let indent_w = UnicodeWidthStr::width(indent);
+    let max_total = term_cols.saturating_sub(indent_w).max(20);
+    let avail = max_total.saturating_sub(3 * cols + 1);
+    if avail > 0 {
+        let min_w = 3usize;
+        let mut sum = widths.iter().sum::<usize>();
+        if avail < min_w * cols {
+            let base = (avail / cols).max(1);
+            let mut rem = avail.saturating_sub(base * cols);
+            for w in &mut widths {
+                *w = base;
+                if rem > 0 {
+                    *w += 1;
+                    rem -= 1;
+                }
+            }
+        } else if sum > avail {
+            let mut indices = (0..cols).collect::<Vec<_>>();
+            indices.sort_by_key(|&i| std::cmp::Reverse(widths[i]));
+            let mut excess = sum - avail;
+            while excess > 0 {
+                let mut changed = false;
+                for &i in &indices {
+                    if excess == 0 {
+                        break;
+                    }
+                    if widths[i] > min_w {
+                        let reducible = widths[i] - min_w;
+                        let delta = reducible.min(excess);
+                        widths[i] -= delta;
+                        excess -= delta;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
+                sum = widths.iter().sum::<usize>();
+                if sum <= avail {
+                    break;
+                }
+            }
+        }
+    }
+
+    let header_lines = header
+        .iter()
+        .enumerate()
+        .map(|(i, cell)| wrap_md_cell(cell, widths[i]))
+        .collect::<Vec<_>>();
+    let header_height = header_lines.iter().map(|c| c.len()).max().unwrap_or(1);
+
+    let rows_lines = rows
+        .iter()
+        .map(|row| {
+            (0..cols)
+                .map(|i| wrap_md_cell(row.get(i).map(|s| s.as_str()).unwrap_or(""), widths[i]))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let row_heights = rows_lines
+        .iter()
+        .map(|r| r.iter().map(|c| c.len()).max().unwrap_or(1))
+        .collect::<Vec<_>>();
+
     let mut out = String::new();
     out.push_str(indent);
     out.push('┌');
@@ -1991,19 +2126,26 @@ fn render_table(indent: &str, header: &[String], align: &[TableAlign], rows: &[V
     }
     out.push('\n');
 
-    out.push_str(indent);
-    out.push('│');
-    for i in 0..cols {
-        let cell = header.get(i).map(|s| s.as_str()).unwrap_or("");
-        let padded = pad_cell(cell, widths[i], align.get(i).copied().unwrap_or(TableAlign::Left));
-        out.push(' ');
-        out.push_str("\x1b[1m\x1b[36m");
-        out.push_str(&render_inline_md(&padded, "\x1b[1m\x1b[36m"));
-        out.push_str("\x1b[0m");
-        out.push(' ');
+    for line_idx in 0..header_height {
+        out.push_str(indent);
         out.push('│');
+        for i in 0..cols {
+            let cell_line = header_lines
+                .get(i)
+                .and_then(|ls| ls.get(line_idx))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            let padded =
+                pad_cell(cell_line, widths[i], align.get(i).copied().unwrap_or(TableAlign::Left));
+            out.push(' ');
+            out.push_str("\x1b[1m\x1b[36m");
+            out.push_str(&render_inline_md(&padded, "\x1b[1m\x1b[36m"));
+            out.push_str("\x1b[0m");
+            out.push(' ');
+            out.push('│');
+        }
+        out.push('\n');
     }
-    out.push('\n');
 
     out.push_str(indent);
     out.push('├');
@@ -2013,18 +2155,26 @@ fn render_table(indent: &str, header: &[String], align: &[TableAlign], rows: &[V
     }
     out.push('\n');
 
-    for row in rows {
-        out.push_str(indent);
-        out.push('│');
-        for i in 0..cols {
-            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-            let padded = pad_cell(cell, widths[i], align.get(i).copied().unwrap_or(TableAlign::Left));
-            out.push(' ');
-            out.push_str(&render_inline_md(&padded, ""));
-            out.push(' ');
+    for (row_idx, row) in rows_lines.iter().enumerate() {
+        let height = row_heights.get(row_idx).copied().unwrap_or(1);
+        for line_idx in 0..height {
+            out.push_str(indent);
             out.push('│');
+            for i in 0..cols {
+                let cell_line = row
+                    .get(i)
+                    .and_then(|ls| ls.get(line_idx))
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let padded =
+                    pad_cell(cell_line, widths[i], align.get(i).copied().unwrap_or(TableAlign::Left));
+                out.push(' ');
+                out.push_str(&render_inline_md(&padded, ""));
+                out.push(' ');
+                out.push('│');
+            }
+            out.push('\n');
         }
-        out.push('\n');
     }
 
     out.push_str(indent);
@@ -2035,6 +2185,29 @@ fn render_table(indent: &str, header: &[String], align: &[TableAlign], rows: &[V
     }
     out.push('\n');
     out
+}
+
+fn terminal_width() -> usize {
+    if let Some(cols) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        && cols > 0
+    {
+        return cols;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stdout().as_raw_fd();
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+        if rc == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
+        }
+    }
+
+    80
 }
 
 fn append_history(path: &PathBuf, content: &str) -> io::Result<()> {
