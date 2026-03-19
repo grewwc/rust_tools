@@ -52,7 +52,9 @@ fn stdout_is_tty() -> bool {
     unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
 }
 
-fn get_clipboard_via_osc52() -> Option<String> {
+/// Read raw bytes from clipboard via OSC52 terminal query.
+/// Returns the decoded clipboard bytes without any UTF-8 requirement.
+fn read_osc52_bytes() -> Option<Vec<u8>> {
     use std::os::unix::io::AsRawFd;
 
     if !stdin_is_tty() || !stdout_is_tty() {
@@ -107,23 +109,15 @@ fn get_clipboard_via_osc52() -> Option<String> {
         let response_str = String::from_utf8_lossy(&response);
         if let Some(start_idx) = response_str.find("]52;c;") {
             let data_start = start_idx + 6;
+            use base64::Engine as _;
+            use base64::engine::general_purpose;
             if let Some(end_idx) = response_str[data_start..].find('\x07') {
                 let base64_data = &response_str[data_start..data_start + end_idx];
-                use base64::Engine as _;
-                use base64::engine::general_purpose;
-                return general_purpose::STANDARD
-                    .decode(base64_data)
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                return general_purpose::STANDARD.decode(base64_data).ok();
             }
             if let Some(end_idx) = response_str[data_start..].find("\x1b\\") {
                 let base64_data = &response_str[data_start..data_start + end_idx];
-                use base64::Engine as _;
-                use base64::engine::general_purpose;
-                return general_purpose::STANDARD
-                    .decode(base64_data)
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok());
+                return general_purpose::STANDARD.decode(base64_data).ok();
             }
         }
         None
@@ -132,6 +126,20 @@ fn get_clipboard_via_osc52() -> Option<String> {
     unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original_termios) };
 
     result
+}
+
+fn get_clipboard_via_osc52() -> Option<String> {
+    read_osc52_bytes().and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+/// Read raw bytes from the clipboard via OSC52 terminal query (SSH sessions).
+/// Returns `None` if not in an SSH session or the terminal does not respond.
+pub fn get_clipboard_raw_bytes_via_osc52() -> Option<Vec<u8>> {
+    if is_ssh_session() {
+        read_osc52_bytes()
+    } else {
+        None
+    }
 }
 
 pub fn save_to_file(fname: &str) -> io::Result<()> {

@@ -58,37 +58,39 @@ fn image_to_base64(img: &image::DynamicImage) -> Result<String, Box<dyn std::err
 pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let fname: String = add_suffix(fname, ".jpg", || !fname.contains('.'));
 
-    // Helper function to try saving from clipboard via OSC 52
+    // Helper function to try saving from clipboard via OSC 52.
+    // Handles two cases:
+    //   1. Native local image copy: terminal responds with base64(raw_image_bytes).
+    //   2. oo -c image copy: terminal responds with base64(base64(image_bytes)) —
+    //      the clipboard text is itself a base64 string that wraps the image.
     fn try_osc52_save(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
-        if !is_ssh_session() {
-            return Err(Box::new(io::Error::other("not ssh session")));
+        let raw_bytes = crate::clipboard::string_content::get_clipboard_raw_bytes_via_osc52()
+            .ok_or_else(|| io::Error::other("no clipboard data via OSC52"))?;
+
+        // Case 1: raw_bytes are directly a valid image (native clipboard copy).
+        if let Ok(img) = image::load_from_memory(&raw_bytes) {
+            img.save(fname)?;
+            println!("save to file: {fname}");
+            return Ok(());
         }
 
-        let content = crate::clipboard::string_content::get_clipboard_content();
-        if content.is_empty() {
-            return Err(Box::new(io::Error::other("no image in clipboard")));
-        }
-
-        // Clean content just in case
-        let clean_content = content.replace(['\n', '\r'], "");
-
+        // Case 2: raw_bytes are a UTF-8 base64 string (from oo -c bridge).
         use base64::Engine as _;
         use base64::engine::general_purpose;
-        match general_purpose::STANDARD.decode(&clean_content) {
-            Ok(data) => {
-                let img = image::load_from_memory(&data).map_err(|e| {
-                    let msg = format!("failed to load image from clipboard data: {}", e);
-                    io::Error::new(io::ErrorKind::InvalidData, msg)
-                })?;
-                img.save(fname)?;
-                println!("save to file: {fname}");
-                Ok(())
-            }
-            Err(e) => {
-                let msg = format!("failed to decode image from clipboard: {}", e);
-                Err(Box::new(io::Error::new(io::ErrorKind::InvalidData, msg)))
-            }
-        }
+        let b64_str = std::str::from_utf8(&raw_bytes)
+            .map(|s| s.replace(['\n', '\r'], ""))
+            .map_err(|_| io::Error::other("clipboard data is not a valid image or base64 string"))?;
+        let data = general_purpose::STANDARD.decode(&b64_str).map_err(|e| {
+            let msg = format!("failed to decode clipboard base64: {}", e);
+            io::Error::new(io::ErrorKind::InvalidData, msg)
+        })?;
+        let img = image::load_from_memory(&data).map_err(|e| {
+            let msg = format!("failed to load image from clipboard data: {}", e);
+            io::Error::new(io::ErrorKind::InvalidData, msg)
+        })?;
+        img.save(fname)?;
+        println!("save to file: {fname}");
+        Ok(())
     }
 
     match Clipboard::new() {
