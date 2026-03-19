@@ -1357,6 +1357,7 @@ fn stream_response(
     let thinking_tag = "<thinking>".yellow().to_string();
     let end_thinking_tag = "<end thinking>".yellow().to_string();
     let mut thinking_open = false;
+    let mut markdown = MarkdownStreamRenderer::new();
     let mut line = String::new();
 
     while !app.shutdown.load(Ordering::SeqCst) {
@@ -1417,7 +1418,7 @@ fn stream_response(
         if content.is_empty() {
             continue;
         }
-        write_stream_content(content.as_str(), app.writer.as_mut())?;
+        write_stream_content(content.as_str(), app.writer.as_mut(), &mut markdown)?;
         if thinking_open {
             continue;
         }
@@ -1463,14 +1464,225 @@ fn extract_chunk_text(
     delta.content.clone()
 }
 
-fn write_stream_content(content: &str, mut writer: Option<&mut File>) -> io::Result<()> {
-    print!("{content}");
-    io::stdout().flush()?;
+fn write_stream_content(
+    content: &str,
+    mut writer: Option<&mut File>,
+    markdown: &mut MarkdownStreamRenderer,
+) -> io::Result<()> {
     if let Some(file) = writer.as_mut() {
         file.write_all(content.as_bytes())?;
         file.flush()?;
     }
-    Ok(())
+
+    if markdown.should_render(content) {
+        markdown.write_chunk(content)?;
+    } else {
+        print!("{content}");
+    }
+    io::stdout().flush()
+}
+
+struct MarkdownStreamRenderer {
+    tty: bool,
+    enabled: bool,
+    in_code_block: bool,
+    line_buf: String,
+}
+
+impl MarkdownStreamRenderer {
+    fn new() -> Self {
+        use std::io::IsTerminal;
+        Self::new_with_tty(io::stdout().is_terminal())
+    }
+
+    fn new_with_tty(tty: bool) -> Self {
+        Self {
+            tty,
+            enabled: true,
+            in_code_block: false,
+            line_buf: String::new(),
+        }
+    }
+
+    fn should_render(&mut self, chunk: &str) -> bool {
+        if !self.tty {
+            return false;
+        }
+        if chunk.contains("\x1b[") {
+            return false;
+        }
+        self.enabled = true;
+        true
+    }
+
+    fn write_chunk(&mut self, chunk: &str) -> io::Result<()> {
+        let mut out = io::stdout();
+        for ch in chunk.chars() {
+            if ch == '\n' {
+                let line = std::mem::take(&mut self.line_buf);
+                let rendered = self.render_line(&line);
+                out.write_all(rendered.as_bytes())?;
+                continue;
+            }
+            self.line_buf.push(ch);
+        }
+        Ok(())
+    }
+
+    fn render_line(&mut self, line: &str) -> String {
+        let (indent, rest) = split_indent(line);
+        let trimmed = rest.trim_start_matches([' ', '\t']);
+
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            self.in_code_block = !self.in_code_block;
+            return format!("{indent}\x1b[2m{trimmed}\x1b[0m\n");
+        }
+
+        if self.in_code_block {
+            if line.is_empty() {
+                return "\n".to_string();
+            }
+            return format!("\x1b[90m{line}\x1b[0m\n");
+        }
+
+        if let Some((level, title)) = parse_heading(trimmed) {
+            let (base, underline_char) = match level {
+                1 => ("\x1b[1m\x1b[35m", Some('═')),
+                2 => ("\x1b[1m\x1b[36m", Some('─')),
+                3 => ("\x1b[1m\x1b[34m", None),
+                _ => ("\x1b[1m\x1b[36m", None),
+            };
+            let mut out = String::new();
+            out.push_str(indent);
+            out.push_str(base);
+            out.push_str(&render_inline_md(title, base));
+            out.push_str("\x1b[0m\n");
+
+            if let Some(ch) = underline_char {
+                let len = title.chars().count().max(3).min(80);
+                out.push_str(indent);
+                out.push_str("\x1b[2m\x1b[36m");
+                out.push_str(&std::iter::repeat(ch).take(len).collect::<String>());
+                out.push_str("\x1b[0m\n");
+            }
+            return out;
+        }
+
+        if let Some((p_indent, prefix, body)) = split_list_prefix(line) {
+            let mut out = String::new();
+            out.push_str(p_indent);
+            out.push_str("\x1b[36m");
+            out.push_str(prefix);
+            out.push_str("\x1b[0m");
+            out.push_str(&render_inline_md(body, ""));
+            out.push('\n');
+            return out;
+        }
+
+        if line.is_empty() {
+            return "\n".to_string();
+        }
+        format!("{}{}\n", indent, render_inline_md(rest, ""))
+    }
+}
+
+fn split_indent(s: &str) -> (&str, &str) {
+    let mut idx = 0usize;
+    for (i, ch) in s.char_indices() {
+        if ch == ' ' || ch == '\t' {
+            idx = i + ch.len_utf8();
+            continue;
+        }
+        idx = i;
+        break;
+    }
+    if s.chars().all(|c| c == ' ' || c == '\t') {
+        return (s, "");
+    }
+    s.split_at(idx)
+}
+
+fn parse_heading(line: &str) -> Option<(usize, &str)> {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i] == b'#' {
+        i += 1;
+    }
+    if i == 0 || i > 6 {
+        return None;
+    }
+    if i >= bytes.len() || bytes[i] != b' ' {
+        return None;
+    }
+    Some((i, line[i + 1..].trim_end()))
+}
+
+fn split_list_prefix(line: &str) -> Option<(&str, &str, &str)> {
+    let (indent, rest) = split_indent(line);
+    let rest = rest.trim_end();
+    if rest.starts_with("- ") || rest.starts_with("* ") || rest.starts_with("+ ") {
+        return Some((indent, &rest[..2], &rest[2..]));
+    }
+    let bytes = rest.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+        if i > 4 {
+            break;
+        }
+    }
+    if i == 0 || i + 1 >= bytes.len() {
+        return None;
+    }
+    if bytes[i] == b'.' && bytes[i + 1] == b' ' {
+        return Some((indent, &rest[..i + 2], &rest[i + 2..]));
+    }
+    None
+}
+
+fn render_inline_md(s: &str, base: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    let mut bold = false;
+    let mut code = false;
+
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            code = !code;
+            out.push_str("\x1b[0m");
+            out.push_str(base);
+            if bold {
+                out.push_str("\x1b[1m");
+            }
+            if code {
+                out.push_str("\x1b[7m");
+            }
+            i += 1;
+            continue;
+        }
+
+        if !code && bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            bold = !bold;
+            out.push_str("\x1b[0m");
+            out.push_str(base);
+            if bold {
+                out.push_str("\x1b[1m");
+            }
+            if code {
+                out.push_str("\x1b[7m");
+            }
+            i += 2;
+            continue;
+        }
+
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out.push_str("\x1b[0m");
+    out
 }
 
 fn append_history(path: &PathBuf, content: &str) -> io::Result<()> {
