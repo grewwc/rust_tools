@@ -1491,6 +1491,7 @@ struct MarkdownStreamRenderer {
     in_code_block: bool,
     bol: bool,
     line_buf: String,
+    line_preview_emitted: bool,
     table_state: TableState,
 }
 
@@ -1507,6 +1508,7 @@ impl MarkdownStreamRenderer {
             in_code_block: false,
             bol: false,
             line_buf: String::new(),
+            line_preview_emitted: false,
             table_state: TableState::None,
         }
     }
@@ -1526,8 +1528,13 @@ impl MarkdownStreamRenderer {
         let mut out = io::stdout();
         for ch in chunk.chars() {
             if ch == '\n' {
+                if self.line_preview_emitted {
+                    out.write_all(b"\n")?;
+                    self.bol = true;
+                }
                 let line = std::mem::take(&mut self.line_buf);
-                let rendered = self.consume_line(&line);
+                let rendered = self.consume_line(&line, self.line_preview_emitted);
+                self.line_preview_emitted = false;
                 if !rendered.is_empty() {
                     out.write_all(rendered.as_bytes())?;
                     self.bol = rendered.ends_with('\n');
@@ -1535,6 +1542,17 @@ impl MarkdownStreamRenderer {
                 continue;
             }
             self.line_buf.push(ch);
+
+            if self.should_emit_table_preview_live() {
+                if !self.line_preview_emitted {
+                    out.write_all(self.line_buf.as_bytes())?;
+                    self.line_preview_emitted = true;
+                } else {
+                    let mut buf = [0u8; 4];
+                    out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
+                }
+                self.bol = false;
+            }
         }
         Ok(())
     }
@@ -1543,7 +1561,8 @@ impl MarkdownStreamRenderer {
         let mut out = io::stdout();
         if !self.line_buf.is_empty() {
             let line = std::mem::take(&mut self.line_buf);
-            let rendered = self.consume_line(&line);
+            let rendered = self.consume_line(&line, self.line_preview_emitted);
+            self.line_preview_emitted = false;
             if !rendered.is_empty() {
                 out.write_all(rendered.as_bytes())?;
                 self.bol = rendered.ends_with('\n');
@@ -1569,7 +1588,12 @@ impl MarkdownStreamRenderer {
         out.flush()
     }
 
-    fn consume_line(&mut self, line: &str) -> String {
+    fn should_emit_table_preview_live(&self) -> bool {
+        matches!(self.table_state, TableState::PendingHeader { .. } | TableState::InTable { .. })
+            && line_looks_like_table_preview(&self.line_buf)
+    }
+
+    fn consume_line(&mut self, line: &str, preview_emitted: bool) -> String {
         let state = std::mem::replace(&mut self.table_state, TableState::None);
         match state {
             TableState::None => {
@@ -1602,10 +1626,12 @@ impl MarkdownStreamRenderer {
                 mut preview_height,
             } => {
                 if is_table_separator(line) {
-                    let mut out = String::new();
                     let raw = line.trim_end().to_string();
-                    out.push_str(&raw);
-                    out.push('\n');
+                    let mut out = String::new();
+                    if !preview_emitted {
+                        out.push_str(&raw);
+                        out.push('\n');
+                    }
                     preview_height += table_preview_height(&raw);
 
                     let header_cells = parse_table_row(&header_line);
@@ -1623,7 +1649,7 @@ impl MarkdownStreamRenderer {
                 let _ = preview_height;
                 let _ = indent;
                 let _ = header_line;
-                self.consume_line(line)
+                self.consume_line(line, preview_emitted)
             }
             TableState::InTable {
                 indent,
@@ -1636,8 +1662,10 @@ impl MarkdownStreamRenderer {
                     rows.push(parse_table_row(line));
                     let raw = line.trim_end().to_string();
                     let mut out = String::new();
-                    out.push_str(&raw);
-                    out.push('\n');
+                    if !preview_emitted {
+                        out.push_str(&raw);
+                        out.push('\n');
+                    }
                     preview_height += table_preview_height(&raw);
                     self.table_state = TableState::InTable {
                         indent,
@@ -1651,7 +1679,7 @@ impl MarkdownStreamRenderer {
 
                 let mut out = String::new();
                 out.push_str(&self.rewrite_table_preview(&indent, preview_height, &header, &align, &rows));
-                out.push_str(&self.consume_line(line));
+                out.push_str(&self.consume_line(line, preview_emitted));
                 out
             }
         }
@@ -1888,6 +1916,18 @@ fn is_table_row_candidate(line: &str) -> bool {
     }
     let cells = parse_table_row(s);
     cells.len() >= 2
+}
+
+fn line_looks_like_table_preview(line: &str) -> bool {
+    if line.trim().is_empty() {
+        return false;
+    }
+    let (_, rest) = split_indent(line);
+    let s = rest.trim_end();
+    if s.starts_with("```") || s.starts_with("~~~") {
+        return false;
+    }
+    s.contains('|')
 }
 
 fn is_table_row(line: &str) -> bool {
@@ -2564,5 +2604,31 @@ mod tests {
 
         assert!(shutdown.load(Ordering::SeqCst));
         assert!(!cancel_stream.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn table_preview_lines_are_not_double_printed_after_live_emit() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+
+        let header_out = renderer.consume_line("| name | value |", false);
+        assert!(header_out.contains("| name | value |\n"));
+
+        let sep_out = renderer.consume_line("| --- | --- |", true);
+        assert_eq!(sep_out, "");
+
+        let row_out = renderer.consume_line("| foo | bar |", true);
+        assert_eq!(row_out, "");
+
+        let end_out = renderer.consume_line("done", false);
+        assert!(end_out.contains("\x1b["));
+        assert!(end_out.contains("done"));
+    }
+
+    #[test]
+    fn table_live_preview_detection_requires_table_like_content() {
+        assert!(line_looks_like_table_preview("| col1 | col2"));
+        assert!(line_looks_like_table_preview("  col1 | col2"));
+        assert!(!line_looks_like_table_preview("plain text"));
+        assert!(!line_looks_like_table_preview("```| not table"));
     }
 }
