@@ -23,7 +23,7 @@ fn wrap_single_line(s: &str, width: usize, indent: usize, delimiter: &str) -> St
         }
         let word_len = get_num_chars(word);
 
-        if cursor + word.len() > width {
+        if cursor + word_len > width {
             let joined = cur_line.concat();
             let joined = joined.trim_end_matches(' ').to_string();
             if !joined.is_empty() {
