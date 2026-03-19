@@ -1,7 +1,7 @@
 use std::{
     cmp::Ordering as CmpOrdering,
     collections::HashMap,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -250,7 +250,7 @@ fn compute_speeds(prev: &Snapshot, curr: &Snapshot) -> Option<(Vec<InterfaceSpee
 }
 
 fn render_waiting(curr: &Snapshot) {
-    print!("\x1b[H\x1b[J");
+    clear_screen();
     println!(
         "ns | grouped realtime network speed monitor | interval {} ms",
         POLL_INTERVAL_MS
@@ -270,7 +270,7 @@ fn render_waiting(curr: &Snapshot) {
 }
 
 fn render_error(err: &str) {
-    print!("\x1b[H\x1b[J");
+    clear_screen();
     println!("ns | grouped realtime network speed monitor");
     println!();
     println!("Failed to read network stats:");
@@ -305,7 +305,7 @@ fn render_dashboard(speeds: &[InterfaceSpeed], dt: f64) {
         .max(8);
     let table_width = name_width + 44;
 
-    print!("\x1b[H\x1b[J");
+    clear_screen();
     println!(
         "ns | grouped realtime network speed monitor | sample {:.0} ms",
         dt * 1000.0
@@ -356,6 +356,7 @@ fn main() {
 
 #[cfg(not(target_os = "windows"))]
 fn main() {
+    let terminal_guard = TerminalGuard::new();
     let running = Arc::new(AtomicBool::new(true));
     let signal = Arc::clone(&running);
     if let Err(err) = ctrlc::set_handler(move || {
@@ -393,4 +394,39 @@ fn main() {
     }
 
     println!();
+    drop(terminal_guard);
+}
+
+fn clear_screen() {
+    if TerminalGuard::enabled() {
+        print!("\x1b[H\x1b[J");
+    }
+}
+
+struct TerminalGuard {
+    enabled: bool,
+}
+
+impl TerminalGuard {
+    fn enabled() -> bool {
+        io::stdout().is_terminal()
+    }
+
+    fn new() -> Self {
+        let enabled = Self::enabled();
+        if enabled {
+            print!("\x1b[?1049h\x1b[H\x1b[J\x1b[?25l");
+            let _ = io::stdout().flush();
+        }
+        Self { enabled }
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.enabled {
+            print!("\x1b[?25h\x1b[?1049l");
+            let _ = io::stdout().flush();
+        }
+    }
 }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use clap::Parser;
@@ -6,13 +6,10 @@ use colored::Colorize;
 use regex::Regex;
 
 use crate::common::configw;
-use crate::common::{editor, prompt};
+use crate::common::prompt;
 use crate::memo::{
-    MemoBackend, MemoBackendMode, MemoMongo, MemoRecord, MemoTag, history, search as memo_search,
-    sync, time as memo_time, ui,
+    MemoBackend, MemoBackendMode, MemoMongo, MemoRecord, MemoTag, history,
 };
-
-pub const DEFAULT_TXT_OUTPUT_NAME: &str = "output.txt";
 
 pub static NUMBERED_ITEM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\d+\.\s").expect("invalid numbered item regex"));

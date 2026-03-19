@@ -1,7 +1,4 @@
-use std::sync::LazyLock;
-
 use clap::Parser;
-use regex::Regex;
 pub use rust_tools::cmd;
 pub use rust_tools::common;
 pub use rust_tools::strw;
@@ -15,13 +12,6 @@ mod features;
 use features::*;
 
 const DEFAULT_TXT_OUTPUT_NAME: &str = "output.txt";
-
-static NUMBERED_ITEM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d+\.\s").expect("invalid numbered item regex"));
-static WRAPPED_NUMBERED_ITEM_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?P<head>.*?)[ ]{2,}(?P<tail>\d+\.\s.*)$")
-        .expect("invalid wrapped numbered item regex")
-});
 
 fn main() {
     let argv = normalize_legacy_single_dash_long_args(std::env::args());

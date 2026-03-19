@@ -1,4 +1,3 @@
-use crate::features::core::*;
 use crate::memo::{time as memo_time, MemoBackend};
 
 pub fn handle_week(db: &MemoBackend) {
