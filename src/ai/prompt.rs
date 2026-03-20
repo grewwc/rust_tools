@@ -148,7 +148,7 @@ impl PromptEditor {
                         let area = f.area();
                         let popup_height = area.height.saturating_sub(4).clamp(10, 18);
                         let popup_width =
-                            area.width.saturating_sub(4).clamp(40, 110).min(area.width);
+                            area.width.saturating_sub(2).clamp(50, 140).min(area.width);
                         let popup = centered_rect(area, popup_width, popup_height);
 
                         let popup_block = Block::default()
