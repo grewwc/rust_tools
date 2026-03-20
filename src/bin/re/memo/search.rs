@@ -10,34 +10,14 @@ const SEARCH_MIN_INFORMATIVE_COVERAGE_WITH_URL: f64 = 0.26;
 
 const SEARCH_SYNONYM_GROUPS: &[&[&str]] = &[
     &[
-        "链接",
-        "地址",
-        "网址",
-        "url",
-        "uri",
-        "link",
-        "endpoint",
-        "host",
-        "域名",
-        "官网",
-        "site",
-        "http",
-        "https",
+        "链接", "地址", "网址", "url", "uri", "link", "endpoint", "host", "域名", "官网", "site",
+        "http", "https",
     ],
     &["数据库", "database", "db"],
 ];
 
 const SEARCH_GENERIC_SUFFIXES: &[&str] = &[
-    "相关",
-    "有关",
-    "内容",
-    "方面",
-    "资料",
-    "信息",
-    "情况",
-    "问题",
-    "事项",
-    "记录",
+    "相关", "有关", "内容", "方面", "资料", "信息", "情况", "问题", "事项", "记录",
 ];
 
 static SEARCH_URL_PATTERN: LazyLock<Regex> =
@@ -343,8 +323,7 @@ fn search_token_similarity(left: &str, right: &str) -> f64 {
     if let (Some(left_group), Some(right_group)) = (
         SEARCH_SYNONYM_INDEX.get(&left),
         SEARCH_SYNONYM_INDEX.get(&right),
-    )
-        && left_group == right_group
+    ) && left_group == right_group
     {
         return 0.92;
     }
@@ -390,7 +369,9 @@ fn normalize_search_text(text: &str) -> String {
 }
 
 fn normalize_search_text_with_options(text: &str, trim_urls: bool) -> String {
-    let source = sanitize_search_source(text, trim_urls).trim().to_lowercase();
+    let source = sanitize_search_source(text, trim_urls)
+        .trim()
+        .to_lowercase();
     if source.is_empty() {
         return String::new();
     }
@@ -422,7 +403,10 @@ fn compact_search_text(text: &str) -> String {
 }
 
 fn compact_normalized_text(normalized: &str) -> String {
-    normalized.chars().filter(|ch| !ch.is_whitespace()).collect()
+    normalized
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect()
 }
 
 fn tokenize_search_text(text: &str) -> Vec<String> {
@@ -697,10 +681,7 @@ mod tests {
 
     #[test]
     fn score_record_matches_query_in_tags() {
-        let record = make_record(
-            "ORDER BY\nshard_skew_ratio DESC",
-            &["判断分片键是否倾斜"],
-        );
+        let record = make_record("ORDER BY\nshard_skew_ratio DESC", &["判断分片键是否倾斜"]);
 
         assert!(score_record(&record, "倾斜") > 0.0);
     }
@@ -715,10 +696,7 @@ mod tests {
 
     #[test]
     fn preview_falls_back_to_title_when_query_only_hits_tags() {
-        let record = make_record(
-            "ORDER BY\nshard_skew_ratio DESC",
-            &["判断分片键是否倾斜"],
-        );
+        let record = make_record("ORDER BY\nshard_skew_ratio DESC", &["判断分片键是否倾斜"]);
 
         assert_eq!(
             build_preview_lines(&record, "倾斜", 3),

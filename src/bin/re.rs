@@ -83,6 +83,11 @@ fn main() {
         return;
     }
 
+    if should_insert_feature(&cli) {
+        insert::insert_feature(&db, &cli, use_vscode);
+        return;
+    }
+
     if should_list_tags_feature(&cli, list_tags_and_order_by_time) {
         list_tags::list_tags_feature(
             &db,
@@ -98,11 +103,6 @@ fn main() {
 
     if should_update_feature(&cli) {
         update::update_feature(&db, &cli, prefix, use_vscode);
-        return;
-    }
-
-    if should_insert_feature(&cli) {
-        insert::insert_feature(&db, &cli, use_vscode);
         return;
     }
 
@@ -210,6 +210,27 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ie_sets_insert_and_editor() {
+        let argv = normalize_legacy_single_dash_long_args(["re".to_string(), "-ie".to_string()]);
+        let cli = Cli::parse_from(argv);
+        assert!(cli.insert);
+        assert!(cli.e);
+    }
+
+    #[test]
+    fn normalize_single_dash_long_flags() {
+        let argv = normalize_legacy_single_dash_long_args([
+            "re".to_string(),
+            "-include-finished".to_string(),
+            "-backend=mongo".to_string(),
+            "-add-tag=todo".to_string(),
+        ]);
+        assert!(argv.iter().any(|a| a == "--include-finished"));
+        assert!(argv.iter().any(|a| a == "--backend=mongo"));
+        assert!(argv.iter().any(|a| a == "--add-tag=todo"));
+    }
 
     #[test]
     fn normalize_title_repairs_wrapped_numbered_links() {

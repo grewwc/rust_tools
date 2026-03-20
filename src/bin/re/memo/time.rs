@@ -5,11 +5,21 @@ pub fn today_local_date() -> NaiveDate {
 }
 
 pub fn format_log_tag(date: NaiveDate) -> String {
-    format!("log.{:04}-{:02}-{:02}", date.year(), date.month(), date.day())
+    format!(
+        "log.{:04}-{:02}-{:02}",
+        date.year(),
+        date.month(),
+        date.day()
+    )
 }
 
 pub fn format_week_tag(date: NaiveDate) -> String {
-    format!("week.{:04}-{:02}-{:02}", date.year(), date.month(), date.day())
+    format!(
+        "week.{:04}-{:02}-{:02}",
+        date.year(),
+        date.month(),
+        date.day()
+    )
 }
 
 pub fn first_day_of_week(date: NaiveDate) -> NaiveDate {
@@ -20,4 +30,3 @@ pub fn first_day_of_week(date: NaiveDate) -> NaiveDate {
 pub fn add_days(date: NaiveDate, days: i64) -> NaiveDate {
     date + Duration::days(days)
 }
-

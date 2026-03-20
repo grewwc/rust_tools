@@ -20,4 +20,3 @@ pub fn prompt_yes_or_no(prompt: &str) -> bool {
         }
     }
 }
-

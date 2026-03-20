@@ -1,4 +1,4 @@
-use crate::memo::{time as memo_time, MemoBackend};
+use crate::memo::{MemoBackend, time as memo_time};
 
 pub fn handle_week(db: &MemoBackend) {
     let mut first = memo_time::first_day_of_week(memo_time::today_local_date());

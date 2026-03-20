@@ -2,7 +2,7 @@ use colored::Colorize;
 use regex::Regex;
 
 use crate::features::core::*;
-use crate::memo::{history, ui, MemoBackend};
+use crate::memo::{MemoBackend, history, ui};
 
 pub fn list_by_title_feature(
     db: &MemoBackend,

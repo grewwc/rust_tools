@@ -373,7 +373,12 @@ where
         None
     }
 
-    fn dfs_finish_order(g: &DirectedGraph<T>, node: &T, visited: &mut FastSet<T>, order: &mut Vec<T>) {
+    fn dfs_finish_order(
+        g: &DirectedGraph<T>,
+        node: &T,
+        visited: &mut FastSet<T>,
+        order: &mut Vec<T>,
+    ) {
         visited.insert(node.clone());
         for next in g.adj(node) {
             if !visited.contains(&next) {
@@ -455,8 +460,14 @@ where
             return false;
         }
 
-        self.adj.get_mut(&u).expect("node must exist").insert(v.clone());
-        self.adj.get_mut(&v).expect("node must exist").insert(u.clone());
+        self.adj
+            .get_mut(&u)
+            .expect("node must exist")
+            .insert(v.clone());
+        self.adj
+            .get_mut(&v)
+            .expect("node must exist")
+            .insert(u.clone());
         self.edge_cnt += 1;
         true
     }
@@ -1240,7 +1251,11 @@ where
 
         let mut root = node.clone();
         loop {
-            let parent = self.parent.get(&root).cloned().unwrap_or_else(|| root.clone());
+            let parent = self
+                .parent
+                .get(&root)
+                .cloned()
+                .unwrap_or_else(|| root.clone());
             if parent == root {
                 break;
             }
@@ -1249,7 +1264,11 @@ where
 
         let mut curr = node;
         loop {
-            let parent = self.parent.get(&curr).cloned().unwrap_or_else(|| curr.clone());
+            let parent = self
+                .parent
+                .get(&curr)
+                .cloned()
+                .unwrap_or_else(|| curr.clone());
             if parent == root {
                 self.parent.insert(curr, root.clone());
                 break;

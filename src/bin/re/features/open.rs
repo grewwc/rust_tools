@@ -1,5 +1,5 @@
 use crate::features::core::*;
-use crate::memo::{history, MemoBackend};
+use crate::memo::{MemoBackend, history};
 
 pub fn open_urls(db: &MemoBackend, args: &[String], prefix: bool) {
     let tags = args

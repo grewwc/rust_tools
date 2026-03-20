@@ -128,7 +128,10 @@ fn read_snapshot() -> io::Result<Snapshot> {
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::other(format!("netstat failed: {}", stderr.trim())));
+        return Err(io::Error::other(format!(
+            "netstat failed: {}",
+            stderr.trim()
+        )));
     }
     let content = String::from_utf8_lossy(&output.stdout);
     let interfaces = parse_macos_interfaces(content.as_ref())?;

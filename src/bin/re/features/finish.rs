@@ -1,5 +1,5 @@
 use crate::features::core::*;
-use crate::memo::{history, MemoBackend};
+use crate::memo::{MemoBackend, history};
 
 pub fn handle_finish_command(
     db: &MemoBackend,

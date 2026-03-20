@@ -1,5 +1,5 @@
 use crate::features::core::*;
-use crate::memo::{time as memo_time, MemoBackend};
+use crate::memo::{MemoBackend, time as memo_time};
 
 pub fn handle_log(db: &MemoBackend, cli: &Cli, use_vscode: bool) {
     let extra = cli
@@ -71,7 +71,11 @@ pub fn insert_records(
         println!();
         title_list.push(title);
     } else {
-        title_list.push(crate::common::prompt::read_line("input the title: ").trim().to_string());
+        title_list.push(
+            crate::common::prompt::read_line("input the title: ")
+                .trim()
+                .to_string(),
+        );
     }
 
     let tags_str = if !tag_name.is_empty() {
@@ -121,8 +125,8 @@ pub fn update_record_impl(
     print!("input the title: ");
     crate::common::editor::flush_stdout();
     if from_editor {
-        let new_title =
-            crate::common::editor::input_with_editor(&old_title, use_vscode).unwrap_or(old_title.clone());
+        let new_title = crate::common::editor::input_with_editor(&old_title, use_vscode)
+            .unwrap_or(old_title.clone());
         if new_title != old_title {
             record.title = new_title;
             changed = true;

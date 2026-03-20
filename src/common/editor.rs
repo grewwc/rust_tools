@@ -23,9 +23,16 @@ pub fn input_with_editor(initial: &str, use_vscode: bool) -> io::Result<String> 
 }
 
 fn launch_editor(path: &Path, use_vscode: bool) -> io::Result<()> {
-    let status = if use_vscode {
-        Command::new("code").arg("--wait").arg(path).status()?
-    } else if let Some(editor_cmd) = configured_editor() {
+    if use_vscode {
+        match Command::new("code").arg("--wait").arg(path).status() {
+            Ok(status) if status.success() => return Ok(()),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    let status = if let Some(editor_cmd) = configured_editor() {
         Command::new("sh")
             .arg("-c")
             .arg("exec $EDITOR_CMD \"$1\"")
@@ -33,13 +40,14 @@ fn launch_editor(path: &Path, use_vscode: bool) -> io::Result<()> {
             .arg(path)
             .env("EDITOR_CMD", editor_cmd)
             .status()?
-    } else if cfg!(target_os = "macos") {
-        Command::new("open")
-            .args(["-W", "-n", "-a", "TextEdit"])
-            .arg(path)
-            .status()?
     } else {
-        Command::new("vi").arg(path).status()?
+        match Command::new("vim").arg(path).status() {
+            Ok(status) => status,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Command::new("vi").arg(path).status()?
+            }
+            Err(e) => return Err(e),
+        }
     };
 
     if status.success() {

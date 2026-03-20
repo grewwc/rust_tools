@@ -13,7 +13,11 @@ struct Cli {
     #[arg(short, long, num_args = 0..=1, default_missing_value = "", value_name = "FILE", help = "copy from file to clipboard (default: 'output'). Image copy uses OSC52 bridge by default for SSH paste; set OO_PREFER_NATIVE_IMAGE=1 to disable")]
     copy: Option<String>,
 
-    #[arg(short = 'B', long, help = "bridge: encode image clipboard as base64 text clipboard (run on LOCAL machine so remote `oo -p` can retrieve it via OSC52)")]
+    #[arg(
+        short = 'B',
+        long,
+        help = "bridge: encode image clipboard as base64 text clipboard (run on LOCAL machine so remote `oo -p` can retrieve it via OSC52)"
+    )]
     bridge: bool,
 }
 
@@ -36,7 +40,9 @@ fn handle_paste_to_file(fname: &str) -> Result<(), String> {
     // This allows: cat image.png | ssh host "oo -p file.png"
     if !stdin_is_tty() {
         let mut bytes = Vec::new();
-        io::stdin().read_to_end(&mut bytes).map_err(|e| format!("stdin read error: {e}"))?;
+        io::stdin()
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("stdin read error: {e}"))?;
         if !bytes.is_empty() {
             std::fs::write(fname, &bytes).map_err(|e| format!("write error: {e}"))?;
             println!("save to file: {fname}");

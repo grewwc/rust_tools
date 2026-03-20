@@ -2,7 +2,7 @@ use colored::Colorize;
 use regex::Regex;
 
 use crate::features::core::*;
-use crate::memo::{history, search as memo_search, ui, MemoBackend};
+use crate::memo::{MemoBackend, history, search as memo_search, ui};
 
 pub fn search_feature(
     db: &MemoBackend,

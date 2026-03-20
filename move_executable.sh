@@ -2,7 +2,7 @@
 
 set -e
 
-DEFAULT_BINS="a configw his j ns oo re"
+DEFAULT_BINS="a configw his j ns oo re tt"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 
 if [ "$#" -gt 0 ]; then

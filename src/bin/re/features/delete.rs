@@ -1,5 +1,5 @@
 use crate::features::core::*;
-use crate::memo::{history, MemoBackend};
+use crate::memo::{MemoBackend, history};
 
 pub fn delete_feature(db: &MemoBackend, cli: &Cli) {
     let arg = cli.delete.as_deref().unwrap_or("").trim();

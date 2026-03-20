@@ -1,7 +1,7 @@
 use colored::Colorize;
 
 use crate::features::core::*;
-use crate::memo::{history, sync, MemoBackend};
+use crate::memo::{MemoBackend, history, sync};
 
 pub fn push_single(db: &MemoBackend, push_ref: &str, cli_host: &str) {
     println!("pushing...");
@@ -22,12 +22,16 @@ pub fn push_single(db: &MemoBackend, push_ref: &str, cli_host: &str) {
                 .list_records_by_tags(&tags, false, false, -1, true, true)
                 .unwrap_or_default();
             if !records.is_empty() {
-                let record_ids = records.iter().map(|record| record.id.clone()).collect::<Vec<_>>();
+                let record_ids = records
+                    .iter()
+                    .map(|record| record.id.clone())
+                    .collect::<Vec<_>>();
                 println!("begin to sync {} records...", record_ids.len());
-                let synced = sync::sync_records_to_host(db, &record_ids, &host).unwrap_or_else(|e| {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                });
+                let synced =
+                    sync::sync_records_to_host(db, &record_ids, &host).unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    });
                 for record_id in &record_ids {
                     history::write_previous_operation(record_id);
                 }

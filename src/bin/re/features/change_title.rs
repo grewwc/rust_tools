@@ -1,5 +1,5 @@
 use crate::features::core::*;
-use crate::memo::{history, MemoBackend};
+use crate::memo::{MemoBackend, history};
 
 pub fn change_title_feature(db: &MemoBackend, cli: &Cli, use_vscode: bool) {
     let id_arg = cli.change_title.as_deref().unwrap_or("");
@@ -19,7 +19,8 @@ pub fn change_title_feature(db: &MemoBackend, cli: &Cli, use_vscode: bool) {
     print!("input the New Title: ");
     crate::common::editor::flush_stdout();
     let mut new_title = if cli.e {
-        crate::common::editor::input_with_editor(&record.title, use_vscode).unwrap_or(record.title.clone())
+        crate::common::editor::input_with_editor(&record.title, use_vscode)
+            .unwrap_or(record.title.clone())
     } else {
         crate::common::prompt::read_line("")
     };
@@ -37,6 +38,9 @@ pub fn change_title_feature(db: &MemoBackend, cli: &Cli, use_vscode: bool) {
     let _ = db.update_title(&id, &new_title);
     println!("New Record: ");
     println!("\tTags: {:?}", record.tags);
-    println!("\tTitle: {}", crate::strw::substring_quiet(&new_title, 0, 200));
+    println!(
+        "\tTitle: {}",
+        crate::strw::substring_quiet(&new_title, 0, 200)
+    );
     history::write_previous_operation(&id);
 }

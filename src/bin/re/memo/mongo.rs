@@ -334,16 +334,9 @@ impl MemoMongo {
         let now = DateTime::now();
         self.rt.block_on(async {
             for tag in tags.iter().filter(|t| !t.trim().is_empty()) {
-                let update = doc! {
-                    "$setOnInsert": { "_id": ObjectId::new(), "name": tag, "count": 0_i64, "modified_date": now },
-                    "$inc": { "count": delta },
-                    "$set": { "modified_date": now }
-                };
+                let update = tag_count_update_doc(delta, now);
                 self.tags
-                    .update_one(
-                        doc! {"name": tag},
-                        update,
-                    )
+                    .update_one(doc! {"name": tag}, update)
                     .with_options(UpdateOptions::builder().upsert(true).build())
                     .await
                     .map_err(|e| e.to_string())?;
@@ -351,6 +344,32 @@ impl MemoMongo {
             Ok::<_, String>(())
         })?;
         Ok(())
+    }
+}
+
+fn tag_count_update_doc(delta: i64, now: DateTime) -> bson::Document {
+    doc! {
+        "$inc": { "count": delta },
+        "$set": { "modified_date": now }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_count_update_doc_has_no_set_on_insert() {
+        let update = tag_count_update_doc(1, DateTime::now());
+        assert!(!update.contains_key("$setOnInsert"));
+        assert!(update.get_document("$inc").is_ok());
+        assert!(
+            update
+                .get_document("$inc")
+                .ok()
+                .and_then(|doc| doc.get("count"))
+                .is_some()
+        );
     }
 }
 

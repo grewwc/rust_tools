@@ -3,9 +3,9 @@ pub mod history;
 pub mod model;
 pub mod mongo;
 pub mod search;
+pub mod sync;
 pub mod time;
 pub mod ui;
-pub mod sync;
 
 pub use db::MemoDb;
 pub use model::{MemoRecord, MemoTag};

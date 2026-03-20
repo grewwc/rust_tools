@@ -1,7 +1,7 @@
 use colored::Colorize;
 
 use crate::features::core::*;
-use crate::memo::{history, ui, MemoBackend};
+use crate::memo::{MemoBackend, history, ui};
 
 pub fn default_print(db: &MemoBackend, limit: i64, list_special: bool) {
     let mut records = db

@@ -1,5 +1,8 @@
+pub mod deque_list;
 pub mod graph;
 pub mod lru_cache;
+pub mod ordered_map;
+pub mod ordered_set;
 pub mod queue;
 pub mod rb_tree;
 pub mod stack;

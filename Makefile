@@ -1,4 +1,4 @@
-BINS = a c configw his j ns oo re
+BINS = a c configw his j ns oo re tt
 
 all:
 	cargo build --release $(addprefix --bin ,$(BINS))
@@ -10,4 +10,3 @@ install:
 install-a:
 	cargo build --release --bin a
 	sh ./move_executable.sh a
-

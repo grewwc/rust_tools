@@ -2,9 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
-use crate::{
-    memo::{MemoBackend, db::MemoDb, history},
-};
+use crate::memo::{MemoBackend, db::MemoDb, history};
 
 const REMOTE_SQLITE_PATH: &str = "~/.go_tools_memo.sqlite3";
 
@@ -105,7 +103,9 @@ pub fn sync_record_from_host(
 fn resolve_record_ref(remote_db: &MemoDb, record_ref: &str) -> Result<String, String> {
     let mut ref_str = record_ref.trim().to_string();
     if ref_str.is_empty() {
-        ref_str = crate::common::prompt::read_line("Input the ObjectID/title/tag: ").trim().to_string();
+        ref_str = crate::common::prompt::read_line("Input the ObjectID/title/tag: ")
+            .trim()
+            .to_string();
     }
     if is_object_id_like(&ref_str) {
         return Ok(ref_str);
@@ -117,7 +117,10 @@ fn resolve_record_ref(remote_db: &MemoDb, record_ref: &str) -> Result<String, St
 
     let exact = records
         .iter()
-        .filter(|r| primary_title(&r.title).eq_ignore_ascii_case(&ref_str) || r.title.trim().eq_ignore_ascii_case(&ref_str))
+        .filter(|r| {
+            primary_title(&r.title).eq_ignore_ascii_case(&ref_str)
+                || r.title.trim().eq_ignore_ascii_case(&ref_str)
+        })
         .map(|r| format!("{}\t{}", r.id, primary_title(&r.title)))
         .collect::<Vec<_>>();
     let exact_tag = records
@@ -132,8 +135,8 @@ fn resolve_record_ref(remote_db: &MemoDb, record_ref: &str) -> Result<String, St
         }
     }
     if !merged.is_empty() {
-        let chosen = history::choose_from_list(&merged)
-            .ok_or_else(|| "no selection".to_string())?;
+        let chosen =
+            history::choose_from_list(&merged).ok_or_else(|| "no selection".to_string())?;
         let id = chosen.split_whitespace().next().unwrap_or("").to_string();
         return Ok(id);
     }
@@ -142,7 +145,8 @@ fn resolve_record_ref(remote_db: &MemoDb, record_ref: &str) -> Result<String, St
     let fuzzy = records
         .iter()
         .filter(|r| {
-            r.title.to_lowercase().contains(&lower) || r.tags.iter().any(|t| t.starts_with(&ref_str))
+            r.title.to_lowercase().contains(&lower)
+                || r.tags.iter().any(|t| t.starts_with(&ref_str))
         })
         .map(|r| format!("{}\t{}", r.id, primary_title(&r.title)))
         .collect::<Vec<_>>();
@@ -306,8 +310,10 @@ mod tests {
     use super::*;
 
     fn temp_db() -> MemoDb {
-        let dir =
-            std::env::temp_dir().join(format!("rust_tools_memo_sync_test_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "rust_tools_memo_sync_test_{}",
+            uuid::Uuid::new_v4()
+        ));
         let path = dir.join("memo.sqlite3");
         MemoDb::open(path).unwrap()
     }

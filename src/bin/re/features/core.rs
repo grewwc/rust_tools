@@ -7,9 +7,7 @@ use regex::Regex;
 
 use crate::common::configw;
 use crate::common::prompt;
-use crate::memo::{
-    MemoBackend, MemoBackendMode, MemoMongo, MemoRecord, MemoTag, history,
-};
+use crate::memo::{MemoBackend, MemoBackendMode, MemoMongo, MemoRecord, MemoTag, history};
 
 pub static NUMBERED_ITEM_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\d+\.\s").expect("invalid numbered item regex"));
@@ -191,7 +189,12 @@ pub struct Cli {
     #[arg(long = "file", num_args = 0..=1, default_missing_value = "")]
     pub file_flag: Option<String>,
 
-    #[arg(long = "e", default_value_t = false, help = "read from editor")]
+    #[arg(
+        short = 'e',
+        long = "e",
+        default_value_t = false,
+        help = "read from editor"
+    )]
     pub e: bool,
 
     #[arg(long = "host", default_value = "")]
@@ -239,7 +242,9 @@ pub struct SearchHit {
     pub preview: Vec<String>,
 }
 
-pub fn normalize_legacy_single_dash_long_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+pub fn normalize_legacy_single_dash_long_args(
+    args: impl IntoIterator<Item = String>,
+) -> Vec<String> {
     const LEGACY_LONG_FLAGS: &[&str] = &[
         "backend",
         "ct",
@@ -268,6 +273,7 @@ pub fn normalize_legacy_single_dash_long_args(args: impl IntoIterator<Item = Str
         "v",
         "file",
         "e",
+        "help",
         "host",
         "push",
         "pull",
@@ -278,6 +284,7 @@ pub fn normalize_legacy_single_dash_long_args(args: impl IntoIterator<Item = Str
         "db",
         "it",
         "ti",
+        "version",
     ];
 
     let mut out = Vec::new();
@@ -780,8 +787,27 @@ pub fn looks_like_url_continuation_fragment(line: &str) -> bool {
         ch.is_ascii_alphanumeric()
             || matches!(
                 ch,
-                '/' | '?' | '#' | '[' | ']' | '@' | '!' | '$' | '&' | '\'' | '(' | ')' | '*'
-                    | '+' | ',' | ';' | '=' | '%' | '-' | '.' | '_' | '~'
+                '/' | '?'
+                    | '#'
+                    | '['
+                    | ']'
+                    | '@'
+                    | '!'
+                    | '$'
+                    | '&'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '*'
+                    | '+'
+                    | ','
+                    | ';'
+                    | '='
+                    | '%'
+                    | '-'
+                    | '.'
+                    | '_'
+                    | '~'
             )
     })
 }

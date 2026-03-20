@@ -23,12 +23,10 @@ fn prefer_osc52_image_bridge() -> bool {
     // Default to OSC52 transport so local copy can be pasted from remote SSH sessions.
     // Set OO_PREFER_NATIVE_IMAGE=1 to keep the previous native-image clipboard behavior.
     match std::env::var("OO_PREFER_NATIVE_IMAGE") {
-        Ok(val) => {
-            !matches!(
-                val.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        }
+        Ok(val) => !matches!(
+            val.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
         Err(_) => true,
     }
 }
@@ -62,12 +60,9 @@ pub fn bridge_image_to_text_clipboard() -> Result<(), Box<dyn std::error::Error>
     let mut clipboard = Clipboard::new()?;
     let image = clipboard.get_image()?;
     let data = image.bytes.to_vec();
-    let img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
-        image.width as u32,
-        image.height as u32,
-        data,
-    )
-    .ok_or("failed to create image buffer")?;
+    let img_buf =
+        ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(image.width as u32, image.height as u32, data)
+            .ok_or("failed to create image buffer")?;
     let dynamic = image::DynamicImage::ImageRgba8(img_buf);
     let b64 = image_to_base64(&dynamic)?;
     clipboard.set_text(b64)?;
@@ -99,7 +94,9 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
         use base64::engine::general_purpose;
         let b64_str = std::str::from_utf8(&raw_bytes)
             .map(|s| s.replace(['\n', '\r'], ""))
-            .map_err(|_| io::Error::other("clipboard data is not a valid image or base64 string"))?;
+            .map_err(|_| {
+                io::Error::other("clipboard data is not a valid image or base64 string")
+            })?;
         let data = general_purpose::STANDARD.decode(&b64_str).map_err(|e| {
             let msg = format!("failed to decode clipboard base64: {}", e);
             io::Error::new(io::ErrorKind::InvalidData, msg)

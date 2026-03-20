@@ -39,4 +39,3 @@ pub fn choose_from_list(items: &[String]) -> Option<String> {
     }
     Some(items[n - 1].clone())
 }
-

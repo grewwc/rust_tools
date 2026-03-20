@@ -7,3 +7,4 @@ pub mod common;
 pub mod jsonw;
 pub mod sortw;
 pub mod strw;
+pub mod terminalw;

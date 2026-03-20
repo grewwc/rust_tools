@@ -18,7 +18,11 @@ pub fn colorize_id(id: &str) -> String {
     id.bright_red().to_string()
 }
 
-pub fn format_record_like_go(record: &MemoRecord, verbose: bool, highlighted_title: Option<String>) -> String {
+pub fn format_record_like_go(
+    record: &MemoRecord,
+    verbose: bool,
+    highlighted_title: Option<String>,
+) -> String {
     let mut out = String::new();
     let tags = colorize_tags(&record.tags);
     let tags_display = if tags.is_empty() {
@@ -43,4 +47,3 @@ pub fn format_record_like_go(record: &MemoRecord, verbose: bool, highlighted_tit
 
     out.trim_end_matches('\n').to_string()
 }
-

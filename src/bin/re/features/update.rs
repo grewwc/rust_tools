@@ -1,17 +1,13 @@
 use crate::features::core::*;
-use crate::memo::{history, MemoBackend};
+use crate::memo::{MemoBackend, history};
 use colored::Colorize;
 
 pub fn update_feature(db: &MemoBackend, cli: &Cli, prefix: bool, use_vscode: bool) {
     let from_file = cli.file_flag.is_some();
-    let mut from_editor = cli.e;
     let mut id = cli.update.as_deref().unwrap_or("").trim().to_string();
 
     if cli.prev && id.is_empty() {
         id = history::read_previous_operation();
-        if !from_file {
-            from_editor = true;
-        }
     }
 
     if id.is_empty() {
@@ -43,7 +39,6 @@ pub fn update_feature(db: &MemoBackend, cli: &Cli, prefix: bool, use_vscode: boo
             }
             if let Some(chosen_id) = choose_record_id(&records) {
                 id = chosen_id;
-                from_editor = true;
             }
         }
     }
@@ -55,7 +50,7 @@ pub fn update_feature(db: &MemoBackend, cli: &Cli, prefix: bool, use_vscode: boo
         return;
     }
 
-    update_record_impl(db, &id, from_file, from_editor, use_vscode);
+    update_record_impl(db, &id, from_file, true, use_vscode);
 }
 
 pub fn update_record_impl(
@@ -81,8 +76,8 @@ pub fn update_record_impl(
     print!("input the title: ");
     crate::common::editor::flush_stdout();
     if from_editor {
-        let new_title =
-            crate::common::editor::input_with_editor(&old_title, use_vscode).unwrap_or(old_title.clone());
+        let new_title = crate::common::editor::input_with_editor(&old_title, use_vscode)
+            .unwrap_or(old_title.clone());
         if new_title != old_title {
             record.title = new_title;
             changed = true;

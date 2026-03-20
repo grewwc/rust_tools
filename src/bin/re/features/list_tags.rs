@@ -1,7 +1,7 @@
 use colored::Colorize;
 
 use crate::features::core::*;
-use crate::memo::{ui, MemoBackend};
+use crate::memo::{MemoBackend, ui};
 
 pub fn list_tags_feature(
     db: &MemoBackend,

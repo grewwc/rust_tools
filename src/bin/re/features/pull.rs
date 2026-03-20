@@ -1,8 +1,8 @@
 use colored::Colorize;
 
 use crate::features::core::*;
-use crate::memo::sync;
 use crate::memo::MemoBackend;
+use crate::memo::sync;
 
 pub fn pull_single(db: &MemoBackend, pull_ref: &str, cli_host: &str) {
     println!("pulling...");

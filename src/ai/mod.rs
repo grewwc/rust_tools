@@ -106,7 +106,11 @@ struct Cli {
     #[arg(short = 'x', action = ArgAction::SetTrue, help = "ask without history")]
     no_history: bool,
 
-    #[arg(short = 'f', default_value = "", help = "input file names. seprated by comma.")]
+    #[arg(
+        short = 'f',
+        default_value = "",
+        help = "input file names. seprated by comma."
+    )]
     files: String,
 
     #[arg(short = 'o', long = "out", num_args = 0..=1, default_missing_value = "output.md", help = "write output to file. default is output.md")]
@@ -255,10 +259,7 @@ struct UploadResponse {
 fn normalize_single_dash_long_opts(args: impl Iterator<Item = String>) -> Vec<String> {
     args.map(|arg| {
         let bytes = arg.as_bytes();
-        if bytes.len() > 2
-            && bytes[0] == b'-'
-            && bytes[1] != b'-'
-            && bytes[1].is_ascii_alphabetic()
+        if bytes.len() > 2 && bytes[0] == b'-' && bytes[1] != b'-' && bytes[1].is_ascii_alphabetic()
         {
             format!("-{arg}")
         } else {
@@ -341,9 +342,8 @@ fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     let endpoint = cfg
         .get_opt("ai.model.endpoint")
         .unwrap_or_else(|| QWEN_ENDPOINT.to_string());
-    let vl_default_model = determine_vl_model(
-        &cfg.get_opt("ai.model.vl_default").unwrap_or_default(),
-    );
+    let vl_default_model =
+        determine_vl_model(&cfg.get_opt("ai.model.vl_default").unwrap_or_default());
     Ok(AppConfig {
         api_key,
         history_file: PathBuf::from(expanduser(&history_file).as_ref()),
@@ -479,16 +479,14 @@ impl PromptEditor {
                         match key.code {
                             KeyCode::Enter => break,
                             KeyCode::Char('d')
-                                if key.modifiers
-                                    == crossterm::event::KeyModifiers::CONTROL =>
+                                if key.modifiers == crossterm::event::KeyModifiers::CONTROL =>
                             {
                                 let _ = disable_raw_mode();
                                 println!();
                                 return Ok(None);
                             }
                             KeyCode::Char('c')
-                                if key.modifiers
-                                    == crossterm::event::KeyModifiers::CONTROL =>
+                                if key.modifiers == crossterm::event::KeyModifiers::CONTROL =>
                             {
                                 let _ = disable_raw_mode();
                                 println!();
@@ -532,8 +530,18 @@ impl PromptEditor {
                 terminal
                     .draw(|f| {
                         let area = f.area();
-                        let popup_height = area.height.saturating_sub(2).min(18).max(6).min(area.height);
-                        let popup_width = area.width.saturating_sub(4).min(110).max(40).min(area.width);
+                        let popup_height = area
+                            .height
+                            .saturating_sub(2)
+                            .min(18)
+                            .max(6)
+                            .min(area.height);
+                        let popup_width = area
+                            .width
+                            .saturating_sub(4)
+                            .min(110)
+                            .max(40)
+                            .min(area.width);
                         let popup = centered_rect(area, popup_width, popup_height);
 
                         let popup_block = Block::default()
@@ -587,7 +595,9 @@ impl PromptEditor {
                     .map_err(|e| io::Error::other(e.to_string()))?;
 
                 match event::read().map_err(|e| io::Error::other(e.to_string()))? {
-                    Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                    Event::Key(key)
+                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+                    {
                         match (key.code, key.modifiers) {
                             (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
                                 let content = textarea_content(&textarea);
@@ -606,7 +616,9 @@ impl PromptEditor {
                                     (KeyCode::Up, modifiers)
                                         if modifiers.is_empty() && textarea.cursor().0 == 0 =>
                                     {
-                                        if let Some(content) = history.previous(&textarea_content(&textarea)) {
+                                        if let Some(content) =
+                                            history.previous(&textarea_content(&textarea))
+                                        {
                                             replace_textarea_content(&mut textarea, &content);
                                             true
                                         } else {
@@ -615,7 +627,8 @@ impl PromptEditor {
                                     }
                                     (KeyCode::Down, modifiers)
                                         if modifiers.is_empty()
-                                            && textarea.cursor().0 + 1 >= textarea.lines().len() =>
+                                            && textarea.cursor().0 + 1
+                                                >= textarea.lines().len() =>
                                     {
                                         if let Some(content) = history.next() {
                                             replace_textarea_content(&mut textarea, &content);
@@ -625,7 +638,9 @@ impl PromptEditor {
                                         }
                                     }
                                     (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
-                                        if let Some(content) = history.previous(&textarea_content(&textarea)) {
+                                        if let Some(content) =
+                                            history.previous(&textarea_content(&textarea))
+                                        {
                                             replace_textarea_content(&mut textarea, &content);
                                             true
                                         } else {
@@ -1217,9 +1232,9 @@ fn do_request(
         enable_search: search_enabled(model).then_some(true),
     };
 
-    let should_use_long_upload =
-        (!app.attached_binary_files.is_empty() || !app.uploaded_file_ids.is_empty())
-            && !is_vl_model(model);
+    let should_use_long_upload = (!app.attached_binary_files.is_empty()
+        || !app.uploaded_file_ids.is_empty())
+        && !is_vl_model(model);
 
     if should_use_long_upload {
         request_body.model = QWEN_LONG.to_string();
@@ -1230,11 +1245,8 @@ fn do_request(
         }
 
         if !files_to_upload.is_empty() {
-            app.uploaded_file_ids = upload_qwen_long_files(
-                &app.client,
-                &app.config.api_key,
-                &files_to_upload,
-            )?;
+            app.uploaded_file_ids =
+                upload_qwen_long_files(&app.client, &app.config.api_key, &files_to_upload)?;
             app.attached_binary_files.clear();
             app.attached_image_files.clear();
         }
@@ -1415,7 +1427,8 @@ fn stream_response(
                 continue;
             }
         };
-        let content = extract_chunk_text(&chunk, &thinking_tag, &end_thinking_tag, &mut thinking_open);
+        let content =
+            extract_chunk_text(&chunk, &thinking_tag, &end_thinking_tag, &mut thinking_open);
         if content.is_empty() {
             continue;
         }
@@ -1589,8 +1602,10 @@ impl MarkdownStreamRenderer {
     }
 
     fn should_emit_table_preview_live(&self) -> bool {
-        matches!(self.table_state, TableState::PendingHeader { .. } | TableState::InTable { .. })
-            && line_looks_like_table_preview(&self.line_buf)
+        matches!(
+            self.table_state,
+            TableState::PendingHeader { .. } | TableState::InTable { .. }
+        ) && line_looks_like_table_preview(&self.line_buf)
     }
 
     fn consume_line(&mut self, line: &str, preview_emitted: bool) -> String {
@@ -1678,7 +1693,13 @@ impl MarkdownStreamRenderer {
                 }
 
                 let mut out = String::new();
-                out.push_str(&self.rewrite_table_preview(&indent, preview_height, &header, &align, &rows));
+                out.push_str(&self.rewrite_table_preview(
+                    &indent,
+                    preview_height,
+                    &header,
+                    &align,
+                    &rows,
+                ));
                 out.push_str(&self.consume_line(line, preview_emitted));
                 out
             }
@@ -1693,7 +1714,9 @@ impl MarkdownStreamRenderer {
         align: &[TableAlign],
         rows: &[Vec<String>],
     ) -> String {
-        let cols = header.len().max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+        let cols = header
+            .len()
+            .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
         if cols < 2 || preview_height == 0 {
             return String::new();
         }
@@ -1728,7 +1751,7 @@ impl MarkdownStreamRenderer {
             if line.is_empty() {
                 return "\n".to_string();
             }
-            return format!("\x1b[90m{line}\x1b[0m\n");
+            return format!("\x1b[97m{line}\x1b[0m\n");
         }
 
         if let Some((level, title)) = parse_heading(trimmed) {
@@ -1874,7 +1897,7 @@ fn render_inline_md(s: &str, base: &str) -> String {
             out.push_str("\x1b[1m");
         }
         if code {
-            out.push_str("\x1b[90m");
+            out.push_str("\x1b[96m");
         }
     }
 
@@ -2242,7 +2265,12 @@ fn render_table_bottom(indent: &str, widths: &[usize]) -> String {
     out
 }
 
-fn render_table_header(indent: &str, header: &[String], align: &[TableAlign], widths: &[usize]) -> String {
+fn render_table_header(
+    indent: &str,
+    header: &[String],
+    align: &[TableAlign],
+    widths: &[usize],
+) -> String {
     let cols = widths.len();
     if cols < 2 {
         return String::new();
@@ -2282,7 +2310,12 @@ fn render_table_header(indent: &str, header: &[String], align: &[TableAlign], wi
     out
 }
 
-fn render_table_row(indent: &str, row: &[String], align: &[TableAlign], widths: &[usize]) -> String {
+fn render_table_row(
+    indent: &str,
+    row: &[String],
+    align: &[TableAlign],
+    widths: &[usize],
+) -> String {
     let cols = widths.len();
     if cols < 2 {
         return String::new();
@@ -2354,7 +2387,11 @@ fn append_history(path: &PathBuf, content: &str) -> io::Result<()> {
 }
 
 fn print_info(model: &str) {
-    let search = if search_enabled(model) { "true" } else { "false" };
+    let search = if search_enabled(model) {
+        "true"
+    } else {
+        "false"
+    };
     print!("[{} (search: {})] ", model.green(), search.red());
     let _ = io::stdout().flush();
 }
@@ -2366,7 +2403,9 @@ fn upload_qwen_long_files(
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let mut ids = Vec::with_capacity(files.len());
     for file in files {
-        ids.push(upload_single_qwen_long_file_with_retry(client, api_key, file, 5)?);
+        ids.push(upload_single_qwen_long_file_with_retry(
+            client, api_key, file, 5,
+        )?);
     }
     Ok(ids)
 }
@@ -2423,7 +2462,9 @@ fn upload_single_qwen_long_file(
 }
 
 fn search_enabled(model: &str) -> bool {
-    ENABLE_SEARCH_MODELS.iter().any(|candidate| *candidate == model)
+    ENABLE_SEARCH_MODELS
+        .iter()
+        .any(|candidate| *candidate == model)
 }
 
 fn is_vl_model(model: &str) -> bool {
@@ -2569,10 +2610,8 @@ mod tests {
 
     #[test]
     fn multiline_history_navigation_restores_draft() {
-        let mut history = MultilineHistoryState::new(vec![
-            "first".to_string(),
-            "second\nline".to_string(),
-        ]);
+        let mut history =
+            MultilineHistoryState::new(vec!["first".to_string(), "second\nline".to_string()]);
 
         assert_eq!(history.previous("draft"), Some("second\nline".to_string()));
         assert_eq!(history.previous("ignored"), Some("first".to_string()));

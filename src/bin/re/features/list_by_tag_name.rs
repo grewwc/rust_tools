@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use colored::Colorize;
 
 use crate::features::core::*;
-use crate::memo::{history, sync, ui, MemoBackend};
+use crate::memo::{MemoBackend, history, sync, ui};
 
 pub fn list_by_tag_name_feature(
     db: &MemoBackend,
@@ -47,13 +47,17 @@ pub fn list_by_tag_name_feature(
         let host = resolve_host(&cli.host);
         let push_mode = cli.push.is_some();
         if push_mode {
-            let record_ids = records.iter().map(|record| record.id.clone()).collect::<Vec<_>>();
+            let record_ids = records
+                .iter()
+                .map(|record| record.id.clone())
+                .collect::<Vec<_>>();
             if !record_ids.is_empty() {
                 println!("begin to sync {} records...", record_ids.len());
-                let synced = sync::sync_records_to_host(db, &record_ids, &host).unwrap_or_else(|e| {
-                    eprintln!("{e}");
-                    std::process::exit(1);
-                });
+                let synced =
+                    sync::sync_records_to_host(db, &record_ids, &host).unwrap_or_else(|e| {
+                        eprintln!("{e}");
+                        std::process::exit(1);
+                    });
                 for record_id in &record_ids {
                     history::write_previous_operation(record_id);
                 }

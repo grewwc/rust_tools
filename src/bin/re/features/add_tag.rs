@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::features::core::*;
-use crate::memo::{history, MemoBackend};
+use crate::memo::{MemoBackend, history};
 
 pub fn add_or_del_tags_feature(db: &MemoBackend, cli: &Cli, add: bool) {
     let id_arg = if add {
@@ -18,7 +18,8 @@ pub fn add_or_del_tags_feature(db: &MemoBackend, cli: &Cli, add: bool) {
         std::process::exit(1);
     };
 
-    let tags = parse_tag_query(&crate::common::prompt::read_line("input the Tag: ").replace(',', " "));
+    let tags =
+        parse_tag_query(&crate::common::prompt::read_line("input the Tag: ").replace(',', " "));
     if tags.is_empty() {
         return;
     }

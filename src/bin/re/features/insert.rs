@@ -1,5 +1,5 @@
 use crate::features::core::*;
-use crate::memo::{history, MemoBackend};
+use crate::memo::{MemoBackend, history};
 
 pub fn insert_feature(db: &MemoBackend, cli: &Cli, use_vscode: bool) {
     let from_editor = cli.e && (cli.insert || pos_has(&cli.args, "i"));
@@ -48,7 +48,11 @@ pub fn insert_records(
         println!();
         title_list.push(title);
     } else {
-        title_list.push(crate::common::prompt::read_line("input the title: ").trim().to_string());
+        title_list.push(
+            crate::common::prompt::read_line("input the title: ")
+                .trim()
+                .to_string(),
+        );
     }
 
     let tags_str = if !tag_name.is_empty() {

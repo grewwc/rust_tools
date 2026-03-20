@@ -2,8 +2,8 @@ use std::io::{self, IsTerminal, Read};
 
 use clap::{ArgAction, Parser as ClapParser};
 use rust_decimal::Decimal;
-use rust_decimal::prelude::*;
 use rust_decimal::RoundingStrategy;
+use rust_decimal::prelude::*;
 
 const DEFAULT_PREC: usize = 16;
 
@@ -13,10 +13,20 @@ const E_DIGITS: &str = "2.71828182845904523536028747135266249775724709369995";
 #[derive(ClapParser, Debug)]
 #[command(about = "Command-line calculator (c)", long_about = None)]
 struct Cli {
-    #[arg(short = 'e', long = "expr", default_value = "", help = "explicit expression input")]
+    #[arg(
+        short = 'e',
+        long = "expr",
+        default_value = "",
+        help = "explicit expression input"
+    )]
     expr: String,
 
-    #[arg(short = 'f', long = "file", default_value = "", help = "read expression from file")]
+    #[arg(
+        short = 'f',
+        long = "file",
+        default_value = "",
+        help = "read expression from file"
+    )]
     file: String,
 
     #[arg(long = "prec", default_value_t = DEFAULT_PREC, help = "decimal digits after division/float functions (default: 16)")]
@@ -39,7 +49,8 @@ fn main() {
 fn normalize_args(args: impl Iterator<Item = String>) -> Vec<String> {
     args.map(|arg| {
         let bytes = arg.as_bytes();
-        if bytes.len() > 2 && bytes[0] == b'-' && bytes[1] != b'-' && bytes[1].is_ascii_alphabetic() {
+        if bytes.len() > 2 && bytes[0] == b'-' && bytes[1] != b'-' && bytes[1].is_ascii_alphabetic()
+        {
             format!("-{arg}")
         } else {
             arg
@@ -107,7 +118,10 @@ struct Token {
 
 impl Token {
     fn eof() -> Self {
-        Token { kind: TokenKind::Eof, value: String::new() }
+        Token {
+            kind: TokenKind::Eof,
+            value: String::new(),
+        }
     }
 }
 
@@ -122,7 +136,9 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
     while i < n {
         let ch = bytes[i];
         match ch {
-            b' ' => { i += 1; }
+            b' ' => {
+                i += 1;
+            }
             b'0'..=b'9' | b'.' => {
                 let start = i;
                 let mut dot_seen = ch == b'.';
@@ -144,9 +160,16 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                     }
                 }
                 let mut lit = input[start..i].to_string();
-                if lit.starts_with('.') { lit.insert(0, '0'); }
-                if lit.ends_with('.') { lit.push('0'); }
-                tokens.push(Token { kind: TokenKind::Number, value: clean_number(&lit) });
+                if lit.starts_with('.') {
+                    lit.insert(0, '0');
+                }
+                if lit.ends_with('.') {
+                    lit.push('0');
+                }
+                tokens.push(Token {
+                    kind: TokenKind::Number,
+                    value: clean_number(&lit),
+                });
             }
             b'a'..=b'z' | b'A'..=b'Z' | b'_' => {
                 let start = i;
@@ -154,15 +177,39 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
                 while i < n && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
-                tokens.push(Token { kind: TokenKind::Identifier, value: input[start..i].to_lowercase() });
+                tokens.push(Token {
+                    kind: TokenKind::Identifier,
+                    value: input[start..i].to_lowercase(),
+                });
             }
             b'+' | b'-' | b'*' | b'/' | b'%' | b'^' => {
-                tokens.push(Token { kind: TokenKind::Operator, value: (ch as char).to_string() });
+                tokens.push(Token {
+                    kind: TokenKind::Operator,
+                    value: (ch as char).to_string(),
+                });
                 i += 1;
             }
-            b'(' => { tokens.push(Token { kind: TokenKind::LParen, value: "(".into() }); i += 1; }
-            b')' => { tokens.push(Token { kind: TokenKind::RParen, value: ")".into() }); i += 1; }
-            b',' => { tokens.push(Token { kind: TokenKind::Comma, value: ",".into() }); i += 1; }
+            b'(' => {
+                tokens.push(Token {
+                    kind: TokenKind::LParen,
+                    value: "(".into(),
+                });
+                i += 1;
+            }
+            b')' => {
+                tokens.push(Token {
+                    kind: TokenKind::RParen,
+                    value: ")".into(),
+                });
+                i += 1;
+            }
+            b',' => {
+                tokens.push(Token {
+                    kind: TokenKind::Comma,
+                    value: ",".into(),
+                });
+                i += 1;
+            }
             _ => return Err(format!("unexpected character {:?}", ch as char)),
         }
     }
@@ -172,11 +219,17 @@ fn tokenize(input: &str) -> Result<Vec<Token>, String> {
 }
 
 fn ends_primary(tok: &Token) -> bool {
-    matches!(tok.kind, TokenKind::Number | TokenKind::Identifier | TokenKind::RParen)
+    matches!(
+        tok.kind,
+        TokenKind::Number | TokenKind::Identifier | TokenKind::RParen
+    )
 }
 
 fn starts_primary(tok: &Token) -> bool {
-    matches!(tok.kind, TokenKind::Number | TokenKind::Identifier | TokenKind::LParen)
+    matches!(
+        tok.kind,
+        TokenKind::Number | TokenKind::Identifier | TokenKind::LParen
+    )
 }
 
 fn insert_implicit_mul(tokens: Vec<Token>) -> Vec<Token> {
@@ -196,7 +249,10 @@ fn insert_implicit_mul(tokens: Vec<Token>) -> Vec<Token> {
             {
                 continue;
             }
-            res.push(Token { kind: TokenKind::Operator, value: "*".into() });
+            res.push(Token {
+                kind: TokenKind::Operator,
+                value: "*".into(),
+            });
         }
     }
     res.push(tokens[tokens.len() - 1].clone());
@@ -214,11 +270,18 @@ struct ExprParser {
 
 impl ExprParser {
     fn new(tokens: Vec<Token>, prec: usize, degree: bool) -> Self {
-        ExprParser { tokens, pos: 0, prec, degree }
+        ExprParser {
+            tokens,
+            pos: 0,
+            prec,
+            degree,
+        }
     }
 
     fn current(&self) -> &Token {
-        self.tokens.get(self.pos).map_or_else(|| &self.tokens[self.tokens.len() - 1], |t| t)
+        self.tokens
+            .get(self.pos)
+            .map_or_else(|| &self.tokens[self.tokens.len() - 1], |t| t)
     }
 
     fn advance(&mut self) {
@@ -285,7 +348,10 @@ impl ExprParser {
         let tok = self.current().clone();
         if tok.kind == TokenKind::Operator {
             match tok.value.as_str() {
-                "+" => { self.advance(); return self.parse_unary(); }
+                "+" => {
+                    self.advance();
+                    return self.parse_unary();
+                }
                 "-" => {
                     self.advance();
                     let v = self.parse_unary()?;
@@ -414,7 +480,8 @@ fn parse_decimal(s: &str) -> Result<Decimal, String> {
 }
 
 fn parse_f64(s: &str) -> Result<f64, String> {
-    s.parse::<f64>().map_err(|_| format!("invalid number {s:?}"))
+    s.parse::<f64>()
+        .map_err(|_| format!("invalid number {s:?}"))
 }
 
 fn round_to(d: Decimal, scale: u32) -> Decimal {
@@ -422,7 +489,9 @@ fn round_to(d: Decimal, scale: u32) -> Decimal {
 }
 
 fn negate(s: &str) -> String {
-    if s == "0" { return "0".into(); }
+    if s == "0" {
+        return "0".into();
+    }
     if let Some(stripped) = s.strip_prefix('-') {
         stripped.to_string()
     } else {
@@ -441,15 +510,21 @@ fn call_function(name: &str, args: &[String], prec: usize, degree: bool) -> Resu
         "sqrt" => {
             require_args(name, args, 1)?;
             let v = parse_f64(&args[0])?;
-            if v < 0.0 { return Err("sqrt requires a non-negative argument".into()); }
+            if v < 0.0 {
+                return Err("sqrt requires a non-negative argument".into());
+            }
             format_float(v.sqrt(), prec)
         }
         "sin" | "cos" | "tan" => {
             require_args(name, args, 1)?;
             let mut v = parse_f64(&args[0])?;
-            if degree { v = v.to_radians(); }
+            if degree {
+                v = v.to_radians();
+            }
             let r = match name {
-                "sin" => v.sin(), "cos" => v.cos(), _ => v.tan(),
+                "sin" => v.sin(),
+                "cos" => v.cos(),
+                _ => v.tan(),
             };
             format_float(r, prec)
         }
@@ -457,15 +532,21 @@ fn call_function(name: &str, args: &[String], prec: usize, degree: bool) -> Resu
             require_args(name, args, 1)?;
             let v = parse_f64(&args[0])?;
             let mut r = match name {
-                "asin" => v.asin(), "acos" => v.acos(), _ => v.atan(),
+                "asin" => v.asin(),
+                "acos" => v.acos(),
+                _ => v.atan(),
             };
-            if degree { r = r.to_degrees(); }
+            if degree {
+                r = r.to_degrees();
+            }
             format_float(r, prec)
         }
         "ln" => {
             require_args(name, args, 1)?;
             let v = parse_f64(&args[0])?;
-            if v <= 0.0 { return Err("ln requires a positive argument".into()); }
+            if v <= 0.0 {
+                return Err("ln requires a positive argument".into());
+            }
             format_float(v.ln(), prec)
         }
         "log" => {
@@ -473,7 +554,9 @@ fn call_function(name: &str, args: &[String], prec: usize, degree: bool) -> Resu
                 return Err("log expects 1 or 2 arguments".into());
             }
             let v = parse_f64(&args[0])?;
-            if v <= 0.0 { return Err("log requires a positive argument".into()); }
+            if v <= 0.0 {
+                return Err("log requires a positive argument".into());
+            }
             if args.len() == 1 {
                 return format_float(v.log10(), prec);
             }
@@ -504,11 +587,17 @@ fn call_function(name: &str, args: &[String], prec: usize, degree: bool) -> Resu
             }
             let d = parse_decimal(&args[0])?;
             if args.len() == 1 {
-                return Ok(clean_number(&d.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero).to_string()));
+                return Ok(clean_number(
+                    &d.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
+                        .to_string(),
+                ));
             }
-            let digits: i32 = args[1].parse().map_err(|_| "round precision must be an integer")?;
+            let digits: i32 = args[1]
+                .parse()
+                .map_err(|_| "round precision must be an integer")?;
             if digits >= 0 {
-                let rounded = d.round_dp_with_strategy(digits as u32, RoundingStrategy::MidpointAwayFromZero);
+                let rounded =
+                    d.round_dp_with_strategy(digits as u32, RoundingStrategy::MidpointAwayFromZero);
                 return Ok(clean_number(&rounded.to_string()));
             }
             // Negative digits: round to 10s, 100s, etc.
@@ -523,7 +612,9 @@ fn call_function(name: &str, args: &[String], prec: usize, degree: bool) -> Resu
             let mut best = parse_decimal(&args[0])?;
             for a in &args[1..] {
                 let v = parse_decimal(a)?;
-                if v < best { best = v; }
+                if v < best {
+                    best = v;
+                }
             }
             Ok(clean_number(&best.to_string()))
         }
@@ -534,7 +625,9 @@ fn call_function(name: &str, args: &[String], prec: usize, degree: bool) -> Resu
             let mut best = parse_decimal(&args[0])?;
             for a in &args[1..] {
                 let v = parse_decimal(a)?;
-                if v > best { best = v; }
+                if v > best {
+                    best = v;
+                }
             }
             Ok(clean_number(&best.to_string()))
         }
@@ -585,8 +678,23 @@ fn trim_constant_digits(value: &str, digits: usize) -> String {
 fn is_function_name(name: &str) -> bool {
     matches!(
         name,
-        "abs" | "acos" | "asin" | "atan" | "ceil" | "cos" | "exp" | "floor"
-            | "ln" | "log" | "max" | "min" | "pow" | "round" | "sin" | "sqrt" | "tan"
+        "abs"
+            | "acos"
+            | "asin"
+            | "atan"
+            | "ceil"
+            | "cos"
+            | "exp"
+            | "floor"
+            | "ln"
+            | "log"
+            | "max"
+            | "min"
+            | "pow"
+            | "round"
+            | "sin"
+            | "sqrt"
+            | "tan"
     )
 }
 
@@ -601,7 +709,9 @@ fn abs_str(s: &str) -> String {
 
 fn clean_number(s: &str) -> String {
     let s = s.trim();
-    if s.is_empty() { return "0".into(); }
+    if s.is_empty() {
+        return "0".into();
+    }
 
     // Remove leading +
     let s = s.strip_prefix('+').unwrap_or(s);
@@ -614,7 +724,11 @@ fn clean_number(s: &str) -> String {
     };
 
     // Normalise leading dot
-    let s = if s.starts_with('.') { format!("0{s}") } else { s.to_string() };
+    let s = if s.starts_with('.') {
+        format!("0{s}")
+    } else {
+        s.to_string()
+    };
 
     let s = if s.contains('.') {
         let s = s.trim_end_matches('0');
@@ -633,7 +747,11 @@ fn clean_number(s: &str) -> String {
     let int_part = if int_part.is_empty() { "0" } else { int_part };
 
     let result = if let Some(frac) = frac_part {
-        if frac.is_empty() { int_part.to_string() } else { format!("{int_part}.{frac}") }
+        if frac.is_empty() {
+            int_part.to_string()
+        } else {
+            format!("{int_part}.{frac}")
+        }
     } else {
         int_part.to_string()
     };
@@ -641,7 +759,11 @@ fn clean_number(s: &str) -> String {
     if result == "0" {
         return "0".into();
     }
-    if sign == "-" { format!("-{result}") } else { result }
+    if sign == "-" {
+        format!("-{result}")
+    } else {
+        result
+    }
 }
 
 fn format_float(v: f64, prec: usize) -> Result<String, String> {
