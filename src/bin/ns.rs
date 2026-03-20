@@ -1,6 +1,5 @@
 use std::{
     cmp::Ordering as CmpOrdering,
-    collections::HashMap,
     io::{self, IsTerminal, Write},
     sync::{
         Arc,
@@ -8,6 +7,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+use rust_tools::common::types::FastMap;
 
 const POLL_INTERVAL_MS: u64 = 500;
 const MIN_ACTIVE_KIB_PER_SEC: f64 = 0.01;
@@ -149,7 +150,7 @@ fn parse_macos_interfaces(content: &str) -> io::Result<Vec<InterfaceTotals>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty netstat output"))?;
     let (recv_idx, sent_idx) = get_input_output_index(header)?;
 
-    let mut interface_map: HashMap<String, NetTotals> = HashMap::new();
+    let mut interface_map: FastMap<String, NetTotals> = FastMap::default();
 
     for line in lines {
         let parts: Vec<&str> = line.split_whitespace().collect();
@@ -218,7 +219,7 @@ fn compute_speeds(prev: &Snapshot, curr: &Snapshot) -> Option<(Vec<InterfaceSpee
         return None;
     }
 
-    let mut prev_map = HashMap::new();
+    let mut prev_map = FastMap::default();
     for iface in &prev.interfaces {
         prev_map.insert(iface.name.as_str(), iface.totals);
     }

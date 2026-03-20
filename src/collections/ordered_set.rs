@@ -1,9 +1,11 @@
-use std::{borrow::Borrow, collections::HashSet, fmt, hash::Hash};
+use std::{borrow::Borrow, fmt, hash::Hash};
+
+use crate::common::types::FastSet;
 
 #[derive(Clone)]
 pub struct OrderedSet<T> {
     order: Vec<T>,
-    set: HashSet<T>,
+    set: FastSet<T>,
 }
 
 impl<T> OrderedSet<T>
@@ -13,7 +15,7 @@ where
     pub fn new() -> Self {
         Self {
             order: Vec::new(),
-            set: HashSet::new(),
+            set: FastSet::default(),
         }
     }
 

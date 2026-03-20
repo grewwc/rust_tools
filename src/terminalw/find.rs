@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     path::Path,
     sync::{
         Arc, Condvar, Mutex,
@@ -7,14 +6,16 @@ use std::{
     },
 };
 
+use crate::common::types::FastSet;
+
 pub struct SyncSet {
-    inner: Mutex<HashSet<String>>,
+    inner: Mutex<FastSet<String>>,
 }
 
 impl SyncSet {
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashSet::new()),
+            inner: Mutex::new(FastSet::default()),
         }
     }
 

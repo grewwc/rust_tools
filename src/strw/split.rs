@@ -1,7 +1,4 @@
 use std::io::Read;
-use std::{collections::HashSet, hash::BuildHasherDefault};
-
-use rustc_hash::FxHasher;
 
 use crate::common::types::FastSet;
 
@@ -301,23 +298,11 @@ pub struct QuoteSplit<'a> {
 
 impl<'a> QuoteSplit<'a> {
     pub fn new(text: &'a str, split_chars: &'a str, symbols: &'a str) -> Self {
-        let mut symbol_set: HashSet<char, BuildHasherDefault<FxHasher>> =
-            HashSet::with_capacity_and_hasher(
-                symbols.len(),
-                BuildHasherDefault::<FxHasher>::default(),
-            );
+        let mut symbol_set: FastSet<char> = FastSet::default();
+        symbol_set.extend(symbols.chars());
 
-        symbols.chars().for_each(|ch| {
-            symbol_set.insert(ch);
-        });
-
-        let mut split_chars_set = HashSet::with_capacity_and_hasher(
-            split_chars.len(),
-            BuildHasherDefault::<FxHasher>::default(),
-        );
-        split_chars.chars().for_each(|ch| {
-            split_chars_set.insert(ch);
-        });
+        let mut split_chars_set: FastSet<char> = FastSet::default();
+        split_chars_set.extend(split_chars.chars());
 
         QuoteSplit {
             text,

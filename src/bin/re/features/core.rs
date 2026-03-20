@@ -1,4 +1,3 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use colored::Colorize;
@@ -8,6 +7,7 @@ use rust_tools::terminalw;
 
 use crate::common::configw;
 use crate::common::prompt;
+use crate::common::types::{FastMap, FastSet};
 use crate::memo::{MemoBackend, MemoBackendMode, MemoMongo, MemoRecord, MemoTag, history};
 
 pub static NUMBERED_ITEM_RE: LazyLock<Regex> =
@@ -560,7 +560,7 @@ pub fn resolve_record_ref_local(
         .unwrap_or_default();
 
     let mut exact = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FastSet::default();
     for r in &records {
         if (primary_title(&r.title).eq_ignore_ascii_case(&reference)
             || r.title.trim().eq_ignore_ascii_case(&reference))
@@ -627,7 +627,7 @@ pub fn compute_tags_from_records(
         records.retain(|r| !is_special_record(r, &patterns));
     }
 
-    let mut map: HashMap<String, (i64, i64)> = HashMap::new();
+    let mut map: FastMap<String, (i64, i64)> = FastMap::default();
     for record in records {
         let modified = record.modified_date;
         for tag in record.tags {

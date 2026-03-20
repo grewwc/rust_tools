@@ -1,7 +1,7 @@
-use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
+use crate::common::types::FastSet;
 use crate::memo::{MemoBackend, db::MemoDb, history};
 
 const REMOTE_SQLITE_PATH: &str = "~/.go_tools_memo.sqlite3";
@@ -51,7 +51,7 @@ pub fn sync_records_to_host(
 }
 
 fn unique_non_empty_record_ids(record_ids: &[String]) -> Vec<String> {
-    let mut seen = HashSet::new();
+    let mut seen = FastSet::default();
     let mut unique = Vec::new();
     for record_id in record_ids {
         let record_id = record_id.trim();

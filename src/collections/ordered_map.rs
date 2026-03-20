@@ -1,9 +1,11 @@
-use std::{borrow::Borrow, collections::HashMap, fmt, hash::Hash};
+use std::{borrow::Borrow, fmt, hash::Hash};
+
+use crate::common::types::FastMap;
 
 #[derive(Clone)]
 pub struct OrderedMap<K, V> {
     order: Vec<K>,
-    map: HashMap<K, V>,
+    map: FastMap<K, V>,
 }
 
 impl<K, V> OrderedMap<K, V>
@@ -13,7 +15,7 @@ where
     pub fn new() -> Self {
         Self {
             order: Vec::new(),
-            map: HashMap::new(),
+            map: FastMap::default(),
         }
     }
 

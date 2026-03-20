@@ -1,8 +1,8 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::common::types::{FastMap, FastSet};
 use crate::memo::model::MemoRecord;
 
 const SEARCH_MIN_INFORMATIVE_COVERAGE: f64 = 0.2;
@@ -22,8 +22,8 @@ const SEARCH_GENERIC_SUFFIXES: &[&str] = &[
 
 static SEARCH_URL_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)https?://\S+").expect("invalid search url regex"));
-static SEARCH_SYNONYM_INDEX: LazyLock<HashMap<String, usize>> = LazyLock::new(|| {
-    let mut index = HashMap::new();
+static SEARCH_SYNONYM_INDEX: LazyLock<FastMap<String, usize>> = LazyLock::new(|| {
+    let mut index = FastMap::default();
     for (group_idx, group) in SEARCH_SYNONYM_GROUPS.iter().enumerate() {
         for term in *group {
             let normalized = compact_search_text(term);
@@ -35,7 +35,7 @@ static SEARCH_SYNONYM_INDEX: LazyLock<HashMap<String, usize>> = LazyLock::new(||
     index
 });
 static SEARCH_KNOWN_TERMS: LazyLock<Vec<String>> = LazyLock::new(|| {
-    let mut seen = HashSet::new();
+    let mut seen = FastSet::default();
     let mut terms = Vec::new();
     for group in SEARCH_SYNONYM_GROUPS {
         for term in *group {
@@ -47,7 +47,7 @@ static SEARCH_KNOWN_TERMS: LazyLock<Vec<String>> = LazyLock::new(|| {
     }
     terms
 });
-static SEARCH_IGNORED_TOKENS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+static SEARCH_IGNORED_TOKENS: LazyLock<FastSet<String>> = LazyLock::new(|| {
     SEARCH_GENERIC_SUFFIXES
         .iter()
         .map(|token| compact_search_text(token))
@@ -60,7 +60,7 @@ struct SearchDocument {
     normalized: String,
     compact: String,
     tokens: Vec<String>,
-    ngrams: HashMap<String, usize>,
+    ngrams: FastMap<String, usize>,
     has_url: bool,
     requests_url: bool,
 }
@@ -260,7 +260,7 @@ fn search_coverage_score(query_tokens: &[String], candidate_tokens: &[String]) -
 
 fn filter_search_informative_tokens(tokens: &[String]) -> Vec<String> {
     let mut result = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FastSet::default();
     for token in tokens {
         let token = compact_search_text(token);
         if token.is_empty() || SEARCH_IGNORED_TOKENS.contains(&token) {
@@ -419,7 +419,7 @@ fn tokenize_normalized_search_text(normalized: &str) -> Vec<String> {
     }
 
     let mut tokens = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FastSet::default();
     for chunk in normalized.split_whitespace() {
         let parts = split_mixed_search_token(chunk);
         for part in parts {
@@ -433,7 +433,7 @@ fn tokenize_normalized_search_text(normalized: &str) -> Vec<String> {
     tokens
 }
 
-fn append_search_token(tokens: &mut Vec<String>, seen: &mut HashSet<String>, token: &str) {
+fn append_search_token(tokens: &mut Vec<String>, seen: &mut FastSet<String>, token: &str) {
     let token = compact_search_text(token);
     if token.is_empty() || SEARCH_IGNORED_TOKENS.contains(&token) || !seen.insert(token.clone()) {
         return;
@@ -441,7 +441,7 @@ fn append_search_token(tokens: &mut Vec<String>, seen: &mut HashSet<String>, tok
     tokens.push(token);
 }
 
-fn append_known_search_terms(token: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+fn append_known_search_terms(token: &str, out: &mut Vec<String>, seen: &mut FastSet<String>) {
     let compact = compact_search_text(token);
     if compact.is_empty() {
         return;
@@ -453,7 +453,7 @@ fn append_known_search_terms(token: &str, out: &mut Vec<String>, seen: &mut Hash
     }
 }
 
-fn append_derived_search_terms(token: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+fn append_derived_search_terms(token: &str, out: &mut Vec<String>, seen: &mut FastSet<String>) {
     let compact = compact_search_text(token);
     if compact.is_empty() {
         return;
@@ -488,7 +488,7 @@ fn strip_generic_search_suffixes(token: &str) -> String {
     stripped
 }
 
-fn append_han_search_prefixes(token: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+fn append_han_search_prefixes(token: &str, out: &mut Vec<String>, seen: &mut FastSet<String>) {
     let runes = token.chars().collect::<Vec<_>>();
     if runes.len() < 3 {
         return;
@@ -547,13 +547,13 @@ fn contains_url(text: &str) -> bool {
     lower.contains("http://") || lower.contains("https://")
 }
 
-fn build_search_ngrams(compact: &str) -> HashMap<String, usize> {
+fn build_search_ngrams(compact: &str) -> FastMap<String, usize> {
     if compact.is_empty() {
-        return HashMap::new();
+        return FastMap::default();
     }
 
     let runes = compact.chars().collect::<Vec<_>>();
-    let mut ngrams = HashMap::new();
+    let mut ngrams = FastMap::default();
     if runes.len() == 1 {
         ngrams.insert(compact.to_string(), 1);
         return ngrams;
@@ -576,7 +576,7 @@ fn build_search_ngrams(compact: &str) -> HashMap<String, usize> {
     ngrams
 }
 
-fn dice_coefficient(left: &HashMap<String, usize>, right: &HashMap<String, usize>) -> f64 {
+fn dice_coefficient(left: &FastMap<String, usize>, right: &FastMap<String, usize>) -> f64 {
     if left.is_empty() || right.is_empty() {
         return 0.0;
     }

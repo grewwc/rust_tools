@@ -1,5 +1,4 @@
-use std::collections::HashSet;
-
+use crate::common::types::FastSet;
 use crate::features::core::*;
 use crate::memo::{MemoBackend, history};
 
@@ -27,7 +26,7 @@ pub fn add_or_del_tags_feature(db: &MemoBackend, cli: &Cli, add: bool) {
     if add {
         let _ = db.add_tags(&id, &tags);
     } else {
-        let mut remain = record.tags.iter().cloned().collect::<HashSet<_>>();
+        let mut remain = record.tags.iter().cloned().collect::<FastSet<_>>();
         for t in &tags {
             remain.remove(t);
         }

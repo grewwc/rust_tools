@@ -1,12 +1,11 @@
-use std::collections::{HashMap, HashSet};
-
+use crate::common::types::{FastMap, FastSet};
 use crate::strw::split;
 
 pub fn add_quote(slice: &[String]) -> Vec<String> {
     slice.iter().map(|s| format!("{s:?}")).collect()
 }
 
-pub fn map_to_string(m: &HashMap<String, String>) -> String {
+pub fn map_to_string(m: &FastMap<String, String>) -> String {
     let mut out = String::new();
     for (k, v) in m {
         if v.trim().contains(' ') {
@@ -18,8 +17,8 @@ pub fn map_to_string(m: &HashMap<String, String>) -> String {
     out
 }
 
-pub fn format_file_extensions(extensions: &str) -> HashSet<String> {
-    let mut out = HashSet::new();
+pub fn format_file_extensions(extensions: &str) -> FastSet<String> {
+    let mut out = FastSet::default();
     let normalized = extensions.replace(',', " ");
     for ext in split::split_no_empty(&normalized, " ") {
         let e = ext.trim();

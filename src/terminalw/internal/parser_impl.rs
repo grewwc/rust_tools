@@ -1,6 +1,7 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use crate::collections::trie::Trie;
+use crate::common::types::FastSet;
 use crate::strw::{indices, split};
 
 use super::{EncodedArgs, FlagDef, FlagType, Parser};
@@ -205,7 +206,7 @@ fn define_flag(p: &mut Parser, name: &str, ty: FlagType, default_value: String, 
 }
 
 fn parse_args_encoded(p: &mut Parser, encoded: &str, bool_opts: &[String]) {
-    let supported = p.flags.keys().cloned().collect::<HashSet<_>>();
+    let supported = p.flags.keys().cloned().collect::<FastSet<_>>();
 
     let mut cmd = encoded.to_string();
     for name in p.flags.keys().cloned().collect::<Vec<_>>() {

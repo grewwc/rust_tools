@@ -106,7 +106,7 @@ impl PromptEditor {
     fn read_multi_line_tui(&mut self) -> io::Result<Option<String>> {
         use crossterm::{
             event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-            terminal::{disable_raw_mode, enable_raw_mode},
+            terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size},
         };
         use ratatui::{
             Terminal,
@@ -118,56 +118,17 @@ impl PromptEditor {
         };
         use tui_textarea::{CursorMove, Input, TextArea};
 
-        {
-            use crossterm::{
-                event::{self, Event, KeyCode, KeyEventKind},
-                terminal::{disable_raw_mode, enable_raw_mode},
-            };
-            print!("\x1b[2m[Press Enter to compose next message, Ctrl+D/Ctrl+C to quit]\x1b[0m ");
-            io::stdout().flush()?;
-            enable_raw_mode()?;
-            loop {
-                match event::read() {
-                    Ok(Event::Key(key))
-                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                    {
-                        match key.code {
-                            KeyCode::Enter => break,
-                            KeyCode::Char('d')
-                                if key.modifiers == crossterm::event::KeyModifiers::CONTROL =>
-                            {
-                                let _ = disable_raw_mode();
-                                println!();
-                                return Ok(None);
-                            }
-                            KeyCode::Char('c')
-                                if key.modifiers == crossterm::event::KeyModifiers::CONTROL =>
-                            {
-                                let _ = disable_raw_mode();
-                                println!();
-                                return Ok(None);
-                            }
-                            _ => {}
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        let _ = disable_raw_mode();
-                        return Err(io::Error::other(e.to_string()));
-                    }
-                }
-            }
-            let _ = disable_raw_mode();
-            println!();
-        }
-
         enable_raw_mode()?;
+
+        let viewport_height = terminal_size()
+            .map(|(_, h)| h.saturating_sub(10).clamp(12, 24))
+            .unwrap_or(18);
 
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = match Terminal::with_options(
             backend,
             ratatui::TerminalOptions {
-                viewport: ratatui::Viewport::Inline(18),
+                viewport: ratatui::Viewport::Inline(viewport_height),
             },
         ) {
             Ok(terminal) => terminal,
@@ -185,18 +146,9 @@ impl PromptEditor {
                 terminal
                     .draw(|f| {
                         let area = f.area();
-                        let popup_height = area
-                            .height
-                            .saturating_sub(2)
-                            .min(18)
-                            .max(6)
-                            .min(area.height);
-                        let popup_width = area
-                            .width
-                            .saturating_sub(4)
-                            .min(110)
-                            .max(40)
-                            .min(area.width);
+                        let popup_height = area.height.saturating_sub(4).clamp(10, 18);
+                        let popup_width =
+                            area.width.saturating_sub(4).clamp(40, 110).min(area.width);
                         let popup = centered_rect(area, popup_width, popup_height);
 
                         let popup_block = Block::default()
@@ -229,9 +181,12 @@ impl PromptEditor {
                                     Span::raw("  "),
                                     Span::styled("Enter", Style::default().fg(Color::Blue)),
                                     Span::raw(" newline  ·  "),
-                                    Span::styled("Ctrl+D", Style::default().fg(Color::Green)),
+                                    Span::styled(
+                                        "Esc/Ctrl+D",
+                                        Style::default().fg(Color::Green),
+                                    ),
                                     Span::raw(" send  ·  "),
-                                    Span::styled("Ctrl+C/Esc", Style::default().fg(Color::Yellow)),
+                                    Span::styled("Ctrl+C", Style::default().fg(Color::Yellow)),
                                     Span::raw(" cancel"),
                                 ]),
                                 Line::from(vec![
@@ -254,7 +209,7 @@ impl PromptEditor {
                         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
                     {
                         match (key.code, key.modifiers) {
-                            (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                            (code, modifiers) if is_submit_key(code, modifiers) => {
                                 let content = textarea_content(&textarea);
                                 let trimmed = content.trim_end_matches('\n').to_string();
                                 break Ok(if trimmed.trim().is_empty() {
@@ -263,7 +218,7 @@ impl PromptEditor {
                                     Some(trimmed)
                                 });
                             }
-                            (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+                            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                                 break Ok(None);
                             }
                             _ => {
@@ -419,9 +374,37 @@ fn replace_textarea_content(textarea: &mut tui_textarea::TextArea<'_>, content: 
     *textarea = tui_textarea::TextArea::new(lines);
 }
 
+fn is_submit_key(code: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    match (code, modifiers) {
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) => true,
+        (KeyCode::Esc, KeyModifiers::NONE) => true,
+        _ => false,
+    }
+}
+
 pub(super) fn trim_trailing_newline(mut line: String) -> String {
     while matches!(line.chars().last(), Some('\n' | '\r')) {
         line.pop();
     }
     line
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+
+    #[test]
+    fn submit_key_recognizes_ctrl_d() {
+        assert!(is_submit_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(!is_submit_key(KeyCode::Char('d'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn submit_key_recognizes_esc() {
+        assert!(is_submit_key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!is_submit_key(KeyCode::Esc, KeyModifiers::SHIFT));
+    }
 }

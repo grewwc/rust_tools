@@ -1,18 +1,18 @@
 use std::{
-    collections::HashMap,
     fs,
     io::{self, BufRead},
     path::{Path, PathBuf},
     sync::{LazyLock, RwLock},
 };
 
+use crate::common::types::FastMap;
 use crate::common::utils::expanduser;
 use crate::strw::split::split_by_str_keep_quotes;
 
 #[derive(Debug, Clone, Default)]
 pub struct ConfigW {
     entries: Vec<(String, String)>,
-    index: HashMap<String, usize>,
+    index: FastMap<String, usize>,
 }
 
 impl ConfigW {

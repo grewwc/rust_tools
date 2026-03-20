@@ -1,11 +1,12 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     sync::{Arc, Mutex},
 };
 
 use rustc_hash::FxHashMap;
 
 use crate::collections::{deque_list::DequeList, ordered_map::OrderedMap, ordered_set::OrderedSet};
+use crate::common::types::FastSet;
 
 use super::actiontype::ActionList;
 
@@ -43,7 +44,7 @@ pub struct Parser {
     groups: OrderedMap<String, Parser>,
     flags: FxHashMap<String, FlagDef>,
     default_val_map: FxHashMap<String, String>,
-    bool_option_set: HashSet<String>,
+    bool_option_set: FastSet<String>,
     alias_map: FxHashMap<String, String>,
 
     cmd: String,
@@ -74,7 +75,7 @@ impl Parser {
             groups: OrderedMap::new(),
             flags: FxHashMap::default(),
             default_val_map: FxHashMap::default(),
-            bool_option_set: HashSet::new(),
+            bool_option_set: FastSet::default(),
             alias_map: FxHashMap::default(),
             cmd: String::new(),
             enable_parse_num: true,
