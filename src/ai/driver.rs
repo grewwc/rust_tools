@@ -95,7 +95,6 @@ pub(super) fn handle_sigint(
 
 fn run_loop(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let mut should_quit = !app.cli.args.is_empty();
-    let mut replied_once = false;
     loop {
         if app.shutdown.load(Ordering::SeqCst) {
             return Ok(());
@@ -149,52 +148,7 @@ fn run_loop(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
             writer.write_all(b"\n---\n")?;
             writer.flush()?;
         }
-
-        if should_pause_after_reply(app, replied_once) {
-            wait_for_next_input(app)?;
-        }
-        replied_once = true;
     }
-}
-
-fn should_pause_after_reply(app: &App, replied_once: bool) -> bool {
-    app.cli.multi_line && app.prompt_editor.is_some() && replied_once
-}
-
-fn wait_for_next_input(app: &mut App) -> io::Result<()> {
-    use std::io::{IsTerminal, Write};
-
-    use crossterm::{
-        event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-        terminal::{disable_raw_mode, enable_raw_mode},
-    };
-
-    if !io::stdout().is_terminal() {
-        return Ok(());
-    }
-
-    print!("\x1b[2m(按 Enter 开始下一次输入)\x1b[0m");
-    io::stdout().flush()?;
-
-    enable_raw_mode()?;
-    let outcome: io::Result<()> = (|| loop {
-        match event::read().map_err(|e| io::Error::other(e.to_string()))? {
-            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                match (key.code, key.modifiers) {
-                    (KeyCode::Enter, _) => break Ok(()),
-                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                        app.shutdown.store(true, Ordering::SeqCst);
-                        break Ok(());
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    })();
-    let _ = disable_raw_mode();
-    println!();
-    outcome
 }
 
 fn drain_response(response: &mut Response) -> Result<(), Box<dyn std::error::Error>> {
@@ -202,71 +156,7 @@ fn drain_response(response: &mut Response) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ai::types::AppConfig;
-    use std::path::PathBuf;
 
-    #[test]
-    fn pause_after_reply_requires_multiline_interactive_and_not_first() {
-        let cli = Cli {
-            history: 0,
-            model: String::new(),
-            multi_line: true,
-            code: false,
-            deepseek: false,
-            clear: false,
-            clipboard: false,
-            no_history: false,
-            files: String::new(),
-            out: None,
-            raw: false,
-            thinking: false,
-            short_output: false,
-            model_0: false,
-            model_1: false,
-            model_2: false,
-            model_3: false,
-            model_4: false,
-            model_5: false,
-            model_6: false,
-            args: Vec::new(),
-        };
-
-        let mut app = App {
-            pending_files: None,
-            pending_clipboard: false,
-            pending_short_output: false,
-            current_model: String::new(),
-            raw_args: String::new(),
-            cli,
-            config: AppConfig {
-                api_key: String::new(),
-                history_file: PathBuf::new(),
-                endpoint: String::new(),
-                vl_default_model: String::new(),
-            },
-            client: reqwest::blocking::Client::builder().build().unwrap(),
-            attached_image_files: Vec::new(),
-            attached_binary_files: Vec::new(),
-            uploaded_file_ids: Vec::new(),
-            shutdown: Arc::new(AtomicBool::new(false)),
-            streaming: Arc::new(AtomicBool::new(false)),
-            cancel_stream: Arc::new(AtomicBool::new(false)),
-            writer: None,
-            prompt_editor: Some(PromptEditor::new()),
-        };
-
-        assert!(!should_pause_after_reply(&app, false));
-        assert!(should_pause_after_reply(&app, true));
-        app.cli.multi_line = false;
-        assert!(!should_pause_after_reply(&app, true));
-        app.cli.multi_line = true;
-        app.prompt_editor = None;
-        assert!(!should_pause_after_reply(&app, true));
-    }
-}
 
 fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn std::error::Error>> {
     if !app.cli.args.is_empty() {
