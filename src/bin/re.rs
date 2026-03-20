@@ -1,4 +1,3 @@
-use clap::Parser;
 pub use rust_tools::cmd;
 pub use rust_tools::common;
 pub use rust_tools::strw;
@@ -10,18 +9,20 @@ mod memo;
 mod features;
 
 use features::*;
+use std::sync::Arc;
 
 const DEFAULT_TXT_OUTPUT_NAME: &str = "output.txt";
 
 fn main() {
     let argv = normalize_legacy_single_dash_long_args(std::env::args());
-    let mut cli = Cli::parse_from(argv);
-    maybe_parse_positional_limit(&mut cli);
+    let (mut parser, cli) = parse_cli_and_parser(argv);
 
     let db = open_backend(&cli).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1);
     });
+    let db = Arc::new(db);
+    let cli = Arc::new(cli);
 
     let to_binary = cli.binary || cli.b;
     let all = (cli.all
@@ -40,12 +41,12 @@ fn main() {
         .as_deref()
         .map(|s| {
             if s.trim().is_empty() {
-                DEFAULT_TXT_OUTPUT_NAME
+                DEFAULT_TXT_OUTPUT_NAME.to_string()
             } else {
-                s.trim()
+                s.trim().to_string()
             }
         })
-        .unwrap_or("");
+        .unwrap_or_default();
 
     let tag_query_raw = get_tag_query_raw(&cli);
     let tag_query_non_empty = tag_query_raw
@@ -53,158 +54,29 @@ fn main() {
         .is_some_and(|s| !s.trim().is_empty());
     let list_tags_and_order_by_time = order_by_time(&cli, tag_query_raw.as_deref());
 
-    if cli.unfinish.is_some() || pos_has(&cli.args, "nf") {
-        finish::handle_finish_command(&db, &cli, cli.unfinish.as_deref(), false, prefix);
-        return;
-    }
+    let title_query = first_non_empty(&[cli.title.as_str(), cli.content.as_str()]).to_string();
 
-    if cli.finish.is_some() {
-        finish::handle_finish_command(&db, &cli, cli.finish.as_deref(), true, prefix);
-        return;
-    }
-
-    if pos_has(&cli.args, "open") || pos_has(&cli.args, "o") {
-        open::open_urls(&db, &cli.args, prefix);
-        return;
-    }
-
-    if cli.clean_tag.is_some() {
-        clean_tag::clean_by_tags(&db, cli.clean_tag.as_deref().unwrap_or(""));
-        return;
-    }
-
-    if should_log_command(&cli) {
-        log::handle_log(&db, &cli, use_vscode);
-        return;
-    }
-
-    if pos_has(&cli.args, "week") {
-        week::handle_week(&db);
-        return;
-    }
-
-    if should_insert_feature(&cli) {
-        insert::insert_feature(&db, &cli, use_vscode);
-        return;
-    }
-
-    if should_list_tags_feature(&cli, list_tags_and_order_by_time) {
-        list_tags::list_tags_feature(
-            &db,
-            &cli,
-            record_limit,
-            reverse,
-            all,
-            list_special,
-            list_tags_and_order_by_time,
-        );
-        return;
-    }
-
-    if should_update_feature(&cli) {
-        update::update_feature(&db, &cli, prefix, use_vscode);
-        return;
-    }
-
-    if cli.change_title.is_some() {
-        change_title::change_title_feature(&db, &cli, use_vscode);
-        return;
-    }
-
-    if cli.delete.is_some() || pos_has(&cli.args, "d") {
-        delete::delete_feature(&db, &cli);
-        return;
-    }
-
-    if cli.add_tag.is_some() {
-        add_tag::add_or_del_tags_feature(&db, &cli, true);
-        return;
-    }
-
-    if cli.del_tag.is_some() {
-        del_tag::add_or_del_tags_feature(&db, &cli, false);
-        return;
-    }
-
-    if let Some(push_ref) = cli.push.as_deref()
-        && !push_ref.trim().is_empty()
-    {
-        push::push_single(&db, push_ref, &cli.host);
-        return;
-    }
-
-    let title_query = first_non_empty(&[cli.title.as_str(), cli.content.as_str()]);
-    if !title_query.trim().is_empty() {
-        list_by_title::list_by_title_feature(
-            &db,
-            title_query,
-            tag_query_raw.as_deref().unwrap_or(""),
-            cli.r#and,
-            prefix,
-            record_limit,
-            reverse,
-            include_finished,
-            out_name,
-            to_binary,
-            cli.count,
-            cli.verbose,
-            cli.force,
-        );
-        return;
-    }
-
-    if !cli.search.trim().is_empty() {
-        search::search_feature(
-            &db,
-            &cli.search,
-            tag_query_raw.as_deref().unwrap_or(""),
-            cli.r#and,
-            prefix,
-            record_limit,
-            include_finished,
-            list_special,
-            out_name,
-            to_binary,
-            cli.count,
-            cli.verbose,
-            cli.force,
-        );
-        return;
-    }
-
-    if should_list_by_tag_name(
+    let ctx = Arc::new(features::register::ReContext {
+        db: Arc::clone(&db),
+        cli: Arc::clone(&cli),
+        prefix,
+        use_vscode,
+        list_special,
+        reverse,
+        all,
+        include_finished,
+        record_limit,
+        out_name,
+        to_binary,
+        only_tags,
+        tag_query_raw,
         tag_query_non_empty,
         list_tags_and_order_by_time,
         title_query,
-        &cli.search,
-    ) {
-        list_by_tag_name::list_by_tag_name_feature(
-            &db,
-            tag_query_raw.as_deref().unwrap_or(""),
-            &cli,
-            prefix,
-            record_limit,
-            reverse,
-            include_finished,
-            list_special,
-            only_tags,
-            to_binary,
-            out_name,
-        );
-        return;
-    }
+    });
 
-    if let Some(pull_ref) = cli.pull.as_deref() {
-        pull::pull_single(&db, pull_ref, &cli.host);
-        return;
-    }
-
-    if cli.push.is_some() {
-        push::push_single(&db, "", &cli.host);
-        return;
-    }
-
-    default_print::default_print(&db, record_limit, list_special);
+    features::register::register_all(&mut parser, ctx);
+    let _ = parser.execute_first();
 }
 
 #[cfg(test)]
@@ -214,7 +86,7 @@ mod tests {
     #[test]
     fn parse_ie_sets_insert_and_editor() {
         let argv = normalize_legacy_single_dash_long_args(["re".to_string(), "-ie".to_string()]);
-        let cli = Cli::parse_from(argv);
+        let cli = parse_cli_and_parser(argv).1;
         assert!(cli.insert);
         assert!(cli.e);
     }
@@ -240,6 +112,18 @@ mod tests {
             normalized,
             "1. 第一条：https://example.com/abc\n2. 第二条：https://example.com/defghi\n3. 第三条：https://example.com/xyz"
         );
+    }
+
+    #[test]
+    fn parse_backend_with_equals_value() {
+        let argv = normalize_legacy_single_dash_long_args([
+            "re".to_string(),
+            "-backend=mongo".to_string(),
+            "-n=12".to_string(),
+        ]);
+        let cli = parse_cli_and_parser(argv).1;
+        assert_eq!(cli.backend, "mongo");
+        assert_eq!(cli.n, 12);
     }
 
     #[test]

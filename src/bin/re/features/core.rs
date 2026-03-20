@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
-use clap::Parser;
 use colored::Colorize;
 use regex::Regex;
+
+use rust_tools::terminalw;
 
 use crate::common::configw;
 use crate::common::prompt;
@@ -16,222 +17,55 @@ pub static WRAPPED_NUMBERED_ITEM_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("invalid wrapped numbered item regex")
 });
 
-#[derive(Parser, Debug, Clone)]
-#[command(about = "Memo record tool (go_tools re compatible)")]
+#[derive(Debug, Clone)]
 pub struct Cli {
-    #[arg(
-        long,
-        default_value = "",
-        help = "backend: auto|mongo|sqlite. '.configW:re.backend'"
-    )]
     pub backend: String,
-
-    #[arg(short = 'i', default_value_t = false, help = "insert a record")]
     pub insert: bool,
-
-    #[arg(
-        long = "ct",
-        num_args = 0..=1,
-        default_missing_value = "",
-        help = "change a record title"
-    )]
     pub change_title: Option<String>,
-
-    #[arg(
-        short = 'u',
-        num_args = 0..=1,
-        default_missing_value = "",
-        help = "update a record"
-    )]
     pub update: Option<String>,
-
-    #[arg(
-        short = 'd',
-        num_args = 0..=1,
-        default_missing_value = "",
-        help = "delete a record"
-    )]
     pub delete: Option<String>,
-
-    #[arg(
-        short = 'f',
-        num_args = 0..=1,
-        default_missing_value = "",
-        help = "finish a record"
-    )]
     pub finish: Option<String>,
-
-    #[arg(
-        long = "nf",
-        num_args = 0..=1,
-        default_missing_value = "",
-        help = "set a record unfinished"
-    )]
     pub unfinish: Option<String>,
-
-    #[arg(short = 'n', default_value_t = 100, help = "# of records to list")]
     pub n: i64,
-
-    #[arg(short = 'r', default_value_t = false, help = "reverse sort")]
     pub reverse: bool,
-
-    #[arg(long = "all", default_value_t = false, help = "including all record")]
     pub all: bool,
-
-    #[arg(short = 'a', default_value_t = false, help = "shortcut for -all")]
     pub a: bool,
-
-    #[arg(
-        short = 't',
-        long = "t",
-        num_args = 0..=1,
-        default_missing_value = "",
-        help = "search by tags"
-    )]
     pub tag_query: Option<String>,
-
-    #[arg(
-        long = "ta",
-        num_args = 0..=1,
-        default_missing_value = "",
-        hide = true
-    )]
     pub tag_query_ta: Option<String>,
-
-    #[arg(
-        long = "at",
-        num_args = 0..=1,
-        default_missing_value = "",
-        hide = true
-    )]
     pub tag_query_at: Option<String>,
-
-    #[arg(
-        long = "and",
-        default_value_t = false,
-        help = "use and logic to match tags"
-    )]
     pub r#and: bool,
-
-    #[arg(long = "include-finished", default_value_t = false)]
     pub include_finished: bool,
-
-    #[arg(long = "title", default_value = "", help = "search by title")]
     pub title: String,
-
-    #[arg(long = "c", default_value = "", help = "content (alias for title)")]
     pub content: String,
-
-    #[arg(
-        long = "search",
-        short = 'q',
-        default_value = "",
-        help = "fuzzy search records"
-    )]
     pub search: String,
-
-    #[arg(long = "out", num_args = 0..=1, default_missing_value = "")]
     pub out: Option<String>,
-
-    #[arg(long = "remote", default_value_t = false)]
     pub remote: bool,
-
-    #[arg(long = "prev", default_value_t = false)]
     pub prev: bool,
-
-    #[arg(long = "count", default_value_t = false)]
     pub count: bool,
-
-    #[arg(long = "prefix", default_value_t = false)]
     pub prefix: bool,
-
-    #[arg(long = "pre", default_value_t = false)]
     pub pre: bool,
-
-    #[arg(long = "binary", default_value_t = false)]
     pub binary: bool,
-
-    #[arg(short = 'b', default_value_t = false)]
     pub b: bool,
-
-    #[arg(long = "force", default_value_t = false)]
     pub force: bool,
-
-    #[arg(long = "sp", default_value_t = false)]
     pub sp: bool,
-
-    #[arg(
-        long = "ex",
-        default_value = "",
-        help = "exclude tag prefix when list tags"
-    )]
     pub ex: String,
-
-    #[arg(long = "code", default_value_t = false)]
     pub code: bool,
-
-    #[arg(
-        short = 's',
-        default_value_t = false,
-        help = "short format, only print tags"
-    )]
     pub short: bool,
-
-    #[arg(short = 'l', default_value_t = false, help = "list tags")]
     pub list_tags_time: bool,
-
-    #[arg(long = "tags", default_value_t = false, help = "list all tags")]
     pub list_tags: bool,
-
-    #[arg(long = "v", short = 'v', default_value_t = false)]
     pub verbose: bool,
-
-    #[arg(long = "file", num_args = 0..=1, default_missing_value = "")]
     pub file_flag: Option<String>,
-
-    #[arg(
-        short = 'e',
-        long = "e",
-        default_value_t = false,
-        help = "read from editor"
-    )]
     pub e: bool,
-
-    #[arg(long = "host", default_value = "")]
     pub host: String,
-
-    #[arg(long = "push", num_args = 0..=1, default_missing_value = "")]
     pub push: Option<String>,
-
-    #[arg(long = "pull", num_args = 0..=1, default_missing_value = "")]
     pub pull: Option<String>,
-
-    #[arg(long = "add-tag", num_args = 0..=1, default_missing_value = "")]
     pub add_tag: Option<String>,
-
-    #[arg(long = "del-tag", num_args = 0..=1, default_missing_value = "")]
     pub del_tag: Option<String>,
-
-    #[arg(long = "clean-tag", num_args = 0..=1, default_missing_value = "")]
     pub clean_tag: Option<String>,
-
-    #[arg(long = "tag", default_value = "")]
     pub tag: String,
-
-    #[arg(long = "db", default_value = "")]
     pub db: String,
-
-    #[arg(long = "it", default_value_t = false, hide = true)]
     pub it: bool,
-
-    #[arg(long = "ti", default_value_t = false, hide = true)]
     pub ti: bool,
-
-    #[arg(
-        value_name = "ARGS",
-        trailing_var_arg = true,
-        allow_hyphen_values = true
-    )]
     pub args: Vec<String>,
 }
 
@@ -326,6 +160,197 @@ pub fn normalize_legacy_single_dash_long_args(
     }
 
     out
+}
+
+fn build_re_parser() -> terminalw::Parser {
+    let mut p = terminalw::Parser::new();
+
+    p.add_string(
+        "backend",
+        "",
+        "local backend: auto|mongo|sqlite. '.configW:re.backend'",
+    );
+    p.add_bool("i", false, "insert a record");
+    p.add_string("ct", "", "change a record title");
+    p.add_string("u", "", "update a record");
+    p.add_string("d", "", "delete a record");
+    p.add_string("f", "", "finish a record");
+    p.add_string("nf", "", "set a record UNFINISHED");
+    p.add_i64("n", 100, "# of records to list");
+    p.add_bool("r", false, "reverse sort");
+    p.add_bool("all", false, "including all record");
+    p.add_bool("a", false, "shortcut for -all");
+    p.add_string("t", "", "search by tags");
+    p.add_string("ta", "", "search by tags (hidden)");
+    p.add_string("at", "", "search by tags (hidden)");
+    p.add_bool("and", false, "use and logic to match tags");
+    p.add_bool("include-finished", false, "include finished record");
+    p.add_string("title", "", "search by title");
+    p.add_string("c", "", "content (alias for title)");
+    p.add_string("search", "", "fuzzy search records");
+    p.alias("search", "q");
+    p.add_string("out", "", "output to text file (default is output.txt)");
+    p.add_bool(
+        "remote",
+        false,
+        "operate on the remote server specified by --host",
+    );
+    p.add_bool("prev", false, "operate based on the previous ObjectIDs");
+    p.add_bool("count", false, "only print the count, not the result");
+    p.add_bool("prefix", false, "tag prefix");
+    p.add_bool("pre", false, "tag prefix (short for -prefix)");
+    p.add_bool("binary", false, "if the title is binary file");
+    p.add_bool("b", false, "shortcut for -binary");
+    p.add_bool("force", false, "force overwrite");
+    p.add_bool(
+        "sp",
+        false,
+        "if list tags started with special (config in .configW->special.tags)",
+    );
+    p.add_string("ex", "", "exclude some tag prefix when list tags");
+    p.add_bool(
+        "code",
+        false,
+        "if use vscode as input editor (default false)",
+    );
+    p.add_bool("s", false, "short format, only print titles");
+    p.add_bool("l", false, "list tags");
+    p.add_bool("tags", false, "list all tags");
+    p.add_bool("v", false, "verbose (show modify/add time, verbose)");
+    p.add_string(
+        "file",
+        "",
+        "read title from a file, for '-u' & '-ct', file serve as bool, for '-i', needs to pass filename",
+    );
+    p.add_bool("e", false, "read from editor");
+    p.add_string(
+        "host",
+        "",
+        "remote host for sqlite sync, e.g. 10.37.110.250, user@10.37.110.250, or user@10.37.110.250:22. '.configW:re.remote.host'",
+    );
+    p.add_string(
+        "push",
+        "",
+        "push one record from the current local backend (mongo/sqlite) to remote sqlite managed by re, requires --host or .configW:re.remote.host",
+    );
+    p.add_string(
+        "pull",
+        "",
+        "pull one record from remote sqlite into the current local backend (mongo/sqlite), requires --host or .configW:re.remote.host",
+    );
+    p.add_string("add-tag", "", "add tags for a record");
+    p.add_string("del-tag", "", "delete tags for a record");
+    p.add_string("clean-tag", "", "clean all the records having the tag");
+    p.add_string("tag", "", "default tags for insert");
+    p.add_string("db", "", "sqlite db override path");
+    p.add_bool("it", false, "order tags by modified time (hidden)");
+    p.add_bool("ti", false, "order tags by modified time (hidden)");
+    p.add_bool("help", false, "print help information");
+    p.add_bool("h", false, "print help information");
+    p.add_bool("version", false, "print version information");
+    p
+}
+
+pub fn parse_cli_and_parser(argv: Vec<String>) -> (terminalw::Parser, Cli) {
+    let mut p = build_re_parser();
+
+    let rest = argv.get(1..).unwrap_or(&[]);
+    p.parse_argv(rest, &[]);
+
+    if p.contains_flag_strict("help") || p.contains_flag_strict("h") {
+        p.print_defaults();
+        std::process::exit(0);
+    }
+    if p.contains_flag_strict("version") {
+        println!("{}", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
+    let mut cli = Cli {
+        backend: p.flag_value_with_default("backend", ""),
+        insert: p.contains_flag_strict("i"),
+        change_title: p
+            .contains_flag_strict("ct")
+            .then(|| p.flag_value_with_default("ct", "")),
+        update: p
+            .contains_flag_strict("u")
+            .then(|| p.flag_value_with_default("u", "")),
+        delete: p
+            .contains_flag_strict("d")
+            .then(|| p.flag_value_with_default("d", "")),
+        finish: p
+            .contains_flag_strict("f")
+            .then(|| p.flag_value_with_default("f", "")),
+        unfinish: p
+            .contains_flag_strict("nf")
+            .then(|| p.flag_value_with_default("nf", "")),
+        n: p.flag_value_with_default("n", "100")
+            .parse::<i64>()
+            .unwrap_or(100),
+        reverse: p.contains_flag_strict("r"),
+        all: p.contains_flag_strict("all"),
+        a: p.contains_flag_strict("a"),
+        tag_query: p
+            .contains_flag_strict("t")
+            .then(|| p.flag_value_with_default("t", "")),
+        tag_query_ta: p
+            .contains_flag_strict("ta")
+            .then(|| p.flag_value_with_default("ta", "")),
+        tag_query_at: p
+            .contains_flag_strict("at")
+            .then(|| p.flag_value_with_default("at", "")),
+        r#and: p.contains_flag_strict("and"),
+        include_finished: p.contains_flag_strict("include-finished"),
+        title: p.flag_value_with_default("title", ""),
+        content: p.flag_value_with_default("c", ""),
+        search: p.flag_value_with_default("search", ""),
+        out: p
+            .contains_flag_strict("out")
+            .then(|| p.flag_value_with_default("out", "")),
+        remote: p.contains_flag_strict("remote"),
+        prev: p.contains_flag_strict("prev"),
+        count: p.contains_flag_strict("count"),
+        prefix: p.contains_flag_strict("prefix"),
+        pre: p.contains_flag_strict("pre"),
+        binary: p.contains_flag_strict("binary"),
+        b: p.contains_flag_strict("b"),
+        force: p.contains_flag_strict("force"),
+        sp: p.contains_flag_strict("sp"),
+        ex: p.flag_value_with_default("ex", ""),
+        code: p.contains_flag_strict("code"),
+        short: p.contains_flag_strict("s"),
+        list_tags_time: p.contains_flag_strict("l"),
+        list_tags: p.contains_flag_strict("tags"),
+        verbose: p.contains_flag_strict("v"),
+        file_flag: p
+            .contains_flag_strict("file")
+            .then(|| p.flag_value_with_default("file", "")),
+        e: p.contains_flag_strict("e"),
+        host: p.flag_value_with_default("host", ""),
+        push: p
+            .contains_flag_strict("push")
+            .then(|| p.flag_value_with_default("push", "")),
+        pull: p
+            .contains_flag_strict("pull")
+            .then(|| p.flag_value_with_default("pull", "")),
+        add_tag: p
+            .contains_flag_strict("add-tag")
+            .then(|| p.flag_value_with_default("add-tag", "")),
+        del_tag: p
+            .contains_flag_strict("del-tag")
+            .then(|| p.flag_value_with_default("del-tag", "")),
+        clean_tag: p
+            .contains_flag_strict("clean-tag")
+            .then(|| p.flag_value_with_default("clean-tag", "")),
+        tag: p.flag_value_with_default("tag", ""),
+        db: p.flag_value_with_default("db", ""),
+        it: p.contains_flag_strict("it"),
+        ti: p.contains_flag_strict("ti"),
+        args: p.positional.to_vec(),
+    };
+
+    maybe_parse_positional_limit(&mut cli);
+    (p, cli)
 }
 
 pub fn maybe_parse_positional_limit(cli: &mut Cli) {

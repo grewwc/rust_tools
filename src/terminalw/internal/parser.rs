@@ -376,11 +376,37 @@ impl Parser {
             if !(entry.cond)(self) {
                 continue;
             }
-            let actions = entry.actions.lock().unwrap().clone();
+            let actions = entry
+                .actions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
             for a in actions {
                 a();
             }
         }
+    }
+
+    pub fn execute_first(&mut self) -> bool {
+        if self.executed {
+            return false;
+        }
+        self.executed = true;
+        for entry in self.actions.iter() {
+            if !(entry.cond)(self) {
+                continue;
+            }
+            let actions = entry
+                .actions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for a in actions {
+                a();
+            }
+            return true;
+        }
+        false
     }
 
     pub fn parse_args_cmd(&mut self, bool_optionals: &[&str]) {
@@ -389,6 +415,10 @@ impl Parser {
 
     pub fn parse_args(&mut self, cmd: &str, bool_optionals: &[&str]) {
         parser_impl::parse_args(self, cmd, bool_optionals);
+    }
+
+    pub fn parse_argv(&mut self, argv: &[String], bool_optionals: &[&str]) {
+        parser_impl::parse_argv(self, argv, bool_optionals);
     }
 }
 

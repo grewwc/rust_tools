@@ -30,13 +30,8 @@ pub(crate) fn parse_args_cmd(p: &mut Parser, bool_optionals: &[&str]) {
             }
         }
     }
-    let mut args = Vec::new();
-    for arg in argv.iter().skip(start) {
-        let trimmed = arg.trim_matches(['"', '\'']);
-        args.push(trimmed.replace(' ', &SPACE.to_string()));
-    }
-    let cmd = args.join(" ");
-    parse_args(p, &cmd, bool_optionals);
+    let rest = argv.into_iter().skip(start).collect::<Vec<_>>();
+    parse_argv(p, &rest, bool_optionals);
 }
 
 pub(crate) fn parse_args(p: &mut Parser, cmd: &str, bool_optionals: &[&str]) {
@@ -72,6 +67,79 @@ pub(crate) fn parse_args(p: &mut Parser, cmd: &str, bool_optionals: &[&str]) {
         split::split_by_str_keep_quotes(cmd, " ", format!("\"'{}", QUOTE).as_str(), true);
     let mut args = Vec::with_capacity(cmd_slice.len());
     for mut arg in cmd_slice {
+        if arg.starts_with("--") && arg.len() > 2 {
+            arg = format!("-{}", arg.trim_start_matches("--"));
+        }
+        if arg.starts_with('-') && arg.len() > 1 {
+            let mut segments = Vec::new();
+            if test_bool_cluster(arg.trim_start_matches('-'), &trie, &mut segments) {
+                for seg in segments {
+                    args.push(format!("{}{}{}{}", QUOTE, DASH, seg, QUOTE));
+                }
+            } else {
+                args.push(format!("{}{}{}", QUOTE, arg, QUOTE));
+            }
+        } else {
+            args.push(format!("{}{}{}", QUOTE, arg, QUOTE));
+        }
+    }
+
+    let mut encoded = args.join(&SEP.to_string());
+    if p.enable_parse_num {
+        if let Some((new_encoded, num)) = extract_num_arg(&encoded) {
+            encoded = new_encoded;
+            p.num_arg = Some(num);
+        }
+    }
+    encoded = format!("{SEP}{encoded}{SEP}");
+    parse_args_encoded(p, &encoded, &bool_opts);
+}
+
+pub(crate) fn parse_argv(p: &mut Parser, argv: &[String], bool_optionals: &[&str]) {
+    p.cmd = argv.join(" ");
+    p.num_arg = None;
+    p.optional.clear();
+    p.positional.clear();
+
+    for opt in bool_optionals {
+        let o = opt.trim_start_matches('-').to_string();
+        if !o.is_empty() {
+            p.bool_option_set.insert(o);
+        }
+    }
+
+    process_alias_defs(p);
+
+    let bool_opts = if bool_optionals.is_empty() {
+        p.bool_option_set.iter().cloned().collect::<Vec<_>>()
+    } else {
+        bool_optionals
+            .iter()
+            .map(|s| s.trim_start_matches('-').to_string())
+            .collect::<Vec<_>>()
+    };
+
+    let mut trie = Trie::new();
+    for name in &bool_opts {
+        trie.insert(name);
+    }
+
+    let mut flat = Vec::with_capacity(argv.len());
+    for raw in argv {
+        let trimmed = raw.trim_matches(['"', '\'']).to_string();
+        if (trimmed.starts_with('-') || trimmed.starts_with("--")) && trimmed.contains('=') {
+            if let Some((k, v)) = trimmed.split_once('=') {
+                flat.push(k.to_string());
+                flat.push(v.to_string());
+                continue;
+            }
+        }
+        flat.push(trimmed);
+    }
+
+    let mut args = Vec::with_capacity(flat.len());
+    for mut arg in flat {
+        arg = arg.replace(' ', &SPACE.to_string());
         if arg.starts_with("--") && arg.len() > 2 {
             arg = format!("-{}", arg.trim_start_matches("--"));
         }

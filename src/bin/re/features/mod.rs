@@ -14,6 +14,7 @@ pub mod log;
 pub mod open;
 pub mod pull;
 pub mod push;
+pub mod register;
 pub mod search;
 pub mod update;
 pub mod week;
