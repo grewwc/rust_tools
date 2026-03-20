@@ -29,8 +29,16 @@ pub fn list_by_tag_name_feature(
             .into_iter()
             .collect()
     } else {
-        db.list_records_by_tags(&tags, cli.r#and, prefix, limit, reverse, include_finished)
-            .unwrap_or_default()
+        let effective_reverse = !reverse;
+        db.list_records_by_tags(
+            &tags,
+            cli.r#and,
+            prefix,
+            limit,
+            effective_reverse,
+            include_finished,
+        )
+        .unwrap_or_default()
     };
 
     if !list_special {
@@ -116,17 +124,39 @@ pub fn list_by_tag_name_feature(
         if !cli.verbose {
             display.title = "<hidden>".to_string();
         }
-        println!("{}", ui::format_record_like_go(&display, cli.verbose, None));
 
-        if is_probably_text(&record.title) {
-            let normalized_title = normalize_title_for_display(&record.title);
-            let wrapped_title = wrap_title_for_terminal(&normalized_title, get_terminal_width());
-            println!(
-                "{}",
+        if cli.verbose {
+            let title = if is_probably_text(&record.title) {
+                let normalized_title = normalize_title_for_display(&record.title);
+                let wrapped_title =
+                    wrap_title_for_terminal(&normalized_title, get_terminal_width());
                 ui::colorize_title(&print_title_with_colored_separator(&wrapped_title))
-            );
+            } else {
+                format!("\n{}", "<binary>".bright_yellow())
+            };
+            println!("{}", ui::format_record_like_go(&display, true, Some(title)));
         } else {
-            println!("\n{}", "<binary>".bright_yellow());
+            println!("{}", ui::format_record_like_go(&display, false, None));
+            if is_probably_text(&record.title) {
+                let normalized_title = normalize_title_for_display(&record.title);
+                let wrapped_title =
+                    wrap_title_for_terminal(&normalized_title, get_terminal_width());
+                let title = ui::colorize_title(&print_title_with_colored_separator(&wrapped_title));
+                let indented_title = title
+                    .lines()
+                    .map(|line| {
+                        if line.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {line}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                println!("{indented_title}");
+            } else {
+                println!("\n  {}", "<binary>".bright_yellow());
+            }
         }
         println!("\n{}", ui::colorize_id(&record.id));
         history::write_previous_operation(&record.id);
