@@ -28,7 +28,7 @@ fn main() {
     let all = (cli.all
         || (cli.a && cli.add_tag.is_none() && cli.del_tag.is_none() && !cli.list_tags))
         && !to_binary;
-    let prefix = cli.prefix || cli.pre || all || cli.a;
+    let prefix = cli.prefix || cli.pre;
     let only_tags = cli.short;
     let use_vscode = cli.code;
     let list_special = cli.sp || all;

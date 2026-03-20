@@ -1,0 +1,111 @@
+use clap::{ArgAction, Parser};
+
+pub(super) const DEFAULT_NUM_HISTORY: usize = 4;
+
+#[derive(Parser, Debug)]
+#[command(about = "AI CLI compatible with go_tools executable/ai/a.go")]
+pub(super) struct Cli {
+    #[arg(long, default_value_t = DEFAULT_NUM_HISTORY, help = "number of history")]
+    pub(super) history: usize,
+
+    #[arg(
+        short = 'm',
+        long = "model",
+        default_value = "",
+        help = "model name. qwq-plus-latest[0], qwen3.5-plus[1], qwen-max[2], qwen3-max[3], qwen3-coder-plus[4], deepseek-v3.1[5], qwen-flash[6]"
+    )]
+    pub(super) model: String,
+
+    #[arg(
+        long = "multi-line",
+        visible_alias = "mul",
+        action = ArgAction::SetTrue,
+        help = "input with multline"
+    )]
+    pub(super) multi_line: bool,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "use code model (qwen3-coder-plus)"
+    )]
+    pub(super) code: bool,
+
+    #[arg(short = 'd', action = ArgAction::SetTrue, help = "deepseek model")]
+    pub(super) deepseek: bool,
+
+    #[arg(long, action = ArgAction::SetTrue, help = "clear history")]
+    pub(super) clear: bool,
+
+    #[arg(short = 'c', action = ArgAction::SetTrue, help = "prepend content in clipboard")]
+    pub(super) clipboard: bool,
+
+    #[arg(short = 'x', action = ArgAction::SetTrue, help = "ask without history")]
+    pub(super) no_history: bool,
+
+    #[arg(
+        short = 'f',
+        default_value = "",
+        help = "input file names. seprated by comma."
+    )]
+    pub(super) files: String,
+
+    #[arg(
+        short = 'o',
+        long = "out",
+        num_args = 0..=1,
+        default_missing_value = "output.md",
+        help = "write output to file. default is output.md"
+    )]
+    pub(super) out: Option<String>,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "raw mode: don't use parser to get positional arguments, use raw inputs instead."
+    )]
+    pub(super) raw: bool,
+
+    #[arg(short = 't', action = ArgAction::SetTrue, help = "use thinking model. default: false.")]
+    pub(super) thinking: bool,
+
+    #[arg(short = 's', action = ArgAction::SetTrue, help = "short output")]
+    pub(super) short_output: bool,
+
+    #[arg(short = '0', action = ArgAction::SetTrue, help = "select qwq-plus-latest")]
+    pub(super) model_0: bool,
+
+    #[arg(short = '1', action = ArgAction::SetTrue, help = "select qwen3.5-plus")]
+    pub(super) model_1: bool,
+
+    #[arg(short = '2', action = ArgAction::SetTrue, help = "select qwen-max")]
+    pub(super) model_2: bool,
+
+    #[arg(short = '3', action = ArgAction::SetTrue, help = "select qwen3-max")]
+    pub(super) model_3: bool,
+
+    #[arg(short = '4', action = ArgAction::SetTrue, help = "select qwen3-coder-plus")]
+    pub(super) model_4: bool,
+
+    #[arg(short = '5', action = ArgAction::SetTrue, help = "select deepseek-v3.1 / deepseek-r1")]
+    pub(super) model_5: bool,
+
+    #[arg(short = '6', action = ArgAction::SetTrue, help = "select qwen-flash")]
+    pub(super) model_6: bool,
+
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub(super) args: Vec<String>,
+}
+
+pub(super) fn normalize_single_dash_long_opts(args: impl Iterator<Item = String>) -> Vec<String> {
+    args.map(|arg| {
+        let bytes = arg.as_bytes();
+        if bytes.len() > 2 && bytes[0] == b'-' && bytes[1] != b'-' && bytes[1].is_ascii_alphabetic()
+        {
+            format!("-{arg}")
+        } else {
+            arg
+        }
+    })
+    .collect()
+}

@@ -196,7 +196,7 @@ fn match_tags(record_tags: &[String], filter_tags: &[String], use_and: bool, pre
         if prefix {
             record_tags.iter().any(|t| t.starts_with(needle))
         } else {
-            record_tags.iter().any(|t| t == needle)
+            record_tags.iter().any(|t| t.contains(needle))
         }
     };
 
@@ -212,14 +212,14 @@ mod tests {
     use super::match_tags;
 
     #[test]
-    fn match_tags_exact_mode_requires_exact_tag_name() {
+    fn match_tags_contains_mode_matches_substring() {
         assert!(match_tags(
             &["links".to_string(), "read".to_string()],
             &["links".to_string()],
             false,
             false,
         ));
-        assert!(!match_tags(
+        assert!(match_tags(
             &["links:archive".to_string()],
             &["links".to_string()],
             false,
@@ -228,6 +228,38 @@ mod tests {
         assert!(match_tags(
             &["links:archive".to_string()],
             &["links".to_string()],
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn match_tags_supports_contains() {
+        assert!(match_tags(
+            &["判断分片键是否倾斜".to_string()],
+            &["倾斜".to_string()],
+            false,
+            false,
+        ));
+        assert!(!match_tags(
+            &["判断分片键是否倾斜".to_string()],
+            &["倾斜".to_string()],
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn match_tags_prefix_mode_is_stricter_than_contains() {
+        assert!(match_tags(
+            &["topic:db".to_string()],
+            &["db".to_string()],
+            false,
+            false,
+        ));
+        assert!(!match_tags(
+            &["topic:db".to_string()],
+            &["db".to_string()],
             false,
             true,
         ));
