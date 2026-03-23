@@ -509,11 +509,15 @@ fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn std::
             question
         };
         app.cli.args.clear();
+        let (question, overrides) = parse_loop_overrides(&base_question);
+        let history_count = overrides
+            .history_count
+            .unwrap_or_else(|| base_history_count(app.cli.history, app.cli.no_history));
         let ctx = finalize_question(
             app,
-            base_question,
-            base_history_count(app.cli.history, app.cli.no_history),
-            false,
+            question,
+            history_count,
+            overrides.short_output,
         )?;
         return Ok(Some(ctx));
     }
@@ -529,7 +533,7 @@ fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn std::
         app.shutdown.store(true, Ordering::SeqCst);
         return Ok(None);
     };
-    let overrides = loop_overrides(&question);
+    let (question, overrides) = parse_loop_overrides(&question);
     let history_count = overrides
         .history_count
         .unwrap_or_else(|| base_history_count(app.cli.history, app.cli.no_history));
@@ -633,34 +637,54 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
 }
 
 pub(super) fn loop_overrides(question: &str) -> LoopOverrides {
+    parse_loop_overrides(question).1
+}
+
+pub(super) fn parse_loop_overrides(question: &str) -> (String, LoopOverrides) {
     let tokens = split_space_keep_symbol(question, "\"'").collect::<Vec<_>>();
-    let short_output = tokens.iter().any(|token| *token == "-s");
+    let mut out_tokens = Vec::with_capacity(tokens.len());
 
-    if tokens.iter().any(|token| *token == "-x") {
-        return LoopOverrides {
-            short_output,
-            history_count: Some(0),
-        };
-    }
+    let mut short_output = false;
+    let has_x = tokens.iter().any(|t| *t == "-x");
+    let mut history_count = has_x.then_some(0);
 
-    let mut history_count = None;
     let mut idx = 0usize;
     while idx < tokens.len() {
-        if tokens[idx] == "--history" {
-            if let Some(next) = tokens.get(idx + 1)
-                && let Ok(value) = next.parse::<usize>()
-            {
-                history_count = Some(value);
-                break;
+        match tokens[idx] {
+            "-s" => {
+                short_output = true;
+                idx += 1;
+            }
+            "-x" => {
+                idx += 1;
+            }
+            "--history" => {
+                if let Some(next) = tokens.get(idx + 1)
+                    && let Ok(value) = next.parse::<usize>()
+                {
+                    if !has_x {
+                        history_count = Some(value);
+                    }
+                    idx += 2;
+                } else {
+                    out_tokens.push(tokens[idx].to_string());
+                    idx += 1;
+                }
+            }
+            _ => {
+                out_tokens.push(tokens[idx].to_string());
+                idx += 1;
             }
         }
-        idx += 1;
     }
 
-    LoopOverrides {
-        short_output,
-        history_count,
-    }
+    (
+        out_tokens.join(" "),
+        LoopOverrides {
+            short_output,
+            history_count,
+        },
+    )
 }
 
 fn resolve_model_for_input(app: &App, question: &mut String) -> String {

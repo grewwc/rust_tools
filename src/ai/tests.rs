@@ -44,6 +44,21 @@ fn loop_overrides_preserve_question_but_change_history() {
 }
 
 #[test]
+fn parse_loop_overrides_strips_tokens() {
+    let (q, overrides) = super::driver::parse_loop_overrides("hello world -s --history 2");
+    assert_eq!(q, "hello world");
+    assert!(overrides.short_output);
+    assert_eq!(overrides.history_count, Some(2));
+}
+
+#[test]
+fn parse_loop_overrides_strips_x_and_history() {
+    let (q, overrides) = super::driver::parse_loop_overrides("hi -x --history 2");
+    assert_eq!(q, "hi");
+    assert_eq!(overrides.history_count, Some(0));
+}
+
+#[test]
 fn trailing_selector_is_detected() {
     assert_eq!(super::driver::trailing_model_selector("hello -3"), Some(3));
     assert_eq!(super::driver::trailing_model_selector("hello-3"), None);

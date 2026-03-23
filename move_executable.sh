@@ -3,7 +3,7 @@
 set -e
 
 DEFAULT_BINS="a configw his j ns oo re tt"
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${INSTALL_DIR:-$(pwd)/bin}"
 
 if [ "$#" -gt 0 ]; then
     BINS="$*"
@@ -14,10 +14,19 @@ fi
 BIN_DIR="$(pwd)/target/release"
 
 if [ ! -d "$INSTALL_DIR" ]; then
-    mkdir -p "$INSTALL_DIR" 2>/dev/null || sudo mkdir -p "$INSTALL_DIR"
+    mkdir -p "$INSTALL_DIR"
 fi
 
-for bin in $BINS; do
+NEED="$(
+    INSTALLW_BIN="${INSTALLW_BIN:-$(pwd)/target/debug/installw}"
+    if [ -x "$INSTALLW_BIN" ]; then
+        INSTALL_DIR="$INSTALL_DIR" "$INSTALLW_BIN" --mode install -- $BINS
+    else
+        INSTALL_DIR="$INSTALL_DIR" cargo run -q --bin installw -- --mode install -- $BINS
+    fi
+)"
+
+for bin in $NEED; do
     src="$BIN_DIR/$bin"
     if [ ! -f "$src" ] || [ ! -x "$src" ]; then
         echo "skip $bin (not built)" >&2
@@ -25,10 +34,13 @@ for bin in $BINS; do
     fi
 
     dst="$INSTALL_DIR/$bin"
-    if [ -w "$INSTALL_DIR" ]; then
-        ln -sf "$src" "$dst"
-    else
-        sudo ln -sf "$src" "$dst"
+
+    if [ -e "$dst" ] || [ -L "$dst" ]; then
+        if [ "$src" -ef "$dst" ]; then
+            rm -f "$dst"
+        fi
     fi
-    echo "linked $dst -> $src"
+
+    cp -p "$src" "$dst"
+    echo "copied $dst <- $src"
 done

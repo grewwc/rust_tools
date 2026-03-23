@@ -17,44 +17,97 @@ fn main() {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Build,
+    Install,
+}
+
 fn run() -> Result<(), String> {
+    let (mode, bins) = parse_args();
     let cwd = env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     let repo_root = find_repo_root(&cwd).ok_or("cannot find repo root")?;
     let src_dir = repo_root.join("src");
     let bin_dir = src_dir.join("bin");
+    let install_dir = env::var("INSTALL_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root.join("bin"));
     let release_dir = repo_root.join("target").join("release");
-
-    let bins = if env::args().len() > 1 {
-        env::args().skip(1).collect::<Vec<_>>()
-    } else {
+    let bins = if bins.is_empty() {
         list_bin_stems(&bin_dir)?
+    } else {
+        bins
     };
 
     let all_rs_files = list_rs_files(&src_dir)?;
     let (graph, interner) = build_module_graph(&all_rs_files)?;
 
-    let mut need_build = Vec::new();
+    let mut out = Vec::new();
     for bin in bins {
         let bin_rs = bin_dir.join(format!("{bin}.rs"));
         if !bin_rs.exists() {
             continue;
         }
-        let bin_exe = release_dir.join(&bin);
-        if !bin_exe.exists() {
-            need_build.push(bin);
-            continue;
-        }
+        let installed_bin = install_dir.join(&bin);
+        let built_bin = release_dir.join(&bin);
 
         let deps = deps_for_bin(&bin, &bin_rs, &repo_root, &graph, &interner)?;
         let newest_src = newest_mtime(&deps)?;
-        let exe_mtime = file_mtime(&bin_exe)?;
-        if newest_src > exe_mtime {
-            need_build.push(bin);
+        match mode {
+            Mode::Build => {
+                let newest_bin = newest_existing_mtime(&[&installed_bin, &built_bin])?;
+                if newest_bin.is_none_or(|t| newest_src > t) {
+                    out.push(bin);
+                }
+            }
+            Mode::Install => {
+                if !built_bin.exists() {
+                    continue;
+                }
+                let built_time = file_mtime(&built_bin)?;
+                let install_time = newest_existing_mtime(&[&installed_bin])?;
+                if install_time.is_none_or(|t| built_time > t) {
+                    out.push(bin);
+                }
+            }
         }
     }
 
-    print!("{}", need_build.join(" "));
+    print!("{}", out.join(" "));
     Ok(())
+}
+
+fn parse_args() -> (Mode, Vec<String>) {
+    let mut mode = Mode::Build;
+    let mut bins = Vec::new();
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            bins.extend(args);
+            break;
+        }
+        if arg == "--mode" {
+            if let Some(v) = args.next() {
+                mode = parse_mode_value(&v);
+                continue;
+            }
+        }
+        if let Some(v) = arg.strip_prefix("--mode=") {
+            mode = parse_mode_value(v);
+            continue;
+        }
+        bins.push(arg);
+    }
+    (mode, bins)
+}
+
+fn parse_mode_value(v: &str) -> Mode {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "install" => Mode::Install,
+        _ => Mode::Build,
+    }
 }
 
 fn find_repo_root(start: &Path) -> Option<PathBuf> {
@@ -311,4 +364,19 @@ fn newest_mtime(files: &[Rc<PathBuf>]) -> Result<SystemTime, String> {
 fn file_mtime(path: &Path) -> Result<SystemTime, String> {
     let meta = fs::metadata(path).map_err(|e| format!("metadata {path:?}: {e}"))?;
     meta.modified().map_err(|e| format!("mtime {path:?}: {e}"))
+}
+
+fn newest_existing_mtime(paths: &[&Path]) -> Result<Option<SystemTime>, String> {
+    let mut newest: Option<SystemTime> = None;
+    for p in paths {
+        let Ok(meta) = fs::metadata(p) else {
+            continue;
+        };
+        let t = meta.modified().map_err(|e| format!("mtime {p:?}: {e}"))?;
+        newest = Some(match newest {
+            Some(cur) if cur >= t => cur,
+            _ => t,
+        });
+    }
+    Ok(newest)
 }
