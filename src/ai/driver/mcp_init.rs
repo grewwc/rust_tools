@@ -35,7 +35,9 @@ pub fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitReport {
         failures: Vec::new(),
     };
     if let Err(err) = fs::metadata(mcp_path) {
-        eprintln!("[mcp] failed to access config file {}: {}", mcp_path, err);
+        if err.kind() != io::ErrorKind::NotFound {
+            eprintln!("[mcp] failed to access config file {}: {}", mcp_path, err);
+        }
         return report;
     }
 
