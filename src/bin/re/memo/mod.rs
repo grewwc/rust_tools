@@ -193,10 +193,19 @@ fn match_tags(record_tags: &[String], filter_tags: &[String], use_and: bool, pre
     }
 
     let matches_one = |needle: &str| {
+        if let Some(exact) = needle.strip_prefix('=') {
+            return record_tags.iter().any(|t| t == exact);
+        }
+        if let Some(contains) = needle.strip_prefix('~') {
+            return record_tags.iter().any(|t| t.contains(contains));
+        }
+        if let Some(pref) = needle.strip_prefix('^') {
+            return record_tags.iter().any(|t| t.starts_with(pref));
+        }
         if prefix {
             record_tags.iter().any(|t| t.starts_with(needle))
         } else {
-            record_tags.iter().any(|t| t.contains(needle))
+            record_tags.iter().any(|t| t == needle)
         }
     };
 
@@ -212,56 +221,100 @@ mod tests {
     use super::match_tags;
 
     #[test]
-    fn match_tags_contains_mode_matches_substring() {
+    fn match_tags_explicit_contains_mode_matches_substring() {
         assert!(match_tags(
             &["links".to_string(), "read".to_string()],
-            &["links".to_string()],
+            &["~links".to_string()],
             false,
             false,
         ));
         assert!(match_tags(
             &["links:archive".to_string()],
+            &["~links".to_string()],
+            false,
+            false,
+        ));
+        assert!(!match_tags(
+            &["links:archive".to_string()],
             &["links".to_string()],
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn match_tags_explicit_contains_supports_unicode() {
         assert!(match_tags(
-            &["links:archive".to_string()],
-            &["links".to_string()],
+            &["判断分片键是否倾斜".to_string()],
+            &["~倾斜".to_string()],
+            false,
+            false,
+        ));
+        assert!(match_tags(
+            &["判断分片键是否倾斜".to_string()],
+            &["~倾斜".to_string()],
             false,
             true,
         ));
     }
 
     #[test]
-    fn match_tags_supports_contains() {
+    fn match_tags_default_exact_is_stricter_than_prefix() {
         assert!(match_tags(
-            &["判断分片键是否倾斜".to_string()],
-            &["倾斜".to_string()],
+            &["db".to_string(), "topic:db".to_string()],
+            &["db".to_string()],
+            false,
+            false,
+        ));
+        assert!(match_tags(
+            &["topic:db".to_string()],
+            &["topic:db".to_string()],
             false,
             false,
         ));
         assert!(!match_tags(
-            &["判断分片键是否倾斜".to_string()],
-            &["倾斜".to_string()],
+            &["topic:db".to_string()],
+            &["db".to_string()],
             false,
             true,
         ));
     }
 
     #[test]
-    fn match_tags_prefix_mode_is_stricter_than_contains() {
+    fn match_tags_explicit_prefix_mode_matches_prefix() {
         assert!(match_tags(
             &["topic:db".to_string()],
-            &["db".to_string()],
+            &["^topic".to_string()],
             false,
             false,
         ));
         assert!(!match_tags(
             &["topic:db".to_string()],
-            &["db".to_string()],
+            &["^db".to_string()],
             false,
-            true,
+            false,
+        ));
+    }
+
+    #[test]
+    fn match_tags_exact_mode_requires_full_match() {
+        assert!(match_tags(
+            &["l".to_string(), "links".to_string()],
+            &["=l".to_string()],
+            false,
+            false,
+        ));
+        assert!(!match_tags(
+            &["links".to_string()],
+            &["=l".to_string()],
+            false,
+            false,
+        ));
+        assert!(match_tags(
+            &["links".to_string()],
+            &["=links".to_string()],
+            false,
+            false,
         ));
     }
 }

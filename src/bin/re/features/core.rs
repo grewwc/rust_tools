@@ -387,13 +387,61 @@ pub fn pos_has(args: &[String], needle: &str) -> bool {
 
 pub fn get_tag_query_raw(cli: &Cli) -> Option<String> {
     if let Some(v) = cli.tag_query.as_ref() {
-        return Some(v.clone());
+        if v.trim().is_empty() {
+            return Some(String::new());
+        }
+        let tags = parse_tag_query(v);
+        if tags.is_empty() {
+            return Some(String::new());
+        }
+        return Some(
+            tags.into_iter()
+                .map(|t| format!("={t}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     if let Some(v) = cli.tag_query_ta.as_ref() {
-        return Some(v.clone());
+        if v.trim().is_empty() {
+            return Some(String::new());
+        }
+        let tags = parse_tag_query(v);
+        if tags.is_empty() {
+            return Some(String::new());
+        }
+        return Some(
+            tags.into_iter()
+                .map(|t| {
+                    if t.starts_with('=') || t.starts_with('~') || t.starts_with('^') {
+                        t
+                    } else {
+                        format!("~{t}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     if let Some(v) = cli.tag_query_at.as_ref() {
-        return Some(v.clone());
+        if v.trim().is_empty() {
+            return Some(String::new());
+        }
+        let tags = parse_tag_query(v);
+        if tags.is_empty() {
+            return Some(String::new());
+        }
+        return Some(
+            tags.into_iter()
+                .map(|t| {
+                    if t.starts_with('=') || t.starts_with('~') || t.starts_with('^') {
+                        t
+                    } else {
+                        format!("~{t}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     None
 }
@@ -555,6 +603,14 @@ pub fn resolve_record_ref_local(
         return Some(reference);
     }
 
+    let (reference, tag_mode): (String, char) = match reference.chars().next() {
+        Some('=') | Some('~') | Some('^') => (
+            reference[1..].to_string(),
+            reference.chars().next().unwrap(),
+        ),
+        _ => (reference, '\0'),
+    };
+
     let records = db
         .list_records(-1, false, include_finished)
         .unwrap_or_default();
@@ -583,10 +639,12 @@ pub fn resolve_record_ref_local(
     seen.clear();
     for r in &records {
         let title_hit = r.title.to_lowercase().contains(&lower);
-        let tag_hit = if prefix {
+        let tag_hit = if tag_mode == '~' {
+            r.tags.iter().any(|t| t.contains(&reference))
+        } else if tag_mode == '^' || prefix {
             r.tags.iter().any(|t| t.starts_with(&reference))
         } else {
-            r.tags.iter().any(|t| t.contains(&reference))
+            r.tags.iter().any(|t| t == &reference)
         };
         if (title_hit || tag_hit) && seen.insert(r.id.clone()) {
             fuzzy.push(r.clone());

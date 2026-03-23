@@ -127,6 +127,28 @@ mod tests {
     }
 
     #[test]
+    fn tag_query_t_uses_exact_match_by_default() {
+        let argv = normalize_legacy_single_dash_long_args([
+            "re".to_string(),
+            "-t".to_string(),
+            "l".to_string(),
+        ]);
+        let cli = parse_cli_and_parser(argv).1;
+        assert_eq!(get_tag_query_raw(&cli).as_deref(), Some("=l"));
+    }
+
+    #[test]
+    fn tag_query_ta_uses_contains_match() {
+        let argv = normalize_legacy_single_dash_long_args([
+            "re".to_string(),
+            "-ta".to_string(),
+            "l".to_string(),
+        ]);
+        let cli = parse_cli_and_parser(argv).1;
+        assert_eq!(get_tag_query_raw(&cli).as_deref(), Some("~l"));
+    }
+
+    #[test]
     fn normalize_title_keeps_non_link_text() {
         let plain = "第一行\r\n第二行";
         let normalized = normalize_title_for_display(plain);

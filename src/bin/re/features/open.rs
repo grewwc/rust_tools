@@ -1,6 +1,24 @@
 use crate::features::core::*;
 use crate::memo::{MemoBackend, history};
 
+fn normalize_open_tag_query(tags: &[String], prefix: bool) -> Vec<String> {
+    if prefix {
+        return tags.to_vec();
+    }
+    tags.iter()
+        .map(|t| {
+            let raw = t.trim();
+            if raw.starts_with('=') {
+                return raw.to_string();
+            }
+            if raw.len() == 1 {
+                return format!("={raw}");
+            }
+            raw.to_string()
+        })
+        .collect()
+}
+
 pub fn open_urls(db: &MemoBackend, args: &[String], prefix: bool) {
     let tags = args
         .iter()
@@ -26,6 +44,8 @@ pub fn open_urls(db: &MemoBackend, args: &[String], prefix: bool) {
         return;
     }
 
+    let tags = normalize_open_tag_query(&tags, prefix);
+
     let records = db
         .list_records_by_tags(&tags, false, prefix, -1, true, true)
         .unwrap_or_default();
@@ -50,4 +70,33 @@ pub fn open_urls_from_title(title: &str) {
         return;
     }
     open_choose_url(&urls);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_open_tag_query;
+
+    #[test]
+    fn normalize_open_tag_query_single_char_defaults_to_exact() {
+        let out = normalize_open_tag_query(&["l".to_string()].to_vec(), false);
+        assert_eq!(out, vec!["=l".to_string()]);
+    }
+
+    #[test]
+    fn normalize_open_tag_query_keeps_non_single_char_as_is() {
+        let out = normalize_open_tag_query(&["links".to_string()].to_vec(), false);
+        assert_eq!(out, vec!["links".to_string()]);
+    }
+
+    #[test]
+    fn normalize_open_tag_query_keeps_exact_marker() {
+        let out = normalize_open_tag_query(&["=l".to_string()].to_vec(), false);
+        assert_eq!(out, vec!["=l".to_string()]);
+    }
+
+    #[test]
+    fn normalize_open_tag_query_respects_prefix_mode() {
+        let out = normalize_open_tag_query(&["l".to_string()].to_vec(), true);
+        assert_eq!(out, vec!["l".to_string()]);
+    }
 }
