@@ -16,14 +16,10 @@ use crate::{clipboard::string_content, strw::split::split_space_keep_symbol};
 use super::{
     cli::{Cli, normalize_single_dash_long_opts},
     config, files,
-    history::{COLON, NEWLINE, Message, append_history, build_message_arr},
-    mcp,
-    mcp_example_server,
-    models,
+    history::{COLON, Message, NEWLINE, append_history, build_message_arr},
+    mcp, mcp_example_server, models,
     prompt::{PromptEditor, trim_trailing_newline},
-    request, stream,
-    skills,
-    tools,
+    request, skills, stream, tools,
     types::{AgentContext, App, LoopOverrides, QuestionContext, StreamOutcome},
 };
 
@@ -121,9 +117,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     if mcp_report.loaded {
         println!(
             "[mcp] {} servers, {} tools (config: {})",
-            mcp_report.server_count,
-            mcp_report.tool_count,
-            mcp_report.config_path
+            mcp_report.server_count, mcp_report.tool_count, mcp_report.config_path
         );
     }
 
@@ -210,7 +204,10 @@ fn run_loop(
             tool_calls: None,
             tool_call_id: None,
         });
-        messages.extend(build_message_arr(ctx.history_count, &app.config.history_file)?);
+        messages.extend(build_message_arr(
+            ctx.history_count,
+            &app.config.history_file,
+        )?);
         messages.push(Message {
             role: "user".to_string(),
             content: request::build_content(&next_model, &question, &app.attached_image_files)?,
@@ -231,13 +228,14 @@ fn run_loop(
             iteration += 1;
             let mut current_history = String::new();
             app.streaming.store(true, Ordering::SeqCst);
-            let mut response = match request::do_request_messages(app, &next_model, messages.clone(), true) {
-                Ok(response) => response,
-                Err(err) => {
-                    app.streaming.store(false, Ordering::SeqCst);
-                    return Err(err);
-                }
-            };
+            let mut response =
+                match request::do_request_messages(app, &next_model, messages.clone(), true) {
+                    Ok(response) => response,
+                    Err(err) => {
+                        app.streaming.store(false, Ordering::SeqCst);
+                        return Err(err);
+                    }
+                };
             if app.cancel_stream.swap(false, Ordering::SeqCst) {
                 app.streaming.store(false, Ordering::SeqCst);
                 println!("\nInterrupted.");
@@ -247,13 +245,14 @@ fn run_loop(
                 break;
             }
             request::print_info(&next_model);
-            let stream_result = match stream::stream_response(app, &mut response, &mut current_history) {
-                Ok(result) => result,
-                Err(err) => {
-                    app.streaming.store(false, Ordering::SeqCst);
-                    return Err(err);
-                }
-            };
+            let stream_result =
+                match stream::stream_response(app, &mut response, &mut current_history) {
+                    Ok(result) => result,
+                    Err(err) => {
+                        app.streaming.store(false, Ordering::SeqCst);
+                        return Err(err);
+                    }
+                };
             app.streaming.store(false, Ordering::SeqCst);
 
             if stream_result.outcome == StreamOutcome::Cancelled {
@@ -336,7 +335,7 @@ fn execute_tool_calls(
     tool_calls: &[super::types::ToolCall],
 ) -> Result<Vec<super::types::ToolResult>, Box<dyn std::error::Error>> {
     let mut results = Vec::new();
-    
+
     for tool_call in tool_calls {
         let result = if let Some((server_name, tool_name)) =
             mcp_client.parse_tool_name_for_known_server(&tool_call.function.name)
@@ -359,7 +358,7 @@ fn execute_tool_calls(
         println!("\n[Executed] {}", tool_call.function.name.green());
         results.push(result);
     }
-    
+
     Ok(results)
 }
 
@@ -513,12 +512,7 @@ fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn std::
         let history_count = overrides
             .history_count
             .unwrap_or_else(|| base_history_count(app.cli.history, app.cli.no_history));
-        let ctx = finalize_question(
-            app,
-            question,
-            history_count,
-            overrides.short_output,
-        )?;
+        let ctx = finalize_question(app, question, history_count, overrides.short_output)?;
         return Ok(Some(ctx));
     }
 

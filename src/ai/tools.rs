@@ -1,17 +1,22 @@
-use std::{
-    fs,
-    path::PathBuf,
-    process::Command,
-};
+use std::{fs, path::PathBuf, process::Command};
 
 use serde_json::{Value, json};
 
-use super::types::{FunctionDefinition, ToolDefinition, ToolResult, ToolCall};
+use super::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
 
 const BUILTIN_TOOLS: &[(&str, &str)] = &[
-    ("read_file", "Read the contents of a file from the local filesystem"),
-    ("write_file", "Write content to a file on the local filesystem"),
-    ("list_directory", "List files and directories in a given path"),
+    (
+        "read_file",
+        "Read the contents of a file from the local filesystem",
+    ),
+    (
+        "write_file",
+        "Write content to a file on the local filesystem",
+    ),
+    (
+        "list_directory",
+        "List files and directories in a given path",
+    ),
     ("search_files", "Search for files matching a pattern"),
     ("execute_command", "Execute a shell command"),
     ("grep_search", "Search for patterns in file contents"),
@@ -188,8 +193,7 @@ fn execute_read_file(args: &Value) -> Result<String, String> {
     let offset = args["offset"].as_u64().unwrap_or(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(1000) as usize;
 
-    let content = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read file: {}", e))?;
+    let content = fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     let lines: Vec<&str> = content.lines().collect();
     let start = offset.saturating_sub(1);
@@ -212,12 +216,10 @@ fn execute_write_file(args: &Value) -> Result<String, String> {
     let path = PathBuf::from(file_path);
 
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create directory: {}", e))?;
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
     }
 
-    fs::write(&path, content)
-        .map_err(|e| format!("Failed to write file: {}", e))?;
+    fs::write(&path, content).map_err(|e| format!("Failed to write file: {}", e))?;
 
     Ok(format!("Successfully wrote to {}", file_path))
 }
@@ -240,11 +242,7 @@ fn execute_list_directory(args: &Value) -> Result<String, String> {
         .map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if is_dir {
-                format!("{}/", name)
-            } else {
-                name
-            }
+            if is_dir { format!("{}/", name) } else { name }
         })
         .collect();
 
@@ -383,7 +381,8 @@ fn execute_command(args: &Value) -> Result<String, String> {
         cmd.current_dir(dir);
     }
 
-    let output = cmd.output()
+    let output = cmd
+        .output()
         .map_err(|e| format!("Failed to execute command: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -392,10 +391,12 @@ fn execute_command(args: &Value) -> Result<String, String> {
     if output.status.success() {
         Ok(stdout.trim().to_string())
     } else {
-        Ok(format!("Exit code: {}\n{}\n{}", 
-            output.status.code().unwrap_or(-1), 
-            stdout.trim(), 
-            stderr.trim()))
+        Ok(format!(
+            "Exit code: {}\n{}\n{}",
+            output.status.code().unwrap_or(-1),
+            stdout.trim(),
+            stderr.trim()
+        ))
     }
 }
 
@@ -411,7 +412,8 @@ fn execute_grep_search(args: &Value) -> Result<String, String> {
         cmd.args(["-g", fp]);
     }
 
-    let output = cmd.output()
+    let output = cmd
+        .output()
         .map_err(|e| format!("Failed to execute rg: {}", e))?;
 
     let result = String::from_utf8_lossy(&output.stdout).to_string();
@@ -428,10 +430,11 @@ fn execute_web_search(args: &Value) -> Result<String, String> {
 fn execute_web_fetch(args: &Value) -> Result<String, String> {
     let url = args["url"].as_str().ok_or("Missing url")?;
 
-    let response = reqwest::blocking::get(url)
-        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
+    let response =
+        reqwest::blocking::get(url).map_err(|e| format!("Failed to fetch URL: {}", e))?;
 
-    let content = response.text()
+    let content = response
+        .text()
         .map_err(|e| format!("Failed to read response: {}", e))?;
 
     Ok(content)

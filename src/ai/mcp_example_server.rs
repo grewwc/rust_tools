@@ -87,7 +87,11 @@ pub(super) fn serve<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> io::R
                         "message": "Method not found"
                     }
                 });
-                let _ = writeln!(writer, "{}", serde_json::to_string(&resp).unwrap_or_default());
+                let _ = writeln!(
+                    writer,
+                    "{}",
+                    serde_json::to_string(&resp).unwrap_or_default()
+                );
                 let _ = writer.flush();
                 continue;
             }
@@ -98,7 +102,11 @@ pub(super) fn serve<R: BufRead, W: Write>(mut reader: R, mut writer: W) -> io::R
             "id": id,
             "result": result
         });
-        let _ = writeln!(writer, "{}", serde_json::to_string(&resp).unwrap_or_default());
+        let _ = writeln!(
+            writer,
+            "{}",
+            serde_json::to_string(&resp).unwrap_or_default()
+        );
         let _ = writer.flush();
     }
 

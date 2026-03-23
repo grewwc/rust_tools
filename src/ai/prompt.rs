@@ -212,10 +212,7 @@ impl PromptEditor {
                                 });
                             }
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                                break Err(io::Error::new(
-                                    io::ErrorKind::Interrupted,
-                                    "Ctrl+C",
-                                ));
+                                break Err(io::Error::new(io::ErrorKind::Interrupted, "Ctrl+C"));
                             }
                             _ => {
                                 let handled = match (key.code, key.modifiers) {

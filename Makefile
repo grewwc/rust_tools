@@ -1,4 +1,4 @@
-INSTALL_BINS ?= `ls ./bin`
+INSTALL_BINS ?= $(sort $(patsubst src/bin/%.rs,%,$(wildcard src/bin/*.rs)))
 ALL_BINS ?= $(INSTALL_BINS) c
 
 RELEASE_DIR := target/release

@@ -1,6 +1,6 @@
 pub mod bloom_filter;
-pub mod counter;
 pub mod concurrent_hash_map;
+pub mod counter;
 pub mod deque_list;
 pub mod graph;
 pub mod lru_cache;
@@ -20,7 +20,9 @@ pub use bloom_filter::BloomFilter;
 pub use concurrent_hash_map::ConcurrentHashMap;
 pub use counter::Counter;
 pub use deque_list::DequeList;
-pub use graph::{DirectedGraph, Edge, Mst, UndirectedGraph, WeightedDirectedGraph, WeightedUndirectedGraph};
+pub use graph::{
+    DirectedGraph, Edge, Mst, UndirectedGraph, WeightedDirectedGraph, WeightedUndirectedGraph,
+};
 pub use lru_cache::LruCache;
 pub use ordered_map::OrderedMap;
 pub use ordered_set::OrderedSet;

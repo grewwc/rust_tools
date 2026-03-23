@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs,
-    path::PathBuf,
-};
+use std::{collections::HashMap, fs, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -85,11 +81,11 @@ impl SkillRegistry {
     }
 
     fn load_skill(&self, path: &PathBuf) -> Result<SkillManifest, String> {
-        let content = fs::read_to_string(path)
-            .map_err(|e| format!("Failed to read skill file: {}", e))?;
+        let content =
+            fs::read_to_string(path).map_err(|e| format!("Failed to read skill file: {}", e))?;
 
-        let skill: SkillManifest = serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse skill: {}", e))?;
+        let skill: SkillManifest =
+            serde_json::from_str(&content).map_err(|e| format!("Failed to parse skill: {}", e))?;
 
         Ok(skill)
     }
@@ -107,8 +103,7 @@ impl SkillRegistry {
         let content = serde_json::to_string_pretty(&skill)
             .map_err(|e| format!("Failed to serialize skill: {}", e))?;
 
-        fs::write(&path, content)
-            .map_err(|e| format!("Failed to write skill file: {}", e))?;
+        fs::write(&path, content).map_err(|e| format!("Failed to write skill file: {}", e))?;
 
         self.skills.insert(skill.name.clone(), skill);
         Ok(())
@@ -118,8 +113,7 @@ impl SkillRegistry {
         let path = self.skills_dir.join(format!("{}.json", name));
 
         if path.exists() {
-            fs::remove_file(&path)
-                .map_err(|e| format!("Failed to remove skill file: {}", e))?;
+            fs::remove_file(&path).map_err(|e| format!("Failed to remove skill file: {}", e))?;
         }
 
         self.skills.remove(name);
@@ -128,7 +122,7 @@ impl SkillRegistry {
 
     pub(super) fn match_skill(&self, input: &str) -> Option<&SkillManifest> {
         let input_lower = input.to_lowercase();
-        
+
         for skill in self.skills.values() {
             for trigger in &skill.triggers {
                 if input_lower.contains(&trigger.to_lowercase()) {
@@ -136,7 +130,7 @@ impl SkillRegistry {
                 }
             }
         }
-        
+
         None
     }
 }
@@ -191,24 +185,27 @@ fn get_skill_tool_definition(name: &str) -> Option<ToolDefinition> {
 
 fn get_skill_tools_map() -> HashMap<&'static str, ToolDefinition> {
     use serde_json::json;
-    
+
     let mut map = HashMap::new();
-    
-    map.insert("code_review", ToolDefinition {
-        tool_type: "function".to_string(),
-        function: FunctionDefinition {
-            name: "code_review".to_string(),
-            description: "Perform a code review on the given code".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "The code to review"},
-                    "language": {"type": "string", "description": "The programming language"}
-                },
-                "required": ["code"]
-            }),
+
+    map.insert(
+        "code_review",
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "code_review".to_string(),
+                description: "Perform a code review on the given code".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "The code to review"},
+                        "language": {"type": "string", "description": "The programming language"}
+                    },
+                    "required": ["code"]
+                }),
+            },
         },
-    });
+    );
 
     map.insert("debug", ToolDefinition {
         tool_type: "function".to_string(),
@@ -242,21 +239,24 @@ fn get_skill_tools_map() -> HashMap<&'static str, ToolDefinition> {
         },
     });
 
-    map.insert("test_generate", ToolDefinition {
-        tool_type: "function".to_string(),
-        function: FunctionDefinition {
-            name: "test_generate".to_string(),
-            description: "Generate tests for the given code".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "The code to test"},
-                    "framework": {"type": "string", "description": "The test framework to use"}
-                },
-                "required": ["code"]
-            }),
+    map.insert(
+        "test_generate",
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "test_generate".to_string(),
+                description: "Generate tests for the given code".to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "The code to test"},
+                        "framework": {"type": "string", "description": "The test framework to use"}
+                    },
+                    "required": ["code"]
+                }),
+            },
         },
-    });
+    );
 
     map.insert("document", ToolDefinition {
         tool_type: "function".to_string(),

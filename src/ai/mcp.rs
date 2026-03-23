@@ -92,7 +92,11 @@ impl McpServerConnection {
         match &mut self.transport {
             McpTransport::Process { stdout, .. } => {
                 let mut response_line = String::new();
-                read_line_with_timeout_process(stdout, self.request_timeout_ms, &mut response_line)?;
+                read_line_with_timeout_process(
+                    stdout,
+                    self.request_timeout_ms,
+                    &mut response_line,
+                )?;
                 Ok(response_line)
             }
             McpTransport::InProcess { stdout, .. } => {
@@ -123,10 +127,7 @@ fn wait_fd_readable(fd: i32, timeout_ms: u64) -> Result<(), String> {
             return Ok(());
         }
         if rc == 0 {
-            return Err(format!(
-                "MCP response timeout after {} ms",
-                timeout_ms
-            ));
+            return Err(format!("MCP response timeout after {} ms", timeout_ms));
         }
 
         let err = std::io::Error::last_os_error();
@@ -176,10 +177,7 @@ fn read_line_with_timeout_buf<R: std::io::Read>(
         if now >= deadline {
             return Err(format!("MCP response timeout after {} ms", timeout_ms));
         }
-        let remaining = deadline
-            .saturating_duration_since(now)
-            .as_millis()
-            .max(1) as u64;
+        let remaining = deadline.saturating_duration_since(now).as_millis().max(1) as u64;
 
         #[cfg(unix)]
         {
@@ -252,13 +250,12 @@ impl McpClient {
             cmd.env(key, value);
         }
 
-        let mut process = cmd.spawn()
+        let mut process = cmd
+            .spawn()
             .map_err(|e| format!("Failed to start MCP server '{}': {}", name, e))?;
 
-        let stdin = process.stdin.take()
-            .ok_or("Failed to get stdin")?;
-        let stdout = process.stdout.take()
-            .ok_or("Failed to get stdout")?;
+        let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
+        let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
 
         let mut conn = McpServerConnection {
             transport: McpTransport::Process {
@@ -371,8 +368,7 @@ impl McpClient {
         let id1 = self.next_request_id();
         Self::send_request_to_conn(conn, id1, "initialize", Some(params))?;
         let id2 = self.next_request_id();
-        if let Err(err) = Self::send_request_to_conn(conn, id2, "notifications/initialized", None)
-        {
+        if let Err(err) = Self::send_request_to_conn(conn, id2, "notifications/initialized", None) {
             let is_method_not_found = err.contains("-32601")
                 && (err.contains("notifications/initialized") || err.contains("initialized"));
             if !is_method_not_found {
@@ -395,7 +391,10 @@ impl McpClient {
         Ok(tools)
     }
 
-    fn list_resources(&mut self, conn: &mut McpServerConnection) -> Result<Vec<McpResource>, String> {
+    fn list_resources(
+        &mut self,
+        conn: &mut McpServerConnection,
+    ) -> Result<Vec<McpResource>, String> {
         let result = self.send_request(conn, "resources/list", None)?;
 
         let resources = result["resources"]
@@ -437,7 +436,9 @@ impl McpClient {
             "arguments": arguments
         });
 
-        let conn = self.servers.get_mut(server_name)
+        let conn = self
+            .servers
+            .get_mut(server_name)
             .ok_or_else(|| format!("Server not found: {}", server_name))?;
 
         let result = Self::send_request_to_conn(conn, id, "tools/call", Some(params))?;
@@ -452,17 +453,15 @@ impl McpClient {
         Ok(content)
     }
 
-    pub(super) fn read_resource(
-        &mut self,
-        server_name: &str,
-        uri: &str,
-    ) -> Result<String, String> {
+    pub(super) fn read_resource(&mut self, server_name: &str, uri: &str) -> Result<String, String> {
         let id = self.next_request_id();
         let params = json!({
             "uri": uri
         });
 
-        let conn = self.servers.get_mut(server_name)
+        let conn = self
+            .servers
+            .get_mut(server_name)
             .ok_or_else(|| format!("Server not found: {}", server_name))?;
 
         let result = Self::send_request_to_conn(conn, id, "resources/read", Some(params))?;
@@ -489,7 +488,9 @@ impl McpClient {
             "arguments": arguments
         });
 
-        let conn = self.servers.get_mut(server_name)
+        let conn = self
+            .servers
+            .get_mut(server_name)
             .ok_or_else(|| format!("Server not found: {}", server_name))?;
 
         let result = Self::send_request_to_conn(conn, id, "prompts/get", Some(params))?;
@@ -606,12 +607,14 @@ pub(super) fn parse_mcp_tool_name(full_name: &str) -> Option<(String, String)> {
     Some((parts[0].to_string(), parts[1].to_string()))
 }
 
-pub(super) fn load_mcp_config_from_file(path: &str) -> Result<HashMap<String, McpServerConfig>, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Failed to read MCP config: {}", e))?;
+pub(super) fn load_mcp_config_from_file(
+    path: &str,
+) -> Result<HashMap<String, McpServerConfig>, String> {
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("Failed to read MCP config: {}", e))?;
 
-    let config: Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Failed to parse MCP config: {}", e))?;
+    let config: Value =
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse MCP config: {}", e))?;
 
     let servers = config["mcpServers"]
         .as_object()

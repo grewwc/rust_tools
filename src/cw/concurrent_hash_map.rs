@@ -1,9 +1,25 @@
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::ptr::NonNull;
 use std::sync::RwLock;
+use std::sync::RwLockReadGuard;
 
 use rustc_hash::FxHasher;
 
 use crate::common::types::FastMap;
+
+pub struct ValueRef<'a, K, V> {
+    guard: RwLockReadGuard<'a, FastMap<K, V>>,
+    value: NonNull<V>,
+}
+
+impl<K, V> Deref for ValueRef<'_, K, V> {
+    type Target = V;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.value.as_ref() }
+    }
+}
 
 pub struct ConcurrentHashMap<K, V>
 where
@@ -80,6 +96,20 @@ where
         let shard = self.shard_for_key(key);
         let guard = shard.read().unwrap();
         guard.get(key).cloned()
+    }
+
+    pub fn get(&self, key: &K) -> Option<ValueRef<'_, K, V>> {
+        let shard = self.shard_for_key(key);
+        let guard = shard.read().unwrap();
+        let value = match guard.get(key) {
+            Some(v) => NonNull::from(v),
+            None => return None,
+        };
+        Some(ValueRef { guard, value })
+    }
+
+    pub fn get_ref(&self, key: &K) -> Option<ValueRef<'_, K, V>> {
+        self.get(key)
     }
 
     pub fn get_with<R>(&self, key: &K, f: impl FnOnce(&V) -> R) -> Option<R> {
@@ -170,6 +200,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
     use std::sync::{
         Arc, Barrier, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -245,6 +276,37 @@ mod tests {
         let m: ConcurrentHashMap<&'static str, usize> = ConcurrentHashMap::new();
         let x = m.get_with(&"missing", |v| v + 1);
         assert_eq!(x, None);
+    }
+
+    #[test]
+    fn test_get_by_ref_deref() {
+        let m = ConcurrentHashMap::new();
+        m.insert("k", vec![1, 2, 3]);
+        let v = m.get(&"k").unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], 1);
+    }
+
+    #[test]
+    fn test_get_by_ref_blocks_writer_until_drop() {
+        let m = Arc::new(ConcurrentHashMap::with_shard_count(1));
+        m.insert("k", 1usize);
+        let guard = m.get(&"k").unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let m2 = Arc::clone(&m);
+        thread::spawn(move || {
+            started_tx.send(()).ok();
+            m2.remove(&"k");
+            done_tx.send(()).ok();
+        });
+
+        started_rx.recv().unwrap();
+        assert!(done_rx.try_recv().is_err());
+        drop(guard);
+        done_rx.recv().unwrap();
+        assert_eq!(m.get_cloned(&"k"), None);
     }
 
     #[test]
@@ -354,7 +416,9 @@ mod tests {
 
     #[test]
     fn test_concurrent_put_if_absent_single_winner() {
-        let m = Arc::new(ConcurrentHashMap::<&'static str, usize>::with_shard_count(32));
+        let m = Arc::new(ConcurrentHashMap::<&'static str, usize>::with_shard_count(
+            32,
+        ));
         let threads = 32usize;
         let barrier = Arc::new(Barrier::new(threads));
         let results = Arc::new(Mutex::new(Vec::new()));
@@ -385,7 +449,9 @@ mod tests {
 
     #[test]
     fn test_concurrent_get_or_insert_with_only_calls_once() {
-        let m = Arc::new(ConcurrentHashMap::<&'static str, usize>::with_shard_count(32));
+        let m = Arc::new(ConcurrentHashMap::<&'static str, usize>::with_shard_count(
+            32,
+        ));
         let threads = 64usize;
         let barrier = Arc::new(Barrier::new(threads));
         let calls = Arc::new(AtomicUsize::new(0));
@@ -413,7 +479,9 @@ mod tests {
 
     #[test]
     fn test_concurrent_compute_increment_same_key() {
-        let m = Arc::new(ConcurrentHashMap::<&'static str, usize>::with_shard_count(64));
+        let m = Arc::new(ConcurrentHashMap::<&'static str, usize>::with_shard_count(
+            64,
+        ));
         let threads = 32usize;
         let iters = 2000usize;
         let barrier = Arc::new(Barrier::new(threads));
@@ -546,7 +614,9 @@ mod tests {
 
     #[test]
     fn test_high_contention_insert_overwrite_same_key() {
-        let m = Arc::new(ConcurrentHashMap::<&'static str, usize>::with_shard_count(64));
+        let m = Arc::new(ConcurrentHashMap::<&'static str, usize>::with_shard_count(
+            64,
+        ));
         let threads = 64usize;
         let barrier = Arc::new(Barrier::new(threads));
 

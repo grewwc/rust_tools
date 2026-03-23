@@ -8,8 +8,7 @@ use super::{
     models,
     prompt::MultilineHistoryState,
     request::{StreamChoice, StreamChunk, StreamDelta},
-    stream,
-    tools,
+    stream, tools,
 };
 
 #[test]

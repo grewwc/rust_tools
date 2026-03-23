@@ -1,5 +1,5 @@
-use std::io::{self, BufRead, BufReader, Write};
 use std::collections::HashMap;
+use std::io::{self, BufRead, BufReader, Write};
 
 use colored::Colorize;
 use serde_json;
@@ -107,8 +107,10 @@ pub(super) fn stream_response(
 
             for stream_tool_call in &choice.delta.tool_calls {
                 let index = stream_tool_call.index;
-                let builder = tool_calls_map.entry(index).or_insert_with(ToolCallBuilder::new);
-                
+                let builder = tool_calls_map
+                    .entry(index)
+                    .or_insert_with(ToolCallBuilder::new);
+
                 if !stream_tool_call.id.is_empty() {
                     builder.id = stream_tool_call.id.clone();
                 }
@@ -118,7 +120,9 @@ pub(super) fn stream_response(
                 if !stream_tool_call.function.name.is_empty() {
                     builder.function_name = stream_tool_call.function.name.clone();
                 }
-                builder.arguments.push_str(&stream_tool_call.function.arguments);
+                builder
+                    .arguments
+                    .push_str(&stream_tool_call.function.arguments);
             }
         }
 
