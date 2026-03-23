@@ -102,7 +102,7 @@ impl<'a, T: Eq + Hash> UF<'a, T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::collections::uf::UF;
+    use crate::cw::uf::UF;
 
     #[test]
     fn test_union() {

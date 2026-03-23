@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
-use crate::collections::trie::Trie;
 use crate::common::types::FastSet;
+use crate::cw::trie::Trie;
 use crate::strw::{indices, split};
 
 use super::{EncodedArgs, FlagDef, FlagType, Parser};
@@ -228,7 +228,7 @@ fn parse_args_encoded(p: &mut Parser, encoded: &str, bool_opts: &[String]) {
     }
 
     let (mut positionals, bool_keys, keys, mut vals) = classify_arguments(&cmd, bool_opts);
-    let mut opt = crate::collections::ordered_map::OrderedMap::new();
+    let mut opt = crate::cw::ordered_map::OrderedMap::new();
 
     for (i, key) in keys.into_iter().enumerate() {
         if i < vals.len() {
@@ -268,7 +268,7 @@ fn parse_args_encoded(p: &mut Parser, encoded: &str, bool_opts: &[String]) {
         }
     }
 
-    p.positional = crate::collections::deque_list::DequeList::from(positionals);
+    p.positional = crate::cw::deque_list::DequeList::from(positionals);
     p.optional = opt;
 }
 

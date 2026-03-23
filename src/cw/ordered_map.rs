@@ -32,11 +32,30 @@ where
         self.map.len()
     }
 
-    pub fn insert(&mut self, k: K, v: V) {
-        if !self.map.contains_key(&k) {
-            self.order.push(k.clone());
+    pub fn insert(&mut self, k: K, v: V) -> bool {
+        match self.map.entry(k) {
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                e.insert(v);
+                false
+            }
+            std::collections::hash_map::Entry::Vacant(e) => {
+                self.order.push(e.key().clone());
+                e.insert(v);
+                true
+            }
         }
-        self.map.insert(k, v);
+    }
+
+    pub(crate) fn remove_exists<Q>(&mut self, k: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        if self.map.remove(k).is_some() {
+            self.order.retain(|x| x.borrow() != k);
+            return true;
+        }
+        false
     }
 
     pub fn remove<Q>(&mut self, k: &Q)
@@ -44,9 +63,7 @@ where
         K: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        if self.map.remove(k).is_some() {
-            self.order.retain(|x| x.borrow() != k);
-        }
+        self.remove_exists(k);
     }
 
     pub fn contains_key<Q>(&self, k: &Q) -> bool

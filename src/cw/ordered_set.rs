@@ -1,11 +1,10 @@
 use std::{borrow::Borrow, fmt, hash::Hash};
 
-use crate::common::types::FastSet;
+use crate::cw::ordered_map::OrderedMap;
 
 #[derive(Clone)]
 pub struct OrderedSet<T> {
-    order: Vec<T>,
-    set: FastSet<T>,
+    map: OrderedMap<T, ()>,
 }
 
 impl<T> OrderedSet<T>
@@ -14,35 +13,48 @@ where
 {
     pub fn new() -> Self {
         Self {
-            order: Vec::new(),
-            set: FastSet::default(),
+            map: OrderedMap::new(),
         }
     }
 
-    pub fn insert(&mut self, v: T) -> bool {
-        if self.set.insert(v.clone()) {
-            self.order.push(v);
-            return true;
-        }
-        false
+    pub fn clear(&mut self) {
+        self.map.clear();
     }
 
-    pub fn contains<Q>(&self, v: &Q) -> bool
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn insert(&mut self, k: T) -> bool {
+        self.map.insert(k, ())
+    }
+
+    pub fn remove<Q>(&mut self, k: &Q) -> bool
     where
         T: Borrow<Q>,
         Q: Eq + Hash + ?Sized,
     {
-        self.set.contains(v)
+        self.map.remove_exists(k)
     }
 
-    pub fn to_vec(&self) -> Vec<T> {
-        self.order.clone()
+    pub fn contains<Q>(&self, k: &Q) -> bool
+    where
+        T: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        self.map.contains_key(k)
     }
-}
 
-impl OrderedSet<String> {
-    pub fn insert_str(&mut self, v: &str) -> bool {
-        self.insert(v.to_string())
+    pub fn keys(&self) -> impl Iterator<Item = &T> {
+        self.map.keys()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.map.keys()
     }
 }
 
@@ -57,9 +69,9 @@ where
 
 impl<T> fmt::Debug for OrderedSet<T>
 where
-    T: fmt::Debug + Eq + Hash,
+    T: fmt::Debug + Eq + Hash + Clone,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_set().entries(self.set.iter()).finish()
+        f.debug_set().entries(self.map.keys()).finish()
     }
 }

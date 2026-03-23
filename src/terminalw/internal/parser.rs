@@ -5,8 +5,8 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
-use crate::collections::{deque_list::DequeList, ordered_map::OrderedMap, ordered_set::OrderedSet};
 use crate::common::types::FastSet;
+use crate::cw::{deque_list::DequeList, ordered_map::OrderedMap, ordered_set::OrderedSet};
 
 use super::actiontype::ActionList;
 
@@ -349,7 +349,7 @@ impl Parser {
         let mut out = OrderedSet::new();
         for (k, v) in self.optional.iter() {
             if v.is_empty() {
-                out.insert_str(k.trim_start_matches('-'));
+                out.insert(k.trim_start_matches('-').to_string());
                 out.insert(k.clone());
             }
         }

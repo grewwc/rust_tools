@@ -156,8 +156,6 @@ fn drain_response(response: &mut Response) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
-
-
 fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn std::error::Error>> {
     if !app.cli.args.is_empty() {
         let base_question = if app.cli.raw {

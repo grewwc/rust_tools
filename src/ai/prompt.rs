@@ -181,10 +181,7 @@ impl PromptEditor {
                                     Span::raw("  "),
                                     Span::styled("Enter", Style::default().fg(Color::Blue)),
                                     Span::raw(" newline  ·  "),
-                                    Span::styled(
-                                        "Esc/Ctrl+D",
-                                        Style::default().fg(Color::Green),
-                                    ),
+                                    Span::styled("Esc/Ctrl+D", Style::default().fg(Color::Green)),
                                     Span::raw(" send  ·  "),
                                     Span::styled("Ctrl+C", Style::default().fg(Color::Yellow)),
                                     Span::raw(" cancel"),
@@ -374,7 +371,10 @@ fn replace_textarea_content(textarea: &mut tui_textarea::TextArea<'_>, content: 
     *textarea = tui_textarea::TextArea::new(lines);
 }
 
-fn is_submit_key(code: crossterm::event::KeyCode, modifiers: crossterm::event::KeyModifiers) -> bool {
+fn is_submit_key(
+    code: crossterm::event::KeyCode,
+    modifiers: crossterm::event::KeyModifiers,
+) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
 
     match (code, modifiers) {
