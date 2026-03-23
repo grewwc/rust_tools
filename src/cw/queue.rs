@@ -27,6 +27,10 @@ impl<T> Queue<T> {
         self.data.pop_front()
     }
 
+    pub fn clear(&mut self) {
+        self.data.clear();
+    }
+
     pub fn size(&self) -> usize {
         self.data.len()
     }
@@ -41,5 +45,51 @@ impl<T> Queue<T> {
 
     pub fn front(&self) -> Option<&T> {
         self.data.front()
+    }
+
+    pub fn back(&self) -> Option<&T> {
+        self.data.back()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.data.iter()
+    }
+
+    pub fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = T>,
+    {
+        self.data.extend(iter);
+    }
+
+    pub fn into_vec(self) -> Vec<T> {
+        self.data.into_iter().collect()
+    }
+}
+
+impl<T> From<Vec<T>> for Queue<T> {
+    fn from(v: Vec<T>) -> Self {
+        Self {
+            data: v.into_iter().collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Queue;
+
+    #[test]
+    fn test_queue_basic() {
+        let mut q = Queue::new();
+        assert!(q.is_empty());
+        q.enqueue(1);
+        q.enqueue(2);
+        assert_eq!(q.front(), Some(&1));
+        assert_eq!(q.back(), Some(&2));
+        assert_eq!(q.iter().copied().collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(q.dequeue(), Some(1));
+        assert_eq!(q.dequeue(), Some(2));
+        assert_eq!(q.dequeue(), None);
     }
 }

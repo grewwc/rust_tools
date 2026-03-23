@@ -92,6 +92,16 @@ where
         None
     }
 
+    pub fn get_ref(&mut self, k: &K) -> Option<&V> {
+        if let Some(node) = self.map.get(k) {
+            let x = node.clone().as_ptr();
+            let ret = unsafe { Some(&(*x).val) };
+            self.move_node_to_front(node.clone());
+            return ret;
+        }
+        None
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -102,6 +112,17 @@ where
 
     pub fn cap(&self) -> usize {
         self.cap
+    }
+
+    pub fn contains_key(&self, k: &K) -> bool {
+        self.map.contains_key(k)
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.len = 0;
+        self.head.borrow_mut().next = Some(self.tail.clone());
+        self.tail.borrow_mut().prev = Some(Rc::downgrade(&self.head));
     }
 }
 
@@ -155,5 +176,28 @@ where
         prev_2.borrow_mut().next = Some(self.tail.clone());
         self.tail.borrow_mut().prev = Some(Rc::downgrade(&prev_2));
         Some(prev)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LruCache;
+
+    #[test]
+    fn test_lru_cache_basic_and_clear() {
+        let mut c: LruCache<i32, i32> = LruCache::new(2);
+        assert!(c.is_empty());
+        c.put(1, 10);
+        c.put(2, 20);
+        assert_eq!(c.len(), 2);
+        assert!(c.contains_key(&1));
+        assert_eq!(c.get(1), Some(&10));
+        c.put(3, 30);
+        assert!(!c.contains_key(&2));
+        assert!(c.contains_key(&3));
+
+        c.clear();
+        assert!(c.is_empty());
+        assert_eq!(c.get_ref(&1), None);
     }
 }

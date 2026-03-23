@@ -126,6 +126,12 @@ where
         true
     }
 
+    pub fn remove_score(&mut self, key: &K) -> Option<f64> {
+        let score = self.map.remove(key)?;
+        self.tree.remove(&ZSetNode::new(key.clone(), score));
+        Some(score)
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -168,6 +174,18 @@ where
         self.tree
             .last()
             .map(|entry| ZSetEntry::new(entry.key.clone(), entry.score))
+    }
+
+    pub fn pop_min(&mut self) -> Option<ZSetEntry<K>> {
+        let node = self.tree.pop_first()?;
+        self.map.remove(&node.key);
+        Some(ZSetEntry::new(node.key, node.score))
+    }
+
+    pub fn pop_max(&mut self) -> Option<ZSetEntry<K>> {
+        let node = self.tree.pop_last()?;
+        self.map.remove(&node.key);
+        Some(ZSetEntry::new(node.key, node.score))
     }
 
     pub fn score(&self, key: &K) -> Option<f64> {
@@ -270,5 +288,18 @@ mod tests {
         z1.subtract(&z2);
         assert_eq!(z1.len(), 1);
         assert!(z1.contains(&"a"));
+    }
+
+    #[test]
+    fn test_zset_pop_min_max_and_remove_score() {
+        let mut z = ZSet::new();
+        z.add("a", 2.0);
+        z.add("b", 1.0);
+        z.add("c", 3.0);
+        assert_eq!(z.remove_score(&"a"), Some(2.0));
+        assert!(!z.contains(&"a"));
+        assert_eq!(z.pop_min().unwrap().key(), &"b");
+        assert_eq!(z.pop_max().unwrap().key(), &"c");
+        assert!(z.is_empty());
     }
 }

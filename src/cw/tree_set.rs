@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::ops::Bound::Included;
 
 /// Ordered set backed by a tree structure.
 pub struct TreeSet<T>
@@ -46,12 +47,41 @@ where
         self.data.iter()
     }
 
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.data.iter()
+    }
+
     pub fn clear(&mut self) {
         self.data.clear();
     }
 
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
+    }
+
+    pub fn min(&self) -> Option<&T> {
+        self.data.first()
+    }
+
+    pub fn max(&self) -> Option<&T> {
+        self.data.last()
+    }
+
+    pub fn pop_min(&mut self) -> Option<T> {
+        self.data.pop_first()
+    }
+
+    pub fn pop_max(&mut self) -> Option<T> {
+        self.data.pop_last()
+    }
+
+    pub fn search_range<'a>(&'a self, lower: &'a T, upper: &'a T) -> Vec<&'a T> {
+        if lower > upper {
+            return Vec::new();
+        }
+        self.data
+            .range((Included(lower), Included(upper)))
+            .collect()
     }
 }
 
@@ -161,5 +191,17 @@ mod tests {
         s1.subtract(&s2);
         assert_eq!(s1.to_vec(), vec![1, 2]);
         assert!(s1.mutual_exclude(&s2));
+    }
+
+    #[test]
+    fn test_min_max_range_pop() {
+        let mut s = TreeSet::new();
+        s.add_all([2, 1, 3]);
+        assert_eq!(s.min(), Some(&1));
+        assert_eq!(s.max(), Some(&3));
+        assert_eq!(s.search_range(&2, &3), vec![&2, &3]);
+        assert_eq!(s.pop_min(), Some(1));
+        assert_eq!(s.pop_max(), Some(3));
+        assert_eq!(s.to_vec(), vec![2]);
     }
 }

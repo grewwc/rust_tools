@@ -23,6 +23,10 @@ where
         self.data.get(key)
     }
 
+    pub fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.data.get_mut(key)
+    }
+
     pub fn contains(&self, key: &K) -> bool {
         self.data.contains_key(key)
     }
@@ -99,6 +103,22 @@ where
         self.data.is_empty()
     }
 
+    pub fn first_key(&self) -> Option<&K> {
+        self.data.first_key_value().map(|(k, _)| k)
+    }
+
+    pub fn last_key(&self) -> Option<&K> {
+        self.data.last_key_value().map(|(k, _)| k)
+    }
+
+    pub fn pop_first(&mut self) -> Option<(K, V)> {
+        self.data.pop_first()
+    }
+
+    pub fn pop_last(&mut self) -> Option<(K, V)> {
+        self.data.pop_last()
+    }
+
     pub fn search_range<'a>(&'a self, lower: &'a K, upper: &'a K) -> Vec<&'a K> {
         if lower > upper {
             return Vec::new();
@@ -155,6 +175,19 @@ mod tests {
         assert!(m.delete(&"a"));
         assert!(!m.delete(&"a"));
         assert_eq!(m.get_or_default(&"missing", 9), 9);
+    }
+
+    #[test]
+    fn test_first_last_pop() {
+        let mut m = TreeMap::new();
+        m.put(2, "b");
+        m.put(1, "a");
+        m.put(3, "c");
+        assert_eq!(m.first_key(), Some(&1));
+        assert_eq!(m.last_key(), Some(&3));
+        assert_eq!(m.pop_first(), Some((1, "a")));
+        assert_eq!(m.pop_last(), Some((3, "c")));
+        assert_eq!(m.keys(), vec![2]);
     }
 
     #[test]
