@@ -100,9 +100,11 @@ pub(super) fn stream_response(
             }
         };
 
+        let mut reached_finish_reason = false;
         if let Some(choice) = chunk.choices.first() {
             if let Some(ref reason) = choice.finish_reason {
                 finish_reason = Some(reason.clone());
+                reached_finish_reason = true;
             }
 
             for stream_tool_call in &choice.delta.tool_calls {
@@ -129,6 +131,9 @@ pub(super) fn stream_response(
         let content =
             extract_chunk_text(&chunk, &thinking_tag, &end_thinking_tag, &mut thinking_open);
         if content.is_empty() {
+            if reached_finish_reason {
+                break;
+            }
             continue;
         }
         write_stream_content(content.as_str(), app.writer.as_mut(), &mut markdown)?;
@@ -139,6 +144,12 @@ pub(super) fn stream_response(
         let text = text.trim_matches('\n');
         current_history.push_str(text);
         assistant_text.push_str(text);
+
+        // Some providers may not send a trailing [DONE] frame promptly.
+        // If finish_reason is present, we already have the terminal chunk.
+        if reached_finish_reason {
+            break;
+        }
     }
 
     markdown.flush_pending()?;

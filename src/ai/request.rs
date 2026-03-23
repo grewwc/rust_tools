@@ -254,8 +254,8 @@ pub(super) fn print_info(model: &str) {
     } else {
         "false"
     };
-    print!("[{} (search: {})] ", model.green(), search.red());
-    let _ = io::stdout().flush();
+    // 使用println!避免手动flush的权限问题
+    println!("[{} (search: {})]", model.green(), search.red());
 }
 
 fn upload_qwen_long_files(
