@@ -9,6 +9,8 @@ use serde_json::Value;
 
 use crate::strw::split::split_by_str_keep_quotes;
 
+use super::types::ToolCall;
+
 const MAX_HISTORY_LINES: usize = 100;
 pub(super) const COLON: char = '\0';
 pub(super) const NEWLINE: char = '\x01';
@@ -17,6 +19,10 @@ pub(super) const NEWLINE: char = '\x01';
 pub(super) struct Message {
     pub(super) role: String,
     pub(super) content: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) tool_calls: Option<Vec<ToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) tool_call_id: Option<String>,
 }
 
 pub(super) fn build_message_arr(
@@ -51,6 +57,8 @@ pub(super) fn build_message_arr(
         messages.push(Message {
             role: role.to_string(),
             content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
         });
     }
 

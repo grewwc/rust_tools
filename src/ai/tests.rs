@@ -9,6 +9,7 @@ use super::{
     prompt::MultilineHistoryState,
     request::{StreamChoice, StreamChunk, StreamDelta},
     stream,
+    tools,
 };
 
 #[test]
@@ -120,7 +121,9 @@ fn thinking_chunks_are_wrapped_once() {
             delta: StreamDelta {
                 content: String::new(),
                 reasoning_content: "step one".to_string(),
+                tool_calls: Vec::new(),
             },
+            finish_reason: None,
         }],
     };
     let mut thinking_open = false;
@@ -134,7 +137,9 @@ fn thinking_chunks_are_wrapped_once() {
             delta: StreamDelta {
                 content: "final".to_string(),
                 reasoning_content: String::new(),
+                tool_calls: Vec::new(),
             },
+            finish_reason: None,
         }],
     };
     let text =
@@ -165,6 +170,18 @@ fn sigint_during_stream_only_cancels_current_reply() {
     super::driver::handle_sigint(&shutdown, &streaming, &cancel_stream);
 
     assert!(!shutdown.load(Ordering::SeqCst));
+    assert!(cancel_stream.load(Ordering::SeqCst));
+}
+
+#[test]
+fn second_sigint_during_stream_requests_shutdown() {
+    let shutdown = AtomicBool::new(false);
+    let streaming = AtomicBool::new(true);
+    let cancel_stream = AtomicBool::new(true);
+
+    super::driver::handle_sigint(&shutdown, &streaming, &cancel_stream);
+
+    assert!(shutdown.load(Ordering::SeqCst));
     assert!(cancel_stream.load(Ordering::SeqCst));
 }
 
@@ -204,4 +221,59 @@ fn table_live_preview_detection_requires_table_like_content() {
     assert!(stream::line_looks_like_table_preview("  col1 | col2"));
     assert!(!stream::line_looks_like_table_preview("plain text"));
     assert!(!stream::line_looks_like_table_preview("```| not table"));
+}
+
+#[test]
+fn execute_command_blocks_dangerous_programs() {
+    assert!(tools::validate_execute_command("rm -rf /").is_err());
+    assert!(tools::validate_execute_command("mv a b").is_err());
+    assert!(tools::validate_execute_command("cp a b").is_err());
+    assert!(tools::validate_execute_command("sudo ls").is_err());
+}
+
+#[test]
+fn execute_command_blocks_shell_metacharacters() {
+    assert!(tools::validate_execute_command("ls; rm -rf /").is_err());
+    assert!(tools::validate_execute_command("ls | wc").is_err());
+    assert!(tools::validate_execute_command("ls && pwd").is_err());
+    assert!(tools::validate_execute_command("echo hi > /tmp/a").is_err());
+    assert!(tools::validate_execute_command("find . -exec ls {} \\;").is_err());
+}
+
+#[test]
+fn execute_command_allows_readonly_commands() {
+    assert!(tools::validate_execute_command("ls").is_ok());
+    assert!(tools::validate_execute_command("pwd").is_ok());
+    assert!(tools::validate_execute_command("cat Cargo.toml").is_ok());
+    assert!(tools::validate_execute_command("rg main src").is_ok());
+}
+
+#[test]
+fn stream_chunk_accepts_null_content() {
+    let payload = r#"{"choices":[{"delta":{"content":null,"reasoning_content":null}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.choices.len(), 1);
+    assert_eq!(parsed.choices[0].delta.content, "");
+    assert_eq!(parsed.choices[0].delta.reasoning_content, "");
+}
+
+#[test]
+fn stream_tool_call_maps_type_field() {
+    let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"mcp_demo_get_time","arguments":""}}]}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    let call = &parsed.choices[0].delta.tool_calls[0];
+    assert_eq!(call.id, "call_1");
+    assert_eq!(call.tool_type, "function");
+    assert_eq!(call.function.name, "mcp_demo_get_time");
+}
+
+#[test]
+fn stream_tool_call_defaults_when_nulls_present() {
+    let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":null,"type":null,"function":{"name":null,"arguments":null}}]}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    let call = &parsed.choices[0].delta.tool_calls[0];
+    assert_eq!(call.id, "");
+    assert_eq!(call.tool_type, "");
+    assert_eq!(call.function.name, "");
+    assert_eq!(call.function.arguments, "");
 }

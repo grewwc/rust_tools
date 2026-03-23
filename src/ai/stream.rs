@@ -1,4 +1,5 @@
 use std::io::{self, BufRead, BufReader, Write};
+use std::collections::HashMap;
 
 use colored::Colorize;
 use serde_json;
@@ -6,24 +7,32 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
     request::StreamChunk,
-    types::{App, StreamOutcome, take_stream_cancelled},
+    types::{App, StreamOutcome, StreamResult, ToolCall, take_stream_cancelled},
 };
 
 pub(super) fn stream_response(
     app: &mut App,
     response: &mut reqwest::blocking::Response,
     current_history: &mut String,
-) -> Result<StreamOutcome, Box<dyn std::error::Error>> {
+) -> Result<StreamResult, Box<dyn std::error::Error>> {
     let mut reader = BufReader::new(response);
     let thinking_tag = "<thinking>".yellow().to_string();
     let end_thinking_tag = "<end thinking>".yellow().to_string();
     let mut thinking_open = false;
     let mut markdown = MarkdownStreamRenderer::new();
     let mut line = String::new();
+    let mut tool_calls_map: HashMap<usize, ToolCallBuilder> = HashMap::new();
+    let mut finish_reason: Option<String> = None;
+    let mut assistant_text = String::new();
 
     while !app.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
         if take_stream_cancelled(app) {
-            return Ok(StreamOutcome::Cancelled);
+            return Ok(StreamResult {
+                outcome: StreamOutcome::Cancelled,
+                tool_calls: Vec::new(),
+                finish_reason: None,
+                assistant_text: String::new(),
+            });
         }
         line.clear();
         let n = match reader.read_line(&mut line) {
@@ -35,16 +44,31 @@ pub(super) fn stream_response(
                 ) =>
             {
                 if take_stream_cancelled(app) {
-                    return Ok(StreamOutcome::Cancelled);
+                    return Ok(StreamResult {
+                        outcome: StreamOutcome::Cancelled,
+                        tool_calls: Vec::new(),
+                        finish_reason: None,
+                        assistant_text: String::new(),
+                    });
                 }
                 if app.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Ok(StreamOutcome::Cancelled);
+                    return Ok(StreamResult {
+                        outcome: StreamOutcome::Cancelled,
+                        tool_calls: Vec::new(),
+                        finish_reason: None,
+                        assistant_text: String::new(),
+                    });
                 }
                 continue;
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {
                 if take_stream_cancelled(app) {
-                    return Ok(StreamOutcome::Cancelled);
+                    return Ok(StreamResult {
+                        outcome: StreamOutcome::Cancelled,
+                        tool_calls: Vec::new(),
+                        finish_reason: None,
+                        assistant_text: String::new(),
+                    });
                 }
                 continue;
             }
@@ -75,6 +99,29 @@ pub(super) fn stream_response(
                 continue;
             }
         };
+
+        if let Some(choice) = chunk.choices.first() {
+            if let Some(ref reason) = choice.finish_reason {
+                finish_reason = Some(reason.clone());
+            }
+
+            for stream_tool_call in &choice.delta.tool_calls {
+                let index = stream_tool_call.index;
+                let builder = tool_calls_map.entry(index).or_insert_with(ToolCallBuilder::new);
+                
+                if !stream_tool_call.id.is_empty() {
+                    builder.id = stream_tool_call.id.clone();
+                }
+                if !stream_tool_call.tool_type.is_empty() {
+                    builder.tool_type = stream_tool_call.tool_type.clone();
+                }
+                if !stream_tool_call.function.name.is_empty() {
+                    builder.function_name = stream_tool_call.function.name.clone();
+                }
+                builder.arguments.push_str(&stream_tool_call.function.arguments);
+            }
+        }
+
         let content =
             extract_chunk_text(&chunk, &thinking_tag, &end_thinking_tag, &mut thinking_open);
         if content.is_empty() {
@@ -87,15 +134,68 @@ pub(super) fn stream_response(
         let text = content.replace(&end_thinking_tag, "");
         let text = text.trim_matches('\n');
         current_history.push_str(text);
+        assistant_text.push_str(text);
     }
 
     markdown.flush_pending()?;
 
     if take_stream_cancelled(app) {
-        return Ok(StreamOutcome::Cancelled);
+        return Ok(StreamResult {
+            outcome: StreamOutcome::Cancelled,
+            tool_calls: Vec::new(),
+            finish_reason: None,
+            assistant_text: String::new(),
+        });
     }
 
-    Ok(StreamOutcome::Completed)
+    let tool_calls: Vec<ToolCall> = tool_calls_map
+        .into_iter()
+        .map(|(_, builder)| builder.build())
+        .collect();
+
+    let outcome = if !tool_calls.is_empty() {
+        StreamOutcome::ToolCall
+    } else {
+        StreamOutcome::Completed
+    };
+
+    Ok(StreamResult {
+        outcome,
+        tool_calls,
+        finish_reason,
+        assistant_text,
+    })
+}
+
+#[derive(Default)]
+struct ToolCallBuilder {
+    id: String,
+    tool_type: String,
+    function_name: String,
+    arguments: String,
+}
+
+impl ToolCallBuilder {
+    fn new() -> Self {
+        Self {
+            id: String::new(),
+            tool_type: "function".to_string(),
+            function_name: String::new(),
+            arguments: String::new(),
+        }
+    }
+
+    fn build(self) -> ToolCall {
+        use super::types::{FunctionCall, ToolCall};
+        ToolCall {
+            id: self.id,
+            tool_type: self.tool_type,
+            function: FunctionCall {
+                name: self.function_name,
+                arguments: self.arguments,
+            },
+        }
+    }
 }
 
 pub(super) fn extract_chunk_text(

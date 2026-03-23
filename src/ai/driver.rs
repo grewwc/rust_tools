@@ -7,21 +7,32 @@ use std::{
 };
 
 use clap::Parser;
+use colored::Colorize;
 use reqwest::blocking::Response;
+use serde_json::Value;
 
 use crate::{clipboard::string_content, strw::split::split_space_keep_symbol};
 
 use super::{
     cli::{Cli, normalize_single_dash_long_opts},
     config, files,
-    history::{COLON, NEWLINE, append_history},
+    history::{COLON, NEWLINE, Message, append_history, build_message_arr},
+    mcp,
+    mcp_example_server,
     models,
     prompt::{PromptEditor, trim_trailing_newline},
     request, stream,
-    types::{App, LoopOverrides, QuestionContext, StreamOutcome},
+    skills,
+    tools,
+    types::{AgentContext, App, LoopOverrides, QuestionContext, StreamOutcome},
 };
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse_from(normalize_single_dash_long_opts(std::env::args()));
+
+    if cli.example_mcp_server {
+        return mcp_example_server::run_example_mcp_server();
+    }
+
     let config = config::load_config()?;
 
     if cli.clear {
@@ -75,9 +86,40 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         cancel_stream,
         writer,
         prompt_editor,
+        agent_context: Some(AgentContext {
+            tools: tools::get_builtin_tool_definitions(),
+            max_iterations: 6,
+            ..Default::default()
+        }),
     };
 
-    run_loop(&mut app)
+    let mut mcp_client = mcp::McpClient::new();
+    let skill_manifests = skills::create_default_skills();
+    let mcp_report = init_mcp(&mut app, &mut mcp_client);
+
+    if app.cli.list_tools {
+        print_builtin_tools(&app);
+        return Ok(());
+    }
+    if app.cli.list_skills {
+        print_skills(&skill_manifests);
+        return Ok(());
+    }
+    if app.cli.list_mcp_tools {
+        print_mcp_tools(&mcp_report, &mcp_client);
+        return Ok(());
+    }
+
+    if mcp_report.loaded {
+        println!(
+            "[mcp] {} servers, {} tools (config: {})",
+            mcp_report.server_count,
+            mcp_report.tool_count,
+            mcp_report.config_path
+        );
+    }
+
+    run_loop(&mut app, &mut mcp_client, &skill_manifests)
 }
 
 pub(super) fn handle_sigint(
@@ -86,14 +128,22 @@ pub(super) fn handle_sigint(
     cancel_stream: &AtomicBool,
 ) {
     if streaming.load(Ordering::SeqCst) {
-        cancel_stream.store(true, Ordering::SeqCst);
+        if cancel_stream.load(Ordering::SeqCst) {
+            shutdown.store(true, Ordering::SeqCst);
+        } else {
+            cancel_stream.store(true, Ordering::SeqCst);
+        }
         return;
     }
 
     shutdown.store(true, Ordering::SeqCst);
 }
 
-fn run_loop(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
+fn run_loop(
+    app: &mut App,
+    mcp_client: &mut mcp::McpClient,
+    skill_manifests: &[skills::SkillManifest],
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut should_quit = !app.cli.args.is_empty();
     loop {
         if app.shutdown.load(Ordering::SeqCst) {
@@ -113,33 +163,123 @@ fn run_loop(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
         app.current_model = next_model.clone();
 
         app.cancel_stream.store(false, Ordering::SeqCst);
-        let mut current_history = format!("user{COLON}{question}{NEWLINE}assistant{COLON}");
-        let mut response = request::do_request(app, &next_model, &question, ctx.history_count)?;
-        request::print_info(&next_model);
-        app.streaming.store(true, Ordering::SeqCst);
-        let outcome = match stream::stream_response(app, &mut response, &mut current_history) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                app.streaming.store(false, Ordering::SeqCst);
-                return Err(err);
+        let skill = match_skill(skill_manifests, &question);
+        let system_prompt = if let Some(skill) = skill {
+            let mut p = "You are a helpful assistant.".to_string();
+            let extra = skill.build_system_prompt();
+            if !extra.trim().is_empty() {
+                p.push_str("\n\n");
+                p.push_str(extra.trim());
             }
+            p
+        } else {
+            "You are a helpful assistant.".to_string()
         };
-        app.streaming.store(false, Ordering::SeqCst);
-        if outcome == StreamOutcome::Cancelled {
-            println!("\nInterrupted.");
-            if should_quit {
+
+        let mut messages = Vec::new();
+        messages.push(Message {
+            role: "system".to_string(),
+            content: Value::String(system_prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        messages.extend(build_message_arr(ctx.history_count, &app.config.history_file)?);
+        messages.push(Message {
+            role: "user".to_string(),
+            content: request::build_content(&next_model, &question, &app.attached_image_files)?,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        let max_iterations = app
+            .agent_context
+            .as_ref()
+            .map(|c| c.max_iterations)
+            .unwrap_or(0);
+        let max_iterations = max_iterations.max(1);
+
+        let mut iteration = 0usize;
+        let mut final_assistant_text = String::new();
+        loop {
+            iteration += 1;
+            let mut current_history = String::new();
+            let mut response =
+                request::do_request_messages(app, &next_model, messages.clone(), true)?;
+            request::print_info(&next_model);
+            app.streaming.store(true, Ordering::SeqCst);
+            let stream_result = match stream::stream_response(app, &mut response, &mut current_history) {
+                Ok(result) => result,
+                Err(err) => {
+                    app.streaming.store(false, Ordering::SeqCst);
+                    return Err(err);
+                }
+            };
+            app.streaming.store(false, Ordering::SeqCst);
+
+            if stream_result.outcome == StreamOutcome::Cancelled {
+                println!("\nInterrupted.");
+                if should_quit {
+                    return Ok(());
+                }
+                break;
+            }
+            if app.shutdown.load(Ordering::SeqCst) {
+                println!();
                 return Ok(());
             }
-            continue;
+            drain_response(&mut response)?;
+
+            let assistant_msg = Message {
+                role: "assistant".to_string(),
+                content: Value::String(stream_result.assistant_text.clone()),
+                tool_calls: if stream_result.tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(stream_result.tool_calls.clone())
+                },
+                tool_call_id: None,
+            };
+            messages.push(assistant_msg);
+
+            if stream_result.outcome != StreamOutcome::ToolCall {
+                final_assistant_text = stream_result.assistant_text;
+                break;
+            }
+
+            println!("\n{}", "[Tool Calls]".yellow());
+            for tool_call in &stream_result.tool_calls {
+                println!(
+                    "  - {}({})",
+                    tool_call.function.name.cyan(),
+                    tool_call.function.arguments.dimmed()
+                );
+            }
+
+            let tool_results = execute_tool_calls(mcp_client, &stream_result.tool_calls)?;
+            for result in &tool_results {
+                println!("\n{}", "[Tool Result]".green());
+                println!("{}", result.content);
+                messages.push(Message {
+                    role: "tool".to_string(),
+                    content: Value::String(result.content.clone()),
+                    tool_calls: None,
+                    tool_call_id: Some(result.tool_call_id.clone()),
+                });
+            }
+
+            if iteration >= max_iterations {
+                final_assistant_text = "Agent stopped: too many tool iterations.".to_string();
+                break;
+            }
         }
-        if app.shutdown.load(Ordering::SeqCst) {
+
+        if !final_assistant_text.is_empty() {
+            let history_line = format!(
+                "user{COLON}{question}{NEWLINE}assistant{COLON}{final_assistant_text}{NEWLINE}"
+            );
+            append_history(&app.config.history_file, &history_line)?;
             println!();
-            return Ok(());
         }
-        drain_response(&mut response)?;
-        current_history.push(NEWLINE);
-        append_history(&app.config.history_file, &current_history)?;
-        println!();
 
         if should_quit {
             return Ok(());
@@ -148,6 +288,169 @@ fn run_loop(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
             writer.write_all(b"\n---\n")?;
             writer.flush()?;
         }
+    }
+}
+
+fn execute_tool_calls(
+    mcp_client: &mut mcp::McpClient,
+    tool_calls: &[super::types::ToolCall],
+) -> Result<Vec<super::types::ToolResult>, Box<dyn std::error::Error>> {
+    let mut results = Vec::new();
+    
+    for tool_call in tool_calls {
+        let result = if let Some((server_name, tool_name)) =
+            mcp_client.parse_tool_name_for_known_server(&tool_call.function.name)
+        {
+            let raw_args = tool_call.function.arguments.trim();
+            let args: Value = if raw_args.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::from_str(raw_args)?
+            };
+            let content = mcp_client.call_tool(&server_name, &tool_name, args)?;
+            super::types::ToolResult {
+                tool_call_id: tool_call.id.clone(),
+                content,
+            }
+        } else {
+            tools::execute_tool_call(tool_call)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+        };
+        println!("\n[Executed] {}", tool_call.function.name.green());
+        results.push(result);
+    }
+    
+    Ok(results)
+}
+
+fn match_skill<'a>(
+    skills: &'a [skills::SkillManifest],
+    input: &str,
+) -> Option<&'a skills::SkillManifest> {
+    let input_lower = input.to_lowercase();
+    skills.iter().find(|s| {
+        s.triggers
+            .iter()
+            .any(|t| !t.trim().is_empty() && input_lower.contains(&t.to_lowercase()))
+    })
+}
+
+fn init_mcp(app: &mut App, mcp_client: &mut mcp::McpClient) -> McpInitReport {
+    init_builtin_example_mcp(app, mcp_client);
+
+    let cfg = crate::common::configw::get_all_config();
+    let mcp_path = if !app.cli.mcp_config.trim().is_empty() {
+        app.cli.mcp_config.trim().to_string()
+    } else {
+        cfg.get_opt("ai.mcp.config")
+            .unwrap_or_else(|| "~/.config/mcp.json".to_string())
+    };
+    let mcp_path = crate::common::utils::expanduser(&mcp_path);
+    let mcp_path = mcp_path.as_ref();
+
+    let mut report = McpInitReport {
+        config_path: mcp_path.to_string(),
+        loaded: false,
+        server_count: 0,
+        tool_count: 0,
+        failures: Vec::new(),
+    };
+    if std::fs::metadata(mcp_path).is_err() {
+        return report;
+    }
+
+    let servers = match mcp::load_mcp_config_from_file(mcp_path) {
+        Ok(s) => s,
+        Err(_) => return report,
+    };
+
+    for (name, server_cfg) in &servers {
+        if let Err(err) = mcp_client.connect_server(name, server_cfg) {
+            report.failures.push(format!("{}: {}", name, err));
+        }
+    }
+
+    if let Some(ctx) = app.agent_context.as_mut() {
+        ctx.mcp_servers = servers;
+        ctx.tools.extend(mcp_client.get_all_tools());
+    }
+    report.loaded = true;
+    report.server_count = app
+        .agent_context
+        .as_ref()
+        .map(|c| c.mcp_servers.len())
+        .unwrap_or(0);
+    report.tool_count = mcp_client.get_all_tools().len();
+    report
+}
+
+#[derive(Debug, Clone)]
+struct McpInitReport {
+    config_path: String,
+    loaded: bool,
+    server_count: usize,
+    tool_count: usize,
+    failures: Vec<String>,
+}
+
+fn init_builtin_example_mcp(app: &mut App, mcp_client: &mut mcp::McpClient) {
+    let cfg = crate::common::configw::get_all_config();
+    let disabled = cfg
+        .get_opt("ai.mcp.example.disabled")
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("true");
+    if disabled {
+        return;
+    }
+
+    let _ = mcp_client.connect_inprocess_example_server("example");
+    if let Some(ctx) = app.agent_context.as_mut() {
+        ctx.tools.extend(mcp_client.get_all_tools());
+    }
+}
+
+fn print_builtin_tools(app: &App) {
+    println!("{}", "[builtin tools]".yellow());
+    let tools = app
+        .agent_context
+        .as_ref()
+        .map(|c| c.tools.clone())
+        .unwrap_or_default();
+    for t in tools {
+        if t.function.name.starts_with("mcp_") {
+            continue;
+        }
+        println!(" - {}: {}", t.function.name.cyan(), t.function.description);
+    }
+}
+
+fn print_skills(skill_manifests: &[skills::SkillManifest]) {
+    println!("{}", "[skills]".yellow());
+    for s in skill_manifests {
+        println!(" - {}: {}", s.name.cyan(), s.description);
+    }
+}
+
+fn print_mcp_tools(report: &McpInitReport, mcp_client: &mcp::McpClient) {
+    if !report.loaded {
+        println!("{}", "[mcp] no config or failed to load".yellow());
+        println!("config path: {}", report.config_path);
+        return;
+    }
+    println!(
+        "{}",
+        format!(
+            "[mcp] {} servers, {} tools",
+            report.server_count, report.tool_count
+        )
+        .yellow()
+    );
+    for failure in &report.failures {
+        println!(" - {}", format!("[mcp failed] {failure}").red());
+    }
+    for t in mcp_client.get_all_tools() {
+        println!(" - {}: {}", t.function.name.cyan(), t.function.description);
     }
 }
 

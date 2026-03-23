@@ -95,6 +95,30 @@ pub(super) struct Cli {
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub(super) args: Vec<String>,
+
+    #[arg(long, action = ArgAction::SetTrue, help = "list builtin tools and exit")]
+    pub(super) list_tools: bool,
+
+    #[arg(
+        long,
+        visible_alias = "list-mcp-servers",
+        action = ArgAction::SetTrue,
+        help = "list mcp tools and exit"
+    )]
+    pub(super) list_mcp_tools: bool,
+
+    #[arg(long, action = ArgAction::SetTrue, help = "list skills and exit")]
+    pub(super) list_skills: bool,
+
+    #[arg(long, default_value = "", help = "mcp config json path override")]
+    pub(super) mcp_config: String,
+
+    #[arg(
+        long,
+        action = ArgAction::SetTrue,
+        help = "run bundled example MCP server over stdio and exit"
+    )]
+    pub(super) example_mcp_server: bool,
 }
 
 pub(super) fn normalize_single_dash_long_opts(args: impl Iterator<Item = String>) -> Vec<String> {

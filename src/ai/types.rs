@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs::File,
     path::PathBuf,
     sync::{
@@ -8,6 +9,8 @@ use std::{
 };
 
 use reqwest::blocking::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use super::{cli::Cli, prompt::PromptEditor};
 
@@ -36,16 +39,141 @@ pub(super) struct App {
     pub(super) raw_args: String,
     pub(super) writer: Option<File>,
     pub(super) prompt_editor: Option<PromptEditor>,
+    pub(super) agent_context: Option<AgentContext>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ToolDefinition {
+    #[serde(rename = "type")]
+    pub(super) tool_type: String,
+    pub(super) function: FunctionDefinition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct FunctionDefinition {
+    pub(super) name: String,
+    pub(super) description: String,
+    pub(super) parameters: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct ToolCall {
+    pub(super) id: String,
+    #[serde(rename = "type")]
+    pub(super) tool_type: String,
+    pub(super) function: FunctionCall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) struct FunctionCall {
+    pub(super) name: String,
+    pub(super) arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ToolResult {
+    pub(super) tool_call_id: String,
+    pub(super) content: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct AgentContext {
+    pub(super) tools: Vec<ToolDefinition>,
+    pub(super) pending_tool_calls: Vec<ToolCall>,
+    pub(super) tool_results: Vec<ToolResult>,
+    pub(super) mcp_servers: HashMap<String, McpServerConfig>,
+    pub(super) skills: Vec<SkillDefinition>,
+    pub(super) active_skill: Option<String>,
+    pub(super) iteration_count: usize,
+    pub(super) max_iterations: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct McpServerConfig {
+    pub(super) command: String,
+    #[serde(default)]
+    pub(super) args: Vec<String>,
+    #[serde(default)]
+    pub(super) env: HashMap<String, String>,
+    #[serde(default = "default_mcp_request_timeout_ms")]
+    pub(super) request_timeout_ms: u64,
+    #[serde(default)]
+    pub(super) disabled: bool,
+}
+
+fn default_mcp_request_timeout_ms() -> u64 {
+    3000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct SkillDefinition {
+    pub(super) name: String,
+    pub(super) description: String,
+    pub(super) prompt: String,
+    #[serde(default)]
+    pub(super) tools: Vec<String>,
+    #[serde(default)]
+    pub(super) mcp_servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct McpTool {
+    pub(super) name: String,
+    pub(super) description: Option<String>,
+    pub(super) input_schema: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct McpResource {
+    pub(super) uri: String,
+    pub(super) name: String,
+    #[serde(default)]
+    pub(super) description: Option<String>,
+    #[serde(default)]
+    pub(super) mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct McpPrompt {
+    pub(super) name: String,
+    #[serde(default)]
+    pub(super) description: Option<String>,
+    #[serde(default)]
+    pub(super) arguments: Vec<McpPromptArgument>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct McpPromptArgument {
+    pub(super) name: String,
+    #[serde(default)]
+    pub(super) description: Option<String>,
+    #[serde(default)]
+    pub(super) required: bool,
 }
 
 pub(super) fn take_stream_cancelled(app: &App) -> bool {
     app.cancel_stream.swap(false, Ordering::SeqCst)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum StreamOutcome {
     Completed,
     Cancelled,
+    ToolCall,
+}
+
+impl Default for StreamOutcome {
+    fn default() -> Self {
+        StreamOutcome::Completed
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(super) struct StreamResult {
+    pub(super) outcome: StreamOutcome,
+    pub(super) tool_calls: Vec<ToolCall>,
+    pub(super) finish_reason: Option<String>,
+    pub(super) assistant_text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
