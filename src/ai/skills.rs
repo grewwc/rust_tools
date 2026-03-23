@@ -25,6 +25,8 @@ pub(super) struct SkillManifest {
     pub(super) examples: Vec<SkillExample>,
     #[serde(default)]
     pub(super) triggers: Vec<String>,
+    #[serde(default)]
+    pub(super) priority: i32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,16 +124,19 @@ impl SkillRegistry {
 
     pub(super) fn match_skill(&self, input: &str) -> Option<&SkillManifest> {
         let input_lower = input.to_lowercase();
+        let mut matched: Vec<&SkillManifest> = Vec::new();
 
         for skill in self.skills.values() {
             for trigger in &skill.triggers {
-                if input_lower.contains(&trigger.to_lowercase()) {
-                    return Some(skill);
+                if !trigger.trim().is_empty() && input_lower.contains(&trigger.to_lowercase()) {
+                    matched.push(skill);
+                    break;
                 }
             }
         }
 
-        None
+        // Return the highest priority matched skill
+        matched.into_iter().max_by_key(|s| s.priority)
     }
 }
 
@@ -290,6 +295,7 @@ pub(super) fn create_default_skills() -> Vec<SkillManifest> {
             system_prompt: Some("You are an expert code reviewer with deep knowledge of software engineering best practices.".to_string()),
             examples: vec![],
             triggers: vec!["review this code".to_string(), "code review".to_string()],
+            priority: 10,
         },
         SkillManifest {
             name: "debugger".to_string(),
@@ -302,6 +308,7 @@ pub(super) fn create_default_skills() -> Vec<SkillManifest> {
             system_prompt: Some("You are an expert debugger with deep knowledge of common programming errors and debugging techniques.".to_string()),
             examples: vec![],
             triggers: vec!["debug".to_string(), "fix this bug".to_string(), "not working".to_string()],
+            priority: 20,
         },
         SkillManifest {
             name: "refactor".to_string(),
@@ -314,6 +321,7 @@ pub(super) fn create_default_skills() -> Vec<SkillManifest> {
             system_prompt: Some("You are an expert at refactoring code while preserving functionality.".to_string()),
             examples: vec![],
             triggers: vec!["refactor".to_string(), "clean up".to_string(), "improve this code".to_string()],
+            priority: 5,
         },
     ]
 }

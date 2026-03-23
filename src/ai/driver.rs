@@ -131,13 +131,13 @@ pub(super) fn handle_sigint(
 ) {
     match sigint_action(streaming, cancel_stream) {
         SigintAction::CancelStream => {
-            cancel_stream.store(true, Ordering::SeqCst);
+            cancel_stream.store(true, Ordering::Release);
         }
         SigintAction::Shutdown => {
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.store(true, Ordering::Release);
         }
         SigintAction::Exit => {
-            shutdown.store(true, Ordering::SeqCst);
+            shutdown.store(true, Ordering::Release);
             #[cfg(unix)]
             unsafe {
                 let _ = libc::close(libc::STDIN_FILENO);
@@ -149,8 +149,8 @@ pub(super) fn handle_sigint(
 }
 
 pub(super) fn sigint_action(streaming: &AtomicBool, cancel_stream: &AtomicBool) -> SigintAction {
-    if streaming.load(Ordering::SeqCst) {
-        if cancel_stream.load(Ordering::SeqCst) {
+    if streaming.load(Ordering::Acquire) {
+        if cancel_stream.load(Ordering::Acquire) {
             SigintAction::Shutdown
         } else {
             SigintAction::CancelStream
@@ -167,7 +167,7 @@ fn run_loop(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut should_quit = !app.cli.args.is_empty();
     loop {
-        if app.shutdown.load(Ordering::SeqCst) {
+        if app.shutdown.load(Ordering::Acquire) {
             return Ok(());
         }
 
@@ -227,17 +227,17 @@ fn run_loop(
         loop {
             iteration += 1;
             let mut current_history = String::new();
-            app.streaming.store(true, Ordering::SeqCst);
+            app.streaming.store(true, Ordering::Release);
             let mut response =
                 match request::do_request_messages(app, &next_model, messages.clone(), true) {
                     Ok(response) => response,
                     Err(err) => {
-                        app.streaming.store(false, Ordering::SeqCst);
+                        app.streaming.store(false, Ordering::Release);
                         return Err(err);
                     }
                 };
-            if app.cancel_stream.swap(false, Ordering::SeqCst) {
-                app.streaming.store(false, Ordering::SeqCst);
+            if app.cancel_stream.swap(false, Ordering::AcqRel) {
+                app.streaming.store(false, Ordering::Release);
                 println!("\nInterrupted.");
                 if should_quit {
                     return Ok(());
@@ -249,11 +249,11 @@ fn run_loop(
                 match stream::stream_response(app, &mut response, &mut current_history) {
                     Ok(result) => result,
                     Err(err) => {
-                        app.streaming.store(false, Ordering::SeqCst);
+                        app.streaming.store(false, Ordering::Release);
                         return Err(err);
                     }
                 };
-            app.streaming.store(false, Ordering::SeqCst);
+            app.streaming.store(false, Ordering::Release);
 
             if stream_result.outcome == StreamOutcome::Cancelled {
                 println!("\nInterrupted.");
@@ -262,7 +262,7 @@ fn run_loop(
                 }
                 break;
             }
-            if app.shutdown.load(Ordering::SeqCst) {
+            if app.shutdown.load(Ordering::Acquire) {
                 println!();
                 return Ok(());
             }
@@ -337,23 +337,44 @@ fn execute_tool_calls(
     let mut results = Vec::new();
 
     for tool_call in tool_calls {
-        let result = if let Some((server_name, tool_name)) =
+        let result = match if let Some((server_name, tool_name)) =
             mcp_client.parse_tool_name_for_known_server(&tool_call.function.name)
         {
             let raw_args = tool_call.function.arguments.trim();
             let args: Value = if raw_args.is_empty() {
                 serde_json::json!({})
             } else {
-                serde_json::from_str(raw_args)?
+                match serde_json::from_str(raw_args) {
+                    Ok(a) => a,
+                    Err(err) => {
+                        eprintln!("[tool error] failed to parse arguments for {}: {}", tool_call.function.name, err);
+                        results.push(super::types::ToolResult {
+                            tool_call_id: tool_call.id.clone(),
+                            content: format!("Error: failed to parse arguments: {}", err),
+                        });
+                        continue;
+                    }
+                }
             };
-            let content = mcp_client.call_tool(&server_name, &tool_name, args)?;
-            super::types::ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content,
+            match mcp_client.call_tool(&server_name, &tool_name, args) {
+                Ok(content) => Ok(super::types::ToolResult {
+                    tool_call_id: tool_call.id.clone(),
+                    content,
+                }),
+                Err(err) => Err(err),
             }
         } else {
             tools::execute_tool_call(tool_call)
-                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?
+                .map_err(|e| e.to_string())
+        } {
+            Ok(res) => res,
+            Err(err) => {
+                eprintln!("[tool error] {} failed: {}", tool_call.function.name, err);
+                super::types::ToolResult {
+                    tool_call_id: tool_call.id.clone(),
+                    content: format!("Error: {} failed: {}", tool_call.function.name, err),
+                }
+            }
         };
         println!("\n[Executed] {}", tool_call.function.name.green());
         results.push(result);
@@ -367,11 +388,19 @@ fn match_skill<'a>(
     input: &str,
 ) -> Option<&'a skills::SkillManifest> {
     let input_lower = input.to_lowercase();
-    skills.iter().find(|s| {
-        s.triggers
-            .iter()
-            .any(|t| !t.trim().is_empty() && input_lower.contains(&t.to_lowercase()))
-    })
+    let mut matched: Vec<&skills::SkillManifest> = Vec::new();
+
+    for skill in skills {
+        for trigger in &skill.triggers {
+            if !trigger.trim().is_empty() && input_lower.contains(&trigger.to_lowercase()) {
+                matched.push(skill);
+                break;
+            }
+        }
+    }
+
+    // Return the highest priority matched skill
+    matched.into_iter().max_by_key(|s| s.priority)
 }
 
 fn init_mcp(app: &mut App, mcp_client: &mut mcp::McpClient) -> McpInitReport {
@@ -394,17 +423,22 @@ fn init_mcp(app: &mut App, mcp_client: &mut mcp::McpClient) -> McpInitReport {
         tool_count: 0,
         failures: Vec::new(),
     };
-    if std::fs::metadata(mcp_path).is_err() {
+    if let Err(err) = std::fs::metadata(mcp_path) {
+        eprintln!("[mcp] failed to access config file {}: {}", mcp_path, err);
         return report;
     }
 
     let servers = match mcp::load_mcp_config_from_file(mcp_path) {
         Ok(s) => s,
-        Err(_) => return report,
+        Err(err) => {
+            eprintln!("[mcp] failed to load config from {}: {}", mcp_path, err);
+            return report;
+        }
     };
 
     for (name, server_cfg) in &servers {
         if let Err(err) = mcp_client.connect_server(name, server_cfg) {
+            eprintln!("[mcp] failed to connect to server {}: {}", name, err);
             report.failures.push(format!("{}: {}", name, err));
         }
     }
@@ -518,13 +552,13 @@ fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn std::
 
     let question = match prompt_user(app) {
         Ok(v) => v,
-        Err(_) if app.shutdown.load(Ordering::SeqCst) => {
+        Err(_) if app.shutdown.load(Ordering::Acquire) => {
             return Ok(None);
         }
         Err(err) => return Err(err.into()),
     };
     let Some(question) = question else {
-        app.shutdown.store(true, Ordering::SeqCst);
+        app.shutdown.store(true, Ordering::Release);
         return Ok(None);
     };
     let (question, overrides) = parse_loop_overrides(&question);
@@ -635,39 +669,48 @@ pub(super) fn loop_overrides(question: &str) -> LoopOverrides {
 }
 
 pub(super) fn parse_loop_overrides(question: &str) -> (String, LoopOverrides) {
-    let tokens = split_space_keep_symbol(question, "\"'").collect::<Vec<_>>();
-    let mut out_tokens = Vec::with_capacity(tokens.len());
+    let mut tokens = split_space_keep_symbol(question, "\"'").peekable();
+    let mut out_tokens = Vec::new();
 
     let mut short_output = false;
-    let has_x = tokens.iter().any(|t| *t == "-x");
-    let mut history_count = has_x.then_some(0);
+    let mut has_x = false;
+    let mut history_count: Option<usize> = None;
 
-    let mut idx = 0usize;
-    while idx < tokens.len() {
-        match tokens[idx] {
+    // First pass to check for -x flag
+    let mut first_pass = split_space_keep_symbol(question, "\"'");
+    while let Some(token) = first_pass.next() {
+        if token == "-x" {
+            has_x = true;
+            break;
+        }
+    }
+    if has_x {
+        history_count = Some(0);
+    }
+
+    // Second pass to process tokens
+    while let Some(token) = tokens.next() {
+        match token {
             "-s" => {
                 short_output = true;
-                idx += 1;
             }
             "-x" => {
-                idx += 1;
+                // Already handled, skip
             }
             "--history" => {
-                if let Some(next) = tokens.get(idx + 1)
-                    && let Ok(value) = next.parse::<usize>()
-                {
-                    if !has_x {
+                if !has_x {
+                    if let Some(next) = tokens.peek()
+                        && let Ok(value) = next.parse::<usize>()
+                    {
                         history_count = Some(value);
+                        tokens.next(); // Consume the value
+                    } else {
+                        out_tokens.push(token.to_string());
                     }
-                    idx += 2;
-                } else {
-                    out_tokens.push(tokens[idx].to_string());
-                    idx += 1;
                 }
             }
             _ => {
-                out_tokens.push(tokens[idx].to_string());
-                idx += 1;
+                out_tokens.push(token.to_string());
             }
         }
     }
@@ -691,19 +734,20 @@ fn resolve_model_for_input(app: &App, question: &mut String) -> String {
         return model;
     }
 
-    let trimmed = question.trim_end().to_string();
-    if let Some(stripped) = trimmed.strip_suffix(" -code") {
-        *question = stripped.to_string();
+    // Work on the original string without cloning first
+    let original_len = question.len();
+    let trimmed_len = question.trim_end().len();
+    
+    if trimmed_len >= 6 && &question[trimmed_len -6..trimmed_len] == " -code" {
+        *question = question[..trimmed_len -6].trim_end().to_string();
         return models::qwen_coder_plus_latest().to_string();
     }
-    if let Some(stripped) = trimmed.strip_suffix(" -d") {
-        *question = stripped.to_string();
+    if trimmed_len >= 3 && &question[trimmed_len -3..trimmed_len] == " -d" {
+        *question = question[..trimmed_len -3].trim_end().to_string();
         return models::deepseek_v3().to_string();
     }
-    if let Some(selector) = trailing_model_selector(&trimmed) {
-        if trimmed.len() >= 3 {
-            *question = trimmed[..trimmed.len() - 3].trim_end().to_string();
-        }
+    if let Some(selector) = trailing_model_selector(question) {
+        *question = question[..original_len - 3].trim_end().to_string();
         return models::model_from_selector(selector, app.cli.thinking)
             .as_str()
             .to_string();
