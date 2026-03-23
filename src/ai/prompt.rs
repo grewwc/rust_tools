@@ -46,8 +46,7 @@ impl PromptEditor {
                 Ok(0) => return Ok(None),
                 Ok(_) => return Ok(Some(trim_trailing_newline(line))),
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                    println!("Exit.");
-                    return Ok(None);
+                    return exit_on_interrupt();
                 }
                 Err(err) => return Err(err),
             }
@@ -59,10 +58,7 @@ impl PromptEditor {
                 Ok(Some(line))
             }
             Err(ReadlineError::Eof) => Ok(None),
-            Err(ReadlineError::Interrupted) => {
-                println!("Exit.");
-                Ok(None)
-            }
+            Err(ReadlineError::Interrupted) => exit_on_interrupt(),
             Err(err) => Err(io::Error::other(err.to_string())),
         }
     }
@@ -216,7 +212,10 @@ impl PromptEditor {
                                 });
                             }
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
-                                break Ok(None);
+                                break Err(io::Error::new(
+                                    io::ErrorKind::Interrupted,
+                                    "Ctrl+C",
+                                ));
                             }
                             _ => {
                                 let handled = match (key.code, key.modifiers) {
@@ -286,7 +285,13 @@ impl PromptEditor {
         let _ = terminal.show_cursor();
         let _ = disable_raw_mode();
 
-        let result = result?;
+        let result = match result {
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                return exit_on_interrupt();
+            }
+            Err(err) => return Err(err),
+            Ok(result) => result,
+        };
         if let Some(content) = &result {
             self.save_history_entry(content);
             let mut lines = content.lines();
@@ -356,6 +361,16 @@ impl MultilineHistoryState {
 
 fn textarea_content(textarea: &tui_textarea::TextArea<'_>) -> String {
     textarea.lines().join("\n")
+}
+
+fn exit_on_interrupt() -> io::Result<Option<String>> {
+    println!("Exit.");
+    #[cfg(not(test))]
+    std::process::exit(130);
+    #[cfg(test)]
+    {
+        Ok(None)
+    }
 }
 
 fn centered_rect(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {

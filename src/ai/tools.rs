@@ -184,7 +184,7 @@ fn execute_read_file(args: &Value) -> Result<String, String> {
     if !path.exists() {
         return Err(format!("File not found: {}", file_path));
     }
-
+    const MAX_NUM_LINES: usize = 10;
     let offset = args["offset"].as_u64().unwrap_or(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(1000) as usize;
 
@@ -197,6 +197,7 @@ fn execute_read_file(args: &Value) -> Result<String, String> {
 
     let result: Vec<String> = lines[start..end]
         .iter()
+        .take(MAX_NUM_LINES)
         .enumerate()
         .map(|(i, line)| format!("{:>6}\t{}", start + i + 1, line))
         .collect();

@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use serde_json::Value;
 
@@ -163,38 +163,35 @@ fn multiline_history_navigation_restores_draft() {
 
 #[test]
 fn sigint_during_stream_only_cancels_current_reply() {
-    let shutdown = AtomicBool::new(false);
     let streaming = AtomicBool::new(true);
     let cancel_stream = AtomicBool::new(false);
 
-    super::driver::handle_sigint(&shutdown, &streaming, &cancel_stream);
-
-    assert!(!shutdown.load(Ordering::SeqCst));
-    assert!(cancel_stream.load(Ordering::SeqCst));
+    assert_eq!(
+        super::driver::sigint_action(&streaming, &cancel_stream),
+        super::driver::SigintAction::CancelStream
+    );
 }
 
 #[test]
 fn second_sigint_during_stream_requests_shutdown() {
-    let shutdown = AtomicBool::new(false);
     let streaming = AtomicBool::new(true);
     let cancel_stream = AtomicBool::new(true);
 
-    super::driver::handle_sigint(&shutdown, &streaming, &cancel_stream);
-
-    assert!(shutdown.load(Ordering::SeqCst));
-    assert!(cancel_stream.load(Ordering::SeqCst));
+    assert_eq!(
+        super::driver::sigint_action(&streaming, &cancel_stream),
+        super::driver::SigintAction::Shutdown
+    );
 }
 
 #[test]
-fn sigint_while_idle_requests_shutdown() {
-    let shutdown = AtomicBool::new(false);
+fn sigint_while_idle_exits_immediately() {
     let streaming = AtomicBool::new(false);
     let cancel_stream = AtomicBool::new(false);
 
-    super::driver::handle_sigint(&shutdown, &streaming, &cancel_stream);
-
-    assert!(shutdown.load(Ordering::SeqCst));
-    assert!(!cancel_stream.load(Ordering::SeqCst));
+    assert_eq!(
+        super::driver::sigint_action(&streaming, &cancel_stream),
+        super::driver::SigintAction::Exit
+    );
 }
 
 #[test]

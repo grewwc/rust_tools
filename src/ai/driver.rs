@@ -26,6 +26,14 @@ use super::{
     tools,
     types::{AgentContext, App, LoopOverrides, QuestionContext, StreamOutcome},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SigintAction {
+    CancelStream,
+    Shutdown,
+    Exit,
+}
+
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse_from(normalize_single_dash_long_opts(std::env::args()));
 
@@ -127,16 +135,35 @@ pub(super) fn handle_sigint(
     streaming: &AtomicBool,
     cancel_stream: &AtomicBool,
 ) {
-    if streaming.load(Ordering::SeqCst) {
-        if cancel_stream.load(Ordering::SeqCst) {
-            shutdown.store(true, Ordering::SeqCst);
-        } else {
+    match sigint_action(streaming, cancel_stream) {
+        SigintAction::CancelStream => {
             cancel_stream.store(true, Ordering::SeqCst);
         }
-        return;
+        SigintAction::Shutdown => {
+            shutdown.store(true, Ordering::SeqCst);
+        }
+        SigintAction::Exit => {
+            shutdown.store(true, Ordering::SeqCst);
+            #[cfg(unix)]
+            unsafe {
+                let _ = libc::close(libc::STDIN_FILENO);
+            }
+            #[cfg(not(test))]
+            std::process::exit(130);
+        }
     }
+}
 
-    shutdown.store(true, Ordering::SeqCst);
+pub(super) fn sigint_action(streaming: &AtomicBool, cancel_stream: &AtomicBool) -> SigintAction {
+    if streaming.load(Ordering::SeqCst) {
+        if cancel_stream.load(Ordering::SeqCst) {
+            SigintAction::Shutdown
+        } else {
+            SigintAction::CancelStream
+        }
+    } else {
+        SigintAction::Exit
+    }
 }
 
 fn run_loop(
@@ -203,10 +230,23 @@ fn run_loop(
         loop {
             iteration += 1;
             let mut current_history = String::new();
-            let mut response =
-                request::do_request_messages(app, &next_model, messages.clone(), true)?;
-            request::print_info(&next_model);
             app.streaming.store(true, Ordering::SeqCst);
+            let mut response = match request::do_request_messages(app, &next_model, messages.clone(), true) {
+                Ok(response) => response,
+                Err(err) => {
+                    app.streaming.store(false, Ordering::SeqCst);
+                    return Err(err);
+                }
+            };
+            if app.cancel_stream.swap(false, Ordering::SeqCst) {
+                app.streaming.store(false, Ordering::SeqCst);
+                println!("\nInterrupted.");
+                if should_quit {
+                    return Ok(());
+                }
+                break;
+            }
+            request::print_info(&next_model);
             let stream_result = match stream::stream_response(app, &mut response, &mut current_history) {
                 Ok(result) => result,
                 Err(err) => {
@@ -478,7 +518,15 @@ fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn std::
         return Ok(Some(ctx));
     }
 
-    let Some(question) = prompt_user(app)? else {
+    let question = match prompt_user(app) {
+        Ok(v) => v,
+        Err(_) if app.shutdown.load(Ordering::SeqCst) => {
+            return Ok(None);
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let Some(question) = question else {
+        app.shutdown.store(true, Ordering::SeqCst);
         return Ok(None);
     };
     let overrides = loop_overrides(&question);
