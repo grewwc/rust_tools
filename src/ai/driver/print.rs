@@ -1,6 +1,6 @@
 use colored::Colorize;
 
-use crate::ai::{types::App, mcp::McpClient, skills::SkillManifest, driver::McpInitReport};
+use crate::ai::{driver::McpInitReport, mcp::McpClient, skills::SkillManifest, types::App};
 
 pub fn print_builtin_tools(app: &App) {
     println!("{}", "[builtin tools]".yellow());

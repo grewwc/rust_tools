@@ -7,11 +7,7 @@ pub enum SigintAction {
     Exit,
 }
 
-pub fn handle_sigint(
-    shutdown: &AtomicBool,
-    streaming: &AtomicBool,
-    cancel_stream: &AtomicBool,
-) {
+pub fn handle_sigint(shutdown: &AtomicBool, streaming: &AtomicBool, cancel_stream: &AtomicBool) {
     match sigint_action(streaming, cancel_stream) {
         SigintAction::CancelStream => {
             cancel_stream.store(true, Ordering::Release);

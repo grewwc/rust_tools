@@ -1,9 +1,9 @@
+use reqwest::blocking::Response;
+use std::error::Error;
 use std::fs;
 use std::io;
-use std::error::Error;
-use reqwest::blocking::Response;
 
-use crate::ai::{types::App, mcp::McpClient};
+use crate::ai::{mcp::McpClient, types::App};
 
 #[derive(Debug, Clone)]
 pub struct McpInitReport {
@@ -15,7 +15,6 @@ pub struct McpInitReport {
 }
 
 pub fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitReport {
-
     let cfg = crate::common::configw::get_all_config();
     let mcp_path = if !app.cli.mcp_config.trim().is_empty() {
         app.cli.mcp_config.trim().to_string()
@@ -68,7 +67,6 @@ pub fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitReport {
     report.tool_count = mcp_client.get_all_tools().len();
     report
 }
-
 
 pub fn drain_response(response: &mut Response) -> Result<(), Box<dyn Error>> {
     response.copy_to(&mut io::sink())?;

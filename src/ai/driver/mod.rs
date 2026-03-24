@@ -1,5 +1,5 @@
 use std::{
-    io::{self, Write, BufRead},
+    io::{self, BufRead, Write},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -10,37 +10,35 @@ use clap::Parser;
 use colored::Colorize;
 use serde_json::Value;
 
-use crate::{
-    ai::{
-        cli::{Cli, normalize_single_dash_long_opts},
-        config,
-        history::{COLON, Message, NEWLINE, append_history, build_message_arr},
-        mcp::McpClient,
-        models,
-        prompt::PromptEditor,
-        request,
-        skills::{self, SkillManifest},
-        stream,
-        types::{AgentContext, App, StreamOutcome},
-    }
+use crate::ai::{
+    cli::{Cli, normalize_single_dash_long_opts},
+    config,
+    history::{COLON, Message, NEWLINE, append_history, build_message_arr},
+    mcp::McpClient,
+    models,
+    prompt::PromptEditor,
+    request,
+    skills::{self, SkillManifest},
+    stream,
+    types::{AgentContext, App, StreamOutcome},
 };
 
-pub mod signal;
-pub mod mcp_init;
-pub mod print;
-pub mod tools;
-pub mod skill_matching;
 pub mod input;
-pub mod params;
+pub mod mcp_init;
 pub mod model;
+pub mod params;
+pub mod print;
+pub mod signal;
+pub mod skill_matching;
+pub mod tools;
 
-pub use signal::*;
-pub use mcp_init::*;
-pub use print::*;
-pub use tools::*;
-pub use skill_matching::*;
 pub use input::*;
+pub use mcp_init::*;
 pub use model::*;
+pub use print::*;
+pub use signal::*;
+pub use skill_matching::*;
+pub use tools::*;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse_from(normalize_single_dash_long_opts(std::env::args()));

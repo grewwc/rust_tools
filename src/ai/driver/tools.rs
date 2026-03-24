@@ -1,11 +1,11 @@
-use std::error::Error;
-use serde_json::Value;
 use colored::Colorize;
+use serde_json::Value;
+use std::error::Error;
 
 use crate::ai::{
     mcp::McpClient,
-    types::{ToolCall, ToolResult},
     tools as builtin_tools,
+    types::{ToolCall, ToolResult},
 };
 
 pub fn execute_tool_calls(
@@ -25,7 +25,10 @@ pub fn execute_tool_calls(
                 match serde_json::from_str(raw_args) {
                     Ok(a) => a,
                     Err(err) => {
-                        eprintln!("[tool error] failed to parse arguments for {}: {}", tool_call.function.name, err);
+                        eprintln!(
+                            "[tool error] failed to parse arguments for {}: {}",
+                            tool_call.function.name, err
+                        );
                         results.push(ToolResult {
                             tool_call_id: tool_call.id.clone(),
                             content: format!("Error: failed to parse arguments: {}", err),
@@ -42,8 +45,7 @@ pub fn execute_tool_calls(
                 Err(err) => Err(err),
             }
         } else {
-            builtin_tools::execute_tool_call(tool_call)
-                .map_err(|e| e.to_string())
+            builtin_tools::execute_tool_call(tool_call).map_err(|e| e.to_string())
         } {
             Ok(res) => res,
             Err(err) => {

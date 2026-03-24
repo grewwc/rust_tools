@@ -122,17 +122,37 @@ pub fn build_preview_lines(record: &MemoRecord, query: &str, max_lines: usize) -
         return Vec::new();
     }
 
+    let lines = normalized_record_lines(&record.title)
+        .into_iter()
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
     let mut out = Vec::new();
-    for line in normalized_record_lines(&record.title) {
-        if out.len() >= max_lines {
-            break;
+    let matched = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| compact_search_text(line).contains(&query))
+        .map(|(idx, _)| idx)
+        .collect::<Vec<_>>();
+
+    if !matched.is_empty() {
+        let mut selected = vec![false; lines.len()];
+        for idx in matched {
+            let start = idx.saturating_sub(1);
+            let end = (idx + 1).min(lines.len().saturating_sub(1));
+            for j in start..=end {
+                selected[j] = true;
+            }
         }
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if compact_search_text(line).contains(&query) {
+        for (idx, line) in lines.iter().enumerate() {
+            if !selected[idx] {
+                continue;
+            }
             out.push(line.to_string());
+            if out.len() >= max_lines {
+                break;
+            }
         }
     }
     if !out.is_empty() {
@@ -144,16 +164,7 @@ pub fn build_preview_lines(record: &MemoRecord, query: &str, max_lines: usize) -
         .iter()
         .any(|tag| compact_search_text(tag).contains(&query))
     {
-        for line in normalized_record_lines(&record.title) {
-            if out.len() >= max_lines {
-                break;
-            }
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            out.push(line.to_string());
-        }
+        out.extend(lines.into_iter().take(max_lines));
     }
 
     out
@@ -701,6 +712,20 @@ mod tests {
         assert_eq!(
             build_preview_lines(&record, "倾斜", 3),
             vec!["ORDER BY".to_string(), "shard_skew_ratio DESC".to_string()]
+        );
+    }
+
+    #[test]
+    fn preview_includes_context_around_matched_lines() {
+        let record = make_record("line 1\nline 2 keyword\nline 3\nline 4", &[]);
+
+        assert_eq!(
+            build_preview_lines(&record, "keyword", 3),
+            vec![
+                "line 1".to_string(),
+                "line 2 keyword".to_string(),
+                "line 3".to_string()
+            ]
         );
     }
 }

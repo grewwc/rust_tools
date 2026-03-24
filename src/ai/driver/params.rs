@@ -1,5 +1,5 @@
-use crate::strw::split::split_space_keep_symbol;
 use crate::ai::types::LoopOverrides;
+use crate::strw::split::split_space_keep_symbol;
 
 pub fn loop_overrides(question: &str) -> LoopOverrides {
     parse_loop_overrides(question).1

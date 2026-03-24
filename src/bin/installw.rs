@@ -264,9 +264,8 @@ fn deps_for_bin(
     let roots = extract_lib_roots_from_bin(&content);
 
     let mut deps: BTreeSet<Rc<PathBuf>> = BTreeSet::new();
-    if let Some(node) = interner.get(bin_rs) {
-        deps.insert(node.clone());
-    }
+    let bin_rs = bin_rs.to_path_buf();
+    collect_reachable(graph, interner, &bin_rs, &mut deps);
 
     for root in roots {
         if let Some(root_file) = resolve_lib_root_file(&root, repo_root) {
@@ -359,6 +358,32 @@ fn newest_mtime(files: &[Rc<PathBuf>]) -> Result<SystemTime, String> {
         }
     }
     Ok(newest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deps_for_re_includes_bin_modules() {
+        let cwd = env::current_dir().unwrap();
+        let repo_root = find_repo_root(&cwd).unwrap();
+        let src_dir = repo_root.join("src");
+        let bin_dir = src_dir.join("bin");
+
+        let all_rs_files = list_rs_files(&src_dir).unwrap();
+        let (graph, interner) = build_module_graph(&all_rs_files).unwrap();
+
+        let bin_rs = bin_dir.join("re.rs");
+        let deps = deps_for_bin("re", &bin_rs, &repo_root, &graph, &interner).unwrap();
+        let deps = deps
+            .into_iter()
+            .map(|p| p.as_ref().clone())
+            .collect::<BTreeSet<_>>();
+
+        assert!(deps.contains(&bin_dir.join("re").join("features").join("mod.rs")));
+        assert!(deps.contains(&bin_dir.join("re").join("features").join("search.rs")));
+    }
 }
 
 fn file_mtime(path: &Path) -> Result<SystemTime, String> {

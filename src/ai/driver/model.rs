@@ -1,4 +1,4 @@
-use crate::ai::{types::App, models};
+use crate::ai::{models, types::App};
 
 pub fn resolve_model_for_input(app: &App, question: &mut String) -> String {
     if let Some(model) = attachment_forced_model(
@@ -13,13 +13,13 @@ pub fn resolve_model_for_input(app: &App, question: &mut String) -> String {
     // Work on the original string without cloning first
     let original_len = question.len();
     let trimmed_len = question.trim_end().len();
-    
-    if trimmed_len >= 6 && &question[trimmed_len -6..trimmed_len] == " -code" {
-        *question = question[..trimmed_len -6].trim_end().to_string();
+
+    if trimmed_len >= 6 && &question[trimmed_len - 6..trimmed_len] == " -code" {
+        *question = question[..trimmed_len - 6].trim_end().to_string();
         return models::qwen_coder_plus_latest().to_string();
     }
-    if trimmed_len >= 3 && &question[trimmed_len -3..trimmed_len] == " -d" {
-        *question = question[..trimmed_len -3].trim_end().to_string();
+    if trimmed_len >= 3 && &question[trimmed_len - 3..trimmed_len] == " -d" {
+        *question = question[..trimmed_len - 3].trim_end().to_string();
         return models::deepseek_v3().to_string();
     }
     if let Some(selector) = trailing_model_selector(question) {

@@ -132,7 +132,7 @@ fn wait_fd_readable(fd: i32, timeout_ms: u64) -> Result<(), String> {
 
         let err = std::io::Error::last_os_error();
         if err.kind() == std::io::ErrorKind::Interrupted {
-            return Err("MCP wait interrupted".to_string());
+            continue;
         }
         return Err(format!("Failed waiting for MCP response: {}", err));
     }

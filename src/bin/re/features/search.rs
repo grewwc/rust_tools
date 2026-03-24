@@ -4,6 +4,8 @@ use regex::Regex;
 use crate::features::core::*;
 use crate::memo::{MemoBackend, history, search as memo_search, ui};
 
+const SEARCH_PREVIEW_MAX_LINES: usize = 6;
+
 pub fn search_feature(
     db: &MemoBackend,
     query: &str,
@@ -39,7 +41,7 @@ pub fn search_feature(
         if score <= 0.0 {
             continue;
         }
-        let preview = memo_search::build_preview_lines(&record, query, 3);
+        let preview = memo_search::build_preview_lines(&record, query, SEARCH_PREVIEW_MAX_LINES);
         results.push(SearchHit {
             score,
             record,
@@ -144,7 +146,7 @@ pub fn print_search_result(
 
     if is_probably_text(&result.record.title) {
         let preview = if result.preview.is_empty() {
-            memo_search::build_preview_lines(&result.record, query, 3)
+            memo_search::build_preview_lines(&result.record, query, SEARCH_PREVIEW_MAX_LINES)
         } else {
             result.preview.clone()
         };

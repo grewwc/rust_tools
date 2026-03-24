@@ -1,12 +1,12 @@
-use std::io::{self, Write, BufRead};
 use std::error::Error;
+use std::io::{self, BufRead, Write};
 use std::sync::atomic::Ordering;
 
-use crate::ai::types::{App, QuestionContext, LoopOverrides};
 use super::params::parse_loop_overrides;
+use crate::ai::types::{App, LoopOverrides, QuestionContext};
 
-use crate::clipboard::string_content;
 use crate::ai::{files, prompt::trim_trailing_newline};
+use crate::clipboard::string_content;
 
 pub fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn Error>> {
     if !app.cli.args.is_empty() {

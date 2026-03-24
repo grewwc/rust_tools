@@ -416,7 +416,7 @@ fn execute_grep_search(args: &Value) -> Result<String, String> {
         .output()
         .map_err(|e| format!("Failed to execute rg: {}", e))?;
 
-    let result = String::from_utf8_lossy(&output.stdout).to_string();
+    let result = String::from_utf8_lossy(&output.stdout).to_owned();
     Ok(result.trim().to_string())
 }
 

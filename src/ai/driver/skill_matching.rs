@@ -1,9 +1,6 @@
 use crate::ai::skills::SkillManifest;
 
-pub fn match_skill<'a>(
-    skills: &'a [SkillManifest],
-    input: &str,
-) -> Option<&'a SkillManifest> {
+pub fn match_skill<'a>(skills: &'a [SkillManifest], input: &str) -> Option<&'a SkillManifest> {
     let input_lower = input.to_lowercase();
     let mut matched: Vec<&SkillManifest> = Vec::new();
 
