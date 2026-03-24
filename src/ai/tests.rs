@@ -74,6 +74,12 @@ fn determine_vl_model_supports_selector_and_fuzzy_name() {
 }
 
 #[test]
+fn tools_are_disabled_for_qwen_flash() {
+    assert!(!models::tools_enabled("qwen-flash"));
+    assert!(models::tools_enabled("qwen3-max"));
+}
+
+#[test]
 fn image_file_detection_by_suffix() {
     assert!(files::is_image_path("/tmp/hello.png"));
     assert!(files::is_image_path("/tmp/hello.JPEG"));

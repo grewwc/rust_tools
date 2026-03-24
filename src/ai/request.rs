@@ -98,7 +98,7 @@ pub(super) fn do_request(
     question: &str,
     history_count: usize,
 ) -> Result<Response, Box<dyn std::error::Error>> {
-    let (tools_value, tool_choice) = agent_tools_for_request(app);
+    let (tools_value, tool_choice) = agent_tools_for_request(app, model);
     let mut request_body = RequestBody {
         model: model.to_string(),
         messages: vec![Message {
@@ -180,7 +180,7 @@ pub(super) fn do_request_messages(
     messages: Vec<Message>,
     stream: bool,
 ) -> Result<Response, Box<dyn std::error::Error>> {
-    let (tools_value, tool_choice) = agent_tools_for_request(app);
+    let (tools_value, tool_choice) = agent_tools_for_request(app, model);
     let request_body = RequestBody {
         model: model.to_string(),
         messages,
@@ -208,7 +208,10 @@ pub(super) fn do_request_messages(
     Ok(response)
 }
 
-fn agent_tools_for_request(app: &App) -> (Option<Value>, Option<Value>) {
+fn agent_tools_for_request(app: &App, model: &str) -> (Option<Value>, Option<Value>) {
+    if !models::tools_enabled(model) {
+        return (None, None);
+    }
     let Some(ctx) = app.agent_context.as_ref() else {
         return (None, None);
     };

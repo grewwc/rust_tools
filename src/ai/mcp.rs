@@ -3,6 +3,10 @@ use std::{
     fs::File,
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::{JoinHandle, spawn},
     time::{Duration, Instant},
 };
@@ -48,8 +52,8 @@ struct JsonRpcError {
 }
 
 pub(super) struct McpClient {
-    servers: HashMap<ServerId, McpServerConnection>,
-    next_id: u64,
+    servers: HashMap<ServerId, Mutex<McpServerConnection>>,
+    next_id: AtomicU64,
 }
 
 struct McpServerConnection {
@@ -227,7 +231,7 @@ impl McpClient {
     pub(super) fn new() -> Self {
         Self {
             servers: HashMap::new(),
-            next_id: 1,
+            next_id: AtomicU64::new(1),
         }
     }
 
@@ -272,14 +276,12 @@ impl McpClient {
         self.initialize_server(&mut conn)?;
         conn.tools = self.list_tools(&mut conn)?;
 
-        self.servers.insert(name.to_string(), conn);
+        self.servers.insert(name.to_string(), Mutex::new(conn));
         Ok(())
     }
 
-    fn next_request_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
+    fn next_request_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
     fn send_request_to_conn(
@@ -314,7 +316,7 @@ impl McpClient {
     }
 
     fn send_request(
-        &mut self,
+        &self,
         conn: &mut McpServerConnection,
         method: &str,
         params: Option<Value>,
@@ -323,7 +325,7 @@ impl McpClient {
         Self::send_request_to_conn(conn, id, method, params)
     }
 
-    fn initialize_server(&mut self, conn: &mut McpServerConnection) -> Result<(), String> {
+    fn initialize_server(&self, conn: &mut McpServerConnection) -> Result<(), String> {
         let params = json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
@@ -350,7 +352,7 @@ impl McpClient {
         Ok(())
     }
 
-    fn list_tools(&mut self, conn: &mut McpServerConnection) -> Result<Vec<McpTool>, String> {
+    fn list_tools(&self, conn: &mut McpServerConnection) -> Result<Vec<McpTool>, String> {
         let result = self.send_request(conn, "tools/list", None)?;
 
         let tools = result["tools"]
@@ -363,10 +365,7 @@ impl McpClient {
         Ok(tools)
     }
 
-    fn list_resources(
-        &mut self,
-        conn: &mut McpServerConnection,
-    ) -> Result<Vec<McpResource>, String> {
+    fn list_resources(&self, conn: &mut McpServerConnection) -> Result<Vec<McpResource>, String> {
         let result = self.send_request(conn, "resources/list", None)?;
 
         let resources = result["resources"]
@@ -381,7 +380,7 @@ impl McpClient {
         Ok(resources)
     }
 
-    fn list_prompts(&mut self, conn: &mut McpServerConnection) -> Result<Vec<McpPrompt>, String> {
+    fn list_prompts(&self, conn: &mut McpServerConnection) -> Result<Vec<McpPrompt>, String> {
         let result = self.send_request(conn, "prompts/list", None)?;
 
         let prompts = result["prompts"]
@@ -397,7 +396,7 @@ impl McpClient {
     }
 
     pub(super) fn call_tool(
-        &mut self,
+        &self,
         server_name: &str,
         tool_name: &str,
         arguments: Value,
@@ -410,10 +409,13 @@ impl McpClient {
 
         let conn = self
             .servers
-            .get_mut(server_name)
+            .get(server_name)
             .ok_or_else(|| format!("Server not found: {}", server_name))?;
 
-        let result = Self::send_request_to_conn(conn, id, "tools/call", Some(params))?;
+        let mut conn = conn
+            .lock()
+            .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+        let result = Self::send_request_to_conn(&mut conn, id, "tools/call", Some(params))?;
 
         let content = result["content"]
             .as_array()
@@ -425,7 +427,7 @@ impl McpClient {
         Ok(content)
     }
 
-    pub(super) fn read_resource(&mut self, server_name: &str, uri: &str) -> Result<String, String> {
+    pub(super) fn read_resource(&self, server_name: &str, uri: &str) -> Result<String, String> {
         let id = self.next_request_id();
         let params = json!({
             "uri": uri
@@ -433,10 +435,13 @@ impl McpClient {
 
         let conn = self
             .servers
-            .get_mut(server_name)
+            .get(server_name)
             .ok_or_else(|| format!("Server not found: {}", server_name))?;
 
-        let result = Self::send_request_to_conn(conn, id, "resources/read", Some(params))?;
+        let mut conn = conn
+            .lock()
+            .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+        let result = Self::send_request_to_conn(&mut conn, id, "resources/read", Some(params))?;
 
         let content = result["contents"]
             .as_array()
@@ -449,7 +454,7 @@ impl McpClient {
     }
 
     pub(super) fn get_prompt(
-        &mut self,
+        &self,
         server_name: &str,
         prompt_name: &str,
         arguments: HashMap<String, String>,
@@ -462,10 +467,13 @@ impl McpClient {
 
         let conn = self
             .servers
-            .get_mut(server_name)
+            .get(server_name)
             .ok_or_else(|| format!("Server not found: {}", server_name))?;
 
-        let result = Self::send_request_to_conn(conn, id, "prompts/get", Some(params))?;
+        let mut conn = conn
+            .lock()
+            .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+        let result = Self::send_request_to_conn(&mut conn, id, "prompts/get", Some(params))?;
 
         let content = result["messages"]
             .as_array()
@@ -480,6 +488,9 @@ impl McpClient {
     pub(super) fn get_all_tools(&self) -> Vec<ToolDefinition> {
         let mut result = Vec::new();
         for (server_name, conn) in &self.servers {
+            let Ok(conn) = conn.lock() else {
+                continue;
+            };
             for tool in &conn.tools {
                 result.push(ToolDefinition {
                     tool_type: "function".to_string(),
@@ -520,6 +531,9 @@ impl McpClient {
     pub(super) fn get_all_resources(&self) -> Vec<(String, McpResource)> {
         let mut result = Vec::new();
         for (server_name, conn) in &self.servers {
+            let Ok(conn) = conn.lock() else {
+                continue;
+            };
             for r in &conn.resources {
                 result.push((server_name.clone(), r.clone()));
             }
@@ -530,6 +544,9 @@ impl McpClient {
     pub(super) fn get_all_prompts(&self) -> Vec<(String, McpPrompt)> {
         let mut result = Vec::new();
         for (server_name, conn) in &self.servers {
+            let Ok(conn) = conn.lock() else {
+                continue;
+            };
             for p in &conn.prompts {
                 result.push((server_name.clone(), p.clone()));
             }
@@ -539,6 +556,7 @@ impl McpClient {
 
     pub(super) fn disconnect_all(&mut self) {
         for (_, conn) in self.servers.drain() {
+            let conn = conn.into_inner().unwrap_or_else(|e| e.into_inner());
             match conn.transport {
                 McpTransport::Process { mut process, .. } => {
                     let _ = process.kill();

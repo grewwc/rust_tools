@@ -14,78 +14,102 @@ const QWEN_VL_FLASH: &str = "qwen3-vl-flash";
 const QWEN_VL_MAX: &str = "qwen3-vl-plus";
 const QWEN_VL_OCR: &str = "qwen-vl-ocr-latest";
 
+const TOOLS_ON: bool = true;
+const TOOLS_OFF: bool = false;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Model {
-    DeepseekV3,
-    DeepseekR1,
-    QwenMaxLatest,
-    QwenPlusLatest,
-    QwenMax,
-    QwenCoderPlusLatest,
-    QwenLong,
-    Qwq,
-    QwenFlash,
-    Qwen3Max,
-    QwenVlFlash,
-    QwenVlMax,
-    QwenVlOcr,
+    DeepseekV3(bool),
+    DeepseekR1(bool),
+    QwenMaxLatest(bool),
+    QwenPlusLatest(bool),
+    QwenMax(bool),
+    QwenCoderPlusLatest(bool),
+    QwenLong(bool),
+    Qwq(bool),
+    QwenFlash(bool),
+    Qwen3Max(bool),
+    QwenVlFlash(bool),
+    QwenVlMax(bool),
+    QwenVlOcr(bool),
 }
 
 impl Model {
     pub(super) const ALL: &'static [Model] = &[
-        Model::DeepseekV3,
-        Model::DeepseekR1,
-        Model::QwenMaxLatest,
-        Model::QwenPlusLatest,
-        Model::QwenMax,
-        Model::QwenCoderPlusLatest,
-        Model::QwenLong,
-        Model::Qwq,
-        Model::QwenFlash,
-        Model::Qwen3Max,
-        Model::QwenVlFlash,
-        Model::QwenVlMax,
-        Model::QwenVlOcr,
+        Model::DeepseekV3(TOOLS_ON),
+        Model::DeepseekR1(TOOLS_ON),
+        Model::QwenMaxLatest(TOOLS_ON),
+        Model::QwenPlusLatest(TOOLS_ON),
+        Model::QwenMax(TOOLS_ON),
+        Model::QwenCoderPlusLatest(TOOLS_ON),
+        Model::QwenLong(TOOLS_ON),
+        Model::Qwq(TOOLS_ON),
+        Model::QwenFlash(TOOLS_OFF),
+        Model::Qwen3Max(TOOLS_ON),
+        Model::QwenVlFlash(TOOLS_OFF),
+        Model::QwenVlMax(TOOLS_ON),
+        Model::QwenVlOcr(TOOLS_OFF),
     ];
 
-    pub(super) const VL: &'static [Model] =
-        &[Model::QwenVlFlash, Model::QwenVlMax, Model::QwenVlOcr];
+    pub(super) const VL: &'static [Model] = &[
+        Model::QwenVlFlash(TOOLS_ON),
+        Model::QwenVlMax(TOOLS_ON),
+        Model::QwenVlOcr(TOOLS_ON),
+    ];
 
     pub(super) fn as_str(self) -> &'static str {
         match self {
-            Model::DeepseekV3 => DEEPSEEK_V3,
-            Model::DeepseekR1 => DEEPSEEK_R1,
-            Model::QwenMaxLatest => QWEN_MAX_LATEST,
-            Model::QwenPlusLatest => QWEN_PLUS_LATEST,
-            Model::QwenMax => QWEN_MAX,
-            Model::QwenCoderPlusLatest => QWEN_CODER_PLUS_LATEST,
-            Model::QwenLong => QWEN_LONG,
-            Model::Qwq => QWQ,
-            Model::QwenFlash => QWEN_FLASH,
-            Model::Qwen3Max => QWEN3_MAX,
-            Model::QwenVlFlash => QWEN_VL_FLASH,
-            Model::QwenVlMax => QWEN_VL_MAX,
-            Model::QwenVlOcr => QWEN_VL_OCR,
+            Model::DeepseekV3(_) => DEEPSEEK_V3,
+            Model::DeepseekR1(_) => DEEPSEEK_R1,
+            Model::QwenMaxLatest(_) => QWEN_MAX_LATEST,
+            Model::QwenPlusLatest(_) => QWEN_PLUS_LATEST,
+            Model::QwenMax(_) => QWEN_MAX,
+            Model::QwenCoderPlusLatest(_) => QWEN_CODER_PLUS_LATEST,
+            Model::QwenLong(_) => QWEN_LONG,
+            Model::Qwq(_) => QWQ,
+            Model::QwenFlash(_) => QWEN_FLASH,
+            Model::Qwen3Max(_) => QWEN3_MAX,
+            Model::QwenVlFlash(_) => QWEN_VL_FLASH,
+            Model::QwenVlMax(_) => QWEN_VL_MAX,
+            Model::QwenVlOcr(_) => QWEN_VL_OCR,
         }
     }
 
     pub(super) fn is_vl(self) -> bool {
         matches!(
             self,
-            Model::QwenVlFlash | Model::QwenVlMax | Model::QwenVlOcr
+            Model::QwenVlFlash(_) | Model::QwenVlMax(_) | Model::QwenVlOcr(_)
         )
     }
 
     pub(super) fn search_enabled(self) -> bool {
         matches!(
             self,
-            Model::QwenMax
-                | Model::QwenMaxLatest
-                | Model::QwenPlusLatest
-                | Model::QwenFlash
-                | Model::DeepseekV3
-                | Model::Qwen3Max
+            Model::QwenMax(_)
+                | Model::QwenMaxLatest(_)
+                | Model::QwenPlusLatest(_)
+                | Model::QwenFlash(_)
+                | Model::DeepseekV3(_)
+                | Model::Qwen3Max(_)
         )
+    }
+
+    pub(super) fn tools_enabled(self) -> bool {
+        match self {
+            Model::DeepseekV3(v)
+            | Model::DeepseekR1(v)
+            | Model::QwenMaxLatest(v)
+            | Model::QwenPlusLatest(v)
+            | Model::QwenMax(v)
+            | Model::QwenCoderPlusLatest(v)
+            | Model::QwenLong(v)
+            | Model::Qwq(v)
+            | Model::QwenFlash(v)
+            | Model::Qwen3Max(v)
+            | Model::QwenVlFlash(v)
+            | Model::QwenVlMax(v)
+            | Model::QwenVlOcr(v) => v,
+        }
     }
 }
 
@@ -135,6 +159,13 @@ pub(super) fn search_enabled(model: &str) -> bool {
         .is_some_and(|m| m.search_enabled())
 }
 
+pub(super) fn tools_enabled(model: &str) -> bool {
+    Model::ALL
+        .iter()
+        .find(|m| m.as_str() == model)
+        .is_none_or(|m| m.tools_enabled())
+}
+
 pub(super) fn initial_model(cli: &Cli) -> String {
     if cli.code {
         return qwen_coder_plus_latest().to_string();
@@ -177,20 +208,20 @@ pub(super) fn selected_model_number(cli: &Cli) -> Option<u8> {
 
 pub(super) fn model_from_selector(selector: u8, thinking_mode: bool) -> Model {
     match selector {
-        0 => Model::Qwq,
-        1 => Model::QwenPlusLatest,
-        2 => Model::QwenMax,
-        3 => Model::Qwen3Max,
-        4 => Model::QwenCoderPlusLatest,
+        0 => Model::Qwq(TOOLS_ON),
+        1 => Model::QwenPlusLatest(TOOLS_ON),
+        2 => Model::QwenMax(TOOLS_ON),
+        3 => Model::Qwen3Max(TOOLS_ON),
+        4 => Model::QwenCoderPlusLatest(TOOLS_ON),
         5 => {
             if thinking_mode {
-                Model::DeepseekR1
+                Model::DeepseekR1(TOOLS_ON)
             } else {
-                Model::DeepseekV3
+                Model::DeepseekV3(TOOLS_ON)
             }
         }
-        6 => Model::QwenFlash,
-        _ => Model::Qwen3Max,
+        6 => Model::QwenFlash(TOOLS_OFF),
+        _ => Model::Qwen3Max(TOOLS_ON),
     }
 }
 

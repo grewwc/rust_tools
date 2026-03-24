@@ -1,8 +1,12 @@
 use std::{fs, path::PathBuf, process::Command};
 
+use regex::Regex;
 use serde_json::{Value, json};
+use std::time::Duration;
 
 use super::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
+
+const HTTP_TOOL_TIMEOUT: Duration = Duration::from_secs(2);
 
 const BUILTIN_TOOLS: &[(&str, &str)] = &[
     (
@@ -422,22 +426,260 @@ fn execute_grep_search(args: &Value) -> Result<String, String> {
 
 fn execute_web_search(args: &Value) -> Result<String, String> {
     let query = args["query"].as_str().ok_or("Missing query")?;
-    let _num_results = args["num_results"].as_u64().unwrap_or(5);
+    let num_results = args["num_results"]
+        .as_u64()
+        .or_else(|| args["num"].as_u64())
+        .unwrap_or(5)
+        .clamp(1, 10) as usize;
 
-    Err(format!("Web search not implemented. Query: {}", query))
+    let hits = duckduckgo_search(query, num_results)?;
+    if hits.is_empty() {
+        return Ok("No results found.".to_string());
+    }
+
+    let mut out = String::new();
+    for (idx, hit) in hits.into_iter().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("{}. {}\n", idx + 1, hit.title.trim()));
+        out.push_str(&format!("{}\n", hit.url.trim()));
+        if !hit.snippet.trim().is_empty() {
+            out.push_str(&format!("{}\n", hit.snippet.trim()));
+        }
+    }
+    Ok(out.trim_end().to_string())
 }
 
 fn execute_web_fetch(args: &Value) -> Result<String, String> {
     let url = args["url"].as_str().ok_or("Missing url")?;
 
-    let response =
-        reqwest::blocking::get(url).map_err(|e| format!("Failed to fetch URL: {}", e))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TOOL_TIMEOUT)
+        .user_agent("Mozilla/5.0 (compatible; rust-tools/1.0)")
+        .build()
+        .map_err(|e| format!("Failed to build http client: {}", e))?;
+
+    let response = client
+        .get(url)
+        .send()
+        .map_err(|e| format!("Failed to fetch URL: {}", e))?;
 
     let content = response
         .text()
         .map_err(|e| format!("Failed to read response: {}", e))?;
 
     Ok(content)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSearchHit {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+fn duckduckgo_search(query: &str, limit: usize) -> Result<Vec<WebSearchHit>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TOOL_TIMEOUT)
+        .user_agent("Mozilla/5.0 (compatible; rust-tools/1.0)")
+        .build()
+        .map_err(|e| format!("Failed to build http client: {}", e))?;
+
+    let response = client
+        .get("https://duckduckgo.com/html/")
+        .query(&[("q", query)])
+        .send()
+        .map_err(|e| format!("Failed to perform web search: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("Web search failed: HTTP {}", status.as_u16()));
+    }
+
+    let html = response
+        .text()
+        .map_err(|e| format!("Failed to read search response: {}", e))?;
+    Ok(parse_duckduckgo_html(&html, limit))
+}
+
+fn parse_duckduckgo_html(html: &str, limit: usize) -> Vec<WebSearchHit> {
+    let title_re = Regex::new(
+        r#"(?s)<a[^>]*class="result__a"[^>]*href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>"#,
+    )
+    .ok();
+    let snippet_re = Regex::new(r#"(?s)<a[^>]*class="result__snippet"[^>]*>(?P<snippet>.*?)</a>|<div[^>]*class="result__snippet"[^>]*>(?P<snippet2>.*?)</div>"#).ok();
+
+    let Some(title_re) = title_re else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for m in title_re.captures_iter(html) {
+        if out.len() >= limit {
+            break;
+        }
+        let raw_url = m.name("url").map(|m| m.as_str()).unwrap_or("").to_string();
+        let url = normalize_duckduckgo_url(&raw_url);
+        let title_html = m.name("title").map(|m| m.as_str()).unwrap_or("");
+        let title = clean_html_text(title_html);
+
+        let mut snippet = String::new();
+        if let Some(snippet_re) = snippet_re.as_ref() {
+            let window_start = m.get(0).map(|m| m.end()).unwrap_or(0);
+            let window_end = (window_start + 4000).min(html.len());
+            let window = &html[window_start..window_end];
+            if let Some(caps) = snippet_re.captures(window) {
+                let snippet_html = caps
+                    .name("snippet")
+                    .or_else(|| caps.name("snippet2"))
+                    .map(|m| m.as_str())
+                    .unwrap_or("");
+                snippet = clean_html_text(snippet_html);
+            }
+        }
+
+        if title.trim().is_empty() || url.trim().is_empty() {
+            continue;
+        }
+        out.push(WebSearchHit {
+            title,
+            url,
+            snippet,
+        });
+    }
+    out
+}
+
+fn normalize_duckduckgo_url(url: &str) -> String {
+    let decoded_url = decode_html_entities(url.trim());
+    if let Some(decoded) = extract_duckduckgo_uddg(&decoded_url) {
+        return decoded;
+    }
+    decoded_url
+}
+
+fn extract_duckduckgo_uddg(url: &str) -> Option<String> {
+    let idx = url.find("uddg=")?;
+    let rest = &url[idx + 5..];
+    let value = rest.split('&').next().unwrap_or(rest);
+    let decoded = percent_decode(value)?;
+    if decoded.trim().is_empty() {
+        None
+    } else {
+        Some(decoded)
+    }
+}
+
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let h1 = bytes[i + 1];
+                let h2 = bytes[i + 2];
+                let v1 = hex_value(h1)?;
+                let v2 = hex_value(h2)?;
+                out.push((v1 << 4) | v2);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn clean_html_text(s: &str) -> String {
+    let without_tags = strip_html_tags(s);
+    let decoded = decode_html_entities(&without_tags);
+    decoded
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim()
+        .to_string()
+}
+
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for ch in s.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out
+}
+
+fn decode_html_entities(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'&' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let Some(end) = s[i..].find(';') else {
+            out.push(b'&');
+            i += 1;
+            continue;
+        };
+        let end = i + end;
+        let entity = &s[i + 1..end];
+        if let Some(decoded) = decode_single_entity(entity) {
+            out.extend_from_slice(decoded.as_bytes());
+        } else {
+            out.push(b'&');
+            out.extend_from_slice(entity.as_bytes());
+            out.push(b';');
+        }
+        i = end + 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn decode_single_entity(entity: &str) -> Option<String> {
+    match entity {
+        "amp" => Some("&".to_string()),
+        "lt" => Some("<".to_string()),
+        "gt" => Some(">".to_string()),
+        "quot" => Some("\"".to_string()),
+        "apos" => Some("'".to_string()),
+        _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+            let hex = &entity[2..];
+            let v = u32::from_str_radix(hex, 16).ok()?;
+            char::from_u32(v).map(|c| c.to_string())
+        }
+        _ if entity.starts_with('#') => {
+            let dec = &entity[1..];
+            let v = u32::from_str_radix(dec, 10).ok()?;
+            char::from_u32(v).map(|c| c.to_string())
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn merge_tool_definitions(
@@ -453,4 +695,41 @@ pub(super) fn merge_tool_definitions(
 
 pub(super) fn tool_definitions_to_value(tools: &[ToolDefinition]) -> Value {
     serde_json::to_value(tools).unwrap_or(Value::Array(Vec::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duckduckgo_html_extracts_title_url_snippet() {
+        let html = r#"
+        <div class="result results_links results_links_deep web-result">
+          <h2 class="result__title">
+            <a class="result__a" href="https://example.com/a?x=1&amp;y=2">A &amp; B</a>
+          </h2>
+          <a class="result__snippet">Hello <b>world</b> &gt; test</a>
+        </div>
+        <div class="result results_links results_links_deep web-result">
+          <h2 class="result__title">
+            <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org%2F">Rust</a>
+          </h2>
+          <div class="result__snippet">The &quot;Rust&quot; language</div>
+        </div>
+        "#;
+
+        let hits = parse_duckduckgo_html(html, 5);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0],
+            WebSearchHit {
+                title: "A & B".to_string(),
+                url: "https://example.com/a?x=1&y=2".to_string(),
+                snippet: "Hello world > test".to_string()
+            }
+        );
+        assert_eq!(hits[1].title, "Rust");
+        assert_eq!(hits[1].url, "https://rust-lang.org/");
+        assert_eq!(hits[1].snippet, "The \"Rust\" language");
+    }
 }

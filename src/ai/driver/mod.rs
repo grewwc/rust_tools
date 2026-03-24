@@ -263,9 +263,28 @@ fn run_loop(
             }
 
             let tool_results = execute_tool_calls(mcp_client, &stream_result.tool_calls)?;
-            for result in &tool_results {
+            for (tool_call, result) in stream_result.tool_calls.iter().zip(tool_results.iter()) {
                 println!("\n{}", "[Tool Result]".green());
-                println!("{}", result.content);
+                if tool_call.function.name == "web_search" {
+                    let mut preview = String::new();
+                    let mut lines = 0usize;
+                    let mut truncated = false;
+                    for line in result.content.lines() {
+                        if lines >= 12 || preview.len() >= 1200 {
+                            truncated = true;
+                            break;
+                        }
+                        preview.push_str(line);
+                        preview.push('\n');
+                        lines += 1;
+                    }
+                    print!("{}", preview);
+                    if truncated {
+                        println!("... (truncated)");
+                    }
+                } else {
+                    println!("{}", result.content);
+                }
                 messages.push(Message {
                     role: "tool".to_string(),
                     content: Value::String(result.content.clone()),
