@@ -120,6 +120,7 @@ pub(super) struct SkillDefinition {
 pub(super) struct McpTool {
     pub(super) name: String,
     pub(super) description: Option<String>,
+    #[serde(rename = "inputSchema")]
     pub(super) input_schema: Value,
 }
 
@@ -129,7 +130,7 @@ pub(super) struct McpResource {
     pub(super) name: String,
     #[serde(default)]
     pub(super) description: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename="mimeType")]
     pub(super) mime_type: Option<String>,
 }
 

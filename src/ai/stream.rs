@@ -321,9 +321,10 @@ impl MarkdownStreamRenderer {
             let (indent, rest) = split_indent(&self.line_buf);
             format!("{indent}{}", render_inline_md(rest, ""))
         };
+        let preview_height = preview_height_for_rendered(&rendered).max(1);
         out.write_all(rendered.as_bytes())?;
         self.line_preview_emitted = true;
-        self.line_preview_height = table_preview_height(&self.line_buf).max(1);
+        self.line_preview_height = preview_height;
         Ok(())
     }
 
@@ -438,7 +439,7 @@ impl MarkdownStreamRenderer {
                 }
                 let rendered = self.render_line_no_table(line);
                 if preview_emitted && !line.is_empty() {
-                    let preview_height = table_preview_height(line);
+                    let preview_height = self.line_preview_height.max(1);
                     return format!("\x1b[{preview_height}A\r\x1b[0J{rendered}");
                 }
                 rendered
@@ -1180,4 +1181,55 @@ fn terminal_width() -> usize {
     }
 
     80
+}
+
+fn preview_height_for_rendered(rendered: &str) -> usize {
+    let cols = terminal_width().max(1);
+    let mut plain = String::new();
+    let bytes = rendered.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            i += 2;
+            while i < bytes.len() {
+                let b = bytes[i];
+                i += 1;
+                if (b as char) >= '@' && (b as char) <= '~' {
+                    break;
+                }
+            }
+            continue;
+        }
+        let ch = rendered[i..].chars().next().unwrap();
+        if ch != '\r' {
+            plain.push(ch);
+        }
+        i += ch.len_utf8();
+    }
+    let width = UnicodeWidthStr::width(plain.as_str()).max(1);
+    (width + cols - 1) / cols
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inline_preview_height_uses_rendered_width_not_raw_markdown() {
+        unsafe { std::env::set_var("COLUMNS", "6") };
+        let raw = "**hello**";
+        assert_eq!(table_preview_height(raw), 2);
+        let rendered = render_inline_md(raw, "");
+        assert_eq!(preview_height_for_rendered(&rendered), 1);
+    }
+
+    #[test]
+    fn consume_line_move_up_matches_preview_height() {
+        unsafe { std::env::set_var("COLUMNS", "6") };
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        renderer.line_preview_height = 1;
+        let out = renderer.consume_line("**hello**", true);
+        assert!(out.contains("\x1b[1A\r\x1b[0J"));
+        assert!(!out.contains("\x1b[2A\r\x1b[0J"));
+    }
 }

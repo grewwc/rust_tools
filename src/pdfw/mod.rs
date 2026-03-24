@@ -8,14 +8,18 @@ use regex::Regex;
 
 use image::{DynamicImage, ImageBuffer, Luma, Rgb};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PdfParseOptions {
     pub extract_text: bool,
+    pub pages: Option<Vec<u32>>,
 }
 
 impl Default for PdfParseOptions {
     fn default() -> Self {
-        Self { extract_text: true }
+        Self {
+            extract_text: true,
+            pages: None,
+        }
     }
 }
 
@@ -96,12 +100,35 @@ pub fn parse_pdf(
     }
 
     let text = if opts.extract_text {
-        let page_numbers: Vec<u32> = (1..=page_count as u32).collect();
+        let mut page_numbers = match opts.pages.as_deref() {
+            Some(pages) => {
+                let mut out = pages
+                    .iter()
+                    .copied()
+                    .filter(|p| *p >= 1 && (*p as usize) <= page_count)
+                    .collect::<Vec<_>>();
+                out.sort_unstable();
+                out.dedup();
+                out
+            }
+            None => (1..=page_count as u32).collect(),
+        };
+        if page_numbers.is_empty() {
+            return Err(PdfParseError::ExtractTextFailed(
+                "no valid pages selected".to_string(),
+            ));
+        }
+
         let extracted = match doc.extract_text(&page_numbers) {
             Ok(t) => t,
-            Err(err) => pdf_extract::extract_text(&canonical).map_err(|e| {
-                PdfParseError::ExtractTextFailed(format!("{err}; fallback failed: {e}"))
-            })?,
+            Err(err) => {
+                if opts.pages.is_some() {
+                    return Err(PdfParseError::ExtractTextFailed(err.to_string()));
+                }
+                pdf_extract::extract_text(&canonical).map_err(|e| {
+                    PdfParseError::ExtractTextFailed(format!("{err}; fallback failed: {e}"))
+                })?
+            }
         };
         Some(extracted)
     } else {
@@ -270,11 +297,33 @@ pub fn ocr_pdf_to_markdown(
     path: impl AsRef<Path>,
     langs: &[&str],
 ) -> Result<String, PdfParseError> {
+    ocr_pdf_to_markdown_pages(path, langs, None)
+}
+
+pub fn ocr_pdf_to_markdown_pages(
+    path: impl AsRef<Path>,
+    langs: &[&str],
+    pages: Option<&[u32]>,
+) -> Result<String, PdfParseError> {
     let doc = lopdf::Document::load(path.as_ref()).map_err(PdfParseError::ParseFailed)?;
-    let pages = doc.get_pages();
+    let page_map = doc.get_pages();
     let mut out = String::new();
-    for page_number in 1..=pages.len() as u32 {
-        let Some(page_id) = pages.get(&page_number) else {
+    let selected_pages: Vec<u32> = match pages {
+        Some(ps) => {
+            let mut out = ps
+                .iter()
+                .copied()
+                .filter(|p| page_map.contains_key(p))
+                .collect::<Vec<_>>();
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+        None => (1..=page_map.len() as u32).collect(),
+    };
+
+    for page_number in selected_pages {
+        let Some(page_id) = page_map.get(&page_number) else {
             continue;
         };
 
@@ -559,8 +608,88 @@ fn ocr_image_to_text(img: &DynamicImage, langs: &[&str]) -> Result<String, Strin
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = langs;
-        Err("ocr is only supported on macos in this build".to_string())
+        return tesseract_ocr(img, langs);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tesseract_ocr(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
+    use std::{io::Write, process::Command};
+
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| e.to_string())?;
+
+    let input_path =
+        std::env::temp_dir().join(format!("rust_tools_ocr_{}.png", uuid::Uuid::new_v4()));
+    {
+        let mut f = std::fs::File::create(&input_path).map_err(|e| e.to_string())?;
+        f.write_all(&png).map_err(|e| e.to_string())?;
+        f.flush().map_err(|e| e.to_string())?;
+    }
+
+    let mut cmd = Command::new("tesseract");
+    cmd.arg(&input_path).arg("stdout");
+    if let Some(lang) = build_tesseract_lang_arg(langs) {
+        cmd.arg("-l").arg(lang);
+    }
+
+    let out = cmd.output().map_err(|e| {
+        let _ = std::fs::remove_file(&input_path);
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "tesseract not found in PATH (install tesseract-ocr)".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
+    let _ = std::fs::remove_file(&input_path);
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if stderr.is_empty() {
+            return Err(format!("tesseract failed: {}", out.status));
+        }
+        return Err(format!("tesseract failed: {}", stderr));
+    }
+
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let normalized = normalize_ocr_line(line);
+        if !normalized.is_empty() {
+            lines.push(normalized);
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+fn build_tesseract_lang_arg(langs: &[&str]) -> Option<String> {
+    if langs.is_empty() {
+        return None;
+    }
+    let mut items = Vec::new();
+    for l in langs {
+        let l = l.trim();
+        if l.is_empty() {
+            continue;
+        }
+        items.push(map_lang_for_tesseract(l));
+    }
+    if items.is_empty() {
+        return None;
+    }
+    Some(items.join("+"))
+}
+
+fn map_lang_for_tesseract(lang: &str) -> String {
+    let key = lang.trim().to_ascii_lowercase();
+    match key.as_str() {
+        "zh-hans" | "zh_cn" | "zh-cn" | "zh" | "zh-hans-cn" => "chi_sim".to_string(),
+        "zh-hant" | "zh_tw" | "zh-tw" | "zh-hant-tw" => "chi_tra".to_string(),
+        "en" | "en-us" | "en_us" | "en-gb" | "en_gb" => "eng".to_string(),
+        "ja" | "ja-jp" | "ja_jp" => "jpn".to_string(),
+        "ko" | "ko-kr" | "ko_kr" => "kor".to_string(),
+        _ => lang.trim().to_string(),
     }
 }
 
@@ -643,7 +772,6 @@ fn nsstring_to_string(s: &objc2_foundation::NSString) -> String {
     unsafe { std::ffi::CStr::from_ptr(ptr).to_string_lossy().to_string() }
 }
 
-#[cfg(target_os = "macos")]
 fn normalize_ocr_line(line: &str) -> String {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -729,5 +857,15 @@ mod tests {
         assert!(parsed.text.unwrap_or_default().contains("Hello PDF"));
 
         let _ = std::fs::remove_file(tmp_path);
+    }
+
+    #[test]
+    fn tesseract_lang_mapping_is_reasonable() {
+        assert_eq!(map_lang_for_tesseract("zh-Hans"), "chi_sim");
+        assert_eq!(map_lang_for_tesseract("en-US"), "eng");
+        assert_eq!(
+            build_tesseract_lang_arg(&["zh-Hans", "en-US"]).as_deref(),
+            Some("chi_sim+eng")
+        );
     }
 }

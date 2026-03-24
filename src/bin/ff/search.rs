@@ -1,5 +1,6 @@
 use crate::{exclude, output};
 use colored::Colorize;
+use rust_tools::cw::concurrent_hash_map::ConcurrentHashMap;
 use rust_tools::terminalw;
 use std::{
     fs,
@@ -174,6 +175,7 @@ fn process_match_blocking(
     opts: &crate::cli::Options,
     count: &Arc<AtomicI64>,
     stop: &Arc<AtomicBool>,
+    printed: &Arc<ConcurrentHashMap<PathBuf, ()>>,
 ) {
     if stop.load(Ordering::Relaxed) || output::PRINT_DISABLED.load(Ordering::Relaxed) {
         stop.store(true, Ordering::Relaxed);
@@ -185,6 +187,10 @@ fn process_match_blocking(
         return;
     }
     if exclude::should_exclude(&abs.to_string_lossy(), &opts.excludes) {
+        return;
+    }
+
+    if printed.put_if_absent(abs.clone(), ()).is_some() {
         return;
     }
 
@@ -222,6 +228,7 @@ async fn run_walk_async(opts: &crate::cli::Options) -> i64 {
     let stop = Arc::new(AtomicBool::new(false));
     let inflight = Arc::new(AtomicUsize::new(0));
     let stop_sent = Arc::new(AtomicBool::new(false));
+    let printed = Arc::new(ConcurrentHashMap::<PathBuf, ()>::default());
 
     let worker_count = opts.thread_count.max(1);
 
@@ -238,6 +245,7 @@ async fn run_walk_async(opts: &crate::cli::Options) -> i64 {
         let stop = Arc::clone(&stop);
         let inflight = Arc::clone(&inflight);
         let stop_sent = Arc::clone(&stop_sent);
+        let printed = Arc::clone(&printed);
 
         handles.push(tokio::spawn(async move {
             loop {
@@ -269,6 +277,7 @@ async fn run_walk_async(opts: &crate::cli::Options) -> i64 {
                             let opts2 = opts.clone();
                             let count2 = Arc::clone(&count);
                             let stop2 = Arc::clone(&stop);
+                            let printed2 = Arc::clone(&printed);
                             let res = tokio::task::spawn_blocking(move || {
                                 if stop2.load(Ordering::Relaxed) {
                                     return Vec::new();
@@ -281,7 +290,7 @@ async fn run_walk_async(opts: &crate::cli::Options) -> i64 {
                                     opts2.verbose,
                                 );
                                 for m in matches {
-                                    process_match_blocking(m, &opts2, &count2, &stop2);
+                                    process_match_blocking(m, &opts2, &count2, &stop2, &printed2);
                                     if stop2.load(Ordering::Relaxed) {
                                         return Vec::new();
                                     }
@@ -354,5 +363,47 @@ mod tests {
         for p in matches {
             assert!(std::fs::metadata(&p).is_ok(), "path should exist: {:?}", p);
         }
+    }
+
+    #[test]
+    fn test_dedup_by_canonical_path() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("rust_tools_ff_test_dedup_{}", stamp));
+        let real_dir = root.join("real");
+        let link_dir = root.join("link");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let file = real_dir.join("a.pdf");
+        std::fs::write(&file, "x").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+
+        let opts = crate::cli::Options {
+            verbose: false,
+            only_dir: false,
+            print_md5: false,
+            glob_mode: false,
+            case_insensitive: false,
+            relative: true,
+            num_print: i64::MAX,
+            thread_count: 1,
+            wd: root.clone(),
+            root_pat: root.to_string_lossy().to_string(),
+            targets: vec!["a.pdf".to_string()],
+            excludes: Vec::new(),
+        };
+
+        let count = Arc::new(AtomicI64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let printed = Arc::new(ConcurrentHashMap::<PathBuf, ()>::default());
+
+        let m1 = real_dir.join("a.pdf");
+        let m2 = link_dir.join("a.pdf");
+        process_match_blocking(m1, &opts, &count, &stop, &printed);
+        process_match_blocking(m2, &opts, &count, &stop, &printed);
+
+        assert_eq!(count.load(Ordering::Relaxed), 1);
     }
 }

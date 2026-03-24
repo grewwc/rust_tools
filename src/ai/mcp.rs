@@ -7,7 +7,7 @@ use std::{
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    thread::{JoinHandle, spawn},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 

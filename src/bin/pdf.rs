@@ -1,12 +1,17 @@
 use clap::{ArgAction, Parser};
 
-use rust_tools::pdfw::{PdfParseOptions, ocr_pdf_to_markdown, parse_pdf};
+use rust_tools::pdfw::{
+    PdfParseOptions, ocr_pdf_to_markdown, ocr_pdf_to_markdown_pages, parse_pdf,
+};
 
 #[derive(Parser)]
 #[command(name = "pdf", about = "Parse a PDF file")]
 struct Cli {
     #[arg(help = "PDF file path")]
     path: String,
+
+    #[arg(long, help = "Only parse a specific page (1-based)")]
+    page: Option<u32>,
 
     #[arg(long, help = "Do not extract text", action = ArgAction::SetTrue)]
     no_text: bool,
@@ -42,7 +47,7 @@ fn main() {
     let cli = Cli::parse();
 
     if cli.stats {
-        if let Err(err) = print_stats(&cli.path) {
+        if let Err(err) = print_stats(&cli.path, cli.page) {
             eprintln!("{err}");
             std::process::exit(1);
         }
@@ -51,6 +56,7 @@ fn main() {
 
     let opts = PdfParseOptions {
         extract_text: !cli.no_text,
+        pages: cli.page.map(|p| vec![p]),
     };
 
     let mut parsed = match parse_pdf(&cli.path, opts) {
@@ -83,7 +89,7 @@ fn main() {
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>();
-        match render_markdown(&cli.path, &parsed, cli.no_ocr, &langs) {
+        match render_markdown(&cli.path, &parsed, cli.no_ocr, &langs, cli.page) {
             Ok(md) => {
                 print!("{md}");
                 return;
@@ -122,6 +128,7 @@ fn render_markdown(
     parsed: &rust_tools::pdfw::ParsedPdf,
     no_ocr: bool,
     langs: &[&str],
+    page: Option<u32>,
 ) -> Result<String, String> {
     let title = parsed
         .title
@@ -150,9 +157,13 @@ fn render_markdown(
     }
 
     let body = if no_ocr {
-        extract_text_markdown_by_page(&parsed.path)?
+        extract_text_markdown_by_page(&parsed.path, page)?
     } else {
-        ocr_pdf_to_markdown(&parsed.path, langs).map_err(|e| e.to_string())?
+        match page {
+            Some(p) => ocr_pdf_to_markdown_pages(&parsed.path, langs, Some(&[p]))
+                .map_err(|e| e.to_string())?,
+            None => ocr_pdf_to_markdown(&parsed.path, langs).map_err(|e| e.to_string())?,
+        }
     };
     if !body.trim().is_empty() {
         pieces.push("\n".to_string());
@@ -165,7 +176,10 @@ fn render_markdown(
     Ok(pieces.concat())
 }
 
-fn extract_text_markdown_by_page(path: &std::path::Path) -> Result<String, String> {
+fn extract_text_markdown_by_page(
+    path: &std::path::Path,
+    page: Option<u32>,
+) -> Result<String, String> {
     let doc = lopdf::Document::load(path).map_err(|e| e.to_string())?;
     let pages = doc.get_pages();
     let page_count = pages.len();
@@ -174,7 +188,14 @@ fn extract_text_markdown_by_page(path: &std::path::Path) -> Result<String, Strin
     }
 
     let mut out = String::new();
-    for page_number in 1..=page_count as u32 {
+    let selected_pages: Vec<u32> = match page {
+        Some(p) => vec![p],
+        None => (1..=page_count as u32).collect(),
+    };
+    for page_number in selected_pages {
+        if !pages.contains_key(&page_number) {
+            continue;
+        }
         let text = doc
             .extract_text(&[page_number])
             .unwrap_or_default()
@@ -190,13 +211,17 @@ fn extract_text_markdown_by_page(path: &std::path::Path) -> Result<String, Strin
     Ok(out)
 }
 
-fn print_stats(path: &str) -> Result<(), String> {
+fn print_stats(path: &str, page: Option<u32>) -> Result<(), String> {
     let path = std::path::Path::new(path);
     let doc = lopdf::Document::load(path).map_err(|e| e.to_string())?;
     let pages = doc.get_pages();
     println!("pages: {}", pages.len());
 
-    for page_number in 1..=pages.len() as u32 {
+    let selected_pages: Vec<u32> = match page {
+        Some(p) => vec![p],
+        None => (1..=pages.len() as u32).collect(),
+    };
+    for page_number in selected_pages {
         let page_id = pages
             .get(&page_number)
             .ok_or_else(|| format!("page {page_number} not found"))?;
