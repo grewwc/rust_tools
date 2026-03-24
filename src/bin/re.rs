@@ -74,7 +74,6 @@ fn main() {
         list_tags_and_order_by_time,
         title_query,
     });
-
     features::register::register_all(&mut parser, ctx);
     let _ = parser.execute_first();
 }

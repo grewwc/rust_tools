@@ -32,3 +32,8 @@ tui-textarea = "0.7"
 unicode-width = "0.2"
 md5 = "0.7"
 num_cpus = "1.16"
+lopdf = "*"
+pdf-extract = "*"
+objc2 = "*"
+objc2-foundation = "*"
+objc2-vision = { version = "*", features = ["VNRequest", "VNObservation"] }

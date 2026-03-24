@@ -42,7 +42,11 @@ pub fn configure_terminalw(opts: &crate::cli::Options) -> std::collections::Hash
 
     if !opts.ext_exclude.trim().is_empty() {
         for e in DEFAULT_EXTENSIONS {
-            let ee = if e.is_empty() { "".to_string() } else { e.to_string() };
+            let ee = if e.is_empty() {
+                "".to_string()
+            } else {
+                e.to_string()
+            };
             if !ee.is_empty() {
                 allowed.insert(ee);
             }

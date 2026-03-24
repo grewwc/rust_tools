@@ -5,6 +5,7 @@ pub mod cmd;
 pub mod common;
 pub mod cw;
 pub mod jsonw;
+pub mod pdfw;
 pub mod sortw;
 pub mod strw;
 pub mod terminalw;

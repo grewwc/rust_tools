@@ -24,4 +24,3 @@ fn main() {
     };
     search::print_summary(found);
 }
-

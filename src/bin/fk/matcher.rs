@@ -3,9 +3,18 @@ use rust_tools::strw::indices::substring_quiet;
 
 #[derive(Clone)]
 pub enum MatchMode {
-    Contains { needle: String, needle_re: Option<Regex> },
-    Strict { needle: String, ignore_case: bool },
-    Regex { re: Regex, overlap_hint_len: usize },
+    Contains {
+        needle: String,
+        needle_re: Option<Regex>,
+    },
+    Strict {
+        needle: String,
+        ignore_case: bool,
+    },
+    Regex {
+        re: Regex,
+        overlap_hint_len: usize,
+    },
 }
 
 impl MatchMode {
@@ -13,7 +22,9 @@ impl MatchMode {
         match self {
             MatchMode::Contains { needle, .. } => needle.len(),
             MatchMode::Strict { needle, .. } => needle.len(),
-            MatchMode::Regex { overlap_hint_len, .. } => *overlap_hint_len,
+            MatchMode::Regex {
+                overlap_hint_len, ..
+            } => *overlap_hint_len,
         }
     }
 }
@@ -40,7 +51,13 @@ pub fn build_matcher(
         }
         let re = Regex::new(&pat).map_err(|e| e.to_string())?;
         let overlap_hint_len = target.len();
-        return Ok((target, MatchMode::Regex { re, overlap_hint_len }));
+        return Ok((
+            target,
+            MatchMode::Regex {
+                re,
+                overlap_hint_len,
+            },
+        ));
     }
 
     if strict {
@@ -49,7 +66,13 @@ pub fn build_matcher(
         } else {
             target
         };
-        return Ok((needle.clone(), MatchMode::Strict { needle, ignore_case }));
+        return Ok((
+            needle.clone(),
+            MatchMode::Strict {
+                needle,
+                ignore_case,
+            },
+        ));
     }
 
     if ignore_case {
@@ -73,7 +96,10 @@ pub fn build_matcher(
     ))
 }
 
-pub fn match_line<'a>(line: &'a str, matcher: &MatchMode) -> Option<(&'a str, Vec<(usize, usize)>)> {
+pub fn match_line<'a>(
+    line: &'a str,
+    matcher: &MatchMode,
+) -> Option<(&'a str, Vec<(usize, usize)>)> {
     match matcher {
         MatchMode::Contains { needle, needle_re } => {
             if let Some(re) = needle_re {
@@ -98,7 +124,10 @@ pub fn match_line<'a>(line: &'a str, matcher: &MatchMode) -> Option<(&'a str, Ve
                 }
             }
         }
-        MatchMode::Strict { needle, ignore_case } => {
+        MatchMode::Strict {
+            needle,
+            ignore_case,
+        } => {
             let trimmed = line.trim();
             let ok = if *ignore_case {
                 trimmed.to_lowercase() == *needle

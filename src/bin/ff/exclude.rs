@@ -51,4 +51,3 @@ mod tests {
         assert!(res[1].is_match("bx.go"));
     }
 }
-

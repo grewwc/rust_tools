@@ -154,24 +154,193 @@ impl Parser {
     }
 
     pub fn print_defaults(&self) {
-        for (k, sub) in self.groups.iter() {
-            println!("{k}");
-            sub.print_defaults();
+        let bin = std::env::args()
+            .next()
+            .and_then(|p| {
+                std::path::Path::new(&p)
+                    .file_name()?
+                    .to_str()
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| "app".to_string());
+
+        println!("Usage:");
+        let mut usage_parts = vec![bin];
+        if !self.groups.is_empty() {
+            usage_parts.push("[COMMAND]".to_string());
         }
-        let mut names = self.flags.keys().cloned().collect::<Vec<_>>();
-        names.sort();
-        for name in names {
-            let Some(def) = self.flags.get(&name) else {
-                continue;
-            };
-            if def.usage.trim().is_empty() {
-                println!("-{} (default: {})", def.name, def.default_value);
+        if !self.flags.is_empty() {
+            usage_parts.push("[OPTIONS]".to_string());
+        }
+        usage_parts.push("[ARGS]".to_string());
+        println!("  {}", usage_parts.join(" "));
+
+        let mut command_names = self.groups.keys().cloned().collect::<Vec<_>>();
+        command_names.sort();
+        if !command_names.is_empty() {
+            println!();
+            println!("Commands:");
+            for name in command_names {
+                println!("  {name}");
+            }
+        }
+
+        let options = self.collect_option_entries();
+        if options.is_empty() {
+            return;
+        }
+        println!();
+        println!("Options:");
+        let spec_width = options
+            .iter()
+            .map(|x| x.spec.len())
+            .max()
+            .unwrap_or(0)
+            .max(24);
+        for opt in options {
+            if opt.help.is_empty() {
+                println!("  {spec:<spec_width$}", spec = opt.spec);
             } else {
                 println!(
-                    "-{} (default: {}) {}",
-                    def.name, def.default_value, def.usage
+                    "  {spec:<spec_width$}  {help}",
+                    spec = opt.spec,
+                    help = opt.help
                 );
             }
+        }
+    }
+
+    fn collect_option_entries(&self) -> Vec<OptionEntry> {
+        let mut visited = FastSet::default();
+        let mut out = Vec::new();
+
+        let mut names = self.flags.keys().cloned().collect::<Vec<_>>();
+        names.sort();
+
+        if self.flags.contains_key("h") && self.flags.contains_key("help") {
+            visited.insert("h".to_string());
+            visited.insert("help".to_string());
+            if let Some(entry) = self.build_option_entry(&["h", "help"]) {
+                out.push(entry);
+            }
+        }
+
+        for name in names {
+            if visited.contains(&name) {
+                continue;
+            }
+            let mut aliases = vec![name.clone()];
+            if let Some(other) = self.alias_map.get(&name).cloned()
+                && other != name
+                && self.flags.contains_key(&other)
+            {
+                aliases.push(other);
+            }
+            for a in &aliases {
+                visited.insert(a.clone());
+            }
+            let refs = aliases.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+            if let Some(entry) = self.build_option_entry(&refs) {
+                out.push(entry);
+            }
+        }
+
+        out.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        out
+    }
+
+    fn build_option_entry(&self, names: &[&str]) -> Option<OptionEntry> {
+        let defs = names
+            .iter()
+            .filter_map(|n| self.flags.get(*n))
+            .collect::<Vec<_>>();
+        if defs.is_empty() {
+            return None;
+        }
+
+        let mut spec_names = names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        spec_names.sort_by(|a, b| {
+            let a_short = a.len() == 1;
+            let b_short = b.len() == 1;
+            a_short
+                .cmp(&b_short)
+                .reverse()
+                .then_with(|| a.len().cmp(&b.len()))
+                .then_with(|| a.cmp(b))
+        });
+        spec_names.dedup();
+
+        let primary = defs
+            .iter()
+            .find(|d| !d.usage.contains("alias for"))
+            .unwrap_or(&defs[0]);
+        let usage = primary.usage.trim();
+        let default_value = primary.default_value.trim();
+
+        let placeholder = match primary.ty {
+            FlagType::Bool => String::new(),
+            _ => format!(
+                "<{}>",
+                primary
+                    .name
+                    .to_uppercase()
+                    .replace('-', "_")
+                    .trim()
+                    .to_string()
+            ),
+        };
+
+        let mut formatted_names = spec_names
+            .iter()
+            .map(|n| self.format_flag_name(n))
+            .collect::<Vec<_>>();
+        let show_value = !matches!(primary.ty, FlagType::Bool);
+        if show_value {
+            if let Some(last) = formatted_names.last_mut() {
+                last.push(' ');
+                last.push_str(&placeholder);
+            }
+        }
+        let spec = formatted_names.join(", ");
+
+        let mut help = usage.to_string();
+        if self.should_show_default(primary) {
+            if !help.is_empty() {
+                help.push(' ');
+            }
+            help.push_str(&format!("[default: {}]", default_value));
+        }
+
+        let sort_key = spec_names
+            .iter()
+            .find(|n| n.len() == 1)
+            .cloned()
+            .or_else(|| spec_names.first().cloned())
+            .unwrap_or_default();
+
+        Some(OptionEntry {
+            spec,
+            help,
+            sort_key,
+        })
+    }
+
+    fn should_show_default(&self, def: &FlagDef) -> bool {
+        let dv = def.default_value.trim();
+        if dv.is_empty() {
+            return false;
+        }
+        match def.ty {
+            FlagType::Bool => dv != "false",
+            _ => true,
+        }
+    }
+
+    fn format_flag_name(&self, name: &str) -> String {
+        if name.len() == 1 {
+            format!("-{name}")
+        } else {
+            format!("--{name}")
         }
     }
 
@@ -421,6 +590,12 @@ impl Parser {
     pub fn parse_argv(&mut self, argv: &[String], bool_optionals: &[&str]) {
         parser_impl::parse_argv(self, argv, bool_optionals);
     }
+}
+
+struct OptionEntry {
+    spec: String,
+    help: String,
+    sort_key: String,
 }
 
 pub(crate) type EncodedArgs = (VecDeque<String>, Vec<String>, Vec<String>, Vec<String>);

@@ -57,4 +57,3 @@ mod tests {
         assert!(out.contains("def"));
     }
 }
-

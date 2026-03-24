@@ -272,10 +272,7 @@ where
     fn detach_node(&mut self, node: &Rc<RefCell<Node<K, V>>>) {
         let (prev, next) = {
             let n = node.borrow();
-            (
-                n.prev.as_ref().and_then(|w| w.upgrade()),
-                n.next.clone(),
-            )
+            (n.prev.as_ref().and_then(|w| w.upgrade()), n.next.clone())
         };
         let Some(prev) = prev else {
             return;

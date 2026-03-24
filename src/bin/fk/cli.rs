@@ -26,7 +26,11 @@ pub fn build_parser() -> terminalw::Parser {
     p.add_string("t", "", "what type of file to search");
     p.add_bool("v", false, "if print error");
     p.add_string("d", ".", "root directory for searching");
-    p.add_bool("re", false, r#"turn on regular expression (use "\" instead of "\\")"#);
+    p.add_bool(
+        "re",
+        false,
+        r#"turn on regular expression (use "\" instead of "\\")"#,
+    );
     p.add_bool("ignore", false, "ignore upper/lower case");
     p.add_bool("i", false, "ignore upper/lower case (shortcut for -ignore)");
     p.add_int(
@@ -34,9 +38,17 @@ pub fn build_parser() -> terminalw::Parser {
         i32::MAX,
         "number of directory levels to search. current directory's level is 0",
     );
-    p.add_bool("strict", false, "find exact the same matches (after triming space)");
+    p.add_bool(
+        "strict",
+        false,
+        "find exact the same matches (after triming space)",
+    );
     p.add_string("nt", "", "check files which are not some types");
-    p.add_bool("w", false, "only match the concrete word, is a shortcut for -re");
+    p.add_bool(
+        "w",
+        false,
+        "only match the concrete word, is a shortcut for -re",
+    );
     p.add_bool("all", false, "shortcut for -n=-1");
     p.add_bool("a", false, "shortcut for -all");
     p.add_string("f", "", "check only these files/directories");
@@ -136,8 +148,12 @@ mod tests {
     fn test_split_list() {
         assert_eq!(
             split_list("a,b  c,,d"),
-            vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ]
         );
     }
 }
-

@@ -35,11 +35,7 @@ pub fn build_parser() -> terminalw::Parser {
     p.add_bool("dir", false, "only search directories");
     p.add_bool("h", false, "print this help");
     p.add_bool("md5", false, "print md5 value");
-    p.add_bool(
-        "abs",
-        false,
-        "print absolute path. (ff.abs in ~/.configW)",
-    );
+    p.add_bool("abs", false, "print absolute path. (ff.abs in ~/.configW)");
     p.add_bool("rel", false, "print relative path.");
     p.add_bool("glob", false, "use glob to match");
     p.add_bool("g", false, "shortcut for -glob");
@@ -133,4 +129,3 @@ mod tests {
         assert_eq!(p.flag_value_or_default("d"), "SOME_ROOT_DIR");
     }
 }
-
