@@ -88,6 +88,14 @@ fn split_pdf_files(files: Vec<String>) -> (Vec<String>, Vec<String>) {
 fn build_pdf_text_prefix(pdfs: &[String]) -> String {
     let mut prefix = String::new();
     for path in pdfs {
+        let display_name = Path::new(path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(path);
+        prefix.push_str("File: ");
+        prefix.push_str(display_name);
+        prefix.push('\n');
+
         let parsed = parse_pdf(path, PdfParseOptions::default()).ok();
         let Some(parsed) = parsed else {
             continue;
@@ -100,6 +108,7 @@ fn build_pdf_text_prefix(pdfs: &[String]) -> String {
             continue;
         }
         prefix.push_str(text);
+        prefix.push('\n');
         prefix.push('\n');
     }
     prefix

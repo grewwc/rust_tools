@@ -137,7 +137,7 @@ fn run_loop(
             return Ok(());
         }
 
-        let Some(ctx) = next_question(app)? else {
+        let Some(ctx) = input::next_question(app)? else {
             return Ok(());
         };
         if ctx.question.trim().is_empty() {
