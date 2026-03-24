@@ -1,12 +1,8 @@
-use std::{
-    fs,
-    io::{self, Write},
-    path::PathBuf,
-};
+use std::fs;
 
 use base64::Engine as _;
 use colored::Colorize;
-use reqwest::blocking::{Client, Response, multipart};
+use reqwest::blocking::Response;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -17,8 +13,6 @@ use super::{
     models,
     types::App,
 };
-
-const FILES_ENDPOINT: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1/files";
 
 #[derive(Debug, Serialize)]
 struct RequestBody {
@@ -86,12 +80,6 @@ where
     Ok(value.unwrap_or_default())
 }
 
-#[derive(Debug, Deserialize)]
-struct UploadResponse {
-    #[serde(default)]
-    id: String,
-}
-
 pub(super) fn do_request(
     app: &mut App,
     model: &str,
@@ -114,33 +102,7 @@ pub(super) fn do_request(
         tool_choice,
     };
 
-    let should_use_long_upload = (!app.attached_binary_files.is_empty()
-        || !app.uploaded_file_ids.is_empty())
-        && !models::is_vl_model(model);
-
-    if should_use_long_upload {
-        request_body.model = models::qwen_long().to_string();
-
-        let mut files_to_upload = app.attached_binary_files.clone();
-        if !app.attached_image_files.is_empty() {
-            files_to_upload.extend(app.attached_image_files.iter().cloned());
-        }
-
-        if !files_to_upload.is_empty() {
-            app.uploaded_file_ids =
-                upload_qwen_long_files(&app.client, &app.config.api_key, &files_to_upload)?;
-            app.attached_binary_files.clear();
-            app.attached_image_files.clear();
-        }
-
-        let file_ids = app.uploaded_file_ids.join(",");
-        request_body.messages.push(Message {
-            role: "system".to_string(),
-            content: Value::String(format!("fileid://{file_ids}")),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-    } else if !models::is_vl_model(model) {
+    if !models::is_vl_model(model) {
         request_body
             .messages
             .extend(build_message_arr(history_count, &app.config.history_file)?);
@@ -259,69 +221,4 @@ pub(super) fn print_info(model: &str) {
     };
     // 使用println!避免手动flush的权限问题
     println!("[{} (search: {})]", model.green(), search.red());
-}
-
-fn upload_qwen_long_files(
-    client: &Client,
-    api_key: &str,
-    files: &[String],
-) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    let mut ids = Vec::with_capacity(files.len());
-    for file in files {
-        ids.push(upload_single_qwen_long_file_with_retry(
-            client, api_key, file, 5,
-        )?);
-    }
-    Ok(ids)
-}
-
-fn upload_single_qwen_long_file_with_retry(
-    client: &Client,
-    api_key: &str,
-    filename: &str,
-    retry: usize,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let mut last_err: Option<Box<dyn std::error::Error>> = None;
-    for _ in 0..retry {
-        match upload_single_qwen_long_file(client, api_key, filename) {
-            Ok(id) if !id.is_empty() => return Ok(id),
-            Ok(_) => last_err = Some("empty file id".into()),
-            Err(err) => last_err = Some(err),
-        }
-    }
-    Err(last_err.unwrap_or_else(|| "upload failed".into()))
-}
-
-fn upload_single_qwen_long_file(
-    client: &Client,
-    api_key: &str,
-    filename: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let path = PathBuf::from(filename);
-    let display_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(filename);
-    println!("Uploading file: {display_name}");
-
-    let bytes = fs::read(filename)?;
-    let part = multipart::Part::bytes(bytes).file_name(display_name.to_string());
-    let form = multipart::Form::new()
-        .part("file", part)
-        .text("purpose", "file-extract");
-
-    let response = client
-        .post(FILES_ENDPOINT)
-        .bearer_auth(api_key)
-        .multipart(form)
-        .send()?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(format!("upload failed: {status} {body}").into());
-    }
-    let body: UploadResponse = response.json()?;
-    println!("Finished upload. Fileid: {}", body.id);
-    Ok(body.id)
 }

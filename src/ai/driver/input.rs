@@ -1,14 +1,16 @@
 use std::error::Error;
 use std::io::{self, BufRead, Write};
+use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use super::params::parse_loop_overrides;
-use crate::ai::types::{App, LoopOverrides, QuestionContext};
+use crate::ai::types::{App, QuestionContext};
 
 use crate::ai::{files, prompt::trim_trailing_newline};
 use crate::clipboard::string_content;
+use crate::pdfw::{PdfParseOptions, parse_pdf};
 
-pub fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn Error>> {
+pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn Error>> {
     if !app.cli.args.is_empty() {
         let base_question = if app.cli.raw {
             app.raw_args.clone()
@@ -45,11 +47,87 @@ pub fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn E
     Ok(Some(ctx))
 }
 
-pub fn base_history_count(history: usize, no_history: bool) -> usize {
+fn base_history_count(history: usize, no_history: bool) -> usize {
     if no_history { 0 } else { history }
 }
 
-pub fn finalize_question(
+fn apply_text_files_prefix(
+    question: &mut String,
+    text_files: &[String],
+) -> Result<(), Box<dyn Error>> {
+    if text_files.is_empty() {
+        return Ok(());
+    }
+    let prefix = files::text_file_contents(text_files)?;
+    if !prefix.is_empty() {
+        *question = format!("{prefix}\n{question}");
+    }
+    Ok(())
+}
+
+fn is_pdf_path(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+}
+
+fn split_pdf_files(files: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut pdfs = Vec::new();
+    let mut unsupported = Vec::new();
+    for file in files {
+        if is_pdf_path(&file) {
+            pdfs.push(file);
+        } else {
+            unsupported.push(file);
+        }
+    }
+    (pdfs, unsupported)
+}
+
+fn build_pdf_text_prefix(pdfs: &[String]) -> String {
+    let mut prefix = String::new();
+    for path in pdfs {
+        let parsed = parse_pdf(path, PdfParseOptions::default()).ok();
+        let Some(parsed) = parsed else {
+            continue;
+        };
+        let Some(text) = parsed.text else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        prefix.push_str(text);
+        prefix.push('\n');
+    }
+    prefix
+}
+
+fn handle_binary_files(
+    question: &mut String,
+    binary_files: Vec<String>,
+) -> Result<(), Box<dyn Error>> {
+    if binary_files.is_empty() {
+        return Ok(());
+    }
+
+    let (pdfs, unsupported) = split_pdf_files(binary_files);
+    if !pdfs.is_empty() {
+        let prefix = build_pdf_text_prefix(&pdfs);
+        if !prefix.trim().is_empty() {
+            *question = format!("{prefix}\n{question}");
+        }
+    }
+
+    if !unsupported.is_empty() {
+        return Err(format!("unsupported binary files: {}", unsupported.join(", ")).into());
+    }
+    Ok(())
+}
+
+fn finalize_question(
     app: &mut App,
     mut question: String,
     history_count: usize,
@@ -57,18 +135,11 @@ pub fn finalize_question(
 ) -> Result<QuestionContext, Box<dyn Error>> {
     if let Some(files) = app.pending_files.take() {
         let parsed = files::parse_files(&files);
-        if !parsed.text_files.is_empty() {
-            let prefix = files::text_file_contents(&parsed.text_files)?;
-            if !prefix.is_empty() {
-                question = format!("{prefix}\n{question}");
-            }
-        }
+        apply_text_files_prefix(&mut question, &parsed.text_files)?;
         if !parsed.image_files.is_empty() {
             app.attached_image_files = parsed.image_files;
         }
-        if !parsed.binary_files.is_empty() {
-            app.attached_binary_files = parsed.binary_files;
-        }
+        handle_binary_files(&mut question, parsed.binary_files)?;
     }
 
     if app.pending_clipboard {
@@ -91,7 +162,7 @@ pub fn finalize_question(
     })
 }
 
-pub fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
+fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
     if let Some(editor) = app.prompt_editor.as_mut() {
         if app.cli.multi_line {
             return editor.read_multi_line();

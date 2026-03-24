@@ -87,8 +87,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         config,
         client,
         attached_image_files: Vec::new(),
-        attached_binary_files: Vec::new(),
-        uploaded_file_ids: Vec::new(),
         shutdown,
         streaming,
         cancel_stream,

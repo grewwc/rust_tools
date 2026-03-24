@@ -31,8 +31,6 @@ pub(super) struct App {
     pub(super) pending_clipboard: bool,
     pub(super) pending_short_output: bool,
     pub(super) attached_image_files: Vec<String>,
-    pub(super) attached_binary_files: Vec<String>,
-    pub(super) uploaded_file_ids: Vec<String>,
     pub(super) shutdown: Arc<AtomicBool>,
     pub(super) streaming: Arc<AtomicBool>,
     pub(super) cancel_stream: Arc<AtomicBool>,
@@ -130,7 +128,7 @@ pub(super) struct McpResource {
     pub(super) name: String,
     #[serde(default)]
     pub(super) description: Option<String>,
-    #[serde(default, rename="mimeType")]
+    #[serde(default, rename = "mimeType")]
     pub(super) mime_type: Option<String>,
 }
 

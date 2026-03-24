@@ -6,7 +6,6 @@ const QWEN_MAX_LATEST: &str = "qwen-max-latest";
 const QWEN_PLUS_LATEST: &str = "qwen3.5-plus";
 const QWEN_MAX: &str = "qwen-max";
 const QWEN_CODER_PLUS_LATEST: &str = "qwen3-coder-plus";
-const QWEN_LONG: &str = "qwen-long";
 const QWQ: &str = "qwq-plus-latest";
 const QWEN_FLASH: &str = "qwen-flash";
 const QWEN3_MAX: &str = "qwen3-max";
@@ -25,7 +24,6 @@ pub(super) enum Model {
     QwenPlusLatest(bool),
     QwenMax(bool),
     QwenCoderPlusLatest(bool),
-    QwenLong(bool),
     Qwq(bool),
     QwenFlash(bool),
     Qwen3Max(bool),
@@ -42,7 +40,6 @@ impl Model {
         Model::QwenPlusLatest(TOOLS_ON),
         Model::QwenMax(TOOLS_ON),
         Model::QwenCoderPlusLatest(TOOLS_ON),
-        Model::QwenLong(TOOLS_ON),
         Model::Qwq(TOOLS_ON),
         Model::QwenFlash(TOOLS_OFF),
         Model::Qwen3Max(TOOLS_ON),
@@ -65,7 +62,6 @@ impl Model {
             Model::QwenPlusLatest(_) => QWEN_PLUS_LATEST,
             Model::QwenMax(_) => QWEN_MAX,
             Model::QwenCoderPlusLatest(_) => QWEN_CODER_PLUS_LATEST,
-            Model::QwenLong(_) => QWEN_LONG,
             Model::Qwq(_) => QWQ,
             Model::QwenFlash(_) => QWEN_FLASH,
             Model::Qwen3Max(_) => QWEN3_MAX,
@@ -102,7 +98,6 @@ impl Model {
             | Model::QwenPlusLatest(v)
             | Model::QwenMax(v)
             | Model::QwenCoderPlusLatest(v)
-            | Model::QwenLong(v)
             | Model::Qwq(v)
             | Model::QwenFlash(v)
             | Model::Qwen3Max(v)
@@ -111,10 +106,6 @@ impl Model {
             | Model::QwenVlOcr(v) => v,
         }
     }
-}
-
-pub(super) fn qwen_long() -> &'static str {
-    QWEN_LONG
 }
 
 pub(super) fn qwen3_max() -> &'static str {

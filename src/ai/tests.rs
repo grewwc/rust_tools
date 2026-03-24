@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, atomic::AtomicBool};
 
 use serde_json::Value;
 
@@ -43,23 +43,54 @@ fn trailing_selector_is_detected() {
 }
 
 #[test]
+fn resolve_model_is_unicode_safe() {
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    let cli = super::cli::Cli::parse_from(["a"]);
+    let config = super::types::AppConfig {
+        api_key: String::new(),
+        history_file: PathBuf::new(),
+        endpoint: String::new(),
+        vl_default_model: models::qwen_vl_flash().to_string(),
+    };
+    let client = reqwest::blocking::Client::builder().build().unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let streaming = Arc::new(AtomicBool::new(false));
+    let cancel_stream = Arc::new(AtomicBool::new(false));
+    let app = super::types::App {
+        cli,
+        config,
+        client,
+        current_model: models::qwen3_max().to_string(),
+        pending_files: None,
+        pending_clipboard: false,
+        pending_short_output: false,
+        attached_image_files: Vec::new(),
+        shutdown,
+        streaming,
+        cancel_stream,
+        raw_args: String::new(),
+        writer: None,
+        prompt_editor: None,
+        agent_context: None,
+    };
+
+    let mut question = "a 什么是rust的一个crate？".to_string();
+    let model = super::driver::resolve_model_for_input(&app, &mut question);
+    assert_eq!(model, app.current_model);
+    assert_eq!(question, "a 什么是rust的一个crate？");
+}
+
+#[test]
 fn image_files_auto_route_to_vl() {
-    let model =
-        super::driver::attachment_forced_model("qwen-flash", true, false, models::qwen_vl_flash());
+    let model = super::driver::attachment_forced_model("qwen-flash", true, models::qwen_vl_flash());
     assert_eq!(model, Some(models::qwen_vl_flash().to_string()));
 }
 
 #[test]
-fn binary_files_auto_route_to_long() {
-    let model =
-        super::driver::attachment_forced_model("qwen-flash", true, true, models::qwen_vl_flash());
-    assert_eq!(model, Some(models::qwen_long().to_string()));
-}
-
-#[test]
 fn configured_vl_model_is_used_for_images() {
-    let model =
-        super::driver::attachment_forced_model("qwen-flash", true, false, models::qwen_vl_max());
+    let model = super::driver::attachment_forced_model("qwen-flash", true, models::qwen_vl_max());
     assert_eq!(model, Some(models::qwen_vl_max().to_string()));
 }
 
