@@ -15,7 +15,6 @@ pub struct McpInitReport {
 }
 
 pub fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitReport {
-    init_builtin_example_mcp(app, mcp_client);
 
     let cfg = crate::common::configw::get_all_config();
     let mcp_path = if !app.cli.mcp_config.trim().is_empty() {
@@ -70,22 +69,6 @@ pub fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitReport {
     report
 }
 
-pub fn init_builtin_example_mcp(app: &mut App, mcp_client: &mut McpClient) {
-    let cfg = crate::common::configw::get_all_config();
-    let disabled = cfg
-        .get_opt("ai.mcp.example.disabled")
-        .unwrap_or_default()
-        .trim()
-        .eq_ignore_ascii_case("true");
-    if disabled {
-        return;
-    }
-
-    let _ = mcp_client.connect_inprocess_example_server("example");
-    if let Some(ctx) = app.agent_context.as_mut() {
-        ctx.tools.extend(mcp_client.get_all_tools());
-    }
-}
 
 pub fn drain_response(response: &mut Response) -> Result<(), Box<dyn Error>> {
     response.copy_to(&mut io::sink())?;

@@ -16,7 +16,6 @@ use crate::{
         config,
         history::{COLON, Message, NEWLINE, append_history, build_message_arr},
         mcp::McpClient,
-        mcp_example_server,
         models,
         prompt::PromptEditor,
         request,
@@ -45,13 +44,7 @@ pub use model::*;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse_from(normalize_single_dash_long_opts(std::env::args()));
-
-    if cli.example_mcp_server {
-        return mcp_example_server::run_example_mcp_server();
-    }
-
     let config = config::load_config()?;
-
     if cli.clear {
         config::clear_history_file(&config.history_file);
         println!("History cleared.");

@@ -4,7 +4,6 @@ mod driver;
 mod files;
 mod history;
 mod mcp;
-mod mcp_example_server;
 mod models;
 mod prompt;
 mod request;

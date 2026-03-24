@@ -276,34 +276,6 @@ impl McpClient {
         Ok(())
     }
 
-    pub(super) fn connect_inprocess_example_server(&mut self, name: &str) -> Result<(), String> {
-        let (c2s_read, c2s_write) = create_pipe_pair()?;
-        let (s2c_read, s2c_write) = create_pipe_pair()?;
-
-        let join = spawn(move || {
-            let reader = BufReader::new(c2s_read);
-            let _ = super::mcp_example_server::serve(reader, s2c_write);
-        });
-
-        let mut conn = McpServerConnection {
-            transport: McpTransport::InProcess {
-                stdin: c2s_write,
-                stdout: BufReader::new(s2c_read),
-                join: Some(join),
-            },
-            request_timeout_ms: 3000,
-            tools: Vec::new(),
-            resources: Vec::new(),
-            prompts: Vec::new(),
-        };
-
-        self.initialize_server(&mut conn)?;
-        conn.tools = self.list_tools(&mut conn)?;
-
-        self.servers.insert(name.to_string(), conn);
-        Ok(())
-    }
-
     fn next_request_id(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
