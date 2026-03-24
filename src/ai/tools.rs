@@ -1,5 +1,11 @@
-use std::{fs, path::PathBuf, process::Command};
+use std::{
+    collections::VecDeque,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
+use mongodb::bson::document::Entry;
 use regex::Regex;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -18,10 +24,13 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
         "Write content to a file on the local filesystem",
     ),
     (
+        "search_files",
+        "Search for files by exact file name or glob pattern",
+    ),
+    (
         "list_directory",
         "List files and directories in a given path",
     ),
-    ("search_files", "Search for files matching a pattern"),
     ("execute_command", "Execute a shell command"),
     ("grep_search", "Search for patterns in file contents"),
     ("web_search", "Search the web for information"),
@@ -91,11 +100,11 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "The glob pattern to match files"
+                    "description": "Exact file name (preffered) or glob pattern to match. Examples: \"Cargo.toml\", \"*.rs\", \"**/*.md\""
                 },
                 "path": {
                     "type": "string",
-                    "description": "The directory to search in"
+                    "description": "The directory to search in (default: \".\")"
                 }
             },
             "required": ["pattern"]
@@ -257,15 +266,73 @@ fn execute_search_files(args: &Value) -> Result<String, String> {
     let pattern = args["pattern"].as_str().ok_or("Missing pattern")?;
     let path = args["path"].as_str().unwrap_or(".");
 
-    let output = Command::new("find")
-        .arg(path)
-        .arg("-name")
-        .arg(pattern)
-        .output()
-        .map_err(|e| format!("Failed to execute find: {}", e))?;
+    let is_exact_name = !pattern.contains('/')
+        && !pattern.contains('\\')
+        && !pattern.contains('*')
+        && !pattern.contains('?')
+        && !pattern.contains('[')
+        && !pattern.contains(']')
+        && !pattern.contains('{')
+        && !pattern.contains('}');
 
-    let result = String::from_utf8_lossy(&output.stdout).to_string();
-    Ok(result.trim().to_string())
+    if is_exact_name {
+        if let Some(found) = find_first_file_by_name(Path::new(path), pattern) {
+            return Ok(found.to_string_lossy().trim().to_string());
+        }
+        return Ok(String::new());
+    }
+
+    let matches =
+        crate::terminalw::glob_paths(pattern, path).map_err(|e| format!("glob failed: {e}"))?;
+    Ok(matches.join("\n").trim().to_string())
+}
+
+fn find_first_file_by_name(root: &Path, filename: &str) -> Option<PathBuf> {
+    if filename.trim().is_empty() {
+        return None;
+    }
+
+    if root.is_file() {
+        let name = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        return (name == filename).then_some(root.to_path_buf());
+    }
+
+    if !root.is_dir() {
+        return None;
+    }
+
+    let mut queue = VecDeque::new();
+    queue.push_back(root.to_path_buf());
+
+    let mut scanned_dirs = 0usize;
+    let max_dirs = 50_000usize;
+
+    while let Some(dir) = queue.pop_front() {
+        scanned_dirs += 1;
+        if scanned_dirs > max_dirs {
+            return None;
+        }
+
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            let file_name = file_name.as_ref();
+            if file_name == filename {
+                return Some(entry.path());
+            }
+
+            let ft = entry.file_type().ok()?;
+            if ft.is_dir() && !ft.is_symlink() {
+                queue.push_back(entry.path());
+            }
+        }
+    }
+
+    None
 }
 
 pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
@@ -700,6 +767,14 @@ pub(super) fn tool_definitions_to_value(tools: &[ToolDefinition]) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test1() {
+        let dir = "/Users/bytedance";
+        let ret = execute_search_files(&json!(
+            {"pattern": "大模型市场趋势分析.pdf", "path": dir}
+        ));
+    }
 
     #[test]
     fn parse_duckduckgo_html_extracts_title_url_snippet() {
