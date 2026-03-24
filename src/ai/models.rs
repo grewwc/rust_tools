@@ -14,7 +14,7 @@ const QWEN_VL_FLASH: &str = "qwen3-vl-flash";
 const QWEN_VL_MAX: &str = "qwen3-vl-plus";
 const QWEN_VL_OCR: &str = "qwen-vl-ocr-latest";
 
-const TOOLS_ON: bool = true;
+const TOOLS_ON: bool = false;
 const TOOLS_OFF: bool = false;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
