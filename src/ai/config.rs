@@ -20,7 +20,7 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     }
     let history_file = cfg
         .get_opt("history_file")
-        .unwrap_or_else(|| "~/.history_file.txt".to_string());
+        .unwrap_or_else(|| "~/.history_file.sqlite".to_string());
     let endpoint = cfg
         .get_opt("ai.model.endpoint")
         .unwrap_or_else(|| QWEN_ENDPOINT.to_string());

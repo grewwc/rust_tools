@@ -14,7 +14,10 @@ use uuid::Uuid;
 use crate::ai::{
     cli::{Cli, normalize_single_dash_long_opts},
     config,
-    history::{COLON, Message, NEWLINE, SessionStore, append_history, build_message_arr},
+    history::{
+        COLON, Message, NEWLINE, SessionStore, append_history, build_message_arr,
+        delete_history_artifacts,
+    },
     mcp::McpClient,
     models,
     prompt::PromptEditor,
@@ -148,13 +151,22 @@ fn run_loop(
     mcp_client: &mut McpClient,
     skill_manifests: &[SkillManifest],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut should_quit = !app.cli.args.is_empty();
+    let one_shot_mode = !app.cli.args.is_empty();
+    let mut should_quit = one_shot_mode;
+
+    let cleanup_one_shot = |app: &App| {
+        if one_shot_mode {
+            let _ = delete_history_artifacts(&app.session_history_file);
+        }
+    };
     loop {
         if app.shutdown.load(Ordering::Acquire) {
+            cleanup_one_shot(app);
             return Ok(());
         }
 
         let Some(ctx) = input::next_question(app)? else {
+            cleanup_one_shot(app);
             return Ok(());
         };
         if ctx.question.trim().is_empty() {
@@ -165,6 +177,7 @@ fn run_loop(
         let mut question = ctx.question;
         if try_handle_help_command(&question) {
             if should_quit {
+                cleanup_one_shot(app);
                 return Ok(());
             }
             should_quit = false;
@@ -172,6 +185,7 @@ fn run_loop(
         }
         if try_handle_session_command(app, &question)? {
             if should_quit {
+                cleanup_one_shot(app);
                 return Ok(());
             }
             should_quit = false;
@@ -230,6 +244,7 @@ fn run_loop(
                     Ok(response) => response,
                     Err(err) => {
                         app.streaming.store(false, Ordering::Release);
+                        cleanup_one_shot(app);
                         return Err(err);
                     }
                 };
@@ -237,6 +252,7 @@ fn run_loop(
                 app.streaming.store(false, Ordering::Release);
                 println!("\nInterrupted.");
                 if should_quit {
+                    cleanup_one_shot(app);
                     return Ok(());
                 }
                 break;
@@ -247,6 +263,7 @@ fn run_loop(
                     Ok(result) => result,
                     Err(err) => {
                         app.streaming.store(false, Ordering::Release);
+                        cleanup_one_shot(app);
                         return Err(err);
                     }
                 };
@@ -255,12 +272,14 @@ fn run_loop(
             if stream_result.outcome == StreamOutcome::Cancelled {
                 println!("\nInterrupted.");
                 if should_quit {
+                    cleanup_one_shot(app);
                     return Ok(());
                 }
                 break;
             }
             if app.shutdown.load(Ordering::Acquire) {
                 println!();
+                cleanup_one_shot(app);
                 return Ok(());
             }
             drain_response(&mut response)?;
@@ -337,17 +356,20 @@ fn run_loop(
         }
 
         if !final_assistant_text.is_empty() {
-            let history_line = format!(
-                "user{COLON}{question}{NEWLINE}assistant{COLON}{final_assistant_text}{NEWLINE}"
-            );
-            // 忽略历史保存错误，避免因为权限问题导致程序异常退出
-            if let Err(e) = append_history(&app.session_history_file, &history_line) {
-                eprintln!("[Warning] Failed to save history: {}", e);
+            if !one_shot_mode {
+                let history_line = format!(
+                    "user{COLON}{question}{NEWLINE}assistant{COLON}{final_assistant_text}{NEWLINE}"
+                );
+                // 忽略历史保存错误，避免因为权限问题导致程序异常退出
+                if let Err(e) = append_history(&app.session_history_file, &history_line) {
+                    eprintln!("[Warning] Failed to save history: {}", e);
+                }
             }
             println!();
         }
 
         if should_quit {
+            cleanup_one_shot(app);
             return Ok(());
         }
         if let Some(writer) = app.writer.as_mut() {
@@ -380,6 +402,7 @@ fn try_handle_help_command(input: &str) -> bool {
     println!("  /sessions new");
     println!("  /sessions use <id>");
     println!("  /sessions delete <id>");
+    println!("  /sessions clear-all");
     true
 }
 
@@ -418,6 +441,7 @@ fn try_handle_session_command(
             println!("  /sessions new");
             println!("  /sessions use <id>");
             println!("  /sessions delete <id>");
+            println!("  /sessions clear-all");
         }
         "list" | "ls" => {
             let sessions = store.list_sessions()?;
@@ -474,6 +498,21 @@ fn try_handle_session_command(
             } else {
                 println!("Session not found: {}", id);
             }
+        }
+        "clear-all" | "clear_all" | "clear" | "wipe" => {
+            let confirm = crate::common::prompt::prompt_yes_or_no_interruptible(
+                "Delete ALL sessions? (y/n): ",
+            );
+            if confirm != Some(true) {
+                println!("canceled by user.");
+                return Ok(true);
+            }
+
+            let deleted = store.clear_all_sessions()?;
+            let new_id = Uuid::new_v4().to_string();
+            app.session_id = new_id.clone();
+            app.session_history_file = store.session_history_file(&new_id);
+            println!("Deleted {deleted} session(s). Switched to new session: {new_id}");
         }
         _ => {
             println!("unknown action: {}. try: /sessions help", action);

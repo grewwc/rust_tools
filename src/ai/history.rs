@@ -6,6 +6,7 @@ use std::{
 };
 
 use chrono::{DateTime, Local};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -31,6 +32,9 @@ pub(super) fn build_message_arr(
     history_count: usize,
     history_file: &PathBuf,
 ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+    if is_sqlite_path(history_file) {
+        return build_message_arr_sqlite(history_count, history_file);
+    }
     let history = match fs::read_to_string(history_file) {
         Ok(history) => history,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -77,6 +81,9 @@ pub(super) fn build_message_arr(
 }
 
 pub(super) fn append_history(path: &PathBuf, content: &str) -> io::Result<()> {
+    if is_sqlite_path(path) {
+        return append_history_sqlite(path, content);
+    }
     let mut options = OpenOptions::new();
     options.create(true).append(true).write(true);
     #[cfg(unix)]
@@ -87,6 +94,145 @@ pub(super) fn append_history(path: &PathBuf, content: &str) -> io::Result<()> {
     let mut file = options.open(path)?;
     use std::io::Write;
     file.write_all(content.as_bytes())
+}
+
+pub(super) fn delete_history_artifacts(path: &PathBuf) -> io::Result<()> {
+    fn remove_one(path: &Path) -> io::Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
+    remove_one(path.as_path())?;
+
+    let base = path.to_string_lossy().to_string();
+    remove_one(Path::new(&format!("{base}-wal")))?;
+    remove_one(Path::new(&format!("{base}-shm")))?;
+    remove_one(Path::new(&format!("{base}-journal")))?;
+    Ok(())
+}
+
+fn is_sqlite_path(path: &PathBuf) -> bool {
+    matches!(
+        path.extension().and_then(|s| s.to_str()),
+        Some("sqlite") | Some("db")
+    )
+}
+
+fn parse_history_blob(content: &str) -> Vec<(String, String)> {
+    let newline = NEWLINE.to_string();
+    let lines = split_by_str_keep_quotes(content, &newline, "\"", false);
+    let mut out = Vec::new();
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let Some(last_colon) = line.rfind(COLON) else {
+            continue;
+        };
+        if last_colon == 0 || last_colon + COLON.len_utf8() >= line.len() {
+            continue;
+        }
+        let role = &line[..last_colon];
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        let msg = &line[last_colon + COLON.len_utf8()..];
+        out.push((role.to_string(), msg.to_string()));
+    }
+    out
+}
+
+fn open_history_db(path: &Path) -> Result<Connection, io::Error> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    Connection::open(path).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+}
+
+fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);",
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    Ok(())
+}
+
+fn append_history_sqlite(path: &PathBuf, content: &str) -> io::Result<()> {
+    let mut conn = open_history_db(path.as_path())?;
+    init_history_schema(&conn)?;
+    let entries = parse_history_blob(content);
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let tx = conn
+        .transaction()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    {
+        let mut stmt = tx
+            .prepare("INSERT INTO messages (role, content) VALUES (?1, ?2)")
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        for (role, msg) in entries {
+            stmt.execute(params![role, msg])
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        }
+    }
+    tx.execute(
+        "DELETE FROM messages
+         WHERE id NOT IN (SELECT id FROM messages ORDER BY id DESC LIMIT ?1)",
+        params![MAX_HISTORY_LINES as i64],
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    tx.commit()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+}
+
+fn build_message_arr_sqlite(
+    history_count: usize,
+    history_file: &PathBuf,
+) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+    let conn = match open_history_db(history_file.as_path()) {
+        Ok(c) => c,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    init_history_schema(&conn)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT role, content
+         FROM messages
+         ORDER BY id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![MAX_HISTORY_LINES as i64], |row| {
+        let role: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        Ok((role, content))
+    })?;
+    let mut messages: Vec<Message> = Vec::new();
+    for row in rows {
+        let (role, content) = row?;
+        messages.push(Message {
+            role,
+            content: Value::String(content),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    messages.reverse();
+
+    if history_count >= messages.len() {
+        return Ok(messages);
+    }
+    Ok(messages[messages.len() - history_count..].to_vec())
 }
 
 #[derive(Debug, Clone)]
@@ -118,7 +264,7 @@ impl SessionStore {
 
     pub(super) fn session_history_file(&self, session_id: &str) -> PathBuf {
         let id = sanitize_session_id(session_id);
-        self.root.join(format!("{id}.txt"))
+        self.root.join(format!("{id}.sqlite"))
     }
 
     pub(super) fn list_sessions(&self) -> io::Result<Vec<SessionInfo>> {
@@ -131,7 +277,7 @@ impl SessionStore {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("txt") {
+            if path.extension().and_then(|s| s.to_str()) != Some("sqlite") {
                 continue;
             }
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
@@ -158,23 +304,38 @@ impl SessionStore {
 
     pub(super) fn delete_session(&self, session_id: &str) -> io::Result<bool> {
         let path = self.session_history_file(session_id);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(err),
-        }
+        let existed = path.exists();
+        delete_history_artifacts(&path)?;
+        Ok(existed)
     }
 
     pub(super) fn clear_session(&self, session_id: &str) -> io::Result<()> {
         let path = self.session_history_file(session_id);
-        let _ = fs::remove_file(path);
+        let _ = delete_history_artifacts(&path);
         Ok(())
     }
 
+    pub(super) fn clear_all_sessions(&self) -> io::Result<usize> {
+        let sessions = self.list_sessions()?;
+        let mut deleted = 0usize;
+        for s in sessions {
+            if self.delete_session(&s.id).is_ok() {
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
     pub(super) fn migrate_legacy_if_needed(&self, legacy_history_file: &PathBuf) -> io::Result<()> {
+        self.ensure_root_dir()?;
+        self.migrate_txt_sessions_to_sqlite()?;
+
         let legacy_session_id = "legacy";
         let legacy_session_path = self.session_history_file(legacy_session_id);
         if legacy_session_path.exists() {
+            return Ok(());
+        }
+        if is_sqlite_path(legacy_history_file) {
             return Ok(());
         }
         let history = match fs::read_to_string(legacy_history_file) {
@@ -185,8 +346,39 @@ impl SessionStore {
         if history.trim().is_empty() {
             return Ok(());
         }
-        self.ensure_root_dir()?;
-        fs::write(legacy_session_path, history)
+        append_history_sqlite(&legacy_session_path, &history)?;
+        Ok(())
+    }
+
+    fn migrate_txt_sessions_to_sqlite(&self) -> io::Result<()> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(v) => v,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("txt") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let sqlite_path = self.root.join(format!("{stem}.sqlite"));
+            if sqlite_path.exists() {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            let history = match fs::read_to_string(&path) {
+                Ok(v) => v,
+                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            append_history_sqlite(&sqlite_path, &history)?;
+            let _ = fs::remove_file(&path);
+        }
+        Ok(())
     }
 }
 

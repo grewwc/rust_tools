@@ -1,10 +1,11 @@
+use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
 
 use serde_json::Value;
 
 use super::{
     files,
-    history::{COLON, NEWLINE, build_message_arr},
+    history::{COLON, NEWLINE, SessionStore, append_history, build_message_arr},
     models,
     prompt::MultilineHistoryState,
     request::{StreamChoice, StreamChunk, StreamDelta},
@@ -128,7 +129,7 @@ fn image_mime_type_matches_suffix() {
 }
 
 #[test]
-fn history_file_parsing_matches_go_format() {
+fn history_file_parsing_txt_matches_go_format() {
     let path = std::env::temp_dir().join(format!("ai-history-{}.txt", uuid::Uuid::new_v4()));
     std::fs::write(
         &path,
@@ -144,6 +145,78 @@ fn history_file_parsing_matches_go_format() {
     assert_eq!(messages[1].content, Value::String("hello".to_string()));
 
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn history_file_parsing_sqlite_matches_go_format() {
+    let path = std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
+    append_history(
+        &path,
+        &format!("user{COLON}hi{NEWLINE}assistant{COLON}hello{NEWLINE}"),
+    )
+    .unwrap();
+
+    let messages = build_message_arr(4, &path).unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].content, Value::String("hi".to_string()));
+    assert_eq!(messages[1].role, "assistant");
+    assert_eq!(messages[1].content, Value::String("hello".to_string()));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn session_delete_removes_sqlite_sidecars() {
+    let history_file =
+        std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
+    let store = SessionStore::new(&history_file);
+    store.ensure_root_dir().unwrap();
+
+    let db = store.session_history_file("abc");
+    std::fs::write(&db, b"test").unwrap();
+    std::fs::write(PathBuf::from(format!("{}-wal", db.display())), b"test").unwrap();
+    std::fs::write(PathBuf::from(format!("{}-shm", db.display())), b"test").unwrap();
+    std::fs::write(PathBuf::from(format!("{}-journal", db.display())), b"test").unwrap();
+
+    assert!(db.exists());
+    assert!(PathBuf::from(format!("{}-wal", db.display())).exists());
+    assert!(PathBuf::from(format!("{}-shm", db.display())).exists());
+    assert!(PathBuf::from(format!("{}-journal", db.display())).exists());
+
+    assert!(store.delete_session("abc").unwrap());
+
+    assert!(!db.exists());
+    assert!(!PathBuf::from(format!("{}-wal", db.display())).exists());
+    assert!(!PathBuf::from(format!("{}-shm", db.display())).exists());
+    assert!(!PathBuf::from(format!("{}-journal", db.display())).exists());
+}
+
+#[test]
+fn session_clear_all_removes_all_sqlite_sidecars() {
+    let history_file =
+        std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
+    let store = SessionStore::new(&history_file);
+    store.ensure_root_dir().unwrap();
+
+    for id in ["a", "b", "c"] {
+        let db = store.session_history_file(id);
+        std::fs::write(&db, b"test").unwrap();
+        std::fs::write(PathBuf::from(format!("{}-wal", db.display())), b"test").unwrap();
+        std::fs::write(PathBuf::from(format!("{}-shm", db.display())), b"test").unwrap();
+        std::fs::write(PathBuf::from(format!("{}-journal", db.display())), b"test").unwrap();
+    }
+
+    let deleted = store.clear_all_sessions().unwrap();
+    assert_eq!(deleted, 3);
+
+    for id in ["a", "b", "c"] {
+        let db = store.session_history_file(id);
+        assert!(!db.exists());
+        assert!(!PathBuf::from(format!("{}-wal", db.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", db.display())).exists());
+        assert!(!PathBuf::from(format!("{}-journal", db.display())).exists());
+    }
 }
 
 #[test]

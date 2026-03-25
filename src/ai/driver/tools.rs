@@ -35,7 +35,7 @@ mod dispatch {
             tools as builtin_tools,
             types::{ToolCall, ToolResult},
         },
-        common::prompt::prompt_yes_or_no,
+        common::prompt::prompt_yes_or_no_interruptible,
     };
 
     use super::args;
@@ -61,12 +61,20 @@ mod dispatch {
                 }
             };
 
-            if !prompt_yes_or_no(&format!("Execute command:{} (y/n): ", args.to_string())) {
+            let confirm = prompt_yes_or_no_interruptible(&format!(
+                "Execute command:{} (y/n): ",
+                args.to_string()
+            ));
+            if confirm != Some(true) {
                 println!("canceled by user.");
                 return RunOneResult {
                     tool_result: ToolResult {
                         tool_call_id: tool_call.id.clone(),
-                        content: "Error: execute_command canceled by user".to_string(),
+                        content: if confirm.is_none() {
+                            "Error: execute_command canceled by user (Ctrl+C)".to_string()
+                        } else {
+                            "Error: execute_command canceled by user".to_string()
+                        },
                     },
                     ok: false,
                     executed: false,
