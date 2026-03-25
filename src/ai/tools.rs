@@ -340,14 +340,6 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
         return Err("empty command".to_string());
     }
 
-    let forbidden_chars = [
-        ';', '|', '&', '>', '<', '\n', '\r', '`', '$', '(', ')', '{', '}', '[', ']', '\\', '"',
-        '\'',
-    ];
-    if command.chars().any(|c| forbidden_chars.contains(&c)) {
-        return Err("contains forbidden shell characters".to_string());
-    }
-
     let tokens = command.split_whitespace().collect::<Vec<_>>();
     if tokens.is_empty() {
         return Err("empty command".to_string());

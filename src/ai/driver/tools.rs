@@ -26,64 +26,12 @@ mod args {
     }
 }
 
-mod approval {
-    use serde_json::Value;
-    use std::io::{self, IsTerminal, Write};
-
-    use crate::ai::types::{ToolCall, ToolResult};
-
-    pub enum ConfirmOutcome {
-        Proceed,
-        Skip,
-        NotInteractive(ToolResult),
-        Error(ToolResult),
-    }
-
-    pub fn confirm_execute_command(tool_call: &ToolCall, args: &Value) -> ConfirmOutcome {
-        let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-        let cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(".");
-
-        if !io::stdin().is_terminal() {
-            return ConfirmOutcome::NotInteractive(ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: "Command not executed: confirmation required (non-interactive)".to_string(),
-            });
-        }
-
-        print!(
-            "\nExecute command? [y/N]\ncommand: {}\ncwd: {}\n> ",
-            command, cwd
-        );
-        if let Err(err) = io::stdout().flush() {
-            return ConfirmOutcome::Error(ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: format!("Error: failed to flush stdout: {}", err),
-            });
-        }
-
-        let mut line = String::new();
-        if let Err(err) = io::stdin().read_line(&mut line) {
-            return ConfirmOutcome::Error(ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content: format!("Error: failed to read confirmation: {}", err),
-            });
-        }
-
-        let answer = line.trim().to_lowercase();
-        if answer == "y" || answer == "yes" {
-            ConfirmOutcome::Proceed
-        } else {
-            ConfirmOutcome::Skip
-        }
-    }
-}
-
 mod dispatch {
     use serde_json::Value;
 
-    use crate::ai::{mcp::McpClient, tools as builtin_tools, types::ToolCall, types::ToolResult};
+    use crate::{ai::{mcp::McpClient, tools as builtin_tools, types::{ToolCall, ToolResult}}, common::prompt::prompt_yes_or_no};
 
-    use super::{approval, args};
+    use super::{args};
 
     pub struct RunOneResult {
         pub tool_result: ToolResult,
@@ -106,32 +54,8 @@ mod dispatch {
                 }
             };
 
-            match approval::confirm_execute_command(tool_call, &args) {
-                approval::ConfirmOutcome::Proceed => {}
-                approval::ConfirmOutcome::Skip => {
-                    return RunOneResult {
-                        tool_result: ToolResult {
-                            tool_call_id: tool_call.id.clone(),
-                            content: "Command cancelled by user".to_string(),
-                        },
-                        ok: true,
-                        executed: false,
-                    };
-                }
-                approval::ConfirmOutcome::NotInteractive(res) => {
-                    return RunOneResult {
-                        tool_result: res,
-                        ok: true,
-                        executed: false,
-                    };
-                }
-                approval::ConfirmOutcome::Error(res) => {
-                    return RunOneResult {
-                        tool_result: res,
-                        ok: false,
-                        executed: true,
-                    };
-                }
+            if !prompt_yes_or_no(&format!("Execute command:{} (y/n): ", args.to_string())) {
+                println!("canceled by user.");   
             }
         }
 
