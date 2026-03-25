@@ -6,7 +6,7 @@ use std::{
 };
 
 use chrono::{DateTime, Local};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -160,7 +160,12 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
             content TEXT NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
-        CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);",
+        CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );",
     )
     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     Ok(())
@@ -173,10 +178,39 @@ fn append_history_sqlite(path: &PathBuf, content: &str) -> io::Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
+    let first_user_in_blob = entries
+        .iter()
+        .find(|(role, _)| role == "user")
+        .map(|(_, msg)| msg.clone());
     let tx = conn
         .transaction()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     {
+        let existing_first: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key='first_user_prompt' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+        if existing_first.is_none() {
+            let first_existing_user: Option<String> = tx
+                .query_row(
+                    "SELECT content FROM messages WHERE role='user' ORDER BY id ASC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            let first_user_prompt = first_existing_user.or(first_user_in_blob.clone());
+            if let Some(v) = first_user_prompt.as_deref() {
+                let _ = tx.execute(
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('first_user_prompt', ?1)",
+                    params![v],
+                );
+            }
+        }
         let mut stmt = tx
             .prepare("INSERT INTO messages (role, content) VALUES (?1, ?2)")
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
@@ -245,6 +279,7 @@ pub(super) struct SessionInfo {
     pub(super) id: String,
     pub(super) modified_local: Option<DateTime<Local>>,
     pub(super) size_bytes: u64,
+    pub(super) first_user_prompt: Option<String>,
 }
 
 impl SessionStore {
@@ -288,10 +323,12 @@ impl SessionStore {
                 Err(_) => continue,
             };
             let modified_local = metadata.modified().ok().map(DateTime::<Local>::from);
+            let first_user_prompt = read_first_user_prompt_sqlite(&path).unwrap_or(None);
             out.push(SessionInfo {
                 id: stem.to_string(),
                 modified_local,
                 size_bytes: metadata.len(),
+                first_user_prompt,
             });
         }
         out.sort_by(|a, b| {
@@ -324,6 +361,14 @@ impl SessionStore {
             }
         }
         Ok(deleted)
+    }
+
+    pub(super) fn first_user_prompt(&self, session_id: &str) -> io::Result<Option<String>> {
+        let path = self.session_history_file(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_first_user_prompt_sqlite(&path)
     }
 
     pub(super) fn migrate_legacy_if_needed(&self, legacy_history_file: &PathBuf) -> io::Result<()> {
@@ -407,4 +452,29 @@ fn sanitize_session_id(session_id: &str) -> String {
     } else {
         out
     }
+}
+
+fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
+    let conn =
+        Connection::open(path).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let meta: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='first_user_prompt' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    if meta.is_some() {
+        return Ok(meta);
+    }
+    let fallback: Option<String> = conn
+        .query_row(
+            "SELECT content FROM messages WHERE role='user' ORDER BY id ASC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    Ok(fallback)
 }

@@ -454,13 +454,30 @@ fn try_handle_session_command(
                         .modified_local
                         .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
                         .unwrap_or_else(|| "-".to_string());
-                    println!("{mark} {}  {}  {}B", s.id, time, s.size_bytes);
+                    let prompt = s
+                        .first_user_prompt
+                        .as_deref()
+                        .map(sanitize_session_prompt)
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "-".to_string());
+                    let prompt = truncate_session_prompt(&prompt, 80);
+                    println!(
+                        "{mark} {:<36}  {}  {:>8}B  {}",
+                        s.id, time, s.size_bytes, prompt
+                    );
                 }
             }
         }
         "current" | "cur" => {
             println!("session: {}", app.session_id);
             println!("history: {}", app.session_history_file.display());
+            let first = store.first_user_prompt(&app.session_id).unwrap_or(None);
+            if let Some(v) = first {
+                let prompt = sanitize_session_prompt(&v);
+                if !prompt.is_empty() {
+                    println!("first: {}", truncate_session_prompt(&prompt, 160));
+                }
+            }
         }
         "new" | "create" => {
             let new_id = Uuid::new_v4().to_string();
@@ -476,6 +493,13 @@ fn try_handle_session_command(
             app.session_id = id.to_string();
             app.session_history_file = store.session_history_file(id);
             println!("Switched session: {}", id);
+            let first = store.first_user_prompt(id).unwrap_or(None);
+            if let Some(v) = first {
+                let prompt = sanitize_session_prompt(&v);
+                if !prompt.is_empty() {
+                    println!("first: {}", truncate_session_prompt(&prompt, 160));
+                }
+            }
         }
         "delete" | "del" | "rm" => {
             let Some(id) = parts.next() else {
@@ -519,4 +543,33 @@ fn try_handle_session_command(
         }
     }
     Ok(true)
+}
+
+fn sanitize_session_prompt(s: &str) -> String {
+    let mut out = String::new();
+    let mut last_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !last_space {
+                out.push(' ');
+                last_space = true;
+            }
+        } else {
+            out.push(ch);
+            last_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn truncate_session_prompt(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push_str("...");
+    out
 }
