@@ -105,7 +105,7 @@ pub(super) fn do_request(
     if !models::is_vl_model(model) {
         request_body
             .messages
-            .extend(build_message_arr(history_count, &app.config.history_file)?);
+            .extend(build_message_arr(history_count, &app.session_history_file)?);
     }
 
     request_body.messages.push(Message {

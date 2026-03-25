@@ -25,6 +25,9 @@ pub(super) struct AppConfig {
 pub(super) struct App {
     pub(super) cli: Cli,
     pub(super) config: AppConfig,
+    pub(super) sessions_root: PathBuf,
+    pub(super) session_id: String,
+    pub(super) session_history_file: PathBuf,
     pub(super) client: Client,
     pub(super) current_model: String,
     pub(super) pending_files: Option<String>,

@@ -119,11 +119,6 @@ pub(super) fn serve_stdio() -> io::Result<()> {
     serve(stdin.lock(), stdout.lock())
 }
 
-#[allow(dead_code)]
-pub fn run_example_mcp_server() -> Result<(), Box<dyn std::error::Error>> {
-    serve_stdio()?;
-    Ok(())
-}
 
 fn handle_tools_call(params: Value) -> Value {
     let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");

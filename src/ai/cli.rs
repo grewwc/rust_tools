@@ -3,7 +3,10 @@ use clap::{ArgAction, Parser};
 pub(super) const DEFAULT_NUM_HISTORY: usize = 4;
 
 #[derive(Parser, Debug)]
-#[command(about = "AI CLI compatible with go_tools executable/ai/a.go")]
+#[command(
+    about = "AI CLI compatible with go_tools executable/ai/a.go",
+    after_help = "Session\n  默认每个进程自动创建独立 session（不会和其它窗口串 history）\n  --session <id>            指定 session id\n  --session                 不指定 id，等同于自动创建新 session\n  --clear --session <id>    清空指定 session 的 history\n\nInteractive\n  /help                     打印交互命令帮助\n  /sessions                 列出所有 sessions\n  /sessions current         查看当前 session\n  /sessions new             新建并切换到新 session\n  /sessions use <id>        切换 session\n  /sessions delete <id>     删除 session（若删除当前 session，会自动切到新 session）\n"
+)]
 pub(super) struct Cli {
     #[arg(long, default_value_t = DEFAULT_NUM_HISTORY, help = "number of history")]
     pub(super) history: usize,
@@ -36,6 +39,15 @@ pub(super) struct Cli {
 
     #[arg(long, action = ArgAction::SetTrue, help = "clear history")]
     pub(super) clear: bool,
+
+    #[arg(
+        long,
+        visible_alias = "ss",
+        num_args = 0..=1,
+        default_missing_value = "",
+        help = "session id. empty means create a new session for this process."
+    )]
+    pub(super) session: Option<String>,
 
     #[arg(short = 'c', action = ArgAction::SetTrue, help = "prepend content in clipboard")]
     pub(super) clipboard: bool,
@@ -112,13 +124,6 @@ pub(super) struct Cli {
 
     #[arg(long, default_value = "", help = "mcp config json path override")]
     pub(super) mcp_config: String,
-
-    #[arg(
-        long,
-        action = ArgAction::SetTrue,
-        help = "run bundled example MCP server over stdio and exit"
-    )]
-    pub(super) example_mcp_server: bool,
 }
 
 pub(super) fn normalize_single_dash_long_opts(args: impl Iterator<Item = String>) -> Vec<String> {

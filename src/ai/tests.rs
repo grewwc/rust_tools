@@ -61,6 +61,9 @@ fn resolve_model_is_unicode_safe() {
     let app = super::types::App {
         cli,
         config,
+        sessions_root: PathBuf::new(),
+        session_id: String::new(),
+        session_history_file: PathBuf::new(),
         client,
         current_model: models::qwen3_max().to_string(),
         pending_files: None,

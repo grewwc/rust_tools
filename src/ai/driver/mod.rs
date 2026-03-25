@@ -1,5 +1,5 @@
 use std::{
-    io::{self, BufRead, Write},
+    io::Write,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -9,11 +9,12 @@ use std::{
 use clap::Parser;
 use colored::Colorize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::ai::{
     cli::{Cli, normalize_single_dash_long_opts},
     config,
-    history::{COLON, Message, NEWLINE, append_history, build_message_arr},
+    history::{COLON, Message, NEWLINE, SessionStore, append_history, build_message_arr},
     mcp::McpClient,
     models,
     prompt::PromptEditor,
@@ -43,9 +44,22 @@ pub use tools::*;
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse_from(normalize_single_dash_long_opts(std::env::args()));
     let config = config::load_config()?;
+    let session_store = SessionStore::new(&config.history_file);
+    if let Err(err) = session_store.migrate_legacy_if_needed(&config.history_file) {
+        eprintln!("[Warning] Failed to migrate legacy history: {}", err);
+    }
+    let session_arg = cli.session.clone().unwrap_or_default();
+    let session_id = if session_arg.trim().is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        session_arg.trim().to_string()
+    };
+    if let Err(err) = session_store.ensure_root_dir() {
+        eprintln!("[Warning] Failed to create sessions dir: {}", err);
+    }
     if cli.clear {
-        config::clear_history_file(&config.history_file);
-        println!("History cleared.");
+        let _ = session_store.clear_session(&session_id);
+        println!("History cleared. (session: {})", session_id);
         return Ok(());
     }
 
@@ -83,6 +97,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         pending_short_output: cli.short_output,
         current_model,
         raw_args,
+        sessions_root: session_store.root().clone(),
+        session_id: session_id.clone(),
+        session_history_file: session_store.session_history_file(&session_id),
         cli,
         config,
         client,
@@ -146,6 +163,20 @@ fn run_loop(
         }
 
         let mut question = ctx.question;
+        if try_handle_help_command(&question) {
+            if should_quit {
+                return Ok(());
+            }
+            should_quit = false;
+            continue;
+        }
+        if try_handle_session_command(app, &question)? {
+            if should_quit {
+                return Ok(());
+            }
+            should_quit = false;
+            continue;
+        }
         let next_model = resolve_model_for_input(app, &mut question);
         app.current_model = next_model.clone();
 
@@ -172,7 +203,7 @@ fn run_loop(
         });
         messages.extend(build_message_arr(
             ctx.history_count,
-            &app.config.history_file,
+            &app.session_history_file,
         )?);
         messages.push(Message {
             role: "user".to_string(),
@@ -234,19 +265,14 @@ fn run_loop(
             }
             drain_response(&mut response)?;
 
-            let assistant_msg = Message {
-                role: "assistant".to_string(),
-                content: Value::String(stream_result.assistant_text.clone()),
-                tool_calls: if stream_result.tool_calls.is_empty() {
-                    None
-                } else {
-                    Some(stream_result.tool_calls.clone())
-                },
-                tool_call_id: None,
-            };
-            messages.push(assistant_msg);
-
             if stream_result.outcome != StreamOutcome::ToolCall {
+                let assistant_msg = Message {
+                    role: "assistant".to_string(),
+                    content: Value::String(stream_result.assistant_text.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                };
+                messages.push(assistant_msg);
                 final_assistant_text = stream_result.assistant_text;
                 break;
             }
@@ -260,8 +286,21 @@ fn run_loop(
                 );
             }
 
-            let tool_results = execute_tool_calls(mcp_client, &stream_result.tool_calls)?;
-            for (tool_call, result) in stream_result.tool_calls.iter().zip(tool_results.iter()) {
+            let exec_result = execute_tool_calls(mcp_client, &stream_result.tool_calls)?;
+
+            let assistant_msg = Message {
+                role: "assistant".to_string(),
+                content: Value::String(stream_result.assistant_text.clone()),
+                tool_calls: Some(exec_result.executed_tool_calls.clone()),
+                tool_call_id: None,
+            };
+            messages.push(assistant_msg);
+
+            for (tool_call, result) in exec_result
+                .executed_tool_calls
+                .iter()
+                .zip(exec_result.tool_results.iter())
+            {
                 println!("\n{}", "[Tool Result]".green());
                 if tool_call.function.name == "web_search" {
                     let mut preview = String::new();
@@ -302,7 +341,7 @@ fn run_loop(
                 "user{COLON}{question}{NEWLINE}assistant{COLON}{final_assistant_text}{NEWLINE}"
             );
             // 忽略历史保存错误，避免因为权限问题导致程序异常退出
-            if let Err(e) = append_history(&app.config.history_file, &history_line) {
+            if let Err(e) = append_history(&app.session_history_file, &history_line) {
                 eprintln!("[Warning] Failed to save history: {}", e);
             }
             println!();
@@ -316,4 +355,129 @@ fn run_loop(
             writer.flush()?;
         }
     }
+}
+
+fn try_handle_help_command(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let normalized = if let Some(rest) = trimmed.strip_prefix('/') {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix(':') {
+        rest
+    } else {
+        return false;
+    };
+    if normalized != "help" && normalized != "h" {
+        return false;
+    }
+    println!("interactive commands:");
+    println!("  /help");
+    println!("  /sessions");
+    println!("  /sessions list");
+    println!("  /sessions current");
+    println!("  /sessions new");
+    println!("  /sessions use <id>");
+    println!("  /sessions delete <id>");
+    true
+}
+
+fn try_handle_session_command(
+    app: &mut App,
+    input: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    let normalized = if let Some(rest) = trimmed.strip_prefix('/') {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix(':') {
+        rest
+    } else {
+        return Ok(false);
+    };
+    let mut parts = normalized.split_whitespace();
+    let Some(cmd) = parts.next() else {
+        return Ok(false);
+    };
+    if cmd != "sessions" && cmd != "session" {
+        return Ok(false);
+    }
+    let action = parts.next().unwrap_or("list");
+    let store = SessionStore::new(&app.config.history_file);
+    let _ = store.ensure_root_dir();
+
+    match action {
+        "help" | "h" => {
+            println!("sessions commands:");
+            println!("  /sessions");
+            println!("  /sessions list");
+            println!("  /sessions current");
+            println!("  /sessions new");
+            println!("  /sessions use <id>");
+            println!("  /sessions delete <id>");
+        }
+        "list" | "ls" => {
+            let sessions = store.list_sessions()?;
+            if sessions.is_empty() {
+                println!("No sessions.");
+            } else {
+                for s in sessions {
+                    let mark = if s.id == app.session_id { "*" } else { " " };
+                    let time = s
+                        .modified_local
+                        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    println!("{mark} {}  {}  {}B", s.id, time, s.size_bytes);
+                }
+            }
+        }
+        "current" | "cur" => {
+            println!("session: {}", app.session_id);
+            println!("history: {}", app.session_history_file.display());
+        }
+        "new" | "create" => {
+            let new_id = Uuid::new_v4().to_string();
+            app.session_id = new_id.clone();
+            app.session_history_file = store.session_history_file(&new_id);
+            println!("Switched to new session: {}", new_id);
+        }
+        "use" | "select" => {
+            let Some(id) = parts.next() else {
+                println!("missing session id. try: /sessions use <id>");
+                return Ok(true);
+            };
+            app.session_id = id.to_string();
+            app.session_history_file = store.session_history_file(id);
+            println!("Switched session: {}", id);
+        }
+        "delete" | "del" | "rm" => {
+            let Some(id) = parts.next() else {
+                println!("missing session id. try: /sessions delete <id>");
+                return Ok(true);
+            };
+            let deleted = store.delete_session(id)?;
+            if deleted {
+                if id == app.session_id {
+                    let new_id = Uuid::new_v4().to_string();
+                    app.session_id = new_id.clone();
+                    app.session_history_file = store.session_history_file(&new_id);
+                    println!(
+                        "Deleted current session. Switched to new session: {}",
+                        new_id
+                    );
+                } else {
+                    println!("Deleted session: {}", id);
+                }
+            } else {
+                println!("Session not found: {}", id);
+            }
+        }
+        _ => {
+            println!("unknown action: {}. try: /sessions help", action);
+        }
+    }
+    Ok(true)
 }

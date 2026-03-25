@@ -339,6 +339,21 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
     if command.is_empty() {
         return Err("empty command".to_string());
     }
+    if command.contains('\n') || command.contains('\r') {
+        return Err("multi-line command is blocked".to_string());
+    }
+    if command.contains('|')
+        || command.contains('>')
+        || command.contains('<')
+        || command.contains(';')
+        || command.contains('&')
+        || command.contains("&&")
+        || command.contains("||")
+        || command.contains("`")
+        || command.contains("$(")
+    {
+        return Err("shell metacharacters are blocked".to_string());
+    }
 
     let tokens = command.split_whitespace().collect::<Vec<_>>();
     if tokens.is_empty() {
