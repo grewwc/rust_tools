@@ -717,6 +717,8 @@ pub(super) fn tool_definitions_to_value(tools: &[ToolDefinition]) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use crate::cmd;
+
     use super::*;
 
     #[test]
@@ -724,6 +726,11 @@ mod tests {
         let command = json!({"command": "zip -r feishu-aeolus-ltc-exact-match.zip feishu-aeolus-ltc-exact-match"});
         let ret = execute_command(&command);
         println!("ret: {:?}", ret);
+        let command = json!({"command": "diff ~/Downloads/1.csv ~/Downloads/2.csv"});
+        let ret = execute_command(&command);
+        println!("ret2: {:?}", ret);
+        let ret = cmd::run_cmd("diff ~/Downloads/1.csv ~/Downloads/2.csv");
+        println!("ret3: {:?}", ret);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::strw::split::split_space_keep_symbol;
+use crate::{common::utils::expanduser, strw::split::split_space_keep_symbol};
 
 use std::{
     io,
@@ -49,7 +49,12 @@ pub fn run_cmd_output(command: &str, opts: RunCmdOptions<'_>) -> io::Result<Outp
         cmd.current_dir(dir);
     }
     iter.for_each(|arg| {
-        cmd.arg(arg);
+        let new_arg = expanduser(arg);
+        if new_arg == arg {
+            cmd.arg(new_arg.as_ref());
+        } else {
+            cmd.arg(new_arg.into_owned());
+        }
     });
 
     cmd.output()
