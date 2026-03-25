@@ -1,6 +1,7 @@
 use crate::ai::types::LoopOverrides;
 use crate::strw::split::split_space_keep_symbol;
 
+#[allow(dead_code)]
 pub fn loop_overrides(question: &str) -> LoopOverrides {
     parse_loop_overrides(question).1
 }
@@ -14,8 +15,8 @@ pub fn parse_loop_overrides(question: &str) -> (String, LoopOverrides) {
     let mut history_count: Option<usize> = None;
 
     // First pass to check for -x flag
-    let mut first_pass = split_space_keep_symbol(question, "\"'");
-    while let Some(token) = first_pass.next() {
+    let first_pass = split_space_keep_symbol(question, "\"'");
+    for token in first_pass {
         if token == "-x" {
             has_x = true;
             break;

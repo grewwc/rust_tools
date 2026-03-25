@@ -115,11 +115,11 @@ fn main() {
     if let Some(v) = parsed.keywords.as_deref() {
         println!("keywords: {v}");
     }
-    if let Some(v) = parsed.text.as_deref() {
-        if !v.trim().is_empty() {
-            println!();
-            print!("{v}");
-        }
+    if let Some(v) = parsed.text.as_deref()
+        && !v.trim().is_empty()
+    {
+        println!();
+        print!("{v}");
     }
 }
 

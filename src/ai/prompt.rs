@@ -138,7 +138,7 @@ impl PromptEditor {
             let mut textarea: TextArea = TextArea::default();
             let mut history = MultilineHistoryState::new(self.multiline_history_entries());
 
-            let outcome = loop {
+            loop {
                 terminal
                     .draw(|f| {
                         let area = f.area();
@@ -274,8 +274,7 @@ impl PromptEditor {
                     Event::Key(_) => {}
                     _ => {}
                 }
-            };
-            outcome
+            }
         })();
 
         let _ = terminal.clear();
@@ -389,11 +388,10 @@ fn is_submit_key(
 ) -> bool {
     use crossterm::event::{KeyCode, KeyModifiers};
 
-    match (code, modifiers) {
-        (KeyCode::Char('d'), KeyModifiers::CONTROL) => true,
-        (KeyCode::Esc, KeyModifiers::NONE) => true,
-        _ => false,
-    }
+    matches!(
+        (code, modifiers),
+        (KeyCode::Char('d'), KeyModifiers::CONTROL) | (KeyCode::Esc, KeyModifiers::NONE)
+    )
 }
 
 pub(super) fn trim_trailing_newline(mut line: String) -> String {

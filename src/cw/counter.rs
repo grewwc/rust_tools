@@ -97,7 +97,7 @@ where
             return Vec::new();
         }
         let mut v: Vec<(K, usize)> = self.data.iter().map(|(k, &c)| (k.clone(), c)).collect();
-        v.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        v.sort_unstable_by_key(|x| std::cmp::Reverse(x.1));
         if v.len() > n {
             v.truncate(n);
         }
@@ -126,7 +126,7 @@ mod tests {
         assert_eq!(c.dec(&"b"), 1);
         assert_eq!(c.total(), 2);
         assert_eq!(c.remove(&"a"), Some(1));
-        assert_eq!(c.contains(&"a"), false);
+        assert!(!c.contains(&"a"));
         assert_eq!(c.total(), 1);
     }
 

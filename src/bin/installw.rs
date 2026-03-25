@@ -10,6 +10,9 @@ use std::{
 
 use rust_tools::cw::graph::DirectedGraph;
 
+type ModuleGraph = DirectedGraph<Rc<PathBuf>>;
+type ModuleInterner = HashMap<PathBuf, Rc<PathBuf>>;
+
 fn main() {
     if let Err(err) = run() {
         eprintln!("{err}");
@@ -88,11 +91,11 @@ fn parse_args() -> (Mode, Vec<String>) {
             bins.extend(args);
             break;
         }
-        if arg == "--mode" {
-            if let Some(v) = args.next() {
-                mode = parse_mode_value(&v);
-                continue;
-            }
+        if arg == "--mode"
+            && let Some(v) = args.next()
+        {
+            mode = parse_mode_value(&v);
+            continue;
         }
         if let Some(v) = arg.strip_prefix("--mode=") {
             mode = parse_mode_value(v);
@@ -156,11 +159,9 @@ fn list_rs_files(src_dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-fn build_module_graph(
-    files: &[PathBuf],
-) -> Result<(DirectedGraph<Rc<PathBuf>>, HashMap<PathBuf, Rc<PathBuf>>), String> {
+fn build_module_graph(files: &[PathBuf]) -> Result<(ModuleGraph, ModuleInterner), String> {
     let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
-    let mut interner: HashMap<PathBuf, Rc<PathBuf>> = HashMap::new();
+    let mut interner: ModuleInterner = HashMap::new();
     let mut g = DirectedGraph::new();
     for file in files {
         let node = interner
@@ -360,6 +361,26 @@ fn newest_mtime(files: &[Rc<PathBuf>]) -> Result<SystemTime, String> {
     Ok(newest)
 }
 
+fn file_mtime(path: &Path) -> Result<SystemTime, String> {
+    let meta = fs::metadata(path).map_err(|e| format!("metadata {path:?}: {e}"))?;
+    meta.modified().map_err(|e| format!("mtime {path:?}: {e}"))
+}
+
+fn newest_existing_mtime(paths: &[&Path]) -> Result<Option<SystemTime>, String> {
+    let mut newest: Option<SystemTime> = None;
+    for p in paths {
+        let Ok(meta) = fs::metadata(p) else {
+            continue;
+        };
+        let t = meta.modified().map_err(|e| format!("mtime {p:?}: {e}"))?;
+        newest = Some(match newest {
+            Some(cur) if cur >= t => cur,
+            _ => t,
+        });
+    }
+    Ok(newest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,24 +405,4 @@ mod tests {
         assert!(deps.contains(&bin_dir.join("re").join("features").join("mod.rs")));
         assert!(deps.contains(&bin_dir.join("re").join("features").join("search.rs")));
     }
-}
-
-fn file_mtime(path: &Path) -> Result<SystemTime, String> {
-    let meta = fs::metadata(path).map_err(|e| format!("metadata {path:?}: {e}"))?;
-    meta.modified().map_err(|e| format!("mtime {path:?}: {e}"))
-}
-
-fn newest_existing_mtime(paths: &[&Path]) -> Result<Option<SystemTime>, String> {
-    let mut newest: Option<SystemTime> = None;
-    for p in paths {
-        let Ok(meta) = fs::metadata(p) else {
-            continue;
-        };
-        let t = meta.modified().map_err(|e| format!("mtime {p:?}: {e}"))?;
-        newest = Some(match newest {
-            Some(cur) if cur >= t => cur,
-            _ => t,
-        });
-    }
-    Ok(newest)
 }

@@ -1,8 +1,11 @@
 use std::sync::{Arc, Mutex};
 
+pub(crate) type ActionFn = Arc<dyn Fn() + Send + Sync + 'static>;
+pub(crate) type ActionFnList = Arc<Mutex<Vec<ActionFn>>>;
+
 #[derive(Clone)]
 pub struct ActionList {
-    pub(crate) actions: Arc<Mutex<Vec<Arc<dyn Fn() + Send + Sync + 'static>>>>,
+    pub(crate) actions: ActionFnList,
 }
 
 impl ActionList {

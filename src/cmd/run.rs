@@ -5,15 +5,9 @@ use std::{
     process::{Command, Output},
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct RunCmdOptions<'a> {
     pub cwd: Option<&'a str>,
-}
-
-impl<'a> Default for RunCmdOptions<'a> {
-    fn default() -> Self {
-        Self { cwd: None }
-    }
 }
 
 pub fn run_cmd_output(command: &str, opts: RunCmdOptions<'_>) -> io::Result<Output> {

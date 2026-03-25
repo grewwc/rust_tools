@@ -22,10 +22,8 @@ pub fn glob_paths(pattern: &str, root_path: &str) -> Result<Vec<String>, String>
     let p = Path::new(root_path).join(pattern);
     let mut out = Vec::new();
     let pat = p.to_string_lossy().to_string();
-    for entry in glob(&pat).map_err(|e| e.to_string())? {
-        if let Ok(path) = entry {
-            out.push(path.to_string_lossy().to_string());
-        }
+    for path in glob(&pat).map_err(|e| e.to_string())?.flatten() {
+        out.push(path.to_string_lossy().to_string());
     }
     Ok(out)
 }

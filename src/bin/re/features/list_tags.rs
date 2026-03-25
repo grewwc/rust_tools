@@ -16,7 +16,7 @@ pub fn list_tags_feature(
         let include_finished = !list_tags_and_order_by_time || all;
         let mut tags = compute_tags_from_records(db, include_finished, list_special);
         if list_tags_and_order_by_time {
-            tags.sort_by(|a, b| a.modified_date.cmp(&b.modified_date));
+            tags.sort_by_key(|a| a.modified_date);
         } else {
             tags.sort_by(|a, b| {
                 b.count

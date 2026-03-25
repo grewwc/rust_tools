@@ -328,7 +328,7 @@ fn register_list_by_tag_name(parser: &mut terminalw::Parser, ctx: Arc<ReContext>
             let query = if by_tag_query {
                 ctx.tag_query_raw.as_deref().unwrap_or("")
             } else {
-                ctx.cli.args.get(0).map(|s| s.as_str()).unwrap_or("")
+                ctx.cli.args.first().map(|s| s.as_str()).unwrap_or("")
             };
             list_by_tag_name::list_by_tag_name_feature(
                 ctx.db.as_ref(),

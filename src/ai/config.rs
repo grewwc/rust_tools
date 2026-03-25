@@ -48,6 +48,7 @@ pub(super) fn open_output_writer(path: Option<&str>) -> io::Result<Option<File>>
     options.open(path).map(Some)
 }
 
+#[allow(dead_code)]
 pub(super) fn clear_history_file(path: &PathBuf) {
     let _ = fs::remove_file(path);
 }

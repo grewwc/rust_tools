@@ -8,7 +8,7 @@ use rustc_hash::FxHashMap;
 use crate::common::types::FastSet;
 use crate::cw::{deque_list::DequeList, ordered_map::OrderedMap, ordered_set::OrderedSet};
 
-use super::actiontype::ActionList;
+use super::actiontype::{ActionFnList, ActionList};
 
 #[path = "parser_impl.rs"]
 mod parser_impl;
@@ -16,7 +16,7 @@ mod parser_impl;
 #[derive(Clone)]
 struct ActionEntry {
     cond: Arc<dyn Fn(&Parser) -> bool + Send + Sync + 'static>,
-    actions: Arc<Mutex<Vec<Arc<dyn Fn() + Send + Sync + 'static>>>>,
+    actions: ActionFnList,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +59,12 @@ pub type ParserOption = fn(&mut Parser);
 
 pub fn disable_parser_number(p: &mut Parser) {
     p.enable_parse_num = false;
+}
+
+impl Default for Parser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Parser {
@@ -279,15 +285,7 @@ impl Parser {
 
         let placeholder = match primary.ty {
             FlagType::Bool => String::new(),
-            _ => format!(
-                "<{}>",
-                primary
-                    .name
-                    .to_uppercase()
-                    .replace('-', "_")
-                    .trim()
-                    .to_string()
-            ),
+            _ => format!("<{}>", primary.name.to_uppercase().replace('-', "_").trim()),
         };
 
         let mut formatted_names = spec_names
@@ -295,11 +293,9 @@ impl Parser {
             .map(|n| self.format_flag_name(n))
             .collect::<Vec<_>>();
         let show_value = !matches!(primary.ty, FlagType::Bool);
-        if show_value {
-            if let Some(last) = formatted_names.last_mut() {
-                last.push(' ');
-                last.push_str(&placeholder);
-            }
+        if show_value && let Some(last) = formatted_names.last_mut() {
+            last.push(' ');
+            last.push_str(&placeholder);
         }
         let spec = formatted_names.join(", ");
 
@@ -450,11 +446,9 @@ impl Parser {
     }
 
     pub fn positional_args(&mut self, exclude_num_arg: bool) -> Vec<String> {
-        if exclude_num_arg {
-            if let Some(n) = self.num_arg {
-                let remove = format!("-{}", n);
-                self.positional.remove_first(|x| x == &remove);
-            }
+        if exclude_num_arg && let Some(n) = self.num_arg {
+            let remove = format!("-{}", n);
+            self.positional.remove_first(|x| x == &remove);
         }
         self.positional.to_vec()
     }

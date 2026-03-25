@@ -5,6 +5,7 @@ use colored::Colorize;
 use crate::features::core::*;
 use crate::memo::{MemoBackend, history, sync, ui};
 
+#[allow(clippy::too_many_arguments)]
 pub fn list_by_tag_name_feature(
     db: &MemoBackend,
     query: &str,

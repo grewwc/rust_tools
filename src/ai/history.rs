@@ -33,7 +33,7 @@ pub(super) fn build_message_arr(
     history_file: &PathBuf,
 ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
     if is_sqlite_path(history_file) {
-        return build_message_arr_sqlite(history_count, history_file);
+        return build_message_arr_sqlite(history_count, history_file.as_path());
     }
     let history = match fs::read_to_string(history_file) {
         Ok(history) => history,
@@ -80,7 +80,7 @@ pub(super) fn build_message_arr(
     Ok(messages[messages.len() - history_count..].to_vec())
 }
 
-pub(super) fn append_history(path: &PathBuf, content: &str) -> io::Result<()> {
+pub(super) fn append_history(path: &Path, content: &str) -> io::Result<()> {
     if is_sqlite_path(path) {
         return append_history_sqlite(path, content);
     }
@@ -96,7 +96,7 @@ pub(super) fn append_history(path: &PathBuf, content: &str) -> io::Result<()> {
     file.write_all(content.as_bytes())
 }
 
-pub(super) fn delete_history_artifacts(path: &PathBuf) -> io::Result<()> {
+pub(super) fn delete_history_artifacts(path: &Path) -> io::Result<()> {
     fn remove_one(path: &Path) -> io::Result<()> {
         match fs::remove_file(path) {
             Ok(()) => Ok(()),
@@ -105,7 +105,7 @@ pub(super) fn delete_history_artifacts(path: &PathBuf) -> io::Result<()> {
         }
     }
 
-    remove_one(path.as_path())?;
+    remove_one(path)?;
 
     let base = path.to_string_lossy().to_string();
     remove_one(Path::new(&format!("{base}-wal")))?;
@@ -114,7 +114,7 @@ pub(super) fn delete_history_artifacts(path: &PathBuf) -> io::Result<()> {
     Ok(())
 }
 
-fn is_sqlite_path(path: &PathBuf) -> bool {
+fn is_sqlite_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|s| s.to_str()),
         Some("sqlite") | Some("db")
@@ -149,7 +149,7 @@ fn open_history_db(path: &Path) -> Result<Connection, io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    Connection::open(path).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    Connection::open(path).map_err(|e| io::Error::other(e.to_string()))
 }
 
 fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
@@ -167,12 +167,12 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );",
     )
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(())
 }
 
-fn append_history_sqlite(path: &PathBuf, content: &str) -> io::Result<()> {
-    let mut conn = open_history_db(path.as_path())?;
+fn append_history_sqlite(path: &Path, content: &str) -> io::Result<()> {
+    let mut conn = open_history_db(path)?;
     init_history_schema(&conn)?;
     let entries = parse_history_blob(content);
     if entries.is_empty() {
@@ -184,7 +184,7 @@ fn append_history_sqlite(path: &PathBuf, content: &str) -> io::Result<()> {
         .map(|(_, msg)| msg.clone());
     let tx = conn
         .transaction()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+        .map_err(|e| io::Error::other(e.to_string()))?;
     {
         let existing_first: Option<String> = tx
             .query_row(
@@ -213,10 +213,10 @@ fn append_history_sqlite(path: &PathBuf, content: &str) -> io::Result<()> {
         }
         let mut stmt = tx
             .prepare("INSERT INTO messages (role, content) VALUES (?1, ?2)")
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| io::Error::other(e.to_string()))?;
         for (role, msg) in entries {
             stmt.execute(params![role, msg])
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| io::Error::other(e.to_string()))?;
         }
     }
     tx.execute(
@@ -224,16 +224,15 @@ fn append_history_sqlite(path: &PathBuf, content: &str) -> io::Result<()> {
          WHERE id NOT IN (SELECT id FROM messages ORDER BY id DESC LIMIT ?1)",
         params![MAX_HISTORY_LINES as i64],
     )
-    .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-    tx.commit()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+    .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
 fn build_message_arr_sqlite(
     history_count: usize,
-    history_file: &PathBuf,
+    history_file: &Path,
 ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
-    let conn = match open_history_db(history_file.as_path()) {
+    let conn = match open_history_db(history_file) {
         Ok(c) => c,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(err) => return Err(err.into()),
@@ -283,7 +282,7 @@ pub(super) struct SessionInfo {
 }
 
 impl SessionStore {
-    pub(super) fn new(history_file: &PathBuf) -> Self {
+    pub(super) fn new(history_file: &Path) -> Self {
         Self {
             root: sessions_root_from_history_file(history_file),
         }
@@ -427,7 +426,7 @@ impl SessionStore {
     }
 }
 
-fn sessions_root_from_history_file(history_file: &PathBuf) -> PathBuf {
+fn sessions_root_from_history_file(history_file: &Path) -> PathBuf {
     let parent = history_file.parent().unwrap_or_else(|| Path::new("."));
     let name = history_file
         .file_stem()
@@ -455,8 +454,7 @@ fn sanitize_session_id(session_id: &str) -> String {
 }
 
 fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
-    let conn =
-        Connection::open(path).map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
     let meta: Option<String> = conn
         .query_row(
             "SELECT value FROM meta WHERE key='first_user_prompt' LIMIT 1",

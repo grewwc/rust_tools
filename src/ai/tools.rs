@@ -453,7 +453,7 @@ fn execute_grep_search(args: &Value) -> Result<String, String> {
         .output()
         .map_err(|e| format!("Failed to execute rg: {}", e))?;
 
-    let result = String::from_utf8_lossy(&output.stdout).to_owned();
+    let result = String::from_utf8_lossy(&output.stdout).into_owned();
     Ok(result.trim().to_string())
 }
 
@@ -708,7 +708,7 @@ fn decode_single_entity(entity: &str) -> Option<String> {
         }
         _ if entity.starts_with('#') => {
             let dec = &entity[1..];
-            let v = u32::from_str_radix(dec, 10).ok()?;
+            let v = dec.parse::<u32>().ok()?;
             char::from_u32(v).map(|c| c.to_string())
         }
         _ => None,

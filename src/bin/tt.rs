@@ -60,10 +60,10 @@ fn parse_unix_like(input: i64) -> DateTime<Local> {
         .unwrap_or_else(|| Local.timestamp_opt(0, 0).single().unwrap());
 
     let as_secs = Local.timestamp_opt(input, 0).single();
-    if let Some(dt) = as_secs {
-        if dt <= threshold {
-            return dt;
-        }
+    if let Some(dt) = as_secs
+        && dt <= threshold
+    {
+        return dt;
     }
 
     let secs = input / 1000;

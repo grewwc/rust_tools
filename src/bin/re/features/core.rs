@@ -767,10 +767,11 @@ pub fn write_text_output(path: &str, content: &str, force: bool) {
     if path.is_empty() {
         return;
     }
-    if std::path::Path::new(path).exists() && !force {
-        if !prompt::prompt_yes_or_no(&format!("{path} exists, overwrite? (y/n): ")) {
-            return;
-        }
+    if std::path::Path::new(path).exists()
+        && !force
+        && !prompt::prompt_yes_or_no(&format!("{path} exists, overwrite? (y/n): "))
+    {
+        return;
     }
     std::fs::write(path, content).unwrap_or_else(|e| {
         eprintln!("failed to write {path}: {e}");
@@ -795,10 +796,11 @@ pub fn write_file_prompt(path: &str, content: &str, force: bool) {
     if path.is_empty() {
         return;
     }
-    if std::path::Path::new(path).exists() && !force {
-        if !prompt::prompt_yes_or_no(&format!("{path} exists, overwrite? (y/n): ")) {
-            return;
-        }
+    if std::path::Path::new(path).exists()
+        && !force
+        && !prompt::prompt_yes_or_no(&format!("{path} exists, overwrite? (y/n): "))
+    {
+        return;
     }
     std::fs::write(path, content).unwrap_or_else(|e| {
         eprintln!("failed to write {path}: {e}");
@@ -904,10 +906,7 @@ pub fn looks_like_url_continuation_fragment(line: &str) -> bool {
 
 pub fn split_wrapped_numbered_line(line: &str, out: &mut Vec<String>) {
     let mut rest = line.trim_end().to_string();
-    loop {
-        let Some(caps) = WRAPPED_NUMBERED_ITEM_RE.captures(&rest) else {
-            break;
-        };
+    while let Some(caps) = WRAPPED_NUMBERED_ITEM_RE.captures(&rest) {
         let head = caps
             .name("head")
             .map(|m| m.as_str().trim())
@@ -978,7 +977,7 @@ pub fn extract_urls(s: &str) -> Vec<String> {
 }
 
 pub fn open_choose_url(urls: &[String]) {
-    let chosen = history::choose_from_list(&urls.to_vec());
+    let chosen = history::choose_from_list(urls);
     let Some(url) = chosen else {
         return;
     };

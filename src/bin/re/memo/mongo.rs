@@ -354,25 +354,6 @@ fn tag_count_update_doc(delta: i64, now: DateTime) -> bson::Document {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tag_count_update_doc_has_no_set_on_insert() {
-        let update = tag_count_update_doc(1, DateTime::now());
-        assert!(!update.contains_key("$setOnInsert"));
-        assert!(update.get_document("$inc").is_ok());
-        assert!(
-            update
-                .get_document("$inc")
-                .ok()
-                .and_then(|doc| doc.get("count"))
-                .is_some()
-        );
-    }
-}
-
 pub fn normalize_mongo_uri(host: &str) -> String {
     let h = host.trim();
     if h.starts_with("mongodb://") || h.starts_with("mongodb+srv://") {
@@ -479,4 +460,23 @@ fn doc_to_tag(doc: bson::Document) -> Option<MemoTag> {
         count,
         modified_date,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tag_count_update_doc_has_no_set_on_insert() {
+        let update = tag_count_update_doc(1, DateTime::now());
+        assert!(!update.contains_key("$setOnInsert"));
+        assert!(update.get_document("$inc").is_ok());
+        assert!(
+            update
+                .get_document("$inc")
+                .ok()
+                .and_then(|doc| doc.get("count"))
+                .is_some()
+        );
+    }
 }

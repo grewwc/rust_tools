@@ -183,10 +183,8 @@ fn pull_remote_sqlite_to_temp(
     if host.is_empty() {
         return Err("host is required".to_string());
     }
-    if prepare_remote {
-        if let Err(err) = run_remote_checkpoint(host) {
-            eprintln!("warning: failed to checkpoint remote sqlite before sync: {err}");
-        }
+    if prepare_remote && let Err(err) = run_remote_checkpoint(host) {
+        eprintln!("warning: failed to checkpoint remote sqlite before sync: {err}");
     }
     let mut args = scp_base_args(host);
     args.push(remote_sqlite_spec(host));
@@ -323,15 +321,11 @@ mod tests {
         let local_db = temp_db();
         let remote_db = temp_db();
 
-        let first_id = local_db
-            .insert("first", &vec!["links".to_string()])
-            .unwrap();
+        let first_id = local_db.insert("first", &["links".to_string()]).unwrap();
         let second_id = local_db
-            .insert("second", &vec!["links".to_string(), "read".to_string()])
+            .insert("second", &["links".to_string(), "read".to_string()])
             .unwrap();
-        let third_id = local_db
-            .insert("third", &vec!["other".to_string()])
-            .unwrap();
+        let third_id = local_db.insert("third", &["other".to_string()]).unwrap();
 
         let backend = MemoBackend::Sqlite(local_db);
         upsert_records_to_remote(

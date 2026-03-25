@@ -157,17 +157,12 @@ pub(super) fn take_stream_cancelled(app: &App) -> bool {
     app.cancel_stream.swap(false, Ordering::SeqCst)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) enum StreamOutcome {
+    #[default]
     Completed,
     Cancelled,
     ToolCall,
-}
-
-impl Default for StreamOutcome {
-    fn default() -> Self {
-        StreamOutcome::Completed
-    }
 }
 
 #[derive(Debug, Clone, Default)]

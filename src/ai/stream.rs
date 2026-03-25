@@ -109,9 +109,7 @@ pub(super) fn stream_response(
 
             for stream_tool_call in &choice.delta.tool_calls {
                 let index = stream_tool_call.index;
-                let builder = tool_calls_map
-                    .entry(index)
-                    .or_insert_with(ToolCallBuilder::new);
+                let builder = tool_calls_map.entry(index).or_default();
 
                 if !stream_tool_call.id.is_empty() {
                     builder.id = stream_tool_call.id.clone();
@@ -164,8 +162,8 @@ pub(super) fn stream_response(
     }
 
     let tool_calls: Vec<ToolCall> = tool_calls_map
-        .into_iter()
-        .map(|(_, builder)| builder.build())
+        .into_values()
+        .map(|builder| builder.build())
         .collect();
 
     let outcome = if !tool_calls.is_empty() {
@@ -536,7 +534,7 @@ impl MarkdownStreamRenderer {
         final_table.push_str(&render_table_header(indent, header, align, &widths));
         final_table.push_str(&render_table_mid(indent, &widths));
         for row in rows {
-            let row_cells = row.iter().cloned().collect::<Vec<_>>();
+            let row_cells = row.to_vec();
             final_table.push_str(&render_table_row(indent, &row_cells, align, &widths));
         }
         final_table.push_str(&render_table_bottom(indent, &widths));
@@ -581,10 +579,10 @@ impl MarkdownStreamRenderer {
             out.push_str("\x1b[0m\n");
 
             if let Some(ch) = underline_char {
-                let len = title.chars().count().max(3).min(80);
+                let len = title.chars().count().clamp(3, 80);
                 out.push_str(indent);
                 out.push_str("\x1b[2m\x1b[36m");
-                out.push_str(&std::iter::repeat(ch).take(len).collect::<String>());
+                out.push_str(&std::iter::repeat_n(ch, len).collect::<String>());
                 out.push_str("\x1b[0m\n");
             }
             return out;
@@ -635,7 +633,7 @@ fn table_preview_height(line: &str) -> usize {
     let cols = terminal_width().max(1);
     let width = UnicodeWidthStr::width(line);
     let width = width.max(1);
-    (width + cols - 1) / cols
+    width.div_ceil(cols)
 }
 
 fn split_indent(s: &str) -> (&str, &str) {
@@ -781,7 +779,7 @@ fn is_table_separator(line: &str) -> bool {
     if s.starts_with('|') {
         s = &s[1..];
     }
-    if s.ends_with('|') && s.len() >= 1 {
+    if s.ends_with('|') && !s.is_empty() {
         s = &s[..s.len() - 1];
     }
     let parts = s.split('|').map(|p| p.trim()).filter(|p| !p.is_empty());
@@ -801,15 +799,11 @@ fn parse_table_row(line: &str) -> Vec<String> {
     let (_, rest) = split_indent(line);
     let s = rest.trim();
     let mut raw = s.split('|').map(|p| p.trim()).collect::<Vec<_>>();
-    if s.starts_with('|') && !raw.is_empty() {
-        if raw.first().is_some_and(|x| x.is_empty()) {
-            raw.remove(0);
-        }
+    if s.starts_with('|') && !raw.is_empty() && raw.first().is_some_and(|x| x.is_empty()) {
+        raw.remove(0);
     }
-    if s.ends_with('|') && !raw.is_empty() {
-        if raw.last().is_some_and(|x| x.is_empty()) {
-            raw.pop();
-        }
+    if s.ends_with('|') && !raw.is_empty() && raw.last().is_some_and(|x| x.is_empty()) {
+        raw.pop();
     }
     raw.into_iter().map(|x| x.to_string()).collect()
 }
@@ -818,19 +812,14 @@ fn parse_table_align(line: &str, cols: usize) -> Vec<TableAlign> {
     let (_, rest) = split_indent(line);
     let s = rest.trim();
     let mut raw = s.split('|').map(|p| p.trim()).collect::<Vec<_>>();
-    if s.starts_with('|') && !raw.is_empty() {
-        if raw.first().is_some_and(|x| x.is_empty()) {
-            raw.remove(0);
-        }
+    if s.starts_with('|') && !raw.is_empty() && raw.first().is_some_and(|x| x.is_empty()) {
+        raw.remove(0);
     }
-    if s.ends_with('|') && !raw.is_empty() {
-        if raw.last().is_some_and(|x| x.is_empty()) {
-            raw.pop();
-        }
+    if s.ends_with('|') && !raw.is_empty() && raw.last().is_some_and(|x| x.is_empty()) {
+        raw.pop();
     }
     let mut out = Vec::with_capacity(cols);
-    for i in 0..cols {
-        let seg = raw.get(i).copied().unwrap_or("");
+    for seg in raw.iter().copied().chain(std::iter::repeat("")).take(cols) {
         let seg = seg.trim();
         let left = seg.starts_with(':');
         let right = seg.ends_with(':');
@@ -963,9 +952,11 @@ fn compute_table_widths(indent: &str, header: &[String], rows: &[Vec<String>]) -
         widths[i] = widths[i].max(visible_width(cell));
     }
     for row in rows {
-        for i in 0..cols {
-            let cell = row.get(i).map(|s| s.as_str()).unwrap_or("");
-            widths[i] = widths[i].max(visible_width(cell));
+        for (width, cell) in widths
+            .iter_mut()
+            .zip(row.iter().map(|s| s.as_str()).chain(std::iter::repeat("")))
+        {
+            *width = (*width).max(visible_width(cell));
         }
     }
     for w in &mut widths {
@@ -1034,8 +1025,8 @@ fn render_table_top(indent: &str, widths: &[usize]) -> String {
     let mut out = String::new();
     out.push_str(indent);
     out.push('┌');
-    for i in 0..cols {
-        out.push_str(&"─".repeat(widths[i] + 2));
+    for (i, width) in widths.iter().enumerate() {
+        out.push_str(&"─".repeat(*width + 2));
         out.push(if i + 1 == cols { '┐' } else { '┬' });
     }
     out.push('\n');
@@ -1050,8 +1041,8 @@ fn render_table_mid(indent: &str, widths: &[usize]) -> String {
     let mut out = String::new();
     out.push_str(indent);
     out.push('├');
-    for i in 0..cols {
-        out.push_str(&"─".repeat(widths[i] + 2));
+    for (i, width) in widths.iter().enumerate() {
+        out.push_str(&"─".repeat(*width + 2));
         out.push(if i + 1 == cols { '┤' } else { '┼' });
     }
     out.push('\n');
@@ -1066,8 +1057,8 @@ fn render_table_bottom(indent: &str, widths: &[usize]) -> String {
     let mut out = String::new();
     out.push_str(indent);
     out.push('└');
-    for i in 0..cols {
-        out.push_str(&"─".repeat(widths[i] + 2));
+    for (i, width) in widths.iter().enumerate() {
+        out.push_str(&"─".repeat(*width + 2));
         out.push(if i + 1 == cols { '┘' } else { '┴' });
     }
     out.push('\n');
@@ -1096,7 +1087,7 @@ fn render_table_header(
     for line_idx in 0..header_height {
         out.push_str(indent);
         out.push('│');
-        for i in 0..cols {
+        for (i, width) in widths.iter().enumerate() {
             let cell_line = header_lines
                 .get(i)
                 .and_then(|ls| ls.get(line_idx))
@@ -1104,7 +1095,7 @@ fn render_table_header(
                 .unwrap_or("");
             let padded = pad_cell(
                 cell_line,
-                widths[i],
+                *width,
                 align.get(i).copied().unwrap_or(TableAlign::Left),
             );
             out.push(' ');
@@ -1130,8 +1121,10 @@ fn render_table_row(
         return String::new();
     }
 
-    let wrapped = (0..cols)
-        .map(|i| wrap_md_cell(row.get(i).map(|s| s.as_str()).unwrap_or(""), widths[i]))
+    let wrapped = widths
+        .iter()
+        .enumerate()
+        .map(|(i, width)| wrap_md_cell(row.get(i).map(|s| s.as_str()).unwrap_or(""), *width))
         .collect::<Vec<_>>();
     let height = wrapped.iter().map(|c| c.len()).max().unwrap_or(1);
 
@@ -1139,7 +1132,7 @@ fn render_table_row(
     for line_idx in 0..height {
         out.push_str(indent);
         out.push('│');
-        for i in 0..cols {
+        for (i, width) in widths.iter().enumerate() {
             let cell_line = wrapped
                 .get(i)
                 .and_then(|ls| ls.get(line_idx))
@@ -1147,7 +1140,7 @@ fn render_table_row(
                 .unwrap_or("");
             let padded = pad_cell(
                 cell_line,
-                widths[i],
+                *width,
                 align.get(i).copied().unwrap_or(TableAlign::Left),
             );
             out.push(' ');
@@ -1207,7 +1200,7 @@ fn preview_height_for_rendered(rendered: &str) -> usize {
         i += ch.len_utf8();
     }
     let width = UnicodeWidthStr::width(plain.as_str()).max(1);
-    (width + cols - 1) / cols
+    width.div_ceil(cols)
 }
 
 #[cfg(test)]

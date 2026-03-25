@@ -36,18 +36,16 @@ pub mod signal;
 pub mod skill_matching;
 pub mod tools;
 
-pub use input::*;
 pub use mcp_init::*;
 pub use model::*;
 pub use print::*;
 pub use signal::*;
 pub use skill_matching::*;
-pub use tools::*;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse_from(normalize_single_dash_long_opts(std::env::args()));
     let config = config::load_config()?;
-    let session_store = SessionStore::new(&config.history_file);
+    let session_store = SessionStore::new(config.history_file.as_path());
     if let Err(err) = session_store.migrate_legacy_if_needed(&config.history_file) {
         eprintln!("[Warning] Failed to migrate legacy history: {}", err);
     }
@@ -305,7 +303,7 @@ fn run_loop(
                 );
             }
 
-            let exec_result = execute_tool_calls(mcp_client, &stream_result.tool_calls)?;
+            let exec_result = tools::execute_tool_calls(mcp_client, &stream_result.tool_calls)?;
 
             let assistant_msg = Message {
                 role: "assistant".to_string(),
@@ -323,16 +321,14 @@ fn run_loop(
                 println!("\n{}", "[Tool Result]".green());
                 if tool_call.function.name == "web_search" {
                     let mut preview = String::new();
-                    let mut lines = 0usize;
                     let mut truncated = false;
-                    for line in result.content.lines() {
+                    for (lines, line) in result.content.lines().enumerate() {
                         if lines >= 12 || preview.len() >= 1200 {
                             truncated = true;
                             break;
                         }
                         preview.push_str(line);
                         preview.push('\n');
-                        lines += 1;
                     }
                     print!("{}", preview);
                     if truncated {
@@ -429,7 +425,7 @@ fn try_handle_session_command(
         return Ok(false);
     }
     let action = parts.next().unwrap_or("list");
-    let store = SessionStore::new(&app.config.history_file);
+    let store = SessionStore::new(app.config.history_file.as_path());
     let _ = store.ensure_root_dir();
 
     match action {

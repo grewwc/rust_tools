@@ -294,7 +294,7 @@ mod tests {
     use super::*;
 
     /// Test data for trie operations
-    const DATA: &[&'static str] = &["hello", "world"];
+    const DATA: &[&str] = &["hello", "world"];
 
     /// Test basic insertion and search operations
     #[test]

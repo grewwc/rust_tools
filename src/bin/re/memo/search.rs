@@ -141,8 +141,8 @@ pub fn build_preview_lines(record: &MemoRecord, query: &str, max_lines: usize) -
         for idx in matched {
             let start = idx.saturating_sub(1);
             let end = (idx + 1).min(lines.len().saturating_sub(1));
-            for j in start..=end {
-                selected[j] = true;
+            for v in selected.iter_mut().take(end + 1).skip(start) {
+                *v = true;
             }
         }
         for (idx, line) in lines.iter().enumerate() {

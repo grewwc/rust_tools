@@ -6,7 +6,14 @@ pub fn handle_week(db: &MemoBackend) {
     let week_tag = memo_time::format_week_tag(first);
 
     let records = db
-        .list_records_by_tags(&vec![week_tag.clone()], false, false, -1, true, true)
+        .list_records_by_tags(
+            std::slice::from_ref(&week_tag),
+            false,
+            false,
+            -1,
+            true,
+            true,
+        )
         .unwrap_or_default();
     if records.len() > 1 {
         eprintln!("too many week tags");
@@ -17,7 +24,7 @@ pub fn handle_week(db: &MemoBackend) {
     while first < now {
         let day_tag = memo_time::format_log_tag(first);
         let day_records = db
-            .list_records_by_tags(&vec![day_tag], false, false, -1, true, true)
+            .list_records_by_tags(std::slice::from_ref(&day_tag), false, false, -1, true, true)
             .unwrap_or_default();
         if day_records.len() > 1 {
             eprintln!("log failed");
@@ -35,10 +42,12 @@ pub fn handle_week(db: &MemoBackend) {
         let _ = db.update_title(&existing.id, &title);
         crate::memo::history::write_previous_operation(&existing.id);
     } else {
-        let id = db.insert(&title, &vec![week_tag]).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
+        let id = db
+            .insert(&title, std::slice::from_ref(&week_tag))
+            .unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            });
         crate::memo::history::write_previous_operation(&id);
     }
 }

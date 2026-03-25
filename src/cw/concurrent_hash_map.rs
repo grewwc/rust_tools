@@ -556,7 +556,7 @@ mod tests {
                 }
                 for i in 0..per {
                     let k = base + i;
-                    if k % 2 == 0 {
+                    if k.is_multiple_of(2) {
                         m.remove(&k);
                     }
                 }

@@ -176,7 +176,7 @@ impl MemoBackend {
         }
         let mut records = self.list_records(-1, false, include_finished)?;
         records.retain(|r| match_tags(&r.tags, tags, use_and, prefix));
-        records.sort_by(|a, b| a.modified_date.cmp(&b.modified_date));
+        records.sort_by_key(|a| a.modified_date);
         if !reverse {
             records.reverse();
         }

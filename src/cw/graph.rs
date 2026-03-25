@@ -1334,7 +1334,7 @@ mod tests {
         for group in &mut groups {
             group.sort();
         }
-        groups.sort_by(|a, b| a[0].cmp(&b[0]));
+        groups.sort_by(|a, b| a[0].cmp(b[0]));
 
         assert_eq!(groups, vec![vec!["A", "B", "C"], vec!["D"]]);
         assert_eq!(g.num_strong_components(), 2);

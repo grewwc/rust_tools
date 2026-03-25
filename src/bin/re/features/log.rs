@@ -16,7 +16,7 @@ pub fn handle_log(db: &MemoBackend, cli: &Cli, use_vscode: bool) {
     let day = memo_time::add_days(memo_time::today_local_date(), next_day);
     let tag = memo_time::format_log_tag(day);
     let records = db
-        .list_records_by_tags(&vec![tag.clone()], false, false, -1, true, true)
+        .list_records_by_tags(std::slice::from_ref(&tag), false, false, -1, true, true)
         .unwrap_or_default();
 
     if records.len() > 1 {

@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn test_default_extensions_non_empty() {
-        assert!(DEFAULT_EXTENSIONS.contains(&".rs") == false);
+        assert!(!DEFAULT_EXTENSIONS.contains(&".rs"));
     }
 
     #[test]

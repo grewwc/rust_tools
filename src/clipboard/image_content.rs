@@ -206,10 +206,12 @@ pub fn copy_from_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let img = open_by_content(fname)?;
     let base64_data = image_to_base64(&img)?;
 
-    if stdout_is_tty() && is_ssh_session() && prefer_osc52_image_bridge() {
-        if set_clipboard_via_osc52(&base64_data).is_ok() {
-            return Ok(());
-        }
+    if stdout_is_tty()
+        && is_ssh_session()
+        && prefer_osc52_image_bridge()
+        && set_clipboard_via_osc52(&base64_data).is_ok()
+    {
+        return Ok(());
     }
 
     match Clipboard::new() {

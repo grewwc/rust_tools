@@ -68,7 +68,7 @@ pub fn collect_refs(value: Option<&str>, args: &[String], skip_tokens: &[&str]) 
         if a.is_empty() {
             continue;
         }
-        if skip_tokens.iter().any(|x| *x == a) {
+        if skip_tokens.contains(&a) {
             continue;
         }
         refs.push(a.to_string());

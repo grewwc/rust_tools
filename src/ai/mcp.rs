@@ -219,7 +219,7 @@ fn create_pipe_pair() -> Result<(File, File), String> {
         }
         let read = unsafe { File::from_raw_fd(fds[0]) };
         let write = unsafe { File::from_raw_fd(fds[1]) };
-        return Ok((read, write));
+        Ok((read, write))
     }
     #[cfg(not(unix))]
     {
@@ -518,10 +518,10 @@ impl McpClient {
 
         for name in names {
             let prefix = format!("mcp_{}_", name);
-            if let Some(tool_name) = full_name.strip_prefix(&prefix) {
-                if !tool_name.is_empty() {
-                    return Some((name.clone(), tool_name.to_string()));
-                }
+            if let Some(tool_name) = full_name.strip_prefix(&prefix)
+                && !tool_name.is_empty()
+            {
+                return Some((name.clone(), tool_name.to_string()));
             }
         }
 

@@ -4,6 +4,7 @@ use regex::Regex;
 use crate::features::core::*;
 use crate::memo::{MemoBackend, history, ui};
 
+#[allow(clippy::too_many_arguments)]
 pub fn list_by_title_feature(
     db: &MemoBackend,
     query: &str,
@@ -30,7 +31,7 @@ pub fn list_by_title_feature(
             .unwrap_or_default();
         let lower = query.to_lowercase();
         records.retain(|r| r.title.to_lowercase().contains(&lower));
-        records.sort_by(|a, b| a.modified_date.cmp(&b.modified_date));
+        records.sort_by_key(|a| a.modified_date);
         if !reverse {
             records.reverse();
         }
@@ -40,7 +41,7 @@ pub fn list_by_title_feature(
         records
     };
 
-    records.sort_by(|a, b| a.modified_date.cmp(&b.modified_date));
+    records.sort_by_key(|a| a.modified_date);
     if !reverse {
         records.reverse();
     }

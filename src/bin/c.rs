@@ -281,7 +281,7 @@ impl ExprParser {
     fn current(&self) -> &Token {
         self.tokens
             .get(self.pos)
-            .map_or_else(|| &self.tokens[self.tokens.len() - 1], |t| t)
+            .unwrap_or_else(|| &self.tokens[self.tokens.len() - 1])
     }
 
     fn advance(&mut self) {

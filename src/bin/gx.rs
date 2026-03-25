@@ -144,7 +144,7 @@ struct AnalysisResult {
 fn main() {
     let cli = Cli::parse();
 
-    let Some(mode) = cli.positional.get(0).cloned() else {
+    let Some(mode) = cli.positional.first().cloned() else {
         let mut cmd = Cli::command();
         cmd.print_help().ok();
         println!();
@@ -510,10 +510,10 @@ fn analyze_graph(edges: &[GraphEdge], opts: &AnalysisOptions) -> AnalysisResult 
                     None => {
                         result.error =
                             "graph has cycle, topological order not available".to_string();
-                        if let Some(cycle) = g.cycle() {
-                            if !cycle.is_empty() {
-                                result.cycle = cycle;
-                            }
+                        if let Some(cycle) = g.cycle()
+                            && !cycle.is_empty()
+                        {
+                            result.cycle = cycle;
                         }
                     }
                 }
@@ -607,7 +607,7 @@ fn mst_edges_out(mst: &Mst<String>) -> Vec<EdgeOut> {
     edges.sort_by(|a, b| {
         let (a1, a2) = normalize_pair(a.v1(), a.v2());
         let (b1, b2) = normalize_pair(b.v1(), b.v2());
-        a1.cmp(&b1).then_with(|| a2.cmp(&b2)).then_with(|| {
+        a1.cmp(b1).then_with(|| a2.cmp(b2)).then_with(|| {
             a.weight()
                 .partial_cmp(&b.weight())
                 .unwrap_or(std::cmp::Ordering::Equal)

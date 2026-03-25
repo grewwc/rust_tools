@@ -23,12 +23,10 @@ pub(crate) fn normalize_flag_key(flag_name: &str) -> String {
 pub(crate) fn parse_args_cmd(p: &mut Parser, bool_optionals: &[&str]) {
     let argv = std::env::args().collect::<Vec<_>>();
     let mut start = 1usize;
-    if argv.len() > 1 {
-        if p.groups.get(&argv[1]).is_some() {
-            start += 1;
-            if let Some(sub) = p.groups.get_mut(&argv[1]) {
-                *p = sub.clone();
-            }
+    if argv.len() > 1 && p.groups.get(&argv[1]).is_some() {
+        start += 1;
+        if let Some(sub) = p.groups.get_mut(&argv[1]) {
+            *p = sub.clone();
         }
     }
     let rest = argv.into_iter().skip(start).collect::<Vec<_>>();
@@ -86,11 +84,11 @@ pub(crate) fn parse_args(p: &mut Parser, cmd: &str, bool_optionals: &[&str]) {
     }
 
     let mut encoded = args.join(&SEP.to_string());
-    if p.enable_parse_num {
-        if let Some((new_encoded, num)) = extract_num_arg(&encoded) {
-            encoded = new_encoded;
-            p.num_arg = Some(num);
-        }
+    if p.enable_parse_num
+        && let Some((new_encoded, num)) = extract_num_arg(&encoded)
+    {
+        encoded = new_encoded;
+        p.num_arg = Some(num);
     }
     encoded = format!("{SEP}{encoded}{SEP}");
     parse_args_encoded(p, &encoded, &bool_opts);
@@ -128,12 +126,13 @@ pub(crate) fn parse_argv(p: &mut Parser, argv: &[String], bool_optionals: &[&str
     let mut flat = Vec::with_capacity(argv.len());
     for raw in argv {
         let trimmed = raw.trim_matches(['"', '\'']).to_string();
-        if (trimmed.starts_with('-') || trimmed.starts_with("--")) && trimmed.contains('=') {
-            if let Some((k, v)) = trimmed.split_once('=') {
-                flat.push(k.to_string());
-                flat.push(v.to_string());
-                continue;
-            }
+        if (trimmed.starts_with('-') || trimmed.starts_with("--"))
+            && trimmed.contains('=')
+            && let Some((k, v)) = trimmed.split_once('=')
+        {
+            flat.push(k.to_string());
+            flat.push(v.to_string());
+            continue;
         }
         flat.push(trimmed);
     }
@@ -159,11 +158,11 @@ pub(crate) fn parse_argv(p: &mut Parser, argv: &[String], bool_optionals: &[&str
     }
 
     let mut encoded = args.join(&SEP.to_string());
-    if p.enable_parse_num {
-        if let Some((new_encoded, num)) = extract_num_arg(&encoded) {
-            encoded = new_encoded;
-            p.num_arg = Some(num);
-        }
+    if p.enable_parse_num
+        && let Some((new_encoded, num)) = extract_num_arg(&encoded)
+    {
+        encoded = new_encoded;
+        p.num_arg = Some(num);
     }
     encoded = format!("{SEP}{encoded}{SEP}");
     parse_args_encoded(p, &encoded, &bool_opts);
@@ -210,9 +209,7 @@ fn parse_args_encoded(p: &mut Parser, encoded: &str, bool_opts: &[String]) {
 
     let mut cmd = encoded.to_string();
     for name in p.flags.keys().cloned().collect::<Vec<_>>() {
-        p.default_val_map
-            .entry(name.clone())
-            .or_insert_with(|| String::new());
+        p.default_val_map.entry(name.clone()).or_default();
         let key = format!("{QUOTE}-{name}{QUOTE}");
         let positions = indices::find_all(&cmd, &key);
         if positions.is_empty() {

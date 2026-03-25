@@ -6,6 +6,7 @@ use crate::memo::{MemoBackend, history, search as memo_search, ui};
 
 const SEARCH_PREVIEW_MAX_LINES: usize = 6;
 
+#[allow(clippy::too_many_arguments)]
 pub fn search_feature(
     db: &MemoBackend,
     query: &str,

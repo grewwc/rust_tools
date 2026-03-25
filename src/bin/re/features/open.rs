@@ -78,25 +78,25 @@ mod tests {
 
     #[test]
     fn normalize_open_tag_query_single_char_defaults_to_exact() {
-        let out = normalize_open_tag_query(&["l".to_string()].to_vec(), false);
+        let out = normalize_open_tag_query(["l".to_string()].as_ref(), false);
         assert_eq!(out, vec!["=l".to_string()]);
     }
 
     #[test]
     fn normalize_open_tag_query_keeps_non_single_char_as_is() {
-        let out = normalize_open_tag_query(&["links".to_string()].to_vec(), false);
+        let out = normalize_open_tag_query(["links".to_string()].as_ref(), false);
         assert_eq!(out, vec!["links".to_string()]);
     }
 
     #[test]
     fn normalize_open_tag_query_keeps_exact_marker() {
-        let out = normalize_open_tag_query(&["=l".to_string()].to_vec(), false);
+        let out = normalize_open_tag_query(["=l".to_string()].as_ref(), false);
         assert_eq!(out, vec!["=l".to_string()]);
     }
 
     #[test]
     fn normalize_open_tag_query_respects_prefix_mode() {
-        let out = normalize_open_tag_query(&["l".to_string()].to_vec(), true);
+        let out = normalize_open_tag_query(["l".to_string()].as_ref(), true);
         assert_eq!(out, vec!["l".to_string()]);
     }
 }

@@ -61,10 +61,8 @@ mod dispatch {
                 }
             };
 
-            let confirm = prompt_yes_or_no_interruptible(&format!(
-                "Execute command:{} (y/n): ",
-                args.to_string()
-            ));
+            let confirm =
+                prompt_yes_or_no_interruptible(&format!("Execute command:{} (y/n): ", args));
             if confirm != Some(true) {
                 println!("canceled by user.");
                 return RunOneResult {

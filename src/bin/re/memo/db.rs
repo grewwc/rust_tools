@@ -183,14 +183,12 @@ impl MemoDb {
             params![id],
             |row| row.get(0),
         )?;
-        let mut pos = start_pos + 1;
-        for tag in tags.iter().filter(|t| !t.trim().is_empty()) {
+        for (pos, tag) in (start_pos + 1..).zip(tags.iter().filter(|t| !t.trim().is_empty())) {
             upsert_tag(&tx, tag, now)?;
             tx.execute(
                 "INSERT OR IGNORE INTO record_tags (record_id, tag, position) VALUES (?1, ?2, ?3)",
                 params![id, tag, pos],
             )?;
-            pos += 1;
         }
         tx.execute(
             "UPDATE records SET modified_date=?2 WHERE id=?1",
@@ -494,7 +492,7 @@ mod tests {
     fn test_insert_and_get() {
         let db = temp_db();
         let id = db
-            .insert("hello", &vec!["a".to_string(), "b".to_string()])
+            .insert("hello", &["a".to_string(), "b".to_string()])
             .unwrap();
         let r = db.get_record(&id).unwrap().unwrap();
         assert_eq!(r.title, "hello");
@@ -504,7 +502,7 @@ mod tests {
     #[test]
     fn test_update_title_and_finish() {
         let db = temp_db();
-        let id = db.insert("hello", &vec![]).unwrap();
+        let id = db.insert("hello", &[]).unwrap();
         assert!(db.update_title(&id, "world").unwrap());
         assert!(db.set_finished(&id, true).unwrap());
         let r = db.get_record(&id).unwrap().unwrap();
@@ -515,18 +513,18 @@ mod tests {
     #[test]
     fn test_add_remove_tags_and_search() {
         let db = temp_db();
-        let id = db.insert("alpha", &vec![]).unwrap();
-        db.add_tags(&id, &vec!["x".to_string(), "y".to_string()])
+        let id = db.insert("alpha", &[]).unwrap();
+        db.add_tags(&id, &["x".to_string(), "y".to_string()])
             .unwrap();
         let found = db
-            .search_by_tags(&vec!["x".to_string()], false, 10, true)
+            .search_by_tags(&["x".to_string()], false, 10, true)
             .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, id);
 
-        db.remove_tags(&id, &vec!["x".to_string()]).unwrap();
+        db.remove_tags(&id, &["x".to_string()]).unwrap();
         let found = db
-            .search_by_tags(&vec!["x".to_string()], false, 10, true)
+            .search_by_tags(&["x".to_string()], false, 10, true)
             .unwrap();
         assert!(found.is_empty());
     }

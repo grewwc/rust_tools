@@ -84,11 +84,11 @@ impl<T> DequeList<T> {
         self.data.iter().cloned().collect()
     }
 
-    pub fn remove_first<F>(&mut self, mut pred: F) -> bool
+    pub fn remove_first<F>(&mut self, pred: F) -> bool
     where
         F: FnMut(&T) -> bool,
     {
-        if let Some(pos) = self.data.iter().position(|x| pred(x)) {
+        if let Some(pos) = self.data.iter().position(pred) {
             self.data.remove(pos);
             return true;
         }

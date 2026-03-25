@@ -72,10 +72,10 @@ impl SkillRegistry {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(skill) = self.load_skill(&path) {
-                    self.skills.insert(skill.name.clone(), skill);
-                }
+            if path.extension().map(|e| e == "json").unwrap_or(false)
+                && let Ok(skill) = self.load_skill(&path)
+            {
+                self.skills.insert(skill.name.clone(), skill);
             }
         }
 

@@ -170,7 +170,7 @@ fn history_file_parsing_sqlite_matches_go_format() {
 fn session_delete_removes_sqlite_sidecars() {
     let history_file =
         std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
-    let store = SessionStore::new(&history_file);
+    let store = SessionStore::new(history_file.as_path());
     store.ensure_root_dir().unwrap();
 
     let db = store.session_history_file("abc");
@@ -196,7 +196,7 @@ fn session_delete_removes_sqlite_sidecars() {
 fn session_clear_all_removes_all_sqlite_sidecars() {
     let history_file =
         std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
-    let store = SessionStore::new(&history_file);
+    let store = SessionStore::new(history_file.as_path());
     store.ensure_root_dir().unwrap();
 
     for id in ["a", "b", "c"] {

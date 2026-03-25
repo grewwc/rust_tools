@@ -100,7 +100,7 @@ pub fn parse_pdf(
     }
 
     let text = if opts.extract_text {
-        let mut page_numbers = match opts.pages.as_deref() {
+        let page_numbers = match opts.pages.as_deref() {
             Some(pages) => {
                 let mut out = pages
                     .iter()
@@ -604,7 +604,7 @@ fn decode_flate_image(stream: &lopdf::Stream) -> Option<DynamicImage> {
 fn ocr_image_to_text(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
-        return macos_vision_ocr(img, langs);
+        macos_vision_ocr(img, langs)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -742,7 +742,7 @@ fn macos_vision_ocr(img: &DynamicImage, langs: &[&str]) -> Result<String, String
     }
     drop(options);
 
-    let results = request.results().unwrap_or_else(|| NSArray::new());
+    let results = request.results().unwrap_or_default();
     let mut lines = Vec::new();
     for obs in results.iter() {
         let candidates: objc2::rc::Retained<NSArray<AnyObject>> =
