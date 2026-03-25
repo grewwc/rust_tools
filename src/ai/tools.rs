@@ -5,7 +5,6 @@ use std::{
     process::Command,
 };
 
-use mongodb::bson::document::Entry;
 use regex::Regex;
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -379,45 +378,20 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
         "mount",
         "umount",
         "ln",
-        "tee",
         "truncate",
-        "curl",
-        "wget",
         "ssh",
         "scp",
         "rsync",
-        "git",
-        "python",
-        "python3",
-        "node",
-        "npm",
-        "pnpm",
-        "yarn",
-        "bash",
-        "sh",
-        "zsh",
-        "fish",
-        "pwsh",
         "powershell",
         "osascript",
-        "open",
     ];
     if denied_programs.contains(&program.as_str()) {
         return Err(format!("program '{program}' is blocked"));
     }
 
-    let allowed_programs = [
-        "ls", "pwd", "cat", "head", "tail", "wc", "rg", "find", "stat", "du", "df", "uname",
-        "whoami", "date", "echo", "printf", "which",
-    ];
-    if !allowed_programs.contains(&program.as_str()) {
-        return Err(format!("program '{program}' is not allowed"));
-    }
-
     let denied_tokens = [
-        "-exec", "-delete", "--delete", "--remove", "rm", "mv", "cp", "chmod", "chown", "sudo",
-        "ssh", "scp", "rsync", "curl", "wget", "bash", "sh", "zsh", "python", "python3", "node",
-        "git",
+        "-exec", "-delete", "--delete", "--remove", "rm", "mv", "chmod", "chown", "sudo",
+        "ssh", "scp", "rsync"
     ];
     for token in tokens.iter().skip(1) {
         let t = token.to_lowercase();
@@ -438,22 +412,7 @@ fn execute_command(args: &Value) -> Result<String, String> {
         return Ok(format!("Command blocked: {reason}"));
     }
 
-    let mut cmd = if cfg!(target_os = "windows") {
-        let mut c = Command::new("cmd");
-        c.args(["/C", command]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", command]);
-        c
-    };
-
-    if let Some(dir) = cwd {
-        cmd.current_dir(dir);
-    }
-
-    let output = cmd
-        .output()
+    let output = crate::cmd::run_cmd_output(command, crate::cmd::RunCmdOptions { cwd })
         .map_err(|e| format!("Failed to execute command: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -769,11 +728,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test1() {
-        let dir = "/Users/bytedance";
-        let ret = execute_search_files(&json!(
-            {"pattern": "大模型市场趋势分析.pdf", "path": dir}
-        ));
+    fn test_execute_cmd() {
+        let command =
+            json!({"command": "zip -r feishu-aeolus-ltc-exact-match.zip feishu-aeolus-ltc-exact-match"});
+        let ret = execute_command(&command);
+        println!("ret: {:?}", ret);
     }
 
     #[test]
