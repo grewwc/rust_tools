@@ -382,8 +382,8 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
     }
 
     let denied_tokens = [
-        "-exec", "-delete", "--delete", "--remove", "rm", "mv", "chmod", "chown", "sudo",
-        "ssh", "scp", "rsync"
+        "-exec", "-delete", "--delete", "--remove", "rm", "mv", "chmod", "chown", "sudo", "ssh",
+        "scp", "rsync",
     ];
     for token in tokens.iter().skip(1) {
         let t = token.to_lowercase();

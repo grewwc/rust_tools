@@ -15,6 +15,18 @@ fn format_epoch_secs_local(secs: i64) -> String {
         .unwrap_or_else(|| secs.to_string())
 }
 
+fn format_epoch_for_display(raw: i64) -> (String, String) {
+    if raw <= 0 {
+        return (raw.to_string(), raw.to_string());
+    }
+    if raw >= 1_000_000_000_000 {
+        let secs = raw / 1000;
+        (format_epoch_secs_local(secs), format!("{raw}ms, {secs}s"))
+    } else {
+        (format_epoch_secs_local(raw), raw.to_string())
+    }
+}
+
 pub fn colorize_tags(tags: &[String]) -> Vec<String> {
     tags.iter().map(|t| t.bright_green().to_string()).collect()
 }
@@ -49,13 +61,11 @@ pub fn format_record_like_go(
     out.push_str(&format!("{indent}Hold: {}\n", record.hold));
 
     if verbose {
+        let (add_date, add_ts) = format_epoch_for_display(record.add_date);
+        out.push_str(&format!("{indent}AddDate: {add_date} ({add_ts})\n"));
+        let (modified_date, modified_ts) = format_epoch_for_display(record.modified_date);
         out.push_str(&format!(
-            "{indent}AddDate: {}\n",
-            format_epoch_secs_local(record.add_date)
-        ));
-        out.push_str(&format!(
-            "{indent}ModifiedDate: {}\n",
-            format_epoch_secs_local(record.modified_date)
+            "{indent}ModifiedDate: {modified_date} ({modified_ts})\n"
         ));
     }
 
@@ -80,4 +90,39 @@ pub fn format_record_like_go(
     }
 
     out.trim_end_matches('\n').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_record(add_date: i64, modified_date: i64) -> MemoRecord {
+        MemoRecord {
+            id: "id".to_string(),
+            add_date,
+            modified_date,
+            finished: false,
+            hold: false,
+            title: "t".to_string(),
+            tags: vec![],
+        }
+    }
+
+    #[test]
+    fn verbose_print_includes_raw_epoch_seconds() {
+        let record = make_record(1_712_345_678, 1_712_345_679);
+        let out = format_record_like_go(&record, true, None);
+        assert!(out.contains("AddDate: "));
+        assert!(out.contains("(1712345678)"));
+        assert!(out.contains("ModifiedDate: "));
+        assert!(out.contains("(1712345679)"));
+    }
+
+    #[test]
+    fn verbose_print_handles_epoch_millis() {
+        let record = make_record(1_712_345_678_901, 1_712_345_679_000);
+        let out = format_record_like_go(&record, true, None);
+        assert!(out.contains("1712345678901ms, 1712345678s"));
+        assert!(out.contains("1712345679000ms, 1712345679s"));
+    }
 }
