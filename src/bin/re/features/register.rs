@@ -10,6 +10,24 @@ use super::{
     list_by_tag_name, list_by_title, list_tags, log, open, pull, push, search, update, week,
 };
 
+fn should_list_by_positional_object_id(
+    cli: &Cli,
+    list_tags_and_order_by_time: bool,
+    title_query: &str,
+    search_query: &str,
+) -> bool {
+    if list_tags_and_order_by_time {
+        return false;
+    }
+    if !title_query.trim().is_empty() || !search_query.trim().is_empty() {
+        return false;
+    }
+    if cli.args.len() != 1 {
+        return false;
+    }
+    is_object_id_like(&cli.args[0])
+}
+
 pub struct ReContext {
     pub db: Arc<MemoBackend>,
     pub cli: Arc<Cli>,
@@ -292,13 +310,29 @@ fn register_list_by_tag_name(parser: &mut terminalw::Parser, ctx: Arc<ReContext>
                     ctx.list_tags_and_order_by_time,
                     &ctx.title_query,
                     &ctx.cli.search,
+                ) || should_list_by_positional_object_id(
+                    ctx.cli.as_ref(),
+                    ctx.list_tags_and_order_by_time,
+                    &ctx.title_query,
+                    &ctx.cli.search,
                 )
             }
         })
         .do_action(move || {
+            let by_tag_query = should_list_by_tag_name(
+                ctx.tag_query_non_empty,
+                ctx.list_tags_and_order_by_time,
+                &ctx.title_query,
+                &ctx.cli.search,
+            );
+            let query = if by_tag_query {
+                ctx.tag_query_raw.as_deref().unwrap_or("")
+            } else {
+                ctx.cli.args.get(0).map(|s| s.as_str()).unwrap_or("")
+            };
             list_by_tag_name::list_by_tag_name_feature(
                 ctx.db.as_ref(),
-                ctx.tag_query_raw.as_deref().unwrap_or(""),
+                query,
                 ctx.cli.as_ref(),
                 ctx.prefix,
                 ctx.record_limit,
@@ -342,4 +376,44 @@ fn register_default(parser: &mut terminalw::Parser, ctx: Arc<ReContext>) {
     parser.on(|_| true).do_action(move || {
         default_print::default_print(ctx.db.as_ref(), ctx.record_limit, ctx.list_special);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn positional_object_id_triggers_list_by_tag_name_path() {
+        let argv = normalize_legacy_single_dash_long_args([
+            "re".to_string(),
+            "6938d88ca1f8f546540c3d68".to_string(),
+        ]);
+        let cli = parse_cli_and_parser(argv).1;
+        let title_query = first_non_empty(&[cli.title.as_str(), cli.content.as_str()]).to_string();
+        let list_tags_and_order_by_time = order_by_time(&cli, None);
+        assert!(should_list_by_positional_object_id(
+            &cli,
+            list_tags_and_order_by_time,
+            &title_query,
+            &cli.search
+        ));
+    }
+
+    #[test]
+    fn positional_object_id_does_not_override_title_search() {
+        let argv = normalize_legacy_single_dash_long_args([
+            "re".to_string(),
+            "--title=hello".to_string(),
+            "6938d88ca1f8f546540c3d68".to_string(),
+        ]);
+        let cli = parse_cli_and_parser(argv).1;
+        let title_query = first_non_empty(&[cli.title.as_str(), cli.content.as_str()]).to_string();
+        let list_tags_and_order_by_time = order_by_time(&cli, None);
+        assert!(!should_list_by_positional_object_id(
+            &cli,
+            list_tags_and_order_by_time,
+            &title_query,
+            &cli.search
+        ));
+    }
 }

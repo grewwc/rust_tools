@@ -721,8 +721,7 @@ mod tests {
 
     #[test]
     fn test_execute_cmd() {
-        let command =
-            json!({"command": "zip -r feishu-aeolus-ltc-exact-match.zip feishu-aeolus-ltc-exact-match"});
+        let command = json!({"command": "zip -r feishu-aeolus-ltc-exact-match.zip feishu-aeolus-ltc-exact-match"});
         let ret = execute_command(&command);
         println!("ret: {:?}", ret);
     }
