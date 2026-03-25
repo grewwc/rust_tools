@@ -394,9 +394,16 @@ pub fn get_tag_query_raw(cli: &Cli) -> Option<String> {
         if tags.is_empty() {
             return Some(String::new());
         }
+        let default_mode = if cli.a || cli.all { '~' } else { '=' };
         return Some(
             tags.into_iter()
-                .map(|t| format!("={t}"))
+                .map(|t| {
+                    if t.starts_with('=') || t.starts_with('~') || t.starts_with('^') {
+                        t
+                    } else {
+                        format!("{default_mode}{t}")
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(" "),
         );

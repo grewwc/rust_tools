@@ -148,6 +148,18 @@ mod tests {
     }
 
     #[test]
+    fn tag_query_t_with_a_uses_contains_match() {
+        let argv = normalize_legacy_single_dash_long_args([
+            "re".to_string(),
+            "-t".to_string(),
+            "db".to_string(),
+            "-a".to_string(),
+        ]);
+        let cli = parse_cli_and_parser(argv).1;
+        assert_eq!(get_tag_query_raw(&cli).as_deref(), Some("~db"));
+    }
+
+    #[test]
     fn normalize_title_keeps_non_link_text() {
         let plain = "第一行\r\n第二行";
         let normalized = normalize_title_for_display(plain);
