@@ -1042,9 +1042,6 @@ fn render_math_tex_to_unicode(s: &str) -> String {
     use regex::Regex;
     use std::sync::LazyLock;
 
-    static RE_FRAC: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\\frac\{([^{}]+)\}\{([^{}]+)\}").unwrap());
-    static RE_SQRT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\sqrt\{([^{}]+)\}").unwrap());
     static RE_MATHBB: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"\\mathbb\{([A-Za-z])\}").unwrap());
 
@@ -1057,6 +1054,173 @@ fn render_math_tex_to_unicode(s: &str) -> String {
     t = t.replace("\\:", " ");
     t = t.replace("\\!", "");
     t = t.replace("\\ ", " ");
+
+    fn read_group_braced(s: &str, start: usize) -> Option<(String, usize)> {
+        let bytes = s.as_bytes();
+        if start >= bytes.len() || bytes[start] != b'{' {
+            return None;
+        }
+        let mut i = start + 1;
+        let mut depth = 1usize;
+        let mut out = String::new();
+        while i < bytes.len() {
+            let ch = match s.get(i..) {
+                Some(rest) => match rest.chars().next() {
+                    Some(ch) => ch,
+                    None => break,
+                },
+                None => break,
+            };
+            i += ch.len_utf8();
+            match ch {
+                '{' => {
+                    depth += 1;
+                    out.push(ch);
+                }
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some((out, i));
+                    }
+                    out.push(ch);
+                }
+                _ => out.push(ch),
+            }
+        }
+        None
+    }
+
+    fn read_group_bracketed(s: &str, start: usize) -> Option<(String, usize)> {
+        let bytes = s.as_bytes();
+        if start >= bytes.len() || bytes[start] != b'[' {
+            return None;
+        }
+        let mut i = start + 1;
+        let mut depth = 1usize;
+        let mut out = String::new();
+        while i < bytes.len() {
+            let ch = match s.get(i..) {
+                Some(rest) => match rest.chars().next() {
+                    Some(ch) => ch,
+                    None => break,
+                },
+                None => break,
+            };
+            i += ch.len_utf8();
+            match ch {
+                '[' => {
+                    depth += 1;
+                    out.push(ch);
+                }
+                ']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some((out, i));
+                    }
+                    out.push(ch);
+                }
+                _ => out.push(ch),
+            }
+        }
+        None
+    }
+
+    fn needs_parens(s: &str) -> bool {
+        let s = s.trim();
+        if s.is_empty() {
+            return false;
+        }
+        if s.starts_with('-') {
+            return true;
+        }
+        if s.chars().count() <= 1 {
+            return false;
+        }
+        for ch in s.chars() {
+            if ch.is_whitespace() {
+                return true;
+            }
+            if matches!(
+                ch,
+                '+' | '-' | '*' | '/' | '=' | '±' | '∓' | '×' | '·' | '÷' | '→' | '←' | '↔'
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn wrap_parens(s: &str) -> String {
+        let s = s.trim();
+        if needs_parens(s) {
+            format!("({s})")
+        } else {
+            s.to_string()
+        }
+    }
+
+    fn replace_structural_tex(mut s: String) -> String {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let bytes = s.as_bytes();
+            let mut out = String::with_capacity(s.len());
+            let mut i = 0usize;
+            while i < bytes.len() {
+                if s[i..].starts_with("\\frac") {
+                    let mut j = i + "\\frac".len();
+                    while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                        j += 1;
+                    }
+                    if let Some((num, j2)) = read_group_braced(&s, j) {
+                        let mut k = j2;
+                        while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t') {
+                            k += 1;
+                        }
+                        if let Some((den, k2)) = read_group_braced(&s, k) {
+                            let num = replace_structural_tex(num);
+                            let den = replace_structural_tex(den);
+                            let num = wrap_parens(&num);
+                            let den = wrap_parens(&den);
+                            out.push_str(&format!("{num}/{den}"));
+                            i = k2;
+                            changed = true;
+                            continue;
+                        }
+                    }
+                }
+                if s[i..].starts_with("\\sqrt") {
+                    let mut j = i + "\\sqrt".len();
+                    while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                        j += 1;
+                    }
+                    if j < bytes.len() && bytes[j] == b'[' {
+                        if let Some((_, j2)) = read_group_bracketed(&s, j) {
+                            j = j2;
+                            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                                j += 1;
+                            }
+                        }
+                    }
+                    if let Some((rad, j2)) = read_group_braced(&s, j) {
+                        let rad = replace_structural_tex(rad);
+                        let rad = rad.trim();
+                        out.push_str(&format!("√({rad})"));
+                        i = j2;
+                        changed = true;
+                        continue;
+                    }
+                }
+                let ch = s[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+            s = out;
+        }
+        s
+    }
+
+    t = replace_structural_tex(t);
 
     t = t.replace("\\times", "×");
     t = t.replace("\\cdot", "·");
@@ -1123,8 +1287,6 @@ fn render_math_tex_to_unicode(s: &str) -> String {
     t = t.replace("\\Psi", "Ψ");
     t = t.replace("\\Omega", "Ω");
 
-    t = RE_FRAC.replace_all(&t, "$1/$2").to_string();
-    t = RE_SQRT.replace_all(&t, "√($1)").to_string();
     t = RE_MATHBB
         .replace_all(&t, |caps: &regex::Captures| {
             let v = &caps[1];

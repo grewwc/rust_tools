@@ -366,6 +366,25 @@ fn table_live_preview_detection_requires_table_like_content() {
 }
 
 #[test]
+fn math_frac_renders_with_nested_braces() {
+    let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
+    assert_eq!(renderer.consume_line("$$", false), "\n");
+
+    let out = renderer.consume_line(
+        r"x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}",
+        false,
+    );
+    assert!(out.contains("x ="));
+    assert!(out.contains("(-b ± √(b² - 4ac))/2a"));
+    assert!(!out.contains("\\frac"));
+
+    let out2 = renderer.consume_line(r"y = \frac{1}{\frac{2}{3}}", false);
+    assert!(out2.contains("y ="));
+    assert!(out2.contains("1/(2/3)"));
+    assert!(!out2.contains("\\frac"));
+}
+
+#[test]
 fn execute_command_blocks_dangerous_programs() {
     assert!(tools::validate_execute_command("rm -rf /").is_err());
     assert!(tools::validate_execute_command("mv a b").is_err());

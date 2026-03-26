@@ -8,6 +8,7 @@ use std::{
 use regex::Regex;
 use serde_json::{Value, json};
 use std::time::Duration;
+use std::{io::Read, process::Stdio, time::Instant};
 
 use super::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
 
@@ -327,9 +328,66 @@ pub(super) fn execute_tool_call(tool_call: &ToolCall) -> Result<ToolResult, Stri
     })
 }
 
+fn is_sensitive_fs_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let s = s.as_ref();
+    if s.contains("/.ssh/")
+        || s.ends_with("/.ssh")
+        || s.contains("/.gnupg/")
+        || s.ends_with("/.gnupg")
+        || s.contains("/.aws/")
+        || s.ends_with("/.aws")
+        || s.contains("/.kube/")
+        || s.ends_with("/.kube")
+        || s.contains("/.configW")
+        || s.ends_with("/.configW")
+    {
+        return true;
+    }
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    matches!(
+        name,
+        "id_rsa"
+            | "id_rsa.pub"
+            | "id_ed25519"
+            | "id_ed25519.pub"
+            | "authorized_keys"
+            | "known_hosts"
+            | ".netrc"
+            | ".npmrc"
+            | ".pypirc"
+            | ".git-credentials"
+            | "credentials"
+            | "config.json"
+    )
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(max_chars + 32);
+    for (i, ch) in s.chars().enumerate() {
+        if i >= max_chars {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("\n... (truncated)");
+    out
+}
+
 fn execute_read_file(args: &Value) -> Result<String, String> {
     let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
     let path = PathBuf::from(file_path);
+    if !path.is_absolute() {
+        return Err("file_path must be absolute".to_string());
+    }
+    if is_sensitive_fs_path(&path) {
+        return Err("Access blocked: sensitive path".to_string());
+    }
 
     if !path.exists() {
         return Err(format!("File not found: {}", file_path));
@@ -357,6 +415,12 @@ fn execute_read_file(args: &Value) -> Result<String, String> {
 fn execute_read_file_lines(args: &Value) -> Result<String, String> {
     let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
     let path = PathBuf::from(file_path);
+    if !path.is_absolute() {
+        return Err("file_path must be absolute".to_string());
+    }
+    if is_sensitive_fs_path(&path) {
+        return Err("Access blocked: sensitive path".to_string());
+    }
 
     if !path.exists() {
         return Err(format!("File not found: {}", file_path));
@@ -386,6 +450,12 @@ fn execute_write_file(args: &Value) -> Result<String, String> {
     let content = args["content"].as_str().ok_or("Missing content")?;
 
     let path = PathBuf::from(file_path);
+    if !path.is_absolute() {
+        return Err("file_path must be absolute".to_string());
+    }
+    if is_sensitive_fs_path(&path) {
+        return Err("Access blocked: sensitive path".to_string());
+    }
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
@@ -520,6 +590,12 @@ fn execute_apply_patch(args: &Value) -> Result<String, String> {
     let patch = args["patch"].as_str().ok_or("Missing patch")?;
 
     let path = PathBuf::from(file_path);
+    if !path.is_absolute() {
+        return Err("file_path must be absolute".to_string());
+    }
+    if is_sensitive_fs_path(&path) {
+        return Err("Access blocked: sensitive path".to_string());
+    }
     let original = if path.exists() {
         fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))?
     } else {
@@ -661,6 +737,19 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
     let program = tokens[0].to_lowercase();
 
     let denied_programs = [
+        "bash",
+        "sh",
+        "zsh",
+        "fish",
+        "python",
+        "python3",
+        "perl",
+        "ruby",
+        "node",
+        "deno",
+        "php",
+        "java",
+        "jshell",
         "rm",
         "mv",
         "cp",
@@ -687,6 +776,16 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
         "ssh",
         "scp",
         "rsync",
+        "curl",
+        "wget",
+        "nc",
+        "netcat",
+        "ncat",
+        "socat",
+        "telnet",
+        "ftp",
+        "sftp",
+        "nmap",
         "powershell",
         "osascript",
     ];
@@ -711,26 +810,65 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
 fn execute_command(args: &Value) -> Result<String, String> {
     let command = args["command"].as_str().ok_or("Missing command")?;
     let cwd = args["cwd"].as_str();
-    let _timeout = args["timeout"].as_u64().unwrap_or(30);
+    let timeout = args["timeout"].as_u64().unwrap_or(30).clamp(1, 300);
 
     if let Err(reason) = validate_execute_command(command) {
         return Ok(format!("Command blocked: {reason}"));
     }
 
-    let output = crate::cmd::run_cmd_output(command, crate::cmd::RunCmdOptions { cwd })
-        .map_err(|e| format!("Failed to execute command: {}", e))?;
+    let mut iter = crate::strw::split::split_space_keep_symbol(command, r#"""#);
+    let Some(program) = iter.next() else {
+        return Err("empty command".to_string());
+    };
+    let mut cmd = Command::new(program);
+    if let Some(dir) = cwd {
+        if !dir.trim().is_empty() {
+            cmd.current_dir(dir);
+        }
+    }
+    iter.for_each(|arg| {
+        let new_arg = crate::common::utils::expanduser(arg);
+        if new_arg == arg {
+            cmd.arg(new_arg.as_ref());
+        } else {
+            cmd.arg(new_arg.into_owned());
+        }
+    });
+    cmd.stdin(Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to execute command: {}", e))?;
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Ok("Command blocked: timeout".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("Failed to execute command: {}", e)),
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to collect command output: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
     if output.status.success() {
-        Ok(stdout.trim().to_string())
+        Ok(truncate_chars(stdout.trim(), 16_000))
     } else {
-        Ok(format!(
+        Ok(truncate_chars(
+            &format!(
             "Exit code: {}\n{}\n{}",
             output.status.code().unwrap_or(-1),
             stdout.trim(),
             stderr.trim()
+        ),
+            16_000,
         ))
     }
 }
@@ -752,7 +890,7 @@ fn execute_grep_search(args: &Value) -> Result<String, String> {
         .map_err(|e| format!("Failed to execute rg: {}", e))?;
 
     let result = String::from_utf8_lossy(&output.stdout).into_owned();
-    Ok(result.trim().to_string())
+    Ok(truncate_chars(result.trim(), 16_000))
 }
 
 fn execute_git_status(args: &Value) -> Result<String, String> {
@@ -925,6 +1063,29 @@ fn execute_web_search(args: &Value) -> Result<String, String> {
 
 fn execute_web_fetch(args: &Value) -> Result<String, String> {
     let url = args["url"].as_str().ok_or("Missing url")?;
+    let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid url".to_string())?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err("Only http/https urls are allowed".to_string());
+    }
+    let Some(host) = parsed.host_str() else {
+        return Err("Invalid url host".to_string());
+    };
+    let host_lc = host.to_lowercase();
+    if host_lc == "localhost" || host_lc.ends_with(".localhost") || host_lc.ends_with(".local") {
+        return Err("Blocked url host".to_string());
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        let blocked = match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_multicast()
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local(),
+        };
+        if blocked {
+            return Err("Blocked url host".to_string());
+        }
+    }
 
     let client = reqwest::blocking::Client::builder()
         .timeout(HTTP_TOOL_TIMEOUT)
@@ -932,14 +1093,21 @@ fn execute_web_fetch(args: &Value) -> Result<String, String> {
         .build()
         .map_err(|e| format!("Failed to build http client: {}", e))?;
 
-    let response = client
+    let mut response = client
         .get(url)
         .send()
         .map_err(|e| format!("Failed to fetch URL: {}", e))?;
 
-    let content = response
-        .text()
+    const MAX_BYTES: usize = 512 * 1024;
+    let mut buf = Vec::new();
+    response
+        .take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
         .map_err(|e| format!("Failed to read response: {}", e))?;
+    if buf.len() > MAX_BYTES {
+        buf.truncate(MAX_BYTES);
+    }
+    let content = String::from_utf8_lossy(&buf).to_string();
 
     Ok(content)
 }
