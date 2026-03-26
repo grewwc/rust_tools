@@ -6,6 +6,8 @@ use std::path::Path;
 
 use crate::ai::{mcp::McpClient, types::App};
 
+const FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS: u64 = 20_000;
+
 #[derive(Debug, Clone)]
 pub struct McpInitReport {
     pub config_path: String,
@@ -90,6 +92,20 @@ pub fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitReport {
             true
         }
     });
+
+    for (name, server_cfg) in &mut loaded_servers {
+        if is_feishu_mcp_server(name, &server_cfg.command)
+            && server_cfg.request_timeout_ms < FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS
+        {
+            eprintln!(
+                "[mcp] raise server '{}' request_timeout_ms from {} to {} for Feishu network calls",
+                name,
+                server_cfg.request_timeout_ms,
+                FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS
+            );
+            server_cfg.request_timeout_ms = FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS;
+        }
+    }
 
     for (name, server_cfg) in &loaded_servers {
         if let Err(err) = mcp_client.connect_server(name, server_cfg) {

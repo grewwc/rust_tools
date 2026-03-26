@@ -46,7 +46,7 @@ cargo build --bin mcp_feishu
         "FEISHU_USER_ACCESS_TOKEN": "u-***",
         "FEISHU_BASE_URL": "https://open.feishu.cn"
       },
-      "request_timeout_ms": 8000,
+      "request_timeout_ms": 20000,
       "disabled": false
     }
   }
@@ -66,7 +66,7 @@ cargo build --bin mcp_feishu
         "FEISHU_APP_SECRET": "***",
         "FEISHU_BASE_URL": "https://open.feishu.cn"
       },
-      "request_timeout_ms": 8000,
+      "request_timeout_ms": 20000,
       "disabled": false
     }
   }

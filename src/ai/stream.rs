@@ -815,7 +815,10 @@ fn is_table_separator(line: &str) -> bool {
     if s.ends_with('|') && !s.is_empty() {
         s = &s[..s.len() - 1];
     }
-    let parts = s.split('|').map(|p| p.trim()).filter(|p| !p.is_empty());
+    let parts = split_table_segments(s)
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
     let mut count = 0usize;
     for p in parts {
         count += 1;
@@ -831,20 +834,20 @@ fn is_table_separator(line: &str) -> bool {
 fn parse_table_row(line: &str) -> Vec<String> {
     let (_, rest) = split_indent(line);
     let s = rest.trim();
-    let mut raw = s.split('|').map(|p| p.trim()).collect::<Vec<_>>();
+    let mut raw = split_table_segments(s);
     if s.starts_with('|') && !raw.is_empty() && raw.first().is_some_and(|x| x.is_empty()) {
         raw.remove(0);
     }
     if s.ends_with('|') && !raw.is_empty() && raw.last().is_some_and(|x| x.is_empty()) {
         raw.pop();
     }
-    raw.into_iter().map(|x| x.to_string()).collect()
+    raw.into_iter().map(|x| x.trim().to_string()).collect()
 }
 
 fn parse_table_align(line: &str, cols: usize) -> Vec<TableAlign> {
     let (_, rest) = split_indent(line);
     let s = rest.trim();
-    let mut raw = s.split('|').map(|p| p.trim()).collect::<Vec<_>>();
+    let mut raw = split_table_segments(s);
     if s.starts_with('|') && !raw.is_empty() && raw.first().is_some_and(|x| x.is_empty()) {
         raw.remove(0);
     }
@@ -852,7 +855,12 @@ fn parse_table_align(line: &str, cols: usize) -> Vec<TableAlign> {
         raw.pop();
     }
     let mut out = Vec::with_capacity(cols);
-    for seg in raw.iter().copied().chain(std::iter::repeat("")).take(cols) {
+    for seg in raw
+        .iter()
+        .map(|s| s.as_str())
+        .chain(std::iter::repeat(""))
+        .take(cols)
+    {
         let seg = seg.trim();
         let left = seg.starts_with(':');
         let right = seg.ends_with(':');
@@ -863,6 +871,59 @@ fn parse_table_align(line: &str, cols: usize) -> Vec<TableAlign> {
         });
     }
     out
+}
+
+fn split_table_segments(s: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = s.chars().peekable();
+    let mut in_code = false;
+    let mut in_math = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            current.push(ch);
+            escaped = true;
+            continue;
+        }
+
+        if ch == '`' && !in_math {
+            in_code = !in_code;
+            current.push(ch);
+            continue;
+        }
+
+        if ch == '$' && !in_code {
+            if chars.peek().copied() == Some('$') {
+                chars.next();
+                in_math = !in_math;
+                current.push('$');
+                current.push('$');
+                continue;
+            }
+
+            in_math = !in_math;
+            current.push(ch);
+            continue;
+        }
+
+        if ch == '|' && !in_code && !in_math {
+            segments.push(std::mem::take(&mut current));
+            continue;
+        }
+
+        current.push(ch);
+    }
+
+    segments.push(current);
+    segments
 }
 
 fn strip_inline_md_markers(s: &str) -> String {
@@ -941,101 +1002,123 @@ fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
         return vec![String::new()];
     }
 
-    let bytes = s.as_bytes();
-    let mut i = 0usize;
     let mut bold = false;
-    let mut code = false;
-    let mut math = false;
-    let mut math_delim = "$";
     let mut cur = String::new();
     let mut cur_w = 0usize;
     let mut lines: Vec<String> = Vec::new();
 
-    let start_new_line = |cur: &mut String,
-                          cur_w: &mut usize,
-                          bold: bool,
-                          code: bool,
-                          math: bool,
-                          math_delim: &str| {
+    let start_new_line = |cur: &mut String, cur_w: &mut usize, bold: bool| {
         if bold {
             cur.push_str("**");
-        }
-        if code {
-            cur.push('`');
-        }
-        if math {
-            cur.push_str(math_delim);
         }
         *cur_w = 0;
     };
 
-    let close_line = |lines: &mut Vec<String>,
-                      cur: &mut String,
-                      bold: bool,
-                      code: bool,
-                      math: bool,
-                      math_delim: &str| {
-        if code {
-            cur.push('`');
-        }
+    let close_line = |lines: &mut Vec<String>, cur: &mut String, bold: bool| {
         if bold {
             cur.push_str("**");
-        }
-        if math {
-            cur.push_str(math_delim);
         }
         lines.push(std::mem::take(cur));
     };
 
-    start_new_line(&mut cur, &mut cur_w, bold, code, math, math_delim);
+    let mut i = 0usize;
+    start_new_line(&mut cur, &mut cur_w, bold);
 
-    while i < bytes.len() {
-        if bytes[i] == b'`' {
-            code = !code;
-            cur.push('`');
-            i += 1;
-            continue;
-        }
-        if !code && bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+    while i < s.len() {
+        let rest = &s[i..];
+
+        if rest.starts_with("**") {
             bold = !bold;
             cur.push_str("**");
             i += 2;
             continue;
         }
-        if !code && bytes[i] == b'$' {
-            let is_double = i + 1 < bytes.len() && bytes[i + 1] == b'$';
-            let delim = if is_double { "$$" } else { "$" };
-            if math {
-                if delim == math_delim {
-                    math = false;
-                    cur.push_str(delim);
-                    i += delim.len();
-                    continue;
-                }
-            } else {
-                math = true;
-                math_delim = delim;
-                cur.push_str(delim);
-                i += delim.len();
-                continue;
+
+        if let Some((piece, next)) = take_atomic_markdown_span(s, i) {
+            let piece_width = visible_width(&piece);
+            if cur_w > 0 && cur_w + piece_width > width {
+                close_line(&mut lines, &mut cur, bold);
+                start_new_line(&mut cur, &mut cur_w, bold);
             }
+            cur.push_str(&piece);
+            cur_w += piece_width;
+            i = next;
+            continue;
         }
-        let ch = s[i..].chars().next().unwrap();
+
+        let ch = rest.chars().next().unwrap();
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
         if cur_w > 0 && cur_w + w > width {
-            close_line(&mut lines, &mut cur, bold, code, math, math_delim);
-            start_new_line(&mut cur, &mut cur_w, bold, code, math, math_delim);
+            close_line(&mut lines, &mut cur, bold);
+            start_new_line(&mut cur, &mut cur_w, bold);
         }
         cur.push(ch);
         cur_w += w;
         i += ch.len_utf8();
     }
 
-    close_line(&mut lines, &mut cur, bold, code, math, math_delim);
+    close_line(&mut lines, &mut cur, bold);
     if lines.is_empty() {
         lines.push(String::new());
     }
     lines
+}
+
+fn take_atomic_markdown_span(s: &str, start: usize) -> Option<(String, usize)> {
+    let rest = &s[start..];
+
+    if rest.starts_with('`') {
+        let end = find_unescaped_delim(s, start + 1, "`")?;
+        return Some((s[start..end].to_string(), end));
+    }
+
+    if rest.starts_with("$$") {
+        let end = find_unescaped_delim(s, start + 2, "$$")?;
+        return Some((s[start..end].to_string(), end));
+    }
+
+    if rest.starts_with('$') {
+        let end = find_unescaped_delim(s, start + 1, "$")?;
+        return Some((s[start..end].to_string(), end));
+    }
+
+    if rest.starts_with("\\") {
+        let next = rest[1..].chars().next()?;
+        let end = start + 1 + next.len_utf8();
+        return Some((s[start..end].to_string(), end));
+    }
+
+    None
+}
+
+fn find_unescaped_delim(s: &str, mut i: usize, delim: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if s[i..].starts_with(delim) && !is_escaped_at(s, i) {
+            return Some(i + delim.len());
+        }
+        let ch = s[i..].chars().next()?;
+        i += ch.len_utf8();
+    }
+    None
+}
+
+fn is_escaped_at(s: &str, idx: usize) -> bool {
+    if idx == 0 {
+        return false;
+    }
+
+    let mut backslashes = 0usize;
+    let mut i = idx;
+    while i > 0 {
+        let prev = s[..i].chars().next_back().unwrap();
+        if prev != '\\' {
+            break;
+        }
+        backslashes += 1;
+        i -= prev.len_utf8();
+    }
+    backslashes % 2 == 1
 }
 
 fn render_math_tex_to_unicode(s: &str) -> String {
@@ -1743,5 +1826,33 @@ mod tests {
         let out = renderer.consume_line("**hello**", true);
         assert!(out.contains("\x1b[1A\r\x1b[0J"));
         assert!(!out.contains("\x1b[2A\r\x1b[0J"));
+    }
+
+    #[test]
+    fn parse_table_row_ignores_embedded_pipes() {
+        assert_eq!(
+            parse_table_row(r#"| `a|b` | x \| y | $p|q$ |"#),
+            vec!["`a|b`", r#"x \| y"#, "$p|q$"]
+        );
+    }
+
+    #[test]
+    fn wrap_md_cell_uses_visible_width_for_math_and_code_spans() {
+        let math = wrap_md_cell(r#"$\frac{1}{2}$"#, 5);
+        assert_eq!(math, vec![r#"$\frac{1}{2}$"#]);
+
+        let code = wrap_md_cell(r#"`a|b`"#, 3);
+        assert_eq!(code, vec![r#"`a|b`"#]);
+    }
+
+    #[test]
+    fn compute_table_widths_does_not_add_columns_for_embedded_pipes() {
+        let header = parse_table_row("| name | value |");
+        let rows = vec![parse_table_row(r#"| `a|b` | $\frac{1}{2}$ |"#)];
+        let widths = compute_table_widths("", &header, &rows);
+
+        assert_eq!(widths.len(), 2);
+        assert!(widths[0] >= visible_width("`a|b`"));
+        assert!(widths[1] >= visible_width(r#"$\frac{1}{2}$"#));
     }
 }
