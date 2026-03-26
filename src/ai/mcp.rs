@@ -1,13 +1,11 @@
 use std::{
     collections::HashMap,
-    fs::File,
     io::{BufRead, BufReader, Write},
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
-    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -15,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 #[cfg(unix)]
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::AsRawFd;
 
 use super::types::{
     FunctionDefinition, McpPrompt, McpResource, McpServerConfig, McpTool, ToolDefinition,
@@ -57,58 +55,28 @@ pub(super) struct McpClient {
 }
 
 struct McpServerConnection {
-    transport: McpTransport,
+    process: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
     request_timeout_ms: u64,
     tools: Vec<McpTool>,
     resources: Vec<McpResource>,
     prompts: Vec<McpPrompt>,
 }
 
-enum McpTransport {
-    Process {
-        process: Child,
-        stdin: ChildStdin,
-        stdout: BufReader<ChildStdout>,
-    },
-    InProcess {
-        stdin: File,
-        stdout: BufReader<File>,
-        join: Option<JoinHandle<()>>,
-    },
-}
-
 impl McpServerConnection {
     fn stdin_mut(&mut self) -> &mut dyn Write {
-        match &mut self.transport {
-            McpTransport::Process { stdin, .. } => stdin,
-            McpTransport::InProcess { stdin, .. } => stdin,
-        }
-    }
-
-    fn stdout_mut(&mut self) -> &mut dyn BufRead {
-        match &mut self.transport {
-            McpTransport::Process { stdout, .. } => stdout,
-            McpTransport::InProcess { stdout, .. } => stdout,
-        }
+        &mut self.stdin
     }
 
     fn read_response_line(&mut self) -> Result<String, String> {
-        match &mut self.transport {
-            McpTransport::Process { stdout, .. } => {
-                let mut response_line = String::new();
-                read_line_with_timeout_process(
-                    stdout,
-                    self.request_timeout_ms,
-                    &mut response_line,
-                )?;
-                Ok(response_line)
-            }
-            McpTransport::InProcess { stdout, .. } => {
-                let mut response_line = String::new();
-                read_line_with_timeout_file(stdout, self.request_timeout_ms, &mut response_line)?;
-                Ok(response_line)
-            }
-        }
+        let mut response_line = String::new();
+        read_line_with_timeout_process(
+            &mut self.stdout,
+            self.request_timeout_ms,
+            &mut response_line,
+        )?;
+        Ok(response_line)
     }
 }
 
@@ -149,16 +117,6 @@ fn wait_fd_readable(_fd: i32, _timeout_ms: u64) -> Result<(), String> {
 
 fn read_line_with_timeout_process(
     stdout: &mut BufReader<ChildStdout>,
-    timeout_ms: u64,
-    response_line: &mut String,
-) -> Result<(), String> {
-    let line = read_line_with_timeout_buf(stdout, stdout.get_ref().as_raw_fd(), timeout_ms)?;
-    response_line.push_str(&line);
-    Ok(())
-}
-
-fn read_line_with_timeout_file(
-    stdout: &mut BufReader<File>,
     timeout_ms: u64,
     response_line: &mut String,
 ) -> Result<(), String> {
@@ -209,24 +167,6 @@ fn read_line_with_timeout_buf<R: std::io::Read>(
     }
 }
 
-fn create_pipe_pair() -> Result<(File, File), String> {
-    #[cfg(unix)]
-    {
-        let mut fds = [0i32; 2];
-        let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-        if rc != 0 {
-            return Err(format!("pipe failed: {}", std::io::Error::last_os_error()));
-        }
-        let read = unsafe { File::from_raw_fd(fds[0]) };
-        let write = unsafe { File::from_raw_fd(fds[1]) };
-        Ok((read, write))
-    }
-    #[cfg(not(unix))]
-    {
-        Err("inprocess mcp is only supported on unix".to_string())
-    }
-}
-
 impl McpClient {
     pub(super) fn new() -> Self {
         Self {
@@ -262,11 +202,9 @@ impl McpClient {
         let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
 
         let mut conn = McpServerConnection {
-            transport: McpTransport::Process {
-                process,
-                stdin,
-                stdout: BufReader::new(stdout),
-            },
+            process,
+            stdin,
+            stdout: BufReader::new(stdout),
             request_timeout_ms: config.request_timeout_ms.max(100),
             tools: Vec::new(),
             resources: Vec::new(),
@@ -275,6 +213,8 @@ impl McpClient {
 
         self.initialize_server(&mut conn)?;
         conn.tools = self.list_tools(&mut conn)?;
+        conn.resources = self.list_resources(&mut conn)?;
+        conn.prompts = self.list_prompts(&mut conn)?;
 
         self.servers.insert(name.to_string(), Mutex::new(conn));
         Ok(())
@@ -308,7 +248,25 @@ impl McpClient {
         let response: JsonRpcResponse = serde_json::from_str(&response_line)
             .map_err(|e| format!("Failed to parse response: {}", e))?;
 
+        if response.jsonrpc != "2.0" {
+            return Err(format!("Invalid JSON-RPC version: {}", response.jsonrpc));
+        }
+        if let Some(resp_id) = response.id
+            && resp_id != id
+        {
+            return Err(format!(
+                "MCP response id mismatch: expected {}, got {}",
+                id, resp_id
+            ));
+        }
+
         if let Some(error) = response.error {
+            if let Some(data) = error.data {
+                return Err(format!(
+                    "MCP error {}: {} ({})",
+                    error.code, error.message, data
+                ));
+            }
             return Err(format!("MCP error {}: {}", error.code, error.message));
         }
 
@@ -427,64 +385,6 @@ impl McpClient {
         Ok(content)
     }
 
-    pub(super) fn read_resource(&self, server_name: &str, uri: &str) -> Result<String, String> {
-        let id = self.next_request_id();
-        let params = json!({
-            "uri": uri
-        });
-
-        let conn = self
-            .servers
-            .get(server_name)
-            .ok_or_else(|| format!("Server not found: {}", server_name))?;
-
-        let mut conn = conn
-            .lock()
-            .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-        let result = Self::send_request_to_conn(&mut conn, id, "resources/read", Some(params))?;
-
-        let content = result["contents"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|c| c["text"].as_str())
-            .unwrap_or("")
-            .to_string();
-
-        Ok(content)
-    }
-
-    pub(super) fn get_prompt(
-        &self,
-        server_name: &str,
-        prompt_name: &str,
-        arguments: HashMap<String, String>,
-    ) -> Result<String, String> {
-        let id = self.next_request_id();
-        let params = json!({
-            "name": prompt_name,
-            "arguments": arguments
-        });
-
-        let conn = self
-            .servers
-            .get(server_name)
-            .ok_or_else(|| format!("Server not found: {}", server_name))?;
-
-        let mut conn = conn
-            .lock()
-            .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-        let result = Self::send_request_to_conn(&mut conn, id, "prompts/get", Some(params))?;
-
-        let content = result["messages"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|m| m["content"]["text"].as_str())
-            .unwrap_or("")
-            .to_string();
-
-        Ok(content)
-    }
-
     pub(super) fn get_all_tools(&self) -> Vec<ToolDefinition> {
         let mut result = Vec::new();
         for (server_name, conn) in &self.servers {
@@ -557,21 +457,8 @@ impl McpClient {
     pub(super) fn disconnect_all(&mut self) {
         for (_, conn) in self.servers.drain() {
             let conn = conn.into_inner().unwrap_or_else(|e| e.into_inner());
-            match conn.transport {
-                McpTransport::Process { mut process, .. } => {
-                    let _ = process.kill();
-                }
-                McpTransport::InProcess {
-                    stdin,
-                    stdout: _,
-                    join,
-                } => {
-                    drop(stdin);
-                    if let Some(handle) = join {
-                        let _ = handle.join();
-                    }
-                }
-            }
+            let mut process = conn.process;
+            let _ = process.kill();
         }
     }
 }
@@ -580,21 +467,6 @@ impl Drop for McpClient {
     fn drop(&mut self) {
         self.disconnect_all();
     }
-}
-
-pub(super) fn parse_mcp_tool_name(full_name: &str) -> Option<(String, String)> {
-    let prefix = "mcp_";
-    if !full_name.starts_with(prefix) {
-        return None;
-    }
-
-    let rest = &full_name[prefix.len()..];
-    let parts: Vec<&str> = rest.splitn(2, '_').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-
-    Some((parts[0].to_string(), parts[1].to_string()))
 }
 
 pub(super) fn load_mcp_config_from_file(

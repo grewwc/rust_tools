@@ -126,7 +126,6 @@ mod dispatch {
 pub(super) struct ExecuteToolCallsResult {
     pub(super) executed_tool_calls: Vec<ToolCall>,
     pub(super) tool_results: Vec<ToolResult>,
-    pub(super) deferred_tool_calls: Vec<ToolCall>,
 }
 
 pub(super) fn execute_tool_calls(
@@ -135,7 +134,6 @@ pub(super) fn execute_tool_calls(
 ) -> Result<ExecuteToolCallsResult, Box<dyn Error>> {
     let mut executed_tool_calls = Vec::with_capacity(tool_calls.len());
     let mut tool_results = Vec::with_capacity(tool_calls.len());
-    let mut deferred_tool_calls: Vec<ToolCall> = Vec::new();
 
     for (idx, tool_call) in tool_calls.iter().enumerate() {
         let is_last = idx + 1 >= tool_calls.len();
@@ -165,7 +163,6 @@ pub(super) fn execute_tool_calls(
         }
 
         if should_barrier_after && !is_last {
-            deferred_tool_calls.extend_from_slice(&tool_calls[idx + 1..]);
             for deferred in &tool_calls[idx + 1..] {
                 println!("\n[Deferred] {}", deferred.function.name.yellow());
             }
@@ -176,6 +173,5 @@ pub(super) fn execute_tool_calls(
     Ok(ExecuteToolCallsResult {
         executed_tool_calls,
         tool_results,
-        deferred_tool_calls,
     })
 }

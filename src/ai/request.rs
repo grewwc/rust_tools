@@ -7,12 +7,7 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{
-    files,
-    history::{Message, build_message_arr},
-    models,
-    types::App,
-};
+use super::{files, history::Message, models, types::App};
 
 #[derive(Debug, Serialize)]
 struct RequestBody {
@@ -78,62 +73,6 @@ where
 {
     let value = Option::<String>::deserialize(deserializer)?;
     Ok(value.unwrap_or_default())
-}
-
-pub(super) fn do_request(
-    app: &mut App,
-    model: &str,
-    question: &str,
-    history_count: usize,
-) -> Result<Response, Box<dyn std::error::Error>> {
-    let (tools_value, tool_choice) = agent_tools_for_request(app, model);
-    let mut request_body = RequestBody {
-        model: model.to_string(),
-        messages: vec![Message {
-            role: "system".to_string(),
-            content: Value::String("You are a helpful assistant.".to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        }],
-        stream: true,
-        enable_thinking: app.cli.thinking,
-        enable_search: models::search_enabled(model).then_some(true),
-        tools: tools_value,
-        tool_choice,
-    };
-
-    if !models::is_vl_model(model) {
-        request_body
-            .messages
-            .extend(build_message_arr(history_count, &app.session_history_file)?);
-    }
-
-    request_body.messages.push(Message {
-        role: "user".to_string(),
-        content: build_content(&request_body.model, question, &app.attached_image_files)?,
-        tool_calls: None,
-        tool_call_id: None,
-    });
-
-    let response = app
-        .client
-        .post(&app.config.endpoint)
-        .bearer_auth(&app.config.api_key)
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(format!("request failed: {status} {body}").into());
-    }
-
-    if models::is_vl_model(&request_body.model) {
-        app.attached_image_files.clear();
-    }
-
-    Ok(response)
 }
 
 pub(super) fn do_request_messages(

@@ -300,9 +300,9 @@ fn test_bool_cluster(cmd: &str, trie: &Trie, out: &mut Vec<String>) -> bool {
         out.push(cmd.to_string());
         return true;
     }
-    for i in 1..cmd.len() {
-        let curr = &cmd[..i];
-        if trie.contains(curr) && test_bool_cluster(&cmd[i..], trie, out) {
+    for (split_idx, _) in cmd.char_indices().skip(1) {
+        let curr = &cmd[..split_idx];
+        if trie.contains(curr) && test_bool_cluster(&cmd[split_idx..], trie, out) {
             out.push(curr.to_string());
             return true;
         }

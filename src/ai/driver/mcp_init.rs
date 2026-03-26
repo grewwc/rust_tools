@@ -11,6 +11,8 @@ pub struct McpInitReport {
     pub loaded: bool,
     pub server_count: usize,
     pub tool_count: usize,
+    pub resource_count: usize,
+    pub prompt_count: usize,
     pub failures: Vec<String>,
 }
 
@@ -30,6 +32,8 @@ pub fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitReport {
         loaded: false,
         server_count: 0,
         tool_count: 0,
+        resource_count: 0,
+        prompt_count: 0,
         failures: Vec::new(),
     };
     if let Err(err) = fs::metadata(mcp_path) {
@@ -65,6 +69,8 @@ pub fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitReport {
         .map(|c| c.mcp_servers.len())
         .unwrap_or(0);
     report.tool_count = mcp_client.get_all_tools().len();
+    report.resource_count = mcp_client.get_all_resources().len();
+    report.prompt_count = mcp_client.get_all_prompts().len();
     report
 }
 

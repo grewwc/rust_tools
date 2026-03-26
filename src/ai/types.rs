@@ -25,7 +25,6 @@ pub(super) struct AppConfig {
 pub(super) struct App {
     pub(super) cli: Cli,
     pub(super) config: AppConfig,
-    pub(super) sessions_root: PathBuf,
     pub(super) session_id: String,
     pub(super) session_history_file: PathBuf,
     pub(super) client: Client,
@@ -80,12 +79,7 @@ pub(super) struct ToolResult {
 #[derive(Debug, Clone, Default)]
 pub(super) struct AgentContext {
     pub(super) tools: Vec<ToolDefinition>,
-    pub(super) pending_tool_calls: Vec<ToolCall>,
-    pub(super) tool_results: Vec<ToolResult>,
     pub(super) mcp_servers: HashMap<String, McpServerConfig>,
-    pub(super) skills: Vec<SkillDefinition>,
-    pub(super) active_skill: Option<String>,
-    pub(super) iteration_count: usize,
     pub(super) max_iterations: usize,
 }
 
@@ -104,17 +98,6 @@ pub(super) struct McpServerConfig {
 
 fn default_mcp_request_timeout_ms() -> u64 {
     3000
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct SkillDefinition {
-    pub(super) name: String,
-    pub(super) description: String,
-    pub(super) prompt: String,
-    #[serde(default)]
-    pub(super) tools: Vec<String>,
-    #[serde(default)]
-    pub(super) mcp_servers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -169,7 +152,6 @@ pub(super) enum StreamOutcome {
 pub(super) struct StreamResult {
     pub(super) outcome: StreamOutcome,
     pub(super) tool_calls: Vec<ToolCall>,
-    pub(super) finish_reason: Option<String>,
     pub(super) assistant_text: String,
 }
 

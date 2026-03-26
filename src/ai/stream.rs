@@ -22,7 +22,6 @@ pub(super) fn stream_response(
     let mut markdown = MarkdownStreamRenderer::new();
     let mut line = String::new();
     let mut tool_calls_map: HashMap<usize, ToolCallBuilder> = HashMap::new();
-    let mut finish_reason: Option<String> = None;
     let mut assistant_text = String::new();
 
     while !app.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
@@ -30,7 +29,6 @@ pub(super) fn stream_response(
             return Ok(StreamResult {
                 outcome: StreamOutcome::Cancelled,
                 tool_calls: Vec::new(),
-                finish_reason: None,
                 assistant_text: String::new(),
             });
         }
@@ -47,7 +45,6 @@ pub(super) fn stream_response(
                     return Ok(StreamResult {
                         outcome: StreamOutcome::Cancelled,
                         tool_calls: Vec::new(),
-                        finish_reason: None,
                         assistant_text: String::new(),
                     });
                 }
@@ -55,7 +52,6 @@ pub(super) fn stream_response(
                     return Ok(StreamResult {
                         outcome: StreamOutcome::Cancelled,
                         tool_calls: Vec::new(),
-                        finish_reason: None,
                         assistant_text: String::new(),
                     });
                 }
@@ -66,7 +62,6 @@ pub(super) fn stream_response(
                     return Ok(StreamResult {
                         outcome: StreamOutcome::Cancelled,
                         tool_calls: Vec::new(),
-                        finish_reason: None,
                         assistant_text: String::new(),
                     });
                 }
@@ -102,10 +97,7 @@ pub(super) fn stream_response(
 
         let mut reached_finish_reason = false;
         if let Some(choice) = chunk.choices.first() {
-            if let Some(ref reason) = choice.finish_reason {
-                finish_reason = Some(reason.clone());
-                reached_finish_reason = true;
-            }
+            reached_finish_reason = choice.finish_reason.is_some();
 
             for stream_tool_call in &choice.delta.tool_calls {
                 let index = stream_tool_call.index;
@@ -156,7 +148,6 @@ pub(super) fn stream_response(
         return Ok(StreamResult {
             outcome: StreamOutcome::Cancelled,
             tool_calls: Vec::new(),
-            finish_reason: None,
             assistant_text: String::new(),
         });
     }
@@ -175,7 +166,6 @@ pub(super) fn stream_response(
     Ok(StreamResult {
         outcome,
         tool_calls,
-        finish_reason,
         assistant_text,
     })
 }
@@ -189,15 +179,6 @@ struct ToolCallBuilder {
 }
 
 impl ToolCallBuilder {
-    fn new() -> Self {
-        Self {
-            id: String::new(),
-            tool_type: "function".to_string(),
-            function_name: String::new(),
-            arguments: String::new(),
-        }
-    }
-
     fn build(self) -> ToolCall {
         use super::types::{FunctionCall, ToolCall};
         ToolCall {

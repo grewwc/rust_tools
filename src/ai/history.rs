@@ -288,10 +288,6 @@ impl SessionStore {
         }
     }
 
-    pub(super) fn root(&self) -> &PathBuf {
-        &self.root
-    }
-
     pub(super) fn ensure_root_dir(&self) -> io::Result<()> {
         fs::create_dir_all(&self.root)
     }

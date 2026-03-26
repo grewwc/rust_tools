@@ -560,8 +560,11 @@ fn parse_duckduckgo_html(html: &str, limit: usize) -> Vec<WebSearchHit> {
         let mut snippet = String::new();
         if let Some(snippet_re) = snippet_re.as_ref() {
             let window_start = m.get(0).map(|m| m.end()).unwrap_or(0);
-            let window_end = (window_start + 4000).min(html.len());
-            let window = &html[window_start..window_end];
+            let mut window_end = (window_start + 4000).min(html.len());
+            while window_end > window_start && !html.is_char_boundary(window_end) {
+                window_end -= 1;
+            }
+            let window = html.get(window_start..window_end).unwrap_or("");
             if let Some(caps) = snippet_re.captures(window) {
                 let snippet_html = caps
                     .name("snippet")
@@ -675,18 +678,26 @@ fn decode_html_entities(s: &str) -> String {
             i += 1;
             continue;
         }
-        let Some(end) = s[i..].find(';') else {
+        let mut end = i + 1;
+        while end < bytes.len() && bytes[end] != b';' {
+            end += 1;
+        }
+        if end >= bytes.len() {
             out.push(b'&');
             i += 1;
             continue;
-        };
-        let end = i + end;
-        let entity = &s[i + 1..end];
-        if let Some(decoded) = decode_single_entity(entity) {
+        }
+
+        let entity_bytes = &bytes[i + 1..end];
+        let decoded = std::str::from_utf8(entity_bytes)
+            .ok()
+            .and_then(decode_single_entity);
+
+        if let Some(decoded) = decoded {
             out.extend_from_slice(decoded.as_bytes());
         } else {
             out.push(b'&');
-            out.extend_from_slice(entity.as_bytes());
+            out.extend_from_slice(entity_bytes);
             out.push(b';');
         }
         i = end + 1;
@@ -713,21 +724,6 @@ fn decode_single_entity(entity: &str) -> Option<String> {
         }
         _ => None,
     }
-}
-
-pub(super) fn merge_tool_definitions(
-    builtin: Vec<ToolDefinition>,
-    mcp_tools: Vec<ToolDefinition>,
-    skill_tools: Vec<ToolDefinition>,
-) -> Vec<ToolDefinition> {
-    let mut tools = builtin;
-    tools.extend(mcp_tools);
-    tools.extend(skill_tools);
-    tools
-}
-
-pub(super) fn tool_definitions_to_value(tools: &[ToolDefinition]) -> Value {
-    serde_json::to_value(tools).unwrap_or(Value::Array(Vec::new()))
 }
 
 #[cfg(test)]
@@ -778,5 +774,21 @@ mod tests {
         assert_eq!(hits[1].title, "Rust");
         assert_eq!(hits[1].url, "https://rust-lang.org/");
         assert_eq!(hits[1].snippet, "The \"Rust\" language");
+    }
+
+    #[test]
+    fn decode_html_entities_handles_utf8_without_panicking() {
+        let s = "你好 &amp; 标";
+        assert_eq!(decode_html_entities(s), "你好 & 标");
+    }
+
+    #[test]
+    fn parse_duckduckgo_html_does_not_panic_on_utf8_boundaries() {
+        let html = format!(
+            r#"<div class="result"><a class="result__a" href="https://example.com">Title</a>{}</div>"#,
+            "标".repeat(2000)
+        );
+        let hits = parse_duckduckgo_html(&html, 1);
+        assert_eq!(hits.len(), 1);
     }
 }

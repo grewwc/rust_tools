@@ -511,15 +511,6 @@ fn collect_images_from_xobject(
     }
 }
 
-fn is_image_xobject(stream: &lopdf::Stream) -> bool {
-    stream
-        .dict
-        .get(b"Subtype")
-        .ok()
-        .and_then(|o| o.as_name().ok())
-        .is_some_and(|n| n == b"Image")
-}
-
 fn decode_xobject_image(stream: &lopdf::Stream) -> Option<DynamicImage> {
     let filter = stream.dict.get(b"Filter").ok();
     let filter_name = filter.as_ref().and_then(|o| o.as_name().ok()).or_else(|| {
@@ -663,6 +654,7 @@ fn tesseract_ocr(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
     Ok(lines.join("\n"))
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn build_tesseract_lang_arg(langs: &[&str]) -> Option<String> {
     if langs.is_empty() {
         return None;
@@ -681,6 +673,7 @@ fn build_tesseract_lang_arg(langs: &[&str]) -> Option<String> {
     Some(items.join("+"))
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn map_lang_for_tesseract(lang: &str) -> String {
     let key = lang.trim().to_ascii_lowercase();
     match key.as_str() {

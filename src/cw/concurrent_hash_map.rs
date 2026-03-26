@@ -9,7 +9,7 @@ use rustc_hash::FxHasher;
 use crate::common::types::FastMap;
 
 pub struct ValueRef<'a, K, V> {
-    guard: RwLockReadGuard<'a, FastMap<K, V>>,
+    _guard: RwLockReadGuard<'a, FastMap<K, V>>,
     value: NonNull<V>,
 }
 
@@ -105,7 +105,10 @@ where
             Some(v) => NonNull::from(v),
             None => return None,
         };
-        Some(ValueRef { guard, value })
+        Some(ValueRef {
+            _guard: guard,
+            value,
+        })
     }
 
     pub fn get_ref(&self, key: &K) -> Option<ValueRef<'_, K, V>> {

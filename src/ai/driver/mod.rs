@@ -98,7 +98,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         pending_short_output: cli.short_output,
         current_model,
         raw_args,
-        sessions_root: session_store.root().clone(),
         session_id: session_id.clone(),
         session_history_file: session_store.session_history_file(&session_id),
         cli,
