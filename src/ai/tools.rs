@@ -1360,6 +1360,7 @@ mod tests {
     use crate::cmd;
 
     use super::*;
+    use uuid::Uuid;
 
     #[test]
     fn test_execute_cmd() {
@@ -1419,5 +1420,38 @@ mod tests {
         );
         let hits = parse_duckduckgo_html(&html, 1);
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn search_files_returns_absolute_paths() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rust_tools_search_files_returns_absolute_paths_{}",
+            Uuid::new_v4()
+        ));
+        fs::create_dir_all(&tmp).unwrap();
+        let f = tmp.join("hello.txt");
+        fs::write(&f, "x").unwrap();
+
+        let out = execute_search_files(&json!({
+            "pattern": "hello.txt",
+            "path": tmp.to_string_lossy()
+        }))
+        .unwrap();
+        assert!(std::path::Path::new(out.trim()).is_absolute());
+
+        let out2 = execute_search_files(&json!({
+            "pattern": "*.txt",
+            "path": tmp.to_string_lossy()
+        }))
+        .unwrap();
+        for line in out2.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            assert!(std::path::Path::new(line).is_absolute());
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }
