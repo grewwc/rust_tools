@@ -5,14 +5,15 @@ RELEASE_DIR := target/release
 DEBUG_DIR := target/debug
 INSTALLW := $(DEBUG_DIR)/installw
 CargoLock := $(wildcard Cargo.lock)
+INSTALLW_DEPS := $(shell find src -type f -name '*.rs') Cargo.toml $(CargoLock)
 
 $(RELEASE_DIR)/%: src/bin/%.rs
 	cargo build --release --bin $*
 
 all: $(addprefix $(RELEASE_DIR)/,$(ALL_BINS))
 
-$(INSTALLW): src/bin/installw.rs Cargo.toml $(CargoLock)
-	cargo build -q --bin installw
+$(INSTALLW): $(INSTALLW_DEPS)
+	cargo build --bin installw
 
 RUSTFLAGS_INSTALL ?= -Awarnings
 install: export RUSTFLAGS := $(strip $(RUSTFLAGS) $(RUSTFLAGS_INSTALL))

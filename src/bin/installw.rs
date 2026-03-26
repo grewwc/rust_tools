@@ -281,7 +281,20 @@ fn deps_for_bin(
         }
     }
 
+    for extra in extra_build_inputs(repo_root) {
+        deps.insert(Rc::new(extra));
+    }
+
     Ok(deps.into_iter().collect())
+}
+
+fn extra_build_inputs(repo_root: &Path) -> Vec<PathBuf> {
+    let mut out = vec![repo_root.join("Cargo.toml")];
+    let cargo_lock = repo_root.join("Cargo.lock");
+    if cargo_lock.is_file() {
+        out.push(cargo_lock);
+    }
+    out
 }
 
 fn extract_lib_roots_from_bin(content: &str) -> BTreeSet<String> {

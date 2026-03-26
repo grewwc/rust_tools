@@ -16,7 +16,7 @@ use crate::ai::{
     cli::{Cli, normalize_single_dash_long_opts},
     config,
     history::{
-        COLON, Message, NEWLINE, SessionStore, append_history, build_message_arr,
+        Message, SessionStore, append_history_messages, build_message_arr,
         compress_messages_for_context, delete_history_artifacts,
     },
     mcp::McpClient,
@@ -43,6 +43,136 @@ pub use model::*;
 pub use print::*;
 pub use signal::*;
 pub use skill_matching::*;
+
+fn prepare_skill_for_turn(
+    app: &mut App,
+    mcp_client: &McpClient,
+    skill_manifests: &[SkillManifest],
+    question: &str,
+) -> (String, Option<(Vec<crate::ai::types::ToolDefinition>, usize)>) {
+    let skill = match_skill(skill_manifests, question);
+    let openclaw_active = skill.as_ref().is_some_and(|s| {
+        s.name.as_str() == "openclaw" || s.tool_groups.iter().any(|g| g == "openclaw")
+    });
+
+    let builtin_tools = if let Some(skill) = skill.as_ref() {
+        if !skill.tool_groups.is_empty() {
+            let groups: Vec<&str> = skill.tool_groups.iter().map(|s| s.as_str()).collect();
+            super::tools::tool_definitions_for_groups(&groups)
+        } else if !skill.tools.is_empty() {
+            super::tools::get_tool_definitions_by_names(&skill.tools)
+        } else {
+            super::tools::get_builtin_tool_definitions()
+        }
+    } else {
+        super::tools::get_builtin_tool_definitions()
+    };
+    let mcp_tools = mcp_client.get_all_tools();
+
+    print_skill_selection(skill, &builtin_tools, &mcp_tools);
+
+    let mut restore_agent_context = None;
+    if let Some(ctx) = app.agent_context.as_mut() {
+        restore_agent_context = Some((ctx.tools.clone(), ctx.max_iterations));
+        let mut all_tools = builtin_tools.clone();
+        all_tools.extend(mcp_tools.clone());
+        ctx.tools = all_tools;
+        ctx.max_iterations = if openclaw_active { 12 } else { 6 };
+    }
+
+    let mut system_prompt = if let Some(skill) = skill {
+        let mut p = "You are a helpful assistant.".to_string();
+        let extra = skill.build_system_prompt();
+        if !extra.trim().is_empty() {
+            p.push_str("\n\n");
+            p.push_str(extra.trim());
+        }
+        p
+    } else {
+        "You are a helpful assistant.".to_string()
+    };
+
+    if openclaw_active && !system_prompt.contains("OpenClaw") {
+        system_prompt = format!(
+            "{}\n\n{}",
+            system_prompt,
+            "OpenClaw mode:\n- Plan before acting.\n- Prefer reading/searching before editing.\n- Make minimal, reversible edits.\n- Verify by running checks/tests.\n- If a tool is unsafe or ambiguous, ask the user."
+        );
+    }
+    if is_feishu_docs_search_intent(question) {
+        system_prompt = format!(
+            "{}\n\n{}",
+            system_prompt,
+            "Feishu mode:\n- If the user asks to search Feishu/Lark cloud docs, call the MCP tool mcp_*_docs_search.\n- If authorization is required, follow the MCP OAuth flow (oauth_authorize_url -> oauth_wait_local_code -> oauth_exchange_code) and then retry.\n- If the MCP tool is not available, tell the user to configure MCP first."
+        );
+    }
+    if mcp_client
+        .get_all_tools()
+        .iter()
+        .any(|t| t.function.name.contains("mcp_feishu_"))
+    {
+        system_prompt = format!(
+            "{}\n\n{}",
+            system_prompt,
+            "If the user asks anything related to Feishu/Lark docs, prefer calling the available Feishu MCP tools instead of saying you cannot access the account."
+        );
+    }
+
+    (system_prompt, restore_agent_context)
+}
+
+fn print_skill_selection(
+    skill: Option<&SkillManifest>,
+    builtin_tools: &[crate::ai::types::ToolDefinition],
+    mcp_tools: &[crate::ai::types::ToolDefinition],
+) {
+    let skill_label = "[skill]".bright_blue().bold();
+    match skill {
+        Some(s) => {
+            let name = s.name.bright_cyan().bold();
+            if let Some(src) = s.source_path.as_ref()
+                && !src.trim().is_empty()
+            {
+                println!("{} matched: {} {}", skill_label, name, format!("({src})").dimmed());
+            } else {
+                println!("{} matched: {}", skill_label, name);
+            }
+        }
+        None => println!("{} matched: {}", skill_label, "none".dimmed()),
+    }
+
+    let builtin_names = format_tool_names(builtin_tools);
+    println!(
+        "{} {}",
+        "[tools]".bright_green().bold(),
+        if builtin_names.is_empty() {
+            "none".dimmed().to_string()
+        } else {
+            builtin_names.join(", ")
+        }
+    );
+
+    let mcp_names = format_tool_names(mcp_tools);
+    println!(
+        "{} {}",
+        "[mcp-tools]".bright_magenta().bold(),
+        if mcp_names.is_empty() {
+            "none".dimmed().to_string()
+        } else {
+            mcp_names.join(", ")
+        }
+    );
+}
+
+fn format_tool_names(tools: &[crate::ai::types::ToolDefinition]) -> Vec<String> {
+    let mut names = tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<Vec<_>>();
+    names.sort();
+    names.dedup();
+    names
+}
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse_from(normalize_single_dash_long_opts(std::env::args()));
@@ -117,7 +247,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut mcp_client = McpClient::new();
-    let skill_manifests = skills::create_default_skills();
+    let skill_manifests = skills::load_all_skills();
     let mcp_report = init_mcp(&mut app, &mut mcp_client);
 
     if app.cli.list_tools {
@@ -200,61 +330,11 @@ fn run_loop(
         app.current_model = next_model.clone();
 
         app.cancel_stream.store(false, Ordering::SeqCst);
-        let skill = match_skill(skill_manifests, &question);
-        let openclaw_active = skill
-            .as_ref()
-            .is_some_and(|s| s.name.as_str() == "openclaw");
-
-        let mut restore_agent_context = None;
-        if openclaw_active {
-            if let Some(ctx) = app.agent_context.as_mut() {
-                restore_agent_context = Some((ctx.tools.clone(), ctx.max_iterations));
-                ctx.tools = super::tools::get_openclaw_tool_definitions();
-                ctx.max_iterations = 12;
-            }
-        }
-        let system_prompt = if let Some(skill) = skill {
-            let mut p = "You are a helpful assistant.".to_string();
-            let extra = skill.build_system_prompt();
-            if !extra.trim().is_empty() {
-                p.push_str("\n\n");
-                p.push_str(extra.trim());
-            }
-            p
-        } else {
-            "You are a helpful assistant.".to_string()
-        };
-        let system_prompt = if openclaw_active && !system_prompt.contains("OpenClaw") {
-            format!(
-                "{}\n\n{}",
-                system_prompt,
-                "OpenClaw mode:\n- Plan before acting.\n- Prefer reading/searching before editing.\n- Make minimal, reversible edits.\n- Verify by running checks/tests.\n- If a tool is unsafe or ambiguous, ask the user."
-            )
-        } else {
-            system_prompt
-        };
-        let system_prompt = if is_feishu_docs_search_intent(&question) {
-            format!(
-                "{}\n\n{}",
-                system_prompt,
-                "Feishu mode:\n- If the user asks to search Feishu/Lark cloud docs, call the MCP tool mcp_*_docs_search.\n- If authorization is required, follow the MCP OAuth flow (oauth_authorize_url -> oauth_wait_local_code -> oauth_exchange_code) and then retry.\n- If the MCP tool is not available, tell the user to configure MCP first."
-            )
-        } else {
-            system_prompt
-        };
-        let system_prompt = if mcp_client
-            .get_all_tools()
-            .iter()
-            .any(|t| t.function.name.contains("mcp_feishu_"))
-        {
-            format!(
-                "{}\n\n{}",
-                system_prompt,
-                "If the user asks anything related to Feishu/Lark docs, prefer calling the available Feishu MCP tools instead of saying you cannot access the account."
-            )
-        } else {
-            system_prompt
-        };
+        // Per turn, always decide whether to load a skill before any model request/tool call.
+        println!("[skill] pre-check turn: start");
+        let (system_prompt, mut restore_agent_context) =
+            prepare_skill_for_turn(app, mcp_client, skill_manifests, &question);
+        println!("[skill] pre-check turn: done");
 
         let mut messages = Vec::new();
         messages.push(Message {
@@ -275,12 +355,14 @@ fn run_loop(
             )
         };
         messages.extend(history);
-        messages.push(Message {
+        let user_message = Message {
             role: "user".to_string(),
             content: request::build_content(&next_model, &question, &app.attached_image_files)?,
             tool_calls: None,
             tool_call_id: None,
-        });
+        };
+        messages.push(user_message.clone());
+        let mut turn_messages = vec![user_message];
 
         let max_iterations = app
             .agent_context
@@ -291,6 +373,7 @@ fn run_loop(
 
         let mut iteration = 0usize;
         let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
         loop {
             iteration += 1;
             let mut current_history = String::new();
@@ -347,8 +430,10 @@ fn run_loop(
                     tool_calls: None,
                     tool_call_id: None,
                 };
-                messages.push(assistant_msg);
+                messages.push(assistant_msg.clone());
+                turn_messages.push(assistant_msg);
                 final_assistant_text = stream_result.assistant_text;
+                final_assistant_recorded = true;
                 break;
             }
 
@@ -369,7 +454,8 @@ fn run_loop(
                 tool_calls: Some(exec_result.executed_tool_calls.clone()),
                 tool_call_id: None,
             };
-            messages.push(assistant_msg);
+            messages.push(assistant_msg.clone());
+            turn_messages.push(assistant_msg);
 
             for (tool_call, result) in exec_result
                 .executed_tool_calls
@@ -395,12 +481,14 @@ fn run_loop(
                 } else {
                     println!("{}", result.content);
                 }
-                messages.push(Message {
+                let tool_message = Message {
                     role: "tool".to_string(),
                     content: Value::String(result.content.clone()),
                     tool_calls: None,
                     tool_call_id: Some(result.tool_call_id.clone()),
-                });
+                };
+                messages.push(tool_message.clone());
+                turn_messages.push(tool_message);
             }
 
             if iteration >= max_iterations {
@@ -410,12 +498,16 @@ fn run_loop(
         }
 
         if !final_assistant_text.is_empty() {
+            if !final_assistant_recorded {
+                turn_messages.push(Message {
+                    role: "assistant".to_string(),
+                    content: Value::String(final_assistant_text.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
             if !one_shot_mode {
-                let history_line = format!(
-                    "user{COLON}{question}{NEWLINE}assistant{COLON}{final_assistant_text}{NEWLINE}"
-                );
-                // 忽略历史保存错误，避免因为权限问题导致程序异常退出
-                if let Err(e) = append_history(&app.session_history_file, &history_line) {
+                if let Err(e) = append_history_messages(&app.session_history_file, &turn_messages) {
                     eprintln!("[Warning] Failed to save history: {}", e);
                 }
             }

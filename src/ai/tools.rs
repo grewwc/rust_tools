@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -7,6 +7,7 @@ use std::{
 
 use regex::Regex;
 use serde_json::{Value, json};
+use std::sync::LazyLock;
 use std::time::Duration;
 use std::{io::Read, process::Stdio, time::Instant};
 
@@ -14,68 +15,74 @@ use super::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
 
 const HTTP_TOOL_TIMEOUT: Duration = Duration::from_secs(2);
 
-const BUILTIN_TOOLS: &[(&str, &str)] = &[
-    (
-        "read_file",
-        "Read the contents of a file from the local filesystem",
-    ),
-    (
-        "write_file",
-        "Write content to a file on the local filesystem",
-    ),
-    (
-        "search_files",
-        "Search for files by exact file name or glob pattern (returns absolute paths)",
-    ),
-    (
-        "list_directory",
-        "List files and directories in a given path",
-    ),
-    ("execute_command", "Execute a shell command"),
-    ("grep_search", "Search for patterns in file contents"),
-    ("web_search", "Search the web for information"),
-    ("web_fetch", "Fetch content from a URL"),
-];
-
-pub(super) fn get_builtin_tool_definitions() -> Vec<ToolDefinition> {
-    BUILTIN_TOOLS
-        .iter()
-        .map(|(name, description)| ToolDefinition {
-            tool_type: "function".to_string(),
-            function: FunctionDefinition {
-                name: name.to_string(),
-                description: description.to_string(),
-                parameters: get_tool_parameters(name),
-            },
-        })
-        .collect()
+#[derive(Clone, Copy)]
+pub(super) struct ToolSpec {
+    pub(super) name: &'static str,
+    pub(super) description: &'static str,
+    pub(super) parameters: fn() -> Value,
+    pub(super) execute: fn(&Value) -> Result<String, String>,
+    pub(super) groups: &'static [&'static str],
 }
 
-const OPENCLAW_EXTRA_TOOLS: &[(&str, &str)] = &[
-    (
-        "read_file_lines",
-        "Read file contents with configurable line limits",
-    ),
-    ("apply_patch", "Apply a unified diff patch to a file"),
-    ("git_status", "Get git status (porcelain)"),
-    ("git_diff", "Get git diff"),
-    ("cargo_check", "Run cargo check"),
-    ("cargo_test", "Run cargo test"),
-];
+pub(super) struct ToolRegistration {
+    pub(super) spec: ToolSpec,
+}
 
-pub(super) fn get_openclaw_tool_definitions() -> Vec<ToolDefinition> {
-    BUILTIN_TOOLS
-        .iter()
-        .chain(OPENCLAW_EXTRA_TOOLS.iter())
-        .map(|(name, description)| ToolDefinition {
+inventory::collect!(ToolRegistration);
+
+static TOOL_INDEX: LazyLock<HashMap<&'static str, &'static ToolSpec>> = LazyLock::new(|| {
+    let mut index: HashMap<&'static str, &'static ToolSpec> = HashMap::new();
+    for reg in inventory::iter::<ToolRegistration> {
+        index.entry(reg.spec.name).or_insert(&reg.spec);
+    }
+    index
+});
+
+pub(super) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition> {
+    let mut out: Vec<ToolDefinition> = Vec::new();
+    for reg in inventory::iter::<ToolRegistration> {
+        if !reg
+            .spec
+            .groups
+            .iter()
+            .any(|g| groups.iter().any(|x| x == g))
+        {
+            continue;
+        }
+        out.push(ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
-                name: name.to_string(),
-                description: description.to_string(),
-                parameters: get_tool_parameters(name),
+                name: reg.spec.name.to_string(),
+                description: reg.spec.description.to_string(),
+                parameters: (reg.spec.parameters)(),
             },
-        })
-        .collect()
+        });
+    }
+    out.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+    out
+}
+
+pub(super) fn get_tool_definitions_by_names(names: &[String]) -> Vec<ToolDefinition> {
+    let mut out: Vec<ToolDefinition> = Vec::new();
+    for name in names {
+        let Some(spec) = TOOL_INDEX.get(name.as_str()).copied() else {
+            continue;
+        };
+        out.push(ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: spec.name.to_string(),
+                description: spec.description.to_string(),
+                parameters: (spec.parameters)(),
+            },
+        });
+    }
+    out.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+    out
+}
+
+pub(super) fn get_builtin_tool_definitions() -> Vec<ToolDefinition> {
+    tool_definitions_for_groups(&["builtin"])
 }
 
 fn get_tool_parameters(name: &str) -> Value {
@@ -300,27 +307,215 @@ fn get_tool_parameters(name: &str) -> Value {
     }
 }
 
-pub(super) fn execute_tool_call(tool_call: &ToolCall) -> Result<ToolResult, String> {
-    let args: Value = serde_json::from_str(&tool_call.function.arguments)
-        .map_err(|e| format!("Failed to parse arguments: {}", e))?;
+fn params_read_file() -> Value {
+    get_tool_parameters("read_file")
+}
 
-    let result = match tool_call.function.name.as_str() {
-        "read_file" => execute_read_file(&args)?,
-        "read_file_lines" => execute_read_file_lines(&args)?,
-        "write_file" => execute_write_file(&args)?,
-        "apply_patch" => execute_apply_patch(&args)?,
-        "list_directory" => execute_list_directory(&args)?,
-        "search_files" => execute_search_files(&args)?,
-        "execute_command" => execute_command(&args)?,
-        "grep_search" => execute_grep_search(&args)?,
-        "web_search" => execute_web_search(&args)?,
-        "web_fetch" => execute_web_fetch(&args)?,
-        "git_status" => execute_git_status(&args)?,
-        "git_diff" => execute_git_diff(&args)?,
-        "cargo_check" => execute_cargo_check(&args)?,
-        "cargo_test" => execute_cargo_test(&args)?,
-        name => return Err(format!("Unknown tool: {}", name)),
+fn params_write_file() -> Value {
+    get_tool_parameters("write_file")
+}
+
+fn params_search_files() -> Value {
+    get_tool_parameters("search_files")
+}
+
+fn params_list_directory() -> Value {
+    get_tool_parameters("list_directory")
+}
+
+fn params_execute_command() -> Value {
+    get_tool_parameters("execute_command")
+}
+
+fn params_grep_search() -> Value {
+    get_tool_parameters("grep_search")
+}
+
+fn params_web_search() -> Value {
+    get_tool_parameters("web_search")
+}
+
+fn params_web_fetch() -> Value {
+    get_tool_parameters("web_fetch")
+}
+
+fn params_read_file_lines() -> Value {
+    get_tool_parameters("read_file_lines")
+}
+
+fn params_apply_patch() -> Value {
+    get_tool_parameters("apply_patch")
+}
+
+fn params_git_status() -> Value {
+    get_tool_parameters("git_status")
+}
+
+fn params_git_diff() -> Value {
+    get_tool_parameters("git_diff")
+}
+
+fn params_cargo_check() -> Value {
+    get_tool_parameters("cargo_check")
+}
+
+fn params_cargo_test() -> Value {
+    get_tool_parameters("cargo_test")
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "read_file",
+        description: "Read the contents of a file from the local filesystem",
+        parameters: params_read_file,
+        execute: execute_read_file,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "write_file",
+        description: "Write content to a file on the local filesystem",
+        parameters: params_write_file,
+        execute: execute_write_file,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "search_files",
+        description: "Search for files by exact file name or glob pattern (returns absolute paths)",
+        parameters: params_search_files,
+        execute: execute_search_files,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "list_directory",
+        description: "List files and directories in a given path",
+        parameters: params_list_directory,
+        execute: execute_list_directory,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "execute_command",
+        description: "Execute a shell command",
+        parameters: params_execute_command,
+        execute: execute_command,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "grep_search",
+        description: "Search for patterns in file contents",
+        parameters: params_grep_search,
+        execute: execute_grep_search,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "web_search",
+        description: "Search the web for information",
+        parameters: params_web_search,
+        execute: execute_web_search,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "web_fetch",
+        description: "Fetch content from a URL",
+        parameters: params_web_fetch,
+        execute: execute_web_fetch,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "read_file_lines",
+        description: "Read file contents with configurable line limits",
+        parameters: params_read_file_lines,
+        execute: execute_read_file_lines,
+        groups: &["openclaw"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "apply_patch",
+        description: "Apply a unified diff patch to a file",
+        parameters: params_apply_patch,
+        execute: execute_apply_patch,
+        groups: &["openclaw"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "git_status",
+        description: "Get git status (porcelain)",
+        parameters: params_git_status,
+        execute: execute_git_status,
+        groups: &["openclaw"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "git_diff",
+        description: "Get git diff",
+        parameters: params_git_diff,
+        execute: execute_git_diff,
+        groups: &["openclaw"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "cargo_check",
+        description: "Run cargo check",
+        parameters: params_cargo_check,
+        execute: execute_cargo_check,
+        groups: &["openclaw"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "cargo_test",
+        description: "Run cargo test",
+        parameters: params_cargo_test,
+        execute: execute_cargo_test,
+        groups: &["openclaw"],
+    }
+});
+
+pub(super) fn execute_tool_call(tool_call: &ToolCall) -> Result<ToolResult, String> {
+    let raw_args = tool_call.function.arguments.trim();
+    let args: Value = if raw_args.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(raw_args).map_err(|e| format!("Failed to parse arguments: {}", e))?
     };
+
+    let name = tool_call.function.name.as_str();
+    let Some(spec) = TOOL_INDEX.get(name).copied() else {
+        return Err(format!("Unknown tool: {}", name));
+    };
+    let result = (spec.execute)(&args)?;
 
     Ok(ToolResult {
         tool_call_id: tool_call.id.clone(),
@@ -857,7 +1052,9 @@ fn execute_command(args: &Value) -> Result<String, String> {
         }
     });
     cmd.stdin(Stdio::null());
-    let mut child = cmd.spawn().map_err(|e| format!("Failed to execute command: {}", e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to execute command: {}", e))?;
     let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
         match child.try_wait() {
@@ -885,11 +1082,11 @@ fn execute_command(args: &Value) -> Result<String, String> {
     } else {
         Ok(truncate_chars(
             &format!(
-            "Exit code: {}\n{}\n{}",
-            output.status.code().unwrap_or(-1),
-            stdout.trim(),
-            stderr.trim()
-        ),
+                "Exit code: {}\n{}\n{}",
+                output.status.code().unwrap_or(-1),
+                stdout.trim(),
+                stderr.trim()
+            ),
             16_000,
         ))
     }
@@ -1115,7 +1312,7 @@ fn execute_web_fetch(args: &Value) -> Result<String, String> {
         .build()
         .map_err(|e| format!("Failed to build http client: {}", e))?;
 
-    let mut response = client
+    let response = client
         .get(url)
         .send()
         .map_err(|e| format!("Failed to fetch URL: {}", e))?;

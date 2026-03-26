@@ -6,13 +6,15 @@ use serde_json::Value;
 use super::{
     files,
     history::{
-        COLON, NEWLINE, SessionStore, append_history, build_message_arr,
+        COLON, NEWLINE, Message, SessionStore, append_history, append_history_messages,
+        build_message_arr,
         compress_messages_for_context,
     },
     models,
     prompt::MultilineHistoryState,
     request::{StreamChoice, StreamChunk, StreamDelta},
     stream, tools,
+    types::{FunctionCall, ToolCall},
 };
 
 #[test]
@@ -171,6 +173,32 @@ fn history_file_parsing_sqlite_matches_go_format() {
 }
 
 #[test]
+fn history_file_parsing_txt_round_trips_structured_messages() {
+    let path = std::env::temp_dir().join(format!("ai-history-{}.txt", uuid::Uuid::new_v4()));
+    let messages = structured_history_messages();
+
+    append_history_messages(&path, &messages).unwrap();
+
+    let loaded = build_message_arr(10, &path).unwrap();
+    assert_eq!(loaded, messages);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn history_file_parsing_sqlite_round_trips_structured_messages() {
+    let path = std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
+    let messages = structured_history_messages();
+
+    append_history_messages(&path, &messages).unwrap();
+
+    let loaded = build_message_arr(10, &path).unwrap();
+    assert_eq!(loaded, messages);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn history_compression_inserts_summary_and_keeps_recent() {
     let path = std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
     let long = "x".repeat(220);
@@ -204,6 +232,51 @@ fn history_compression_inserts_summary_and_keeps_recent() {
     assert!(total <= 1200);
 
     let _ = std::fs::remove_file(path);
+}
+
+fn structured_history_messages() -> Vec<Message> {
+    vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::Array(vec![serde_json::json!({
+                "type": "text",
+                "text": "hello"
+            })]),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "demo".to_string(),
+                    arguments: r#"{"x":1}"#.to_string(),
+                },
+            }]),
+            tool_call_id: None,
+        },
+        Message {
+            role: "tool".to_string(),
+            content: Value::String("tool output".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("done".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ]
 }
 
 #[test]
@@ -370,10 +443,7 @@ fn math_frac_renders_with_nested_braces() {
     let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
     assert_eq!(renderer.consume_line("$$", false), "\n");
 
-    let out = renderer.consume_line(
-        r"x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}",
-        false,
-    );
+    let out = renderer.consume_line(r"x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}", false);
     assert!(out.contains("x ="));
     assert!(out.contains("(-b ± √(b² - 4ac))/2a"));
     assert!(!out.contains("\\frac"));

@@ -10,8 +10,6 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::strw::split::split_by_str_keep_quotes;
-
 use super::types::ToolCall;
 
 const MAX_HISTORY_LINES: usize = 100;
@@ -81,30 +79,13 @@ pub(super) fn build_message_arr(
     };
 
     let newline = NEWLINE.to_string();
-    let lines = split_by_str_keep_quotes(&history, &newline, "\"", false);
+    let lines: Vec<&str> = history.split(NEWLINE).collect();
     let mut messages = Vec::new();
 
     for line in &lines {
-        if line.is_empty() {
-            continue;
+        if let Some(message) = parse_history_line(line) {
+            messages.push(message);
         }
-        let Some(last_colon) = line.rfind(COLON) else {
-            continue;
-        };
-        if last_colon == 0 || last_colon + COLON.len_utf8() >= line.len() {
-            continue;
-        }
-        let role = &line[..last_colon];
-        if role != "user" && role != "assistant" {
-            continue;
-        }
-        let content = &line[last_colon + COLON.len_utf8()..];
-        messages.push(Message {
-            role: role.to_string(),
-            content: Value::String(content.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
     }
 
     if lines.len() > MAX_HISTORY_LINES {
@@ -123,6 +104,29 @@ pub(super) fn append_history(path: &Path, content: &str) -> io::Result<()> {
     if is_sqlite_path(path) {
         return append_history_sqlite(path, content);
     }
+    append_history_blob(path, content)
+}
+
+pub(super) fn append_history_messages(path: &Path, messages: &[Message]) -> io::Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    let newline = NEWLINE.to_string();
+    let mut records = Vec::with_capacity(messages.len());
+    for message in messages {
+        let record = serde_json::to_string(message).map_err(|e| io::Error::other(e.to_string()))?;
+        records.push(record);
+    }
+    let blob = format!("{}{}", records.join(&newline), newline);
+
+    if is_sqlite_path(path) {
+        return append_history_sqlite(path, &blob);
+    }
+    append_history(path, &blob)
+}
+
+fn append_history_blob(path: &Path, content: &str) -> io::Result<()> {
     let mut options = OpenOptions::new();
     options.create(true).append(true).write(true);
     #[cfg(unix)]
@@ -160,28 +164,39 @@ fn is_sqlite_path(path: &Path) -> bool {
     )
 }
 
-fn parse_history_blob(content: &str) -> Vec<(String, String)> {
-    let newline = NEWLINE.to_string();
-    let lines = split_by_str_keep_quotes(content, &newline, "\"", false);
+fn parse_history_blob(content: &str) -> Vec<Message> {
     let mut out = Vec::new();
-    for line in lines {
-        if line.is_empty() {
-            continue;
+    for line in content.split(NEWLINE) {
+        if let Some(message) = parse_history_line(line) {
+            out.push(message);
         }
-        let Some(last_colon) = line.rfind(COLON) else {
-            continue;
-        };
-        if last_colon == 0 || last_colon + COLON.len_utf8() >= line.len() {
-            continue;
-        }
-        let role = &line[..last_colon];
-        if role != "user" && role != "assistant" {
-            continue;
-        }
-        let msg = &line[last_colon + COLON.len_utf8()..];
-        out.push((role.to_string(), msg.to_string()));
     }
     out
+}
+
+fn parse_history_line(line: &str) -> Option<Message> {
+    if line.is_empty() {
+        return None;
+    }
+    if let Ok(message) = serde_json::from_str::<Message>(line) {
+        return Some(message);
+    }
+
+    let last_colon = line.rfind(COLON)?;
+    if last_colon == 0 || last_colon + COLON.len_utf8() >= line.len() {
+        return None;
+    }
+    let role = &line[..last_colon];
+    if !matches!(role, "user" | "assistant" | "system" | "tool") {
+        return None;
+    }
+    let content = &line[last_colon + COLON.len_utf8()..];
+    Some(Message {
+        role: role.to_string(),
+        content: Value::String(content.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    })
 }
 
 fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<Message> {
@@ -302,6 +317,8 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
+            tool_calls TEXT,
+            tool_call_id TEXT,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
         CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
@@ -312,7 +329,23 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
         );",
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
+    add_column_if_missing(conn, "messages", "tool_calls", "TEXT")?;
+    add_column_if_missing(conn, "messages", "tool_call_id", "TEXT")?;
     Ok(())
+}
+
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), io::Error> {
+    let sql = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    match conn.execute(&sql, []) {
+        Ok(_) => Ok(()),
+        Err(err) if err.to_string().contains("duplicate column name") => Ok(()),
+        Err(err) => Err(io::Error::other(err.to_string())),
+    }
 }
 
 fn append_history_sqlite(path: &Path, content: &str) -> io::Result<()> {
@@ -324,8 +357,8 @@ fn append_history_sqlite(path: &Path, content: &str) -> io::Result<()> {
     }
     let first_user_in_blob = entries
         .iter()
-        .find(|(role, _)| role == "user")
-        .map(|(_, msg)| msg.clone());
+        .find(|message| message.role == "user")
+        .map(|message| value_to_string(&message.content));
     let tx = conn
         .transaction()
         .map_err(|e| io::Error::other(e.to_string()))?;
@@ -356,10 +389,21 @@ fn append_history_sqlite(path: &Path, content: &str) -> io::Result<()> {
             }
         }
         let mut stmt = tx
-            .prepare("INSERT INTO messages (role, content) VALUES (?1, ?2)")
+            .prepare(
+                "INSERT INTO messages (role, content, tool_calls, tool_call_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
             .map_err(|e| io::Error::other(e.to_string()))?;
-        for (role, msg) in entries {
-            stmt.execute(params![role, msg])
+        for message in entries {
+            let content = serde_json::to_string(&message.content)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let tool_calls = message
+                .tool_calls
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            stmt.execute(params![message.role, content, tool_calls, message.tool_call_id])
                 .map_err(|e| io::Error::other(e.to_string()))?;
         }
     }
@@ -384,7 +428,7 @@ fn build_message_arr_sqlite(
     init_history_schema(&conn)?;
 
     let mut stmt = conn.prepare(
-        "SELECT role, content
+        "SELECT role, content, tool_calls, tool_call_id
          FROM messages
          ORDER BY id DESC
          LIMIT ?1",
@@ -392,16 +436,18 @@ fn build_message_arr_sqlite(
     let rows = stmt.query_map(params![MAX_HISTORY_LINES as i64], |row| {
         let role: String = row.get(0)?;
         let content: String = row.get(1)?;
-        Ok((role, content))
+        let tool_calls: Option<String> = row.get(2)?;
+        let tool_call_id: Option<String> = row.get(3)?;
+        Ok((role, content, tool_calls, tool_call_id))
     })?;
     let mut messages: Vec<Message> = Vec::new();
     for row in rows {
-        let (role, content) = row?;
+        let (role, content, tool_calls, tool_call_id) = row?;
         messages.push(Message {
             role,
-            content: Value::String(content),
-            tool_calls: None,
-            tool_call_id: None,
+            content: decode_message_content(&content),
+            tool_calls: decode_tool_calls(tool_calls.as_deref()),
+            tool_call_id,
         });
     }
     messages.reverse();
@@ -610,9 +656,17 @@ fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
         .query_row(
             "SELECT content FROM messages WHERE role='user' ORDER BY id ASC LIMIT 1",
             [],
-            |row| row.get(0),
+            |row| row.get::<_, String>(0),
         )
         .optional()
         .unwrap_or(None);
-    Ok(fallback)
+    Ok(fallback.map(|content| value_to_string(&decode_message_content(&content))))
+}
+
+fn decode_message_content(content: &str) -> Value {
+    serde_json::from_str(content).unwrap_or_else(|_| Value::String(content.to_string()))
+}
+
+fn decode_tool_calls(tool_calls: Option<&str>) -> Option<Vec<ToolCall>> {
+    tool_calls.and_then(|raw| serde_json::from_str(raw).ok())
 }

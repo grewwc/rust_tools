@@ -18,7 +18,13 @@ pub fn print_builtin_tools(app: &App) {
 }
 
 pub fn print_skills(skill_manifests: &[SkillManifest]) {
+    let dir = crate::ai::skills::skills_dir();
+
     println!("{}", "[skills]".yellow());
+    println!(
+        "register: put *.skill (or *.md) into {}",
+        dir.display().to_string().cyan()
+    );
     for s in skill_manifests {
         println!(" - {}: {}", s.name.cyan(), s.description);
     }
