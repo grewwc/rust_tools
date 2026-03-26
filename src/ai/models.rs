@@ -2,12 +2,12 @@ use super::cli::Cli;
 
 const DEEPSEEK_V3: &str = "deepseek-v3.1";
 const DEEPSEEK_R1: &str = "deepseek-r1";
-const QWEN_MAX_LATEST: &str = "qwen-max-latest";
+const QWEN_MAX_LATEST: &str = "qwen3-max";
 const QWEN_PLUS_LATEST: &str = "qwen3.5-plus";
-const QWEN_MAX: &str = "qwen-max";
+const QWEN_MAX: &str = "qwen3-max";
 const QWEN_CODER_PLUS_LATEST: &str = "qwen3-coder-plus";
 const QWQ: &str = "qwq-plus-latest";
-const QWEN_FLASH: &str = "qwen-flash";
+const QWEN_FLASH: &str = "qwen3.5-flash";
 const QWEN3_MAX: &str = "qwen3-max";
 const QWEN_VL_FLASH: &str = "qwen3-vl-flash";
 const QWEN_VL_MAX: &str = "qwen3-vl-plus";
