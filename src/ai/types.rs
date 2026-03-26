@@ -20,6 +20,9 @@ pub(super) struct AppConfig {
     pub(super) history_file: PathBuf,
     pub(super) endpoint: String,
     pub(super) vl_default_model: String,
+    pub(super) history_max_chars: usize,
+    pub(super) history_keep_last: usize,
+    pub(super) history_summary_max_chars: usize,
 }
 
 pub(super) struct App {

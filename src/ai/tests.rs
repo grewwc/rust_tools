@@ -5,7 +5,10 @@ use serde_json::Value;
 
 use super::{
     files,
-    history::{COLON, NEWLINE, SessionStore, append_history, build_message_arr},
+    history::{
+        COLON, NEWLINE, SessionStore, append_history, build_message_arr,
+        compress_messages_for_context,
+    },
     models,
     prompt::MultilineHistoryState,
     request::{StreamChoice, StreamChunk, StreamDelta},
@@ -54,6 +57,9 @@ fn resolve_model_is_unicode_safe() {
         history_file: PathBuf::new(),
         endpoint: String::new(),
         vl_default_model: models::qwen_vl_flash().to_string(),
+        history_max_chars: 12000,
+        history_keep_last: 8,
+        history_summary_max_chars: 4000,
     };
     let client = reqwest::blocking::Client::builder().build().unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -161,6 +167,42 @@ fn history_file_parsing_sqlite_matches_go_format() {
     assert_eq!(messages[0].content, Value::String("hi".to_string()));
     assert_eq!(messages[1].role, "assistant");
     assert_eq!(messages[1].content, Value::String("hello".to_string()));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn history_compression_inserts_summary_and_keeps_recent() {
+    let path = std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
+    let long = "x".repeat(220);
+    let mut blob = String::new();
+    for i in 0..10 {
+        blob.push_str(&format!("user{COLON}u{i} {long}{NEWLINE}"));
+        blob.push_str(&format!("assistant{COLON}a{i} {long}{NEWLINE}"));
+    }
+    append_history(&path, &blob).unwrap();
+
+    let messages = build_message_arr(100, &path).unwrap();
+    let compressed = compress_messages_for_context(messages, 1200, 4, 200);
+
+    assert!(!compressed.is_empty());
+    assert_eq!(compressed[0].role, "system");
+    assert!(
+        compressed[0]
+            .content
+            .as_str()
+            .unwrap_or_default()
+            .contains("对话摘要")
+    );
+    assert_eq!(
+        compressed.last().unwrap().content,
+        Value::String(format!("a9 {long}"))
+    );
+    let total = compressed
+        .iter()
+        .map(|m| m.content.as_str().map(|s| s.len()).unwrap_or(0))
+        .sum::<usize>();
+    assert!(total <= 1200);
 
     let _ = std::fs::remove_file(path);
 }

@@ -16,7 +16,7 @@ use crate::ai::{
     config,
     history::{
         COLON, Message, NEWLINE, SessionStore, append_history, build_message_arr,
-        delete_history_artifacts,
+        compress_messages_for_context, delete_history_artifacts,
     },
     mcp::McpClient,
     models,
@@ -212,10 +212,18 @@ fn run_loop(
             tool_calls: None,
             tool_call_id: None,
         });
-        messages.extend(build_message_arr(
-            ctx.history_count,
-            &app.session_history_file,
-        )?);
+        let history = build_message_arr(ctx.history_count, &app.session_history_file)?;
+        let history = if app.config.history_max_chars == 0 {
+            history
+        } else {
+            compress_messages_for_context(
+                history,
+                app.config.history_max_chars,
+                app.config.history_keep_last,
+                app.config.history_summary_max_chars,
+            )
+        };
+        messages.extend(history);
         messages.push(Message {
             role: "user".to_string(),
             content: request::build_content(&next_model, &question, &app.attached_image_files)?,

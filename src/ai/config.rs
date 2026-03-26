@@ -26,11 +26,26 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         .unwrap_or_else(|| QWEN_ENDPOINT.to_string());
     let vl_default_model =
         models::determine_vl_model(&cfg.get_opt("ai.model.vl_default").unwrap_or_default());
+    let history_max_chars = cfg
+        .get_opt("ai.history.max_chars")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(12000);
+    let history_keep_last = cfg
+        .get_opt("ai.history.keep_last")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8);
+    let history_summary_max_chars = cfg
+        .get_opt("ai.history.summary_max_chars")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4000);
     Ok(AppConfig {
         api_key,
         history_file: PathBuf::from(expanduser(&history_file).as_ref()),
         endpoint,
         vl_default_model,
+        history_max_chars,
+        history_keep_last,
+        history_summary_max_chars,
     })
 }
 

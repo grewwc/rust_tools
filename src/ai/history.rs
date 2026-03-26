@@ -28,6 +28,45 @@ pub(super) struct Message {
     pub(super) tool_call_id: Option<String>,
 }
 
+pub(super) fn compress_messages_for_context(
+    messages: Vec<Message>,
+    max_chars: usize,
+    keep_last: usize,
+    summary_max_chars: usize,
+) -> Vec<Message> {
+    if max_chars == 0 || messages.is_empty() {
+        return messages;
+    }
+
+    let keep_last = keep_last.min(messages.len());
+    if keep_last == 0 {
+        return shrink_messages_to_fit(messages, max_chars);
+    }
+
+    let split_at = messages.len().saturating_sub(keep_last);
+    let (older, recent) = messages.split_at(split_at);
+    if older.is_empty() {
+        return shrink_messages_to_fit(recent.to_vec(), max_chars);
+    }
+
+    let mut out = Vec::new();
+    if summary_max_chars > 0 {
+        let summary = build_summary_text(older, summary_max_chars);
+        if !summary.trim().is_empty() {
+            out.push(Message {
+                role: "system".to_string(),
+                content: Value::String(format!(
+                    "对话摘要（自动压缩，以下为早期对话要点）：\n{summary}"
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+    }
+    out.extend_from_slice(recent);
+    shrink_messages_to_fit(out, max_chars)
+}
+
 pub(super) fn build_message_arr(
     history_count: usize,
     history_file: &PathBuf,
@@ -142,6 +181,111 @@ fn parse_history_blob(content: &str) -> Vec<(String, String)> {
         let msg = &line[last_colon + COLON.len_utf8()..];
         out.push((role.to_string(), msg.to_string()));
     }
+    out
+}
+
+fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<Message> {
+    if max_chars == 0 || messages.is_empty() {
+        return Vec::new();
+    }
+
+    let mut start = 0usize;
+    while start + 1 < messages.len() && messages_total_chars(&messages[start..]) > max_chars {
+        start += 1;
+    }
+    if start > 0 {
+        messages = messages[start..].to_vec();
+    }
+
+    if messages_total_chars(&messages) <= max_chars {
+        return messages;
+    }
+
+    let first = messages.first_mut().unwrap();
+    let text = value_to_string(&first.content);
+    let truncated = truncate_to_chars(&text, max_chars);
+    *first = Message {
+        role: first.role.clone(),
+        content: Value::String(truncated),
+        tool_calls: first.tool_calls.clone(),
+        tool_call_id: first.tool_call_id.clone(),
+    };
+    messages.truncate(1);
+    messages
+}
+
+fn messages_total_chars(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|m| value_len_chars(&m.content))
+        .sum::<usize>()
+}
+
+fn value_len_chars(v: &Value) -> usize {
+    v.as_str()
+        .map(|s| s.len())
+        .unwrap_or_else(|| v.to_string().len())
+}
+
+fn value_to_string(v: &Value) -> String {
+    v.as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| v.to_string())
+}
+
+fn build_summary_text(messages: &[Message], max_chars: usize) -> String {
+    let mut lines = Vec::new();
+    for m in messages {
+        let role = match m.role.as_str() {
+            "user" => "用户",
+            "assistant" => "助手",
+            other => other,
+        };
+        let text = normalize_whitespace(&value_to_string(&m.content));
+        if text.is_empty() {
+            continue;
+        }
+        let snippet = truncate_to_chars(&text, 200);
+        lines.push(format!("{role}: {snippet}"));
+        if lines.join("\n").len() >= max_chars {
+            break;
+        }
+    }
+    let joined = lines.join("\n");
+    truncate_to_chars(&joined, max_chars)
+}
+
+fn normalize_whitespace(s: &str) -> String {
+    let mut out = String::new();
+    let mut in_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !in_ws {
+                out.push(' ');
+                in_ws = true;
+            }
+        } else {
+            out.push(ch);
+            in_ws = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn truncate_to_chars(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let end = s
+        .char_indices()
+        .nth(max_chars)
+        .map(|(idx, _)| idx)
+        .unwrap_or_else(|| s.len());
+    let mut out = s[..end].to_string();
+    out.push('…');
     out
 }
 
