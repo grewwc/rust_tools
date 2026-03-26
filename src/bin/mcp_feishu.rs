@@ -152,6 +152,21 @@ fn handle_tools_list() -> Result<Value, JsonRpcErr> {
                 }
             },
             {
+                "name": "docs_get_text_by_url",
+                "description": "Fetch plain text content for a Feishu/Lark URL. Supports wiki/doc/docx/sheets URLs. For wiki URLs, resolves node to underlying object and then fetches content (doc/docx raw_content, sheets preview). Requires user_access_token.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "Feishu/Lark docs URL, e.g. https://bytedance.larkoffice.com/wiki/<token> or https://xxx.feishu.cn/docx/<token>" },
+                        "lang": { "type": "integer", "description": "docx raw_content lang: 0=zh,1=en,2=ja (default 0)" },
+                        "max_rows": { "type": "integer", "description": "For sheets: preview max rows per sheet (default 50, max 500)" },
+                        "max_cols": { "type": "integer", "description": "For sheets: preview max columns per sheet (default 20, max 200)" },
+                        "max_sheets": { "type": "integer", "description": "For sheets: preview max sheets (default 3, max 20)" }
+                    },
+                    "required": ["url"]
+                }
+            },
+            {
                 "name": "oauth_authorize_url",
                 "description": "Build Feishu OAuth authorize URL to obtain code (for user_access_token). You must configure redirect_uri in Feishu app console.",
                 "inputSchema": {
@@ -231,6 +246,14 @@ fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcErr> {
         }
         "docs_export_text" => {
             let text = feishu_docs_export_text(&args)?;
+            Ok(json!({
+                "content": [
+                    { "type": "text", "text": text }
+                ]
+            }))
+        }
+        "docs_get_text_by_url" => {
+            let text = feishu_docs_get_text_by_url(&args)?;
             Ok(json!({
                 "content": [
                     { "type": "text", "text": text }
@@ -497,6 +520,122 @@ fn feishu_docs_get_text(args: &Value) -> Result<String, JsonRpcErr> {
     Ok(content)
 }
 
+fn feishu_docs_get_text_by_url(args: &Value) -> Result<String, JsonRpcErr> {
+    let url = args
+        .get("url")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if url.is_empty() {
+        return Err(json_rpc_error(-32602, "Invalid params: url is empty", None));
+    }
+
+    let lang = args
+        .get("lang")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .clamp(0, 2);
+
+    let max_rows = args
+        .get("max_rows")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(50)
+        .clamp(1, 500) as usize;
+    let max_cols = args
+        .get("max_cols")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(20)
+        .clamp(1, 200) as usize;
+    let max_sheets = args
+        .get("max_sheets")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(3)
+        .clamp(1, 20) as usize;
+
+    let base_url = resolve_base_url_for_user_url(&url);
+    let client = Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to build http client",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    let token = if let Some(tok) = resolve_user_access_token() {
+        tok
+    } else {
+        get_user_access_token_cached(&client, &base_url).map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Missing user_access_token. Fetch requires OAuth once.",
+                Some(json!({
+                    "detail": e.message,
+                    "next_steps": ["oauth_authorize_url", "oauth_wait_local_code", "oauth_exchange_code"],
+                    "token_store": token_store_path().display().to_string()
+                })),
+            )
+        })?
+    };
+
+    let Some((kind, tok)) = parse_docs_url_kind_and_token(&url) else {
+        return Err(json_rpc_error(
+            -32602,
+            "Unsupported URL: failed to extract docs token/type",
+            Some(json!({ "url": url })),
+        ));
+    };
+
+    match kind.as_str() {
+        "wiki" => {
+            let (docs_type, docs_token) =
+                feishu_wiki_resolve_obj(&client, &base_url, &token, &tok)?;
+            match docs_type.as_str() {
+                "doc" | "docx" => {
+                    let content = feishu_fetch_raw_content(
+                        &client,
+                        &base_url,
+                        &token,
+                        &docs_type,
+                        &docs_token,
+                        lang,
+                    )?;
+                    Ok(content)
+                }
+                "sheet" => feishu_fetch_sheet_preview_text(
+                    &client,
+                    &base_url,
+                    &token,
+                    &docs_token,
+                    max_rows,
+                    max_cols,
+                    max_sheets,
+                ),
+                other => Err(json_rpc_error(
+                    -32602,
+                    "Unsupported wiki node object type (supported: doc/docx/sheet for now)",
+                    Some(json!({ "obj_type": other, "obj_token": docs_token, "node_token": tok })),
+                )),
+            }
+        }
+        "doc" | "docx" => {
+            let content = feishu_fetch_raw_content(&client, &base_url, &token, &kind, &tok, lang)?;
+            Ok(content)
+        }
+        "sheet" => feishu_fetch_sheet_preview_text(
+            &client, &base_url, &token, &tok, max_rows, max_cols, max_sheets,
+        ),
+        other => Err(json_rpc_error(
+            -32602,
+            "Unsupported docs URL type (supported: wiki/doc/docx/sheets for now)",
+            Some(json!({ "url": url, "parsed_type": other, "parsed_token": tok })),
+        )),
+    }
+}
+
 fn feishu_docs_export_text(args: &Value) -> Result<String, JsonRpcErr> {
     let docs_token = args
         .get("docs_token")
@@ -583,6 +722,428 @@ fn feishu_docs_export_text(args: &Value) -> Result<String, JsonRpcErr> {
     let _ = fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600));
 
     Ok(format!("exported: {}", file_path.display()))
+}
+
+fn resolve_base_url_for_user_url(url: &str) -> String {
+    let u = url.to_lowercase();
+    if u.contains("larkoffice.com") || u.contains("larksuite.com") {
+        "https://open.larksuite.com".to_string()
+    } else {
+        resolve_base_url()
+    }
+}
+
+fn parse_docs_url_kind_and_token(url: &str) -> Option<(String, String)> {
+    let mut s = url.trim();
+    if let Some(idx) = s.find("://") {
+        s = &s[idx + 3..];
+    }
+    let s = s.splitn(2, '?').next().unwrap_or(s);
+    let s = s.splitn(2, '#').next().unwrap_or(s);
+    let path = if let Some(idx) = s.find('/') {
+        &s[idx..]
+    } else {
+        s
+    };
+    let path = path.trim_start_matches('/');
+
+    let segs = path
+        .split('/')
+        .filter(|p| !p.trim().is_empty())
+        .collect::<Vec<_>>();
+    if segs.len() < 2 {
+        return None;
+    }
+
+    for i in 0..(segs.len().saturating_sub(1)) {
+        let kind = segs[i].trim().to_lowercase();
+        let token = segs[i + 1].trim();
+        if token.is_empty() {
+            continue;
+        }
+        let kind = match kind.as_str() {
+            "wiki" => "wiki",
+            "docx" => "docx",
+            "doc" | "docs" => "doc",
+            "sheets" | "sheet" => "sheet",
+            _ => continue,
+        };
+        return Some((kind.to_string(), token.to_string()));
+    }
+    None
+}
+
+fn feishu_wiki_resolve_obj(
+    client: &Client,
+    base_url: &str,
+    user_access_token: &str,
+    token: &str,
+) -> Result<(String, String), JsonRpcErr> {
+    let q_token = url_encode_component(token);
+    let url = format!(
+        "{}/open-apis/wiki/v2/spaces/get_node?token={}",
+        base_url.trim_end_matches('/'),
+        q_token
+    );
+
+    let resp = client
+        .get(url)
+        .header(
+            "Authorization",
+            format!("Bearer {}", user_access_token.trim()),
+        )
+        .header("Content-Type", "application/json; charset=utf-8")
+        .send()
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to call wiki get_node API",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    let status = resp.status();
+    let text = resp.text().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to read wiki get_node response",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(json_rpc_error(
+            -32000,
+            "wiki get_node API returned non-success HTTP status",
+            Some(json!({ "status": status.as_u16(), "body": text })),
+        ));
+    }
+
+    let v: Value = serde_json::from_str(&text).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to parse wiki get_node JSON",
+            Some(json!({ "error": e.to_string(), "body": text })),
+        )
+    })?;
+    let code = v.get("code").and_then(|x| x.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v
+            .get("msg")
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown error");
+        return Err(json_rpc_error(
+            -32000,
+            "wiki get_node returned error",
+            Some(json!({ "code": code, "msg": msg, "body": v })),
+        ));
+    }
+
+    let data = v.get("data").cloned().unwrap_or_else(|| json!({}));
+    let node = data.get("node").cloned().unwrap_or_else(|| data.clone());
+
+    let obj_type = node
+        .get("obj_type")
+        .and_then(|x| x.as_str())
+        .or_else(|| node.get("objType").and_then(|x| x.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let obj_token = node
+        .get("obj_token")
+        .and_then(|x| x.as_str())
+        .or_else(|| node.get("objToken").and_then(|x| x.as_str()))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if obj_type.is_empty() || obj_token.is_empty() {
+        return Err(json_rpc_error(
+            -32000,
+            "wiki get_node response missing obj_type/obj_token",
+            Some(json!({ "parsed": { "obj_type": obj_type, "obj_token": obj_token }, "body": v })),
+        ));
+    }
+
+    Ok((obj_type, obj_token))
+}
+
+fn feishu_fetch_sheet_preview_text(
+    client: &Client,
+    base_url: &str,
+    user_access_token: &str,
+    spreadsheet_token: &str,
+    max_rows: usize,
+    max_cols: usize,
+    max_sheets: usize,
+) -> Result<String, JsonRpcErr> {
+    let sheets = feishu_query_sheet_list(client, base_url, user_access_token, spreadsheet_token)?;
+    if sheets.is_empty() {
+        return Err(json_rpc_error(
+            -32000,
+            "No sheets found in spreadsheet",
+            Some(json!({ "spreadsheet_token": spreadsheet_token })),
+        ));
+    }
+
+    let mut out = String::new();
+    for (idx, (sheet_id, title)) in sheets.into_iter().take(max_sheets).enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!("[sheet] {} ({})\n", title.trim(), sheet_id.trim()));
+
+        let col = col_letters(max_cols.saturating_sub(1));
+        let range = format!("{}!A1:{}{}", sheet_id.trim(), col, max_rows);
+        let values = feishu_sheets_read_range_values(
+            client,
+            base_url,
+            user_access_token,
+            spreadsheet_token,
+            &range,
+        )?;
+        out.push_str(&format_values_as_tsv(&values));
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+
+    Ok(out.trim_end().to_string())
+}
+
+fn feishu_query_sheet_list(
+    client: &Client,
+    base_url: &str,
+    user_access_token: &str,
+    spreadsheet_token: &str,
+) -> Result<Vec<(String, String)>, JsonRpcErr> {
+    let url = format!(
+        "{}/open-apis/sheets/v3/spreadsheets/{}/sheets/query",
+        base_url.trim_end_matches('/'),
+        spreadsheet_token.trim()
+    );
+    let resp = client
+        .get(url)
+        .header(
+            "Authorization",
+            format!("Bearer {}", user_access_token.trim()),
+        )
+        .header("Content-Type", "application/json; charset=utf-8")
+        .send()
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to query sheets list",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
+    let status = resp.status();
+    let text = resp.text().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to read sheets list response",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(json_rpc_error(
+            -32000,
+            "Sheets list API returned non-success HTTP status",
+            Some(json!({ "status": status.as_u16(), "body": text })),
+        ));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to parse sheets list JSON",
+            Some(json!({ "error": e.to_string(), "body": text })),
+        )
+    })?;
+    let code = v.get("code").and_then(|x| x.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v
+            .get("msg")
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown error");
+        return Err(json_rpc_error(
+            -32000,
+            "Sheets list returned error",
+            Some(json!({ "code": code, "msg": msg, "body": v })),
+        ));
+    }
+
+    let data = v.get("data").cloned().unwrap_or_else(|| json!({}));
+    let arr = data
+        .get("sheets")
+        .and_then(|x| x.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::new();
+    for item in arr {
+        let sheet_id = item
+            .get("sheet_id")
+            .and_then(|x| x.as_str())
+            .or_else(|| item.get("sheetId").and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let title = item
+            .get("title")
+            .and_then(|x| x.as_str())
+            .or_else(|| item.get("name").and_then(|x| x.as_str()))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if !sheet_id.is_empty() {
+            out.push((sheet_id, title));
+        }
+    }
+    Ok(out)
+}
+
+fn feishu_sheets_read_range_values(
+    client: &Client,
+    base_url: &str,
+    user_access_token: &str,
+    spreadsheet_token: &str,
+    range: &str,
+) -> Result<Value, JsonRpcErr> {
+    let encoded_range = url_encode_component(range);
+    let url = format!(
+        "{}/open-apis/sheets/v2/spreadsheets/{}/values/{}?valueRenderOption=ToString&dateTimeRenderOption=FormattedString",
+        base_url.trim_end_matches('/'),
+        spreadsheet_token.trim(),
+        encoded_range
+    );
+
+    let resp = client
+        .get(url)
+        .header(
+            "Authorization",
+            format!("Bearer {}", user_access_token.trim()),
+        )
+        .header("Content-Type", "application/json; charset=utf-8")
+        .send()
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to read spreadsheet range",
+                Some(json!({ "error": e.to_string(), "range": range })),
+            )
+        })?;
+    let status = resp.status();
+    let text = resp.text().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to read spreadsheet range response body",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(json_rpc_error(
+            -32000,
+            "Spreadsheet range API returned non-success HTTP status",
+            Some(json!({ "status": status.as_u16(), "body": text })),
+        ));
+    }
+    let v: Value = serde_json::from_str(&text).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to parse spreadsheet range JSON",
+            Some(json!({ "error": e.to_string(), "body": text })),
+        )
+    })?;
+    let code = v.get("code").and_then(|x| x.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        let msg = v
+            .get("msg")
+            .and_then(|x| x.as_str())
+            .unwrap_or("unknown error");
+        return Err(json_rpc_error(
+            -32000,
+            "Spreadsheet range returned error",
+            Some(json!({ "code": code, "msg": msg, "body": v })),
+        ));
+    }
+
+    let values = v
+        .get("data")
+        .and_then(|d| d.get("valueRange"))
+        .and_then(|vr| vr.get("values"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    Ok(values)
+}
+
+fn format_values_as_tsv(values: &Value) -> String {
+    let rows = values.as_array().cloned().unwrap_or_default();
+    let mut out = String::new();
+    for row in rows {
+        let cells = row.as_array().cloned().unwrap_or_default();
+        let mut first = true;
+        for cell in cells {
+            if !first {
+                out.push('\t');
+            }
+            first = false;
+            out.push_str(&cell_to_text(&cell));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+fn cell_to_text(v: &Value) -> String {
+    if let Some(s) = v.as_str() {
+        return s.to_string();
+    }
+    if let Some(n) = v.as_i64() {
+        return n.to_string();
+    }
+    if let Some(n) = v.as_f64() {
+        return n.to_string();
+    }
+    if let Some(obj) = v.as_object() {
+        if let Some(t) = obj.get("text").and_then(|x| x.as_str()) {
+            return t.to_string();
+        }
+        if obj.get("fileToken").and_then(|x| x.as_str()).is_some()
+            || obj
+                .get("float_image_token")
+                .and_then(|x| x.as_str())
+                .is_some()
+            || obj
+                .get("floatImageToken")
+                .and_then(|x| x.as_str())
+                .is_some()
+        {
+            return "[image]".to_string();
+        }
+        if let Some(t) = obj.get("type").and_then(|x| x.as_str())
+            && t == "embed-image"
+        {
+            return "[image]".to_string();
+        }
+        if let Some(s) = obj.get("value").and_then(|x| x.as_str()) {
+            return s.to_string();
+        }
+    }
+    if v.is_null() {
+        return String::new();
+    }
+    v.to_string()
+}
+
+fn col_letters(mut idx: usize) -> String {
+    let mut out = Vec::new();
+    loop {
+        let rem = idx % 26;
+        out.push((b'A' + rem as u8) as char);
+        if idx < 26 {
+            break;
+        }
+        idx = idx / 26 - 1;
+    }
+    out.iter().rev().collect()
 }
 
 fn feishu_fetch_raw_content(

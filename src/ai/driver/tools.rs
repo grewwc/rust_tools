@@ -27,7 +27,9 @@ mod args {
 }
 
 mod dispatch {
+    use regex::Regex;
     use serde_json::{Value, json};
+    use std::sync::LazyLock;
 
     use crate::{
         ai::{
@@ -45,6 +47,31 @@ mod dispatch {
         e.contains("missing user_access_token")
             || e.contains("invalid access token")
             || e.contains("99991668")
+            || e.contains("99991679")
+            || e.contains("re-authorization")
+    }
+
+    fn extract_feishu_required_scopes(err: &str) -> Vec<String> {
+        static RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"\b[a-z][a-z0-9_-]*:[a-z0-9_-]+(?::[a-z0-9_-]+)*\b").unwrap()
+        });
+        let mut out = Vec::new();
+        for m in RE.find_iter(err) {
+            let s = m.as_str();
+            if s.starts_with("http") {
+                continue;
+            }
+            if s.contains("open-apis") {
+                continue;
+            }
+            if s.contains("bytedance") {
+                continue;
+            }
+            out.push(s.to_string());
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 
     fn extract_oauth_code(s: &str) -> Option<String> {
@@ -69,7 +96,11 @@ mod dispatch {
         let _ = std::process::Command::new(program).arg(url).status();
     }
 
-    fn run_feishu_oauth_flow(mcp_client: &McpClient, server_name: &str) -> Result<(), String> {
+    fn run_feishu_oauth_flow(
+        mcp_client: &McpClient,
+        server_name: &str,
+        scope: &str,
+    ) -> Result<(), String> {
         let confirm =
             prompt_yes_or_no_interruptible("Feishu authorization required. Authorize now? (y/n): ");
         if confirm != Some(true) {
@@ -87,7 +118,7 @@ mod dispatch {
             "oauth_authorize_url",
             json!({
                 "redirect_uri": redirect_uri,
-                "scope": "offline_access",
+                "scope": scope,
                 "prompt": "consent",
                 "state": "rust-tools-ai"
             }),
@@ -182,8 +213,18 @@ mod dispatch {
                     content,
                 }),
                 Err(err) => {
-                    if tool_name == "docs_search" && looks_like_feishu_oauth_required(&err) {
-                        match run_feishu_oauth_flow(mcp_client, &server_name) {
+                    let is_oauth_tool = tool_name.starts_with("oauth_");
+                    if !is_oauth_tool && looks_like_feishu_oauth_required(&err) {
+                        let required = extract_feishu_required_scopes(&err);
+                        let scope = if required.is_empty() {
+                            "offline_access".to_string()
+                        } else {
+                            let mut parts = Vec::with_capacity(required.len() + 1);
+                            parts.push("offline_access".to_string());
+                            parts.extend(required);
+                            parts.join(" ")
+                        };
+                        match run_feishu_oauth_flow(mcp_client, &server_name, &scope) {
                             Ok(()) => {
                                 match mcp_client.call_tool(&server_name, &tool_name, args_value) {
                                     Ok(content) => Ok(ToolResult {
