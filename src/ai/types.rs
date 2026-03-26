@@ -39,7 +39,6 @@ pub(super) struct App {
     pub(super) shutdown: Arc<AtomicBool>,
     pub(super) streaming: Arc<AtomicBool>,
     pub(super) cancel_stream: Arc<AtomicBool>,
-    pub(super) raw_args: String,
     pub(super) writer: Option<File>,
     pub(super) prompt_editor: Option<PromptEditor>,
     pub(super) agent_context: Option<AgentContext>,

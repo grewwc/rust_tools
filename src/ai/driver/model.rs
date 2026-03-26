@@ -10,10 +10,6 @@ pub fn resolve_model_for_input(app: &App, question: &mut String) -> String {
     }
 
     let trimmed = question.trim_end();
-    if let Some(stripped) = trimmed.strip_suffix(" -code") {
-        *question = stripped.trim_end().to_string();
-        return models::qwen_coder_plus_latest().to_string();
-    }
     if let Some(stripped) = trimmed.strip_suffix(" -d") {
         *question = stripped.trim_end().to_string();
         return models::deepseek_v3().to_string();

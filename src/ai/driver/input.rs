@@ -12,18 +12,10 @@ use crate::pdfw::{PdfParseOptions, parse_pdf};
 
 pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn Error>> {
     if !app.cli.args.is_empty() {
-        let base_question = if app.cli.raw {
-            app.raw_args.clone()
-        } else {
-            let question = app.cli.args.join(" ");
-            app.cli.args.clear();
-            question
-        };
+        let base_question = app.cli.args.join(" ");
         app.cli.args.clear();
         let (question, overrides) = parse_loop_overrides(&base_question);
-        let history_count = overrides
-            .history_count
-            .unwrap_or_else(|| base_history_count(app.cli.history, app.cli.no_history));
+        let history_count = overrides.history_count.unwrap_or(app.cli.history);
         let ctx = finalize_question(app, question, history_count, overrides.short_output)?;
         return Ok(Some(ctx));
     }
@@ -40,15 +32,9 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
         return Ok(None);
     };
     let (question, overrides) = parse_loop_overrides(&question);
-    let history_count = overrides
-        .history_count
-        .unwrap_or_else(|| base_history_count(app.cli.history, app.cli.no_history));
+    let history_count = overrides.history_count.unwrap_or(app.cli.history);
     let ctx = finalize_question(app, question, history_count, overrides.short_output)?;
     Ok(Some(ctx))
-}
-
-fn base_history_count(history: usize, no_history: bool) -> usize {
-    if no_history { 0 } else { history }
 }
 
 fn apply_text_files_prefix(

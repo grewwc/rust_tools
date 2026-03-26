@@ -79,7 +79,6 @@ fn resolve_model_is_unicode_safe() {
         shutdown,
         streaming,
         cancel_stream,
-        raw_args: String::new(),
         writer: None,
         prompt_editor: None,
         agent_context: None,

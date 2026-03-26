@@ -27,7 +27,7 @@ mod args {
 }
 
 mod dispatch {
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     use crate::{
         ai::{
@@ -40,6 +40,82 @@ mod dispatch {
 
     use super::args;
 
+    fn looks_like_feishu_oauth_required(err: &str) -> bool {
+        let e = err.to_lowercase();
+        e.contains("missing user_access_token")
+            || e.contains("invalid access token")
+            || e.contains("99991668")
+    }
+
+    fn extract_oauth_code(s: &str) -> Option<String> {
+        for line in s.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("code:") {
+                let v = rest.trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+        None
+    }
+
+    fn open_browser(url: &str) {
+        let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let _ = std::process::Command::new(program).arg(url).status();
+    }
+
+    fn run_feishu_oauth_flow(mcp_client: &McpClient, server_name: &str) -> Result<(), String> {
+        let confirm = prompt_yes_or_no_interruptible("Feishu authorization required. Authorize now? (y/n): ");
+        if confirm != Some(true) {
+            return Err(if confirm.is_none() {
+                "feishu oauth canceled by user (Ctrl+C)".to_string()
+            } else {
+                "feishu oauth canceled by user".to_string()
+            });
+        }
+
+        let port = 8711u16;
+        let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+        let auth_url = mcp_client.call_tool(
+            server_name,
+            "oauth_authorize_url",
+            json!({
+                "redirect_uri": redirect_uri,
+                "scope": "offline_access",
+                "prompt": "consent",
+                "state": "rust-tools-ai"
+            }),
+        )?;
+        let auth_url = auth_url.trim().to_string();
+        println!("\n[feishu] authorize url:\n{}\n", auth_url);
+
+        let open_now = prompt_yes_or_no_interruptible("Open browser now? (y/n): ");
+        if open_now == Some(true) {
+            open_browser(&auth_url);
+        }
+
+        println!("[feishu] waiting for oauth callback on http://127.0.0.1:{port}/callback ...");
+        let code_out = mcp_client.call_tool(
+            server_name,
+            "oauth_wait_local_code",
+            json!({
+                "port": port,
+                "timeout_sec": 180
+            }),
+        )?;
+        let Some(code) = extract_oauth_code(&code_out) else {
+            return Err(format!(
+                "failed to capture oauth code. raw output:\n{}",
+                code_out.trim()
+            ));
+        };
+
+        let exchange_out = mcp_client.call_tool(server_name, "oauth_exchange_code", json!({ "code": code }))?;
+        println!("\n[feishu] {}\n", exchange_out.trim());
+        Ok(())
+    }
+
     pub struct RunOneResult {
         pub tool_result: ToolResult,
         pub ok: bool,
@@ -49,7 +125,7 @@ mod dispatch {
     pub fn run_one(mcp_client: &McpClient, tool_call: &ToolCall) -> RunOneResult {
         let name = tool_call.function.name.as_str();
 
-        if name == "execute_command" {
+        if name == "execute_command" || name == "apply_patch" {
             let args: Value = match args::parse_args(tool_call) {
                 Ok(a) => a,
                 Err(res) => {
@@ -62,16 +138,16 @@ mod dispatch {
             };
 
             let confirm =
-                prompt_yes_or_no_interruptible(&format!("Execute command:{} (y/n): ", args));
+                prompt_yes_or_no_interruptible(&format!("Confirm tool execution:{} (y/n): ", args));
             if confirm != Some(true) {
                 println!("canceled by user.");
                 return RunOneResult {
                     tool_result: ToolResult {
                         tool_call_id: tool_call.id.clone(),
                         content: if confirm.is_none() {
-                            "Error: execute_command canceled by user (Ctrl+C)".to_string()
+                            format!("Error: {} canceled by user (Ctrl+C)", name)
                         } else {
-                            "Error: execute_command canceled by user".to_string()
+                            format!("Error: {} canceled by user", name)
                         },
                     },
                     ok: false,
@@ -83,7 +159,7 @@ mod dispatch {
         let result: Result<ToolResult, String> = if let Some((server_name, tool_name)) =
             mcp_client.parse_tool_name_for_known_server(name)
         {
-            let args: Value = match args::parse_args(tool_call) {
+            let args_value: Value = match args::parse_args(tool_call) {
                 Ok(a) => a,
                 Err(res) => {
                     return RunOneResult {
@@ -94,12 +170,27 @@ mod dispatch {
                 }
             };
 
-            match mcp_client.call_tool(&server_name, &tool_name, args) {
+            match mcp_client.call_tool(&server_name, &tool_name, args_value.clone()) {
                 Ok(content) => Ok(ToolResult {
                     tool_call_id: tool_call.id.clone(),
                     content,
                 }),
-                Err(err) => Err(err),
+                Err(err) => {
+                    if tool_name == "docs_search" && looks_like_feishu_oauth_required(&err) {
+                        match run_feishu_oauth_flow(mcp_client, &server_name) {
+                            Ok(()) => match mcp_client.call_tool(&server_name, &tool_name, args_value) {
+                                Ok(content) => Ok(ToolResult {
+                                    tool_call_id: tool_call.id.clone(),
+                                    content,
+                                }),
+                                Err(err) => Err(err),
+                            },
+                            Err(e) => Err(format!("feishu oauth failed: {}", e)),
+                        }
+                    } else {
+                        Err(err)
+                    }
+                }
             }
         } else {
             builtin_tools::execute_tool_call(tool_call).map_err(|e| e.to_string())

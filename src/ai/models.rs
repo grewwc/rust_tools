@@ -112,16 +112,8 @@ pub(super) fn qwen3_max() -> &'static str {
     QWEN3_MAX
 }
 
-pub(super) fn qwen_coder_plus_latest() -> &'static str {
-    QWEN_CODER_PLUS_LATEST
-}
-
 pub(super) fn deepseek_v3() -> &'static str {
     DEEPSEEK_V3
-}
-
-pub(super) fn deepseek_r1() -> &'static str {
-    DEEPSEEK_R1
 }
 
 pub(super) fn qwen_vl_flash() -> &'static str {
@@ -158,16 +150,6 @@ pub(super) fn tools_enabled(model: &str) -> bool {
 }
 
 pub(super) fn initial_model(cli: &Cli) -> String {
-    if cli.code {
-        return qwen_coder_plus_latest().to_string();
-    }
-    if cli.deepseek {
-        return if cli.thinking {
-            deepseek_r1().to_string()
-        } else {
-            deepseek_v3().to_string()
-        };
-    }
     if let Some(selector) = selected_model_number(cli) {
         return model_from_selector(selector, cli.thinking)
             .as_str()

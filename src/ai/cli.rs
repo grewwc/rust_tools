@@ -27,16 +27,6 @@ pub(super) struct Cli {
     )]
     pub(super) multi_line: bool,
 
-    #[arg(
-        long,
-        action = ArgAction::SetTrue,
-        help = "use code model (qwen3-coder-plus)"
-    )]
-    pub(super) code: bool,
-
-    #[arg(short = 'd', action = ArgAction::SetTrue, help = "deepseek model")]
-    pub(super) deepseek: bool,
-
     #[arg(long, action = ArgAction::SetTrue, help = "clear history")]
     pub(super) clear: bool,
 
@@ -51,9 +41,6 @@ pub(super) struct Cli {
 
     #[arg(short = 'c', action = ArgAction::SetTrue, help = "prepend content in clipboard")]
     pub(super) clipboard: bool,
-
-    #[arg(short = 'x', action = ArgAction::SetTrue, help = "ask without history")]
-    pub(super) no_history: bool,
 
     #[arg(
         short = 'f',
@@ -70,13 +57,6 @@ pub(super) struct Cli {
         help = "write output to file. default is output.md"
     )]
     pub(super) out: Option<String>,
-
-    #[arg(
-        long,
-        action = ArgAction::SetTrue,
-        help = "raw mode: don't use parser to get positional arguments, use raw inputs instead."
-    )]
-    pub(super) raw: bool,
 
     #[arg(short = 't', action = ArgAction::SetTrue, help = "use thinking model. default: false.")]
     pub(super) thinking: bool,

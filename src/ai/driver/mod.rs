@@ -1,5 +1,6 @@
 use std::{
     io::Write,
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -8,7 +9,7 @@ use std::{
 
 use clap::Parser;
 use colored::Colorize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::ai::{
@@ -26,6 +27,7 @@ use crate::ai::{
     stream,
     types::{AgentContext, App, StreamOutcome},
 };
+use crate::common::prompt::{prompt_yes_or_no_interruptible, read_line};
 
 pub mod input;
 pub mod mcp_init;
@@ -81,7 +83,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let writer = config::open_output_writer(cli.out.as_deref())?;
     let current_model = models::initial_model(&cli);
     let client = reqwest::blocking::Client::builder().build()?;
-    let raw_args = std::env::args().skip(1).collect::<Vec<_>>().join(" ");
     let prompt_editor = if cli.args.is_empty() {
         Some(PromptEditor::new())
     } else {
@@ -97,7 +98,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         pending_clipboard: cli.clipboard,
         pending_short_output: cli.short_output,
         current_model,
-        raw_args,
         session_id: session_id.clone(),
         session_history_file: session_store.session_history_file(&session_id),
         cli,
@@ -188,11 +188,31 @@ fn run_loop(
             should_quit = false;
             continue;
         }
+        if try_handle_feishu_auth_command(mcp_client, &question)? {
+            if should_quit {
+                cleanup_one_shot(app);
+                return Ok(());
+            }
+            should_quit = false;
+            continue;
+        }
         let next_model = resolve_model_for_input(app, &mut question);
         app.current_model = next_model.clone();
 
         app.cancel_stream.store(false, Ordering::SeqCst);
         let skill = match_skill(skill_manifests, &question);
+        let openclaw_active = skill
+            .as_ref()
+            .is_some_and(|s| s.name.as_str() == "openclaw");
+
+        let mut restore_agent_context = None;
+        if openclaw_active {
+            if let Some(ctx) = app.agent_context.as_mut() {
+                restore_agent_context = Some((ctx.tools.clone(), ctx.max_iterations));
+                ctx.tools = super::tools::get_openclaw_tool_definitions();
+                ctx.max_iterations = 12;
+            }
+        }
         let system_prompt = if let Some(skill) = skill {
             let mut p = "You are a helpful assistant.".to_string();
             let extra = skill.build_system_prompt();
@@ -203,6 +223,37 @@ fn run_loop(
             p
         } else {
             "You are a helpful assistant.".to_string()
+        };
+        let system_prompt = if openclaw_active && !system_prompt.contains("OpenClaw") {
+            format!(
+                "{}\n\n{}",
+                system_prompt,
+                "OpenClaw mode:\n- Plan before acting.\n- Prefer reading/searching before editing.\n- Make minimal, reversible edits.\n- Verify by running checks/tests.\n- If a tool is unsafe or ambiguous, ask the user."
+            )
+        } else {
+            system_prompt
+        };
+        let system_prompt = if is_feishu_docs_search_intent(&question) {
+            format!(
+                "{}\n\n{}",
+                system_prompt,
+                "Feishu mode:\n- If the user asks to search Feishu/Lark cloud docs, call the MCP tool mcp_*_docs_search.\n- If authorization is required, follow the MCP OAuth flow (oauth_authorize_url -> oauth_wait_local_code -> oauth_exchange_code) and then retry.\n- If the MCP tool is not available, tell the user to configure MCP first."
+            )
+        } else {
+            system_prompt
+        };
+        let system_prompt = if mcp_client
+            .get_all_tools()
+            .iter()
+            .any(|t| t.function.name.contains("mcp_feishu_"))
+        {
+            format!(
+                "{}\n\n{}",
+                system_prompt,
+                "If the user asks anything related to Feishu/Lark docs, prefer calling the available Feishu MCP tools instead of saying you cannot access the account."
+            )
+        } else {
+            system_prompt
         };
 
         let mut messages = Vec::new();
@@ -371,6 +422,12 @@ fn run_loop(
             println!();
         }
 
+        if let Some((tools, max_iterations)) = restore_agent_context.take() {
+            if let Some(ctx) = app.agent_context.as_mut() {
+                ctx.tools = tools;
+                ctx.max_iterations = max_iterations;
+            }
+        }
         if should_quit {
             cleanup_one_shot(app);
             return Ok(());
@@ -380,6 +437,123 @@ fn run_loop(
             writer.flush()?;
         }
     }
+}
+
+fn try_handle_feishu_auth_command(
+    mcp_client: &mut McpClient,
+    input: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    let normalized = if let Some(rest) = trimmed.strip_prefix('/') {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix(':') {
+        rest
+    } else {
+        return Ok(false);
+    };
+    if normalized != "feishu-auth" && normalized != "feishu auth" && normalized != "feishu_auth" {
+        return Ok(false);
+    }
+
+    let mut server = None;
+    for tool in mcp_client.get_all_tools() {
+        if let Some((server_name, tool_name)) =
+            mcp_client.parse_tool_name_for_known_server(&tool.function.name)
+        {
+            if tool_name == "oauth_authorize_url" {
+                server = Some(server_name);
+                break;
+            }
+        }
+    }
+    let Some(server) = server else {
+        println!("未检测到飞书 OAuth MCP 工具（oauth_authorize_url）。");
+        println!("- 先运行：cargo run --bin a -- --list-mcp-tools");
+        println!("- 再按文档配置：docs/mcp-feishu.md");
+        return Ok(true);
+    };
+
+    let scope = read_line("OAuth scope (default: offline_access): ");
+    let scope = if scope.trim().is_empty() {
+        "offline_access".to_string()
+    } else {
+        scope.trim().to_string()
+    };
+
+    let port_input = read_line("Local callback port (default: 8711): ");
+    let port = port_input
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .filter(|p| *p > 0)
+        .unwrap_or(8711);
+    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+
+    let url = mcp_client.call_tool(
+        &server,
+        "oauth_authorize_url",
+        json!({
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "prompt": "consent",
+            "state": "rust-tools-ai"
+        }),
+    )?;
+    let url = url.trim().to_string();
+    println!("\n授权链接：\n{url}\n");
+
+    let open_now = prompt_yes_or_no_interruptible("Open browser now? (y/n): ");
+    if open_now == Some(true) {
+        let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let _ = Command::new(program).arg(&url).status();
+    }
+
+    println!("等待授权回调（{redirect_uri}）...");
+    let code_out = mcp_client.call_tool(
+        &server,
+        "oauth_wait_local_code",
+        json!({
+            "port": port,
+            "timeout_sec": 180
+        }),
+    )?;
+    let code = extract_code_from_wait_output(&code_out).unwrap_or_default();
+    if code.is_empty() {
+        println!("未获取到 code，原始输出：\n{code_out}");
+        return Ok(true);
+    }
+
+    let exchange = mcp_client.call_tool(&server, "oauth_exchange_code", json!({ "code": code }))?;
+    println!("{exchange}");
+    Ok(true)
+}
+
+fn extract_code_from_wait_output(s: &str) -> Option<String> {
+    for line in s.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("code:") {
+            let v = rest.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn is_feishu_docs_search_intent(input: &str) -> bool {
+    let q = input.trim();
+    if q.is_empty() {
+        return false;
+    }
+    let lower = q.to_lowercase();
+    let mentions_feishu = q.contains("飞书") || lower.contains("feishu") || lower.contains("lark");
+    let mentions_docs = q.contains("云文档") || q.contains("文档");
+    let mentions_search = q.contains("搜索");
+    mentions_feishu && mentions_docs && mentions_search
 }
 
 fn try_handle_help_command(input: &str) -> bool {
@@ -399,6 +573,7 @@ fn try_handle_help_command(input: &str) -> bool {
     }
     println!("interactive commands:");
     println!("  /help");
+    println!("  /feishu-auth");
     println!("  /sessions");
     println!("  /sessions list");
     println!("  /sessions current");

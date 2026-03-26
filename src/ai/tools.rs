@@ -50,6 +50,30 @@ pub(super) fn get_builtin_tool_definitions() -> Vec<ToolDefinition> {
         .collect()
 }
 
+const OPENCLAW_EXTRA_TOOLS: &[(&str, &str)] = &[
+    ("read_file_lines", "Read file contents with configurable line limits"),
+    ("apply_patch", "Apply a unified diff patch to a file"),
+    ("git_status", "Get git status (porcelain)"),
+    ("git_diff", "Get git diff"),
+    ("cargo_check", "Run cargo check"),
+    ("cargo_test", "Run cargo test"),
+];
+
+pub(super) fn get_openclaw_tool_definitions() -> Vec<ToolDefinition> {
+    BUILTIN_TOOLS
+        .iter()
+        .chain(OPENCLAW_EXTRA_TOOLS.iter())
+        .map(|(name, description)| ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: description.to_string(),
+                parameters: get_tool_parameters(name),
+            },
+        })
+        .collect()
+}
+
 fn get_tool_parameters(name: &str) -> Value {
     match name {
         "read_file" => json!({
@@ -66,6 +90,24 @@ fn get_tool_parameters(name: &str) -> Value {
                 "limit": {
                     "type": "integer",
                     "description": "The number of lines to read"
+                }
+            },
+            "required": ["file_path"]
+        }),
+        "read_file_lines" => json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The absolute path to the file to read"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "The line number to start reading from (1-based)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "The number of lines to read (max: 400)"
                 }
             },
             "required": ["file_path"]
@@ -168,6 +210,88 @@ fn get_tool_parameters(name: &str) -> Value {
             },
             "required": ["url"]
         }),
+        "apply_patch" => json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The absolute path to the file to patch"
+                },
+                "patch": {
+                    "type": "string",
+                    "description": "Unified diff patch content"
+                }
+            },
+            "required": ["file_path", "patch"]
+        }),
+        "git_status" => json!({
+            "type": "object",
+            "properties": {
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory (default: \".\")"
+                }
+            }
+        }),
+        "git_diff" => json!({
+            "type": "object",
+            "properties": {
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory (default: \".\")"
+                },
+                "cached": {
+                    "type": "boolean",
+                    "description": "Diff staged changes"
+                },
+                "pathspec": {
+                    "type": "string",
+                    "description": "Optional pathspec, like \"src\" or \"Cargo.toml\""
+                }
+            }
+        }),
+        "cargo_check" => json!({
+            "type": "object",
+            "properties": {
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory (default: \".\")"
+                },
+                "workspace": {
+                    "type": "boolean",
+                    "description": "Run for workspace"
+                },
+                "all_features": {
+                    "type": "boolean",
+                    "description": "Enable all features"
+                },
+                "package": {
+                    "type": "string",
+                    "description": "Optional package name"
+                }
+            }
+        }),
+        "cargo_test" => json!({
+            "type": "object",
+            "properties": {
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory (default: \".\")"
+                },
+                "workspace": {
+                    "type": "boolean",
+                    "description": "Run for workspace"
+                },
+                "all_features": {
+                    "type": "boolean",
+                    "description": "Enable all features"
+                },
+                "package": {
+                    "type": "string",
+                    "description": "Optional package name"
+                }
+            }
+        }),
         _ => json!({"type": "object", "properties": {}}),
     }
 }
@@ -178,13 +302,19 @@ pub(super) fn execute_tool_call(tool_call: &ToolCall) -> Result<ToolResult, Stri
 
     let result = match tool_call.function.name.as_str() {
         "read_file" => execute_read_file(&args)?,
+        "read_file_lines" => execute_read_file_lines(&args)?,
         "write_file" => execute_write_file(&args)?,
+        "apply_patch" => execute_apply_patch(&args)?,
         "list_directory" => execute_list_directory(&args)?,
         "search_files" => execute_search_files(&args)?,
         "execute_command" => execute_command(&args)?,
         "grep_search" => execute_grep_search(&args)?,
         "web_search" => execute_web_search(&args)?,
         "web_fetch" => execute_web_fetch(&args)?,
+        "git_status" => execute_git_status(&args)?,
+        "git_diff" => execute_git_diff(&args)?,
+        "cargo_check" => execute_cargo_check(&args)?,
+        "cargo_test" => execute_cargo_test(&args)?,
         name => return Err(format!("Unknown tool: {}", name)),
     };
 
@@ -221,6 +351,33 @@ fn execute_read_file(args: &Value) -> Result<String, String> {
     Ok(result.join("\n"))
 }
 
+fn execute_read_file_lines(args: &Value) -> Result<String, String> {
+    let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
+    let path = PathBuf::from(file_path);
+
+    if !path.exists() {
+        return Err(format!("File not found: {}", file_path));
+    }
+    let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
+    let mut limit = args["limit"].as_u64().unwrap_or(200) as usize;
+    limit = limit.clamp(1, 400);
+
+    let content = fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let lines: Vec<&str> = content.lines().collect();
+    let start = offset.saturating_sub(1);
+    if start >= lines.len() {
+        return Ok(String::new());
+    }
+    let end = (start + limit).min(lines.len());
+
+    let result: Vec<String> = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| format!("{:>6}\t{}", start + i + 1, line))
+        .collect();
+    Ok(result.join("\n"))
+}
+
 fn execute_write_file(args: &Value) -> Result<String, String> {
     let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
     let content = args["content"].as_str().ok_or("Missing content")?;
@@ -234,6 +391,140 @@ fn execute_write_file(args: &Value) -> Result<String, String> {
     fs::write(&path, content).map_err(|e| format!("Failed to write file: {}", e))?;
 
     Ok(format!("Successfully wrote to {}", file_path))
+}
+
+#[derive(Debug, Clone)]
+struct UnifiedHunk {
+    old_start: usize,
+    lines: Vec<UnifiedLine>,
+}
+
+#[derive(Debug, Clone)]
+enum UnifiedLine {
+    Context(String),
+    Remove(String),
+    Add(String),
+}
+
+fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
+    let mut hunks = Vec::new();
+    let mut iter = patch.lines().peekable();
+    while let Some(line) = iter.next() {
+        let Some(rest) = line.strip_prefix("@@") else {
+            continue;
+        };
+        let rest = rest.trim();
+        let Some(rest) = rest.strip_prefix('-') else {
+            return Err("invalid hunk header".to_string());
+        };
+        let mut parts = rest.split_whitespace();
+        let old_part = parts.next().ok_or("invalid hunk header")?;
+        let _new_part = parts.next().ok_or("invalid hunk header")?;
+
+        let old_start = old_part
+            .split(',')
+            .next()
+            .ok_or("invalid hunk header")?
+            .parse::<isize>()
+            .map_err(|_| "invalid hunk header")?;
+        let old_start = if old_start <= 0 { 0 } else { old_start as usize };
+
+        let mut lines = Vec::new();
+        while let Some(next) = iter.peek().copied() {
+            if next.starts_with("@@") {
+                break;
+            }
+            let l = iter.next().unwrap_or_default();
+            if l.starts_with("\\ No newline at end of file") {
+                continue;
+            }
+            let (prefix, body) = l.split_at(1);
+            match prefix {
+                " " => lines.push(UnifiedLine::Context(body.to_string())),
+                "-" => lines.push(UnifiedLine::Remove(body.to_string())),
+                "+" => lines.push(UnifiedLine::Add(body.to_string())),
+                _ => return Err(format!("invalid hunk line: {}", l)),
+            }
+        }
+        hunks.push(UnifiedHunk { old_start, lines });
+    }
+    if hunks.is_empty() {
+        return Err("no hunks found".to_string());
+    }
+    Ok(hunks)
+}
+
+fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
+    let had_trailing_newline = original.ends_with('\n');
+    let hunks = parse_unified_hunks(patch)?;
+    let orig_lines: Vec<String> = original.lines().map(|s| s.to_string()).collect();
+
+    let mut out: Vec<String> = Vec::new();
+    let mut cursor = 0usize;
+
+    for hunk in hunks {
+        let apply_at = hunk.old_start.saturating_sub(1);
+        if apply_at > orig_lines.len() {
+            return Err("hunk start out of range".to_string());
+        }
+        if apply_at < cursor {
+            return Err("hunks out of order".to_string());
+        }
+
+        out.extend_from_slice(&orig_lines[cursor..apply_at]);
+        let mut idx = apply_at;
+
+        for line in hunk.lines {
+            match line {
+                UnifiedLine::Context(s) => {
+                    let cur = orig_lines.get(idx).ok_or("context out of range")?;
+                    if cur != &s {
+                        return Err("context mismatch".to_string());
+                    }
+                    out.push(s);
+                    idx += 1;
+                }
+                UnifiedLine::Remove(s) => {
+                    let cur = orig_lines.get(idx).ok_or("remove out of range")?;
+                    if cur != &s {
+                        return Err("remove mismatch".to_string());
+                    }
+                    idx += 1;
+                }
+                UnifiedLine::Add(s) => {
+                    out.push(s);
+                }
+            }
+        }
+
+        cursor = idx;
+    }
+
+    out.extend_from_slice(&orig_lines[cursor..]);
+    let mut s = out.join("\n");
+    if had_trailing_newline {
+        s.push('\n');
+    }
+    Ok(s)
+}
+
+fn execute_apply_patch(args: &Value) -> Result<String, String> {
+    let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
+    let patch = args["patch"].as_str().ok_or("Missing patch")?;
+
+    let path = PathBuf::from(file_path);
+    let original = if path.exists() {
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))?
+    } else {
+        String::new()
+    };
+    let next = apply_unified_patch(&original, patch)?;
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
+    }
+    fs::write(&path, next).map_err(|e| format!("Failed to write file: {}", e))?;
+    Ok(format!("Successfully patched {}", file_path))
 }
 
 fn execute_list_directory(args: &Value) -> Result<String, String> {
@@ -455,6 +746,143 @@ fn execute_grep_search(args: &Value) -> Result<String, String> {
 
     let result = String::from_utf8_lossy(&output.stdout).into_owned();
     Ok(result.trim().to_string())
+}
+
+fn execute_git_status(args: &Value) -> Result<String, String> {
+    let cwd = args["cwd"].as_str().unwrap_or(".");
+
+    let output = Command::new("git")
+        .args(["status", "--porcelain=v1", "--branch"])
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("Failed to execute git: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        Ok(stdout.trim().to_string())
+    } else {
+        Ok(format!(
+            "Exit code: {}\n{}\n{}",
+            output.status.code().unwrap_or(-1),
+            stdout.trim(),
+            stderr.trim()
+        ))
+    }
+}
+
+fn execute_git_diff(args: &Value) -> Result<String, String> {
+    let cwd = args["cwd"].as_str().unwrap_or(".");
+    let cached = args["cached"].as_bool().unwrap_or(false);
+    let pathspec = args["pathspec"].as_str().unwrap_or("").trim().to_string();
+
+    let mut cmd = Command::new("git");
+    cmd.arg("diff");
+    if cached {
+        cmd.arg("--cached");
+    }
+    if !pathspec.is_empty() {
+        cmd.arg("--").arg(pathspec);
+    }
+    let output = cmd
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("Failed to execute git: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let mut out = if output.status.success() {
+        stdout
+    } else {
+        format!(
+            "Exit code: {}\n{}\n{}",
+            output.status.code().unwrap_or(-1),
+            stdout.trim(),
+            stderr.trim()
+        )
+    };
+
+    const MAX_CHARS: usize = 16_000;
+    if out.len() > MAX_CHARS {
+        out.truncate(MAX_CHARS);
+        out.push_str("\n... (truncated)");
+    }
+    Ok(out.trim().to_string())
+}
+
+fn cargo_common_args(args: &Value) -> (String, bool, bool, Option<String>) {
+    let cwd = args["cwd"].as_str().unwrap_or(".").to_string();
+    let workspace = args["workspace"].as_bool().unwrap_or(true);
+    let all_features = args["all_features"].as_bool().unwrap_or(false);
+    let package = args["package"].as_str().map(|s| s.trim().to_string());
+    let package = package.filter(|s| !s.is_empty());
+    (cwd, workspace, all_features, package)
+}
+
+fn execute_cargo_check(args: &Value) -> Result<String, String> {
+    let (cwd, workspace, all_features, package) = cargo_common_args(args);
+
+    let mut cmd = Command::new("cargo");
+    cmd.arg("check");
+    if workspace {
+        cmd.arg("--workspace");
+    }
+    if all_features {
+        cmd.arg("--all-features");
+    }
+    if let Some(pkg) = package {
+        cmd.args(["-p", &pkg]);
+    }
+    let output = cmd
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("Failed to execute cargo: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        Ok(format!("{}\n{}", stdout.trim(), stderr.trim()).trim().to_string())
+    } else {
+        Ok(format!(
+            "Exit code: {}\n{}\n{}",
+            output.status.code().unwrap_or(-1),
+            stdout.trim(),
+            stderr.trim()
+        ))
+    }
+}
+
+fn execute_cargo_test(args: &Value) -> Result<String, String> {
+    let (cwd, workspace, all_features, package) = cargo_common_args(args);
+
+    let mut cmd = Command::new("cargo");
+    cmd.arg("test");
+    if workspace {
+        cmd.arg("--workspace");
+    }
+    if all_features {
+        cmd.arg("--all-features");
+    }
+    if let Some(pkg) = package {
+        cmd.args(["-p", &pkg]);
+    }
+    let output = cmd
+        .current_dir(cwd)
+        .output()
+        .map_err(|e| format!("Failed to execute cargo: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        Ok(format!("{}\n{}", stdout.trim(), stderr.trim()).trim().to_string())
+    } else {
+        Ok(format!(
+            "Exit code: {}\n{}\n{}",
+            output.status.code().unwrap_or(-1),
+            stdout.trim(),
+            stderr.trim()
+        ))
+    }
 }
 
 fn execute_web_search(args: &Value) -> Result<String, String> {
