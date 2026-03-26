@@ -324,7 +324,16 @@ impl McpClient {
     }
 
     fn list_resources(&self, conn: &mut McpServerConnection) -> Result<Vec<McpResource>, String> {
-        let result = self.send_request(conn, "resources/list", None)?;
+        let result = match self.send_request(conn, "resources/list", None) {
+            Ok(v) => v,
+            Err(err) => {
+                let is_method_not_found = err.contains("-32601") && err.contains("resources/list");
+                if is_method_not_found {
+                    return Ok(Vec::new());
+                }
+                return Err(err);
+            }
+        };
 
         let resources = result["resources"]
             .as_array()
@@ -339,7 +348,16 @@ impl McpClient {
     }
 
     fn list_prompts(&self, conn: &mut McpServerConnection) -> Result<Vec<McpPrompt>, String> {
-        let result = self.send_request(conn, "prompts/list", None)?;
+        let result = match self.send_request(conn, "prompts/list", None) {
+            Ok(v) => v,
+            Err(err) => {
+                let is_method_not_found = err.contains("-32601") && err.contains("prompts/list");
+                if is_method_not_found {
+                    return Ok(Vec::new());
+                }
+                return Err(err);
+            }
+        };
 
         let prompts = result["prompts"]
             .as_array()
