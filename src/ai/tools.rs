@@ -25,7 +25,7 @@ const BUILTIN_TOOLS: &[(&str, &str)] = &[
     ),
     (
         "search_files",
-        "Search for files by exact file name or glob pattern",
+        "Search for files by exact file name or glob pattern (returns absolute paths)",
     ),
     (
         "list_directory",
@@ -145,11 +145,11 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Exact file name (preffered) or glob pattern to match. Examples: \"Cargo.toml\", \"*.rs\", \"**/*.md\""
+                    "description": "Exact file name (preferred) or glob pattern to match. Examples: \"Cargo.toml\", \"*.rs\", \"**/*.md\""
                 },
                 "path": {
                     "type": "string",
-                    "description": "The directory to search in (default: \".\")"
+                    "description": "The directory to search in (default: \".\"). Returned paths are absolute."
                 }
             },
             "required": ["pattern"]
@@ -639,6 +639,12 @@ fn execute_search_files(args: &Value) -> Result<String, String> {
     let pattern = args["pattern"].as_str().ok_or("Missing pattern")?;
     let path = args["path"].as_str().unwrap_or(".");
 
+    let cwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {}", e))?;
+    let base_dir = {
+        let p = PathBuf::from(path);
+        if p.is_absolute() { p } else { cwd.join(p) }
+    };
+
     let is_exact_name = !pattern.contains('/')
         && !pattern.contains('\\')
         && !pattern.contains('*')
@@ -650,14 +656,30 @@ fn execute_search_files(args: &Value) -> Result<String, String> {
 
     if is_exact_name {
         if let Some(found) = find_first_file_by_name(Path::new(path), pattern) {
-            return Ok(found.to_string_lossy().trim().to_string());
+            let abs = if found.is_absolute() {
+                found
+            } else {
+                base_dir.join(found)
+            };
+            let abs = fs::canonicalize(&abs).unwrap_or(abs);
+            return Ok(abs.to_string_lossy().trim().to_string());
         }
         return Ok(String::new());
     }
 
     let matches =
         crate::terminalw::glob_paths(pattern, path).map_err(|e| format!("glob failed: {e}"))?;
-    Ok(matches.join("\n").trim().to_string())
+    let out: Vec<String> = matches
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| {
+            let p = PathBuf::from(s.trim());
+            let abs = if p.is_absolute() { p } else { base_dir.join(p) };
+            let abs = fs::canonicalize(&abs).unwrap_or(abs);
+            abs.to_string_lossy().to_string()
+        })
+        .collect();
+    Ok(out.join("\n").trim().to_string())
 }
 
 fn find_first_file_by_name(root: &Path, filename: &str) -> Option<PathBuf> {
