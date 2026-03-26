@@ -507,7 +507,11 @@ fn try_handle_feishu_auth_command(
 
     let open_now = prompt_yes_or_no_interruptible("Open browser now? (y/n): ");
     if open_now == Some(true) {
-        let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
         let _ = Command::new(program).arg(&url).status();
     }
 

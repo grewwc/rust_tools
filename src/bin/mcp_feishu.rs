@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use std::{fs, os::unix::fs::PermissionsExt};
 
 use reqwest::blocking::Client;
+use rust_tools::common::configw;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use rust_tools::common::configw;
 
 struct CachedToken {
     token: String,
@@ -62,7 +62,11 @@ fn main() {
             "tools/call" => handle_tools_call(params),
             "resources/list" => Ok(json!({"resources": []})),
             "prompts/list" => Ok(json!({"prompts": []})),
-            _ => Err(json_rpc_error(-32601, "Method not found", Some(json!({ "method": method })))),
+            _ => Err(json_rpc_error(
+                -32601,
+                "Method not found",
+                Some(json!({ "method": method })),
+            )),
         };
 
         match res {
@@ -203,7 +207,10 @@ fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcErr> {
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     match name.as_str() {
         "docs_search" => {
@@ -280,7 +287,11 @@ fn feishu_docs_search(args: &Value) -> Result<String, JsonRpcErr> {
         .trim()
         .to_string();
     if search_key.is_empty() {
-        return Err(json_rpc_error(-32602, "Invalid params: search_key is empty", None));
+        return Err(json_rpc_error(
+            -32602,
+            "Invalid params: search_key is empty",
+            None,
+        ));
     }
 
     let mut body = json!({
@@ -306,7 +317,13 @@ fn feishu_docs_search(args: &Value) -> Result<String, JsonRpcErr> {
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
-        .map_err(|e| json_rpc_error(-32000, "Failed to build http client", Some(json!({ "error": e.to_string() }))))?;
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to build http client",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
 
     let token = if let Some(tok) = resolve_user_access_token() {
         tok
@@ -369,8 +386,13 @@ fn feishu_docs_search(args: &Value) -> Result<String, JsonRpcErr> {
         ));
     }
 
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|e| json_rpc_error(-32000, "Feishu API response is not valid JSON", Some(json!({ "error": e.to_string(), "body": text }))))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Feishu API response is not valid JSON",
+            Some(json!({ "error": e.to_string(), "body": text })),
+        )
+    })?;
 
     let code = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 {
@@ -383,7 +405,10 @@ fn feishu_docs_search(args: &Value) -> Result<String, JsonRpcErr> {
 
     let data = v.get("data").cloned().unwrap_or_else(|| json!({}));
     let total = data.get("total").and_then(|v| v.as_i64()).unwrap_or(0);
-    let has_more = data.get("has_more").and_then(|v| v.as_bool()).unwrap_or(false);
+    let has_more = data
+        .get("has_more")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let docs = data
         .get("docs_entities")
         .and_then(|v| v.as_array())
@@ -395,7 +420,10 @@ fn feishu_docs_search(args: &Value) -> Result<String, JsonRpcErr> {
     for (i, item) in docs.iter().enumerate() {
         let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
         let docs_type = item.get("docs_type").and_then(|v| v.as_str()).unwrap_or("");
-        let token = item.get("docs_token").and_then(|v| v.as_str()).unwrap_or("");
+        let token = item
+            .get("docs_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let owner_id = item.get("owner_id").and_then(|v| v.as_str()).unwrap_or("");
         out.push_str(&format!(
             "{}. [{}] {} (token: {}, owner_id: {})\n",
@@ -430,13 +458,23 @@ fn feishu_docs_get_text(args: &Value) -> Result<String, JsonRpcErr> {
         ));
     }
 
-    let lang = args.get("lang").and_then(|v| v.as_i64()).unwrap_or(0).clamp(0, 2);
+    let lang = args
+        .get("lang")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .clamp(0, 2);
 
     let base_url = resolve_base_url();
     let client = Client::builder()
         .timeout(Duration::from_secs(12))
         .build()
-        .map_err(|e| json_rpc_error(-32000, "Failed to build http client", Some(json!({ "error": e.to_string() }))))?;
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to build http client",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
 
     let token = if let Some(tok) = resolve_user_access_token() {
         tok
@@ -454,7 +492,8 @@ fn feishu_docs_get_text(args: &Value) -> Result<String, JsonRpcErr> {
         })?
     };
 
-    let content = feishu_fetch_raw_content(&client, &base_url, &token, &docs_type, &docs_token, lang)?;
+    let content =
+        feishu_fetch_raw_content(&client, &base_url, &token, &docs_type, &docs_token, lang)?;
     Ok(content)
 }
 
@@ -478,7 +517,11 @@ fn feishu_docs_export_text(args: &Value) -> Result<String, JsonRpcErr> {
             Some(json!({ "docs_token": docs_token, "docs_type": docs_type })),
         ));
     }
-    let lang = args.get("lang").and_then(|v| v.as_i64()).unwrap_or(0).clamp(0, 2);
+    let lang = args
+        .get("lang")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .clamp(0, 2);
 
     let out_dir = args
         .get("out_dir")
@@ -491,14 +534,22 @@ fn feishu_docs_export_text(args: &Value) -> Result<String, JsonRpcErr> {
             .as_ref()
             .to_string()
     } else {
-        rust_tools::common::utils::expanduser(&out_dir).as_ref().to_string()
+        rust_tools::common::utils::expanduser(&out_dir)
+            .as_ref()
+            .to_string()
     };
 
     let base_url = resolve_base_url();
     let client = Client::builder()
         .timeout(Duration::from_secs(12))
         .build()
-        .map_err(|e| json_rpc_error(-32000, "Failed to build http client", Some(json!({ "error": e.to_string() }))))?;
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to build http client",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
 
     let token = if let Some(tok) = resolve_user_access_token() {
         tok
@@ -506,7 +557,8 @@ fn feishu_docs_export_text(args: &Value) -> Result<String, JsonRpcErr> {
         get_user_access_token_cached(&client, &base_url)?
     };
 
-    let content = feishu_fetch_raw_content(&client, &base_url, &token, &docs_type, &docs_token, lang)?;
+    let content =
+        feishu_fetch_raw_content(&client, &base_url, &token, &docs_type, &docs_token, lang)?;
 
     let dir = PathBuf::from(&out_dir);
     fs::create_dir_all(&dir).map_err(|e| {
@@ -570,14 +622,34 @@ fn feishu_fetch_raw_content(
 
     let resp = client
         .get(url)
-        .header("Authorization", format!("Bearer {}", user_access_token.trim()))
-        .header("Content-Type", if is_docx { "application/json; charset=utf-8" } else { "text/plain" })
+        .header(
+            "Authorization",
+            format!("Bearer {}", user_access_token.trim()),
+        )
+        .header(
+            "Content-Type",
+            if is_docx {
+                "application/json; charset=utf-8"
+            } else {
+                "text/plain"
+            },
+        )
         .send()
-        .map_err(|e| json_rpc_error(-32000, "Failed to fetch raw_content", Some(json!({ "error": e.to_string() }))))?;
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to fetch raw_content",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
     let status = resp.status();
-    let text = resp
-        .text()
-        .map_err(|e| json_rpc_error(-32000, "Failed to read raw_content response", Some(json!({ "error": e.to_string() }))))?;
+    let text = resp.text().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to read raw_content response",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
     if !status.is_success() {
         return Err(json_rpc_error(
             -32000,
@@ -585,11 +657,20 @@ fn feishu_fetch_raw_content(
             Some(json!({ "status": status.as_u16(), "body": text })),
         ));
     }
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|e| json_rpc_error(-32000, "raw_content response is not valid JSON", Some(json!({ "error": e.to_string(), "body": text }))))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "raw_content response is not valid JSON",
+            Some(json!({ "error": e.to_string(), "body": text })),
+        )
+    })?;
     let code = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 {
-        return Err(json_rpc_error(-32000, "raw_content API returned error code", Some(v)));
+        return Err(json_rpc_error(
+            -32000,
+            "raw_content API returned error code",
+            Some(v),
+        ));
     }
     let content = v
         .get("data")
@@ -612,12 +693,22 @@ fn do_docs_search_request(
         .header("Content-Type", "application/json; charset=utf-8")
         .json(body)
         .send()
-        .map_err(|e| json_rpc_error(-32000, "Failed to call Feishu API", Some(json!({ "error": e.to_string() }))))?;
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to call Feishu API",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
 
     let status = resp.status();
-    let text = resp
-        .text()
-        .map_err(|e| json_rpc_error(-32000, "Failed to read response body", Some(json!({ "error": e.to_string() }))))?;
+    let text = resp.text().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to read response body",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
     Ok((status, text))
 }
 
@@ -693,14 +784,16 @@ fn resolve_refresh_token() -> Option<String> {
     if v.is_some() {
         return v;
     }
-    load_token_store()
-        .ok()
-        .and_then(|s| s.refresh_token)
+    load_token_store().ok().and_then(|s| s.refresh_token)
 }
 
 fn resolve_app_credentials() -> Option<(String, String)> {
-    let env_id = std::env::var("FEISHU_APP_ID").ok().map(|v| v.trim().to_string());
-    let env_secret = std::env::var("FEISHU_APP_SECRET").ok().map(|v| v.trim().to_string());
+    let env_id = std::env::var("FEISHU_APP_ID")
+        .ok()
+        .map(|v| v.trim().to_string());
+    let env_secret = std::env::var("FEISHU_APP_SECRET")
+        .ok()
+        .map(|v| v.trim().to_string());
     if let (Some(id), Some(secret)) = (env_id, env_secret) {
         if !id.is_empty() && !secret.is_empty() {
             return Some((id, secret));
@@ -709,7 +802,9 @@ fn resolve_app_credentials() -> Option<(String, String)> {
 
     let cfg = configw::get_all_config();
     let id = cfg.get_opt("feishu.app_id").map(|v| v.trim().to_string());
-    let secret = cfg.get_opt("feishu.app_secret").map(|v| v.trim().to_string());
+    let secret = cfg
+        .get_opt("feishu.app_secret")
+        .map(|v| v.trim().to_string());
     match (id, secret) {
         (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => Some((id, secret)),
         _ => None,
@@ -729,7 +824,10 @@ fn get_user_access_token_cached(client: &Client, base_url: &str) -> Result<Strin
     refresh_user_access_token_and_cache(client, base_url)
 }
 
-fn refresh_user_access_token_and_cache(client: &Client, base_url: &str) -> Result<String, JsonRpcErr> {
+fn refresh_user_access_token_and_cache(
+    client: &Client,
+    base_url: &str,
+) -> Result<String, JsonRpcErr> {
     let refresh_token = resolve_refresh_token().ok_or_else(|| {
         json_rpc_error(
             -32000,
@@ -786,12 +884,22 @@ fn refresh_user_access_token_api(
         .header("Content-Type", "application/json; charset=utf-8")
         .json(&body)
         .send()
-        .map_err(|e| json_rpc_error(-32000, "Failed to call refresh_access_token API", Some(json!({ "error": e.to_string() }))))?;
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to call refresh_access_token API",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
 
     let status = resp.status();
-    let text = resp
-        .text()
-        .map_err(|e| json_rpc_error(-32000, "Failed to read refresh_access_token response body", Some(json!({ "error": e.to_string() }))))?;
+    let text = resp.text().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to read refresh_access_token response body",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
     if !status.is_success() {
         return Err(json_rpc_error(
             -32000,
@@ -799,11 +907,20 @@ fn refresh_user_access_token_api(
             Some(json!({ "status": status.as_u16(), "body": text })),
         ));
     }
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|e| json_rpc_error(-32000, "refresh_access_token response is not valid JSON", Some(json!({ "error": e.to_string(), "body": text }))))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "refresh_access_token response is not valid JSON",
+            Some(json!({ "error": e.to_string(), "body": text })),
+        )
+    })?;
     let code_num = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code_num != 0 {
-        return Err(json_rpc_error(-32000, "refresh_access_token API returned error code", Some(v)));
+        return Err(json_rpc_error(
+            -32000,
+            "refresh_access_token API returned error code",
+            Some(v),
+        ));
     }
     let data = v.get("data").cloned().unwrap_or_else(|| json!({}));
     let user_access_token = data
@@ -818,10 +935,21 @@ fn refresh_user_access_token_api(
         .unwrap_or("")
         .trim()
         .to_string();
-    let expires_in = data.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(0).max(60) as u64;
-    let refresh_expires_in = data.get("refresh_expires_in").and_then(|v| v.as_i64()).unwrap_or(0);
+    let expires_in = data
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(60) as u64;
+    let refresh_expires_in = data
+        .get("refresh_expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     if user_access_token.is_empty() {
-        return Err(json_rpc_error(-32000, "Missing access_token in refresh response", Some(data)));
+        return Err(json_rpc_error(
+            -32000,
+            "Missing access_token in refresh response",
+            Some(data),
+        ));
     }
     Ok(RefreshedUserToken {
         user_access_token,
@@ -854,7 +982,10 @@ fn get_app_access_token_cached(client: &Client, base_url: &str) -> Result<String
 
     let (token, expires_at) = fetch_app_access_token(client, base_url, &app_id, &app_secret)?;
     if let Ok(mut guard) = cache.lock() {
-        *guard = Some(CachedToken { token: token.clone(), expires_at });
+        *guard = Some(CachedToken {
+            token: token.clone(),
+            expires_at,
+        });
     }
     Ok(token)
 }
@@ -879,12 +1010,22 @@ fn fetch_app_access_token(
         .header("Content-Type", "application/json; charset=utf-8")
         .json(&body)
         .send()
-        .map_err(|e| json_rpc_error(-32000, "Failed to call app_access_token API", Some(json!({ "error": e.to_string() }))))?;
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to call app_access_token API",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
 
     let status = resp.status();
-    let text = resp
-        .text()
-        .map_err(|e| json_rpc_error(-32000, "Failed to read app_access_token response body", Some(json!({ "error": e.to_string() }))))?;
+    let text = resp.text().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to read app_access_token response body",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
     if !status.is_success() {
         return Err(json_rpc_error(
             -32000,
@@ -893,11 +1034,20 @@ fn fetch_app_access_token(
         ));
     }
 
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|e| json_rpc_error(-32000, "app_access_token response is not valid JSON", Some(json!({ "error": e.to_string(), "body": text }))))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "app_access_token response is not valid JSON",
+            Some(json!({ "error": e.to_string(), "body": text })),
+        )
+    })?;
     let code = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 {
-        return Err(json_rpc_error(-32000, "app_access_token API returned error code", Some(v)));
+        return Err(json_rpc_error(
+            -32000,
+            "app_access_token API returned error code",
+            Some(v),
+        ));
     }
 
     let token = v
@@ -907,9 +1057,17 @@ fn fetch_app_access_token(
         .trim()
         .to_string();
     if token.is_empty() {
-        return Err(json_rpc_error(-32000, "app_access_token missing in response", Some(v)));
+        return Err(json_rpc_error(
+            -32000,
+            "app_access_token missing in response",
+            Some(v),
+        ));
     }
-    let expire = v.get("expire").and_then(|v| v.as_i64()).unwrap_or(0).max(60) as u64;
+    let expire = v
+        .get("expire")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(60) as u64;
     let expires_at = Instant::now() + Duration::from_secs(expire);
     Ok((token, expires_at))
 }
@@ -933,7 +1091,11 @@ fn feishu_oauth_authorize_url(args: &Value) -> Result<String, JsonRpcErr> {
         .trim()
         .to_string();
     if redirect_uri.is_empty() {
-        return Err(json_rpc_error(-32602, "Invalid params: redirect_uri is empty", None));
+        return Err(json_rpc_error(
+            -32602,
+            "Invalid params: redirect_uri is empty",
+            None,
+        ));
     }
 
     let scope = args
@@ -942,7 +1104,10 @@ fn feishu_oauth_authorize_url(args: &Value) -> Result<String, JsonRpcErr> {
         .unwrap_or("offline_access")
         .trim()
         .to_string();
-    let state = args.get("state").and_then(|v| v.as_str()).unwrap_or("rust-tools-ai");
+    let state = args
+        .get("state")
+        .and_then(|v| v.as_str())
+        .unwrap_or("rust-tools-ai");
     let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
 
     let encoded_redirect = url_encode_component(&redirect_uri);
@@ -965,15 +1130,26 @@ fn feishu_oauth_authorize_url(args: &Value) -> Result<String, JsonRpcErr> {
 }
 
 fn feishu_oauth_wait_local_code(args: &Value) -> Result<String, JsonRpcErr> {
-    let port = args.get("port").and_then(|v| v.as_i64()).unwrap_or(8711).clamp(1, 65535) as u16;
-    let timeout_sec = args.get("timeout_sec").and_then(|v| v.as_i64()).unwrap_or(180).clamp(1, 600) as u64;
+    let port = args
+        .get("port")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(8711)
+        .clamp(1, 65535) as u16;
+    let timeout_sec = args
+        .get("timeout_sec")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(180)
+        .clamp(1, 600) as u64;
     let addr = format!("127.0.0.1:{port}");
 
-    let listener = TcpListener::bind(&addr)
-        .map_err(|e| json_rpc_error(-32000, "Failed to bind local callback port", Some(json!({ "addr": addr, "error": e.to_string() }))))?;
-    listener
-        .set_nonblocking(true)
-        .ok();
+    let listener = TcpListener::bind(&addr).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to bind local callback port",
+            Some(json!({ "addr": addr, "error": e.to_string() })),
+        )
+    })?;
+    listener.set_nonblocking(true).ok();
 
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -1014,7 +1190,11 @@ fn feishu_oauth_wait_local_code(args: &Value) -> Result<String, JsonRpcErr> {
 
     match rx.recv_timeout(Duration::from_secs(timeout_sec)) {
         Ok(code) => Ok(format!("code: {code}\nport: {port}\npath: /callback")),
-        Err(_) => Err(json_rpc_error(-32000, "Timeout waiting for OAuth code", Some(json!({ "port": port, "timeout_sec": timeout_sec })))),
+        Err(_) => Err(json_rpc_error(
+            -32000,
+            "Timeout waiting for OAuth code",
+            Some(json!({ "port": port, "timeout_sec": timeout_sec })),
+        )),
     }
 }
 
@@ -1093,13 +1273,23 @@ fn feishu_oauth_exchange_code(args: &Value) -> Result<String, JsonRpcErr> {
         .trim()
         .to_string();
     if code.is_empty() {
-        return Err(json_rpc_error(-32602, "Invalid params: code is empty", None));
+        return Err(json_rpc_error(
+            -32602,
+            "Invalid params: code is empty",
+            None,
+        ));
     }
     let base_url = resolve_base_url();
     let client = Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
-        .map_err(|e| json_rpc_error(-32000, "Failed to build http client", Some(json!({ "error": e.to_string() }))))?;
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to build http client",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
 
     let app_access_token = get_app_access_token_cached(&client, &base_url)?;
     let url = format!(
@@ -1116,12 +1306,22 @@ fn feishu_oauth_exchange_code(args: &Value) -> Result<String, JsonRpcErr> {
         .header("Content-Type", "application/json; charset=utf-8")
         .json(&body)
         .send()
-        .map_err(|e| json_rpc_error(-32000, "Failed to call user_access_token API", Some(json!({ "error": e.to_string() }))))?;
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to call user_access_token API",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
 
     let status = resp.status();
-    let text = resp
-        .text()
-        .map_err(|e| json_rpc_error(-32000, "Failed to read user_access_token response body", Some(json!({ "error": e.to_string() }))))?;
+    let text = resp.text().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to read user_access_token response body",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
     if !status.is_success() {
         return Err(json_rpc_error(
             -32000,
@@ -1129,20 +1329,46 @@ fn feishu_oauth_exchange_code(args: &Value) -> Result<String, JsonRpcErr> {
             Some(json!({ "status": status.as_u16(), "body": text })),
         ));
     }
-    let v: Value = serde_json::from_str(&text)
-        .map_err(|e| json_rpc_error(-32000, "user_access_token response is not valid JSON", Some(json!({ "error": e.to_string(), "body": text }))))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "user_access_token response is not valid JSON",
+            Some(json!({ "error": e.to_string(), "body": text })),
+        )
+    })?;
     let code_num = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code_num != 0 {
-        return Err(json_rpc_error(-32000, "user_access_token API returned error code", Some(v)));
+        return Err(json_rpc_error(
+            -32000,
+            "user_access_token API returned error code",
+            Some(v),
+        ));
     }
     let data = v.get("data").cloned().unwrap_or_else(|| json!({}));
-    let access_token = data.get("access_token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
-    let refresh_token = data.get("refresh_token").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let access_token = data
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let refresh_token = data
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
     let expires_in = data.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(0);
-    let refresh_expires_in = data.get("refresh_expires_in").and_then(|v| v.as_i64()).unwrap_or(0);
+    let refresh_expires_in = data
+        .get("refresh_expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
 
     if access_token.is_empty() {
-        return Err(json_rpc_error(-32000, "Missing access_token in response", Some(data)));
+        return Err(json_rpc_error(
+            -32000,
+            "Missing access_token in response",
+            Some(data),
+        ));
     }
 
     let expires_at = Instant::now() + Duration::from_secs(expires_in.max(60) as u64);
@@ -1180,13 +1406,20 @@ fn feishu_oauth_refresh_user_access_token(args: &Value) -> Result<String, JsonRp
     let client = Client::builder()
         .timeout(Duration::from_secs(8))
         .build()
-        .map_err(|e| json_rpc_error(-32000, "Failed to build http client", Some(json!({ "error": e.to_string() }))))?;
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to build http client",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
 
     let refreshed = refresh_user_access_token_api(&client, &base_url, &refresh_token)?;
     let _ = save_token_store(&TokenStore {
         user_access_token: Some(refreshed.user_access_token.clone()),
         user_access_token_expires_at_epoch_ms: Some(epoch_ms_from_instant(refreshed.expires_at)),
-        refresh_token: (!refreshed.refresh_token.is_empty()).then_some(refreshed.refresh_token.clone()),
+        refresh_token: (!refreshed.refresh_token.is_empty())
+            .then_some(refreshed.refresh_token.clone()),
         refresh_token_expires_in: Some(refreshed.refresh_expires_in),
         updated_at_epoch_ms: Some(epoch_ms_now()),
     });
@@ -1224,7 +1457,9 @@ fn token_store_path() -> PathBuf {
             return PathBuf::from(rust_tools::common::utils::expanduser(&v).as_ref());
         }
     }
-    PathBuf::from(rust_tools::common::utils::expanduser("~/.config/rust_tools/feishu_token.json").as_ref())
+    PathBuf::from(
+        rust_tools::common::utils::expanduser("~/.config/rust_tools/feishu_token.json").as_ref(),
+    )
 }
 
 fn load_token_store() -> Result<TokenStore, JsonRpcErr> {
@@ -1256,8 +1491,13 @@ fn save_token_store(store: &TokenStore) -> Result<(), JsonRpcErr> {
             )
         })?;
     }
-    let s = serde_json::to_string_pretty(store)
-        .map_err(|e| json_rpc_error(-32000, "Failed to serialize token store", Some(json!({ "error": e.to_string() }))))?;
+    let s = serde_json::to_string_pretty(store).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to serialize token store",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
 
     fs::write(&path, s).map_err(|e| {
         json_rpc_error(

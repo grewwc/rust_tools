@@ -61,12 +61,17 @@ mod dispatch {
     }
 
     fn open_browser(url: &str) {
-        let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+        let program = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
         let _ = std::process::Command::new(program).arg(url).status();
     }
 
     fn run_feishu_oauth_flow(mcp_client: &McpClient, server_name: &str) -> Result<(), String> {
-        let confirm = prompt_yes_or_no_interruptible("Feishu authorization required. Authorize now? (y/n): ");
+        let confirm =
+            prompt_yes_or_no_interruptible("Feishu authorization required. Authorize now? (y/n): ");
         if confirm != Some(true) {
             return Err(if confirm.is_none() {
                 "feishu oauth canceled by user (Ctrl+C)".to_string()
@@ -111,7 +116,8 @@ mod dispatch {
             ));
         };
 
-        let exchange_out = mcp_client.call_tool(server_name, "oauth_exchange_code", json!({ "code": code }))?;
+        let exchange_out =
+            mcp_client.call_tool(server_name, "oauth_exchange_code", json!({ "code": code }))?;
         println!("\n[feishu] {}\n", exchange_out.trim());
         Ok(())
     }
@@ -178,13 +184,15 @@ mod dispatch {
                 Err(err) => {
                     if tool_name == "docs_search" && looks_like_feishu_oauth_required(&err) {
                         match run_feishu_oauth_flow(mcp_client, &server_name) {
-                            Ok(()) => match mcp_client.call_tool(&server_name, &tool_name, args_value) {
-                                Ok(content) => Ok(ToolResult {
-                                    tool_call_id: tool_call.id.clone(),
-                                    content,
-                                }),
-                                Err(err) => Err(err),
-                            },
+                            Ok(()) => {
+                                match mcp_client.call_tool(&server_name, &tool_name, args_value) {
+                                    Ok(content) => Ok(ToolResult {
+                                        tool_call_id: tool_call.id.clone(),
+                                        content,
+                                    }),
+                                    Err(err) => Err(err),
+                                }
+                            }
                             Err(e) => Err(format!("feishu oauth failed: {}", e)),
                         }
                     } else {

@@ -51,7 +51,10 @@ pub(super) fn get_builtin_tool_definitions() -> Vec<ToolDefinition> {
 }
 
 const OPENCLAW_EXTRA_TOOLS: &[(&str, &str)] = &[
-    ("read_file_lines", "Read file contents with configurable line limits"),
+    (
+        "read_file_lines",
+        "Read file contents with configurable line limits",
+    ),
     ("apply_patch", "Apply a unified diff patch to a file"),
     ("git_status", "Get git status (porcelain)"),
     ("git_diff", "Get git diff"),
@@ -427,7 +430,11 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
             .ok_or("invalid hunk header")?
             .parse::<isize>()
             .map_err(|_| "invalid hunk header")?;
-        let old_start = if old_start <= 0 { 0 } else { old_start as usize };
+        let old_start = if old_start <= 0 {
+            0
+        } else {
+            old_start as usize
+        };
 
         let mut lines = Vec::new();
         while let Some(next) = iter.peek().copied() {
@@ -841,7 +848,9 @@ fn execute_cargo_check(args: &Value) -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if output.status.success() {
-        Ok(format!("{}\n{}", stdout.trim(), stderr.trim()).trim().to_string())
+        Ok(format!("{}\n{}", stdout.trim(), stderr.trim())
+            .trim()
+            .to_string())
     } else {
         Ok(format!(
             "Exit code: {}\n{}\n{}",
@@ -874,7 +883,9 @@ fn execute_cargo_test(args: &Value) -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     if output.status.success() {
-        Ok(format!("{}\n{}", stdout.trim(), stderr.trim()).trim().to_string())
+        Ok(format!("{}\n{}", stdout.trim(), stderr.trim())
+            .trim()
+            .to_string())
     } else {
         Ok(format!(
             "Exit code: {}\n{}\n{}",

@@ -240,6 +240,7 @@ pub(super) struct MarkdownStreamRenderer {
     tty: bool,
     enabled: bool,
     in_code_block: bool,
+    in_math_block: bool,
     bol: bool,
     line_buf: String,
     line_preview_emitted: bool,
@@ -258,6 +259,7 @@ impl MarkdownStreamRenderer {
             tty,
             enabled: true,
             in_code_block: false,
+            in_math_block: false,
             bol: false,
             line_buf: String::new(),
             line_preview_emitted: false,
@@ -542,6 +544,19 @@ impl MarkdownStreamRenderer {
             return format!("\x1b[97m{line}\x1b[0m\n");
         }
 
+        if trimmed == "$$" || trimmed == "\\[" || trimmed == "\\]" {
+            self.in_math_block = !self.in_math_block;
+            return "\n".to_string();
+        }
+
+        if self.in_math_block {
+            if line.is_empty() {
+                return "\n".to_string();
+            }
+            let math = render_math_tex_to_unicode(rest.trim_end());
+            return format!("{indent}\x1b[95m{math}\x1b[0m\n");
+        }
+
         if let Some((level, title)) = parse_heading(trimmed) {
             let (base, underline_char) = match level {
                 1 => ("\x1b[1m\x1b[35m", Some('═')),
@@ -677,8 +692,11 @@ fn render_inline_md(s: &str, base: &str) -> String {
     let mut i = 0usize;
     let mut bold = false;
     let mut code = false;
+    let mut math = false;
+    let mut math_delim = "$";
+    let mut math_buf = String::new();
 
-    fn apply_style(out: &mut String, base: &str, bold: bool, code: bool) {
+    fn apply_style(out: &mut String, base: &str, bold: bool, code: bool, math: bool) {
         out.push_str("\x1b[0m");
         out.push_str(base);
         if bold {
@@ -687,26 +705,60 @@ fn render_inline_md(s: &str, base: &str) -> String {
         if code {
             out.push_str("\x1b[96m");
         }
+        if math {
+            out.push_str("\x1b[95m");
+        }
     }
 
     while i < bytes.len() {
         if bytes[i] == b'`' {
             code = !code;
-            apply_style(&mut out, base, bold, code);
+            apply_style(&mut out, base, bold, code, math);
             i += 1;
             continue;
         }
 
-        if !code && bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+        if !code && !math && bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
             bold = !bold;
-            apply_style(&mut out, base, bold, code);
+            apply_style(&mut out, base, bold, code, math);
             i += 2;
             continue;
         }
 
+        if !code && bytes[i] == b'$' {
+            let is_double = i + 1 < bytes.len() && bytes[i + 1] == b'$';
+            let delim = if is_double { "$$" } else { "$" };
+
+            if math {
+                if delim == math_delim {
+                    let rendered = render_math_tex_to_unicode(math_buf.trim());
+                    out.push_str(&rendered);
+                    math_buf.clear();
+                    math = false;
+                    apply_style(&mut out, base, bold, code, math);
+                    i += delim.len();
+                    continue;
+                }
+            } else {
+                math = true;
+                math_delim = delim;
+                apply_style(&mut out, base, bold, code, math);
+                i += delim.len();
+                continue;
+            }
+        }
+
         let ch = s[i..].chars().next().unwrap();
-        out.push(ch);
+        if math && !code {
+            math_buf.push(ch);
+        } else {
+            out.push(ch);
+        }
         i += ch.len_utf8();
+    }
+
+    if math && !math_buf.is_empty() {
+        out.push_str(&render_math_tex_to_unicode(math_buf.trim()));
     }
 
     out.push_str("\x1b[0m");
@@ -817,18 +869,48 @@ fn strip_inline_md_markers(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = String::new();
     let mut i = 0usize;
+    let mut code = false;
+    let mut math = false;
+    let mut math_delim = "$";
+    let mut math_buf = String::new();
     while i < bytes.len() {
         if bytes[i] == b'`' {
+            code = !code;
             i += 1;
             continue;
         }
-        if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+        if !code && bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
             i += 2;
             continue;
         }
+        if !code && bytes[i] == b'$' {
+            let is_double = i + 1 < bytes.len() && bytes[i + 1] == b'$';
+            let delim = if is_double { "$$" } else { "$" };
+            if math {
+                if delim == math_delim {
+                    out.push_str(&render_math_tex_to_unicode(math_buf.trim()));
+                    math_buf.clear();
+                    math = false;
+                    i += delim.len();
+                    continue;
+                }
+            } else {
+                math = true;
+                math_delim = delim;
+                i += delim.len();
+                continue;
+            }
+        }
         let ch = s[i..].chars().next().unwrap();
-        out.push(ch);
+        if math && !code {
+            math_buf.push(ch);
+        } else {
+            out.push(ch);
+        }
         i += ch.len_utf8();
+    }
+    if math && !math_buf.is_empty() {
+        out.push_str(&render_math_tex_to_unicode(math_buf.trim()));
     }
     out
 }
@@ -863,31 +945,49 @@ fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
     let mut i = 0usize;
     let mut bold = false;
     let mut code = false;
+    let mut math = false;
+    let mut math_delim = "$";
     let mut cur = String::new();
     let mut cur_w = 0usize;
     let mut lines: Vec<String> = Vec::new();
 
-    let start_new_line = |cur: &mut String, cur_w: &mut usize, bold: bool, code: bool| {
+    let start_new_line = |cur: &mut String,
+                          cur_w: &mut usize,
+                          bold: bool,
+                          code: bool,
+                          math: bool,
+                          math_delim: &str| {
         if bold {
             cur.push_str("**");
         }
         if code {
             cur.push('`');
+        }
+        if math {
+            cur.push_str(math_delim);
         }
         *cur_w = 0;
     };
 
-    let close_line = |lines: &mut Vec<String>, cur: &mut String, bold: bool, code: bool| {
+    let close_line = |lines: &mut Vec<String>,
+                      cur: &mut String,
+                      bold: bool,
+                      code: bool,
+                      math: bool,
+                      math_delim: &str| {
         if code {
             cur.push('`');
         }
         if bold {
             cur.push_str("**");
         }
+        if math {
+            cur.push_str(math_delim);
+        }
         lines.push(std::mem::take(cur));
     };
 
-    start_new_line(&mut cur, &mut cur_w, bold, code);
+    start_new_line(&mut cur, &mut cur_w, bold, code, math, math_delim);
 
     while i < bytes.len() {
         if bytes[i] == b'`' {
@@ -896,28 +996,304 @@ fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
             i += 1;
             continue;
         }
-        if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+        if !code && bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
             bold = !bold;
             cur.push_str("**");
             i += 2;
             continue;
         }
+        if !code && bytes[i] == b'$' {
+            let is_double = i + 1 < bytes.len() && bytes[i + 1] == b'$';
+            let delim = if is_double { "$$" } else { "$" };
+            if math {
+                if delim == math_delim {
+                    math = false;
+                    cur.push_str(delim);
+                    i += delim.len();
+                    continue;
+                }
+            } else {
+                math = true;
+                math_delim = delim;
+                cur.push_str(delim);
+                i += delim.len();
+                continue;
+            }
+        }
         let ch = s[i..].chars().next().unwrap();
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
         if cur_w > 0 && cur_w + w > width {
-            close_line(&mut lines, &mut cur, bold, code);
-            start_new_line(&mut cur, &mut cur_w, bold, code);
+            close_line(&mut lines, &mut cur, bold, code, math, math_delim);
+            start_new_line(&mut cur, &mut cur_w, bold, code, math, math_delim);
         }
         cur.push(ch);
         cur_w += w;
         i += ch.len_utf8();
     }
 
-    close_line(&mut lines, &mut cur, bold, code);
+    close_line(&mut lines, &mut cur, bold, code, math, math_delim);
     if lines.is_empty() {
         lines.push(String::new());
     }
     lines
+}
+
+fn render_math_tex_to_unicode(s: &str) -> String {
+    use regex::Regex;
+    use std::sync::LazyLock;
+
+    static RE_FRAC: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\\frac\{([^{}]+)\}\{([^{}]+)\}").unwrap());
+    static RE_SQRT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\\sqrt\{([^{}]+)\}").unwrap());
+    static RE_MATHBB: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\\mathbb\{([A-Za-z])\}").unwrap());
+
+    let mut t = s.to_string();
+
+    t = t.replace("\\left", "");
+    t = t.replace("\\right", "");
+    t = t.replace("\\,", " ");
+    t = t.replace("\\;", " ");
+    t = t.replace("\\:", " ");
+    t = t.replace("\\!", "");
+    t = t.replace("\\ ", " ");
+
+    t = t.replace("\\times", "×");
+    t = t.replace("\\cdot", "·");
+    t = t.replace("\\div", "÷");
+    t = t.replace("\\pm", "±");
+    t = t.replace("\\mp", "∓");
+
+    t = t.replace("\\leq", "≤");
+    t = t.replace("\\geq", "≥");
+    t = t.replace("\\neq", "≠");
+    t = t.replace("\\approx", "≈");
+    t = t.replace("\\equiv", "≡");
+    t = t.replace("\\to", "→");
+    t = t.replace("\\rightarrow", "→");
+    t = t.replace("\\leftarrow", "←");
+    t = t.replace("\\leftrightarrow", "↔");
+
+    t = t.replace("\\infty", "∞");
+    t = t.replace("\\sum", "∑");
+    t = t.replace("\\prod", "∏");
+    t = t.replace("\\int", "∫");
+
+    t = t.replace("\\in", "∈");
+    t = t.replace("\\notin", "∉");
+    t = t.replace("\\subset", "⊂");
+    t = t.replace("\\subseteq", "⊆");
+    t = t.replace("\\supset", "⊃");
+    t = t.replace("\\supseteq", "⊇");
+    t = t.replace("\\cup", "∪");
+    t = t.replace("\\cap", "∩");
+
+    t = t.replace("\\alpha", "α");
+    t = t.replace("\\beta", "β");
+    t = t.replace("\\gamma", "γ");
+    t = t.replace("\\delta", "δ");
+    t = t.replace("\\epsilon", "ε");
+    t = t.replace("\\zeta", "ζ");
+    t = t.replace("\\eta", "η");
+    t = t.replace("\\theta", "θ");
+    t = t.replace("\\iota", "ι");
+    t = t.replace("\\kappa", "κ");
+    t = t.replace("\\lambda", "λ");
+    t = t.replace("\\mu", "μ");
+    t = t.replace("\\nu", "ν");
+    t = t.replace("\\xi", "ξ");
+    t = t.replace("\\pi", "π");
+    t = t.replace("\\rho", "ρ");
+    t = t.replace("\\sigma", "σ");
+    t = t.replace("\\tau", "τ");
+    t = t.replace("\\upsilon", "υ");
+    t = t.replace("\\phi", "φ");
+    t = t.replace("\\chi", "χ");
+    t = t.replace("\\psi", "ψ");
+    t = t.replace("\\omega", "ω");
+
+    t = t.replace("\\Gamma", "Γ");
+    t = t.replace("\\Delta", "Δ");
+    t = t.replace("\\Theta", "Θ");
+    t = t.replace("\\Lambda", "Λ");
+    t = t.replace("\\Xi", "Ξ");
+    t = t.replace("\\Pi", "Π");
+    t = t.replace("\\Sigma", "Σ");
+    t = t.replace("\\Phi", "Φ");
+    t = t.replace("\\Psi", "Ψ");
+    t = t.replace("\\Omega", "Ω");
+
+    t = RE_FRAC.replace_all(&t, "$1/$2").to_string();
+    t = RE_SQRT.replace_all(&t, "√($1)").to_string();
+    t = RE_MATHBB
+        .replace_all(&t, |caps: &regex::Captures| {
+            let v = &caps[1];
+            match v {
+                "R" => "ℝ".to_string(),
+                "N" => "ℕ".to_string(),
+                "Z" => "ℤ".to_string(),
+                "Q" => "ℚ".to_string(),
+                "C" => "ℂ".to_string(),
+                other => other.to_string(),
+            }
+        })
+        .to_string();
+
+    t = t.replace("\\_", "_");
+    t = t.replace("\\{", "{");
+    t = t.replace("\\}", "}");
+
+    t = apply_super_subscripts(&t);
+    t = t.replace('{', "");
+    t = t.replace('}', "");
+
+    t
+}
+
+fn apply_super_subscripts(s: &str) -> String {
+    fn map_sup(ch: char) -> Option<char> {
+        match ch {
+            '0' => Some('⁰'),
+            '1' => Some('¹'),
+            '2' => Some('²'),
+            '3' => Some('³'),
+            '4' => Some('⁴'),
+            '5' => Some('⁵'),
+            '6' => Some('⁶'),
+            '7' => Some('⁷'),
+            '8' => Some('⁸'),
+            '9' => Some('⁹'),
+            '+' => Some('⁺'),
+            '-' => Some('⁻'),
+            '=' => Some('⁼'),
+            '(' => Some('⁽'),
+            ')' => Some('⁾'),
+            'n' => Some('ⁿ'),
+            'i' => Some('ⁱ'),
+            _ => None,
+        }
+    }
+
+    fn map_sub(ch: char) -> Option<char> {
+        match ch {
+            '0' => Some('₀'),
+            '1' => Some('₁'),
+            '2' => Some('₂'),
+            '3' => Some('₃'),
+            '4' => Some('₄'),
+            '5' => Some('₅'),
+            '6' => Some('₆'),
+            '7' => Some('₇'),
+            '8' => Some('₈'),
+            '9' => Some('₉'),
+            '+' => Some('₊'),
+            '-' => Some('₋'),
+            '=' => Some('₌'),
+            '(' => Some('₍'),
+            ')' => Some('₎'),
+            'a' => Some('ₐ'),
+            'e' => Some('ₑ'),
+            'h' => Some('ₕ'),
+            'i' => Some('ᵢ'),
+            'j' => Some('ⱼ'),
+            'k' => Some('ₖ'),
+            'l' => Some('ₗ'),
+            'm' => Some('ₘ'),
+            'n' => Some('ₙ'),
+            'o' => Some('ₒ'),
+            'p' => Some('ₚ'),
+            'r' => Some('ᵣ'),
+            's' => Some('ₛ'),
+            't' => Some('ₜ'),
+            'u' => Some('ᵤ'),
+            'v' => Some('ᵥ'),
+            'x' => Some('ₓ'),
+            _ => None,
+        }
+    }
+
+    fn read_braced(s: &str, start: usize) -> Option<(String, usize)> {
+        let bytes = s.as_bytes();
+        if start >= bytes.len() || bytes[start] != b'{' {
+            return None;
+        }
+        let mut i = start + 1;
+        let mut depth = 1usize;
+        let mut out = String::new();
+        while i < bytes.len() {
+            let ch = s[i..].chars().next().unwrap();
+            i += ch.len_utf8();
+            match ch {
+                '{' => {
+                    depth += 1;
+                    out.push(ch);
+                }
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some((out, i));
+                    }
+                    out.push(ch);
+                }
+                _ => out.push(ch),
+            }
+        }
+        None
+    }
+
+    fn convert_group(group: &str, sup: bool) -> Option<String> {
+        let mut out = String::new();
+        for ch in group.chars() {
+            let mapped = if sup { map_sup(ch) } else { map_sub(ch) }?;
+            out.push(mapped);
+        }
+        Some(out)
+    }
+
+    let bytes = s.as_bytes();
+    let mut out = String::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let ch = s[i..].chars().next().unwrap();
+        if ch == '^' || ch == '_' {
+            let sup = ch == '^';
+            i += ch.len_utf8();
+            if i >= bytes.len() {
+                out.push(ch);
+                break;
+            }
+            if bytes[i] == b'{' {
+                if let Some((group, next)) = read_braced(s, i) {
+                    if let Some(converted) = convert_group(group.trim(), sup) {
+                        out.push_str(&converted);
+                    } else {
+                        out.push(if sup { '^' } else { '_' });
+                        out.push('(');
+                        out.push_str(group.trim());
+                        out.push(')');
+                    }
+                    i = next;
+                    continue;
+                }
+            }
+            let next_ch = s[i..].chars().next().unwrap();
+            if let Some(mapped) = if sup {
+                map_sup(next_ch)
+            } else {
+                map_sub(next_ch)
+            } {
+                out.push(mapped);
+            } else {
+                out.push(if sup { '^' } else { '_' });
+                out.push(next_ch);
+            }
+            i += next_ch.len_utf8();
+            continue;
+        }
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
 }
 
 fn compute_table_widths(indent: &str, header: &[String], rows: &[Vec<String>]) -> Vec<usize> {
