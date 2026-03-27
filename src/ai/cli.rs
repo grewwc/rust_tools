@@ -11,12 +11,7 @@ pub(super) struct Cli {
     #[arg(long, default_value_t = DEFAULT_NUM_HISTORY, help = "number of history")]
     pub(super) history: usize,
 
-    #[arg(
-        short = 'm',
-        long = "model",
-        default_value = "",
-        help = "model name. kimi-k2.5[0], qwen3.5-plus[1], qwen3-max[2], qwen3-max[3], qwen3-coder-plus[4], deepseek-v3.2[5], qwen3.5-flash[6] (thinking mode uses glm-5 for [5])"
-    )]
+    #[arg(short = 'm', long = "model", default_value = "", help = "model name")]
     pub(super) model: String,
 
     #[arg(
@@ -63,28 +58,6 @@ pub(super) struct Cli {
 
     #[arg(short = 's', action = ArgAction::SetTrue, help = "short output")]
     pub(super) short_output: bool,
-
-    // Model selectors are single-digit shortcuts that mirror the trailing " -<digit>" syntax.
-    #[arg(short = '0', action = ArgAction::SetTrue, help = "select kimi-k2.5")]
-    pub(super) model_0: bool,
-
-    #[arg(short = '1', action = ArgAction::SetTrue, help = "select qwen3.5-plus")]
-    pub(super) model_1: bool,
-
-    #[arg(short = '2', action = ArgAction::SetTrue, help = "select qwen3-max")]
-    pub(super) model_2: bool,
-
-    #[arg(short = '3', action = ArgAction::SetTrue, help = "select qwen3-max")]
-    pub(super) model_3: bool,
-
-    #[arg(short = '4', action = ArgAction::SetTrue, help = "select qwen3-coder-plus")]
-    pub(super) model_4: bool,
-
-    #[arg(short = '5', action = ArgAction::SetTrue, help = "select deepseek-v3.2 / glm-5")]
-    pub(super) model_5: bool,
-
-    #[arg(short = '6', action = ArgAction::SetTrue, help = "select qwen3.5-flash")]
-    pub(super) model_6: bool,
 
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub(super) args: Vec<String>,

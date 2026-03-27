@@ -17,22 +17,12 @@ use super::{
 };
 
 #[test]
-fn selector_mapping_matches_go() {
-    assert_eq!(models::model_from_selector(0, false), "kimi-k2.5");
-    assert_eq!(models::model_from_selector(1, false), "qwen3.5-plus");
-    assert_eq!(models::model_from_selector(2, false), "qwen3-max");
-    assert_eq!(models::model_from_selector(3, false), "qwen3-max");
-    assert_eq!(models::model_from_selector(4, false), "qwen3-coder-plus");
-    assert_eq!(models::model_from_selector(5, false), "deepseek-v3.2");
-    assert_eq!(models::model_from_selector(5, true), "glm-5");
-    assert_eq!(models::model_from_selector(6, false), "qwen3.5-flash");
-}
-
-#[test]
-fn trailing_selector_is_detected() {
-    assert_eq!(super::driver::trailing_model_selector("hello -3"), Some(3));
-    assert_eq!(super::driver::trailing_model_selector("hello-3"), None);
-    assert_eq!(super::driver::trailing_model_selector("hello -33"), None);
+fn default_model_names_are_stable() {
+    assert_eq!(models::qwen3_max(), "qwen3-max");
+    assert_eq!(models::deepseek_v3(), "deepseek-v3.2");
+    assert_eq!(models::qwen_vl_flash(), "qwen3-vl-flash");
+    assert_eq!(models::qwen_vl_max(), "qwen3-vl-plus");
+    assert_eq!(models::minimax_vl(), "minimax-m2.5");
 }
 
 #[test]

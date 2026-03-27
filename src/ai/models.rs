@@ -130,9 +130,6 @@ pub(super) fn tools_enabled(model: &str) -> bool {
 }
 
 pub(super) fn initial_model(cli: &Cli) -> String {
-    if let Some(selector) = selected_model_number(cli) {
-        return model_from_selector(selector, cli.thinking).to_string();
-    }
     if !cli.model.trim().is_empty() {
         return determine_model(&cli.model);
     }
@@ -140,42 +137,6 @@ pub(super) fn initial_model(cli: &Cli) -> String {
     cfg.get_opt("ai.model.default")
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| qwen3_max().to_string())
-}
-
-pub(super) fn selected_model_number(cli: &Cli) -> Option<u8> {
-    [
-        cli.model_0,
-        cli.model_1,
-        cli.model_2,
-        cli.model_3,
-        cli.model_4,
-        cli.model_5,
-        cli.model_6,
-    ]
-    .into_iter()
-    .enumerate()
-    .find_map(|(idx, enabled)| enabled.then_some(idx as u8))
-}
-
-pub(super) fn model_from_selector(selector: u8, thinking_mode: bool) -> &'static str {
-    // Selector numbers are part of the CLI user experience and must not shift. The only
-    // contextual mapping is selector 5, which switches to GLM when thinking mode is enabled.
-    match selector {
-        0 => "kimi-k2.5",
-        1 => "qwen3.5-plus",
-        2 => "qwen3-max",
-        3 => "qwen3-max",
-        4 => "qwen3-coder-plus",
-        5 => {
-            if thinking_mode {
-                "glm-5"
-            } else {
-                "deepseek-v3.2"
-            }
-        }
-        6 => "qwen3.5-flash",
-        _ => "qwen3-max",
-    }
 }
 
 pub(super) fn determine_model(model: &str) -> String {
