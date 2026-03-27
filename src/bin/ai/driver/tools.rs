@@ -43,10 +43,11 @@ mod dispatch {
     use super::args;
 
     fn requires_user_confirmation_for_tool(name: &str) -> bool {
-        let lower = name.to_lowercase();
-        let looks_like_feishu = lower.contains("feishu") || lower.contains("lark");
-        let looks_like_search = lower.contains("search") || lower.contains("docs_search");
-        looks_like_feishu && looks_like_search
+        false
+        // let lower = name.to_lowercase();
+        // let looks_like_feishu = lower.contains("feishu") || lower.contains("lark");
+        // let looks_like_search = lower.contains("search") || lower.contains("docs_search");
+        // looks_like_feishu && looks_like_search
     }
 
     fn looks_like_feishu_oauth_required(err: &str) -> bool {
@@ -213,23 +214,23 @@ mod dispatch {
                 }
             };
 
-            // let confirm =
-            //     prompt_yes_or_no_interruptible(&format!("Confirm tool execution:{} (y/n): ", args));
-            // if confirm != Some(true) {
-            //     println!("canceled by user.");
-            //     return RunOneResult {
-            //         tool_result: ToolResult {
-            //             tool_call_id: tool_call.id.clone(),
-            //             content: if confirm.is_none() {
-            //                 format!("Error: {} canceled by user (Ctrl+C)", name)
-            //             } else {
-            //                 format!("Error: {} canceled by user", name)
-            //             },
-            //         },
-            //         ok: false,
-            //         executed: false,
-            //     };
-            // }
+            let confirm =
+                prompt_yes_or_no_interruptible(&format!("Confirm tool execution:{} (y/n): ", args));
+            if confirm != Some(true) {
+                println!("canceled by user.");
+                return RunOneResult {
+                    tool_result: ToolResult {
+                        tool_call_id: tool_call.id.clone(),
+                        content: if confirm.is_none() {
+                            format!("Error: {} canceled by user (Ctrl+C)", name)
+                        } else {
+                            format!("Error: {} canceled by user", name)
+                        },
+                    },
+                    ok: false,
+                    executed: false,
+                };
+            }
         }
 
         let result: Result<ToolResult, String> = if let Some((server_name, tool_name)) =
