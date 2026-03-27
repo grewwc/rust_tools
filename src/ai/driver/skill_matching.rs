@@ -153,13 +153,7 @@ fn normalize(input: &str) -> String {
         .trim()
         .to_lowercase()
         .chars()
-        .map(|c| {
-            if c.is_ascii_punctuation() {
-                ' '
-            } else {
-                c
-            }
-        })
+        .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
         .collect::<String>()
 }
 
@@ -201,7 +195,12 @@ mod tests {
     #[test]
     fn review_style_input_prefers_code_review_over_priority_fallback() {
         let skills = vec![
-            skill("openclaw", "OpenClaw-like autonomous tool-using agent", &["openclaw"], 30),
+            skill(
+                "openclaw",
+                "OpenClaw-like autonomous tool-using agent",
+                &["openclaw"],
+                30,
+            ),
             skill(
                 "code-review",
                 "Review code for quality, security, and best practices",
@@ -215,7 +214,12 @@ mod tests {
 
     #[test]
     fn explicit_openclaw_trigger_still_matches() {
-        let skills = vec![skill("openclaw", "agent", &["openclaw模式", "开启openclaw"], 30)];
+        let skills = vec![skill(
+            "openclaw",
+            "agent",
+            &["openclaw模式", "开启openclaw"],
+            30,
+        )];
         let matched = match_skill(&skills, "帮我开启openclaw模式").unwrap();
         assert_eq!(matched.name, "openclaw");
     }

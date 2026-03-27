@@ -1,159 +1,137 @@
 use super::cli::Cli;
 
-const DEEPSEEK_V3: &str = "deepseek-v3.1";
-const DEEPSEEK_R1: &str = "deepseek-r1";
-const QWEN_MAX_LATEST: &str = "qwen3-max";
-const QWEN_PLUS_LATEST: &str = "qwen3.5-plus";
-const QWEN_MAX: &str = "qwen3-max";
-const QWEN_CODER_PLUS_LATEST: &str = "qwen3-coder-plus";
-const QWQ: &str = "qwq-plus-latest";
-const QWEN_FLASH: &str = "qwen3.5-flash";
-const QWEN3_MAX: &str = "qwen3-max";
-const QWEN_VL_FLASH: &str = "qwen3-vl-flash";
-const QWEN_VL_MAX: &str = "qwen3-vl-plus";
-const QWEN_VL_OCR: &str = "qwen-vl-ocr-latest";
-
-const TOOLS_ON: bool = true;
-const TOOLS_OFF: bool = false;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Model {
-    DeepseekV3(bool),
-    DeepseekR1(bool),
-    QwenMaxLatest(bool),
-    QwenPlusLatest(bool),
-    QwenMax(bool),
-    QwenCoderPlusLatest(bool),
-    Qwq(bool),
-    QwenFlash(bool),
-    Qwen3Max(bool),
-    QwenVlFlash(bool),
-    QwenVlMax(bool),
-    QwenVlOcr(bool),
+enum BuiltinModel {
+    DeepseekV3,
+    Glm,
+    QwenPlusLatest,
+    Qwen3Max,
+    QwenCoderPlusLatest,
+    Kimi,
+    QwenFlash,
+    QwenVlFlash,
+    QwenVlMax,
+    MiniMax,
 }
 
-impl Model {
-    pub(super) const ALL: &'static [Model] = &[
-        Model::DeepseekV3(TOOLS_ON),
-        Model::DeepseekR1(TOOLS_ON),
-        Model::QwenMaxLatest(TOOLS_ON),
-        Model::QwenPlusLatest(TOOLS_ON),
-        Model::QwenMax(TOOLS_ON),
-        Model::QwenCoderPlusLatest(TOOLS_ON),
-        Model::Qwq(TOOLS_ON),
-        Model::QwenFlash(TOOLS_OFF),
-        Model::Qwen3Max(TOOLS_ON),
-        Model::QwenVlFlash(TOOLS_OFF),
-        Model::QwenVlMax(TOOLS_ON),
-        Model::QwenVlOcr(TOOLS_OFF),
+impl BuiltinModel {
+    const ALL: &'static [BuiltinModel] = &[
+        BuiltinModel::DeepseekV3,
+        BuiltinModel::Glm,
+        BuiltinModel::QwenPlusLatest,
+        BuiltinModel::Qwen3Max,
+        BuiltinModel::QwenCoderPlusLatest,
+        BuiltinModel::Kimi,
+        BuiltinModel::QwenFlash,
+        BuiltinModel::QwenVlFlash,
+        BuiltinModel::QwenVlMax,
+        BuiltinModel::MiniMax,
     ];
 
-    pub(super) const VL: &'static [Model] = &[
-        Model::QwenVlFlash(TOOLS_ON),
-        Model::QwenVlMax(TOOLS_ON),
-        Model::QwenVlOcr(TOOLS_ON),
-    ];
-
-    pub(super) fn as_str(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
-            Model::DeepseekV3(_) => DEEPSEEK_V3,
-            Model::DeepseekR1(_) => DEEPSEEK_R1,
-            Model::QwenMaxLatest(_) => QWEN_MAX_LATEST,
-            Model::QwenPlusLatest(_) => QWEN_PLUS_LATEST,
-            Model::QwenMax(_) => QWEN_MAX,
-            Model::QwenCoderPlusLatest(_) => QWEN_CODER_PLUS_LATEST,
-            Model::Qwq(_) => QWQ,
-            Model::QwenFlash(_) => QWEN_FLASH,
-            Model::Qwen3Max(_) => QWEN3_MAX,
-            Model::QwenVlFlash(_) => QWEN_VL_FLASH,
-            Model::QwenVlMax(_) => QWEN_VL_MAX,
-            Model::QwenVlOcr(_) => QWEN_VL_OCR,
+            BuiltinModel::DeepseekV3 => "deepseek-v3.2",
+            BuiltinModel::Glm => "glm-5",
+            BuiltinModel::QwenPlusLatest => "qwen3.5-plus",
+            BuiltinModel::Qwen3Max => "qwen3-max",
+            BuiltinModel::QwenCoderPlusLatest => "qwen3-coder-plus",
+            BuiltinModel::Kimi => "kimi-k2.5",
+            BuiltinModel::QwenFlash => "qwen3.5-flash",
+            BuiltinModel::QwenVlFlash => "qwen3-vl-flash",
+            BuiltinModel::QwenVlMax => "qwen3-vl-plus",
+            BuiltinModel::MiniMax => "minimax-m2.5",
         }
     }
 
-    pub(super) fn is_vl(self) -> bool {
+    fn is_vl(self) -> bool {
         matches!(
             self,
-            Model::QwenVlFlash(_) | Model::QwenVlMax(_) | Model::QwenVlOcr(_)
+            BuiltinModel::QwenVlFlash | BuiltinModel::QwenVlMax | BuiltinModel::MiniMax
         )
     }
 
-    pub(super) fn search_enabled(self) -> bool {
+    fn search_enabled(self) -> bool {
         matches!(
             self,
-            Model::QwenMax(_)
-                | Model::QwenMaxLatest(_)
-                | Model::QwenPlusLatest(_)
-                | Model::QwenFlash(_)
-                | Model::DeepseekV3(_)
-                | Model::Qwen3Max(_)
+            BuiltinModel::DeepseekV3
+                | BuiltinModel::Glm
+                | BuiltinModel::QwenPlusLatest
+                | BuiltinModel::Qwen3Max
+                | BuiltinModel::QwenFlash
         )
     }
 
-    pub(super) fn tools_enabled(self) -> bool {
+    fn tools_default_enabled(self) -> bool {
         match self {
-            Model::DeepseekV3(v)
-            | Model::DeepseekR1(v)
-            | Model::QwenMaxLatest(v)
-            | Model::QwenPlusLatest(v)
-            | Model::QwenMax(v)
-            | Model::QwenCoderPlusLatest(v)
-            | Model::Qwq(v)
-            | Model::QwenFlash(v)
-            | Model::Qwen3Max(v)
-            | Model::QwenVlFlash(v)
-            | Model::QwenVlMax(v)
-            | Model::QwenVlOcr(v) => v,
+            BuiltinModel::QwenFlash | BuiltinModel::QwenVlFlash | BuiltinModel::MiniMax => false,
+            BuiltinModel::DeepseekV3
+            | BuiltinModel::Glm
+            | BuiltinModel::QwenPlusLatest
+            | BuiltinModel::Qwen3Max
+            | BuiltinModel::QwenCoderPlusLatest
+            | BuiltinModel::Kimi
+            | BuiltinModel::QwenVlMax => true,
         }
     }
+}
+
+fn find_model(name: &str) -> Option<BuiltinModel> {
+    let name = name.trim();
+    BuiltinModel::ALL
+        .iter()
+        .copied()
+        .find(|m| m.name().eq_ignore_ascii_case(name))
+}
+
+fn all_model_names() -> impl Iterator<Item = &'static str> {
+    BuiltinModel::ALL.iter().map(|m| m.name())
+}
+
+fn vl_model_names() -> impl Iterator<Item = &'static str> {
+    BuiltinModel::ALL
+        .iter()
+        .copied()
+        .filter(|m| m.is_vl())
+        .map(|m| m.name())
 }
 
 pub(super) fn qwen3_max() -> &'static str {
-    QWEN3_MAX
+    BuiltinModel::Qwen3Max.name()
 }
 
 pub(super) fn deepseek_v3() -> &'static str {
-    DEEPSEEK_V3
+    BuiltinModel::DeepseekV3.name()
 }
 
 pub(super) fn qwen_vl_flash() -> &'static str {
-    QWEN_VL_FLASH
+    BuiltinModel::QwenVlFlash.name()
 }
 
 pub(super) fn qwen_vl_max() -> &'static str {
-    QWEN_VL_MAX
+    BuiltinModel::QwenVlMax.name()
 }
 
-pub(super) fn qwen_vl_ocr() -> &'static str {
-    QWEN_VL_OCR
+pub(super) fn minimax_vl() -> &'static str {
+    BuiltinModel::MiniMax.name()
 }
 
 pub(super) fn is_vl_model(model: &str) -> bool {
-    Model::ALL
-        .iter()
-        .find(|m| m.as_str() == model)
-        .is_some_and(|m| m.is_vl())
+    find_model(model).is_some_and(|m| m.is_vl())
 }
 
 pub(super) fn search_enabled(model: &str) -> bool {
-    Model::ALL
-        .iter()
-        .find(|m| m.as_str() == model)
-        .is_some_and(|m| m.search_enabled())
+    find_model(model).is_some_and(|m| m.search_enabled())
 }
 
 pub(super) fn tools_enabled(model: &str) -> bool {
-    Model::ALL
-        .iter()
-        .find(|m| m.as_str() == model)
-        .is_none_or(|m| m.tools_enabled())
+    find_model(model)
+        .map(|m| m.tools_default_enabled())
+        .unwrap_or(true)
 }
 
 pub(super) fn initial_model(cli: &Cli) -> String {
     if let Some(selector) = selected_model_number(cli) {
-        return model_from_selector(selector, cli.thinking)
-            .as_str()
-            .to_string();
+        return model_from_selector(selector, cli.thinking).to_string();
     }
     if !cli.model.trim().is_empty() {
         return determine_model(&cli.model);
@@ -179,22 +157,24 @@ pub(super) fn selected_model_number(cli: &Cli) -> Option<u8> {
     .find_map(|(idx, enabled)| enabled.then_some(idx as u8))
 }
 
-pub(super) fn model_from_selector(selector: u8, thinking_mode: bool) -> Model {
+pub(super) fn model_from_selector(selector: u8, thinking_mode: bool) -> &'static str {
+    // Selector numbers are part of the CLI user experience and must not shift. The only
+    // contextual mapping is selector 5, which switches to GLM when thinking mode is enabled.
     match selector {
-        0 => Model::Qwq(TOOLS_ON),
-        1 => Model::QwenPlusLatest(TOOLS_ON),
-        2 => Model::QwenMax(TOOLS_ON),
-        3 => Model::Qwen3Max(TOOLS_ON),
-        4 => Model::QwenCoderPlusLatest(TOOLS_ON),
+        0 => "kimi-k2.5",
+        1 => "qwen3.5-plus",
+        2 => "qwen3-max",
+        3 => "qwen3-max",
+        4 => "qwen3-coder-plus",
         5 => {
             if thinking_mode {
-                Model::DeepseekR1(TOOLS_ON)
+                "glm-5"
             } else {
-                Model::DeepseekV3(TOOLS_ON)
+                "deepseek-v3.2"
             }
         }
-        6 => Model::QwenFlash(TOOLS_OFF),
-        _ => Model::Qwen3Max(TOOLS_ON),
+        6 => "qwen3.5-flash",
+        _ => "qwen3-max",
     }
 }
 
@@ -203,18 +183,7 @@ pub(super) fn determine_model(model: &str) -> String {
     if model.is_empty() {
         return qwen3_max().to_string();
     }
-    let mut best = qwen3_max();
-    let mut best_dist = f32::MAX;
-    for candidate in Model::ALL {
-        let candidate = candidate.as_str();
-        let dist = levenshtein(model.as_bytes(), candidate.as_bytes()) as f32
-            / (model.len() + candidate.len()) as f32;
-        if dist < best_dist {
-            best_dist = dist;
-            best = candidate;
-        }
-    }
-    best.to_string()
+    best_match_model_name(&model, all_model_names(), qwen3_max()).to_string()
 }
 
 pub(super) fn determine_vl_model(model: &str) -> String {
@@ -226,7 +195,7 @@ pub(super) fn determine_vl_model(model: &str) -> String {
     match model.as_str() {
         "0" => return qwen_vl_flash().to_string(),
         "1" => return qwen_vl_max().to_string(),
-        "2" => return qwen_vl_ocr().to_string(),
+        "2" => return minimax_vl().to_string(),
         _ => {}
     }
 
@@ -234,18 +203,26 @@ pub(super) fn determine_vl_model(model: &str) -> String {
         return model;
     }
 
-    let mut best = qwen_vl_flash();
+    best_match_model_name(&model, vl_model_names(), qwen_vl_flash()).to_string()
+}
+
+fn best_match_model_name(
+    input_lowercase: &str,
+    candidates: impl Iterator<Item = &'static str>,
+    default: &'static str,
+) -> &'static str {
+    let mut best = default;
     let mut best_dist = f32::MAX;
-    for candidate in Model::VL {
-        let candidate = candidate.as_str();
-        let dist = levenshtein(model.as_bytes(), candidate.as_bytes()) as f32
-            / (model.len() + candidate.len()) as f32;
+    for candidate in candidates {
+        let candidate_lower = candidate.to_ascii_lowercase();
+        let dist = levenshtein(input_lowercase.as_bytes(), candidate_lower.as_bytes()) as f32
+            / (input_lowercase.len() + candidate_lower.len()) as f32;
         if dist < best_dist {
             best_dist = dist;
             best = candidate;
         }
     }
-    best.to_string()
+    best
 }
 
 fn levenshtein(left: &[u8], right: &[u8]) -> usize {

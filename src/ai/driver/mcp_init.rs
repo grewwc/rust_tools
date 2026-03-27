@@ -99,9 +99,7 @@ pub fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitReport {
         {
             eprintln!(
                 "[mcp] raise server '{}' request_timeout_ms from {} to {} for Feishu network calls",
-                name,
-                server_cfg.request_timeout_ms,
-                FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS
+                name, server_cfg.request_timeout_ms, FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS
             );
             server_cfg.request_timeout_ms = FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS;
         }

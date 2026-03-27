@@ -403,8 +403,13 @@ fn append_history_sqlite(path: &Path, content: &str) -> io::Result<()> {
                 .map(serde_json::to_string)
                 .transpose()
                 .map_err(|e| io::Error::other(e.to_string()))?;
-            stmt.execute(params![message.role, content, tool_calls, message.tool_call_id])
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            stmt.execute(params![
+                message.role,
+                content,
+                tool_calls,
+                message.tool_call_id
+            ])
+            .map_err(|e| io::Error::other(e.to_string()))?;
         }
     }
     tx.execute(

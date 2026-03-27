@@ -49,7 +49,10 @@ fn prepare_skill_for_turn(
     mcp_client: &McpClient,
     skill_manifests: &[SkillManifest],
     question: &str,
-) -> (String, Option<(Vec<crate::ai::types::ToolDefinition>, usize)>) {
+) -> (
+    String,
+    Option<(Vec<crate::ai::types::ToolDefinition>, usize)>,
+) {
     let skill = match_skill(skill_manifests, question);
     let openclaw_active = skill.as_ref().is_some_and(|s| {
         s.name.as_str() == "openclaw" || s.tool_groups.iter().any(|g| g == "openclaw")
@@ -133,7 +136,12 @@ fn print_skill_selection(
             if let Some(src) = s.source_path.as_ref()
                 && !src.trim().is_empty()
             {
-                println!("{} matched: {} {}", skill_label, name, format!("({src})").dimmed());
+                println!(
+                    "{} matched: {} {}",
+                    skill_label,
+                    name,
+                    format!("({src})").dimmed()
+                );
             } else {
                 println!("{} matched: {}", skill_label, name);
             }

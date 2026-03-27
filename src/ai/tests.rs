@@ -6,9 +6,8 @@ use serde_json::Value;
 use super::{
     files,
     history::{
-        COLON, NEWLINE, Message, SessionStore, append_history, append_history_messages,
-        build_message_arr,
-        compress_messages_for_context,
+        COLON, Message, NEWLINE, SessionStore, append_history, append_history_messages,
+        build_message_arr, compress_messages_for_context,
     },
     models,
     prompt::MultilineHistoryState,
@@ -19,26 +18,14 @@ use super::{
 
 #[test]
 fn selector_mapping_matches_go() {
-    assert_eq!(
-        models::model_from_selector(0, false).as_str(),
-        "qwq-plus-latest"
-    );
-    assert_eq!(
-        models::model_from_selector(1, false).as_str(),
-        "qwen3.5-plus"
-    );
-    assert_eq!(models::model_from_selector(2, false).as_str(), "qwen-max");
-    assert_eq!(models::model_from_selector(3, false).as_str(), "qwen3-max");
-    assert_eq!(
-        models::model_from_selector(4, false).as_str(),
-        "qwen3-coder-plus"
-    );
-    assert_eq!(
-        models::model_from_selector(5, false).as_str(),
-        "deepseek-v3.1"
-    );
-    assert_eq!(models::model_from_selector(5, true).as_str(), "deepseek-r1");
-    assert_eq!(models::model_from_selector(6, false).as_str(), "qwen-flash");
+    assert_eq!(models::model_from_selector(0, false), "kimi-k2.5");
+    assert_eq!(models::model_from_selector(1, false), "qwen3.5-plus");
+    assert_eq!(models::model_from_selector(2, false), "qwen3-max");
+    assert_eq!(models::model_from_selector(3, false), "qwen3-max");
+    assert_eq!(models::model_from_selector(4, false), "qwen3-coder-plus");
+    assert_eq!(models::model_from_selector(5, false), "deepseek-v3.2");
+    assert_eq!(models::model_from_selector(5, true), "glm-5");
+    assert_eq!(models::model_from_selector(6, false), "qwen3.5-flash");
 }
 
 #[test]
@@ -94,13 +81,15 @@ fn resolve_model_is_unicode_safe() {
 
 #[test]
 fn image_files_auto_route_to_vl() {
-    let model = super::driver::attachment_forced_model("qwen-flash", true, models::qwen_vl_flash());
+    let model =
+        super::driver::attachment_forced_model("qwen3.5-flash", true, models::qwen_vl_flash());
     assert_eq!(model, Some(models::qwen_vl_flash().to_string()));
 }
 
 #[test]
 fn configured_vl_model_is_used_for_images() {
-    let model = super::driver::attachment_forced_model("qwen-flash", true, models::qwen_vl_max());
+    let model =
+        super::driver::attachment_forced_model("qwen3.5-flash", true, models::qwen_vl_max());
     assert_eq!(model, Some(models::qwen_vl_max().to_string()));
 }
 
@@ -109,14 +98,14 @@ fn determine_vl_model_supports_selector_and_fuzzy_name() {
     assert_eq!(models::determine_vl_model(""), models::qwen_vl_flash());
     assert_eq!(models::determine_vl_model("1"), models::qwen_vl_max());
     assert_eq!(
-        models::determine_vl_model("qwen-vl-ocr-latst"),
-        models::qwen_vl_ocr()
+        models::determine_vl_model("minmax-m2.5"),
+        models::minimax_vl()
     );
 }
 
 #[test]
 fn tools_are_disabled_for_qwen_flash() {
-    assert!(!models::tools_enabled("qwen-flash"));
+    assert!(!models::tools_enabled("qwen3.5-flash"));
     assert!(models::tools_enabled("qwen3-max"));
 }
 
