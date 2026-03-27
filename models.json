@@ -1,0 +1,82 @@
+[
+  {
+    "key": "DEEPSEEK_V3",
+    "name": "deepseek-v3.2",
+    "is_vl": false,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": false
+  },
+  {
+    "key": "GLM",
+    "name": "glm-5",
+    "is_vl": false,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": false
+  },
+  {
+    "key": "QWEN_PLUS_LATEST",
+    "name": "qwen3.5-plus",
+    "is_vl": false,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": false
+  },
+  {
+    "key": "QWEN3_MAX",
+    "name": "qwen3-max",
+    "is_vl": false,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": false
+  },
+  {
+    "key": "QWEN_CODER_PLUS_LATEST",
+    "name": "qwen3-coder-plus",
+    "is_vl": false,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": false
+  },
+  {
+    "key": "KIMI",
+    "name": "kimi-k2.5",
+    "is_vl": false,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": false
+  },
+  {
+    "key": "QWEN_FLASH",
+    "name": "qwen3.5-flash",
+    "is_vl": false,
+    "search_enabled": true,
+    "tools_default_enabled": false,
+    "enable_thinking": false
+  },
+  {
+    "key": "QWEN_VL_FLASH",
+    "name": "qwen3-vl-flash",
+    "is_vl": true,
+    "search_enabled": false,
+    "tools_default_enabled": false,
+    "enable_thinking": false
+  },
+  {
+    "key": "QWEN_VL_MAX",
+    "name": "qwen3-vl-plus",
+    "is_vl": true,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": false
+  },
+  {
+    "key": "MINIMAX",
+    "name": "MiniMax-M2.5",
+    "is_vl": true,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": true
+  }
+]

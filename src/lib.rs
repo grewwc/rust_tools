@@ -1,4 +1,3 @@
-pub mod ai;
 pub mod algow;
 pub mod clipboard;
 pub mod cmd;

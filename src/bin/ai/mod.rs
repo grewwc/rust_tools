@@ -4,6 +4,7 @@ mod driver;
 mod files;
 mod history;
 mod mcp;
+mod model_names;
 mod models;
 mod prompt;
 mod request;

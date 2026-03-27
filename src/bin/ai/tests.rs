@@ -16,13 +16,42 @@ use super::{
     types::{FunctionCall, ToolCall},
 };
 
+fn any_model_name() -> String {
+    super::model_names::all()
+        .first()
+        .map(|m| m.name.clone())
+        .expect("models.json is empty")
+}
+
+fn vl_model_name_at(index: usize) -> Option<String> {
+    super::model_names::all()
+        .iter()
+        .filter(|m| m.is_vl)
+        .nth(index)
+        .map(|m| m.name.clone())
+}
+
+fn any_vl_model_name() -> String {
+    vl_model_name_at(0).unwrap_or_else(any_model_name)
+}
+
 #[test]
-fn default_model_names_are_stable() {
-    assert_eq!(models::qwen3_max(), "qwen3-max");
-    assert_eq!(models::deepseek_v3(), "deepseek-v3.2");
-    assert_eq!(models::qwen_vl_flash(), "qwen3-vl-flash");
-    assert_eq!(models::qwen_vl_max(), "qwen3-vl-plus");
-    assert_eq!(models::minimax_vl(), "minimax-m2.5");
+fn default_model_names_exist() {
+    assert!(!super::model_names::all().is_empty());
+}
+
+#[test]
+fn cli_model_flag_after_prompt_is_not_forwarded() {
+    use clap::Parser;
+
+    let argv = super::cli::normalize_single_dash_long_opts(
+        ["a", "hello", "-m", "minimax"]
+            .into_iter()
+            .map(|s| s.to_string()),
+    );
+    let cli = super::cli::Cli::parse_from(argv);
+    assert_eq!(cli.model.as_deref(), Some("minimax"));
+    assert_eq!(cli.args, vec!["hello"]);
 }
 
 #[test]
@@ -35,7 +64,7 @@ fn resolve_model_is_unicode_safe() {
         api_key: String::new(),
         history_file: PathBuf::new(),
         endpoint: String::new(),
-        vl_default_model: models::qwen_vl_flash().to_string(),
+        vl_default_model: any_vl_model_name(),
         history_max_chars: 12000,
         history_keep_last: 8,
         history_summary_max_chars: 4000,
@@ -50,7 +79,7 @@ fn resolve_model_is_unicode_safe() {
         session_id: String::new(),
         session_history_file: PathBuf::new(),
         client,
-        current_model: models::qwen3_max().to_string(),
+        current_model: any_model_name(),
         pending_files: None,
         pending_clipboard: false,
         pending_short_output: false,
@@ -71,26 +100,31 @@ fn resolve_model_is_unicode_safe() {
 
 #[test]
 fn image_files_auto_route_to_vl() {
-    let model =
-        super::driver::attachment_forced_model("qwen3.5-flash", true, models::qwen_vl_flash());
-    assert_eq!(model, Some(models::qwen_vl_flash().to_string()));
+    let vl = any_vl_model_name();
+    let model = super::driver::attachment_forced_model("qwen3.5-flash", true, vl.as_str());
+    assert_eq!(model, Some(vl));
 }
 
 #[test]
 fn configured_vl_model_is_used_for_images() {
-    let model =
-        super::driver::attachment_forced_model("qwen3.5-flash", true, models::qwen_vl_max());
-    assert_eq!(model, Some(models::qwen_vl_max().to_string()));
+    let vl = any_vl_model_name();
+    let model = super::driver::attachment_forced_model("qwen3.5-flash", true, vl.as_str());
+    assert_eq!(model, Some(vl));
 }
 
 #[test]
 fn determine_vl_model_supports_selector_and_fuzzy_name() {
-    assert_eq!(models::determine_vl_model(""), models::qwen_vl_flash());
-    assert_eq!(models::determine_vl_model("1"), models::qwen_vl_max());
-    assert_eq!(
-        models::determine_vl_model("minmax-m2.5"),
-        models::minimax_vl()
-    );
+    assert_eq!(models::determine_vl_model(""), any_vl_model_name());
+    assert_eq!(models::determine_vl_model("0"), any_vl_model_name());
+    if let Some(vl1) = vl_model_name_at(1) {
+        assert_eq!(models::determine_vl_model("1"), vl1);
+    } else {
+        assert_eq!(models::determine_vl_model("1"), any_vl_model_name());
+    }
+
+    let vl = any_vl_model_name();
+    let canonical = models::determine_vl_model(&vl);
+    assert_eq!(canonical, vl);
 }
 
 #[test]

@@ -11,8 +11,8 @@ pub(super) struct Cli {
     #[arg(long, default_value_t = DEFAULT_NUM_HISTORY, help = "number of history")]
     pub(super) history: usize,
 
-    #[arg(short = 'm', long = "model", default_value = "", help = "model name")]
-    pub(super) model: String,
+    #[arg(short = 'm', long = "model", num_args = 1, help = "model name")]
+    pub(super) model: Option<String>,
 
     #[arg(
         long = "multi-line",
@@ -81,14 +81,87 @@ pub(super) struct Cli {
 }
 
 pub(super) fn normalize_single_dash_long_opts(args: impl Iterator<Item = String>) -> Vec<String> {
-    args.map(|arg| {
+    let raw: Vec<String> = args.collect();
+    if raw.is_empty() {
+        return raw;
+    }
+
+    let mut out = Vec::with_capacity(raw.len() + 1);
+    out.push(raw[0].clone());
+
+    let mut prompt_args: Vec<String> = Vec::new();
+
+    let mut i = 1usize;
+    while i < raw.len() {
+        let original = raw[i].clone();
+        if original == "--" {
+            prompt_args.extend_from_slice(&raw[i + 1..]);
+            break;
+        }
+
+        let mut arg = original.clone();
         let bytes = arg.as_bytes();
         if bytes.len() > 2 && bytes[0] == b'-' && bytes[1] != b'-' && bytes[1].is_ascii_alphabetic()
         {
-            format!("-{arg}")
-        } else {
-            arg
+            arg = format!("-{arg}");
         }
-    })
-    .collect()
+
+        let take_next = |raw: &[String], i: &mut usize, out: &mut Vec<String>| {
+            if *i + 1 < raw.len() && raw[*i + 1] != "--" {
+                out.push(raw[*i + 1].clone());
+                *i += 1;
+            }
+        };
+
+        match arg.as_str() {
+            "-m" | "--model" => {
+                out.push(arg);
+                take_next(&raw, &mut i, &mut out);
+            }
+            "-f" => {
+                out.push(arg);
+                take_next(&raw, &mut i, &mut out);
+            }
+            "-o" | "--out" => {
+                out.push(arg);
+                if i + 1 < raw.len() && raw[i + 1] != "--" && !raw[i + 1].starts_with('-') {
+                    out.push(raw[i + 1].clone());
+                    i += 1;
+                }
+            }
+            "-c" | "-t" | "-s" | "--clear" | "--multi-line" | "--mul" | "--list-tools"
+            | "--list-mcp-tools" | "--list-mcp-servers" | "--list-skills" | "-h" | "--help" => {
+                out.push(arg);
+            }
+            "--history" | "--mcp-config" => {
+                out.push(arg);
+                take_next(&raw, &mut i, &mut out);
+            }
+            "--session" | "--ss" => {
+                out.push(arg);
+                if i + 1 < raw.len() && raw[i + 1] != "--" && !raw[i + 1].starts_with('-') {
+                    out.push(raw[i + 1].clone());
+                    i += 1;
+                }
+            }
+            _ if arg.starts_with("--model=")
+                || arg.starts_with("--history=")
+                || arg.starts_with("--mcp-config=") =>
+            {
+                out.push(arg);
+            }
+            _ => {
+                prompt_args.push(original);
+            }
+        }
+
+        i += 1;
+    }
+
+    if !prompt_args.is_empty() {
+        out.push("--".to_string());
+        out.extend(prompt_args);
+    }
+
+    out
 }

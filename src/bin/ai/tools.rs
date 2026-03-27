@@ -861,6 +861,12 @@ fn resolve_configured_skills_dir() -> PathBuf {
 }
 
 fn resolve_memory_file() -> PathBuf {
+    if let Ok(path) = std::env::var("RUST_TOOLS_MEMORY_FILE") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return PathBuf::from(crate::common::utils::expanduser(path).as_ref());
+        }
+    }
     let cfg = crate::common::configw::get_all_config();
     let raw = cfg
         .get_opt("ai.memory.file")
@@ -2039,6 +2045,7 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", &home);
         }
+        crate::common::configw::refresh();
 
         let ret = execute_save_skill(&json!({
             "name": "test-memory-skill",
@@ -2064,8 +2071,12 @@ mod tests {
     #[test]
     fn memory_append_and_search_work() {
         let home = std::env::temp_dir().join(format!("rust-tools-home-{}", Uuid::new_v4()));
+        let memory_file = home.join("agent_memory.jsonl");
+        if let Some(parent) = memory_file.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
         unsafe {
-            std::env::set_var("HOME", &home);
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &memory_file);
         }
 
         execute_memory_append(&json!({
@@ -2091,6 +2102,9 @@ mod tests {
         let recent = execute_memory_recent(&json!({"limit": 1})).unwrap();
         assert!(recent.contains("avoid destructive commands"));
 
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
         let _ = fs::remove_dir_all(home);
     }
 }

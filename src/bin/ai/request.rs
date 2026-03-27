@@ -86,7 +86,7 @@ pub(super) fn do_request_messages(
         model: model.to_string(),
         messages,
         stream,
-        enable_thinking: app.cli.thinking,
+        enable_thinking: app.cli.thinking || models::enable_thinking(model),
         enable_search: models::search_enabled(model).then_some(true),
         tools: tools_value,
         tool_choice,
