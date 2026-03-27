@@ -10,6 +10,40 @@ use crate::ai::{files, prompt::trim_trailing_newline};
 use crate::clipboard::string_content;
 use crate::pdfw::{PdfParseOptions, parse_pdf};
 
+/// Clear any pending input from stdin to prevent stray Enter keys
+/// from interrupting the next input prompt.
+pub(crate) fn clear_stdin_buffer() {
+    use std::io::IsTerminal;
+    if !io::stdin().is_terminal() {
+        return;
+    }
+    
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        use libc::{fcntl, F_GETFL, F_SETFL, O_NONBLOCK};
+        
+        let fd = io::stdin().as_raw_fd();
+        unsafe {
+            // Get current flags
+            let flags = fcntl(fd, F_GETFL, 0);
+            if flags >= 0 {
+                // Set non-blocking mode
+                let _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+                
+                // Read and discard any pending input
+                let mut buf = [0u8; 1024];
+                while libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) > 0 {
+                    // Discard
+                }
+                
+                // Restore blocking mode
+                let _ = fcntl(fd, F_SETFL, flags);
+            }
+        }
+    }
+}
+
 pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Box<dyn Error>> {
     if !app.cli.args.is_empty() {
         let base_question = app.cli.args.join(" ");
@@ -175,7 +209,12 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
         let mut line = String::new();
         match stdin.read_line(&mut line) {
             Ok(0) => Ok(None),
-            Ok(_) => Ok(Some(trim_trailing_newline(line))),
+            Ok(_) => {
+                let trimmed = trim_trailing_newline(line);
+                // If we get an empty line, it might be a stray Enter from during streaming.
+                // Return it as-is and let the caller decide what to do.
+                Ok(Some(trimmed))
+            }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {
                 println!("Exit.");
                 Ok(None)

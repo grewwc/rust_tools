@@ -249,14 +249,32 @@ fn build_summary_text(messages: &[Message], max_chars: usize) -> String {
         let role = match m.role.as_str() {
             "user" => "用户",
             "assistant" => "助手",
+            "tool" => "工具",
             other => other,
         };
         let text = normalize_whitespace(&value_to_string(&m.content));
-        if text.is_empty() {
+        
+        // Include tool call information if present
+        let tool_info = if let Some(ref tool_calls) = m.tool_calls {
+            let tool_names: Vec<&str> = tool_calls
+                .iter()
+                .map(|tc| tc.function.name.as_str())
+                .collect();
+            if !tool_names.is_empty() {
+                format!(" [tools: {}]", tool_names.join(", "))
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+        
+        if text.is_empty() && tool_info.is_empty() {
             continue;
         }
+        
         let snippet = truncate_to_chars(&text, 200);
-        lines.push(format!("{role}: {snippet}"));
+        lines.push(format!("{role}: {snippet}{tool_info}"));
         if lines.join("\n").len() >= max_chars {
             break;
         }

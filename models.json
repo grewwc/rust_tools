@@ -13,7 +13,7 @@
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
-    "enable_thinking": false
+    "enable_thinking": true
   },
   {
     "key": "QWEN_PLUS_LATEST",
@@ -43,9 +43,9 @@
     "key": "KIMI",
     "name": "kimi-k2.5",
     "is_vl": false,
-    "search_enabled": false,
+    "search_enabled": true,
     "tools_default_enabled": true,
-    "enable_thinking": false
+    "enable_thinking": true
   },
   {
     "key": "QWEN_FLASH",

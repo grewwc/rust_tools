@@ -31,7 +31,7 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     let history_keep_last = cfg
         .get_opt("ai.history.keep_last")
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(8);
+        .unwrap_or(256);
     let history_summary_max_chars = cfg
         .get_opt("ai.history.summary_max_chars")
         .and_then(|v| v.parse::<usize>().ok())

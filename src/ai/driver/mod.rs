@@ -207,7 +207,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         prompt_editor,
         agent_context: Some(AgentContext {
             tools: super::tools::get_builtin_tool_definitions(),
-            max_iterations: 6,
+            max_iterations: 512,
             ..Default::default()
         }),
     };
@@ -372,10 +372,6 @@ fn run_loop(
                 };
             app.streaming.store(false, Ordering::Release);
 
-            // Clear any stray input (e.g., Enter keys pressed during streaming)
-            // to prevent them from interrupting the next prompt.
-            input::clear_stdin_buffer();
-
             if stream_result.outcome == StreamOutcome::Cancelled {
                 println!("\nInterrupted.");
                 if should_quit {
@@ -469,9 +465,8 @@ fn run_loop(
             }
         }
 
-        if !final_assistant_text.trim().is_empty() {
+        if !final_assistant_text.is_empty() {
             if !final_assistant_recorded {
-                println!("\n{}", final_assistant_text.yellow());
                 turn_messages.push(Message {
                     role: "assistant".to_string(),
                     content: Value::String(final_assistant_text.clone()),
@@ -485,9 +480,6 @@ fn run_loop(
                 eprintln!("[Warning] Failed to save history: {}", e);
             }
             println!();
-        } else {
-            // Model returned no text (thinking-only response or stream was interrupted).
-            println!("{}", "(no response)".dimmed());
         }
 
         if let Some((tools, max_iterations)) = restore_agent_context.take()

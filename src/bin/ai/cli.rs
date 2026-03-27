@@ -1,6 +1,6 @@
 use clap::{ArgAction, Parser};
 
-pub(super) const DEFAULT_NUM_HISTORY: usize = 4;
+pub(super) const DEFAULT_NUM_HISTORY: usize = 256;
 
 #[derive(Parser, Debug)]
 #[command(

@@ -217,7 +217,7 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "The URL to fetch"
+                    "description": "The URL to fetch content from (supports http/https links, can access external websites and documentation)"
                 }
             },
             "required": ["url"]
@@ -551,7 +551,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "web_search",
-        description: "Search the web for information",
+        description: "Search the web for information. Use this tool when you need to find information online, look up documentation, or search for external resources.",
         parameters: params_web_search,
         execute: execute_web_search,
         groups: &["builtin"],
@@ -561,7 +561,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "web_fetch",
-        description: "Fetch content from a URL",
+        description: "Fetch content from a URL or external link. Use this tool to access external websites, documentation, articles, or any http/https links.",
         parameters: params_web_fetch,
         execute: execute_web_fetch,
         groups: &["builtin"],
