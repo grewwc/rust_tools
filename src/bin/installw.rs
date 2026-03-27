@@ -60,8 +60,12 @@ fn run() -> Result<(), String> {
         let newest_src = newest_mtime(&deps)?;
         match mode {
             Mode::Build => {
-                let newest_bin = newest_existing_mtime(&[&installed_bin, &built_bin])?;
-                if newest_bin.is_none_or(|t| newest_src > t) {
+                if !built_bin.exists() {
+                    out.push(bin);
+                    continue;
+                }
+                let newest_installed = newest_existing_mtime(&[&installed_bin])?;
+                if newest_installed.is_none_or(|t| newest_src > t) {
                     out.push(bin);
                 }
             }

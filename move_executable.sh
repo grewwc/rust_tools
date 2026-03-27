@@ -41,6 +41,6 @@ for bin in $NEED; do
         fi
     fi
 
-    cp -p "$src" "$dst"
+    cp "$src" "$dst"
     echo "copied $dst <- $src"
 done
