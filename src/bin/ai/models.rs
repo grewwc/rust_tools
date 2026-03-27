@@ -25,15 +25,16 @@ pub(super) fn enable_thinking(model: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn all_model_names() -> impl Iterator<Item = String> + 'static {
-    model_names::all().iter().map(|m| m.name.clone())
+fn all_model_names() -> Vec<String> {
+    model_names::all().iter().map(|m| m.name.clone()).collect()
 }
 
-fn vl_model_names() -> impl Iterator<Item = String> + 'static {
+fn vl_model_names() -> Vec<String> {
     model_names::all()
         .iter()
         .filter(|m| m.is_vl)
         .map(|m| m.name.clone())
+        .collect()
 }
 
 fn default_model() -> String {
@@ -78,7 +79,7 @@ pub(super) fn determine_model(model: &str) -> String {
     if model.is_empty() {
         return default_model();
     }
-    best_match_model_name(&model, all_model_names(), default_model())
+    best_match_model_name(&model, all_model_names().into_iter(), default_model())
 }
 
 pub(super) fn determine_vl_model(model: &str) -> String {
@@ -88,7 +89,8 @@ pub(super) fn determine_vl_model(model: &str) -> String {
     }
 
     if let Ok(idx) = model.parse::<usize>() {
-        let vl = model_names::all().iter().filter(|m| m.is_vl).nth(idx);
+        let all = model_names::all();
+        let vl = all.iter().filter(|m| m.is_vl).nth(idx);
         if let Some(vl) = vl {
             return vl.name.clone();
         }
@@ -101,7 +103,7 @@ pub(super) fn determine_vl_model(model: &str) -> String {
         }
     }
 
-    best_match_model_name(&model, vl_model_names(), default_vl_model())
+    best_match_model_name(&model, vl_model_names().into_iter(), default_vl_model())
 }
 
 fn best_match_model_name(
