@@ -710,6 +710,33 @@ fn render_inline_md(s: &str, base: &str) -> String {
         }
     }
 
+    fn is_url_start(bytes: &[u8], i: usize) -> bool {
+        bytes
+            .get(i..i + 8)
+            .is_some_and(|s| s.eq_ignore_ascii_case(b"https://"))
+            || bytes
+                .get(i..i + 7)
+                .is_some_and(|s| s.eq_ignore_ascii_case(b"http://"))
+    }
+
+    fn url_raw_end(bytes: &[u8], start: usize) -> usize {
+        let mut end = start;
+        while end < bytes.len() {
+            let b = bytes[end];
+            if b.is_ascii_whitespace()
+                || b == b'<'
+                || b == b'"'
+                || b == b'\''
+                || b == b'`'
+                || b == b'\\'
+            {
+                break;
+            }
+            end += 1;
+        }
+        end
+    }
+
     while i < bytes.len() {
         if bytes[i] == b'`' {
             code = !code;
@@ -746,6 +773,32 @@ fn render_inline_md(s: &str, base: &str) -> String {
                 i += delim.len();
                 continue;
             }
+        }
+
+        if !math && is_url_start(bytes, i) {
+            let raw_end = url_raw_end(bytes, i);
+            let mut end = raw_end;
+            while end > i {
+                match bytes[end - 1] {
+                    b'.' | b',' | b';' | b':' | b')' | b']' => end -= 1,
+                    _ => break,
+                }
+            }
+            let url = &s[i..end];
+            let trail = &s[end..raw_end];
+
+            out.push_str("\x1b[0m");
+            out.push_str(base);
+            if bold {
+                out.push_str("\x1b[1m");
+            }
+            out.push_str("\x1b[4m\x1b[34m");
+            out.push_str(url);
+            apply_style(&mut out, base, bold, code, math);
+            out.push_str(trail);
+
+            i = raw_end;
+            continue;
         }
 
         let ch = s[i..].chars().next().unwrap();

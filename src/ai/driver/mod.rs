@@ -44,6 +44,24 @@ pub use print::*;
 pub use signal::*;
 pub use skill_matching::*;
 
+fn print_assistant_banner() {
+    println!("\n{}", "[Assistant]".bright_blue().bold());
+}
+
+fn print_tool_output_block(content: &str) {
+    if content.trim().is_empty() {
+        println!("  {} {}", "│".bright_black(), "(empty)".dimmed());
+        return;
+    }
+    for line in content.lines() {
+        if line.is_empty() {
+            println!("  {}", "│".bright_black());
+        } else {
+            println!("  {} {}", "│".bright_black(), line.dimmed());
+        }
+    }
+}
+
 fn prepare_skill_for_turn(
     app: &mut App,
     mcp_client: &McpClient,
@@ -405,6 +423,7 @@ fn run_loop(
                 break;
             }
             request::print_info(&next_model);
+            print_assistant_banner();
             let stream_result =
                 match stream::stream_response(app, &mut response, &mut current_history) {
                     Ok(result) => result,
@@ -470,7 +489,11 @@ fn run_loop(
                 .iter()
                 .zip(exec_result.tool_results.iter())
             {
-                println!("\n{}", "[Tool Result]".green());
+                println!(
+                    "\n{} {}",
+                    "[Tool]".bright_green().bold(),
+                    tool_call.function.name.bright_cyan().bold()
+                );
                 if tool_call.function.name == "web_search" {
                     let mut preview = String::new();
                     let mut truncated = false;
@@ -482,12 +505,12 @@ fn run_loop(
                         preview.push_str(line);
                         preview.push('\n');
                     }
-                    print!("{}", preview);
+                    print_tool_output_block(&preview);
                     if truncated {
-                        println!("... (truncated)");
+                        print_tool_output_block("... (truncated)");
                     }
                 } else {
-                    println!("{}", result.content);
+                    print_tool_output_block(&result.content);
                 }
                 let tool_message = Message {
                     role: "tool".to_string(),

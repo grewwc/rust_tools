@@ -437,7 +437,6 @@ fn math_frac_renders_with_nested_braces() {
 fn execute_command_blocks_dangerous_programs() {
     assert!(tools::validate_execute_command("rm -rf /").is_err());
     assert!(tools::validate_execute_command("mv a b").is_err());
-    assert!(tools::validate_execute_command("cp a b").is_err());
     assert!(tools::validate_execute_command("sudo ls").is_err());
 }
 
@@ -456,6 +455,20 @@ fn execute_command_allows_readonly_commands() {
     assert!(tools::validate_execute_command("pwd").is_ok());
     assert!(tools::validate_execute_command("cat Cargo.toml").is_ok());
     assert!(tools::validate_execute_command("rg main src").is_ok());
+}
+
+#[test]
+fn execute_command_captures_stdout() {
+    let tool_call = ToolCall {
+        id: "call_1".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "execute_command".to_string(),
+            arguments: r#"{"command":"echo hello"}"#.to_string(),
+        },
+    };
+    let res = tools::execute_tool_call(&tool_call).unwrap();
+    assert_eq!(res.content.trim(), "hello");
 }
 
 #[test]

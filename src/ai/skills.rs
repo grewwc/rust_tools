@@ -81,7 +81,20 @@ impl SkillManifest {
 pub(super) fn load_all_skills() -> Vec<SkillManifest> {
     let dir = skills_dir();
     let _ = ensure_seeded_skills_dir(&dir);
-    let mut out = load_skills_from_dir(&dir);
+    let mut by_name = std::collections::BTreeMap::<String, SkillManifest>::new();
+
+    for (filename, content) in BUILTIN_SKILLS {
+        if let Ok(mut skill) = parse_skill_front_matter(content) {
+            skill.source_path = Some(format!("builtin:{filename}"));
+            by_name.insert(skill.name.clone(), skill);
+        }
+    }
+
+    for skill in load_skills_from_dir(&dir) {
+        by_name.insert(skill.name.clone(), skill);
+    }
+
+    let mut out = by_name.into_values().collect::<Vec<_>>();
     out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.name.cmp(&b.name)));
     out
 }
@@ -312,5 +325,45 @@ mod tests {
         let skills = load_skills_from_dir(&dir);
         assert_eq!(skills.len(), 4);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_all_skills_includes_builtin_even_when_user_has_custom_skill() {
+        let home = std::env::temp_dir()
+            .join(format!("rust-tools-home-{}", uuid::Uuid::new_v4()))
+            .display()
+            .to_string();
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let dir = skills_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("custom.skill"),
+            r#"---
+name: custom-skill
+description: custom
+triggers:
+  - custom
+priority: 1
+---
+
+custom"#,
+        )
+        .unwrap();
+
+        let skills = load_all_skills();
+        let names = skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(names.contains("openclaw"));
+        assert!(names.contains("debugger"));
+        assert!(names.contains("code-review"));
+        assert!(names.contains("refactor"));
+        assert!(names.contains("custom-skill"));
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

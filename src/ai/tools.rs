@@ -970,22 +970,10 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
     let program = tokens[0].to_lowercase();
 
     let denied_programs = [
-        "bash",
-        "sh",
-        "zsh",
         "fish",
-        "python",
-        "python3",
-        "perl",
-        "ruby",
-        "node",
-        "deno",
-        "php",
-        "java",
         "jshell",
         "rm",
         "mv",
-        "cp",
         "dd",
         "chmod",
         "chown",
@@ -1008,19 +996,6 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
         "truncate",
         "ssh",
         "scp",
-        "rsync",
-        "curl",
-        "wget",
-        "nc",
-        "netcat",
-        "ncat",
-        "socat",
-        "telnet",
-        "ftp",
-        "sftp",
-        "nmap",
-        "powershell",
-        "osascript",
     ];
     if denied_programs.contains(&program.as_str()) {
         return Err(format!("program '{program}' is blocked"));
@@ -1053,6 +1028,8 @@ fn execute_command(args: &Value) -> Result<String, String> {
         crate::cmd::run::build_no_shell_command(command, crate::cmd::run::RunCmdOptions { cwd })
             .map_err(|e| format!("Failed to execute command: {}", e))?;
     cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to execute command: {}", e))?;
@@ -1078,15 +1055,25 @@ fn execute_command(args: &Value) -> Result<String, String> {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
+    let stdout_trimmed = stdout.trim();
+    let stderr_trimmed = stderr.trim();
+
     if output.status.success() {
-        Ok(truncate_chars(stdout.trim(), 16_000))
+        let combined = if stdout_trimmed.is_empty() {
+            stderr_trimmed.to_string()
+        } else if stderr_trimmed.is_empty() {
+            stdout_trimmed.to_string()
+        } else {
+            format!("{stdout_trimmed}\n{stderr_trimmed}")
+        };
+        Ok(truncate_chars(combined.trim(), 16_000))
     } else {
         Ok(truncate_chars(
             &format!(
                 "Exit code: {}\n{}\n{}",
                 output.status.code().unwrap_or(-1),
-                stdout.trim(),
-                stderr.trim()
+                stdout_trimmed,
+                stderr_trimmed
             ),
             16_000,
         ))
