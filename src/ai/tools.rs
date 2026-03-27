@@ -574,6 +574,22 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     out
 }
 
+fn output_to_strings(output: &std::process::Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+fn format_exit_code_output(output: &std::process::Output, stdout: &str, stderr: &str) -> String {
+    format!(
+        "Exit code: {}\n{}\n{}",
+        output.status.code().unwrap_or(-1),
+        stdout.trim(),
+        stderr.trim()
+    )
+}
+
 fn execute_read_file(args: &Value) -> Result<String, String> {
     let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
     let path = PathBuf::from(file_path);
@@ -1026,31 +1042,16 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
 
 fn execute_command(args: &Value) -> Result<String, String> {
     let command = args["command"].as_str().ok_or("Missing command")?;
-    let cwd = args["cwd"].as_str();
+    let cwd = args["cwd"].as_str().filter(|dir| !dir.trim().is_empty());
     let timeout = args["timeout"].as_u64().unwrap_or(30).clamp(1, 300);
 
     if let Err(reason) = validate_execute_command(command) {
         return Ok(format!("Command blocked: {reason}"));
     }
 
-    let mut iter = crate::strw::split::split_space_keep_symbol(command, r#"""#);
-    let Some(program) = iter.next() else {
-        return Err("empty command".to_string());
-    };
-    let mut cmd = Command::new(program);
-    if let Some(dir) = cwd {
-        if !dir.trim().is_empty() {
-            cmd.current_dir(dir);
-        }
-    }
-    iter.for_each(|arg| {
-        let new_arg = crate::common::utils::expanduser(arg);
-        if new_arg == arg {
-            cmd.arg(new_arg.as_ref());
-        } else {
-            cmd.arg(new_arg.into_owned());
-        }
-    });
+    let mut cmd =
+        crate::cmd::run::build_no_shell_command(command, crate::cmd::run::RunCmdOptions { cwd })
+            .map_err(|e| format!("Failed to execute command: {}", e))?;
     cmd.stdin(Stdio::null());
     let mut child = cmd
         .spawn()
@@ -1121,17 +1122,11 @@ fn execute_git_status(args: &Value) -> Result<String, String> {
         .output()
         .map_err(|e| format!("Failed to execute git: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let (stdout, stderr) = output_to_strings(&output);
     if output.status.success() {
         Ok(stdout.trim().to_string())
     } else {
-        Ok(format!(
-            "Exit code: {}\n{}\n{}",
-            output.status.code().unwrap_or(-1),
-            stdout.trim(),
-            stderr.trim()
-        ))
+        Ok(format_exit_code_output(&output, &stdout, &stderr))
     }
 }
 
@@ -1153,17 +1148,11 @@ fn execute_git_diff(args: &Value) -> Result<String, String> {
         .output()
         .map_err(|e| format!("Failed to execute git: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let (stdout, stderr) = output_to_strings(&output);
     let mut out = if output.status.success() {
         stdout
     } else {
-        format!(
-            "Exit code: {}\n{}\n{}",
-            output.status.code().unwrap_or(-1),
-            stdout.trim(),
-            stderr.trim()
-        )
+        format_exit_code_output(&output, &stdout, &stderr)
     };
 
     const MAX_CHARS: usize = 16_000;
@@ -1183,11 +1172,11 @@ fn cargo_common_args(args: &Value) -> (String, bool, bool, Option<String>) {
     (cwd, workspace, all_features, package)
 }
 
-fn execute_cargo_check(args: &Value) -> Result<String, String> {
+fn execute_cargo_command(subcommand: &str, args: &Value) -> Result<String, String> {
     let (cwd, workspace, all_features, package) = cargo_common_args(args);
 
     let mut cmd = Command::new("cargo");
-    cmd.arg("check");
+    cmd.arg(subcommand);
     if workspace {
         cmd.arg("--workspace");
     }
@@ -1202,55 +1191,22 @@ fn execute_cargo_check(args: &Value) -> Result<String, String> {
         .output()
         .map_err(|e| format!("Failed to execute cargo: {}", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let (stdout, stderr) = output_to_strings(&output);
     if output.status.success() {
         Ok(format!("{}\n{}", stdout.trim(), stderr.trim())
             .trim()
             .to_string())
     } else {
-        Ok(format!(
-            "Exit code: {}\n{}\n{}",
-            output.status.code().unwrap_or(-1),
-            stdout.trim(),
-            stderr.trim()
-        ))
+        Ok(format_exit_code_output(&output, &stdout, &stderr))
     }
 }
 
+fn execute_cargo_check(args: &Value) -> Result<String, String> {
+    execute_cargo_command("check", args)
+}
+
 fn execute_cargo_test(args: &Value) -> Result<String, String> {
-    let (cwd, workspace, all_features, package) = cargo_common_args(args);
-
-    let mut cmd = Command::new("cargo");
-    cmd.arg("test");
-    if workspace {
-        cmd.arg("--workspace");
-    }
-    if all_features {
-        cmd.arg("--all-features");
-    }
-    if let Some(pkg) = package {
-        cmd.args(["-p", &pkg]);
-    }
-    let output = cmd
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("Failed to execute cargo: {}", e))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if output.status.success() {
-        Ok(format!("{}\n{}", stdout.trim(), stderr.trim())
-            .trim()
-            .to_string())
-    } else {
-        Ok(format!(
-            "Exit code: {}\n{}\n{}",
-            output.status.code().unwrap_or(-1),
-            stdout.trim(),
-            stderr.trim()
-        ))
-    }
+    execute_cargo_command("test", args)
 }
 
 fn execute_web_search(args: &Value) -> Result<String, String> {

@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self},
     io,
     path::Path,
     path::PathBuf,
@@ -9,6 +9,8 @@ use chrono::{DateTime, Local};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::common::utils::open_file_for_append;
 
 use super::types::ToolCall;
 
@@ -127,14 +129,7 @@ pub(super) fn append_history_messages(path: &Path, messages: &[Message]) -> io::
 }
 
 fn append_history_blob(path: &Path, content: &str) -> io::Result<()> {
-    let mut options = OpenOptions::new();
-    options.create(true).append(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o664);
-    }
-    let mut file = options.open(path)?;
+    let mut file = open_file_for_append(path, 0o664)?;
     use std::io::Write;
     file.write_all(content.as_bytes())
 }

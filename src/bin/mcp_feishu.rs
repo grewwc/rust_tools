@@ -371,16 +371,16 @@ fn feishu_docs_search(args: &Value) -> Result<String, JsonRpcErr> {
     };
 
     let (mut status, mut text) = do_docs_search_request(&client, &url, &token, &body)?;
-    if !status.is_success() {
-        if let Ok(v) = serde_json::from_str::<Value>(&text) {
-            let code = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-            if code == 99991668 {
-                if let Ok(tok) = refresh_user_access_token_and_cache(&client, &base_url) {
-                    let (s2, t2) = do_docs_search_request(&client, &url, &tok, &body)?;
-                    status = s2;
-                    text = t2;
-                }
-            }
+    if !status.is_success()
+        && let Ok(v) = serde_json::from_str::<Value>(&text)
+    {
+        let code = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code == 99991668
+            && let Ok(tok) = refresh_user_access_token_and_cache(&client, &base_url)
+        {
+            let (s2, t2) = do_docs_search_request(&client, &url, &tok, &body)?;
+            status = s2;
+            text = t2;
         }
     }
     if !status.is_success() {
@@ -738,8 +738,8 @@ fn parse_docs_url_kind_and_token(url: &str) -> Option<(String, String)> {
     if let Some(idx) = s.find("://") {
         s = &s[idx + 3..];
     }
-    let s = s.splitn(2, '?').next().unwrap_or(s);
-    let s = s.splitn(2, '#').next().unwrap_or(s);
+    let s = s.split('?').next().unwrap_or(s);
+    let s = s.split('#').next().unwrap_or(s);
     let path = if let Some(idx) = s.find('/') {
         &s[idx..]
     } else {
@@ -1355,10 +1355,11 @@ fn resolve_app_credentials() -> Option<(String, String)> {
     let env_secret = std::env::var("FEISHU_APP_SECRET")
         .ok()
         .map(|v| v.trim().to_string());
-    if let (Some(id), Some(secret)) = (env_id, env_secret) {
-        if !id.is_empty() && !secret.is_empty() {
-            return Some((id, secret));
-        }
+    if let (Some(id), Some(secret)) = (env_id, env_secret)
+        && !id.is_empty()
+        && !secret.is_empty()
+    {
+        return Some((id, secret));
     }
 
     let cfg = configw::get_all_config();
@@ -1375,12 +1376,11 @@ fn resolve_app_credentials() -> Option<(String, String)> {
 fn get_user_access_token_cached(client: &Client, base_url: &str) -> Result<String, JsonRpcErr> {
     let cache = USER_TOKEN_CACHE.get_or_init(|| Mutex::new(None));
     let now = Instant::now();
-    if let Ok(guard) = cache.lock() {
-        if let Some(cached) = guard.as_ref() {
-            if cached.expires_at > now + Duration::from_secs(300) {
-                return Ok(cached.token.clone());
-            }
-        }
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.as_ref()
+        && cached.expires_at > now + Duration::from_secs(300)
+    {
+        return Ok(cached.token.clone());
     }
     refresh_user_access_token_and_cache(client, base_url)
 }
@@ -1522,12 +1522,11 @@ fn refresh_user_access_token_api(
 fn get_app_access_token_cached(client: &Client, base_url: &str) -> Result<String, JsonRpcErr> {
     let cache = APP_TOKEN_CACHE.get_or_init(|| Mutex::new(None));
     let now = Instant::now();
-    if let Ok(guard) = cache.lock() {
-        if let Some(cached) = guard.as_ref() {
-            if cached.expires_at > now + Duration::from_secs(300) {
-                return Ok(cached.token.clone());
-            }
-        }
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.as_ref()
+        && cached.expires_at > now + Duration::from_secs(300)
+    {
+        return Ok(cached.token.clone());
     }
 
     let Some((app_id, app_secret)) = resolve_app_credentials() else {
@@ -2112,7 +2111,7 @@ fn write_json_rpc_result(out: &mut dyn Write, id: Option<&Value>, result: Value)
         "id": id.cloned().unwrap_or(Value::Null),
         "result": result
     });
-    writeln!(out, "{}", payload.to_string())?;
+    writeln!(out, "{payload}")?;
     out.flush()
 }
 
@@ -2135,6 +2134,6 @@ fn write_json_rpc_error(
         "id": id.cloned().unwrap_or(Value::Null),
         "error": err
     });
-    writeln!(out, "{}", payload.to_string())?;
+    writeln!(out, "{payload}")?;
     out.flush()
 }

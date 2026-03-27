@@ -1,11 +1,9 @@
-use std::{
-    fs,
-    fs::{File, OpenOptions},
-    io,
-    path::PathBuf,
-};
+use std::{fs, fs::File, io, path::Path, path::PathBuf};
 
-use crate::common::{configw, utils::expanduser};
+use crate::common::{
+    configw,
+    utils::{expanduser, open_file_for_write_truncate},
+};
 
 use super::{models, types::AppConfig};
 
@@ -53,14 +51,7 @@ pub(super) fn open_output_writer(path: Option<&str>) -> io::Result<Option<File>>
     let Some(path) = path else {
         return Ok(None);
     };
-    let mut options = OpenOptions::new();
-    options.create(true).write(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o644);
-    }
-    options.open(path).map(Some)
+    open_file_for_write_truncate(Path::new(path), 0o644).map(Some)
 }
 
 #[allow(dead_code)]

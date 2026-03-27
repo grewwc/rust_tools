@@ -514,19 +514,19 @@ fn run_loop(
                     tool_call_id: None,
                 });
             }
-            if !one_shot_mode {
-                if let Err(e) = append_history_messages(&app.session_history_file, &turn_messages) {
-                    eprintln!("[Warning] Failed to save history: {}", e);
-                }
+            if !one_shot_mode
+                && let Err(e) = append_history_messages(&app.session_history_file, &turn_messages)
+            {
+                eprintln!("[Warning] Failed to save history: {}", e);
             }
             println!();
         }
 
-        if let Some((tools, max_iterations)) = restore_agent_context.take() {
-            if let Some(ctx) = app.agent_context.as_mut() {
-                ctx.tools = tools;
-                ctx.max_iterations = max_iterations;
-            }
+        if let Some((tools, max_iterations)) = restore_agent_context.take()
+            && let Some(ctx) = app.agent_context.as_mut()
+        {
+            ctx.tools = tools;
+            ctx.max_iterations = max_iterations;
         }
         if should_quit {
             cleanup_one_shot(app);
@@ -562,11 +562,10 @@ fn try_handle_feishu_auth_command(
     for tool in mcp_client.get_all_tools() {
         if let Some((server_name, tool_name)) =
             mcp_client.parse_tool_name_for_known_server(&tool.function.name)
+            && tool_name == "oauth_authorize_url"
         {
-            if tool_name == "oauth_authorize_url" {
-                server = Some(server_name);
-                break;
-            }
+            server = Some(server_name);
+            break;
         }
     }
     let Some(server) = server else {

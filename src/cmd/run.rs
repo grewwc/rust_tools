@@ -1,6 +1,7 @@
 use crate::{common::utils::expanduser, strw::split::split_space_keep_symbol};
 
 use std::{
+    ffi::OsString,
     io,
     process::{Command, Output},
 };
@@ -8,6 +9,31 @@ use std::{
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunCmdOptions<'a> {
     pub cwd: Option<&'a str>,
+}
+
+pub fn build_no_shell_command(command: &str, opts: RunCmdOptions<'_>) -> io::Result<Command> {
+    if command.is_empty() {
+        return Err(io::Error::other("empty command"));
+    }
+
+    let mut iter = split_space_keep_symbol(command, r#"""#);
+    let Some(program) = iter.next() else {
+        return Err(io::Error::other("empty command"));
+    };
+
+    let mut cmd = Command::new(program);
+    if let Some(dir) = opts.cwd {
+        cmd.current_dir(dir);
+    }
+    iter.for_each(|arg| {
+        let new_arg = expanduser(arg);
+        if new_arg == arg {
+            cmd.arg(OsString::from(new_arg.as_ref()));
+        } else {
+            cmd.arg(OsString::from(new_arg.into_owned()));
+        }
+    });
+    Ok(cmd)
 }
 
 pub fn run_cmd_output(command: &str, opts: RunCmdOptions<'_>) -> io::Result<Output> {
@@ -33,25 +59,7 @@ pub fn run_cmd_output(command: &str, opts: RunCmdOptions<'_>) -> io::Result<Outp
         return cmd.output();
     }
 
-    let mut iter = split_space_keep_symbol(command, r#"""#);
-    let Some(program) = iter.next() else {
-        return Err(io::Error::other("empty command"));
-    };
-
-    let mut cmd = Command::new(program);
-    if let Some(dir) = opts.cwd {
-        cmd.current_dir(dir);
-    }
-    iter.for_each(|arg| {
-        let new_arg = expanduser(arg);
-        if new_arg == arg {
-            cmd.arg(new_arg.as_ref());
-        } else {
-            cmd.arg(new_arg.into_owned());
-        }
-    });
-
-    cmd.output()
+    build_no_shell_command(command, opts)?.output()
 }
 
 pub fn run_cmd(command: &str) -> io::Result<String> {

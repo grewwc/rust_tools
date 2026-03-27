@@ -1082,8 +1082,8 @@ fn take_atomic_markdown_span(s: &str, start: usize) -> Option<(String, usize)> {
         return Some((s[start..end].to_string(), end));
     }
 
-    if rest.starts_with("\\") {
-        let next = rest[1..].chars().next()?;
+    if let Some(stripped) = rest.strip_prefix('\\') {
+        let next = stripped.chars().next()?;
         let end = start + 1 + next.len_utf8();
         return Some((s[start..end].to_string(), end));
     }
@@ -1277,12 +1277,13 @@ fn render_math_tex_to_unicode(s: &str) -> String {
                     while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
                         j += 1;
                     }
-                    if j < bytes.len() && bytes[j] == b'[' {
-                        if let Some((_, j2)) = read_group_bracketed(&s, j) {
-                            j = j2;
-                            while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
-                                j += 1;
-                            }
+                    if j < bytes.len()
+                        && bytes[j] == b'['
+                        && let Some((_, j2)) = read_group_bracketed(&s, j)
+                    {
+                        j = j2;
+                        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+                            j += 1;
                         }
                     }
                     if let Some((rad, j2)) = read_group_braced(&s, j) {
@@ -1507,19 +1508,19 @@ fn apply_super_subscripts(s: &str) -> String {
                 out.push(ch);
                 break;
             }
-            if bytes[i] == b'{' {
-                if let Some((group, next)) = read_braced(s, i) {
-                    if let Some(converted) = convert_group(group.trim(), sup) {
-                        out.push_str(&converted);
-                    } else {
-                        out.push(if sup { '^' } else { '_' });
-                        out.push('(');
-                        out.push_str(group.trim());
-                        out.push(')');
-                    }
-                    i = next;
-                    continue;
+            if bytes[i] == b'{'
+                && let Some((group, next)) = read_braced(s, i)
+            {
+                if let Some(converted) = convert_group(group.trim(), sup) {
+                    out.push_str(&converted);
+                } else {
+                    out.push(if sup { '^' } else { '_' });
+                    out.push('(');
+                    out.push_str(group.trim());
+                    out.push(')');
                 }
+                i = next;
+                continue;
             }
             let next_ch = s[i..].chars().next().unwrap();
             if let Some(mapped) = if sup {
