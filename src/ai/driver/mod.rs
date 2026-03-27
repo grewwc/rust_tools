@@ -90,8 +90,6 @@ fn prepare_skill_for_turn(
     };
     let mcp_tools = mcp_client.get_all_tools();
 
-    print_skill_selection(skill, &builtin_tools, &mcp_tools);
-
     let mut restore_agent_context = None;
     if let Some(ctx) = app.agent_context.as_mut() {
         restore_agent_context = Some((ctx.tools.clone(), ctx.max_iterations));
@@ -140,64 +138,6 @@ fn prepare_skill_for_turn(
     }
 
     (system_prompt, restore_agent_context)
-}
-
-fn print_skill_selection(
-    skill: Option<&SkillManifest>,
-    builtin_tools: &[crate::ai::types::ToolDefinition],
-    mcp_tools: &[crate::ai::types::ToolDefinition],
-) {
-    let skill_label = "[skill]".bright_blue().bold();
-    match skill {
-        Some(s) => {
-            let name = s.name.bright_cyan().bold();
-            if let Some(src) = s.source_path.as_ref()
-                && !src.trim().is_empty()
-            {
-                println!(
-                    "{} matched: {} {}",
-                    skill_label,
-                    name,
-                    format!("({src})").dimmed()
-                );
-            } else {
-                println!("{} matched: {}", skill_label, name);
-            }
-        }
-        None => println!("{} matched: {}", skill_label, "none".dimmed()),
-    }
-
-    let builtin_names = format_tool_names(builtin_tools);
-    println!(
-        "{} {}",
-        "[tools]".bright_green().bold(),
-        if builtin_names.is_empty() {
-            "none".dimmed().to_string()
-        } else {
-            builtin_names.join(", ")
-        }
-    );
-
-    let mcp_names = format_tool_names(mcp_tools);
-    println!(
-        "{} {}",
-        "[mcp-tools]".bright_magenta().bold(),
-        if mcp_names.is_empty() {
-            "none".dimmed().to_string()
-        } else {
-            mcp_names.join(", ")
-        }
-    );
-}
-
-fn format_tool_names(tools: &[crate::ai::types::ToolDefinition]) -> Vec<String> {
-    let mut names = tools
-        .iter()
-        .map(|tool| tool.function.name.clone())
-        .collect::<Vec<_>>();
-    names.sort();
-    names.dedup();
-    names
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -356,11 +296,8 @@ fn run_loop(
         app.current_model = next_model.clone();
 
         app.cancel_stream.store(false, Ordering::SeqCst);
-        // Per turn, always decide whether to load a skill before any model request/tool call.
-        println!("[skill] pre-check turn: start");
         let (system_prompt, mut restore_agent_context) =
             prepare_skill_for_turn(app, mcp_client, skill_manifests, &question);
-        println!("[skill] pre-check turn: done");
 
         let mut messages = Vec::new();
         messages.push(Message {
