@@ -24,6 +24,20 @@ cargo build --release
 cargo run --bin <tool_name>
 ```
 
+## AI Skill And Memory
+
+The AI agent now supports writing reusable skills and persistent memory notes by tool calls.
+
+- `save_skill`: writes a `.skill` file into external skills directory.
+- `memory_append`: appends notes to agent memory store (`jsonl`).
+- `memory_search`: searches memory by keyword.
+- `memory_recent`: reads recent notes.
+
+Config keys in `~/.configW`:
+
+- `ai.skills.dir` (optional): override skills directory. Default: `~/.config/rust_tools/skills`
+- `ai.memory.file` (optional): override memory file. Default: `~/.config/rust_tools/agent_memory.jsonl`
+
 ## Project Structure
 
 ```

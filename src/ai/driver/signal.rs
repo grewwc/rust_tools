@@ -8,7 +8,7 @@ pub enum SigintAction {
 }
 
 pub fn handle_sigint(shutdown: &AtomicBool, streaming: &AtomicBool, cancel_stream: &AtomicBool) {
-    match sigint_action(streaming, cancel_stream) {
+    match sigint_action(shutdown, streaming, cancel_stream) {
         SigintAction::CancelStream => {
             cancel_stream.store(true, Ordering::Release);
         }
@@ -27,14 +27,22 @@ pub fn handle_sigint(shutdown: &AtomicBool, streaming: &AtomicBool, cancel_strea
     }
 }
 
-pub fn sigint_action(streaming: &AtomicBool, cancel_stream: &AtomicBool) -> SigintAction {
+pub fn sigint_action(
+    shutdown: &AtomicBool,
+    streaming: &AtomicBool,
+    cancel_stream: &AtomicBool,
+) -> SigintAction {
     if streaming.load(Ordering::Acquire) {
         if cancel_stream.load(Ordering::Acquire) {
             SigintAction::Shutdown
         } else {
             SigintAction::CancelStream
         }
-    } else {
+    } else if shutdown.load(Ordering::Acquire) {
         SigintAction::Exit
+    } else {
+        // Outside streaming (including tool execution), first Ctrl+C requests a graceful
+        // shutdown so the process won't terminate abruptly mid-turn.
+        SigintAction::Shutdown
     }
 }

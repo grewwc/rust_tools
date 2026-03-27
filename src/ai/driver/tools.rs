@@ -42,6 +42,13 @@ mod dispatch {
 
     use super::args;
 
+    fn requires_user_confirmation_for_tool(name: &str) -> bool {
+        let lower = name.to_lowercase();
+        let looks_like_feishu = lower.contains("feishu") || lower.contains("lark");
+        let looks_like_search = lower.contains("search") || lower.contains("docs_search");
+        looks_like_feishu && looks_like_search
+    }
+
     fn looks_like_feishu_oauth_required(err: &str) -> bool {
         let e = err.to_lowercase();
         e.contains("missing user_access_token")
@@ -162,7 +169,7 @@ mod dispatch {
     pub fn run_one(mcp_client: &McpClient, tool_call: &ToolCall) -> RunOneResult {
         let name = tool_call.function.name.as_str();
 
-        if name == "execute_command" || name == "apply_patch" {
+        if requires_user_confirmation_for_tool(name) {
             let args: Value = match args::parse_args(tool_call) {
                 Ok(a) => a,
                 Err(res) => {
