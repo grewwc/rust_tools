@@ -58,6 +58,38 @@ mod dispatch {
             || e.contains("re-authorization")
     }
 
+    fn remediation_hint(tool_name: &str, err: &str) -> Option<String> {
+        let err_lower = err.to_lowercase();
+
+        if tool_name == "mcp_feishu_docs_get_text_by_url"
+            && err_lower.contains("unsupported url")
+        {
+            return Some(
+                "Suggestion: this tool only works for supported Feishu/Lark docs URLs. Do not retry with the same URL. Use mcp_feishu_docs_search to find the document first, or ask the user for a direct Feishu docs/wiki/sheet URL.".to_string(),
+            );
+        }
+
+        if err_lower.contains("failed to parse arguments") || err_lower.contains("invalid type") {
+            return Some(
+                "Suggestion: fix the tool arguments to match the declared JSON schema before retrying.".to_string(),
+            );
+        }
+
+        if err_lower.contains("no such file") || err_lower.contains("not found") {
+            return Some(
+                "Suggestion: verify the path or identifier first, or use a search/list tool to discover the correct target before retrying.".to_string(),
+            );
+        }
+
+        if err_lower.contains("timeout") || err_lower.contains("timed out") {
+            return Some(
+                "Suggestion: retry once with a narrower query or a smaller scope. If it still fails, switch to another tool or ask the user.".to_string(),
+            );
+        }
+
+        None
+    }
+
     fn extract_feishu_required_scopes(err: &str) -> Vec<String> {
         static RE: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(r"\b[a-z][a-z0-9_-]*:[a-z0-9_-]+(?::[a-z0-9_-]+)*\b").unwrap()
@@ -181,23 +213,23 @@ mod dispatch {
                 }
             };
 
-            let confirm =
-                prompt_yes_or_no_interruptible(&format!("Confirm tool execution:{} (y/n): ", args));
-            if confirm != Some(true) {
-                println!("canceled by user.");
-                return RunOneResult {
-                    tool_result: ToolResult {
-                        tool_call_id: tool_call.id.clone(),
-                        content: if confirm.is_none() {
-                            format!("Error: {} canceled by user (Ctrl+C)", name)
-                        } else {
-                            format!("Error: {} canceled by user", name)
-                        },
-                    },
-                    ok: false,
-                    executed: false,
-                };
-            }
+            // let confirm =
+            //     prompt_yes_or_no_interruptible(&format!("Confirm tool execution:{} (y/n): ", args));
+            // if confirm != Some(true) {
+            //     println!("canceled by user.");
+            //     return RunOneResult {
+            //         tool_result: ToolResult {
+            //             tool_call_id: tool_call.id.clone(),
+            //             content: if confirm.is_none() {
+            //                 format!("Error: {} canceled by user (Ctrl+C)", name)
+            //             } else {
+            //                 format!("Error: {} canceled by user", name)
+            //             },
+            //         },
+            //         ok: false,
+            //         executed: false,
+            //     };
+            // }
         }
 
         let result: Result<ToolResult, String> = if let Some((server_name, tool_name)) =
@@ -261,7 +293,14 @@ mod dispatch {
             Err(err) => RunOneResult {
                 tool_result: ToolResult {
                     tool_call_id: tool_call.id.clone(),
-                    content: format!("Error: {} failed: {}", tool_call.function.name, err),
+                    content: if let Some(hint) = remediation_hint(&tool_call.function.name, &err) {
+                        format!(
+                            "Error: {} failed: {}\n{}",
+                            tool_call.function.name, err, hint
+                        )
+                    } else {
+                        format!("Error: {} failed: {}", tool_call.function.name, err)
+                    },
                 },
                 ok: false,
                 executed: true,

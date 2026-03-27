@@ -44,6 +44,9 @@ pub use print::*;
 pub use signal::*;
 pub use skill_matching::*;
 
+const DEFAULT_MAX_ITERATIONS: usize = 256;
+const OPENCLAW_MAX_ITERATIONS: usize = 256;
+
 fn print_assistant_banner() {
     println!("\n{}", "[Assistant]".bright_blue().bold());
 }
@@ -96,7 +99,11 @@ fn prepare_skill_for_turn(
         let mut all_tools = builtin_tools.clone();
         all_tools.extend(mcp_tools.clone());
         ctx.tools = all_tools;
-        ctx.max_iterations = if openclaw_active { 12 } else { 6 };
+        ctx.max_iterations = if openclaw_active {
+            OPENCLAW_MAX_ITERATIONS
+        } else {
+            DEFAULT_MAX_ITERATIONS
+        };
     }
 
     let mut system_prompt = if let Some(skill) = skill {
@@ -136,6 +143,12 @@ fn prepare_skill_for_turn(
             "If the user asks anything related to Feishu/Lark docs, prefer calling the available Feishu MCP tools instead of saying you cannot access the account."
         );
     }
+
+    system_prompt = format!(
+        "{}\n\n{}",
+        system_prompt,
+        "Tool recovery mode:\n- If a tool call fails, read the error message and correct course before answering.\n- Prefer retrying with corrected arguments or switching to a more appropriate tool.\n- Do not repeat the exact same failing tool call unless the error indicates a transient retry is appropriate.\n- If a URL-based docs fetch tool says the URL is unsupported, switch to a search tool or ask for a supported docs URL instead of retrying the same call.\n- Only stop and ask the user when the error is ambiguous or missing required information."
+    );
 
     (system_prompt, restore_agent_context)
 }
@@ -207,7 +220,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         prompt_editor,
         agent_context: Some(AgentContext {
             tools: super::tools::get_builtin_tool_definitions(),
-            max_iterations: 6,
+            max_iterations: DEFAULT_MAX_ITERATIONS,
             ..Default::default()
         }),
     };
@@ -335,14 +348,42 @@ fn run_loop(
         let max_iterations = max_iterations.max(1);
 
         let mut iteration = 0usize;
+        let mut force_final_response = false;
         let mut final_assistant_text = String::new();
         let mut final_assistant_recorded = false;
         loop {
             iteration += 1;
             let mut current_history = String::new();
             app.streaming.store(true, Ordering::Release);
+            if force_final_response {
+                messages.push(Message {
+                    role: "system".to_string(),
+                    content: Value::String(
+                        "Tool limit reached. Do not call any more tools. Provide the best possible final answer using the information already collected.".to_string(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+
+            let saved_tools = if force_final_response {
+                app.agent_context
+                    .as_mut()
+                    .map(|ctx| std::mem::take(&mut ctx.tools))
+            } else {
+                None
+            };
+
+            let request_result = request::do_request_messages(app, &next_model, messages.clone(), true);
+
+            if let Some(saved_tools) = saved_tools
+                && let Some(ctx) = app.agent_context.as_mut()
+            {
+                ctx.tools = saved_tools;
+            }
+
             let mut response =
-                match request::do_request_messages(app, &next_model, messages.clone(), true) {
+                match request_result {
                     Ok(response) => response,
                     Err(err) => {
                         app.streaming.store(false, Ordering::Release);
@@ -463,9 +504,18 @@ fn run_loop(
                 turn_messages.push(tool_message);
             }
 
+            // Ignore stray Enter presses while tool results are being printed so they
+            // do not affect the next model step or the following user prompt.
+            input::clear_stdin_buffer();
+
             if iteration >= max_iterations {
-                final_assistant_text = "Agent stopped: too many tool iterations.".to_string();
-                break;
+                if force_final_response {
+                    final_assistant_text = format!(
+                        "Agent reached the tool iteration limit ({max_iterations}) without producing a final answer."
+                    );
+                    break;
+                }
+                force_final_response = true;
             }
         }
 
