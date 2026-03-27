@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::{BufRead, BufReader, Write},
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio},
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
@@ -58,6 +58,7 @@ struct McpServerConnection {
     process: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    stderr: BufReader<ChildStderr>,
     request_timeout_ms: u64,
     tools: Vec<McpTool>,
     resources: Vec<McpResource>,
@@ -75,8 +76,37 @@ impl McpServerConnection {
             &mut self.stdout,
             self.request_timeout_ms,
             &mut response_line,
-        )?;
+        )
+        .map_err(|err| self.decorate_transport_error(err))?;
         Ok(response_line)
+    }
+
+    fn decorate_transport_error(&mut self, err: String) -> String {
+        let mut detail = err;
+
+        if let Ok(Some(status)) = self.process.try_wait() {
+            detail.push_str(&format!(" | process exited with status {}", status));
+        }
+
+        let stderr = self.read_stderr_snippet();
+        if !stderr.is_empty() {
+            detail.push_str(" | stderr: ");
+            detail.push_str(&stderr);
+        }
+
+        detail
+    }
+
+    fn read_stderr_snippet(&mut self) -> String {
+        let fd = self.stderr.get_ref().as_raw_fd();
+        let bytes = read_available_buf(&mut self.stderr, fd);
+        let text = String::from_utf8_lossy(&bytes).trim().to_string();
+        if text.chars().count() > 400 {
+            let truncated = text.chars().take(400).collect::<String>();
+            format!("{}...", truncated)
+        } else {
+            text
+        }
     }
 }
 
@@ -167,6 +197,46 @@ fn read_line_with_timeout_buf<R: std::io::Read>(
     }
 }
 
+#[cfg(unix)]
+fn is_fd_readable_now(fd: i32) -> bool {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN | libc::POLLHUP,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+    rc > 0
+}
+
+#[cfg(not(unix))]
+fn is_fd_readable_now(_fd: i32) -> bool {
+    false
+}
+
+fn read_available_buf<R: std::io::Read>(reader: &mut BufReader<R>, fd: i32) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    loop {
+        #[cfg(unix)]
+        if !is_fd_readable_now(fd) {
+            break;
+        }
+
+        let Ok(available) = reader.fill_buf() else {
+            break;
+        };
+        if available.is_empty() {
+            break;
+        }
+
+        out.extend_from_slice(available);
+        let consumed = available.len();
+        reader.consume(consumed);
+    }
+
+    out
+}
+
 impl McpClient {
     pub(super) fn new() -> Self {
         Self {
@@ -188,7 +258,7 @@ impl McpClient {
         cmd.args(&config.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         for (key, value) in &config.env {
             cmd.env(key, value);
@@ -200,11 +270,13 @@ impl McpClient {
 
         let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
         let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
+        let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
 
         let mut conn = McpServerConnection {
             process,
             stdin,
             stdout: BufReader::new(stdout),
+            stderr: BufReader::new(stderr),
             request_timeout_ms: config.request_timeout_ms.max(100),
             tools: Vec::new(),
             resources: Vec::new(),
@@ -241,7 +313,7 @@ impl McpClient {
             .map_err(|e| format!("Failed to serialize request: {}", e))?;
 
         writeln!(conn.stdin_mut(), "{}", request_str)
-            .map_err(|e| format!("Failed to send request: {}", e))?;
+            .map_err(|e| conn.decorate_transport_error(format!("Failed to send request: {}", e)))?;
 
         let response_line = conn.read_response_line()?;
 
