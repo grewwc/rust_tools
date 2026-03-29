@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{files, history::Message, models, skills::SkillManifest, types::App};
+use crate::common::configw;
 
 #[derive(Debug, Serialize)]
 struct RequestBody {
@@ -213,19 +214,52 @@ fn strip_json_fence(s: &str) -> &str {
     trimmed
 }
 
-fn parse_skill_name_from_router_output(s: &str) -> Option<String> {
+fn parse_router_output(s: &str) -> (Option<String>, f64) {
     let s = strip_json_fence(s);
     let candidate = if let (Some(l), Some(r)) = (s.find('{'), s.rfind('}')) && r >= l {
         &s[l..=r]
     } else {
         s
     };
-    let v: Value = serde_json::from_str(candidate).ok()?;
-    let name = v.get("skill")?.as_str()?.trim().to_string();
+    let v: Value = match serde_json::from_str(candidate) {
+        Ok(v) => v,
+        Err(_) => return (None, 0.0),
+    };
+    let name = v
+        .get("skill")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let confidence = v
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
     if name.is_empty() || name == "none" || name == "null" {
-        None
+        (None, confidence)
     } else {
-        Some(name)
+        (Some(name), confidence)
+    }
+}
+
+fn extract_router_content(v: &Value) -> Option<String> {
+    let choices = v
+        .get("choices")
+        .or_else(|| v.get("output").and_then(|o| o.get("choices")))?;
+    let msg = choices.get(0)?.get("message")?;
+    let content = msg.get("content")?;
+    match content {
+        Value::String(s) => Some(s.to_string()),
+        Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(s) = part.get("text").and_then(|v| v.as_str()) {
+                    out.push_str(s);
+                }
+            }
+            Some(out)
+        }
+        _ => None,
     }
 }
 
@@ -313,17 +347,18 @@ pub(super) fn select_skill_via_model(
 
     let text = response.text().ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
-    let content = v
-        .get("choices")?
-        .get(0)?
-        .get("message")?
-        .get("content")?
-        .as_str()
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    parse_skill_name_from_router_output(&content)
+    let content = extract_router_content(&v).unwrap_or_default();
+    let (name, confidence) = parse_router_output(&content);
+    let cfg = configw::get_all_config();
+    let threshold = cfg
+        .get_opt("ai.skills.router_threshold")
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.7);
+    if confidence >= threshold {
+        name
+    } else {
+        None
+    }
 }
 
 fn agent_tools_for_request(app: &App, model: &str) -> (Option<Value>, Option<Value>) {

@@ -102,11 +102,16 @@ fn prepare_skill_for_turn(
         match_skill(skill_manifests, question)
     };
     let matched_skill_name = skill.map(|s| s.name.clone());
+    let prompt_optimizer_active = skill
+        .as_ref()
+        .is_some_and(|s| s.name.as_str() == "prompt-optimizer");
     let openclaw_active = skill.as_ref().is_some_and(|s| {
         s.name.as_str() == "openclaw" || s.tool_groups.iter().any(|g| g == "openclaw")
     });
 
-    let builtin_tools = if let Some(skill) = skill.as_ref() {
+    let builtin_tools = if prompt_optimizer_active {
+        Vec::new()
+    } else if let Some(skill) = skill.as_ref() {
         if !skill.tool_groups.is_empty() {
             let groups: Vec<&str> = skill.tool_groups.iter().map(|s| s.as_str()).collect();
             super::tools::tool_definitions_for_groups(&groups)
@@ -118,7 +123,11 @@ fn prepare_skill_for_turn(
     } else {
         super::tools::get_builtin_tool_definitions()
     };
-    let mcp_tools = mcp_client.get_all_tools();
+    let mcp_tools = if prompt_optimizer_active {
+        Vec::new()
+    } else {
+        mcp_client.get_all_tools()
+    };
 
     let mut restore_agent_context = None;
     if let Some(ctx) = app.agent_context.as_mut() {
@@ -146,32 +155,6 @@ fn prepare_skill_for_turn(
     } else {
         "You are a helpful assistant.".to_string()
     };
-
-    if openclaw_active && !system_prompt.contains("OpenClaw") {
-        system_prompt = format!(
-            "{}\n\n{}",
-            system_prompt,
-            "OpenClaw mode:\n- Plan before acting.\n- Prefer reading/searching before editing.\n- Make minimal, reversible edits.\n- Verify by running checks/tests.\n- If a tool is unsafe or ambiguous, ask the user."
-        );
-    }
-    if is_feishu_docs_search_intent(question) {
-        system_prompt = format!(
-            "{}\n\n{}",
-            system_prompt,
-            "Feishu mode:\n- If the user asks to search Feishu/Lark cloud docs, call the MCP tool mcp_*_docs_search.\n- If authorization is required, follow the MCP OAuth flow (oauth_authorize_url -> oauth_wait_local_code -> oauth_exchange_code) and then retry.\n- If the MCP tool is not available, tell the user to configure MCP first."
-        );
-    }
-    if mcp_client
-        .get_all_tools()
-        .iter()
-        .any(|t| t.function.name.contains("mcp_feishu_"))
-    {
-        system_prompt = format!(
-            "{}\n\n{}",
-            system_prompt,
-            "If the user asks anything related to Feishu/Lark docs, prefer calling the available Feishu MCP tools instead of saying you cannot access the account."
-        );
-    }
 
     system_prompt = format!(
         "{}\n\n{}",
@@ -343,6 +326,9 @@ fn run_loop(
             prepare_skill_for_turn(app, mcp_client, skill_manifests, &question);
         if let Some(name) = matched_skill_name.as_deref() {
             println!("[skill: {}]", name.cyan());
+            println!("[skill-prompt: {}]", name.cyan());
+            println!("{system_prompt}");
+            println!("[/skill-prompt]");
         }
 
         let mut messages = Vec::new();
@@ -705,18 +691,6 @@ fn extract_code_from_wait_output(s: &str) -> Option<String> {
         }
     }
     None
-}
-
-fn is_feishu_docs_search_intent(input: &str) -> bool {
-    let q = input.trim();
-    if q.is_empty() {
-        return false;
-    }
-    let lower = q.to_lowercase();
-    let mentions_feishu = q.contains("飞书") || lower.contains("feishu") || lower.contains("lark");
-    let mentions_docs = q.contains("云文档") || q.contains("文档");
-    let mentions_search = q.contains("搜索");
-    mentions_feishu && mentions_docs && mentions_search
 }
 
 fn try_handle_help_command(input: &str) -> bool {
