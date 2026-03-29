@@ -261,7 +261,7 @@ fn build_summary_text(messages: &[Message], max_chars: usize) -> String {
             other => other,
         };
         let text = normalize_whitespace(&value_to_string(&m.content));
-        
+
         // Include tool call information if present
         let tool_info = if let Some(ref tool_calls) = m.tool_calls {
             let tool_names: Vec<&str> = tool_calls
@@ -276,11 +276,11 @@ fn build_summary_text(messages: &[Message], max_chars: usize) -> String {
         } else {
             String::new()
         };
-        
+
         if text.is_empty() && tool_info.is_empty() {
             continue;
         }
-        
+
         let snippet = truncate_to_chars(&text, 200);
         lines.push(format!("{role}: {snippet}{tool_info}"));
         if lines.join("\n").len() >= max_chars {

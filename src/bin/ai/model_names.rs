@@ -16,8 +16,10 @@ pub struct ModelDef {
 
 static USER_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_user_models);
 static BUILTIN_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_builtin_models);
-static USER_BY_NAME: LazyLock<std::collections::HashMap<String, usize>> = LazyLock::new(build_user_name_index);
-static BUILTIN_BY_NAME: LazyLock<std::collections::HashMap<String, usize>> = LazyLock::new(build_builtin_name_index);
+static USER_BY_NAME: LazyLock<std::collections::HashMap<String, usize>> =
+    LazyLock::new(build_user_name_index);
+static BUILTIN_BY_NAME: LazyLock<std::collections::HashMap<String, usize>> =
+    LazyLock::new(build_builtin_name_index);
 
 fn user_config_path() -> PathBuf {
     let home = expanduser("~/.config/rust_tools/models.json");
@@ -54,7 +56,10 @@ fn load_user_models() -> Vec<ModelDef> {
 fn load_builtin_models() -> Vec<ModelDef> {
     let path = builtin_config_path();
     if !path.exists() {
-        eprintln!("[model_names] builtin models.json not found at {}", path.display());
+        eprintln!(
+            "[model_names] builtin models.json not found at {}",
+            path.display()
+        );
         std::process::exit(1);
     }
     let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
@@ -86,35 +91,39 @@ fn build_builtin_name_index() -> std::collections::HashMap<String, usize> {
 pub fn all() -> Vec<&'static ModelDef> {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
-    
+
     for m in USER_MODELS.iter() {
         let key = m.name.to_lowercase();
         if seen.insert(key) {
             result.push(m);
         }
     }
-    
+
     for m in BUILTIN_MODELS.iter() {
         let key = m.name.to_lowercase();
         if seen.insert(key) {
             result.push(m);
         }
     }
-    
+
     result
 }
 
 pub fn find_by_name(name: &str) -> Option<&'static ModelDef> {
     let name_lower = name.trim().to_lowercase();
-    
+
     if let Some(&i) = USER_BY_NAME.get(&name_lower) {
         return Some(&USER_MODELS[i]);
     }
-    
-    BUILTIN_BY_NAME.get(&name_lower).map(|&i| &BUILTIN_MODELS[i])
+
+    BUILTIN_BY_NAME
+        .get(&name_lower)
+        .map(|&i| &BUILTIN_MODELS[i])
 }
 
 pub fn find_by_key(key: &str) -> Option<&'static ModelDef> {
-    USER_MODELS.iter().find(|m| m.key == key)
+    USER_MODELS
+        .iter()
+        .find(|m| m.key == key)
         .or_else(|| BUILTIN_MODELS.iter().find(|m| m.key == key))
 }

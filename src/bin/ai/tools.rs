@@ -12,9 +12,9 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use std::{io::Read, process::Stdio, time::Instant};
 
-use crate::common::utils::expanduser;
 use super::ff_embed;
 use super::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
+use crate::common::utils::expanduser;
 
 const HTTP_TOOL_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -678,14 +678,21 @@ pub(super) fn execute_tool_call(tool_call: &ToolCall) -> Result<ToolResult, Stri
         serde_json::from_str(raw_args).map_err(|e| format!("Failed to parse arguments: {}", e))?
     };
 
-    let name = tool_call.function.name.as_str();
+    execute_tool_call_with_args(&tool_call.id, &tool_call.function.name, &args)
+}
+
+pub(super) fn execute_tool_call_with_args(
+    tool_call_id: &str,
+    name: &str,
+    args: &Value,
+) -> Result<ToolResult, String> {
     let Some(spec) = TOOL_INDEX.get(name).copied() else {
         return Err(format!("Unknown tool: {}", name));
     };
     let result = (spec.execute)(&args)?;
 
     Ok(ToolResult {
-        tool_call_id: tool_call.id.clone(),
+        tool_call_id: tool_call_id.to_string(),
         content: result,
     })
 }
@@ -1394,7 +1401,10 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
         return Err("empty command".to_string());
     }
 
-    if command.contains('|') || command.contains('>') || command.contains('<') || command.contains(';')
+    if command.contains('|')
+        || command.contains('>')
+        || command.contains('<')
+        || command.contains(';')
     {
         return Err("shell metacharacters are blocked".to_string());
     }
@@ -2050,7 +2060,9 @@ mod tests {
 
     #[test]
     fn save_skill_writes_front_matter_file() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!("rust-tools-home-{}", Uuid::new_v4()));
+        let old_home = std::env::var("HOME").ok();
         unsafe {
             std::env::set_var("HOME", &home);
         }
@@ -2074,16 +2086,27 @@ mod tests {
         assert!(content.contains("name: \"test-memory-skill\""));
         assert!(content.contains("step1"));
 
+        match old_home {
+            Some(v) => unsafe {
+                std::env::set_var("HOME", v);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        crate::common::configw::refresh();
         let _ = fs::remove_dir_all(home);
     }
 
     #[test]
     fn memory_append_and_search_work() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir().join(format!("rust-tools-home-{}", Uuid::new_v4()));
         let memory_file = home.join("agent_memory.jsonl");
         if let Some(parent) = memory_file.parent() {
             fs::create_dir_all(parent).unwrap();
         }
+        let old_memory_file = std::env::var("RUST_TOOLS_MEMORY_FILE").ok();
         unsafe {
             std::env::set_var("RUST_TOOLS_MEMORY_FILE", &memory_file);
         }
@@ -2111,8 +2134,13 @@ mod tests {
         let recent = execute_memory_recent(&json!({"limit": 1})).unwrap();
         assert!(recent.contains("avoid destructive commands"));
 
-        unsafe {
-            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        match old_memory_file {
+            Some(v) => unsafe {
+                std::env::set_var("RUST_TOOLS_MEMORY_FILE", v);
+            },
+            None => unsafe {
+                std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+            },
         }
         let _ = fs::remove_dir_all(home);
     }

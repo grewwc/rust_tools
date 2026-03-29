@@ -17,12 +17,12 @@ pub(crate) fn clear_stdin_buffer() {
     if !io::stdin().is_terminal() {
         return;
     }
-    
+
     #[cfg(unix)]
     {
+        use libc::{F_GETFL, F_SETFL, O_NONBLOCK, fcntl};
         use std::os::unix::io::AsRawFd;
-        use libc::{fcntl, F_GETFL, F_SETFL, O_NONBLOCK};
-        
+
         let fd = io::stdin().as_raw_fd();
         unsafe {
             // Get current flags
@@ -30,13 +30,13 @@ pub(crate) fn clear_stdin_buffer() {
             if flags >= 0 {
                 // Set non-blocking mode
                 let _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-                
+
                 // Read and discard any pending input
                 let mut buf = [0u8; 1024];
                 while libc::read(fd, buf.as_mut_ptr() as *mut _, buf.len()) > 0 {
                     // Discard
                 }
-                
+
                 // Restore blocking mode
                 let _ = fcntl(fd, F_SETFL, flags);
             }

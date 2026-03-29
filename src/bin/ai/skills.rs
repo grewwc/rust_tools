@@ -46,19 +46,11 @@ pub(super) struct SkillManifest {
     #[serde(default)]
     pub(super) system_prompt: Option<String>,
     #[serde(default)]
-    pub(super) examples: Vec<SkillExample>,
-    #[serde(default)]
     pub(super) triggers: Vec<String>,
     #[serde(default)]
     pub(super) priority: i32,
     #[serde(skip)]
     pub(super) source_path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct SkillExample {
-    pub(super) user: String,
-    pub(super) assistant: String,
 }
 
 impl SkillManifest {
@@ -244,7 +236,6 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
         mcp_servers,
         prompt: body.trim().to_string(),
         system_prompt: system_prompt.filter(|s| !s.trim().is_empty()),
-        examples: Vec::new(),
         triggers,
         priority,
         source_path: None,
@@ -338,10 +329,12 @@ mod tests {
 
     #[test]
     fn load_all_skills_includes_builtin_even_when_user_has_custom_skill() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
         let home = std::env::temp_dir()
             .join(format!("rust-tools-home-{}", uuid::Uuid::new_v4()))
             .display()
             .to_string();
+        let old_home = std::env::var("HOME").ok();
         unsafe {
             std::env::set_var("HOME", &home);
         }
@@ -373,6 +366,14 @@ custom"#,
         assert!(names.contains("refactor"));
         assert!(names.contains("custom-skill"));
 
+        match old_home {
+            Some(v) => unsafe {
+                std::env::set_var("HOME", v);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 }

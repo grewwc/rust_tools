@@ -125,7 +125,7 @@ pub(super) fn stream_response(
             &end_thinking_tag,
             &mut thinking_open,
         );
-        
+
         for tc in internal_tool_calls {
             let builder = tool_calls_map.entry(internal_tool_call_idx).or_default();
             builder.id = tc.id;
@@ -134,7 +134,7 @@ pub(super) fn stream_response(
             builder.arguments = tc.arguments;
             internal_tool_call_idx += 1;
         }
-        
+
         if content.is_empty() {
             if reached_finish_reason {
                 break;
@@ -223,7 +223,8 @@ pub(super) fn extract_chunk_text(
     end_thinking_tag: &str,
     thinking_open: &mut bool,
 ) -> String {
-    let (content, _) = extract_chunk_text_with_tools(chunk, thinking_tag, end_thinking_tag, thinking_open);
+    let (content, _) =
+        extract_chunk_text_with_tools(chunk, thinking_tag, end_thinking_tag, thinking_open);
     content
 }
 
@@ -260,7 +261,10 @@ fn extract_chunk_text_with_tools(
 
     if *thinking_open {
         *thinking_open = false;
-        return (format!("\n{end_thinking_tag}\n{}", delta.content), Vec::new());
+        return (
+            format!("\n{end_thinking_tag}\n{}", delta.content),
+            Vec::new(),
+        );
     }
     (delta.content.clone(), Vec::new())
 }
@@ -270,20 +274,23 @@ fn extract_internal_tool_calls(s: &str) -> (String, Vec<InternalToolCall>) {
     let mut tool_calls = Vec::new();
     let bytes = s.as_bytes();
     let mut i = 0usize;
-    
+
     while i < bytes.len() {
         if bytes[i] == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
             let marker_start = i;
             let mut marker_end = i + 2;
             while marker_end < bytes.len() {
-                if bytes[marker_end] == b'|' && marker_end + 1 < bytes.len() && bytes[marker_end + 1] == b'>' {
+                if bytes[marker_end] == b'|'
+                    && marker_end + 1 < bytes.len()
+                    && bytes[marker_end + 1] == b'>'
+                {
                     break;
                 }
                 marker_end += 1;
             }
-            
+
             let marker = &s[marker_start..marker_end + 2];
-            
+
             if marker == "<|tool_call_begin|>" {
                 let (name, consumed) = parse_tool_call_name(s, marker_end + 2);
                 if let Some(name) = name {
@@ -293,7 +300,7 @@ fn extract_internal_tool_calls(s: &str) -> (String, Vec<InternalToolCall>) {
                         function_name: name,
                         arguments: String::new(),
                     };
-                    
+
                     let remaining_start = marker_end + 2 + consumed;
                     if let Some((args, args_consumed)) = parse_tool_call_args(s, remaining_start) {
                         tc.arguments = args;
@@ -301,7 +308,7 @@ fn extract_internal_tool_calls(s: &str) -> (String, Vec<InternalToolCall>) {
                     } else {
                         i = remaining_start;
                     }
-                    
+
                     tool_calls.push(tc);
                     continue;
                 }
@@ -312,16 +319,16 @@ fn extract_internal_tool_calls(s: &str) -> (String, Vec<InternalToolCall>) {
                 i = marker_end + 2;
                 continue;
             }
-            
+
             i = marker_end + 2;
             continue;
         }
-        
+
         let ch = s[i..].chars().next().unwrap();
         result.push(ch);
         i += ch.len_utf8();
     }
-    
+
     (result, tool_calls)
 }
 
@@ -329,7 +336,7 @@ fn parse_tool_call_name(s: &str, start: usize) -> (Option<String>, usize) {
     let bytes = s.as_bytes();
     let mut i = start;
     let mut name = String::new();
-    
+
     while i < bytes.len() {
         let ch = s[i..].chars().next().unwrap();
         if ch == '<' || ch == '{' {
@@ -338,7 +345,7 @@ fn parse_tool_call_name(s: &str, start: usize) -> (Option<String>, usize) {
         name.push(ch);
         i += ch.len_utf8();
     }
-    
+
     let name = name.trim().to_string();
     if name.is_empty() {
         (None, 0)
@@ -350,29 +357,31 @@ fn parse_tool_call_name(s: &str, start: usize) -> (Option<String>, usize) {
 fn parse_tool_call_args(s: &str, start: usize) -> Option<(String, usize)> {
     let bytes = s.as_bytes();
     let mut i = start;
-    
-    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\t') {
+
+    while i < bytes.len()
+        && (bytes[i] == b' ' || bytes[i] == b'\n' || bytes[i] == b'\r' || bytes[i] == b'\t')
+    {
         i += 1;
     }
-    
+
     if i >= bytes.len() || bytes[i] != b'{' {
         return None;
     }
-    
+
     let json_start = i;
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escape = false;
-    
+
     while i < bytes.len() {
         let b = bytes[i];
-        
+
         if escape {
             escape = false;
             i += 1;
             continue;
         }
-        
+
         match b {
             b'\\' if in_string => escape = true,
             b'"' => in_string = !in_string,
@@ -388,7 +397,7 @@ fn parse_tool_call_args(s: &str, start: usize) -> Option<(String, usize)> {
         }
         i += 1;
     }
-    
+
     let json_str = s[json_start..i].to_string();
     Some((json_str, i - start))
 }

@@ -179,7 +179,6 @@ mod tests {
             mcp_servers: Vec::new(),
             prompt: String::new(),
             system_prompt: None,
-            examples: Vec::new(),
             triggers: triggers.iter().map(|s| s.to_string()).collect(),
             priority,
             source_path: None,

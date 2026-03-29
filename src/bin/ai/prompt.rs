@@ -7,10 +7,10 @@ use std::{
 use rustyline::{DefaultEditor, error::ReadlineError};
 use uuid::Uuid;
 
-use crate::common::utils::expanduser;
+use super::history::SessionStore;
 use crate::clipboard::image_content;
 use crate::clipboard::string_content;
-use super::history::SessionStore;
+use crate::common::utils::expanduser;
 
 const LINE_REPL_HISTORY_FILE: &str = "~/.liner_histroy";
 
@@ -108,7 +108,10 @@ impl PromptEditor {
 
     fn read_multi_line_tui(&mut self) -> io::Result<Option<String>> {
         use crossterm::{
-            event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
+            event::{
+                self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+                KeyModifiers,
+            },
             execute,
             terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size},
         };

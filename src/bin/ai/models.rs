@@ -61,7 +61,6 @@ pub(super) fn forced_deepseek_model() -> String {
         .unwrap_or_else(default_model)
 }
 
-
 pub(super) fn initial_model(cli: &Cli) -> String {
     if let Some(ref model) = cli.model {
         if !model.trim().is_empty() {

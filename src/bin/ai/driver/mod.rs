@@ -66,6 +66,68 @@ fn print_tool_output_block(content: &str) {
     }
 }
 
+fn builtin_tools_for_skill(
+    prompt_optimizer_active: bool,
+    skill: Option<&SkillManifest>,
+) -> Vec<crate::ai::types::ToolDefinition> {
+    if prompt_optimizer_active {
+        return Vec::new();
+    }
+    if let Some(skill) = skill {
+        if !skill.tool_groups.is_empty() {
+            let groups: Vec<&str> = skill.tool_groups.iter().map(|s| s.as_str()).collect();
+            return super::tools::tool_definitions_for_groups(&groups);
+        }
+        if !skill.tools.is_empty() {
+            return super::tools::get_tool_definitions_by_names(&skill.tools);
+        }
+    }
+    super::tools::get_builtin_tool_definitions()
+}
+
+fn tool_uses_mcp_server(tool_name: &str, allowed_servers: &[String]) -> bool {
+    if !tool_name.starts_with("mcp_") {
+        return false;
+    }
+
+    let mut names = allowed_servers
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    names.sort_by_key(|name| std::cmp::Reverse(name.len()));
+
+    names.into_iter().any(|server_name| {
+        let prefix = format!("mcp_{server_name}_");
+        tool_name
+            .strip_prefix(&prefix)
+            .is_some_and(|tool_part| !tool_part.is_empty())
+    })
+}
+
+fn mcp_tools_for_skill(
+    mcp_client: &McpClient,
+    prompt_optimizer_active: bool,
+    skill: Option<&SkillManifest>,
+) -> Vec<crate::ai::types::ToolDefinition> {
+    if prompt_optimizer_active {
+        return Vec::new();
+    }
+
+    let all_tools = mcp_client.get_all_tools();
+    let Some(skill) = skill else {
+        return all_tools;
+    };
+    if skill.mcp_servers.is_empty() {
+        return all_tools;
+    }
+
+    all_tools
+        .into_iter()
+        .filter(|tool| tool_uses_mcp_server(&tool.function.name, &skill.mcp_servers))
+        .collect()
+}
+
 fn prepare_skill_for_turn(
     app: &mut App,
     mcp_client: &McpClient,
@@ -109,25 +171,8 @@ fn prepare_skill_for_turn(
         s.name.as_str() == "openclaw" || s.tool_groups.iter().any(|g| g == "openclaw")
     });
 
-    let builtin_tools = if prompt_optimizer_active {
-        Vec::new()
-    } else if let Some(skill) = skill.as_ref() {
-        if !skill.tool_groups.is_empty() {
-            let groups: Vec<&str> = skill.tool_groups.iter().map(|s| s.as_str()).collect();
-            super::tools::tool_definitions_for_groups(&groups)
-        } else if !skill.tools.is_empty() {
-            super::tools::get_tool_definitions_by_names(&skill.tools)
-        } else {
-            super::tools::get_builtin_tool_definitions()
-        }
-    } else {
-        super::tools::get_builtin_tool_definitions()
-    };
-    let mcp_tools = if prompt_optimizer_active {
-        Vec::new()
-    } else {
-        mcp_client.get_all_tools()
-    };
+    let builtin_tools = builtin_tools_for_skill(prompt_optimizer_active, skill);
+    let mcp_tools = mcp_tools_for_skill(mcp_client, prompt_optimizer_active, skill);
 
     let mut restore_agent_context = None;
     if let Some(ctx) = app.agent_context.as_mut() {
@@ -163,6 +208,19 @@ fn prepare_skill_for_turn(
     );
 
     (system_prompt, restore_agent_context, matched_skill_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tool_uses_mcp_server;
+
+    #[test]
+    fn mcp_server_filter_matches_longest_server_name_prefix() {
+        let allowed = vec!["foo".to_string(), "foo_bar".to_string()];
+        assert!(tool_uses_mcp_server("mcp_foo_bar_search", &allowed));
+        assert!(tool_uses_mcp_server("mcp_foo_lookup", &allowed));
+        assert!(!tool_uses_mcp_server("mcp_bar_search", &allowed));
+    }
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -205,7 +263,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let current_model = models::initial_model(&cli);
     let client = reqwest::blocking::Client::builder().build()?;
     let prompt_editor = if cli.args.is_empty() {
-        Some(PromptEditor::new(&session_id, config.history_file.as_path()))
+        Some(PromptEditor::new(
+            &session_id,
+            config.history_file.as_path(),
+        ))
     } else {
         None
     };
@@ -402,23 +463,22 @@ fn run_loop(
                 ctx.tools = saved_tools;
             }
 
-            let mut response =
-                match request_result {
-                    Ok(response) => response,
-                    Err(err) => {
-                        app.streaming.store(false, Ordering::Release);
-                        if request::is_transient_error(&err) {
-                            eprintln!("[Warning] {}", err);
-                            if should_quit {
-                                cleanup_one_shot(app);
-                                return Ok(());
-                            }
-                            break;
+            let mut response = match request_result {
+                Ok(response) => response,
+                Err(err) => {
+                    app.streaming.store(false, Ordering::Release);
+                    if request::is_transient_error(&err) {
+                        eprintln!("[Warning] {}", err);
+                        if should_quit {
+                            cleanup_one_shot(app);
+                            return Ok(());
                         }
-                        cleanup_one_shot(app);
-                        return Err(err.into());
+                        break;
                     }
-                };
+                    cleanup_one_shot(app);
+                    return Err(err.into());
+                }
+            };
             if app.cancel_stream.swap(false, Ordering::AcqRel) {
                 app.streaming.store(false, Ordering::Release);
                 println!("\nInterrupted.");

@@ -216,7 +216,9 @@ fn strip_json_fence(s: &str) -> &str {
 
 fn parse_router_output(s: &str) -> (Option<String>, f64) {
     let s = strip_json_fence(s);
-    let candidate = if let (Some(l), Some(r)) = (s.find('{'), s.rfind('}')) && r >= l {
+    let candidate = if let (Some(l), Some(r)) = (s.find('{'), s.rfind('}'))
+        && r >= l
+    {
         &s[l..=r]
     } else {
         s
@@ -231,10 +233,7 @@ fn parse_router_output(s: &str) -> (Option<String>, f64) {
         .unwrap_or("")
         .trim()
         .to_string();
-    let confidence = v
-        .get("confidence")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
+    let confidence = v.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
     if name.is_empty() || name == "none" || name == "null" {
         (None, confidence)
     } else {
@@ -354,11 +353,7 @@ pub(super) fn select_skill_via_model(
         .get_opt("ai.skills.router_threshold")
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.7);
-    if confidence >= threshold {
-        name
-    } else {
-        None
-    }
+    if confidence >= threshold { name } else { None }
 }
 
 fn agent_tools_for_request(app: &App, model: &str) -> (Option<Value>, Option<Value>) {
