@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -499,25 +500,12 @@ fn feishu_docs_get_text(args: &Value) -> Result<String, JsonRpcErr> {
             )
         })?;
 
-    let token = if let Some(tok) = resolve_user_access_token() {
-        tok
-    } else {
-        get_user_access_token_cached(&client, &base_url).map_err(|e| {
-            json_rpc_error(
-                -32000,
-                "Missing user_access_token. Fetch requires OAuth once.",
-                Some(json!({
-                    "detail": e.message,
-                    "next_steps": ["oauth_authorize_url", "oauth_wait_local_code", "oauth_exchange_code"],
-                    "token_store": token_store_path().display().to_string()
-                })),
-            )
-        })?
-    };
-
-    let content =
-        feishu_fetch_raw_content(&client, &base_url, &token, &docs_type, &docs_token, lang)?;
-    Ok(content)
+    with_user_access_token(
+        &client,
+        &base_url,
+        "Missing user_access_token. Fetch requires OAuth once.",
+        |token| feishu_fetch_raw_content(&client, &base_url, token, &docs_type, &docs_token, lang),
+    )
 }
 
 fn feishu_docs_get_text_by_url(args: &Value) -> Result<String, JsonRpcErr> {
@@ -565,22 +553,6 @@ fn feishu_docs_get_text_by_url(args: &Value) -> Result<String, JsonRpcErr> {
             )
         })?;
 
-    let token = if let Some(tok) = resolve_user_access_token() {
-        tok
-    } else {
-        get_user_access_token_cached(&client, &base_url).map_err(|e| {
-            json_rpc_error(
-                -32000,
-                "Missing user_access_token. Fetch requires OAuth once.",
-                Some(json!({
-                    "detail": e.message,
-                    "next_steps": ["oauth_authorize_url", "oauth_wait_local_code", "oauth_exchange_code"],
-                    "token_store": token_store_path().display().to_string()
-                })),
-            )
-        })?
-    };
-
     let Some((kind, tok)) = parse_docs_url_kind_and_token(&url) else {
         return Err(json_rpc_error(
             -32602,
@@ -589,51 +561,52 @@ fn feishu_docs_get_text_by_url(args: &Value) -> Result<String, JsonRpcErr> {
         ));
     };
 
-    match kind.as_str() {
-        "wiki" => {
-            let (docs_type, docs_token) =
-                feishu_wiki_resolve_obj(&client, &base_url, &token, &tok)?;
-            match docs_type.as_str() {
-                "doc" | "docx" => {
-                    let content = feishu_fetch_raw_content(
+    with_user_access_token(
+        &client,
+        &base_url,
+        "Missing user_access_token. Fetch requires OAuth once.",
+        |token| match kind.as_str() {
+            "wiki" => {
+                let (docs_type, docs_token) =
+                    feishu_wiki_resolve_obj(&client, &base_url, token, &tok)?;
+                match docs_type.as_str() {
+                    "doc" | "docx" => feishu_fetch_raw_content(
                         &client,
                         &base_url,
-                        &token,
+                        token,
                         &docs_type,
                         &docs_token,
                         lang,
-                    )?;
-                    Ok(content)
+                    ),
+                    "sheet" => feishu_fetch_sheet_preview_text(
+                        &client,
+                        &base_url,
+                        token,
+                        &docs_token,
+                        max_rows,
+                        max_cols,
+                        max_sheets,
+                    ),
+                    other => Err(json_rpc_error(
+                        -32602,
+                        "Unsupported wiki node object type (supported: doc/docx/sheet for now)",
+                        Some(
+                            json!({ "obj_type": other, "obj_token": docs_token, "node_token": tok }),
+                        ),
+                    )),
                 }
-                "sheet" => feishu_fetch_sheet_preview_text(
-                    &client,
-                    &base_url,
-                    &token,
-                    &docs_token,
-                    max_rows,
-                    max_cols,
-                    max_sheets,
-                ),
-                other => Err(json_rpc_error(
-                    -32602,
-                    "Unsupported wiki node object type (supported: doc/docx/sheet for now)",
-                    Some(json!({ "obj_type": other, "obj_token": docs_token, "node_token": tok })),
-                )),
             }
-        }
-        "doc" | "docx" => {
-            let content = feishu_fetch_raw_content(&client, &base_url, &token, &kind, &tok, lang)?;
-            Ok(content)
-        }
-        "sheet" => feishu_fetch_sheet_preview_text(
-            &client, &base_url, &token, &tok, max_rows, max_cols, max_sheets,
-        ),
-        other => Err(json_rpc_error(
-            -32602,
-            "Unsupported docs URL type (supported: wiki/doc/docx/sheets for now)",
-            Some(json!({ "url": url, "parsed_type": other, "parsed_token": tok })),
-        )),
-    }
+            "doc" | "docx" => feishu_fetch_raw_content(&client, &base_url, token, &kind, &tok, lang),
+            "sheet" => feishu_fetch_sheet_preview_text(
+                &client, &base_url, token, &tok, max_rows, max_cols, max_sheets,
+            ),
+            other => Err(json_rpc_error(
+                -32602,
+                "Unsupported docs URL type (supported: wiki/doc/docx/sheets for now)",
+                Some(json!({ "url": url, "parsed_type": other, "parsed_token": tok })),
+            )),
+        },
+    )
 }
 
 fn feishu_docs_export_text(args: &Value) -> Result<String, JsonRpcErr> {
@@ -689,15 +662,12 @@ fn feishu_docs_export_text(args: &Value) -> Result<String, JsonRpcErr> {
                 Some(json!({ "error": e.to_string() })),
             )
         })?;
-
-    let token = if let Some(tok) = resolve_user_access_token() {
-        tok
-    } else {
-        get_user_access_token_cached(&client, &base_url)?
-    };
-
-    let content =
-        feishu_fetch_raw_content(&client, &base_url, &token, &docs_type, &docs_token, lang)?;
+    let content = with_user_access_token(
+        &client,
+        &base_url,
+        "Missing user_access_token. Fetch requires OAuth once.",
+        |token| feishu_fetch_raw_content(&client, &base_url, token, &docs_type, &docs_token, lang),
+    )?;
 
     let dir = PathBuf::from(&out_dir);
     fs::create_dir_all(&dir).map_err(|e| {
@@ -1154,6 +1124,36 @@ fn feishu_fetch_raw_content(
     docs_token: &str,
     lang: i64,
 ) -> Result<String, JsonRpcErr> {
+    let content = feishu_fetch_raw_content_api(
+        client,
+        base_url,
+        user_access_token,
+        docs_type,
+        docs_token,
+        lang,
+    )?;
+
+    if docs_type != "docx" {
+        return Ok(content);
+    }
+
+    let blocks_text =
+        feishu_fetch_docx_blocks_text(client, base_url, user_access_token, docs_token)?;
+    if should_prefer_docx_blocks_render(&content, &blocks_text) {
+        Ok(blocks_text)
+    } else {
+        Ok(content)
+    }
+}
+
+fn feishu_fetch_raw_content_api(
+    client: &Client,
+    base_url: &str,
+    user_access_token: &str,
+    docs_type: &str,
+    docs_token: &str,
+    lang: i64,
+) -> Result<String, JsonRpcErr> {
     let (url, is_docx) = match docs_type {
         "docx" => (
             format!(
@@ -1240,6 +1240,511 @@ fn feishu_fetch_raw_content(
         .unwrap_or("")
         .to_string();
     Ok(content)
+}
+
+fn feishu_fetch_docx_blocks_text(
+    client: &Client,
+    base_url: &str,
+    user_access_token: &str,
+    document_id: &str,
+) -> Result<String, JsonRpcErr> {
+    let mut page_token: Option<String> = None;
+    let mut items = Vec::new();
+
+    loop {
+        let mut url = format!(
+            "{}/open-apis/docx/v1/documents/{}/blocks?page_size=500",
+            base_url.trim_end_matches('/'),
+            document_id.trim()
+        );
+        if let Some(token) = page_token.as_deref()
+            && !token.trim().is_empty()
+        {
+            url.push_str("&page_token=");
+            url.push_str(&url_encode_component(token.trim()));
+        }
+
+        let resp = client
+            .get(&url)
+            .header(
+                "Authorization",
+                format!("Bearer {}", user_access_token.trim()),
+            )
+            .header("Content-Type", "application/json; charset=utf-8")
+            .send()
+            .map_err(|e| {
+                json_rpc_error(
+                    -32000,
+                    "Failed to fetch docx blocks",
+                    Some(json!({ "error": e.to_string(), "document_id": document_id })),
+                )
+            })?;
+        let status = resp.status();
+        let text = resp.text().map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to read docx blocks response",
+                Some(json!({ "error": e.to_string(), "document_id": document_id })),
+            )
+        })?;
+        if !status.is_success() {
+            return Err(json_rpc_error(
+                -32000,
+                "docx blocks API returned non-success HTTP status",
+                Some(
+                    json!({ "status": status.as_u16(), "body": text, "document_id": document_id }),
+                ),
+            ));
+        }
+
+        let v: Value = serde_json::from_str(&text).map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "docx blocks response is not valid JSON",
+                Some(json!({ "error": e.to_string(), "body": text, "document_id": document_id })),
+            )
+        })?;
+        let code = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            return Err(json_rpc_error(
+                -32000,
+                "docx blocks API returned error code",
+                Some(v),
+            ));
+        }
+
+        let data = v.get("data").cloned().unwrap_or_else(|| json!({}));
+        if let Some(arr) = data.get("items").and_then(|v| v.as_array()) {
+            items.extend(arr.iter().cloned());
+        }
+
+        let has_more = data
+            .get("has_more")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let next_token = data
+            .get("page_token")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        if !has_more || next_token.is_none() {
+            break;
+        }
+        page_token = next_token;
+    }
+
+    Ok(render_docx_blocks_as_text(&items))
+}
+
+fn should_prefer_docx_blocks_render(raw_content: &str, blocks_text: &str) -> bool {
+    let raw = raw_content.trim();
+    let rendered = blocks_text.trim();
+    if rendered.is_empty() {
+        return false;
+    }
+    if raw.is_empty() {
+        return true;
+    }
+    if rendered == raw {
+        return false;
+    }
+
+    docx_blocks_text_has_non_text_placeholders(rendered)
+}
+
+fn docx_blocks_text_has_non_text_placeholders(s: &str) -> bool {
+    s.contains("[流程图]")
+        || s.contains("[UML 图]")
+        || s.contains("[文字绘图")
+        || s.contains("[图片")
+        || s.contains("[文件")
+        || s.contains("[思维笔记")
+        || s.contains("[电子表格")
+        || s.contains("[多维表格")
+        || s.contains("[嵌入内容")
+        || s.contains("[会话卡片")
+        || s.contains("[小组件")
+}
+
+fn render_docx_blocks_as_text(items: &[Value]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+
+    let mut by_id: HashMap<String, &Value> = HashMap::new();
+    let mut root_id = None::<String>;
+    for item in items {
+        if let Some(block_id) = item.get("block_id").and_then(|v| v.as_str()) {
+            if item
+                .get("parent_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .is_empty()
+            {
+                root_id = Some(block_id.to_string());
+            }
+            by_id.insert(block_id.to_string(), item);
+        }
+    }
+
+    let Some(root_id) = root_id.or_else(|| {
+        items
+            .first()
+            .and_then(|v| v.get("block_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    }) else {
+        return String::new();
+    };
+
+    let mut out = String::new();
+    render_docx_block_text(&root_id, &by_id, &mut out);
+    normalize_rendered_docx_text(&out)
+}
+
+fn render_docx_block_text(block_id: &str, by_id: &HashMap<String, &Value>, out: &mut String) {
+    let Some(block) = by_id.get(block_id).copied() else {
+        return;
+    };
+
+    let block_type = block
+        .get("block_type")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let line = render_docx_block_line(block);
+    if !line.is_empty() {
+        out.push_str(&line);
+        out.push('\n');
+    }
+
+    if block_type == 31 {
+        render_docx_table_cells(block, by_id, out);
+        return;
+    }
+
+    let children = block
+        .get("children")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for child in children {
+        if let Some(child_id) = child.as_str() {
+            render_docx_block_text(child_id, by_id, out);
+        }
+    }
+}
+
+fn render_docx_table_cells(block: &Value, by_id: &HashMap<String, &Value>, out: &mut String) {
+    let cells = block
+        .get("table")
+        .and_then(|v| v.get("cells"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let col_size = block
+        .get("table")
+        .and_then(|v| v.get("property"))
+        .and_then(|v| v.get("column_size"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    if cells.is_empty() || col_size == 0 {
+        return;
+    }
+
+    let mut row: Vec<String> = Vec::new();
+    for cell in cells {
+        let Some(cell_id) = cell.as_str() else {
+            continue;
+        };
+        let cell_text = render_docx_table_cell_text(cell_id, by_id);
+        row.push(cell_text);
+        if row.len() >= col_size {
+            out.push_str(&row.join("\t"));
+            out.push('\n');
+            row.clear();
+        }
+    }
+    if !row.is_empty() {
+        out.push_str(&row.join("\t"));
+        out.push('\n');
+    }
+}
+
+fn render_docx_table_cell_text(cell_id: &str, by_id: &HashMap<String, &Value>) -> String {
+    let Some(block) = by_id.get(cell_id).copied() else {
+        return String::new();
+    };
+
+    let direct = render_text_elements(
+        block
+            .get("table_cell")
+            .and_then(|v| v.get("elements"))
+            .or_else(|| block.get("text").and_then(|v| v.get("elements"))),
+    );
+    if !direct.is_empty() {
+        return direct;
+    }
+
+    let mut parts = Vec::new();
+    let children = block
+        .get("children")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for child in children {
+        let Some(child_id) = child.as_str() else {
+            continue;
+        };
+        let Some(child_block) = by_id.get(child_id).copied() else {
+            continue;
+        };
+        let line = render_docx_block_line(child_block);
+        if !line.is_empty() {
+            parts.push(line);
+        }
+    }
+    parts.join(" ")
+}
+
+fn render_docx_block_line(block: &Value) -> String {
+    let block_type = block
+        .get("block_type")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    match block_type {
+        1 => render_text_elements(block.get("page").and_then(|v| v.get("elements"))),
+        2 => render_text_elements(block.get("text").and_then(|v| v.get("elements"))),
+        3..=11 => {
+            let level = (block_type - 2) as usize;
+            let text = render_text_elements(
+                block
+                    .get(format!("heading{}", level).as_str())
+                    .and_then(|v| v.get("elements")),
+            );
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!("{} {}", "#".repeat(level), text)
+            }
+        }
+        12 => {
+            let text = render_text_elements(block.get("bullet").and_then(|v| v.get("elements")));
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!("- {}", text)
+            }
+        }
+        13 => {
+            let text = render_text_elements(block.get("ordered").and_then(|v| v.get("elements")));
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!("1. {}", text)
+            }
+        }
+        14 => {
+            let text = render_text_elements(block.get("code").and_then(|v| v.get("elements")));
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!("```text\n{}\n```", text)
+            }
+        }
+        15 => {
+            let text = render_text_elements(block.get("quote").and_then(|v| v.get("elements")));
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!("> {}", text)
+            }
+        }
+        17 => {
+            let todo = block.get("todo");
+            let text = render_text_elements(todo.and_then(|v| v.get("elements")));
+            let checked = todo
+                .and_then(|v| v.get("style"))
+                .and_then(|v| v.get("done"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if text.is_empty() {
+                String::new()
+            } else {
+                format!("- [{}] {}", if checked { "x" } else { " " }, text)
+            }
+        }
+        18 => render_token_placeholder(block.get("bitable"), "token", "多维表格"),
+        19 => {
+            let text = render_text_elements(block.get("callout").and_then(|v| v.get("elements")));
+            if text.is_empty() {
+                "[高亮块]".to_string()
+            } else {
+                format!("[高亮块] {}", text)
+            }
+        }
+        20 => "[会话卡片]".to_string(),
+        21 => render_diagram_placeholder(block),
+        22 => "---".to_string(),
+        23 => render_named_placeholder(block.get("file"), "name", "文件"),
+        24 | 25 | 26 | 32 | 33 | 34 | 35 | 36 | 37 => String::new(),
+        27 => render_token_placeholder(block.get("image"), "token", "图片"),
+        28 => "[小组件]".to_string(),
+        29 => render_token_placeholder(block.get("mindnote"), "token", "思维笔记"),
+        30 => render_token_placeholder(block.get("sheet"), "token", "电子表格"),
+        31 => String::new(),
+        43 => render_token_placeholder(block.get("board"), "token", "文字绘图"),
+        _ => String::new(),
+    }
+}
+
+fn render_diagram_placeholder(block: &Value) -> String {
+    let diagram_type = block
+        .get("diagram")
+        .and_then(|v| v.get("diagram_type"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    match diagram_type {
+        1 => "[流程图]".to_string(),
+        2 => "[UML 图]".to_string(),
+        _ => "[文字绘图]".to_string(),
+    }
+}
+
+fn render_named_placeholder(container: Option<&Value>, field: &str, label: &str) -> String {
+    let name = container
+        .and_then(|v| v.get(field))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        format!("[{}]", label)
+    } else {
+        format!("[{}: {}]", label, name)
+    }
+}
+
+fn render_token_placeholder(container: Option<&Value>, field: &str, label: &str) -> String {
+    let token = container
+        .and_then(|v| v.get(field))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        format!("[{}]", label)
+    } else {
+        format!("[{}: {}]", label, token)
+    }
+}
+
+fn render_text_elements(elements: Option<&Value>) -> String {
+    let Some(arr) = elements.and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+
+    let mut out = String::new();
+    for el in arr {
+        if let Some(v) = el
+            .get("text_run")
+            .and_then(|v| v.get("content"))
+            .and_then(|v| v.as_str())
+        {
+            out.push_str(v);
+            continue;
+        }
+        if let Some(v) = el
+            .get("equation")
+            .and_then(|v| v.get("content"))
+            .and_then(|v| v.as_str())
+        {
+            out.push_str(v);
+            continue;
+        }
+        if let Some(v) = el
+            .get("mention_user")
+            .and_then(|v| {
+                v.get("user_name")
+                    .or_else(|| v.get("name"))
+                    .or_else(|| v.get("title"))
+            })
+            .and_then(|v| v.as_str())
+        {
+            out.push('@');
+            out.push_str(v);
+            continue;
+        }
+        if let Some(v) = el
+            .get("mention_doc")
+            .and_then(|v| {
+                v.get("title")
+                    .or_else(|| v.get("obj_type"))
+                    .or_else(|| v.get("token"))
+            })
+            .and_then(|v| v.as_str())
+        {
+            out.push_str(v);
+            continue;
+        }
+        if let Some(v) = el
+            .get("reminder")
+            .and_then(|v| v.get("notify_time"))
+            .and_then(|v| v.as_str())
+        {
+            out.push_str("[提醒:");
+            out.push_str(v);
+            out.push(']');
+            continue;
+        }
+        if let Some(v) = el
+            .get("file")
+            .and_then(|v| {
+                v.get("name")
+                    .or_else(|| v.get("file_token"))
+                    .or_else(|| v.get("token"))
+            })
+            .and_then(|v| v.as_str())
+        {
+            out.push_str("[附件:");
+            out.push_str(v);
+            out.push(']');
+            continue;
+        }
+        if let Some(v) = el
+            .get("inline_block")
+            .and_then(|v| {
+                v.get("block_id")
+                    .or_else(|| v.get("token"))
+                    .or_else(|| v.get("url"))
+            })
+            .and_then(|v| v.as_str())
+        {
+            out.push_str("[内联块:");
+            out.push_str(v);
+            out.push(']');
+        }
+    }
+    out.trim().to_string()
+}
+
+fn normalize_rendered_docx_text(s: &str) -> String {
+    let mut out = String::new();
+    let mut blank_run = 0usize;
+    for line in s.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            blank_run += 1;
+            if blank_run <= 1 {
+                out.push('\n');
+            }
+            continue;
+        }
+        blank_run = 0;
+        out.push_str(trimmed);
+        out.push('\n');
+    }
+    out.trim().to_string()
 }
 
 fn do_docs_search_request(
@@ -1348,6 +1853,22 @@ fn resolve_refresh_token() -> Option<String> {
     load_token_store().ok().and_then(|s| s.refresh_token)
 }
 
+fn resolve_stored_user_access_token() -> Option<(String, Option<i64>)> {
+    let store = load_token_store().ok()?;
+    let token = store.user_access_token?.trim().to_string();
+    if token.is_empty() || !token.starts_with("u-") {
+        return None;
+    }
+    let expires_at = store.user_access_token_expires_at_epoch_ms;
+    if let Some(epoch_ms) = expires_at
+        && epoch_ms > 0
+        && epoch_ms <= epoch_ms_now() + 300_000
+    {
+        return None;
+    }
+    Some((token, expires_at))
+}
+
 fn resolve_app_credentials() -> Option<(String, String)> {
     let env_id = std::env::var("FEISHU_APP_ID")
         .ok()
@@ -1383,6 +1904,152 @@ fn get_user_access_token_cached(client: &Client, base_url: &str) -> Result<Strin
         return Ok(cached.token.clone());
     }
     refresh_user_access_token_and_cache(client, base_url)
+}
+
+fn cache_user_access_token(token: &str, expires_at_epoch_ms: Option<i64>) {
+    if token.trim().is_empty() {
+        return;
+    }
+    let expires_at = match expires_at_epoch_ms {
+        Some(ms) if ms > epoch_ms_now() => {
+            Instant::now() + Duration::from_millis(ms.saturating_sub(epoch_ms_now()) as u64)
+        }
+        _ => Instant::now() + Duration::from_secs(600),
+    };
+    let cache = USER_TOKEN_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(CachedToken {
+            token: token.trim().to_string(),
+            expires_at,
+        });
+    }
+}
+
+fn acquire_user_access_token(client: &Client, base_url: &str) -> Result<String, JsonRpcErr> {
+    if let Some(tok) = resolve_user_access_token() {
+        return Ok(tok);
+    }
+    if let Some((tok, expires_at_epoch_ms)) = resolve_stored_user_access_token() {
+        cache_user_access_token(&tok, expires_at_epoch_ms);
+        return Ok(tok);
+    }
+    get_user_access_token_cached(client, base_url)
+}
+
+fn with_user_access_token<T, F>(
+    client: &Client,
+    base_url: &str,
+    missing_message: &str,
+    mut op: F,
+) -> Result<T, JsonRpcErr>
+where
+    F: FnMut(&str) -> Result<T, JsonRpcErr>,
+{
+    let primary = acquire_user_access_token(client, base_url).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            missing_message,
+            Some(json!({
+                "detail": e.message,
+                "next_steps": ["oauth_authorize_url", "oauth_wait_local_code", "oauth_exchange_code"],
+                "token_store": token_store_path().display().to_string()
+            })),
+        )
+    })?;
+
+    let mut err = match op(&primary) {
+        Ok(v) => return Ok(v),
+        Err(err) => err,
+    };
+    if !is_invalid_user_access_token_error(&err) {
+        return Err(err);
+    }
+
+    if let Some((stored, expires_at_epoch_ms)) = resolve_stored_user_access_token()
+        && stored != primary
+    {
+        cache_user_access_token(&stored, expires_at_epoch_ms);
+        match op(&stored) {
+            Ok(v) => return Ok(v),
+            Err(next_err) => {
+                if !is_invalid_user_access_token_error(&next_err) {
+                    return Err(next_err);
+                }
+                err = next_err;
+            }
+        }
+    }
+
+    if let Ok(refreshed) = refresh_user_access_token_and_cache(client, base_url)
+        && refreshed != primary
+    {
+        match op(&refreshed) {
+            Ok(v) => return Ok(v),
+            Err(next_err) => err = next_err,
+        }
+    }
+
+    if is_invalid_user_access_token_error(&err) {
+        Err(invalid_user_access_token_error(err))
+    } else {
+        Err(err)
+    }
+}
+
+fn is_invalid_user_access_token_error(err: &JsonRpcErr) -> bool {
+    if err.message.contains("Invalid access token") {
+        return true;
+    }
+    extract_feishu_error_code(err.data.as_ref()) == Some(99991668)
+}
+
+fn extract_feishu_error_code(data: Option<&Value>) -> Option<i64> {
+    let data = data?;
+    if let Some(code) = data.get("feishu_code").and_then(|v| v.as_i64()) {
+        return Some(code);
+    }
+    if let Some(code) = data.get("code").and_then(|v| v.as_i64()) {
+        return Some(code);
+    }
+    let body = data.get("body").and_then(|v| v.as_str())?;
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("code").and_then(|x| x.as_i64()))
+}
+
+fn extract_feishu_error_message(data: Option<&Value>) -> Option<String> {
+    let data = data?;
+    if let Some(msg) = data.get("msg").and_then(|v| v.as_str()) {
+        return Some(msg.trim().to_string());
+    }
+    let body = data.get("body").and_then(|v| v.as_str())?;
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("msg").and_then(|x| x.as_str()).map(|s| s.trim().to_string()))
+}
+
+fn invalid_user_access_token_error(err: JsonRpcErr) -> JsonRpcErr {
+    let status = err
+        .data
+        .as_ref()
+        .and_then(|v| v.get("status"))
+        .and_then(|v| v.as_u64());
+    let feishu_code = extract_feishu_error_code(err.data.as_ref());
+    let msg = extract_feishu_error_message(err.data.as_ref()).unwrap_or(err.message);
+    json_rpc_error(
+        -32000,
+        "Invalid access token. Provide a valid user_access_token or set refresh_token for automatic refresh.",
+        Some(json!({
+            "status": status,
+            "feishu_code": feishu_code,
+            "msg": msg,
+            "token_store": token_store_path().display().to_string(),
+            "next_steps": [
+                "If you have refresh_token: call oauth_refresh_user_access_token, then update FEISHU_USER_ACCESS_TOKEN (or set FEISHU_REFRESH_TOKEN for auto refresh)",
+                "Otherwise: run oauth_authorize_url -> oauth_wait_local_code -> oauth_exchange_code"
+            ]
+        })),
+    )
 }
 
 fn refresh_user_access_token_and_cache(
@@ -2235,4 +2902,177 @@ fn write_json_rpc_error(
     });
     writeln!(out, "{payload}")?;
     out.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn invalid_token_err() -> JsonRpcErr {
+        json_rpc_error(
+            -32000,
+            "raw_content API returned non-success HTTP status",
+            Some(json!({
+                "status": 400,
+                "body": "{\"code\":99991668,\"msg\":\"Invalid access token for authorization. Please make a request with token attached.\"}"
+            })),
+        )
+    }
+
+    #[test]
+    fn render_docx_blocks_keeps_diagram_placeholder_near_heading() {
+        let items = vec![
+            json!({
+                "block_id": "root",
+                "block_type": 1,
+                "parent_id": "",
+                "children": ["h2", "diagram"],
+                "page": { "elements": [] }
+            }),
+            json!({
+                "block_id": "h2",
+                "block_type": 4,
+                "parent_id": "root",
+                "heading2": {
+                    "elements": [
+                        { "text_run": { "content": "6.1 文字绘图", "text_element_style": {} } }
+                    ]
+                }
+            }),
+            json!({
+                "block_id": "diagram",
+                "block_type": 21,
+                "parent_id": "root",
+                "diagram": { "diagram_type": 1 }
+            }),
+        ];
+
+        let rendered = render_docx_blocks_as_text(&items);
+        assert!(rendered.contains("## 6.1 文字绘图"));
+        assert!(rendered.contains("[流程图]"));
+        assert!(rendered.find("## 6.1 文字绘图") < rendered.find("[流程图]"));
+    }
+
+    #[test]
+    fn prefer_blocks_render_when_special_blocks_would_be_lost() {
+        let raw = "## 6.1 文字绘图";
+        let rendered = "## 6.1 文字绘图\n[流程图]";
+        assert!(should_prefer_docx_blocks_render(raw, rendered));
+        assert!(!should_prefer_docx_blocks_render(raw, raw));
+    }
+
+    #[test]
+    fn render_docx_blocks_keeps_board_placeholders_after_heading() {
+        let items = vec![
+            json!({
+                "block_id": "root",
+                "block_type": 1,
+                "parent_id": "",
+                "children": ["h3", "board1", "board2"],
+                "page": { "elements": [] }
+            }),
+            json!({
+                "block_id": "h3",
+                "block_type": 5,
+                "parent_id": "root",
+                "heading3": {
+                    "elements": [
+                        { "text_run": { "content": "6.1. 系统架构图", "text_element_style": {} } }
+                    ]
+                }
+            }),
+            json!({
+                "block_id": "board1",
+                "block_type": 43,
+                "parent_id": "root",
+                "board": { "token": "board-token-1" }
+            }),
+            json!({
+                "block_id": "board2",
+                "block_type": 43,
+                "parent_id": "root",
+                "board": { "token": "board-token-2" }
+            }),
+        ];
+
+        let rendered = render_docx_blocks_as_text(&items);
+        assert!(rendered.contains("### 6.1. 系统架构图"));
+        assert!(rendered.contains("[文字绘图: board-token-1]"));
+        assert!(rendered.contains("[文字绘图: board-token-2]"));
+        assert!(
+            rendered.find("### 6.1. 系统架构图") < rendered.find("[文字绘图: board-token-1]")
+        );
+    }
+
+    #[test]
+    fn detects_invalid_user_access_token_from_raw_body() {
+        assert!(is_invalid_user_access_token_error(&invalid_token_err()));
+    }
+
+    #[test]
+    fn with_user_access_token_falls_back_to_token_store_when_env_token_is_stale() {
+        let _guard = env_lock().lock().unwrap();
+        let token_store_path = format!(
+            "/tmp/mcp_feishu_token_test_{}_{}.json",
+            std::process::id(),
+            epoch_ms_now()
+        );
+        let old_env_token_store_path = std::env::var("FEISHU_TOKEN_STORE_PATH").ok();
+        let old_env_user_token = std::env::var("FEISHU_USER_ACCESS_TOKEN").ok();
+        let _ = fs::remove_file(&token_store_path);
+
+        unsafe {
+            std::env::set_var("FEISHU_TOKEN_STORE_PATH", &token_store_path);
+            std::env::set_var("FEISHU_USER_ACCESS_TOKEN", "u-stale-token");
+        }
+
+        save_token_store(&TokenStore {
+            user_access_token: Some("u-fresh-token".to_string()),
+            user_access_token_expires_at_epoch_ms: Some(epoch_ms_now() + 3_600_000),
+            refresh_token: None,
+            refresh_token_expires_in: None,
+            updated_at_epoch_ms: Some(epoch_ms_now()),
+        })
+        .unwrap();
+
+        let client = Client::builder().build().unwrap();
+        let mut seen = Vec::new();
+        let result = with_user_access_token(
+            &client,
+            "https://open.feishu.cn",
+            "Missing user_access_token. Fetch requires OAuth once.",
+            |token| {
+                seen.push(token.to_string());
+                if token == "u-stale-token" {
+                    Err(invalid_token_err())
+                } else {
+                    Ok(token.to_string())
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result, "u-fresh-token");
+        assert_eq!(seen, vec!["u-stale-token", "u-fresh-token"]);
+
+        let _ = fs::remove_file(&token_store_path);
+        unsafe {
+            if let Some(v) = old_env_token_store_path {
+                std::env::set_var("FEISHU_TOKEN_STORE_PATH", v);
+            } else {
+                std::env::remove_var("FEISHU_TOKEN_STORE_PATH");
+            }
+            if let Some(v) = old_env_user_token {
+                std::env::set_var("FEISHU_USER_ACCESS_TOKEN", v);
+            } else {
+                std::env::remove_var("FEISHU_USER_ACCESS_TOKEN");
+            }
+        }
+    }
 }
