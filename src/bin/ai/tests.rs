@@ -304,11 +304,15 @@ fn session_delete_removes_sqlite_sidecars() {
     std::fs::write(PathBuf::from(format!("{}-wal", db.display())), b"test").unwrap();
     std::fs::write(PathBuf::from(format!("{}-shm", db.display())), b"test").unwrap();
     std::fs::write(PathBuf::from(format!("{}-journal", db.display())), b"test").unwrap();
+    let assets = store.session_assets_dir("abc");
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("paste.png"), b"test").unwrap();
 
     assert!(db.exists());
     assert!(PathBuf::from(format!("{}-wal", db.display())).exists());
     assert!(PathBuf::from(format!("{}-shm", db.display())).exists());
     assert!(PathBuf::from(format!("{}-journal", db.display())).exists());
+    assert!(assets.exists());
 
     assert!(store.delete_session("abc").unwrap());
 
@@ -316,6 +320,7 @@ fn session_delete_removes_sqlite_sidecars() {
     assert!(!PathBuf::from(format!("{}-wal", db.display())).exists());
     assert!(!PathBuf::from(format!("{}-shm", db.display())).exists());
     assert!(!PathBuf::from(format!("{}-journal", db.display())).exists());
+    assert!(!assets.exists());
 }
 
 #[test]
@@ -331,6 +336,9 @@ fn session_clear_all_removes_all_sqlite_sidecars() {
         std::fs::write(PathBuf::from(format!("{}-wal", db.display())), b"test").unwrap();
         std::fs::write(PathBuf::from(format!("{}-shm", db.display())), b"test").unwrap();
         std::fs::write(PathBuf::from(format!("{}-journal", db.display())), b"test").unwrap();
+        let assets = store.session_assets_dir(id);
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("paste.png"), b"test").unwrap();
     }
 
     let deleted = store.clear_all_sessions().unwrap();
@@ -342,11 +350,14 @@ fn session_clear_all_removes_all_sqlite_sidecars() {
         assert!(!PathBuf::from(format!("{}-wal", db.display())).exists());
         assert!(!PathBuf::from(format!("{}-shm", db.display())).exists());
         assert!(!PathBuf::from(format!("{}-journal", db.display())).exists());
+        let assets = store.session_assets_dir(id);
+        assert!(!assets.exists());
     }
 }
 
 #[test]
 fn thinking_chunks_are_wrapped_once() {
+    colored::control::set_override(false);
     let chunk = StreamChunk {
         choices: vec![StreamChoice {
             delta: StreamDelta {

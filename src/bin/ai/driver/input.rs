@@ -71,6 +71,30 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
     Ok(Some(ctx))
 }
 
+const IMAGE_PLACEHOLDER_PREFIX: &str = "[[image:";
+const IMAGE_PLACEHOLDER_SUFFIX: &str = "]]";
+
+fn extract_inline_image_paths(question: &mut String) -> Vec<String> {
+    let mut images = Vec::new();
+    loop {
+        let Some(start) = question.find(IMAGE_PLACEHOLDER_PREFIX) else {
+            break;
+        };
+        let search_start = start + IMAGE_PLACEHOLDER_PREFIX.len();
+        let Some(end_rel) = question[search_start..].find(IMAGE_PLACEHOLDER_SUFFIX) else {
+            break;
+        };
+        let end = search_start + end_rel;
+        let path = question[search_start..end].trim().to_string();
+        if !path.is_empty() {
+            images.push(path);
+        }
+        let remove_end = end + IMAGE_PLACEHOLDER_SUFFIX.len();
+        question.replace_range(start..remove_end, "");
+    }
+    images
+}
+
 fn apply_text_files_prefix(
     question: &mut String,
     text_files: &[String],
@@ -162,13 +186,17 @@ fn finalize_question(
     history_count: usize,
     loop_short_output: bool,
 ) -> Result<QuestionContext, Box<dyn Error>> {
+    let mut inline_images = extract_inline_image_paths(&mut question);
     if let Some(files) = app.pending_files.take() {
         let parsed = files::parse_files(&files);
         apply_text_files_prefix(&mut question, &parsed.text_files)?;
         if !parsed.image_files.is_empty() {
-            app.attached_image_files = parsed.image_files;
+            inline_images.extend(parsed.image_files);
         }
         handle_binary_files(&mut question, parsed.binary_files)?;
+    }
+    if !inline_images.is_empty() {
+        app.attached_image_files = inline_images;
     }
 
     if app.pending_clipboard {

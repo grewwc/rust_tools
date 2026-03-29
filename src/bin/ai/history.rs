@@ -152,6 +152,14 @@ pub(super) fn delete_history_artifacts(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+fn delete_assets_dir(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
 fn is_sqlite_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|s| s.to_str()),
@@ -505,6 +513,11 @@ impl SessionStore {
         self.root.join(format!("{id}.sqlite"))
     }
 
+    pub(super) fn session_assets_dir(&self, session_id: &str) -> PathBuf {
+        let id = sanitize_session_id(session_id);
+        self.root.join(format!("{id}.assets"))
+    }
+
     pub(super) fn list_sessions(&self) -> io::Result<Vec<SessionInfo>> {
         let entries = match fs::read_dir(&self.root) {
             Ok(v) => v,
@@ -544,14 +557,18 @@ impl SessionStore {
 
     pub(super) fn delete_session(&self, session_id: &str) -> io::Result<bool> {
         let path = self.session_history_file(session_id);
+        let assets = self.session_assets_dir(session_id);
         let existed = path.exists();
         delete_history_artifacts(&path)?;
+        let _ = delete_assets_dir(&assets);
         Ok(existed)
     }
 
     pub(super) fn clear_session(&self, session_id: &str) -> io::Result<()> {
         let path = self.session_history_file(session_id);
+        let assets = self.session_assets_dir(session_id);
         let _ = delete_history_artifacts(&path);
+        let _ = delete_assets_dir(&assets);
         Ok(())
     }
 

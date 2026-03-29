@@ -1,18 +1,22 @@
 use std::{
     fs,
     io::{self, BufRead, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use rustyline::{DefaultEditor, error::ReadlineError};
+use uuid::Uuid;
 
 use crate::common::utils::expanduser;
+use crate::clipboard::image_content;
+use super::history::SessionStore;
 
 const LINE_REPL_HISTORY_FILE: &str = "~/.liner_histroy";
 
 pub(super) struct PromptEditor {
     pub(super) editor: Option<DefaultEditor>,
     pub(super) history_path: PathBuf,
+    session_image_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -23,7 +27,7 @@ pub(super) struct MultilineHistoryState {
 }
 
 impl PromptEditor {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(session_id: &str, history_file: &Path) -> Self {
         let mut editor = DefaultEditor::new().ok();
         let history_path = PathBuf::from(expanduser(LINE_REPL_HISTORY_FILE).as_ref());
         if history_path.exists()
@@ -31,9 +35,11 @@ impl PromptEditor {
         {
             let _ = editor.load_history(&history_path);
         }
+        let session_image_dir = SessionStore::new(history_file).session_assets_dir(session_id);
         Self {
             editor,
             history_path,
+            session_image_dir,
         }
     }
 
@@ -101,7 +107,8 @@ impl PromptEditor {
 
     fn read_multi_line_tui(&mut self) -> io::Result<Option<String>> {
         use crossterm::{
-            event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+            event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
+            execute,
             terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size},
         };
         use ratatui::{
@@ -115,6 +122,7 @@ impl PromptEditor {
         use tui_textarea::{CursorMove, Input, TextArea};
 
         enable_raw_mode()?;
+        let _ = execute!(io::stdout(), EnableBracketedPaste);
 
         let viewport_height = terminal_size()
             .map(|(_, h)| h.saturating_sub(10).clamp(12, 24))
@@ -137,6 +145,7 @@ impl PromptEditor {
         let result: io::Result<Option<String>> = (|| {
             let mut textarea: TextArea = TextArea::default();
             let mut history = MultilineHistoryState::new(self.multiline_history_entries());
+            let mut accept_release = false;
 
             loop {
                 terminal
@@ -189,7 +198,9 @@ impl PromptEditor {
                                     Span::styled("Ctrl+P/N", Style::default().fg(Color::Blue)),
                                     Span::raw(" history  ·  "),
                                     Span::styled("Backspace", Style::default().fg(Color::Blue)),
-                                    Span::raw(" edits previous lines"),
+                                    Span::raw(" edits previous lines  ·  "),
+                                    Span::styled("Paste", Style::default().fg(Color::Blue)),
+                                    Span::raw(" image"),
                                 ]),
                             ]),
                             chunks[1],
@@ -198,9 +209,24 @@ impl PromptEditor {
                     .map_err(|e| io::Error::other(e.to_string()))?;
 
                 match event::read().map_err(|e| io::Error::other(e.to_string()))? {
-                    Event::Key(key)
-                        if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
-                    {
+                    Event::Paste(pasted) => {
+                        if let Ok(Some(path)) = save_clipboard_image(&self.session_image_dir) {
+                            let placeholder = image_placeholder(&path);
+                            insert_text(&mut textarea, &placeholder);
+                        } else {
+                            insert_text(&mut textarea, &pasted);
+                        }
+                    }
+                    Event::Key(mut key) => {
+                        if key.kind == KeyEventKind::Release {
+                            accept_release = true;
+                            key.kind = KeyEventKind::Press;
+                        } else if key.kind != KeyEventKind::Press
+                            && key.kind != KeyEventKind::Repeat
+                            && !accept_release
+                        {
+                            continue;
+                        }
                         match (key.code, key.modifiers) {
                             (code, modifiers) if is_submit_key(code, modifiers) => {
                                 let content = textarea_content(&textarea);
@@ -271,7 +297,6 @@ impl PromptEditor {
                             }
                         }
                     }
-                    Event::Key(_) => {}
                     _ => {}
                 }
             }
@@ -279,6 +304,7 @@ impl PromptEditor {
 
         let _ = terminal.clear();
         let _ = terminal.show_cursor();
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = disable_raw_mode();
 
         let result = match result {
@@ -380,6 +406,26 @@ fn centered_rect(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatu
 fn replace_textarea_content(textarea: &mut tui_textarea::TextArea<'_>, content: &str) {
     let lines = content.split('\n').map(|line| line.to_string()).collect();
     *textarea = tui_textarea::TextArea::new(lines);
+}
+
+fn insert_text(textarea: &mut tui_textarea::TextArea<'_>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    textarea.insert_str(text);
+}
+
+fn image_placeholder(path: &Path) -> String {
+    format!("[[image:{}]]", path.display())
+}
+
+fn save_clipboard_image(dir: &Path) -> io::Result<Option<PathBuf>> {
+    fs::create_dir_all(dir)?;
+    let path = dir.join(format!("paste-{}.png", Uuid::new_v4()));
+    match image_content::save_to_file(path.to_string_lossy().as_ref()) {
+        Ok(()) => Ok(Some(path)),
+        Err(_) => Ok(None),
+    }
 }
 
 fn is_submit_key(

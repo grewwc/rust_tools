@@ -17,7 +17,7 @@ use crate::ai::{
     config,
     history::{
         Message, SessionStore, append_history_messages, build_message_arr,
-        compress_messages_for_context, delete_history_artifacts,
+        compress_messages_for_context,
     },
     mcp::McpClient,
     models,
@@ -180,7 +180,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let current_model = models::initial_model(&cli);
     let client = reqwest::blocking::Client::builder().build()?;
     let prompt_editor = if cli.args.is_empty() {
-        Some(PromptEditor::new())
+        Some(PromptEditor::new(&session_id, config.history_file.as_path()))
     } else {
         None
     };
@@ -249,7 +249,8 @@ fn run_loop(
 
     let cleanup_one_shot = |app: &App| {
         if one_shot_mode {
-            let _ = delete_history_artifacts(&app.session_history_file);
+            let store = SessionStore::new(app.config.history_file.as_path());
+            let _ = store.delete_session(&app.session_id);
         }
     };
     loop {

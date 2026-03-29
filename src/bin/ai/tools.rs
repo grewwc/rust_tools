@@ -775,7 +775,7 @@ fn execute_read_file(args: &Value) -> Result<String, String> {
     let content = fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))?;
 
     let lines: Vec<&str> = content.lines().collect();
-    let start = offset.saturating_sub(1);
+    let start = offset.saturating_sub(1).min(lines.len());
     let end = (start + limit).min(lines.len());
 
     let result: Vec<String> = lines[start..end]
