@@ -1,5 +1,5 @@
 use std::io::{self, BufRead, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
@@ -1700,16 +1700,34 @@ fn feishu_oauth_wait_local_code(args: &Value) -> Result<String, JsonRpcErr> {
         .and_then(|v| v.as_i64())
         .unwrap_or(180)
         .clamp(1, 600) as u64;
-    let addr = format!("127.0.0.1:{port}");
-
-    let listener = TcpListener::bind(&addr).map_err(|e| {
-        json_rpc_error(
+    let mut listeners: Vec<TcpListener> = Vec::new();
+    let addr4 = format!("127.0.0.1:{port}");
+    match TcpListener::bind(&addr4) {
+        Ok(l) => {
+            l.set_nonblocking(true).ok();
+            listeners.push(l);
+        }
+        Err(e) => {
+            let _ = e;
+        }
+    }
+    let addr6 = format!("[::1]:{port}");
+    match TcpListener::bind(&addr6) {
+        Ok(l) => {
+            l.set_nonblocking(true).ok();
+            listeners.push(l);
+        }
+        Err(e) => {
+            let _ = e;
+        }
+    }
+    if listeners.is_empty() {
+        return Err(json_rpc_error(
             -32000,
             "Failed to bind local callback port",
-            Some(json!({ "addr": addr, "error": e.to_string() })),
-        )
-    })?;
-    listener.set_nonblocking(true).ok();
+            Some(json!({ "port": port, "addrs": [addr4, addr6] })),
+        ));
+    }
 
     let (tx, rx) = mpsc::channel::<String>();
     std::thread::spawn(move || {
@@ -1718,33 +1736,55 @@ fn feishu_oauth_wait_local_code(args: &Value) -> Result<String, JsonRpcErr> {
             if Instant::now() >= deadline {
                 break;
             }
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                    let mut buf = [0u8; 2048];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let code = extract_code_from_http_request(&req).unwrap_or_default();
-                    let body = if code.is_empty() {
-                        "<html><body>Missing code</body></html>"
-                    } else {
-                        "<html><body>OK. You can close this tab.</body></html>"
-                    };
-                    let _ = stream.write_all(format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
-                        body.len(),
-                        body
-                    ).as_bytes());
-                    let _ = stream.flush();
-                    if !code.is_empty() {
-                        let _ = tx.send(code);
-                        return;
+            let mut accepted: Option<TcpStream> = None;
+            for listener in &listeners {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        accepted = Some(stream);
+                        break;
                     }
-                }
-                Err(_) => {
-                    std::thread::sleep(Duration::from_millis(50));
+                    Err(_) => {}
                 }
             }
+
+            let Some(mut stream) = accepted else {
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            };
+
+            let req = read_http_request(&mut stream);
+            let code = parse_oauth_code_from_http_request(&req).unwrap_or_default();
+            if !code.is_empty() {
+                let body = "<html><body>OK. You can close this tab.</body></html>";
+                let _ = write_http_response(&mut stream, body);
+                let _ = tx.send(code);
+                return;
+            }
+
+            let body = r#"<html><head><meta charset="utf-8"></head><body>
+<div>Waiting for OAuth code...</div>
+<script>
+  (function () {
+    try {
+      var url = new URL(window.location.href);
+      var code = url.searchParams.get('code');
+      if (!code && window.location.hash && window.location.hash.length > 1) {
+        var hash = window.location.hash.substring(1);
+        var params = new URLSearchParams(hash);
+        code = params.get('code');
+      }
+      if (code) {
+        url.hash = '';
+        url.searchParams.set('code', code);
+        window.location.replace(url.toString());
+        return;
+      }
+    } catch (e) {}
+    document.body.innerHTML = '<div>Missing code. If you see a "code" in the URL, copy it and paste back into the CLI.</div>';
+  })();
+</script>
+</body></html>"#;
+            let _ = write_http_response(&mut stream, body);
         }
     });
 
@@ -1758,12 +1798,71 @@ fn feishu_oauth_wait_local_code(args: &Value) -> Result<String, JsonRpcErr> {
     }
 }
 
-fn extract_code_from_http_request(req: &str) -> Option<String> {
+fn read_http_request(stream: &mut TcpStream) -> String {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
+    let mut out: Vec<u8> = Vec::with_capacity(2048);
+    let mut buf = [0u8; 1024];
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if Instant::now() >= deadline || out.len() >= 16_384 {
+            break;
+        }
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                out.extend_from_slice(&buf[..n]);
+                if out.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn write_http_response(stream: &mut TcpStream, body: &str) -> io::Result<()> {
+    let bytes = body.as_bytes();
+    stream.write_all(
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            bytes.len()
+        )
+        .as_bytes(),
+    )?;
+    stream.write_all(bytes)?;
+    stream.flush()
+}
+
+fn parse_oauth_code_from_http_request(req: &str) -> Option<String> {
     let first = req.lines().next()?.trim();
-    let first = first.strip_prefix("GET ")?;
-    let path = first.split_whitespace().next().unwrap_or("");
-    let qidx = path.find('?')?;
-    let query = &path[qidx + 1..];
+    let mut parts = first.split_whitespace();
+    let _method = parts.next()?;
+    let target = parts.next().unwrap_or("");
+    if let Some(code) = parse_oauth_code_from_urlish(target) {
+        return Some(code);
+    }
+    if let Some(idx) = req.find("\r\n\r\n") {
+        let body = &req[idx + 4..];
+        if let Some(code) = parse_oauth_code_from_query(body) {
+            return Some(code);
+        }
+    }
+    None
+}
+
+fn parse_oauth_code_from_urlish(target: &str) -> Option<String> {
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let without_fragment = target.split('#').next().unwrap_or(target);
+    let qidx = without_fragment.find('?')?;
+    let query = &without_fragment[qidx + 1..];
+    parse_oauth_code_from_query(query)
+}
+
+fn parse_oauth_code_from_query(query: &str) -> Option<String> {
     for part in query.split('&') {
         let mut it = part.splitn(2, '=');
         let k = it.next().unwrap_or("");

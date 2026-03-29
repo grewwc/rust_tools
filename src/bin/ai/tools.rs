@@ -12,6 +12,8 @@ use std::sync::LazyLock;
 use std::time::Duration;
 use std::{io::Read, process::Stdio, time::Instant};
 
+use crate::common::utils::expanduser;
+use super::ff_embed;
 use super::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
 
 const HTTP_TOOL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1392,6 +1394,14 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
         return Err("empty command".to_string());
     }
 
+    if command.contains('|') || command.contains('>') || command.contains('<') || command.contains(';')
+    {
+        return Err("shell metacharacters are blocked".to_string());
+    }
+    if command.contains("&&") || command.contains("||") {
+        return Err("shell metacharacters are blocked".to_string());
+    }
+
     let tokens = command.split_whitespace().collect::<Vec<_>>();
     if tokens.is_empty() {
         return Err("empty command".to_string());
@@ -1514,19 +1524,55 @@ fn execute_grep_search(args: &Value) -> Result<String, String> {
     let path = args["path"].as_str().unwrap_or(".");
     let file_pattern = args["file_pattern"].as_str();
 
-    let mut cmd = Command::new("rg");
-    cmd.args(["-n", "--color=never", pattern, path]);
-
-    if let Some(fp) = file_pattern {
-        cmd.args(["-g", fp]);
+    let target = file_pattern.unwrap_or(pattern).trim();
+    if target.is_empty() {
+        return Err("pattern is empty".to_string());
     }
 
-    let output = cmd
-        .output()
-        .map_err(|e| format!("Failed to execute rg: {}", e))?;
+    let root_pat = expanduser(path.trim()).to_string();
+    let root_pat = if root_pat.trim().is_empty() {
+        ".".to_string()
+    } else {
+        root_pat
+    };
+    let glob_mode = file_pattern.is_some()
+        || target.contains('*')
+        || target.contains('?')
+        || target.contains('[')
+        || target.contains(']')
+        || target.contains('{')
+        || target.contains('}');
 
-    let result = String::from_utf8_lossy(&output.stdout).into_owned();
-    Ok(truncate_chars(result.trim(), 16_000))
+    let wd = std::env::current_dir()
+        .ok()
+        .and_then(|p| fs::canonicalize(&p).ok())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let opts = ff_embed::cli::Options {
+        verbose: false,
+        only_dir: false,
+        print_md5: false,
+        glob_mode,
+        case_insensitive: false,
+        relative: true,
+        num_print: i64::MAX,
+        thread_count: (num_cpus::get() / 2).max(1),
+        wd,
+        root_pat,
+        targets: vec![target.to_string()],
+        excludes: Vec::new(),
+    };
+
+    ff_embed::output::begin_capture();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads((num_cpus::get() / 2).max(1))
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|e| format!("Failed to build async runtime: {e}"))?;
+    let _ = rt.block_on(ff_embed::search::run_async(&opts));
+    let results = ff_embed::output::finish_capture();
+    Ok(truncate_chars(results.join("\n").trim(), 16_000))
 }
 
 fn execute_git_status(args: &Value) -> Result<String, String> {

@@ -11,7 +11,7 @@
     "key": "GLM",
     "name": "glm-5",
     "is_vl": false,
-    "search_enabled": true,
+    "search_enabled": false,
     "tools_default_enabled": true,
     "enable_thinking": true
   },
@@ -21,7 +21,7 @@
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
-    "enable_thinking": false
+    "enable_thinking": true
   },
   {
     "key": "QWEN3_MAX",

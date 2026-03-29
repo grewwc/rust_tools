@@ -17,3 +17,18 @@ mod types;
 mod tests;
 
 pub use driver::run;
+
+mod ff_embed {
+    pub mod cli {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/ff/cli.rs"));
+    }
+    pub mod exclude {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/ff/exclude.rs"));
+    }
+    pub mod output {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/ff/output.rs"));
+    }
+    pub mod search {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bin/ff/search.rs"));
+    }
+}

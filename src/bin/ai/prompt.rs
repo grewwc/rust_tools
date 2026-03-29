@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::common::utils::expanduser;
 use crate::clipboard::image_content;
+use crate::clipboard::string_content;
 use super::history::SessionStore;
 
 const LINE_REPL_HISTORY_FILE: &str = "~/.liner_histroy";
@@ -240,8 +241,21 @@ impl PromptEditor {
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                                 break Err(io::Error::new(io::ErrorKind::Interrupted, "Ctrl+C"));
                             }
+                            (KeyCode::Char('a'), modifiers)
+                                if modifiers.contains(KeyModifiers::SUPER)
+                                    || modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                let content = textarea_content(&textarea);
+                                let _ = string_content::set_clipboard_content(&content);
+                            }
                             (KeyCode::Backspace | KeyCode::Delete, modifiers)
                                 if modifiers.contains(KeyModifiers::SUPER) =>
+                            {
+                                delete_current_line(&mut textarea);
+                            }
+                            (KeyCode::Char('u'), modifiers)
+                                if modifiers.contains(KeyModifiers::CONTROL)
+                                    || modifiers.contains(KeyModifiers::SUPER) =>
                             {
                                 delete_current_line(&mut textarea);
                             }

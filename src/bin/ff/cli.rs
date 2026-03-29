@@ -1,4 +1,4 @@
-use crate::exclude;
+use super::exclude;
 use rust_tools::{
     common::{configw, utils::expanduser},
     terminalw,

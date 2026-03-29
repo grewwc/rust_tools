@@ -1,4 +1,4 @@
-use crate::{exclude, output};
+use super::{exclude, output};
 use colored::Colorize;
 use rust_tools::cw::concurrent_hash_map::ConcurrentHashMap;
 use rust_tools::terminalw;
@@ -112,14 +112,14 @@ fn maybe_send_stop(tx: &mpsc::UnboundedSender<Msg>, stop_sent: &AtomicBool, work
     }
 }
 
-pub async fn run_async(opts: &crate::cli::Options) -> i64 {
+pub async fn run_async(opts: &super::cli::Options) -> i64 {
     if opts.targets.iter().any(|t| Path::new(t).is_absolute()) {
         return run_absolute_targets(opts);
     }
     run_walk_async(opts).await
 }
 
-fn run_absolute_targets(opts: &crate::cli::Options) -> i64 {
+fn run_absolute_targets(opts: &super::cli::Options) -> i64 {
     let mut printed = 0_i64;
     for t in opts.targets.iter().filter(|t| Path::new(t).is_absolute()) {
         let abs = PathBuf::from(t);
@@ -172,7 +172,7 @@ fn scan_dir_blocking(
 
 fn process_match_blocking(
     m: PathBuf,
-    opts: &crate::cli::Options,
+    opts: &super::cli::Options,
     count: &Arc<AtomicI64>,
     stop: &Arc<AtomicBool>,
     printed: &Arc<ConcurrentHashMap<PathBuf, ()>>,
@@ -220,7 +220,7 @@ fn process_match_blocking(
     }
 }
 
-async fn run_walk_async(opts: &crate::cli::Options) -> i64 {
+async fn run_walk_async(opts: &super::cli::Options) -> i64 {
     let (tx, rx) = mpsc::unbounded_channel::<Msg>();
     let rx = Arc::new(Mutex::new(rx));
 
@@ -380,7 +380,7 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
 
-        let opts = crate::cli::Options {
+        let opts = super::super::cli::Options {
             verbose: false,
             only_dir: false,
             print_md5: false,

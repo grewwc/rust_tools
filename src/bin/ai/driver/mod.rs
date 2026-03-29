@@ -27,6 +27,7 @@ use crate::ai::{
     stream,
     types::{AgentContext, App, StreamOutcome},
 };
+use crate::common::configw;
 use crate::common::prompt::{prompt_yes_or_no_interruptible, read_line};
 
 pub mod input;
@@ -73,8 +74,34 @@ fn prepare_skill_for_turn(
 ) -> (
     String,
     Option<(Vec<crate::ai::types::ToolDefinition>, usize)>,
+    Option<String>,
 ) {
-    let skill = match_skill(skill_manifests, question);
+    let cfg = configw::get_all_config();
+    let router_enabled = cfg
+        .get_opt("ai.skills.router")
+        .unwrap_or_else(|| "true".to_string())
+        .trim()
+        .to_ascii_lowercase()
+        != "false";
+
+    let router_selected = if router_enabled {
+        let model = app.current_model.clone();
+        request::select_skill_via_model(app, &model, question, skill_manifests).and_then(|name| {
+            skill_manifests
+                .iter()
+                .any(|s| s.name == name)
+                .then_some(name)
+        })
+    } else {
+        None
+    };
+
+    let skill = if let Some(name) = router_selected.as_deref() {
+        skill_manifests.iter().find(|s| s.name == name)
+    } else {
+        match_skill(skill_manifests, question)
+    };
+    let matched_skill_name = skill.map(|s| s.name.clone());
     let openclaw_active = skill.as_ref().is_some_and(|s| {
         s.name.as_str() == "openclaw" || s.tool_groups.iter().any(|g| g == "openclaw")
     });
@@ -108,6 +135,8 @@ fn prepare_skill_for_turn(
 
     let mut system_prompt = if let Some(skill) = skill {
         let mut p = "You are a helpful assistant.".to_string();
+        p.push_str("\n\n");
+        p.push_str("Skill enforcement:\n- You MUST follow the active skill instructions precisely.\n- Do not ignore, weaken, or bypass the skill behavior.\n- If the user request conflicts with the skill, ask a brief clarification aligned with the skill.");
         let extra = skill.build_system_prompt();
         if !extra.trim().is_empty() {
             p.push_str("\n\n");
@@ -150,7 +179,7 @@ fn prepare_skill_for_turn(
         "Tool recovery mode:\n- If a tool call fails, read the error message and correct course before answering.\n- Prefer retrying with corrected arguments or switching to a more appropriate tool.\n- Do not repeat the exact same failing tool call unless the error indicates a transient retry is appropriate.\n- If a URL-based docs fetch tool says the URL is unsupported, switch to a search tool or ask for a supported docs URL instead of retrying the same call.\n- Only stop and ask the user when the error is ambiguous or missing required information."
     );
 
-    (system_prompt, restore_agent_context)
+    (system_prompt, restore_agent_context, matched_skill_name)
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -310,8 +339,11 @@ fn run_loop(
         app.current_model = next_model.clone();
 
         app.cancel_stream.store(false, Ordering::SeqCst);
-        let (system_prompt, mut restore_agent_context) =
+        let (system_prompt, mut restore_agent_context, matched_skill_name) =
             prepare_skill_for_turn(app, mcp_client, skill_manifests, &question);
+        if let Some(name) = matched_skill_name.as_deref() {
+            println!("[skill: {}]", name.cyan());
+        }
 
         let mut messages = Vec::new();
         messages.push(Message {
@@ -375,7 +407,8 @@ fn run_loop(
                 None
             };
 
-            let request_result = request::do_request_messages(app, &next_model, messages.clone(), true);
+            let request_result =
+                request::do_request_messages(app, &next_model, messages.clone(), true);
 
             if let Some(saved_tools) = saved_tools
                 && let Some(ctx) = app.agent_context.as_mut()
@@ -388,8 +421,16 @@ fn run_loop(
                     Ok(response) => response,
                     Err(err) => {
                         app.streaming.store(false, Ordering::Release);
+                        if request::is_transient_error(&err) {
+                            eprintln!("[Warning] {}", err);
+                            if should_quit {
+                                cleanup_one_shot(app);
+                                return Ok(());
+                            }
+                            break;
+                        }
                         cleanup_one_shot(app);
-                        return Err(err);
+                        return Err(err.into());
                     }
                 };
             if app.cancel_stream.swap(false, Ordering::AcqRel) {

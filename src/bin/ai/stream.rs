@@ -467,11 +467,8 @@ impl MarkdownStreamRenderer {
         }
     }
 
-    fn should_render(&mut self, chunk: &str) -> bool {
+    fn should_render(&mut self, _chunk: &str) -> bool {
         if !self.tty {
-            return false;
-        }
-        if chunk.contains("\x1b[") {
             return false;
         }
         self.enabled = true;

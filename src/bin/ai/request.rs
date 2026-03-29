@@ -1,13 +1,15 @@
+use std::fmt;
 use std::fs;
+use std::time::Duration;
 
 use base64::Engine as _;
 use colored::Colorize;
-use reqwest::blocking::Response;
+use reqwest::{StatusCode, blocking::Response};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{files, history::Message, models, types::App};
+use super::{files, history::Message, models, skills::SkillManifest, types::App};
 
 #[derive(Debug, Serialize)]
 struct RequestBody {
@@ -75,12 +77,77 @@ where
     Ok(value.unwrap_or_default())
 }
 
+#[derive(Debug)]
+pub(super) enum RequestErrorKind {
+    Network,
+    Status(StatusCode),
+}
+
+#[derive(Debug)]
+pub(super) struct RequestError {
+    kind: RequestErrorKind,
+    message: String,
+}
+
+impl RequestError {
+    fn network(err: reqwest::Error) -> Self {
+        Self {
+            kind: RequestErrorKind::Network,
+            message: err.to_string(),
+        }
+    }
+
+    fn status(status: StatusCode, body: String) -> Self {
+        Self {
+            kind: RequestErrorKind::Status(status),
+            message: if body.trim().is_empty() {
+                format!("request failed: {}", status)
+            } else {
+                format!("request failed: {} {}", status, body)
+            },
+        }
+    }
+}
+
+impl fmt::Display for RequestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for RequestError {}
+
+const REQUEST_MAX_ATTEMPTS: usize = 3;
+const REQUEST_RETRY_BASE_MS: u64 = 500;
+const REQUEST_RETRY_MAX_MS: u64 = 4000;
+
+fn should_retry_status(status: StatusCode) -> bool {
+    status.as_u16() == 429 || status.is_server_error()
+}
+
+fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect() || err.is_request()
+}
+
+fn retry_delay(attempt: usize) -> Duration {
+    let shift = attempt.saturating_sub(1).min(4) as u32;
+    let backoff = REQUEST_RETRY_BASE_MS.saturating_mul(1u64 << shift);
+    Duration::from_millis(backoff.min(REQUEST_RETRY_MAX_MS))
+}
+
+pub(super) fn is_transient_error(err: &RequestError) -> bool {
+    match err.kind {
+        RequestErrorKind::Network => true,
+        RequestErrorKind::Status(status) => should_retry_status(status),
+    }
+}
+
 pub(super) fn do_request_messages(
     app: &mut App,
     model: &str,
     messages: Vec<Message>,
     stream: bool,
-) -> Result<Response, Box<dyn std::error::Error>> {
+) -> Result<Response, RequestError> {
     let (tools_value, tool_choice) = agent_tools_for_request(app, model);
     let request_body = RequestBody {
         model: model.to_string(),
@@ -92,21 +159,171 @@ pub(super) fn do_request_messages(
         tool_choice,
     };
 
+    for attempt in 1..=REQUEST_MAX_ATTEMPTS {
+        let response = app
+            .client
+            .post(&app.config.endpoint)
+            .bearer_auth(&app.config.api_key)
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send();
+
+        match response {
+            Ok(response) => {
+                if response.status().is_success() {
+                    return Ok(response);
+                }
+                let status = response.status();
+                let body = response.text().unwrap_or_default();
+                let err = RequestError::status(status, body);
+                if should_retry_status(status) && attempt < REQUEST_MAX_ATTEMPTS {
+                    std::thread::sleep(retry_delay(attempt));
+                    continue;
+                }
+                return Err(err);
+            }
+            Err(err) => {
+                let retryable = is_retryable_reqwest_error(&err);
+                let err = RequestError::network(err);
+                if retryable && attempt < REQUEST_MAX_ATTEMPTS {
+                    std::thread::sleep(retry_delay(attempt));
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    Err(RequestError {
+        kind: RequestErrorKind::Network,
+        message: "request failed".to_string(),
+    })
+}
+
+fn strip_json_fence(s: &str) -> &str {
+    let trimmed = s.trim();
+    if let Some(rest) = trimmed.strip_prefix("```") {
+        let rest = rest.trim_start();
+        let rest = rest.strip_prefix("json").unwrap_or(rest);
+        let rest = rest.trim_start_matches('\n').trim_start_matches('\r');
+        if let Some(end) = rest.rfind("```") {
+            return rest[..end].trim();
+        }
+    }
+    trimmed
+}
+
+fn parse_skill_name_from_router_output(s: &str) -> Option<String> {
+    let s = strip_json_fence(s);
+    let candidate = if let (Some(l), Some(r)) = (s.find('{'), s.rfind('}')) && r >= l {
+        &s[l..=r]
+    } else {
+        s
+    };
+    let v: Value = serde_json::from_str(candidate).ok()?;
+    let name = v.get("skill")?.as_str()?.trim().to_string();
+    if name.is_empty() || name == "none" || name == "null" {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+pub(super) fn select_skill_via_model(
+    app: &mut App,
+    model: &str,
+    question: &str,
+    skills: &[SkillManifest],
+) -> Option<String> {
+    if question.trim().is_empty() {
+        return None;
+    }
+    if skills.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    lines.push("Choose at most one skill from the list. Return JSON only.".to_string());
+    lines.push("Output schema: {\"skill\":\"<name or empty>\",\"confidence\":0.0}".to_string());
+    lines.push("Rules:".to_string());
+    lines.push("- Only choose a skill if it clearly helps.".to_string());
+    lines.push("- If none fits, set skill to empty string.".to_string());
+    lines.push("- Use EXACT skill name from the list.".to_string());
+    lines.push("Skills:".to_string());
+
+    for s in skills.iter().take(32) {
+        let mut hint = String::new();
+        if !s.description.trim().is_empty() {
+            hint.push_str(s.description.trim());
+        }
+        if !s.triggers.is_empty() {
+            if !hint.is_empty() {
+                hint.push_str(" | ");
+            }
+            let mut t = s.triggers.clone();
+            t.truncate(6);
+            hint.push_str("hints: ");
+            hint.push_str(&t.join(", "));
+        }
+        if hint.is_empty() {
+            hint = "(no description)".to_string();
+        }
+        lines.push(format!("- {}: {}", s.name, hint));
+    }
+
+    let system_prompt = lines.join("\n");
+
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String(system_prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(question.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+
+    let request_body = RequestBody {
+        model: model.to_string(),
+        messages,
+        stream: false,
+        enable_thinking: false,
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+    };
+
     let response = app
         .client
         .post(&app.config.endpoint)
         .bearer_auth(&app.config.api_key)
         .header("Content-Type", "application/json")
         .json(&request_body)
-        .send()?;
+        .send()
+        .ok()?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(format!("request failed: {status} {body}").into());
+        return None;
     }
 
-    Ok(response)
+    let text = response.text().ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let content = v
+        .get("choices")?
+        .get(0)?
+        .get("message")?
+        .get("content")?
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    parse_skill_name_from_router_output(&content)
 }
 
 fn agent_tools_for_request(app: &App, model: &str) -> (Option<Value>, Option<Value>) {

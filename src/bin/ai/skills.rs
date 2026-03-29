@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::common::{configw, utils::expanduser};
+
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
     (
         "openclaw.skill",
@@ -100,7 +102,14 @@ pub(super) fn load_all_skills() -> Vec<SkillManifest> {
 }
 
 pub(super) fn skills_dir() -> PathBuf {
-    PathBuf::from(crate::common::utils::expanduser("~/.config/rust_tools/skills").as_ref())
+    let cfg = configw::get_all_config();
+    let raw = cfg.get_opt("ai.skills.dir").unwrap_or_default();
+    let path = if raw.trim().is_empty() {
+        "~/.config/rust_tools/skills".to_string()
+    } else {
+        raw
+    };
+    PathBuf::from(expanduser(&path).as_ref())
 }
 
 fn looks_like_front_matter_skill(content: &str) -> bool {

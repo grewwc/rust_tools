@@ -3,10 +3,27 @@ use std::{
     fs,
     io::{self, Write},
     path::{Component, Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 pub static PRINT_DISABLED: AtomicBool = AtomicBool::new(false);
+static CAPTURED: LazyLock<Mutex<Option<Vec<String>>>> = LazyLock::new(|| Mutex::new(None));
+
+pub fn begin_capture() {
+    if let Ok(mut guard) = CAPTURED.lock() {
+        *guard = Some(Vec::new());
+    }
+}
+
+pub fn finish_capture() -> Vec<String> {
+    if let Ok(mut guard) = CAPTURED.lock() {
+        return guard.take().unwrap_or_default();
+    }
+    Vec::new()
+}
 
 fn parse_file_size(size: u64) -> String {
     const K: f64 = 1024.0;
@@ -149,6 +166,13 @@ pub fn print_match(
         let digest = md5::compute(bytes);
         out.push('\t');
         out.push_str(&format!("{:x}", digest));
+    }
+
+    if let Ok(mut guard) = CAPTURED.lock()
+        && let Some(buf) = guard.as_mut()
+    {
+        buf.push(out);
+        return Ok(());
     }
 
     let mut stdout = io::stdout().lock();
