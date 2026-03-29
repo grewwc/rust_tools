@@ -42,7 +42,7 @@ mod dispatch {
 
     use super::args;
 
-    fn requires_user_confirmation_for_tool(name: &str) -> bool {
+    fn requires_user_confirmation_for_tool(_name: &str) -> bool {
         false
         // let lower = name.to_lowercase();
         // let looks_like_feishu = lower.contains("feishu") || lower.contains("lark");
@@ -62,9 +62,7 @@ mod dispatch {
     fn remediation_hint(tool_name: &str, err: &str) -> Option<String> {
         let err_lower = err.to_lowercase();
 
-        if tool_name == "mcp_feishu_docs_get_text_by_url"
-            && err_lower.contains("unsupported url")
-        {
+        if tool_name == "mcp_feishu_docs_get_text_by_url" && err_lower.contains("unsupported url") {
             return Some(
                 "Suggestion: this tool only works for supported Feishu/Lark docs URLs. Do not retry with the same URL. Use mcp_feishu_docs_search to find the document first, or ask the user for a direct Feishu docs/wiki/sheet URL.".to_string(),
             );

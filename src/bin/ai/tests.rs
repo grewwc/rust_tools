@@ -55,6 +55,21 @@ fn cli_model_flag_after_prompt_is_not_forwarded() {
 }
 
 #[test]
+fn cli_single_dash_long_opts_with_equals_are_preserved() {
+    use clap::Parser;
+
+    let argv = super::cli::normalize_single_dash_long_opts(
+        ["a", "-session=my-session", "-out=result.md", "hello"]
+            .into_iter()
+            .map(|s| s.to_string()),
+    );
+    let cli = super::cli::Cli::parse_from(argv);
+    assert_eq!(cli.session.as_deref(), Some("my-session"));
+    assert_eq!(cli.out.as_deref(), Some("result.md"));
+    assert_eq!(cli.args, vec!["hello"]);
+}
+
+#[test]
 fn resolve_model_is_unicode_safe() {
     use clap::Parser;
     use std::path::PathBuf;

@@ -146,7 +146,9 @@ pub(super) fn normalize_single_dash_long_opts(args: impl Iterator<Item = String>
             }
             _ if arg.starts_with("--model=")
                 || arg.starts_with("--history=")
-                || arg.starts_with("--mcp-config=") =>
+                || arg.starts_with("--mcp-config=")
+                || arg.starts_with("--out=")
+                || arg.starts_with("--session=") =>
             {
                 out.push(arg);
             }
