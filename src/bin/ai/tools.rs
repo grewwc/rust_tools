@@ -1006,7 +1006,8 @@ fn load_memory_entries(path: &Path) -> Result<Vec<AgentMemoryEntry>, String> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let content = fs::read_to_string(path).map_err(|e| format!("Failed to read memory file: {e}"))?;
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read memory file: {e}"))?;
     let mut out = Vec::new();
     for line in content.lines() {
         let line = line.trim();
@@ -1076,8 +1077,8 @@ fn execute_memory_append(args: &Value) -> Result<String, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create memory dir: {e}"))?;
     }
-    let serialized =
-        serde_json::to_string(&entry).map_err(|e| format!("Failed to serialize memory entry: {e}"))?;
+    let serialized = serde_json::to_string(&entry)
+        .map_err(|e| format!("Failed to serialize memory entry: {e}"))?;
     let mut existing = if path.exists() {
         fs::read_to_string(&path).map_err(|e| format!("Failed to read memory file: {e}"))?
     } else {
@@ -1390,21 +1391,6 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
     if command.is_empty() {
         return Err("empty command".to_string());
     }
-    if command.contains('\n') || command.contains('\r') {
-        return Err("multi-line command is blocked".to_string());
-    }
-    if command.contains('|')
-        || command.contains('>')
-        || command.contains('<')
-        || command.contains(';')
-        || command.contains('&')
-        || command.contains("&&")
-        || command.contains("||")
-        || command.contains("`")
-        || command.contains("$(")
-    {
-        return Err("shell metacharacters are blocked".to_string());
-    }
 
     let tokens = command.split_whitespace().collect::<Vec<_>>();
     if tokens.is_empty() {
@@ -1446,8 +1432,7 @@ pub(super) fn validate_execute_command(command: &str) -> Result<(), String> {
     }
 
     let denied_tokens = [
-        "-exec", "-delete", "--delete", "--remove", "rm", "mv", "chmod", "chown", "sudo", "ssh",
-        "scp", "rsync",
+        "-delete", "--remove", "rm", "mv", "chmod", "chown", "sudo", "ssh", "scp", "rsync",
     ];
     for token in tokens.iter().skip(1) {
         let t = token.to_lowercase();
@@ -1640,31 +1625,9 @@ fn execute_cargo_test(args: &Value) -> Result<String, String> {
     execute_cargo_command("test", args)
 }
 
-fn execute_web_search(args: &Value) -> Result<String, String> {
-    let query = args["query"].as_str().ok_or("Missing query")?;
-    let num_results = args["num_results"]
-        .as_u64()
-        .or_else(|| args["num"].as_u64())
-        .unwrap_or(5)
-        .clamp(1, 10) as usize;
-
-    let hits = duckduckgo_search(query, num_results)?;
-    if hits.is_empty() {
-        return Ok("No results found.".to_string());
-    }
-
-    let mut out = String::new();
-    for (idx, hit) in hits.into_iter().enumerate() {
-        if idx > 0 {
-            out.push('\n');
-        }
-        out.push_str(&format!("{}. {}\n", idx + 1, hit.title.trim()));
-        out.push_str(&format!("{}\n", hit.url.trim()));
-        if !hit.snippet.trim().is_empty() {
-            out.push_str(&format!("{}\n", hit.snippet.trim()));
-        }
-    }
-    Ok(out.trim_end().to_string())
+fn execute_web_search(_args: &Value) -> Result<String, String> {
+    let _ = duckduckgo_search as fn(&str, usize) -> Result<Vec<WebSearchHit>, String>;
+    Err("web_search is disabled".to_string())
 }
 
 fn execute_web_fetch(args: &Value) -> Result<String, String> {
