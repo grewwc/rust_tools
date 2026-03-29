@@ -240,6 +240,11 @@ impl PromptEditor {
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                                 break Err(io::Error::new(io::ErrorKind::Interrupted, "Ctrl+C"));
                             }
+                            (KeyCode::Backspace | KeyCode::Delete, modifiers)
+                                if modifiers.contains(KeyModifiers::SUPER) =>
+                            {
+                                delete_current_line(&mut textarea);
+                            }
                             _ => {
                                 let handled = match (key.code, key.modifiers) {
                                     (KeyCode::Up, modifiers)
@@ -408,11 +413,42 @@ fn replace_textarea_content(textarea: &mut tui_textarea::TextArea<'_>, content: 
     *textarea = tui_textarea::TextArea::new(lines);
 }
 
+fn delete_current_line(textarea: &mut tui_textarea::TextArea<'_>) {
+    let (row, col) = textarea.cursor();
+    let mut lines = textarea.lines().to_vec();
+    if lines.len() <= 1 {
+        textarea.set_lines(vec![String::new()], (0, 0));
+        return;
+    }
+    let remove_at = row.min(lines.len() - 1);
+    lines.remove(remove_at);
+    let new_row = remove_at.min(lines.len() - 1);
+    let new_col = col.min(lines[new_row].len());
+    textarea.set_lines(lines, (new_row, new_col));
+}
+
 fn insert_text(textarea: &mut tui_textarea::TextArea<'_>, text: &str) {
     if text.is_empty() {
         return;
     }
-    textarea.insert_str(text);
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if !normalized.contains('\n') {
+        textarea.insert_str(&normalized);
+        return;
+    }
+
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    for (idx, line) in lines.iter().enumerate() {
+        if !line.is_empty() {
+            textarea.insert_str(line);
+        }
+        if idx + 1 < lines.len() {
+            let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+            textarea.input(tui_textarea::Input::from(enter));
+        }
+    }
 }
 
 fn image_placeholder(path: &Path) -> String {
