@@ -10,6 +10,11 @@ use super::{
     types::{App, StreamOutcome, StreamResult, ToolCall, take_stream_cancelled},
 };
 
+/// Maximum number of decode errors before giving up and returning partial content
+const MAX_DECODE_ERRORS: usize = 3;
+/// Delay in milliseconds between retry attempts on transient errors
+const DECODE_ERROR_RETRY_DELAY_MS: u64 = 100;
+
 pub(super) fn stream_response(
     app: &mut App,
     response: &mut reqwest::blocking::Response,
@@ -25,6 +30,9 @@ pub(super) fn stream_response(
     let mut tool_calls_map: HashMap<usize, ToolCallBuilder> = HashMap::new();
     let mut assistant_text = String::new();
     let mut internal_tool_call_idx: usize = 0;
+    
+    // Track decode errors to handle transient network issues gracefully
+    let mut decode_error_count = 0;
 
     while !app.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
         if take_stream_cancelled(app) {
@@ -69,7 +77,59 @@ pub(super) fn stream_response(
                 }
                 continue;
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => {
+                // Handle response body decode errors (e.g., UTF-8 decode failure, connection interrupted)
+                decode_error_count += 1;
+                eprintln!(
+                    "[Warning] 读取响应流时出错：{} (错误次数：{}/{})",
+                    err,
+                    decode_error_count,
+                    MAX_DECODE_ERRORS
+                );
+                
+                // Check for cancellation during error handling
+                if take_stream_cancelled(app) {
+                    return Ok(StreamResult {
+                        outcome: StreamOutcome::Cancelled,
+                        tool_calls: Vec::new(),
+                        assistant_text: String::new(),
+                    });
+                }
+                
+                // If this is a transient error and we haven't exceeded max retries, try to continue
+                if decode_error_count <= MAX_DECODE_ERRORS {
+                    eprintln!("[Warning] 尝试继续读取...");
+                    std::thread::sleep(std::time::Duration::from_millis(DECODE_ERROR_RETRY_DELAY_MS));
+                    continue;
+                }
+                
+                // Exceeded max error count, return collected content instead of crashing
+                eprintln!("[Error] 响应流读取失败，返回已收集的内容");
+                
+                // Close thinking block if still open
+                if thinking_open {
+                    let _ = write_stream_content(
+                        &format!("\n{end_thinking_tag}\n"),
+                        app.writer.as_mut(),
+                        &mut markdown,
+                    );
+                }
+                
+                let _ = markdown.flush_pending();
+                
+                return Ok(StreamResult {
+                    outcome: if !assistant_text.is_empty() {
+                        StreamOutcome::Completed
+                    } else {
+                        StreamOutcome::Completed
+                    },
+                    tool_calls: tool_calls_map
+                        .into_values()
+                        .filter_map(|b| Some(b.build()))
+                        .collect(),
+                    assistant_text,
+                });
+            }
         };
         if n == 0 {
             break;

@@ -25,7 +25,7 @@ use crate::ai::{
     request,
     skills::{self, SkillManifest},
     stream,
-    types::{AgentContext, App, StreamOutcome},
+    types::{AgentContext, App, StreamOutcome, StreamResult},
 };
 use crate::common::configw;
 use crate::common::prompt::{prompt_yes_or_no_interruptible, read_line};
@@ -495,11 +495,22 @@ fn run_loop(
                     Ok(result) => result,
                     Err(err) => {
                         app.streaming.store(false, Ordering::Release);
-                        cleanup_one_shot(app);
-                        return Err(err);
+                        
+                        // Log the error and handle gracefully instead of crashing
+                        eprintln!("\n[Error] 流式响应处理失败：{}", err);
+                        eprintln!("[Info] 尝试继续对话...");
+                        
+                        // Try to drain any remaining response data
+                        let _ = drain_response(&mut response);
+                        
+                        // Create an empty StreamResult to allow continuation
+                        StreamResult {
+                            outcome: StreamOutcome::Completed,
+                            tool_calls: Vec::new(),
+                            assistant_text: "[响应解析失败，请重试]".to_string(),
+                        }
                     }
                 };
-            app.streaming.store(false, Ordering::Release);
 
             // Clear any stray input (e.g., Enter keys pressed during streaming)
             // to prevent them from interrupting the next prompt.
