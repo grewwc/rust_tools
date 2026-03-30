@@ -119,6 +119,7 @@ impl fmt::Display for RequestError {
 impl std::error::Error for RequestError {}
 
 const REQUEST_MAX_ATTEMPTS: usize = 3;
+const REQUEST_MAX_ATTEMPTS_429: usize = 6; // 429 错误重试 6 次
 const REQUEST_RETRY_BASE_MS: u64 = 500;
 const REQUEST_RETRY_MAX_MS: u64 = 4000;
 
@@ -160,7 +161,7 @@ pub(super) fn do_request_messages(
         tool_choice,
     };
 
-    for attempt in 1..=REQUEST_MAX_ATTEMPTS {
+    for attempt in 1..=REQUEST_MAX_ATTEMPTS_429 {
         let response = app
             .client
             .post(&app.config.endpoint)
@@ -177,8 +178,35 @@ pub(super) fn do_request_messages(
                 let status = response.status();
                 let body = response.text().unwrap_or_default();
                 let err = RequestError::status(status, body);
-                if should_retry_status(status) && attempt < REQUEST_MAX_ATTEMPTS {
-                    std::thread::sleep(retry_delay(attempt));
+                
+                // 根据状态码确定最大重试次数
+                let max_attempts_for_status = if status.as_u16() == 429 {
+                    REQUEST_MAX_ATTEMPTS_429
+                } else {
+                    REQUEST_MAX_ATTEMPTS
+                };
+                
+                if should_retry_status(status) && attempt < max_attempts_for_status {
+                    // 打印 sleep 原因
+                    let delay = retry_delay(attempt);
+                    
+                    if status.as_u16() == 429 {
+                        eprintln!(
+                            "[Warning] 429 Too Many Requests - 配额超限，sleep {} 秒后重试 (attempt {}/{})",
+                            delay.as_secs_f32(),
+                            attempt,
+                            max_attempts_for_status
+                        );
+                    } else {
+                        eprintln!(
+                            "[Warning] {} - sleep {} 秒后重试 (attempt {}/{})",
+                            status,
+                            delay.as_secs_f32(),
+                            attempt,
+                            max_attempts_for_status
+                        );
+                    }
+                    std::thread::sleep(delay);
                     continue;
                 }
                 return Err(err);
@@ -187,7 +215,15 @@ pub(super) fn do_request_messages(
                 let retryable = is_retryable_reqwest_error(&err);
                 let err = RequestError::network(err);
                 if retryable && attempt < REQUEST_MAX_ATTEMPTS {
-                    std::thread::sleep(retry_delay(attempt));
+                    // 打印 sleep 原因
+                    let delay = retry_delay(attempt);
+                    eprintln!(
+                        "[Warning] 网络错误 - sleep {} 秒后重试 (attempt {}/{})",
+                        delay.as_secs_f32(),
+                        attempt,
+                        REQUEST_MAX_ATTEMPTS
+                    );
+                    std::thread::sleep(delay);
                     continue;
                 }
                 return Err(err);
@@ -405,6 +441,6 @@ pub(super) fn print_info(model: &str) {
     } else {
         "false"
     };
-    // 使用println!避免手动flush的权限问题
+    // 使用 println! 避免手动 flush 的权限问题
     println!("[{} (search: {})]", model.green(), search.red());
 }

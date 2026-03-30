@@ -35,10 +35,9 @@ for bin in $NEED; do
 
     dst="$INSTALL_DIR/$bin"
 
+    # 先删除已存在的文件（包括软链接）
     if [ -e "$dst" ] || [ -L "$dst" ]; then
-        if [ "$src" -ef "$dst" ]; then
-            rm -f "$dst"
-        fi
+        rm -f "$dst"
     fi
 
     cp "$src" "$dst"
