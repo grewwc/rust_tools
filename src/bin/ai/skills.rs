@@ -81,6 +81,14 @@ pub(super) fn load_all_skills() -> Vec<SkillManifest> {
     }
 
     for skill in load_skills_from_dir(&dir) {
+        if let Some(existing) = by_name.get(&skill.name)
+            && existing
+                .source_path
+                .as_deref()
+                .is_some_and(|p| p.starts_with("builtin:"))
+        {
+            continue;
+        }
         by_name.insert(skill.name.clone(), skill);
     }
 
@@ -246,38 +254,8 @@ fn parse_skill_front_matter_with_path(content: &str, path: &Path) -> Result<Skil
 
 fn ensure_seeded_skills_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("failed to create skills dir: {e}"))?;
-
-    let mut has_skill = false;
-    if let Ok(rd) = std::fs::read_dir(dir) {
-        for entry in rd.flatten() {
-            let p = entry.path();
-            if !p.is_file() {
-                continue;
-            }
-            let Some(name) = p.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if name.starts_with('.') {
-                continue;
-            }
-            if file_looks_like_front_matter_skill(&p) {
-                has_skill = true;
-                break;
-            }
-        }
-    }
-
-    if has_skill {
-        return Ok(());
-    }
-
-    for (name, content) in BUILTIN_SKILLS {
-        let path = dir.join(name);
-        if path.exists() {
-            continue;
-        }
-        std::fs::write(&path, content).map_err(|e| format!("failed to seed builtin skill: {e}"))?;
-    }
+    // 不再将内置 skill 复制到 ~/.config/rust_tools/skills/ 目录
+    // 内置 skill 仅通过 BUILTIN_SKILLS 常量在内存中使用
     Ok(())
 }
 
@@ -315,11 +293,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seed_skills_dir_writes_skills_when_empty() {
+    fn seed_skills_dir_creates_dir_but_does_not_copy_builtins() {
         let dir = std::env::temp_dir().join(format!("rust-tools-skills-{}", uuid::Uuid::new_v4()));
         ensure_seeded_skills_dir(&dir).unwrap();
         let skills = load_skills_from_dir(&dir);
-        assert_eq!(skills.len(), BUILTIN_SKILLS.len());
+        // 内置 skill 不再被复制到磁盘，所以目录应该是空的
+        assert_eq!(skills.len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -351,6 +330,20 @@ custom"#,
         )
         .unwrap();
 
+        std::fs::write(
+            dir.join("code-review.skill"),
+            r#"---
+name: code-review
+description: override
+triggers:
+  - 帮我看一下
+priority: 999
+---
+
+override"#,
+        )
+        .unwrap();
+
         let skills = load_all_skills();
         let names = skills
             .iter()
@@ -360,6 +353,11 @@ custom"#,
         assert!(names.contains("code-review"));
         assert!(names.contains("refactor"));
         assert!(names.contains("custom-skill"));
+        let code_review = skills.iter().find(|s| s.name == "code-review").unwrap();
+        assert!(code_review
+            .source_path
+            .as_deref()
+            .is_some_and(|p| p.starts_with("builtin:")));
 
         match old_home {
             Some(v) => unsafe {

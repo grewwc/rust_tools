@@ -7,7 +7,8 @@ use serde_json::Value;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
 
-const HTTP_TOOL_TIMEOUT: Duration = Duration::from_secs(2);
+const HTTP_TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn params_web_search() -> Value {
     serde_json::json!({
@@ -19,7 +20,7 @@ fn params_web_search() -> Value {
             },
             "num_results": {
                 "type": "integer",
-                "description": "Maximum number of results to return (default: 5)."
+                "description": "Maximum number of results to return (default: 5, max: 20)."
             }
         },
         "required": ["query"]
@@ -32,7 +33,7 @@ fn params_web_fetch() -> Value {
         "properties": {
             "url": {
                 "type": "string",
-                "description": "http/https URL to fetch. Localhost and private network targets are blocked; response body is capped."
+                "description": "http/https URL to fetch. Localhost and private network targets are blocked; response body is capped at 512KB."
             }
         },
         "required": ["url"]
@@ -42,7 +43,7 @@ fn params_web_fetch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "web_search",
-        description: "Search the public web (DuckDuckGo HTML parsing) for documentation and references. Currently disabled in this build.",
+        description: "Search the public web using DuckDuckGo for documentation and references. Returns up to num_results results with title, URL, and snippet.",
         parameters: params_web_search,
         execute: execute_web_search,
         groups: &["builtin"],
@@ -52,16 +53,64 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "web_fetch",
-        description: "Fetch the raw response body of an http/https URL (2s timeout, 512KB cap). Blocks localhost/private network targets.",
+        description: "Fetch the raw response body of an http/https URL (10s timeout, 512KB cap). Blocks localhost/private network targets. Returns URL, status, content-type, and content.",
         parameters: params_web_fetch,
         execute: execute_web_fetch,
         groups: &["builtin"],
     }
 });
 
-pub(crate) fn execute_web_search(_args: &Value) -> Result<String, String> {
-    let _ = duckduckgo_search as fn(&str, usize) -> Result<Vec<WebSearchHit>, String>;
-    Err("web_search is disabled".to_string())
+/// Format search results as a readable string
+fn format_search_results(hits: &[WebSearchHit]) -> String {
+    if hits.is_empty() {
+        return "No results found.".to_string();
+    }
+    
+    let mut output = String::new();
+    output.push_str(&format!("Found {} result(s):\n\n", hits.len()));
+    
+    for (i, hit) in hits.iter().enumerate() {
+        output.push_str(&format!("{}. {}\n", i + 1, hit.title));
+        output.push_str(&format!("   URL: {}\n", hit.url));
+        if !hit.snippet.is_empty() {
+            output.push_str(&format!("   Snippet: {}\n", hit.snippet));
+        }
+        output.push('\n');
+    }
+    
+    output
+}
+
+pub(crate) fn execute_web_search(args: &Value) -> Result<String, String> {
+    let query = args["query"].as_str().ok_or("Missing query parameter")?;
+    let num_results = args["num_results"]
+        .as_u64()
+        .unwrap_or(5) as usize;
+    
+    if query.trim().is_empty() {
+        return Err("Query cannot be empty".to_string());
+    }
+    
+    let limit = if num_results == 0 { 5 } else { num_results.min(20) };
+    
+    match duckduckgo_search(query, limit) {
+        Ok(hits) => {
+            if hits.is_empty() {
+                eprintln!("[web_search] No results from primary. Trying fallback...");
+                duckduckgo_search_fallback(query, limit)
+                    .map(|h| format_search_results(&h))
+            } else {
+                Ok(format_search_results(&hits))
+            }
+        },
+        Err(e) => {
+            eprintln!("[web_search] Primary search failed: {}. Trying fallback...", e);
+            match duckduckgo_search_fallback(query, limit) {
+                Ok(hits) => Ok(format_search_results(&hits)),
+                Err(e) => Err(format!("Search failed: {}. Try a different query or check network connectivity.", e)),
+            }
+        }
+    }
 }
 
 pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
@@ -92,6 +141,7 @@ pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
 
     let client = reqwest::blocking::Client::builder()
         .timeout(HTTP_TOOL_TIMEOUT)
+        .connect_timeout(Duration::from_secs(5))
         .user_agent("Mozilla/5.0 (compatible; rust-tools/1.0)")
         .build()
         .map_err(|e| format!("Failed to build http client: {}", e))?;
@@ -102,17 +152,112 @@ pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
         .map_err(|e| format!("Failed to fetch URL: {}", e))?;
 
     const MAX_BYTES: usize = 512 * 1024;
+    
+    // Extract metadata before consuming response (clone to avoid borrow issues)
+    let status = response.status().as_u16();
+    let content_type: String = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("text/plain")
+        .to_string();
+    
     let mut buf = Vec::new();
     response
         .take((MAX_BYTES + 1) as u64)
         .read_to_end(&mut buf)
         .map_err(|e| format!("Failed to read response: {}", e))?;
-    if buf.len() > MAX_BYTES {
+
+    let truncated = buf.len() > MAX_BYTES;
+    if truncated {
         buf.truncate(MAX_BYTES);
     }
     let content = String::from_utf8_lossy(&buf).to_string();
 
-    Ok(content)
+    // Add metadata header
+    let mut result = String::new();
+    result.push_str(&format!("URL: {}\n", url));
+    result.push_str(&format!("Status: {}\n", status));
+    result.push_str(&format!("Content-Type: {}\n", content_type));
+    result.push_str(&format!("Size: {} bytes", buf.len()));
+    if truncated {
+        result.push_str(" (truncated at 512KB)");
+    }
+    result.push_str("\n\n--- Content ---\n\n");
+    result.push_str(&content);
+    
+    Ok(result)
+}
+
+/// Fallback search using DuckDuckGo lite version
+fn duckduckgo_search_fallback(query: &str, limit: usize) -> Result<Vec<WebSearchHit>, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HTTP_SEARCH_TIMEOUT)
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("Failed to build http client: {}", e))?;
+
+    // Try the lite version of DuckDuckGo
+    let response = client
+        .get("https://lite.duckduckgo.com/lite/")
+        .query(&[("q", query)])
+        .send()
+        .map_err(|e| format!("Failed to perform web search: {}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("Web search failed: HTTP {}", status.as_u16()));
+    }
+
+    let html = response
+        .text()
+        .map_err(|e| format!("Failed to read search response: {}", e))?;
+    
+    Ok(parse_duckduckgo_lite(&html, limit))
+}
+
+/// Parse DuckDuckGo lite HTML format
+fn parse_duckduckgo_lite(html: &str, limit: usize) -> Vec<WebSearchHit> {
+    let mut out = Vec::new();
+    let lines: Vec<&str> = html.lines().collect();
+    
+    for i in 0..lines.len().saturating_sub(2) {
+        if out.len() >= limit {
+            break;
+        }
+        
+        let line = lines[i].trim();
+        if line.contains("<a") && line.contains("href=") {
+            // Extract URL
+            if let Some(url_start) = line.find("href=\"") {
+                let url_rest = &line[url_start + 6..];
+                if let Some(url_end) = url_rest.find('"') {
+                    let raw_url = url_rest[..url_end].to_string();
+                    let url = if raw_url.starts_with("http") {
+                        raw_url
+                    } else {
+                        format!("https://lite.duckduckgo.com{}", raw_url)
+                    };
+                    
+                    // Extract title
+                    let title = clean_html_text(line);
+                    
+                    // Extract snippet (next line usually contains it)
+                    let snippet = if i + 1 < lines.len() {
+                        clean_html_text(lines[i + 1])
+                    } else {
+                        String::new()
+                    };
+                    
+                    if !title.is_empty() && !url.is_empty() {
+                        out.push(WebSearchHit { title, url, snippet });
+                    }
+                }
+            }
+        }
+    }
+    
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,7 +269,8 @@ struct WebSearchHit {
 
 fn duckduckgo_search(query: &str, limit: usize) -> Result<Vec<WebSearchHit>, String> {
     let client = reqwest::blocking::Client::builder()
-        .timeout(HTTP_TOOL_TIMEOUT)
+        .timeout(HTTP_SEARCH_TIMEOUT)
+        .connect_timeout(Duration::from_secs(3))
         .user_agent("Mozilla/5.0 (compatible; rust-tools/1.0)")
         .build()
         .map_err(|e| format!("Failed to build http client: {}", e))?;
@@ -147,13 +293,14 @@ fn duckduckgo_search(query: &str, limit: usize) -> Result<Vec<WebSearchHit>, Str
 }
 
 fn parse_duckduckgo_html(html: &str, limit: usize) -> Vec<WebSearchHit> {
+    // Try multiple regex patterns for flexibility
     let title_re =
-        Regex::new(r#"(?s)<a[^>]*class="result__a"[^>]*href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>"#).ok();
-    let snippet_re = Regex::new(r#"(?s)<a[^>]*class="result__snippet"[^>]*>(?P<snippet>.*?)</a>|<div[^>]*class="result__snippet"[^>]*>(?P<snippet2>.*?)</div>"#).ok();
-
-    let Some(title_re) = title_re else {
-        return Vec::new();
-    };
+        Regex::new(r#"(?s)<a[^>]*class="result__a"[^>]*href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>"#)
+            .unwrap_or_else(|_| Regex::new(r#"(?s)<a[^>]*href="(?P<url>[^"]+)"[^>]*class="result__a"[^>]*>(?P<title>.*?)</a>"#).unwrap());
+    
+    let snippet_re = Regex::new(r#"(?s)<a[^>]*class="result__snippet"[^>]*>(?P<snippet>.*?)</a>|<div[^>]*class="result__snippet"[^>]*>(?P<snippet2>.*?)</div>"#)
+        .ok()
+        .or_else(|| Regex::new(r#"(?s)<div[^>]*>(?P<snippet>.*?)</div>"#).ok());
 
     let mut out = Vec::new();
     for m in title_re.captures_iter(html) {
@@ -183,7 +330,7 @@ fn parse_duckduckgo_html(html: &str, limit: usize) -> Vec<WebSearchHit> {
             }
         }
 
-        if title.trim().is_empty() || url.trim().is_empty() {
+        if title.trim().is_empty() {
             continue;
         }
         out.push(WebSearchHit {

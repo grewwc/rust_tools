@@ -445,9 +445,13 @@ fn score_skill(
 
 /// 检查是否满足技能的上下文关键词要求
 fn check_context_requirement(skill: &SkillManifest, input_norm: &str) -> bool {
+    let mut has_context_rule = false;
     for trigger in &skill.triggers {
         if let Some(keywords_str) = trigger.strip_prefix("context:") {
-            let keywords: Vec<&str> = keywords_str.split(',').collect();
+            has_context_rule = true;
+            let keywords: Vec<&str> = keywords_str
+                .split(|c| matches!(c, ',' | '，' | '、'))
+                .collect();
             if keywords.is_empty() {
                 continue;
             }
@@ -461,8 +465,8 @@ fn check_context_requirement(skill: &SkillManifest, input_norm: &str) -> bool {
             }
         }
     }
-    // 没有定义 context 要求，默认返回 true（不强制）
-    true
+    // 没有定义 context 规则时，默认返回 true（不强制）；定义了但未命中，则返回 false
+    !has_context_rule
 }
 
 // ==================== Token 重叠计算 ====================

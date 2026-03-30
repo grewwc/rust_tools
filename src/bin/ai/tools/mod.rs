@@ -10,6 +10,8 @@ mod memory_tools;
 mod patch_tools;
 
 pub(crate) use common::{execute_tool_call_with_args};
+#[cfg(test)]
+pub(crate) use common::{execute_tool_call};
 pub(crate) use common::{
     get_builtin_tool_definitions, get_tool_definitions_by_names, tool_definitions_for_groups,
 };

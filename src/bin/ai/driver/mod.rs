@@ -128,6 +128,44 @@ fn mcp_tools_for_skill(
         .collect()
 }
 
+fn normalize_for_skill_router(input: &str) -> String {
+    input
+        .trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
+        .collect::<String>()
+}
+
+fn router_skill_has_evidence(skill: &SkillManifest, question: &str) -> bool {
+    let input_norm = normalize_for_skill_router(question);
+    if input_norm.is_empty() {
+        return false;
+    }
+
+    for trigger in &skill.triggers {
+        if trigger.starts_with("negative:") {
+            continue;
+        }
+        if let Some(keywords_str) = trigger.strip_prefix("context:") {
+            for keyword in keywords_str.split(|c| matches!(c, ',' | '，' | '、')) {
+                let kw = normalize_for_skill_router(keyword);
+                if !kw.trim().is_empty() && input_norm.contains(&kw) {
+                    return true;
+                }
+            }
+            continue;
+        }
+
+        let trigger_norm = normalize_for_skill_router(trigger);
+        if !trigger_norm.trim().is_empty() && input_norm.contains(&trigger_norm) {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn prepare_skill_for_turn(
     app: &mut App,
     mcp_client: &McpClient,
@@ -158,10 +196,18 @@ fn prepare_skill_for_turn(
         None
     };
 
-    let skill = if let Some(name) = router_selected.as_deref() {
-        skill_manifests.iter().find(|s| s.name == name)
+    let heuristic_skill = match_skill(skill_manifests, question);
+    let router_skill = router_selected
+        .as_deref()
+        .and_then(|name| skill_manifests.iter().find(|s| s.name == name));
+    let skill = if heuristic_skill.is_some() {
+        heuristic_skill
+    } else if let Some(skill) = router_skill
+        && router_skill_has_evidence(skill, question)
+    {
+        Some(skill)
     } else {
-        match_skill(skill_manifests, question)
+        None
     };
     let matched_skill_name = skill.map(|s| s.name.clone());
     let prompt_optimizer_active = skill

@@ -8,6 +8,37 @@ tools:
   - write_file
   - read_file_lines
   - apply_patch
+  - grep_search
+  - search_files
+  - list_directory
+  - execute_command
+  - git_status
+  - git_diff
+  - cargo_check
+  - cargo_test
+triggers:
+  - debugger
+  - debug
+  - 调试
+  - 修复
+  - 修复 bug
+  - fix bug
+  - 报错
+  - error
+  - exception
+  - 异常
+  - panic
+  - traceback
+  - stack trace
+  - 崩溃
+  - crash
+  - 编译失败
+  - 测试失败
+  - context:报错,error,exception,异常,panic,traceback,stack trace,崩溃,crash,编译失败,测试失败,无法运行,bug,修复,debug
+  - /debug
+  - /fix
+priority: 80
+---
 
 guidelines:
   # 核心原则
