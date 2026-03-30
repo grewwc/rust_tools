@@ -387,9 +387,6 @@ fn run_loop(
             prepare_skill_for_turn(app, mcp_client, skill_manifests, &question);
         if let Some(name) = matched_skill_name.as_deref() {
             println!("[skill: {}]", name.cyan());
-            println!("[skill-prompt: {}]", name.cyan());
-            println!("{system_prompt}");
-            println!("[/skill-prompt]");
         }
 
         let mut messages = Vec::new();
