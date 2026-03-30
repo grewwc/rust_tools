@@ -231,6 +231,7 @@ else:
 2. 测试边界索引：index = 0, index = len(my_list) - 1
 3. 测试越界索引：index = len(my_list), index = -len(my_list) - 1
 4. 运行现有单元测试确保无回归
+5. 测试方式必须和代码语言主流习惯保持一致。例如：rust则用#[test]方式写测试
 ```
 
 ---

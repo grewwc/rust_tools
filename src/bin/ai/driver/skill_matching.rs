@@ -1,4 +1,5 @@
 use crate::ai::skills::SkillManifest;
+use regex::Regex;
 use std::collections::BTreeSet;
 
 const SKILL_MATCH_THRESHOLD: i64 = 30;
@@ -45,20 +46,40 @@ pub fn match_skill<'a>(skills: &'a [SkillManifest], input: &str) -> Option<&'a S
     best.map(|(skill, _)| skill)
 }
 
-/// 方案二：检查是否命中负面触发器
+/// 方案二：检查是否命中负面触发器（支持正则表达式）
 fn has_negative_trigger(skill: &SkillManifest, input_norm: &str) -> bool {
-    // 从 skill 的扩展字段中读取 negative_triggers
-    // 由于 SkillManifest 结构可能不支持，这里使用 triggers 中的特殊格式
-    // 格式：negative:xxx 表示负面触发器
+    // 从 skill 的 triggers 中读取 negative triggers
+    // 格式：negative:pattern 表示负面触发器，pattern 可以是普通字符串或正则表达式
     for trigger in &skill.triggers {
         if trigger.starts_with("negative:") {
-            let negative_trigger = normalize(&trigger[9..]);
-            if !negative_trigger.is_empty() && input_norm.contains(&negative_trigger) {
-                return true;
+            let pattern = &trigger[9..];
+            if !pattern.is_empty() {
+                // 尝试将 pattern 作为正则表达式匹配
+                if match_regex_pattern(pattern, input_norm) {
+                    return true;
+                }
             }
         }
     }
     false
+}
+
+/// 使用正则表达式或普通字符串匹配
+fn match_regex_pattern(pattern: &str, text: &str) -> bool {
+    // 首先尝试作为正则表达式匹配
+    // 如果 pattern 包含正则特殊字符，则作为正则处理
+    let has_regex_chars = pattern.contains(|c| matches!(c, '.' | '*' | '+' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'));
+    
+    if has_regex_chars {
+        // 包含正则特殊字符，尝试编译为正则可以
+        if let Ok(regex) = Regex::new(pattern) {
+            return regex.is_match(text);
+        }
+        // 如果正则编译失败，降级为普通字符串匹配
+    }
+    
+    // 普通字符串包含匹配（已 normalized）
+    text.contains(pattern)
 }
 
 /// 方案三：检查是否包含必要的上下文关键词
@@ -324,6 +345,42 @@ mod tests {
     }
 
     #[test]
+    fn negative_trigger_with_regex_pattern() {
+        // 测试正则表达式模式的 negative trigger
+        let skills = vec![skill(
+            "prompt-optimizer",
+            "优化提示词",
+            &[
+                "优化提示词",
+                "negative:为什么.*调用",  // 正则模式：为什么...调用
+                "negative:为什么会",       // 普通字符串模式
+                "negative:技能匹配",       // 普通字符串模式
+            ],
+            20,
+        )];
+
+        // 测试用例 1：匹配正则模式 "为什么.*调用"
+        let input1 = "为什么这个 prompt 会调用到 prompt-optimizer 呢？";
+        assert!(match_skill(&skills, input1).is_none(), "应该被正则模式匹配并排除");
+
+        // 测试用例 2：匹配普通字符串模式 "为什么会"
+        let input2 = "为什么会命中这个 skill 呢？";
+        assert!(match_skill(&skills, input2).is_none(), "应该被普通字符串模式匹配并排除");
+
+        // 测试用例 3：匹配普通字符串模式 "技能匹配"
+        let input3 = "这是什么技能匹配逻辑？";
+        assert!(match_skill(&skills, input3).is_none(), "应该被普通字符串模式匹配并排除");
+
+        // 测试用例 4：不匹配任何 negative trigger，应该正常匹配
+        let input4 = "帮我优化这个提示词";
+        assert!(match_skill(&skills, input4).is_some(), "应该正常匹配");
+
+        // 测试用例 5：用户实际问题复现
+        let input5 = "为什么会命中 /Users/bytedance/.config/rust_tools/skills/prompt-optimizer.skill 这个 skill 呢？";
+        assert!(match_skill(&skills, input5).is_none(), "用户实际问题应该被排除");
+    }
+
+    #[test]
     fn context_keywords_improve_matching() {
         // 方案三测试：上下文关键词应该提高匹配分数
         let skills = vec![
@@ -346,5 +403,29 @@ mod tests {
         let input2 = "优化提示词";
         let matched2 = match_skill(&skills, input2);
         assert!(matched2.is_some());
+    }
+
+    #[test]
+    fn regex_pattern_with_complex_cases() {
+        // 测试更复杂的正则模式
+        let skills = vec![skill(
+            "debugger",
+            "调试代码",
+            &[
+                "调试",
+                "negative:排查.*agent",      // 正则：排查...agent
+                "negative:选择到.*skill",    // 正则：选择到...skill
+                "negative:错误.*触发",       // 正则：错误...触发
+            ],
+            20,
+        )];
+
+        // 匹配正则模式
+        assert!(match_skill(&skills, "排查一下 agent 的问题").is_none());
+        assert!(match_skill(&skills, "为什么选择到这个 skill").is_none());
+        assert!(match_skill(&skills, "这个错误触发了什么问题").is_none());
+
+        // 不匹配 negative trigger，应该正常匹配
+        assert!(match_skill(&skills, "帮我调试这段代码").is_some());
     }
 }
