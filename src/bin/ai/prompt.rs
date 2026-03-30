@@ -45,6 +45,28 @@ impl PromptEditor {
     }
 
     pub(super) fn read_single_line(&mut self) -> io::Result<Option<String>> {
+        use std::io::IsTerminal;
+        // 如果不是 TTY 环境（如 VSCode 终端、管道等），使用普通输入
+        if !io::stdout().is_terminal() {
+            print!("> ");
+            io::stdout().flush()?;
+            let mut line = String::new();
+            match io::stdin().read_line(&mut line) {
+                Ok(0) => {
+                    return Ok(None);
+                }
+                Ok(_) => {
+                    return Ok(Some(trim_trailing_newline(line)));
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                    return exit_on_interrupt();
+                }
+                Err(err) => {
+                    return Err(err);
+                }
+            }
+        }
+
         let Some(editor) = self.editor.as_mut() else {
             print!("> ");
             io::stdout().flush()?;
@@ -250,7 +272,9 @@ impl PromptEditor {
                                 });
                             }
                             // 检测 ctrl+v (CONTROL + v) 粘贴图片
-                            (KeyCode::Char('v'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                            (KeyCode::Char('v'), modifiers)
+                                if modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
                                 // 优先尝试从剪贴板保存图片（模仿 a -f 行为）
                                 match save_clipboard_images(&self.session_image_dir) {
                                     Ok(paths) if !paths.is_empty() => {
@@ -263,7 +287,9 @@ impl PromptEditor {
                                     }
                                     _ => {
                                         // 保存失败或没有图片，尝试粘贴文本
-                                        let clipboard_text = crate::clipboard::string_content::get_clipboard_content();
+                                        let clipboard_text =
+                                            crate::clipboard::string_content::get_clipboard_content(
+                                            );
                                         if !clipboard_text.is_empty() {
                                             insert_text(&mut textarea, &clipboard_text);
                                             continue;
@@ -506,7 +532,7 @@ fn image_placeholder(path: &Path) -> String {
 fn save_clipboard_images(dir: &Path) -> io::Result<Vec<PathBuf>> {
     fs::create_dir_all(dir)?;
     let mut paths = Vec::new();
-    
+
     // 尝试保存一张图片
     let path = dir.join(format!("paste-{}.png", Uuid::new_v4()));
     match image_content::save_to_file(path.to_string_lossy().as_ref()) {
@@ -517,10 +543,10 @@ fn save_clipboard_images(dir: &Path) -> io::Result<Vec<PathBuf>> {
             return Ok(paths);
         }
     }
-    
+
     // 注意：arboard 目前只支持获取单张图片，所以这里只保存一张
     // 如果未来需要支持多张图片，可以在这里添加循环逻辑
-    
+
     Ok(paths)
 }
 
