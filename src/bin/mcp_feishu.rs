@@ -504,7 +504,9 @@ fn feishu_docs_get_text(args: &Value) -> Result<String, JsonRpcErr> {
         &client,
         &base_url,
         "Missing user_access_token. Fetch requires OAuth once.",
-        |token| feishu_fetch_raw_content(&client, &base_url, token, &docs_type, &docs_token, lang),
+        |token| {
+            feishu_fetch_raw_content(&client, &base_url, token, &docs_type, &docs_token, lang, None)
+        },
     )
 }
 
@@ -560,6 +562,7 @@ fn feishu_docs_get_text_by_url(args: &Value) -> Result<String, JsonRpcErr> {
             Some(json!({ "url": url })),
         ));
     };
+    let default_origin = extract_url_origin(&url);
 
     with_user_access_token(
         &client,
@@ -577,6 +580,7 @@ fn feishu_docs_get_text_by_url(args: &Value) -> Result<String, JsonRpcErr> {
                         &docs_type,
                         &docs_token,
                         lang,
+                        default_origin.as_deref(),
                     ),
                     "sheet" => feishu_fetch_sheet_preview_text(
                         &client,
@@ -597,7 +601,15 @@ fn feishu_docs_get_text_by_url(args: &Value) -> Result<String, JsonRpcErr> {
                 }
             }
             "doc" | "docx" => {
-                feishu_fetch_raw_content(&client, &base_url, token, &kind, &tok, lang)
+                feishu_fetch_raw_content(
+                    &client,
+                    &base_url,
+                    token,
+                    &kind,
+                    &tok,
+                    lang,
+                    default_origin.as_deref(),
+                )
             }
             "sheet" => feishu_fetch_sheet_preview_text(
                 &client, &base_url, token, &tok, max_rows, max_cols, max_sheets,
@@ -668,7 +680,9 @@ fn feishu_docs_export_text(args: &Value) -> Result<String, JsonRpcErr> {
         &client,
         &base_url,
         "Missing user_access_token. Fetch requires OAuth once.",
-        |token| feishu_fetch_raw_content(&client, &base_url, token, &docs_type, &docs_token, lang),
+        |token| {
+            feishu_fetch_raw_content(&client, &base_url, token, &docs_type, &docs_token, lang, None)
+        },
     )?;
 
     let dir = PathBuf::from(&out_dir);
@@ -1125,6 +1139,7 @@ fn feishu_fetch_raw_content(
     docs_type: &str,
     docs_token: &str,
     lang: i64,
+    default_origin: Option<&str>,
 ) -> Result<String, JsonRpcErr> {
     let content = feishu_fetch_raw_content_api(
         client,
@@ -1139,8 +1154,13 @@ fn feishu_fetch_raw_content(
         return Ok(content);
     }
 
-    let blocks_text =
-        feishu_fetch_docx_blocks_text(client, base_url, user_access_token, docs_token)?;
+    let blocks_text = feishu_fetch_docx_blocks_text(
+        client,
+        base_url,
+        user_access_token,
+        docs_token,
+        default_origin,
+    )?;
     if should_prefer_docx_blocks_render(&content, &blocks_text) {
         Ok(blocks_text)
     } else {
@@ -1249,6 +1269,7 @@ fn feishu_fetch_docx_blocks_text(
     base_url: &str,
     user_access_token: &str,
     document_id: &str,
+    default_origin: Option<&str>,
 ) -> Result<String, JsonRpcErr> {
     let mut page_token: Option<String> = None;
     let mut items = Vec::new();
@@ -1336,7 +1357,7 @@ fn feishu_fetch_docx_blocks_text(
         page_token = next_token;
     }
 
-    Ok(render_docx_blocks_as_text(&items))
+    Ok(render_docx_blocks_as_text(&items, default_origin))
 }
 
 fn should_prefer_docx_blocks_render(raw_content: &str, blocks_text: &str) -> bool {
@@ -1369,7 +1390,7 @@ fn docx_blocks_text_has_non_text_placeholders(s: &str) -> bool {
         || s.contains("[小组件")
 }
 
-fn render_docx_blocks_as_text(items: &[Value]) -> String {
+fn render_docx_blocks_as_text(items: &[Value], default_origin: Option<&str>) -> String {
     if items.is_empty() {
         return String::new();
     }
@@ -1401,11 +1422,16 @@ fn render_docx_blocks_as_text(items: &[Value]) -> String {
     };
 
     let mut out = String::new();
-    render_docx_block_text(&root_id, &by_id, &mut out);
+    render_docx_block_text(&root_id, &by_id, default_origin, &mut out);
     normalize_rendered_docx_text(&out)
 }
 
-fn render_docx_block_text(block_id: &str, by_id: &HashMap<String, &Value>, out: &mut String) {
+fn render_docx_block_text(
+    block_id: &str,
+    by_id: &HashMap<String, &Value>,
+    default_origin: Option<&str>,
+    out: &mut String,
+) {
     let Some(block) = by_id.get(block_id).copied() else {
         return;
     };
@@ -1414,14 +1440,14 @@ fn render_docx_block_text(block_id: &str, by_id: &HashMap<String, &Value>, out: 
         .get("block_type")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    let line = render_docx_block_line(block);
+    let line = render_docx_block_line(block, default_origin);
     if !line.is_empty() {
         out.push_str(&line);
         out.push('\n');
     }
 
     if block_type == 31 {
-        render_docx_table_cells(block, by_id, out);
+        render_docx_table_cells(block, by_id, default_origin, out);
         return;
     }
 
@@ -1432,12 +1458,17 @@ fn render_docx_block_text(block_id: &str, by_id: &HashMap<String, &Value>, out: 
         .unwrap_or_default();
     for child in children {
         if let Some(child_id) = child.as_str() {
-            render_docx_block_text(child_id, by_id, out);
+            render_docx_block_text(child_id, by_id, default_origin, out);
         }
     }
 }
 
-fn render_docx_table_cells(block: &Value, by_id: &HashMap<String, &Value>, out: &mut String) {
+fn render_docx_table_cells(
+    block: &Value,
+    by_id: &HashMap<String, &Value>,
+    default_origin: Option<&str>,
+    out: &mut String,
+) {
     let cells = block
         .get("table")
         .and_then(|v| v.get("cells"))
@@ -1459,7 +1490,7 @@ fn render_docx_table_cells(block: &Value, by_id: &HashMap<String, &Value>, out: 
         let Some(cell_id) = cell.as_str() else {
             continue;
         };
-        let cell_text = render_docx_table_cell_text(cell_id, by_id);
+        let cell_text = render_docx_table_cell_text(cell_id, by_id, default_origin);
         row.push(cell_text);
         if row.len() >= col_size {
             out.push_str(&row.join("\t"));
@@ -1473,7 +1504,11 @@ fn render_docx_table_cells(block: &Value, by_id: &HashMap<String, &Value>, out: 
     }
 }
 
-fn render_docx_table_cell_text(cell_id: &str, by_id: &HashMap<String, &Value>) -> String {
+fn render_docx_table_cell_text(
+    cell_id: &str,
+    by_id: &HashMap<String, &Value>,
+    default_origin: Option<&str>,
+) -> String {
     let Some(block) = by_id.get(cell_id).copied() else {
         return String::new();
     };
@@ -1483,6 +1518,7 @@ fn render_docx_table_cell_text(cell_id: &str, by_id: &HashMap<String, &Value>) -
             .get("table_cell")
             .and_then(|v| v.get("elements"))
             .or_else(|| block.get("text").and_then(|v| v.get("elements"))),
+        default_origin,
     );
     if !direct.is_empty() {
         return direct;
@@ -1501,7 +1537,7 @@ fn render_docx_table_cell_text(cell_id: &str, by_id: &HashMap<String, &Value>) -
         let Some(child_block) = by_id.get(child_id).copied() else {
             continue;
         };
-        let line = render_docx_block_line(child_block);
+        let line = render_docx_block_line(child_block, default_origin);
         if !line.is_empty() {
             parts.push(line);
         }
@@ -1509,20 +1545,21 @@ fn render_docx_table_cell_text(cell_id: &str, by_id: &HashMap<String, &Value>) -
     parts.join(" ")
 }
 
-fn render_docx_block_line(block: &Value) -> String {
+fn render_docx_block_line(block: &Value, default_origin: Option<&str>) -> String {
     let block_type = block
         .get("block_type")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
     match block_type {
-        1 => render_text_elements(block.get("page").and_then(|v| v.get("elements"))),
-        2 => render_text_elements(block.get("text").and_then(|v| v.get("elements"))),
+        1 => render_text_elements(block.get("page").and_then(|v| v.get("elements")), default_origin),
+        2 => render_text_elements(block.get("text").and_then(|v| v.get("elements")), default_origin),
         3..=11 => {
             let level = (block_type - 2) as usize;
             let text = render_text_elements(
                 block
                     .get(format!("heading{}", level).as_str())
                     .and_then(|v| v.get("elements")),
+                default_origin,
             );
             if text.is_empty() {
                 String::new()
@@ -1531,7 +1568,8 @@ fn render_docx_block_line(block: &Value) -> String {
             }
         }
         12 => {
-            let text = render_text_elements(block.get("bullet").and_then(|v| v.get("elements")));
+            let text =
+                render_text_elements(block.get("bullet").and_then(|v| v.get("elements")), default_origin);
             if text.is_empty() {
                 String::new()
             } else {
@@ -1539,7 +1577,8 @@ fn render_docx_block_line(block: &Value) -> String {
             }
         }
         13 => {
-            let text = render_text_elements(block.get("ordered").and_then(|v| v.get("elements")));
+            let text =
+                render_text_elements(block.get("ordered").and_then(|v| v.get("elements")), default_origin);
             if text.is_empty() {
                 String::new()
             } else {
@@ -1547,7 +1586,10 @@ fn render_docx_block_line(block: &Value) -> String {
             }
         }
         14 => {
-            let text = render_text_elements(block.get("code").and_then(|v| v.get("elements")));
+            let text = render_text_elements(
+                block.get("code").and_then(|v| v.get("elements")),
+                default_origin,
+            );
             if text.is_empty() {
                 String::new()
             } else {
@@ -1555,7 +1597,10 @@ fn render_docx_block_line(block: &Value) -> String {
             }
         }
         15 => {
-            let text = render_text_elements(block.get("quote").and_then(|v| v.get("elements")));
+            let text = render_text_elements(
+                block.get("quote").and_then(|v| v.get("elements")),
+                default_origin,
+            );
             if text.is_empty() {
                 String::new()
             } else {
@@ -1564,7 +1609,7 @@ fn render_docx_block_line(block: &Value) -> String {
         }
         17 => {
             let todo = block.get("todo");
-            let text = render_text_elements(todo.and_then(|v| v.get("elements")));
+            let text = render_text_elements(todo.and_then(|v| v.get("elements")), default_origin);
             let checked = todo
                 .and_then(|v| v.get("style"))
                 .and_then(|v| v.get("done"))
@@ -1578,7 +1623,10 @@ fn render_docx_block_line(block: &Value) -> String {
         }
         18 => render_token_placeholder(block.get("bitable"), "token", "多维表格"),
         19 => {
-            let text = render_text_elements(block.get("callout").and_then(|v| v.get("elements")));
+            let text = render_text_elements(
+                block.get("callout").and_then(|v| v.get("elements")),
+                default_origin,
+            );
             if text.is_empty() {
                 "[高亮块]".to_string()
             } else {
@@ -1641,21 +1689,140 @@ fn render_token_placeholder(container: Option<&Value>, field: &str, label: &str)
     }
 }
 
-fn render_text_elements(elements: Option<&Value>) -> String {
+fn extract_url_origin(url: &str) -> Option<String> {
+    let raw = url.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let raw = raw.split('#').next().unwrap_or(raw);
+    let raw = raw.split('?').next().unwrap_or(raw);
+    let (scheme, rest) = if let Some((s, r)) = raw.split_once("://") {
+        (s.trim(), r)
+    } else {
+        ("https", raw)
+    };
+    let host = rest.split('/').next().unwrap_or("").trim();
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{}://{}", scheme, host))
+}
+
+fn render_doc_mention_as_markdown(mention: &Value, default_origin: Option<&str>) -> Option<String> {
+    let title = mention
+        .get("title")
+        .or_else(|| mention.get("name"))
+        .or_else(|| mention.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let url = mention
+        .get("url")
+        .and_then(|v| v.as_str())
+        .or_else(|| mention.get("href").and_then(|v| v.as_str()))
+        .or_else(|| {
+            mention
+                .get("link")
+                .and_then(|v| v.get("url"))
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let token = mention
+        .get("token")
+        .or_else(|| mention.get("obj_token"))
+        .or_else(|| mention.get("docs_token"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    let obj_type = mention
+        .get("obj_type")
+        .or_else(|| mention.get("docs_type"))
+        .or_else(|| mention.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_lowercase();
+
+    let url = url.or_else(|| {
+        if token.is_empty() {
+            return None;
+        }
+        let kind = match obj_type.as_str() {
+            "docx" => "docx",
+            "doc" | "docs" => "doc",
+            "sheet" | "sheets" => "sheets",
+            "wiki" => "wiki",
+            _ => "docx",
+        };
+        let origin = default_origin.unwrap_or("https://www.feishu.cn").trim();
+        Some(format!(
+            "{}/{}/{}",
+            origin.trim_end_matches('/'),
+            kind,
+            token
+        ))
+    });
+
+    let Some(url) = url else {
+        if title.is_empty() {
+            return None;
+        }
+        return Some(title);
+    };
+
+    if title.is_empty() {
+        Some(url)
+    } else {
+        Some(format!("[{}]({})", title, url))
+    }
+}
+
+fn render_text_elements(elements: Option<&Value>, default_origin: Option<&str>) -> String {
     let Some(arr) = elements.and_then(|v| v.as_array()) else {
         return String::new();
     };
 
     let mut out = String::new();
     for el in arr {
-        if let Some(v) = el
-            .get("text_run")
-            .and_then(|v| v.get("content"))
-            .and_then(|v| v.as_str())
-        {
-            out.push_str(v);
+        // 处理 text_run，包括链接
+        if let Some(text_run) = el.get("text_run") {
+            let content = text_run
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            // 检查是否有链接
+            let link_url = text_run
+                .get("text_style")
+                .and_then(|v| v.get("link"))
+                .and_then(|v| v.get("url"))
+                .and_then(|v| v.as_str());
+
+            if let Some(url) = link_url {
+                // 如果有链接，格式化为 [文本](URL) 的 Markdown 格式
+                if !content.is_empty() {
+                    out.push('[');
+                    out.push_str(content);
+                    out.push_str("](");
+                    out.push_str(url);
+                    out.push(')');
+                } else {
+                    // 如果内容为空但 URL 存在，直接显示 URL
+                    out.push_str(url);
+                }
+            } else {
+                // 没有链接，直接显示文本
+                out.push_str(content);
+            }
             continue;
         }
+
         if let Some(v) = el
             .get("equation")
             .and_then(|v| v.get("content"))
@@ -1677,17 +1844,11 @@ fn render_text_elements(elements: Option<&Value>) -> String {
             out.push_str(v);
             continue;
         }
-        if let Some(v) = el
-            .get("mention_doc")
-            .and_then(|v| {
-                v.get("title")
-                    .or_else(|| v.get("obj_type"))
-                    .or_else(|| v.get("token"))
-            })
-            .and_then(|v| v.as_str())
-        {
-            out.push_str(v);
-            continue;
+        if let Some(v) = el.get("mention_doc") {
+            if let Some(s) = render_doc_mention_as_markdown(v, default_origin) {
+                out.push_str(&s);
+                continue;
+            }
         }
         if let Some(v) = el
             .get("reminder")
@@ -2957,7 +3118,7 @@ mod tests {
             }),
         ];
 
-        let rendered = render_docx_blocks_as_text(&items);
+        let rendered = render_docx_blocks_as_text(&items, None);
         assert!(rendered.contains("## 6.1 文字绘图"));
         assert!(rendered.contains("[流程图]"));
         assert!(rendered.find("## 6.1 文字绘图") < rendered.find("[流程图]"));
@@ -3005,7 +3166,7 @@ mod tests {
             }),
         ];
 
-        let rendered = render_docx_blocks_as_text(&items);
+        let rendered = render_docx_blocks_as_text(&items, None);
         assert!(rendered.contains("### 6.1. 系统架构图"));
         assert!(rendered.contains("[文字绘图: board-token-1]"));
         assert!(rendered.contains("[文字绘图: board-token-2]"));
@@ -3076,5 +3237,72 @@ mod tests {
                 std::env::remove_var("FEISHU_USER_ACCESS_TOKEN");
             }
         }
+    }
+    #[test]
+    fn render_text_elements_preserves_links() {
+        // 测试普通文本（无链接）
+        let elements_no_link = json!([
+            { "text_run": { "content": "普通文本" } }
+        ]);
+        assert_eq!(
+            render_text_elements(Some(&elements_no_link), None),
+            "普通文本"
+        );
+
+        // 测试带链接的文本
+        let elements_with_link = json!([
+            {
+                "text_run": {
+                    "content": "点击这里",
+                    "text_style": {
+                        "link": {
+                            "url": "https://example.com"
+                        }
+                    }
+                }
+            }
+        ]);
+        assert_eq!(
+            render_text_elements(Some(&elements_with_link), None),
+            "[点击这里](https://example.com)"
+        );
+
+        // 测试混合文本（有链接和无链接）
+        let elements_mixed = json!([
+            { "text_run": { "content": "前面文字" } },
+            {
+                "text_run": {
+                    "content": "链接文本",
+                    "text_style": {
+                        "link": {
+                            "url": "https://test.com"
+                        }
+                    }
+                }
+            },
+            { "text_run": { "content": "后面文字" } }
+        ]);
+        assert_eq!(
+            render_text_elements(Some(&elements_mixed), None),
+            "前面文字[链接文本](https://test.com)后面文字"
+        );
+
+        // 测试只有 URL 没有文本内容的情况
+        let elements_url_only = json!([
+            {
+                "text_run": {
+                    "content": "",
+                    "text_style": {
+                        "link": {
+                            "url": "https://bare-url.com"
+                        }
+                    }
+                }
+            }
+        ]);
+        assert_eq!(
+            render_text_elements(Some(&elements_url_only), None),
+            "https://bare-url.com"
+        );
     }
 }
