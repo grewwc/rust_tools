@@ -214,11 +214,19 @@ impl PromptEditor {
 
                 match event::read().map_err(|e| io::Error::other(e.to_string()))? {
                     Event::Paste(pasted) => {
-                        if let Ok(Some(path)) = save_clipboard_image(&self.session_image_dir) {
-                            let placeholder = image_placeholder(&path);
-                            insert_text(&mut textarea, &placeholder);
-                        } else {
-                            insert_text(&mut textarea, &pasted);
+                        // 优先尝试从剪贴板保存图片（模仿 a -f 行为）
+                        match save_clipboard_images(&self.session_image_dir) {
+                            Ok(paths) if !paths.is_empty() => {
+                                // 保存图片成功，插入所有图片的文件路径
+                                for path in paths {
+                                    let placeholder = image_placeholder(&path);
+                                    insert_text(&mut textarea, &placeholder);
+                                }
+                            }
+                            _ => {
+                                // 保存失败或没有图片，插入原始文本
+                                insert_text(&mut textarea, &pasted);
+                            }
                         }
                     }
                     Event::Key(mut key) => {
@@ -241,20 +249,26 @@ impl PromptEditor {
                                     Some(trimmed)
                                 });
                             }
-                            // Detect cmd+v (SUPER + v) to paste image from clipboard
-                            (KeyCode::Char('v'), modifiers) if modifiers.contains(KeyModifiers::SUPER) => {
-                                // Try to save image from clipboard
-                                if let Ok(Some(path)) = save_clipboard_image(&self.session_image_dir) {
-                                    let placeholder = image_placeholder(&path);
-                                    insert_text(&mut textarea, &placeholder);
-                                    continue; // Skip further input processing
-                                }
-                                // If no image, also try to paste text from clipboard
-                                // This ensures cmd+v works for both images and text
-                                let clipboard_text = crate::clipboard::string_content::get_clipboard_content();
-                                if !clipboard_text.is_empty() {
-                                    insert_text(&mut textarea, &clipboard_text);
-                                    continue;
+                            // 检测 ctrl+v (CONTROL + v) 粘贴图片
+                            (KeyCode::Char('v'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+                                // 优先尝试从剪贴板保存图片（模仿 a -f 行为）
+                                match save_clipboard_images(&self.session_image_dir) {
+                                    Ok(paths) if !paths.is_empty() => {
+                                        // 保存图片成功，插入所有图片的文件路径
+                                        for path in paths {
+                                            let placeholder = image_placeholder(&path);
+                                            insert_text(&mut textarea, &placeholder);
+                                        }
+                                        continue; // 跳过后续处理
+                                    }
+                                    _ => {
+                                        // 保存失败或没有图片，尝试粘贴文本
+                                        let clipboard_text = crate::clipboard::string_content::get_clipboard_content();
+                                        if !clipboard_text.is_empty() {
+                                            insert_text(&mut textarea, &clipboard_text);
+                                            continue;
+                                        }
+                                    }
                                 }
                             }
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
@@ -488,13 +502,26 @@ fn image_placeholder(path: &Path) -> String {
     format!("[[image:{}]]", path.display())
 }
 
-fn save_clipboard_image(dir: &Path) -> io::Result<Option<PathBuf>> {
+/// 从剪贴板保存图片（可能多个），返回保存的文件路径列表
+fn save_clipboard_images(dir: &Path) -> io::Result<Vec<PathBuf>> {
     fs::create_dir_all(dir)?;
+    let mut paths = Vec::new();
+    
+    // 尝试保存一张图片
     let path = dir.join(format!("paste-{}.png", Uuid::new_v4()));
     match image_content::save_to_file(path.to_string_lossy().as_ref()) {
-        Ok(()) => Ok(Some(path)),
-        Err(_) => Ok(None),
+        Ok(()) => {
+            paths.push(path);
+        }
+        Err(e) => {
+            return Ok(paths);
+        }
     }
+    
+    // 注意：arboard 目前只支持获取单张图片，所以这里只保存一张
+    // 如果未来需要支持多张图片，可以在这里添加循环逻辑
+    
+    Ok(paths)
 }
 
 fn is_submit_key(
