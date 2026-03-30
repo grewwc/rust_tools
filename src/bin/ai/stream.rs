@@ -15,7 +15,8 @@ pub(super) fn stream_response(
     response: &mut reqwest::blocking::Response,
     current_history: &mut String,
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
-    let mut reader = BufReader::new(response);
+    // Use smaller buffer to reduce latency in streaming output
+    let mut reader = BufReader::with_capacity(256, response);
     let thinking_tag = "<thinking>".yellow().to_string();
     let end_thinking_tag = "<end thinking>".yellow().to_string();
     let mut thinking_open = false;
@@ -438,10 +439,13 @@ fn write_stream_content(
 
     if markdown.should_render(content) {
         markdown.write_chunk(content)?;
+        // Force flush after markdown rendering to ensure real-time output
+        io::stdout().flush()?;
     } else {
         print!("{content}");
+        io::stdout().flush()?;
     }
-    io::stdout().flush()
+    Ok(())
 }
 
 pub(super) struct MarkdownStreamRenderer {
@@ -509,6 +513,7 @@ impl MarkdownStreamRenderer {
         };
         let preview_height = preview_height_for_rendered(&rendered).max(1);
         out.write_all(rendered.as_bytes())?;
+        out.flush()?;
         self.line_preview_emitted = true;
         self.line_preview_height = preview_height;
         Ok(())
@@ -520,6 +525,7 @@ impl MarkdownStreamRenderer {
             if ch == '\n' {
                 if self.line_preview_emitted {
                     out.write_all(b"\n")?;
+                    out.flush()?;
                     self.bol = true;
                 }
                 let line = std::mem::take(&mut self.line_buf);
@@ -528,6 +534,7 @@ impl MarkdownStreamRenderer {
                 self.line_preview_height = 0;
                 if !rendered.is_empty() {
                     out.write_all(rendered.as_bytes())?;
+                    out.flush()?;
                     self.bol = rendered.ends_with('\n');
                 }
                 continue;
@@ -537,11 +544,13 @@ impl MarkdownStreamRenderer {
             if self.should_emit_table_preview_live() {
                 if !self.line_preview_emitted {
                     out.write_all(self.line_buf.as_bytes())?;
+                    out.flush()?;
                     self.line_preview_emitted = true;
                     self.line_preview_height = table_preview_height(&self.line_buf).max(1);
                 } else {
                     let mut buf = [0u8; 4];
                     out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
+                    out.flush()?;
                     self.line_preview_height = table_preview_height(&self.line_buf).max(1);
                 }
             } else {

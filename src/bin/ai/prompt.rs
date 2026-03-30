@@ -241,6 +241,22 @@ impl PromptEditor {
                                     Some(trimmed)
                                 });
                             }
+                            // Detect cmd+v (SUPER + v) to paste image from clipboard
+                            (KeyCode::Char('v'), modifiers) if modifiers.contains(KeyModifiers::SUPER) => {
+                                // Try to save image from clipboard
+                                if let Ok(Some(path)) = save_clipboard_image(&self.session_image_dir) {
+                                    let placeholder = image_placeholder(&path);
+                                    insert_text(&mut textarea, &placeholder);
+                                    continue; // Skip further input processing
+                                }
+                                // If no image, also try to paste text from clipboard
+                                // This ensures cmd+v works for both images and text
+                                let clipboard_text = crate::clipboard::string_content::get_clipboard_content();
+                                if !clipboard_text.is_empty() {
+                                    insert_text(&mut textarea, &clipboard_text);
+                                    continue;
+                                }
+                            }
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                                 break Err(io::Error::new(io::ErrorKind::Interrupted, "Ctrl+C"));
                             }
