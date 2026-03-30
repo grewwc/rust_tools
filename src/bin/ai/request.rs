@@ -178,18 +178,18 @@ pub(super) fn do_request_messages(
                 let status = response.status();
                 let body = response.text().unwrap_or_default();
                 let err = RequestError::status(status, body);
-                
+
                 // 根据状态码确定最大重试次数
                 let max_attempts_for_status = if status.as_u16() == 429 {
                     REQUEST_MAX_ATTEMPTS_429
                 } else {
                     REQUEST_MAX_ATTEMPTS
                 };
-                
+
                 if should_retry_status(status) && attempt < max_attempts_for_status {
                     // 打印 sleep 原因
                     let delay = retry_delay(attempt);
-                    
+
                     if status.as_u16() == 429 {
                         eprintln!(
                             "[Warning] 429 Too Many Requests - 配额超限，sleep {} 秒后重试 (attempt {}/{})",

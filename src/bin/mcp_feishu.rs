@@ -505,7 +505,15 @@ fn feishu_docs_get_text(args: &Value) -> Result<String, JsonRpcErr> {
         &base_url,
         "Missing user_access_token. Fetch requires OAuth once.",
         |token| {
-            feishu_fetch_raw_content(&client, &base_url, token, &docs_type, &docs_token, lang, None)
+            feishu_fetch_raw_content(
+                &client,
+                &base_url,
+                token,
+                &docs_type,
+                &docs_token,
+                lang,
+                None,
+            )
         },
     )
 }
@@ -600,17 +608,15 @@ fn feishu_docs_get_text_by_url(args: &Value) -> Result<String, JsonRpcErr> {
                     )),
                 }
             }
-            "doc" | "docx" => {
-                feishu_fetch_raw_content(
-                    &client,
-                    &base_url,
-                    token,
-                    &kind,
-                    &tok,
-                    lang,
-                    default_origin.as_deref(),
-                )
-            }
+            "doc" | "docx" => feishu_fetch_raw_content(
+                &client,
+                &base_url,
+                token,
+                &kind,
+                &tok,
+                lang,
+                default_origin.as_deref(),
+            ),
             "sheet" => feishu_fetch_sheet_preview_text(
                 &client, &base_url, token, &tok, max_rows, max_cols, max_sheets,
             ),
@@ -681,7 +687,15 @@ fn feishu_docs_export_text(args: &Value) -> Result<String, JsonRpcErr> {
         &base_url,
         "Missing user_access_token. Fetch requires OAuth once.",
         |token| {
-            feishu_fetch_raw_content(&client, &base_url, token, &docs_type, &docs_token, lang, None)
+            feishu_fetch_raw_content(
+                &client,
+                &base_url,
+                token,
+                &docs_type,
+                &docs_token,
+                lang,
+                None,
+            )
         },
     )?;
 
@@ -1551,8 +1565,14 @@ fn render_docx_block_line(block: &Value, default_origin: Option<&str>) -> String
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
     match block_type {
-        1 => render_text_elements(block.get("page").and_then(|v| v.get("elements")), default_origin),
-        2 => render_text_elements(block.get("text").and_then(|v| v.get("elements")), default_origin),
+        1 => render_text_elements(
+            block.get("page").and_then(|v| v.get("elements")),
+            default_origin,
+        ),
+        2 => render_text_elements(
+            block.get("text").and_then(|v| v.get("elements")),
+            default_origin,
+        ),
         3..=11 => {
             let level = (block_type - 2) as usize;
             let text = render_text_elements(
@@ -1568,8 +1588,10 @@ fn render_docx_block_line(block: &Value, default_origin: Option<&str>) -> String
             }
         }
         12 => {
-            let text =
-                render_text_elements(block.get("bullet").and_then(|v| v.get("elements")), default_origin);
+            let text = render_text_elements(
+                block.get("bullet").and_then(|v| v.get("elements")),
+                default_origin,
+            );
             if text.is_empty() {
                 String::new()
             } else {
@@ -1577,8 +1599,10 @@ fn render_docx_block_line(block: &Value, default_origin: Option<&str>) -> String
             }
         }
         13 => {
-            let text =
-                render_text_elements(block.get("ordered").and_then(|v| v.get("elements")), default_origin);
+            let text = render_text_elements(
+                block.get("ordered").and_then(|v| v.get("elements")),
+                default_origin,
+            );
             if text.is_empty() {
                 String::new()
             } else {

@@ -492,14 +492,14 @@ fn run_loop(
                     Ok(result) => result,
                     Err(err) => {
                         app.streaming.store(false, Ordering::Release);
-                        
+
                         // Log the error and handle gracefully instead of crashing
                         eprintln!("\n[Error] 流式响应处理失败：{}", err);
                         eprintln!("[Info] 尝试继续对话...");
-                        
+
                         // Try to drain any remaining response data
                         let _ = drain_response(&mut response);
-                        
+
                         // Create an empty StreamResult to allow continuation
                         StreamResult {
                             outcome: StreamOutcome::Completed,

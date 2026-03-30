@@ -90,7 +90,7 @@ impl Default for SkipListConfig {
 }
 
 /// 跳表数据结构
-/// 
+///
 /// 跳表是一种基于链表的数据结构，通过多层索引实现高效的查找、插入和删除操作。
 /// 平均时间复杂度：查找 O(log n)，插入 O(log n)，删除 O(log n)
 /// 空间复杂度：O(n)
@@ -131,9 +131,9 @@ where
             },
             forward: vec![None; config.max_level],
         });
-        
+
         let head_ptr = NonNull::new(Box::into_raw(head)).unwrap();
-        
+
         SkipList {
             head: head_ptr,
             level: 1,
@@ -162,14 +162,12 @@ where
     fn random_level(&self) -> usize {
         let mut lvl = 1;
         let mut rng = rand::random::<f64>();
-        
-        while lvl < self.config.max_level 
-            && rng < self.config.promotion_probability 
-        {
+
+        while lvl < self.config.max_level && rng < self.config.promotion_probability {
             lvl += 1;
             rng = rand::random::<f64>();
         }
-        
+
         lvl
     }
 
@@ -177,7 +175,7 @@ where
     fn find(&self, key: &K) -> (Vec<NonNull<Node<K, V>>>, Option<NonNull<Node<K, V>>>) {
         let mut update: Vec<NonNull<Node<K, V>>> = vec![self.head; self.config.max_level];
         let mut current = self.head;
-        
+
         unsafe {
             for i in (0..self.level).rev() {
                 while let Some(next) = (&(*current.as_ptr()).forward)[i] {
@@ -189,7 +187,7 @@ where
                 }
                 update[i] = current;
             }
-            
+
             // 检查下一个节点是否是要找的节点
             if let Some(next) = (&(*current.as_ptr()).forward).get(0).and_then(|&x| x) {
                 if (*next.as_ptr()).key == *key {
@@ -197,7 +195,7 @@ where
                 }
             }
         }
-        
+
         (update, None)
     }
 
@@ -215,7 +213,7 @@ where
     /// 插入或更新键值对
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let (update, existing) = self.find(&key);
-        
+
         unsafe {
             if let Some(node_ptr) = existing {
                 // 键已存在，更新值
@@ -223,10 +221,10 @@ where
                 std::ptr::write(&mut (*node_ptr.as_ptr()).value, value);
                 return Some(old_value);
             }
-            
+
             // 生成新节点的层级
             let new_level = self.random_level();
-            
+
             // 如果新层级超过当前最大层级，更新 update 数组
             let mut update = update;
             if new_level > self.level {
@@ -235,17 +233,18 @@ where
                 }
                 self.level = new_level;
             }
-            
+
             // 创建新节点
             let new_node = Box::new(Node::new(key, value, new_level));
             let new_node_ptr = NonNull::new(Box::into_raw(new_node)).unwrap();
-            
+
             // 在每一层插入新节点
             for i in 0..new_level {
-                (&mut (*new_node_ptr.as_ptr()).forward)[i] = (&mut (*update[i].as_ptr()).forward)[i];
+                (&mut (*new_node_ptr.as_ptr()).forward)[i] =
+                    (&mut (*update[i].as_ptr()).forward)[i];
                 (&mut (*update[i].as_ptr()).forward)[i] = Some(new_node_ptr);
             }
-            
+
             self.length += 1;
             None
         }
@@ -254,16 +253,16 @@ where
     /// 删除指定键的节点
     pub fn remove(&mut self, key: &K) -> Option<V> {
         let (update, existing) = self.find(key);
-        
+
         unsafe {
             let node_ptr = existing?;
-            
+
             // 验证节点确实存在于跳表中
             let node_key = &(*node_ptr.as_ptr()).key;
             if node_key != key {
                 return None;
             }
-            
+
             // 从每一层中移除节点
             for i in 0..self.level {
                 let current_forward = (&mut (*update[i].as_ptr()).forward)[i];
@@ -271,18 +270,18 @@ where
                     (&mut (*update[i].as_ptr()).forward)[i] = (&(*node_ptr.as_ptr()).forward)[i];
                 }
             }
-            
+
             // 读取被删除节点的值
             let removed_value = std::ptr::read(&(*node_ptr.as_ptr()).value);
-            
+
             // 释放节点内存
             drop(Box::from_raw(node_ptr.as_ptr()));
-            
+
             // 更新最大层级
             while self.level > 1 && (&(*self.head.as_ptr()).forward)[self.level - 1].is_none() {
                 self.level -= 1;
             }
-            
+
             self.length -= 1;
             Some(removed_value)
         }
@@ -309,7 +308,7 @@ where
         if self.is_empty() {
             return None;
         }
-        
+
         unsafe {
             let mut current = self.head;
             for i in (0..self.level).rev() {
@@ -317,11 +316,11 @@ where
                     current = next;
                 }
             }
-            
+
             if current == self.head {
                 return None;
             }
-            
+
             let node = &*current.as_ptr();
             Some((&node.key, &node.value))
         }
@@ -340,7 +339,7 @@ where
                     }
                 }
             }
-            
+
             if let Some(next) = (&(*current.as_ptr()).forward).get(0).and_then(|&x| x) {
                 let node = &*next.as_ptr();
                 return Some((&node.key, &node.value));
@@ -362,7 +361,7 @@ where
                     }
                 }
             }
-            
+
             if let Some(next) = (&(*current.as_ptr()).forward).get(0).and_then(|&x| x) {
                 let node = &*next.as_ptr();
                 return Some((&node.key, &node.value));
@@ -374,7 +373,7 @@ where
     /// 获取指定范围内的所有元素（左闭右开区间 [start, end)）
     pub fn range(&self, start: &K, end: &K) -> Vec<(&K, &V)> {
         let mut result = Vec::new();
-        
+
         unsafe {
             let mut current = self.head;
             for i in (0..self.level).rev() {
@@ -386,13 +385,13 @@ where
                     }
                 }
             }
-            
+
             // 从第一个 >= start 的节点开始遍历
             if let Some(mut next) = (&(*current.as_ptr()).forward).get(0).and_then(|&x| x) {
                 while (*next.as_ptr()).key < *end {
                     let node = &*next.as_ptr();
                     result.push((&node.key, &node.value));
-                    
+
                     if let Some(n) = (&(*next.as_ptr()).forward).get(0).and_then(|&x| x) {
                         next = n;
                     } else {
@@ -401,7 +400,7 @@ where
                 }
             }
         }
-        
+
         result
     }
 
@@ -414,12 +413,12 @@ where
                 drop(Box::from_raw(node_ptr.as_ptr()));
                 current = next;
             }
-            
+
             // 重置头节点的指针
             for i in 0..self.config.max_level {
                 (&mut (*self.head.as_ptr()).forward)[i] = None;
             }
-            
+
             self.level = 1;
             self.length = 0;
         }
@@ -500,13 +499,13 @@ mod tests {
     #[test]
     fn test_insert_and_get() {
         let mut sl = SkipList::new();
-        
+
         sl.insert(3, "three");
         sl.insert(1, "one");
         sl.insert(5, "five");
         sl.insert(2, "two");
         sl.insert(4, "four");
-        
+
         assert_eq!(sl.get(&1), Some(&"one"));
         assert_eq!(sl.get(&2), Some(&"two"));
         assert_eq!(sl.get(&3), Some(&"three"));
@@ -518,10 +517,10 @@ mod tests {
     #[test]
     fn test_update() {
         let mut sl = SkipList::new();
-        
+
         sl.insert(1, "one");
         assert_eq!(sl.get(&1), Some(&"one"));
-        
+
         let old = sl.insert(1, "ONE");
         assert_eq!(old, Some("one"));
         assert_eq!(sl.get(&1), Some(&"ONE"));
@@ -530,15 +529,15 @@ mod tests {
     #[test]
     fn test_remove() {
         let mut sl = SkipList::new();
-        
+
         sl.insert(1, "one");
         sl.insert(2, "two");
         sl.insert(3, "three");
-        
+
         assert_eq!(sl.remove(&2), Some("two"));
         assert_eq!(sl.get(&2), None);
         assert_eq!(sl.len(), 2);
-        
+
         assert_eq!(sl.remove(&2), None);
         assert_eq!(sl.len(), 2);
     }
@@ -548,14 +547,14 @@ mod tests {
         let mut sl = SkipList::<i32, i32>::new();
         assert!(sl.is_empty());
         assert_eq!(sl.len(), 0);
-        
+
         sl.insert(1, 1);
         assert!(!sl.is_empty());
         assert_eq!(sl.len(), 1);
-        
+
         sl.insert(2, 2);
         assert_eq!(sl.len(), 2);
-        
+
         sl.remove(&1);
         assert_eq!(sl.len(), 1);
     }
@@ -565,11 +564,11 @@ mod tests {
         let mut sl = SkipList::new();
         assert_eq!(sl.first(), None);
         assert_eq!(sl.last(), None);
-        
+
         sl.insert(3, "three");
         sl.insert(1, "one");
         sl.insert(5, "five");
-        
+
         assert_eq!(sl.first(), Some((&1, &"one")));
         assert_eq!(sl.last(), Some((&5, &"five")));
     }
@@ -578,7 +577,7 @@ mod tests {
     fn test_contains_key() {
         let mut sl = SkipList::new();
         sl.insert(1, "one");
-        
+
         assert!(sl.contains_key(&1));
         assert!(!sl.contains_key(&2));
     }
@@ -589,7 +588,7 @@ mod tests {
         sl.insert(1, "one");
         sl.insert(3, "three");
         sl.insert(5, "five");
-        
+
         assert_eq!(sl.lower_bound(&2), Some((&3, &"three")));
         assert_eq!(sl.lower_bound(&3), Some((&3, &"three")));
         assert_eq!(sl.lower_bound(&6), None);
@@ -601,7 +600,7 @@ mod tests {
         sl.insert(1, "one");
         sl.insert(3, "three");
         sl.insert(5, "five");
-        
+
         assert_eq!(sl.upper_bound(&2), Some((&3, &"three")));
         assert_eq!(sl.upper_bound(&3), Some((&5, &"five")));
         assert_eq!(sl.upper_bound(&5), None);
@@ -613,7 +612,7 @@ mod tests {
         for i in 1..=10 {
             sl.insert(i, i * 10);
         }
-        
+
         let range = sl.range(&3, &7);
         assert_eq!(range.len(), 4);
         assert_eq!(range[0], (&3, &30));
@@ -628,7 +627,7 @@ mod tests {
         sl.insert(3, "three");
         sl.insert(1, "one");
         sl.insert(2, "two");
-        
+
         let keys: Vec<_> = sl.iter().map(|(k, _)| *k).collect();
         assert_eq!(keys, vec![1, 2, 3]);
     }
@@ -639,7 +638,7 @@ mod tests {
         sl.insert(1, "one");
         sl.insert(2, "two");
         sl.insert(3, "three");
-        
+
         assert_eq!(sl.len(), 3);
         sl.clear();
         assert_eq!(sl.len(), 0);
@@ -650,26 +649,26 @@ mod tests {
     #[test]
     fn test_large_dataset() {
         let mut sl = SkipList::new();
-        
+
         // 插入大量数据
         for i in 0..1000 {
             sl.insert(i, i * 2);
         }
-        
+
         assert_eq!(sl.len(), 1000);
-        
+
         // 验证所有数据
         for i in 0..1000 {
             assert_eq!(sl.get(&i), Some(&(i * 2)));
         }
-        
+
         // 删除一半数据
         for i in 0..500 {
             sl.remove(&i);
         }
-        
+
         assert_eq!(sl.len(), 500);
-        
+
         // 验证删除后的数据
         for i in 0..500 {
             assert_eq!(sl.get(&i), None);
@@ -684,7 +683,7 @@ mod tests {
         let mut sl = SkipList::new();
         sl.insert(1, "one");
         sl.insert(2, "two");
-        
+
         let debug_str = format!("{:?}", sl);
         assert!(debug_str.contains("1"));
         assert!(debug_str.contains("2"));

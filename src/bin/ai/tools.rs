@@ -95,15 +95,15 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute path to the file to read"
+                    "description": "Absolute path to a regular file to read (directories are not supported; some sensitive paths are blocked)."
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "The line number to start reading from (1-based)"
+                    "description": "1-based line number to start reading from (default: 1)."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "The number of lines to read"
+                    "description": "Requested number of lines to read; output is capped (currently 10 lines) and may be truncated."
                 }
             },
             "required": ["file_path"]
@@ -113,15 +113,15 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute path to the file to read"
+                    "description": "Absolute path to a regular file to read (directories are not supported; some sensitive paths are blocked)."
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "The line number to start reading from (1-based)"
+                    "description": "1-based line number to start reading from (default: 1)."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "The number of lines to read (max: 400)"
+                    "description": "Number of lines to return (1-400; default: 200)."
                 }
             },
             "required": ["file_path"]
@@ -131,11 +131,11 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute path to the file to write"
+                    "description": "Absolute path to the file to write. Parent directories are created if missing."
                 },
                 "content": {
                     "type": "string",
-                    "description": "The content to write to the file"
+                    "description": "Full file content to write (overwrites existing file)."
                 }
             },
             "required": ["file_path", "content"]
@@ -145,7 +145,7 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "The absolute path to the directory to list"
+                    "description": "Directory path to list (non-recursive). Absolute path recommended."
                 }
             },
             "required": ["path"]
@@ -159,7 +159,7 @@ fn get_tool_parameters(name: &str) -> Value {
                 },
                 "path": {
                     "type": "string",
-                    "description": "The directory to search in (default: \".\"). Returned paths are absolute."
+                    "description": "Root directory to search in (default: \".\"). Returned paths are canonical absolute paths."
                 }
             },
             "required": ["pattern"]
@@ -169,15 +169,15 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The command to execute"
+                    "description": "Shell command to execute. Destructive/network/escalation commands are blocked."
                 },
                 "cwd": {
                     "type": "string",
-                    "description": "The working directory for the command"
+                    "description": "Optional working directory for the command (default: current directory)."
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds"
+                    "description": "Timeout in seconds (1-300; default: 30)."
                 }
             },
             "required": ["command"]
@@ -187,15 +187,15 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "The regex pattern to search for"
+                    "description": "Filename or glob pattern to match (e.g. \"Cargo.toml\", \"*.rs\", \"src/**\")."
                 },
                 "path": {
                     "type": "string",
-                    "description": "The file or directory to search in"
+                    "description": "Root directory to search in (default: \".\")."
                 },
                 "file_pattern": {
                     "type": "string",
-                    "description": "Glob pattern to filter files"
+                    "description": "Optional glob pattern override. If provided, it takes precedence over `pattern`."
                 }
             },
             "required": ["pattern"]
@@ -205,11 +205,11 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The search query"
+                    "description": "Search query text."
                 },
                 "num_results": {
                     "type": "integer",
-                    "description": "Number of results to return"
+                    "description": "Maximum number of results to return (default: 5)."
                 }
             },
             "required": ["query"]
@@ -219,7 +219,7 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "The URL to fetch content from (supports http/https links, can access external websites and documentation)"
+                    "description": "http/https URL to fetch. Localhost and private network targets are blocked; response body is capped."
                 }
             },
             "required": ["url"]
@@ -229,11 +229,11 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "The absolute path to the file to patch"
+                    "description": "Absolute path to the file to patch (some sensitive paths are blocked)."
                 },
                 "patch": {
                     "type": "string",
-                    "description": "Unified diff patch content"
+                    "description": "Unified diff patch text (expects @@ hunks with context/add/remove lines)."
                 }
             },
             "required": ["file_path", "patch"]
@@ -243,7 +243,7 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "cwd": {
                     "type": "string",
-                    "description": "Working directory (default: \".\")"
+                    "description": "Working directory containing the git repository (default: \".\")."
                 }
             }
         }),
@@ -252,15 +252,15 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "cwd": {
                     "type": "string",
-                    "description": "Working directory (default: \".\")"
+                    "description": "Working directory containing the git repository (default: \".\")."
                 },
                 "cached": {
                     "type": "boolean",
-                    "description": "Diff staged changes"
+                    "description": "If true, diff staged changes (--cached)."
                 },
                 "pathspec": {
                     "type": "string",
-                    "description": "Optional pathspec, like \"src\" or \"Cargo.toml\""
+                    "description": "Optional pathspec to limit the diff (e.g. \"src\" or \"Cargo.toml\")."
                 }
             }
         }),
@@ -269,19 +269,19 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "cwd": {
                     "type": "string",
-                    "description": "Working directory (default: \".\")"
+                    "description": "Working directory for the cargo command (default: \".\")."
                 },
                 "workspace": {
                     "type": "boolean",
-                    "description": "Run for workspace"
+                    "description": "If true (default), run for the whole workspace (--workspace)."
                 },
                 "all_features": {
                     "type": "boolean",
-                    "description": "Enable all features"
+                    "description": "If true, enable all features (--all-features)."
                 },
                 "package": {
                     "type": "string",
-                    "description": "Optional package name"
+                    "description": "Optional package name to target (-p <name>)."
                 }
             }
         }),
@@ -290,19 +290,19 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "cwd": {
                     "type": "string",
-                    "description": "Working directory (default: \".\")"
+                    "description": "Working directory for the cargo command (default: \".\")."
                 },
                 "workspace": {
                     "type": "boolean",
-                    "description": "Run for workspace"
+                    "description": "If true (default), run for the whole workspace (--workspace)."
                 },
                 "all_features": {
                     "type": "boolean",
-                    "description": "Enable all features"
+                    "description": "If true, enable all features (--all-features)."
                 },
                 "package": {
                     "type": "string",
-                    "description": "Optional package name"
+                    "description": "Optional package name to target (-p <name>)."
                 }
             }
         }),
@@ -311,59 +311,59 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Skill name"
+                    "description": "Skill identifier used in the YAML front matter (and default filename)."
                 },
                 "description": {
                     "type": "string",
-                    "description": "Short skill description"
+                    "description": "Short summary shown in skill lists and matching."
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Skill prompt body"
+                    "description": "Full skill prompt body (Markdown). Saved after the YAML front matter."
                 },
                 "system_prompt": {
                     "type": "string",
-                    "description": "Optional system prompt"
+                    "description": "Optional additional system prompt text to include in the YAML front matter."
                 },
                 "triggers": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Trigger phrases for matching"
+                    "description": "Trigger phrases used for matching this skill."
                 },
                 "tools": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Explicit tool names"
+                    "description": "Explicit tool names that the skill is allowed to use."
                 },
                 "tool_groups": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Tool groups, e.g. builtin/openclaw"
+                    "description": "Tool groups that the skill is allowed to use (e.g. builtin, openclaw)."
                 },
                 "mcp_servers": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Required MCP server names"
+                    "description": "Required MCP server names needed to run this skill."
                 },
                 "priority": {
                     "type": "integer",
-                    "description": "Match priority"
+                    "description": "Optional match priority; higher values take precedence."
                 },
                 "author": {
                     "type": "string",
-                    "description": "Skill author"
+                    "description": "Author string (default: \"agent\")."
                 },
                 "version": {
                     "type": "string",
-                    "description": "Skill version"
+                    "description": "Version string (default: \"1.0.0\")."
                 },
                 "file_name": {
                     "type": "string",
-                    "description": "Optional target file name"
+                    "description": "Optional output filename; it will be sanitized and forced to end with .skill."
                 },
                 "overwrite": {
                     "type": "boolean",
-                    "description": "Whether overwrite existing file, default true"
+                    "description": "If false, fail when the target file already exists (default: true)."
                 }
             },
             "required": ["name", "prompt"]
@@ -373,20 +373,20 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "note": {
                     "type": "string",
-                    "description": "Memory content"
+                    "description": "Memory note text to store."
                 },
                 "category": {
                     "type": "string",
-                    "description": "Memory category"
+                    "description": "Category label for the note (default: \"general\")."
                 },
                 "tags": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional tags"
+                    "description": "Optional tags for later retrieval."
                 },
                 "source": {
                     "type": "string",
-                    "description": "Optional source/context"
+                    "description": "Optional source/context string (e.g. URL, project name, ticket id)."
                 }
             },
             "required": ["note"]
@@ -396,11 +396,11 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Case-insensitive keyword query"
+                    "description": "Keyword query (case-insensitive) matched against note/category/tags/source."
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max entries, default 8"
+                    "description": "Maximum number of results (1-50; default: 8)."
                 }
             },
             "required": ["query"]
@@ -410,7 +410,7 @@ fn get_tool_parameters(name: &str) -> Value {
             "properties": {
                 "limit": {
                     "type": "integer",
-                    "description": "Max entries, default 8"
+                    "description": "Maximum number of entries to return (1-50; default: 8)."
                 }
             }
         }),
@@ -493,7 +493,7 @@ fn params_memory_recent() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "read_file",
-        description: "Read the contents of a file from the local filesystem",
+        description: "Read a small, line-numbered excerpt from a local file (regular files only; directories are not supported; absolute paths only). Use offset/limit to choose a range; output is capped (currently 10 lines) and may be truncated.",
         parameters: params_read_file,
         execute: execute_read_file,
         groups: &["builtin"],
@@ -503,7 +503,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "write_file",
-        description: "Write content to a file on the local filesystem",
+        description: "Create or overwrite a local file at an absolute path. Creates parent directories if missing; access to common secret locations is blocked.",
         parameters: params_write_file,
         execute: execute_write_file,
         groups: &["builtin"],
@@ -513,7 +513,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "search_files",
-        description: "Search for files by exact file name or glob pattern (returns absolute paths)",
+        description: "Find files under a directory by exact filename (fast) or glob pattern. Returns canonical absolute paths, one per line (empty output means no matches).",
         parameters: params_search_files,
         execute: execute_search_files,
         groups: &["builtin"],
@@ -523,7 +523,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "list_directory",
-        description: "List files and directories in a given path",
+        description: "List direct children of a directory (non-recursive). Each line is a child name; directories are suffixed with '/'.",
         parameters: params_list_directory,
         execute: execute_list_directory,
         groups: &["builtin"],
@@ -533,7 +533,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "execute_command",
-        description: "Execute a shell command",
+        description: "Run a shell command with an optional working directory and timeout. Destructive/network/escalation commands are blocked; output is truncated and includes an exit code on failure.",
         parameters: params_execute_command,
         execute: execute_command,
         groups: &["builtin"],
@@ -543,7 +543,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "grep_search",
-        description: "Search for patterns in file contents",
+        description: "Fast file-path search under a root directory using filename match or glob. Returns paths relative to the current working directory (may include ANSI highlighting).",
         parameters: params_grep_search,
         execute: execute_grep_search,
         groups: &["builtin"],
@@ -553,7 +553,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "web_search",
-        description: "Search the web for information. Use this tool when you need to find information online, look up documentation, or search for external resources.",
+        description: "Search the public web (DuckDuckGo HTML parsing) for documentation and references. Currently disabled in this build.",
         parameters: params_web_search,
         execute: execute_web_search,
         groups: &["builtin"],
@@ -563,7 +563,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "web_fetch",
-        description: "Fetch content from a URL or external link. Use this tool to access external websites, documentation, articles, or any http/https links.",
+        description: "Fetch the raw response body of an http/https URL (2s timeout, 512KB cap). Blocks localhost/private network targets.",
         parameters: params_web_fetch,
         execute: execute_web_fetch,
         groups: &["builtin"],
@@ -573,7 +573,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "read_file_lines",
-        description: "Read file contents with configurable line limits",
+        description: "Read line-numbered text from a local file with configurable offset/limit (limit capped at 400).",
         parameters: params_read_file_lines,
         execute: execute_read_file_lines,
         groups: &["openclaw"],
@@ -583,7 +583,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply a unified diff patch to a file",
+        description: "Apply a unified-diff patch to a file (absolute path). Creates missing parent directories; fails if context/removals do not match.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
         groups: &["openclaw"],
@@ -593,7 +593,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "git_status",
-        description: "Get git status (porcelain)",
+        description: "Run `git status --porcelain=v1 --branch` in a directory and return the output.",
         parameters: params_git_status,
         execute: execute_git_status,
         groups: &["openclaw"],
@@ -603,7 +603,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "git_diff",
-        description: "Get git diff",
+        description: "Run `git diff` (optionally --cached and/or with a pathspec) and return the diff (truncated).",
         parameters: params_git_diff,
         execute: execute_git_diff,
         groups: &["openclaw"],
@@ -613,7 +613,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "cargo_check",
-        description: "Run cargo check",
+        description: "Run `cargo check` with optional workspace/all-features/package flags and return the output.",
         parameters: params_cargo_check,
         execute: execute_cargo_check,
         groups: &["openclaw"],
@@ -623,7 +623,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "cargo_test",
-        description: "Run cargo test",
+        description: "Run `cargo test` with optional workspace/all-features/package flags and return the output.",
         parameters: params_cargo_test,
         execute: execute_cargo_test,
         groups: &["openclaw"],
@@ -633,7 +633,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "save_skill",
-        description: "Save a reusable skill into external skills directory",
+        description: "Render and save a .skill file (YAML front matter + prompt body) into the configured skills directory.",
         parameters: params_save_skill,
         execute: execute_save_skill,
         groups: &["builtin"],
@@ -643,7 +643,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "memory_append",
-        description: "Append a note into agent memory store",
+        description: "Append a structured memory entry (timestamp/category/tags/source/note) to the agent memory store (JSONL).",
         parameters: params_memory_append,
         execute: execute_memory_append,
         groups: &["builtin"],
@@ -653,7 +653,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "memory_search",
-        description: "Search notes from agent memory store",
+        description: "Search the agent memory store for a keyword across note/category/tags/source and return recent matches.",
         parameters: params_memory_search,
         execute: execute_memory_search,
         groups: &["builtin"],
@@ -663,7 +663,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "memory_recent",
-        description: "Show recent notes from agent memory store",
+        description: "Show the most recent entries from the agent memory store.",
         parameters: params_memory_recent,
         execute: execute_memory_recent,
         groups: &["builtin"],

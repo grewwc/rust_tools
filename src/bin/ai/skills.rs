@@ -5,10 +5,6 @@ use crate::common::{configw, utils::expanduser};
 
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
     (
-        "openclaw.skill",
-        include_str!("builtin_skills/openclaw.skill"),
-    ),
-    (
         "debugger.skill",
         include_str!("builtin_skills/debugger.skill"),
     ),
@@ -323,7 +319,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rust-tools-skills-{}", uuid::Uuid::new_v4()));
         ensure_seeded_skills_dir(&dir).unwrap();
         let skills = load_skills_from_dir(&dir);
-        assert_eq!(skills.len(), 4);
+        assert_eq!(skills.len(), BUILTIN_SKILLS.len());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -360,7 +356,6 @@ custom"#,
             .iter()
             .map(|s| s.name.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        assert!(names.contains("openclaw"));
         assert!(names.contains("debugger"));
         assert!(names.contains("code-review"));
         assert!(names.contains("refactor"));

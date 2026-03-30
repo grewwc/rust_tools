@@ -31,42 +31,210 @@ const PRIORITY_WEIGHT: f64 = 0.3;
 // 常见停用词（中文和英文），降低这些词的权重
 const STOP_WORDS: &[&str] = &[
     // 中文停用词
-    "的", "了", "是", "在", "有", "和", "就", "不", "人",
-    "都", "一", "一个", "上", "也", "很", "到", "说", "要", "去",
-    "会", "着", "没有", "看", "好", "自己", "这", "那",
-    "他", "她", "它", "们", "这个", "那个", "怎么",
-    "如何", "为什么", "请", "一下", "可以", "能",
-    "吗", "呢", "吧", "啊", "哦", "嗯",
+    "的",
+    "了",
+    "是",
+    "在",
+    "有",
+    "和",
+    "就",
+    "不",
+    "人",
+    "都",
+    "一",
+    "一个",
+    "上",
+    "也",
+    "很",
+    "到",
+    "说",
+    "要",
+    "去",
+    "会",
+    "着",
+    "没有",
+    "看",
+    "好",
+    "自己",
+    "这",
+    "那",
+    "他",
+    "她",
+    "它",
+    "们",
+    "这个",
+    "那个",
+    "怎么",
+    "如何",
+    "为什么",
+    "请",
+    "一下",
+    "可以",
+    "能",
+    "吗",
+    "呢",
+    "吧",
+    "啊",
+    "哦",
+    "嗯",
     // 英文停用词
-    "the", "a", "an", "is", "are", "was", "were", "be", "been",
-    "being", "have", "has", "had", "do", "does", "did", "will",
-    "would", "could", "should", "may", "might", "must", "shall",
-    "can", "need", "dare", "ought", "used", "to", "of", "in",
-    "for", "on", "with", "at", "by", "from", "as", "into", "through",
-    "during", "before", "after", "above", "below", "between",
-    "under", "again", "further", "then", "once", "here", "there",
-    "when", "where", "why", "how", "all", "each", "few", "more",
-    "most", "other", "some", "such", "no", "nor", "not", "only",
-    "own", "same", "so", "than", "too", "very", "just", "and",
-    "but", "if", "or", "because", "until", "while", "about",
-    "against", "this", "that", "these", "those", "am", "it", "its",
-    "i", "me", "my", "myself", "we", "our", "ours", "ourselves",
-    "you", "your", "yours", "yourself", "yourselves", "he", "him",
-    "his", "himself", "she", "her", "hers", "herself", "they",
-    "them", "their", "theirs", "themselves", "what", "which",
-    "who", "whom", "any", "both", "her", "his", "yours", "mine",
+    "the",
+    "a",
+    "an",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "have",
+    "has",
+    "had",
+    "do",
+    "does",
+    "did",
+    "will",
+    "would",
+    "could",
+    "should",
+    "may",
+    "might",
+    "must",
+    "shall",
+    "can",
+    "need",
+    "dare",
+    "ought",
+    "used",
+    "to",
+    "of",
+    "in",
+    "for",
+    "on",
+    "with",
+    "at",
+    "by",
+    "from",
+    "as",
+    "into",
+    "through",
+    "during",
+    "before",
+    "after",
+    "above",
+    "below",
+    "between",
+    "under",
+    "again",
+    "further",
+    "then",
+    "once",
+    "here",
+    "there",
+    "when",
+    "where",
+    "why",
+    "how",
+    "all",
+    "each",
+    "few",
+    "more",
+    "most",
+    "other",
+    "some",
+    "such",
+    "no",
+    "nor",
+    "not",
+    "only",
+    "own",
+    "same",
+    "so",
+    "than",
+    "too",
+    "very",
+    "just",
+    "and",
+    "but",
+    "if",
+    "or",
+    "because",
+    "until",
+    "while",
+    "about",
+    "against",
+    "this",
+    "that",
+    "these",
+    "those",
+    "am",
+    "it",
+    "its",
+    "i",
+    "me",
+    "my",
+    "myself",
+    "we",
+    "our",
+    "ours",
+    "ourselves",
+    "you",
+    "your",
+    "yours",
+    "yourself",
+    "yourselves",
+    "he",
+    "him",
+    "his",
+    "himself",
+    "she",
+    "her",
+    "hers",
+    "herself",
+    "they",
+    "them",
+    "their",
+    "theirs",
+    "themselves",
+    "what",
+    "which",
+    "who",
+    "whom",
+    "any",
+    "both",
+    "her",
+    "his",
+    "yours",
+    "mine",
     // 通用编程术语（过于常见）
-    "code", "代码", "function", "函数", "file", "文件", "help", "帮助",
-    "make", "让", "get", "获取", "use", "使用", "write", "写", "read", "读",
+    "code",
+    "代码",
+    "function",
+    "函数",
+    "file",
+    "文件",
+    "help",
+    "帮助",
+    "make",
+    "让",
+    "get",
+    "获取",
+    "use",
+    "使用",
+    "write",
+    "写",
+    "read",
+    "读",
 ];
 
 // ==================== 数据结构 ====================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SkillScore {
-    evidence: i64,      // 证据分（基于匹配度）
-    total: i64,         // 总分（证据分 + 优先级加权）
-    matched_triggers: i64, // 匹配的 trigger 数量
+    evidence: i64,           // 证据分（基于匹配度）
+    total: i64,              // 总分（证据分 + 优先级加权）
+    matched_triggers: i64,   // 匹配的 trigger 数量
     has_context_bonus: bool, // 是否有上下文奖励
 }
 
@@ -125,11 +293,7 @@ pub fn match_skill<'a>(skills: &'a [SkillManifest], input: &str) -> Option<&'a S
             // 其次比较匹配的 trigger 数量
             .then_with(|| score_b.matched_triggers.cmp(&score_a.matched_triggers))
             // 再比较是否有上下文奖励
-            .then_with(|| {
-                score_b
-                    .has_context_bonus
-                    .cmp(&score_a.has_context_bonus)
-            })
+            .then_with(|| score_b.has_context_bonus.cmp(&score_a.has_context_bonus))
             // 最后比较优先级（权重已降低）
             .then_with(|| score_b.total.cmp(&score_a.total))
             // 如果都相同，按技能名称字母序（保证确定性）
@@ -157,7 +321,12 @@ fn has_negative_trigger(skill: &SkillManifest, input_norm: &str) -> bool {
 /// 使用正则表达式或普通字符串匹配
 fn match_regex_pattern(pattern: &str, text: &str) -> bool {
     // 判断是否包含正则特殊字符
-    let has_regex_chars = pattern.contains(|c| matches!(c, '.' | '*' | '+' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'));
+    let has_regex_chars = pattern.contains(|c| {
+        matches!(
+            c,
+            '.' | '*' | '+' | '?' | '^' | '$' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+        )
+    });
 
     if has_regex_chars {
         // 尝试编译为正则
@@ -223,7 +392,8 @@ fn score_skill(
 
         if overlap >= 2 {
             // 基础分 + 重叠数量分
-            let overlap_score = TOKEN_OVERLAP_BASE_SCORE + (overlap as i64 * TOKEN_OVERLAP_BASE_SCORE);
+            let overlap_score =
+                TOKEN_OVERLAP_BASE_SCORE + (overlap as i64 * TOKEN_OVERLAP_BASE_SCORE);
 
             // 如果有上下文关键词，增加权重
             if has_context_bonus {
@@ -298,11 +468,7 @@ fn check_context_requirement(skill: &SkillManifest, input_norm: &str) -> bool {
 // ==================== Token 重叠计算 ====================
 
 /// 带权重的 token 重叠计算（考虑停用词）
-fn weighted_token_overlap(
-    a: &[String],
-    b: &[String],
-    stop_words_set: &BTreeSet<String>,
-) -> usize {
+fn weighted_token_overlap(a: &[String], b: &[String], stop_words_set: &BTreeSet<String>) -> usize {
     if a.is_empty() || b.is_empty() {
         return 0;
     }
@@ -398,13 +564,7 @@ fn normalize(input: &str) -> String {
         .trim()
         .to_lowercase()
         .chars()
-        .map(|c| {
-            if c.is_ascii_punctuation() {
-                ' '
-            } else {
-                c
-            }
-        })
+        .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
         .collect::<String>()
 }
 
@@ -492,11 +652,7 @@ mod tests {
             skill(
                 "prompt-optimizer",
                 "优化提示词",
-                &[
-                    "优化提示词",
-                    "改进提示",
-                    "context:优化，改进，建议，更好",
-                ],
+                &["优化提示词", "改进提示", "context:优化，改进，建议，更好"],
                 80,
             ),
             skill(
@@ -554,12 +710,7 @@ mod tests {
                 &["帮我看看代码", "代码审查", "代码有问题吗"],
                 80,
             ),
-            skill(
-                "debugger",
-                "调试代码",
-                &["调试"],
-                70,
-            ),
+            skill("debugger", "调试代码", &["调试"], 70),
         ];
 
         // 输入匹配多个 code-review 的 trigger
@@ -607,11 +758,7 @@ mod tests {
         let skills = vec![skill(
             "debugger",
             "调试代码",
-            &[
-                "调试",
-                "negative:排查.*agent",
-                "negative:选择到.*skill",
-            ],
+            &["调试", "negative:排查.*agent", "negative:选择到.*skill"],
             70,
         )];
 
