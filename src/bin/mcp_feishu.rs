@@ -596,7 +596,9 @@ fn feishu_docs_get_text_by_url(args: &Value) -> Result<String, JsonRpcErr> {
                     )),
                 }
             }
-            "doc" | "docx" => feishu_fetch_raw_content(&client, &base_url, token, &kind, &tok, lang),
+            "doc" | "docx" => {
+                feishu_fetch_raw_content(&client, &base_url, token, &kind, &tok, lang)
+            }
             "sheet" => feishu_fetch_sheet_preview_text(
                 &client, &base_url, token, &tok, max_rows, max_cols, max_sheets,
             ),
@@ -2023,9 +2025,11 @@ fn extract_feishu_error_message(data: Option<&Value>) -> Option<String> {
         return Some(msg.trim().to_string());
     }
     let body = data.get("body").and_then(|v| v.as_str())?;
-    serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| v.get("msg").and_then(|x| x.as_str()).map(|s| s.trim().to_string()))
+    serde_json::from_str::<Value>(body).ok().and_then(|v| {
+        v.get("msg")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+    })
 }
 
 fn invalid_user_access_token_error(err: JsonRpcErr) -> JsonRpcErr {
@@ -3005,9 +3009,7 @@ mod tests {
         assert!(rendered.contains("### 6.1. 系统架构图"));
         assert!(rendered.contains("[文字绘图: board-token-1]"));
         assert!(rendered.contains("[文字绘图: board-token-2]"));
-        assert!(
-            rendered.find("### 6.1. 系统架构图") < rendered.find("[文字绘图: board-token-1]")
-        );
+        assert!(rendered.find("### 6.1. 系统架构图") < rendered.find("[文字绘图: board-token-1]"));
     }
 
     #[test]

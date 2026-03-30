@@ -8,9 +8,9 @@ use std::{
 use chrono::Local;
 use regex::Regex;
 use serde_json::{Value, json};
+use std::io::Read;
 use std::sync::LazyLock;
 use std::time::Duration;
-use std::{io::Read, process::Stdio, time::Instant};
 
 use super::ff_embed;
 use super::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
@@ -1093,6 +1093,10 @@ fn execute_memory_append(args: &Value) -> Result<String, String> {
     } else {
         String::new()
     };
+    // Ensure proper newline separation if existing content doesn't end with newline
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        existing.push('\n');
+    }
     existing.push_str(&serialized);
     existing.push('\n');
     fs::write(&path, existing).map_err(|e| format!("Failed to write memory file: {e}"))?;
@@ -1462,33 +1466,19 @@ fn execute_command(args: &Value) -> Result<String, String> {
         return Ok(format!("Command blocked: {reason}"));
     }
 
-    let mut cmd =
-        crate::cmd::run::build_no_shell_command(command, crate::cmd::run::RunCmdOptions { cwd })
-            .map_err(|e| format!("Failed to execute command: {}", e))?;
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to execute command: {}", e))?;
-    let deadline = Instant::now() + Duration::from_secs(timeout);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Ok("Command blocked: timeout".to_string());
-                }
-                std::thread::sleep(Duration::from_millis(20));
+    let output = match crate::cmd::run::run_cmd_output_with_timeout(
+        command,
+        crate::cmd::run::RunCmdOptions { cwd },
+        Duration::from_secs(timeout),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                return Ok("Command blocked: timeout".to_string());
             }
-            Err(e) => return Err(format!("Failed to execute command: {}", e)),
+            return Err(format!("Failed to execute command: {}", e));
         }
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("Failed to collect command output: {}", e))?;
+    };
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();

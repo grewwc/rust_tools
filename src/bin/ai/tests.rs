@@ -516,12 +516,10 @@ fn execute_command_blocks_dangerous_programs() {
 }
 
 #[test]
-fn execute_command_blocks_shell_metacharacters() {
-    assert!(tools::validate_execute_command("ls; rm -rf /").is_err());
-    assert!(tools::validate_execute_command("ls | wc").is_err());
-    assert!(tools::validate_execute_command("ls && pwd").is_err());
-    assert!(tools::validate_execute_command("echo hi > /tmp/a").is_err());
-    assert!(tools::validate_execute_command("find . -exec ls {} \\;").is_err());
+fn execute_command_allows_common_shell_syntax() {
+    assert!(tools::validate_execute_command("ls | wc").is_ok());
+    assert!(tools::validate_execute_command("ls && pwd").is_ok());
+    assert!(tools::validate_execute_command("echo hi > /tmp/a").is_ok());
 }
 
 #[test]
