@@ -14,7 +14,7 @@ use crate::common::utils::open_file_for_append;
 
 use super::types::ToolCall;
 
-const MAX_HISTORY_LINES: usize = 100;
+pub(super) const MAX_HISTORY_LINES: usize = 200;
 pub(super) const COLON: char = '\0';
 pub(super) const NEWLINE: char = '\x01';
 
@@ -203,10 +203,20 @@ fn parse_history_line(line: &str) -> Option<Message> {
 }
 
 fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<Message> {
-    if max_chars == 0 || messages.is_empty() {
+    if max_chars == 0 {
+        return messages;
+    }
+
+    if messages.is_empty() {
         return Vec::new();
     }
 
+    // 如果总长度已经在限制内，直接返回
+    if messages_total_chars(&messages) <= max_chars {
+        return messages;
+    }
+
+    // 从前往后移除消息，直到总长度满足限制（至少保留最后一条）
     let mut start = 0usize;
     while start + 1 < messages.len() && messages_total_chars(&messages[start..]) > max_chars {
         start += 1;
@@ -215,21 +225,29 @@ fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<M
         messages = messages[start..].to_vec();
     }
 
-    if messages_total_chars(&messages) <= max_chars {
-        return messages;
+    // 如果仍然超出限制，截断第一条消息的内容（而不是删除其他消息）
+    if messages_total_chars(&messages) > max_chars {
+        truncate_first_message_to_fit(&mut messages, max_chars);
     }
 
-    let first = messages.first_mut().unwrap();
-    let text = value_to_string(&first.content);
-    let truncated = truncate_to_chars(&text, max_chars);
-    *first = Message {
-        role: first.role.clone(),
-        content: Value::String(truncated),
-        tool_calls: first.tool_calls.clone(),
-        tool_call_id: first.tool_call_id.clone(),
-    };
-    messages.truncate(1);
     messages
+}
+
+/// 截断第一条消息的内容，使其适应剩余字符限制
+/// 至少保留 50 个字符给第一条消息
+fn truncate_first_message_to_fit(messages: &mut [Message], max_chars: usize) {
+    if messages.is_empty() {
+        return;
+    }
+
+    let remaining_chars = max_chars
+        .saturating_sub(messages_total_chars(&messages[1..]))
+        .max(50);
+
+    let first = &mut messages[0];
+    let text = value_to_string(&first.content);
+    let truncated = truncate_to_chars(&text, remaining_chars);
+    first.content = Value::String(truncated);
 }
 
 fn messages_total_chars(messages: &[Message]) -> usize {
