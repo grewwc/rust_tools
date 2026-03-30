@@ -312,32 +312,32 @@ pub(super) fn select_skill_via_model(
     }
 
     let mut lines = Vec::new();
-    lines.push("Choose at most one skill from the list. Return JSON only.".to_string());
-    lines.push("Output schema: {\"skill\":\"<name or empty>\",\"confidence\":0.0}".to_string());
-    lines.push("Rules:".to_string());
-    lines.push("- Only choose a skill if it clearly helps.".to_string());
-    lines.push("- If none fits, set skill to empty string.".to_string());
-    lines.push("- Use EXACT skill name from the list.".to_string());
+    lines.push("You are a skill router for a CODE development assistant. Your ONLY job is to route CODE-related questions to appropriate skills.".to_string());
+    lines.push("Output schema: {\"skill\":\"<exact skill name or empty>\",\"confidence\":0.0}".to_string());
+    lines.push("Critical Rules:".to_string());
+    lines.push("- ALL skills in this system are for CODE only. If the question is NOT about programming/coding, ALWAYS return empty skill.".to_string());
+    lines.push("- Check: Is the user asking about SOURCE CODE files (.rs, .py, .js, .java, .go, etc.)? If NO → empty skill.".to_string());
+    lines.push("- Common NON-code topics that should get EMPTY skill: news, sports, weather, stocks, NBA, music, movies, general knowledge, data analysis, business questions.".to_string());
+    lines.push("- Word traps: '看一下'、'检查'、'分析'、'审查' in Chinese do NOT mean code review unless explicitly about CODE.".to_string());
+    lines.push("- If unsure, return empty skill with confidence < 0.5. Better to skip than misroute.".to_string());
+    lines.push("- Use EXACT skill name from the list below.".to_string());
+    lines.push("- Return ONLY valid JSON, no explanations.".to_string());
+    lines.push("Examples:".to_string());
+    lines.push("- User: '帮我看一下今天 nba 的比赛' → {\"skill\":\"\",\"confidence\":0.1} ❌ sports, not code".to_string());
+    lines.push("- User: '分析一下这个函数的时间复杂度' → {\"skill\":\"\",\"confidence\":0.2} ❌ algorithm question, but no code provided".to_string());
+    lines.push("- User: '帮我 review 这段 Rust 代码' → {\"skill\":\"code-review\",\"confidence\":0.95} ✅ explicitly about code".to_string());
+    lines.push("- User: '这个编译错误怎么修复' → {\"skill\":\"debugger\",\"confidence\":0.9} ✅ compilation error".to_string());
+    lines.push("- User: '优化一下这个函数的结构' → {\"skill\":\"refactor\",\"confidence\":0.85} ✅ code refactoring".to_string());
+    lines.push("- User: '查询数据库中的用户数据' → {\"skill\":\"\",\"confidence\":0.1} ❌ data query, not code".to_string());
     lines.push("Skills:".to_string());
 
     for s in skills.iter().take(32) {
-        let mut hint = String::new();
-        if !s.description.trim().is_empty() {
-            hint.push_str(s.description.trim());
-        }
-        if !s.triggers.is_empty() {
-            if !hint.is_empty() {
-                hint.push_str(" | ");
-            }
-            let mut t = s.triggers.clone();
-            t.truncate(6);
-            hint.push_str("hints: ");
-            hint.push_str(&t.join(", "));
-        }
-        if hint.is_empty() {
-            hint = "(no description)".to_string();
-        }
-        lines.push(format!("- {}: {}", s.name, hint));
+        let desc = if s.description.trim().is_empty() {
+            "(no description)".to_string()
+        } else {
+            s.description.trim().to_string()
+        };
+        lines.push(format!("- {}: {}", s.name, desc));
     }
 
     let system_prompt = lines.join("\n");

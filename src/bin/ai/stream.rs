@@ -385,7 +385,10 @@ fn extract_internal_tool_calls(s: &str) -> (String, Vec<InternalToolCall>) {
             continue;
         }
 
-        let ch = s[i..].chars().next().unwrap();
+        let Some(ch) = s[i..].chars().next() else {
+            // Should not happen if i < bytes.len(), but handle gracefully
+            break;
+        };
         result.push(ch);
         i += ch.len_utf8();
     }
@@ -399,7 +402,10 @@ fn parse_tool_call_name(s: &str, start: usize) -> (Option<String>, usize) {
     let mut name = String::new();
 
     while i < bytes.len() {
-        let ch = s[i..].chars().next().unwrap();
+        let Some(ch) = s[i..].chars().next() else {
+            // Handle case where s[i..] is empty or invalid UTF-8
+            break;
+        };
         if ch == '<' || ch == '{' {
             break;
         }
@@ -479,7 +485,10 @@ fn strip_ansi_codes(s: &str) -> String {
             }
             continue;
         }
-        let ch = s[i..].chars().next().unwrap();
+        let Some(ch) = s[i..].chars().next() else {
+            // Handle case where s[i..] is empty or invalid UTF-8
+            break;
+        };
         result.push(ch);
         i += ch.len_utf8();
     }

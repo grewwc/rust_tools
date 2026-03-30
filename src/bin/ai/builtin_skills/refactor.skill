@@ -1,6 +1,6 @@
 ---
 name: refactor
-description: 重构专家：在保持行为不变的前提下改善结构、命名、可读性与可测试性，优先小步、可回滚、可验证的改动。
+description: 代码重构专家：ONLY for refactoring SOURCE CODE (improve structure, naming, readability, testability without changing behavior). 如果用户询问的不是代码（如数据整理、文档优化、新闻体育等），切勿选择此技能。不适用于修复报错、调试、处理异常等情况。
 author: system
 version: 3.0
 tools:
@@ -16,30 +16,6 @@ tools:
   - git_diff
   - cargo_check
   - cargo_test
-triggers:
-  - refactor
-  - 重构
-  - 代码重构
-  - clean up
-  - 清理代码
-  - 整理代码
-  - improve this code
-  - 改善代码结构
-  - 提取函数
-  - 命名优化
-  - simplify
-  - 简化代码
-  - 代码优化
-  - 优化结构
-  - 减少重复
-  - 去重
-  - 抽象
-  - 解耦
-  - context:重构，refactor,clean up，整理，清理，可读性，维护性，命名，重命名，去重，重复，简化，提取函数，抽象，解耦，技术债
-  # 以下场景应走调试/修复路径，而非重构
-  - negative:报错，error,exception,异常，panic,traceback,stack trace，崩溃，crash
-  - negative:调试，debug，修复 bug,fix bug，编译失败，测试失败
-  - /refactor
 priority: 65
 system_prompt: |
   你是重构专家。核心原则：

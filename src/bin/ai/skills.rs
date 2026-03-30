@@ -27,6 +27,7 @@ pub(super) struct SkillManifest {
     pub(super) name: String,
     #[serde(default = "default_skill_version")]
     pub(super) version: String,
+    /// 技能描述：用于模型路由选择的核心字段
     #[serde(default)]
     pub(super) description: String,
     #[serde(default)]
@@ -41,8 +42,7 @@ pub(super) struct SkillManifest {
     pub(super) prompt: String,
     #[serde(default)]
     pub(super) system_prompt: Option<String>,
-    #[serde(default)]
-    pub(super) triggers: Vec<String>,
+    /// 优先级：仅在多个技能匹配度相近时使用
     #[serde(default)]
     pub(super) priority: i32,
     #[serde(skip)]
@@ -50,6 +50,7 @@ pub(super) struct SkillManifest {
 }
 
 impl SkillManifest {
+    /// 构建系统提示词
     pub(super) fn build_system_prompt(&self) -> String {
         let mut prompt = if let Some(sys) = &self.system_prompt {
             sys.clone()
@@ -149,7 +150,6 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
     let mut tool_groups: Vec<String> = Vec::new();
     let mut mcp_servers: Vec<String> = Vec::new();
     let mut system_prompt: Option<String> = None;
-    let mut triggers: Vec<String> = Vec::new();
     let mut priority: i32 = 0;
 
     let mut body = String::new();
@@ -181,7 +181,6 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
                     "tools" => tools.push(v),
                     "tool_groups" => tool_groups.push(v),
                     "mcp_servers" => mcp_servers.push(v),
-                    "triggers" => triggers.push(v),
                     _ => {}
                 }
                 continue;
@@ -213,7 +212,6 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
                 "tools" => tools = parse_list_value(unquoted),
                 "tool_groups" => tool_groups = parse_list_value(unquoted),
                 "mcp_servers" => mcp_servers = parse_list_value(unquoted),
-                "triggers" => triggers = parse_list_value(unquoted),
                 _ => {}
             }
         } else {
@@ -240,7 +238,6 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
         mcp_servers,
         prompt: body.trim().to_string(),
         system_prompt: system_prompt.filter(|s| !s.trim().is_empty()),
-        triggers,
         priority,
         source_path: None,
     })
@@ -254,8 +251,6 @@ fn parse_skill_front_matter_with_path(content: &str, path: &Path) -> Result<Skil
 
 fn ensure_seeded_skills_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("failed to create skills dir: {e}"))?;
-    // 不再将内置 skill 复制到 ~/.config/rust_tools/skills/ 目录
-    // 内置 skill 仅通过 BUILTIN_SKILLS 常量在内存中使用
     Ok(())
 }
 
@@ -297,7 +292,6 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rust-tools-skills-{}", uuid::Uuid::new_v4()));
         ensure_seeded_skills_dir(&dir).unwrap();
         let skills = load_skills_from_dir(&dir);
-        // 内置 skill 不再被复制到磁盘，所以目录应该是空的
         assert_eq!(skills.len(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -321,8 +315,6 @@ mod tests {
             r#"---
 name: custom-skill
 description: custom
-triggers:
-  - custom
 priority: 1
 ---
 
@@ -335,8 +327,6 @@ custom"#,
             r#"---
 name: code-review
 description: override
-triggers:
-  - 帮我看一下
 priority: 999
 ---
 
@@ -368,5 +358,25 @@ override"#,
             },
         }
         let _ = std::fs::remove_dir_all(&home);
+    }
+    
+    #[test]
+    fn test_simple_format_parsing() {
+        let content = r#"---
+name: test-skill
+description: test skill for helping users
+tools:
+  - read_file
+  - write_file
+priority: 50
+---
+
+test prompt"#;
+        
+        let skill = parse_skill_front_matter(content).unwrap();
+        assert_eq!(skill.name, "test-skill");
+        assert_eq!(skill.description, "test skill for helping users");
+        assert_eq!(skill.tools, vec!["read_file", "write_file"]);
+        assert_eq!(skill.priority, 50);
     }
 }

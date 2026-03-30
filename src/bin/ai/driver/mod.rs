@@ -128,43 +128,6 @@ fn mcp_tools_for_skill(
         .collect()
 }
 
-fn normalize_for_skill_router(input: &str) -> String {
-    input
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
-        .collect::<String>()
-}
-
-fn router_skill_has_evidence(skill: &SkillManifest, question: &str) -> bool {
-    let input_norm = normalize_for_skill_router(question);
-    if input_norm.is_empty() {
-        return false;
-    }
-
-    for trigger in &skill.triggers {
-        if trigger.starts_with("negative:") {
-            continue;
-        }
-        if let Some(keywords_str) = trigger.strip_prefix("context:") {
-            for keyword in keywords_str.split(|c| matches!(c, ',' | '，' | '、')) {
-                let kw = normalize_for_skill_router(keyword);
-                if !kw.trim().is_empty() && input_norm.contains(&kw) {
-                    return true;
-                }
-            }
-            continue;
-        }
-
-        let trigger_norm = normalize_for_skill_router(trigger);
-        if !trigger_norm.trim().is_empty() && input_norm.contains(&trigger_norm) {
-            return true;
-        }
-    }
-
-    false
-}
 
 fn prepare_skill_for_turn(
     app: &mut App,
@@ -200,15 +163,9 @@ fn prepare_skill_for_turn(
     let router_skill = router_selected
         .as_deref()
         .and_then(|name| skill_manifests.iter().find(|s| s.name == name));
-    let skill = if heuristic_skill.is_some() {
-        heuristic_skill
-    } else if let Some(skill) = router_skill
-        && router_skill_has_evidence(skill, question)
-    {
-        Some(skill)
-    } else {
-        None
-    };
+    // 优先使用模型路由结果，其次使用启发式匹配作为 fallback
+    // 当模型路由失败（返回 None）时，才使用启发式匹配
+    let skill = router_skill.or(heuristic_skill);
     let matched_skill_name = skill.map(|s| s.name.clone());
     let prompt_optimizer_active = skill
         .as_ref()
@@ -345,7 +302,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut mcp_client = McpClient::new();
-    let skill_manifests = skills::load_all_skills();
+    let skill_manifests = if app.cli.no_skills {
+        Vec::new()
+    } else {
+        skills::load_all_skills()
+    };
     let mcp_report = init_mcp(&mut app, &mut mcp_client);
 
     if app.cli.list_tools {

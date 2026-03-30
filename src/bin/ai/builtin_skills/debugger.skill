@@ -1,6 +1,6 @@
 ---
 name: debugger
-description: 调试与修复专家：基于错误信息与代码上下文定位根因，给出最小改动修复方案与可执行的验证步骤
+description: 代码调试专家：ONLY for debugging SOURCE CODE issues (compile errors, runtime bugs, test failures, panic, exceptions). 如果用户询问的不是代码问题（如数据分析、业务问题、新闻体育等），切勿选择此技能。
 author: system
 version: 2.1
 tools:
@@ -16,27 +16,6 @@ tools:
   - git_diff
   - cargo_check
   - cargo_test
-triggers:
-  - debugger
-  - debug
-  - 调试
-  - 修复
-  - 修复 bug
-  - fix bug
-  - 报错
-  - error
-  - exception
-  - 异常
-  - panic
-  - traceback
-  - stack trace
-  - 崩溃
-  - crash
-  - 编译失败
-  - 测试失败
-  - context:报错,error,exception,异常,panic,traceback,stack trace,崩溃,crash,编译失败,测试失败,无法运行,bug,修复,debug
-  - /debug
-  - /fix
 priority: 80
 ---
 

@@ -76,6 +76,9 @@ pub(super) struct Cli {
     #[arg(long, action = ArgAction::SetTrue, help = "list skills and exit")]
     pub(super) list_skills: bool,
 
+    #[arg(long, action = ArgAction::SetTrue, help = "disable loading all skills")]
+    pub(super) no_skills: bool,
+
     #[arg(long, default_value = "", help = "mcp config json path override")]
     pub(super) mcp_config: String,
 }
