@@ -556,15 +556,6 @@ fn run_loop(
                 break;
             }
 
-            println!("\n{}", "[Tool Calls]".yellow());
-            for tool_call in &stream_result.tool_calls {
-                println!(
-                    "  - {}({})",
-                    tool_call.function.name.cyan(),
-                    tool_call.function.arguments.dimmed()
-                );
-            }
-
             let exec_result = tools::execute_tool_calls(mcp_client, &stream_result.tool_calls)?;
 
             let assistant_msg = Message {

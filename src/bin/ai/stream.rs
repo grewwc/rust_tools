@@ -30,6 +30,9 @@ pub(super) fn stream_response(
     let mut assistant_text = String::new();
     let mut internal_tool_call_idx: usize = 0;
 
+    let mut printed_tool_calls_header = false;
+    let mut current_printing_index: Option<usize> = None;
+
     // Track decode errors to handle transient network issues gracefully
     let mut decode_error_count = 0;
 
@@ -160,6 +163,20 @@ pub(super) fn stream_response(
                 let index = stream_tool_call.index;
                 let builder = tool_calls_map.entry(index).or_default();
 
+                if !printed_tool_calls_header {
+                    if thinking_open {
+                        let _ = write_stream_content(
+                            &format!("\n{end_thinking_tag}\n"),
+                            app.writer.as_mut(),
+                            &mut markdown,
+                        );
+                        thinking_open = false;
+                    }
+                    let _ = markdown.flush_pending();
+                    println!("\n{}", "[Tool Calls]".yellow());
+                    printed_tool_calls_header = true;
+                }
+
                 if !stream_tool_call.id.is_empty() {
                     builder.id = stream_tool_call.id.clone();
                 }
@@ -172,6 +189,23 @@ pub(super) fn stream_response(
                 builder
                     .arguments
                     .push_str(&stream_tool_call.function.arguments);
+
+                if !builder.function_name.is_empty() {
+                    if current_printing_index != Some(index) {
+                        if current_printing_index.is_some() {
+                            println!(")");
+                        }
+                        current_printing_index = Some(index);
+                        print!("  - {}(", builder.function_name.cyan());
+                        let _ = io::stdout().flush();
+                        // Print already accumulated arguments in case we missed them while switching
+                        print!("{}", builder.arguments.dimmed());
+                        let _ = io::stdout().flush();
+                    } else if !stream_tool_call.function.arguments.is_empty() {
+                        print!("{}", stream_tool_call.function.arguments.dimmed());
+                        let _ = io::stdout().flush();
+                    }
+                }
             }
         }
 
@@ -186,8 +220,32 @@ pub(super) fn stream_response(
             let builder = tool_calls_map.entry(internal_tool_call_idx).or_default();
             builder.id = tc.id;
             builder.tool_type = tc.tool_type;
-            builder.function_name = tc.function_name;
-            builder.arguments = tc.arguments;
+            builder.function_name = tc.function_name.clone();
+            builder.arguments = tc.arguments.clone();
+            
+            if !printed_tool_calls_header {
+                if thinking_open {
+                    let _ = write_stream_content(
+                        &format!("\n{end_thinking_tag}\n"),
+                        app.writer.as_mut(),
+                        &mut markdown,
+                    );
+                    thinking_open = false;
+                }
+                let _ = markdown.flush_pending();
+                println!("\n{}", "[Tool Calls]".yellow());
+                printed_tool_calls_header = true;
+            }
+
+            if current_printing_index.is_some() {
+                println!(")");
+                current_printing_index = None;
+            }
+
+            print!("  - {}({})", tc.function_name.cyan(), tc.arguments.dimmed());
+            println!();
+            let _ = io::stdout().flush();
+
             internal_tool_call_idx += 1;
         }
 
@@ -224,6 +282,10 @@ pub(super) fn stream_response(
     }
 
     markdown.flush_pending()?;
+
+    if current_printing_index.is_some() {
+        println!(")");
+    }
 
     if take_stream_cancelled(app) {
         return Ok(StreamResult {
@@ -582,51 +644,113 @@ impl MarkdownStreamRenderer {
         Ok(())
     }
 
+    /// Writes a chunk of markdown content to stdout with live preview support.
+    /// 
+    /// This method processes the input character by character, handling:
+    /// - Newline characters (triggers line rendering)
+    /// - Table preview (live updates for table rows)
+    /// - Code blocks (real-time character output)
+    /// - Regular content (real-time character output)
     fn write_chunk(&mut self, chunk: &str) -> io::Result<()> {
         let mut out = io::stdout();
         for ch in chunk.chars() {
             if ch == '\n' {
-                if self.line_preview_emitted {
-                    out.write_all(b"\n")?;
-                    out.flush()?;
-                    self.bol = true;
-                }
-                let line = std::mem::take(&mut self.line_buf);
-                let rendered = self.consume_line(&line, self.line_preview_emitted);
-                self.line_preview_emitted = false;
-                self.line_preview_height = 0;
-                if !rendered.is_empty() {
-                    out.write_all(rendered.as_bytes())?;
-                    out.flush()?;
-                    self.bol = rendered.ends_with('\n');
-                }
+                self.handle_newline(&mut out)?;
                 continue;
             }
+            
             self.line_buf.push(ch);
-
-            if self.should_emit_table_preview_live() {
-                if !self.line_preview_emitted {
-                    out.write_all(self.line_buf.as_bytes())?;
-                    out.flush()?;
-                    self.line_preview_emitted = true;
-                    self.line_preview_height = table_preview_height(&self.line_buf).max(1);
-                } else {
-                    let mut buf = [0u8; 4];
-                    out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
-                    out.flush()?;
-                    self.line_preview_height = table_preview_height(&self.line_buf).max(1);
-                }
-            } else {
-                self.redraw_inline_preview(&mut out)?;
-            }
+            self.handle_char(&mut out, ch)?;
             self.bol = false;
+        }
+        out.flush()?;
+        Ok(())
+    }
+
+    /// Handles newline character: clears preview, renders the complete line, and resets state.
+    fn handle_newline(&mut self, out: &mut std::io::Stdout) -> io::Result<()> {
+        // If a preview was emitted, move to the next line
+        if self.line_preview_emitted {
+            out.write_all(b"\n")?;
+            out.flush()?;
+            self.bol = true;
+        }
+
+        // Take the accumulated line and render it
+        let line = std::mem::take(&mut self.line_buf);
+        let rendered = self.consume_line(&line, self.line_preview_emitted);
+        
+        // Reset preview state
+        self.line_preview_emitted = false;
+        self.line_preview_height = 0;
+
+        // Output the rendered line
+        if !rendered.is_empty() {
+            out.write_all(rendered.as_bytes())?;
+            out.flush()?;
+            self.bol = rendered.ends_with('\n');
         }
         Ok(())
     }
 
+    /// Handles a single character: decides whether to emit table preview or realtime output.
+    fn handle_char(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
+        if self.should_emit_table_preview_live() {
+            self.handle_table_preview(out, ch)
+        } else {
+            self.handle_realtime_output(out, ch)
+        }
+    }
+
+    /// Handles live table preview output.
+    /// 
+    /// For the first character of a table row, outputs the entire buffer.
+    /// For subsequent characters, outputs just the new character.
+    fn handle_table_preview(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
+        if !self.line_preview_emitted {
+            // First character: output the entire line buffer
+            out.write_all(self.line_buf.as_bytes())?;
+            out.flush()?;
+            self.line_preview_emitted = true;
+            self.line_preview_height = table_preview_height(&self.line_buf).max(1);
+        } else {
+            // Subsequent characters: output just the new character
+            self.emit_char(out, ch)?;
+            self.line_preview_height = table_preview_height(&self.line_buf).max(1);
+        }
+        Ok(())
+    }
+
+    /// Handles realtime output for code blocks and regular content.
+    /// 
+    /// Outputs characters immediately to avoid the feeling of "freezing".
+    fn handle_realtime_output(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
+        self.emit_char(out, ch)?;
+        self.line_preview_emitted = true;
+        
+        // Track height for code blocks
+        if self.in_code_block {
+            self.line_preview_height = self.line_preview_height.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Emits a single character to stdout with proper UTF-8 encoding.
+    fn emit_char(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
+        let mut buf = [0u8; 4];
+        out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
+        out.flush()?;
+        Ok(())
+    }
+    /// Flushes any pending content: renders the accumulated line and completes table state.
+    /// 
+    /// This method should be called at the end of streaming to ensure all content is rendered.
     fn flush_pending(&mut self) -> io::Result<()> {
         let mut out = io::stdout();
+        
+        // Render any pending line content
         if !self.line_buf.is_empty() {
+            // Handle newline-like behavior for pending content
             if self.line_preview_emitted {
                 out.write_all(b"\n")?;
                 self.bol = true;
@@ -641,6 +765,7 @@ impl MarkdownStreamRenderer {
             }
         }
 
+        // Complete any pending table state
         let state = std::mem::replace(&mut self.table_state, TableState::None);
         let rendered = match state {
             TableState::None => String::new(),
@@ -799,8 +924,13 @@ impl MarkdownStreamRenderer {
         }
         final_table.push_str(&render_table_bottom(indent, &widths));
 
+        // Calculate the actual height of the rendered table (number of lines)
+        let actual_table_height = final_table.lines().count().max(1);
+        // Use the maximum of move_up and actual_table_height to ensure we clear enough lines
+        let clear_height = move_up.max(actual_table_height);
+
         let mut out = String::new();
-        out.push_str(&format!("\x1b[{move_up}A\r\x1b[0J"));
+        out.push_str(&format!("\x1b[{clear_height}A\r\x1b[0J"));
         out.push_str(&final_table);
         out
     }

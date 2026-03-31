@@ -58,8 +58,16 @@ pub fn match_skill<'a>(skills: &'a [SkillManifest], input: &str) -> Option<&'a S
         }
     }
 
-    // 动态阈值：根据技能数量和匹配质量调整
-    let threshold = thresholds::skill_count_threshold(skills.len());
+    // 动态阈值：根据技能数量和匹配质量调整，但保证一个较高的最低底线
+    // 因为误触发的代价通常大于不触发（模型也能正常完成任务）
+    let base_threshold = thresholds::skill_count_threshold(skills.len());
+    // 如果意图只是请求行动，但没有明确指向现有技能，提高阈值防止 "代码" 等通用词导致误触发
+    let threshold = if input_intent == UserIntent::RequestAction {
+        base_threshold.max(4.5)
+    } else {
+        base_threshold.max(3.0)
+    };
+
     if best_score >= threshold {
         best_match
     } else {
@@ -360,7 +368,7 @@ fn intent_match_bonus(skill: &SkillManifest, intent: &UserIntent, input: &str) -
         UserIntent::RequestAction => {
             let mut score = 0.0;
             
-            // 基础意图匹配
+            // 基础意图匹配：降低单纯行动意图的加分，避免只要有“帮我做”就容易过阈值
             if desc_lower.contains("进行")
                 || desc_lower.contains("评估")
                 || desc_lower.contains("审查")
@@ -368,7 +376,7 @@ fn intent_match_bonus(skill: &SkillManifest, intent: &UserIntent, input: &str) -
                 || desc_lower.contains("调试")
                 || desc_lower.contains("help")
             {
-                score += weights::INTENT_MATCH_MEDIUM;
+                score += weights::INTENT_MATCH_MEDIUM * 0.5; // 减弱通用匹配权重
             }
 
             // 强匹配：审查
@@ -548,6 +556,18 @@ mod tests {
         // 应该不匹配，因为这是在询问变量含义，不是请求代码审查
         assert!(matched.is_none(), "Python Flask 变量询问不应该匹配到 code-review 技能");
     }
+
+    #[test]
+    fn test_generate_code_does_not_match_code_review() {
+        let skills = vec![skill(
+            "code-review",
+            "代码审查专家：仅针对源代码文件进行质量、安全、性能与可维护性评估。ONLY for reviewing SOURCE CODE files (e.g., .rs, .py, .js, .java, etc.). 如果用户询问的不是代码（如新闻、体育、数据、文档等），切勿选择此技能。",
+            70,
+        )];
+        let input = "你帮我生成一段大约200行的python代码。需要可以运行，不需要依赖任何三方库";
+        let matched = match_skill(&skills, input);
+        assert!(matched.is_none(), "生成代码不应该匹配到 code-review");
+    }
     
     #[test]
     fn test_intent_detection_query_concept() {
@@ -644,12 +664,12 @@ mod tests {
     fn test_phrase_matching() {
         let skills = vec![skill(
             "refactor",
-            "重构专家：提取函数、减少嵌套、优化代码结构",
+            "重构专家：提取函数、减少嵌套、优化代码结构，专门用于重构代码",
             65,
         )];
         
         // 输入包含技能描述中的短语
-        let input = "帮我提取函数，减少嵌套";
+        let input = "帮我重构这段代码，提取函数，减少嵌套";
         let matched = match_skill(&skills, input);
         assert!(matched.is_some(), "短语匹配应该成功");
     }
@@ -658,12 +678,12 @@ mod tests {
     fn test_chinese_semantic_matching() {
         let skills = vec![skill(
             "debugger",
-            "调试专家：帮助定位和修复代码中的 bug、错误、异常",
+            "调试专家：帮助定位和修复代码中的 bug、错误、异常，专门用于调试",
             70,
         )];
         
         // 输入包含中文关键词
-        let input = "代码有错误，帮我定位一下";
+        let input = "代码有错误，帮我调试定位一下";
         let matched = match_skill(&skills, input);
         assert!(matched.is_some(), "中文语义匹配应该成功");
     }

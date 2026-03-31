@@ -74,7 +74,7 @@ where
         let level = self.level().min(self.max_height - 1);
         unsafe {
             let (updates, found) = self.find(&k.clone(), level);
-            let found = found as *mut Skipnode<K,V>;
+            let found = found as *mut Skipnode<K, V>;
             if !found.is_null() {
                 (&mut *found).v.write(v);
                 return;
@@ -82,7 +82,7 @@ where
             let new_node = Skipnode::new(k, v, self.max_height);
 
             for i in (0..=level).rev() {
-                let prev = *updates.get_unchecked(i) as *mut Skipnode<K,V>;
+                let prev = *updates.get_unchecked(i) as *mut Skipnode<K, V>;
                 if prev == &mut self.head as *mut Skipnode<K, V> {
                     let tmp = self.head.forward[i];
                     self.head.forward[i] = new_node;
@@ -149,6 +149,10 @@ where
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     pub fn clear(&mut self) {
         let mut forward = std::mem::take(&mut self.head.forward);
         let first = forward.first().copied().unwrap_or(ptr::null_mut());
@@ -167,14 +171,14 @@ where
         }
         unsafe {
             for i in 0..self.max_height {
-                let prev = *updates.get_unchecked(i) as *mut Skipnode<K,V>;
+                let prev = *updates.get_unchecked(i) as *mut Skipnode<K, V>;
                 let next = *(&*prev).forward.get_unchecked(i);
                 if next.is_null() || found != next {
                     continue;
                 }
                 (&mut *prev).forward[i] = *(&*next).forward.get_unchecked(i);
             }
-            drop(Box::from_raw(found as *mut Skipnode<K,V>));
+            drop(Box::from_raw(found as *mut Skipnode<K, V>));
         }
         self.len -= 1;
         true
@@ -310,6 +314,14 @@ where
         }
         self.inner.insert(value, ());
         true
+    }
+
+    pub fn range(&self, r: std::ops::Range<T>) -> Vec<&T> {
+        self.inner.range(r).into_iter().map(|(k, _)| k).collect()
+    }
+
+    pub fn clear(&mut self) {
+        self.inner.clear();
     }
 
     pub fn contains(&self, value: &T) -> bool {
