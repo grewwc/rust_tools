@@ -613,37 +613,6 @@ impl MarkdownStreamRenderer {
         true
     }
 
-    fn redraw_inline_preview(&mut self, out: &mut std::io::Stdout) -> io::Result<()> {
-        if !self.tty {
-            return Ok(());
-        }
-        if self.line_preview_emitted {
-            let up = self.line_preview_height.saturating_sub(1);
-            if up > 0 {
-                out.write_all(format!("\x1b[{up}A\r\x1b[0J").as_bytes())?;
-            } else {
-                out.write_all(b"\r\x1b[0J")?;
-            }
-        }
-
-        let rendered = if self.in_code_block {
-            if self.line_buf.is_empty() {
-                String::new()
-            } else {
-                format!("\x1b[97m{}\x1b[0m", self.line_buf)
-            }
-        } else {
-            let (indent, rest) = split_indent(&self.line_buf);
-            format!("{indent}{}", render_inline_md(rest, ""))
-        };
-        let preview_height = preview_height_for_rendered(&rendered).max(1);
-        out.write_all(rendered.as_bytes())?;
-        out.flush()?;
-        self.line_preview_emitted = true;
-        self.line_preview_height = preview_height;
-        Ok(())
-    }
-
     /// Writes a chunk of markdown content to stdout with live preview support.
     /// 
     /// This method processes the input character by character, handling:
@@ -727,11 +696,7 @@ impl MarkdownStreamRenderer {
     fn handle_realtime_output(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
         self.emit_char(out, ch)?;
         self.line_preview_emitted = true;
-        
-        // Track height for code blocks
-        if self.in_code_block {
-            self.line_preview_height = self.line_preview_height.saturating_add(1);
-        }
+        self.line_preview_height = table_preview_height(&self.line_buf).max(1);
         Ok(())
     }
 
@@ -2239,45 +2204,9 @@ fn terminal_width() -> usize {
     80
 }
 
-fn preview_height_for_rendered(rendered: &str) -> usize {
-    let cols = terminal_width().max(1);
-    let mut plain = String::new();
-    let bytes = rendered.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            i += 2;
-            while i < bytes.len() {
-                let b = bytes[i];
-                i += 1;
-                if (b as char) >= '@' && (b as char) <= '~' {
-                    break;
-                }
-            }
-            continue;
-        }
-        let ch = rendered[i..].chars().next().unwrap();
-        if ch != '\r' {
-            plain.push(ch);
-        }
-        i += ch.len_utf8();
-    }
-    let width = UnicodeWidthStr::width(plain.as_str()).max(1);
-    width.div_ceil(cols)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn inline_preview_height_uses_rendered_width_not_raw_markdown() {
-        unsafe { std::env::set_var("COLUMNS", "6") };
-        let raw = "**hello**";
-        assert_eq!(table_preview_height(raw), 2);
-        let rendered = render_inline_md(raw, "");
-        assert_eq!(preview_height_for_rendered(&rendered), 1);
-    }
 
     #[test]
     fn consume_line_move_up_matches_preview_height() {
@@ -2315,5 +2244,18 @@ mod tests {
         assert_eq!(widths.len(), 2);
         assert!(widths[0] >= visible_width("`a|b`"));
         assert!(widths[1] >= visible_width(r#"$\frac{1}{2}$"#));
+    }
+
+    #[test]
+    fn test_write_chunk_preview_height() {
+        unsafe { std::env::set_var("COLUMNS", "10") };
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        // Write 15 characters, should wrap to 2 lines
+        let _ = renderer.write_chunk("123456789012345");
+        assert_eq!(renderer.line_preview_height, 2);
+        
+        // Write 6 more characters, total 21, should wrap to 3 lines
+        let _ = renderer.write_chunk("678901");
+        assert_eq!(renderer.line_preview_height, 3);
     }
 }
