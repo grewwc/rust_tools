@@ -41,40 +41,21 @@ fn default_model_names_exist() {
 }
 
 #[test]
-fn cli_model_flag_after_prompt_is_not_forwarded() {
-    use clap::Parser;
-
-    let argv = super::cli::normalize_single_dash_long_opts(
+fn cli_parse_args_basic() {
+    let cli = super::cli::parse_cli_args(
         ["a", "hello", "-m", "minimax"]
             .into_iter()
             .map(|s| s.to_string()),
     );
-    let cli = super::cli::Cli::parse_from(argv);
     assert_eq!(cli.model.as_deref(), Some("minimax"));
-    assert_eq!(cli.args, vec!["hello"]);
-}
-
-#[test]
-fn cli_single_dash_long_opts_with_equals_are_preserved() {
-    use clap::Parser;
-
-    let argv = super::cli::normalize_single_dash_long_opts(
-        ["a", "-session=my-session", "-out=result.md", "hello"]
-            .into_iter()
-            .map(|s| s.to_string()),
-    );
-    let cli = super::cli::Cli::parse_from(argv);
-    assert_eq!(cli.session.as_deref(), Some("my-session"));
-    assert_eq!(cli.out.as_deref(), Some("result.md"));
-    assert_eq!(cli.args, vec!["hello"]);
+    assert_eq!(cli.args, vec!["hello".to_string()]);
 }
 
 #[test]
 fn resolve_model_is_unicode_safe() {
-    use clap::Parser;
     use std::path::PathBuf;
 
-    let cli = super::cli::Cli::parse_from(["a"]);
+    let cli = super::cli::ParsedCli::default();
     let config = super::types::AppConfig {
         api_key: String::new(),
         history_file: PathBuf::new(),

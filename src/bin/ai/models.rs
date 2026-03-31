@@ -1,4 +1,4 @@
-use super::cli::Cli;
+use super::cli::ParsedCli;
 use super::model_names;
 
 pub(super) fn is_vl_model(model: &str) -> bool {
@@ -61,7 +61,7 @@ pub(super) fn forced_deepseek_model() -> String {
         .unwrap_or_else(default_model)
 }
 
-pub(super) fn initial_model(cli: &Cli) -> String {
+pub(super) fn initial_model(cli: &ParsedCli) -> String {
     if let Some(ref model) = cli.model
         && !model.trim().is_empty()
     {

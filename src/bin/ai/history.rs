@@ -1,5 +1,6 @@
 use std::{
     fs::{self},
+    fs::File,
     io,
     path::Path,
     path::PathBuf,
@@ -609,6 +610,40 @@ impl SessionStore {
         read_first_user_prompt_sqlite(&path)
     }
 
+    pub(super) fn read_all_messages(&self, session_id: &str) -> io::Result<Vec<Message>> {
+        let path = self.session_history_file(session_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        read_all_messages_sqlite(&path)
+    }
+
+    pub(super) fn export_session_to_markdown(
+        &self,
+        session_id: &str,
+        output_path: &Path,
+    ) -> io::Result<()> {
+        let messages = self.read_all_messages(session_id)?;
+        if messages.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Session '{}' not found or empty", session_id),
+            ));
+        }
+
+        let markdown = messages_to_markdown(&messages, session_id);
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut file = File::create(output_path)?;
+        use std::io::Write;
+        file.write_all(markdown.as_bytes())?;
+
+        Ok(())
+    }
+
     pub(super) fn migrate_legacy_if_needed(&self, legacy_history_file: &PathBuf) -> io::Result<()> {
         self.ensure_root_dir()?;
         self.migrate_txt_sessions_to_sqlite()?;
@@ -722,4 +757,92 @@ fn decode_message_content(content: &str) -> Value {
 
 fn decode_tool_calls(tool_calls: Option<&str>) -> Option<Vec<ToolCall>> {
     tool_calls.and_then(|raw| serde_json::from_str(raw).ok())
+}
+
+fn read_all_messages_sqlite(path: &Path) -> io::Result<Vec<Message>> {
+    let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT role, content, tool_calls, tool_call_id
+             FROM messages
+             ORDER BY id ASC",
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let role: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let tool_calls: Option<String> = row.get(2)?;
+            let tool_call_id: Option<String> = row.get(3)?;
+            Ok((role, content, tool_calls, tool_call_id))
+        })
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
+    let mut messages: Vec<Message> = Vec::new();
+    for row in rows {
+        let (role, content, tool_calls, tool_call_id) =
+            row.map_err(|e| io::Error::other(e.to_string()))?;
+        messages.push(Message {
+            role,
+            content: decode_message_content(&content),
+            tool_calls: decode_tool_calls(tool_calls.as_deref()),
+            tool_call_id,
+        });
+    }
+
+    Ok(messages)
+}
+
+pub(super) fn messages_to_markdown(messages: &[Message], session_id: &str) -> String {
+    let mut md = String::new();
+    md.push_str(&format!("# Session: {}\n\n", session_id));
+    md.push_str(&format!("**Total messages:** {}\n\n", messages.len()));
+    md.push_str("---\n\n");
+
+    for (i, msg) in messages.iter().enumerate() {
+        let role_emoji = match msg.role.as_str() {
+            "user" => "👤",
+            "assistant" => "🤖",
+            "system" => "⚙️",
+            "tool" => "🔧",
+            _ => "📝",
+        };
+
+        md.push_str(&format!("### {} {}\n\n", role_emoji, msg.role.to_uppercase()));
+
+        let content_str = value_to_string(&msg.content);
+        if !content_str.is_empty() {
+            md.push_str(&content_str);
+            md.push_str("\n\n");
+        }
+
+        if let Some(ref tool_calls) = msg.tool_calls {
+            md.push_str("**Tool Calls:**\n");
+            for tc in tool_calls {
+                md.push_str(&format!("- `{}`", tc.function.name));
+                if !tc.function.arguments.trim().is_empty() {
+                    // Try to parse as JSON for pretty printing
+                    if let Ok(args_val) = serde_json::from_str::<Value>(&tc.function.arguments) {
+                        md.push_str(&format!("({})", args_val));
+                    } else {
+                        md.push_str(&format!("({})", tc.function.arguments));
+                    }
+                }
+                md.push('\n');
+            }
+            md.push('\n');
+        }
+
+        if let Some(ref tool_call_id) = msg.tool_call_id {
+            md.push_str(&format!("**Tool Call ID:** `{}`\n\n", tool_call_id));
+        }
+
+        if i < messages.len() - 1 {
+            md.push_str("---\n\n");
+        }
+    }
+
+    md
 }

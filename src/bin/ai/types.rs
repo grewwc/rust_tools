@@ -12,7 +12,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{cli::Cli, prompt::PromptEditor};
+use super::{cli::ParsedCli, prompt::PromptEditor};
 
 #[derive(Clone)]
 pub(super) struct AppConfig {
@@ -26,7 +26,7 @@ pub(super) struct AppConfig {
 }
 
 pub(super) struct App {
-    pub(super) cli: Cli,
+    pub(super) cli: ParsedCli,
     pub(super) config: AppConfig,
     pub(super) session_id: String,
     pub(super) session_history_file: PathBuf,

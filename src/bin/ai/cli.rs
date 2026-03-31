@@ -1,172 +1,236 @@
-use clap::{ArgAction, Parser};
+use crate::terminalw::parser::Parser as TermParser;
 
 pub(super) const DEFAULT_NUM_HISTORY: usize = 256;
 
-#[derive(Parser, Debug)]
-#[command(
-    about = "AI CLI compatible with go_tools executable/ai/a.go",
-    after_help = "Session\n  默认每个进程自动创建独立 session（不会和其它窗口串 history）\n  --session <id>            指定 session id\n  --session                 不指定 id，等同于自动创建新 session\n  --clear --session <id>    清空指定 session 的 history\n\nInteractive\n  /help                     打印交互命令帮助\n  /sessions                 列出所有 sessions\n  /sessions current         查看当前 session\n  /sessions new             新建并切换到新 session\n  /sessions use <id>        切换 session\n  /sessions delete <id>     删除 session（若删除当前 session，会自动切到新 session）\n  /sessions clear-all       删除全部 sessions\n"
-)]
-pub(super) struct Cli {
-    #[arg(long, default_value_t = DEFAULT_NUM_HISTORY, help = "number of history")]
+/// 解析后的 CLI 参数结构体
+#[derive(Debug, Clone)]
+pub(super) struct ParsedCli {
     pub(super) history: usize,
-
-    #[arg(short = 'm', long = "model", num_args = 1, help = "model name")]
     pub(super) model: Option<String>,
-
-    #[arg(
-        long = "multi-line",
-        visible_alias = "mul",
-        action = ArgAction::SetTrue,
-        help = "input with multline"
-    )]
     pub(super) multi_line: bool,
-
-    #[arg(long, action = ArgAction::SetTrue, help = "clear history")]
     pub(super) clear: bool,
-
-    #[arg(
-        long,
-        visible_alias = "ss",
-        num_args = 0..=1,
-        default_missing_value = "",
-        help = "session id. empty means create a new session for this process."
-    )]
     pub(super) session: Option<String>,
-
-    #[arg(short = 'c', action = ArgAction::SetTrue, help = "prepend content in clipboard")]
     pub(super) clipboard: bool,
-
-    #[arg(
-        short = 'f',
-        default_value = "",
-        help = "input file names. seprated by comma."
-    )]
     pub(super) files: String,
-
-    #[arg(
-        short = 'o',
-        long = "out",
-        num_args = 0..=1,
-        default_missing_value = "output.md",
-        help = "write output to file. default is output.md"
-    )]
     pub(super) out: Option<String>,
-
-    #[arg(short = 't', action = ArgAction::SetTrue, help = "use thinking model. default: false.")]
     pub(super) thinking: bool,
-
-    #[arg(short = 's', action = ArgAction::SetTrue, help = "short output")]
     pub(super) short_output: bool,
-
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub(super) args: Vec<String>,
-
-    #[arg(long, action = ArgAction::SetTrue, help = "list builtin tools and exit")]
     pub(super) list_tools: bool,
-
-    #[arg(
-        long,
-        visible_alias = "list-mcp-servers",
-        action = ArgAction::SetTrue,
-        help = "list mcp tools and exit"
-    )]
     pub(super) list_mcp_tools: bool,
-
-    #[arg(long, action = ArgAction::SetTrue, help = "list skills and exit")]
     pub(super) list_skills: bool,
-
-    #[arg(long, action = ArgAction::SetTrue, help = "disable loading all skills")]
     pub(super) no_skills: bool,
-
-    #[arg(long, default_value = "", help = "mcp config json path override")]
     pub(super) mcp_config: String,
+    pub(super) help: bool,
 }
 
-pub(super) fn normalize_single_dash_long_opts(args: impl Iterator<Item = String>) -> Vec<String> {
+impl Default for ParsedCli {
+    fn default() -> Self {
+        Self {
+            history: DEFAULT_NUM_HISTORY,
+            model: None,
+            multi_line: false,
+            clear: false,
+            session: None,
+            clipboard: false,
+            files: String::new(),
+            out: None,
+            thinking: false,
+            short_output: false,
+            args: Vec::new(),
+            list_tools: false,
+            list_mcp_tools: false,
+            list_skills: false,
+            no_skills: false,
+            mcp_config: String::new(),
+            help: false,
+        }
+    }
+}
+
+/// 使用 terminalw::Parser 解析 CLI 参数
+pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     let raw: Vec<String> = args.collect();
     if raw.is_empty() {
-        return raw;
+        return ParsedCli::default();
     }
 
-    let mut out = Vec::with_capacity(raw.len() + 1);
-    out.push(raw[0].clone());
+    // 创建 terminalw parser
+    let mut parser = TermParser::new();
+    
+    // 定义所有 bool 选项
+    parser.add_bool("clear", false, "clear history");
+    parser.add_bool("multi-line", false, "input with multline");
+    parser.alias("mul", "multi-line");
+    parser.add_bool("clipboard", false, "prepend content in clipboard");
+    parser.add_bool("thinking", false, "use thinking model");
+    parser.alias("t", "thinking");
+    parser.add_bool("short-output", false, "short output");
+    parser.alias("s", "short-output");
+    parser.add_bool("list-tools", false, "list builtin tools and exit");
+    parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
+    parser.alias("list-mcp-servers", "list-mcp-tools");
+    parser.add_bool("list-skills", false, "list skills and exit");
+    parser.add_bool("no-skills", false, "disable loading all skills");
+    parser.add_bool("help", false, "print help");
+    parser.alias("h", "help");
+    
+    // 定义所有 string/int 选项
+    parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history");
+    parser.add_string("model", "", "model name");
+    parser.alias("m", "model");
+    parser.add_string("session", "", "session id");
+    parser.alias("ss", "session");
+    parser.add_string("files", "", "input file names");
+    parser.alias("f", "files");
+    parser.add_string("out", "", "write output to file");
+    parser.alias("o", "out");
+    parser.add_string("mcp-config", "", "mcp config json path override");
 
-    let mut prompt_args: Vec<String> = Vec::new();
-
-    let mut i = 1usize;
-    while i < raw.len() {
-        let original = raw[i].clone();
-        if original == "--" {
-            prompt_args.extend_from_slice(&raw[i + 1..]);
-            break;
+    // 解析 argv（跳过 program name）
+    let mut argv: Vec<String> = if raw.len() > 1 {
+        raw[1..].to_vec()
+    } else {
+        Vec::new()
+    };
+    
+    // 预处理：将 --ss 转换为 --session，避免与 -s 冲突
+    // 这是必要的，因为 terminalw::Parser 的布尔簇检测会将 -ss 分解为 -s + -s
+    for arg in &mut argv {
+        if arg == "--ss" || arg.starts_with("--ss=") {
+            *arg = arg.replace("--ss", "--session");
         }
-
-        let mut arg = original.clone();
-        let bytes = arg.as_bytes();
-        if bytes.len() > 2 && bytes[0] == b'-' && bytes[1] != b'-' && bytes[1].is_ascii_alphabetic()
-        {
-            arg = format!("-{arg}");
+        if arg == "-ss" || arg.starts_with("-ss=") {
+            *arg = arg.replace("-ss", "--session");
         }
-
-        let take_next = |raw: &[String], i: &mut usize, out: &mut Vec<String>| {
-            if *i + 1 < raw.len() && raw[*i + 1] != "--" {
-                out.push(raw[*i + 1].clone());
-                *i += 1;
-            }
-        };
-
-        match arg.as_str() {
-            "-m" | "--model" => {
-                out.push(arg);
-                take_next(&raw, &mut i, &mut out);
-            }
-            "-f" => {
-                out.push(arg);
-                take_next(&raw, &mut i, &mut out);
-            }
-            "-o" | "--out" => {
-                out.push(arg);
-                if i + 1 < raw.len() && raw[i + 1] != "--" && !raw[i + 1].starts_with('-') {
-                    out.push(raw[i + 1].clone());
-                    i += 1;
-                }
-            }
-            "-c" | "-t" | "-s" | "--clear" | "--multi-line" | "--mul" | "--list-tools"
-            | "--list-mcp-tools" | "--list-mcp-servers" | "--list-skills" | "--no-skills" | "-h" | "--help" => {
-                out.push(arg);
-            }
-            "--history" | "--mcp-config" => {
-                out.push(arg);
-                take_next(&raw, &mut i, &mut out);
-            }
-            "--session" | "--ss" => {
-                out.push(arg);
-                if i + 1 < raw.len() && raw[i + 1] != "--" && !raw[i + 1].starts_with('-') {
-                    out.push(raw[i + 1].clone());
-                    i += 1;
-                }
-            }
-            _ if arg.starts_with("--model=")
-                || arg.starts_with("--history=")
-                || arg.starts_with("--mcp-config=")
-                || arg.starts_with("--out=")
-                || arg.starts_with("--session=") =>
-            {
-                out.push(arg);
-            }
-            _ => {
-                prompt_args.push(original);
-            }
-        }
-
-        i += 1;
     }
 
-    if !prompt_args.is_empty() {
-        out.push("--".to_string());
-        out.extend(prompt_args);
+    // 使用 terminalw 解析参数
+    parser.parse_argv(&argv, &[]);
+
+    // 构建 ParsedCli 结构体
+    let mut cli = ParsedCli::default();
+
+    // 处理 help（需要特殊处理，因为它是别名）
+    cli.help = parser.contains_flag_strict("help") || parser.contains_flag_strict("h");
+
+    // 处理 history
+    if parser.contains_flag_strict("history") {
+        cli.history = parser.flag_value_i32("history") as usize;
     }
 
-    out
+    // 处理 model
+    if parser.contains_flag_strict("model") {
+        let val = parser.flag_value_or_default("model");
+        if !val.trim().is_empty() {
+            cli.model = Some(val);
+        }
+    }
+
+    // 处理 multi-line
+    cli.multi_line = parser.contains_flag_strict("multi-line");
+
+    // 处理 clear
+    cli.clear = parser.contains_flag_strict("clear");
+
+    // 处理 session
+    if parser.contains_flag_strict("session") {
+        let val = parser.flag_value_or_default("session");
+        cli.session = Some(val);
+    }
+
+    // 处理 clipboard
+    cli.clipboard = parser.contains_flag_strict("clipboard");
+
+    // 处理 files
+    if parser.contains_flag_strict("files") {
+        cli.files = parser.flag_value_or_default("files");
+    }
+
+    // 处理 out
+    if parser.contains_flag_strict("out") {
+        let val = parser.flag_value_or_default("out");
+        if !val.trim().is_empty() {
+            cli.out = Some(val);
+        }
+    }
+
+    // 处理 thinking
+    cli.thinking = parser.contains_flag_strict("thinking");
+
+    // 处理 short-output
+    cli.short_output = parser.contains_flag_strict("short-output");
+
+    // 处理 list-tools
+    cli.list_tools = parser.contains_flag_strict("list-tools");
+
+    // 处理 list-mcp-tools
+    cli.list_mcp_tools = parser.contains_flag_strict("list-mcp-tools");
+
+    // 处理 list-skills
+    cli.list_skills = parser.contains_flag_strict("list-skills");
+
+    // 处理 no-skills
+    cli.no_skills = parser.contains_flag_strict("no-skills");
+
+    // 处理 mcp-config
+    if parser.contains_flag_strict("mcp-config") {
+        cli.mcp_config = parser.flag_value_or_default("mcp-config");
+    }
+
+    // 处理位置参数（prompt args）
+    cli.args = parser.positional_args(false);
+
+    cli
+}
+
+/// 打印帮助信息
+pub(super) fn print_help() {
+    let mut parser = TermParser::new();
+    
+    parser.add_bool("clear", false, "clear history");
+    parser.add_bool("multi-line", false, "input with multline");
+    parser.alias("mul", "multi-line");
+    parser.add_bool("clipboard", false, "prepend content in clipboard");
+    parser.add_bool("thinking", false, "use thinking model");
+    parser.alias("t", "thinking");
+    parser.add_bool("short-output", false, "short output");
+    parser.alias("s", "short-output");
+    parser.add_bool("list-tools", false, "list builtin tools and exit");
+    parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
+    parser.alias("list-mcp-servers", "list-mcp-tools");
+    parser.add_bool("list-skills", false, "list skills and exit");
+    parser.add_bool("no-skills", false, "disable loading all skills");
+    parser.add_bool("help", false, "print help");
+    parser.alias("h", "help");
+    
+    parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history");
+    parser.add_string("model", "", "model name");
+    parser.alias("m", "model");
+    parser.add_string("session", "", "session id");
+    parser.alias("ss", "session");
+    parser.add_string("files", "", "input file names");
+    parser.alias("f", "files");
+    parser.add_string("out", "", "write output to file");
+    parser.alias("o", "out");
+    parser.add_string("mcp-config", "", "mcp config json path override");
+
+    println!("AI CLI compatible with go_tools executable/ai/a.go");
+    println!();
+    parser.print_defaults();
+    println!();
+    println!("Session");
+    println!("  默认每个进程自动创建独立 session（不会和其它窗口串 history）");
+    println!("  --session <id>            指定 session id");
+    println!("  --session                 不指定 id，等同于自动创建新 session");
+    println!("  --clear --session <id>    清空指定 session 的 history");
+    println!();
+    println!("Interactive");
+    println!("  /help                     打印交互命令帮助");
+    println!("  /sessions                 列出所有 sessions");
+    println!("  /sessions current         查看当前 session");
+    println!("  /sessions new             新建并切换到新 session");
+    println!("  /sessions use <id>        切换 session");
+    println!("  /sessions delete <id>     删除 session（若删除当前 session，会自动切到新 session）");
+    println!("  /sessions clear-all       删除全部 sessions");
 }

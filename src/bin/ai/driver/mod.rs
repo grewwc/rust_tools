@@ -7,13 +7,12 @@ use std::{
     },
 };
 
-use clap::Parser;
 use colored::Colorize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::ai::{
-    cli::{Cli, normalize_single_dash_long_opts},
+    cli::{self},
     config,
     history::{
         Message, SessionStore, append_history_messages, build_message_arr,
@@ -227,7 +226,8 @@ mod tests {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse_from(normalize_single_dash_long_opts(std::env::args()));
+    // 处理 --help 或 -h
+    let cli = cli::parse_cli_args(std::env::args());
     let config = config::load_config()?;
     let session_store = SessionStore::new(config.history_file.as_path());
     if let Err(err) = session_store.migrate_legacy_if_needed(&config.history_file) {
@@ -239,6 +239,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         session_arg.trim().to_string()
     };
+
+    // 处理 help 标志
+    if cli.help {
+        cli::print_help();
+        return Ok(());
+    }
+
     if let Err(err) = session_store.ensure_root_dir() {
         eprintln!("[Warning] Failed to create sessions dir: {}", err);
     }
@@ -787,6 +794,9 @@ fn try_handle_help_command(input: &str) -> bool {
     println!("  /help");
     println!("  /feishu-auth");
     println!("  /sessions");
+    println!("  /sessions export <id> [output.md]");
+    println!("  /sessions export-current [output.md]");
+    println!("  /sessions export-last [output.md]");
     println!("  /sessions list");
     println!("  /sessions current");
     println!("  /sessions new");
@@ -832,6 +842,9 @@ fn try_handle_session_command(
             println!("  /sessions use <id>");
             println!("  /sessions delete <id>");
             println!("  /sessions clear-all");
+            println!("  /sessions export <id> [output.md]");
+            println!("  /sessions export-current [output.md]");
+            println!("  /sessions export-last [output.md]");
         }
         "list" | "ls" => {
             let sessions = store.list_sessions()?;
@@ -911,6 +924,54 @@ fn try_handle_session_command(
                 }
             } else {
                 println!("Session not found: {}", id);
+            }
+        }
+        "export" => {
+            let Some(id) = parts.next() else {
+                println!("missing session id. try: /sessions export <id> [output.md]");
+                return Ok(true);
+            };
+            let output_path = parts.next().unwrap_or("session_export.md");
+            let output_path = std::path::Path::new(output_path);
+            
+            match store.export_session_to_markdown(id, output_path) {
+                Ok(()) => {
+                    println!("Exported session '{}' to '{}'", id, output_path.display());
+                }
+                Err(err) => {
+                    eprintln!("Failed to export session: {}", err);
+                }
+            }
+        }
+        "export-current" | "export-cur" => {
+            let output_path = parts.next().unwrap_or("session_export.md");
+            let output_path = std::path::Path::new(output_path);
+            
+            match store.export_session_to_markdown(&app.session_id, output_path) {
+                Ok(()) => {
+                    println!("Exported current session '{}' to '{}'", app.session_id, output_path.display());
+                }
+                Err(err) => {
+                    eprintln!("Failed to export session: {}", err);
+                }
+            }
+        }
+        "export-last" | "export-latest" => {
+            let sessions = store.list_sessions()?;
+            let Some(last) = sessions.first() else {
+                println!("No sessions found to export.");
+                return Ok(true);
+            };
+            let output_path = parts.next().unwrap_or("session_export.md");
+            let output_path = std::path::Path::new(output_path);
+            
+            match store.export_session_to_markdown(&last.id, output_path) {
+                Ok(()) => {
+                    println!("Exported latest session '{}' to '{}'", last.id, output_path.display());
+                }
+                Err(err) => {
+                    eprintln!("Failed to export session: {}", err);
+                }
             }
         }
         "clear-all" | "clear_all" | "clear" | "wipe" => {
