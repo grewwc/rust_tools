@@ -142,9 +142,11 @@ impl PromptEditor {
             Terminal,
             backend::CrosstermBackend,
             layout::{Constraint, Direction, Layout},
-            style::{Color, Style},
+            style::{Color, Modifier, Style},
             text::{Line, Span},
             widgets::{Block, Borders, Clear, Paragraph},
+            layout::Rect,
+            layout::Alignment,
         };
         use tui_textarea::{CursorMove, Input, TextArea};
 
@@ -173,6 +175,7 @@ impl PromptEditor {
             let mut textarea: TextArea = TextArea::default();
             let mut history = MultilineHistoryState::new(self.multiline_history_entries());
             let mut accept_release = false;
+            let mut status_msg: Option<String> = None;
 
             loop {
                 terminal
@@ -237,25 +240,42 @@ impl PromptEditor {
                                     Span::raw("  "),
                                     Span::styled("Enter", Style::default().fg(Color::Blue)),
                                     Span::raw(" newline  ·  "),
-                                    Span::styled("Alt+Enter/F2/Esc", Style::default().fg(Color::Green)),
+                                    Span::styled(
+                                        "Alt+Enter/F2/Esc",
+                                        Style::default().fg(Color::Green),
+                                    ),
                                     Span::raw(" send  ·  "),
                                     Span::styled("Ctrl+C", Style::default().fg(Color::Yellow)),
                                     Span::raw(" cancel"),
                                 ]),
                                 Line::from(vec![
                                     Span::raw("  "),
-                                    Span::styled("Up/Down edge", Style::default().fg(Color::Blue)),
-                                    Span::raw(" or "),
+                                    Span::styled("↑/↓", Style::default().fg(Color::Blue)),
+                                    Span::raw("/"),
                                     Span::styled("Ctrl+P/N", Style::default().fg(Color::Blue)),
-                                    Span::raw(" history  ·  "),
-                                    Span::styled("Backspace", Style::default().fg(Color::Blue)),
-                                    Span::raw(" edits previous lines  ·  "),
-                                    Span::styled("Paste", Style::default().fg(Color::Blue)),
-                                    Span::raw(" image"),
+                                    Span::raw(" hist  ·  "),
+                                    Span::styled("BS", Style::default().fg(Color::Blue)),
+                                    Span::raw(" edit  ·  "),
+                                    Span::styled("Ctrl+V", Style::default().fg(Color::Blue)),
+                                    Span::raw(" paste  ·  "),
+                                    Span::styled("F9", Style::default().fg(Color::Blue)),
+                                    Span::raw(" last  ·  "),
+                                    Span::styled("F10", Style::default().fg(Color::Blue)),
+                                    Span::raw(" full"),
                                 ]),
                             ]),
                             chunks[1],
                         );
+
+                        // 显示状态消息
+                        if let Some(ref msg) = status_msg {
+                            let status_para = Paragraph::new(Line::from(
+                                Span::styled(msg, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+                            ))
+                            .alignment(Alignment::Center);
+                            let status_area = Rect::new(chunks[1].x, chunks[1].y + 1, chunks[1].width, 1);
+                            f.render_widget(status_para, status_area);
+                        }
                     })
                     .map_err(|e| io::Error::other(e.to_string()))?;
 
@@ -277,6 +297,8 @@ impl PromptEditor {
                         }
                     }
                     Event::Key(mut key) => {
+                        // 清除状态消息
+                        status_msg = None;
                         if key.kind == KeyEventKind::Release {
                             accept_release = true;
                             key.kind = KeyEventKind::Press;
@@ -325,12 +347,34 @@ impl PromptEditor {
                             (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                                 break Err(io::Error::new(io::ErrorKind::Interrupted, "Ctrl+C"));
                             }
-                            (KeyCode::Char('a'), modifiers)
-                                if modifiers.contains(KeyModifiers::SUPER)
-                                    || modifiers.contains(KeyModifiers::CONTROL) =>
+                            // 复制最后一次回答：F9
+                            (KeyCode::F(9), _) =>
+                            {
+                                let lines = textarea.lines();
+                                // 找到最后一个 "assistant:" 或 "AI:" 开始的位置
+                                let mut last_answer_start = None;
+                                for (i, line) in lines.iter().enumerate() {
+                                    if line.starts_with("assistant:") || line.starts_with("AI:") || line.starts_with("Assistant:") {
+                                        last_answer_start = Some(i);
+                                    }
+                                }
+                                let answer = if let Some(start) = last_answer_start {
+                                    lines[start..].join("
+")
+                                } else {
+                                    // 如果没有找到 assistant:，复制最后一段非空内容
+                                    lines.join("
+")
+                                };
+                                let _ = string_content::set_clipboard_content(&answer);
+                                status_msg = Some("✓ 已复制最后回答到剪贴板".to_string());
+                            }
+                            // 全文复制：F10
+                            (KeyCode::F(10), _) =>
                             {
                                 let content = textarea_content(&textarea);
                                 let _ = string_content::set_clipboard_content(&content);
+                                status_msg = Some("✓ 已复制全文到剪贴板".to_string());
                             }
                             (KeyCode::Backspace | KeyCode::Delete, modifiers)
                                 if modifiers.contains(KeyModifiers::SUPER) =>

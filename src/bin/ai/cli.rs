@@ -233,4 +233,7 @@ pub(super) fn print_help() {
     println!("  /sessions use <id>        切换 session");
     println!("  /sessions delete <id>     删除 session（若删除当前 session，会自动切到新 session）");
     println!("  /sessions clear-all       删除全部 sessions");
+    println!("  /sessions export <id> [output.md]    导出指定 session 为 Markdown");
+    println!("  /sessions export-current [output.md] 导出当前 session 为 Markdown");
+    println!("  /sessions export-last [output.md]    导出最新 session 为 Markdown");
 }
