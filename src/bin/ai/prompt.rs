@@ -12,7 +12,8 @@ use crate::clipboard::image_content;
 use crate::clipboard::string_content;
 use crate::common::utils::expanduser;
 
-const LINE_REPL_HISTORY_FILE: &str = "~/.liner_histroy";
+const LINE_REPL_HISTORY_FILE: &str = "~/.liner_history";
+const MAX_INPUT_CHARS: usize = 4000;
 
 pub(super) struct PromptEditor {
     pub(super) editor: Option<DefaultEditor>,
@@ -196,14 +197,38 @@ impl PromptEditor {
                         f.render_widget(popup_block, popup);
 
                         let n = textarea.lines().len();
+                        let current_content = textarea_content(&textarea);
+                        let char_count = current_content.chars().count();
+
+                        let title = if char_count > MAX_INPUT_CHARS {
+                            format!(
+                                " Message ({n} line{}, {} chars) ⚠️ Exceeded (max: {}) ",
+                                if n == 1 { "" } else { "s" },
+                                char_count,
+                                MAX_INPUT_CHARS
+                            )
+                        } else {
+                            let warning_threshold = MAX_INPUT_CHARS * 90 / 100;
+                            if char_count > warning_threshold {
+                                format!(
+                                    " Message ({n} line{}, {} chars) ⚠️ Approaching limit ",
+                                    if n == 1 { "" } else { "s" },
+                                    char_count
+                                )
+                            } else {
+                                format!(
+                                    " Message ({n} line{}, {} chars) ",
+                                    if n == 1 { "" } else { "s" },
+                                    char_count
+                                )
+                            }
+                        };
+
                         textarea.set_block(
                             Block::default()
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(Color::Cyan))
-                                .title(format!(
-                                    " Message ({n} line{}) ",
-                                    if n == 1 { "" } else { "s" }
-                                )),
+                                .title(title),
                         );
                         f.render_widget(&textarea, chunks[0]);
                         f.render_widget(
@@ -212,8 +237,12 @@ impl PromptEditor {
                                     Span::raw("  "),
                                     Span::styled("Enter", Style::default().fg(Color::Blue)),
                                     Span::raw(" newline  ·  "),
-                                    Span::styled("Esc/Ctrl+D", Style::default().fg(Color::Green)),
+                                    Span::styled("Alt+Enter/F2", Style::default().fg(Color::Green)),
                                     Span::raw(" send  ·  "),
+                                    Span::styled("Esc", Style::default().fg(Color::Green)),
+                                    Span::raw("/"),
+                                    Span::styled("Ctrl+D", Style::default().fg(Color::Green)),
+                                    Span::raw(" also send  ·  "),
                                     Span::styled("Ctrl+C", Style::default().fg(Color::Yellow)),
                                     Span::raw(" cancel"),
                                 ]),
@@ -558,7 +587,9 @@ fn is_submit_key(
 
     matches!(
         (code, modifiers),
-        (KeyCode::Char('d'), KeyModifiers::CONTROL) | (KeyCode::Esc, KeyModifiers::NONE)
+        (KeyCode::Esc, KeyModifiers::NONE)
+            | (KeyCode::Enter, KeyModifiers::ALT)      // 新增：Alt+Enter 提交
+            | (KeyCode::F(2), KeyModifiers::NONE) // 新增：F2 提交
     )
 }
 
