@@ -46,7 +46,7 @@ where
     V: Clone,
 {
     unsafe fn free_chain(mut curr: *mut Skipnode<K, V>) {
-        while curr != ptr::null_mut() {
+        while !curr.is_null() {
             let next = unsafe { (&*curr).forward[0] };
             unsafe {
                 drop(Box::from_raw(curr));
@@ -74,14 +74,15 @@ where
         let level = self.level().min(self.max_height - 1);
         unsafe {
             let (updates, found) = self.find(&k.clone(), level);
-            if found != ptr::null_mut() {
+            let found = found as *mut Skipnode<K,V>;
+            if !found.is_null() {
                 (&mut *found).v = v;
                 return;
             }
             let new_node = Skipnode::new(k, v, self.max_height);
 
             for i in (0..=level).rev() {
-                let prev = updates[i];
+                let prev = *updates.get_unchecked(i) as *mut Skipnode<K,V>;
                 if prev == &mut self.head as *mut Skipnode<K, V> {
                     let tmp = self.head.forward[i];
                     self.head.forward[i] = new_node;
@@ -116,14 +117,14 @@ where
         let f = self.cmp.as_ref();
         unsafe {
             for i in (0..self.max_height).rev() {
-                let mut curr = (&*prev).forward[i];
-                while curr != ptr::null_mut() && f(&(*curr).k, &start) < 0 {
+                let mut curr = *(&*prev).forward.get_unchecked(i);
+                while !curr.is_null() && f(&(*curr).k, &start) < 0 {
                     prev = curr;
                     curr = (&*curr).forward[i];
                 }
             }
-            let mut curr = (&*prev).forward[0];
-            while curr != ptr::null_mut() {
+            let mut curr = *(&*prev).forward.get_unchecked(0);
+            while !curr.is_null() {
                 if f(&(*curr).k, &end) >= 0 {
                     break;
                 }
@@ -153,19 +154,19 @@ where
 
     pub fn remove(&mut self, k: &K) -> bool {
         let (updates, found) = self.find(k, self.max_height - 1);
-        if found == ptr::null_mut() {
+        if found.is_null() {
             return false;
         }
         unsafe {
             for i in 0..self.max_height {
-                let prev = *updates.get_unchecked(i);
-                let next = (&*prev).forward[i];
-                if next == ptr::null_mut() || found != next {
+                let prev = *updates.get_unchecked(i) as *mut Skipnode<K,V>;
+                let next = *(&*prev).forward.get_unchecked(i);
+                if next.is_null() || found != next {
                     continue;
                 }
                 (&mut *prev).forward[i] = *(&*next).forward.get_unchecked(i);
             }
-            drop(Box::from_raw(found));
+            drop(Box::from_raw(found as *mut Skipnode<K,V>));
         }
         self.len -= 1;
         true
@@ -225,7 +226,7 @@ where
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.curr == ptr::null_mut() {
+        if self.curr.is_null() {
             return None;
         }
         unsafe {
@@ -241,14 +242,14 @@ where
     K: Clone,
     V: Clone,
 {
-    fn find(&mut self, k: &K, level: usize) -> (Vec<*mut Skipnode<K, V>>, *mut Skipnode<K, V>) {
+    fn find(&self, k: &K, level: usize) -> (Vec<*const Skipnode<K, V>>, *const Skipnode<K, V>) {
         let f: &dyn Fn(&K, &K) -> i32 = self.cmp.as_ref();
         unsafe {
-            let mut updates = vec![ptr::null_mut(); level + 1];
-            let mut prev = &mut self.head as *mut Skipnode<K, V>;
+            let mut updates = vec![ptr::null(); level + 1];
+            let mut prev = &self.head as *const Skipnode<K, V>;
             let mut found = ptr::null_mut();
             for i in (0..=level).rev() {
-                let mut curr = (&*prev).forward[i];
+                let mut curr = *(&*prev).forward.get_unchecked(i);
                 while curr != ptr::null_mut() && f(&(&*curr).k, &k) < 0 {
                     prev = curr;
                     curr = *((&*curr).forward).get_unchecked(i);
