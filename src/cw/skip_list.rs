@@ -58,8 +58,8 @@ where
     pub fn new(max_height: usize, cmp: impl Fn(&K, &K) -> i32 + 'static) -> Box<Self> {
         let ret = Box::new(Skiplist {
             head: Skipnode {
-                k: unsafe { std::mem::MaybeUninit::zeroed().assume_init() },
-                v: unsafe { std::mem::MaybeUninit::zeroed().assume_init() },
+                k: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
+                v: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
                 forward: vec![ptr::null_mut(); max_height],
             },
             max_height,
@@ -178,7 +178,12 @@ where
     V: Clone,
 {
     fn drop(&mut self) {
-        let first = self.head.forward.first().copied().unwrap_or(ptr::null_mut());
+        let first = self
+            .head
+            .forward
+            .first()
+            .copied()
+            .unwrap_or(ptr::null_mut());
         unsafe {
             Skiplist::free_chain(first);
         }
@@ -431,7 +436,10 @@ mod tests {
         sl.insert(7, 12);
         assert_eq!(sl.len(), 1);
         assert_eq!(sl.get(&7), Some(12));
-        let items = (&*sl).into_iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
+        let items = (&*sl)
+            .into_iter()
+            .map(|(k, v)| (*k, *v))
+            .collect::<Vec<_>>();
         assert_eq!(items, vec![(7, 12)]);
     }
 
@@ -466,13 +474,25 @@ mod tests {
         for i in 1..=10 {
             sl.insert(i, i);
         }
-        let got = sl.range(3..7).into_iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        let got = sl
+            .range(3..7)
+            .into_iter()
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>();
         assert_eq!(got, vec![3, 4, 5, 6]);
 
-        let got = sl.range(1..1).into_iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        let got = sl
+            .range(1..1)
+            .into_iter()
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>();
         assert!(got.is_empty());
 
-        let got = sl.range(10..11).into_iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        let got = sl
+            .range(10..11)
+            .into_iter()
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>();
         assert_eq!(got, vec![10]);
     }
 
@@ -482,7 +502,11 @@ mod tests {
         for i in 1..=10 {
             sl.insert(i, i * 10);
         }
-        let got = sl.range(9..4).into_iter().map(|(k, _)| *k).collect::<Vec<_>>();
+        let got = sl
+            .range(9..4)
+            .into_iter()
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>();
         assert_eq!(got, vec![9, 8, 7, 6, 5]);
     }
 
