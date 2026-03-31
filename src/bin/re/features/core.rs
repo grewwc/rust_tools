@@ -611,7 +611,10 @@ pub fn resolve_record_ref_local(
     }
 
     let (reference, tag_mode): (String, char) = match reference.chars().next() {
-        Some(tag @ ('=' | '~' | '^')) => (reference[tag.len_utf8()..].to_string(), tag),
+        Some('=') | Some('~') | Some('^') => (
+            reference[1..].to_string(),
+            reference.chars().next().unwrap(),
+        ),
         _ => (reference, '\0'),
     };
 

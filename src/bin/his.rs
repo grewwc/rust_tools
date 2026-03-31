@@ -77,9 +77,7 @@ impl UserInput {
                 _ => DEFAULT_N as i32,
             };
             if self.branch.is_none() {
-                if let Some(m0) = cap.get(0) {
-                    args.replace_range(m0.range(), "");
-                }
+                args.replace_range(cap.get(0).unwrap().range(), "");
                 let args = args.trim();
                 if !args.is_empty() {
                     self.branch = Some(args.to_string());

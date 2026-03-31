@@ -30,7 +30,7 @@ pub use ordered_set::OrderedSet;
 pub use priority_queue::{MaxPriorityQueue, MinPriorityQueue};
 pub use queue::Queue;
 pub use rb_tree::RbTree;
-pub use skip_list::{SkipList, SkipListConfig};
+pub use skip_list::{Skiplist};
 pub use stack::Stack;
 pub use tree_map::TreeMap;
 pub use tree_set::TreeSet;

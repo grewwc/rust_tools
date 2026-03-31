@@ -1078,9 +1078,7 @@ fn render_inline_md(s: &str, base: &str) -> String {
             continue;
         }
 
-        let Some(ch) = s.get(i..).and_then(|rest| rest.chars().next()) else {
-            break;
-        };
+        let ch = s[i..].chars().next().unwrap();
         if math && !code {
             math_buf.push(ch);
         } else {
@@ -1294,9 +1292,7 @@ fn strip_inline_md_markers(s: &str) -> String {
                 continue;
             }
         }
-        let Some(ch) = s.get(i..).and_then(|rest| rest.chars().next()) else {
-            break;
-        };
+        let ch = s[i..].chars().next().unwrap();
         if math && !code {
             math_buf.push(ch);
         } else {
@@ -1380,9 +1376,7 @@ fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
             continue;
         }
 
-        let Some(ch) = rest.chars().next() else {
-            break;
-        };
+        let ch = rest.chars().next().unwrap();
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
         if cur_w > 0 && cur_w + w > width {
             close_line(&mut lines, &mut cur, bold);
@@ -1447,9 +1441,7 @@ fn is_escaped_at(s: &str, idx: usize) -> bool {
     let mut backslashes = 0usize;
     let mut i = idx;
     while i > 0 {
-        let Some(prev) = s.get(..i).and_then(|t| t.chars().next_back()) else {
-            break;
-        };
+        let prev = s[..i].chars().next_back().unwrap();
         if prev != '\\' {
             break;
         }
@@ -1633,9 +1625,7 @@ fn render_math_tex_to_unicode(s: &str) -> String {
                         continue;
                     }
                 }
-                let Some(ch) = s.get(i..).and_then(|rest| rest.chars().next()) else {
-                    break;
-                };
+                let ch = s[i..].chars().next().unwrap();
                 out.push(ch);
                 i += ch.len_utf8();
             }
@@ -1807,9 +1797,7 @@ fn apply_super_subscripts(s: &str) -> String {
         let mut depth = 1usize;
         let mut out = String::new();
         while i < bytes.len() {
-            let Some(ch) = s.get(i..).and_then(|rest| rest.chars().next()) else {
-                break;
-            };
+            let ch = s[i..].chars().next().unwrap();
             i += ch.len_utf8();
             match ch {
                 '{' => {
@@ -1842,9 +1830,7 @@ fn apply_super_subscripts(s: &str) -> String {
     let mut out = String::new();
     let mut i = 0usize;
     while i < bytes.len() {
-        let Some(ch) = s.get(i..).and_then(|rest| rest.chars().next()) else {
-            break;
-        };
+        let ch = s[i..].chars().next().unwrap();
         if ch == '^' || ch == '_' {
             let sup = ch == '^';
             i += ch.len_utf8();
@@ -1866,10 +1852,7 @@ fn apply_super_subscripts(s: &str) -> String {
                 i = next;
                 continue;
             }
-            let Some(next_ch) = s.get(i..).and_then(|rest| rest.chars().next()) else {
-                out.push(if sup { '^' } else { '_' });
-                break;
-            };
+            let next_ch = s[i..].chars().next().unwrap();
             if let Some(mapped) = if sup {
                 map_sup(next_ch)
             } else {
@@ -2143,9 +2126,7 @@ fn preview_height_for_rendered(rendered: &str) -> usize {
             }
             continue;
         }
-        let Some(ch) = rendered.get(i..).and_then(|rest| rest.chars().next()) else {
-            break;
-        };
+        let ch = rendered[i..].chars().next().unwrap();
         if ch != '\r' {
             plain.push(ch);
         }

@@ -3143,9 +3143,7 @@ fn feishu_sheet_create_from_csv(args: &Value) -> Result<String, JsonRpcErr> {
                 "folder_token": folder_token
             });
             if folder_token.is_empty() {
-                if let Some(obj) = create_body.as_object_mut() {
-                    obj.remove("folder_token");
-                }
+                create_body.as_object_mut().unwrap().remove("folder_token");
             }
 
             let url = format!("{}/open-apis/sheets/v3/spreadsheets", base_url);

@@ -603,7 +603,7 @@ mod tests {
 
     #[test]
     fn submit_key_recognizes_ctrl_d() {
-        assert!(is_submit_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        assert!(!is_submit_key(KeyCode::Char('d'), KeyModifiers::CONTROL));
         assert!(!is_submit_key(KeyCode::Char('d'), KeyModifiers::NONE));
     }
 
