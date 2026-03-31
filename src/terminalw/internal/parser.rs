@@ -425,13 +425,13 @@ impl Parser {
     pub fn flag_value_i32(&self, flag_name: &str) -> i32 {
         self.flag_value_or_default(flag_name)
             .parse::<i32>()
-            .unwrap()
+            .unwrap_or(0)
     }
 
     pub fn flag_value_i64(&self, flag_name: &str) -> i64 {
         self.flag_value_or_default(flag_name)
             .parse::<i64>()
-            .unwrap()
+            .unwrap_or(0)
     }
 
     pub fn flag_value_int(&self, flag_name: &str) -> i32 {

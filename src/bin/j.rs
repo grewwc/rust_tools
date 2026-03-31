@@ -87,9 +87,21 @@ fn main() {
     if let Some(fname) = cli.format.as_deref() {
         let options = jsonw::ParseOptions::default();
         let j = if fname.is_empty() {
-            jsonw::Json::from_clipboard(options).unwrap()
+            match jsonw::Json::from_clipboard(options) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
         } else {
-            jsonw::Json::from_file(fname, options).unwrap()
+            match jsonw::Json::from_file(fname, options) {
+                Ok(j) => j,
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(1);
+                }
+            }
         };
 
         let mut formatted = j.to_pretty_string();
@@ -104,14 +116,29 @@ fn main() {
             format!("{}_f.json", base_no_ext(fname))
         };
         println!("write file to {output_fname}");
-        j.to_file(output_fname, true).unwrap();
+        if let Err(e) = j.to_file(output_fname, true) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
         return;
     }
 
     if cli.files.len() == 2 {
         let options = jsonw::ParseOptions::default();
-        let old = jsonw::Json::from_file(&cli.files[0], options).unwrap();
-        let new = jsonw::Json::from_file(&cli.files[1], options).unwrap();
+        let old = match jsonw::Json::from_file(&cli.files[0], options) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
+        let new = match jsonw::Json::from_file(&cli.files[1], options) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        };
 
         let diff = jsonw::diff_json(old.value(), new.value(), cli.sort);
         let diff_value = serde_json::to_value(diff).unwrap_or(Value::Null);
@@ -130,7 +157,10 @@ fn main() {
         } else {
             cli.output.clone()
         };
-        diff_json.to_file(&fname, true).unwrap();
+        if let Err(e) = diff_json.to_file(&fname, true) {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
         println!("write to {fname}");
         return;
     }

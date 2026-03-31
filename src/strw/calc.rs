@@ -148,21 +148,21 @@ fn remove_suffix_zero(s: &str) -> String {
     out
 }
 
-fn count_dot_digit(a: &str, b: &str, add: bool) -> (usize, usize, usize) {
+fn count_dot_digit(a: &str, b: &str, add: bool) -> Option<(usize, usize, usize)> {
     let a_dot = a.as_bytes().iter().filter(|c| **c == b'.').count();
     let b_dot = b.as_bytes().iter().filter(|c| **c == b'.').count();
     if a_dot > 1 || b_dot > 1 {
-        panic!("invalid number: {a}, {b}");
+        return None;
     }
 
-    let ai = a.find('.').unwrap_or_else(|| a.len().saturating_sub(1));
-    let bi = b.find('.').unwrap_or_else(|| b.len().saturating_sub(1));
-    let ca = a.len().saturating_sub(ai + 1);
-    let cb = b.len().saturating_sub(bi + 1);
+    let ai = a.find('.').unwrap_or(a.len());
+    let bi = b.find('.').unwrap_or(b.len());
+    let ca = if ai >= a.len() { 0 } else { a.len().saturating_sub(ai + 1) };
+    let cb = if bi >= b.len() { 0 } else { b.len().saturating_sub(bi + 1) };
     if !add {
-        return (ca, cb, ca + cb);
+        return Some((ca, cb, ca + cb));
     }
-    (ca, cb, ca.max(cb))
+    Some((ca, cb, ca.max(cb)))
 }
 
 fn prepend_leading_zero(s: &str, decimal_count: usize) -> String {
@@ -285,7 +285,9 @@ fn plus2(a: &str, b: &str) -> String {
     (a, _) = remove_leading_zero(&a);
     (b, _) = remove_leading_zero(&b);
 
-    let (n1, n2, num_dot) = count_dot_digit(&a, &b, true);
+    let Some((n1, n2, num_dot)) = count_dot_digit(&a, &b, true) else {
+        return String::new();
+    };
     let mut a = a.replace('.', "");
     let mut b = b.replace('.', "");
     a.push_str(&"0".repeat(num_dot.saturating_sub(n1)));
@@ -331,7 +333,9 @@ fn minus2(a: &str, b: &str) -> String {
         return format!("-{res}");
     }
 
-    let (n1, n2, num_dot) = count_dot_digit(&a, &b, true);
+    let Some((n1, n2, num_dot)) = count_dot_digit(&a, &b, true) else {
+        return String::new();
+    };
     let mut a = a.replace('.', "");
     let mut b = b.replace('.', "");
 
@@ -412,11 +416,16 @@ fn mul2(a: &str, b: &str) -> String {
         return "0".to_string();
     }
 
-    let (_, _, num_dot) = count_dot_digit(&a, &b, false);
+    let Some((_, _, num_dot)) = count_dot_digit(&a, &b, false) else {
+        return String::new();
+    };
     a = a.replace('.', "");
     b = b.replace('.', "");
     (a, _) = remove_leading_zero(&a);
     (b, _) = remove_leading_zero(&b);
+    if a.is_empty() || b.is_empty() {
+        return String::new();
+    }
 
     let mut out = mul_integer_strings(&a, &b);
     out = prepend_leading_zero(&out, num_dot);
@@ -493,14 +502,19 @@ fn div2(a: &str, b: &str, num_digit_to_keep: i32) -> String {
     a = strip_leading_minus(&a).to_string();
     b = strip_leading_minus(&b).to_string();
 
-    let (d1, d2, d) = count_dot_digit(&a, &b, false);
+    let Some((d1, d2, d)) = count_dot_digit(&a, &b, false) else {
+        return String::new();
+    };
     let a_no_decimal = a.replace('.', "");
     let b_no_decimal = b.replace('.', "");
     (a, _) = remove_leading_zero(&a_no_decimal);
     (b, _) = remove_leading_zero(&b_no_decimal);
+    if a.is_empty() || b.is_empty() {
+        return String::new();
+    }
 
     if b == "0" {
-        panic!("b is 0");
+        return String::new();
     }
     if a == "0" {
         return "0".to_string();

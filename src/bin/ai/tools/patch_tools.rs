@@ -78,11 +78,15 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
             if l.starts_with("\\ No newline at end of file") {
                 continue;
             }
-            let (prefix, body) = l.split_at(1);
+            let mut chars = l.chars();
+            let prefix = chars
+                .next()
+                .ok_or_else(|| "invalid hunk line: empty".to_string())?;
+            let body = chars.as_str();
             match prefix {
-                " " => lines.push(UnifiedLine::Context(body.to_string())),
-                "-" => lines.push(UnifiedLine::Remove(body.to_string())),
-                "+" => lines.push(UnifiedLine::Add(body.to_string())),
+                ' ' => lines.push(UnifiedLine::Context(body.to_string())),
+                '-' => lines.push(UnifiedLine::Remove(body.to_string())),
+                '+' => lines.push(UnifiedLine::Add(body.to_string())),
                 _ => return Err(format!("invalid hunk line: {}", l)),
             }
         }
@@ -207,4 +211,15 @@ pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
     }
     fs::write(&path, next).map_err(|e| format!("Failed to write file: {}", e))?;
     Ok(format!("Successfully patched {}", file_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_unified_hunks;
+
+    #[test]
+    fn parse_unified_hunks_rejects_empty_hunk_line_instead_of_panicking() {
+        let patch = "@@ -1,1 +1,1 @@\n\n-foo\n+bar\n";
+        assert!(parse_unified_hunks(patch).is_err());
+    }
 }

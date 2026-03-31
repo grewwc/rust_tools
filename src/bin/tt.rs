@@ -54,10 +54,11 @@ fn parse_datetime_local(input: &str) -> Result<DateTime<Local>, String> {
 }
 
 fn parse_unix_like(input: i64) -> DateTime<Local> {
+    let epoch = Local.timestamp_opt(0, 0).single().unwrap_or_else(Local::now);
     let threshold = Local
         .with_ymd_and_hms(2500, 1, 1, 0, 0, 0)
         .single()
-        .unwrap_or_else(|| Local.timestamp_opt(0, 0).single().unwrap());
+        .unwrap_or_else(|| epoch);
 
     let as_secs = Local.timestamp_opt(input, 0).single();
     if let Some(dt) = as_secs
@@ -70,7 +71,7 @@ fn parse_unix_like(input: i64) -> DateTime<Local> {
     Local
         .timestamp_opt(secs, 0)
         .single()
-        .unwrap_or_else(|| Local.timestamp_opt(0, 0).single().unwrap())
+        .unwrap_or(epoch)
 }
 
 fn main() {

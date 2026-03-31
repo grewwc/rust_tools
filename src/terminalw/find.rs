@@ -20,15 +20,18 @@ impl SyncSet {
     }
 
     pub fn add(&self, v: &str) {
-        self.inner.lock().unwrap().insert(v.to_string());
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(v.to_string());
     }
 
     pub fn contains(&self, v: &str) -> bool {
-        self.inner.lock().unwrap().contains(v)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).contains(v)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().is_empty()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 }
 
@@ -67,15 +70,15 @@ impl Semaphore {
     }
 
     fn acquire(&self) {
-        let mut used = self.state.lock().unwrap();
+        let mut used = self.state.lock().unwrap_or_else(|e| e.into_inner());
         while *used >= self.cap {
-            used = self.cv.wait(used).unwrap();
+            used = self.cv.wait(used).unwrap_or_else(|e| e.into_inner());
         }
         *used += 1;
     }
 
     fn release(&self) {
-        let mut used = self.state.lock().unwrap();
+        let mut used = self.state.lock().unwrap_or_else(|e| e.into_inner());
         *used = used.saturating_sub(1);
         self.cv.notify_one();
     }
@@ -85,7 +88,7 @@ static MAX_THREADS: std::sync::LazyLock<Mutex<Arc<Semaphore>>> =
     std::sync::LazyLock::new(|| Mutex::new(Arc::new(Semaphore::new(4))));
 
 pub fn change_threads(num: usize) {
-    let mut lock = MAX_THREADS.lock().unwrap();
+    let mut lock = MAX_THREADS.lock().unwrap_or_else(|e| e.into_inner());
     *lock = Arc::new(Semaphore::new(num.max(1)));
 }
 
@@ -102,13 +105,13 @@ impl WaitGroup {
 
     pub fn add(&self, n: usize) {
         let (m, _) = &*self.inner;
-        let mut v = m.lock().unwrap();
+        let mut v = m.lock().unwrap_or_else(|e| e.into_inner());
         *v += n;
     }
 
     pub fn done(&self) {
         let (m, cv) = &*self.inner;
-        let mut v = m.lock().unwrap();
+        let mut v = m.lock().unwrap_or_else(|e| e.into_inner());
         *v = v.saturating_sub(1);
         if *v == 0 {
             cv.notify_all();
@@ -117,9 +120,9 @@ impl WaitGroup {
 
     pub fn wait(&self) {
         let (m, cv) = &*self.inner;
-        let mut v = m.lock().unwrap();
+        let mut v = m.lock().unwrap_or_else(|e| e.into_inner());
         while *v != 0 {
-            v = cv.wait(v).unwrap();
+            v = cv.wait(v).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -163,7 +166,7 @@ where
     if level > MAX_LEVEL.load(Ordering::Relaxed) {
         return;
     }
-    let sem = { Arc::clone(&*MAX_THREADS.lock().unwrap()) };
+    let sem = { Arc::clone(&*MAX_THREADS.lock().unwrap_or_else(|e| e.into_inner())) };
     sem.acquire();
     let _guard = ScopeGuard::new(move || sem.release());
 

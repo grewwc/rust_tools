@@ -133,7 +133,7 @@ pub(super) fn normalize_single_dash_long_opts(args: impl Iterator<Item = String>
                 }
             }
             "-c" | "-t" | "-s" | "--clear" | "--multi-line" | "--mul" | "--list-tools"
-            | "--list-mcp-tools" | "--list-mcp-servers" | "--list-skills" | "-h" | "--help" => {
+            | "--list-mcp-tools" | "--list-mcp-servers" | "--list-skills" | "--no-skills" | "-h" | "--help" => {
                 out.push(arg);
             }
             "--history" | "--mcp-config" => {

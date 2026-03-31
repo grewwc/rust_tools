@@ -129,6 +129,6 @@ fn main() {
             eprintln!("oo failed: {e}");
         }
     } else {
-        Cli::command().print_help().unwrap();
+        let _ = Cli::command().print_help();
     }
 }

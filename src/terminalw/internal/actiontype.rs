@@ -13,6 +13,9 @@ impl ActionList {
     where
         F: Fn() + Send + Sync + 'static,
     {
-        self.actions.lock().unwrap().push(Arc::new(f));
+        self.actions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::new(f));
     }
 }

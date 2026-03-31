@@ -85,7 +85,7 @@ where
 
     pub fn contains_key(&self, key: &K) -> bool {
         let shard = self.shard_for_key(key);
-        let guard = shard.read().unwrap();
+        let guard = shard.read().unwrap_or_else(|e| e.into_inner());
         guard.contains_key(key)
     }
 
@@ -94,13 +94,13 @@ where
         V: Clone,
     {
         let shard = self.shard_for_key(key);
-        let guard = shard.read().unwrap();
+        let guard = shard.read().unwrap_or_else(|e| e.into_inner());
         guard.get(key).cloned()
     }
 
     pub fn get(&self, key: &K) -> Option<ValueRef<'_, K, V>> {
         let shard = self.shard_for_key(key);
-        let guard = shard.read().unwrap();
+        let guard = shard.read().unwrap_or_else(|e| e.into_inner());
         let value = match guard.get(key) {
             Some(v) => NonNull::from(v),
             None => return None,
@@ -117,19 +117,19 @@ where
 
     pub fn get_with<R>(&self, key: &K, f: impl FnOnce(&V) -> R) -> Option<R> {
         let shard = self.shard_for_key(key);
-        let guard = shard.read().unwrap();
+        let guard = shard.read().unwrap_or_else(|e| e.into_inner());
         guard.get(key).map(f)
     }
 
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         let shard = self.shard_for_key(&key);
-        let mut guard = shard.write().unwrap();
+        let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
         guard.insert(key, value)
     }
 
     pub fn remove(&self, key: &K) -> Option<V> {
         let shard = self.shard_for_key(key);
-        let mut guard = shard.write().unwrap();
+        let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
         guard.remove(key)
     }
 
@@ -138,7 +138,7 @@ where
         V: Clone,
     {
         let shard = self.shard_for_key(&key);
-        let mut guard = shard.write().unwrap();
+        let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = guard.get(&key) {
             return Some(existing.clone());
         }
@@ -151,7 +151,7 @@ where
         V: Clone,
     {
         let shard = self.shard_for_key(&key);
-        let mut guard = shard.write().unwrap();
+        let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = guard.get(&key) {
             return existing.clone();
         }
@@ -162,7 +162,7 @@ where
 
     pub fn compute<R>(&self, key: K, f: impl FnOnce(Option<&V>) -> (Option<V>, R)) -> R {
         let shard = self.shard_for_key(&key);
-        let mut guard = shard.write().unwrap();
+        let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
         let current = guard.get(&key);
         let (next, out) = f(current);
         match next {
