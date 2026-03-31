@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 
 use colored::Colorize;
-use serde_json;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::{
@@ -118,14 +117,10 @@ pub(super) fn stream_response(
                 let _ = markdown.flush_pending();
 
                 return Ok(StreamResult {
-                    outcome: if !assistant_text.is_empty() {
-                        StreamOutcome::Completed
-                    } else {
-                        StreamOutcome::Completed
-                    },
+                    outcome: StreamOutcome::Completed,
                     tool_calls: tool_calls_map
                         .into_values()
-                        .filter_map(|b| Some(b.build()))
+                        .map(|b| b.build())
                         .collect(),
                     assistant_text,
                 });
@@ -373,11 +368,10 @@ fn extract_internal_tool_calls(s: &str) -> (String, Vec<InternalToolCall>) {
                     tool_calls.push(tc);
                     continue;
                 }
-            } else if marker == "<|tool_call_end|>" || marker == "<|tool_calls_section_end|>" {
-                i = marker_end + 2;
-                continue;
-            } else if marker == "<|tool_call_argument_begin|>" {
-                i = marker_end + 2;
+            } else if marker == "<|tool_call_end|>"
+                || marker == "<|tool_calls_section_end|>"
+                || marker == "<|tool_call_argument_begin|>"
+            {
                 continue;
             }
 

@@ -94,7 +94,7 @@ pub(crate) fn execute_tool_call_with_args(
     let Some(spec) = TOOL_INDEX.get(name).copied() else {
         return Err(format!("Unknown tool: {}", name));
     };
-    let result = (spec.execute)(&args)?;
+    let result = (spec.execute)(args)?;
 
     Ok(ToolResult {
         tool_call_id: tool_call_id.to_string(),

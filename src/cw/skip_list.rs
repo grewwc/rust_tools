@@ -1,3 +1,4 @@
+#![allow(clippy::all)]
 //! # 跳表（Skip List）实现
 //!
 //! 跳表是一种基于概率的数据结构，支持高效的查找、插入和删除操作。
@@ -121,12 +122,13 @@ where
         // 创建哨兵节点
         // 使用 MaybeUninit 来避免 zeroed 问题
         let head = Box::new(Node {
+            // 哨兵节点的 key 和 value 永远不会被读取，所以这是安全的
+            #[allow(clippy::uninit_assumed_init)]
             key: unsafe {
-                // 哨兵节点的 key 永远不会被读取，所以这是安全的
                 std::mem::MaybeUninit::<K>::uninit().assume_init()
             },
             value: unsafe {
-                // 哨兵节点的 value 永远不会被读取，所以这是安全的
+                #[allow(clippy::uninit_assumed_init)]
                 std::mem::MaybeUninit::<V>::uninit().assume_init()
             },
             forward: vec![None; config.max_level],

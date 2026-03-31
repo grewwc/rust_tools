@@ -311,8 +311,7 @@ pub(super) fn select_skill_via_model(
         return None;
     }
 
-    let mut lines = Vec::new();
-    lines.push("You are a skill router for a CODE development assistant. Your ONLY job is to route CODE-related questions to appropriate skills.".to_string());
+    let mut lines = vec!["You are a skill router for a CODE development assistant. Your ONLY job is to route CODE-related questions to appropriate skills.".to_string()];
     lines.push("Output schema: {\"skill\":\"<exact skill name or empty>\",\"confidence\":0.0}".to_string());
     lines.push("Critical Rules:".to_string());
     lines.push("- ALL skills in this system are for CODE only. If the question is NOT about programming/coding, ALWAYS return empty skill.".to_string());

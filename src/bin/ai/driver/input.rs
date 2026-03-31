@@ -76,10 +76,7 @@ const IMAGE_PLACEHOLDER_SUFFIX: &str = "]]";
 
 fn extract_inline_image_paths(question: &mut String) -> Vec<String> {
     let mut images = Vec::new();
-    loop {
-        let Some(start) = question.find(IMAGE_PLACEHOLDER_PREFIX) else {
-            break;
-        };
+    while let Some(start) = question.find(IMAGE_PLACEHOLDER_PREFIX) {
         let search_start = start + IMAGE_PLACEHOLDER_PREFIX.len();
         let Some(end_rel) = question[search_start..].find(IMAGE_PLACEHOLDER_SUFFIX) else {
             break;

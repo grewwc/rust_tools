@@ -62,10 +62,10 @@ pub(super) fn forced_deepseek_model() -> String {
 }
 
 pub(super) fn initial_model(cli: &Cli) -> String {
-    if let Some(ref model) = cli.model {
-        if !model.trim().is_empty() {
-            return determine_model(model);
-        }
+    if let Some(ref model) = cli.model
+        && !model.trim().is_empty()
+    {
+        return determine_model(model);
     }
     let cfg = crate::common::configw::get_all_config();
     cfg.get_opt("ai.model.default")
@@ -96,10 +96,10 @@ pub(super) fn determine_vl_model(model: &str) -> String {
         return default_vl_model();
     }
 
-    if let Some(def) = model_names::find_by_name(&model) {
-        if def.is_vl {
-            return def.name.clone();
-        }
+    if let Some(def) = model_names::find_by_name(&model)
+        && def.is_vl
+    {
+        return def.name.clone();
     }
 
     best_match_model_name(&model, vl_model_names().into_iter(), default_vl_model())

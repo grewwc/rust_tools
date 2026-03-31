@@ -1910,11 +1910,12 @@ fn render_text_elements(elements: Option<&Value>, default_origin: Option<&str>) 
             out.push_str(v);
             continue;
         }
-        if let Some(v) = el.get("mention_doc") {
-            if let Some(s) = render_doc_mention_as_markdown(v, default_origin) {
-                out.push_str(&s);
-                continue;
-            }
+        if let Some(v) = el
+            .get("mention_doc")
+            .and_then(|v| render_doc_mention_as_markdown(v, default_origin))
+        {
+            out.push_str(&v);
+            continue;
         }
         if let Some(v) = el
             .get("reminder")
@@ -2636,12 +2637,9 @@ fn feishu_oauth_wait_local_code(args: &Value) -> Result<String, JsonRpcErr> {
             }
             let mut accepted: Option<TcpStream> = None;
             for listener in &listeners {
-                match listener.accept() {
-                    Ok((stream, _)) => {
+                if let Ok((stream, _)) = listener.accept() {
                         accepted = Some(stream);
                         break;
-                    }
-                    Err(_) => {}
                 }
             }
 
@@ -3537,16 +3535,18 @@ fn convert_markdown_to_docx_blocks(markdown: &str) -> Vec<Value> {
             continue;
         }
 
-        let (block_type, content) = if trimmed.starts_with("# ") {
-            (1, trimmed[2..].to_string())
-        } else if trimmed.starts_with("## ") {
-            (2, trimmed[3..].to_string())
-        } else if trimmed.starts_with("### ") {
-            (3, trimmed[4..].to_string())
-        } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
-            (4, trimmed[2..].to_string())
-        } else if trimmed.starts_with("> ") {
-            (5, trimmed[2..].to_string())
+        let (block_type, content) = if let Some(content) = trimmed.strip_prefix("# ") {
+            (1, content.to_string())
+        } else if let Some(content) = trimmed.strip_prefix("## ") {
+            (2, content.to_string())
+        } else if let Some(content) = trimmed.strip_prefix("### ") {
+            (3, content.to_string())
+        } else if let Some(content) = trimmed.strip_prefix("- ") {
+            (4, content.to_string())
+        } else if let Some(content) = trimmed.strip_prefix("* ") {
+            (4, content.to_string())
+        } else if let Some(content) = trimmed.strip_prefix("> ") {
+            (5, content.to_string())
         } else {
             (6, trimmed.to_string())
         };

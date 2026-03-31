@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 #[path = "ff/cli.rs"]
 mod cli;
 #[path = "ff/exclude.rs"]

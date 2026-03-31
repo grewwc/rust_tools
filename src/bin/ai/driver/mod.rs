@@ -129,6 +129,7 @@ fn mcp_tools_for_skill(
 }
 
 
+#[allow(clippy::type_complexity)]
 fn prepare_skill_for_turn(
     app: &mut App,
     mcp_client: &McpClient,
@@ -140,12 +141,11 @@ fn prepare_skill_for_turn(
     Option<String>,
 ) {
     let cfg = configw::get_all_config();
-    let router_enabled = cfg
+    let router_enabled = !cfg
         .get_opt("ai.skills.router")
         .unwrap_or_else(|| "true".to_string())
         .trim()
-        .to_ascii_lowercase()
-        != "false";
+        .eq_ignore_ascii_case("false");
 
     let router_selected = if router_enabled {
         let model = app.current_model.clone();

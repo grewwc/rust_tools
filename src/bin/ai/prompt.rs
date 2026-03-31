@@ -539,7 +539,7 @@ fn save_clipboard_images(dir: &Path) -> io::Result<Vec<PathBuf>> {
         Ok(()) => {
             paths.push(path);
         }
-        Err(e) => {
+        Err(_e) => {
             return Ok(paths);
         }
     }
