@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     env,
     ffi::OsStr,
     fs,
@@ -8,7 +8,7 @@ use std::{
     time::SystemTime,
 };
 
-use rust_tools::cw::graph::DirectedGraph;
+use rust_tools::cw::{SkipSet, graph::DirectedGraph};
 
 type ModuleGraph = DirectedGraph<Rc<PathBuf>>;
 type ModuleInterner = HashMap<PathBuf, Rc<PathBuf>>;
@@ -164,7 +164,10 @@ fn list_rs_files(src_dir: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn build_module_graph(files: &[PathBuf]) -> Result<(ModuleGraph, ModuleInterner), String> {
-    let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
+    let mut file_set = SkipSet::new(16);
+    for file in files {
+        file_set.insert(file.clone());
+    }
     let mut interner: ModuleInterner = HashMap::new();
     let mut g = DirectedGraph::new();
     for file in files {
@@ -264,11 +267,11 @@ fn deps_for_bin(
     repo_root: &Path,
     graph: &DirectedGraph<Rc<PathBuf>>,
     interner: &HashMap<PathBuf, Rc<PathBuf>>,
-) -> Result<Vec<Rc<PathBuf>>, String> {
+) -> Result<Vec<PathBuf>, String> {
     let content = fs::read_to_string(bin_rs).map_err(|e| format!("read {bin_rs:?}: {e}"))?;
     let roots = extract_lib_roots_from_bin(&content);
 
-    let mut deps: BTreeSet<Rc<PathBuf>> = BTreeSet::new();
+    let mut deps: SkipSet<PathBuf> = SkipSet::new(16);
     let bin_rs = bin_rs.to_path_buf();
     collect_reachable(graph, interner, &bin_rs, &mut deps);
 
@@ -277,7 +280,6 @@ fn deps_for_bin(
             collect_reachable(graph, interner, &root_file, &mut deps);
         }
     }
-
     if deps.len() == 1 {
         let default_root = default_lib_root_for_bin(bin_name);
         if let Some(root_file) = resolve_lib_root_file(&default_root, repo_root) {
@@ -286,10 +288,9 @@ fn deps_for_bin(
     }
 
     for extra in extra_build_inputs(repo_root) {
-        deps.insert(Rc::new(extra));
+        deps.insert(extra);
     }
-
-    Ok(deps.into_iter().collect())
+    Ok(deps.to_vec())
 }
 
 fn extra_build_inputs(repo_root: &Path) -> Vec<PathBuf> {
@@ -301,8 +302,8 @@ fn extra_build_inputs(repo_root: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn extract_lib_roots_from_bin(content: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
+fn extract_lib_roots_from_bin(content: &str) -> Vec<String> {
+    let mut out = SkipSet::new(16);
     for (prefix, slice) in [
         ("rust_tools::", content),
         ("use rust_tools::", content),
@@ -322,7 +323,7 @@ fn extract_lib_roots_from_bin(content: &str) -> BTreeSet<String> {
             start = idx;
         }
     }
-    out
+    out.to_vec()
 }
 
 fn default_lib_root_for_bin(bin_name: &str) -> String {
@@ -349,25 +350,27 @@ fn collect_reachable(
     graph: &DirectedGraph<Rc<PathBuf>>,
     interner: &HashMap<PathBuf, Rc<PathBuf>>,
     start: &PathBuf,
-    out: &mut BTreeSet<Rc<PathBuf>>,
+    out: &mut SkipSet<PathBuf>,
 ) {
     let Some(start) = interner.get(start).cloned() else {
         return;
     };
-    if !out.insert(start.clone()) {
+    if !out.insert(start.as_ref().clone()) {
         return;
     }
-    let mut q = vec![start];
+    let mut q = vec![start.as_ref().clone()];
     while let Some(u) = q.pop() {
-        for v in graph.adj(&u) {
-            if out.insert(v.clone()) {
-                q.push(v);
+        let u_rc = interner.get(&u).cloned().unwrap_or_else(|| Rc::new(u.clone()));
+        for v in graph.adj(&u_rc) {
+            let v_path = v.as_ref().clone();
+            if out.insert(v_path.clone()) {
+                q.push(v_path);
             }
         }
     }
 }
 
-fn newest_mtime(files: &[Rc<PathBuf>]) -> Result<SystemTime, String> {
+fn newest_mtime(files: &[PathBuf]) -> Result<SystemTime, String> {
     let mut newest = SystemTime::UNIX_EPOCH;
     for f in files {
         let t = file_mtime(f.as_ref())?;
@@ -414,12 +417,12 @@ mod tests {
 
         let bin_rs = bin_dir.join("re.rs");
         let deps = deps_for_bin("re", &bin_rs, &repo_root, &graph, &interner).unwrap();
-        let deps = deps
-            .into_iter()
-            .map(|p| p.as_ref().clone())
-            .collect::<BTreeSet<_>>();
+        let mut deps_set = SkipSet::new(16);
+        for p in deps {
+            deps_set.insert(p.clone());
+        }
 
-        assert!(deps.contains(&bin_dir.join("re").join("features").join("mod.rs")));
-        assert!(deps.contains(&bin_dir.join("re").join("features").join("search.rs")));
+        assert!(deps_set.contains(&bin_dir.join("re").join("features").join("mod.rs")));
+        assert!(deps_set.contains(&bin_dir.join("re").join("features").join("search.rs")));
     }
 }

@@ -1,6 +1,5 @@
-use std::collections::BTreeSet;
-
 use colored::Colorize;
+use rust_tools::cw::SkipSet;
 
 use crate::features::core::*;
 use crate::memo::{MemoBackend, history, sync, ui};
@@ -91,13 +90,13 @@ pub fn list_by_tag_name_feature(
     }
 
     if only_tags {
-        let mut set = BTreeSet::new();
+        let mut set = SkipSet::new(16);
         for r in &records {
             for t in &r.tags {
                 set.insert(t.clone());
             }
         }
-        for t in set {
+        for t in set.iter() {
             print!("{:?}  ", t);
         }
         println!();

@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, BufRead, Read};
 use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser};
 use rust_tools::cw::{
-    DirectedGraph, Edge, Mst, UndirectedGraph, WeightedDirectedGraph, WeightedUndirectedGraph,
+    DirectedGraph, Edge, Mst, SkipSet, SkipMap, UndirectedGraph, WeightedDirectedGraph,
+    WeightedUndirectedGraph,
 };
 use serde::Serialize;
 
@@ -392,7 +392,7 @@ fn split_fields(line: &str, sep: &str) -> Vec<String> {
 }
 
 fn count_nodes(edges: &[GraphEdge]) -> usize {
-    let mut set = BTreeSet::new();
+    let mut set = SkipSet::new(16);
     for e in edges {
         set.insert(e.from.clone());
         set.insert(e.to.clone());
@@ -401,12 +401,12 @@ fn count_nodes(edges: &[GraphEdge]) -> usize {
 }
 
 fn sorted_nodes(edges: &[GraphEdge]) -> Vec<String> {
-    let mut set = BTreeSet::new();
+    let mut set = SkipSet::new(16);
     for e in edges {
         set.insert(e.from.clone());
         set.insert(e.to.clone());
     }
-    set.into_iter().collect()
+    set.to_vec()
 }
 
 fn build_directed(edges: &[GraphEdge]) -> DirectedGraph<String> {
@@ -695,7 +695,8 @@ fn escape_mermaid_label(s: &str) -> String {
 
 fn build_mermaid(edges: &[GraphEdge], undirected: bool, weighted: bool) -> String {
     let nodes = sorted_nodes(edges);
-    let mut id_map = BTreeMap::new();
+    let mut id_map: Box<SkipMap<String, String>> =
+        SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
     let mut lines = Vec::new();
     lines.push("graph TD".to_string());
     for (idx, node) in nodes.iter().enumerate() {
@@ -706,10 +707,13 @@ fn build_mermaid(edges: &[GraphEdge], undirected: bool, weighted: bool) -> Strin
     let op = if undirected { "---" } else { "-->" };
     for e in edges {
         let from = id_map
-            .get(&e.from)
+            .get_ref(&e.from)
             .cloned()
             .unwrap_or_else(|| e.from.clone());
-        let to = id_map.get(&e.to).cloned().unwrap_or_else(|| e.to.clone());
+        let to = id_map
+            .get_ref(&e.to)
+            .cloned()
+            .unwrap_or_else(|| e.to.clone());
         if weighted {
             lines.push(format!("    {from} {op}|{}| {to}", format_weight(e.weight)));
         } else {
@@ -915,20 +919,20 @@ fn csv_escape(s: String) -> String {
     }
 }
 
-fn normalize_ext_set(raw: &str) -> (BTreeSet<String>, bool) {
+fn normalize_ext_set(raw: &str) -> (SkipSet<String>, bool) {
     let raw = raw.trim();
     if raw.is_empty() || raw == "*" {
-        return (BTreeSet::new(), true);
+        return (SkipSet::new(16), true);
     }
 
-    let mut set = BTreeSet::new();
+    let mut set = SkipSet::new(16);
     for part in raw.split(',') {
         let mut p = part.trim().to_lowercase();
         if p.is_empty() {
             continue;
         }
         if p == "*" {
-            return (BTreeSet::new(), true);
+            return (SkipSet::new(16), true);
         }
         if !p.starts_with('.') {
             p = format!(".{p}");
@@ -937,7 +941,7 @@ fn normalize_ext_set(raw: &str) -> (BTreeSet<String>, bool) {
     }
 
     if set.is_empty() {
-        (BTreeSet::new(), true)
+        (SkipSet::new(16), true)
     } else {
         (set, false)
     }

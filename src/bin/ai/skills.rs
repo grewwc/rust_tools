@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use rust_tools::cw::SkipMap;
+
 use crate::common::{configw, utils::expanduser};
 
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
@@ -72,7 +74,8 @@ impl SkillManifest {
 pub(super) fn load_all_skills() -> Vec<SkillManifest> {
     let dir = skills_dir();
     let _ = ensure_seeded_skills_dir(&dir);
-    let mut by_name = std::collections::BTreeMap::<String, SkillManifest>::new();
+    let mut by_name: Box<SkipMap<String, SkillManifest>> =
+        SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
 
     for (filename, content) in BUILTIN_SKILLS {
         if let Ok(mut skill) = parse_skill_front_matter(content) {
@@ -82,7 +85,7 @@ pub(super) fn load_all_skills() -> Vec<SkillManifest> {
     }
 
     for skill in load_skills_from_dir(&dir) {
-        if let Some(existing) = by_name.get(&skill.name)
+        if let Some(existing) = by_name.get_ref(&skill.name)
             && existing
                 .source_path
                 .as_deref()
@@ -93,7 +96,10 @@ pub(super) fn load_all_skills() -> Vec<SkillManifest> {
         by_name.insert(skill.name.clone(), skill);
     }
 
-    let mut out = by_name.into_values().collect::<Vec<_>>();
+    let mut out = (&*by_name)
+        .into_iter()
+        .map(|(_, v)| v.clone())
+        .collect::<Vec<_>>();
     out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.name.cmp(&b.name)));
     out
 }
@@ -285,6 +291,7 @@ fn load_skills_from_dir(dir: &Path) -> Vec<SkillManifest> {
 
 #[cfg(test)]
 mod tests {
+    use rust_tools::cw::SkipSet;
     use super::*;
 
     #[test]
@@ -335,14 +342,18 @@ override"#,
         .unwrap();
 
         let skills = load_all_skills();
-        let names = skills
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-        assert!(names.contains("debugger"));
-        assert!(names.contains("code-review"));
-        assert!(names.contains("refactor"));
-        assert!(names.contains("custom-skill"));
+        let mut names = SkipSet::new(8);
+        for s in &skills {
+            names.insert(s.name.clone());
+        }
+        let debugger = "debugger".to_string();
+        let code_review = "code-review".to_string();
+        let refactor = "refactor".to_string();
+        let custom = "custom-skill".to_string();
+        assert!(names.contains(&debugger));
+        assert!(names.contains(&code_review));
+        assert!(names.contains(&refactor));
+        assert!(names.contains(&custom));
         let code_review = skills.iter().find(|s| s.name == "code-review").unwrap();
         assert!(code_review
             .source_path

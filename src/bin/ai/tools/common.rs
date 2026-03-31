@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use rust_tools::cw::SkipMap;
 use serde_json::Value;
 
 use crate::ai::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
@@ -29,7 +30,10 @@ static TOOL_INDEX: LazyLock<HashMap<&'static str, &'static ToolSpec>> = LazyLock
 });
 
 pub(crate) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition> {
-    let mut out: Vec<ToolDefinition> = Vec::new();
+    // 使用 SkipMap 按工具名称字典序维护工具列表
+    let mut tools: Box<SkipMap<String, ToolDefinition>> =
+        SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
+
     for reg in inventory::iter::<ToolRegistration> {
         if !reg
             .spec
@@ -39,36 +43,39 @@ pub(crate) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition
         {
             continue;
         }
-        out.push(ToolDefinition {
+        let tool_def = ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: reg.spec.name.to_string(),
                 description: reg.spec.description.to_string(),
                 parameters: (reg.spec.parameters)(),
             },
-        });
+        };
+        tools.insert(tool_def.function.name.clone(), tool_def);
     }
-    out.sort_by(|a, b| a.function.name.cmp(&b.function.name));
-    out
+    tools.into_iter().map(|(_, v)| v.clone()).collect()
 }
 
 pub(crate) fn get_tool_definitions_by_names(names: &[String]) -> Vec<ToolDefinition> {
-    let mut out: Vec<ToolDefinition> = Vec::new();
+    // 使用 SkipMap 按工具名称字典序维护工具列表
+    let mut tools: Box<SkipMap<String, ToolDefinition>> =
+        SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
+
     for name in names {
         let Some(spec) = TOOL_INDEX.get(name.as_str()).copied() else {
             continue;
         };
-        out.push(ToolDefinition {
+        let tool_def = ToolDefinition {
             tool_type: "function".to_string(),
             function: FunctionDefinition {
                 name: spec.name.to_string(),
                 description: spec.description.to_string(),
                 parameters: (spec.parameters)(),
             },
-        });
+        };
+        tools.insert(tool_def.function.name.clone(), tool_def);
     }
-    out.sort_by(|a, b| a.function.name.cmp(&b.function.name));
-    out
+    tools.into_iter().map(|(_, v)| v.clone()).collect()
 }
 
 pub(crate) fn get_builtin_tool_definitions() -> Vec<ToolDefinition> {

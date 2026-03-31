@@ -7,8 +7,8 @@ where
     K: Clone,
     V: Clone,
 {
-    k: K,
-    v: V,
+    k: std::mem::MaybeUninit<K>,
+    v: std::mem::MaybeUninit<V>,
     forward: Vec<*mut Skipnode<K, V>>,
 }
 
@@ -19,15 +19,15 @@ where
 {
     fn new(k: K, v: V, max_height: usize) -> *mut Self {
         let ret = Box::new(Skipnode {
-            k,
-            v,
+            k: std::mem::MaybeUninit::new(k),
+            v: std::mem::MaybeUninit::new(v),
             forward: vec![ptr::null_mut(); max_height],
         });
         Box::into_raw(ret) as *mut Self
     }
 }
 
-pub struct Skiplist<K, V>
+pub struct SkipMap<K, V>
 where
     K: Clone,
     V: Clone,
@@ -40,7 +40,7 @@ where
     rng: ThreadRng,
 }
 
-impl<K, V> Skiplist<K, V>
+impl<K, V> SkipMap<K, V>
 where
     K: Clone,
     V: Clone,
@@ -56,10 +56,10 @@ where
     }
 
     pub fn new(max_height: usize, cmp: impl Fn(&K, &K) -> i32 + 'static) -> Box<Self> {
-        let ret = Box::new(Skiplist {
+        let ret = Box::new(SkipMap {
             head: Skipnode {
-                k: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
-                v: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
+                k: std::mem::MaybeUninit::uninit(),
+                v: std::mem::MaybeUninit::uninit(),
                 forward: vec![ptr::null_mut(); max_height],
             },
             max_height,
@@ -76,7 +76,7 @@ where
             let (updates, found) = self.find(&k.clone(), level);
             let found = found as *mut Skipnode<K,V>;
             if !found.is_null() {
-                (&mut *found).v = v;
+                (&mut *found).v.write(v);
                 return;
             }
             let new_node = Skipnode::new(k, v, self.max_height);
@@ -97,19 +97,27 @@ where
         self.len += 1;
     }
 
-    pub fn get(&mut self, k: &K) -> Option<V> {
+    pub fn get_ref(&self, k: &K) -> Option<&V> {
         let (_, found) = self.find(k, self.max_height - 1);
         if found == ptr::null_mut() {
             return None;
         }
-        Some(unsafe { (*found).v.clone() })
+        Some(unsafe { (&*found).v.assume_init_ref() })
     }
 
-    pub fn contains(&mut self, k: &K) -> bool {
-        self.get(k).is_some()
+    pub fn get(&self, k: &K) -> Option<V> {
+        self.get_ref(k).cloned()
     }
 
-    pub fn range(&mut self, r: std::ops::Range<K>) -> Vec<(&K, &V)> {
+    pub fn contains_key(&self, k: &K) -> bool {
+        self.get_ref(k).is_some()
+    }
+
+    pub fn contains(&self, k: &K) -> bool {
+        self.contains_key(k)
+    }
+
+    pub fn range(&self, r: std::ops::Range<K>) -> Vec<(&K, &V)> {
         let start = r.start;
         let end = r.end;
         let mut prev = &self.head as *const Skipnode<K, V>;
@@ -118,18 +126,18 @@ where
         unsafe {
             for i in (0..self.max_height).rev() {
                 let mut curr = *(&*prev).forward.get_unchecked(i);
-                while !curr.is_null() && f(&(*curr).k, &start) < 0 {
+                while !curr.is_null() && f((*curr).k.assume_init_ref(), &start) < 0 {
                     prev = curr;
                     curr = (&*curr).forward[i];
                 }
             }
             let mut curr = *(&*prev).forward.get_unchecked(0);
             while !curr.is_null() {
-                if f(&(*curr).k, &end) >= 0 {
+                if f((*curr).k.assume_init_ref(), &end) >= 0 {
                     break;
                 }
-                let k = &(*curr).k;
-                let v = &(*curr).v;
+                let k = (*curr).k.assume_init_ref();
+                let v = (*curr).v.assume_init_ref();
                 ret.push((k, v));
                 curr = (&*curr).forward[0];
             }
@@ -173,7 +181,7 @@ where
     }
 }
 
-impl<K, V> Drop for Skiplist<K, V>
+impl<K, V> Drop for SkipMap<K, V>
 where
     K: Clone,
     V: Clone,
@@ -186,7 +194,7 @@ where
             .copied()
             .unwrap_or(ptr::null_mut());
         unsafe {
-            Skiplist::free_chain(first);
+            SkipMap::free_chain(first);
         }
     }
 }
@@ -197,10 +205,10 @@ where
     V: Clone,
 {
     curr: *mut Skipnode<K, V>,
-    _marker: PhantomData<&'a Skiplist<K, V>>,
+    _marker: PhantomData<&'a SkipMap<K, V>>,
 }
 
-impl<'a, K, V> IntoIterator for &'a Skiplist<K, V>
+impl<'a, K, V> IntoIterator for &'a SkipMap<K, V>
 where
     K: Clone,
     V: Clone,
@@ -232,12 +240,12 @@ where
         unsafe {
             let node = &*self.curr;
             self.curr = *node.forward.get_unchecked(0);
-            Some((&node.k, &node.v))
+            Some((node.k.assume_init_ref(), node.v.assume_init_ref()))
         }
     }
 }
 
-impl<K, V> Skiplist<K, V>
+impl<K, V> SkipMap<K, V>
 where
     K: Clone,
     V: Clone,
@@ -250,11 +258,11 @@ where
             let mut found = ptr::null_mut();
             for i in (0..=level).rev() {
                 let mut curr = *(&*prev).forward.get_unchecked(i);
-                while curr != ptr::null_mut() && f(&(&*curr).k, &k) < 0 {
+                while curr != ptr::null_mut() && f((&*curr).k.assume_init_ref(), &k) < 0 {
                     prev = curr;
                     curr = *((&*curr).forward).get_unchecked(i);
                 }
-                if curr != ptr::null_mut() && f(&(*curr).k, &k) == 0 {
+                if curr != ptr::null_mut() && f((*curr).k.assume_init_ref(), &k) == 0 {
                     found = curr;
                 }
                 updates[i] = prev;
@@ -275,6 +283,57 @@ where
     }
 }
 
+pub struct SkipSet<T>
+where
+    T: Clone + Ord + 'static,
+{
+    inner: Box<SkipMap<T, ()>>,
+}
+
+impl<T> SkipSet<T>
+where
+    T: Clone + Ord + 'static,
+{
+    pub fn new(max_height: usize) -> Self {
+        Self {
+            inner: SkipMap::new(max_height, Self::cmp),
+        }
+    }
+
+    fn cmp(a: &T, b: &T) -> i32 {
+        a.cmp(b) as i32
+    }
+
+    pub fn insert(&mut self, value: T) -> bool {
+        if self.contains(&value) {
+            return false;
+        }
+        self.inner.insert(value, ());
+        true
+    }
+
+    pub fn contains(&self, value: &T) -> bool {
+        self.inner.contains_key(value)
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        (&*self.inner).into_iter().map(|(k, _)| k)
+    }
+
+    pub fn to_vec(&self) -> Vec<T> {
+        let ret = self.iter().cloned().collect();
+        return ret;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,8 +342,8 @@ mod tests {
         (*b).cmp(a) as i32
     }
 
-    fn new_list(max_height: usize) -> Box<Skiplist<i32, i32>> {
-        Skiplist::new(max_height, |a: &i32, b: &i32| a.cmp(b) as i32)
+    fn new_list(max_height: usize) -> Box<SkipMap<i32, i32>> {
+        SkipMap::new(max_height, |a: &i32, b: &i32| a.cmp(b) as i32)
     }
 
     #[test]
@@ -345,7 +404,7 @@ mod tests {
 
     #[test]
     fn iter_yields_sorted_by_comparator_descending() {
-        let mut sl: Box<Skiplist<i32, i32>> = Skiplist::new(1, cmp_i32_desc);
+        let mut sl: Box<SkipMap<i32, i32>> = SkipMap::new(1, cmp_i32_desc);
         sl.insert(1, 10);
         sl.insert(3, 30);
         sl.insert(2, 20);
@@ -499,7 +558,7 @@ mod tests {
 
     #[test]
     fn range_descending_comparator_uses_start_as_upper_and_end_as_lower() {
-        let mut sl: Box<Skiplist<i32, i32>> = Skiplist::new(6, cmp_i32_desc);
+        let mut sl: Box<SkipMap<i32, i32>> = SkipMap::new(6, cmp_i32_desc);
         for i in 1..=10 {
             sl.insert(i, i * 10);
         }

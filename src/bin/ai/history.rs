@@ -11,6 +11,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use rust_tools::cw::SkipMap;
 use crate::common::utils::open_file_for_append;
 
 use super::types::ToolCall;
@@ -543,7 +544,19 @@ impl SessionStore {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(err),
         };
-        let mut out = Vec::new();
+        // 使用 SkipMap 按修改时间倒序维护 session 列表
+        // key: (timestamp, id) - timestamp 用 u64 表示，0 表示未知时间
+        // 排序规则：时间倒序，时间相同时按 id 升序
+        let mut sessions: Box<SkipMap<(u64, String), SessionInfo>> = SkipMap::new(
+            16,
+            |a: &(u64, String), b: &(u64, String)| {
+                match b.0.cmp(&a.0) {
+                    std::cmp::Ordering::Equal => a.1.cmp(&b.1) as i32,
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Greater => 1,
+                }
+            },
+        );
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
@@ -559,19 +572,21 @@ impl SessionStore {
             };
             let modified_local = metadata.modified().ok().map(DateTime::<Local>::from);
             let first_user_prompt = read_first_user_prompt_sqlite(&path).unwrap_or(None);
-            out.push(SessionInfo {
-                id: stem.to_string(),
-                modified_local,
-                size_bytes: metadata.len(),
-                first_user_prompt,
-            });
+            let id = stem.to_string();
+            let timestamp = modified_local
+                .map(|dt| dt.timestamp_millis() as u64)
+                .unwrap_or(0);
+            sessions.insert(
+                (timestamp, id.clone()),
+                SessionInfo {
+                    id,
+                    modified_local,
+                    size_bytes: metadata.len(),
+                    first_user_prompt,
+                },
+            );
         }
-        out.sort_by(|a, b| {
-            b.modified_local
-                .cmp(&a.modified_local)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        Ok(out)
+        Ok(sessions.into_iter().map(|(_, v)| v.clone()).collect())
     }
 
     pub(super) fn delete_session(&self, session_id: &str) -> io::Result<bool> {
