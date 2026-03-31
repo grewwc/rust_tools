@@ -51,7 +51,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     out
 }
 
-pub(crate) fn validate_execute_command(command: &str) -> Result<(), String> {
+pub fn validate_execute_command(command: &str) -> Result<(), String> {
     let command = command.trim();
     if command.is_empty() {
         return Err("empty command".to_string());

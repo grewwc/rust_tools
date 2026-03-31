@@ -311,24 +311,35 @@ pub(super) fn select_skill_via_model(
         return None;
     }
 
-    let mut lines = vec!["You are a skill router for a CODE development assistant. Your ONLY job is to route CODE-related questions to appropriate skills.".to_string()];
-    lines.push("Output schema: {\"skill\":\"<exact skill name or empty>\",\"confidence\":0.0}".to_string());
-    lines.push("Critical Rules:".to_string());
-    lines.push("- ALL skills in this system are for CODE only. If the question is NOT about programming/coding, ALWAYS return empty skill.".to_string());
-    lines.push("- Check: Is the user asking about SOURCE CODE files (.rs, .py, .js, .java, .go, etc.)? If NO → empty skill.".to_string());
-    lines.push("- Common NON-code topics that should get EMPTY skill: news, sports, weather, stocks, NBA, music, movies, general knowledge, data analysis, business questions.".to_string());
-    lines.push("- Word traps: '看一下'、'检查'、'分析'、'审查' in Chinese do NOT mean code review unless explicitly about CODE.".to_string());
-    lines.push("- If unsure, return empty skill with confidence < 0.5. Better to skip than misroute.".to_string());
-    lines.push("- Use EXACT skill name from the list below.".to_string());
-    lines.push("- Return ONLY valid JSON, no explanations.".to_string());
-    lines.push("Examples:".to_string());
-    lines.push("- User: '帮我看一下今天 nba 的比赛' → {\"skill\":\"\",\"confidence\":0.1} ❌ sports, not code".to_string());
-    lines.push("- User: '分析一下这个函数的时间复杂度' → {\"skill\":\"\",\"confidence\":0.2} ❌ algorithm question, but no code provided".to_string());
-    lines.push("- User: '帮我 review 这段 Rust 代码' → {\"skill\":\"code-review\",\"confidence\":0.95} ✅ explicitly about code".to_string());
-    lines.push("- User: '这个编译错误怎么修复' → {\"skill\":\"debugger\",\"confidence\":0.9} ✅ compilation error".to_string());
-    lines.push("- User: '优化一下这个函数的结构' → {\"skill\":\"refactor\",\"confidence\":0.85} ✅ code refactoring".to_string());
-    lines.push("- User: '查询数据库中的用户数据' → {\"skill\":\"\",\"confidence\":0.1} ❌ data query, not code".to_string());
-    lines.push("Skills:".to_string());
+    // Use raw multi-line string for better readability
+    let mut system_prompt = r#"You are a skill router for a CODE development assistant. Your ONLY job is to route SOURCE CODE programming questions to appropriate skills.
+ALL skills are for PROGRAMMING/CODING tasks only (writing, reviewing, debugging, refactoring code).
+Output schema: {"skill":"<exact skill name or empty>","confidence":0.0}
+Critical Rules:
+- MANDATORY CHECK 1: Is the user asking to WRITE/REVIEW/DEBUG/REFACTOR specific SOURCE CODE (files or snippets)? If NO → return empty skill.
+- MANDATORY CHECK 2: Is this a GENERAL KNOWLEDGE question about programming concepts/APIs/libraries (e.g., 'What is X?', 'How to use X?', 'X 是什么')? If YES → return empty skill. These are documentation/knowledge questions, NOT code tasks.
+- NON-CODE TOPICS (ALWAYS return empty): documents/docs (文档，云文档，飞书文档), notes, wikis, data analysis, business questions, news, sports, weather, stocks, music, movies, general knowledge, project management, architecture design (without code), programming concept questions (API 说明，库的用法，框架特性).
+- KEY INDICATOR: Does the question include ACTUAL CODE SNIPPET or SPECIFIC FILE PATH and ask to operate on it (review, fix, refactor, write)? If NO → likely not a code task.
+- QUESTION TYPE MATTERS: 'X 是什么' / 'What is X' / '怎么用 X' / 'How to use X' = knowledge question (NO skill). '帮我 review 这段代码' / 'Fix this bug' / 'Refactor this function' = code task (YES skill).
+- Chinese word traps: '看一下'、'检查'、'分析'、'审查'、'文档'、'架构' do NOT mean code tasks unless explicitly about operating on SOURCE CODE files/snippets.
+- If unsure, return empty skill with confidence < 0.5. Better to skip than misroute.
+- Use EXACT skill name from the list below.
+- Return ONLY valid JSON, no explanations.
+Examples:
+- User: '帮我看一下今天 nba 的比赛' → {"skill":"","confidence":0.1} ❌ sports, not code
+- User: '分析一下这个函数的时间复杂度' → {"skill":"","confidence":0.2} ❌ algorithm question without code
+- User: 'python flask 中 g.request_base_info_dict 这个是什么' → {"skill":"","confidence":0.1} ❌ knowledge question about Flask API, not a code task
+- User: 'Django 的 ORM 怎么用' → {"skill":"","confidence":0.1} ❌ knowledge question about Django, not a code task
+- User: 'React hooks 是什么' → {"skill":"","confidence":0.1} ❌ knowledge question about React, not a code task
+- User: 'Rust 的 borrow checker 怎么工作的' → {"skill":"","confidence":0.1} ❌ knowledge question about Rust, not a code task
+- User: '帮我 review 这段 Rust 代码' → {"skill":"code-review","confidence":0.95} ✅ explicitly about code
+- User: '这个编译错误怎么修复：error[E0382]...' → {"skill":"debugger","confidence":0.9} ✅ compilation error with code
+- User: '优化一下这个函数的结构：fn foo() { ... }' → {"skill":"refactor","confidence":0.85} ✅ code refactoring with code
+- User: '查询数据库中的用户数据' → {"skill":"","confidence":0.1} ❌ data/business query, not code
+- User: '帮我一下我的飞书文档：dataagent 项目架构相关' → {"skill":"","confidence":0.1} ❌ about cloud documents, not code
+- User: '查看项目架构文档' → {"skill":"","confidence":0.1} ❌ documentation, not code
+Skills:
+"#.to_string();
 
     for s in skills.iter().take(32) {
         let desc = if s.description.trim().is_empty() {
@@ -336,11 +347,8 @@ pub(super) fn select_skill_via_model(
         } else {
             s.description.trim().to_string()
         };
-        lines.push(format!("- {}: {}", s.name, desc));
+        system_prompt.push_str(&format!("- {}: {}\n", s.name, desc));
     }
-
-    let system_prompt = lines.join("\n");
-
     let messages = vec![
         Message {
             role: "system".to_string(),

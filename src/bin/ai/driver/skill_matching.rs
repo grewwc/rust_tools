@@ -172,3 +172,46 @@ mod tests {
         assert!(matched.is_none(), "NBA 查询不应该匹配到 refactor 技能");
     }
 }
+
+#[cfg(test)]
+mod command_validation_tests {
+    use crate::ai::tools::command_tools;
+
+    #[test]
+    fn execute_command_blocks_dangerous_programs() {
+        assert!(command_tools::validate_execute_command("rm -rf /").is_err());
+        assert!(command_tools::validate_execute_command("mv a b").is_err());
+        assert!(command_tools::validate_execute_command("sudo ls").is_err());
+    }
+
+    #[test]
+    fn execute_command_allows_common_shell_syntax() {
+        assert!(command_tools::validate_execute_command("ls | wc").is_ok());
+        assert!(command_tools::validate_execute_command("ls && pwd").is_ok());
+        assert!(command_tools::validate_execute_command("echo hi > /tmp/a").is_ok());
+    }
+
+    #[test]
+    fn execute_command_blocks_network_and_system_commands() {
+        assert!(command_tools::validate_execute_command("ssh user@host").is_err());
+    }
+
+    #[test]
+    fn execute_command_allows_safe_git_operations() {
+        assert!(command_tools::validate_execute_command("git status").is_ok());
+        assert!(command_tools::validate_execute_command("git diff").is_ok());
+        assert!(command_tools::validate_execute_command("git log").is_ok());
+        assert!(command_tools::validate_execute_command("git add .").is_ok());
+        assert!(command_tools::validate_execute_command("git commit -m 'msg'").is_ok());
+    }
+
+    #[test]
+    fn execute_command_allows_cargo_and_build_tools() {
+        assert!(command_tools::validate_execute_command("cargo build").is_ok());
+        assert!(command_tools::validate_execute_command("cargo test").is_ok());
+        assert!(command_tools::validate_execute_command("cargo check").is_ok());
+        assert!(command_tools::validate_execute_command("cargo clippy").is_ok());
+        assert!(command_tools::validate_execute_command("make").is_ok());
+        assert!(command_tools::validate_execute_command("npm install").is_ok());
+    }
+}
