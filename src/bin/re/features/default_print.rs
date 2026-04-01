@@ -5,7 +5,7 @@ use crate::memo::{MemoBackend, MemoRecord, history, ui};
 
 fn list_default_records(db: &MemoBackend, limit: i64) -> Vec<MemoRecord> {
     let tags = parse_tag_query("todo urgent");
-    db.list_records_by_tags(&tags, false, true, limit, false, false)
+    db.list_records_by_tags(&tags, false, true, limit, true, false)
         .unwrap_or_default()
 }
 

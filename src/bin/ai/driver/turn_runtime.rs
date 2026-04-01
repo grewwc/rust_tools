@@ -8,7 +8,6 @@ use crate::ai::{
 use super::{
     drain_response, input,
     print::{print_assistant_banner, print_tool_output_block},
-    skill_runtime::SkillTurnGuard,
     reflection,
     tools,
 };
@@ -21,13 +20,20 @@ pub(super) enum TurnOutcome {
 pub(super) async fn run_turn(
     app: &mut App,
     mcp_client: &mut McpClient,
-    skill_turn: SkillTurnGuard,
+    skill_manifests: &[crate::ai::skills::SkillManifest],
     history_count: usize,
     question: String,
     next_model: String,
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
+    let mut skill_turn = super::skill_runtime::prepare_skill_for_turn(
+        app,
+        mcp_client,
+        skill_manifests,
+        &question,
+    )
+    .await;
     if let Some(name) = skill_turn.matched_skill_name() {
         println!("[skill: {}]", name.cyan());
     }
@@ -112,6 +118,27 @@ pub(super) async fn run_turn(
     let mut final_assistant_recorded = false;
     loop {
         iteration += 1;
+        if iteration > 1 {
+            let prev_skill = skill_turn.matched_skill_name().map(|s| s.to_string());
+            let new_skill_turn = super::skill_runtime::prepare_skill_for_turn(
+                app,
+                mcp_client,
+                skill_manifests,
+                &question,
+            )
+            .await;
+            let next_skill = new_skill_turn.matched_skill_name().map(|s| s.to_string());
+
+            if prev_skill != next_skill {
+                match next_skill.as_deref() {
+                    Some(name) => println!("[skill switched: {}]", name.cyan()),
+                    None => println!("[skill switched: <none>]"),
+                }
+            }
+            skill_turn = new_skill_turn;
+            messages[0].content = Value::String(skill_turn.system_prompt().to_string());
+        }
+
         let mut current_history = String::new();
         app.streaming.store(true, std::sync::atomic::Ordering::Relaxed);
         if force_final_response {

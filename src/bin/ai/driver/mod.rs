@@ -215,13 +215,10 @@ async fn run_loop(
         app.current_model = next_model.clone();
 
         app.cancel_stream.store(false, Ordering::Relaxed);
-        let skill_turn =
-            skill_runtime::prepare_skill_for_turn(app, mcp_client, skill_manifests, &question)
-                .await;
         let turn_outcome = turn_runtime::run_turn(
             app,
             mcp_client,
-            skill_turn,
+            skill_manifests,
             ctx.history_count,
             question,
             next_model,
