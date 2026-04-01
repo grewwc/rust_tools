@@ -33,7 +33,7 @@ use rustc_hash::FxHasher;
 /// # 示例
 ///
 /// ```rust
-/// use rust_tools::cw::bloom_filter::BloomFilter;
+/// use rust_tools::cw::BloomFilter;
 ///
 /// // 方式 1：直接指定参数
 /// let mut bf = BloomFilter::new(1000, 3); // 1000 位，3 个哈希函数
@@ -80,7 +80,7 @@ impl BloomFilter {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::bloom_filter::BloomFilter;
+    /// use rust_tools::cw::BloomFilter;
     ///
     /// let bf = BloomFilter::new(1024, 3);
     /// assert_eq!(bf.bit_count(), 1024);
@@ -109,7 +109,7 @@ impl BloomFilter {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::bloom_filter::BloomFilter;
+    /// use rust_tools::cw::BloomFilter;
     ///
     /// // 期望存储 10000 个元素，假阳性率 1%
     /// let bf = BloomFilter::with_rate(10000, 0.01);
@@ -138,7 +138,7 @@ impl BloomFilter {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::bloom_filter::BloomFilter;
+    /// use rust_tools::cw::BloomFilter;
     ///
     /// let mut bf = BloomFilter::new(128, 3);
     /// bf.insert(&"hello".to_string());
@@ -155,7 +155,7 @@ impl BloomFilter {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::bloom_filter::BloomFilter;
+    /// use rust_tools::cw::BloomFilter;
     ///
     /// let bf = BloomFilter::new(1024, 3);
     /// assert_eq!(bf.bit_count(), 1024);
@@ -169,7 +169,7 @@ impl BloomFilter {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::bloom_filter::BloomFilter;
+    /// use rust_tools::cw::BloomFilter;
     ///
     /// let bf = BloomFilter::new(1024, 5);
     /// assert_eq!(bf.hash_count(), 5);
@@ -187,7 +187,7 @@ impl BloomFilter {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::bloom_filter::BloomFilter;
+    /// use rust_tools::cw::BloomFilter;
     ///
     /// let mut bf = BloomFilter::new(1000, 3);
     /// bf.insert(&"hello".to_string());
@@ -215,7 +215,7 @@ impl BloomFilter {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::bloom_filter::BloomFilter;
+    /// use rust_tools::cw::BloomFilter;
     ///
     /// let mut bf = BloomFilter::new(1000, 3);
     /// bf.insert(&"hello".to_string());

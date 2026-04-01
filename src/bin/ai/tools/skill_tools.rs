@@ -82,12 +82,12 @@ inventory::submit!(ToolRegistration {
 });
 
 fn resolve_configured_skills_dir() -> PathBuf {
-    let cfg = crate::common::configw::get_all_config();
+    let cfg = crate::commonw::configw::get_all_config();
     let raw = cfg.get_opt("ai.skills.dir").unwrap_or_default();
     if raw.trim().is_empty() {
         return crate::ai::skills::skills_dir();
     }
-    PathBuf::from(crate::common::utils::expanduser(&raw).as_ref())
+    PathBuf::from(crate::commonw::utils::expanduser(&raw).as_ref())
 }
 
 fn parse_string_array(v: &Value) -> Vec<String> {

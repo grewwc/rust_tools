@@ -1,6 +1,6 @@
 use std::{collections::hash_map::Entry, ptr::null_mut};
 
-use crate::common::types::FastMap;
+use crate::commonw::types::FastMap;
 
 /// A Trie (prefix tree) data structure for efficient string storage and retrieval.
 ///
@@ -11,7 +11,7 @@ use crate::common::types::FastMap;
 /// # Examples
 ///
 /// ```
-/// use rust_tools::cw::trie::Trie;
+/// use rust_tools::cw::Trie;
 ///
 /// let mut trie = Trie::new();
 /// trie.insert("hello");
@@ -41,7 +41,7 @@ impl Trie {
     /// # Examples
     ///
     /// ```
-    /// use rust_tools::cw::trie::Trie;
+    /// use rust_tools::cw::Trie;
     ///
     /// let trie = Trie::new();
     /// assert!(trie.is_empty());
@@ -75,7 +75,7 @@ impl Trie {
     /// # Examples
     ///
     /// ```
-    /// use rust_tools::cw::trie::Trie;
+    /// use rust_tools::cw::Trie;
     ///
     /// let mut trie = Trie::new();
     /// assert!(trie.insert("hello"));
@@ -124,7 +124,7 @@ impl Trie {
     /// # Examples
     ///
     /// ```
-    /// use rust_tools::cw::trie::Trie;
+    /// use rust_tools::cw::Trie;
     ///
     /// let mut trie = Trie::new();
     /// trie.insert("hello");
@@ -159,7 +159,7 @@ impl Trie {
     /// # Examples
     ///
     /// ```
-    /// use rust_tools::cw::trie::Trie;
+    /// use rust_tools::cw::Trie;
     ///
     /// let mut trie = Trie::new();
     /// trie.insert("hello");
@@ -202,7 +202,7 @@ impl Trie {
     /// # Examples
     ///
     /// ```
-    /// use rust_tools::cw::trie::Trie;
+    /// use rust_tools::cw::Trie;
     ///
     /// let mut trie = Trie::new();
     /// trie.insert("hello");
@@ -256,7 +256,7 @@ impl Trie {
     /// # Examples
     ///
     /// ```
-    /// use rust_tools::cw::trie::Trie;
+    /// use rust_tools::cw::Trie;
     ///
     /// let mut trie = Trie::new();
     /// assert_eq!(trie.len(), 0);
@@ -276,7 +276,7 @@ impl Trie {
     /// # Examples
     ///
     /// ```
-    /// use rust_tools::cw::trie::Trie;
+    /// use rust_tools::cw::Trie;
     ///
     /// let mut trie = Trie::new();
     /// assert!(trie.is_empty());

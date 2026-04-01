@@ -16,7 +16,7 @@ use std::collections::LinkedList;
 /// # 示例
 ///
 /// ```rust
-/// use rust_tools::cw::queue::Queue;
+/// use rust_tools::cw::Queue;
 ///
 /// let mut queue: Queue<i32> = Queue::new();
 ///
@@ -54,7 +54,7 @@ impl<T> Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let queue: Queue<i32> = Queue::new();
     /// assert!(queue.is_empty());
@@ -78,7 +78,7 @@ impl<T> Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let mut queue = Queue::new();
     /// queue.enqueue(1);
@@ -96,7 +96,7 @@ impl<T> Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let mut queue = Queue::new();
     /// queue.enqueue(1);
@@ -112,7 +112,7 @@ impl<T> Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let mut queue = Queue::new();
     /// queue.enqueue(1);
@@ -129,7 +129,7 @@ impl<T> Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let mut queue = Queue::new();
     /// queue.enqueue(1);
@@ -145,7 +145,7 @@ impl<T> Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let mut queue = Queue::new();
     /// queue.enqueue(1);
@@ -160,7 +160,7 @@ impl<T> Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let mut queue = Queue::new();
     /// assert!(queue.is_empty());
@@ -178,7 +178,7 @@ impl<T> Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let mut queue = Queue::new();
     /// queue.enqueue(1);
@@ -196,7 +196,7 @@ impl<T> Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let mut queue = Queue::new();
     /// queue.enqueue(1);
@@ -214,7 +214,7 @@ impl<T> Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let mut queue = Queue::new();
     /// queue.enqueue(1);
@@ -233,7 +233,7 @@ impl<T> Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let mut queue = Queue::new();
     /// queue.extend([1, 2, 3]);
@@ -253,7 +253,7 @@ impl<T> Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let mut queue = Queue::new();
     /// queue.enqueue(1);
@@ -274,7 +274,7 @@ impl<T> From<Vec<T>> for Queue<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::queue::Queue;
+    /// use rust_tools::cw::Queue;
     ///
     /// let vec = vec![1, 2, 3];
     /// let queue: Queue<i32> = Queue::from(vec);

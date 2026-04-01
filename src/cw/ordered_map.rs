@@ -1,6 +1,6 @@
 use std::{borrow::Borrow, fmt, hash::Hash};
 
-use crate::common::types::FastMap;
+use crate::commonw::types::FastMap;
 
 #[derive(Clone)]
 pub struct OrderedMap<K, V> {

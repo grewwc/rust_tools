@@ -19,7 +19,7 @@ pub struct McpInitReport {
 }
 
 fn has_feishu_app_credentials_in_configw() -> bool {
-    let cfg = crate::common::configw::get_all_config();
+    let cfg = crate::commonw::configw::get_all_config();
     let app_id = cfg
         .get_opt("feishu.app_id")
         .unwrap_or_default()
@@ -44,14 +44,14 @@ fn is_feishu_mcp_server(name: &str, command: &str) -> bool {
 }
 
 pub fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitReport {
-    let cfg = crate::common::configw::get_all_config();
+    let cfg = crate::commonw::configw::get_all_config();
     let mcp_path = if !app.cli.mcp_config.trim().is_empty() {
         app.cli.mcp_config.trim().to_string()
     } else {
         cfg.get_opt("ai.mcp.config")
             .unwrap_or_else(|| "~/.config/mcp.json".to_string())
     };
-    let mcp_path = crate::common::utils::expanduser(&mcp_path);
+    let mcp_path = crate::commonw::utils::expanduser(&mcp_path);
     let mcp_path = mcp_path.as_ref();
 
     let mut report = McpInitReport {

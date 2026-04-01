@@ -8,7 +8,7 @@ use mongodb::{
 };
 
 use crate::{
-    common::configw,
+    commonw::configw,
     memo::model::{MemoRecord, MemoTag},
 };
 

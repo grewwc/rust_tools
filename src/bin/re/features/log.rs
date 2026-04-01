@@ -66,13 +66,13 @@ pub fn insert_records(
         }
     } else if from_editor {
         print!("input the title: ");
-        crate::common::editor::flush_stdout();
-        let title = crate::common::editor::input_with_editor("", use_vscode).unwrap_or_default();
+        rust_tools::commonw::editor::flush_stdout();
+        let title = rust_tools::commonw::editor::input_with_editor("", use_vscode).unwrap_or_default();
         println!();
         title_list.push(title);
     } else {
         title_list.push(
-            crate::common::prompt::read_line("input the title: ")
+            rust_tools::commonw::prompt::read_line("input the title: ")
                 .trim()
                 .to_string(),
         );
@@ -83,7 +83,7 @@ pub fn insert_records(
     } else if !tag_flag.trim().is_empty() {
         tag_flag.to_string()
     } else {
-        crate::common::prompt::read_line("input the tags: ")
+        rust_tools::commonw::prompt::read_line("input the tags: ")
     };
     let mut tags = parse_tag_query(&tags_str.replace(',', " "));
     if tags.is_empty() {
@@ -123,9 +123,9 @@ pub fn update_record_impl(
     let mut changed = false;
 
     print!("input the title: ");
-    crate::common::editor::flush_stdout();
+    rust_tools::commonw::editor::flush_stdout();
     if from_editor {
-        let new_title = crate::common::editor::input_with_editor(&old_title, use_vscode)
+        let new_title = rust_tools::commonw::editor::input_with_editor(&old_title, use_vscode)
             .unwrap_or(old_title.clone());
         if new_title != old_title {
             record.title = new_title;
@@ -133,7 +133,7 @@ pub fn update_record_impl(
         }
         println!();
     } else {
-        let mut title = crate::common::prompt::read_line("").trim().to_string();
+        let mut title = rust_tools::commonw::prompt::read_line("").trim().to_string();
         if from_file && !title.is_empty() {
             title = std::fs::read_to_string(&title)
                 .unwrap_or_default()
@@ -146,7 +146,7 @@ pub fn update_record_impl(
         }
     }
 
-    let tags = crate::common::prompt::read_line("input the tags: ").replace(',', " ");
+    let tags = rust_tools::commonw::prompt::read_line("input the tags: ").replace(',', " ");
     let tags = tags.chars().filter(|c| !c.is_control()).collect::<String>();
     let tags = parse_tag_query(&tags);
     if !tags.is_empty() {

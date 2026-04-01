@@ -20,7 +20,7 @@ use crate::ai::{
     skills::{self, SkillManifest},
     types::{AgentContext, App},
 };
-use crate::common::prompt::{prompt_yes_or_no_interruptible, read_line};
+use crate::commonw::prompt::{prompt_yes_or_no_interruptible, read_line};
 
 pub mod input;
 pub mod mcp_init;
@@ -39,8 +39,8 @@ pub use print::*;
 pub use signal::*;
 pub use skill_matching::*;
 
-const DEFAULT_MAX_ITERATIONS: usize = 256;
-const OPENCLAW_MAX_ITERATIONS: usize = 256;
+const DEFAULT_MAX_ITERATIONS: usize = 6;
+const OPENCLAW_MAX_ITERATIONS: usize = 16;
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = cli::parse_cli_args(std::env::args());
@@ -554,7 +554,7 @@ fn try_handle_session_command(
             }
         }
         "clear-all" | "clear_all" | "clear" | "wipe" => {
-            let confirm = crate::common::prompt::prompt_yes_or_no_interruptible(
+            let confirm = crate::commonw::prompt::prompt_yes_or_no_interruptible(
                 "Delete ALL sessions? (y/n): ",
             );
             if confirm != Some(true) {

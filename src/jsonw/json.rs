@@ -4,7 +4,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::{
-    clipboard::string_content, jsonw::sanitize::sanitize_json_input, jsonw::sort,
+    clipboardw::string_content, jsonw::sanitize::sanitize_json_input, jsonw::sort,
     jsonw::types::ParseOptions,
 };
 

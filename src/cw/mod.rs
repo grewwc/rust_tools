@@ -42,7 +42,7 @@
 //! ### 队列
 //!
 //! ```rust
-//! use rust_tools::cw::queue::Queue;
+//! use rust_tools::cw::Queue;
 //!
 //! let mut queue: Queue<i32> = Queue::new();
 //! queue.enqueue(1);
@@ -56,7 +56,7 @@
 //! ### LRU 缓存
 //!
 //! ```rust
-//! use rust_tools::cw::lru_cache::LruCache;
+//! use rust_tools::cw::LruCache;
 //!
 //! let mut cache = LruCache::new(2); // 容量为 2
 //! cache.put(1, "a");
@@ -71,7 +71,7 @@
 //! ### 布隆过滤器
 //!
 //! ```rust
-//! use rust_tools::cw::bloom_filter::BloomFilter;
+//! use rust_tools::cw::BloomFilter;
 //!
 //! let mut bf = BloomFilter::new(1000, 3); // 1000 位，3 个哈希函数
 //! bf.insert(&"hello".to_string());
@@ -85,7 +85,7 @@
 //! ### 计数器
 //!
 //! ```rust
-//! use rust_tools::cw::counter::Counter;
+//! use rust_tools::cw::Counter;
 //!
 //! let mut counter: Counter<char> = Counter::new();
 //! for c in "hello world".chars() {
@@ -99,7 +99,7 @@
 //! ### 有序集合
 //!
 //! ```rust
-//! use rust_tools::cw::ordered_set::OrderedSet;
+//! use rust_tools::cw::OrderedSet;
 //!
 //! let mut set = OrderedSet::new();
 //! set.insert(3);
@@ -131,6 +131,7 @@ pub mod uf;
 pub mod zset;
 
 // 重新导出常用类型
+pub use bloom_filter::BloomFilter;
 pub use counter::Counter;
 pub use deque_list::DequeList;
 pub use graph::{DirectedGraph, Edge, Mst, UndirectedGraph, WeightedDirectedGraph, WeightedUndirectedGraph};

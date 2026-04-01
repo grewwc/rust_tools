@@ -4,7 +4,7 @@
 
 use std::hash::Hash;
 
-use crate::common::types::FastMap;
+use crate::commonw::types::FastMap;
 
 /// 计数器（Counter）
 ///
@@ -18,7 +18,7 @@ use crate::common::types::FastMap;
 /// # 示例
 ///
 /// ```rust
-/// use rust_tools::cw::counter::Counter;
+/// use rust_tools::cw::Counter;
 ///
 /// let mut counter: Counter<char> = Counter::new();
 ///
@@ -71,7 +71,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let counter: Counter<i32> = Counter::new();
     /// assert!(counter.is_empty());
@@ -91,7 +91,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let mut counter = Counter::new();
     /// counter.inc("a");
@@ -110,7 +110,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let mut counter = Counter::new();
     /// counter.inc("a");
@@ -127,7 +127,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let mut counter = Counter::new();
     /// assert!(counter.is_empty());
@@ -143,7 +143,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let mut counter = Counter::new();
     /// counter.inc("a");
@@ -165,7 +165,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let mut counter = Counter::new();
     /// counter.inc("a");
@@ -190,7 +190,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let mut counter = Counter::new();
     /// assert_eq!(counter.add("a", 5), 5);
@@ -225,7 +225,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let mut counter = Counter::new();
     /// assert_eq!(counter.inc("a"), 1);
@@ -248,7 +248,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let mut counter = Counter::new();
     /// counter.add("a", 3);
@@ -293,7 +293,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let mut counter = Counter::new();
     /// counter.add("a", 5);
@@ -315,7 +315,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let mut counter = Counter::new();
     /// counter.inc("a");
@@ -333,7 +333,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let mut counter = Counter::new();
     /// counter.inc("a");
@@ -369,7 +369,7 @@ where
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::counter::Counter;
+    /// use rust_tools::cw::Counter;
     ///
     /// let mut counter = Counter::new();
     /// counter.add("a", 5);

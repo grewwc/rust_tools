@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use crate::common::types::FastSet;
+use rust_tools::commonw::types::FastSet;
 use crate::memo::{MemoBackend, db::MemoDb, history};
 
 const REMOTE_SQLITE_PATH: &str = "~/.go_tools_memo.sqlite3";
@@ -103,7 +103,7 @@ pub fn sync_record_from_host(
 fn resolve_record_ref(remote_db: &MemoDb, record_ref: &str) -> Result<String, String> {
     let mut ref_str = record_ref.trim().to_string();
     if ref_str.is_empty() {
-        ref_str = crate::common::prompt::read_line("Input the ObjectID/title/tag: ")
+        ref_str = rust_tools::commonw::prompt::read_line("Input the ObjectID/title/tag: ")
             .trim()
             .to_string();
     }

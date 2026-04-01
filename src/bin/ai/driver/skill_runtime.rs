@@ -4,12 +4,15 @@ use crate::ai::{
     skills::SkillManifest,
     types::{App, ToolDefinition},
 };
-use crate::common::configw;
+use crate::commonw::configw;
 use std::ptr::NonNull;
+use std::sync::{LazyLock, Mutex};
 
 use super::{DEFAULT_MAX_ITERATIONS, OPENCLAW_MAX_ITERATIONS, match_skill};
 
 type ToolDef = ToolDefinition;
+
+static LAST_SKILL: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 pub(super) struct SkillTurnGuard {
     app: NonNull<App>,
@@ -153,6 +156,11 @@ pub(super) async fn prepare_skill_for_turn(
     question: &str,
 ) -> SkillTurnGuard {
     let cfg = configw::get_all_config();
+    let debug = cfg
+        .get_opt("ai.skills.debug")
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("true");
     let router_enabled = !cfg
         .get_opt("ai.skills.router")
         .unwrap_or_else(|| "true".to_string())
@@ -170,7 +178,47 @@ pub(super) async fn prepare_skill_for_turn(
     let router_skill = router_selected
         .as_deref()
         .and_then(|name| skill_manifests.iter().find(|s| s.name == name));
-    let skill = router_skill.or(heuristic_skill);
+    let penalty_enabled = cfg
+        .get_opt("ai.skills.penalty.enable")
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("true");
+    let mut skill = if penalty_enabled {
+        match (router_skill, heuristic_skill) {
+            (Some(r), Some(h)) => {
+                let pr = super::tools::penalty_for_skill_tools(r);
+                let ph = super::tools::penalty_for_skill_tools(h);
+                if ph + 1e-6 < pr {
+                    Some(h)
+                } else {
+                    Some(r)
+                }
+            }
+            (Some(r), None) => Some(r),
+            (None, Some(h)) => Some(h),
+            (None, None) => None,
+        }
+    } else {
+        router_skill.or(heuristic_skill)
+    };
+    if skill.is_none() {
+        if let Some(last) = LAST_SKILL.lock().ok().and_then(|g| g.clone()) {
+            skill = skill_manifests.iter().find(|s| s.name == last);
+        }
+    }
+    if debug {
+        if let Some(name) = router_selected.as_deref() {
+            eprintln!("[skills] router selected: {}", name);
+        }
+        if let Some(s) = heuristic_skill.as_ref() {
+            eprintln!("[skills] heuristic candidate: {}", s.name);
+        }
+        if let Some(s) = skill.as_ref() {
+            eprintln!("[skills] final: {}", s.name);
+        } else {
+            eprintln!("[skills] final: <none>");
+        }
+    }
     let matched_skill_name = skill.map(|s| s.name.clone());
     let prompt_optimizer_active = skill
         .as_ref()
@@ -184,12 +232,18 @@ pub(super) async fn prepare_skill_for_turn(
     let restore_agent_context =
         activate_skill_context(app, builtin_tools, mcp_tools, openclaw_active);
 
-    SkillTurnGuard {
+    let guard = SkillTurnGuard {
         app: NonNull::from(&mut *app),
         restore_agent_context,
         system_prompt: build_system_prompt(skill),
         matched_skill_name,
+    };
+    if let Some(name) = guard.matched_skill_name.as_ref() {
+        if let Ok(mut g) = LAST_SKILL.lock() {
+            *g = Some(name.clone());
+        }
     }
+    guard
 }
 
 #[cfg(test)]

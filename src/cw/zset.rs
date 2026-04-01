@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::hash::Hash;
 
-use crate::common::types::FastMap;
+use crate::commonw::types::FastMap;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ZSetEntry<K>

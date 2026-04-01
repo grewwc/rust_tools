@@ -6,7 +6,7 @@ use std::sync::RwLockReadGuard;
 
 use rustc_hash::FxHasher;
 
-use crate::common::types::FastMap;
+use crate::commonw::types::FastMap;
 
 pub struct ValueRef<'a, K, V> {
     _guard: RwLockReadGuard<'a, FastMap<K, V>>,

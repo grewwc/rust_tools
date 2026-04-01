@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{files, history::Message, models, skills::SkillManifest, types::App};
-use crate::common::configw;
+use crate::commonw::configw;
 
 #[derive(Debug, Serialize)]
 struct RequestBody<'a> {

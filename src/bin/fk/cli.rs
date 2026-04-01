@@ -1,4 +1,4 @@
-use rust_tools::{common::utils::expanduser, terminalw};
+use rust_tools::{commonw::utils::expanduser, terminalw};
 
 #[derive(Clone)]
 pub struct Options {

@@ -1,5 +1,5 @@
 use clap::Parser;
-use rust_tools::common::configw;
+use rust_tools::commonw::configw;
 
 #[derive(Parser, Debug)]
 #[command(about = "Read ~/.configW (go_tools compatible)")]

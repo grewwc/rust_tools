@@ -2,13 +2,11 @@ use regex::Regex;
 use serde_json::{Value, json};
 use std::sync::LazyLock;
 
-use crate::{
-    ai::{
-        mcp::McpClient,
-        types::{ToolCall, ToolResult},
-    },
-    common::prompt::prompt_yes_or_no_interruptible,
+use crate::ai::{
+    mcp::McpClient,
+    types::{ToolCall, ToolResult},
 };
+use crate::commonw::prompt::prompt_yes_or_no_interruptible;
 
 fn looks_like_feishu_oauth_required(err: &str) -> bool {
     let e = err.to_lowercase();

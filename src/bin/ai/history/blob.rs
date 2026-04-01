@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::common::utils::open_file_for_append;
+use crate::commonw::utils::open_file_for_append;
 
 use super::{
     sqlite,

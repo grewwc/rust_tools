@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use clap::Parser;
-use rust_tools::{clipboard::string_content, jsonw};
+use rust_tools::{clipboardw::string_content, jsonw};
 use serde_json::Value;
 
 #[derive(Parser)]

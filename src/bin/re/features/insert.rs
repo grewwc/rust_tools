@@ -43,13 +43,13 @@ pub fn insert_records(
         }
     } else if from_editor {
         print!("input the title: ");
-        crate::common::editor::flush_stdout();
-        let title = crate::common::editor::input_with_editor("", use_vscode).unwrap_or_default();
+        rust_tools::commonw::editor::flush_stdout();
+        let title = rust_tools::commonw::editor::input_with_editor("", use_vscode).unwrap_or_default();
         println!();
         title_list.push(title);
     } else {
         title_list.push(
-            crate::common::prompt::read_line("input the title: ")
+            rust_tools::commonw::prompt::read_line("input the title: ")
                 .trim()
                 .to_string(),
         );
@@ -60,7 +60,7 @@ pub fn insert_records(
     } else if !tag_flag.trim().is_empty() {
         tag_flag.to_string()
     } else {
-        crate::common::prompt::read_line("input the tags: ")
+        rust_tools::commonw::prompt::read_line("input the tags: ")
     };
     let mut tags = parse_tag_query(&tags_str.replace(',', " "));
     if tags.is_empty() {

@@ -31,7 +31,7 @@
 //! ### 文本剪贴板操作
 //!
 //! ```rust,no_run
-//! use rust_tools::clipboard::{get_clipboard_content, set_clipboard_content};
+//! use rust_tools::clipboardw::{get_clipboard_content, set_clipboard_content};
 //!
 //! // 读取剪贴板文本
 //! let text = get_clipboard_content();
@@ -44,7 +44,7 @@
 //! ### 文件操作
 //!
 //! ```rust,no_run
-//! use rust_tools::clipboard::{save_to_file, copy_from_file};
+//! use rust_tools::clipboardw::{save_to_file, copy_from_file};
 //!
 //! // 保存剪贴板内容到文件
 //! save_to_file("output.txt").expect("保存失败");

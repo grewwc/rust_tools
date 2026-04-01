@@ -1,6 +1,6 @@
 use super::exclude;
 use rust_tools::{
-    common::{configw, utils::expanduser},
+    commonw::{configw, utils::expanduser},
     terminalw,
 };
 use std::{fs, path::PathBuf};

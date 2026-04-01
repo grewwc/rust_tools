@@ -2,7 +2,7 @@
 //!
 //! 提供系统命令的执行功能，包括超时控制和工作目录设置。
 
-use crate::{common::utils::expanduser, strw::split::split_space_keep_symbol};
+use crate::{commonw::utils::expanduser, strw::split::split_space_keep_symbol};
 
 use std::{
     ffi::OsString,

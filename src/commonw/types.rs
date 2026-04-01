@@ -22,7 +22,7 @@ use rustc_hash::FxHasher;
 /// # 示例
 ///
 /// ```rust
-/// use rust_tools::common::types::FastMap;
+/// use rust_tools::commonw::FastMap;
 ///
 /// let mut map: FastMap<&str, i32> = FastMap::default();
 /// map.insert("a", 1);
@@ -63,7 +63,7 @@ pub type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
 /// # 示例
 ///
 /// ```rust
-/// use rust_tools::common::types::FastSet;
+/// use rust_tools::commonw::FastSet;
 ///
 /// let mut set: FastSet<i32> = FastSet::default();
 /// set.insert(1);

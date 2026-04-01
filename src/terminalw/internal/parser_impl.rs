@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::common::types::FastSet;
+use crate::commonw::types::FastSet;
 use crate::cw::trie::Trie;
 use crate::strw::{indices, split};
 

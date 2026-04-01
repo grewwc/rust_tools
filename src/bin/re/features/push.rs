@@ -10,7 +10,7 @@ pub fn push_single(db: &MemoBackend, push_ref: &str, cli_host: &str) {
 
     let mut reference = push_ref.trim().to_string();
     if reference.is_empty() {
-        reference = crate::common::prompt::read_line("Input the ObjectID/title/tag: ")
+        reference = rust_tools::commonw::prompt::read_line("Input the ObjectID/title/tag: ")
             .trim()
             .to_string();
     }

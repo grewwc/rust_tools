@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use rust_tools::cw::SkipMap;
 
-use crate::common::{configw, utils::expanduser};
+use crate::commonw::{configw, utils::expanduser};
 
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
     (

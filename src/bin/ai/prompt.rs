@@ -8,9 +8,9 @@ use rustyline::{DefaultEditor, error::ReadlineError};
 use uuid::Uuid;
 
 use super::history::SessionStore;
-use crate::clipboard::image_content;
-use crate::clipboard::string_content;
-use crate::common::utils::expanduser;
+use crate::clipboardw::image_content;
+use crate::clipboardw::string_content;
+use crate::commonw::utils::expanduser;
 
 const LINE_REPL_HISTORY_FILE: &str = "~/.liner_history";
 const MAX_INPUT_CHARS: usize = 4000;
@@ -339,7 +339,7 @@ impl PromptEditor {
                                     _ => {
                                         // 保存失败或没有图片，尝试粘贴文本
                                         let clipboard_text =
-                                            crate::clipboard::string_content::get_clipboard_content(
+                                            crate::clipboardw::string_content::get_clipboard_content(
                                             );
                                         if !clipboard_text.is_empty() {
                                             insert_text(&mut textarea, &clipboard_text);

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use std::{fs, os::unix::fs::PermissionsExt};
 
 use reqwest::blocking::Client;
-use rust_tools::common::configw;
+use rust_tools::commonw::configw;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -704,11 +704,11 @@ fn feishu_docs_export_text(args: &Value) -> Result<String, JsonRpcErr> {
         .trim()
         .to_string();
     let out_dir = if out_dir.is_empty() {
-        rust_tools::common::utils::expanduser("~/.config/rust_tools/feishu_docs_text")
+        rust_tools::commonw::utils::expanduser("~/.config/rust_tools/feishu_docs_text")
             .as_ref()
             .to_string()
     } else {
-        rust_tools::common::utils::expanduser(&out_dir)
+        rust_tools::commonw::utils::expanduser(&out_dir)
             .as_ref()
             .to_string()
     };
@@ -3009,11 +3009,11 @@ fn token_store_path() -> PathBuf {
     if let Some(v) = cfg.get_opt("feishu.token_store") {
         let v = v.trim().to_string();
         if !v.is_empty() {
-            return PathBuf::from(rust_tools::common::utils::expanduser(&v).as_ref());
+            return PathBuf::from(rust_tools::commonw::utils::expanduser(&v).as_ref());
         }
     }
     PathBuf::from(
-        rust_tools::common::utils::expanduser("~/.config/rust_tools/feishu_token.json").as_ref(),
+        rust_tools::commonw::utils::expanduser("~/.config/rust_tools/feishu_token.json").as_ref(),
     )
 }
 

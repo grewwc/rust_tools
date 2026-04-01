@@ -5,9 +5,9 @@ use regex::Regex;
 
 use rust_tools::terminalw;
 
-use crate::common::configw;
-use crate::common::prompt;
-use crate::common::types::{FastMap, FastSet};
+use rust_tools::commonw::configw;
+use rust_tools::commonw::prompt;
+use rust_tools::commonw::types::{FastMap, FastSet};
 use crate::memo::{MemoBackend, MemoBackendMode, MemoMongo, MemoRecord, MemoTag, history};
 
 pub static NUMBERED_ITEM_RE: LazyLock<Regex> =

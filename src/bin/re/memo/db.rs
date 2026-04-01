@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::{
-    common::configw,
-    common::utils::expanduser,
+    commonw::configw,
+    commonw::utils::expanduser,
     memo::model::{MemoRecord, MemoTag},
 };
 

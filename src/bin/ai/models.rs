@@ -67,7 +67,7 @@ pub(super) fn initial_model(cli: &ParsedCli) -> String {
     {
         return determine_model(model);
     }
-    let cfg = crate::common::configw::get_all_config();
+    let cfg = crate::commonw::configw::get_all_config();
     cfg.get_opt("ai.model.default")
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(default_model)

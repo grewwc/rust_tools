@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::common::types::{FastMap, FastSet};
+use rust_tools::commonw::types::{FastMap, FastSet};
 use crate::memo::model::MemoRecord;
 
 const SEARCH_MIN_INFORMATIVE_COVERAGE: f64 = 0.2;

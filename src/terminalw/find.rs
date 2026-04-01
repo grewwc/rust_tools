@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use crate::common::types::FastSet;
+use crate::commonw::types::FastSet;
 
 pub struct SyncSet {
     inner: Mutex<FastSet<String>>,

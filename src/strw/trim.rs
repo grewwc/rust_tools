@@ -4,7 +4,7 @@
 
 use std::borrow::Cow;
 
-use crate::common::types::FastSet;
+use crate::commonw::types::FastSet;
 
 /// 从字符串中移除所有属于指定字符集的字符
 ///
@@ -25,7 +25,7 @@ use crate::common::types::FastSet;
 /// # 示例
 ///
 /// ```rust
-/// use rust_tools::strw::trim::trim_cutset;
+/// use rust_tools::strw::trim_cutset;
 ///
 /// // 移除所有 'x' 字符
 /// let result = trim_cutset("xxxhello worldxxx", "x");

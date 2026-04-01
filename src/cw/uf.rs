@@ -1,6 +1,6 @@
 use std::hash::Hash;
 
-use crate::common::types::FastMap;
+use crate::commonw::types::FastMap;
 
 pub struct UF<'a, T>
 where

@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
-use crate::common::utils::expanduser;
+use crate::commonw::utils::expanduser;
 
 fn params_list_directory() -> Value {
     serde_json::json!({

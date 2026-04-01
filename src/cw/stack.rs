@@ -14,7 +14,7 @@
 /// # 示例
 ///
 /// ```rust
-/// use rust_tools::cw::stack::Stack;
+/// use rust_tools::cw::Stack;
 ///
 /// let mut stack: Stack<i32> = Stack::new();
 ///
@@ -51,7 +51,7 @@ impl<T> Stack<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::stack::Stack;
+    /// use rust_tools::cw::Stack;
     ///
     /// let stack: Stack<i32> = Stack::new();
     /// assert!(stack.is_empty());
@@ -75,7 +75,7 @@ impl<T> Stack<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::stack::Stack;
+    /// use rust_tools::cw::Stack;
     ///
     /// let mut stack = Stack::new();
     /// stack.push(1);
@@ -93,7 +93,7 @@ impl<T> Stack<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::stack::Stack;
+    /// use rust_tools::cw::Stack;
     ///
     /// let mut stack = Stack::new();
     /// stack.push(1);
@@ -109,7 +109,7 @@ impl<T> Stack<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::stack::Stack;
+    /// use rust_tools::cw::Stack;
     ///
     /// let mut stack = Stack::new();
     /// stack.push(1);
@@ -126,7 +126,7 @@ impl<T> Stack<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::stack::Stack;
+    /// use rust_tools::cw::Stack;
     ///
     /// let mut stack = Stack::new();
     /// stack.push(1);
@@ -142,7 +142,7 @@ impl<T> Stack<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::stack::Stack;
+    /// use rust_tools::cw::Stack;
     ///
     /// let mut stack = Stack::new();
     /// stack.push(1);
@@ -157,7 +157,7 @@ impl<T> Stack<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::stack::Stack;
+    /// use rust_tools::cw::Stack;
     ///
     /// let mut stack = Stack::new();
     /// assert!(stack.is_empty());
@@ -175,7 +175,7 @@ impl<T> Stack<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::stack::Stack;
+    /// use rust_tools::cw::Stack;
     ///
     /// let mut stack = Stack::new();
     /// stack.push(1);
@@ -193,7 +193,7 @@ impl<T> Stack<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::stack::Stack;
+    /// use rust_tools::cw::Stack;
     ///
     /// let mut stack = Stack::new();
     /// stack.push(1);
@@ -212,7 +212,7 @@ impl<T> Stack<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::stack::Stack;
+    /// use rust_tools::cw::Stack;
     ///
     /// let mut stack = Stack::new();
     /// stack.extend([1, 2, 3]);
@@ -232,7 +232,7 @@ impl<T> Stack<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::stack::Stack;
+    /// use rust_tools::cw::Stack;
     ///
     /// let mut stack = Stack::new();
     /// stack.push(1);
@@ -253,7 +253,7 @@ impl<T> From<Vec<T>> for Stack<T> {
     /// # 示例
     ///
     /// ```rust
-    /// use rust_tools::cw::stack::Stack;
+    /// use rust_tools::cw::Stack;
     ///
     /// let vec = vec![1, 2, 3];
     /// let stack: Stack<i32> = Stack::from(vec);

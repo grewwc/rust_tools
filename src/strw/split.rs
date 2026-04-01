@@ -1,6 +1,6 @@
 use std::io::Read;
 
-use crate::common::types::FastSet;
+use crate::commonw::types::FastSet;
 
 const COMMON_WHITESPACES: &str = " \t\n\r\x0B\x0C";
 

@@ -1,4 +1,5 @@
-use chrono::Local;
+use chrono::{DateTime, Local, Utc};
+use std::io::{BufRead, Write};
 use serde_json::Value;
 
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
@@ -79,9 +80,108 @@ pub(crate) fn execute_memory_search(args: &Value) -> Result<String, String> {
         return Err("query is empty".to_string());
     }
     let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 50) as usize;
+    let category_filter = args["category"].as_str().map(|s| s.trim().to_lowercase());
+    let tags_any = parse_string_array(&args["tags_any"])
+        .into_iter()
+        .map(|s| s.to_lowercase())
+        .collect::<Vec<_>>();
+    let tags_all = parse_string_array(&args["tags_all"])
+        .into_iter()
+        .map(|s| s.to_lowercase())
+        .collect::<Vec<_>>();
+    let source_sub = args["source_substring"]
+        .as_str()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
+    let debug_score = args["debug_score"].as_bool().unwrap_or(false);
     let store = MemoryStore::from_env_or_config();
-    let entries = store.search(query, limit)?;
-    Ok(render_memory_entries(&entries))
+    let entries = store.search(query, 10_000)?;
+
+    let mut scored = Vec::with_capacity(entries.len());
+    for e in entries {
+        if let Some(cat) = category_filter.as_ref() {
+            if e.category.to_lowercase() != *cat {
+                continue;
+            }
+        }
+        if !tags_any.is_empty()
+            && !e
+                .tags
+                .iter()
+                .any(|t| tags_any.iter().any(|x| t.to_lowercase() == *x))
+        {
+            continue;
+        }
+        if !tags_all.is_empty()
+            && !tags_all
+                .iter()
+                .all(|x| e.tags.iter().any(|t| t.to_lowercase() == *x))
+        {
+            continue;
+        }
+        if let Some(sub) = source_sub.as_ref() {
+            if !e
+                .source
+                .as_ref()
+                .map(|s| s.to_lowercase().contains(sub))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+        }
+        let mut score = 0.0_f64;
+        let qlc = query.to_lowercase();
+        if e.note.to_lowercase().contains(&qlc) {
+            score += 3.0;
+            score += (qlc.len() as f64).min(20.0) * 0.05;
+        }
+        if e.category.to_lowercase().contains(&qlc) {
+            score += 1.5;
+        }
+        if e.tags.iter().any(|t| t.to_lowercase().contains(&qlc)) {
+            score += 1.2;
+        }
+        if e.source
+            .as_ref()
+            .map(|s| s.to_lowercase().contains(&qlc))
+            .unwrap_or(false)
+        {
+            score += 0.8;
+        }
+        let recency_bonus = parse_rfc3339_ts(&e.timestamp)
+            .map(|ts| {
+                let age_secs = (Utc::now() - ts).num_seconds().max(0) as f64;
+                if age_secs <= 7.0 * 86400.0 {
+                    1.0
+                } else if age_secs <= 30.0 * 86400.0 {
+                    0.3
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+        score += recency_bonus;
+        scored.push((score, e));
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    let mut top_scored = scored;
+    top_scored.truncate(limit);
+    let top: Vec<AgentMemoryEntry> = top_scored.iter().map(|(_, e)| e.clone()).collect();
+    let mut out = render_memory_entries(&top);
+    if debug_score {
+        out.push_str("\n");
+        out.push_str("--- scores ---\n");
+        for (idx, (s, e)) in top_scored.iter().enumerate() {
+            out.push_str(&format!(
+                "{}. score={:.2} [{}] {}\n",
+                idx + 1,
+                s,
+                e.category,
+                e.note
+            ));
+        }
+    }
+    Ok(out)
 }
 
 pub(crate) fn execute_memory_recent(args: &Value) -> Result<String, String> {
@@ -89,4 +189,158 @@ pub(crate) fn execute_memory_recent(args: &Value) -> Result<String, String> {
     let store = MemoryStore::from_env_or_config();
     let entries = store.recent(limit)?;
     Ok(render_memory_entries(&entries))
+}
+
+pub(crate) fn execute_memory_list_json(args: &Value) -> Result<String, String> {
+    let limit = args["limit"].as_u64().unwrap_or(50).clamp(1, 200) as usize;
+    let offset = args["offset"].as_u64().unwrap_or(0) as usize;
+    let store = MemoryStore::from_env_or_config();
+    let entries = store.recent(limit + offset)?;
+    let sliced = if offset >= entries.len() {
+        Vec::new()
+    } else {
+        entries.into_iter().skip(offset).collect::<Vec<_>>()
+    };
+    serde_json::to_string(&sliced).map_err(|e| format!("{}", e))
+}
+
+pub(crate) fn execute_memory_rotate(args: &Value) -> Result<String, String> {
+    let max_bytes = args["max_bytes"].as_u64().ok_or("Missing max_bytes")? as u64;
+    let store = MemoryStore::from_env_or_config();
+    let path = store.path().to_path_buf();
+    super::super::storage::with_memory_file_lock(&path, || {
+        let meta = std::fs::metadata(&path).ok();
+        if let Some(meta) = meta {
+            if meta.len() > max_bytes {
+                let ts = Local::now().format("%Y%m%d%H%M%S").to_string();
+                let mut new_name = path.clone();
+                new_name.set_extension(format!("jsonl.{}", ts));
+                std::fs::rename(&path, &new_name)
+                    .map_err(|e| format!("Failed to rotate file: {}", e))?;
+                std::fs::File::create(&path)
+                    .map_err(|e| format!("Failed to create new memory file: {}", e))?;
+                return Ok(format!(
+                    "Rotated: {} -> {}",
+                    path.display(),
+                    new_name.display()
+                ));
+            }
+        }
+        Ok("Rotate skipped: size within limit".to_string())
+    })
+}
+
+pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
+    let max_days = args["max_days"].as_u64().ok_or("Missing max_days")? as i64;
+    let min_keep = args["min_keep"].as_u64().unwrap_or(200) as usize;
+    let store = MemoryStore::from_env_or_config();
+    let path = store.path().to_path_buf();
+    super::super::storage::with_memory_file_lock(&path, || {
+        if !path.exists() {
+            return Ok("No memory file".to_string());
+        }
+        let file = std::fs::File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
+        let reader = std::io::BufReader::new(file);
+        let mut entries = Vec::new();
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("Failed to read memory file: {}", e))?;
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(e) = serde_json::from_str::<AgentMemoryEntry>(&line) {
+                entries.push(e);
+            }
+        }
+        if entries.is_empty() {
+            return Ok("No entries".to_string());
+        }
+        let now = Utc::now();
+        let cutoff_secs = max_days * 86400;
+        entries.retain(|e| {
+            parse_rfc3339_ts(&e.timestamp)
+                .map(|ts| (now - ts).num_seconds() <= cutoff_secs)
+                .unwrap_or(true)
+        });
+        if entries.len() < min_keep {
+            entries = store.recent(min_keep)?;
+        }
+        let tmp = path.with_extension("jsonl.tmp");
+        {
+            let mut f =
+                std::fs::File::create(&tmp).map_err(|e| format!("Failed to create tmp: {}", e))?;
+            for e in &entries {
+                let line = serde_json::to_string(e).map_err(|e| format!("{}", e))?;
+                f.write_all(line.as_bytes())
+                    .and_then(|_| f.write_all(b"\n"))
+                    .map_err(|e| format!("Failed to write tmp: {}", e))?;
+            }
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to replace memory file: {}", e))?;
+        Ok(format!("GC done: {} entries kept", entries.len()))
+    })
+}
+
+fn parse_rfc3339_ts(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
+    use std::collections::HashSet;
+    let store = MemoryStore::from_env_or_config();
+    let path = store.path().to_path_buf();
+    super::super::storage::with_memory_file_lock(&path, || {
+        if !path.exists() {
+            return Ok("No memory file".to_string());
+        }
+        let file = std::fs::File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
+        let reader = std::io::BufReader::new(file);
+        let mut entries = Vec::new();
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("Failed to read memory file: {}", e))?;
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(e) = serde_json::from_str::<AgentMemoryEntry>(&line) {
+                entries.push(e);
+            }
+        }
+        if entries.is_empty() {
+            return Ok("No entries".to_string());
+        }
+        let mut seen: HashSet<(String, String, Vec<String>, Option<String>)> = HashSet::new();
+        let mut deduped: Vec<AgentMemoryEntry> = Vec::with_capacity(entries.len());
+        for e in entries.into_iter().rev() {
+            let key = (
+                e.note.clone(),
+                e.category.clone(),
+                {
+                    let mut t = e.tags.clone();
+                    t.sort();
+                    t
+                },
+                e.source.clone(),
+            );
+            if seen.insert(key) {
+                deduped.push(e);
+            }
+        }
+        deduped.reverse();
+        let tmp = path.with_extension("jsonl.tmp");
+        {
+            let mut f =
+                std::fs::File::create(&tmp).map_err(|e| format!("Failed to create tmp: {}", e))?;
+            for e in &deduped {
+                let line = serde_json::to_string(e).map_err(|e| format!("{}", e))?;
+                f.write_all(line.as_bytes())
+                    .and_then(|_| f.write_all(b"\n"))
+                    .map_err(|e| format!("Failed to write tmp: {}", e))?;
+            }
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to replace memory file: {}", e))?;
+        Ok("Dedup done".to_string())
+    })
 }

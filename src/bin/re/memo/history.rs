@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::common::utils::expanduser;
+use rust_tools::commonw::utils::expanduser;
 
 const PREV_FILE: &str = "~/.go_tools_previous_op.txt";
 

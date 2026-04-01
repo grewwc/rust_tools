@@ -1,18 +1,21 @@
 use colored::Colorize;
 use serde_json::{Value, json};
 use std::error::Error;
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
-use crate::{
-    ai::{
-        mcp::McpClient,
-        tools as builtin_tools,
-        types::{ToolCall, ToolResult},
-    },
-    common::prompt::prompt_yes_or_no_interruptible,
+use crate::ai::{
+    mcp::McpClient,
+    tools as builtin_tools,
+    types::{ToolCall, ToolResult},
 };
+use crate::commonw::prompt::prompt_yes_or_no_interruptible;
 
 mod barrier;
 mod oauth;
+
+static TOOL_FAILURES: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone)]
 enum ToolRoute {
@@ -207,6 +210,15 @@ fn run_one(mcp_client: &McpClient, tool_call: &ToolCall) -> (ToolRoute, RunOneRe
             executed: true,
         },
     };
+    if run_result.executed {
+        if !run_result.ok {
+            if let Ok(mut map) = TOOL_FAILURES.lock() {
+                let name = tool_call.function.name.clone();
+                let counter = map.entry(name).or_insert(0);
+                *counter = counter.saturating_add(1).min(100);
+            }
+        }
+    }
 
     (prepared.route, run_result)
 }
@@ -258,4 +270,21 @@ fn execute_tool_calls_inner(
         executed_tool_calls,
         tool_results,
     })
+}
+
+pub(super) fn penalty_for_skill_tools(skill: &crate::ai::skills::SkillManifest) -> f64 {
+    if skill.tools.is_empty() {
+        return 0.0;
+    }
+    let tools = &skill.tools;
+    let Ok(map) = TOOL_FAILURES.lock() else {
+        return 0.0;
+    };
+    let mut score = 0.0f64;
+    for t in tools {
+        if let Some(c) = map.get(t) {
+            score += (*c as f64).min(10.0);
+        }
+    }
+    score
 }

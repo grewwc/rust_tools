@@ -1,6 +1,6 @@
 use std::io::{self, BufRead, Read};
 
-use rust_tools::{clipboard, strw::find::find_first_non_blank};
+use rust_tools::{clipboardw, strw::find::find_first_non_blank};
 
 use clap::{CommandFactory, Parser};
 
@@ -32,7 +32,7 @@ fn is_ssh() -> bool {
 }
 
 fn try_paste_image_via_osc52(fname: &str) -> Result<(), String> {
-    clipboard::image_content::save_to_file(fname).map_err(|e| e.to_string())
+    clipboardw::image_content::save_to_file(fname).map_err(|e| e.to_string())
 }
 
 fn handle_paste_to_file(fname: &str) -> Result<(), String> {
@@ -50,10 +50,10 @@ fn handle_paste_to_file(fname: &str) -> Result<(), String> {
         }
     }
 
-    if clipboard::binary_content::save_to_file(fname).is_ok() {
+    if clipboardw::binary_content::save_to_file(fname).is_ok() {
         return Ok(());
     }
-    if clipboard::string_content::save_to_file(fname).is_ok() {
+    if clipboardw::string_content::save_to_file(fname).is_ok() {
         return Ok(());
     }
 
@@ -85,14 +85,14 @@ fn handle_paste_to_file(fname: &str) -> Result<(), String> {
 }
 
 fn handle_copy_from_file(fname: &str) -> bool {
-    if clipboard::string_content::copy_from_file(fname).is_ok() {
+    if clipboardw::string_content::copy_from_file(fname).is_ok() {
         return true;
     }
 
-    if clipboard::image_content::copy_from_file(fname).is_ok() {
+    if clipboardw::image_content::copy_from_file(fname).is_ok() {
         return true;
     }
-    if clipboard::binary_content::copy_from_file(fname).is_ok() {
+    if clipboardw::binary_content::copy_from_file(fname).is_ok() {
         return true;
     }
     false
@@ -104,7 +104,7 @@ fn main() {
     let cli = Cli::parse();
 
     if cli.bridge {
-        match clipboard::image_content::bridge_image_to_text_clipboard() {
+        match clipboardw::image_content::bridge_image_to_text_clipboard() {
             Ok(()) => {}
             Err(e) => eprintln!("oo -B failed: {e}"),
         }

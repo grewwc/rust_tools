@@ -26,7 +26,7 @@
 //! ### 使用高性能集合
 //!
 //! ```rust
-//! use rust_tools::common::types::{FastMap, FastSet};
+//! use rust_tools::commonw::{FastMap, FastSet};
 //!
 //! // 快速 HashMap
 //! let mut map: FastMap<&str, i32> = FastMap::default();
@@ -46,3 +46,6 @@ pub mod filename;
 pub mod prompt;
 pub mod types;
 pub mod utils;
+
+// 重新导出常用类型
+pub use types::{FastMap, FastSet};

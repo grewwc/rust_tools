@@ -19,7 +19,7 @@
 //! ### 字符串修剪
 //!
 //! ```rust
-//! use rust_tools::strw::trim::trim_cutset;
+//! use rust_tools::strw::trim_cutset;
 //!
 //! let text = "xxxhello worldxxx";
 //! let trimmed = trim_cutset(text, "x");
@@ -29,7 +29,7 @@
 //! ### 字符串分割
 //!
 //! ```rust
-//! use rust_tools::strw::split::split_no_empty;
+//! use rust_tools::strw::split_no_empty;
 //!
 //! let parts: Vec<&str> = split_no_empty("a,,b,,,c", ",");
 //! assert_eq!(parts, vec!["a", "b", "c"]);
@@ -38,7 +38,7 @@
 //! ### 文本格式化
 //!
 //! ```rust
-//! use rust_tools::strw::format::wrap;
+//! use rust_tools::strw::wrap;
 //!
 //! let text = "hello world this is a long line";
 //! let wrapped = wrap(text, 20, 0, "-");
@@ -48,7 +48,7 @@
 //! ### 字符串检查
 //!
 //! ```rust
-//! use rust_tools::strw::check::is_blank;
+//! use rust_tools::strw::is_blank;
 //!
 //! assert!(is_blank("   "));
 //! assert!(is_blank(""));

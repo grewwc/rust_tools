@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rust_tools::common::types::FastMap;
+use rust_tools::commonw::types::FastMap;
 
 const POLL_INTERVAL_MS: u64 = 500;
 const MIN_ACTIVE_KIB_PER_SEC: f64 = 0.01;
