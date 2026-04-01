@@ -1,6 +1,6 @@
 use std::{
-    fs::{self},
     fs::File,
+    fs::{self},
     io,
     path::Path,
     path::PathBuf,
@@ -11,8 +11,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use rust_tools::cw::SkipMap;
 use crate::common::utils::open_file_for_append;
+use rust_tools::cw::SkipMap;
 
 use super::types::ToolCall;
 
@@ -547,16 +547,14 @@ impl SessionStore {
         // 使用 SkipMap 按修改时间倒序维护 session 列表
         // key: (timestamp, id) - timestamp 用 u64 表示，0 表示未知时间
         // 排序规则：时间倒序，时间相同时按 id 升序
-        let mut sessions: Box<SkipMap<(u64, String), SessionInfo>> = SkipMap::new(
-            16,
-            |a: &(u64, String), b: &(u64, String)| {
+        let mut sessions: Box<SkipMap<(u64, String), SessionInfo>> =
+            SkipMap::new(16, |a: &(u64, String), b: &(u64, String)| {
                 match b.0.cmp(&a.0) {
                     std::cmp::Ordering::Equal => a.1.cmp(&b.1) as i32,
                     std::cmp::Ordering::Less => -1,
                     std::cmp::Ordering::Greater => 1,
                 }
-            },
-        );
+            });
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
@@ -825,7 +823,11 @@ pub(super) fn messages_to_markdown(messages: &[Message], session_id: &str) -> St
             _ => "📝",
         };
 
-        md.push_str(&format!("### {} {}\n\n", role_emoji, msg.role.to_uppercase()));
+        md.push_str(&format!(
+            "### {} {}\n\n",
+            role_emoji,
+            msg.role.to_uppercase()
+        ));
 
         let content_str = value_to_string(&msg.content);
         if !content_str.is_empty() {

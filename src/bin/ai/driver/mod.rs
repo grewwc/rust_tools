@@ -127,9 +127,8 @@ fn mcp_tools_for_skill(
         .collect()
 }
 
-
 #[allow(clippy::type_complexity)]
-fn prepare_skill_for_turn(
+async fn prepare_skill_for_turn(
     app: &mut App,
     mcp_client: &McpClient,
     skill_manifests: &[SkillManifest],
@@ -148,12 +147,7 @@ fn prepare_skill_for_turn(
 
     let router_selected = if router_enabled {
         let model = app.current_model.clone();
-        request::select_skill_via_model(app, &model, question, skill_manifests).and_then(|name| {
-            skill_manifests
-                .iter()
-                .any(|s| s.name == name)
-                .then_some(name)
-        })
+        request::select_skill_via_model(app, &model, question, skill_manifests).await
     } else {
         None
     };
@@ -178,15 +172,18 @@ fn prepare_skill_for_turn(
 
     let mut restore_agent_context = None;
     if let Some(ctx) = app.agent_context.as_mut() {
-        restore_agent_context = Some((ctx.tools.clone(), ctx.max_iterations));
-        let mut all_tools = builtin_tools.clone();
-        all_tools.extend(mcp_tools.clone());
-        ctx.tools = all_tools;
-        ctx.max_iterations = if openclaw_active {
-            OPENCLAW_MAX_ITERATIONS
-        } else {
-            DEFAULT_MAX_ITERATIONS
-        };
+        let mut all_tools = builtin_tools;
+        all_tools.extend(mcp_tools);
+        let prev_tools = std::mem::replace(&mut ctx.tools, all_tools);
+        let prev_max_iterations = std::mem::replace(
+            &mut ctx.max_iterations,
+            if openclaw_active {
+                OPENCLAW_MAX_ITERATIONS
+            } else {
+                DEFAULT_MAX_ITERATIONS
+            },
+        );
+        restore_agent_context = Some((prev_tools, prev_max_iterations));
     }
 
     let mut system_prompt = if let Some(skill) = skill {
@@ -225,8 +222,7 @@ mod tests {
     }
 }
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // 处理 --help 或 -h
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = cli::parse_cli_args(std::env::args());
     let config = config::load_config()?;
     let session_store = SessionStore::new(config.history_file.as_path());
@@ -240,7 +236,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         session_arg.trim().to_string()
     };
 
-    // 处理 help 标志
     if cli.help {
         cli::print_help();
         return Ok(());
@@ -271,7 +266,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let writer = config::open_output_writer(cli.out.as_deref())?;
     let current_model = models::initial_model(&cli);
-    let client = reqwest::blocking::Client::builder().build()?;
+    let client = reqwest::Client::builder().build()?;
     let prompt_editor = if cli.args.is_empty() {
         Some(PromptEditor::new(
             &session_id,
@@ -336,10 +331,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    run_loop(&mut app, &mut mcp_client, &skill_manifests)
+    run_loop(&mut app, &mut mcp_client, &skill_manifests).await
 }
 
-fn run_loop(
+async fn run_loop(
     app: &mut App,
     mcp_client: &mut McpClient,
     skill_manifests: &[SkillManifest],
@@ -354,7 +349,7 @@ fn run_loop(
         }
     };
     loop {
-        if app.shutdown.load(Ordering::Acquire) {
+        if app.shutdown.load(Ordering::Relaxed) {
             cleanup_one_shot(app);
             return Ok(());
         }
@@ -396,20 +391,13 @@ fn run_loop(
         let next_model = resolve_model_for_input(app, &mut question);
         app.current_model = next_model.clone();
 
-        app.cancel_stream.store(false, Ordering::SeqCst);
+        app.cancel_stream.store(false, Ordering::Relaxed);
         let (system_prompt, mut restore_agent_context, matched_skill_name) =
-            prepare_skill_for_turn(app, mcp_client, skill_manifests, &question);
+            prepare_skill_for_turn(app, mcp_client, skill_manifests, &question).await;
         if let Some(name) = matched_skill_name.as_deref() {
             println!("[skill: {}]", name.cyan());
         }
 
-        let mut messages = Vec::new();
-        messages.push(Message {
-            role: "system".to_string(),
-            content: Value::String(system_prompt),
-            tool_calls: None,
-            tool_call_id: None,
-        });
         let history = build_message_arr(ctx.history_count, &app.session_history_file)?;
         let history = if app.config.history_max_chars == 0 {
             history
@@ -421,6 +409,13 @@ fn run_loop(
                 app.config.history_summary_max_chars,
             )
         };
+        let mut messages = Vec::with_capacity(history.len() + 2);
+        messages.push(Message {
+            role: "system".to_string(),
+            content: Value::String(system_prompt),
+            tool_calls: None,
+            tool_call_id: None,
+        });
         messages.extend(history);
         let user_message = Message {
             role: "user".to_string(),
@@ -429,7 +424,8 @@ fn run_loop(
             tool_call_id: None,
         };
         messages.push(user_message.clone());
-        let mut turn_messages = vec![user_message];
+        let mut turn_messages = Vec::with_capacity(8);
+        turn_messages.push(user_message);
 
         let max_iterations = app
             .agent_context
@@ -445,7 +441,7 @@ fn run_loop(
         loop {
             iteration += 1;
             let mut current_history = String::new();
-            app.streaming.store(true, Ordering::Release);
+            app.streaming.store(true, Ordering::Relaxed);
             if force_final_response {
                 messages.push(Message {
                     role: "system".to_string(),
@@ -466,7 +462,7 @@ fn run_loop(
             };
 
             let request_result =
-                request::do_request_messages(app, &next_model, messages.clone(), true);
+                request::do_request_messages(app, &next_model, &messages, true).await;
 
             if let Some(saved_tools) = saved_tools
                 && let Some(ctx) = app.agent_context.as_mut()
@@ -477,7 +473,7 @@ fn run_loop(
             let mut response = match request_result {
                 Ok(response) => response,
                 Err(err) => {
-                    app.streaming.store(false, Ordering::Release);
+                    app.streaming.store(false, Ordering::Relaxed);
                     if request::is_transient_error(&err) {
                         eprintln!("[Warning] {}", err);
                         if should_quit {
@@ -490,8 +486,8 @@ fn run_loop(
                     return Err(err.into());
                 }
             };
-            if app.cancel_stream.swap(false, Ordering::AcqRel) {
-                app.streaming.store(false, Ordering::Release);
+            if app.cancel_stream.swap(false, Ordering::Relaxed) {
+                app.streaming.store(false, Ordering::Relaxed);
                 println!("\nInterrupted.");
                 if should_quit {
                     cleanup_one_shot(app);
@@ -502,19 +498,13 @@ fn run_loop(
             request::print_info(&next_model);
             print_assistant_banner();
             let stream_result =
-                match stream::stream_response(app, &mut response, &mut current_history) {
+                match stream::stream_response(app, &mut response, &mut current_history).await {
                     Ok(result) => result,
                     Err(err) => {
-                        app.streaming.store(false, Ordering::Release);
-
-                        // Log the error and handle gracefully instead of crashing
+                        app.streaming.store(false, Ordering::Relaxed);
                         eprintln!("\n[Error] 流式响应处理失败：{}", err);
                         eprintln!("[Info] 尝试继续对话...");
-
-                        // Try to drain any remaining response data
-                        let _ = drain_response(&mut response);
-
-                        // Create an empty StreamResult to allow continuation
+                        let _ = drain_response(&mut response).await;
                         StreamResult {
                             outcome: StreamOutcome::Completed,
                             tool_calls: Vec::new(),
@@ -523,8 +513,6 @@ fn run_loop(
                     }
                 };
 
-            // Clear any stray input (e.g., Enter keys pressed during streaming)
-            // to prevent them from interrupting the next prompt.
             input::clear_stdin_buffer();
 
             if stream_result.outcome == StreamOutcome::Cancelled {
@@ -535,12 +523,12 @@ fn run_loop(
                 }
                 break;
             }
-            if app.shutdown.load(Ordering::Acquire) {
+            if app.shutdown.load(Ordering::Relaxed) {
                 println!();
                 cleanup_one_shot(app);
                 return Ok(());
             }
-            drain_response(&mut response)?;
+            drain_response(&mut response).await?;
 
             if stream_result.outcome != StreamOutcome::ToolCall {
                 let assistant_msg = Message {
@@ -605,8 +593,6 @@ fn run_loop(
                 turn_messages.push(tool_message);
             }
 
-            // Ignore stray Enter presses while tool results are being printed so they
-            // do not affect the next model step or the following user prompt.
             input::clear_stdin_buffer();
 
             if iteration >= max_iterations {
@@ -637,7 +623,6 @@ fn run_loop(
             }
             println!();
         } else {
-            // Model returned no text (thinking-only response or stream was interrupted).
             println!("{}", "(no response)".dimmed());
         }
 
@@ -924,7 +909,7 @@ fn try_handle_session_command(
             };
             let output_path = parts.next().unwrap_or("session_export.md");
             let output_path = std::path::Path::new(output_path);
-            
+
             match store.export_session_to_markdown(id, output_path) {
                 Ok(()) => {
                     println!("Exported session '{}' to '{}'", id, output_path.display());
@@ -937,10 +922,14 @@ fn try_handle_session_command(
         "export-current" | "export-cur" => {
             let output_path = parts.next().unwrap_or("session_export.md");
             let output_path = std::path::Path::new(output_path);
-            
+
             match store.export_session_to_markdown(&app.session_id, output_path) {
                 Ok(()) => {
-                    println!("Exported current session '{}' to '{}'", app.session_id, output_path.display());
+                    println!(
+                        "Exported current session '{}' to '{}'",
+                        app.session_id,
+                        output_path.display()
+                    );
                 }
                 Err(err) => {
                     eprintln!("Failed to export session: {}", err);
@@ -955,10 +944,14 @@ fn try_handle_session_command(
             };
             let output_path = parts.next().unwrap_or("session_export.md");
             let output_path = std::path::Path::new(output_path);
-            
+
             match store.export_session_to_markdown(&last.id, output_path) {
                 Ok(()) => {
-                    println!("Exported latest session '{}' to '{}'", last.id, output_path.display());
+                    println!(
+                        "Exported latest session '{}' to '{}'",
+                        last.id,
+                        output_path.display()
+                    );
                 }
                 Err(err) => {
                     eprintln!("Failed to export session: {}", err);

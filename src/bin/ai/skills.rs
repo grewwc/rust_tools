@@ -291,8 +291,8 @@ fn load_skills_from_dir(dir: &Path) -> Vec<SkillManifest> {
 
 #[cfg(test)]
 mod tests {
-    use rust_tools::cw::SkipSet;
     use super::*;
+    use rust_tools::cw::SkipSet;
 
     #[test]
     fn seed_skills_dir_creates_dir_but_does_not_copy_builtins() {
@@ -355,10 +355,12 @@ override"#,
         assert!(names.contains(&refactor));
         assert!(names.contains(&custom));
         let code_review = skills.iter().find(|s| s.name == "code-review").unwrap();
-        assert!(code_review
-            .source_path
-            .as_deref()
-            .is_some_and(|p| p.starts_with("builtin:")));
+        assert!(
+            code_review
+                .source_path
+                .as_deref()
+                .is_some_and(|p| p.starts_with("builtin:"))
+        );
 
         match old_home {
             Some(v) => unsafe {
@@ -370,7 +372,7 @@ override"#,
         }
         let _ = std::fs::remove_dir_all(&home);
     }
-    
+
     #[test]
     fn test_simple_format_parsing() {
         let content = r#"---
@@ -383,7 +385,7 @@ priority: 50
 ---
 
 test prompt"#;
-        
+
         let skill = parse_skill_front_matter(content).unwrap();
         assert_eq!(skill.name, "test-skill");
         assert_eq!(skill.description, "test skill for helping users");

@@ -65,10 +65,10 @@ fn format_search_results(hits: &[WebSearchHit]) -> String {
     if hits.is_empty() {
         return "No results found.".to_string();
     }
-    
+
     let mut output = String::new();
     output.push_str(&format!("Found {} result(s):\n\n", hits.len()));
-    
+
     for (i, hit) in hits.iter().enumerate() {
         output.push_str(&format!("{}. {}\n", i + 1, hit.title));
         output.push_str(&format!("   URL: {}\n", hit.url));
@@ -77,37 +77,44 @@ fn format_search_results(hits: &[WebSearchHit]) -> String {
         }
         output.push('\n');
     }
-    
+
     output
 }
 
 pub(crate) fn execute_web_search(args: &Value) -> Result<String, String> {
     let query = args["query"].as_str().ok_or("Missing query parameter")?;
-    let num_results = args["num_results"]
-        .as_u64()
-        .unwrap_or(5) as usize;
-    
+    let num_results = args["num_results"].as_u64().unwrap_or(5) as usize;
+
     if query.trim().is_empty() {
         return Err("Query cannot be empty".to_string());
     }
-    
-    let limit = if num_results == 0 { 5 } else { num_results.min(20) };
-    
+
+    let limit = if num_results == 0 {
+        5
+    } else {
+        num_results.min(20)
+    };
+
     match duckduckgo_search(query, limit) {
         Ok(hits) => {
             if hits.is_empty() {
                 eprintln!("[web_search] No results from primary. Trying fallback...");
-                duckduckgo_search_fallback(query, limit)
-                    .map(|h| format_search_results(&h))
+                duckduckgo_search_fallback(query, limit).map(|h| format_search_results(&h))
             } else {
                 Ok(format_search_results(&hits))
             }
-        },
+        }
         Err(e) => {
-            eprintln!("[web_search] Primary search failed: {}. Trying fallback...", e);
+            eprintln!(
+                "[web_search] Primary search failed: {}. Trying fallback...",
+                e
+            );
             match duckduckgo_search_fallback(query, limit) {
                 Ok(hits) => Ok(format_search_results(&hits)),
-                Err(e) => Err(format!("Search failed: {}. Try a different query or check network connectivity.", e)),
+                Err(e) => Err(format!(
+                    "Search failed: {}. Try a different query or check network connectivity.",
+                    e
+                )),
             }
         }
     }
@@ -152,7 +159,7 @@ pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
         .map_err(|e| format!("Failed to fetch URL: {}", e))?;
 
     const MAX_BYTES: usize = 512 * 1024;
-    
+
     // Extract metadata before consuming response (clone to avoid borrow issues)
     let status = response.status().as_u16();
     let content_type: String = response
@@ -161,7 +168,7 @@ pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("text/plain")
         .to_string();
-    
+
     let mut buf = Vec::new();
     response
         .take((MAX_BYTES + 1) as u64)
@@ -185,7 +192,7 @@ pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
     }
     result.push_str("\n\n--- Content ---\n\n");
     result.push_str(&content);
-    
+
     Ok(result)
 }
 
@@ -212,7 +219,7 @@ fn duckduckgo_search_fallback(query: &str, limit: usize) -> Result<Vec<WebSearch
     let html = response
         .text()
         .map_err(|e| format!("Failed to read search response: {}", e))?;
-    
+
     Ok(parse_duckduckgo_lite(&html, limit))
 }
 
@@ -220,12 +227,12 @@ fn duckduckgo_search_fallback(query: &str, limit: usize) -> Result<Vec<WebSearch
 fn parse_duckduckgo_lite(html: &str, limit: usize) -> Vec<WebSearchHit> {
     let mut out = Vec::new();
     let lines: Vec<&str> = html.lines().collect();
-    
+
     for i in 0..lines.len().saturating_sub(2) {
         if out.len() >= limit {
             break;
         }
-        
+
         let line = lines[i].trim();
         if line.contains("<a") && line.contains("href=") {
             // Extract URL
@@ -238,25 +245,29 @@ fn parse_duckduckgo_lite(html: &str, limit: usize) -> Vec<WebSearchHit> {
                     } else {
                         format!("https://lite.duckduckgo.com{}", raw_url)
                     };
-                    
+
                     // Extract title
                     let title = clean_html_text(line);
-                    
+
                     // Extract snippet (next line usually contains it)
                     let snippet = if i + 1 < lines.len() {
                         clean_html_text(lines[i + 1])
                     } else {
                         String::new()
                     };
-                    
+
                     if !title.is_empty() && !url.is_empty() {
-                        out.push(WebSearchHit { title, url, snippet });
+                        out.push(WebSearchHit {
+                            title,
+                            url,
+                            snippet,
+                        });
                     }
                 }
             }
         }
     }
-    
+
     out
 }
 
@@ -294,10 +305,16 @@ fn duckduckgo_search(query: &str, limit: usize) -> Result<Vec<WebSearchHit>, Str
 
 fn parse_duckduckgo_html(html: &str, limit: usize) -> Vec<WebSearchHit> {
     // Try multiple regex patterns for flexibility
-    let title_re =
-        Regex::new(r#"(?s)<a[^>]*class="result__a"[^>]*href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>"#)
-            .unwrap_or_else(|_| Regex::new(r#"(?s)<a[^>]*href="(?P<url>[^"]+)"[^>]*class="result__a"[^>]*>(?P<title>.*?)</a>"#).unwrap());
-    
+    let title_re = Regex::new(
+        r#"(?s)<a[^>]*class="result__a"[^>]*href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>"#,
+    )
+    .unwrap_or_else(|_| {
+        Regex::new(
+            r#"(?s)<a[^>]*href="(?P<url>[^"]+)"[^>]*class="result__a"[^>]*>(?P<title>.*?)</a>"#,
+        )
+        .unwrap()
+    });
+
     let snippet_re = Regex::new(r#"(?s)<a[^>]*class="result__snippet"[^>]*>(?P<snippet>.*?)</a>|<div[^>]*class="result__snippet"[^>]*>(?P<snippet2>.*?)</div>"#)
         .ok()
         .or_else(|| Regex::new(r#"(?s)<div[^>]*>(?P<snippet>.*?)</div>"#).ok());

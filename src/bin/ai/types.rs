@@ -8,7 +8,7 @@ use std::{
     },
 };
 
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -139,7 +139,7 @@ pub(super) struct McpPromptArgument {
 }
 
 pub(super) fn take_stream_cancelled(app: &App) -> bool {
-    app.cancel_stream.swap(false, Ordering::SeqCst)
+    app.cancel_stream.swap(false, Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

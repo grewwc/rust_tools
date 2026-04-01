@@ -360,7 +360,10 @@ fn collect_reachable(
     }
     let mut q = vec![start.as_ref().clone()];
     while let Some(u) = q.pop() {
-        let u_rc = interner.get(&u).cloned().unwrap_or_else(|| Rc::new(u.clone()));
+        let u_rc = interner
+            .get(&u)
+            .cloned()
+            .unwrap_or_else(|| Rc::new(u.clone()));
         for v in graph.adj(&u_rc) {
             let v_path = v.as_ref().clone();
             if out.insert(v_path.clone()) {

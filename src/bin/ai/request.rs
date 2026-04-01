@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use colored::Colorize;
-use reqwest::{StatusCode, blocking::Response};
+use reqwest::{Response, StatusCode};
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -13,9 +13,9 @@ use super::{files, history::Message, models, skills::SkillManifest, types::App};
 use crate::common::configw;
 
 #[derive(Debug, Serialize)]
-struct RequestBody {
-    model: String,
-    messages: Vec<Message>,
+struct RequestBody<'a> {
+    model: &'a str,
+    messages: &'a [Message],
     stream: bool,
     enable_thinking: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -144,15 +144,15 @@ pub(super) fn is_transient_error(err: &RequestError) -> bool {
     }
 }
 
-pub(super) fn do_request_messages(
+pub(super) async fn do_request_messages(
     app: &mut App,
     model: &str,
-    messages: Vec<Message>,
+    messages: &[Message],
     stream: bool,
 ) -> Result<Response, RequestError> {
     let (tools_value, tool_choice) = agent_tools_for_request(app, model);
     let request_body = RequestBody {
-        model: model.to_string(),
+        model,
         messages,
         stream,
         enable_thinking: app.cli.thinking || models::enable_thinking(model),
@@ -168,7 +168,8 @@ pub(super) fn do_request_messages(
             .bearer_auth(&app.config.api_key)
             .header("Content-Type", "application/json")
             .json(&request_body)
-            .send();
+            .send()
+            .await;
 
         match response {
             Ok(response) => {
@@ -176,11 +177,12 @@ pub(super) fn do_request_messages(
                     return Ok(response);
                 }
                 let status = response.status();
-                let body = response.text().unwrap_or_default();
+                let status_code = status.as_u16();
+                let body = (response.text().await).unwrap_or_default();
                 let err = RequestError::status(status, body);
 
                 // 根据状态码确定最大重试次数
-                let max_attempts_for_status = if status.as_u16() == 429 {
+                let max_attempts_for_status = if status_code == 429 {
                     REQUEST_MAX_ATTEMPTS_429
                 } else {
                     REQUEST_MAX_ATTEMPTS
@@ -190,7 +192,7 @@ pub(super) fn do_request_messages(
                     // 打印 sleep 原因
                     let delay = retry_delay(attempt);
 
-                    if status.as_u16() == 429 {
+                    if status_code == 429 {
                         eprintln!(
                             "[Warning] 429 Too Many Requests - 配额超限，sleep {} 秒后重试 (attempt {}/{})",
                             delay.as_secs_f32(),
@@ -206,7 +208,7 @@ pub(super) fn do_request_messages(
                             max_attempts_for_status
                         );
                     }
-                    std::thread::sleep(delay);
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 return Err(err);
@@ -223,7 +225,7 @@ pub(super) fn do_request_messages(
                         attempt,
                         REQUEST_MAX_ATTEMPTS
                     );
-                    std::thread::sleep(delay);
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
                 return Err(err);
@@ -298,7 +300,7 @@ fn extract_router_content(v: &Value) -> Option<String> {
     }
 }
 
-pub(super) fn select_skill_via_model(
+pub(super) async fn select_skill_via_model(
     app: &mut App,
     model: &str,
     question: &str,
@@ -365,8 +367,8 @@ Skills:
     ];
 
     let request_body = RequestBody {
-        model: model.to_string(),
-        messages,
+        model,
+        messages: &messages,
         stream: false,
         enable_thinking: false,
         enable_search: None,
@@ -381,13 +383,14 @@ Skills:
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
+        .await
         .ok()?;
 
     if !response.status().is_success() {
         return None;
     }
 
-    let text = response.text().ok()?;
+    let text = response.text().await.ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     let content = extract_router_content(&v).unwrap_or_default();
     let (name, confidence) = parse_router_output(&content);

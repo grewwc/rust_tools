@@ -385,7 +385,7 @@ pub(super) fn execute_tool_calls(
 
     for (idx, tool_call) in tool_calls.iter().enumerate() {
         let is_last = idx + 1 >= tool_calls.len();
-        let (route, run_result) = run_one(mcp_client, tool_call);
+        let (route, run_result) = tokio::task::block_in_place(|| run_one(mcp_client, tool_call));
         let should_barrier = should_barrier_after(
             &route,
             tool_call,

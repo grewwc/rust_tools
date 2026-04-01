@@ -67,7 +67,11 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
             .ok_or("invalid hunk header")?
             .parse::<isize>()
             .map_err(|_| "invalid hunk header")?;
-        let old_start = if old_start <= 0 { 0 } else { old_start as usize };
+        let old_start = if old_start <= 0 {
+            0
+        } else {
+            old_start as usize
+        };
 
         let mut lines = Vec::new();
         while let Some(next) = iter.peek().copied() {

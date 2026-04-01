@@ -57,7 +57,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     // 创建 terminalw parser
     let mut parser = TermParser::new();
-    
+
     // 定义所有 bool 选项
     parser.add_bool("clear", false, "clear history");
     parser.add_bool("multi-line", false, "input with multline");
@@ -74,7 +74,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
     parser.alias("h", "help");
-    
+
     // 定义所有 string/int 选项
     parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history");
     parser.add_string("model", "", "model name");
@@ -93,7 +93,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     } else {
         Vec::new()
     };
-    
+
     // 预处理：将 --ss 转换为 --session，避免与 -s 冲突
     // 这是必要的，因为 terminalw::Parser 的布尔簇检测会将 -ss 分解为 -s + -s
     for arg in &mut argv {
@@ -187,7 +187,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 /// 打印帮助信息
 pub(super) fn print_help() {
     let mut parser = TermParser::new();
-    
+
     parser.add_bool("clear", false, "clear history");
     parser.add_bool("multi-line", false, "input with multline");
     parser.alias("mul", "multi-line");
@@ -203,7 +203,7 @@ pub(super) fn print_help() {
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
     parser.alias("h", "help");
-    
+
     parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history");
     parser.add_string("model", "", "model name");
     parser.alias("m", "model");
@@ -231,7 +231,9 @@ pub(super) fn print_help() {
     println!("  /sessions current         查看当前 session");
     println!("  /sessions new             新建并切换到新 session");
     println!("  /sessions use <id>        切换 session");
-    println!("  /sessions delete <id>     删除 session（若删除当前 session，会自动切到新 session）");
+    println!(
+        "  /sessions delete <id>     删除 session（若删除当前 session，会自动切到新 session）"
+    );
     println!("  /sessions clear-all       删除全部 sessions");
     println!("  /sessions export <id> [output.md]    导出指定 session 为 Markdown");
     println!("  /sessions export-current [output.md] 导出当前 session 为 Markdown");

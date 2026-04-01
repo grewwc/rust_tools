@@ -65,9 +65,32 @@ pub fn validate_execute_command(command: &str) -> Result<(), String> {
     let program = tokens[0].to_lowercase();
 
     let denied_programs = [
-        "fish", "jshell", "rm", "mv", "dd", "chmod", "chown", "chgrp", "kill", "pkill",
-        "killall", "sudo", "su", "passwd", "shutdown", "reboot", "launchctl", "systemctl",
-        "service", "diskutil", "mount", "umount", "ln", "truncate", "ssh", "scp",
+        "fish",
+        "jshell",
+        "rm",
+        "mv",
+        "dd",
+        "chmod",
+        "chown",
+        "chgrp",
+        "kill",
+        "pkill",
+        "killall",
+        "sudo",
+        "su",
+        "passwd",
+        "shutdown",
+        "reboot",
+        "launchctl",
+        "systemctl",
+        "service",
+        "diskutil",
+        "mount",
+        "umount",
+        "ln",
+        "truncate",
+        "ssh",
+        "scp",
     ];
     if denied_programs.contains(&program.as_str()) {
         return Err(format!("program '{program}' is blocked"));

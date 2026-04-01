@@ -56,13 +56,13 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
 
     let question = match prompt_user(app) {
         Ok(v) => v,
-        Err(_) if app.shutdown.load(Ordering::Acquire) => {
+        Err(_) if app.shutdown.load(Ordering::Relaxed) => {
             return Ok(None);
         }
         Err(err) => return Err(err.into()),
     };
     let Some(question) = question else {
-        app.shutdown.store(true, Ordering::Release);
+        app.shutdown.store(true, Ordering::Relaxed);
         return Ok(None);
     };
     let (question, overrides) = parse_loop_overrides(&question);

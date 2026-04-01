@@ -141,12 +141,12 @@ impl PromptEditor {
         use ratatui::{
             Terminal,
             backend::CrosstermBackend,
+            layout::Alignment,
+            layout::Rect,
             layout::{Constraint, Direction, Layout},
             style::{Color, Modifier, Style},
             text::{Line, Span},
             widgets::{Block, Borders, Clear, Paragraph},
-            layout::Rect,
-            layout::Alignment,
         };
         use tui_textarea::{CursorMove, Input, TextArea};
 
@@ -269,11 +269,15 @@ impl PromptEditor {
 
                         // 显示状态消息
                         if let Some(ref msg) = status_msg {
-                            let status_para = Paragraph::new(Line::from(
-                                Span::styled(msg, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
-                            ))
+                            let status_para = Paragraph::new(Line::from(Span::styled(
+                                msg,
+                                Style::default()
+                                    .fg(Color::Green)
+                                    .add_modifier(Modifier::BOLD),
+                            )))
                             .alignment(Alignment::Center);
-                            let status_area = Rect::new(chunks[1].x, chunks[1].y + 1, chunks[1].width, 1);
+                            let status_area =
+                                Rect::new(chunks[1].x, chunks[1].y + 1, chunks[1].width, 1);
                             f.render_widget(status_para, status_area);
                         }
                     })
@@ -348,30 +352,35 @@ impl PromptEditor {
                                 break Err(io::Error::new(io::ErrorKind::Interrupted, "Ctrl+C"));
                             }
                             // 复制最后一次回答：F9
-                            (KeyCode::F(9), _) =>
-                            {
+                            (KeyCode::F(9), _) => {
                                 let lines = textarea.lines();
                                 // 找到最后一个 "assistant:" 或 "AI:" 开始的位置
                                 let mut last_answer_start = None;
                                 for (i, line) in lines.iter().enumerate() {
-                                    if line.starts_with("assistant:") || line.starts_with("AI:") || line.starts_with("Assistant:") {
+                                    if line.starts_with("assistant:")
+                                        || line.starts_with("AI:")
+                                        || line.starts_with("Assistant:")
+                                    {
                                         last_answer_start = Some(i);
                                     }
                                 }
                                 let answer = if let Some(start) = last_answer_start {
-                                    lines[start..].join("
-")
+                                    lines[start..].join(
+                                        "
+",
+                                    )
                                 } else {
                                     // 如果没有找到 assistant:，复制最后一段非空内容
-                                    lines.join("
-")
+                                    lines.join(
+                                        "
+",
+                                    )
                                 };
                                 let _ = string_content::set_clipboard_content(&answer);
                                 status_msg = Some("✓ 已复制最后回答到剪贴板".to_string());
                             }
                             // 全文复制：F10
-                            (KeyCode::F(10), _) =>
-                            {
+                            (KeyCode::F(10), _) => {
                                 let content = textarea_content(&textarea);
                                 let _ = string_content::set_clipboard_content(&content);
                                 status_msg = Some("✓ 已复制全文到剪贴板".to_string());

@@ -10,13 +10,13 @@ pub enum SigintAction {
 pub fn handle_sigint(shutdown: &AtomicBool, streaming: &AtomicBool, cancel_stream: &AtomicBool) {
     match sigint_action(shutdown, streaming, cancel_stream) {
         SigintAction::CancelStream => {
-            cancel_stream.store(true, Ordering::Release);
+            cancel_stream.store(true, Ordering::Relaxed);
         }
         SigintAction::Shutdown => {
-            shutdown.store(true, Ordering::Release);
+            shutdown.store(true, Ordering::Relaxed);
         }
         SigintAction::Exit => {
-            shutdown.store(true, Ordering::Release);
+            shutdown.store(true, Ordering::Relaxed);
             #[cfg(unix)]
             unsafe {
                 let _ = libc::close(libc::STDIN_FILENO);
@@ -32,13 +32,13 @@ pub fn sigint_action(
     streaming: &AtomicBool,
     cancel_stream: &AtomicBool,
 ) -> SigintAction {
-    if streaming.load(Ordering::Acquire) {
-        if cancel_stream.load(Ordering::Acquire) {
+    if streaming.load(Ordering::Relaxed) {
+        if cancel_stream.load(Ordering::Relaxed) {
             SigintAction::Shutdown
         } else {
             SigintAction::CancelStream
         }
-    } else if shutdown.load(Ordering::Acquire) {
+    } else if shutdown.load(Ordering::Relaxed) {
         SigintAction::Exit
     } else {
         // Outside streaming (including tool execution), first Ctrl+C requests a graceful

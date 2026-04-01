@@ -181,7 +181,11 @@ pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
         return Err("note is empty".to_string());
     }
     let category = args["category"].as_str().unwrap_or("general").trim();
-    let category = if category.is_empty() { "general" } else { category };
+    let category = if category.is_empty() {
+        "general"
+    } else {
+        category
+    };
     let tags = parse_string_array(&args["tags"]);
     let source = args["source"]
         .as_str()
@@ -199,8 +203,8 @@ pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create memory dir: {e}"))?;
     }
-    let serialized =
-        serde_json::to_string(&entry).map_err(|e| format!("Failed to serialize memory entry: {e}"))?;
+    let serialized = serde_json::to_string(&entry)
+        .map_err(|e| format!("Failed to serialize memory entry: {e}"))?;
     let mut existing = if path.exists() {
         fs::read_to_string(&path).map_err(|e| format!("Failed to read memory file: {e}"))?
     } else {

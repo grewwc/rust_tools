@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser};
 use rust_tools::cw::{
-    DirectedGraph, Edge, Mst, SkipSet, SkipMap, UndirectedGraph, WeightedDirectedGraph,
+    DirectedGraph, Edge, Mst, SkipMap, SkipSet, UndirectedGraph, WeightedDirectedGraph,
     WeightedUndirectedGraph,
 };
 use serde::Serialize;

@@ -2638,8 +2638,8 @@ fn feishu_oauth_wait_local_code(args: &Value) -> Result<String, JsonRpcErr> {
             let mut accepted: Option<TcpStream> = None;
             for listener in &listeners {
                 if let Ok((stream, _)) = listener.accept() {
-                        accepted = Some(stream);
-                        break;
+                    accepted = Some(stream);
+                    break;
                 }
             }
 
@@ -3085,7 +3085,6 @@ fn epoch_ms_from_instant(instant: Instant) -> i64 {
     now_ms.saturating_add(delta)
 }
 
-
 fn feishu_sheet_create_from_csv(args: &Value) -> Result<String, JsonRpcErr> {
     let title = args
         .get("title")
@@ -3178,7 +3177,6 @@ fn feishu_sheet_create_from_csv(args: &Value) -> Result<String, JsonRpcErr> {
                 )
             })?;
 
-
             let code = json.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
             if code != 0 {
                 let err_json = json.clone();
@@ -3195,11 +3193,7 @@ fn feishu_sheet_create_from_csv(args: &Value) -> Result<String, JsonRpcErr> {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
                     let err_json = json.clone();
-                    json_rpc_error(
-                        -32000,
-                        "No spreadsheet_token in response",
-                        Some(err_json),
-                    )
+                    json_rpc_error(-32000, "No spreadsheet_token in response", Some(err_json))
                 })?;
 
             Ok(token.to_string())
@@ -3417,7 +3411,6 @@ fn feishu_doc_create_from_markdown(args: &Value) -> Result<String, JsonRpcErr> {
                 )
             })?;
 
-
             let code = json.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
             if code != 0 {
                 let err_json = json.clone();
@@ -3434,11 +3427,7 @@ fn feishu_doc_create_from_markdown(args: &Value) -> Result<String, JsonRpcErr> {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
                     let err_json = json.clone();
-                    json_rpc_error(
-                        -32000,
-                        "No document_id in response",
-                        Some(err_json),
-                    )
+                    json_rpc_error(-32000, "No document_id in response", Some(err_json))
                 })?;
 
             Ok(id.to_string())

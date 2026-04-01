@@ -65,7 +65,7 @@ fn resolve_model_is_unicode_safe() {
         history_keep_last: 8,
         history_summary_max_chars: 4000,
     };
-    let client = reqwest::blocking::Client::builder().build().unwrap();
+    let client = reqwest::Client::builder().build().unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
     let streaming = Arc::new(AtomicBool::new(false));
     let cancel_stream = Arc::new(AtomicBool::new(false));

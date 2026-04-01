@@ -1,4 +1,3 @@
-use reqwest::blocking::Response;
 use std::error::Error;
 use std::fs;
 use std::io;
@@ -128,7 +127,7 @@ pub fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitReport {
     report
 }
 
-pub fn drain_response(response: &mut Response) -> Result<(), Box<dyn Error>> {
-    response.copy_to(&mut io::sink())?;
+pub async fn drain_response(response: &mut reqwest::Response) -> Result<(), Box<dyn Error>> {
+    while response.chunk().await?.is_some() {}
     Ok(())
 }

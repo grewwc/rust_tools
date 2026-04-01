@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
+use std::time::Duration;
 
 use colored::Colorize;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -14,18 +15,15 @@ const MAX_DECODE_ERRORS: usize = 3;
 /// Delay in milliseconds between retry attempts on transient errors
 const DECODE_ERROR_RETRY_DELAY_MS: u64 = 100;
 
-pub(super) fn stream_response(
+pub(super) async fn stream_response(
     app: &mut App,
-    response: &mut reqwest::blocking::Response,
+    response: &mut reqwest::Response,
     current_history: &mut String,
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
-    // Use smaller buffer to reduce latency in streaming output
-    let mut reader = BufReader::with_capacity(256, response);
     let thinking_tag = "<thinking>".yellow().to_string();
     let end_thinking_tag = "<end thinking>".yellow().to_string();
     let mut thinking_open = false;
     let mut markdown = MarkdownStreamRenderer::new();
-    let mut line = String::new();
     let mut tool_calls_map: HashMap<usize, ToolCallBuilder> = HashMap::new();
     let mut assistant_text = String::new();
     let mut internal_tool_call_idx: usize = 0;
@@ -35,239 +33,143 @@ pub(super) fn stream_response(
 
     // Track decode errors to handle transient network issues gracefully
     let mut decode_error_count = 0;
+    let mut pending = Vec::<u8>::with_capacity(4096);
 
-    while !app.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-        if take_stream_cancelled(app) {
+    while !app.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        if app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(StreamResult {
                 outcome: StreamOutcome::Cancelled,
                 tool_calls: Vec::new(),
                 assistant_text: String::new(),
             });
         }
-        line.clear();
-        let n = match reader.read_line(&mut line) {
-            Ok(n) => n,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                ) =>
-            {
-                if take_stream_cancelled(app) {
-                    return Ok(StreamResult {
-                        outcome: StreamOutcome::Cancelled,
-                        tool_calls: Vec::new(),
-                        assistant_text: String::new(),
-                    });
-                }
-                if app.shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-                    return Ok(StreamResult {
-                        outcome: StreamOutcome::Cancelled,
-                        tool_calls: Vec::new(),
-                        assistant_text: String::new(),
-                    });
-                }
-                continue;
-            }
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                if take_stream_cancelled(app) {
-                    return Ok(StreamResult {
-                        outcome: StreamOutcome::Cancelled,
-                        tool_calls: Vec::new(),
-                        assistant_text: String::new(),
-                    });
-                }
-                continue;
-            }
-            Err(err) => {
-                // Handle response body decode errors (e.g., UTF-8 decode failure, connection interrupted)
-                decode_error_count += 1;
-                eprintln!(
-                    "[Warning] 读取响应流时出错：{} (错误次数：{}/{})",
-                    err, decode_error_count, MAX_DECODE_ERRORS
-                );
 
-                // Check for cancellation during error handling
-                if take_stream_cancelled(app) {
-                    return Ok(StreamResult {
-                        outcome: StreamOutcome::Cancelled,
-                        tool_calls: Vec::new(),
-                        assistant_text: String::new(),
-                    });
-                }
-
-                // If this is a transient error and we haven't exceeded max retries, try to continue
-                if decode_error_count <= MAX_DECODE_ERRORS {
-                    eprintln!("[Warning] 尝试继续读取...");
-                    std::thread::sleep(std::time::Duration::from_millis(
-                        DECODE_ERROR_RETRY_DELAY_MS,
-                    ));
-                    continue;
-                }
-
-                // Exceeded max error count, return collected content instead of crashing
-                eprintln!("[Error] 响应流读取失败，返回已收集的内容");
-
-                // Close thinking block if still open
-                if thinking_open {
-                    let _ = write_stream_content(
-                        &format!("\n{end_thinking_tag}\n"),
-                        app.writer.as_mut(),
-                        &mut markdown,
-                    );
-                }
-
-                let _ = markdown.flush_pending();
-
+        let chunk_result = tokio::select! {
+            chunk = response.chunk() => chunk,
+            _ = wait_for_interrupt(app) => {
                 return Ok(StreamResult {
-                    outcome: StreamOutcome::Completed,
-                    tool_calls: tool_calls_map
-                        .into_values()
-                        .map(|b| b.build())
-                        .collect(),
-                    assistant_text,
+                    outcome: StreamOutcome::Cancelled,
+                    tool_calls: Vec::new(),
+                    assistant_text: String::new(),
                 });
             }
         };
-        if n == 0 {
-            break;
-        }
-        let trimmed = line.trim();
-        if !trimmed.starts_with("data:") {
-            continue;
-        }
-        let payload = trimmed.trim_start_matches("data:").trim();
-        if payload.is_empty() {
-            continue;
-        }
-        if payload == "[DONE]" {
-            break;
-        }
 
-        let chunk: StreamChunk = match serde_json::from_str(payload) {
-            Ok(chunk) => chunk,
+        let should_stop = match chunk_result {
+            Ok(Some(chunk)) => {
+                pending.extend_from_slice(&chunk);
+                decode_error_count = 0;
+                let mut should_stop = false;
+                let mut consumed = 0usize;
+                while let Some(line_end_rel) = pending[consumed..].iter().position(|b| *b == b'\n')
+                {
+                    let line_end = consumed + line_end_rel + 1;
+                    let line = match std::str::from_utf8(&pending[consumed..line_end]) {
+                        Ok(line) => line,
+                        Err(err) => {
+                            if let Some(result) = handle_stream_decode_error(
+                                app,
+                                &end_thinking_tag,
+                                &mut thinking_open,
+                                &mut markdown,
+                                &mut tool_calls_map,
+                                &mut assistant_text,
+                                &mut decode_error_count,
+                                err,
+                            )
+                            .await
+                            {
+                                return Ok(result);
+                            }
+                            consumed = line_end;
+                            continue;
+                        }
+                    };
+                    if process_stream_line(
+                        app,
+                        current_history,
+                        &thinking_tag,
+                        &end_thinking_tag,
+                        &mut thinking_open,
+                        &mut markdown,
+                        &mut tool_calls_map,
+                        &mut assistant_text,
+                        &mut internal_tool_call_idx,
+                        &mut printed_tool_calls_header,
+                        &mut current_printing_index,
+                        line,
+                    )? {
+                        should_stop = true;
+                        consumed = line_end;
+                        break;
+                    }
+                    consumed = line_end;
+                }
+                if consumed != 0 {
+                    pending.drain(..consumed);
+                }
+                should_stop
+            }
+            Ok(None) => break,
             Err(err) => {
-                eprintln!("handleResponse error {err}");
-                eprintln!("======> response: ");
-                eprintln!("{payload}");
-                eprintln!("<======");
+                if let Some(result) = handle_stream_decode_error(
+                    app,
+                    &end_thinking_tag,
+                    &mut thinking_open,
+                    &mut markdown,
+                    &mut tool_calls_map,
+                    &mut assistant_text,
+                    &mut decode_error_count,
+                    err,
+                )
+                .await
+                {
+                    return Ok(result);
+                }
                 continue;
             }
         };
-
-        let mut reached_finish_reason = false;
-        if let Some(choice) = chunk.choices.first() {
-            reached_finish_reason = choice.finish_reason.is_some();
-
-            for stream_tool_call in &choice.delta.tool_calls {
-                let index = stream_tool_call.index;
-                let builder = tool_calls_map.entry(index).or_default();
-
-                if !printed_tool_calls_header {
-                    if thinking_open {
-                        let _ = write_stream_content(
-                            &format!("\n{end_thinking_tag}\n"),
-                            app.writer.as_mut(),
-                            &mut markdown,
-                        );
-                        thinking_open = false;
-                    }
-                    let _ = markdown.flush_pending();
-                    println!("\n{}", "[Tool Calls]".yellow());
-                    printed_tool_calls_header = true;
-                }
-
-                if !stream_tool_call.id.is_empty() {
-                    builder.id = stream_tool_call.id.clone();
-                }
-                if !stream_tool_call.tool_type.is_empty() {
-                    builder.tool_type = stream_tool_call.tool_type.clone();
-                }
-                if !stream_tool_call.function.name.is_empty() {
-                    builder.function_name = stream_tool_call.function.name.clone();
-                }
-                builder
-                    .arguments
-                    .push_str(&stream_tool_call.function.arguments);
-
-                if !builder.function_name.is_empty() {
-                    if current_printing_index != Some(index) {
-                        if current_printing_index.is_some() {
-                            println!(")");
-                        }
-                        current_printing_index = Some(index);
-                        print!("  - {}(", builder.function_name.cyan());
-                        let _ = io::stdout().flush();
-                        // Print already accumulated arguments in case we missed them while switching
-                        print!("{}", builder.arguments.dimmed());
-                        let _ = io::stdout().flush();
-                    } else if !stream_tool_call.function.arguments.is_empty() {
-                        print!("{}", stream_tool_call.function.arguments.dimmed());
-                        let _ = io::stdout().flush();
-                    }
-                }
-            }
-        }
-
-        let (content, internal_tool_calls) = extract_chunk_text_with_tools(
-            &chunk,
-            &thinking_tag,
-            &end_thinking_tag,
-            &mut thinking_open,
-        );
-
-        for tc in internal_tool_calls {
-            let builder = tool_calls_map.entry(internal_tool_call_idx).or_default();
-            builder.id = tc.id;
-            builder.tool_type = tc.tool_type;
-            builder.function_name = tc.function_name.clone();
-            builder.arguments = tc.arguments.clone();
-            
-            if !printed_tool_calls_header {
-                if thinking_open {
-                    let _ = write_stream_content(
-                        &format!("\n{end_thinking_tag}\n"),
-                        app.writer.as_mut(),
-                        &mut markdown,
-                    );
-                    thinking_open = false;
-                }
-                let _ = markdown.flush_pending();
-                println!("\n{}", "[Tool Calls]".yellow());
-                printed_tool_calls_header = true;
-            }
-
-            if current_printing_index.is_some() {
-                println!(")");
-                current_printing_index = None;
-            }
-
-            print!("  - {}({})", tc.function_name.cyan(), tc.arguments.dimmed());
-            println!();
-            let _ = io::stdout().flush();
-
-            internal_tool_call_idx += 1;
-        }
-
-        if content.is_empty() {
-            if reached_finish_reason {
-                break;
-            }
-            continue;
-        }
-        write_stream_content(content.as_str(), app.writer.as_mut(), &mut markdown)?;
-        if thinking_open {
-            continue;
-        }
-        let text = content.replace(&end_thinking_tag, "");
-        let text = text.trim_matches('\n');
-        current_history.push_str(text);
-        assistant_text.push_str(text);
-
-        // Some providers may not send a trailing [DONE] frame promptly.
-        // If finish_reason is present, we already have the terminal chunk.
-        if reached_finish_reason {
+        if should_stop {
             break;
+        }
+    }
+
+    if !pending.is_empty() {
+        let line = match std::str::from_utf8(&pending) {
+            Ok(line) => line,
+            Err(err) => {
+                if let Some(result) = handle_stream_decode_error(
+                    app,
+                    &end_thinking_tag,
+                    &mut thinking_open,
+                    &mut markdown,
+                    &mut tool_calls_map,
+                    &mut assistant_text,
+                    &mut decode_error_count,
+                    err,
+                )
+                .await
+                {
+                    return Ok(result);
+                }
+                ""
+            }
+        };
+        if !line.is_empty() {
+            let _ = process_stream_line(
+                app,
+                current_history,
+                &thinking_tag,
+                &end_thinking_tag,
+                &mut thinking_open,
+                &mut markdown,
+                &mut tool_calls_map,
+                &mut assistant_text,
+                &mut internal_tool_call_idx,
+                &mut printed_tool_calls_header,
+                &mut current_printing_index,
+                line,
+            )?;
         }
     }
 
@@ -311,6 +213,223 @@ pub(super) fn stream_response(
         tool_calls,
         assistant_text,
     })
+}
+
+async fn wait_for_interrupt(app: &App) {
+    loop {
+        if app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
+            || app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn handle_stream_decode_error<E: std::fmt::Display>(
+    app: &mut App,
+    end_thinking_tag: &str,
+    thinking_open: &mut bool,
+    markdown: &mut MarkdownStreamRenderer,
+    tool_calls_map: &mut HashMap<usize, ToolCallBuilder>,
+    assistant_text: &mut String,
+    decode_error_count: &mut usize,
+    err: E,
+) -> Option<StreamResult> {
+    *decode_error_count += 1;
+    eprintln!(
+        "[Warning] 读取响应流时出错：{} (错误次数：{}/{})",
+        err, decode_error_count, MAX_DECODE_ERRORS
+    );
+
+    if take_stream_cancelled(app) {
+        return Some(StreamResult {
+            outcome: StreamOutcome::Cancelled,
+            tool_calls: Vec::new(),
+            assistant_text: String::new(),
+        });
+    }
+
+    if *decode_error_count <= MAX_DECODE_ERRORS {
+        eprintln!("[Warning] 尝试继续读取...");
+        tokio::time::sleep(Duration::from_millis(DECODE_ERROR_RETRY_DELAY_MS)).await;
+        return None;
+    }
+
+    eprintln!("[Error] 响应流读取失败，返回已收集的内容");
+
+    if *thinking_open {
+        let _ = write_stream_content(
+            &format!("\n{end_thinking_tag}\n"),
+            app.writer.as_mut(),
+            markdown,
+        );
+    }
+
+    let _ = markdown.flush_pending();
+
+    Some(StreamResult {
+        outcome: StreamOutcome::Completed,
+        tool_calls: tool_calls_map.drain().map(|(_, b)| b.build()).collect(),
+        assistant_text: assistant_text.clone(),
+    })
+}
+
+fn process_stream_line(
+    app: &mut App,
+    current_history: &mut String,
+    thinking_tag: &str,
+    end_thinking_tag: &str,
+    thinking_open: &mut bool,
+    markdown: &mut MarkdownStreamRenderer,
+    tool_calls_map: &mut HashMap<usize, ToolCallBuilder>,
+    assistant_text: &mut String,
+    internal_tool_call_idx: &mut usize,
+    printed_tool_calls_header: &mut bool,
+    current_printing_index: &mut Option<usize>,
+    line: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let trimmed = line.trim();
+    if !trimmed.starts_with("data:") {
+        return Ok(false);
+    }
+    let payload = trimmed.trim_start_matches("data:").trim();
+    if payload.is_empty() {
+        return Ok(false);
+    }
+    if payload == "[DONE]" {
+        return Ok(true);
+    }
+
+    let chunk: StreamChunk = match serde_json::from_str(payload) {
+        Ok(chunk) => chunk,
+        Err(err) => {
+            eprintln!("handleResponse error {err}");
+            eprintln!("======> response: ");
+            eprintln!("{payload}");
+            eprintln!("<======");
+            return Ok(false);
+        }
+    };
+
+    let mut reached_finish_reason = false;
+    if let Some(choice) = chunk.choices.first() {
+        reached_finish_reason = choice.finish_reason.is_some();
+
+        for stream_tool_call in &choice.delta.tool_calls {
+            let index = stream_tool_call.index;
+            let builder = tool_calls_map.entry(index).or_default();
+
+            if !*printed_tool_calls_header {
+                if *thinking_open {
+                    let _ = write_stream_content(
+                        &format!("\n{end_thinking_tag}\n"),
+                        app.writer.as_mut(),
+                        markdown,
+                    );
+                    *thinking_open = false;
+                }
+                let _ = markdown.flush_pending();
+                println!("\n{}", "[Tool Calls]".yellow());
+                *printed_tool_calls_header = true;
+            }
+
+            if !stream_tool_call.id.is_empty() {
+                builder.id = stream_tool_call.id.clone();
+            }
+            if !stream_tool_call.tool_type.is_empty() {
+                builder.tool_type = stream_tool_call.tool_type.clone();
+            }
+            if !stream_tool_call.function.name.is_empty() {
+                builder.function_name = stream_tool_call.function.name.clone();
+            }
+            builder
+                .arguments
+                .push_str(&stream_tool_call.function.arguments);
+
+            if !builder.function_name.is_empty() {
+                if *current_printing_index != Some(index) {
+                    if current_printing_index.is_some() {
+                        println!(")");
+                    }
+                    *current_printing_index = Some(index);
+                    print!("  - {}(", builder.function_name.cyan());
+                    let _ = io::stdout().flush();
+                    print!("{}", builder.arguments.dimmed());
+                    let _ = io::stdout().flush();
+                } else if !stream_tool_call.function.arguments.is_empty() {
+                    print!("{}", stream_tool_call.function.arguments.dimmed());
+                    let _ = io::stdout().flush();
+                }
+            }
+        }
+    }
+
+    let (content, internal_tool_calls) =
+        extract_chunk_text_with_tools(&chunk, thinking_tag, end_thinking_tag, thinking_open);
+
+    for tc in internal_tool_calls {
+        let InternalToolCall {
+            id,
+            tool_type,
+            function_name,
+            arguments,
+        } = tc;
+        let builder = tool_calls_map.entry(*internal_tool_call_idx).or_default();
+        builder.id = id;
+        builder.tool_type = tool_type;
+        builder.function_name = function_name;
+        builder.arguments = arguments;
+
+        if !*printed_tool_calls_header {
+            if *thinking_open {
+                let _ = write_stream_content(
+                    &format!("\n{end_thinking_tag}\n"),
+                    app.writer.as_mut(),
+                    markdown,
+                );
+                *thinking_open = false;
+            }
+            let _ = markdown.flush_pending();
+            println!("\n{}", "[Tool Calls]".yellow());
+            *printed_tool_calls_header = true;
+        }
+
+        if current_printing_index.is_some() {
+            println!(")");
+            *current_printing_index = None;
+        }
+
+        print!(
+            "  - {}({})",
+            builder.function_name.cyan(),
+            builder.arguments.dimmed()
+        );
+        println!();
+        let _ = io::stdout().flush();
+
+        *internal_tool_call_idx += 1;
+    }
+
+    if content.is_empty() {
+        return Ok(reached_finish_reason);
+    }
+    write_stream_content(content.as_str(), app.writer.as_mut(), markdown)?;
+    if *thinking_open {
+        return Ok(false);
+    }
+    let text = if content.contains(end_thinking_tag) {
+        content.replace(end_thinking_tag, "")
+    } else {
+        content
+    };
+    let text = text.trim_matches('\n');
+    current_history.reserve(text.len());
+    assistant_text.reserve(text.len());
+    current_history.push_str(text);
+    assistant_text.push_str(text);
+
+    Ok(reached_finish_reason)
 }
 
 #[derive(Default)]
@@ -614,7 +733,7 @@ impl MarkdownStreamRenderer {
     }
 
     /// Writes a chunk of markdown content to stdout with live preview support.
-    /// 
+    ///
     /// This method processes the input character by character, handling:
     /// - Newline characters (triggers line rendering)
     /// - Table preview (live updates for table rows)
@@ -627,7 +746,7 @@ impl MarkdownStreamRenderer {
                 self.handle_newline(&mut out)?;
                 continue;
             }
-            
+
             self.line_buf.push(ch);
             self.handle_char(&mut out, ch)?;
             self.bol = false;
@@ -648,7 +767,7 @@ impl MarkdownStreamRenderer {
         // Take the accumulated line and render it
         let line = std::mem::take(&mut self.line_buf);
         let rendered = self.consume_line(&line, self.line_preview_emitted);
-        
+
         // Reset preview state
         self.line_preview_emitted = false;
         self.line_preview_height = 0;
@@ -672,7 +791,7 @@ impl MarkdownStreamRenderer {
     }
 
     /// Handles live table preview output.
-    /// 
+    ///
     /// For the first character of a table row, outputs the entire buffer.
     /// For subsequent characters, outputs just the new character.
     fn handle_table_preview(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
@@ -691,7 +810,7 @@ impl MarkdownStreamRenderer {
     }
 
     /// Handles realtime output for code blocks and regular content.
-    /// 
+    ///
     /// Outputs characters immediately to avoid the feeling of "freezing".
     fn handle_realtime_output(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
         self.emit_char(out, ch)?;
@@ -708,11 +827,11 @@ impl MarkdownStreamRenderer {
         Ok(())
     }
     /// Flushes any pending content: renders the accumulated line and completes table state.
-    /// 
+    ///
     /// This method should be called at the end of streaming to ensure all content is rendered.
     fn flush_pending(&mut self) -> io::Result<()> {
         let mut out = io::stdout();
-        
+
         // Render any pending line content
         if !self.line_buf.is_empty() {
             // Handle newline-like behavior for pending content
@@ -769,7 +888,8 @@ impl MarkdownStreamRenderer {
         let state = std::mem::replace(&mut self.table_state, TableState::None);
         match state {
             TableState::None => {
-                if !self.in_code_block && is_table_row_candidate(line) && !is_table_separator(line) {
+                if !self.in_code_block && is_table_row_candidate(line) && !is_table_separator(line)
+                {
                     let mut out = String::new();
                     if !self.bol {
                         out.push('\n');
@@ -2274,7 +2394,7 @@ mod tests {
         // Write 15 characters, should wrap to 2 lines
         let _ = renderer.write_chunk("123456789012345");
         assert_eq!(renderer.line_preview_height, 2);
-        
+
         // Write 6 more characters, total 21, should wrap to 3 lines
         let _ = renderer.write_chunk("678901");
         assert_eq!(renderer.line_preview_height, 3);
@@ -2283,15 +2403,15 @@ mod tests {
     #[test]
     fn test_pending_header_restore() {
         let mut renderer = MarkdownStreamRenderer::new_with_tty(false); // No TTY to simplify output
-        
+
         // This line looks like a table header
-        let out1 = renderer.consume_line("| Header A | Header B |", false);
+        let _ = renderer.consume_line("| Header A | Header B |", false);
         // It should be stored in PendingHeader, not rendered yet (if we want to be strict, but actually it is rendered as preview)
         // In non-TTY mode, it is rendered immediately by consume_line
-        
+
         // Now a line that is NOT a separator
-        let out2 = renderer.consume_line("Not a separator", false);
-        
+        let _ = renderer.consume_line("Not a separator", false);
+
         // // The total output should contain both lines
         // assert!(out1.contains("| Header A | Header B |"));
         // assert!(out2.contains("Not a separator"));

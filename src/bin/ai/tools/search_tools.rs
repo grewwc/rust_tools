@@ -107,11 +107,7 @@ pub(crate) fn execute_list_directory(args: &Value) -> Result<String, String> {
         .map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if is_dir {
-                format!("{}/", name)
-            } else {
-                name
-            }
+            if is_dir { format!("{}/", name) } else { name }
         })
         .collect();
 
@@ -125,11 +121,7 @@ pub(crate) fn execute_search_files(args: &Value) -> Result<String, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {}", e))?;
     let base_dir = {
         let p = PathBuf::from(path);
-        if p.is_absolute() {
-            p
-        } else {
-            cwd.join(p)
-        }
+        if p.is_absolute() { p } else { cwd.join(p) }
     };
 
     let is_exact_name = !pattern.contains('/')
@@ -154,18 +146,14 @@ pub(crate) fn execute_search_files(args: &Value) -> Result<String, String> {
         return Ok(String::new());
     }
 
-    let matches = crate::terminalw::glob_paths(pattern, path)
-        .map_err(|e| format!("glob failed: {e}"))?;
+    let matches =
+        crate::terminalw::glob_paths(pattern, path).map_err(|e| format!("glob failed: {e}"))?;
     let out: Vec<String> = matches
         .into_iter()
         .filter(|s| !s.trim().is_empty())
         .map(|s| {
             let p = PathBuf::from(s.trim());
-            let abs = if p.is_absolute() {
-                p
-            } else {
-                base_dir.join(p)
-            };
+            let abs = if p.is_absolute() { p } else { base_dir.join(p) };
             let abs = fs::canonicalize(&abs).unwrap_or(abs);
             abs.to_string_lossy().to_string()
         })
