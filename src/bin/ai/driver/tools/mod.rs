@@ -1,7 +1,7 @@
 use colored::Colorize;
 use serde_json::{Value, json};
 use std::error::Error;
-use std::collections::HashMap;
+use rust_tools::commonw::FastMap;
 use std::sync::{LazyLock, Mutex};
 
 use crate::ai::{
@@ -14,8 +14,8 @@ use crate::commonw::prompt::prompt_yes_or_no_interruptible;
 mod barrier;
 mod oauth;
 
-static TOOL_FAILURES: LazyLock<Mutex<HashMap<String, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static TOOL_FAILURES: LazyLock<Mutex<FastMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(FastMap::default()));
 
 #[derive(Debug, Clone)]
 enum ToolRoute {

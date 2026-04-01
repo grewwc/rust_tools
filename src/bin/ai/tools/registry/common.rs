@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rust_tools::commonw::FastMap;
 use std::sync::LazyLock;
 
 use rust_tools::cw::SkipMap;
@@ -23,8 +23,8 @@ pub(crate) struct ToolRegistration {
 
 inventory::collect!(ToolRegistration);
 
-static TOOL_INDEX: LazyLock<HashMap<&'static str, &'static ToolSpec>> = LazyLock::new(|| {
-    let mut index: HashMap<&'static str, &'static ToolSpec> = HashMap::new();
+static TOOL_INDEX: LazyLock<FastMap<&'static str, &'static ToolSpec>> = LazyLock::new(|| {
+    let mut index: FastMap<&'static str, &'static ToolSpec> = FastMap::default();
     for reg in inventory::iter::<ToolRegistration> {
         index.entry(reg.spec.name).or_insert(&reg.spec);
     }

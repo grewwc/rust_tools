@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipSet;
 use crate::commonw::utils::expanduser;
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -16,9 +18,9 @@ pub struct ModelDef {
 
 static USER_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_user_models);
 static BUILTIN_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_builtin_models);
-static USER_BY_NAME: LazyLock<std::collections::HashMap<String, usize>> =
+static USER_BY_NAME: LazyLock<FastMap<String, usize>> =
     LazyLock::new(build_user_name_index);
-static BUILTIN_BY_NAME: LazyLock<std::collections::HashMap<String, usize>> =
+static BUILTIN_BY_NAME: LazyLock<FastMap<String, usize>> =
     LazyLock::new(build_builtin_name_index);
 
 fn user_config_path() -> PathBuf {
@@ -72,24 +74,24 @@ fn load_builtin_models() -> Vec<ModelDef> {
     })
 }
 
-fn build_user_name_index() -> std::collections::HashMap<String, usize> {
-    let mut index = std::collections::HashMap::new();
+fn build_user_name_index() -> FastMap<String, usize> {
+    let mut index = FastMap::default();
     for (i, m) in USER_MODELS.iter().enumerate() {
-        index.insert(m.name.to_lowercase(), i);
+        index.insert(m.name.clone().to_lowercase(), i);
     }
     index
 }
 
-fn build_builtin_name_index() -> std::collections::HashMap<String, usize> {
-    let mut index = std::collections::HashMap::new();
+fn build_builtin_name_index() -> FastMap<String, usize> {
+    let mut index = FastMap::default();
     for (i, m) in BUILTIN_MODELS.iter().enumerate() {
-        index.insert(m.name.to_lowercase(), i);
+        index.insert(m.name.clone().to_lowercase(), i);
     }
     index
 }
 
 pub fn all() -> Vec<&'static ModelDef> {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = SkipSet::new(16);
     let mut result = Vec::new();
 
     for m in USER_MODELS.iter() {

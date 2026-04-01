@@ -5,7 +5,7 @@
 /// 2. 如果过期，重新检索并更新
 /// 3. 根据知识类型决定更新策略
 
-use std::collections::HashMap;
+use rust_tools::commonw::FastMap;
 use serde_json::Value;
 use crate::ai::tools::storage::knowledge_cache::{
     SessionKnowledgeCache, CachedKnowledge, KnowledgeType, make_cache_key
@@ -28,7 +28,7 @@ use crate::ai::tools::storage::memory_store::MemoryStore;
 /// * `Err(String)` - 错误信息
 pub fn get_knowledge_with_cache(
     topic: &str,
-    context: &HashMap<String, String>,
+    context: &FastMap<String, String>,
     force_refresh: bool,
 ) -> Result<String, String> {
     let mut cache = SessionKnowledgeCache::new();
@@ -145,7 +145,7 @@ pub fn get_knowledge_with_cache(
 /// 为特定主题检索知识
 fn retrieve_knowledge_for_topic(
     topic: &str,
-    context: &HashMap<String, String>,
+    context: &FastMap<String, String>,
 ) -> Result<String, String> {
     let store = MemoryStore::from_env_or_config();
     
@@ -252,7 +252,7 @@ pub fn execute_knowledge_cache_manage(args: &Value) -> Result<String, String> {
             let topic = args["topic"].as_str()
                 .ok_or("topic is required for refresh action")?;
             
-            let mut context = HashMap::new();
+            let mut context = FastMap::default();
             if let Some(cat) = args["category"].as_str() {
                 context.insert("category".to_string(), cat.to_string());
             }
@@ -276,10 +276,10 @@ mod tests {
     
     #[test]
     fn test_cache_key_generation() {
-        let mut ctx1 = HashMap::new();
+        let mut ctx1 = FastMap::default();
         ctx1.insert("project".to_string(), "rust_tools".to_string());
         
-        let mut ctx2 = HashMap::new();
+        let mut ctx2 = FastMap::default();
         ctx2.insert("project".to_string(), "rust_tools".to_string());
         
         // 相同的上下文应该生成相同的键

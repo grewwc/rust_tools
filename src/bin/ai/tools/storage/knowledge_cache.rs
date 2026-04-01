@@ -8,7 +8,7 @@
 /// 3. 每次会话开始时检查缓存是否过期
 /// 4. 如果过期，重新检索并更新缓存
 
-use std::collections::HashMap;
+use rust_tools::commonw::FastMap;
 use std::time::{SystemTime, Duration, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use crate::commonw::utils::get_config_dir;
@@ -27,7 +27,7 @@ pub struct CachedKnowledge {
     /// 知识类型（旧版，保留兼容）
     pub knowledge_type: KnowledgeType,
     /// 关联的上下文（如项目路径、文件列表等）
-    pub context: HashMap<String, String>,
+    pub context: FastMap<String, String>,
     /// 文件指纹（用于检测实际变化，仅 FileBased 类型）
     pub fingerprint: Option<KnowledgeFingerprint>,
     /// 知识元数据（新版，包含验证策略）
@@ -96,7 +96,7 @@ impl CachedKnowledge {
     pub fn new(
         content: String,
         knowledge_type: KnowledgeType,
-        context: HashMap<String, String>,
+        context: FastMap<String, String>,
     ) -> Self {
         let ttl = knowledge_type.default_ttl();
         Self {
@@ -117,7 +117,7 @@ impl CachedKnowledge {
     pub fn new_with_fingerprint(
         content: String,
         knowledge_type: KnowledgeType,
-        context: HashMap<String, String>,
+        context: FastMap<String, String>,
         fingerprint: KnowledgeFingerprint,
     ) -> Self {
         let ttl = knowledge_type.default_ttl();
@@ -353,7 +353,7 @@ impl CachedKnowledge {
 /// 会话知识缓存管理器
 pub struct SessionKnowledgeCache {
     /// 缓存的知识
-    cache: HashMap<String, CachedKnowledge>,
+    cache: FastMap<String, CachedKnowledge>,
     /// 缓存配置文件路径
     cache_file: std::path::PathBuf,
 }
@@ -366,7 +366,7 @@ impl SessionKnowledgeCache {
             .join("knowledge_cache.json");
         
         Self {
-            cache: HashMap::new(),
+            cache: FastMap::default(),
             cache_file,
         }
     }
@@ -380,7 +380,7 @@ impl SessionKnowledgeCache {
         let content = std::fs::read_to_string(&self.cache_file)
             .map_err(|e| format!("Failed to read cache file: {}", e))?;
         
-        let cache: HashMap<String, CachedKnowledge> = serde_json::from_str(&content)
+        let cache: FastMap<String, CachedKnowledge> = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse cache file: {}", e))?;
         
         // 过滤掉过期的条目
@@ -475,7 +475,7 @@ impl Default for SessionKnowledgeCache {
 }
 
 /// 生成缓存键
-pub fn make_cache_key(topic: &str, context: &HashMap<String, String>) -> String {
+pub fn make_cache_key(topic: &str, context: &FastMap<String, String>) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     
@@ -496,7 +496,7 @@ pub fn make_cache_key(topic: &str, context: &HashMap<String, String>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use rust_tools::commonw::FastMap;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
     use crate::ai::tools::storage::knowledge_fingerprint::KnowledgeFingerprint;
@@ -510,7 +510,7 @@ mod tests {
     
     #[test]
     fn test_cache_expiry() {
-        let mut context = HashMap::new();
+        let mut context = FastMap::default();
         context.insert("project".to_string(), "rust_tools".to_string());
         
         let knowledge = CachedKnowledge::new(
@@ -532,9 +532,9 @@ mod tests {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::write(&file, "a").unwrap();
-        let mut fp = KnowledgeFingerprint::new(&HashMap::new());
+        let mut fp = KnowledgeFingerprint::new(&FastMap::default());
         fp.add_file(&file, true).unwrap();
-        let metadata = KnowledgeMetadata::new(NewKnowledgeType::FileBased, HashMap::new(), Some("file".to_string()));
+        let metadata = KnowledgeMetadata::new(NewKnowledgeType::FileBased, FastMap::default(), Some("file".to_string()));
         let ck = CachedKnowledge::new_with_metadata("x".to_string(), metadata, Some(fp));
         assert!(!ck.needs_refresh());
         fs::write(&file, "b").unwrap();
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_needs_refresh_time_range_expired() {
-        let mut md = create_time_sensitive_metadata("ts", HashMap::new(), Some(1));
+        let mut md = create_time_sensitive_metadata("ts", FastMap::default(), Some(1));
         if let ValidationStrategy::TimeRange { valid_from, valid_until } = &mut md.validation {
             *valid_from = 0;
             *valid_until = 0;
@@ -561,12 +561,12 @@ mod tests {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
         fs::write(&file, "a").unwrap();
-        let mut fp = KnowledgeFingerprint::new(&HashMap::new());
+        let mut fp = KnowledgeFingerprint::new(&FastMap::default());
         fp.add_file(&file, true).unwrap();
-        let metadata = KnowledgeMetadata::new(NewKnowledgeType::FileBased, HashMap::new(), Some("file".to_string()));
+        let metadata = KnowledgeMetadata::new(NewKnowledgeType::FileBased, FastMap::default(), Some("file".to_string()));
         let ck = CachedKnowledge::new_with_metadata("x".to_string(), metadata, Some(fp));
         let mut cache = SessionKnowledgeCache::new();
-        let key = make_cache_key("project_structure", &HashMap::new());
+        let key = make_cache_key("project_structure", &FastMap::default());
         cache.set(key.clone(), ck);
         fs::write(&file, "b").unwrap();
         assert!(cache.needs_refresh(&key));

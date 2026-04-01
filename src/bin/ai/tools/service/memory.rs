@@ -2,6 +2,7 @@ use chrono::{DateTime, Local, Utc};
 use std::io::{BufRead, Write};
 use serde_json::Value;
 use uuid::Uuid;
+use rust_tools::commonw::FastSet;
 
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 
@@ -413,7 +414,6 @@ fn parse_rfc3339_ts(s: &str) -> Option<DateTime<Utc>> {
 }
 
 pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
-    use std::collections::HashSet;
     let store = MemoryStore::from_env_or_config();
     let path = store.path().to_path_buf();
     super::super::storage::with_memory_file_lock(&path, || {
@@ -424,7 +424,7 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
         if entries.is_empty() {
             return Ok("No entries".to_string());
         }
-        let mut seen: HashSet<(String, String, Vec<String>, Option<String>)> = HashSet::new();
+        let mut seen: FastSet<(String, String, Vec<String>, Option<String>)> = FastSet::default();
         let mut deduped: Vec<AgentMemoryEntry> = Vec::with_capacity(entries.len());
         for e in entries.into_iter().rev() {
             let key = (

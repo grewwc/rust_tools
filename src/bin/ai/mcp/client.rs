@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     io::BufReader,
     process::{Command, Stdio},
     sync::{
@@ -9,6 +8,7 @@ use std::{
 };
 
 use serde_json::{Value, json};
+use rust_tools::commonw::FastMap;
 
 use crate::ai::types::{
     FunctionDefinition, McpPrompt, McpResource, McpServerConfig, McpTool, ToolDefinition,
@@ -22,7 +22,7 @@ use super::{
 type ServerId = String;
 
 pub(in crate::ai) struct McpClient {
-    servers: HashMap<ServerId, Mutex<McpServerConnection>>,
+    servers: FastMap<ServerId, Mutex<McpServerConnection>>,
     next_id: AtomicU64,
     cached_tool_definitions: Vec<ToolDefinition>,
     cached_resources: Vec<(String, McpResource)>,
@@ -33,7 +33,7 @@ pub(in crate::ai) struct McpClient {
 impl McpClient {
     pub(in crate::ai) fn new() -> Self {
         Self {
-            servers: HashMap::new(),
+            servers: FastMap::default(),
             next_id: AtomicU64::new(1),
             cached_tool_definitions: Vec::new(),
             cached_resources: Vec::new(),

@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     fs::File,
     path::PathBuf,
     sync::{
@@ -9,6 +8,8 @@ use std::{
 };
 
 use reqwest::Client;
+use rust_tools::commonw::FastMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -82,7 +83,7 @@ pub(super) struct ToolResult {
 #[derive(Debug, Clone, Default)]
 pub(super) struct AgentContext {
     pub(super) tools: Vec<ToolDefinition>,
-    pub(super) mcp_servers: HashMap<String, McpServerConfig>,
+    pub(super) mcp_servers: FastMap<String, McpServerConfig>,
     pub(super) max_iterations: usize,
 }
 
@@ -92,7 +93,7 @@ pub(super) struct McpServerConfig {
     #[serde(default)]
     pub(super) args: Vec<String>,
     #[serde(default)]
-    pub(super) env: HashMap<String, String>,
+    pub(super) env: FastMap<String, String>,
     #[serde(default = "default_mcp_request_timeout_ms")]
     pub(super) request_timeout_ms: u64,
     #[serde(default)]

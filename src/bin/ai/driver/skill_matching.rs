@@ -1,6 +1,6 @@
 use crate::ai::skills::SkillManifest;
 use rust_tools::cw::SkipSet;
-use std::collections::HashMap;
+use rust_tools::commonw::FastMap;
 
 pub use super::intent_recognition::{CoreIntent, UserIntent};
 
@@ -240,8 +240,8 @@ fn extract_meaningful_phrases(text: &str) -> SkipSet<String> {
 }
 
 /// 提取关键词并计算 IDF 权重
-fn extract_keywords(text: &str) -> HashMap<String, f64> {
-    let mut keywords = HashMap::new();
+fn extract_keywords(text: &str) -> FastMap<String, f64> {
+    let mut keywords = FastMap::default();
 
     // 英文关键词
     for word in text.split_whitespace() {

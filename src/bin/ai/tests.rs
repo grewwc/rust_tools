@@ -7,7 +7,8 @@ use super::{
     files,
     history::{
         COLON, MAX_HISTORY_TURNS, Message, NEWLINE, SessionStore, append_history,
-        append_history_messages, build_message_arr, compress_messages_for_context,
+        append_history_messages, build_context_history, build_message_arr,
+        compress_messages_for_context,
     },
     models,
     prompt::MultilineHistoryState,
@@ -381,6 +382,64 @@ fn history_compacts_old_turns_into_summary() {
         );
         let _ = std::fs::remove_file(path);
     }
+}
+
+#[test]
+fn context_history_summarizes_beyond_history_count_instead_of_dropping() {
+    let path = std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
+
+    for i in 0..240 {
+        append_history_messages(
+            &path,
+            &[
+                Message {
+                    role: "user".to_string(),
+                    content: Value::String(format!("question-{i}")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: Value::String(format!("answer-{i}")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+        )
+        .unwrap();
+    }
+
+    let context = build_context_history(
+        32,
+        &path,
+        6000,
+        32,
+        2000,
+    )
+    .unwrap();
+
+    assert!(!context.is_empty());
+    assert_eq!(context.first().unwrap().role, "system");
+    assert!(
+        context
+            .first()
+            .and_then(|m| m.content.as_str())
+            .unwrap_or_default()
+            .contains("摘要")
+    );
+    assert_eq!(
+        context
+            .iter()
+            .filter(|m| m.role == "user")
+            .count(),
+        16
+    );
+    assert_eq!(
+        context.last().unwrap().content,
+        Value::String("answer-239".to_string())
+    );
+
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]

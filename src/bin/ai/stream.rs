@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use rust_tools::commonw::FastMap;
+
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ pub(super) async fn stream_response(
     let mut thinking_open = false;
     let _hidden_open = false;
     let mut markdown = MarkdownStreamRenderer::new();
-    let mut tool_calls_map: HashMap<usize, ToolCallBuilder> = HashMap::new();
+    let mut tool_calls_map: FastMap<usize, ToolCallBuilder> = FastMap::default();
     let mut assistant_text = String::new();
     let mut hidden_meta = String::new();
     let mut hidden_open = false;
@@ -255,7 +256,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     end_thinking_tag: &str,
     thinking_open: &mut bool,
     markdown: &mut MarkdownStreamRenderer,
-    tool_calls_map: &mut HashMap<usize, ToolCallBuilder>,
+    tool_calls_map: &mut FastMap<usize, ToolCallBuilder>,
     assistant_text: &mut String,
     decode_error_count: &mut usize,
     err: E,
@@ -297,7 +298,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     Some(StreamResult {
         outcome: StreamOutcome::Completed,
         tool_calls: tool_calls_map.drain().map(|(_, b)| b.build()).collect(),
-        assistant_text: assistant_text.clone(),
+        assistant_text: std::mem::take(assistant_text),
         hidden_meta: String::new(),
     })
 }
@@ -309,7 +310,7 @@ fn process_stream_line(
     end_thinking_tag: &str,
     thinking_open: &mut bool,
     markdown: &mut MarkdownStreamRenderer,
-    tool_calls_map: &mut HashMap<usize, ToolCallBuilder>,
+    tool_calls_map: &mut FastMap<usize, ToolCallBuilder>,
     assistant_text: &mut String,
     hidden_meta: &mut String,
     hidden_begin: &str,
@@ -369,13 +370,13 @@ fn process_stream_line(
             }
 
             if !stream_tool_call.id.is_empty() {
-                builder.id = stream_tool_call.id.clone();
+                builder.id.clone_from(&stream_tool_call.id);
             }
             if !stream_tool_call.tool_type.is_empty() {
-                builder.tool_type = stream_tool_call.tool_type.clone();
+                builder.tool_type.clone_from(&stream_tool_call.tool_type);
             }
             if !stream_tool_call.function.name.is_empty() {
-                builder.function_name = stream_tool_call.function.name.clone();
+                builder.function_name.clone_from(&stream_tool_call.function.name);
             }
             builder
                 .arguments

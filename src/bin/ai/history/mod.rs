@@ -27,14 +27,25 @@ pub(in crate::ai) fn build_context_history(
     history_keep_last: usize,
     history_summary_max_chars: usize,
 ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
-    let history = build_message_arr(history_count, history_file)?;
+    // Load full session history first, then apply context-size compression.
+    // This avoids dropping old turns before compression has a chance to summarize them.
+    let history = build_message_arr(usize::MAX, history_file)?;
     let out = if history_max_chars == 0 {
-        history
+        if history_count >= history.len() {
+            history
+        } else {
+            history[history.len() - history_count..].to_vec()
+        }
     } else {
+        let keep_last = if history_count == 0 {
+            history_keep_last
+        } else {
+            history_count
+        };
         compress_messages_for_context(
             history,
             history_max_chars,
-            history_keep_last,
+            keep_last,
             history_summary_max_chars,
         )
     };

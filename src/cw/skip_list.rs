@@ -3,21 +3,13 @@ use std::marker::PhantomData;
 use std::ptr;
 use std::sync::Mutex;
 
-struct Skipnode<K, V>
-where
-    K: Clone,
-    V: Clone,
-{
+struct Skipnode<K, V> {
     k: std::mem::MaybeUninit<K>,
     v: std::mem::MaybeUninit<V>,
     forward: Vec<*mut Skipnode<K, V>>,
 }
 
-impl<K, V> Skipnode<K, V>
-where
-    K: Clone,
-    V: Clone,
-{
+impl<K, V> Skipnode<K, V> {
     fn new(k: K, v: V, max_height: usize) -> *mut Self {
         let ret = Box::new(Skipnode {
             k: std::mem::MaybeUninit::new(k),
@@ -28,15 +20,11 @@ where
     }
 }
 
-pub struct SkipMap<K, V>
-where
-    K: Clone,
-    V: Clone,
-{
+pub struct SkipMap<K, V> {
     head: Skipnode<K, V>,
     max_height: usize,
     len: usize,
-    cmp: Box<dyn Fn(&K, &K) -> i32 + Send + Sync>,
+    cmp: fn(&K, &K) -> i32,
 
     rng: Mutex<StdRng>,
 }
@@ -44,14 +32,10 @@ where
 // 安全地实现 Send + Sync
 // SkipMap 内部使用裸指针，但如果 K 和 V 是 Send + Sync，且所有操作通过 &mut self 进行，
 // 那么可以安全地实现 Send + Sync
-unsafe impl<K: Clone + Send, V: Clone + Send> Send for SkipMap<K, V> {}
-unsafe impl<K: Clone + Send + Sync, V: Clone + Send + Sync> Sync for SkipMap<K, V> {}
+unsafe impl<K: Send, V: Send> Send for SkipMap<K, V> {}
+unsafe impl<K: Send + Sync, V: Send + Sync> Sync for SkipMap<K, V> {}
 
-impl<K, V> SkipMap<K, V>
-where
-    K: Clone,
-    V: Clone,
-{
+impl<K, V> SkipMap<K, V> {
     unsafe fn free_chain(mut curr: *mut Skipnode<K, V>) {
         while !curr.is_null() {
             let next = unsafe { (&*curr).forward[0] };
@@ -62,10 +46,7 @@ where
         }
     }
 
-    pub fn new(
-        max_height: usize,
-        cmp: impl Fn(&K, &K) -> i32 + Send + Sync + 'static,
-    ) -> Box<Self> {
+    pub fn new(max_height: usize, cmp: fn(&K, &K) -> i32) -> Box<Self> {
         // 使用随机种子创建 StdRng
         let seed: [u8; 32] = rand::random();
         let ret = Box::new(SkipMap {
@@ -76,7 +57,7 @@ where
             },
             max_height,
             len: 0,
-            cmp: Box::new(cmp),
+            cmp,
             rng: Mutex::new(StdRng::from_seed(seed)),
         });
         ret
@@ -85,7 +66,7 @@ where
     pub fn insert(&mut self, k: K, v: V) {
         let level = self.level().min(self.max_height - 1);
         unsafe {
-            let (updates, found) = self.find(&k.clone(), level);
+            let (updates, found) = self.find(&k, level);
             let found = found as *mut Skipnode<K, V>;
             if !found.is_null() {
                 (&mut *found).v.write(v);
@@ -117,7 +98,10 @@ where
         Some(unsafe { (&*found).v.assume_init_ref() })
     }
 
-    pub fn get(&self, k: &K) -> Option<V> {
+    pub fn get(&self, k: &K) -> Option<V>
+    where
+        V: Clone,
+    {
         self.get_ref(k).cloned()
     }
 
@@ -134,7 +118,7 @@ where
         let end = r.end;
         let mut prev = &self.head as *const Skipnode<K, V>;
         let mut ret = vec![];
-        let f = self.cmp.as_ref();
+        let f = self.cmp;
         unsafe {
             for i in (0..self.max_height).rev() {
                 let mut curr = *(&*prev).forward.get_unchecked(i);
@@ -197,11 +181,7 @@ where
     }
 }
 
-impl<K, V> Drop for SkipMap<K, V>
-where
-    K: Clone,
-    V: Clone,
-{
+impl<K, V> Drop for SkipMap<K, V> {
     fn drop(&mut self) {
         let first = self
             .head
@@ -215,20 +195,12 @@ where
     }
 }
 
-pub struct SkipListIter<'a, K, V>
-where
-    K: Clone,
-    V: Clone,
-{
+pub struct SkipListIter<'a, K, V> {
     curr: *mut Skipnode<K, V>,
     _marker: PhantomData<&'a SkipMap<K, V>>,
 }
 
-impl<'a, K, V> IntoIterator for &'a SkipMap<K, V>
-where
-    K: Clone,
-    V: Clone,
-{
+impl<'a, K, V> IntoIterator for &'a SkipMap<K, V> {
     type Item = (&'a K, &'a V);
 
     type IntoIter = SkipListIter<'a, K, V>;
@@ -242,11 +214,7 @@ where
     }
 }
 
-impl<'a, K, V> Iterator for SkipListIter<'a, K, V>
-where
-    K: Clone,
-    V: Clone,
-{
+impl<'a, K, V> Iterator for SkipListIter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -261,13 +229,9 @@ where
     }
 }
 
-impl<K, V> SkipMap<K, V>
-where
-    K: Clone,
-    V: Clone,
-{
+impl<K, V> SkipMap<K, V> {
     fn find(&self, k: &K, level: usize) -> (Vec<*const Skipnode<K, V>>, *const Skipnode<K, V>) {
-        let f: &dyn Fn(&K, &K) -> i32 = self.cmp.as_ref();
+        let f = self.cmp;
         unsafe {
             let mut updates = vec![ptr::null(); level + 1];
             let mut prev = &self.head as *const Skipnode<K, V>;
@@ -308,18 +272,18 @@ where
 
 pub struct SkipSet<T>
 where
-    T: Clone + Ord + 'static,
+    T: Ord,
 {
     inner: Box<SkipMap<T, ()>>,
 }
 
 // SkipSet 的 Send + Sync 实现
-unsafe impl<T: Clone + Ord + Send> Send for SkipSet<T> {}
-unsafe impl<T: Clone + Ord + Send + Sync> Sync for SkipSet<T> {}
+unsafe impl<T: Ord + Send> Send for SkipSet<T> {}
+unsafe impl<T: Ord + Send + Sync> Sync for SkipSet<T> {}
 
 impl<T> SkipSet<T>
 where
-    T: Clone + Ord + 'static,
+    T: Ord,
 {
     pub fn new(max_height: usize) -> Self {
         Self {
@@ -367,9 +331,11 @@ where
         (&*self.inner).into_iter().map(|(k, _)| k)
     }
 
-    pub fn to_vec(&self) -> Vec<T> {
-        let ret = self.iter().cloned().collect();
-        return ret;
+    pub fn to_vec(&self) -> Vec<T>
+    where
+        T: Clone,
+    {
+        self.iter().cloned().collect()
     }
 }
 

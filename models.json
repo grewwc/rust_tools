@@ -29,7 +29,7 @@
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
-    "enable_thinking": false
+    "enable_thinking": true
   },
   {
     "key": "QWEN_CODER_PLUS_LATEST",
@@ -37,7 +37,7 @@
     "is_vl": false,
     "search_enabled": false,
     "tools_default_enabled": true,
-    "enable_thinking": false
+    "enable_thinking": true
   },
   {
     "key": "KIMI",

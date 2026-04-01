@@ -4,6 +4,7 @@
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use rust_tools::commonw::FastMap;
 use std::sync::{Arc, Mutex};
 
 /// 决策类型
@@ -197,10 +198,10 @@ impl DecisionLogStore {
         }).count();
         let failures = total - successes;
         
-        let by_type: std::collections::HashMap<String, usize> = logs
+        let by_type: FastMap<String, usize> = logs
             .iter()
             .map(|log| format!("{:?}", log.decision_type))
-            .fold(std::collections::HashMap::new(), |mut acc, t| {
+            .fold(FastMap::default(), |mut acc, t| {
                 *acc.entry(t).or_insert(0) += 1;
                 acc
             });
@@ -248,7 +249,7 @@ pub struct DecisionStats {
     pub successes: usize,
     pub failures: usize,
     pub success_rate: f64,
-    pub by_type: std::collections::HashMap<String, usize>,
+    pub by_type: FastMap<String, usize>,
     pub avg_confidence: f64,
     pub avg_execution_time_ms: f64,
 }

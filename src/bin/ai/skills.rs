@@ -54,17 +54,14 @@ pub(super) struct SkillManifest {
 impl SkillManifest {
     /// 构建系统提示词
     pub(super) fn build_system_prompt(&self) -> String {
-        let mut prompt = if let Some(sys) = &self.system_prompt {
-            sys.clone()
-        } else {
-            String::new()
-        };
+        let mut prompt = self.system_prompt.clone().unwrap_or_default();
 
         if !self.prompt.is_empty() {
             if !prompt.is_empty() {
                 prompt.push_str("\n\n");
             }
-            prompt.push_str(&self.prompt);
+            // Avoid extra clone when prompt is already allocated
+            prompt.push_str(self.prompt.as_str());
         }
 
         prompt

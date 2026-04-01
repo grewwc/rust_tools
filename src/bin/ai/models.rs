@@ -38,10 +38,7 @@ fn vl_model_names() -> Vec<String> {
 }
 
 fn default_model() -> String {
-    model_names::all()
-        .first()
-        .map(|m| m.name.clone())
-        .unwrap_or_else(|| {
+    model_names::all().first().map(|m| m.name.as_str().to_owned()).unwrap_or_else(|| {
             eprintln!("[model_names] models.json is empty");
             std::process::exit(1);
         })
@@ -51,13 +48,13 @@ fn default_vl_model() -> String {
     model_names::all()
         .iter()
         .find(|m| m.is_vl)
-        .map(|m| m.name.clone())
+        .map(|m| m.name.as_str().to_owned())
         .unwrap_or_else(default_model)
 }
 
 pub(super) fn forced_deepseek_model() -> String {
     model_names::find_by_key("DEEPSEEK_V3")
-        .map(|m| m.name.clone())
+        .map(|m| m.name.as_str().to_owned())
         .unwrap_or_else(default_model)
 }
 
@@ -91,7 +88,7 @@ pub(super) fn determine_vl_model(model: &str) -> String {
         let all = model_names::all();
         let vl = all.iter().filter(|m| m.is_vl).nth(idx);
         if let Some(vl) = vl {
-            return vl.name.clone();
+            return vl.name.as_str().to_owned();
         }
         return default_vl_model();
     }
@@ -99,7 +96,7 @@ pub(super) fn determine_vl_model(model: &str) -> String {
     if let Some(def) = model_names::find_by_name(&model)
         && def.is_vl
     {
-        return def.name.clone();
+        return def.name.as_str().to_owned();
     }
 
     best_match_model_name(&model, vl_model_names().into_iter(), default_vl_model())

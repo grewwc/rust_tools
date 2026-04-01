@@ -173,12 +173,13 @@ impl MemoryStore {
             return Ok(Vec::new());
         }
         let nq_tokens = expand_tokens(&tokenize(&query_lc));
-        use std::collections::{HashMap, HashSet};
-        let mut df: HashMap<String, usize> = HashMap::new();
+        use rust_tools::commonw::FastMap;
+        use rust_tools::commonw::FastSet;
+        let mut df: FastMap<String, usize> = FastMap::default();
         let mut avgdl = 0.0f64;
         for (_, _, toks) in &docs {
             avgdl += toks.len() as f64;
-            let mut set = HashSet::new();
+            let mut set = FastSet::default();
             for t in toks {
                 if set.insert(t) {
                     *df.entry(t.clone()).or_insert(0) += 1;
@@ -192,13 +193,13 @@ impl MemoryStore {
         let mut scored: Vec<(f64, usize)> = Vec::with_capacity(docs.len());
         let mut bm25_vals: Vec<f64> = Vec::with_capacity(docs.len());
         for (idx, (entry, _full, toks)) in docs.iter().enumerate() {
-            let mut tf: HashMap<&str, usize> = HashMap::new();
+            let mut tf: FastMap<&str, usize> = FastMap::default();
             for t in toks {
                 *tf.entry(t.as_str()).or_insert(0) += 1;
             }
             let mut bm25 = 0.0f64;
             let dl = toks.len() as f64;
-            let mut seenq = HashSet::new();
+            let mut seenq = FastSet::default();
             for qt in &nq_tokens {
                 if !seenq.insert(qt) {
                     continue;
@@ -387,9 +388,9 @@ fn dice_coefficient(a: &[(char, char)], b: &[(char, char)]) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
-    use std::collections::HashMap;
+    use rust_tools::commonw::FastMap;
     let mut count = 0usize;
-    let mut map: HashMap<(char, char), usize> = HashMap::new();
+    let mut map: FastMap<(char, char), usize> = FastMap::default();
     for x in a {
         *map.entry(*x).or_insert(0) += 1;
     }
@@ -465,8 +466,8 @@ fn synonyms_for(token: &str) -> Vec<&'static str> {
 
 fn expand_tokens(tokens: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(tokens.len() * 2);
-    use std::collections::HashSet;
-    let mut seen: HashSet<String> = HashSet::new();
+    use rust_tools::commonw::FastSet;
+    let mut seen: FastSet<String> = FastSet::default();
     for t in tokens {
         let tnorm = t.to_lowercase();
         if seen.insert(tnorm.clone()) {
@@ -486,15 +487,16 @@ fn jaccard(a: &[String], b: &[String]) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
+    // 手动计算 Jaccard 相似度（不使用 SkipSet，避免生命周期问题）
     use std::collections::HashSet;
     let sa: HashSet<&String> = a.iter().collect();
     let sb: HashSet<&String> = b.iter().collect();
     let inter = sa.intersection(&sb).count() as f64;
-    let uni = sa.union(&sb).count() as f64;
-    if uni == 0.0 {
+    let union = sa.union(&sb).count() as f64;
+    if union == 0.0 {
         0.0
     } else {
-        inter / uni
+        inter / union as f64
     }
 }
 
@@ -502,6 +504,7 @@ fn char_overlap(a: &str, b: &str) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
+    // 手动计算字符重叠度（不使用 SkipSet，避免 FromIterator 问题）
     use std::collections::HashSet;
     let sa: HashSet<char> = a.chars().collect();
     let sb: HashSet<char> = b.chars().collect();
