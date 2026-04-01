@@ -2,10 +2,7 @@ use colored::Colorize;
 use serde_json::Value;
 
 use crate::ai::{
-    history::{Message, append_history_messages, build_context_history},
-    mcp::McpClient,
-    request, stream,
-    types::{App, StreamOutcome, StreamResult},
+    history::{Message, append_history_messages, build_context_history}, mcp::McpClient, request, stream, types::{App, StreamOutcome, StreamResult}
 };
 
 use super::{
@@ -49,6 +46,37 @@ pub(super) async fn run_turn(
         tool_calls: None,
         tool_call_id: None,
     });
+    {
+        let integrated = crate::commonw::configw::get_all_config()
+            .get_opt("ai.critic_revise.integrated")
+            .unwrap_or_else(|| "true".to_string())
+            .trim()
+            .ne("false");
+        let reflect_integrated = crate::commonw::configw::get_all_config()
+            .get_opt("ai.reflection.integrated")
+            .unwrap_or_else(|| "true".to_string())
+            .trim()
+            .ne("false");
+        if integrated || reflect_integrated {
+            let mut sys = String::new();
+            if integrated {
+                sys.push_str("Before replying, internally perform a brief CRITIC→REVISE pass to ensure correctness, missing steps, and clear structure. Do not output the critic. Output only the final improved answer.\n");
+            }
+            if reflect_integrated {
+                sys.push_str("At the very end of your message, include a compact self experience note enclosed within <meta:self_note> and </meta:self_note>. The note should be 2-6 short bullets grouped under 'Do:' and 'Avoid:'. Do not mention these tags in the visible content.\n");
+            }
+            if !sys.is_empty() {
+                messages.push(Message {
+                    role: "system".to_string(),
+                    content: Value::String(sys),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+        }
+    }
+    
+    
     if let Some(guidelines) = super::reflection::build_persistent_guidelines(&question, 1200) {
         if !guidelines.trim().is_empty() {
             messages.push(Message {
@@ -152,6 +180,7 @@ pub(super) async fn run_turn(
                     outcome: StreamOutcome::Completed,
                     tool_calls: Vec::new(),
                     assistant_text: "[响应解析失败，请重试]".to_string(),
+                    hidden_meta: String::new(),
                 }
             }
         };
@@ -185,6 +214,25 @@ pub(super) async fn run_turn(
             turn_messages.push(assistant_msg);
             final_assistant_text = stream_result.assistant_text;
             final_assistant_recorded = true;
+            if !stream_result.hidden_meta.trim().is_empty() {
+                let record = Message {
+                    role: "system".to_string(),
+                    content: Value::String(format!("self_note:\n{}", stream_result.hidden_meta.trim())),
+                    tool_calls: None,
+                    tool_call_id: None,
+                };
+                turn_messages.push(record);
+                let entry = crate::ai::tools::storage::memory_store::AgentMemoryEntry {
+                    timestamp: chrono::Local::now().to_rfc3339(),
+                    category: "self_note".to_string(),
+                    note: stream_result.hidden_meta.trim().to_string(),
+                    tags: vec!["agent".to_string(), "policy".to_string()],
+                    source: Some(format!("session:{}", app.session_id)),
+                };
+                let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
+                let _ = store.append(&entry);
+                store.maintain_after_append();
+            }
             break;
         }
 
@@ -251,30 +299,6 @@ pub(super) async fn run_turn(
     }
 
     if !final_assistant_text.trim().is_empty() {
-        if let Some((critic, revised)) =
-            super::reflection::maybe_critic_and_revise(app, &next_model, &question, &final_assistant_text).await
-        {
-            if let Some(last) = turn_messages.iter_mut().rev().find(|m| m.role == "assistant") {
-                last.content = Value::String(revised.clone());
-            } else {
-                turn_messages.push(Message {
-                    role: "assistant".to_string(),
-                    content: Value::String(revised.clone()),
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
-            }
-            turn_messages.push(Message {
-                role: "system".to_string(),
-                content: Value::String(format!("critic:\n{}", critic)),
-                tool_calls: None,
-                tool_call_id: None,
-            });
-            println!("\n{}", "[Revised]".yellow());
-            println!("{}", revised);
-            final_assistant_text = revised;
-            final_assistant_recorded = true;
-        }
         if !final_assistant_recorded {
             println!("\n{}", final_assistant_text.yellow());
             turn_messages.push(Message {
@@ -284,20 +308,50 @@ pub(super) async fn run_turn(
                 tool_call_id: None,
             });
         }
-        reflection::maybe_append_self_reflection(
-            app,
-            &next_model,
-            &question,
-            &final_assistant_text,
-            &mut turn_messages,
-        )
-        .await;
+        {
+            let integrated_reflect = crate::commonw::configw::get_all_config()
+                .get_opt("ai.reflection.integrated")
+                .unwrap_or_else(|| "true".to_string())
+                .trim()
+                .ne("false");
+            if !integrated_reflect {
+                reflection::maybe_append_self_reflection(
+                    app,
+                    &next_model,
+                    &question,
+                    &final_assistant_text,
+                    &mut turn_messages,
+                )
+                .await;
+            }
+        }
         if !one_shot_mode
             && let Err(e) = append_history_messages(&app.session_history_file, &turn_messages)
         {
             eprintln!("[Warning] Failed to save history: {}", e);
         }
         println!();
+        // Background Critic→Revise (fire-and-forget)
+        {
+            let integrated = crate::commonw::configw::get_all_config()
+                .get_opt("ai.critic_revise.integrated")
+                .unwrap_or_else(|| "true".to_string())
+                .trim()
+                .ne("false");
+            if integrated {
+                // skip background critic→revise when integrated into main turn
+            } else {
+            let path = app.session_history_file.clone();
+            let model_bg = crate::commonw::configw::get_all_config()
+                .get_opt("ai.critic_revise.model")
+                .unwrap_or_else(|| "qwen3.5-flash".to_string());
+            let q_bg = question.clone();
+            let a_bg = final_assistant_text.clone();
+            tokio::spawn(async move {
+                super::reflection::run_critic_revise_background(path, model_bg, q_bg, a_bg).await;
+            });
+            }
+        }
     } else {
         println!("{}", "(no response)".dimmed());
     }
@@ -308,3 +362,4 @@ pub(super) async fn run_turn(
         TurnOutcome::Continue
     })
 }
+

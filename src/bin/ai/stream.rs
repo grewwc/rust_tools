@@ -22,10 +22,17 @@ pub(super) async fn stream_response(
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
     let thinking_tag = "<thinking>".yellow().to_string();
     let end_thinking_tag = "<end thinking>".yellow().to_string();
+    let hidden_begin = "<meta:self_note>";
+    let hidden_end = "</meta:self_note>";
     let mut thinking_open = false;
+    let mut hidden_open = false;
     let mut markdown = MarkdownStreamRenderer::new();
     let mut tool_calls_map: HashMap<usize, ToolCallBuilder> = HashMap::new();
     let mut assistant_text = String::new();
+    let mut hidden_meta = String::new();
+    let mut hidden_open = false;
+    let mut hidden_begin_match: usize = 0;
+    let mut hidden_end_match: usize = 0;
     let mut internal_tool_call_idx: usize = 0;
 
     let mut printed_tool_calls_header = false;
@@ -41,6 +48,7 @@ pub(super) async fn stream_response(
                 outcome: StreamOutcome::Cancelled,
                 tool_calls: Vec::new(),
                 assistant_text: String::new(),
+                hidden_meta: String::new(),
             });
         }
 
@@ -51,6 +59,7 @@ pub(super) async fn stream_response(
                     outcome: StreamOutcome::Cancelled,
                     tool_calls: Vec::new(),
                     assistant_text: String::new(),
+                    hidden_meta: String::new(),
                 });
             }
         };
@@ -94,6 +103,12 @@ pub(super) async fn stream_response(
                         &mut markdown,
                         &mut tool_calls_map,
                         &mut assistant_text,
+                        &mut hidden_meta,
+                        hidden_begin,
+                        hidden_end,
+                        &mut hidden_open,
+                        &mut hidden_begin_match,
+                        &mut hidden_end_match,
                         &mut internal_tool_call_idx,
                         &mut printed_tool_calls_header,
                         &mut current_printing_index,
@@ -165,6 +180,12 @@ pub(super) async fn stream_response(
                 &mut markdown,
                 &mut tool_calls_map,
                 &mut assistant_text,
+                &mut hidden_meta,
+                hidden_begin,
+                hidden_end,
+                &mut hidden_open,
+                &mut hidden_begin_match,
+                &mut hidden_end_match,
                 &mut internal_tool_call_idx,
                 &mut printed_tool_calls_header,
                 &mut current_printing_index,
@@ -194,6 +215,7 @@ pub(super) async fn stream_response(
             outcome: StreamOutcome::Cancelled,
             tool_calls: Vec::new(),
             assistant_text: String::new(),
+            hidden_meta: String::new(),
         });
     }
 
@@ -212,6 +234,7 @@ pub(super) async fn stream_response(
         outcome,
         tool_calls,
         assistant_text,
+        hidden_meta,
     })
 }
 
@@ -247,6 +270,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
             outcome: StreamOutcome::Cancelled,
             tool_calls: Vec::new(),
             assistant_text: String::new(),
+            hidden_meta: String::new(),
         });
     }
 
@@ -272,6 +296,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         outcome: StreamOutcome::Completed,
         tool_calls: tool_calls_map.drain().map(|(_, b)| b.build()).collect(),
         assistant_text: assistant_text.clone(),
+        hidden_meta: String::new(),
     })
 }
 
@@ -284,6 +309,12 @@ fn process_stream_line(
     markdown: &mut MarkdownStreamRenderer,
     tool_calls_map: &mut HashMap<usize, ToolCallBuilder>,
     assistant_text: &mut String,
+    hidden_meta: &mut String,
+    hidden_begin: &str,
+    hidden_end: &str,
+    hidden_open: &mut bool,
+    hidden_begin_match: &mut usize,
+    hidden_end_match: &mut usize,
     internal_tool_call_idx: &mut usize,
     printed_tool_calls_header: &mut bool,
     current_printing_index: &mut Option<usize>,
@@ -365,8 +396,50 @@ fn process_stream_line(
         }
     }
 
-    let (content, internal_tool_calls) =
+    let (mut content, internal_tool_calls) =
         extract_chunk_text_with_tools(&chunk, thinking_tag, end_thinking_tag, thinking_open);
+
+    if !content.is_empty() {
+        let mut visible = String::with_capacity(content.len());
+        let hb: Vec<char> = hidden_begin.chars().collect();
+        let he: Vec<char> = hidden_end.chars().collect();
+        for ch in content.chars() {
+            if !*hidden_open {
+                if *hidden_begin_match < hb.len() && ch == hb[*hidden_begin_match] {
+                    *hidden_begin_match += 1;
+                    if *hidden_begin_match == hb.len() {
+                        *hidden_open = true;
+                        *hidden_begin_match = 0;
+                    }
+                } else {
+                    if *hidden_begin_match > 0 {
+                        for k in 0..*hidden_begin_match {
+                            visible.push(hb[k]);
+                        }
+                        *hidden_begin_match = 0;
+                    }
+                    visible.push(ch);
+                }
+            } else {
+                if *hidden_end_match < he.len() && ch == he[*hidden_end_match] {
+                    *hidden_end_match += 1;
+                    if *hidden_end_match == he.len() {
+                        *hidden_open = false;
+                        *hidden_end_match = 0;
+                    }
+                } else {
+                    if *hidden_end_match > 0 {
+                        for k in 0..*hidden_end_match {
+                            hidden_meta.push(he[k]);
+                        }
+                        *hidden_end_match = 0;
+                    }
+                    hidden_meta.push(ch);
+                }
+            }
+        }
+        content = visible;
+    }
 
     for tc in internal_tool_calls {
         let InternalToolCall {
@@ -1390,7 +1463,7 @@ fn is_table_separator(line: &str) -> bool {
         count += 1;
         let p = p.trim_matches(' ');
         let core = p.trim_matches(':');
-        if core.len() < 3 || !core.chars().all(|c| c == '-') {
+        if core.is_empty() || !core.chars().all(|c| c == '-') {
             return false;
         }
     }

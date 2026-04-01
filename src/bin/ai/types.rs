@@ -155,6 +155,7 @@ pub(super) struct StreamResult {
     pub(super) outcome: StreamOutcome,
     pub(super) tool_calls: Vec<ToolCall>,
     pub(super) assistant_text: String,
+    pub(super) hidden_meta: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -4,31 +4,46 @@ use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 use crate::ai::tools::service::memory::{
     execute_memory_append, execute_memory_dedup, execute_memory_gc, execute_memory_list_json,
     execute_memory_recent, execute_memory_rotate, execute_memory_search,
+    execute_memory_save,
 };
+use crate::ai::tools::service::knowledge_update::execute_knowledge_cache_manage;
 
 fn params_memory_append() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "note": {
+            "content": {
                 "type": "string",
-                "description": "Memory note text to store."
+                "description": "Content to append to memory."
+            }
+        },
+        "required": ["content"]
+    })
+}
+
+fn params_memory_save() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "Content to save to memory."
             },
             "category": {
                 "type": "string",
-                "description": "Category label for the note (default: \"general\")."
+                "description": "Category label (default: \"user_memory\")."
             },
             "tags": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Optional tags for later retrieval."
+                "description": "Optional tags for categorization."
             },
             "source": {
                 "type": "string",
-                "description": "Optional source/context string (e.g. URL, project name, ticket id)."
+                "description": "Optional source context (e.g. user command, project name)."
             }
         },
-        "required": ["note"]
+        "required": ["content"]
     })
 }
 
@@ -38,33 +53,15 @@ fn params_memory_search() -> Value {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Keyword query (case-insensitive) matched against note/category/tags/source."
+                "description": "Search query."
             },
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of results (1-50; default: 8)."
+                "description": "Max results (default: 10)."
             },
             "category": {
                 "type": "string",
-                "description": "Optional category filter (exact match)."
-            },
-            "tags_any": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional tags filter: any of these tags."
-            },
-            "tags_all": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Optional tags filter: all of these tags."
-            },
-            "source_substring": {
-                "type": "string",
-                "description": "Optional substring to match in source."
-            },
-            "debug_score": {
-                "type": "boolean",
-                "description": "If true, append a score line per entry for debugging ranking."
+                "description": "Filter by category."
             }
         },
         "required": ["query"]
@@ -77,16 +74,98 @@ fn params_memory_recent() -> Value {
         "properties": {
             "limit": {
                 "type": "integer",
-                "description": "Maximum number of entries to return (1-50; default: 8)."
+                "description": "Number of recent entries (default: 10, max: 50)."
             }
         }
+    })
+}
+
+fn params_memory_list_json() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "limit": {
+                "type": "integer",
+                "description": "Max entries (default: 100)."
+            }
+        }
+    })
+}
+
+fn params_memory_rotate() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "max_entries": {
+                "type": "integer",
+                "description": "Max entries to keep (default: 1000)."
+            }
+        }
+    })
+}
+
+fn params_memory_gc() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "older_than_days": {
+                "type": "integer",
+                "description": "Remove entries older than N days (default: 90)."
+            },
+            "dry_run": {
+                "type": "boolean",
+                "description": "If true, only report what would be removed."
+            }
+        }
+    })
+}
+
+fn params_memory_dedup() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "dry_run": {
+                "type": "boolean",
+                "description": "If true, only report duplicates."
+            }
+        }
+    })
+}
+
+fn params_knowledge_cache_manage() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "description": "Action: stats, clear_volatile, refresh",
+                "enum": ["stats", "clear_volatile", "refresh"]
+            },
+            "topic": {
+                "type": "string",
+                "description": "Topic to refresh (required for refresh action)."
+            },
+            "category": {
+                "type": "string",
+                "description": "Category for filtering."
+            },
+            "query": {
+                "type": "string",
+                "description": "Search query for refresh."
+            },
+            "limit": {
+                "type": "string",
+                "description": "Limit for refresh results."
+            }
+        },
+        "required": ["action"]
     })
 }
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "memory_append",
-        description: "Append a structured memory entry (timestamp/category/tags/source/note) to the agent memory store (JSONL).",
+        description: "Append content to the global memory store.",
         parameters: params_memory_append,
         execute: execute_memory_append,
         groups: &["builtin"],
@@ -95,8 +174,18 @@ inventory::submit!(ToolRegistration {
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
+        name: "memory_save",
+        description: "Save user-directed content to the global memory store with optional category and tags.",
+        parameters: params_memory_save,
+        execute: execute_memory_save,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
         name: "memory_search",
-        description: "Search the agent memory store for a keyword across note/category/tags/source and return recent matches.",
+        description: "Search memory entries by keyword.",
         parameters: params_memory_search,
         execute: execute_memory_search,
         groups: &["builtin"],
@@ -106,102 +195,59 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "memory_recent",
-        description: "Show the most recent entries from the agent memory store.",
+        description: "Get recent memory entries.",
         parameters: params_memory_recent,
         execute: execute_memory_recent,
         groups: &["builtin"],
     }
 });
 
-fn params_memory_list_json() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "limit": {
-                "type": "integer",
-                "description": "Maximum number of entries to return (1-200; default: 50)."
-            },
-            "offset": {
-                "type": "integer",
-                "description": "Skip the first N most recent entries (default: 0)."
-            }
-        }
-    })
-}
-
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "memory_list_json",
-        description: "Return recent memory entries as a JSON array (for programmatic use).",
+        description: "List memory entries as JSON.",
         parameters: params_memory_list_json,
         execute: execute_memory_list_json,
         groups: &["builtin"],
     }
 });
 
-fn params_memory_dedup() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {}
-    })
-}
-
-inventory::submit!(ToolRegistration {
-    spec: ToolSpec {
-        name: "memory_dedup",
-        description: "Deduplicate the memory file by (note,category,tags,source), keeping the most recent for each key.",
-        parameters: params_memory_dedup,
-        execute: execute_memory_dedup,
-        groups: &["builtin"],
-    }
-});
-
-fn params_memory_rotate() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "max_bytes": {
-                "type": "integer",
-                "description": "Rotate if file size exceeds this many bytes."
-            }
-        },
-        "required": ["max_bytes"]
-    })
-}
-
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "memory_rotate",
-        description: "Rotate the memory jsonl file if its size exceeds max_bytes; archive current file and create an empty one.",
+        description: "Rotate memory file to keep only recent entries.",
         parameters: params_memory_rotate,
         execute: execute_memory_rotate,
         groups: &["builtin"],
     }
 });
 
-fn params_memory_gc() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "max_days": {
-                "type": "integer",
-                "description": "Remove entries older than this number of days."
-            },
-            "min_keep": {
-                "type": "integer",
-                "description": "Keep at least this many recent entries even if older than max_days (default: 200)."
-            }
-        },
-        "required": ["max_days"]
-    })
-}
-
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "memory_gc",
-        description: "Garbage collect old memory entries: keep recent entries and drop entries older than max_days.",
+        description: "Garbage collect old memory entries.",
         parameters: params_memory_gc,
         execute: execute_memory_gc,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "memory_dedup",
+        description: "Remove duplicate memory entries.",
+        parameters: params_memory_dedup,
+        execute: execute_memory_dedup,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "knowledge_cache_manage",
+        description: "Manage knowledge cache: view stats, clear volatile cache, or force refresh.",
+        parameters: params_knowledge_cache_manage,
+        execute: execute_knowledge_cache_manage,
         groups: &["builtin"],
     }
 });

@@ -344,3 +344,40 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
         Ok("Dedup done".to_string())
     })
 }
+
+/// 用户主动保存记忆到全局 memory store
+pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
+    let content = args["content"].as_str().ok_or("Missing content")?.trim();
+    if content.is_empty() {
+        return Err("content is empty".to_string());
+    }
+    
+    let category = args["category"].as_str().unwrap_or("user_memory").trim();
+    let tags = args["tags"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["user_directed".to_string()]);
+    
+    let source = args["source"]
+        .as_str()
+        .map(|s| s.trim().to_string())
+        .or(Some("user_command".to_string()));
+    
+    let entry = AgentMemoryEntry {
+        timestamp: Local::now().to_rfc3339(),
+        category: if category.is_empty() { "user_memory".to_string() } else { category.to_string() },
+        note: content.to_string(),
+        tags,
+        source,
+    };
+    
+    let store = MemoryStore::from_env_or_config();
+    store.append(&entry)?;
+    Ok(format!("Memory saved: {} (category: {})", store.path().display(), entry.category))
+}
