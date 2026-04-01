@@ -1,5 +1,6 @@
 use crate::{matcher, output};
 use rust_tools::{strw::indices::substring_quiet, terminalw};
+use rust_tools::cw::SkipSet;
 use std::{
     fs::File,
     io::{BufRead, BufReader},
@@ -12,7 +13,7 @@ const DEFAULT_EXTENSIONS: &[&str] = &[
     ".cc", ".htm", ".ts", ".xml", ".php", ".sc", "",
 ];
 
-pub fn configure_terminalw(opts: &crate::cli::Options) -> std::collections::HashSet<String> {
+pub fn configure_terminalw(opts: &crate::cli::Options) -> SkipSet<String> {
     terminalw::COUNT.store(0, Ordering::Relaxed);
     terminalw::NUM_PRINT.store(opts.num_print, Ordering::Relaxed);
     terminalw::VERBOSE.store(opts.verbose, Ordering::Relaxed);
@@ -30,7 +31,7 @@ pub fn configure_terminalw(opts: &crate::cli::Options) -> std::collections::Hash
         }
     }
 
-    let mut allowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut allowed: SkipSet<String> = SkipSet::new(16);
     if !opts.ext.trim().is_empty() {
         for e in terminalw::format_file_extensions(&opts.ext) {
             terminalw::EXTENSIONS.add(&e);
@@ -54,7 +55,7 @@ pub fn configure_terminalw(opts: &crate::cli::Options) -> std::collections::Hash
         for ex in terminalw::format_file_extensions(&opts.ext_exclude) {
             allowed.remove(&ex);
         }
-        for e in &allowed {
+        for e in allowed.iter() {
             terminalw::EXTENSIONS.add(e);
         }
         terminalw::CHECK_EXTENSION.store(true, Ordering::Relaxed);

@@ -252,7 +252,7 @@ fn dedup_adjacent(messages: &mut Vec<Message>) {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     let mut prev_role = String::new();
     let mut prev_content = String::new();
-    for mut m in messages.drain(..) {
+    for m in messages.drain(..) {
         let text = value_to_string(&m.content);
         if m.role == prev_role && text == prev_content {
             continue;

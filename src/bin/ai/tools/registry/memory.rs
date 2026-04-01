@@ -12,12 +12,29 @@ fn params_memory_append() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
-            "content": {
+            "note": {
                 "type": "string",
                 "description": "Content to append to memory."
+            },
+            "category": {
+                "type": "string",
+                "description": "Category label (default: \"general\")."
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional tags for categorization."
+            },
+            "source": {
+                "type": "string",
+                "description": "Optional source context."
+            },
+            "priority": {
+                "type": "integer",
+                "description": "Priority level 0-255. 255=permanent (never delete), 100-200=high, 50-99=normal, 0-49=low. Default: 100."
             }
         },
-        "required": ["content"]
+        "required": ["note"]
     })
 }
 
@@ -41,6 +58,10 @@ fn params_memory_save() -> Value {
             "source": {
                 "type": "string",
                 "description": "Optional source context (e.g. user command, project name)."
+            },
+            "priority": {
+                "type": "integer",
+                "description": "Priority level 0-255. 255=permanent (never delete), 100-200=high, 50-99=normal, 0-49=low. Default: 150 for user-directed memory."
             }
         },
         "required": ["content"]

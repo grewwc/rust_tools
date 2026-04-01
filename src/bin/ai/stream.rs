@@ -25,7 +25,7 @@ pub(super) async fn stream_response(
     let hidden_begin = "<meta:self_note>";
     let hidden_end = "</meta:self_note>";
     let mut thinking_open = false;
-    let mut hidden_open = false;
+    let _hidden_open = false;
     let mut markdown = MarkdownStreamRenderer::new();
     let mut tool_calls_map: HashMap<usize, ToolCallBuilder> = HashMap::new();
     let mut assistant_text = String::new();

@@ -10,15 +10,11 @@ use serde_json::Value;
 use crate::ai::tools::storage::knowledge_cache::{
     SessionKnowledgeCache, CachedKnowledge, KnowledgeType, make_cache_key
 };
-use crate::ai::tools::storage::knowledge_fingerprint::{
-    create_fingerprint_for_topic, KnowledgeFingerprint
-};
+use crate::ai::tools::storage::knowledge_fingerprint::create_fingerprint_for_topic;
 use crate::ai::tools::storage::knowledge_types::{
-    KnowledgeType as NewKnowledgeType, KnowledgeMetadata, ValidationStrategy,
-    create_time_sensitive_metadata, create_external_metadata, create_session_metadata
+    KnowledgeType as NewKnowledgeType, KnowledgeMetadata
 };
 use crate::ai::tools::storage::memory_store::MemoryStore;
-use crate::commonw::configw;
 
 /// 检查并获取知识（自动处理缓存和过期）
 /// 
@@ -52,7 +48,7 @@ pub fn get_knowledge_with_cache(
         let inferred_type = NewKnowledgeType::infer_from_description(description);
         
         // 创建元数据（包含验证策略）
-        let mut metadata = KnowledgeMetadata::new(
+        let metadata = KnowledgeMetadata::new(
             inferred_type.clone(),
             context.clone(),
             Some(description.to_string()),

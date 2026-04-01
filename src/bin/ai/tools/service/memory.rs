@@ -57,6 +57,7 @@ pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
         .as_str()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let priority = args["priority"].as_u64().map(|p| p as u8);
     let entry = AgentMemoryEntry {
         timestamp: Local::now().to_rfc3339(),
         category: if category.is_empty() {
@@ -67,6 +68,7 @@ pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
         note: note.to_string(),
         tags,
         source,
+        priority,
     };
 
     let store = MemoryStore::from_env_or_config();
@@ -255,21 +257,69 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
         if entries.is_empty() {
             return Ok("No entries".to_string());
         }
+        
+        // Separate permanent entries (priority=255) - these are never deleted
+        let mut permanent: Vec<AgentMemoryEntry> = entries
+            .iter()
+            .filter(|e| e.priority.unwrap_or(100) == 255)
+            .cloned()
+            .collect();
+        let mut deletable: Vec<AgentMemoryEntry> = entries
+            .into_iter()
+            .filter(|e| e.priority.unwrap_or(100) != 255)
+            .collect();
+        
         let now = Utc::now();
         let cutoff_secs = max_days * 86400;
-        entries.retain(|e| {
+        
+        // Apply age filter to deletable entries
+        deletable.retain(|e| {
             parse_rfc3339_ts(&e.timestamp)
                 .map(|ts| (now - ts).num_seconds() <= cutoff_secs)
                 .unwrap_or(true)
         });
-        if entries.len() < min_keep {
-            entries = store.recent(min_keep)?;
+        
+        // Sort deletable entries by priority (ascending) then by timestamp (ascending)
+        // This ensures low priority and old entries are deleted first
+        deletable.sort_by(|a, b| {
+            let prio_a = a.priority.unwrap_or(100);
+            let prio_b = b.priority.unwrap_or(100);
+            prio_a.cmp(&prio_b).then_with(|| {
+                let ts_a = parse_rfc3339_ts(&a.timestamp);
+                let ts_b = parse_rfc3339_ts(&b.timestamp);
+                ts_a.cmp(&ts_b)
+            })
+        });
+        
+        // Ensure minimum keep count (but never delete permanent entries)
+        let total_permanent = permanent.len();
+        if deletable.len() + total_permanent < min_keep {
+            // Need to restore some entries, but prefer higher priority ones
+            let all_entries = store.recent(min_keep)?;
+            let new_deletable: Vec<AgentMemoryEntry> = all_entries
+                .iter()
+                .filter(|e| e.priority.unwrap_or(100) != 255)
+                .cloned()
+                .collect();
+            let new_permanent: Vec<AgentMemoryEntry> = all_entries
+                .iter()
+                .filter(|e| e.priority.unwrap_or(100) == 255)
+                .cloned()
+                .collect();
+            permanent = new_permanent;
+            deletable = new_deletable;
         }
+        
+        // Combine permanent and deletable entries
+        let permanent_count = permanent.len();
+        let mut final_entries = permanent;
+        final_entries.append(&mut deletable);
+        
         let tmp = path.with_extension("jsonl.tmp");
         {
             let mut f =
                 std::fs::File::create(&tmp).map_err(|e| format!("Failed to create tmp: {}", e))?;
-            for e in &entries {
+            for e in &final_entries {
                 let line = serde_json::to_string(e).map_err(|e| format!("{}", e))?;
                 f.write_all(line.as_bytes())
                     .and_then(|_| f.write_all(b"\n"))
@@ -277,7 +327,7 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
             }
         }
         std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to replace memory file: {}", e))?;
-        Ok(format!("GC done: {} entries kept", entries.len()))
+        Ok(format!("GC done: {} entries kept (including {} permanent)", final_entries.len(), permanent_count))
     })
 }
 
@@ -369,12 +419,14 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
         .map(|s| s.trim().to_string())
         .or(Some("user_command".to_string()));
     
+    let priority = args["priority"].as_u64().map(|p| p as u8).or(Some(150)); // Default high priority for user-directed memory
     let entry = AgentMemoryEntry {
         timestamp: Local::now().to_rfc3339(),
         category: if category.is_empty() { "user_memory".to_string() } else { category.to_string() },
         note: content.to_string(),
         tags,
         source,
+        priority,
     };
     
     let store = MemoryStore::from_env_or_config();

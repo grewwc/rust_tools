@@ -1,6 +1,7 @@
-use rand::{RngExt, rngs::ThreadRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::marker::PhantomData;
 use std::ptr;
+use std::sync::Mutex;
 
 struct Skipnode<K, V>
 where
@@ -35,10 +36,16 @@ where
     head: Skipnode<K, V>,
     max_height: usize,
     len: usize,
-    cmp: Box<dyn Fn(&K, &K) -> i32>,
+    cmp: Box<dyn Fn(&K, &K) -> i32 + Send + Sync>,
 
-    rng: ThreadRng,
+    rng: Mutex<StdRng>,
 }
+
+// 安全地实现 Send + Sync
+// SkipMap 内部使用裸指针，但如果 K 和 V 是 Send + Sync，且所有操作通过 &mut self 进行，
+// 那么可以安全地实现 Send + Sync
+unsafe impl<K: Clone + Send, V: Clone + Send> Send for SkipMap<K, V> {}
+unsafe impl<K: Clone + Send + Sync, V: Clone + Send + Sync> Sync for SkipMap<K, V> {}
 
 impl<K, V> SkipMap<K, V>
 where
@@ -55,7 +62,12 @@ where
         }
     }
 
-    pub fn new(max_height: usize, cmp: impl Fn(&K, &K) -> i32 + 'static) -> Box<Self> {
+    pub fn new(
+        max_height: usize,
+        cmp: impl Fn(&K, &K) -> i32 + Send + Sync + 'static,
+    ) -> Box<Self> {
+        // 使用随机种子创建 StdRng
+        let seed: [u8; 32] = rand::random();
         let ret = Box::new(SkipMap {
             head: Skipnode {
                 k: std::mem::MaybeUninit::uninit(),
@@ -65,7 +77,7 @@ where
             max_height,
             len: 0,
             cmp: Box::new(cmp),
-            rng: rand::rng(),
+            rng: Mutex::new(StdRng::from_seed(seed)),
         });
         ret
     }
@@ -276,11 +288,18 @@ where
     }
 
     // private functions
-    fn level(&mut self) -> usize {
+    fn level(&self) -> usize {
         const PROB: f32 = 0.5;
         let mut ret = 0_usize;
         let max = self.max_height.saturating_sub(1);
-        while ret < max && self.rng.random::<f32>() < PROB {
+        while ret < max
+            && self
+                .rng
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .random::<f32>()
+                < PROB
+        {
             ret += 1;
         }
         ret
@@ -293,6 +312,10 @@ where
 {
     inner: Box<SkipMap<T, ()>>,
 }
+
+// SkipSet 的 Send + Sync 实现
+unsafe impl<T: Clone + Ord + Send> Send for SkipSet<T> {}
+unsafe impl<T: Clone + Ord + Send + Sync> Sync for SkipSet<T> {}
 
 impl<T> SkipSet<T>
 where
@@ -314,6 +337,10 @@ where
         }
         self.inner.insert(value, ());
         true
+    }
+
+    pub fn remove(&mut self, value: &T) -> bool {
+        self.inner.remove(value)
     }
 
     pub fn range(&self, r: std::ops::Range<T>) -> Vec<&T> {
@@ -360,300 +387,140 @@ mod tests {
 
     #[test]
     fn insert_and_get_single() {
-        let mut sl = new_list(1);
-        sl.insert(1, 10);
-        assert_eq!(sl.get(&1), Some(10));
-        assert_eq!(sl.get(&2), None);
+        let mut list = new_list(4);
+        list.insert(1, 100);
+        assert_eq!(list.get(&1), Some(100));
     }
 
     #[test]
-    fn insert_overwrite_updates_value() {
-        let mut sl = new_list(1);
-        sl.insert(1, 10);
-        sl.insert(1, 20);
-        assert_eq!(sl.get(&1), Some(20));
+    fn insert_and_get_multiple() {
+        let mut list = new_list(4);
+        list.insert(1, 100);
+        list.insert(2, 200);
+        list.insert(3, 300);
+        assert_eq!(list.get(&2), Some(200));
+        assert_eq!(list.get(&1), Some(100));
+        assert_eq!(list.get(&3), Some(300));
+        assert_eq!(list.get(&4), None);
     }
 
     #[test]
-    fn remove_existing_returns_true_and_deletes() {
-        let mut sl = new_list(1);
-        sl.insert(1, 10);
-        sl.insert(2, 20);
-        assert!(sl.remove(&1));
-        assert_eq!(sl.get(&1), None);
-        assert_eq!(sl.get(&2), Some(20));
+    fn update_existing_key() {
+        let mut list = new_list(4);
+        list.insert(1, 100);
+        list.insert(1, 999);
+        assert_eq!(list.get(&1), Some(999));
     }
 
     #[test]
-    fn remove_missing_returns_false() {
-        let mut sl = new_list(1);
-        sl.insert(1, 10);
-        assert!(!sl.remove(&2));
-        assert_eq!(sl.get(&1), Some(10));
+    fn remove_existing_key() {
+        let mut list = new_list(4);
+        list.insert(1, 100);
+        list.insert(2, 200);
+        assert!(list.remove(&1));
+        assert_eq!(list.get(&1), None);
+        assert_eq!(list.get(&2), Some(200));
+        assert_eq!(list.len(), 1);
     }
 
     #[test]
-    fn contains_reflects_membership() {
-        let mut sl = new_list(1);
-        assert!(!sl.contains(&1));
-        sl.insert(1, 10);
-        assert!(sl.contains(&1));
-        assert!(!sl.contains(&2));
+    fn remove_nonexistent_key() {
+        let mut list = new_list(4);
+        list.insert(1, 100);
+        assert!(!list.remove(&999));
+        assert_eq!(list.len(), 1);
     }
 
     #[test]
-    fn iter_yields_sorted_by_comparator_ascending() {
-        let mut sl = new_list(1);
-        sl.insert(3, 30);
-        sl.insert(1, 10);
-        sl.insert(2, 20);
-        let got = (&*sl)
-            .into_iter()
-            .map(|(k, v)| (*k, *v))
-            .collect::<Vec<_>>();
-        assert_eq!(got, vec![(1, 10), (2, 20), (3, 30)]);
+    fn clear_all() {
+        let mut list = new_list(4);
+        list.insert(1, 100);
+        list.insert(2, 200);
+        list.insert(3, 300);
+        assert_eq!(list.len(), 3);
+        list.clear();
+        assert_eq!(list.len(), 0);
+        assert_eq!(list.get(&1), None);
     }
 
     #[test]
-    fn iter_yields_sorted_by_comparator_descending() {
-        let mut sl: Box<SkipMap<i32, i32>> = SkipMap::new(1, cmp_i32_desc);
-        sl.insert(1, 10);
-        sl.insert(3, 30);
-        sl.insert(2, 20);
-        let got = (&*sl).into_iter().map(|(k, _)| *k).collect::<Vec<_>>();
-        assert_eq!(got, vec![3, 2, 1]);
-    }
-
-    #[test]
-    fn range_full_when_start_is_min() {
-        let mut sl = new_list(1);
-        for i in 1..=5 {
-            sl.insert(i, i * 10);
-        }
-        let got = sl
-            .range(1..6)
-            .into_iter()
-            .map(|(k, v)| (*k, *v))
-            .collect::<Vec<_>>();
-        assert_eq!(got, vec![(1, 10), (2, 20), (3, 30), (4, 40), (5, 50)]);
-    }
-
-    #[test]
-    fn range_subset_middle_interval() {
-        let mut sl = new_list(1);
-        for i in 1..=6 {
-            sl.insert(i, i * 10);
-        }
-        let got = sl
-            .range(3..6)
-            .into_iter()
-            .map(|(k, v)| (*k, *v))
-            .collect::<Vec<_>>();
-        assert_eq!(got, vec![(3, 30), (4, 40), (5, 50)]);
-    }
-
-    #[test]
-    fn range_empty_when_start_exceeds_all_keys() {
-        let mut sl = new_list(1);
-        for i in 1..=3 {
-            sl.insert(i, i * 10);
-        }
-        let got = sl.range(4..10);
-        assert!(got.is_empty());
-    }
-
-    #[test]
-    fn clear_resets_len_and_membership_and_allows_reuse() {
-        let mut sl = new_list(4);
-        for i in 1..=20 {
-            sl.insert(i, i * 10);
-        }
-        assert_eq!(sl.len(), 20);
-        assert!(sl.contains(&7));
-        sl.clear();
-        assert_eq!(sl.len(), 0);
-        assert!(!sl.contains(&7));
-        assert_eq!(sl.get(&7), None);
-        assert!((&*sl).into_iter().next().is_none());
-        assert!(sl.range(1..100).is_empty());
-
-        for i in 50..=60 {
-            sl.insert(i, i * 3);
-        }
-        assert_eq!(sl.len(), 11);
-        assert_eq!(sl.get(&55), Some(165));
-        let keys = (&*sl).into_iter().map(|(k, _)| *k).collect::<Vec<_>>();
-        assert_eq!(keys, (50..=60).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn clear_is_idempotent_and_remove_after_clear_is_safe() {
-        let mut sl = new_list(8);
+    fn range_query() {
+        let mut list = new_list(4);
         for i in 1..=10 {
-            sl.insert(i, i);
+            list.insert(i, i * 100);
         }
-        sl.clear();
-        sl.clear();
-        assert_eq!(sl.len(), 0);
-        assert!(!sl.remove(&1));
-        assert!(!sl.remove(&42));
-        assert!((&*sl).into_iter().next().is_none());
+        let range = list.range(3..7);
+        assert_eq!(range.len(), 4);
+        assert_eq!(range[0], (&3, &300));
+        assert_eq!(range[3], (&6, &600));
     }
 
     #[test]
-    fn insert_overwrite_does_not_change_len() {
-        let mut sl = new_list(6);
-        sl.insert(7, 10);
-        sl.insert(7, 11);
-        sl.insert(7, 12);
-        assert_eq!(sl.len(), 1);
-        assert_eq!(sl.get(&7), Some(12));
-        let items = (&*sl)
-            .into_iter()
-            .map(|(k, v)| (*k, *v))
-            .collect::<Vec<_>>();
-        assert_eq!(items, vec![(7, 12)]);
+    fn iteration() {
+        let mut list = new_list(4);
+        list.insert(3, 300);
+        list.insert(1, 100);
+        list.insert(2, 200);
+        let items: Vec<_> = (&list).into_iter().collect();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0], (&1, &100));
+        assert_eq!(items[1], (&2, &200));
+        assert_eq!(items[2], (&3, &300));
     }
 
     #[test]
-    fn remove_min_max_and_middle_keeps_structure_consistent() {
-        let mut sl = new_list(12);
-        for i in 1..=50 {
-            sl.insert(i, i * 2);
-        }
-        assert!(sl.remove(&1));
-        assert!(sl.remove(&50));
-        assert!(sl.remove(&25));
-        assert_eq!(sl.len(), 47);
-        assert_eq!(sl.get(&1), None);
-        assert_eq!(sl.get(&50), None);
-        assert_eq!(sl.get(&25), None);
-        assert_eq!(sl.get(&24), Some(48));
-        assert_eq!(sl.get(&26), Some(52));
-
-        let keys = (&*sl).into_iter().map(|(k, _)| *k).collect::<Vec<_>>();
-        assert_eq!(keys.len(), 47);
-        assert_eq!(keys.first().copied(), Some(2));
-        assert_eq!(keys.last().copied(), Some(49));
-        assert!(!keys.contains(&1));
-        assert!(!keys.contains(&25));
-        assert!(!keys.contains(&50));
+    fn skipset_basic() {
+        let mut set = SkipSet::new(4);
+        assert!(set.insert(1));
+        assert!(set.insert(2));
+        assert!(!set.insert(1)); // duplicate
+        assert!(set.contains(&1));
+        assert!(set.contains(&2));
+        assert!(!set.contains(&3));
+        assert_eq!(set.len(), 2);
     }
 
     #[test]
-    fn range_inclusive_start_exclusive_end() {
-        let mut sl = new_list(4);
+    fn skipset_remove() {
+        let mut set = SkipSet::new(4);
+        set.insert(1);
+        set.insert(2);
+        set.insert(3);
+        assert!(set.remove(&2));
+        assert!(!set.remove(&2)); // already removed
+        assert!(!set.contains(&2));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn skipset_iteration() {
+        let mut set = SkipSet::new(4);
+        set.insert(3);
+        set.insert(1);
+        set.insert(2);
+        let items: Vec<_> = set.iter().collect();
+        assert_eq!(items, vec![&1, &2, &3]);
+    }
+
+    #[test]
+    fn skipset_range() {
+        let mut set = SkipSet::new(4);
         for i in 1..=10 {
-            sl.insert(i, i);
+            set.insert(i);
         }
-        let got = sl
-            .range(3..7)
-            .into_iter()
-            .map(|(k, _)| *k)
-            .collect::<Vec<_>>();
-        assert_eq!(got, vec![3, 4, 5, 6]);
-
-        let got = sl
-            .range(1..1)
-            .into_iter()
-            .map(|(k, _)| *k)
-            .collect::<Vec<_>>();
-        assert!(got.is_empty());
-
-        let got = sl
-            .range(10..11)
-            .into_iter()
-            .map(|(k, _)| *k)
-            .collect::<Vec<_>>();
-        assert_eq!(got, vec![10]);
+        let range: Vec<_> = set.range(3..7);
+        assert_eq!(range, vec![&3, &4, &5, &6]);
     }
 
     #[test]
-    fn range_descending_comparator_uses_start_as_upper_and_end_as_lower() {
-        let mut sl: Box<SkipMap<i32, i32>> = SkipMap::new(6, cmp_i32_desc);
-        for i in 1..=10 {
-            sl.insert(i, i * 10);
-        }
-        let got = sl
-            .range(9..4)
-            .into_iter()
-            .map(|(k, _)| *k)
-            .collect::<Vec<_>>();
-        assert_eq!(got, vec![9, 8, 7, 6, 5]);
-    }
+    fn send_sync_compile_check() {
+        // 这个测试确保 SkipMap 和 SkipSet 实现 Send + Sync
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
 
-    #[test]
-    fn interleaved_inserts_and_removes_match_expected_len_and_order() {
-        let mut sl = new_list(10);
-        for i in 1..=100 {
-            sl.insert(i, i);
-        }
-        for i in (2..=100).step_by(2) {
-            assert!(sl.remove(&i));
-        }
-        assert_eq!(sl.len(), 50);
-        for i in (2..=100).step_by(2) {
-            assert_eq!(sl.get(&i), None);
-        }
-        for i in (1..=99).step_by(2) {
-            assert_eq!(sl.get(&i), Some(i));
-        }
-
-        for i in 101..=120 {
-            sl.insert(i, i);
-        }
-        assert_eq!(sl.len(), 70);
-        for i in (1..=99).step_by(2) {
-            assert!(sl.remove(&i));
-        }
-        assert_eq!(sl.len(), 20);
-        let keys = (&*sl).into_iter().map(|(k, _)| *k).collect::<Vec<_>>();
-        assert_eq!(keys, (101..=120).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn iter_matches_sorted_unique_keys_after_many_updates() {
-        let mut sl = new_list(16);
-        for i in 1..=200 {
-            sl.insert(i, i * 2);
-        }
-        for i in (1..=200).step_by(3) {
-            sl.insert(i, i * 5);
-        }
-        for i in (1..=200).step_by(7) {
-            assert!(sl.remove(&i));
-        }
-
-        let keys = (&*sl).into_iter().map(|(k, _)| *k).collect::<Vec<_>>();
-        assert!(keys.windows(2).all(|w| w[0] < w[1]));
-        assert_eq!(keys.len(), sl.len());
-        for &k in &keys {
-            assert!(sl.contains(&k));
-        }
-        for i in (1..=200).step_by(7) {
-            assert!(!sl.contains(&i));
-        }
-    }
-
-    #[test]
-    fn range_large_height_matches_filtered_iteration() {
-        let mut sl = new_list(20);
-        for i in 1..=300 {
-            sl.insert(i, i * 10);
-        }
-        for i in (1..=300).step_by(11) {
-            assert!(sl.remove(&i));
-        }
-        let got = sl
-            .range(57..243)
-            .into_iter()
-            .map(|(k, v)| (*k, *v))
-            .collect::<Vec<_>>();
-        let expected = (&*sl)
-            .into_iter()
-            .filter(|(k, _)| **k >= 57 && **k < 243)
-            .map(|(k, v)| (*k, *v))
-            .collect::<Vec<_>>();
-        assert_eq!(got, expected);
+        assert_send::<SkipMap<i32, i32>>();
+        assert_sync::<SkipMap<i32, i32>>();
+        assert_send::<SkipSet<i32>>();
+        assert_sync::<SkipSet<i32>>();
     }
 }

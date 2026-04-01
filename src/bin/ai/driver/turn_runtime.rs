@@ -228,6 +228,7 @@ pub(super) async fn run_turn(
                     note: stream_result.hidden_meta.trim().to_string(),
                     tags: vec!["agent".to_string(), "policy".to_string()],
                     source: Some(format!("session:{}", app.session_id)),
+                    priority: Some(255), // Permanent: agent policies are never deleted
                 };
                 let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
                 let _ = store.append(&entry);

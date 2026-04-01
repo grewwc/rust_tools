@@ -40,8 +40,8 @@ pub use print::*;
 pub use signal::*;
 pub use skill_matching::*;
 
-const DEFAULT_MAX_ITERATIONS: usize = 64;
-const OPENCLAW_MAX_ITERATIONS: usize = 16;
+const DEFAULT_MAX_ITERATIONS: usize = 1024;
+const OPENCLAW_MAX_ITERATIONS: usize = 64;
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = cli::parse_cli_args(std::env::args());

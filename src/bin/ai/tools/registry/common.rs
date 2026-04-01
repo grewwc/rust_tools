@@ -125,6 +125,7 @@ fn record_tool_stat(name: &str, ok: bool) {
         note: format!("name={} result={}", name, if ok { "ok" } else { "err" }),
         tags: vec![name.to_string(), if ok { "ok".to_string() } else { "err".to_string() }],
         source: None,
+        priority: Some(50), // Normal priority: tool stats can be GC'd normally
     };
     let store = MemoryStore::from_env_or_config();
     let _ = store.append(&entry);

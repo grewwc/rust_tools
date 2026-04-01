@@ -29,11 +29,98 @@ pub fn validate_execute_command(command: &str) -> Result<(), String> {
     }
 
     let program = tokens[0].to_lowercase();
+    let normalize_path = |path: &std::path::Path| {
+        let mut normalized = std::path::PathBuf::new();
+        for component in path.components() {
+            match component {
+                std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+                std::path::Component::RootDir => normalized.push(component.as_os_str()),
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    normalized.pop();
+                }
+                std::path::Component::Normal(part) => normalized.push(part),
+            }
+        }
+        normalized
+    };
+
+    if program == "rm" || program == "mv" {
+        let base_dir = std::env::current_dir()
+            .map_err(|err| format!("failed to resolve current directory: {err}"))?;
+        let base_dir = normalize_path(&base_dir);
+        let mut path_args: Vec<String> = Vec::new();
+        let mut iter = tokens.iter().skip(1).peekable();
+        let mut end_of_options = false;
+
+        while let Some(token) = iter.next() {
+            if !end_of_options {
+                if *token == "--" {
+                    end_of_options = true;
+                    continue;
+                }
+
+                if token.starts_with('-') {
+                    if program == "mv" {
+                        let option = token.to_lowercase();
+                        if option == "-t" || option == "--target-directory" {
+                            let dir = iter
+                                .next()
+                                .ok_or_else(|| format!("missing target directory for '{token}'"))?;
+                            path_args.push((*dir).to_string());
+                            continue;
+                        }
+
+                        if let Some(dir) = option.strip_prefix("--target-directory=") {
+                            if dir.is_empty() {
+                                return Err(format!("missing target directory for '{token}'"));
+                            }
+                            path_args.push(dir.to_string());
+                            continue;
+                        }
+
+                        if token.starts_with("-t") && token.len() > 2 {
+                            path_args.push(token[2..].to_string());
+                            continue;
+                        }
+                    }
+
+                    continue;
+                }
+            }
+
+            path_args.push((*token).to_string());
+        }
+
+        if path_args.is_empty() {
+            return Err(format!("program '{program}' requires path arguments"));
+        }
+
+        for raw_path in path_args {
+            let raw_path = raw_path.trim();
+            if raw_path.is_empty() {
+                return Err(format!("program '{program}' contains an empty path"));
+            }
+
+            let resolved = if std::path::Path::new(raw_path).is_absolute() {
+                normalize_path(std::path::Path::new(raw_path))
+            } else {
+                normalize_path(&base_dir.join(raw_path))
+            };
+
+            if !resolved.starts_with(&base_dir) {
+                return Err(format!(
+                    "path '{raw_path}' is outside the current directory"
+                ));
+            }
+        }
+
+        return Ok(());
+    }
+
     let denied_programs = [
         "fish",
         "jshell",
-        "rm",
-        "mv",
         "dd",
         "chmod",
         "chown",

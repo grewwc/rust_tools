@@ -19,6 +19,14 @@ pub(crate) struct AgentMemoryEntry {
     pub(crate) note: String,
     pub(crate) tags: Vec<String>,
     pub(crate) source: Option<String>,
+    /// Priority level: 0-255. Higher = more important. 255 = permanent (never delete).
+    /// Default: 100 (normal priority). Low: 0-49, Normal: 50-99, High: 100-200, Permanent: 255
+    #[serde(default = "default_priority")]
+    pub(crate) priority: Option<u8>,
+}
+
+fn default_priority() -> Option<u8> {
+    Some(100)
 }
 
 pub(crate) struct MemoryStore {
@@ -294,6 +302,7 @@ mod tests {
             note: "parsing login error occurred".to_string(),
             tags: vec!["auth".to_string()],
             source: Some("svc".to_string()),
+            priority: Some(100),
         };
         let e2 = AgentMemoryEntry {
             timestamp: "2025-01-02T00:00:00Z".to_string(),
@@ -301,6 +310,7 @@ mod tests {
             note: "user profile updated".to_string(),
             tags: vec!["user".to_string()],
             source: Some("svc".to_string()),
+            priority: Some(100),
         };
         store.append(&e1).unwrap();
         store.append(&e2).unwrap();
@@ -321,6 +331,7 @@ mod tests {
             note: "user login failed due to authentication error".to_string(),
             tags: vec!["login".to_string()],
             source: None,
+            priority: Some(100),
         };
         store.append(&e).unwrap();
         let out = store.search("signin failure", 3).unwrap();
@@ -340,6 +351,7 @@ mod tests {
             note: "登录失败，密码错误".to_string(),
             tags: vec!["登录".to_string()],
             source: None,
+            priority: Some(100),
         };
         store.append(&e).unwrap();
         let out = store.search("登陆失败", 3).unwrap();

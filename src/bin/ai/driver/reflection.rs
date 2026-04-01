@@ -561,6 +561,7 @@ pub(super) async fn run_self_reflection_background(
         note: note.to_string(),
         tags: vec!["agent".to_string(), "policy".to_string()],
         source: Some(format!("session:{}", session_id)),
+        priority: Some(255), // Permanent: agent policies are never deleted
     };
     let store = MemoryStore::from_env_or_config();
     let _ = store.append(&entry);

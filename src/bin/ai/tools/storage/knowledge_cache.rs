@@ -222,7 +222,7 @@ impl CachedKnowledge {
             let is_valid = metadata.is_valid();
             
             let (validation_type, details, suggestion) = match &metadata.validation {
-                ValidationStrategy::Fingerprint { files, git_commit } => {
+                ValidationStrategy::Fingerprint { files: _, git_commit: _ } => {
                     let fp_result = self.fingerprint.as_ref().map(|f| f.verify()).unwrap_or_else(|| {
                         FingerprintVerificationResult {
                             is_valid: true,
@@ -248,7 +248,7 @@ impl CachedKnowledge {
                     }
                 },
                 
-                ValidationStrategy::TimeRange { valid_from, valid_until } => {
+                ValidationStrategy::TimeRange { valid_from: _, valid_until } => {
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap_or(Duration::ZERO)

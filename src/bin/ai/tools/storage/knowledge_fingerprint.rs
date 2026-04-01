@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{Read, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
