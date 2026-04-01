@@ -377,10 +377,6 @@ where
 mod tests {
     use super::*;
 
-    fn cmp_i32_desc(a: &i32, b: &i32) -> i32 {
-        (*b).cmp(a) as i32
-    }
-
     fn new_list(max_height: usize) -> Box<SkipMap<i32, i32>> {
         SkipMap::new(max_height, |a: &i32, b: &i32| a.cmp(b) as i32)
     }

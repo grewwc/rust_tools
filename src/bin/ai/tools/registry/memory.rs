@@ -3,8 +3,8 @@ use serde_json::Value;
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 use crate::ai::tools::service::memory::{
     execute_memory_append, execute_memory_dedup, execute_memory_gc, execute_memory_list_json,
-    execute_memory_recent, execute_memory_rotate, execute_memory_search,
-    execute_memory_save,
+    execute_memory_recent, execute_memory_rotate, execute_memory_search, execute_memory_save,
+    execute_memory_update,
 };
 use crate::ai::tools::service::knowledge_update::execute_knowledge_cache_manage;
 
@@ -86,6 +86,40 @@ fn params_memory_search() -> Value {
             }
         },
         "required": ["query"]
+    })
+}
+
+fn params_memory_update() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Memory entry id to update."
+            },
+            "content": {
+                "type": "string",
+                "description": "New memory content."
+            },
+            "category": {
+                "type": "string",
+                "description": "New category."
+            },
+            "tags": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "New tags. Use an empty array to clear tags."
+            },
+            "source": {
+                "type": ["string", "null"],
+                "description": "New source. Use null or an empty string to clear source."
+            },
+            "priority": {
+                "type": "integer",
+                "description": "New priority level 0-255."
+            }
+        },
+        "required": ["id"]
     })
 }
 
@@ -209,6 +243,16 @@ inventory::submit!(ToolRegistration {
         description: "Search memory entries by keyword.",
         parameters: params_memory_search,
         execute: execute_memory_search,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "memory_update",
+        description: "Update an existing memory entry by id.",
+        parameters: params_memory_update,
+        execute: execute_memory_update,
         groups: &["builtin"],
     }
 });

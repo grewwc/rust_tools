@@ -14,6 +14,8 @@ use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AgentMemoryEntry {
+    #[serde(default)]
+    pub(crate) id: Option<String>,
     pub(crate) timestamp: String,
     pub(crate) category: String,
     pub(crate) note: String,
@@ -297,6 +299,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("rt_mem_{ts}.jsonl"));
         let store = MemoryStore::for_tests_with_path(path.clone());
         let e1 = AgentMemoryEntry {
+            id: None,
             timestamp: "2025-01-01T00:00:00Z".to_string(),
             category: "log".to_string(),
             note: "parsing login error occurred".to_string(),
@@ -305,6 +308,7 @@ mod tests {
             priority: Some(100),
         };
         let e2 = AgentMemoryEntry {
+            id: None,
             timestamp: "2025-01-02T00:00:00Z".to_string(),
             category: "info".to_string(),
             note: "user profile updated".to_string(),
@@ -326,6 +330,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("rt_mem_syn_{ts}.jsonl"));
         let store = MemoryStore::for_tests_with_path(path.clone());
         let e = AgentMemoryEntry {
+            id: None,
             timestamp: "2025-01-03T00:00:00Z".to_string(),
             category: "auth".to_string(),
             note: "user login failed due to authentication error".to_string(),
@@ -346,6 +351,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("rt_mem_cn_{ts}.jsonl"));
         let store = MemoryStore::for_tests_with_path(path.clone());
         let e = AgentMemoryEntry {
+            id: None,
             timestamp: "2025-01-04T00:00:00Z".to_string(),
             category: "auth".to_string(),
             note: "登录失败，密码错误".to_string(),

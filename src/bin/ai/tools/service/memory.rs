@@ -1,6 +1,7 @@
 use chrono::{DateTime, Local, Utc};
 use std::io::{BufRead, Write};
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 
@@ -34,6 +35,11 @@ fn render_memory_entries(entries: &[AgentMemoryEntry]) -> String {
             entry.category,
             entry.note
         ));
+        if let Some(id) = &entry.id
+            && !id.trim().is_empty()
+        {
+            output.push_str(&format!("\nID: {}", id));
+        }
         if !entry.tags.is_empty() {
             output.push_str(&format!("\nTags: {}", entry.tags.join(", ")));
         }
@@ -44,6 +50,10 @@ fn render_memory_entries(entries: &[AgentMemoryEntry]) -> String {
         }
     }
     output
+}
+
+fn next_memory_id() -> String {
+    format!("mem_{}", Uuid::new_v4().simple())
 }
 
 pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
@@ -59,6 +69,7 @@ pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
         .filter(|value| !value.is_empty());
     let priority = args["priority"].as_u64().map(|p| p as u8);
     let entry = AgentMemoryEntry {
+        id: Some(next_memory_id()),
         timestamp: Local::now().to_rfc3339(),
         category: if category.is_empty() {
             "general".to_string()
@@ -73,7 +84,11 @@ pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
 
     let store = MemoryStore::from_env_or_config();
     store.append(&entry)?;
-    Ok(format!("Memory appended: {}", store.path().display()))
+    Ok(format!(
+        "Memory appended: {} (id: {})",
+        store.path().display(),
+        entry.id.as_deref().unwrap_or("")
+    ))
 }
 
 pub(crate) fn execute_memory_search(args: &Value) -> Result<String, String> {
@@ -395,6 +410,139 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
     })
 }
 
+pub(crate) fn execute_memory_update(args: &Value) -> Result<String, String> {
+    let id = args["id"].as_str().ok_or("Missing id")?.trim();
+    if id.is_empty() {
+        return Err("id is empty".to_string());
+    }
+
+    let has_content = args.get("content").is_some();
+    let has_category = args.get("category").is_some();
+    let has_tags = args.get("tags").is_some();
+    let has_source = args.get("source").is_some();
+    let has_priority = args.get("priority").is_some();
+    if !has_content && !has_category && !has_tags && !has_source && !has_priority {
+        return Err("no fields to update".to_string());
+    }
+
+    let new_content = if has_content {
+        let value = args["content"].as_str().ok_or("content must be a string")?.trim();
+        if value.is_empty() {
+            return Err("content is empty".to_string());
+        }
+        Some(value.to_string())
+    } else {
+        None
+    };
+    let new_category = if has_category {
+        let value = args["category"]
+            .as_str()
+            .ok_or("category must be a string")?
+            .trim();
+        if value.is_empty() {
+            return Err("category is empty".to_string());
+        }
+        Some(value.to_string())
+    } else {
+        None
+    };
+    let new_tags = if has_tags {
+        Some(parse_string_array(&args["tags"]))
+    } else {
+        None
+    };
+    let new_source = if has_source {
+        match args["source"].as_str() {
+            Some(value) => {
+                let value = value.trim();
+                if value.is_empty() {
+                    Some(None)
+                } else {
+                    Some(Some(value.to_string()))
+                }
+            }
+            None if args["source"].is_null() => Some(None),
+            None => return Err("source must be a string or null".to_string()),
+        }
+    } else {
+        None
+    };
+    let new_priority = if has_priority {
+        let priority = args["priority"]
+            .as_u64()
+            .ok_or("priority must be an integer")?;
+        if priority > u8::MAX as u64 {
+            return Err("priority out of range".to_string());
+        }
+        Some(priority as u8)
+    } else {
+        None
+    };
+
+    let store = MemoryStore::from_env_or_config();
+    let path = store.path().to_path_buf();
+    super::super::storage::with_memory_file_lock(&path, || {
+        if !path.exists() {
+            return Err("No memory file".to_string());
+        }
+
+        let file =
+            std::fs::File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
+        let reader = std::io::BufReader::new(file);
+        let mut entries = Vec::new();
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("Failed to read memory file: {}", e))?;
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(&line) {
+                entries.push(entry);
+            }
+        }
+
+        let Some(entry) = entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.id.as_deref() == Some(id))
+        else {
+            return Err(format!("memory id not found: {id}"));
+        };
+
+        if let Some(content) = new_content.as_ref() {
+            entry.note = content.clone();
+        }
+        if let Some(category) = new_category.as_ref() {
+            entry.category = category.clone();
+        }
+        if let Some(tags) = new_tags.as_ref() {
+            entry.tags = tags.clone();
+        }
+        if let Some(source) = new_source.as_ref() {
+            entry.source = source.clone();
+        }
+        if let Some(priority) = new_priority {
+            entry.priority = Some(priority);
+        }
+        entry.timestamp = Local::now().to_rfc3339();
+
+        let tmp = path.with_extension("jsonl.tmp");
+        {
+            let mut f =
+                std::fs::File::create(&tmp).map_err(|e| format!("Failed to create tmp: {}", e))?;
+            for e in &entries {
+                let line = serde_json::to_string(e).map_err(|e| format!("{}", e))?;
+                f.write_all(line.as_bytes())
+                    .and_then(|_| f.write_all(b"\n"))
+                    .map_err(|e| format!("Failed to write tmp: {}", e))?;
+            }
+        }
+        std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to replace memory file: {}", e))?;
+
+        Ok(format!("Memory updated: {} (id: {})", path.display(), id))
+    })
+}
+
 /// 用户主动保存记忆到全局 memory store
 pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
     let content = args["content"].as_str().ok_or("Missing content")?.trim();
@@ -421,6 +569,7 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
     
     let priority = args["priority"].as_u64().map(|p| p as u8).or(Some(150)); // Default high priority for user-directed memory
     let entry = AgentMemoryEntry {
+        id: Some(next_memory_id()),
         timestamp: Local::now().to_rfc3339(),
         category: if category.is_empty() { "user_memory".to_string() } else { category.to_string() },
         note: content.to_string(),
@@ -431,5 +580,67 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
     
     let store = MemoryStore::from_env_or_config();
     store.append(&entry)?;
-    Ok(format!("Memory saved: {} (category: {})", store.path().display(), entry.category))
+    Ok(format!(
+        "Memory saved: {} (category: {}, id: {})",
+        store.path().display(),
+        entry.category,
+        entry.id.as_deref().unwrap_or("")
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{execute_memory_list_json, execute_memory_save, execute_memory_update};
+    use crate::ai::test_support::ENV_LOCK;
+
+    #[test]
+    fn memory_save_assigns_id_and_update_rewrites_entry() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_memory_update_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let save_args = serde_json::json!({
+            "content": "delete carefully",
+            "category": "safety_rules",
+            "tags": ["safety"],
+            "source": "test",
+            "priority": 255
+        });
+        let save_msg = execute_memory_save(&save_args).unwrap();
+        assert!(save_msg.contains("id: mem_"));
+
+        let list_before = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
+        let before: serde_json::Value = serde_json::from_str(&list_before).unwrap();
+        let id = before[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(before[0]["note"].as_str().unwrap(), "delete carefully");
+
+        let update_args = serde_json::json!({
+            "id": id,
+            "content": "delete carefully after confirmation",
+            "priority": 200,
+            "tags": ["safety", "confirmed"]
+        });
+        let update_msg = execute_memory_update(&update_args).unwrap();
+        assert!(update_msg.contains("Memory updated"));
+
+        let list_after = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&list_after).unwrap();
+        assert_eq!(
+            after[0]["note"].as_str().unwrap(),
+            "delete carefully after confirmation"
+        );
+        assert_eq!(after[0]["priority"].as_u64().unwrap(), 200);
+        assert_eq!(after[0]["tags"].as_array().unwrap().len(), 2);
+
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
 }

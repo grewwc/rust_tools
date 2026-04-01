@@ -223,6 +223,7 @@ pub(super) async fn run_turn(
                 };
                 turn_messages.push(record);
                 let entry = crate::ai::tools::storage::memory_store::AgentMemoryEntry {
+                    id: None,
                     timestamp: chrono::Local::now().to_rfc3339(),
                     category: "self_note".to_string(),
                     note: stream_result.hidden_meta.trim().to_string(),
@@ -363,4 +364,3 @@ pub(super) async fn run_turn(
         TurnOutcome::Continue
     })
 }
-

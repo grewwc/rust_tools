@@ -120,6 +120,7 @@ pub(crate) fn execute_tool_call_with_args(
 
 fn record_tool_stat(name: &str, ok: bool) {
     let entry = AgentMemoryEntry {
+        id: None,
         timestamp: Local::now().to_rfc3339(),
         category: "tool_stat".to_string(),
         note: format!("name={} result={}", name, if ok { "ok" } else { "err" }),

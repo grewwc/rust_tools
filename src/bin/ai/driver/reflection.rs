@@ -55,7 +55,6 @@ fn extract_content(v: &Value) -> Option<String> {
 
 pub(super) fn build_persistent_guidelines(question: &str, max_chars: usize) -> Option<String> {
     let store = MemoryStore::from_env_or_config();
-    // 搜索更相关的 self_note，若未命中则回退 recent
     let entries = store.search(question, 120).ok().filter(|v| !v.is_empty())
         .or_else(|| store.recent(120).ok())
         .unwrap_or_default();
@@ -66,7 +65,10 @@ pub(super) fn build_persistent_guidelines(question: &str, max_chars: usize) -> O
     let mut seen: SkipSet<String> = SkipSet::new(16);
     let mut selected: Vec<String> = Vec::new();
     for e in entries.into_iter().rev() {
-        if e.category.to_lowercase() != "self_note" {
+        let category = e.category.to_lowercase();
+        let priority = e.priority.unwrap_or(100);
+        let include = category == "self_note" || category == "safety_rules" || priority >= 200;
+        if !include {
             continue;
         }
         let note = e.note.trim().to_string();
@@ -109,6 +111,87 @@ pub(super) fn build_persistent_guidelines(question: &str, max_chars: usize) -> O
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_persistent_guidelines;
+    use crate::ai::test_support::ENV_LOCK;
+    use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
+    use chrono::Local;
+
+    #[test]
+    fn persistent_guidelines_include_safety_rules_and_high_priority_entries() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_guidelines_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let store = MemoryStore::from_env_or_config();
+        let timestamp = Local::now().to_rfc3339();
+        store
+            .append(&AgentMemoryEntry {
+                id: None,
+                timestamp: timestamp.clone(),
+                category: "self_note".to_string(),
+                note: "Do: validate tool arguments".to_string(),
+                tags: vec![],
+                source: Some("test".to_string()),
+                priority: Some(100),
+            })
+            .unwrap();
+        store
+            .append(&AgentMemoryEntry {
+                id: None,
+                timestamp: timestamp.clone(),
+                category: "safety_rules".to_string(),
+                note: "Avoid: delete files without double checking".to_string(),
+                tags: vec![],
+                source: Some("test".to_string()),
+                priority: Some(255),
+            })
+            .unwrap();
+        store
+            .append(&AgentMemoryEntry {
+                id: None,
+                timestamp: timestamp.clone(),
+                category: "user_memory".to_string(),
+                note: "Do: always ask before risky file operations".to_string(),
+                tags: vec![],
+                source: Some("test".to_string()),
+                priority: Some(200),
+            })
+            .unwrap();
+        store
+            .append(&AgentMemoryEntry {
+                id: None,
+                timestamp,
+                category: "user_memory".to_string(),
+                note: "Ignore me".to_string(),
+                tags: vec![],
+                source: Some("test".to_string()),
+                priority: Some(150),
+            })
+            .unwrap();
+
+        let guidelines =
+            build_persistent_guidelines("delete files safely", 1200).expect("guidelines");
+
+        assert!(guidelines.contains("Do: validate tool arguments"));
+        assert!(guidelines.contains("Avoid: delete files without double checking"));
+        assert!(guidelines.contains("Do: always ask before risky file operations"));
+        assert!(!guidelines.contains("Ignore me"));
+
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
 }
 
 pub(super) async fn maybe_critic_and_revise(
@@ -556,6 +639,7 @@ pub(super) async fn run_self_reflection_background(
     };
     let _ = append_history_messages(&history_path, &[record]);
     let entry = AgentMemoryEntry {
+        id: None,
         timestamp: Local::now().to_rfc3339(),
         category: "self_note".to_string(),
         note: note.to_string(),
