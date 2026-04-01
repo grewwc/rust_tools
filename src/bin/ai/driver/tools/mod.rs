@@ -1,8 +1,6 @@
 use colored::Colorize;
-use regex::Regex;
 use serde_json::{Value, json};
 use std::error::Error;
-use std::sync::LazyLock;
 
 use crate::{
     ai::{
@@ -12,6 +10,9 @@ use crate::{
     },
     common::prompt::prompt_yes_or_no_interruptible,
 };
+
+mod barrier;
+mod oauth;
 
 #[derive(Debug, Clone)]
 enum ToolRoute {
@@ -37,20 +38,6 @@ pub(super) struct RunOneResult {
     pub(super) tool_result: ToolResult,
     pub(super) ok: bool,
     pub(super) executed: bool,
-}
-
-fn is_barrier_tool(tool_name: &str) -> bool {
-    matches!(tool_name, "search_files" | "list_directory" | "web_search")
-}
-
-fn should_barrier_after(route: &ToolRoute, tool_call: &ToolCall, ok: bool, content: &str) -> bool {
-    match route {
-        ToolRoute::Mcp { .. } => true,
-        ToolRoute::Builtin if tool_call.function.name == "search_files" => {
-            ok && !content.trim().is_empty()
-        }
-        ToolRoute::Builtin => is_barrier_tool(&tool_call.function.name),
-    }
 }
 
 fn route_tool_call(mcp_client: &McpClient, tool_name: &str) -> ToolRoute {
@@ -87,10 +74,6 @@ fn prepare_tool_call(
 
 fn requires_user_confirmation_for_tool(_tool_name: &str) -> bool {
     false
-    // let lower = tool_name.to_lowercase();
-    // let looks_like_feishu = lower.contains("feishu") || lower.contains("lark");
-    // let looks_like_search = lower.contains("search") || lower.contains("docs_search");
-    // looks_like_feishu && looks_like_search
 }
 
 fn confirm_tool_execution(tool_call: &ToolCall, args: &Value) -> Result<(), RunOneResult> {
@@ -167,154 +150,6 @@ fn format_tool_error(tool_call: &ToolCall, err: &str) -> ToolResult {
     }
 }
 
-fn looks_like_feishu_oauth_required(err: &str) -> bool {
-    let e = err.to_lowercase();
-    e.contains("missing user_access_token")
-        || e.contains("invalid access token")
-        || e.contains("99991668")
-        || e.contains("99991679")
-        || e.contains("re-authorization")
-}
-
-fn extract_feishu_required_scopes(err: &str) -> Vec<String> {
-    static RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\b[a-z][a-z0-9_-]*:[a-z0-9_-]+(?::[a-z0-9_-]+)*\b").unwrap());
-    let mut out = Vec::new();
-    for m in RE.find_iter(err) {
-        let s = m.as_str();
-        if s.starts_with("http") {
-            continue;
-        }
-        if s.contains("open-apis") {
-            continue;
-        }
-        if s.contains("bytedance") {
-            continue;
-        }
-        out.push(s.to_string());
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
-fn extract_oauth_code(s: &str) -> Option<String> {
-    for line in s.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("code:") {
-            let v = rest.trim().to_string();
-            if !v.is_empty() {
-                return Some(v);
-            }
-        }
-    }
-    None
-}
-
-fn open_browser(url: &str) {
-    let program = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let _ = std::process::Command::new(program).arg(url).status();
-}
-
-fn run_feishu_oauth_flow(
-    mcp_client: &McpClient,
-    server_name: &str,
-    scope: &str,
-) -> Result<(), String> {
-    let confirm =
-        prompt_yes_or_no_interruptible("Feishu authorization required. Authorize now? (y/n): ");
-    if confirm != Some(true) {
-        return Err(if confirm.is_none() {
-            "feishu oauth canceled by user (Ctrl+C)".to_string()
-        } else {
-            "feishu oauth canceled by user".to_string()
-        });
-    }
-
-    let port = 8711u16;
-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
-    let auth_url = mcp_client.call_tool(
-        server_name,
-        "oauth_authorize_url",
-        json!({
-            "redirect_uri": redirect_uri,
-            "scope": scope,
-            "prompt": "consent",
-            "state": "rust-tools-ai"
-        }),
-    )?;
-    let auth_url = auth_url.trim().to_string();
-    println!("\n[feishu] authorize url:\n{}\n", auth_url);
-
-    let open_now = prompt_yes_or_no_interruptible("Open browser now? (y/n): ");
-    if open_now == Some(true) {
-        open_browser(&auth_url);
-    }
-
-    println!("[feishu] waiting for oauth callback on http://127.0.0.1:{port}/callback ...");
-    let code_out = mcp_client.call_tool(
-        server_name,
-        "oauth_wait_local_code",
-        json!({
-            "port": port,
-            "timeout_sec": 180
-        }),
-    )?;
-    let Some(code) = extract_oauth_code(&code_out) else {
-        return Err(format!(
-            "failed to capture oauth code. raw output:\n{}",
-            code_out.trim()
-        ));
-    };
-
-    let exchange_out =
-        mcp_client.call_tool(server_name, "oauth_exchange_code", json!({ "code": code }))?;
-    println!("\n[feishu] {}\n", exchange_out.trim());
-    Ok(())
-}
-
-fn oauth_scope_from_error(err: &str) -> String {
-    let required = extract_feishu_required_scopes(err);
-    if required.is_empty() {
-        return "offline_access".to_string();
-    }
-
-    let mut parts = Vec::with_capacity(required.len() + 1);
-    parts.push("offline_access".to_string());
-    parts.extend(required);
-    parts.join(" ")
-}
-
-fn execute_mcp_tool_call(
-    mcp_client: &McpClient,
-    tool_call: &ToolCall,
-    server_name: &str,
-    tool_name: &str,
-    args: &Value,
-) -> Result<ToolResult, String> {
-    match mcp_client.call_tool(server_name, tool_name, args.clone()) {
-        Ok(content) => Ok(ToolResult {
-            tool_call_id: tool_call.id.clone(),
-            content,
-        }),
-        Err(err) if !tool_name.starts_with("oauth_") && looks_like_feishu_oauth_required(&err) => {
-            let scope = oauth_scope_from_error(&err);
-            run_feishu_oauth_flow(mcp_client, server_name, &scope)
-                .map_err(|e| format!("feishu oauth failed: {}", e))?;
-            let content = mcp_client.call_tool(server_name, tool_name, args.clone())?;
-            Ok(ToolResult {
-                tool_call_id: tool_call.id.clone(),
-                content,
-            })
-        }
-        Err(err) => Err(err),
-    }
-}
-
 fn execute_prepared_tool_call(
     mcp_client: &McpClient,
     tool_call: &ToolCall,
@@ -330,7 +165,7 @@ fn execute_prepared_tool_call(
         ToolRoute::Mcp {
             server_name,
             tool_name,
-        } => execute_mcp_tool_call(
+        } => oauth::execute_mcp_tool_call(
             mcp_client,
             tool_call,
             server_name,
@@ -396,7 +231,7 @@ fn execute_tool_calls_inner(
     for (idx, tool_call) in tool_calls.iter().enumerate() {
         let is_last = idx + 1 >= tool_calls.len();
         let (route, run_result) = run_one(mcp_client, tool_call);
-        let should_barrier = should_barrier_after(
+        let should_barrier = barrier::should_barrier_after(
             &route,
             tool_call,
             run_result.ok,
@@ -423,63 +258,4 @@ fn execute_tool_calls_inner(
         executed_tool_calls,
         tool_results,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tool_call(name: &str) -> ToolCall {
-        ToolCall {
-            id: "call-1".to_string(),
-            tool_type: "function".to_string(),
-            function: crate::ai::types::FunctionCall {
-                name: name.to_string(),
-                arguments: "{}".to_string(),
-            },
-        }
-    }
-
-    #[test]
-    fn barrier_builtin_search_files_requires_non_empty_success_output() {
-        let tc = tool_call("search_files");
-        assert!(!should_barrier_after(&ToolRoute::Builtin, &tc, true, "   "));
-        assert!(!should_barrier_after(
-            &ToolRoute::Builtin,
-            &tc,
-            false,
-            "/tmp/a.rs"
-        ));
-        assert!(should_barrier_after(
-            &ToolRoute::Builtin,
-            &tc,
-            true,
-            "/tmp/a.rs"
-        ));
-    }
-
-    #[test]
-    fn barrier_builtin_and_mcp_rules_match_existing_behavior() {
-        assert!(should_barrier_after(
-            &ToolRoute::Builtin,
-            &tool_call("list_directory"),
-            true,
-            ""
-        ));
-        assert!(!should_barrier_after(
-            &ToolRoute::Builtin,
-            &tool_call("read_file"),
-            true,
-            "content"
-        ));
-        assert!(should_barrier_after(
-            &ToolRoute::Mcp {
-                server_name: "foo".to_string(),
-                tool_name: "bar".to_string(),
-            },
-            &tool_call("mcp_foo_bar"),
-            false,
-            ""
-        ));
-    }
 }

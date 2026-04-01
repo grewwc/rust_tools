@@ -118,8 +118,8 @@ impl fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {}
 
-const REQUEST_MAX_ATTEMPTS: usize = 3;
-const REQUEST_MAX_ATTEMPTS_429: usize = 6; // 429 错误重试 6 次
+const REQUEST_MAX_ATTEMPTS: usize = 6;
+const REQUEST_MAX_ATTEMPTS_429: usize = 16; // 429 错误重试 16 次
 const REQUEST_RETRY_BASE_MS: u64 = 500;
 const REQUEST_RETRY_MAX_MS: u64 = 4000;
 

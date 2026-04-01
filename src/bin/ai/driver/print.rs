@@ -2,6 +2,24 @@ use colored::Colorize;
 
 use crate::ai::{driver::McpInitReport, mcp::McpClient, skills::SkillManifest, types::App};
 
+pub fn print_assistant_banner() {
+    println!("\n{}", "[Assistant]".bright_blue().bold());
+}
+
+pub fn print_tool_output_block(content: &str) {
+    if content.trim().is_empty() {
+        println!("  {} {}", "│".bright_black(), "(empty)".dimmed());
+        return;
+    }
+    for line in content.lines() {
+        if line.is_empty() {
+            println!("  {}", "│".bright_black());
+        } else {
+            println!("  {} {}", "│".bright_black(), line.dimmed());
+        }
+    }
+}
+
 pub fn print_builtin_tools(app: &App) {
     println!("{}", "[builtin tools]".yellow());
     let tools = app
