@@ -409,8 +409,8 @@ mod tests {
     
     #[test]
     fn test_time_sensitive_validation() {
-        let mut ctx = HashMap::new();
-        let mut metadata = create_time_sensitive_metadata(
+        let ctx = HashMap::new();
+        let metadata = create_time_sensitive_metadata(
             "今天天气",
             ctx.clone(),
             Some(300), // 5 分钟

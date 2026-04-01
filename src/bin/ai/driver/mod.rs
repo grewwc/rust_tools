@@ -29,6 +29,7 @@ pub mod model;
 pub mod params;
 pub mod print;
 pub mod signal;
+pub mod intent_recognition;
 pub mod skill_matching;
 pub mod skill_runtime;
 pub mod reflection;

@@ -23,6 +23,7 @@ pub(super) struct AppConfig {
     pub(super) history_max_chars: usize,
     pub(super) history_keep_last: usize,
     pub(super) history_summary_max_chars: usize,
+    pub(super) intent_model: Option<String>,
 }
 
 pub(super) struct App {

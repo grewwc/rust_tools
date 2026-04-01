@@ -6,8 +6,8 @@ use serde_json::Value;
 use crate::ai::types::ToolCall;
 
 use super::{
-    compress::value_to_string,
-    types::{MAX_HISTORY_LINES, Message},
+    compress::{compact_persisted_history, value_to_string},
+    types::Message,
 };
 
 fn open_history_db(path: &Path) -> Result<Connection, io::Error> {
@@ -93,37 +93,74 @@ pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -
                 );
             }
         }
-        let mut stmt = tx
-            .prepare(
-                "INSERT INTO messages (role, content, tool_calls, tool_call_id)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        for message in entries {
-            let content = serde_json::to_string(&message.content)
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            let tool_calls = message
-                .tool_calls
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .map_err(|e| io::Error::other(e.to_string()))?;
-            stmt.execute(params![
-                message.role,
-                content,
-                tool_calls,
-                message.tool_call_id
-            ])
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        }
+        insert_messages(&tx, entries)?;
     }
-    tx.execute(
-        "DELETE FROM messages
-         WHERE id NOT IN (SELECT id FROM messages ORDER BY id DESC LIMIT ?1)",
-        params![MAX_HISTORY_LINES as i64],
+    let messages = read_messages_with_sql(
+        &tx,
+        "SELECT role, content, tool_calls, tool_call_id
+         FROM messages
+         ORDER BY id ASC",
     )
     .map_err(|e| io::Error::other(e.to_string()))?;
+    let compacted = compact_persisted_history(messages.clone());
+    if compacted != messages {
+        tx.execute("DELETE FROM messages", [])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        insert_messages(&tx, compacted)?;
+    }
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
+}
+
+fn insert_messages(conn: &Connection, messages: Vec<Message>) -> io::Result<()> {
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO messages (role, content, tool_calls, tool_call_id)
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    for message in messages {
+        let content =
+            serde_json::to_string(&message.content).map_err(|e| io::Error::other(e.to_string()))?;
+        let tool_calls = message
+            .tool_calls
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        stmt.execute(params![
+            message.role,
+            content,
+            tool_calls,
+            message.tool_call_id
+        ])
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    }
+    Ok(())
+}
+
+fn read_messages_with_sql(
+    conn: &Connection,
+    sql: &str,
+) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], |row| {
+        let role: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let tool_calls: Option<String> = row.get(2)?;
+        let tool_call_id: Option<String> = row.get(3)?;
+        Ok((role, content, tool_calls, tool_call_id))
+    })?;
+    let mut messages = Vec::new();
+    for row in rows {
+        let (role, content, tool_calls, tool_call_id) = row?;
+        messages.push(Message {
+            role,
+            content: decode_message_content(&content),
+            tool_calls: decode_tool_calls(tool_calls.as_deref()),
+            tool_call_id,
+        });
+    }
+    Ok(messages)
 }
 
 pub(in crate::ai) fn build_message_arr_sqlite(
@@ -137,31 +174,12 @@ pub(in crate::ai) fn build_message_arr_sqlite(
     };
     init_history_schema(&conn)?;
 
-    let mut stmt = conn.prepare(
+    let messages = read_messages_with_sql(
+        &conn,
         "SELECT role, content, tool_calls, tool_call_id
          FROM messages
-         ORDER BY id DESC
-         LIMIT ?1",
+         ORDER BY id ASC",
     )?;
-    let rows = stmt.query_map(params![MAX_HISTORY_LINES as i64], |row| {
-        let role: String = row.get(0)?;
-        let content: String = row.get(1)?;
-        let tool_calls: Option<String> = row.get(2)?;
-        let tool_call_id: Option<String> = row.get(3)?;
-        Ok((role, content, tool_calls, tool_call_id))
-    })?;
-    let mut messages: Vec<Message> = Vec::new();
-    for row in rows {
-        let (role, content, tool_calls, tool_call_id) = row?;
-        messages.push(Message {
-            role,
-            content: decode_message_content(&content),
-            tool_calls: decode_tool_calls(tool_calls.as_deref()),
-            tool_call_id,
-        });
-    }
-    messages.reverse();
-
     if history_count >= messages.len() {
         return Ok(messages);
     }
@@ -203,35 +221,11 @@ fn decode_tool_calls(tool_calls: Option<&str>) -> Option<Vec<ToolCall>> {
 pub(in crate::ai) fn read_all_messages_sqlite(path: &Path) -> io::Result<Vec<Message>> {
     let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT role, content, tool_calls, tool_call_id
-             FROM messages
-             ORDER BY id ASC",
-        )
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    let rows = stmt
-        .query_map([], |row| {
-            let role: String = row.get(0)?;
-            let content: String = row.get(1)?;
-            let tool_calls: Option<String> = row.get(2)?;
-            let tool_call_id: Option<String> = row.get(3)?;
-            Ok((role, content, tool_calls, tool_call_id))
-        })
-        .map_err(|e| io::Error::other(e.to_string()))?;
-
-    let mut messages: Vec<Message> = Vec::new();
-    for row in rows {
-        let (role, content, tool_calls, tool_call_id) =
-            row.map_err(|e| io::Error::other(e.to_string()))?;
-        messages.push(Message {
-            role,
-            content: decode_message_content(&content),
-            tool_calls: decode_tool_calls(tool_calls.as_deref()),
-            tool_call_id,
-        });
-    }
-
-    Ok(messages)
+    read_messages_with_sql(
+        &conn,
+        "SELECT role, content, tool_calls, tool_call_id
+         FROM messages
+         ORDER BY id ASC",
+    )
+    .map_err(|e| io::Error::other(e.to_string()))
 }

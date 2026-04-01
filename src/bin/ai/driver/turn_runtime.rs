@@ -97,6 +97,7 @@ pub(super) async fn run_turn(
     messages.push(user_message.clone());
     let mut turn_messages = Vec::with_capacity(8);
     turn_messages.push(user_message);
+    let mut persisted_turn_messages = 0usize;
 
     let max_iterations = app
         .agent_context
@@ -145,6 +146,12 @@ pub(super) async fn run_turn(
             Err(err) => {
                 app.streaming
                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                persist_pending_turn_messages(
+                    app,
+                    one_shot_mode,
+                    &turn_messages,
+                    &mut persisted_turn_messages,
+                );
                 if request::is_transient_error(&err) {
                     eprintln!("[Warning] {}", err);
                     break;
@@ -158,6 +165,12 @@ pub(super) async fn run_turn(
         {
             app.streaming
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            persist_pending_turn_messages(
+                app,
+                one_shot_mode,
+                &turn_messages,
+                &mut persisted_turn_messages,
+            );
             println!("\nInterrupted.");
             return Ok(if should_quit {
                 TurnOutcome::Quit
@@ -188,6 +201,12 @@ pub(super) async fn run_turn(
         input::clear_stdin_buffer();
 
         if stream_result.outcome == StreamOutcome::Cancelled {
+            persist_pending_turn_messages(
+                app,
+                one_shot_mode,
+                &turn_messages,
+                &mut persisted_turn_messages,
+            );
             println!("\nInterrupted.");
             return Ok(if should_quit {
                 TurnOutcome::Quit
@@ -196,6 +215,12 @@ pub(super) async fn run_turn(
             });
         }
         if app.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            persist_pending_turn_messages(
+                app,
+                one_shot_mode,
+                &turn_messages,
+                &mut persisted_turn_messages,
+            );
             println!();
             return Ok(TurnOutcome::Quit);
         }
@@ -287,6 +312,13 @@ pub(super) async fn run_turn(
             turn_messages.push(tool_message);
         }
 
+        persist_pending_turn_messages(
+            app,
+            one_shot_mode,
+            &turn_messages,
+            &mut persisted_turn_messages,
+        );
+
         input::clear_stdin_buffer();
 
         if iteration >= max_iterations {
@@ -327,11 +359,12 @@ pub(super) async fn run_turn(
                 .await;
             }
         }
-        if !one_shot_mode
-            && let Err(e) = append_history_messages(&app.session_history_file, &turn_messages)
-        {
-            eprintln!("[Warning] Failed to save history: {}", e);
-        }
+        persist_pending_turn_messages(
+            app,
+            one_shot_mode,
+            &turn_messages,
+            &mut persisted_turn_messages,
+        );
         println!();
         // Background Critic→Revise (fire-and-forget)
         {
@@ -363,4 +396,114 @@ pub(super) async fn run_turn(
     } else {
         TurnOutcome::Continue
     })
+}
+
+fn persist_pending_turn_messages(
+    app: &App,
+    one_shot_mode: bool,
+    turn_messages: &[Message],
+    persisted_turn_messages: &mut usize,
+) {
+    if one_shot_mode || *persisted_turn_messages >= turn_messages.len() {
+        return;
+    }
+
+    if let Err(err) = append_history_messages(
+        &app.session_history_file,
+        &turn_messages[*persisted_turn_messages..],
+    ) {
+        eprintln!("[Warning] Failed to save history: {}", err);
+        return;
+    }
+
+    *persisted_turn_messages = turn_messages.len();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::{
+        Arc,
+        atomic::AtomicBool,
+    };
+
+    use serde_json::Value;
+
+    use super::*;
+    use crate::ai::{
+        cli::ParsedCli,
+        history::build_message_arr,
+        types::AppConfig,
+    };
+
+    fn test_app(history_file: PathBuf) -> App {
+        App {
+            cli: ParsedCli::default(),
+            config: AppConfig {
+                api_key: String::new(),
+                history_file: history_file.clone(),
+                endpoint: String::new(),
+                vl_default_model: String::new(),
+                history_max_chars: 12_000,
+                history_keep_last: 256,
+                history_summary_max_chars: 4_000,
+                intent_model: None,
+            },
+            session_id: "test".to_string(),
+            session_history_file: history_file,
+            client: reqwest::Client::builder().build().unwrap(),
+            current_model: String::new(),
+            pending_files: None,
+            pending_clipboard: false,
+            pending_short_output: false,
+            attached_image_files: Vec::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            streaming: Arc::new(AtomicBool::new(false)),
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            writer: None,
+            prompt_editor: None,
+            agent_context: None,
+        }
+    }
+
+    #[test]
+    fn persist_pending_turn_messages_only_appends_new_entries() {
+        let path = std::env::temp_dir().join(format!(
+            "ai-turn-history-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let app = test_app(path.clone());
+
+        let mut turn_messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let mut persisted = 0usize;
+
+        persist_pending_turn_messages(&app, false, &turn_messages, &mut persisted);
+        assert_eq!(persisted, 1);
+
+        turn_messages.push(Message {
+            role: "tool".to_string(),
+            content: Value::String("tool output".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+        });
+        turn_messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::String("done".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+
+        persist_pending_turn_messages(&app, false, &turn_messages, &mut persisted);
+        assert_eq!(persisted, 3);
+
+        let loaded = build_message_arr(16, &path).unwrap();
+        assert_eq!(loaded, turn_messages);
+
+        let _ = std::fs::remove_file(&path);
+    }
 }

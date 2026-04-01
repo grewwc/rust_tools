@@ -2,6 +2,8 @@ use crate::ai::skills::SkillManifest;
 use rust_tools::cw::SkipSet;
 use std::collections::HashMap;
 
+pub use super::intent_recognition::{CoreIntent, UserIntent};
+
 /// 评分权重常量
 mod weights {
     pub const NAME_MATCH: f64 = 10.0;
@@ -32,27 +34,31 @@ mod thresholds {
 
 /// 简化的技能匹配逻辑：基于语义和意图的智能匹配
 /// 仅作为模型路由的 fallback，当模型路由失败时使用
-pub fn match_skill<'a>(skills: &'a [SkillManifest], input: &str) -> Option<&'a SkillManifest> {
+/// intent 参数可选：如果提供，会使用意图信息进行更精确的匹配
+pub fn match_skill<'a>(
+    skills: &'a [SkillManifest],
+    input: &str,
+    intent: Option<&UserIntent>,
+) -> Option<&'a SkillManifest> {
     if input.trim().is_empty() || skills.is_empty() {
         return None;
     }
 
     let input_lower = input.to_lowercase();
 
-    // 第一步：意图识别 - 判断用户是否在询问概念/定义
-    let input_intent = detect_intent(&input_lower);
-
-    // 第二步：为每个技能评分
+    // 为每个技能评分
     let mut best_match: Option<&SkillManifest> = None;
     let mut best_score = 0.0;
 
     for skill in skills {
-        // 如果技能描述明确排除了当前意图，直接跳过
-        if is_intent_excluded(skill, &input_intent) {
-            continue;
+        // 如果技能描述明确排除了当前意图，直接跳过（如果有 intent 的话）
+        if let Some(intent_ref) = intent {
+            if is_intent_excluded(skill, intent_ref) {
+                continue;
+            }
         }
 
-        let score = score_skill_smart(skill, &input_lower, &input_intent);
+        let score = score_skill_smart(skill, &input_lower, intent);
         if score > best_score {
             best_score = score;
             best_match = Some(skill);
@@ -60,11 +66,14 @@ pub fn match_skill<'a>(skills: &'a [SkillManifest], input: &str) -> Option<&'a S
     }
 
     // 动态阈值：根据技能数量和匹配质量调整，但保证一个较高的最低底线
-    // 因为误触发的代价通常大于不触发（模型也能正常完成任务）
     let base_threshold = thresholds::skill_count_threshold(skills.len());
     // 如果意图只是请求行动，但没有明确指向现有技能，提高阈值防止 "代码" 等通用词导致误触发
-    let threshold = if input_intent == UserIntent::RequestAction {
-        base_threshold.max(4.5)
+    let threshold = if let Some(intent_ref) = intent {
+        if intent_ref.core == CoreIntent::RequestAction {
+            base_threshold.max(4.5)
+        } else {
+            base_threshold.max(3.0)
+        }
     } else {
         base_threshold.max(3.0)
     };
@@ -76,104 +85,12 @@ pub fn match_skill<'a>(skills: &'a [SkillManifest], input: &str) -> Option<&'a S
     }
 }
 
-/// 用户意图类型
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UserIntent {
-    /// 询问概念/定义（"这是什么"、"是什么意思"）
-    QueryConcept,
-    /// 请求操作（"帮我做 X"）
-    RequestAction,
-    /// 寻求解决方案（"怎么处理"、"如何解决"）
-    SeekSolution,
-    /// 闲聊/其他
-    Casual,
-}
-
-/// 检测用户意图
-pub fn detect_intent(input: &str) -> UserIntent {
-    // 询问概念的关键词
-    let concept_patterns = [
-        "是什么",
-        "什么意思",
-        "含义",
-        "定义",
-        "解释",
-        "说明",
-        "what is",
-        "what's",
-        "meaning",
-        "define",
-        "explain",
-        "是啥",
-        "啥意思",
-        "咋回事",
-        "指的是什么",
-        "代表什么",
-    ];
-
-    // 寻求解决方案的关键词（优先检查，因为"怎么"、"如何"更具体）
-    let seek_solution_patterns = [
-        "怎么",
-        "如何",
-        "怎么办",
-        "怎么处理",
-        "如何解决",
-        "how to",
-        "how do i",
-        "what should i do",
-        "为什么",
-        "为啥",
-        "原因",
-    ];
-
-    // 请求行动的关键词
-    let request_action_patterns = [
-        "帮我",
-        "给我",
-        "请",
-        "帮我做",
-        "帮我写",
-        "帮我改",
-        "帮我检查",
-        "帮我调试",
-        "帮我重构",
-        "帮我审查",
-        "help me",
-        "please",
-        "do this",
-        "fix",
-        "review",
-        "refactor",
-        "优化",
-        "改进",
-        "整理",
-        "重写",
-        "运行",
-        "执行",
-    ];
-
-    // 优先匹配最具体的模式
-    if concept_patterns.iter().any(|p| input.contains(p)) {
-        return UserIntent::QueryConcept;
-    }
-
-    if seek_solution_patterns.iter().any(|p| input.contains(p)) {
-        return UserIntent::SeekSolution;
-    }
-
-    if request_action_patterns.iter().any(|p| input.contains(p)) {
-        return UserIntent::RequestAction;
-    }
-
-    UserIntent::Casual
-}
-
 /// 检查技能描述是否明确排除了某种意图
 fn is_intent_excluded(skill: &SkillManifest, intent: &UserIntent) -> bool {
     let desc_lower = skill.description.to_lowercase();
 
-    match intent {
-        UserIntent::QueryConcept => {
+    match &intent.core {
+        CoreIntent::QueryConcept => {
             // 如果技能描述明确说"不适用于询问概念"之类
             let exclusion_patterns = [
                 "如果用户询问的不是",
@@ -185,12 +102,33 @@ fn is_intent_excluded(skill: &SkillManifest, intent: &UserIntent) -> bool {
             ];
             exclusion_patterns.iter().any(|p| desc_lower.contains(p))
         }
-        _ => false,
+        CoreIntent::RequestAction | CoreIntent::SeekSolution | CoreIntent::Casual => {
+            // 如果用户是在搜索资源（如"找几个 skill"），而不是请求执行技能
+            // 所有具体执行类技能都应该排除
+            if intent.is_searching_resource("skill") {
+                let execution_keywords = [
+                    "审查", "重构", "调试", "评估", "分析",
+                    "review", "refactor", "debug", "analyze",
+                ];
+                let name_lower = skill.name.to_lowercase();
+                execution_keywords.iter().any(|kw| desc_lower.contains(kw))
+                    && (name_lower.contains("review")
+                        || name_lower.contains("refactor")
+                        || name_lower.contains("debug")
+                        || name_lower.contains("analyzer"))
+            } else {
+                false
+            }
+        }
     }
 }
 
 /// 智能评分：结合 TF-IDF 思想、短语匹配、意图匹配
-fn score_skill_smart(skill: &SkillManifest, input_lower: &str, intent: &UserIntent) -> f64 {
+fn score_skill_smart(
+    skill: &SkillManifest,
+    input_lower: &str,
+    intent: Option<&UserIntent>,
+) -> f64 {
     let mut score = 0.0;
 
     // 1. 技能名称匹配（权重最高）
@@ -232,8 +170,10 @@ fn score_skill_smart(skill: &SkillManifest, input_lower: &str, intent: &UserInte
     // 4. 中文字符匹配（更智能：优先匹配连续的中文字词）
     score += score_chinese_semantic(&description_lower, input_lower);
 
-    // 5. 意图匹配度加分
-    score += intent_match_bonus(skill, intent, input_lower);
+    // 5. 意图匹配度加分（如果有 intent）
+    if let Some(intent_ref) = intent {
+        score += intent_match_bonus(skill, intent_ref, input_lower);
+    }
 
     // 6. 否定词惩罚
     if has_negation_context(input_lower, &description_lower) {
@@ -289,7 +229,7 @@ fn extract_meaningful_phrases(text: &str) -> SkipSet<String> {
         let segment = segment.trim();
         if segment.len() >= 4 && segment.len() <= 15 {
             // 检查是否包含有意义的中文
-            let chinese_chars: String = segment.chars().filter(|c| c.is_ascii() == false).collect();
+            let chinese_chars: String = segment.chars().filter(|c| !c.is_ascii()).collect();
             if chinese_chars.len() >= thresholds::MIN_CHINESE_WORD_LENGTH {
                 phrases.insert(segment.to_string());
             }
@@ -405,8 +345,25 @@ fn intent_match_bonus(skill: &SkillManifest, intent: &UserIntent, input: &str) -
     let desc_lower = skill.description.to_lowercase();
     let name_lower = skill.name.to_lowercase();
 
-    match intent {
-        UserIntent::QueryConcept => {
+    // 如果是搜索资源类查询，给执行类技能负分
+    if intent.is_searching_resource("skill") {
+        let execution_keywords = [
+            "审查", "重构", "调试", "评估", "分析",
+            "review", "refactor", "debug", "analyze",
+        ];
+
+        if execution_keywords.iter().any(|kw| desc_lower.contains(kw))
+            && (name_lower.contains("review")
+                || name_lower.contains("refactor")
+                || name_lower.contains("debug")
+                || name_lower.contains("analyzer"))
+        {
+            return weights::EXCLUDED_INTENT_PENALTY;
+        }
+    }
+
+    match &intent.core {
+        CoreIntent::QueryConcept => {
             // 如果技能是用于"询问概念"的，加分
             // 但大多数代码技能不适用于概念询问，所以这里通常是 0 或负分
             if desc_lower.contains("询问") || desc_lower.contains("question") {
@@ -417,10 +374,10 @@ fn intent_match_bonus(skill: &SkillManifest, intent: &UserIntent, input: &str) -
                 0.0
             }
         }
-        UserIntent::RequestAction => {
+        CoreIntent::RequestAction => {
             let mut score = 0.0;
 
-            // 基础意图匹配：降低单纯行动意图的加分，避免只要有“帮我做”就容易过阈值
+            // 基础意图匹配：降低单纯行动意图的加分，避免只要有"帮我做"就容易过阈值
             if desc_lower.contains("进行")
                 || desc_lower.contains("评估")
                 || desc_lower.contains("审查")
@@ -461,7 +418,7 @@ fn intent_match_bonus(skill: &SkillManifest, intent: &UserIntent, input: &str) -
 
             score
         }
-        UserIntent::SeekSolution => {
+        CoreIntent::SeekSolution => {
             let mut score = 0.0;
             if desc_lower.contains("解决")
                 || desc_lower.contains("修复")
@@ -485,7 +442,7 @@ fn intent_match_bonus(skill: &SkillManifest, intent: &UserIntent, input: &str) -
             }
             score
         }
-        UserIntent::Casual => 0.0,
+        CoreIntent::Casual => 0.0,
     }
 }
 
@@ -637,419 +594,4 @@ fn is_chinese_stop_char(ch: char) -> bool {
             | '为'
             | '以'
     )
-}
-
-
-/// 技能匹配的历史成功率统计 - 用于动态调整技能选择
-#[derive(Debug, Clone)]
-pub struct SkillSuccessRate {
-    /// 技能名称
-    pub skill_name: String,
-    /// 总调用次数
-    pub total_invocations: u32,
-    /// 成功次数
-    pub successful_outcomes: u32,
-    /// 平均解决轮次
-    pub avg_turns_to_resolve: f64,
-    /// 用户满意度评分 (如果有反馈)
-    pub user_satisfaction_score: Option<f64>,
-}
-
-impl SkillSuccessRate {
-    pub fn new(skill_name: &str) -> Self {
-        Self {
-            skill_name: skill_name.to_string(),
-            total_invocations: 0,
-            successful_outcomes: 0,
-            avg_turns_to_resolve: 0.0,
-            user_satisfaction_score: None,
-        }
-    }
-    
-    /// 记录一次调用
-    pub fn record_invocation(&mut self, success: bool, turns: u32) {
-        self.total_invocations += 1;
-        if success {
-            self.successful_outcomes += 1;
-        }
-        // 指数移动平均更新
-        let alpha = 0.3;
-        self.avg_turns_to_resolve = 
-            (turns as f64) * alpha + self.avg_turns_to_resolve * (1.0 - alpha);
-    }
-    
-    /// 记录用户反馈
-    pub fn record_feedback(&mut self, rating: f64) {
-        let alpha = 0.3;
-        self.user_satisfaction_score = Some(
-            match self.user_satisfaction_score {
-                Some(current) => rating * alpha + current * (1.0 - alpha),
-                None => rating,
-            }
-        );
-    }
-    
-    /// 计算成功率
-    pub fn success_rate(&self) -> f64 {
-        if self.total_invocations == 0 {
-            return 0.0;
-        }
-        self.successful_outcomes as f64 / self.total_invocations as f64
-    }
-    
-    /// 计算综合评分乘数 (0.5 - 1.5)
-    pub fn multiplier(&self) -> f64 {
-        let base = 1.0;
-        
-        // 成功率贡献
-        let rate_factor = if self.total_invocations >= 5 {
-            // 有足够样本时才考虑成功率
-            let rate = self.success_rate();
-            (rate - 0.5) * 0.4  // -0.2 to +0.2
-        } else {
-            0.0
-        };
-        
-        // 用户满意度贡献
-        let satisfaction_factor = self.user_satisfaction_score
-            .map(|score| (score - 0.5) * 0.4)  // -0.2 to +0.2
-            .unwrap_or(0.0);
-        
-        // 解决速度贡献（越快越好）
-        let speed_factor = if self.avg_turns_to_resolve > 0.0 {
-            let speed_score = 1.0 / (1.0 + self.avg_turns_to_resolve / 5.0);
-            (speed_score - 0.5) * 0.2  // -0.1 to +0.1
-        } else {
-            0.0
-        };
-        
-        (base + rate_factor + satisfaction_factor + speed_factor).clamp(0.5, 1.5)
-    }
-}
-
-/// 技能匹配统计管理器
-pub struct SkillMatchStats {
-    rates: std::collections::HashMap<String, SkillSuccessRate>,
-}
-
-impl SkillMatchStats {
-    pub fn new() -> Self {
-        Self {
-            rates: std::collections::HashMap::new(),
-        }
-    }
-    
-    /// 获取或创建技能的统计
-    pub fn get_or_create(&mut self, skill_name: &str) -> &mut SkillSuccessRate {
-        self.rates
-            .entry(skill_name.to_string())
-            .or_insert_with(|| SkillSuccessRate::new(skill_name))
-    }
-    
-    /// 记录技能调用结果
-    pub fn record_outcome(&mut self, skill_name: &str, success: bool, turns: u32) {
-        let rate = self.get_or_create(skill_name);
-        rate.record_invocation(success, turns);
-    }
-    
-    /// 记录用户反馈
-    pub fn record_feedback(&mut self, skill_name: &str, rating: f64) {
-        let rate = self.get_or_create(skill_name);
-        rate.record_feedback(rating);
-    }
-    
-    /// 获取技能的评分乘数
-    pub fn get_multiplier(&self, skill_name: &str) -> f64 {
-        self.rates
-            .get(skill_name)
-            .map(|r| r.multiplier())
-            .unwrap_or(1.0)
-    }
-    
-    /// 导出统计信息（用于调试/分析）
-    pub fn export_stats(&self) -> Vec<SkillSuccessRate> {
-        self.rates.values().cloned().collect()
-    }
-}
-
-impl Default for SkillMatchStats {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn skill(name: &str, description: &str, priority: i32) -> SkillManifest {
-        SkillManifest {
-            name: name.to_string(),
-            version: "1.0.0".to_string(),
-            description: description.to_string(),
-            author: Some("system".to_string()),
-            tools: Vec::new(),
-            tool_groups: Vec::new(),
-            mcp_servers: Vec::new(),
-            prompt: String::new(),
-            system_prompt: None,
-            priority,
-            source_path: None,
-        }
-    }
-
-    #[test]
-    fn test_no_match_for_irrelevant_input() {
-        let skills = vec![skill("openclaw", "agent mode for complex tasks", 30)];
-        assert!(match_skill(&skills, "随便聊聊今天吃什么").is_none());
-    }
-
-    #[test]
-    fn test_name_match() {
-        let skills = vec![skill("refactor", "code refactoring expert", 65)];
-        let matched = match_skill(&skills, "帮我 refactor 这段代码");
-        assert!(matched.is_some());
-        assert_eq!(matched.unwrap().name, "refactor");
-    }
-
-    #[test]
-    fn test_description_match() {
-        let skills = vec![skill(
-            "debugger",
-            "调试专家：帮助定位和修复代码中的 bug、错误、异常",
-            70,
-        )];
-        let matched = match_skill(&skills, "代码有 bug，帮我调试一下");
-        assert!(matched.is_some());
-        assert_eq!(matched.unwrap().name, "debugger");
-    }
-
-    #[test]
-    fn test_priority_not_primary_factor() {
-        let skills = vec![
-            skill("openclaw", "agent mode for complex tasks", 30),
-            skill("debugger", "调试专家：帮助定位和修复代码中的 bug", 90),
-        ];
-
-        // 输入明确指向 openclaw，应该匹配 openclaw 而不是高优先级的 debugger
-        let matched = match_skill(&skills, "开启 openclaw 模式");
-        assert!(matched.is_some());
-        assert_eq!(matched.unwrap().name, "openclaw");
-    }
-
-    #[test]
-    fn test_nba_query_does_not_match_refactor() {
-        // 验证：查询 NBA 比赛和排名不应该匹配到 refactor 技能
-        let skills = vec![skill(
-            "refactor",
-            "重构专家：重构代码结构、命名、可读性与可测试性。适用于代码整理、提取函数、去重复、优化结构等场景。不适用于修复报错、调试、处理异常等情况。",
-            65,
-        )];
-        let input = "帮我看一下今天 nba 的比赛，和现在东西部的所有球队排名";
-        let matched = match_skill(&skills, input);
-        // 应该不匹配，因为输入与重构无关
-        assert!(matched.is_none(), "NBA 查询不应该匹配到 refactor 技能");
-    }
-
-    #[test]
-    fn test_python_flask_question_does_not_match_code_review() {
-        // 验证：询问 Python Flask 中的变量含义不应该匹配到 code-review 技能
-        // 这是一个回归测试，防止标点符号（如 .）导致误匹配
-        let skills = vec![skill(
-            "code-review",
-            "代码审查专家：仅针对源代码文件进行质量、安全、性能与可维护性评估。ONLY for reviewing SOURCE CODE files (e.g., .rs, .py, .js, .java, etc.). 如果用户询问的不是代码（如新闻、体育、数据、文档等），切勿选择此技能。",
-            70,
-        )];
-        let input = "python flask 中 g.request_base_info_dict 这个是什么";
-        let matched = match_skill(&skills, input);
-        // 应该不匹配，因为这是在询问变量含义，不是请求代码审查
-        assert!(
-            matched.is_none(),
-            "Python Flask 变量询问不应该匹配到 code-review 技能"
-        );
-    }
-
-    #[test]
-    fn test_generate_code_does_not_match_code_review() {
-        let skills = vec![skill(
-            "code-review",
-            "代码审查专家：仅针对源代码文件进行质量、安全、性能与可维护性评估。ONLY for reviewing SOURCE CODE files (e.g., .rs, .py, .js, .java, etc.). 如果用户询问的不是代码（如新闻、体育、数据、文档等），切勿选择此技能。",
-            70,
-        )];
-        let input = "你帮我生成一段大约200行的python代码。需要可以运行，不需要依赖任何三方库";
-        let matched = match_skill(&skills, input);
-        assert!(matched.is_none(), "生成代码不应该匹配到 code-review");
-    }
-
-    #[test]
-    fn test_intent_detection_query_concept() {
-        assert_eq!(detect_intent("这是什么意思"), UserIntent::QueryConcept);
-        assert_eq!(
-            detect_intent("python flask 中 g.request 是什么"),
-            UserIntent::QueryConcept
-        );
-        assert_eq!(detect_intent("what is this"), UserIntent::QueryConcept);
-        assert_eq!(detect_intent("这个变量代表什么"), UserIntent::QueryConcept);
-    }
-
-    #[test]
-    fn test_intent_detection_request_action() {
-        assert_eq!(detect_intent("帮我重构这段代码"), UserIntent::RequestAction);
-        assert_eq!(detect_intent("请帮我审查代码"), UserIntent::RequestAction);
-        assert_eq!(detect_intent("help me fix this"), UserIntent::RequestAction);
-        assert_eq!(detect_intent("帮我运行测试"), UserIntent::RequestAction);
-    }
-
-    #[test]
-    fn test_intent_detection_seek_solution() {
-        assert_eq!(detect_intent("怎么解决这个问题"), UserIntent::SeekSolution);
-        assert_eq!(detect_intent("如何处理这个错误"), UserIntent::SeekSolution);
-        assert_eq!(detect_intent("how to fix this"), UserIntent::SeekSolution);
-        assert_eq!(
-            detect_intent("为什么会出现这个错误"),
-            UserIntent::SeekSolution
-        );
-    }
-
-    #[test]
-    fn test_code_review_should_match_review_request() {
-        // 验证：明确的代码审查请求应该匹配 code-review
-        let skills = vec![skill(
-            "code-review",
-            "代码审查专家：仅针对源代码文件进行质量、安全、性能与可维护性评估。ONLY for reviewing SOURCE CODE files (e.g., .rs, .py, .js, .java, etc.). 如果用户询问的不是代码（如新闻、体育、数据、文档等），切勿选择此技能。",
-            70,
-        )];
-        let input = "帮我审查一下这段代码的质量";
-        let matched = match_skill(&skills, input);
-        assert!(matched.is_some(), "代码审查请求应该匹配 code-review 技能");
-        assert_eq!(matched.unwrap().name, "code-review");
-    }
-
-    #[test]
-    fn test_refactor_should_match_refactor_request() {
-        // 验证：明确的重构请求应该匹配 refactor
-        let skills = vec![skill(
-            "refactor",
-            "代码重构专家：ONLY for refactoring SOURCE CODE (improve structure, naming, readability, testability without changing behavior). 如果用户询问的不是代码（如数据整理、文档优化、新闻体育等），切勿选择此技能。不适用于修复报错、调试、处理异常等情况。",
-            65,
-        )];
-        let input = "帮我重构这个函数，提高可读性";
-        let matched = match_skill(&skills, input);
-        assert!(matched.is_some(), "重构请求应该匹配 refactor 技能");
-        assert_eq!(matched.unwrap().name, "refactor");
-    }
-
-    #[test]
-    fn test_debugger_should_match_debug_request() {
-        // 验证：调试请求应该匹配 debugger
-        let skills = vec![skill(
-            "debugger",
-            "代码调试专家：ONLY for debugging SOURCE CODE issues (compile errors, runtime bugs, test failures, panic, exceptions). 如果用户询问的不是代码问题（如数据分析、业务问题、新闻体育等），切勿选择此技能。",
-            70,
-        )];
-        let input = "代码编译报错了，帮我调试一下";
-        let matched = match_skill(&skills, input);
-        assert!(matched.is_some(), "调试请求应该匹配 debugger 技能");
-        assert_eq!(matched.unwrap().name, "debugger");
-    }
-
-    #[test]
-    fn test_question_about_code_not_match_action_skills() {
-        // 验证：询问代码概念不应该匹配需要行动的技能
-        let skills = vec![
-            skill(
-                "code-review",
-                "代码审查专家：仅针对源代码文件进行质量、安全、性能与可维护性评估。如果用户询问的不是代码，切勿选择此技能。",
-                70,
-            ),
-            skill(
-                "refactor",
-                "代码重构专家：ONLY for refactoring SOURCE CODE. 如果用户询问的不是代码，切勿选择此技能。",
-                65,
-            ),
-        ];
-
-        // 询问变量含义
-        let input1 = "g.request_base_info_dict 这个变量是什么意思";
-        assert!(
-            match_skill(&skills, input1).is_none(),
-            "询问变量含义不应该匹配任何技能"
-        );
-
-        // 询问函数定义
-        let input2 = "flask 中的 g 对象是什么";
-        assert!(
-            match_skill(&skills, input2).is_none(),
-            "询问概念不应该匹配任何技能"
-        );
-    }
-
-    #[test]
-    fn test_phrase_matching() {
-        let skills = vec![skill(
-            "refactor",
-            "重构专家：提取函数、减少嵌套、优化代码结构，专门用于重构代码",
-            65,
-        )];
-
-        // 输入包含技能描述中的短语
-        let input = "帮我重构这段代码，提取函数，减少嵌套";
-        let matched = match_skill(&skills, input);
-        assert!(matched.is_some(), "短语匹配应该成功");
-    }
-
-    #[test]
-    fn test_chinese_semantic_matching() {
-        let skills = vec![skill(
-            "debugger",
-            "调试专家：帮助定位和修复代码中的 bug、错误、异常，专门用于调试",
-            70,
-        )];
-
-        // 输入包含中文关键词
-        let input = "代码有错误，帮我调试定位一下";
-        let matched = match_skill(&skills, input);
-        assert!(matched.is_some(), "中文语义匹配应该成功");
-    }
-
-    #[test]
-    fn test_multiple_skills_selection() {
-        // 验证：当有多个技能时，选择最匹配的
-        let skills = vec![
-            skill(
-                "refactor",
-                "代码重构专家：优化代码结构、提取函数、去重复",
-                65,
-            ),
-            skill("debugger", "调试专家：修复 bug、错误、异常", 70),
-            skill("code-review", "代码审查专家：评估代码质量、安全、性能", 65),
-        ];
-
-        // 明确的重构请求
-        let input1 = "帮我重构这段代码，提取函数";
-        let matched1 = match_skill(&skills, input1);
-        assert_eq!(matched1.unwrap().name, "refactor");
-
-        // 明确的调试请求（包含 bug 关键词）
-        let input2 = "代码有 bug，帮我修复";
-        let matched2 = match_skill(&skills, input2);
-        assert_eq!(matched2.unwrap().name, "debugger");
-
-        // 明确的审查请求
-        let input3 = "帮我审查代码质量";
-        let matched3 = match_skill(&skills, input3);
-        assert_eq!(matched3.unwrap().name, "code-review");
-    }
-}
-
-#[cfg(test)]
-mod command_validation_tests {
-    use crate::ai::tools::command_tools;
-
-    #[test]
-    fn execute_command_blocks_dangerous_programs() {
-        assert!(command_tools::validate_execute_command("rm -rf /").is_err());
-        // assert!(command_tools::validate_execute_command("mv a b").is_err());
-        assert!(command_tools::validate_execute_command("sudo ls").is_err());
-    }
 }

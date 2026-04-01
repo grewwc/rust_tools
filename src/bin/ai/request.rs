@@ -454,3 +454,57 @@ pub(super) fn print_info(model: &str) {
     // 使用 println! 避免手动 flush 的权限问题
     println!("[{} (search: {})]", model.green(), search.red());
 }
+
+/// 使用 LLM 进行 JSON 格式的请求（用于意图识别等场景）
+pub async fn do_request_json(
+    app: &App,
+    model: &str,
+    messages: &[serde_json::Value],
+    stream: bool,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let request_body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    });
+
+    for attempt in 1..=REQUEST_MAX_ATTEMPTS {
+        let response = app
+            .client
+            .post(&app.config.endpoint)
+            .bearer_auth(&app.config.api_key)
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await;
+
+        match response {
+            Ok(response) => {
+                if response.status().is_success() {
+                    let json: serde_json::Value = response.json().await?;
+                    return Ok(json);
+                }
+                let status = response.status();
+                let body = (response.text().await).unwrap_or_default();
+                let err = RequestError::status(status, body);
+                if should_retry_status(status) && attempt < REQUEST_MAX_ATTEMPTS {
+                    let delay = retry_delay(attempt);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(err.into());
+            }
+            Err(err) => {
+                if is_retryable_reqwest_error(&err) && attempt < REQUEST_MAX_ATTEMPTS {
+                    let delay = retry_delay(attempt);
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                return Err(err.into());
+            }
+        }
+    }
+
+    Err("request failed after all attempts".into())
+}
+

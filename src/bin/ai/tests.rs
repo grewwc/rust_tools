@@ -6,8 +6,8 @@ use serde_json::Value;
 use super::{
     files,
     history::{
-        COLON, Message, NEWLINE, SessionStore, append_history, append_history_messages,
-        build_message_arr, compress_messages_for_context,
+        COLON, MAX_HISTORY_TURNS, Message, NEWLINE, SessionStore, append_history,
+        append_history_messages, build_message_arr, compress_messages_for_context,
     },
     models,
     prompt::MultilineHistoryState,
@@ -64,6 +64,7 @@ fn resolve_model_is_unicode_safe() {
         history_max_chars: 12000,
         history_keep_last: 8,
         history_summary_max_chars: 4000,
+        intent_model: None,
     };
     let client = reqwest::Client::builder().build().unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -289,6 +290,100 @@ fn structured_history_messages() -> Vec<Message> {
 }
 
 #[test]
+fn history_retains_turns_under_cap() {
+    let turns = MAX_HISTORY_TURNS.saturating_sub(50).max(1);
+    for ext in ["txt", "sqlite"] {
+        let path = std::env::temp_dir().join(format!("ai-history-{}.{}", uuid::Uuid::new_v4(), ext));
+        for i in 0..turns {
+            append_history_messages(
+                &path,
+                &[
+                    Message {
+                        role: "user".to_string(),
+                        content: Value::String(format!("u{i}")),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    Message {
+                        role: "assistant".to_string(),
+                        content: Value::String(format!("a{i}")),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                ],
+            )
+            .unwrap();
+        }
+        let loaded = build_message_arr(10_000, &path).unwrap();
+        assert_eq!(loaded.first().unwrap().content, Value::String("u0".to_string()));
+        assert_eq!(
+            loaded.last().unwrap().content,
+            Value::String(format!("a{}", turns - 1))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
+fn history_compacts_old_turns_into_summary() {
+    let turns = MAX_HISTORY_TURNS + 50;
+    for ext in ["txt", "sqlite"] {
+        let path = std::env::temp_dir().join(format!("ai-history-{}.{}", uuid::Uuid::new_v4(), ext));
+        for i in 0..turns {
+            append_history_messages(
+                &path,
+                &[
+                    Message {
+                        role: "user".to_string(),
+                        content: Value::String(format!("u{i}")),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    Message {
+                        role: "assistant".to_string(),
+                        content: Value::String(format!("a{i}")),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                    Message {
+                        role: "tool".to_string(),
+                        content: Value::String(format!("t{i}")),
+                        tool_calls: None,
+                        tool_call_id: Some(format!("call_{i}")),
+                    },
+                    Message {
+                        role: "assistant".to_string(),
+                        content: Value::String(format!("a{i}_final")),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                ],
+            )
+            .unwrap();
+        }
+        let loaded = build_message_arr(10_000, &path).unwrap();
+        assert_eq!(loaded.first().unwrap().role, "system");
+        assert!(
+            loaded
+                .first()
+                .and_then(|m| m.content.as_str())
+                .unwrap_or_default()
+                .contains("历史摘要")
+        );
+        let first_user = loaded.iter().find(|m| m.role == "user").unwrap();
+        assert_ne!(first_user.content, Value::String("u0".to_string()));
+        let user_count = loaded.iter().filter(|m| m.role == "user").count();
+        assert!(user_count <= MAX_HISTORY_TURNS);
+        assert!(user_count < turns);
+        assert_eq!(
+            loaded.last().unwrap().content,
+            Value::String(format!("a{}_final", turns - 1))
+        );
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[test]
 fn session_delete_removes_sqlite_sidecars() {
     let history_file =
         std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
@@ -367,7 +462,7 @@ fn thinking_chunks_are_wrapped_once() {
     let mut thinking_open = false;
     let text =
         stream::extract_chunk_text(&chunk, "<thinking>", "<end thinking>", &mut thinking_open);
-    assert_eq!(text, "\n<thinking>\nstep one");
+    assert_eq!(text, "\n<thinking>\n\x1b[2mstep one");
     assert!(thinking_open);
 
     let chunk = StreamChunk {
@@ -382,7 +477,7 @@ fn thinking_chunks_are_wrapped_once() {
     };
     let text =
         stream::extract_chunk_text(&chunk, "<thinking>", "<end thinking>", &mut thinking_open);
-    assert_eq!(text, "\n<end thinking>\nfinal");
+    assert_eq!(text, "\x1b[0m\n<end thinking>\nfinal");
     assert!(!thinking_open);
 }
 

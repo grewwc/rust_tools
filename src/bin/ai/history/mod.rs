@@ -18,7 +18,7 @@ pub(in crate::ai) use markdown::messages_to_markdown;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
 #[allow(unused_imports)]
-pub(in crate::ai) use types::{COLON, MAX_HISTORY_LINES, Message, NEWLINE};
+pub(in crate::ai) use types::{COLON, MAX_HISTORY_TURNS, Message, NEWLINE};
 
 pub(in crate::ai) fn build_context_history(
     history_count: usize,

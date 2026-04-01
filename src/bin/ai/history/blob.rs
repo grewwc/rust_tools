@@ -7,8 +7,9 @@ use std::{
 use crate::commonw::utils::open_file_for_append;
 
 use super::{
+    compress,
     sqlite,
-    types::{COLON, MAX_HISTORY_LINES, Message, NEWLINE},
+    types::{COLON, Message, NEWLINE},
 };
 
 pub(in crate::ai) fn build_message_arr(
@@ -24,21 +25,23 @@ pub(in crate::ai) fn build_message_arr(
         Err(err) => return Err(err.into()),
     };
 
-    let newline = NEWLINE.to_string();
-    let lines: Vec<&str> = history.split(NEWLINE).collect();
-    let mut messages = Vec::new();
-
+    // Split and filter out empty trailing line (caused by trailing newline)
+    let mut lines: Vec<&str> = history.split(NEWLINE).collect();
+    if lines.last().map_or(false, |s| s.is_empty()) {
+        lines.pop();
+    }
+    let mut parsed_messages = Vec::new();
     for line in &lines {
         if let Some(message) = parse_history_line(line) {
-            messages.push(message);
+            parsed_messages.push(message);
         }
     }
 
-    if lines.len() > MAX_HISTORY_LINES {
-        let start = lines.len() - MAX_HISTORY_LINES;
-        let trimmed = lines[start..].join(&newline);
-        fs::write(history_file, trimmed)?;
+    let compacted = compress::compact_persisted_history(parsed_messages.clone());
+    if compacted != parsed_messages {
+        fs::write(history_file, serialize_history_messages(&compacted))?;
     }
+    let messages = compacted;
 
     if history_count >= messages.len() {
         return Ok(messages);
@@ -76,6 +79,21 @@ fn append_history_blob(path: &Path, content: &str) -> io::Result<()> {
     let mut file = open_file_for_append(path, 0o664)?;
     use std::io::Write;
     file.write_all(content.as_bytes())
+}
+
+fn serialize_history_messages(messages: &[Message]) -> String {
+    let newline = NEWLINE.to_string();
+    let mut records = Vec::with_capacity(messages.len());
+    for message in messages {
+        if let Ok(record) = serde_json::to_string(message) {
+            records.push(record);
+        }
+    }
+    if records.is_empty() {
+        String::new()
+    } else {
+        format!("{}{}", records.join(&newline), newline)
+    }
 }
 
 pub(in crate::ai) fn delete_history_artifacts(path: &Path) -> io::Result<()> {

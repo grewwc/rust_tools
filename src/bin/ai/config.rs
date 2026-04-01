@@ -36,6 +36,7 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         .get_opt("ai.history.summary_max_chars")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4000);
+    let intent_model = cfg.get_opt("ai.intent_model");
     Ok(AppConfig {
         api_key,
         history_file: PathBuf::from(expanduser(&history_file).as_ref()),
@@ -44,6 +45,7 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         history_max_chars,
         history_keep_last,
         history_summary_max_chars,
+        intent_model,
     })
 }
 

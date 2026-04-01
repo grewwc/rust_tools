@@ -16,6 +16,8 @@ tools:
   - git_diff
   - cargo_check
   - cargo_test
+  - web_search
+  - web_fetch
 priority: 70
 ---
 

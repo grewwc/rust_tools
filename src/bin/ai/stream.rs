@@ -1237,9 +1237,20 @@ enum TableAlign {
 
 fn table_preview_height(line: &str) -> usize {
     let cols = terminal_width().max(1);
-    let width = UnicodeWidthStr::width(line);
-    let width = width.max(1);
-    width.div_ceil(cols)
+    let mut lines = 1usize;
+    let mut current_col = 0usize;
+    
+    for ch in line.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_col > 0 && current_col + w > cols {
+            lines += 1;
+            current_col = w;
+        } else {
+            current_col += w;
+        }
+    }
+    
+    lines
 }
 
 fn split_indent(s: &str) -> (&str, &str) {

@@ -238,7 +238,7 @@ pub(super) async fn prepare_skill_for_turn(
         None
     };
 
-    let heuristic_skill = match_skill(skill_manifests, question);
+    let heuristic_skill = match_skill(skill_manifests, question, None);
     let router_skill = router_selected
         .as_deref()
         .and_then(|name| skill_manifests.iter().find(|s| s.name == name));
