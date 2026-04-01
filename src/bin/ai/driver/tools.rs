@@ -380,12 +380,22 @@ pub(super) fn execute_tool_calls(
     mcp_client: &McpClient,
     tool_calls: &[ToolCall],
 ) -> Result<ExecuteToolCallsResult, Box<dyn Error>> {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return tokio::task::block_in_place(|| execute_tool_calls_inner(mcp_client, tool_calls));
+    }
+    execute_tool_calls_inner(mcp_client, tool_calls)
+}
+
+fn execute_tool_calls_inner(
+    mcp_client: &McpClient,
+    tool_calls: &[ToolCall],
+) -> Result<ExecuteToolCallsResult, Box<dyn Error>> {
     let mut executed_tool_calls = Vec::with_capacity(tool_calls.len());
     let mut tool_results = Vec::with_capacity(tool_calls.len());
 
     for (idx, tool_call) in tool_calls.iter().enumerate() {
         let is_last = idx + 1 >= tool_calls.len();
-        let (route, run_result) = tokio::task::block_in_place(|| run_one(mcp_client, tool_call));
+        let (route, run_result) = run_one(mcp_client, tool_call);
         let should_barrier = should_barrier_after(
             &route,
             tool_call,

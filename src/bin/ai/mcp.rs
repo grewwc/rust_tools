@@ -52,6 +52,10 @@ struct JsonRpcError {
 pub(super) struct McpClient {
     servers: HashMap<ServerId, Mutex<McpServerConnection>>,
     next_id: AtomicU64,
+    cached_tool_definitions: Vec<ToolDefinition>,
+    cached_resources: Vec<(String, McpResource)>,
+    cached_prompts: Vec<(String, McpPrompt)>,
+    cached_server_prefixes: Vec<(String, String)>,
 }
 
 struct McpServerConnection {
@@ -242,6 +246,10 @@ impl McpClient {
         Self {
             servers: HashMap::new(),
             next_id: AtomicU64::new(1),
+            cached_tool_definitions: Vec::new(),
+            cached_resources: Vec::new(),
+            cached_prompts: Vec::new(),
+            cached_server_prefixes: Vec::new(),
         }
     }
 
@@ -289,7 +297,57 @@ impl McpClient {
         conn.prompts = self.list_prompts(&mut conn)?;
 
         self.servers.insert(name.to_string(), Mutex::new(conn));
+        self.rebuild_metadata_cache();
         Ok(())
+    }
+
+    fn rebuild_metadata_cache(&mut self) {
+        let mut tool_definitions = Vec::new();
+        let mut resources = Vec::new();
+        let mut prompts = Vec::new();
+        let mut server_prefixes = Vec::with_capacity(self.servers.len());
+
+        for (server_name, conn) in &self.servers {
+            server_prefixes.push((server_name.clone(), format!("mcp_{server_name}_")));
+
+            let Ok(conn) = conn.lock() else {
+                continue;
+            };
+
+            tool_definitions.reserve(conn.tools.len());
+            for tool in &conn.tools {
+                tool_definitions.push(ToolDefinition {
+                    tool_type: "function".to_string(),
+                    function: FunctionDefinition {
+                        name: format!("mcp_{}_{}", server_name, tool.name),
+                        description: tool.description.clone().unwrap_or_default(),
+                        parameters: tool.input_schema.clone(),
+                    },
+                });
+            }
+
+            resources.reserve(conn.resources.len());
+            resources.extend(
+                conn.resources
+                    .iter()
+                    .cloned()
+                    .map(|resource| (server_name.clone(), resource)),
+            );
+
+            prompts.reserve(conn.prompts.len());
+            prompts.extend(
+                conn.prompts
+                    .iter()
+                    .cloned()
+                    .map(|prompt| (server_name.clone(), prompt)),
+            );
+        }
+
+        rust_tools::sortw::stable_sort_by(&mut server_prefixes, |a, b| b.1.len().cmp(&a.1.len()));
+        self.cached_tool_definitions = tool_definitions;
+        self.cached_resources = resources;
+        self.cached_prompts = prompts;
+        self.cached_server_prefixes = server_prefixes;
     }
 
     fn next_request_id(&self) -> u64 {
@@ -476,23 +534,7 @@ impl McpClient {
     }
 
     pub(super) fn get_all_tools(&self) -> Vec<ToolDefinition> {
-        let mut result = Vec::new();
-        for (server_name, conn) in &self.servers {
-            let Ok(conn) = conn.lock() else {
-                continue;
-            };
-            for tool in &conn.tools {
-                result.push(ToolDefinition {
-                    tool_type: "function".to_string(),
-                    function: FunctionDefinition {
-                        name: format!("mcp_{}_{}", server_name, tool.name),
-                        description: tool.description.clone().unwrap_or_default(),
-                        parameters: tool.input_schema.clone(),
-                    },
-                });
-            }
-        }
-        result
+        self.cached_tool_definitions.clone()
     }
 
     pub(super) fn parse_tool_name_for_known_server(
@@ -503,15 +545,11 @@ impl McpClient {
             return None;
         }
 
-        let mut names: Vec<&String> = self.servers.keys().collect();
-        names.sort_by_key(|n| std::cmp::Reverse(n.len()));
-
-        for name in names {
-            let prefix = format!("mcp_{}_", name);
-            if let Some(tool_name) = full_name.strip_prefix(&prefix)
+        for (server_name, prefix) in &self.cached_server_prefixes {
+            if let Some(tool_name) = full_name.strip_prefix(prefix)
                 && !tool_name.is_empty()
             {
-                return Some((name.clone(), tool_name.to_string()));
+                return Some((server_name.clone(), tool_name.to_string()));
             }
         }
 
@@ -519,29 +557,11 @@ impl McpClient {
     }
 
     pub(super) fn get_all_resources(&self) -> Vec<(String, McpResource)> {
-        let mut result = Vec::new();
-        for (server_name, conn) in &self.servers {
-            let Ok(conn) = conn.lock() else {
-                continue;
-            };
-            for r in &conn.resources {
-                result.push((server_name.clone(), r.clone()));
-            }
-        }
-        result
+        self.cached_resources.clone()
     }
 
     pub(super) fn get_all_prompts(&self) -> Vec<(String, McpPrompt)> {
-        let mut result = Vec::new();
-        for (server_name, conn) in &self.servers {
-            let Ok(conn) = conn.lock() else {
-                continue;
-            };
-            for p in &conn.prompts {
-                result.push((server_name.clone(), p.clone()));
-            }
-        }
-        result
+        self.cached_prompts.clone()
     }
 
     pub(super) fn disconnect_all(&mut self) {
@@ -550,6 +570,10 @@ impl McpClient {
             let mut process = conn.process;
             let _ = process.kill();
         }
+        self.cached_tool_definitions.clear();
+        self.cached_resources.clear();
+        self.cached_prompts.clear();
+        self.cached_server_prefixes.clear();
     }
 }
 
