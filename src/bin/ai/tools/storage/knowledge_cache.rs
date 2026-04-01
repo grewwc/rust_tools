@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, Duration, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
+use crate::commonw::utils::get_config_dir;
 use crate::ai::tools::storage::knowledge_fingerprint::{KnowledgeFingerprint, FingerprintVerificationResult};
 use crate::ai::tools::storage::knowledge_types::{KnowledgeMetadata, ValidationStrategy, ValidationResult, ValidationSuggestion, KnowledgeType as NewKnowledgeType};
 
@@ -69,7 +70,9 @@ impl KnowledgeType {
             "project_structure" | "project_info" => KnowledgeType::ProjectStructure,
             "code_content" | "code_snippet" => KnowledgeType::CodeContent,
             "project_config" | "config" => KnowledgeType::ProjectConfig,
-            "coding_guideline" | "best_practice" => KnowledgeType::CodingGuideline,
+            "coding_guideline" | "best_practice" | "common_sense" => {
+                KnowledgeType::CodingGuideline
+            }
             "user_preference" | "preference" => KnowledgeType::UserPreference,
             _ => KnowledgeType::Other,
         }
@@ -358,7 +361,7 @@ pub struct SessionKnowledgeCache {
 impl SessionKnowledgeCache {
     /// 创建新的缓存管理器
     pub fn new() -> Self {
-        let cache_file = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
+        let cache_file = get_config_dir().unwrap_or_else(|| std::path::PathBuf::from("~/.config"))
             .join("rust_tools")
             .join("knowledge_cache.json");
         

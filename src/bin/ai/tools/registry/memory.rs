@@ -3,8 +3,8 @@ use serde_json::Value;
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 use crate::ai::tools::service::memory::{
     execute_memory_append, execute_memory_dedup, execute_memory_gc, execute_memory_list_json,
-    execute_memory_recent, execute_memory_rotate, execute_memory_search, execute_memory_save,
-    execute_memory_update,
+    execute_memory_delete, execute_memory_recent, execute_memory_rotate, execute_memory_search,
+    execute_memory_save, execute_memory_update,
 };
 use crate::ai::tools::service::knowledge_update::execute_knowledge_cache_manage;
 
@@ -132,6 +132,19 @@ fn params_memory_recent() -> Value {
                 "description": "Number of recent entries (default: 10, max: 50)."
             }
         }
+    })
+}
+
+fn params_memory_delete() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "description": "Memory entry id to delete."
+            }
+        },
+        "required": ["id"]
     })
 }
 
@@ -263,6 +276,16 @@ inventory::submit!(ToolRegistration {
         description: "Get recent memory entries.",
         parameters: params_memory_recent,
         execute: execute_memory_recent,
+        groups: &["builtin"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "memory_delete",
+        description: "Delete a memory entry by id.",
+        parameters: params_memory_delete,
+        execute: execute_memory_delete,
         groups: &["builtin"],
     }
 });

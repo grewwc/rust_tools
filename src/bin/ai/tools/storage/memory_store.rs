@@ -770,3 +770,273 @@ impl MemoryStore {
         Ok(())
     }
 }
+
+/// 记忆重要性评分 - 用于主动学习和自动遗忘
+#[derive(Debug, Clone)]
+pub struct MemoryImportance {
+    /// 被引用次数
+    pub frequency: u32,
+    /// 时间衰减因子 (0.0 - 1.0, 越近越高)
+    pub recency: f64,
+    /// 适用范围广度 (0.0 - 1.0)
+    pub generality: f64,
+    /// 用户是否确认过
+    pub user_validated: bool,
+}
+
+impl MemoryImportance {
+    pub fn new() -> Self {
+        Self {
+            frequency: 0,
+            recency: 1.0,
+            generality: 0.5,
+            user_validated: false,
+        }
+    }
+    
+    /// 计算综合重要性分数 (0.0 - 1.0)
+    pub fn score(&self) -> f64 {
+        let freq_score = (self.frequency as f64).min(10.0) / 10.0; // 0-1
+        let recency_score = self.recency.clamp(0.0, 1.0);
+        let generality_score = self.generality.clamp(0.0, 1.0);
+        let validation_bonus = if self.user_validated { 0.2 } else { 0.0 };
+        
+        // 权重：频率 30%, 时效性 30%, 通用性 20%, 用户确认 20%
+        (freq_score * 0.3 + recency_score * 0.3 + generality_score * 0.2 + validation_bonus).min(1.0)
+    }
+    
+    /// 增加引用次数
+    pub fn increment_frequency(&mut self) {
+        self.frequency += 1;
+    }
+    
+    /// 更新时间衰减
+    pub fn update_recency(&mut self, created_at: &str) {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(created_at) {
+            let now = chrono::Utc::now();
+            let age_days = (now - dt.with_timezone(&chrono::Utc)).num_seconds() as f64 / 86400.0;
+            // 指数衰减：半衰期 30 天
+            self.recency = (-age_days * std::f64::consts::LN_2 / 30.0).exp();
+        }
+    }
+    
+    /// 评估通用性（基于类别和标签）
+    pub fn evaluate_generality(&mut self, category: &str, tags: &[String]) {
+        let general_categories = [
+            "common_sense",
+            "best_practice",
+            "coding_guideline",
+            "safety_rules",
+        ];
+        
+        let general_tags = [
+            "general",
+            "universal",
+            "fundamental",
+            "core",
+        ];
+        
+        let category_score = if general_categories.contains(&category.as_ref()) {
+            1.0
+        } else {
+            0.5
+        };
+        
+        let tag_score = tags.iter()
+            .filter(|t| general_tags.contains(&t.as_str()))
+            .count() as f64 / tags.len().max(1) as f64;
+        
+        self.generality = (category_score * 0.7 + tag_score * 0.3).clamp(0.0, 1.0);
+    }
+    
+    /// 标记为用户确认
+    pub fn mark_user_validated(&mut self) {
+        self.user_validated = true;
+    }
+    
+    /// 判断是否应该被遗忘（低价值记忆）
+    pub fn should_prune(&self, min_score: f64) -> bool {
+        self.score() < min_score
+    }
+}
+
+impl Default for MemoryImportance {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MemoryStore {
+    /// 修剪低价值记忆
+    /// 
+    /// 删除满足以下条件的记忆：
+    /// - 重要性分数 < min_score
+    /// - 优先级 < 200（非高优先级）
+    /// - 90 天未使用
+    pub fn prune_low_value_memories(
+        &self,
+        min_score: f64,
+        max_age_days: i64,
+    ) -> Result<usize, String> {
+        let entries = self.all()?;
+        let mut to_remove = Vec::new();
+        let now = chrono::Utc::now();
+        
+        for entry in entries {
+            // 永久记忆和高优先级记忆不删除
+            if entry.priority.unwrap_or(100) >= 200 {
+                continue;
+            }
+            
+            // 计算重要性
+            let mut importance = MemoryImportance::new();
+            importance.update_recency(&entry.timestamp);
+            importance.evaluate_generality(&entry.category, &entry.tags);
+            
+            // 检查年龄
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&entry.timestamp) {
+                let age_days = (now - dt.with_timezone(&chrono::Utc)).num_days();
+                if age_days > max_age_days && importance.should_prune(min_score) {
+                    to_remove.push(entry.id.clone());
+                }
+            }
+        }
+        
+        let removed_count = to_remove.len();
+        
+        // 执行删除
+        for id in to_remove {
+            if let Some(id) = id {
+                self.remove_by_id(&id)?;
+            }
+        }
+        
+        Ok(removed_count)
+    }
+    
+    /// 根据 ID 删除记忆
+    fn remove_by_id(&self, id: &str) -> Result<(), String> {
+        let entries = self.all()?;
+        let new_entries: Vec<AgentMemoryEntry> = entries
+            .into_iter()
+            .filter(|e| e.id.as_deref() != Some(id))
+            .collect();
+        
+        // 重写文件
+        super::with_memory_file_lock(&self.path, || {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.path)
+                .map_err(|e| format!("Failed to open memory file: {e}"))?;
+            
+            for entry in new_entries {
+                let serialized = serde_json::to_string(&entry)
+                    .map_err(|e| format!("Failed to serialize memory entry: {e}"))?;
+                writeln!(file, "{}", serialized)
+                    .map_err(|e| format!("Failed to write memory entry: {e}"))?;
+            }
+            
+            Ok(())
+        })
+    }
+    
+    /// 获取所有记忆
+    pub fn all(&self) -> Result<Vec<AgentMemoryEntry>, String> {
+        self.search("", usize::MAX)
+    }
+    
+    /// 记录记忆被使用（增加引用次数）
+    pub fn record_usage(&self, _entry_id: &str) -> Result<(), String> {
+        // 这里可以扩展为在单独的元数据文件中记录使用次数
+        // 简化版本：暂时不实现，留给未来扩展
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod importance_tests {
+    use super::*;
+    use chrono::Utc;
+    
+    #[test]
+    fn test_memory_importance_score() {
+        let mut importance = MemoryImportance::new();
+        assert_eq!(importance.frequency, 0);
+        assert_eq!(importance.recency, 1.0);
+        assert_eq!(importance.generality, 0.5);
+        assert!(!importance.user_validated);
+        
+        // 初始分数
+        let initial_score = importance.score();
+        assert!(initial_score > 0.0 && initial_score < 1.0);
+        
+        // 增加引用
+        for _ in 0..10 {
+            importance.increment_frequency();
+        }
+        assert_eq!(importance.frequency, 10);
+        
+        // 用户确认
+        importance.mark_user_validated();
+        assert!(importance.user_validated);
+        
+        // 分数应该提高
+        let new_score = importance.score();
+        assert!(new_score > initial_score);
+    }
+    
+    #[test]
+    fn test_memory_importance_recency_decay() {
+        let mut importance = MemoryImportance::new();
+        
+        // 30 天前的记忆
+        let old_timestamp = (Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        importance.update_recency(&old_timestamp);
+        
+        // 时效性应该衰减到约 0.5（半衰期）
+        assert!(importance.recency > 0.4 && importance.recency < 0.6);
+        
+        // 90 天前的记忆
+        let very_old_timestamp = (Utc::now() - chrono::Duration::days(90)).to_rfc3339();
+        importance.update_recency(&very_old_timestamp);
+        
+        // 时效性应该很低
+        assert!(importance.recency < 0.2);
+    }
+    
+    #[test]
+    fn test_memory_importance_generality() {
+        let mut importance = MemoryImportance::new();
+        
+        // 通用类别
+        importance.evaluate_generality("common_sense", &vec![]);
+        assert!(importance.generality >= 0.7);
+        
+        // 特定类别
+        importance.evaluate_generality("user_specific", &vec![]);
+        assert!(importance.generality <= 0.5);
+        
+        // 带有通用标签
+        importance.evaluate_generality("user_specific", &vec!["general".to_string(), "core".to_string()]);
+        assert!(importance.generality >= 0.5);
+    }
+    
+    #[test]
+    fn test_should_prune() {
+        let mut importance = MemoryImportance::new();
+        
+        // 高价值记忆不应该被修剪
+        importance.frequency = 10;
+        importance.user_validated = true;
+        assert!(!importance.should_prune(0.3));
+        
+        // 低价值记忆应该被修剪
+        let mut low_importance = MemoryImportance::new();
+        low_importance.frequency = 0;
+        low_importance.recency = 0.1;
+        low_importance.generality = 0.2;
+        assert!(low_importance.should_prune(0.3));
+    }
+}

@@ -9,6 +9,48 @@ use serde_json::json;
 use rust_tools::cw::SkipSet;
 use chrono::Local;
 
+/// 反思触发条件 - 用于主动学习
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReflectionTrigger {
+    /// 工具调用失败
+    ToolFailure,
+    /// 模型回答置信度低
+    LowConfidenceAnswer,
+    /// 用户纠正
+    UserCorrection,
+    /// 重复问题（说明之前没解决）
+    RepeatedQuestion,
+    /// 超长对话轮次（>10 轮）
+    LongTurn,
+    /// 常规反思
+    Routine,
+}
+
+/// 反思质量评估
+#[derive(Debug, Clone)]
+pub struct ReflectionQuality {
+    /// 是否可执行
+    pub actionable: bool,
+    /// 是否具体
+    pub specific: bool,
+    /// 是否可推广
+    pub generalizable: bool,
+}
+
+impl ReflectionQuality {
+    pub fn score(&self) -> u8 {
+        let mut score = 0;
+        if self.actionable { score += 1; }
+        if self.specific { score += 1; }
+        if self.generalizable { score += 1; }
+        score
+    }
+    
+    pub fn is_high_quality(&self) -> bool {
+        self.score() >= 2
+    }
+}
+
 pub(super) async fn maybe_append_self_reflection(
     app: &mut App,
     model: &str,
@@ -55,60 +97,165 @@ fn extract_content(v: &Value) -> Option<String> {
 
 pub(super) fn build_persistent_guidelines(question: &str, max_chars: usize) -> Option<String> {
     let store = MemoryStore::from_env_or_config();
-    let entries = store.search(question, 120).ok().filter(|v| !v.is_empty())
-        .or_else(|| store.recent(120).ok())
-        .unwrap_or_default();
     let cfg = configw::get_all_config();
     let max_days: i64 = cfg.get_opt("ai.memory.guidelines_days")
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(30);
+
+    let hot_categories = [
+        "self_note",
+        "safety_rules",
+        "common_sense",
+        "coding_guideline",
+        "best_practice",
+        "user_preference",
+        "preference",
+    ];
+
+    let mut entries: Vec<AgentMemoryEntry> = Vec::new();
+    entries.extend(store.search(question, 160).ok().unwrap_or_default());
+    for cat in hot_categories {
+        if let Ok(mut v) = store.search(cat, 120) {
+            entries.append(&mut v);
+        }
+    }
+    if entries.is_empty() {
+        entries = store.recent(200).ok().unwrap_or_default();
+    }
+
     let mut seen: SkipSet<String> = SkipSet::new(16);
-    let mut selected: Vec<String> = Vec::new();
-    for e in entries.into_iter().rev() {
+
+    fn parse_ts_utc(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+    }
+
+    fn hot_group(category: &str) -> u8 {
+        match category {
+            "safety_rules" => 0,
+            "user_preference" | "preference" | "coding_guideline" | "best_practice"
+            | "common_sense" => 1,
+            "self_note" => 2,
+            _ => 3,
+        }
+    }
+
+    let mut ranked: Vec<(u8, u8, i64, String)> = Vec::with_capacity(entries.len());
+    for e in entries {
         let category = e.category.to_lowercase();
         let priority = e.priority.unwrap_or(100);
-        let include = category == "self_note" || category == "safety_rules" || priority >= 200;
-        if !include {
+        let group = hot_group(&category);
+        if group >= 3 && priority < 200 {
             continue;
         }
-        let note = e.note.trim().to_string();
-        if note.is_empty() {
-            continue;
-        }
-        if max_days > 0 {
-            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&e.timestamp) {
-                let age_days = (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_seconds().max(0) as i64 / 86400;
+
+        if max_days > 0 && group >= 2 {
+            if let Some(dt) = parse_ts_utc(&e.timestamp) {
+                let age_days =
+                    (chrono::Utc::now() - dt).num_seconds().max(0) as i64 / 86400;
                 if age_days > max_days {
                     continue;
                 }
             }
         }
+
+        let note = e.note.trim().to_string();
+        if note.is_empty() {
+            continue;
+        }
+
+        let ts_rank = parse_ts_utc(&e.timestamp)
+            .map(|dt| dt.timestamp())
+            .unwrap_or(0);
+        ranked.push((group, priority, ts_rank, note));
+    }
+
+    ranked.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| b.2.cmp(&a.2))
+    });
+
+    let mut by_group: [Vec<String>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for (group, _priority, _ts, note) in ranked {
         if seen.insert(note.clone()) {
-            selected.push(note);
+            let g = group.min(3) as usize;
+            by_group[g].push(note);
         }
     }
-    if selected.is_empty() {
+    if by_group.iter().all(|v| v.is_empty()) {
         return None;
     }
-    selected.reverse();
+
     let mut out = String::from("Persistent Guidelines:\n");
     let mut used = out.len();
-    for note in selected {
-        for line in note.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let bullet = if line.starts_with('-') { format!("{line}\n") } else { format!("- {line}\n") };
-            if used + bullet.len() > max_chars {
-                break;
-            }
-            out.push_str(&bullet);
-            used += bullet.len();
+    if used >= max_chars {
+        return Some(out);
+    }
+
+    fn group_budget(max_chars: usize, used: usize, weights: [usize; 4], idx: usize) -> usize {
+        let remaining = max_chars.saturating_sub(used);
+        if remaining == 0 {
+            return 0;
         }
+        let total: usize = weights.iter().sum();
+        let w = weights[idx];
+        remaining.saturating_mul(w) / total.max(1)
+    }
+
+    fn append_notes(
+        out: &mut String,
+        used: &mut usize,
+        max_chars: usize,
+        budget: usize,
+        notes: &[String],
+    ) {
+        if budget == 0 || *used >= max_chars {
+            return;
+        }
+        let start_used = *used;
+        for note in notes {
+            for line in note.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let bullet = if line.starts_with('-') {
+                    format!("{line}\n")
+                } else {
+                    format!("- {line}\n")
+                };
+                if *used + bullet.len() > max_chars {
+                    return;
+                }
+                if *used - start_used + bullet.len() > budget {
+                    return;
+                }
+                out.push_str(&bullet);
+                *used += bullet.len();
+                if *used >= max_chars {
+                    return;
+                }
+            }
+        }
+    }
+
+    let weights = [35usize, 40usize, 15usize, 10usize];
+    for group_idx in 0..4 {
+        if by_group[group_idx].is_empty() {
+            continue;
+        }
+        let mut budget = group_budget(max_chars, used, weights, group_idx);
+        budget = budget.max(120).min(max_chars.saturating_sub(used));
+        append_notes(&mut out, &mut used, max_chars, budget, &by_group[group_idx]);
         if used >= max_chars {
             break;
         }
+    }
+
+    if used <= "Persistent Guidelines:\n".len() {
+        return None;
     }
     Some(out)
 }
@@ -160,6 +307,39 @@ mod tests {
             .append(&AgentMemoryEntry {
                 id: None,
                 timestamp: timestamp.clone(),
+                category: "common_sense".to_string(),
+                note: "Keep broadly applicable engineering habits in memory.".to_string(),
+                tags: vec![],
+                source: Some("test".to_string()),
+                priority: Some(150),
+            })
+            .unwrap();
+        store
+            .append(&AgentMemoryEntry {
+                id: None,
+                timestamp: timestamp.clone(),
+                category: "coding_guideline".to_string(),
+                note: "Prefer cargo check before cargo test for quick feedback.".to_string(),
+                tags: vec![],
+                source: Some("test".to_string()),
+                priority: Some(150),
+            })
+            .unwrap();
+        store
+            .append(&AgentMemoryEntry {
+                id: None,
+                timestamp: timestamp.clone(),
+                category: "user_preference".to_string(),
+                note: "Prefer concise, information-dense answers.".to_string(),
+                tags: vec![],
+                source: Some("test".to_string()),
+                priority: Some(150),
+            })
+            .unwrap();
+        store
+            .append(&AgentMemoryEntry {
+                id: None,
+                timestamp: timestamp.clone(),
                 category: "user_memory".to_string(),
                 note: "Do: always ask before risky file operations".to_string(),
                 tags: vec![],
@@ -184,6 +364,9 @@ mod tests {
 
         assert!(guidelines.contains("Do: validate tool arguments"));
         assert!(guidelines.contains("Avoid: delete files without double checking"));
+        assert!(guidelines.contains("Keep broadly applicable engineering habits in memory."));
+        assert!(guidelines.contains("Prefer cargo check before cargo test for quick feedback."));
+        assert!(guidelines.contains("Prefer concise, information-dense answers."));
         assert!(guidelines.contains("Do: always ask before risky file operations"));
         assert!(!guidelines.contains("Ignore me"));
 

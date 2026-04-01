@@ -639,6 +639,145 @@ fn is_chinese_stop_char(ch: char) -> bool {
     )
 }
 
+
+/// 技能匹配的历史成功率统计 - 用于动态调整技能选择
+#[derive(Debug, Clone)]
+pub struct SkillSuccessRate {
+    /// 技能名称
+    pub skill_name: String,
+    /// 总调用次数
+    pub total_invocations: u32,
+    /// 成功次数
+    pub successful_outcomes: u32,
+    /// 平均解决轮次
+    pub avg_turns_to_resolve: f64,
+    /// 用户满意度评分 (如果有反馈)
+    pub user_satisfaction_score: Option<f64>,
+}
+
+impl SkillSuccessRate {
+    pub fn new(skill_name: &str) -> Self {
+        Self {
+            skill_name: skill_name.to_string(),
+            total_invocations: 0,
+            successful_outcomes: 0,
+            avg_turns_to_resolve: 0.0,
+            user_satisfaction_score: None,
+        }
+    }
+    
+    /// 记录一次调用
+    pub fn record_invocation(&mut self, success: bool, turns: u32) {
+        self.total_invocations += 1;
+        if success {
+            self.successful_outcomes += 1;
+        }
+        // 指数移动平均更新
+        let alpha = 0.3;
+        self.avg_turns_to_resolve = 
+            (turns as f64) * alpha + self.avg_turns_to_resolve * (1.0 - alpha);
+    }
+    
+    /// 记录用户反馈
+    pub fn record_feedback(&mut self, rating: f64) {
+        let alpha = 0.3;
+        self.user_satisfaction_score = Some(
+            match self.user_satisfaction_score {
+                Some(current) => rating * alpha + current * (1.0 - alpha),
+                None => rating,
+            }
+        );
+    }
+    
+    /// 计算成功率
+    pub fn success_rate(&self) -> f64 {
+        if self.total_invocations == 0 {
+            return 0.0;
+        }
+        self.successful_outcomes as f64 / self.total_invocations as f64
+    }
+    
+    /// 计算综合评分乘数 (0.5 - 1.5)
+    pub fn multiplier(&self) -> f64 {
+        let base = 1.0;
+        
+        // 成功率贡献
+        let rate_factor = if self.total_invocations >= 5 {
+            // 有足够样本时才考虑成功率
+            let rate = self.success_rate();
+            (rate - 0.5) * 0.4  // -0.2 to +0.2
+        } else {
+            0.0
+        };
+        
+        // 用户满意度贡献
+        let satisfaction_factor = self.user_satisfaction_score
+            .map(|score| (score - 0.5) * 0.4)  // -0.2 to +0.2
+            .unwrap_or(0.0);
+        
+        // 解决速度贡献（越快越好）
+        let speed_factor = if self.avg_turns_to_resolve > 0.0 {
+            let speed_score = 1.0 / (1.0 + self.avg_turns_to_resolve / 5.0);
+            (speed_score - 0.5) * 0.2  // -0.1 to +0.1
+        } else {
+            0.0
+        };
+        
+        (base + rate_factor + satisfaction_factor + speed_factor).clamp(0.5, 1.5)
+    }
+}
+
+/// 技能匹配统计管理器
+pub struct SkillMatchStats {
+    rates: std::collections::HashMap<String, SkillSuccessRate>,
+}
+
+impl SkillMatchStats {
+    pub fn new() -> Self {
+        Self {
+            rates: std::collections::HashMap::new(),
+        }
+    }
+    
+    /// 获取或创建技能的统计
+    pub fn get_or_create(&mut self, skill_name: &str) -> &mut SkillSuccessRate {
+        self.rates
+            .entry(skill_name.to_string())
+            .or_insert_with(|| SkillSuccessRate::new(skill_name))
+    }
+    
+    /// 记录技能调用结果
+    pub fn record_outcome(&mut self, skill_name: &str, success: bool, turns: u32) {
+        let rate = self.get_or_create(skill_name);
+        rate.record_invocation(success, turns);
+    }
+    
+    /// 记录用户反馈
+    pub fn record_feedback(&mut self, skill_name: &str, rating: f64) {
+        let rate = self.get_or_create(skill_name);
+        rate.record_feedback(rating);
+    }
+    
+    /// 获取技能的评分乘数
+    pub fn get_multiplier(&self, skill_name: &str) -> f64 {
+        self.rates
+            .get(skill_name)
+            .map(|r| r.multiplier())
+            .unwrap_or(1.0)
+    }
+    
+    /// 导出统计信息（用于调试/分析）
+    pub fn export_stats(&self) -> Vec<SkillSuccessRate> {
+        self.rates.values().cloned().collect()
+    }
+}
+
+impl Default for SkillMatchStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

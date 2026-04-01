@@ -56,26 +56,86 @@ fn next_memory_id() -> String {
     format!("mem_{}", Uuid::new_v4().simple())
 }
 
+fn normalized_category(raw: Option<&str>, fallback: &str) -> String {
+    let value = raw.unwrap_or(fallback).trim().to_lowercase();
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value
+    }
+}
+
+fn default_priority_for_category(category: &str) -> u8 {
+    match category {
+        "common_sense" | "coding_guideline" | "best_practice" | "user_preference" | "preference" => {
+            210
+        }
+        "safety_rules" => 255,
+        _ => 150,
+    }
+}
+
+fn parse_priority_arg(args: &Value, field: &str) -> Result<Option<u8>, String> {
+    match args.get(field).and_then(|value| value.as_u64()) {
+        Some(priority) if priority > u8::MAX as u64 => Err("priority out of range".to_string()),
+        Some(priority) => Ok(Some(priority as u8)),
+        None => Ok(None),
+    }
+}
+
+fn load_memory_entries(path: &std::path::Path) -> Result<Vec<AgentMemoryEntry>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("Failed to open file: {}", e))?;
+    let reader = std::io::BufReader::new(file);
+    let mut entries = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|e| format!("Failed to read memory file: {}", e))?;
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(&line) {
+            entries.push(entry);
+        }
+    }
+    Ok(entries)
+}
+
+fn write_memory_entries(
+    path: &std::path::Path,
+    entries: &[AgentMemoryEntry],
+) -> Result<(), String> {
+    let tmp = path.with_extension("jsonl.tmp");
+    {
+        let mut f =
+            std::fs::File::create(&tmp).map_err(|e| format!("Failed to create tmp: {}", e))?;
+        for entry in entries {
+            let line = serde_json::to_string(entry).map_err(|e| format!("{}", e))?;
+            f.write_all(line.as_bytes())
+                .and_then(|_| f.write_all(b"\n"))
+                .map_err(|e| format!("Failed to write tmp: {}", e))?;
+        }
+    }
+    std::fs::rename(&tmp, path).map_err(|e| format!("Failed to replace memory file: {}", e))?;
+    Ok(())
+}
+
 pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
     let note = args["note"].as_str().ok_or("Missing note")?.trim();
     if note.is_empty() {
         return Err("note is empty".to_string());
     }
-    let category = args["category"].as_str().unwrap_or("general").trim();
+    let category = normalized_category(args["category"].as_str(), "general");
     let tags = parse_string_array(&args["tags"]);
     let source = args["source"]
         .as_str()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let priority = args["priority"].as_u64().map(|p| p as u8);
+    let priority = parse_priority_arg(args, "priority")?
+        .or_else(|| Some(default_priority_for_category(&category)));
     let entry = AgentMemoryEntry {
         id: Some(next_memory_id()),
         timestamp: Local::now().to_rfc3339(),
-        category: if category.is_empty() {
-            "general".to_string()
-        } else {
-            category.to_string()
-        },
+        category,
         note: note.to_string(),
         tags,
         source,
@@ -360,19 +420,7 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
         if !path.exists() {
             return Ok("No memory file".to_string());
         }
-        let file = std::fs::File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
-        let reader = std::io::BufReader::new(file);
-        let mut entries = Vec::new();
-        for line in reader.lines() {
-            let line = line.map_err(|e| format!("Failed to read memory file: {}", e))?;
-            let line = line.trim().to_string();
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(e) = serde_json::from_str::<AgentMemoryEntry>(&line) {
-                entries.push(e);
-            }
-        }
+        let entries = load_memory_entries(&path)?;
         if entries.is_empty() {
             return Ok("No entries".to_string());
         }
@@ -394,18 +442,7 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
             }
         }
         deduped.reverse();
-        let tmp = path.with_extension("jsonl.tmp");
-        {
-            let mut f =
-                std::fs::File::create(&tmp).map_err(|e| format!("Failed to create tmp: {}", e))?;
-            for e in &deduped {
-                let line = serde_json::to_string(e).map_err(|e| format!("{}", e))?;
-                f.write_all(line.as_bytes())
-                    .and_then(|_| f.write_all(b"\n"))
-                    .map_err(|e| format!("Failed to write tmp: {}", e))?;
-            }
-        }
-        std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to replace memory file: {}", e))?;
+        write_memory_entries(&path, &deduped)?;
         Ok("Dedup done".to_string())
     })
 }
@@ -486,20 +523,7 @@ pub(crate) fn execute_memory_update(args: &Value) -> Result<String, String> {
             return Err("No memory file".to_string());
         }
 
-        let file =
-            std::fs::File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
-        let reader = std::io::BufReader::new(file);
-        let mut entries = Vec::new();
-        for line in reader.lines() {
-            let line = line.map_err(|e| format!("Failed to read memory file: {}", e))?;
-            let line = line.trim().to_string();
-            if line.is_empty() {
-                continue;
-            }
-            if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(&line) {
-                entries.push(entry);
-            }
-        }
+        let mut entries = load_memory_entries(&path)?;
 
         let Some(entry) = entries
             .iter_mut()
@@ -526,20 +550,34 @@ pub(crate) fn execute_memory_update(args: &Value) -> Result<String, String> {
         }
         entry.timestamp = Local::now().to_rfc3339();
 
-        let tmp = path.with_extension("jsonl.tmp");
-        {
-            let mut f =
-                std::fs::File::create(&tmp).map_err(|e| format!("Failed to create tmp: {}", e))?;
-            for e in &entries {
-                let line = serde_json::to_string(e).map_err(|e| format!("{}", e))?;
-                f.write_all(line.as_bytes())
-                    .and_then(|_| f.write_all(b"\n"))
-                    .map_err(|e| format!("Failed to write tmp: {}", e))?;
-            }
-        }
-        std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to replace memory file: {}", e))?;
+        write_memory_entries(&path, &entries)?;
 
         Ok(format!("Memory updated: {} (id: {})", path.display(), id))
+    })
+}
+
+pub(crate) fn execute_memory_delete(args: &Value) -> Result<String, String> {
+    let id = args["id"].as_str().ok_or("Missing id")?.trim();
+    if id.is_empty() {
+        return Err("id is empty".to_string());
+    }
+
+    let store = MemoryStore::from_env_or_config();
+    let path = store.path().to_path_buf();
+    super::super::storage::with_memory_file_lock(&path, || {
+        if !path.exists() {
+            return Err("No memory file".to_string());
+        }
+
+        let mut entries = load_memory_entries(&path)?;
+        let before_len = entries.len();
+        entries.retain(|entry| entry.id.as_deref() != Some(id));
+        if entries.len() == before_len {
+            return Err(format!("memory id not found: {id}"));
+        }
+
+        write_memory_entries(&path, &entries)?;
+        Ok(format!("Memory deleted: {} (id: {})", path.display(), id))
     })
 }
 
@@ -549,8 +587,8 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
     if content.is_empty() {
         return Err("content is empty".to_string());
     }
-    
-    let category = args["category"].as_str().unwrap_or("user_memory").trim();
+
+    let category = normalized_category(args["category"].as_str(), "user_memory");
     let tags = args["tags"]
         .as_array()
         .map(|arr| {
@@ -566,12 +604,13 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
         .as_str()
         .map(|s| s.trim().to_string())
         .or(Some("user_command".to_string()));
-    
-    let priority = args["priority"].as_u64().map(|p| p as u8).or(Some(150)); // Default high priority for user-directed memory
+
+    let priority = parse_priority_arg(args, "priority")?
+        .or_else(|| Some(default_priority_for_category(&category)));
     let entry = AgentMemoryEntry {
         id: Some(next_memory_id()),
         timestamp: Local::now().to_rfc3339(),
-        category: if category.is_empty() { "user_memory".to_string() } else { category.to_string() },
+        category,
         note: content.to_string(),
         tags,
         source,
@@ -590,7 +629,9 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_memory_list_json, execute_memory_save, execute_memory_update};
+    use super::{
+        execute_memory_delete, execute_memory_list_json, execute_memory_save, execute_memory_update,
+    };
     use crate::ai::test_support::ENV_LOCK;
 
     #[test]
@@ -637,6 +678,45 @@ mod tests {
         );
         assert_eq!(after[0]["priority"].as_u64().unwrap(), 200);
         assert_eq!(after[0]["tags"].as_array().unwrap().len(), 2);
+
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn memory_save_common_sense_defaults_to_persistent_priority_and_can_delete() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_memory_delete_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let save_args = serde_json::json!({
+            "content": "Files should end with a trailing newline",
+            "category": "common_sense",
+            "tags": ["editing"]
+        });
+        execute_memory_save(&save_args).unwrap();
+
+        let list_before = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
+        let before: serde_json::Value = serde_json::from_str(&list_before).unwrap();
+        let id = before[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(before[0]["category"].as_str().unwrap(), "common_sense");
+        assert_eq!(before[0]["priority"].as_u64().unwrap(), 210);
+
+        let delete_args = serde_json::json!({ "id": id });
+        let delete_msg = execute_memory_delete(&delete_args).unwrap();
+        assert!(delete_msg.contains("Memory deleted"));
+
+        let list_after = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&list_after).unwrap();
+        assert!(after.as_array().unwrap().is_empty());
 
         let _ = std::fs::remove_file(&path);
         unsafe {
