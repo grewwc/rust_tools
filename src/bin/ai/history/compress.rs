@@ -50,8 +50,20 @@ fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<M
         return Vec::new();
     }
 
+    truncate_tool_messages(&mut messages, 1200, 120);
+    redact_images_except_last(&mut messages, 1);
+    dedup_adjacent(&mut messages);
+
     if messages_total_chars(&messages) <= max_chars {
         return messages;
+    }
+
+    while messages_total_chars(&messages) > max_chars {
+        if let Some(idx) = first_index_of_role(&messages, "tool") {
+            messages.remove(idx);
+            continue;
+        }
+        break;
     }
 
     let mut start = 0usize;
@@ -174,4 +186,80 @@ fn truncate_to_chars(s: &str, max_chars: usize) -> String {
     let mut out = s[..end].to_string();
     out.push('…');
     out
+}
+
+fn first_index_of_role(messages: &[Message], role: &str) -> Option<usize> {
+    for (i, m) in messages.iter().enumerate() {
+        if m.role == role {
+            return Some(i);
+        }
+    }
+    None
+}
+
+fn truncate_tool_messages(messages: &mut [Message], max_chars_per_msg: usize, max_lines: usize) {
+    for m in messages.iter_mut() {
+        if m.role.as_str() != "tool" {
+            continue;
+        }
+        let text = value_to_string(&m.content);
+        if text.is_empty() {
+            continue;
+        }
+        let mut out = String::new();
+        let mut lines = 0usize;
+        for line in text.lines() {
+            if lines >= max_lines || out.chars().count() + line.chars().count() + 1 > max_chars_per_msg {
+                break;
+            }
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(line);
+            lines += 1;
+        }
+        if out.len() < text.len() {
+            out.push_str("\n…");
+            m.content = Value::String(out);
+        }
+    }
+}
+
+fn redact_images_except_last(messages: &mut [Message], keep_last: usize) {
+    let mut indices = Vec::new();
+    for (i, m) in messages.iter().enumerate() {
+        let text = value_to_string(&m.content);
+        if text.contains("data:image/") {
+            indices.push(i);
+        }
+    }
+    if indices.len() <= keep_last {
+        return;
+    }
+    let cutoff = indices.len().saturating_sub(keep_last);
+    for i in 0..cutoff {
+        let idx = indices[i];
+        if let Some(m) = messages.get_mut(idx) {
+            m.content = Value::String("[[image omitted]]".to_string());
+        }
+    }
+}
+
+fn dedup_adjacent(messages: &mut Vec<Message>) {
+    if messages.is_empty() {
+        return;
+    }
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    let mut prev_role = String::new();
+    let mut prev_content = String::new();
+    for mut m in messages.drain(..) {
+        let text = value_to_string(&m.content);
+        if m.role == prev_role && text == prev_content {
+            continue;
+        }
+        prev_role = m.role.clone();
+        prev_content = text;
+        out.push(m);
+    }
+    *messages = out;
 }

@@ -5,6 +5,8 @@ use rust_tools::cw::SkipMap;
 use serde_json::Value;
 
 use crate::ai::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
+use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
+use chrono::Local;
 
 #[derive(Clone, Copy)]
 pub(crate) struct ToolSpec {
@@ -97,12 +99,32 @@ pub(crate) fn execute_tool_call_with_args(
     args: &Value,
 ) -> Result<ToolResult, String> {
     let Some(spec) = TOOL_INDEX.get(name).copied() else {
+        record_tool_stat(name, false);
         return Err(format!("Unknown tool: {}", name));
     };
-    let result = (spec.execute)(args)?;
+    let exec = (spec.execute)(args);
+    match exec {
+        Ok(result) => {
+            record_tool_stat(name, true);
+            Ok(ToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                content: result,
+            })
+        }
+        Err(err) => {
+            record_tool_stat(name, false);
+            Err(err)
+        }
+    }
+}
 
-    Ok(ToolResult {
-        tool_call_id: tool_call_id.to_string(),
-        content: result,
-    })
+fn record_tool_stat(name: &str, ok: bool) {
+    let entry = AgentMemoryEntry {
+        timestamp: Local::now().to_rfc3339(),
+        category: "tool_stat".to_string(),
+        note: format!("name={} result={}", name, if ok { "ok" } else { "err" }),
+        tags: vec![name.to_string(), if ok { "ok".to_string() } else { "err".to_string() }],
+        source: None,
+    };
+    let _ = MemoryStore::from_env_or_config().append(&entry);
 }

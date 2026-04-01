@@ -30,6 +30,7 @@ pub mod print;
 pub mod signal;
 pub mod skill_matching;
 pub mod skill_runtime;
+pub mod reflection;
 pub mod tools;
 pub mod turn_runtime;
 
@@ -39,7 +40,7 @@ pub use print::*;
 pub use signal::*;
 pub use skill_matching::*;
 
-const DEFAULT_MAX_ITERATIONS: usize = 6;
+const DEFAULT_MAX_ITERATIONS: usize = 64;
 const OPENCLAW_MAX_ITERATIONS: usize = 16;
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {

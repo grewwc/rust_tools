@@ -7,6 +7,8 @@ use crate::ai::{
 use crate::commonw::configw;
 use std::ptr::NonNull;
 use std::sync::{LazyLock, Mutex};
+use rust_tools::cw::SkipMap;
+use chrono::{DateTime, Utc};
 
 use super::{DEFAULT_MAX_ITERATIONS, OPENCLAW_MAX_ITERATIONS, match_skill};
 
@@ -51,8 +53,7 @@ fn activate_skill_context(
 ) -> Option<(Vec<ToolDef>, usize)> {
     let mut restore = None;
     if let Some(ctx) = app.agent_context.as_mut() {
-        let mut all_tools = builtin_tools;
-        all_tools.extend(mcp_tools);
+        let all_tools = reorder_tools_by_stats(builtin_tools, mcp_tools);
         let prev_tools = std::mem::replace(&mut ctx.tools, all_tools);
         let prev_max_iterations = std::mem::replace(
             &mut ctx.max_iterations,
@@ -84,6 +85,69 @@ fn builtin_tools_for_skill(
         }
     }
     super::super::tools::get_builtin_tool_definitions()
+}
+
+fn reorder_tools_by_stats(mut builtin: Vec<ToolDef>, mut mcp: Vec<ToolDef>) -> Vec<ToolDef> {
+    let mut all = Vec::new();
+    all.append(&mut builtin);
+    all.append(&mut mcp);
+    if all.is_empty() {
+        return all;
+    }
+    let scores = load_tool_scores();
+    all.sort_by(|a, b| {
+        let sa = (*scores).get(&a.function.name).unwrap_or(0.0);
+        let sb = (*scores).get(&b.function.name).unwrap_or(0.0);
+        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.function.name.cmp(&b.function.name))
+    });
+    all
+}
+
+fn load_tool_scores() -> Box<SkipMap<String, f64>> {
+    use crate::ai::tools::storage::memory_store::MemoryStore;
+    let store = MemoryStore::from_env_or_config();
+    let entries = store.recent(600).unwrap_or_default();
+    let mut ok: Box<SkipMap<String, f64>> = SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
+    let mut err: Box<SkipMap<String, f64>> = SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
+    for e in entries {
+        if e.category.to_lowercase() != "tool_stat" {
+            continue;
+        }
+        if e.tags.is_empty() {
+            continue;
+        }
+        let name = e.tags[0].clone();
+        let is_ok = e.tags.iter().any(|t| t == "ok");
+        let is_err = e.tags.iter().any(|t| t == "err");
+        let weight = recency_weight(&e.timestamp);
+        if is_ok {
+            let cur = ok.get(&name).unwrap_or(0.0);
+            ok.insert(name.clone(), cur + 1.0 * weight);
+        }
+        if is_err {
+            let cur = err.get(&name).unwrap_or(0.0);
+            err.insert(name.clone(), cur + 1.0 * weight);
+        }
+    }
+    let mut score: Box<SkipMap<String, f64>> =
+        SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
+    for (k, v) in (&*ok).into_iter() {
+        let cur = score.get(k).unwrap_or(0.0);
+        score.insert(k.clone(), cur + *v);
+    }
+    for (k, v) in (&*err).into_iter() {
+        let cur = score.get(k).unwrap_or(0.0);
+        score.insert(k.clone(), cur - 1.5 * *v);
+    }
+    score
+}
+
+fn recency_weight(ts: &str) -> f64 {
+    let parsed: Option<DateTime<Utc>> = chrono::DateTime::parse_from_rfc3339(ts).ok().map(|dt| dt.with_timezone(&Utc));
+    let Some(t) = parsed else { return 1.0; };
+    let age_days = (Utc::now() - t).num_seconds().max(0) as f64 / 86400.0;
+    f64::exp(-age_days / 14.0)
 }
 
 fn tool_uses_mcp_server(tool_name: &str, allowed_servers: &[String]) -> bool {

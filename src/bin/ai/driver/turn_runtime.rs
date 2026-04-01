@@ -12,6 +12,7 @@ use super::{
     drain_response, input,
     print::{print_assistant_banner, print_tool_output_block},
     skill_runtime::SkillTurnGuard,
+    reflection,
     tools,
 };
 
@@ -48,6 +49,16 @@ pub(super) async fn run_turn(
         tool_calls: None,
         tool_call_id: None,
     });
+    if let Some(guidelines) = super::reflection::build_persistent_guidelines(&question, 1200) {
+        if !guidelines.trim().is_empty() {
+            messages.push(Message {
+                role: "system".to_string(),
+                content: Value::String(guidelines),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+    }
     messages.extend(history);
     let user_message = Message {
         role: "user".to_string(),
@@ -238,6 +249,30 @@ pub(super) async fn run_turn(
     }
 
     if !final_assistant_text.trim().is_empty() {
+        if let Some((critic, revised)) =
+            super::reflection::maybe_critic_and_revise(app, &next_model, &question, &final_assistant_text).await
+        {
+            if let Some(last) = turn_messages.iter_mut().rev().find(|m| m.role == "assistant") {
+                last.content = Value::String(revised.clone());
+            } else {
+                turn_messages.push(Message {
+                    role: "assistant".to_string(),
+                    content: Value::String(revised.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+            turn_messages.push(Message {
+                role: "system".to_string(),
+                content: Value::String(format!("critic:\n{}", critic)),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            println!("\n{}", "[Revised]".yellow());
+            println!("{}", revised.yellow());
+            final_assistant_text = revised;
+            final_assistant_recorded = true;
+        }
         if !final_assistant_recorded {
             println!("\n{}", final_assistant_text.yellow());
             turn_messages.push(Message {
@@ -247,6 +282,14 @@ pub(super) async fn run_turn(
                 tool_call_id: None,
             });
         }
+        reflection::maybe_append_self_reflection(
+            app,
+            &next_model,
+            &question,
+            &final_assistant_text,
+            &mut turn_messages,
+        )
+        .await;
         if !one_shot_mode
             && let Err(e) = append_history_messages(&app.session_history_file, &turn_messages)
         {
@@ -263,4 +306,3 @@ pub(super) async fn run_turn(
         TurnOutcome::Continue
     })
 }
-

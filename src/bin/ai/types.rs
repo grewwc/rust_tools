@@ -99,7 +99,7 @@ pub(super) struct McpServerConfig {
 }
 
 fn default_mcp_request_timeout_ms() -> u64 {
-    3000
+    30000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
