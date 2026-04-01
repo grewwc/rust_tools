@@ -126,5 +126,7 @@ fn record_tool_stat(name: &str, ok: bool) {
         tags: vec![name.to_string(), if ok { "ok".to_string() } else { "err".to_string() }],
         source: None,
     };
-    let _ = MemoryStore::from_env_or_config().append(&entry);
+    let store = MemoryStore::from_env_or_config();
+    let _ = store.append(&entry);
+    store.maintain_after_append();
 }

@@ -281,6 +281,44 @@ rust_tools/
 - `re` - 备忘录工具
 - 更多工具见 `src/bin/` 目录
 
+## AI 助手（a/ai）配置参考
+
+以下配置通过 `~/.configW` 读取（或相关环境变量），用于控制 AI 助手在对话、记忆与自我优化方面的行为。未设置时使用默认值。
+
+- 反思与批改
+  - ai.reflection.enable: 是否开启自反思 self_note（默认 true）
+  - ai.critic_revise.enable: 是否开启双阶段 Critic→Revise（默认 true）
+  - ai.memory.guidelines_days: 注入“Persistent Guidelines”的时间窗口（天，默认 30）
+
+- 长期记忆文件
+  - ai.memory.file: 记忆文件路径（默认 `~/.config/rust_tools/agent_memory.jsonl`）
+  - 环境变量 RUST_TOOLS_MEMORY_FILE 可覆盖上述路径
+
+- 自动旋转与维护
+  - ai.memory.auto_rotate.max_bytes: 当前记忆文件旋转阈值（字节，默认 8MB）
+  - ai.memory.auto_maintain.probability: 追加后触发去重/GC/归档清理的概率（默认 0.05）
+  - ai.memory.auto_gc.days: 当前文件 GC 的时间窗口（天，默认 30）
+  - ai.memory.auto_gc.min_keep: 当前文件最小保留条数（默认 200）
+
+- 归档清理策略（旋转后的 `.jsonl.<timestamp>`）
+  - ai.memory.archives.retain_days: 归档保留天数（默认 60）
+  - ai.memory.archives.keep_last: 始终保留最近 N 个归档（默认 10）
+  - ai.memory.archives.max_bytes: 归档总体积上限（默认 64MB）
+
+- 跨归档检索
+  - ai.memory.search_archives.enable: 是否在检索记忆时包含最近的归档（默认 false）
+  - ai.memory.search_archives.keep_last: 检索时包含最近的归档数（默认 3）
+
+- 技能/路由（可选）
+  - ai.skills.debug: 打印技能选择调试信息（默认 false）
+  - ai.skills.router: 是否启用基于模型的技能路由（默认 true）
+  - ai.skills.router_threshold: 技能路由置信阈值（默认 0.7）
+
+说明
+- 自反思 self_note 会持久化存储，并在每轮开头按“更相关检索 + 时间窗口 + 去重”注入到系统提示中。
+- 工具执行成功/失败会被记录，用于动态排序工具优先级（最近表现权重更高）。
+- 记忆文件超过阈值会旋转，归档文件按保留天数/数量/总容量综合清理；默认不会参与检索，除非开启跨归档检索。
+
 ## 贡献
 
 欢迎贡献代码！请遵循以下步骤：

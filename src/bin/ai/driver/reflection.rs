@@ -92,7 +92,9 @@ pub(super) async fn maybe_append_self_reflection(
         tags: vec!["agent".to_string(), "policy".to_string()],
         source: Some(format!("session:{}", app.session_id)),
     };
-    let _ = MemoryStore::from_env_or_config().append(&entry);
+    let store = MemoryStore::from_env_or_config();
+    let _ = store.append(&entry);
+    store.maintain_after_append();
 }
 
 fn extract_content(v: &Value) -> Option<String> {
