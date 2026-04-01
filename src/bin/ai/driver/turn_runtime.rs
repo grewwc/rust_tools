@@ -171,6 +171,8 @@ pub(super) async fn run_turn(
             return Ok(TurnOutcome::Quit);
         }
         drain_response(&mut response).await?;
+        app.streaming
+            .store(false, std::sync::atomic::Ordering::Relaxed);
 
         if stream_result.outcome != StreamOutcome::ToolCall {
             let assistant_msg = Message {
@@ -269,7 +271,7 @@ pub(super) async fn run_turn(
                 tool_call_id: None,
             });
             println!("\n{}", "[Revised]".yellow());
-            println!("{}", revised.yellow());
+            println!("{}", revised);
             final_assistant_text = revised;
             final_assistant_recorded = true;
         }
