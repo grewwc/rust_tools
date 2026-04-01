@@ -394,7 +394,11 @@ pub fn get_tag_query_raw(cli: &Cli) -> Option<String> {
         if tags.is_empty() {
             return Some(String::new());
         }
-        let default_mode = if cli.a || cli.all { '~' } else { '=' };
+        let default_mode = if cli.prefix || cli.pre {
+            '^'
+        } else if cli.a || cli.all {
+            '~'
+        } else { '=' };
         return Some(
             tags.into_iter()
                 .map(|t| {

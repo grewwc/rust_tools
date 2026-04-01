@@ -72,7 +72,9 @@ pub fn get_knowledge_with_cache(
         );
         
         cache.set(cache_key, cached);
-        cache.save().ok(); // 保存失败不阻塞
+        if let Err(e) = cache.save() {
+            eprintln!("knowledge_cache save failed: {}", e);
+        }
         
         Ok(knowledge)
     } else {
@@ -105,7 +107,9 @@ pub fn get_knowledge_with_cache(
                     };
                     
                     cache.set(cache_key, cached);
-                    cache.save().ok();
+                    if let Err(e) = cache.save() {
+                        eprintln!("knowledge_cache save failed: {}", e);
+                    }
                     
                     Ok(knowledge)
                 } else {
@@ -113,8 +117,30 @@ pub fn get_knowledge_with_cache(
                 }
             },
             None => {
-                // 缓存未命中，重新检索
-                retrieve_knowledge_for_topic(topic, context)
+                // 缓存未命中，重新检索并写回缓存
+                let knowledge = retrieve_knowledge_for_topic(topic, context)?;
+                let description = context.get("description").map(|s| s.as_str()).unwrap_or(topic);
+                let inferred_type = NewKnowledgeType::infer_from_description(description);
+                let metadata = KnowledgeMetadata::new(
+                    inferred_type.clone(),
+                    context.clone(),
+                    Some(description.to_string()),
+                );
+                let fingerprint = if matches!(inferred_type, NewKnowledgeType::FileBased) {
+                    create_fingerprint_for_topic(topic, context).ok()
+                } else {
+                    None
+                };
+                let cached = CachedKnowledge::new_with_metadata(
+                    knowledge.clone(),
+                    metadata,
+                    fingerprint,
+                );
+                cache.set(cache_key, cached);
+                if let Err(e) = cache.save() {
+                    eprintln!("knowledge_cache save failed: {}", e);
+                }
+                Ok(knowledge)
             }
         }
     }

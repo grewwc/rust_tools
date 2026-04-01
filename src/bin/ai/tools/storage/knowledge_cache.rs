@@ -182,25 +182,37 @@ impl CachedKnowledge {
     
     /// 检查是否需要刷新（综合所有验证策略）
     pub fn needs_refresh(&self) -> bool {
-        // 优先使用新版元数据验证
+        // 新版元数据验证优先，其次再结合 TTL / 指纹做补充
         if let Some(ref metadata) = self.metadata {
-            return !metadata.is_valid();
+            match &metadata.validation {
+                // 指纹类：必须校验指纹是否仍然匹配，或 TTL 到期
+                ValidationStrategy::Fingerprint { .. } => {
+                    if self.is_expired() {
+                        return true;
+                    }
+                    let fp_ok = self.fingerprint.as_ref().map(|f| f.verify().is_valid).unwrap_or(true);
+                    return !fp_ok;
+                }
+                // 时间范围/外部检查/会话绑定/无校验：依赖元数据判定，同时允许 TTL 作为兜底
+                _ => {
+                    if !metadata.is_valid() {
+                        return true;
+                    }
+                    return self.is_expired();
+                }
+            }
         }
         
-        // 回退到旧版验证逻辑
-        // 时间过期
+        // 兼容旧版：仅基于 TTL 与指纹
         if self.is_expired() {
             return true;
         }
-        
-        // 指纹变化（实际文件已修改）
         if let Some(ref fp) = self.fingerprint {
             let verification = fp.verify();
             if !verification.is_valid {
                 return true;
             }
         }
-        
         false
     }
     
@@ -424,7 +436,7 @@ impl SessionKnowledgeCache {
     pub fn needs_refresh(&self, key: &str) -> bool {
         match self.get(key) {
             None => true, // 没有缓存，需要检索
-            Some(entry) => entry.is_expired(), // 过期了，需要刷新
+            Some(entry) => entry.needs_refresh(), // 综合判定是否需要刷新
         }
     }
     
@@ -481,6 +493,11 @@ pub fn make_cache_key(topic: &str, context: &HashMap<String, String>) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::ai::tools::storage::knowledge_fingerprint::KnowledgeFingerprint;
+    use crate::ai::tools::storage::knowledge_types::{KnowledgeType as NewKnowledgeType, KnowledgeMetadata, ValidationStrategy, create_time_sensitive_metadata};
     
     #[test]
     fn test_knowledge_type_ttl() {
@@ -502,5 +519,54 @@ mod tests {
         // 刚创建，不应该过期
         assert!(!knowledge.is_expired());
         assert!(knowledge.ttl_remaining() <= 1800);
+    }
+
+    #[test]
+    fn test_needs_refresh_fingerprint_change() {
+        let tmp = std::env::temp_dir();
+        let file = tmp.join(format!(
+            "rt_kc_{}.txt",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::write(&file, "a").unwrap();
+        let mut fp = KnowledgeFingerprint::new(&HashMap::new());
+        fp.add_file(&file, true).unwrap();
+        let metadata = KnowledgeMetadata::new(NewKnowledgeType::FileBased, HashMap::new(), Some("file".to_string()));
+        let ck = CachedKnowledge::new_with_metadata("x".to_string(), metadata, Some(fp));
+        assert!(!ck.needs_refresh());
+        fs::write(&file, "b").unwrap();
+        assert!(ck.needs_refresh());
+        let _ = fs::remove_file(&file);
+    }
+
+    #[test]
+    fn test_needs_refresh_time_range_expired() {
+        let mut md = create_time_sensitive_metadata("ts", HashMap::new(), Some(1));
+        if let ValidationStrategy::TimeRange { valid_from, valid_until } = &mut md.validation {
+            *valid_from = 0;
+            *valid_until = 0;
+        }
+        let ck = CachedKnowledge::new_with_metadata("x".to_string(), md, None);
+        assert!(ck.needs_refresh());
+    }
+
+    #[test]
+    fn test_session_cache_needs_refresh_delegation() {
+        let tmp = std::env::temp_dir();
+        let file = tmp.join(format!(
+            "rt_kc_d_{}.txt",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::write(&file, "a").unwrap();
+        let mut fp = KnowledgeFingerprint::new(&HashMap::new());
+        fp.add_file(&file, true).unwrap();
+        let metadata = KnowledgeMetadata::new(NewKnowledgeType::FileBased, HashMap::new(), Some("file".to_string()));
+        let ck = CachedKnowledge::new_with_metadata("x".to_string(), metadata, Some(fp));
+        let mut cache = SessionKnowledgeCache::new();
+        let key = make_cache_key("project_structure", &HashMap::new());
+        cache.set(key.clone(), ck);
+        fs::write(&file, "b").unwrap();
+        assert!(cache.needs_refresh(&key));
+        let _ = fs::remove_file(&file);
     }
 }
