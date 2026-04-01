@@ -201,6 +201,7 @@ pub(super) async fn stream_response(
             &format!("\n{end_thinking_tag}\n"),
             app.writer.as_mut(),
             &mut markdown,
+            true,
         )?;
     }
 
@@ -287,6 +288,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
             &format!("\n{end_thinking_tag}\n"),
             app.writer.as_mut(),
             markdown,
+            true,
         );
     }
 
@@ -357,6 +359,7 @@ fn process_stream_line(
                         &format!("\n{end_thinking_tag}\n"),
                         app.writer.as_mut(),
                         markdown,
+                        true,
                     );
                     *thinking_open = false;
                 }
@@ -460,6 +463,7 @@ fn process_stream_line(
                     &format!("\n{end_thinking_tag}\n"),
                     app.writer.as_mut(),
                     markdown,
+                    true,
                 );
                 *thinking_open = false;
             }
@@ -487,7 +491,7 @@ fn process_stream_line(
     if content.is_empty() {
         return Ok(reached_finish_reason);
     }
-    write_stream_content(content.as_str(), app.writer.as_mut(), markdown)?;
+    write_stream_content(content.as_str(), app.writer.as_mut(), markdown, *thinking_open)?;
     if *thinking_open {
         return Ok(false);
     }
@@ -561,18 +565,17 @@ fn extract_chunk_text_with_tools(
         if cleaned.is_empty() && tool_calls.is_empty() {
             return (String::new(), Vec::new());
         }
-        let dimmed = cleaned.dimmed().to_string();
         if !*thinking_open {
             *thinking_open = true;
-            return (format!("\n{thinking_tag}\n{dimmed}"), tool_calls);
+            return (format!("\n{thinking_tag}\n\x1b[2m{cleaned}"), tool_calls);
         }
-        return (dimmed, tool_calls);
+        return (cleaned, tool_calls);
     }
 
     if *thinking_open {
         *thinking_open = false;
         return (
-            format!("\n{end_thinking_tag}\n{}", delta.content),
+            format!("\x1b[0m\n{end_thinking_tag}\n{}", delta.content),
             Vec::new(),
         );
     }
@@ -747,6 +750,7 @@ fn write_stream_content(
     content: &str,
     mut writer: Option<&mut std::fs::File>,
     markdown: &mut MarkdownStreamRenderer,
+    dimmed: bool,
 ) -> io::Result<()> {
     if let Some(file) = writer.as_mut() {
         let clean = strip_ansi_codes(content);
@@ -755,11 +759,15 @@ fn write_stream_content(
     }
 
     if markdown.should_render(content) {
-        markdown.write_chunk(content)?;
+        markdown.write_chunk(content, dimmed)?;
         // Force flush after markdown rendering to ensure real-time output
         io::stdout().flush()?;
     } else {
-        print!("{content}");
+        if dimmed {
+            print!("{}", content.dimmed());
+        } else {
+            print!("{content}");
+        }
         io::stdout().flush()?;
     }
     Ok(())
@@ -775,6 +783,7 @@ pub(super) struct MarkdownStreamRenderer {
     line_preview_emitted: bool,
     line_preview_height: usize,
     table_state: TableState,
+    dimmed: bool,
 }
 
 impl MarkdownStreamRenderer {
@@ -794,6 +803,7 @@ impl MarkdownStreamRenderer {
             line_preview_emitted: false,
             line_preview_height: 0,
             table_state: TableState::None,
+            dimmed: false,
         }
     }
 
@@ -812,7 +822,8 @@ impl MarkdownStreamRenderer {
     /// - Table preview (live updates for table rows)
     /// - Code blocks (real-time character output)
     /// - Regular content (real-time character output)
-    fn write_chunk(&mut self, chunk: &str) -> io::Result<()> {
+    fn write_chunk(&mut self, chunk: &str, dimmed: bool) -> io::Result<()> {
+        self.dimmed = dimmed;
         let mut out = io::stdout();
         for ch in chunk.chars() {
             if ch == '\n' {
@@ -869,6 +880,9 @@ impl MarkdownStreamRenderer {
     /// For subsequent characters, outputs just the new character.
     fn handle_table_preview(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
         if !self.line_preview_emitted {
+            if self.dimmed {
+                out.write_all(b"\x1b[2m")?;
+            }
             // First character: output the entire line buffer
             out.write_all(self.line_buf.as_bytes())?;
             out.flush()?;
@@ -886,6 +900,9 @@ impl MarkdownStreamRenderer {
     ///
     /// Outputs characters immediately to avoid the feeling of "freezing".
     fn handle_realtime_output(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
+        if self.line_buf.chars().count() == 1 && self.dimmed {
+            out.write_all(b"\x1b[2m")?;
+        }
         self.emit_char(out, ch)?;
         self.line_preview_emitted = true;
         self.line_preview_height = table_preview_height(&self.line_buf).max(1);
@@ -1118,6 +1135,8 @@ impl MarkdownStreamRenderer {
         let (indent, rest) = split_indent(line);
         let trimmed = rest.trim_start_matches([' ', '\t']);
 
+        let base = if self.dimmed { "\x1b[2m" } else { "" };
+
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             self.in_code_block = !self.in_code_block;
             return format!("{indent}\x1b[2m{trimmed}\x1b[0m\n");
@@ -1127,7 +1146,8 @@ impl MarkdownStreamRenderer {
             if line.is_empty() {
                 return "\n".to_string();
             }
-            return format!("\x1b[97m{line}\x1b[0m\n");
+            let text_color = if self.dimmed { "\x1b[2m" } else { "\x1b[97m" };
+            return format!("{text_color}{line}\x1b[0m\n");
         }
 
         if trimmed == "$$" || trimmed == "\\[" || trimmed == "\\]" {
@@ -1140,11 +1160,11 @@ impl MarkdownStreamRenderer {
                 return "\n".to_string();
             }
             let math = render_math_tex_to_unicode(rest.trim_end());
-            return format!("{indent}\x1b[95m{math}\x1b[0m\n");
+            return format!("{indent}{base}\x1b[95m{math}\x1b[0m\n");
         }
 
         if let Some((level, title)) = parse_heading(trimmed) {
-            let (base, underline_char) = match level {
+            let (h_base, underline_char) = match level {
                 1 => ("\x1b[1m\x1b[35m", Some('═')),
                 2 => ("\x1b[1m\x1b[36m", Some('─')),
                 3 => ("\x1b[1m\x1b[34m", None),
@@ -1157,12 +1177,15 @@ impl MarkdownStreamRenderer {
             }
             out.push_str(indent);
             out.push_str(base);
-            out.push_str(&render_inline_md(title, base));
+            out.push_str(h_base);
+            let combined_base = format!("{}{}", base, h_base);
+            out.push_str(&render_inline_md(title, &combined_base));
             out.push_str("\x1b[0m\n");
 
             if let Some(ch) = underline_char {
                 let len = title.chars().count().clamp(3, 80);
                 out.push_str(indent);
+                out.push_str(base);
                 out.push_str("\x1b[2m\x1b[36m");
                 out.push_str(&std::iter::repeat_n(ch, len).collect::<String>());
                 out.push_str("\x1b[0m\n");
@@ -1173,10 +1196,11 @@ impl MarkdownStreamRenderer {
         if let Some((p_indent, prefix, body)) = split_list_prefix(line) {
             let mut out = String::new();
             out.push_str(p_indent);
+            out.push_str(base);
             out.push_str("\x1b[36m");
             out.push_str(prefix);
             out.push_str("\x1b[0m");
-            out.push_str(&render_inline_md(body, ""));
+            out.push_str(&render_inline_md(body, base));
             out.push('\n');
             return out;
         }
@@ -1184,7 +1208,7 @@ impl MarkdownStreamRenderer {
         if line.is_empty() {
             return "\n".to_string();
         }
-        format!("{}{}\n", indent, render_inline_md(rest, ""))
+        format!("{}{}{}\n", indent, base, render_inline_md(rest, base))
     }
 }
 
@@ -2465,11 +2489,11 @@ mod tests {
         unsafe { std::env::set_var("COLUMNS", "10") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         // Write 15 characters, should wrap to 2 lines
-        let _ = renderer.write_chunk("123456789012345");
+        let _ = renderer.write_chunk("123456789012345", false);
         assert_eq!(renderer.line_preview_height, 2);
 
         // Write 6 more characters, total 21, should wrap to 3 lines
-        let _ = renderer.write_chunk("678901");
+        let _ = renderer.write_chunk("678901", false);
         assert_eq!(renderer.line_preview_height, 3);
     }
 
