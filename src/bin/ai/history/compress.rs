@@ -20,7 +20,7 @@ pub(in crate::ai) fn compress_messages_for_context(
         return shrink_messages_to_fit(messages, max_chars);
     }
 
-    let split_at = messages.len().saturating_sub(keep_last);
+    let split_at = retained_turn_start(&messages, keep_last);
     let (older, recent) = messages.split_at(split_at);
     if older.is_empty() {
         return shrink_messages_to_fit(recent.to_vec(), max_chars);
@@ -28,7 +28,7 @@ pub(in crate::ai) fn compress_messages_for_context(
 
     let mut out = Vec::new();
     if summary_max_chars > 0 {
-        let summary = build_summary_text(older, summary_max_chars);
+        let summary = build_persisted_summary_text(older, summary_max_chars);
         if !summary.trim().is_empty() {
             out.push(Message {
                 role: "system".to_string(),
@@ -82,6 +82,7 @@ fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<M
     }
 
     truncate_tool_messages(&mut messages, 1200, 120);
+    summarize_tool_messages(&mut messages, 240);
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
 
@@ -94,15 +95,11 @@ fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<M
             messages.remove(idx);
             continue;
         }
+        if let Some(idx) = first_trim_candidate(&messages) {
+            messages.remove(idx);
+            continue;
+        }
         break;
-    }
-
-    let mut start = 0usize;
-    while start + 1 < messages.len() && messages_total_chars(&messages[start..]) > max_chars {
-        start += 1;
-    }
-    if start > 0 {
-        messages = messages[start..].to_vec();
     }
 
     if messages_total_chars(&messages) > max_chars {
@@ -439,6 +436,46 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
         truncate_to_chars(&line, 280)
     }
 
+    fn render_known_tool_line(turn: &TurnSummary) -> Option<String> {
+        if turn.tool_names.is_empty() {
+            return None;
+        }
+        let mut line = String::new();
+        line.push_str("- ");
+        line.push_str(&turn.tool_names.join(", "));
+        if !turn.topic_label.is_empty() {
+            line.push_str(" @ ");
+            line.push_str(&turn.topic_label);
+        }
+        let conclusion = if !turn.tool_highlights.is_empty() {
+            turn.tool_highlights.join("；")
+        } else {
+            turn.assistant_final.clone()
+        };
+        if !conclusion.is_empty() {
+            line.push_str(" => ");
+            line.push_str(&conclusion);
+        }
+        Some(truncate_to_chars(&line, 240))
+    }
+
+    fn push_line_with_budget(lines: &mut Vec<String>, line: String, max_chars: usize) -> bool {
+        if lines.is_empty() && line.chars().count() > max_chars {
+            lines.push(truncate_to_chars(&line, max_chars));
+            return true;
+        }
+        let candidate_len = if lines.is_empty() {
+            line.chars().count()
+        } else {
+            lines.join("\n").chars().count() + 1 + line.chars().count()
+        };
+        if candidate_len > max_chars {
+            return false;
+        }
+        lines.push(line);
+        true
+    }
+
     let mut pre_summary_lines: Vec<String> = Vec::new();
     let mut turns: Vec<TurnSummary> = Vec::new();
     let mut current = TurnSummary::default();
@@ -514,13 +551,30 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
 
     let merged = merge_turns(turns);
     let mut lines: Vec<String> = Vec::new();
+    let mut known_tool_lines: Vec<String> = Vec::new();
     for s in pre_summary_lines.into_iter().take(3) {
-        lines.push(s);
+        if !push_line_with_budget(&mut lines, s, max_chars) {
+            return truncate_to_chars(&lines.join("\n"), max_chars);
+        }
     }
-    for t in merged {
-        lines.push(format!("- {}", render_line(&t)));
-        if lines.join("\n").chars().count() >= max_chars {
+    for t in &merged {
+        if !push_line_with_budget(&mut lines, format!("- {}", render_line(t)), max_chars) {
             break;
+        }
+        if let Some(line) = render_known_tool_line(t)
+            && !known_tool_lines.iter().any(|existing| existing == &line)
+            && known_tool_lines.len() < 6
+        {
+            known_tool_lines.push(line);
+        }
+    }
+
+    if !known_tool_lines.is_empty() {
+        let _ = push_line_with_budget(&mut lines, "已知工具结论:".to_string(), max_chars);
+        for line in known_tool_lines {
+            if !push_line_with_budget(&mut lines, line, max_chars) {
+                break;
+            }
         }
     }
 
@@ -553,6 +607,24 @@ fn first_index_of_role(messages: &[Message], role: &str) -> Option<usize> {
     None
 }
 
+fn first_trim_candidate(messages: &[Message]) -> Option<usize> {
+    for (index, message) in messages.iter().enumerate() {
+        if index == 0 && is_summary_message(message) {
+            continue;
+        }
+        return Some(index);
+    }
+    None
+}
+
+fn is_summary_message(message: &Message) -> bool {
+    if message.role != "system" {
+        return false;
+    }
+    let text = value_to_string(&message.content);
+    text.starts_with("对话摘要（自动压缩") || text.starts_with("历史摘要（自动压缩")
+}
+
 fn truncate_tool_messages(messages: &mut [Message], max_chars_per_msg: usize, max_lines: usize) {
     for m in messages.iter_mut() {
         if m.role.as_str() != "tool" {
@@ -579,6 +651,54 @@ fn truncate_tool_messages(messages: &mut [Message], max_chars_per_msg: usize, ma
             m.content = Value::String(out);
         }
     }
+}
+
+fn summarize_tool_messages(messages: &mut [Message], max_chars_per_msg: usize) {
+    for message in messages.iter_mut() {
+        if message.role.as_str() != "tool" {
+            continue;
+        }
+        let text = value_to_string(&message.content);
+        if text.is_empty() {
+            continue;
+        }
+        let summary = summarize_tool_text(&text, max_chars_per_msg);
+        if summary.chars().count() < text.chars().count() {
+            message.content = Value::String(summary);
+        }
+    }
+}
+
+fn summarize_tool_text(text: &str, max_chars: usize) -> String {
+    let normalized = normalize_whitespace(text);
+    if normalized.is_empty() {
+        return String::new();
+    }
+
+    let lines = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    let important = lines
+        .iter()
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("error")
+                || lower.contains("failed")
+                || lower.contains("panic")
+                || lower.contains("exception")
+                || lower.contains("not found")
+                || lower.contains("timeout")
+        })
+        .copied();
+
+    let selected = important
+        .or_else(|| lines.first().copied())
+        .unwrap_or(normalized.as_str());
+
+    truncate_to_chars(selected, max_chars)
 }
 
 fn redact_images_except_last(messages: &mut [Message], keep_last: usize) {

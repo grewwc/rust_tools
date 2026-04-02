@@ -11,6 +11,7 @@ use crate::ai::types::{McpPrompt, McpResource, McpTool};
 use super::io::{read_available_buf, read_line_with_timeout_process};
 
 pub(super) struct McpServerConnection {
+    pub(super) config: crate::ai::types::McpServerConfig,
     pub(super) process: Child,
     pub(super) stdin: ChildStdin,
     pub(super) stdout: BufReader<ChildStdout>,

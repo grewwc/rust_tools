@@ -432,12 +432,136 @@ fn context_history_summarizes_beyond_history_count_instead_of_dropping() {
             .iter()
             .filter(|m| m.role == "user")
             .count(),
-        16
+        32
     );
     assert_eq!(
         context.last().unwrap().content,
         Value::String("answer-239".to_string())
     );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn context_history_keep_last_counts_user_turns_not_raw_messages() {
+    let path = std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
+
+    for i in 0..6 {
+        append_history_messages(
+            &path,
+            &[
+                Message {
+                    role: "user".to_string(),
+                    content: Value::String(format!("question-{i}")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: Value::String(String::new()),
+                    tool_calls: Some(vec![ToolCall {
+                        id: format!("call_{i}"),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "demo_tool".to_string(),
+                            arguments: format!(r#"{{"i":{i}}}"#),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                Message {
+                    role: "tool".to_string(),
+                    content: Value::String(format!("tool-output-{i}")),
+                    tool_calls: None,
+                    tool_call_id: Some(format!("call_{i}")),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: Value::String(format!("answer-{i}")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+        )
+        .unwrap();
+    }
+
+    let context = build_context_history(2, &path, 100_000, 2, 2_000).unwrap();
+
+    let user_questions = context
+        .iter()
+        .filter(|m| m.role == "user")
+        .map(|m| m.content.as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(user_questions, vec!["question-4".to_string(), "question-5".to_string()]);
+    assert!(context.iter().any(|m| {
+        m.role == "system"
+            && m.content
+                .as_str()
+                .unwrap_or_default()
+                .contains("question-0")
+    }));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn context_history_summary_keeps_tool_names_and_results() {
+    let path = std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));
+
+    for i in 0..8 {
+        append_history_messages(
+            &path,
+            &[
+                Message {
+                    role: "user".to_string(),
+                    content: Value::String(format!("请分析 issue-{i}")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: Value::String(String::new()),
+                    tool_calls: Some(vec![ToolCall {
+                        id: format!("call_{i}"),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "grep_search".to_string(),
+                            arguments: format!(r#"{{"query":"issue-{i}"}}"#),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                Message {
+                    role: "tool".to_string(),
+                    content: Value::String(format!(
+                        "ERROR: repeated failure for issue-{i}\nfull stack trace {}",
+                        "x".repeat(400)
+                    )),
+                    tool_calls: None,
+                    tool_call_id: Some(format!("call_{i}")),
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: Value::String(format!("结论 issue-{i}")),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ],
+        )
+        .unwrap();
+    }
+
+    let context = build_context_history(2, &path, 1_800, 2, 1_000).unwrap();
+    let summary = context
+        .first()
+        .and_then(|m| m.content.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(summary.contains("已知工具结论"));
+    assert!(summary.contains("grep_search"));
+    assert!(summary.contains("issue-0"));
+    assert!(summary.contains("ERROR") || summary.contains("repeated failure"));
 
     let _ = std::fs::remove_file(path);
 }

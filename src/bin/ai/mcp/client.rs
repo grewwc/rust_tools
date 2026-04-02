@@ -7,6 +7,11 @@ use std::{
     },
 };
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use libc;
+
 use serde_json::{Value, json};
 use rust_tools::commonw::FastMap;
 
@@ -56,6 +61,16 @@ impl McpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        unsafe {
+            let _ = cmd.pre_exec(|| {
+                {
+                    libc::signal(libc::SIGINT, libc::SIG_IGN);
+                    libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                }
+                Ok(())
+            });
+        }
 
         for (key, value) in &config.env {
             cmd.env(key, value);
@@ -70,6 +85,7 @@ impl McpClient {
         let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
 
         let mut conn = McpServerConnection {
+            config: config.clone(),
             process,
             stdin,
             stdout: BufReader::new(stdout),
@@ -87,6 +103,65 @@ impl McpClient {
 
         self.servers.insert(name.to_string(), Mutex::new(conn));
         self.rebuild_metadata_cache();
+        Ok(())
+    }
+
+    fn is_transport_error(err: &str) -> bool {
+        let e = err.to_lowercase();
+        e.contains("broken pipe")
+            || e.contains("closed the stream unexpectedly")
+            || e.contains("mcp response timeout")
+            || e.contains("failed waiting for mcp response")
+            || e.contains("failed to read response")
+            || e.contains("process exited with status")
+            || e.contains("failed to get stdin")
+            || e.contains("failed to get stdout")
+    }
+
+    fn restart_connection(&self, conn: &mut McpServerConnection) -> Result<(), String> {
+        let cfg = conn.config.clone();
+
+        let _ = conn.process.kill();
+
+        let mut cmd = Command::new(&cfg.command);
+        cmd.args(&cfg.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        unsafe {
+            let _ = cmd.pre_exec(|| {
+                {
+                    libc::signal(libc::SIGINT, libc::SIG_IGN);
+                    libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+                }
+                Ok(())
+            });
+        }
+        for (key, value) in &cfg.env {
+            cmd.env(key, value);
+        }
+
+        let mut process = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to restart MCP server: {}", e))?;
+        let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
+        let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
+        let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
+
+        conn.process = process;
+        conn.stdin = stdin;
+        conn.stdout = BufReader::new(stdout);
+        conn.stderr = BufReader::new(stderr);
+        conn.request_timeout_ms = cfg.request_timeout_ms.max(100);
+        conn.tools.clear();
+        conn.resources.clear();
+        conn.prompts.clear();
+
+        self.initialize_server(conn)?;
+        conn.tools = self.list_tools(conn)?;
+        conn.resources = self.list_resources(conn)?;
+        conn.prompts = self.list_prompts(conn)?;
         Ok(())
     }
 
@@ -296,30 +371,64 @@ impl McpClient {
         tool_name: &str,
         arguments: Value,
     ) -> Result<String, String> {
-        let id = self.next_request_id();
-        let params = json!({
-            "name": tool_name,
-            "arguments": arguments
-        });
+        let make_params = || {
+            let id = self.next_request_id();
+            (id, json!({ "name": tool_name, "arguments": arguments }))
+        };
 
-        let conn = self
+        let conn_cell = self
             .servers
             .get(server_name)
             .ok_or_else(|| format!("Server not found: {}", server_name))?;
 
-        let mut conn = conn
+        // First attempt
+        let mut conn = conn_cell
             .lock()
             .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
-        let result = Self::send_request_to_conn(&mut conn, id, "tools/call", Some(params))?;
+        let (id1, params1) = make_params();
+        let first = Self::send_request_to_conn(&mut conn, id1, "tools/call", Some(params1));
+        match first {
+            Ok(result) => {
+                let content = result["content"]
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|c| c["text"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                return Ok(content);
+            }
+            Err(err) if Self::is_transport_error(&err) => {
+                // Try restart once and retry
+                let restart_res = self.restart_connection(&mut conn);
+                drop(conn);
+                match restart_res {
+                    Ok(()) => {
+                        let mut conn2 = conn_cell
+                            .lock()
+                            .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+                        let (id2, params2) = make_params();
+                        let result =
+                            Self::send_request_to_conn(&mut conn2, id2, "tools/call", Some(params2))?;
+                        let content = result["content"]
+                            .as_array()
+                            .and_then(|arr| arr.first())
+                            .and_then(|c| c["text"].as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        return Ok(content);
+                    }
+                    Err(restart_err) => {
+                        return Err(format!(
+                            "Transport error: {} | restart failed: {}",
+                            err, restart_err
+                        ));
+                    }
+                }
+            }
+            Err(err) => return Err(err),
+        }
 
-        let content = result["content"]
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|c| c["text"].as_str())
-            .unwrap_or("")
-            .to_string();
-
-        Ok(content)
+        // unreachable
     }
 
     pub(in crate::ai) fn get_all_tools(&self) -> Vec<ToolDefinition> {

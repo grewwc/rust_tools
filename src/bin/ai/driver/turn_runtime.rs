@@ -290,7 +290,27 @@ pub(super) async fn run_turn(
             break;
         }
 
-        let exec_result = tools::execute_tool_calls(mcp_client, &stream_result.tool_calls)?;
+        let exec_result = tools::execute_tool_calls(&app.session_id, mcp_client, &stream_result.tool_calls)?;
+
+        if exec_result.cached_hits.iter().any(|hit| *hit) {
+            let cached_names = exec_result
+                .executed_tool_calls
+                .iter()
+                .zip(exec_result.cached_hits.iter())
+                .filter_map(|(tool_call, cached)| cached.then_some(tool_call.function.name.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let cache_note = Message {
+                role: "system".to_string(),
+                content: Value::String(format!(
+                    "Context note: reused cached tool results from the current session for identical calls within the recent TTL. Treat these results as already verified context unless the user asks to refresh. Tools: {cached_names}"
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+            };
+            messages.push(cache_note.clone());
+            turn_messages.push(cache_note);
+        }
 
         let assistant_msg = Message {
             role: "assistant".to_string(),

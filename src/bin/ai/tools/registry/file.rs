@@ -77,17 +77,17 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "read_file_lines",
-        description: "Read line-numbered text from a local file with configurable offset/limit (limit capped at 400).",
+        description: "Read line-numbered text from a local file with configurable offset/limit (limit capped at 400). Prefer this before patching an existing file so edits can target the exact local region instead of rewriting the whole file.",
         parameters: params_read_file_lines,
         execute: execute_read_file_lines,
-        groups: &["openclaw"],
+        groups: &["openclaw", "builtin"],
     }
 });
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "write_file",
-        description: "Create or overwrite a local file at an absolute path. Creates parent directories if missing; access to common secret locations is blocked.",
+        description: "Create a new file or intentionally replace an entire file at an absolute path. For modifying an existing document or source file, prefer read_file_lines + apply_patch with the smallest localized diff instead of rewriting the whole file.",
         parameters: params_write_file,
         execute: execute_write_file,
         groups: &["builtin"],

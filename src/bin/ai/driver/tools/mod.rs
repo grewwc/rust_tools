@@ -1,5 +1,8 @@
+use chrono::{DateTime, Duration, Local, Utc};
 use colored::Colorize;
+use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use rust_tools::commonw::FastMap;
 use std::sync::{LazyLock, Mutex};
@@ -35,13 +38,26 @@ struct PreparedToolCall {
 pub(super) struct ExecuteToolCallsResult {
     pub(super) executed_tool_calls: Vec<ToolCall>,
     pub(super) tool_results: Vec<ToolResult>,
+    pub(super) cached_hits: Vec<bool>,
 }
 
 pub(super) struct RunOneResult {
     pub(super) tool_result: ToolResult,
     pub(super) ok: bool,
     pub(super) executed: bool,
+    pub(super) cached: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolCachePayload {
+    tool_name: String,
+    args: Value,
+    result: String,
+}
+
+const TOOL_CACHE_RECENT_LIMIT: usize = 400;
+const TOOL_CACHE_MAX_RESULT_CHARS: usize = 12_000;
+const TOOL_CACHE_TTL_MINUTES: i64 = 30;
 
 fn route_tool_call(mcp_client: &McpClient, tool_name: &str) -> ToolRoute {
     if let Some((server_name, tool_name)) = mcp_client.parse_tool_name_for_known_server(tool_name) {
@@ -105,6 +121,7 @@ fn confirm_tool_execution(tool_call: &ToolCall, args: &Value) -> Result<(), RunO
         },
         ok: false,
         executed: false,
+        cached: false,
     })
 }
 
@@ -178,7 +195,7 @@ fn execute_prepared_tool_call(
     }
 }
 
-fn run_one(mcp_client: &McpClient, tool_call: &ToolCall) -> (ToolRoute, RunOneResult) {
+fn run_one(mcp_client: &McpClient, session_id: &str, tool_call: &ToolCall) -> (ToolRoute, RunOneResult) {
     let prepared = match prepare_tool_call(mcp_client, tool_call) {
         Ok(prepared) => prepared,
         Err(tool_result) => {
@@ -188,6 +205,7 @@ fn run_one(mcp_client: &McpClient, tool_call: &ToolCall) -> (ToolRoute, RunOneRe
                     tool_result,
                     ok: false,
                     executed: true,
+                    cached: false,
                 },
             );
         }
@@ -197,17 +215,34 @@ fn run_one(mcp_client: &McpClient, tool_call: &ToolCall) -> (ToolRoute, RunOneRe
         return (prepared.route, result);
     }
 
+    if let Some(tool_result) = load_cached_tool_result(session_id, tool_call, &prepared.args) {
+        return (
+            prepared.route,
+            RunOneResult {
+                tool_result,
+                ok: true,
+                executed: false,
+                cached: true,
+            },
+        );
+    }
+
     let result = execute_prepared_tool_call(mcp_client, tool_call, &prepared);
     let run_result = match result {
-        Ok(tool_result) => RunOneResult {
-            tool_result,
-            ok: true,
-            executed: true,
-        },
+        Ok(tool_result) => {
+            store_tool_cache_result(session_id, tool_call, &prepared.args, &tool_result);
+            RunOneResult {
+                tool_result,
+                ok: true,
+                executed: true,
+                cached: false,
+            }
+        }
         Err(err) => RunOneResult {
             tool_result: format_tool_error(tool_call, &err),
             ok: false,
             executed: true,
+            cached: false,
         },
     };
     if run_result.executed {
@@ -224,25 +259,28 @@ fn run_one(mcp_client: &McpClient, tool_call: &ToolCall) -> (ToolRoute, RunOneRe
 }
 
 pub(super) fn execute_tool_calls(
+    session_id: &str,
     mcp_client: &McpClient,
     tool_calls: &[ToolCall],
 ) -> Result<ExecuteToolCallsResult, Box<dyn Error>> {
     if tokio::runtime::Handle::try_current().is_ok() {
-        return tokio::task::block_in_place(|| execute_tool_calls_inner(mcp_client, tool_calls));
+        return tokio::task::block_in_place(|| execute_tool_calls_inner(session_id, mcp_client, tool_calls));
     }
-    execute_tool_calls_inner(mcp_client, tool_calls)
+    execute_tool_calls_inner(session_id, mcp_client, tool_calls)
 }
 
 fn execute_tool_calls_inner(
+    session_id: &str,
     mcp_client: &McpClient,
     tool_calls: &[ToolCall],
 ) -> Result<ExecuteToolCallsResult, Box<dyn Error>> {
     let mut executed_tool_calls = Vec::with_capacity(tool_calls.len());
     let mut tool_results = Vec::with_capacity(tool_calls.len());
+    let mut cached_hits = Vec::with_capacity(tool_calls.len());
 
     for (idx, tool_call) in tool_calls.iter().enumerate() {
         let is_last = idx + 1 >= tool_calls.len();
-        let (route, run_result) = run_one(mcp_client, tool_call);
+        let (route, run_result) = run_one(mcp_client, session_id, tool_call);
         let should_barrier = barrier::should_barrier_after(
             &route,
             tool_call,
@@ -251,8 +289,11 @@ fn execute_tool_calls_inner(
         );
 
         executed_tool_calls.push(tool_call.clone());
+        cached_hits.push(run_result.cached);
         tool_results.push(run_result.tool_result);
-        if run_result.executed {
+        if run_result.cached {
+            println!("\n[Cached] {}", tool_call.function.name.bright_blue());
+        } else if run_result.executed {
             println!("\n[Executed] {}", tool_call.function.name.green());
         } else {
             println!("\n[Skipped] {}", tool_call.function.name.yellow());
@@ -269,7 +310,154 @@ fn execute_tool_calls_inner(
     Ok(ExecuteToolCallsResult {
         executed_tool_calls,
         tool_results,
+        cached_hits,
     })
+}
+
+fn load_cached_tool_result(session_id: &str, tool_call: &ToolCall, args: &Value) -> Option<ToolResult> {
+    if !is_cacheable_tool_name(&tool_call.function.name) {
+        return None;
+    }
+    let source = format!("session:{session_id}");
+    let cache_key = build_tool_cache_key(&tool_call.function.name, args);
+    let store = MemoryStore::from_env_or_config();
+    let entries = store.recent(TOOL_CACHE_RECENT_LIMIT).ok()?;
+    for entry in entries {
+        if entry.category != "tool_cache" {
+            continue;
+        }
+        if !is_tool_cache_entry_fresh(&entry) {
+            continue;
+        }
+        if entry.source.as_deref() != Some(source.as_str()) {
+            continue;
+        }
+        if entry.tags.first().map(String::as_str) != Some(tool_call.function.name.as_str()) {
+            continue;
+        }
+        if entry.tags.get(1).map(String::as_str) != Some(cache_key.as_str()) {
+            continue;
+        }
+        let payload = serde_json::from_str::<ToolCachePayload>(&entry.note).ok()?;
+        if payload.tool_name != tool_call.function.name || payload.args != *args {
+            continue;
+        }
+        return Some(ToolResult {
+            tool_call_id: tool_call.id.clone(),
+            content: payload.result,
+        });
+    }
+    None
+}
+
+fn is_tool_cache_entry_fresh(entry: &AgentMemoryEntry) -> bool {
+    let Ok(timestamp) = DateTime::parse_from_rfc3339(&entry.timestamp) else {
+        return false;
+    };
+    let timestamp = timestamp.with_timezone(&Utc);
+    Utc::now().signed_duration_since(timestamp) <= Duration::minutes(TOOL_CACHE_TTL_MINUTES)
+}
+
+fn store_tool_cache_result(session_id: &str, tool_call: &ToolCall, args: &Value, tool_result: &ToolResult) {
+    if !is_cacheable_tool_name(&tool_call.function.name) {
+        return;
+    }
+    if tool_result.content.trim().is_empty() || tool_result.content.starts_with("Error:") {
+        return;
+    }
+    let payload = ToolCachePayload {
+        tool_name: tool_call.function.name.clone(),
+        args: args.clone(),
+        result: truncate_chars(&tool_result.content, TOOL_CACHE_MAX_RESULT_CHARS),
+    };
+    let Ok(note) = serde_json::to_string(&payload) else {
+        return;
+    };
+    let cache_key = build_tool_cache_key(&tool_call.function.name, args);
+    let entry = AgentMemoryEntry {
+        id: None,
+        timestamp: Local::now().to_rfc3339(),
+        category: "tool_cache".to_string(),
+        note,
+        tags: vec![tool_call.function.name.clone(), cache_key],
+        source: Some(format!("session:{session_id}")),
+        priority: Some(80),
+    };
+    let store = MemoryStore::from_env_or_config();
+    let _ = store.append(&entry);
+    store.maintain_after_append();
+}
+
+fn is_cacheable_tool_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let mutating = [
+        "create", "delete", "remove", "update", "write", "save", "append", "insert",
+        "rename", "move", "install", "run", "execute", "oauth", "open_browser",
+        "report_event", "memory", "kill_terminal", "edit", "apply_patch",
+    ];
+    if mutating.iter().any(|needle| lower.contains(needle)) {
+        return false;
+    }
+    let reusable = ["search", "read", "get", "list", "view", "fetch", "export"];
+    reusable.iter().any(|needle| lower.contains(needle))
+}
+
+fn build_tool_cache_key(name: &str, args: &Value) -> String {
+    let args_json = serde_json::to_string(args).unwrap_or_else(|_| args.to_string());
+    format!("{:x}", md5::compute(format!("{name}\n{args_json}")))
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 || s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_chars).collect();
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_tool_cache_key, is_cacheable_tool_name, is_tool_cache_entry_fresh, TOOL_CACHE_TTL_MINUTES};
+    use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
+    use chrono::{Duration, Utc};
+    use serde_json::json;
+
+    #[test]
+    fn cacheable_tool_name_prefers_read_only_tools() {
+        assert!(is_cacheable_tool_name("read_file"));
+        assert!(is_cacheable_tool_name("grep_search"));
+        assert!(!is_cacheable_tool_name("create_file"));
+        assert!(!is_cacheable_tool_name("execute_command"));
+    }
+
+    #[test]
+    fn tool_cache_key_is_stable_for_same_args() {
+        let key1 = build_tool_cache_key("read_file", &json!({"path":"a","start":1}));
+        let key2 = build_tool_cache_key("read_file", &json!({"path":"a","start":1}));
+        let key3 = build_tool_cache_key("read_file", &json!({"path":"a","start":2}));
+        assert_eq!(key1, key2);
+        assert_ne!(key1, key3);
+    }
+
+    #[test]
+    fn tool_cache_entry_obeys_ttl() {
+        let fresh = AgentMemoryEntry {
+            id: None,
+            timestamp: Utc::now().to_rfc3339(),
+            category: "tool_cache".to_string(),
+            note: "{}".to_string(),
+            tags: Vec::new(),
+            source: None,
+            priority: Some(80),
+        };
+        let stale = AgentMemoryEntry {
+            timestamp: (Utc::now() - Duration::minutes(TOOL_CACHE_TTL_MINUTES + 1)).to_rfc3339(),
+            ..fresh.clone()
+        };
+        assert!(is_tool_cache_entry_fresh(&fresh));
+        assert!(!is_tool_cache_entry_fresh(&stale));
+    }
 }
 
 pub(super) fn penalty_for_skill_tools(skill: &crate::ai::skills::SkillManifest) -> f64 {
