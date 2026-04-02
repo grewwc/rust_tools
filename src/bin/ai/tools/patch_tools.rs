@@ -197,9 +197,6 @@ pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
     let patch = args["patch"].as_str().ok_or("Missing patch")?;
 
     let path = PathBuf::from(file_path);
-    if !path.is_absolute() {
-        return Err("file_path must be absolute".to_string());
-    }
     if is_sensitive_fs_path(&path) {
         return Err("Access blocked: sensitive path".to_string());
     }

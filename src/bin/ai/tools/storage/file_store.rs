@@ -15,9 +15,6 @@ impl FileStore {
     }
 
     pub(crate) fn validate_access(&self) -> Result<(), String> {
-        if !self.path.is_absolute() {
-            return Err("file_path must be absolute".to_string());
-        }
         if is_sensitive_fs_path(&self.path) {
             return Err("Access blocked: sensitive path".to_string());
         }
