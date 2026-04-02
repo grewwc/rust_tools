@@ -179,11 +179,19 @@ pub(super) async fn run_turn(
                     &turn_messages,
                     &mut persisted_turn_messages,
                 );
+                let err_text = err.to_string();
                 if request::is_transient_error(&err) {
-                    eprintln!("[Warning] {}", err);
-                    break;
+                    eprintln!("[Warning] {}", err_text);
+                } else {
+                    eprintln!("[Error] {}", err_text);
                 }
-                return Err(err.into());
+                if err_text.contains("function.arguments") && err_text.contains("must be in JSON format") {
+                    eprintln!("[Info] 检测到模型返回了非法 tool arguments，本轮已跳过，继续下一轮对话。");
+                } else {
+                    eprintln!("[Info] 本轮请求失败，已保持会话存活，可直接继续提问。");
+                }
+                final_assistant_text = "[本轮请求失败，请重试或换个问法]".to_string();
+                break;
             }
         };
         if app

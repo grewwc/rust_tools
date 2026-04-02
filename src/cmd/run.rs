@@ -82,6 +82,18 @@ fn should_use_shell(command: &str) -> bool {
         || command.contains("&&")
         || command.contains("||")
         || command.contains(';')
+        || command.contains('\'')
+        || command.contains('`')
+        || command.contains("$(")
+        || command.contains("${")
+        || command.contains('\\')
+        || command.contains('&')
+        || command.contains('*')
+        || command.contains('?')
+        || command.contains('#')
+        || command.contains("<<")
+        || command.contains('(')
+        || command.contains(')')
 }
 
 /// 构建使用 Shell 的命令对象

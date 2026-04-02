@@ -215,7 +215,7 @@ async fn run_loop(
         app.current_model = next_model.clone();
 
         app.cancel_stream.store(false, Ordering::Relaxed);
-        let turn_outcome = turn_runtime::run_turn(
+        let turn_outcome = match turn_runtime::run_turn(
             app,
             mcp_client,
             skill_manifests,
@@ -225,7 +225,20 @@ async fn run_loop(
             one_shot_mode,
             should_quit,
         )
-        .await?;
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                eprintln!("[Error] 当前轮执行失败：{}", err);
+                if one_shot_mode || should_quit {
+                    cleanup_one_shot(app);
+                    return Err(err);
+                }
+                eprintln!("[Info] 会话保持运行，请继续输入下一条消息。\n");
+                should_quit = false;
+                continue;
+            }
+        };
 
         if matches!(turn_outcome, turn_runtime::TurnOutcome::Quit) || should_quit {
             cleanup_one_shot(app);
