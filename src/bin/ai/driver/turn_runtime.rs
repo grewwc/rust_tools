@@ -308,12 +308,7 @@ pub(super) async fn run_turn(
         app.config.history_summary_max_chars,
     )?;
     let mut messages = Vec::with_capacity(history.len() + 2);
-    messages.push(Message {
-        role: "system".to_string(),
-        content: Value::String(skill_turn.system_prompt().to_string()),
-        tool_calls: None,
-        tool_call_id: None,
-    });
+
     {
         let integrated = crate::commonw::configw::get_all_config()
             .get_opt("ai.critic_revise.integrated")
@@ -334,27 +329,23 @@ pub(super) async fn run_turn(
                 sys.push_str("At the very end of your message, include a compact self experience note enclosed within <meta:self_note> and </meta:self_note>. The note should be 2-6 short bullets grouped under 'Do:' and 'Avoid:'. Do not mention these tags in the visible content.\n");
             }
             if !sys.is_empty() {
-                messages.push(Message {
-                    role: "system".to_string(),
-                    content: Value::String(sys),
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
+                skill_turn.append_system_prompt(&sys);
             }
         }
     }
-    
-    
     if let Some(guidelines) = super::reflection::build_persistent_guidelines(&question, 1200) {
         if !guidelines.trim().is_empty() {
-            messages.push(Message {
-                role: "system".to_string(),
-                content: Value::String(guidelines),
-                tool_calls: None,
-                tool_call_id: None,
-            });
+            skill_turn.append_system_prompt(&format!("\n{guidelines}"));
         }
     }
+
+    messages.push(Message {
+        role: "system".to_string(),
+        content: Value::String(skill_turn.system_prompt().to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+    });
+
     messages.extend(history);
     let user_message = Message {
         role: "user".to_string(),

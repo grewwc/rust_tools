@@ -25,6 +25,10 @@ impl SkillTurnGuard {
         &self.system_prompt
     }
 
+    pub(super) fn append_system_prompt(&mut self, extra: &str) {
+        self.system_prompt.push_str(extra);
+    }
+
     pub(super) fn matched_skill_name(&self) -> Option<&str> {
         self.matched_skill_name.as_deref()
     }
