@@ -56,6 +56,7 @@ fn main() {
 
     let title_query = first_non_empty(&[cli.title.as_str(), cli.content.as_str()]).to_string();
 
+    let clipboard = cli.clipboard;
     let ctx = Arc::new(features::register::ReContext {
         db: Arc::clone(&db),
         cli: Arc::clone(&cli),
@@ -67,6 +68,7 @@ fn main() {
         include_finished,
         record_limit,
         out_name,
+        clipboard,
         to_binary,
         only_tags,
         tag_query_raw,

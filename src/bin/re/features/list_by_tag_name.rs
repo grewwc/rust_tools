@@ -17,6 +17,7 @@ pub fn list_by_tag_name_feature(
     only_tags: bool,
     to_binary: bool,
     out_name: &str,
+    clipboard: bool,
 ) {
     let tags = parse_tag_query(query);
     if tags.is_empty() {
@@ -112,12 +113,17 @@ pub fn list_by_tag_name_feature(
         return;
     }
 
-    if !out_name.trim().is_empty() {
+    let write_out = !out_name.trim().is_empty();
+    if write_out || clipboard {
         let out = records_to_output_text(&records);
-        write_text_output(out_name, &out, cli.force);
+        if write_out {
+            write_text_output(out_name, &out, cli.force);
+        }
+        if clipboard {
+            copy_to_clipboard(&out);
+        }
         return;
     }
-
     for record in records {
         ui::print_separator();
         let mut display = record.clone();

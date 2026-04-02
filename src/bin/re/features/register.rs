@@ -39,6 +39,7 @@ pub struct ReContext {
     pub include_finished: bool,
     pub record_limit: i64,
     pub out_name: String,
+    pub clipboard: bool,
     pub to_binary: bool,
     pub only_tags: bool,
     pub tag_query_raw: Option<String>,
@@ -267,6 +268,7 @@ fn register_list_by_title(parser: &mut terminalw::Parser, ctx: Arc<ReContext>) {
                 ctx.reverse,
                 ctx.include_finished,
                 &ctx.out_name,
+                ctx.clipboard,
                 ctx.to_binary,
                 ctx.cli.count,
                 ctx.cli.verbose,
@@ -292,6 +294,7 @@ fn register_search(parser: &mut terminalw::Parser, ctx: Arc<ReContext>) {
                 ctx.include_finished,
                 ctx.list_special,
                 &ctx.out_name,
+                ctx.clipboard,
                 ctx.to_binary,
                 ctx.cli.count,
                 ctx.cli.verbose,
@@ -342,6 +345,7 @@ fn register_list_by_tag_name(parser: &mut terminalw::Parser, ctx: Arc<ReContext>
                 ctx.only_tags,
                 ctx.to_binary,
                 &ctx.out_name,
+                ctx.clipboard,
             );
         });
 }

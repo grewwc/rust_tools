@@ -20,6 +20,7 @@ pub static WRAPPED_NUMBERED_ITEM_RE: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Debug, Clone)]
 pub struct Cli {
     pub backend: String,
+    pub clipboard: bool,
     pub insert: bool,
     pub change_title: Option<String>,
     pub update: Option<String>,
@@ -98,6 +99,7 @@ pub fn normalize_legacy_single_dash_long_args(
         "count",
         "prefix",
         "pre",
+        "cp",
         "binary",
         "force",
         "sp",
@@ -201,6 +203,9 @@ fn build_re_parser() -> terminalw::Parser {
     p.add_bool("pre", false, "tag prefix (short for -prefix)");
     p.add_bool("binary", false, "if the title is binary file");
     p.add_bool("b", false, "shortcut for -binary");
+    p.add_bool(
+        "cp", false, "copy output to clipboard",
+    );
     p.add_bool("force", false, "force overwrite");
     p.add_bool(
         "sp",
@@ -268,6 +273,7 @@ pub fn parse_cli_and_parser(argv: Vec<String>) -> (terminalw::Parser, Cli) {
 
     let mut cli = Cli {
         backend: p.flag_value_with_default("backend", ""),
+        clipboard: p.contains_flag_strict("cp"),
         insert: p.contains_flag_strict("i"),
         change_title: p
             .contains_flag_strict("ct")
@@ -782,6 +788,18 @@ pub fn write_text_output(path: &str, content: &str, force: bool) {
         std::process::exit(1);
     });
     println!("write to {path}");
+}
+
+/// Copy text content to the system clipboard.
+/// Prints a success message or error to stderr on failure.
+pub fn copy_to_clipboard(content: &str) {
+    match rust_tools::clipboardw::set_clipboard_content(content) {
+        Ok(()) => println!("copied to clipboard"),
+        Err(e) => {
+            eprintln!("failed to copy to clipboard: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 pub fn split_binary_title(title: &str) -> Option<(String, String)> {

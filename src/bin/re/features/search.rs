@@ -17,6 +17,7 @@ pub fn search_feature(
     include_finished: bool,
     list_special: bool,
     out_name: &str,
+    clipboard: bool,
     to_binary: bool,
     count_only: bool,
     verbose: bool,
@@ -70,7 +71,8 @@ pub fn search_feature(
         std::process::exit(1);
     }
 
-    if !out_name.trim().is_empty() {
+    let write_out = !out_name.trim().is_empty();
+    if write_out || clipboard {
         let mut out = String::new();
         for idx in (0..results.len()).rev() {
             let item = &results[idx];
@@ -83,10 +85,14 @@ pub fn search_feature(
             out.push_str(&item.record.title);
             out.push('\n');
         }
-        write_text_output(out_name, &out, force);
+        if write_out {
+            write_text_output(out_name, &out, force);
+        }
+        if clipboard {
+            copy_to_clipboard(&out);
+        }
         return;
     }
-
     let pattern = memo_search::highlight_pattern(query);
     for idx in (0..results.len()).rev() {
         if idx < results.len().saturating_sub(1) {

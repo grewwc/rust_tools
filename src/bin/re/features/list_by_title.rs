@@ -15,6 +15,7 @@ pub fn list_by_title_feature(
     reverse: bool,
     include_finished: bool,
     out_name: &str,
+    clipboard: bool,
     to_binary: bool,
     count_only: bool,
     verbose: bool,
@@ -59,12 +60,17 @@ pub fn list_by_title_feature(
         std::process::exit(1);
     }
 
-    if !out_name.trim().is_empty() {
+    let write_out = !out_name.trim().is_empty();
+    if write_out || clipboard {
         let out = records_to_output_text(&records);
-        write_text_output(out_name, &out, force);
+        if write_out {
+            write_text_output(out_name, &out, force);
+        }
+        if clipboard {
+            copy_to_clipboard(&out);
+        }
         return;
     }
-
     let pattern = Regex::new(&format!("(?i){}", regex::escape(query))).ok();
     for record in records {
         ui::print_separator();
