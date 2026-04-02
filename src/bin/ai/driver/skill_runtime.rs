@@ -6,15 +6,12 @@ use crate::ai::{
 };
 use crate::commonw::configw;
 use std::ptr::NonNull;
-use std::sync::{LazyLock, Mutex};
 use rust_tools::cw::SkipMap;
 use chrono::{DateTime, Utc};
 
 use super::{DEFAULT_MAX_ITERATIONS, OPENCLAW_MAX_ITERATIONS, match_skill};
 
 type ToolDef = ToolDefinition;
-
-static LAST_SKILL: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
 
 pub(super) struct SkillTurnGuard {
     app: NonNull<App>,
@@ -267,11 +264,6 @@ pub(super) async fn prepare_skill_for_turn(
     } else {
         router_skill.or(heuristic_skill)
     };
-    if skill.is_none() {
-        if let Some(last) = LAST_SKILL.lock().ok().and_then(|g| g.clone()) {
-            skill = skill_manifests.iter().find(|s| s.name == last);
-        }
-    }
     if debug {
         if let Some(name) = router_selected.as_deref() {
             eprintln!("[skills] router selected: {}", name);
@@ -304,11 +296,6 @@ pub(super) async fn prepare_skill_for_turn(
         system_prompt: build_system_prompt(skill),
         matched_skill_name,
     };
-    if let Some(name) = guard.matched_skill_name.as_ref() {
-        if let Ok(mut g) = LAST_SKILL.lock() {
-            *g = Some(name.clone());
-        }
-    }
     guard
 }
 
