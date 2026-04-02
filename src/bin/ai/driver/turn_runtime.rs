@@ -1,8 +1,16 @@
+use std::{
+    fs,
+    path::PathBuf,
+};
+
 use colored::Colorize;
 use serde_json::Value;
 
 use crate::ai::{
-    history::{Message, append_history_messages, build_context_history}, mcp::McpClient, request, stream, types::{App, StreamOutcome, StreamResult}
+    history::{Message, SessionStore, append_history_messages, build_context_history},
+    mcp::McpClient,
+    request, stream,
+    types::{App, StreamOutcome, StreamResult},
 };
 
 use super::{
@@ -11,6 +19,260 @@ use super::{
     reflection,
     tools,
 };
+
+const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;
+const TOOL_OVERFLOW_PREVIEW_CHARS: usize = 800;
+
+struct PreparedToolResult {
+    content_for_model: String,
+    content_for_terminal: String,
+}
+
+struct LargeToolSummary {
+    body: String,
+    summary: String,
+    top_level_keys: Vec<String>,
+    field_samples: Vec<String>,
+}
+
+fn truncate_chars(content: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        return content.to_string();
+    }
+    let mut out = String::with_capacity(max_chars + 32);
+    for (i, ch) in content.chars().enumerate() {
+        if i >= max_chars {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+fn summarize_large_tool_output(content: &str) -> LargeToolSummary {
+    let trimmed = content.trim();
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && let Ok(json) = serde_json::from_str::<Value>(trimmed)
+    {
+        let pretty = serde_json::to_string_pretty(&json).unwrap_or_else(|_| content.to_string());
+        let mut top_level_keys = Vec::new();
+        let mut field_samples = Vec::new();
+        let summary = match &json {
+            Value::Object(map) => {
+                top_level_keys = map.keys().take(12).cloned().collect::<Vec<_>>();
+                if map.len() > 12 {
+                    top_level_keys.push("...".to_string());
+                }
+                field_samples = map
+                    .iter()
+                    .take(6)
+                    .map(|(key, value)| format!("{}: {}", key, json_value_sample(value, 90)))
+                    .collect();
+                format!("JSON object with {} top-level keys", map.len())
+            }
+            Value::Array(arr) => {
+                if let Some(Value::Object(map)) = arr.first() {
+                    top_level_keys = map.keys().take(12).cloned().collect::<Vec<_>>();
+                    if map.len() > 12 {
+                        top_level_keys.push("...".to_string());
+                    }
+                    field_samples = map
+                        .iter()
+                        .take(6)
+                        .map(|(key, value)| format!("{}: {}", key, json_value_sample(value, 90)))
+                        .collect();
+                } else if let Some(first) = arr.first() {
+                    field_samples.push(format!("item[0]: {}", json_value_sample(first, 90)));
+                }
+                format!("JSON array with {} items", arr.len())
+            }
+            other => format!("JSON {} value", json_type_name(other)),
+        };
+        return LargeToolSummary {
+            body: pretty,
+            summary,
+            top_level_keys,
+            field_samples,
+        };
+    }
+
+    let important = content
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            let lower = line.to_ascii_lowercase();
+            !line.is_empty()
+                && (lower.contains("error")
+                    || lower.contains("failed")
+                    || lower.contains("panic")
+                    || lower.contains("exception")
+                    || lower.contains("timeout"))
+        })
+        .map(|s| s.to_string());
+    let fallback = content
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string();
+    let summary = important.unwrap_or(fallback);
+    LargeToolSummary {
+        body: content.to_string(),
+        summary: truncate_chars(&summary, 240),
+        top_level_keys: Vec::new(),
+        field_samples: Vec::new(),
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn json_value_sample(value: &Value, max_chars: usize) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(v) => v.to_string(),
+        Value::Number(v) => v.to_string(),
+        Value::String(v) => format!("{:?}", truncate_chars(v, max_chars)),
+        Value::Array(arr) => {
+            if let Some(first) = arr.first() {
+                format!(
+                    "array(len={}, first={})",
+                    arr.len(),
+                    json_value_sample(first, max_chars / 2)
+                )
+            } else {
+                "array(len=0)".to_string()
+            }
+        }
+        Value::Object(map) => {
+            let mut keys = map.keys().take(5).cloned().collect::<Vec<_>>();
+            if map.len() > 5 {
+                keys.push("...".to_string());
+            }
+            format!("object(keys={})", keys.join(", "))
+        }
+    }
+}
+
+fn tail_chars(content: &str, max_chars: usize) -> String {
+    let total = content.chars().count();
+    if total <= max_chars {
+        return content.to_string();
+    }
+    content
+        .chars()
+        .skip(total.saturating_sub(max_chars))
+        .collect::<String>()
+}
+
+fn write_tool_overflow_file(
+    app: &App,
+    tool_name: &str,
+    body: &str,
+    extension: &str,
+) -> Result<PathBuf, String> {
+    let store = SessionStore::new(app.config.history_file.as_path());
+    let dir = store.session_assets_dir(&app.session_id).join("tool_overflow");
+    fs::create_dir_all(&dir).map_err(|e| format!("failed to create tool overflow dir: {}", e))?;
+
+    let mut safe_tool = String::new();
+    for ch in tool_name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            safe_tool.push(ch);
+        } else {
+            safe_tool.push('_');
+        }
+    }
+    let filename = format!(
+        "{}_{}.{}",
+        safe_tool,
+        uuid::Uuid::new_v4(),
+        extension.trim_start_matches('.')
+    );
+    let path = dir.join(filename);
+    fs::write(&path, body).map_err(|e| format!("failed to write tool overflow file: {}", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
+}
+
+fn prepare_tool_result(app: &App, tool_name: &str, content: &str) -> PreparedToolResult {
+    if content.chars().count() <= MAX_TOOL_RESULT_INLINE_CHARS {
+        return PreparedToolResult {
+            content_for_model: content.to_string(),
+            content_for_terminal: content.to_string(),
+        };
+    }
+
+    let large = summarize_large_tool_output(content);
+    let body = large.body;
+    let extension = if body.trim_start().starts_with('{') || body.trim_start().starts_with('[') {
+        "json"
+    } else {
+        "txt"
+    };
+
+    match write_tool_overflow_file(app, tool_name, &body, extension) {
+        Ok(path) => {
+            let lines = body.lines().count();
+            let chars = body.chars().count();
+            let head = truncate_chars(&body, TOOL_OVERFLOW_PREVIEW_CHARS);
+            let tail = truncate_chars(&tail_chars(&body, TOOL_OVERFLOW_PREVIEW_CHARS), TOOL_OVERFLOW_PREVIEW_CHARS);
+            let top_level_keys = if large.top_level_keys.is_empty() {
+                String::new()
+            } else {
+                format!("\n- top_level_keys: {}", large.top_level_keys.join(", "))
+            };
+            let field_samples = if large.field_samples.is_empty() {
+                String::new()
+            } else {
+                format!("\n- field_samples:\n  - {}", large.field_samples.join("\n  - "))
+            };
+            let stub = format!(
+                "Output too large; full result saved to a session file.\n- file_path: {}\n- chars: {}\n- lines: {}\n- summary: {}{}{}\n- preview_head:\n{}\n- preview_tail:\n{}\n- read_next: use read_file_lines with this file_path and a limit between 200 and 400.",
+                path.display(),
+                chars,
+                lines,
+                if large.summary.trim().is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    large.summary
+                },
+                top_level_keys,
+                field_samples,
+                head.trim_end(),
+                tail.trim_end(),
+            );
+            PreparedToolResult {
+                content_for_model: stub.clone(),
+                content_for_terminal: stub,
+            }
+        }
+        Err(err) => {
+            let fallback = format!(
+                "{}\n... (output truncated; overflow spill failed: {})",
+                truncate_chars(content, MAX_TOOL_RESULT_INLINE_CHARS),
+                err
+            );
+            PreparedToolResult {
+                content_for_model: fallback.clone(),
+                content_for_terminal: fallback,
+            }
+        }
+    }
+}
 
 pub(super) enum TurnOutcome {
     Continue,
@@ -334,12 +596,15 @@ pub(super) async fn run_turn(
             .iter()
             .zip(exec_result.tool_results.iter())
         {
+            let prepared = prepare_tool_result(app, &tool_call.function.name, &result.content);
             println!(
                 "\n{} {}",
                 "[Tool]".bright_green().bold(),
                 tool_call.function.name.bright_cyan().bold()
             );
-            if tool_call.function.name == "web_search" {
+            if tool_call.function.name == "web_search"
+                && prepared.content_for_model == result.content
+            {
                 let mut preview = String::new();
                 let mut truncated = false;
                 for (lines, line) in result.content.lines().enumerate() {
@@ -355,11 +620,11 @@ pub(super) async fn run_turn(
                     print_tool_output_block("... (truncated)");
                 }
             } else {
-                print_tool_output_block(&result.content);
+                print_tool_output_block(&prepared.content_for_terminal);
             }
             let tool_message = Message {
                 role: "tool".to_string(),
-                content: Value::String(result.content.clone()),
+                content: Value::String(prepared.content_for_model),
                 tool_calls: None,
                 tool_call_id: Some(result.tool_call_id.clone()),
             };
@@ -476,7 +741,7 @@ fn persist_pending_turn_messages(
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::{
         Arc,
         atomic::AtomicBool,
@@ -487,7 +752,7 @@ mod tests {
     use super::*;
     use crate::ai::{
         cli::ParsedCli,
-        history::build_message_arr,
+        history::{SessionStore, build_message_arr},
         types::AppConfig,
     };
 
@@ -519,6 +784,12 @@ mod tests {
             prompt_editor: None,
             agent_context: None,
         }
+    }
+
+    fn extract_stub_path(stub: &str) -> Option<PathBuf> {
+        stub.lines()
+            .find_map(|line| line.strip_prefix("- file_path: "))
+            .map(PathBuf::from)
     }
 
     #[test]
@@ -560,5 +831,69 @@ mod tests {
         assert_eq!(loaded, turn_messages);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn prepare_tool_result_spills_large_output_to_session_file() {
+        let history_file = std::env::temp_dir().join(format!(
+            "ai-tool-overflow-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let app = test_app(history_file.clone());
+        let store = SessionStore::new(history_file.as_path());
+        store.ensure_root_dir().unwrap();
+        std::fs::write(store.session_history_file(&app.session_id), b"test").unwrap();
+
+        let content = "x".repeat(MAX_TOOL_RESULT_INLINE_CHARS + 256);
+        let prepared = prepare_tool_result(&app, "mcp_big_payload", &content);
+
+        assert!(prepared.content_for_model.contains("Output too large; full result saved"));
+        let path = extract_stub_path(&prepared.content_for_model).unwrap();
+        assert!(path.is_absolute());
+        assert!(Path::new(&path).exists());
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(saved, content);
+
+        let _ = store.delete_session(&app.session_id);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn prepare_tool_result_json_stub_includes_keys_and_samples() {
+        let history_file = std::env::temp_dir().join(format!(
+            "ai-tool-overflow-json-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let app = test_app(history_file.clone());
+        let store = SessionStore::new(history_file.as_path());
+        store.ensure_root_dir().unwrap();
+        std::fs::write(store.session_history_file(&app.session_id), b"test").unwrap();
+
+        let payload = serde_json::json!({
+            "id": 123,
+            "name": "example payload",
+            "items": [
+                { "kind": "doc", "token": "abc", "size": 42 }
+            ],
+            "meta": {
+                "source": "mcp",
+                "ok": true
+            }
+        });
+        let content = format!(
+            "{}{}",
+            payload,
+            " ".repeat(MAX_TOOL_RESULT_INLINE_CHARS)
+        );
+        let prepared = prepare_tool_result(&app, "mcp_json_payload", &content);
+
+        assert!(prepared.content_for_model.contains("- top_level_keys:"));
+        assert!(prepared.content_for_model.contains("id"));
+        assert!(prepared.content_for_model.contains("name"));
+        assert!(prepared.content_for_model.contains("- field_samples:"));
+        assert!(prepared.content_for_model.contains("items:"));
+        assert!(prepared.content_for_model.contains("meta:"));
+
+        let _ = store.delete_session(&app.session_id);
     }
 }
