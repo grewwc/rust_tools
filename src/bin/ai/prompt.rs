@@ -453,6 +453,11 @@ impl PromptEditor {
                             }
                         }
                     }
+                    Event::Resize(_, _) => {
+                        if let Ok((w, h)) = terminal_size() {
+                            let _ = terminal.resize(Rect::new(0, 0, w, h));
+                        }
+                    }
                     _ => {}
                 }
             }
