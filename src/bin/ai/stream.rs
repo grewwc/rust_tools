@@ -209,7 +209,7 @@ pub(super) async fn stream_response(
     markdown.flush_pending()?;
 
     if current_printing_index.is_some() {
-        println!(")");
+        println!("\x1b[0m)");
     }
 
     if take_stream_cancelled(app) {
@@ -385,15 +385,15 @@ fn process_stream_line(
             if !builder.function_name.is_empty() {
                 if *current_printing_index != Some(index) {
                     if current_printing_index.is_some() {
-                        println!(")");
+                        println!("\x1b[0m)");
                     }
                     *current_printing_index = Some(index);
-                    print!("  - {}(", builder.function_name.cyan());
+                    print!("  - {}(\x1b[2m", builder.function_name.cyan());
                     let _ = io::stdout().flush();
-                    print!("{}", builder.arguments.dimmed());
+                    print!("{}", builder.arguments);
                     let _ = io::stdout().flush();
                 } else if !stream_tool_call.function.arguments.is_empty() {
-                    print!("{}", stream_tool_call.function.arguments.dimmed());
+                    print!("{}", stream_tool_call.function.arguments);
                     let _ = io::stdout().flush();
                 }
             }
@@ -474,14 +474,14 @@ fn process_stream_line(
         }
 
         if current_printing_index.is_some() {
-            println!(")");
+            println!("\x1b[0m)");
             *current_printing_index = None;
         }
 
         print!(
-            "  - {}({})",
+            "  - {}(\x1b[2m{}\x1b[0m)",
             builder.function_name.cyan(),
-            builder.arguments.dimmed()
+            builder.arguments
         );
         println!();
         let _ = io::stdout().flush();

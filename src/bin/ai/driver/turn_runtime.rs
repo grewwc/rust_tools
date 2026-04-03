@@ -436,6 +436,43 @@ pub(super) async fn run_turn(
             skill_turn.append_system_prompt(&format!("\n{guidelines}"));
         }
     }
+    if let Some(recalled) = super::reflection::build_auto_recalled_knowledge(&question, 2000) {
+        if !recalled.content.trim().is_empty() {
+            let project_part = recalled
+                .project_hint
+                .as_deref()
+                .map(|project| format!(" project={project}"))
+                .unwrap_or_default();
+            let category_part = if recalled.categories.is_empty() {
+                String::new()
+            } else {
+                format!(" categories={}", recalled.categories.join(","))
+            };
+            let confidence_part = if recalled.high_confidence_project_memory {
+                " high_confidence=true"
+            } else {
+                " high_confidence=false"
+            };
+            println!(
+                "{} count={}{}{}{}",
+                "[Memory] recalled".bright_blue().bold(),
+                recalled.entry_count,
+                project_part,
+                category_part,
+                confidence_part
+            );
+            skill_turn.append_system_prompt(&format!("\n{}", recalled.content));
+            if recalled.high_confidence_project_memory {
+                skill_turn.append_system_prompt(
+                    "\nMemory-first project answer policy:\n- High-confidence project memory has been recalled for this question.\n- Prefer answering directly from the recalled knowledge when it already covers the user's ask.\n- Do NOT read files, grep the repo, or call search tools unless a specific detail is missing, ambiguous, or the user explicitly asks you to verify against the current code.\n- If only part of the answer is covered, answer the covered part first and use tools only to fill the missing pieces.",
+                );
+            } else {
+                skill_turn.append_system_prompt(
+                    "\nKnowledge usage policy:\n- Recalled knowledge is available and relevant for this turn. Build your answer primarily from it.\n- Only call file-read/repo-search tools if the recalled knowledge is missing key details the user specifically asked about.\n- Do NOT re-scan the entire project when the recalled knowledge already covers the user's question.",
+                );
+            }
+        }
+    }
 
     messages.push(Message {
         role: "system".to_string(),
@@ -518,9 +555,11 @@ pub(super) async fn run_turn(
         }
 
         let saved_tools = if force_final_response {
-            app.agent_context
-                .as_mut()
-                .map(|ctx| std::mem::take(&mut ctx.tools))
+            if let Some(ctx) = app.agent_context.as_mut() {
+                Some(std::mem::replace(&mut ctx.tools, Vec::new()))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -885,6 +924,14 @@ pub(super) async fn run_turn(
                 .await;
             }
         }
+        reflection::maybe_write_back_project_knowledge(
+            app,
+            &next_model,
+            &question,
+            &final_assistant_text,
+            &turn_messages,
+        )
+        .await;
         persist_pending_turn_messages(
             app,
             one_shot_mode,
@@ -948,7 +995,7 @@ fn persist_pending_turn_messages(
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
 
     use serde_json::Value;
@@ -1054,7 +1101,7 @@ mod tests {
         );
         let path = extract_stub_path(&prepared.content_for_model).unwrap();
         assert!(path.is_absolute());
-        assert!(Path::new(&path).exists());
+        assert!(path.exists());
         let saved = std::fs::read_to_string(&path).unwrap();
         assert_eq!(saved, content);
 

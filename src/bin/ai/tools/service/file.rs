@@ -5,15 +5,14 @@ use serde_json::Value;
 use crate::ai::tools::storage::file_store::FileStore;
 
 fn render_lines(content: &str, start: usize, end: usize, max_lines: usize) -> String {
-    // let lines: Vec<&str> = content.lines().collect();
-    // let result: Vec<String> = lines[start..end]
-    //     .iter()
-    //     .take(max_lines)
-    //     .enumerate()
-    //     .map(|(idx, line)| format!("{:>6}\t{}", start + idx + 1, line))
-    //     .collect();
-    // result.join("\n")
-    "readling file lines...".to_string()
+    let lines: Vec<&str> = content.lines().collect();
+    let result: Vec<String> = lines[start..end]
+        .iter()
+        .take(max_lines)
+        .enumerate()
+        .map(|(idx, line)| format!("{:>6}\t{}", start + idx + 1, line))
+        .collect();
+    result.join("\n")
 }
 
 pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
