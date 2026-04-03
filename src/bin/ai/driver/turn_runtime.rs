@@ -1,7 +1,4 @@
-use std::{
-    fs,
-    path::PathBuf,
-};
+use std::{fs, path::PathBuf};
 
 use colored::Colorize;
 use serde_json::Value;
@@ -16,8 +13,7 @@ use crate::ai::{
 use super::{
     drain_response, input,
     print::{print_assistant_banner, print_tool_output_block},
-    reflection,
-    tools,
+    reflection, tools,
 };
 
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;
@@ -34,6 +30,49 @@ struct LargeToolSummary {
     top_level_keys: Vec<String>,
     field_samples: Vec<String>,
 }
+
+// #region debug-point agent-hang:reporter
+fn report_agent_hang_debug(
+    run_id: &'static str,
+    hypothesis_id: &'static str,
+    location: &'static str,
+    msg: &'static str,
+    data: Value,
+) {
+    std::thread::spawn(move || {
+        let mut debug_server_url = "http://127.0.0.1:7777/event".to_string();
+        let mut debug_session_id = "agent-hang".to_string();
+        if let Ok(env_text) = fs::read_to_string(".dbg/agent-hang.env") {
+            for line in env_text.lines() {
+                if let Some(value) = line.strip_prefix("DEBUG_SERVER_URL=") {
+                    if !value.trim().is_empty() {
+                        debug_server_url = value.trim().to_string();
+                    }
+                } else if let Some(value) = line.strip_prefix("DEBUG_SESSION_ID=") {
+                    if !value.trim().is_empty() {
+                        debug_session_id = value.trim().to_string();
+                    }
+                }
+            }
+        }
+        let payload = serde_json::json!({
+            "sessionId": debug_session_id,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "msg": msg,
+            "data": data,
+            "ts": chrono::Utc::now().timestamp_millis(),
+        });
+        if let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+        {
+            let _ = client.post(debug_server_url).json(&payload).send();
+        }
+    });
+}
+// #endregion
 
 fn truncate_chars(content: &str, max_chars: usize) -> String {
     if content.chars().count() <= max_chars {
@@ -181,7 +220,9 @@ fn write_tool_overflow_file(
     extension: &str,
 ) -> Result<PathBuf, String> {
     let store = SessionStore::new(app.config.history_file.as_path());
-    let dir = store.session_assets_dir(&app.session_id).join("tool_overflow");
+    let dir = store
+        .session_assets_dir(&app.session_id)
+        .join("tool_overflow");
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create tool overflow dir: {}", e))?;
 
     let mut safe_tool = String::new();
@@ -229,7 +270,10 @@ fn prepare_tool_result(app: &App, tool_name: &str, content: &str) -> PreparedToo
             let lines = body.lines().count();
             let chars = body.chars().count();
             let head = truncate_chars(&body, TOOL_OVERFLOW_PREVIEW_CHARS);
-            let tail = truncate_chars(&tail_chars(&body, TOOL_OVERFLOW_PREVIEW_CHARS), TOOL_OVERFLOW_PREVIEW_CHARS);
+            let tail = truncate_chars(
+                &tail_chars(&body, TOOL_OVERFLOW_PREVIEW_CHARS),
+                TOOL_OVERFLOW_PREVIEW_CHARS,
+            );
             let top_level_keys = if large.top_level_keys.is_empty() {
                 String::new()
             } else {
@@ -238,7 +282,10 @@ fn prepare_tool_result(app: &App, tool_name: &str, content: &str) -> PreparedToo
             let field_samples = if large.field_samples.is_empty() {
                 String::new()
             } else {
-                format!("\n- field_samples:\n  - {}", large.field_samples.join("\n  - "))
+                format!(
+                    "\n- field_samples:\n  - {}",
+                    large.field_samples.join("\n  - ")
+                )
             };
             let stub = format!(
                 "Output too large; full result saved to a session file.\n- file_path: {}\n- chars: {}\n- lines: {}\n- summary: {}{}{}\n- preview_head:\n{}\n- preview_tail:\n{}\n- read_next: use read_file_lines with this file_path and a limit between 200 and 400.",
@@ -289,17 +336,57 @@ pub(super) async fn run_turn(
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
-    let mut skill_turn = super::skill_runtime::prepare_skill_for_turn(
-        app,
-        mcp_client,
-        skill_manifests,
-        &question,
-    )
-    .await;
+    // #region debug-point A:turn-start
+    report_agent_hang_debug(
+        "pre-fix",
+        "A",
+        "turn_runtime::run_turn:start",
+        "[DEBUG] run_turn started",
+        serde_json::json!({
+            "history_count": history_count,
+            "question_len": question.chars().count(),
+            "model": next_model,
+            "one_shot_mode": one_shot_mode,
+        }),
+    );
+    // #endregion
+
+    // #region debug-point E:prepare-skill-begin
+    report_agent_hang_debug(
+        "pre-fix",
+        "E",
+        "turn_runtime::run_turn:prepare_skill_for_turn:begin",
+        "[DEBUG] preparing skill for turn",
+        serde_json::json!({}),
+    );
+    // #endregion
+    let mut skill_turn =
+        super::skill_runtime::prepare_skill_for_turn(app, mcp_client, skill_manifests, &question)
+            .await;
+    // #region debug-point E:prepare-skill-end
+    report_agent_hang_debug(
+        "pre-fix",
+        "E",
+        "turn_runtime::run_turn:prepare_skill_for_turn:end",
+        "[DEBUG] prepared skill for turn",
+        serde_json::json!({
+            "matched_skill": skill_turn.matched_skill_name(),
+        }),
+    );
+    // #endregion
     if let Some(name) = skill_turn.matched_skill_name() {
         println!("[skill: {}]", name.cyan());
     }
 
+    // #region debug-point E:build-history-begin
+    report_agent_hang_debug(
+        "pre-fix",
+        "E",
+        "turn_runtime::run_turn:build_context_history:begin",
+        "[DEBUG] building context history",
+        serde_json::json!({}),
+    );
+    // #endregion
     let history = build_context_history(
         history_count,
         &app.session_history_file,
@@ -307,6 +394,17 @@ pub(super) async fn run_turn(
         app.config.history_keep_last,
         app.config.history_summary_max_chars,
     )?;
+    // #region debug-point E:build-history-end
+    report_agent_hang_debug(
+        "pre-fix",
+        "E",
+        "turn_runtime::run_turn:build_context_history:end",
+        "[DEBUG] built context history",
+        serde_json::json!({
+            "history_messages": history.len(),
+        }),
+    );
+    // #endregion
     let mut messages = Vec::with_capacity(history.len() + 2);
 
     {
@@ -371,6 +469,19 @@ pub(super) async fn run_turn(
     let mut final_assistant_recorded = false;
     loop {
         iteration += 1;
+        // #region debug-point A:iteration-begin
+        report_agent_hang_debug(
+            "pre-fix",
+            "A",
+            "turn_runtime::run_turn:iteration:begin",
+            "[DEBUG] turn iteration started",
+            serde_json::json!({
+                "iteration": iteration,
+                "force_final_response": force_final_response,
+                "message_count": messages.len(),
+            }),
+        );
+        // #endregion
         if iteration > 1 {
             let prev_skill = skill_turn.matched_skill_name().map(|s| s.to_string());
             let new_skill_turn = super::skill_runtime::prepare_skill_for_turn(
@@ -393,7 +504,8 @@ pub(super) async fn run_turn(
         }
 
         let mut current_history = String::new();
-        app.streaming.store(true, std::sync::atomic::Ordering::Relaxed);
+        app.streaming
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if force_final_response {
             messages.push(Message {
                 role: "system".to_string(),
@@ -413,7 +525,32 @@ pub(super) async fn run_turn(
             None
         };
 
+        // #region debug-point B:request-begin
+        report_agent_hang_debug(
+            "pre-fix",
+            "B",
+            "turn_runtime::run_turn:do_request_messages:begin",
+            "[DEBUG] sending model request",
+            serde_json::json!({
+                "iteration": iteration,
+                "message_count": messages.len(),
+                "model": next_model,
+            }),
+        );
+        // #endregion
         let request_result = request::do_request_messages(app, &next_model, &messages, true).await;
+        // #region debug-point B:request-end
+        report_agent_hang_debug(
+            "pre-fix",
+            "B",
+            "turn_runtime::run_turn:do_request_messages:end",
+            "[DEBUG] model request finished",
+            serde_json::json!({
+                "iteration": iteration,
+                "ok": request_result.is_ok(),
+            }),
+        );
+        // #endregion
 
         if let Some(saved_tools) = saved_tools
             && let Some(ctx) = app.agent_context.as_mut()
@@ -438,8 +575,12 @@ pub(super) async fn run_turn(
                 } else {
                     eprintln!("[Error] {}", err_text);
                 }
-                if err_text.contains("function.arguments") && err_text.contains("must be in JSON format") {
-                    eprintln!("[Info] 检测到模型返回了非法 tool arguments，本轮已跳过，继续下一轮对话。");
+                if err_text.contains("function.arguments")
+                    && err_text.contains("must be in JSON format")
+                {
+                    eprintln!(
+                        "[Info] 检测到模型返回了非法 tool arguments，本轮已跳过，继续下一轮对话。"
+                    );
                 } else {
                     eprintln!("[Info] 本轮请求失败，已保持会话存活，可直接继续提问。");
                 }
@@ -468,23 +609,49 @@ pub(super) async fn run_turn(
         }
         request::print_info(&next_model);
         print_assistant_banner();
-        let stream_result = match stream::stream_response(app, &mut response, &mut current_history).await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                app.streaming
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                eprintln!("\n[Error] 流式响应处理失败：{}", err);
-                eprintln!("[Info] 尝试继续对话...");
-                let _ = drain_response(&mut response).await;
-                StreamResult {
-                    outcome: StreamOutcome::Completed,
-                    tool_calls: Vec::new(),
-                    assistant_text: "[响应解析失败，请重试]".to_string(),
-                    hidden_meta: String::new(),
+        // #region debug-point B:stream-begin
+        report_agent_hang_debug(
+            "pre-fix",
+            "B",
+            "turn_runtime::run_turn:stream_response:begin",
+            "[DEBUG] streaming response started",
+            serde_json::json!({
+                "iteration": iteration,
+            }),
+        );
+        // #endregion
+        let stream_result =
+            match stream::stream_response(app, &mut response, &mut current_history).await {
+                Ok(result) => result,
+                Err(err) => {
+                    app.streaming
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("\n[Error] 流式响应处理失败：{}", err);
+                    eprintln!("[Info] 尝试继续对话...");
+                    let _ = drain_response(&mut response).await;
+                    StreamResult {
+                        outcome: StreamOutcome::Completed,
+                        tool_calls: Vec::new(),
+                        assistant_text: "[响应解析失败，请重试]".to_string(),
+                        hidden_meta: String::new(),
+                    }
                 }
-            }
-        };
+            };
+        // #region debug-point B:stream-end
+        report_agent_hang_debug(
+            "pre-fix",
+            "B",
+            "turn_runtime::run_turn:stream_response:end",
+            "[DEBUG] streaming response finished",
+            serde_json::json!({
+                "iteration": iteration,
+                "outcome": format!("{:?}", stream_result.outcome),
+                "assistant_chars": stream_result.assistant_text.chars().count(),
+                "tool_calls": stream_result.tool_calls.len(),
+                "history_chars": current_history.chars().count(),
+            }),
+        );
+        // #endregion
 
         input::clear_stdin_buffer();
 
@@ -517,6 +684,18 @@ pub(super) async fn run_turn(
             .store(false, std::sync::atomic::Ordering::Relaxed);
 
         if stream_result.outcome != StreamOutcome::ToolCall {
+            // #region debug-point A:final-response
+            report_agent_hang_debug(
+                "pre-fix",
+                "A",
+                "turn_runtime::run_turn:final-response",
+                "[DEBUG] final assistant response without tool calls",
+                serde_json::json!({
+                    "iteration": iteration,
+                    "assistant_chars": stream_result.assistant_text.chars().count(),
+                }),
+            );
+            // #endregion
             let assistant_msg = Message {
                 role: "assistant".to_string(),
                 content: Value::String(stream_result.assistant_text.clone()),
@@ -530,7 +709,10 @@ pub(super) async fn run_turn(
             if !stream_result.hidden_meta.trim().is_empty() {
                 let record = Message {
                     role: "system".to_string(),
-                    content: Value::String(format!("self_note:\n{}", stream_result.hidden_meta.trim())),
+                    content: Value::String(format!(
+                        "self_note:\n{}",
+                        stream_result.hidden_meta.trim()
+                    )),
                     tool_calls: None,
                     tool_call_id: None,
                 };
@@ -544,21 +726,54 @@ pub(super) async fn run_turn(
                     source: Some(format!("session:{}", app.session_id)),
                     priority: Some(255), // Permanent: agent policies are never deleted
                 };
-                let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
+                let store =
+                    crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
                 let _ = store.append(&entry);
                 store.maintain_after_append();
             }
             break;
         }
 
-        let exec_result = tools::execute_tool_calls(&app.session_id, mcp_client, &stream_result.tool_calls)?;
+        // #region debug-point C:tool-exec-begin
+        report_agent_hang_debug(
+            "pre-fix",
+            "C",
+            "turn_runtime::run_turn:execute_tool_calls:begin",
+            "[DEBUG] executing tool calls",
+            serde_json::json!({
+                "iteration": iteration,
+                "tool_calls": stream_result
+                    .tool_calls
+                    .iter()
+                    .map(|tool| tool.function.name.clone())
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        // #endregion
+        let exec_result =
+            tools::execute_tool_calls(&app.session_id, mcp_client, &stream_result.tool_calls)?;
+        // #region debug-point C:tool-exec-end
+        report_agent_hang_debug(
+            "pre-fix",
+            "C",
+            "turn_runtime::run_turn:execute_tool_calls:end",
+            "[DEBUG] executed tool calls",
+            serde_json::json!({
+                "iteration": iteration,
+                "tool_result_count": exec_result.tool_results.len(),
+                "cached_hits": exec_result.cached_hits,
+            }),
+        );
+        // #endregion
 
         if exec_result.cached_hits.iter().any(|hit| *hit) {
             let cached_names = exec_result
                 .executed_tool_calls
                 .iter()
                 .zip(exec_result.cached_hits.iter())
-                .filter_map(|(tool_call, cached)| cached.then_some(tool_call.function.name.as_str()))
+                .filter_map(|(tool_call, cached)| {
+                    cached.then_some(tool_call.function.name.as_str())
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             let cache_note = Message {
@@ -687,15 +902,16 @@ pub(super) async fn run_turn(
             if integrated {
                 // skip background critic→revise when integrated into main turn
             } else {
-            let path = app.session_history_file.clone();
-            let model_bg = crate::commonw::configw::get_all_config()
-                .get_opt("ai.critic_revise.model")
-                .unwrap_or_else(|| "qwen3.5-flash".to_string());
-            let q_bg = question.clone();
-            let a_bg = final_assistant_text.clone();
-            tokio::spawn(async move {
-                super::reflection::run_critic_revise_background(path, model_bg, q_bg, a_bg).await;
-            });
+                let path = app.session_history_file.clone();
+                let model_bg = crate::commonw::configw::get_all_config()
+                    .get_opt("ai.critic_revise.model")
+                    .unwrap_or_else(|| "qwen3.5-flash".to_string());
+                let q_bg = question.clone();
+                let a_bg = final_assistant_text.clone();
+                tokio::spawn(async move {
+                    super::reflection::run_critic_revise_background(path, model_bg, q_bg, a_bg)
+                        .await;
+                });
             }
         }
     } else {
@@ -733,10 +949,7 @@ fn persist_pending_turn_messages(
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::{
-        Arc,
-        atomic::AtomicBool,
-    };
+    use std::sync::{Arc, atomic::AtomicBool};
 
     use serde_json::Value;
 
@@ -785,10 +998,8 @@ mod tests {
 
     #[test]
     fn persist_pending_turn_messages_only_appends_new_entries() {
-        let path = std::env::temp_dir().join(format!(
-            "ai-turn-history-{}.sqlite",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ai-turn-history-{}.sqlite", uuid::Uuid::new_v4()));
         let app = test_app(path.clone());
 
         let mut turn_messages = vec![Message {
@@ -826,10 +1037,8 @@ mod tests {
 
     #[test]
     fn prepare_tool_result_spills_large_output_to_session_file() {
-        let history_file = std::env::temp_dir().join(format!(
-            "ai-tool-overflow-{}.sqlite",
-            uuid::Uuid::new_v4()
-        ));
+        let history_file =
+            std::env::temp_dir().join(format!("ai-tool-overflow-{}.sqlite", uuid::Uuid::new_v4()));
         let app = test_app(history_file.clone());
         let store = SessionStore::new(history_file.as_path());
         store.ensure_root_dir().unwrap();
@@ -838,7 +1047,11 @@ mod tests {
         let content = "x".repeat(MAX_TOOL_RESULT_INLINE_CHARS + 256);
         let prepared = prepare_tool_result(&app, "mcp_big_payload", &content);
 
-        assert!(prepared.content_for_model.contains("Output too large; full result saved"));
+        assert!(
+            prepared
+                .content_for_model
+                .contains("Output too large; full result saved")
+        );
         let path = extract_stub_path(&prepared.content_for_model).unwrap();
         assert!(path.is_absolute());
         assert!(Path::new(&path).exists());
@@ -871,11 +1084,7 @@ mod tests {
                 "ok": true
             }
         });
-        let content = format!(
-            "{}{}",
-            payload,
-            " ".repeat(MAX_TOOL_RESULT_INLINE_CHARS)
-        );
+        let content = format!("{}{}", payload, " ".repeat(MAX_TOOL_RESULT_INLINE_CHARS));
         let prepared = prepare_tool_result(&app, "mcp_json_payload", &content);
 
         assert!(prepared.content_for_model.contains("- top_level_keys:"));

@@ -1,48 +1,47 @@
 use rustc_hash::FxHashMap;
 use std::{
-    cell::RefCell,
-    fmt::Display,
     hash::Hash,
-    rc::{Rc, Weak},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
-struct Node<K, V>
-where
-    K: Hash + Eq + Default,
-    V: Default + Display,
-{
-    key: K,
-    val: V,
+struct Node<K, V> {
+    key: Option<Arc<K>>,
+    val: Option<V>,
     expires_at: Option<Instant>,
-    prev: Option<Weak<RefCell<Node<K, V>>>>,
-    next: Option<Rc<RefCell<Node<K, V>>>>,
+    prev: Option<Weak<Mutex<Node<K, V>>>>,
+    next: Option<Arc<Mutex<Node<K, V>>>>,
 }
 
 impl<K, V> Node<K, V>
 where
-    K: Eq + Default + Hash,
-    V: Default + Display,
+    K: Eq + Hash,
 {
-    fn new(k: K, v: V, expires_at: Option<Instant>) -> Self {
+    fn new(k: Arc<K>, v: V, expires_at: Option<Instant>) -> Self {
         Self {
-            key: k,
-            val: v,
+            key: Some(k),
+            val: Some(v),
             expires_at,
+            prev: None,
+            next: None,
+        }
+    }
+
+    fn new_sentinel() -> Self {
+        Self {
+            key: None,
+            val: None,
+            expires_at: None,
             prev: None,
             next: None,
         }
     }
 }
 
-pub struct LruCache<K, V>
-where
-    K: Eq + Hash + Default + Clone,
-    V: Default + Display,
-{
-    map: FxHashMap<K, Rc<RefCell<Node<K, V>>>>,
-    head: Rc<RefCell<Node<K, V>>>,
-    tail: Rc<RefCell<Node<K, V>>>,
+pub struct LruCache<K, V> {
+    map: FxHashMap<Arc<K>, Arc<Mutex<Node<K, V>>>>,
+    head: Arc<Mutex<Node<K, V>>>,
+    tail: Arc<Mutex<Node<K, V>>>,
     len: usize,
     cap: usize,
     ttl_ms: i64,
@@ -50,19 +49,18 @@ where
 
 impl<K, V> LruCache<K, V>
 where
-    K: Eq + Hash + Default + Clone,
-    V: Display + Default,
+    K: Eq + Hash,
 {
     pub fn new(cap: usize) -> Self {
-        let dummy_head = Rc::new(RefCell::new(Node::new(K::default(), V::default(), None)));
-        let dummy_tail = Rc::new(RefCell::new(Node::new(K::default(), V::default(), None)));
-        dummy_head.borrow_mut().next = Some(dummy_tail.clone());
-        dummy_tail.borrow_mut().prev = Some(Rc::downgrade(&dummy_head));
+        let dummy_head = Arc::new(Mutex::new(Node::new_sentinel()));
+        let dummy_tail = Arc::new(Mutex::new(Node::new_sentinel()));
+        dummy_head.lock().unwrap().next = Some(dummy_tail.clone());
+        dummy_tail.lock().unwrap().prev = Some(Arc::downgrade(&dummy_head));
         Self {
             map: FxHashMap::default(),
             head: dummy_head,
             tail: dummy_tail,
-            len: 0usize,
+            len: 0,
             cap,
             ttl_ms: -1,
         }
@@ -84,7 +82,6 @@ where
     pub fn ttl_ms(&self) -> i64 {
         self.ttl_ms
     }
-
     pub fn put(&mut self, k: K, v: V) {
         let now = Instant::now();
         if self.ttl_ms >= 0 {
@@ -92,61 +89,63 @@ where
         }
 
         if let Some(node) = self.map.get(&k).cloned() {
-            if self.is_expired_rc(&node, now) {
+            if self.is_expired(&node, now) {
                 self.remove_node(node);
             } else {
+                let expires_at = self.calc_expires_at(now);
                 {
-                    let mut n = node.borrow_mut();
-                    n.val = v;
-                    n.expires_at = self.calc_expires_at(now);
+                    let mut n = node.lock().unwrap();
+                    n.val = Some(v);
+                    n.expires_at = expires_at;
                 }
                 self.move_node_to_front(node);
                 return;
             }
         }
 
-        let new_node = Rc::new(RefCell::new(Node::new(
-            k.clone(),
-            v,
-            self.calc_expires_at(now),
-        )));
-        if self.len == self.cap
-            && let Some(removed) = self.remove_tail()
-        {
-            self.map.remove(&removed.borrow().key);
-            self.len -= 1;
+        let key = Arc::new(k);
+        let new_node = Arc::new(Mutex::new(Node::new(key.clone(), v, self.calc_expires_at(now))));
+        if self.len == self.cap {
+            if let Some(removed) = self.remove_tail_node() {
+                if let Some(rkey) = removed.lock().unwrap().key.clone() {
+                    self.map.remove(&rkey);
+                }
+                self.len -= 1;
+            }
         }
         self.add_to_front(new_node.clone());
-        self.map.insert(k, new_node);
+        self.map.insert(key, new_node);
         self.len += 1;
     }
-
-    pub fn get(&mut self, k: K) -> Option<&V> {
+    pub fn get(&mut self, k: K) -> Option<V>
+    where
+        V: Clone,
+    {
         let now = Instant::now();
-        if let Some(node) = self.map.get(&k).cloned() {
-            if self.is_expired_rc(&node, now) {
-                self.remove_node(node);
-                return None;
-            }
-            let x = node.as_ptr();
-            self.move_node_to_front(node);
-            return unsafe { Some(&(*x).val) };
+        let key = Arc::new(k);
+        let node = self.map.get(&key)?.clone();
+        if self.is_expired(&node, now) {
+            self.remove_node(node);
+            return None;
         }
-        None
+        let val = node.lock().unwrap().val.clone();
+        self.move_node_to_front(node);
+        val
     }
 
-    pub fn get_ref(&mut self, k: &K) -> Option<&V> {
+    pub fn get_ref(&mut self, k: &K) -> Option<V>
+    where
+        V: Clone,
+    {
         let now = Instant::now();
-        if let Some(node) = self.map.get(k).cloned() {
-            if self.is_expired_rc(&node, now) {
-                self.remove_node(node);
-                return None;
-            }
-            let x = node.as_ptr();
-            self.move_node_to_front(node);
-            return unsafe { Some(&(*x).val) };
+        let node = self.map.get(k)?.clone();
+        if self.is_expired(&node, now) {
+            self.remove_node(node);
+            return None;
         }
-        None
+        let val = node.lock().unwrap().val.clone();
+        self.move_node_to_front(node);
+        val
     }
 
     pub fn len(&self) -> usize {
@@ -154,18 +153,18 @@ where
             return self.len;
         }
         let now = Instant::now();
-        let mut count = 0usize;
-        let mut curr = self.head.borrow().next.clone();
+        let mut count = 0;
+        let mut curr = self.head.lock().unwrap().next.clone();
         while let Some(node) = curr {
-            if Rc::ptr_eq(&node, &self.tail) {
+            if Arc::ptr_eq(&node, &self.tail) {
                 break;
             }
             let (expires_at, next) = {
-                let n = node.borrow();
+                let n = node.lock().unwrap();
                 (n.expires_at, n.next.clone())
             };
             if !Self::is_expired_at(expires_at, now) {
-                count = count.saturating_add(1);
+                count += 1;
             }
             curr = next;
         }
@@ -187,14 +186,14 @@ where
         if self.ttl_ms < 0 {
             return true;
         }
-        !Self::is_expired_at(node.borrow().expires_at, Instant::now())
+        !Self::is_expired_at(node.lock().unwrap().expires_at, Instant::now())
     }
 
     pub fn clear(&mut self) {
         self.map.clear();
         self.len = 0;
-        self.head.borrow_mut().next = Some(self.tail.clone());
-        self.tail.borrow_mut().prev = Some(Rc::downgrade(&self.head));
+        self.head.lock().unwrap().next = Some(self.tail.clone());
+        self.tail.lock().unwrap().prev = Some(Arc::downgrade(&self.head));
     }
 
     fn calc_expires_at(&self, now: Instant) -> Option<Instant> {
@@ -204,74 +203,73 @@ where
         now.checked_add(Duration::from_millis(self.ttl_ms as u64))
     }
 
-    fn is_expired_rc(&self, node: &Rc<RefCell<Node<K, V>>>, now: Instant) -> bool {
+    fn is_expired(&self, node: &Arc<Mutex<Node<K, V>>>, now: Instant) -> bool {
         if self.ttl_ms < 0 {
             return false;
         }
-        Self::is_expired_at(node.borrow().expires_at, now)
+        Self::is_expired_at(node.lock().unwrap().expires_at, now)
     }
 
     fn is_expired_at(expires_at: Option<Instant>, now: Instant) -> bool {
         matches!(expires_at, Some(t) if t <= now)
     }
-}
 
-impl<K, V> LruCache<K, V>
-where
-    K: Eq + Hash + Default + Clone,
-    V: Default + Display,
-{
-    fn move_node_to_front(&mut self, node: Rc<RefCell<Node<K, V>>>) {
-        let curr_head = self.head.borrow_mut().next.take().unwrap();
-        if Rc::ptr_eq(&curr_head, &node) {
-            self.head.borrow_mut().next = Some(curr_head);
+    fn move_node_to_front(&mut self, node: Arc<Mutex<Node<K, V>>>) {
+        let curr_head = self.head.lock().unwrap().next.take().unwrap();
+        if Arc::ptr_eq(&curr_head, &node) {
+            self.head.lock().unwrap().next = Some(curr_head);
             return;
         }
-        let next = node.borrow().next.clone().unwrap();
-        let prev = node.borrow().prev.clone().unwrap().upgrade().unwrap();
-        prev.borrow_mut().next = Some(next.clone());
-        next.borrow_mut().prev = Some(Rc::downgrade(&prev));
+        let (next, prev) = {
+            let n = node.lock().unwrap();
+            (n.next.clone(), n.prev.clone())
+        };
+        let next = next.unwrap();
+        let prev = prev.unwrap().upgrade().unwrap();
+        prev.lock().unwrap().next = Some(next.clone());
+        next.lock().unwrap().prev = Some(Arc::downgrade(&prev));
 
-        self.head.borrow_mut().next = Some(node.clone());
-        node.borrow_mut().prev = Some(Rc::downgrade(&self.head));
-        node.borrow_mut().next = Some(curr_head.clone());
-        curr_head.borrow_mut().prev = Some(Rc::downgrade(&node));
+        self.head.lock().unwrap().next = Some(node.clone());
+        node.lock().unwrap().prev = Some(Arc::downgrade(&self.head));
+        node.lock().unwrap().next = Some(curr_head.clone());
+        curr_head.lock().unwrap().prev = Some(Arc::downgrade(&node));
     }
 
-    fn add_to_front(&mut self, node: Rc<RefCell<Node<K, V>>>) {
-        let prev_head = self.head.borrow_mut().next.take().unwrap();
-        self.head.borrow_mut().next = Some(node.clone());
-        node.borrow_mut().prev = Some(Rc::downgrade(&self.head));
+    fn add_to_front(&mut self, node: Arc<Mutex<Node<K, V>>>) {
+        let prev_head = self.head.lock().unwrap().next.take().unwrap();
+        self.head.lock().unwrap().next = Some(node.clone());
+        node.lock().unwrap().prev = Some(Arc::downgrade(&self.head));
 
-        node.borrow_mut().next = Some(prev_head.clone());
-        prev_head.borrow_mut().prev = Some(Rc::downgrade(&node));
+        node.lock().unwrap().next = Some(prev_head.clone());
+        prev_head.lock().unwrap().prev = Some(Arc::downgrade(&node));
         if self.len == 0 {
-            self.tail.borrow_mut().prev = Some(Rc::downgrade(&node));
-            node.borrow_mut().next = Some(self.tail.clone());
+            self.tail.lock().unwrap().prev = Some(Arc::downgrade(&node));
+            node.lock().unwrap().next = Some(self.tail.clone());
         }
     }
 
-    fn remove_tail(&mut self) -> Option<Rc<RefCell<Node<K, V>>>> {
+    fn remove_tail_node(&mut self) -> Option<Arc<Mutex<Node<K, V>>>> {
         if self.len == 0 {
             return None;
         }
         let prev = self
             .tail
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .prev
             .take()
             .unwrap()
             .upgrade()
             .unwrap();
-        let prev_2 = prev.borrow_mut().prev.take().unwrap().upgrade().unwrap();
-        prev_2.borrow_mut().next = Some(self.tail.clone());
-        self.tail.borrow_mut().prev = Some(Rc::downgrade(&prev_2));
+        let prev_2 = prev.lock().unwrap().prev.take().unwrap().upgrade().unwrap();
+        prev_2.lock().unwrap().next = Some(self.tail.clone());
+        self.tail.lock().unwrap().prev = Some(Arc::downgrade(&prev_2));
         Some(prev)
     }
 
-    fn detach_node(&mut self, node: &Rc<RefCell<Node<K, V>>>) {
+    fn detach_node(&mut self, node: &Arc<Mutex<Node<K, V>>>) {
         let (prev, next) = {
-            let n = node.borrow();
+            let n = node.lock().unwrap();
             (n.prev.as_ref().and_then(|w| w.upgrade()), n.next.clone())
         };
         let Some(prev) = prev else {
@@ -280,19 +278,24 @@ where
         let Some(next) = next else {
             return;
         };
-        prev.borrow_mut().next = Some(next.clone());
-        next.borrow_mut().prev = Some(Rc::downgrade(&prev));
-        node.borrow_mut().prev = None;
-        node.borrow_mut().next = None;
+        prev.lock().unwrap().next = Some(next.clone());
+        next.lock().unwrap().prev = Some(Arc::downgrade(&prev));
+        node.lock().unwrap().prev = None;
+        node.lock().unwrap().next = None;
     }
 
-    fn remove_node(&mut self, node: Rc<RefCell<Node<K, V>>>) {
-        if self.len == 0 || Rc::ptr_eq(&node, &self.head) || Rc::ptr_eq(&node, &self.tail) {
+    fn remove_node(&mut self, node: Arc<Mutex<Node<K, V>>>) {
+        if self.len == 0
+            || Arc::ptr_eq(&node, &self.head)
+            || Arc::ptr_eq(&node, &self.tail)
+        {
             return;
         }
-        let key = node.borrow().key.clone();
+        let key = node.lock().unwrap().key.clone();
         self.detach_node(&node);
-        self.map.remove(&key);
+        if let Some(key) = key {
+            self.map.remove(&key);
+        }
         self.len -= 1;
     }
 
@@ -300,13 +303,19 @@ where
         if self.ttl_ms < 0 || self.len == 0 {
             return;
         }
-        let mut curr = self.tail.borrow().prev.as_ref().and_then(|w| w.upgrade());
+        let mut curr = self
+            .tail
+            .lock()
+            .unwrap()
+            .prev
+            .as_ref()
+            .and_then(|w| w.upgrade());
         while let Some(node) = curr {
-            if Rc::ptr_eq(&node, &self.head) {
+            if Arc::ptr_eq(&node, &self.head) {
                 break;
             }
             let (prev, expired, key) = {
-                let n = node.borrow();
+                let n = node.lock().unwrap();
                 (
                     n.prev.as_ref().and_then(|w| w.upgrade()),
                     Self::is_expired_at(n.expires_at, now),
@@ -315,7 +324,9 @@ where
             };
             if expired {
                 self.detach_node(&node);
-                self.map.remove(&key);
+                if let Some(key) = key {
+                    self.map.remove(&key);
+                }
                 self.len -= 1;
             }
             curr = prev;
@@ -337,7 +348,7 @@ mod tests {
         c.put(2, 20);
         assert_eq!(c.len(), 2);
         assert!(c.contains_key(&1));
-        assert_eq!(c.get(1), Some(&10));
+        assert_eq!(c.get(1), Some(10));
         c.put(3, 30);
         assert!(!c.contains_key(&2));
         assert!(c.contains_key(&3));
@@ -352,7 +363,7 @@ mod tests {
         let mut c: LruCache<i32, i32> = LruCache::new(2);
         c.put(1, 10);
         sleep(Duration::from_millis(30));
-        assert_eq!(c.get(1), Some(&10));
+        assert_eq!(c.get(1), Some(10));
     }
 
     #[test]
@@ -371,7 +382,23 @@ mod tests {
         let mut c: LruCache<i32, i32> = LruCache::new(2);
         c.put(1, 10);
         c.put(2, 20);
-        assert_eq!(c.get(2), Some(&20));
-        assert_eq!(c.get(2), Some(&20));
+        assert_eq!(c.get(2), Some(20));
+        assert_eq!(c.get(2), Some(20));
+    }
+
+    #[test]
+    fn test_lru_cache_without_display_bound() {
+        #[derive(Hash, Eq, PartialEq)]
+        struct Key(&'static str);
+
+        // No Display derive needed
+        let mut c: LruCache<Key, String> = LruCache::new(2);
+        c.put(Key("a"), String::from("A"));
+        c.put(Key("b"), String::from("B"));
+        assert_eq!(c.get_ref(&Key("a")), Some(String::from("A")));
+
+        c.put(Key("c"), String::from("C"));
+        assert!(c.get_ref(&Key("b")).is_none());
+        assert_eq!(c.get_ref(&Key("c")), Some(String::from("C")));
     }
 }

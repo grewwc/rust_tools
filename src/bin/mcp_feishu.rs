@@ -19,6 +19,7 @@ struct CachedToken {
 
 static APP_TOKEN_CACHE: OnceLock<Mutex<Option<CachedToken>>> = OnceLock::new();
 static USER_TOKEN_CACHE: OnceLock<Mutex<Option<CachedToken>>> = OnceLock::new();
+static TENANT_TOKEN_CACHE: OnceLock<Mutex<Option<CachedToken>>> = OnceLock::new();
 
 fn main() {
     let stdin = io::stdin();
@@ -121,6 +122,30 @@ fn handle_tools_list() -> Result<Value, JsonRpcErr> {
                             "items": { "type": "string" },
                             "description": "doc/sheet/slides/bitable/mindnote/file"
                         }
+                    },
+                    "required": ["search_key"]
+                }
+            },
+            {
+                "name": "messages_search",
+                "description": "Search Feishu chat or thread messages by keyword. This works on Feishu IM messages, not docs. It fetches message history from the target chat/thread and filters locally.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "search_key": { "type": "string", "description": "Keyword to search in message content" },
+                        "chat_id": { "type": "string", "description": "Target chat_id. Use this for normal group/private chats." },
+                        "thread_id": { "type": "string", "description": "Target thread/topic id. Use this instead of chat_id when searching a thread." },
+                        "start_time": { "type": "string", "description": "Optional start time in milliseconds" },
+                        "end_time": { "type": "string", "description": "Optional end time in milliseconds" },
+                        "msg_types": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Optional message type filter, e.g. text/post/interactive/file/image/media/audio/sticker/share_chat/share_user/system"
+                        },
+                        "sort_order": { "type": "string", "description": "desc or asc. Default: desc" },
+                        "page_size": { "type": "integer", "description": "Messages fetched per API call. Default 50, max 50" },
+                        "max_pages": { "type": "integer", "description": "How many pages to scan at most. Default 5, max 20" },
+                        "limit": { "type": "integer", "description": "Maximum matched messages to return. Default 20, max 100" }
                     },
                     "required": ["search_key"]
                 }
@@ -257,6 +282,14 @@ fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcErr> {
     match name.as_str() {
         "docs_search" => {
             let text = feishu_docs_search(&args)?;
+            Ok(json!({
+                "content": [
+                    { "type": "text", "text": text }
+                ]
+            }))
+        }
+        "messages_search" => {
+            let text = feishu_messages_search(&args)?;
             Ok(json!({
                 "content": [
                     { "type": "text", "text": text }
@@ -501,6 +534,451 @@ fn feishu_docs_search(args: &Value) -> Result<String, JsonRpcErr> {
         ));
     }
     Ok(out.trim_end().to_string())
+}
+
+fn feishu_messages_search(args: &Value) -> Result<String, JsonRpcErr> {
+    let search_key = args
+        .get("search_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if search_key.is_empty() {
+        return Err(json_rpc_error(
+            -32602,
+            "Invalid params: search_key is empty",
+            None,
+        ));
+    }
+
+    let (container_id_type, container_id) = resolve_message_container(args)?;
+    let msg_type_filters = extract_string_array(args.get("msg_types"));
+    let sort_type = match args
+        .get("sort_order")
+        .and_then(|v| v.as_str())
+        .unwrap_or("desc")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "asc" => "ByCreateTimeAsc",
+        _ => "ByCreateTimeDesc",
+    };
+    let page_size = args
+        .get("page_size")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(50)
+        .clamp(1, 50) as usize;
+    let max_pages = args
+        .get("max_pages")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(5)
+        .clamp(1, 20) as usize;
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(20)
+        .clamp(1, 100) as usize;
+    let start_time = get_optional_arg_string(args, "start_time");
+    let end_time = get_optional_arg_string(args, "end_time");
+
+    let base_url = resolve_base_url();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to build http client",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
+    let token = acquire_tenant_access_token(&client, &base_url).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Missing tenant_access_token. Message search requires FEISHU_TENANT_ACCESS_TOKEN or app_id/app_secret.",
+            Some(json!({
+                "detail": e.message,
+                "env": ["FEISHU_TENANT_ACCESS_TOKEN", "FEISHU_APP_ID", "FEISHU_APP_SECRET"],
+                "config_keys": ["feishu.tenant_access_token", "feishu.app_id", "feishu.app_secret"]
+            })),
+        )
+    })?;
+
+    let mut page_token: Option<String> = None;
+    let mut matches: Vec<String> = Vec::new();
+    let mut scanned_messages = 0usize;
+    let mut scanned_pages = 0usize;
+    let needle = search_key.to_lowercase();
+
+    while scanned_pages < max_pages && matches.len() < limit {
+        let (status, text) = do_messages_list_request(
+            &client,
+            &base_url,
+            &token,
+            container_id_type,
+            &container_id,
+            sort_type,
+            page_size,
+            page_token.as_deref(),
+            start_time.as_deref(),
+            end_time.as_deref(),
+        )?;
+        if !status.is_success() {
+            return Err(json_rpc_error(
+                -32000,
+                "messages API returned non-success HTTP status",
+                Some(json!({ "status": status.as_u16(), "body": text })),
+            ));
+        }
+        let v: Value = serde_json::from_str(&text).map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "messages API response is not valid JSON",
+                Some(json!({ "error": e.to_string(), "body": text })),
+            )
+        })?;
+        let code = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            return Err(json_rpc_error(
+                -32000,
+                "messages API returned error code",
+                Some(v),
+            ));
+        }
+
+        let data = v.get("data").cloned().unwrap_or_else(|| json!({}));
+        let items = data
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let has_more = data
+            .get("has_more")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let next_page_token = data
+            .get("page_token")
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        scanned_pages += 1;
+        scanned_messages += items.len();
+
+        for item in &items {
+            let msg_type = item
+                .get("msg_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !msg_type_filters.is_empty()
+                && !msg_type_filters.iter().any(|allowed| allowed == &msg_type)
+            {
+                continue;
+            }
+
+            let searchable_text = build_feishu_message_searchable_text(item);
+            if searchable_text.is_empty() || !searchable_text.to_lowercase().contains(&needle) {
+                continue;
+            }
+            matches.push(render_feishu_message_hit(
+                item,
+                &searchable_text,
+                matches.len() + 1,
+            ));
+            if matches.len() >= limit {
+                break;
+            }
+        }
+
+        if !has_more || next_page_token.is_none() {
+            break;
+        }
+        page_token = next_page_token;
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "search_key: {}\ncontainer: {} {}\nscanned_pages: {}\nscanned_messages: {}\nmatched: {}",
+        search_key,
+        container_id_type,
+        container_id,
+        scanned_pages,
+        scanned_messages,
+        matches.len()
+    ));
+    if !msg_type_filters.is_empty() {
+        out.push_str(&format!("\nmsg_types: {}", msg_type_filters.join(", ")));
+    }
+    if matches.is_empty() {
+        out.push_str("\n\nNo matched message found.");
+        return Ok(out);
+    }
+    out.push_str("\n\n");
+    out.push_str(&matches.join("\n\n"));
+    Ok(out)
+}
+
+fn resolve_message_container(args: &Value) -> Result<(&'static str, String), JsonRpcErr> {
+    let chat_id = args
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let thread_id = args
+        .get("thread_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !chat_id.is_empty() && !thread_id.is_empty() {
+        return Err(json_rpc_error(
+            -32602,
+            "Invalid params: chat_id and thread_id cannot both be set",
+            None,
+        ));
+    }
+    if !thread_id.is_empty() {
+        return Ok(("thread", thread_id));
+    }
+    if !chat_id.is_empty() {
+        return Ok(("chat", chat_id));
+    }
+    Err(json_rpc_error(
+        -32602,
+        "Invalid params: chat_id or thread_id is required",
+        None,
+    ))
+}
+
+fn get_optional_arg_string(args: &Value, key: &str) -> Option<String> {
+    let value = args.get(key)?;
+    match value {
+        Value::String(s) => {
+            let s = s.trim().to_string();
+            (!s.is_empty()).then_some(s)
+        }
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn extract_string_array(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn do_messages_list_request(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+    container_id_type: &str,
+    container_id: &str,
+    sort_type: &str,
+    page_size: usize,
+    page_token: Option<&str>,
+    start_time: Option<&str>,
+    end_time: Option<&str>,
+) -> Result<(reqwest::StatusCode, String), JsonRpcErr> {
+    let mut url = format!(
+        "{}/open-apis/im/v1/messages?container_id_type={}&container_id={}&sort_type={}&page_size={}",
+        base_url.trim_end_matches('/'),
+        url_encode_component(container_id_type),
+        url_encode_component(container_id),
+        url_encode_component(sort_type),
+        page_size
+    );
+    if let Some(page_token) = page_token.filter(|v| !v.trim().is_empty()) {
+        url.push_str("&page_token=");
+        url.push_str(&url_encode_component(page_token.trim()));
+    }
+    if let Some(start_time) = start_time.filter(|v| !v.trim().is_empty()) {
+        url.push_str("&start_time=");
+        url.push_str(&url_encode_component(start_time.trim()));
+    }
+    if let Some(end_time) = end_time.filter(|v| !v.trim().is_empty()) {
+        url.push_str("&end_time=");
+        url.push_str(&url_encode_component(end_time.trim()));
+    }
+
+    let resp = client
+        .get(url)
+        .header("Authorization", format!("Bearer {}", token.trim()))
+        .send()
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to call messages API",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    let status = resp.status();
+    let text = resp.text().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to read messages API response body",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
+    Ok((status, text))
+}
+
+fn build_feishu_message_searchable_text(item: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(v) = item.get("body") {
+        collect_message_text(v, &mut parts);
+    }
+    if let Some(v) = item.get("mentions") {
+        collect_message_text(v, &mut parts);
+    }
+    if let Some(v) = item.get("sender") {
+        collect_message_text(v, &mut parts);
+    }
+    let merged = parts.join(" ");
+    compact_message_text(&merged)
+}
+
+fn collect_message_text(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return;
+            }
+            if (trimmed.starts_with('{') || trimmed.starts_with('['))
+                && let Ok(parsed) = serde_json::from_str::<Value>(trimmed)
+            {
+                collect_message_text(&parsed, out);
+                return;
+            }
+            if let Some((_, rest)) = trimmed.split_once(':')
+                && matches!(
+                    trimmed.split_once(':').map(|(prefix, _)| prefix),
+                    Some("text" | "post" | "card" | "interactive")
+                )
+            {
+                let rest = rest.trim();
+                if !rest.is_empty() {
+                    out.push(rest.to_string());
+                    return;
+                }
+            }
+            out.push(trimmed.to_string());
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_message_text(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values() {
+                collect_message_text(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn compact_message_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_was_space = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !last_was_space {
+                out.push(' ');
+            }
+            last_was_space = true;
+        } else {
+            out.push(ch);
+            last_was_space = false;
+        }
+    }
+    out.trim().to_string()
+}
+
+fn render_feishu_message_hit(item: &Value, searchable_text: &str, index: usize) -> String {
+    let message_id = item
+        .get("message_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let chat_id = item
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let root_id = item
+        .get("root_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let parent_id = item
+        .get("parent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let upper_message_id = item
+        .get("upper_message_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let msg_type = item
+        .get("msg_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let create_time = item
+        .get("create_time")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let sender = item
+        .get("sender")
+        .and_then(|v| v.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let preview = truncate_for_preview(searchable_text, 200);
+
+    let mut meta = format!(
+        "{}. [{}] create_time: {} | sender: {} | chat_id: {} | message_id: {}",
+        index, msg_type, create_time, sender, chat_id, message_id
+    );
+    if !root_id.is_empty() {
+        meta.push_str(&format!(" | root_id: {}", root_id));
+    }
+    if !parent_id.is_empty() {
+        meta.push_str(&format!(" | parent_id: {}", parent_id));
+    }
+    if !upper_message_id.is_empty() {
+        meta.push_str(&format!(" | upper_message_id: {}", upper_message_id));
+    }
+    format!("{meta}\n{preview}")
+}
+
+fn truncate_for_preview(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in s.chars().enumerate() {
+        if idx >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn feishu_docs_get_text(args: &Value) -> Result<String, JsonRpcErr> {
@@ -2065,6 +2543,19 @@ fn resolve_user_access_token() -> Option<String> {
         .filter(|v| !v.is_empty() && v.starts_with("u-"))
 }
 
+fn resolve_tenant_access_token() -> Option<String> {
+    if let Ok(v) = std::env::var("FEISHU_TENANT_ACCESS_TOKEN") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let cfg = configw::get_all_config();
+    cfg.get_opt("feishu.tenant_access_token")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 fn resolve_refresh_token() -> Option<String> {
     if let Ok(v) = std::env::var("FEISHU_REFRESH_TOKEN") {
         let v = v.trim().to_string();
@@ -2136,6 +2627,36 @@ fn get_user_access_token_cached(client: &Client, base_url: &str) -> Result<Strin
     refresh_user_access_token_and_cache(client, base_url)
 }
 
+fn get_tenant_access_token_cached(client: &Client, base_url: &str) -> Result<String, JsonRpcErr> {
+    let cache = TENANT_TOKEN_CACHE.get_or_init(|| Mutex::new(None));
+    let now = Instant::now();
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.as_ref()
+        && cached.expires_at > now + Duration::from_secs(300)
+    {
+        return Ok(cached.token.clone());
+    }
+
+    let Some((app_id, app_secret)) = resolve_app_credentials() else {
+        return Err(json_rpc_error(
+            -32000,
+            "Missing Feishu app credentials (app_id/app_secret)",
+            Some(json!({
+                "env": ["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
+                "config_keys": ["feishu.app_id", "feishu.app_secret"]
+            })),
+        ));
+    };
+    let (token, expires_at) = fetch_tenant_access_token(client, base_url, &app_id, &app_secret)?;
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some(CachedToken {
+            token: token.clone(),
+            expires_at,
+        });
+    }
+    Ok(token)
+}
+
 fn cache_user_access_token(token: &str, expires_at_epoch_ms: Option<i64>) {
     if token.trim().is_empty() {
         return;
@@ -2164,6 +2685,13 @@ fn acquire_user_access_token(client: &Client, base_url: &str) -> Result<String, 
         return Ok(tok);
     }
     get_user_access_token_cached(client, base_url)
+}
+
+fn acquire_tenant_access_token(client: &Client, base_url: &str) -> Result<String, JsonRpcErr> {
+    if let Some(tok) = resolve_tenant_access_token() {
+        return Ok(tok);
+    }
+    get_tenant_access_token_cached(client, base_url)
 }
 
 fn with_user_access_token<T, F>(
@@ -2519,6 +3047,88 @@ fn fetch_app_access_token(
         return Err(json_rpc_error(
             -32000,
             "app_access_token missing in response",
+            Some(v),
+        ));
+    }
+    let expire = v
+        .get("expire")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        .max(60) as u64;
+    let expires_at = Instant::now() + Duration::from_secs(expire);
+    Ok((token, expires_at))
+}
+
+fn fetch_tenant_access_token(
+    client: &Client,
+    base_url: &str,
+    app_id: &str,
+    app_secret: &str,
+) -> Result<(String, Instant), JsonRpcErr> {
+    let url = format!(
+        "{}/open-apis/auth/v3/tenant_access_token/internal",
+        base_url.trim_end_matches('/')
+    );
+    let body = json!({
+        "app_id": app_id,
+        "app_secret": app_secret
+    });
+
+    let resp = client
+        .post(url)
+        .header("Content-Type", "application/json; charset=utf-8")
+        .json(&body)
+        .send()
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to call tenant_access_token API",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    let status = resp.status();
+    let text = resp.text().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to read tenant_access_token response body",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
+    if !status.is_success() {
+        return Err(json_rpc_error(
+            -32000,
+            "tenant_access_token API returned non-success HTTP status",
+            Some(json!({ "status": status.as_u16(), "body": text })),
+        ));
+    }
+
+    let v: Value = serde_json::from_str(&text).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "tenant_access_token response is not valid JSON",
+            Some(json!({ "error": e.to_string(), "body": text })),
+        )
+    })?;
+    let code = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+    if code != 0 {
+        return Err(json_rpc_error(
+            -32000,
+            "tenant_access_token API returned error code",
+            Some(v),
+        ));
+    }
+
+    let token = v
+        .get("tenant_access_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if token.is_empty() {
+        return Err(json_rpc_error(
+            -32000,
+            "tenant_access_token missing in response",
             Some(v),
         ));
     }
@@ -3901,5 +4511,39 @@ mod tests {
             render_text_elements(Some(&elements_url_only), None),
             "https://bare-url.com"
         );
+    }
+
+    #[test]
+    fn resolve_message_container_rejects_ambiguous_input() {
+        let err = resolve_message_container(&json!({
+            "chat_id": "oc_123",
+            "thread_id": "omt_456"
+        }))
+        .unwrap_err();
+        assert!(err.message.contains("cannot both be set"));
+    }
+
+    #[test]
+    fn build_message_searchable_text_extracts_text_json() {
+        let item = json!({
+            "msg_type": "text",
+            "body": {
+                "content": "{\"text\":\"项目复盘记录\"}"
+            }
+        });
+        let searchable = build_feishu_message_searchable_text(&item);
+        assert!(searchable.contains("项目复盘记录"));
+    }
+
+    #[test]
+    fn build_message_searchable_text_flattens_card_payload() {
+        let item = json!({
+            "msg_type": "interactive",
+            "body": {
+                "content": "{\"config\":{\"wide_screen_mode\":true},\"elements\":[{\"tag\":\"div\",\"text\":{\"tag\":\"plain_text\",\"content\":\"报警记录 #123\"}}]}"
+            }
+        });
+        let searchable = build_feishu_message_searchable_text(&item);
+        assert!(searchable.contains("报警记录 #123"));
     }
 }

@@ -65,7 +65,7 @@
 //! cache.put(3, "c"); // 键 2 会被淘汰
 //!
 //! assert!(cache.get(2).is_none());
-//! assert_eq!(cache.get(1), Some(&"a"));
+//! assert_eq!(cache.get(1), Some("a"));
 //! ```
 //!
 //! ### 布隆过滤器
