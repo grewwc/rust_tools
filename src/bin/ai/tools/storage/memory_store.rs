@@ -663,6 +663,48 @@ impl MemoryStore {
         }
     }
 
+
+    /// 根据 id 删除条目（返回被删除的条目）
+    pub(crate) fn delete_by_id(&self, id: &str) -> Result<Option<AgentMemoryEntry>, String> {
+        super::with_memory_file_lock(&self.path, || {
+            let content = std::fs::read_to_string(&self.path)
+                .map_err(|e| format!("Failed to read memory file: {}", e))?;
+
+            let mut entries: Vec<AgentMemoryEntry> = Vec::new();
+            let mut deleted_entry: Option<AgentMemoryEntry> = None;
+
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
+                    let entry_id = entry.id.as_deref().unwrap_or("");
+                    if entry_id == id {
+                        deleted_entry = Some(entry);
+                        continue;
+                    }
+                    entries.push(entry);
+                }
+            }
+
+            if deleted_entry.is_none() {
+                return Ok(None);
+            }
+
+            let mut output = String::new();
+            for entry in &entries {
+                if let Ok(s) = serde_json::to_string(entry) {
+                    output.push_str(&s);
+                    output.push('\n');
+                }
+            }
+
+            std::fs::write(&self.path, output)
+                .map_err(|e| format!("Failed to write memory file: {}", e))?;
+
+            Ok(deleted_entry)
+        })
+    }
+
     fn cleanup_archives_auto(&self) -> Result<(), String> {
         let cfg = configw::get_all_config();
         let retain_days = cfg
