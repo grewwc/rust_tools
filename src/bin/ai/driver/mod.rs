@@ -117,6 +117,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         shutdown,
         streaming,
         cancel_stream,
+        ignore_next_prompt_interrupt: false,
         writer,
         prompt_editor,
         agent_context: Some(AgentContext {

@@ -633,6 +633,7 @@ pub(super) async fn run_turn(
         {
             app.streaming
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            app.ignore_next_prompt_interrupt = true;
             persist_pending_turn_messages(
                 app,
                 one_shot_mode,
@@ -695,6 +696,9 @@ pub(super) async fn run_turn(
         input::clear_stdin_buffer();
 
         if stream_result.outcome == StreamOutcome::Cancelled {
+            app.streaming
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            app.ignore_next_prompt_interrupt = true;
             persist_pending_turn_messages(
                 app,
                 one_shot_mode,
@@ -1031,6 +1035,7 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
             cancel_stream: Arc::new(AtomicBool::new(false)),
+            ignore_next_prompt_interrupt: false,
             writer: None,
             prompt_editor: None,
             agent_context: None,

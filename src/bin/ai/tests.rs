@@ -85,6 +85,7 @@ fn resolve_model_is_unicode_safe() {
         shutdown,
         streaming,
         cancel_stream,
+        ignore_next_prompt_interrupt: false,
         writer: None,
         prompt_editor: None,
         agent_context: None,

@@ -60,7 +60,7 @@ impl PromptEditor {
                     return Ok(Some(trim_trailing_newline(line)));
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                    return exit_on_interrupt();
+                    return interrupted_error();
                 }
                 Err(err) => {
                     return Err(err);
@@ -76,7 +76,7 @@ impl PromptEditor {
                 Ok(0) => return Ok(None),
                 Ok(_) => return Ok(Some(trim_trailing_newline(line))),
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                    return exit_on_interrupt();
+                    return interrupted_error();
                 }
                 Err(err) => return Err(err),
             }
@@ -88,7 +88,7 @@ impl PromptEditor {
                 Ok(Some(line))
             }
             Err(ReadlineError::Eof) => Ok(None),
-            Err(ReadlineError::Interrupted) => exit_on_interrupt(),
+            Err(ReadlineError::Interrupted) => interrupted_error(),
             Err(err) => Err(io::Error::other(err.to_string())),
         }
     }
@@ -470,7 +470,7 @@ impl PromptEditor {
 
         let result = match result {
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                return exit_on_interrupt();
+                return interrupted_error();
             }
             Err(err) => return Err(err),
             Ok(result) => result,
@@ -546,14 +546,8 @@ fn textarea_content(textarea: &tui_textarea::TextArea<'_>) -> String {
     textarea.lines().join("\n")
 }
 
-fn exit_on_interrupt() -> io::Result<Option<String>> {
-    println!("Exit.");
-    #[cfg(not(test))]
-    std::process::exit(130);
-    #[cfg(test)]
-    {
-        Ok(None)
-    }
+fn interrupted_error() -> io::Result<Option<String>> {
+    Err(io::Error::new(io::ErrorKind::Interrupted, "Ctrl+C"))
 }
 
 fn centered_rect(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {

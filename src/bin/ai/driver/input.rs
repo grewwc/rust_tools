@@ -54,14 +54,30 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
         return Ok(Some(ctx));
     }
 
-    let question = match prompt_user(app) {
-        Ok(v) => v,
-        Err(_) if app.shutdown.load(Ordering::Relaxed) => {
-            return Ok(None);
+    let question = loop {
+        match prompt_user(app) {
+            Ok(v) => {
+                app.ignore_next_prompt_interrupt = false;
+                break v;
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                if app.ignore_next_prompt_interrupt {
+                    app.ignore_next_prompt_interrupt = false;
+                    clear_stdin_buffer();
+                    continue;
+                }
+                println!("Exit.");
+                app.shutdown.store(true, Ordering::Relaxed);
+                return Ok(None);
+            }
+            Err(_) if app.shutdown.load(Ordering::Relaxed) => {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.into()),
         }
-        Err(err) => return Err(err.into()),
     };
     let Some(question) = question else {
+        app.ignore_next_prompt_interrupt = false;
         app.shutdown.store(true, Ordering::Relaxed);
         return Ok(None);
     };
