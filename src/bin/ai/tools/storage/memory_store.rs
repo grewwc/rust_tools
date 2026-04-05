@@ -92,7 +92,7 @@ impl MemoryStore {
         &self,
         query: &str,
         limit: usize,
-    ) -> Result<Vec<AgentMemoryEntry>, String> {
+    ) -> Result<Vec<(AgentMemoryEntry, f64)>, String> {
         let query_lc = query.to_lowercase();
         let mut docs: Vec<(AgentMemoryEntry, String, Vec<String>)> = Vec::new();
         let cfg = configw::get_all_config();
@@ -229,26 +229,26 @@ impl MemoryStore {
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
         let cap = limit.saturating_mul(10).min(200).max(limit);
-        let mut top_idx: Vec<usize> = scored.iter().take(cap).map(|(_, i)| *i).collect();
+        let mut top_idx: Vec<(f64, usize)> = scored.iter().take(cap).map(|(s, i)| (*s, *i)).collect();
         let qv = embed_text(&query_lc);
         if let Some(qv) = qv {
             let mut rescored: Vec<(f64, usize)> = Vec::with_capacity(top_idx.len());
-            for &i in &top_idx {
+            for &(_s, i) in &top_idx {
                 let (_, full, _) = &docs[i];
                 let ev = embed_text(full);
                 let emb = ev.as_ref().map(|v| cosine_similarity(&qv, v)).unwrap_or(0.0);
-                let base = scored[i].0;
+                let base = _s;
                 let final_s = 0.85 * base + 0.15 * emb as f64;
                 rescored.push((final_s, i));
             }
             rescored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-            top_idx = rescored.into_iter().take(limit).map(|(_, i)| i).collect();
+            top_idx = rescored.into_iter().take(limit).collect();
         } else {
             top_idx.truncate(limit);
         }
         let mut out = Vec::with_capacity(top_idx.len());
-        for i in top_idx {
-            out.push(docs[i].0.clone());
+        for (s, i) in top_idx {
+            out.push((docs[i].0.clone(), s));
         }
         Ok(out)
     }
@@ -321,7 +321,7 @@ mod tests {
         store.append(&e2).unwrap();
         let out = store.search("parse login", 5).unwrap();
         assert!(!out.is_empty());
-        assert!(out.iter().any(|x| x.note.contains("parsing login")));
+        assert!(out.iter().any(|(x, _)| x.note.contains("parsing login")));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -342,7 +342,7 @@ mod tests {
         store.append(&e).unwrap();
         let out = store.search("signin failure", 3).unwrap();
         assert!(!out.is_empty());
-        assert!(out.iter().any(|x| x.note.contains("login failed")));
+        assert!(out.iter().any(|(x, _)| x.note.contains("login failed")));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -363,7 +363,7 @@ mod tests {
         store.append(&e).unwrap();
         let out = store.search("登陆失败", 3).unwrap();
         assert!(!out.is_empty());
-        assert!(out.iter().any(|x| x.note.contains("登录失败")));
+        assert!(out.iter().any(|(x, _)| x.note.contains("登录失败")));
         let _ = std::fs::remove_file(&path);
     }
 }
@@ -441,43 +441,14 @@ fn tokenize(s: &str) -> Vec<String> {
     tokens
 }
 
-fn synonyms_for(token: &str) -> Vec<&'static str> {
-    match token {
-        "login" => vec!["signin", "sign-in", "logon"],
-        "signin" => vec!["login", "sign-in", "logon"],
-        "sign-in" => vec!["login", "signin", "logon"],
-        "auth" => vec!["authentication", "authorize", "authorization"],
-        "authentication" => vec!["auth"],
-        "解析" => vec!["parse", "parsing"],
-        "parse" => vec!["解析", "parsing"],
-        "parsing" => vec!["parse", "解析"],
-        "登录" => vec!["登陆", "login", "signin", "sign-in", "logon"],
-        "登陆" => vec!["登录", "login", "signin", "sign-in", "logon"],
-        "失败" => vec!["错误", "error", "failed"],
-        "错误" => vec!["失败", "error", "bug"],
-        "error" => vec!["failed", "failure"],
-        "配置" => vec!["config", "configuration"],
-        "config" => vec!["configuration", "配置"],
-        "代码" => vec!["code", "源码"],
-        "code" => vec!["源码", "代码"],
-        _ => vec![],
-    }
-}
-
 fn expand_tokens(tokens: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(tokens.len() * 2);
+    let mut out = Vec::with_capacity(tokens.len());
     use rust_tools::commonw::FastSet;
     let mut seen: FastSet<String> = FastSet::default();
     for t in tokens {
         let tnorm = t.to_lowercase();
         if seen.insert(tnorm.clone()) {
-            out.push(tnorm.clone());
-        }
-        for syn in synonyms_for(&tnorm) {
-            let s = syn.to_string();
-            if seen.insert(s.clone()) {
-                out.push(s);
-            }
+            out.push(tnorm);
         }
     }
     out
@@ -989,7 +960,7 @@ impl MemoryStore {
     
     /// 获取所有记忆
     pub fn all(&self) -> Result<Vec<AgentMemoryEntry>, String> {
-        self.search("", usize::MAX)
+        self.search("", usize::MAX).map(|results| results.into_iter().map(|(e, _score)| e).collect())
     }
     
     /// 记录记忆被使用（增加引用次数）

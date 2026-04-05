@@ -110,7 +110,7 @@ fn hybrid_bm25_fallback(
     let mem_results = mem_store.search(query, 20)?;
 
     let mut results = Vec::new();
-    for (rank, entry) in mem_results.into_iter().enumerate() {
+    for (rank, (entry, _score)) in mem_results.into_iter().enumerate() {
         let id = entry.id.clone().unwrap_or_else(|| {
             format!("{:x}", md5::compute(&entry.note))
         });

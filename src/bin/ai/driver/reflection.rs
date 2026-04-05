@@ -154,10 +154,10 @@ pub(super) fn build_persistent_guidelines(question: &str, max_chars: usize) -> O
     ];
 
     let mut entries: Vec<AgentMemoryEntry> = Vec::new();
-    entries.extend(store.search(question, 160).ok().unwrap_or_default());
+    entries.extend(store.search(question, 160).ok().unwrap_or_default().into_iter().filter(|(_, score)| *score > 0.0).map(|(e, _)| e));
     for cat in hot_categories {
         if let Ok(mut v) = store.search(cat, 120) {
-            entries.append(&mut v);
+            entries.append(&mut v.into_iter().filter(|(_, score)| *score > 0.0).map(|(e, _)| e).collect::<Vec<_>>());
         }
     }
     if entries.is_empty() {
@@ -407,7 +407,10 @@ fn build_auto_recalled_knowledge_with_project(
         if query.trim().is_empty() {
             continue;
         }
-        for entry in store.search(&query, 24).ok().unwrap_or_default() {
+        for (entry, score) in store.search(&query, 24).ok().unwrap_or_default() {
+            if score < 0.25 {
+                continue; // 过滤低相关性条目
+            }
             if entry.category == "tool_cache" {
                 continue;
             }

@@ -213,7 +213,8 @@ fn execute_knowledge_search(args: &Value) -> Result<String, String> {
         query.to_string()
     };
 
-    let entries = store.search(&search_query, limit)?;
+    let results = store.search(&search_query, limit)?;
+    let entries: Vec<_> = results.into_iter().map(|(e, _score)| e).collect();
 
     if entries.is_empty() {
         return Ok(format!("No knowledge entries found for query: '{}'", query));

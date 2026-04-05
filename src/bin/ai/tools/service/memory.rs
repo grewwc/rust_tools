@@ -173,10 +173,10 @@ pub(crate) fn execute_memory_search(args: &Value) -> Result<String, String> {
         .filter(|s| !s.is_empty());
     let debug_score = args["debug_score"].as_bool().unwrap_or(false);
     let store = MemoryStore::from_env_or_config();
-    let entries = store.search(query, 10_000)?;
+    let results = store.search(query, 10_000)?;
 
-    let mut scored = Vec::with_capacity(entries.len());
-    for e in entries {
+    let mut scored = Vec::with_capacity(results.len());
+    for (e, search_score) in results {
         if let Some(cat) = category_filter.as_ref() {
             if e.category.to_lowercase() != *cat {
                 continue;
