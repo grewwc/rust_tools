@@ -1,6 +1,6 @@
 use crate::ai::skills::SkillManifest;
-use rust_tools::cw::SkipSet;
 use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipSet;
 
 pub use super::intent_recognition::{CoreIntent, UserIntent};
 
@@ -24,7 +24,13 @@ mod weights {
 /// 动态阈值配置
 mod thresholds {
     pub fn skill_count_threshold(skill_count: usize) -> f64 {
-        if skill_count > 5 { 3.0 } else { 2.0 }
+        if skill_count > 10 {
+            5.0
+        } else if skill_count > 5 {
+            4.0
+        } else {
+            3.5
+        }
     }
 
     pub const MIN_PHRASE_LENGTH: usize = 5;
@@ -65,17 +71,18 @@ pub fn match_skill<'a>(
         }
     }
 
-    // 动态阈值：根据技能数量和匹配质量调整，但保证一个较高的最低底线
+    // 动态阈值：根据技能数量和匹配质量调整，提高底线防止误触发
     let base_threshold = thresholds::skill_count_threshold(skills.len());
-    // 如果意图只是请求行动，但没有明确指向现有技能，提高阈值防止 "代码" 等通用词导致误触发
+    // 提高阈值防止通用词导致误匹配
     let threshold = if let Some(intent_ref) = intent {
-        if intent_ref.core == CoreIntent::RequestAction {
-            base_threshold.max(4.5)
-        } else {
-            base_threshold.max(3.0)
+        match intent_ref.core {
+            CoreIntent::RequestAction => base_threshold.max(5.0),
+            CoreIntent::SeekSolution => base_threshold.max(4.5),
+            CoreIntent::QueryConcept => base_threshold.max(6.0),
+            CoreIntent::Casual => base_threshold.max(6.0),
         }
     } else {
-        base_threshold.max(3.0)
+        base_threshold.max(5.0)
     };
 
     if best_score >= threshold {
@@ -103,19 +110,8 @@ fn is_intent_excluded(skill: &SkillManifest, intent: &UserIntent) -> bool {
             exclusion_patterns.iter().any(|p| desc_lower.contains(p))
         }
         CoreIntent::RequestAction | CoreIntent::SeekSolution | CoreIntent::Casual => {
-            // 如果用户是在搜索资源（如"找几个 skill"），而不是请求执行技能
-            // 所有具体执行类技能都应该排除
             if intent.is_searching_resource("skill") {
-                let execution_keywords = [
-                    "审查", "重构", "调试", "评估", "分析",
-                    "review", "refactor", "debug", "analyze",
-                ];
-                let name_lower = skill.name.to_lowercase();
-                execution_keywords.iter().any(|kw| desc_lower.contains(kw))
-                    && (name_lower.contains("review")
-                        || name_lower.contains("refactor")
-                        || name_lower.contains("debug")
-                        || name_lower.contains("analyzer"))
+                true
             } else {
                 false
             }
@@ -124,11 +120,7 @@ fn is_intent_excluded(skill: &SkillManifest, intent: &UserIntent) -> bool {
 }
 
 /// 智能评分：结合 TF-IDF 思想、短语匹配、意图匹配
-fn score_skill_smart(
-    skill: &SkillManifest,
-    input_lower: &str,
-    intent: Option<&UserIntent>,
-) -> f64 {
+fn score_skill_smart(skill: &SkillManifest, input_lower: &str, intent: Option<&UserIntent>) -> f64 {
     let mut score = 0.0;
 
     // 1. 技能名称匹配（权重最高）
@@ -345,21 +337,9 @@ fn intent_match_bonus(skill: &SkillManifest, intent: &UserIntent, input: &str) -
     let desc_lower = skill.description.to_lowercase();
     let name_lower = skill.name.to_lowercase();
 
-    // 如果是搜索资源类查询，给执行类技能负分
+    // 如果是搜索资源类查询，给所有技能负分
     if intent.is_searching_resource("skill") {
-        let execution_keywords = [
-            "审查", "重构", "调试", "评估", "分析",
-            "review", "refactor", "debug", "analyze",
-        ];
-
-        if execution_keywords.iter().any(|kw| desc_lower.contains(kw))
-            && (name_lower.contains("review")
-                || name_lower.contains("refactor")
-                || name_lower.contains("debug")
-                || name_lower.contains("analyzer"))
-        {
-            return weights::EXCLUDED_INTENT_PENALTY;
-        }
+        return weights::EXCLUDED_INTENT_PENALTY;
     }
 
     match &intent.core {

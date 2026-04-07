@@ -1,11 +1,24 @@
-/// 知识库工具 — 为 agent 提供持久化的记忆管理
+/// 知识库工具 — 为用户提供知识管理功能
 ///
-/// 包含六个工具：
-/// - `knowledge_save` — 记录新知识（自动同步到 RAG 向量索引）
-/// - `knowledge_forget` — 删除指定记忆（同步删除 RAG 向量）
-/// - `knowledge_search` — 按关键词搜索记忆
-/// - `knowledge_list` — 列出最近的记忆条目
-
+/// ## 与 Memory 系统的区别
+/// - **Knowledge (知识库)**: 用户主动保存的项目知识、决策记录、偏好设置等
+///   - 工具: `knowledge_save`, `knowledge_forget`, `knowledge_search`, `knowledge_list`
+///   - 用途: 用户显式管理的事实性知识，如项目结构、技术决策、用户偏好
+///   - 类别: `user_memory`, `project_info`, `architecture`, `decision_log` 等
+///
+/// - **Memory (记忆)**: Agent 内部自动学习的行为规则、安全策略、自我反思
+///   - 工具: `memory_save`, `memory_search`, `memory_recent` (内部使用)
+///   - 用途: Agent 自动积累的行为指导，如安全规则、编码规范、自我反思笔记
+///   - 类别: `safety_rules`, `coding_guideline`, `self_note`, `common_sense` 等
+///
+/// 两者共享底层存储 (`MemoryStore`)，但用途和访问方式不同。
+/// 知识库面向用户，记忆面向 Agent 自身。
+///
+/// 包含工具：
+/// - `knowledge_save` — 保存用户知识（自动同步到 RAG 向量索引）
+/// - `knowledge_forget` — 删除指定知识（同步删除 RAG 向量）
+/// - `knowledge_search` — 按关键词搜索知识
+/// - `knowledge_list` — 列出最近的知识条目
 use serde_json::Value;
 
 use crate::ai::tools::common::ToolRegistration;
@@ -46,10 +59,17 @@ fn params_knowledge_save() -> Value {
 }
 
 fn execute_knowledge_save(args: &Value) -> Result<String, String> {
-    let content = args["content"].as_str().ok_or("Missing 'content'. Provide the text to remember.")?;
+    let content = args["content"]
+        .as_str()
+        .ok_or("Missing 'content'. Provide the text to remember.")?;
     let category = args["category"].as_str().unwrap_or("user_memory");
-    let tags: Vec<String> = args["tags"].as_array()
-        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+    let tags: Vec<String> = args["tags"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let source = args["source"].as_str().map(String::from);
     let priority = args["priority"].as_u64().map(|p| p as u8).unwrap_or(150);
@@ -76,7 +96,10 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
     if let Ok(_) = ensure_rag_store() {
         if let Ok(guard) = get_rag_store() {
             if let Some(rag) = guard.as_ref() {
-                let id = format!("{:x}", md5::compute(&format!("{}:{}", entry.timestamp, content)));
+                let id = format!(
+                    "{:x}",
+                    md5::compute(&format!("{}:{}", entry.timestamp, content))
+                );
                 let embedding_text = format!("{}: {}", entry.category, entry.note);
                 if let Ok(embeddings) = rag.embed_texts(&[embedding_text.clone()]) {
                     if let Some(embedding) = embeddings.into_iter().next() {
@@ -133,15 +156,23 @@ fn params_knowledge_forget() -> Value {
 }
 
 fn execute_knowledge_forget(args: &Value) -> Result<String, String> {
-    let id = args["id"].as_str().ok_or("Missing 'id'. Provide the memory entry id to forget.")?;
+    let id = args["id"]
+        .as_str()
+        .ok_or("Missing 'id'. Provide the memory entry id to forget.")?;
 
     let store = MemoryStore::from_env_or_config();
-    
+
     // 从 memory_store 删除
-    let deleted = store.delete_by_id(id)
+    let deleted = store
+        .delete_by_id(id)
         .map_err(|e| format!("Failed to delete memory entry: {e}"))?
-        .ok_or_else(|| format!("No memory entry found with id '{}'. Use knowledge_list to find valid ids.", id))?;
-    
+        .ok_or_else(|| {
+            format!(
+                "No memory entry found with id '{}'. Use knowledge_list to find valid ids.",
+                id
+            )
+        })?;
+
     let preview: String = if deleted.note.chars().count() > 100 {
         let s: String = deleted.note.chars().take(100).collect();
         format!("{}...", s)
@@ -202,7 +233,9 @@ fn params_knowledge_search() -> Value {
 }
 
 fn execute_knowledge_search(args: &Value) -> Result<String, String> {
-    let query = args["query"].as_str().ok_or("Missing 'query'. Provide a search term.")?;
+    let query = args["query"]
+        .as_str()
+        .ok_or("Missing 'query'. Provide a search term.")?;
     let category = args["category"].as_str();
     let limit = args["limit"].as_u64().map(|v| v as usize).unwrap_or(10);
 
@@ -220,7 +253,11 @@ fn execute_knowledge_search(args: &Value) -> Result<String, String> {
         return Ok(format!("No knowledge entries found for query: '{}'", query));
     }
 
-    let mut result = format!("🔍 Search results for '{}' ({} found):\n\n", query, entries.len());
+    let mut result = format!(
+        "🔍 Search results for '{}' ({} found):\n\n",
+        query,
+        entries.len()
+    );
     for (idx, entry) in entries.iter().enumerate() {
         let entry_id = entry.id.as_deref().unwrap_or("N/A");
         result.push_str(&format!(
@@ -246,7 +283,8 @@ fn execute_knowledge_search(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_search",
-        description: "Search knowledge base entries by keyword. Returns matching entries with their ids.",
+        description:
+            "Search knowledge base entries by keyword. Returns matching entries with their ids.",
         parameters: params_knowledge_search,
         execute: execute_knowledge_search,
         groups: &["builtin"],
@@ -268,7 +306,11 @@ fn params_knowledge_list() -> Value {
 }
 
 fn execute_knowledge_list(args: &Value) -> Result<String, String> {
-    let limit = args["limit"].as_u64().map(|v| v as usize).unwrap_or(20).min(100);
+    let limit = args["limit"]
+        .as_u64()
+        .map(|v| v as usize)
+        .unwrap_or(20)
+        .min(100);
 
     let store = MemoryStore::from_env_or_config();
     let path = store.path().to_path_buf();
@@ -279,8 +321,8 @@ fn execute_knowledge_list(args: &Value) -> Result<String, String> {
         return Ok("Knowledge base is empty. Use knowledge_save to add entries.".to_string());
     }
 
-    let content = fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read memory file: {e}"))?;
+    let content =
+        fs::read_to_string(&path).map_err(|e| format!("Failed to read memory file: {e}"))?;
 
     let mut entries: Vec<AgentMemoryEntry> = Vec::new();
     for line in content.lines() {
@@ -301,7 +343,11 @@ fn execute_knowledge_list(args: &Value) -> Result<String, String> {
     let start = entries.len().saturating_sub(limit);
     let recent: &[AgentMemoryEntry] = &entries[start..];
 
-    let mut result = format!("📋 Recent knowledge entries (showing {} of {}):\n\n", recent.len(), entries.len());
+    let mut result = format!(
+        "📋 Recent knowledge entries (showing {} of {}):\n\n",
+        recent.len(),
+        entries.len()
+    );
     for entry in recent.iter().rev() {
         let entry_id = entry.id.as_deref().unwrap_or("N/A");
         let preview: String = if entry.note.chars().count() > 120 {
@@ -317,7 +363,10 @@ fn execute_knowledge_list(args: &Value) -> Result<String, String> {
         if !entry.tags.is_empty() {
             result.push_str(&format!("  Tags: {}\n", entry.tags.join(", ")));
         }
-        result.push_str(&format!("  Priority: {}\n\n", entry.priority.unwrap_or(100)));
+        result.push_str(&format!(
+            "  Priority: {}\n\n",
+            entry.priority.unwrap_or(100)
+        ));
     }
 
     Ok(result)
@@ -340,26 +389,38 @@ mod tests {
     #[test]
     fn test_knowledge_save_params() {
         let params = params_knowledge_save();
-        assert!(params["required"].as_array().unwrap().contains(&Value::String("content".to_string())));
+        assert!(params["required"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("content".to_string())));
         assert!(params["properties"]["content"].is_object());
     }
 
     #[test]
     fn test_knowledge_forget_params() {
         let params = params_knowledge_forget();
-        assert!(params["required"].as_array().unwrap().contains(&Value::String("id".to_string())));
+        assert!(params["required"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("id".to_string())));
     }
 
     #[test]
     fn test_knowledge_search_params() {
         let params = params_knowledge_search();
-        assert!(params["required"].as_array().unwrap().contains(&Value::String("query".to_string())));
+        assert!(params["required"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("query".to_string())));
     }
 
     #[test]
     fn test_knowledge_list_params() {
         let params = params_knowledge_list();
         // limit is optional, so no required
-        assert!(params["required"].as_array().map(|a| a.is_empty()).unwrap_or(true));
+        assert!(params["required"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true));
     }
 }

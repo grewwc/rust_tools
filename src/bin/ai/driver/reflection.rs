@@ -1,14 +1,18 @@
 use serde_json::Value;
 
-use crate::ai::{history::Message, request::{self, build_content}, types::App};
-use crate::commonw::configw;
+use crate::ai::history::append_history_messages;
 use crate::ai::tools::service::memory::execute_memory_update;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
-use crate::ai::history::append_history_messages;
-use std::path::PathBuf;
-use serde_json::json;
-use rust_tools::cw::SkipSet;
+use crate::ai::{
+    history::Message,
+    request::{self, build_content},
+    types::App,
+};
+use crate::commonw::configw;
 use chrono::Local;
+use rust_tools::cw::SkipSet;
+use serde_json::json;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 /// 反思触发条件 - 用于主动学习
@@ -42,12 +46,18 @@ pub struct ReflectionQuality {
 impl ReflectionQuality {
     pub fn score(&self) -> u8 {
         let mut score = 0;
-        if self.actionable { score += 1; }
-        if self.specific { score += 1; }
-        if self.generalizable { score += 1; }
+        if self.actionable {
+            score += 1;
+        }
+        if self.specific {
+            score += 1;
+        }
+        if self.generalizable {
+            score += 1;
+        }
         score
     }
-    
+
     pub fn is_high_quality(&self) -> bool {
         self.score() >= 2
     }
@@ -136,41 +146,144 @@ fn extract_content(v: &Value) -> Option<String> {
     }
 }
 
+/// Guidelines categories: agent behavior rules, safety, preferences
+const GUIDELINE_CATEGORIES: &[&str] = &[
+    "safety_rules",
+    "user_preference",
+    "preference",
+    "coding_guideline",
+    "best_practice",
+    "common_sense",
+    "self_note",
+];
+
+/// Knowledge categories: project facts, user memories (excluded from guidelines)
+const KNOWLEDGE_CATEGORIES: &[&str] = &[
+    "user_memory",
+    "project_info",
+    "architecture",
+    "decision_log",
+];
+
+fn guideline_category(category: &str) -> bool {
+    GUIDELINE_CATEGORIES
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(category))
+}
+
+fn parse_ts_utc(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+fn note_similarity(a: &str, b: &str) -> f64 {
+    let a_lower = a.to_lowercase();
+    let b_lower = b.to_lowercase();
+    if a_lower == b_lower {
+        return 1.0;
+    }
+    let a_words: std::collections::HashSet<&str> = a_lower.split_whitespace().collect();
+    let b_words: std::collections::HashSet<&str> = b_lower.split_whitespace().collect();
+    if a_words.is_empty() || b_words.is_empty() {
+        return 0.0;
+    }
+    let intersection = a_words.intersection(&b_words).count();
+    let union = a_words.union(&b_words).count();
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+fn deduplicate_entries(entries: &mut Vec<AgentMemoryEntry>, similarity_threshold: f64) {
+    if entries.len() <= 1 {
+        return;
+    }
+    let mut keep = vec![true; entries.len()];
+    for i in 0..entries.len() {
+        if !keep[i] {
+            continue;
+        }
+        for j in (i + 1)..entries.len() {
+            if !keep[j] {
+                continue;
+            }
+            let sim = note_similarity(&entries[i].note, &entries[j].note);
+            if sim >= similarity_threshold {
+                let pri_i = entries[i].priority.unwrap_or(100);
+                let pri_j = entries[j].priority.unwrap_or(100);
+                if pri_j > pri_i {
+                    keep[i] = false;
+                    break;
+                } else {
+                    keep[j] = false;
+                }
+            }
+        }
+    }
+    let mut filtered = Vec::with_capacity(entries.len());
+    for (i, entry) in entries.iter().enumerate() {
+        if keep[i] {
+            filtered.push(entry.clone());
+        }
+    }
+    *entries = filtered;
+}
+
 pub(super) fn build_persistent_guidelines(question: &str, max_chars: usize) -> Option<String> {
     let store = MemoryStore::from_env_or_config();
     let cfg = configw::get_all_config();
-    let max_days: i64 = cfg.get_opt("ai.memory.guidelines_days")
+    let max_days: i64 = cfg
+        .get_opt("ai.memory.guidelines_days")
         .and_then(|v| v.parse::<i64>().ok())
         .unwrap_or(30);
 
-    let hot_categories = [
-        "self_note",
-        "safety_rules",
-        "common_sense",
-        "coding_guideline",
-        "best_practice",
-        "user_preference",
-        "preference",
-    ];
-
     let mut entries: Vec<AgentMemoryEntry> = Vec::new();
-    entries.extend(store.search(question, 160).ok().unwrap_or_default().into_iter().filter(|(_, score)| *score > 0.0).map(|(e, _)| e));
-    for cat in hot_categories {
-        if let Ok(mut v) = store.search(cat, 120) {
-            entries.append(&mut v.into_iter().filter(|(_, score)| *score > 0.0).map(|(e, _)| e).collect::<Vec<_>>());
+    for cat in GUIDELINE_CATEGORIES {
+        if let Ok(results) = store.search(cat, 80) {
+            for (e, score) in results {
+                if score < 0.15 {
+                    continue;
+                }
+                if !guideline_category(&e.category) {
+                    continue;
+                }
+                entries.push(e);
+            }
         }
     }
+
+    if !question.trim().is_empty() {
+        if let Ok(results) = store.search(question, 60) {
+            for (e, score) in results {
+                if score < 0.2 {
+                    continue;
+                }
+                if !guideline_category(&e.category) {
+                    continue;
+                }
+                entries.push(e);
+            }
+        }
+    }
+
     if entries.is_empty() {
-        entries = store.recent(200).ok().unwrap_or_default();
+        if let Ok(recent) = store.recent(100) {
+            entries = recent
+                .into_iter()
+                .filter(|e| guideline_category(&e.category))
+                .filter(|e| e.priority.unwrap_or(100) >= 150)
+                .collect();
+        }
     }
 
-    let mut seen: SkipSet<String> = SkipSet::new(16);
-
-    fn parse_ts_utc(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc))
+    if entries.is_empty() {
+        return None;
     }
+
+    deduplicate_entries(&mut entries, 0.7);
 
     fn hot_group(category: &str) -> u8 {
         match category {
@@ -182,7 +295,7 @@ pub(super) fn build_persistent_guidelines(question: &str, max_chars: usize) -> O
         }
     }
 
-    let mut ranked: Vec<(u8, u8, i64, String)> = Vec::with_capacity(entries.len());
+    let mut ranked: Vec<(u8, u8, i64, AgentMemoryEntry)> = Vec::with_capacity(entries.len());
     for e in entries {
         let category = e.category.to_lowercase();
         let priority = e.priority.unwrap_or(100);
@@ -193,15 +306,14 @@ pub(super) fn build_persistent_guidelines(question: &str, max_chars: usize) -> O
 
         if max_days > 0 && group >= 2 {
             if let Some(dt) = parse_ts_utc(&e.timestamp) {
-                let age_days =
-                    (chrono::Utc::now() - dt).num_seconds().max(0) as i64 / 86400;
+                let age_days = (chrono::Utc::now() - dt).num_seconds().max(0) as i64 / 86400;
                 if age_days > max_days {
                     continue;
                 }
             }
         }
 
-        let note = e.note.trim().to_string();
+        let note = e.note.trim();
         if note.is_empty() {
             continue;
         }
@@ -209,7 +321,7 @@ pub(super) fn build_persistent_guidelines(question: &str, max_chars: usize) -> O
         let ts_rank = parse_ts_utc(&e.timestamp)
             .map(|dt| dt.timestamp())
             .unwrap_or(0);
-        ranked.push((group, priority, ts_rank, note));
+        ranked.push((group, priority, ts_rank, e));
     }
 
     ranked.sort_by(|a, b| {
@@ -218,8 +330,10 @@ pub(super) fn build_persistent_guidelines(question: &str, max_chars: usize) -> O
             .then_with(|| b.2.cmp(&a.2))
     });
 
+    let mut seen: SkipSet<String> = SkipSet::new(16);
     let mut by_group: [Vec<String>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    for (group, _priority, _ts, note) in ranked {
+    for (group, _priority, _ts, entry) in ranked {
+        let note = entry.note.trim().to_string();
         if seen.insert(note.clone()) {
             let g = group.min(3) as usize;
             by_group[g].push(note);
@@ -341,7 +455,10 @@ fn entry_mentions_project(entry: &AgentMemoryEntry, project_hint: &str) -> bool 
     {
         return true;
     }
-    entry.tags.iter().any(|tag| tag.to_lowercase().contains(&hint))
+    entry
+        .tags
+        .iter()
+        .any(|tag| tag.to_lowercase().contains(&hint))
 }
 
 fn push_entry_lines(
@@ -357,12 +474,25 @@ fn push_entry_lines(
     let mut wrote_any = false;
     for line in note.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
-        let bullet = if line.starts_with('-') { format!("{line}\n") } else { format!("- {line}\n") };
+        if line.is_empty() {
+            continue;
+        }
+        let bullet = if line.starts_with('-') {
+            format!("{line}\n")
+        } else {
+            format!("- {line}\n")
+        };
         if *used + bullet.len() > max_chars {
             if !wrote_any && *used + 40 <= max_chars {
-                let summary = note.chars().take(max_chars.saturating_sub(*used).saturating_sub(40)).collect::<String>();
-                out.push_str(&format!("- [summary, truncated]: {}\n- ... ({} chars total)\n", summary, note.len()));
+                let summary = note
+                    .chars()
+                    .take(max_chars.saturating_sub(*used).saturating_sub(40))
+                    .collect::<String>();
+                out.push_str(&format!(
+                    "- [summary, truncated]: {}\n- ... ({} chars total)\n",
+                    summary,
+                    note.len()
+                ));
                 *used += out.len();
                 return true;
             }
@@ -391,47 +521,65 @@ fn build_auto_recalled_knowledge_with_project(
     project_hint: Option<&str>,
 ) -> Option<AutoRecalledKnowledge> {
     let store = MemoryStore::from_env_or_config();
-    let mut query_variants = vec![question.trim().to_string()];
     let project_hint = project_hint
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    if let Some(project) = project_hint.as_deref() {
-        query_variants.push(format!("{question} {project}"));
-        query_variants.push(project.to_string());
-    }
 
     let mut entries: Vec<AgentMemoryEntry> = Vec::new();
     let mut seen: SkipSet<String> = SkipSet::new(32);
-    for query in query_variants {
+
+    let mut query_variants = Vec::new();
+    let q = question.trim();
+    if !q.is_empty() {
+        query_variants.push(q.to_string());
+        if let Some(project) = project_hint.as_deref() {
+            query_variants.push(format!("{q} {project}"));
+        }
+    }
+    if let Some(project) = project_hint.as_deref() {
+        query_variants.push(project.to_string());
+    }
+
+    for query in &query_variants {
         if query.trim().is_empty() {
             continue;
         }
-        for (entry, score) in store.search(&query, 24).ok().unwrap_or_default() {
-            if score < 0.25 {
-                continue; // 过滤低相关性条目
-            }
-            if entry.category == "tool_cache" {
-                continue;
-            }
-            let key = memory_entry_key(&entry);
-            if seen.insert(key) {
-                entries.push(entry);
+        if let Ok(results) = store.search(query, 30) {
+            for (entry, score) in results {
+                if score < 0.3 {
+                    continue;
+                }
+                if entry.category == "tool_cache" {
+                    continue;
+                }
+                if guideline_category(&entry.category) {
+                    continue;
+                }
+                let key = memory_entry_key(&entry);
+                if seen.insert(key) {
+                    entries.push(entry);
+                }
             }
         }
     }
 
     if let Some(project) = project_hint.as_deref() {
-        for entry in store.recent(80).ok().unwrap_or_default() {
-            if entry.category == "tool_cache" {
-                continue;
-            }
-            if !entry_mentions_project(&entry, project) {
-                continue;
-            }
-            let key = memory_entry_key(&entry);
-            if seen.insert(key) {
-                entries.push(entry);
+        if let Ok(recent) = store.recent(60) {
+            for entry in recent {
+                if entry.category == "tool_cache" {
+                    continue;
+                }
+                if guideline_category(&entry.category) {
+                    continue;
+                }
+                if !entry_mentions_project(&entry, project) {
+                    continue;
+                }
+                let key = memory_entry_key(&entry);
+                if seen.insert(key) {
+                    entries.push(entry);
+                }
             }
         }
     }
@@ -440,11 +588,7 @@ fn build_auto_recalled_knowledge_with_project(
         return None;
     }
 
-    fn parse_ts_utc(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-        chrono::DateTime::parse_from_rfc3339(s)
-            .ok()
-            .map(|dt| dt.with_timezone(&chrono::Utc))
-    }
+    deduplicate_entries(&mut entries, 0.65);
 
     let project_hint_lc = project_hint.as_deref().map(|s| s.to_lowercase());
     entries.sort_by(|a, b| {
@@ -470,6 +614,7 @@ fn build_auto_recalled_knowledge_with_project(
             })
     });
 
+    let max_entries = if project_hint.is_some() { 10 } else { 6 };
     let mut out = String::from("Auto-Recalled Knowledge:\n");
     let mut used = out.len();
     let mut appended = 0usize;
@@ -477,7 +622,8 @@ fn build_auto_recalled_knowledge_with_project(
     let mut first_entry_project_match = false;
     let mut strongest_project_priority = 0u8;
     let mut categories = Vec::new();
-    for (idx, entry) in entries.into_iter().take(8).enumerate() {
+
+    for (idx, entry) in entries.into_iter().take(max_entries).enumerate() {
         let is_project_match = project_hint_lc
             .as_deref()
             .map(|hint| entry_mentions_project(&entry, hint))
@@ -523,8 +669,8 @@ fn build_auto_recalled_knowledge_with_project(
     let high_confidence_project_memory = project_hint.is_some()
         && appended_project_matches > 0
         && (first_entry_project_match
-            || appended_project_matches >= 1
-            || strongest_project_priority >= 150);
+            || appended_project_matches >= 2
+            || strongest_project_priority >= 180);
     Some(AutoRecalledKnowledge {
         content: out,
         high_confidence_project_memory,
@@ -548,12 +694,13 @@ pub(super) fn build_auto_recalled_knowledge(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_auto_recalled_knowledge_with_project, build_persistent_guidelines,
-        turn_uses_repo_inspection_tools, upsert_project_writeback_entry, ProjectWritebackUpsert,
+        ProjectWritebackUpsert, build_auto_recalled_knowledge_with_project,
+        build_persistent_guidelines, turn_uses_repo_inspection_tools,
+        upsert_project_writeback_entry,
     };
+    use crate::ai::history::Message;
     use crate::ai::test_support::ENV_LOCK;
     use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
-    use crate::ai::history::Message;
     use crate::ai::types::{FunctionCall, ToolCall};
     use chrono::Local;
     use serde_json::Value;
@@ -631,7 +778,7 @@ mod tests {
             .append(&AgentMemoryEntry {
                 id: None,
                 timestamp: timestamp.clone(),
-                category: "user_memory".to_string(),
+                category: "safety_rules".to_string(),
                 note: "Do: always ask before risky file operations".to_string(),
                 tags: vec![],
                 source: Some("test".to_string()),
@@ -643,7 +790,7 @@ mod tests {
                 id: None,
                 timestamp,
                 category: "user_memory".to_string(),
-                note: "Ignore me".to_string(),
+                note: "Ignore me - this is knowledge not guideline".to_string(),
                 tags: vec![],
                 source: Some("test".to_string()),
                 priority: Some(150),
@@ -777,7 +924,11 @@ mod tests {
             &store,
             source,
             "- rust_tools 项目结构：更新版本",
-            vec!["project".to_string(), "rust_tools".to_string(), "structure".to_string()],
+            vec![
+                "project".to_string(),
+                "rust_tools".to_string(),
+                "structure".to_string(),
+            ],
             200,
         )
         .unwrap();
@@ -798,7 +949,11 @@ mod tests {
             &store,
             source,
             "- rust_tools 项目结构：更新版本",
-            vec!["project".to_string(), "rust_tools".to_string(), "structure".to_string()],
+            vec![
+                "project".to_string(),
+                "rust_tools".to_string(),
+                "structure".to_string(),
+            ],
             200,
         )
         .unwrap();
@@ -829,13 +984,21 @@ mod tests {
             eprintln!("[DIAG] Memory file not found: {}", real_path.display());
             return;
         }
-        unsafe { std::env::set_var("RUST_TOOLS_MEMORY_FILE", real_path.to_string_lossy().as_ref()); }
+        unsafe {
+            std::env::set_var(
+                "RUST_TOOLS_MEMORY_FILE",
+                real_path.to_string_lossy().as_ref(),
+            );
+        }
 
         let question = "你帮我简单总结一下rust_tools这个项目结构";
         let project_hint = "rust_tools";
         let max_chars = 2000;
 
-        eprintln!("=== DIAG: build_auto_recalled_knowledge (max_chars={}) ===", max_chars);
+        eprintln!(
+            "=== DIAG: build_auto_recalled_knowledge (max_chars={}) ===",
+            max_chars
+        );
         eprintln!("[DIAG] question   = {:?}", question);
         eprintln!("[DIAG] project_hint = {:?}", project_hint);
 
@@ -849,52 +1012,108 @@ mod tests {
             eprintln!("[DIAG] query_variant[{}] = {:?} (len={})", i, q, q.len());
             let results = store.search(q, 24).unwrap_or_default();
             eprintln!("[DIAG]   search returned {} results", results.len());
-            for (j, entry) in results.iter().enumerate() {
-                if entry.category == "tool_cache" { continue; }
+            for (j, (entry, _score)) in results.iter().enumerate() {
+                if entry.category == "tool_cache" {
+                    continue;
+                }
                 let note_str = entry.note.as_str();
                 let preview: String = if note_str.len() > 80 {
-                    let end = note_str.char_indices().find(|(i, _)| *i >= 80).map(|(i, _)| i).unwrap_or(note_str.len());
+                    let end = note_str
+                        .char_indices()
+                        .find(|(i, _)| *i >= 80)
+                        .map(|(i, _)| i)
+                        .unwrap_or(note_str.len());
                     format!("{}...", &note_str[..end])
-                } else { entry.note.clone() };
-                eprintln!("[DIAG]   [{}] cat={} pri={} src={:?} tags={:?} note={:?}", j, entry.category, entry.priority.unwrap_or(0), entry.source, entry.tags, preview);
+                } else {
+                    entry.note.clone()
+                };
+                eprintln!(
+                    "[DIAG]   [{}] cat={} pri={} src={:?} tags={:?} note={:?}",
+                    j,
+                    entry.category,
+                    entry.priority.unwrap_or(0),
+                    entry.source,
+                    entry.tags,
+                    preview
+                );
             }
         }
 
         let recent_entries = store.recent(80).unwrap_or_default();
-        let project_entries: Vec<_> = recent_entries.iter().filter(|e| e.category != "tool_cache").filter(|e| {
-            let h = project_hint.to_lowercase();
-            e.category.to_lowercase().contains(&h) || e.note.to_lowercase().contains(&h)
-            || e.source.as_deref().is_some_and(|s| s.to_lowercase().contains(&h))
-            || e.tags.iter().any(|t| t.to_lowercase().contains(&h))
-        }).collect();
-        eprintln!("[DIAG] recent(80) non-tool_cache entries mentioning '{}': {}", project_hint, project_entries.len());
+        let project_entries: Vec<_> = recent_entries
+            .iter()
+            .filter(|e| e.category != "tool_cache")
+            .filter(|e| {
+                let h = project_hint.to_lowercase();
+                e.category.to_lowercase().contains(&h)
+                    || e.note.to_lowercase().contains(&h)
+                    || e.source
+                        .as_deref()
+                        .is_some_and(|s| s.to_lowercase().contains(&h))
+                    || e.tags.iter().any(|t| t.to_lowercase().contains(&h))
+            })
+            .collect();
+        eprintln!(
+            "[DIAG] recent(80) non-tool_cache entries mentioning '{}': {}",
+            project_hint,
+            project_entries.len()
+        );
         for (i, entry) in project_entries.iter().enumerate() {
             let note_str = entry.note.as_str();
             let preview: String = if note_str.len() > 100 {
-                let end = note_str.char_indices().find(|(i, _)| *i >= 100).map(|(i, _)| i).unwrap_or(note_str.len());
+                let end = note_str
+                    .char_indices()
+                    .find(|(i, _)| *i >= 100)
+                    .map(|(i, _)| i)
+                    .unwrap_or(note_str.len());
                 format!("{}...", &note_str[..end])
-            } else { entry.note.clone() };
-            eprintln!("[DIAG]   [{}] cat={} pri={} src={:?} tags={:?} note={:?}", i, entry.category, entry.priority.unwrap_or(0), entry.source, entry.tags, preview);
+            } else {
+                entry.note.clone()
+            };
+            eprintln!(
+                "[DIAG]   [{}] cat={} pri={} src={:?} tags={:?} note={:?}",
+                i,
+                entry.category,
+                entry.priority.unwrap_or(0),
+                entry.source,
+                entry.tags,
+                preview
+            );
             eprintln!("[DIAG]       note_total_len={}", entry.note.len());
         }
 
-        let result = build_auto_recalled_knowledge_with_project(question, max_chars, Some(project_hint));
+        let result =
+            build_auto_recalled_knowledge_with_project(question, max_chars, Some(project_hint));
         match result {
-            None => { eprintln!("[DIAG] >>> RESULT: None !!!"); }
+            None => {
+                eprintln!("[DIAG] >>> RESULT: None !!!");
+            }
             Some(r) => {
                 eprintln!("[DIAG] >>> RESULT: Some {{");
                 eprintln!("[DIAG] >>>   entry_count  = {}", r.entry_count);
                 eprintln!("[DIAG] >>>   categories   = {:?}", r.categories);
-                eprintln!("[DIAG] >>>   high_confidence_project_memory = {}", r.high_confidence_project_memory);
+                eprintln!(
+                    "[DIAG] >>>   high_confidence_project_memory = {}",
+                    r.high_confidence_project_memory
+                );
                 eprintln!("[DIAG] >>>   content_len  = {} chars", r.content.len());
                 eprintln!("[DIAG] >>>   content (first 30 lines):");
-                for (i, line) in r.content.lines().take(30).enumerate() { eprintln!("[DIAG] >>>     {}: {}", i, line); }
-                if r.content.lines().count() > 30 { eprintln!("[DIAG] >>>     ... ({} total lines)", r.content.lines().count()); }
+                for (i, line) in r.content.lines().take(30).enumerate() {
+                    eprintln!("[DIAG] >>>     {}: {}", i, line);
+                }
+                if r.content.lines().count() > 30 {
+                    eprintln!(
+                        "[DIAG] >>>     ... ({} total lines)",
+                        r.content.lines().count()
+                    );
+                }
                 eprintln!("[DIAG] >>> }}");
             }
         }
 
-        unsafe { std::env::remove_var("RUST_TOOLS_MEMORY_FILE"); }
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
     }
 }
 
@@ -904,7 +1123,7 @@ pub(super) async fn maybe_critic_and_revise(
     question: &str,
     draft: &str,
 ) -> Option<(String, String)> {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
     let cfg = configw::get_all_config();
     let enabled = !cfg
         .get_opt("ai.critic_revise.enable")
@@ -944,8 +1163,19 @@ pub(super) async fn maybe_critic_and_revise(
     let critic_system = "You are a strict code assistant critic. Review the DRAFT answer for the user QUESTION.\nReturn a compact list of 3-8 actionable points focused on:\n- factual correctness and missing steps\n- tool usage and argument hygiene\n- clarity and structure of final message\nNo markdown fences. Use short bullets.";
     let critic_user = format!("QUESTION:\n{}\n\nDRAFT:\n{}", question.trim(), draft.trim());
     let critic_req = vec![
-        Message { role: "system".to_string(), content: Value::String(critic_system.to_string()), tool_calls: None, tool_call_id: None },
-        Message { role: "user".to_string(), content: build_content(model, &critic_user, &[]).unwrap_or(Value::String(critic_user.clone())), tool_calls: None, tool_call_id: None },
+        Message {
+            role: "system".to_string(),
+            content: Value::String(critic_system.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: build_content(model, &critic_user, &[])
+                .unwrap_or(Value::String(critic_user.clone())),
+            tool_calls: None,
+            tool_call_id: None,
+        },
     ];
     let critic_fut = request::do_request_messages(app, model, &critic_req, false);
     let critic_resp = match timeout(Duration::from_millis(to_ms), critic_fut).await {
@@ -973,10 +1203,26 @@ pub(super) async fn maybe_critic_and_revise(
         return None;
     }
     let revise_system = "You are a senior coding assistant. Rewrite the final answer for the QUESTION using the CRITIC points.\nRules:\n- Fix issues; add missing steps; keep answers concise and correct.\n- If code is needed, use proper markdown fences.\n- Do not mention the critic itself.";
-    let revise_user = format!("QUESTION:\n{}\n\nCRITIC:\n{}\n\nDRAFT:\n{}", question.trim(), critic.trim(), draft.trim());
+    let revise_user = format!(
+        "QUESTION:\n{}\n\nCRITIC:\n{}\n\nDRAFT:\n{}",
+        question.trim(),
+        critic.trim(),
+        draft.trim()
+    );
     let revise_req = vec![
-        Message { role: "system".to_string(), content: Value::String(revise_system.to_string()), tool_calls: None, tool_call_id: None },
-        Message { role: "user".to_string(), content: build_content(model, &revise_user, &[]).unwrap_or(Value::String(revise_user.clone())), tool_calls: None, tool_call_id: None },
+        Message {
+            role: "system".to_string(),
+            content: Value::String(revise_system.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: build_content(model, &revise_user, &[])
+                .unwrap_or(Value::String(revise_user.clone())),
+            tool_calls: None,
+            tool_call_id: None,
+        },
     ];
     let revise_fut = request::do_request_messages(app, model, &revise_req, false);
     let revised_resp = match timeout(Duration::from_millis(to_ms), revise_fut).await {
@@ -1007,11 +1253,7 @@ pub(super) async fn maybe_critic_and_revise(
     }
 }
 
-fn reflection_filtered(
-    question: &str,
-    answer: &str,
-    turn_messages: &Vec<Message>,
-) -> bool {
+fn reflection_filtered(question: &str, answer: &str, turn_messages: &Vec<Message>) -> bool {
     let cfg = configw::get_all_config();
     let enabled = !cfg
         .get_opt("ai.reflection.filter.enable")
@@ -1067,7 +1309,7 @@ async fn model_should_reflect(
     answer: &str,
     had_tool: bool,
 ) -> Option<bool> {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
     let cfg = configw::get_all_config();
     let to_ms = cfg
         .get_opt("ai.reflection.model_gate.timeout_ms")
@@ -1186,11 +1428,7 @@ async fn model_should_revise(
     draft: &str,
 ) -> Option<bool> {
     let system = "You decide if the DRAFT answer should be CRITIC→REVISE refined.\nReturn STRICT JSON ONLY: {\"revise\": true|false}.\nRules:\n- true ONLY for software engineering tasks: code writing/review/debug/refactor, tool execution results, build/test errors, patch proposals.\n- false for general knowledge, Q&A like weather/news/sports/finance, travel, generic suggestions, or casual chat.\n- false when the answer is short and already sufficient without code/steps.\nNo extra text.";
-    let user = format!(
-        "QUESTION:\n{}\n\nDRAFT:\n{}",
-        question.trim(),
-        draft.trim()
-    );
+    let user = format!("QUESTION:\n{}\n\nDRAFT:\n{}", question.trim(), draft.trim());
     let messages = vec![
         Message {
             role: "system".to_string(),
@@ -1205,7 +1443,9 @@ async fn model_should_revise(
             tool_call_id: None,
         },
     ];
-    let resp = request::do_request_messages(app, model, &messages, false).await.ok()?;
+    let resp = request::do_request_messages(app, model, &messages, false)
+        .await
+        .ok()?;
     let text = resp.text().await.ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     let content = extract_content(&v).unwrap_or_default();
@@ -1221,7 +1461,7 @@ pub(super) async fn run_critic_revise_background(
     question: String,
     draft: String,
 ) {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
     let cfg = configw::get_all_config();
     let to_ms = cfg
         .get_opt("ai.critic_revise.timeout_ms")
@@ -1254,11 +1494,18 @@ pub(super) async fn run_critic_revise_background(
         json!({"role":"system","content":system_r}),
         json!({"role":"user","content":revise_user}),
     ];
-    let resp_r = match timeout(Duration::from_millis(to_ms), background_call(&model, &messages_r)).await {
+    let resp_r = match timeout(
+        Duration::from_millis(to_ms),
+        background_call(&model, &messages_r),
+    )
+    .await
+    {
         Ok(v) => v.and_then(|vv| Some(vv)),
         Err(_) => None,
     };
-    let Some(resp_r) = resp_r else { return; };
+    let Some(resp_r) = resp_r else {
+        return;
+    };
     let content_r = extract_back_content(&resp_r).unwrap_or_default();
     if content_r.trim().is_empty() {
         return;
@@ -1266,7 +1513,11 @@ pub(super) async fn run_critic_revise_background(
     // Append as a single system record (background meta)
     let record = Message {
         role: "system".to_string(),
-        content: Value::String(format!("critic:\n{}\n\nrevised:\n{}", content_c.trim(), content_r.trim())),
+        content: Value::String(format!(
+            "critic:\n{}\n\nrevised:\n{}",
+            content_c.trim(),
+            content_r.trim()
+        )),
         tool_calls: None,
         tool_call_id: None,
     };
@@ -1297,7 +1548,9 @@ async fn background_call(model: &str, messages: &Vec<Value>) -> Option<Value> {
 }
 
 fn extract_back_content(v: &Value) -> Option<String> {
-    let choices = v.get("choices").or_else(|| v.get("output")?.get("choices"))?;
+    let choices = v
+        .get("choices")
+        .or_else(|| v.get("output")?.get("choices"))?;
     let msg = choices.get(0)?.get("message")?;
     let content = msg.get("content")?;
     match content {
@@ -1323,7 +1576,7 @@ pub(super) async fn run_self_reflection_background(
     answer: String,
     had_tool: bool,
 ) {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
     let cfg = configw::get_all_config();
     let enabled = !cfg
         .get_opt("ai.reflection.enable")
@@ -1369,11 +1622,18 @@ pub(super) async fn run_self_reflection_background(
         .get_opt("ai.reflection.timeout_ms")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(3000);
-    let resp = match timeout(Duration::from_millis(to_ms_note), background_call(&model, &messages)).await {
+    let resp = match timeout(
+        Duration::from_millis(to_ms_note),
+        background_call(&model, &messages),
+    )
+    .await
+    {
         Ok(v) => v,
         Err(_) => None,
     };
-    let Some(resp) = resp else { return; };
+    let Some(resp) = resp else {
+        return;
+    };
     let content = extract_back_content(&resp).unwrap_or_default();
     let note = content.trim();
     if note.is_empty() {
@@ -1442,7 +1702,11 @@ fn parse_project_writeback_payload(s: &str) -> Option<ProjectWritebackPayload> {
         serde_json::from_str::<Value>(&trimmed[l..=r]).ok()?
     };
 
-    if !candidate.get("writeback").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if !candidate
+        .get("writeback")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return None;
     }
     let content = candidate
@@ -1488,9 +1752,7 @@ fn find_existing_project_writeback_entry(
         .ok()
         .unwrap_or_default()
         .into_iter()
-        .find(|entry| {
-            entry.category == "project_memory" && entry.source.as_deref() == Some(source)
-        })
+        .find(|entry| entry.category == "project_memory" && entry.source.as_deref() == Some(source))
 }
 
 enum ProjectWritebackUpsert {
@@ -1543,7 +1805,7 @@ pub(super) async fn run_project_knowledge_writeback_background(
     question: String,
     answer: String,
 ) {
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
     let cfg = configw::get_all_config();
     let timeout_ms = cfg
         .get_opt("ai.project_writeback.timeout_ms")
@@ -1569,7 +1831,9 @@ pub(super) async fn run_project_knowledge_writeback_background(
         Ok(v) => v,
         Err(_) => None,
     };
-    let Some(resp) = resp else { return; };
+    let Some(resp) = resp else {
+        return;
+    };
     let content = extract_back_content(&resp).unwrap_or_default();
     let Some(payload) = parse_project_writeback_payload(&content) else {
         return;
@@ -1587,28 +1851,19 @@ pub(super) async fn run_project_knowledge_writeback_background(
             tags.push(tag);
         }
     }
-    match upsert_project_writeback_entry(
-        &store,
-        &source,
-        &payload.content,
-        tags,
-        payload.priority,
-    ) {
+    match upsert_project_writeback_entry(&store, &source, &payload.content, tags, payload.priority)
+    {
         Ok(ProjectWritebackUpsert::Saved) => {
             println!(
                 "[Memory] writeback saved project={} source={} category=project_memory priority={}",
-                project_name,
-                source,
-                payload.priority
+                project_name, source, payload.priority
             );
             store.maintain_after_append();
         }
         Ok(ProjectWritebackUpsert::Updated) => {
             println!(
                 "[Memory] writeback updated project={} source={} category=project_memory priority={}",
-                project_name,
-                source,
-                payload.priority
+                project_name, source, payload.priority
             );
             store.maintain_after_append();
         }

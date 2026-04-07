@@ -3,3 +3,4 @@ Cargo.lock
 .vscode
 /bin
 .fastembed_cache
+.DS_Store

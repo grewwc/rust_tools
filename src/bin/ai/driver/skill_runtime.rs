@@ -10,6 +10,7 @@ use rust_tools::cw::SkipMap;
 use chrono::{DateTime, Utc};
 
 use super::{DEFAULT_MAX_ITERATIONS, OPENCLAW_MAX_ITERATIONS, match_skill};
+use super::intent_recognition::{self, UserIntent};
 
 type ToolDef = ToolDefinition;
 
@@ -240,6 +241,8 @@ pub(super) async fn prepare_skill_for_turn(
         .trim()
         .eq_ignore_ascii_case("false");
 
+    let intent = intent_recognition::detect_intent_fallback(question);
+
     let router_selected = if router_enabled {
         let model = app.current_model.clone();
         request::select_skill_via_model(app, &model, question, skill_manifests).await
@@ -247,33 +250,13 @@ pub(super) async fn prepare_skill_for_turn(
         None
     };
 
-    let heuristic_skill = match_skill(skill_manifests, question, None);
+    let heuristic_skill = match_skill(skill_manifests, question, Some(&intent));
     let router_skill = router_selected
         .as_deref()
         .and_then(|name| skill_manifests.iter().find(|s| s.name == name));
-    let penalty_enabled = cfg
-        .get_opt("ai.skills.penalty.enable")
-        .unwrap_or_default()
-        .trim()
-        .eq_ignore_ascii_case("true");
-    let mut skill = if penalty_enabled {
-        match (router_skill, heuristic_skill) {
-            (Some(r), Some(h)) => {
-                let pr = super::tools::penalty_for_skill_tools(r);
-                let ph = super::tools::penalty_for_skill_tools(h);
-                if ph + 1e-6 < pr {
-                    Some(h)
-                } else {
-                    Some(r)
-                }
-            }
-            (Some(r), None) => Some(r),
-            (None, Some(h)) => Some(h),
-            (None, None) => None,
-        }
-    } else {
-        router_skill.or(heuristic_skill)
-    };
+
+    let skill = resolve_skill_selection(router_skill, heuristic_skill, &intent);
+
     if debug {
         if let Some(name) = router_selected.as_deref() {
             eprintln!("[skills] router selected: {}", name);
@@ -281,13 +264,14 @@ pub(super) async fn prepare_skill_for_turn(
         if let Some(s) = heuristic_skill.as_ref() {
             eprintln!("[skills] heuristic candidate: {}", s.name);
         }
+        eprintln!("[skills] intent: {:?}", intent.core);
         if let Some(s) = skill.as_ref() {
             eprintln!("[skills] final: {}", s.name);
         } else {
             eprintln!("[skills] final: <none>");
         }
     }
-    let matched_skill_name = skill.map(|s| s.name.clone());
+    let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
     let prompt_optimizer_active = skill
         .as_ref()
         .is_some_and(|s| s.name.as_str() == "prompt-optimizer");
@@ -307,6 +291,39 @@ pub(super) async fn prepare_skill_for_turn(
         matched_skill_name,
     };
     guard
+}
+
+fn resolve_skill_selection<'a>(
+    router_skill: Option<&'a SkillManifest>,
+    heuristic_skill: Option<&'a SkillManifest>,
+    intent: &UserIntent,
+) -> Option<&'a SkillManifest> {
+    match (router_skill, heuristic_skill) {
+        (Some(r), Some(h)) => {
+            if r.name == h.name {
+                return Some(r);
+            }
+            if intent.is_searching_resource("skill") {
+                return None;
+            }
+            let pr = super::tools::penalty_for_skill_tools(r);
+            let ph = super::tools::penalty_for_skill_tools(h);
+            if ph + 1e-6 < pr {
+                Some(h)
+            } else {
+                Some(r)
+            }
+        }
+        (Some(r), None) => {
+            if intent.is_searching_resource("skill") {
+                None
+            } else {
+                Some(r)
+            }
+        }
+        (None, Some(h)) => Some(h),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]
