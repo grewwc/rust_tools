@@ -3,12 +3,16 @@
 /// 包含两个工具：
 /// - `knowledge_semantic_search` — 语义相似度搜索（向量检索）
 /// - `knowledge_rebuild_index` — 重建向量索引（从 memory_store 同步）
-
 use serde_json::Value;
 
+use crate::ai::knowledge::config::KnowledgeConfig;
+use crate::ai::knowledge::retrieval::semantic_search;
+use crate::ai::knowledge::storage::jsonl_store::JsonlStore;
+use crate::ai::knowledge::sync::knowledge_sync;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
-use crate::ai::tools::storage::rag_store::{ensure_rag_store, get_rag_store, RagStore};
+use crate::ai::tools::storage::memory_store::MemoryStore;
+use crate::ai::tools::storage::rag_store::{ensure_rag_store, get_rag_store};
 
 // ─── knowledge_semantic_search ───────────────────────────────────────────────
 
@@ -42,22 +46,57 @@ fn execute_semantic_search(args: &Value) -> Result<String, String> {
     let guard = get_rag_store()?;
     let store = guard.as_ref().ok_or("RAG store not initialized")?;
 
-    let query = args["query"].as_str()
+    let query = args["query"]
+        .as_str()
         .ok_or("Missing 'query'. Provide a semantic search query.")?;
     let category = args["category"].as_str();
     let limit = args["limit"].as_u64().map(|v| v as usize).unwrap_or(5);
     let use_hybrid = args["hybrid"].as_bool().unwrap_or(true);
 
     if use_hybrid {
-        // 混合搜索：需要先获取 BM25 结果
-        let bm25_results = hybrid_bm25_fallback(store, query, category)?;
-        let results = store.hybrid_search(query, bm25_results, limit, category, 0.4)?;
+        // Hybrid search: combine BM25 with vector
+        let mem_store = MemoryStore::from_env_or_config();
+        let jsonl_store = JsonlStore::new(mem_store.path().to_path_buf());
+        let config = KnowledgeConfig::default();
+
+        let bm25_results = crate::ai::knowledge::retrieval::keyword_search::keyword_search(
+            &jsonl_store,
+            query,
+            limit * 3,
+            &config,
+        )?;
+
+        let bm25_for_hybrid: Vec<(String, f32)> = bm25_results
+            .iter()
+            .filter_map(|(entry, score)| entry.id.as_ref().map(|id| (id.clone(), *score as f32)))
+            .collect();
+
+        let results = store.hybrid_search(
+            query,
+            bm25_for_hybrid,
+            limit,
+            category,
+            config.hybrid_vector_weight,
+        )?;
+
+        let bm25_for_hybrid: Vec<(String, f32)> = bm25_results
+            .iter()
+            .filter_map(|(entry, score)| entry.id.as_ref().map(|id| (id.clone(), *score as f32)))
+            .collect();
+
+        let results = store.hybrid_search(
+            query,
+            bm25_for_hybrid,
+            limit,
+            category,
+            config.hybrid_vector_weight,
+        )?;
 
         if results.is_empty() {
-            return Ok(format!("🔍 No results found for: '{}'", query));
+            return Ok(format!("No results found for: '{}'", query));
         }
 
-        let mut output = format!("🧠 Semantic search results for '{}':\n\n", query);
+        let mut output = format!("Semantic search results for '{}':\n\n", query);
         for (idx, (_id, entry, score)) in results.iter().enumerate() {
             output.push_str(&format!(
                 "{}. [score: {:.3}] [{}] {}\n",
@@ -73,14 +112,14 @@ fn execute_semantic_search(args: &Value) -> Result<String, String> {
         }
         Ok(output)
     } else {
-        // 纯语义搜索
+        // Pure semantic search
         let results = store.semantic_search(query, limit, category)?;
 
         if results.is_empty() {
-            return Ok(format!("🔍 No results found for: '{}'", query));
+            return Ok(format!("No results found for: '{}'", query));
         }
 
-        let mut output = format!("🧠 Semantic search results for '{}':\n\n", query);
+        let mut output = format!("Semantic search results for '{}':\n\n", query);
         for (idx, (entry, score)) in results.iter().enumerate() {
             output.push_str(&format!(
                 "{}. [score: {:.3}] [{}] {}\n",
@@ -96,33 +135,6 @@ fn execute_semantic_search(args: &Value) -> Result<String, String> {
         }
         Ok(output)
     }
-}
-
-/// BM25 回退 — 用 memory_store 的 BM25 搜索结果作为 hybrid 输入
-fn hybrid_bm25_fallback(
-    store: &RagStore,
-    query: &str,
-    _category: Option<&str>,
-) -> Result<Vec<(String, f32)>, String> {
-    use crate::ai::tools::storage::memory_store::MemoryStore;
-
-    let mem_store = MemoryStore::from_env_or_config();
-    let mem_results = mem_store.search(query, 20)?;
-
-    let mut results = Vec::new();
-    for (rank, (entry, _score)) in mem_results.into_iter().enumerate() {
-        let id = entry.id.clone().unwrap_or_else(|| {
-            format!("{:x}", md5::compute(&entry.note))
-        });
-
-        // 检查向量索引中是否存在该条目
-        if store.get_entry(&id)?.is_some() {
-            // 用排名位置做粗略分数（排名越前分数越高）
-            let pseudo_score = (1.0 - (rank as f32 * 0.05)).max(0.1);
-            results.push((id, pseudo_score));
-        }
-    }
-    Ok(results)
 }
 
 inventory::submit!(ToolRegistration {
@@ -149,8 +161,11 @@ fn execute_rebuild_index(_args: &Value) -> Result<String, String> {
     let guard = get_rag_store()?;
     let store = guard.as_ref().ok_or("RAG store not initialized")?;
 
-    let count = store.rebuild_from_memory()?;
-    Ok(format!("✅ Rebuilt RAG index: {} entries vectorized.", count))
+    let mem_store = MemoryStore::from_env_or_config();
+    let jsonl_store = JsonlStore::new(mem_store.path().to_path_buf());
+    let count = knowledge_sync::rebuild_vector_index(&jsonl_store, store)?;
+
+    Ok(format!("Rebuilt RAG index: {} entries vectorized.", count))
 }
 
 inventory::submit!(ToolRegistration {
@@ -170,13 +185,19 @@ mod tests {
     #[test]
     fn test_semantic_search_params() {
         let params = params_semantic_search();
-        assert!(params["required"].as_array().unwrap().contains(&Value::String("query".to_string())));
+        assert!(params["required"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("query".to_string())));
     }
 
     #[test]
     fn test_rebuild_index_params() {
         let params = params_rebuild_index();
-        // 无必需参数
-        assert!(params["required"].as_array().map(|a| a.is_empty()).unwrap_or(true));
+        // No required parameters
+        assert!(params["required"]
+            .as_array()
+            .map(|a| a.is_empty())
+            .unwrap_or(true));
     }
 }

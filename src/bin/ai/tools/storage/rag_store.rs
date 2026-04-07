@@ -3,12 +3,11 @@
 /// 使用 fastembed 生成本地 embedding（all-MiniLM-L6-v2, 384维），
 /// 使用 sled 持久化存储向量索引。
 /// 支持余弦相似度检索和混合 BM25 + 向量检索。
-
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use dirs;
-use fastembed::{TextEmbedding, InitOptions};
+use fastembed::{InitOptions, TextEmbedding};
 use serde::{Deserialize, Serialize};
 
 use crate::ai::tools::storage::memory_store::MemoryStore;
@@ -47,29 +46,36 @@ impl LazyEmbedder {
     fn get(&self) -> Result<&TextEmbedding, String> {
         // 先尝试快速读取（不加锁的情况下检查）
         {
-            let guard = self.inner.lock().map_err(|e| format!("Lock poisoned: {}", e))?;
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|e| format!("Lock poisoned: {}", e))?;
             if let Some(ref embedder) = *guard {
                 // Safety: embedder 存在且生命周期与 self 绑定
-                return Ok(unsafe { std::mem::transmute::<&TextEmbedding, &TextEmbedding>(embedder) });
+                return Ok(unsafe {
+                    std::mem::transmute::<&TextEmbedding, &TextEmbedding>(embedder)
+                });
             }
         }
-        
+
         // 需要初始化
-        let mut guard = self.inner.lock().map_err(|e| format!("Lock poisoned: {}", e))?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
         if guard.is_none() {
-            let embedder = TextEmbedding::try_new(
-                {
+            let embedder = TextEmbedding::try_new({
                 let cache_dir = dirs::cache_dir()
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
                     .join("fastembed_cache");
                 InitOptions::default()
                     .with_cache_dir(cache_dir)
                     .with_show_download_progress(true)
-            },
-            ).map_err(|e| format!("Failed to load embedding model: {}", e))?;
+            })
+            .map_err(|e| format!("Failed to load embedding model: {}", e))?;
             *guard = Some(embedder);
         }
-        
+
         // Safety: 我们已经确保 Some 存在
         let embedder = guard.as_ref().unwrap();
         Ok(unsafe { std::mem::transmute::<&TextEmbedding, &TextEmbedding>(embedder) })
@@ -86,8 +92,7 @@ pub struct RagStore {
 impl RagStore {
     /// 从默认路径创建 RAG Store
     pub fn new() -> Result<Self, String> {
-        let base = dirs::config_dir()
-            .ok_or("Cannot determine config directory")?;
+        let base = dirs::config_dir().ok_or("Cannot determine config directory")?;
         let index_path = base.join("rust_tools/rag_index");
         Self::with_path(&index_path)
     }
@@ -96,7 +101,7 @@ impl RagStore {
     pub fn with_path(path: &Path) -> Result<Self, String> {
         let db = sled::open(path)
             .map_err(|e| format!("Failed to open RAG index at {:?}: {}", path, e))?;
-        
+
         Ok(Self {
             db,
             embedder: LazyEmbedder::new(),
@@ -110,10 +115,13 @@ impl RagStore {
 
     pub fn embed_text(&self, text: &str) -> Result<Vec<f32>, String> {
         let embedder = self.embedder()?;
-        let embeddings = embedder.embed(vec![text], None)
+        let embeddings = embedder
+            .embed(vec![text], None)
             .map_err(|e| format!("Failed to embed text: {}", e))?;
-        
-        embeddings.into_iter().next()
+
+        embeddings
+            .into_iter()
+            .next()
             .ok_or_else(|| "No embedding generated".to_string())
     }
 
@@ -122,7 +130,8 @@ impl RagStore {
             return Ok(Vec::new());
         }
         let embedder = self.embedder()?;
-        embedder.embed(texts.to_vec(), None)
+        embedder
+            .embed(texts.to_vec(), None)
             .map_err(|e| format!("Failed to embed texts: {}", e))
     }
 
@@ -130,29 +139,40 @@ impl RagStore {
         let key = format!("vec:{}", entry.id);
         let value = serde_json::to_vec(&entry)
             .map_err(|e| format!("Failed to serialize RagEntry: {}", e))?;
-        
-        self.db.insert(key.as_bytes(), value)
+
+        self.db
+            .insert(key.as_bytes(), value)
             .map_err(|e| format!("Failed to write to sled: {}", e))?;
-        self.db.flush()
+        self.db
+            .flush()
             .map_err(|e| format!("Failed to flush sled: {}", e))?;
         Ok(())
     }
 
     pub fn delete(&self, id: &str) -> Result<bool, String> {
         let key = format!("vec:{}", id);
-        let existed = self.db.contains_key(key.as_bytes())
+        let existed = self
+            .db
+            .contains_key(key.as_bytes())
             .map_err(|e| format!("Failed to check key: {}", e))?;
         if existed {
-            self.db.remove(key.as_bytes())
+            self.db
+                .remove(key.as_bytes())
                 .map_err(|e| format!("Failed to delete: {}", e))?;
-            self.db.flush()
+            self.db
+                .flush()
                 .map_err(|e| format!("Failed to flush: {}", e))?;
         }
         Ok(existed)
     }
 
     /// 语义搜索 — 余弦相似度 top-k
-    pub fn semantic_search(&self, query: &str, limit: usize, category: Option<&str>) -> Result<Vec<(RagEntry, f32)>, String> {
+    pub fn semantic_search(
+        &self,
+        query: &str,
+        limit: usize,
+        category: Option<&str>,
+    ) -> Result<Vec<(RagEntry, f32)>, String> {
         // Lazy rebuild check: if index is empty, try to rebuild
         if self.count()? == 0 {
             let rebuilt = self.rebuild_from_memory()?;
@@ -160,27 +180,31 @@ impl RagStore {
                 eprintln!("[RAG lazy rebuild triggered: {} entries", rebuilt);
             }
         }
-        
+
         let query_embedding = self.embed_text(query)?;
-        
+
         let mut candidates = Vec::new();
         for result in self.db.iter() {
-            let (key_bytes, val_bytes) = result
-                .map_err(|e| format!("Failed to iterate sled: {}", e))?;
+            let (key_bytes, val_bytes) =
+                result.map_err(|e| format!("Failed to iterate sled: {}", e))?;
             let key = String::from_utf8_lossy(&key_bytes);
-            if !key.starts_with("vec:") { continue; }
-            
+            if !key.starts_with("vec:") {
+                continue;
+            }
+
             let entry: RagEntry = serde_json::from_slice(&val_bytes)
                 .map_err(|e| format!("Failed to deserialize RagEntry: {}", e))?;
-            
+
             if let Some(cat) = category {
-                if entry.category != cat { continue; }
+                if entry.category != cat {
+                    continue;
+                }
             }
-            
+
             let similarity = cosine_similarity(&query_embedding, &entry.embedding);
             candidates.push((entry, similarity));
         }
-        
+
         candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         candidates.truncate(limit);
         Ok(candidates)
@@ -200,20 +224,21 @@ impl RagStore {
             .into_iter()
             .map(|(entry, score)| (entry.id.clone(), score))
             .collect();
-        
+
         let bm25_max = bm25_results.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
         let bm25_normalized: std::collections::HashMap<String, f32> = if bm25_max > 0.0 {
-            bm25_results.into_iter()
+            bm25_results
+                .into_iter()
                 .map(|(id, score)| (id, score / bm25_max))
                 .collect()
         } else {
             std::collections::HashMap::new()
         };
-        
+
         let mut all_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         all_ids.extend(bm25_normalized.keys().cloned());
         all_ids.extend(semantic_scores.keys().cloned());
-        
+
         let mut combined: Vec<(String, f32)> = Vec::new();
         for id in all_ids {
             let bm25 = bm25_normalized.get(&id).copied().unwrap_or(0.0);
@@ -221,15 +246,17 @@ impl RagStore {
             let final_score = (1.0 - vector_weight) * bm25 + vector_weight * semantic;
             combined.push((id, final_score));
         }
-        
+
         combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         combined.truncate(limit);
-        
+
         let mut results = Vec::new();
         for (id, score) in combined {
             let key = format!("vec:{}", id);
-            if let Some(val_bytes) = self.db.get(key.as_bytes())
-                .map_err(|e| format!("Failed to get key: {}", e))? 
+            if let Some(val_bytes) = self
+                .db
+                .get(key.as_bytes())
+                .map_err(|e| format!("Failed to get key: {}", e))?
             {
                 let entry: RagEntry = serde_json::from_slice(&val_bytes)
                     .map_err(|e| format!("Failed to deserialize: {}", e))?;
@@ -242,10 +269,11 @@ impl RagStore {
     pub fn count(&self) -> Result<usize, String> {
         let mut count = 0;
         for result in self.db.iter() {
-            let (key_bytes, _) = result
-                .map_err(|e| format!("Failed to iterate: {}", e))?;
+            let (key_bytes, _) = result.map_err(|e| format!("Failed to iterate: {}", e))?;
             let key = String::from_utf8_lossy(&key_bytes);
-            if key.starts_with("vec:") { count += 1; }
+            if key.starts_with("vec:") {
+                count += 1;
+            }
         }
         Ok(count)
     }
@@ -253,8 +281,7 @@ impl RagStore {
     pub fn list_ids(&self) -> Result<Vec<String>, String> {
         let mut ids = Vec::new();
         for result in self.db.iter() {
-            let (key_bytes, _) = result
-                .map_err(|e| format!("Failed to iterate: {}", e))?;
+            let (key_bytes, _) = result.map_err(|e| format!("Failed to iterate: {}", e))?;
             let key = String::from_utf8_lossy(&key_bytes);
             if key.starts_with("vec:") {
                 ids.push(key.trim_start_matches("vec:").to_string());
@@ -265,8 +292,10 @@ impl RagStore {
 
     pub fn get_entry(&self, id: &str) -> Result<Option<RagEntry>, String> {
         let key = format!("vec:{}", id);
-        if let Some(val_bytes) = self.db.get(key.as_bytes())
-            .map_err(|e| format!("Failed to get: {}", e))? 
+        if let Some(val_bytes) = self
+            .db
+            .get(key.as_bytes())
+            .map_err(|e| format!("Failed to get: {}", e))?
         {
             let entry: RagEntry = serde_json::from_slice(&val_bytes)
                 .map_err(|e| format!("Failed to deserialize: {}", e))?;
@@ -280,25 +309,29 @@ impl RagStore {
     pub fn rebuild_from_memory(&self) -> Result<usize, String> {
         let store = MemoryStore::from_env_or_config();
         let entries = store.all()?;
-        
-        let texts: Vec<String> = entries.iter().map(|e| {
-            let mut text = format!("{}: {}", e.category, e.note);
-            if !e.tags.is_empty() {
-                text.push_str(&format!(" [tags: {}]", e.tags.join(", ")));
-            }
-            if let Some(src) = &e.source {
-                text.push_str(&format!(" (source: {})", src));
-            }
-            text
-        }).collect();
-        
+
+        let texts: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                let mut text = format!("{}: {}", e.category, e.note);
+                if !e.tags.is_empty() {
+                    text.push_str(&format!(" [tags: {}]", e.tags.join(", ")));
+                }
+                if let Some(src) = &e.source {
+                    text.push_str(&format!(" (source: {})", src));
+                }
+                text
+            })
+            .collect();
+
         let embeddings = self.embed_texts(&texts)?;
-        
+
         let mut count = 0;
         for (entry, embedding) in entries.into_iter().zip(embeddings.into_iter()) {
-            let id = entry.id.clone().unwrap_or_else(|| {
-                format!("{:x}", md5::compute(&entry.note))
-            });
+            let id = entry
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("{:x}", md5::compute(&entry.note)));
             let content = format!("{}: {}", entry.category, entry.note);
             self.upsert(RagEntry {
                 id,
@@ -318,12 +351,45 @@ impl RagStore {
     }
 }
 
+/// Implement the VectorStoreSync trait for compatibility with the new knowledge sync module.
+impl crate::ai::knowledge::sync::knowledge_sync::VectorStoreSync for RagStore {
+    fn upsert_entry(
+        &self,
+        id: String,
+        content: String,
+        category: String,
+        tags: Vec<String>,
+        embedding: Vec<f32>,
+    ) -> Result<(), String> {
+        self.upsert(RagEntry {
+            id,
+            content,
+            category,
+            tags,
+            embedding,
+            timestamp: 0,
+        })
+    }
+
+    fn delete_entry(&self, id: &str) -> Result<bool, String> {
+        self.delete(id)
+    }
+
+    fn embed_text(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.embed_text(text)
+    }
+}
+
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() { return 0.0; }
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a < 1e-8 || norm_b < 1e-8 { return 0.0; }
+    if norm_a < 1e-8 || norm_b < 1e-8 {
+        return 0.0;
+    }
     dot / (norm_a * norm_b)
 }
 
@@ -346,22 +412,24 @@ pub fn ensure_rag_store() -> Result<(), String> {
     let mut guard = get_rag_store()?;
     if guard.is_none() {
         let store = RagStore::new()?;
-        
+
         // Lazy rebuild: 如果 RAG 索引为空但 memory_store 有数据，自动同步
         let index_count = store.count()?;
         if index_count == 0 {
             if let Ok(rebuilt) = store.rebuild_from_memory() {
                 if rebuilt > 0 {
-                    eprintln!("[RAG index auto-rebuilt: {} entries from memory store", rebuilt);
+                    eprintln!(
+                        "[RAG index auto-rebuilt: {} entries from memory store",
+                        rebuilt
+                    );
                 }
             }
         }
-        
+
         *guard = Some(store);
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -393,7 +461,14 @@ mod tests {
         assert_eq!(cosine_similarity(&[], &[]), 0.0);
     }
 
-    fn make_entry(id: &str, content: &str, category: &str, tags: Vec<&str>, ts: u64, store: &RagStore) -> RagEntry {
+    fn make_entry(
+        id: &str,
+        content: &str,
+        category: &str,
+        tags: Vec<&str>,
+        ts: u64,
+        store: &RagStore,
+    ) -> RagEntry {
         let emb = store.embed_text(content).unwrap();
         RagEntry {
             id: id.to_string(),
@@ -413,34 +488,54 @@ mod tests {
         let _ = std::fs::create_dir_all(&tmp);
 
         let store = RagStore::with_path(&tmp).unwrap();
-        
+
         // 插入条目
-        let e1 = make_entry("ci_cd_1", "CI/CD 使用 Jenkins 自动化部署", "deploy", vec!["ci", "jenkins"], 1000, &store);
+        let e1 = make_entry(
+            "ci_cd_1",
+            "CI/CD 使用 Jenkins 自动化部署",
+            "deploy",
+            vec!["ci", "jenkins"],
+            1000,
+            &store,
+        );
         store.upsert(e1).unwrap();
 
-        let e2 = make_entry("review_1", "代码审查必须通过两个 reviewer 批准", "process", vec!["review"], 2000, &store);
+        let e2 = make_entry(
+            "review_1",
+            "代码审查必须通过两个 reviewer 批准",
+            "process",
+            vec!["review"],
+            2000,
+            &store,
+        );
         store.upsert(e2).unwrap();
 
         assert_eq!(store.count().unwrap(), 2);
 
         // 语义搜索：英文搜中文内容
-        let results = store.semantic_search("how do we deploy code?", 5, None).unwrap();
+        let results = store
+            .semantic_search("how do we deploy code?", 5, None)
+            .unwrap();
         assert!(!results.is_empty(), "semantic search should find results");
         assert_eq!(results[0].0.id, "ci_cd_1");
         assert!(results[0].1 > 0.0);
 
         // 按 category 过滤
-        let filtered = store.semantic_search("code review", 5, Some("process")).unwrap();
+        let filtered = store
+            .semantic_search("code review", 5, Some("process"))
+            .unwrap();
         assert!(!filtered.is_empty());
         assert_eq!(filtered[0].0.id, "review_1");
 
-        let no_results = store.semantic_search("code review", 5, Some("nonexistent")).unwrap();
+        let no_results = store
+            .semantic_search("code review", 5, Some("nonexistent"))
+            .unwrap();
         assert!(no_results.is_empty());
 
         // 删除
         store.delete("ci_cd_1").unwrap();
         assert_eq!(store.count().unwrap(), 1);
-        
+
         let after_delete = store.semantic_search("deploy", 5, None).unwrap();
         assert!(after_delete.is_empty() || after_delete.iter().all(|(e, _)| e.id != "ci_cd_1"));
 
@@ -477,31 +572,41 @@ mod tests {
 
         let store = RagStore::with_path(&tmp).unwrap();
 
-        let texts: Vec<String> = vec!["Jenkins CI/CD 自动化部署流程".into(), "单元测试使用 cargo test".into(), "代码风格使用 rustfmt 格式化".into()];
+        let texts: Vec<String> = vec![
+            "Jenkins CI/CD 自动化部署流程".into(),
+            "单元测试使用 cargo test".into(),
+            "代码风格使用 rustfmt 格式化".into(),
+        ];
         let embeddings = store.embed_texts(&texts).unwrap();
 
         for (i, text) in texts.iter().enumerate() {
-            store.upsert(RagEntry {
-                id: format!("entry_{}", i),
-                content: text.to_string(),
-                category: "misc".to_string(),
-                tags: vec![],
-                embedding: embeddings[i].clone(),
-                timestamp: i as u64,
-            }).unwrap();
+            store
+                .upsert(RagEntry {
+                    id: format!("entry_{}", i),
+                    content: text.to_string(),
+                    category: "misc".to_string(),
+                    tags: vec![],
+                    embedding: embeddings[i].clone(),
+                    timestamp: i as u64,
+                })
+                .unwrap();
         }
 
         // hybrid_search 需要 BM25 results 作为输入
-        let bm25_results: Vec<(String, f32)> = vec![
-            ("entry_0".to_string(), 0.8),
-            ("entry_1".to_string(), 0.3),
-        ];
-        let results = store.hybrid_search("部署", bm25_results, 5, None, 0.4).unwrap();
+        let bm25_results: Vec<(String, f32)> =
+            vec![("entry_0".to_string(), 0.8), ("entry_1".to_string(), 0.3)];
+        let results = store
+            .hybrid_search("部署", bm25_results, 5, None, 0.4)
+            .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].1.id, "entry_0");
-        
+
         for (_, _, score) in &results {
-            assert!(*score >= 0.0 && *score <= 1.0, "score {} out of range", score);
+            assert!(
+                *score >= 0.0 && *score <= 1.0,
+                "score {} out of range",
+                score
+            );
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -518,18 +623,24 @@ mod tests {
         assert_eq!(store.count().unwrap(), 0);
 
         // 模拟 rebuild：手动插入类似 memory_store 的条目
-        let texts: Vec<String> = vec!["test: 第一条测试知识".into(), "test: 第二条测试知识".into(), "deploy: 部署用 Jenkins".into()];
+        let texts: Vec<String> = vec![
+            "test: 第一条测试知识".into(),
+            "test: 第二条测试知识".into(),
+            "deploy: 部署用 Jenkins".into(),
+        ];
         let embeddings = store.embed_texts(&texts).unwrap();
 
         for (i, text) in texts.iter().enumerate() {
-            store.upsert(RagEntry {
-                id: format!("mem_entry_{}", i),
-                content: text.to_string(),
-                category: "test".to_string(),
-                tags: vec![],
-                embedding: embeddings[i].clone(),
-                timestamp: (i as u64) * 1000,
-            }).unwrap();
+            store
+                .upsert(RagEntry {
+                    id: format!("mem_entry_{}", i),
+                    content: text.to_string(),
+                    category: "test".to_string(),
+                    tags: vec![],
+                    embedding: embeddings[i].clone(),
+                    timestamp: (i as u64) * 1000,
+                })
+                .unwrap();
         }
 
         assert_eq!(store.count().unwrap(), 3);
@@ -551,7 +662,14 @@ mod tests {
         // 写入
         {
             let store = RagStore::with_path(&tmp).unwrap();
-            let e = make_entry("persist_1", "this should survive restart", "persist", vec![], 999, &store);
+            let e = make_entry(
+                "persist_1",
+                "this should survive restart",
+                "persist",
+                vec![],
+                999,
+                &store,
+            );
             store.upsert(e).unwrap();
         }
 
@@ -562,7 +680,7 @@ mod tests {
             let found = store.get_entry("persist_1").unwrap();
             assert!(found.is_some());
             assert_eq!(found.unwrap().content, "this should survive restart");
-            
+
             let results = store.semantic_search("persistent", 5, None).unwrap();
             assert!(!results.is_empty());
         }
@@ -573,12 +691,12 @@ mod tests {
     #[test]
     fn test_memory_store_delete_by_id() {
         use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
-        
+
         let tmp = std::env::temp_dir().join(format!("mem_del_{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&tmp).ok();
 
         let store = MemoryStore::for_tests_with_path(tmp.clone());
-        
+
         let entry = AgentMemoryEntry {
             id: Some("del_test_1".to_string()),
             category: "test".to_string(),

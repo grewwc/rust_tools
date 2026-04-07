@@ -74,14 +74,11 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
     let source = args["source"].as_str().map(String::from);
     let priority = args["priority"].as_u64().map(|p| p as u8).unwrap_or(150);
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("Clock error: {e}"))?
-        .as_millis();
+    let now = chrono::Local::now().to_rfc3339();
 
     let entry = AgentMemoryEntry {
         id: None,
-        timestamp: now.to_string(),
+        timestamp: now,
         category: category.to_string(),
         note: content.to_string(),
         tags,
@@ -92,7 +89,7 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
     let store = MemoryStore::from_env_or_config();
     store.append(&entry)?;
 
-    // ─── 自动同步到 RAG 向量索引 ───
+    // Sync to RAG vector index
     if let Ok(_) = ensure_rag_store() {
         if let Ok(guard) = get_rag_store() {
             if let Some(rag) = guard.as_ref() {
@@ -117,7 +114,7 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
         }
     }
 
-    let mut result = format!("✅ Saved to knowledge [{}]:\n  {}\n", category, content);
+    let mut result = format!("Saved to knowledge [{}]:\n  {}\n", category, content);
     if !entry.tags.is_empty() {
         result.push_str(&format!("  Tags: {}\n", entry.tags.join(", ")));
     }
@@ -162,7 +159,7 @@ fn execute_knowledge_forget(args: &Value) -> Result<String, String> {
 
     let store = MemoryStore::from_env_or_config();
 
-    // 从 memory_store 删除
+    // Delete from memory_store
     let deleted = store
         .delete_by_id(id)
         .map_err(|e| format!("Failed to delete memory entry: {e}"))?
@@ -179,11 +176,11 @@ fn execute_knowledge_forget(args: &Value) -> Result<String, String> {
     } else {
         deleted.note.clone()
     };
-    // ─── 同步从 RAG 向量索引删除 ───
+
+    // Sync delete from RAG vector index
     if let Ok(_) = ensure_rag_store() {
         if let Ok(guard) = get_rag_store() {
             if let Some(rag) = guard.as_ref() {
-                // 用与 save 相同的算法计算 RAG id
                 let rag_id = format!(
                     "{:x}",
                     md5::compute(&format!("{}:{}", deleted.timestamp, deleted.note))
@@ -194,7 +191,7 @@ fn execute_knowledge_forget(args: &Value) -> Result<String, String> {
     }
 
     Ok(format!(
-        "🗑️ Forgotten knowledge entry:\n  id: {}\n  category: {}\n  content: {}\n  (Also removed from RAG vector index)",
+        "Forgotten knowledge entry:\n  id: {}\n  category: {}\n  content: {}\n  (Also removed from RAG vector index)",
         id, deleted.category, preview
     ))
 }
