@@ -1,5 +1,38 @@
 use crate::ai::agents::{self, AgentManifest};
 
+/// 统一的交互式命令帮助信息
+pub fn print_interactive_help() {
+    println!("Interactive commands:");
+    println!();
+    println!("  General:");
+    println!("    /help, /h                 show this help message");
+    println!("    /feishu-auth              authenticate with Feishu");
+    println!("    /share [output.md]        export current session as shareable markdown");
+    println!();
+    println!("  Agent management:");
+    println!("    /agents                   list available agents");
+    println!("    /agents list              list available agents");
+    println!("    /agents current           show current agent");
+    println!("    /agents use <name>        switch to an agent");
+    println!();
+    println!("  Session management:");
+    println!("    /sessions                 list all sessions");
+    println!("    /sessions list            list all sessions");
+    println!("    /sessions current         show current session info");
+    println!("    /sessions new             create and switch to new session");
+    println!("    /sessions use <id>        switch to specified session");
+    println!("    /sessions delete <id>     delete specified session");
+    println!("    /sessions clear-all       delete all sessions");
+    println!("    /sessions export <id> [output.md]       export session to Markdown");
+    println!("    /sessions export-current [output.md]    export current session to Markdown");
+    println!("    /sessions export-last [output.md]       export latest session to Markdown");
+    println!();
+    println!("  Notes:");
+    println!("    - Commands support both / and : prefix (e.g., /help or :help)");
+    println!("    - Press Ctrl+C to interrupt streaming or exit");
+    println!();
+}
+
 pub fn try_handle_help_command(input: &str) -> bool {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -15,24 +48,7 @@ pub fn try_handle_help_command(input: &str) -> bool {
     if normalized != "help" && normalized != "h" {
         return false;
     }
-    println!("interactive commands:");
-    println!("  /help");
-    println!("  /feishu-auth");
-    println!("  /agents                     list available agents");
-    println!("  /agents use <name>          switch to an agent");
-    println!("  /agents current             show current agent");
-    println!("  /sessions");
-    println!("  /sessions export <id> [output.md]");
-    println!("  /sessions export-current [output.md]");
-    println!("  /sessions export-last [output.md]");
-    println!("  /sessions list");
-    println!("  /sessions current");
-    println!("  /sessions new");
-    println!("  /sessions use <id>");
-    println!("  /sessions delete <id>");
-    println!("  /sessions clear-all");
-    println!("  /share [output.md]              export current session as shareable markdown");
-    println!();
+    print_interactive_help();
     true
 }
 

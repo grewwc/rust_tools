@@ -30,19 +30,21 @@ pub fn try_handle_session_command(
 
     match action {
         "help" | "h" => {
-            println!("sessions commands:");
-            println!("  /sessions");
-            println!("  /sessions list");
-            println!("  /sessions current");
-            println!("  /sessions new");
-            println!("  /sessions use <id>");
-            println!("  /sessions delete <id>");
-            println!("  /sessions clear-all");
-            println!("  /sessions export <id> [output.md]");
-            println!("  /sessions export-current [output.md]");
-            println!("  /sessions export-last [output.md]");
+            println!("Session management commands:");
+            println!();
+            println!("  /sessions                 list all sessions");
+            println!("  /sessions list            list all sessions");
+            println!("  /sessions current         show current session info");
+            println!("  /sessions new             create and switch to new session");
+            println!("  /sessions use <id>        switch to specified session");
+            println!("  /sessions delete <id>     delete specified session");
+            println!("  /sessions clear-all       delete all sessions");
+            println!("  /sessions export <id> [output.md]       export session to Markdown");
+            println!("  /sessions export-current [output.md]    export current session to Markdown");
+            println!("  /sessions export-last [output.md]       export latest session to Markdown");
+            println!();
         }
-        "list" | "ls" => {
+        "list" | "ls" | "" => {
             let sessions = store.list_sessions()?;
             if sessions.is_empty() {
                 println!("No sessions.");
@@ -194,37 +196,29 @@ pub fn try_handle_session_command(
             println!("Deleted {deleted} session(s). Switched to new session: {new_id}");
         }
         _ => {
-            println!("unknown action: {}. try: /sessions help", action);
+            println!("unknown action: '{}'. try: /sessions help", action);
         }
     }
     Ok(true)
 }
 
 fn sanitize_session_prompt(s: &str) -> String {
-    let mut out = String::new();
-    let mut last_space = false;
-    for ch in s.chars() {
-        if ch.is_whitespace() {
-            if !last_space {
-                out.push(' ');
-                last_space = true;
-            }
-        } else {
-            out.push(ch);
-            last_space = false;
-        }
-    }
-    out.trim().to_string()
+    s.lines()
+        .next()
+        .unwrap_or(s)
+        .replace('\n', " ")
+        .replace('\r', "")
 }
 
-fn truncate_session_prompt(s: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
+fn truncate_session_prompt(s: &str, max_len: usize) -> String {
+    if max_len == 0 {
         return String::new();
     }
-    if s.chars().count() <= max_chars {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
         return s.to_string();
     }
-    let mut out: String = s.chars().take(max_chars).collect();
+    let mut out: String = s.chars().take(max_len).collect();
     out.push_str("...");
     out
 }

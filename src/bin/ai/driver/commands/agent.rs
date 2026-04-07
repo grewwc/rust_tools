@@ -30,13 +30,15 @@ pub fn try_handle_agent_command(
 
     match action {
         "help" | "h" => {
-            println!("agent commands:");
-            println!("  /agents");
-            println!("  /agents list");
-            println!("  /agents current");
-            println!("  /agents use <name>");
+            println!("Agent management commands:");
+            println!();
+            println!("  /agents                   list available agents");
+            println!("  /agents list              list available agents");
+            println!("  /agents current           show current agent");
+            println!("  /agents use <name>        switch to an agent");
+            println!();
         }
-        "list" | "ls" => {
+        "list" | "ls" | "" => {
             let primary_agents = agents::get_primary_agents(agent_manifests);
             let subagents = agents::get_subagents(agent_manifests);
 
@@ -125,7 +127,7 @@ pub fn try_handle_agent_command(
             }
         }
         _ => {
-            println!("unknown action: {}. try: /agents help", action);
+            println!("unknown action: '{}'. try: /agents help", action);
         }
     }
     Ok(true)
