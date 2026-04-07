@@ -123,6 +123,7 @@ const REQUEST_MAX_ATTEMPTS: usize = 6;
 const REQUEST_MAX_ATTEMPTS_429: usize = 16; // 429 错误重试 16 次
 const REQUEST_RETRY_BASE_MS: u64 = 500;
 const REQUEST_RETRY_MAX_MS: u64 = 4000;
+const DEFAULT_AUTO_THINKING_THRESHOLD: f64 = 0.7;
 
 fn should_retry_status(status: StatusCode) -> bool {
     status.as_u16() == 429 || status.is_server_error()
@@ -152,7 +153,7 @@ pub(super) fn is_transient_error(err: &RequestError) -> bool {
 /// 2. If model doesn't support thinking, return false
 /// 3. If auto-thinking is disabled by config, return false
 /// 4. Auto-detect based on question complexity
-fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool {
+async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool {
     // CLI flag always wins
     if app.cli.thinking {
         return true;
@@ -174,95 +175,111 @@ fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool {
         return false;
     }
 
-    // Auto-detect based on question complexity
-    should_enable_thinking_auto(messages)
+    // Model-only decision path: if gate fails/uncertain, default to disabled.
+    decide_thinking_via_model(app, model, messages)
+        .await
+        .unwrap_or(false)
 }
 
-/// Automatically decide whether to enable thinking based on question complexity.
+/// Ask the model whether this request needs thinking mode.
 ///
-/// Scoring factors:
-/// - Question length (longer = more complex)
-/// - Code-related keywords
-/// - Reasoning/analysis indicators
-/// - Multi-step task indicators
-/// - Current agent type (plan mode favors thinking)
-fn should_enable_thinking_auto(messages: &[Message]) -> bool {
-    let mut score = 0;
-
-    // Extract user question text from messages
+/// Returns `Some(decision)` only when response parses successfully and confidence
+/// passes configured threshold; otherwise returns `None` for local fallback.
+async fn decide_thinking_via_model(app: &App, model: &str, messages: &[Message]) -> Option<bool> {
     let user_text: String = messages
         .iter()
         .filter(|m| m.role == "user")
-        .filter_map(|m| extract_message_text(m))
+        .filter_map(extract_message_text)
         .collect::<Vec<_>>()
-        .join(" ");
-
-    let text = user_text.to_lowercase();
-    let char_count = text.chars().count();
-
-    // Factor 1: Question length
-    if char_count > 200 {
-        score += 3;
-    } else if char_count > 100 {
-        score += 2;
-    } else if char_count > 50 {
-        score += 1;
+        .join("\n");
+    let question = user_text.trim();
+    if question.is_empty() {
+        return None;
     }
 
-    // Factor 2: Code-related keywords (strong signal)
-    let code_keywords = &[
-        "implement", "实现", "重构", "refactor", "debug", "调试",
-        "optimize", "优化", "架构", "architecture", "design pattern",
-        "并发", "concurrent", "async", "异步", "内存", "memory",
-        "性能", "performance", "algorithm", "算法", "数据结构",
-        "trait", "lifetime", "borrow", "ownership", "泛型",
-        "macro", "宏", "unsafe", "ffi", "序列化",
+    let clipped = if question.chars().count() > 1200 {
+        question.chars().take(1200).collect::<String>()
+    } else {
+        question.to_string()
+    };
+
+    let gate_messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String(
+                "You are a request complexity gate. Decide whether this user request needs deliberate reasoning mode.\nOutput STRICT JSON only: {\"thinking\":true|false,\"confidence\":0.0}\nRules:\n- thinking=true for multi-step tasks, code changes, debugging, comparative analysis, or ambiguous complex intent.\n- thinking=false for greetings, simple factual asks, tiny rewrites, or short direct requests.\n- confidence is your certainty in [0,1]."
+                    .to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(clipped),
+            tool_calls: None,
+            tool_call_id: None,
+        },
     ];
-    for kw in code_keywords {
-        if text.contains(kw) {
-            score += 2;
-        }
+
+    let request_body = RequestBody {
+        model,
+        messages: &gate_messages,
+        stream: false,
+        enable_thinking: false,
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+    };
+
+    let response = app
+        .client
+        .post(&app.config.endpoint)
+        .bearer_auth(&app.config.api_key)
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .ok()?;
+
+    if !response.status().is_success() {
+        return None;
     }
 
-    // Factor 3: Reasoning/analysis indicators
-    let reasoning_keywords = &[
-        "为什么", "分析", "explain", "why", "how does", "原理",
-        "比较", "compare", "区别", "difference", "优劣",
-        "pros and cons", "tradeoff", "权衡", "深入", "detailed",
-        "详细", "完整", "comprehensive", "系统",
-    ];
-    for kw in reasoning_keywords {
-        if text.contains(kw) {
-            score += 2;
-        }
-    }
+    let text = response.text().await.ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let content = extract_router_content(&v)?;
+    let (thinking, confidence) = parse_thinking_gate_output(&content)?;
+    let cfg = configw::get_all_config();
+    let threshold = cfg
+        .get_opt(AiConfig::MODEL_AUTO_THINKING_THRESHOLD)
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(DEFAULT_AUTO_THINKING_THRESHOLD);
 
-    // Factor 4: Multi-step task indicators
-    let multistep_keywords = &[
-        "第一步", "第二步", "然后", "接着", "步骤",
-        "step 1", "step 2", "first", "then", "finally",
-        "流程", "workflow", "pipeline", "完整流程",
-    ];
-    for kw in multistep_keywords {
-        if text.contains(kw) {
-            score += 2;
-        }
+    if confidence >= threshold {
+        Some(thinking)
+    } else {
+        None
     }
+}
 
-    // Factor 5: Simple chat indicators (negative signal)
-    let chat_keywords = &[
-        "你好", "hello", "hi ", "hey", "谢谢", "thanks",
-        "再见", "bye", "天气", "weather", "新闻", "news",
-        "你是谁", "who are you", "你叫什么",
-    ];
-    for kw in chat_keywords {
-        if text.contains(kw) {
-            score -= 3;
-        }
-    }
+fn parse_thinking_gate_output(s: &str) -> Option<(bool, f64)> {
+    let s = strip_json_fence(s);
+    let candidate = if let (Some(l), Some(r)) = (s.find('{'), s.rfind('}'))
+        && r >= l
+    {
+        &s[l..=r]
+    } else {
+        s
+    };
 
-    // Threshold: score >= 3 enables thinking
-    score >= 3
+    let v: Value = serde_json::from_str(candidate).ok()?;
+    let thinking = match v.get("thinking") {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => s.trim().eq_ignore_ascii_case("true"),
+        _ => return None,
+    };
+    let confidence = v.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    Some((thinking, confidence))
 }
 
 /// Extract text content from a message.
@@ -293,7 +310,7 @@ pub(super) async fn do_request_messages(
     stream: bool,
 ) -> Result<Response, RequestError> {
     let (tools_value, tool_choice) = agent_tools_for_request(app, model);
-    let enable_thinking = resolve_thinking(app, model, messages);
+    let enable_thinking = resolve_thinking(app, model, messages).await;
     let request_body = RequestBody {
         model,
         messages,
@@ -654,73 +671,29 @@ pub async fn do_request_json(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
-    fn make_user_message(text: &str) -> Message {
-        Message {
-            role: "user".to_string(),
-            content: json!(text),
-            tool_calls: None,
-            tool_call_id: None,
-        }
+    #[test]
+    fn test_parse_thinking_gate_output_bool() {
+        let s = r#"{"thinking":true,"confidence":0.91}"#;
+        assert_eq!(parse_thinking_gate_output(s), Some((true, 0.91)));
     }
 
     #[test]
-    fn test_auto_thinking_simple_chat() {
-        let messages = vec![make_user_message("你好")];
-        assert!(!should_enable_thinking_auto(&messages));
+    fn test_parse_thinking_gate_output_string_bool() {
+        let s = r#"{"thinking":"false","confidence":0.8}"#;
+        assert_eq!(parse_thinking_gate_output(s), Some((false, 0.8)));
     }
 
     #[test]
-    fn test_auto_thinking_greeting() {
-        let messages = vec![make_user_message("hello, how are you?")];
-        assert!(!should_enable_thinking_auto(&messages));
+    fn test_parse_thinking_gate_output_with_fence() {
+        let s = "```json\n{\"thinking\":true,\"confidence\":0.73}\n```";
+        assert_eq!(parse_thinking_gate_output(s), Some((true, 0.73)));
     }
 
     #[test]
-    fn test_auto_thinking_code_question() {
-        let messages = vec![make_user_message(
-            "帮我实现一个 Rust 的异步并发数据结构，需要支持多线程安全的内存管理",
-        )];
-        assert!(should_enable_thinking_auto(&messages));
-    }
-
-    #[test]
-    fn test_auto_thinking_long_analysis() {
-        let messages = vec![make_user_message(
-            "请详细分析 Rust 中 borrow checker 的工作原理，并比较与其他语言内存管理的优劣",
-        )];
-        assert!(should_enable_thinking_auto(&messages));
-    }
-
-    #[test]
-    fn test_auto_thinking_multistep() {
-        let messages = vec![make_user_message(
-            "第一步读取文件，然后解析 JSON，最后写入数据库，完整流程是怎样的",
-        )];
-        assert!(should_enable_thinking_auto(&messages));
-    }
-
-    #[test]
-    fn test_auto_thinking_short_technical() {
-        let messages = vec![make_user_message("Rust 的 trait 和 Go 的 interface 有什么区别？")];
-        // Reasoning keyword "区别" + code keywords "trait", "interface"
-        assert!(should_enable_thinking_auto(&messages));
-    }
-
-    #[test]
-    fn test_auto_thinking_empty_messages() {
-        let messages: Vec<Message> = vec![];
-        assert!(!should_enable_thinking_auto(&messages));
-    }
-
-    #[test]
-    fn test_auto_thinking_mixed_messages() {
-        let messages = vec![
-            make_user_message("帮我看看这段代码"),
-            make_user_message("需要重构和性能优化"),
-        ];
-        assert!(should_enable_thinking_auto(&messages));
+    fn test_parse_thinking_gate_output_invalid() {
+        let s = r#"{"confidence":0.73}"#;
+        assert_eq!(parse_thinking_gate_output(s), None);
     }
 }
 

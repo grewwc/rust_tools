@@ -78,7 +78,7 @@ fn params_web_fetch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "web_search",
-        description: "Search the public web using DuckDuckGo for documentation and references. Returns up to num_results results with title, URL, and snippet.",
+        description: "Search the public web using DuckDuckGo for real-time information including weather, news, stock prices, current events, documentation, and references. Returns up to num_results results with title, URL, and snippet.",
         parameters: params_web_search,
         execute: execute_web_search,
         groups: &["builtin"],

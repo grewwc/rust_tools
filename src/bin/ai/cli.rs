@@ -265,4 +265,8 @@ pub(super) fn print_help() {
     println!("  /sessions export <id> [output.md]    导出指定 session 为 Markdown");
     println!("  /sessions export-current [output.md] 导出当前 session 为 Markdown");
     println!("  /sessions export-last [output.md]    导出最新 session 为 Markdown");
+    println!();
+    println!("Config (.configW)");
+    println!("  ai.model.auto_thinking.enable      auto gate switch (default: true)");
+    println!("  ai.model.auto_thinking.threshold   model gate confidence threshold (default: 0.7)");
 }
