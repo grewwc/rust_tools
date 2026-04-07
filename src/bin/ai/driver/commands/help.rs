@@ -31,6 +31,7 @@ pub fn try_handle_help_command(input: &str) -> bool {
     println!("  /sessions use <id>");
     println!("  /sessions delete <id>");
     println!("  /sessions clear-all");
+    println!("  /share [output.md]              export current session as shareable markdown");
     println!();
     true
 }

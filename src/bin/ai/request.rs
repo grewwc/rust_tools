@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{files, history::Message, models, skills::SkillManifest, types::App};
+use crate::ai::config_schema::AiConfig;
 use crate::commonw::configw;
 
 #[derive(Debug, Serialize)]
@@ -144,6 +145,147 @@ pub(super) fn is_transient_error(err: &RequestError) -> bool {
     }
 }
 
+/// Resolve whether to enable thinking mode for this request.
+///
+/// Decision order:
+/// 1. CLI `--thinking` flag always wins
+/// 2. If model doesn't support thinking, return false
+/// 3. If auto-thinking is disabled by config, return false
+/// 4. Auto-detect based on question complexity
+fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool {
+    // CLI flag always wins
+    if app.cli.thinking {
+        return true;
+    }
+
+    // Model must support thinking
+    if !models::enable_thinking(model) {
+        return false;
+    }
+
+    // Check config for auto-thinking override
+    let cfg = configw::get_all_config();
+    let auto_enabled = cfg
+        .get_opt(AiConfig::MODEL_AUTO_THINKING_ENABLE)
+        .map(|v| !v.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(true); // Default: enabled
+
+    if !auto_enabled {
+        return false;
+    }
+
+    // Auto-detect based on question complexity
+    should_enable_thinking_auto(messages)
+}
+
+/// Automatically decide whether to enable thinking based on question complexity.
+///
+/// Scoring factors:
+/// - Question length (longer = more complex)
+/// - Code-related keywords
+/// - Reasoning/analysis indicators
+/// - Multi-step task indicators
+/// - Current agent type (plan mode favors thinking)
+fn should_enable_thinking_auto(messages: &[Message]) -> bool {
+    let mut score = 0;
+
+    // Extract user question text from messages
+    let user_text: String = messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| extract_message_text(m))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let text = user_text.to_lowercase();
+    let char_count = text.chars().count();
+
+    // Factor 1: Question length
+    if char_count > 200 {
+        score += 3;
+    } else if char_count > 100 {
+        score += 2;
+    } else if char_count > 50 {
+        score += 1;
+    }
+
+    // Factor 2: Code-related keywords (strong signal)
+    let code_keywords = &[
+        "implement", "实现", "重构", "refactor", "debug", "调试",
+        "optimize", "优化", "架构", "architecture", "design pattern",
+        "并发", "concurrent", "async", "异步", "内存", "memory",
+        "性能", "performance", "algorithm", "算法", "数据结构",
+        "trait", "lifetime", "borrow", "ownership", "泛型",
+        "macro", "宏", "unsafe", "ffi", "序列化",
+    ];
+    for kw in code_keywords {
+        if text.contains(kw) {
+            score += 2;
+        }
+    }
+
+    // Factor 3: Reasoning/analysis indicators
+    let reasoning_keywords = &[
+        "为什么", "分析", "explain", "why", "how does", "原理",
+        "比较", "compare", "区别", "difference", "优劣",
+        "pros and cons", "tradeoff", "权衡", "深入", "detailed",
+        "详细", "完整", "comprehensive", "系统",
+    ];
+    for kw in reasoning_keywords {
+        if text.contains(kw) {
+            score += 2;
+        }
+    }
+
+    // Factor 4: Multi-step task indicators
+    let multistep_keywords = &[
+        "第一步", "第二步", "然后", "接着", "步骤",
+        "step 1", "step 2", "first", "then", "finally",
+        "流程", "workflow", "pipeline", "完整流程",
+    ];
+    for kw in multistep_keywords {
+        if text.contains(kw) {
+            score += 2;
+        }
+    }
+
+    // Factor 5: Simple chat indicators (negative signal)
+    let chat_keywords = &[
+        "你好", "hello", "hi ", "hey", "谢谢", "thanks",
+        "再见", "bye", "天气", "weather", "新闻", "news",
+        "你是谁", "who are you", "你叫什么",
+    ];
+    for kw in chat_keywords {
+        if text.contains(kw) {
+            score -= 3;
+        }
+    }
+
+    // Threshold: score >= 3 enables thinking
+    score >= 3
+}
+
+/// Extract text content from a message.
+fn extract_message_text(msg: &Message) -> Option<String> {
+    match &msg.content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(s) = part.get("text").and_then(|v| v.as_str()) {
+                    out.push_str(s);
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
+        }
+        _ => None,
+    }
+}
+
 pub(super) async fn do_request_messages(
     app: &mut App,
     model: &str,
@@ -151,11 +293,12 @@ pub(super) async fn do_request_messages(
     stream: bool,
 ) -> Result<Response, RequestError> {
     let (tools_value, tool_choice) = agent_tools_for_request(app, model);
+    let enable_thinking = resolve_thinking(app, model, messages);
     let request_body = RequestBody {
         model,
         messages,
         stream,
-        enable_thinking: app.cli.thinking || models::enable_thinking(model),
+        enable_thinking,
         enable_search: models::search_enabled(model).then_some(true),
         tools: tools_value,
         tool_choice,
@@ -506,5 +649,78 @@ pub async fn do_request_json(
     }
 
     Err("request failed after all attempts".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_user_message(text: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: json!(text),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn test_auto_thinking_simple_chat() {
+        let messages = vec![make_user_message("你好")];
+        assert!(!should_enable_thinking_auto(&messages));
+    }
+
+    #[test]
+    fn test_auto_thinking_greeting() {
+        let messages = vec![make_user_message("hello, how are you?")];
+        assert!(!should_enable_thinking_auto(&messages));
+    }
+
+    #[test]
+    fn test_auto_thinking_code_question() {
+        let messages = vec![make_user_message(
+            "帮我实现一个 Rust 的异步并发数据结构，需要支持多线程安全的内存管理",
+        )];
+        assert!(should_enable_thinking_auto(&messages));
+    }
+
+    #[test]
+    fn test_auto_thinking_long_analysis() {
+        let messages = vec![make_user_message(
+            "请详细分析 Rust 中 borrow checker 的工作原理，并比较与其他语言内存管理的优劣",
+        )];
+        assert!(should_enable_thinking_auto(&messages));
+    }
+
+    #[test]
+    fn test_auto_thinking_multistep() {
+        let messages = vec![make_user_message(
+            "第一步读取文件，然后解析 JSON，最后写入数据库，完整流程是怎样的",
+        )];
+        assert!(should_enable_thinking_auto(&messages));
+    }
+
+    #[test]
+    fn test_auto_thinking_short_technical() {
+        let messages = vec![make_user_message("Rust 的 trait 和 Go 的 interface 有什么区别？")];
+        // Reasoning keyword "区别" + code keywords "trait", "interface"
+        assert!(should_enable_thinking_auto(&messages));
+    }
+
+    #[test]
+    fn test_auto_thinking_empty_messages() {
+        let messages: Vec<Message> = vec![];
+        assert!(!should_enable_thinking_auto(&messages));
+    }
+
+    #[test]
+    fn test_auto_thinking_mixed_messages() {
+        let messages = vec![
+            make_user_message("帮我看看这段代码"),
+            make_user_message("需要重构和性能优化"),
+        ];
+        assert!(should_enable_thinking_auto(&messages));
+    }
 }
 

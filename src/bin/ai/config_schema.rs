@@ -17,6 +17,8 @@ impl AiConfig {
     pub const MODEL_DEFAULT: &str = "ai.model.default";
     pub const MODEL_VL_DEFAULT: &str = "ai.model.vl_default";
     pub const MODEL_THINKING: &str = "ai.model.thinking";
+    pub const MODEL_AUTO_THINKING_ENABLE: &str = "ai.model.auto_thinking.enable";
+    pub const MODEL_AUTO_THINKING_THRESHOLD: &str = "ai.model.auto_thinking.threshold";
 
     // ── History ────────────────────────────────────────────
     pub const HISTORY_MAX_CHARS: &str = "ai.history.max_chars";

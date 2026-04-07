@@ -15,6 +15,8 @@ use serde_json::Value;
 
 use super::{cli::ParsedCli, prompt::PromptEditor};
 
+/// Configuration for the AI application, including API credentials,
+/// endpoint, model settings, and conversation history parameters.
 #[derive(Clone)]
 pub(super) struct AppConfig {
     pub(super) api_key: String,
@@ -27,6 +29,8 @@ pub(super) struct AppConfig {
     pub(super) intent_model: Option<String>,
 }
 
+/// Main application state holding CLI arguments, configuration,
+/// HTTP client, session data, and streaming control flags.
 pub(super) struct App {
     pub(super) cli: ParsedCli,
     pub(super) config: AppConfig,
@@ -48,6 +52,8 @@ pub(super) struct App {
     pub(super) agent_context: Option<AgentContext>,
 }
 
+/// Schema definition for a tool that can be offered to the AI model,
+/// wrapping a function definition with a type discriminator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ToolDefinition {
     #[serde(rename = "type")]
@@ -55,6 +61,8 @@ pub(super) struct ToolDefinition {
     pub(super) function: FunctionDefinition,
 }
 
+/// Describes a callable function: its name, human-readable description,
+/// and JSON Schema for parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct FunctionDefinition {
     pub(super) name: String,
@@ -62,6 +70,8 @@ pub(super) struct FunctionDefinition {
     pub(super) parameters: Value,
 }
 
+/// A request from the AI model to invoke a specific tool,
+/// identified by a unique call ID and containing the function name and arguments.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct ToolCall {
     pub(super) id: String,
@@ -70,18 +80,24 @@ pub(super) struct ToolCall {
     pub(super) function: FunctionCall,
 }
 
+/// The function invocation details within a `ToolCall`,
+/// containing the function name and a JSON-encoded argument string.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct FunctionCall {
     pub(super) name: String,
     pub(super) arguments: String,
 }
 
+/// The output produced after executing a tool call,
+/// linking back to the original call ID with the result content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct ToolResult {
     pub(super) tool_call_id: String,
     pub(super) content: String,
 }
 
+/// Runtime context for an agent, containing its available tools,
+/// MCP server configurations, and iteration limits.
 #[derive(Debug, Clone, Default)]
 pub(super) struct AgentContext {
     pub(super) tools: Vec<ToolDefinition>,

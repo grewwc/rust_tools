@@ -5,6 +5,7 @@ mod context_tools;
 mod git_tools;
 mod knowledge_tools;
 mod lsp_tools;
+mod permissions;
 mod rag_tools;
 mod plan_tools;
 mod patch_tools;

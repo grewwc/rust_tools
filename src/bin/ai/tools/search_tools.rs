@@ -107,7 +107,11 @@ pub(crate) fn execute_list_directory(args: &Value) -> Result<String, String> {
         .map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if is_dir { format!("{}/", name) } else { name }
+            if is_dir {
+                format!("{}/", name)
+            } else {
+                name
+            }
         })
         .collect();
 
@@ -121,7 +125,11 @@ pub(crate) fn execute_search_files(args: &Value) -> Result<String, String> {
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {}", e))?;
     let base_dir = {
         let p = PathBuf::from(path);
-        if p.is_absolute() { p } else { cwd.join(p) }
+        if p.is_absolute() {
+            p
+        } else {
+            cwd.join(p)
+        }
     };
 
     let is_exact_name = !pattern.contains('/')
@@ -279,4 +287,108 @@ pub(crate) fn execute_grep_search(args: &Value) -> Result<String, String> {
     }
 
     Ok(truncate_chars(results.join("\n").trim(), 16_000))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn make_temp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ai_search_test_{}_{}", name, uuid::Uuid::new_v4()));
+        fs::create_dir_all(&path).expect("failed to create temp dir");
+        path
+    }
+
+    #[test]
+    fn test_grep_search_finds_content() {
+        let dir = make_temp_dir("grep");
+        let file_path = dir.join("target.txt");
+        let unique_marker = "GREP_TEST_MARKER_42";
+        fs::write(
+            &file_path,
+            format!("some text\n{}\nmore text", unique_marker),
+        )
+        .unwrap();
+
+        let saved_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let args = serde_json::json!({
+            "pattern": unique_marker,
+            "path": "."
+        });
+        let result = execute_grep_search(&args);
+        std::env::set_current_dir(&saved_cwd).unwrap();
+
+        assert!(result.is_ok(), "grep should not error, got: {:?}", result);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_search_files_by_name_pattern() {
+        let dir = make_temp_dir("search");
+        fs::write(dir.join("foo.rs"), "").unwrap();
+        fs::write(dir.join("bar.rs"), "").unwrap();
+        fs::write(dir.join("baz.txt"), "").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "*.rs",
+            "path": dir.to_string_lossy()
+        });
+        let result = execute_search_files(&args);
+        assert!(result.is_ok(), "search failed: {:?}", result);
+        let output = result.unwrap();
+        assert!(
+            output.contains("foo.rs"),
+            "should find foo.rs, got: {}",
+            output
+        );
+        assert!(
+            output.contains("bar.rs"),
+            "should find bar.rs, got: {}",
+            output
+        );
+        assert!(
+            !output.contains("baz.txt"),
+            "should not find baz.txt, got: {}",
+            output
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_list_directory_returns_entries() {
+        let dir = make_temp_dir("listdir");
+        fs::write(dir.join("file1.txt"), "").unwrap();
+        fs::write(dir.join("file2.txt"), "").unwrap();
+        fs::create_dir(dir.join("subdir")).unwrap();
+
+        let args = serde_json::json!({
+            "path": dir.to_string_lossy()
+        });
+        let result = execute_list_directory(&args);
+        assert!(result.is_ok(), "list_dir failed: {:?}", result);
+        let output = result.unwrap();
+        assert!(
+            output.contains("file1.txt"),
+            "should list file1.txt, got: {}",
+            output
+        );
+        assert!(
+            output.contains("file2.txt"),
+            "should list file2.txt, got: {}",
+            output
+        );
+        assert!(
+            output.contains("subdir/"),
+            "should list subdir with trailing /, got: {}",
+            output
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

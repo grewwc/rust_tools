@@ -37,7 +37,7 @@ pub mod turn_runtime;
 
 pub use commands::{
     try_handle_agent_command, try_handle_feishu_auth_command, try_handle_help_command,
-    try_handle_session_command,
+    try_handle_session_command, try_handle_share_command,
 };
 pub use mcp_init::*;
 pub use model::*;
@@ -245,6 +245,14 @@ async fn run_loop(
             continue;
         }
         if try_handle_feishu_auth_command(mcp_client, &question)? {
+            if should_quit {
+                cleanup_one_shot(app);
+                return Ok(());
+            }
+            should_quit = false;
+            continue;
+        }
+        if try_handle_share_command(app, &question)? {
             if should_quit {
                 cleanup_one_shot(app);
                 return Ok(());

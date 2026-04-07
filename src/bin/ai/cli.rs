@@ -67,7 +67,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     parser.add_bool("multi-line", false, "input with multline");
     parser.alias("mul", "multi-line");
     parser.add_bool("clipboard", false, "prepend content in clipboard");
-    parser.add_bool("thinking", false, "use thinking model");
+    parser.add_bool("thinking", false, "force enable thinking (auto-enabled by default for complex questions)");
     parser.alias("t", "thinking");
     parser.add_bool("short-output", false, "short output");
     parser.alias("s", "short-output");
@@ -210,7 +210,7 @@ pub(super) fn print_help() {
     parser.add_bool("multi-line", false, "input with multline");
     parser.alias("mul", "multi-line");
     parser.add_bool("clipboard", false, "prepend content in clipboard");
-    parser.add_bool("thinking", false, "use thinking model");
+    parser.add_bool("thinking", false, "force enable thinking (auto-enabled by default for complex questions)");
     parser.alias("t", "thinking");
     parser.add_bool("short-output", false, "short output");
     parser.alias("s", "short-output");

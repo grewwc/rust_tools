@@ -20,6 +20,8 @@ const BUILTIN_AGENTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Categorizes an agent's role: `Primary` for main conversation,
+/// `Subagent` for delegated tasks, or `All` for both.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) enum AgentMode {
     #[serde(rename = "primary")]
@@ -36,6 +38,8 @@ impl Default for AgentMode {
     }
 }
 
+/// Parsed configuration for an agent, loaded from a `.agent` file
+/// with front-matter metadata and a prompt body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct AgentManifest {
     pub(super) name: String,
@@ -91,6 +95,8 @@ impl AgentManifest {
     }
 }
 
+/// Loads all builtin and user-defined agents, merging them by name
+/// (user agents override builtins) and sorting primaries first.
 pub(super) fn load_all_agents() -> Vec<AgentManifest> {
     let dir = agents_dir();
     let _ = ensure_seeded_agents_dir(&dir);
@@ -128,10 +134,14 @@ pub(super) fn load_all_agents() -> Vec<AgentManifest> {
     out
 }
 
+/// Filters agents that can serve as primary agents, excluding
+/// disabled and hidden ones.
 pub(super) fn get_primary_agents(agents: &[AgentManifest]) -> Vec<&AgentManifest> {
     agents.iter().filter(|a| a.is_primary() && !a.disabled && !a.hidden).collect()
 }
 
+/// Filters agents that can be spawned as subagents, excluding
+/// disabled and hidden ones.
 pub(super) fn get_subagents(agents: &[AgentManifest]) -> Vec<&AgentManifest> {
     agents.iter().filter(|a| a.is_subagent() && !a.disabled && !a.hidden).collect()
 }

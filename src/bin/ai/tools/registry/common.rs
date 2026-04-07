@@ -4,10 +4,13 @@ use std::sync::LazyLock;
 use rust_tools::cw::SkipMap;
 use serde_json::Value;
 
-use crate::ai::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
+use crate::ai::tools::permissions::ToolPermissions;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
+use crate::ai::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
 use chrono::Local;
 
+/// Static specification for a builtin tool, including its name,
+/// description, parameter schema, execution function, and group memberships.
 #[derive(Clone, Copy)]
 pub(crate) struct ToolSpec {
     pub(crate) name: &'static str,
@@ -17,6 +20,8 @@ pub(crate) struct ToolSpec {
     pub(crate) groups: &'static [&'static str],
 }
 
+/// Registry entry submitted via `inventory!` to register a tool
+/// at compile time for runtime discovery.
 pub(crate) struct ToolRegistration {
     pub(crate) spec: ToolSpec,
 }
@@ -31,6 +36,8 @@ static TOOL_INDEX: LazyLock<FastMap<&'static str, &'static ToolSpec>> = LazyLock
     index
 });
 
+/// Returns tool definitions for all registered tools that belong
+/// to at least one of the specified groups.
 pub(crate) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition> {
     let mut tools: Box<SkipMap<String, ToolDefinition>> =
         SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
@@ -82,6 +89,8 @@ pub(crate) fn get_builtin_tool_definitions() -> Vec<ToolDefinition> {
     tool_definitions_for_groups(&["builtin"])
 }
 
+/// Executes a tool call by parsing its arguments and dispatching
+/// to the registered tool implementation.
 pub(crate) fn execute_tool_call(tool_call: &ToolCall) -> Result<ToolResult, String> {
     let raw_args = tool_call.function.arguments.trim();
     let args: Value = if raw_args.is_empty() {
@@ -124,11 +133,45 @@ fn record_tool_stat(name: &str, ok: bool) {
         timestamp: Local::now().to_rfc3339(),
         category: "tool_stat".to_string(),
         note: format!("name={} result={}", name, if ok { "ok" } else { "err" }),
-        tags: vec![name.to_string(), if ok { "ok".to_string() } else { "err".to_string() }],
+        tags: vec![
+            name.to_string(),
+            if ok {
+                "ok".to_string()
+            } else {
+                "err".to_string()
+            },
+        ],
         source: None,
         priority: Some(50), // Normal priority: tool stats can be GC'd normally
     };
     let store = MemoryStore::from_env_or_config();
     let _ = store.append(&entry);
     store.maintain_after_append();
+}
+
+/// Executes a tool call with permission checking.
+/// - If denied: returns an error immediately.
+/// - If ask: prompts the user for confirmation before executing.
+/// - If allowed: proceeds to execute directly.
+pub(crate) fn execute_tool_call_with_permissions(
+    tool_call: &ToolCall,
+    permissions: &ToolPermissions,
+) -> Result<ToolResult, String> {
+    let tool_name = &tool_call.function.name;
+
+    if permissions.is_denied(tool_name) {
+        return Err(format!("Tool '{}' is denied by permissions", tool_name));
+    }
+
+    if permissions.needs_ask(tool_name) {
+        let confirmed = crate::commonw::prompt::prompt_yes_or_no_interruptible(&format!(
+            "Confirm tool execution: {} (y/n): ",
+            tool_name
+        ));
+        if !confirmed.unwrap_or(false) {
+            return Err(format!("Tool '{}' execution cancelled by user", tool_name));
+        }
+    }
+
+    execute_tool_call(tool_call)
 }

@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::ai::errors::AiError;
+
 pub(crate) struct FileStore {
     path: PathBuf,
 }
@@ -14,29 +16,50 @@ impl FileStore {
         &self.path
     }
 
-    pub(crate) fn validate_access(&self) -> Result<(), String> {
+    pub(crate) fn validate_access(&self) -> Result<(), AiError> {
         if is_sensitive_fs_path(&self.path) {
-            return Err("Access blocked: sensitive path".to_string());
+            return Err(AiError::file(
+                self.path.display().to_string(),
+                "Access blocked: sensitive path",
+            ));
         }
         Ok(())
     }
 
-    pub(crate) fn ensure_exists(&self) -> Result<(), String> {
+    pub(crate) fn ensure_exists(&self) -> Result<(), AiError> {
         if !self.path.exists() {
-            return Err(format!("File not found: {}", self.path.display()));
+            return Err(AiError::file(
+                self.path.display().to_string(),
+                "File not found",
+            ));
         }
         Ok(())
     }
 
-    pub(crate) fn read_to_string(&self) -> Result<String, String> {
-        fs::read_to_string(&self.path).map_err(|e| format!("Failed to read file: {}", e))
+    pub(crate) fn read_to_string(&self) -> Result<String, AiError> {
+        fs::read_to_string(&self.path).map_err(|e| {
+            AiError::file(
+                self.path.display().to_string(),
+                format!("Failed to read file: {}", e),
+            )
+        })
     }
 
-    pub(crate) fn write_all(&self, content: &str) -> Result<(), String> {
+    pub(crate) fn write_all(&self, content: &str) -> Result<(), AiError> {
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
+            fs::create_dir_all(parent).map_err(|e| {
+                AiError::file(
+                    self.path.display().to_string(),
+                    format!("Failed to create directory: {}", e),
+                )
+            })?;
         }
-        fs::write(&self.path, content).map_err(|e| format!("Failed to write file: {}", e))
+        fs::write(&self.path, content).map_err(|e| {
+            AiError::file(
+                self.path.display().to_string(),
+                format!("Failed to write file: {}", e),
+            )
+        })
     }
 }
 
