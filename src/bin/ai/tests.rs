@@ -1,14 +1,13 @@
 use std::path::PathBuf;
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{atomic::AtomicBool, Arc};
 
 use serde_json::Value;
 
 use super::{
     files,
     history::{
-        COLON, MAX_HISTORY_TURNS, Message, NEWLINE, SessionStore, append_history,
-        append_history_messages, build_context_history, build_message_arr,
-        compress_messages_for_context,
+        append_history, append_history_messages, build_context_history, build_message_arr,
+        compress_messages_for_context, Message, SessionStore, COLON, MAX_HISTORY_TURNS, NEWLINE,
     },
     models,
     prompt::MultilineHistoryState,
@@ -78,6 +77,7 @@ fn resolve_model_is_unicode_safe() {
         session_history_file: PathBuf::new(),
         client,
         current_model: any_model_name(),
+        current_agent: "build".to_string(),
         pending_files: None,
         pending_clipboard: false,
         pending_short_output: false,
@@ -226,13 +226,11 @@ fn history_compression_inserts_summary_and_keeps_recent() {
 
     assert!(!compressed.is_empty());
     assert_eq!(compressed[0].role, "system");
-    assert!(
-        compressed[0]
-            .content
-            .as_str()
-            .unwrap_or_default()
-            .contains("对话摘要")
-    );
+    assert!(compressed[0]
+        .content
+        .as_str()
+        .unwrap_or_default()
+        .contains("对话摘要"));
     assert_eq!(
         compressed.last().unwrap().content,
         Value::String(format!("a9 {long}"))
@@ -295,7 +293,8 @@ fn structured_history_messages() -> Vec<Message> {
 fn history_retains_turns_under_cap() {
     let turns = MAX_HISTORY_TURNS.saturating_sub(50).max(1);
     for ext in ["txt", "sqlite"] {
-        let path = std::env::temp_dir().join(format!("ai-history-{}.{}", uuid::Uuid::new_v4(), ext));
+        let path =
+            std::env::temp_dir().join(format!("ai-history-{}.{}", uuid::Uuid::new_v4(), ext));
         for i in 0..turns {
             append_history_messages(
                 &path,
@@ -317,7 +316,10 @@ fn history_retains_turns_under_cap() {
             .unwrap();
         }
         let loaded = build_message_arr(10_000, &path).unwrap();
-        assert_eq!(loaded.first().unwrap().content, Value::String("u0".to_string()));
+        assert_eq!(
+            loaded.first().unwrap().content,
+            Value::String("u0".to_string())
+        );
         assert_eq!(
             loaded.last().unwrap().content,
             Value::String(format!("a{}", turns - 1))
@@ -330,7 +332,8 @@ fn history_retains_turns_under_cap() {
 fn history_compacts_old_turns_into_summary() {
     let turns = MAX_HISTORY_TURNS + 50;
     for ext in ["txt", "sqlite"] {
-        let path = std::env::temp_dir().join(format!("ai-history-{}.{}", uuid::Uuid::new_v4(), ext));
+        let path =
+            std::env::temp_dir().join(format!("ai-history-{}.{}", uuid::Uuid::new_v4(), ext));
         for i in 0..turns {
             append_history_messages(
                 &path,
@@ -365,13 +368,11 @@ fn history_compacts_old_turns_into_summary() {
         }
         let loaded = build_message_arr(10_000, &path).unwrap();
         assert_eq!(loaded.first().unwrap().role, "system");
-        assert!(
-            loaded
-                .first()
-                .and_then(|m| m.content.as_str())
-                .unwrap_or_default()
-                .contains("历史摘要")
-        );
+        assert!(loaded
+            .first()
+            .and_then(|m| m.content.as_str())
+            .unwrap_or_default()
+            .contains("历史摘要"));
         let first_user = loaded.iter().find(|m| m.role == "user").unwrap();
         assert_ne!(first_user.content, Value::String("u0".to_string()));
         let user_count = loaded.iter().filter(|m| m.role == "user").count();
@@ -410,31 +411,16 @@ fn context_history_summarizes_beyond_history_count_instead_of_dropping() {
         .unwrap();
     }
 
-    let context = build_context_history(
-        32,
-        &path,
-        6000,
-        32,
-        2000,
-    )
-    .unwrap();
+    let context = build_context_history(32, &path, 6000, 32, 2000).unwrap();
 
     assert!(!context.is_empty());
     assert_eq!(context.first().unwrap().role, "system");
-    assert!(
-        context
-            .first()
-            .and_then(|m| m.content.as_str())
-            .unwrap_or_default()
-            .contains("摘要")
-    );
-    assert_eq!(
-        context
-            .iter()
-            .filter(|m| m.role == "user")
-            .count(),
-        32
-    );
+    assert!(context
+        .first()
+        .and_then(|m| m.content.as_str())
+        .unwrap_or_default()
+        .contains("摘要"));
+    assert_eq!(context.iter().filter(|m| m.role == "user").count(), 32);
     assert_eq!(
         context.last().unwrap().content,
         Value::String("answer-239".to_string())
@@ -494,7 +480,10 @@ fn context_history_keep_last_counts_user_turns_not_raw_messages() {
         .filter(|m| m.role == "user")
         .map(|m| m.content.as_str().unwrap_or_default().to_string())
         .collect::<Vec<_>>();
-    assert_eq!(user_questions, vec!["question-4".to_string(), "question-5".to_string()]);
+    assert_eq!(
+        user_questions,
+        vec!["question-4".to_string(), "question-5".to_string()]
+    );
     assert!(context.iter().any(|m| {
         m.role == "system"
             && m.content

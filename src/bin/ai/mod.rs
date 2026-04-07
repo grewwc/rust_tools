@@ -1,6 +1,9 @@
 #![allow(dead_code)]
+mod agents;
 mod cli;
 mod config;
+pub mod config_schema;
+mod errors;
 mod driver;
 mod files;
 mod history;

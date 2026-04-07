@@ -13,7 +13,6 @@ use crate::ai::{
 };
 use crate::commonw::configw;
 use chrono::Local;
-use rust_tools::cw::SkipSet;
 use serde_json::json;
 use std::path::PathBuf;
 use uuid::Uuid;

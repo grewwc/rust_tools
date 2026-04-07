@@ -176,7 +176,7 @@ pub(crate) fn execute_memory_search(args: &Value) -> Result<String, String> {
     let results = store.search(query, 10_000)?;
 
     let mut scored = Vec::with_capacity(results.len());
-    for (e, search_score) in results {
+    for (e, _search_score) in results {
         if let Some(cat) = category_filter.as_ref() {
             if e.category.to_lowercase() != *cat {
                 continue;

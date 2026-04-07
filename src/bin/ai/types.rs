@@ -2,8 +2,8 @@ use std::{
     fs::File,
     path::PathBuf,
     sync::{
-        Arc,
         atomic::{AtomicBool, Ordering},
+        Arc,
     },
 };
 
@@ -34,6 +34,7 @@ pub(super) struct App {
     pub(super) session_history_file: PathBuf,
     pub(super) client: Client,
     pub(super) current_model: String,
+    pub(super) current_agent: String,
     pub(super) pending_files: Option<String>,
     pub(super) pending_clipboard: bool,
     pub(super) pending_short_output: bool,

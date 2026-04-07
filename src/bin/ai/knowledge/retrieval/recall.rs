@@ -221,26 +221,12 @@ pub fn build_auto_recalled_knowledge_with_project(
         }
     }
 
-    // Add project-matching recent entries
-    if let Some(project) = project_hint.as_deref() {
-        if let Ok(recent) = store.recent(60) {
-            for entry in recent {
-                if entry.category == "tool_cache" {
-                    continue;
-                }
-                if entry.category_enum().is_guideline() {
-                    continue;
-                }
-                if !entry.mentions_project(project) {
-                    continue;
-                }
-                let key = entry.dedup_key();
-                if seen.insert(key) {
-                    entries.push(entry);
-                }
-            }
-        }
-    }
+    // Note: Removed blind project-matching fallback.
+    // If the question is truly project-related, the keyword search above
+    // (which includes "{question} {project}" as a query variant) should
+    // naturally surface relevant entries. Forcing project entries into
+    // context for every turn causes false positives and wastes tokens.
+    // Let the model use knowledge_search tool when it needs project context.
 
     if entries.is_empty() {
         return None;

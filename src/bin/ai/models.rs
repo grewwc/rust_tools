@@ -1,4 +1,5 @@
 use super::cli::ParsedCli;
+use super::config_schema::AiConfig;
 use super::model_names;
 
 pub(super) fn is_vl_model(model: &str) -> bool {
@@ -65,7 +66,7 @@ pub(super) fn initial_model(cli: &ParsedCli) -> String {
         return determine_model(model);
     }
     let cfg = crate::commonw::configw::get_all_config();
-    cfg.get_opt("ai.model.default")
+    cfg.get_opt(AiConfig::MODEL_DEFAULT)
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(default_model)
 }

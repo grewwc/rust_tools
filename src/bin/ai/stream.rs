@@ -45,6 +45,10 @@ pub(super) async fn stream_response(
 
     while !app.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         if app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed) {
+            if thinking_open {
+                print!("\x1b[0m");
+                let _ = io::stdout().flush();
+            }
             return Ok(StreamResult {
                 outcome: StreamOutcome::Cancelled,
                 tool_calls: Vec::new(),
@@ -56,6 +60,10 @@ pub(super) async fn stream_response(
         let chunk_result = tokio::select! {
             chunk = response.chunk() => chunk,
             _ = wait_for_interrupt(app) => {
+                if thinking_open {
+                    print!("\x1b[0m");
+                    let _ = io::stdout().flush();
+                }
                 return Ok(StreamResult {
                     outcome: StreamOutcome::Cancelled,
                     tool_calls: Vec::new(),
@@ -268,6 +276,10 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     );
 
     if take_stream_cancelled(app) {
+        if *thinking_open {
+            print!("\x1b[0m");
+            let _ = io::stdout().flush();
+        }
         return Some(StreamResult {
             outcome: StreamOutcome::Cancelled,
             tool_calls: Vec::new(),
@@ -291,6 +303,8 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
             markdown,
             true,
         );
+        print!("\x1b[0m");
+        let _ = io::stdout().flush();
     }
 
     let _ = markdown.flush_pending();

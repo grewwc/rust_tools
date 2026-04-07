@@ -331,6 +331,47 @@ where
         (&*self.inner).into_iter().map(|(k, _)| k)
     }
 
+    /// Returns a reference to the first (smallest) element, or `None` if empty.
+    pub fn first(&self) -> Option<&T> {
+        (&*self.inner).into_iter().next().map(|(k, _)| k)
+    }
+
+    /// Returns a reference to the last (largest) element, or `None` if empty.
+    pub fn last(&self) -> Option<&T> {
+        let mut iter = (&*self.inner).into_iter();
+        let mut last = iter.next()?;
+        for item in iter {
+            last = item;
+        }
+        Some(last.0)
+    }
+
+    /// Removes and returns the first (smallest) element, or `None` if empty.
+    pub fn pop_first(&mut self) -> Option<T>
+    where
+        T: Clone,
+    {
+        let first = self.first()?.clone();
+        if self.remove(&first) {
+            Some(first)
+        } else {
+            None
+        }
+    }
+
+    /// Removes and returns the last (largest) element, or `None` if empty.
+    pub fn pop_last(&mut self) -> Option<T>
+    where
+        T: Clone,
+    {
+        let last = self.last()?.clone();
+        if self.remove(&last) {
+            Some(last)
+        } else {
+            None
+        }
+    }
+
     pub fn to_vec(&self) -> Vec<T>
     where
         T: Clone,

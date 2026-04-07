@@ -1,8 +1,10 @@
 mod cargo_tools;
 pub(crate) mod command_tools;
 mod common;
+mod context_tools;
 mod git_tools;
 mod knowledge_tools;
+mod lsp_tools;
 mod rag_tools;
 mod plan_tools;
 mod patch_tools;
@@ -11,6 +13,8 @@ mod search_tools;
 pub(crate) mod service;
 mod skill_tools;
 pub(crate) mod storage;
+mod task_tools;
+mod undo_tools;
 mod web_tools;
 
 #[cfg(test)]

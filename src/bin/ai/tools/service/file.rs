@@ -54,9 +54,13 @@ pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
     let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
     let content = args["content"].as_str().ok_or("Missing content")?;
 
+    super::super::undo_tools::snapshot_file_before_write(file_path);
+
     let store = FileStore::new(PathBuf::from(file_path));
     store.validate_access()?;
     store.write_all(content)?;
+
+    super::super::undo_tools::commit_change_set(&format!("write_file: {}", file_path));
 
     Ok(format!("Successfully wrote to {}", store.path().display()))
 }

@@ -6,7 +6,6 @@
 use serde_json::Value;
 
 use crate::ai::knowledge::config::KnowledgeConfig;
-use crate::ai::knowledge::retrieval::semantic_search;
 use crate::ai::knowledge::storage::jsonl_store::JsonlStore;
 use crate::ai::knowledge::sync::knowledge_sync;
 use crate::ai::tools::common::ToolRegistration;
@@ -71,7 +70,7 @@ fn execute_semantic_search(args: &Value) -> Result<String, String> {
             .filter_map(|(entry, score)| entry.id.as_ref().map(|id| (id.clone(), *score as f32)))
             .collect();
 
-        let results = store.hybrid_search(
+        let _results = store.hybrid_search(
             query,
             bm25_for_hybrid,
             limit,

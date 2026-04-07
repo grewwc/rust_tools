@@ -7,6 +7,7 @@ pub(super) const DEFAULT_NUM_HISTORY: usize = 256;
 pub(super) struct ParsedCli {
     pub(super) history: usize,
     pub(super) model: Option<String>,
+    pub(super) agent: Option<String>,
     pub(super) multi_line: bool,
     pub(super) clear: bool,
     pub(super) session: Option<String>,
@@ -19,6 +20,7 @@ pub(super) struct ParsedCli {
     pub(super) list_tools: bool,
     pub(super) list_mcp_tools: bool,
     pub(super) list_skills: bool,
+    pub(super) list_agents: bool,
     pub(super) no_skills: bool,
     pub(super) mcp_config: String,
     pub(super) help: bool,
@@ -29,6 +31,7 @@ impl Default for ParsedCli {
         Self {
             history: DEFAULT_NUM_HISTORY,
             model: None,
+            agent: None,
             multi_line: false,
             clear: false,
             session: None,
@@ -41,6 +44,7 @@ impl Default for ParsedCli {
             list_tools: false,
             list_mcp_tools: false,
             list_skills: false,
+            list_agents: false,
             no_skills: false,
             mcp_config: String::new(),
             help: false,
@@ -71,6 +75,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
     parser.alias("list-mcp-servers", "list-mcp-tools");
     parser.add_bool("list-skills", false, "list skills and exit");
+    parser.add_bool("list-agents", false, "list available agents and exit");
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
     parser.alias("h", "help");
@@ -79,6 +84,8 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history");
     parser.add_string("model", "", "model name");
     parser.alias("m", "model");
+    parser.add_string("agent", "", "agent name");
+    parser.alias("a", "agent");
     parser.add_string("session", "", "session id");
     parser.alias("ss", "session");
     parser.add_string("files", "", "input file names");
@@ -127,6 +134,14 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         }
     }
 
+    // 处理 agent
+    if parser.contains_flag_strict("agent") {
+        let val = parser.flag_value_or_default("agent");
+        if !val.trim().is_empty() {
+            cli.agent = Some(val);
+        }
+    }
+
     // 处理 multi-line
     cli.multi_line = parser.contains_flag_strict("multi-line");
 
@@ -170,6 +185,9 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     // 处理 list-skills
     cli.list_skills = parser.contains_flag_strict("list-skills");
 
+    // 处理 list-agents
+    cli.list_agents = parser.contains_flag_strict("list-agents");
+
     // 处理 no-skills
     cli.no_skills = parser.contains_flag_strict("no-skills");
 
@@ -200,6 +218,7 @@ pub(super) fn print_help() {
     parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
     parser.alias("list-mcp-servers", "list-mcp-tools");
     parser.add_bool("list-skills", false, "list skills and exit");
+    parser.add_bool("list-agents", false, "list available agents and exit");
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
     parser.alias("h", "help");
@@ -207,6 +226,8 @@ pub(super) fn print_help() {
     parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history");
     parser.add_string("model", "", "model name");
     parser.alias("m", "model");
+    parser.add_string("agent", "", "agent name");
+    parser.alias("a", "agent");
     parser.add_string("session", "", "session id");
     parser.alias("ss", "session");
     parser.add_string("files", "", "input file names");
@@ -219,6 +240,10 @@ pub(super) fn print_help() {
     println!();
     parser.print_defaults();
     println!();
+    println!("Agent");
+    println!("  --agent <name>            start with specified agent (build/plan/explore)");
+    println!("  --list-agents             list available agents and exit");
+    println!();
     println!("Session");
     println!("  默认每个进程自动创建独立 session（不会和其它窗口串 history）");
     println!("  --session <id>            指定 session id");
@@ -227,6 +252,8 @@ pub(super) fn print_help() {
     println!();
     println!("Interactive");
     println!("  /help                     打印交互命令帮助");
+    println!("  /agents                   list available agents");
+    println!("  /agents use <name>        switch to an agent");
     println!("  /sessions                 列出所有 sessions");
     println!("  /sessions current         查看当前 session");
     println!("  /sessions new             新建并切换到新 session");

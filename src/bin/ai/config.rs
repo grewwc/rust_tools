@@ -1,5 +1,6 @@
 use std::{fs, fs::File, io, path::Path, path::PathBuf};
 
+use crate::ai::config_schema::AiConfig;
 use crate::commonw::{
     configw,
     utils::{expanduser, open_file_for_write_truncate},
@@ -20,23 +21,23 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         .get_opt("history_file")
         .unwrap_or_else(|| "~/.history_file.sqlite".to_string());
     let endpoint = cfg
-        .get_opt("ai.model.endpoint")
+        .get_opt(AiConfig::MODEL_ENDPOINT)
         .unwrap_or_else(|| QWEN_ENDPOINT.to_string());
     let vl_default_model =
-        models::determine_vl_model(&cfg.get_opt("ai.model.vl_default").unwrap_or_default());
+        models::determine_vl_model(&cfg.get_opt(AiConfig::MODEL_VL_DEFAULT).unwrap_or_default());
     let history_max_chars = cfg
-        .get_opt("ai.history.max_chars")
+        .get_opt(AiConfig::HISTORY_MAX_CHARS)
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(12000);
     let history_keep_last = cfg
-        .get_opt("ai.history.keep_last")
+        .get_opt(AiConfig::HISTORY_KEEP_LAST)
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(256);
     let history_summary_max_chars = cfg
-        .get_opt("ai.history.summary_max_chars")
+        .get_opt(AiConfig::HISTORY_SUMMARY_MAX_CHARS)
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4000);
-    let intent_model = cfg.get_opt("ai.intent_model");
+    let intent_model = cfg.get_opt(AiConfig::INTENT_MODEL);
     Ok(AppConfig {
         api_key,
         history_file: PathBuf::from(expanduser(&history_file).as_ref()),

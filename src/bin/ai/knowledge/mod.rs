@@ -47,9 +47,3 @@ pub mod retrieval;
 pub mod storage;
 pub mod sync;
 pub mod types;
-
-// Re-exports for convenient access
-pub use config::KnowledgeConfig;
-pub use entry::KnowledgeEntry;
-pub use types::Category;
-pub use types::KnowledgeType;

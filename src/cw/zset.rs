@@ -1,28 +1,18 @@
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
 use std::hash::Hash;
 
 use crate::commonw::types::FastMap;
+use crate::cw::SkipSet;
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ZSetEntry<K>
-where
-    K: Clone,
-{
-    key: K,
+pub struct ZSetEntry<'a, K> {
+    key: &'a K,
     score: f64,
 }
 
-impl<K> ZSetEntry<K>
-where
-    K: Clone,
-{
-    pub fn new(key: K, score: f64) -> Self {
-        Self { key, score }
-    }
-
+impl<K> ZSetEntry<'_, K> {
     pub fn key(&self) -> &K {
-        &self.key
+        self.key
     }
 
     pub fn score(&self) -> f64 {
@@ -31,105 +21,62 @@ where
 }
 
 #[derive(Clone, Debug)]
-struct ZSetNode<K>
-where
-    K: Ord + Clone,
-{
+struct ZSetNode<K> {
     key: K,
     score: f64,
+    order: u64,
 }
 
-impl<K> ZSetNode<K>
-where
-    K: Ord + Clone,
-{
-    fn new(key: K, score: f64) -> Self {
-        Self { key, score }
+impl<K> ZSetNode<K> {
+    fn new(key: K, score: f64, order: u64) -> Self {
+        Self { key, score, order }
     }
 }
 
-impl<K> PartialEq for ZSetNode<K>
-where
-    K: Ord + Clone,
-{
+impl<K> PartialEq for ZSetNode<K> {
     fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
+        self.order == other.order
     }
 }
 
-impl<K> Eq for ZSetNode<K> where K: Ord + Clone {}
+impl<K> Eq for ZSetNode<K> {}
 
-impl<K> PartialOrd for ZSetNode<K>
-where
-    K: Ord + Clone,
-{
+impl<K> PartialOrd for ZSetNode<K> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<K> Ord for ZSetNode<K>
-where
-    K: Ord + Clone,
-{
+impl<K> Ord for ZSetNode<K> {
     fn cmp(&self, other: &Self) -> Ordering {
         self.score
             .total_cmp(&other.score)
-            .then_with(|| self.key.cmp(&other.key))
+            .then_with(|| self.order.cmp(&other.order))
     }
 }
 
+/// Ordered set with scores (similar to Redis ZSET).
+///
+/// Elements are sorted by score. K only needs `Eq + Hash`.
 pub struct ZSet<K>
 where
-    K: Eq + Hash + Ord + Clone,
+    K: Eq + Hash,
 {
-    tree: BTreeSet<ZSetNode<K>>,
-    map: FastMap<K, f64>,
+    tree: SkipSet<ZSetNode<K>>,
+    map: FastMap<K, (f64, u64)>,
+    next_order: u64,
 }
 
 impl<K> ZSet<K>
 where
-    K: Eq + Hash + Ord + Clone,
+    K: Eq + Hash,
 {
     pub fn new() -> Self {
         Self {
-            tree: BTreeSet::new(),
+            tree: SkipSet::new(12),
             map: FastMap::default(),
+            next_order: 0,
         }
-    }
-
-    pub fn add(&mut self, key: K, score: f64) -> bool {
-        if self.map.contains_key(&key) {
-            return false;
-        }
-        self.tree.insert(ZSetNode::new(key.clone(), score));
-        self.map.insert(key, score);
-        true
-    }
-
-    pub fn update_score(&mut self, key: &K, score: f64) -> bool {
-        let Some(old_score) = self.map.get(key).copied() else {
-            return false;
-        };
-        let old_node = ZSetNode::new(key.clone(), old_score);
-        self.tree.remove(&old_node);
-        self.tree.insert(ZSetNode::new(key.clone(), score));
-        self.map.insert(key.clone(), score);
-        true
-    }
-
-    pub fn delete(&mut self, key: &K) -> bool {
-        let Some(score) = self.map.remove(key) else {
-            return false;
-        };
-        self.tree.remove(&ZSetNode::new(key.clone(), score));
-        true
-    }
-
-    pub fn remove_score(&mut self, key: &K) -> Option<f64> {
-        let score = self.map.remove(key)?;
-        self.tree.remove(&ZSetNode::new(key.clone(), score));
-        Some(score)
     }
 
     pub fn len(&self) -> usize {
@@ -140,14 +87,17 @@ where
         self.map.is_empty()
     }
 
-    pub fn search_range(&self, score_low: f64, score_high: f64) -> Vec<ZSetEntry<K>> {
+    pub fn search_range(&self, score_low: f64, score_high: f64) -> Vec<ZSetEntry<'_, K>> {
         if score_low > score_high {
             return Vec::new();
         }
         self.tree
             .iter()
             .filter(|entry| entry.score >= score_low && entry.score <= score_high)
-            .map(|entry| ZSetEntry::new(entry.key.clone(), entry.score))
+            .map(|entry| ZSetEntry {
+                key: &entry.key,
+                score: entry.score,
+            })
             .collect()
     }
 
@@ -157,50 +107,120 @@ where
             return -1;
         }
         for (idx, node) in self.tree.iter().enumerate() {
-            if &node.key == key {
+            if node.key == *key {
                 return idx as isize + 1;
             }
         }
         -1
     }
 
-    pub fn min(&self) -> Option<ZSetEntry<K>> {
-        self.tree
-            .first()
-            .map(|entry| ZSetEntry::new(entry.key.clone(), entry.score))
+    pub fn min(&self) -> Option<ZSetEntry<'_, K>> {
+        self.tree.first().map(|entry| ZSetEntry {
+            key: &entry.key,
+            score: entry.score,
+        })
     }
 
-    pub fn max(&self) -> Option<ZSetEntry<K>> {
-        self.tree
-            .last()
-            .map(|entry| ZSetEntry::new(entry.key.clone(), entry.score))
-    }
-
-    pub fn pop_min(&mut self) -> Option<ZSetEntry<K>> {
-        let node = self.tree.pop_first()?;
-        self.map.remove(&node.key);
-        Some(ZSetEntry::new(node.key, node.score))
-    }
-
-    pub fn pop_max(&mut self) -> Option<ZSetEntry<K>> {
-        let node = self.tree.pop_last()?;
-        self.map.remove(&node.key);
-        Some(ZSetEntry::new(node.key, node.score))
+    pub fn max(&self) -> Option<ZSetEntry<'_, K>> {
+        self.tree.last().map(|entry| ZSetEntry {
+            key: &entry.key,
+            score: entry.score,
+        })
     }
 
     pub fn score(&self, key: &K) -> Option<f64> {
-        self.map.get(key).copied()
+        self.map.get(key).map(|(s, _)| *s)
     }
 
     pub fn contains(&self, key: &K) -> bool {
         self.map.contains_key(key)
     }
 
-    pub fn iter(&self) -> Vec<ZSetEntry<K>> {
+    pub fn iter(&self) -> Vec<ZSetEntry<'_, K>> {
         self.tree
             .iter()
-            .map(|entry| ZSetEntry::new(entry.key.clone(), entry.score))
+            .map(|entry| ZSetEntry {
+                key: &entry.key,
+                score: entry.score,
+            })
             .collect()
+    }
+
+    pub fn clear(&mut self) {
+        self.tree.clear();
+        self.map.clear();
+        self.next_order = 0;
+    }
+}
+
+impl<K> ZSet<K>
+where
+    K: Eq + Hash + Clone,
+{
+    pub fn add(&mut self, key: K, score: f64) -> bool {
+        if self.map.contains_key(&key) {
+            return false;
+        }
+        let order = self.next_order;
+        self.next_order += 1;
+        self.tree.insert(ZSetNode::new(key.clone(), score, order));
+        self.map.insert(key, (score, order));
+        true
+    }
+
+    pub fn update_score(&mut self, key: &K, score: f64) -> bool {
+        let Some((old_score, old_order)) = self.map.get(key).copied() else {
+            return false;
+        };
+        let old_node = ZSetNode::new(key.clone(), old_score, old_order);
+        self.tree.remove(&old_node);
+        let order = self.next_order;
+        self.next_order += 1;
+        self.tree.insert(ZSetNode::new(key.clone(), score, order));
+        self.map.insert(key.clone(), (score, order));
+        true
+    }
+
+    pub fn delete(&mut self, key: &K) -> bool {
+        let Some((score, order)) = self.map.remove(key) else {
+            return false;
+        };
+        self.tree.remove(&ZSetNode::new(key.clone(), score, order));
+        true
+    }
+
+    pub fn remove_score(&mut self, key: &K) -> Option<f64> {
+        let (score, order) = self.map.remove(key)?;
+        self.tree.remove(&ZSetNode::new(key.clone(), score, order));
+        Some(score)
+    }
+
+    pub fn pop_min(&mut self) -> Option<(K, f64)> {
+        let node = self.tree.first()?;
+        let key = node.key.clone();
+        let score = node.score;
+        let order = node.order;
+        let node_to_remove = ZSetNode::new(key.clone(), score, order);
+        if self.tree.remove(&node_to_remove) {
+            self.map.remove(&key);
+            Some((key, score))
+        } else {
+            None
+        }
+    }
+
+    pub fn pop_max(&mut self) -> Option<(K, f64)> {
+        let node = self.tree.last()?;
+        let key = node.key.clone();
+        let score = node.score;
+        let order = node.order;
+        let node_to_remove = ZSetNode::new(key.clone(), score, order);
+        if self.tree.remove(&node_to_remove) {
+            self.map.remove(&key);
+            Some((key, score))
+        } else {
+            None
+        }
     }
 
     pub fn intersect(&self, another: &ZSet<K>) -> ZSet<K> {
@@ -229,16 +249,11 @@ where
             let _ = self.delete(&entry.key);
         }
     }
-
-    pub fn clear(&mut self) {
-        self.tree.clear();
-        self.map.clear();
-    }
 }
 
 impl<K> Default for ZSet<K>
 where
-    K: Eq + Hash + Ord + Clone,
+    K: Eq + Hash,
 {
     fn default() -> Self {
         Self::new()
@@ -298,8 +313,49 @@ mod tests {
         z.add("c", 3.0);
         assert_eq!(z.remove_score(&"a"), Some(2.0));
         assert!(!z.contains(&"a"));
-        assert_eq!(z.pop_min().unwrap().key(), &"b");
-        assert_eq!(z.pop_max().unwrap().key(), &"c");
+        assert_eq!(&z.pop_min().unwrap().0, &"b");
+        assert_eq!(&z.pop_max().unwrap().0, &"c");
         assert!(z.is_empty());
+    }
+
+    #[test]
+    fn test_zset_with_non_ord_key() {
+        use std::hash::Hash as StdHash;
+
+        #[derive(Debug, Clone)]
+        struct NotOrd {
+            id: u32,
+        }
+
+        impl PartialEq for NotOrd {
+            fn eq(&self, other: &Self) -> bool {
+                self.id == other.id
+            }
+        }
+
+        impl Eq for NotOrd {}
+
+        impl StdHash for NotOrd {
+            fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+                self.id.hash(state);
+            }
+        }
+
+        let mut z = ZSet::new();
+        let k1 = NotOrd { id: 1 };
+        let k2 = NotOrd { id: 2 };
+        let k3 = NotOrd { id: 3 };
+
+        assert!(z.add(k1, 3.0));
+        assert!(z.add(k2, 1.0));
+        assert!(z.add(k3, 2.0));
+
+        assert_eq!(z.rank(&NotOrd { id: 2 }), 1);
+        assert_eq!(z.rank(&NotOrd { id: 3 }), 2);
+        assert_eq!(z.rank(&NotOrd { id: 1 }), 3);
+
+        let min = z.pop_min().unwrap();
+        assert_eq!(min.0.id, 2);
+        assert_eq!(min.1, 1.0);
     }
 }

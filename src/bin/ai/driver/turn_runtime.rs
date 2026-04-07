@@ -502,7 +502,7 @@ pub(super) async fn run_turn(
 
     let mut iteration = 0usize;
     let mut force_final_response = false;
-    let mut final_assistant_text = String::new();
+    let final_assistant_text;
     let mut final_assistant_recorded = false;
     loop {
         iteration += 1;
@@ -1028,6 +1028,7 @@ mod tests {
             session_history_file: history_file,
             client: reqwest::Client::builder().build().unwrap(),
             current_model: String::new(),
+            current_agent: "build".to_string(),
             pending_files: None,
             pending_clipboard: false,
             pending_short_output: false,
