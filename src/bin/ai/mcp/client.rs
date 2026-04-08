@@ -19,6 +19,58 @@ use crate::ai::types::{
     FunctionDefinition, McpPrompt, McpResource, McpServerConfig, McpTool, ToolDefinition,
 };
 
+/// 发送 JSON-RPC 请求到 MCP 服务器连接（独立函数，可在任何上下文中调用）
+pub(in crate::ai) fn send_request_to_conn(
+    conn: &mut McpServerConnection,
+    id: u64,
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value, String> {
+    
+    let request = JsonRpcRequest {
+        jsonrpc: "2.0".to_string(),
+        id,
+        method: method.to_string(),
+        params,
+    };
+
+    let request_str = serde_json::to_string(&request)
+        .map_err(|e| format!("Failed to serialize request: {}", e))?;
+
+    writeln!(conn.stdin_mut(), "{}", request_str)
+        .map_err(|e| conn.decorate_transport_error(format!("Failed to send request: {}", e)))?;
+
+    let response_line = conn.read_response_line()?;
+
+    let response: JsonRpcResponse = serde_json::from_str(&response_line)
+        .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+    if response.jsonrpc != "2.0" {
+        return Err(format!("Invalid JSON-RPC version: {}", response.jsonrpc));
+    }
+    if let Some(resp_id) = response.id
+        && resp_id != id
+    {
+        return Err(format!(
+            "MCP response id mismatch: expected {}, got {}",
+            id, resp_id
+        ));
+    }
+
+    if let Some(error) = response.error {
+        if let Some(data) = error.data {
+            return Err(format!(
+                "MCP error {}: {} ({})",
+                error.code, error.message, data
+            ));
+        } else {
+            return Err(format!("MCP error {}: {}", error.code, error.message));
+        }
+    }
+
+    response.result.ok_or("No result in response".to_string())
+}
+
 use super::{
     connection::McpServerConnection,
     jsonrpc::{JsonRpcRequest, JsonRpcResponse},
@@ -27,7 +79,7 @@ use super::{
 type ServerId = String;
 
 pub(in crate::ai) struct McpClient {
-    servers: FastMap<ServerId, Mutex<McpServerConnection>>,
+    pub(in crate::ai) servers: FastMap<ServerId, Mutex<McpServerConnection>>,
     next_id: AtomicU64,
     cached_tool_definitions: Vec<ToolDefinition>,
     cached_resources: Vec<(String, McpResource)>,
@@ -165,7 +217,7 @@ impl McpClient {
         Ok(())
     }
 
-    fn rebuild_metadata_cache(&mut self) {
+    pub(in crate::ai) fn rebuild_metadata_cache(&mut self) {
         let mut tool_definitions = Vec::new();
         let mut resources = Vec::new();
         let mut prompts = Vec::new();
@@ -218,7 +270,7 @@ impl McpClient {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn send_request_to_conn(
+    pub(in crate::ai) fn send_request_to_conn(
         conn: &mut McpServerConnection,
         id: u64,
         method: &str,

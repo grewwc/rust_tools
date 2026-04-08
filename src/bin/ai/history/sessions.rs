@@ -9,7 +9,7 @@ use chrono::{DateTime, Local};
 use rust_tools::cw::SkipMap;
 
 use super::{
-    blob::{delete_assets_dir, delete_history_artifacts, is_sqlite_path, parse_history_blob},
+    blob::{delete_assets_dir, delete_history_artifacts},
     markdown::messages_to_markdown,
     sqlite::{read_all_messages_sqlite, read_first_user_prompt_sqlite},
     types::Message,

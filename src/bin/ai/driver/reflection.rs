@@ -162,7 +162,7 @@ pub(super) fn build_persistent_guidelines(question: &str, max_chars: usize) -> O
     let store = MemoryStore::from_env_or_config();
     let jsonl_store = JsonlStore::new(store.path().to_path_buf());
     let config = KnowledgeConfig::from_config_file();
-    recall::build_persistent_guidelines(&jsonl_store, question, max_chars, &config)
+    build_persistent_guidelines_from_parts(&jsonl_store, question, max_chars, &config)
 }
 
 pub(super) struct AutoRecalledKnowledge {
@@ -180,15 +180,7 @@ pub(super) fn build_auto_recalled_knowledge(
     let store = MemoryStore::from_env_or_config();
     let jsonl_store = JsonlStore::new(store.path().to_path_buf());
     let config = KnowledgeConfig::from_config_file();
-    recall::build_auto_recalled_knowledge(&jsonl_store, question, max_chars, &config).map(|r| {
-        AutoRecalledKnowledge {
-            content: r.content,
-            high_confidence_project_memory: r.high_confidence_project_memory,
-            entry_count: r.entry_count,
-            project_hint: r.project_hint,
-            categories: r.categories,
-        }
-    })
+    build_auto_recalled_knowledge_from_parts(&jsonl_store, question, max_chars, &config)
 }
 
 pub(super) fn build_auto_recalled_knowledge_with_project(
@@ -199,15 +191,90 @@ pub(super) fn build_auto_recalled_knowledge_with_project(
     let store = MemoryStore::from_env_or_config();
     let jsonl_store = JsonlStore::new(store.path().to_path_buf());
     let config = KnowledgeConfig::from_config_file();
-    recall::build_auto_recalled_knowledge_with_project(&jsonl_store, question, max_chars, project_hint, &config).map(|r| {
-        AutoRecalledKnowledge {
-            content: r.content,
-            high_confidence_project_memory: r.high_confidence_project_memory,
-            entry_count: r.entry_count,
-            project_hint: r.project_hint,
-            categories: r.categories,
-        }
-    })
+    build_auto_recalled_knowledge_with_project_from_parts(
+        &jsonl_store,
+        question,
+        max_chars,
+        project_hint,
+        &config,
+    )
+}
+
+pub(super) struct RecallBundle {
+    pub(super) guidelines: Option<String>,
+    pub(super) recalled: Option<AutoRecalledKnowledge>,
+}
+
+pub(super) fn build_recall_bundle(
+    question: &str,
+    guideline_max_chars: usize,
+    recall_max_chars: usize,
+) -> RecallBundle {
+    let store = MemoryStore::from_env_or_config();
+    let jsonl_store = JsonlStore::new(store.path().to_path_buf());
+    let config = KnowledgeConfig::from_config_file();
+    RecallBundle {
+        guidelines: build_persistent_guidelines_from_parts(
+            &jsonl_store,
+            question,
+            guideline_max_chars,
+            &config,
+        ),
+        recalled: build_auto_recalled_knowledge_from_parts(
+            &jsonl_store,
+            question,
+            recall_max_chars,
+            &config,
+        ),
+    }
+}
+
+fn build_persistent_guidelines_from_parts(
+    jsonl_store: &JsonlStore,
+    question: &str,
+    max_chars: usize,
+    config: &KnowledgeConfig,
+) -> Option<String> {
+    recall::build_persistent_guidelines(jsonl_store, question, max_chars, config)
+}
+
+fn build_auto_recalled_knowledge_from_parts(
+    jsonl_store: &JsonlStore,
+    question: &str,
+    max_chars: usize,
+    config: &KnowledgeConfig,
+) -> Option<AutoRecalledKnowledge> {
+    recall::build_auto_recalled_knowledge(jsonl_store, question, max_chars, config)
+        .map(map_auto_recalled_knowledge)
+}
+
+fn build_auto_recalled_knowledge_with_project_from_parts(
+    jsonl_store: &JsonlStore,
+    question: &str,
+    max_chars: usize,
+    project_hint: Option<&str>,
+    config: &KnowledgeConfig,
+) -> Option<AutoRecalledKnowledge> {
+    recall::build_auto_recalled_knowledge_with_project(
+        jsonl_store,
+        question,
+        max_chars,
+        project_hint,
+        config,
+    )
+    .map(map_auto_recalled_knowledge)
+}
+
+fn map_auto_recalled_knowledge(
+    r: crate::ai::knowledge::retrieval::recall::AutoRecalledKnowledge,
+) -> AutoRecalledKnowledge {
+    AutoRecalledKnowledge {
+        content: r.content,
+        high_confidence_project_memory: r.high_confidence_project_memory,
+        entry_count: r.entry_count,
+        project_hint: r.project_hint,
+        categories: r.categories,
+    }
 }
 
 #[cfg(test)]

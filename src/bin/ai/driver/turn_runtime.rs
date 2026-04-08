@@ -4,9 +4,9 @@ use colored::Colorize;
 use serde_json::Value;
 
 use crate::ai::{
-    history::{Message, SessionStore, append_history_messages, build_context_history},
+    history::{append_history_messages, build_context_history, Message, SessionStore},
     mcp::McpClient,
-    request, stream,
+    request::{self, do_request_messages}, stream,
     types::{App, StreamOutcome, StreamResult},
 };
 
@@ -32,7 +32,8 @@ struct LargeToolSummary {
 }
 
 // #region debug-point agent-hang:reporter
-fn report_agent_hang_debug(
+#[cfg(feature = "agent-hang-debug")]
+pub(in crate::ai) fn report_agent_hang_debug(
     run_id: &'static str,
     hypothesis_id: &'static str,
     location: &'static str,
@@ -71,6 +72,16 @@ fn report_agent_hang_debug(
             let _ = client.post(debug_server_url).json(&payload).send();
         }
     });
+}
+
+#[cfg(not(feature = "agent-hang-debug"))]
+pub(in crate::ai) fn report_agent_hang_debug(
+    _run_id: &'static str,
+    _hypothesis_id: &'static str,
+    _location: &'static str,
+    _msg: &'static str,
+    _data: Value,
+) {
 }
 // #endregion
 
@@ -431,13 +442,39 @@ pub(super) async fn run_turn(
             }
         }
     }
-    if let Some(guidelines) = super::reflection::build_persistent_guidelines(&question, 1200) {
-        if !guidelines.trim().is_empty() {
-            skill_turn.append_system_prompt(&format!("\n{guidelines}"));
+    let recall_intent = skill_turn.intent();
+    let skip_recall_for_skill_context = skill_turn.skip_recall_by_skill();
+    let skip_recall_for_light_turn = skill_turn.matched_skill_name().is_none()
+        && question.chars().count() <= 64
+        && matches!(
+            recall_intent.core,
+            super::intent_recognition::CoreIntent::Casual
+                | super::intent_recognition::CoreIntent::QueryConcept
+        );
+    let skip_recall = skip_recall_for_skill_context || skip_recall_for_light_turn;
+    report_agent_hang_debug(
+        "post-fix",
+        "K",
+        "turn_runtime::run_turn:knowledge_recall:gate",
+        "[DEBUG] knowledge recall gate decided",
+        serde_json::json!({
+            "matched_skill": skill_turn.matched_skill_name(),
+            "core": format!("{:?}", recall_intent.core),
+            "skip_recall_for_skill_context": skip_recall_for_skill_context,
+            "skip_recall_for_light_turn": skip_recall_for_light_turn,
+            "skip_recall": skip_recall,
+        }),
+    );
+    if !skip_recall {
+        let recall_bundle = super::reflection::build_recall_bundle(&question, 1200, 2000);
+        if let Some(guidelines) = recall_bundle.guidelines {
+            if !guidelines.trim().is_empty() {
+                skill_turn.append_system_prompt(&format!("\n{guidelines}"));
+            }
         }
-    }
-    if let Some(recalled) = super::reflection::build_auto_recalled_knowledge(&question, 2000) {
-        if !recalled.content.trim().is_empty() {
+        if let Some(recalled) = recall_bundle.recalled
+            && !recalled.content.trim().is_empty()
+        {
             let project_part = recalled
                 .project_hint
                 .as_deref()
@@ -539,7 +576,6 @@ pub(super) async fn run_turn(
             skill_turn = new_skill_turn;
             messages[0].content = Value::String(skill_turn.system_prompt().to_string());
         }
-
         let mut current_history = String::new();
         app.streaming
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -577,7 +613,7 @@ pub(super) async fn run_turn(
             }),
         );
         // #endregion
-        let request_result = request::do_request_messages(app, &next_model, &messages, true).await;
+        let request_result = do_request_messages(app, &next_model, &messages, true).await;
         // #region debug-point B:request-end
         report_agent_hang_debug(
             "pre-fix",
@@ -1023,6 +1059,8 @@ mod tests {
                 history_keep_last: 256,
                 history_summary_max_chars: 4_000,
                 intent_model: None,
+                intent_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("config/intent/intent_model.json"),
             },
             session_id: "test".to_string(),
             session_history_file: history_file,

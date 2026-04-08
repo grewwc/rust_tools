@@ -276,6 +276,8 @@ pub(super) fn print_help() {
     println!("    - Press Ctrl+C to interrupt streaming or exit");
     println!();
     println!("Config (.configW):");
+    println!("  ai.intent_model                    light model for thinking gate / skill router");
+    println!("  ai.intent.model_path               local TF-IDF + LR intent model json");
     println!("  ai.model.auto_thinking.enable      auto gate switch (default: true)");
     println!("  ai.model.auto_thinking.threshold   model gate confidence threshold (default: 0.7)");
 }

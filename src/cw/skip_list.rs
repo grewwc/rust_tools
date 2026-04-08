@@ -212,7 +212,12 @@ impl<K, V> IntoIterator for Box<SkipMap<K, V>> {
     type IntoIter = IntoSkipMapIter<K, V>;
 
     fn into_iter(mut self) -> Self::IntoIter {
-        let first = self.head.forward.first().copied().unwrap_or(ptr::null_mut());
+        let first = self
+            .head
+            .forward
+            .first()
+            .copied()
+            .unwrap_or(ptr::null_mut());
         self.head.forward.fill(ptr::null_mut());
         self.len = 0;
         IntoSkipMapIter { curr_node: first }
@@ -229,7 +234,7 @@ impl<K, V> Iterator for IntoSkipMapIter<K, V> {
         let temp = std::mem::replace(&mut self.curr_node, ptr::null_mut());
         unsafe {
             let boxed = Box::from_raw(temp);
-            let next = (*boxed.forward.get_unchecked(0)) as *mut SkipNode<K,V>;
+            let next = (*boxed.forward.get_unchecked(0)) as *mut SkipNode<K, V>;
             self.curr_node = next;
             let k = ptr::read(&boxed.k).assume_init();
             let v = ptr::read(&boxed.v).assume_init();
@@ -241,6 +246,11 @@ impl<K, V> Iterator for IntoSkipMapIter<K, V> {
 pub struct SkipListIter<'a, K, V> {
     curr: *mut SkipNode<K, V>,
     _marker: PhantomData<&'a SkipMap<K, V>>,
+}
+
+pub struct SkipListIterMut<'a, K, V> {
+    curr: *mut SkipNode<K, V>,
+    _marker: PhantomData<&'a mut SkipMap<K, V>>,
 }
 
 impl<'a, K, V> IntoIterator for &'a SkipMap<K, V> {
@@ -267,10 +277,33 @@ impl<'a, K, V> Iterator for SkipListIter<'a, K, V> {
     }
 }
 
+impl<'a, K, V> Iterator for SkipListIterMut<'a, K, V> {
+    type Item = (&'a mut K, &'a mut V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.curr.is_null() {
+            return None;
+        }
+        unsafe {
+            let node = &mut *self.curr;
+            self.curr = *node.forward.get_unchecked(0);
+            Some((node.k.assume_init_mut(), node.v.assume_init_mut()))
+        }
+    }
+}
+
 impl<K, V> SkipMap<K, V> {
     pub fn iter(&self) -> SkipListIter<'_, K, V> {
         let curr = unsafe { *self.head.forward.get_unchecked(0) };
         SkipListIter {
+            curr,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn iter_mut(&mut self) -> SkipListIterMut<'_, K, V> {
+        let curr = unsafe { *self.head.forward.get_unchecked(0) };
+        SkipListIterMut {
             curr,
             _marker: PhantomData,
         }
@@ -375,6 +408,10 @@ where
 
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         self.inner.iter().map(|(k, _)| k)
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.inner.iter_mut().map(|(k, _)| k)
     }
 
     /// Returns a reference to the first (smallest) element, or `None` if empty.

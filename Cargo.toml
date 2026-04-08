@@ -3,6 +3,10 @@ name = "rust_tools"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+agent-hang-debug = []
+
 [dependencies]
 arboard = "3.3"
 image = {version = "0.25.8", features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico", "qoi"]}
@@ -39,6 +43,8 @@ rand = "0.10.0"
 fastembed = "4"
 sled = "0.34"
 dirs = "5"
+rust_tools_macros = { path = "crates/rust_tools_macros" }
+tracing = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "*"

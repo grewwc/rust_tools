@@ -5,7 +5,7 @@ use crate::ai::{
     types::{App, ToolDefinition},
 };
 use crate::commonw::configw;
-use std::ptr::NonNull;
+use std::{ptr::NonNull, time::Instant};
 use rust_tools::cw::SkipMap;
 use chrono::{DateTime, Utc};
 
@@ -19,6 +19,8 @@ pub(super) struct SkillTurnGuard {
     restore_agent_context: Option<(Vec<ToolDef>, usize)>,
     system_prompt: String,
     matched_skill_name: Option<String>,
+    intent: UserIntent,
+    skip_recall_by_skill: bool,
 }
 
 impl SkillTurnGuard {
@@ -32,6 +34,14 @@ impl SkillTurnGuard {
 
     pub(super) fn matched_skill_name(&self) -> Option<&str> {
         self.matched_skill_name.as_deref()
+    }
+
+    pub(super) fn intent(&self) -> &UserIntent {
+        &self.intent
+    }
+
+    pub(super) fn skip_recall_by_skill(&self) -> bool {
+        self.skip_recall_by_skill
     }
 }
 
@@ -225,6 +235,16 @@ fn build_system_prompt(skill: Option<&SkillManifest>) -> String {
     system_prompt
 }
 
+fn should_skip_recall_for_skill(skill: Option<&SkillManifest>) -> bool {
+    let Some(skill) = skill else {
+        return false;
+    };
+    matches!(
+        skill.name.as_str(),
+        "debugger" | "code-review" | "refactor" | "prompt-optimizer" | "openclaw"
+    ) || skill.tool_groups.iter().any(|g| g == "openclaw")
+}
+
 pub(super) async fn prepare_skill_for_turn(
     app: &mut App,
     mcp_client: &McpClient,
@@ -243,14 +263,63 @@ pub(super) async fn prepare_skill_for_turn(
         .trim()
         .eq_ignore_ascii_case("false");
 
-    let intent = intent_recognition::detect_intent_fallback(question);
-
-    let router_selected = if router_enabled {
+    let intent_start = Instant::now();
+    super::turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "R",
+        "skill_runtime::prepare_skill_for_turn:intent:begin",
+        "[DEBUG] intent recognition started",
+        serde_json::json!({
+            "question_len": question.chars().count(),
+        }),
+    );
+    let intent =
+        intent_recognition::detect_intent_with_model_path(question, &app.config.intent_model_path);
+    super::turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "R",
+        "skill_runtime::prepare_skill_for_turn:intent:end",
+        "[DEBUG] intent recognition finished",
+        serde_json::json!({
+            "core": format!("{:?}", intent.core),
+            "elapsed_ms": intent_start.elapsed().as_secs_f64() * 1000.0,
+        }),
+    );
+    let question_len = question.chars().count();
+    let skip_router_for_local_intent = matches!(
+        intent.core,
+        intent_recognition::CoreIntent::Casual | intent_recognition::CoreIntent::QueryConcept
+    ) && question_len <= 64;
+    let router_start = Instant::now();
+    super::turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "R",
+        "skill_runtime::prepare_skill_for_turn:router:begin",
+        "[DEBUG] skill router started",
+        serde_json::json!({
+            "router_enabled": router_enabled,
+            "skip_router_for_local_intent": skip_router_for_local_intent,
+            "skill_count": skill_manifests.len(),
+        }),
+    );
+    let router_selected = if router_enabled && !skip_router_for_local_intent {
         let model = app.current_model.clone();
         request::select_skill_via_model(app, &model, question, skill_manifests).await
     } else {
         None
     };
+    super::turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "R",
+        "skill_runtime::prepare_skill_for_turn:router:end",
+        "[DEBUG] skill router finished",
+        serde_json::json!({
+            "router_enabled": router_enabled,
+            "skip_router_for_local_intent": skip_router_for_local_intent,
+            "selected": router_selected.as_deref(),
+            "elapsed_ms": router_start.elapsed().as_secs_f64() * 1000.0,
+        }),
+    );
 
     let heuristic_skill = match_skill(skill_manifests, question, Some(&intent));
     let router_skill = router_selected
@@ -274,6 +343,7 @@ pub(super) async fn prepare_skill_for_turn(
         }
     }
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
+    let skip_recall_by_skill = should_skip_recall_for_skill(skill);
     let prompt_optimizer_active = skill
         .as_ref()
         .is_some_and(|s| s.name.as_str() == "prompt-optimizer");
@@ -291,6 +361,8 @@ pub(super) async fn prepare_skill_for_turn(
         restore_agent_context,
         system_prompt: build_system_prompt(skill),
         matched_skill_name,
+        intent,
+        skip_recall_by_skill,
     };
     guard
 }

@@ -1,16 +1,18 @@
 use std::fmt;
 use std::fs;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use colored::Colorize;
 use reqwest::{Response, StatusCode};
+use rust_tools::commonw;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{files, history::Message, models, skills::SkillManifest, types::App};
 use crate::ai::config_schema::AiConfig;
+use crate::ai::driver::intent_recognition;
 use crate::commonw::configw;
 
 #[derive(Debug, Serialize)]
@@ -124,6 +126,7 @@ const REQUEST_MAX_ATTEMPTS_429: usize = 16; // 429 错误重试 16 次
 const REQUEST_RETRY_BASE_MS: u64 = 500;
 const REQUEST_RETRY_MAX_MS: u64 = 4000;
 const DEFAULT_AUTO_THINKING_THRESHOLD: f64 = 0.7;
+const DEFAULT_CONTROL_MODEL: &str = "qwen3.5-flash";
 
 fn should_retry_status(status: StatusCode) -> bool {
     status.as_u16() == 429 || status.is_server_error()
@@ -137,6 +140,15 @@ fn retry_delay(attempt: usize) -> Duration {
     let shift = attempt.saturating_sub(1).min(4) as u32;
     let backoff = REQUEST_RETRY_BASE_MS.saturating_mul(1u64 << shift);
     Duration::from_millis(backoff.min(REQUEST_RETRY_MAX_MS))
+}
+
+fn control_model_for_aux_tasks(app: &App) -> String {
+    app.config
+        .intent_model
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .map(models::determine_model)
+        .unwrap_or_else(|| models::determine_model(DEFAULT_CONTROL_MODEL))
 }
 
 pub(super) fn is_transient_error(err: &RequestError) -> bool {
@@ -153,6 +165,7 @@ pub(super) fn is_transient_error(err: &RequestError) -> bool {
 /// 2. If model doesn't support thinking, return false
 /// 3. If auto-thinking is disabled by config, return false
 /// 4. Auto-detect based on question complexity
+#[commonw::debug_measure_time("resolve_thinking")]
 async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool {
     // CLI flag always wins
     if app.cli.thinking {
@@ -175,6 +188,36 @@ async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool 
         return false;
     }
 
+    let question = messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .filter_map(|m| m.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let question = question.trim();
+    if !question.is_empty() {
+        let local_intent =
+            intent_recognition::detect_intent_with_model_path(question, &app.config.intent_model_path);
+        let question_len = question.chars().count();
+        let skip_thinking_gate = matches!(
+            local_intent.core,
+            intent_recognition::CoreIntent::Casual | intent_recognition::CoreIntent::QueryConcept
+        ) && question_len <= 64;
+        if skip_thinking_gate {
+            crate::ai::driver::turn_runtime::report_agent_hang_debug(
+                "post-fix",
+                "G",
+                "request::resolve_thinking:local_skip",
+                "[DEBUG] resolve thinking skipped by local intent",
+                serde_json::json!({
+                    "core": format!("{:?}", local_intent.core),
+                    "question_len": question_len,
+                }),
+            );
+            return false;
+        }
+    }
+
     // Model-only decision path: if gate fails/uncertain, default to disabled.
     decide_thinking_via_model(app, model, messages)
         .await
@@ -185,7 +228,21 @@ async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool 
 ///
 /// Returns `Some(decision)` only when response parses successfully and confidence
 /// passes configured threshold; otherwise returns `None` for local fallback.
-async fn decide_thinking_via_model(app: &App, model: &str, messages: &[Message]) -> Option<bool> {
+async fn decide_thinking_via_model(
+    app: &App,
+    _model: &str,
+    messages: &[Message],
+) -> Option<bool> {
+    let gate_start = Instant::now();
+    crate::ai::driver::turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "G",
+        "request::decide_thinking_via_model:begin",
+        "[DEBUG] thinking gate started",
+        serde_json::json!({
+            "message_count": messages.len(),
+        }),
+    );
     let user_text: String = messages
         .iter()
         .filter(|m| m.role == "user")
@@ -194,6 +251,15 @@ async fn decide_thinking_via_model(app: &App, model: &str, messages: &[Message])
         .join("\n");
     let question = user_text.trim();
     if question.is_empty() {
+        crate::ai::driver::turn_runtime::report_agent_hang_debug(
+            "pre-fix",
+            "G",
+            "request::decide_thinking_via_model:empty",
+            "[DEBUG] thinking gate skipped empty question",
+            serde_json::json!({
+                "elapsed_ms": gate_start.elapsed().as_secs_f64() * 1000.0,
+            }),
+        );
         return None;
     }
 
@@ -221,8 +287,9 @@ async fn decide_thinking_via_model(app: &App, model: &str, messages: &[Message])
         },
     ];
 
+    let control_model = control_model_for_aux_tasks(app);
     let request_body = RequestBody {
-        model,
+        model: &control_model,
         messages: &gate_messages,
         stream: false,
         enable_thinking: false,
@@ -242,6 +309,15 @@ async fn decide_thinking_via_model(app: &App, model: &str, messages: &[Message])
         .ok()?;
 
     if !response.status().is_success() {
+        crate::ai::driver::turn_runtime::report_agent_hang_debug(
+            "pre-fix",
+            "G",
+            "request::decide_thinking_via_model:http_non_success",
+            "[DEBUG] thinking gate http non success",
+            serde_json::json!({
+                "elapsed_ms": gate_start.elapsed().as_secs_f64() * 1000.0,
+            }),
+        );
         return None;
     }
 
@@ -255,11 +331,24 @@ async fn decide_thinking_via_model(app: &App, model: &str, messages: &[Message])
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(DEFAULT_AUTO_THINKING_THRESHOLD);
 
-    if confidence >= threshold {
+    let result = if confidence >= threshold {
         Some(thinking)
     } else {
         None
-    }
+    };
+    crate::ai::driver::turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "G",
+        "request::decide_thinking_via_model:end",
+        "[DEBUG] thinking gate finished",
+        serde_json::json!({
+            "decision": result,
+            "confidence": confidence,
+            "threshold": threshold,
+            "elapsed_ms": gate_start.elapsed().as_secs_f64() * 1000.0,
+        }),
+    );
+    result
 }
 
 fn parse_thinking_gate_output(s: &str) -> Option<(bool, f64)> {
@@ -303,6 +392,7 @@ fn extract_message_text(msg: &Message) -> Option<String> {
     }
 }
 
+#[commonw::debug_measure_time("do_request_message")]
 pub(super) async fn do_request_messages(
     app: &mut App,
     model: &str,
@@ -310,7 +400,18 @@ pub(super) async fn do_request_messages(
     stream: bool,
 ) -> Result<Response, RequestError> {
     let (tools_value, tool_choice) = agent_tools_for_request(app, model);
+    let thinking_start = Instant::now();
     let enable_thinking = resolve_thinking(app, model, messages).await;
+    crate::ai::driver::turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "G",
+        "request::do_request_messages:resolve_thinking:end",
+        "[DEBUG] resolve thinking finished",
+        serde_json::json!({
+            "enable_thinking": enable_thinking,
+            "elapsed_ms": thinking_start.elapsed().as_secs_f64() * 1000.0,
+        }),
+    );
     let request_body = RequestBody {
         model,
         messages,
@@ -322,6 +423,7 @@ pub(super) async fn do_request_messages(
     };
 
     for attempt in 1..=REQUEST_MAX_ATTEMPTS_429 {
+        let http_start = Instant::now();
         let response = app
             .client
             .post(&app.config.endpoint)
@@ -334,6 +436,17 @@ pub(super) async fn do_request_messages(
         match response {
             Ok(response) => {
                 if response.status().is_success() {
+                    crate::ai::driver::turn_runtime::report_agent_hang_debug(
+                        "pre-fix",
+                        "B",
+                        "request::do_request_messages:http_success",
+                        "[DEBUG] request http success",
+                        serde_json::json!({
+                            "attempt": attempt,
+                            "stream": stream,
+                            "elapsed_ms": http_start.elapsed().as_secs_f64() * 1000.0,
+                        }),
+                    );
                     return Ok(response);
                 }
                 let status = response.status();
@@ -349,6 +462,17 @@ pub(super) async fn do_request_messages(
                 };
 
                 if should_retry_status(status) && attempt < max_attempts_for_status {
+                    crate::ai::driver::turn_runtime::report_agent_hang_debug(
+                        "pre-fix",
+                        "B",
+                        "request::do_request_messages:http_retry",
+                        "[DEBUG] request http retry",
+                        serde_json::json!({
+                            "attempt": attempt,
+                            "status": status_code,
+                            "elapsed_ms": http_start.elapsed().as_secs_f64() * 1000.0,
+                        }),
+                    );
                     // 打印 sleep 原因
                     let delay = retry_delay(attempt);
 
@@ -371,11 +495,32 @@ pub(super) async fn do_request_messages(
                     tokio::time::sleep(delay).await;
                     continue;
                 }
+                crate::ai::driver::turn_runtime::report_agent_hang_debug(
+                    "pre-fix",
+                    "B",
+                    "request::do_request_messages:http_error",
+                    "[DEBUG] request http error",
+                    serde_json::json!({
+                        "attempt": attempt,
+                        "status": status_code,
+                        "elapsed_ms": http_start.elapsed().as_secs_f64() * 1000.0,
+                    }),
+                );
                 return Err(err);
             }
             Err(err) => {
                 let retryable = is_retryable_reqwest_error(&err);
                 let err = RequestError::network(err);
+                crate::ai::driver::turn_runtime::report_agent_hang_debug(
+                    "pre-fix",
+                    "B",
+                    "request::do_request_messages:network_error",
+                    "[DEBUG] request network error",
+                    serde_json::json!({
+                        "attempt": attempt,
+                        "elapsed_ms": http_start.elapsed().as_secs_f64() * 1000.0,
+                    }),
+                );
                 if retryable && attempt < REQUEST_MAX_ATTEMPTS {
                     // 打印 sleep 原因
                     let delay = retry_delay(attempt);
@@ -462,14 +607,43 @@ fn extract_router_content(v: &Value) -> Option<String> {
 
 pub(super) async fn select_skill_via_model(
     app: &mut App,
-    model: &str,
+    _model: &str,
     question: &str,
     skills: &[SkillManifest],
 ) -> Option<String> {
+    let router_start = Instant::now();
+    crate::ai::driver::turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "R",
+        "request::select_skill_via_model:begin",
+        "[DEBUG] model skill router started",
+        serde_json::json!({
+            "question_len": question.chars().count(),
+            "skill_count": skills.len(),
+        }),
+    );
     if question.trim().is_empty() {
+        crate::ai::driver::turn_runtime::report_agent_hang_debug(
+            "pre-fix",
+            "R",
+            "request::select_skill_via_model:empty_question",
+            "[DEBUG] model skill router skipped empty question",
+            serde_json::json!({
+                "elapsed_ms": router_start.elapsed().as_secs_f64() * 1000.0,
+            }),
+        );
         return None;
     }
     if skills.is_empty() {
+        crate::ai::driver::turn_runtime::report_agent_hang_debug(
+            "pre-fix",
+            "R",
+            "request::select_skill_via_model:empty_skills",
+            "[DEBUG] model skill router skipped empty skills",
+            serde_json::json!({
+                "elapsed_ms": router_start.elapsed().as_secs_f64() * 1000.0,
+            }),
+        );
         return None;
     }
 
@@ -526,8 +700,9 @@ Skills:
         },
     ];
 
+    let control_model = control_model_for_aux_tasks(app);
     let request_body = RequestBody {
-        model,
+        model: &control_model,
         messages: &messages,
         stream: false,
         enable_thinking: false,
@@ -547,6 +722,15 @@ Skills:
         .ok()?;
 
     if !response.status().is_success() {
+        crate::ai::driver::turn_runtime::report_agent_hang_debug(
+            "pre-fix",
+            "R",
+            "request::select_skill_via_model:http_non_success",
+            "[DEBUG] model skill router http non success",
+            serde_json::json!({
+                "elapsed_ms": router_start.elapsed().as_secs_f64() * 1000.0,
+            }),
+        );
         return None;
     }
 
@@ -559,7 +743,20 @@ Skills:
         .get_opt("ai.skills.router_threshold")
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.7);
-    if confidence >= threshold { name } else { None }
+    let selected = if confidence >= threshold { name } else { None };
+    crate::ai::driver::turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "R",
+        "request::select_skill_via_model:end",
+        "[DEBUG] model skill router finished",
+        serde_json::json!({
+            "selected": selected,
+            "confidence": confidence,
+            "threshold": threshold,
+            "elapsed_ms": router_start.elapsed().as_secs_f64() * 1000.0,
+        }),
+    );
+    selected
 }
 
 fn agent_tools_for_request(app: &App, model: &str) -> (Option<Value>, Option<Value>) {
@@ -696,4 +893,3 @@ mod tests {
         assert_eq!(parse_thinking_gate_output(s), None);
     }
 }
-

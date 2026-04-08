@@ -65,6 +65,8 @@ fn resolve_model_is_unicode_safe() {
         history_keep_last: 8,
         history_summary_max_chars: 4000,
         intent_model: None,
+        intent_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("config/intent/intent_model.json"),
     };
     let client = reqwest::Client::builder().build().unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));

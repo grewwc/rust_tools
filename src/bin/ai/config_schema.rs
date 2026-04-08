@@ -27,6 +27,7 @@ impl AiConfig {
 
     // ── Intent ─────────────────────────────────────────────
     pub const INTENT_MODEL: &str = "ai.intent_model";
+    pub const INTENT_MODEL_PATH: &str = "ai.intent.model_path";
 
     // ── MCP ────────────────────────────────────────────────
     pub const MCP_CONFIG: &str = "ai.mcp.config";

@@ -48,4 +48,10 @@ pub mod types;
 pub mod utils;
 
 // 重新导出常用类型
+pub use rust_tools_macros::{
+    debug_measure_time,
+    debug_measure_time_tracing,
+    measure_time,
+    measure_time_tracing,
+};
 pub use types::{FastMap, FastSet};

@@ -27,6 +27,7 @@ pub(super) struct AppConfig {
     pub(super) history_keep_last: usize,
     pub(super) history_summary_max_chars: usize,
     pub(super) intent_model: Option<String>,
+    pub(super) intent_model_path: PathBuf,
 }
 
 /// Main application state holding CLI arguments, configuration,
@@ -105,16 +106,16 @@ pub(super) struct AgentContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct McpServerConfig {
-    pub(super) command: String,
+pub(in crate::ai) struct McpServerConfig {
+    pub(in crate::ai) command: String,
     #[serde(default)]
-    pub(super) args: Vec<String>,
+    pub(in crate::ai) args: Vec<String>,
     #[serde(default)]
-    pub(super) env: FastMap<String, String>,
+    pub(in crate::ai) env: FastMap<String, String>,
     #[serde(default = "default_mcp_request_timeout_ms")]
-    pub(super) request_timeout_ms: u64,
+    pub(in crate::ai) request_timeout_ms: u64,
     #[serde(default)]
-    pub(super) disabled: bool,
+    pub(in crate::ai) disabled: bool,
 }
 
 fn default_mcp_request_timeout_ms() -> u64 {
@@ -122,28 +123,28 @@ fn default_mcp_request_timeout_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct McpTool {
-    pub(super) name: String,
-    pub(super) description: Option<String>,
+pub(in crate::ai) struct McpTool {
+    pub(in crate::ai) name: String,
+    pub(in crate::ai) description: Option<String>,
     #[serde(rename = "inputSchema")]
-    pub(super) input_schema: Value,
+    pub(in crate::ai) input_schema: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct McpResource {
-    pub(super) uri: String,
-    pub(super) name: String,
+pub(in crate::ai) struct McpResource {
+    pub(in crate::ai) uri: String,
+    pub(in crate::ai) name: String,
     #[serde(default)]
-    pub(super) description: Option<String>,
+    pub(in crate::ai) description: Option<String>,
     #[serde(default, rename = "mimeType")]
-    pub(super) mime_type: Option<String>,
+    pub(in crate::ai) mime_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct McpPrompt {
-    pub(super) name: String,
+pub(in crate::ai) struct McpPrompt {
+    pub(in crate::ai) name: String,
     #[serde(default)]
-    pub(super) description: Option<String>,
+    pub(in crate::ai) description: Option<String>,
     #[serde(default)]
     pub(super) arguments: Vec<McpPromptArgument>,
 }

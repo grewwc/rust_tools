@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 use uuid::Uuid;
@@ -23,6 +24,7 @@ use crate::ai::{
 pub mod commands;
 pub mod decision_log;
 pub mod input;
+pub mod intent_model;
 pub mod intent_recognition;
 pub mod mcp_init;
 pub mod model;
@@ -121,12 +123,50 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut mcp_client = McpClient::new();
+    let skills_start = Instant::now();
+    turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "S",
+        "driver::run:load_all_skills:begin",
+        "[DEBUG] loading skills",
+        serde_json::json!({ "no_skills": app.cli.no_skills }),
+    );
     let skill_manifests = if app.cli.no_skills {
         Vec::new()
     } else {
         skills::load_all_skills()
     };
-    let mcp_report = init_mcp(&mut app, &mut mcp_client);
+    turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "S",
+        "driver::run:load_all_skills:end",
+        "[DEBUG] loaded skills",
+        serde_json::json!({
+            "count": skill_manifests.len(),
+            "elapsed_ms": skills_start.elapsed().as_secs_f64() * 1000.0,
+        }),
+    );
+    let mcp_start = Instant::now();
+    turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "M",
+        "driver::run:init_mcp:begin",
+        "[DEBUG] initializing mcp",
+        serde_json::json!({}),
+    );
+    let mcp_report = init_mcp(&mut app, &mut mcp_client).await;
+    turn_runtime::report_agent_hang_debug(
+        "pre-fix",
+        "M",
+        "driver::run:init_mcp:end",
+        "[DEBUG] initialized mcp",
+        serde_json::json!({
+            "loaded": mcp_report.loaded,
+            "server_count": mcp_report.server_count,
+            "tool_count": mcp_report.tool_count,
+            "elapsed_ms": mcp_start.elapsed().as_secs_f64() * 1000.0,
+        }),
+    );
 
     if app.cli.list_tools {
         print::print_builtin_tools(&app);
@@ -142,7 +182,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let agent_manifests = agents::load_all_agents();
-
     if app.cli.list_agents {
         commands::help::print_agents_list(&agent_manifests);
         return Ok(());
@@ -173,7 +212,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             mcp_report.server_count, mcp_report.tool_count, mcp_report.config_path
         );
     }
-
     run_loop(&mut app, &mut mcp_client, &skill_manifests, &agent_manifests).await
 }
 
@@ -198,7 +236,6 @@ async fn run_loop(
             cleanup_one_shot(app);
             return Ok(());
         }
-
         let Some(ctx) = input::next_question(app)? else {
             cleanup_one_shot(app);
             return Ok(());
@@ -249,7 +286,6 @@ async fn run_loop(
             should_quit = false;
             continue;
         }
-
         let next_model = resolve_model_for_input(app, &mut question);
         app.current_model = next_model.clone();
 
@@ -278,7 +314,6 @@ async fn run_loop(
                 continue;
             }
         };
-
         if matches!(turn_outcome, turn_runtime::TurnOutcome::Quit) || should_quit {
             cleanup_one_shot(app);
             return Ok(());

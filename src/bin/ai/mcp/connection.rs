@@ -10,20 +10,20 @@ use crate::ai::types::{McpPrompt, McpResource, McpTool};
 
 use super::io::{read_available_buf, read_line_with_timeout_process};
 
-pub(super) struct McpServerConnection {
-    pub(super) config: crate::ai::types::McpServerConfig,
-    pub(super) process: Child,
-    pub(super) stdin: ChildStdin,
-    pub(super) stdout: BufReader<ChildStdout>,
-    pub(super) stderr: BufReader<ChildStderr>,
-    pub(super) request_timeout_ms: u64,
-    pub(super) tools: Vec<McpTool>,
-    pub(super) resources: Vec<McpResource>,
-    pub(super) prompts: Vec<McpPrompt>,
+pub(in crate::ai) struct McpServerConnection {
+    pub(in crate::ai) config: crate::ai::types::McpServerConfig,
+    pub(in crate::ai) process: Child,
+    pub(in crate::ai) stdin: ChildStdin,
+    pub(in crate::ai) stdout: BufReader<ChildStdout>,
+    pub(in crate::ai) stderr: BufReader<ChildStderr>,
+    pub(in crate::ai) request_timeout_ms: u64,
+    pub(in crate::ai) tools: Vec<McpTool>,
+    pub(in crate::ai) resources: Vec<McpResource>,
+    pub(in crate::ai) prompts: Vec<McpPrompt>,
 }
 
 impl McpServerConnection {
-    pub(super) fn stdin_mut(&mut self) -> &mut dyn Write {
+    pub(in crate::ai) fn stdin_mut(&mut self) -> &mut dyn Write {
         &mut self.stdin
     }
 

@@ -7,7 +7,6 @@ use super::params::parse_loop_overrides;
 use crate::ai::types::{App, QuestionContext};
 
 use crate::ai::{files, prompt::trim_trailing_newline};
-use crate::clipboardw::string_content;
 use crate::pdfw::{PdfParseOptions, parse_pdf};
 
 /// Clear any pending input from stdin to prevent stray Enter keys
