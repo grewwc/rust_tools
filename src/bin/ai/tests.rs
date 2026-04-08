@@ -711,6 +711,39 @@ fn math_frac_renders_with_nested_braces() {
 }
 
 #[test]
+fn math_renderer_preserves_longer_commands_and_literal_braces() {
+    let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
+    assert_eq!(renderer.consume_line("$$", false), "\n");
+
+    let out = renderer.consume_line(
+        r"\leftarrow \rightarrow \leftrightarrow \subseteq \supseteq \sqrt[3]{x} \sqrt[5]{y} \left\{a\right\}",
+        false,
+    );
+    assert!(out.contains("←"));
+    assert!(out.contains("→"));
+    assert!(out.contains("↔"));
+    assert!(out.contains("⊆"));
+    assert!(out.contains("⊇"));
+    assert!(out.contains("∛(x)"));
+    assert!(out.contains("√[5](y)"));
+    assert!(out.contains("{a}"));
+    assert!(!out.contains("arrow"));
+    assert!(!out.contains("⊂eq"));
+    assert!(!out.contains("⊃eq"));
+}
+
+#[test]
+fn math_renderer_maps_mathbb_and_preserves_unknown_commands() {
+    let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
+    assert_eq!(renderer.consume_line("$$", false), "\n");
+
+    let out = renderer.consume_line(r"\mathbb{R} \customcmd \alpha", false);
+    assert!(out.contains("ℝ"));
+    assert!(out.contains(r"\customcmd"));
+    assert!(out.contains("α"));
+}
+
+#[test]
 fn execute_command_blocks_dangerous_programs() {
     assert!(tools::validate_execute_command("rm -rf /").is_err());
     // assert!(tools::validate_execute_command("mv a b").is_err());

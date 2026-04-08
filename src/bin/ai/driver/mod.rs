@@ -37,10 +37,7 @@ pub mod skill_runtime;
 pub mod tools;
 pub mod turn_runtime;
 
-pub use commands::{
-    try_handle_agent_command, try_handle_feishu_auth_command, try_handle_help_command,
-    try_handle_session_command, try_handle_share_command,
-};
+pub use commands::try_handle_interactive_command;
 pub use mcp_init::*;
 pub use model::*;
 pub use skill_matching::*;
@@ -230,6 +227,15 @@ async fn run_loop(
             let _ = store.delete_session(&app.session_id);
         }
     };
+    let handle_post_command = |app: &App, should_quit: &mut bool| {
+        if *should_quit {
+            cleanup_one_shot(app);
+            true
+        } else {
+            *should_quit = false;
+            false
+        }
+    };
 
     loop {
         if app.shutdown.load(Ordering::Relaxed) {
@@ -246,44 +252,10 @@ async fn run_loop(
         }
 
         let mut question = ctx.question;
-        if try_handle_help_command(&question) {
-            if should_quit {
-                cleanup_one_shot(app);
+        if try_handle_interactive_command(app, mcp_client, &question, agent_manifests)? {
+            if handle_post_command(app, &mut should_quit) {
                 return Ok(());
             }
-            should_quit = false;
-            continue;
-        }
-        if try_handle_session_command(app, &question)? {
-            if should_quit {
-                cleanup_one_shot(app);
-                return Ok(());
-            }
-            should_quit = false;
-            continue;
-        }
-        if try_handle_agent_command(app, &question, agent_manifests)? {
-            if should_quit {
-                cleanup_one_shot(app);
-                return Ok(());
-            }
-            should_quit = false;
-            continue;
-        }
-        if try_handle_feishu_auth_command(mcp_client, &question)? {
-            if should_quit {
-                cleanup_one_shot(app);
-                return Ok(());
-            }
-            should_quit = false;
-            continue;
-        }
-        if try_handle_share_command(app, &question)? {
-            if should_quit {
-                cleanup_one_shot(app);
-                return Ok(());
-            }
-            should_quit = false;
             continue;
         }
         let next_model = resolve_model_for_input(app, &mut question);
