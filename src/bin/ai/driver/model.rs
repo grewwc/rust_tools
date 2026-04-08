@@ -13,12 +13,6 @@ pub fn resolve_model_for_input(app: &App, question: &mut String) -> String {
     ) {
         return model;
     }
-
-    let trimmed = question.trim_end();
-    if let Some(stripped) = trimmed.strip_suffix(" -d") {
-        *question = stripped.trim_end().to_string();
-        return models::forced_deepseek_model();
-    }
     app.current_model.clone()
 }
 

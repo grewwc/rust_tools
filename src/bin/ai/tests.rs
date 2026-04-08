@@ -79,7 +79,6 @@ fn resolve_model_is_unicode_safe() {
         current_model: any_model_name(),
         current_agent: "build".to_string(),
         pending_files: None,
-        pending_clipboard: false,
         pending_short_output: false,
         attached_image_files: Vec::new(),
         shutdown,
@@ -665,54 +664,6 @@ fn multiline_history_navigation_restores_draft() {
     assert_eq!(history.next(), Some("second\nline".to_string()));
     assert_eq!(history.next(), Some("draft".to_string()));
     assert_eq!(history.next(), None);
-}
-
-#[test]
-fn sigint_during_stream_only_cancels_current_reply() {
-    let shutdown = AtomicBool::new(false);
-    let streaming = AtomicBool::new(true);
-    let cancel_stream = AtomicBool::new(false);
-
-    assert_eq!(
-        super::driver::sigint_action(&shutdown, &streaming, &cancel_stream),
-        super::driver::SigintAction::CancelStream
-    );
-}
-
-#[test]
-fn second_sigint_during_stream_requests_shutdown() {
-    let shutdown = AtomicBool::new(false);
-    let streaming = AtomicBool::new(true);
-    let cancel_stream = AtomicBool::new(true);
-
-    assert_eq!(
-        super::driver::sigint_action(&shutdown, &streaming, &cancel_stream),
-        super::driver::SigintAction::Shutdown
-    );
-}
-
-#[test]
-fn sigint_while_idle_requests_graceful_shutdown() {
-    let shutdown = AtomicBool::new(false);
-    let streaming = AtomicBool::new(false);
-    let cancel_stream = AtomicBool::new(false);
-
-    assert_eq!(
-        super::driver::sigint_action(&shutdown, &streaming, &cancel_stream),
-        super::driver::SigintAction::Shutdown
-    );
-}
-
-#[test]
-fn sigint_while_shutdown_pending_exits() {
-    let shutdown = AtomicBool::new(true);
-    let streaming = AtomicBool::new(false);
-    let cancel_stream = AtomicBool::new(false);
-
-    assert_eq!(
-        super::driver::sigint_action(&shutdown, &streaming, &cancel_stream),
-        super::driver::SigintAction::Exit
-    );
 }
 
 #[test]

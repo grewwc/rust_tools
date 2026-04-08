@@ -41,8 +41,6 @@ pub use commands::{
 };
 pub use mcp_init::*;
 pub use model::*;
-#[cfg(test)]
-pub use signal::{sigint_action, SigintAction};
 pub use skill_matching::*;
 
 const DEFAULT_MAX_ITERATIONS: usize = 1024;
@@ -52,9 +50,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = cli::parse_cli_args(std::env::args());
     let config = config::load_config()?;
     let session_store = SessionStore::new(config.history_file.as_path());
-    if let Err(err) = session_store.migrate_legacy_if_needed(&config.history_file) {
-        eprintln!("[Warning] Failed to migrate legacy history: {}", err);
-    }
     let session_arg = cli.session.clone().unwrap_or_default();
     let session_id = if session_arg.trim().is_empty() {
         Uuid::new_v4().to_string()
@@ -69,11 +64,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Err(err) = session_store.ensure_root_dir() {
         eprintln!("[Warning] Failed to create sessions dir: {}", err);
-    }
-    if cli.clear {
-        let _ = session_store.clear_session(&session_id);
-        println!("History cleared. (session: {})", session_id);
-        return Ok(());
     }
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -108,7 +98,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             Some(cli.files.clone())
         },
-        pending_clipboard: cli.clipboard,
         pending_short_output: cli.short_output,
         current_model,
         current_agent: "build".to_string(),

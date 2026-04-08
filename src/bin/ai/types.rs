@@ -40,7 +40,6 @@ pub(super) struct App {
     pub(super) current_model: String,
     pub(super) current_agent: String,
     pub(super) pending_files: Option<String>,
-    pub(super) pending_clipboard: bool,
     pub(super) pending_short_output: bool,
     pub(super) attached_image_files: Vec<String>,
     pub(super) shutdown: Arc<AtomicBool>,

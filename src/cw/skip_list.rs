@@ -3,15 +3,15 @@ use std::marker::PhantomData;
 use std::ptr;
 use std::sync::Mutex;
 
-struct Skipnode<K, V> {
+struct SkipNode<K, V> {
     k: std::mem::MaybeUninit<K>,
     v: std::mem::MaybeUninit<V>,
-    forward: Vec<*mut Skipnode<K, V>>,
+    forward: Vec<*mut SkipNode<K, V>>,
 }
 
-impl<K, V> Skipnode<K, V> {
+impl<K, V> SkipNode<K, V> {
     fn new(k: K, v: V, max_height: usize) -> *mut Self {
-        let ret = Box::new(Skipnode {
+        let ret = Box::new(SkipNode {
             k: std::mem::MaybeUninit::new(k),
             v: std::mem::MaybeUninit::new(v),
             forward: vec![ptr::null_mut(); max_height],
@@ -21,7 +21,7 @@ impl<K, V> Skipnode<K, V> {
 }
 
 pub struct SkipMap<K, V> {
-    head: Skipnode<K, V>,
+    head: SkipNode<K, V>,
     max_height: usize,
     len: usize,
     cmp: fn(&K, &K) -> i32,
@@ -36,7 +36,7 @@ unsafe impl<K: Send, V: Send> Send for SkipMap<K, V> {}
 unsafe impl<K: Send + Sync, V: Send + Sync> Sync for SkipMap<K, V> {}
 
 impl<K, V> SkipMap<K, V> {
-    unsafe fn free_chain(mut curr: *mut Skipnode<K, V>) {
+    unsafe fn free_chain(mut curr: *mut SkipNode<K, V>) {
         while !curr.is_null() {
             let next = unsafe { (&*curr).forward[0] };
             unsafe {
@@ -50,7 +50,7 @@ impl<K, V> SkipMap<K, V> {
         // 使用随机种子创建 StdRng
         let seed: [u8; 32] = rand::random();
         let ret = Box::new(SkipMap {
-            head: Skipnode {
+            head: SkipNode {
                 k: std::mem::MaybeUninit::uninit(),
                 v: std::mem::MaybeUninit::uninit(),
                 forward: vec![ptr::null_mut(); max_height],
@@ -67,16 +67,16 @@ impl<K, V> SkipMap<K, V> {
         let level = self.level().min(self.max_height - 1);
         unsafe {
             let (updates, found) = self.find(&k, level);
-            let found = found as *mut Skipnode<K, V>;
+            let found = found as *mut SkipNode<K, V>;
             if !found.is_null() {
                 (&mut *found).v.write(v);
                 return;
             }
-            let new_node = Skipnode::new(k, v, self.max_height);
+            let new_node = SkipNode::new(k, v, self.max_height);
 
             for i in (0..=level).rev() {
-                let prev = *updates.get_unchecked(i) as *mut Skipnode<K, V>;
-                if prev == &mut self.head as *mut Skipnode<K, V> {
+                let prev = *updates.get_unchecked(i) as *mut SkipNode<K, V>;
+                if prev == &mut self.head as *mut SkipNode<K, V> {
                     let tmp = self.head.forward[i];
                     self.head.forward[i] = new_node;
                     (&mut *new_node).forward[i] = tmp;
@@ -116,7 +116,7 @@ impl<K, V> SkipMap<K, V> {
     pub fn range(&self, r: std::ops::Range<K>) -> Vec<(&K, &V)> {
         let start = r.start;
         let end = r.end;
-        let mut prev = &self.head as *const Skipnode<K, V>;
+        let mut prev = &self.head as *const SkipNode<K, V>;
         let mut ret = vec![];
         let f = self.cmp;
         unsafe {
@@ -167,14 +167,14 @@ impl<K, V> SkipMap<K, V> {
         }
         unsafe {
             for i in 0..self.max_height {
-                let prev = *updates.get_unchecked(i) as *mut Skipnode<K, V>;
+                let prev = *updates.get_unchecked(i) as *mut SkipNode<K, V>;
                 let next = *(&*prev).forward.get_unchecked(i);
                 if next.is_null() || found != next {
                     continue;
                 }
                 (&mut *prev).forward[i] = *(&*next).forward.get_unchecked(i);
             }
-            drop(Box::from_raw(found as *mut Skipnode<K, V>));
+            drop(Box::from_raw(found as *mut SkipNode<K, V>));
         }
         self.len -= 1;
         true
@@ -195,22 +195,60 @@ impl<K, V> Drop for SkipMap<K, V> {
     }
 }
 
+pub struct IntoSkipMapIter<K, V> {
+    curr_node: *mut SkipNode<K, V>,
+}
+
+impl<K, V> Drop for IntoSkipMapIter<K, V> {
+    fn drop(&mut self) {
+        unsafe {
+            SkipMap::free_chain(self.curr_node);
+        }
+    }
+}
+
+impl<K, V> IntoIterator for Box<SkipMap<K, V>> {
+    type Item = (K, V);
+    type IntoIter = IntoSkipMapIter<K, V>;
+
+    fn into_iter(mut self) -> Self::IntoIter {
+        let first = self.head.forward.first().copied().unwrap_or(ptr::null_mut());
+        self.head.forward.fill(ptr::null_mut());
+        self.len = 0;
+        IntoSkipMapIter { curr_node: first }
+    }
+}
+
+impl<K, V> Iterator for IntoSkipMapIter<K, V> {
+    type Item = (K, V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.curr_node.is_null() {
+            return None;
+        }
+        let temp = std::mem::replace(&mut self.curr_node, ptr::null_mut());
+        unsafe {
+            let boxed = Box::from_raw(temp);
+            let next = (*boxed.forward.get_unchecked(0)) as *mut SkipNode<K,V>;
+            self.curr_node = next;
+            let k = ptr::read(&boxed.k).assume_init();
+            let v = ptr::read(&boxed.v).assume_init();
+            Some((k, v))
+        }
+    }
+}
+
 pub struct SkipListIter<'a, K, V> {
-    curr: *mut Skipnode<K, V>,
+    curr: *mut SkipNode<K, V>,
     _marker: PhantomData<&'a SkipMap<K, V>>,
 }
 
 impl<'a, K, V> IntoIterator for &'a SkipMap<K, V> {
     type Item = (&'a K, &'a V);
-
     type IntoIter = SkipListIter<'a, K, V>;
 
     fn into_iter(self) -> Self::IntoIter {
-        let curr = unsafe { *self.head.forward.get_unchecked(0) };
-        SkipListIter {
-            curr,
-            _marker: PhantomData,
-        }
+        self.iter()
     }
 }
 
@@ -230,11 +268,19 @@ impl<'a, K, V> Iterator for SkipListIter<'a, K, V> {
 }
 
 impl<K, V> SkipMap<K, V> {
-    fn find(&self, k: &K, level: usize) -> (Vec<*const Skipnode<K, V>>, *const Skipnode<K, V>) {
+    pub fn iter(&self) -> SkipListIter<'_, K, V> {
+        let curr = unsafe { *self.head.forward.get_unchecked(0) };
+        SkipListIter {
+            curr,
+            _marker: PhantomData,
+        }
+    }
+
+    fn find(&self, k: &K, level: usize) -> (Vec<*const SkipNode<K, V>>, *const SkipNode<K, V>) {
         let f = self.cmp;
         unsafe {
             let mut updates = vec![ptr::null(); level + 1];
-            let mut prev = &self.head as *const Skipnode<K, V>;
+            let mut prev = &self.head as *const SkipNode<K, V>;
             let mut found = ptr::null_mut();
             for i in (0..=level).rev() {
                 let mut curr = *(&*prev).forward.get_unchecked(i);
@@ -328,17 +374,17 @@ where
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &T> {
-        (&*self.inner).into_iter().map(|(k, _)| k)
+        self.inner.iter().map(|(k, _)| k)
     }
 
     /// Returns a reference to the first (smallest) element, or `None` if empty.
     pub fn first(&self) -> Option<&T> {
-        (&*self.inner).into_iter().next().map(|(k, _)| k)
+        self.inner.iter().next().map(|(k, _)| k)
     }
 
     /// Returns a reference to the last (largest) element, or `None` if empty.
     pub fn last(&self) -> Option<&T> {
-        let mut iter = (&*self.inner).into_iter();
+        let mut iter = self.inner.iter();
         let mut last = iter.next()?;
         for item in iter {
             last = item;
@@ -365,11 +411,7 @@ where
         T: Clone,
     {
         let last = self.last()?.clone();
-        if self.remove(&last) {
-            Some(last)
-        } else {
-            None
-        }
+        if self.remove(&last) { Some(last) } else { None }
     }
 
     pub fn to_vec(&self) -> Vec<T>
@@ -464,11 +506,21 @@ mod tests {
         list.insert(3, 300);
         list.insert(1, 100);
         list.insert(2, 200);
-        let items: Vec<_> = (&list).into_iter().collect();
+        let items: Vec<_> = list.iter().collect();
         assert_eq!(items.len(), 3);
         assert_eq!(items[0], (&1, &100));
         assert_eq!(items[1], (&2, &200));
         assert_eq!(items[2], (&3, &300));
+    }
+
+    #[test]
+    fn into_iteration() {
+        let mut list = new_list(4);
+        list.insert(3, 300);
+        list.insert(1, 100);
+        list.insert(2, 200);
+        let items: Vec<_> = list.into_iter().collect();
+        assert_eq!(items, vec![(1, 100), (2, 200), (3, 300)]);
     }
 
     #[test]

@@ -92,7 +92,7 @@ impl SessionStore {
                 },
             );
         }
-        Ok(sessions.into_iter().map(|(_, v)| v.clone()).collect())
+        Ok(sessions.into_iter().map(|(_, v)| v).collect())
     }
 
     pub(in crate::ai) fn delete_session(&self, session_id: &str) -> io::Result<bool> {
@@ -162,64 +162,6 @@ impl SessionStore {
         use std::io::Write;
         file.write_all(markdown.as_bytes())?;
 
-        Ok(())
-    }
-
-    pub(in crate::ai) fn migrate_legacy_if_needed(
-        &self,
-        legacy_history_file: &PathBuf,
-    ) -> io::Result<()> {
-        self.ensure_root_dir()?;
-        self.migrate_txt_sessions_to_sqlite()?;
-
-        let legacy_session_id = "legacy";
-        let legacy_session_path = self.session_history_file(legacy_session_id);
-        if legacy_session_path.exists() {
-            return Ok(());
-        }
-        if is_sqlite_path(legacy_history_file) {
-            return Ok(());
-        }
-        let history = match fs::read_to_string(legacy_history_file) {
-            Ok(v) => v,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        if history.trim().is_empty() {
-            return Ok(());
-        }
-        super::sqlite::append_history_sqlite(&legacy_session_path, parse_history_blob(&history))?;
-        Ok(())
-    }
-
-    fn migrate_txt_sessions_to_sqlite(&self) -> io::Result<()> {
-        let entries = match fs::read_dir(&self.root) {
-            Ok(v) => v,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(err),
-        };
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) != Some("txt") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let sqlite_path = self.root.join(format!("{stem}.sqlite"));
-            if sqlite_path.exists() {
-                let _ = fs::remove_file(&path);
-                continue;
-            }
-            let history = match fs::read_to_string(&path) {
-                Ok(v) => v,
-                Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
-                Err(err) => return Err(err),
-            };
-            super::sqlite::append_history_sqlite(&sqlite_path, parse_history_blob(&history))?;
-            let _ = fs::remove_file(&path);
-        }
         Ok(())
     }
 }

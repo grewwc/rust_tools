@@ -61,7 +61,7 @@ pub(crate) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition
         };
         tools.insert(tool_def.function.name.clone(), tool_def);
     }
-    tools.into_iter().map(|(_, v)| v.clone()).collect()
+    tools.into_iter().map(|(_, v)| v).collect()
 }
 
 pub(crate) fn get_tool_definitions_by_names(names: &[String]) -> Vec<ToolDefinition> {
@@ -82,7 +82,7 @@ pub(crate) fn get_tool_definitions_by_names(names: &[String]) -> Vec<ToolDefinit
         };
         tools.insert(tool_def.function.name.clone(), tool_def);
     }
-    tools.into_iter().map(|(_, v)| v.clone()).collect()
+    tools.into_iter().map(|(_, v)| v).collect()
 }
 
 pub(crate) fn get_builtin_tool_definitions() -> Vec<ToolDefinition> {

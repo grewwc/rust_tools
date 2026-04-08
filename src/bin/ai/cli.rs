@@ -145,17 +145,11 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     // 处理 multi-line
     cli.multi_line = parser.contains_flag_strict("multi-line");
 
-    // 处理 clear
-    cli.clear = parser.contains_flag_strict("clear");
-
     // 处理 session
     if parser.contains_flag_strict("session") {
         let val = parser.flag_value_or_default("session");
         cli.session = Some(val);
     }
-
-    // 处理 clipboard
-    cli.clipboard = parser.contains_flag_strict("clipboard");
 
     // 处理 files
     if parser.contains_flag_strict("files") {
@@ -206,7 +200,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 pub(super) fn print_help() {
     let mut parser = TermParser::new();
 
-    parser.add_bool("clear", false, "clear history");
     parser.add_bool("multi-line", false, "input with multline");
     parser.alias("mul", "multi-line");
     parser.add_bool("clipboard", false, "prepend content in clipboard");

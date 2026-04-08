@@ -7,7 +7,7 @@ pub enum SigintAction {
     Exit,
 }
 
-pub fn handle_sigint(shutdown: &AtomicBool, streaming: &AtomicBool, cancel_stream: &AtomicBool) {
+pub(in crate::ai) fn handle_sigint(shutdown: &AtomicBool, streaming: &AtomicBool, cancel_stream: &AtomicBool) {
     match sigint_action(shutdown, streaming, cancel_stream) {
         SigintAction::CancelStream => {
             cancel_stream.store(true, Ordering::Relaxed);
@@ -27,7 +27,7 @@ pub fn handle_sigint(shutdown: &AtomicBool, streaming: &AtomicBool, cancel_strea
     }
 }
 
-pub fn sigint_action(
+pub(in crate::ai) fn sigint_action(
     shutdown: &AtomicBool,
     streaming: &AtomicBool,
     cancel_stream: &AtomicBool,

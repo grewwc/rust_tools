@@ -502,7 +502,7 @@ pub(super) async fn run_turn(
 
     let mut iteration = 0usize;
     let mut force_final_response = false;
-    let final_assistant_text;
+    let mut final_assistant_text = String::new();
     let mut final_assistant_recorded = false;
     loop {
         iteration += 1;
@@ -1030,7 +1030,6 @@ mod tests {
             current_model: String::new(),
             current_agent: "build".to_string(),
             pending_files: None,
-            pending_clipboard: false,
             pending_short_output: false,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),

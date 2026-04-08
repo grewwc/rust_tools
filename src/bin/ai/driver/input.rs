@@ -212,12 +212,6 @@ fn finalize_question(
         app.attached_image_files = inline_images;
     }
 
-    if app.pending_clipboard {
-        let clipboard = string_content::get_clipboard_content();
-        question = format!("{clipboard}{question}");
-        app.pending_clipboard = false;
-    }
-
     if app.pending_short_output || loop_short_output {
         if !question.ends_with('\n') {
             question.push('\n');
