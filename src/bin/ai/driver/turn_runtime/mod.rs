@@ -1,263 +1,23 @@
+mod debug;
 mod finalize;
 mod iteration;
+mod orchestrator;
+mod persistence;
 mod prepare;
-mod tool_round;
+mod tool_result;
+mod types;
 
-use std::{fs, path::PathBuf};
-
-use colored::Colorize;
-use serde_json::Value;
-
-use crate::ai::{
-    history::{Message, SessionStore, append_history_messages, build_context_history},
-    mcp::McpClient,
-    request::{self, do_request_messages},
-    stream,
-    types::{App, StreamOutcome, StreamResult},
-};
-
-use super::{
-    drain_response, input,
-    print::{print_assistant_banner, print_tool_output_block},
-    reflection, tools,
-};
-use finalize::finalize_turn;
-use iteration::{execute_turn_iteration, refresh_skill_turn_for_iteration};
-use prepare::prepare_turn;
-use tool_round::handle_iteration_execution;
+pub(super) use orchestrator::run_turn;
 #[cfg(test)]
-use tool_round::prepare_tool_result;
+use persistence::persist_pending_turn_messages;
+#[cfg(test)]
+use tool_result::prepare_tool_result;
+pub(super) use types::TurnOutcome;
 
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;
 const TOOL_OVERFLOW_PREVIEW_CHARS: usize = 800;
 
-struct PreparedToolResult {
-    content_for_model: String,
-    content_for_terminal: String,
-}
-
-struct LargeToolSummary {
-    body: String,
-    summary: String,
-    top_level_keys: Vec<String>,
-    field_samples: Vec<String>,
-}
-
-struct TurnPreparation {
-    skill_turn: super::skill_runtime::SkillTurnGuard,
-    messages: Vec<Message>,
-    turn_messages: Vec<Message>,
-    persisted_turn_messages: usize,
-    max_iterations: usize,
-}
-
-enum IterationExecution {
-    Exit(TurnOutcome),
-    RequestFailed(String),
-    FinalResponse(StreamResult),
-    ToolCall(StreamResult),
-}
-
-enum TurnLoopStep {
-    Continue,
-    Break,
-    Return(TurnOutcome),
-}
-
-// #region debug-point agent-hang:reporter
-#[cfg(feature = "agent-hang-debug")]
-pub(in crate::ai) fn report_agent_hang_debug(
-    run_id: &'static str,
-    hypothesis_id: &'static str,
-    location: &'static str,
-    msg: &'static str,
-    data: Value,
-) {
-    std::thread::spawn(move || {
-        let mut debug_server_url = "http://127.0.0.1:7777/event".to_string();
-        let mut debug_session_id = "agent-hang".to_string();
-        if let Ok(env_text) = fs::read_to_string(".dbg/agent-hang.env") {
-            for line in env_text.lines() {
-                if let Some(value) = line.strip_prefix("DEBUG_SERVER_URL=") {
-                    if !value.trim().is_empty() {
-                        debug_server_url = value.trim().to_string();
-                    }
-                } else if let Some(value) = line.strip_prefix("DEBUG_SESSION_ID=") {
-                    if !value.trim().is_empty() {
-                        debug_session_id = value.trim().to_string();
-                    }
-                }
-            }
-        }
-        let payload = serde_json::json!({
-            "sessionId": debug_session_id,
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "msg": msg,
-            "data": data,
-            "ts": chrono::Utc::now().timestamp_millis(),
-        });
-        if let Ok(client) = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_millis(300))
-            .build()
-        {
-            let _ = client.post(debug_server_url).json(&payload).send();
-        }
-    });
-}
-
-#[cfg(not(feature = "agent-hang-debug"))]
-pub(in crate::ai) fn report_agent_hang_debug(
-    _run_id: &'static str,
-    _hypothesis_id: &'static str,
-    _location: &'static str,
-    _msg: &'static str,
-    _data: Value,
-) {
-}
-// #endregion
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum TurnOutcome {
-    Continue,
-    Quit,
-}
-
-#[crate::ai::agent_hang_span(
-    "pre-fix",
-    "A",
-    "turn_runtime::run_turn",
-    "[DEBUG] run_turn started",
-    "[DEBUG] run_turn finished",
-    {
-        "history_count": history_count,
-        "question_len": question.chars().count(),
-        "model": next_model.as_str(),
-        "one_shot_mode": one_shot_mode,
-        "should_quit": should_quit,
-    },
-    {
-        "ok": __agent_hang_result.is_ok(),
-        "outcome": __agent_hang_result
-            .as_ref()
-            .map(|v| format!("{:?}", v))
-            .unwrap_or_else(|err| err.to_string()),
-        "elapsed_ms": __agent_hang_elapsed_ms,
-    }
-)]
-pub(super) async fn run_turn(
-    app: &mut App,
-    mcp_client: &mut McpClient,
-    skill_manifests: &[crate::ai::skills::SkillManifest],
-    history_count: usize,
-    question: String,
-    next_model: String,
-    one_shot_mode: bool,
-    should_quit: bool,
-) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
-    // 1. prepare 
-    let TurnPreparation {
-        mut skill_turn,
-        mut messages,
-        mut turn_messages,
-        mut persisted_turn_messages,
-        max_iterations,
-    } = prepare_turn(
-        app,
-        mcp_client,
-        skill_manifests,
-        history_count,
-        &question,
-        &next_model,
-    )
-    .await?;
-
-    let mut iteration = 0usize;
-    let mut force_final_response = false;
-    let mut final_assistant_text = String::new();
-    let mut final_assistant_recorded = false;
-    loop {
-        iteration += 1;
-        // 2. re-choose skill
-        refresh_skill_turn_for_iteration(
-            app,
-            mcp_client,
-            skill_manifests,
-            &question,
-            iteration,
-            &mut skill_turn,
-            &mut messages,
-        )
-        .await;
-        // 3. execute
-        let execution = execute_turn_iteration(
-            app,
-            &next_model,
-            &mut messages,
-            &turn_messages,
-            one_shot_mode,
-            &mut persisted_turn_messages,
-            should_quit,
-            force_final_response,
-            iteration,
-        )
-        .await?;
-        // 4. handle execution result 
-        match handle_iteration_execution(
-            app,
-            mcp_client,
-            execution,
-            &mut messages,
-            &mut turn_messages,
-            one_shot_mode,
-            &mut persisted_turn_messages,
-            &mut final_assistant_text,
-            &mut final_assistant_recorded,
-            &mut force_final_response,
-            iteration,
-            max_iterations,
-        )? {
-            TurnLoopStep::Continue => {}
-            TurnLoopStep::Break => break,
-            TurnLoopStep::Return(outcome) => return Ok(outcome),
-        }
-    }
-    // 5. finilization
-    finalize_turn(
-        app,
-        &next_model,
-        &question,
-        &final_assistant_text,
-        final_assistant_recorded,
-        &mut turn_messages,
-        one_shot_mode,
-        &mut persisted_turn_messages,
-        should_quit,
-    )
-    .await
-}
-
-fn persist_pending_turn_messages(
-    app: &App,
-    one_shot_mode: bool,
-    turn_messages: &[Message],
-    persisted_turn_messages: &mut usize,
-) {
-    if one_shot_mode || *persisted_turn_messages >= turn_messages.len() {
-        return;
-    }
-
-    if let Err(err) = append_history_messages(
-        &app.session_history_file,
-        &turn_messages[*persisted_turn_messages..],
-    ) {
-        eprintln!("[Warning] Failed to save history: {}", err);
-        return;
-    }
-
-    *persisted_turn_messages = turn_messages.len();
-}
+pub(in crate::ai) use debug::report_agent_hang_debug;
 
 #[cfg(test)]
 mod tests {
@@ -269,8 +29,8 @@ mod tests {
     use super::*;
     use crate::ai::{
         cli::ParsedCli,
-        history::{SessionStore, build_message_arr},
-        types::AppConfig,
+        history::{Message, SessionStore, build_message_arr},
+        types::{App, AppConfig},
     };
 
     fn test_app(history_file: PathBuf) -> App {

@@ -1,4 +1,24 @@
-use super::*;
+use colored::Colorize;
+use serde_json::Value;
+
+use crate::ai::{
+    driver::{
+        drain_response, input,
+        print::print_assistant_banner,
+        skill_runtime,
+    },
+    history::Message,
+    mcp::McpClient,
+    request::{self, do_request_messages},
+    stream,
+    types::{App, StreamOutcome, StreamResult},
+};
+
+use super::{
+    TurnOutcome,
+    persistence::persist_pending_turn_messages,
+    types::IterationExecution,
+};
 
 pub(super) async fn refresh_skill_turn_for_iteration(
     app: &mut App,
@@ -15,7 +35,7 @@ pub(super) async fn refresh_skill_turn_for_iteration(
 
     let prev_skill = skill_turn.matched_skill_name().map(|s| s.to_string());
     let new_skill_turn =
-        super::super::skill_runtime::prepare_skill_for_turn(app, mcp_client, skill_manifests, question)
+        skill_runtime::prepare_skill_for_turn(app, mcp_client, skill_manifests, question)
             .await;
     let next_skill = new_skill_turn.matched_skill_name().map(|s| s.to_string());
 
@@ -80,7 +100,7 @@ fn finish_interrupted_turn(
     app.streaming
         .store(false, std::sync::atomic::Ordering::Relaxed);
     app.ignore_next_prompt_interrupt = true;
-    super::persist_pending_turn_messages(
+    persist_pending_turn_messages(
         app,
         one_shot_mode,
         turn_messages,
@@ -96,7 +116,7 @@ fn finish_shutdown_turn(
     turn_messages: &[Message],
     persisted_turn_messages: &mut usize,
 ) -> TurnOutcome {
-    super::persist_pending_turn_messages(
+    persist_pending_turn_messages(
         app,
         one_shot_mode,
         turn_messages,
@@ -115,7 +135,7 @@ fn handle_request_error(
 ) -> String {
     app.streaming
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    super::persist_pending_turn_messages(
+    persist_pending_turn_messages(
         app,
         one_shot_mode,
         turn_messages,

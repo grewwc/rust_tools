@@ -1,4 +1,12 @@
-use super::*;
+use colored::Colorize;
+use serde_json::Value;
+use crate::ai::{
+    driver::reflection,
+    history::Message,
+    types::App,
+};
+
+use super::{TurnOutcome, persistence::persist_pending_turn_messages};
 
 fn ensure_final_assistant_recorded(
     final_assistant_text: &str,
@@ -117,7 +125,7 @@ pub(super) async fn finalize_turn(
             turn_messages,
         )
         .await;
-        super::persist_pending_turn_messages(
+        persist_pending_turn_messages(
             app,
             one_shot_mode,
             turn_messages,

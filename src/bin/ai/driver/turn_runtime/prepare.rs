@@ -1,4 +1,15 @@
-use super::*;
+use colored::Colorize;
+use serde_json::Value;
+
+use crate::ai::mcp::McpClient;
+use crate::ai::{
+    driver::{reflection, skill_runtime},
+    history::{Message, build_context_history},
+    request,
+    types::App,
+};
+
+use super::types::TurnPreparation;
 
 #[crate::ai::agent_hang_span(
     "post-fix",
@@ -40,7 +51,7 @@ pub(super) async fn prepare_turn(
         app.config.history_summary_max_chars,
     )?;
     let mut skill_turn =
-        super::super::skill_runtime::prepare_skill_for_turn(app, mcp_client, skill_manifests, question)
+        skill_runtime::prepare_skill_for_turn(app, mcp_client, skill_manifests, question)
             .await;
 
     let mut messages = Vec::with_capacity(history.len() + 2);
@@ -76,8 +87,8 @@ pub(super) async fn prepare_turn(
         && question.chars().count() <= 64
         && matches!(
             recall_intent.core,
-            super::super::intent_recognition::CoreIntent::Casual
-                | super::super::intent_recognition::CoreIntent::QueryConcept
+            crate::ai::driver::intent_recognition::CoreIntent::Casual
+                | crate::ai::driver::intent_recognition::CoreIntent::QueryConcept
         );
     let skip_recall = skip_recall_for_skill_context || skip_recall_for_light_turn;
     if !skip_recall {
