@@ -820,6 +820,8 @@ fn levenshtein(a: &[char], b: &[char]) -> usize {
 struct ChatInfo {
     chat_id: String,
     name: String,
+    recent_time: i64,
+    source_order: usize,
 }
 
 /// List recent chats using the Feishu API.
@@ -834,6 +836,7 @@ fn list_recent_chats(
     let url = format!("{}/open-apis/im/v1/chats", base_url);
     
     let mut all_chats = Vec::new();
+    let mut source_order = 0usize;
     let mut page_token = String::new();
     
     loop {
@@ -872,11 +875,13 @@ fn list_recent_chats(
             if !chat_mode_matches(chat_mode, include_p2p, include_group) {
                 continue;
             }
-            
-            all_chats.push(ChatInfo { chat_id, name });
-            if all_chats.len() >= max_chats {
-                return Ok(all_chats);
-            }
+            all_chats.push(ChatInfo {
+                chat_id,
+                name,
+                recent_time: chat_recent_time(item),
+                source_order,
+            });
+            source_order += 1;
         }
         
         page_token = data.get("page_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -885,6 +890,14 @@ fn list_recent_chats(
         }
     }
     
+    all_chats.sort_by(|a, b| {
+        b.recent_time
+            .cmp(&a.recent_time)
+            .then_with(|| a.source_order.cmp(&b.source_order))
+    });
+    if all_chats.len() > max_chats {
+        all_chats.truncate(max_chats);
+    }
     Ok(all_chats)
 }
 
@@ -1117,53 +1130,27 @@ fn feishu_messages_global_search_with_token(
     let mut scanned_messages = 0usize;
 
     for chat in &chats {
+        if should_stop_before_chat(chat, &matches, limit) {
+            break;
+        }
         scanned_chats += 1;
 
-        let messages = fetch_chat_messages(
+        scan_chat_messages_for_matches(
             client,
             base_url,
             access_token,
-            &chat.chat_id,
+            chat,
             msgs_per_chat,
             max_pages,
+            msg_type_filters,
+            search_mode,
+            regex_opt,
+            needle_lower,
+            fuzzy_threshold,
+            limit,
+            &mut scanned_messages,
+            &mut matches,
         )?;
-        for item in &messages {
-            scanned_messages += 1;
-
-            if !msg_type_filters.is_empty() {
-                let msg_type = item.get("msg_type").and_then(|v| v.as_str()).unwrap_or("");
-                if !msg_type_filters.iter().any(|f| f == msg_type) {
-                    continue;
-                }
-            }
-
-            let searchable_text = build_feishu_global_searchable_text(item, chat);
-            if searchable_text.is_empty() {
-                continue;
-            }
-            let matched = match search_mode {
-                "regex" => regex_opt.map(|re| re.is_match(&searchable_text)).unwrap_or(false),
-                "fuzzy" => fuzzy_match(&searchable_text, &needle_lower, fuzzy_threshold),
-                _ => searchable_text.to_lowercase().contains(&needle_lower), // substring (default)
-            };
-            if !matched {
-                continue;
-            }
-            let mut enriched = item.clone();
-            if let Some(obj) = enriched.as_object_mut() {
-                obj.insert("chat_name".to_string(), Value::String(chat.name.clone()));
-                obj.insert("chat_id".to_string(), Value::String(chat.chat_id.clone()));
-            }
-            matches.push((
-                message_create_time(item),
-                serde_json::to_string_pretty(&enriched).unwrap_or_else(|_| "<error>".to_string()),
-            ));
-        }
-    }
-
-    matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    if matches.len() > limit {
-        matches.truncate(limit);
     }
 
     let mut out = String::new();
@@ -1185,8 +1172,165 @@ fn feishu_messages_global_search_with_token(
     Ok(out)
 }
 
+fn scan_chat_messages_for_matches(
+    client: &Client,
+    base_url: &str,
+    access_token: &str,
+    chat: &ChatInfo,
+    msgs_per_chat: u64,
+    max_pages: u64,
+    msg_type_filters: &[String],
+    search_mode: &str,
+    regex_opt: Option<&regex::Regex>,
+    needle_lower: &str,
+    fuzzy_threshold: usize,
+    limit: usize,
+    scanned_messages: &mut usize,
+    matches: &mut Vec<(i64, String)>,
+) -> Result<(), JsonRpcErr> {
+    let mut page_token: Option<String> = None;
+    for _ in 0..max_pages {
+        if should_stop_inside_chat(None, matches, limit) {
+            break;
+        }
+        let (status, body_text) = do_messages_list_request(
+            client,
+            base_url,
+            access_token,
+            "chat",
+            &chat.chat_id,
+            "ByCreateTimeDesc",
+            msgs_per_chat as usize,
+            page_token.as_deref(),
+            None,
+            None,
+        )?;
+        if !status.is_success() {
+            return Err(json_rpc_error(-32000, "Messages list API returned error code", Some(json!({
+                "status": status.as_u16(),
+                "body": body_text
+            }))));
+        }
+        let body = parse_json_response_body(
+            "messages response",
+            status,
+            Some("application/json"),
+            &body_text,
+        )?;
+        let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            return Err(json_rpc_error(
+                -32000,
+                &format!("Messages API error: code={}", code),
+                Some(body),
+            ));
+        }
+        let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
+        let items = data.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let is_empty = items.is_empty();
+        let oldest_in_page = items.iter().map(message_create_time).min();
+
+        for item in &items {
+            *scanned_messages += 1;
+            if !msg_type_filters.is_empty() {
+                let msg_type = item.get("msg_type").and_then(|v| v.as_str()).unwrap_or("");
+                if !msg_type_filters.iter().any(|f| f == msg_type) {
+                    continue;
+                }
+            }
+            let searchable_text = build_feishu_global_searchable_text(item, chat);
+            if searchable_text.is_empty() {
+                continue;
+            }
+            let matched = match search_mode {
+                "regex" => regex_opt.map(|re| re.is_match(&searchable_text)).unwrap_or(false),
+                "fuzzy" => fuzzy_match(&searchable_text, needle_lower, fuzzy_threshold),
+                _ => searchable_text.to_lowercase().contains(needle_lower),
+            };
+            if !matched {
+                continue;
+            }
+            let mut enriched = item.clone();
+            if let Some(obj) = enriched.as_object_mut() {
+                obj.insert("chat_name".to_string(), Value::String(chat.name.clone()));
+                obj.insert("chat_id".to_string(), Value::String(chat.chat_id.clone()));
+            }
+            push_global_match(
+                matches,
+                message_create_time(item),
+                serde_json::to_string_pretty(&enriched).unwrap_or_else(|_| "<error>".to_string()),
+                limit,
+            );
+        }
+
+        if should_stop_inside_chat(oldest_in_page, matches, limit) {
+            break;
+        }
+
+        page_token = data
+            .get("page_token")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+            .filter(|v| !v.is_empty());
+        if page_token.is_none() || is_empty {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn push_global_match(
+    matches: &mut Vec<(i64, String)>,
+    create_time: i64,
+    rendered: String,
+    limit: usize,
+) {
+    matches.push((create_time, rendered));
+    matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    if matches.len() > limit {
+        matches.truncate(limit);
+    }
+}
+
+fn current_kth_match_time(matches: &[(i64, String)], limit: usize) -> Option<i64> {
+    if matches.len() < limit {
+        None
+    } else {
+        matches.last().map(|(ts, _)| *ts)
+    }
+}
+
+fn should_stop_before_chat(chat: &ChatInfo, matches: &[(i64, String)], limit: usize) -> bool {
+    current_kth_match_time(matches, limit)
+        .is_some_and(|kth| chat.recent_time > 0 && chat.recent_time <= kth)
+}
+
+fn should_stop_inside_chat(
+    oldest_in_page: Option<i64>,
+    matches: &[(i64, String)],
+    limit: usize,
+) -> bool {
+    match (oldest_in_page, current_kth_match_time(matches, limit)) {
+        (Some(oldest), Some(kth)) => oldest <= kth,
+        _ => false,
+    }
+}
+
 fn message_create_time(item: &Value) -> i64 {
     item.get("create_time")
+        .or_else(|| item.get("last_message_time"))
+        .or_else(|| item.get("latest_message_time"))
+        .or_else(|| item.get("update_time"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn chat_recent_time(item: &Value) -> i64 {
+    item.get("last_message_time")
+        .or_else(|| item.get("latest_message_time"))
+        .or_else(|| item.get("update_time"))
+        .or_else(|| item.get("create_time"))
         .and_then(|v| v.as_str())
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0)
@@ -5117,7 +5261,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_global_search_sorts_matches_globally_by_create_time() {
+    fn messages_global_search_prioritizes_recent_chats_and_stops_early() {
         let _guard = env_lock().lock().unwrap();
         let base_url = start_mock_http_server(move |request| {
             let first_line = request.lines().next().unwrap_or_default().to_string();
@@ -5127,8 +5271,8 @@ mod tests {
                     "msg": "ok",
                     "data": {
                         "items": [
-                            {"chat_id": "oc_old", "name": "old-chat", "chat_mode": "group"},
-                            {"chat_id": "oc_new", "name": "new-chat", "chat_mode": "group"}
+                            {"chat_id": "oc_old", "name": "old-chat", "chat_mode": "group", "last_message_time": "100"},
+                            {"chat_id": "oc_new", "name": "new-chat", "chat_mode": "group", "last_message_time": "200"}
                         ],
                         "page_token": ""
                     }
@@ -5184,9 +5328,105 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(result.contains("scanned_chats: 2/2"));
+        assert!(result.contains("scanned_chats: 1/2"));
         assert!(result.contains("\"message_id\": \"om_new\""));
         assert!(!result.contains("\"message_id\": \"om_old\""));
+
+        unsafe {
+            if let Some(v) = old_base {
+                std::env::set_var("FEISHU_BASE_URL", v);
+            } else {
+                std::env::remove_var("FEISHU_BASE_URL");
+            }
+            if let Some(v) = old_user {
+                std::env::set_var("FEISHU_USER_ACCESS_TOKEN", v);
+            } else {
+                std::env::remove_var("FEISHU_USER_ACCESS_TOKEN");
+            }
+        }
+    }
+
+    #[test]
+    fn messages_global_search_does_not_stop_early_when_newer_chat_may_still_win() {
+        let _guard = env_lock().lock().unwrap();
+        let base_url = start_mock_http_server(move |request| {
+            let first_line = request.lines().next().unwrap_or_default().to_string();
+            if first_line.contains("/open-apis/im/v1/chats?") || first_line.contains("/open-apis/im/v1/chats ") {
+                return serde_json::json!({
+                    "code": 0,
+                    "msg": "ok",
+                    "data": {
+                        "items": [
+                            {"chat_id": "oc_hot", "name": "hot-chat", "chat_mode": "group", "last_message_time": "2000"},
+                            {"chat_id": "oc_mid", "name": "mid-chat", "chat_mode": "group", "last_message_time": "1500"}
+                        ],
+                        "page_token": ""
+                    }
+                }).to_string();
+            }
+            if first_line.contains("container_id=oc_hot") {
+                return serde_json::json!({
+                    "code": 0,
+                    "msg": "ok",
+                    "data": {
+                        "items": [
+                            {
+                                "message_id": "om_hot_nonmatch",
+                                "chat_id": "oc_hot",
+                                "msg_type": "text",
+                                "create_time": "2000",
+                                "sender": {"id": "ou_1"},
+                                "body": {"content": "{\"text\":\"other\"}"}
+                            },
+                            {
+                                "message_id": "om_hot_old_match",
+                                "chat_id": "oc_hot",
+                                "msg_type": "text",
+                                "create_time": "100",
+                                "sender": {"id": "ou_1"},
+                                "body": {"content": "{\"text\":\"dataagent old\"}"}
+                            }
+                        ],
+                        "has_more": false
+                    }
+                }).to_string();
+            }
+            serde_json::json!({
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "items": [{
+                        "message_id": "om_mid_new_match",
+                        "chat_id": "oc_mid",
+                        "msg_type": "text",
+                        "create_time": "1400",
+                        "sender": {"id": "ou_2"},
+                        "body": {"content": "{\"text\":\"dataagent new\"}"}
+                    }],
+                    "has_more": false
+                }
+            }).to_string()
+        });
+
+        let old_base = std::env::var("FEISHU_BASE_URL").ok();
+        let old_user = std::env::var("FEISHU_USER_ACCESS_TOKEN").ok();
+        unsafe {
+            std::env::set_var("FEISHU_BASE_URL", &base_url);
+            std::env::set_var("FEISHU_USER_ACCESS_TOKEN", "u-test-user-token");
+        }
+
+        let result = feishu_messages_global_search(&serde_json::json!({
+            "search_key": "dataagent",
+            "limit": 1,
+            "max_chats": 2,
+            "msgs_per_chat": 50,
+            "max_pages": 1
+        }))
+        .unwrap();
+
+        assert!(result.contains("scanned_chats: 2/2"));
+        assert!(result.contains("\"message_id\": \"om_mid_new_match\""));
+        assert!(!result.contains("\"message_id\": \"om_hot_old_match\""));
 
         unsafe {
             if let Some(v) = old_base {
@@ -5326,6 +5566,8 @@ mod tests {
         let chat = ChatInfo {
             chat_id: "oc_123".to_string(),
             name: "dataagent".to_string(),
+            recent_time: 0,
+            source_order: 0,
         };
         let searchable = build_feishu_global_searchable_text(&item, &chat);
         assert!(searchable.contains("dataagent"));
