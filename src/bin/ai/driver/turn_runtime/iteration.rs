@@ -135,12 +135,29 @@ fn handle_request_error(
     "[本轮请求失败，请重试或换个问法]".to_string()
 }
 
+#[crate::ai::agent_hang_span(
+    "pre-fix",
+    "B",
+    "turn_runtime::run_turn:do_request_messages",
+    "[DEBUG] sending model request",
+    "[DEBUG] model request finished",
+    {
+        "iteration": _iteration,
+        "message_count": messages.len(),
+        "model": next_model,
+    },
+    {
+        "iteration": _iteration,
+        "ok": __agent_hang_result.is_ok(),
+        "elapsed_ms": __agent_hang_elapsed_ms,
+    }
+)]
 async fn request_model_response(
     app: &mut App,
     next_model: &str,
     messages: &mut Vec<Message>,
     force_final_response: bool,
-    iteration: usize,
+    _iteration: usize,
 ) -> Result<reqwest::Response, request::RequestError> {
     if force_final_response {
         messages.push(Message {
@@ -163,28 +180,7 @@ async fn request_model_response(
         None
     };
 
-    report_agent_hang_debug(
-        "pre-fix",
-        "B",
-        "turn_runtime::run_turn:do_request_messages:begin",
-        "[DEBUG] sending model request",
-        serde_json::json!({
-            "iteration": iteration,
-            "message_count": messages.len(),
-            "model": next_model,
-        }),
-    );
     let request_result = do_request_messages(app, next_model, messages, true).await;
-    report_agent_hang_debug(
-        "pre-fix",
-        "B",
-        "turn_runtime::run_turn:do_request_messages:end",
-        "[DEBUG] model request finished",
-        serde_json::json!({
-            "iteration": iteration,
-            "ok": request_result.is_ok(),
-        }),
-    );
 
     if let Some(saved_tools) = saved_tools
         && let Some(ctx) = app.agent_context.as_mut()
@@ -195,22 +191,31 @@ async fn request_model_response(
     request_result
 }
 
+#[crate::ai::agent_hang_span(
+    "pre-fix",
+    "B",
+    "turn_runtime::run_turn:stream_response",
+    "[DEBUG] streaming response started",
+    "[DEBUG] streaming response finished",
+    {
+        "iteration": _iteration,
+    },
+    {
+        "iteration": _iteration,
+        "outcome": format!("{:?}", __agent_hang_result.outcome),
+        "assistant_chars": __agent_hang_result.assistant_text.chars().count(),
+        "tool_calls": __agent_hang_result.tool_calls.len(),
+        "history_chars": current_history.chars().count(),
+        "elapsed_ms": __agent_hang_elapsed_ms,
+    }
+)]
 async fn stream_model_response(
     app: &mut App,
     response: &mut reqwest::Response,
     current_history: &mut String,
-    iteration: usize,
+    _iteration: usize,
 ) -> StreamResult {
     print_assistant_banner();
-    report_agent_hang_debug(
-        "pre-fix",
-        "B",
-        "turn_runtime::run_turn:stream_response:begin",
-        "[DEBUG] streaming response started",
-        serde_json::json!({
-            "iteration": iteration,
-        }),
-    );
     let stream_result = match stream::stream_response(app, response, current_history).await {
         Ok(result) => result,
         Err(err) => {
@@ -227,19 +232,6 @@ async fn stream_model_response(
             }
         }
     };
-    report_agent_hang_debug(
-        "pre-fix",
-        "B",
-        "turn_runtime::run_turn:stream_response:end",
-        "[DEBUG] streaming response finished",
-        serde_json::json!({
-            "iteration": iteration,
-            "outcome": format!("{:?}", stream_result.outcome),
-            "assistant_chars": stream_result.assistant_text.chars().count(),
-            "tool_calls": stream_result.tool_calls.len(),
-            "history_chars": current_history.chars().count(),
-        }),
-    );
     stream_result
 }
 

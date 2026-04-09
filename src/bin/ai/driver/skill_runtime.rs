@@ -5,7 +5,7 @@ use crate::ai::{
     types::{App, ToolDefinition},
 };
 use crate::commonw::configw;
-use std::{ptr::NonNull, time::Instant};
+use std::ptr::NonNull;
 use rust_tools::cw::SkipMap;
 use chrono::{DateTime, Utc};
 
@@ -223,6 +223,8 @@ fn build_system_prompt(skill: Option<&SkillManifest>) -> String {
     system_prompt.push_str("\n\n");
     system_prompt.push_str("Tool recovery mode:\n- If a tool call fails, read the error message and correct course before answering.\n- Prefer retrying with corrected arguments or switching to a more appropriate tool.\n- Do not repeat the exact same failing tool call unless the error indicates a transient retry is appropriate.\n- If a URL-based docs fetch tool says the URL is unsupported, switch to a search tool or ask for a supported docs URL instead of retrying the same call.\n- Only stop and ask the user when the error is ambiguous or missing required information.");
     system_prompt.push_str("\n\n");
+    system_prompt.push_str("Code navigation policy:\n- Prefer `code_search` for locating files, symbols, definitions, references, diagnostics, structural code matches, or full-text content hits.\n- When you need to find where a symbol is declared or used, prefer `code_search` with `workspace_symbol`, `go_to_definition`, or `find_references`.\n- When you need to find literal text, log messages, SQL fragments, config keys, or other exact content, prefer `code_search` with `text_search`.\n- For structural searches, prefer high-level `code_search` intents like `find_functions`, `find_classes`, `find_methods`, and `find_calls` before writing a raw tree-sitter query.\n- When structural results are too broad, add `name` to filter the `@name` capture or `contains_text` to filter by captured snippet text.\n- For call searches, you can further narrow matches with `call_kind`, `receiver`, and `qualified_name`.\n- Use `code_search` before raw `grep_search` / `read_file_lines` when you are still narrowing down where relevant code lives.\n- Use `read_file` or `read_file_lines` only after `code_search` or `lsp` has identified the exact file or region you need to inspect.\n- Use raw `grep_search` mainly as a fallback when higher-level code navigation does not apply.");
+    system_prompt.push_str("\n\n");
     system_prompt.push_str("File editing policy:\n- When modifying an existing file or document, DO NOT rewrite the whole file unless the user explicitly asks for a full rewrite or the change truly affects most of the file.\n- First inspect the relevant region with read_file or read_file_lines, then use apply_patch to make the smallest localized edit that preserves the surrounding content.\n- Use write_file mainly for creating new files or for deliberate full-file replacement.\n- This rule applies equally to prose documents, markdown notes, configuration files, and source code.");
     system_prompt.push_str("\n\n");
     system_prompt.push_str("Planning before acting:\n- For simple tasks (read a file, answer a question, run a single command, quick lookup), act directly — do NOT call the plan tool.\n- For complex tasks (multi-step refactoring, debugging across files, building a feature, investigating an unfamiliar codebase), call the `plan` tool first to create a step-by-step plan, then execute it step by step.\n- After each tool execution, review the result and adjust the plan if needed. You do not need to re-plan for minor adjustments.\n- A good rule of thumb: if the task requires 3+ tool calls across different tools/files, plan first.");
@@ -245,6 +247,60 @@ fn should_skip_recall_for_skill(skill: Option<&SkillManifest>) -> bool {
     ) || skill.tool_groups.iter().any(|g| g == "openclaw")
 }
 
+#[crate::ai::agent_hang_span(
+    "pre-fix",
+    "R",
+    "skill_runtime::prepare_skill_for_turn:intent",
+    "[DEBUG] intent recognition started",
+    "[DEBUG] intent recognition finished",
+    {
+        "question_len": question.chars().count(),
+    },
+    {
+        "core": format!("{:?}", __agent_hang_result.core),
+        "elapsed_ms": __agent_hang_elapsed_ms,
+    }
+)]
+fn detect_turn_intent(
+    question: &str,
+    intent_model_path: &std::path::Path,
+) -> intent_recognition::UserIntent {
+    intent_recognition::detect_intent_with_model_path(question, intent_model_path)
+}
+
+#[crate::ai::agent_hang_span(
+    "pre-fix",
+    "R",
+    "skill_runtime::prepare_skill_for_turn:router",
+    "[DEBUG] skill router started",
+    "[DEBUG] skill router finished",
+    {
+        "router_enabled": router_enabled,
+        "skip_router_for_local_intent": skip_router_for_local_intent,
+        "skill_count": skill_manifests.len(),
+    },
+    {
+        "router_enabled": router_enabled,
+        "skip_router_for_local_intent": skip_router_for_local_intent,
+        "selected": __agent_hang_result.as_deref(),
+        "elapsed_ms": __agent_hang_elapsed_ms,
+    }
+)]
+async fn route_skill_for_turn(
+    app: &mut App,
+    question: &str,
+    skill_manifests: &[SkillManifest],
+    router_enabled: bool,
+    skip_router_for_local_intent: bool,
+) -> Option<String> {
+    if router_enabled && !skip_router_for_local_intent {
+        let model = app.current_model.clone();
+        request::select_skill_via_model(app, &model, question, skill_manifests).await
+    } else {
+        None
+    }
+}
+
 pub(super) async fn prepare_skill_for_turn(
     app: &mut App,
     mcp_client: &McpClient,
@@ -263,63 +319,20 @@ pub(super) async fn prepare_skill_for_turn(
         .trim()
         .eq_ignore_ascii_case("false");
 
-    let intent_start = Instant::now();
-    super::turn_runtime::report_agent_hang_debug(
-        "pre-fix",
-        "R",
-        "skill_runtime::prepare_skill_for_turn:intent:begin",
-        "[DEBUG] intent recognition started",
-        serde_json::json!({
-            "question_len": question.chars().count(),
-        }),
-    );
-    let intent =
-        intent_recognition::detect_intent_with_model_path(question, &app.config.intent_model_path);
-    super::turn_runtime::report_agent_hang_debug(
-        "pre-fix",
-        "R",
-        "skill_runtime::prepare_skill_for_turn:intent:end",
-        "[DEBUG] intent recognition finished",
-        serde_json::json!({
-            "core": format!("{:?}", intent.core),
-            "elapsed_ms": intent_start.elapsed().as_secs_f64() * 1000.0,
-        }),
-    );
+    let intent = detect_turn_intent(question, &app.config.intent_model_path);
     let question_len = question.chars().count();
     let skip_router_for_local_intent = matches!(
         intent.core,
         intent_recognition::CoreIntent::Casual | intent_recognition::CoreIntent::QueryConcept
     ) && question_len <= 64;
-    let router_start = Instant::now();
-    super::turn_runtime::report_agent_hang_debug(
-        "pre-fix",
-        "R",
-        "skill_runtime::prepare_skill_for_turn:router:begin",
-        "[DEBUG] skill router started",
-        serde_json::json!({
-            "router_enabled": router_enabled,
-            "skip_router_for_local_intent": skip_router_for_local_intent,
-            "skill_count": skill_manifests.len(),
-        }),
-    );
-    let router_selected = if router_enabled && !skip_router_for_local_intent {
-        let model = app.current_model.clone();
-        request::select_skill_via_model(app, &model, question, skill_manifests).await
-    } else {
-        None
-    };
-    super::turn_runtime::report_agent_hang_debug(
-        "pre-fix",
-        "R",
-        "skill_runtime::prepare_skill_for_turn:router:end",
-        "[DEBUG] skill router finished",
-        serde_json::json!({
-            "router_enabled": router_enabled,
-            "skip_router_for_local_intent": skip_router_for_local_intent,
-            "selected": router_selected.as_deref(),
-            "elapsed_ms": router_start.elapsed().as_secs_f64() * 1000.0,
-        }),
-    );
+    let router_selected = route_skill_for_turn(
+        app,
+        question,
+        skill_manifests,
+        router_enabled,
+        skip_router_for_local_intent,
+    )
+    .await;
 
     let heuristic_skill = match_skill(skill_manifests, question, Some(&intent));
     let router_skill = router_selected

@@ -47,6 +47,20 @@ fn is_feishu_mcp_server(name: &str, command: &str) -> bool {
     file_name == "mcp_feishu" || file_name == "mcp_feishu.exe"
 }
 
+#[crate::ai::agent_hang_span(
+    "pre-fix",
+    "M",
+    "driver::run:init_mcp",
+    "[DEBUG] initializing mcp",
+    "[DEBUG] initialized mcp",
+    {},
+    {
+        "loaded": __agent_hang_result.loaded,
+        "server_count": __agent_hang_result.server_count,
+        "tool_count": __agent_hang_result.tool_count,
+        "elapsed_ms": __agent_hang_elapsed_ms,
+    }
+)]
 pub async fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitReport {
     let cfg = crate::commonw::configw::get_all_config();
     let mcp_path = if !app.cli.mcp_config.trim().is_empty() {

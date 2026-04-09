@@ -35,7 +35,7 @@ pub(super) async fn stream_response(
         }
 
         let chunk_result = tokio::select! {
-            chunk = response.chunk() => chunk.map(|opt| opt.map(|bytes| bytes.to_vec())),
+            chunk = response.chunk() => chunk,
             _ = wait_for_interrupt(app) => {
                 return Ok(cancelled_stream_result(state.thinking_open));
             }
@@ -75,16 +75,16 @@ fn cancelled_stream_result(thinking_open: bool) -> StreamResult {
     }
 }
 
-async fn process_chunk_result(
+async fn process_chunk_result<T: AsRef<[u8]>>(
     app: &mut App,
     current_history: &mut String,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
-    chunk_result: Result<Option<Vec<u8>>, reqwest::Error>,
+    chunk_result: Result<Option<T>, reqwest::Error>,
 ) -> Result<StreamChunkStep, Box<dyn std::error::Error>> {
     match chunk_result {
         Ok(Some(chunk)) => {
-            state.pending.extend_from_slice(&chunk);
+            state.pending.extend_from_slice(chunk.as_ref());
             state.decode_error_count = 0;
             consume_pending_complete_lines(app, current_history, markers, state).await
         }
@@ -105,22 +105,25 @@ async fn consume_pending_complete_lines(
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
 ) -> Result<StreamChunkStep, Box<dyn std::error::Error>> {
+    // Move the pending buffer out so line slices can borrow from it while `state`
+    // remains available for mutation inside `process_stream_line()`.
+    let mut pending = std::mem::take(&mut state.pending);
     let mut should_stop = false;
     let mut consumed = 0usize;
-    while let Some(line_end_rel) = state.pending[consumed..].iter().position(|b| *b == b'\n') {
+    while let Some(line_end_rel) = pending[consumed..].iter().position(|b| *b == b'\n') {
         let line_end = consumed + line_end_rel + 1;
-        let line_bytes = state.pending[consumed..line_end].to_vec();
-        let line = match std::str::from_utf8(&line_bytes) {
-            Ok(line) => line.to_owned(),
+        let line = match std::str::from_utf8(&pending[consumed..line_end]) {
+            Ok(line) => line,
             Err(err) => {
                 if let Some(result) = handle_stream_decode_error(app, markers, state, err).await {
+                    state.pending = pending;
                     return Ok(StreamChunkStep::Return(result));
                 }
                 consumed = line_end;
                 continue;
             }
         };
-        if process_stream_line(app, current_history, markers, state, &line)? {
+        if process_stream_line(app, current_history, markers, state, line)? {
             should_stop = true;
             consumed = line_end;
             break;
@@ -128,8 +131,9 @@ async fn consume_pending_complete_lines(
         consumed = line_end;
     }
     if consumed != 0 {
-        state.pending.drain(..consumed);
+        pending.drain(..consumed);
     }
+    state.pending = pending;
     Ok(if should_stop {
         StreamChunkStep::Stop
     } else {
@@ -147,19 +151,21 @@ async fn process_pending_tail(
         return Ok(None);
     }
 
-    let pending_bytes = state.pending.clone();
-    let line = match std::str::from_utf8(&pending_bytes) {
-        Ok(line) => line.to_owned(),
+    let pending = std::mem::take(&mut state.pending);
+    let line = match std::str::from_utf8(&pending) {
+        Ok(line) => line,
         Err(err) => {
             if let Some(result) = handle_stream_decode_error(app, markers, state, err).await {
                 return Ok(Some(result));
             }
-            String::new()
+            state.pending = pending;
+            return Ok(None);
         }
     };
     if !line.is_empty() {
-        let _ = process_stream_line(app, current_history, markers, state, &line)?;
+        let _ = process_stream_line(app, current_history, markers, state, line)?;
     }
+    state.pending = pending;
     Ok(None)
 }
 

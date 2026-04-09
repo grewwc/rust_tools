@@ -1,6 +1,6 @@
 use crate::ai::{models, types::App};
 
-pub fn resolve_model_for_input(app: &App, question: &mut String) -> String {
+pub fn resolve_model_for_input(app: &App, _question: &mut String) -> String {
     // Resolution order:
     // 1) If there are image attachments, force a VL-capable model (unless already VL).
     // 2) A trailing " -d" forces the default DeepSeek model (and strips the suffix).

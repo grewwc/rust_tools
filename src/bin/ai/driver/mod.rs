@@ -4,7 +4,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
 };
 
 use uuid::Uuid;
@@ -44,6 +43,26 @@ pub use skill_matching::*;
 
 const DEFAULT_MAX_ITERATIONS: usize = 1024;
 const OPENCLAW_MAX_ITERATIONS: usize = 64;
+
+#[crate::ai::agent_hang_span(
+    "pre-fix",
+    "S",
+    "driver::run:load_all_skills",
+    "[DEBUG] loading skills",
+    "[DEBUG] loaded skills",
+    { "no_skills": no_skills },
+    {
+        "count": __agent_hang_result.len(),
+        "elapsed_ms": __agent_hang_elapsed_ms,
+    }
+)]
+fn load_skill_manifests(no_skills: bool) -> Vec<SkillManifest> {
+    if no_skills {
+        Vec::new()
+    } else {
+        skills::load_all_skills()
+    }
+}
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = cli::parse_cli_args(std::env::args());
@@ -120,50 +139,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut mcp_client = McpClient::new();
-    let skills_start = Instant::now();
-    turn_runtime::report_agent_hang_debug(
-        "pre-fix",
-        "S",
-        "driver::run:load_all_skills:begin",
-        "[DEBUG] loading skills",
-        serde_json::json!({ "no_skills": app.cli.no_skills }),
-    );
-    let skill_manifests = if app.cli.no_skills {
-        Vec::new()
-    } else {
-        skills::load_all_skills()
-    };
-    turn_runtime::report_agent_hang_debug(
-        "pre-fix",
-        "S",
-        "driver::run:load_all_skills:end",
-        "[DEBUG] loaded skills",
-        serde_json::json!({
-            "count": skill_manifests.len(),
-            "elapsed_ms": skills_start.elapsed().as_secs_f64() * 1000.0,
-        }),
-    );
-    let mcp_start = Instant::now();
-    turn_runtime::report_agent_hang_debug(
-        "pre-fix",
-        "M",
-        "driver::run:init_mcp:begin",
-        "[DEBUG] initializing mcp",
-        serde_json::json!({}),
-    );
+    let skill_manifests = load_skill_manifests(app.cli.no_skills);
     let mcp_report = init_mcp(&mut app, &mut mcp_client).await;
-    turn_runtime::report_agent_hang_debug(
-        "pre-fix",
-        "M",
-        "driver::run:init_mcp:end",
-        "[DEBUG] initialized mcp",
-        serde_json::json!({
-            "loaded": mcp_report.loaded,
-            "server_count": mcp_report.server_count,
-            "tool_count": mcp_report.tool_count,
-            "elapsed_ms": mcp_start.elapsed().as_secs_f64() * 1000.0,
-        }),
-    );
 
     if app.cli.list_tools {
         print::print_builtin_tools(&app);

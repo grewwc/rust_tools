@@ -3,6 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use super::ast_symbols;
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 
 fn params_lsp() -> Value {
@@ -384,14 +385,30 @@ fn lsp_hover(file_path: &str, line: usize, column: usize) -> Result<String, Stri
 fn lsp_document_symbols(file_path: &str) -> Result<String, String> {
     let content =
         fs::read_to_string(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
-
-    let mut symbols = Vec::new();
     let language = detect_language(file_path);
 
+    if let Some(result) = ast_symbols::extract_document_symbols(&language, file_path, &content) {
+        match result {
+            Ok(symbols) => return Ok(ast_symbols::format_symbols_output(file_path, &symbols)),
+            Err(err) => {
+                let fallback = fallback_document_symbols(file_path, &content, &language);
+                return Ok(format!(
+                    "{}\n\n[AST parser fallback: {}]",
+                    fallback, err
+                ));
+            }
+        }
+    }
+
+    Ok(fallback_document_symbols(file_path, &content, &language))
+}
+
+fn fallback_document_symbols(file_path: &str, content: &str, language: &str) -> String {
+    let mut symbols = Vec::new();
     for (idx, line) in content.lines().enumerate() {
         let trimmed = line.trim();
 
-        let symbol = match language.as_str() {
+        let symbol = match language {
             "rust" => {
                 if let Some(name) = trimmed.strip_prefix("fn ") {
                     name.split('(')
@@ -475,9 +492,9 @@ fn lsp_document_symbols(file_path: &str) -> Result<String, String> {
     }
 
     if symbols.is_empty() {
-        Ok(format!("No symbols found in {}", file_path))
+        format!("No symbols found in {}", file_path)
     } else {
-        Ok(format!("Symbols in {}:\n{}", file_path, symbols.join("\n")))
+        format!("Symbols in {}:\n{}", file_path, symbols.join("\n"))
     }
 }
 

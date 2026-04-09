@@ -124,6 +124,28 @@ pub(super) enum TurnOutcome {
     Quit,
 }
 
+#[crate::ai::agent_hang_span(
+    "pre-fix",
+    "A",
+    "turn_runtime::run_turn",
+    "[DEBUG] run_turn started",
+    "[DEBUG] run_turn finished",
+    {
+        "history_count": history_count,
+        "question_len": question.chars().count(),
+        "model": next_model.as_str(),
+        "one_shot_mode": one_shot_mode,
+        "should_quit": should_quit,
+    },
+    {
+        "ok": __agent_hang_result.is_ok(),
+        "outcome": __agent_hang_result
+            .as_ref()
+            .map(|v| format!("{:?}", v))
+            .unwrap_or_else(|err| err.to_string()),
+        "elapsed_ms": __agent_hang_elapsed_ms,
+    }
+)]
 pub(super) async fn run_turn(
     app: &mut App,
     mcp_client: &mut McpClient,
@@ -134,19 +156,6 @@ pub(super) async fn run_turn(
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
-    report_agent_hang_debug(
-        "pre-fix",
-        "A",
-        "turn_runtime::run_turn:start",
-        "[DEBUG] run_turn started",
-        serde_json::json!({
-            "history_count": history_count,
-            "question_len": question.chars().count(),
-            "model": next_model,
-            "one_shot_mode": one_shot_mode,
-        }),
-    );
-
     let TurnPreparation {
         mut skill_turn,
         mut messages,
@@ -169,17 +178,6 @@ pub(super) async fn run_turn(
     let mut final_assistant_recorded = false;
     loop {
         iteration += 1;
-        report_agent_hang_debug(
-            "pre-fix",
-            "A",
-            "turn_runtime::run_turn:iteration:begin",
-            "[DEBUG] turn iteration started",
-            serde_json::json!({
-                "iteration": iteration,
-                "force_final_response": force_final_response,
-                "message_count": messages.len(),
-            }),
-        );
         refresh_skill_turn_for_iteration(
             app,
             mcp_client,
@@ -427,6 +425,11 @@ mod tests {
 
         let prepared = prepare_tool_result(&app, "read_file_lines", &content);
 
+        eprintln!("DEBUG: content chars = {}", content.chars().count());
+        eprintln!("DEBUG: content lines = {}", content.lines().count());
+        eprintln!("DEBUG: terminal preview len = {}", prepared.content_for_terminal.len());
+        eprintln!("DEBUG: terminal preview first 300 chars:\n{}", &prepared.content_for_terminal[..300.min(prepared.content_for_terminal.len())]);
+        
         assert_eq!(prepared.content_for_model, content);
         assert!(prepared.content_for_terminal.contains("truncated for terminal preview"));
         assert!(prepared.content_for_terminal.len() < prepared.content_for_model.len());

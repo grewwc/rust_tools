@@ -1,5 +1,29 @@
 use super::*;
 
+#[crate::ai::agent_hang_span(
+    "post-fix",
+    "K",
+    "turn_runtime::run_turn:prepare_turn",
+    "[DEBUG] preparing turn",
+    "[DEBUG] prepared turn",
+    {
+        "history_count": history_count,
+        "question_len": question.chars().count(),
+        "model": next_model,
+    },
+    {
+        "message_count": __agent_hang_result.as_ref().map(|v| v.messages.len()).unwrap_or(0),
+        "turn_message_count": __agent_hang_result
+            .as_ref()
+            .map(|v| v.turn_messages.len())
+            .unwrap_or(0),
+        "max_iterations": __agent_hang_result
+            .as_ref()
+            .map(|v| v.max_iterations)
+            .unwrap_or(0),
+        "elapsed_ms": __agent_hang_elapsed_ms,
+    }
+)]
 pub(super) async fn prepare_turn(
     app: &mut App,
     mcp_client: &mut McpClient,
@@ -18,19 +42,6 @@ pub(super) async fn prepare_turn(
     let mut skill_turn =
         super::super::skill_runtime::prepare_skill_for_turn(app, mcp_client, skill_manifests, question)
             .await;
-
-    report_agent_hang_debug(
-        "post-fix",
-        "K",
-        "turn_runtime::run_turn:prepare_turn:start",
-        "[DEBUG] preparing turn",
-        serde_json::json!({
-            "history_count": history_count,
-            "history_len": history.len(),
-            "model": next_model,
-            "matched_skill": skill_turn.matched_skill_name(),
-        }),
-    );
 
     let mut messages = Vec::with_capacity(history.len() + 2);
 
@@ -69,18 +80,18 @@ pub(super) async fn prepare_turn(
                 | super::super::intent_recognition::CoreIntent::QueryConcept
         );
     let skip_recall = skip_recall_for_skill_context || skip_recall_for_light_turn;
-    report_agent_hang_debug(
+    crate::ai::agent_hang_debug!(
         "post-fix",
         "K",
         "turn_runtime::run_turn:knowledge_recall:gate",
         "[DEBUG] knowledge recall gate decided",
-        serde_json::json!({
+        {
             "matched_skill": skill_turn.matched_skill_name(),
             "core": format!("{:?}", recall_intent.core),
             "skip_recall_for_skill_context": skip_recall_for_skill_context,
             "skip_recall_for_light_turn": skip_recall_for_light_turn,
             "skip_recall": skip_recall,
-        }),
+        },
     );
     if !skip_recall {
         let recall_bundle = reflection::build_recall_bundle(question, 1200, 2000);

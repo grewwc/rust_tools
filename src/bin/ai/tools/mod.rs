@@ -1,4 +1,7 @@
+mod ast_symbols;
+mod ast_structural;
 mod cargo_tools;
+mod code_search;
 pub(crate) mod command_tools;
 mod common;
 mod context_tools;

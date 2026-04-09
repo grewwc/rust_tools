@@ -124,11 +124,19 @@ fn build_terminal_preview(tool_name: &str, content: &str) -> String {
         }
     }
 
+    let contains_truncation_notice = preview.contains("truncated for terminal preview");
+    
     if preview.chars().count() > policy.max_chars {
         let truncated = truncate_chars(&preview, policy.max_chars);
+        
+        let suffix = if contains_truncation_notice {
+            "... (truncated for terminal preview)"
+        } else {
+            "... (terminal preview capped)"
+        };
         return format!(
-            "{}\n... (terminal preview capped at {} chars)",
-            truncated, policy.max_chars
+            "{}\n{}",
+            truncated, suffix
         );
     }
 
@@ -477,6 +485,42 @@ fn record_final_stream_response(
     record_hidden_self_note(app, turn_messages, &stream_result.hidden_meta);
 }
 
+#[crate::ai::agent_hang_span(
+    "pre-fix",
+    "C",
+    "turn_runtime::run_turn:execute_tool_calls",
+    "[DEBUG] executing tool calls",
+    "[DEBUG] executed tool calls",
+    {
+        "iteration": _iteration,
+        "tool_calls": tool_calls
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect::<Vec<_>>(),
+    },
+    {
+        "iteration": _iteration,
+        "tool_result_count": __agent_hang_result
+            .as_ref()
+            .map(|v| v.tool_results.len())
+            .unwrap_or(0),
+        "cached_hits": __agent_hang_result
+            .as_ref()
+            .map(|v| v.cached_hits.clone())
+            .unwrap_or_default(),
+        "ok": __agent_hang_result.is_ok(),
+        "elapsed_ms": __agent_hang_elapsed_ms,
+    }
+)]
+fn execute_tool_calls_for_round(
+    session_id: &str,
+    mcp_client: &mut McpClient,
+    tool_calls: &[crate::ai::types::ToolCall],
+    _iteration: usize,
+) -> Result<tools::ExecuteToolCallsResult, Box<dyn std::error::Error>> {
+    tools::execute_tool_calls(session_id, mcp_client, tool_calls)
+}
+
 fn handle_tool_call_round(
     app: &App,
     mcp_client: &mut McpClient,
@@ -487,33 +531,12 @@ fn handle_tool_call_round(
     persisted_turn_messages: &mut usize,
     iteration: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    report_agent_hang_debug(
-        "pre-fix",
-        "C",
-        "turn_runtime::run_turn:execute_tool_calls:begin",
-        "[DEBUG] executing tool calls",
-        serde_json::json!({
-            "iteration": iteration,
-            "tool_calls": stream_result
-                .tool_calls
-                .iter()
-                .map(|tool| tool.function.name.clone())
-                .collect::<Vec<_>>(),
-        }),
-    );
-    let exec_result =
-        tools::execute_tool_calls(&app.session_id, mcp_client, &stream_result.tool_calls)?;
-    report_agent_hang_debug(
-        "pre-fix",
-        "C",
-        "turn_runtime::run_turn:execute_tool_calls:end",
-        "[DEBUG] executed tool calls",
-        serde_json::json!({
-            "iteration": iteration,
-            "tool_result_count": exec_result.tool_results.len(),
-            "cached_hits": exec_result.cached_hits,
-        }),
-    );
+    let exec_result = execute_tool_calls_for_round(
+        &app.session_id,
+        mcp_client,
+        &stream_result.tool_calls,
+        iteration,
+    )?;
 
     append_cached_tool_results_note(&exec_result, messages, turn_messages);
     append_tool_result_messages(
@@ -555,15 +578,15 @@ pub(super) fn handle_iteration_execution(
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::FinalResponse(stream_result) => {
-            report_agent_hang_debug(
+            crate::ai::agent_hang_debug!(
                 "pre-fix",
                 "A",
                 "turn_runtime::run_turn:final-response",
                 "[DEBUG] final assistant response without tool calls",
-                serde_json::json!({
+                {
                     "iteration": iteration,
                     "assistant_chars": stream_result.assistant_text.chars().count(),
-                }),
+                },
             );
             record_final_stream_response(
                 app,
