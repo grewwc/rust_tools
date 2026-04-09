@@ -2,6 +2,7 @@
   {
     "key": "DEEPSEEK_V3",
     "name": "deepseek-v3.2",
+    "quality_tier": "strong",
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
@@ -10,6 +11,7 @@
   {
     "key": "GLM",
     "name": "glm-5",
+    "quality_tier": "strong",
     "is_vl": false,
     "search_enabled": false,
     "tools_default_enabled": true,
@@ -18,6 +20,7 @@
   {
     "key": "QWEN_PLUS_LATEST",
     "name": "qwen3.6-plus",
+    "quality_tier": "flagship",
     "is_vl": true,
     "search_enabled": true,
     "tools_default_enabled": true,
@@ -26,6 +29,7 @@
   {
     "key": "QWEN3_MAX",
     "name": "qwen3-max",
+    "quality_tier": "flagship",
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
@@ -34,6 +38,7 @@
   {
     "key": "QWEN_CODER_PLUS_LATEST",
     "name": "qwen3-coder-plus",
+    "quality_tier": "strong",
     "is_vl": false,
     "search_enabled": false,
     "tools_default_enabled": true,
@@ -42,6 +47,7 @@
   {
     "key": "KIMI",
     "name": "kimi-k2.5",
+    "quality_tier": "strong",
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
@@ -50,6 +56,7 @@
   {
     "key": "QWEN_FLASH",
     "name": "qwen3.5-flash",
+    "quality_tier": "basic",
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": false,
@@ -58,6 +65,7 @@
   {
     "key": "QWEN_VL_FLASH",
     "name": "qwen3-vl-flash",
+    "quality_tier": "basic",
     "is_vl": true,
     "search_enabled": false,
     "tools_default_enabled": false,
@@ -66,6 +74,7 @@
   {
     "key": "QWEN_VL_MAX",
     "name": "qwen3-vl-plus",
+    "quality_tier": "strong",
     "is_vl": true,
     "search_enabled": false,
     "tools_default_enabled": true,
@@ -74,6 +83,7 @@
   {
     "key": "MINIMAX",
     "name": "MiniMax-M2.5",
+    "quality_tier": "strong",
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
@@ -82,9 +92,50 @@
   {
     "key": "qwen-open",
     "name": "qwen3.5-397b-a17b",
+    "quality_tier": "flagship",
     "is_vl": true,
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true
+  },
+  {
+    "key": "OPENAI_GPT_4O",
+    "name": "gpt-4o",
+    "provider": "openai",
+    "quality_tier": "basic",
+    "is_vl": true,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": false
+  },
+  {
+    "key": "OPENAI_GPT_4O_MINI",
+    "name": "gpt-4o-mini",
+    "provider": "openai",
+    "quality_tier": "basic",
+    "is_vl": true,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": false
+  },
+  {
+    "key": "OPENAI_GPT_4_1",
+    "name": "gpt-4.1",
+    "provider": "openai",
+    "quality_tier": "basic",
+    "is_vl": true,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": false
+  },
+  {
+    "key": "OPENAI_GPT_4_1_MINI",
+    "name": "gpt-4.1-mini",
+    "provider": "openai",
+    "quality_tier": "basic",
+    "is_vl": true,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": false
   }
 ]

@@ -40,9 +40,11 @@ pub(in crate::ai) fn sigint_action(
         }
     } else if shutdown.load(Ordering::Relaxed) {
         SigintAction::Exit
-    } else {
-        // Outside streaming (including tool execution), first Ctrl+C requests a graceful
-        // shutdown so the process won't terminate abruptly mid-turn.
+    } else if cancel_stream.load(Ordering::Relaxed) {
         SigintAction::Shutdown
+    } else {
+        // Outside streaming (including tool execution), first Ctrl+C cancels the current
+        // turn but keeps the session alive. A second Ctrl+C will shut down.
+        SigintAction::CancelStream
     }
 }

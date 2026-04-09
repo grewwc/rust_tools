@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 mod agents;
 mod cli;
+mod code_discovery_policy;
 mod config;
 pub mod config_schema;
 mod errors;
@@ -11,6 +12,7 @@ mod knowledge;
 mod mcp;
 mod model_names;
 mod models;
+mod provider;
 mod prompt;
 mod request;
 mod skills;

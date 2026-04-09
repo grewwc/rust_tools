@@ -1,4 +1,7 @@
-use crate::ai::stream::render::inline::{render_inline_md, visible_width, wrap_md_cell};
+use crate::ai::stream::{
+    extract::strip_ansi_codes,
+    render::inline::{render_inline_md, visible_width, wrap_md_cell},
+};
 
 #[derive(Clone)]
 pub(super) enum TableState {
@@ -25,11 +28,12 @@ pub(super) enum TableAlign {
 }
 
 pub(super) fn table_preview_height(line: &str) -> usize {
+    let visible = strip_ansi_codes(line);
     let cols = terminal_width().max(1);
     let mut lines = 1usize;
     let mut current_col = 0usize;
 
-    for ch in line.chars() {
+    for ch in visible.chars() {
         let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
         if current_col > 0 && current_col + w > cols {
             lines += 1;
@@ -496,5 +500,12 @@ mod tests {
         assert_eq!(widths.len(), 2);
         assert!(widths[0] >= visible_width("`a|b`"));
         assert!(widths[1] >= visible_width(r#"$\frac{1}{2}$"#));
+    }
+
+    #[test]
+    fn table_preview_height_ignores_ansi_sequences() {
+        let plain = "a".repeat(200);
+        let colored = format!("\x1b[2m{plain}\x1b[0m");
+        assert_eq!(table_preview_height(&colored), table_preview_height(&plain));
     }
 }

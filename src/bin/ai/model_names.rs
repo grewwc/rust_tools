@@ -5,10 +5,16 @@ use rust_tools::commonw::FastMap;
 use rust_tools::cw::SkipSet;
 use crate::commonw::utils::expanduser;
 
+use super::provider::{ApiProvider, ModelQualityTier};
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ModelDef {
     pub key: String,
     pub name: String,
+    #[serde(default)]
+    pub provider: ApiProvider,
+    #[serde(default)]
+    pub quality_tier: ModelQualityTier,
     pub is_vl: bool,
     pub search_enabled: bool,
     pub tools_default_enabled: bool,

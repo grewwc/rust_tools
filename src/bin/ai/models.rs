@@ -2,6 +2,7 @@ use super::agents::{AgentManifest, AgentModelTier};
 use super::cli::ParsedCli;
 use super::config_schema::AiConfig;
 use super::model_names::{self, ModelDef};
+use super::provider::{ApiProvider, ModelQualityTier};
 
 pub(super) fn is_vl_model(model: &str) -> bool {
     model_names::find_by_name(model)
@@ -27,6 +28,18 @@ pub(super) fn enable_thinking(model: &str) -> bool {
         .unwrap_or(false)
 }
 
+pub(super) fn model_provider(model: &str) -> ApiProvider {
+    model_names::find_by_name(model)
+        .map(|m| m.provider)
+        .unwrap_or_default()
+}
+
+pub(super) fn model_quality_tier(model: &str) -> ModelQualityTier {
+    model_names::find_by_name(model)
+        .map(|m| m.quality_tier)
+        .unwrap_or_default()
+}
+
 fn all_model_names() -> Vec<String> {
     model_names::all().iter().map(|m| m.name.clone()).collect()
 }
@@ -40,18 +53,14 @@ fn vl_model_names() -> Vec<String> {
 }
 
 fn default_model() -> String {
-    model_names::all().first().map(|m| m.name.as_str().to_owned()).unwrap_or_else(|| {
-            eprintln!("[model_names] models.json is empty");
-            std::process::exit(1);
-        })
+    choose_default_model_name(false).unwrap_or_else(|| {
+        eprintln!("[model_names] models.json is empty");
+        std::process::exit(1);
+    })
 }
 
 fn default_vl_model() -> String {
-    model_names::all()
-        .iter()
-        .find(|m| m.is_vl)
-        .map(|m| m.name.as_str().to_owned())
-        .unwrap_or_else(default_model)
+    choose_default_model_name(true).unwrap_or_else(default_model)
 }
 
 pub(super) fn forced_deepseek_model() -> String {
@@ -87,15 +96,19 @@ pub(super) fn initial_model(cli: &ParsedCli) -> String {
 }
 
 pub(super) fn determine_model(model: &str) -> String {
-    let model = model.trim().to_lowercase();
-    if model.is_empty() {
+    let raw = model.trim();
+    if raw.is_empty() {
         return default_model();
     }
-    best_match_model_name(&model, all_model_names().into_iter(), default_model())
+    if let Some(def) = model_names::find_by_name(raw) {
+        return def.name.as_str().to_owned();
+    }
+    best_match_model_name(&raw.to_lowercase(), all_model_names().into_iter(), default_model())
 }
 
 pub(super) fn determine_vl_model(model: &str) -> String {
-    let model = model.trim().to_lowercase();
+    let raw = model.trim();
+    let model = raw.to_lowercase();
     if model.is_empty() {
         return default_vl_model();
     }
@@ -118,6 +131,10 @@ pub(super) fn determine_vl_model(model: &str) -> String {
     best_match_model_name(&model, vl_model_names().into_iter(), default_vl_model())
 }
 
+pub(super) fn supports_image_input(model: &str) -> bool {
+    is_vl_model(model)
+}
+
 pub(super) fn auto_subagent_model_for_agent(
     agent: &AgentManifest,
     description: &str,
@@ -129,14 +146,17 @@ pub(super) fn auto_subagent_model_for_agent(
         ModelStrengthTier::Light => pick_subagent_model(
             &["DEEPSEEK_V3", "KIMI", "GLM", "MINIMAX"],
             false,
+            target_tier,
         ),
         ModelStrengthTier::Standard => pick_subagent_model(
             &["QWEN_CODER_PLUS_LATEST", "GLM", "KIMI", "MINIMAX", "DEEPSEEK_V3"],
             true,
+            target_tier,
         ),
         ModelStrengthTier::Heavy => pick_subagent_model(
             &["QWEN3_MAX", "QWEN_CODER_PLUS_LATEST", "MINIMAX", "GLM", "KIMI"],
             true,
+            target_tier,
         ),
     }
 }
@@ -259,26 +279,38 @@ fn classify_subagent_task_difficulty(
     SubagentTaskDifficulty::Standard
 }
 
-fn pick_subagent_model(preferred_keys: &[&str], require_thinking: bool) -> String {
-    for key in preferred_keys {
-        if let Some(model) = model_names::find_by_key(key)
-            && subagent_model_eligible(model, require_thinking)
-        {
-            return model.name.clone();
-        }
+fn pick_subagent_model(
+    preferred_keys: &[&str],
+    require_thinking: bool,
+    target_tier: ModelStrengthTier,
+) -> String {
+    let preferred = preferred_keys
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, key)| model_names::find_by_key(key).map(|model| (idx, model)))
+        .filter(|(_, model)| subagent_model_eligible(model, require_thinking))
+        .collect::<Vec<_>>();
+    if let Some((_, model)) = choose_best_candidate(&preferred, target_tier) {
+        return model.name.clone();
     }
 
-    for model in model_names::all() {
-        if subagent_model_eligible(model, require_thinking) {
-            return model.name.clone();
-        }
+    let fallback = model_names::all()
+        .into_iter()
+        .enumerate()
+        .filter(|(_, model)| subagent_model_eligible(model, require_thinking))
+        .collect::<Vec<_>>();
+    if let Some((_, model)) = choose_best_candidate(&fallback, target_tier) {
+        return model.name.clone();
     }
 
     if require_thinking {
-        for model in model_names::all() {
-            if model.tools_default_enabled {
-                return model.name.clone();
-            }
+        let tools_only = model_names::all()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, model)| model.tools_default_enabled)
+            .collect::<Vec<_>>();
+        if let Some((_, model)) = choose_best_candidate(&tools_only, target_tier) {
+            return model.name.clone();
         }
     }
 
@@ -287,6 +319,75 @@ fn pick_subagent_model(preferred_keys: &[&str], require_thinking: bool) -> Strin
 
 fn subagent_model_eligible(model: &ModelDef, require_thinking: bool) -> bool {
     model.tools_default_enabled && (!require_thinking || model.enable_thinking)
+}
+
+fn choose_default_model_name(require_vl: bool) -> Option<String> {
+    let candidates = model_names::all()
+        .into_iter()
+        .enumerate()
+        .filter(|(_, model)| model.is_vl == require_vl)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return None;
+    }
+
+    choose_best_default_candidate(
+        &candidates
+            .iter()
+            .copied()
+            .filter(|(_, model)| model.provider == ApiProvider::Compatible)
+            .collect::<Vec<_>>(),
+    )
+    .or_else(|| choose_best_default_candidate(&candidates))
+    .map(|(_, model)| model.name.clone())
+}
+
+fn choose_best_default_candidate<'a>(
+    candidates: &[(usize, &'a ModelDef)],
+) -> Option<(usize, &'a ModelDef)> {
+    candidates.iter().copied().max_by(|(left_idx, left), (right_idx, right)| {
+        default_candidate_rank(left, *left_idx).cmp(&default_candidate_rank(right, *right_idx))
+    })
+}
+
+fn default_candidate_rank(model: &ModelDef, preferred_index: usize) -> (ModelQualityTier, u8, usize) {
+    (
+        model.quality_tier,
+        model.tools_default_enabled as u8,
+        usize::MAX - preferred_index,
+    )
+}
+
+fn choose_best_candidate<'a>(
+    candidates: &[(usize, &'a ModelDef)],
+    target_tier: ModelStrengthTier,
+) -> Option<(usize, &'a ModelDef)> {
+    candidates.iter().copied().max_by(|(left_idx, left), (right_idx, right)| {
+        candidate_rank(left, *left_idx, target_tier).cmp(&candidate_rank(right, *right_idx, target_tier))
+    })
+}
+
+fn candidate_rank(
+    model: &ModelDef,
+    preferred_index: usize,
+    target_tier: ModelStrengthTier,
+) -> (u8, ModelQualityTier, usize) {
+    (
+        quality_tier_satisfies_target(model.quality_tier, target_tier) as u8,
+        model.quality_tier,
+        usize::MAX - preferred_index,
+    )
+}
+
+fn quality_tier_satisfies_target(
+    quality_tier: ModelQualityTier,
+    target_tier: ModelStrengthTier,
+) -> bool {
+    match target_tier {
+        ModelStrengthTier::Light => quality_tier >= ModelQualityTier::Basic,
+        ModelStrengthTier::Standard => quality_tier >= ModelQualityTier::Strong,
+        ModelStrengthTier::Heavy => quality_tier >= ModelQualityTier::Flagship,
+    }
 }
 
 fn best_match_model_name(
@@ -332,9 +433,12 @@ fn levenshtein(left: &[u8], right: &[u8]) -> usize {
 mod tests {
     use super::{
         agent_model_tier, auto_subagent_model_for_agent, classify_subagent_task_difficulty,
-        merge_agent_tier_with_difficulty, ModelStrengthTier, SubagentTaskDifficulty,
+        default_model, default_vl_model, determine_model, determine_vl_model,
+        merge_agent_tier_with_difficulty, model_provider, model_quality_tier, ModelStrengthTier,
+        SubagentTaskDifficulty,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
+    use crate::ai::provider::{ApiProvider, ModelQualityTier};
 
     fn manifest(name: &str, description: &str, model_tier: Option<AgentModelTier>) -> AgentManifest {
         AgentManifest {
@@ -394,6 +498,24 @@ mod tests {
         let def = super::model_names::find_by_name(&model).expect("selected model must exist");
         assert!(def.tools_default_enabled);
         assert!(def.enable_thinking);
+        assert_eq!(def.quality_tier, ModelQualityTier::Flagship);
+    }
+
+    #[test]
+    fn standard_subagent_model_prefers_high_quality_tier() {
+        let model = auto_subagent_model_for_agent(
+            &manifest(
+                "plan",
+                "Read-only planning and analysis agent",
+                Some(AgentModelTier::Standard),
+            ),
+            "Plan a refactor",
+            "Review the architecture, compare approaches, and propose a refactor strategy.",
+        );
+        let def = super::model_names::find_by_name(&model).expect("selected model must exist");
+        assert!(def.tools_default_enabled);
+        assert!(def.enable_thinking);
+        assert!(def.quality_tier >= ModelQualityTier::Strong);
     }
 
     #[test]
@@ -435,5 +557,35 @@ mod tests {
             ),
             ModelStrengthTier::Standard
         );
+    }
+
+    #[test]
+    fn openai_model_entries_resolve_exactly() {
+        assert_eq!(determine_model("gpt-4o"), "gpt-4o");
+        assert_eq!(determine_vl_model("gpt-4.1-mini"), "gpt-4.1-mini");
+    }
+
+    #[test]
+    fn openai_model_entries_carry_provider_and_quality_tier() {
+        let def = super::model_names::find_by_name("gpt-4o").expect("gpt-4o model must exist");
+        assert_eq!(model_provider("gpt-4o"), def.provider);
+        assert_eq!(model_quality_tier("gpt-4o"), def.quality_tier);
+    }
+
+    #[test]
+    fn default_model_prefers_high_quality_compatible_model() {
+        let def = super::model_names::find_by_name(&default_model()).expect("default model must exist");
+        assert_eq!(def.provider, ApiProvider::Compatible);
+        assert!(!def.is_vl);
+        assert_eq!(def.quality_tier, ModelQualityTier::Flagship);
+    }
+
+    #[test]
+    fn default_vl_model_prefers_high_quality_compatible_vl_model() {
+        let def =
+            super::model_names::find_by_name(&default_vl_model()).expect("default vl model must exist");
+        assert_eq!(def.provider, ApiProvider::Compatible);
+        assert!(def.is_vl);
+        assert_eq!(def.quality_tier, ModelQualityTier::Flagship);
     }
 }

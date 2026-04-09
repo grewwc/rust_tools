@@ -1,0 +1,114 @@
+{
+  "classification": {
+    "rules": [
+      {
+        "enabled": true,
+        "tool_names": ["read_file", "read_file_lines", "code_search", "grep_search"],
+        "match": {
+          "any_contains": ["root cause", "caused by", "because ", "due to "]
+        },
+        "kind": "root_cause",
+        "confidence": "high"
+      },
+      {
+        "enabled": true,
+        "tool_names": ["code_search", "read_file", "read_file_lines"],
+        "match": {
+          "any_contains": ["call chain", "caller", "callee", "invokes ", " -> "]
+        },
+        "kind": "call_chain",
+        "confidence": "medium"
+      },
+      {
+        "enabled": true,
+        "tool_names": ["read_file", "read_file_lines", "code_search"],
+        "match": {
+          "any_contains": ["entry point", "bootstrap", "startup", "fn main(", "app::run("]
+        },
+        "kind": "entry_point",
+        "confidence": "high"
+      },
+      {
+        "enabled": true,
+        "tool_names": ["read_file", "read_file_lines", "code_search", "grep_search"],
+        "match": {
+          "any_contains": ["panic", "error", "failed", "missing"]
+        },
+        "kind": "error_site",
+        "confidence": "high"
+      },
+      {
+        "enabled": true,
+        "tool_names": ["read_file", "read_file_lines", "code_search"],
+        "match": {
+          "any_contains": ["fn ", "class ", "struct ", "impl "]
+        },
+        "kind": "symbol",
+        "confidence": "high"
+      },
+      {
+        "enabled": true,
+        "tool_names": ["read_file", "read_file_lines", "code_search"],
+        "match": {
+          "any_contains": ["todo", "fixme"]
+        },
+        "kind": "todo",
+        "confidence": "medium"
+      },
+      {
+        "enabled": true,
+        "tool_names": ["read_file", "read_file_lines", "code_search", "grep_search"],
+        "match": {
+          "any_contains": ["config", "feature flag", ".toml"]
+        },
+        "kind": "config",
+        "confidence": "medium"
+      },
+      {
+        "enabled": true,
+        "tool_names": ["code_search"],
+        "match": {
+          "any_contains": [".rs:"]
+        },
+        "kind": "code_path",
+        "confidence": "medium"
+      },
+      {
+        "enabled": true,
+        "tool_names": ["read_file", "read_file_lines", "grep_search"],
+        "match": {
+          "any_contains": [".rs:"]
+        },
+        "kind": "code_path",
+        "confidence": "low"
+      }
+    ]
+  },
+  "recall": {
+    "max_items": 8,
+    "confidence_weight": {
+      "low": 100,
+      "medium": 200,
+      "high": 300
+    },
+    "kind_weight": {
+      "error_site": 60,
+      "root_cause": 70,
+      "entry_point": 50,
+      "call_chain": 40,
+      "symbol": 30,
+      "code_path": 10,
+      "config": 20,
+      "todo": 0
+    }
+  },
+  "persistence": {
+    "max_persist_per_turn": 3,
+    "min_confidence": "medium",
+    "priority_weight": {
+      "low": 120,
+      "medium": 160,
+      "high": 200
+    }
+  }
+}

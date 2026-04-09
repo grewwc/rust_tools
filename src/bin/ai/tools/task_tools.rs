@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::process::Command;
 
 use crate::ai::{
-    agents::{self, AgentManifest},
+    agents::{self, AgentManifest, AgentModelTier},
     models,
     tools::common::{ToolRegistration, ToolSpec},
 };
@@ -90,12 +90,42 @@ fn auto_subagent_score(agent: &AgentManifest, task_text: &str) -> i32 {
     score
 }
 
+#[derive(Debug)]
+struct SelectedSubagent<'a> {
+    agent: &'a AgentManifest,
+    auto_selected: bool,
+    matched_tags: Vec<String>,
+    score: i32,
+}
+
+fn matched_routing_tags(agent: &AgentManifest, task_text: &str) -> Vec<String> {
+    let task = task_text.to_ascii_lowercase();
+    agent
+        .routing_tags_normalized()
+        .into_iter()
+        .filter(|tag| {
+            if task.contains(tag) {
+                return true;
+            }
+            if tag.contains('-') || tag.contains(' ') {
+                let parts = tag
+                    .split(['-', ' '])
+                    .map(str::trim)
+                    .filter(|part| !part.is_empty())
+                    .collect::<Vec<_>>();
+                return !parts.is_empty() && parts.iter().all(|part| task.contains(part));
+            }
+            false
+        })
+        .collect()
+}
+
 fn select_subagent<'a>(
     all_agents: &'a [AgentManifest],
     requested_agent: Option<&str>,
     description: &str,
     prompt: &str,
-) -> Result<&'a AgentManifest, String> {
+) -> Result<SelectedSubagent<'a>, String> {
     let subagents = agents::get_subagents(all_agents);
     if subagents.is_empty() {
         return Err("No subagents are available. Add at least one agent with mode: subagent or all."
@@ -108,7 +138,12 @@ fn select_subagent<'a>(
             .copied()
             .find(|agent| agent.name.eq_ignore_ascii_case(requested))
         {
-            return Ok(agent);
+            return Ok(SelectedSubagent {
+                agent,
+                auto_selected: false,
+                matched_tags: Vec::new(),
+                score: 0,
+            });
         }
 
         if let Some(agent) = agents::find_agent_by_name(all_agents, requested) {
@@ -137,7 +172,70 @@ fn select_subagent<'a>(
                 .cmp(&auto_subagent_score(b, &task_text))
                 .then_with(|| b.name.cmp(&a.name))
         })
+        .map(|agent| SelectedSubagent {
+            agent,
+            auto_selected: true,
+            matched_tags: matched_routing_tags(agent, &task_text),
+            score: auto_subagent_score(agent, &task_text),
+        })
         .ok_or_else(|| "No subagents are available.".to_string())
+}
+
+fn format_agent_model_tier(agent: &AgentManifest) -> &'static str {
+    match agent.model_tier {
+        Some(AgentModelTier::Light) => "light",
+        Some(AgentModelTier::Standard) | None => "standard",
+        Some(AgentModelTier::Heavy) => "heavy",
+    }
+}
+
+fn format_quality_tier(tier: crate::ai::provider::ModelQualityTier) -> &'static str {
+    match tier {
+        crate::ai::provider::ModelQualityTier::Basic => "basic",
+        crate::ai::provider::ModelQualityTier::Standard => "standard",
+        crate::ai::provider::ModelQualityTier::Strong => "strong",
+        crate::ai::provider::ModelQualityTier::Flagship => "flagship",
+    }
+}
+
+fn format_provider(provider: crate::ai::provider::ApiProvider) -> &'static str {
+    match provider {
+        crate::ai::provider::ApiProvider::Compatible => "compatible",
+        crate::ai::provider::ApiProvider::OpenAi => "openai",
+    }
+}
+
+fn build_selection_explanation(
+    selected: &SelectedSubagent<'_>,
+    selected_model: &str,
+    model_override: Option<&str>,
+) -> String {
+    let agent_reason = if selected.auto_selected {
+        if selected.matched_tags.is_empty() {
+            "agent_reason=auto-selected as the best available subagent".to_string()
+        } else {
+            format!(
+                "agent_reason=auto-selected by routing_tags [{}] (score={})",
+                selected.matched_tags.join(", "),
+                selected.score
+            )
+        }
+    } else {
+        "agent_reason=explicit agent override".to_string()
+    };
+
+    let model_reason = if model_override.map(str::trim).filter(|value| !value.is_empty()).is_some() {
+        "model_reason=explicit model override".to_string()
+    } else {
+        format!(
+            "model_reason=auto-selected for agent_tier={} using {} provider and {} quality_tier",
+            format_agent_model_tier(selected.agent),
+            format_provider(models::model_provider(selected_model)),
+            format_quality_tier(models::model_quality_tier(selected_model))
+        )
+    };
+
+    format!("{agent_reason}\n{model_reason}")
 }
 
 fn execute_subagent_task(
@@ -150,14 +248,15 @@ fn execute_subagent_task(
 
     let start = Instant::now();
     let all_agents = agents::load_all_agents();
-    let selected_agent = select_subagent(&all_agents, agent, description, prompt)?;
+    let selected = select_subagent(&all_agents, agent, description, prompt)?;
     let selected_model = model
         .map(models::determine_model)
-        .unwrap_or_else(|| models::auto_subagent_model_for_agent(selected_agent, description, prompt));
+        .unwrap_or_else(|| models::auto_subagent_model_for_agent(selected.agent, description, prompt));
+    let selection_explanation = build_selection_explanation(&selected, &selected_model, model);
 
     println!(
-        "\n[Task] Launching subagent '{}' with model '{}' for: {}",
-        selected_agent.name, selected_model, description
+        "\n[Task] Launching subagent '{}' with model '{}' for: {}\n{}",
+        selected.agent.name, selected_model, description, selection_explanation
     );
 
     let mut cmd_args = vec!["--".to_string(), "--no-skills".to_string()];
@@ -165,7 +264,7 @@ fn execute_subagent_task(
     cmd_args.push("--model".to_string());
     cmd_args.push(selected_model.clone());
     cmd_args.push("--agent".to_string());
-    cmd_args.push(selected_agent.name.clone());
+    cmd_args.push(selected.agent.name.clone());
     cmd_args.push(prompt.to_string());
 
     let output = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
@@ -178,22 +277,24 @@ fn execute_subagent_task(
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let result = format!(
-            "[Task: {} via {} @ {}] (completed in {:.1}s)\n{}",
+            "[Task: {} via {} @ {}] (completed in {:.1}s)\n{}\n{}",
             description,
-            selected_agent.name,
+            selected.agent.name,
             selected_model,
             duration.as_secs_f64(),
+            selection_explanation,
             stdout.trim()
         );
         Ok(result)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!(
-            "[Task: {} via {} @ {}] failed after {:.1}s:\n{}",
+            "[Task: {} via {} @ {}] failed after {:.1}s:\n{}\n{}",
             description,
-            selected_agent.name,
+            selected.agent.name,
             selected_model,
             duration.as_secs_f64(),
+            selection_explanation,
             stderr.trim()
         ))
     }
@@ -201,7 +302,7 @@ fn execute_subagent_task(
 
 #[cfg(test)]
 mod tests {
-    use super::select_subagent;
+    use super::{SelectedSubagent, build_selection_explanation, select_subagent};
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 
     fn manifest(name: &str, description: &str, mode: AgentMode) -> AgentManifest {
@@ -256,7 +357,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selected.name, "explore");
+        assert_eq!(selected.agent.name, "explore");
+        assert!(selected.auto_selected);
+        assert!(!selected.matched_tags.is_empty());
     }
 
     #[test]
@@ -299,7 +402,41 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(selected.name, "navigator");
+        assert_eq!(selected.agent.name, "navigator");
+    }
+
+    #[test]
+    fn selection_explanation_mentions_quality_tier_for_auto_model_choice() {
+        let agent = manifest("build", "Main build agent", AgentMode::Subagent);
+        let selected = SelectedSubagent {
+            agent: &agent,
+            auto_selected: true,
+            matched_tags: vec!["implement".to_string(), "fix".to_string()],
+            score: 48,
+        };
+
+        let explanation = build_selection_explanation(&selected, "qwen3-max", None);
+
+        assert!(explanation.contains("routing_tags [implement, fix]"));
+        assert!(explanation.contains("quality_tier"));
+        assert!(explanation.contains("flagship"));
+        assert!(explanation.contains("compatible"));
+    }
+
+    #[test]
+    fn selection_explanation_mentions_explicit_overrides() {
+        let agent = manifest("explore", "Read-only codebase exploration agent", AgentMode::Subagent);
+        let selected = SelectedSubagent {
+            agent: &agent,
+            auto_selected: false,
+            matched_tags: Vec::new(),
+            score: 0,
+        };
+
+        let explanation = build_selection_explanation(&selected, "gpt-4o", Some("gpt-4o"));
+
+        assert!(explanation.contains("explicit agent override"));
+        assert!(explanation.contains("explicit model override"));
     }
 }
 

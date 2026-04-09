@@ -23,6 +23,8 @@ impl CommandCompleter {
             ":help",
             "/h",
             ":h",
+            "/history",
+            ":history",
             "/feishu-auth",
             ":feishu-auth",
             "/share",
@@ -51,6 +53,23 @@ impl CommandCompleter {
             "export",
             "export-current",
             "export-last",
+        ]
+    }
+
+    fn history_subcommands() -> &'static [&'static str] {
+        &[
+            "full",
+            "user",
+            "assistant",
+            "tool",
+            "system",
+            "grep",
+            "export",
+            "copy",
+            "3",
+            "6",
+            "10",
+            "20",
         ]
     }
 
@@ -83,6 +102,7 @@ impl CommandCompleter {
             let source = match first {
                 "/agents" | ":agents" | "/agent" | ":agent" => Self::agent_subcommands(),
                 "/sessions" | ":sessions" => Self::session_subcommands(),
+                "/history" | ":history" => Self::history_subcommands(),
                 _ => &[],
             };
             source
@@ -372,6 +392,41 @@ mod tests {
             .unwrap();
         assert_eq!(start, 8);
         assert!(pairs.iter().any(|pair| pair.replacement == "auto"));
+    }
+
+    #[test]
+    fn history_command_completion_is_suggested() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let (_, pairs) = completer
+            .complete("/his", 4, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "/history"));
+    }
+
+    #[test]
+    fn history_command_completion_lists_subcommands() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let (start, pairs) = completer
+            .complete("/history a", 10, &Context::new(&history))
+            .unwrap();
+        assert_eq!(start, 9);
+        assert!(pairs.iter().any(|pair| pair.replacement == "assistant"));
+    }
+
+    #[test]
+    fn history_command_completion_lists_extended_subcommands() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let (_, pairs) = completer
+            .complete("/history ", 9, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "tool"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "system"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "grep"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "export"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "copy"));
     }
 
     #[test]

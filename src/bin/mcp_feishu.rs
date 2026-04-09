@@ -127,7 +127,7 @@ fn handle_tools_list() -> Result<Value, JsonRpcErr> {
             },
             {
                 "name": "messages_search",
-                "description": "Search Feishu chat or thread messages by keyword. This works on Feishu IM messages, not docs. It fetches message history from the target chat/thread and filters locally.",
+                "description": "Search Feishu chat or thread messages by keyword from the authorized user's perspective. This works on Feishu IM messages, not docs. Requires user_access_token.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -145,6 +145,25 @@ fn handle_tools_list() -> Result<Value, JsonRpcErr> {
                         "page_size": { "type": "integer", "description": "Messages fetched per API call. Default 50, max 50" },
                         "max_pages": { "type": "integer", "description": "How many pages to scan at most. Default 5, max 20" },
                         "limit": { "type": "integer", "description": "Maximum matched messages to return. Default 20, max 100" }
+                    },
+                    "required": ["search_key"]
+                }
+            },
+            {
+                "name": "messages_global_search",
+                "description": "Search Feishu IM messages across chats visible to the authorized user, without needing a specific chat_id. Supports substring, regex, and fuzzy matching modes. Requires user_access_token.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "search_key": { "type": "string", "description": "Keyword or pattern to search in message content" },
+                        "max_chats": { "type": "integer", "description": "Maximum number of recent chats to scan. Default 50, max 200" },
+                        "msgs_per_chat": { "type": "integer", "description": "Max messages per API page per chat. Default 50, max 50" },
+                        "max_pages": { "type": "integer", "description": "Max pages to fetch per chat. Default 10, max 50. Total messages per chat = msgs_per_chat * max_pages" },
+                        "msg_types": { "type": "array", "items": { "type": "string" }, "description": "Optional message type filter, e.g. text/post/interactive/file/image/media/audio/sticker/share_chat/share_user/system" },
+                        "limit": { "type": "integer", "description": "Maximum matched messages to return. Default 20, max 100" },
+                        "include_p2p": { "type": "boolean", "description": "Include 1-on-1 chats. Default true" },
+                        "include_group": { "type": "boolean", "description": "Include group chats. Default true" },
+                        "search_mode": { "type": "string", "enum": ["substring", "regex", "fuzzy"], "description": "Search mode: substring (default, case-insensitive), regex (Rust regex), fuzzy (edit distance <= 2)" }
                     },
                     "required": ["search_key"]
                 }
@@ -289,6 +308,14 @@ fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcErr> {
         }
         "messages_search" => {
             let text = feishu_messages_search(&args)?;
+            Ok(json!({
+                "content": [
+                    { "type": "text", "text": text }
+                ]
+            }))
+        }
+        "messages_global_search" => {
+            let text = feishu_messages_global_search(&args)?;
             Ok(json!({
                 "content": [
                     { "type": "text", "text": text }
@@ -592,18 +619,45 @@ fn feishu_messages_search(args: &Value) -> Result<String, JsonRpcErr> {
                 Some(json!({ "error": e.to_string() })),
             )
         })?;
-    let token = acquire_tenant_access_token(&client, &base_url).map_err(|e| {
-        json_rpc_error(
-            -32000,
-            "Missing tenant_access_token. Message search requires FEISHU_TENANT_ACCESS_TOKEN or app_id/app_secret.",
-            Some(json!({
-                "detail": e.message,
-                "env": ["FEISHU_TENANT_ACCESS_TOKEN", "FEISHU_APP_ID", "FEISHU_APP_SECRET"],
-                "config_keys": ["feishu.tenant_access_token", "feishu.app_id", "feishu.app_secret"]
-            })),
-        )
-    })?;
+    with_user_access_token(
+        &client,
+        &base_url,
+        "Missing user_access_token. Message search requires OAuth once.",
+        |token| {
+            feishu_messages_search_with_token(
+                &client,
+                &base_url,
+                token,
+                &search_key,
+                container_id_type,
+                &container_id,
+                &msg_type_filters,
+                sort_type,
+                page_size,
+                max_pages,
+                limit,
+                start_time.as_deref(),
+                end_time.as_deref(),
+            )
+        },
+    )
+}
 
+fn feishu_messages_search_with_token(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+    search_key: &str,
+    container_id_type: &str,
+    container_id: &str,
+    msg_type_filters: &[String],
+    sort_type: &str,
+    page_size: usize,
+    max_pages: usize,
+    limit: usize,
+    start_time: Option<&str>,
+    end_time: Option<&str>,
+) -> Result<String, JsonRpcErr> {
     let mut page_token: Option<String> = None;
     let mut matches: Vec<String> = Vec::new();
     let mut scanned_messages = 0usize;
@@ -718,6 +772,432 @@ fn feishu_messages_search(args: &Value) -> Result<String, JsonRpcErr> {
     out.push_str("\n\n");
     out.push_str(&matches.join("\n\n"));
     Ok(out)
+}
+
+/// Fuzzy match using Levenshtein distance. Returns true if the edit distance
+/// between `text` and `pattern` is <= `max_distance`.
+fn fuzzy_match(text: &str, pattern: &str, max_distance: usize) -> bool {
+    let t_chars: Vec<char> = text.chars().collect();
+    let p_chars: Vec<char> = pattern.chars().collect();
+    let t_len = t_chars.len();
+    let p_len = p_chars.len();
+    
+    if p_len == 0 { return true; }
+    if t_len == 0 { return false; }
+    
+    // Use sliding window for efficiency when pattern is much shorter than text
+    let mut min_dist = usize::MAX;
+    for i in 0..=(t_len.saturating_sub(p_len)) {
+        let end = (i + p_len).min(t_len);
+        let window = &t_chars[i..end];
+        let dist = levenshtein(window, &p_chars);
+        min_dist = min_dist.min(dist);
+        if min_dist <= max_distance { return true; }
+    }
+    min_dist <= max_distance
+}
+
+/// Compute Levenshtein (edit) distance between two char slices.
+fn levenshtein(a: &[char], b: &[char]) -> usize {
+    let (m, n) = (a.len(), b.len());
+    let mut prev: Vec<usize> = (0..=n).collect();
+    let mut curr = vec![0usize; n + 1];
+    
+    for i in 1..=m {
+        curr[0] = i;
+        for j in 1..=n {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1)          // deletion
+                .min(curr[j - 1] + 1)         // insertion
+                .min(prev[j - 1] + cost);     // substitution
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[n]
+}
+
+#[derive(Debug, Clone)]
+struct ChatInfo {
+    chat_id: String,
+    name: String,
+}
+
+/// List recent chats using the Feishu API.
+fn list_recent_chats(
+    client: &Client,
+    base_url: &str,
+    access_token: &str,
+    max_chats: usize,
+    include_p2p: bool,
+    include_group: bool,
+) -> Result<Vec<ChatInfo>, JsonRpcErr> {
+    let url = format!("{}/open-apis/im/v1/chats", base_url);
+    
+    let mut all_chats = Vec::new();
+    let mut page_token = String::new();
+    
+    loop {
+        let mut req = client.get(&url)
+            .header("Authorization", format!("Bearer {}", access_token))
+            .query(&[("page_size", "50")]);
+        
+        if !page_token.is_empty() {
+            req = req.query(&[("page_token", &page_token)]);
+        }
+        
+        let resp = req.send().map_err(|e| {
+            json_rpc_error(-32000, "Failed to fetch chats", Some(json!({ "error": e.to_string() })))
+        })?;
+
+        let (status, content_type, body_text) = read_response_text(resp, "chats response")?;
+        let body = parse_json_response_body("chats response", status, content_type.as_deref(), &body_text)?;
+        
+        if !status.is_success() {
+            return Err(json_rpc_error(-32000, "Chats list API returned error code", Some(body)));
+        }
+        
+        let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            return Err(json_rpc_error(-32000, &format!("Chats API error: code={}", code), Some(body)));
+        }
+        
+        let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
+        let items = data.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        
+        for item in &items {
+            let chat_id = item.get("chat_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let chat_mode = item.get("chat_mode").and_then(|v| v.as_str()).unwrap_or("");
+            
+            if !chat_mode_matches(chat_mode, include_p2p, include_group) {
+                continue;
+            }
+            
+            all_chats.push(ChatInfo { chat_id, name });
+            if all_chats.len() >= max_chats {
+                return Ok(all_chats);
+            }
+        }
+        
+        page_token = data.get("page_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if page_token.is_empty() || items.is_empty() {
+            break;
+        }
+    }
+    
+    Ok(all_chats)
+}
+
+/// Fetch messages from a specific chat.
+fn fetch_chat_messages(
+    client: &Client,
+    base_url: &str,
+    access_token: &str,
+    chat_id: &str,
+    msgs_per_chat: u64,
+    max_pages: u64,
+) -> Result<Vec<Value>, JsonRpcErr> {
+    let mut all_messages = Vec::new();
+    let mut page_token: Option<String> = None;
+
+    for _page in 0..max_pages {
+        let (status, body_text) = do_messages_list_request(
+            client,
+            base_url,
+            access_token,
+            "chat",
+            chat_id,
+            "ByCreateTimeDesc",
+            msgs_per_chat as usize,
+            page_token.as_deref(),
+            None,
+            None,
+        )?;
+        if !status.is_success() {
+            return Err(json_rpc_error(
+                -32000,
+                "Messages list API returned error code",
+                Some(json!({
+                    "status": status.as_u16(),
+                    "body": body_text
+                })),
+            ));
+        }
+
+        let body = parse_json_response_body(
+            "messages response",
+            status,
+            Some("application/json"),
+            &body_text,
+        )?;
+
+        let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            return Err(json_rpc_error(
+                -32000,
+                &format!("Messages API error: code={}", code),
+                Some(body),
+            ));
+        }
+        
+        let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
+        let items = data.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        
+        let is_empty = items.is_empty();
+        all_messages.extend(items);
+        
+        page_token = data
+            .get("page_token")
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+            .filter(|v| !v.is_empty());
+        if page_token.is_none() || is_empty {
+            break;
+        }
+    }
+    
+    Ok(all_messages)
+}
+
+fn read_response_text(
+    resp: reqwest::blocking::Response,
+    label: &str,
+) -> Result<(reqwest::StatusCode, Option<String>, String), JsonRpcErr> {
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    let body = resp.bytes().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            &format!("Failed to read {}", label),
+            Some(json!({
+                "error": e.to_string(),
+                "status": status.as_u16(),
+                "content_type": content_type,
+            })),
+        )
+    })?;
+    Ok((
+        status,
+        content_type,
+        String::from_utf8_lossy(&body).to_string(),
+    ))
+}
+
+fn parse_json_response_body(
+    label: &str,
+    status: reqwest::StatusCode,
+    content_type: Option<&str>,
+    body_text: &str,
+) -> Result<Value, JsonRpcErr> {
+    serde_json::from_str::<Value>(body_text).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            &format!("Failed to parse {}", label),
+            Some(json!({
+                "error": e.to_string(),
+                "status": status.as_u16(),
+                "content_type": content_type,
+                "body": truncate_for_error_body(body_text, 1200),
+            })),
+        )
+    })
+}
+
+fn truncate_for_error_body(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in s.chars().enumerate() {
+        if idx >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn feishu_messages_global_search(args: &Value) -> Result<String, JsonRpcErr> {
+    let search_key = args
+        .get("search_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if search_key.is_empty() {
+        return Err(json_rpc_error(-32602, "Invalid params: search_key is empty", None));
+    }
+
+    let max_chats: usize = args.get("max_chats").and_then(|v| v.as_u64()).unwrap_or(50).min(200) as usize;
+    let msgs_per_chat: u64 = args.get("msgs_per_chat").and_then(|v| v.as_u64()).unwrap_or(50).min(50);
+    let max_pages: u64 = args.get("max_pages").and_then(|v| v.as_u64()).unwrap_or(10).min(50);
+    let limit: usize = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(100) as usize;
+    let include_p2p = args.get("include_p2p").and_then(|v| v.as_bool()).unwrap_or(true);
+    let include_group = args.get("include_group").and_then(|v| v.as_bool()).unwrap_or(true);
+    let msg_type_filters = extract_string_array(args.get("msg_types"));
+
+    let search_mode = args
+        .get("search_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("substring");
+
+    // Prepare matcher based on search_mode
+    let regex_opt = if search_mode == "regex" {
+        Some(regex::Regex::new(&search_key).map_err(|e| {
+            json_rpc_error(-32602, &format!("Invalid regex pattern: {}", e), None)
+        })?)
+    } else {
+        None
+    };
+    let needle_lower = search_key.to_lowercase();
+    let fuzzy_threshold = if search_mode == "fuzzy" { 2 } else { 0 };
+
+    let base_url = resolve_base_url();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .map_err(|e| {
+            json_rpc_error(-32000, "Failed to build http client", Some(json!({ "error": e.to_string() })))
+        })?;
+
+    with_user_access_token(
+        &client,
+        &base_url,
+        "Missing user_access_token. Global message search requires OAuth once.",
+        |token| {
+            feishu_messages_global_search_with_token(
+                &client,
+                &base_url,
+                token,
+                search_key,
+                max_chats,
+                msgs_per_chat,
+                max_pages,
+                limit,
+                include_p2p,
+                include_group,
+                &msg_type_filters,
+                search_mode,
+                regex_opt.as_ref(),
+                &needle_lower,
+                fuzzy_threshold,
+            )
+        },
+    )
+}
+
+fn feishu_messages_global_search_with_token(
+    client: &Client,
+    base_url: &str,
+    access_token: &str,
+    search_key: &str,
+    max_chats: usize,
+    msgs_per_chat: u64,
+    max_pages: u64,
+    limit: usize,
+    include_p2p: bool,
+    include_group: bool,
+    msg_type_filters: &[String],
+    search_mode: &str,
+    regex_opt: Option<&regex::Regex>,
+    needle_lower: &str,
+    fuzzy_threshold: usize,
+) -> Result<String, JsonRpcErr> {
+    let chats = list_recent_chats(
+        client,
+        base_url,
+        access_token,
+        max_chats,
+        include_p2p,
+        include_group,
+    )?;
+
+    let mut matches: Vec<(i64, String)> = Vec::new();
+    let mut scanned_chats = 0usize;
+    let mut scanned_messages = 0usize;
+
+    for chat in &chats {
+        scanned_chats += 1;
+
+        let messages = fetch_chat_messages(
+            client,
+            base_url,
+            access_token,
+            &chat.chat_id,
+            msgs_per_chat,
+            max_pages,
+        )?;
+        for item in &messages {
+            scanned_messages += 1;
+
+            if !msg_type_filters.is_empty() {
+                let msg_type = item.get("msg_type").and_then(|v| v.as_str()).unwrap_or("");
+                if !msg_type_filters.iter().any(|f| f == msg_type) {
+                    continue;
+                }
+            }
+
+            let searchable_text = build_feishu_global_searchable_text(item, chat);
+            if searchable_text.is_empty() {
+                continue;
+            }
+            let matched = match search_mode {
+                "regex" => regex_opt.map(|re| re.is_match(&searchable_text)).unwrap_or(false),
+                "fuzzy" => fuzzy_match(&searchable_text, &needle_lower, fuzzy_threshold),
+                _ => searchable_text.to_lowercase().contains(&needle_lower), // substring (default)
+            };
+            if !matched {
+                continue;
+            }
+            let mut enriched = item.clone();
+            if let Some(obj) = enriched.as_object_mut() {
+                obj.insert("chat_name".to_string(), Value::String(chat.name.clone()));
+                obj.insert("chat_id".to_string(), Value::String(chat.chat_id.clone()));
+            }
+            matches.push((
+                message_create_time(item),
+                serde_json::to_string_pretty(&enriched).unwrap_or_else(|_| "<error>".to_string()),
+            ));
+        }
+    }
+
+    matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    if matches.len() > limit {
+        matches.truncate(limit);
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "search_key: {} (mode: {})\nscanned_chats: {}/{}\nscanned_messages: {}\nmatched: {}",
+        search_key, search_mode, scanned_chats, chats.len(), scanned_messages, matches.len()
+    ));
+    if !msg_type_filters.is_empty() {
+        out.push_str(&format!("\nfiltered_msg_types: {:?}", msg_type_filters));
+    }
+    out.push_str("\n\n");
+    out.push_str(
+        &matches
+            .into_iter()
+            .map(|(_, rendered)| rendered)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    );
+    Ok(out)
+}
+
+fn message_create_time(item: &Value) -> i64 {
+    item.get("create_time")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+fn chat_mode_matches(chat_mode: &str, include_p2p: bool, include_group: bool) -> bool {
+    match chat_mode {
+        "p2p" => include_p2p,
+        "group" | "topic" => include_group,
+        _ => include_group,
+    }
 }
 
 fn resolve_message_container(args: &Value) -> Result<(&'static str, String), JsonRpcErr> {
@@ -848,6 +1328,17 @@ fn build_feishu_message_searchable_text(item: &Value) -> String {
     }
     let merged = parts.join(" ");
     compact_message_text(&merged)
+}
+
+fn build_feishu_global_searchable_text(item: &Value, chat: &ChatInfo) -> String {
+    let message_text = build_feishu_message_searchable_text(item);
+    if chat.name.trim().is_empty() {
+        return message_text;
+    }
+    if message_text.is_empty() {
+        return compact_message_text(&chat.name);
+    }
+    compact_message_text(&format!("{} {}", chat.name, message_text))
 }
 
 fn collect_message_text(value: &Value, out: &mut Vec<String>) {
@@ -4278,7 +4769,9 @@ fn write_json_rpc_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::thread;
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4294,6 +4787,35 @@ mod tests {
                 "body": "{\"code\":99991668,\"msg\":\"Invalid access token for authorization. Please make a request with token attached.\"}"
             })),
         )
+    }
+
+    fn start_mock_http_server<F>(handler: F) -> String
+    where
+        F: Fn(String) -> String + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handler = Arc::new(handler);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = handler(request);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        format!("http://{}", addr)
     }
 
     #[test]
@@ -4444,6 +4966,253 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn messages_search_uses_user_access_token() {
+        let _guard = env_lock().lock().unwrap();
+        let seen_auth = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_auth_clone = Arc::clone(&seen_auth);
+        let base_url = start_mock_http_server(move |request| {
+            if let Some(line) = request
+                .lines()
+                .find(|line| line.starts_with("Authorization: "))
+            {
+                seen_auth_clone.lock().unwrap().push(line.to_string());
+            }
+            serde_json::json!({
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "items": [{
+                        "message_id": "om_1",
+                        "chat_id": "oc_1",
+                        "msg_type": "text",
+                        "create_time": "1",
+                        "sender": {"id": "ou_1"},
+                        "body": {"content": "{\"text\":\"dataagent ping\"}"}
+                    }],
+                    "has_more": false
+                }
+            })
+            .to_string()
+        });
+
+        let old_base = std::env::var("FEISHU_BASE_URL").ok();
+        let old_user = std::env::var("FEISHU_USER_ACCESS_TOKEN").ok();
+        unsafe {
+            std::env::set_var("FEISHU_BASE_URL", &base_url);
+            std::env::set_var("FEISHU_USER_ACCESS_TOKEN", "u-test-user-token");
+        }
+
+        let result = feishu_messages_search(&serde_json::json!({
+            "search_key": "dataagent",
+            "chat_id": "oc_1"
+        }))
+        .unwrap();
+
+        assert!(result.contains("matched: 1"));
+        assert!(seen_auth
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|line| line.contains("Bearer u-test-user-token")));
+
+        unsafe {
+            if let Some(v) = old_base {
+                std::env::set_var("FEISHU_BASE_URL", v);
+            } else {
+                std::env::remove_var("FEISHU_BASE_URL");
+            }
+            if let Some(v) = old_user {
+                std::env::set_var("FEISHU_USER_ACCESS_TOKEN", v);
+            } else {
+                std::env::remove_var("FEISHU_USER_ACCESS_TOKEN");
+            }
+        }
+    }
+
+    #[test]
+    fn messages_global_search_uses_user_access_token_and_includes_topic_chats() {
+        let _guard = env_lock().lock().unwrap();
+        let seen_auth = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_auth_clone = Arc::clone(&seen_auth);
+        let base_url = start_mock_http_server(move |request| {
+            if let Some(line) = request
+                .lines()
+                .find(|line| line.starts_with("Authorization: "))
+            {
+                seen_auth_clone.lock().unwrap().push(line.to_string());
+            }
+            let first_line = request.lines().next().unwrap_or_default().to_string();
+            if first_line.contains("/open-apis/im/v1/chats?") || first_line.contains("/open-apis/im/v1/chats ") {
+                return serde_json::json!({
+                    "code": 0,
+                    "msg": "ok",
+                    "data": {
+                        "items": [{
+                            "chat_id": "oc_topic",
+                            "name": "dataagent",
+                            "chat_mode": "topic"
+                        }],
+                        "page_token": ""
+                    }
+                })
+                .to_string();
+            }
+            serde_json::json!({
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "items": [{
+                        "message_id": "om_topic_1",
+                        "chat_id": "oc_topic",
+                        "msg_type": "text",
+                        "create_time": "1",
+                        "sender": {"id": "ou_1"},
+                        "body": {"content": "{\"text\":\"hello from thread\"}"}
+                    }],
+                    "page_token": ""
+                }
+            })
+            .to_string()
+        });
+
+        let old_base = std::env::var("FEISHU_BASE_URL").ok();
+        let old_user = std::env::var("FEISHU_USER_ACCESS_TOKEN").ok();
+        unsafe {
+            std::env::set_var("FEISHU_BASE_URL", &base_url);
+            std::env::set_var("FEISHU_USER_ACCESS_TOKEN", "u-test-user-token");
+        }
+
+        let result = feishu_messages_global_search(&serde_json::json!({
+            "search_key": "dataagent",
+            "limit": 10,
+            "max_chats": 10,
+            "msgs_per_chat": 50,
+            "max_pages": 2
+        }))
+        .unwrap();
+
+        assert!(result.contains("scanned_chats: 1/1"));
+        assert!(result.contains("matched: 1"));
+        assert!(result.contains("\"chat_name\": \"dataagent\""));
+        assert!(seen_auth
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|line| line.contains("Bearer u-test-user-token")));
+
+        unsafe {
+            if let Some(v) = old_base {
+                std::env::set_var("FEISHU_BASE_URL", v);
+            } else {
+                std::env::remove_var("FEISHU_BASE_URL");
+            }
+            if let Some(v) = old_user {
+                std::env::set_var("FEISHU_USER_ACCESS_TOKEN", v);
+            } else {
+                std::env::remove_var("FEISHU_USER_ACCESS_TOKEN");
+            }
+        }
+    }
+
+    #[test]
+    fn messages_global_search_sorts_matches_globally_by_create_time() {
+        let _guard = env_lock().lock().unwrap();
+        let base_url = start_mock_http_server(move |request| {
+            let first_line = request.lines().next().unwrap_or_default().to_string();
+            if first_line.contains("/open-apis/im/v1/chats?") || first_line.contains("/open-apis/im/v1/chats ") {
+                return serde_json::json!({
+                    "code": 0,
+                    "msg": "ok",
+                    "data": {
+                        "items": [
+                            {"chat_id": "oc_old", "name": "old-chat", "chat_mode": "group"},
+                            {"chat_id": "oc_new", "name": "new-chat", "chat_mode": "group"}
+                        ],
+                        "page_token": ""
+                    }
+                }).to_string();
+            }
+            if first_line.contains("container_id=oc_old") {
+                return serde_json::json!({
+                    "code": 0,
+                    "msg": "ok",
+                    "data": {
+                        "items": [{
+                            "message_id": "om_old",
+                            "chat_id": "oc_old",
+                            "msg_type": "text",
+                            "create_time": "100",
+                            "sender": {"id": "ou_1"},
+                            "body": {"content": "{\"text\":\"dataagent old\"}"}
+                        }],
+                        "has_more": false
+                    }
+                }).to_string();
+            }
+            serde_json::json!({
+                "code": 0,
+                "msg": "ok",
+                "data": {
+                    "items": [{
+                        "message_id": "om_new",
+                        "chat_id": "oc_new",
+                        "msg_type": "text",
+                        "create_time": "200",
+                        "sender": {"id": "ou_2"},
+                        "body": {"content": "{\"text\":\"dataagent new\"}"}
+                    }],
+                    "has_more": false
+                }
+            }).to_string()
+        });
+
+        let old_base = std::env::var("FEISHU_BASE_URL").ok();
+        let old_user = std::env::var("FEISHU_USER_ACCESS_TOKEN").ok();
+        unsafe {
+            std::env::set_var("FEISHU_BASE_URL", &base_url);
+            std::env::set_var("FEISHU_USER_ACCESS_TOKEN", "u-test-user-token");
+        }
+
+        let result = feishu_messages_global_search(&serde_json::json!({
+            "search_key": "dataagent",
+            "limit": 1,
+            "max_chats": 2,
+            "msgs_per_chat": 50,
+            "max_pages": 1
+        }))
+        .unwrap();
+
+        assert!(result.contains("scanned_chats: 2/2"));
+        assert!(result.contains("\"message_id\": \"om_new\""));
+        assert!(!result.contains("\"message_id\": \"om_old\""));
+
+        unsafe {
+            if let Some(v) = old_base {
+                std::env::set_var("FEISHU_BASE_URL", v);
+            } else {
+                std::env::remove_var("FEISHU_BASE_URL");
+            }
+            if let Some(v) = old_user {
+                std::env::set_var("FEISHU_USER_ACCESS_TOKEN", v);
+            } else {
+                std::env::remove_var("FEISHU_USER_ACCESS_TOKEN");
+            }
+        }
+    }
+
+    #[test]
+    fn chat_mode_matches_keeps_topic_when_group_search_enabled() {
+        assert!(chat_mode_matches("topic", true, true));
+        assert!(!chat_mode_matches("topic", true, false));
+    }
+
+    #[test]
+    fn message_create_time_parses_timestamp() {
+        let item = json!({"create_time": "1772192845747"});
+        assert_eq!(message_create_time(&item), 1_772_192_845_747);
+    }
     #[test]
     fn render_text_elements_preserves_links() {
         // 测试普通文本（无链接）
@@ -4544,5 +5313,22 @@ mod tests {
         });
         let searchable = build_feishu_message_searchable_text(&item);
         assert!(searchable.contains("报警记录 #123"));
+    }
+
+    #[test]
+    fn build_global_searchable_text_includes_chat_name() {
+        let item = json!({
+            "msg_type": "text",
+            "body": {
+                "content": "{\"text\":\"hello world\"}"
+            }
+        });
+        let chat = ChatInfo {
+            chat_id: "oc_123".to_string(),
+            name: "dataagent".to_string(),
+        };
+        let searchable = build_feishu_global_searchable_text(&item, &chat);
+        assert!(searchable.contains("dataagent"));
+        assert!(searchable.contains("hello world"));
     }
 }

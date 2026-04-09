@@ -85,7 +85,8 @@ pub(super) async fn model_should_reflect(
         },
         Message {
             role: "user".to_string(),
-            content: build_content(model, &user, &[]).unwrap_or(Value::String(user)),
+            content: build_content(model, &user, &[])
+                .unwrap_or(Value::String(user)),
             tool_calls: None,
             tool_call_id: None,
         },
@@ -119,6 +120,7 @@ pub(super) fn parse_reflect_flag(s: &str) -> Option<bool> {
 
 pub(super) fn turn_uses_repo_inspection_tools(messages: &Vec<Message>) -> bool {
     const REPO_INSPECTION_TOOLS: &[&str] = &[
+        "code_search",
         "read_file",
         "read_file_lines",
         "list_directory",
@@ -192,7 +194,8 @@ pub(super) async fn model_should_revise(
         },
         Message {
             role: "user".to_string(),
-            content: build_content(model, &user, &[]).unwrap_or(Value::String(user)),
+            content: build_content(model, &user, &[])
+                .unwrap_or(Value::String(user)),
             tool_calls: None,
             tool_call_id: None,
         },

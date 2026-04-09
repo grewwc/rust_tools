@@ -10,7 +10,9 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{files, history::Message, models, skills::SkillManifest, types::App};
+use super::{
+    files, history::Message, models, provider::ApiProvider, skills::SkillManifest, types::App,
+};
 use crate::ai::config_schema::AiConfig;
 use crate::ai::driver::intent_recognition;
 use crate::commonw::configw;
@@ -20,7 +22,8 @@ struct RequestBody<'a> {
     model: &'a str,
     messages: &'a [Message],
     stream: bool,
-    enable_thinking: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enable_thinking: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_search: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,7 +151,17 @@ fn control_model_for_aux_tasks(app: &App) -> String {
         .as_deref()
         .filter(|v| !v.trim().is_empty())
         .map(models::determine_model)
-        .unwrap_or_else(|| models::determine_model(DEFAULT_CONTROL_MODEL))
+        .unwrap_or_else(|| match models::model_provider(&app.current_model) {
+            ApiProvider::OpenAi => {
+                let current_model = app.current_model.trim();
+                if current_model.is_empty() {
+                    "gpt-4o-mini".to_string()
+                } else {
+                    current_model.to_string()
+                }
+            }
+            ApiProvider::Compatible => models::determine_model(DEFAULT_CONTROL_MODEL),
+        })
 }
 
 pub(super) fn is_transient_error(err: &RequestError) -> bool {
@@ -293,15 +306,15 @@ async fn decide_thinking_via_model(
     ];
 
     let control_model = control_model_for_aux_tasks(app);
-    let request_body = RequestBody {
-        model: &control_model,
-        messages: &gate_messages,
-        stream: false,
-        enable_thinking: false,
-        enable_search: None,
-        tools: None,
-        tool_choice: None,
-    };
+    let request_body = build_request_body(
+        &control_model,
+        &gate_messages,
+        false,
+        false,
+        None,
+        None,
+        None,
+    );
 
     let response = app
         .client
@@ -405,18 +418,17 @@ pub(super) async fn do_request_messages(
             "elapsed_ms": thinking_start.elapsed().as_secs_f64() * 1000.0,
         },
     );
-    let request_body = RequestBody {
+    let request_body = build_request_body(
         model,
         messages,
         stream,
         enable_thinking,
-        enable_search: models::search_enabled(model).then_some(true),
-        tools: tools_value,
+        models::search_enabled(model).then_some(true),
+        tools_value,
         tool_choice,
-    };
+    );
 
     for attempt in 1..=REQUEST_MAX_ATTEMPTS_429 {
-        let http_start = Instant::now();
         let response = app
             .client
             .post(&app.config.endpoint)
@@ -656,15 +668,15 @@ Skills:
     ];
 
     let control_model = control_model_for_aux_tasks(app);
-    let request_body = RequestBody {
-        model: &control_model,
-        messages: &messages,
-        stream: false,
-        enable_thinking: false,
-        enable_search: None,
-        tools: None,
-        tool_choice: None,
-    };
+    let request_body = build_request_body(
+        &control_model,
+        &messages,
+        false,
+        false,
+        None,
+        None,
+        None,
+    );
 
     let response = app
         .client
@@ -724,19 +736,28 @@ pub(super) fn build_content(
     question: &str,
     image_files: &[String],
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    if !models::is_vl_model(model) || image_files.is_empty() {
+    if !models::supports_image_input(model) || image_files.is_empty() {
         return Ok(Value::String(question.to_string()));
     }
 
+    let provider = models::model_provider(model);
     let mut parts = Vec::new();
     for file in image_files {
         let bytes = fs::read(file)?;
         let mime = files::image_mime_type(file);
         let image = base64::engine::general_purpose::STANDARD.encode(bytes);
-        parts.push(json!({
-            "type": "image_url",
-            "image_url": format!("data:{mime};base64,{image}"),
-        }));
+        parts.push(match provider {
+            ApiProvider::OpenAi => json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{mime};base64,{image}")
+                },
+            }),
+            ApiProvider::Compatible => json!({
+                "type": "image_url",
+                "image_url": format!("data:{mime};base64,{image}"),
+            }),
+        });
     }
     parts.push(json!({
         "type": "text",
@@ -753,6 +774,38 @@ pub(super) fn print_info(model: &str) {
     };
     // 使用 println! 避免手动 flush 的权限问题
     println!("[{} (search: {})]", model.green(), search.red());
+}
+
+fn build_request_body<'a>(
+    model: &'a str,
+    messages: &'a [Message],
+    stream: bool,
+    enable_thinking: bool,
+    enable_search: Option<bool>,
+    tools: Option<Value>,
+    tool_choice: Option<Value>,
+) -> RequestBody<'a> {
+    let provider = models::model_provider(model);
+    match provider {
+        ApiProvider::OpenAi => RequestBody {
+            model,
+            messages,
+            stream,
+            enable_thinking: None,
+            enable_search: None,
+            tools,
+            tool_choice,
+        },
+        ApiProvider::Compatible => RequestBody {
+            model,
+            messages,
+            stream,
+            enable_thinking: Some(enable_thinking),
+            enable_search,
+            tools,
+            tool_choice,
+        },
+    }
 }
 
 /// 使用 LLM 进行 JSON 格式的请求（用于意图识别等场景）
@@ -834,5 +887,74 @@ mod tests {
     fn test_parse_thinking_gate_output_invalid() {
         let s = r#"{"confidence":0.73}"#;
         assert_eq!(parse_thinking_gate_output(s), None);
+    }
+
+    #[test]
+    fn openai_request_body_omits_nonstandard_flags() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let body = build_request_body(
+            "gpt-4o",
+            &messages,
+            true,
+            true,
+            Some(true),
+            None,
+            None,
+        );
+        let value = serde_json::to_value(&body).unwrap();
+
+        assert!(value.get("enable_thinking").is_none());
+        assert!(value.get("enable_search").is_none());
+        assert_eq!(value.get("model").and_then(|v| v.as_str()), Some("gpt-4o"));
+    }
+
+    #[test]
+    fn compatible_request_body_keeps_extension_flags() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("hello".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+        let body = build_request_body(
+            "qwen",
+            &messages,
+            false,
+            true,
+            Some(true),
+            None,
+            None,
+        );
+        let value = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(value.get("enable_thinking").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(value.get("enable_search").and_then(|v| v.as_bool()), Some(true));
+    }
+
+    #[test]
+    fn openai_image_content_uses_object_image_url_shape() {
+        let path = std::env::temp_dir().join(format!("ai-openai-image-{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"fake").unwrap();
+
+        let value = build_content(
+            "gpt-4o",
+            "describe",
+            &[path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        let first = value.as_array().and_then(|items| items.first()).unwrap();
+        assert_eq!(first.get("type").and_then(|v| v.as_str()), Some("image_url"));
+        assert!(first
+            .get("image_url")
+            .and_then(|v| v.get("url"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.starts_with("data:image/png;base64,"))
+            .unwrap_or(false));
     }
 }

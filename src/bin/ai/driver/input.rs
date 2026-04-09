@@ -1,14 +1,26 @@
 use std::error::Error;
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
+use regex::RegexBuilder;
+
 use super::params::parse_loop_overrides;
+use crate::ai::history;
 use crate::ai::types::{App, QuestionContext};
+use crate::clipboardw::string_content;
 
 use crate::ai::{files, prompt::trim_trailing_newline};
 use crate::pdfw::{PdfParseOptions, parse_pdf};
+
+const HISTORY_PREVIEW_DEFAULT_COUNT: usize = 6;
+const HISTORY_PREVIEW_FULL_COUNT: usize = 20;
+const HISTORY_PREVIEW_MAX_COUNT: usize = 20;
+const HISTORY_PREVIEW_MAX_CHARS: usize = 160;
+const HISTORY_PREVIEW_FULL_MAX_CHARS: usize = 320;
+const HISTORY_GREP_HIGHLIGHT_START: &str = "\x1b[1;93m";
+const HISTORY_GREP_HIGHLIGHT_END: &str = "\x1b[0m";
 
 /// Clear any pending input from stdin to prevent stray Enter keys
 /// from interrupting the next input prompt.
@@ -58,7 +70,13 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
         match prompt_user(app) {
             Ok(v) => {
                 app.ignore_next_prompt_interrupt = false;
-                break v;
+                let Some(input) = v else {
+                    break None;
+                };
+                if handle_local_command(app, &input)? {
+                    continue;
+                }
+                break Some(input);
             }
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {
                 if app.ignore_next_prompt_interrupt {
@@ -85,6 +103,304 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
     let history_count = overrides.history_count.unwrap_or(app.cli.history);
     let ctx = finalize_question(app, question, history_count, overrides.short_output)?;
     Ok(Some(ctx))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalCommand {
+    ShowHistory(HistoryPreviewOptions),
+    ExportHistory(HistoryPreviewOptions, Option<PathBuf>),
+    CopyHistory(HistoryPreviewOptions),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryRoleFilter {
+    All,
+    User,
+    Assistant,
+    Tool,
+    System,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HistoryPreviewOptions {
+    count: usize,
+    role_filter: HistoryRoleFilter,
+    full: bool,
+    grep: Option<String>,
+}
+
+fn handle_local_command(app: &App, input: &str) -> Result<bool, Box<dyn Error>> {
+    let Some(command) = parse_local_command(input)? else {
+        return Ok(false);
+    };
+
+    match command {
+        LocalCommand::ShowHistory(options) => {
+            println!("{}", render_history_preview(app, options)?);
+        }
+        LocalCommand::ExportHistory(options, output_path) => {
+            let path = output_path.unwrap_or_else(|| default_history_export_path(app));
+            let rendered = render_history_preview(app, options)?;
+            fs::write(&path, rendered)?;
+            println!("[history] Exported to {}", path.display());
+        }
+        LocalCommand::CopyHistory(options) => {
+            let rendered = render_history_preview(app, options)?;
+            string_content::set_clipboard_content(&rendered)?;
+            println!("[history] Copied preview to clipboard.");
+        }
+    }
+    Ok(true)
+}
+
+fn parse_local_command(input: &str) -> Result<Option<LocalCommand>, Box<dyn Error>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let normalized = if let Some(rest) = trimmed.strip_prefix('/') {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix(':') {
+        rest
+    } else {
+        return Ok(None);
+    };
+    let mut parts = normalized.split_whitespace();
+    let Some(command) = parts.next() else {
+        return Ok(None);
+    };
+    match command {
+        "history" => parse_history_local_command(parts.collect::<Vec<_>>().as_slice()),
+        _ => Ok(None),
+    }
+}
+
+fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Box<dyn Error>> {
+    let (options, action) = parse_history_preview_options(args)?;
+    Ok(Some(match action {
+        HistoryAction::Show => LocalCommand::ShowHistory(options),
+        HistoryAction::Export(path) => LocalCommand::ExportHistory(options, path.map(PathBuf::from)),
+        HistoryAction::Copy => LocalCommand::CopyHistory(options),
+    }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HistoryAction {
+    Show,
+    Export(Option<String>),
+    Copy,
+}
+
+fn parse_history_preview_options(
+    args: &[&str],
+) -> Result<(HistoryPreviewOptions, HistoryAction), Box<dyn Error>> {
+    let mut options = HistoryPreviewOptions {
+        count: HISTORY_PREVIEW_DEFAULT_COUNT,
+        role_filter: HistoryRoleFilter::All,
+        full: false,
+        grep: None,
+    };
+    let mut action = HistoryAction::Show;
+    let mut idx = 0usize;
+
+    while idx < args.len() {
+        match args[idx] {
+            "full" => {
+                options.full = true;
+                options.count = HISTORY_PREVIEW_FULL_COUNT;
+                idx += 1;
+            }
+            "user" => {
+                options.role_filter = HistoryRoleFilter::User;
+                idx += 1;
+            }
+            "assistant" => {
+                options.role_filter = HistoryRoleFilter::Assistant;
+                idx += 1;
+            }
+            "tool" => {
+                options.role_filter = HistoryRoleFilter::Tool;
+                idx += 1;
+            }
+            "system" => {
+                options.role_filter = HistoryRoleFilter::System;
+                idx += 1;
+            }
+            "grep" => {
+                let keyword = args[idx + 1..].join(" ");
+                if keyword.trim().is_empty() {
+                    return Err("`/history grep` requires a keyword".into());
+                }
+                options.grep = Some(keyword);
+                break;
+            }
+            "export" => {
+                action = HistoryAction::Export(args.get(idx + 1).map(|s| (*s).to_string()));
+                break;
+            }
+            "copy" => {
+                action = HistoryAction::Copy;
+                break;
+            }
+            raw => {
+                options.count = raw
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid /history argument: {raw}"))?
+                    .clamp(1, HISTORY_PREVIEW_MAX_COUNT);
+                idx += 1;
+                continue;
+            }
+        }
+    }
+
+    Ok((options, action))
+}
+
+fn render_history_preview(
+    app: &App,
+    options: HistoryPreviewOptions,
+) -> Result<String, Box<dyn Error>> {
+    let grep = options.grep.clone();
+    let label = match options.role_filter {
+        HistoryRoleFilter::All => "message(s)",
+        HistoryRoleFilter::User => "user message(s)",
+        HistoryRoleFilter::Assistant => "assistant message(s)",
+        HistoryRoleFilter::Tool => "tool message(s)",
+        HistoryRoleFilter::System => "system message(s)",
+    };
+    let max_chars = if options.full {
+        HISTORY_PREVIEW_FULL_MAX_CHARS
+    } else {
+        HISTORY_PREVIEW_MAX_CHARS
+    };
+    let grep_suffix = options
+        .grep
+        .as_deref()
+        .map(|grep| format!(" matching \"{}\"", grep))
+        .unwrap_or_default();
+    let shown = collect_history_messages(app, options)?;
+    if shown.is_empty() {
+        return Ok("[history] No recent messages.".to_string());
+    }
+
+    let total = shown.len();
+    let mut out = format!("[history] Showing {} recent {}{}:\n", total, label, grep_suffix);
+    for (idx, message) in shown.iter().enumerate() {
+        let content = summarize_history_content(&message.content, max_chars, grep.as_deref());
+        out.push_str(&format!(
+            "{}. [{}] {}\n",
+            idx + 1,
+            message.role,
+            content
+        ));
+    }
+    Ok(out.trim_end().to_string())
+}
+
+fn collect_history_messages(
+    app: &App,
+    options: HistoryPreviewOptions,
+) -> Result<Vec<history::Message>, Box<dyn Error>> {
+    let history_file = active_history_path(app);
+    let messages =
+        history::build_message_arr(HISTORY_PREVIEW_MAX_COUNT.max(options.count), &history_file)?;
+    let filtered = messages
+        .into_iter()
+        .filter(|message| match options.role_filter {
+            HistoryRoleFilter::All => true,
+            HistoryRoleFilter::User => message.role == "user",
+            HistoryRoleFilter::Assistant => message.role == "assistant",
+            HistoryRoleFilter::Tool => message.role == "tool",
+            HistoryRoleFilter::System => message.role == "system",
+        })
+        .filter(|message| {
+            options.grep.as_deref().is_none_or(|needle| {
+                let haystack = searchable_history_content(&message.content).to_ascii_lowercase();
+                haystack.contains(&needle.to_ascii_lowercase())
+            })
+        })
+        .collect::<Vec<_>>();
+    let shown = if filtered.len() > options.count {
+        filtered[filtered.len() - options.count..].to_vec()
+    } else {
+        filtered
+    };
+    Ok(shown)
+}
+
+fn active_history_path(app: &App) -> std::path::PathBuf {
+    if !app.session_history_file.as_os_str().is_empty() {
+        app.session_history_file.clone()
+    } else {
+        app.config.history_file.clone()
+    }
+}
+
+fn summarize_history_content(
+    value: &serde_json::Value,
+    max_chars: usize,
+    grep: Option<&str>,
+) -> String {
+    let raw = searchable_history_content(value);
+    let single_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated = truncate_for_terminal(&single_line, max_chars);
+    highlight_history_keyword(&truncated, grep)
+}
+
+fn searchable_history_content(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "<non-string content>".to_string()),
+    }
+}
+
+fn truncate_for_terminal(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+    let mut out = String::new();
+    for (idx, ch) in value.chars().enumerate() {
+        if idx >= max_chars {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+fn highlight_history_keyword(value: &str, grep: Option<&str>) -> String {
+    let Some(needle) = grep.map(str::trim).filter(|needle| !needle.is_empty()) else {
+        return value.to_string();
+    };
+    let Ok(pattern) = RegexBuilder::new(&regex::escape(needle))
+        .case_insensitive(true)
+        .build()
+    else {
+        return value.to_string();
+    };
+
+    pattern
+        .replace_all(value, |caps: &regex::Captures| {
+            format!(
+                "{}{}{}",
+                HISTORY_GREP_HIGHLIGHT_START,
+                &caps[0],
+                HISTORY_GREP_HIGHLIGHT_END
+            )
+        })
+        .into_owned()
+}
+
+fn default_history_export_path(app: &App) -> PathBuf {
+    let file_name = if app.session_id.trim().is_empty() {
+        "history-export.txt".to_string()
+    } else {
+        format!("history-{}.txt", app.session_id)
+    };
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(file_name)
 }
 
 const IMAGE_PLACEHOLDER_PREFIX: &str = "[[image:";
@@ -334,8 +650,17 @@ fn finalize_question(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_at_file_references, finalize_question};
-    use crate::ai::types::{App, AppConfig};
+    use super::{
+        extract_at_file_references, finalize_question, parse_history_preview_options,
+        highlight_history_keyword, parse_local_command, render_history_preview,
+        summarize_history_content, truncate_for_terminal, HistoryAction,
+        HistoryPreviewOptions, HistoryRoleFilter, LocalCommand,
+    };
+    use crate::ai::{
+        history::{Message, append_history_messages},
+        types::{App, AppConfig},
+    };
+    use serde_json::Value;
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
     use uuid::Uuid;
@@ -425,6 +750,259 @@ mod tests {
 
         assert!(ctx.question.contains("hello from file"));
         assert!(!ctx.question.contains(path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn parse_local_command_supports_history_default_and_custom_count() {
+        assert_eq!(
+            parse_local_command("/history").unwrap(),
+            Some(LocalCommand::ShowHistory(HistoryPreviewOptions {
+                count: 6,
+                role_filter: HistoryRoleFilter::All,
+                full: false,
+                grep: None,
+            }))
+        );
+        assert_eq!(
+            parse_local_command("/history 3").unwrap(),
+            Some(LocalCommand::ShowHistory(HistoryPreviewOptions {
+                count: 3,
+                role_filter: HistoryRoleFilter::All,
+                full: false,
+                grep: None,
+            }))
+        );
+        assert_eq!(
+            parse_local_command("/history 999").unwrap(),
+            Some(LocalCommand::ShowHistory(HistoryPreviewOptions {
+                count: 20,
+                role_filter: HistoryRoleFilter::All,
+                full: false,
+                grep: None,
+            }))
+        );
+        assert_eq!(
+            parse_local_command(":history user 4").unwrap(),
+            Some(LocalCommand::ShowHistory(HistoryPreviewOptions {
+                count: 4,
+                role_filter: HistoryRoleFilter::User,
+                full: false,
+                grep: None,
+            }))
+        );
+        assert_eq!(
+            parse_local_command("/history grep panic").unwrap(),
+            Some(LocalCommand::ShowHistory(HistoryPreviewOptions {
+                count: 6,
+                role_filter: HistoryRoleFilter::All,
+                full: false,
+                grep: Some("panic".to_string()),
+            }))
+        );
+        assert_eq!(
+            parse_local_command("/history export dump.txt").unwrap(),
+            Some(LocalCommand::ExportHistory(
+                HistoryPreviewOptions {
+                    count: 6,
+                    role_filter: HistoryRoleFilter::All,
+                    full: false,
+                    grep: None,
+                },
+                Some(PathBuf::from("dump.txt")),
+            ))
+        );
+        assert_eq!(
+            parse_local_command("/history copy").unwrap(),
+            Some(LocalCommand::CopyHistory(HistoryPreviewOptions {
+                count: 6,
+                role_filter: HistoryRoleFilter::All,
+                full: false,
+                grep: None,
+            }))
+        );
+        assert_eq!(parse_local_command("hello").unwrap(), None);
+    }
+
+    #[test]
+    fn parse_history_preview_options_supports_full_and_role_filters() {
+        assert_eq!(
+            parse_history_preview_options(&["full"]).unwrap(),
+            (
+                HistoryPreviewOptions {
+                    count: 20,
+                    role_filter: HistoryRoleFilter::All,
+                    full: true,
+                    grep: None,
+                },
+                HistoryAction::Show,
+            )
+        );
+        assert_eq!(
+            parse_history_preview_options(&["assistant", "8"]).unwrap(),
+            (
+                HistoryPreviewOptions {
+                    count: 8,
+                    role_filter: HistoryRoleFilter::Assistant,
+                    full: false,
+                    grep: None,
+                },
+                HistoryAction::Show,
+            )
+        );
+    }
+
+    #[test]
+    fn summarize_history_content_flattens_and_truncates() {
+        let content = Value::String("hello\nfrom\tterminal history".to_string());
+        let summarized = summarize_history_content(&content, 12, None);
+        assert_eq!(summarized, "hello from t...");
+        assert_eq!(truncate_for_terminal("short", 10), "short");
+    }
+
+    #[test]
+    fn highlight_history_keyword_marks_matches_with_ansi() {
+        let highlighted = highlight_history_keyword("panic in fetch_chat_messages", Some("panic"));
+        assert!(highlighted.contains("\x1b[1;93mpanic\x1b[0m"));
+    }
+
+    #[test]
+    fn highlight_history_keyword_marks_all_matches() {
+        let highlighted = highlight_history_keyword("panic then Panic again", Some("panic"));
+        assert_eq!(highlighted.matches("\x1b[1;93m").count(), 2);
+    }
+
+    #[test]
+    fn render_history_preview_reads_recent_session_messages() {
+        let history_path =
+            std::env::temp_dir().join(format!("ai-history-preview-{}.sqlite", Uuid::new_v4()));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Value::String("first question".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String("first answer".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String("second question".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        append_history_messages(&history_path, &messages).unwrap();
+
+        let rendered = render_history_preview(
+            &app,
+            HistoryPreviewOptions {
+                count: 2,
+                role_filter: HistoryRoleFilter::All,
+                full: false,
+                grep: None,
+            },
+        )
+        .unwrap();
+        assert!(rendered.contains("[history] Showing 2 recent message(s):"));
+        assert!(rendered.contains("[assistant] first answer"));
+        assert!(rendered.contains("[user] second question"));
+        assert!(!rendered.contains("first question"));
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn render_history_preview_filters_user_messages() {
+        let history_path =
+            std::env::temp_dir().join(format!("ai-history-filter-{}.sqlite", Uuid::new_v4()));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Value::String("first user".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String("assistant reply".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String("second user".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        append_history_messages(&history_path, &messages).unwrap();
+
+        let rendered = render_history_preview(
+            &app,
+            HistoryPreviewOptions {
+                count: 5,
+                role_filter: HistoryRoleFilter::User,
+                full: false,
+                grep: None,
+            },
+        )
+        .unwrap();
+        assert!(rendered.contains("recent user message(s)"));
+        assert!(rendered.contains("[user] first user"));
+        assert!(rendered.contains("[user] second user"));
+        assert!(!rendered.contains("assistant reply"));
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn render_history_preview_supports_grep_and_tool_role() {
+        let history_path =
+            std::env::temp_dir().join(format!("ai-history-grep-{}.sqlite", Uuid::new_v4()));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+
+        let messages = vec![
+            Message {
+                role: "tool".to_string(),
+                content: Value::String("panic in fetch_messages".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "system".to_string(),
+                content: Value::String("stable note".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+        append_history_messages(&history_path, &messages).unwrap();
+
+        let rendered = render_history_preview(
+            &app,
+            HistoryPreviewOptions {
+                count: 5,
+                role_filter: HistoryRoleFilter::Tool,
+                full: false,
+                grep: Some("panic".to_string()),
+            },
+        )
+        .unwrap();
+        assert!(rendered.contains("recent tool message(s) matching \"panic\""));
+        assert!(rendered.contains("[tool] \x1b[1;93mpanic\x1b[0m in fetch_messages"));
+        assert!(!rendered.contains("stable note"));
+
+        let _ = std::fs::remove_file(history_path);
     }
 }
 

@@ -6,6 +6,10 @@ pub fn print_interactive_help() {
     println!();
     println!("  General:");
     println!("    /help, /h                 show this help message");
+    println!("    /history [full|user|assistant|tool|system] [N]     show recent session messages");
+    println!("    /history grep <keyword>      search recent messages by keyword");
+    println!("    /history export [file.txt]   export current preview to a file");
+    println!("    /history copy                copy current preview to clipboard");
     println!("    /feishu-auth              authenticate with Feishu");
     println!("    /share [output.md]        export current session as shareable markdown");
     println!();

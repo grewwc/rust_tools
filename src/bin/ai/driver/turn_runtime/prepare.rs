@@ -1,15 +1,25 @@
 use colored::Colorize;
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 use crate::ai::mcp::McpClient;
 use crate::ai::{
+    code_discovery_policy::{
+        CodeDiscoveryRecord, parse_confidence, parse_kind, parse_record_line, recall_limit,
+        recall_rank, render_record,
+    },
     driver::{reflection, skill_runtime},
     history::{Message, build_context_history},
     request,
+    tools::storage::memory_store::{AgentMemoryEntry, MemoryStore},
     types::App,
 };
 
 use super::types::TurnPreparation;
+
+const CODE_DISCOVERY_PREFIX: &str = "code_discovery:";
+const CODE_DISCOVERY_CATEGORY: &str = "code_discovery";
+const SESSION_CODE_DISCOVERY_RECALL_PREFIX: &str = "Recent session code discoveries:";
 
 #[crate::ai::agent_hang_span(
     "post-fix",
@@ -135,6 +145,15 @@ pub(super) async fn prepare_turn(
                 );
             }
         }
+
+        if let Some(code_discovery_recall) = build_session_code_discovery_recall(app, &history) {
+            println!(
+                "{} session={}",
+                "[Memory] code_discovery recalled".bright_blue().bold(),
+                app.session_id
+            );
+            skill_turn.append_system_prompt(&format!("\n{code_discovery_recall}"));
+        }
     }
 
     messages.push(Message {
@@ -168,4 +187,193 @@ pub(super) async fn prepare_turn(
         persisted_turn_messages: 0,
         max_iterations,
     })
+}
+
+fn build_session_code_discovery_recall(app: &App, history: &[Message]) -> Option<String> {
+    let existing = extract_existing_code_discoveries(history);
+    let store = MemoryStore::from_env_or_config();
+    let entries = store.recent(200).ok()?;
+    let discoveries = collect_session_code_discovery_records(
+        &entries,
+        &format!("session:{}", app.session_id),
+        &existing,
+    );
+    render_session_code_discovery_recall(&discoveries)
+}
+
+fn extract_existing_code_discoveries(messages: &[Message]) -> BTreeSet<CodeDiscoveryRecord> {
+    let mut out = BTreeSet::new();
+    for message in messages {
+        let Value::String(content) = &message.content else {
+            continue;
+        };
+        if !content.starts_with(CODE_DISCOVERY_PREFIX) {
+            continue;
+        }
+        for line in content[CODE_DISCOVERY_PREFIX.len()..].lines() {
+            if let Some(record) = parse_record_line(line) {
+                out.insert(record);
+            }
+        }
+    }
+    out
+}
+
+fn collect_session_code_discovery_records(
+    entries: &[AgentMemoryEntry],
+    session_source: &str,
+    existing_records: &BTreeSet<CodeDiscoveryRecord>,
+) -> Vec<CodeDiscoveryRecord> {
+    let mut seen = existing_records.clone();
+    let mut discoveries = Vec::new();
+    for entry in entries {
+        if entry.category != CODE_DISCOVERY_CATEGORY {
+            continue;
+        }
+        if entry.source.as_deref() != Some(session_source) {
+            continue;
+        }
+        let Some(record) = code_discovery_record_from_memory_entry(entry) else {
+            continue;
+        };
+        if !seen.insert(record.clone()) {
+            continue;
+        }
+        discoveries.push(record);
+        if discoveries.len() >= 16 {
+            break;
+        }
+    }
+    discoveries.sort_by(|a, b| {
+        recall_rank(b)
+            .cmp(&recall_rank(a))
+            .then_with(|| a.finding.cmp(&b.finding))
+    });
+    discoveries.truncate(recall_limit());
+    discoveries
+}
+
+fn render_session_code_discovery_recall(discoveries: &[CodeDiscoveryRecord]) -> Option<String> {
+    if discoveries.is_empty() {
+        return None;
+    }
+    let mut out = String::from(SESSION_CODE_DISCOVERY_RECALL_PREFIX);
+    out.push('\n');
+    for record in discoveries {
+        out.push_str(&render_record(record));
+        out.push('\n');
+    }
+    out.push_str(
+        "Treat these as stable findings established earlier in this session. Prioritize high-confidence findings first, then use medium-confidence findings as supporting context. Reuse them instead of re-running the same repo inspection steps unless the user asks you to verify against the latest code or you need a narrower slice.\n",
+    );
+    Some(out)
+}
+
+fn code_discovery_record_from_memory_entry(entry: &AgentMemoryEntry) -> Option<CodeDiscoveryRecord> {
+    let mut confidence = None;
+    let mut kind = None;
+    for tag in &entry.tags {
+        if let Some(value) = tag.strip_prefix("confidence:") {
+            confidence = parse_confidence(value.trim());
+        } else if let Some(value) = tag.strip_prefix("kind:") {
+            kind = parse_kind(value.trim());
+        }
+    }
+    Some(CodeDiscoveryRecord {
+        finding: entry.note.trim().to_string(),
+        confidence: confidence?,
+        kind: kind?,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        collect_session_code_discovery_records, extract_existing_code_discoveries,
+        render_session_code_discovery_recall,
+    };
+    use crate::ai::code_discovery_policy::parse_record_line;
+    use crate::ai::history::Message;
+    use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn extract_existing_code_discovery_lines_reads_history_messages() {
+        let history = vec![Message {
+            role: "system".to_string(),
+            content: Value::String(
+                "code_discovery:\n- [confidence=high kind=error_site] code_search(operation=text_search, query=panic) => src/main.rs:42: panic!(\"boom\")\n- [confidence=high kind=symbol] read_file_lines(file=src/main.rs, lines=40..50) => fn crash() {".to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+
+        let lines = extract_existing_code_discoveries(&history);
+        assert!(lines.contains(&parse_record_line("- [confidence=high kind=error_site] code_search(operation=text_search, query=panic) => src/main.rs:42: panic!(\"boom\")").unwrap()));
+        assert!(lines.contains(&parse_record_line("- [confidence=high kind=symbol] read_file_lines(file=src/main.rs, lines=40..50) => fn crash() {").unwrap()));
+    }
+
+    #[test]
+    fn collect_session_code_discovery_lines_filters_by_session_and_dedupes() {
+        let entries = vec![
+            AgentMemoryEntry {
+                id: None,
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+                category: "code_discovery".to_string(),
+                note: "read_file_lines(file=src/main.rs, lines=40..50) => fn crash() {".to_string(),
+                tags: vec!["kind:symbol".to_string(), "confidence:high".to_string()],
+                source: Some("session:abc".to_string()),
+                priority: Some(180),
+            },
+            AgentMemoryEntry {
+                id: None,
+                timestamp: "2026-01-01T00:01:00Z".to_string(),
+                category: "code_discovery".to_string(),
+                note: "code_search(operation=text_search, query=panic) => src/main.rs:42: panic!(\"boom\")".to_string(),
+                tags: vec!["kind:error_site".to_string(), "confidence:high".to_string()],
+                source: Some("session:abc".to_string()),
+                priority: Some(180),
+            },
+            AgentMemoryEntry {
+                id: None,
+                timestamp: "2026-01-01T00:02:00Z".to_string(),
+                category: "code_discovery".to_string(),
+                note: "read_file_lines(file=src/main.rs, lines=40..50) => fn crash() {".to_string(),
+                tags: vec!["kind:symbol".to_string(), "confidence:high".to_string()],
+                source: Some("session:xyz".to_string()),
+                priority: Some(180),
+            },
+        ];
+        let mut existing = BTreeSet::new();
+        existing.insert(
+            parse_record_line(
+                "- [confidence=high kind=symbol] read_file_lines(file=src/main.rs, lines=40..50) => fn crash() {",
+            )
+            .unwrap(),
+        );
+
+        let lines = collect_session_code_discovery_records(&entries, "session:abc", &existing);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0],
+            parse_record_line(
+                "- [confidence=high kind=error_site] code_search(operation=text_search, query=panic) => src/main.rs:42: panic!(\"boom\")",
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn render_session_code_discovery_recall_formats_system_note() {
+        let note = render_session_code_discovery_recall(&[parse_record_line(
+            "- [confidence=high kind=error_site] code_search(operation=text_search, query=panic) => src/main.rs:42: panic!(\"boom\")",
+        )
+        .unwrap()])
+        .expect("note");
+
+        assert!(note.contains("Recent session code discoveries:"));
+        assert!(note.contains("confidence=high kind=error_site"));
+        assert!(note.contains("Treat these as stable findings"));
+    }
 }
