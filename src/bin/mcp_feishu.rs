@@ -2699,22 +2699,37 @@ fn render_docx_table_cells(
         return;
     }
 
+    let mut rows: Vec<Vec<String>> = Vec::new();
     let mut row: Vec<String> = Vec::new();
     for cell in cells {
         let Some(cell_id) = cell.as_str() else {
             continue;
         };
         let cell_text = render_docx_table_cell_text(cell_id, by_id, default_origin);
-        row.push(cell_text);
+        let escaped = cell_text
+            .replace('|', "\\|")
+            .replace('\n', "<br>");
+        row.push(escaped);
         if row.len() >= col_size {
-            out.push_str(&row.join("\t"));
-            out.push('\n');
-            row.clear();
+            rows.push(row);
+            row = Vec::new();
         }
     }
     if !row.is_empty() {
-        out.push_str(&row.join("\t"));
-        out.push('\n');
+        rows.push(row);
+    }
+
+    for (i, row) in rows.iter().enumerate() {
+        out.push_str("| ");
+        out.push_str(&row.join(" | "));
+        out.push_str(" |\n");
+        if i == 0 {
+            out.push_str("|");
+            for _ in 0..col_size {
+                out.push_str(" --- |");
+            }
+            out.push('\n');
+        }
     }
 }
 
