@@ -1464,25 +1464,13 @@ fn build_feishu_message_searchable_text(item: &Value) -> String {
     if let Some(v) = item.get("body") {
         collect_message_text(v, &mut parts);
     }
-    if let Some(v) = item.get("mentions") {
-        collect_message_text(v, &mut parts);
-    }
-    if let Some(v) = item.get("sender") {
-        collect_message_text(v, &mut parts);
-    }
     let merged = parts.join(" ");
     compact_message_text(&merged)
 }
 
 fn build_feishu_global_searchable_text(item: &Value, chat: &ChatInfo) -> String {
-    let message_text = build_feishu_message_searchable_text(item);
-    if chat.name.trim().is_empty() {
-        return message_text;
-    }
-    if message_text.is_empty() {
-        return compact_message_text(&chat.name);
-    }
-    compact_message_text(&format!("{} {}", chat.name, message_text))
+    let _ = chat;
+    build_feishu_message_searchable_text(item)
 }
 
 fn collect_message_text(value: &Value, out: &mut Vec<String>) {
@@ -1518,12 +1506,32 @@ fn collect_message_text(value: &Value, out: &mut Vec<String>) {
             }
         }
         Value::Object(map) => {
-            for value in map.values() {
+            if map
+                .get("tag")
+                .and_then(|v| v.as_str())
+                .is_some_and(|tag| tag == "a")
+            {
+                if let Some(text) = map.get("text") {
+                    collect_message_text(text, out);
+                }
+                return;
+            }
+            for (key, value) in map {
+                if should_skip_message_text_key(key) {
+                    continue;
+                }
                 collect_message_text(value, out);
             }
         }
         _ => {}
     }
+}
+
+fn should_skip_message_text_key(key: &str) -> bool {
+    matches!(
+        key,
+        "href" | "url" | "pc_url" | "ios_url" | "android_url" | "card_link"
+    )
 }
 
 fn compact_message_text(s: &str) -> String {
@@ -5556,7 +5564,30 @@ mod tests {
     }
 
     #[test]
-    fn build_global_searchable_text_includes_chat_name() {
+    fn build_message_searchable_text_skips_urls_and_card_links() {
+        let item = json!({
+            "msg_type": "interactive",
+            "body": {
+                "content": "{\"title\":\"告警\",\"card_link\":{\"url\":\"https://meego.larkoffice.com/dataagent/story/detail/1\"},\"elements\":[[{\"tag\":\"text\",\"text\":\"正文内容\"},{\"tag\":\"a\",\"href\":\"https://example.com/dataagent\",\"text\":\"查看详情\"}]]}"
+            },
+            "mentions": [{
+                "name": "dataagent-bot"
+            }],
+            "sender": {
+                "id": "dataagent-sender"
+            }
+        });
+        let searchable = build_feishu_message_searchable_text(&item);
+        assert!(searchable.contains("正文内容"));
+        assert!(searchable.contains("查看详情"));
+        assert!(!searchable.contains("https://meego.larkoffice.com/dataagent/story/detail/1"));
+        assert!(!searchable.contains("https://example.com/dataagent"));
+        assert!(!searchable.contains("dataagent-bot"));
+        assert!(!searchable.contains("dataagent-sender"));
+    }
+
+    #[test]
+    fn build_global_searchable_text_only_uses_body_text() {
         let item = json!({
             "msg_type": "text",
             "body": {
@@ -5570,7 +5601,6 @@ mod tests {
             source_order: 0,
         };
         let searchable = build_feishu_global_searchable_text(&item, &chat);
-        assert!(searchable.contains("dataagent"));
-        assert!(searchable.contains("hello world"));
+        assert_eq!(searchable, "hello world");
     }
 }
