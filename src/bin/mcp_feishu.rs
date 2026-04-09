@@ -18,7 +18,6 @@ struct CachedToken {
 
 static APP_TOKEN_CACHE: OnceLock<Mutex<Option<CachedToken>>> = OnceLock::new();
 static USER_TOKEN_CACHE: OnceLock<Mutex<Option<CachedToken>>> = OnceLock::new();
-static TENANT_TOKEN_CACHE: OnceLock<Mutex<Option<CachedToken>>> = OnceLock::new();
 
 fn main() {
     let stdin = io::stdin();
@@ -386,14 +385,6 @@ fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcErr> {
                 ]
             }))
         }
-        "doc_create_from_markdown" => {
-            let result = feishu_doc_create_from_markdown(&args)?;
-            Ok(json!({
-                "content": [
-                    { "type": "text", "text": result }
-                ]
-            }))
-        }
         _ => Err(json_rpc_error(
             -32602,
             "Invalid params: unknown tool name",
@@ -450,56 +441,32 @@ fn feishu_docs_search(args: &Value) -> Result<String, JsonRpcErr> {
             )
         })?;
 
-    let token = if let Some(tok) = resolve_user_access_token() {
-        tok
-    } else if let Ok(tok) = get_user_access_token_cached(&client, &base_url) {
-        tok
-    } else {
-        return Err(json_rpc_error(
-            -32000,
-            "Missing user_access_token. docs-api search requires user_access_token. Use OAuth once, then keep refresh_token for automatic refresh.",
-            Some(json!({
-                "next_steps": [
-                    "Call oauth_authorize_url to get an authorization URL",
-                    "Open the URL in a browser, complete authorization",
-                    "Call oauth_wait_local_code (or copy code from redirect URL)",
-                    "Call oauth_exchange_code to get user_access_token + refresh_token",
-                    "Then store FEISHU_REFRESH_TOKEN (and app_id/app_secret) so the token can be refreshed automatically"
-                ],
-                "config_keys": ["feishu.app_id", "feishu.app_secret", "feishu.user_access_token", "feishu.refresh_token"],
-                "env": ["FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_USER_ACCESS_TOKEN", "FEISHU_REFRESH_TOKEN"]
-            })),
-        ));
-    };
+    with_user_access_token(
+        &client,
+        &base_url,
+        "Missing user_access_token. docs-api search requires OAuth once.",
+        |token| feishu_docs_search_with_token(&client, &url, token, &body),
+    )
+}
 
-    let (mut status, mut text) = do_docs_search_request(&client, &url, &token, &body)?;
-    if !status.is_success()
-        && let Ok(v) = serde_json::from_str::<Value>(&text)
-    {
-        let code = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-        if code == 99991668
-            && let Ok(tok) = refresh_user_access_token_and_cache(&client, &base_url)
-        {
-            let (s2, t2) = do_docs_search_request(&client, &url, &tok, &body)?;
-            status = s2;
-            text = t2;
-        }
-    }
+fn feishu_docs_search_with_token(
+    client: &Client,
+    url: &str,
+    token: &str,
+    body: &Value,
+) -> Result<String, JsonRpcErr> {
+    let (status, text) = do_docs_search_request(client, url, token, body)?;
     if !status.is_success() {
         if let Ok(v) = serde_json::from_str::<Value>(&text) {
             let code = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
             if code == 99991668 {
                 return Err(json_rpc_error(
                     -32000,
-                    "Invalid access token. Provide a valid user_access_token or set refresh_token for automatic refresh.",
+                    "Invalid access token",
                     Some(json!({
                         "status": status.as_u16(),
                         "feishu_code": code,
                         "msg": v.get("msg").cloned().unwrap_or(Value::Null),
-                        "next_steps": [
-                            "If you have refresh_token: call oauth_refresh_user_access_token, then update FEISHU_USER_ACCESS_TOKEN (or set FEISHU_REFRESH_TOKEN for auto refresh)",
-                            "Otherwise: run oauth_authorize_url -> oauth_wait_local_code -> oauth_exchange_code"
-                        ]
                     })),
                 ));
             }
@@ -545,7 +512,7 @@ fn feishu_docs_search(args: &Value) -> Result<String, JsonRpcErr> {
     for (i, item) in docs.iter().enumerate() {
         let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
         let docs_type = item.get("docs_type").and_then(|v| v.as_str()).unwrap_or("");
-        let token = item
+        let docs_token = item
             .get("docs_token")
             .and_then(|v| v.as_str())
             .unwrap_or("");
@@ -555,7 +522,7 @@ fn feishu_docs_search(args: &Value) -> Result<String, JsonRpcErr> {
             i + 1,
             docs_type,
             title.trim(),
-            token.trim(),
+            docs_token.trim(),
             owner_id.trim()
         ));
     }
@@ -834,44 +801,45 @@ fn list_recent_chats(
     include_group: bool,
 ) -> Result<Vec<ChatInfo>, JsonRpcErr> {
     let url = format!("{}/open-apis/im/v1/chats", base_url);
-    
+
+    let max_chat_pages = (max_chats / 50 + 2).max(2);
     let mut all_chats = Vec::new();
     let mut source_order = 0usize;
     let mut page_token = String::new();
-    
-    loop {
+
+    for _ in 0..max_chat_pages {
         let mut req = client.get(&url)
             .header("Authorization", format!("Bearer {}", access_token))
             .query(&[("page_size", "50")]);
-        
+
         if !page_token.is_empty() {
             req = req.query(&[("page_token", &page_token)]);
         }
-        
+
         let resp = req.send().map_err(|e| {
             json_rpc_error(-32000, "Failed to fetch chats", Some(json!({ "error": e.to_string() })))
         })?;
 
         let (status, content_type, body_text) = read_response_text(resp, "chats response")?;
         let body = parse_json_response_body("chats response", status, content_type.as_deref(), &body_text)?;
-        
+
         if !status.is_success() {
             return Err(json_rpc_error(-32000, "Chats list API returned error code", Some(body)));
         }
-        
+
         let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
         if code != 0 {
             return Err(json_rpc_error(-32000, &format!("Chats API error: code={}", code), Some(body)));
         }
-        
+
         let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
         let items = data.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        
+
         for item in &items {
             let chat_id = item.get("chat_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let chat_mode = item.get("chat_mode").and_then(|v| v.as_str()).unwrap_or("");
-            
+
             if !chat_mode_matches(chat_mode, include_p2p, include_group) {
                 continue;
             }
@@ -883,13 +851,17 @@ fn list_recent_chats(
             });
             source_order += 1;
         }
-        
+
+        if all_chats.len() >= max_chats {
+            break;
+        }
+
         page_token = data.get("page_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
         if page_token.is_empty() || items.is_empty() {
             break;
         }
     }
-    
+
     all_chats.sort_by(|a, b| {
         b.recent_time
             .cmp(&a.recent_time)
@@ -1125,38 +1097,104 @@ fn feishu_messages_global_search_with_token(
         include_group,
     )?;
 
+    let concurrency = 8usize.min(chats.len().max(1));
+    let total_chats = chats.len();
+
     let mut matches: Vec<(i64, String)> = Vec::new();
     let mut scanned_chats = 0usize;
     let mut scanned_messages = 0usize;
 
-    for chat in &chats {
-        if should_stop_before_chat(chat, &matches, limit) {
-            break;
-        }
-        scanned_chats += 1;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(concurrency)
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            json_rpc_error(-32000, "Failed to build tokio runtime", Some(json!({ "error": e.to_string() })))
+        })?;
 
-        scan_chat_messages_for_matches(
-            client,
-            base_url,
-            access_token,
-            chat,
-            msgs_per_chat,
-            max_pages,
-            msg_type_filters,
-            search_mode,
-            regex_opt,
-            needle_lower,
-            fuzzy_threshold,
-            limit,
-            &mut scanned_messages,
-            &mut matches,
-        )?;
+    let base_url_owned = base_url.to_string();
+    let access_token_owned = access_token.to_string();
+    let msg_type_filters_owned: Vec<String> = msg_type_filters.to_vec();
+    let search_mode_owned = search_mode.to_string();
+    let needle_lower_owned = needle_lower.to_string();
+    let regex_pattern_owned = regex_opt.map(|re| re.as_str().to_string());
+
+    for batch in chats.chunks(concurrency) {
+        let batch_chats: Vec<ChatInfo> = batch.to_vec();
+
+        let batch_results: Vec<Result<(usize, Vec<(i64, String)>), JsonRpcErr>> = rt.block_on(async {
+            let mut handles = Vec::with_capacity(batch_chats.len());
+            for chat in batch_chats {
+                let base_url_c = base_url_owned.clone();
+                let access_token_c = access_token_owned.clone();
+                let msg_type_filters_c = msg_type_filters_owned.clone();
+                let search_mode_c = search_mode_owned.clone();
+                let needle_lower_c = needle_lower_owned.clone();
+                let regex_pattern_c = regex_pattern_owned.clone();
+                handles.push(tokio::task::spawn_blocking(move || {
+                    let thread_client = Client::builder()
+                        .timeout(Duration::from_secs(12))
+                        .build()
+                        .map_err(|e| {
+                            json_rpc_error(
+                                -32000,
+                                "Failed to build http client",
+                                Some(json!({ "error": e.to_string() })),
+                            )
+                        })?;
+                    let re = regex_pattern_c.as_deref().map(|p| regex::Regex::new(p).unwrap());
+                    let mut local_matches: Vec<(i64, String)> = Vec::new();
+                    let mut local_scanned_messages = 0usize;
+                    scan_chat_messages_for_matches(
+                        &thread_client,
+                        &base_url_c,
+                        &access_token_c,
+                        &chat,
+                        msgs_per_chat,
+                        max_pages,
+                        &msg_type_filters_c,
+                        &search_mode_c,
+                        re.as_ref(),
+                        &needle_lower_c,
+                        fuzzy_threshold,
+                        limit,
+                        &mut local_scanned_messages,
+                        &mut local_matches,
+                    )?;
+                    Ok((local_scanned_messages, local_matches))
+                }));
+            }
+            let mut results = Vec::with_capacity(handles.len());
+            for h in handles {
+                results.push(h.await.unwrap_or_else(|e| {
+                    Err(json_rpc_error(-32000, "Task panicked", Some(json!({ "error": e.to_string() }))))
+                }));
+            }
+            results
+        });
+
+        for result in batch_results {
+            let (sm, local_matches) = result?;
+            scanned_chats += 1;
+            scanned_messages += sm;
+            matches.extend(local_matches);
+        }
+        matches.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        if matches.len() > limit {
+            matches.truncate(limit);
+        }
+
+        if let Some(next_chat) = chats.get(scanned_chats) {
+            if should_stop_before_chat(next_chat, &matches, limit) {
+                break;
+            }
+        }
     }
 
     let mut out = String::new();
     out.push_str(&format!(
         "search_key: {} (mode: {})\nscanned_chats: {}/{}\nscanned_messages: {}\nmatched: {}",
-        search_key, search_mode, scanned_chats, chats.len(), scanned_messages, matches.len()
+        search_key, search_mode, scanned_chats, total_chats, scanned_messages, matches.len()
     ));
     if !msg_type_filters.is_empty() {
         out.push_str(&format!("\nfiltered_msg_types: {:?}", msg_type_filters));
@@ -3185,19 +3223,6 @@ fn resolve_user_access_token() -> Option<String> {
         .filter(|v| !v.is_empty() && v.starts_with("u-"))
 }
 
-fn resolve_tenant_access_token() -> Option<String> {
-    if let Ok(v) = std::env::var("FEISHU_TENANT_ACCESS_TOKEN") {
-        let v = v.trim().to_string();
-        if !v.is_empty() {
-            return Some(v);
-        }
-    }
-    let cfg = configw::get_all_config();
-    cfg.get_opt("feishu.tenant_access_token")
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
 fn resolve_refresh_token() -> Option<String> {
     if let Ok(v) = std::env::var("FEISHU_REFRESH_TOKEN") {
         let v = v.trim().to_string();
@@ -3269,36 +3294,6 @@ fn get_user_access_token_cached(client: &Client, base_url: &str) -> Result<Strin
     refresh_user_access_token_and_cache(client, base_url)
 }
 
-fn get_tenant_access_token_cached(client: &Client, base_url: &str) -> Result<String, JsonRpcErr> {
-    let cache = TENANT_TOKEN_CACHE.get_or_init(|| Mutex::new(None));
-    let now = Instant::now();
-    if let Ok(guard) = cache.lock()
-        && let Some(cached) = guard.as_ref()
-        && cached.expires_at > now + Duration::from_secs(300)
-    {
-        return Ok(cached.token.clone());
-    }
-
-    let Some((app_id, app_secret)) = resolve_app_credentials() else {
-        return Err(json_rpc_error(
-            -32000,
-            "Missing Feishu app credentials (app_id/app_secret)",
-            Some(json!({
-                "env": ["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
-                "config_keys": ["feishu.app_id", "feishu.app_secret"]
-            })),
-        ));
-    };
-    let (token, expires_at) = fetch_tenant_access_token(client, base_url, &app_id, &app_secret)?;
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some(CachedToken {
-            token: token.clone(),
-            expires_at,
-        });
-    }
-    Ok(token)
-}
-
 fn cache_user_access_token(token: &str, expires_at_epoch_ms: Option<i64>) {
     if token.trim().is_empty() {
         return;
@@ -3327,13 +3322,6 @@ fn acquire_user_access_token(client: &Client, base_url: &str) -> Result<String, 
         return Ok(tok);
     }
     get_user_access_token_cached(client, base_url)
-}
-
-fn acquire_tenant_access_token(client: &Client, base_url: &str) -> Result<String, JsonRpcErr> {
-    if let Some(tok) = resolve_tenant_access_token() {
-        return Ok(tok);
-    }
-    get_tenant_access_token_cached(client, base_url)
 }
 
 fn with_user_access_token<T, F>(
@@ -3689,88 +3677,6 @@ fn fetch_app_access_token(
         return Err(json_rpc_error(
             -32000,
             "app_access_token missing in response",
-            Some(v),
-        ));
-    }
-    let expire = v
-        .get("expire")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        .max(60) as u64;
-    let expires_at = Instant::now() + Duration::from_secs(expire);
-    Ok((token, expires_at))
-}
-
-fn fetch_tenant_access_token(
-    client: &Client,
-    base_url: &str,
-    app_id: &str,
-    app_secret: &str,
-) -> Result<(String, Instant), JsonRpcErr> {
-    let url = format!(
-        "{}/open-apis/auth/v3/tenant_access_token/internal",
-        base_url.trim_end_matches('/')
-    );
-    let body = json!({
-        "app_id": app_id,
-        "app_secret": app_secret
-    });
-
-    let resp = client
-        .post(url)
-        .header("Content-Type", "application/json; charset=utf-8")
-        .json(&body)
-        .send()
-        .map_err(|e| {
-            json_rpc_error(
-                -32000,
-                "Failed to call tenant_access_token API",
-                Some(json!({ "error": e.to_string() })),
-            )
-        })?;
-
-    let status = resp.status();
-    let text = resp.text().map_err(|e| {
-        json_rpc_error(
-            -32000,
-            "Failed to read tenant_access_token response body",
-            Some(json!({ "error": e.to_string() })),
-        )
-    })?;
-    if !status.is_success() {
-        return Err(json_rpc_error(
-            -32000,
-            "tenant_access_token API returned non-success HTTP status",
-            Some(json!({ "status": status.as_u16(), "body": text })),
-        ));
-    }
-
-    let v: Value = serde_json::from_str(&text).map_err(|e| {
-        json_rpc_error(
-            -32000,
-            "tenant_access_token response is not valid JSON",
-            Some(json!({ "error": e.to_string(), "body": text })),
-        )
-    })?;
-    let code = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        return Err(json_rpc_error(
-            -32000,
-            "tenant_access_token API returned error code",
-            Some(v),
-        ));
-    }
-
-    let token = v
-        .get("tenant_access_token")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if token.is_empty() {
-        return Err(json_rpc_error(
-            -32000,
-            "tenant_access_token missing in response",
             Some(v),
         ));
     }
@@ -4572,304 +4478,6 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     cells
 }
 
-fn feishu_doc_create_from_markdown(args: &Value) -> Result<String, JsonRpcErr> {
-    let title = args
-        .get("title")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let markdown_content = args
-        .get("markdown_content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let folder_token = args
-        .get("folder_token")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-
-    if title.is_empty() {
-        return Err(json_rpc_error(
-            -32602,
-            "Invalid params: title is required",
-            Some(json!({ "title": title })),
-        ));
-    }
-    if markdown_content.is_empty() {
-        return Err(json_rpc_error(
-            -32602,
-            "Invalid params: markdown_content is required",
-            None,
-        ));
-    }
-
-    let base_url = resolve_base_url();
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| {
-            json_rpc_error(
-                -32000,
-                "Failed to build http client",
-                Some(json!({ "error": e.to_string() })),
-            )
-        })?;
-
-    // Step 1: Create document
-    let document_id = with_user_access_token(
-        &client,
-        &base_url,
-        "Missing user_access_token. Create document requires OAuth once.",
-        |token| {
-            let mut create_body = json!({
-                "title": title
-            });
-            if !folder_token.is_empty() {
-                create_body["folder_token"] = json!(folder_token);
-            }
-
-            let url = format!("{}/open-apis/docx/v1/documents", base_url);
-            let resp = client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", token.trim()))
-                .header("Content-Type", "application/json; charset=utf-8")
-                .json(&create_body)
-                .send()
-                .map_err(|e| {
-                    json_rpc_error(
-                        -32000,
-                        "Failed to create document",
-                        Some(json!({ "error": e.to_string() })),
-                    )
-                })?;
-
-            let _status = resp.status();
-            let text = resp.text().map_err(|e| {
-                json_rpc_error(
-                    -32000,
-                    "Failed to read response body",
-                    Some(json!({ "error": e.to_string() })),
-                )
-            })?;
-
-            let json: Value = serde_json::from_str(&text).map_err(|e| {
-                json_rpc_error(
-                    -32000,
-                    "Failed to parse response JSON",
-                    Some(json!({ "error": e.to_string(), "body": text })),
-                )
-            })?;
-
-            let code = json.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
-            if code != 0 {
-                let err_json = json.clone();
-                return Err(json_rpc_error(
-                    -32000,
-                    "Failed to create document",
-                    Some(err_json),
-                ));
-            }
-
-            let id = json
-                .get("data")
-                .and_then(|d| d.get("document_id"))
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    let err_json = json.clone();
-                    json_rpc_error(-32000, "No document_id in response", Some(err_json))
-                })?;
-
-            Ok(id.to_string())
-        },
-    )?;
-
-    // Step 2: Convert Markdown to docx blocks and update document
-    with_user_access_token(
-        &client,
-        &base_url,
-        "Missing user_access_token. Update document requires OAuth.",
-        |token| {
-            // Simple markdown to docx blocks conversion
-            let blocks = convert_markdown_to_docx_blocks(&markdown_content);
-
-            let update_body = json!({
-                "document_id": document_id,
-                "blocks": blocks
-            });
-
-            let url = format!(
-                "{}/open-apis/docx/v1/documents/{}/blocks/batch-update",
-                base_url, document_id
-            );
-            let resp = client
-                .post(&url)
-                .header("Authorization", format!("Bearer {}", token.trim()))
-                .header("Content-Type", "application/json; charset=utf-8")
-                .json(&update_body)
-                .send()
-                .map_err(|e| {
-                    json_rpc_error(
-                        -32000,
-                        "Failed to update document content",
-                        Some(json!({ "error": e.to_string() })),
-                    )
-                })?;
-
-            let _status = resp.status();
-            let text = resp.text().map_err(|e| {
-                json_rpc_error(
-                    -32000,
-                    "Failed to read response body",
-                    Some(json!({ "error": e.to_string() })),
-                )
-            })?;
-
-            let json: Value = serde_json::from_str(&text).map_err(|e| {
-                json_rpc_error(
-                    -32000,
-                    "Failed to parse response JSON",
-                    Some(json!({ "error": e.to_string(), "body": text })),
-                )
-            })?;
-
-            let code = json.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
-            if code != 0 {
-                return Err(json_rpc_error(
-                    -32000,
-                    "Failed to update document content",
-                    Some(json),
-                ));
-            }
-
-            Ok(())
-        },
-    )?;
-
-    // Generate URL
-    let document_url = format!(
-        "https://{}.feishu.cn/docx/{}",
-        base_url
-            .trim_start_matches("https://")
-            .trim_end_matches("/open-apis")
-            .split('.')
-            .next()
-            .unwrap_or("app"),
-        document_id
-    );
-
-    Ok(format!(
-        "Created document: {}\nID: {}",
-        document_url, document_id
-    ))
-}
-
-fn convert_markdown_to_docx_blocks(markdown: &str) -> Vec<Value> {
-    let mut blocks = Vec::new();
-    let mut block_id_counter = 0;
-
-    for line in markdown.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let (block_type, content) = if let Some(content) = trimmed.strip_prefix("# ") {
-            (1, content.to_string())
-        } else if let Some(content) = trimmed.strip_prefix("## ") {
-            (2, content.to_string())
-        } else if let Some(content) = trimmed.strip_prefix("### ") {
-            (3, content.to_string())
-        } else if let Some(content) = trimmed.strip_prefix("- ") {
-            (4, content.to_string())
-        } else if let Some(content) = trimmed.strip_prefix("* ") {
-            (4, content.to_string())
-        } else if let Some(content) = trimmed.strip_prefix("> ") {
-            (5, content.to_string())
-        } else {
-            (6, trimmed.to_string())
-        };
-
-        let block_id = format!("block_{}", block_id_counter);
-        block_id_counter += 1;
-
-        let block = match block_type {
-            1 => json!({
-                "block_id": block_id,
-                "block_type": 1,
-                "heading1": {
-                    "elements": [{
-                        "text_run": {
-                            "content": content
-                        }
-                    }]
-                }
-            }),
-            2 => json!({
-                "block_id": block_id,
-                "block_type": 2,
-                "heading2": {
-                    "elements": [{
-                        "text_run": {
-                            "content": content
-                        }
-                    }]
-                }
-            }),
-            3 => json!({
-                "block_id": block_id,
-                "block_type": 3,
-                "heading3": {
-                    "elements": [{
-                        "text_run": {
-                            "content": content
-                        }
-                    }]
-                }
-            }),
-            4 => json!({
-                "block_id": block_id,
-                "block_type": 4,
-                "bullet": {
-                    "elements": [{
-                        "text_run": {
-                            "content": content
-                        }
-                    }]
-                }
-            }),
-            5 => json!({
-                "block_id": block_id,
-                "block_type": 5,
-                "quote": {
-                    "elements": [{
-                        "text_run": {
-                            "content": content
-                        }
-                    }]
-                }
-            }),
-            _ => json!({
-                "block_id": block_id,
-                "block_type": 6,
-                "text": {
-                    "elements": [{
-                        "text_run": {
-                            "content": content
-                        }
-                    }]
-                }
-            }),
-        };
-
-        blocks.push(block);
-    }
-
-    blocks
-}
-
 #[derive(Debug, Clone)]
 struct JsonRpcErr {
     code: i64,
@@ -5336,7 +4944,8 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(result.contains("scanned_chats: 1/2"));
+        assert!(result.contains("scanned_chats: 2/2"));
+        assert!(result.contains("matched: 1"));
         assert!(result.contains("\"message_id\": \"om_new\""));
         assert!(!result.contains("\"message_id\": \"om_old\""));
 
