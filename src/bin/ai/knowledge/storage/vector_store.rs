@@ -1,6 +1,5 @@
 /// Vector store — pure vector CRUD operations.
 /// Decoupled from JSONL store; sync is handled by the sync module.
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 

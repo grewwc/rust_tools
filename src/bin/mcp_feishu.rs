@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -8,7 +7,7 @@ use std::time::{Duration, Instant};
 use std::{fs, os::unix::fs::PermissionsExt};
 
 use reqwest::blocking::Client;
-use rust_tools::commonw::configw;
+use rust_tools::commonw::{FastMap, configw};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -1929,7 +1928,7 @@ fn render_docx_blocks_as_text(items: &[Value], default_origin: Option<&str>) -> 
         return String::new();
     }
 
-    let mut by_id: HashMap<String, &Value> = HashMap::new();
+    let mut by_id: FastMap<String, &Value> = FastMap::default();
     let mut root_id = None::<String>;
     for item in items {
         if let Some(block_id) = item.get("block_id").and_then(|v| v.as_str()) {
@@ -1962,7 +1961,7 @@ fn render_docx_blocks_as_text(items: &[Value], default_origin: Option<&str>) -> 
 
 fn render_docx_block_text(
     block_id: &str,
-    by_id: &HashMap<String, &Value>,
+    by_id: &FastMap<String, &Value>,
     default_origin: Option<&str>,
     out: &mut String,
 ) {
@@ -1999,7 +1998,7 @@ fn render_docx_block_text(
 
 fn render_docx_table_cells(
     block: &Value,
-    by_id: &HashMap<String, &Value>,
+    by_id: &FastMap<String, &Value>,
     default_origin: Option<&str>,
     out: &mut String,
 ) {
@@ -2040,7 +2039,7 @@ fn render_docx_table_cells(
 
 fn render_docx_table_cell_text(
     cell_id: &str,
-    by_id: &HashMap<String, &Value>,
+    by_id: &FastMap<String, &Value>,
     default_origin: Option<&str>,
 ) -> String {
     let Some(block) = by_id.get(cell_id).copied() else {

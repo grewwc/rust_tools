@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 
 use dirs;
 use fastembed::{InitOptions, TextEmbedding};
+use rust_tools::commonw::{FastMap, FastSet};
 use serde::{Deserialize, Serialize};
 
 use crate::ai::tools::storage::memory_store::MemoryStore;
@@ -220,22 +221,22 @@ impl RagStore {
         vector_weight: f32,
     ) -> Result<Vec<(String, RagEntry, f32)>, String> {
         let semantic_results = self.semantic_search(query, limit * 3, category)?;
-        let semantic_scores: std::collections::HashMap<String, f32> = semantic_results
+        let semantic_scores: FastMap<String, f32> = semantic_results
             .into_iter()
             .map(|(entry, score)| (entry.id.clone(), score))
             .collect();
 
         let bm25_max = bm25_results.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
-        let bm25_normalized: std::collections::HashMap<String, f32> = if bm25_max > 0.0 {
+        let bm25_normalized: FastMap<String, f32> = if bm25_max > 0.0 {
             bm25_results
                 .into_iter()
                 .map(|(id, score)| (id, score / bm25_max))
                 .collect()
         } else {
-            std::collections::HashMap::new()
+            FastMap::default()
         };
 
-        let mut all_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut all_ids: FastSet<String> = FastSet::default();
         all_ids.extend(bm25_normalized.keys().cloned());
         all_ids.extend(semantic_scores.keys().cloned());
 

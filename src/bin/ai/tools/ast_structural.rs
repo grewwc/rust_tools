@@ -235,7 +235,9 @@ fn normalize_match(
     if let Some(receiver) = receiver.filter(|s| !s.is_empty()) {
         normalized.push(("receiver".to_string(), receiver));
     }
-    if raw_name != normalized_name && raw_name != qualified_name {
+    if primary_capture_name == "name" {
+        normalized.push(("raw_name".to_string(), raw_name));
+    } else if raw_name != normalized_name && raw_name != qualified_name {
         normalized.push(("raw_name".to_string(), raw_name));
     } else if primary_capture_name == "constructor_name" {
         normalized.push(("raw_name".to_string(), raw_name));

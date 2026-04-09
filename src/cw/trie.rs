@@ -4,7 +4,7 @@ use crate::commonw::types::FastMap;
 
 /// A Trie (prefix tree) data structure for efficient string storage and retrieval.
 ///
-/// This implementation uses a HashMap-based approach where each node contains
+/// This implementation uses a FastMap-based approach where each node contains
 /// a map of characters to child nodes. It supports basic operations like insert,
 /// search, prefix matching, and deletion.
 ///

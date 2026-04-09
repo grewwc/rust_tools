@@ -103,41 +103,44 @@ fn build_terminal_preview(tool_name: &str, content: &str) -> String {
 
     let lines = content.lines().collect::<Vec<_>>();
     let omitted = line_count.saturating_sub(policy.head_lines + policy.tail_lines);
-    let mut preview = String::new();
+    let mut head = String::new();
     for line in lines.iter().take(policy.head_lines) {
-        preview.push_str(line);
-        preview.push('\n');
+        head.push_str(line);
+        head.push('\n');
     }
-    preview.push_str(&format!(
+    let notice = format!(
         "... (truncated for terminal preview; {} lines, {} chars total",
         line_count, char_count
-    ));
+    );
+    let mut notice = notice;
     if omitted > 0 {
-        preview.push_str(&format!(", {} lines omitted", omitted));
+        notice.push_str(&format!(", {} lines omitted", omitted));
     }
-    preview.push_str(")\n");
+    notice.push_str(")\n");
+    let mut tail = String::new();
     if policy.tail_lines > 0 && line_count > policy.head_lines {
         let tail_start = line_count.saturating_sub(policy.tail_lines);
         for line in lines.iter().skip(tail_start) {
-            preview.push_str(line);
-            preview.push('\n');
+            tail.push_str(line);
+            tail.push('\n');
         }
     }
 
-    let contains_truncation_notice = preview.contains("truncated for terminal preview");
-    
+    let mut preview = format!("{head}{notice}{tail}");
     if preview.chars().count() > policy.max_chars {
-        let truncated = truncate_chars(&preview, policy.max_chars);
-        
-        let suffix = if contains_truncation_notice {
-            "... (truncated for terminal preview)"
+        let notice_len = notice.chars().count();
+        let available = policy.max_chars.saturating_sub(notice_len);
+        if !tail.is_empty() && available > 32 {
+            let tail_budget = available.min(available / 3).max(available / 4).max(96);
+            let tail_budget = tail_budget.min(available.saturating_sub(32));
+            let head_budget = available.saturating_sub(tail_budget);
+            let head = truncate_chars(head.trim_end(), head_budget);
+            let tail = tail_chars(tail.trim_end(), tail_budget);
+            preview = format!("{head}\n{notice}{tail}");
         } else {
-            "... (terminal preview capped)"
-        };
-        return format!(
-            "{}\n{}",
-            truncated, suffix
-        );
+            let truncated = truncate_chars(&preview, policy.max_chars);
+            return format!("{truncated}\n... (truncated for terminal preview)");
+        }
     }
 
     preview
@@ -280,11 +283,7 @@ fn write_tool_overflow_file(
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let store = SessionStore::new(app.session_history_file.as_path());
     store.ensure_root_dir()?;
-    let mut dir = store.session_history_file(&app.session_id);
-    if let Some(parent) = dir.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    dir.set_extension("");
+    let dir = store.session_assets_dir(&app.session_id).join("tool-overflow");
     fs::create_dir_all(&dir)?;
     let sanitized_name = tool_name
         .chars()

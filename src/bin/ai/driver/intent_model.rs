@@ -1,18 +1,18 @@
 use std::{
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
 };
 
+use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
 
 use super::intent_recognition::{CoreIntent, IntentModifiers, UserIntent};
 
 const DEFAULT_INTENT_MODEL_RELATIVE_PATH: &str = "config/intent/intent_model.json";
 
-static INTENT_MODEL_CACHE: LazyLock<Mutex<HashMap<PathBuf, Arc<IntentModelFile>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static INTENT_MODEL_CACHE: LazyLock<Mutex<FastMap<PathBuf, Arc<IntentModelFile>>>> =
+    LazyLock::new(|| Mutex::new(FastMap::default()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct IntentModelFile {
@@ -179,8 +179,8 @@ fn predict_core_intent(input: &str, model: &IntentModelFile) -> CoreIntent {
     label_to_core(model.labels.get(best_idx).map(|s| s.as_str()))
 }
 
-fn extract_tfidf_features(input: &str, cfg: &FeatureConfig) -> HashMap<String, f64> {
-    let mut counts = HashMap::new();
+fn extract_tfidf_features(input: &str, cfg: &FeatureConfig) -> FastMap<String, f64> {
+    let mut counts = FastMap::default();
     for ngram in extract_char_ngrams(input, cfg.char_ngram_min, cfg.char_ngram_max) {
         *counts.entry(ngram).or_insert(0.0) += 1.0;
     }
