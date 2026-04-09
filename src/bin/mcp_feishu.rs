@@ -216,7 +216,7 @@ fn handle_tools_list() -> Result<Value, JsonRpcErr> {
                     "type": "object",
                     "properties": {
                         "redirect_uri": { "type": "string", "description": "Redirect URI configured in Feishu console. Default: http://127.0.0.1:8711/callback" },
-                        "scope": { "type": "string", "description": "Scopes separated by space. Tip: include offline_access if you need refresh_token." },
+                        "scope": { "type": "string", "description": "Scopes separated by space. Default: offline_access im:chat:readonly im:message:readonly docs:doc:readonly docx:document:readonly wiki:wiki:readonly sheets:spreadsheet" },
                         "state": { "type": "string", "description": "Opaque state string for CSRF protection" },
                         "prompt": { "type": "string", "description": "Optional. Use \"consent\" to force explicit consent UI." }
                     }
@@ -3718,7 +3718,7 @@ fn feishu_oauth_authorize_url(args: &Value) -> Result<String, JsonRpcErr> {
     let scope = args
         .get("scope")
         .and_then(|v| v.as_str())
-        .unwrap_or("offline_access")
+        .unwrap_or("offline_access im:chat:readonly im:message:readonly docs:doc:readonly docx:document:readonly wiki:wiki:readonly sheets:spreadsheet")
         .trim()
         .to_string();
     let state = args
