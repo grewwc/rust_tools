@@ -238,7 +238,7 @@ pub(super) fn print_help() {
     parser.print_defaults();
     println!();
     println!("Agent (CLI):");
-    println!("  --agent <name>            start with specified agent (build/plan/explore)");
+    println!("  --agent <name>            start with specified agent (build/openclaw/plan/explore)");
     println!("  --list-agents             list available agents and exit");
     println!();
     println!("Session (CLI):");
@@ -258,6 +258,7 @@ pub(super) fn print_help() {
     println!("    /agents list              list available agents");
     println!("    /agents current           show current agent");
     println!("    /agents use <name>        switch to an agent");
+    println!("    /agents auto              restore automatic agent routing");
     println!();
     println!("  Session management:");
     println!("    /sessions                 list all sessions");
@@ -278,6 +279,8 @@ pub(super) fn print_help() {
     println!("Config (.configW):");
     println!("  ai.intent_model                    light model for thinking gate / skill router");
     println!("  ai.intent.model_path               local TF-IDF + LR intent model json");
+    println!("  ai.agents.auto_route.enable        auto switch primary agent by turn intent (default: true)");
+    println!("  ai.agents.auto_route.openclaw_min_chars  min chars before routing complex tasks to openclaw (default: 48)");
     println!("  ai.model.auto_thinking.enable      auto gate switch (default: true)");
     println!("  ai.model.auto_thinking.threshold   model gate confidence threshold (default: 0.7)");
 }

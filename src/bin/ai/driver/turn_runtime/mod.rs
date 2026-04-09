@@ -291,6 +291,7 @@ mod tests {
             client: reqwest::Client::builder().build().unwrap(),
             current_model: String::new(),
             current_agent: "build".to_string(),
+            current_agent_manifest: None,
             pending_files: None,
             pending_short_output: false,
             attached_image_files: Vec::new(),

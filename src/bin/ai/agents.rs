@@ -11,6 +11,10 @@ const BUILTIN_AGENTS: &[(&str, &str)] = &[
         include_str!("builtin_agents/build.agent"),
     ),
     (
+        "openclaw.agent",
+        include_str!("builtin_agents/openclaw.agent"),
+    ),
+    (
         "plan.agent",
         include_str!("builtin_agents/plan.agent"),
     ),

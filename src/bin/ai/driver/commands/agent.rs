@@ -36,6 +36,7 @@ pub fn try_handle_agent_command(
             println!("  /agents list              list available agents");
             println!("  /agents current           show current agent");
             println!("  /agents use <name>        switch to an agent");
+            println!("  /agents auto              restore automatic agent routing");
             println!();
         }
         "list" | "ls" | "" => {
@@ -69,6 +70,14 @@ pub fn try_handle_agent_command(
         "current" | "cur" => {
             if let Some(agent) = agents::find_agent_by_name(agent_manifests, &app.current_agent) {
                 println!("Current agent: {}", app.current_agent);
+                println!(
+                    "Routing mode: {}",
+                    if app.cli.agent.is_some() {
+                        "manual"
+                    } else {
+                        "auto"
+                    }
+                );
                 println!("Description: {}", agent.description);
                 println!("Mode: {:?}", agent.mode);
                 if let Some(model) = &agent.model {
@@ -82,6 +91,18 @@ pub fn try_handle_agent_command(
                     "Current agent: {} (not found in manifests)",
                     app.current_agent
                 );
+            }
+        }
+        "auto" => {
+            let was_manual = app.cli.agent.take().is_some();
+            println!("Agent auto-routing is now enabled.");
+            if was_manual {
+                println!(
+                    "Current agent remains '{}' for now and may auto-switch on the next user request.",
+                    app.current_agent
+                );
+            } else {
+                println!("Agent routing was already in auto mode.");
             }
         }
         "use" | "select" | "switch" => {
@@ -109,6 +130,8 @@ pub fn try_handle_agent_command(
 
                 let old_agent = app.current_agent.clone();
                 app.current_agent = agent.name.clone();
+                app.current_agent_manifest = Some(agent.clone());
+                app.cli.agent = Some(agent.name.clone());
 
                 if let Some(model) = &agent.model {
                     app.current_model = model.clone();

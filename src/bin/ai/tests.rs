@@ -80,6 +80,7 @@ fn resolve_model_is_unicode_safe() {
         client,
         current_model: any_model_name(),
         current_agent: "build".to_string(),
+        current_agent_manifest: None,
         pending_files: None,
         pending_short_output: false,
         attached_image_files: Vec::new(),

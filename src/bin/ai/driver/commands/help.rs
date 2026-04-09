@@ -14,6 +14,7 @@ pub fn print_interactive_help() {
     println!("    /agents list              list available agents");
     println!("    /agents current           show current agent");
     println!("    /agents use <name>        switch to an agent");
+    println!("    /agents auto              restore automatic agent routing");
     println!();
     println!("  Session management:");
     println!("    /sessions                 list all sessions");

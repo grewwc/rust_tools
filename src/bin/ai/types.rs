@@ -13,7 +13,7 @@ use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{cli::ParsedCli, prompt::PromptEditor};
+use super::{agents::AgentManifest, cli::ParsedCli, prompt::PromptEditor};
 
 /// Configuration for the AI application, including API credentials,
 /// endpoint, model settings, and conversation history parameters.
@@ -40,6 +40,7 @@ pub(super) struct App {
     pub(super) client: Client,
     pub(super) current_model: String,
     pub(super) current_agent: String,
+    pub(super) current_agent_manifest: Option<AgentManifest>,
     pub(super) pending_files: Option<String>,
     pub(super) pending_short_output: bool,
     pub(super) attached_image_files: Vec<String>,

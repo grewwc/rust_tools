@@ -21,7 +21,7 @@ pub fn try_handle_session_command(
     let Some(cmd) = parts.next() else {
         return Ok(false);
     };
-    if cmd != "sessions" && cmd != "session" {
+    if cmd != "sessions" && cmd != "session" && cmd != "ss" {
         return Ok(false);
     }
     let action = parts.next().unwrap_or("list");

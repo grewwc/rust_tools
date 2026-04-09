@@ -1,4 +1,5 @@
 use crate::ai::{
+    agents::AgentManifest,
     mcp::McpClient,
     request,
     skills::SkillManifest,
@@ -61,40 +62,59 @@ fn activate_skill_context(
     app: &mut App,
     builtin_tools: Vec<ToolDef>,
     mcp_tools: Vec<ToolDef>,
-    openclaw_active: bool,
+    max_iterations: usize,
 ) -> Option<(Vec<ToolDef>, usize)> {
     let mut restore = None;
     if let Some(ctx) = app.agent_context.as_mut() {
         let all_tools = reorder_tools_by_stats(builtin_tools, mcp_tools);
         let prev_tools = std::mem::replace(&mut ctx.tools, all_tools);
-        let prev_max_iterations = std::mem::replace(
-            &mut ctx.max_iterations,
-            if openclaw_active {
-                OPENCLAW_MAX_ITERATIONS
-            } else {
-                DEFAULT_MAX_ITERATIONS
-            },
-        );
+        let prev_max_iterations = std::mem::replace(&mut ctx.max_iterations, max_iterations);
         restore = Some((prev_tools, prev_max_iterations));
     }
     restore
 }
 
+fn manifest_tool_definitions(
+    tool_groups: &[String],
+    tools: &[String],
+) -> Option<Vec<ToolDef>> {
+    if !tool_groups.is_empty() {
+        let groups: Vec<&str> = tool_groups.iter().map(|s| s.as_str()).collect();
+        return Some(super::super::tools::tool_definitions_for_groups(&groups));
+    }
+    if !tools.is_empty() {
+        return Some(super::super::tools::get_tool_definitions_by_names(tools));
+    }
+    None
+}
+
+fn resolve_max_iterations(active_agent: Option<&AgentManifest>, openclaw_active: bool) -> usize {
+    active_agent
+        .and_then(|agent| agent.max_steps)
+        .unwrap_or(if openclaw_active {
+            OPENCLAW_MAX_ITERATIONS
+        } else {
+            DEFAULT_MAX_ITERATIONS
+        })
+}
+
 fn builtin_tools_for_skill(
     prompt_optimizer_active: bool,
     skill: Option<&SkillManifest>,
+    active_agent: Option<&AgentManifest>,
 ) -> Vec<ToolDef> {
     if prompt_optimizer_active {
         return Vec::new();
     }
     if let Some(skill) = skill {
-        if !skill.tool_groups.is_empty() {
-            let groups: Vec<&str> = skill.tool_groups.iter().map(|s| s.as_str()).collect();
-            return super::super::tools::tool_definitions_for_groups(&groups);
+        if let Some(tool_defs) = manifest_tool_definitions(&skill.tool_groups, &skill.tools) {
+            return tool_defs;
         }
-        if !skill.tools.is_empty() {
-            return super::super::tools::get_tool_definitions_by_names(&skill.tools);
-        }
+    }
+    if let Some(agent) = active_agent
+        && let Some(tool_defs) = manifest_tool_definitions(&agent.tool_groups, &agent.tools)
+    {
+        return tool_defs;
     }
     super::super::tools::get_builtin_tool_definitions()
 }
@@ -205,20 +225,25 @@ fn mcp_tools_for_skill(
         .collect()
 }
 
-fn build_system_prompt(skill: Option<&SkillManifest>) -> String {
-    let mut system_prompt = if let Some(skill) = skill {
-        let mut p = "You are a helpful assistant.".to_string();
-        p.push_str("\n\n");
-        p.push_str("Skill enforcement:\n- You MUST follow the active skill instructions precisely.\n- Do not ignore, weaken, or bypass the skill behavior.\n- If the user request conflicts with the skill, ask a brief clarification aligned with the skill.");
+fn build_system_prompt(active_agent: Option<&AgentManifest>, skill: Option<&SkillManifest>) -> String {
+    let mut system_prompt = "You are a helpful assistant.".to_string();
+    if let Some(agent) = active_agent {
+        let extra = agent.build_system_prompt();
+        if !extra.trim().is_empty() {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str("Agent enforcement:\n- You MUST follow the active agent profile for behavior, workflow, and safety boundaries.\n- Treat the active agent as the default operating mode for this turn.\n- When a skill is also active, satisfy both the agent profile and the skill instructions.\n\n");
+            system_prompt.push_str(extra.trim());
+        }
+    }
+    if let Some(skill) = skill {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("Skill enforcement:\n- You MUST follow the active skill instructions precisely.\n- Do not ignore, weaken, or bypass the skill behavior.\n- If the user request conflicts with the skill, ask a brief clarification aligned with the skill.");
         let extra = skill.build_system_prompt();
         if !extra.trim().is_empty() {
-            p.push_str("\n\n");
-            p.push_str(extra.trim());
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(extra.trim());
         }
-        p
-    } else {
-        "You are a helpful assistant.".to_string()
-    };
+    }
 
     system_prompt.push_str("\n\n");
     system_prompt.push_str("Tool recovery mode:\n- If a tool call fails, read the error message and correct course before answering.\n- Prefer retrying with corrected arguments or switching to a more appropriate tool.\n- Do not repeat the exact same failing tool call unless the error indicates a transient retry is appropriate.\n- If a URL-based docs fetch tool says the URL is unsupported, switch to a search tool or ask for a supported docs URL instead of retrying the same call.\n- Only stop and ask the user when the error is ambiguous or missing required information.");
@@ -360,19 +385,24 @@ pub(super) async fn prepare_skill_for_turn(
     let prompt_optimizer_active = skill
         .as_ref()
         .is_some_and(|s| s.name.as_str() == "prompt-optimizer");
+    let active_agent = app.current_agent_manifest.clone();
     let openclaw_active = skill.as_ref().is_some_and(|s| {
         s.name.as_str() == "openclaw" || s.tool_groups.iter().any(|g| g == "openclaw")
+    }) || active_agent.as_ref().is_some_and(|agent| {
+        agent.name.as_str() == "openclaw" || agent.tool_groups.iter().any(|g| g == "openclaw")
     });
 
-    let builtin_tools = builtin_tools_for_skill(prompt_optimizer_active, skill);
+    let builtin_tools = builtin_tools_for_skill(prompt_optimizer_active, skill, active_agent.as_ref());
     let mcp_tools = mcp_tools_for_skill(mcp_client, prompt_optimizer_active, skill);
+    let system_prompt = build_system_prompt(active_agent.as_ref(), skill);
+    let max_iterations = resolve_max_iterations(active_agent.as_ref(), openclaw_active);
     let restore_agent_context =
-        activate_skill_context(app, builtin_tools, mcp_tools, openclaw_active);
+        activate_skill_context(app, builtin_tools, mcp_tools, max_iterations);
 
     let guard = SkillTurnGuard {
         app: NonNull::from(&mut *app),
         restore_agent_context,
-        system_prompt: build_system_prompt(skill),
+        system_prompt,
         matched_skill_name,
         intent,
         skip_recall_by_skill,
@@ -415,7 +445,8 @@ fn resolve_skill_selection<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::tool_uses_mcp_server;
+    use super::{resolve_max_iterations, tool_uses_mcp_server};
+    use crate::ai::agents::{AgentManifest, AgentMode};
 
     #[test]
     fn mcp_server_filter_matches_longest_server_name_prefix() {
@@ -423,5 +454,31 @@ mod tests {
         assert!(tool_uses_mcp_server("mcp_foo_bar_search", &allowed));
         assert!(tool_uses_mcp_server("mcp_foo_lookup", &allowed));
         assert!(!tool_uses_mcp_server("mcp_bar_search", &allowed));
+    }
+
+    #[test]
+    fn active_agent_max_steps_override_default_iterations() {
+        let agent = AgentManifest {
+            name: "openclaw".to_string(),
+            description: String::new(),
+            mode: AgentMode::Primary,
+            model: None,
+            temperature: None,
+            max_steps: Some(17),
+            prompt: String::new(),
+            system_prompt: None,
+            tools: Vec::new(),
+            tool_groups: vec!["builtin".to_string(), "openclaw".to_string()],
+            mcp_servers: Vec::new(),
+            disabled: false,
+            hidden: false,
+            color: None,
+            source_path: None,
+        };
+
+        assert_eq!(resolve_max_iterations(Some(&agent), false), 17);
+        assert_eq!(resolve_max_iterations(Some(&agent), true), 17);
+        assert_eq!(resolve_max_iterations(None, true), super::super::OPENCLAW_MAX_ITERATIONS);
+        assert_eq!(resolve_max_iterations(None, false), super::super::DEFAULT_MAX_ITERATIONS);
     }
 }
