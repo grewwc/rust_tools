@@ -429,17 +429,6 @@ pub(super) async fn do_request_messages(
         match response {
             Ok(response) => {
                 if response.status().is_success() {
-                    crate::ai::agent_hang_debug!(
-                        "pre-fix",
-                        "B",
-                        "request::do_request_messages:http_success",
-                        "[DEBUG] request http success",
-                        {
-                            "attempt": attempt,
-                            "stream": stream,
-                            "elapsed_ms": http_start.elapsed().as_secs_f64() * 1000.0,
-                        },
-                    );
                     return Ok(response);
                 }
                 let status = response.status();
@@ -455,17 +444,6 @@ pub(super) async fn do_request_messages(
                 };
 
                 if should_retry_status(status) && attempt < max_attempts_for_status {
-                    crate::ai::agent_hang_debug!(
-                        "pre-fix",
-                        "B",
-                        "request::do_request_messages:http_retry",
-                        "[DEBUG] request http retry",
-                        {
-                            "attempt": attempt,
-                            "status": status_code,
-                            "elapsed_ms": http_start.elapsed().as_secs_f64() * 1000.0,
-                        },
-                    );
                     // 打印 sleep 原因
                     let delay = retry_delay(attempt);
 
@@ -488,32 +466,11 @@ pub(super) async fn do_request_messages(
                     tokio::time::sleep(delay).await;
                     continue;
                 }
-                crate::ai::agent_hang_debug!(
-                    "pre-fix",
-                    "B",
-                    "request::do_request_messages:http_error",
-                    "[DEBUG] request http error",
-                    {
-                        "attempt": attempt,
-                        "status": status_code,
-                        "elapsed_ms": http_start.elapsed().as_secs_f64() * 1000.0,
-                    },
-                );
                 return Err(err);
             }
             Err(err) => {
                 let retryable = is_retryable_reqwest_error(&err);
                 let err = RequestError::network(err);
-                crate::ai::agent_hang_debug!(
-                    "pre-fix",
-                    "B",
-                    "request::do_request_messages:network_error",
-                    "[DEBUG] request network error",
-                    {
-                        "attempt": attempt,
-                        "elapsed_ms": http_start.elapsed().as_secs_f64() * 1000.0,
-                    },
-                );
                 if retryable && attempt < REQUEST_MAX_ATTEMPTS {
                     // 打印 sleep 原因
                     let delay = retry_delay(attempt);

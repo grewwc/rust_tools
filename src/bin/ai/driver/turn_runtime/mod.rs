@@ -156,6 +156,7 @@ pub(super) async fn run_turn(
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
+    // 1. prepare 
     let TurnPreparation {
         mut skill_turn,
         mut messages,
@@ -178,6 +179,7 @@ pub(super) async fn run_turn(
     let mut final_assistant_recorded = false;
     loop {
         iteration += 1;
+        // 2. re-choose skill
         refresh_skill_turn_for_iteration(
             app,
             mcp_client,
@@ -188,7 +190,7 @@ pub(super) async fn run_turn(
             &mut messages,
         )
         .await;
-
+        // 3. execute
         let execution = execute_turn_iteration(
             app,
             &next_model,
@@ -201,7 +203,7 @@ pub(super) async fn run_turn(
             iteration,
         )
         .await?;
-
+        // 4. handle execution result 
         match handle_iteration_execution(
             app,
             mcp_client,
@@ -221,7 +223,7 @@ pub(super) async fn run_turn(
             TurnLoopStep::Return(outcome) => return Ok(outcome),
         }
     }
-
+    // 5. finilization
     finalize_turn(
         app,
         &next_model,

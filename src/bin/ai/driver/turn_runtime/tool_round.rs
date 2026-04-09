@@ -578,16 +578,6 @@ pub(super) fn handle_iteration_execution(
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::FinalResponse(stream_result) => {
-            crate::ai::agent_hang_debug!(
-                "pre-fix",
-                "A",
-                "turn_runtime::run_turn:final-response",
-                "[DEBUG] final assistant response without tool calls",
-                {
-                    "iteration": iteration,
-                    "assistant_chars": stream_result.assistant_text.chars().count(),
-                },
-            );
             record_final_stream_response(
                 app,
                 stream_result,

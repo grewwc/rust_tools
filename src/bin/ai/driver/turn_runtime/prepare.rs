@@ -80,19 +80,6 @@ pub(super) async fn prepare_turn(
                 | super::super::intent_recognition::CoreIntent::QueryConcept
         );
     let skip_recall = skip_recall_for_skill_context || skip_recall_for_light_turn;
-    crate::ai::agent_hang_debug!(
-        "post-fix",
-        "K",
-        "turn_runtime::run_turn:knowledge_recall:gate",
-        "[DEBUG] knowledge recall gate decided",
-        {
-            "matched_skill": skill_turn.matched_skill_name(),
-            "core": format!("{:?}", recall_intent.core),
-            "skip_recall_for_skill_context": skip_recall_for_skill_context,
-            "skip_recall_for_light_turn": skip_recall_for_light_turn,
-            "skip_recall": skip_recall,
-        },
-    );
     if !skip_recall {
         let recall_bundle = reflection::build_recall_bundle(question, 1200, 2000);
         if let Some(guidelines) = recall_bundle.guidelines {

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
 
 use super::super::indexing::similarity;
@@ -219,23 +220,23 @@ impl VectorStore {
             all_entries.push((entry.id.clone(), entry, sim));
         }
 
-        let semantic_scores: HashMap<String, f32> = all_entries
+        let semantic_scores: FastMap<String, f32> = all_entries
             .iter()
             .map(|(id, _, score)| (id.clone(), *score))
             .collect();
-        let entry_map: HashMap<String, VectorEntry> = all_entries
+        let entry_map: FastMap<String, VectorEntry> = all_entries
             .into_iter()
             .map(|(id, entry, _)| (id, entry))
             .collect();
 
         let bm25_max = bm25_results.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
-        let bm25_normalized: HashMap<String, f32> = if bm25_max > 0.0 {
+        let bm25_normalized: FastMap<String, f32> = if bm25_max > 0.0 {
             bm25_results
                 .into_iter()
                 .map(|(id, score)| (id, score / bm25_max))
                 .collect()
         } else {
-            HashMap::new()
+            FastMap::default()
         };
 
         let mut all_ids: std::collections::HashSet<String> = std::collections::HashSet::new();

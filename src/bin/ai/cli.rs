@@ -230,8 +230,6 @@ pub(super) fn print_help() {
     parser.add_string("mcp-config", "", "mcp config json path override");
 
     println!("AI CLI - Interactive AI Assistant");
-    println!("Compatible with go_tools executable/ai/a.go");
-    println!();
     println!("Usage: a [OPTIONS] [PROMPT]");
     println!();
     println!("Options:");
