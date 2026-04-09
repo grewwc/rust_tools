@@ -9,19 +9,23 @@ pub(super) fn parse_files(content: &str) -> FileParseResult {
     let files = split_by_str_keep_quotes(content, ",", "\"", false);
     let mut parsed = FileParseResult::default();
     for file in files {
-        let file = expanduser(file.trim()).to_string();
-        if file.is_empty() {
-            continue;
-        }
-        if fs::read_to_string(&file).is_ok() {
-            parsed.text_files.push(file);
-        } else if is_image_path(&file) {
-            parsed.image_files.push(file);
-        } else {
-            parsed.binary_files.push(file);
-        }
+        classify_file_reference(&mut parsed, file.trim());
     }
     parsed
+}
+
+pub(super) fn classify_file_reference(parsed: &mut FileParseResult, raw: &str) {
+    let file = expanduser(raw.trim()).to_string();
+    if file.is_empty() {
+        return;
+    }
+    if Path::new(&file).exists() && is_image_path(&file) {
+        parsed.image_files.push(file);
+    } else if fs::read_to_string(&file).is_ok() {
+        parsed.text_files.push(file);
+    } else if Path::new(&file).exists() {
+        parsed.binary_files.push(file);
+    }
 }
 
 pub(super) fn is_image_path(path: &str) -> bool {

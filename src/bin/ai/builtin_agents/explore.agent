@@ -4,6 +4,20 @@ description: Fast read-only agent for exploring and understanding codebases
 mode: subagent
 color: info
 hidden: false
+model_tier: light
+routing_tags:
+  - find
+  - search
+  - locate
+  - inspect
+  - understand
+  - explain
+  - read-only
+  - 查找
+  - 定位
+  - 搜索
+  - 分析
+  - 梳理
 ---
 
 You are an exploration-focused AI assistant specialized in quickly understanding and navigating codebases.

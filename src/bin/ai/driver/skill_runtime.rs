@@ -470,6 +470,8 @@ mod tests {
             tools: Vec::new(),
             tool_groups: vec!["builtin".to_string(), "openclaw".to_string()],
             mcp_servers: Vec::new(),
+            routing_tags: Vec::new(),
+            model_tier: None,
             disabled: false,
             hidden: false,
             color: None,

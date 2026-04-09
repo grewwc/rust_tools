@@ -42,6 +42,17 @@ impl Default for AgentMode {
     }
 }
 
+/// Declares the preferred model strength tier for an agent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(super) enum AgentModelTier {
+    #[serde(rename = "light")]
+    Light,
+    #[serde(rename = "standard")]
+    Standard,
+    #[serde(rename = "heavy")]
+    Heavy,
+}
+
 /// Parsed configuration for an agent, loaded from a `.agent` file
 /// with front-matter metadata and a prompt body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +77,10 @@ pub(super) struct AgentManifest {
     pub(super) tool_groups: Vec<String>,
     #[serde(default)]
     pub(super) mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub(super) routing_tags: Vec<String>,
+    #[serde(default)]
+    pub(super) model_tier: Option<AgentModelTier>,
     #[serde(default)]
     pub(super) disabled: bool,
     #[serde(default)]
@@ -96,6 +111,14 @@ impl AgentManifest {
 
     pub(super) fn is_subagent(&self) -> bool {
         matches!(self.mode, AgentMode::Subagent | AgentMode::All)
+    }
+
+    pub(super) fn routing_tags_normalized(&self) -> Vec<String> {
+        self.routing_tags
+            .iter()
+            .map(|tag| tag.trim().to_ascii_lowercase())
+            .filter(|tag| !tag.is_empty())
+            .collect()
     }
 }
 
@@ -185,12 +208,14 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
     let mut temperature: Option<f64> = None;
     let mut max_steps: Option<usize> = None;
     let mut system_prompt: Option<String> = None;
+    let mut model_tier: Option<String> = None;
     let mut disabled = false;
     let mut hidden = false;
     let mut color: Option<String> = None;
     let mut tools: Vec<String> = Vec::new();
     let mut tool_groups: Vec<String> = Vec::new();
     let mut mcp_servers: Vec<String> = Vec::new();
+    let mut routing_tags: Vec<String> = Vec::new();
 
     let mut body = String::new();
     let mut in_front_matter = true;
@@ -221,6 +246,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
                     "tools" => tools.push(v),
                     "tool_groups" => tool_groups.push(v),
                     "mcp_servers" => mcp_servers.push(v),
+                    "routing_tags" => routing_tags.push(v),
                     _ => {}
                 }
                 continue;
@@ -245,6 +271,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
                 "description" => description = Some(unquoted.to_string()),
                 "mode" => mode = Some(unquoted.to_string()),
                 "model" => model = Some(unquoted.to_string()),
+                "model_tier" => model_tier = Some(unquoted.to_string()),
                 "system_prompt" => system_prompt = Some(unquoted.to_string()),
                 "color" => color = Some(unquoted.to_string()),
                 "temperature" => {
@@ -262,6 +289,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
                 "tools" => tools = parse_list_value(unquoted),
                 "tool_groups" => tool_groups = parse_list_value(unquoted),
                 "mcp_servers" => mcp_servers = parse_list_value(unquoted),
+                "routing_tags" => routing_tags = parse_list_value(unquoted),
                 _ => {}
             }
         } else {
@@ -289,6 +317,13 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
         None => AgentMode::All,
         Some(other) => return Err(format!("invalid mode: {}", other)),
     };
+    let agent_model_tier = match model_tier.as_deref() {
+        Some("light") => Some(AgentModelTier::Light),
+        Some("standard") => Some(AgentModelTier::Standard),
+        Some("heavy") => Some(AgentModelTier::Heavy),
+        None => None,
+        Some(other) => return Err(format!("invalid model_tier: {}", other)),
+    };
 
     Ok(AgentManifest {
         name,
@@ -302,6 +337,8 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
         tools,
         tool_groups,
         mcp_servers,
+        routing_tags,
+        model_tier: agent_model_tier,
         disabled,
         hidden,
         color: color.filter(|s| !s.trim().is_empty()),
@@ -360,4 +397,53 @@ fn load_agents_from_dir(dir: &Path) -> Vec<AgentManifest> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_agent_front_matter, AgentModelTier};
+
+    #[test]
+    fn parses_routing_tags_and_model_tier_from_front_matter() {
+        let content = r#"---
+name: explore
+description: Fast read-only codebase exploration
+mode: subagent
+model_tier: light
+routing_tags:
+  - find
+  - search
+  - read-only
+---
+
+Read the codebase and summarize findings.
+"#;
+
+        let agent = parse_agent_front_matter(content).unwrap();
+        assert_eq!(agent.name, "explore");
+        assert_eq!(agent.model_tier, Some(AgentModelTier::Light));
+        assert_eq!(
+            agent.routing_tags,
+            vec![
+                "find".to_string(),
+                "search".to_string(),
+                "read-only".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_model_tier_in_front_matter() {
+        let content = r#"---
+name: bad
+description: invalid tier
+model_tier: giant
+---
+
+noop
+"#;
+
+        let err = parse_agent_front_matter(content).unwrap_err();
+        assert!(err.contains("invalid model_tier"));
+    }
 }

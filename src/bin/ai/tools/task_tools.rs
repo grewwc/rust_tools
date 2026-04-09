@@ -1,7 +1,11 @@
 use serde_json::Value;
 use std::process::Command;
 
-use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::ai::{
+    agents::{self, AgentManifest},
+    models,
+    tools::common::{ToolRegistration, ToolSpec},
+};
 
 fn params_task() -> Value {
     serde_json::json!({
@@ -17,7 +21,7 @@ fn params_task() -> Value {
             },
             "agent": {
                 "type": "string",
-                "description": "Which subagent to use (e.g., 'explore', 'general'). Defaults to 'general' if not specified."
+                "description": "Optional subagent name. Leave empty to let the runtime auto-select the best subagent for this task."
             },
             "model": {
                 "type": "string",
@@ -31,7 +35,7 @@ fn params_task() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task",
-        description: "Launch a specialized subagent to handle a specific task in parallel. Use this for complex multi-step work, codebase exploration, or tasks that benefit from specialized agents. The subagent runs independently and returns its full response.",
+        description: "Launch a specialized subagent to handle a focused task. Use this for complex work, codebase exploration, independent side investigations, or when multiple subtasks can be delegated. If agent is omitted, the runtime auto-selects a suitable subagent.",
         parameters: params_task,
         execute: execute_task,
         groups: &["builtin"],
@@ -47,8 +51,8 @@ pub(crate) fn execute_task(args: &Value) -> Result<String, String> {
         .as_str()
         .ok_or("Missing 'prompt' parameter")?;
 
-    let agent = args["agent"].as_str().unwrap_or("general");
-    let _model = args["model"].as_str();
+    let agent = args["agent"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let model_override = args["model"].as_str();
 
     if description.trim().is_empty() {
         return Err("description cannot be empty".to_string());
@@ -58,31 +62,110 @@ pub(crate) fn execute_task(args: &Value) -> Result<String, String> {
         return Err("prompt cannot be empty".to_string());
     }
 
-    execute_subagent_task(description, prompt, agent, _model)
+    execute_subagent_task(description, prompt, agent, model_override)
+}
+
+fn auto_subagent_score(agent: &AgentManifest, task_text: &str) -> i32 {
+    let task = task_text.to_ascii_lowercase();
+    let mut score = 0i32;
+
+    for tag in agent.routing_tags_normalized() {
+        if tag.is_empty() {
+            continue;
+        }
+        if task.contains(&tag) {
+            score += 24;
+        } else if tag.contains('-') || tag.contains(' ') {
+            let parts = tag
+                .split(['-', ' '])
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>();
+            if !parts.is_empty() && parts.iter().all(|part| task.contains(part)) {
+                score += 14;
+            }
+        }
+    }
+
+    score
+}
+
+fn select_subagent<'a>(
+    all_agents: &'a [AgentManifest],
+    requested_agent: Option<&str>,
+    description: &str,
+    prompt: &str,
+) -> Result<&'a AgentManifest, String> {
+    let subagents = agents::get_subagents(all_agents);
+    if subagents.is_empty() {
+        return Err("No subagents are available. Add at least one agent with mode: subagent or all."
+            .to_string());
+    }
+
+    if let Some(requested) = requested_agent {
+        if let Some(agent) = subagents
+            .iter()
+            .copied()
+            .find(|agent| agent.name.eq_ignore_ascii_case(requested))
+        {
+            return Ok(agent);
+        }
+
+        if let Some(agent) = agents::find_agent_by_name(all_agents, requested) {
+            return Err(format!(
+                "Agent '{}' exists but is not a subagent. Use a subagent or omit the agent field for auto-selection.",
+                agent.name
+            ));
+        }
+
+        let available = subagents
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "Unknown subagent '{}'. Available subagents: {}",
+            requested, available
+        ));
+    }
+
+    let task_text = format!("{description}\n{prompt}");
+    subagents
+        .into_iter()
+        .max_by(|a, b| {
+            auto_subagent_score(a, &task_text)
+                .cmp(&auto_subagent_score(b, &task_text))
+                .then_with(|| b.name.cmp(&a.name))
+        })
+        .ok_or_else(|| "No subagents are available.".to_string())
 }
 
 fn execute_subagent_task(
     description: &str,
     prompt: &str,
-    agent: &str,
+    agent: Option<&str>,
     model: Option<&str>,
 ) -> Result<String, String> {
     use std::time::Instant;
 
     let start = Instant::now();
+    let all_agents = agents::load_all_agents();
+    let selected_agent = select_subagent(&all_agents, agent, description, prompt)?;
+    let selected_model = model
+        .map(models::determine_model)
+        .unwrap_or_else(|| models::auto_subagent_model_for_agent(selected_agent, description, prompt));
 
     println!(
-        "\n[Task] Launching subagent '{}' for: {}",
-        agent, description
+        "\n[Task] Launching subagent '{}' with model '{}' for: {}",
+        selected_agent.name, selected_model, description
     );
 
     let mut cmd_args = vec!["--".to_string(), "--no-skills".to_string()];
 
-    if let Some(m) = model {
-        cmd_args.push("--model".to_string());
-        cmd_args.push(m.to_string());
-    }
-
+    cmd_args.push("--model".to_string());
+    cmd_args.push(selected_model.clone());
+    cmd_args.push("--agent".to_string());
+    cmd_args.push(selected_agent.name.clone());
     cmd_args.push(prompt.to_string());
 
     let output = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
@@ -95,8 +178,10 @@ fn execute_subagent_task(
     if output.status.success() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let result = format!(
-            "[Task: {}] (completed in {:.1}s)\n{}",
+            "[Task: {} via {} @ {}] (completed in {:.1}s)\n{}",
             description,
+            selected_agent.name,
+            selected_model,
             duration.as_secs_f64(),
             stdout.trim()
         );
@@ -104,11 +189,117 @@ fn execute_subagent_task(
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!(
-            "[Task: {}] failed after {:.1}s:\n{}",
+            "[Task: {} via {} @ {}] failed after {:.1}s:\n{}",
             description,
+            selected_agent.name,
+            selected_model,
             duration.as_secs_f64(),
             stderr.trim()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_subagent;
+    use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
+
+    fn manifest(name: &str, description: &str, mode: AgentMode) -> AgentManifest {
+        AgentManifest {
+            name: name.to_string(),
+            description: description.to_string(),
+            mode,
+            model: None,
+            temperature: None,
+            max_steps: None,
+            prompt: String::new(),
+            system_prompt: None,
+            tools: Vec::new(),
+            tool_groups: Vec::new(),
+            mcp_servers: Vec::new(),
+            routing_tags: Vec::new(),
+            model_tier: Some(AgentModelTier::Standard),
+            disabled: false,
+            hidden: false,
+            color: None,
+            source_path: None,
+        }
+    }
+
+    #[test]
+    fn auto_select_prefers_explore_for_codebase_investigation() {
+        let mut build = manifest("build", "Main build agent", AgentMode::Primary);
+        build.routing_tags = vec!["implement".to_string(), "fix".to_string()];
+        build.model_tier = Some(AgentModelTier::Heavy);
+        let mut explore = manifest(
+            "explore",
+            "Read-only codebase exploration agent",
+            AgentMode::Subagent,
+        );
+        explore.routing_tags = vec![
+            "find".to_string(),
+            "search".to_string(),
+            "read-only".to_string(),
+            "understand".to_string(),
+        ];
+        explore.model_tier = Some(AgentModelTier::Light);
+        let mut review = manifest("review", "Read-only review agent", AgentMode::Subagent);
+        review.routing_tags = vec!["review".to_string(), "audit".to_string()];
+
+        let all_agents = vec![build, explore, review];
+
+        let selected = select_subagent(
+            &all_agents,
+            None,
+            "Locate routing logic",
+            "Find where automatic agent routing happens and summarize the files involved.",
+        )
+        .unwrap();
+
+        assert_eq!(selected.name, "explore");
+    }
+
+    #[test]
+    fn explicit_primary_agent_is_rejected_for_task_tool() {
+        let mut build = manifest("build", "Main build agent", AgentMode::Primary);
+        build.routing_tags = vec!["implement".to_string()];
+        let mut explore = manifest(
+            "explore",
+            "Read-only codebase exploration agent",
+            AgentMode::Subagent,
+        );
+        explore.routing_tags = vec!["find".to_string(), "search".to_string()];
+        let all_agents = vec![build, explore];
+
+        let err = select_subagent(&all_agents, Some("build"), "Inspect code", "Look up files")
+            .unwrap_err();
+
+        assert!(err.contains("not a subagent"));
+    }
+
+    #[test]
+    fn routing_tags_drive_auto_selection_without_name_special_cases() {
+        let mut explore = manifest(
+            "navigator",
+            "Read-only codebase exploration agent",
+            AgentMode::Subagent,
+        );
+        explore.routing_tags = vec!["find".to_string(), "search".to_string(), "locate".to_string()];
+        explore.model_tier = Some(AgentModelTier::Light);
+
+        let mut review = manifest("critic", "Code review agent", AgentMode::Subagent);
+        review.routing_tags = vec!["review".to_string(), "audit".to_string()];
+        let all_agents = vec![explore, review];
+
+        let selected = select_subagent(
+            &all_agents,
+            None,
+            "Find handler",
+            "Search the codebase and locate where the request handler is defined.",
+        )
+        .unwrap();
+
+        assert_eq!(selected.name, "navigator");
     }
 }
 

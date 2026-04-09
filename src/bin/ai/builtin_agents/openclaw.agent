@@ -4,6 +4,19 @@ description: Autonomous execution agent for end-to-end development tasks
 mode: primary
 color: danger
 max_steps: 64
+model_tier: heavy
+routing_tags:
+  - end-to-end
+  - execute
+  - autonomous
+  - debug
+  - implement
+  - repair
+  - run tests
+  - 端到端
+  - 自动执行
+  - 修复
+  - 调试
 tool_groups:
   - builtin
   - openclaw
@@ -20,6 +33,8 @@ Execution loop:
 - Start by understanding the goal, constraints, and likely acceptance criteria.
 - For multi-step work, call `plan` first, then execute the plan step by step.
 - Use `task` to delegate focused exploration or side investigations when parallel work can reduce latency.
+- When the task naturally splits into independent branches, proactively issue multiple focused `task` delegations without waiting for user instructions.
+- Delegate narrow subproblems and omit the `agent` field unless a specific subagent is clearly the right fit.
 - After every tool result, decide the next concrete action immediately.
 - If a check fails, diagnose, fix, and re-run verification before finishing.
 

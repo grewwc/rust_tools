@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -88,6 +89,106 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
 
 const IMAGE_PLACEHOLDER_PREFIX: &str = "[[image:";
 const IMAGE_PLACEHOLDER_SUFFIX: &str = "]]";
+
+fn extract_at_file_references(question: &mut String) -> crate::ai::types::FileParseResult {
+    let mut parsed = crate::ai::types::FileParseResult::default();
+    let mut rewritten = String::with_capacity(question.len());
+    let chars: Vec<char> = question.chars().collect();
+    let mut i = 0usize;
+
+    while i < chars.len() {
+        if chars[i] != '@' || !at_ref_can_start(&chars, i) {
+            rewritten.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        let Some((next_index, raw_path)) = parse_at_ref_candidate(&chars, i) else {
+            rewritten.push(chars[i]);
+            i += 1;
+            continue;
+        };
+
+        let Some(path) = normalize_existing_ref_path(&raw_path) else {
+            rewritten.push(chars[i]);
+            i += 1;
+            continue;
+        };
+
+        files::classify_file_reference(&mut parsed, &path);
+        if !parsed.text_files.iter().any(|candidate| candidate == &path)
+            && !parsed.image_files.iter().any(|candidate| candidate == &path)
+            && !parsed.binary_files.iter().any(|candidate| candidate == &path)
+        {
+            rewritten.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        i = next_index;
+    }
+
+    *question = rewritten;
+    parsed
+}
+
+fn at_ref_can_start(chars: &[char], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    let prev = chars[index - 1];
+    prev.is_whitespace() || matches!(prev, '(' | '[' | '{' | '"' | '\'')
+}
+
+fn parse_at_ref_candidate(chars: &[char], at_index: usize) -> Option<(usize, String)> {
+    let start = at_index + 1;
+    if start >= chars.len() {
+        return None;
+    }
+
+    let quote = chars[start];
+    if quote == '"' || quote == '\'' {
+        let mut idx = start + 1;
+        let mut value = String::new();
+        while idx < chars.len() && chars[idx] != quote {
+            value.push(chars[idx]);
+            idx += 1;
+        }
+        if idx >= chars.len() || value.trim().is_empty() {
+            return None;
+        }
+        return Some((idx + 1, value));
+    }
+
+    let mut idx = start;
+    let mut value = String::new();
+    while idx < chars.len() && !chars[idx].is_whitespace() {
+        value.push(chars[idx]);
+        idx += 1;
+    }
+    if value.is_empty() {
+        return None;
+    }
+    Some((idx, value))
+}
+
+fn normalize_existing_ref_path(raw: &str) -> Option<String> {
+    let mut candidate = raw.trim().to_string();
+    while !candidate.is_empty() {
+        let expanded = crate::commonw::utils::expanduser(&candidate).to_string();
+        if fs::metadata(&expanded).is_ok() {
+            return Some(expanded);
+        }
+        let Some(last) = candidate.chars().last() else {
+            break;
+        };
+        if !matches!(last, ',' | '.' | ';' | ':' | '!' | '?' | ')' | ']' | '}') {
+            break;
+        }
+        candidate.pop();
+    }
+    None
+}
 
 fn extract_inline_image_paths(question: &mut String) -> Vec<String> {
     let mut images = Vec::new();
@@ -198,7 +299,13 @@ fn finalize_question(
     history_count: usize,
     loop_short_output: bool,
 ) -> Result<QuestionContext, Box<dyn Error>> {
+    let inline_files = extract_at_file_references(&mut question);
     let mut inline_images = extract_inline_image_paths(&mut question);
+    apply_text_files_prefix(&mut question, &inline_files.text_files)?;
+    if !inline_files.image_files.is_empty() {
+        inline_images.extend(inline_files.image_files);
+    }
+    handle_binary_files(&mut question, inline_files.binary_files)?;
     if let Some(files) = app.pending_files.take() {
         let parsed = files::parse_files(&files);
         apply_text_files_prefix(&mut question, &parsed.text_files)?;
@@ -223,6 +330,102 @@ fn finalize_question(
         question,
         history_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{extract_at_file_references, finalize_question};
+    use crate::ai::types::{App, AppConfig};
+    use std::path::PathBuf;
+    use std::sync::{Arc, atomic::AtomicBool};
+    use uuid::Uuid;
+
+    fn any_model_name() -> String {
+        crate::ai::model_names::all()
+            .first()
+            .map(|m| m.name.clone())
+            .expect("models.json is empty")
+    }
+
+    fn any_vl_model_name() -> String {
+        crate::ai::model_names::all()
+            .iter()
+            .find(|m| m.is_vl)
+            .map(|m| m.name.clone())
+            .unwrap_or_else(any_model_name)
+    }
+
+    fn test_app() -> App {
+        let client = reqwest::Client::builder().build().unwrap();
+        App {
+            cli: crate::ai::cli::ParsedCli::default(),
+            config: AppConfig {
+                api_key: String::new(),
+                history_file: PathBuf::new(),
+                endpoint: String::new(),
+                vl_default_model: any_vl_model_name(),
+                history_max_chars: 12000,
+                history_keep_last: 8,
+                history_summary_max_chars: 4000,
+                intent_model: None,
+                intent_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("config/intent/intent_model.json"),
+            },
+            session_id: String::new(),
+            session_history_file: PathBuf::new(),
+            client,
+            current_model: any_model_name(),
+            current_agent: "build".to_string(),
+            current_agent_manifest: None,
+            pending_files: None,
+            pending_short_output: false,
+            attached_image_files: Vec::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            streaming: Arc::new(AtomicBool::new(false)),
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            ignore_next_prompt_interrupt: false,
+            writer: None,
+            prompt_editor: None,
+            agent_context: None,
+        }
+    }
+
+    #[test]
+    fn at_image_reference_is_attached_and_removed_from_question() {
+        let path = std::env::temp_dir().join(format!("ai-image-{}.png", Uuid::new_v4()));
+        std::fs::write(&path, b"fake").unwrap();
+
+        let mut app = test_app();
+        let question = format!("Please inspect @{} now", path.display());
+        let ctx = finalize_question(&mut app, question, 6, false).unwrap();
+
+        assert!(!ctx.question.contains(path.to_string_lossy().as_ref()));
+        assert_eq!(app.attached_image_files, vec![path.to_string_lossy().to_string()]);
+    }
+
+    #[test]
+    fn at_agent_mention_is_not_treated_as_file_reference() {
+        let mut question = "@explore check this module".to_string();
+        let parsed = extract_at_file_references(&mut question);
+
+        assert!(parsed.text_files.is_empty());
+        assert!(parsed.image_files.is_empty());
+        assert!(parsed.binary_files.is_empty());
+        assert_eq!(question, "@explore check this module");
+    }
+
+    #[test]
+    fn quoted_at_text_file_reference_is_inlined() {
+        let path = std::env::temp_dir().join(format!("ai-note-{}.txt", Uuid::new_v4()));
+        std::fs::write(&path, "hello from file").unwrap();
+
+        let mut app = test_app();
+        let question = format!("Summarize @\"{}\"", path.display());
+        let ctx = finalize_question(&mut app, question, 6, false).unwrap();
+
+        assert!(ctx.question.contains("hello from file"));
+        assert!(!ctx.question.contains(path.to_string_lossy().as_ref()));
+    }
 }
 
 fn prompt_user(app: &mut App) -> io::Result<Option<String>> {

@@ -4,6 +4,19 @@ description: Read-only agent for planning and analysis without making changes
 mode: primary
 color: warning
 disabled: false
+model_tier: standard
+routing_tags:
+  - plan
+  - planning
+  - review
+  - analyze
+  - analysis
+  - summarize
+  - architecture
+  - 规划
+  - 分析
+  - 方案
+  - 总结
 ---
 
 You are a planning-focused AI assistant specialized in analyzing code and creating implementation plans WITHOUT making any changes.

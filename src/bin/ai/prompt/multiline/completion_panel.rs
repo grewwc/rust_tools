@@ -251,4 +251,31 @@ mod tests {
         assert!(pending.is_none());
         assert!(panel.is_none());
     }
+
+    #[test]
+    fn multiline_completion_lists_file_reference_candidates() {
+        let dir = std::env::temp_dir().join(format!("ai-multi-complete-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("screen.png");
+        let other = dir.join("script.rs");
+        std::fs::write(&image, b"fake").unwrap();
+        std::fs::write(&other, b"fn main() {}").unwrap();
+
+        let mut textarea = TextArea::new(vec![format!("@{}", dir.join("scr").display())]);
+        textarea.move_cursor(CursorMove::End);
+        let mut pending = None;
+        let mut panel = None;
+
+        let first = apply_multiline_completion(&mut textarea, &mut pending, &mut panel);
+
+        assert!(first.is_none());
+        assert!(pending.is_some());
+        assert!(panel.is_none());
+
+        let status = apply_multiline_completion(&mut textarea, &mut pending, &mut panel).unwrap();
+        assert!(status.contains("发现"));
+        let items = panel.as_ref().map(|panel| panel.items.clone()).unwrap();
+        assert!(items.contains(&format!("@{}", image.display())));
+        assert!(items.contains(&format!("@{}", other.display())));
+    }
 }

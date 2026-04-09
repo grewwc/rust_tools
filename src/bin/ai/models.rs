@@ -1,6 +1,7 @@
+use super::agents::{AgentManifest, AgentModelTier};
 use super::cli::ParsedCli;
 use super::config_schema::AiConfig;
-use super::model_names;
+use super::model_names::{self, ModelDef};
 
 pub(super) fn is_vl_model(model: &str) -> bool {
     model_names::find_by_name(model)
@@ -59,6 +60,20 @@ pub(super) fn forced_deepseek_model() -> String {
         .unwrap_or_else(default_model)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubagentTaskDifficulty {
+    Light,
+    Standard,
+    Heavy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ModelStrengthTier {
+    Light,
+    Standard,
+    Heavy,
+}
+
 pub(super) fn initial_model(cli: &ParsedCli) -> String {
     if let Some(ref model) = cli.model
         && !model.trim().is_empty()
@@ -103,6 +118,177 @@ pub(super) fn determine_vl_model(model: &str) -> String {
     best_match_model_name(&model, vl_model_names().into_iter(), default_vl_model())
 }
 
+pub(super) fn auto_subagent_model_for_agent(
+    agent: &AgentManifest,
+    description: &str,
+    prompt: &str,
+) -> String {
+    let difficulty = classify_subagent_task_difficulty(description, prompt);
+    let target_tier = merge_agent_tier_with_difficulty(agent_model_tier(agent), difficulty);
+    match target_tier {
+        ModelStrengthTier::Light => pick_subagent_model(
+            &["DEEPSEEK_V3", "KIMI", "GLM", "MINIMAX"],
+            false,
+        ),
+        ModelStrengthTier::Standard => pick_subagent_model(
+            &["QWEN_CODER_PLUS_LATEST", "GLM", "KIMI", "MINIMAX", "DEEPSEEK_V3"],
+            true,
+        ),
+        ModelStrengthTier::Heavy => pick_subagent_model(
+            &["QWEN3_MAX", "QWEN_CODER_PLUS_LATEST", "MINIMAX", "GLM", "KIMI"],
+            true,
+        ),
+    }
+}
+
+fn agent_model_tier(agent: &AgentManifest) -> ModelStrengthTier {
+    match agent.model_tier {
+        Some(AgentModelTier::Light) => ModelStrengthTier::Light,
+        Some(AgentModelTier::Standard) => ModelStrengthTier::Standard,
+        Some(AgentModelTier::Heavy) => ModelStrengthTier::Heavy,
+        None => ModelStrengthTier::Standard,
+    }
+}
+
+fn merge_agent_tier_with_difficulty(
+    base_tier: ModelStrengthTier,
+    difficulty: SubagentTaskDifficulty,
+) -> ModelStrengthTier {
+    match difficulty {
+        SubagentTaskDifficulty::Heavy => ModelStrengthTier::Heavy,
+        SubagentTaskDifficulty::Standard => base_tier,
+        SubagentTaskDifficulty::Light => match base_tier {
+            ModelStrengthTier::Heavy => ModelStrengthTier::Standard,
+            other => other,
+        },
+    }
+}
+
+fn classify_subagent_task_difficulty(
+    description: &str,
+    prompt: &str,
+) -> SubagentTaskDifficulty {
+    let combined = format!("{}\n{}", description.trim(), prompt.trim());
+    let lower = combined.to_lowercase();
+    let char_count = combined.chars().count();
+    let line_count = combined
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    let conjunction_hits = [
+        " and ", " then ", " after ", "同时", "然后", "并且", "接着", "最后",
+    ]
+    .iter()
+    .filter(|marker| lower.contains(**marker))
+    .count();
+    let complex_markers = [
+        "multi-step",
+        "end-to-end",
+        "across files",
+        "cross-file",
+        "debug",
+        "refactor",
+        "migrate",
+        "integrate",
+        "repair",
+        "fix failing",
+        "panic",
+        "compile error",
+        "test failure",
+        "run tests",
+        "implement a fix",
+        "implement fixes",
+        "implement the change",
+        "make code changes",
+        "architecture",
+        "design",
+        "复杂",
+        "端到端",
+        "跨文件",
+        "调试",
+        "排查",
+        "修复",
+        "重构",
+        "迁移",
+        "联调",
+        "实现修复",
+        "实现改动",
+        "跑测试",
+        "报错",
+    ];
+    let light_markers = [
+        "find",
+        "search",
+        "locate",
+        "where",
+        "list",
+        "summarize",
+        "show",
+        "identify",
+        "look up",
+        "read-only",
+        "read only",
+        "which file",
+        "which files",
+        "查找",
+        "定位",
+        "看看",
+        "看一下",
+        "列出",
+        "总结",
+        "只读",
+        "搜索",
+        "梳理位置",
+    ];
+
+    let heavy = char_count >= 360
+        || line_count >= 8
+        || conjunction_hits >= 2
+        || complex_markers.iter().any(|marker| lower.contains(marker));
+    if heavy {
+        return SubagentTaskDifficulty::Heavy;
+    }
+
+    let light = char_count <= 140
+        && line_count <= 4
+        && light_markers.iter().any(|marker| lower.contains(marker));
+    if light {
+        return SubagentTaskDifficulty::Light;
+    }
+
+    SubagentTaskDifficulty::Standard
+}
+
+fn pick_subagent_model(preferred_keys: &[&str], require_thinking: bool) -> String {
+    for key in preferred_keys {
+        if let Some(model) = model_names::find_by_key(key)
+            && subagent_model_eligible(model, require_thinking)
+        {
+            return model.name.clone();
+        }
+    }
+
+    for model in model_names::all() {
+        if subagent_model_eligible(model, require_thinking) {
+            return model.name.clone();
+        }
+    }
+
+    if require_thinking {
+        for model in model_names::all() {
+            if model.tools_default_enabled {
+                return model.name.clone();
+            }
+        }
+    }
+
+    default_model()
+}
+
+fn subagent_model_eligible(model: &ModelDef, require_thinking: bool) -> bool {
+    model.tools_default_enabled && (!require_thinking || model.enable_thinking)
+}
+
 fn best_match_model_name(
     input_lowercase: &str,
     candidates: impl Iterator<Item = String>,
@@ -140,4 +326,114 @@ fn levenshtein(left: &[u8], right: &[u8]) -> usize {
         std::mem::swap(&mut prev, &mut curr);
     }
     prev[right.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        agent_model_tier, auto_subagent_model_for_agent, classify_subagent_task_difficulty,
+        merge_agent_tier_with_difficulty, ModelStrengthTier, SubagentTaskDifficulty,
+    };
+    use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
+
+    fn manifest(name: &str, description: &str, model_tier: Option<AgentModelTier>) -> AgentManifest {
+        AgentManifest {
+            name: name.to_string(),
+            description: description.to_string(),
+            mode: AgentMode::Subagent,
+            model: None,
+            temperature: None,
+            max_steps: None,
+            prompt: String::new(),
+            system_prompt: None,
+            tools: Vec::new(),
+            tool_groups: Vec::new(),
+            mcp_servers: Vec::new(),
+            routing_tags: Vec::new(),
+            model_tier,
+            disabled: false,
+            hidden: false,
+            color: None,
+            source_path: None,
+        }
+    }
+
+    #[test]
+    fn light_subagent_tasks_use_light_tier() {
+        assert_eq!(
+            classify_subagent_task_difficulty(
+                "Locate task tool",
+                "Find where the task tool is implemented and summarize the file."
+            ),
+            SubagentTaskDifficulty::Light
+        );
+    }
+
+    #[test]
+    fn heavy_subagent_tasks_use_heavy_tier() {
+        assert_eq!(
+            classify_subagent_task_difficulty(
+                "Debug end-to-end failure",
+                "Investigate a failing build across multiple files, implement fixes, run tests, and summarize remaining risks."
+            ),
+            SubagentTaskDifficulty::Heavy
+        );
+    }
+
+    #[test]
+    fn heavy_subagent_model_prefers_tool_capable_thinking_model() {
+        let model = auto_subagent_model_for_agent(
+            &manifest(
+                "build",
+                "Autonomous execution agent",
+                Some(AgentModelTier::Heavy),
+            ),
+            "Debug end-to-end failure",
+            "Investigate a failing build across multiple files, implement fixes, run tests, and summarize remaining risks.",
+        );
+        let def = super::model_names::find_by_name(&model).expect("selected model must exist");
+        assert!(def.tools_default_enabled);
+        assert!(def.enable_thinking);
+    }
+
+    #[test]
+    fn explore_agents_default_to_light_tier() {
+        let agent = manifest(
+            "explore",
+            "Read-only codebase exploration agent",
+            Some(AgentModelTier::Light),
+        );
+        assert_eq!(agent_model_tier(&agent), ModelStrengthTier::Light);
+    }
+
+    #[test]
+    fn plan_agents_default_to_standard_tier() {
+        let agent = manifest(
+            "plan",
+            "Read-only planning and analysis agent",
+            Some(AgentModelTier::Standard),
+        );
+        assert_eq!(agent_model_tier(&agent), ModelStrengthTier::Standard);
+    }
+
+    #[test]
+    fn build_agents_default_to_heavy_tier() {
+        let agent = manifest(
+            "build",
+            "Autonomous execution and debugging agent",
+            Some(AgentModelTier::Heavy),
+        );
+        assert_eq!(agent_model_tier(&agent), ModelStrengthTier::Heavy);
+    }
+
+    #[test]
+    fn light_tasks_downgrade_heavy_agents_to_standard_tier() {
+        assert_eq!(
+            merge_agent_tier_with_difficulty(
+                ModelStrengthTier::Heavy,
+                SubagentTaskDifficulty::Light
+            ),
+            ModelStrengthTier::Standard
+        );
+    }
 }
