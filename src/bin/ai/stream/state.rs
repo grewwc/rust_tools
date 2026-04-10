@@ -2,6 +2,7 @@ use rust_tools::commonw::FastMap;
 
 use crate::ai::{
     request::StreamChunk,
+    theme::{ACCENT_MUTED, ACCENT_RULE, RESET},
     types::{FunctionCall, StreamResult, ToolCall},
 };
 
@@ -16,11 +17,9 @@ pub(super) struct StreamMarkers {
 
 impl StreamMarkers {
     pub(super) fn new() -> Self {
-        use colored::Colorize;
-
         Self {
-            thinking_tag: "<thinking>".yellow().to_string(),
-            end_thinking_tag: "<end thinking>".yellow().to_string(),
+            thinking_tag: format!("{ACCENT_RULE}╭─{RESET} {ACCENT_MUTED}thinking{RESET}"),
+            end_thinking_tag: format!("{ACCENT_RULE}╰─{RESET} {ACCENT_MUTED}done thinking{RESET}"),
             hidden_begin: "<meta:self_note>",
             hidden_end: "</meta:self_note>",
         }
@@ -30,6 +29,10 @@ impl StreamMarkers {
 pub(super) struct StreamProcessingState {
     pub(super) thinking_open: bool,
     pub(super) markdown: MarkdownStreamRenderer,
+    pub(super) waiting_hint_active: bool,
+    pub(super) waiting_hint_buffering: bool,
+    pub(super) empty_choice_chunks: usize,
+    pub(super) saw_reasoning_output: bool,
     pub(super) tool_calls_map: FastMap<usize, ToolCallBuilder>,
     pub(super) assistant_text: String,
     pub(super) hidden_meta: String,
@@ -48,6 +51,10 @@ impl StreamProcessingState {
         Self {
             thinking_open: false,
             markdown: MarkdownStreamRenderer::new(),
+            waiting_hint_active: false,
+            waiting_hint_buffering: false,
+            empty_choice_chunks: 0,
+            saw_reasoning_output: false,
             tool_calls_map: FastMap::default(),
             assistant_text: String::new(),
             hidden_meta: String::new(),

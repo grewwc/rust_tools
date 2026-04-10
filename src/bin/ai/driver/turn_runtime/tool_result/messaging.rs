@@ -1,4 +1,3 @@
-use colored::Colorize;
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap};
 
@@ -7,7 +6,10 @@ use crate::ai::{
         CodeDiscoveryRecord, classify_finding, confidence_label, kind_label, persistence_limit,
         priority_for_confidence, render_record, should_persist,
     },
-    driver::{print::print_tool_output_block, tools::ExecuteToolCallsResult},
+    driver::{
+        print::{format_tool_header, print_tool_output_block},
+        tools::ExecuteToolCallsResult,
+    },
     history::{Message, ROLE_INTERNAL_NOTE, is_system_like_role},
     types::ToolCall,
     types::App,
@@ -92,11 +94,7 @@ pub(super) fn append_cached_tool_results_note(
 }
 
 pub(super) fn print_tool_result_preview(tool_name: &str, prepared: &PreparedToolResult) {
-    println!(
-        "\n{} {}",
-        "[Tool]".bright_green().bold(),
-        tool_name.bright_cyan().bold()
-    );
+    println!("\n{}", format_tool_header(tool_name));
     print_tool_output_block(&prepared.content_for_terminal);
 }
 

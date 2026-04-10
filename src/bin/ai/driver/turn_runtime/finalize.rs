@@ -1,7 +1,7 @@
 use colored::Colorize;
 use serde_json::Value;
 use crate::ai::{
-    driver::reflection,
+    driver::{print::format_empty_state, reflection},
     history::Message,
     types::App,
 };
@@ -134,7 +134,7 @@ pub(super) async fn finalize_turn(
         println!();
         maybe_spawn_critic_revise_background(app, question, final_assistant_text);
     } else {
-        println!("{}", "(no response)".dimmed());
+        println!("{}", format_empty_state("no response"));
     }
 
     Ok(if should_quit {

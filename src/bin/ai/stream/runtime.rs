@@ -1,10 +1,12 @@
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::time::Duration;
 
-use colored::Colorize;
-
 use crate::ai::{
+    driver::print::format_section_header,
+    models,
+    provider::ApiProvider,
     request::StreamChunk,
+    theme::{ACCENT_MUTED, ACCENT_RULE, DIM, RESET},
     types::{App, StreamOutcome, StreamResult, ToolCall, take_stream_cancelled},
 };
 
@@ -28,6 +30,10 @@ pub(super) async fn stream_response(
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
+
+    if should_show_opencode_waiting_hint(app) {
+        print_waiting_hint(&mut state)?;
+    }
 
     while !app.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         if let Some(result) = immediate_cancel_result(app, state.thinking_open) {
@@ -54,6 +60,51 @@ pub(super) async fn stream_response(
     }
 
     finalize_stream_response(app, &markers, state)
+}
+
+fn should_show_opencode_waiting_hint(app: &App) -> bool {
+    io::stdout().is_terminal() && models::model_provider(&app.current_model) == ApiProvider::OpenCode
+}
+
+fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
+    if state.waiting_hint_active {
+        return Ok(());
+    }
+    println!(
+        "{}",
+        format_section_header("stream", Some("waiting for first visible chunk from provider..."))
+    );
+    io::stdout().flush()?;
+    state.waiting_hint_active = true;
+    Ok(())
+}
+
+fn upgrade_waiting_hint_for_buffering(state: &mut StreamProcessingState) -> io::Result<()> {
+    if !state.waiting_hint_active || state.waiting_hint_buffering {
+        return Ok(());
+    }
+    print!("\x1b[1A\r\x1b[2K");
+    println!(
+        "{}",
+        format_section_header(
+            "stream",
+            Some("provider is alive but buffering visible output; text may arrive in one block...")
+        )
+    );
+    io::stdout().flush()?;
+    state.waiting_hint_buffering = true;
+    Ok(())
+}
+
+fn clear_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
+    if !state.waiting_hint_active {
+        return Ok(());
+    }
+    print!("\x1b[1A\r\x1b[2K");
+    io::stdout().flush()?;
+    state.waiting_hint_active = false;
+    state.waiting_hint_buffering = false;
+    Ok(())
 }
 
 fn immediate_cancel_result(app: &App, thinking_open: bool) -> Option<StreamResult> {
@@ -174,12 +225,14 @@ fn finalize_stream_response(
     markers: &StreamMarkers,
     mut state: StreamProcessingState,
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
+    clear_waiting_hint(&mut state)?;
+
     if state.thinking_open {
         write_stream_content(
             &format!("\n{}\n", markers.end_thinking_tag),
             app.writer.as_mut(),
             &mut state.markdown,
-            true,
+            false,
         )?;
     }
 
@@ -253,7 +306,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
             &format!("\n{}\n", markers.end_thinking_tag),
             app.writer.as_mut(),
             &mut state.markdown,
-            true,
+            false,
         );
         print!("\x1b[0m");
         let _ = io::stdout().flush();
@@ -278,17 +331,19 @@ fn ensure_tool_calls_section_open(
         return;
     }
 
+    let _ = clear_waiting_hint(state);
+
     if state.thinking_open {
         let _ = write_stream_content(
             &format!("\n{}\n", markers.end_thinking_tag),
             app.writer.as_mut(),
             &mut state.markdown,
-            true,
+            false,
         );
         state.thinking_open = false;
     }
     let _ = state.markdown.flush_pending();
-    println!("\n{}", "[Tool Calls]".yellow());
+    println!("\n{}", format_section_header("tool calls", None));
     state.printed_tool_calls_header = true;
 }
 
@@ -328,7 +383,10 @@ fn process_external_tool_calls_delta(
                     println!("\x1b[0m)");
                 }
                 state.current_printing_index = Some(index);
-                print!("  - {}(\x1b[2m", builder.function_name.cyan());
+                print!(
+                    "  {}│{} {}{}{}({}",
+                    ACCENT_RULE, RESET, ACCENT_MUTED, builder.function_name, RESET, DIM
+                );
                 let _ = io::stdout().flush();
                 print!("{}", builder.arguments);
                 let _ = io::stdout().flush();
@@ -416,8 +474,13 @@ fn process_internal_tool_calls(
         }
 
         print!(
-            "  - {}(\x1b[2m{}\x1b[0m)",
-            builder.function_name.cyan(),
+            "  {}│{} {}{}{}({}{}\x1b[0m)",
+            ACCENT_RULE,
+            RESET,
+            ACCENT_MUTED,
+            builder.function_name,
+            RESET,
+            DIM,
             builder.arguments
         );
         println!();
@@ -437,6 +500,8 @@ fn commit_visible_content(
     if content.is_empty() {
         return Ok(());
     }
+
+    clear_waiting_hint(state)?;
 
     write_stream_content(
         content.as_str(),
@@ -501,8 +566,21 @@ fn process_stream_line(
         ParsedStreamPayload::Chunk(chunk) => chunk,
     };
 
+    if chunk.choices.is_empty() {
+        state.empty_choice_chunks += 1;
+        if should_show_opencode_waiting_hint(app) && state.empty_choice_chunks >= 3 {
+            let _ = upgrade_waiting_hint_for_buffering(state);
+        }
+        return Ok(false);
+    }
+
+    state.empty_choice_chunks = 0;
+
     let mut reached_finish_reason = false;
     if let Some(choice) = chunk.choices.first() {
+        if !choice.delta.reasoning_content.is_empty() {
+            state.saw_reasoning_output = true;
+        }
         reached_finish_reason = choice.finish_reason.is_some();
     }
 
@@ -546,7 +624,7 @@ fn write_stream_content(
         io::stdout().flush()?;
     } else {
         if dimmed {
-            print!("{}", content.dimmed());
+            print!("{DIM}{content}{RESET}");
         } else {
             print!("{content}");
         }

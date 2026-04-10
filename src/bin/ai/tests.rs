@@ -638,7 +638,7 @@ fn thinking_chunks_are_wrapped_once() {
     let mut thinking_open = false;
     let text =
         stream::extract_chunk_text(&chunk, "<thinking>", "<end thinking>", &mut thinking_open);
-    assert_eq!(text, "\n<thinking>\n\x1b[2mstep one");
+    assert_eq!(text, "\n<thinking>\nstep one");
     assert!(thinking_open);
 
     let chunk = StreamChunk {
@@ -653,7 +653,7 @@ fn thinking_chunks_are_wrapped_once() {
     };
     let text =
         stream::extract_chunk_text(&chunk, "<thinking>", "<end thinking>", &mut thinking_open);
-    assert_eq!(text, "\x1b[0m\n<end thinking>\nfinal");
+    assert_eq!(text, "\n<end thinking>\nfinal");
     assert!(!thinking_open);
 }
 
@@ -788,6 +788,26 @@ fn stream_chunk_accepts_null_content() {
     assert_eq!(parsed.choices.len(), 1);
     assert_eq!(parsed.choices[0].delta.content, "");
     assert_eq!(parsed.choices[0].delta.reasoning_content, "");
+}
+
+#[test]
+fn stream_chunk_accepts_reasoning_alias() {
+    // OpenCode/OpenRouter providers often stream reasoning under `delta.reasoning`.
+    let payload = r#"{"choices":[{"delta":{"content":"","reasoning":"step by step"}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.choices.len(), 1);
+    assert_eq!(parsed.choices[0].delta.content, "");
+    assert_eq!(parsed.choices[0].delta.reasoning_content, "step by step");
+}
+
+#[test]
+fn stream_chunk_accepts_reasoning_text_alias() {
+    // Some provider shims expose the same field as `delta.reasoning_text`.
+    let payload = r#"{"choices":[{"delta":{"content":"","reasoning_text":"step by step"}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.choices.len(), 1);
+    assert_eq!(parsed.choices[0].delta.content, "");
+    assert_eq!(parsed.choices[0].delta.reasoning_content, "step by step");
 }
 
 #[test]

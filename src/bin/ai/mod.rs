@@ -17,6 +17,7 @@ mod prompt;
 mod request;
 mod skills;
 mod stream;
+mod theme;
 mod tools;
 mod types;
 

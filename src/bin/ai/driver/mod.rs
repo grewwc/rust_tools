@@ -488,8 +488,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     if mcp_report.loaded {
         println!(
-            "[mcp] {} servers, {} tools (config: {})",
-            mcp_report.server_count, mcp_report.tool_count, mcp_report.config_path
+            "{}",
+            print::format_section_header(
+                "mcp",
+                Some(&format!(
+                    "{} servers, {} tools (config: {})",
+                    mcp_report.server_count, mcp_report.tool_count, mcp_report.config_path
+                ))
+            )
         );
     }
     run_loop(&mut app, &mut mcp_client, &skill_manifests, &mut agent_manifests).await

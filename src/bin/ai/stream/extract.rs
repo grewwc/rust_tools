@@ -30,17 +30,14 @@ pub(super) fn extract_chunk_text_with_tools(
         }
         if !*thinking_open {
             *thinking_open = true;
-            return (format!("\n{thinking_tag}\n\x1b[2m{cleaned}"), tool_calls);
+            return (format!("\n{thinking_tag}\n{cleaned}"), tool_calls);
         }
         return (cleaned, tool_calls);
     }
 
     if *thinking_open {
         *thinking_open = false;
-        return (
-            format!("\x1b[0m\n{end_thinking_tag}\n{}", delta.content),
-            Vec::new(),
-        );
+        return (format!("\n{end_thinking_tag}\n{}", delta.content), Vec::new());
     }
     (delta.content.clone(), Vec::new())
 }

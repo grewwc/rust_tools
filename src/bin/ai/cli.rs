@@ -279,6 +279,7 @@ pub(super) fn print_help() {
     println!("  ai.intent.model_path               local TF-IDF + LR intent model json");
     println!("  ai.agents.auto_route.enable        auto switch primary agent by turn intent (default: true)");
     println!("  ai.agents.auto_route.openclaw_min_chars  min chars before routing complex tasks to openclaw (default: 48)");
+    println!("  ai.model.thinking                 force enable thinking when the selected model supports it");
     println!("  ai.model.auto_thinking.enable      auto gate switch (default: true)");
     println!("  ai.model.auto_thinking.threshold   model gate confidence threshold (default: 0.7)");
 }

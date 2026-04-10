@@ -98,12 +98,10 @@
   {
     "key": "MINIMAX",
     "name": "MiniMax-M2.5",
-    "provider": "openai",
-    "endpoint": "https://openrouter.ai/api/v1/chat/completions",
-    "api_key_config_key": "openrouter.api_key",
+    "provider": "opencode",
     "quality_tier": "strong",
-    "is_vl": false,
-    "search_enabled": true,
+    "is_vl": true,
+    "search_enabled": false,
     "tools_default_enabled": true,
     "enable_thinking": true
   },
@@ -207,7 +205,7 @@
     "is_vl": false,
     "search_enabled": false,
     "tools_default_enabled": true,
-    "enable_thinking": false
+    "enable_thinking": true
   },
   {
     "key": "Nemotron 3 Super Free",
@@ -217,16 +215,36 @@
     "is_vl": false,
     "search_enabled": false,
     "tools_default_enabled": true,
-    "enable_thinking": false
+    "enable_thinking": true
   },
   {
     "key": "GPT 5.4 Pro",
     "name": "gpt-5.4-pro",
     "provider": "opencode",
     "quality_tier": "basic",
+    "is_vl": true,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": false
+  },
+  {
+    "key": "GLM 5.1",
+    "name": "glm-5.1",
+    "provider": "opencode",
+    "quality_tier": "strong",
     "is_vl": false,
     "search_enabled": false,
     "tools_default_enabled": true,
     "enable_thinking": false
+  },
+  {
+    "key": "Qwen3.6 Plus",
+    "name": "qwen3.6-plus",
+    "provider": "opencode",
+    "quality_tier": "strong",
+    "is_vl": true,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": true
   }
 ]

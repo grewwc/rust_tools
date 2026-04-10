@@ -55,7 +55,12 @@ pub(super) struct StreamChoice {
 pub(super) struct StreamDelta {
     #[serde(default, deserialize_with = "string_or_default")]
     pub(super) content: String,
-    #[serde(default, deserialize_with = "string_or_default")]
+    #[serde(
+        default,
+        alias = "reasoning",
+        alias = "reasoning_text",
+        deserialize_with = "string_or_default"
+    )]
     pub(super) reasoning_content: String,
     #[serde(default)]
     pub(super) tool_calls: Vec<StreamToolCall>,
@@ -143,6 +148,17 @@ const REQUEST_RETRY_MAX_MS: u64 = 4000;
 const DEFAULT_AUTO_THINKING_THRESHOLD: f64 = 0.7;
 const DEFAULT_CONTROL_MODEL: &str = "qwen3.5-flash";
 
+fn config_bool_is_true(value: Option<String>) -> bool {
+    value
+        .map(|v| v.trim().to_ascii_lowercase())
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn config_forces_thinking() -> bool {
+    let cfg = configw::get_all_config();
+    config_bool_is_true(cfg.get_opt(AiConfig::MODEL_THINKING))
+}
+
 fn endpoint_for_request_model(app: &App, model: &str) -> String {
     models::endpoint_for_model(model, &app.config.endpoint)
 }
@@ -223,14 +239,17 @@ pub(super) fn is_transient_error(err: &RequestError) -> bool {
 ///
 /// Decision order:
 /// 1. CLI `--thinking` flag always wins
-/// 2. If model doesn't support thinking, return false
-/// 3. If auto-thinking is disabled by config, return false
-/// 4. Auto-detect based on question complexity
+/// 2. Config `ai.model.thinking=true` forces thinking when the model supports it
+/// 3. If model doesn't support thinking, return false
+/// 4. If auto-thinking is disabled by config, return false
+/// 5. Auto-detect based on question complexity
 #[commonw::debug_measure_time("resolve_thinking")]
 async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool {
-    // CLI flag always wins
-    if app.cli.thinking {
-        return true;
+    let cfg = configw::get_all_config();
+    let force_thinking = app.cli.thinking || config_bool_is_true(cfg.get_opt(AiConfig::MODEL_THINKING));
+
+    if force_thinking {
+        return models::enable_thinking(model);
     }
 
     // Model must support thinking
@@ -239,7 +258,6 @@ async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool 
     }
 
     // Check config for auto-thinking override
-    let cfg = configw::get_all_config();
     let auto_enabled = cfg
         .get_opt(AiConfig::MODEL_AUTO_THINKING_ENABLE)
         .map(|v| !v.trim().eq_ignore_ascii_case("false"))
@@ -455,6 +473,7 @@ pub(super) async fn do_request_messages(
     let normalized_messages = normalize_messages_for_request(messages);
     let (tools_value, tool_choice) = agent_tools_for_request(app, model);
     let thinking_start = Instant::now();
+    let force_thinking_requested = app.cli.thinking || config_forces_thinking();
     let enable_thinking = resolve_thinking(app, model, &normalized_messages).await;
     crate::ai::agent_hang_debug!(
         "pre-fix",
@@ -466,6 +485,12 @@ pub(super) async fn do_request_messages(
             "elapsed_ms": thinking_start.elapsed().as_secs_f64() * 1000.0,
         },
     );
+    if force_thinking_requested && !enable_thinking {
+        eprintln!(
+            "[Info] thinking 已请求，但当前模型 `{}` 不支持 thinking；本轮将继续以普通模式输出。",
+            model
+        );
+    }
     let request_body = build_request_body(
         model,
         &normalized_messages,

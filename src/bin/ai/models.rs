@@ -752,4 +752,12 @@ mod tests {
         assert!(def.is_vl);
         assert_eq!(def.quality_tier, ModelQualityTier::Flagship);
     }
+
+    #[test]
+    fn gpt_5_4_pro_does_not_advertise_thinking_support() {
+        let def = super::model_names::find_by_name("gpt-5.4-pro")
+            .expect("gpt-5.4-pro model must exist");
+        assert_eq!(def.provider, ApiProvider::OpenCode);
+        assert!(!def.enable_thinking);
+    }
 }

@@ -1,5 +1,8 @@
 use std::io::{self, Write};
 
+use crate::ai::theme::{
+    ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS,
+};
 use crate::ai::stream::render::code::{
     MONOKAI_BG, MONOKAI_DIM, highlight_code_line, parse_code_block_language,
 };
@@ -368,19 +371,16 @@ impl MarkdownStreamRenderer {
             if self.in_code_block {
                 self.in_code_block = false;
                 self.code_block_lang = None;
-                // Bottom border for code block
-                let total = 40usize.max(self.code_line_number.to_string().len() + 4);
-                let border = "─".repeat(total);
                 let block_indent = std::mem::take(&mut self.code_block_indent);
-                return format!("{block_indent}{MONOKAI_BG}{MONOKAI_DIM}└{border}\x1b[0m\n");
+                let border = "─".repeat(22);
+                return format!("{block_indent}{MONOKAI_BG}{MONOKAI_DIM}╰{border}\x1b[0m\n");
             } else {
-                // Top border with language label
                 self.in_code_block = true;
                 self.code_block_indent = indent.to_string();
                 self.code_block_lang = parse_code_block_language(trimmed);
                 self.code_line_number = 0;
-                let lang = self.code_block_lang.as_deref().unwrap_or("");
-                return format!("{indent}{MONOKAI_BG}{MONOKAI_DIM}┌─ {lang}\x1b[0m\n");
+                let lang = self.code_block_lang.as_deref().unwrap_or("code");
+                return format!("{indent}{MONOKAI_BG}{MONOKAI_DIM}╭─ {lang}\x1b[0m\n");
             }
         }
 
@@ -413,15 +413,15 @@ impl MarkdownStreamRenderer {
                 return "\n".to_string();
             }
             let math = crate::ai::stream::render_math_tex_to_unicode(rest.trim_end());
-            return format!("{indent}{base}\x1b[95m{math}\x1b[0m\n");
+            return format!("{indent}{base}{ACCENT_SECONDARY}{math}\x1b[0m\n");
         }
 
         if let Some((level, title)) = parse_heading(trimmed) {
-            let (h_base, underline_char) = match level {
-                1 => ("\x1b[1m\x1b[35m", Some('═')),
-                2 => ("\x1b[1m\x1b[36m", Some('─')),
-                3 => ("\x1b[1m\x1b[34m", None),
-                _ => ("\x1b[1m\x1b[36m", None),
+            let (heading_style, underline_char, underline_style) = match level {
+                1 => ("\x1b[1m\x1b[38;2;191;219;254m", Some('━'), ACCENT_RULE),
+                2 => ("\x1b[1m\x1b[38;2;125;211;252m", Some('─'), ACCENT_RULE),
+                3 => ("\x1b[1m\x1b[38;2;165;180;252m", None, ACCENT_RULE),
+                _ => ("\x1b[1m\x1b[38;2;148;163;184m", None, ACCENT_RULE),
             };
             let mut out = String::new();
             if !self.bol {
@@ -430,8 +430,8 @@ impl MarkdownStreamRenderer {
             }
             out.push_str(indent);
             out.push_str(base);
-            out.push_str(h_base);
-            let combined_base = format!("{}{}", base, h_base);
+            out.push_str(heading_style);
+            let combined_base = format!("{}{}", base, heading_style);
             out.push_str(&render_inline_md(title, &combined_base));
             out.push_str("\x1b[0m\n");
 
@@ -439,23 +439,48 @@ impl MarkdownStreamRenderer {
                 let len = title.chars().count().clamp(3, 80);
                 out.push_str(indent);
                 out.push_str(base);
-                out.push_str("\x1b[2m\x1b[36m");
+                out.push_str("\x1b[2m");
+                out.push_str(underline_style);
                 out.push_str(&std::iter::repeat_n(ch, len).collect::<String>());
                 out.push_str("\x1b[0m\n");
             }
             return out;
         }
 
+        if is_thematic_break(trimmed) {
+            return format!("{indent}{base}{ACCENT_RULE}{}\x1b[0m\n", "─".repeat(28));
+        }
+
+        if let Some(body) = parse_blockquote(trimmed) {
+            return format!(
+                "{indent}{base}{ACCENT_MUTED}▍\x1b[0m {base}{}\n",
+                render_inline_md(body, base)
+            );
+        }
+
         if let Some((p_indent, prefix, checkbox, body)) = split_list_prefix(line) {
             let mut out = String::new();
             out.push_str(p_indent);
-            out.push_str(base);
-            out.push_str("\x1b[36m");
-            out.push_str(prefix);
-            out.push_str("\x1b[0m");
             if let Some(checked) = checkbox {
-                let mark = if checked { "✅ " } else { "⬜ " };
-                out.push_str(mark);
+                out.push_str(base);
+                if checked {
+                    out.push_str(ACCENT_SUCCESS);
+                    out.push('✓');
+                } else {
+                    out.push_str(ACCENT_MUTED);
+                    out.push('○');
+                }
+                out.push_str("\x1b[0m ");
+            } else if prefix.ends_with(". ") {
+                out.push_str(base);
+                out.push_str(ACCENT_MUTED);
+                out.push_str(prefix.trim_end());
+                out.push_str("\x1b[0m ");
+            } else {
+                out.push_str(base);
+                out.push_str(ACCENT_PRIMARY);
+                out.push('•');
+                out.push_str("\x1b[0m ");
             }
             out.push_str(&render_inline_md(body, base));
             out.push('\n');
@@ -482,6 +507,26 @@ fn parse_heading(line: &str) -> Option<(usize, &str)> {
         return None;
     }
     Some((i, line[i + 1..].trim_end()))
+}
+
+fn is_thematic_break(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.len() < 3 {
+        return false;
+    }
+    let mut chars = trimmed.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !matches!(first, '-' | '*' | '_') {
+        return false;
+    }
+    chars.all(|ch| ch == first)
+}
+
+fn parse_blockquote(line: &str) -> Option<&str> {
+    let body = line.strip_prefix("> ")?;
+    Some(body.trim_end())
 }
 
 fn split_list_prefix(line: &str) -> Option<(&str, &str, Option<bool>, &str)> {
@@ -590,5 +635,33 @@ mod tests {
 
         let visible = strip_ansi_for_test(&out);
         assert!(visible.starts_with("    1 │    let x = 1;"));
+    }
+
+    #[test]
+    fn task_list_uses_minimal_markers_instead_of_emoji() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+
+        let checked = renderer.consume_line("- [x] done", false);
+        let unchecked = renderer.consume_line("- [ ] todo", false);
+
+        let checked_visible = strip_ansi_for_test(&checked);
+        let unchecked_visible = strip_ansi_for_test(&unchecked);
+        assert!(checked_visible.contains("✓ done"));
+        assert!(unchecked_visible.contains("○ todo"));
+        assert!(!checked_visible.contains("✅"));
+        assert!(!unchecked_visible.contains("⬜"));
+    }
+
+    #[test]
+    fn blockquote_and_rule_render_with_cleaner_structure() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+
+        let quote = renderer.consume_line("> note", false);
+        let rule = renderer.consume_line("---", false);
+
+        let quote_visible = strip_ansi_for_test(&quote);
+        let rule_visible = strip_ansi_for_test(&rule);
+        assert!(quote_visible.contains("▍ note"));
+        assert!(rule_visible.contains(&"─".repeat(28)));
     }
 }
