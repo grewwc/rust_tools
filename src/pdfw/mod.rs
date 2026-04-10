@@ -592,7 +592,7 @@ fn decode_flate_image(stream: &lopdf::Stream) -> Option<DynamicImage> {
     }
 }
 
-fn ocr_image_to_text(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
+pub fn ocr_image_to_text(img: &DynamicImage, langs: &[&str]) -> Result<String, String> {
     #[cfg(target_os = "macos")]
     {
         macos_vision_ocr(img, langs)
