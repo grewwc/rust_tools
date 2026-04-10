@@ -8,21 +8,36 @@ use crate::commonw::{
 
 use super::{models, types::AppConfig};
 
-const QWEN_ENDPOINT: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
-
 pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     let cfg = configw::get_all_config();
     let api_key = cfg.get_opt("api_key").unwrap_or_default();
-    if api_key.trim().is_empty() {
-        println!("set api_key in ~/.configW");
+    let openrouter_api_key = cfg
+        .get_opt(AiConfig::MODEL_OPENROUTER_API_KEY)
+        .unwrap_or_default();
+    let compatible_api_key = cfg
+        .get_opt(AiConfig::MODEL_COMPATIBLE_API_KEY)
+        .unwrap_or_default();
+    let aliyun_api_key = cfg.get_opt(AiConfig::MODEL_ALIYUN_API_KEY).unwrap_or_default();
+    let openai_api_key = cfg.get_opt(AiConfig::MODEL_OPENAI_API_KEY).unwrap_or_default();
+    let endpoint = cfg
+        .get_opt(AiConfig::MODEL_ENDPOINT)
+        .unwrap_or_default();
+    let default_model =
+        models::determine_model(&cfg.get_opt(AiConfig::MODEL_DEFAULT).unwrap_or_default());
+    let default_endpoint = models::endpoint_for_model(&default_model, &endpoint);
+    if api_key.trim().is_empty()
+        && openrouter_api_key.trim().is_empty()
+        && compatible_api_key.trim().is_empty()
+        && aliyun_api_key.trim().is_empty()
+        && openai_api_key.trim().is_empty()
+        && !models::endpoint_supports_anonymous_auth(&default_endpoint)
+    {
+        println!("set api_key / openrouter.api_key / compatible.api_key / aliyun.api_key / openai.api_key in ~/.configW");
         std::process::exit(0);
     }
     let history_file = cfg
         .get_opt("history_file")
         .unwrap_or_else(|| "~/.history_file.sqlite".to_string());
-    let endpoint = cfg
-        .get_opt(AiConfig::MODEL_ENDPOINT)
-        .unwrap_or_else(|| QWEN_ENDPOINT.to_string());
     let vl_default_model =
         models::determine_vl_model(&cfg.get_opt(AiConfig::MODEL_VL_DEFAULT).unwrap_or_default());
     let history_max_chars = cfg

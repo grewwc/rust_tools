@@ -64,6 +64,7 @@ mod tests {
             writer: None,
             prompt_editor: None,
             agent_context: None,
+            agent_reload_counter: None,
         }
     }
 

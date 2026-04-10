@@ -14,6 +14,11 @@ pub struct AiConfig;
 impl AiConfig {
     // ── Model ──────────────────────────────────────────────
     pub const MODEL_ENDPOINT: &str = "ai.model.endpoint";
+    pub const MODEL_API_KEY: &str = "api_key";
+    pub const MODEL_OPENROUTER_API_KEY: &str = "openrouter.api_key";
+    pub const MODEL_COMPATIBLE_API_KEY: &str = "compatible.api_key";
+    pub const MODEL_ALIYUN_API_KEY: &str = "aliyun.api_key";
+    pub const MODEL_OPENAI_API_KEY: &str = "openai.api_key";
     pub const MODEL_DEFAULT: &str = "ai.model.default";
     pub const MODEL_VL_DEFAULT: &str = "ai.model.vl_default";
     pub const MODEL_THINKING: &str = "ai.model.thinking";

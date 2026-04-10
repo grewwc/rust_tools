@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::ai::{
     driver::{
         drain_response, input,
-        print::print_assistant_banner,
+        print::print_assistant_banner_with_app,
         skill_runtime,
     },
     history::Message,
@@ -34,9 +34,13 @@ pub(super) async fn refresh_skill_turn_for_iteration(
     }
 
     let prev_skill = skill_turn.matched_skill_name().map(|s| s.to_string());
-    let new_skill_turn =
+    let inherited_restore = skill_turn.take_restore_agent_context();
+    let mut new_skill_turn =
         skill_runtime::prepare_skill_for_turn(app, mcp_client, skill_manifests, question)
             .await;
+    if inherited_restore.is_some() {
+        new_skill_turn.set_restore_agent_context(inherited_restore);
+    }
     let next_skill = new_skill_turn.matched_skill_name().map(|s| s.to_string());
 
     if prev_skill != next_skill {
@@ -235,7 +239,7 @@ async fn stream_model_response(
     current_history: &mut String,
     _iteration: usize,
 ) -> StreamResult {
-    print_assistant_banner();
+    print_assistant_banner_with_app(Some(app));
     let stream_result = match stream::stream_response(app, response, current_history).await {
         Ok(result) => result,
         Err(err) => {

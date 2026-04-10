@@ -9,9 +9,9 @@ use serde_json::Value;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
 
-const HTTP_TOOL_TIMEOUT: Duration = Duration::from_secs(10);
-const HTTP_SEARCH_TIMEOUT: Duration = Duration::from_secs(4);
-const HTTP_SEARCH_TOTAL_BUDGET: Duration = Duration::from_secs(12);
+const HTTP_TOOL_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
+const HTTP_SEARCH_TOTAL_BUDGET: Duration = Duration::from_secs(5);
 const MAX_SEARCH_RETRIES: usize = 2;
 const MAX_PUBLIC_SEARXNG_INSTANCES_PER_ATTEMPT: usize = 1;
 const DEFAULT_NUM_RESULTS: usize = 10;
@@ -92,7 +92,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "web_fetch",
-        description: "Fetch the content of an http/https URL (10s timeout, 512KB cap). Blocks localhost/private network targets. Set extract_content=true to auto-remove nav, script, style and return clean article text. Returns URL, status, content-type, and content.",
+        description: "Fetch the content of an http/https URL (5s timeout, 512KB cap). Blocks localhost/private network targets. Set extract_content=true to auto-remove nav, script, style and return clean article text. Returns URL, status, content-type, and content.",
         parameters: params_web_fetch,
         execute: execute_web_fetch,
         groups: &["builtin"],
@@ -192,6 +192,9 @@ fn search_with_retries(
     let deadline = started_at + HTTP_SEARCH_TOTAL_BUDGET;
 
     for attempt in 0..MAX_SEARCH_RETRIES {
+        if crate::ai::tools::registry::common::is_tool_cancel_requested() {
+            return Err("web_search canceled by user".to_string());
+        }
         if started_at.elapsed() >= HTTP_SEARCH_TOTAL_BUDGET {
             break;
         }
@@ -235,7 +238,9 @@ fn search_with_retries(
         // Exponential backoff before retry (except for last attempt)
         if attempt < MAX_SEARCH_RETRIES - 1 && started_at.elapsed() < HTTP_SEARCH_TOTAL_BUDGET {
             let delay_ms = [100u64, 200, 400].get(attempt).copied().unwrap_or(400);
-            std::thread::sleep(Duration::from_millis(delay_ms));
+            if sleep_interruptibly(Duration::from_millis(delay_ms)) {
+                return Err("web_search canceled by user".to_string());
+            }
         }
     }
 
@@ -243,6 +248,18 @@ fn search_with_retries(
         "All search methods failed within {:?}. Last error: {}",
         HTTP_SEARCH_TOTAL_BUDGET, last_error
     ))
+}
+
+fn sleep_interruptibly(delay: Duration) -> bool {
+    let started_at = std::time::Instant::now();
+    while started_at.elapsed() < delay {
+        if crate::ai::tools::registry::common::is_tool_cancel_requested() {
+            return true;
+        }
+        let remaining = delay.saturating_sub(started_at.elapsed());
+        std::thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+    false
 }
 
 /// Run all search sources in parallel and return the first successful non-empty result.

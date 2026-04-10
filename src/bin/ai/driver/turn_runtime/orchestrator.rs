@@ -86,6 +86,7 @@ pub(in crate::ai::driver) async fn run_turn(
         .await?;
         match handle_iteration_execution(
             app,
+            &question,
             mcp_client,
             execution,
             &mut messages,

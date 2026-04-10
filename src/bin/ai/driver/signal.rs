@@ -10,12 +10,15 @@ pub enum SigintAction {
 pub(in crate::ai) fn handle_sigint(shutdown: &AtomicBool, streaming: &AtomicBool, cancel_stream: &AtomicBool) {
     match sigint_action(shutdown, streaming, cancel_stream) {
         SigintAction::CancelStream => {
+            crate::ai::tools::registry::common::request_tool_cancel();
             cancel_stream.store(true, Ordering::Relaxed);
         }
         SigintAction::Shutdown => {
+            crate::ai::tools::registry::common::request_tool_cancel();
             shutdown.store(true, Ordering::Relaxed);
         }
         SigintAction::Exit => {
+            crate::ai::tools::registry::common::request_tool_cancel();
             shutdown.store(true, Ordering::Relaxed);
             #[cfg(unix)]
             unsafe {

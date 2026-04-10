@@ -1,5 +1,6 @@
 use rust_tools::commonw::FastMap;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rust_tools::cw::SkipMap;
 use serde_json::Value;
@@ -27,6 +28,20 @@ pub(crate) struct ToolRegistration {
 }
 
 inventory::collect!(ToolRegistration);
+
+static TOOL_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn request_tool_cancel() {
+    TOOL_CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn clear_tool_cancel() {
+    TOOL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+}
+
+pub(crate) fn is_tool_cancel_requested() -> bool {
+    TOOL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+}
 
 static TOOL_INDEX: LazyLock<FastMap<&'static str, &'static ToolSpec>> = LazyLock::new(|| {
     let mut index: FastMap<&'static str, &'static ToolSpec> = FastMap::default();

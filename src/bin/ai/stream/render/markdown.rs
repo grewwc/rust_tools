@@ -15,6 +15,7 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     tty: bool,
     enabled: bool,
     in_code_block: bool,
+    code_block_indent: String,
     code_block_lang: Option<String>,
     code_line_number: usize,
     in_math_block: bool,
@@ -37,6 +38,7 @@ impl MarkdownStreamRenderer {
             tty,
             enabled: true,
             in_code_block: false,
+            code_block_indent: String::new(),
             code_block_lang: None,
             code_line_number: 0,
             in_math_block: false,
@@ -369,10 +371,12 @@ impl MarkdownStreamRenderer {
                 // Bottom border for code block
                 let total = 40usize.max(self.code_line_number.to_string().len() + 4);
                 let border = "─".repeat(total);
-                return format!("{indent}{MONOKAI_BG}{MONOKAI_DIM}└{border}\x1b[0m\n");
+                let block_indent = std::mem::take(&mut self.code_block_indent);
+                return format!("{block_indent}{MONOKAI_BG}{MONOKAI_DIM}└{border}\x1b[0m\n");
             } else {
                 // Top border with language label
                 self.in_code_block = true;
+                self.code_block_indent = indent.to_string();
                 self.code_block_lang = parse_code_block_language(trimmed);
                 self.code_line_number = 0;
                 let lang = self.code_block_lang.as_deref().unwrap_or("");
@@ -384,13 +388,18 @@ impl MarkdownStreamRenderer {
             self.code_line_number += 1;
             let line_num = format!("{}", self.code_line_number);
             let line_num_str = format!("{:>3}", line_num);
-            if line.is_empty() {
-                return format!("{indent}{MONOKAI_BG}{MONOKAI_DIM}{} │\x1b[0m\n", line_num_str);
+            let block_indent = self.code_block_indent.as_str();
+            let code_text = line.strip_prefix(block_indent).unwrap_or(line);
+            if code_text.is_empty() {
+                return format!(
+                    "{block_indent}{MONOKAI_BG}{MONOKAI_DIM}{} │\x1b[0m\n",
+                    line_num_str
+                );
             }
             return format!(
-                "{indent}{MONOKAI_BG}{MONOKAI_DIM}{} │{base}{}\x1b[0m\n",
+                "{block_indent}{MONOKAI_BG}{MONOKAI_DIM}{} │{base}{}\x1b[0m\n",
                 line_num_str,
-                highlight_code_line(rest, self.code_block_lang.as_deref())
+                highlight_code_line(code_text, self.code_block_lang.as_deref())
             );
         }
 
@@ -514,6 +523,26 @@ fn split_list_prefix(line: &str) -> Option<(&str, &str, Option<bool>, &str)> {
 mod tests {
     use super::*;
 
+    fn strip_ansi_for_test(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\x1b' {
+                if chars.peek() == Some(&'[') {
+                    let _ = chars.next();
+                    while let Some(c) = chars.next() {
+                        if c == 'm' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            out.push(ch);
+        }
+        out
+    }
+
     #[test]
     fn consume_line_move_up_matches_preview_height() {
         unsafe { std::env::set_var("COLUMNS", "6") };
@@ -541,5 +570,25 @@ mod tests {
         let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
         let _ = renderer.consume_line("| Header A | Header B |", false);
         let _ = renderer.consume_line("Not a separator", false);
+    }
+
+    #[test]
+    fn code_block_keeps_inner_indentation_after_gutter() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let _ = renderer.consume_line("```rust", false);
+        let out = renderer.consume_line("    let x = 1;", false);
+
+        let visible = strip_ansi_for_test(&out);
+        assert!(visible.contains("│    let x = 1;"));
+    }
+
+    #[test]
+    fn code_block_nested_indent_is_stable() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let _ = renderer.consume_line("  ```rust", false);
+        let out = renderer.consume_line("      let x = 1;", false);
+
+        let visible = strip_ansi_for_test(&out);
+        assert!(visible.starts_with("    1 │    let x = 1;"));
     }
 }

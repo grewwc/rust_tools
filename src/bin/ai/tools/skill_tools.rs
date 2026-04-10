@@ -3,8 +3,130 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::ai::skills::SkillManifest;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
+
+fn params_discover_skills() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Optional substring filter applied to skill name, description, tool names, tool groups, MCP servers, and source path."
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of skills to return (default: 20, max: 100)."
+            },
+            "include_capabilities": {
+                "type": "boolean",
+                "description": "If true, include tool names, tool groups, and MCP servers for each skill."
+            }
+        }
+    })
+}
+
+fn skill_matches_query(skill: &SkillManifest, query: &str) -> bool {
+    if query.trim().is_empty() {
+        return true;
+    }
+    let query = query.to_ascii_lowercase();
+    skill.name.to_ascii_lowercase().contains(&query)
+        || skill.description.to_ascii_lowercase().contains(&query)
+        || skill
+            .tools
+            .iter()
+            .any(|item| item.to_ascii_lowercase().contains(&query))
+        || skill
+            .tool_groups
+            .iter()
+            .any(|item| item.to_ascii_lowercase().contains(&query))
+        || skill
+            .mcp_servers
+            .iter()
+            .any(|item| item.to_ascii_lowercase().contains(&query))
+        || skill
+            .source_path
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .contains(&query)
+}
+
+fn summarize_skill(skill: &SkillManifest, include_capabilities: bool) -> String {
+    let source = skill.source_path.as_deref().unwrap_or("unknown");
+    let mut line = format!(
+        "- {} | priority={} | source={}",
+        skill.name, skill.priority, source
+    );
+    if !skill.description.trim().is_empty() {
+        line.push_str(&format!(" | {}", skill.description.trim()));
+    }
+    if include_capabilities {
+        if !skill.tools.is_empty() {
+            line.push_str(&format!(" | tools={}", skill.tools.join(",")));
+        }
+        if !skill.tool_groups.is_empty() {
+            line.push_str(&format!(" | tool_groups={}", skill.tool_groups.join(",")));
+        }
+        if !skill.mcp_servers.is_empty() {
+            line.push_str(&format!(" | mcp_servers={}", skill.mcp_servers.join(",")));
+        }
+    }
+    line
+}
+
+pub(crate) fn execute_discover_skills(args: &Value) -> Result<String, String> {
+    let query = args["query"].as_str().unwrap_or("").trim();
+    let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
+    let include_capabilities = args["include_capabilities"].as_bool().unwrap_or(false);
+
+    let skills = crate::ai::skills::load_all_skills();
+    let filtered = skills
+        .into_iter()
+        .filter(|skill| skill_matches_query(skill, query))
+        .take(limit)
+        .collect::<Vec<_>>();
+    if filtered.is_empty() {
+        return Ok(if query.is_empty() {
+            "No skills are currently available.".to_string()
+        } else {
+            format!("No skills matched query '{}'.", query)
+        });
+    }
+
+    let mut lines = Vec::with_capacity(filtered.len() + 2);
+    if query.is_empty() {
+        lines.push(format!("{} skills available:", filtered.len()));
+    } else {
+        lines.push(format!(
+            "{} skills matched query '{}':",
+            filtered.len(),
+            query
+        ));
+    }
+    lines.extend(
+        filtered
+            .iter()
+            .map(|skill| summarize_skill(skill, include_capabilities)),
+    );
+    lines.push(
+        "This tool returns skill metadata only. Skill prompts stay unloaded until routing selects a skill."
+            .to_string(),
+    );
+    Ok(lines.join("\n"))
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "discover_skills",
+        description: "List available skills by metadata only. Use this to discover skill names, descriptions, priorities, and optional capability summaries without loading full skill prompts.",
+        parameters: params_discover_skills,
+        execute: execute_discover_skills,
+        groups: &["builtin", "core"],
+    }
+});
 
 fn params_save_skill() -> Value {
     serde_json::json!({
@@ -216,4 +338,33 @@ pub(crate) fn execute_save_skill(args: &Value) -> Result<String, String> {
         path.display(),
         name
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execute_discover_skills;
+
+    #[test]
+    fn discover_skills_returns_builtin_skill_metadata() {
+        let args = serde_json::json!({
+            "query": "debug",
+            "limit": 10
+        });
+        let out = execute_discover_skills(&args).unwrap();
+        assert!(out.contains("debugger"));
+        assert!(out.contains("metadata only"));
+        assert!(!out.contains("Skill enforcement"));
+    }
+
+    #[test]
+    fn discover_skills_can_include_capabilities() {
+        let args = serde_json::json!({
+            "query": "review",
+            "limit": 10,
+            "include_capabilities": true
+        });
+        let out = execute_discover_skills(&args).unwrap();
+        assert!(out.contains("code-review"));
+        assert!(out.contains("tools=") || out.contains("tool_groups="));
+    }
 }

@@ -6,7 +6,7 @@ use crate::ai::{
 pub fn try_handle_agent_command(
     app: &mut App,
     input: &str,
-    agent_manifests: &[AgentManifest],
+    agent_manifests: &mut Vec<AgentManifest>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -37,6 +37,7 @@ pub fn try_handle_agent_command(
             println!("  /agents current           show current agent");
             println!("  /agents use <name>        switch to an agent");
             println!("  /agents auto              restore automatic agent routing");
+            println!("  /agents reload            reload agents from disk (hot-discovery)");
             println!();
         }
         "list" | "ls" | "" => {
@@ -103,6 +104,19 @@ pub fn try_handle_agent_command(
                 );
             } else {
                 println!("Agent routing was already in auto mode.");
+            }
+        }
+        "reload" => {
+            let old_count = agent_manifests.len();
+            *agent_manifests = agents::load_all_agents();
+            let new_count = agent_manifests.len();
+            let delta = new_count as i64 - old_count as i64;
+            if delta > 0 {
+                println!("[Agent 发现] 重新扫描完成，新发现 {} 个 agent(s)，当前共 {} 个", delta, new_count);
+            } else if delta < 0 {
+                println!("[Agent 发现] 重新扫描完成，{} 个 agent 已移除，当前共 {} 个", -delta, new_count);
+            } else {
+                println!("[Agent 发现] 重新扫描完成，共 {} 个 agent (无变化)", new_count);
             }
         }
         "use" | "select" | "switch" => {

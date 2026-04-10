@@ -342,18 +342,38 @@ fn restore_tools(app: &mut App, saved_tools: Option<Vec<ToolDefinition>>) {
 
 pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Option<Value> {
     let cfg = configw::get_all_config();
-    let endpoint = cfg.get_opt("ai.model.endpoint")?;
-    let api_key = cfg.get_opt("api_key")?;
-    let body = json!({
-        "model": model,
-        "messages": messages,
-        "stream": false,
-        "enable_thinking": false
-    });
+    let endpoint =
+        crate::ai::models::endpoint_for_model(model, &cfg.get_opt("ai.model.endpoint").unwrap_or_default());
+    let api_key =
+        crate::ai::models::api_key_for_model(model, &cfg.get_opt("api_key").unwrap_or_default());
+    if api_key.trim().is_empty()
+        && !crate::ai::models::endpoint_supports_anonymous_auth(&endpoint)
+    {
+        return None;
+    }
+    let body = match crate::ai::models::model_provider(model) {
+        crate::ai::provider::ApiProvider::OpenAi => json!({
+            "model": model,
+            "messages": messages,
+            "stream": false
+        }),
+        crate::ai::provider::ApiProvider::Compatible => json!({
+            "model": model,
+            "messages": messages,
+            "stream": false,
+            "enable_thinking": false
+        }),
+    };
     let client = reqwest::Client::new();
-    let resp = client
-        .post(&endpoint)
-        .bearer_auth(api_key)
+    let req = client.post(&endpoint);
+    let req = if api_key.trim().is_empty()
+        && crate::ai::models::endpoint_supports_anonymous_auth(&endpoint)
+    {
+        req
+    } else {
+        req.bearer_auth(api_key)
+    };
+    let resp = req
         .header("Content-Type", "application/json")
         .json(&body)
         .send()

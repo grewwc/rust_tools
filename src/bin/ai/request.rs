@@ -109,6 +109,13 @@ impl RequestError {
         }
     }
 
+    fn cancelled(message: impl Into<String>) -> Self {
+        Self {
+            kind: RequestErrorKind::Network,
+            message: message.into(),
+        }
+    }
+
     fn status(status: StatusCode, body: String) -> Self {
         Self {
             kind: RequestErrorKind::Status(status),
@@ -136,6 +143,25 @@ const REQUEST_RETRY_MAX_MS: u64 = 4000;
 const DEFAULT_AUTO_THINKING_THRESHOLD: f64 = 0.7;
 const DEFAULT_CONTROL_MODEL: &str = "qwen3.5-flash";
 
+fn endpoint_for_request_model(app: &App, model: &str) -> String {
+    models::endpoint_for_model(model, &app.config.endpoint)
+}
+
+fn api_key_for_request_model(app: &App, model: &str) -> String {
+    models::api_key_for_model(model, &app.config.api_key)
+}
+
+fn apply_request_auth(
+    builder: reqwest::RequestBuilder,
+    endpoint: &str,
+    api_key: &str,
+) -> reqwest::RequestBuilder {
+    if api_key.trim().is_empty() && models::endpoint_supports_anonymous_auth(endpoint) {
+        return builder;
+    }
+    builder.bearer_auth(api_key)
+}
+
 fn should_retry_status(status: StatusCode) -> bool {
     status.as_u16() == 429 || status.is_server_error()
 }
@@ -148,6 +174,23 @@ fn retry_delay(attempt: usize) -> Duration {
     let shift = attempt.saturating_sub(1).min(4) as u32;
     let backoff = REQUEST_RETRY_BASE_MS.saturating_mul(1u64 << shift);
     Duration::from_millis(backoff.min(REQUEST_RETRY_MAX_MS))
+}
+
+fn should_abort_retry_wait(app: &App) -> bool {
+    app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
+        || app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+async fn sleep_with_cancel(app: &App, delay: Duration) -> bool {
+    let started_at = std::time::Instant::now();
+    while started_at.elapsed() < delay {
+        if should_abort_retry_wait(app) {
+            return true;
+        }
+        let remaining = delay.saturating_sub(started_at.elapsed());
+        tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+    }
+    should_abort_retry_wait(app)
 }
 
 fn control_model_for_aux_tasks(app: &App) -> String {
@@ -321,10 +364,9 @@ async fn decide_thinking_via_model(
         None,
     );
 
-    let response = app
-        .client
-        .post(&app.config.endpoint)
-        .bearer_auth(&app.config.api_key)
+    let endpoint = endpoint_for_request_model(app, &control_model);
+    let api_key = api_key_for_request_model(app, &control_model);
+    let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
@@ -435,10 +477,9 @@ pub(super) async fn do_request_messages(
     );
 
     for attempt in 1..=REQUEST_MAX_ATTEMPTS_429 {
-        let response = app
-            .client
-            .post(&app.config.endpoint)
-            .bearer_auth(&app.config.api_key)
+        let endpoint = endpoint_for_request_model(app, model);
+        let api_key = api_key_for_request_model(app, model);
+        let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
             .header("Content-Type", "application/json")
             .json(&request_body)
             .send()
@@ -481,7 +522,11 @@ pub(super) async fn do_request_messages(
                             max_attempts_for_status
                         );
                     }
-                    tokio::time::sleep(delay).await;
+                    if sleep_with_cancel(app, delay).await {
+                        return Err(RequestError::cancelled(
+                            "request canceled by user during retry wait",
+                        ));
+                    }
                     continue;
                 }
                 return Err(err);
@@ -498,7 +543,11 @@ pub(super) async fn do_request_messages(
                         attempt,
                         REQUEST_MAX_ATTEMPTS
                     );
-                    tokio::time::sleep(delay).await;
+                    if sleep_with_cancel(app, delay).await {
+                        return Err(RequestError::cancelled(
+                            "request canceled by user during retry wait",
+                        ));
+                    }
                     continue;
                 }
                 return Err(err);
@@ -639,10 +688,9 @@ Skills:
         None,
     );
 
-    let response = app
-        .client
-        .post(&app.config.endpoint)
-        .bearer_auth(&app.config.api_key)
+    let endpoint = endpoint_for_request_model(app, &control_model);
+    let api_key = api_key_for_request_model(app, &control_model);
+    let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send()
@@ -994,10 +1042,9 @@ pub async fn do_request_json(
     });
 
     for attempt in 1..=REQUEST_MAX_ATTEMPTS {
-        let response = app
-            .client
-            .post(&app.config.endpoint)
-            .bearer_auth(&app.config.api_key)
+        let endpoint = endpoint_for_request_model(app, model);
+        let api_key = api_key_for_request_model(app, model);
+        let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
             .header("Content-Type", "application/json")
             .json(&request_body)
             .send()
@@ -1014,7 +1061,11 @@ pub async fn do_request_json(
                 let err = RequestError::status(status, body);
                 if should_retry_status(status) && attempt < REQUEST_MAX_ATTEMPTS {
                     let delay = retry_delay(attempt);
-                    tokio::time::sleep(delay).await;
+                    if sleep_with_cancel(app, delay).await {
+                        return Err(Box::new(RequestError::cancelled(
+                            "request canceled by user during retry wait",
+                        )));
+                    }
                     continue;
                 }
                 return Err(err.into());
@@ -1022,7 +1073,11 @@ pub async fn do_request_json(
             Err(err) => {
                 if is_retryable_reqwest_error(&err) && attempt < REQUEST_MAX_ATTEMPTS {
                     let delay = retry_delay(attempt);
-                    tokio::time::sleep(delay).await;
+                    if sleep_with_cancel(app, delay).await {
+                        return Err(Box::new(RequestError::cancelled(
+                            "request canceled by user during retry wait",
+                        )));
+                    }
                     continue;
                 }
                 return Err(err.into());

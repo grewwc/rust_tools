@@ -14,6 +14,9 @@ static PENDING_MCP_ENABLE: LazyLock<Mutex<Vec<String>>> =
 static ACTIVE_TOOL_NAMES: LazyLock<Mutex<Vec<String>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
+static EXPLICIT_ENABLED_TOOL_NAMES: LazyLock<Mutex<Vec<String>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
 static AVAILABLE_MCP_TOOLS: LazyLock<Mutex<Vec<ToolDefinition>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -26,6 +29,33 @@ pub(crate) fn set_active_tool_names(names: Vec<String>) {
 pub(crate) fn set_available_mcp_tools(tools: Vec<ToolDefinition>) {
     if let Ok(mut guard) = AVAILABLE_MCP_TOOLS.lock() {
         *guard = tools;
+    }
+}
+
+pub(crate) fn explicit_enabled_tool_names() -> Vec<String> {
+    EXPLICIT_ENABLED_TOOL_NAMES
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default()
+}
+
+fn mark_explicitly_enabled_tools(names: &[String]) {
+    if names.is_empty() {
+        return;
+    }
+    if let Ok(mut guard) = EXPLICIT_ENABLED_TOOL_NAMES.lock() {
+        for name in names {
+            if !guard.contains(name) {
+                guard.push(name.clone());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_explicit_enabled_tool_names(names: Vec<String>) {
+    if let Ok(mut guard) = EXPLICIT_ENABLED_TOOL_NAMES.lock() {
+        *guard = names;
     }
 }
 
@@ -169,6 +199,11 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 })
                 .cloned()
                 .collect();
+            let explicitly_requested: Vec<String> = tool_names
+                .iter()
+                .filter(|n| !unknown.iter().any(|u| u == *n))
+                .cloned()
+                .collect();
             let to_enable: Vec<String> = tool_names
                 .into_iter()
                 .filter(|n| !active.iter().any(|a| a == n.as_str()))
@@ -191,6 +226,7 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                     }
                 }
             }
+            mark_explicitly_enabled_tools(&explicitly_requested);
             let mut msg = Vec::new();
             if !to_enable.is_empty() {
                 msg.push(format!(

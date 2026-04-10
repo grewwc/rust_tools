@@ -91,6 +91,7 @@ fn resolve_model_is_unicode_safe() {
         writer: None,
         prompt_editor: None,
         agent_context: None,
+        agent_reload_counter: None,
     };
 
     let mut question = "a 什么是rust的一个crate？".to_string();

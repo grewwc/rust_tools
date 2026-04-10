@@ -3,6 +3,12 @@ use super::cli::ParsedCli;
 use super::config_schema::AiConfig;
 use super::model_names::{self, ModelDef};
 use super::provider::{ApiProvider, ModelQualityTier};
+use crate::commonw::configw;
+
+const COMPATIBLE_DEFAULT_ENDPOINT: &str =
+    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+const OPENAI_DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
+const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 pub(super) fn is_vl_model(model: &str) -> bool {
     model_names::find_by_name(model)
@@ -32,6 +38,81 @@ pub(super) fn model_provider(model: &str) -> ApiProvider {
     model_names::find_by_name(model)
         .map(|m| m.provider)
         .unwrap_or_default()
+}
+
+fn default_endpoint_for_provider(provider: ApiProvider) -> &'static str {
+    match provider {
+        ApiProvider::Compatible => COMPATIBLE_DEFAULT_ENDPOINT,
+        ApiProvider::OpenAi => OPENAI_DEFAULT_ENDPOINT,
+    }
+}
+
+fn default_api_key_config_candidates(provider: ApiProvider) -> &'static [&'static str] {
+    match provider {
+        ApiProvider::Compatible => &[
+            AiConfig::MODEL_COMPATIBLE_API_KEY,
+            AiConfig::MODEL_ALIYUN_API_KEY,
+            AiConfig::MODEL_API_KEY,
+        ],
+        ApiProvider::OpenAi => &[
+            AiConfig::MODEL_OPENROUTER_API_KEY,
+            AiConfig::MODEL_OPENAI_API_KEY,
+            AiConfig::MODEL_API_KEY,
+        ],
+    }
+}
+
+pub(super) fn endpoint_for_model(model: &str, global_fallback: &str) -> String {
+    if let Some(endpoint) = model_names::find_by_name(model)
+        .and_then(|m| m.endpoint.as_deref())
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+    {
+        return endpoint.to_string();
+    }
+
+    let global_fallback = global_fallback.trim();
+    if !global_fallback.is_empty() {
+        return global_fallback.to_string();
+    }
+
+    default_endpoint_for_provider(model_provider(model)).to_string()
+}
+
+pub(super) fn api_key_for_model(model: &str, global_fallback: &str) -> String {
+    let cfg = configw::get_all_config();
+
+    if let Some(config_key) = model_names::find_by_name(model)
+        .and_then(|m| m.api_key_config_key.as_deref())
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        && let Some(value) = cfg
+            .get_opt(config_key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    {
+        return value;
+    }
+
+    for key in default_api_key_config_candidates(model_provider(model)) {
+        if let Some(value) = cfg
+            .get_opt(key)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            return value;
+        }
+    }
+
+    global_fallback.trim().to_string()
+}
+
+pub(super) fn endpoint_supports_anonymous_auth(endpoint: &str) -> bool {
+    let endpoint = endpoint.trim().to_ascii_lowercase();
+    endpoint.starts_with("http://127.0.0.1")
+        || endpoint.starts_with("http://localhost")
+        || endpoint.starts_with("http://0.0.0.0")
+        || endpoint.starts_with("http://[::1]")
 }
 
 pub(super) fn model_quality_tier(model: &str) -> ModelQualityTier {
@@ -92,6 +173,7 @@ pub(super) fn initial_model(cli: &ParsedCli) -> String {
     let cfg = crate::commonw::configw::get_all_config();
     cfg.get_opt(AiConfig::MODEL_DEFAULT)
         .filter(|v| !v.trim().is_empty())
+        .map(|v| determine_model(&v))
         .unwrap_or_else(default_model)
 }
 
@@ -99,6 +181,9 @@ pub(super) fn determine_model(model: &str) -> String {
     let raw = model.trim();
     if raw.is_empty() {
         return default_model();
+    }
+    if let Some(def) = super::model_names::find_by_key(raw) {
+        return def.name.as_str().to_owned();
     }
     if let Some(def) = model_names::find_by_name(raw) {
         return def.name.as_str().to_owned();
@@ -432,12 +517,15 @@ fn levenshtein(left: &[u8], right: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_model_tier, auto_subagent_model_for_agent, classify_subagent_task_difficulty,
-        default_model, default_vl_model, determine_model, determine_vl_model,
-        merge_agent_tier_with_difficulty, model_provider, model_quality_tier, ModelStrengthTier,
-        SubagentTaskDifficulty,
+        agent_model_tier, api_key_for_model, auto_subagent_model_for_agent,
+        classify_subagent_task_difficulty, default_model, default_vl_model, determine_model,
+        determine_vl_model, endpoint_for_model, initial_model, merge_agent_tier_with_difficulty,
+        endpoint_supports_anonymous_auth, model_provider, model_quality_tier, ModelStrengthTier, SubagentTaskDifficulty,
+        COMPATIBLE_DEFAULT_ENDPOINT, OPENROUTER_ENDPOINT,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
+    use crate::ai::cli::ParsedCli;
+    use crate::ai::config_schema::AiConfig;
     use crate::ai::provider::{ApiProvider, ModelQualityTier};
 
     fn manifest(name: &str, description: &str, model_tier: Option<AgentModelTier>) -> AgentManifest {
@@ -566,10 +654,66 @@ mod tests {
     }
 
     #[test]
+    fn model_keys_resolve_to_model_names() {
+        assert_eq!(determine_model("gemma-4"), "google/gemma-4-26b-a4b-it:free");
+    }
+
+    #[test]
+    fn initial_model_normalizes_configured_model_key() {
+        let mut cli = ParsedCli::default();
+        cli.model = None;
+        let model = initial_model(&cli);
+        if crate::commonw::configw::get_all_config()
+            .get_opt(AiConfig::MODEL_DEFAULT)
+            .as_deref()
+            == Some("gemma-4")
+        {
+            assert_eq!(model, "google/gemma-4-26b-a4b-it:free");
+        }
+    }
+
+    #[test]
     fn openai_model_entries_carry_provider_and_quality_tier() {
         let def = super::model_names::find_by_name("gpt-4o").expect("gpt-4o model must exist");
         assert_eq!(model_provider("gpt-4o"), def.provider);
         assert_eq!(model_quality_tier("gpt-4o"), def.quality_tier);
+    }
+
+    #[test]
+    fn endpoint_for_openai_model_prefers_model_config() {
+        let endpoint = endpoint_for_model("gpt-4o", "");
+        assert_eq!(endpoint, OPENROUTER_ENDPOINT);
+    }
+
+    #[test]
+    fn endpoint_for_compatible_model_prefers_model_config() {
+        let endpoint = endpoint_for_model("qwen3-max", "");
+        assert_eq!(endpoint, COMPATIBLE_DEFAULT_ENDPOINT);
+    }
+
+    #[test]
+    fn openai_model_entries_prefer_openai_api_key_config() {
+        let key = api_key_for_model("gpt-4o", "fallback-key");
+        assert!(!key.is_empty());
+    }
+
+    #[test]
+    fn openrouter_models_use_openrouter_endpoint_in_config() {
+        let endpoint = endpoint_for_model("deepseek-v3.2", "");
+        assert_eq!(endpoint, OPENROUTER_ENDPOINT);
+    }
+
+    #[test]
+    fn localhost_endpoint_supports_anonymous_auth() {
+        assert!(endpoint_supports_anonymous_auth(
+            "http://127.0.0.1:11434/v1/chat/completions"
+        ));
+        assert!(endpoint_supports_anonymous_auth(
+            "http://localhost:11434/v1/chat/completions"
+        ));
+        assert!(!endpoint_supports_anonymous_auth(
+            "https://openrouter.ai/api/v1/chat/completions"
+        ));
     }
 
     #[test]

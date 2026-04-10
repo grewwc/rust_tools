@@ -4,6 +4,8 @@ use crate::ai::{
     mcp::McpClient,
     types::{App, ToolCall},
 };
+use serde_json::Value;
+use std::collections::BTreeSet;
 
 use super::{
     messaging::{
@@ -19,6 +21,216 @@ use super::super::{
     MAX_TOOL_RESULT_INLINE_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
     types::{IterationExecution, PreparedToolResult, TurnLoopStep},
 };
+
+const TOOL_USE_CORRECTION_PREFIX: &str = "Tool-use correction:";
+
+fn turn_has_tool_use(turn_messages: &[Message]) -> bool {
+    turn_messages.iter().any(|message| {
+        message.role == "tool"
+            || message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| !calls.is_empty())
+    })
+}
+
+fn count_tool_use_corrections(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.role == "system")
+        .filter_map(|message| message.content.as_str())
+        .filter(|content| content.starts_with(TOOL_USE_CORRECTION_PREFIX))
+        .count()
+}
+
+fn available_tool_names(app: &App) -> BTreeSet<String> {
+    app.agent_context
+        .as_ref()
+        .map(|ctx| {
+            ctx.tools
+                .iter()
+                .map(|tool| tool.function.name.clone())
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn looks_time_sensitive_request(question: &str) -> bool {
+    let lower = question.to_ascii_lowercase();
+    [
+        "latest",
+        "current",
+        "today",
+        "now",
+        "weather",
+        "news",
+        "stock",
+        "sports",
+        "score",
+        "recent",
+        "release",
+        "今天",
+        "现在",
+        "最新",
+        "近期",
+        "实时",
+        "天气",
+        "新闻",
+        "股价",
+        "比分",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn looks_command_request(question: &str) -> bool {
+    let lower = question.to_ascii_lowercase();
+    [
+        "run ",
+        "build",
+        "test",
+        "compile",
+        "cargo ",
+        "npm ",
+        "pnpm ",
+        "yarn ",
+        "执行",
+        "运行",
+        "构建",
+        "测试",
+        "编译",
+        "跑一下",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn looks_edit_request(question: &str) -> bool {
+    let lower = question.to_ascii_lowercase();
+    [
+        "fix",
+        "modify",
+        "edit",
+        "update",
+        "refactor",
+        "implement",
+        "change",
+        "修复",
+        "修改",
+        "改一下",
+        "重构",
+        "实现",
+        "新增",
+        "添加",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn looks_repo_or_code_request(question: &str) -> bool {
+    let lower = question.to_ascii_lowercase();
+    [
+        ".rs",
+        ".py",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".java",
+        ".go",
+        "src/",
+        "cargo.toml",
+        "代码",
+        "函数",
+        "文件",
+        "配置",
+        "逻辑",
+        "报错",
+        "bug",
+        "stack trace",
+        "repo",
+        "repository",
+        "agent",
+        "symbol",
+        "class",
+        "method",
+        "why",
+        "检查一下代码",
+        "看看代码",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn tool_use_requirement_reason(question: &str, app: &App) -> Option<String> {
+    let available = available_tool_names(app);
+    if available.is_empty() {
+        return None;
+    }
+
+    if looks_time_sensitive_request(question) && available.contains("web_search") {
+        return Some(
+            "This request is time-sensitive. Call `web_search` before giving a final answer."
+                .to_string(),
+        );
+    }
+
+    if looks_command_request(question) && available.contains("execute_command") {
+        return Some(
+            "This request asks you to run, build, test, or reproduce behavior. Call `execute_command` before giving a final answer."
+                .to_string(),
+        );
+    }
+
+    if looks_edit_request(question)
+        && (available.contains("apply_patch")
+            || available.contains("write_file")
+            || available.contains("read_file")
+            || available.contains("read_file_lines"))
+    {
+        return Some(
+            "This request asks for code or file changes. Inspect the file with `read_file` / `read_file_lines`, then make the change with editing tools before giving a final answer."
+                .to_string(),
+        );
+    }
+
+    if looks_repo_or_code_request(question)
+        && (available.contains("code_search")
+            || available.contains("read_file")
+            || available.contains("read_file_lines"))
+    {
+        return Some(
+            "This request depends on repository code or file contents. Inspect the repo with `code_search` or file-read tools before giving a final answer."
+                .to_string(),
+        );
+    }
+
+    None
+}
+
+fn maybe_enqueue_tool_use_correction(
+    app: &App,
+    question: &str,
+    messages: &mut Vec<Message>,
+    turn_messages: &mut Vec<Message>,
+) -> bool {
+    if turn_has_tool_use(turn_messages) || count_tool_use_corrections(messages) >= 2 {
+        return false;
+    }
+    let Some(reason) = tool_use_requirement_reason(question, app) else {
+        return false;
+    };
+    let note = Message {
+        role: "system".to_string(),
+        content: Value::String(format!(
+            "{TOOL_USE_CORRECTION_PREFIX} {reason}\nCall at least one relevant tool in your next response. Do not give a final answer yet."
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+    };
+    messages.push(note.clone());
+    turn_messages.push(note);
+    true
+}
 
 pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
     app: &App,
@@ -130,6 +342,7 @@ fn handle_tool_call_round(
 
 pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     app: &App,
+    question: &str,
     mcp_client: &mut McpClient,
     execution: IterationExecution,
     messages: &mut Vec<Message>,
@@ -149,6 +362,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::FinalResponse(stream_result) => {
+            if maybe_enqueue_tool_use_correction(app, question, messages, turn_messages) {
+                return Ok(TurnLoopStep::Continue);
+            }
             record_final_stream_response(
                 app,
                 stream_result,
@@ -185,5 +401,100 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
 
             Ok(TurnLoopStep::Continue)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{
+        cli::ParsedCli,
+        types::{AgentContext, App, AppConfig, FunctionDefinition, ToolDefinition},
+    };
+    use rust_tools::commonw::FastMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    fn test_app_with_tools(tool_names: &[&str]) -> App {
+        App {
+            cli: ParsedCli::default(),
+            config: AppConfig {
+                api_key: String::new(),
+                history_file: PathBuf::new(),
+                endpoint: String::new(),
+                vl_default_model: String::new(),
+                history_max_chars: 0,
+                history_keep_last: 0,
+                history_summary_max_chars: 0,
+                intent_model: None,
+                intent_model_path: PathBuf::new(),
+            },
+            session_id: "test".to_string(),
+            session_history_file: PathBuf::new(),
+            client: reqwest::Client::builder().build().unwrap(),
+            current_model: String::new(),
+            current_agent: "build".to_string(),
+            current_agent_manifest: None,
+            pending_files: None,
+            pending_short_output: false,
+            attached_image_files: Vec::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            streaming: Arc::new(AtomicBool::new(false)),
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            ignore_next_prompt_interrupt: false,
+            writer: None,
+            prompt_editor: None,
+            agent_context: Some(AgentContext {
+                tools: tool_names
+                    .iter()
+                    .map(|name| ToolDefinition {
+                        tool_type: "function".to_string(),
+                        function: FunctionDefinition {
+                            name: (*name).to_string(),
+                            description: String::new(),
+                            parameters: serde_json::json!({}),
+                        },
+                    })
+                    .collect(),
+                mcp_servers: FastMap::default(),
+                max_iterations: 16,
+            }),
+            agent_reload_counter: None,
+        }
+    }
+
+    #[test]
+    fn tool_requirement_detects_time_sensitive_requests() {
+        let app = test_app_with_tools(&["web_search"]);
+        let reason = tool_use_requirement_reason("帮我查一下今天的天气", &app);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("web_search"));
+    }
+
+    #[test]
+    fn tool_requirement_detects_code_requests() {
+        let app = test_app_with_tools(&["code_search", "read_file"]);
+        let reason = tool_use_requirement_reason("帮我看一下 a.rs 这个 agent 为什么会报错", &app);
+        assert!(reason.is_some());
+        assert!(reason.unwrap().contains("code_search"));
+    }
+
+    #[test]
+    fn enqueue_tool_use_correction_only_happens_without_prior_tool_use() {
+        let app = test_app_with_tools(&["code_search"]);
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+        assert!(maybe_enqueue_tool_use_correction(
+            &app,
+            "帮我看一下 a.rs 这个 agent",
+            &mut messages,
+            &mut turn_messages,
+        ));
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0]
+            .content
+            .as_str()
+            .unwrap()
+            .starts_with(TOOL_USE_CORRECTION_PREFIX));
     }
 }

@@ -22,6 +22,13 @@ const HISTORY_PREVIEW_FULL_MAX_CHARS: usize = 320;
 const HISTORY_GREP_HIGHLIGHT_START: &str = "\x1b[1;93m";
 const HISTORY_GREP_HIGHLIGHT_END: &str = "\x1b[0m";
 
+fn print_history_help() {
+    println!(
+        "/history usage:\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history grep <keyword>  Search messages\n  /history export [path] Export to file\n  /history copy          Copy to clipboard\n  /history help            Show this help",
+        HISTORY_PREVIEW_DEFAULT_COUNT
+    );
+}
+
 /// Clear any pending input from stdin to prevent stray Enter keys
 /// from interrupting the next input prompt.
 pub(crate) fn clear_stdin_buffer() {
@@ -108,6 +115,7 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalCommand {
     ShowHistory(HistoryPreviewOptions),
+    HelpHistory,
     ExportHistory(HistoryPreviewOptions, Option<PathBuf>),
     CopyHistory(HistoryPreviewOptions),
 }
@@ -129,7 +137,17 @@ struct HistoryPreviewOptions {
     grep: Option<String>,
 }
 
-fn handle_local_command(app: &App, input: &str) -> Result<bool, Box<dyn Error>> {
+fn handle_local_command(app: &App, input: &str) -> io::Result<bool> {
+    match handle_local_command_inner(app, input) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            eprintln!("local command error: {e}");
+            Ok(false)
+        }
+    }
+}
+
+fn handle_local_command_inner(app: &App, input: &str) -> Result<bool, Box<dyn Error>> {
     let Some(command) = parse_local_command(input)? else {
         return Ok(false);
     };
@@ -137,6 +155,9 @@ fn handle_local_command(app: &App, input: &str) -> Result<bool, Box<dyn Error>> 
     match command {
         LocalCommand::ShowHistory(options) => {
             println!("{}", render_history_preview(app, options)?);
+        }
+        LocalCommand::HelpHistory => {
+            print_history_help();
         }
         LocalCommand::ExportHistory(options, output_path) => {
             let path = output_path.unwrap_or_else(|| default_history_export_path(app));
@@ -179,6 +200,7 @@ fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Bo
     let (options, action) = parse_history_preview_options(args)?;
     Ok(Some(match action {
         HistoryAction::Show => LocalCommand::ShowHistory(options),
+        HistoryAction::Help => LocalCommand::HelpHistory,
         HistoryAction::Export(path) => LocalCommand::ExportHistory(options, path.map(PathBuf::from)),
         HistoryAction::Copy => LocalCommand::CopyHistory(options),
     }))
@@ -187,6 +209,7 @@ fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Bo
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HistoryAction {
     Show,
+    Help,
     Export(Option<String>),
     Copy,
 }
@@ -240,6 +263,10 @@ fn parse_history_preview_options(
             }
             "copy" => {
                 action = HistoryAction::Copy;
+                break;
+            }
+            "help" => {
+                action = HistoryAction::Help;
                 break;
             }
             raw => {
@@ -712,6 +739,7 @@ mod tests {
             writer: None,
             prompt_editor: None,
             agent_context: None,
+            agent_reload_counter: None,
         }
     }
 

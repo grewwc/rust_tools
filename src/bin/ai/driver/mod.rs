@@ -111,6 +111,130 @@ fn contains_code_action_marker(question: &str) -> bool {
     .any(|marker| lower.contains(marker))
 }
 
+/// Extracts plain text content from a Message for context scoring.
+fn extract_text_from_message(msg: &crate::ai::history::Message) -> Option<String> {
+    use serde_json::Value;
+    match &msg.content {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(arr) => {
+            let parts: Vec<String> = arr.iter().filter_map(|part| {
+                if let Value::Object(obj) = part {
+                    if let Some(Value::String(s)) = obj.get("text") {
+                        return Some(s.clone());
+                    }
+                }
+                None
+            }).collect();
+            if parts.is_empty() { None } else { Some(parts.join(" ")) }
+        }
+        _ => None,
+    }
+}
+
+/// Computes a context-aware routing score for each candidate agent.
+/// Returns the best matching agent, or None if none qualifies.
+fn select_best_agent_by_context<'a>(
+    agent_manifests: &'a [AgentManifest],
+    question: &str,
+    history: &[crate::ai::history::Message],
+) -> Option<&'a AgentManifest> {
+    let question_lower = question.to_lowercase();
+
+    let mut best: Option<&AgentManifest> = None;
+    let mut best_score: f64 = 0.0;
+
+    for agent in agent_manifests.iter() {
+        if !agent.is_primary() || agent.disabled || agent.hidden {
+            continue;
+        }
+
+        let score = score_agent_for_question(agent, &question_lower, history);
+        if score > best_score {
+            best_score = score;
+            best = Some(agent);
+        }
+    }
+
+    // Only switch if the score exceeds a minimum threshold
+    if best_score >= 5.0 {
+        best
+    } else {
+        None
+    }
+}
+
+/// Scores a single agent for the given question and conversation history.
+fn score_agent_for_question(
+    agent: &AgentManifest,
+    question_lower: &str,
+    history: &[crate::ai::history::Message],
+) -> f64 {
+    let mut score = 0.0;
+
+    // 1. Direct name mention in the question (highest signal)
+    let agent_name_lower = agent.name.to_lowercase();
+    if question_lower.contains(&agent_name_lower) {
+        score += 20.0;
+    }
+
+    // 2. Routing tags matching question keywords
+    for tag in agent.routing_tags_normalized() {
+        if question_lower.contains(&tag) {
+            score += 3.0;
+        }
+    }
+
+    // 3. Description keyword match
+    let desc_lower = agent.description.to_lowercase();
+    for word in question_lower.split_whitespace().filter(|w| w.len() >= 3) {
+        if desc_lower.contains(word) {
+            score += 1.5;
+        }
+    }
+
+    // 4. Context carry-over: if recent conversation was about the same agent's
+    //    domain, give a bonus
+    if !history.is_empty() {
+        let recent_entries: Vec<_> = history.iter().rev().take(4).collect();
+        for entry in recent_entries {
+            if let Some(text) = extract_text_from_message(entry) {
+                let entry_lower = text.to_lowercase();
+                let agent_name_lower = agent.name.to_lowercase();
+                if entry_lower.contains(&agent_name_lower) {
+                    score += 2.0;
+                }
+                let desc_lower = agent.description.to_lowercase();
+                for word in entry_lower.split_whitespace().filter(|w| w.len() >= 4) {
+                    if desc_lower.contains(word) {
+                        score += 0.5;
+                    }
+                }
+            }
+        }
+    }
+
+    // 5. Model tier alignment: prefer lightweight agents for simple queries
+    let word_count = question_lower.split_whitespace().count();
+    if word_count <= 5
+        && agent
+            .model_tier
+            .as_ref()
+            .is_some_and(|t| matches!(t, agents::AgentModelTier::Light))
+    {
+        score += 2.0;
+    }
+    if word_count >= 20
+        && agent
+            .model_tier
+            .as_ref()
+            .is_some_and(|t| matches!(t, agents::AgentModelTier::Heavy))
+    {
+        score += 2.0;
+    }
+
+    score
+}
+
 fn should_auto_route_to_openclaw(
     intent: &intent_recognition::UserIntent,
     question: &str,
@@ -148,17 +272,45 @@ fn maybe_auto_route_agent(
 
     let intent =
         intent_recognition::detect_intent_with_model_path(question, &app.config.intent_model_path);
-    let target_agent_name = if should_auto_route_to_openclaw(&intent, question) {
-        "openclaw"
+
+    // Phase 1: Legacy hardcoded routing (openclaw vs build) for backward compatibility
+    let legacy_target = if should_auto_route_to_openclaw(&intent, question) {
+        Some("openclaw")
     } else {
-        "build"
+        None
+    };
+
+    // Phase 2: Context-aware routing using agent routing_tags and conversation history
+    let history_entries = read_recent_history(app);
+    let context_target = select_best_agent_by_context(agent_manifests, question, &history_entries);
+
+    // Phase 3: Resolve final target — context-aware routing takes precedence
+    // unless the legacy hard-coded routing explicitly triggers openclaw
+    let target_agent_name: String = if let Some(name) = legacy_target {
+        // Legacy openclaw trigger wins only if no better context match exists
+        // with a significantly higher score
+        if let Some(ctx_agent) = context_target {
+            if ctx_agent.name == name || ctx_agent.name == "openclaw" {
+                name.to_string()
+            } else {
+                // Let context-aware routing decide
+                ctx_agent.name.clone()
+            }
+        } else {
+            name.to_string()
+        }
+    } else if let Some(ctx_agent) = context_target {
+        ctx_agent.name.clone()
+    } else {
+        // Fallback: stay on current agent
+        app.current_agent.clone()
     };
 
     if app.current_agent == target_agent_name {
         return;
     }
 
-    let Some(agent) = agents::find_agent_by_name(agent_manifests, target_agent_name) else {
+    let Some(agent) = agents::find_agent_by_name(agent_manifests, &target_agent_name) else {
         return;
     };
     if !agent.is_primary() || agent.disabled {
@@ -167,10 +319,49 @@ fn maybe_auto_route_agent(
 
     let old_agent = app.current_agent.clone();
     activate_primary_agent(app, agent);
+
+    // Determine switch reason for logging
+    let reason = if legacy_target.is_some() && legacy_target.unwrap() == target_agent_name {
+        "complex-execution"
+    } else if let Some(ctx) = context_target {
+        if ctx.name == target_agent_name {
+            "context-match"
+        } else {
+            "unknown"
+        }
+    } else {
+        "fallback"
+    };
+
     println!(
-        "[agent auto-routed: {} -> {}]",
-        old_agent, app.current_agent
+        "\n[Agent 自动切换: {} → {}] (原因: {})\n",
+        old_agent, app.current_agent, reason
     );
+}
+
+/// Reads the most recent conversation history entries for the current session.
+/// Used by context-aware routing to understand what the conversation has been about.
+fn read_recent_history(app: &App) -> Vec<crate::ai::history::Message> {
+    use crate::ai::history::build_message_arr;
+    match build_message_arr(usize::MAX, &app.session_history_file) {
+        Ok(entries) => entries.into_iter().rev().take(10).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Loads all agents fresh from disk, enabling hot-reload of newly added/modified agents.
+/// Returns the updated manifests.
+fn reload_agent_manifests(agent_manifests: &mut Vec<AgentManifest>) {
+    let new_agents = agents::load_all_agents();
+    if new_agents.len() != agent_manifests.len() {
+        let added = new_agents.len() as i64 - agent_manifests.len() as i64;
+        if added > 0 {
+            println!("[Agent 发现] 新发现 {} 个 agent(s)，已自动加载", added);
+        } else {
+            println!("[Agent 发现] agent 列表已更新，共 {} 个", new_agents.len());
+        }
+        *agent_manifests = new_agents;
+    }
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -246,6 +437,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             ..Default::default()
         }),
+        agent_reload_counter: None,
     };
 
     let mut mcp_client = McpClient::new();
@@ -265,7 +457,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let agent_manifests = agents::load_all_agents();
+    let mut agent_manifests = agents::load_all_agents();
     if app.cli.list_agents {
         commands::help::print_agents_list(&agent_manifests);
         return Ok(());
@@ -300,14 +492,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             mcp_report.server_count, mcp_report.tool_count, mcp_report.config_path
         );
     }
-    run_loop(&mut app, &mut mcp_client, &skill_manifests, &agent_manifests).await
+    run_loop(&mut app, &mut mcp_client, &skill_manifests, &mut agent_manifests).await
 }
 
 async fn run_loop(
     app: &mut App,
     mcp_client: &mut McpClient,
     skill_manifests: &[SkillManifest],
-    agent_manifests: &[AgentManifest],
+    agent_manifests: &mut Vec<AgentManifest>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let one_shot_mode = !app.cli.args.is_empty();
     let mut should_quit = one_shot_mode;
@@ -329,6 +521,16 @@ async fn run_loop(
     };
 
     loop {
+        // Agent hot-discovery: check for new agents every 5 turns
+        if let Some(counter) = app.agent_reload_counter.as_mut() {
+            *counter += 1;
+            if *counter % 5 == 0 {
+                reload_agent_manifests(agent_manifests);
+            }
+        } else {
+            app.agent_reload_counter = Some(0);
+        }
+
         if app.shutdown.load(Ordering::Relaxed) {
             cleanup_one_shot(app);
             return Ok(());
@@ -349,11 +551,12 @@ async fn run_loop(
             }
             continue;
         }
-        maybe_auto_route_agent(app, agent_manifests, &question);
+        maybe_auto_route_agent(app, &*agent_manifests, &question);
         let next_model = resolve_model_for_input(app, &mut question);
         app.current_model = next_model.clone();
 
         app.cancel_stream.store(false, Ordering::Relaxed);
+        crate::ai::tools::registry::common::clear_tool_cancel();
         let turn_outcome = match turn_runtime::run_turn(
             app,
             mcp_client,

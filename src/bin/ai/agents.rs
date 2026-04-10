@@ -22,6 +22,10 @@ const BUILTIN_AGENTS: &[(&str, &str)] = &[
         "explore.agent",
         include_str!("builtin_agents/explore.agent"),
     ),
+    (
+        "prompt-skill.agent",
+        include_str!("builtin_agents/prompt-skill.agent"),
+    ),
 ];
 
 /// Categorizes an agent's role: `Primary` for main conversation,
@@ -122,43 +126,112 @@ impl AgentManifest {
     }
 }
 
+/// Discovery level for an agent, used to determine precedence.
+/// Higher priority levels override lower ones when agents share the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum DiscoveryLevel {
+    /// Built-in agents shipped with the binary
+    Builtin = 0,
+    /// Global user-level agents (~/.config/rust_tools/agents/)
+    User = 1,
+    /// Workspace-level agents (from config)
+    Workspace = 2,
+    /// Project-level agents (.agents/ or agents/ near cwd)
+    Project = 3,
+}
+
 /// Loads all builtin and user-defined agents, merging them by name
-/// (user agents override builtins) and sorting primaries first.
+/// with precedence: project > workspace > user > builtin.
 pub(super) fn load_all_agents() -> Vec<AgentManifest> {
     let dir = agents_dir();
     let _ = ensure_seeded_agents_dir(&dir);
-    let mut by_name: Box<SkipMap<String, AgentManifest>> =
-        SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
+    let mut by_name: Box<SkipMap<String, (DiscoveryLevel, AgentManifest)>> =
+        SkipMap::new(32, |a: &String, b: &String| a.cmp(b) as i32);
 
+    // Level 0: Built-in agents (lowest precedence)
     for (filename, content) in BUILTIN_AGENTS {
         if let Ok(mut agent) = parse_agent_front_matter(content) {
             agent.source_path = Some(format!("builtin:{filename}"));
-            by_name.insert(agent.name.clone(), agent);
+            by_name.insert(agent.name.clone(), (DiscoveryLevel::Builtin, agent));
         }
     }
 
-    for agent in load_agents_from_dir(&dir) {
-        if let Some(existing) = by_name.get_ref(&agent.name)
-            && existing
-                .source_path
-                .as_deref()
-                .is_some_and(|p| p.starts_with("builtin:"))
-        {
-            continue;
+    // Level 1: User-level agents from config dir
+    for agent in load_agents_from_dir_with_level(&dir, DiscoveryLevel::User) {
+        let should_insert = match by_name.get_ref(&agent.name) {
+            Some((level, _)) => DiscoveryLevel::User > *level,
+            None => true,
+        };
+        if should_insert {
+            by_name.insert(agent.name.clone(), (DiscoveryLevel::User, agent));
         }
-        by_name.insert(agent.name.clone(), agent);
     }
 
-    let mut out = (&*by_name)
+    // Level 2: Workspace-level agents
+    if let Some(ref ws_dir) = workspace_agents_dir() {
+        for agent in load_agents_from_dir_with_level(ws_dir, DiscoveryLevel::Workspace) {
+            let should_insert = match by_name.get_ref(&agent.name) {
+                Some((level, _)) => DiscoveryLevel::Workspace > *level,
+                None => true,
+            };
+            if should_insert {
+                by_name.insert(agent.name.clone(), (DiscoveryLevel::Workspace, agent));
+            }
+        }
+    }
+
+    // Level 3: Project-level agents (highest precedence)
+    for project_dir in discover_project_dirs() {
+        for agent in load_agents_from_dir_with_level(&project_dir, DiscoveryLevel::Project) {
+            let should_insert = match by_name.get_ref(&agent.name) {
+                Some((level, _)) => DiscoveryLevel::Project > *level,
+                None => true,
+            };
+            if should_insert {
+                by_name.insert(agent.name.clone(), (DiscoveryLevel::Project, agent));
+            }
+        }
+    }
+
+    let mut out: Vec<AgentManifest> = (&*by_name)
         .into_iter()
-        .map(|(_, v)| v.clone())
-        .collect::<Vec<_>>();
+        .map(|(_, (_, v))| v.clone())
+        .collect();
     out.sort_by(|a, b| {
         let primary_a = a.is_primary() as i32;
         let primary_b = b.is_primary() as i32;
         primary_b.cmp(&primary_a).then(a.name.cmp(&b.name))
     });
     out
+}
+
+/// Returns the workspace-level agents directory if configured.
+fn workspace_agents_dir() -> Option<PathBuf> {
+    let cfg = configw::get_all_config();
+    let raw = cfg.get_opt("ai.agents.workspace_dir")?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(expanduser(raw.trim()).as_ref()))
+}
+
+/// Discovers project-level agent directories.
+/// Looks for `.agents/` or `agents/` in the current working directory.
+fn discover_project_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Ok(cwd) = std::env::current_dir() {
+        let dot_agents = cwd.join(".agents");
+        if dot_agents.is_dir() {
+            dirs.push(dot_agents.clone());
+        }
+        let plain_agents = cwd.join("agents");
+        if plain_agents.is_dir() && plain_agents != dot_agents {
+            dirs.push(plain_agents);
+        }
+    }
+
+    dirs
 }
 
 /// Filters agents that can serve as primary agents, excluding
@@ -370,7 +443,9 @@ fn ensure_seeded_agents_dir(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn load_agents_from_dir(dir: &Path) -> Vec<AgentManifest> {
+/// Loads agents from a directory, annotated with the given discovery level.
+/// The level is used for logging and precedence resolution in `load_all_agents`.
+fn load_agents_from_dir_with_level(dir: &Path, level: DiscoveryLevel) -> Vec<AgentManifest> {
     let mut out = Vec::new();
     let Ok(rd) = std::fs::read_dir(dir) else {
         return out;
@@ -396,7 +471,26 @@ fn load_agents_from_dir(dir: &Path) -> Vec<AgentManifest> {
             out.push(agent);
         }
     }
+    if !out.is_empty() {
+        let level_name = match level {
+            DiscoveryLevel::Builtin => "builtin",
+            DiscoveryLevel::User => "user",
+            DiscoveryLevel::Workspace => "workspace",
+            DiscoveryLevel::Project => "project",
+        };
+        eprintln!(
+            "[agent discovery] loaded {} agent(s) from {} ({})",
+            out.len(),
+            dir.display(),
+            level_name
+        );
+    }
     out
+}
+
+/// Legacy wrapper for backward compatibility.
+fn load_agents_from_dir(dir: &Path) -> Vec<AgentManifest> {
+    load_agents_from_dir_with_level(dir, DiscoveryLevel::User)
 }
 
 #[cfg(test)]

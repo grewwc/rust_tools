@@ -688,7 +688,7 @@ mod tests {
         let finding = RepoInspectionFinding {
             tool_name: "code_search".to_string(),
             rendered:
-                "- code_search(operation=find_calls, query=load_config) => call chain: main -> bootstrap -> load_config"
+                "- code_search(operation=structural, intent=find_calls, query=load_config) => call chain: main -> bootstrap -> load_config"
                     .to_string(),
             highlight: "call chain: main -> bootstrap -> load_config".to_string(),
         };

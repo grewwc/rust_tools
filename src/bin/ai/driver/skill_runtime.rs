@@ -6,6 +6,7 @@ use crate::ai::{
     types::{App, ToolDefinition},
 };
 use crate::commonw::configw;
+use std::collections::BTreeSet;
 use std::ptr::NonNull;
 use rust_tools::cw::SkipMap;
 use chrono::{DateTime, Utc};
@@ -44,6 +45,14 @@ impl SkillTurnGuard {
     pub(super) fn skip_recall_by_skill(&self) -> bool {
         self.skip_recall_by_skill
     }
+
+    pub(super) fn take_restore_agent_context(&mut self) -> Option<(Vec<ToolDef>, usize)> {
+        self.restore_agent_context.take()
+    }
+
+    pub(super) fn set_restore_agent_context(&mut self, restore: Option<(Vec<ToolDef>, usize)>) {
+        self.restore_agent_context = restore;
+    }
 }
 
 impl Drop for SkillTurnGuard {
@@ -66,7 +75,7 @@ fn activate_skill_context(
 ) -> Option<(Vec<ToolDef>, usize)> {
     let mut restore = None;
     if let Some(ctx) = app.agent_context.as_mut() {
-        let all_tools = reorder_tools_by_stats(builtin_tools, mcp_tools);
+        let all_tools = merge_with_runtime_enabled_tools(builtin_tools, mcp_tools, &ctx.tools);
         let names: Vec<String> = all_tools.iter().map(|t| t.function.name.clone()).collect();
         super::super::tools::enable_tools::set_active_tool_names(names);
         let prev_tools = std::mem::replace(&mut ctx.tools, all_tools);
@@ -76,16 +85,82 @@ fn activate_skill_context(
     restore
 }
 
+fn merge_with_runtime_enabled_tools(
+    builtin_tools: Vec<ToolDef>,
+    mcp_tools: Vec<ToolDef>,
+    current_tools: &[ToolDef],
+) -> Vec<ToolDef> {
+    let mut merged = reorder_tools_by_stats(builtin_tools, mcp_tools);
+    let explicit_enabled = super::super::tools::enable_tools::explicit_enabled_tool_names()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if explicit_enabled.is_empty() {
+        return merged;
+    }
+    let known_names: BTreeSet<String> = merged
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect();
+    let runtime_extra = current_tools
+        .iter()
+        .filter(|tool| explicit_enabled.contains(&tool.function.name))
+        .filter(|tool| !known_names.contains(&tool.function.name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if runtime_extra.is_empty() {
+        return merged;
+    }
+    merged.extend(runtime_extra);
+    rust_tools::sortw::stable_sort_by(&mut merged, |a, b| a.function.name.cmp(&b.function.name));
+    dedupe_tools_by_name(merged)
+}
+
+fn dedupe_tools_by_name(tools: Vec<ToolDef>) -> Vec<ToolDef> {
+    let mut seen = BTreeSet::new();
+    tools
+        .into_iter()
+        .filter(|tool| seen.insert(tool.function.name.clone()))
+        .collect()
+}
+
+fn required_discovery_tool_names() -> Vec<String> {
+    vec![
+        "enable_tools".to_string(),
+        "discover_skills".to_string(),
+    ]
+}
+
+fn ensure_required_discovery_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
+    let existing = tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .collect::<BTreeSet<_>>();
+    let missing = required_discovery_tool_names()
+        .into_iter()
+        .filter(|name| !existing.contains(name))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return dedupe_tools_by_name(tools);
+    }
+    let extra = super::super::tools::get_tool_definitions_by_names(&missing);
+    tools.extend(extra);
+    dedupe_tools_by_name(tools)
+}
+
 fn manifest_tool_definitions(
     tool_groups: &[String],
     tools: &[String],
 ) -> Option<Vec<ToolDef>> {
     if !tool_groups.is_empty() {
         let groups: Vec<&str> = tool_groups.iter().map(|s| s.as_str()).collect();
-        return Some(super::super::tools::tool_definitions_for_groups(&groups));
+        return Some(ensure_required_discovery_tools(
+            super::super::tools::tool_definitions_for_groups(&groups),
+        ));
     }
     if !tools.is_empty() {
-        return Some(super::super::tools::get_tool_definitions_by_names(tools));
+        return Some(ensure_required_discovery_tools(
+            super::super::tools::get_tool_definitions_by_names(tools),
+        ));
     }
     None
 }
@@ -118,7 +193,19 @@ fn builtin_tools_for_skill(
     {
         return tool_defs;
     }
-    super::super::tools::tool_definitions_for_groups(&["core"])
+    super::super::tools::tool_definitions_for_groups(&["builtin"])
+}
+
+fn available_tool_names(builtin_tools: &[ToolDef], mcp_tools: &[ToolDef]) -> BTreeSet<String> {
+    builtin_tools
+        .iter()
+        .chain(mcp_tools.iter())
+        .map(|tool| tool.function.name.clone())
+        .collect()
+}
+
+fn has_tool(available: &BTreeSet<String>, name: &str) -> bool {
+    available.contains(name)
 }
 
 fn reorder_tools_by_stats(mut builtin: Vec<ToolDef>, mut mcp: Vec<ToolDef>) -> Vec<ToolDef> {
@@ -227,7 +314,11 @@ fn mcp_tools_for_skill(
         .collect()
 }
 
-fn build_system_prompt(active_agent: Option<&AgentManifest>, skill: Option<&SkillManifest>) -> String {
+fn build_system_prompt(
+    active_agent: Option<&AgentManifest>,
+    skill: Option<&SkillManifest>,
+    available_tools: &BTreeSet<String>,
+) -> String {
     let mut system_prompt = "You are a helpful assistant.".to_string();
     if let Some(agent) = active_agent {
         let extra = agent.build_system_prompt();
@@ -247,20 +338,66 @@ fn build_system_prompt(active_agent: Option<&AgentManifest>, skill: Option<&Skil
         }
     }
 
+    if !available_tools.is_empty() {
+        let available = available_tools
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("Tool availability:\n- Only rely on tools that are actually available in this turn.\n- Available tools: ");
+        system_prompt.push_str(&available);
+        system_prompt.push('\n');
+    }
+
     system_prompt.push_str("\n\n");
-    system_prompt.push_str("Tool recovery mode:\n- If a tool call fails, read the error message and correct course before answering.\n- Prefer retrying with corrected arguments or switching to a more appropriate tool.\n- Do not repeat the exact same failing tool call unless the error indicates a transient retry is appropriate.\n- If a URL-based docs fetch tool says the URL is unsupported, switch to a search tool or ask for a supported docs URL instead of retrying the same call.\n- Only stop and ask the user when the error is ambiguous or missing required information.");
+    system_prompt.push_str("Tool recovery mode:\n- If a tool call fails, read the error message and correct course before answering.\n- Prefer retrying with corrected arguments or switching to a more appropriate tool.\n- Do not repeat the exact same failing tool call unless the error indicates a transient retry is appropriate.\n- If `code_search` returns only `No ...` style results, do not rerun the same request unchanged; broaden the scope, remove filters, change the operation, or use the fallback guidance returned by `code_search`.\n- If a URL-based docs fetch tool says the URL is unsupported, switch to a search tool or ask for a supported docs URL instead of retrying the same call.\n- Only stop and ask the user when the error is ambiguous or missing required information.");
     system_prompt.push_str("\n\n");
-    system_prompt.push_str("Code navigation policy:\n- ALWAYS use `code_search` as your FIRST tool when exploring code. Do NOT start with `read_file`, `read_file_lines`, `grep_search`, or `search_files`.\n- The only exception: use `read_file_lines` directly when you already know the exact file path AND line range from a previous `code_search` result.\n- When you need to find where a symbol is declared or used, use `code_search` with `workspace_symbol`, `go_to_definition`, or `find_references`.\n- When you need to find literal text, log messages, SQL fragments, config keys, or other exact content, use `code_search` with `text_search`.\n- For structural searches, use high-level `code_search` intents like `find_functions`, `find_classes`, `find_methods`, and `find_calls` before writing a raw tree-sitter query.\n- When structural results are too broad, add `name` to filter the `@name` capture or `contains_text` to filter by captured snippet text.\n- For call searches, you can further narrow matches with `call_kind`, `receiver`, and `qualified_name`.\n- Use raw `grep_search` ONLY as a last resort when `code_search` does not apply.\n- If a recent system note labeled `Current code-inspection working memory` is present, treat it as authoritative current-turn context and avoid re-reading the same file range or rerunning equivalent raw searches unless you need verification or a narrower slice.\n- If you have already used raw repo-inspection tools and are still locating code, you MUST switch to `code_search` immediately.");
-    system_prompt.push_str("\n\n");
-    system_prompt.push_str("File editing policy:\n- When modifying an existing file or document, DO NOT rewrite the whole file unless the user explicitly asks for a full rewrite or the change truly affects most of the file.\n- First inspect the relevant region with read_file or read_file_lines, then use apply_patch to make the smallest localized edit that preserves the surrounding content.\n- Use write_file mainly for creating new files or for deliberate full-file replacement.\n- This rule applies equally to prose documents, markdown notes, configuration files, and source code.");
-    system_prompt.push_str("\n\n");
-    system_prompt.push_str("Planning before acting:\n- For simple tasks (read a file, answer a question, run a single command, quick lookup), act directly — do NOT call the plan tool.\n- For complex tasks (multi-step refactoring, debugging across files, building a feature, investigating an unfamiliar codebase), call the `plan` tool first to create a step-by-step plan, then execute it step by step.\n- After each tool execution, review the result and adjust the plan if needed. You do not need to re-plan for minor adjustments.\n- A good rule of thumb: if the task requires 3+ tool calls across different tools/files, plan first.");
-    system_prompt.push_str("\n\n");
-    system_prompt.push_str("Knowledge base auto-check:\n- At the start of each conversation, briefly consider whether the user's request might benefit from checking the knowledge base.\n- If the request relates to past decisions, project context, preferences, or remembered information, use `knowledge_search` to look up relevant entries.\n- You do NOT need to check the knowledge base for every single query — only when the user's request seems to reference prior context, preferences, or accumulated knowledge.\n- Use `knowledge_list` to browse recent entries when the user asks \"what do you remember\" or similar.");
-    system_prompt.push_str("\n\n");
-    system_prompt.push_str("Semantic knowledge retrieval:\n- Use `knowledge_semantic_search` when keyword search doesn't find relevant results — it understands meaning, not just exact words.\n- For example, searching \"how to deploy\" can find entries about \"CI/CD pipeline\" even without matching keywords.\n- Use `knowledge_rebuild_index` to sync the vector index if it seems out of date.\n- The knowledge base supports both BM25 keyword search and vector semantic search, combined in hybrid mode.");
-    system_prompt.push_str("\n\n");
-    system_prompt.push_str("Web search policy:\n- For questions about real-time or time-sensitive information (weather, news, stock prices, sports scores, current events, recent developments, product releases), you MUST use the `web_search` tool to find up-to-date answers.\n- Do NOT attempt to answer time-sensitive questions from your training data alone, as the information is likely outdated or unknown.\n- Use `web_fetch` to retrieve detailed content from specific URLs when search results point to relevant pages.\n- If the user asks about anything that could have changed since your training cutoff, search first.");
+    system_prompt.push_str("Tool selection policy:\n- If the answer depends on code or repo contents and code/file tools are available, inspect with tools before concluding.\n- If the user asks you to modify files and editing tools are available, make the change with tools instead of only describing what to change.\n- If the user asks to run, build, test, or reproduce behavior and command tools are available, execute the relevant command instead of only suggesting it.\n- If a path, URL, symbol, or query is provided and there is a matching tool for that resource, prefer using the tool over guessing.");
+
+    if has_tool(available_tools, "enable_tools") {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("Tool discovery policy:\n- Do NOT assume every possible tool is already loaded for this turn.\n- When you need a capability that is not currently available, call `enable_tools(operation=list)` to discover additional tools, then `enable_tools(operation=enable, tools=[...])` to load only the tools you need.");
+    }
+
+    if has_tool(available_tools, "discover_skills") {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("Skill discovery policy:\n- Do NOT assume all skill prompts are already visible in this turn.\n- When you need to discover specialized skills, call `discover_skills` to inspect skill metadata only.\n- Use skill discovery to find relevant skill names and capabilities without loading every skill prompt into context.");
+    }
+
+    if has_tool(available_tools, "code_search") {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("Code navigation policy:\n- ALWAYS use `code_search` as your FIRST tool when exploring code. Do NOT start with `read_file`, `read_file_lines`, `grep_search`, or `search_files`.\n- The only exception: use `read_file_lines` directly when you already know the exact file path AND line range from a previous `code_search` result.\n- When you need to find where a symbol is declared or used, use `code_search` with `operation=workspace_symbol`, `operation=go_to_definition`, or `operation=find_references`.\n- When you need to find literal text, log messages, SQL fragments, config keys, or other exact content, use `code_search` with `operation=text_search`.\n- For structural searches, ALWAYS call `code_search` with `operation=structural` and set `intent` to one of `find_functions`, `find_classes`, `find_methods`, or `find_calls`.\n- Never send `find_functions`, `find_classes`, `find_methods`, or `find_calls` as the `operation` value; those belong in `intent`.\n- When structural results are too broad, add `name` to filter the `@name` capture or `contains_text` to filter by captured snippet text.\n- For call searches, you can further narrow matches with `call_kind`, `receiver`, and `qualified_name`.\n- Use raw `grep_search` ONLY as a last resort when `code_search` does not apply.\n- If a recent system note labeled `Current code-inspection working memory` is present, treat it as authoritative current-turn context and avoid re-reading the same file range or rerunning equivalent raw searches unless you need verification or a narrower slice.\n- If you have already used raw repo-inspection tools and are still locating code, you MUST switch to `code_search` immediately.");
+    }
+
+    if has_tool(available_tools, "read_file")
+        || has_tool(available_tools, "read_file_lines")
+        || has_tool(available_tools, "apply_patch")
+        || has_tool(available_tools, "write_file")
+    {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("File editing policy:\n- When modifying an existing file or document, DO NOT rewrite the whole file unless the user explicitly asks for a full rewrite or the change truly affects most of the file.\n- First inspect the relevant region with read_file or read_file_lines, then use apply_patch to make the smallest localized edit that preserves the surrounding content.\n- Use write_file mainly for creating new files or for deliberate full-file replacement.\n- This rule applies equally to prose documents, markdown notes, configuration files, and source code.");
+    }
+
+    if has_tool(available_tools, "plan") {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("Planning before acting:\n- For simple tasks (read a file, answer a question, run a single command, quick lookup), act directly — do NOT call the plan tool.\n- For complex tasks (multi-step refactoring, debugging across files, building a feature, investigating an unfamiliar codebase), call the `plan` tool first to create a step-by-step plan, then execute it step by step.\n- After each tool execution, review the result and adjust the plan if needed. You do not need to re-plan for minor adjustments.\n- A good rule of thumb: if the task requires 3+ tool calls across different tools/files, plan first.");
+    }
+
+    if has_tool(available_tools, "knowledge_search") || has_tool(available_tools, "knowledge_list") {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("Knowledge base auto-check:\n- At the start of each conversation, briefly consider whether the user's request might benefit from checking the knowledge base.\n- If the request relates to past decisions, project context, preferences, or remembered information, use `knowledge_search` to look up relevant entries.\n- You do NOT need to check the knowledge base for every single query — only when the user's request seems to reference prior context, preferences, or accumulated knowledge.\n- Use `knowledge_list` to browse recent entries when the user asks \"what do you remember\" or similar.");
+    }
+
+    if has_tool(available_tools, "knowledge_semantic_search") {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("Semantic knowledge retrieval:\n- Use `knowledge_semantic_search` when keyword search doesn't find relevant results — it understands meaning, not just exact words.\n- For example, searching \"how to deploy\" can find entries about \"CI/CD pipeline\" even without matching keywords.\n- Use `knowledge_rebuild_index` to sync the vector index if it seems out of date.\n- The knowledge base supports both BM25 keyword search and vector semantic search, combined in hybrid mode.");
+    }
+
+    if has_tool(available_tools, "web_search") || has_tool(available_tools, "web_fetch") {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("Web search policy:\n- For questions about real-time or time-sensitive information (weather, news, stock prices, sports scores, current events, recent developments, product releases), you MUST use the `web_search` tool to find up-to-date answers.\n- Do NOT attempt to answer time-sensitive questions from your training data alone, as the information is likely outdated or unknown.\n- Use `web_fetch` to retrieve detailed content from specific URLs when search results point to relevant pages.\n- If the user asks about anything that could have changed since your training cutoff, search first.");
+    }
     system_prompt
 }
 
@@ -397,7 +534,8 @@ pub(super) async fn prepare_skill_for_turn(
 
     let builtin_tools = builtin_tools_for_skill(prompt_optimizer_active, skill, active_agent.as_ref());
     let mcp_tools = mcp_tools_for_skill(mcp_client, prompt_optimizer_active, skill);
-    let system_prompt = build_system_prompt(active_agent.as_ref(), skill);
+    let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
+    let system_prompt = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
     let max_iterations = resolve_max_iterations(active_agent.as_ref(), openclaw_active);
     let restore_agent_context =
         activate_skill_context(app, builtin_tools, mcp_tools, max_iterations);
@@ -448,8 +586,14 @@ fn resolve_skill_selection<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_max_iterations, tool_uses_mcp_server};
+    use super::{
+        build_system_prompt, builtin_tools_for_skill, ensure_required_discovery_tools,
+        merge_with_runtime_enabled_tools, resolve_max_iterations, tool_uses_mcp_server,
+    };
     use crate::ai::agents::{AgentManifest, AgentMode};
+    use crate::ai::tools::enable_tools::set_explicit_enabled_tool_names;
+    use crate::ai::types::{FunctionDefinition, ToolDefinition};
+    use std::collections::BTreeSet;
 
     #[test]
     fn mcp_server_filter_matches_longest_server_name_prefix() {
@@ -485,5 +629,98 @@ mod tests {
         assert_eq!(resolve_max_iterations(Some(&agent), true), 17);
         assert_eq!(resolve_max_iterations(None, true), super::super::OPENCLAW_MAX_ITERATIONS);
         assert_eq!(resolve_max_iterations(None, false), super::super::DEFAULT_MAX_ITERATIONS);
+    }
+
+    #[test]
+    fn default_tools_include_builtin_web_and_knowledge_tools() {
+        let tools = builtin_tools_for_skill(false, None, None);
+        let names = tools
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert!(names.iter().any(|name| name == "web_search"));
+        assert!(names.iter().any(|name| name == "knowledge_search"));
+        assert!(names.iter().any(|name| name == "read_file"));
+    }
+
+    #[test]
+    fn system_prompt_only_mentions_tools_available_this_turn() {
+        let mut available = BTreeSet::new();
+        available.insert("code_search".to_string());
+        available.insert("read_file".to_string());
+        available.insert("apply_patch".to_string());
+        available.insert("enable_tools".to_string());
+        available.insert("discover_skills".to_string());
+
+        let prompt = build_system_prompt(None, None, &available);
+        assert!(prompt.contains("Available tools:"));
+        assert!(prompt.contains("Code navigation policy"));
+        assert!(prompt.contains("File editing policy"));
+        assert!(prompt.contains("Tool discovery policy"));
+        assert!(prompt.contains("Skill discovery policy"));
+        assert!(!prompt.contains("Web search policy"));
+        assert!(!prompt.contains("Knowledge base auto-check"));
+    }
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: String::new(),
+                parameters: serde_json::json!({}),
+            },
+        }
+    }
+
+    #[test]
+    fn runtime_enabled_tools_are_preserved_when_refreshing_context() {
+        set_explicit_enabled_tool_names(vec!["enable_tools".to_string(), "web_search".to_string()]);
+        let merged = merge_with_runtime_enabled_tools(
+            vec![tool("code_search"), tool("read_file")],
+            vec![],
+            &[tool("code_search"), tool("enable_tools"), tool("web_search")],
+        );
+        let names = merged
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"code_search".to_string()));
+        assert!(names.contains(&"enable_tools".to_string()));
+        assert!(names.contains(&"web_search".to_string()));
+        set_explicit_enabled_tool_names(Vec::new());
+    }
+
+    #[test]
+    fn non_explicit_skill_tools_do_not_leak_into_next_context() {
+        set_explicit_enabled_tool_names(vec!["web_search".to_string()]);
+        let merged = merge_with_runtime_enabled_tools(
+            vec![tool("code_search")],
+            vec![],
+            &[tool("code_search"), tool("apply_patch"), tool("web_search")],
+        );
+        let names = merged
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"code_search".to_string()));
+        assert!(names.contains(&"web_search".to_string()));
+        assert!(!names.contains(&"apply_patch".to_string()));
+        set_explicit_enabled_tool_names(Vec::new());
+    }
+
+    #[test]
+    fn explicit_tool_lists_keep_only_discovery_entry_available() {
+        let merged = ensure_required_discovery_tools(vec![tool("code_search")]);
+        let names = merged
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"enable_tools".to_string()));
+        assert!(names.contains(&"discover_skills".to_string()));
+        assert!(names.contains(&"code_search".to_string()));
+        assert!(!names.contains(&"plan".to_string()));
+        assert!(!names.contains(&"read_file".to_string()));
+        assert!(!names.contains(&"search_files".to_string()));
     }
 }

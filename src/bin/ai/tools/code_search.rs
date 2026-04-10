@@ -132,7 +132,7 @@ fn params_code_search() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "code_search",
-        description: "High-level code navigation and search tool. Prefer this before raw grep/read tools. Internally routes to LSP for symbol/definition/reference lookups, to search_files for file discovery, to built-in content scanning for full-text search, and to built-in tree-sitter AST search for structural matching. For structural searches, prefer high-level intents like find_functions or find_calls over raw queries, and use name / contains_text / call_kind / receiver / qualified_name to narrow large result sets. Example: operation=structural, intent=find_calls, call_kind=method_call, receiver=app.view, name=render.",
+        description: "High-level code navigation and search tool. Prefer this before raw grep/read tools. Internally routes to LSP for symbol/definition/reference lookups, to search_files for file discovery, to built-in content scanning for full-text search, and to built-in tree-sitter AST search for structural matching. For structural searches, set operation=structural and choose intent=find_functions|find_classes|find_methods|find_calls. Use name / contains_text / call_kind / receiver / qualified_name to narrow large result sets. Example: operation=structural, intent=find_calls, call_kind=method_call, receiver=app.view, name=render.",
         parameters: params_code_search,
         execute: execute_code_search,
         groups: &["builtin", "core"],
@@ -143,6 +143,13 @@ pub(crate) fn execute_code_search(args: &Value) -> Result<String, String> {
     let operation = args["operation"]
         .as_str()
         .ok_or("Missing 'operation' parameter")?;
+
+    if let Some(intent) = legacy_structural_intent(operation) {
+        let mut normalized = args.clone();
+        normalized["operation"] = Value::String("structural".to_string());
+        normalized["intent"] = Value::String(intent.to_string());
+        return execute_code_structural(&normalized);
+    }
 
     match operation {
         "find_file" => execute_code_find_file(args),
@@ -158,6 +165,160 @@ pub(crate) fn execute_code_search(args: &Value) -> Result<String, String> {
     }
 }
 
+fn legacy_structural_intent(operation: &str) -> Option<&'static str> {
+    match operation {
+        "find_functions" => Some("find_functions"),
+        "find_classes" => Some("find_classes"),
+        "find_methods" => Some("find_methods"),
+        "find_calls" => Some("find_calls"),
+        _ => None,
+    }
+}
+
+fn nonempty_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
+    args.get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn build_text_search_args(args: &Value, query: &str, forced_path: Option<&str>) -> Value {
+    let mut forwarded = serde_json::json!({
+        "operation": "text_search",
+        "query": query,
+    });
+
+    if let Some(path) = forced_path.filter(|value| !value.trim().is_empty()) {
+        forwarded["path"] = Value::String(path.to_string());
+    } else if let Some(file_path) = nonempty_str_arg(args, "file_path") {
+        forwarded["file_path"] = Value::String(file_path.to_string());
+    } else if let Some(path) = nonempty_str_arg(args, "path") {
+        forwarded["path"] = Value::String(path.to_string());
+    }
+
+    if let Some(file_pattern) = nonempty_str_arg(args, "file_pattern") {
+        forwarded["file_pattern"] = Value::String(file_pattern.to_string());
+    }
+    if let Some(case_sensitive) = args.get("case_sensitive").and_then(|value| value.as_bool()) {
+        forwarded["case_sensitive"] = Value::Bool(case_sensitive);
+    }
+    if let Some(is_regex) = args.get("is_regex").and_then(|value| value.as_bool()) {
+        forwarded["is_regex"] = Value::Bool(is_regex);
+    }
+
+    forwarded
+}
+
+fn render_guidance_lines(lines: &[String]) -> String {
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("guidance:\n");
+    for line in lines {
+        out.push_str("- ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+fn is_structural_no_match(result: &str) -> bool {
+    result.starts_with("No AST structural matches")
+        || result.starts_with("No supported source files found")
+}
+
+fn is_workspace_symbol_no_match(result: &str) -> bool {
+    result.starts_with("No symbols matching '")
+}
+
+fn derive_structural_fallback_query<'a>(args: &'a Value) -> Option<&'a str> {
+    nonempty_str_arg(args, "name")
+        .or_else(|| nonempty_str_arg(args, "contains_text"))
+        .or_else(|| {
+            if args.get("intent").and_then(|value| value.as_str()).is_some() {
+                nonempty_str_arg(args, "query")
+            } else {
+                None
+            }
+        })
+}
+
+fn structural_guidance(args: &Value, target: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut scope = format!("path={target}");
+    if let Some(file_path) = nonempty_str_arg(args, "file_path") {
+        scope = format!("file_path={file_path}");
+    }
+    if let Some(name) = nonempty_str_arg(args, "name") {
+        lines.push(format!(
+            "Remove or broaden the `name` filter, then retry `code_search(operation=structural, intent={}, {}, name={})` only if the narrower symbol name is still likely correct.",
+            nonempty_str_arg(args, "intent").unwrap_or("find_functions"),
+            scope,
+            name
+        ));
+    }
+    if let Some(query) = derive_structural_fallback_query(args) {
+        lines.push(format!(
+            "Use `code_search(operation=text_search, query={}, {})` to search by raw text when AST structure is too narrow.",
+            query, scope
+        ));
+    }
+    lines.push("If you need broader discovery, switch intent between `find_functions`, `find_methods`, `find_calls`, and `find_classes` instead of repeating the same request.".to_string());
+    lines
+}
+
+fn text_search_guidance(query: &str, target: &Path, file_pattern: Option<&str>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if file_pattern.is_some() {
+        lines.push("Remove or widen `file_pattern` if the current glob may be excluding the relevant files.".to_string());
+    }
+    lines.push(format!(
+        "Retry with `case_sensitive=false` if '{}' may appear with different casing.",
+        query
+    ));
+    lines.push(format!(
+        "If '{}' is a symbol or type name, try `code_search(operation=workspace_symbol, query={}, path={})` or `code_search(operation=structural, intent=find_functions, path={})`.",
+        query,
+        query,
+        target.display(),
+        target.display()
+    ));
+    lines
+}
+
+fn find_file_guidance(pattern: &str, path: &str) -> Vec<String> {
+    vec![
+        format!(
+            "Retry with a broader glob such as `**/*{pattern}*` if the exact filename is uncertain."
+        ),
+        format!(
+            "If '{}' is content rather than a filename, use `code_search(operation=text_search, query={}, path={})`.",
+            pattern, pattern, path
+        ),
+    ]
+}
+
+fn render_workspace_symbol_with_fallback(
+    args: &Value,
+    query: &str,
+    result: String,
+    fallback_path: &str,
+) -> Result<String, String> {
+    if !is_workspace_symbol_no_match(&result) {
+        return Ok(format!(
+            "code_search route=lsp operation=workspace_symbol\n{}",
+            result
+        ));
+    }
+
+    let fallback_args = build_text_search_args(args, query, Some(fallback_path));
+    let fallback = execute_code_text_search(&fallback_args)?;
+    Ok(format!(
+        "code_search route=lsp operation=workspace_symbol\nsummary: No workspace symbols matched '{}'; ran text_search fallback in '{}'.\n{}\n\nFallback content search:\n{}",
+        query, fallback_path, result, fallback
+    ))
+}
+
 fn execute_code_find_file(args: &Value) -> Result<String, String> {
     let pattern = args["pattern"]
         .as_str()
@@ -170,9 +331,14 @@ fn execute_code_find_file(args: &Value) -> Result<String, String> {
     });
     let result = execute_search_files(&forwarded)?;
     if result.trim().is_empty() {
+        let guidance = render_guidance_lines(&find_file_guidance(pattern, path));
         Ok(format!(
-            "code_search route=search_files operation=find_file\nNo files matched '{}' under '{}'.",
-            pattern, path
+            "code_search route=search_files operation=find_file\nsummary: No files matched '{}' under '{}'.\nNo files matched '{}' under '{}'.\n{}",
+            pattern,
+            path,
+            pattern,
+            path,
+            guidance
         ))
     } else {
         Ok(format!(
@@ -198,10 +364,18 @@ fn execute_code_text_search(args: &Value) -> Result<String, String> {
         case_sensitive,
     )?;
     if result.trim().is_empty() {
-        Ok(format!(
-            "code_search route=content_search operation=text_search\nNo text matches for '{}' under '{}'.",
+        let guidance = render_guidance_lines(&text_search_guidance(
             query,
-            target.display()
+            &target,
+            args["file_pattern"].as_str(),
+        ));
+        Ok(format!(
+            "code_search route=content_search operation=text_search\nsummary: No text matches for '{}' under '{}'.\nNo text matches for '{}' under '{}'.\n{}",
+            query,
+            target.display(),
+            query,
+            target.display(),
+            guidance
         ))
     } else {
         Ok(format!(
@@ -355,10 +529,8 @@ fn execute_code_workspace_symbol(args: &Value) -> Result<String, String> {
         "query": query,
     });
     let result = execute_lsp(&forwarded)?;
-    Ok(format!(
-        "code_search route=lsp operation=workspace_symbol\n{}",
-        result
-    ))
+    let fallback_path = args["path"].as_str().unwrap_or(".");
+    render_workspace_symbol_with_fallback(args, query, result, fallback_path)
 }
 
 fn execute_code_document_symbol(args: &Value) -> Result<String, String> {
@@ -442,9 +614,11 @@ fn fallback_lsp_to_workspace_symbol(
         "query": query,
     });
     let result = execute_lsp(&forwarded)?;
+    let fallback_path = args["path"].as_str().unwrap_or(".");
+    let rendered = render_workspace_symbol_with_fallback(args, query, result, fallback_path)?;
     Ok(format!(
-        "code_search route=lsp operation={} (fallback to workspace_symbol, file_path was not provided)\n{}",
-        original_operation, result
+        "{}\ncontext: original operation was '{}' and file_path was not provided.",
+        rendered, original_operation
     ))
 }
 
@@ -476,10 +650,31 @@ fn execute_code_structural(args: &Value) -> Result<String, String> {
             filters,
         )?
     };
-    Ok(format!(
-        "code_search route=tree_sitter operation=structural\n{}",
+    if !is_structural_no_match(&result) {
+        return Ok(format!(
+            "code_search route=tree_sitter operation=structural\n{}",
+            result
+        ));
+    }
+
+    let mut sections = vec![format!(
+        "code_search route=tree_sitter operation=structural\nsummary: {}",
         result
-    ))
+    )];
+    sections.push(result);
+
+    if let Some(query) = derive_structural_fallback_query(args) {
+        let fallback_args = build_text_search_args(args, query, Some(&target));
+        let fallback = execute_code_text_search(&fallback_args)?;
+        sections.push(format!("Fallback content search for '{}':\n{}", query, fallback));
+    }
+
+    let guidance = render_guidance_lines(&structural_guidance(args, &target));
+    if !guidance.is_empty() {
+        sections.push(guidance);
+    }
+
+    Ok(sections.join("\n\n"))
 }
 
 fn require_file_path<'a>(args: &'a Value, operation: &str) -> Result<&'a str, String> {
@@ -597,6 +792,15 @@ mod tests {
     }
 
     #[test]
+    fn legacy_structural_operation_is_mapped_to_intent() {
+        assert_eq!(legacy_structural_intent("find_functions"), Some("find_functions"));
+        assert_eq!(legacy_structural_intent("find_classes"), Some("find_classes"));
+        assert_eq!(legacy_structural_intent("find_methods"), Some("find_methods"));
+        assert_eq!(legacy_structural_intent("find_calls"), Some("find_calls"));
+        assert_eq!(legacy_structural_intent("text_search"), None);
+    }
+
+    #[test]
     fn is_code_file_detects_rust_source() {
         assert!(is_code_file(Path::new("/tmp/foo.rs")));
         assert!(!is_code_file(Path::new("/tmp/foo.txt")));
@@ -644,6 +848,27 @@ mod tests {
     }
 
     #[test]
+    fn text_search_no_match_includes_summary_and_guidance() {
+        let dir = make_temp_dir("text_search_no_match");
+        let file = dir.join("sample.rs");
+        fs::write(&file, "fn alpha() {}\n").unwrap();
+
+        let args = serde_json::json!({
+            "operation": "text_search",
+            "path": dir.to_string_lossy(),
+            "query": "missing_symbol",
+            "file_pattern": "*.rs"
+        });
+        let result = execute_code_text_search(&args).unwrap();
+
+        assert!(result.contains("summary: No text matches for 'missing_symbol'"));
+        assert!(result.contains("guidance:"));
+        assert!(result.contains("case_sensitive=false"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn find_file_behavior_still_routes_to_search_files() {
         let dir = make_temp_dir("find_file");
         let file = dir.join("Cargo.toml");
@@ -658,6 +883,72 @@ mod tests {
 
         assert!(result.contains("code_search route=search_files operation=find_file"));
         assert!(result.contains("Cargo.toml"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn structural_no_match_runs_text_fallback() {
+        let dir = make_temp_dir("structural_fallback");
+        let file = dir.join("sample.rs");
+        fs::write(&file, "fn alpha() {}\nfn beta() {}\n").unwrap();
+
+        let args = serde_json::json!({
+            "operation": "structural",
+            "intent": "find_functions",
+            "file_path": file.to_string_lossy(),
+            "name": "gamma"
+        });
+        let result = execute_code_search(&args).unwrap();
+
+        assert!(result.contains("summary: No AST structural matches"));
+        assert!(result.contains("Fallback content search for 'gamma'"));
+        assert!(result.contains("summary: No text matches for 'gamma'"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_symbol_no_match_runs_text_fallback() {
+        let dir = make_temp_dir("workspace_symbol_fallback");
+        let file = dir.join("sample.rs");
+        fs::write(&file, "fn alpha() {}\n").unwrap();
+
+        let args = serde_json::json!({
+            "operation": "workspace_symbol",
+            "path": dir.to_string_lossy(),
+            "query": "alpha"
+        });
+        let result = render_workspace_symbol_with_fallback(
+            &args,
+            "alpha",
+            "No symbols matching 'alpha' found in workspace".to_string(),
+            &dir.to_string_lossy(),
+        )
+        .unwrap();
+
+        assert!(result.contains("summary: No workspace symbols matched 'alpha'"));
+        assert!(result.contains("Fallback content search:"));
+        assert!(result.contains("sample.rs:1: fn alpha() {}"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_structural_operation_executes_structural_search() {
+        let dir = make_temp_dir("legacy_structural");
+        let file = dir.join("sample.rs");
+        fs::write(&file, "fn alpha() {}\nfn beta() {}\n").unwrap();
+
+        let args = serde_json::json!({
+            "operation": "find_functions",
+            "file_path": file.to_string_lossy(),
+            "name": "alpha"
+        });
+        let result = execute_code_search(&args).unwrap();
+
+        assert!(result.contains("code_search route=tree_sitter operation=structural"));
+        assert!(result.contains("alpha"));
 
         let _ = fs::remove_dir_all(&dir);
     }

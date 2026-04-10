@@ -3,7 +3,17 @@ use colored::Colorize;
 use crate::ai::{driver::McpInitReport, mcp::McpClient, skills::SkillManifest, types::App};
 
 pub fn print_assistant_banner() {
-    println!("\n{}", "[Assistant]".bright_blue().bold());
+    print_assistant_banner_with_app(None);
+}
+
+pub fn print_assistant_banner_with_app(app: Option<&App>) {
+    let agent_info = app.map(|a| &a.current_agent);
+    let banner = if let Some(agent) = agent_info {
+        format!("[Assistant] ({agent})")
+    } else {
+        "[Assistant]".to_string()
+    };
+    println!("\n{}", banner.bright_blue().bold());
 }
 
 pub fn print_tool_output_block(content: &str) {

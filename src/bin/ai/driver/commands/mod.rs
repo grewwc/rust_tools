@@ -20,7 +20,7 @@ pub fn try_handle_interactive_command(
     app: &mut App,
     mcp_client: &mut McpClient,
     input: &str,
-    agent_manifests: &[AgentManifest],
+    agent_manifests: &mut Vec<AgentManifest>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if try_handle_help_command(input) {
         return Ok(true);

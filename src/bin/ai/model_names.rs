@@ -13,6 +13,10 @@ pub struct ModelDef {
     pub name: String,
     #[serde(default)]
     pub provider: ApiProvider,
+    #[serde(default, alias = "base_url")]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub api_key_config_key: Option<String>,
     #[serde(default)]
     pub quality_tier: ModelQualityTier,
     pub is_vl: bool,
