@@ -20,8 +20,8 @@ impl Default for SearchThresholds {
             min_score_knowledge: 0.3,
             dedup_similarity_guideline: 0.7,
             dedup_similarity_knowledge: 0.65,
-            max_entries_with_project: 10,
-            max_entries_without_project: 6,
+            max_entries_with_project: 4,
+            max_entries_without_project: 2,
             high_confidence_min_matches: 2,
             high_confidence_min_priority: 180,
         }
@@ -149,6 +149,18 @@ impl KnowledgeConfig {
             .and_then(|v| v.parse::<f64>().ok())
         {
             config.thresholds.min_score_knowledge = v;
+        }
+        if let Some(v) = cfg
+            .get_opt("ai.knowledge.thresholds.max_entries_with_project")
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            config.thresholds.max_entries_with_project = v;
+        }
+        if let Some(v) = cfg
+            .get_opt("ai.knowledge.thresholds.max_entries_without_project")
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            config.thresholds.max_entries_without_project = v;
         }
         if let Some(v) = cfg
             .get_opt("ai.knowledge.maintenance.guidelines_max_chars")

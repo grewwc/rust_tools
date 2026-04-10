@@ -4,7 +4,7 @@ use super::super::config::KnowledgeConfig;
 use super::super::entry::KnowledgeEntry;
 use super::super::indexing::similarity;
 use super::super::storage::jsonl_store::JsonlStore;
-use super::super::types::GuidelineGroup;
+use super::super::types::{Category, GuidelineGroup};
 use super::keyword_search;
 
 /// Result of auto-recalled knowledge.
@@ -158,7 +158,11 @@ pub fn build_auto_recalled_knowledge(
     max_chars: usize,
     config: &KnowledgeConfig,
 ) -> Option<AutoRecalledKnowledge> {
-    let project_hint = current_project_hint();
+    let project_hint = if should_use_project_context(question) {
+        current_project_hint()
+    } else {
+        None
+    };
     build_auto_recalled_knowledge_with_project(
         store,
         question,
@@ -176,9 +180,14 @@ pub fn build_auto_recalled_knowledge_with_project(
     project_hint: Option<&str>,
     config: &KnowledgeConfig,
 ) -> Option<AutoRecalledKnowledge> {
+    if should_skip_auto_recall(question) {
+        return None;
+    }
+
     let project_hint = project_hint
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .filter(|_| should_use_project_context(question))
         .map(|s| s.to_string());
 
     let mut entries: Vec<KnowledgeEntry> = Vec::new();
@@ -207,10 +216,7 @@ pub fn build_auto_recalled_knowledge_with_project(
                 if score < config.thresholds.min_score_knowledge {
                     continue;
                 }
-                if entry.category == "tool_cache" {
-                    continue;
-                }
-                if entry.category_enum().is_guideline() {
+                if !should_include_in_auto_recall(&entry) {
                     continue;
                 }
                 let key = entry.dedup_key();
@@ -373,6 +379,136 @@ fn current_project_hint() -> Option<String> {
     }
 }
 
+fn should_include_in_auto_recall(entry: &KnowledgeEntry) -> bool {
+    matches!(
+        entry.category_enum(),
+        Category::UserMemory | Category::ProjectInfo | Category::Architecture | Category::DecisionLog
+    )
+}
+
+fn should_skip_auto_recall(question: &str) -> bool {
+    let q = question.trim().to_lowercase();
+    if q.is_empty() {
+        return false;
+    }
+
+    is_generic_generation_request(&q) && !should_use_project_context(&q)
+}
+
+fn should_use_project_context(question: &str) -> bool {
+    let q = question.trim().to_lowercase();
+    if q.is_empty() {
+        return false;
+    }
+
+    q.contains('/')
+        || q.contains('\\')
+        || q.contains("::")
+        || q.contains(".rs")
+        || q.contains(".py")
+        || q.contains(".ts")
+        || q.contains(".tsx")
+        || q.contains(".js")
+        || q.contains(".jsx")
+        || q.contains(".java")
+        || q.contains(".go")
+        || q.contains(".json")
+        || q.contains("panic")
+        || q.contains("traceback")
+        || q.contains("stack trace")
+        || q.contains("compile error")
+        || q.contains("build error")
+        || q.contains("cargo ")
+        || contains_any(
+            &q,
+            &[
+                "this project",
+                "this repo",
+                "current repo",
+                "current project",
+                "repository",
+                "repo",
+                "project structure",
+                "codebase",
+                "source code",
+                "file",
+                "files",
+                "path",
+                "module",
+                "function",
+                "struct",
+                "enum",
+                "trait",
+                "impl",
+                "implementation",
+                "call chain",
+                "bug",
+                "error",
+                "failure",
+                "endpoint",
+                "config",
+                "workspace",
+                "这个项目",
+                "当前项目",
+                "这个仓库",
+                "当前仓库",
+                "代码库",
+                "项目结构",
+                "源码",
+                "文件",
+                "路径",
+                "目录",
+                "模块",
+                "函数",
+                "结构体",
+                "枚举",
+                "实现",
+                "调用链",
+                "报错",
+                "错误",
+                "异常",
+                "编译",
+                "配置",
+            ],
+        )
+}
+
+fn is_generic_generation_request(question: &str) -> bool {
+    contains_any(
+        question,
+        &[
+            "help me write",
+            "write a",
+            "write an",
+            "generate",
+            "create",
+            "draft",
+            "summarize",
+            "translate",
+            "polish",
+            "example code",
+            "sample code",
+            "python code",
+            "帮我写",
+            "写一段",
+            "写个",
+            "生成",
+            "来一段",
+            "总结",
+            "翻译",
+            "润色",
+            "示例代码",
+            "python 代码",
+            "10 行",
+            "10行",
+        ],
+    )
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
 fn deduplicate_entries(entries: &mut Vec<KnowledgeEntry>, similarity_threshold: f64) {
     if entries.len() <= 1 {
         return;
@@ -498,5 +634,114 @@ fn append_notes(
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_auto_recalled_knowledge_with_project, is_generic_generation_request,
+        should_skip_auto_recall, should_use_project_context,
+    };
+    use crate::ai::knowledge::config::KnowledgeConfig;
+    use crate::ai::knowledge::entry::KnowledgeEntry;
+    use crate::ai::knowledge::storage::jsonl_store::JsonlStore;
+
+    fn test_store_path(name: &str) -> std::path::PathBuf {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("rt_recall_{name}_{ts}.jsonl"))
+    }
+
+    fn append_entry(store: &JsonlStore, category: &str, note: &str, source: &str, priority: u8) {
+        store
+            .append(&KnowledgeEntry {
+                id: None,
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                category: category.to_string(),
+                note: note.to_string(),
+                tags: vec!["rust_tools".to_string()],
+                source: Some(source.to_string()),
+                priority: Some(priority),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn generic_generation_requests_are_detected() {
+        assert!(is_generic_generation_request("help me write 10 lines of python code"));
+        assert!(should_skip_auto_recall("帮我写一段 10 行的 python 代码"));
+        assert!(!should_use_project_context("帮我写一段 10 行的 python 代码"));
+    }
+
+    #[test]
+    fn project_questions_enable_project_context() {
+        assert!(should_use_project_context(
+            "Which file in this project defines endpoint_for_model?"
+        ));
+        assert!(should_use_project_context("这个项目里哪个文件定义了 endpoint_for_model？"));
+        assert!(!should_skip_auto_recall(
+            "这个项目里哪个文件定义了 endpoint_for_model？"
+        ));
+    }
+
+    #[test]
+    fn generic_generation_request_returns_none_even_with_matching_project_memory() {
+        let path = test_store_path("generic_skip");
+        let store = JsonlStore::new(path.clone());
+        append_entry(
+            &store,
+            "user_memory",
+            "rust_tools prefers concise Python snippets for quick experiments.",
+            "rust_tools",
+            180,
+        );
+
+        let recalled = build_auto_recalled_knowledge_with_project(
+            &store,
+            "帮我写一段 10 行的 python 代码",
+            1200,
+            Some("rust_tools"),
+            &KnowledgeConfig::default(),
+        );
+
+        assert!(recalled.is_none());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_recall_excludes_code_discovery_entries() {
+        let path = test_store_path("exclude_code_discovery");
+        let store = JsonlStore::new(path.clone());
+        append_entry(
+            &store,
+            "user_memory",
+            "rust_tools project structure: src/bin contains entrypoints and src/cw has shared utilities.",
+            "rust_tools",
+            180,
+        );
+        append_entry(
+            &store,
+            "code_discovery",
+            "read_file_lines(file=src/bin/ai/models.rs, lines=68..87) => endpoint_for_model",
+            "session:test",
+            220,
+        );
+
+        let recalled = build_auto_recalled_knowledge_with_project(
+            &store,
+            "What is the project structure of this project?",
+            1200,
+            Some("rust_tools"),
+            &KnowledgeConfig::default(),
+        )
+        .expect("recalled knowledge");
+
+        assert!(recalled.content.contains("project structure"));
+        assert!(!recalled.content.contains("read_file_lines"));
+        assert_eq!(recalled.categories, vec!["user_memory".to_string()]);
+        let _ = std::fs::remove_file(path);
     }
 }

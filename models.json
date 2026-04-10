@@ -218,5 +218,15 @@
     "search_enabled": false,
     "tools_default_enabled": true,
     "enable_thinking": false
+  },
+  {
+    "key": "GPT 5.4 Pro",
+    "name": "gpt-5.4-pro",
+    "provider": "opencode",
+    "quality_tier": "basic",
+    "is_vl": false,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": false
   }
 ]
