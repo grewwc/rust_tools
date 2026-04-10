@@ -52,6 +52,7 @@ pub(super) async fn prepare_turn(
     history_count: usize,
     question: &str,
     next_model: &str,
+    precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
 ) -> Result<TurnPreparation, Box<dyn std::error::Error>> {
     let history = build_context_history(
         history_count,
@@ -168,17 +169,15 @@ pub(super) async fn prepare_turn(
         content: {
             let has_images = !app.attached_image_files.is_empty();
             let mut final_question = question.to_string();
-            if has_images {
-                if let Ok(Some(ocr)) = crate::ai::driver::model::ocr_images_for_attached_input(
-                    mcp_client,
-                    &app.attached_image_files,
-                ) {
-                    print_ocr_summary(&ocr);
-                    final_question = format!(
-                        "{}\n\n[Auto OCR From Attached Images via {}]\n{}",
-                        final_question, ocr.tool_name, ocr.content
-                    );
-                }
+            if has_images
+                && !crate::ai::models::supports_image_input(next_model)
+                && let Some(ocr) = precomputed_ocr
+            {
+                print_ocr_summary(&ocr);
+                final_question = format!(
+                    "{}\n\n[Auto OCR From Attached Images via {}]\n{}",
+                    final_question, ocr.tool_name, ocr.content
+                );
             }
             request::build_content(next_model, &final_question, &app.attached_image_files)?
         },

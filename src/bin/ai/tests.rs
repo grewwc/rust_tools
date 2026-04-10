@@ -95,7 +95,7 @@ fn resolve_model_is_unicode_safe() {
     };
 
     let mut question = "a 什么是rust的一个crate？".to_string();
-    let model = super::driver::resolve_model_for_input(&app, &mut question);
+    let model = super::driver::resolve_model_for_input(&app, false, &mut question);
     assert_eq!(model, app.current_model);
     assert_eq!(question, "a 什么是rust的一个crate？");
 }
@@ -103,15 +103,22 @@ fn resolve_model_is_unicode_safe() {
 #[test]
 fn image_files_auto_route_to_vl() {
     let vl = any_vl_model_name();
-    let model = super::driver::attachment_forced_model("qwen3.5-flash", true, vl.as_str());
+    let model = super::driver::attachment_forced_model("qwen3.5-flash", true, vl.as_str(), false);
     assert_eq!(model, Some(vl));
 }
 
 #[test]
 fn configured_vl_model_is_used_for_images() {
     let vl = any_vl_model_name();
-    let model = super::driver::attachment_forced_model("qwen3.5-flash", true, vl.as_str());
+    let model = super::driver::attachment_forced_model("qwen3.5-flash", true, vl.as_str(), false);
     assert_eq!(model, Some(vl));
+}
+
+#[test]
+fn successful_ocr_keeps_text_model_for_images() {
+    let vl = any_vl_model_name();
+    let model = super::driver::attachment_forced_model("qwen3.5-flash", true, vl.as_str(), true);
+    assert_eq!(model, None);
 }
 
 #[test]

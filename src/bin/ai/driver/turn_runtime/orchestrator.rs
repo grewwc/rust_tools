@@ -37,6 +37,7 @@ pub(in crate::ai::driver) async fn run_turn(
     history_count: usize,
     question: String,
     next_model: String,
+    precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
@@ -53,6 +54,7 @@ pub(in crate::ai::driver) async fn run_turn(
         history_count,
         &question,
         &next_model,
+        precomputed_ocr,
     )
     .await?;
 

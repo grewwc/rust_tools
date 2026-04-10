@@ -558,7 +558,23 @@ async fn run_loop(
             continue;
         }
         maybe_auto_route_agent(app, &*agent_manifests, &question);
-        let next_model = resolve_model_for_input(app, &mut question);
+        let precomputed_ocr = if !app.attached_image_files.is_empty()
+            && !crate::ai::models::is_vl_model(&app.current_model)
+        {
+            crate::ai::driver::model::ocr_images_for_attached_input(
+                mcp_client,
+                &app.attached_image_files,
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        let ocr_succeeded_for_images = precomputed_ocr
+            .as_ref()
+            .map(|ocr| ocr.images.iter().all(|image| image.error.is_none()))
+            .unwrap_or(false);
+        let next_model = resolve_model_for_input(app, ocr_succeeded_for_images, &mut question);
         app.current_model = next_model.clone();
 
         app.cancel_stream.store(false, Ordering::Relaxed);
@@ -570,6 +586,7 @@ async fn run_loop(
             ctx.history_count,
             question,
             next_model,
+            precomputed_ocr,
             one_shot_mode,
             should_quit,
         )

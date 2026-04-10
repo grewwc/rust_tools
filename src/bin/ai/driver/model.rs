@@ -2,7 +2,11 @@ use crate::ai::{mcp::McpClient, models, types::App};
 use serde_json::json;
 use std::path::Path;
 
-pub fn resolve_model_for_input(app: &App, _question: &mut String) -> String {
+pub fn resolve_model_for_input(
+    app: &App,
+    ocr_succeeded_for_images: bool,
+    _question: &mut String,
+) -> String {
     // Resolution order:
     // 1) If there are image attachments, force a VL-capable model (unless already VL).
     // 2) A trailing " -d" forces the default DeepSeek model (and strips the suffix).
@@ -12,6 +16,7 @@ pub fn resolve_model_for_input(app: &App, _question: &mut String) -> String {
         &app.current_model,
         !app.attached_image_files.is_empty(),
         &app.config.vl_default_model,
+        ocr_succeeded_for_images,
     ) {
         return model;
     }
@@ -22,10 +27,11 @@ pub fn attachment_forced_model(
     current_model: &str,
     has_image_files: bool,
     vl_default_model: &str,
+    ocr_succeeded_for_images: bool,
 ) -> Option<String> {
     // Many models are text-only. When there are images, we route to a VL model to avoid
     // provider-side errors.
-    if has_image_files && !models::is_vl_model(current_model) {
+    if has_image_files && !models::is_vl_model(current_model) && !ocr_succeeded_for_images {
         return Some(models::determine_vl_model(vl_default_model));
     }
     None
