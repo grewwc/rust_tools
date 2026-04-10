@@ -98,7 +98,27 @@ pub(in crate::ai::driver) async fn run_turn(
             iteration,
             max_iterations,
         )? {
-            TurnLoopStep::Continue => {}
+            TurnLoopStep::Continue => {
+                let mut new_tools = crate::ai::tools::enable_tools::drain_pending_enable();
+                let pending_mcp = crate::ai::tools::enable_tools::drain_pending_mcp_names();
+                if !pending_mcp.is_empty() {
+                    let mcp_all = mcp_client.get_all_tools();
+                    for tool in mcp_all {
+                        if pending_mcp.iter().any(|n| n == &tool.function.name) {
+                            new_tools.push(tool);
+                        }
+                    }
+                }
+                if !new_tools.is_empty() {
+                    if let Some(ctx) = app.agent_context.as_mut() {
+                        for tool in new_tools {
+                            if !ctx.tools.iter().any(|t| t.function.name == tool.function.name) {
+                                ctx.tools.push(tool);
+                            }
+                        }
+                    }
+                }
+            }
             TurnLoopStep::Break => break,
             TurnLoopStep::Return(outcome) => return Ok(outcome),
         }

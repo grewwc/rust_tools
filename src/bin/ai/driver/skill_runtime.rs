@@ -67,6 +67,8 @@ fn activate_skill_context(
     let mut restore = None;
     if let Some(ctx) = app.agent_context.as_mut() {
         let all_tools = reorder_tools_by_stats(builtin_tools, mcp_tools);
+        let names: Vec<String> = all_tools.iter().map(|t| t.function.name.clone()).collect();
+        super::super::tools::enable_tools::set_active_tool_names(names);
         let prev_tools = std::mem::replace(&mut ctx.tools, all_tools);
         let prev_max_iterations = std::mem::replace(&mut ctx.max_iterations, max_iterations);
         restore = Some((prev_tools, prev_max_iterations));
@@ -116,7 +118,7 @@ fn builtin_tools_for_skill(
     {
         return tool_defs;
     }
-    super::super::tools::get_builtin_tool_definitions()
+    super::super::tools::tool_definitions_for_groups(&["core"])
 }
 
 fn reorder_tools_by_stats(mut builtin: Vec<ToolDef>, mut mcp: Vec<ToolDef>) -> Vec<ToolDef> {
@@ -211,14 +213,14 @@ fn mcp_tools_for_skill(
         return Vec::new();
     }
 
-    let all_tools = mcp_client.get_all_tools();
     let Some(skill) = skill else {
-        return all_tools;
+        return Vec::new();
     };
     if skill.mcp_servers.is_empty() {
-        return all_tools;
+        return Vec::new();
     }
 
+    let all_tools = mcp_client.get_all_tools();
     all_tools
         .into_iter()
         .filter(|tool| tool_uses_mcp_server(&tool.function.name, &skill.mcp_servers))
@@ -248,7 +250,7 @@ fn build_system_prompt(active_agent: Option<&AgentManifest>, skill: Option<&Skil
     system_prompt.push_str("\n\n");
     system_prompt.push_str("Tool recovery mode:\n- If a tool call fails, read the error message and correct course before answering.\n- Prefer retrying with corrected arguments or switching to a more appropriate tool.\n- Do not repeat the exact same failing tool call unless the error indicates a transient retry is appropriate.\n- If a URL-based docs fetch tool says the URL is unsupported, switch to a search tool or ask for a supported docs URL instead of retrying the same call.\n- Only stop and ask the user when the error is ambiguous or missing required information.");
     system_prompt.push_str("\n\n");
-    system_prompt.push_str("Code navigation policy:\n- Prefer `code_search` for locating files, symbols, definitions, references, diagnostics, structural code matches, or full-text content hits.\n- When you need to find where a symbol is declared or used, prefer `code_search` with `workspace_symbol`, `go_to_definition`, or `find_references`.\n- When you need to find literal text, log messages, SQL fragments, config keys, or other exact content, prefer `code_search` with `text_search`.\n- For structural searches, prefer high-level `code_search` intents like `find_functions`, `find_classes`, `find_methods`, and `find_calls` before writing a raw tree-sitter query.\n- When structural results are too broad, add `name` to filter the `@name` capture or `contains_text` to filter by captured snippet text.\n- For call searches, you can further narrow matches with `call_kind`, `receiver`, and `qualified_name`.\n- Use `code_search` before raw `grep_search` / `read_file_lines` when you are still narrowing down where relevant code lives.\n- Use `read_file` or `read_file_lines` only after `code_search` or `lsp` has identified the exact file or region you need to inspect.\n- Use raw `grep_search` mainly as a fallback when higher-level code navigation does not apply.\n- If a recent system note labeled `Current code-inspection working memory` is present, treat it as authoritative current-turn context and avoid re-reading the same file range or rerunning equivalent raw searches unless you need verification or a narrower slice.\n- If you have already used several raw repo-inspection tools in a row and are still locating code, switch to `code_search` before making more broad `read_file_lines` or `grep_search` calls.");
+    system_prompt.push_str("Code navigation policy:\n- ALWAYS use `code_search` as your FIRST tool when exploring code. Do NOT start with `read_file`, `read_file_lines`, `grep_search`, or `search_files`.\n- The only exception: use `read_file_lines` directly when you already know the exact file path AND line range from a previous `code_search` result.\n- When you need to find where a symbol is declared or used, use `code_search` with `workspace_symbol`, `go_to_definition`, or `find_references`.\n- When you need to find literal text, log messages, SQL fragments, config keys, or other exact content, use `code_search` with `text_search`.\n- For structural searches, use high-level `code_search` intents like `find_functions`, `find_classes`, `find_methods`, and `find_calls` before writing a raw tree-sitter query.\n- When structural results are too broad, add `name` to filter the `@name` capture or `contains_text` to filter by captured snippet text.\n- For call searches, you can further narrow matches with `call_kind`, `receiver`, and `qualified_name`.\n- Use raw `grep_search` ONLY as a last resort when `code_search` does not apply.\n- If a recent system note labeled `Current code-inspection working memory` is present, treat it as authoritative current-turn context and avoid re-reading the same file range or rerunning equivalent raw searches unless you need verification or a narrower slice.\n- If you have already used raw repo-inspection tools and are still locating code, you MUST switch to `code_search` immediately.");
     system_prompt.push_str("\n\n");
     system_prompt.push_str("File editing policy:\n- When modifying an existing file or document, DO NOT rewrite the whole file unless the user explicitly asks for a full rewrite or the change truly affects most of the file.\n- First inspect the relevant region with read_file or read_file_lines, then use apply_patch to make the smallest localized edit that preserves the surrounding content.\n- Use write_file mainly for creating new files or for deliberate full-file replacement.\n- This rule applies equally to prose documents, markdown notes, configuration files, and source code.");
     system_prompt.push_str("\n\n");
@@ -332,6 +334,7 @@ pub(super) async fn prepare_skill_for_turn(
     skill_manifests: &[SkillManifest],
     question: &str,
 ) -> SkillTurnGuard {
+    super::super::tools::enable_tools::set_available_mcp_tools(mcp_client.get_all_tools());
     let cfg = configw::get_all_config();
     let debug = cfg
         .get_opt("ai.skills.debug")

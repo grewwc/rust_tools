@@ -1,13 +1,42 @@
 use std::collections::VecDeque;
 use std::fs;
+use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 
+use regex::RegexBuilder;
 use serde_json::Value;
 
 use crate::ai::tools::ast_structural::execute_structural_search;
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 use crate::ai::tools::lsp_tools::execute_lsp;
 use crate::ai::tools::search_tools::execute_search_files;
+
+const CODE_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "h", "cpp", "cc", "cxx", "hpp",
+    "rb", "php", "cs",
+];
+
+const EXTRA_TEXT_EXTENSIONS: &[&str] = &[
+    "json", "yaml", "yml", "toml", "md", "txt", "sql", "sh",
+];
+
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    "vendor",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".cargo",
+];
 
 fn params_code_search() -> Value {
     serde_json::json!({
@@ -66,6 +95,14 @@ fn params_code_search() -> Value {
                 "type": "string",
                 "description": "Optional file glob restriction for text_search or structural search when searching a directory."
             },
+            "is_regex": {
+                "type": "boolean",
+                "description": "When true, treat 'query' as a regular expression for text_search. Defaults to false (literal substring match)."
+            },
+            "case_sensitive": {
+                "type": "boolean",
+                "description": "When false, perform case-insensitive matching for text_search. Defaults to true."
+            },
             "name": {
                 "type": "string",
                 "description": "Optional structural filter. When operation=structural, keep only matches whose @name capture contains this text."
@@ -98,7 +135,7 @@ inventory::submit!(ToolRegistration {
         description: "High-level code navigation and search tool. Prefer this before raw grep/read tools. Internally routes to LSP for symbol/definition/reference lookups, to search_files for file discovery, to built-in content scanning for full-text search, and to built-in tree-sitter AST search for structural matching. For structural searches, prefer high-level intents like find_functions or find_calls over raw queries, and use name / contains_text / call_kind / receiver / qualified_name to narrow large result sets. Example: operation=structural, intent=find_calls, call_kind=method_call, receiver=app.view, name=render.",
         parameters: params_code_search,
         execute: execute_code_search,
-        groups: &["builtin"],
+        groups: &["builtin", "core"],
     }
 });
 
@@ -151,7 +188,15 @@ fn execute_code_text_search(args: &Value) -> Result<String, String> {
         .or_else(|| args["pattern"].as_str())
         .ok_or("text_search requires 'query' or 'pattern'")?;
     let target = text_search_target(args)?;
-    let result = execute_content_text_search(query, &target, args["file_pattern"].as_str())?;
+    let is_regex = args["is_regex"].as_bool().unwrap_or(false);
+    let case_sensitive = args["case_sensitive"].as_bool().unwrap_or(true);
+    let result = execute_content_text_search(
+        query,
+        &target,
+        args["file_pattern"].as_str(),
+        is_regex,
+        case_sensitive,
+    )?;
     if result.trim().is_empty() {
         Ok(format!(
             "code_search route=content_search operation=text_search\nNo text matches for '{}' under '{}'.",
@@ -189,30 +234,67 @@ fn execute_content_text_search(
     query: &str,
     target: &Path,
     file_pattern: Option<&str>,
+    is_regex: bool,
+    case_sensitive: bool,
 ) -> Result<String, String> {
     if query.trim().is_empty() {
         return Err("text_search query is empty".to_string());
     }
 
+    let pattern = if is_regex { query.to_string() } else { regex::escape(query) };
+    let re = RegexBuilder::new(&pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|e| format!("Invalid regex pattern: {}", e))?;
+
     let files = collect_text_search_files(target, file_pattern)?;
-    let mut matches = Vec::new();
-    for file in files {
-        let Ok(content) = fs::read_to_string(&file) else {
-            continue;
+    
+    // Parallel text search across files
+    let max_threads = (num_cpus::get() / 2).max(1);
+    let chunk_size = (files.len() / max_threads).max(1);
+    let chunks: Vec<Vec<PathBuf>> = files.chunks(chunk_size).map(|c| c.to_vec()).collect();
+    
+    let all_matches: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let found_enough: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    
+    std::thread::scope(|scope| {
+        for chunk in chunks {
+            let re_ref = &re;
+            let matches_ref = Arc::clone(&all_matches);
+            let done_ref = Arc::clone(&found_enough);
+            scope.spawn(move || {
+                let mut local_matches = Vec::new();
+                for file in chunk {
+                    if done_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let Ok(content) = fs::read_to_string(&file) else {
+                        continue;
+                    };
+                    for (idx, line) in content.lines().enumerate() {
+                        if !re_ref.is_match(line) {
+                            continue;
+                        }
+                        local_matches.push(format!("{}:{}: {}", file.display(), idx + 1, line));
+                        if local_matches.len() >= 200 {
+                            break;
+                        }
+                    }
+                    if local_matches.len() >= 200 {
+                        done_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                        break;
+                    }
+                }
+                if !local_matches.is_empty() {
+                    let mut guard = matches_ref.lock().unwrap();
+                    guard.extend(local_matches);
+                }
+            });
         };
-        for (idx, line) in content.lines().enumerate() {
-            if !line.contains(query) {
-                continue;
-            }
-            matches.push(format!("{}:{}: {}", file.display(), idx + 1, line));
-            if matches.len() >= 200 {
-                break;
-            }
-        }
-        if matches.len() >= 200 {
-            break;
-        }
-    }
+    });
+    
+    let mut matches = all_matches.lock().unwrap().clone();
+    matches.truncate(200);
 
     Ok(truncate_chars(&matches.join("\n"), 16_000))
 }
@@ -236,68 +318,15 @@ fn collect_text_search_files(target: &Path, file_pattern: Option<&str>) -> Resul
         return Ok(files);
     }
 
-    let mut files = Vec::new();
-    let mut queue = VecDeque::new();
-    queue.push_back(target.to_path_buf());
-    let mut scanned_dirs = 0usize;
-    let max_dirs = 10_000usize;
-
-    while let Some(dir) = queue.pop_front() {
-        scanned_dirs += 1;
-        if scanned_dirs > max_dirs {
-            break;
-        }
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let ft = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            if ft.is_file() && is_text_search_file(&path) {
-                files.push(path);
-            } else if ft.is_dir() && !ft.is_symlink() {
-                queue.push_back(path);
-            }
-        }
-    }
-    Ok(files)
+    Ok(walk_files(target, is_text_search_file))
 }
 
 fn is_text_search_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|s| s.to_str()),
-        Some(
-            "rs"
-                | "ts"
-                | "tsx"
-                | "js"
-                | "jsx"
-                | "py"
-                | "go"
-                | "java"
-                | "c"
-                | "h"
-                | "cpp"
-                | "cc"
-                | "cxx"
-                | "hpp"
-                | "rb"
-                | "php"
-                | "cs"
-                | "json"
-                | "yaml"
-                | "yml"
-                | "toml"
-                | "md"
-                | "txt"
-                | "sql"
-                | "sh"
-        )
-    )
+    let ext = match path.extension().and_then(|s| s.to_str()) {
+        Some(e) => e,
+        None => return false,
+    };
+    CODE_EXTENSIONS.contains(&ext) || EXTRA_TEXT_EXTENSIONS.contains(&ext)
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -346,7 +375,23 @@ fn execute_code_document_symbol(args: &Value) -> Result<String, String> {
 }
 
 fn execute_code_lsp_with_file(args: &Value, operation: &str) -> Result<String, String> {
-    let file_path = require_file_path(args, operation)?;
+    let file_path = match args["file_path"].as_str() {
+        Some(fp) => {
+            if !Path::new(fp).exists() {
+                return Err(format!("File not found: {}", fp));
+            }
+            fp.to_string()
+        }
+        None => {
+            if let Some(query) = args["query"].as_str() {
+                return fallback_lsp_to_workspace_symbol(args, operation, query);
+            }
+            return Err(format!(
+                "{} requires 'file_path' (with 'line'/'column') or 'query' to fall back to a workspace symbol search",
+                operation
+            ));
+        }
+    };
     let mut forwarded = serde_json::json!({
         "operation": operation,
         "file_path": file_path,
@@ -354,16 +399,52 @@ fn execute_code_lsp_with_file(args: &Value, operation: &str) -> Result<String, S
     if let Some(query) = args["query"].as_str() {
         forwarded["query"] = Value::String(query.to_string());
     }
+    let needs_position = matches!(operation, "go_to_definition" | "find_references" | "hover");
     if let Some(line) = args["line"].as_u64() {
         forwarded["line"] = Value::Number(line.into());
-    }
-    if let Some(column) = args["column"].as_u64() {
-        forwarded["column"] = Value::Number(column.into());
+        if let Some(column) = args["column"].as_u64() {
+            forwarded["column"] = Value::Number(column.into());
+        }
+    } else if needs_position {
+        if let Some(query) = args["query"].as_str() {
+            if let Some((line, col)) = find_symbol_position(&file_path, query) {
+                forwarded["line"] = Value::Number(line.into());
+                forwarded["column"] = Value::Number(col.into());
+            }
+        }
     }
     let result = execute_lsp(&forwarded)?;
     Ok(format!(
         "code_search route=lsp operation={}\n{}",
         operation, result
+    ))
+}
+
+fn find_symbol_position(file_path: &str, symbol: &str) -> Option<(usize, usize)> {
+    let content = fs::read_to_string(file_path).ok()?;
+    for (idx, line) in content.lines().enumerate() {
+        if let Some(col) = line.find(symbol) {
+            return Some((idx + 1, col + 1));
+        }
+    }
+    None
+}
+
+fn fallback_lsp_to_workspace_symbol(
+    args: &Value,
+    original_operation: &str,
+    query: &str,
+) -> Result<String, String> {
+    let anchor_file = resolve_anchor_file(args)?;
+    let forwarded = serde_json::json!({
+        "operation": "workspace_symbol",
+        "file_path": anchor_file,
+        "query": query,
+    });
+    let result = execute_lsp(&forwarded)?;
+    Ok(format!(
+        "code_search route=lsp operation={} (fallback to workspace_symbol, file_path was not provided)\n{}",
+        original_operation, result
     ))
 }
 
@@ -443,10 +524,24 @@ fn find_code_anchor_file(root: &Path) -> Option<PathBuf> {
     if root.is_file() {
         return is_code_file(root).then(|| root.to_path_buf());
     }
-    if !root.exists() || !root.is_dir() {
-        return None;
-    }
+    walk_files(root, is_code_file).into_iter().next()
+}
 
+fn is_code_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|s| s.to_str())
+        .map_or(false, |ext| CODE_EXTENSIONS.contains(&ext))
+}
+
+fn should_skip_dir(dir_name: &str) -> bool {
+    SKIP_DIRS.contains(&dir_name)
+}
+
+fn walk_files(root: &Path, predicate: fn(&Path) -> bool) -> Vec<PathBuf> {
+    if !root.exists() || !root.is_dir() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
     let mut queue = VecDeque::new();
     queue.push_back(root.to_path_buf());
     let mut scanned_dirs = 0usize;
@@ -455,49 +550,29 @@ fn find_code_anchor_file(root: &Path) -> Option<PathBuf> {
     while let Some(dir) = queue.pop_front() {
         scanned_dirs += 1;
         if scanned_dirs > max_dirs {
-            return None;
+            break;
         }
-        let entries = fs::read_dir(&dir).ok()?;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             let ft = match entry.file_type() {
                 Ok(ft) => ft,
                 Err(_) => continue,
             };
-            if ft.is_file() && is_code_file(&path) {
-                return Some(path);
-            }
-            if ft.is_dir() && !ft.is_symlink() {
-                queue.push_back(path);
+            if ft.is_file() && predicate(&path) {
+                files.push(path);
+            } else if ft.is_dir() && !ft.is_symlink() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !should_skip_dir(name) {
+                    queue.push_back(path);
+                }
             }
         }
     }
-    None
-}
-
-fn is_code_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|s| s.to_str()),
-        Some(
-            "rs"
-                | "ts"
-                | "tsx"
-                | "js"
-                | "jsx"
-                | "py"
-                | "go"
-                | "java"
-                | "c"
-                | "h"
-                | "cpp"
-                | "cc"
-                | "cxx"
-                | "hpp"
-                | "rb"
-                | "php"
-                | "cs"
-        )
-    )
+    files
 }
 
 #[cfg(test)]

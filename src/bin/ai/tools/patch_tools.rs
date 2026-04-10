@@ -29,7 +29,7 @@ inventory::submit!(ToolRegistration {
         description: "Apply a unified-diff patch to a file (absolute path). Prefer this for updating an existing document or source file with the smallest localized change instead of rewriting the entire file. Creates missing parent directories; fails if context/removals do not match.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
-        groups: &["openclaw", "builtin"],
+        groups: &["openclaw", "builtin", "core"],
     }
 });
 
@@ -102,6 +102,73 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
     Ok(hunks)
 }
 
+fn lines_match(actual: &str, expected: &str) -> bool {
+    actual == expected || actual.trim_end() == expected.trim_end()
+}
+
+fn find_hunk_offset(orig_lines: &[String], hunk: &UnifiedHunk) -> Option<usize> {
+    let context_and_remove: Vec<&str> = hunk
+        .lines
+        .iter()
+        .filter_map(|line| match line {
+            UnifiedLine::Context(s) | UnifiedLine::Remove(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect();
+    if context_and_remove.is_empty() {
+        return None;
+    }
+    let nominal = hunk.old_start.saturating_sub(1);
+    let search_radius = 50usize;
+    let start = nominal.saturating_sub(search_radius);
+    let end = (nominal + search_radius).min(orig_lines.len());
+    for candidate in start..end {
+        if candidate + context_and_remove.len() > orig_lines.len() {
+            continue;
+        }
+        let all_match = context_and_remove
+            .iter()
+            .enumerate()
+            .all(|(i, expected)| lines_match(&orig_lines[candidate + i], expected));
+        if all_match {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn try_apply_hunk_at(
+    orig_lines: &[String],
+    hunk: &UnifiedHunk,
+    start: usize,
+) -> Option<(Vec<String>, usize)> {
+    let mut out = Vec::new();
+    let mut idx = start;
+    for line in &hunk.lines {
+        match line {
+            UnifiedLine::Context(s) => {
+                let cur = orig_lines.get(idx)?;
+                if !lines_match(cur, s) {
+                    return None;
+                }
+                out.push(cur.clone());
+                idx += 1;
+            }
+            UnifiedLine::Remove(s) => {
+                let cur = orig_lines.get(idx)?;
+                if !lines_match(cur, s) {
+                    return None;
+                }
+                idx += 1;
+            }
+            UnifiedLine::Add(s) => {
+                out.push(s.clone());
+            }
+        }
+    }
+    Some((out, idx))
+}
+
 fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
     let had_trailing_newline = original.ends_with('\n');
     let hunks = parse_unified_hunks(patch)?;
@@ -110,42 +177,27 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
     let mut out: Vec<String> = Vec::new();
     let mut cursor = 0usize;
 
-    for hunk in hunks {
-        let apply_at = hunk.old_start.saturating_sub(1);
-        if apply_at > orig_lines.len() {
-            return Err("hunk start out of range".to_string());
-        }
-        if apply_at < cursor {
-            return Err("hunks out of order".to_string());
-        }
+    for hunk in &hunks {
+        let nominal = hunk.old_start.saturating_sub(1);
+        let apply_at = if nominal <= orig_lines.len()
+            && nominal >= cursor
+            && try_apply_hunk_at(&orig_lines, hunk, nominal).is_some()
+        {
+            nominal
+        } else if let Some(offset) = find_hunk_offset(&orig_lines, hunk) {
+            if offset < cursor {
+                return Err("hunks out of order".to_string());
+            }
+            offset
+        } else {
+            return Err("context mismatch".to_string());
+        };
 
         out.extend_from_slice(&orig_lines[cursor..apply_at]);
-        let mut idx = apply_at;
-
-        for line in hunk.lines {
-            match line {
-                UnifiedLine::Context(s) => {
-                    let cur = orig_lines.get(idx).ok_or("context out of range")?;
-                    if cur != &s {
-                        return Err("context mismatch".to_string());
-                    }
-                    out.push(s);
-                    idx += 1;
-                }
-                UnifiedLine::Remove(s) => {
-                    let cur = orig_lines.get(idx).ok_or("remove out of range")?;
-                    if cur != &s {
-                        return Err("remove mismatch".to_string());
-                    }
-                    idx += 1;
-                }
-                UnifiedLine::Add(s) => {
-                    out.push(s);
-                }
-            }
-        }
-
-        cursor = idx;
+        let (hunk_out, new_idx) = try_apply_hunk_at(&orig_lines, hunk, apply_at)
+            .ok_or("context mismatch")?;
+        out.extend(hunk_out);
+        cursor = new_idx;
     }
 
     out.extend_from_slice(&orig_lines[cursor..]);

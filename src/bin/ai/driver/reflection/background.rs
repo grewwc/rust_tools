@@ -291,7 +291,7 @@ pub(crate) async fn run_self_reflection_background(
         return;
     }
     let record = Message {
-        role: "system".to_string(),
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(format!("self_note:\n{}", note)),
         tool_calls: None,
         tool_call_id: None,

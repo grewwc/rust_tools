@@ -11,7 +11,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    files, history::Message, models, provider::ApiProvider, skills::SkillManifest, types::App,
+    files,
+    history::{Message, ROLE_SYSTEM, is_internal_note_role, is_system_like_role},
+    models,
+    provider::ApiProvider,
+    skills::SkillManifest,
+    types::App,
 };
 use crate::ai::config_schema::AiConfig;
 use crate::ai::driver::intent_recognition;
@@ -405,9 +410,10 @@ pub(super) async fn do_request_messages(
     messages: &[Message],
     stream: bool,
 ) -> Result<Response, RequestError> {
+    let normalized_messages = normalize_messages_for_request(messages);
     let (tools_value, tool_choice) = agent_tools_for_request(app, model);
     let thinking_start = Instant::now();
-    let enable_thinking = resolve_thinking(app, model, messages).await;
+    let enable_thinking = resolve_thinking(app, model, &normalized_messages).await;
     crate::ai::agent_hang_debug!(
         "pre-fix",
         "G",
@@ -420,7 +426,7 @@ pub(super) async fn do_request_messages(
     );
     let request_body = build_request_body(
         model,
-        messages,
+        &normalized_messages,
         stream,
         enable_thinking,
         models::search_enabled(model).then_some(true),
@@ -567,54 +573,21 @@ fn extract_router_content(v: &Value) -> Option<String> {
     }
 }
 
-#[crate::ai::agent_hang_span(
-    "pre-fix",
-    "R",
-    "request::select_skill_via_model",
-    "[DEBUG] model skill router started",
-    "[DEBUG] model skill router finished",
-    {
-        "question_len": question.chars().count(),
-        "skill_count": skills.len(),
-    },
-    {
-        "selected": __agent_hang_result.as_deref(),
-        "elapsed_ms": __agent_hang_elapsed_ms,
-    }
-)]
-pub(super) async fn select_skill_via_model(
-    app: &mut App,
-    _model: &str,
+#[derive(Debug, Clone)]
+struct SkillRouterDecision {
+    skill: Option<String>,
+    confidence: f64,
+}
+
+async fn select_skill_candidate_via_model(
+    app: &App,
     question: &str,
     skills: &[SkillManifest],
-) -> Option<String> {
-    let router_start = Instant::now();
-    if question.trim().is_empty() {
-        crate::ai::agent_hang_debug!(
-            "pre-fix",
-            "R",
-            "request::select_skill_via_model:empty_question",
-            "[DEBUG] model skill router skipped empty question",
-            {
-                "elapsed_ms": router_start.elapsed().as_secs_f64() * 1000.0,
-            },
-        );
-        return None;
-    }
-    if skills.is_empty() {
-        crate::ai::agent_hang_debug!(
-            "pre-fix",
-            "R",
-            "request::select_skill_via_model:empty_skills",
-            "[DEBUG] model skill router skipped empty skills",
-            {
-                "elapsed_ms": router_start.elapsed().as_secs_f64() * 1000.0,
-            },
-        );
+) -> Option<SkillRouterDecision> {
+    if question.trim().is_empty() || skills.is_empty() {
         return None;
     }
 
-    // Use raw multi-line string for better readability
     let mut system_prompt = r#"You are a skill router for a CODE development assistant. Your ONLY job is to route SOURCE CODE programming questions to appropriate skills.
 ALL skills are for PROGRAMMING/CODING tasks only (writing, reviewing, debugging, refactoring code).
 Output schema: {"skill":"<exact skill name or empty>","confidence":0.0}
@@ -628,23 +601,10 @@ Critical Rules:
 - If unsure, return empty skill with confidence < 0.5. Better to skip than misroute.
 - Use EXACT skill name from the list below.
 - Return ONLY valid JSON, no explanations.
-Examples:
-- User: '帮我看一下今天 nba 的比赛' → {"skill":"","confidence":0.1} ❌ sports, not code
-- User: '分析一下这个函数的时间复杂度' → {"skill":"","confidence":0.2} ❌ algorithm question without code
-- User: 'python flask 中 g.request_base_info_dict 这个是什么' → {"skill":"","confidence":0.1} ❌ knowledge question about Flask API, not a code task
-- User: 'Django 的 ORM 怎么用' → {"skill":"","confidence":0.1} ❌ knowledge question about Django, not a code task
-- User: 'React hooks 是什么' → {"skill":"","confidence":0.1} ❌ knowledge question about React, not a code task
-- User: 'Rust 的 borrow checker 怎么工作的' → {"skill":"","confidence":0.1} ❌ knowledge question about Rust, not a code task
-- User: '帮我 review 这段 Rust 代码' → {"skill":"code-review","confidence":0.95} ✅ explicitly about code
-- User: '这个编译错误怎么修复：error[E0382]...' → {"skill":"debugger","confidence":0.9} ✅ compilation error with code
-- User: '优化一下这个函数的结构：fn foo() { ... }' → {"skill":"refactor","confidence":0.85} ✅ code refactoring with code
-- User: '查询数据库中的用户数据' → {"skill":"","confidence":0.1} ❌ data/business query, not code
-- User: '帮我一下我的飞书文档：dataagent 项目架构相关' → {"skill":"","confidence":0.1} ❌ about cloud documents, not code
-- User: '查看项目架构文档' → {"skill":"","confidence":0.1} ❌ documentation, not code
 Skills:
 "#.to_string();
 
-    for s in skills.iter().take(32) {
+    for s in skills {
         let desc = if s.description.trim().is_empty() {
             "(no description)".to_string()
         } else {
@@ -652,6 +612,7 @@ Skills:
         };
         system_prompt.push_str(&format!("- {}: {}\n", s.name, desc));
     }
+
     let messages = vec![
         Message {
             role: "system".to_string(),
@@ -687,17 +648,7 @@ Skills:
         .send()
         .await
         .ok()?;
-
     if !response.status().is_success() {
-        crate::ai::agent_hang_debug!(
-            "pre-fix",
-            "R",
-            "request::select_skill_via_model:http_non_success",
-            "[DEBUG] model skill router http non success",
-            {
-                "elapsed_ms": router_start.elapsed().as_secs_f64() * 1000.0,
-            },
-        );
         return None;
     }
 
@@ -705,13 +656,117 @@ Skills:
     let v: Value = serde_json::from_str(&text).ok()?;
     let content = extract_router_content(&v).unwrap_or_default();
     let (name, confidence) = parse_router_output(&content);
+    Some(SkillRouterDecision {
+        skill: name,
+        confidence,
+    })
+}
+
+#[crate::ai::agent_hang_span(
+    "pre-fix",
+    "R",
+    "request::select_skill_via_model",
+    "[DEBUG] model skill router started",
+    "[DEBUG] model skill router finished",
+    {
+        "question_len": question.chars().count(),
+        "skill_count": skills.len(),
+    },
+    {
+        "selected": __agent_hang_result.as_deref(),
+        "elapsed_ms": __agent_hang_elapsed_ms,
+    }
+)]
+pub(super) async fn select_skill_via_model(
+    app: &mut App,
+    _model: &str,
+    question: &str,
+    skills: &[SkillManifest],
+) -> Option<String> {
+    const SKILL_ROUTER_CHUNK_SIZE: usize = 32;
+    let router_start = Instant::now();
+    if question.trim().is_empty() {
+        crate::ai::agent_hang_debug!(
+            "pre-fix",
+            "R",
+            "request::select_skill_via_model:empty_question",
+            "[DEBUG] model skill router skipped empty question",
+            {
+                "elapsed_ms": router_start.elapsed().as_secs_f64() * 1000.0,
+            },
+        );
+        return None;
+    }
+    if skills.is_empty() {
+        crate::ai::agent_hang_debug!(
+            "pre-fix",
+            "R",
+            "request::select_skill_via_model:empty_skills",
+            "[DEBUG] model skill router skipped empty skills",
+            {
+                "elapsed_ms": router_start.elapsed().as_secs_f64() * 1000.0,
+            },
+        );
+        return None;
+    }
+
     let cfg = configw::get_all_config();
     let threshold = cfg
         .get_opt("ai.skills.router_threshold")
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(0.7);
-    let selected = if confidence >= threshold { name } else { None };
-    selected
+    let decision = if skills.len() <= SKILL_ROUTER_CHUNK_SIZE {
+        select_skill_candidate_via_model(app, question, skills).await
+    } else {
+        let mut chunk_best: Vec<(String, f64)> = Vec::new();
+        for chunk in skills.chunks(SKILL_ROUTER_CHUNK_SIZE) {
+            let Some(decision) = select_skill_candidate_via_model(app, question, chunk).await else {
+                continue;
+            };
+            let Some(name) = decision.skill else {
+                continue;
+            };
+            if let Some(existing) = chunk_best.iter_mut().find(|(n, _)| *n == name) {
+                if decision.confidence > existing.1 {
+                    existing.1 = decision.confidence;
+                }
+            } else {
+                chunk_best.push((name, decision.confidence));
+            }
+        }
+        chunk_best.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        if chunk_best.is_empty() {
+            None
+        } else if chunk_best.len() == 1 {
+            Some(SkillRouterDecision {
+                skill: Some(chunk_best[0].0.clone()),
+                confidence: chunk_best[0].1,
+            })
+        } else {
+            let finalists = chunk_best
+                .iter()
+                .filter_map(|(name, _)| skills.iter().find(|s| s.name == *name).cloned())
+                .collect::<Vec<_>>();
+            select_skill_candidate_via_model(app, question, &finalists).await.or_else(|| {
+                Some(SkillRouterDecision {
+                    skill: Some(chunk_best[0].0.clone()),
+                    confidence: chunk_best[0].1,
+                })
+            })
+        }
+    };
+    let Some(decision) = decision else {
+        return None;
+    };
+    if decision.confidence >= threshold {
+        decision.skill
+    } else {
+        None
+    }
 }
 
 fn agent_tools_for_request(app: &App, model: &str) -> (Option<Value>, Option<Value>) {
@@ -729,6 +784,123 @@ fn agent_tools_for_request(app: &App, model: &str) -> (Option<Value>, Option<Val
         .as_ref()
         .map(|_| Value::String("auto".to_string()));
     (tools_value, tool_choice)
+}
+
+fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
+    const MERGED_NOTES_MAX_CHARS: usize = 4_000;
+    const MERGED_SINGLE_NOTE_MAX_CHARS: usize = 1_200;
+
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum InternalNoteKind {
+        WorkingMemory,
+        CodeDiscovery,
+        CachedTools,
+        Summary,
+        SelfNote,
+        Generic,
+    }
+
+    fn truncate_chars(s: &str, max_chars: usize) -> String {
+        if s.chars().count() <= max_chars {
+            return s.to_string();
+        }
+        let mut out = String::new();
+        for ch in s.chars().take(max_chars.saturating_sub(1)) {
+            out.push(ch);
+        }
+        out.push('…');
+        out
+    }
+
+    fn detect_note_kind(text: &str) -> InternalNoteKind {
+        let trimmed = text.trim();
+        if trimmed.starts_with("Current code-inspection working memory:") {
+            return InternalNoteKind::WorkingMemory;
+        }
+        if trimmed.starts_with("code_discovery:") {
+            return InternalNoteKind::CodeDiscovery;
+        }
+        if trimmed.starts_with("Context note: reused cached tool results") {
+            return InternalNoteKind::CachedTools;
+        }
+        if trimmed.starts_with("对话摘要（自动压缩") || trimmed.starts_with("历史摘要（自动压缩") {
+            return InternalNoteKind::Summary;
+        }
+        if trimmed.starts_with("self_note:") {
+            return InternalNoteKind::SelfNote;
+        }
+        InternalNoteKind::Generic
+    }
+
+    fn note_heading(kind: InternalNoteKind) -> &'static str {
+        match kind {
+            InternalNoteKind::WorkingMemory => "Working Memory",
+            InternalNoteKind::CodeDiscovery => "Code Discoveries",
+            InternalNoteKind::CachedTools => "Cached Tool Results",
+            InternalNoteKind::Summary => "History Summary",
+            InternalNoteKind::SelfNote => "Self Notes",
+            InternalNoteKind::Generic => "Additional Notes",
+        }
+    }
+
+    let first_system_idx = messages
+        .iter()
+        .position(|m| m.role == ROLE_SYSTEM || is_internal_note_role(&m.role));
+    let Some(first_system_idx) = first_system_idx else {
+        return messages.to_vec();
+    };
+
+    let mut merged_notes: Vec<(usize, InternalNoteKind, String)> = Vec::new();
+    for (idx, message) in messages.iter().enumerate() {
+        if idx == first_system_idx || !is_system_like_role(&message.role) {
+            continue;
+        }
+        let text = message
+            .content
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+        if !text.is_empty() {
+            merged_notes.push((
+                idx,
+                detect_note_kind(text),
+                truncate_chars(text, MERGED_SINGLE_NOTE_MAX_CHARS),
+            ));
+        }
+    }
+    merged_notes.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut merged_first = messages[first_system_idx].clone();
+    merged_first.role = ROLE_SYSTEM.to_string();
+    if let Some(base) = merged_first.content.as_str() {
+        let mut content = base.to_string();
+        if !merged_notes.is_empty() {
+            content.push_str("\n\n[Merged system notes from history/runtime]\n");
+            let mut grouped = Vec::new();
+            let mut current_kind: Option<InternalNoteKind> = None;
+            for (_, kind, text) in merged_notes {
+                if current_kind != Some(kind) {
+                    grouped.push(format!("## {}", note_heading(kind)));
+                    current_kind = Some(kind);
+                }
+                grouped.push(text);
+            }
+            let merged_blob = truncate_chars(&grouped.join("\n\n"), MERGED_NOTES_MAX_CHARS);
+            content.push_str(&merged_blob);
+        }
+        merged_first.content = Value::String(content);
+    }
+
+    let mut out = Vec::with_capacity(messages.len());
+    out.push(merged_first);
+    for (idx, message) in messages.iter().enumerate() {
+        if idx == first_system_idx || is_system_like_role(&message.role) {
+            continue;
+        }
+        out.push(message.clone());
+    }
+    out
 }
 
 pub(super) fn build_content(
@@ -935,6 +1107,97 @@ mod tests {
         assert_eq!(value.get("enable_thinking").and_then(|v| v.as_bool()), Some(true));
         assert_eq!(value.get("enable_search").and_then(|v| v.as_bool()), Some(true));
     }
+
+    #[test]
+    fn normalize_messages_merges_non_leading_system_messages() {
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: Value::String("base system".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String("question".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+                content: Value::String("history summary".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String("answer".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+                content: Value::String("working memory".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+
+        let normalized = normalize_messages_for_request(&messages);
+
+        assert_eq!(normalized[0].role, "system");
+        assert_eq!(normalized.iter().filter(|m| m.role == "system").count(), 1);
+        let text = normalized[0].content.as_str().unwrap();
+        assert!(text.contains("base system"));
+        assert!(text.contains("history summary"));
+        assert!(text.contains("working memory"));
+        assert_eq!(normalized[1].role, "user");
+        assert_eq!(normalized[2].role, "assistant");
+    }
+
+    #[test]
+    fn normalize_messages_prioritizes_working_memory_before_summary_and_self_note() {
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: Value::String("base system".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+                content: Value::String("self_note:\nremember style".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+                content: Value::String(
+                    "对话摘要（自动压缩，以下为早期对话要点）：\nolder summary".to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+                content: Value::String(
+                    "Current code-inspection working memory:\n- use code_search first".to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+
+        let normalized = normalize_messages_for_request(&messages);
+        let text = normalized[0].content.as_str().unwrap();
+        let wm = text.find("## Working Memory").unwrap();
+        let summary = text.find("## History Summary").unwrap();
+        let self_note = text.find("## Self Notes").unwrap();
+        assert!(wm < summary);
+        assert!(summary < self_note);
+    }
+
+
 
     #[test]
     fn openai_image_content_uses_object_image_url_shape() {

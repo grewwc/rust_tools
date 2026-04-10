@@ -1,6 +1,6 @@
 /// Background color for code blocks.
-/// Uses a neutral dark gray (close to `#1E1E1E`) that blends well with modern dark terminals.
-pub(super) const MONOKAI_BG: &str = "\x1b[48;2;30;30;30m";
+/// A warm dark gray (#282828) that provides excellent contrast with Monokai colors.
+pub(super) const MONOKAI_BG: &str = "\x1b[48;2;40;40;40m";
 pub(super) const MONOKAI_FG: &str = "\x1b[38;2;248;248;242m";
 pub(super) const MONOKAI_COMMENT: &str = "\x1b[38;2;117;113;94m";
 pub(super) const MONOKAI_KEYWORD: &str = "\x1b[38;2;249;38;114m";
@@ -11,6 +11,8 @@ pub(super) const MONOKAI_IDENT: &str = MONOKAI_FG;
 pub(super) const MONOKAI_RESET: &str = "\x1b[0m";
 /// Semantic alias: restore default foreground after a token.
 pub(super) const MONOKAI_DEFAULT: &str = MONOKAI_FG;
+/// Dimmed color for line numbers and fence borders (#6B6B6B)
+pub(super) const MONOKAI_DIM: &str = "\x1b[38;2;107;107;107m";
 
 // ---------------------------------------------------------------------------
 // Parse code-block fence

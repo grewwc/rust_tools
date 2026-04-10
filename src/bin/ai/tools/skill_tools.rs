@@ -77,7 +77,7 @@ inventory::submit!(ToolRegistration {
         description: "Render and save a .skill file (YAML front matter + prompt body) into the configured skills directory.",
         parameters: params_save_skill,
         execute: execute_save_skill,
-        groups: &["builtin"],
+        groups: &["builtin", "core"],
     }
 });
 

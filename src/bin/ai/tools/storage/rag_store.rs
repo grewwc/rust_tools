@@ -379,6 +379,11 @@ impl crate::ai::knowledge::sync::knowledge_sync::VectorStoreSync for RagStore {
     fn embed_text(&self, text: &str) -> Result<Vec<f32>, String> {
         self.embed_text(text)
     }
+    
+    fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        // Use the optimized batch embedding
+        self.embed_texts(texts)
+    }
 }
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {

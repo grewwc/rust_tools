@@ -41,7 +41,7 @@ mod tests {
                 history_file: history_file.clone(),
                 endpoint: String::new(),
                 vl_default_model: String::new(),
-                history_max_chars: 12_000,
+                history_max_chars: 24_000,
                 history_keep_last: 256,
                 history_summary_max_chars: 4_000,
                 intent_model: None,

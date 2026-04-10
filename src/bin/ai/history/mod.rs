@@ -22,6 +22,17 @@ pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
 #[allow(unused_imports)]
 pub(in crate::ai) use types::{COLON, MAX_HISTORY_TURNS, Message, NEWLINE};
 
+pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
+pub(in crate::ai) const ROLE_INTERNAL_NOTE: &str = types::ROLE_INTERNAL_NOTE;
+
+pub(in crate::ai) fn is_internal_note_role(role: &str) -> bool {
+    types::is_internal_note_role(role)
+}
+
+pub(in crate::ai) fn is_system_like_role(role: &str) -> bool {
+    types::is_system_like_role(role)
+}
+
 pub(in crate::ai) fn build_context_history(
     history_count: usize,
     history_file: &PathBuf,

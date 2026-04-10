@@ -38,7 +38,7 @@ inventory::submit!(ToolRegistration {
         description: "Launch a specialized subagent to handle a focused task. Use this for complex work, codebase exploration, independent side investigations, or when multiple subtasks can be delegated. If agent is omitted, the runtime auto-selects a suitable subagent.",
         parameters: params_task,
         execute: execute_task,
-        groups: &["builtin"],
+        groups: &["builtin", "core"],
     }
 });
 
@@ -485,7 +485,7 @@ inventory::submit!(ToolRegistration {
         description: "Ask the user questions during execution. Use this to gather preferences, clarify ambiguous instructions, get decisions on implementation choices, or offer choices about direction. Returns the user's selected answer(s).",
         parameters: params_question,
         execute: execute_question,
-        groups: &["builtin"],
+        groups: &["builtin", "core"],
     }
 });
 

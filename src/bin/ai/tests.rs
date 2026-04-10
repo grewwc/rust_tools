@@ -227,7 +227,7 @@ fn history_compression_inserts_summary_and_keeps_recent() {
     let compressed = compress_messages_for_context(messages, 1200, 4, 200);
 
     assert!(!compressed.is_empty());
-    assert_eq!(compressed[0].role, "system");
+    assert_eq!(compressed[0].role, crate::ai::history::ROLE_INTERNAL_NOTE);
     assert!(compressed[0]
         .content
         .as_str()
@@ -369,7 +369,7 @@ fn history_compacts_old_turns_into_summary() {
             .unwrap();
         }
         let loaded = build_message_arr(10_000, &path).unwrap();
-        assert_eq!(loaded.first().unwrap().role, "system");
+        assert_eq!(loaded.first().unwrap().role, crate::ai::history::ROLE_INTERNAL_NOTE);
         assert!(loaded
             .first()
             .and_then(|m| m.content.as_str())
@@ -416,7 +416,7 @@ fn context_history_summarizes_beyond_history_count_instead_of_dropping() {
     let context = build_context_history(32, &path, 6000, 32, 2000).unwrap();
 
     assert!(!context.is_empty());
-    assert_eq!(context.first().unwrap().role, "system");
+    assert_eq!(context.first().unwrap().role, crate::ai::history::ROLE_INTERNAL_NOTE);
     assert!(context
         .first()
         .and_then(|m| m.content.as_str())
@@ -487,7 +487,7 @@ fn context_history_keep_last_counts_user_turns_not_raw_messages() {
         vec!["question-4".to_string(), "question-5".to_string()]
     );
     assert!(context.iter().any(|m| {
-        m.role == "system"
+        crate::ai::history::is_system_like_role(&m.role)
             && m.content
                 .as_str()
                 .unwrap_or_default()

@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::io::Read;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use regex::Regex;
@@ -69,6 +69,10 @@ fn params_web_fetch() -> Value {
             "url": {
                 "type": "string",
                 "description": "http/https URL to fetch. Localhost and private network targets are blocked; response body is capped at 512KB."
+            },
+            "extract_content": {
+                "type": "boolean",
+                "description": "When true, auto-extract main article content by removing nav, script, style, and boilerplate. Returns clean text optimized for LLM consumption. Default: false (returns raw HTML + metadata)."
             }
         },
         "required": ["url"]
@@ -88,7 +92,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "web_fetch",
-        description: "Fetch the raw response body of an http/https URL (10s timeout, 512KB cap). Blocks localhost/private network targets. Returns URL, status, content-type, and content.",
+        description: "Fetch the content of an http/https URL (10s timeout, 512KB cap). Blocks localhost/private network targets. Set extract_content=true to auto-remove nav, script, style and return clean article text. Returns URL, status, content-type, and content.",
         parameters: params_web_fetch,
         execute: execute_web_fetch,
         groups: &["builtin"],
@@ -177,7 +181,6 @@ pub(crate) fn execute_web_search(args: &Value) -> Result<String, String> {
         )),
     }
 }
-
 fn search_with_retries(
     query: &str,
     region: &str,
@@ -203,144 +206,29 @@ fn search_with_retries(
             started_at.elapsed()
         );
 
-        // Try primary search
-        match duckduckgo_search(query, region, time_range, limit, timeout) {
+        // Run all search sources in parallel; take first non-empty success
+        match search_all_parallel(query, region, time_range, limit, timeout) {
             Ok(hits) if !hits.is_empty() => {
-                eprintln!("[web_search] Success on primary (attempt {})", attempt + 1);
-                return Ok(hits);
-            }
-            Ok(_) => {
                 eprintln!(
-                    "[web_search] Primary returned empty (attempt {})",
-                    attempt + 1
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "[web_search] Primary failed (attempt {}): {}",
+                    "[web_search] Success (attempt {}, {:?} elapsed)",
                     attempt + 1,
-                    e
-                );
-                last_error = e;
-            }
-        }
-
-        let Some(timeout) = remaining_search_timeout(deadline) else {
-            break;
-        };
-        // Try fallback
-        match duckduckgo_search_fallback(query, region, time_range, limit, timeout) {
-            Ok(hits) if !hits.is_empty() => {
-                eprintln!("[web_search] Success on fallback (attempt {})", attempt + 1);
-                return Ok(hits);
-            }
-            Ok(_) => {
-                eprintln!(
-                    "[web_search] Fallback returned empty (attempt {})",
-                    attempt + 1
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "[web_search] Fallback failed (attempt {}): {}",
-                    attempt + 1,
-                    e
-                );
-                last_error = e;
-            }
-        }
-
-        let Some(timeout) = remaining_search_timeout(deadline) else {
-            break;
-        };
-        // Try alternative search endpoint
-        match duckduckgo_search_alternative(query, limit, timeout) {
-            Ok(hits) if !hits.is_empty() => {
-                eprintln!(
-                    "[web_search] Success on alternative (attempt {})",
-                    attempt + 1
+                    started_at.elapsed()
                 );
                 return Ok(hits);
             }
             Ok(_) => {
                 eprintln!(
-                    "[web_search] Alternative returned empty (attempt {})",
+                    "[web_search] All parallel sources returned empty (attempt {})",
                     attempt + 1
                 );
             }
             Err(e) => {
                 eprintln!(
-                    "[web_search] Alternative failed (attempt {}): {}",
+                    "[web_search] All parallel sources failed (attempt {}): {}",
                     attempt + 1,
                     e
                 );
                 last_error = e;
-            }
-        }
-
-        let Some(timeout) = remaining_search_timeout(deadline) else {
-            break;
-        };
-        // Try SearXNG search (free, open-source metasearch engine)
-        if let Some(instance) = std::env::var("SEARXNG_INSTANCE")
-            .ok()
-            .filter(|s| !s.is_empty())
-        {
-            match searxng_search(&instance, query, region, time_range, limit, timeout) {
-                Ok(hits) if !hits.is_empty() => {
-                    eprintln!("[web_search] Success on SearXNG (attempt {})", attempt + 1);
-                    return Ok(hits);
-                }
-                Ok(_) => {
-                    eprintln!(
-                        "[web_search] SearXNG returned empty (attempt {})",
-                        attempt + 1
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[web_search] SearXNG failed (attempt {}): {}",
-                        attempt + 1,
-                        e
-                    );
-                    last_error = e;
-                }
-            }
-        } else {
-            // Try public SearXNG instances as fallback
-            for instance in SEARXNG_PUBLIC_INSTANCES
-                .iter()
-                .take(MAX_PUBLIC_SEARXNG_INSTANCES_PER_ATTEMPT)
-            {
-                let Some(timeout) = remaining_search_timeout(deadline) else {
-                    break;
-                };
-                match searxng_search(instance, query, region, time_range, limit, timeout) {
-                    Ok(hits) if !hits.is_empty() => {
-                        eprintln!(
-                            "[web_search] Success on public SearXNG {} (attempt {})",
-                            instance,
-                            attempt + 1
-                        );
-                        return Ok(hits);
-                    }
-                    Ok(_) => {
-                        eprintln!(
-                            "[web_search] Public SearXNG {} returned empty (attempt {})",
-                            instance,
-                            attempt + 1
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[web_search] Public SearXNG {} failed (attempt {}): {}",
-                            instance,
-                            attempt + 1,
-                            e
-                        );
-                        last_error = e;
-                    }
-                }
             }
         }
 
@@ -357,6 +245,114 @@ fn search_with_retries(
     ))
 }
 
+/// Run all search sources in parallel and return the first successful non-empty result.
+fn search_all_parallel(
+    query: &str,
+    region: &str,
+    time_range: &str,
+    limit: usize,
+    timeout: Duration,
+) -> Result<Vec<WebSearchHit>, String> {
+    // Shared state: first successful non-empty result, or collected errors
+    let first_success: Arc<Mutex<Option<Result<Vec<WebSearchHit>, String>>>> =
+        Arc::new(Mutex::new(None));
+    let errors: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Build list of search tasks to run in parallel
+    let mut tasks: Vec<(&str, Box<dyn FnOnce() -> Result<Vec<WebSearchHit>, String> + Send>)> =
+        Vec::new();
+
+    tasks.push((
+        "ddg_primary",
+        Box::new(|| duckduckgo_search(query, region, time_range, limit, timeout)),
+    ));
+    tasks.push((
+        "ddg_fallback",
+        Box::new(|| duckduckgo_search_fallback(query, region, time_range, limit, timeout)),
+    ));
+    tasks.push((
+        "ddg_alternative",
+        Box::new(|| duckduckgo_search_alternative(query, limit, timeout)),
+    ));
+
+    // SearXNG: env var or public instances
+    if let Some(instance) = std::env::var("SEARXNG_INSTANCE")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        let instance = instance.clone();
+        tasks.push((
+            "searxng_env",
+            Box::new(move || {
+                searxng_search(&instance, query, region, time_range, limit, timeout)
+            }),
+        ));
+    } else {
+        for (i, instance) in SEARXNG_PUBLIC_INSTANCES
+            .iter()
+            .take(MAX_PUBLIC_SEARXNG_INSTANCES_PER_ATTEMPT)
+            .enumerate()
+        {
+            let instance = instance.to_string();
+            tasks.push((
+                "searxng_public",
+                Box::new(move || {
+                    searxng_search(&instance, query, region, time_range, limit, timeout)
+                        .map_err(|e| format!("searxng[{}]: {}", i, e))
+                }),
+            ));
+        }
+    }
+
+    // Spawn all tasks in parallel using thread::scope
+    std::thread::scope(|scope| {
+        for (name, task) in tasks {
+            let success_ref = Arc::clone(&first_success);
+            let errors_ref = Arc::clone(&errors);
+            scope.spawn(move || {
+                let result = task();
+                match &result {
+                    Ok(hits) if !hits.is_empty() => {
+                        // Only store first success
+                        let mut guard = success_ref.lock().unwrap();
+                        if guard.is_none() {
+                            eprintln!(
+                                "[web_search] {} succeeded first with {} hits",
+                                name,
+                                hits.len()
+                            );
+                            *guard = Some(result);
+                        }
+                    }
+                    Ok(_) => {
+                        eprintln!("[web_search] {} returned empty", name);
+                    }
+                    Err(e) => {
+                        eprintln!("[web_search] {} failed: {}", name, e);
+                        errors_ref.lock().unwrap().push((name.to_string(), e.clone()));
+                    }
+                }
+            });
+        }
+    });
+
+    // Check if we got a successful result
+    let guard = first_success.lock().unwrap();
+    if let Some(result) = guard.as_ref() {
+        return result.clone();
+    }
+    drop(guard);
+
+    // All failed or returned empty
+    let errs = errors.lock().unwrap();
+    if errs.is_empty() {
+        Ok(Vec::new())
+    } else {
+        let last_err = errs.last().map(|(_, e)| e.as_str()).unwrap_or("unknown");
+        Err(format!("All sources failed. Last: {}", last_err))
+    }
+}
+
 fn remaining_search_timeout(deadline: std::time::Instant) -> Option<Duration> {
     let remaining = deadline.checked_duration_since(std::time::Instant::now())?;
     if remaining.is_zero() {
@@ -367,6 +363,9 @@ fn remaining_search_timeout(deadline: std::time::Instant) -> Option<Duration> {
 
 pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
     let url = args["url"].as_str().ok_or("Missing url")?;
+    let extract_content = args["extract_content"]
+        .as_bool()
+        .unwrap_or(false);
     let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid url".to_string())?;
     let scheme = parsed.scheme();
     if scheme != "http" && scheme != "https" {
@@ -436,11 +435,40 @@ pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
         result.push_str(" (truncated at 512KB)");
     }
     result.push_str("\n\n--- Content ---\n\n");
-    result.push_str(&content);
+    if extract_content && content_type.starts_with("text/html") {
+        result.push_str(&extract_main_content(&content));
+    } else {
+        result.push_str(&content);
+    }
 
     Ok(result)
 }
 
+/// Extract main article content from HTML by removing script, style, nav,
+/// header, footer, sidebar, and other boilerplate elements. Returns clean text.
+fn extract_main_content(html: &str) -> String {
+    // Remove script and style elements first
+    let no_script = Regex::new(r"(?s)<script[^>]*>.*?</script>")
+        .map(|re| re.replace_all(html, "").to_string())
+        .unwrap_or_else(|_| html.to_string());
+    let no_style = Regex::new(r"(?s)<style[^>]*>.*?</style>")
+        .map(|re| re.replace_all(&no_script, "").to_string())
+        .unwrap_or_else(|_| no_script);
+    // Remove nav, header, footer, sidebar, aside
+    let no_nav = Regex::new(r"(?s)<(nav|header|footer|aside|sidebar)[^>]*>.*?</\1>")
+        .map(|re| re.replace_all(&no_style, "").to_string())
+        .unwrap_or_else(|_| no_style);
+    // Strip all remaining HTML tags
+    let text = strip_html_tags(&no_nav);
+    // Decode HTML entities
+    let decoded = decode_html_entities(&text);
+    // Remove excessive blank lines
+    let clean: Vec<&str> = decoded.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    clean.join("\n")
+}
 /// Public SearXNG instances (no API key required, but may be rate-limited)
 const SEARXNG_PUBLIC_INSTANCES: &[&str] = &[
     "https://search.bus-hit.me",

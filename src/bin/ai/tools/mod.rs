@@ -5,6 +5,7 @@ mod code_search;
 pub(crate) mod command_tools;
 mod common;
 mod context_tools;
+pub(crate) mod enable_tools;
 mod git_tools;
 mod knowledge_tools;
 mod lsp_tools;

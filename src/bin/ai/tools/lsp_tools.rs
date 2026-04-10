@@ -42,7 +42,7 @@ inventory::submit!(ToolRegistration {
         description: "Interact with Language Server Protocol (LSP) to get code intelligence. Supports: go_to_definition (find where a symbol is defined), find_references (find all usages of a symbol), hover (get type info and docs at cursor), document_symbol (list symbols in file), workspace_symbol (search symbols across project), diagnostics (get errors/warnings). Note: Requires appropriate LSP server to be running for the file's language.",
         parameters: params_lsp,
         execute: execute_lsp,
-        groups: &["builtin"],
+        groups: &["builtin", "core"],
     }
 });
 

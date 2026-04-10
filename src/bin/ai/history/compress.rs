@@ -1,6 +1,8 @@
 use serde_json::Value;
 
-use super::types::{MAX_HISTORY_TURNS, Message, retained_turn_start};
+use super::types::{
+    MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start,
+};
 
 const PERSISTED_HISTORY_KEEP_RECENT_TURNS: usize = 160;
 const PERSISTED_HISTORY_SUMMARY_MAX_CHARS: usize = 8_000;
@@ -31,7 +33,7 @@ pub(in crate::ai) fn compress_messages_for_context(
         let summary = build_persisted_summary_text(older, summary_max_chars);
         if !summary.trim().is_empty() {
             out.push(Message {
-                role: "system".to_string(),
+                role: ROLE_INTERNAL_NOTE.to_string(),
                 content: Value::String(format!(
                     "对话摘要（自动压缩，以下为早期对话要点）：\n{summary}"
                 )),
@@ -60,7 +62,7 @@ pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Me
     let mut out = Vec::with_capacity(messages.len() - split_at + 1);
     if !summary.is_empty() {
         out.push(Message {
-            role: "system".to_string(),
+            role: ROLE_INTERNAL_NOTE.to_string(),
             content: Value::String(format!(
                 "历史摘要（自动压缩，以下为更早对话的简短语义）：\n{summary}"
             )),
@@ -81,8 +83,8 @@ fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<M
         return Vec::new();
     }
 
-    truncate_tool_messages(&mut messages, 1200, 120);
-    summarize_tool_messages(&mut messages, 240);
+    truncate_tool_messages(&mut messages, 2400, 200);
+    summarize_tool_messages(&mut messages, 480);
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
 
@@ -91,8 +93,10 @@ fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<M
     }
 
     while messages_total_chars(&messages) > max_chars {
-        if let Some(idx) = first_index_of_role(&messages, "tool") {
-            messages.remove(idx);
+        if let Some(group) = first_tool_call_group(&messages) {
+            for idx in group.into_iter().rev() {
+                messages.remove(idx);
+            }
             continue;
         }
         if let Some(idx) = first_trim_candidate(&messages) {
@@ -141,45 +145,6 @@ pub(in crate::ai) fn value_to_string(v: &Value) -> String {
     v.as_str()
         .map(|s| s.to_string())
         .unwrap_or_else(|| v.to_string())
-}
-
-fn build_summary_text(messages: &[Message], max_chars: usize) -> String {
-    let mut lines = Vec::new();
-    for m in messages {
-        let role = match m.role.as_str() {
-            "user" => "用户",
-            "assistant" => "助手",
-            "tool" => "工具",
-            other => other,
-        };
-        let text = normalize_whitespace(&value_to_string(&m.content));
-
-        let tool_info = if let Some(ref tool_calls) = m.tool_calls {
-            let tool_names: Vec<&str> = tool_calls
-                .iter()
-                .map(|tc| tc.function.name.as_str())
-                .collect();
-            if !tool_names.is_empty() {
-                format!(" [tools: {}]", tool_names.join(", "))
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-
-        if text.is_empty() && tool_info.is_empty() {
-            continue;
-        }
-
-        let snippet = truncate_to_chars(&text, 200);
-        lines.push(format!("{role}: {snippet}{tool_info}"));
-        if lines.join("\n").len() >= max_chars {
-            break;
-        }
-    }
-    let joined = lines.join("\n");
-    truncate_to_chars(&joined, max_chars)
 }
 
 fn normalize_whitespace(s: &str) -> String {
@@ -456,7 +421,7 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
             line.push_str(" => ");
             line.push_str(&conclusion);
         }
-        Some(truncate_to_chars(&line, 240))
+        Some(truncate_to_chars(&line, 320))
     }
 
     fn push_line_with_budget(lines: &mut Vec<String>, line: String, max_chars: usize) -> bool {
@@ -483,7 +448,7 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
     for message in messages {
         let text = normalize_whitespace(&value_to_string(&message.content));
         match message.role.as_str() {
-            "system" => {
+            role if is_system_like_role(role) => {
                 let normalized = strip_summary_header(&text);
                 if normalized.is_empty() || normalized.starts_with("self_note:") {
                     continue;
@@ -563,7 +528,7 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
         }
         if let Some(line) = render_known_tool_line(t)
             && !known_tool_lines.iter().any(|existing| existing == &line)
-            && known_tool_lines.len() < 6
+            && known_tool_lines.len() < 10
         {
             known_tool_lines.push(line);
         }
@@ -598,13 +563,28 @@ fn truncate_to_chars(s: &str, max_chars: usize) -> String {
     out
 }
 
-fn first_index_of_role(messages: &[Message], role: &str) -> Option<usize> {
+fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> {
+    let assistant_idx = messages.iter().position(|m| {
+        m.role == "assistant" && m.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty())
+    })?;
+    let tool_call_ids: Vec<String> = messages[assistant_idx]
+        .tool_calls
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|tc| tc.id.clone())
+        .collect();
+    let mut group = vec![assistant_idx];
     for (i, m) in messages.iter().enumerate() {
-        if m.role == role {
-            return Some(i);
+        if m.role == "tool" {
+            if let Some(ref id) = m.tool_call_id {
+                if tool_call_ids.contains(id) {
+                    group.push(i);
+                }
+            }
         }
     }
-    None
+    Some(group)
 }
 
 fn first_trim_candidate(messages: &[Message]) -> Option<usize> {
@@ -618,18 +598,31 @@ fn first_trim_candidate(messages: &[Message]) -> Option<usize> {
 }
 
 fn is_summary_message(message: &Message) -> bool {
-    if message.role != "system" {
+    if !is_system_like_role(&message.role) {
         return false;
     }
     let text = value_to_string(&message.content);
     text.starts_with("对话摘要（自动压缩") || text.starts_with("历史摘要（自动压缩")
 }
 
+const KEEP_RECENT_TOOL_MESSAGES: usize = 6;
+
+fn tool_message_indices(messages: &[Message]) -> Vec<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| (m.role == "tool").then_some(i))
+        .collect()
+}
+
 fn truncate_tool_messages(messages: &mut [Message], max_chars_per_msg: usize, max_lines: usize) {
-    for m in messages.iter_mut() {
-        if m.role.as_str() != "tool" {
-            continue;
+    let indices = tool_message_indices(messages);
+    let protect_from = indices.len().saturating_sub(KEEP_RECENT_TOOL_MESSAGES);
+    for (rank, &idx) in indices.iter().enumerate() {
+        if rank >= protect_from {
+            break;
         }
+        let m = &mut messages[idx];
         let text = value_to_string(&m.content);
         if text.is_empty() {
             continue;
@@ -654,10 +647,13 @@ fn truncate_tool_messages(messages: &mut [Message], max_chars_per_msg: usize, ma
 }
 
 fn summarize_tool_messages(messages: &mut [Message], max_chars_per_msg: usize) {
-    for message in messages.iter_mut() {
-        if message.role.as_str() != "tool" {
-            continue;
+    let indices = tool_message_indices(messages);
+    let protect_from = indices.len().saturating_sub(KEEP_RECENT_TOOL_MESSAGES);
+    for (rank, &idx) in indices.iter().enumerate() {
+        if rank >= protect_from {
+            break;
         }
+        let message = &mut messages[idx];
         let text = value_to_string(&message.content);
         if text.is_empty() {
             continue;

@@ -1,7 +1,7 @@
 use std::io::{self, Write};
 
 use crate::ai::stream::render::code::{
-    MONOKAI_BG, MONOKAI_COMMENT, highlight_code_line, parse_code_block_language,
+    MONOKAI_BG, MONOKAI_DIM, highlight_code_line, parse_code_block_language,
 };
 use crate::ai::stream::render::inline::render_inline_md;
 use crate::ai::stream::render::table::{
@@ -16,6 +16,7 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     enabled: bool,
     in_code_block: bool,
     code_block_lang: Option<String>,
+    code_line_number: usize,
     in_math_block: bool,
     bol: bool,
     line_buf: String,
@@ -37,6 +38,7 @@ impl MarkdownStreamRenderer {
             enabled: true,
             in_code_block: false,
             code_block_lang: None,
+            code_line_number: 0,
             in_math_block: false,
             bol: false,
             line_buf: String::new(),
@@ -82,6 +84,14 @@ impl MarkdownStreamRenderer {
 
     pub(in crate::ai::stream::render) fn code_block_lang(&self) -> Option<&str> {
         self.code_block_lang.as_deref()
+    }
+
+    pub(in crate::ai::stream::render) fn code_line_number(&self) -> usize {
+        self.code_line_number
+    }
+
+    pub(in crate::ai::stream::render) fn reset_code_line_number(&mut self) {
+        self.code_line_number = 0;
     }
 
     fn handle_newline(&mut self, out: &mut std::io::Stdout) -> io::Result<()> {
@@ -356,19 +366,30 @@ impl MarkdownStreamRenderer {
             if self.in_code_block {
                 self.in_code_block = false;
                 self.code_block_lang = None;
+                // Bottom border for code block
+                let total = 40usize.max(self.code_line_number.to_string().len() + 4);
+                let border = "─".repeat(total);
+                return format!("{indent}{MONOKAI_BG}{MONOKAI_DIM}└{border}\x1b[0m\n");
             } else {
+                // Top border with language label
                 self.in_code_block = true;
                 self.code_block_lang = parse_code_block_language(trimmed);
+                self.code_line_number = 0;
+                let lang = self.code_block_lang.as_deref().unwrap_or("");
+                return format!("{indent}{MONOKAI_BG}{MONOKAI_DIM}┌─ {lang}\x1b[0m\n");
             }
-            return format!("{indent}{MONOKAI_BG}{MONOKAI_COMMENT}{trimmed}\x1b[0m\n");
         }
 
         if self.in_code_block {
+            self.code_line_number += 1;
+            let line_num = format!("{}", self.code_line_number);
+            let line_num_str = format!("{:>3}", line_num);
             if line.is_empty() {
-                return "\n".to_string();
+                return format!("{indent}{MONOKAI_BG}{MONOKAI_DIM}{} │\x1b[0m\n", line_num_str);
             }
             return format!(
-                "{indent}{MONOKAI_BG}{base}{}\x1b[0m\n",
+                "{indent}{MONOKAI_BG}{MONOKAI_DIM}{} │{base}{}\x1b[0m\n",
+                line_num_str,
                 highlight_code_line(rest, self.code_block_lang.as_deref())
             );
         }

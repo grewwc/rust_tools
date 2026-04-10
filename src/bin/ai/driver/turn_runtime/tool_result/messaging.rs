@@ -8,7 +8,7 @@ use crate::ai::{
         priority_for_confidence, render_record, should_persist,
     },
     driver::{print::print_tool_output_block, tools::ExecuteToolCallsResult},
-    history::Message,
+    history::{Message, ROLE_INTERNAL_NOTE, is_system_like_role},
     types::ToolCall,
     types::App,
 };
@@ -43,7 +43,7 @@ pub(super) fn record_hidden_self_note(app: &App, turn_messages: &mut Vec<Message
     }
 
     let record = Message {
-        role: "system".to_string(),
+        role: ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(format!("self_note:\n{hidden_meta}")),
         tool_calls: None,
         tool_call_id: None,
@@ -81,7 +81,7 @@ pub(super) fn append_cached_tool_results_note(
         .collect::<Vec<_>>()
         .join(", ");
     let cache_note = Message {
-        role: "system".to_string(),
+        role: ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(format!(
             "Context note: reused cached tool results from the current session for identical calls within the recent TTL. Treat these results as already verified context unless the user asks to refresh. Tools: {cached_names}"
         )),
@@ -141,7 +141,7 @@ pub(super) fn append_code_inspection_working_memory(
     };
 
     let duplicate = messages.iter().rev().find_map(|message| {
-        if message.role != "system" {
+        if !is_system_like_role(&message.role) {
             return None;
         }
         match &message.content {
@@ -156,7 +156,7 @@ pub(super) fn append_code_inspection_working_memory(
     }
 
     messages.push(Message {
-        role: "system".to_string(),
+        role: ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note),
         tool_calls: None,
         tool_call_id: None,
@@ -185,7 +185,7 @@ pub(super) fn record_persistent_code_discoveries(
     }
 
     let record = Message {
-        role: "system".to_string(),
+        role: ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(format!("{CODE_DISCOVERY_PREFIX}\n{body}")),
         tool_calls: None,
         tool_call_id: None,
@@ -237,9 +237,6 @@ pub(super) fn record_final_stream_response(
 
 fn build_code_inspection_working_memory(turn_messages: &[Message]) -> Option<String> {
     let findings = collect_repo_inspection_findings(turn_messages);
-    if findings.is_empty() {
-        return None;
-    }
 
     let mut raw_repo_tool_count = 0usize;
     let mut code_search_count = 0usize;
@@ -261,6 +258,10 @@ fn build_code_inspection_working_memory(turn_messages: &[Message]) -> Option<Str
         }
     }
 
+    if findings.is_empty() && raw_repo_tool_count < 2 {
+        return None;
+    }
+
     let mut note = String::from(CODE_INSPECTION_MEMORY_PREFIX);
     note.push('\n');
     for finding in findings.iter().rev().take(6).rev() {
@@ -270,13 +271,13 @@ fn build_code_inspection_working_memory(turn_messages: &[Message]) -> Option<Str
     note.push_str(
         "Treat these findings as already-known context for the current debugging turn. Avoid re-running the same raw file/search reads unless you need verification or a narrower slice.\n",
     );
-    if raw_repo_tool_count >= 3 && code_search_count == 0 {
+    if raw_repo_tool_count >= 2 && code_search_count == 0 {
         note.push_str(
-            "Code-navigation correction: you have used several raw inspection tools without `code_search`. Before more `read_file`, `read_file_lines`, `search_files`, or `grep_search`, prefer `code_search` to narrow the location unless the exact file and line range are already known.\n",
+            "Code-navigation correction: you have used raw inspection tools without `code_search`. STOP using `read_file`, `read_file_lines`, `search_files`, or `grep_search` for exploration. Use `code_search` first to locate the relevant file/symbol/definition before reading specific lines.\n",
         );
-    } else if raw_repo_tool_count >= 5 && code_search_count <= 1 {
+    } else if raw_repo_tool_count >= 3 && code_search_count <= 1 {
         note.push_str(
-            "Code-navigation correction: rely on the recent findings above and prefer `code_search` for the next narrowing step instead of another broad raw read/search.\n",
+            "Code-navigation correction: too many raw reads/searches. Use `code_search` for the next step instead of another `read_file_lines` or `grep_search`.\n",
         );
     }
     Some(truncate_note(&note, 1800))
@@ -562,7 +563,7 @@ mod tests {
         assert!(note.contains("read_file_lines(file=src/lib.rs, lines=10..29)"));
         assert!(note.contains("grep_search(query=panic!)"));
         assert!(note.contains("Code-navigation correction"));
-        assert!(note.contains("prefer `code_search`"));
+        assert!(note.contains("Use `code_search`"));
     }
 
     #[test]

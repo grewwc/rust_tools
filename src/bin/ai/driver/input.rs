@@ -311,7 +311,7 @@ fn collect_history_messages(
             HistoryRoleFilter::User => message.role == "user",
             HistoryRoleFilter::Assistant => message.role == "assistant",
             HistoryRoleFilter::Tool => message.role == "tool",
-            HistoryRoleFilter::System => message.role == "system",
+            HistoryRoleFilter::System => crate::ai::history::is_system_like_role(&message.role),
         })
         .filter(|message| {
             options.grep.as_deref().is_none_or(|needle| {

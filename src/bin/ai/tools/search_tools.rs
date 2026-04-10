@@ -75,7 +75,7 @@ inventory::submit!(ToolRegistration {
         description: "Find files under a directory by exact filename (fast) or glob pattern. Returns canonical absolute paths, one per line (empty output means no matches).",
         parameters: params_search_files,
         execute: execute_search_files,
-        groups: &["builtin"],
+        groups: &["builtin", "core"],
     }
 });
 
@@ -85,7 +85,7 @@ inventory::submit!(ToolRegistration {
         description: "Fast file-path search under a root directory using filename match or glob. Returns paths relative to the current working directory (may include ANSI highlighting).",
         parameters: params_grep_search,
         execute: execute_grep_search,
-        groups: &["builtin"],
+        groups: &["builtin", "core"],
     }
 });
 

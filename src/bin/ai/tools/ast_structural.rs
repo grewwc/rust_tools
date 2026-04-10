@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::fs;
+use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 
 use streaming_iterator::StreamingIterator;
@@ -48,44 +49,86 @@ pub(crate) fn execute_structural_search(
         ));
     }
 
-    let mut matches = Vec::new();
-    let mut unsupported_files = 0usize;
 
-    for file in files {
-        let Some((language_name, language)) = language_for_path(&file) else {
-            unsupported_files += 1;
-            continue;
-        };
-        let query = match resolve_query_for_language(request, language_name) {
-            Ok(Some(query)) => query,
-            Ok(None) => {
-                unsupported_files += 1;
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
-        let content = match fs::read_to_string(&file) {
-            Ok(content) => content,
-            Err(_) => continue,
-        };
-        let file_matches = match run_query_on_file(language, &query, &file, &content) {
-            Ok(file_matches) => file_matches,
-            Err(err) => {
-                return Err(format!(
-                    "Failed to run AST structural search for {} file '{}': {}",
-                    language_name,
-                    file.display(),
-                    err
-                ));
-            }
-        };
-        matches.extend(
-            file_matches
-                .into_iter()
-                .map(|m| normalize_match(language_name, request, m))
-                .filter(|m| match_filters(m, filters)),
-        );
+    
+    // Parallel AST structural search across files
+    let max_threads = (num_cpus::get() / 2).max(1);
+    let chunk_size = (files.len() / max_threads).max(1);
+    let chunks: Vec<Vec<PathBuf>> = files.chunks(chunk_size).map(|c| c.to_vec()).collect();
+    
+    let all_matches: Arc<Mutex<Vec<(String, Vec<StructuralMatch>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let error_occurred: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let unsupported_count: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    
+    std::thread::scope(|scope| {
+        for chunk in chunks {
+            let matches_ref = Arc::clone(&all_matches);
+            let error_ref = Arc::clone(&error_occurred);
+            let unsupported_ref = Arc::clone(&unsupported_count);
+            scope.spawn(move || {
+                let mut local_results: Vec<(String, Vec<StructuralMatch>)> = Vec::new();
+                for file in chunk {
+                    if error_ref.lock().unwrap().is_some() {
+                        break;
+                    }
+                    let Some((language_name, language)) = language_for_path(&file) else {
+                        unsupported_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    };
+                    let query = match resolve_query_for_language(request, language_name) {
+                        Ok(Some(query)) => query,
+                        Ok(None) => {
+                            unsupported_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            continue;
+                        }
+                        Err(err) => {
+                            *error_ref.lock().unwrap() = Some(err);
+                            return;
+                        }
+                    };
+                    let content = match fs::read_to_string(&file) {
+                        Ok(content) => content,
+                        Err(_) => continue,
+                    };
+                    let file_matches = match run_query_on_file(language, &query, &file, &content) {
+                        Ok(file_matches) => file_matches,
+                        Err(err) => {
+                            *error_ref.lock().unwrap() = Some(format!(
+                                "Failed to run AST structural search for {} file '{}': {}",
+                                language_name,
+                                file.display(),
+                                err
+                            ));
+                            return;
+                        }
+                    };
+                    let filtered: Vec<StructuralMatch> = file_matches
+                        .into_iter()
+                        .map(|m| normalize_match(language_name, request, m))
+                        .filter(|m| match_filters(m, filters))
+                        .collect();
+                    if !filtered.is_empty() {
+                        local_results.push((language_name.to_string(), filtered));
+                    }
+                }
+                if !local_results.is_empty() {
+                    matches_ref.lock().unwrap().extend(local_results);
+                }
+            });
+        }
+    });
+    
+    // Check for errors
+    if let Some(err) = error_occurred.lock().unwrap().as_ref() {
+        return Err(err.clone());
     }
+    
+    let all_results = all_matches.lock().unwrap();
+    let mut matches: Vec<StructuralMatch> = Vec::new();
+    for (_, file_matches) in all_results.iter() {
+        matches.extend(file_matches.iter().cloned());
+    }
+    let unsupported_files = unsupported_count.load(std::sync::atomic::Ordering::Relaxed);
 
     if matches.is_empty() {
         return Ok(format!(
