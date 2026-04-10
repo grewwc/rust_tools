@@ -5,11 +5,13 @@ pub(super) enum ApiProvider {
     Compatible,
     #[serde(alias = "openai")]
     OpenAi,
+    #[serde(alias = "opencode")]
+    OpenCode,
 }
 
 impl ApiProvider {
     pub(super) fn is_openai(self) -> bool {
-        matches!(self, Self::OpenAi)
+        matches!(self, Self::OpenAi | Self::OpenCode)
     }
 }
 
@@ -54,5 +56,14 @@ mod tests {
         .unwrap();
         assert_eq!(def.provider, ApiProvider::OpenAi);
         assert_eq!(def.quality_tier, ModelQualityTier::Flagship);
+    }
+
+    #[test]
+    fn parses_opencode_provider_alias() {
+        let def: ModelDef = serde_json::from_str(
+            r#"{"key":"X","name":"x","provider":"opencode","quality_tier":"basic","is_vl":false,"search_enabled":false,"tools_default_enabled":true}"#,
+        )
+        .unwrap();
+        assert_eq!(def.provider, ApiProvider::OpenCode);
     }
 }

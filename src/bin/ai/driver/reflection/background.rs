@@ -352,16 +352,16 @@ pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Optio
         return None;
     }
     let body = match crate::ai::models::model_provider(model) {
-        crate::ai::provider::ApiProvider::OpenAi => json!({
-            "model": model,
-            "messages": messages,
-            "stream": false
-        }),
         crate::ai::provider::ApiProvider::Compatible => json!({
             "model": model,
             "messages": messages,
             "stream": false,
             "enable_thinking": false
+        }),
+        _ => json!({
+            "model": model,
+            "messages": messages,
+            "stream": false
         }),
     };
     let client = reqwest::Client::new();

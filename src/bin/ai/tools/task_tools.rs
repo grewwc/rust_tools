@@ -202,6 +202,7 @@ fn format_provider(provider: crate::ai::provider::ApiProvider) -> &'static str {
     match provider {
         crate::ai::provider::ApiProvider::Compatible => "compatible",
         crate::ai::provider::ApiProvider::OpenAi => "openai",
+        _ => "opencode",
     }
 }
 

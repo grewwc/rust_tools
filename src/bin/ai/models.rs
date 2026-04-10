@@ -8,6 +8,7 @@ use crate::commonw::configw;
 const COMPATIBLE_DEFAULT_ENDPOINT: &str =
     "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 const OPENAI_DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
+const OPENCODE_DEFAULT_ENDPOINT: &str = "https://opencode.ai/zen/v1/chat/completions";
 const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 pub(super) fn is_vl_model(model: &str) -> bool {
@@ -44,6 +45,7 @@ fn default_endpoint_for_provider(provider: ApiProvider) -> &'static str {
     match provider {
         ApiProvider::Compatible => COMPATIBLE_DEFAULT_ENDPOINT,
         ApiProvider::OpenAi => OPENAI_DEFAULT_ENDPOINT,
+        ApiProvider::OpenCode => OPENCODE_DEFAULT_ENDPOINT,
     }
 }
 
@@ -59,16 +61,22 @@ fn default_api_key_config_candidates(provider: ApiProvider) -> &'static [&'stati
             AiConfig::MODEL_OPENAI_API_KEY,
             AiConfig::MODEL_API_KEY,
         ],
+        ApiProvider::OpenCode => &[AiConfig::MODEL_OPENCODE_API_KEY, AiConfig::MODEL_API_KEY],
     }
 }
 
 pub(super) fn endpoint_for_model(model: &str, global_fallback: &str) -> String {
-    if let Some(endpoint) = model_names::find_by_name(model)
-        .and_then(|m| m.endpoint.as_deref())
-        .map(str::trim)
-        .filter(|endpoint| !endpoint.is_empty())
-    {
-        return endpoint.to_string();
+    if let Some(model_def) = model_names::find_by_name(model) {
+        if let Some(endpoint) = model_def
+            .endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|endpoint| !endpoint.is_empty())
+        {
+            return endpoint.to_string();
+        }
+
+        return default_endpoint_for_provider(model_def.provider).to_string();
     }
 
     let global_fallback = global_fallback.trim();
@@ -521,7 +529,7 @@ mod tests {
         classify_subagent_task_difficulty, default_model, default_vl_model, determine_model,
         determine_vl_model, endpoint_for_model, initial_model, merge_agent_tier_with_difficulty,
         endpoint_supports_anonymous_auth, model_provider, model_quality_tier, ModelStrengthTier, SubagentTaskDifficulty,
-        COMPATIBLE_DEFAULT_ENDPOINT, OPENROUTER_ENDPOINT,
+        COMPATIBLE_DEFAULT_ENDPOINT, OPENCODE_DEFAULT_ENDPOINT, OPENROUTER_ENDPOINT,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
@@ -701,6 +709,18 @@ mod tests {
     fn openrouter_models_use_openrouter_endpoint_in_config() {
         let endpoint = endpoint_for_model("deepseek-v3.2", "");
         assert_eq!(endpoint, OPENROUTER_ENDPOINT);
+    }
+
+    #[test]
+    fn known_model_without_endpoint_uses_provider_default_before_global_fallback() {
+        let endpoint = endpoint_for_model("minimax-m2.5-free", "https://example.com/v1/chat/completions");
+        assert_eq!(endpoint, OPENCODE_DEFAULT_ENDPOINT);
+    }
+
+    #[test]
+    fn unknown_model_uses_global_fallback_endpoint() {
+        let endpoint = endpoint_for_model("custom-model", "https://example.com/v1/chat/completions");
+        assert_eq!(endpoint, "https://example.com/v1/chat/completions");
     }
 
     #[test]

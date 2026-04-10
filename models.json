@@ -198,5 +198,25 @@
     "search_enabled": false,
     "tools_default_enabled": true,
     "enable_thinking": false
+  },
+  {
+    "key": "MiniMax M2.5 Free",
+    "name": "minimax-m2.5-free",
+    "provider": "opencode",
+    "quality_tier": "basic",
+    "is_vl": false,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": false
+  },
+  {
+    "key": "Nemotron 3 Super Free",
+    "name": "nemotron-3-super-free",
+    "provider": "opencode",
+    "quality_tier": "basic",
+    "is_vl": false,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": false
   }
 ]

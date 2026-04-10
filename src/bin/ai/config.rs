@@ -11,6 +11,9 @@ use super::{models, types::AppConfig};
 pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     let cfg = configw::get_all_config();
     let api_key = cfg.get_opt("api_key").unwrap_or_default();
+    let opencode_api_key = cfg
+        .get_opt(AiConfig::MODEL_OPENCODE_API_KEY)
+        .unwrap_or_default();
     let openrouter_api_key = cfg
         .get_opt(AiConfig::MODEL_OPENROUTER_API_KEY)
         .unwrap_or_default();
@@ -26,13 +29,14 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         models::determine_model(&cfg.get_opt(AiConfig::MODEL_DEFAULT).unwrap_or_default());
     let default_endpoint = models::endpoint_for_model(&default_model, &endpoint);
     if api_key.trim().is_empty()
+        && opencode_api_key.trim().is_empty()
         && openrouter_api_key.trim().is_empty()
         && compatible_api_key.trim().is_empty()
         && aliyun_api_key.trim().is_empty()
         && openai_api_key.trim().is_empty()
         && !models::endpoint_supports_anonymous_auth(&default_endpoint)
     {
-        println!("set api_key / openrouter.api_key / compatible.api_key / aliyun.api_key / openai.api_key in ~/.configW");
+        println!("set api_key / opencode.api_key / openrouter.api_key / compatible.api_key / aliyun.api_key / openai.api_key in ~/.configW");
         std::process::exit(0);
     }
     let history_file = cfg

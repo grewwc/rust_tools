@@ -200,7 +200,8 @@ fn control_model_for_aux_tasks(app: &App) -> String {
         .filter(|v| !v.trim().is_empty())
         .map(models::determine_model)
         .unwrap_or_else(|| match models::model_provider(&app.current_model) {
-            ApiProvider::OpenAi => {
+            ApiProvider::Compatible => models::determine_model(DEFAULT_CONTROL_MODEL),
+            _ => {
                 let current_model = app.current_model.trim();
                 if current_model.is_empty() {
                     "gpt-4o-mini".to_string()
@@ -208,7 +209,6 @@ fn control_model_for_aux_tasks(app: &App) -> String {
                     current_model.to_string()
                 }
             }
-            ApiProvider::Compatible => models::determine_model(DEFAULT_CONTROL_MODEL),
         })
 }
 
@@ -967,15 +967,15 @@ pub(super) fn build_content(
         let mime = files::image_mime_type(file);
         let image = base64::engine::general_purpose::STANDARD.encode(bytes);
         parts.push(match provider {
-            ApiProvider::OpenAi => json!({
+            ApiProvider::Compatible => json!({
+                "type": "image_url",
+                "image_url": format!("data:{mime};base64,{image}"),
+            }),
+            _ => json!({
                 "type": "image_url",
                 "image_url": {
                     "url": format!("data:{mime};base64,{image}")
                 },
-            }),
-            ApiProvider::Compatible => json!({
-                "type": "image_url",
-                "image_url": format!("data:{mime};base64,{image}"),
             }),
         });
     }
@@ -1007,21 +1007,21 @@ fn build_request_body<'a>(
 ) -> RequestBody<'a> {
     let provider = models::model_provider(model);
     match provider {
-        ApiProvider::OpenAi => RequestBody {
-            model,
-            messages,
-            stream,
-            enable_thinking: None,
-            enable_search: None,
-            tools,
-            tool_choice,
-        },
         ApiProvider::Compatible => RequestBody {
             model,
             messages,
             stream,
             enable_thinking: Some(enable_thinking),
             enable_search,
+            tools,
+            tool_choice,
+        },
+        _ => RequestBody {
+            model,
+            messages,
+            stream,
+            enable_thinking: None,
+            enable_search: None,
             tools,
             tool_choice,
         },
