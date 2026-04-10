@@ -8,7 +8,7 @@ use crate::ai::{
         CodeDiscoveryRecord, parse_confidence, parse_kind, parse_record_line, recall_limit,
         recall_rank, render_record,
     },
-    driver::{reflection, skill_runtime},
+    driver::{print::print_ocr_summary, reflection, skill_runtime},
     history::{Message, build_context_history},
     request,
     tools::storage::memory_store::{AgentMemoryEntry, MemoryStore},
@@ -166,19 +166,18 @@ pub(super) async fn prepare_turn(
     let user_message = Message {
         role: "user".to_string(), 
         content: {
-            // 检查模型是否支持图片输入
-            let model_supports_images = crate::ai::driver::model::model_supports_images(next_model);
             let has_images = !app.attached_image_files.is_empty();
-            
-            // 如果模型不支持图片但有图片，进行 OCR
             let mut final_question = question.to_string();
-            if has_images && !model_supports_images {
-                if let Ok(ocr_content) = crate::ai::driver::model::ocr_images_for_text_model(
+            if has_images {
+                if let Ok(Some(ocr)) = crate::ai::driver::model::ocr_images_for_attached_input(
                     mcp_client,
                     &app.attached_image_files,
                 ) {
-                    final_question = format!("{}\n\n{}", final_question, ocr_content);
-                    println!("[OCR] Converted {} image(s) to text for non-VL model", app.attached_image_files.len());
+                    print_ocr_summary(&ocr);
+                    final_question = format!(
+                        "{}\n\n[Auto OCR From Attached Images via {}]\n{}",
+                        final_question, ocr.tool_name, ocr.content
+                    );
                 }
             }
             request::build_content(next_model, &final_question, &app.attached_image_files)?

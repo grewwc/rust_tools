@@ -781,6 +781,19 @@ mod tests {
     }
 
     #[test]
+    fn pending_files_image_is_attached_for_dash_f_flow() {
+        let path = std::env::temp_dir().join(format!("ai-pending-image-{}.png", Uuid::new_v4()));
+        std::fs::write(&path, b"fake").unwrap();
+
+        let mut app = test_app();
+        app.pending_files = Some(path.to_string_lossy().to_string());
+        let ctx = finalize_question(&mut app, "describe this".to_string(), 6, false).unwrap();
+
+        assert_eq!(ctx.question, "describe this");
+        assert_eq!(app.attached_image_files, vec![path.to_string_lossy().to_string()]);
+    }
+
+    #[test]
     fn parse_local_command_supports_history_default_and_custom_count() {
         assert_eq!(
             parse_local_command("/history").unwrap(),

@@ -1,4 +1,5 @@
 use crate::ai::{
+    driver::model::OcrExtraction,
     driver::McpInitReport,
     mcp::McpClient,
     skills::SkillManifest,
@@ -16,6 +17,12 @@ pub fn print_assistant_banner_with_app(app: Option<&App>) {
 
 pub fn print_tool_output_block(content: &str) {
     for line in format_tool_output_block(content) {
+        println!("{line}");
+    }
+}
+
+pub fn print_ocr_summary(extraction: &OcrExtraction) {
+    for line in format_ocr_summary_block(extraction) {
         println!("{line}");
     }
 }
@@ -95,6 +102,44 @@ pub(in crate::ai) fn format_tool_output_block(content: &str) -> Vec<String> {
         .collect()
 }
 
+pub(in crate::ai) fn format_ocr_summary_block(extraction: &OcrExtraction) -> Vec<String> {
+    let mut lines = Vec::with_capacity(extraction.images.len() + 1);
+    let ok_count = extraction.images.iter().filter(|img| img.error.is_none()).count();
+    let failed_count = extraction.images.len().saturating_sub(ok_count);
+    let detail = if failed_count == 0 {
+        format!("{} images · {}", extraction.images.len(), extraction.tool_name)
+    } else {
+        format!(
+            "{} images · {} ok · {} failed · {}",
+            extraction.images.len(),
+            ok_count,
+            failed_count,
+            extraction.tool_name
+        )
+    };
+    lines.push(format_section_header("ocr", Some(&detail)));
+    for image in &extraction.images {
+        let description = if let Some(err) = &image.error {
+            format!("failed · {}", truncate_terminal_detail(err, 120))
+        } else if image.extracted_chars == 0 {
+            "ok · empty text".to_string()
+        } else {
+            format!("ok · {} chars", image.extracted_chars)
+        };
+        lines.push(format_section_item(&image.file_name, &description));
+    }
+    lines
+}
+
+fn truncate_terminal_detail(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
 pub fn print_builtin_tools(app: &App) {
     println!("{}", format_section_header("builtin tools", None));
     let tools = app
@@ -156,9 +201,11 @@ pub fn print_mcp_tools(report: &McpInitReport, mcp_client: &McpClient) {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_assistant_banner, format_empty_state, format_section_header, format_section_item,
-        format_section_note, format_tool_header, format_tool_output_block,
+        format_assistant_banner, format_empty_state, format_ocr_summary_block,
+        format_section_header, format_section_item, format_section_note, format_tool_header,
+        format_tool_output_block,
     };
+    use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};
 
     fn strip_ansi_for_test(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
@@ -207,5 +254,34 @@ mod tests {
         assert_eq!(note, "  │ config path: ~/.config/mcp.json");
         assert_eq!(item, "  │ search_codebase · semantic code search");
         assert_eq!(empty, "╰─ no response");
+    }
+
+    #[test]
+    fn ocr_summary_block_is_compact_and_informative() {
+        let extraction = OcrExtraction {
+            tool_name: "mcp_ocr_extract_ocr_image".to_string(),
+            content: String::new(),
+            images: vec![
+                OcrImageSummary {
+                    file_name: "a.png".to_string(),
+                    extracted_chars: 128,
+                    error: None,
+                },
+                OcrImageSummary {
+                    file_name: "b.png".to_string(),
+                    extracted_chars: 42,
+                    error: Some("timeout talking to OCR service".to_string()),
+                },
+            ],
+        };
+
+        let visible = format_ocr_summary_block(&extraction)
+            .into_iter()
+            .map(|line| strip_ansi_for_test(&line))
+            .collect::<Vec<_>>();
+
+        assert_eq!(visible[0], "╭─ ocr · 2 images · 1 ok · 1 failed · mcp_ocr_extract_ocr_image");
+        assert_eq!(visible[1], "  │ a.png · ok · 128 chars");
+        assert!(visible[2].starts_with("  │ b.png · failed · timeout talking to OCR service"));
     }
 }
