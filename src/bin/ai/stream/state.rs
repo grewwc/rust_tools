@@ -5,7 +5,7 @@ use crate::ai::{
     types::{FunctionCall, StreamResult, ToolCall},
 };
 
-use super::MarkdownStreamRenderer;
+use super::{MarkdownStreamRenderer, splitter::StreamSplitter};
 
 pub(super) const THINKING_TAG_TEXT: &str = "╭─ thinking";
 pub(super) const END_THINKING_TAG_TEXT: &str = "╰─ done thinking";
@@ -67,6 +67,7 @@ pub(super) struct StreamRenderState {
     pub(super) printed_tool_calls_header: bool,
     pub(super) current_printing_index: Option<usize>,
     pub(super) terminal_dedupe: Option<TerminalDedupeState>,
+    pub(super) terminal_splitter: StreamSplitter,
 }
 
 impl StreamRenderState {
@@ -78,6 +79,7 @@ impl StreamRenderState {
             printed_tool_calls_header: false,
             current_printing_index: None,
             terminal_dedupe: None,
+            terminal_splitter: StreamSplitter::new(),
         }
     }
 }
@@ -94,9 +96,7 @@ pub(super) struct StreamContentState {
     pub(super) tool_calls_map: FastMap<usize, ToolCallBuilder>,
     pub(super) assistant_text: String,
     pub(super) hidden_meta: String,
-    pub(super) hidden_open: bool,
-    pub(super) hidden_begin_match: usize,
-    pub(super) hidden_end_match: usize,
+    pub(super) hidden_meta_parse: HiddenMetaParseState,
     pub(super) internal_tool_call_idx: usize,
 }
 
@@ -109,12 +109,17 @@ impl StreamContentState {
             tool_calls_map: FastMap::default(),
             assistant_text: String::new(),
             hidden_meta: String::new(),
-            hidden_open: false,
-            hidden_begin_match: 0,
-            hidden_end_match: 0,
+            hidden_meta_parse: HiddenMetaParseState::default(),
             internal_tool_call_idx: 0,
         }
     }
+}
+
+#[derive(Default)]
+pub(super) struct HiddenMetaParseState {
+    pub(super) hidden_open: bool,
+    pub(super) hidden_begin_match: usize,
+    pub(super) hidden_end_match: usize,
 }
 
 pub(super) enum StreamChunkStep {

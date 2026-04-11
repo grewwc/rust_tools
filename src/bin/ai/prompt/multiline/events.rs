@@ -154,13 +154,13 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
                         lines.join("\n")
                     };
                     let _ = string_content::set_clipboard_content(&answer);
-                    *status_msg = Some("? ???????????".to_string());
+                    *status_msg = Some("Copied to clipboard!".to_string());
                     Ok(EventLoopAction::Continue)
                 }
                 (KeyCode::F(10), _) => {
                     let content = textarea_content(textarea);
                     let _ = string_content::set_clipboard_content(&content);
-                    *status_msg = Some("? ?????????".to_string());
+                    *status_msg = Some("Copied to clipboard!".to_string());
                     Ok(EventLoopAction::Continue)
                 }
                 (KeyCode::Backspace | KeyCode::Delete, modifiers)

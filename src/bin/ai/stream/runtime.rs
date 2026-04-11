@@ -12,8 +12,9 @@ use crate::ai::{
 
 use super::{
     MarkdownStreamRenderer,
-    extract::{extract_chunk_text_with_tools, strip_ansi_codes},
+    extract::{StreamTextEvent, extract_chunk_events_with_tools, strip_ansi_codes},
     framing, normalize,
+    splitter::StreamSplitSegment,
     state::{StreamChunkStep, StreamMarkers, StreamProcessingState},
 };
 
@@ -246,6 +247,8 @@ fn finalize_stream_response(
         )?;
     }
 
+    flush_terminal_splitter(&mut state, markers)?;
+
     let suppress_buffered_output = final_assistant_matches_terminal_dedupe(&state);
     disable_terminal_dedupe(&mut state, suppress_buffered_output)?;
 
@@ -418,59 +421,6 @@ fn process_external_tool_calls_delta(
     }
 }
 
-fn process_hidden_meta_and_visible_content(
-    markers: &StreamMarkers,
-    state: &mut StreamProcessingState,
-    mut content: String,
-) -> String {
-    if content.is_empty() {
-        return content;
-    }
-
-    let mut visible = String::with_capacity(content.len());
-    let hb: Vec<char> = markers.hidden_begin.chars().collect();
-    let he: Vec<char> = markers.hidden_end.chars().collect();
-    for ch in content.chars() {
-        if !state.content.hidden_open {
-            if state.content.hidden_begin_match < hb.len()
-                && ch == hb[state.content.hidden_begin_match]
-            {
-                state.content.hidden_begin_match += 1;
-                if state.content.hidden_begin_match == hb.len() {
-                    state.content.hidden_open = true;
-                    state.content.hidden_begin_match = 0;
-                }
-            } else {
-                if state.content.hidden_begin_match > 0 {
-                    for k in 0..state.content.hidden_begin_match {
-                        visible.push(hb[k]);
-                    }
-                    state.content.hidden_begin_match = 0;
-                }
-                visible.push(ch);
-            }
-        } else if state.content.hidden_end_match < he.len()
-            && ch == he[state.content.hidden_end_match]
-        {
-            state.content.hidden_end_match += 1;
-            if state.content.hidden_end_match == he.len() {
-                state.content.hidden_open = false;
-                state.content.hidden_end_match = 0;
-            }
-        } else {
-            if state.content.hidden_end_match > 0 {
-                for k in 0..state.content.hidden_end_match {
-                    state.content.hidden_meta.push(he[k]);
-                }
-                state.content.hidden_end_match = 0;
-            }
-            state.content.hidden_meta.push(ch);
-        }
-    }
-    content = visible;
-    content
-}
-
 fn process_internal_tool_calls(
     app: &mut App,
     markers: &StreamMarkers,
@@ -618,36 +568,44 @@ fn disable_terminal_dedupe(
     write_stream_content_to_terminal(&buffered, &mut state.render.markdown, false)
 }
 
-fn maybe_write_stream_content(
-    content: &str,
-    mut writer: Option<&mut std::fs::File>,
+fn flush_terminal_splitter(
     state: &mut StreamProcessingState,
     markers: &StreamMarkers,
+) -> io::Result<()> {
+    let marker_line = format!("{}\n", markers.end_thinking_tag);
+    let marker_line_with_prefix = format!("\n{}\n", markers.end_thinking_tag);
+    let segments = state
+        .render
+        .terminal_splitter
+        .flush(&[marker_line_with_prefix.as_str(), marker_line.as_str()]);
+    for segment in segments {
+        write_stream_split_segment(segment, state)?;
+    }
+    Ok(())
+}
+
+fn write_stream_split_segment(
+    segment: StreamSplitSegment,
+    state: &mut StreamProcessingState,
+) -> io::Result<()> {
+    match segment {
+        StreamSplitSegment::Text(text) => maybe_write_plain_stream_text(&text, state, false),
+        StreamSplitSegment::Marker { marker_index: _, text } => {
+            write_stream_content_to_terminal(&text, &mut state.render.markdown, false)
+        }
+    }
+}
+
+fn maybe_write_plain_stream_text(
+    content: &str,
+    state: &mut StreamProcessingState,
     dimmed: bool,
 ) -> io::Result<()> {
-    if !dimmed
-        && state.render.terminal_dedupe.is_some()
-        && let Some(marker_pos) = content.find(&markers.end_thinking_tag)
-    {
-        let mut split_at = marker_pos + markers.end_thinking_tag.len();
-        if content[split_at..].starts_with('\n') {
-            split_at += 1;
-        }
-        let (marker_chunk, suffix) = content.split_at(split_at);
-        write_stream_content_to_file(marker_chunk, writer.as_deref_mut())?;
-        write_stream_content_to_terminal(marker_chunk, &mut state.render.markdown, false)?;
-        if suffix.is_empty() {
-            return Ok(());
-        }
-        return maybe_write_stream_content(suffix, writer, state, markers, false);
+    if content.is_empty() {
+        return Ok(());
     }
-
-    write_stream_content_to_file(content, writer)?;
-
-    let is_reasoning_marker =
-        content.contains(&markers.thinking_tag) || content.contains(&markers.end_thinking_tag);
-    if dimmed || is_reasoning_marker {
-        return write_stream_content_to_terminal(content, &mut state.render.markdown, dimmed);
+    if dimmed {
+        return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
     }
 
     if let Some(dedupe) = state.render.terminal_dedupe.as_mut() {
@@ -661,7 +619,32 @@ fn maybe_write_stream_content(
         return Ok(());
     }
 
-    write_stream_content_to_terminal(content, &mut state.render.markdown, dimmed)
+    write_stream_content_to_terminal(content, &mut state.render.markdown, false)
+}
+
+fn maybe_write_stream_content(
+    content: &str,
+    writer: Option<&mut std::fs::File>,
+    state: &mut StreamProcessingState,
+    markers: &StreamMarkers,
+    dimmed: bool,
+) -> io::Result<()> {
+    write_stream_content_to_file(content, writer)?;
+
+    if dimmed {
+        return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
+    }
+
+    let marker_line = format!("{}\n", markers.end_thinking_tag);
+    let marker_line_with_prefix = format!("\n{}\n", markers.end_thinking_tag);
+    let segments = state
+        .render
+        .terminal_splitter
+        .push(content, &[marker_line_with_prefix.as_str(), marker_line.as_str()]);
+    for segment in segments {
+        write_stream_split_segment(segment, state)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -796,25 +779,53 @@ fn process_stream_payload(
 
     process_external_tool_calls_delta(app, markers, state, &chunk);
 
-    let (mut content, internal_tool_calls) = extract_chunk_text_with_tools(
+    let (events, internal_tool_calls) = extract_chunk_events_with_tools(
         &chunk,
-        &markers.thinking_tag,
-        &markers.end_thinking_tag,
+        markers.hidden_begin,
+        markers.hidden_end,
         &mut state.content.thinking_open,
+        &mut state.content.hidden_meta_parse,
     );
-
-    content = process_hidden_meta_and_visible_content(markers, state, content);
     process_internal_tool_calls(app, markers, state, internal_tool_calls);
 
-    if content.is_empty() {
+    if events.is_empty() {
         return Ok(reached_finish_reason);
     }
-    commit_visible_content(app, current_history, markers, state, content)?;
-    if state.content.thinking_open {
-        return Ok(false);
+    for event in events {
+        match event {
+            StreamTextEvent::AppendHiddenMeta(text) => {
+                state.content.hidden_meta.push_str(&text);
+            }
+            other => {
+                let Some(content) = stream_text_event_to_content(&other, markers) else {
+                    continue;
+                };
+                if content.is_empty() {
+                    continue;
+                }
+                commit_visible_content(app, current_history, markers, state, content)?;
+                if state.content.thinking_open {
+                    return Ok(false);
+                }
+            }
+        }
     }
 
     Ok(reached_finish_reason)
+}
+
+fn stream_text_event_to_content(
+    event: &StreamTextEvent,
+    markers: &StreamMarkers,
+) -> Option<String> {
+    match event {
+        StreamTextEvent::OpenThinking => Some(format!("\n{}\n", markers.thinking_tag)),
+        StreamTextEvent::AppendThinking(text) | StreamTextEvent::AppendContent(text) => {
+            (!text.is_empty()).then(|| text.clone())
+        }
+        StreamTextEvent::AppendHiddenMeta(_) => None,
+        StreamTextEvent::CloseThinking => Some(format!("{}\n", markers.end_thinking_tag)),
+    }
 }
 
 fn flush_sse_event(

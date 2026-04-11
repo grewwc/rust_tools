@@ -3,6 +3,7 @@ mod framing;
 mod normalize;
 mod render;
 mod runtime;
+mod splitter;
 mod state;
 
 pub(super) use render::markdown::MarkdownStreamRenderer;

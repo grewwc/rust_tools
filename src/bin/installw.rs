@@ -179,8 +179,7 @@ fn build_module_graph(files: &[PathBuf]) -> Result<(ModuleGraph, ModuleInterner)
     }
     for file in files {
         let content = fs::read_to_string(file).map_err(|e| format!("read {file:?}: {e}"))?;
-        let dir = file.parent().unwrap_or_else(|| Path::new("."));
-        let edges = parse_mod_edges(&content, dir);
+        let edges = parse_mod_edges(&content, file);
         for dep in edges {
             if file_set.contains(&dep) {
                 let u = interner
@@ -198,9 +197,11 @@ fn build_module_graph(files: &[PathBuf]) -> Result<(ModuleGraph, ModuleInterner)
     Ok((g, interner))
 }
 
-fn parse_mod_edges(content: &str, current_dir: &Path) -> Vec<PathBuf> {
+fn parse_mod_edges(content: &str, current_file: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut pending_path: Option<String> = None;
+    let current_dir = current_file.parent().unwrap_or_else(|| Path::new("."));
+    let implicit_mod_dir = implicit_module_dir(current_file);
     for raw_line in content.lines() {
         let line = raw_line.trim();
         if line.starts_with("#[path") {
@@ -220,10 +221,37 @@ fn parse_mod_edges(content: &str, current_dir: &Path) -> Vec<PathBuf> {
             continue;
         }
 
-        out.push(current_dir.join(format!("{mod_name}.rs")));
-        out.push(current_dir.join(mod_name).join("mod.rs"));
+        out.push(implicit_mod_dir.join(format!("{mod_name}.rs")));
+        out.push(implicit_mod_dir.join(mod_name).join("mod.rs"));
     }
     out
+}
+
+fn implicit_module_dir(current_file: &Path) -> PathBuf {
+    let current_dir = current_file.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = current_file.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if file_name == "mod.rs" || is_crate_root_file(current_file) {
+        return current_dir.to_path_buf();
+    }
+    let stem = current_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    current_dir.join(stem)
+}
+
+fn is_crate_root_file(current_file: &Path) -> bool {
+    let Some(parent) = current_file.parent() else {
+        return false;
+    };
+    let file_name = current_file.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if matches!(file_name, "lib.rs" | "main.rs") {
+        return true;
+    }
+    matches!(
+        parent.file_name().and_then(|s| s.to_str()),
+        Some("bin" | "tests" | "examples" | "benches")
+    )
 }
 
 fn extract_path_attr(line: &str) -> Option<String> {
@@ -427,5 +455,33 @@ mod tests {
 
         assert!(deps_set.contains(&bin_dir.join("re").join("features").join("mod.rs")));
         assert!(deps_set.contains(&bin_dir.join("re").join("features").join("search.rs")));
+    }
+
+    #[test]
+    fn deps_for_a_include_nested_file_module_children() {
+        let cwd = env::current_dir().unwrap();
+        let repo_root = find_repo_root(&cwd).unwrap();
+        let src_dir = repo_root.join("src");
+        let bin_dir = src_dir.join("bin");
+
+        let all_rs_files = list_rs_files(&src_dir).unwrap();
+        let (graph, interner) = build_module_graph(&all_rs_files).unwrap();
+
+        let bin_rs = bin_dir.join("a.rs");
+        let deps = deps_for_bin("a", &bin_rs, &repo_root, &graph, &interner).unwrap();
+        let mut deps_set = SkipSet::new(16);
+        for p in deps {
+            deps_set.insert(p.clone());
+        }
+
+        assert!(deps_set.contains(&bin_dir.join("ai").join("prompt.rs")));
+        assert!(deps_set.contains(&bin_dir.join("ai").join("prompt").join("multiline.rs")));
+        assert!(deps_set.contains(
+            &bin_dir
+                .join("ai")
+                .join("prompt")
+                .join("multiline")
+                .join("render.rs")
+        ));
     }
 }
