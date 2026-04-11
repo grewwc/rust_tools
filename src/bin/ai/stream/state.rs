@@ -2,11 +2,13 @@ use rust_tools::commonw::FastMap;
 
 use crate::ai::{
     request::StreamChunk,
-    theme::{ACCENT_MUTED, ACCENT_RULE, RESET},
     types::{FunctionCall, StreamResult, ToolCall},
 };
 
 use super::MarkdownStreamRenderer;
+
+pub(super) const THINKING_TAG_TEXT: &str = "╭─ thinking";
+pub(super) const END_THINKING_TAG_TEXT: &str = "╰─ done thinking";
 
 pub(super) struct StreamMarkers {
     pub(super) thinking_tag: String,
@@ -18,8 +20,8 @@ pub(super) struct StreamMarkers {
 impl StreamMarkers {
     pub(super) fn new() -> Self {
         Self {
-            thinking_tag: format!("{ACCENT_RULE}╭─{RESET} {ACCENT_MUTED}thinking{RESET}"),
-            end_thinking_tag: format!("{ACCENT_RULE}╰─{RESET} {ACCENT_MUTED}done thinking{RESET}"),
+            thinking_tag: THINKING_TAG_TEXT.to_string(),
+            end_thinking_tag: END_THINKING_TAG_TEXT.to_string(),
             hidden_begin: "<meta:self_note>",
             hidden_end: "</meta:self_note>",
         }
@@ -27,10 +29,66 @@ impl StreamMarkers {
 }
 
 pub(super) struct StreamProcessingState {
-    pub(super) thinking_open: bool,
+    pub(super) framing: StreamFramingState,
+    pub(super) render: StreamRenderState,
+    pub(super) content: StreamContentState,
+}
+
+impl StreamProcessingState {
+    pub(super) fn new() -> Self {
+        Self {
+            framing: StreamFramingState::new(),
+            render: StreamRenderState::new(),
+            content: StreamContentState::new(),
+        }
+    }
+}
+
+pub(super) struct StreamFramingState {
+    pub(super) decode_error_count: usize,
+    pub(super) pending: Vec<u8>,
+    pub(super) sse_event_data: String,
+}
+
+impl StreamFramingState {
+    fn new() -> Self {
+        Self {
+            decode_error_count: 0,
+            pending: Vec::with_capacity(4096),
+            sse_event_data: String::with_capacity(4096),
+        }
+    }
+}
+
+pub(super) struct StreamRenderState {
     pub(super) markdown: MarkdownStreamRenderer,
     pub(super) waiting_hint_active: bool,
     pub(super) waiting_hint_buffering: bool,
+    pub(super) printed_tool_calls_header: bool,
+    pub(super) current_printing_index: Option<usize>,
+    pub(super) terminal_dedupe: Option<TerminalDedupeState>,
+}
+
+impl StreamRenderState {
+    fn new() -> Self {
+        Self {
+            markdown: MarkdownStreamRenderer::new(),
+            waiting_hint_active: false,
+            waiting_hint_buffering: false,
+            printed_tool_calls_header: false,
+            current_printing_index: None,
+            terminal_dedupe: None,
+        }
+    }
+}
+
+pub(super) struct TerminalDedupeState {
+    pub(super) candidate: String,
+    pub(super) buffered_terminal_output: String,
+}
+
+pub(super) struct StreamContentState {
+    pub(super) thinking_open: bool,
     pub(super) empty_choice_chunks: usize,
     pub(super) saw_reasoning_output: bool,
     pub(super) tool_calls_map: FastMap<usize, ToolCallBuilder>,
@@ -40,19 +98,12 @@ pub(super) struct StreamProcessingState {
     pub(super) hidden_begin_match: usize,
     pub(super) hidden_end_match: usize,
     pub(super) internal_tool_call_idx: usize,
-    pub(super) printed_tool_calls_header: bool,
-    pub(super) current_printing_index: Option<usize>,
-    pub(super) decode_error_count: usize,
-    pub(super) pending: Vec<u8>,
 }
 
-impl StreamProcessingState {
-    pub(super) fn new() -> Self {
+impl StreamContentState {
+    fn new() -> Self {
         Self {
             thinking_open: false,
-            markdown: MarkdownStreamRenderer::new(),
-            waiting_hint_active: false,
-            waiting_hint_buffering: false,
             empty_choice_chunks: 0,
             saw_reasoning_output: false,
             tool_calls_map: FastMap::default(),
@@ -62,10 +113,6 @@ impl StreamProcessingState {
             hidden_begin_match: 0,
             hidden_end_match: 0,
             internal_tool_call_idx: 0,
-            printed_tool_calls_header: false,
-            current_printing_index: None,
-            decode_error_count: 0,
-            pending: Vec::with_capacity(4096),
         }
     }
 }

@@ -195,6 +195,20 @@ impl<K, V> Drop for SkipMap<K, V> {
     }
 }
 
+impl<K, V> Clone for SkipMap<K, V>
+where
+    K: Clone + Ord,
+    V: Clone,
+{
+    fn clone(&self) -> Self {
+        let mut map = *SkipMap::new(self.max_height, self.cmp);
+        for (k, v) in self.iter() {
+            map.insert(k.clone(), v.clone());
+        }
+        map
+    }
+}
+
 pub struct IntoSkipMapIter<K, V> {
     curr_node: *mut SkipNode<K, V>,
 }
@@ -292,6 +306,19 @@ impl<'a, K, V> Iterator for SkipListIterMut<'a, K, V> {
     }
 }
 
+// FromIterator for Box<SkipMap<K, V>>
+impl<K, V> FromIterator<(K, V)> for Box<SkipMap<K, V>>
+where
+    K: Ord,
+{
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+        let mut map = SkipMap::new(16, |a: &K, b: &K| a.cmp(b) as i32);
+        for (k, v) in iter {
+            map.insert(k, v);
+        }
+        map
+    }
+}
 impl<K, V> SkipMap<K, V> {
     pub fn iter(&self) -> SkipListIter<'_, K, V> {
         let curr = unsafe { *self.head.forward.get_unchecked(0) };
@@ -398,6 +425,19 @@ where
         self.inner.contains_key(value)
     }
 
+    /// Check if the set contains a value, accepting &str directly for String type.
+    pub fn contains_str(&self, value: &str) -> bool
+    where
+        T: AsRef<str>,
+    {
+        for k in self.iter() {
+            if k.as_ref() == value {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -456,6 +496,30 @@ where
         T: Clone,
     {
         self.iter().cloned().collect()
+    }
+}
+
+impl<T> FromIterator<T> for Box<SkipSet<T>>
+where
+    T: Ord,
+{
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut set = SkipSet::new(16);
+        for item in iter {
+            set.insert(item);
+        }
+        Box::new(set)
+    }
+}
+
+impl<T> Extend<T> for Box<SkipSet<T>>
+where
+    T: Ord,
+{
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for item in iter {
+            self.insert(item);
+        }
     }
 }
 
@@ -615,4 +679,35 @@ mod tests {
         assert_send::<SkipSet<i32>>();
         assert_sync::<SkipSet<i32>>();
     }
+
+    #[test]
+    fn skipmap_from_iter() {
+        let data: Vec<(i32, &str)> = vec![(3, "c"), (1, "a"), (2, "b")];
+        let map: Box<SkipMap<i32, &str>> = data.into_iter().collect();
+        let items: Vec<_> = map.iter().collect();
+        // SkipMap 按 key 排序
+        assert_eq!(items, vec![(&1, &"a"), (&2, &"b"), (&3, &"c")]);
+    }
+
+    #[test]
+    fn skipmap_clone() {
+        let mut map = SkipMap::new(4, |a: &i32, b: &i32| a.cmp(b) as i32);
+        map.insert(1, "one");
+        map.insert(2, "two");
+        map.insert(3, "three");
+        
+        let cloned = map.clone();
+        assert_eq!(cloned.get_ref(&1), Some(&"one"));
+        assert_eq!(cloned.get_ref(&2), Some(&"two"));
+        assert_eq!(cloned.get_ref(&3), Some(&"three"));
+        assert_eq!(cloned.len(), 3);
+        
+        // 原 map 不受影响
+        map.insert(4, "four");
+        assert_eq!(map.len(), 4);
+        assert_eq!(cloned.len(), 3);
+    }
 }
+
+
+

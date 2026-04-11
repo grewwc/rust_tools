@@ -49,6 +49,14 @@ pub(super) struct RunOneResult {
     pub(super) cached: bool,
 }
 
+pub(super) trait ToolExecutionObserver {
+    fn on_tool_started(&mut self, _tool_call: &ToolCall) {}
+
+    fn on_tool_stream(&mut self, _tool_call: &ToolCall, _chunk: &[u8]) {}
+
+    fn on_tool_finished(&mut self, _tool_call: &ToolCall, _run_result: &RunOneResult) {}
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ToolCachePayload {
     tool_name: String,
@@ -175,14 +183,29 @@ fn execute_prepared_tool_call(
     mcp_client: &McpClient,
     tool_call: &ToolCall,
     prepared: &PreparedToolCall,
+    observer: &mut Option<&mut dyn ToolExecutionObserver>,
 ) -> Result<ToolResult, String> {
     match &prepared.route {
-        ToolRoute::Builtin => builtin_tools::execute_tool_call_with_args(
-            &tool_call.id,
-            &tool_call.function.name,
-            &prepared.args,
-        )
-        .map_err(|e| e.to_string()),
+        ToolRoute::Builtin => {
+            if tool_call.function.name == "execute_command" {
+                builtin_tools::command_tools::execute_command_streaming(&prepared.args, |chunk| {
+                    if let Some(observer) = observer.as_deref_mut() {
+                        observer.on_tool_stream(tool_call, chunk);
+                    }
+                })
+                .map(|content| ToolResult {
+                    tool_call_id: tool_call.id.clone(),
+                    content,
+                })
+            } else {
+                builtin_tools::execute_tool_call_with_args(
+                    &tool_call.id,
+                    &tool_call.function.name,
+                    &prepared.args,
+                )
+                .map_err(|e| e.to_string())
+            }
+        }
         ToolRoute::Mcp {
             server_name,
             tool_name,
@@ -376,7 +399,12 @@ fn execute_parallel_task_batch(
         .collect()
 }
 
-fn run_one(mcp_client: &McpClient, session_id: &str, tool_call: &ToolCall) -> (ToolRoute, RunOneResult) {
+fn run_one(
+    mcp_client: &McpClient,
+    session_id: &str,
+    tool_call: &ToolCall,
+    observer: &mut Option<&mut dyn ToolExecutionObserver>,
+) -> (ToolRoute, RunOneResult) {
     let prepared = match prepare_tool_call(mcp_client, tool_call) {
         Ok(prepared) => prepared,
         Err(tool_result) => {
@@ -408,7 +436,11 @@ fn run_one(mcp_client: &McpClient, session_id: &str, tool_call: &ToolCall) -> (T
         );
     }
 
-    let result = execute_prepared_tool_call(mcp_client, tool_call, &prepared);
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.on_tool_started(tool_call);
+    }
+
+    let result = execute_prepared_tool_call(mcp_client, tool_call, &prepared, observer);
     let run_result = finalize_execution_result(session_id, tool_call, &prepared, result, true, false);
 
     (prepared.route, run_result)
@@ -418,17 +450,21 @@ pub(super) fn execute_tool_calls(
     session_id: &str,
     mcp_client: &McpClient,
     tool_calls: &[ToolCall],
+    observer: Option<&mut dyn ToolExecutionObserver>,
 ) -> Result<ExecuteToolCallsResult, Box<dyn Error>> {
     if tokio::runtime::Handle::try_current().is_ok() {
-        return tokio::task::block_in_place(|| execute_tool_calls_inner(session_id, mcp_client, tool_calls));
+        return tokio::task::block_in_place(|| {
+            execute_tool_calls_inner(session_id, mcp_client, tool_calls, observer)
+        });
     }
-    execute_tool_calls_inner(session_id, mcp_client, tool_calls)
+    execute_tool_calls_inner(session_id, mcp_client, tool_calls, observer)
 }
 
 fn execute_tool_calls_inner(
     session_id: &str,
     mcp_client: &McpClient,
     tool_calls: &[ToolCall],
+    mut observer: Option<&mut dyn ToolExecutionObserver>,
 ) -> Result<ExecuteToolCallsResult, Box<dyn Error>> {
     let mut executed_tool_calls = Vec::with_capacity(tool_calls.len());
     let mut tool_results = Vec::with_capacity(tool_calls.len());
@@ -449,6 +485,7 @@ fn execute_tool_calls_inner(
                     run_result.ok,
                     &run_result.tool_result.content,
                 );
+                notify_tool_finished(&mut observer, tool_call, &run_result);
                 print_run_status(tool_call, &run_result);
                 tool_results.push(run_result.tool_result);
                 if should_barrier {
@@ -468,7 +505,7 @@ fn execute_tool_calls_inner(
 
         let tool_call = &tool_calls[idx];
         let is_last = idx + 1 >= tool_calls.len();
-        let (route, run_result) = run_one(mcp_client, session_id, tool_call);
+        let (route, run_result) = run_one(mcp_client, session_id, tool_call, &mut observer);
         let should_barrier = barrier::should_barrier_after(
             &route,
             tool_call,
@@ -478,6 +515,7 @@ fn execute_tool_calls_inner(
 
         executed_tool_calls.push(tool_call.clone());
         cached_hits.push(run_result.cached);
+        notify_tool_finished(&mut observer, tool_call, &run_result);
         print_run_status(tool_call, &run_result);
         tool_results.push(run_result.tool_result);
 
@@ -495,6 +533,16 @@ fn execute_tool_calls_inner(
         tool_results,
         cached_hits,
     })
+}
+
+fn notify_tool_finished(
+    observer: &mut Option<&mut dyn ToolExecutionObserver>,
+    tool_call: &ToolCall,
+    run_result: &RunOneResult,
+) {
+    if let Some(observer) = observer.as_deref_mut() {
+        observer.on_tool_finished(tool_call, run_result);
+    }
 }
 
 fn load_cached_tool_result(session_id: &str, tool_call: &ToolCall, args: &Value) -> Option<ToolResult> {

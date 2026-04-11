@@ -62,6 +62,7 @@ pub(in crate::ai::driver) async fn run_turn(
     let mut force_final_response = false;
     let mut final_assistant_text = String::new();
     let mut final_assistant_recorded = false;
+    let mut terminal_dedupe_candidate = None;
     loop {
         iteration += 1;
         refresh_skill_turn_for_iteration(
@@ -83,6 +84,7 @@ pub(in crate::ai::driver) async fn run_turn(
             &mut persisted_turn_messages,
             should_quit,
             force_final_response,
+            terminal_dedupe_candidate.as_deref(),
             iteration,
         )
         .await?;
@@ -98,6 +100,7 @@ pub(in crate::ai::driver) async fn run_turn(
             &mut final_assistant_text,
             &mut final_assistant_recorded,
             &mut force_final_response,
+            &mut terminal_dedupe_candidate,
             iteration,
             max_iterations,
         )? {

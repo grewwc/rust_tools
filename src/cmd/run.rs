@@ -6,8 +6,10 @@ use crate::{commonw::utils::expanduser, strw::split::split_space_keep_symbol};
 
 use std::{
     ffi::OsString,
-    io,
+    io::{self, Read},
     process::{Command, Output, Stdio},
+    sync::mpsc::{self, RecvTimeoutError, Sender},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -253,6 +255,51 @@ pub fn run_cmd_output_with_timeout(
     opts: RunCmdOptions<'_>,
     timeout: Duration,
 ) -> io::Result<Output> {
+    run_cmd_output_streaming_with_timeout(command, opts, timeout, |_| {}, || false)
+}
+
+fn spawn_pipe_reader<R>(mut reader: R, tx: Sender<Vec<u8>>) -> thread::JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut collected = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(read) => {
+                    collected.extend_from_slice(&buf[..read]);
+                    if tx.send(buf[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(collected)
+    })
+}
+
+fn join_pipe_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => Err(io::Error::other("command output reader thread panicked")),
+    }
+}
+
+pub fn run_cmd_output_streaming_with_timeout<F, C>(
+    command: &str,
+    opts: RunCmdOptions<'_>,
+    timeout: Duration,
+    mut on_chunk: F,
+    should_cancel: C,
+) -> io::Result<Output>
+where
+    F: FnMut(&[u8]),
+    C: Fn() -> bool,
+{
     let mut cmd = build_command(command, opts)?;
 
     cmd.stdin(Stdio::null());
@@ -260,22 +307,69 @@ pub fn run_cmd_output_with_timeout(
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing stdout pipe"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing stderr pipe"))?;
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let stdout_handle = spawn_pipe_reader(stdout, tx.clone());
+    let stderr_handle = spawn_pipe_reader(stderr, tx.clone());
+    drop(tx);
+
     let deadline = Instant::now() + timeout;
-    loop {
+    let status = loop {
+        while let Ok(chunk) = rx.try_recv() {
+            on_chunk(&chunk);
+        }
+
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => {
+                if should_cancel() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = join_pipe_reader(stdout_handle);
+                    let _ = join_pipe_reader(stderr_handle);
+                    while let Ok(chunk) = rx.try_recv() {
+                        on_chunk(&chunk);
+                    }
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+                }
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = join_pipe_reader(stdout_handle);
+                    let _ = join_pipe_reader(stderr_handle);
+                    while let Ok(chunk) = rx.try_recv() {
+                        on_chunk(&chunk);
+                    }
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout"));
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                match rx.recv_timeout(Duration::from_millis(20)) {
+                    Ok(chunk) => on_chunk(&chunk),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {}
+                }
             }
-            Err(e) => return Err(e),
+            Err(err) => return Err(err),
         }
+    };
+
+    let stdout = join_pipe_reader(stdout_handle)?;
+    let stderr = join_pipe_reader(stderr_handle)?;
+    while let Ok(chunk) = rx.try_recv() {
+        on_chunk(&chunk);
     }
-    child.wait_with_output()
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// 执行命令并返回输出文本
@@ -320,7 +414,8 @@ pub fn run_cmd(command: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_cmd, run_cmd_output, RunCmdOptions};
+    use super::{run_cmd, run_cmd_output, run_cmd_output_streaming_with_timeout, RunCmdOptions};
+    use std::time::Duration;
 
     #[test]
     fn test_run_cmd_basic() {
@@ -344,6 +439,24 @@ mod tests {
             let output = run_cmd_output("echo hello", RunCmdOptions::default()).unwrap();
             assert!(output.status.success());
             assert!(output.stdout.contains(&b'h'));
+        }
+    }
+
+    #[test]
+    fn test_run_cmd_output_streaming_collects_chunks() {
+        #[cfg(unix)]
+        {
+            let mut streamed = Vec::new();
+            let output = run_cmd_output_streaming_with_timeout(
+                "printf 'hello\\nworld'",
+                RunCmdOptions::default(),
+                Duration::from_secs(2),
+                |chunk| streamed.extend_from_slice(chunk),
+                || false,
+            )
+            .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&streamed), "hello\nworld");
         }
     }
 }

@@ -277,23 +277,19 @@ async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool 
     if !question.is_empty() {
         let local_intent =
             intent_recognition::detect_intent_with_model_path(question, &app.config.intent_model_path);
-        let question_len = question.chars().count();
-        let skip_thinking_gate = matches!(
-            local_intent.core,
-            intent_recognition::CoreIntent::Casual | intent_recognition::CoreIntent::QueryConcept
-        ) && question_len <= 64;
-        if skip_thinking_gate {
+        if let Some(local_decision) = local_thinking_decision(question, &local_intent) {
             crate::ai::agent_hang_debug!(
                 "post-fix",
                 "G",
-                "request::resolve_thinking:local_skip",
-                "[DEBUG] resolve thinking skipped by local intent",
+                "request::resolve_thinking:local_decision",
+                "[DEBUG] resolve thinking decided locally",
                 {
                     "core": format!("{:?}", local_intent.core),
-                    "question_len": question_len,
+                    "question_len": question.chars().count(),
+                    "decision": local_decision,
                 },
             );
-            return false;
+            return local_decision;
         }
     }
 
@@ -301,6 +297,64 @@ async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool 
     decide_thinking_via_model(app, model, messages)
         .await
         .unwrap_or(false)
+}
+
+fn local_thinking_decision(
+    question: &str,
+    intent: &intent_recognition::UserIntent,
+) -> Option<bool> {
+    let question = question.trim();
+    if question.is_empty() {
+        return Some(false);
+    }
+
+    let question_len = question.chars().count();
+    let line_count = question.lines().count();
+    let has_code_like_content = question.contains("```")
+        || question.contains("::")
+        || question.contains("fn ")
+        || question.contains("panic")
+        || question.contains("traceback")
+        || question.contains("Exception")
+        || question.contains("Error")
+        || question.contains("error");
+    let has_multistep_shape = line_count >= 3
+        || question.contains("\n- ")
+        || question.contains("\n1.")
+        || question.contains("步骤")
+        || question.contains("step by step");
+    let looks_like_complex_solution_request = matches!(
+        intent.core,
+        intent_recognition::CoreIntent::SeekSolution
+    ) && (question_len >= 48 || has_code_like_content || has_multistep_shape);
+    let looks_like_complex_action_request = matches!(
+        intent.core,
+        intent_recognition::CoreIntent::RequestAction
+    ) && (question_len >= 96 || has_code_like_content || has_multistep_shape);
+
+    if matches!(
+        intent.core,
+        intent_recognition::CoreIntent::Casual | intent_recognition::CoreIntent::QueryConcept
+    ) && question_len <= 120
+        && !has_code_like_content
+        && !intent.is_search_query()
+    {
+        return Some(false);
+    }
+
+    if looks_like_complex_solution_request
+        || looks_like_complex_action_request
+        || (question_len >= 220
+            && matches!(
+                intent.core,
+                intent_recognition::CoreIntent::RequestAction
+                    | intent_recognition::CoreIntent::SeekSolution
+            ))
+    {
+        return Some(true);
+    }
+
+    None
 }
 
 /// Ask the model whether this request needs thinking mode.
@@ -1116,6 +1170,7 @@ pub async fn do_request_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
 
     #[test]
     fn test_parse_thinking_gate_output_bool() {
@@ -1139,6 +1194,30 @@ mod tests {
     fn test_parse_thinking_gate_output_invalid() {
         let s = r#"{"confidence":0.73}"#;
         assert_eq!(parse_thinking_gate_output(s), None);
+    }
+
+    #[test]
+    fn local_thinking_decision_skips_simple_concept_questions() {
+        let intent = UserIntent::new(CoreIntent::QueryConcept);
+        let decision = local_thinking_decision("Rust 的 trait 是什么？", &intent);
+        assert_eq!(decision, Some(false));
+    }
+
+    #[test]
+    fn local_thinking_decision_enables_for_debugging_requests() {
+        let intent = UserIntent::new(CoreIntent::SeekSolution);
+        let decision = local_thinking_decision(
+            "帮我排查这个报错，并分析可能的修复方案\npanic: index out of bounds",
+            &intent,
+        );
+        assert_eq!(decision, Some(true));
+    }
+
+    #[test]
+    fn local_thinking_decision_leaves_ambiguous_short_actions_to_gate() {
+        let intent = UserIntent::new(CoreIntent::RequestAction);
+        let decision = local_thinking_decision("帮我写个函数", &intent);
+        assert_eq!(decision, None);
     }
 
     #[test]

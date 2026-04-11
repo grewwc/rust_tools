@@ -7,8 +7,14 @@ use crate::ai::types::ToolCall;
 
 use super::{
     compress::{compact_persisted_history, value_to_string},
-    types::Message,
+    types::{Message, ROLE_INTERNAL_NOTE},
 };
+
+pub(in crate::ai) struct RecentTurnWindow {
+    pub(in crate::ai) messages: Vec<Message>,
+    pub(in crate::ai) start_message_id: Option<i64>,
+    pub(in crate::ai) has_older_messages: bool,
+}
 
 fn open_history_db(path: &Path) -> Result<Connection, io::Error> {
     if let Some(parent) = path.parent() {
@@ -186,6 +192,124 @@ pub(in crate::ai) fn build_message_arr_sqlite(
     Ok(messages[messages.len() - history_count..].to_vec())
 }
 
+pub(in crate::ai) fn read_recent_turn_window_sqlite(
+    history_file: &Path,
+    keep_last_user_turns: usize,
+) -> Result<RecentTurnWindow, Box<dyn std::error::Error>> {
+    let conn = match open_history_db(history_file) {
+        Ok(c) => c,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(RecentTurnWindow {
+                messages: Vec::new(),
+                start_message_id: None,
+                has_older_messages: false,
+            });
+        }
+        Err(err) => return Err(err.into()),
+    };
+    init_history_schema(&conn)?;
+
+    if keep_last_user_turns == 0 {
+        let messages = read_messages_with_sql(
+            &conn,
+            "SELECT role, content, tool_calls, tool_call_id
+             FROM messages
+             ORDER BY id ASC",
+        )?;
+        return Ok(RecentTurnWindow {
+            messages,
+            start_message_id: None,
+            has_older_messages: false,
+        });
+    }
+
+    let threshold_user_id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM messages
+             WHERE role='user'
+             ORDER BY id DESC
+             LIMIT 1 OFFSET ?1",
+            params![keep_last_user_turns.saturating_sub(1) as i64],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    let Some(start_message_id) = threshold_user_id else {
+        let messages = read_messages_with_sql(
+            &conn,
+            "SELECT role, content, tool_calls, tool_call_id
+             FROM messages
+             ORDER BY id ASC",
+        )?;
+        return Ok(RecentTurnWindow {
+            messages,
+            start_message_id: None,
+            has_older_messages: false,
+        });
+    };
+
+    let has_older_messages = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id < ?1 LIMIT 1)",
+            params![start_message_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        != 0;
+
+    let messages = read_messages_since_id(&conn, start_message_id)?;
+    Ok(RecentTurnWindow {
+        messages,
+        start_message_id: Some(start_message_id),
+        has_older_messages,
+    })
+}
+
+pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
+    history_file: &Path,
+    before_message_id: i64,
+) -> Result<Option<Message>, Box<dyn std::error::Error>> {
+    let conn = match open_history_db(history_file) {
+        Ok(c) => c,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    init_history_schema(&conn)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT role, content, tool_calls, tool_call_id
+         FROM messages
+         WHERE id < ?1 AND role = ?2
+         ORDER BY id DESC
+         LIMIT 8",
+    )?;
+    let rows = stmt.query_map(params![before_message_id, ROLE_INTERNAL_NOTE], |row| {
+        let role: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let tool_calls: Option<String> = row.get(2)?;
+        let tool_call_id: Option<String> = row.get(3)?;
+        Ok(Message {
+            role,
+            content: decode_message_content(&content),
+            tool_calls: decode_tool_calls(tool_calls.as_deref()),
+            tool_call_id,
+        })
+    })?;
+
+    for row in rows {
+        let message = row?;
+        let Some(text) = message.content.as_str() else {
+            continue;
+        };
+        if text.starts_with("历史摘要（自动压缩")
+            || text.starts_with("对话摘要（自动压缩")
+        {
+            return Ok(Some(message));
+        }
+    }
+    Ok(None)
+}
+
 pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
     let meta: Option<String> = conn
@@ -228,4 +352,34 @@ pub(in crate::ai) fn read_all_messages_sqlite(path: &Path) -> io::Result<Vec<Mes
          ORDER BY id ASC",
     )
     .map_err(|e| io::Error::other(e.to_string()))
+}
+
+fn read_messages_since_id(
+    conn: &Connection,
+    start_message_id: i64,
+) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+    let mut stmt = conn.prepare(
+        "SELECT role, content, tool_calls, tool_call_id
+         FROM messages
+         WHERE id >= ?1
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(params![start_message_id], |row| {
+        let role: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let tool_calls: Option<String> = row.get(2)?;
+        let tool_call_id: Option<String> = row.get(3)?;
+        Ok((role, content, tool_calls, tool_call_id))
+    })?;
+    let mut messages = Vec::new();
+    for row in rows {
+        let (role, content, tool_calls, tool_call_id) = row?;
+        messages.push(Message {
+            role,
+            content: decode_message_content(&content),
+            tool_calls: decode_tool_calls(tool_calls.as_deref()),
+            tool_call_id,
+        });
+    }
+    Ok(messages)
 }

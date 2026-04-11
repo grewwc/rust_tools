@@ -119,7 +119,6 @@ pub(super) fn append_tool_result_messages(
         .zip(exec_result.tool_results.iter())
     {
         let prepared = prepare_tool_result(app, &tool_call.function.name, &result.content);
-        print_tool_result_preview(&tool_call.function.name, &prepared);
         let tool_message = Message {
             role: "tool".to_string(),
             content: Value::String(prepared.content_for_model),

@@ -1,4 +1,6 @@
 mod extract;
+mod framing;
+mod normalize;
 mod render;
 mod runtime;
 mod state;
@@ -20,8 +22,9 @@ pub(super) async fn stream_response(
     app: &mut App,
     response: &mut reqwest::Response,
     current_history: &mut String,
+    terminal_dedupe_candidate: Option<&str>,
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
-    runtime::stream_response(app, response, current_history).await
+    runtime::stream_response(app, response, current_history, terminal_dedupe_candidate).await
 }
 
 pub(super) fn line_looks_like_table_preview(line: &str) -> bool {

@@ -6,15 +6,23 @@ use crate::ai::{
     types::{App, ToolDefinition},
 };
 use crate::commonw::configw;
-use std::collections::BTreeSet;
 use std::ptr::NonNull;
 use rust_tools::cw::SkipMap;
+use rust_tools::cw::SkipSet;
 use chrono::{DateTime, Utc};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use super::{DEFAULT_MAX_ITERATIONS, OPENCLAW_MAX_ITERATIONS, match_skill};
 use super::intent_recognition::{self, UserIntent};
 
 type ToolDef = ToolDefinition;
+type ToolScoreMap = SkipMap<String, f64>;
+
+const TOOL_SCORE_CACHE_TTL: Duration = Duration::from_secs(20);
+
+static TOOL_SCORE_CACHE: LazyLock<Mutex<Option<(Instant, Arc<Box<ToolScoreMap>>)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 pub(super) struct SkillTurnGuard {
     app: NonNull<App>,
@@ -93,11 +101,11 @@ fn merge_with_runtime_enabled_tools(
     let mut merged = reorder_tools_by_stats(builtin_tools, mcp_tools);
     let explicit_enabled = super::super::tools::enable_tools::explicit_enabled_tool_names()
         .into_iter()
-        .collect::<BTreeSet<_>>();
+        .collect::<Box<SkipSet<_>>>();
     if explicit_enabled.is_empty() {
         return merged;
     }
-    let known_names: BTreeSet<String> = merged
+    let known_names: Box<SkipSet<String>> = merged
         .iter()
         .map(|tool| tool.function.name.clone())
         .collect();
@@ -116,11 +124,14 @@ fn merge_with_runtime_enabled_tools(
 }
 
 fn dedupe_tools_by_name(tools: Vec<ToolDef>) -> Vec<ToolDef> {
-    let mut seen = BTreeSet::new();
-    tools
-        .into_iter()
-        .filter(|tool| seen.insert(tool.function.name.clone()))
-        .collect()
+    let mut seen = SkipSet::new(16);
+    let mut result = Vec::new();
+    for tool in tools {
+        if seen.insert(tool.function.name.clone()) {
+            result.push(tool);
+        }
+    }
+    result
 }
 
 fn required_discovery_tool_names() -> Vec<String> {
@@ -134,7 +145,7 @@ fn ensure_required_discovery_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
     let existing = tools
         .iter()
         .map(|tool| tool.function.name.clone())
-        .collect::<BTreeSet<_>>();
+        .collect::<Box<SkipSet<_>>>();
     let missing = required_discovery_tool_names()
         .into_iter()
         .filter(|name| !existing.contains(name))
@@ -196,7 +207,7 @@ fn builtin_tools_for_skill(
     super::super::tools::tool_definitions_for_groups(&["builtin"])
 }
 
-fn available_tool_names(builtin_tools: &[ToolDef], mcp_tools: &[ToolDef]) -> BTreeSet<String> {
+fn available_tool_names(builtin_tools: &[ToolDef], mcp_tools: &[ToolDef]) -> Box<SkipSet<String>> {
     builtin_tools
         .iter()
         .chain(mcp_tools.iter())
@@ -204,8 +215,8 @@ fn available_tool_names(builtin_tools: &[ToolDef], mcp_tools: &[ToolDef]) -> BTr
         .collect()
 }
 
-fn has_tool(available: &BTreeSet<String>, name: &str) -> bool {
-    available.contains(name)
+fn has_tool(available: &Box<SkipSet<String>>, name: &str) -> bool {
+    available.contains_str(name)
 }
 
 fn reorder_tools_by_stats(mut builtin: Vec<ToolDef>, mut mcp: Vec<ToolDef>) -> Vec<ToolDef> {
@@ -217,15 +228,22 @@ fn reorder_tools_by_stats(mut builtin: Vec<ToolDef>, mut mcp: Vec<ToolDef>) -> V
     }
     let scores = load_tool_scores();
     all.sort_by(|a, b| {
-        let sa = (*scores).get(&a.function.name).unwrap_or(0.0);
-        let sb = (*scores).get(&b.function.name).unwrap_or(0.0);
+        let sa = scores.get_ref(&a.function.name).copied().unwrap_or(0.0);
+        let sb = scores.get_ref(&b.function.name).copied().unwrap_or(0.0);
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.function.name.cmp(&b.function.name))
     });
     all
 }
 
-fn load_tool_scores() -> Box<SkipMap<String, f64>> {
+fn load_tool_scores() -> Box<ToolScoreMap> {
+    if let Ok(cache) = TOOL_SCORE_CACHE.lock()
+        && let Some((created_at, scores)) = cache.as_ref()
+        && created_at.elapsed() < TOOL_SCORE_CACHE_TTL
+    {
+        return (**scores).clone();
+    }
+
     use crate::ai::tools::storage::memory_store::MemoryStore;
     let store = MemoryStore::from_env_or_config();
     let entries = store.recent(600).unwrap_or_default();
@@ -261,7 +279,15 @@ fn load_tool_scores() -> Box<SkipMap<String, f64>> {
         let cur = score.get(k).unwrap_or(0.0);
         score.insert(k.clone(), cur - 1.5 * *v);
     }
-    score
+    let scores: Box<SkipMap<String, f64>> = (&*score)
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect::<Box<SkipMap<_, _>>>();
+    let result = scores.clone();
+    if let Ok(mut cache) = TOOL_SCORE_CACHE.lock() {
+        *cache = Some((Instant::now(), Arc::new(scores)));
+    }
+    result
 }
 
 fn recency_weight(ts: &str) -> f64 {
@@ -317,7 +343,7 @@ fn mcp_tools_for_skill(
 fn build_system_prompt(
     active_agent: Option<&AgentManifest>,
     skill: Option<&SkillManifest>,
-    available_tools: &BTreeSet<String>,
+    available_tools: &Box<SkipSet<String>>,
 ) -> String {
     let mut system_prompt = "You are a helpful assistant.".to_string();
     if let Some(agent) = active_agent {
@@ -465,6 +491,28 @@ async fn route_skill_for_turn(
     }
 }
 
+fn should_skip_remote_skill_router(
+    intent: &UserIntent,
+    question_len: usize,
+    skill_count: usize,
+    heuristic_skill_found: bool,
+) -> bool {
+    if skill_count == 0 {
+        return true;
+    }
+    if heuristic_skill_found {
+        return true;
+    }
+    if matches!(
+        intent.core,
+        intent_recognition::CoreIntent::Casual | intent_recognition::CoreIntent::QueryConcept
+    ) && question_len <= 96
+    {
+        return true;
+    }
+    false
+}
+
 pub(super) async fn prepare_skill_for_turn(
     app: &mut App,
     mcp_client: &McpClient,
@@ -486,10 +534,14 @@ pub(super) async fn prepare_skill_for_turn(
 
     let intent = detect_turn_intent(question, &app.config.intent_model_path);
     let question_len = question.chars().count();
-    let skip_router_for_local_intent = matches!(
-        intent.core,
-        intent_recognition::CoreIntent::Casual | intent_recognition::CoreIntent::QueryConcept
-    ) && question_len <= 64;
+    let heuristic_skill = match_skill(skill_manifests, question, Some(&intent));
+    let skip_router_for_local_intent =
+        should_skip_remote_skill_router(
+            &intent,
+            question_len,
+            skill_manifests.len(),
+            heuristic_skill.is_some(),
+        );
     let router_selected = route_skill_for_turn(
         app,
         question,
@@ -499,7 +551,6 @@ pub(super) async fn prepare_skill_for_turn(
     )
     .await;
 
-    let heuristic_skill = match_skill(skill_manifests, question, Some(&intent));
     let router_skill = router_selected
         .as_deref()
         .and_then(|name| skill_manifests.iter().find(|s| s.name == name));
@@ -588,13 +639,15 @@ fn resolve_skill_selection<'a>(
 mod tests {
     use super::{
         build_system_prompt, builtin_tools_for_skill, ensure_required_discovery_tools,
-        merge_with_runtime_enabled_tools, resolve_max_iterations, tool_uses_mcp_server,
+        merge_with_runtime_enabled_tools, resolve_max_iterations, should_skip_remote_skill_router,
+        tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
+    use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
     use crate::ai::tools::enable_tools::set_explicit_enabled_tool_names;
     use crate::ai::types::{FunctionDefinition, ToolDefinition};
-    use std::collections::BTreeSet;
-
+    use rust_tools::cw::SkipSet;
+    
     #[test]
     fn mcp_server_filter_matches_longest_server_name_prefix() {
         let allowed = vec!["foo".to_string(), "foo_bar".to_string()];
@@ -645,14 +698,14 @@ mod tests {
 
     #[test]
     fn system_prompt_only_mentions_tools_available_this_turn() {
-        let mut available = BTreeSet::new();
+        let mut available = SkipSet::new(16);
         available.insert("code_search".to_string());
         available.insert("read_file".to_string());
         available.insert("apply_patch".to_string());
         available.insert("enable_tools".to_string());
         available.insert("discover_skills".to_string());
 
-        let prompt = build_system_prompt(None, None, &available);
+        let prompt = build_system_prompt(None, None, &Box::new(available));
         assert!(prompt.contains("Available tools:"));
         assert!(prompt.contains("Code navigation policy"));
         assert!(prompt.contains("File editing policy"));
@@ -722,5 +775,23 @@ mod tests {
         assert!(!names.contains(&"plan".to_string()));
         assert!(!names.contains(&"read_file".to_string()));
         assert!(!names.contains(&"search_files".to_string()));
+    }
+
+    #[test]
+    fn short_casual_turn_skips_remote_skill_router() {
+        let intent = UserIntent::new(CoreIntent::Casual);
+        assert!(should_skip_remote_skill_router(&intent, 24, 3, false));
+    }
+
+    #[test]
+    fn heuristic_skill_hit_skips_remote_skill_router() {
+        let intent = UserIntent::new(CoreIntent::RequestAction);
+        assert!(should_skip_remote_skill_router(&intent, 24, 3, true));
+    }
+
+    #[test]
+    fn short_action_turn_without_heuristic_keeps_remote_skill_router_available() {
+        let intent = UserIntent::new(CoreIntent::RequestAction);
+        assert!(!should_skip_remote_skill_router(&intent, 24, 3, false));
     }
 }

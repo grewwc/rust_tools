@@ -1,5 +1,7 @@
 use colored::Colorize;
 use serde_json::Value;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
 
 use crate::ai::{
     driver::{
@@ -159,6 +161,20 @@ fn handle_request_error(
     "[本轮请求失败，请重试或换个问法]".to_string()
 }
 
+fn request_interrupt_pending(shutdown: &AtomicBool, cancel_stream: &AtomicBool) -> bool {
+    shutdown.load(std::sync::atomic::Ordering::Relaxed)
+        || cancel_stream.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+async fn wait_for_request_interrupt(shutdown: &AtomicBool, cancel_stream: &AtomicBool) {
+    loop {
+        if request_interrupt_pending(shutdown, cancel_stream) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[crate::ai::agent_hang_span(
     "pre-fix",
     "B",
@@ -237,10 +253,18 @@ async fn stream_model_response(
     app: &mut App,
     response: &mut reqwest::Response,
     current_history: &mut String,
+    terminal_dedupe_candidate: Option<&str>,
     _iteration: usize,
 ) -> StreamResult {
     print_assistant_banner_with_app(Some(app));
-    let stream_result = match stream::stream_response(app, response, current_history).await {
+    let stream_result = match stream::stream_response(
+        app,
+        response,
+        current_history,
+        terminal_dedupe_candidate,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(err) => {
             app.streaming
@@ -307,21 +331,35 @@ pub(super) async fn execute_turn_iteration(
     persisted_turn_messages: &mut usize,
     should_quit: bool,
     force_final_response: bool,
+    terminal_dedupe_candidate: Option<&str>,
     iteration: usize,
 ) -> Result<IterationExecution, Box<dyn std::error::Error>> {
     let mut current_history = String::new();
     app.streaming
         .store(true, std::sync::atomic::Ordering::Relaxed);
 
-    let mut response = match request_model_response(
-        app,
-        next_model,
-        messages,
-        force_final_response,
-        iteration,
-    )
-    .await
-    {
+    let shutdown = app.shutdown.clone();
+    let cancel_stream = app.cancel_stream.clone();
+    let request_result = tokio::select! {
+        response = request_model_response(
+            app,
+            next_model,
+            messages,
+            force_final_response,
+            iteration,
+        ) => response,
+        _ = wait_for_request_interrupt(shutdown.as_ref(), cancel_stream.as_ref()) => {
+            return Ok(interrupted_iteration_execution(
+                app,
+                one_shot_mode,
+                turn_messages,
+                persisted_turn_messages,
+                should_quit,
+            ));
+        }
+    };
+
+    let mut response = match request_result {
         Ok(response) => response,
         Err(err) => {
             return Ok(IterationExecution::RequestFailed(handle_request_error(
@@ -349,7 +387,14 @@ pub(super) async fn execute_turn_iteration(
 
     request::print_info(next_model);
     let stream_result =
-        stream_model_response(app, &mut response, &mut current_history, iteration).await;
+        stream_model_response(
+            app,
+            &mut response,
+            &mut current_history,
+            terminal_dedupe_candidate,
+            iteration,
+        )
+        .await;
     finalize_stream_interaction(
         app,
         &mut response,
@@ -360,4 +405,24 @@ pub(super) async fn execute_turn_iteration(
         should_quit,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::request_interrupt_pending;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn request_interrupt_pending_tracks_shutdown_or_stream_cancel() {
+        let shutdown = AtomicBool::new(false);
+        let cancel_stream = AtomicBool::new(false);
+        assert!(!request_interrupt_pending(&shutdown, &cancel_stream));
+
+        cancel_stream.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(request_interrupt_pending(&shutdown, &cancel_stream));
+
+        cancel_stream.store(false, std::sync::atomic::Ordering::Relaxed);
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(request_interrupt_pending(&shutdown, &cancel_stream));
+    }
 }

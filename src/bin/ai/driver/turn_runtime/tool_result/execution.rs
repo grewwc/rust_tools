@@ -16,6 +16,8 @@ use super::{
     overflow::{build_model_overflow_stub, summarize_large_tool_output, write_tool_overflow_file},
     preview::{build_terminal_preview, tail_chars},
 };
+use crate::ai::driver::print::{format_tool_header, print_tool_output_block, print_tool_output_line};
+use super::messaging::print_tool_result_preview;
 use super::super::persistence::persist_pending_turn_messages;
 use super::super::{
     MAX_TOOL_RESULT_INLINE_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
@@ -297,9 +299,142 @@ fn execute_tool_calls_for_round(
     session_id: &str,
     mcp_client: &mut McpClient,
     tool_calls: &[ToolCall],
+    observer: Option<&mut dyn tools::ToolExecutionObserver>,
     _iteration: usize,
 ) -> Result<ExecuteToolCallsResult, Box<dyn std::error::Error>> {
-    tools::execute_tool_calls(session_id, mcp_client, tool_calls)
+    tools::execute_tool_calls(session_id, mcp_client, tool_calls, observer)
+}
+
+struct TerminalToolObserver<'a> {
+    app: &'a App,
+    active_stream_tool_call_id: Option<String>,
+    pending_utf8: Vec<u8>,
+    line_buffer: String,
+    stream_header_printed: bool,
+    streamed_any_output: bool,
+}
+
+impl<'a> TerminalToolObserver<'a> {
+    fn new(app: &'a App) -> Self {
+        Self {
+            app,
+            active_stream_tool_call_id: None,
+            pending_utf8: Vec::new(),
+            line_buffer: String::new(),
+            stream_header_printed: false,
+            streamed_any_output: false,
+        }
+    }
+
+    fn reset_stream_state(&mut self) {
+        self.active_stream_tool_call_id = None;
+        self.pending_utf8.clear();
+        self.line_buffer.clear();
+        self.stream_header_printed = false;
+        self.streamed_any_output = false;
+    }
+
+    fn push_stream_text(&mut self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.line_buffer.push_str(&normalized);
+        while let Some(pos) = self.line_buffer.find('\n') {
+            let line = self.line_buffer[..pos].to_string();
+            print_tool_output_line(&line);
+            self.line_buffer.drain(..=pos);
+            self.streamed_any_output = true;
+        }
+    }
+
+    fn flush_pending_utf8(&mut self) {
+        if self.pending_utf8.is_empty() {
+            return;
+        }
+        let text = String::from_utf8_lossy(&self.pending_utf8).into_owned();
+        self.pending_utf8.clear();
+        self.push_stream_text(&text);
+    }
+
+    fn flush_trailing_line(&mut self) {
+        self.flush_pending_utf8();
+        if !self.line_buffer.is_empty() {
+            print_tool_output_line(&self.line_buffer);
+            self.line_buffer.clear();
+            self.streamed_any_output = true;
+        }
+    }
+}
+
+impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
+    fn on_tool_started(&mut self, tool_call: &ToolCall) {
+        if tool_call.function.name != "execute_command" {
+            return;
+        }
+
+        self.reset_stream_state();
+        self.active_stream_tool_call_id = Some(tool_call.id.clone());
+        self.stream_header_printed = true;
+        println!("\n{}", format_tool_header(&tool_call.function.name));
+    }
+
+    fn on_tool_stream(&mut self, tool_call: &ToolCall, chunk: &[u8]) {
+        if self.active_stream_tool_call_id.as_deref() != Some(tool_call.id.as_str()) {
+            return;
+        }
+
+        self.pending_utf8.extend_from_slice(chunk);
+        loop {
+            match std::str::from_utf8(&self.pending_utf8) {
+                Ok(text) => {
+                    let text = text.to_string();
+                    self.pending_utf8.clear();
+                    self.push_stream_text(&text);
+                    break;
+                }
+                Err(err) => {
+                    let valid_up_to = err.valid_up_to();
+                    if valid_up_to == 0 {
+                        if err.error_len().is_some() {
+                            self.flush_pending_utf8();
+                        }
+                        break;
+                    }
+
+                    let text = String::from_utf8_lossy(&self.pending_utf8[..valid_up_to]).into_owned();
+                    self.pending_utf8.drain(..valid_up_to);
+                    self.push_stream_text(&text);
+
+                    if err.error_len().is_some() {
+                        self.flush_pending_utf8();
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_tool_finished(&mut self, tool_call: &ToolCall, run_result: &tools::RunOneResult) {
+        if tool_call.function.name == "execute_command" {
+            self.flush_trailing_line();
+
+            let prepared = prepare_tool_result(
+                self.app,
+                &tool_call.function.name,
+                &run_result.tool_result.content,
+            );
+            if !self.streamed_any_output {
+                print_tool_output_block(&prepared.content_for_terminal);
+            } else if run_result.tool_result.content.starts_with("Exit code:") {
+                if let Some(exit_line) = run_result.tool_result.content.lines().next() {
+                    print_tool_output_line(exit_line);
+                }
+            }
+
+            self.reset_stream_state();
+            return;
+        }
+
+        let prepared = prepare_tool_result(self.app, &tool_call.function.name, &run_result.tool_result.content);
+        print_tool_result_preview(&tool_call.function.name, &prepared);
+    }
 }
 
 fn handle_tool_call_round(
@@ -311,13 +446,16 @@ fn handle_tool_call_round(
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
     iteration: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut observer = TerminalToolObserver::new(app);
     let exec_result = execute_tool_calls_for_round(
         &app.session_id,
         mcp_client,
         &stream_result.tool_calls,
+        Some(&mut observer),
         iteration,
     )?;
+    let terminal_dedupe_candidate = terminal_dedupe_candidate_for_exec_result(&exec_result);
 
     append_cached_tool_results_note(&exec_result, messages, turn_messages);
     append_tool_result_messages(
@@ -337,7 +475,23 @@ fn handle_tool_call_round(
         persisted_turn_messages,
     );
 
-    Ok(())
+    Ok(terminal_dedupe_candidate)
+}
+
+fn terminal_dedupe_candidate_for_exec_result(exec_result: &ExecuteToolCallsResult) -> Option<String> {
+    if exec_result.executed_tool_calls.len() != 1 || exec_result.tool_results.len() != 1 {
+        return None;
+    }
+    let tool_call = &exec_result.executed_tool_calls[0];
+    let tool_result = &exec_result.tool_results[0];
+    if tool_call.function.name != "execute_command" {
+        return None;
+    }
+    let content = tool_result.content.trim();
+    if content.is_empty() {
+        return None;
+    }
+    Some(content.to_string())
 }
 
 pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
@@ -352,6 +506,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     final_assistant_text: &mut String,
     final_assistant_recorded: &mut bool,
     force_final_response: &mut bool,
+    terminal_dedupe_candidate: &mut Option<String>,
     iteration: usize,
     max_iterations: usize,
 ) -> Result<TurnLoopStep, Box<dyn std::error::Error>> {
@@ -376,7 +531,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::ToolCall(stream_result) => {
-            handle_tool_call_round(
+            *terminal_dedupe_candidate = handle_tool_call_round(
                 app,
                 mcp_client,
                 &stream_result,
@@ -409,7 +564,10 @@ mod tests {
     use super::*;
     use crate::ai::{
         cli::ParsedCli,
-        types::{AgentContext, App, AppConfig, FunctionDefinition, ToolDefinition},
+        types::{
+            AgentContext, App, AppConfig, FunctionCall, FunctionDefinition, ToolDefinition,
+            ToolResult,
+        },
     };
     use rust_tools::commonw::FastMap;
     use std::path::PathBuf;
@@ -496,5 +654,29 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with(TOOL_USE_CORRECTION_PREFIX));
+    }
+
+    #[test]
+    fn terminal_dedupe_candidate_tracks_single_execute_command_result() {
+        let exec_result = ExecuteToolCallsResult {
+            executed_tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "execute_command".to_string(),
+                    arguments: "{\"command\":\"seq 3\"}".to_string(),
+                },
+            }],
+            tool_results: vec![ToolResult {
+                tool_call_id: "call_1".to_string(),
+                content: "1\n2\n3\n".to_string(),
+            }],
+            cached_hits: vec![false],
+        };
+
+        assert_eq!(
+            terminal_dedupe_candidate_for_exec_result(&exec_result),
+            Some("1\n2\n3".to_string())
+        );
     }
 }

@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use crate::ai::theme::{
     ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS,
 };
+use crate::ai::stream::state::{END_THINKING_TAG_TEXT, THINKING_TAG_TEXT};
 use crate::ai::stream::render::code::{
     MONOKAI_BG, MONOKAI_DIM, highlight_code_line, parse_code_block_language,
 };
@@ -89,6 +90,10 @@ impl MarkdownStreamRenderer {
 
     pub(in crate::ai::stream::render) fn code_block_lang(&self) -> Option<&str> {
         self.code_block_lang.as_deref()
+    }
+
+    pub(in crate::ai::stream) fn has_unfinished_line(&self) -> bool {
+        !self.line_buf.is_empty()
     }
 
     pub(in crate::ai::stream::render) fn code_line_number(&self) -> usize {
@@ -366,6 +371,23 @@ impl MarkdownStreamRenderer {
         let trimmed = rest.trim_start_matches([' ', '\t']);
 
         let base = if self.dimmed { "\x1b[2m" } else { "" };
+
+        if trimmed == THINKING_TAG_TEXT || trimmed == END_THINKING_TAG_TEXT {
+            self.in_code_block = false;
+            self.code_block_indent.clear();
+            self.code_block_lang = None;
+            self.code_line_number = 0;
+
+            let label = if trimmed == THINKING_TAG_TEXT {
+                "thinking"
+            } else {
+                "done thinking"
+            };
+            let glyph = if trimmed == THINKING_TAG_TEXT { "╭─" } else { "╰─" };
+            return format!(
+                "{indent}{ACCENT_RULE}{glyph}\x1b[0m {ACCENT_MUTED}{label}\x1b[0m\n"
+            );
+        }
 
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             if self.in_code_block {
@@ -663,5 +685,40 @@ mod tests {
         let rule_visible = strip_ansi_for_test(&rule);
         assert!(quote_visible.contains("▍ note"));
         assert!(rule_visible.contains(&"─".repeat(28)));
+    }
+
+    #[test]
+    fn thinking_markers_render_cleanly_without_leaking_ansi_bytes() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+
+        let start = renderer.consume_line(THINKING_TAG_TEXT, false);
+        let end = renderer.consume_line(END_THINKING_TAG_TEXT, false);
+
+        let start_visible = strip_ansi_for_test(&start);
+        let end_visible = strip_ansi_for_test(&end);
+        assert_eq!(start_visible, "╭─ thinking\n");
+        assert_eq!(end_visible, "╰─ done thinking\n");
+    }
+
+    #[test]
+    fn thinking_marker_breaks_out_of_code_block_rendering() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+
+        let _ = renderer.consume_line("```rust", false);
+        let out = renderer.consume_line(END_THINKING_TAG_TEXT, false);
+
+        let visible = strip_ansi_for_test(&out);
+        assert_eq!(visible, "╰─ done thinking\n");
+    }
+
+    #[test]
+    fn unfinished_line_state_tracks_pending_inline_content() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+
+        renderer.write_chunk("hello", false).unwrap();
+        assert!(renderer.has_unfinished_line());
+
+        renderer.write_chunk("\n", false).unwrap();
+        assert!(!renderer.has_unfinished_line());
     }
 }

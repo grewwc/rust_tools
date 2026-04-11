@@ -246,5 +246,15 @@
     "search_enabled": false,
     "tools_default_enabled": true,
     "enable_thinking": true
+  },
+  {
+    "key": "MiniMax M2.5",
+    "name": "minimax-m2.5",
+    "provider": "opencode",
+    "quality_tier": "strong",
+    "is_vl": true,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": true
   }
 ]

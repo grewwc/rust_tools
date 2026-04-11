@@ -37,9 +37,40 @@ pub(super) fn extract_chunk_text_with_tools(
 
     if *thinking_open {
         *thinking_open = false;
-        return (format!("\n{end_thinking_tag}\n{}", delta.content), Vec::new());
+        return (format!("{end_thinking_tag}\n{}", delta.content), Vec::new());
     }
     (delta.content.clone(), Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::request::{StreamChoice, StreamDelta};
+
+    #[test]
+    fn closing_thinking_does_not_add_extra_blank_line_before_end_marker() {
+        let chunk = StreamChunk {
+            choices: vec![StreamChoice {
+                delta: StreamDelta {
+                    content: "next".to_string(),
+                    reasoning_content: String::new(),
+                    tool_calls: Vec::new(),
+                },
+                finish_reason: None,
+            }],
+        };
+
+        let mut thinking_open = true;
+        let (content, _) = extract_chunk_text_with_tools(
+            &chunk,
+            "╭─ thinking",
+            "╰─ done thinking",
+            &mut thinking_open,
+        );
+
+        assert_eq!(content, "╰─ done thinking\nnext");
+        assert!(!thinking_open);
+    }
 }
 
 fn extract_internal_tool_calls(s: &str) -> (String, Vec<InternalToolCall>) {

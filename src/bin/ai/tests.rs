@@ -567,6 +567,115 @@ fn context_history_summary_keeps_tool_names_and_results() {
 }
 
 #[test]
+fn context_history_cache_invalidates_after_history_changes() {
+    let path = std::env::temp_dir().join(format!("ai-history-cache-{}.sqlite", uuid::Uuid::new_v4()));
+    append_history(
+        &path,
+        &format!("user{COLON}first{NEWLINE}assistant{COLON}one{NEWLINE}"),
+    )
+    .unwrap();
+
+    let first = build_context_history(8, &path, 10_000, 8, 2_000).unwrap();
+    assert_eq!(first.len(), 2);
+
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    append_history(
+        &path,
+        &format!("user{COLON}second{NEWLINE}assistant{COLON}two{NEWLINE}"),
+    )
+    .unwrap();
+
+    let second = build_context_history(8, &path, 10_000, 8, 2_000).unwrap();
+    assert_eq!(second.len(), 4);
+    assert_eq!(second.last().unwrap().content, serde_json::Value::String("two".to_string()));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_recent_turn_window_reads_only_recent_user_turns() {
+    let path = std::env::temp_dir().join(format!("ai-history-window-{}.sqlite", uuid::Uuid::new_v4()));
+    let mut messages = Vec::new();
+    for i in 0..5 {
+        messages.push(Message {
+            role: "user".to_string(),
+            content: serde_json::Value::String(format!("u{i}")),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(format!("a{i}")),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+    append_history_messages(&path, &messages).unwrap();
+
+    let recent = crate::ai::history::read_recent_turn_window_sqlite(&path, 2).unwrap();
+    let texts = recent
+        .messages
+        .iter()
+        .filter_map(|m| m.content.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(texts, vec!["u3", "a3", "u4", "a4"]);
+    assert!(recent.has_older_messages);
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_context_fastpath_keeps_existing_history_summary() {
+    let path = std::env::temp_dir().join(format!("ai-history-fastpath-{}.sqlite", uuid::Uuid::new_v4()));
+    let messages = vec![
+        Message {
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+            content: serde_json::Value::String(
+                "历史摘要（自动压缩，以下为更早对话的简短语义）：\nolder summary".to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: serde_json::Value::String("u1".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String("a1".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: serde_json::Value::String("u2".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String("a2".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+    append_history_messages(&path, &messages).unwrap();
+
+    let context = build_context_history(2, &path, 10_000, 2, 2_000).unwrap();
+    assert_eq!(context[0].role, crate::ai::history::ROLE_INTERNAL_NOTE);
+    assert!(context[0]
+        .content
+        .as_str()
+        .unwrap_or_default()
+        .contains("older summary"));
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn session_delete_removes_sqlite_sidecars() {
     let history_file =
         std::env::temp_dir().join(format!("ai-history-{}.sqlite", uuid::Uuid::new_v4()));

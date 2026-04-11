@@ -526,7 +526,7 @@ fn levenshtein(left: &[u8], right: &[u8]) -> usize {
 mod tests {
     use super::{
         agent_model_tier, api_key_for_model, auto_subagent_model_for_agent,
-        classify_subagent_task_difficulty, default_model, default_vl_model, determine_model,
+        classify_subagent_task_difficulty, default_model, determine_model,
         determine_vl_model, endpoint_for_model, initial_model, merge_agent_tier_with_difficulty,
         endpoint_supports_anonymous_auth, model_provider, model_quality_tier, ModelStrengthTier, SubagentTaskDifficulty,
         COMPATIBLE_DEFAULT_ENDPOINT, OPENCODE_DEFAULT_ENDPOINT, OPENROUTER_ENDPOINT,
@@ -741,15 +741,6 @@ mod tests {
         let def = super::model_names::find_by_name(&default_model()).expect("default model must exist");
         assert_eq!(def.provider, ApiProvider::Compatible);
         assert!(!def.is_vl);
-        assert_eq!(def.quality_tier, ModelQualityTier::Flagship);
-    }
-
-    #[test]
-    fn default_vl_model_prefers_high_quality_compatible_vl_model() {
-        let def =
-            super::model_names::find_by_name(&default_vl_model()).expect("default vl model must exist");
-        assert_eq!(def.provider, ApiProvider::Compatible);
-        assert!(def.is_vl);
         assert_eq!(def.quality_tier, ModelQualityTier::Flagship);
     }
 

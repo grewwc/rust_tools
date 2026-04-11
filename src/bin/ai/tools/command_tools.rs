@@ -8,6 +8,13 @@ pub(crate) fn execute_command(args: &Value) -> Result<String, String> {
     super::service::command::execute_command(args)
 }
 
+pub(crate) fn execute_command_streaming<F>(args: &Value, on_chunk: F) -> Result<String, String>
+where
+    F: FnMut(&[u8]),
+{
+    super::service::command::execute_command_streaming(args, on_chunk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,5 +72,17 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_execute_command_streaming_matches_final_output() {
+        let args = serde_json::json!({
+            "command": "printf 'hello\\nworld'"
+        });
+        let mut chunks = Vec::new();
+        let result = execute_command_streaming(&args, |chunk| chunks.extend_from_slice(chunk));
+        assert!(result.is_ok(), "command failed: {:?}", result);
+        assert_eq!(String::from_utf8_lossy(&chunks), "hello\nworld");
+        assert_eq!(result.unwrap(), "hello\nworld");
     }
 }

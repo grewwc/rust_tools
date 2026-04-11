@@ -1,6 +1,9 @@
 use serde_json::Value;
+use std::process::Output;
 
 use crate::ai::tools::storage::command_runner;
+
+const MAX_COMMAND_OUTPUT_CHARS: usize = 16_000;
 
 fn truncate_chars(content: &str, max_chars: usize) -> String {
     if content.chars().count() <= max_chars {
@@ -161,16 +164,7 @@ pub fn validate_execute_command(command: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn execute_command(args: &Value) -> Result<String, String> {
-    let command = args["command"].as_str().ok_or("Missing command")?;
-    let cwd = args["cwd"].as_str().filter(|dir| !dir.trim().is_empty());
-    let timeout = args["timeout"].as_u64().unwrap_or(60).clamp(1, 300);
-
-    if let Err(reason) = validate_execute_command(command) {
-        return Ok(format!("Command blocked: {reason}"));
-    }
-
-    let output = command_runner::run_command(command, cwd, timeout)?;
+fn format_command_output(output: Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let stdout_trimmed = stdout.trim();
@@ -184,16 +178,43 @@ pub(crate) fn execute_command(args: &Value) -> Result<String, String> {
         } else {
             format!("{stdout_trimmed}\n{stderr_trimmed}")
         };
-        Ok(truncate_chars(combined.trim(), 16_000))
+        truncate_chars(combined.trim(), MAX_COMMAND_OUTPUT_CHARS)
     } else {
-        Ok(truncate_chars(
+        truncate_chars(
             &format!(
                 "Exit code: {}\n{}\n{}",
                 output.status.code().unwrap_or(-1),
                 stdout_trimmed,
                 stderr_trimmed
             ),
-            16_000,
-        ))
+            MAX_COMMAND_OUTPUT_CHARS,
+        )
     }
+}
+
+fn execute_command_inner<F>(args: &Value, on_chunk: F) -> Result<String, String>
+where
+    F: FnMut(&[u8]),
+{
+    let command = args["command"].as_str().ok_or("Missing command")?;
+    let cwd = args["cwd"].as_str().filter(|dir| !dir.trim().is_empty());
+    let timeout = args["timeout"].as_u64().unwrap_or(60).clamp(1, 300);
+
+    if let Err(reason) = validate_execute_command(command) {
+        return Ok(format!("Command blocked: {reason}"));
+    }
+
+    let output = command_runner::run_command_streaming(command, cwd, timeout, on_chunk)?;
+    Ok(format_command_output(output))
+}
+
+pub(crate) fn execute_command(args: &Value) -> Result<String, String> {
+    execute_command_inner(args, |_| {})
+}
+
+pub(crate) fn execute_command_streaming<F>(args: &Value, on_chunk: F) -> Result<String, String>
+where
+    F: FnMut(&[u8]),
+{
+    execute_command_inner(args, on_chunk)
 }
