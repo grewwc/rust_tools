@@ -59,25 +59,22 @@ fn parse_openrouter_payload(payload: &str) -> ParsedStreamPayload {
 }
 
 fn parse_opencode_payload(payload: &str) -> ParsedStreamPayload {
-    // OpenCode API 可能返回非标准格式的流式响应
     let trimmed = payload.trim();
-    
-    // 尝试直接解析
-    if let Some(chunk) = try_parse_stream_chunk(trimmed) {
-        return ParsedStreamPayload::Chunk(chunk);
-    }
-    
-    // 对于 OpenCode 特殊处理：打印被忽略的内容长度，帮助调试
-    // 但不打印完整内容，避免隐私问题
-    if !trimmed.is_empty() && trimmed != "[DONE]" {
-        eprintln!("[opencode] ignored payload, length: {}, starts_with: {:.30}", 
-            trimmed.len(), trimmed);
-    }
-    
     if trimmed.is_empty() || trimmed == "[DONE]" {
         return ParsedStreamPayload::Ignore;
     }
-    ParsedStreamPayload::Ignore
+
+    match serde_json::from_str::<StreamChunk>(trimmed) {
+        Ok(chunk) => ParsedStreamPayload::Chunk(chunk),
+        Err(_) => {
+            eprintln!(
+                "[opencode] ignored payload, length: {}, starts_with: {:.30}",
+                trimmed.len(),
+                trimmed
+            );
+            ParsedStreamPayload::Ignore
+        }
+    }
 }
 
 fn parse_stream_chunk(adapter_label: &str, payload: &str) -> ParsedStreamPayload {
@@ -131,5 +128,16 @@ mod tests {
             "https://opencode.ai/zen/v1/chat/completions",
         );
         assert_eq!(adapter, StreamProviderAdapterKind::OpenCode);
+    }
+
+    #[test]
+    fn opencode_payload_accepts_structured_content_chunks() {
+        let payload = r#"{"id":"chatcmpl-1","choices":[{"delta":{"content":[{"type":"output_text","text":"hi"}]}}]}"#;
+        match parse_stream_payload(StreamProviderAdapterKind::OpenCode, payload) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.content, "hi");
+            }
+            _ => panic!("expected parsed chunk"),
+        }
     }
 }

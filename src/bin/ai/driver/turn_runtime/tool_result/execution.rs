@@ -4,8 +4,7 @@ use crate::ai::{
     mcp::McpClient,
     types::{App, ToolCall},
 };
-use serde_json::Value;
-use std::collections::BTreeSet;
+use std::io::Write;
 
 use super::{
     messaging::{
@@ -16,223 +15,15 @@ use super::{
     overflow::{build_model_overflow_stub, summarize_large_tool_output, write_tool_overflow_file},
     preview::{build_terminal_preview, tail_chars},
 };
-use crate::ai::driver::print::{format_tool_header, print_tool_output_block, print_tool_output_line};
+use crate::ai::driver::print::{
+    format_tool_output_prefix, print_tool_note_line, print_tool_output_block,
+};
 use super::messaging::print_tool_result_preview;
 use super::super::persistence::persist_pending_turn_messages;
 use super::super::{
     MAX_TOOL_RESULT_INLINE_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
     types::{IterationExecution, PreparedToolResult, TurnLoopStep},
 };
-
-const TOOL_USE_CORRECTION_PREFIX: &str = "Tool-use correction:";
-
-fn turn_has_tool_use(turn_messages: &[Message]) -> bool {
-    turn_messages.iter().any(|message| {
-        message.role == "tool"
-            || message
-                .tool_calls
-                .as_ref()
-                .is_some_and(|calls| !calls.is_empty())
-    })
-}
-
-fn count_tool_use_corrections(messages: &[Message]) -> usize {
-    messages
-        .iter()
-        .filter(|message| message.role == "system")
-        .filter_map(|message| message.content.as_str())
-        .filter(|content| content.starts_with(TOOL_USE_CORRECTION_PREFIX))
-        .count()
-}
-
-fn available_tool_names(app: &App) -> BTreeSet<String> {
-    app.agent_context
-        .as_ref()
-        .map(|ctx| {
-            ctx.tools
-                .iter()
-                .map(|tool| tool.function.name.clone())
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default()
-}
-
-fn looks_time_sensitive_request(question: &str) -> bool {
-    let lower = question.to_ascii_lowercase();
-    [
-        "latest",
-        "current",
-        "today",
-        "now",
-        "weather",
-        "news",
-        "stock",
-        "sports",
-        "score",
-        "recent",
-        "release",
-        "今天",
-        "现在",
-        "最新",
-        "近期",
-        "实时",
-        "天气",
-        "新闻",
-        "股价",
-        "比分",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn looks_command_request(question: &str) -> bool {
-    let lower = question.to_ascii_lowercase();
-    [
-        "run ",
-        "build",
-        "test",
-        "compile",
-        "cargo ",
-        "npm ",
-        "pnpm ",
-        "yarn ",
-        "执行",
-        "运行",
-        "构建",
-        "测试",
-        "编译",
-        "跑一下",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn looks_edit_request(question: &str) -> bool {
-    let lower = question.to_ascii_lowercase();
-    [
-        "fix",
-        "modify",
-        "edit",
-        "update",
-        "refactor",
-        "implement",
-        "change",
-        "修复",
-        "修改",
-        "改一下",
-        "重构",
-        "实现",
-        "新增",
-        "添加",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn looks_repo_or_code_request(question: &str) -> bool {
-    let lower = question.to_ascii_lowercase();
-    [
-        ".rs",
-        ".py",
-        ".ts",
-        ".tsx",
-        ".js",
-        ".java",
-        ".go",
-        "src/",
-        "cargo.toml",
-        "代码",
-        "函数",
-        "文件",
-        "配置",
-        "逻辑",
-        "报错",
-        "bug",
-        "stack trace",
-        "repo",
-        "repository",
-        "agent",
-        "symbol",
-        "class",
-        "method",
-        "why",
-        "检查一下代码",
-        "看看代码",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
-fn tool_use_requirement_reason(question: &str, app: &App) -> Option<String> {
-    let available = available_tool_names(app);
-    if available.is_empty() {
-        return None;
-    }
-
-    if looks_time_sensitive_request(question) && available.contains("web_search") {
-        return Some(
-            "This request is time-sensitive. Call `web_search` before giving a final answer."
-                .to_string(),
-        );
-    }
-
-    if looks_command_request(question) && available.contains("execute_command") {
-        return Some(
-            "This request asks you to run, build, test, or reproduce behavior. Call `execute_command` before giving a final answer."
-                .to_string(),
-        );
-    }
-
-    if looks_edit_request(question)
-        && (available.contains("apply_patch")
-            || available.contains("write_file")
-            || available.contains("read_file")
-            || available.contains("read_file_lines"))
-    {
-        return Some(
-            "This request asks for code or file changes. Inspect the file with `read_file` / `read_file_lines`, then make the change with editing tools before giving a final answer."
-                .to_string(),
-        );
-    }
-
-    if looks_repo_or_code_request(question)
-        && (available.contains("code_search")
-            || available.contains("read_file")
-            || available.contains("read_file_lines"))
-    {
-        return Some(
-            "This request depends on repository code or file contents. Inspect the repo with `code_search` or file-read tools before giving a final answer."
-                .to_string(),
-        );
-    }
-
-    None
-}
-
-fn maybe_enqueue_tool_use_correction(
-    app: &App,
-    question: &str,
-    messages: &mut Vec<Message>,
-    turn_messages: &mut Vec<Message>,
-) -> bool {
-    if turn_has_tool_use(turn_messages) || count_tool_use_corrections(messages) >= 2 {
-        return false;
-    }
-    let Some(reason) = tool_use_requirement_reason(question, app) else {
-        return false;
-    };
-    let note = Message {
-        role: "system".to_string(),
-        content: Value::String(format!(
-            "{TOOL_USE_CORRECTION_PREFIX} {reason}\nCall at least one relevant tool in your next response. Do not give a final answer yet."
-        )),
-        tool_calls: None,
-        tool_call_id: None,
-    };
-    messages.push(note.clone());
-    turn_messages.push(note);
-    true
-}
 
 pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
     app: &App,
@@ -309,8 +100,7 @@ struct TerminalToolObserver<'a> {
     app: &'a App,
     active_stream_tool_call_id: Option<String>,
     pending_utf8: Vec<u8>,
-    line_buffer: String,
-    stream_header_printed: bool,
+    at_line_start: bool,
     streamed_any_output: bool,
 }
 
@@ -320,8 +110,7 @@ impl<'a> TerminalToolObserver<'a> {
             app,
             active_stream_tool_call_id: None,
             pending_utf8: Vec::new(),
-            line_buffer: String::new(),
-            stream_header_printed: false,
+            at_line_start: true,
             streamed_any_output: false,
         }
     }
@@ -329,18 +118,28 @@ impl<'a> TerminalToolObserver<'a> {
     fn reset_stream_state(&mut self) {
         self.active_stream_tool_call_id = None;
         self.pending_utf8.clear();
-        self.line_buffer.clear();
-        self.stream_header_printed = false;
+        self.at_line_start = true;
         self.streamed_any_output = false;
     }
 
     fn push_stream_text(&mut self, text: &str) {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.line_buffer.push_str(&normalized);
-        while let Some(pos) = self.line_buffer.find('\n') {
-            let line = self.line_buffer[..pos].to_string();
-            print_tool_output_line(&line);
-            self.line_buffer.drain(..=pos);
+        let mut rendered = String::new();
+        for ch in normalized.chars() {
+            if self.at_line_start {
+                rendered.push_str(&format_tool_output_prefix());
+                self.at_line_start = false;
+            }
+            if ch == '\n' {
+                rendered.push_str("\x1b[0m\n");
+                self.at_line_start = true;
+            } else {
+                rendered.push(ch);
+            }
+        }
+        if !rendered.is_empty() {
+            print!("{rendered}");
+            let _ = std::io::stdout().flush();
             self.streamed_any_output = true;
         }
     }
@@ -354,12 +153,16 @@ impl<'a> TerminalToolObserver<'a> {
         self.push_stream_text(&text);
     }
 
-    fn flush_trailing_line(&mut self) {
+    fn finish_stream_output(&mut self, newline: bool) {
         self.flush_pending_utf8();
-        if !self.line_buffer.is_empty() {
-            print_tool_output_line(&self.line_buffer);
-            self.line_buffer.clear();
-            self.streamed_any_output = true;
+        if !self.at_line_start {
+            if newline {
+                print!("\x1b[0m\n");
+                self.at_line_start = true;
+            } else {
+                print!("\x1b[0m");
+            }
+            let _ = std::io::stdout().flush();
         }
     }
 }
@@ -372,8 +175,7 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
 
         self.reset_stream_state();
         self.active_stream_tool_call_id = Some(tool_call.id.clone());
-        self.stream_header_printed = true;
-        println!("\n{}", format_tool_header(&tool_call.function.name));
+        print_tool_note_line("output", "streaming command output");
     }
 
     fn on_tool_stream(&mut self, tool_call: &ToolCall, chunk: &[u8]) {
@@ -413,7 +215,8 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
 
     fn on_tool_finished(&mut self, tool_call: &ToolCall, run_result: &tools::RunOneResult) {
         if tool_call.function.name == "execute_command" {
-            self.flush_trailing_line();
+            let is_failure = run_result.tool_result.content.starts_with("Exit code:");
+            self.finish_stream_output(is_failure);
 
             let prepared = prepare_tool_result(
                 self.app,
@@ -421,11 +224,14 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
                 &run_result.tool_result.content,
             );
             if !self.streamed_any_output {
+                print_tool_note_line("result", "captured command output");
                 print_tool_output_block(&prepared.content_for_terminal);
-            } else if run_result.tool_result.content.starts_with("Exit code:") {
+            } else if is_failure {
                 if let Some(exit_line) = run_result.tool_result.content.lines().next() {
-                    print_tool_output_line(exit_line);
+                    print_tool_note_line("error", exit_line);
                 }
+            } else {
+                print_tool_note_line("result", "command completed");
             }
 
             self.reset_stream_state();
@@ -455,8 +261,6 @@ fn handle_tool_call_round(
         Some(&mut observer),
         iteration,
     )?;
-    let terminal_dedupe_candidate = terminal_dedupe_candidate_for_exec_result(&exec_result);
-
     append_cached_tool_results_note(&exec_result, messages, turn_messages);
     append_tool_result_messages(
         app,
@@ -475,28 +279,12 @@ fn handle_tool_call_round(
         persisted_turn_messages,
     );
 
-    Ok(terminal_dedupe_candidate)
-}
-
-fn terminal_dedupe_candidate_for_exec_result(exec_result: &ExecuteToolCallsResult) -> Option<String> {
-    if exec_result.executed_tool_calls.len() != 1 || exec_result.tool_results.len() != 1 {
-        return None;
-    }
-    let tool_call = &exec_result.executed_tool_calls[0];
-    let tool_result = &exec_result.tool_results[0];
-    if tool_call.function.name != "execute_command" {
-        return None;
-    }
-    let content = tool_result.content.trim();
-    if content.is_empty() {
-        return None;
-    }
-    Some(content.to_string())
+    Ok(None)
 }
 
 pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     app: &App,
-    question: &str,
+    _question: &str,
     mcp_client: &mut McpClient,
     execution: IterationExecution,
     messages: &mut Vec<Message>,
@@ -517,9 +305,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::FinalResponse(stream_result) => {
-            if maybe_enqueue_tool_use_correction(app, question, messages, turn_messages) {
-                return Ok(TurnLoopStep::Continue);
-            }
             record_final_stream_response(
                 app,
                 stream_result,
@@ -623,42 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_requirement_detects_time_sensitive_requests() {
-        let app = test_app_with_tools(&["web_search"]);
-        let reason = tool_use_requirement_reason("帮我查一下今天的天气", &app);
-        assert!(reason.is_some());
-        assert!(reason.unwrap().contains("web_search"));
-    }
-
-    #[test]
-    fn tool_requirement_detects_code_requests() {
-        let app = test_app_with_tools(&["code_search", "read_file"]);
-        let reason = tool_use_requirement_reason("帮我看一下 a.rs 这个 agent 为什么会报错", &app);
-        assert!(reason.is_some());
-        assert!(reason.unwrap().contains("code_search"));
-    }
-
-    #[test]
-    fn enqueue_tool_use_correction_only_happens_without_prior_tool_use() {
-        let app = test_app_with_tools(&["code_search"]);
-        let mut messages = Vec::new();
-        let mut turn_messages = Vec::new();
-        assert!(maybe_enqueue_tool_use_correction(
-            &app,
-            "帮我看一下 a.rs 这个 agent",
-            &mut messages,
-            &mut turn_messages,
-        ));
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0]
-            .content
-            .as_str()
-            .unwrap()
-            .starts_with(TOOL_USE_CORRECTION_PREFIX));
-    }
-
-    #[test]
-    fn terminal_dedupe_candidate_tracks_single_execute_command_result() {
+    fn tool_call_round_no_longer_requests_terminal_dedupe() {
         let exec_result = ExecuteToolCallsResult {
             executed_tool_calls: vec![ToolCall {
                 id: "call_1".to_string(),
@@ -675,9 +425,7 @@ mod tests {
             cached_hits: vec![false],
         };
 
-        assert_eq!(
-            terminal_dedupe_candidate_for_exec_result(&exec_result),
-            Some("1\n2\n3".to_string())
-        );
+        assert_eq!(exec_result.executed_tool_calls.len(), 1);
+        assert_eq!(exec_result.tool_results.len(), 1);
     }
 }

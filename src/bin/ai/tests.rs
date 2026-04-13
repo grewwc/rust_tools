@@ -947,3 +947,19 @@ fn stream_tool_call_defaults_when_nulls_present() {
     assert_eq!(call.function.name, "");
     assert_eq!(call.function.arguments, "");
 }
+
+#[test]
+fn stream_chunk_accepts_structured_content_arrays() {
+    let payload = r#"{"choices":[{"delta":{"content":[{"type":"output_text","text":"hel"},{"type":"output_text","text":"lo"}]}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.choices[0].delta.content, "hello");
+}
+
+#[test]
+fn stream_tool_call_accepts_object_arguments() {
+    let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"apply_patch","arguments":{"file":"a.rs","patch":"..."}}}]}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    let args: Value = serde_json::from_str(&parsed.choices[0].delta.tool_calls[0].function.arguments).unwrap();
+    assert_eq!(args["file"], "a.rs");
+    assert_eq!(args["patch"], "...");
+}

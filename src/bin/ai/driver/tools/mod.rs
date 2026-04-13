@@ -276,12 +276,15 @@ fn is_parallel_task_tool_call(tool_call: &ToolCall, prepared: &PreparedToolCall)
 }
 
 fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
+    let name = &tool_call.function.name;
     if run_result.cached {
-        println!("\n[Cached] {}", tool_call.function.name.bright_blue());
-    } else if run_result.executed {
-        println!("\n[Executed] {}", tool_call.function.name.green());
+        println!("\n[Cached] {}", name.bright_blue());
+    } else if !run_result.executed {
+        println!("\n[Skipped] {}", name.yellow());
+    } else if run_result.ok {
+        println!("\n[Completed] {}", name.green());
     } else {
-        println!("\n[Skipped] {}", tool_call.function.name.yellow());
+        println!("\n[Failed] {}", name.red());
     }
 }
 
@@ -435,6 +438,8 @@ fn run_one(
             },
         );
     }
+
+    println!("\n[Running] {}", tool_call.function.name.cyan());
 
     if let Some(observer) = observer.as_deref_mut() {
         observer.on_tool_started(tool_call);

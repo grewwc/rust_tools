@@ -39,7 +39,7 @@ struct RequestBody<'a> {
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct StreamChunk {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "vec_or_default")]
     pub(super) choices: Vec<StreamChoice>,
 }
 
@@ -62,7 +62,7 @@ pub(super) struct StreamDelta {
         deserialize_with = "string_or_default"
     )]
     pub(super) reasoning_content: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "vec_or_default")]
     pub(super) tool_calls: Vec<StreamToolCall>,
 }
 
@@ -86,12 +86,56 @@ pub(super) struct StreamFunctionCall {
     pub(super) arguments: String,
 }
 
+fn vec_or_default<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(|opt| opt.unwrap_or_default())
+}
+
 fn string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<String>::deserialize(deserializer)?;
-    Ok(value.unwrap_or_default())
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .map(json_value_to_string_lossy)
+        .unwrap_or_default())
+}
+
+fn json_value_to_string_lossy(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::Array(items) => items
+            .iter()
+            .map(json_value_to_string_lossy)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(""),
+        Value::Object(map) => {
+            for key in [
+                "text",
+                "content",
+                "value",
+                "reasoning_content",
+                "reasoning",
+                "arguments",
+            ] {
+                if let Some(inner) = map.get(key) {
+                    let extracted = json_value_to_string_lossy(inner);
+                    if !extracted.is_empty() {
+                        return extracted;
+                    }
+                }
+            }
+            serde_json::to_string(value).unwrap_or_default()
+        }
+    }
 }
 
 #[derive(Debug)]

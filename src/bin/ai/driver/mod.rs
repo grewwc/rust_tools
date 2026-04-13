@@ -289,6 +289,11 @@ fn maybe_auto_route_agent(
     let history_entries = read_recent_history(app);
     let context_target = select_best_agent_by_context(agent_manifests, question, &history_entries);
 
+    let fallback_agent_name = agents::find_agent_by_name(agent_manifests, "build")
+        .filter(|agent| agent.is_primary() && !agent.disabled && !agent.hidden)
+        .map(|agent| agent.name.clone())
+        .unwrap_or_else(|| app.current_agent.clone());
+
     // Phase 3: Resolve final target — context-aware routing takes precedence
     // unless the legacy hard-coded routing explicitly triggers the executor agent.
     let target_agent_name: String = if let Some(name) = legacy_target {
@@ -307,8 +312,8 @@ fn maybe_auto_route_agent(
     } else if let Some(ctx_agent) = context_target {
         ctx_agent.name.clone()
     } else {
-        // Fallback: stay on current agent
-        app.current_agent.clone()
+        // Fallback: return to the default build agent instead of keeping sticky context.
+        fallback_agent_name
     };
 
     if app.current_agent == target_agent_name {
@@ -623,8 +628,75 @@ async fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::should_auto_route_to_executor;
+    use super::{maybe_auto_route_agent, should_auto_route_to_executor};
+    use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
+    use crate::ai::cli::ParsedCli;
     use crate::ai::driver::intent_recognition::{CoreIntent, IntentModifiers, UserIntent};
+    use crate::ai::types::{AgentContext, App, AppConfig};
+    use std::path::PathBuf;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    fn primary_agent(name: &str, description: &str, routing_tags: &[&str]) -> AgentManifest {
+        AgentManifest {
+            name: name.to_string(),
+            description: description.to_string(),
+            mode: AgentMode::Primary,
+            model: None,
+            temperature: None,
+            max_steps: None,
+            prompt: String::new(),
+            system_prompt: None,
+            tools: Vec::new(),
+            tool_groups: Vec::new(),
+            mcp_servers: Vec::new(),
+            routing_tags: routing_tags.iter().map(|tag| (*tag).to_string()).collect(),
+            model_tier: Some(AgentModelTier::Heavy),
+            disabled: false,
+            hidden: false,
+            color: None,
+            source_path: None,
+        }
+    }
+
+    fn test_app(current_agent: &str) -> App {
+        App {
+            cli: ParsedCli::default(),
+            config: AppConfig {
+                api_key: String::new(),
+                history_file: PathBuf::new(),
+                endpoint: String::new(),
+                vl_default_model: String::new(),
+                history_max_chars: 12000,
+                history_keep_last: 8,
+                history_summary_max_chars: 4000,
+                intent_model: None,
+                intent_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("config/intent/intent_model.json"),
+            },
+            session_id: String::new(),
+            session_history_file: PathBuf::new(),
+            client: reqwest::Client::new(),
+            current_model: "test-model".to_string(),
+            current_agent: current_agent.to_string(),
+            current_agent_manifest: None,
+            pending_files: None,
+            pending_short_output: false,
+            attached_image_files: Vec::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            streaming: Arc::new(AtomicBool::new(false)),
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            ignore_next_prompt_interrupt: false,
+            writer: None,
+            prompt_editor: None,
+            agent_context: Some(AgentContext {
+                tools: Vec::new(),
+                mcp_servers: Default::default(),
+                max_iterations: super::DEFAULT_MAX_ITERATIONS,
+            }),
+            last_skill_bias: None,
+            agent_reload_counter: None,
+        }
+    }
 
     #[test]
     fn auto_routes_complex_execution_requests_to_executor() {
@@ -651,4 +723,28 @@ mod tests {
         };
         assert!(!should_auto_route_to_executor(&intent, "帮我找几个调试工具"));
     }
+
+    #[test]
+    fn auto_route_falls_back_to_build_instead_of_current_agent() {
+        let build = primary_agent("build", "Default agent for development work", &["fix", "debug"]);
+        let prompt_skill = primary_agent(
+            "prompt-skill",
+            "Specialized agent for optimizing and generating prompts and skills",
+            &["prompt", "skill", "optimize"],
+        );
+        let mut app = test_app("prompt-skill");
+
+        maybe_auto_route_agent(
+            &mut app,
+            &[build.clone(), prompt_skill.clone()],
+            "这个问题为什么会这样？",
+        );
+
+        assert_eq!(app.current_agent, "build");
+        assert_eq!(
+            app.current_agent_manifest.as_ref().map(|agent| agent.name.as_str()),
+            Some("build")
+        );
+    }
+
 }

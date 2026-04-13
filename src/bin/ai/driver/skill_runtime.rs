@@ -390,35 +390,28 @@ fn build_system_prompt(
     }
 
     if !available_tools.is_empty() {
-        let available = available_tools
-            .iter()
-            .map(|name| format!("`{name}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
         system_prompt.push_str("\n\n");
-        system_prompt.push_str("Tool availability:\n- Only rely on tools that are actually available in this turn.\n- Available tools: ");
-        system_prompt.push_str(&available);
-        system_prompt.push('\n');
+        system_prompt.push_str("Tool availability:\n- Only rely on tools available in this turn's tool schema.\n- If a needed capability is missing, discover/enable it instead of guessing tool names.");
     }
 
     system_prompt.push_str("\n\n");
-    system_prompt.push_str("Tool recovery mode:\n- If a tool call fails, read the error message and correct course before answering.\n- Prefer retrying with corrected arguments or switching to a more appropriate tool.\n- Do not repeat the exact same failing tool call unless the error indicates a transient retry is appropriate.\n- If `code_search` returns only `No ...` style results, do not rerun the same request unchanged; broaden the scope, remove filters, change the operation, or use the fallback guidance returned by `code_search`.\n- If a URL-based docs fetch tool says the URL is unsupported, switch to a search tool or ask for a supported docs URL instead of retrying the same call.\n- Only stop and ask the user when the error is ambiguous or missing required information.");
+    system_prompt.push_str("Tool recovery mode:\n- On tool failure, read the error and correct course before answering.\n- Retry with fixed args or switch tools; avoid repeating the same failing call unless the error is transient.\n- If `code_search` returns only `No ...` results, broaden scope/change operation instead of rerunning unchanged.\n- If a docs URL is unsupported, switch to search or ask for a supported URL.\n- Ask the user only when required information is missing or ambiguous.");
     system_prompt.push_str("\n\n");
-    system_prompt.push_str("Tool selection policy:\n- If the answer depends on code or repo contents and code/file tools are available, inspect with tools before concluding.\n- If the user asks you to modify files and editing tools are available, make the change with tools instead of only describing what to change.\n- If the user asks to run, build, test, or reproduce behavior and command tools are available, execute the relevant command instead of only suggesting it.\n- If a path, URL, symbol, or query is provided and there is a matching tool for that resource, prefer using the tool over guessing.");
+    system_prompt.push_str("Tool selection policy:\n- If the answer depends on repo/code facts, inspect with tools before concluding.\n- If the user asks for edits, perform edits with tools instead of only describing them.\n- If the user asks to run/build/test/reproduce, run commands with tools when available.\n- If a path/URL/symbol/query maps to a tool, use the tool instead of guessing.");
 
     if has_tool(available_tools, "enable_tools") {
         system_prompt.push_str("\n\n");
-        system_prompt.push_str("Tool discovery policy:\n- Do NOT assume every possible tool is already loaded for this turn.\n- When you need a capability that is not currently available, call `enable_tools(operation=list)` to discover additional tools, then `enable_tools(operation=enable, tools=[...])` to load only the tools you need.");
+        system_prompt.push_str("Tool discovery policy:\n- Do NOT assume all tools are already loaded.\n- If a capability is missing, call `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.");
     }
 
     if has_tool(available_tools, "discover_skills") {
         system_prompt.push_str("\n\n");
-        system_prompt.push_str("Skill discovery policy:\n- Do NOT assume all skill prompts are already visible in this turn.\n- When you need to discover specialized skills, call `discover_skills` to inspect skill metadata only.\n- Use skill discovery to find relevant skill names and capabilities without loading every skill prompt into context.");
+        system_prompt.push_str("Skill discovery policy:\n- Do NOT assume all skills are already visible.\n- Use `discover_skills` to inspect skill metadata and pick relevant skills without loading all prompts.");
     }
 
     if has_tool(available_tools, "code_search") {
         system_prompt.push_str("\n\n");
-        system_prompt.push_str("Code navigation policy:\n- ALWAYS use `code_search` as your FIRST tool when exploring code. Do NOT start with `read_file`, `read_file_lines`, `grep_search`, or `search_files`.\n- The only exception: use `read_file_lines` directly when you already know the exact file path AND line range from a previous `code_search` result.\n- When you need to find where a symbol is declared or used, use `code_search` with `operation=workspace_symbol`, `operation=go_to_definition`, or `operation=find_references`.\n- When you need to find literal text, log messages, SQL fragments, config keys, or other exact content, use `code_search` with `operation=text_search`.\n- For structural searches, ALWAYS call `code_search` with `operation=structural` and set `intent` to one of `find_functions`, `find_classes`, `find_methods`, or `find_calls`.\n- Never send `find_functions`, `find_classes`, `find_methods`, or `find_calls` as the `operation` value; those belong in `intent`.\n- When structural results are too broad, add `name` to filter the `@name` capture or `contains_text` to filter by captured snippet text.\n- For call searches, you can further narrow matches with `call_kind`, `receiver`, and `qualified_name`.\n- Use raw `grep_search` ONLY as a last resort when `code_search` does not apply.\n- If a recent system note labeled `Current code-inspection working memory` is present, treat it as authoritative current-turn context and avoid re-reading the same file range or rerunning equivalent raw searches unless you need verification or a narrower slice.\n- If you have already used raw repo-inspection tools and are still locating code, you MUST switch to `code_search` immediately.");
+        system_prompt.push_str("Code navigation policy:\n- Use `code_search` first for code exploration; do not start with raw file/text tools.\n- Exception: `read_file_lines` is fine when path + line range is already known from prior `code_search`.\n- Symbol lookup: `workspace_symbol`, `go_to_definition`, `find_references`.\n- Exact text lookup: `text_search`.\n- Structural lookup: `operation=structural` and set `intent` to `find_functions|find_classes|find_methods|find_calls` (not in `operation`).\n- If structural results are broad, narrow with `name`, `contains_text`, and for calls with `call_kind`/`receiver`/`qualified_name`.\n- Use `grep_search` only as last resort.\n- Reuse `Current code-inspection working memory` when present; avoid duplicate reads/searches unless verifying or narrowing.");
     }
 
     if has_tool(available_tools, "read_file")
@@ -427,27 +420,27 @@ fn build_system_prompt(
         || has_tool(available_tools, "write_file")
     {
         system_prompt.push_str("\n\n");
-        system_prompt.push_str("File editing policy:\n- When modifying an existing file or document, DO NOT rewrite the whole file unless the user explicitly asks for a full rewrite or the change truly affects most of the file.\n- First inspect the relevant region with read_file or read_file_lines, then use apply_patch to make the smallest localized edit that preserves the surrounding content.\n- Use write_file mainly for creating new files or for deliberate full-file replacement.\n- This rule applies equally to prose documents, markdown notes, configuration files, and source code.");
+        system_prompt.push_str("File editing policy:\n- For existing files, avoid full rewrites unless explicitly requested or truly necessary.\n- Inspect target regions first, then prefer localized `apply_patch` edits that preserve surrounding content.\n- Use `write_file` mainly for new files or intentional full replacements.");
     }
 
     if has_tool(available_tools, "plan") {
         system_prompt.push_str("\n\n");
-        system_prompt.push_str("Planning before acting:\n- For simple tasks (read a file, answer a question, run a single command, quick lookup), act directly — do NOT call the plan tool.\n- For complex tasks (multi-step refactoring, debugging across files, building a feature, investigating an unfamiliar codebase), call the `plan` tool first to create a step-by-step plan, then execute it step by step.\n- After each tool execution, review the result and adjust the plan if needed. You do not need to re-plan for minor adjustments.\n- A good rule of thumb: if the task requires 3+ tool calls across different tools/files, plan first.");
+        system_prompt.push_str("Planning before acting:\n- Simple tasks: act directly without `plan`.\n- Complex multi-step tasks: call `plan` first, execute step by step, and adjust after results.\n- Rule of thumb: if work likely needs 3+ tool calls across files/tools, plan first.");
     }
 
     if has_tool(available_tools, "knowledge_search") || has_tool(available_tools, "knowledge_list") {
         system_prompt.push_str("\n\n");
-        system_prompt.push_str("Knowledge base auto-check:\n- At the start of each conversation, briefly consider whether the user's request might benefit from checking the knowledge base.\n- If the request relates to past decisions, project context, preferences, or remembered information, use `knowledge_search` to look up relevant entries.\n- You do NOT need to check the knowledge base for every single query — only when the user's request seems to reference prior context, preferences, or accumulated knowledge.\n- Use `knowledge_list` to browse recent entries when the user asks \"what do you remember\" or similar.");
+        system_prompt.push_str("Knowledge base auto-check:\n- If the request involves prior decisions/context/preferences/memory, use `knowledge_search`.\n- No need to check for every query.\n- Use `knowledge_list` when the user asks what is remembered.");
     }
 
     if has_tool(available_tools, "knowledge_semantic_search") {
         system_prompt.push_str("\n\n");
-        system_prompt.push_str("Semantic knowledge retrieval:\n- Use `knowledge_semantic_search` when keyword search doesn't find relevant results — it understands meaning, not just exact words.\n- For example, searching \"how to deploy\" can find entries about \"CI/CD pipeline\" even without matching keywords.\n- Use `knowledge_rebuild_index` to sync the vector index if it seems out of date.\n- The knowledge base supports both BM25 keyword search and vector semantic search, combined in hybrid mode.");
+        system_prompt.push_str("Semantic knowledge retrieval:\n- Use `knowledge_semantic_search` when keyword search misses relevant results.\n- If semantic index seems stale, run `knowledge_rebuild_index`.\n- Knowledge retrieval supports keyword + vector hybrid search.");
     }
 
     if has_tool(available_tools, "web_search") || has_tool(available_tools, "web_fetch") {
         system_prompt.push_str("\n\n");
-        system_prompt.push_str("Web search policy:\n- For questions about real-time or time-sensitive information (weather, news, stock prices, sports scores, current events, recent developments, product releases), you MUST use the `web_search` tool to find up-to-date answers.\n- Do NOT attempt to answer time-sensitive questions from your training data alone, as the information is likely outdated or unknown.\n- Use `web_fetch` to retrieve detailed content from specific URLs when search results point to relevant pages.\n- If the user asks about anything that could have changed since your training cutoff, search first.");
+        system_prompt.push_str("Web search policy:\n- For real-time or time-sensitive topics, use `web_search` first.\n- Do not answer such questions from memory alone.\n- Use `web_fetch` for detailed content from selected URLs.");
     }
     system_prompt
 }
@@ -825,7 +818,7 @@ mod tests {
         available.insert("discover_skills".to_string());
 
         let prompt = build_system_prompt(None, None, &Box::new(available));
-        assert!(prompt.contains("Available tools:"));
+        assert!(prompt.contains("Tool availability:"));
         assert!(prompt.contains("Code navigation policy"));
         assert!(prompt.contains("File editing policy"));
         assert!(prompt.contains("Tool discovery policy"));

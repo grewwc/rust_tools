@@ -7,7 +7,7 @@ use crate::ai::{
         priority_for_confidence, render_record, should_persist,
     },
     driver::{
-        print::{format_tool_header, print_tool_output_block},
+        print::{print_tool_note_line, print_tool_output_block},
         tools::ExecuteToolCallsResult,
     },
     history::{Message, ROLE_INTERNAL_NOTE, is_system_like_role},
@@ -93,8 +93,8 @@ pub(super) fn append_cached_tool_results_note(
     append_message_pair(messages, turn_messages, cache_note);
 }
 
-pub(super) fn print_tool_result_preview(tool_name: &str, prepared: &PreparedToolResult) {
-    println!("\n{}", format_tool_header(tool_name));
+pub(super) fn print_tool_result_preview(_tool_name: &str, prepared: &PreparedToolResult) {
+    print_tool_note_line("output", "tool result");
     print_tool_output_block(&prepared.content_for_terminal);
 }
 

@@ -158,11 +158,11 @@ pub(super) async fn prepare_turn(
             skill_turn.append_system_prompt(&format!("\n{}", recalled.content));
             if recalled.high_confidence_project_memory {
                 skill_turn.append_system_prompt(
-                    "\nMemory-first project answer policy:\n- High-confidence project memory has been recalled for this question.\n- Prefer answering directly from the recalled knowledge when it already covers the user's ask.\n- Do NOT read files, grep the repo, or call search tools unless a specific detail is missing, ambiguous, or the user explicitly asks you to verify against the current code.\n- If only part of the answer is covered, answer the covered part first and use tools only to fill the missing pieces.",
+                    "\nMemory-first project answer policy:\n- High-confidence project memory is available. Answer from it first when it already covers the ask.\n- Only use file/search tools for missing details, ambiguity, or explicit verification against current code.",
                 );
             } else {
                 skill_turn.append_system_prompt(
-                    "\nKnowledge usage policy:\n- Recalled knowledge is available and relevant for this turn. Build your answer primarily from it.\n- Only call file-read/repo-search tools if the recalled knowledge is missing key details the user specifically asked about.\n- Do NOT re-scan the entire project when the recalled knowledge already covers the user's question.",
+                    "\nKnowledge usage policy:\n- Recalled knowledge is relevant for this turn; build the answer primarily from it.\n- Use file/repo tools only when key requested details are missing; avoid full re-scan when recall is sufficient.",
                 );
             }
         }
@@ -439,7 +439,7 @@ fn render_session_code_discovery_recall(discoveries: &[CodeDiscoveryRecord]) -> 
         out.push('\n');
     }
     out.push_str(
-        "Treat these as stable findings established earlier in this session. Prioritize high-confidence findings first, then use medium-confidence findings as supporting context. Reuse them instead of re-running the same repo inspection steps unless the user asks you to verify against the latest code or you need a narrower slice.\n",
+        "Treat these as stable findings from earlier in this session. Prioritize high-confidence items, use medium-confidence as support, and reuse them before rerunning equivalent repo inspection unless verification or a narrower slice is needed.\n",
     );
     Some(out)
 }

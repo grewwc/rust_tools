@@ -25,6 +25,10 @@ pub fn print_tool_output_line(line: &str) {
     println!("{}", format_tool_output_line(line));
 }
 
+pub fn print_tool_note_line(label: &str, value: &str) {
+    println!("{}", format_tool_note_line(label, value));
+}
+
 pub fn print_ocr_summary(extraction: &OcrExtraction) {
     for line in format_ocr_summary_block(extraction) {
         println!("{line}");
@@ -89,6 +93,10 @@ pub(in crate::ai) fn format_tool_header(tool_name: &str) -> String {
     )
 }
 
+pub(in crate::ai) fn format_tool_output_prefix() -> String {
+    format!("  {}│{} {}", ACCENT_RULE, RESET, DIM)
+}
+
 pub(in crate::ai) fn format_tool_output_line(line: &str) -> String {
     if line.is_empty() {
         format!("  {}│{}", ACCENT_RULE, RESET)
@@ -97,9 +105,16 @@ pub(in crate::ai) fn format_tool_output_line(line: &str) -> String {
     }
 }
 
+pub(in crate::ai) fn format_tool_note_line(label: &str, value: &str) -> String {
+    format!(
+        "  {}│{} {}{}:{} {}{}{}",
+        ACCENT_RULE, RESET, BOLD, label, RESET, ACCENT_PRIMARY, value, RESET
+    )
+}
+
 pub(in crate::ai) fn format_tool_output_block(content: &str) -> Vec<String> {
     if content.trim().is_empty() {
-        return vec![format!("  {}│{} {}(empty){}", ACCENT_RULE, RESET, ACCENT_MUTED, RESET)];
+        return vec![format_tool_note_line("result", "no output")];
     }
 
     content.lines().map(format_tool_output_line).collect()
@@ -206,7 +221,7 @@ mod tests {
     use super::{
         format_assistant_banner, format_empty_state, format_ocr_summary_block,
         format_section_header, format_section_item, format_section_note, format_tool_header,
-        format_tool_output_block, format_tool_output_line,
+        format_tool_output_block, format_tool_output_line, format_tool_output_prefix,
     };
     use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};
 
@@ -244,6 +259,16 @@ mod tests {
 
         assert_eq!(header, "├─ tool search_codebase");
         assert_eq!(lines, vec!["  │ line 1", "  │", "  │ line 3"]);
+    }
+
+    #[test]
+    fn empty_tool_output_uses_explicit_no_output_note() {
+        let lines = format_tool_output_block("")
+            .into_iter()
+            .map(|line| strip_ansi_for_test(&line))
+            .collect::<Vec<_>>();
+
+        assert_eq!(lines, vec!["  │ result: no output"]);
     }
 
     #[test]
@@ -292,5 +317,11 @@ mod tests {
     fn tool_output_line_formats_single_line() {
         let visible = strip_ansi_for_test(&format_tool_output_line("hello"));
         assert_eq!(visible, "  │ hello");
+    }
+
+    #[test]
+    fn tool_output_prefix_formats_gutter_without_closing_line() {
+        let visible = strip_ansi_for_test(&format_tool_output_prefix());
+        assert_eq!(visible, "  │ ");
     }
 }

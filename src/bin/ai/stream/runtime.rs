@@ -27,12 +27,10 @@ pub(super) async fn stream_response(
     app: &mut App,
     response: &mut reqwest::Response,
     current_history: &mut String,
-    terminal_dedupe_candidate: Option<&str>,
+    _terminal_dedupe_candidate: Option<&str>,
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
-    state.render.terminal_dedupe =
-        terminal_dedupe_candidate.and_then(build_terminal_dedupe_state);
     let adapter_kind = normalize::resolve_adapter_kind(
         models::model_provider(&app.current_model),
         &models::endpoint_for_model(&app.current_model, &app.config.endpoint),
@@ -249,9 +247,6 @@ fn finalize_stream_response(
 
     flush_terminal_splitter(&mut state, markers)?;
 
-    let suppress_buffered_output = final_assistant_matches_terminal_dedupe(&state);
-    disable_terminal_dedupe(&mut state, suppress_buffered_output)?;
-
     state.render.markdown.flush_pending()?;
 
     if state.render.current_printing_index.is_some() {
@@ -354,7 +349,6 @@ fn ensure_tool_calls_section_open(
     }
 
     let _ = clear_waiting_hint(state);
-    let _ = disable_terminal_dedupe(state, false);
 
     if state.content.thinking_open {
         let _ = write_stream_content(
@@ -524,50 +518,6 @@ fn normalize_end_thinking_boundary(
     }
 }
 
-fn build_terminal_dedupe_state(candidate: &str) -> Option<super::state::TerminalDedupeState> {
-    let candidate = normalize_terminal_dedupe_text(candidate);
-    if candidate.trim().is_empty() {
-        return None;
-    }
-    Some(super::state::TerminalDedupeState {
-        candidate,
-        buffered_terminal_output: String::new(),
-    })
-}
-
-fn normalize_terminal_dedupe_text(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
-}
-
-fn final_assistant_matches_terminal_dedupe(state: &StreamProcessingState) -> bool {
-    let Some(dedupe) = state.render.terminal_dedupe.as_ref() else {
-        return false;
-    };
-    normalize_terminal_dedupe_text(&state.content.assistant_text).trim() == dedupe.candidate.trim()
-}
-
-fn terminal_dedupe_still_matches(candidate: &str, buffered: &str) -> bool {
-    let buffered = normalize_terminal_dedupe_text(buffered);
-    if candidate.starts_with(&buffered) {
-        return true;
-    }
-    buffered.starts_with(candidate) && buffered[candidate.len()..].trim().is_empty()
-}
-
-fn disable_terminal_dedupe(
-    state: &mut StreamProcessingState,
-    suppress_buffered_output: bool,
-) -> io::Result<()> {
-    let Some(mut dedupe) = state.render.terminal_dedupe.take() else {
-        return Ok(());
-    };
-    if suppress_buffered_output || dedupe.buffered_terminal_output.is_empty() {
-        return Ok(());
-    }
-    let buffered = std::mem::take(&mut dedupe.buffered_terminal_output);
-    write_stream_content_to_terminal(&buffered, &mut state.render.markdown, false)
-}
-
 fn flush_terminal_splitter(
     state: &mut StreamProcessingState,
     markers: &StreamMarkers,
@@ -606,17 +556,6 @@ fn maybe_write_plain_stream_text(
     }
     if dimmed {
         return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
-    }
-
-    if let Some(dedupe) = state.render.terminal_dedupe.as_mut() {
-        dedupe.buffered_terminal_output.push_str(content);
-        let still_matches =
-            terminal_dedupe_still_matches(&dedupe.candidate, &dedupe.buffered_terminal_output);
-        if still_matches {
-            return Ok(());
-        }
-        disable_terminal_dedupe(state, false)?;
-        return Ok(());
     }
 
     write_stream_content_to_terminal(content, &mut state.render.markdown, false)
@@ -690,59 +629,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn terminal_dedupe_holds_exact_prefix_matches() {
-        let candidate = "1\n2\n3";
-        assert!(terminal_dedupe_still_matches(candidate, "1\n2"));
-        assert!(terminal_dedupe_still_matches(candidate, "1\n2\n3\n"));
-        assert!(!terminal_dedupe_still_matches(candidate, "1\n2\n4"));
-    }
-
-    #[test]
-    fn final_assistant_dedupe_ignores_trailing_whitespace() {
-        let mut state = StreamProcessingState::new();
-        state.content.assistant_text = "1\n2\n3\n".to_string();
-        state.render.terminal_dedupe = build_terminal_dedupe_state("1\n2\n3");
-
-        assert!(final_assistant_matches_terminal_dedupe(&state));
-    }
-
-    #[test]
-    fn reasoning_markers_do_not_clear_terminal_dedupe_candidate() {
-        let markers = StreamMarkers::new();
-        let mut state = StreamProcessingState::new();
-        state.render.terminal_dedupe = build_terminal_dedupe_state("1\n2\n3");
-
-        maybe_write_stream_content(
-            &format!("{}\n", markers.end_thinking_tag),
-            None,
-            &mut state,
-            &markers,
-            false,
-        )
-        .unwrap();
-
-        assert!(state.render.terminal_dedupe.is_some());
-    }
-
-    #[test]
-    fn mixed_done_thinking_chunk_still_preserves_terminal_dedupe() {
-        let markers = StreamMarkers::new();
-        let mut state = StreamProcessingState::new();
-        state.render.terminal_dedupe = build_terminal_dedupe_state("1\n2\n3");
-
-        maybe_write_stream_content(
-            &format!("{}\n1\n2", markers.end_thinking_tag),
-            None,
-            &mut state,
-            &markers,
-            false,
-        )
-        .unwrap();
-
-        let dedupe = state.render.terminal_dedupe.as_ref().unwrap();
-        assert_eq!(dedupe.buffered_terminal_output, "1\n2");
-    }
 }
 
 fn process_stream_payload(
