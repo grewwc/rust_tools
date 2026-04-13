@@ -22,12 +22,12 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     let area = f.area();
 
     // 计算 popup 尺寸
-    let popup_height = area.height.saturating_sub(4).clamp(10, 18);
-    let popup_width = area.width.saturating_sub(2).clamp(60, 180).min(area.width);
+    let popup_height = area.height.saturating_sub(2).clamp(8, 28).min(area.height);
+    let popup_width = area.width.saturating_sub(2).clamp(40, 180).min(area.width);
 
-    // 计算 popup 位置（居中）
+    // 计算 popup 位置（顶部对齐，减少与上方日志的空白间隔）
     let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
-    let popup_y = area.y + area.height.saturating_sub(popup_height) / 2;
+    let popup_y = area.y;
     let popup = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
     // 计算内区域 - popup 的边框占据 1 格，标题占据 1 行
@@ -190,21 +190,23 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     };
     f.render_widget(Paragraph::new(help_lines), chunks[2]);
 
-    // 渲染状态消息
     if let Some(msg) = status_msg {
-        let status_width = chunks[2].width.saturating_sub(2) as usize;
-        let status_text = truncate_with_ellipsis(msg, status_width);
-        let status_para = Paragraph::new(Line::from(Span::styled(
-            status_text,
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )))
-        .alignment(Alignment::Center);
+        let c2 = chunks[2];
+        if c2.height >= 2 && c2.width > 2 {
+            let status_width = (c2.width - 2) as usize;
+            let status_text = truncate_with_ellipsis(msg, status_width);
+            let status_para = Paragraph::new(Line::from(Span::styled(
+                status_text,
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .alignment(Alignment::Center);
 
-        let status_area = Rect::new(chunks[2].x + 1, chunks[2].y + 1, chunks[2].width - 2, 1);
-        f.render_widget(Clear, status_area);
-        f.render_widget(status_para, status_area);
+            let status_area = Rect::new(c2.x + 1, c2.y + 1, c2.width - 2, 1);
+            f.render_widget(Clear, status_area);
+            f.render_widget(status_para, status_area);
+        }
     }
 }
 

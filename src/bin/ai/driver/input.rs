@@ -1050,54 +1050,30 @@ mod tests {
 
 fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
     if let Some(editor) = app.prompt_editor.as_mut() {
-        if app.cli.multi_line {
-            return editor.read_multi_line();
-        }
-        return editor.read_single_line();
+        return editor.read_multi_line();
     }
 
-    let multiline = app.cli.multi_line;
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
 
-    if !multiline {
-        print!("> ");
+    let mut lines = Vec::new();
+    loop {
+        print!("  ");
         io::stdout().flush()?;
         let mut line = String::new();
         match stdin.read_line(&mut line) {
-            Ok(0) => Ok(None),
-            Ok(_) => {
-                let trimmed = trim_trailing_newline(line);
-                // If we get an empty line, it might be a stray Enter from during streaming.
-                // Return it as-is and let the caller decide what to do.
-                Ok(Some(trimmed))
-            }
+            Ok(0) => break,
+            Ok(_) => lines.push(trim_trailing_newline(line)),
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {
                 println!("Exit.");
-                Ok(None)
+                return Ok(None);
             }
-            Err(err) => Err(err),
+            Err(err) => return Err(err),
         }
+    }
+    if lines.is_empty() {
+        Ok(None)
     } else {
-        let mut lines = Vec::new();
-        loop {
-            print!("  ");
-            io::stdout().flush()?;
-            let mut line = String::new();
-            match stdin.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => lines.push(trim_trailing_newline(line)),
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                    println!("Exit.");
-                    return Ok(None);
-                }
-                Err(err) => return Err(err),
-            }
-        }
-        if lines.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(lines.join("\n")))
-        }
+        Ok(Some(lines.join("\n")))
     }
 }

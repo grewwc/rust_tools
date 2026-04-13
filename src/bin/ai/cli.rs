@@ -32,7 +32,7 @@ impl Default for ParsedCli {
             history: DEFAULT_NUM_HISTORY,
             model: None,
             agent: None,
-            multi_line: false,
+            multi_line: true,
             clear: false,
             session: None,
             clipboard: false,
@@ -64,8 +64,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     // 定义所有 bool 选项
     parser.add_bool("clear", false, "clear history");
-    parser.add_bool("multi-line", false, "input with multline");
-    parser.alias("mul", "multi-line");
     parser.add_bool("clipboard", false, "prepend content in clipboard");
     parser.add_bool("thinking", false, "force enable thinking (auto-enabled by default for complex questions)");
     parser.alias("t", "thinking");
@@ -143,7 +141,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     }
 
     // 处理 multi-line
-    cli.multi_line = parser.contains_flag_strict("multi-line");
 
     // 处理 session
     if parser.contains_flag_strict("session") {

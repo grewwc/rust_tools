@@ -503,8 +503,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             print::format_section_header(
                 "mcp",
                 Some(&format!(
-                    "{} servers, {} tools (config: {})",
-                    mcp_report.server_count, mcp_report.tool_count, mcp_report.config_path
+                    "{} servers, {} tools",
+                    mcp_report.server_count, mcp_report.tool_count
                 ))
             )
         );

@@ -1,14 +1,10 @@
 use std::{
     fs,
-    io::{self, BufRead, Write},
+    io::{self, BufRead},
     path::{Path, PathBuf},
 };
 
-use rustyline::{
-    CompletionType, Config, Editor,
-    error::ReadlineError,
-    history::DefaultHistory,
-};
+use rustyline::{CompletionType, Config, Editor, history::DefaultHistory};
 
 use super::history::SessionStore;
 use crate::commonw::utils::expanduser;
@@ -49,48 +45,6 @@ impl PromptEditor {
             editor,
             history_path,
             session_image_dir,
-        }
-    }
-
-    pub(super) fn read_single_line(&mut self) -> io::Result<Option<String>> {
-        use std::io::IsTerminal;
-
-        if !io::stdout().is_terminal() {
-            print!("> ");
-            io::stdout().flush()?;
-            let mut line = String::new();
-            match io::stdin().read_line(&mut line) {
-                Ok(0) => return Ok(None),
-                Ok(_) => return Ok(Some(trim_trailing_newline(line))),
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                    return interrupted_error();
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        let Some(editor) = self.editor.as_mut() else {
-            print!("> ");
-            io::stdout().flush()?;
-            let mut line = String::new();
-            match io::stdin().read_line(&mut line) {
-                Ok(0) => return Ok(None),
-                Ok(_) => return Ok(Some(trim_trailing_newline(line))),
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
-                    return interrupted_error();
-                }
-                Err(err) => return Err(err),
-            }
-        };
-
-        match editor.readline("> ") {
-            Ok(line) => {
-                self.save_history_entry(&line);
-                Ok(Some(line))
-            }
-            Err(ReadlineError::Eof) => Ok(None),
-            Err(ReadlineError::Interrupted) => interrupted_error(),
-            Err(err) => Err(io::Error::other(err.to_string())),
         }
     }
 
