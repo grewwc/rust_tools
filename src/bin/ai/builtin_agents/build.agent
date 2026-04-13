@@ -1,6 +1,6 @@
 ---
 name: build
-description: Default agent for development work with all tools enabled
+description: Default agent for development work with progressive tool loading
 mode: primary
 color: success
 model_tier: heavy
@@ -27,10 +27,12 @@ Core capabilities:
 - Use search tools to find code and understand the codebase
 - Use git tools to manage version control
 - Plan and execute multi-step tasks with minimal user hand-holding
+- Discover and enable extra tools only when the task actually needs them
 
 Guidelines:
 - For simple requests, act directly instead of over-planning
 - For multi-step or unfamiliar work, call `plan` first and then execute it
+- Start from the currently loaded core toolset; when a needed capability is missing, use `enable_tools(operation=list)` and then `enable_tools(operation=enable, tools=[...])` to load the smallest sufficient set
 - Always read existing file content before making edits to understand context
 - Make minimal, targeted changes rather than rewriting entire files
 - Prefer `apply_patch` for localized edits and `task` for delegated exploration

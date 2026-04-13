@@ -33,7 +33,9 @@ pub mod print;
 pub mod reflection;
 pub mod signal;
 pub mod skill_matching;
+pub mod skill_ranking;
 pub mod skill_runtime;
+pub mod text_similarity;
 pub mod tools;
 pub mod turn_runtime;
 
@@ -41,9 +43,11 @@ pub use commands::try_handle_interactive_command;
 pub use mcp_init::*;
 pub use model::*;
 pub use skill_matching::*;
+pub use skill_ranking::*;
+pub use text_similarity::*;
 
 const DEFAULT_MAX_ITERATIONS: usize = 1024;
-const OPENCLAW_MAX_ITERATIONS: usize = 64;
+const EXECUTOR_MAX_ITERATIONS: usize = 64;
 
 #[crate::ai::agent_hang_span(
     "pre-fix",
@@ -81,9 +85,10 @@ fn auto_agent_routing_enabled() -> bool {
         .eq_ignore_ascii_case("false")
 }
 
-fn auto_openclaw_length_threshold() -> usize {
-    configw::get_all_config()
-        .get_opt("ai.agents.auto_route.openclaw_min_chars")
+fn auto_executor_length_threshold() -> usize {
+    let cfg = configw::get_all_config();
+    cfg.get_opt("ai.agents.auto_route.executor_min_chars")
+        .or_else(|| cfg.get_opt("ai.agents.auto_route.openclaw_min_chars"))
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(48)
 }
@@ -235,7 +240,7 @@ fn score_agent_for_question(
     score
 }
 
-fn should_auto_route_to_openclaw(
+fn should_auto_route_to_executor(
     intent: &intent_recognition::UserIntent,
     question: &str,
 ) -> bool {
@@ -256,7 +261,7 @@ fn should_auto_route_to_openclaw(
 
     let char_count = question.chars().count();
     let line_count = question.lines().count();
-    char_count >= auto_openclaw_length_threshold()
+    char_count >= auto_executor_length_threshold()
         || line_count >= 2
         || contains_complex_execution_marker(question)
 }
@@ -273,9 +278,9 @@ fn maybe_auto_route_agent(
     let intent =
         intent_recognition::detect_intent_with_model_path(question, &app.config.intent_model_path);
 
-    // Phase 1: Legacy hardcoded routing (openclaw vs build) for backward compatibility
-    let legacy_target = if should_auto_route_to_openclaw(&intent, question) {
-        Some("openclaw")
+    // Phase 1: Legacy hardcoded routing (executor vs build) for backward compatibility
+    let legacy_target = if should_auto_route_to_executor(&intent, question) {
+        Some("executor")
     } else {
         None
     };
@@ -285,12 +290,12 @@ fn maybe_auto_route_agent(
     let context_target = select_best_agent_by_context(agent_manifests, question, &history_entries);
 
     // Phase 3: Resolve final target — context-aware routing takes precedence
-    // unless the legacy hard-coded routing explicitly triggers openclaw
+    // unless the legacy hard-coded routing explicitly triggers the executor agent.
     let target_agent_name: String = if let Some(name) = legacy_target {
-        // Legacy openclaw trigger wins only if no better context match exists
+        // Legacy executor trigger wins only if no better context match exists
         // with a significantly higher score
         if let Some(ctx_agent) = context_target {
-            if ctx_agent.name == name || ctx_agent.name == "openclaw" {
+            if agents::canonical_agent_name(&ctx_agent.name) == name {
                 name.to_string()
             } else {
                 // Let context-aware routing decide
@@ -433,10 +438,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         writer,
         prompt_editor,
         agent_context: Some(AgentContext {
-            tools: super::tools::get_builtin_tool_definitions(),
+            tools: super::tools::tool_definitions_for_groups(&["core"]),
             max_iterations: DEFAULT_MAX_ITERATIONS,
             ..Default::default()
         }),
+        last_skill_bias: None,
         agent_reload_counter: None,
     };
 
@@ -617,24 +623,24 @@ async fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::should_auto_route_to_openclaw;
+    use super::should_auto_route_to_executor;
     use crate::ai::driver::intent_recognition::{CoreIntent, IntentModifiers, UserIntent};
 
     #[test]
-    fn auto_routes_complex_execution_requests_to_openclaw() {
+    fn auto_routes_complex_execution_requests_to_executor() {
         let intent = UserIntent::new(CoreIntent::RequestAction);
         let question = "帮我实现这个 agent 的自动执行能力，然后跑检查并修掉相关报错";
-        assert!(should_auto_route_to_openclaw(&intent, question));
+        assert!(should_auto_route_to_executor(&intent, question));
     }
 
     #[test]
-    fn does_not_route_simple_concept_questions_to_openclaw() {
+    fn does_not_route_simple_concept_questions_to_executor() {
         let intent = UserIntent::new(CoreIntent::QueryConcept);
-        assert!(!should_auto_route_to_openclaw(&intent, "Rust 的 crate 是什么？"));
+        assert!(!should_auto_route_to_executor(&intent, "Rust 的 crate 是什么？"));
     }
 
     #[test]
-    fn does_not_route_search_queries_to_openclaw() {
+    fn does_not_route_search_queries_to_executor() {
         let intent = UserIntent {
             core: CoreIntent::RequestAction,
             modifiers: IntentModifiers {
@@ -643,6 +649,6 @@ mod tests {
                 negation: false,
             },
         };
-        assert!(!should_auto_route_to_openclaw(&intent, "帮我找几个调试工具"));
+        assert!(!should_auto_route_to_executor(&intent, "帮我找几个调试工具"));
     }
 }

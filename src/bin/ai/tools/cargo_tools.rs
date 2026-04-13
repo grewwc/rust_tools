@@ -59,7 +59,7 @@ inventory::submit!(ToolRegistration {
         description: "Run `cargo check` with optional workspace/all-features/package flags and return the output.",
         parameters: params_cargo_check,
         execute: execute_cargo_check,
-        groups: &["openclaw"],
+        groups: &["executor"],
     }
 });
 
@@ -69,7 +69,7 @@ inventory::submit!(ToolRegistration {
         description: "Run `cargo test` with optional workspace/all-features/package flags and return the output.",
         parameters: params_cargo_test,
         execute: execute_cargo_test,
-        groups: &["openclaw"],
+        groups: &["executor"],
     }
 });
 

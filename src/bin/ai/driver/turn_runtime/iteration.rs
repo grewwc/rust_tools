@@ -36,10 +36,16 @@ pub(super) async fn refresh_skill_turn_for_iteration(
     }
 
     let prev_skill = skill_turn.matched_skill_name().map(|s| s.to_string());
+    let intent = skill_turn.intent().clone();
     let inherited_restore = skill_turn.take_restore_agent_context();
-    let mut new_skill_turn =
-        skill_runtime::prepare_skill_for_turn(app, mcp_client, skill_manifests, question)
-            .await;
+    let mut new_skill_turn = skill_runtime::rebuild_skill_turn_with_existing_selection(
+        app,
+        mcp_client,
+        skill_manifests,
+        question,
+        prev_skill.as_deref(),
+        &intent,
+    );
     if inherited_restore.is_some() {
         new_skill_turn.set_restore_agent_context(inherited_restore);
     }

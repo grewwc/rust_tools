@@ -161,7 +161,7 @@ fn params_save_skill() -> Value {
             "tool_groups": {
                 "type": "array",
                 "items": {"type": "string"},
-                "description": "Tool groups that the skill is allowed to use (e.g. builtin, openclaw)."
+                "description": "Tool groups that the skill is allowed to use (e.g. builtin, executor; legacy openclaw is still accepted)."
             },
             "mcp_servers": {
                 "type": "array",

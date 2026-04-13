@@ -29,5 +29,5 @@ pub use command_tools::validate_execute_command;
 pub(crate) use registry::common::execute_tool_call;
 pub(crate) use registry::common::execute_tool_call_with_args;
 pub(crate) use registry::common::{
-    get_builtin_tool_definitions, get_tool_definitions_by_names, tool_definitions_for_groups,
+    get_tool_definitions_by_names, tool_definitions_for_groups,
 };

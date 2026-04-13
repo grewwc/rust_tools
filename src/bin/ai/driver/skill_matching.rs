@@ -3,9 +3,10 @@ use rust_tools::commonw::FastMap;
 use rust_tools::cw::SkipSet;
 
 pub use super::intent_recognition::{CoreIntent, UserIntent};
+use super::rank_skills_locally;
 
 /// 评分权重常量
-mod weights {
+pub(super) mod weights {
     pub const NAME_MATCH: f64 = 10.0;
     pub const PHRASE_MATCH_BASE: f64 = 2.0;
     pub const PHRASE_LENGTH_BONUS: f64 = 0.5;
@@ -19,6 +20,7 @@ mod weights {
     pub const INTENT_MATCH_MEDIUM: f64 = 1.5;
     pub const NEGATION_PENALTY: f64 = 0.5;
     pub const EXCLUDED_INTENT_PENALTY: f64 = -5.0;
+    pub const LOCAL_MODEL_SCORE_SCALE: f64 = 8.0;
 }
 
 /// 动态阈值配置
@@ -50,26 +52,12 @@ pub fn match_skill<'a>(
         return None;
     }
 
-    let input_lower = input.to_lowercase();
-
-    // 为每个技能评分
-    let mut best_match: Option<&SkillManifest> = None;
-    let mut best_score = 0.0;
-
-    for skill in skills {
-        // 如果技能描述明确排除了当前意图，直接跳过（如果有 intent 的话）
-        if let Some(intent_ref) = intent {
-            if is_intent_excluded(skill, intent_ref) {
-                continue;
-            }
-        }
-
-        let score = score_skill_smart(skill, &input_lower, intent);
-        if score > best_score {
-            best_score = score;
-            best_match = Some(skill);
-        }
-    }
+    let ranked = rank_skills_locally(skills, input, intent);
+    let Some(best) = ranked.first() else {
+        return None;
+    };
+    let best_match = Some(best.skill);
+    let best_score = best.score;
 
     // 动态阈值：根据技能数量和匹配质量调整，提高底线防止误触发
     let base_threshold = thresholds::skill_count_threshold(skills.len());
@@ -93,7 +81,7 @@ pub fn match_skill<'a>(
 }
 
 /// 检查技能描述是否明确排除了某种意图
-fn is_intent_excluded(skill: &SkillManifest, intent: &UserIntent) -> bool {
+pub(super) fn is_intent_excluded(skill: &SkillManifest, intent: &UserIntent) -> bool {
     let desc_lower = skill.description.to_lowercase();
 
     match &intent.core {
@@ -120,7 +108,11 @@ fn is_intent_excluded(skill: &SkillManifest, intent: &UserIntent) -> bool {
 }
 
 /// 智能评分：结合 TF-IDF 思想、短语匹配、意图匹配
-fn score_skill_smart(skill: &SkillManifest, input_lower: &str, intent: Option<&UserIntent>) -> f64 {
+pub(super) fn score_skill_smart(
+    skill: &SkillManifest,
+    input_lower: &str,
+    intent: Option<&UserIntent>,
+) -> f64 {
     let mut score = 0.0;
 
     // 1. 技能名称匹配（权重最高）

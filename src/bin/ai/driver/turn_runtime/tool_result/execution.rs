@@ -617,6 +617,7 @@ mod tests {
                 mcp_servers: FastMap::default(),
                 max_iterations: 16,
             }),
+            last_skill_bias: None,
             agent_reload_counter: None,
         }
     }

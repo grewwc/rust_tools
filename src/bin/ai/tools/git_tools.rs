@@ -43,7 +43,7 @@ inventory::submit!(ToolRegistration {
         description: "Run `git status --porcelain=v1 --branch` in a directory and return the output.",
         parameters: params_git_status,
         execute: execute_git_status,
-        groups: &["openclaw"],
+        groups: &["executor"],
     }
 });
 
@@ -53,7 +53,7 @@ inventory::submit!(ToolRegistration {
         description: "Run `git diff` (optionally --cached and/or with a pathspec) and return the diff (truncated).",
         parameters: params_git_diff,
         execute: execute_git_diff,
-        groups: &["openclaw"],
+        groups: &["executor"],
     }
 });
 

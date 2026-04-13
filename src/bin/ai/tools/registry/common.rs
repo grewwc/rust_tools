@@ -56,13 +56,20 @@ static TOOL_INDEX: LazyLock<FastMap<&'static str, &'static ToolSpec>> = LazyLock
 pub(crate) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition> {
     let mut tools: Box<SkipMap<String, ToolDefinition>> =
         SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
+    let mut expanded_groups: Vec<&str> = groups.to_vec();
+    if groups.contains(&"executor") && !expanded_groups.contains(&"openclaw") {
+        expanded_groups.push("openclaw");
+    }
+    if groups.contains(&"openclaw") && !expanded_groups.contains(&"executor") {
+        expanded_groups.push("executor");
+    }
 
     for reg in inventory::iter::<ToolRegistration> {
         if !reg
             .spec
             .groups
             .iter()
-            .any(|g| groups.iter().any(|x| x == g))
+            .any(|g| expanded_groups.iter().any(|x| x == g))
         {
             continue;
         }

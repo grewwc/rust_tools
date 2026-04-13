@@ -80,7 +80,7 @@ inventory::submit!(ToolRegistration {
         description: "Read line-numbered text from a local file with configurable offset/limit (limit capped at 400). Prefer this before patching an existing file so edits can target the exact local region instead of rewriting the whole file.",
         parameters: params_read_file_lines,
         execute: execute_read_file_lines,
-        groups: &["openclaw", "builtin", "core"],
+        groups: &["executor", "builtin", "core"],
     }
 });
 

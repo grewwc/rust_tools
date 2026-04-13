@@ -11,8 +11,8 @@ const BUILTIN_AGENTS: &[(&str, &str)] = &[
         include_str!("builtin_agents/build.agent"),
     ),
     (
-        "openclaw.agent",
-        include_str!("builtin_agents/openclaw.agent"),
+        "executor.agent",
+        include_str!("builtin_agents/executor.agent"),
     ),
     (
         "plan.agent",
@@ -247,7 +247,17 @@ pub(super) fn get_subagents(agents: &[AgentManifest]) -> Vec<&AgentManifest> {
 }
 
 pub(super) fn find_agent_by_name<'a>(agents: &'a [AgentManifest], name: &str) -> Option<&'a AgentManifest> {
-    agents.iter().find(|a| a.name == name)
+    let canonical = canonical_agent_name(name);
+    agents
+        .iter()
+        .find(|a| a.name == canonical || a.name == name)
+}
+
+pub(super) fn canonical_agent_name(name: &str) -> &str {
+    match name {
+        "openclaw" => "executor",
+        other => other,
+    }
 }
 
 pub(super) fn agents_dir() -> PathBuf {

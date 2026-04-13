@@ -739,6 +739,7 @@ mod tests {
             writer: None,
             prompt_editor: None,
             agent_context: None,
+            last_skill_bias: None,
             agent_reload_counter: None,
         }
     }

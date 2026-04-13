@@ -1,9 +1,8 @@
 use crate::ai::{
     agents::AgentManifest,
     mcp::McpClient,
-    request,
     skills::SkillManifest,
-    types::{App, ToolDefinition},
+    types::{App, SkillBiasMemory, ToolDefinition},
 };
 use crate::commonw::configw;
 use std::ptr::NonNull;
@@ -13,16 +12,32 @@ use chrono::{DateTime, Utc};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use super::{DEFAULT_MAX_ITERATIONS, OPENCLAW_MAX_ITERATIONS, match_skill};
+use super::{
+    DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS, TextSimilarityFeatures,
+    jaccard_similarity_for_sets, rank_skills_locally, set_intersection_count,
+};
 use super::intent_recognition::{self, UserIntent};
 
 type ToolDef = ToolDefinition;
 type ToolScoreMap = SkipMap<String, f64>;
 
 const TOOL_SCORE_CACHE_TTL: Duration = Duration::from_secs(20);
+const DEFAULT_TURN_TOOL_GROUPS: &[&str] = &["core"];
+const CURRENT_SKILL_STICKY_BONUS: f64 = 1.25;
+const CURRENT_SKILL_KEEP_FLOOR_DELTA: f64 = 0.75;
+const SKILL_SWITCH_MARGIN: f64 = 1.5;
+const CROSS_TURN_SKILL_STICKY_BONUS: f64 = 0.35;
+const CROSS_TURN_SKILL_KEEP_FLOOR_DELTA: f64 = 0.25;
+const CROSS_TURN_SKILL_SWITCH_MARGIN: f64 = 0.6;
 
 static TOOL_SCORE_CACHE: LazyLock<Mutex<Option<(Instant, Arc<Box<ToolScoreMap>>)>>> =
     LazyLock::new(|| Mutex::new(None));
+
+#[derive(Clone, Copy)]
+enum PreferenceStrength {
+    StrongSticky,
+    CrossTurnBias,
+}
 
 pub(super) struct SkillTurnGuard {
     app: NonNull<App>,
@@ -176,11 +191,21 @@ fn manifest_tool_definitions(
     None
 }
 
-fn resolve_max_iterations(active_agent: Option<&AgentManifest>, openclaw_active: bool) -> usize {
+fn is_executor_name(name: &str) -> bool {
+    matches!(name, "executor" | "openclaw")
+}
+
+fn has_executor_group(tool_groups: &[String]) -> bool {
+    tool_groups
+        .iter()
+        .any(|group| matches!(group.as_str(), "executor" | "openclaw"))
+}
+
+fn resolve_max_iterations(active_agent: Option<&AgentManifest>, executor_active: bool) -> usize {
     active_agent
         .and_then(|agent| agent.max_steps)
-        .unwrap_or(if openclaw_active {
-            OPENCLAW_MAX_ITERATIONS
+        .unwrap_or(if executor_active {
+            EXECUTOR_MAX_ITERATIONS
         } else {
             DEFAULT_MAX_ITERATIONS
         })
@@ -204,7 +229,7 @@ fn builtin_tools_for_skill(
     {
         return tool_defs;
     }
-    super::super::tools::tool_definitions_for_groups(&["builtin"])
+    super::super::tools::tool_definitions_for_groups(DEFAULT_TURN_TOOL_GROUPS)
 }
 
 fn available_tool_names(builtin_tools: &[ToolDef], mcp_tools: &[ToolDef]) -> Box<SkipSet<String>> {
@@ -433,8 +458,171 @@ fn should_skip_recall_for_skill(skill: Option<&SkillManifest>) -> bool {
     };
     matches!(
         skill.name.as_str(),
-        "debugger" | "code-review" | "refactor" | "prompt-optimizer" | "openclaw"
-    ) || skill.tool_groups.iter().any(|g| g == "openclaw")
+        "debugger" | "code-review" | "refactor" | "prompt-optimizer"
+    ) || is_executor_name(skill.name.as_str())
+        || has_executor_group(&skill.tool_groups)
+}
+
+fn skill_selection_threshold(intent: &UserIntent, skill_count: usize) -> f64 {
+    let base: f64 = if skill_count > 10 {
+        5.0
+    } else if skill_count > 5 {
+        4.5
+    } else {
+        4.0
+    };
+    match intent.core {
+        intent_recognition::CoreIntent::RequestAction => base.max(4.5),
+        intent_recognition::CoreIntent::SeekSolution => base.max(4.25),
+        intent_recognition::CoreIntent::QueryConcept => base.max(5.5),
+        intent_recognition::CoreIntent::Casual => base.max(5.5),
+    }
+}
+
+fn looks_like_follow_up_or_same_topic(question: &str, previous_question: &str) -> bool {
+    let current = question.trim();
+    let previous = previous_question.trim();
+    if current.is_empty() || previous.is_empty() {
+        return false;
+    }
+
+    let current_features = TextSimilarityFeatures::from_text(current);
+    let previous_features = TextSimilarityFeatures::from_text(previous);
+    let token_similarity = jaccard_similarity_for_sets(
+        &current_features.token_set,
+        &previous_features.token_set,
+    );
+    if token_similarity >= 0.34 {
+        return true;
+    }
+
+    let bigram_similarity = jaccard_similarity_for_sets(
+        &current_features.char_bigrams,
+        &previous_features.char_bigrams,
+    );
+    if bigram_similarity >= 0.2 {
+        return true;
+    }
+
+    if current_features.token_set.is_empty() || previous_features.token_set.is_empty() {
+        return false;
+    }
+
+    let overlap =
+        set_intersection_count(&current_features.token_set, &previous_features.token_set);
+    let new_tokens = current_features.token_set.len().saturating_sub(overlap);
+    let new_token_ratio = new_tokens as f64 / current_features.token_set.len().max(1) as f64;
+    let current_chars = current.chars().count();
+    let previous_chars = previous.chars().count();
+
+    (current_chars <= 64 && overlap >= 1 && new_token_ratio <= 0.5)
+        || (current_chars <= 32 && current_chars <= previous_chars && overlap >= 1)
+        || (current_chars <= 24 && (token_similarity >= 0.18 || bigram_similarity >= 0.12))
+}
+
+fn cross_turn_preferred_skill_name(
+    app: &App,
+    question: &str,
+    intent: &UserIntent,
+) -> Option<String> {
+    if intent.is_searching_resource("skill") {
+        return None;
+    }
+    let memory = app.last_skill_bias.as_ref()?;
+    if looks_like_follow_up_or_same_topic(question, &memory.question) {
+        Some(memory.skill_name.clone())
+    } else {
+        None
+    }
+}
+
+fn update_cross_turn_skill_bias(app: &mut App, question: &str, skill: Option<&SkillManifest>) {
+    app.last_skill_bias = skill.map(|selected| SkillBiasMemory {
+        skill_name: selected.name.clone(),
+        question: question.trim().to_string(),
+    });
+}
+
+fn select_skill_with_preference<'a>(
+    skill_manifests: &'a [SkillManifest],
+    question: &str,
+    intent: &UserIntent,
+    preferred_skill_name: Option<&str>,
+) -> Option<&'a SkillManifest> {
+    select_skill_with_preference_strength(
+        skill_manifests,
+        question,
+        intent,
+        preferred_skill_name,
+        PreferenceStrength::StrongSticky,
+    )
+}
+
+fn select_skill_with_preference_strength<'a>(
+    skill_manifests: &'a [SkillManifest],
+    question: &str,
+    intent: &UserIntent,
+    preferred_skill_name: Option<&str>,
+    strength: PreferenceStrength,
+) -> Option<&'a SkillManifest> {
+    if question.trim().is_empty() || skill_manifests.is_empty() || intent.is_searching_resource("skill") {
+        return None;
+    }
+
+    let ranked = rank_skills_locally(skill_manifests, question, Some(intent));
+    let Some(best) = ranked.first() else {
+        return None;
+    };
+    let threshold = skill_selection_threshold(intent, skill_manifests.len());
+    let preferred = preferred_skill_name.and_then(|name| ranked.iter().find(|item| item.skill.name == name));
+
+    if let Some(current) = preferred {
+        let (sticky_bonus, keep_floor_delta, switch_margin, keep_current_when_best, keep_below_threshold) =
+            match strength {
+                PreferenceStrength::StrongSticky => (
+                    CURRENT_SKILL_STICKY_BONUS,
+                    CURRENT_SKILL_KEEP_FLOOR_DELTA,
+                    SKILL_SWITCH_MARGIN,
+                    true,
+                    true,
+                ),
+                PreferenceStrength::CrossTurnBias => (
+                    CROSS_TURN_SKILL_STICKY_BONUS,
+                    CROSS_TURN_SKILL_KEEP_FLOOR_DELTA,
+                    CROSS_TURN_SKILL_SWITCH_MARGIN,
+                    true,
+                    false,
+                ),
+            };
+        let current_has_signal = current.score >= (threshold - keep_floor_delta).max(0.0)
+            || current.heuristic_score >= 3.0
+            || current.model_score >= 0.08;
+        if best.skill.name == current.skill.name {
+            return if keep_current_when_best || current.score >= threshold || current_has_signal {
+                Some(current.skill)
+            } else {
+                None
+            };
+        }
+
+        let effective_current = current.score + sticky_bonus;
+        let best_clearly_wins = best.score >= effective_current + switch_margin;
+        if keep_below_threshold && best.score < threshold {
+            return Some(current.skill);
+        }
+        if current_has_signal && !best_clearly_wins {
+            return Some(current.skill);
+        }
+        if best.score >= threshold {
+            return Some(best.skill);
+        }
+        if current_has_signal {
+            return Some(current.skill);
+        }
+        return None;
+    }
+
+    (best.score >= threshold).then_some(best.skill)
 }
 
 #[crate::ai::agent_hang_span(
@@ -458,59 +646,54 @@ fn detect_turn_intent(
     intent_recognition::detect_intent_with_model_path(question, intent_model_path)
 }
 
-#[crate::ai::agent_hang_span(
-    "pre-fix",
-    "R",
-    "skill_runtime::prepare_skill_for_turn:router",
-    "[DEBUG] skill router started",
-    "[DEBUG] skill router finished",
-    {
-        "router_enabled": router_enabled,
-        "skip_router_for_local_intent": skip_router_for_local_intent,
-        "skill_count": skill_manifests.len(),
-    },
-    {
-        "router_enabled": router_enabled,
-        "skip_router_for_local_intent": skip_router_for_local_intent,
-        "selected": __agent_hang_result.as_deref(),
-        "elapsed_ms": __agent_hang_elapsed_ms,
-    }
-)]
-async fn route_skill_for_turn(
+fn build_skill_turn_guard(
     app: &mut App,
-    question: &str,
-    skill_manifests: &[SkillManifest],
-    router_enabled: bool,
-    skip_router_for_local_intent: bool,
-) -> Option<String> {
-    if router_enabled && !skip_router_for_local_intent {
-        let model = app.current_model.clone();
-        request::select_skill_via_model(app, &model, question, skill_manifests).await
-    } else {
-        None
+    mcp_client: &McpClient,
+    skill: Option<&SkillManifest>,
+    intent: UserIntent,
+) -> SkillTurnGuard {
+    super::super::tools::enable_tools::set_available_mcp_tools(mcp_client.get_all_tools());
+    let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
+    let skip_recall_by_skill = should_skip_recall_for_skill(skill);
+    let prompt_optimizer_active = skill
+        .as_ref()
+        .is_some_and(|s| s.name.as_str() == "prompt-optimizer");
+    let active_agent = app.current_agent_manifest.clone();
+    let executor_active = skill.as_ref().is_some_and(|s| {
+        is_executor_name(s.name.as_str()) || has_executor_group(&s.tool_groups)
+    }) || active_agent.as_ref().is_some_and(|agent| {
+        is_executor_name(agent.name.as_str()) || has_executor_group(&agent.tool_groups)
+    });
+
+    let builtin_tools = builtin_tools_for_skill(prompt_optimizer_active, skill, active_agent.as_ref());
+    let mcp_tools = mcp_tools_for_skill(mcp_client, prompt_optimizer_active, skill);
+    let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
+    let system_prompt = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
+    let max_iterations = resolve_max_iterations(active_agent.as_ref(), executor_active);
+    let restore_agent_context =
+        activate_skill_context(app, builtin_tools, mcp_tools, max_iterations);
+
+    SkillTurnGuard {
+        app: NonNull::from(&mut *app),
+        restore_agent_context,
+        system_prompt,
+        matched_skill_name,
+        intent,
+        skip_recall_by_skill,
     }
 }
 
-fn should_skip_remote_skill_router(
+pub(super) fn rebuild_skill_turn_with_existing_selection(
+    app: &mut App,
+    mcp_client: &McpClient,
+    skill_manifests: &[SkillManifest],
+    question: &str,
+    preferred_skill_name: Option<&str>,
     intent: &UserIntent,
-    question_len: usize,
-    skill_count: usize,
-    heuristic_skill_found: bool,
-) -> bool {
-    if skill_count == 0 {
-        return true;
-    }
-    if heuristic_skill_found {
-        return true;
-    }
-    if matches!(
-        intent.core,
-        intent_recognition::CoreIntent::Casual | intent_recognition::CoreIntent::QueryConcept
-    ) && question_len <= 96
-    {
-        return true;
-    }
-    false
+) -> SkillTurnGuard {
+    let skill =
+        select_skill_with_preference(skill_manifests, question, intent, preferred_skill_name);
+    build_skill_turn_guard(app, mcp_client, skill, intent.clone())
 }
 
 pub(super) async fn prepare_skill_for_turn(
@@ -519,50 +702,33 @@ pub(super) async fn prepare_skill_for_turn(
     skill_manifests: &[SkillManifest],
     question: &str,
 ) -> SkillTurnGuard {
-    super::super::tools::enable_tools::set_available_mcp_tools(mcp_client.get_all_tools());
     let cfg = configw::get_all_config();
     let debug = cfg
         .get_opt("ai.skills.debug")
         .unwrap_or_default()
         .trim()
         .eq_ignore_ascii_case("true");
-    let router_enabled = !cfg
-        .get_opt("ai.skills.router")
-        .unwrap_or_else(|| "true".to_string())
-        .trim()
-        .eq_ignore_ascii_case("false");
 
     let intent = detect_turn_intent(question, &app.config.intent_model_path);
-    let question_len = question.chars().count();
-    let heuristic_skill = match_skill(skill_manifests, question, Some(&intent));
-    let skip_router_for_local_intent =
-        should_skip_remote_skill_router(
-            &intent,
-            question_len,
-            skill_manifests.len(),
-            heuristic_skill.is_some(),
-        );
-    let router_selected = route_skill_for_turn(
-        app,
-        question,
+    let ranked = rank_skills_locally(skill_manifests, question, Some(&intent));
+    let cross_turn_preference = cross_turn_preferred_skill_name(app, question, &intent);
+    let skill = select_skill_with_preference_strength(
         skill_manifests,
-        router_enabled,
-        skip_router_for_local_intent,
-    )
-    .await;
-
-    let router_skill = router_selected
-        .as_deref()
-        .and_then(|name| skill_manifests.iter().find(|s| s.name == name));
-
-    let skill = resolve_skill_selection(router_skill, heuristic_skill, &intent);
+        question,
+        &intent,
+        cross_turn_preference.as_deref(),
+        PreferenceStrength::CrossTurnBias,
+    );
 
     if debug {
-        if let Some(name) = router_selected.as_deref() {
-            eprintln!("[skills] router selected: {}", name);
+        if let Some(top) = ranked.first() {
+            eprintln!(
+                "[skills] local top: {} total={:.3} heuristic={:.3} model={:.3}",
+                top.skill.name, top.score, top.heuristic_score, top.model_score
+            );
         }
-        if let Some(s) = heuristic_skill.as_ref() {
-            eprintln!("[skills] heuristic candidate: {}", s.name);
+        if let Some(preferred) = cross_turn_preference.as_deref() {
+            eprintln!("[skills] cross-turn preferred: {}", preferred);
         }
         eprintln!("[skills] intent: {:?}", intent.core);
         if let Some(s) = skill.as_ref() {
@@ -571,82 +737,32 @@ pub(super) async fn prepare_skill_for_turn(
             eprintln!("[skills] final: <none>");
         }
     }
+    update_cross_turn_skill_bias(app, question, skill);
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
     let skip_recall_by_skill = should_skip_recall_for_skill(skill);
-    let prompt_optimizer_active = skill
-        .as_ref()
-        .is_some_and(|s| s.name.as_str() == "prompt-optimizer");
-    let active_agent = app.current_agent_manifest.clone();
-    let openclaw_active = skill.as_ref().is_some_and(|s| {
-        s.name.as_str() == "openclaw" || s.tool_groups.iter().any(|g| g == "openclaw")
-    }) || active_agent.as_ref().is_some_and(|agent| {
-        agent.name.as_str() == "openclaw" || agent.tool_groups.iter().any(|g| g == "openclaw")
-    });
-
-    let builtin_tools = builtin_tools_for_skill(prompt_optimizer_active, skill, active_agent.as_ref());
-    let mcp_tools = mcp_tools_for_skill(mcp_client, prompt_optimizer_active, skill);
-    let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
-    let system_prompt = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
-    let max_iterations = resolve_max_iterations(active_agent.as_ref(), openclaw_active);
-    let restore_agent_context =
-        activate_skill_context(app, builtin_tools, mcp_tools, max_iterations);
-
-    let guard = SkillTurnGuard {
-        app: NonNull::from(&mut *app),
-        restore_agent_context,
-        system_prompt,
-        matched_skill_name,
-        intent,
-        skip_recall_by_skill,
-    };
+    let mut guard = build_skill_turn_guard(app, mcp_client, skill, intent);
+    guard.matched_skill_name = matched_skill_name;
+    guard.skip_recall_by_skill = skip_recall_by_skill;
     guard
-}
-
-fn resolve_skill_selection<'a>(
-    router_skill: Option<&'a SkillManifest>,
-    heuristic_skill: Option<&'a SkillManifest>,
-    intent: &UserIntent,
-) -> Option<&'a SkillManifest> {
-    match (router_skill, heuristic_skill) {
-        (Some(r), Some(h)) => {
-            if r.name == h.name {
-                return Some(r);
-            }
-            if intent.is_searching_resource("skill") {
-                return None;
-            }
-            let pr = super::tools::penalty_for_skill_tools(r);
-            let ph = super::tools::penalty_for_skill_tools(h);
-            if ph + 1e-6 < pr {
-                Some(h)
-            } else {
-                Some(r)
-            }
-        }
-        (Some(r), None) => {
-            if intent.is_searching_resource("skill") {
-                None
-            } else {
-                Some(r)
-            }
-        }
-        (None, Some(h)) => Some(h),
-        (None, None) => None,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         build_system_prompt, builtin_tools_for_skill, ensure_required_discovery_tools,
-        merge_with_runtime_enabled_tools, resolve_max_iterations, should_skip_remote_skill_router,
-        tool_uses_mcp_server,
+        looks_like_follow_up_or_same_topic, merge_with_runtime_enabled_tools,
+        resolve_max_iterations, select_skill_with_preference,
+        select_skill_with_preference_strength, tool_uses_mcp_server, PreferenceStrength,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
+    use crate::ai::skills::SkillManifest;
     use crate::ai::tools::enable_tools::set_explicit_enabled_tool_names;
     use crate::ai::types::{FunctionDefinition, ToolDefinition};
     use rust_tools::cw::SkipSet;
+    use std::sync::{LazyLock, Mutex};
+
+    static EXPLICIT_TOOL_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     
     #[test]
     fn mcp_server_filter_matches_longest_server_name_prefix() {
@@ -659,7 +775,7 @@ mod tests {
     #[test]
     fn active_agent_max_steps_override_default_iterations() {
         let agent = AgentManifest {
-            name: "openclaw".to_string(),
+            name: "executor".to_string(),
             description: String::new(),
             mode: AgentMode::Primary,
             model: None,
@@ -668,7 +784,7 @@ mod tests {
             prompt: String::new(),
             system_prompt: None,
             tools: Vec::new(),
-            tool_groups: vec!["builtin".to_string(), "openclaw".to_string()],
+            tool_groups: vec!["builtin".to_string(), "executor".to_string()],
             mcp_servers: Vec::new(),
             routing_tags: Vec::new(),
             model_tier: None,
@@ -680,20 +796,23 @@ mod tests {
 
         assert_eq!(resolve_max_iterations(Some(&agent), false), 17);
         assert_eq!(resolve_max_iterations(Some(&agent), true), 17);
-        assert_eq!(resolve_max_iterations(None, true), super::super::OPENCLAW_MAX_ITERATIONS);
+        assert_eq!(resolve_max_iterations(None, true), super::super::EXECUTOR_MAX_ITERATIONS);
         assert_eq!(resolve_max_iterations(None, false), super::super::DEFAULT_MAX_ITERATIONS);
     }
 
     #[test]
-    fn default_tools_include_builtin_web_and_knowledge_tools() {
+    fn default_tools_start_with_core_discovery_and_editing() {
         let tools = builtin_tools_for_skill(false, None, None);
         let names = tools
             .into_iter()
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
-        assert!(names.iter().any(|name| name == "web_search"));
-        assert!(names.iter().any(|name| name == "knowledge_search"));
+        assert!(names.iter().any(|name| name == "enable_tools"));
+        assert!(names.iter().any(|name| name == "discover_skills"));
+        assert!(names.iter().any(|name| name == "code_search"));
         assert!(names.iter().any(|name| name == "read_file"));
+        assert!(!names.iter().any(|name| name == "web_search"));
+        assert!(!names.iter().any(|name| name == "knowledge_search"));
     }
 
     #[test]
@@ -726,11 +845,28 @@ mod tests {
         }
     }
 
+    fn skill(name: &str, description: &str) -> SkillManifest {
+        SkillManifest {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            description: description.to_string(),
+            author: None,
+            tools: Vec::new(),
+            tool_groups: Vec::new(),
+            mcp_servers: Vec::new(),
+            prompt: String::new(),
+            system_prompt: None,
+            priority: 0,
+            source_path: Some(format!("builtin:{name}.skill")),
+        }
+    }
+
     #[test]
     fn runtime_enabled_tools_are_preserved_when_refreshing_context() {
+        let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
         set_explicit_enabled_tool_names(vec!["enable_tools".to_string(), "web_search".to_string()]);
         let merged = merge_with_runtime_enabled_tools(
-            vec![tool("code_search"), tool("read_file")],
+            vec![tool("code_search"), tool("read_file"), tool("enable_tools")],
             vec![],
             &[tool("code_search"), tool("enable_tools"), tool("web_search")],
         );
@@ -746,6 +882,7 @@ mod tests {
 
     #[test]
     fn non_explicit_skill_tools_do_not_leak_into_next_context() {
+        let _guard = EXPLICIT_TOOL_TEST_GUARD.lock().unwrap();
         set_explicit_enabled_tool_names(vec!["web_search".to_string()]);
         let merged = merge_with_runtime_enabled_tools(
             vec![tool("code_search")],
@@ -778,20 +915,83 @@ mod tests {
     }
 
     #[test]
-    fn short_casual_turn_skips_remote_skill_router() {
-        let intent = UserIntent::new(CoreIntent::Casual);
-        assert!(should_skip_remote_skill_router(&intent, 24, 3, false));
+    fn local_selector_chooses_review_skill_for_review_request() {
+        let intent = UserIntent::new(CoreIntent::RequestAction);
+        let skills = vec![
+            skill("code-review", "Review code changes and highlight bugs"),
+            skill("debugger", "Debug runtime failures and collect traces"),
+        ];
+        let selected = select_skill_with_preference(&skills, "帮我 review 这段 Rust 代码", &intent, None);
+        assert_eq!(selected.map(|item| item.name.as_str()), Some("code-review"));
     }
 
     #[test]
-    fn heuristic_skill_hit_skips_remote_skill_router() {
+    fn local_selector_prefers_current_skill_without_clear_winner() {
         let intent = UserIntent::new(CoreIntent::RequestAction);
-        assert!(should_skip_remote_skill_router(&intent, 24, 3, true));
+        let skills = vec![
+            skill("code-review", "Review code changes and summarize defects"),
+            skill("debugger", "Debug runtime failures, panic, and stack traces"),
+        ];
+        let selected =
+            select_skill_with_preference(&skills, "帮我看一下这段代码哪里有问题", &intent, Some("code-review"));
+        assert_eq!(selected.map(|item| item.name.as_str()), Some("code-review"));
     }
 
     #[test]
-    fn short_action_turn_without_heuristic_keeps_remote_skill_router_available() {
+    fn local_selector_switches_when_new_skill_is_significantly_better() {
         let intent = UserIntent::new(CoreIntent::RequestAction);
-        assert!(!should_skip_remote_skill_router(&intent, 24, 3, false));
+        let skills = vec![
+            skill("code-review", "Review code changes and summarize defects"),
+            skill("debugger", "Debug panic crash stack trace runtime failure logs"),
+        ];
+        let selected = select_skill_with_preference(
+            &skills,
+            "程序 panic 了，帮我调试这个 crash 和 stack trace",
+            &intent,
+            Some("code-review"),
+        );
+        assert_eq!(selected.map(|item| item.name.as_str()), Some("debugger"));
+    }
+
+    #[test]
+    fn follow_up_detector_recognizes_short_continuation_question() {
+        assert!(looks_like_follow_up_or_same_topic(
+            "那这个 panic 呢？",
+            "帮我调试一下这个 Rust panic"
+        ));
+    }
+
+    #[test]
+    fn cross_turn_bias_prefers_previous_skill_on_follow_up() {
+        let intent = UserIntent::new(CoreIntent::RequestAction);
+        let skills = vec![
+            skill("code-review", "Review code changes and summarize defects"),
+            skill("debugger", "Debug runtime failures and panic stack traces"),
+        ];
+        let selected = select_skill_with_preference_strength(
+            &skills,
+            "那这个报错顺便再看一下",
+            &intent,
+            Some("debugger"),
+            PreferenceStrength::CrossTurnBias,
+        );
+        assert_eq!(selected.map(|item| item.name.as_str()), Some("debugger"));
+    }
+
+    #[test]
+    fn cross_turn_bias_still_switches_when_new_skill_is_clearly_better() {
+        let intent = UserIntent::new(CoreIntent::RequestAction);
+        let skills = vec![
+            skill("code-review", "Review code changes and summarize defects"),
+            skill("debugger", "Debug panic crash stack trace runtime failure logs"),
+        ];
+        let selected = select_skill_with_preference_strength(
+            &skills,
+            "继续这个问题，不过现在请直接 review 这段实现有没有逻辑 bug",
+            &intent,
+            Some("debugger"),
+            PreferenceStrength::CrossTurnBias,
+        );
+        assert_eq!(selected.map(|item| item.name.as_str()), Some("code-review"));
     }
 }

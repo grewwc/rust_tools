@@ -51,8 +51,15 @@ pub(super) struct App {
     pub(super) writer: Option<File>,
     pub(super) prompt_editor: Option<PromptEditor>,
     pub(super) agent_context: Option<AgentContext>,
+    pub(super) last_skill_bias: Option<SkillBiasMemory>,
     /// Turn counter for periodic agent manifest hot-reload.
     pub(super) agent_reload_counter: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct SkillBiasMemory {
+    pub(super) skill_name: String,
+    pub(super) question: String,
 }
 
 /// Schema definition for a tool that can be offered to the AI model,
