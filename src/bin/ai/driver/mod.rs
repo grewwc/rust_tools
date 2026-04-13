@@ -21,6 +21,7 @@ use crate::ai::{
 };
 use crate::commonw::configw;
 
+pub mod agent_router;
 pub mod commands;
 pub mod decision_log;
 pub mod input;
@@ -85,185 +86,12 @@ fn auto_agent_routing_enabled() -> bool {
         .eq_ignore_ascii_case("false")
 }
 
-fn auto_executor_length_threshold() -> usize {
-    let cfg = configw::get_all_config();
-    cfg.get_opt("ai.agents.auto_route.executor_min_chars")
-        .or_else(|| cfg.get_opt("ai.agents.auto_route.openclaw_min_chars"))
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(48)
-}
-
-fn contains_complex_execution_marker(question: &str) -> bool {
-    let lower = question.to_lowercase();
-    [
-        "然后", "同时", "顺便", "一步步", "分步骤", "自动", "完整", "端到端", "闭环", "multi-step",
-        "end-to-end", "step by step", "across", "implement", "refactor", "debug", "fix", "repair",
-        "integrate", "migrate",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn contains_code_action_marker(question: &str) -> bool {
-    let lower = question.to_lowercase();
-    [
-        "帮我", "修", "修复", "修改", "改一下", "实现", "添加", "扩展", "重构", "排查", "调试", "处理",
-        "完成", "补", "优化", "迁移", "接入", "联调", "修一下", "报错", "panic", "error", "failing",
-        "test", "build", "cargo", "fix", "implement", "add", "extend", "refactor", "debug",
-        "update", "wire", "integrate", "migrate",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-/// Extracts plain text content from a Message for context scoring.
-fn extract_text_from_message(msg: &crate::ai::history::Message) -> Option<String> {
-    use serde_json::Value;
-    match &msg.content {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(arr) => {
-            let parts: Vec<String> = arr.iter().filter_map(|part| {
-                if let Value::Object(obj) = part {
-                    if let Some(Value::String(s)) = obj.get("text") {
-                        return Some(s.clone());
-                    }
-                }
-                None
-            }).collect();
-            if parts.is_empty() { None } else { Some(parts.join(" ")) }
-        }
-        _ => None,
-    }
-}
-
-/// Computes a context-aware routing score for each candidate agent.
-/// Returns the best matching agent, or None if none qualifies.
-fn select_best_agent_by_context<'a>(
-    agent_manifests: &'a [AgentManifest],
-    question: &str,
-    history: &[crate::ai::history::Message],
-) -> Option<&'a AgentManifest> {
-    let question_lower = question.to_lowercase();
-
-    let mut best: Option<&AgentManifest> = None;
-    let mut best_score: f64 = 0.0;
-
-    for agent in agent_manifests.iter() {
-        if !agent.is_primary() || agent.disabled || agent.hidden {
-            continue;
-        }
-
-        let score = score_agent_for_question(agent, &question_lower, history);
-        if score > best_score {
-            best_score = score;
-            best = Some(agent);
-        }
-    }
-
-    // Only switch if the score exceeds a minimum threshold
-    if best_score >= 5.0 {
-        best
-    } else {
-        None
-    }
-}
-
-/// Scores a single agent for the given question and conversation history.
-fn score_agent_for_question(
-    agent: &AgentManifest,
-    question_lower: &str,
-    history: &[crate::ai::history::Message],
-) -> f64 {
-    let mut score = 0.0;
-
-    // 1. Direct name mention in the question (highest signal)
-    let agent_name_lower = agent.name.to_lowercase();
-    if question_lower.contains(&agent_name_lower) {
-        score += 20.0;
-    }
-
-    // 2. Routing tags matching question keywords
-    for tag in agent.routing_tags_normalized() {
-        if question_lower.contains(&tag) {
-            score += 3.0;
-        }
-    }
-
-    // 3. Description keyword match
-    let desc_lower = agent.description.to_lowercase();
-    for word in question_lower.split_whitespace().filter(|w| w.len() >= 3) {
-        if desc_lower.contains(word) {
-            score += 1.5;
-        }
-    }
-
-    // 4. Context carry-over: if recent conversation was about the same agent's
-    //    domain, give a bonus
-    if !history.is_empty() {
-        let recent_entries: Vec<_> = history.iter().rev().take(4).collect();
-        for entry in recent_entries {
-            if let Some(text) = extract_text_from_message(entry) {
-                let entry_lower = text.to_lowercase();
-                let agent_name_lower = agent.name.to_lowercase();
-                if entry_lower.contains(&agent_name_lower) {
-                    score += 2.0;
-                }
-                let desc_lower = agent.description.to_lowercase();
-                for word in entry_lower.split_whitespace().filter(|w| w.len() >= 4) {
-                    if desc_lower.contains(word) {
-                        score += 0.5;
-                    }
-                }
-            }
-        }
-    }
-
-    // 5. Model tier alignment: prefer lightweight agents for simple queries
-    let word_count = question_lower.split_whitespace().count();
-    if word_count <= 5
-        && agent
-            .model_tier
-            .as_ref()
-            .is_some_and(|t| matches!(t, agents::AgentModelTier::Light))
-    {
-        score += 2.0;
-    }
-    if word_count >= 20
-        && agent
-            .model_tier
-            .as_ref()
-            .is_some_and(|t| matches!(t, agents::AgentModelTier::Heavy))
-    {
-        score += 2.0;
-    }
-
-    score
-}
-
-fn should_auto_route_to_executor(
-    intent: &intent_recognition::UserIntent,
-    question: &str,
-) -> bool {
-    if intent.is_search_query() {
-        return false;
-    }
-    if !matches!(
-        intent.core,
-        intent_recognition::CoreIntent::RequestAction | intent_recognition::CoreIntent::SeekSolution
-    ) {
-        return false;
-    }
-
-    let question = question.trim();
-    if question.is_empty() || !contains_code_action_marker(question) {
-        return false;
-    }
-
-    let char_count = question.chars().count();
-    let line_count = question.lines().count();
-    char_count >= auto_executor_length_threshold()
-        || line_count >= 2
-        || contains_complex_execution_marker(question)
+fn auto_route_strategy() -> String {
+    configw::get_all_config()
+        .get_opt("ai.agents.auto_route.strategy")
+        .unwrap_or_else(|| "model".to_string())
+        .trim()
+        .to_lowercase()
 }
 
 fn maybe_auto_route_agent(
@@ -275,52 +103,23 @@ fn maybe_auto_route_agent(
         return;
     }
 
-    let intent =
-        intent_recognition::detect_intent_with_model_path(question, &app.config.intent_model_path);
-
-    // Phase 1: Legacy hardcoded routing (executor vs build) for backward compatibility
-    let legacy_target = if should_auto_route_to_executor(&intent, question) {
-        Some("executor")
-    } else {
-        None
-    };
-
-    // Phase 2: Context-aware routing using agent routing_tags and conversation history
-    let history_entries = read_recent_history(app);
-    let context_target = select_best_agent_by_context(agent_manifests, question, &history_entries);
-
-    let fallback_agent_name = agents::find_agent_by_name(agent_manifests, "build")
-        .filter(|agent| agent.is_primary() && !agent.disabled && !agent.hidden)
-        .map(|agent| agent.name.clone())
-        .unwrap_or_else(|| app.current_agent.clone());
-
-    // Phase 3: Resolve final target — context-aware routing takes precedence
-    // unless the legacy hard-coded routing explicitly triggers the executor agent.
-    let target_agent_name: String = if let Some(name) = legacy_target {
-        // Legacy executor trigger wins only if no better context match exists
-        // with a significantly higher score
-        if let Some(ctx_agent) = context_target {
-            if agents::canonical_agent_name(&ctx_agent.name) == name {
-                name.to_string()
-            } else {
-                // Let context-aware routing decide
-                ctx_agent.name.clone()
-            }
-        } else {
-            name.to_string()
+    let history = read_recent_history(app);
+    let decision = match auto_route_strategy().as_str() {
+        "heuristic" => {
+            let router = agent_router::HeuristicRouter;
+            agent_router::AgentRouter::route(&router, agent_manifests, question, &history, &app.current_agent)
         }
-    } else if let Some(ctx_agent) = context_target {
-        ctx_agent.name.clone()
-    } else {
-        // Fallback: return to the default build agent instead of keeping sticky context.
-        fallback_agent_name
+        _ => {
+            let model_path = app.config.agent_route_model_path.clone();
+            let router = agent_router::ModelRouter::new(model_path);
+            agent_router::AgentRouter::route(&router, agent_manifests, question, &history, &app.current_agent)
+        }
+    };
+    let Some(decision) = decision else {
+        return;
     };
 
-    if app.current_agent == target_agent_name {
-        return;
-    }
-
-    let Some(agent) = agents::find_agent_by_name(agent_manifests, &target_agent_name) else {
+    let Some(agent) = agents::find_agent_by_name(agent_manifests, &decision.agent_name) else {
         return;
     };
     if !agent.is_primary() || agent.disabled {
@@ -330,27 +129,12 @@ fn maybe_auto_route_agent(
     let old_agent = app.current_agent.clone();
     activate_primary_agent(app, agent);
 
-    // Determine switch reason for logging
-    let reason = if legacy_target.is_some() && legacy_target.unwrap() == target_agent_name {
-        "complex-execution"
-    } else if let Some(ctx) = context_target {
-        if ctx.name == target_agent_name {
-            "context-match"
-        } else {
-            "unknown"
-        }
-    } else {
-        "fallback"
-    };
-
     println!(
         "\n[Agent 自动切换: {} → {}] (原因: {})\n",
-        old_agent, app.current_agent, reason
+        old_agent, app.current_agent, decision.reason
     );
 }
 
-/// Reads the most recent conversation history entries for the current session.
-/// Used by context-aware routing to understand what the conversation has been about.
 fn read_recent_history(app: &App) -> Vec<crate::ai::history::Message> {
     use crate::ai::history::build_message_arr;
     match build_message_arr(usize::MAX, &app.session_history_file) {
@@ -628,10 +412,9 @@ async fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{maybe_auto_route_agent, should_auto_route_to_executor};
+    use super::maybe_auto_route_agent;
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
-    use crate::ai::driver::intent_recognition::{CoreIntent, IntentModifiers, UserIntent};
     use crate::ai::types::{AgentContext, App, AppConfig};
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
@@ -671,7 +454,9 @@ mod tests {
                 history_summary_max_chars: 4000,
                 intent_model: None,
                 intent_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("config/intent/intent_model.json"),
+                    .join("src/bin/ai/config/intent/intent_model.json"),
+                agent_route_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/bin/ai/config/agent_route/agent_route_model.json"),
             },
             session_id: String::new(),
             session_history_file: PathBuf::new(),
@@ -699,32 +484,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_routes_complex_execution_requests_to_executor() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
-        let question = "帮我实现这个 agent 的自动执行能力，然后跑检查并修掉相关报错";
-        assert!(should_auto_route_to_executor(&intent, question));
-    }
-
-    #[test]
-    fn does_not_route_simple_concept_questions_to_executor() {
-        let intent = UserIntent::new(CoreIntent::QueryConcept);
-        assert!(!should_auto_route_to_executor(&intent, "Rust 的 crate 是什么？"));
-    }
-
-    #[test]
-    fn does_not_route_search_queries_to_executor() {
-        let intent = UserIntent {
-            core: CoreIntent::RequestAction,
-            modifiers: IntentModifiers {
-                is_search_query: true,
-                target_resource: Some("tool".to_string()),
-                negation: false,
-            },
-        };
-        assert!(!should_auto_route_to_executor(&intent, "帮我找几个调试工具"));
-    }
-
-    #[test]
     fn auto_route_falls_back_to_build_instead_of_current_agent() {
         let build = primary_agent("build", "Default agent for development work", &["fix", "debug"]);
         let prompt_skill = primary_agent(
@@ -746,5 +505,4 @@ mod tests {
             Some("build")
         );
     }
-
 }

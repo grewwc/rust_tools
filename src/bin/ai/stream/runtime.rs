@@ -655,12 +655,10 @@ fn process_stream_payload(
 
     state.content.empty_choice_chunks = 0;
 
-    let mut reached_finish_reason = false;
     if let Some(choice) = chunk.choices.first() {
         if !choice.delta.reasoning_content.is_empty() {
             state.content.saw_reasoning_output = true;
         }
-        reached_finish_reason = choice.finish_reason.is_some();
     }
 
     process_external_tool_calls_delta(app, markers, state, &chunk);
@@ -675,7 +673,7 @@ fn process_stream_payload(
     process_internal_tool_calls(app, markers, state, internal_tool_calls);
 
     if events.is_empty() {
-        return Ok(reached_finish_reason);
+        return Ok(false);
     }
     for event in events {
         match event {
@@ -697,7 +695,9 @@ fn process_stream_payload(
         }
     }
 
-    Ok(reached_finish_reason)
+    // Keep streaming until explicit stream end ([DONE] or EOF). Some providers can
+    // set finish_reason before all visible content chunks are delivered.
+    Ok(false)
 }
 
 fn stream_text_event_to_content(

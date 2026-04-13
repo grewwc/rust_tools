@@ -9,7 +9,7 @@ use rustyline::{CompletionType, Config, Editor, history::DefaultHistory};
 use super::history::SessionStore;
 use crate::commonw::utils::expanduser;
 
-mod completion;
+pub(super) mod completion;
 mod multiline;
 
 use completion::{CommandCompleter, LineEditor};

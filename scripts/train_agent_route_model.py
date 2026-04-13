@@ -35,8 +35,9 @@ def build_dataset(corpus: dict):
     doc_freq = Counter()
     docs = []
     for sample in samples:
+        label = sample.get("agent") or sample.get("core")
         feats = extract_char_ngrams(sample["text"], min_n, max_n)
-        docs.append({"label": sample["core"], "features": feats, "text": sample["text"]})
+        docs.append({"label": label, "features": feats, "text": sample["text"]})
         for token in feats.keys():
             doc_freq[token] += 1
 
@@ -156,25 +157,24 @@ def build_model_json(corpus, labels, vocab, idf, weights, bias):
             "char_ngram_min": corpus["feature_config"]["char_ngram_min"],
             "char_ngram_max": corpus["feature_config"]["char_ngram_max"],
         },
-        "runtime_rules": corpus["runtime_rules"],
         "bias": [round(x, 8) for x in bias],
         "features": features,
     }
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train local TF-IDF + Logistic Regression intent model")
+    parser = argparse.ArgumentParser(description="Train local TF-IDF + Logistic Regression agent route model")
     parser.add_argument(
         "--corpus",
-        default="src/bin/ai/config/intent/training_corpus.json",
+        default="src/bin/ai/config/agent_route/training_corpus.json",
         help="Path to training corpus json",
     )
     parser.add_argument(
         "--output",
-        default="src/bin/ai/config/intent/intent_model.json",
+        default="src/bin/ai/config/agent_route/agent_route_model.json",
         help="Path to output model json",
     )
-    parser.add_argument("--epochs", type=int, default=220, help="Training epochs")
+    parser.add_argument("--epochs", type=int, default=300, help="Training epochs")
     parser.add_argument("--learning-rate", type=float, default=0.55, help="Learning rate")
     parser.add_argument("--l2", type=float, default=0.0002, help="L2 regularization")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")

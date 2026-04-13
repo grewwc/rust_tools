@@ -32,22 +32,14 @@ pub(in crate::ai) fn handle_sigint(shutdown: &AtomicBool, streaming: &AtomicBool
 
 pub(in crate::ai) fn sigint_action(
     shutdown: &AtomicBool,
-    streaming: &AtomicBool,
-    cancel_stream: &AtomicBool,
+    _streaming: &AtomicBool,
+    _cancel_stream: &AtomicBool,
 ) -> SigintAction {
-    if streaming.load(Ordering::Relaxed) {
-        if cancel_stream.load(Ordering::Relaxed) {
-            SigintAction::Shutdown
-        } else {
-            SigintAction::CancelStream
-        }
-    } else if shutdown.load(Ordering::Relaxed) {
+    if shutdown.load(Ordering::Relaxed) {
         SigintAction::Exit
-    } else if cancel_stream.load(Ordering::Relaxed) {
-        SigintAction::Shutdown
     } else {
-        // Outside streaming (including tool execution), first Ctrl+C cancels the current
-        // turn but keeps the session alive. A second Ctrl+C will shut down.
+        // Always cancel the current turn/output and keep the REPL session alive.
+        // Repeated Ctrl+C should keep cancelling, not escalate to shutdown.
         SigintAction::CancelStream
     }
 }

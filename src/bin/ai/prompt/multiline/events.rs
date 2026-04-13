@@ -88,9 +88,17 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
                 (KeyCode::Enter, modifiers)
                     if modifiers.is_empty() && completion_panel.is_some() =>
                 {
-                    *status_msg =
-                        confirm_completion_selection(textarea, pending_tab_completion, completion_panel);
-                    Ok(EventLoopAction::Continue)
+                    let selection = confirm_completion_selection(
+                        textarea,
+                        pending_tab_completion,
+                        completion_panel,
+                    );
+                    *status_msg = selection.status;
+                    if let Some(submit) = selection.submit {
+                        Ok(EventLoopAction::Submit(Some(submit)))
+                    } else {
+                        Ok(EventLoopAction::Continue)
+                    }
                 }
                 (KeyCode::Esc, modifiers) if modifiers.is_empty() && completion_panel.is_some() => {
                     dismiss_completion_panel(pending_tab_completion, completion_panel);

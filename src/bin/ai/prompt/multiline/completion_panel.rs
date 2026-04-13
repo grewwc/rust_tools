@@ -1,6 +1,6 @@
 use tui_textarea::TextArea;
 
-use super::super::completion::CommandCompleter;
+use super::super::completion::{CommandCompleter, CompletionCandidate};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::ai::prompt::multiline) struct PendingTabCompletion {
@@ -8,13 +8,19 @@ pub(in crate::ai::prompt::multiline) struct PendingTabCompletion {
     col: usize,
     token_start: usize,
     line: String,
-    candidates: Vec<String>,
+    candidates: Vec<CompletionCandidate>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::ai::prompt::multiline) struct CompletionPanel {
-    pub(in crate::ai::prompt::multiline) items: Vec<String>,
+    pub(in crate::ai::prompt::multiline) items: Vec<CompletionCandidate>,
     pub(in crate::ai::prompt::multiline) selected_index: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::ai::prompt::multiline) struct CompletionConfirmResult {
+    pub(in crate::ai::prompt::multiline) status: Option<String>,
+    pub(in crate::ai::prompt::multiline) submit: Option<String>,
 }
 
 fn replace_current_line_range(
@@ -53,6 +59,23 @@ fn build_multiline_completion_context(textarea: &TextArea<'_>) -> Option<Pending
     })
 }
 
+fn should_open_popup_on_first_tab(ctx: &PendingTabCompletion) -> bool {
+    let trimmed = ctx.line[..ctx.col].trim();
+    matches!(trimmed, "/model" | ":model")
+        || trimmed.starts_with("/model ")
+        || trimmed.starts_with(":model ")
+}
+
+fn should_submit_immediately(line: &str) -> bool {
+    let trimmed = line.trim();
+    (trimmed.starts_with("/model ") || trimmed.starts_with(":model "))
+        && trimmed.split_whitespace().nth(1).is_some()
+        && !matches!(
+            trimmed.split_whitespace().nth(1),
+            Some("help" | "current" | "list")
+        )
+}
+
 pub(in crate::ai::prompt::multiline) fn move_completion_selection(
     panel: &mut Option<CompletionPanel>,
     delta: isize,
@@ -72,24 +95,41 @@ pub(in crate::ai::prompt::multiline) fn confirm_completion_selection(
     textarea: &mut TextArea<'_>,
     pending: &mut Option<PendingTabCompletion>,
     completion_panel: &mut Option<CompletionPanel>,
-) -> Option<String> {
+) -> CompletionConfirmResult {
     let Some((row, token_start, col)) = pending
         .as_ref()
         .map(|ctx| (ctx.row, ctx.token_start, ctx.col))
     else {
         *completion_panel = None;
-        return None;
+        return CompletionConfirmResult {
+            status: None,
+            submit: None,
+        };
     };
     let Some(panel) = completion_panel.as_ref() else {
-        return None;
+        return CompletionConfirmResult {
+            status: None,
+            submit: None,
+        };
     };
     let Some(selected) = panel.items.get(panel.selected_index).cloned() else {
-        return None;
+        return CompletionConfirmResult {
+            status: None,
+            submit: None,
+        };
     };
-    replace_current_line_range(textarea, row, token_start, col, &selected);
+    replace_current_line_range(textarea, row, token_start, col, &selected.replacement);
     *pending = None;
     *completion_panel = None;
-    Some(format!("已选择 {}", selected))
+    let final_line = textarea
+        .lines()
+        .get(row)
+        .cloned()
+        .unwrap_or_else(String::new);
+    CompletionConfirmResult {
+        status: Some(format!("已选择 {}", selected.replacement)),
+        submit: should_submit_immediately(&final_line).then_some(final_line),
+    }
 }
 
 pub(in crate::ai::prompt::multiline) fn dismiss_completion_panel(
@@ -122,15 +162,15 @@ pub(in crate::ai::prompt::multiline) fn apply_multiline_completion(
             ctx.row,
             ctx.token_start,
             ctx.col,
-            &ctx.candidates[0],
+            &ctx.candidates[0].replacement,
         );
         *pending = None;
         *completion_panel = None;
-        return Some(format!("已补全为 {}", ctx.candidates[0]));
+        return Some(format!("已补全为 {}", ctx.candidates[0].replacement));
     }
 
     let repeated_tab = pending.as_ref() == Some(&ctx);
-    if !repeated_tab {
+    if !repeated_tab && !should_open_popup_on_first_tab(&ctx) {
         *pending = Some(ctx.clone());
         *completion_panel = None;
         return None;
@@ -178,8 +218,32 @@ mod tests {
         assert!(pending.is_some());
         assert!(status.contains("发现 2 个候选"));
         let items = panel.as_ref().map(|panel| panel.items.clone()).unwrap();
-        assert!(items.contains(&"/agent".to_string()));
-        assert!(items.contains(&"/agents".to_string()));
+        assert!(items.iter().any(|item| item.replacement == "/agent"));
+        assert!(items.iter().any(|item| item.replacement == "/agents"));
+    }
+
+    #[test]
+    fn model_completion_opens_popup_on_first_tab() {
+        let current = crate::ai::model_names::all()
+            .first()
+            .expect("models.json is empty")
+            .name
+            .clone();
+        CommandCompleter::set_current_model_hint(&current);
+
+        let mut textarea = TextArea::new(vec!["/model".to_string()]);
+        textarea.move_cursor(CursorMove::End);
+        let mut pending = None;
+        let mut panel = None;
+
+        let status = apply_multiline_completion(&mut textarea, &mut pending, &mut panel).unwrap();
+
+        assert!(status.contains("发现"));
+        let panel = panel.expect("panel should open on first tab");
+        assert!(!panel.items.is_empty());
+        assert_eq!(panel.selected_index, 0);
+        assert_eq!(panel.items[0].replacement, format!("/model {current}"));
+        assert!(panel.items[0].display.contains("current"));
     }
 
     #[test]
@@ -194,14 +258,27 @@ mod tests {
 
         assert!(status.contains("发现"));
         let items = panel.as_ref().map(|panel| panel.items.clone()).unwrap();
-        assert!(items.contains(&"help".to_string()));
-        assert!(items.contains(&"auto".to_string()));
+        assert!(items.iter().any(|item| item.replacement == "help"));
+        assert!(items.iter().any(|item| item.replacement == "auto"));
     }
 
     #[test]
     fn completion_panel_selection_moves_with_arrow_navigation() {
         let mut panel = Some(CompletionPanel {
-            items: vec!["/agents".to_string(), "/agent".to_string(), "/help".to_string()],
+            items: vec![
+                CompletionCandidate {
+                    display: "/agents".to_string(),
+                    replacement: "/agents".to_string(),
+                },
+                CompletionCandidate {
+                    display: "/agent".to_string(),
+                    replacement: "/agent".to_string(),
+                },
+                CompletionCandidate {
+                    display: "/help".to_string(),
+                    replacement: "/help".to_string(),
+                },
+            ],
             selected_index: 0,
         });
 
@@ -226,13 +303,34 @@ mod tests {
         let _ = apply_multiline_completion(&mut textarea, &mut pending, &mut panel);
         move_completion_selection(&mut panel, 1);
 
-        let status =
-            confirm_completion_selection(&mut textarea, &mut pending, &mut panel).unwrap();
+        let result = confirm_completion_selection(&mut textarea, &mut pending, &mut panel);
 
         assert_eq!(textarea.lines(), vec!["/agent"]);
         assert!(pending.is_none());
         assert!(panel.is_none());
-        assert!(status.contains("已选择 /agent"));
+        assert_eq!(result.submit, None);
+        assert_eq!(result.status.as_deref(), Some("已选择 /agent"));
+    }
+
+    #[test]
+    fn model_panel_confirmation_submits_immediately() {
+        let current = crate::ai::model_names::all()
+            .first()
+            .expect("models.json is empty")
+            .name
+            .clone();
+        CommandCompleter::set_current_model_hint(&current);
+
+        let mut textarea = TextArea::new(vec!["/model".to_string()]);
+        textarea.move_cursor(CursorMove::End);
+        let mut pending = None;
+        let mut panel = None;
+        let _ = apply_multiline_completion(&mut textarea, &mut pending, &mut panel);
+
+        let result = confirm_completion_selection(&mut textarea, &mut pending, &mut panel);
+
+        assert_eq!(result.submit, Some(format!("/model {current}")));
+        assert_eq!(textarea.lines(), vec![format!("/model {current}")]);
     }
 
     #[test]
@@ -275,7 +373,11 @@ mod tests {
         let status = apply_multiline_completion(&mut textarea, &mut pending, &mut panel).unwrap();
         assert!(status.contains("发现"));
         let items = panel.as_ref().map(|panel| panel.items.clone()).unwrap();
-        assert!(items.contains(&format!("@{}", image.display())));
-        assert!(items.contains(&format!("@{}", other.display())));
+        assert!(items
+            .iter()
+            .any(|item| item.replacement == format!("@{}", image.display())));
+        assert!(items
+            .iter()
+            .any(|item| item.replacement == format!("@{}", other.display())));
     }
 }

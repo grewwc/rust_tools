@@ -1,4 +1,9 @@
-use std::{cmp::Ordering, fs, path::PathBuf};
+use std::{
+    cmp::Ordering,
+    fs,
+    path::PathBuf,
+    sync::{LazyLock, RwLock},
+};
 
 use rustyline::{
     Context, Editor, Helper,
@@ -13,10 +18,32 @@ use crate::commonw::utils::expanduser;
 
 pub(super) type LineEditor = Editor<CommandCompleter, DefaultHistory>;
 
+static CURRENT_MODEL_HINT: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new(String::new()));
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::ai) struct CompletionCandidate {
+    pub(in crate::ai) display: String,
+    pub(in crate::ai) replacement: String,
+}
+
 #[derive(Clone, Default)]
-pub(super) struct CommandCompleter;
+pub(in crate::ai) struct CommandCompleter;
 
 impl CommandCompleter {
+    pub(in crate::ai) fn set_current_model_hint(model: &str) {
+        if let Ok(mut guard) = CURRENT_MODEL_HINT.write() {
+            *guard = model.trim().to_string();
+        }
+    }
+
+    fn current_model_hint() -> Option<String> {
+        CURRENT_MODEL_HINT
+            .read()
+            .ok()
+            .map(|guard| guard.trim().to_string())
+            .filter(|model| !model.is_empty())
+    }
+
     fn top_level_commands() -> &'static [&'static str] {
         &[
             "/help",
@@ -29,6 +56,8 @@ impl CommandCompleter {
             ":feishu-auth",
             "/share",
             ":share",
+            "/model",
+            ":model",
             "/agents",
             ":agents",
             "/agent",
@@ -36,6 +65,91 @@ impl CommandCompleter {
             "/sessions",
             ":sessions",
         ]
+    }
+
+    fn is_model_command(token: &str) -> bool {
+        matches!(token, "/model" | ":model")
+    }
+
+    fn plain_candidates(values: impl IntoIterator<Item = String>) -> Vec<CompletionCandidate> {
+        values
+            .into_iter()
+            .map(|value| CompletionCandidate {
+                display: value.clone(),
+                replacement: value,
+            })
+            .collect()
+    }
+
+    fn ordered_model_names() -> Vec<String> {
+        let current = Self::current_model_hint().map(|m| m.to_lowercase());
+        let mut current_first = Vec::new();
+        let mut rest = Vec::new();
+        for model in crate::ai::model_names::all() {
+            let name = model.name.clone();
+            if current.as_deref() == Some(&name.to_lowercase()) {
+                current_first.push(name);
+            } else {
+                rest.push(name);
+            }
+        }
+        current_first.extend(rest);
+        current_first
+    }
+
+    fn model_candidate_detail(model: &crate::ai::model_names::ModelDef) -> String {
+        let mut flags = Vec::new();
+        if model.enable_thinking {
+            flags.push("thinking");
+        }
+        if model.tools_default_enabled {
+            flags.push("tools");
+        }
+        if model.is_vl {
+            flags.push("vl");
+        }
+        let flags = if flags.is_empty() {
+            "plain".to_string()
+        } else {
+            flags.join("/")
+        };
+        format!("{} · {:?} · {}", model.name, model.provider, flags)
+    }
+
+    fn model_command_candidates(prefix: &str) -> Vec<CompletionCandidate> {
+        let current = Self::current_model_hint().map(|m| m.to_lowercase());
+        let mut candidates = Vec::new();
+        for model in crate::ai::model_names::all() {
+            let display = if current.as_deref() == Some(&model.name.to_lowercase()) {
+                format!("{} · current", Self::model_candidate_detail(model))
+            } else {
+                Self::model_candidate_detail(model)
+            };
+            candidates.push(CompletionCandidate {
+                display,
+                replacement: format!("{prefix} {}", model.name),
+            });
+        }
+        candidates
+    }
+
+    fn model_name_candidates() -> Vec<CompletionCandidate> {
+        let current = Self::current_model_hint().map(|m| m.to_lowercase());
+        let mut candidates = Vec::new();
+        for name in Self::ordered_model_names() {
+            let model = crate::ai::model_names::find_by_name(&name)
+                .expect("ordered model name must exist");
+            let display = if current.as_deref() == Some(&name.to_lowercase()) {
+                format!("{} · current", Self::model_candidate_detail(model))
+            } else {
+                Self::model_candidate_detail(model)
+            };
+            candidates.push(CompletionCandidate {
+                display,
+                replacement: name,
+            });
+        }
+        candidates
     }
 
     fn agent_subcommands() -> &'static [&'static str] {
@@ -73,7 +187,7 @@ impl CommandCompleter {
         ]
     }
 
-    pub(super) fn complete_for_line(line: &str, pos: usize) -> (usize, Vec<String>) {
+    pub(super) fn complete_for_line(line: &str, pos: usize) -> (usize, Vec<CompletionCandidate>) {
         let pos = pos.min(line.len());
         let before = &line[..pos];
         if let Some((token_start, candidates)) = Self::complete_file_reference(before) {
@@ -88,34 +202,47 @@ impl CommandCompleter {
             return (pos, Vec::new());
         }
 
+        if token_start == 0 && Self::is_model_command(token) {
+            return (0, Self::model_command_candidates(token));
+        }
+
         let candidates = if token_start == 0 {
-            Self::top_level_commands()
-                .iter()
-                .filter(|candidate| candidate.starts_with(token))
-                .map(|candidate| (*candidate).to_string())
-                .collect()
+            Self::plain_candidates(
+                Self::top_level_commands()
+                    .iter()
+                    .filter(|candidate| candidate.starts_with(token))
+                    .map(|candidate| (*candidate).to_string()),
+            )
         } else {
             let mut words = before[..token_start].split_whitespace();
             let Some(first) = words.next() else {
                 return (token_start, Vec::new());
             };
-            let source = match first {
-                "/agents" | ":agents" | "/agent" | ":agent" => Self::agent_subcommands(),
-                "/sessions" | ":sessions" => Self::session_subcommands(),
-                "/history" | ":history" => Self::history_subcommands(),
-                _ => &[],
-            };
-            source
-                .iter()
-                .filter(|candidate| candidate.starts_with(token))
-                .map(|candidate| (*candidate).to_string())
-                .collect()
+            if Self::is_model_command(first) {
+                Self::model_name_candidates()
+                    .into_iter()
+                    .filter(|candidate| candidate.replacement.starts_with(token))
+                    .collect()
+            } else {
+                let source = match first {
+                    "/agents" | ":agents" | "/agent" | ":agent" => Self::agent_subcommands(),
+                    "/sessions" | ":sessions" => Self::session_subcommands(),
+                    "/history" | ":history" => Self::history_subcommands(),
+                    _ => &[],
+                };
+                Self::plain_candidates(
+                    source
+                        .iter()
+                        .filter(|candidate| candidate.starts_with(token))
+                        .map(|candidate| (*candidate).to_string()),
+                )
+            }
         };
 
         (token_start, candidates)
     }
 
-    fn complete_file_reference(before: &str) -> Option<(usize, Vec<String>)> {
+    fn complete_file_reference(before: &str) -> Option<(usize, Vec<CompletionCandidate>)> {
         let (token_start, raw_token, quote) = find_file_reference_token(before)?;
         let fragment = raw_token.strip_prefix('@')?;
         let fragment = if let Some(quote) = quote {
@@ -123,7 +250,7 @@ impl CommandCompleter {
         } else {
             fragment
         };
-        let candidates = complete_path_fragment(fragment, quote);
+        let candidates = Self::plain_candidates(complete_path_fragment(fragment, quote));
         Some((token_start, candidates))
     }
 }
@@ -361,8 +488,8 @@ impl Completer for CommandCompleter {
         let candidates = candidates
             .into_iter()
             .map(|candidate| Pair {
-                display: candidate.clone(),
-                replacement: candidate,
+                display: candidate.display,
+                replacement: candidate.replacement,
             })
             .collect();
         Ok((token_start, candidates))
@@ -430,6 +557,55 @@ mod tests {
     }
 
     #[test]
+    fn model_command_completion_lists_full_command_candidates() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let model = crate::ai::model_names::all()
+            .first()
+            .expect("models.json is empty")
+            .name
+            .clone();
+
+        let (_, pairs) = completer
+            .complete("/model", 6, &Context::new(&history))
+            .unwrap();
+
+        assert!(pairs
+            .iter()
+            .any(|pair| pair.replacement == format!("/model {model}")));
+    }
+
+    #[test]
+    fn model_command_completion_prefers_current_model_first() {
+        let current = crate::ai::model_names::all()
+            .first()
+            .expect("models.json is empty")
+            .name
+            .clone();
+        CommandCompleter::set_current_model_hint(&current);
+
+        let (_, candidates) = CommandCompleter::complete_for_line("/model ", 7);
+
+        let first = candidates.first().expect("model candidates should not be empty");
+        assert_eq!(first.replacement, current);
+        assert!(first.display.contains("current"));
+    }
+
+    #[test]
+    fn direct_model_completion_lists_models() {
+        let current = crate::ai::model_names::all()
+            .first()
+            .expect("models.json is empty")
+            .name
+            .clone();
+        CommandCompleter::set_current_model_hint(&current);
+
+        let (_, candidates) = CommandCompleter::complete_for_line("/model ", 7);
+
+        assert_eq!(candidates.first().map(|c| c.replacement.as_str()), Some(current.as_str()));
+    }
+
+    #[test]
     fn file_completion_suggests_absolute_image_path() {
         let dir = std::env::temp_dir().join(format!("ai-complete-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -440,7 +616,9 @@ mod tests {
         let (start, candidates) = CommandCompleter::complete_for_line(&line, line.len());
 
         assert_eq!(start, 0);
-        assert!(candidates.iter().any(|candidate| candidate == &format!("@{}", image.display())));
+        assert!(candidates
+            .iter()
+            .any(|candidate| candidate.replacement == format!("@{}", image.display())));
     }
 
     #[test]
@@ -454,7 +632,7 @@ mod tests {
         let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
 
         assert!(candidates.iter().any(|candidate| {
-            candidate == &format!("@\"{}\"", image.display())
+            candidate.replacement == format!("@\"{}\"", image.display())
         }));
     }
 

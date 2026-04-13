@@ -108,7 +108,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                             Style::default().fg(Color::DarkGray)
                         },
                     ),
-                    Span::styled(item, style),
+                    Span::styled(&item.display, style),
                 ])
             })
             .collect();

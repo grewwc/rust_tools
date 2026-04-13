@@ -477,6 +477,13 @@ fn execute_tool_calls_inner(
 
     let mut idx = 0usize;
     while idx < tool_calls.len() {
+        if crate::ai::tools::registry::common::is_tool_cancel_requested() {
+            for deferred in &tool_calls[idx..] {
+                println!("\n[Deferred] {}", deferred.function.name.yellow());
+            }
+            break;
+        }
+
         let batch_len = parallel_task_batch_len(mcp_client, tool_calls, idx);
         if batch_len > 1 {
             let batch = &tool_calls[idx..idx + batch_len];
@@ -494,6 +501,16 @@ fn execute_tool_calls_inner(
                 print_run_status(tool_call, &run_result);
                 tool_results.push(run_result.tool_result);
                 if should_barrier {
+                    for deferred in &tool_calls[idx + batch_len..] {
+                        println!("\n[Deferred] {}", deferred.function.name.yellow());
+                    }
+                    return Ok(ExecuteToolCallsResult {
+                        executed_tool_calls,
+                        tool_results,
+                        cached_hits,
+                    });
+                }
+                if crate::ai::tools::registry::common::is_tool_cancel_requested() {
                     for deferred in &tool_calls[idx + batch_len..] {
                         println!("\n[Deferred] {}", deferred.function.name.yellow());
                     }
@@ -525,6 +542,13 @@ fn execute_tool_calls_inner(
         tool_results.push(run_result.tool_result);
 
         if should_barrier && !is_last {
+            for deferred in &tool_calls[idx + 1..] {
+                println!("\n[Deferred] {}", deferred.function.name.yellow());
+            }
+            break;
+        }
+
+        if crate::ai::tools::registry::common::is_tool_cancel_requested() {
             for deferred in &tool_calls[idx + 1..] {
                 println!("\n[Deferred] {}", deferred.function.name.yellow());
             }

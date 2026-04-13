@@ -89,14 +89,14 @@ mod tests {
 
     #[test]
     fn test_fallback_query_concept() {
-        let intent = detect_intent_fallback("Rust 的所有权是什么？");
+        let intent = detect_intent_fallback("什么是 trait object");
         assert_eq!(intent.core, CoreIntent::QueryConcept);
         assert!(!intent.modifiers.is_search_query);
     }
 
     #[test]
     fn test_fallback_request_action() {
-        let intent = detect_intent_fallback("帮我审查这段代码");
+        let intent = detect_intent_fallback("帮我添加错误处理");
         assert_eq!(intent.core, CoreIntent::RequestAction);
         assert!(!intent.modifiers.is_search_query);
     }
@@ -118,9 +118,8 @@ mod tests {
 
     #[test]
     fn test_fallback_search_tool() {
-        // "有什么" 触发搜索查询，核心意图为 Casual（因为没有明确的概念询问词）
         let intent = detect_intent_fallback("有什么工具可以调试？");
-        assert_eq!(intent.core, CoreIntent::Casual);
+        assert_eq!(intent.core, CoreIntent::RequestAction);
         assert!(intent.modifiers.is_search_query);
         assert_eq!(intent.modifiers.target_resource, Some("tool".to_string()));
     }

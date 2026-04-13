@@ -245,6 +245,7 @@ pub(super) fn print_help() {
     println!("Interactive Commands (use in REPL mode):");
     println!("  General:");
     println!("    /help, /h                 show this help message");
+    println!("    /model [name]             list or switch models");
     println!("    /feishu-auth              authenticate with Feishu");
     println!("    /share [output.md]        export current session as shareable markdown");
     println!();

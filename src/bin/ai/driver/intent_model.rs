@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::intent_recognition::{CoreIntent, IntentModifiers, UserIntent};
 
-const DEFAULT_INTENT_MODEL_RELATIVE_PATH: &str = "config/intent/intent_model.json";
+const DEFAULT_INTENT_MODEL_RELATIVE_PATH: &str = "src/bin/ai/config/intent/intent_model.json";
 
 static INTENT_MODEL_CACHE: LazyLock<Mutex<FastMap<PathBuf, Arc<IntentModelFile>>>> =
     LazyLock::new(|| Mutex::new(FastMap::default()));
@@ -71,7 +71,10 @@ pub(crate) fn detect_intent(input: &str, model_path: Option<&Path>) -> UserInten
     };
 
     let modifiers = detect_modifiers(&normalized, &model.runtime_rules);
-    let core = predict_core_intent(&normalized, &model);
+    let mut core = predict_core_intent(&normalized, &model);
+    if modifiers.is_search_query && core == CoreIntent::Casual {
+        core = CoreIntent::RequestAction;
+    }
     UserIntent { core, modifiers }
 }
 

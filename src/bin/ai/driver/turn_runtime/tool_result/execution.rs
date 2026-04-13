@@ -371,6 +371,7 @@ mod tests {
                 history_summary_max_chars: 0,
                 intent_model: None,
                 intent_model_path: PathBuf::new(),
+                agent_route_model_path: PathBuf::new(),
             },
             session_id: "test".to_string(),
             session_history_file: PathBuf::new(),

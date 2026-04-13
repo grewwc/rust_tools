@@ -721,7 +721,9 @@ mod tests {
                 history_summary_max_chars: 4000,
                 intent_model: None,
                 intent_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("config/intent/intent_model.json"),
+                    .join("src/bin/ai/config/intent/intent_model.json"),
+                agent_route_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/bin/ai/config/agent_route/agent_route_model.json"),
             },
             session_id: String::new(),
             session_history_file: PathBuf::new(),
@@ -1050,6 +1052,7 @@ mod tests {
 
 fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
     if let Some(editor) = app.prompt_editor.as_mut() {
+        crate::ai::prompt::completion::CommandCompleter::set_current_model_hint(&app.current_model);
         return editor.read_multi_line();
     }
 
