@@ -111,7 +111,7 @@ mod tests {
         let normalized = normalize_title_for_display(broken);
         assert_eq!(
             normalized,
-            "1. 第一条：https://example.com/abc\n2. 第二条：https://example.com/defghi\n3. 第三条：https://example.com/xyz"
+            "1. 第一条：https://example.com/abc\n2. 第二条：https://example.com/def\nghi\n3. 第三条：https://example.com/xyz"
         );
     }
 

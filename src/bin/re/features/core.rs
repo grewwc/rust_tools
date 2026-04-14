@@ -10,8 +10,6 @@ use rust_tools::commonw::prompt;
 use rust_tools::commonw::types::{FastMap, FastSet};
 use crate::memo::{MemoBackend, MemoBackendMode, MemoMongo, MemoRecord, MemoTag, history};
 
-pub static NUMBERED_ITEM_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^\d+\.\s").expect("invalid numbered item regex"));
 pub static WRAPPED_NUMBERED_ITEM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?P<head>.*?)[ ]{2,}(?P<tail>\d+\.\s.*)$")
         .expect("invalid wrapped numbered item regex")
@@ -856,15 +854,6 @@ pub fn normalize_title_for_display(title: &str) -> String {
             merged.push(String::new());
             continue;
         }
-        let is_numbered_item = NUMBERED_ITEM_RE.is_match(&line);
-        if !is_numbered_item
-            && let Some(prev) = merged.last_mut()
-            && (prev.contains("https://") || prev.contains("http://"))
-            && looks_like_url_continuation_fragment(&line)
-        {
-            prev.push_str(&line);
-            continue;
-        }
         merged.push(line);
     }
 
@@ -873,57 +862,6 @@ pub fn normalize_title_for_display(title: &str) -> String {
     } else {
         merged.join("\n")
     }
-}
-
-pub fn looks_like_url_continuation_fragment(line: &str) -> bool {
-    let line = line.trim();
-    if line.is_empty() {
-        return false;
-    }
-    if line.contains("http://") || line.contains("https://") {
-        return false;
-    }
-    if line.contains('：') {
-        return false;
-    }
-    if line.starts_with('~') || line.starts_with('-') {
-        return false;
-    }
-    if let Some(idx) = line.find(':')
-        && idx <= 24
-    {
-        return false;
-    }
-    if line.chars().any(|ch| ch.is_whitespace()) {
-        return false;
-    }
-    line.chars().all(|ch| {
-        ch.is_ascii_alphanumeric()
-            || matches!(
-                ch,
-                '/' | '?'
-                    | '#'
-                    | '['
-                    | ']'
-                    | '@'
-                    | '!'
-                    | '$'
-                    | '&'
-                    | '\''
-                    | '('
-                    | ')'
-                    | '*'
-                    | '+'
-                    | ','
-                    | ';'
-                    | '='
-                    | '%'
-                    | '-'
-                    | '.'
-                    | '_'
-                    | '~'
-            )
-    })
 }
 
 pub fn split_wrapped_numbered_line(line: &str, out: &mut Vec<String>) {
