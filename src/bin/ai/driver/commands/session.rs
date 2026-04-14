@@ -38,6 +38,7 @@ pub fn try_handle_session_command(
             println!("  /sessions new             create and switch to new session");
             println!("  /sessions use <id>        switch to specified session");
             println!("  /sessions delete <id>     delete specified session");
+            println!("  /sessions clear-history   clear current session history (keeps session alive)");
             println!("  /sessions clear-all       delete all sessions");
             println!("  /sessions export <id> [output.md]       export session to Markdown");
             println!("  /sessions export-current [output.md]    export current session to Markdown");
@@ -179,6 +180,24 @@ pub fn try_handle_session_command(
                     eprintln!("Failed to export session: {}", err);
                 }
             }
+        }
+        "clear-history" | "clear_history" | "ch" => {
+            let confirm = crate::commonw::prompt::prompt_yes_or_no_interruptible(
+                "Clear current session history? (y/n): ",
+            );
+            if confirm != Some(true) {
+                println!("canceled by user.");
+                return Ok(true);
+            }
+
+            store.clear_session_history(&app.session_id)?;
+            if let Some(ctx) = app.agent_context.as_mut() {
+                ctx.tools.clear();
+            }
+            println!(
+                "Cleared history for session: {} (session preserved)",
+                app.session_id
+            );
         }
         "clear-all" | "clear_all" | "clear" | "wipe" => {
             let confirm = crate::commonw::prompt::prompt_yes_or_no_interruptible(

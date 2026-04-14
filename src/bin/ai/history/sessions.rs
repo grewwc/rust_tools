@@ -112,6 +112,16 @@ impl SessionStore {
         Ok(())
     }
 
+    pub(in crate::ai) fn clear_session_history(&self, session_id: &str) -> io::Result<()> {
+        let path = self.session_history_file(session_id);
+        if path.exists() {
+            super::sqlite::clear_session_history_sqlite(&path)?;
+        }
+        let assets = self.session_assets_dir(session_id);
+        let _ = delete_assets_dir(&assets);
+        Ok(())
+    }
+
     pub(in crate::ai) fn clear_all_sessions(&self) -> io::Result<usize> {
         let sessions = self.list_sessions()?;
         let mut deleted = 0usize;

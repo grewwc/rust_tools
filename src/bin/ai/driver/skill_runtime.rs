@@ -365,6 +365,99 @@ fn mcp_tools_for_skill(
         .collect()
 }
 
+struct CapabilityEntry {
+    trigger: &'static str,
+    tools: &'static [&'static str],
+    hint: &'static str,
+}
+
+const CAPABILITY_CATALOG: &[CapabilityEntry] = &[
+    CapabilityEntry {
+        trigger: "remember, memorize, save, store, 记住, 记忆, 保存",
+        tools: &["memory_save"],
+        hint: "Do NOT just acknowledge — actually call memory_save so the information persists.",
+    },
+    CapabilityEntry {
+        trigger: "recall, search memory, 回忆, 查找记忆",
+        tools: &["memory_search", "memory_recent"],
+        hint: "",
+    },
+    CapabilityEntry {
+        trigger: "knowledge, decisions, preferences, 知识库, 决策, 偏好",
+        tools: &["knowledge_search", "knowledge_list"],
+        hint: "",
+    },
+    CapabilityEntry {
+        trigger: "semantic search, vector search, 语义搜索",
+        tools: &["knowledge_semantic_search"],
+        hint: "",
+    },
+    CapabilityEntry {
+        trigger: "web, real-time, URL, 实时, 网页, 链接",
+        tools: &["web_search", "web_fetch"],
+        hint: "",
+    },
+    CapabilityEntry {
+        trigger: "git status, git diff",
+        tools: &["git_status", "git_diff"],
+        hint: "",
+    },
+    CapabilityEntry {
+        trigger: "cargo check, cargo test, 编译, 测试",
+        tools: &["cargo_check", "cargo_test"],
+        hint: "",
+    },
+    CapabilityEntry {
+        trigger: "undo, redo, 撤销, 重做",
+        tools: &["undo", "redo"],
+        hint: "",
+    },
+    CapabilityEntry {
+        trigger: "compact context, 压缩上下文",
+        tools: &["compact_context"],
+        hint: "",
+    },
+    CapabilityEntry {
+        trigger: "list directory, 列出目录",
+        tools: &["list_directory"],
+        hint: "",
+    },
+];
+
+fn build_capability_catalog(available_tools: &Box<SkipSet<String>>) -> Option<String> {
+    let mut lines = Vec::new();
+    for entry in CAPABILITY_CATALOG {
+        let missing: Vec<String> = entry
+            .tools
+            .iter()
+            .filter(|name| !available_tools.contains_str(name))
+            .map(|name| (*name).to_string())
+            .collect();
+        if missing.is_empty() {
+            continue;
+        }
+        let mut line = format!("- \"{}\" → enable {:?}", entry.trigger, missing);
+        if !entry.hint.is_empty() {
+            line.push_str(" — ");
+            line.push_str(entry.hint);
+        }
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "Capability catalog (not yet loaded — enable as needed):\n\
+         When the user's request matches a trigger below, call `enable_tools(operation=enable, tools=[...])` \
+         with the listed tools before proceeding.\n",
+    );
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    Some(out)
+}
+
 fn build_system_prompt(
     active_agent: Option<&AgentManifest>,
     skill: Option<&SkillManifest>,
@@ -402,6 +495,15 @@ fn build_system_prompt(
     if has_tool(available_tools, "enable_tools") {
         system_prompt.push_str("\n\n");
         system_prompt.push_str("Tool discovery policy:\n- Do NOT assume all tools are already loaded.\n- If a capability is missing, call `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.");
+        if let Some(catalog) = build_capability_catalog(available_tools) {
+            system_prompt.push_str("\n\n");
+            system_prompt.push_str(&catalog);
+        }
+    }
+
+    if has_tool(available_tools, "memory_save") {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str("Memory tool usage:\n- When the user asks you to remember, memorize, save, or store something, call `memory_save` with the content.\n- Do NOT skip the save step or just acknowledge — actually call `memory_save` so the information persists.\n- When the user asks to recall or search saved memory, call `memory_search` or `memory_recent`.");
     }
 
     if has_tool(available_tools, "discover_skills") {

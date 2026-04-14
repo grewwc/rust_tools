@@ -310,6 +310,20 @@ pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
     Ok(None)
 }
 
+pub(in crate::ai) fn clear_session_history_sqlite(path: &Path) -> io::Result<()> {
+    let conn = match open_history_db(path) {
+        Ok(c) => c,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    init_history_schema(&conn)?;
+    conn.execute("DELETE FROM messages", [])
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    conn.execute("DELETE FROM meta", [])
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(())
+}
+
 pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
     let meta: Option<String> = conn
