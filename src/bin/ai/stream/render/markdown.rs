@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 
+use crate::ai::stream::extract::strip_ansi_codes;
 use crate::ai::theme::{
     ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS,
 };
@@ -29,6 +30,7 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     line_preview_height: usize,
     table_state: TableState,
     dimmed: bool,
+    code_preview_segment_width: usize,
 }
 
 impl MarkdownStreamRenderer {
@@ -52,6 +54,7 @@ impl MarkdownStreamRenderer {
             line_preview_height: 0,
             table_state: TableState::None,
             dimmed: false,
+            code_preview_segment_width: 0,
         }
     }
 
@@ -63,21 +66,41 @@ impl MarkdownStreamRenderer {
         true
     }
 
-    pub(in crate::ai::stream) fn write_chunk(&mut self, chunk: &str, dimmed: bool) -> io::Result<()> {
-        self.dimmed = dimmed;
+    pub(in crate::ai::stream) fn write_chunk(
+        &mut self,
+        chunk: &str,
+        dimmed: bool,
+    ) -> io::Result<()> {
         let mut out = io::stdout();
+        self.write_chunk_to(&mut out, chunk, dimmed)
+    }
+
+    fn write_chunk_to(
+        &mut self,
+        out: &mut dyn Write,
+        chunk: &str,
+        dimmed: bool,
+    ) -> io::Result<()> {
+        self.dimmed = dimmed;
         for ch in chunk.chars() {
             if ch == '\n' {
-                self.handle_newline(&mut out)?;
+                self.handle_newline(out)?;
                 continue;
             }
 
             self.line_buf.push(ch);
-            self.handle_char(&mut out, ch)?;
+            self.handle_char(out, ch)?;
             self.bol = false;
         }
         out.flush()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn write_chunk_for_test(&mut self, chunk: &str, dimmed: bool) -> io::Result<String> {
+        let mut out = Vec::new();
+        self.write_chunk_to(&mut out, chunk, dimmed)?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
     pub(in crate::ai::stream::render) fn line_preview_height(&self) -> usize {
@@ -104,9 +127,13 @@ impl MarkdownStreamRenderer {
         self.code_line_number = 0;
     }
 
-    fn handle_newline(&mut self, out: &mut std::io::Stdout) -> io::Result<()> {
+    fn handle_newline(&mut self, out: &mut dyn Write) -> io::Result<()> {
         if self.line_preview_emitted {
-            out.write_all(b"\n")?;
+            if self.in_code_block {
+                out.write_all(b"\x1b[0m\n")?;
+            } else {
+                out.write_all(b"\n")?;
+            }
             out.flush()?;
             self.bol = true;
         }
@@ -116,6 +143,7 @@ impl MarkdownStreamRenderer {
 
         self.line_preview_emitted = false;
         self.line_preview_height = 0;
+        self.code_preview_segment_width = 0;
 
         if !rendered.is_empty() {
             out.write_all(rendered.as_bytes())?;
@@ -125,7 +153,7 @@ impl MarkdownStreamRenderer {
         Ok(())
     }
 
-    fn handle_char(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
+    fn handle_char(&mut self, out: &mut dyn Write, ch: char) -> io::Result<()> {
         if self.should_emit_table_preview_live() {
             self.handle_table_preview(out, ch)
         } else {
@@ -133,7 +161,7 @@ impl MarkdownStreamRenderer {
         }
     }
 
-    fn handle_table_preview(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
+    fn handle_table_preview(&mut self, out: &mut dyn Write, ch: char) -> io::Result<()> {
         if !self.line_preview_emitted {
             if self.dimmed {
                 out.write_all(b"\x1b[2m")?;
@@ -149,7 +177,13 @@ impl MarkdownStreamRenderer {
         Ok(())
     }
 
-    fn handle_realtime_output(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
+    fn handle_realtime_output(&mut self, out: &mut dyn Write, ch: char) -> io::Result<()> {
+        if self.in_code_block {
+            self.handle_code_block_realtime_output(out, ch)?;
+            self.line_preview_emitted = true;
+            self.line_preview_height = self.current_line_preview_height();
+            return Ok(());
+        }
         if self.line_buf.chars().count() == 1 && self.dimmed {
             out.write_all(b"\x1b[2m")?;
         }
@@ -159,25 +193,53 @@ impl MarkdownStreamRenderer {
         Ok(())
     }
 
+    fn handle_code_block_realtime_output(
+        &mut self,
+        out: &mut dyn Write,
+        ch: char,
+    ) -> io::Result<()> {
+        let block_indent = self.code_block_indent.as_str();
+        let line_num_str = format!("{:>3}", self.code_line_number + 1);
+        let available_width = code_block_content_width(block_indent, &line_num_str).max(1);
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+
+        if !self.line_preview_emitted {
+            out.write_all(code_block_preview_prefix(block_indent, &line_num_str, self.dimmed).as_bytes())?;
+        } else if self.code_preview_segment_width > 0
+            && self.code_preview_segment_width + ch_width > available_width
+        {
+            out.write_all(b"\x1b[0m\n")?;
+            out.write_all(
+                code_block_preview_continuation_prefix(block_indent, self.dimmed).as_bytes(),
+            )?;
+            self.code_preview_segment_width = 0;
+        }
+
+        self.emit_char(out, ch)?;
+        self.code_preview_segment_width += ch_width;
+        Ok(())
+    }
+
     fn current_line_preview_height(&self) -> usize {
         if self.in_code_block {
             return self.code_block_preview_height(&self.line_buf);
         }
-        table_preview_height(&self.line_buf).max(1)
+        live_preview_cursor_rows(&self.line_buf)
     }
 
     fn code_block_preview_height(&self, line: &str) -> usize {
         let block_indent = self.code_block_indent.as_str();
+        let line_num_str = format!("{:>3}", self.code_line_number + 1);
         let code_text = line.strip_prefix(block_indent).unwrap_or(line);
-        let visible = if code_text.is_empty() {
-            format!("{block_indent}{:>3} │", self.code_line_number + 1)
-        } else {
-            format!("{block_indent}{:>3} │{}", self.code_line_number + 1, code_text)
-        };
-        table_preview_height(&visible).max(1)
+        wrap_code_block_text(
+            code_text,
+            code_block_content_width(block_indent, &line_num_str),
+        )
+        .len()
+        .max(1)
     }
 
-    fn emit_char(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
+    fn emit_char(&mut self, out: &mut dyn Write, ch: char) -> io::Result<()> {
         let mut buf = [0u8; 4];
         out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
         out.flush()?;
@@ -189,13 +251,18 @@ impl MarkdownStreamRenderer {
 
         if !self.line_buf.is_empty() {
             if self.line_preview_emitted {
-                out.write_all(b"\n")?;
+                if self.in_code_block {
+                    out.write_all(b"\x1b[0m\n")?;
+                } else {
+                    out.write_all(b"\n")?;
+                }
                 self.bol = true;
             }
             let line = std::mem::take(&mut self.line_buf);
             let rendered = self.consume_line(&line, self.line_preview_emitted);
             self.line_preview_emitted = false;
             self.line_preview_height = 0;
+            self.code_preview_segment_width = 0;
             if !rendered.is_empty() {
                 out.write_all(rendered.as_bytes())?;
                 self.bol = rendered.ends_with('\n');
@@ -436,11 +503,27 @@ impl MarkdownStreamRenderer {
                     line_num_str
                 );
             }
-            return format!(
-                "{block_indent}{MONOKAI_BG}{MONOKAI_DIM}{} │{base}{}\x1b[0m\n",
-                line_num_str,
-                highlight_code_line(code_text, self.code_block_lang.as_deref())
+            let wrapped = wrap_code_block_text(
+                code_text,
+                code_block_content_width(block_indent, &line_num_str),
             );
+            let mut out = String::new();
+            for (idx, segment) in wrapped.iter().enumerate() {
+                let gutter = if idx == 0 {
+                    line_num_str.as_str()
+                } else {
+                    "   "
+                };
+                out.push_str(block_indent);
+                out.push_str(MONOKAI_BG);
+                out.push_str(MONOKAI_DIM);
+                out.push_str(gutter);
+                out.push_str(" │");
+                out.push_str(base);
+                out.push_str(&highlight_code_line(segment, self.code_block_lang.as_deref()));
+                out.push_str("\x1b[0m\n");
+            }
+            return out;
         }
 
         if trimmed == "$$" || trimmed == "\\[" || trimmed == "\\]" {
@@ -534,6 +617,97 @@ impl MarkdownStreamRenderer {
     }
 }
 
+fn live_preview_cursor_rows(line: &str) -> usize {
+    let cols = preview_terminal_width().max(1);
+    let visible = strip_ansi_codes(line);
+    let width = unicode_width::UnicodeWidthStr::width(visible.as_str());
+    if width == 0 {
+        1
+    } else {
+        1 + (width / cols)
+    }
+}
+
+fn preview_terminal_width() -> usize {
+    if let Some(cols) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        && cols > 0
+    {
+        return cols;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stdout().as_raw_fd();
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) };
+        if rc == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
+        }
+    }
+
+    80
+}
+
+fn code_block_gutter_width(block_indent: &str, line_num_str: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(block_indent)
+        + unicode_width::UnicodeWidthStr::width(line_num_str)
+        + unicode_width::UnicodeWidthStr::width(" │")
+}
+
+fn code_block_content_width(block_indent: &str, line_num_str: &str) -> usize {
+    preview_terminal_width()
+        .saturating_sub(code_block_gutter_width(block_indent, line_num_str))
+        .max(1)
+}
+
+fn wrap_code_block_text(text: &str, content_width: usize) -> Vec<String> {
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for ch in text.chars() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if current_width > 0 && current_width + ch_width > content_width {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+
+    if current.is_empty() {
+        lines.push(String::new());
+    } else {
+        lines.push(current);
+    }
+    lines
+}
+
+fn code_block_preview_prefix(block_indent: &str, line_num_str: &str, dimmed: bool) -> String {
+    let mut out = String::new();
+    out.push_str(block_indent);
+    out.push_str(MONOKAI_BG);
+    out.push_str(MONOKAI_DIM);
+    out.push_str(line_num_str);
+    out.push_str(" │\x1b[0m");
+    out.push_str(MONOKAI_BG);
+    if dimmed {
+        out.push_str("\x1b[2m");
+    }
+    out
+}
+
+fn code_block_preview_continuation_prefix(block_indent: &str, dimmed: bool) -> String {
+    code_block_preview_prefix(block_indent, "   ", dimmed)
+}
+
 fn parse_heading(line: &str) -> Option<(usize, &str)> {
     let bytes = line.as_bytes();
     let mut i = 0usize;
@@ -607,6 +781,11 @@ fn split_list_prefix(line: &str) -> Option<(&str, &str, Option<bool>, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::test_support::ENV_LOCK;
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+    }
 
     fn strip_ansi_for_test(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
@@ -630,6 +809,7 @@ mod tests {
 
     #[test]
     fn consume_line_move_up_matches_preview_height() {
+        let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "6") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         renderer.set_line_preview_height(1);
@@ -640,13 +820,14 @@ mod tests {
 
     #[test]
     fn test_write_chunk_preview_height() {
+        let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "10") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
-        let _ = renderer.write_chunk("123456789012345", false);
+        let _ = renderer.write_chunk_for_test("123456789012345", false);
         let first_height = renderer.line_preview_height();
         assert!(first_height >= 1);
 
-        let _ = renderer.write_chunk("678901", false);
+        let _ = renderer.write_chunk_for_test("678901", false);
         assert!(renderer.line_preview_height() >= first_height);
     }
 
@@ -659,6 +840,8 @@ mod tests {
 
     #[test]
     fn code_block_keeps_inner_indentation_after_gutter() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "40") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         let _ = renderer.consume_line("```rust", false);
         let out = renderer.consume_line("    let x = 1;", false);
@@ -669,6 +852,8 @@ mod tests {
 
     #[test]
     fn code_block_nested_indent_is_stable() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "40") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         let _ = renderer.consume_line("  ```rust", false);
         let out = renderer.consume_line("      let x = 1;", false);
@@ -733,37 +918,88 @@ mod tests {
     fn unfinished_line_state_tracks_pending_inline_content() {
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
 
-        renderer.write_chunk("hello", false).unwrap();
+        renderer.write_chunk_for_test("hello", false).unwrap();
         assert!(renderer.has_unfinished_line());
 
-        renderer.write_chunk("\n", false).unwrap();
+        renderer.write_chunk_for_test("\n", false).unwrap();
         assert!(!renderer.has_unfinished_line());
     }
 
     #[test]
     fn html_code_block_preview_height_accounts_for_code_gutter() {
-        unsafe { std::env::set_var("COLUMNS", "20") };
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "7") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
 
         let _ = renderer.consume_line("```html", false);
-        renderer
-            .write_chunk(r#"<div class="input-area very-long-class-name">"#, false)
-            .unwrap();
+        renderer.write_chunk_for_test("<x>", false).unwrap();
 
         assert!(
-            renderer.line_preview_height()
-                > table_preview_height(r#"<div class="input-area very-long-class-name">"#),
+            renderer.line_preview_height() > live_preview_cursor_rows("<x>"),
             "code-block preview height should include the rendered line-number gutter"
         );
     }
 
     #[test]
     fn html_code_block_line_remains_visible_after_rewrite() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "16") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         let _ = renderer.consume_line("```html", false);
         let out = renderer.consume_line(r#"<div class="input-area"></div>"#, true);
 
         let visible = strip_ansi_for_test(&out);
-        assert!(visible.contains(r#"<div class="input-area"></div>"#));
+        assert!(visible.contains(r#"<div class="#), "{visible:?}");
+        assert!(visible.contains("input-area"), "{visible:?}");
+        assert!(visible.contains("</div>"), "{visible:?}");
+        assert!(
+            visible.lines().skip(1).any(|line| line.starts_with("    │")),
+            "{visible:?}"
+        );
+    }
+
+    #[test]
+    fn live_preview_cursor_rows_counts_exact_width_cjk_boundary() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "20") };
+        assert_eq!(live_preview_cursor_rows("你好你好你好你好你好"), 2);
+    }
+
+    #[test]
+    fn exact_width_cjk_preview_updates_renderer_height_to_two_rows() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "20") };
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        renderer.write_chunk_for_test("你好你好你好你好你好", true).unwrap();
+
+        assert_eq!(renderer.line_preview_height(), 2);
+    }
+
+    #[test]
+    fn code_block_long_line_wraps_with_aligned_continuation_gutter() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "12") };
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let _ = renderer.consume_line("```text", false);
+
+        let out = renderer.consume_line("abcdefghijkl", false);
+        let visible = strip_ansi_for_test(&out);
+        let lines = visible.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("  1 │"));
+        assert!(lines[1].starts_with("    │"));
+    }
+
+    #[test]
+    fn code_block_streaming_preview_wraps_before_newline() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "12") };
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let _ = renderer.consume_line("```text", false);
+
+        renderer.write_chunk_for_test("abcdefghijkl", false).unwrap();
+
+        assert_eq!(renderer.line_preview_height(), 2);
     }
 }
