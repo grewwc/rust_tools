@@ -269,7 +269,7 @@ fn handle_tools_list() -> Result<Value, JsonRpcErr> {
             },
             {
                 "name": "doc_create_from_markdown",
-                "description": "Create a new Feishu docx document from Markdown content and return the document URL. Requires user_access_token.",
+                "description": "Create a new Feishu docx document from Markdown content and return the document URL. Supports headings, lists, code blocks, tables, quotes, todo, dividers, and inline bold/italic/code. Requires user_access_token.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -379,6 +379,14 @@ fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcErr> {
         }
         "sheet_create_from_csv" => {
             let result = feishu_sheet_create_from_csv(&args)?;
+            Ok(json!({
+                "content": [
+                    { "type": "text", "text": result }
+                ]
+            }))
+        }
+        "doc_create_from_markdown" => {
+            let result = feishu_doc_create_from_markdown(&args)?;
             Ok(json!({
                 "content": [
                     { "type": "text", "text": result }
@@ -4491,6 +4499,1467 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     }
     cells.push(current_cell.trim().to_string());
     cells
+}
+
+fn make_text_element(content: &str, bold: bool, italic: bool, inline_code: bool) -> Value {
+    let mut style = json!({});
+    if bold {
+        style["bold"] = json!(true);
+    }
+    if italic {
+        style["italic"] = json!(true);
+    }
+    if inline_code {
+        style["inline_code"] = json!(true);
+    }
+    json!({
+        "text_run": {
+            "content": content,
+            "text_element_style": style
+        }
+    })
+}
+
+fn parse_inline_elements(text: &str) -> Vec<Value> {
+    let mut elements = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    let mut bold_depth = 0usize;
+    let mut italic_depth = 0usize;
+    let mut in_code = false;
+
+    while let Some(c) = chars.next() {
+        if in_code {
+            if c == '`' {
+                in_code = false;
+                if !current.is_empty() {
+                    elements.push(make_text_element(&current, false, false, true));
+                    current.clear();
+                }
+            } else {
+                current.push(c);
+            }
+            continue;
+        }
+
+        match c {
+            '`' => {
+                if !current.is_empty() {
+                    elements.push(make_text_element(
+                        &current,
+                        bold_depth > 0,
+                        italic_depth > 0,
+                        false,
+                    ));
+                    current.clear();
+                }
+                in_code = true;
+            }
+            '*' => {
+                let peeked = chars.peek();
+                if peeked == Some(&'*') {
+                    chars.next();
+                    if !current.is_empty() {
+                        elements.push(make_text_element(
+                            &current,
+                            bold_depth > 0,
+                            italic_depth > 0,
+                            false,
+                        ));
+                        current.clear();
+                    }
+                    if bold_depth > 0 {
+                        bold_depth -= 1;
+                    } else {
+                        bold_depth += 1;
+                    }
+                } else {
+                    if !current.is_empty() {
+                        elements.push(make_text_element(
+                            &current,
+                            bold_depth > 0,
+                            italic_depth > 0,
+                            false,
+                        ));
+                        current.clear();
+                    }
+                    if italic_depth > 0 {
+                        italic_depth -= 1;
+                    } else {
+                        italic_depth += 1;
+                    }
+                }
+            }
+            '_' => {
+                let next_is_underscore = chars.peek() == Some(&'_');
+                if next_is_underscore {
+                    chars.next();
+                    if !current.is_empty() {
+                        elements.push(make_text_element(
+                            &current,
+                            bold_depth > 0,
+                            italic_depth > 0,
+                            false,
+                        ));
+                        current.clear();
+                    }
+                    if bold_depth > 0 {
+                        bold_depth -= 1;
+                    } else {
+                        bold_depth += 1;
+                    }
+                } else {
+                    current.push(c);
+                }
+            }
+            _ => {
+                current.push(c);
+            }
+        }
+    }
+
+    if !current.is_empty() {
+        elements.push(make_text_element(
+            &current,
+            bold_depth > 0,
+            italic_depth > 0,
+            in_code,
+        ));
+    }
+
+    if elements.is_empty() {
+        elements.push(make_text_element("", false, false, false));
+    }
+
+    elements
+}
+
+#[derive(Clone)]
+enum BlockOp {
+    Simple(Value),
+    Descendant { children_id: Vec<String>, descendants: Vec<Value> },
+}
+
+#[derive(Clone)]
+enum MdNode {
+    Heading { level: u8, elements: Vec<Value> },
+    Paragraph { elements: Vec<Value> },
+    BulletList { items: Vec<ListItem> },
+    OrderedList { items: Vec<ListItem> },
+    CodeBlock { lang: Option<String>, content: String },
+    BlockQuote { children: Vec<MdNode> },
+    Table { rows: Vec<Vec<String>> },
+    Divider,
+    Todo { done: bool, elements: Vec<Value> },
+}
+
+#[derive(Clone)]
+struct ListItem {
+    elements: Vec<Value>,
+    children: Vec<MdNode>,
+}
+
+fn count_indent(line: &str) -> usize {
+    line.chars().take_while(|c| *c == ' ').count()
+}
+
+fn is_table_separator_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.starts_with('|') || !trimmed.ends_with('|') {
+        return false;
+    }
+    let inner = trimmed[1..trimmed.len() - 1].trim();
+    if inner.is_empty() {
+        return false;
+    }
+    inner.split('|').all(|cell| {
+        let c = cell.trim();
+        c.starts_with('-')
+            && c.ends_with('-')
+            && c.chars().all(|ch| ch == '-' || ch == ':' || ch == ' ')
+    })
+}
+
+fn parse_table_row(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let inner = if trimmed.starts_with('|') && trimmed.ends_with('|') {
+        &trimmed[1..trimmed.len() - 1]
+    } else if trimmed.starts_with('|') {
+        &trimmed[1..]
+    } else if trimmed.ends_with('|') {
+        &trimmed[..trimmed.len() - 1]
+    } else {
+        trimmed
+    };
+    inner.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+fn strip_ordered_list_prefix(s: &str) -> Option<&str> {
+    let mut chars = s.char_indices().peekable();
+    let mut found_digit = false;
+    while let Some(&(idx, c)) = chars.peek() {
+        if c.is_ascii_digit() {
+            found_digit = true;
+            chars.next();
+        } else if found_digit && c == '.' {
+            chars.next();
+            let rest = &s[idx + 1..];
+            return Some(rest.trim_start());
+        } else {
+            break;
+        }
+    }
+    None
+}
+
+fn parse_heading_node(trimmed: &str) -> Option<MdNode> {
+    let (level, rest) = if let Some(r) = trimmed.strip_prefix("###### ") {
+        (6u8, r)
+    } else if let Some(r) = trimmed.strip_prefix("##### ") {
+        (5, r)
+    } else if let Some(r) = trimmed.strip_prefix("#### ") {
+        (4, r)
+    } else if let Some(r) = trimmed.strip_prefix("### ") {
+        (3, r)
+    } else if let Some(r) = trimmed.strip_prefix("## ") {
+        (2, r)
+    } else if let Some(r) = trimmed.strip_prefix("# ") {
+        (1, r)
+    } else {
+        return None;
+    };
+    Some(MdNode::Heading {
+        level,
+        elements: parse_inline_elements(rest),
+    })
+}
+
+fn detect_list_marker(trimmed: &str) -> Option<(ListKind, &str)> {
+    if let Some(rest) = trimmed.strip_prefix("- [x] ") {
+        return Some((ListKind::Todo(true), rest));
+    }
+    if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
+        return Some((ListKind::Todo(false), rest));
+    }
+    if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        return Some((ListKind::Bullet, rest));
+    }
+    if let Some(rest) = strip_ordered_list_prefix(trimmed) {
+        return Some((ListKind::Ordered, rest));
+    }
+    None
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ListKind {
+    Bullet,
+    Ordered,
+    Todo(bool),
+}
+
+fn parse_markdown_ast(markdown: &str) -> Vec<MdNode> {
+    let lines: Vec<&str> = markdown.lines().collect();
+    let mut ctx = ParseCtx { lines: &lines, pos: 0 };
+    let mut nodes = Vec::new();
+    while ctx.pos < lines.len() {
+        if let Some(node) = parse_next_node(&mut ctx) {
+            nodes.push(node);
+        }
+    }
+    nodes
+}
+
+struct ParseCtx<'a> {
+    lines: &'a [&'a str],
+    pos: usize,
+}
+
+fn parse_next_node(ctx: &mut ParseCtx) -> Option<MdNode> {
+    while ctx.pos < ctx.lines.len() && ctx.lines[ctx.pos].trim().is_empty() {
+        ctx.pos += 1;
+    }
+    if ctx.pos >= ctx.lines.len() {
+        return None;
+    }
+
+    let line = ctx.lines[ctx.pos];
+    let trimmed = line.trim();
+
+    if trimmed.starts_with("```") {
+        return Some(parse_code_block_node(ctx));
+    }
+
+    if is_table_start_at(ctx.lines, ctx.pos) {
+        return Some(parse_table_node(ctx));
+    }
+
+    if let Some(node) = parse_heading_node(trimmed) {
+        ctx.pos += 1;
+        return Some(node);
+    }
+
+    if trimmed.starts_with('>') {
+        return Some(parse_block_quote_node(ctx));
+    }
+
+    if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+        ctx.pos += 1;
+        return Some(MdNode::Divider);
+    }
+
+    if detect_list_marker(trimmed).is_some() {
+        return Some(parse_list_node(ctx, 0));
+    }
+
+    Some(parse_paragraph_node(ctx))
+}
+
+fn parse_code_block_node(ctx: &mut ParseCtx) -> MdNode {
+    parse_code_block_node_with_indent(ctx, 0)
+}
+
+fn parse_code_block_node_with_indent(ctx: &mut ParseCtx, base_indent: usize) -> MdNode {
+    let first = ctx.lines[ctx.pos].trim();
+    let lang = first.strip_prefix("```").map(|s| s.trim().to_string());
+    let lang = lang.filter(|s| !s.is_empty());
+    ctx.pos += 1;
+
+    let mut content = String::new();
+    while ctx.pos < ctx.lines.len() {
+        let line = ctx.lines[ctx.pos];
+        if line.trim().starts_with("```") {
+            ctx.pos += 1;
+            break;
+        }
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        let code_line = if line.len() > base_indent && line.chars().take(base_indent).all(|c| c == ' ') {
+            &line[base_indent..]
+        } else {
+            line.trim_start()
+        };
+        content.push_str(code_line);
+        ctx.pos += 1;
+    }
+
+    MdNode::CodeBlock {
+        lang,
+        content: content.trim_end().to_string(),
+    }
+}
+
+fn is_table_start_at(lines: &[&str], pos: usize) -> bool {
+    let trimmed = lines[pos].trim();
+    if !trimmed.contains('|') {
+        return false;
+    }
+    if pos + 1 >= lines.len() {
+        return false;
+    }
+    is_table_separator_line(lines[pos + 1].trim())
+}
+
+fn parse_table_node(ctx: &mut ParseCtx) -> MdNode {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+
+    while ctx.pos < ctx.lines.len() {
+        let trimmed = ctx.lines[ctx.pos].trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if !trimmed.contains('|') {
+            break;
+        }
+        if is_table_separator_line(trimmed) {
+            ctx.pos += 1;
+            continue;
+        }
+        rows.push(parse_table_row(trimmed));
+        ctx.pos += 1;
+    }
+
+    MdNode::Table { rows }
+}
+
+fn parse_block_quote_node(ctx: &mut ParseCtx) -> MdNode {
+    let mut inner_lines: Vec<String> = Vec::new();
+
+    while ctx.pos < ctx.lines.len() {
+        let line = ctx.lines[ctx.pos];
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            let mut j = ctx.pos + 1;
+            while j < ctx.lines.len() && ctx.lines[j].trim().is_empty() {
+                j += 1;
+            }
+            if j >= ctx.lines.len() || !ctx.lines[j].trim().starts_with('>') {
+                break;
+            }
+            inner_lines.push(String::new());
+            ctx.pos += 1;
+            continue;
+        }
+        if !trimmed.starts_with('>') {
+            break;
+        }
+        let content = if trimmed == ">" {
+            String::new()
+        } else if let Some(rest) = trimmed.strip_prefix("> ") {
+            rest.to_string()
+        } else {
+            trimmed[1..].to_string()
+        };
+        inner_lines.push(content);
+        ctx.pos += 1;
+    }
+
+    let inner_text = inner_lines.join("\n");
+    let children = parse_markdown_ast(&inner_text);
+
+    MdNode::BlockQuote { children }
+}
+
+fn parse_list_node(ctx: &mut ParseCtx, base_indent: usize) -> MdNode {
+    let first_trimmed = ctx.lines[ctx.pos].trim_start();
+    let (first_kind, first_rest) = detect_list_marker(first_trimmed)
+        .expect("parse_list_node called on non-list line");
+
+    let mut items: Vec<ListItem> = Vec::new();
+    items.push(ListItem {
+        elements: parse_inline_elements(first_rest),
+        children: Vec::new(),
+    });
+    ctx.pos += 1;
+
+
+    while ctx.pos < ctx.lines.len() {
+        let line = ctx.lines[ctx.pos];
+        if line.trim().is_empty() {
+            let mut j = ctx.pos + 1;
+            while j < ctx.lines.len() && ctx.lines[j].trim().is_empty() {
+                j += 1;
+            }
+            if j >= ctx.lines.len() {
+                break;
+            }
+            let next_indent = count_indent(ctx.lines[j]);
+            let next_trimmed = ctx.lines[j].trim_start();
+            if next_indent < base_indent {
+                break;
+            }
+            if next_indent == base_indent && detect_list_marker(next_trimmed).is_none() {
+                break;
+            }
+            ctx.pos += 1;
+            continue;
+        }
+
+        let indent = count_indent(line);
+        let trimmed = line.trim_start();
+
+        if indent < base_indent {
+            break;
+        }
+
+        if indent == base_indent {
+            if let Some((kind, rest)) = detect_list_marker(trimmed) {
+                let same_type = match (&first_kind, &kind) {
+                    (ListKind::Bullet, ListKind::Bullet) => true,
+                    (ListKind::Ordered, ListKind::Ordered) => true,
+                    (ListKind::Todo(_), ListKind::Todo(_)) => true,
+                    _ => false,
+                };
+                if !same_type {
+                    break;
+                }
+                items.push(ListItem {
+                    elements: parse_inline_elements(rest),
+                    children: Vec::new(),
+                });
+                ctx.pos += 1;
+            } else {
+                break;
+            }
+        } else {
+            let nested = parse_nested_content(ctx, indent);
+            if let Some(last) = items.last_mut() {
+                last.children.extend(nested);
+            }
+        }
+    }
+
+    match first_kind {
+        ListKind::Bullet => MdNode::BulletList { items },
+        ListKind::Ordered => MdNode::OrderedList { items },
+        ListKind::Todo(done) => {
+            let todo_items: Vec<ListItem> = items.into_iter().map(|item| {
+                let elements = item.elements.clone();
+                ListItem {
+                    elements: item.elements,
+                    children: {
+                        let mut ch = item.children;
+                        if !ch.is_empty() {
+                            ch.insert(0, MdNode::Todo { done, elements });
+                            ch
+                        } else {
+                            ch
+                        }
+                    },
+                }
+            }).collect();
+            if let Some(first) = todo_items.first() {
+                MdNode::Todo {
+                    done,
+                    elements: first.elements.clone(),
+                }
+            } else {
+                MdNode::Todo { done, elements: vec![make_text_element("", false, false, false)] }
+            }
+        }
+    }
+}
+
+fn parse_nested_content(ctx: &mut ParseCtx, indent: usize) -> Vec<MdNode> {
+    let mut nodes = Vec::new();
+
+    while ctx.pos < ctx.lines.len() {
+        let line = ctx.lines[ctx.pos];
+        if line.trim().is_empty() {
+            let mut j = ctx.pos + 1;
+            while j < ctx.lines.len() && ctx.lines[j].trim().is_empty() {
+                j += 1;
+            }
+            if j >= ctx.lines.len() || count_indent(ctx.lines[j]) < indent {
+                break;
+            }
+            ctx.pos += 1;
+            continue;
+        }
+
+        let cur_indent = count_indent(line);
+        if cur_indent < indent {
+            break;
+        }
+
+        if cur_indent >= indent {
+            let sub_indent = cur_indent;
+            let trimmed = line.trim_start();
+
+            if let Some((kind, rest)) = detect_list_marker(trimmed) {
+                let item = ListItem {
+                    elements: parse_inline_elements(rest),
+                    children: Vec::new(),
+                };
+                ctx.pos += 1;
+
+                let mut sub_items = vec![item];
+                while ctx.pos < ctx.lines.len() {
+                    let sub_line = ctx.lines[ctx.pos];
+                    if sub_line.trim().is_empty() {
+                        let mut j = ctx.pos + 1;
+                        while j < ctx.lines.len() && ctx.lines[j].trim().is_empty() {
+                            j += 1;
+                        }
+                        if j >= ctx.lines.len() || count_indent(ctx.lines[j]) < sub_indent {
+                            break;
+                        }
+                        ctx.pos += 1;
+                        continue;
+                    }
+                    let si = count_indent(sub_line);
+                    let st = sub_line.trim_start();
+                    if si < sub_indent {
+                        break;
+                    }
+                    if si == sub_indent {
+                        if let Some((k2, r2)) = detect_list_marker(st) {
+                            let same = matches!(
+                                (&kind, &k2),
+                                (ListKind::Bullet, ListKind::Bullet)
+                                    | (ListKind::Ordered, ListKind::Ordered)
+                                    | (ListKind::Todo(_), ListKind::Todo(_))
+                            );
+                            if !same {
+                                break;
+                            }
+                            sub_items.push(ListItem {
+                                elements: parse_inline_elements(r2),
+                                children: Vec::new(),
+                            });
+                            ctx.pos += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        let nested = parse_nested_content(ctx, si);
+                        if let Some(last) = sub_items.last_mut() {
+                            last.children.extend(nested);
+                        }
+                    }
+                }
+
+                let list_node = match kind {
+                    ListKind::Bullet => MdNode::BulletList { items: sub_items },
+                    ListKind::Ordered => MdNode::OrderedList { items: sub_items },
+                    ListKind::Todo(done) => MdNode::Todo {
+                        done,
+                        elements: sub_items
+                            .first()
+                            .map(|it| it.elements.clone())
+                            .unwrap_or_else(|| vec![make_text_element("", false, false, false)]),
+                    },
+                };
+                nodes.push(list_node);
+            } else if trimmed.starts_with('>') {
+                nodes.push(parse_block_quote_node(ctx));
+            } else if trimmed.starts_with("```") {
+                nodes.push(parse_code_block_node_with_indent(ctx, indent));
+            } else if let Some(node) = parse_heading_node(trimmed) {
+                ctx.pos += 1;
+                nodes.push(node);
+            } else if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+                ctx.pos += 1;
+                nodes.push(MdNode::Divider);
+            } else {
+                let mut para = trimmed.to_string();
+                ctx.pos += 1;
+                while ctx.pos < ctx.lines.len() {
+                    let pl = ctx.lines[ctx.pos];
+                    if pl.trim().is_empty() {
+                        break;
+                    }
+                    let pi = count_indent(pl);
+                    if pi < indent {
+                        break;
+                    }
+                    if detect_list_marker(pl.trim_start()).is_some()
+                        || pl.trim_start().starts_with('>')
+                        || pl.trim_start().starts_with("```")
+                        || parse_heading_node(pl.trim()).is_some()
+                    {
+                        break;
+                    }
+                    para.push(' ');
+                    para.push_str(pl.trim());
+                    ctx.pos += 1;
+                }
+                nodes.push(MdNode::Paragraph {
+                    elements: parse_inline_elements(&para),
+                });
+            }
+        }
+    }
+
+    nodes
+}
+
+fn parse_paragraph_node(ctx: &mut ParseCtx) -> MdNode {
+    let mut text = ctx.lines[ctx.pos].trim().to_string();
+    ctx.pos += 1;
+
+    while ctx.pos < ctx.lines.len() {
+        let line = ctx.lines[ctx.pos];
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if trimmed.starts_with("```")
+            || parse_heading_node(trimmed).is_some()
+            || trimmed.starts_with('>')
+            || detect_list_marker(trimmed).is_some()
+            || trimmed == "---"
+            || trimmed == "***"
+            || trimmed == "___"
+            || is_table_start_at(ctx.lines, ctx.pos)
+        {
+            break;
+        }
+        text.push(' ');
+        text.push_str(trimmed);
+        ctx.pos += 1;
+    }
+
+    MdNode::Paragraph {
+        elements: parse_inline_elements(text.trim()),
+    }
+}
+
+fn alloc_id(counter: &mut usize) -> String {
+    let id = format!("blk_{}", counter);
+    *counter += 1;
+    id
+}
+
+fn heading_block_type(level: u8) -> i64 {
+    match level {
+        1 => 3,
+        2 => 4,
+        3 => 5,
+        4 => 6,
+        5 => 7,
+        6 => 8,
+        _ => 2,
+    }
+}
+
+fn heading_block_key(level: u8) -> &'static str {
+    match level {
+        1 => "heading1",
+        2 => "heading2",
+        3 => "heading3",
+        4 => "heading4",
+        5 => "heading5",
+        6 => "heading6",
+        _ => "text",
+    }
+}
+
+fn md_node_to_block_ops(node: MdNode, id_counter: &mut usize) -> Vec<BlockOp> {
+    match node {
+        MdNode::Heading { level, elements } => {
+            let bt = heading_block_type(level);
+            let key = heading_block_key(level);
+            let mut block = json!({
+                "block_type": bt,
+            });
+            block[key] = json!({ "elements": elements });
+            vec![BlockOp::Simple(block)]
+        }
+        MdNode::Paragraph { elements } => {
+            vec![BlockOp::Simple(json!({
+                "block_type": 2,
+                "text": { "elements": elements }
+            }))]
+        }
+        MdNode::CodeBlock { lang, content } => {
+            let mut style = json!({});
+            if let Some(l) = lang {
+                style["language"] = json!(l);
+            }
+            vec![BlockOp::Simple(json!({
+                "block_type": 14,
+                "code": {
+                    "elements": [{ "text_run": { "content": content, "text_element_style": {} } }],
+                    "style": style
+                }
+            }))]
+        }
+        MdNode::Divider => {
+            vec![BlockOp::Simple(json!({
+                "block_type": 22,
+                "divider": {}
+            }))]
+        }
+        MdNode::Todo { done, elements } => {
+            vec![BlockOp::Simple(json!({
+                "block_type": 17,
+                "todo": {
+                    "elements": elements,
+                    "style": { "done": done }
+                }
+            }))]
+        }
+        MdNode::BulletList { items } => {
+            let mut ops = Vec::new();
+            for item in items {
+                ops.extend(list_item_to_block_ops(item, 12, "bullet", id_counter));
+            }
+            ops
+        }
+        MdNode::OrderedList { items } => {
+            let mut ops = Vec::new();
+            for item in items {
+                ops.extend(list_item_to_block_ops(item, 13, "ordered", id_counter));
+            }
+            ops
+        }
+        MdNode::BlockQuote { children } => {
+            if children.is_empty() {
+                return vec![BlockOp::Simple(json!({
+                    "block_type": 15,
+                    "quote": { "elements": [make_text_element("", false, false, false)] }
+                }))];
+            }
+            let quote_id = alloc_id(id_counter);
+            let mut child_ids: Vec<String> = Vec::new();
+            let mut all_descendants: Vec<Value> = Vec::new();
+
+            for child in children {
+                let (root_ids, descs) = md_node_to_descendant_blocks(child, id_counter);
+                child_ids.extend(root_ids);
+                all_descendants.extend(descs);
+            }
+
+            let mut quote_block = json!({
+                "block_id": quote_id,
+                "block_type": 15,
+                "quote": { "elements": [make_text_element("", false, false, false)] },
+                "children": child_ids
+            });
+            if child_ids.is_empty() {
+                quote_block["quote"] = json!({ "elements": [make_text_element("", false, false, false)] });
+                vec![BlockOp::Simple(json!({
+                    "block_type": 15,
+                    "quote": { "elements": [make_text_element("", false, false, false)] }
+                }))]
+            } else {
+                let mut descendants = vec![quote_block];
+                descendants.extend(all_descendants);
+                vec![BlockOp::Descendant {
+                    children_id: vec![quote_id],
+                    descendants,
+                }]
+            }
+        }
+        MdNode::Table { rows } => {
+            vec![build_table_descendant(&rows, id_counter)]
+        }
+    }
+}
+
+fn list_item_to_block_ops(
+    item: ListItem,
+    block_type: i64,
+    key: &str,
+    id_counter: &mut usize,
+) -> Vec<BlockOp> {
+    if item.children.is_empty() {
+        let mut block = json!({ "block_type": block_type });
+        block[key] = json!({ "elements": item.elements });
+        vec![BlockOp::Simple(block)]
+    } else {
+        let item_id = alloc_id(id_counter);
+        let mut child_ids: Vec<String> = Vec::new();
+        let mut all_descendants: Vec<Value> = Vec::new();
+
+        for child in item.children {
+            let (root_ids, descs) = md_node_to_descendant_blocks(child, id_counter);
+            child_ids.extend(root_ids);
+            all_descendants.extend(descs);
+        }
+
+        let mut item_block = json!({
+            "block_id": item_id,
+            "block_type": block_type,
+            "children": child_ids
+        });
+        item_block[key] = json!({ "elements": item.elements });
+
+        let mut descendants = vec![item_block];
+        descendants.extend(all_descendants);
+
+        vec![BlockOp::Descendant {
+            children_id: vec![item_id],
+            descendants,
+        }]
+    }
+}
+
+fn md_node_to_descendant_blocks(
+    node: MdNode,
+    id_counter: &mut usize,
+) -> (Vec<String>, Vec<Value>) {
+    match node {
+        MdNode::Heading { level, elements } => {
+            let id = alloc_id(id_counter);
+            let bt = heading_block_type(level);
+            let key = heading_block_key(level);
+            let mut block = json!({
+                "block_id": id,
+                "block_type": bt,
+                "children": []
+            });
+            block[key] = json!({ "elements": elements });
+            (vec![id], vec![block])
+        }
+        MdNode::Paragraph { elements } => {
+            let id = alloc_id(id_counter);
+            let block = json!({
+                "block_id": id,
+                "block_type": 2,
+                "text": { "elements": elements },
+                "children": []
+            });
+            (vec![id], vec![block])
+        }
+        MdNode::CodeBlock { lang, content } => {
+            let id = alloc_id(id_counter);
+            let mut style = json!({});
+            if let Some(l) = lang {
+                style["language"] = json!(l);
+            }
+            let block = json!({
+                "block_id": id,
+                "block_type": 14,
+                "code": {
+                    "elements": [{ "text_run": { "content": content, "text_element_style": {} } }],
+                    "style": style
+                },
+                "children": []
+            });
+            (vec![id], vec![block])
+        }
+        MdNode::Divider => {
+            let id = alloc_id(id_counter);
+            let block = json!({
+                "block_id": id,
+                "block_type": 22,
+                "divider": {},
+                "children": []
+            });
+            (vec![id], vec![block])
+        }
+        MdNode::Todo { done, elements } => {
+            let id = alloc_id(id_counter);
+            let block = json!({
+                "block_id": id,
+                "block_type": 17,
+                "todo": {
+                    "elements": elements,
+                    "style": { "done": done }
+                },
+                "children": []
+            });
+            (vec![id], vec![block])
+        }
+        MdNode::BulletList { items } => {
+            let mut root_ids = Vec::new();
+            let mut all_blocks = Vec::new();
+            for item in items {
+                let (ids, blocks) = list_item_to_descendant(item, 12, "bullet", id_counter);
+                root_ids.extend(ids);
+                all_blocks.extend(blocks);
+            }
+            (root_ids, all_blocks)
+        }
+        MdNode::OrderedList { items } => {
+            let mut root_ids = Vec::new();
+            let mut all_blocks = Vec::new();
+            for item in items {
+                let (ids, blocks) = list_item_to_descendant(item, 13, "ordered", id_counter);
+                root_ids.extend(ids);
+                all_blocks.extend(blocks);
+            }
+            (root_ids, all_blocks)
+        }
+        MdNode::BlockQuote { children } => {
+            let quote_id = alloc_id(id_counter);
+            let mut child_ids: Vec<String> = Vec::new();
+            let mut all_blocks: Vec<Value> = Vec::new();
+            for child in children {
+                let (ids, blocks) = md_node_to_descendant_blocks(child, id_counter);
+                child_ids.extend(ids);
+                all_blocks.extend(blocks);
+            }
+            let quote_block = json!({
+                "block_id": quote_id,
+                "block_type": 15,
+                "quote": { "elements": [make_text_element("", false, false, false)] },
+                "children": child_ids
+            });
+            let mut result = vec![quote_block];
+            result.extend(all_blocks);
+            (vec![quote_id], result)
+        }
+        MdNode::Table { rows } => {
+            let (ids, blocks) = build_table_descendant_data(&rows, id_counter);
+            (ids, blocks)
+        }
+    }
+}
+
+fn list_item_to_descendant(
+    item: ListItem,
+    block_type: i64,
+    key: &str,
+    id_counter: &mut usize,
+) -> (Vec<String>, Vec<Value>) {
+    let item_id = alloc_id(id_counter);
+    let mut child_ids: Vec<String> = Vec::new();
+    let mut all_blocks: Vec<Value> = Vec::new();
+
+    for child in item.children {
+        let (ids, blocks) = md_node_to_descendant_blocks(child, id_counter);
+        child_ids.extend(ids);
+        all_blocks.extend(blocks);
+    }
+
+    let mut item_block = json!({
+        "block_id": item_id,
+        "block_type": block_type,
+        "children": child_ids
+    });
+    item_block[key] = json!({ "elements": item.elements });
+
+    let mut result = vec![item_block];
+    result.extend(all_blocks);
+    (vec![item_id], result)
+}
+
+fn build_table_descendant(rows: &[Vec<String>], id_counter: &mut usize) -> BlockOp {
+    let (children_id, descendants) = build_table_descendant_data(rows, id_counter);
+    BlockOp::Descendant {
+        children_id,
+        descendants,
+    }
+}
+
+fn build_table_descendant_data(
+    rows: &[Vec<String>],
+    id_counter: &mut usize,
+) -> (Vec<String>, Vec<Value>) {
+    let row_size = rows.len();
+    let column_size = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if row_size == 0 || column_size == 0 {
+        let id = alloc_id(id_counter);
+        return (
+            vec![id.clone()],
+            vec![json!({
+                "block_id": id,
+                "block_type": 2,
+                "text": { "elements": [make_text_element("", false, false, false)] },
+                "children": []
+            })],
+        );
+    }
+
+    let table_id = alloc_id(id_counter);
+    let mut cell_ids: Vec<String> = Vec::new();
+    let mut descendants: Vec<Value> = Vec::new();
+
+    for row in rows {
+        for col_idx in 0..column_size {
+            let cell_id = alloc_id(id_counter);
+            cell_ids.push(cell_id.clone());
+
+            let cell_text = row.get(col_idx).cloned().unwrap_or_default();
+            let child_id = alloc_id(id_counter);
+
+            let cell_block = json!({
+                "block_id": cell_id,
+                "block_type": 32,
+                "table_cell": {},
+                "children": [child_id]
+            });
+
+            let child_block = json!({
+                "block_id": child_id,
+                "block_type": 2,
+                "text": { "elements": parse_inline_elements(&cell_text) },
+                "children": []
+            });
+
+            descendants.push(cell_block);
+            descendants.push(child_block);
+        }
+    }
+
+    let table_block = json!({
+        "block_id": table_id,
+        "block_type": 31,
+        "table": {
+            "property": {
+                "row_size": row_size,
+                "column_size": column_size
+            }
+        },
+        "children": cell_ids
+    });
+
+    let mut all_descendants = vec![table_block];
+    all_descendants.extend(descendants);
+    (vec![table_id], all_descendants)
+}
+
+fn convert_markdown_to_docx_blocks(markdown: &str) -> Vec<BlockOp> {
+    let ast = parse_markdown_ast(markdown);
+    let mut id_counter: usize = 1;
+    let mut ops = Vec::new();
+    for node in ast {
+        ops.extend(md_node_to_block_ops(node, &mut id_counter));
+    }
+    ops
+}
+
+fn feishu_doc_create_from_markdown(args: &Value) -> Result<String, JsonRpcErr> {
+    let title = args
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let markdown_content = args
+        .get("markdown_content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let folder_token = args
+        .get("folder_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+
+    if title.is_empty() {
+        return Err(json_rpc_error(
+            -32602,
+            "Invalid params: title is required",
+            Some(json!({ "title": title })),
+        ));
+    }
+    if markdown_content.trim().is_empty() {
+        return Err(json_rpc_error(
+            -32602,
+            "Invalid params: markdown_content is required",
+            None,
+        ));
+    }
+
+    let base_url = resolve_base_url();
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to build http client",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    let document_id = with_user_access_token(
+        &client,
+        &base_url,
+        "Missing user_access_token. Create document requires OAuth once.",
+        |token| {
+            let mut create_body = json!({
+                "title": title,
+                "folder_token": folder_token
+            });
+            if folder_token.is_empty() {
+                create_body
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("folder_token");
+            }
+
+            let url = format!(
+                "{}/open-apis/docx/v1/documents",
+                base_url.trim_end_matches('/')
+            );
+            let resp = client
+                .post(&url)
+                .header(
+                    "Authorization",
+                    format!("Bearer {}", token.trim()),
+                )
+                .header("Content-Type", "application/json; charset=utf-8")
+                .json(&create_body)
+                .send()
+                .map_err(|e| {
+                    json_rpc_error(
+                        -32000,
+                        "Failed to create document",
+                        Some(json!({ "error": e.to_string() })),
+                    )
+                })?;
+
+            let text = resp.text().map_err(|e| {
+                json_rpc_error(
+                    -32000,
+                    "Failed to read response body",
+                    Some(json!({ "error": e.to_string() })),
+                )
+            })?;
+
+            let json: Value = serde_json::from_str(&text).map_err(|e| {
+                json_rpc_error(
+                    -32000,
+                    "Failed to parse response JSON",
+                    Some(json!({ "error": e.to_string(), "body": text })),
+                )
+            })?;
+
+            let code = json.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+            if code != 0 {
+                let err_json = json.clone();
+                return Err(json_rpc_error(
+                    -32000,
+                    "Failed to create document",
+                    Some(err_json),
+                ));
+            }
+
+            let doc_id = json
+                .get("data")
+                .and_then(|d| d.get("document_id"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    let err_json = json.clone();
+                    json_rpc_error(-32000, "No document_id in response", Some(err_json))
+                })?;
+
+            Ok(doc_id.to_string())
+        },
+    )?;
+
+    let block_ops = convert_markdown_to_docx_blocks(&markdown_content);
+    if block_ops.is_empty() {
+        let doc_url = format!(
+            "https://{}.feishu.cn/docx/{}",
+            extract_domain_from_base_url(&base_url),
+            document_id
+        );
+        return Ok(format!(
+            "Created document (empty): {}\nID: {}",
+            doc_url, document_id
+        ));
+    }
+
+    let mut index: i64 = 0;
+    let mut simple_batch: Vec<Value> = Vec::new();
+
+    for op in &block_ops {
+        match op {
+            BlockOp::Simple(block) => {
+                simple_batch.push(block.clone());
+                if simple_batch.len() >= 50 {
+                    let batch = simple_batch.clone();
+                    with_user_access_token(
+                        &client,
+                        &base_url,
+                        "Missing user_access_token. Update document requires OAuth.",
+                        |token| {
+                            create_children_batch(
+                                &client,
+                                &base_url,
+                                token,
+                                &document_id,
+                                &batch,
+                                index,
+                            )?;
+                            Ok(())
+                        },
+                    )?;
+                    index += batch.len() as i64;
+                    simple_batch.clear();
+                }
+            }
+            BlockOp::Descendant {
+                children_id,
+                descendants,
+            } => {
+                if !simple_batch.is_empty() {
+                    let batch = simple_batch.clone();
+                    with_user_access_token(
+                        &client,
+                        &base_url,
+                        "Missing user_access_token. Update document requires OAuth.",
+                        |token| {
+                            create_children_batch(
+                                &client,
+                                &base_url,
+                                token,
+                                &document_id,
+                                &batch,
+                                index,
+                            )?;
+                            Ok(())
+                        },
+                    )?;
+                    index += batch.len() as i64;
+                    simple_batch.clear();
+                }
+                let desc = descendants.clone();
+                let cids = children_id.clone();
+                with_user_access_token(
+                    &client,
+                    &base_url,
+                    "Missing user_access_token. Update document requires OAuth.",
+                    |token| {
+                        create_descendant_batch(
+                            &client,
+                            &base_url,
+                            token,
+                            &document_id,
+                            &cids,
+                            &desc,
+                            index,
+                        )?;
+                        Ok(())
+                    },
+                )?;
+                index += 1;
+            }
+        }
+    }
+
+    if !simple_batch.is_empty() {
+        let batch = simple_batch.clone();
+        with_user_access_token(
+            &client,
+            &base_url,
+            "Missing user_access_token. Update document requires OAuth.",
+            |token| {
+                create_children_batch(
+                    &client,
+                    &base_url,
+                    token,
+                    &document_id,
+                    &batch,
+                    index,
+                )?;
+                Ok(())
+            },
+        )?;
+    }
+
+    let doc_url = format!(
+        "https://{}.feishu.cn/docx/{}",
+        extract_domain_from_base_url(&base_url),
+        document_id
+    );
+
+    Ok(format!(
+        "Created document: {}\nID: {}",
+        doc_url, document_id
+    ))
+}
+
+fn create_children_batch(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+    document_id: &str,
+    children: &[Value],
+    index: i64,
+) -> Result<(), JsonRpcErr> {
+    let url = format!(
+        "{}/open-apis/docx/v1/documents/{}/blocks/{}/children",
+        base_url.trim_end_matches('/'),
+        document_id,
+        document_id
+    );
+    let body = json!({
+        "children": children,
+        "index": index
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token.trim()))
+        .header("Content-Type", "application/json; charset=utf-8")
+        .json(&body)
+        .send()
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to create document blocks",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    let text = resp.text().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to read response body",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    let json: Value = serde_json::from_str(&text).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to parse response JSON",
+            Some(json!({ "error": e.to_string(), "body": text })),
+        )
+    })?;
+
+    let code = json.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+    if code != 0 {
+        return Err(json_rpc_error(
+            -32000,
+            "Failed to create document blocks",
+            Some(json),
+        ));
+    }
+
+    Ok(())
+}
+
+fn create_descendant_batch(
+    client: &Client,
+    base_url: &str,
+    token: &str,
+    document_id: &str,
+    children_id: &[String],
+    descendants: &[Value],
+    index: i64,
+) -> Result<(), JsonRpcErr> {
+    let url = format!(
+        "{}/open-apis/docx/v1/documents/{}/blocks/{}/descendant",
+        base_url.trim_end_matches('/'),
+        document_id,
+        document_id
+    );
+    let body = json!({
+        "index": index,
+        "children_id": children_id,
+        "descendants": descendants
+    });
+
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", token.trim()))
+        .header("Content-Type", "application/json; charset=utf-8")
+        .json(&body)
+        .send()
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to create table descendant blocks",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
+
+    let text = resp.text().map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to read response body",
+            Some(json!({ "error": e.to_string() })),
+        )
+    })?;
+
+    let json: Value = serde_json::from_str(&text).map_err(|e| {
+        json_rpc_error(
+            -32000,
+            "Failed to parse response JSON",
+            Some(json!({ "error": e.to_string(), "body": text })),
+        )
+    })?;
+
+    let code = json.get("code").and_then(|v| v.as_i64()).unwrap_or(0);
+    if code != 0 {
+        return Err(json_rpc_error(
+            -32000,
+            "Failed to create table descendant blocks",
+            Some(json),
+        ));
+    }
+
+    Ok(())
+}
+
+fn extract_domain_from_base_url(base_url: &str) -> String {
+    base_url
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or("app.feishu.cn")
+        .to_string()
 }
 
 #[derive(Debug, Clone)]
