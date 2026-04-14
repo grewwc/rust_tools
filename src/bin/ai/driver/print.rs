@@ -98,11 +98,57 @@ pub(in crate::ai) fn format_tool_output_prefix() -> String {
 }
 
 pub(in crate::ai) fn format_tool_output_line(line: &str) -> String {
-    if line.is_empty() {
+    let sanitized = sanitize_for_terminal(line);
+    if sanitized.is_empty() {
         format!("  {}│{}", ACCENT_RULE, RESET)
     } else {
-        format!("  {}│{} {}{}{}", ACCENT_RULE, RESET, DIM, line, RESET)
+        format!("  {}│{} {}{}{}", ACCENT_RULE, RESET, DIM, sanitized, RESET)
     }
+}
+
+pub(in crate::ai) fn sanitize_for_terminal(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut result = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    i += 1;
+                    if b >= 0x40 && b <= 0x7e {
+                        break;
+                    }
+                }
+            } else if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                i += 2;
+                while i < bytes.len() {
+                    if bytes[i] == 0x07 || (bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\') {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            } else {
+                i += 1;
+                if i < bytes.len() {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        let Some(ch) = text[i..].chars().next() else {
+            break;
+        };
+        if ch.is_control() && ch != '\n' && ch != '\t' {
+            i += ch.len_utf8();
+            continue;
+        }
+        result.push(ch);
+        i += ch.len_utf8();
+    }
+    result
 }
 
 pub(in crate::ai) fn format_tool_note_line(label: &str, value: &str) -> String {
@@ -222,6 +268,7 @@ mod tests {
         format_assistant_banner, format_empty_state, format_ocr_summary_block,
         format_section_header, format_section_item, format_section_note, format_tool_header,
         format_tool_output_block, format_tool_output_line, format_tool_output_prefix,
+        sanitize_for_terminal,
     };
     use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};
 
@@ -323,5 +370,46 @@ mod tests {
     fn tool_output_prefix_formats_gutter_without_closing_line() {
         let visible = strip_ansi_for_test(&format_tool_output_prefix());
         assert_eq!(visible, "  │ ");
+    }
+
+    #[test]
+    fn sanitize_strips_control_characters_but_keeps_newline_and_tab() {
+        let input = "hello\x03world\x04\nline\t2\x07";
+        let sanitized = sanitize_for_terminal(input);
+        assert_eq!(sanitized, "helloworld\nline\t2");
+    }
+
+    #[test]
+    fn sanitize_strips_ansi_csi_sequences() {
+        let input = "\x1b[31mred text\x1b[0m normal";
+        let sanitized = sanitize_for_terminal(input);
+        assert_eq!(sanitized, "red text normal");
+    }
+
+    #[test]
+    fn sanitize_strips_ansi_osc_sequences() {
+        let input = "\x1b]0;window title\x07content";
+        let sanitized = sanitize_for_terminal(input);
+        assert_eq!(sanitized, "content");
+    }
+
+    #[test]
+    fn sanitize_strips_bare_esc_sequences() {
+        let input = "before\x1bXafter";
+        let sanitized = sanitize_for_terminal(input);
+        assert_eq!(sanitized, "beforeafter");
+    }
+
+    #[test]
+    fn sanitize_preserves_normal_text() {
+        let input = "正常文本 hello world 123";
+        let sanitized = sanitize_for_terminal(input);
+        assert_eq!(sanitized, input);
+    }
+
+    #[test]
+    fn tool_output_line_strips_control_characters() {
+        let visible = strip_ansi_for_test(&format_tool_output_line("line\x03with\x04ctrl"));
+        assert_eq!(visible, "  │ linewithctrl");
     }
 }

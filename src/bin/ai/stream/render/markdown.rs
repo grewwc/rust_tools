@@ -141,10 +141,10 @@ impl MarkdownStreamRenderer {
             out.write_all(self.line_buf.as_bytes())?;
             out.flush()?;
             self.line_preview_emitted = true;
-            self.line_preview_height = table_preview_height(&self.line_buf).max(1);
+            self.line_preview_height = self.current_line_preview_height();
         } else {
             self.emit_char(out, ch)?;
-            self.line_preview_height = table_preview_height(&self.line_buf).max(1);
+            self.line_preview_height = self.current_line_preview_height();
         }
         Ok(())
     }
@@ -155,8 +155,26 @@ impl MarkdownStreamRenderer {
         }
         self.emit_char(out, ch)?;
         self.line_preview_emitted = true;
-        self.line_preview_height = table_preview_height(&self.line_buf).max(1);
+        self.line_preview_height = self.current_line_preview_height();
         Ok(())
+    }
+
+    fn current_line_preview_height(&self) -> usize {
+        if self.in_code_block {
+            return self.code_block_preview_height(&self.line_buf);
+        }
+        table_preview_height(&self.line_buf).max(1)
+    }
+
+    fn code_block_preview_height(&self, line: &str) -> usize {
+        let block_indent = self.code_block_indent.as_str();
+        let code_text = line.strip_prefix(block_indent).unwrap_or(line);
+        let visible = if code_text.is_empty() {
+            format!("{block_indent}{:>3} │", self.code_line_number + 1)
+        } else {
+            format!("{block_indent}{:>3} │{}", self.code_line_number + 1, code_text)
+        };
+        table_preview_height(&visible).max(1)
     }
 
     fn emit_char(&mut self, out: &mut std::io::Stdout, ch: char) -> io::Result<()> {
@@ -720,5 +738,32 @@ mod tests {
 
         renderer.write_chunk("\n", false).unwrap();
         assert!(!renderer.has_unfinished_line());
+    }
+
+    #[test]
+    fn html_code_block_preview_height_accounts_for_code_gutter() {
+        unsafe { std::env::set_var("COLUMNS", "20") };
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+
+        let _ = renderer.consume_line("```html", false);
+        renderer
+            .write_chunk(r#"<div class="input-area very-long-class-name">"#, false)
+            .unwrap();
+
+        assert!(
+            renderer.line_preview_height()
+                > table_preview_height(r#"<div class="input-area very-long-class-name">"#),
+            "code-block preview height should include the rendered line-number gutter"
+        );
+    }
+
+    #[test]
+    fn html_code_block_line_remains_visible_after_rewrite() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let _ = renderer.consume_line("```html", false);
+        let out = renderer.consume_line(r#"<div class="input-area"></div>"#, true);
+
+        let visible = strip_ansi_for_test(&out);
+        assert!(visible.contains(r#"<div class="input-area"></div>"#));
     }
 }

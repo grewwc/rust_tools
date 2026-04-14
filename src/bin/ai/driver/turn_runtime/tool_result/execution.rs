@@ -17,6 +17,7 @@ use super::{
 };
 use crate::ai::driver::print::{
     format_tool_output_prefix, print_tool_note_line, print_tool_output_block,
+    sanitize_for_terminal,
 };
 use super::messaging::print_tool_result_preview;
 use super::super::persistence::persist_pending_turn_messages;
@@ -124,8 +125,9 @@ impl<'a> TerminalToolObserver<'a> {
 
     fn push_stream_text(&mut self, text: &str) {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let sanitized = sanitize_for_terminal(&normalized);
         let mut rendered = String::new();
-        for ch in normalized.chars() {
+        for ch in sanitized.chars() {
             if self.at_line_start {
                 rendered.push_str(&format_tool_output_prefix());
                 self.at_line_start = false;
