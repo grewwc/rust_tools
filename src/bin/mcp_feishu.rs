@@ -170,15 +170,18 @@ fn handle_tools_list() -> Result<Value, JsonRpcErr> {
             },
             {
                 "name": "docs_get_text",
-                "description": "Fetch plain text content for a Feishu doc/docx (raw_content). Requires user_access_token.",
+                "description": "Fetch plain text content for a Feishu doc/docx/wiki/sheet. Supports wiki (auto-resolves to underlying object) and sheet (preview). Requires user_access_token.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "docs_token": { "type": "string", "description": "docs_token from docs_search" },
-                        "docs_type": { "type": "string", "description": "doc or docx" },
-                        "lang": { "type": "integer", "description": "docx raw_content lang: 0=zh,1=en,2=ja (default 0)" }
+                        "docs_token": { "type": "string", "description": "docs_token from docs_search or URL" },
+                        "docs_type": { "type": "string", "description": "doc, docx, wiki, or sheet. If omitted, inferred from token pattern." },
+                        "lang": { "type": "integer", "description": "docx raw_content lang: 0=zh,1=en,2=ja (default 0)" },
+                        "max_rows": { "type": "integer", "description": "For sheets: preview max rows per sheet (default 50, max 500)" },
+                        "max_cols": { "type": "integer", "description": "For sheets: preview max columns per sheet (default 20, max 200)" },
+                        "max_sheets": { "type": "integer", "description": "For sheets: preview max sheets (default 3, max 20)" }
                     },
-                    "required": ["docs_token", "docs_type"]
+                    "required": ["docs_token"]
                 }
             },
             {
@@ -1677,25 +1680,42 @@ fn feishu_docs_get_text(args: &Value) -> Result<String, JsonRpcErr> {
         .unwrap_or("")
         .trim()
         .to_string();
+    if docs_token.is_empty() {
+        return Err(json_rpc_error(
+            -32602,
+            "Invalid params: docs_token is required",
+            None,
+        ));
+    }
+
     let docs_type = args
         .get("docs_type")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
-        .to_string();
-    if docs_token.is_empty() || docs_type.is_empty() {
-        return Err(json_rpc_error(
-            -32602,
-            "Invalid params: docs_token/docs_type required",
-            Some(json!({ "docs_token": docs_token, "docs_type": docs_type })),
-        ));
-    }
+        .to_lowercase();
 
     let lang = args
         .get("lang")
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
         .clamp(0, 2);
+
+    let max_rows = args
+        .get("max_rows")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(50)
+        .clamp(1, 500) as usize;
+    let max_cols = args
+        .get("max_cols")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(20)
+        .clamp(1, 200) as usize;
+    let max_sheets = args
+        .get("max_sheets")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(3)
+        .clamp(1, 20) as usize;
 
     let base_url = resolve_base_url();
     let client = Client::builder()
@@ -1714,17 +1734,79 @@ fn feishu_docs_get_text(args: &Value) -> Result<String, JsonRpcErr> {
         &base_url,
         "Missing user_access_token. Fetch requires OAuth once.",
         |token| {
-            feishu_fetch_raw_content(
-                &client,
-                &base_url,
-                token,
-                &docs_type,
-                &docs_token,
-                lang,
-                None,
-            )
+            let resolved_type = if docs_type.is_empty() {
+                infer_docs_type(&docs_token)
+            } else {
+                docs_type.clone()
+            };
+
+            match resolved_type.as_str() {
+                "wiki" => {
+                    let (obj_type, obj_token) =
+                        feishu_wiki_resolve_obj(&client, &base_url, token, &docs_token)?;
+                    match obj_type.as_str() {
+                        "doc" | "docx" => feishu_fetch_raw_content(
+                            &client,
+                            &base_url,
+                            token,
+                            &obj_type,
+                            &obj_token,
+                            lang,
+                            None,
+                        ),
+                        "sheet" | "sheets" => feishu_fetch_sheet_preview_text(
+                            &client,
+                            &base_url,
+                            token,
+                            &obj_token,
+                            max_rows,
+                            max_cols,
+                            max_sheets,
+                        ),
+                        other => Err(json_rpc_error(
+                            -32000,
+                            "Wiki node resolved to unsupported type",
+                            Some(json!({ "obj_type": other, "obj_token": obj_token })),
+                        )),
+                    }
+                }
+                "sheet" | "sheets" => feishu_fetch_sheet_preview_text(
+                    &client,
+                    &base_url,
+                    token,
+                    &docs_token,
+                    max_rows,
+                    max_cols,
+                    max_sheets,
+                ),
+                "doc" | "docx" => feishu_fetch_raw_content(
+                    &client,
+                    &base_url,
+                    token,
+                    &resolved_type,
+                    &docs_token,
+                    lang,
+                    None,
+                ),
+                other => Err(json_rpc_error(
+                    -32602,
+                    "Unsupported docs_type",
+                    Some(json!({ "docs_type": other, "supported": ["doc", "docx", "wiki", "sheet"] })),
+                )),
+            }
         },
     )
+}
+
+fn infer_docs_type(token: &str) -> String {
+    let t = token.trim();
+    if t.len() < 10 {
+        return "docx".to_string();
+    }
+    if t.starts_with("bascn") || t.starts_with("bascnt") {
+        return "sheet".to_string();
+    }
+    "docx".to_string()
 }
 
 fn feishu_docs_get_text_by_url(args: &Value) -> Result<String, JsonRpcErr> {
