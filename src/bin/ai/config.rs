@@ -73,6 +73,14 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
                 .display()
                 .to_string()
         });
+    let skill_match_model_path = cfg
+        .get_opt("ai.skills.match_model_path")
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src/bin/ai/config/skill_match/skill_match_model.json")
+                .display()
+                .to_string()
+        });
     Ok(AppConfig {
         api_key,
         history_file: PathBuf::from(expanduser(&history_file).as_ref()),
@@ -84,6 +92,7 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         intent_model,
         intent_model_path: PathBuf::from(expanduser(&intent_model_path).as_ref()),
         agent_route_model_path: PathBuf::from(expanduser(&agent_route_model_path).as_ref()),
+        skill_match_model_path: PathBuf::from(expanduser(&skill_match_model_path).as_ref()),
     })
 }
 

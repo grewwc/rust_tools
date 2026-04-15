@@ -724,6 +724,8 @@ mod tests {
                     .join("src/bin/ai/config/intent/intent_model.json"),
                 agent_route_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("src/bin/ai/config/agent_route/agent_route_model.json"),
+                skill_match_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/bin/ai/config/skill_match/skill_match_model.json"),
             },
             session_id: String::new(),
             session_history_file: PathBuf::new(),

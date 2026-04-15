@@ -374,6 +374,7 @@ mod tests {
                 intent_model: None,
                 intent_model_path: PathBuf::new(),
                 agent_route_model_path: PathBuf::new(),
+                skill_match_model_path: PathBuf::new(),
             },
             session_id: "test".to_string(),
             session_history_file: PathBuf::new(),

@@ -28,7 +28,7 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     let start = offset.saturating_sub(1).min(lines.len());
     let end = (start + limit).min(lines.len());
 
-    Ok(render_lines(&content, start, end, 10))
+    Ok(render_lines(&content, start, end, usize::MAX))
 }
 
 pub(crate) fn execute_read_file_lines(args: &Value) -> Result<String, String> {

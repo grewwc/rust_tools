@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::{
     DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS, TextSimilarityFeatures,
-    jaccard_similarity_for_sets, rank_skills_locally, set_intersection_count,
+    jaccard_similarity_for_sets, rank_skills_locally_with_model_path, set_intersection_count,
 };
 use super::intent_recognition::{self, UserIntent};
 
@@ -253,8 +253,8 @@ fn dedupe_tools_by_name(tools: Vec<ToolDef>) -> Vec<ToolDef> {
 
 fn required_discovery_tool_names() -> Vec<String> {
     vec![
-        "enable_tools".to_string(),
         "discover_skills".to_string(),
+        "enable_tools".to_string(),
     ]
 }
 
@@ -623,7 +623,15 @@ fn build_system_prompt(
     b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- If the answer depends on repo/code facts, inspect with tools before concluding.\n- If the user asks for edits, perform edits with tools instead of only describing them.\n- If the user asks to run/build/test/reproduce, run commands with tools when available.\n- On tool failure, read the error and correct course before answering. Retry with fixed args or switch tools; avoid repeating the same failing call.\n- If `code_search` returns only `No ...` results, broaden scope instead of rerunning unchanged.");
 
     if has_tool(available_tools, "enable_tools") {
-        b.push(ContextKind::Policy, "Tool discovery:\n- Do NOT assume all tools are already loaded.\n- If a capability is missing, call `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.\n- This also applies to MCP tools. For external systems such as Feishu/Lark, docs/wiki/sheets, or third-party services, discover and enable the matching `mcp_*` tools before proceeding.");
+        let mut discovery_policy = String::from(
+            "Tool discovery:\n- Do NOT assume all tools are already loaded.\n- Before answering a non-trivial request from scratch, especially an action request or a task that may benefit from a specialized workflow, check whether a skill fits the task. Call `discover_skills` early instead of guessing.\n- If you are unsure how to solve the user's request, feel stuck, or do not know the best next step, use `discover_skills` before continuing. Use `discover_skills` to inspect the currently available skills.\n- If a capability is missing, call `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.\n- This also applies to MCP tools. For external systems such as Feishu/Lark, docs/wiki/sheets, media generation, presentations, or third-party services, discover and enable the matching `mcp_*` tools before proceeding.",
+        );
+        if skill.is_none() {
+            discovery_policy.push_str(
+                "\n- No skill is active yet. For any request that is not obviously a simple direct answer, prefer calling `discover_skills` before giving a freeform response.",
+            );
+        }
+        b.push(ContextKind::Policy, discovery_policy);
         if let Some(catalog) = build_capability_catalog(available_tools) {
             b.push(ContextKind::Fact, catalog);
         }
@@ -744,6 +752,7 @@ fn select_skill_with_preference<'a>(
     question: &str,
     intent: &UserIntent,
     preferred_skill_name: Option<&str>,
+    model_path: &std::path::Path,
 ) -> Option<&'a SkillManifest> {
     select_skill_with_preference_strength(
         skill_manifests,
@@ -751,6 +760,7 @@ fn select_skill_with_preference<'a>(
         intent,
         preferred_skill_name,
         PreferenceStrength::StrongSticky,
+        model_path,
     )
 }
 
@@ -760,12 +770,13 @@ fn select_skill_with_preference_strength<'a>(
     intent: &UserIntent,
     preferred_skill_name: Option<&str>,
     strength: PreferenceStrength,
+    model_path: &std::path::Path,
 ) -> Option<&'a SkillManifest> {
     if question.trim().is_empty() || skill_manifests.is_empty() || intent.is_searching_resource("skill") {
         return None;
     }
 
-    let ranked = rank_skills_locally(skill_manifests, question, Some(intent));
+    let ranked = rank_skills_locally_with_model_path(skill_manifests, question, Some(intent), model_path);
     let Some(best) = ranked.first() else {
         return None;
     };
@@ -895,7 +906,7 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
     intent: &UserIntent,
 ) -> SkillTurnGuard {
     let skill =
-        select_skill_with_preference(skill_manifests, question, intent, preferred_skill_name);
+        select_skill_with_preference(skill_manifests, question, intent, preferred_skill_name, &app.config.skill_match_model_path);
     build_skill_turn_guard(app, mcp_client, skill, intent.clone())
 }
 
@@ -913,7 +924,7 @@ pub(super) async fn prepare_skill_for_turn(
         .eq_ignore_ascii_case("true");
 
     let intent = detect_turn_intent(question, &app.config.intent_model_path);
-    let ranked = rank_skills_locally(skill_manifests, question, Some(&intent));
+    let ranked = rank_skills_locally_with_model_path(skill_manifests, question, Some(&intent), &app.config.skill_match_model_path);
     let cross_turn_preference = cross_turn_preferred_skill_name(app, question, &intent);
     let skill = select_skill_with_preference_strength(
         skill_manifests,
@@ -921,6 +932,7 @@ pub(super) async fn prepare_skill_for_turn(
         &intent,
         cross_turn_preference.as_deref(),
         PreferenceStrength::CrossTurnBias,
+        &app.config.skill_match_model_path,
     );
 
     if debug {
@@ -1040,6 +1052,27 @@ mod tests {
         available.insert("enable_tools".to_string());
         let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
         assert!(prompt.contains("This also applies to MCP tools"));
+    }
+
+    #[test]
+    fn system_prompt_reminds_model_to_check_skills_when_unsure() {
+        let mut available = SkipSet::new(16);
+        available.insert("enable_tools".to_string());
+        available.insert("discover_skills".to_string());
+        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        assert!(prompt.contains("If you are unsure how to solve the user's request"));
+        assert!(prompt.contains("Use `discover_skills` to inspect the currently available skills"));
+    }
+
+    #[test]
+    fn system_prompt_prefers_discover_skills_before_freeform_when_no_skill_active() {
+        let mut available = SkipSet::new(16);
+        available.insert("enable_tools".to_string());
+        available.insert("discover_skills".to_string());
+        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        assert!(prompt.contains("Call `discover_skills` early instead of guessing"));
+        assert!(prompt.contains("No skill is active yet"));
+        assert!(prompt.contains("prefer calling `discover_skills` before giving a freeform response"));
     }
 
     fn tool(name: &str) -> ToolDefinition {
@@ -1165,6 +1198,10 @@ mod tests {
         assert!(!names.contains(&"search_files".to_string()));
     }
 
+    fn model_path() -> std::path::PathBuf {
+        crate::ai::driver::skill_match_model::default_model_path()
+    }
+
     #[test]
     fn local_selector_chooses_review_skill_for_review_request() {
         let intent = UserIntent::new(CoreIntent::RequestAction);
@@ -1172,7 +1209,7 @@ mod tests {
             skill("code-review", "Review code changes and highlight bugs"),
             skill("debugger", "Debug runtime failures and collect traces"),
         ];
-        let selected = select_skill_with_preference(&skills, "帮我 review 这段 Rust 代码", &intent, None);
+        let selected = select_skill_with_preference(&skills, "帮我 review 这段 Rust 代码", &intent, None, &model_path());
         assert_eq!(selected.map(|item| item.name.as_str()), Some("code-review"));
     }
 
@@ -1184,7 +1221,7 @@ mod tests {
             skill("debugger", "Debug runtime failures, panic, and stack traces"),
         ];
         let selected =
-            select_skill_with_preference(&skills, "帮我看一下这段代码哪里有问题", &intent, Some("code-review"));
+            select_skill_with_preference(&skills, "帮我看一下这段代码哪里有问题", &intent, Some("code-review"), &model_path());
         assert_eq!(selected.map(|item| item.name.as_str()), Some("code-review"));
     }
 
@@ -1200,6 +1237,7 @@ mod tests {
             "程序 panic 了，帮我调试这个 crash 和 stack trace",
             &intent,
             Some("code-review"),
+            &model_path(),
         );
         assert_eq!(selected.map(|item| item.name.as_str()), Some("debugger"));
     }
@@ -1225,6 +1263,7 @@ mod tests {
             &intent,
             Some("debugger"),
             PreferenceStrength::CrossTurnBias,
+            &model_path(),
         );
         assert_eq!(selected.map(|item| item.name.as_str()), Some("debugger"));
     }
@@ -1242,6 +1281,7 @@ mod tests {
             &intent,
             Some("debugger"),
             PreferenceStrength::CrossTurnBias,
+            &model_path(),
         );
         assert_eq!(selected.map(|item| item.name.as_str()), Some("code-review"));
     }

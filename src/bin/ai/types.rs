@@ -29,6 +29,7 @@ pub(super) struct AppConfig {
     pub(super) intent_model: Option<String>,
     pub(super) intent_model_path: PathBuf,
     pub(super) agent_route_model_path: PathBuf,
+    pub(super) skill_match_model_path: PathBuf,
 }
 
 /// Main application state holding CLI arguments, configuration,
