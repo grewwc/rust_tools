@@ -170,6 +170,13 @@ impl McpClient {
             || e.contains("failed to get stdout")
     }
 
+    fn is_user_interrupt_error(err: &str) -> bool {
+        let e = err.to_lowercase();
+        e.contains("canceled by user")
+            || e.contains("cancelled by user")
+            || e.contains("interrupted by user")
+    }
+
     fn restart_connection(&self, conn: &mut McpServerConnection) -> Result<(), String> {
         let cfg = conn.config.clone();
 
@@ -448,6 +455,17 @@ impl McpClient {
                     .unwrap_or("")
                     .to_string();
                 return Ok(content);
+            }
+            Err(err) if Self::is_user_interrupt_error(&err) => {
+                let restart_res = self.restart_connection(&mut conn);
+                drop(conn);
+                return match restart_res {
+                    Ok(()) => Err(format!("MCP tool call canceled by user (Ctrl+C): {}", tool_name)),
+                    Err(restart_err) => Err(format!(
+                        "MCP tool call canceled by user (Ctrl+C): {} | restart failed: {}",
+                        tool_name, restart_err
+                    )),
+                };
             }
             Err(err) if Self::is_transport_error(&err) => {
                 // Try restart once and retry

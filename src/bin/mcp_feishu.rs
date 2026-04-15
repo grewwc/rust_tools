@@ -1,6 +1,8 @@
 use std::io::{self, BufRead, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -16,7 +18,6 @@ struct CachedToken {
     expires_at: Instant,
 }
 
-static APP_TOKEN_CACHE: OnceLock<Mutex<Option<CachedToken>>> = OnceLock::new();
 static USER_TOKEN_CACHE: OnceLock<Mutex<Option<CachedToken>>> = OnceLock::new();
 
 fn main() {
@@ -235,7 +236,7 @@ fn handle_tools_list() -> Result<Value, JsonRpcErr> {
             },
             {
                 "name": "oauth_exchange_code",
-                "description": "Exchange OAuth code for user_access_token (requires app_id/app_secret). Returns user_access_token and refresh_token.",
+                "description": "Exchange OAuth code for user_access_token (requires client_id/client_secret; legacy app_id/app_secret is still accepted). Returns user_access_token and refresh_token.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -246,7 +247,7 @@ fn handle_tools_list() -> Result<Value, JsonRpcErr> {
             },
             {
                 "name": "oauth_refresh_user_access_token",
-                "description": "Refresh user_access_token using refresh_token (requires app_id/app_secret).",
+                "description": "Refresh user_access_token using refresh_token (requires client_id/client_secret; legacy app_id/app_secret is still accepted).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -3280,13 +3281,15 @@ fn resolve_stored_user_access_token() -> Option<(String, Option<i64>)> {
     Some((token, expires_at))
 }
 
-fn resolve_app_credentials() -> Option<(String, String)> {
-    let env_id = std::env::var("FEISHU_APP_ID")
+fn resolve_client_credentials() -> Option<(String, String)> {
+    let env_id = std::env::var("FEISHU_CLIENT_ID")
         .ok()
-        .map(|v| v.trim().to_string());
-    let env_secret = std::env::var("FEISHU_APP_SECRET")
+        .map(|v| v.trim().to_string())
+        .or_else(|| std::env::var("FEISHU_APP_ID").ok().map(|v| v.trim().to_string()));
+    let env_secret = std::env::var("FEISHU_CLIENT_SECRET")
         .ok()
-        .map(|v| v.trim().to_string());
+        .map(|v| v.trim().to_string())
+        .or_else(|| std::env::var("FEISHU_APP_SECRET").ok().map(|v| v.trim().to_string()));
     if let (Some(id), Some(secret)) = (env_id, env_secret)
         && !id.is_empty()
         && !secret.is_empty()
@@ -3295,10 +3298,14 @@ fn resolve_app_credentials() -> Option<(String, String)> {
     }
 
     let cfg = configw::get_all_config();
-    let id = cfg.get_opt("feishu.app_id").map(|v| v.trim().to_string());
+    let id = cfg
+        .get_opt("feishu.client_id")
+        .map(|v| v.trim().to_string())
+        .or_else(|| cfg.get_opt("feishu.app_id").map(|v| v.trim().to_string()));
     let secret = cfg
-        .get_opt("feishu.app_secret")
-        .map(|v| v.trim().to_string());
+        .get_opt("feishu.client_secret")
+        .map(|v| v.trim().to_string())
+        .or_else(|| cfg.get_opt("feishu.app_secret").map(|v| v.trim().to_string()));
     match (id, secret) {
         (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => Some((id, secret)),
         _ => None,
@@ -3510,18 +3517,38 @@ fn refresh_user_access_token_api(
     base_url: &str,
     refresh_token: &str,
 ) -> Result<RefreshedUserToken, JsonRpcErr> {
-    let app_access_token = get_app_access_token_cached(client, base_url)?;
+    let Some((client_id, client_secret)) = resolve_client_credentials() else {
+        return Err(json_rpc_error(
+            -32000,
+            "Missing Feishu client credentials (client_id/client_secret)",
+            Some(json!({
+                "env": [
+                    "FEISHU_CLIENT_ID",
+                    "FEISHU_CLIENT_SECRET",
+                    "FEISHU_APP_ID",
+                    "FEISHU_APP_SECRET"
+                ],
+                "config_keys": [
+                    "feishu.client_id",
+                    "feishu.client_secret",
+                    "feishu.app_id",
+                    "feishu.app_secret"
+                ]
+            })),
+        ));
+    };
     let url = format!(
-        "{}/open-apis/authen/v1/refresh_access_token",
+        "{}/open-apis/authen/v2/oauth/token",
         base_url.trim_end_matches('/')
     );
     let body = json!({
         "grant_type": "refresh_token",
+        "client_id": client_id,
+        "client_secret": client_secret,
         "refresh_token": refresh_token
     });
     let resp = client
         .post(url)
-        .header("Authorization", format!("Bearer {}", app_access_token))
         .header("Content-Type", "application/json; charset=utf-8")
         .json(&body)
         .send()
@@ -3563,163 +3590,61 @@ fn refresh_user_access_token_api(
             Some(v),
         ));
     }
-    let data = v.get("data").cloned().unwrap_or_else(|| json!({}));
-    let user_access_token = data
+    let user_access_token = v
         .get("access_token")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
         .to_string();
-    let refresh_token = data
+    let next_refresh_token = v
         .get("refresh_token")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
         .to_string();
-    let expires_in = data
+    let expires_in = v
         .get("expires_in")
         .and_then(|v| v.as_i64())
         .unwrap_or(0)
         .max(60) as u64;
-    let refresh_expires_in = data
-        .get("refresh_expires_in")
+    let refresh_expires_in = v
+        .get("refresh_token_expires_in")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
     if user_access_token.is_empty() {
         return Err(json_rpc_error(
             -32000,
             "Missing access_token in refresh response",
-            Some(data),
+            Some(v),
         ));
     }
     Ok(RefreshedUserToken {
         user_access_token,
-        refresh_token,
+        refresh_token: next_refresh_token,
         expires_at: Instant::now() + Duration::from_secs(expires_in),
         refresh_expires_in,
     })
 }
-fn get_app_access_token_cached(client: &Client, base_url: &str) -> Result<String, JsonRpcErr> {
-    let cache = APP_TOKEN_CACHE.get_or_init(|| Mutex::new(None));
-    let now = Instant::now();
-    if let Ok(guard) = cache.lock()
-        && let Some(cached) = guard.as_ref()
-        && cached.expires_at > now + Duration::from_secs(300)
-    {
-        return Ok(cached.token.clone());
-    }
-
-    let Some((app_id, app_secret)) = resolve_app_credentials() else {
-        return Err(json_rpc_error(
-            -32000,
-            "Missing Feishu app credentials (app_id/app_secret)",
-            Some(json!({
-                "env": ["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
-                "config_keys": ["feishu.app_id", "feishu.app_secret"]
-            })),
-        ));
-    };
-
-    let (token, expires_at) = fetch_app_access_token(client, base_url, &app_id, &app_secret)?;
-    if let Ok(mut guard) = cache.lock() {
-        *guard = Some(CachedToken {
-            token: token.clone(),
-            expires_at,
-        });
-    }
-    Ok(token)
-}
-
-fn fetch_app_access_token(
-    client: &Client,
-    base_url: &str,
-    app_id: &str,
-    app_secret: &str,
-) -> Result<(String, Instant), JsonRpcErr> {
-    let url = format!(
-        "{}/open-apis/auth/v3/app_access_token/internal",
-        base_url.trim_end_matches('/')
-    );
-    let body = json!({
-        "app_id": app_id,
-        "app_secret": app_secret
-    });
-
-    let resp = client
-        .post(url)
-        .header("Content-Type", "application/json; charset=utf-8")
-        .json(&body)
-        .send()
-        .map_err(|e| {
-            json_rpc_error(
-                -32000,
-                "Failed to call app_access_token API",
-                Some(json!({ "error": e.to_string() })),
-            )
-        })?;
-
-    let status = resp.status();
-    let text = resp.text().map_err(|e| {
-        json_rpc_error(
-            -32000,
-            "Failed to read app_access_token response body",
-            Some(json!({ "error": e.to_string() })),
-        )
-    })?;
-    if !status.is_success() {
-        return Err(json_rpc_error(
-            -32000,
-            "app_access_token API returned non-success HTTP status",
-            Some(json!({ "status": status.as_u16(), "body": text })),
-        ));
-    }
-
-    let v: Value = serde_json::from_str(&text).map_err(|e| {
-        json_rpc_error(
-            -32000,
-            "app_access_token response is not valid JSON",
-            Some(json!({ "error": e.to_string(), "body": text })),
-        )
-    })?;
-    let code = v.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-    if code != 0 {
-        return Err(json_rpc_error(
-            -32000,
-            "app_access_token API returned error code",
-            Some(v),
-        ));
-    }
-
-    let token = v
-        .get("app_access_token")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if token.is_empty() {
-        return Err(json_rpc_error(
-            -32000,
-            "app_access_token missing in response",
-            Some(v),
-        ));
-    }
-    let expire = v
-        .get("expire")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0)
-        .max(60) as u64;
-    let expires_at = Instant::now() + Duration::from_secs(expire);
-    Ok((token, expires_at))
-}
 
 fn feishu_oauth_authorize_url(args: &Value) -> Result<String, JsonRpcErr> {
     let cfg = configw::get_all_config();
-    let app_id = cfg
-        .get_opt("feishu.app_id")
+    let client_id = cfg
+        .get_opt("feishu.client_id")
+        .or_else(|| cfg.get_opt("feishu.app_id"))
+        .or_else(|| std::env::var("FEISHU_CLIENT_ID").ok())
         .or_else(|| std::env::var("FEISHU_APP_ID").ok())
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| json_rpc_error(-32000, "Missing feishu.app_id / FEISHU_APP_ID", None))?;
+        .ok_or_else(|| {
+            json_rpc_error(
+                -32000,
+                "Missing feishu.client_id / FEISHU_CLIENT_ID",
+                Some(json!({
+                    "legacy_env": ["FEISHU_APP_ID"],
+                    "legacy_config_keys": ["feishu.app_id"]
+                })),
+            )
+        })?;
 
     let base_url = resolve_base_url();
     let accounts_base = resolve_accounts_base_url(&base_url);
@@ -3757,7 +3682,7 @@ fn feishu_oauth_authorize_url(args: &Value) -> Result<String, JsonRpcErr> {
     let mut url = format!(
         "{}/open-apis/authen/v1/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}&state={}",
         accounts_base.trim_end_matches('/'),
-        url_encode_component(&app_id),
+        url_encode_component(&client_id),
         encoded_redirect,
         encoded_scope,
         encoded_state
@@ -3810,9 +3735,14 @@ fn feishu_oauth_wait_local_code(args: &Value) -> Result<String, JsonRpcErr> {
     }
 
     let (tx, rx) = mpsc::channel::<String>();
-    std::thread::spawn(move || {
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let worker_stop_flag = Arc::clone(&stop_flag);
+    let worker = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(timeout_sec);
         loop {
+            if worker_stop_flag.load(Ordering::Relaxed) {
+                break;
+            }
             if Instant::now() >= deadline {
                 break;
             }
@@ -3865,14 +3795,17 @@ fn feishu_oauth_wait_local_code(args: &Value) -> Result<String, JsonRpcErr> {
         }
     });
 
-    match rx.recv_timeout(Duration::from_secs(timeout_sec)) {
+    let result = match rx.recv_timeout(Duration::from_secs(timeout_sec)) {
         Ok(code) => Ok(format!("code: {code}\nport: {port}\npath: /callback")),
         Err(_) => Err(json_rpc_error(
             -32000,
             "Timeout waiting for OAuth code",
             Some(json!({ "port": port, "timeout_sec": timeout_sec })),
         )),
-    }
+    };
+    stop_flag.store(true, Ordering::Relaxed);
+    let _ = worker.join();
+    result
 }
 
 fn read_http_request(stream: &mut TcpStream) -> String {
@@ -4015,6 +3948,26 @@ fn feishu_oauth_exchange_code(args: &Value) -> Result<String, JsonRpcErr> {
             None,
         ));
     }
+    let Some((client_id, client_secret)) = resolve_client_credentials() else {
+        return Err(json_rpc_error(
+            -32000,
+            "Missing Feishu client credentials (client_id/client_secret)",
+            Some(json!({
+                "env": [
+                    "FEISHU_CLIENT_ID",
+                    "FEISHU_CLIENT_SECRET",
+                    "FEISHU_APP_ID",
+                    "FEISHU_APP_SECRET"
+                ],
+                "config_keys": [
+                    "feishu.client_id",
+                    "feishu.client_secret",
+                    "feishu.app_id",
+                    "feishu.app_secret"
+                ]
+            })),
+        ));
+    };
     let base_url = resolve_base_url();
     let client = Client::builder()
         .timeout(Duration::from_secs(8))
@@ -4027,18 +3980,18 @@ fn feishu_oauth_exchange_code(args: &Value) -> Result<String, JsonRpcErr> {
             )
         })?;
 
-    let app_access_token = get_app_access_token_cached(&client, &base_url)?;
     let url = format!(
-        "{}/open-apis/authen/v1/access_token",
+        "{}/open-apis/authen/v2/oauth/token",
         base_url.trim_end_matches('/')
     );
     let body = json!({
         "grant_type": "authorization_code",
+        "client_id": client_id,
+        "client_secret": client_secret,
         "code": code
     });
     let resp = client
         .post(url)
-        .header("Authorization", format!("Bearer {}", app_access_token))
         .header("Content-Type", "application/json; charset=utf-8")
         .json(&body)
         .send()
@@ -4080,22 +4033,21 @@ fn feishu_oauth_exchange_code(args: &Value) -> Result<String, JsonRpcErr> {
             Some(v),
         ));
     }
-    let data = v.get("data").cloned().unwrap_or_else(|| json!({}));
-    let access_token = data
+    let access_token = v
         .get("access_token")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
         .to_string();
-    let refresh_token = data
+    let refresh_token = v
         .get("refresh_token")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .trim()
         .to_string();
-    let expires_in = data.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(0);
-    let refresh_expires_in = data
-        .get("refresh_expires_in")
+    let expires_in = v.get("expires_in").and_then(|v| v.as_i64()).unwrap_or(0);
+    let refresh_expires_in = v
+        .get("refresh_token_expires_in")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
 
@@ -4103,7 +4055,7 @@ fn feishu_oauth_exchange_code(args: &Value) -> Result<String, JsonRpcErr> {
         return Err(json_rpc_error(
             -32000,
             "Missing access_token in response",
-            Some(data),
+            Some(v),
         ));
     }
 

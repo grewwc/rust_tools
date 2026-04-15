@@ -7,15 +7,40 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
+const MCP_POLL_SLICE_MS: u64 = 100;
+
+fn tool_cancel_error() -> String {
+    "MCP request canceled by user".to_string()
+}
+
+fn tool_cancel_requested() -> bool {
+    crate::ai::tools::registry::common::is_tool_cancel_requested()
+}
+
 #[cfg(unix)]
 fn wait_fd_readable(fd: i32, timeout_ms: u64) -> Result<(), String> {
-    let timeout = if timeout_ms > i32::MAX as u64 {
-        i32::MAX
-    } else {
-        timeout_ms as i32
-    };
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
     loop {
+        if tool_cancel_requested() {
+            return Err(tool_cancel_error());
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(format!("MCP response timeout after {} ms", timeout_ms));
+        }
+        let mut remaining_ms = deadline.saturating_duration_since(now).as_millis();
+        if remaining_ms == 0 {
+            remaining_ms = 1;
+        }
+        if remaining_ms > MCP_POLL_SLICE_MS as u128 {
+            remaining_ms = MCP_POLL_SLICE_MS as u128;
+        }
+        if remaining_ms > i32::MAX as u128 {
+            remaining_ms = i32::MAX as u128;
+        }
+        let timeout = remaining_ms as i32;
+
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,
@@ -26,7 +51,7 @@ fn wait_fd_readable(fd: i32, timeout_ms: u64) -> Result<(), String> {
             return Ok(());
         }
         if rc == 0 {
-            return Err(format!("MCP response timeout after {} ms", timeout_ms));
+            continue;
         }
 
         let err = std::io::Error::last_os_error();
@@ -39,6 +64,9 @@ fn wait_fd_readable(fd: i32, timeout_ms: u64) -> Result<(), String> {
 
 #[cfg(not(unix))]
 fn wait_fd_readable(_fd: i32, _timeout_ms: u64) -> Result<(), String> {
+    if tool_cancel_requested() {
+        return Err(tool_cancel_error());
+    }
     Ok(())
 }
 
@@ -62,6 +90,9 @@ pub(super) fn read_line_with_timeout_buf<R: std::io::Read>(
     let mut buf = Vec::<u8>::new();
 
     loop {
+        if tool_cancel_requested() {
+            return Err(tool_cancel_error());
+        }
         let now = Instant::now();
         if now >= deadline {
             return Err(format!("MCP response timeout after {} ms", timeout_ms));
