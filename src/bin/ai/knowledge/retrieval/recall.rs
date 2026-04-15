@@ -158,11 +158,7 @@ pub fn build_auto_recalled_knowledge(
     max_chars: usize,
     config: &KnowledgeConfig,
 ) -> Option<AutoRecalledKnowledge> {
-    let project_hint = if should_use_project_context(question) {
-        current_project_hint()
-    } else {
-        None
-    };
+    let project_hint = current_project_hint();
     build_auto_recalled_knowledge_with_project(
         store,
         question,
@@ -180,37 +176,26 @@ pub fn build_auto_recalled_knowledge_with_project(
     project_hint: Option<&str>,
     config: &KnowledgeConfig,
 ) -> Option<AutoRecalledKnowledge> {
-    if should_skip_auto_recall(question) {
+    let q = question.trim();
+    if q.is_empty() {
         return None;
     }
 
     let project_hint = project_hint
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .filter(|_| should_use_project_context(question))
         .map(|s| s.to_string());
 
     let mut entries: Vec<KnowledgeEntry> = Vec::new();
     let mut seen = rust_tools::cw::SkipSet::new(32);
 
-    // Build query variants
     let mut query_variants = Vec::new();
-    let q = question.trim();
-    if !q.is_empty() {
-        query_variants.push(q.to_string());
-        if let Some(project) = project_hint.as_deref() {
-            query_variants.push(format!("{q} {project}"));
-        }
-    }
+    query_variants.push(q.to_string());
     if let Some(project) = project_hint.as_deref() {
-        query_variants.push(project.to_string());
+        query_variants.push(format!("{q} {project}"));
     }
 
-    // Search by query variants
     for query in &query_variants {
-        if query.trim().is_empty() {
-            continue;
-        }
         if let Ok(results) = keyword_search::keyword_search(store, query, 30, config) {
             for (entry, score) in results {
                 if score < config.thresholds.min_score_knowledge {
@@ -227,21 +212,12 @@ pub fn build_auto_recalled_knowledge_with_project(
         }
     }
 
-    // Note: Removed blind project-matching fallback.
-    // If the question is truly project-related, the keyword search above
-    // (which includes "{question} {project}" as a query variant) should
-    // naturally surface relevant entries. Forcing project entries into
-    // context for every turn causes false positives and wastes tokens.
-    // Let the model use knowledge_search tool when it needs project context.
-
     if entries.is_empty() {
         return None;
     }
 
-    // Deduplicate
     deduplicate_entries(&mut entries, config.thresholds.dedup_similarity_knowledge);
 
-    // Sort: project match > priority > recency
     let project_hint_lc = project_hint.as_deref().map(|s| s.to_lowercase());
     entries.sort_by(|a, b| {
         let a_project = project_hint_lc
@@ -266,7 +242,6 @@ pub fn build_auto_recalled_knowledge_with_project(
             })
     });
 
-    // Format output
     let max_entries = if project_hint.is_some() {
         config.thresholds.max_entries_with_project
     } else {
@@ -384,129 +359,6 @@ fn should_include_in_auto_recall(entry: &KnowledgeEntry) -> bool {
         entry.category_enum(),
         Category::UserMemory | Category::ProjectInfo | Category::Architecture | Category::DecisionLog
     )
-}
-
-fn should_skip_auto_recall(question: &str) -> bool {
-    let q = question.trim().to_lowercase();
-    if q.is_empty() {
-        return false;
-    }
-
-    is_generic_generation_request(&q) && !should_use_project_context(&q)
-}
-
-fn should_use_project_context(question: &str) -> bool {
-    let q = question.trim().to_lowercase();
-    if q.is_empty() {
-        return false;
-    }
-
-    q.contains('/')
-        || q.contains('\\')
-        || q.contains("::")
-        || q.contains(".rs")
-        || q.contains(".py")
-        || q.contains(".ts")
-        || q.contains(".tsx")
-        || q.contains(".js")
-        || q.contains(".jsx")
-        || q.contains(".java")
-        || q.contains(".go")
-        || q.contains(".json")
-        || q.contains("panic")
-        || q.contains("traceback")
-        || q.contains("stack trace")
-        || q.contains("compile error")
-        || q.contains("build error")
-        || q.contains("cargo ")
-        || contains_any(
-            &q,
-            &[
-                "this project",
-                "this repo",
-                "current repo",
-                "current project",
-                "repository",
-                "repo",
-                "project structure",
-                "codebase",
-                "source code",
-                "file",
-                "files",
-                "path",
-                "module",
-                "function",
-                "struct",
-                "enum",
-                "trait",
-                "impl",
-                "implementation",
-                "call chain",
-                "bug",
-                "error",
-                "failure",
-                "endpoint",
-                "config",
-                "workspace",
-                "这个项目",
-                "当前项目",
-                "这个仓库",
-                "当前仓库",
-                "代码库",
-                "项目结构",
-                "源码",
-                "文件",
-                "路径",
-                "目录",
-                "模块",
-                "函数",
-                "结构体",
-                "枚举",
-                "实现",
-                "调用链",
-                "报错",
-                "错误",
-                "异常",
-                "编译",
-                "配置",
-            ],
-        )
-}
-
-fn is_generic_generation_request(question: &str) -> bool {
-    contains_any(
-        question,
-        &[
-            "help me write",
-            "write a",
-            "write an",
-            "generate",
-            "create",
-            "draft",
-            "summarize",
-            "translate",
-            "polish",
-            "example code",
-            "sample code",
-            "python code",
-            "帮我写",
-            "写一段",
-            "写个",
-            "生成",
-            "来一段",
-            "总结",
-            "翻译",
-            "润色",
-            "示例代码",
-            "python 代码",
-            "10 行",
-            "10行",
-        ],
-    )
-}
-
-fn contains_any(haystack: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn deduplicate_entries(entries: &mut Vec<KnowledgeEntry>, similarity_threshold: f64) {
@@ -639,10 +491,7 @@ fn append_notes(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_auto_recalled_knowledge_with_project, is_generic_generation_request,
-        should_skip_auto_recall, should_use_project_context,
-    };
+    use super::build_auto_recalled_knowledge_with_project;
     use crate::ai::knowledge::config::KnowledgeConfig;
     use crate::ai::knowledge::entry::KnowledgeEntry;
     use crate::ai::knowledge::storage::jsonl_store::JsonlStore;
@@ -670,43 +519,23 @@ mod tests {
     }
 
     #[test]
-    fn generic_generation_requests_are_detected() {
-        assert!(is_generic_generation_request("help me write 10 lines of python code"));
-        assert!(should_skip_auto_recall("帮我写一段 10 行的 python 代码"));
-        assert!(!should_use_project_context("帮我写一段 10 行的 python 代码"));
-    }
-
-    #[test]
-    fn project_questions_enable_project_context() {
-        assert!(should_use_project_context(
-            "Which file in this project defines endpoint_for_model?"
-        ));
-        assert!(should_use_project_context("这个项目里哪个文件定义了 endpoint_for_model？"));
-        assert!(!should_skip_auto_recall(
-            "这个项目里哪个文件定义了 endpoint_for_model？"
-        ));
-    }
-
-    #[test]
-    fn generic_generation_request_returns_none_even_with_matching_project_memory() {
-        let path = test_store_path("generic_skip");
+    fn empty_question_returns_none() {
+        let path = test_store_path("empty_q");
         let store = JsonlStore::new(path.clone());
         append_entry(
             &store,
             "user_memory",
-            "rust_tools prefers concise Python snippets for quick experiments.",
+            "rust_tools prefers concise Python snippets.",
             "rust_tools",
             180,
         );
-
         let recalled = build_auto_recalled_knowledge_with_project(
             &store,
-            "帮我写一段 10 行的 python 代码",
+            "",
             1200,
             Some("rust_tools"),
             &KnowledgeConfig::default(),
         );
-
         assert!(recalled.is_none());
         let _ = std::fs::remove_file(path);
     }
