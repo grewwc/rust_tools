@@ -112,8 +112,14 @@ fn run_feishu_oauth_flow(
         ));
     };
 
-    let exchange_out =
-        mcp_client.call_tool(server_name, "oauth_exchange_code", json!({ "code": code }))?;
+    let exchange_out = mcp_client.call_tool(
+        server_name,
+        "oauth_exchange_code",
+        json!({
+            "code": code,
+            "redirect_uri": redirect_uri
+        }),
+    )?;
     println!("\n[feishu] {}\n", exchange_out.trim());
     Ok(())
 }
@@ -144,8 +150,10 @@ pub(super) fn execute_mcp_tool_call(
         }),
         Err(err) if !tool_name.starts_with("oauth_") && looks_like_feishu_oauth_required(&err) => {
             let scope = oauth_scope_from_error(&err);
-            run_feishu_oauth_flow(mcp_client, server_name, &scope)
-                .map_err(|e| format!("feishu oauth failed: {}", e))?;
+            if let Err(oauth_err) = run_feishu_oauth_flow(mcp_client, server_name, &scope) {
+                let _ = mcp_client.reset_server(server_name);
+                return Err(format!("feishu oauth failed: {}", oauth_err));
+            }
             let content = mcp_client.call_tool(server_name, tool_name, args.clone())?;
             Ok(ToolResult {
                 tool_call_id: tool_call.id.clone(),

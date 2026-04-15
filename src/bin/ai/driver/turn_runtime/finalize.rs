@@ -2,7 +2,7 @@ use colored::Colorize;
 use serde_json::Value;
 use crate::ai::{
     driver::{print::format_empty_state, reflection},
-    history::Message,
+    history::{Message, compact_session_history_with_app},
     types::App,
 };
 
@@ -131,6 +131,9 @@ pub(super) async fn finalize_turn(
             turn_messages,
             persisted_turn_messages,
         );
+        if let Err(err) = compact_session_history_with_app(app).await {
+            eprintln!("[Warning] Failed to compact persisted history: {}", err);
+        }
         println!();
         maybe_spawn_critic_revise_background(app, question, final_assistant_text);
     } else {

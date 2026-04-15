@@ -75,6 +75,28 @@ pub(in crate::ai) fn append_history_messages(path: &Path, messages: &[Message]) 
     append_history(path, &blob)
 }
 
+pub(in crate::ai) fn append_history_messages_uncompacted(
+    path: &Path,
+    messages: &[Message],
+) -> io::Result<()> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+
+    let newline = NEWLINE.to_string();
+    let mut records = Vec::with_capacity(messages.len());
+    for message in messages {
+        let record = serde_json::to_string(message).map_err(|e| io::Error::other(e.to_string()))?;
+        records.push(record);
+    }
+    let blob = format!("{}{}", records.join(&newline), newline);
+
+    if is_sqlite_path(path) {
+        return sqlite::append_history_sqlite_uncompacted(path, messages.to_vec());
+    }
+    append_history_blob(path, &blob)
+}
+
 fn append_history_blob(path: &Path, content: &str) -> io::Result<()> {
     let mut file = open_file_for_append(path, 0o664)?;
     use std::io::Write;
@@ -94,6 +116,10 @@ fn serialize_history_messages(messages: &[Message]) -> String {
     } else {
         format!("{}{}", records.join(&newline), newline)
     }
+}
+
+pub(in crate::ai) fn serialize_history_messages_for_storage(messages: &[Message]) -> String {
+    serialize_history_messages(messages)
 }
 
 pub(in crate::ai) fn delete_history_artifacts(path: &Path) -> io::Result<()> {

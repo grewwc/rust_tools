@@ -170,6 +170,13 @@ impl McpClient {
             || e.contains("failed to get stdout")
     }
 
+    fn is_protocol_desync_error(err: &str) -> bool {
+        let e = err.to_lowercase();
+        e.contains("mcp response id mismatch")
+            || e.contains("failed to parse response")
+            || e.contains("invalid json-rpc version")
+    }
+
     fn is_user_interrupt_error(err: &str) -> bool {
         let e = err.to_lowercase();
         e.contains("canceled by user")
@@ -222,6 +229,17 @@ impl McpClient {
         conn.resources = self.list_resources(conn)?;
         conn.prompts = self.list_prompts(conn)?;
         Ok(())
+    }
+
+    pub(in crate::ai) fn reset_server(&self, server_name: &str) -> Result<(), String> {
+        let conn_cell = self
+            .servers
+            .get(server_name)
+            .ok_or_else(|| format!("Server not found: {}", server_name))?;
+        let mut conn = conn_cell
+            .lock()
+            .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
+        self.restart_connection(&mut conn)
     }
 
     pub(in crate::ai) fn rebuild_metadata_cache(&mut self) {
@@ -467,7 +485,7 @@ impl McpClient {
                     )),
                 };
             }
-            Err(err) if Self::is_transport_error(&err) => {
+            Err(err) if Self::is_transport_error(&err) || Self::is_protocol_desync_error(&err) => {
                 // Try restart once and retry
                 let restart_res = self.restart_connection(&mut conn);
                 drop(conn);
@@ -488,9 +506,14 @@ impl McpClient {
                         return Ok(content);
                     }
                     Err(restart_err) => {
+                        let kind = if Self::is_protocol_desync_error(&err) {
+                            "Protocol desync"
+                        } else {
+                            "Transport error"
+                        };
                         return Err(format!(
-                            "Transport error: {} | restart failed: {}",
-                            err, restart_err
+                            "{}: {} | restart failed: {}",
+                            kind, err, restart_err
                         ));
                     }
                 }

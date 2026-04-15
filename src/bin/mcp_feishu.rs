@@ -13,6 +13,8 @@ use rust_tools::commonw::{FastMap, configw};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+const FEISHU_SCOPE: &str = "sheets:spreadsheet:write_only sheets:spreadsheet:create docs:document:export sheets:spreadsheet.meta:read docs:document.content:read drive:drive.search:readonly search:docs:read docx:document:readonly wiki:node:read wiki:wiki:readonly wiki:node:retrieve sheets:spreadsheet:read offline_access contact:user.employee_id:readonly im:message:send_as_bot drive:drive.metadata:readonly drive:file.meta.sec_label.read_only directory:department.base:read docs:document.media:download docs:doc base:app:create base:app:read base:app:update base:field:create base:field:delete base:field:update base:form:read base:form:update base:record:create base:record:delete base:record:read base:record:update base:table:create base:table:delete base:table:update base:view:read base:view:write_only docs:permission.member:create drive:file:download drive:file:upload sheets:spreadsheet.meta:write_only space:folder:create search:suite_dataset:readonly docs:document.media:upload docs:document:import docx:document:create docx:document:write_only docs:permission.member:transfer contact:contact.base:readonly board:whiteboard:node:read docs:document.comment:read base:table:read base:record:retrieve base:field:read im:chat:read im:chat.members:read docs:document.comment:update docs:permission.setting:write_only docs:permission.member:auth docs:document.comment:create task:task:read calendar:calendar.event:read calendar:calendar:read docs:permission.member:retrieve contact:user.base:readonly docs:event:subscribe base:app:copy";
+
 struct CachedToken {
     token: String,
     expires_at: Instant,
@@ -243,7 +245,8 @@ fn handle_tools_list() -> Result<Value, JsonRpcErr> {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "code": { "type": "string", "description": "OAuth authorization code (valid ~5 minutes, single-use)" }
+                        "code": { "type": "string", "description": "OAuth authorization code (valid ~5 minutes, single-use)" },
+                        "redirect_uri": { "type": "string", "description": "Must match the redirect_uri used in oauth_authorize_url. Default: http://127.0.0.1:8711/callback" }
                     },
                     "required": ["code"]
                 }
@@ -2678,6 +2681,18 @@ fn should_prefer_docx_blocks_render(raw_content: &str, blocks_text: &str) -> boo
         return false;
     }
 
+    if rendered.contains("```") {
+        return true;
+    }
+
+    if rendered.contains("| --- |") {
+        return true;
+    }
+
+    if rendered.contains("- [ ] ") || rendered.contains("- [x] ") {
+        return true;
+    }
+
     docx_blocks_text_has_non_text_placeholders(rendered)
 }
 
@@ -2727,7 +2742,7 @@ fn render_docx_blocks_as_text(items: &[Value], default_origin: Option<&str>) -> 
     };
 
     let mut out = String::new();
-    render_docx_block_text(&root_id, &by_id, default_origin, &mut out);
+    render_docx_block_text(&root_id, &by_id, default_origin, &mut out, 0, 0);
     normalize_rendered_docx_text(&out)
 }
 
@@ -2736,6 +2751,8 @@ fn render_docx_block_text(
     by_id: &FastMap<String, &Value>,
     default_origin: Option<&str>,
     out: &mut String,
+    list_depth: usize,
+    quote_depth: usize,
 ) {
     let Some(block) = by_id.get(block_id).copied() else {
         return;
@@ -2745,9 +2762,9 @@ fn render_docx_block_text(
         .get("block_type")
         .and_then(|v| v.as_i64())
         .unwrap_or(0);
-    let line = render_docx_block_line(block, default_origin);
+    let line = render_docx_block_line(block, default_origin, list_depth);
     if !line.is_empty() {
-        out.push_str(&line);
+        out.push_str(&prefix_rendered_line(&line, quote_depth));
         out.push('\n');
     }
 
@@ -2763,7 +2780,24 @@ fn render_docx_block_text(
         .unwrap_or_default();
     for child in children {
         if let Some(child_id) = child.as_str() {
-            render_docx_block_text(child_id, by_id, default_origin, out);
+            let next_depth = if matches!(block_type, 12 | 13 | 17) {
+                list_depth + 1
+            } else {
+                list_depth
+            };
+            let next_quote_depth = if block_type == 15 {
+                quote_depth + 1
+            } else {
+                quote_depth
+            };
+            render_docx_block_text(
+                child_id,
+                by_id,
+                default_origin,
+                out,
+                next_depth,
+                next_quote_depth,
+            );
         }
     }
 }
@@ -2786,6 +2820,12 @@ fn render_docx_table_cells(
         .and_then(|v| v.get("column_size"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
+    let header_row = block
+        .get("table")
+        .and_then(|v| v.get("property"))
+        .and_then(|v| v.get("header_row"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if cells.is_empty() || col_size == 0 {
         return;
     }
@@ -2811,10 +2851,14 @@ fn render_docx_table_cells(
     }
 
     for (i, row) in rows.iter().enumerate() {
+        let mut normalized_row = row.clone();
+        while normalized_row.len() < col_size {
+            normalized_row.push(String::new());
+        }
         out.push_str("| ");
-        out.push_str(&row.join(" | "));
+        out.push_str(&normalized_row.join(" | "));
         out.push_str(" |\n");
-        if i == 0 {
+        if i == 0 && header_row {
             out.push_str("|");
             for _ in 0..col_size {
                 out.push_str(" --- |");
@@ -2857,15 +2901,15 @@ fn render_docx_table_cell_text(
         let Some(child_block) = by_id.get(child_id).copied() else {
             continue;
         };
-        let line = render_docx_block_line(child_block, default_origin);
+        let line = render_docx_block_line(child_block, default_origin, 0);
         if !line.is_empty() {
             parts.push(line);
         }
     }
-    parts.join(" ")
+    parts.join("<br>")
 }
 
-fn render_docx_block_line(block: &Value, default_origin: Option<&str>) -> String {
+fn render_docx_block_line(block: &Value, default_origin: Option<&str>, list_depth: usize) -> String {
     let block_type = block
         .get("block_type")
         .and_then(|v| v.as_i64())
@@ -2901,7 +2945,7 @@ fn render_docx_block_line(block: &Value, default_origin: Option<&str>) -> String
             if text.is_empty() {
                 String::new()
             } else {
-                format!("- {}", text)
+                format!("{}- {}", "  ".repeat(list_depth), text)
             }
         }
         13 => {
@@ -2912,18 +2956,24 @@ fn render_docx_block_line(block: &Value, default_origin: Option<&str>) -> String
             if text.is_empty() {
                 String::new()
             } else {
-                format!("1. {}", text)
+                format!(
+                    "{}{}. {}",
+                    "  ".repeat(list_depth),
+                    ordered_list_sequence(block),
+                    text
+                )
             }
         }
         14 => {
-            let text = render_text_elements(
+            let text = render_code_block_elements(
                 block.get("code").and_then(|v| v.get("elements")),
                 default_origin,
             );
+            let lang = code_block_language_tag(block.get("code").and_then(|v| v.get("style")));
             if text.is_empty() {
                 String::new()
             } else {
-                format!("```text\n{}\n```", text)
+                format!("```{}\n{}\n```", lang, text)
             }
         }
         15 => {
@@ -2948,7 +2998,12 @@ fn render_docx_block_line(block: &Value, default_origin: Option<&str>) -> String
             if text.is_empty() {
                 String::new()
             } else {
-                format!("- [{}] {}", if checked { "x" } else { " " }, text)
+                format!(
+                    "{}- [{}] {}",
+                    "  ".repeat(list_depth),
+                    if checked { "x" } else { " " },
+                    text
+                )
             }
         }
         18 => render_token_placeholder(block.get("bitable"), "token", "多维表格"),
@@ -2975,6 +3030,88 @@ fn render_docx_block_line(block: &Value, default_origin: Option<&str>) -> String
         31 => String::new(),
         43 => render_token_placeholder(block.get("board"), "token", "文字绘图"),
         _ => String::new(),
+    }
+}
+
+fn prefix_rendered_line(line: &str, quote_depth: usize) -> String {
+    if quote_depth == 0 || line.is_empty() {
+        return line.to_string();
+    }
+    let prefix = format!("{} ", ">".repeat(quote_depth));
+    line.lines()
+        .map(|part| format!("{prefix}{part}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn ordered_list_sequence(block: &Value) -> String {
+    block
+        .get("ordered")
+        .and_then(|v| v.get("style"))
+        .and_then(|v| v.get("sequence"))
+        .and_then(|v| {
+            v.as_str()
+                .map(|s| s.to_string())
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        })
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "1".to_string())
+}
+
+fn render_code_block_elements(elements: Option<&Value>, default_origin: Option<&str>) -> String {
+    let Some(arr) = elements.and_then(|v| v.as_array()) else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for el in arr {
+        if let Some(text_run) = el.get("text_run") {
+            let content = text_run
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            out.push_str(content);
+            continue;
+        }
+        let fallback = render_text_elements(Some(el), default_origin);
+        if !fallback.is_empty() {
+            out.push_str(&fallback);
+        }
+    }
+    out
+}
+
+fn code_block_language_tag(style: Option<&Value>) -> String {
+    let Some(style) = style else {
+        return "text".to_string();
+    };
+    if let Some(lang) = style.get("language").and_then(|v| v.as_str()) {
+        let normalized = lang.trim().to_ascii_lowercase();
+        if !normalized.is_empty() {
+            return normalized;
+        }
+    }
+    match style.get("language").and_then(|v| v.as_i64()) {
+        Some(7) => "bash".to_string(),
+        Some(22) => "go".to_string(),
+        Some(24) => "html".to_string(),
+        Some(28) => "json".to_string(),
+        Some(29) => "java".to_string(),
+        Some(30) => "javascript".to_string(),
+        Some(32) => "kotlin".to_string(),
+        Some(39) => "markdown".to_string(),
+        Some(43) => "php".to_string(),
+        Some(49) => "python".to_string(),
+        Some(50) => "r".to_string(),
+        Some(53) => "rust".to_string(),
+        Some(56) => "sql".to_string(),
+        Some(60) => "shell".to_string(),
+        Some(63) => "typescript".to_string(),
+        Some(66) => "xml".to_string(),
+        Some(67) => "yaml".to_string(),
+        Some(68) => "cmake".to_string(),
+        Some(74) => "solidity".to_string(),
+        Some(75) => "toml".to_string(),
+        _ => "text".to_string(),
     }
 }
 
@@ -3745,12 +3882,7 @@ fn feishu_oauth_authorize_url(args: &Value) -> Result<String, JsonRpcErr> {
         ));
     }
 
-    let scope = args
-        .get("scope")
-        .and_then(|v| v.as_str())
-        .unwrap_or("offline_access im:chat:readonly im:message:readonly docs:doc:readonly docx:document:readonly wiki:wiki:readonly sheets:spreadsheet")
-        .trim()
-        .to_string();
+    let scope = FEISHU_SCOPE;
     let state = args
         .get("state")
         .and_then(|v| v.as_str())
@@ -4023,10 +4155,23 @@ fn feishu_oauth_exchange_code(args: &Value) -> Result<String, JsonRpcErr> {
         .unwrap_or("")
         .trim()
         .to_string();
+    let redirect_uri = args
+        .get("redirect_uri")
+        .and_then(|v| v.as_str())
+        .unwrap_or("http://127.0.0.1:8711/callback")
+        .trim()
+        .to_string();
     if code.is_empty() {
         return Err(json_rpc_error(
             -32602,
             "Invalid params: code is empty",
+            None,
+        ));
+    }
+    if redirect_uri.is_empty() {
+        return Err(json_rpc_error(
+            -32602,
+            "Invalid params: redirect_uri is empty",
             None,
         ));
     }
@@ -4070,7 +4215,8 @@ fn feishu_oauth_exchange_code(args: &Value) -> Result<String, JsonRpcErr> {
         "grant_type": "authorization_code",
         "client_id": client_id,
         "client_secret": client_secret,
-        "code": code
+        "code": code,
+        "redirect_uri": redirect_uri
     });
     let resp = client
         .post(url)
@@ -4486,13 +4632,8 @@ fn feishu_sheet_create_from_csv(args: &Value) -> Result<String, JsonRpcErr> {
 
     // Generate URL
     let spreadsheet_url = format!(
-        "https://{}.feishu.cn/sheets/{}",
-        base_url
-            .trim_start_matches("https://")
-            .trim_end_matches("/open-apis")
-            .split('.')
-            .next()
-            .unwrap_or("app"),
+        "{}/sheets/{}",
+        resolve_docs_web_base_url(&base_url),
         spreadsheet_token
     );
 
@@ -4680,17 +4821,18 @@ enum MdNode {
     Paragraph { elements: Vec<Value> },
     BulletList { items: Vec<ListItem> },
     OrderedList { items: Vec<ListItem> },
+    TodoList { items: Vec<ListItem> },
     CodeBlock { lang: Option<String>, content: String },
     BlockQuote { children: Vec<MdNode> },
     Table { rows: Vec<Vec<String>> },
     Divider,
-    Todo { done: bool, elements: Vec<Value> },
 }
 
 #[derive(Clone)]
 struct ListItem {
     elements: Vec<Value>,
     children: Vec<MdNode>,
+    done: Option<bool>,
 }
 
 fn count_indent(line: &str) -> usize {
@@ -4963,6 +5105,10 @@ fn parse_list_node(ctx: &mut ParseCtx, base_indent: usize) -> MdNode {
     items.push(ListItem {
         elements: parse_inline_elements(first_rest),
         children: Vec::new(),
+        done: match first_kind {
+            ListKind::Todo(done) => Some(done),
+            _ => None,
+        },
     });
     ctx.pos += 1;
 
@@ -5010,6 +5156,10 @@ fn parse_list_node(ctx: &mut ParseCtx, base_indent: usize) -> MdNode {
                 items.push(ListItem {
                     elements: parse_inline_elements(rest),
                     children: Vec::new(),
+                    done: match kind {
+                        ListKind::Todo(done) => Some(done),
+                        _ => None,
+                    },
                 });
                 ctx.pos += 1;
             } else {
@@ -5026,31 +5176,7 @@ fn parse_list_node(ctx: &mut ParseCtx, base_indent: usize) -> MdNode {
     match first_kind {
         ListKind::Bullet => MdNode::BulletList { items },
         ListKind::Ordered => MdNode::OrderedList { items },
-        ListKind::Todo(done) => {
-            let todo_items: Vec<ListItem> = items.into_iter().map(|item| {
-                let elements = item.elements.clone();
-                ListItem {
-                    elements: item.elements,
-                    children: {
-                        let mut ch = item.children;
-                        if !ch.is_empty() {
-                            ch.insert(0, MdNode::Todo { done, elements });
-                            ch
-                        } else {
-                            ch
-                        }
-                    },
-                }
-            }).collect();
-            if let Some(first) = todo_items.first() {
-                MdNode::Todo {
-                    done,
-                    elements: first.elements.clone(),
-                }
-            } else {
-                MdNode::Todo { done, elements: vec![make_text_element("", false, false, false)] }
-            }
-        }
+        ListKind::Todo(_) => MdNode::TodoList { items },
     }
 }
 
@@ -5084,6 +5210,10 @@ fn parse_nested_content(ctx: &mut ParseCtx, indent: usize) -> Vec<MdNode> {
                 let item = ListItem {
                     elements: parse_inline_elements(rest),
                     children: Vec::new(),
+                    done: match kind {
+                        ListKind::Todo(done) => Some(done),
+                        _ => None,
+                    },
                 };
                 ctx.pos += 1;
 
@@ -5120,6 +5250,10 @@ fn parse_nested_content(ctx: &mut ParseCtx, indent: usize) -> Vec<MdNode> {
                             sub_items.push(ListItem {
                                 elements: parse_inline_elements(r2),
                                 children: Vec::new(),
+                                done: match k2 {
+                                    ListKind::Todo(done) => Some(done),
+                                    _ => None,
+                                },
                             });
                             ctx.pos += 1;
                         } else {
@@ -5136,13 +5270,7 @@ fn parse_nested_content(ctx: &mut ParseCtx, indent: usize) -> Vec<MdNode> {
                 let list_node = match kind {
                     ListKind::Bullet => MdNode::BulletList { items: sub_items },
                     ListKind::Ordered => MdNode::OrderedList { items: sub_items },
-                    ListKind::Todo(done) => MdNode::Todo {
-                        done,
-                        elements: sub_items
-                            .first()
-                            .map(|it| it.elements.clone())
-                            .unwrap_or_else(|| vec![make_text_element("", false, false, false)]),
-                    },
+                    ListKind::Todo(_) => MdNode::TodoList { items: sub_items },
                 };
                 nodes.push(list_node);
             } else if trimmed.starts_with('>') {
@@ -5267,10 +5395,7 @@ fn md_node_to_block_ops(node: MdNode, id_counter: &mut usize) -> Vec<BlockOp> {
             }))]
         }
         MdNode::CodeBlock { lang, content } => {
-            let mut style = json!({});
-            if let Some(l) = lang {
-                style["language"] = json!(l);
-            }
+            let style = build_code_block_style(lang.as_deref());
             vec![BlockOp::Simple(json!({
                 "block_type": 14,
                 "code": {
@@ -5285,15 +5410,6 @@ fn md_node_to_block_ops(node: MdNode, id_counter: &mut usize) -> Vec<BlockOp> {
                 "divider": {}
             }))]
         }
-        MdNode::Todo { done, elements } => {
-            vec![BlockOp::Simple(json!({
-                "block_type": 17,
-                "todo": {
-                    "elements": elements,
-                    "style": { "done": done }
-                }
-            }))]
-        }
         MdNode::BulletList { items } => {
             let mut ops = Vec::new();
             for item in items {
@@ -5305,6 +5421,13 @@ fn md_node_to_block_ops(node: MdNode, id_counter: &mut usize) -> Vec<BlockOp> {
             let mut ops = Vec::new();
             for item in items {
                 ops.extend(list_item_to_block_ops(item, 13, "ordered", id_counter));
+            }
+            ops
+        }
+        MdNode::TodoList { items } => {
+            let mut ops = Vec::new();
+            for item in items {
+                ops.extend(list_item_to_block_ops(item, 17, "todo", id_counter));
             }
             ops
         }
@@ -5358,9 +5481,10 @@ fn list_item_to_block_ops(
     key: &str,
     id_counter: &mut usize,
 ) -> Vec<BlockOp> {
+    let content = build_list_block_content(&item, block_type);
     if item.children.is_empty() {
         let mut block = json!({ "block_type": block_type });
-        block[key] = json!({ "elements": item.elements });
+        block[key] = content;
         vec![BlockOp::Simple(block)]
     } else {
         let item_id = alloc_id(id_counter);
@@ -5378,7 +5502,7 @@ fn list_item_to_block_ops(
             "block_type": block_type,
             "children": child_ids
         });
-        item_block[key] = json!({ "elements": item.elements });
+        item_block[key] = content;
 
         let mut descendants = vec![item_block];
         descendants.extend(all_descendants);
@@ -5419,10 +5543,7 @@ fn md_node_to_descendant_blocks(
         }
         MdNode::CodeBlock { lang, content } => {
             let id = alloc_id(id_counter);
-            let mut style = json!({});
-            if let Some(l) = lang {
-                style["language"] = json!(l);
-            }
+            let style = build_code_block_style(lang.as_deref());
             let block = json!({
                 "block_id": id,
                 "block_type": 14,
@@ -5444,19 +5565,6 @@ fn md_node_to_descendant_blocks(
             });
             (vec![id], vec![block])
         }
-        MdNode::Todo { done, elements } => {
-            let id = alloc_id(id_counter);
-            let block = json!({
-                "block_id": id,
-                "block_type": 17,
-                "todo": {
-                    "elements": elements,
-                    "style": { "done": done }
-                },
-                "children": []
-            });
-            (vec![id], vec![block])
-        }
         MdNode::BulletList { items } => {
             let mut root_ids = Vec::new();
             let mut all_blocks = Vec::new();
@@ -5472,6 +5580,16 @@ fn md_node_to_descendant_blocks(
             let mut all_blocks = Vec::new();
             for item in items {
                 let (ids, blocks) = list_item_to_descendant(item, 13, "ordered", id_counter);
+                root_ids.extend(ids);
+                all_blocks.extend(blocks);
+            }
+            (root_ids, all_blocks)
+        }
+        MdNode::TodoList { items } => {
+            let mut root_ids = Vec::new();
+            let mut all_blocks = Vec::new();
+            for item in items {
+                let (ids, blocks) = list_item_to_descendant(item, 17, "todo", id_counter);
                 root_ids.extend(ids);
                 all_blocks.extend(blocks);
             }
@@ -5512,6 +5630,7 @@ fn list_item_to_descendant(
     let item_id = alloc_id(id_counter);
     let mut child_ids: Vec<String> = Vec::new();
     let mut all_blocks: Vec<Value> = Vec::new();
+    let content = build_list_block_content(&item, block_type);
 
     for child in item.children {
         let (ids, blocks) = md_node_to_descendant_blocks(child, id_counter);
@@ -5524,11 +5643,67 @@ fn list_item_to_descendant(
         "block_type": block_type,
         "children": child_ids
     });
-    item_block[key] = json!({ "elements": item.elements });
+    item_block[key] = content;
 
     let mut result = vec![item_block];
     result.extend(all_blocks);
     (vec![item_id], result)
+}
+
+fn build_list_block_content(item: &ListItem, block_type: i64) -> Value {
+    if block_type == 17 {
+        json!({
+            "elements": item.elements.clone(),
+            "style": { "done": item.done.unwrap_or(false) }
+        })
+    } else {
+        json!({ "elements": item.elements.clone() })
+    }
+}
+
+fn build_code_block_style(lang: Option<&str>) -> Value {
+    let mut style = json!({ "wrap": true });
+    let normalized = lang.map(|value| value.trim().to_ascii_lowercase());
+    if matches!(normalized.as_deref(), Some("mermaid")) {
+        style["language"] = json!("mermaid");
+    } else if let Some(language) = map_feishu_code_language(lang) {
+        style["language"] = json!(language);
+    }
+    style
+}
+
+fn map_feishu_code_language(lang: Option<&str>) -> Option<i64> {
+    let normalized = lang?.trim().to_ascii_lowercase();
+    let value = match normalized.as_str() {
+        "" | "text" | "plaintext" | "plain" => 1,
+        "bash" | "sh" | "zsh" | "shell" => 7,
+        "csharp" | "cs" => 8,
+        "cpp" | "c++" => 9,
+        "c" => 10,
+        "css" => 12,
+        "dockerfile" => 18,
+        "go" => 22,
+        "html" => 24,
+        "json" => 28,
+        "java" => 29,
+        "javascript" | "js" => 30,
+        "kotlin" | "kt" => 32,
+        "markdown" | "md" | "mermaid" => 39,
+        "php" => 43,
+        "python" | "py" => 49,
+        "ruby" | "rb" => 52,
+        "rust" | "rs" => 53,
+        "sql" => 56,
+        "swift" => 61,
+        "typescript" | "ts" => 63,
+        "xml" => 66,
+        "yaml" | "yml" => 67,
+        "cmake" => 68,
+        "graphql" | "gql" => 71,
+        "toml" => 75,
+        _ => return None,
+    };
+    Some(value)
 }
 
 fn build_table_descendant(rows: &[Vec<String>], id_counter: &mut usize) -> BlockOp {
@@ -5595,7 +5770,8 @@ fn build_table_descendant_data(
         "table": {
             "property": {
                 "row_size": row_size,
-                "column_size": column_size
+                "column_size": column_size,
+                "header_row": row_size > 1
             }
         },
         "children": cell_ids
@@ -5727,7 +5903,12 @@ fn feishu_doc_create_from_markdown(args: &Value) -> Result<String, JsonRpcErr> {
 
             let doc_id = json
                 .get("data")
-                .and_then(|d| d.get("document_id"))
+                .and_then(|d| {
+                    d.get("document_id").or_else(|| {
+                        d.get("document")
+                            .and_then(|document| document.get("document_id"))
+                    })
+                })
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
                     let err_json = json.clone();
@@ -5740,11 +5921,7 @@ fn feishu_doc_create_from_markdown(args: &Value) -> Result<String, JsonRpcErr> {
 
     let block_ops = convert_markdown_to_docx_blocks(&markdown_content);
     if block_ops.is_empty() {
-        let doc_url = format!(
-            "https://{}.feishu.cn/docx/{}",
-            extract_domain_from_base_url(&base_url),
-            document_id
-        );
+        let doc_url = format!("{}/docx/{}", resolve_docs_web_base_url(&base_url), document_id);
         return Ok(format!(
             "Created document (empty): {}\nID: {}",
             doc_url, document_id
@@ -5849,11 +6026,7 @@ fn feishu_doc_create_from_markdown(args: &Value) -> Result<String, JsonRpcErr> {
         )?;
     }
 
-    let doc_url = format!(
-        "https://{}.feishu.cn/docx/{}",
-        extract_domain_from_base_url(&base_url),
-        document_id
-    );
+    let doc_url = format!("{}/docx/{}", resolve_docs_web_base_url(&base_url), document_id);
 
     Ok(format!(
         "Created document: {}\nID: {}",
@@ -5985,15 +6158,27 @@ fn create_descendant_batch(
     Ok(())
 }
 
-fn extract_domain_from_base_url(base_url: &str) -> String {
-    base_url
+fn resolve_docs_web_base_url(base_url: &str) -> String {
+    let host = base_url
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_end_matches('/')
         .split('/')
         .next()
-        .unwrap_or("app.feishu.cn")
-        .to_string()
+        .unwrap_or("open.feishu.cn")
+        .to_ascii_lowercase();
+
+    match host.as_str() {
+        "open.feishu.cn" => "https://www.feishu.cn".to_string(),
+        "open.larksuite.com" | "open.larkoffice.com" => "https://www.larksuite.com".to_string(),
+        _ if host.ends_with(".feishu.cn")
+            || host.ends_with(".larksuite.com")
+            || host.ends_with(".larkoffice.com") =>
+        {
+            format!("https://{}", host)
+        }
+        _ => "https://www.feishu.cn".to_string(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -6139,6 +6324,13 @@ mod tests {
     }
 
     #[test]
+    fn prefer_blocks_render_when_raw_content_flattens_code_block() {
+        let raw = "Python 代码示例\n4 行 Python 代码\ndef greet(name): return f\"Hello, {name}!\"\nresult = greet(\"World\") print(result)";
+        let rendered = "```python\ndef greet(name):\n    return f\"Hello, {name}!\"\n\nresult = greet(\"World\")\nprint(result)\n```";
+        assert!(should_prefer_docx_blocks_render(raw, rendered));
+    }
+
+    #[test]
     fn render_docx_blocks_keeps_board_placeholders_after_heading() {
         let items = vec![
             json!({
@@ -6177,6 +6369,127 @@ mod tests {
         assert!(rendered.contains("[文字绘图: board-token-1]"));
         assert!(rendered.contains("[文字绘图: board-token-2]"));
         assert!(rendered.find("### 6.1. 系统架构图") < rendered.find("[文字绘图: board-token-1]"));
+    }
+
+    #[test]
+    fn render_docx_blocks_preserves_quote_and_nested_list_formatting() {
+        let items = vec![
+            json!({
+                "block_id": "root",
+                "block_type": 1,
+                "parent_id": "",
+                "children": ["quote"],
+                "page": { "elements": [] }
+            }),
+            json!({
+                "block_id": "quote",
+                "block_type": 15,
+                "parent_id": "root",
+                "children": ["todo_nested"],
+                "quote": { "elements": [{ "text_run": { "content": "注意事项", "text_element_style": {} } }] }
+            }),
+            json!({
+                "block_id": "todo_nested",
+                "block_type": 17,
+                "parent_id": "quote",
+                "children": [],
+                "todo": {
+                    "elements": [{ "text_run": { "content": "先检查输入", "text_element_style": {} } }],
+                    "style": { "done": false }
+                }
+            })
+        ];
+
+        let rendered = render_docx_blocks_as_text(&items, None);
+        assert!(rendered.contains("> 注意事项"));
+        assert!(rendered.contains("> - [ ] 先检查输入"));
+    }
+
+    #[test]
+    fn render_docx_blocks_uses_header_row_and_cell_line_breaks() {
+        let items = vec![
+            json!({
+                "block_id": "root",
+                "block_type": 1,
+                "parent_id": "",
+                "children": ["table1"],
+                "page": { "elements": [] }
+            }),
+            json!({
+                "block_id": "table1",
+                "block_type": 31,
+                "parent_id": "root",
+                "table": {
+                    "cells": ["cell1", "cell2"],
+                    "property": { "row_size": 1, "column_size": 2, "header_row": false }
+                }
+            }),
+            json!({
+                "block_id": "cell1",
+                "block_type": 32,
+                "parent_id": "table1",
+                "table_cell": {},
+                "children": ["cell1_text", "cell1_text2"]
+            }),
+            json!({
+                "block_id": "cell1_text",
+                "block_type": 2,
+                "parent_id": "cell1",
+                "text": { "elements": [{ "text_run": { "content": "第一行", "text_element_style": {} } }] },
+                "children": []
+            }),
+            json!({
+                "block_id": "cell1_text2",
+                "block_type": 2,
+                "parent_id": "cell1",
+                "text": { "elements": [{ "text_run": { "content": "第二行", "text_element_style": {} } }] },
+                "children": []
+            }),
+            json!({
+                "block_id": "cell2",
+                "block_type": 32,
+                "parent_id": "table1",
+                "table_cell": {},
+                "children": ["cell2_text"]
+            }),
+            json!({
+                "block_id": "cell2_text",
+                "block_type": 2,
+                "parent_id": "cell2",
+                "text": { "elements": [{ "text_run": { "content": "值", "text_element_style": {} } }] },
+                "children": []
+            })
+        ];
+
+        let rendered = render_docx_blocks_as_text(&items, None);
+        assert!(rendered.contains("| 第一行<br>第二行 | 值 |"));
+        assert!(!rendered.contains("| --- | --- |"));
+    }
+
+    #[test]
+    fn render_docx_blocks_uses_ordered_sequence_when_available() {
+        let items = vec![
+            json!({
+                "block_id": "root",
+                "block_type": 1,
+                "parent_id": "",
+                "children": ["ordered1"],
+                "page": { "elements": [] }
+            }),
+            json!({
+                "block_id": "ordered1",
+                "block_type": 13,
+                "parent_id": "root",
+                "ordered": {
+                    "elements": [{ "text_run": { "content": "第三项", "text_element_style": {} } }],
+                    "style": { "sequence": "3" }
+                },
+                "children": []
+            })
+        ];
+
+        let rendered = render_docx_blocks_as_text(&items, None);
+        assert!(rendered.contains("3. 第三项"));
     }
 
     #[test]
@@ -6307,6 +6620,59 @@ mod tests {
                 std::env::remove_var("FEISHU_USER_ACCESS_TOKEN");
             }
         }
+    }
+
+    #[test]
+    fn docs_web_base_url_maps_open_feishu_to_www_feishu() {
+        assert_eq!(
+            resolve_docs_web_base_url("https://open.feishu.cn"),
+            "https://www.feishu.cn"
+        );
+    }
+
+    #[test]
+    fn docs_web_base_url_maps_open_larksuite_to_www_larksuite() {
+        assert_eq!(
+            resolve_docs_web_base_url("https://open.larksuite.com"),
+            "https://www.larksuite.com"
+        );
+    }
+
+    #[test]
+    fn prefer_blocks_render_for_markdown_table_and_todo() {
+        assert!(should_prefer_docx_blocks_render(
+            "任务列表 待办事项",
+            "- [ ] 第一项\n- [x] 第二项"
+        ));
+        assert!(should_prefer_docx_blocks_render(
+            "姓名 年龄 Alice 18",
+            "| 姓名 | 年龄 |\n| --- | --- |\n| Alice | 18 |"
+        ));
+    }
+
+    #[test]
+    fn parse_markdown_ast_preserves_todo_items_state() {
+        let ast = parse_markdown_ast("- [ ] first\n- [x] second");
+        match &ast[0] {
+            MdNode::TodoList { items } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].done, Some(false));
+                assert_eq!(items[1].done, Some(true));
+            }
+            _ => panic!("unexpected node kind"),
+        }
+    }
+
+    #[test]
+    fn build_code_block_style_maps_common_languages_and_mermaid() {
+        assert_eq!(
+            build_code_block_style(Some("python"))["language"],
+            serde_json::json!(49)
+        );
+        assert_eq!(
+            build_code_block_style(Some("mermaid"))["language"],
+            serde_json::json!("mermaid")
+        );
     }
 
     #[test]

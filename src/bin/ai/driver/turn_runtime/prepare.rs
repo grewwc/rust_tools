@@ -86,6 +86,16 @@ pub(super) async fn prepare_turn(
         skill_runtime::prepare_skill_for_turn(app, mcp_client, skill_manifests, question)
             .await;
 
+    {
+        let now = chrono::Local::now();
+        let date_str = now.format("%Y-%m-%d").to_string();
+        skill_turn.push_labeled_section(
+            skill_runtime::ContextKind::Fact,
+            "Current Date",
+            &format!("Today's date is {}.", date_str),
+        );
+    }
+
     let mut messages = Vec::with_capacity(history.len() + 2);
 
     {
@@ -108,7 +118,7 @@ pub(super) async fn prepare_turn(
                 sys.push_str("At the very end of your message, include a compact self experience note enclosed within <meta:self_note> and </meta:self_note>. The note should be 2-6 short bullets grouped under 'Do:' and 'Avoid:'. Do not mention these tags in the visible content.\n");
             }
             if !sys.is_empty() {
-                skill_turn.append_system_prompt(&sys);
+                skill_turn.push_section(skill_runtime::ContextKind::Behavior, &sys);
             }
         }
     }
@@ -126,7 +136,7 @@ pub(super) async fn prepare_turn(
         let recall_bundle = reflection::build_recall_bundle(question, 1200, 2000);
         if let Some(guidelines) = recall_bundle.guidelines {
             if !guidelines.trim().is_empty() {
-                skill_turn.append_system_prompt(&format!("\n{guidelines}"));
+                skill_turn.push_labeled_section(skill_runtime::ContextKind::Fact, "Guidelines", &guidelines);
             }
         }
         if let Some(recalled) = recall_bundle.recalled
@@ -155,14 +165,16 @@ pub(super) async fn prepare_turn(
                 category_part,
                 confidence_part
             );
-            skill_turn.append_system_prompt(&format!("\n{}", recalled.content));
+            skill_turn.push_labeled_section(skill_runtime::ContextKind::Fact, "Recalled Knowledge", &recalled.content);
             if recalled.high_confidence_project_memory {
-                skill_turn.append_system_prompt(
-                    "\nMemory-first project answer policy:\n- High-confidence project memory is available. Answer from it first when it already covers the ask.\n- Only use file/search tools for missing details, ambiguity, or explicit verification against current code.",
+                skill_turn.push_section(
+                    skill_runtime::ContextKind::Policy,
+                    "Memory-first project answer policy:\n- High-confidence project memory is available. Answer from it first when it already covers the ask.\n- Only use file/search tools for missing details, ambiguity, or explicit verification against current code.",
                 );
             } else {
-                skill_turn.append_system_prompt(
-                    "\nKnowledge usage policy:\n- Recalled knowledge is relevant for this turn; build the answer primarily from it.\n- Use file/repo tools only when key requested details are missing; avoid full re-scan when recall is sufficient.",
+                skill_turn.push_section(
+                    skill_runtime::ContextKind::Policy,
+                    "Knowledge usage policy:\n- Recalled knowledge is relevant for this turn; build the answer primarily from it.\n- Use file/repo tools only when key requested details are missing; avoid full re-scan when recall is sufficient.",
                 );
             }
         }
@@ -180,7 +192,7 @@ pub(super) async fn prepare_turn(
             "[Memory] code_discovery recalled".bright_blue().bold(),
             app.session_id
         );
-        skill_turn.append_system_prompt(&format!("\n{code_discovery_recall}"));
+        skill_turn.push_labeled_section(skill_runtime::ContextKind::Fact, "Code Discovery", &code_discovery_recall);
     }
 
     messages.push(Message {
@@ -190,6 +202,21 @@ pub(super) async fn prepare_turn(
         tool_call_id: None,
     });
     messages.extend(history);
+    let context_reminder = skill_turn.context_reminder();
+    if let Some(reminder) = &context_reminder {
+        messages.push(Message {
+            role: "user".to_string(),
+            content: Value::String(reminder.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::String("Understood. I will use the provided context when relevant.".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
     let user_message = Message {
         role: "user".to_string(), 
         content: {

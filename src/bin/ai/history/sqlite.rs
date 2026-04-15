@@ -117,6 +117,65 @@ pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
+pub(in crate::ai) fn append_history_sqlite_uncompacted(
+    path: &Path,
+    entries: Vec<Message>,
+) -> io::Result<()> {
+    let mut conn = open_history_db(path)?;
+    init_history_schema(&conn)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let first_user_in_blob = entries
+        .iter()
+        .find(|message| message.role == "user")
+        .map(|message| value_to_string(&message.content));
+    let tx = conn
+        .transaction()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    {
+        let existing_first: Option<String> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key='first_user_prompt' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+        if existing_first.is_none() {
+            let first_existing_user: Option<String> = tx
+                .query_row(
+                    "SELECT content FROM messages WHERE role='user' ORDER BY id ASC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            let first_user_prompt = first_existing_user.or(first_user_in_blob.clone());
+            if let Some(v) = first_user_prompt.as_deref() {
+                let _ = tx.execute(
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('first_user_prompt', ?1)",
+                    params![v],
+                );
+            }
+        }
+        insert_messages(&tx, entries)?;
+    }
+    tx.commit().map_err(|e| io::Error::other(e.to_string()))
+}
+
+pub(in crate::ai) fn replace_all_messages_sqlite(path: &Path, messages: &[Message]) -> io::Result<()> {
+    let mut conn = open_history_db(path)?;
+    init_history_schema(&conn)?;
+    let tx = conn
+        .transaction()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.execute("DELETE FROM messages", [])
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    insert_messages(&tx, messages.to_vec())?;
+    tx.commit().map_err(|e| io::Error::other(e.to_string()))
+}
+
 fn insert_messages(conn: &Connection, messages: Vec<Message>) -> io::Result<()> {
     let mut stmt = conn
         .prepare(

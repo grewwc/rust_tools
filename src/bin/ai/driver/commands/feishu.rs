@@ -84,22 +84,40 @@ pub fn try_handle_feishu_auth_command(
     }
 
     println!("等待授权回调（{redirect_uri}）...");
-    let code_out = mcp_client.call_tool(
+    let code_out = match mcp_client.call_tool(
         &server,
         "oauth_wait_local_code",
         json!({
             "port": port,
             "timeout_sec": 180
         }),
-    )?;
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = mcp_client.reset_server(&server);
+            return Err(err.into());
+        }
+    };
     let code = extract_code_from_wait_output(&code_out).unwrap_or_default();
     if code.is_empty() {
         println!("未获取到 code，原始输出：\n{code_out}");
         return Ok(true);
     }
 
-    let exchange =
-        mcp_client.call_tool(&server, "oauth_exchange_code", json!({ "code": code }))?;
+    let exchange = match mcp_client.call_tool(
+        &server,
+        "oauth_exchange_code",
+        json!({
+            "code": code,
+            "redirect_uri": redirect_uri
+        }),
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            let _ = mcp_client.reset_server(&server);
+            return Err(err.into());
+        }
+    };
     println!("{exchange}");
     Ok(true)
 }

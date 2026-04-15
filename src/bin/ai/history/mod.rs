@@ -11,7 +11,8 @@ use std::time::SystemTime;
 
 #[allow(unused_imports)]
 pub(in crate::ai) use blob::{
-    append_history, append_history_messages, build_message_arr, delete_history_artifacts,
+    append_history, append_history_messages, append_history_messages_uncompacted, build_message_arr,
+    delete_history_artifacts,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use compress::compress_messages_for_context;
@@ -25,6 +26,7 @@ pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
 pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
 #[allow(unused_imports)]
 pub(in crate::ai) use types::{COLON, MAX_HISTORY_TURNS, Message, NEWLINE};
+use crate::ai::types::App;
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
 pub(in crate::ai) const ROLE_INTERNAL_NOTE: &str = types::ROLE_INTERNAL_NOTE;
@@ -212,4 +214,35 @@ fn store_cached_context_history(key: ContextHistoryCacheKey, value: Vec<Message>
     if cache.len() > CONTEXT_HISTORY_CACHE_LIMIT {
         cache.truncate(CONTEXT_HISTORY_CACHE_LIMIT);
     }
+}
+
+pub(in crate::ai) async fn compact_session_history_with_app(
+    app: &App,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let history_file = &app.session_history_file;
+    let messages = if blob::is_sqlite_path(history_file) {
+        sqlite::build_message_arr_sqlite(usize::MAX, history_file.as_path())?
+    } else {
+        let history = match std::fs::read_to_string(history_file) {
+            Ok(history) => history,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(err.into()),
+        };
+        blob::parse_history_blob(&history)
+    };
+
+    let compacted = compress::compact_persisted_history_with_app(app, messages.clone()).await;
+    if compacted == messages {
+        return Ok(());
+    }
+
+    if blob::is_sqlite_path(history_file) {
+        sqlite::replace_all_messages_sqlite(history_file.as_path(), &compacted)?;
+    } else {
+        std::fs::write(
+            history_file,
+            blob::serialize_history_messages_for_storage(&compacted),
+        )?;
+    }
+    Ok(())
 }

@@ -1,5 +1,5 @@
 use crate::ai::{
-    history::{Message, append_history_messages},
+    history::{Message, append_history_messages_uncompacted},
     types::App,
 };
 
@@ -13,7 +13,7 @@ pub(in crate::ai::driver::turn_runtime) fn persist_pending_turn_messages(
         return;
     }
 
-    if let Err(err) = append_history_messages(
+    if let Err(err) = append_history_messages_uncompacted(
         &app.session_history_file,
         &turn_messages[*persisted_turn_messages..],
     ) {

@@ -21,6 +21,84 @@ use super::intent_recognition::{self, UserIntent};
 type ToolDef = ToolDefinition;
 type ToolScoreMap = SkipMap<String, f64>;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum ContextKind {
+    Identity,
+    Behavior,
+    Policy,
+    Fact,
+}
+
+#[derive(Clone)]
+pub(super) struct SystemPromptBuilder {
+    sections: Vec<(ContextKind, Option<String>, String)>,
+}
+
+impl SystemPromptBuilder {
+    fn new() -> Self {
+        Self { sections: Vec::new() }
+    }
+
+    fn push(&mut self, kind: ContextKind, content: impl Into<String>) {
+        let content = content.into();
+        if !content.trim().is_empty() {
+            self.sections.push((kind, None, content));
+        }
+    }
+
+    fn push_labeled(&mut self, kind: ContextKind, label: &str, content: impl Into<String>) {
+        let content = content.into();
+        if !content.trim().is_empty() {
+            self.sections.push((kind, Some(label.to_string()), content));
+        }
+    }
+
+    fn render_system_prompt(&self) -> String {
+        let mut out = String::new();
+        for (kind, _, content) in &self.sections {
+            if *kind == ContextKind::Fact {
+                continue;
+            }
+            let tag = match kind {
+                ContextKind::Identity => "identity",
+                ContextKind::Behavior => "behavior",
+                ContextKind::Policy => "policy",
+                ContextKind::Fact => unreachable!(),
+            };
+            out.push_str(&format!("<{}>\n{}\n</{}>\n", tag, content.trim(), tag));
+        }
+        out
+    }
+
+    fn render_context_reminder(&self) -> Option<String> {
+        let facts: Vec<(&Option<String>, &str)> = self
+            .sections
+            .iter()
+            .filter(|(k, _, _)| *k == ContextKind::Fact)
+            .filter_map(|(_kind, label, content)| {
+                if content.trim().is_empty() {
+                    None
+                } else {
+                    Some((label, content.as_str()))
+                }
+            })
+            .collect();
+        if facts.is_empty() {
+            return None;
+        }
+        let mut out = String::from("<system-reminder>\nAs you answer the user's questions, you can use the following context:\n");
+        for (label, content) in &facts {
+            if let Some(key) = label {
+                out.push_str(&format!("# {}\n{}\n\n", key, content.trim()));
+            } else {
+                out.push_str(&format!("{}\n\n", content.trim()));
+            }
+        }
+        out.push_str("IMPORTANT: this context may or may not be relevant to your tasks. You should not respond to this context unless it is highly relevant to your task.\n</system-reminder>");
+        Some(out)
+    }
+}
+
 const TOOL_SCORE_CACHE_TTL: Duration = Duration::from_secs(20);
 const DEFAULT_TURN_TOOL_GROUPS: &[&str] = &["core"];
 const CURRENT_SKILL_STICKY_BONUS: f64 = 1.25;
@@ -42,19 +120,43 @@ enum PreferenceStrength {
 pub(super) struct SkillTurnGuard {
     app: NonNull<App>,
     restore_agent_context: Option<(Vec<ToolDef>, usize)>,
-    system_prompt: String,
+    builder: SystemPromptBuilder,
+    cached_system_prompt: Option<String>,
+    cached_context_reminder: Option<Option<String>>,
     matched_skill_name: Option<String>,
     intent: UserIntent,
     skip_recall_by_skill: bool,
 }
 
 impl SkillTurnGuard {
-    pub(super) fn system_prompt(&self) -> &str {
-        &self.system_prompt
+    pub(super) fn system_prompt(&mut self) -> &str {
+        if self.cached_system_prompt.is_none() {
+            self.cached_system_prompt = Some(self.builder.render_system_prompt());
+        }
+        self.cached_system_prompt.as_deref().unwrap_or_default()
+    }
+
+    pub(super) fn context_reminder(&mut self) -> Option<String> {
+        if self.cached_context_reminder.is_none() {
+            self.cached_context_reminder = Some(self.builder.render_context_reminder());
+        }
+        self.cached_context_reminder.clone().flatten()
+    }
+
+    pub(super) fn push_section(&mut self, kind: ContextKind, content: &str) {
+        self.cached_system_prompt = None;
+        self.cached_context_reminder = None;
+        self.builder.push(kind, content);
+    }
+
+    pub(super) fn push_labeled_section(&mut self, kind: ContextKind, label: &str, content: &str) {
+        self.cached_system_prompt = None;
+        self.cached_context_reminder = None;
+        self.builder.push_labeled(kind, label, content);
     }
 
     pub(super) fn append_system_prompt(&mut self, extra: &str) {
-        self.system_prompt.push_str(extra);
+        self.push_section(ContextKind::Fact, extra);
     }
 
     pub(super) fn matched_skill_name(&self) -> Option<&str> {
@@ -342,27 +444,55 @@ fn tool_uses_mcp_server(tool_name: &str, allowed_servers: &[String]) -> bool {
     })
 }
 
-fn mcp_tools_for_skill(
+fn resolved_mcp_servers(
+    skill: Option<&SkillManifest>,
+    active_agent: Option<&AgentManifest>,
+) -> Vec<String> {
+    let mut servers = Vec::new();
+    if let Some(skill) = skill {
+        for server in &skill.mcp_servers {
+            let server = server.trim();
+            if !server.is_empty() && !servers.iter().any(|existing| existing == server) {
+                servers.push(server.to_string());
+            }
+        }
+    }
+    if let Some(agent) = active_agent {
+        for server in &agent.mcp_servers {
+            let server = server.trim();
+            if !server.is_empty() && !servers.iter().any(|existing| existing == server) {
+                servers.push(server.to_string());
+            }
+        }
+    }
+    servers
+}
+
+fn filter_mcp_tools_by_allowed_servers(
+    tools: Vec<ToolDef>,
+    allowed_servers: &[String],
+) -> Vec<ToolDef> {
+    tools.into_iter()
+        .filter(|tool| tool_uses_mcp_server(&tool.function.name, allowed_servers))
+        .collect()
+}
+
+fn mcp_tools_for_turn(
     mcp_client: &McpClient,
     prompt_optimizer_active: bool,
     skill: Option<&SkillManifest>,
+    active_agent: Option<&AgentManifest>,
 ) -> Vec<ToolDef> {
     if prompt_optimizer_active {
         return Vec::new();
     }
 
-    let Some(skill) = skill else {
-        return Vec::new();
-    };
-    if skill.mcp_servers.is_empty() {
+    let allowed_servers = resolved_mcp_servers(skill, active_agent);
+    if allowed_servers.is_empty() {
         return Vec::new();
     }
 
-    let all_tools = mcp_client.get_all_tools();
-    all_tools
-        .into_iter()
-        .filter(|tool| tool_uses_mcp_server(&tool.function.name, &skill.mcp_servers))
-        .collect()
+    filter_mcp_tools_by_allowed_servers(mcp_client.get_all_tools(), &allowed_servers)
 }
 
 struct CapabilityEntry {
@@ -396,6 +526,15 @@ const CAPABILITY_CATALOG: &[CapabilityEntry] = &[
         trigger: "web, real-time, URL, 实时, 网页, 链接",
         tools: &["web_search", "web_fetch"],
         hint: "",
+    },
+    CapabilityEntry {
+        trigger: "Feishu, Lark, 飞书, 文档, docx, wiki, sheet, 多维表格",
+        tools: &[
+            "mcp_feishu_docs_search",
+            "mcp_feishu_docs_get_text_by_url",
+            "mcp_feishu_doc_create_from_markdown",
+        ],
+        hint: "For Feishu/Lark docs or sheets, enable the relevant MCP tools before proceeding.",
     },
     CapabilityEntry {
         trigger: "git status, git diff",
@@ -462,89 +601,51 @@ fn build_system_prompt(
     active_agent: Option<&AgentManifest>,
     skill: Option<&SkillManifest>,
     available_tools: &Box<SkipSet<String>>,
-) -> String {
-    let mut system_prompt = "You are a helpful assistant.".to_string();
+) -> SystemPromptBuilder {
+    let mut b = SystemPromptBuilder::new();
+
+    b.push(ContextKind::Identity, "You are a helpful assistant.");
+
     if let Some(agent) = active_agent {
         let extra = agent.build_system_prompt();
         if !extra.trim().is_empty() {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str("Agent enforcement:\n- You MUST follow the active agent profile for behavior, workflow, and safety boundaries.\n- Treat the active agent as the default operating mode for this turn.\n- When a skill is also active, satisfy both the agent profile and the skill instructions.\n\n");
-            system_prompt.push_str(extra.trim());
+            b.push(ContextKind::Identity, format!("Agent enforcement:\n- You MUST follow the active agent profile for behavior, workflow, and safety boundaries.\n- Treat the active agent as the default operating mode for this turn.\n- When a skill is also active, satisfy both the agent profile and the skill instructions.\n\n{}", extra.trim()));
         }
     }
     if let Some(skill) = skill {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str("Skill enforcement:\n- You MUST follow the active skill instructions precisely.\n- Do not ignore, weaken, or bypass the skill behavior.\n- If the user request conflicts with the skill, ask a brief clarification aligned with the skill.");
+        b.push(ContextKind::Identity, "Skill enforcement:\n- You MUST follow the active skill instructions precisely.\n- Do not ignore, weaken, or bypass the skill behavior.\n- If the user request conflicts with the skill, ask a brief clarification aligned with the skill.");
         let extra = skill.build_system_prompt();
         if !extra.trim().is_empty() {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(extra.trim());
+            b.push(ContextKind::Identity, extra.trim());
         }
     }
 
-    if !available_tools.is_empty() {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str("Tool availability:\n- Only rely on tools available in this turn's tool schema.\n- If a needed capability is missing, discover/enable it instead of guessing tool names.");
-    }
-
-    system_prompt.push_str("\n\n");
-    system_prompt.push_str("Tool recovery mode:\n- On tool failure, read the error and correct course before answering.\n- Retry with fixed args or switch tools; avoid repeating the same failing call unless the error is transient.\n- If `code_search` returns only `No ...` results, broaden scope/change operation instead of rerunning unchanged.\n- If a docs URL is unsupported, switch to search or ask for a supported URL.\n- Ask the user only when required information is missing or ambiguous.");
-    system_prompt.push_str("\n\n");
-    system_prompt.push_str("Tool selection policy:\n- If the answer depends on repo/code facts, inspect with tools before concluding.\n- If the user asks for edits, perform edits with tools instead of only describing them.\n- If the user asks to run/build/test/reproduce, run commands with tools when available.\n- If a path/URL/symbol/query maps to a tool, use the tool instead of guessing.");
+    b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- If the answer depends on repo/code facts, inspect with tools before concluding.\n- If the user asks for edits, perform edits with tools instead of only describing them.\n- If the user asks to run/build/test/reproduce, run commands with tools when available.\n- On tool failure, read the error and correct course before answering. Retry with fixed args or switch tools; avoid repeating the same failing call.\n- If `code_search` returns only `No ...` results, broaden scope instead of rerunning unchanged.");
 
     if has_tool(available_tools, "enable_tools") {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str("Tool discovery policy:\n- Do NOT assume all tools are already loaded.\n- If a capability is missing, call `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.");
+        b.push(ContextKind::Policy, "Tool discovery:\n- Do NOT assume all tools are already loaded.\n- If a capability is missing, call `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.\n- This also applies to MCP tools. For external systems such as Feishu/Lark, docs/wiki/sheets, or third-party services, discover and enable the matching `mcp_*` tools before proceeding.");
         if let Some(catalog) = build_capability_catalog(available_tools) {
-            system_prompt.push_str("\n\n");
-            system_prompt.push_str(&catalog);
+            b.push(ContextKind::Fact, catalog);
         }
     }
 
     if has_tool(available_tools, "memory_save") {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str("Memory tool usage:\n- When the user asks you to remember, memorize, save, or store something, call `memory_save` with the content.\n- Do NOT skip the save step or just acknowledge — actually call `memory_save` so the information persists.\n- When the user asks to recall or search saved memory, call `memory_search` or `memory_recent`.");
-    }
-
-    if has_tool(available_tools, "discover_skills") {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str("Skill discovery policy:\n- Do NOT assume all skills are already visible.\n- Use `discover_skills` to inspect skill metadata and pick relevant skills without loading all prompts.");
-    }
-
-    if has_tool(available_tools, "code_search") {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str("Code navigation policy:\n- Use `code_search` first for code exploration; do not start with raw file/text tools.\n- Exception: `read_file_lines` is fine when path + line range is already known from prior `code_search`.\n- Symbol lookup: `workspace_symbol`, `go_to_definition`, `find_references`.\n- Exact text lookup: `text_search`.\n- Structural lookup: `operation=structural` and set `intent` to `find_functions|find_classes|find_methods|find_calls` (not in `operation`).\n- If structural results are broad, narrow with `name`, `contains_text`, and for calls with `call_kind`/`receiver`/`qualified_name`.\n- Use `grep_search` only as last resort.\n- Reuse `Current code-inspection working memory` when present; avoid duplicate reads/searches unless verifying or narrowing.");
-    }
-
-    if has_tool(available_tools, "read_file")
-        || has_tool(available_tools, "read_file_lines")
-        || has_tool(available_tools, "apply_patch")
-        || has_tool(available_tools, "write_file")
-    {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str("File editing policy:\n- For existing files, avoid full rewrites unless explicitly requested or truly necessary.\n- Inspect target regions first, then prefer localized `apply_patch` edits that preserve surrounding content.\n- Use `write_file` mainly for new files or intentional full replacements.");
+        b.push(ContextKind::Policy, "Memory:\n- When the user asks to remember/save something, call `memory_save`. Do NOT skip the save step.\n- When the user asks to recall saved memory, call `memory_search` or `memory_recent`.");
     }
 
     if has_tool(available_tools, "plan") {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str("Planning before acting:\n- Simple tasks: act directly without `plan`.\n- Complex multi-step tasks: call `plan` first, execute step by step, and adjust after results.\n- Rule of thumb: if work likely needs 3+ tool calls across files/tools, plan first.");
+        b.push(ContextKind::Behavior, "Planning:\n- Simple tasks: act directly without `plan`.\n- Complex multi-step tasks (3+ tool calls across files/tools): call `plan` first, execute step by step.");
     }
 
-    if has_tool(available_tools, "knowledge_search") || has_tool(available_tools, "knowledge_list") {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str("Knowledge base auto-check:\n- If the request involves prior decisions/context/preferences/memory, use `knowledge_search`.\n- No need to check for every query.\n- Use `knowledge_list` when the user asks what is remembered.");
-    }
-
-    if has_tool(available_tools, "knowledge_semantic_search") {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str("Semantic knowledge retrieval:\n- Use `knowledge_semantic_search` when keyword search misses relevant results.\n- If semantic index seems stale, run `knowledge_rebuild_index`.\n- Knowledge retrieval supports keyword + vector hybrid search.");
+    if has_tool(available_tools, "knowledge_search") || has_tool(available_tools, "knowledge_semantic_search") {
+        b.push(ContextKind::Policy, "Knowledge retrieval:\n- If the request involves prior decisions/context/preferences, use `knowledge_search` or `knowledge_semantic_search`.\n- Use `knowledge_list` when the user asks what is remembered.\n- If semantic index seems stale, run `knowledge_rebuild_index`.");
     }
 
     if has_tool(available_tools, "web_search") || has_tool(available_tools, "web_fetch") {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str("Web search policy:\n- For real-time or time-sensitive topics, use `web_search` first.\n- Do not answer such questions from memory alone.\n- Use `web_fetch` for detailed content from selected URLs.");
+        b.push(ContextKind::Policy, "Web search:\n- For real-time or time-sensitive topics, use `web_search` first. Do not answer from memory alone.\n- Use `web_fetch` for detailed content from selected URLs.");
     }
-    system_prompt
+
+    b
 }
 
 fn should_skip_recall_for_skill(skill: Option<&SkillManifest>) -> bool {
@@ -761,9 +862,14 @@ fn build_skill_turn_guard(
     });
 
     let builtin_tools = builtin_tools_for_skill(prompt_optimizer_active, skill, active_agent.as_ref());
-    let mcp_tools = mcp_tools_for_skill(mcp_client, prompt_optimizer_active, skill);
+    let mcp_tools = mcp_tools_for_turn(
+        mcp_client,
+        prompt_optimizer_active,
+        skill,
+        active_agent.as_ref(),
+    );
     let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
-    let system_prompt = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
+    let builder = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
     let max_iterations = resolve_max_iterations(active_agent.as_ref(), executor_active);
     let restore_agent_context =
         activate_skill_context(app, builtin_tools, mcp_tools, max_iterations);
@@ -771,7 +877,9 @@ fn build_skill_turn_guard(
     SkillTurnGuard {
         app: NonNull::from(&mut *app),
         restore_agent_context,
-        system_prompt,
+        builder,
+        cached_system_prompt: None,
+        cached_context_reminder: None,
         matched_skill_name,
         intent,
         skip_recall_by_skill,
@@ -845,8 +953,8 @@ pub(super) async fn prepare_skill_for_turn(
 mod tests {
     use super::{
         build_system_prompt, builtin_tools_for_skill, ensure_required_discovery_tools,
-        looks_like_follow_up_or_same_topic, merge_with_runtime_enabled_tools,
-        resolve_max_iterations, select_skill_with_preference,
+        filter_mcp_tools_by_allowed_servers, looks_like_follow_up_or_same_topic,
+        merge_with_runtime_enabled_tools, resolve_max_iterations, select_skill_with_preference,
         select_skill_with_preference_strength, tool_uses_mcp_server, PreferenceStrength,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
@@ -919,14 +1027,19 @@ mod tests {
         available.insert("enable_tools".to_string());
         available.insert("discover_skills".to_string());
 
-        let prompt = build_system_prompt(None, None, &Box::new(available));
-        assert!(prompt.contains("Tool availability:"));
-        assert!(prompt.contains("Code navigation policy"));
-        assert!(prompt.contains("File editing policy"));
-        assert!(prompt.contains("Tool discovery policy"));
-        assert!(prompt.contains("Skill discovery policy"));
-        assert!(!prompt.contains("Web search policy"));
-        assert!(!prompt.contains("Knowledge base auto-check"));
+        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        assert!(prompt.contains("Tool usage:"));
+        assert!(prompt.contains("Tool discovery:"));
+        assert!(!prompt.contains("Web search:"));
+        assert!(!prompt.contains("Knowledge retrieval:"));
+    }
+
+    #[test]
+    fn system_prompt_mentions_mcp_discovery_when_enable_tools_available() {
+        let mut available = SkipSet::new(16);
+        available.insert("enable_tools".to_string());
+        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        assert!(prompt.contains("This also applies to MCP tools"));
     }
 
     fn tool(name: &str) -> ToolDefinition {
@@ -954,6 +1067,49 @@ mod tests {
             priority: 0,
             source_path: Some(format!("builtin:{name}.skill")),
         }
+    }
+
+    fn agent(name: &str, mcp_servers: Vec<&str>) -> AgentManifest {
+        AgentManifest {
+            name: name.to_string(),
+            description: String::new(),
+            mode: AgentMode::Primary,
+            model: None,
+            temperature: None,
+            max_steps: None,
+            prompt: String::new(),
+            system_prompt: None,
+            tools: Vec::new(),
+            tool_groups: Vec::new(),
+            mcp_servers: mcp_servers.into_iter().map(|s| s.to_string()).collect(),
+            routing_tags: Vec::new(),
+            model_tier: None,
+            disabled: false,
+            hidden: false,
+            color: None,
+            source_path: None,
+        }
+    }
+
+    #[test]
+    fn active_agent_mcp_servers_auto_load_matching_mcp_tools() {
+        let all_tools = vec![
+            tool("mcp_feishu_docs_search"),
+            tool("mcp_feishu_docs_get_text_by_url"),
+            tool("mcp_other_lookup"),
+        ];
+        let build_agent = agent("build", vec!["feishu"]);
+        let allowed_servers = build_agent.mcp_servers.clone();
+
+        let tools = filter_mcp_tools_by_allowed_servers(all_tools, &allowed_servers);
+        let names = tools
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"mcp_feishu_docs_search".to_string()));
+        assert!(names.contains(&"mcp_feishu_docs_get_text_by_url".to_string()));
+        assert!(!names.contains(&"mcp_other_lookup".to_string()));
     }
 
     #[test]

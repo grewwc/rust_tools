@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use super::{
     files,
-    history::{Message, ROLE_SYSTEM, is_internal_note_role, is_system_like_role},
+    history::{Message, ROLE_SYSTEM, is_internal_note_role, is_system_like_role, messages_to_markdown},
     models,
     provider::ApiProvider,
     skills::SkillManifest,
@@ -1209,6 +1209,87 @@ pub async fn do_request_json(
     }
 
     Err("request failed after all attempts".into())
+}
+
+pub(super) async fn summarize_history_via_model(
+    app: &App,
+    messages: &[Message],
+    max_chars: usize,
+) -> Option<String> {
+    if messages.is_empty() || max_chars == 0 {
+        return None;
+    }
+
+    let transcript = messages_to_markdown(messages, &app.session_id);
+    let transcript = if transcript.chars().count() > 24_000 {
+        let head: String = transcript.chars().take(16_000).collect();
+        let tail: String = transcript
+            .chars()
+            .rev()
+            .take(6_000)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        format!("{head}\n\n[... older transcript omitted for summary budget ...]\n\n{tail}")
+    } else {
+        transcript
+    };
+
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String(format!(
+                "你是一个软件开发对话历史压缩器。你的任务是把较早对话压缩成后续 coding agent 能继续工作的摘要。\n\
+输出要求：\n\
+- 只输出纯文本，不要 markdown 代码块，不要解释。\n\
+- 必须保留：用户明确要求、文件路径/函数名/工具名、关键报错、修复结论、当前工作、未完成任务。\n\
+- 优先保留事实和决定，删除寒暄、重复确认、冗长日志。\n\
+- 使用下面这些标题，并且每个标题下用 `- ` 开头的短行：\n\
+主要请求:\n关键上下文:\n错误与修复:\n当前工作:\n待办任务:\n已知工具结论:\n\
+- 如果某项没有内容，写 `- 无`。\n\
+- 总长度尽量控制在 {} 个字符以内。", max_chars
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(format!(
+                "请压缩下面的较早对话：\n\n{}",
+                transcript
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+        },
+    ];
+
+    let control_model = control_model_for_aux_tasks(app);
+    let request_body = build_request_body(
+        &control_model,
+        &messages,
+        false,
+        false,
+        None,
+        None,
+        None,
+    );
+    let endpoint = endpoint_for_request_model(app, &control_model);
+    let api_key = api_key_for_request_model(app, &control_model);
+    let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let text = response.text().await.ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let content = extract_router_content(&v)?;
+    let trimmed = content.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 #[cfg(test)]
