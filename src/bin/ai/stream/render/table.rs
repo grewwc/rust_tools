@@ -274,7 +274,7 @@ pub(super) fn compute_table_widths(
     }
 
     let min_w = 3usize;
-    let mut sum = widths.iter().sum::<usize>();
+    let sum = widths.iter().sum::<usize>();
     if avail < min_w * cols {
         let base = (avail / cols).max(1);
         let mut rem = avail.saturating_sub(base * cols);
@@ -289,30 +289,24 @@ pub(super) fn compute_table_widths(
     }
 
     if sum > avail {
-        let mut indices = (0..cols).collect::<Vec<_>>();
-        indices.sort_by_key(|&i| std::cmp::Reverse(widths[i]));
         let mut excess = sum - avail;
         while excess > 0 {
-            let mut changed = false;
-            for &i in &indices {
-                if excess == 0 {
-                    break;
-                }
-                if widths[i] > min_w {
-                    let reducible = widths[i] - min_w;
-                    let delta = reducible.min(excess);
-                    widths[i] -= delta;
-                    excess -= delta;
-                    changed = true;
+            // Find the index of the column with the maximum width
+            let mut max_idx = 0;
+            let mut max_w = 0;
+            for (i, &w) in widths.iter().enumerate() {
+                if w > max_w {
+                    max_w = w;
+                    max_idx = i;
                 }
             }
-            if !changed {
-                break;
+            
+            if max_w <= min_w {
+                break; // Cannot reduce further
             }
-            sum = widths.iter().sum::<usize>();
-            if sum <= avail {
-                break;
-            }
+            
+            widths[max_idx] -= 1;
+            excess -= 1;
         }
     }
 
