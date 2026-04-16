@@ -97,7 +97,7 @@ impl MarkdownStreamRenderer {
     }
 
     #[cfg(test)]
-    fn write_chunk_for_test(&mut self, chunk: &str, dimmed: bool) -> io::Result<String> {
+    pub fn write_chunk_for_test(&mut self, chunk: &str, dimmed: bool) -> io::Result<String> {
         let mut out = Vec::new();
         self.write_chunk_to(&mut out, chunk, dimmed)?;
         Ok(String::from_utf8_lossy(&out).into_owned())
@@ -442,11 +442,12 @@ impl MarkdownStreamRenderer {
         }
         final_table.push_str(&render_table_bottom(indent, &widths));
 
-        let actual_table_height = final_table.lines().count().max(1);
-        let clear_height = move_up.max(actual_table_height);
-
         let mut out = String::new();
-        out.push_str(&format!("\x1b[{clear_height}A\r\x1b[0J"));
+        if move_up > 0 {
+            out.push_str(&format!("\x1b[{move_up}A\r\x1b[0J"));
+        } else {
+            out.push_str("\r\x1b[0J");
+        }
         out.push_str(&final_table);
         out
     }
