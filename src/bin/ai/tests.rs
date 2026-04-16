@@ -752,6 +752,7 @@ fn thinking_chunks_are_wrapped_once() {
             delta: StreamDelta {
                 content: String::new(),
                 reasoning_content: "step one".to_string(),
+                reasoning_details: String::new(),
                 tool_calls: Vec::new(),
             },
             finish_reason: None,
@@ -768,6 +769,7 @@ fn thinking_chunks_are_wrapped_once() {
             delta: StreamDelta {
                 content: "final".to_string(),
                 reasoning_content: String::new(),
+                reasoning_details: String::new(),
                 tool_calls: Vec::new(),
             },
             finish_reason: None,
@@ -930,6 +932,130 @@ fn stream_chunk_accepts_reasoning_text_alias() {
     assert_eq!(parsed.choices.len(), 1);
     assert_eq!(parsed.choices[0].delta.content, "");
     assert_eq!(parsed.choices[0].delta.reasoning_content, "step by step");
+}
+
+#[test]
+fn stream_chunk_ignores_structured_reasoning_object_without_text() {
+    let payload = r#"{"choices":[{"delta":{"content":"","reasoning":{"confidence":0.9,"thinking":true}}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.choices[0].delta.reasoning_content, "");
+}
+
+#[test]
+fn stream_chunk_extracts_text_from_reasoning_object() {
+    let payload = r#"{"choices":[{"delta":{"content":"","reasoning":{"type":"thinking","text":"step by step"}}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.choices[0].delta.reasoning_content, "step by step");
+}
+
+#[test]
+fn stream_chunk_extracts_nested_reasoning_delta_text() {
+    let payload =
+        r#"{"choices":[{"delta":{"content":"","reasoning":{"type":"reasoning_text","delta":"No"}}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.choices[0].delta.reasoning_content, "No");
+}
+
+#[test]
+fn stream_chunk_ignores_bool_and_number_reasoning() {
+    let payload = r#"{"choices":[{"delta":{"content":"","reasoning":42}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.choices[0].delta.reasoning_content, "");
+}
+
+#[test]
+fn stream_chunk_merges_reasoning_details_into_reasoning_content() {
+    let payload = r#"{"choices":[{"delta":{"content":"","reasoning_details":[{"text":"step 1"},{"text":" step 2"}]}}]}"#;
+    let mut parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.choices[0].delta.reasoning_content, "");
+    parsed.merge_reasoning();
+    assert_eq!(parsed.choices[0].delta.reasoning_content, "step 1 step 2");
+}
+
+#[test]
+fn stream_chunk_merges_reasoning_details_prefix_with_punctuation_continuation() {
+    let payload = r#"{"choices":[{"delta":{"content":"","reasoning":", that's not really necessary.","reasoning_details":[{"delta":"No"}]}}]}"#;
+    let mut parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(
+        parsed.choices[0].delta.reasoning_content,
+        ", that's not really necessary."
+    );
+    parsed.merge_reasoning();
+    assert_eq!(
+        parsed.choices[0].delta.reasoning_content,
+        "No, that's not really necessary."
+    );
+}
+
+#[test]
+fn stream_chunk_reasoning_content_takes_priority_over_details() {
+    let payload = r#"{"choices":[{"delta":{"content":"","reasoning":"from reasoning field","reasoning_details":[{"text":"from details"}]}}]}"#;
+    let mut parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.choices[0].delta.reasoning_content, "from reasoning field");
+    parsed.merge_reasoning();
+    assert_eq!(parsed.choices[0].delta.reasoning_content, "from reasoning field");
+}
+
+#[test]
+fn merge_reasoning_fragments_stripped_overlap() {
+    use crate::ai::request::merge_reasoning_fragments;
+    assert_eq!(
+        merge_reasoning_fragments("I think", " think this is right"),
+        "I think this is right"
+    );
+}
+
+#[test]
+fn merge_reasoning_fragments_cjk_punctuation_continuation() {
+    use crate::ai::request::merge_reasoning_fragments;
+    assert_eq!(
+        merge_reasoning_fragments("是的", "，这很重要"),
+        "是的，这很重要"
+    );
+    assert_eq!(
+        merge_reasoning_fragments("注意", "！危险"),
+        "注意！危险"
+    );
+}
+
+#[test]
+fn merge_reasoning_fragments_english_contraction_continuation() {
+    use crate::ai::request::merge_reasoning_fragments;
+    assert_eq!(
+        merge_reasoning_fragments("It is", "n't necessary"),
+        "It isn't necessary"
+    );
+    assert_eq!(
+        merge_reasoning_fragments("I", "'ve already checked"),
+        "I've already checked"
+    );
+    assert_eq!(
+        merge_reasoning_fragments("They", "'re coming"),
+        "They're coming"
+    );
+}
+
+#[test]
+fn merge_reasoning_fragments_no_false_positive_on_independent_sentence() {
+    use crate::ai::request::merge_reasoning_fragments;
+    let result = merge_reasoning_fragments("First step done", "Second step begins");
+    assert_eq!(result, "Second step begins");
+}
+
+#[test]
+fn merge_reasoning_fragments_ellipsis_continuation() {
+    use crate::ai::request::merge_reasoning_fragments;
+    assert_eq!(
+        merge_reasoning_fragments("等等", "…还有更多"),
+        "等等…还有更多"
+    );
+}
+
+#[test]
+fn stream_chunk_opencode_structured_content_extracts_text() {
+    let payload = r#"{"choices":[{"delta":{"content":[{"type":"output_text","text":"hi"}]}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.choices[0].delta.content, "hi");
 }
 
 #[test]

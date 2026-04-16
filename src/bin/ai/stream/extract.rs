@@ -148,6 +148,7 @@ mod tests {
                 delta: StreamDelta {
                     content: "next".to_string(),
                     reasoning_content: String::new(),
+                    reasoning_details: String::new(),
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,
@@ -176,6 +177,7 @@ mod tests {
                 delta: StreamDelta {
                     content: String::new(),
                     reasoning_content: "step one".to_string(),
+                    reasoning_details: String::new(),
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,
@@ -210,6 +212,7 @@ mod tests {
                 delta: StreamDelta {
                     content: "before<meta:self_note>secret</meta:self_note>after".to_string(),
                     reasoning_content: String::new(),
+                    reasoning_details: String::new(),
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,
@@ -243,6 +246,7 @@ mod tests {
                 delta: StreamDelta {
                     content: "before<meta:self".to_string(),
                     reasoning_content: String::new(),
+                    reasoning_details: String::new(),
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,
@@ -253,6 +257,7 @@ mod tests {
                 delta: StreamDelta {
                     content: "_note>secret</meta:self_note>after".to_string(),
                     reasoning_content: String::new(),
+                    reasoning_details: String::new(),
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,

@@ -47,6 +47,7 @@ impl StreamProcessingState {
 pub(super) struct StreamFramingState {
     pub(super) decode_error_count: usize,
     pub(super) pending: Vec<u8>,
+    pub(super) sse_event_type: Option<String>,
     pub(super) sse_event_data: String,
 }
 
@@ -55,9 +56,16 @@ impl StreamFramingState {
         Self {
             decode_error_count: 0,
             pending: Vec::with_capacity(4096),
+            sse_event_type: None,
             sse_event_data: String::with_capacity(4096),
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct SseEvent {
+    pub(super) event_type: Option<String>,
+    pub(super) payload: String,
 }
 
 pub(super) struct StreamRenderState {

@@ -502,4 +502,21 @@ mod tests {
         let colored = format!("\x1b[2m{plain}\x1b[0m");
         assert_eq!(table_preview_height(&colored), table_preview_height(&plain));
     }
+
+    #[test]
+    fn pad_cell_aligns_emojis_correctly() {
+        let w1 = visible_width("🌧️天气");
+        let w2 = visible_width("💧湿度");
+        let w3 = visible_width("🍃空气质量");
+        
+        assert_eq!(w1, 5); // 1 + 2 + 2
+        assert_eq!(w2, 6); // 2 + 2 + 2
+        assert_eq!(w3, 10); // 2 + 2 + 2 + 2 + 2
+        
+        let p1 = pad_cell("🌧️天气", 10, TableAlign::Left);
+        let p2 = pad_cell("💧湿度", 10, TableAlign::Left);
+        
+        assert_eq!(p1, "🌧️天气     "); // padded 5 spaces
+        assert_eq!(p2, "💧湿度    "); // padded 4 spaces
+    }
 }

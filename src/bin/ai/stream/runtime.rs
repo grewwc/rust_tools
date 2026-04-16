@@ -643,9 +643,10 @@ fn process_stream_payload(
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
     adapter_kind: normalize::StreamProviderAdapterKind,
+    event_type: Option<&str>,
     payload: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let chunk = match normalize::parse_stream_payload(adapter_kind, payload) {
+    let chunk = match normalize::parse_stream_payload(adapter_kind, payload, event_type) {
         super::state::ParsedStreamPayload::Ignore => return Ok(false),
         super::state::ParsedStreamPayload::Done => return Ok(true),
         super::state::ParsedStreamPayload::Chunk(chunk) => chunk,
@@ -727,10 +728,18 @@ fn flush_sse_event(
     state: &mut StreamProcessingState,
     adapter_kind: normalize::StreamProviderAdapterKind,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let Some(payload) = framing::flush_sse_event(&mut state.framing) else {
+    let Some(event) = framing::flush_sse_event(&mut state.framing) else {
         return Ok(false);
     };
-    process_stream_payload(app, current_history, markers, state, adapter_kind, &payload)
+    process_stream_payload(
+        app,
+        current_history,
+        markers,
+        state,
+        adapter_kind,
+        event.event_type.as_deref(),
+        &event.payload,
+    )
 }
 
 fn process_stream_line(
@@ -741,8 +750,16 @@ fn process_stream_line(
     adapter_kind: normalize::StreamProviderAdapterKind,
     line: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if let Some(payload) = framing::consume_sse_line(&mut state.framing, line) {
-        return process_stream_payload(app, current_history, markers, state, adapter_kind, &payload);
+    if let Some(event) = framing::consume_sse_line(&mut state.framing, line) {
+        return process_stream_payload(
+            app,
+            current_history,
+            markers,
+            state,
+            adapter_kind,
+            event.event_type.as_deref(),
+            &event.payload,
+        );
     }
 
     Ok(false)

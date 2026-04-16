@@ -621,7 +621,7 @@ impl MarkdownStreamRenderer {
 fn live_preview_cursor_rows(line: &str) -> usize {
     let cols = preview_terminal_width().max(1);
     let visible = strip_ansi_codes(line);
-    let width = unicode_width::UnicodeWidthStr::width(visible.as_str());
+    let width: usize = visible.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)).sum();
     if width == 0 {
         1
     } else {

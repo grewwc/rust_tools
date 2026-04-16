@@ -239,7 +239,10 @@ fn strip_inline_md_markers(s: &str) -> String {
 }
 
 pub(super) fn visible_width(s: &str) -> usize {
-    unicode_width::UnicodeWidthStr::width(strip_inline_md_markers(s).as_str())
+    strip_inline_md_markers(s)
+        .chars()
+        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
 }
 
 pub(super) fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {

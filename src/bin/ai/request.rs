@@ -43,6 +43,18 @@ pub(super) struct StreamChunk {
     pub(super) choices: Vec<StreamChoice>,
 }
 
+impl StreamChunk {
+    pub(super) fn merge_reasoning(&mut self) {
+        for choice in &mut self.choices {
+            choice.delta.reasoning_content = merge_reasoning_fragments(
+                &choice.delta.reasoning_details,
+                &choice.delta.reasoning_content,
+            );
+            choice.delta.reasoning_details.clear();
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct StreamChoice {
     #[serde(default)]
@@ -53,15 +65,17 @@ pub(super) struct StreamChoice {
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct StreamDelta {
-    #[serde(default, deserialize_with = "string_or_default")]
+    #[serde(default, deserialize_with = "displayable_string_or_default")]
     pub(super) content: String,
     #[serde(
         default,
         alias = "reasoning",
         alias = "reasoning_text",
-        deserialize_with = "string_or_default"
+        deserialize_with = "displayable_string_or_default"
     )]
     pub(super) reasoning_content: String,
+    #[serde(default, deserialize_with = "reasoning_details_string_or_default")]
+    pub(super) reasoning_details: String,
     #[serde(default, deserialize_with = "vec_or_default")]
     pub(super) tool_calls: Vec<StreamToolCall>,
 }
@@ -103,6 +117,193 @@ where
         .as_ref()
         .map(json_value_to_string_lossy)
         .unwrap_or_default())
+}
+
+fn displayable_string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .map(extract_displayable_text)
+        .unwrap_or_default())
+}
+
+fn reasoning_details_string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .map(extract_reasoning_details_text)
+        .unwrap_or_default())
+}
+
+fn extract_displayable_text(value: &Value) -> String {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => String::new(),
+        Value::String(s) => s.clone(),
+        Value::Array(items) => items
+            .iter()
+            .map(extract_displayable_text)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(""),
+        Value::Object(map) => extract_text_from_object(map, &["text", "content", "delta"]),
+    }
+}
+
+fn extract_reasoning_details_text(value: &Value) -> String {
+    match value {
+        Value::Array(items) => items
+            .iter()
+            .map(extract_reasoning_details_text)
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(""),
+        Value::Object(map) => extract_text_from_object(
+            map,
+            &[
+                "text",
+                "content",
+                "delta",
+                "summary_text",
+                "reasoning_text",
+                "reasoning",
+                "summary",
+            ],
+        ),
+        Value::String(s) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+fn extract_text_from_object(
+    map: &serde_json::Map<String, Value>,
+    preferred_keys: &[&str],
+) -> String {
+    for key in preferred_keys {
+        if let Some(inner) = map.get(*key) {
+            let extracted = match *key {
+                "reasoning" | "summary" => extract_reasoning_details_text(inner),
+                _ => extract_displayable_text(inner),
+            };
+            if !extracted.is_empty() {
+                return extracted;
+            }
+        }
+    }
+    String::new()
+}
+
+pub(crate) fn merge_reasoning_fragments(details: &str, content: &str) -> String {
+    if content.is_empty() {
+        return details.to_string();
+    }
+    if details.is_empty() {
+        return content.to_string();
+    }
+    if content.contains(details) {
+        return content.to_string();
+    }
+    if details.contains(content) {
+        return details.to_string();
+    }
+
+    let overlap = longest_suffix_prefix_overlap(details, content);
+    if overlap > 0 {
+        return format!("{}{}", details, &content[overlap..]);
+    }
+
+    let content_stripped = content.trim_start();
+    let stripped_overlap = longest_suffix_prefix_overlap(details, content_stripped);
+    if stripped_overlap > 0 {
+        return format!("{}{}", details, &content_stripped[stripped_overlap..]);
+    }
+
+    if looks_like_continuation(details, content_stripped) {
+        return format!("{details}{content}");
+    }
+
+    content.to_string()
+}
+
+fn looks_like_continuation(prefix: &str, continuation: &str) -> bool {
+    let first = match continuation.chars().next() {
+        Some(c) => c,
+        None => return false,
+    };
+
+    if is_continuation_punctuation(first) {
+        return true;
+    }
+
+    if first == '\'' {
+        let rest = &continuation[first.len_utf8()..];
+        if rest.starts_with('s')
+            || rest.starts_with('t')
+            || rest.starts_with("re ")
+            || rest.starts_with("ve ")
+            || rest.starts_with("ll ")
+            || rest.starts_with("d ")
+            || rest.starts_with("m ")
+        {
+            return true;
+        }
+    }
+
+    if continuation.starts_with("n't") {
+        let prefix_stripped = prefix.trim_end();
+        if prefix_stripped.ends_with("is")
+            || prefix_stripped.ends_with("was")
+            || prefix_stripped.ends_with("were")
+            || prefix_stripped.ends_with("would")
+            || prefix_stripped.ends_with("could")
+            || prefix_stripped.ends_with("should")
+            || prefix_stripped.ends_with("do")
+            || prefix_stripped.ends_with("does")
+            || prefix_stripped.ends_with("did")
+            || prefix_stripped.ends_with("has")
+            || prefix_stripped.ends_with("have")
+            || prefix_stripped.ends_with("had")
+            || prefix_stripped.ends_with("ca")
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_continuation_punctuation(ch: char) -> bool {
+    matches!(
+        ch,
+        ',' | '.' | ';' | ':'
+        | '!' | '?'
+        | ')' | ']' | '}'
+        | '，' | '。' | '；' | '：'
+        | '！' | '？'
+        | '）' | '】' | '》'
+        | '…'
+    )
+}
+
+fn longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
+    let mut candidates = right.char_indices().map(|(idx, _)| idx).collect::<Vec<_>>();
+    candidates.push(right.len());
+    candidates.reverse();
+
+    for overlap in candidates {
+        if overlap == 0 || overlap > left.len() {
+            continue;
+        }
+        if left.ends_with(&right[..overlap]) {
+            return overlap;
+        }
+    }
+    0
 }
 
 fn json_value_to_string_lossy(value: &Value) -> String {
