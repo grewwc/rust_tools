@@ -6713,7 +6713,7 @@ mod tests {
                         "msg_type": "text",
                         "create_time": "1",
                         "sender": {"id": "ou_1"},
-                        "body": {"content": "{\"text\":\"hello from thread\"}"}
+                        "body": {"content": "{\"text\":\"hello from dataagent thread\"}"}
                     }],
                     "page_token": ""
                 }
