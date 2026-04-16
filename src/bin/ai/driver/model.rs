@@ -1,4 +1,4 @@
-use crate::ai::{mcp::McpClient, models, types::App};
+use crate::ai::{mcp::{McpClient, SharedMcpClient}, models, types::App};
 use serde_json::json;
 use std::path::Path;
 
@@ -94,14 +94,18 @@ pub(in crate::ai) struct OcrImageSummary {
 /// 对附加图片执行 OCR，并返回可拼接进 prompt 的 Markdown 内容。
 /// 返回格式: "<!-- OCR_IMAGE: filename -->\nocr_text\n<!-- /OCR_IMAGE -->"
 pub fn ocr_images_for_attached_input(
-    mcp_client: &mut McpClient,
+    mcp_client: &SharedMcpClient,
     image_files: &[String],
 ) -> Result<Option<OcrExtraction>, String> {
     if image_files.is_empty() {
         return Ok(None);
     }
-    let Some((server_name, tool_name, full_tool_name)) = resolve_ocr_route(mcp_client) else {
-        return Ok(None);
+    let (server_name, tool_name, full_tool_name) = {
+        let mc = mcp_client.lock().unwrap();
+        match resolve_ocr_route(&mc) {
+            Some(route) => route,
+            None => return Ok(None),
+        }
     };
 
     let mut ocr_contents = Vec::new();
@@ -112,13 +116,16 @@ pub fn ocr_images_for_attached_input(
             .and_then(|s| s.to_str())
             .unwrap_or(file_path);
 
-        let result = mcp_client.call_tool(
-            &server_name,
-            &tool_name,
-            json!({
-                "image_path": file_path
-            }),
-        );
+        let result = {
+            let mc = mcp_client.lock().unwrap();
+            mc.call_tool(
+                &server_name,
+                &tool_name,
+                json!({
+                    "image_path": file_path
+                }),
+            )
+        };
 
         let (ocr_text, extracted_chars, error) = match result {
             Ok(text) => {
@@ -132,7 +139,6 @@ pub fn ocr_images_for_attached_input(
             }
         };
 
-        // 格式化输出，带标记
         let content = format!(
             "<!-- OCR_IMAGE: {} -->\n{}\n<!-- /OCR_IMAGE -->",
             file_name, ocr_text

@@ -2,11 +2,11 @@ use std::process::Command;
 
 use serde_json::json;
 
-use crate::ai::mcp::McpClient;
+use crate::ai::mcp::SharedMcpClient;
 use crate::commonw::prompt::{prompt_yes_or_no_interruptible, read_line};
 
 pub fn try_handle_feishu_auth_command(
-    mcp_client: &mut McpClient,
+    mcp_client: &SharedMcpClient,
     input: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let trimmed = input.trim();
@@ -28,13 +28,16 @@ pub fn try_handle_feishu_auth_command(
     }
 
     let mut server = None;
-    for tool in mcp_client.get_all_tools() {
-        if let Some((server_name, tool_name)) =
-            mcp_client.parse_tool_name_for_known_server(&tool.function.name)
-            && tool_name == "oauth_authorize_url"
-        {
-            server = Some(server_name);
-            break;
+    {
+        let mc = mcp_client.lock().unwrap();
+        for tool in mc.get_all_tools() {
+            if let Some((server_name, tool_name)) =
+                mc.parse_tool_name_for_known_server(&tool.function.name)
+                && tool_name == "oauth_authorize_url"
+            {
+                server = Some(server_name);
+                break;
+            }
         }
     }
     let Some(server) = server else {
@@ -60,16 +63,19 @@ pub fn try_handle_feishu_auth_command(
         .unwrap_or(8711);
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
-    let url = mcp_client.call_tool(
-        &server,
-        "oauth_authorize_url",
-        json!({
-            "redirect_uri": redirect_uri,
-            "scope": scope,
-            "prompt": "consent",
-            "state": "rust-tools-ai"
-        }),
-    )?;
+    let url = {
+        let mc = mcp_client.lock().unwrap();
+        mc.call_tool(
+            &server,
+            "oauth_authorize_url",
+            json!({
+                "redirect_uri": redirect_uri,
+                "scope": scope,
+                "prompt": "consent",
+                "state": "rust-tools-ai"
+            }),
+        )?
+    };
     let url = url.trim().to_string();
     println!("\n授权链接：\n{url}\n");
 
@@ -84,18 +90,21 @@ pub fn try_handle_feishu_auth_command(
     }
 
     println!("等待授权回调（{redirect_uri}）...");
-    let code_out = match mcp_client.call_tool(
-        &server,
-        "oauth_wait_local_code",
-        json!({
-            "port": port,
-            "timeout_sec": 180
-        }),
-    ) {
-        Ok(v) => v,
-        Err(err) => {
-            let _ = mcp_client.reset_server(&server);
-            return Err(err.into());
+    let code_out = {
+        let mc = mcp_client.lock().unwrap();
+        match mc.call_tool(
+            &server,
+            "oauth_wait_local_code",
+            json!({
+                "port": port,
+                "timeout_sec": 180
+            }),
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = mc.reset_server(&server);
+                return Err(err.into());
+            }
         }
     };
     let code = extract_code_from_wait_output(&code_out).unwrap_or_default();
@@ -104,18 +113,21 @@ pub fn try_handle_feishu_auth_command(
         return Ok(true);
     }
 
-    let exchange = match mcp_client.call_tool(
-        &server,
-        "oauth_exchange_code",
-        json!({
-            "code": code,
-            "redirect_uri": redirect_uri
-        }),
-    ) {
-        Ok(v) => v,
-        Err(err) => {
-            let _ = mcp_client.reset_server(&server);
-            return Err(err.into());
+    let exchange = {
+        let mc = mcp_client.lock().unwrap();
+        match mc.call_tool(
+            &server,
+            "oauth_exchange_code",
+            json!({
+                "code": code,
+                "redirect_uri": redirect_uri
+            }),
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                let _ = mc.reset_server(&server);
+                return Err(err.into());
+            }
         }
     };
     println!("{exchange}");

@@ -168,6 +168,8 @@ mod tests {
                 tags: vec![],
                 source: Some("test".to_string()),
                 priority: Some(100),
+                owner_pid: None,
+                owner_pgid: None,
             })
             .unwrap();
         store
@@ -179,6 +181,8 @@ mod tests {
                 tags: vec![],
                 source: Some("test".to_string()),
                 priority: Some(255),
+                owner_pid: None,
+                owner_pgid: None,
             })
             .unwrap();
         store
@@ -190,6 +194,8 @@ mod tests {
                 tags: vec![],
                 source: Some("test".to_string()),
                 priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
             })
             .unwrap();
         store
@@ -201,6 +207,8 @@ mod tests {
                 tags: vec![],
                 source: Some("test".to_string()),
                 priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
             })
             .unwrap();
         store
@@ -212,6 +220,8 @@ mod tests {
                 tags: vec![],
                 source: Some("test".to_string()),
                 priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
             })
             .unwrap();
         store
@@ -223,6 +233,8 @@ mod tests {
                 tags: vec![],
                 source: Some("test".to_string()),
                 priority: Some(200),
+                owner_pid: None,
+                owner_pgid: None,
             })
             .unwrap();
         store
@@ -234,6 +246,8 @@ mod tests {
                 tags: vec![],
                 source: Some("test".to_string()),
                 priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
             })
             .unwrap();
 
@@ -277,6 +291,8 @@ mod tests {
                 tags: vec!["project".to_string(), "rust_tools".to_string()],
                 source: Some("rust_tools".to_string()),
                 priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
             })
             .unwrap();
         store
@@ -288,6 +304,8 @@ mod tests {
                 tags: vec!["read_file".to_string()],
                 source: Some("session:test".to_string()),
                 priority: Some(80),
+                owner_pid: None,
+                owner_pgid: None,
             })
             .unwrap();
 

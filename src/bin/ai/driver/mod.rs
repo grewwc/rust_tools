@@ -1,5 +1,6 @@
 use std::{
     io::Write,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -13,7 +14,7 @@ use crate::ai::{
     cli::{self},
     config,
     history::SessionStore,
-    mcp::McpClient,
+    mcp::{McpClient, SharedMcpClient},
     models,
     prompt::PromptEditor,
     skills::{self, SkillManifest},
@@ -29,6 +30,7 @@ pub mod intent_model;
 pub mod intent_recognition;
 pub mod mcp_init;
 pub mod model;
+pub mod os;
 pub mod params;
 pub mod print;
 pub mod reflection;
@@ -47,6 +49,10 @@ pub use model::*;
 pub use skill_matching::*;
 pub use skill_ranking::*;
 pub use text_similarity::*;
+
+pub(crate) fn new_local_kernel() -> crate::ai::kernel::SharedKernel {
+    crate::ai::kernel::new_shared_kernel(os::LocalOS::new())
+}
 
 const DEFAULT_MAX_ITERATIONS: usize = 1024;
 const EXECUTOR_MAX_ITERATIONS: usize = 64;
@@ -193,7 +199,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     })?;
 
-    let writer = config::open_output_writer(cli.out.as_deref())?;
+    let writer = config::open_output_writer(cli.out.as_deref())?.map(|f| Arc::new(std::sync::Mutex::new(f)));
     let current_model = models::initial_model(&cli);
     let client = reqwest::Client::builder().build()?;
     let prompt_editor = if cli.args.is_empty() {
@@ -204,6 +210,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    let os_arc = new_local_kernel();
+    crate::ai::tools::os_tools::init_os_tools_globals(os_arc.clone());
 
     let mut app = App {
         pending_files: if cli.files.trim().is_empty() {
@@ -229,16 +238,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         prompt_editor,
         agent_context: Some(AgentContext {
             tools: super::tools::tool_definitions_for_groups(&["core"]),
+            mcp_servers: rust_tools::commonw::FastMap::default(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
-            ..Default::default()
         }),
         last_skill_bias: None,
+        os: os_arc,
         agent_reload_counter: None,
     };
 
-    let mut mcp_client = McpClient::new();
+    let mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
     let skill_manifests = load_skill_manifests(app.cli.no_skills);
-    let mcp_report = init_mcp(&mut app, &mut mcp_client).await;
+    let mcp_report = init_mcp(&mut app, &mut mcp_client.lock().unwrap()).await;
 
     if app.cli.list_tools {
         print::print_builtin_tools(&app);
@@ -249,7 +259,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     if app.cli.list_mcp_tools {
-        print::print_mcp_tools(&mcp_report, &mcp_client);
+        print::print_mcp_tools(&mcp_report, &mcp_client.lock().unwrap());
         return Ok(());
     }
 
@@ -294,12 +304,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
         );
     }
-    run_loop(&mut app, &mut mcp_client, &skill_manifests, &mut agent_manifests).await
+    run_loop(&mut app, &mcp_client, &skill_manifests, &mut agent_manifests).await
+}
+
+fn process_history_path(base: &Path, pid: u64) -> PathBuf {
+    let file_name = base
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.proc-{pid}"))
+        .unwrap_or_else(|| format!("session.proc-{pid}"));
+    base.with_file_name(file_name)
 }
 
 async fn run_loop(
     app: &mut App,
-    mcp_client: &mut McpClient,
+    mcp_client: &SharedMcpClient,
     skill_manifests: &[SkillManifest],
     agent_manifests: &mut Vec<AgentManifest>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -323,7 +342,11 @@ async fn run_loop(
     };
 
     loop {
-        // Agent hot-discovery: check for new agents every 5 turns
+        {
+            let mut os = app.os.lock().unwrap_or_else(|err|err.into_inner());
+            os.advance_tick();
+        }
+
         if let Some(counter) = app.agent_reload_counter.as_mut() {
             *counter += 1;
             if *counter % 5 == 0 {
@@ -337,16 +360,160 @@ async fn run_loop(
             cleanup_one_shot(app);
             return Ok(());
         }
-        let Some(ctx) = input::next_question(app)? else {
-            cleanup_one_shot(app);
-            return Ok(());
+
+        let mut history_count = usize::MAX;
+        let mut question = String::new();
+
+        let background_procs: Vec<crate::ai::kernel::Process> = {
+            let mut os = app.os.lock().unwrap();
+            os.pop_all_ready(4)
         };
-        if ctx.question.trim().is_empty() {
-            should_quit = false;
+
+        if !background_procs.is_empty() {
+            use colored::Colorize;
+            for proc in &background_procs {
+                println!("\n{} Process {} ({})", "[OS Dispatch]".bright_blue().bold(), proc.pid, proc.name);
+            }
+
+            let original_history_file = app.session_history_file.clone();
+
+            let mut task_specs: Vec<(u64, String, PathBuf)> = Vec::new();
+            for proc in &background_procs {
+                let pid = proc.pid;
+                let proc_question = if !proc.mailbox.is_empty() {
+                    let messages: Vec<String> = proc.mailbox.iter().cloned().collect();
+                    {
+                        let mut os = app.os.lock().unwrap();
+                        if let Some(actual) = os.get_process_mut(pid) {
+                            actual.mailbox.clear();
+                        }
+                    }
+                    format!(
+                        "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nResume execution based on the goal and these messages.",
+                        pid, proc.goal, messages.join("\n---\n")
+                    )
+                } else {
+                    format!("[Process {}] Goal: {}\nExecute this goal autonomously and provide the final result.", pid, proc.goal)
+                };
+
+                {
+                    let mut os = app.os.lock().unwrap();
+                    os.set_current_pid(Some(pid));
+                    if let Some(p) = os.get_process_mut(pid) {
+                        if p.history_file.is_none() {
+                            p.history_file = Some(process_history_path(&original_history_file, pid));
+                        }
+                        let _ = os.process_pending_signals();
+                    }
+                }
+
+                let history_path = process_history_path(&original_history_file, pid);
+                task_specs.push((pid, proc_question, history_path));
+            }
+
+            let mut join_set: tokio::task::JoinSet<(u64, Result<turn_runtime::TurnOutcome, String>)> = tokio::task::JoinSet::new();
+
+            for (pid, proc_question, history_path) in task_specs {
+                let mut task_app = app.clone();
+                task_app.session_history_file = history_path;
+                task_app.cancel_stream.store(false, Ordering::Relaxed);
+                let task_mcp = mcp_client.clone();
+                let task_skills = skill_manifests.to_vec();
+                let next_model = app.current_model.clone();
+
+                join_set.spawn(
+                    crate::ai::kernel::TASK_PID.scope(Some(pid), async move {
+                        crate::ai::tools::registry::common::clear_tool_cancel();
+                        let result = turn_runtime::run_turn(
+                            &mut task_app,
+                            &task_mcp,
+                            &task_skills,
+                            usize::MAX,
+                            proc_question,
+                            next_model,
+                            None,
+                            false,
+                            false,
+                        )
+                        .await
+                        .map_err(|e| format!("{}", e));
+                        (pid, result)
+                    })
+                );
+            }
+
+            while let Some(join_result) = join_set.join_next().await {
+                let (pid, turn_result) = match join_result {
+                    Ok(pair) => pair,
+                    Err(join_err) => {
+                        eprintln!("[OS] Task panicked: {}", join_err);
+                        continue;
+                    }
+                };
+
+                {
+                    let mut os = app.os.lock().unwrap();
+                    os.set_current_pid(Some(pid));
+                    match turn_result {
+                        Ok(_outcome) => {
+                            os.increment_turns_used_for(pid);
+                            let mut should_terminate = true;
+                            let mut termination_result = "Completed".to_string();
+                            if let Some(p) = os.get_process_mut(pid) {
+                                if p.quota_turns > 0 {
+                                    p.quota_turns -= 1;
+                                }
+                                if p.quota_turns == 0 {
+                                    termination_result = "Terminated: Max LLM quota reached.".to_string();
+                                }
+                                if matches!(p.state, crate::ai::kernel::ProcessState::Waiting { .. } | crate::ai::kernel::ProcessState::Sleeping { .. } | crate::ai::kernel::ProcessState::Stopped) {
+                                    should_terminate = false;
+                                }
+                            }
+                            if should_terminate {
+                                os.cleanup_process_resources(pid);
+                                os.set_current_pid(Some(pid));
+                                os.terminate_current(termination_result);
+                                os.drop_terminated(pid);
+                            } else if os.is_round_robin() {
+                                os.set_current_pid(Some(pid));
+                                os.requeue_current();
+                            }
+                        }
+                        Err(err) => {
+                            os.cleanup_process_resources(pid);
+                            os.set_current_pid(Some(pid));
+                            os.terminate_current(format!("Failed: {}", err));
+                            os.drop_terminated(pid);
+                        }
+                    }
+
+                    let restarted = os.check_daemon_restart();
+                    if !restarted.is_empty() {
+                        use colored::Colorize;
+                        for rid in &restarted {
+                            println!("{} Daemon process {} restarted.", "[OS]".bright_blue().bold(), rid);
+                        }
+                    }
+                }
+            }
+
             continue;
         }
 
-        let mut question = ctx.question;
+        {
+            let Some(ctx) = input::next_question(app)? else {
+                cleanup_one_shot(app);
+                return Ok(());
+            };
+            if ctx.question.trim().is_empty() {
+                should_quit = false;
+                continue;
+            }
+            question = ctx.question;
+            history_count = ctx.history_count;
+        }
+
         if try_handle_interactive_command(app, mcp_client, &question, agent_manifests)? {
             if handle_post_command(app, &mut should_quit) {
                 return Ok(());
@@ -373,23 +540,107 @@ async fn run_loop(
         let next_model = resolve_model_for_input(app, ocr_succeeded_for_images, &mut question);
         app.current_model = next_model.clone();
 
+        {
+            let mut os = app.os.lock().unwrap();
+            os.begin_foreground(
+                "foreground".to_string(),
+                question.clone(),
+                10,
+                usize::MAX,
+                None,
+            );
+        }
+
+        let original_history_file = app.session_history_file.clone();
+        let original_writer = app.writer.clone();
+
         app.cancel_stream.store(false, Ordering::Relaxed);
         crate::ai::tools::registry::common::clear_tool_cancel();
-        let turn_outcome = match turn_runtime::run_turn(
+
+        {
+            let mut os = app.os.lock().unwrap();
+            if os.process_pending_signals() {
+                app.session_history_file = original_history_file;
+                app.writer = original_writer;
+                continue;
+            }
+        }
+
+        let fg_pid = {
+            let os = app.os.lock().unwrap();
+            os.current_process_id()
+        };
+
+        let turn_outcome = crate::ai::kernel::TASK_PID.scope(fg_pid, turn_runtime::run_turn(
             app,
             mcp_client,
             skill_manifests,
-            ctx.history_count,
+            history_count,
             question,
             next_model,
             precomputed_ocr,
             one_shot_mode,
             should_quit,
-        )
-        .await
-        {
-            Ok(outcome) => outcome,
+        ))
+        .await;
+
+        match turn_outcome {
+            Ok(outcome) => {
+                let mut os = app.os.lock().unwrap();
+                let current_pid = os.current_process_id();
+                let mut should_terminate = true;
+                let mut termination_result = "Completed".to_string();
+
+                if let Some(pid) = current_pid {
+                    os.increment_turns_used_for(pid);
+                    if let Some(proc) = os.get_process_mut(pid) {
+                        if proc.quota_turns > 0 {
+                            proc.quota_turns -= 1;
+                        }
+                        if proc.quota_turns == 0 {
+                            termination_result =
+                                "Terminated: Max LLM quota reached.".to_string();
+                        }
+
+                        if matches!(proc.state, crate::ai::kernel::ProcessState::Waiting { .. } | crate::ai::kernel::ProcessState::Sleeping { .. } | crate::ai::kernel::ProcessState::Stopped) {
+                            should_terminate = false;
+                        }
+                    }
+                }
+
+                if should_terminate {
+                    if let Some(pid) = current_pid {
+                        os.cleanup_process_resources(pid);
+                        os.terminate_current(termination_result);
+                        os.drop_terminated(pid);
+                    }
+                }
+
+                let restarted = os.check_daemon_restart();
+                if !restarted.is_empty() {
+                    use colored::Colorize;
+                    for pid in &restarted {
+                        println!("{} Daemon process {} restarted.", "[OS]".bright_blue().bold(), pid);
+                    }
+                }
+
+                if os.is_round_robin() && os.has_ready() {
+                    os.requeue_current();
+                }
+                outcome
+            },
             Err(err) => {
+                let mut os = app.os.lock().unwrap();
+                let current_pid = os.current_process_id();
+                if let Some(pid) = current_pid {
+                    os.cleanup_process_resources(pid);
+                }
+                os.terminate_current(format!("Failed: {}", err));
+                if let Some(pid) = current_pid {
+                    os.drop_terminated(pid);
+                }
+                app.session_history_file = original_history_file;
+                app.writer = original_writer;
                 eprintln!("[Error] 当前轮请求失败：{}", err);
                 if one_shot_mode || should_quit {
                     cleanup_one_shot(app);
@@ -400,13 +651,16 @@ async fn run_loop(
                 continue;
             }
         };
-        if matches!(turn_outcome, turn_runtime::TurnOutcome::Quit) || should_quit {
+        app.session_history_file = original_history_file;
+        app.writer = original_writer;
+        if matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Quit)) || should_quit {
             cleanup_one_shot(app);
             return Ok(());
         }
-        if let Some(writer) = app.writer.as_mut() {
-            writer.write_all(b"\n---\n")?;
-            writer.flush()?;
+        if let Some(writer) = app.writer.as_ref() {
+            let mut guard = writer.lock().unwrap();
+            guard.write_all(b"\n---\n")?;
+            guard.flush()?;
         }
     }
 }
@@ -482,6 +736,7 @@ mod tests {
                 max_iterations: super::DEFAULT_MAX_ITERATIONS,
             }),
             last_skill_bias: None,
+            os: super::new_local_kernel(),
             agent_reload_counter: None,
         }
     }

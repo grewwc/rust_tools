@@ -22,9 +22,9 @@ use super::{
     types::IterationExecution,
 };
 
-pub(super) async fn refresh_skill_turn_for_iteration(
+pub(super) fn refresh_skill_turn_for_iteration(
     app: &mut App,
-    mcp_client: &mut McpClient,
+    mcp_client: &McpClient,
     skill_manifests: &[crate::ai::skills::SkillManifest],
     question: &str,
     iteration: usize,
@@ -263,7 +263,7 @@ async fn stream_model_response(
     _iteration: usize,
 ) -> StreamResult {
     print_assistant_banner_with_app(Some(app));
-    let stream_result = match stream::stream_response(
+    let stream_ok = match stream::stream_response(
         app,
         response,
         current_history,
@@ -271,12 +271,18 @@ async fn stream_model_response(
     )
     .await
     {
-        Ok(result) => result,
+        Ok(result) => Some(result),
         Err(err) => {
             app.streaming
                 .store(false, std::sync::atomic::Ordering::Relaxed);
             eprintln!("\n[Error] 流式响应处理失败：{}", err);
             eprintln!("[Info] 尝试继续对话...");
+            None
+        }
+    };
+    let stream_result = match stream_ok {
+        Some(result) => result,
+        None => {
             let _ = drain_response(response).await;
             StreamResult {
                 outcome: StreamOutcome::Completed,

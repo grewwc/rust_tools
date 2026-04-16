@@ -5,7 +5,6 @@ use crate::ai::{
     types::{App, SkillBiasMemory, ToolDefinition},
 };
 use crate::commonw::configw;
-use std::ptr::NonNull;
 use rust_tools::cw::SkipMap;
 use rust_tools::cw::SkipSet;
 use chrono::{DateTime, Utc};
@@ -118,7 +117,6 @@ enum PreferenceStrength {
 }
 
 pub(super) struct SkillTurnGuard {
-    app: NonNull<App>,
     restore_agent_context: Option<(Vec<ToolDef>, usize)>,
     builder: SystemPromptBuilder,
     cached_system_prompt: Option<String>,
@@ -178,12 +176,9 @@ impl SkillTurnGuard {
     pub(super) fn set_restore_agent_context(&mut self, restore: Option<(Vec<ToolDef>, usize)>) {
         self.restore_agent_context = restore;
     }
-}
 
-impl Drop for SkillTurnGuard {
-    fn drop(&mut self) {
-        if let Some((tools, max_iterations)) = self.restore_agent_context.take() {
-            let app = unsafe { self.app.as_mut() };
+    pub(super) fn restore_agent_context(self, app: &mut App) {
+        if let Some((tools, max_iterations)) = self.restore_agent_context {
             if let Some(ctx) = app.agent_context.as_mut() {
                 ctx.tools = tools;
                 ctx.max_iterations = max_iterations;
@@ -641,8 +636,8 @@ fn build_system_prompt(
         b.push(ContextKind::Policy, "Memory:\n- When the user asks to remember/save something, call `memory_save`. Do NOT skip the save step.\n- When the user asks to recall saved memory, call `memory_search` or `memory_recent`.");
     }
 
-    if has_tool(available_tools, "plan") {
-        b.push(ContextKind::Behavior, "Planning:\n- Simple tasks: act directly without `plan`.\n- Complex multi-step tasks (3+ tool calls across files/tools): call `plan` first, execute step by step.");
+    if has_tool(available_tools, "plan") || has_tool(available_tools, "spawn_process") {
+        b.push(ContextKind::Behavior, "Planning & Sub-process Execution:\n- Simple tasks: act directly without `plan`.\n- Complex multi-step tasks: use `plan` first.\n- If a task can be delegated or run autonomously in the background (e.g. searching broadly, running a heavy test suite), use `spawn_process` to let the Agent OS handle it asynchronously.\n- Child processes can be created with reduced capabilities for least-privilege execution.\n- After spawning, you can either continue your work in parallel, or use `wait_process` to yield control until the child finishes.\n- Use `sleep_process` to suspend yourself for future scheduler ticks.\n- Use `kill_process` to terminate a descendant that is no longer needed.\n- Use `reap_process` to collect a terminated descendant and remove it from the process table.\n- Use `send_ipc_message` and `read_mailbox` to communicate across processes.");
     }
 
     if has_tool(available_tools, "knowledge_search") || has_tool(available_tools, "knowledge_semantic_search") {
@@ -886,7 +881,6 @@ fn build_skill_turn_guard(
         activate_skill_context(app, builtin_tools, mcp_tools, max_iterations);
 
     SkillTurnGuard {
-        app: NonNull::from(&mut *app),
         restore_agent_context,
         builder,
         cached_system_prompt: None,
@@ -910,7 +904,7 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
     build_skill_turn_guard(app, mcp_client, skill, intent.clone())
 }
 
-pub(super) async fn prepare_skill_for_turn(
+pub(super) fn prepare_skill_for_turn(
     app: &mut App,
     mcp_client: &McpClient,
     skill_manifests: &[SkillManifest],

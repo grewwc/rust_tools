@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::ai::mcp::McpClient;
+use crate::ai::mcp::SharedMcpClient;
 use crate::ai::{
     code_discovery_policy::{
         CodeDiscoveryRecord, parse_confidence, parse_kind, parse_record_line, recall_limit,
@@ -68,7 +68,7 @@ struct RecentMemoryCacheEntry {
 )]
 pub(super) async fn prepare_turn(
     app: &mut App,
-    mcp_client: &mut McpClient,
+    mcp_client: &SharedMcpClient,
     skill_manifests: &[crate::ai::skills::SkillManifest],
     history_count: usize,
     question: &str,
@@ -82,9 +82,10 @@ pub(super) async fn prepare_turn(
         app.config.history_keep_last,
         app.config.history_summary_max_chars,
     )?;
-    let mut skill_turn =
-        skill_runtime::prepare_skill_for_turn(app, mcp_client, skill_manifests, question)
-            .await;
+    let mut skill_turn = {
+        let mc = mcp_client.lock().unwrap();
+        skill_runtime::prepare_skill_for_turn(app, &mc, skill_manifests, question)
+    };
 
     {
         let now = chrono::Local::now();
@@ -529,6 +530,8 @@ mod tests {
                 tags: vec!["kind:symbol".to_string(), "confidence:high".to_string()],
                 source: Some("session:abc".to_string()),
                 priority: Some(180),
+                owner_pid: None,
+                owner_pgid: None,
             },
             AgentMemoryEntry {
                 id: None,
@@ -538,6 +541,8 @@ mod tests {
                 tags: vec!["kind:error_site".to_string(), "confidence:high".to_string()],
                 source: Some("session:abc".to_string()),
                 priority: Some(180),
+                owner_pid: None,
+                owner_pgid: None,
             },
             AgentMemoryEntry {
                 id: None,
@@ -547,6 +552,8 @@ mod tests {
                 tags: vec!["kind:symbol".to_string(), "confidence:high".to_string()],
                 source: Some("session:xyz".to_string()),
                 priority: Some(180),
+                owner_pid: None,
+                owner_pgid: None,
             },
         ];
         let mut existing = BTreeSet::new();

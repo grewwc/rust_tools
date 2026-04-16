@@ -4,7 +4,94 @@ use serde_json::Value;
 use uuid::Uuid;
 use rust_tools::commonw::FastSet;
 
+use crate::ai::tools::os_tools::GLOBAL_OS;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
+
+fn current_owner_tags() -> (Option<u64>, Option<u64>) {
+    if let Ok(guard) = GLOBAL_OS.lock() {
+        if let Some(os_arc) = guard.as_ref() {
+            if let Ok(os) = os_arc.lock() {
+                if let Some(pid) = os.current_process_id() {
+                    let pgid = os.get_process(pid).and_then(|p| p.process_group);
+                    return (Some(pid), pgid);
+                }
+            }
+        }
+    }
+    (None, None)
+}
+
+fn is_memory_visible_to(entry: &AgentMemoryEntry, viewer_pid: Option<u64>) -> bool {
+    let Some(viewer) = viewer_pid else {
+        return true;
+    };
+    let Some(owner) = entry.owner_pid else {
+        return true;
+    };
+    if owner == viewer {
+        return true;
+    }
+    let Ok(guard) = GLOBAL_OS.lock() else {
+        return false;
+    };
+    let Some(os_arc) = guard.as_ref() else {
+        return false;
+    };
+    let Ok(os) = os_arc.lock() else {
+        return false;
+    };
+    if let Some(entry_pgid) = entry.owner_pgid {
+        if let Some(vpgid) = os.get_process(viewer).and_then(|p| p.process_group) {
+            if entry_pgid == vpgid {
+                return true;
+            }
+        }
+    }
+    let mut cursor = owner;
+    while let Some(proc) = os.get_process(cursor) {
+        if proc.parent_pid == Some(viewer) {
+            return true;
+        }
+        match proc.parent_pid {
+            Some(parent) => cursor = parent,
+            None => break,
+        }
+    }
+    false
+}
+
+struct ViewerContext {
+    viewer_pid: Option<u64>,
+    viewer_pgid: Option<u64>,
+}
+
+impl ViewerContext {
+    fn current() -> Self {
+        let (pid, pgid) = current_owner_tags();
+        Self { viewer_pid: pid, viewer_pgid: pgid }
+    }
+
+    fn can_see(&self, entry: &AgentMemoryEntry) -> bool {
+        let Some(viewer) = self.viewer_pid else { return true; };
+        let Some(owner) = entry.owner_pid else { return true; };
+        if owner == viewer { return true; }
+        if let (Some(entry_pgid), Some(vpgid)) = (entry.owner_pgid, self.viewer_pgid) {
+            if entry_pgid == vpgid { return true; }
+        }
+        let Ok(guard) = GLOBAL_OS.lock() else { return false; };
+        let Some(os_arc) = guard.as_ref() else { return false; };
+        let Ok(os) = os_arc.lock() else { return false; };
+        let mut cursor = owner;
+        while let Some(proc) = os.get_process(cursor) {
+            if proc.parent_pid == Some(viewer) { return true; }
+            match proc.parent_pid {
+                Some(parent) => cursor = parent,
+                None => break,
+            }
+        }
+        false
+    }
+}
 
 fn parse_string_array(value: &Value) -> Vec<String> {
     value
@@ -133,6 +220,7 @@ pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
         .filter(|value| !value.is_empty());
     let priority = parse_priority_arg(args, "priority")?
         .or_else(|| Some(default_priority_for_category(&category)));
+    let (owner_pid, owner_pgid) = current_owner_tags();
     let entry = AgentMemoryEntry {
         id: Some(next_memory_id()),
         timestamp: Local::now().to_rfc3339(),
@@ -141,6 +229,8 @@ pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
         tags,
         source,
         priority,
+        owner_pid,
+        owner_pgid,
     };
 
     let store = MemoryStore::from_env_or_config();
@@ -174,9 +264,13 @@ pub(crate) fn execute_memory_search(args: &Value) -> Result<String, String> {
     let debug_score = args["debug_score"].as_bool().unwrap_or(false);
     let store = MemoryStore::from_env_or_config();
     let results = store.search(query, 10_000)?;
+    let viewer = ViewerContext::current();
 
     let mut scored = Vec::with_capacity(results.len());
     for (e, _search_score) in results {
+        if !viewer.can_see(&e) {
+            continue;
+        }
         if let Some(cat) = category_filter.as_ref() {
             if e.category.to_lowercase() != *cat {
                 continue;
@@ -266,7 +360,12 @@ pub(crate) fn execute_memory_recent(args: &Value) -> Result<String, String> {
     let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 50) as usize;
     let store = MemoryStore::from_env_or_config();
     let entries = store.recent(limit)?;
-    Ok(render_memory_entries(&entries))
+    let viewer = ViewerContext::current();
+    let visible: Vec<AgentMemoryEntry> = entries
+        .into_iter()
+        .filter(|e| viewer.can_see(e))
+        .collect();
+    Ok(render_memory_entries(&visible))
 }
 
 pub(crate) fn execute_memory_list_json(args: &Value) -> Result<String, String> {
@@ -274,10 +373,15 @@ pub(crate) fn execute_memory_list_json(args: &Value) -> Result<String, String> {
     let offset = args["offset"].as_u64().unwrap_or(0) as usize;
     let store = MemoryStore::from_env_or_config();
     let entries = store.recent(limit + offset)?;
-    let sliced = if offset >= entries.len() {
+    let viewer = ViewerContext::current();
+    let visible: Vec<AgentMemoryEntry> = entries
+        .into_iter()
+        .filter(|e| viewer.can_see(e))
+        .collect();
+    let sliced = if offset >= visible.len() {
         Vec::new()
     } else {
-        entries.into_iter().skip(offset).collect::<Vec<_>>()
+        visible.into_iter().skip(offset).collect::<Vec<_>>()
     };
     serde_json::to_string(&sliced).map_err(|e| format!("{}", e))
 }
@@ -607,6 +711,7 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
 
     let priority = parse_priority_arg(args, "priority")?
         .or_else(|| Some(default_priority_for_category(&category)));
+    let (owner_pid, owner_pgid) = current_owner_tags();
     let entry = AgentMemoryEntry {
         id: Some(next_memory_id()),
         timestamp: Local::now().to_rfc3339(),
@@ -615,6 +720,8 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
         tags,
         source,
         priority,
+        owner_pid,
+        owner_pgid,
     };
     
     let store = MemoryStore::from_env_or_config();
@@ -631,8 +738,12 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
 mod tests {
     use super::{
         execute_memory_delete, execute_memory_list_json, execute_memory_save, execute_memory_update,
+        is_memory_visible_to,
     };
+    use crate::ai::kernel::{KernelInternal, Syscall};
     use crate::ai::test_support::ENV_LOCK;
+    use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
+    use chrono::Local;
 
     #[test]
     fn memory_save_assigns_id_and_update_rewrites_entry() {
@@ -721,6 +832,162 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         unsafe {
             std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn memory_visibility_unowned_entries_visible_to_all() {
+        let entry = AgentMemoryEntry {
+            id: None,
+            timestamp: Local::now().to_rfc3339(),
+            category: "general".to_string(),
+            note: "public note".to_string(),
+            tags: vec![],
+            source: None,
+            priority: Some(100),
+            owner_pid: None,
+            owner_pgid: None,
+        };
+        assert!(is_memory_visible_to(&entry, None));
+        assert!(is_memory_visible_to(&entry, Some(1)));
+        assert!(is_memory_visible_to(&entry, Some(999)));
+    }
+
+    #[test]
+    fn memory_visibility_owner_sees_own_entries() {
+        let entry = AgentMemoryEntry {
+            id: None,
+            timestamp: Local::now().to_rfc3339(),
+            category: "general".to_string(),
+            note: "my note".to_string(),
+            tags: vec![],
+            source: None,
+            priority: Some(100),
+            owner_pid: Some(42),
+            owner_pgid: None,
+        };
+        assert!(is_memory_visible_to(&entry, Some(42)));
+        assert!(!is_memory_visible_to(&entry, Some(99)));
+    }
+
+    #[test]
+    fn memory_visibility_foreground_sees_all() {
+        let entry = AgentMemoryEntry {
+            id: None,
+            timestamp: Local::now().to_rfc3339(),
+            category: "general".to_string(),
+            note: "tagged note".to_string(),
+            tags: vec![],
+            source: None,
+            priority: Some(100),
+            owner_pid: Some(42),
+            owner_pgid: Some(10),
+        };
+        assert!(is_memory_visible_to(&entry, None));
+    }
+
+    #[test]
+    fn memory_visibility_same_process_group() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let kernel = crate::ai::driver::new_local_kernel();
+        let (root, child_a, child_b) = {
+            let mut os = kernel.lock().unwrap();
+            let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+            let child_a = os.spawn(Some(root), "a".to_string(), "goal a".to_string(), 20, 4, None, None).unwrap();
+            let child_b = os.spawn(Some(root), "b".to_string(), "goal b".to_string(), 20, 4, None, None).unwrap();
+            os.set_process_group(child_a, 100).unwrap();
+            os.set_process_group(child_b, 100).unwrap();
+            (root, child_a, child_b)
+        };
+        crate::ai::tools::os_tools::init_os_tools_globals(kernel.clone());
+
+        let entry_a = AgentMemoryEntry {
+            id: None,
+            timestamp: Local::now().to_rfc3339(),
+            category: "general".to_string(),
+            note: "a's note".to_string(),
+            tags: vec![],
+            source: None,
+            priority: Some(100),
+            owner_pid: Some(child_a),
+            owner_pgid: Some(100),
+        };
+
+        assert!(is_memory_visible_to(&entry_a, Some(child_b)));
+
+        {
+            if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+                *guard = None;
+            }
+        }
+    }
+
+    #[test]
+    fn memory_visibility_ancestor_sees_descendant() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let kernel = crate::ai::driver::new_local_kernel();
+        let (root, child) = {
+            let mut os = kernel.lock().unwrap();
+            let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+            let child = os.spawn(Some(root), "child".to_string(), "goal child".to_string(), 20, 4, None, None).unwrap();
+            (root, child)
+        };
+        crate::ai::tools::os_tools::init_os_tools_globals(kernel.clone());
+
+        let child_entry = AgentMemoryEntry {
+            id: None,
+            timestamp: Local::now().to_rfc3339(),
+            category: "general".to_string(),
+            note: "child's secret".to_string(),
+            tags: vec![],
+            source: None,
+            priority: Some(100),
+            owner_pid: Some(child),
+            owner_pgid: None,
+        };
+
+        assert!(is_memory_visible_to(&child_entry, Some(root)));
+
+        {
+            if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+                *guard = None;
+            }
+        }
+    }
+
+    #[test]
+    fn memory_visibility_unrelated_process_blocked() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let kernel = crate::ai::driver::new_local_kernel();
+        let (child_a, child_b) = {
+            let mut os = kernel.lock().unwrap();
+            let root1 = os.begin_foreground("fg1".to_string(), "goal1".to_string(), 10, usize::MAX, None);
+            let child_a = os.spawn(Some(root1), "a".to_string(), "goal a".to_string(), 20, 4, None, None).unwrap();
+
+            let root2 = os.begin_foreground("fg2".to_string(), "goal2".to_string(), 10, usize::MAX, None);
+            let child_b = os.spawn(Some(root2), "b".to_string(), "goal b".to_string(), 20, 4, None, None).unwrap();
+            (child_a, child_b)
+        };
+        crate::ai::tools::os_tools::init_os_tools_globals(kernel.clone());
+
+        let entry_a = AgentMemoryEntry {
+            id: None,
+            timestamp: Local::now().to_rfc3339(),
+            category: "general".to_string(),
+            note: "a's private note".to_string(),
+            tags: vec![],
+            source: None,
+            priority: Some(100),
+            owner_pid: Some(child_a),
+            owner_pgid: None,
+        };
+
+        assert!(!is_memory_visible_to(&entry_a, Some(child_b)));
+
+        {
+            if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+                *guard = None;
+            }
         }
     }
 }

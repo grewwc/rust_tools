@@ -1,4 +1,5 @@
 use std::io::{self, IsTerminal, Write};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ai::{
@@ -239,7 +240,7 @@ fn finalize_stream_response(
     if state.content.thinking_open {
         write_stream_content(
             &format!("\n{}\n", markers.end_thinking_tag),
-            app.writer.as_mut(),
+            app.writer.as_ref(),
             &mut state.render.markdown,
             false,
         )?;
@@ -316,7 +317,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     if state.content.thinking_open {
         let _ = write_stream_content(
             &format!("\n{}\n", markers.end_thinking_tag),
-            app.writer.as_mut(),
+            app.writer.as_ref(),
             &mut state.render.markdown,
             false,
         );
@@ -353,7 +354,7 @@ fn ensure_tool_calls_section_open(
     if state.content.thinking_open {
         let _ = write_stream_content(
             &format_end_thinking_line(markers, &state.render.markdown),
-            app.writer.as_mut(),
+            app.writer.as_ref(),
             &mut state.render.markdown,
             false,
         );
@@ -479,7 +480,7 @@ fn commit_visible_content(
 
     maybe_write_stream_content(
         content.as_str(),
-        app.writer.as_mut(),
+        app.writer.as_ref(),
         state,
         markers,
         state.content.thinking_open,
@@ -563,12 +564,17 @@ fn maybe_write_plain_stream_text(
 
 fn maybe_write_stream_content(
     content: &str,
-    writer: Option<&mut std::fs::File>,
+    writer: Option<&Arc<std::sync::Mutex<std::fs::File>>>,
     state: &mut StreamProcessingState,
     markers: &StreamMarkers,
     dimmed: bool,
 ) -> io::Result<()> {
-    write_stream_content_to_file(content, writer)?;
+    if let Some(w) = writer {
+        let mut guard = w.lock().unwrap();
+        let clean = strip_ansi_codes(content);
+        guard.write_all(clean.as_bytes())?;
+        guard.flush()?;
+    }
 
     if dimmed {
         return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
@@ -744,11 +750,16 @@ fn process_stream_line(
 
 fn write_stream_content(
     content: &str,
-    writer: Option<&mut std::fs::File>,
+    writer: Option<&Arc<std::sync::Mutex<std::fs::File>>>,
     markdown: &mut MarkdownStreamRenderer,
     dimmed: bool,
 ) -> io::Result<()> {
-    write_stream_content_to_file(content, writer)?;
+    if let Some(w) = writer {
+        let mut guard = w.lock().unwrap();
+        let clean = strip_ansi_codes(content);
+        guard.write_all(clean.as_bytes())?;
+        guard.flush()?;
+    }
     write_stream_content_to_terminal(content, markdown, dimmed)
 }
 

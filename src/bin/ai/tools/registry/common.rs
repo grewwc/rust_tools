@@ -164,7 +164,9 @@ fn record_tool_stat(name: &str, ok: bool) {
             },
         ],
         source: None,
-        priority: Some(50), // Normal priority: tool stats can be GC'd normally
+        priority: Some(50),
+        owner_pid: None,
+        owner_pgid: None,
     };
     let store = MemoryStore::from_env_or_config();
     let _ = store.append(&entry);

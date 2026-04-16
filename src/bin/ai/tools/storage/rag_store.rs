@@ -711,6 +711,8 @@ mod tests {
             timestamp: "1000".to_string(),
             source: None,
             priority: Some(100),
+            owner_pid: None,
+            owner_pgid: None,
         };
         store.append(&entry).unwrap();
 
@@ -722,6 +724,8 @@ mod tests {
             timestamp: "2000".to_string(),
             source: None,
             priority: Some(100),
+            owner_pid: None,
+            owner_pgid: None,
         };
         store.append(&entry2).unwrap();
 

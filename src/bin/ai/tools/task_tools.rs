@@ -1,11 +1,58 @@
 use serde_json::Value;
 use std::process::Command;
+use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::ai::{
     agents::{self, AgentManifest, AgentModelTier},
     models,
     tools::common::{ToolRegistration, ToolSpec},
 };
+use rust_tools::commonw::FastMap;
+use uuid::Uuid;
+
+enum TaskState {
+    Running(std::process::Child),
+    Reaping,
+    Completed { stdout: String, stderr: String, duration_secs: f64 },
+    Failed { stdout: String, stderr: String, duration_secs: f64 },
+}
+
+struct AsyncTaskEntry {
+    description: String,
+    agent_name: String,
+    model: String,
+    selection_explanation: String,
+    started_at: Instant,
+    state: TaskState,
+}
+
+static TASK_REGISTRY: LazyLock<Mutex<FastMap<String, AsyncTaskEntry>>> =
+    LazyLock::new(|| Mutex::new(FastMap::default()));
+
+const MAX_TASK_REGISTRY_SIZE: usize = 100;
+
+fn prune_completed_tasks(registry: &mut FastMap<String, AsyncTaskEntry>) {
+    if registry.len() <= MAX_TASK_REGISTRY_SIZE {
+        return;
+    }
+    let completed_keys: Vec<String> = registry
+        .iter()
+        .filter(|(_, e)| matches!(e.state, TaskState::Completed { .. } | TaskState::Failed { .. }))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in completed_keys {
+        registry.remove(&key);
+        if registry.len() <= MAX_TASK_REGISTRY_SIZE {
+            break;
+        }
+    }
+}
+
+fn next_task_id() -> String {
+    format!("task_{}", Uuid::new_v4().simple())
+}
 
 fn params_task() -> Value {
     serde_json::json!({
@@ -63,6 +110,387 @@ pub(crate) fn execute_task(args: &Value) -> Result<String, String> {
     }
 
     execute_subagent_task(description, prompt, agent, model_override)
+}
+
+fn params_task_spawn() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "description": {
+                "type": "string",
+                "description": "Short description of what this task will do (3-10 words)."
+            },
+            "prompt": {
+                "type": "string",
+                "description": "The task/prompt to send to the subagent. Be specific about what you want accomplished."
+            },
+            "agent": {
+                "type": "string",
+                "description": "Optional subagent name. Leave empty to let the runtime auto-select the best subagent."
+            },
+            "model": {
+                "type": "string",
+                "description": "Optional model override for this subagent task."
+            }
+        },
+        "required": ["description", "prompt"]
+    })
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "task_spawn",
+        description: "Launch a subagent task asynchronously and return immediately with a task_id. Use this when you want to run multiple subagent tasks in parallel. Collect results later with task_wait.",
+        parameters: params_task_spawn,
+        execute: execute_task_spawn,
+        groups: &["builtin", "core"],
+    }
+});
+
+pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
+    let description = args["description"]
+        .as_str()
+        .ok_or("Missing 'description' parameter")?;
+    let prompt = args["prompt"]
+        .as_str()
+        .ok_or("Missing 'prompt' parameter")?;
+    let agent = args["agent"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let model_override = args["model"].as_str();
+
+    if description.trim().is_empty() {
+        return Err("description cannot be empty".to_string());
+    }
+    if prompt.trim().is_empty() {
+        return Err("prompt cannot be empty".to_string());
+    }
+
+    let all_agents = agents::load_all_agents();
+    let selected = select_subagent(&all_agents, agent, description, prompt)?;
+    let selected_model = model_override
+        .map(models::determine_model)
+        .unwrap_or_else(|| models::auto_subagent_model_for_agent(selected.agent, description, prompt));
+    let selection_explanation = build_selection_explanation(&selected, &selected_model, model_override);
+
+    let task_id = next_task_id();
+
+    let mut cmd_args = vec!["--".to_string(), "--no-skills".to_string()];
+    cmd_args.push("--model".to_string());
+    cmd_args.push(selected_model.clone());
+    cmd_args.push("--agent".to_string());
+    cmd_args.push(selected.agent.name.clone());
+    cmd_args.push(prompt.to_string());
+
+    let child = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
+        .args(&cmd_args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to launch subagent: {}", e))?;
+
+    println!(
+        "\n[TaskSpawn] Launched subagent '{}' with model '{}' for: {} (task_id: {})",
+        selected.agent.name, selected_model, description, task_id
+    );
+
+    {
+        let mut registry = TASK_REGISTRY.lock().unwrap();
+        registry.insert(
+            task_id.clone(),
+            AsyncTaskEntry {
+                description: description.to_string(),
+                agent_name: selected.agent.name.clone(),
+                model: selected_model.clone(),
+                selection_explanation,
+                started_at: Instant::now(),
+                state: TaskState::Running(child),
+            },
+        );
+        prune_completed_tasks(&mut registry);
+    }
+
+    Ok(format!(
+        "Task spawned: task_id={}, agent={}, model={}\nUse task_wait to collect results when ready.",
+        task_id, selected.agent.name, selected_model
+    ))
+}
+
+fn params_task_wait() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "task_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Array of task_id strings returned by task_spawn. Waits for ALL to complete."
+            },
+            "timeout_secs": {
+                "type": "integer",
+                "description": "Maximum seconds to wait for all tasks. Default 120."
+            }
+        },
+        "required": ["task_ids"]
+    })
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "task_wait",
+        description: "Wait for one or more asynchronously spawned tasks to complete and collect their results. Polls all tasks in parallel so total wait time equals the slowest task, not the sum. Use after task_spawn to gather results.",
+        parameters: params_task_wait,
+        execute: execute_task_wait,
+        groups: &["builtin", "core"],
+    }
+});
+
+pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
+    let task_ids = args["task_ids"]
+        .as_array()
+        .ok_or("Missing 'task_ids' array parameter")?
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect::<Vec<_>>();
+
+    if task_ids.is_empty() {
+        return Err("task_ids array cannot be empty".to_string());
+    }
+
+    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(120);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+
+    {
+        let registry = TASK_REGISTRY.lock().unwrap();
+        for tid in &task_ids {
+            if !registry.contains_key(tid) {
+                return Err(format!("Unknown task_id: {}", tid));
+            }
+        }
+    }
+
+    loop {
+        let mut all_done = true;
+        {
+            let mut registry = TASK_REGISTRY.lock().unwrap();
+            for tid in &task_ids {
+                if let Some(entry) = registry.get_mut(tid) {
+                    let prev = std::mem::replace(&mut entry.state, TaskState::Reaping);
+                    match prev {
+                        TaskState::Running(mut child) => {
+                            match child.try_wait() {
+                                Ok(Some(status)) => {
+                                    let duration_secs = entry.started_at.elapsed().as_secs_f64();
+                                    match child.wait_with_output() {
+                                        Ok(out) => {
+                                            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                                            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                                            if status.success() {
+                                                entry.state = TaskState::Completed {
+                                                    stdout,
+                                                    stderr,
+                                                    duration_secs,
+                                                };
+                                            } else {
+                                                entry.state = TaskState::Failed {
+                                                    stdout,
+                                                    stderr,
+                                                    duration_secs,
+                                                };
+                                            }
+                                        }
+                                        Err(e) => {
+                                            entry.state = TaskState::Failed {
+                                                stdout: String::new(),
+                                                stderr: format!("Failed to read output: {}", e),
+                                                duration_secs,
+                                            };
+                                        }
+                                    }
+                                }
+                                Ok(None) => {
+                                    entry.state = TaskState::Running(child);
+                                    all_done = false;
+                                }
+                                Err(e) => {
+                                    let duration_secs = entry.started_at.elapsed().as_secs_f64();
+                                    let _ = child.kill();
+                                    let _ = child.wait();
+                                    entry.state = TaskState::Failed {
+                                        stdout: String::new(),
+                                        stderr: format!("Process error: {}", e),
+                                        duration_secs,
+                                    };
+                                }
+                            }
+                        }
+                        other => {
+                            entry.state = other;
+                        }
+                    }
+                }
+            }
+        }
+
+        if all_done {
+            break;
+        }
+
+        if Instant::now() >= deadline {
+            let mut registry = TASK_REGISTRY.lock().unwrap();
+            for tid in &task_ids {
+                if let Some(entry) = registry.get_mut(tid) {
+                    let prev = std::mem::replace(&mut entry.state, TaskState::Reaping);
+                    if let TaskState::Running(mut child) = prev {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        entry.state = TaskState::Failed {
+                            stdout: String::new(),
+                            stderr: "Timed out: process killed".to_string(),
+                            duration_secs: entry.started_at.elapsed().as_secs_f64(),
+                        };
+                    } else {
+                        entry.state = prev;
+                    }
+                }
+            }
+            break;
+        }
+
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let mut results = Vec::new();
+    {
+        let mut registry = TASK_REGISTRY.lock().unwrap();
+        for tid in &task_ids {
+            let result_str = if let Some(entry) = registry.remove(tid) {
+                match entry.state {
+                    TaskState::Running(_) | TaskState::Reaping => {
+                        format!(
+                            "[Task: {} via {} @ {}] TIMED OUT after {:.1}s",
+                            entry.description, entry.agent_name, entry.model,
+                            entry.started_at.elapsed().as_secs_f64()
+                        )
+                    }
+                    TaskState::Completed { stdout, duration_secs, .. } => {
+                        format!(
+                            "[Task: {} via {} @ {}] (completed in {:.1}s)\n{}\n{}",
+                            entry.description, entry.agent_name, entry.model,
+                            duration_secs, entry.selection_explanation, stdout
+                        )
+                    }
+                    TaskState::Failed { stdout, stderr, duration_secs } => {
+                        let mut parts = vec![format!(
+                            "[Task: {} via {} @ {}] FAILED after {:.1}s",
+                            entry.description, entry.agent_name, entry.model, duration_secs
+                        )];
+                        parts.push(entry.selection_explanation.clone());
+                        if !stderr.is_empty() {
+                            parts.push(format!("Error: {}", stderr));
+                        }
+                        if !stdout.is_empty() {
+                            parts.push(format!("Partial output:\n{}", stdout));
+                        }
+                        parts.join("\n")
+                    }
+                }
+            } else {
+                format!("[Task {}] already collected", tid)
+            };
+            results.push(result_str);
+        }
+    }
+
+    Ok(results.join("\n\n---\n\n"))
+}
+
+fn params_task_status() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {}
+    })
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "task_status",
+        description: "Show status of all asynchronously spawned tasks. Lists task_id, agent, model, and current state (running/completed/failed) without blocking.",
+        parameters: params_task_status,
+        execute: execute_task_status,
+        groups: &["builtin", "core"],
+    }
+});
+
+pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
+    let mut registry = TASK_REGISTRY.lock().unwrap();
+    if registry.is_empty() {
+        return Ok("No async tasks currently tracked.".to_string());
+    }
+
+    let mut lines = vec!["TaskID              Agent          Model          State       Description".to_string()];
+
+    for (tid, entry) in registry.iter_mut() {
+        let prev = std::mem::replace(&mut entry.state, TaskState::Reaping);
+        let (state_str, new_state) = match prev {
+            TaskState::Running(mut child) => {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let duration_secs = entry.started_at.elapsed().as_secs_f64();
+                        match child.wait_with_output() {
+                            Ok(out) => {
+                                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                                if status.success() {
+                                    ("completed".to_string(), TaskState::Completed {
+                                        stdout,
+                                        stderr,
+                                        duration_secs,
+                                    })
+                                } else {
+                                    ("failed".to_string(), TaskState::Failed {
+                                        stdout,
+                                        stderr,
+                                        duration_secs,
+                                    })
+                                }
+                            }
+                            Err(e) => {
+                                ("error".to_string(), TaskState::Failed {
+                                    stdout: String::new(),
+                                    stderr: format!("wait_with_output failed: {}", e),
+                                    duration_secs: entry.started_at.elapsed().as_secs_f64(),
+                                })
+                            }
+                        }
+                    }
+                    Ok(None) => ("running".to_string(), TaskState::Running(child)),
+                    Err(e) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        ("error".to_string(), TaskState::Failed {
+                            stdout: String::new(),
+                            stderr: format!("try_wait failed: {}", e),
+                            duration_secs: entry.started_at.elapsed().as_secs_f64(),
+                        })
+                    }
+                }
+            }
+            TaskState::Completed { .. } => {
+                ("completed".to_string(), prev)
+            }
+            TaskState::Failed { .. } => {
+                ("failed".to_string(), prev)
+            }
+            TaskState::Reaping => ("reaping".to_string(), TaskState::Reaping),
+        };
+        entry.state = new_state;
+
+        let short_id = if tid.len() > 19 { &tid[..19] } else { tid };
+        lines.push(format!(
+            "{:<19} {:<14} {:<14} {:<11} {}",
+            short_id, entry.agent_name, entry.model, state_str, entry.description
+        ));
+    }
+
+    Ok(lines.join("\n"))
 }
 
 fn auto_subagent_score(agent: &AgentManifest, task_text: &str) -> i32 {

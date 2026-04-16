@@ -8,6 +8,7 @@ mod errors;
 mod driver;
 mod files;
 mod history;
+pub(crate) mod kernel;
 mod knowledge;
 mod mcp;
 mod model_names;

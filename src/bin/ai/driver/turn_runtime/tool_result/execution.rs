@@ -89,7 +89,7 @@ pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
 )]
 fn execute_tool_calls_for_round(
     session_id: &str,
-    mcp_client: &mut McpClient,
+    mcp_client: &McpClient,
     tool_calls: &[ToolCall],
     observer: Option<&mut dyn tools::ToolExecutionObserver>,
     _iteration: usize,
@@ -247,7 +247,7 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
 
 fn handle_tool_call_round(
     app: &App,
-    mcp_client: &mut McpClient,
+    mcp_client: &McpClient,
     stream_result: &crate::ai::types::StreamResult,
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
@@ -287,7 +287,7 @@ fn handle_tool_call_round(
 pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     app: &App,
     _question: &str,
-    mcp_client: &mut McpClient,
+    mcp_client: &McpClient,
     execution: IterationExecution,
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
@@ -330,6 +330,15 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             )?;
 
             crate::ai::driver::input::clear_stdin_buffer();
+
+            {
+                let mut os = app.os.lock().unwrap();
+                if os.consume_yield_requested() {
+                    return Ok(TurnLoopStep::Return(
+                        crate::ai::driver::turn_runtime::types::TurnOutcome::Continue,
+                    ));
+                }
+            }
 
             if iteration >= max_iterations {
                 if *force_final_response {
@@ -407,6 +416,7 @@ mod tests {
                 max_iterations: 16,
             }),
             last_skill_bias: None,
+            os: crate::ai::driver::new_local_kernel(),
             agent_reload_counter: None,
         }
     }

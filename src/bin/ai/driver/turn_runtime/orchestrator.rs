@@ -1,4 +1,4 @@
-use crate::ai::{mcp::McpClient, types::App};
+use crate::ai::{mcp::SharedMcpClient, types::App};
 
 use super::{
     finalize::finalize_turn,
@@ -32,7 +32,7 @@ use super::{
 )]
 pub(in crate::ai::driver) async fn run_turn(
     app: &mut App,
-    mcp_client: &mut McpClient,
+    mcp_client: &SharedMcpClient,
     skill_manifests: &[crate::ai::skills::SkillManifest],
     history_count: usize,
     question: String,
@@ -47,7 +47,7 @@ pub(in crate::ai::driver) async fn run_turn(
         mut turn_messages,
         mut persisted_turn_messages,
         max_iterations,
-    } = prepare_turn(
+    } = match prepare_turn(
         app,
         mcp_client,
         skill_manifests,
@@ -56,26 +56,32 @@ pub(in crate::ai::driver) async fn run_turn(
         &next_model,
         precomputed_ocr,
     )
-    .await?;
+    .await
+    {
+        Ok(prep) => prep,
+        Err(err) => return Err(err),
+    };
 
     let mut iteration = 0usize;
     let mut force_final_response = false;
     let mut final_assistant_text = String::new();
     let mut final_assistant_recorded = false;
     let mut terminal_dedupe_candidate = None;
-    loop {
+    let loop_result = 'turn: loop {
         iteration += 1;
-        refresh_skill_turn_for_iteration(
-            app,
-            mcp_client,
-            skill_manifests,
-            &question,
-            iteration,
-            &mut skill_turn,
-            &mut messages,
-        )
-        .await;
-        let execution = execute_turn_iteration(
+        {
+            let mc = mcp_client.lock().unwrap();
+            refresh_skill_turn_for_iteration(
+                app,
+                &mc,
+                skill_manifests,
+                &question,
+                iteration,
+                &mut skill_turn,
+                &mut messages,
+            );
+        }
+        let execution = match execute_turn_iteration(
             app,
             &next_model,
             &mut messages,
@@ -87,58 +93,78 @@ pub(in crate::ai::driver) async fn run_turn(
             terminal_dedupe_candidate.as_deref(),
             iteration,
         )
-        .await?;
-        match handle_iteration_execution(
-            app,
-            &question,
-            mcp_client,
-            execution,
-            &mut messages,
-            &mut turn_messages,
-            one_shot_mode,
-            &mut persisted_turn_messages,
-            &mut final_assistant_text,
-            &mut final_assistant_recorded,
-            &mut force_final_response,
-            &mut terminal_dedupe_candidate,
-            iteration,
-            max_iterations,
-        )? {
-            TurnLoopStep::Continue => {
-                let mut new_tools = crate::ai::tools::enable_tools::drain_pending_enable();
-                let pending_mcp = crate::ai::tools::enable_tools::drain_pending_mcp_names();
-                if !pending_mcp.is_empty() {
-                    let mcp_all = mcp_client.get_all_tools();
-                    for tool in mcp_all {
-                        if pending_mcp.iter().any(|n| n == &tool.function.name) {
-                            new_tools.push(tool);
+        .await
+        {
+            Ok(e) => e,
+            Err(err) => break 'turn Err(err),
+        };
+        {
+            let mc = mcp_client.lock().unwrap();
+            let step = match handle_iteration_execution(
+                app,
+                &question,
+                &mc,
+                execution,
+                &mut messages,
+                &mut turn_messages,
+                one_shot_mode,
+                &mut persisted_turn_messages,
+                &mut final_assistant_text,
+                &mut final_assistant_recorded,
+                &mut force_final_response,
+                &mut terminal_dedupe_candidate,
+                iteration,
+                max_iterations,
+            ) {
+                Ok(s) => s,
+                Err(err) => break 'turn Err(err),
+            };
+            match step {
+                TurnLoopStep::Continue => {
+                    let mut new_tools = crate::ai::tools::enable_tools::drain_pending_enable();
+                    let pending_mcp = crate::ai::tools::enable_tools::drain_pending_mcp_names();
+                    if !pending_mcp.is_empty() {
+                        let mcp_all = mc.get_all_tools();
+                        for tool in mcp_all {
+                            if pending_mcp.iter().any(|n| n == &tool.function.name) {
+                                new_tools.push(tool);
+                            }
                         }
                     }
-                }
-                if !new_tools.is_empty() {
-                    if let Some(ctx) = app.agent_context.as_mut() {
-                        for tool in new_tools {
-                            if !ctx.tools.iter().any(|t| t.function.name == tool.function.name) {
-                                ctx.tools.push(tool);
+                    if !new_tools.is_empty() {
+                        if let Some(ctx) = app.agent_context.as_mut() {
+                            for tool in new_tools {
+                                if !ctx.tools.iter().any(|t| t.function.name == tool.function.name) {
+                                    ctx.tools.push(tool);
+                                }
                             }
                         }
                     }
                 }
+                TurnLoopStep::Break => break 'turn Ok(None),
+                TurnLoopStep::Return(outcome) => break 'turn Ok(Some(outcome)),
             }
-            TurnLoopStep::Break => break,
-            TurnLoopStep::Return(outcome) => return Ok(outcome),
         }
+    };
+
+    skill_turn.restore_agent_context(app);
+
+    let loop_result = loop_result.map_err(|e: Box<dyn std::error::Error>| e.to_string());
+
+    match loop_result {
+        Ok(Some(outcome)) => Ok(outcome),
+        Ok(None) => finalize_turn(
+            app,
+            &next_model,
+            &question,
+            &final_assistant_text,
+            final_assistant_recorded,
+            &mut turn_messages,
+            one_shot_mode,
+            &mut persisted_turn_messages,
+            should_quit,
+        )
+        .await,
+        Err(err_str) => Err(err_str.into()),
     }
-    finalize_turn(
-        app,
-        &next_model,
-        &question,
-        &final_assistant_text,
-        final_assistant_recorded,
-        &mut turn_messages,
-        one_shot_mode,
-        &mut persisted_turn_messages,
-        should_quit,
-    )
-    .await
 }

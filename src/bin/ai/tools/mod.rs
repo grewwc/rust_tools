@@ -12,6 +12,7 @@ mod lsp_tools;
 mod permissions;
 mod rag_tools;
 mod plan_tools;
+pub mod os_tools;
 mod patch_tools;
 pub(crate) mod registry;
 mod search_tools;

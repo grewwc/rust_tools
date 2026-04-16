@@ -53,10 +53,30 @@ pub(crate) struct AgentMemoryEntry {
     /// Default: 100 (normal priority). Low: 0-49, Normal: 50-99, High: 100-200, Permanent: 255
     #[serde(default = "default_priority")]
     pub(crate) priority: Option<u8>,
+    #[serde(default)]
+    pub(crate) owner_pid: Option<u64>,
+    #[serde(default)]
+    pub(crate) owner_pgid: Option<u64>,
 }
 
 fn default_priority() -> Option<u8> {
     Some(100)
+}
+
+impl Default for AgentMemoryEntry {
+    fn default() -> Self {
+        Self {
+            id: None,
+            timestamp: String::new(),
+            category: String::new(),
+            note: String::new(),
+            tags: Vec::new(),
+            source: None,
+            priority: Some(100),
+            owner_pid: None,
+            owner_pgid: None,
+        }
+    }
 }
 
 pub(crate) struct MemoryStore {
@@ -348,6 +368,8 @@ mod tests {
             tags: vec!["auth".to_string()],
             source: Some("svc".to_string()),
             priority: Some(100),
+            owner_pid: None,
+            owner_pgid: None,
         };
         let e2 = AgentMemoryEntry {
             id: None,
@@ -357,6 +379,8 @@ mod tests {
             tags: vec!["user".to_string()],
             source: Some("svc".to_string()),
             priority: Some(100),
+            owner_pid: None,
+            owner_pgid: None,
         };
         store.append(&e1).unwrap();
         store.append(&e2).unwrap();
@@ -382,6 +406,8 @@ mod tests {
             tags: vec!["login".to_string()],
             source: None,
             priority: Some(100),
+            owner_pid: None,
+            owner_pgid: None,
         };
         store.append(&e).unwrap();
         let out = store.search("signin failure", 3).unwrap();
@@ -406,6 +432,8 @@ mod tests {
             tags: vec!["登录".to_string()],
             source: None,
             priority: Some(100),
+            owner_pid: None,
+            owner_pgid: None,
         };
         store.append(&e).unwrap();
         let out = store.search("登陆失败", 3).unwrap();
@@ -683,18 +711,88 @@ impl MemoryStore {
             .get_opt("ai.memory.auto_maintain.probability")
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(0.05);
+        let max_entries = cfg
+            .get_opt("ai.memory.quota.max_entries")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10000);
         let rotated = self.rotate_if_exceeds(max_bytes).unwrap_or(false);
         let _ = if rotated {
             self.cleanup_archives_auto()
         } else {
             Ok(())
         };
+        let _ = self.enforce_max_entries(max_entries, min_keep);
         let roll = rand::random::<f64>();
         if roll < prob {
             let _ = execute_memory_dedup(&json!({}));
             let _ = execute_memory_gc(&json!({ "max_days": gc_days, "min_keep": min_keep }));
             let _ = self.cleanup_archives_auto();
         }
+    }
+
+    fn enforce_max_entries(&self, max_entries: usize, min_keep: usize) -> Result<(), String> {
+        super::with_memory_file_lock(&self.path, || {
+            let content = std::fs::read_to_string(&self.path)
+                .map_err(|e| format!("Failed to read memory file: {}", e))?;
+
+            let mut entries: Vec<AgentMemoryEntry> = content
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        return None;
+                    }
+                    serde_json::from_str::<AgentMemoryEntry>(line).ok()
+                })
+                .collect();
+
+            if entries.len() <= max_entries {
+                return Ok(());
+            }
+
+            entries.sort_by(|a, b| {
+                let pa = a.priority.unwrap_or(100);
+                let pb = b.priority.unwrap_or(100);
+                if pa == 255 && pb != 255 {
+                    return std::cmp::Ordering::Greater;
+                }
+                if pb == 255 && pa != 255 {
+                    return std::cmp::Ordering::Less;
+                }
+                pa.cmp(&pb).then_with(|| a.timestamp.cmp(&b.timestamp))
+            });
+
+            let target = max_entries.saturating_sub(min_keep);
+            if target == 0 {
+                entries.truncate(min_keep);
+            } else {
+                let mut removed = 0;
+                let mut i = 0;
+                while i < entries.len() && entries.len() > max_entries {
+                    if entries[i].priority.unwrap_or(100) == 255 {
+                        i += 1;
+                        continue;
+                    }
+                    entries.remove(i);
+                    removed += 1;
+                    if removed >= target && entries.len() > max_entries {
+                        entries.remove(i);
+                        removed += 1;
+                    }
+                }
+            }
+
+            let mut output = String::new();
+            for entry in &entries {
+                if let Ok(s) = serde_json::to_string(entry) {
+                    output.push_str(&s);
+                    output.push('\n');
+                }
+            }
+
+            std::fs::write(&self.path, output)
+                .map_err(|e| format!("Failed to write memory file after quota enforcement: {}", e))
+        })
     }
 
     /// 根据 id 删除条目（返回被删除的条目）

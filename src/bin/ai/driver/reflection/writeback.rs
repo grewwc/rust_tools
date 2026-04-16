@@ -162,6 +162,8 @@ pub(super) fn upsert_project_writeback_entry(
         tags,
         source: Some(source.to_string()),
         priority: Some(priority),
+        owner_pid: None,
+        owner_pgid: None,
     };
     store.append(&entry)?;
     Ok(ProjectWritebackUpsert::Saved)

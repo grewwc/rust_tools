@@ -34,6 +34,34 @@ pub(super) struct AppConfig {
 
 /// Main application state holding CLI arguments, configuration,
 /// HTTP client, session data, and streaming control flags.
+impl Clone for App {
+    fn clone(&self) -> Self {
+        Self {
+            cli: self.cli.clone(),
+            config: self.config.clone(),
+            session_id: self.session_id.clone(),
+            session_history_file: self.session_history_file.clone(),
+            client: self.client.clone(),
+            current_model: self.current_model.clone(),
+            current_agent: self.current_agent.clone(),
+            current_agent_manifest: self.current_agent_manifest.clone(),
+            pending_files: self.pending_files.clone(),
+            pending_short_output: self.pending_short_output,
+            attached_image_files: self.attached_image_files.clone(),
+            shutdown: self.shutdown.clone(),
+            streaming: self.streaming.clone(),
+            cancel_stream: self.cancel_stream.clone(),
+            ignore_next_prompt_interrupt: self.ignore_next_prompt_interrupt,
+            writer: self.writer.clone(),
+            prompt_editor: None,
+            agent_context: self.agent_context.clone(),
+            last_skill_bias: self.last_skill_bias.clone(),
+            os: self.os.clone(),
+            agent_reload_counter: self.agent_reload_counter,
+        }
+    }
+}
+
 pub(super) struct App {
     pub(super) cli: ParsedCli,
     pub(super) config: AppConfig,
@@ -50,11 +78,11 @@ pub(super) struct App {
     pub(super) streaming: Arc<AtomicBool>,
     pub(super) cancel_stream: Arc<AtomicBool>,
     pub(super) ignore_next_prompt_interrupt: bool,
-    pub(super) writer: Option<File>,
+    pub(super) writer: Option<Arc<std::sync::Mutex<File>>>,
     pub(super) prompt_editor: Option<PromptEditor>,
     pub(super) agent_context: Option<AgentContext>,
     pub(super) last_skill_bias: Option<SkillBiasMemory>,
-    /// Turn counter for periodic agent manifest hot-reload.
+    pub(super) os: crate::ai::kernel::SharedKernel,
     pub(super) agent_reload_counter: Option<usize>,
 }
 

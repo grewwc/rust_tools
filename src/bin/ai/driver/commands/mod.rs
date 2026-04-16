@@ -7,7 +7,7 @@ pub mod share;
 
 use crate::ai::{
     agents::AgentManifest,
-    mcp::McpClient,
+    mcp::SharedMcpClient,
     types::App,
 };
 
@@ -20,7 +20,7 @@ pub use share::try_handle_share_command;
 
 pub fn try_handle_interactive_command(
     app: &mut App,
-    mcp_client: &mut McpClient,
+    mcp_client: &SharedMcpClient,
     input: &str,
     agent_manifests: &mut Vec<AgentManifest>,
 ) -> Result<bool, Box<dyn std::error::Error>> {

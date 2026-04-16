@@ -84,6 +84,8 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
         tags,
         source,
         priority: Some(priority),
+        owner_pid: None,
+        owner_pgid: None,
     };
 
     let store = MemoryStore::from_env_or_config();

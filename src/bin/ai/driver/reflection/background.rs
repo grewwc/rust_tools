@@ -263,7 +263,7 @@ pub(crate) async fn run_self_reflection_background(
     } else if reflection_filtered_bg(q, a, had_tool) {
         return;
     }
-    let system = "You are an introspective meta-optimizer for a coding assistant. Produce a brief self note to improve future turns.\nRules:\n- Output 2-6 compact bullets grouped under 'Do:' and 'Avoid:' tuned to the given Q&A.\n- Focus on planning, tool usage, argument hygiene, and verification habits.\n- No apologies, no explanations, no markdown code fences.\n- Keep under 800 chars.";
+    let system = "You are an introspective meta-optimizer and OS-level evolutionary engine for a coding assistant. Produce a brief self note and evolutionary policy to improve future runs.\nRules:\n- Output 2-6 compact bullets grouped under 'Do:' and 'Avoid:' tuned to the given Q&A.\n- Focus on planning, tool usage, goal decomposition, and verification habits.\n- Frame the learnings as 'System Evolution Policies' that will persist in memory and guide future agent processes.\n- No apologies, no explanations, no markdown code fences.\n- Keep under 800 chars.";
     let user_payload = format!("question:\n{}\n\nanswer:\n{}", q, a);
     let messages = vec![
         json!({"role":"system","content":system}),
@@ -305,6 +305,8 @@ pub(crate) async fn run_self_reflection_background(
         tags: vec!["agent".to_string(), "policy".to_string()],
         source: Some(format!("session:{}", session_id)),
         priority: Some(255),
+        owner_pid: None,
+        owner_pgid: None,
     };
     let store = MemoryStore::from_env_or_config();
     let _ = store.append(&entry);

@@ -4,9 +4,10 @@ use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use serde_json::{Value, json};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::thread;
-use rust_tools::commonw::FastMap;
 use std::sync::{LazyLock, Mutex};
+use std::thread;
+use crate::ai::tools::os_tools::GLOBAL_OS;
+use rust_tools::commonw::FastMap;
 
 use crate::ai::{
     mcp::McpClient,
@@ -427,6 +428,32 @@ fn run_one(
         return (prepared.route, result);
     }
 
+    if let Ok(guard) = GLOBAL_OS.lock() {
+        if let Some(os_arc) = guard.as_ref() {
+            if let Ok(os) = os_arc.lock() {
+                if let Some(current_pid) = os.current_process_id() {
+                    if let Some(proc) = os.get_process(current_pid) {
+                        if !proc.allowed_tools.is_empty() && !proc.allowed_tools.contains(&tool_call.function.name) {
+                            let content = format!("Error: tool '{}' is not in the allowed whitelist for this process.", tool_call.function.name);
+                            return (
+                                prepared.route,
+                                RunOneResult {
+                                    tool_result: ToolResult {
+                                        tool_call_id: tool_call.id.clone(),
+                                        content,
+                                    },
+                                    ok: false,
+                                    executed: false,
+                                    cached: false,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(tool_result) = load_cached_tool_result(session_id, tool_call, &prepared.args) {
         return (
             prepared.route,
@@ -440,6 +467,16 @@ fn run_one(
     }
 
     println!("\n[Running] {}", tool_call.function.name.cyan());
+
+    if let Ok(guard) = GLOBAL_OS.lock() {
+        if let Some(os_arc) = guard.as_ref() {
+            if let Ok(mut os) = os_arc.lock() {
+                if let Some(pid) = os.current_process_id() {
+                    os.increment_tool_calls_used_for(pid);
+                }
+            }
+        }
+    }
 
     if let Some(observer) = observer.as_deref_mut() {
         observer.on_tool_started(tool_call);
@@ -642,6 +679,8 @@ fn store_tool_cache_result(session_id: &str, tool_call: &ToolCall, args: &Value,
         tags: vec![tool_call.function.name.clone(), cache_key],
         source: Some(format!("session:{session_id}")),
         priority: Some(80),
+        owner_pid: None,
+        owner_pgid: None,
     };
     let store = MemoryStore::from_env_or_config();
     let _ = store.append(&entry);
@@ -715,6 +754,8 @@ mod tests {
             tags: Vec::new(),
             source: None,
             priority: Some(80),
+            owner_pid: None,
+            owner_pgid: None,
         };
         let stale = AgentMemoryEntry {
             timestamp: (Utc::now() - Duration::minutes(TOOL_CACHE_TTL_MINUTES + 1)).to_rfc3339(),

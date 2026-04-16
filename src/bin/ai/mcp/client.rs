@@ -2,6 +2,7 @@ use std::{
     io::BufReader,
     process::{Command, Stdio},
     sync::{
+        Arc,
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
@@ -75,6 +76,8 @@ use super::{
     connection::McpServerConnection,
     jsonrpc::{JsonRpcRequest, JsonRpcResponse},
 };
+
+pub(in crate::ai) type SharedMcpClient = Arc<std::sync::Mutex<McpClient>>;
 
 type ServerId = String;
 

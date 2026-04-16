@@ -60,6 +60,8 @@ pub(super) fn record_hidden_self_note(app: &App, turn_messages: &mut Vec<Message
         tags: vec!["agent".to_string(), "policy".to_string()],
         source: Some(format!("session:{}", app.session_id)),
         priority: Some(255),
+        owner_pid: None,
+        owner_pgid: None,
     };
     let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
     let _ = store.append(&entry);
@@ -206,6 +208,8 @@ pub(super) fn record_persistent_code_discoveries(
             ],
             source: Some(session_source.clone()),
             priority: Some(priority_for_confidence(discovery.confidence)),
+            owner_pid: None,
+            owner_pgid: None,
         };
         let _ = store.append(&entry);
     }
