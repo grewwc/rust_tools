@@ -332,23 +332,37 @@ fn extra_build_inputs(repo_root: &Path) -> Vec<PathBuf> {
 
 fn extract_lib_roots_from_bin(content: &str) -> Vec<String> {
     let mut out = SkipSet::new(16);
-    for (prefix, slice) in [
-        ("rust_tools::", content),
-        ("use rust_tools::", content),
-        ("use crate::", content),
+    for prefix in [
+        "rust_tools::",
+        "use rust_tools::",
+        "use crate::",
     ] {
         let mut start = 0usize;
-        while let Some(idx) = slice[start..].find(prefix) {
-            let idx = start + idx + prefix.len();
-            let rest = &slice[idx..];
-            let seg = rest
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect::<String>();
-            if !seg.is_empty() {
-                out.insert(seg);
+        while let Some(idx) = content[start..].find(prefix) {
+            let offset = start + idx + prefix.len();
+            let rest = &content[offset..];
+            
+            // Extract until the next semicolon to bound the search
+            let end_stmt = rest.find(';').unwrap_or(rest.len());
+            let stmt = &rest[..end_stmt];
+            
+            // Extract all alphanumeric segments within the statement
+            let mut word = String::new();
+            for c in stmt.chars() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    word.push(c);
+                } else {
+                    if !word.is_empty() {
+                        out.insert(word.clone());
+                        word.clear();
+                    }
+                }
             }
-            start = idx;
+            if !word.is_empty() {
+                out.insert(word);
+            }
+            
+            start = offset + end_stmt;
         }
     }
     out.to_vec()
