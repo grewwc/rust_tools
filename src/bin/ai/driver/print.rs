@@ -131,13 +131,34 @@ pub(in crate::ai) fn sanitize_for_terminal(text: &str) -> String {
                     i += 1;
                 }
             } else {
+                // Unknown ESC sequence. Preserve the old behavior of dropping the following
+                // payload as well, but do it in char units instead of raw bytes so we never
+                // slice inside a UTF-8 code point.
                 i += 1;
-                if i < bytes.len() {
+                while i < bytes.len() && !text.is_char_boundary(i) {
                     i += 1;
+                }
+                if i < bytes.len() {
+                    if let Some(ch) = text[i..].chars().next() {
+                        i += ch.len_utf8();
+                    } else {
+                        break;
+                    }
                 }
             }
             continue;
         }
+
+        // `i` is a byte index. In rare cases (e.g. binary blobs containing ESC + UTF8 leading
+        // bytes), previous byte-based skipping can leave `i` in the middle of a UTF8 sequence.
+        // Never slice `text[i..]` unless `i` is a valid char boundary.
+        while i < bytes.len() && !text.is_char_boundary(i) {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+
         let Some(ch) = text[i..].chars().next() else {
             break;
         };
@@ -405,6 +426,13 @@ mod tests {
         let input = "正常文本 hello world 123";
         let sanitized = sanitize_for_terminal(input);
         assert_eq!(sanitized, input);
+    }
+
+    #[test]
+    fn sanitize_does_not_panic_when_esc_is_followed_by_utf8_bytes() {
+        let input = "prefix\x1b中文 suffix";
+        let sanitized = sanitize_for_terminal(input);
+        assert_eq!(sanitized, "prefix文 suffix");
     }
 
     #[test]

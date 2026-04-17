@@ -625,7 +625,7 @@ fn live_preview_cursor_rows(line: &str) -> usize {
     if width == 0 {
         1
     } else {
-        1 + (width / cols)
+        1 + ((width - 1) / cols)
     }
 }
 
@@ -963,17 +963,29 @@ mod tests {
     fn live_preview_cursor_rows_counts_exact_width_cjk_boundary() {
         let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "20") };
-        assert_eq!(live_preview_cursor_rows("你好你好你好你好你好"), 2);
+        assert_eq!(live_preview_cursor_rows("你好你好你好你好你好"), 1);
     }
 
     #[test]
-    fn exact_width_cjk_preview_updates_renderer_height_to_two_rows() {
+    fn exact_width_cjk_preview_updates_renderer_height_to_one_row() {
         let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "20") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         renderer.write_chunk_for_test("你好你好你好你好你好", true).unwrap();
 
-        assert_eq!(renderer.line_preview_height(), 2);
+        assert_eq!(renderer.line_preview_height(), 1);
+    }
+
+    #[test]
+    fn exact_width_cjk_rewrite_moves_up_one_row() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "20") };
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        renderer.set_line_preview_height(1);
+
+        let out = renderer.consume_line("你好你好你好你好你好", true);
+        assert!(out.contains("\x1b[1A\r\x1b[0J"), "{out:?}");
+        assert!(!out.contains("\x1b[2A\r\x1b[0J"), "{out:?}");
     }
 
     #[test]
