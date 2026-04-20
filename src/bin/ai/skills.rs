@@ -1,3 +1,23 @@
+// =============================================================================
+// AIOS Skills - Agent Capabilities System
+// =============================================================================
+// Skills are the equivalent of commands in a CLI - they provide capabilities
+// that AI agents can invoke to perform specific tasks.
+// 
+// Similar to agents:
+//   - Loaded from .skill files (with YAML front-matter)
+//   - Have name, description, prompt, system_prompt
+//   - Support tools, tool_groups, mcp_servers
+// 
+// Key differences from agents:
+//   - Skills are invoked via tool calls, not conversation
+//   - Lower priority in skill matching wins ties
+//   - Don't have model/temperature (use agent's settings)
+//   - No routing tags or disabled/hidden flags
+// 
+// Skill files are searched in same directories as agents.
+// =============================================================================
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

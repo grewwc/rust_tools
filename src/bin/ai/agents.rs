@@ -1,3 +1,26 @@
+// =============================================================================
+// AIOS Agents - Agent Definitions and Loading
+// =============================================================================
+// Agents are LLM-powered assistants with specific personalities and capabilities.
+// 
+// Agent files (.agent) contain YAML front-matter and a prompt body:
+//   - name: Agent identifier
+//   - description: For agent routing selection
+//   - mode: primary, subagent, or all
+//   - model: Override default model
+//   - temperature: Override default temperature
+//   - tools/tool_groups/mcp_servers: Available tools
+//   - routing_tags: For ML-based routing
+//   - model_tier: light/standard/heavy preference
+// 
+// Builtin agents:
+//   - build: Default code-writing agent
+//   - executor: Background task execution
+//   - plan: Multi-step planning
+//   - explore: Codebase exploration
+//   - prompt-skill: Skill creation
+// =============================================================================
+
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

@@ -1,3 +1,30 @@
+// =============================================================================
+// AIOS LocalOS - Local Process OS Implementation
+// =============================================================================
+// This module implements the Kernel trait for a single-machine process OS.
+// 
+// Key features:
+//   - Process table: HashMap of all processes (pid -> Process)
+//   - Ready queue: FIFO/priority queue of ready processes
+//   - Wait queue: HashMap of blocked processes waiting on each pid
+//   - Tick counter: Scheduler time for sleeping processes
+//   - Shared memory: Key-value store with ownership
+//   - Process groups: Signal broadcasting
+// 
+// Scheduling:
+//   - pop_ready(): Get highest-priority ready process
+//   - advance_tick(): Increment tick, wake sleeping processes
+//   - Sleeping processes wake when tick >= their until_tick
+// 
+// Process state transitions:
+//   - spawn() -> ready queue (Ready)
+//   - wait_on(pid) -> wait queue (Waiting)
+//   - terminate() -> waiters become Ready
+//   - sleep_current(N) -> sleeping until tick+N
+//   - receive SIGSTOP -> Stopped
+//   - receive SIGCONT -> Ready
+// =============================================================================
+
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use rust_tools::commonw::{FastMap, FastSet};

@@ -1,3 +1,25 @@
+// =============================================================================
+// AIOS Turn Runtime - Core Execution Engine
+// =============================================================================
+// This module handles the core execution loop where the LLM repeatedly calls tools.
+// 
+// The turn execution follows this flow:
+//   1. Prepare: Build messages, select skills, initial request
+//   2. Iterate: LLM generates response with potential tool calls
+//   3. Execute: Run each tool call and collect results
+//   4. Finalize: Build final response and persist history
+// 
+// Submodules:
+//   - prepare: Prepare turn (build messages, select skills)
+//   - iteration: Execute one LLM turn (call LLM, execute tools)
+//   - orchestrator: run_turn() - main turn coordination
+//   - tool_result: Handle tool execution results
+//   - finalize: Build final response, persist history
+//   - types: Outcome types (TurnOutcome, etc)
+//   - debug: Hang/debug reporting
+//   - persistence: SQLite history management
+// =============================================================================
+
 mod debug;
 mod finalize;
 mod iteration;

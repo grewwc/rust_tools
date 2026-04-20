@@ -1,3 +1,18 @@
+// =============================================================================
+// Turn Orchestrator - Main Turn Execution Coordinator
+// =============================================================================
+// This module contains run_turn(), the main entry point for executing a single turn.
+// 
+// Flow:
+//   1. prepare_turn(): Build initial messages
+//   2. Loop (max_iterations):
+//        - Call LLM with current messages
+//        - Execute any tool calls
+//        - Handle results and add back to messages
+//   3. finalize_turn(): Build final response
+//   4. Return TurnOutcome (Quit, Success, or Error)
+// =============================================================================
+
 use crate::ai::{mcp::SharedMcpClient, types::App};
 
 use super::{
