@@ -1215,11 +1215,84 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
         }
     }
 
+    fn content_is_effectively_empty(content: &Value) -> bool {
+        match content {
+            Value::Null => true,
+            Value::String(s) => s.trim().is_empty(),
+            Value::Array(items) => items.is_empty(),
+            Value::Object(map) => map.is_empty(),
+            Value::Bool(_) | Value::Number(_) => false,
+        }
+    }
+
+    fn sanitize_tool_message_sequence(messages: Vec<Message>) -> Vec<Message> {
+        let mut out = Vec::with_capacity(messages.len());
+        let mut idx = 0usize;
+
+        while idx < messages.len() {
+            let message = &messages[idx];
+            if message.role == "tool" {
+                idx += 1;
+                continue;
+            }
+
+            let Some(tool_calls) = message.tool_calls.as_ref().filter(|calls| !calls.is_empty()) else {
+                out.push(message.clone());
+                idx += 1;
+                continue;
+            };
+
+            let expected_ids = tool_calls
+                .iter()
+                .map(|tool_call| tool_call.id.as_str())
+                .collect::<Vec<_>>();
+            let mut matched_ids = Vec::new();
+            let mut matched_tool_messages = Vec::new();
+            let mut scan = idx + 1;
+
+            while scan < messages.len() && messages[scan].role == "tool" {
+                let tool_message = &messages[scan];
+                if let Some(tool_call_id) = tool_message.tool_call_id.as_deref()
+                    && expected_ids.iter().any(|expected| *expected == tool_call_id)
+                    && !matched_ids.iter().any(|seen| seen == tool_call_id)
+                {
+                    matched_ids.push(tool_call_id.to_string());
+                    matched_tool_messages.push(tool_message.clone());
+                }
+                scan += 1;
+            }
+
+            if matched_ids.is_empty() {
+                let mut assistant_only = message.clone();
+                assistant_only.tool_calls = None;
+                if !content_is_effectively_empty(&assistant_only.content) {
+                    out.push(assistant_only);
+                }
+                idx = scan.max(idx + 1);
+                continue;
+            }
+
+            let mut assistant_with_matched_calls = message.clone();
+            assistant_with_matched_calls.tool_calls = Some(
+                tool_calls
+                    .iter()
+                    .filter(|tool_call| matched_ids.iter().any(|id| id == &tool_call.id))
+                    .cloned()
+                    .collect(),
+            );
+            out.push(assistant_with_matched_calls);
+            out.extend(matched_tool_messages);
+            idx = scan;
+        }
+
+        out
+    }
+
     let first_system_idx = messages
         .iter()
         .position(|m| m.role == ROLE_SYSTEM || is_internal_note_role(&m.role));
     let Some(first_system_idx) = first_system_idx else {
-        return messages.to_vec();
+        return sanitize_tool_message_sequence(messages.to_vec());
     };
 
     let mut merged_notes: Vec<(usize, InternalNoteKind, String)> = Vec::new();
@@ -1272,7 +1345,7 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
         }
         out.push(message.clone());
     }
-    out
+    sanitize_tool_message_sequence(out)
 }
 
 pub(super) fn build_content(
@@ -1680,6 +1753,109 @@ mod tests {
         let self_note = text.find("## Self Notes").unwrap();
         assert!(wm < summary);
         assert!(summary < self_note);
+    }
+
+    #[test]
+    fn normalize_messages_drops_orphan_tool_results_and_strips_broken_tool_calls() {
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: Value::String("base system".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String("question".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                tool_calls: Some(vec![crate::ai::types::ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: crate::ai::types::FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String("later answer".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Value::String("stale tool output".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+            },
+        ];
+
+        let normalized = normalize_messages_for_request(&messages);
+
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0].role, "system");
+        assert_eq!(normalized[1].role, "user");
+        assert_eq!(normalized[2].role, "assistant");
+        assert_eq!(normalized[2].content.as_str(), Some("later answer"));
+        assert!(normalized.iter().all(|message| message.role != "tool"));
+    }
+
+    #[test]
+    fn normalize_messages_keeps_contiguous_tool_call_blocks() {
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: Value::String("base system".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String("question".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                tool_calls: Some(vec![crate::ai::types::ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: crate::ai::types::FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: "{}".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Value::String("fresh tool output".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+            },
+        ];
+
+        let normalized = normalize_messages_for_request(&messages);
+
+        assert_eq!(normalized.len(), 4);
+        assert_eq!(normalized[2].role, "assistant");
+        assert_eq!(
+            normalized[2]
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.len()),
+            Some(1)
+        );
+        assert_eq!(normalized[3].role, "tool");
+        assert_eq!(normalized[3].tool_call_id.as_deref(), Some("call_1"));
     }
 
 
