@@ -44,6 +44,7 @@ pub(super) fn extract_chunk_events_with_tools(
 
     if delta.content.is_empty() && !delta.reasoning_content.is_empty() {
         let (cleaned, tool_calls) = splitter::extract_internal_tool_calls(&delta.reasoning_content);
+        let cleaned = normalize_stream_text(cleaned);
         if cleaned.is_empty() && tool_calls.is_empty() {
             return (Vec::new(), Vec::new());
         }
@@ -71,9 +72,10 @@ pub(super) fn extract_chunk_events_with_tools(
         events.push(StreamTextEvent::CloseThinking);
     }
     if !delta.content.is_empty() {
+        let content = normalize_stream_text(delta.content.clone());
         push_text_with_hidden_meta(
             &mut events,
-            delta.content.clone(),
+            content,
             false,
             hidden_begin,
             hidden_end,
@@ -290,6 +292,64 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn extract_normalizes_carriage_returns_before_emitting_events() {
+        let reasoning_chunk = StreamChunk {
+            choices: vec![StreamChoice {
+                delta: StreamDelta {
+                    content: String::new(),
+                    reasoning_content: "step 1\rstep 2\r\nstep 3".to_string(),
+                    reasoning_details: String::new(),
+                    tool_calls: Vec::new(),
+                },
+                finish_reason: None,
+            }],
+        };
+        let content_chunk = StreamChunk {
+            choices: vec![StreamChoice {
+                delta: StreamDelta {
+                    content: "line 1\rline 2\r\nline 3".to_string(),
+                    reasoning_content: String::new(),
+                    reasoning_details: String::new(),
+                    tool_calls: Vec::new(),
+                },
+                finish_reason: None,
+            }],
+        };
+
+        let mut thinking_open = false;
+        let mut hidden_meta_parse = HiddenMetaParseState::default();
+        let (reasoning_events, _) = extract_chunk_events_with_tools(
+            &reasoning_chunk,
+            "<meta:self_note>",
+            "</meta:self_note>",
+            &mut thinking_open,
+            &mut hidden_meta_parse,
+        );
+        let (content_events, _) = extract_chunk_events_with_tools(
+            &content_chunk,
+            "<meta:self_note>",
+            "</meta:self_note>",
+            &mut thinking_open,
+            &mut hidden_meta_parse,
+        );
+
+        assert_eq!(
+            reasoning_events,
+            vec![
+                StreamTextEvent::OpenThinking,
+                StreamTextEvent::AppendThinking("step 1\nstep 2\nstep 3".to_string()),
+            ]
+        );
+        assert_eq!(
+            content_events,
+            vec![
+                StreamTextEvent::CloseThinking,
+                StreamTextEvent::AppendContent("line 1\nline 2\nline 3".to_string()),
+            ]
+        );
+    }
 }
 
 fn push_text_with_hidden_meta(
@@ -369,6 +429,10 @@ fn push_text_with_hidden_meta(
 
     flush_visible(events, &mut visible, is_thinking);
     flush_hidden(events, &mut hidden);
+}
+
+fn normalize_stream_text(text: String) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 pub(super) fn strip_ansi_codes(s: &str) -> String {
