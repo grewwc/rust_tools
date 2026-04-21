@@ -35,6 +35,7 @@ pub struct ThinkingOrchestrator {
     pub current_tree_node_id: Option<crate::ai::driver::thinking::engine::ThoughtNodeId>,
     pub poisoned: bool,
     pub pending_suggested_tool_calls: Vec<crate::ai::driver::observer::SuggestedToolCall>,
+    pub protocol_injected: bool,
 }
 
 impl ThinkingOrchestrator {
@@ -52,6 +53,7 @@ impl ThinkingOrchestrator {
             current_tree_node_id: None,
             poisoned: false,
             pending_suggested_tool_calls: Vec::new(),
+            protocol_injected: false,
         }
     }
 
@@ -228,30 +230,22 @@ impl ThinkingOrchestrator {
         }
     }
 
-    fn build_system_prompt_injection(&self) -> Option<String> {
+    fn build_system_prompt_injection(&mut self) -> Option<String> {
         let mut parts = Vec::new();
 
-        // Always advertise the meta-tag protocol. This is how the LLM
-        // explicitly opts into structured thinking modes when *it* judges
-        // the situation warrants them — we do not guess on its behalf.
-        parts.push(
-            "[Thinking Protocol]\n\
-             You may opt into structured thinking modes by emitting one of these tags in your \
-             reply (they will be parsed back in the next turn, NOT shown to the user):\n\
-             - <meta:begin_tree_of_thoughts>ROOT_QUESTION</meta:begin_tree_of_thoughts> — \
-             enter tree-of-thoughts exploration when you face multiple plausible approaches.\n\
-             - <meta:begin_verification>HYPOTHESIS</meta:begin_verification> — \
-             enter scientific-method verification loop when you have a concrete hypothesis \
-             that can be falsified by executing a test.\n\
-             - <meta:begin_goal>LONG_HORIZON_GOAL</meta:begin_goal> — \
-             enter goal-directed decomposition when the task requires multi-step planning \
-             with dependency tracking.\n\
-             - <meta:reset_thinking/> — clear all thinking state when the conversation topic \
-             has shifted and previous reasoning no longer applies.\n\
-             - <meta:self_note>Do: ...</meta:self_note> / <meta:self_note>Avoid: ...</meta:self_note> — \
-             record an actionable policy you want generalized across future tasks.\n\
-             Do NOT emit tags unless the situation truly calls for them.".to_string()
-        );
+        // Advertise the meta-tag protocol only once per conversation.
+        // After the first injection, the LLM already knows the protocol.
+        if !self.protocol_injected {
+            self.protocol_injected = true;
+            parts.push(
+                "[Thinking Protocol] Emit tags in your reply (hidden from user): \
+                 <meta:begin_tree_of_thoughts>Q</meta:begin_tree_of_thoughts> \
+                 | <meta:begin_verification>H</meta:begin_verification> \
+                 | <meta:begin_goal>G</meta:begin_goal> \
+                 | <meta:reset_thinking/> \
+                 | <meta:self_note>Do:/Avoid: ...</meta:self_note>.".to_string()
+            );
+        }
 
         if self.active_modes.contains(&ThinkingMode::TreeOfThoughts) {
             if let Some(ref tree) = self.thought_tree {
@@ -325,20 +319,38 @@ pub struct ThinkingOutcome {
     pub goal_status: Option<String>,
 }
 
-fn extract_self_note_from_text(text: &str) -> Option<String> {
-    let start = text.find("<meta:self_note>")?;
-    let end = text.find("</meta:self_note>")?;
-    if end <= start {
-        return None;
+fn extract_all_self_notes_from_text(text: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    let open = "<meta:self_note>";
+    let close = "</meta:self_note>";
+    let mut search_from = 0;
+    while let Some(start) = text[search_from..].find(open) {
+        let abs_start = search_from + start;
+        let content_start = abs_start + open.len();
+        if let Some(end) = text[content_start..].find(close) {
+            let content = text[content_start..content_start + end].trim();
+            if !content.is_empty() {
+                notes.push(content.to_string());
+            }
+            search_from = content_start + end + close.len();
+        } else {
+            break;
+        }
     }
-    Some(text[start + "<meta:self_note>".len()..end].trim().to_string())
+    notes
 }
 
 fn extract_tag(text: &str, tag: &str) -> Option<String> {
-    let open = format!("<{}>", tag);
+    // Supports attributes: <meta:begin_verification priority="high">content</meta:begin_verification>
+    // We search for the open tag prefix, then find the first '>' after it,
+    // then find the matching close tag.
+    let open_prefix = format!("<{}", tag);
     let close = format!("</{}>", tag);
-    let start = text.find(&open)?;
-    let content_start = start + open.len();
+    let start = text.find(&open_prefix)?;
+    let after_prefix = start + open_prefix.len();
+    // Find the closing '>' of the open tag (skipping attributes)
+    let tag_end = text[after_prefix..].find('>')?;
+    let content_start = after_prefix + tag_end + 1;
     let end = text[content_start..].find(&close)?;
     let content = &text[content_start..content_start + end];
     let trimmed = content.trim();
@@ -350,18 +362,24 @@ fn extract_tag(text: &str, tag: &str) -> Option<String> {
 }
 
 impl TurnObserver for ThinkingOrchestrator {
-    fn on_prepare(&mut self, ctx: &PrepareContext) -> Vec<(String, String)> {
-        // Parse explicit meta-tags in the question. This is NOT semantic
-        // guessing — it's literal tag extraction, similar to how we already
-        // parse <meta:self_note>. The LLM is the intelligent party; it is
-        // responsible for emitting these tags (typically as part of its
-        // previous-turn answer, carried back here via conversation history).
-        self.apply_meta_tags(&ctx.question);
+    fn on_tool_result(&mut self, ctx: &ToolResultContext) {
+        self.process_tool_result(&ctx.tool_name, &ctx.result_content, ctx.success);
+    }
 
-        // Whatever thinking state currently exists is activated.
-        // No keyword-based relevance heuristics — state lifetime is controlled
-        // explicitly by the LLM (via <meta:reset_thinking/>) or implicitly by
-        // on_conversation_end.
+    fn on_prepare(&mut self, ctx: &PrepareContext) -> Vec<(String, String)> {
+        // Backward-compat shim: delegate to the canonical rich implementation
+        // and flatten the result.
+        let rich = self.on_prepare_rich(ctx);
+        rich.sections
+            .into_iter()
+            .map(|(_kind, label, content)| (label, content))
+            .collect()
+    }
+
+    fn on_prepare_rich(&mut self, ctx: &PrepareContext) -> crate::ai::driver::observer::PrepareOutput {
+        use crate::ai::driver::observer::{PrepareOutput, SectionKind};
+
+        // Activate existing state (creation happens in on_finalize via meta-tags).
         if self.thought_tree.is_some() {
             self.active_modes.insert(ThinkingMode::TreeOfThoughts);
         }
@@ -373,15 +391,16 @@ impl TurnObserver for ThinkingOrchestrator {
         }
 
         let decision = self.analyze_question(&ctx.question);
-        let mut sections = Vec::new();
-        if let Some(injection) = &decision.inject_into_system_prompt {
-            sections.push(("Behavior".to_string(), injection.clone()));
+        let mut sections: Vec<(SectionKind, String, String)> = Vec::new();
+        if let Some(injection) = decision.inject_into_system_prompt {
+            sections.push((SectionKind::Behavior, "Behavior".to_string(), injection));
         }
         if decision.active_modes.contains(&ThinkingMode::TreeOfThoughts) {
             if let Some(ref tree) = self.thought_tree {
                 if let Some(current) = tree.ucb_select(1.414) {
                     self.current_tree_node_id = Some(current);
                     sections.push((
+                        SectionKind::Behavior,
                         "Reasoning Tree".to_string(),
                         tree.generate_thinking_prompt(current),
                     ));
@@ -443,36 +462,19 @@ impl TurnObserver for ThinkingOrchestrator {
                         }
                     );
                 } else if !prompt.is_empty() {
-                    sections.push(("Verification".to_string(), prompt));
+                    sections.push((SectionKind::Behavior, "Verification".to_string(), prompt));
                 }
             }
         }
         if decision.active_modes.contains(&ThinkingMode::GoalDirected) {
             if let Some(goal) = self.goal_manager.active_goal() {
                 sections.push((
+                    SectionKind::Behavior,
                     "Goal Decomposition".to_string(),
                     goal.generate_decomposition_prompt(),
                 ));
             }
         }
-        sections
-    }
-
-    fn on_tool_result(&mut self, ctx: &ToolResultContext) {
-        self.process_tool_result(&ctx.tool_name, &ctx.result_content, ctx.success);
-    }
-
-    fn on_prepare_rich(&mut self, ctx: &PrepareContext) -> crate::ai::driver::observer::PrepareOutput {
-        use crate::ai::driver::observer::{PrepareOutput, SectionKind};
-        let legacy = self.on_prepare(ctx);
-        let sections = legacy
-            .into_iter()
-            .map(|(label, content)| {
-                // Thinking sections are all behavior-directing (telling LLM *how* to reason),
-                // so they all belong to Behavior channel, not Fact channel.
-                (SectionKind::Behavior, label, content)
-            })
-            .collect();
         let suggested_tool_calls = std::mem::take(&mut self.pending_suggested_tool_calls);
         PrepareOutput {
             sections,
@@ -483,7 +485,13 @@ impl TurnObserver for ThinkingOrchestrator {
     fn on_finalize(&mut self, ctx: &FinalizeContext) -> ObserverOutput {
         let mut display_lines = Vec::new();
 
-        if let Some(note) = extract_self_note_from_text(&ctx.final_text) {
+        // Parse meta-tags from the LLM's assistant output (final_text).
+        // This is where <meta:begin_*> / <meta:reset_thinking/> tags live,
+        // because the LLM emits them in its reply, not in the user question.
+        self.apply_meta_tags(&ctx.final_text);
+
+        // Extract ALL self-notes (LLM may emit multiple in one reply).
+        for note in extract_all_self_notes_from_text(&ctx.final_text) {
             self.process_self_note(&note);
         }
 
@@ -527,14 +535,18 @@ impl TurnObserver for ThinkingOrchestrator {
     }
 
     fn on_conversation_end(&mut self) {
-        let _ = self.goal_manager.persist_goals();
-        self.thought_tree = None;
-        self.verification = None;
-        self.active_modes.clear();
-        self.current_tree_node_id = None;
-        self.generalizer = ExperienceGeneralizer::new();
-        self.goal_manager = GoalManager::new()
-            .with_persistence_dir_opt(dirs::home_dir().map(|h| h.join(".config").join("rust_tools").join("thinking_goals")));
+        // Only clear state after successful persist. If persist fails,
+        // keep the current in-memory state so the user doesn't lose goal
+        // progress across conversation boundaries.
+        if self.goal_manager.persist_goals().is_ok() {
+            self.thought_tree = None;
+            self.verification = None;
+            self.active_modes.clear();
+            self.current_tree_node_id = None;
+            self.generalizer = ExperienceGeneralizer::new();
+            self.goal_manager = GoalManager::new()
+                .with_persistence_dir_opt(dirs::home_dir().map(|h| h.join(".config").join("rust_tools").join("thinking_goals")));
+        }
     }
 
     fn name(&self) -> &str {

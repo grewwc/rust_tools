@@ -107,6 +107,16 @@ impl ExperienceGeneralizer {
         if self.experience_buffer.len() < self.min_experiences_for_generalization {
             return None;
         }
+        // Fast path: if no experience carries an explicit structured prefix,
+        // synthesize_principle would return None anyway — skip the grouping work.
+        let has_structured = self.experience_buffer.iter().any(|e| {
+            let lower = e.note.trim_start().to_lowercase();
+            lower.starts_with("do:") || lower.starts_with("avoid:")
+                || lower.starts_with("always") || lower.starts_with("never")
+        });
+        if !has_structured {
+            return None;
+        }
 
         let grouped = self.group_by_semantic_similarity();
         let best_group = grouped
