@@ -595,6 +595,51 @@ fn maybe_write_stream_content(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::{
+        cli::ParsedCli,
+        types::{App, AppConfig},
+    };
+    use std::fs::File;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+
+    fn test_app() -> App {
+        App {
+            cli: ParsedCli::default(),
+            config: AppConfig {
+                api_key: String::new(),
+                history_file: PathBuf::new(),
+                endpoint: String::new(),
+                vl_default_model: String::new(),
+                history_max_chars: 0,
+                history_keep_last: 0,
+                history_summary_max_chars: 0,
+                intent_model: None,
+                intent_model_path: PathBuf::new(),
+                agent_route_model_path: PathBuf::new(),
+                skill_match_model_path: PathBuf::new(),
+            },
+            session_id: String::new(),
+            session_history_file: PathBuf::new(),
+            client: reqwest::Client::builder().build().unwrap(),
+            current_model: String::new(),
+            current_agent: String::new(),
+            current_agent_manifest: None,
+            pending_files: None,
+            pending_short_output: false,
+            attached_image_files: Vec::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            streaming: Arc::new(AtomicBool::new(false)),
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            ignore_next_prompt_interrupt: false,
+            writer: None,
+            prompt_editor: None,
+            agent_context: None,
+            last_skill_bias: None,
+            os: crate::ai::driver::new_local_kernel(),
+            agent_reload_counter: None,
+        }
+    }
 
     #[test]
     fn closing_thinking_marker_starts_on_new_line_when_reasoning_line_is_open() {
@@ -633,6 +678,40 @@ mod tests {
             format_end_thinking_line(&markers, &state.render.markdown),
             format!("\n{}\n", markers.end_thinking_tag)
         );
+    }
+
+    #[test]
+    fn first_reasoning_chunk_keeps_open_marker_and_first_text() {
+        let markers = StreamMarkers::new();
+        let mut state = StreamProcessingState::new();
+        let mut app = test_app();
+        let mut current_history = String::new();
+        let path = std::env::temp_dir().join(format!(
+            "ai-stream-thinking-{}.log",
+            uuid::Uuid::new_v4()
+        ));
+        let file = File::create(&path).unwrap();
+        app.writer = Some(Arc::new(Mutex::new(file)));
+        let payload = r#"{"choices":[{"delta":{"reasoning_content":"我判断这是首段"}}]}"#;
+
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            normalize::StreamProviderAdapterKind::Compatible,
+            None,
+            payload,
+        )
+        .unwrap();
+
+        assert!(state.content.thinking_open);
+        assert!(current_history.is_empty());
+        drop(app.writer.take());
+        let written = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(written.contains(&markers.thinking_tag));
+        assert!(written.contains("我判断这是首段"));
     }
 
 }
@@ -695,9 +774,6 @@ fn process_stream_payload(
                     continue;
                 }
                 commit_visible_content(app, current_history, markers, state, content)?;
-                if state.content.thinking_open {
-                    return Ok(false);
-                }
             }
         }
     }
