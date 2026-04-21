@@ -280,6 +280,10 @@ impl GoalManager {
         self.active_goal_id.as_ref().and_then(|id| self.goals.get(id))
     }
 
+    pub fn deactivate_active_goal(&mut self) {
+        self.active_goal_id = None;
+    }
+
     pub fn active_goal_mut(&mut self) -> Option<&mut Goal> {
         self.active_goal_id.as_ref().and_then(|id| self.goals.get_mut(id))
     }

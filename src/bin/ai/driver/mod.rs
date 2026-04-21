@@ -789,7 +789,16 @@ async fn run_loop(
         app.writer = original_writer;
         if matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Quit)) || should_quit {
             for obs in app.observers.iter_mut() {
-                obs.on_conversation_end();
+                if obs.is_poisoned() {
+                    continue;
+                }
+                let obs_name = obs.name().to_string();
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    obs.on_conversation_end();
+                })).is_err() {
+                    eprintln!("[Warning] observer '{}' panicked in on_conversation_end; disabling.", obs_name);
+                    obs.mark_poisoned();
+                }
             }
             cleanup_one_shot(app);
             return Ok(());

@@ -3,11 +3,11 @@ use std::collections::HashSet;
 use crate::ai::driver::thinking::{
     engine::ThoughtTree,
     generalization::ExperienceGeneralizer,
-    goals::{GoalManager, GoalState},
+    goals::GoalManager,
     verification::{VerificationOutcome, VerificationStep, VerificationWorkflow},
 };
 use crate::ai::driver::observer::{
-    FinalizeContext, MemoryEntry, ObserverOutput, PrepareContext, ToolResultContext, TurnObserver,
+    FinalizeContext, ObserverOutput, PrepareContext, ToolResultContext, TurnObserver,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -32,6 +32,9 @@ pub struct ThinkingOrchestrator {
     pub goal_manager: GoalManager,
     pub active_modes: HashSet<ThinkingMode>,
     pub enabled: bool,
+    pub current_tree_node_id: Option<crate::ai::driver::thinking::engine::ThoughtNodeId>,
+    pub poisoned: bool,
+    pub pending_suggested_tool_calls: Vec<crate::ai::driver::observer::SuggestedToolCall>,
 }
 
 impl ThinkingOrchestrator {
@@ -46,6 +49,9 @@ impl ThinkingOrchestrator {
             goal_manager,
             active_modes: HashSet::new(),
             enabled: true,
+            current_tree_node_id: None,
+            poisoned: false,
+            pending_suggested_tool_calls: Vec::new(),
         }
     }
 
@@ -54,32 +60,20 @@ impl ThinkingOrchestrator {
             return ThinkingDecision::default();
         }
 
-        let needs_tree = self.detect_complex_reasoning(question);
-        let needs_verification = self.detect_verification_need(question);
-        let needs_decomposition = self.detect_goal_decomposition_need(question);
-
-        if needs_tree {
-            if self.thought_tree.is_none() {
-                self.thought_tree = Some(ThoughtTree::new(question, 4, 3));
-            }
-            self.active_modes.insert(ThinkingMode::TreeOfThoughts);
-        }
-
-        if needs_verification {
-            if self.verification.is_none() {
-                self.verification = Some(VerificationWorkflow::new(question.to_string()));
-            }
-            self.active_modes.insert(ThinkingMode::VerificationLoop);
-        }
-
-        if needs_decomposition {
-            if self.goal_manager.active_goal().is_none() {
-                let goal_id = self.goal_manager.create_goal(question.to_string());
-                self.goal_manager.activate_goal(&goal_id);
-            }
-            self.active_modes.insert(ThinkingMode::GoalDirected);
-        }
-
+        // We do NOT try to guess whether the question needs TreeOfThoughts /
+        // Verification / GoalDirected by keyword matching — that is just
+        // substring-based pseudo-understanding. Instead:
+        //
+        //   * If the LLM explicitly requested a mode via a <meta:begin_*>
+        //     self-note in a previous turn, that mode is already established
+        //     and its state (thought_tree / verification / goal_manager) is
+        //     present.
+        //   * on_prepare activates whatever state currently exists; we do not
+        //     destroy or auto-create state here.
+        //
+        // This method now only computes derived artifacts from the current
+        // active_modes, without altering them.
+        let _ = question;
         let inject = self.build_system_prompt_injection();
 
         let next_sub_goal = if self.active_modes.contains(&ThinkingMode::GoalDirected) {
@@ -89,7 +83,7 @@ impl ThinkingOrchestrator {
         };
 
         let verification_step = if self.active_modes.contains(&ThinkingMode::VerificationLoop) {
-            self.verification.as_ref().map(|v| v.current_step.clone())
+            self.verification.as_ref().map(|v| v.current_step)
         } else {
             None
         };
@@ -105,7 +99,7 @@ impl ThinkingOrchestrator {
     pub fn process_tool_result(&mut self, tool_name: &str, result: &str, success: bool) {
         if self.active_modes.contains(&ThinkingMode::TreeOfThoughts) {
             if let Some(ref mut tree) = self.thought_tree {
-                if let Some(current) = tree.ucb_select(1.414) {
+                if let Some(current) = self.current_tree_node_id {
                     let score = if success { 0.7 } else { 0.2 };
                     tree.score_node(current, score);
                     tree.record_outcome(
@@ -113,6 +107,7 @@ impl ThinkingOrchestrator {
                         result.chars().take(200).collect(),
                         vec![tool_name.to_string()],
                     );
+                    self.current_tree_node_id = None;
                 }
             }
         }
@@ -135,12 +130,13 @@ impl ThinkingOrchestrator {
         }
 
         if !success {
+            let safe_snippet: String = result.chars().take(200).collect();
             self.generalizer.ingest_experience(
                 "failure",
                 &format!(
                     "Avoid: {} led to failure - {}",
                     tool_name,
-                    &result[..result.len().min(200)]
+                    safe_snippet
                 ),
                 &[tool_name.to_string()],
                 None,
@@ -149,11 +145,13 @@ impl ThinkingOrchestrator {
     }
 
     pub fn process_self_note(&mut self, note: &str) {
-        let is_do = note.to_lowercase().contains("do:");
-        let is_avoid = note.to_lowercase().contains("avoid:");
-        let category = if is_do {
+        // Explicit structured prefix — not substring guessing. The LLM is
+        // expected to literally start its note with "Do:" or "Avoid:" to
+        // categorize it.
+        let trimmed = note.trim_start().to_lowercase();
+        let category = if trimmed.starts_with("do:") {
             "self_note_do"
-        } else if is_avoid {
+        } else if trimmed.starts_with("avoid:") {
             "self_note_avoid"
         } else {
             "self_note"
@@ -168,10 +166,9 @@ impl ThinkingOrchestrator {
 
     pub fn try_generalize(&mut self) -> Option<GeneralizeResult> {
         let principle = self.generalizer.try_generalize()?;
-        let memory_entry = self.generalizer.persist_principle(&principle);
+        self.generalizer.persist_principle(&principle);
         Some(GeneralizeResult {
             principle_text: principle.principle.clone(),
-            memory_entry,
         })
     }
 
@@ -193,88 +190,68 @@ impl ThinkingOrchestrator {
         }
     }
 
-    pub fn reset_for_new_turn(&mut self) {
-        self.thought_tree = None;
-        self.verification = None;
-        self.active_modes.clear();
-    }
+    fn apply_meta_tags(&mut self, text: &str) {
+        // Explicit tag extraction — not keyword guessing. The LLM controls
+        // thinking state lifecycle by emitting these literal tags.
 
-    fn detect_complex_reasoning(&self, question: &str) -> bool {
-        let lower = question.to_lowercase();
-        let indicators = [
-            "why does", "root cause", "figure out", "investigate",
-            "multiple approaches", "compare", "trade-off", "tradeoff",
-            "which is better", "analyze", "debug", "diagnose",
-            "为什么", "根因", "排查", "分析", "对比", "权衡",
-        ];
-        indicators.iter().filter(|i| lower.contains(*i)).count() >= 1 || question.len() > 200
-    }
-
-    fn detect_verification_need(&self, question: &str) -> bool {
-        let lower = question.to_lowercase();
-        let indicators = [
-            "fix", "bug", "broken", "not working", "error", "crash",
-            "test", "verify", "validate", "reproduce",
-            "修复", "bug", "报错", "崩溃", "验证", "复现",
-        ];
-        indicators.iter().any(|i| lower.contains(i))
-    }
-
-    fn detect_goal_decomposition_need(&self, question: &str) -> bool {
-        let lower = question.to_lowercase();
-        let indicators = [
-            "refactor", "migrate", "redesign", "rewrite", "implement",
-            "build", "create a system", "end to end", "from scratch",
-            "重构", "迁移", "重写", "实现", "搭建", "从零",
-        ];
-        indicators.iter().any(|i| lower.contains(i))
-    }
-
-    fn is_question_related_to_tree(&self, question: &str) -> bool {
-        if let Some(ref tree) = self.thought_tree {
-            let root = match tree.get_node(tree.root_id()) {
-                Some(n) => n,
-                None => return false,
-            };
-            let root_words: std::collections::HashSet<String> = root.hypothesis
-                .to_lowercase().split_whitespace()
-                .filter(|w| w.len() > 3)
-                .map(|w| w.to_string())
-                .collect();
-            let question_words: std::collections::HashSet<String> = question
-                .to_lowercase().split_whitespace()
-                .filter(|w| w.len() > 3)
-                .map(|w| w.to_string())
-                .collect();
-            let overlap = root_words.intersection(&question_words).count();
-            overlap >= 2 || (root_words.len() <= 3 && overlap >= 1)
-        } else {
-            false
+        // <meta:reset_thinking/> — clear all thinking state
+        if text.contains("<meta:reset_thinking/>") || text.contains("<meta:reset_thinking />") {
+            self.thought_tree = None;
+            self.verification = None;
+            self.active_modes.clear();
+            self.current_tree_node_id = None;
         }
-    }
 
-    fn is_question_related_to_verification(&self, question: &str) -> bool {
-        if let Some(ref wf) = self.verification {
-            let hypothesis = &wf.current_cycle().hypothesis;
-            let hyp_words: std::collections::HashSet<String> = hypothesis
-                .to_lowercase().split_whitespace()
-                .filter(|w| w.len() > 3)
-                .map(|w| w.to_string())
-                .collect();
-            let question_words: std::collections::HashSet<String> = question
-                .to_lowercase().split_whitespace()
-                .filter(|w| w.len() > 3)
-                .map(|w| w.to_string())
-                .collect();
-            let overlap = hyp_words.intersection(&question_words).count();
-            overlap >= 2 || (hyp_words.len() <= 3 && overlap >= 1)
-        } else {
-            false
+        // <meta:begin_tree_of_thoughts>...</meta:begin_tree_of_thoughts>
+        if let Some(root_thought) = extract_tag(text, "meta:begin_tree_of_thoughts") {
+            if self.thought_tree.is_none() {
+                self.thought_tree = Some(ThoughtTree::new(&root_thought, 4, 3));
+            }
+            self.active_modes.insert(ThinkingMode::TreeOfThoughts);
+        }
+
+        // <meta:begin_verification>...</meta:begin_verification>
+        if let Some(hypothesis) = extract_tag(text, "meta:begin_verification") {
+            if self.verification.is_none() {
+                self.verification = Some(VerificationWorkflow::new(hypothesis));
+            }
+            self.active_modes.insert(ThinkingMode::VerificationLoop);
+        }
+
+        // <meta:begin_goal>...</meta:begin_goal>
+        if let Some(goal_desc) = extract_tag(text, "meta:begin_goal") {
+            if self.goal_manager.active_goal().is_none() {
+                let goal_id = self.goal_manager.create_goal(goal_desc);
+                self.goal_manager.activate_goal(&goal_id);
+            }
+            self.active_modes.insert(ThinkingMode::GoalDirected);
         }
     }
 
     fn build_system_prompt_injection(&self) -> Option<String> {
         let mut parts = Vec::new();
+
+        // Always advertise the meta-tag protocol. This is how the LLM
+        // explicitly opts into structured thinking modes when *it* judges
+        // the situation warrants them — we do not guess on its behalf.
+        parts.push(
+            "[Thinking Protocol]\n\
+             You may opt into structured thinking modes by emitting one of these tags in your \
+             reply (they will be parsed back in the next turn, NOT shown to the user):\n\
+             - <meta:begin_tree_of_thoughts>ROOT_QUESTION</meta:begin_tree_of_thoughts> — \
+             enter tree-of-thoughts exploration when you face multiple plausible approaches.\n\
+             - <meta:begin_verification>HYPOTHESIS</meta:begin_verification> — \
+             enter scientific-method verification loop when you have a concrete hypothesis \
+             that can be falsified by executing a test.\n\
+             - <meta:begin_goal>LONG_HORIZON_GOAL</meta:begin_goal> — \
+             enter goal-directed decomposition when the task requires multi-step planning \
+             with dependency tracking.\n\
+             - <meta:reset_thinking/> — clear all thinking state when the conversation topic \
+             has shifted and previous reasoning no longer applies.\n\
+             - <meta:self_note>Do: ...</meta:self_note> / <meta:self_note>Avoid: ...</meta:self_note> — \
+             record an actionable policy you want generalized across future tasks.\n\
+             Do NOT emit tags unless the situation truly calls for them.".to_string()
+        );
 
         if self.active_modes.contains(&ThinkingMode::TreeOfThoughts) {
             if let Some(ref tree) = self.thought_tree {
@@ -339,7 +316,6 @@ impl ThinkingOrchestrator {
 
 pub struct GeneralizeResult {
     pub principle_text: String,
-    pub memory_entry: MemoryEntry,
 }
 
 #[derive(Debug, Clone)]
@@ -358,21 +334,39 @@ fn extract_self_note_from_text(text: &str) -> Option<String> {
     Some(text[start + "<meta:self_note>".len()..end].trim().to_string())
 }
 
+fn extract_tag(text: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let close = format!("</{}>", tag);
+    let start = text.find(&open)?;
+    let content_start = start + open.len();
+    let end = text[content_start..].find(&close)?;
+    let content = &text[content_start..content_start + end];
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 impl TurnObserver for ThinkingOrchestrator {
     fn on_prepare(&mut self, ctx: &PrepareContext) -> Vec<(String, String)> {
+        // Parse explicit meta-tags in the question. This is NOT semantic
+        // guessing — it's literal tag extraction, similar to how we already
+        // parse <meta:self_note>. The LLM is the intelligent party; it is
+        // responsible for emitting these tags (typically as part of its
+        // previous-turn answer, carried back here via conversation history).
+        self.apply_meta_tags(&ctx.question);
+
+        // Whatever thinking state currently exists is activated.
+        // No keyword-based relevance heuristics — state lifetime is controlled
+        // explicitly by the LLM (via <meta:reset_thinking/>) or implicitly by
+        // on_conversation_end.
         if self.thought_tree.is_some() {
-            if self.is_question_related_to_tree(&ctx.question) {
-                self.active_modes.insert(ThinkingMode::TreeOfThoughts);
-            } else {
-                self.thought_tree = None;
-            }
+            self.active_modes.insert(ThinkingMode::TreeOfThoughts);
         }
         if self.verification.is_some() {
-            if self.is_question_related_to_verification(&ctx.question) {
-                self.active_modes.insert(ThinkingMode::VerificationLoop);
-            } else {
-                self.verification = None;
-            }
+            self.active_modes.insert(ThinkingMode::VerificationLoop);
         }
         if self.goal_manager.active_goal().is_some() {
             self.active_modes.insert(ThinkingMode::GoalDirected);
@@ -386,6 +380,7 @@ impl TurnObserver for ThinkingOrchestrator {
         if decision.active_modes.contains(&ThinkingMode::TreeOfThoughts) {
             if let Some(ref tree) = self.thought_tree {
                 if let Some(current) = tree.ucb_select(1.414) {
+                    self.current_tree_node_id = Some(current);
                     sections.push((
                         "Reasoning Tree".to_string(),
                         tree.generate_thinking_prompt(current),
@@ -394,19 +389,19 @@ impl TurnObserver for ThinkingOrchestrator {
             }
         }
         if decision.active_modes.contains(&ThinkingMode::VerificationLoop) {
-            if let Some(ref wf) = self.verification {
+            let verification_data: Option<(VerificationStep, String, String)> = self.verification.as_ref().map(|wf| {
                 let prompt = match wf.current_step {
                     VerificationStep::GenerateHypothesis => {
-                        Some(wf.generate_hypothesis_prompt(&ctx.question, ""))
+                        wf.generate_hypothesis_prompt(&ctx.question, "")
                     }
                     VerificationStep::DesignTest => {
-                        Some(wf.generate_test_design_prompt(&wf.current_cycle().hypothesis))
+                        wf.generate_test_design_prompt(&wf.current_cycle().hypothesis)
                     }
                     VerificationStep::AnalyzeResult => {
-                        Some(wf.generate_analysis_prompt(wf.current_cycle()))
+                        wf.generate_analysis_prompt(wf.current_cycle())
                     }
                     VerificationStep::ConfirmOrReject => {
-                        Some(format!(
+                        format!(
                             "Based on all evidence gathered, make a final judgment.\n\n\
                              Hypothesis: {}\n\
                              Total test cycles: {}\n\
@@ -415,13 +410,13 @@ impl TurnObserver for ThinkingOrchestrator {
                             wf.current_cycle().hypothesis,
                             wf.cycles.len(),
                             wf.current_cycle().test_results.len(),
-                        ))
+                        )
                     }
                     VerificationStep::ReviseHypothesis => {
                         let results_summary: Vec<String> = wf.current_cycle().test_results.iter()
                             .map(|r| format!("{}: {}", r.command, if r.passed { "PASSED" } else { "FAILED" }))
                             .collect();
-                        Some(format!(
+                        format!(
                             "Based on the test results, revise your hypothesis.\n\n\
                              Original hypothesis: {}\n\
                              Test results: {}\n\n\
@@ -429,14 +424,26 @@ impl TurnObserver for ThinkingOrchestrator {
                              Output STRICT JSON: {{\"new_hypothesis\":\"...\",\"feedback\":\"...\"}}",
                             wf.current_cycle().hypothesis,
                             results_summary.join(", ")
-                        ))
+                        )
                     }
-                    VerificationStep::ExecuteTest => None,
+                    VerificationStep::ExecuteTest => String::new(),
                 };
-                if let Some(p) = prompt {
-                    if !p.is_empty() {
-                        sections.push(("Verification".to_string(), p));
-                    }
+                (wf.current_step, wf.current_cycle().hypothesis.clone(), prompt)
+            });
+            if let Some((step, hypothesis, prompt)) = verification_data {
+                if matches!(step, VerificationStep::ExecuteTest) {
+                    self.pending_suggested_tool_calls.push(
+                        crate::ai::driver::observer::SuggestedToolCall {
+                            tool_name: "RunCommand".to_string(),
+                            arguments: serde_json::json!({
+                                "note": "Execute the test command designed in the previous DesignTest step",
+                                "hypothesis": hypothesis,
+                            }),
+                            rationale: format!("Verify hypothesis: '{}'", hypothesis),
+                        }
+                    );
+                } else if !prompt.is_empty() {
+                    sections.push(("Verification".to_string(), prompt));
                 }
             }
         }
@@ -455,9 +462,26 @@ impl TurnObserver for ThinkingOrchestrator {
         self.process_tool_result(&ctx.tool_name, &ctx.result_content, ctx.success);
     }
 
+    fn on_prepare_rich(&mut self, ctx: &PrepareContext) -> crate::ai::driver::observer::PrepareOutput {
+        use crate::ai::driver::observer::{PrepareOutput, SectionKind};
+        let legacy = self.on_prepare(ctx);
+        let sections = legacy
+            .into_iter()
+            .map(|(label, content)| {
+                // Thinking sections are all behavior-directing (telling LLM *how* to reason),
+                // so they all belong to Behavior channel, not Fact channel.
+                (SectionKind::Behavior, label, content)
+            })
+            .collect();
+        let suggested_tool_calls = std::mem::take(&mut self.pending_suggested_tool_calls);
+        PrepareOutput {
+            sections,
+            suggested_tool_calls,
+        }
+    }
+
     fn on_finalize(&mut self, ctx: &FinalizeContext) -> ObserverOutput {
         let mut display_lines = Vec::new();
-        let mut memory_entries = Vec::new();
 
         if let Some(note) = extract_self_note_from_text(&ctx.final_text) {
             self.process_self_note(&note);
@@ -465,7 +489,6 @@ impl TurnObserver for ThinkingOrchestrator {
 
         if let Some(result) = self.try_generalize() {
             display_lines.push(format!("[Thinking] Generalized principle: {}", result.principle_text));
-            memory_entries.push(result.memory_entry);
         }
 
         if self.try_cross_domain_link().is_some() {
@@ -496,10 +519,10 @@ impl TurnObserver for ThinkingOrchestrator {
         }
 
         self.active_modes.clear();
+        self.current_tree_node_id = None;
 
         ObserverOutput {
             display_lines,
-            memory_entries,
         }
     }
 
@@ -508,6 +531,7 @@ impl TurnObserver for ThinkingOrchestrator {
         self.thought_tree = None;
         self.verification = None;
         self.active_modes.clear();
+        self.current_tree_node_id = None;
         self.generalizer = ExperienceGeneralizer::new();
         self.goal_manager = GoalManager::new()
             .with_persistence_dir_opt(dirs::home_dir().map(|h| h.join(".config").join("rust_tools").join("thinking_goals")));
@@ -516,6 +540,14 @@ impl TurnObserver for ThinkingOrchestrator {
     fn name(&self) -> &str {
         "thinking"
     }
+
+    fn is_poisoned(&self) -> bool {
+        self.poisoned
+    }
+
+    fn mark_poisoned(&mut self) {
+        self.poisoned = true;
+    }
 }
 
 #[cfg(test)]
@@ -523,32 +555,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn analyze_complex_question_activates_verification() {
+    fn explicit_meta_tag_activates_verification() {
         let mut orch = ThinkingOrchestrator::new();
-        let decision = orch.analyze_question("Why does the server crash under high load?");
+        orch.apply_meta_tags("<meta:begin_verification>server crashes under high load</meta:begin_verification>");
+        let decision = orch.analyze_question("anything");
         assert!(decision.active_modes.contains(&ThinkingMode::VerificationLoop));
     }
 
     #[test]
-    fn analyze_decomposition_question_creates_goal() {
+    fn explicit_meta_tag_activates_goal() {
         let mut orch = ThinkingOrchestrator::new();
-        let decision = orch.analyze_question("Refactor the entire networking layer");
+        orch.apply_meta_tags("<meta:begin_goal>Refactor the entire networking layer</meta:begin_goal>");
+        let decision = orch.analyze_question("anything");
         assert!(decision.active_modes.contains(&ThinkingMode::GoalDirected));
         assert!(orch.goal_manager.active_goal().is_some());
     }
 
     #[test]
-    fn modes_can_be_parallel() {
+    fn explicit_meta_tags_can_activate_multiple_modes() {
         let mut orch = ThinkingOrchestrator::new();
-        let decision = orch.analyze_question("Fix the bug and refactor the error handling module");
+        orch.apply_meta_tags(
+            "<meta:begin_verification>bug hypothesis</meta:begin_verification>\
+             <meta:begin_goal>refactor error handling</meta:begin_goal>"
+        );
+        let decision = orch.analyze_question("anything");
         assert!(decision.active_modes.contains(&ThinkingMode::VerificationLoop));
         assert!(decision.active_modes.contains(&ThinkingMode::GoalDirected));
     }
 
     #[test]
+    fn question_without_meta_tags_activates_no_modes() {
+        let mut orch = ThinkingOrchestrator::new();
+        let decision = orch.analyze_question("Why does the server crash under high load?");
+        assert!(decision.active_modes.is_empty());
+        assert!(orch.goal_manager.active_goal().is_none());
+    }
+
+    #[test]
+    fn reset_meta_tag_clears_state() {
+        let mut orch = ThinkingOrchestrator::new();
+        orch.apply_meta_tags("<meta:begin_verification>h1</meta:begin_verification>");
+        assert!(orch.verification.is_some());
+        orch.apply_meta_tags("<meta:reset_thinking/>");
+        assert!(orch.verification.is_none());
+        assert!(orch.active_modes.is_empty());
+    }
+
+    #[test]
     fn process_tool_result_scores_tree() {
         let mut orch = ThinkingOrchestrator::new();
-        orch.analyze_question("Investigate the root cause of this bug");
+        orch.apply_meta_tags("<meta:begin_tree_of_thoughts>root</meta:begin_tree_of_thoughts>");
         orch.process_tool_result("code_search", "found relevant code", true);
     }
 
@@ -567,19 +623,18 @@ mod tests {
     #[test]
     fn on_finalize_returns_output_no_io() {
         let mut orch = ThinkingOrchestrator::new();
-        orch.analyze_question("Debug this complex issue");
         let output = orch.on_finalize(&FinalizeContext {
             question: "test".to_string(),
             final_text: "some response".to_string(),
             had_tool_calls: false,
         });
-        assert!(output.display_lines.is_empty() || output.display_lines.len() >= 0);
+        let _ = output.display_lines;
     }
 
     #[test]
     fn on_conversation_end_clears_goals() {
         let mut orch = ThinkingOrchestrator::new();
-        orch.analyze_question("Refactor the system");
+        orch.apply_meta_tags("<meta:begin_goal>Refactor the system</meta:begin_goal>");
         assert!(orch.goal_manager.active_goal().is_some());
         orch.on_conversation_end();
         assert!(orch.goal_manager.active_goal().is_none());

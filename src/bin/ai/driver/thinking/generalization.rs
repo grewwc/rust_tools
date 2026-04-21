@@ -84,10 +84,16 @@ impl ExperienceGeneralizer {
         tags: &[String],
         source: Option<&str>,
     ) {
+        const MAX_NOTE_CHARS: usize = 2000;
+        let truncated_note: String = if note.chars().count() > MAX_NOTE_CHARS {
+            note.chars().take(MAX_NOTE_CHARS).collect::<String>() + "...[truncated]"
+        } else {
+            note.to_string()
+        };
         let experience = RawExperience {
             id: format!("exp_{}", uuid::Uuid::new_v4().simple()),
             category: category.to_string(),
-            note: note.to_string(),
+            note: truncated_note,
             tags: tags.to_vec(),
             source: source.map(|s| s.to_string()),
         };
@@ -189,8 +195,10 @@ impl ExperienceGeneralizer {
         None
     }
 
-    pub fn persist_principle(&self, principle: &GeneralizedPrinciple) -> crate::ai::driver::observer::MemoryEntry {
-        crate::ai::driver::observer::MemoryEntry {
+    pub fn persist_principle(&self, principle: &GeneralizedPrinciple) {
+        let entry = crate::ai::tools::storage::memory_store::AgentMemoryEntry {
+            id: None,
+            timestamp: chrono::Local::now().to_rfc3339(),
             category: "generalized_principle".to_string(),
             note: format!(
                 "[domain={}] [abstraction={}] [confidence={:.2}] [reinforced={}] {}\nCross-domain links: {}",
@@ -203,8 +211,14 @@ impl ExperienceGeneralizer {
             ),
             tags: vec!["generalized".to_string(), "principle".to_string(), principle.domain.clone()],
             source: Some("experience_generalizer".to_string()),
-            priority: self.priority_for_abstraction(principle.abstraction_level),
-        }
+            priority: Some(self.priority_for_abstraction(principle.abstraction_level)),
+            owner_pid: None,
+            owner_pgid: None,
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
+            let _ = store.append(&entry);
+        }));
     }
 
     pub fn generate_generalization_prompt(&self, experiences: &[RawExperience]) -> String {
@@ -253,57 +267,52 @@ impl ExperienceGeneralizer {
     }
 
     fn infer_domain(&self, experiences: &[&RawExperience]) -> String {
-        let categories: Vec<&str> = experiences.iter().map(|e| e.category.as_str()).collect();
-        let tags: Vec<&str> = experiences
-            .iter()
-            .flat_map(|e| e.tags.iter().map(|t| t.as_str()))
-            .collect();
-        let all_text = format!("{} {}", categories.join(" "), tags.join(" "));
-        let lower = all_text.to_lowercase();
-        if lower.contains("async") || lower.contains("concurrent") || lower.contains("race") {
-            return "async_patterns".to_string();
+        // No more keyword guessing. Prefer explicit tags; fall back to
+        // category; fall back to a single neutral bucket.
+        for e in experiences {
+            for tag in &e.tags {
+                let t = tag.trim();
+                if !t.is_empty() && t != "agent" && t != "policy" && t != "generalized" && t != "principle" {
+                    return t.to_string();
+                }
+            }
         }
-        if lower.contains("error") || lower.contains("fail") || lower.contains("bug") {
-            return "error_handling".to_string();
-        }
-        if lower.contains("api") || lower.contains("endpoint") || lower.contains("request") {
-            return "api_design".to_string();
-        }
-        if lower.contains("test") || lower.contains("verify") || lower.contains("assert") {
-            return "testing".to_string();
-        }
-        if lower.contains("security") || lower.contains("auth") || lower.contains("permission") {
-            return "security".to_string();
-        }
-        if lower.contains("performance") || lower.contains("optim") || lower.contains("speed") {
-            return "performance".to_string();
-        }
-        if lower.contains("refactor") || lower.contains("architect") || lower.contains("design") {
-            return "architecture".to_string();
+        if let Some(first) = experiences.first() {
+            if !first.category.is_empty() {
+                return first.category.clone();
+            }
         }
         "general_engineering".to_string()
     }
 
     fn synthesize_principle(&self, experiences: &[&RawExperience], domain: &str) -> Option<String> {
+        // Only synthesize when there are explicit structured signals
+        // (Do:/Avoid:/Always/Never prefixes). If the experiences carry no
+        // such structure, we refuse to fabricate a "principle" out of
+        // keyword co-occurrence — that would be pattern theater, not
+        // generalization.
         let notes: Vec<&str> = experiences.iter().map(|e| e.note.as_str()).collect();
-        let common_keywords = self.find_common_keywords(&notes);
-        if common_keywords.is_empty() {
-            return None;
-        }
         let do_items: Vec<&str> = notes
             .iter()
             .filter(|n| {
-                n.to_lowercase().starts_with("do:") || n.to_lowercase().starts_with("always")
+                let lower = n.trim_start().to_lowercase();
+                lower.starts_with("do:") || lower.starts_with("always")
             })
             .map(|n| *n)
             .collect();
         let avoid_items: Vec<&str> = notes
             .iter()
             .filter(|n| {
-                n.to_lowercase().starts_with("avoid:") || n.to_lowercase().starts_with("never")
+                let lower = n.trim_start().to_lowercase();
+                lower.starts_with("avoid:") || lower.starts_with("never")
             })
             .map(|n| *n)
             .collect();
+
+        if do_items.is_empty() && avoid_items.is_empty() {
+            return None;
+        }
+
         let mut principle = format!("In {}, ", domain.replace('_', " "));
         if !do_items.is_empty() {
             principle.push_str(&format!("Do: {}; ", do_items.join("; ")));
@@ -311,38 +320,7 @@ impl ExperienceGeneralizer {
         if !avoid_items.is_empty() {
             principle.push_str(&format!("Avoid: {}", avoid_items.join("; ")));
         }
-        if do_items.is_empty() && avoid_items.is_empty() {
-            principle.push_str(&format!("key pattern: {}", common_keywords.join(", ")));
-        }
         Some(principle)
-    }
-
-    fn find_common_keywords(&self, notes: &[&str]) -> Vec<String> {
-        let stop_words: &[&str] = &[
-            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being", "have", "has",
-            "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "must",
-            "shall", "can", "need", "dare", "ought", "used", "to", "of", "in", "for", "on", "with",
-            "at", "by", "from", "as", "into", "through", "during", "before", "after", "above",
-            "below", "between", "out", "off", "over", "under", "again", "further", "then", "once",
-            "and", "but", "or", "nor", "not", "so", "yet", "both", "either", "neither", "each",
-            "every", "all", "any", "few", "more", "most", "other", "some", "such", "no", "only",
-            "own", "same", "than", "too", "very", "just", "because", "if", "when", "this", "that",
-            "these", "those", "it", "its", "i", "me", "my", "we", "our",
-        ];
-        let mut word_counts: HashMap<String, usize> = HashMap::new();
-        for note in notes {
-            for word in note.to_lowercase().split_whitespace() {
-                let w = word.trim_matches(|c: char| !c.is_alphanumeric());
-                if w.len() < 3 || stop_words.contains(&w) {
-                    continue;
-                }
-                *word_counts.entry(w.to_string()).or_insert(0) += 1;
-            }
-        }
-        let mut keywords: Vec<(String, usize)> = word_counts.into_iter().collect();
-        keywords.sort_by(|a, b| b.1.cmp(&a.1));
-        keywords.truncate(5);
-        keywords.into_iter().map(|(w, _)| w).collect()
     }
 
     fn find_similar_principle(&self, text: &str) -> Option<&GeneralizedPrinciple> {
@@ -414,7 +392,10 @@ mod tests {
         let principle = generalizer.try_generalize();
         assert!(principle.is_some());
         let p = principle.unwrap();
-        assert!(p.domain == "async_patterns" || p.domain == "error_handling");
+        // Domain inference now prefers explicit tags → category → neutral
+        // bucket, so "async" (the tag) wins over the keyword-guessed
+        // "async_patterns" from before.
+        assert_eq!(p.domain, "async");
     }
 
     #[test]

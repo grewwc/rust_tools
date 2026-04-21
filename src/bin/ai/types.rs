@@ -63,6 +63,13 @@ impl Clone for App {
     }
 }
 
+impl App {
+    #[allow(dead_code)]
+    pub(super) fn clone_without_observers_intentionally(&self) -> Self {
+        self.clone()
+    }
+}
+
 pub(super) struct App {
     pub(super) cli: ParsedCli,
     pub(super) config: AppConfig,
@@ -86,6 +93,36 @@ pub(super) struct App {
     pub(super) os: crate::ai::kernel::SharedKernel,
     pub(super) agent_reload_counter: Option<usize>,
     pub(super) observers: Vec<Box<dyn crate::ai::driver::observer::TurnObserver>>,
+}
+
+impl App {
+    #[allow(dead_code)]
+    pub(super) fn register_observer(
+        &mut self,
+        observer: Box<dyn crate::ai::driver::observer::TurnObserver>,
+    ) {
+        let new_name = observer.name().to_string();
+        // Only dedup by name when the observer provides a non-default name.
+        // "anonymous" is the trait's default fallback — multiple anonymous
+        // observers are legitimate and must NOT be collapsed into one.
+        if new_name != "anonymous"
+            && self.observers.iter().any(|o| o.name() == new_name)
+        {
+            return;
+        }
+        self.observers.push(observer);
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn unregister_observer(&mut self, name: &str) -> bool {
+        if name == "anonymous" {
+            // Refuse to mass-remove anonymous observers; must use typed handle.
+            return false;
+        }
+        let len_before = self.observers.len();
+        self.observers.retain(|o| o.name() != name);
+        self.observers.len() != len_before
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

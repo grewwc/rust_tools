@@ -124,16 +124,56 @@ pub(super) async fn prepare_turn(
         }
     }
 
-    let observer_sections: Vec<(String, String)> = app.observers.iter_mut().flat_map(|obs| {
-        obs.on_prepare(&crate::ai::driver::observer::PrepareContext {
-            question: question.to_string(),
-        })
-    }).collect();
-    for (kind, content) in &observer_sections {
-        match kind.as_str() {
-            "Behavior" => skill_turn.push_section(skill_runtime::ContextKind::Behavior, content),
-            _ => skill_turn.push_labeled_section(skill_runtime::ContextKind::Fact, kind, content),
+    let observer_outputs: Vec<crate::ai::driver::observer::PrepareOutput> = app.observers.iter_mut().filter_map(|obs| {
+        if obs.is_poisoned() {
+            return None;
         }
+        let ctx = crate::ai::driver::observer::PrepareContext {
+            question: question.to_string(),
+        };
+        let obs_name = obs.name().to_string();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            obs.on_prepare_rich(&ctx)
+        })) {
+            Ok(out) => Some(out),
+            Err(_) => {
+                eprintln!("[Warning] observer '{}' panicked in on_prepare; disabling for rest of conversation.", obs_name);
+                obs.mark_poisoned();
+                None
+            }
+        }
+    }).collect();
+    for output in &observer_outputs {
+        for (kind, label, content) in &output.sections {
+            match kind {
+                crate::ai::driver::observer::SectionKind::Behavior => {
+                    skill_turn.push_section(skill_runtime::ContextKind::Behavior, content);
+                    let _ = label;
+                }
+                crate::ai::driver::observer::SectionKind::Fact => {
+                    skill_turn.push_labeled_section(skill_runtime::ContextKind::Fact, label, content);
+                }
+            }
+        }
+    }
+    let suggested_tool_calls_aggregated: Vec<_> = observer_outputs
+        .iter()
+        .flat_map(|o| o.suggested_tool_calls.clone())
+        .collect();
+    if !suggested_tool_calls_aggregated.is_empty() {
+        let mut block = String::from(
+            "Thinking engine proposes the following verification-driven tool calls BEFORE answering. \
+             Consider them as high-priority candidates:\n"
+        );
+        for sc in &suggested_tool_calls_aggregated {
+            block.push_str(&format!(
+                "- {} (rationale: {})\n  args: {}\n",
+                sc.tool_name,
+                sc.rationale,
+                sc.arguments
+            ));
+        }
+        skill_turn.push_section(skill_runtime::ContextKind::Behavior, &block);
     }
 
     let recall_intent = skill_turn.intent().clone();

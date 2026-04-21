@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum VerificationStep {
     GenerateHypothesis,
     DesignTest,
@@ -192,19 +192,23 @@ impl VerificationWorkflow {
                 result.command,
                 result.exit_code,
                 result.passed,
-                if result.stdout_preview.len() > 300 { &result.stdout_preview[..300] } else { &result.stdout_preview },
-                if result.stderr_preview.len() > 300 { &result.stderr_preview[..300] } else { &result.stderr_preview },
+                if result.stdout_preview.len() > 600 { &result.stdout_preview[..600] } else { &result.stdout_preview },
+                if result.stderr_preview.len() > 600 { &result.stderr_preview[..600] } else { &result.stderr_preview },
             ));
         }
+        if cycle.test_results.is_empty() {
+            results_str.push_str("(no test results captured yet - be explicit that evidence is missing)\n");
+        }
         format!(
-            "Analyze these test results against the hypothesis.\n\n\
+            "Analyze these test results against the hypothesis. Ground your judgment in the stdout/stderr content, not just pass/fail booleans.\n\n\
              Hypothesis: {}\n\
              Test results:\n{}\n\n\
              Determine:\n\
              1. Is the hypothesis confirmed, rejected, or needs revision?\n\
-             2. If needs revision, what should the new hypothesis be?\n\
-             3. What specific feedback led to this conclusion?\n\n\
-             Output STRICT JSON: {{\"verdict\":\"confirmed\"|\"rejected\"|\"needs_revision\"|\"inconclusive\",\"reason\":\"...\",\"new_hypothesis\":\"...\",\"feedback\":\"...\"}}",
+             2. Quote specific evidence from stdout/stderr that supports your verdict.\n\
+             3. If needs revision, what should the new hypothesis be?\n\
+             4. What specific feedback led to this conclusion?\n\n\
+             Output STRICT JSON: {{\"verdict\":\"confirmed\"|\"rejected\"|\"needs_revision\"|\"inconclusive\",\"reason\":\"...\",\"evidence\":\"...\",\"new_hypothesis\":\"...\",\"feedback\":\"...\"}}",
             cycle.hypothesis,
             results_str
         )

@@ -122,7 +122,10 @@ pub(super) fn append_tool_result_messages(
     {
         let prepared = prepare_tool_result(app, &tool_call.function.name, &result.content);
         for obs in app.observers.iter_mut() {
-            obs.on_tool_result(&crate::ai::driver::observer::ToolResultContext {
+            if obs.is_poisoned() {
+                continue;
+            }
+            let ctx = crate::ai::driver::observer::ToolResultContext {
                 tool_name: tool_call.function.name.clone(),
                 result_content: result.content.clone(),
                 success: {
@@ -139,7 +142,14 @@ pub(super) fn append_tool_result_messages(
                         !content_lower.starts_with("error:") && !content_lower.starts_with("failed:")
                     }
                 },
-            });
+            };
+            let obs_name = obs.name().to_string();
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                obs.on_tool_result(&ctx);
+            })).is_err() {
+                eprintln!("[Warning] observer '{}' panicked in on_tool_result; disabling for rest of conversation.", obs_name);
+                obs.mark_poisoned();
+            }
         }
         let tool_message = Message {
             role: "tool".to_string(),

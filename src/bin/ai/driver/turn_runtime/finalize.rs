@@ -138,20 +138,41 @@ pub(super) async fn finalize_turn(
         maybe_spawn_critic_revise_background(app, question, final_assistant_text);
 
         let had_tool_calls = turn_messages.iter().any(|m| m.role == "tool" || m.tool_calls.as_ref().map_or(false, |c| !c.is_empty()));
+        let mut first_observer_emitted = false;
+        let mut poisoned: Vec<String> = Vec::new();
         for obs in app.observers.iter_mut() {
-            let output = obs.on_finalize(&crate::ai::driver::observer::FinalizeContext {
+            if obs.is_poisoned() {
+                continue;
+            }
+            let ctx = crate::ai::driver::observer::FinalizeContext {
                 question: question.to_string(),
                 final_text: final_assistant_text.to_string(),
                 had_tool_calls,
-            });
+            };
+            let obs_name = obs.name().to_string();
+            let output = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                obs.on_finalize(&ctx)
+            })) {
+                Ok(o) => o,
+                Err(_) => {
+                    eprintln!("[Warning] observer '{}' panicked in on_finalize; disabling for rest of conversation.", obs_name);
+                    obs.mark_poisoned();
+                    poisoned.push(obs_name);
+                    continue;
+                }
+            };
+            if output.display_lines.is_empty() {
+                continue;
+            }
+            if first_observer_emitted {
+                println!("---");
+            }
+            first_observer_emitted = true;
             for line in &output.display_lines {
                 println!("{}", line);
             }
-            for entry in &output.memory_entries {
-                let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
-                let _ = store.append(&entry.to_agent_memory_entry());
-            }
         }
+        let _ = poisoned;
     } else {
         println!("{}", format_empty_state("no response"));
     }
