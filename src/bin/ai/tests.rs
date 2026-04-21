@@ -98,6 +98,7 @@ fn resolve_model_is_unicode_safe() {
         last_skill_bias: None,
         os: crate::ai::driver::new_local_kernel(),
         agent_reload_counter: None,
+        observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
     };
 
     let mut question = "a 什么是rust的一个crate？".to_string();

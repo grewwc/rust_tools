@@ -101,7 +101,7 @@ pub(super) fn print_tool_result_preview(_tool_name: &str, prepared: &PreparedToo
 }
 
 pub(super) fn append_tool_result_messages(
-    app: &App,
+    app: &mut App,
     stream_assistant_text: &str,
     exec_result: &ExecuteToolCallsResult,
     messages: &mut Vec<Message>,
@@ -121,6 +121,26 @@ pub(super) fn append_tool_result_messages(
         .zip(exec_result.tool_results.iter())
     {
         let prepared = prepare_tool_result(app, &tool_call.function.name, &result.content);
+        for obs in app.observers.iter_mut() {
+            obs.on_tool_result(&crate::ai::driver::observer::ToolResultContext {
+                tool_name: tool_call.function.name.clone(),
+                result_content: result.content.clone(),
+                success: {
+                    let content_lower = result.content.to_lowercase();
+                    let is_execution_tool = tool_call.function.name == "execute_command"
+                        || tool_call.function.name == "run_command"
+                        || tool_call.function.name == "shell"
+                        || tool_call.function.name == "bash";
+                    if is_execution_tool {
+                        !content_lower.contains("error:") && !content_lower.contains("exit code")
+                            && !content_lower.contains("command not found")
+                            && !content_lower.contains("permission denied")
+                    } else {
+                        !content_lower.starts_with("error:") && !content_lower.starts_with("failed:")
+                    }
+                },
+            });
+        }
         let tool_message = Message {
             role: "tool".to_string(),
             content: Value::String(prepared.content_for_model),

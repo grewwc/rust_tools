@@ -53,6 +53,7 @@ pub mod intent_recognition;
 pub mod mcp_init;
 pub mod model;
 pub mod os;
+pub mod observer;
 pub mod params;
 pub mod print;
 pub mod reflection;
@@ -62,6 +63,7 @@ pub mod skill_matching;
 pub mod skill_ranking;
 pub mod skill_runtime;
 pub mod text_similarity;
+pub mod thinking;
 pub mod tools;
 pub mod turn_runtime;
 
@@ -309,7 +311,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         last_skill_bias: None,
         os: os_arc,
         agent_reload_counter: None,
-    };
+            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
+        };
 
     let mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
     let skill_manifests = load_skill_manifests(app.cli.no_skills);
@@ -785,6 +788,9 @@ async fn run_loop(
         app.session_history_file = original_history_file;
         app.writer = original_writer;
         if matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Quit)) || should_quit {
+            for obs in app.observers.iter_mut() {
+                obs.on_conversation_end();
+            }
             cleanup_one_shot(app);
             return Ok(());
         }
@@ -869,6 +875,7 @@ mod tests {
             last_skill_bias: None,
             os: super::new_local_kernel(),
             agent_reload_counter: None,
+            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
         }
     }
 

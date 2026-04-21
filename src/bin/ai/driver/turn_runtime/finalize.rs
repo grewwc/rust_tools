@@ -136,6 +136,22 @@ pub(super) async fn finalize_turn(
         }
         println!();
         maybe_spawn_critic_revise_background(app, question, final_assistant_text);
+
+        let had_tool_calls = turn_messages.iter().any(|m| m.role == "tool" || m.tool_calls.as_ref().map_or(false, |c| !c.is_empty()));
+        for obs in app.observers.iter_mut() {
+            let output = obs.on_finalize(&crate::ai::driver::observer::FinalizeContext {
+                question: question.to_string(),
+                final_text: final_assistant_text.to_string(),
+                had_tool_calls,
+            });
+            for line in &output.display_lines {
+                println!("{}", line);
+            }
+            for entry in &output.memory_entries {
+                let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
+                let _ = store.append(&entry.to_agent_memory_entry());
+            }
+        }
     } else {
         println!("{}", format_empty_state("no response"));
     }

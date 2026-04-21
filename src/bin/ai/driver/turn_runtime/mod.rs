@@ -93,6 +93,7 @@ mod tests {
             last_skill_bias: None,
             os: crate::ai::driver::new_local_kernel(),
             agent_reload_counter: None,
+            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
         }
     }
 

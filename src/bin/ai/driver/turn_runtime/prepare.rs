@@ -124,6 +124,18 @@ pub(super) async fn prepare_turn(
         }
     }
 
+    let observer_sections: Vec<(String, String)> = app.observers.iter_mut().flat_map(|obs| {
+        obs.on_prepare(&crate::ai::driver::observer::PrepareContext {
+            question: question.to_string(),
+        })
+    }).collect();
+    for (kind, content) in &observer_sections {
+        match kind.as_str() {
+            "Behavior" => skill_turn.push_section(skill_runtime::ContextKind::Behavior, content),
+            _ => skill_turn.push_labeled_section(skill_runtime::ContextKind::Fact, kind, content),
+        }
+    }
+
     let recall_intent = skill_turn.intent().clone();
     let skip_recall_for_skill_context = skill_turn.skip_recall_by_skill();
     let matched_skill_name = skill_turn.matched_skill_name().map(|name| name.to_string());

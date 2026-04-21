@@ -246,7 +246,7 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
 }
 
 fn handle_tool_call_round(
-    app: &App,
+    app: &mut App,
     mcp_client: &McpClient,
     stream_result: &crate::ai::types::StreamResult,
     messages: &mut Vec<Message>,
@@ -285,7 +285,7 @@ fn handle_tool_call_round(
 }
 
 pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
-    app: &App,
+    app: &mut App,
     _question: &str,
     mcp_client: &McpClient,
     execution: IterationExecution,
@@ -418,6 +418,7 @@ mod tests {
             last_skill_bias: None,
             os: crate::ai::driver::new_local_kernel(),
             agent_reload_counter: None,
+            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
         }
     }
 

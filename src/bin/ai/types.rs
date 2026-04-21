@@ -58,6 +58,7 @@ impl Clone for App {
             last_skill_bias: self.last_skill_bias.clone(),
             os: self.os.clone(),
             agent_reload_counter: self.agent_reload_counter,
+            observers: Vec::new(),
         }
     }
 }
@@ -84,6 +85,7 @@ pub(super) struct App {
     pub(super) last_skill_bias: Option<SkillBiasMemory>,
     pub(super) os: crate::ai::kernel::SharedKernel,
     pub(super) agent_reload_counter: Option<usize>,
+    pub(super) observers: Vec<Box<dyn crate::ai::driver::observer::TurnObserver>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
