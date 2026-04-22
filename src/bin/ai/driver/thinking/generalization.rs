@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use chrono::Local;
 use serde::{Deserialize, Serialize};
@@ -59,72 +61,22 @@ impl ExperienceGeneralizer {
             Err(_) => return,
         };
         if let Ok(results) = store.search("generalized principle", 50) {
+            let mut deduped = HashMap::new();
             for (entry, _score) in results {
                 if entry.category != "generalized_principle" {
                     continue;
                 }
-                let (note_text, cross_domain_links) =
-                    if let Some(idx) = entry.note.find(PERSIST_SUFFIX_LINKS) {
-                        let links_part = entry.note[idx + PERSIST_SUFFIX_LINKS.len()..]
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        (&entry.note[..idx], links_part)
-                    } else {
-                        (entry.note.as_str(), Vec::new())
-                    };
-
-                let mut domain = entry.tags.iter()
-                    .find(|t| t.as_str() != "generalized" && t.as_str() != "principle")
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                let mut abstraction_level = 1;
-                let mut confidence = 0.6;
-                let mut reinforcement_count = 1;
-
-                let principle_body = if let Some(rest) = note_text
-                    .strip_prefix(PERSIST_PREFIX_DOMAIN)
-                    .and_then(|s| s.split_once("] ["))
-                    .and_then(|(d, s1)| {
-                        s1.strip_prefix(PERSIST_PREFIX_ABSTRACTION)
-                            .and_then(|s| s.split_once("] ["))
-                            .map(|(a, s2)| (d, a, s2))
-                    })
-                    .and_then(|(d, a, s2)| {
-                        s2.strip_prefix(PERSIST_PREFIX_CONFIDENCE)
-                            .and_then(|s| s.split_once("] ["))
-                            .map(|(c, s3)| (d, a, c, s3))
-                    })
-                    .and_then(|(d, a, c, s3)| {
-                        s3.strip_prefix(PERSIST_PREFIX_REINFORCED)
-                            .and_then(|s| s.split_once("] "))
-                            .map(|(r, body)| (d, a, c, r, body))
-                    })
-                {
-                    domain = rest.0.to_string();
-                    abstraction_level = rest.1.parse().unwrap_or(1);
-                    confidence = rest.2.parse().unwrap_or(0.6);
-                    reinforcement_count = rest.3.parse().unwrap_or(1);
-                    rest.4.to_string()
-                } else {
-                    note_text.to_string()
-                };
-
-                let principle = GeneralizedPrinciple {
-                    id: entry.id.unwrap_or_default(),
-                    principle: principle_body,
-                    source_experiences: vec![],
-                    domain,
-                    abstraction_level,
-                    confidence,
-                    created_at: entry.timestamp.clone(),
-                    last_reinforced: entry.timestamp.clone(),
-                    reinforcement_count,
-                    cross_domain_links,
-                };
-                self.principles.push(principle);
+                let principle = Self::decode_persisted_principle(&entry);
+                match deduped.get(&principle.id) {
+                    Some(existing) if !Self::should_replace_loaded_principle(existing, &principle) => {}
+                    _ => {
+                        deduped.insert(principle.id.clone(), principle);
+                    }
+                }
             }
+            let mut principles = deduped.into_values().collect::<Vec<_>>();
+            principles.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+            self.principles.extend(principles);
         }
     }
 
@@ -254,6 +206,10 @@ impl ExperienceGeneralizer {
                 self.principles[i].abstraction_level = (level_i + 1).min(5);
                 self.principles[j].abstraction_level = (level_j + 1).min(5);
             }
+            let updated_i = self.principles[i].clone();
+            let updated_j = self.principles[j].clone();
+            self.persist_principle(&updated_i);
+            self.persist_principle(&updated_j);
             return Some((id_i, id_j));
         }
         None
@@ -261,7 +217,7 @@ impl ExperienceGeneralizer {
 
     pub fn persist_principle(&self, principle: &GeneralizedPrinciple) {
         let entry = crate::ai::tools::storage::memory_store::AgentMemoryEntry {
-            id: None,
+            id: Some(principle.id.clone()),
             timestamp: chrono::Local::now().to_rfc3339(),
             category: "generalized_principle".to_string(),
             note: format!(
@@ -283,6 +239,124 @@ impl ExperienceGeneralizer {
             let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
             let _ = store.append(&entry);
         }));
+    }
+
+    fn decode_persisted_principle(
+        entry: &crate::ai::tools::storage::memory_store::AgentMemoryEntry,
+    ) -> GeneralizedPrinciple {
+        let (note_text, cross_domain_links) = Self::split_cross_domain_links(&entry.note);
+        let (
+            principle_body,
+            domain,
+            abstraction_level,
+            confidence,
+            reinforcement_count,
+        ) = Self::parse_persisted_principle_note(note_text, &entry.tags);
+
+        GeneralizedPrinciple {
+            id: entry
+                .id
+                .clone()
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| Self::legacy_principle_id(&entry.timestamp, &principle_body)),
+            principle: principle_body,
+            source_experiences: vec![],
+            domain,
+            abstraction_level,
+            confidence,
+            created_at: entry.timestamp.clone(),
+            last_reinforced: entry.timestamp.clone(),
+            reinforcement_count,
+            cross_domain_links,
+        }
+    }
+
+    fn split_cross_domain_links(note: &str) -> (&str, Vec<String>) {
+        if let Some(idx) = note.find(PERSIST_SUFFIX_LINKS) {
+            let links = note[idx + PERSIST_SUFFIX_LINKS.len()..]
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            (&note[..idx], links)
+        } else {
+            (note, Vec::new())
+        }
+    }
+
+    fn parse_persisted_principle_note(
+        note_text: &str,
+        tags: &[String],
+    ) -> (String, String, u8, f64, u32) {
+        let fallback_domain = tags
+            .iter()
+            .find(|t| t.as_str() != "generalized" && t.as_str() != "principle")
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let Some(rest) = note_text.strip_prefix(PERSIST_PREFIX_DOMAIN) else {
+            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
+        };
+        let Some((domain, rest)) = rest.split_once("] [") else {
+            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
+        };
+        let Some(rest) = rest.strip_prefix(PERSIST_PREFIX_ABSTRACTION) else {
+            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
+        };
+        let Some((abstraction, rest)) = rest.split_once("] [") else {
+            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
+        };
+        let Some(rest) = rest.strip_prefix(PERSIST_PREFIX_CONFIDENCE) else {
+            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
+        };
+        let Some((confidence, rest)) = rest.split_once("] [") else {
+            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
+        };
+        let Some(rest) = rest.strip_prefix(PERSIST_PREFIX_REINFORCED) else {
+            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
+        };
+        let Some((reinforced, principle_body)) = rest.split_once("] ") else {
+            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
+        };
+
+        (
+            principle_body.to_string(),
+            domain.to_string(),
+            abstraction.parse().unwrap_or(1),
+            confidence.parse().unwrap_or(0.6),
+            reinforced.parse().unwrap_or(1),
+        )
+    }
+
+    fn should_replace_loaded_principle(
+        existing: &GeneralizedPrinciple,
+        candidate: &GeneralizedPrinciple,
+    ) -> bool {
+        (
+            candidate.cross_domain_links.len(),
+            candidate.reinforcement_count,
+            candidate.abstraction_level,
+            candidate.last_reinforced.as_str(),
+            candidate.created_at.as_str(),
+        ) > (
+            existing.cross_domain_links.len(),
+            existing.reinforcement_count,
+            existing.abstraction_level,
+            existing.last_reinforced.as_str(),
+            existing.created_at.as_str(),
+        )
+    }
+
+    fn legacy_principle_id(timestamp: &str, principle_body: &str) -> String {
+        let mut hasher = DefaultHasher::new();
+        timestamp.hash(&mut hasher);
+        principle_body.hash(&mut hasher);
+        format!("legacy_principle_{:016x}", hasher.finish())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_principles_for_test(&mut self, principles: Vec<GeneralizedPrinciple>) {
+        self.principles = principles;
     }
 
     pub fn generate_generalization_prompt(&self, experiences: &[RawExperience]) -> String {
@@ -431,6 +505,12 @@ impl ExperienceGeneralizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn ingest_and_generalize() {
@@ -491,6 +571,60 @@ mod tests {
         });
         let link = generalizer.try_cross_domain_link();
         assert!(link.is_some());
+    }
+
+    #[test]
+    fn cross_domain_link_is_not_repeated_after_reload() {
+        let _guard = env_lock().lock().unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "rt_generalization_reload_{}_{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let ts = Local::now().to_rfc3339();
+        let principle_a = GeneralizedPrinciple {
+            id: "p1".to_string(),
+            principle: "Always validate inputs before processing in API handlers".to_string(),
+            source_experiences: vec![],
+            domain: "api_design".to_string(),
+            abstraction_level: 1,
+            confidence: 0.7,
+            created_at: ts.clone(),
+            last_reinforced: ts.clone(),
+            reinforcement_count: 1,
+            cross_domain_links: vec![],
+        };
+        let principle_b = GeneralizedPrinciple {
+            id: "p2".to_string(),
+            principle: "Always validate inputs before processing in async handlers".to_string(),
+            source_experiences: vec![],
+            domain: "async_patterns".to_string(),
+            abstraction_level: 1,
+            confidence: 0.7,
+            created_at: ts.clone(),
+            last_reinforced: ts,
+            reinforcement_count: 1,
+            cross_domain_links: vec![],
+        };
+
+        let generalizer = ExperienceGeneralizer::new();
+        generalizer.persist_principle(&principle_a);
+        generalizer.persist_principle(&principle_b);
+
+        let mut reloaded = ExperienceGeneralizer::new();
+        assert!(reloaded.try_cross_domain_link().is_some());
+
+        let mut reloaded_again = ExperienceGeneralizer::new();
+        assert!(reloaded_again.try_cross_domain_link().is_none());
+
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
     }
 
     #[test]

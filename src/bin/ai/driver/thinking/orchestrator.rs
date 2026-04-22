@@ -495,11 +495,12 @@ impl TurnObserver for ThinkingOrchestrator {
             self.process_self_note(&note);
         }
 
-        if let Some(result) = self.try_generalize() {
+        let generalized = self.try_generalize();
+        if let Some(result) = &generalized {
             display_lines.push(format!("[Thinking] Generalized principle: {}", result.principle_text));
         }
 
-        if self.try_cross_domain_link().is_some() {
+        if generalized.is_some() && self.try_cross_domain_link().is_some() {
             display_lines.push("[Thinking] Cross-domain link discovered".to_string());
         }
 
@@ -641,6 +642,47 @@ mod tests {
             had_tool_calls: false,
         });
         let _ = output.display_lines;
+    }
+
+    #[test]
+    fn on_finalize_does_not_emit_cross_domain_link_without_new_generalization() {
+        let mut orch = ThinkingOrchestrator::new();
+        let ts = chrono::Local::now().to_rfc3339();
+        orch.generalizer.inject_principles_for_test(vec![
+            crate::ai::driver::thinking::generalization::GeneralizedPrinciple {
+                id: "p1".to_string(),
+                principle: "Always validate inputs before processing in API handlers".to_string(),
+                source_experiences: vec![],
+                domain: "api_design".to_string(),
+                abstraction_level: 1,
+                confidence: 0.7,
+                created_at: ts.clone(),
+                last_reinforced: ts.clone(),
+                reinforcement_count: 1,
+                cross_domain_links: vec![],
+            },
+            crate::ai::driver::thinking::generalization::GeneralizedPrinciple {
+                id: "p2".to_string(),
+                principle: "Always validate inputs before processing in async handlers".to_string(),
+                source_experiences: vec![],
+                domain: "async_patterns".to_string(),
+                abstraction_level: 1,
+                confidence: 0.7,
+                created_at: ts.clone(),
+                last_reinforced: ts,
+                reinforcement_count: 1,
+                cross_domain_links: vec![],
+            },
+        ]);
+        let output = orch.on_finalize(&FinalizeContext {
+            question: "hello".to_string(),
+            final_text: "hello".to_string(),
+            had_tool_calls: false,
+        });
+        assert!(!output
+            .display_lines
+            .iter()
+            .any(|line| line.contains("Cross-domain link discovered")));
     }
 
     #[test]
