@@ -5,7 +5,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size},
 };
-use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use tui_textarea::TextArea;
 
 use super::{
@@ -60,10 +60,8 @@ impl PromptEditor {
                     .map_err(|e| io::Error::other(e.to_string()))?;
 
                 let event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
-                if let Event::Resize(_, _) = &event
-                    && let Ok((w, h)) = terminal_size()
-                {
-                    let _ = terminal.resize(Rect::new(0, 0, w, h));
+                if let Event::Resize(_, _) = &event {
+                    let _ = terminal.clear();
                 }
 
                 match handle_multiline_event(

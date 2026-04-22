@@ -297,9 +297,9 @@ where
     Arc::new(Mutex::new(Box::new(kernel)))
 }
 
-/// Task-local storage for the current process ID.
-/// Used by spawn_process() to scope async blocks to specific processes.
-/// This allows the turn runtime to know which process is currently executing.
+// Task-local storage for the current process ID.
+// Used by spawn_process() to scope async blocks to specific processes.
+// This allows the turn runtime to know which process is currently executing.
 tokio::task_local! {
     pub static TASK_PID: Option<u64>;
 }
