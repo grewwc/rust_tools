@@ -20,6 +20,7 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     tty: bool,
     enabled: bool,
     in_code_block: bool,
+    show_line_gutter: bool,
     code_block_indent: String,
     code_block_lang: Option<String>,
     code_line_number: usize,
@@ -42,6 +43,7 @@ impl MarkdownStreamRenderer {
     pub(in crate::ai) fn new_with_tty(tty: bool) -> Self {
         Self {
             tty,
+            show_line_gutter: false,
             enabled: true,
             in_code_block: false,
             code_block_indent: String::new(),
@@ -127,6 +129,11 @@ impl MarkdownStreamRenderer {
         self.code_line_number = 0;
     }
 
+    #[cfg(test)]
+    fn set_show_line_gutter(&mut self, show_line_gutter: bool) {
+        self.show_line_gutter = show_line_gutter;
+    }
+
     fn handle_newline(&mut self, out: &mut dyn Write) -> io::Result<()> {
         if self.line_preview_emitted {
             if self.in_code_block {
@@ -200,17 +207,21 @@ impl MarkdownStreamRenderer {
     ) -> io::Result<()> {
         let block_indent = self.code_block_indent.as_str();
         let line_num_str = format!("{:>3}", self.code_line_number + 1);
-        let available_width = code_block_content_width(block_indent, &line_num_str).max(1);
+        let available_width =
+            code_block_content_width(block_indent, &line_num_str, self.show_line_gutter).max(1);
         let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
 
         if !self.line_preview_emitted {
-            out.write_all(code_block_preview_prefix(block_indent, &line_num_str, self.dimmed).as_bytes())?;
+            out.write_all(
+                code_block_preview_prefix(block_indent, &line_num_str, self.dimmed, self.show_line_gutter)
+                    .as_bytes(),
+            )?;
         } else if self.code_preview_segment_width > 0
             && self.code_preview_segment_width + ch_width > available_width
         {
             out.write_all(b"\x1b[0m\n")?;
             out.write_all(
-                code_block_preview_continuation_prefix(block_indent, self.dimmed).as_bytes(),
+                code_block_preview_continuation_prefix(block_indent, self.dimmed, self.show_line_gutter).as_bytes(),
             )?;
             self.code_preview_segment_width = 0;
         }
@@ -233,7 +244,7 @@ impl MarkdownStreamRenderer {
         let code_text = line.strip_prefix(block_indent).unwrap_or(line);
         wrap_code_block_text(
             code_text,
-            code_block_content_width(block_indent, &line_num_str),
+            code_block_content_width(block_indent, &line_num_str, self.show_line_gutter),
         )
         .len()
         .max(1)
@@ -499,27 +510,32 @@ impl MarkdownStreamRenderer {
             let block_indent = self.code_block_indent.as_str();
             let code_text = line.strip_prefix(block_indent).unwrap_or(line);
             if code_text.is_empty() {
-                return format!(
-                    "{block_indent}{MONOKAI_BG}{MONOKAI_DIM}{} │\x1b[0m\n",
-                    line_num_str
-                );
+                if self.show_line_gutter {
+                    return format!(
+                        "{block_indent}{MONOKAI_BG}{MONOKAI_DIM}{} │\x1b[0m\n",
+                        line_num_str
+                    );
+                }
+                return format!("{block_indent}{MONOKAI_BG}\x1b[0m\n");
             }
             let wrapped = wrap_code_block_text(
                 code_text,
-                code_block_content_width(block_indent, &line_num_str),
+                code_block_content_width(block_indent, &line_num_str, self.show_line_gutter),
             );
             let mut out = String::new();
             for (idx, segment) in wrapped.iter().enumerate() {
-                let gutter = if idx == 0 {
-                    line_num_str.as_str()
-                } else {
-                    "   "
-                };
                 out.push_str(block_indent);
                 out.push_str(MONOKAI_BG);
-                out.push_str(MONOKAI_DIM);
-                out.push_str(gutter);
-                out.push_str(" │");
+                if self.show_line_gutter {
+                    let gutter = if idx == 0 {
+                        line_num_str.as_str()
+                    } else {
+                        "   "
+                    };
+                    out.push_str(MONOKAI_DIM);
+                    out.push_str(gutter);
+                    out.push_str(" │");
+                }
                 out.push_str(base);
                 out.push_str(&highlight_code_line(segment, self.code_block_lang.as_deref()));
                 out.push_str("\x1b[0m\n");
@@ -652,15 +668,30 @@ fn preview_terminal_width() -> usize {
     80
 }
 
-fn code_block_gutter_width(block_indent: &str, line_num_str: &str) -> usize {
-    unicode_width::UnicodeWidthStr::width(block_indent)
-        + unicode_width::UnicodeWidthStr::width(line_num_str)
-        + unicode_width::UnicodeWidthStr::width(" │")
+fn code_block_gutter_width(
+    block_indent: &str,
+    line_num_str: &str,
+    show_line_gutter: bool,
+) -> usize {
+    let mut width = unicode_width::UnicodeWidthStr::width(block_indent);
+    if show_line_gutter {
+        width += unicode_width::UnicodeWidthStr::width(line_num_str)
+            + unicode_width::UnicodeWidthStr::width(" │");
+    }
+    width
 }
 
-fn code_block_content_width(block_indent: &str, line_num_str: &str) -> usize {
+fn code_block_content_width(
+    block_indent: &str,
+    line_num_str: &str,
+    show_line_gutter: bool,
+) -> usize {
     preview_terminal_width()
-        .saturating_sub(code_block_gutter_width(block_indent, line_num_str))
+        .saturating_sub(code_block_gutter_width(
+            block_indent,
+            line_num_str,
+            show_line_gutter,
+        ))
         .max(1)
 }
 
@@ -691,13 +722,22 @@ fn wrap_code_block_text(text: &str, content_width: usize) -> Vec<String> {
     lines
 }
 
-fn code_block_preview_prefix(block_indent: &str, line_num_str: &str, dimmed: bool) -> String {
+fn code_block_preview_prefix(
+    block_indent: &str,
+    line_num_str: &str,
+    dimmed: bool,
+    show_line_gutter: bool,
+) -> String {
     let mut out = String::new();
     out.push_str(block_indent);
     out.push_str(MONOKAI_BG);
-    out.push_str(MONOKAI_DIM);
-    out.push_str(line_num_str);
-    out.push_str(" │\x1b[0m");
+    if show_line_gutter {
+        out.push_str(MONOKAI_DIM);
+        out.push_str(line_num_str);
+        out.push_str(" │\x1b[0m");
+    } else {
+        out.push_str("\x1b[0m");
+    }
     out.push_str(MONOKAI_BG);
     if dimmed {
         out.push_str("\x1b[2m");
@@ -705,8 +745,12 @@ fn code_block_preview_prefix(block_indent: &str, line_num_str: &str, dimmed: boo
     out
 }
 
-fn code_block_preview_continuation_prefix(block_indent: &str, dimmed: bool) -> String {
-    code_block_preview_prefix(block_indent, "   ", dimmed)
+fn code_block_preview_continuation_prefix(
+    block_indent: &str,
+    dimmed: bool,
+    show_line_gutter: bool,
+) -> String {
+    code_block_preview_prefix(block_indent, "   ", dimmed, show_line_gutter)
 }
 
 fn parse_heading(line: &str) -> Option<(usize, &str)> {
@@ -840,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn code_block_keeps_inner_indentation_after_gutter() {
+    fn code_block_keeps_inner_indentation_without_visible_gutter() {
         let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "40") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
@@ -848,7 +892,7 @@ mod tests {
         let out = renderer.consume_line("    let x = 1;", false);
 
         let visible = strip_ansi_for_test(&out);
-        assert!(visible.contains("│    let x = 1;"));
+        assert_eq!(visible, "    let x = 1;\n");
     }
 
     #[test]
@@ -860,7 +904,7 @@ mod tests {
         let out = renderer.consume_line("      let x = 1;", false);
 
         let visible = strip_ansi_for_test(&out);
-        assert!(visible.starts_with("    1 │    let x = 1;"));
+        assert_eq!(visible, "      let x = 1;\n");
     }
 
     #[test]
@@ -927,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn html_code_block_preview_height_accounts_for_code_gutter() {
+    fn html_code_block_preview_height_matches_plain_width_without_gutter() {
         let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "7") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
@@ -936,8 +980,8 @@ mod tests {
         renderer.write_chunk_for_test("<x>", false).unwrap();
 
         assert!(
-            renderer.line_preview_height() > live_preview_cursor_rows("<x>"),
-            "code-block preview height should include the rendered line-number gutter"
+            renderer.line_preview_height() == live_preview_cursor_rows("<x>"),
+            "code-block preview height should match the visible code width when gutter is hidden"
         );
     }
 
@@ -950,13 +994,10 @@ mod tests {
         let out = renderer.consume_line(r#"<div class="input-area"></div>"#, true);
 
         let visible = strip_ansi_for_test(&out);
-        assert!(visible.contains(r#"<div class="#), "{visible:?}");
-        assert!(visible.contains("input-area"), "{visible:?}");
-        assert!(visible.contains("</div>"), "{visible:?}");
-        assert!(
-            visible.lines().skip(1).any(|line| line.starts_with("    │")),
-            "{visible:?}"
-        );
+        let flattened = visible.replace('\n', "");
+        assert_eq!(flattened, r#"<div class="input-area"></div>"#);
+        assert!(visible.lines().count() > 1, "{visible:?}");
+        assert!(!visible.contains('│'), "{visible:?}");
     }
 
     #[test]
@@ -989,9 +1030,9 @@ mod tests {
     }
 
     #[test]
-    fn code_block_long_line_wraps_with_aligned_continuation_gutter() {
+    fn code_block_long_line_wraps_without_gutter_prefix() {
         let _guard = env_guard();
-        unsafe { std::env::set_var("COLUMNS", "12") };
+        unsafe { std::env::set_var("COLUMNS", "10") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         let _ = renderer.consume_line("```text", false);
 
@@ -1000,19 +1041,33 @@ mod tests {
         let lines = visible.lines().collect::<Vec<_>>();
 
         assert_eq!(lines.len(), 2);
-        assert!(lines[0].starts_with("  1 │"));
-        assert!(lines[1].starts_with("    │"));
+        assert_eq!(lines[0], "abcdefghij");
+        assert_eq!(lines[1], "kl");
     }
 
     #[test]
     fn code_block_streaming_preview_wraps_before_newline() {
         let _guard = env_guard();
-        unsafe { std::env::set_var("COLUMNS", "12") };
+        unsafe { std::env::set_var("COLUMNS", "10") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         let _ = renderer.consume_line("```text", false);
 
         renderer.write_chunk_for_test("abcdefghijkl", false).unwrap();
 
         assert_eq!(renderer.line_preview_height(), 2);
+    }
+
+    #[test]
+    fn optional_code_block_gutter_still_renders_line_numbers() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "40") };
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        renderer.set_show_line_gutter(true);
+        let _ = renderer.consume_line("```rust", false);
+
+        let out = renderer.consume_line("let x = 1;", false);
+        let visible = strip_ansi_for_test(&out);
+
+        assert!(visible.starts_with("  1 │let x = 1;"), "{visible:?}");
     }
 }

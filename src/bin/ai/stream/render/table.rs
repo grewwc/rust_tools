@@ -475,6 +475,7 @@ fn terminal_width() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::test_support::ENV_LOCK;
     use crate::ai::stream::render::inline::visible_width;
 
     #[test]
@@ -498,6 +499,8 @@ mod tests {
 
     #[test]
     fn table_preview_height_ignores_ansi_sequences() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::set_var("COLUMNS", "40") };
         let plain = "a".repeat(200);
         let colored = format!("\x1b[2m{plain}\x1b[0m");
         assert_eq!(table_preview_height(&colored), table_preview_height(&plain));

@@ -505,12 +505,7 @@ impl ExperienceGeneralizer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use crate::ai::test_support::ENV_LOCK;
 
     #[test]
     fn ingest_and_generalize() {
@@ -575,7 +570,7 @@ mod tests {
 
     #[test]
     fn cross_domain_link_is_not_repeated_after_reload() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let path = std::env::temp_dir().join(format!(
             "rt_generalization_reload_{}_{}.jsonl",
             std::process::id(),

@@ -38,11 +38,19 @@ pub struct ThinkingOrchestrator {
     pub protocol_injected: bool,
 }
 
+#[cfg(not(test))]
+fn default_goal_persistence_dir() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".config").join("rust_tools").join("thinking_goals"))
+}
+
+#[cfg(test)]
+fn default_goal_persistence_dir() -> Option<std::path::PathBuf> {
+    None
+}
+
 impl ThinkingOrchestrator {
     pub fn new() -> Self {
-        let persistence_dir = dirs::home_dir().map(|h| h.join(".config").join("rust_tools").join("thinking_goals"));
-        let goal_manager = GoalManager::new()
-            .with_persistence_dir_opt(persistence_dir);
+        let goal_manager = GoalManager::new().with_persistence_dir_opt(default_goal_persistence_dir());
         Self {
             thought_tree: None,
             verification: None,
@@ -545,8 +553,7 @@ impl TurnObserver for ThinkingOrchestrator {
             self.active_modes.clear();
             self.current_tree_node_id = None;
             self.generalizer = ExperienceGeneralizer::new();
-            self.goal_manager = GoalManager::new()
-                .with_persistence_dir_opt(dirs::home_dir().map(|h| h.join(".config").join("rust_tools").join("thinking_goals")));
+            self.goal_manager = GoalManager::new().with_persistence_dir_opt(default_goal_persistence_dir());
         }
     }
 

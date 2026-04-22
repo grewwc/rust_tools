@@ -312,15 +312,11 @@ mod tests {
         )
         .unwrap();
 
-        let saved_cwd = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-
         let args = serde_json::json!({
             "pattern": unique_marker,
-            "path": "."
+            "path": dir.to_string_lossy()
         });
         let result = execute_grep_search(&args);
-        std::env::set_current_dir(&saved_cwd).unwrap();
 
         assert!(result.is_ok(), "grep should not error, got: {:?}", result);
 
