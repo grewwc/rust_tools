@@ -3,6 +3,12 @@ use std::collections::HashMap;
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 
+const PERSIST_PREFIX_DOMAIN: &str = "[domain=";
+const PERSIST_PREFIX_ABSTRACTION: &str = "[abstraction=";
+const PERSIST_PREFIX_CONFIDENCE: &str = "[confidence=";
+const PERSIST_PREFIX_REINFORCED: &str = "[reinforced=";
+const PERSIST_SUFFIX_LINKS: &str = "\nCross-domain links: ";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralizedPrinciple {
     pub id: String,
@@ -57,20 +63,65 @@ impl ExperienceGeneralizer {
                 if entry.category != "generalized_principle" {
                     continue;
                 }
+                let (note_text, cross_domain_links) =
+                    if let Some(idx) = entry.note.find(PERSIST_SUFFIX_LINKS) {
+                        let links_part = entry.note[idx + PERSIST_SUFFIX_LINKS.len()..]
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        (&entry.note[..idx], links_part)
+                    } else {
+                        (entry.note.as_str(), Vec::new())
+                    };
+
+                let mut domain = entry.tags.iter()
+                    .find(|t| t.as_str() != "generalized" && t.as_str() != "principle")
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let mut abstraction_level = 1;
+                let mut confidence = 0.6;
+                let mut reinforcement_count = 1;
+
+                let principle_body = if let Some(rest) = note_text
+                    .strip_prefix(PERSIST_PREFIX_DOMAIN)
+                    .and_then(|s| s.split_once("] ["))
+                    .and_then(|(d, s1)| {
+                        s1.strip_prefix(PERSIST_PREFIX_ABSTRACTION)
+                            .and_then(|s| s.split_once("] ["))
+                            .map(|(a, s2)| (d, a, s2))
+                    })
+                    .and_then(|(d, a, s2)| {
+                        s2.strip_prefix(PERSIST_PREFIX_CONFIDENCE)
+                            .and_then(|s| s.split_once("] ["))
+                            .map(|(c, s3)| (d, a, c, s3))
+                    })
+                    .and_then(|(d, a, c, s3)| {
+                        s3.strip_prefix(PERSIST_PREFIX_REINFORCED)
+                            .and_then(|s| s.split_once("] "))
+                            .map(|(r, body)| (d, a, c, r, body))
+                    })
+                {
+                    domain = rest.0.to_string();
+                    abstraction_level = rest.1.parse().unwrap_or(1);
+                    confidence = rest.2.parse().unwrap_or(0.6);
+                    reinforcement_count = rest.3.parse().unwrap_or(1);
+                    rest.4.to_string()
+                } else {
+                    note_text.to_string()
+                };
+
                 let principle = GeneralizedPrinciple {
                     id: entry.id.unwrap_or_default(),
-                    principle: entry.note.clone(),
+                    principle: principle_body,
                     source_experiences: vec![],
-                    domain: entry.tags.iter()
-                        .find(|t| t.as_str() != "generalized" && t.as_str() != "principle")
-                        .cloned()
-                        .unwrap_or_else(|| "unknown".to_string()),
-                    abstraction_level: 1,
-                    confidence: 0.6,
+                    domain,
+                    abstraction_level,
+                    confidence,
                     created_at: entry.timestamp.clone(),
                     last_reinforced: entry.timestamp.clone(),
-                    reinforcement_count: 1,
-                    cross_domain_links: Vec::new(),
+                    reinforcement_count,
+                    cross_domain_links,
                 };
                 self.principles.push(principle);
             }
@@ -175,6 +226,9 @@ impl ExperienceGeneralizer {
         for i in 0..self.principles.len() {
             for j in (i + 1)..self.principles.len() {
                 if self.principles[i].domain == self.principles[j].domain {
+                    continue;
+                }
+                if self.principles[i].cross_domain_links.contains(&self.principles[j].id) {
                     continue;
                 }
                 let similarity = self.compute_text_similarity(
