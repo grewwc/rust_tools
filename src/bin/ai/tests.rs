@@ -239,7 +239,7 @@ fn history_compression_inserts_summary_and_keeps_recent() {
     append_history(&path, &blob).unwrap();
 
     let messages = build_message_arr(100, &path).unwrap();
-    let compressed = compress_messages_for_context(messages, 1200, 4, 200);
+    let compressed = compress_messages_for_context(messages, 1200, 4, 200, None);
 
     assert!(!compressed.is_empty());
     assert_eq!(compressed[0].role, crate::ai::history::ROLE_INTERNAL_NOTE);
@@ -248,6 +248,11 @@ fn history_compression_inserts_summary_and_keeps_recent() {
         .as_str()
         .unwrap_or_default()
         .contains("对话摘要"));
+    assert!(compressed[0]
+        .content
+        .as_str()
+        .unwrap_or_default()
+        .contains("初始目标: u0"));
     assert_eq!(
         compressed.last().unwrap().content,
         Value::String(format!("a9 {long}"))
@@ -259,6 +264,168 @@ fn history_compression_inserts_summary_and_keeps_recent() {
     assert!(total <= 1200);
 
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn history_compression_summarizes_when_keep_last_exceeds_turns_but_budget_overflows() {
+    // Reproduces the "agent forgets earlier questions after ~30 turns" bug:
+    // with a large `keep_last` (e.g. CLI default 256) but a much smaller
+    // `max_chars` budget, the older-segment summary path was never taken,
+    // and early user turns got silently dropped from the head of the list.
+    // The new shrink path must inject a summary note so at least a textual
+    // trace of the earliest user turns survives.
+    let path =
+        std::env::temp_dir().join(format!("ai-history-long-{}.sqlite", uuid::Uuid::new_v4()));
+    let long = "y".repeat(260);
+    let mut blob = String::new();
+    for i in 0..30usize {
+        blob.push_str(&format!(
+            "user{COLON}QUESTION_{i:02} {long}{NEWLINE}"
+        ));
+        blob.push_str(&format!("assistant{COLON}ANSWER_{i:02} {long}{NEWLINE}"));
+    }
+    append_history(&path, &blob).unwrap();
+
+    let messages = build_message_arr(300, &path).unwrap();
+    // keep_last=256 models the CLI default `--history 256`; max_chars=4000
+    // is far smaller than the raw history size (30 turns * ~560 bytes ~= 17k).
+    let compressed = compress_messages_for_context(messages, 4000, 256, 600, None);
+
+    assert!(!compressed.is_empty());
+    assert_eq!(
+        compressed[0].role,
+        crate::ai::history::ROLE_INTERNAL_NOTE,
+        "expected a synthesized summary at the head; got {:?}",
+        compressed[0].role
+    );
+    let note_text = compressed[0]
+        .content
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        note_text.contains("对话摘要"),
+        "summary header missing: {note_text:?}"
+    );
+    assert!(
+        note_text.contains("初始目标: QUESTION_00"),
+        "summary should preserve the initial goal, got: {note_text:?}"
+    );
+    // The summary should at least preserve a non-trivial textual trace of
+    // the dropped region (instead of silently losing it). The exact content
+    // depends on heuristic topic extraction; we only assert the summary body
+    // has some characters beyond the header.
+    let body_len = note_text
+        .trim_start_matches("对话摘要（自动压缩，以下为早期对话要点）：")
+        .trim()
+        .chars()
+        .count();
+    assert!(
+        body_len >= 10,
+        "summary body is essentially empty: {note_text:?}"
+    );
+
+    let total = compressed
+        .iter()
+        .map(|m| m.content.as_str().map(|s| s.len()).unwrap_or(0))
+        .sum::<usize>();
+    assert!(
+        total <= 4000,
+        "compressed payload must respect the byte budget, got {total}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context() {
+    let path = std::env::temp_dir().join(format!(
+        "ai-overflow-test-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-overflow-dir-{}", uuid::Uuid::new_v4()));
+
+    let long = "z".repeat(300);
+    let mut blob = String::new();
+    for i in 0..20usize {
+        blob.push_str(&format!("user{COLON}Q{i:02} {long}{NEWLINE}"));
+        blob.push_str(&format!("assistant{COLON}A{i:02} {long}{NEWLINE}"));
+    }
+    append_history(&path, &blob).unwrap();
+
+    let messages = build_message_arr(100, &path).unwrap();
+    let compressed =
+        compress_messages_for_context(messages, 2000, 256, 400, Some(overflow_dir.clone()));
+
+    let first_msg = compressed.first().expect("should have messages");
+    assert_eq!(
+        first_msg.role, crate::ai::history::ROLE_INTERNAL_NOTE,
+        "first message should be an internal note with compressed long-term memory"
+    );
+    let memory_text = first_msg.content.as_str().unwrap_or_default();
+    assert!(
+        memory_text.contains("长期记忆摘要"),
+        "first note should expose compressed memory, got: {memory_text:?}"
+    );
+    assert!(
+        memory_text.contains("Q00"),
+        "compressed memory should still expose the initial goal, got: {memory_text:?}"
+    );
+    let archive_text = compressed
+        .iter()
+        .find_map(|m| {
+            let text = m.content.as_str().unwrap_or_default();
+            text.contains("原始归档文件").then_some(text)
+        })
+        .expect("should include an explicit archive note");
+    assert!(
+        archive_text.contains("read_file_lines"),
+        "archive note should give an explicit file-read action, got: {archive_text:?}"
+    );
+
+    let overflow_file = overflow_dir.join("overflow-history.md");
+    assert!(
+        overflow_file.exists(),
+        "overflow file should have been created at {:?}",
+        overflow_file
+    );
+    let overflow_content = std::fs::read_to_string(&overflow_file).unwrap();
+    assert!(
+        overflow_content.contains("Q00"),
+        "overflow file should contain the earliest user question Q00, got first 200 chars: {:?}",
+        &overflow_content[..overflow_content.len().min(200)]
+    );
+    assert!(
+        overflow_content.contains("溢出对话历史"),
+        "overflow file should have the header"
+    );
+
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+#[test]
+fn session_delete_cleans_up_overflow_history_file() {
+    let session_id = format!("test-{}", uuid::Uuid::new_v4());
+    let history_file = std::env::temp_dir().join(format!("ai-session-cleanup-{}.sqlite", uuid::Uuid::new_v4()));
+    let store = SessionStore::new(&history_file);
+    store.ensure_root_dir().unwrap();
+
+    let db = store.session_history_file(&session_id);
+    let assets = store.session_assets_dir(&session_id);
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(assets.join("overflow-history.md"), "# test overflow content").unwrap();
+    std::fs::write(&db, b"test").unwrap();
+
+    assert!(assets.join("overflow-history.md").exists());
+
+    store.delete_session(&session_id).unwrap();
+
+    assert!(!assets.exists(), "assets dir (including overflow file) should be deleted");
+    assert!(!db.exists(), "sqlite file should be deleted");
+
+    let _ = std::fs::remove_dir_all(store.session_assets_dir("__cleanup__"));
 }
 
 fn structured_history_messages() -> Vec<Message> {
@@ -428,7 +595,7 @@ fn context_history_summarizes_beyond_history_count_instead_of_dropping() {
         .unwrap();
     }
 
-    let context = build_context_history(32, &path, 6000, 32, 2000).unwrap();
+    let context = build_context_history(32, &path, 6000, 32, 2000, None).unwrap();
 
     assert!(!context.is_empty());
     assert_eq!(context.first().unwrap().role, crate::ai::history::ROLE_INTERNAL_NOTE);
@@ -490,7 +657,7 @@ fn context_history_keep_last_counts_user_turns_not_raw_messages() {
         .unwrap();
     }
 
-    let context = build_context_history(2, &path, 100_000, 2, 2_000).unwrap();
+    let context = build_context_history(2, &path, 100_000, 2, 2_000, None).unwrap();
 
     let user_questions = context
         .iter()
@@ -559,7 +726,7 @@ fn context_history_summary_keeps_tool_names_and_results() {
         .unwrap();
     }
 
-    let context = build_context_history(2, &path, 1_800, 2, 1_000).unwrap();
+    let context = build_context_history(2, &path, 1_800, 2, 1_000, None).unwrap();
     let summary = context
         .first()
         .and_then(|m| m.content.as_str())
@@ -582,7 +749,7 @@ fn context_history_cache_invalidates_after_history_changes() {
     )
     .unwrap();
 
-    let first = build_context_history(8, &path, 10_000, 8, 2_000).unwrap();
+    let first = build_context_history(8, &path, 10_000, 8, 2_000, None).unwrap();
     assert_eq!(first.len(), 2);
 
     std::thread::sleep(std::time::Duration::from_millis(2));
@@ -592,7 +759,7 @@ fn context_history_cache_invalidates_after_history_changes() {
     )
     .unwrap();
 
-    let second = build_context_history(8, &path, 10_000, 8, 2_000).unwrap();
+    let second = build_context_history(8, &path, 10_000, 8, 2_000, None).unwrap();
     assert_eq!(second.len(), 4);
     assert_eq!(second.last().unwrap().content, serde_json::Value::String("two".to_string()));
 
@@ -671,7 +838,7 @@ fn sqlite_context_fastpath_keeps_existing_history_summary() {
     ];
     append_history_messages(&path, &messages).unwrap();
 
-    let context = build_context_history(2, &path, 10_000, 2, 2_000).unwrap();
+    let context = build_context_history(2, &path, 10_000, 2, 2_000, None).unwrap();
     assert_eq!(context[0].role, crate::ai::history::ROLE_INTERNAL_NOTE);
     assert!(context[0]
         .content

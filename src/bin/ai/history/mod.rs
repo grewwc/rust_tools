@@ -66,6 +66,7 @@ pub(in crate::ai) fn build_context_history(
     history_max_chars: usize,
     history_keep_last: usize,
     history_summary_max_chars: usize,
+    overflow_dir: Option<PathBuf>,
 ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
     let cache_key = context_history_cache_key(
         history_file,
@@ -86,14 +87,13 @@ pub(in crate::ai) fn build_context_history(
             history_max_chars,
             history_keep_last,
             history_summary_max_chars,
+            overflow_dir.as_deref(),
         )?
     {
         store_cached_context_history(cache_key, fast.clone());
         return Ok(fast);
     }
 
-    // Load full session history first, then apply context-size compression.
-    // This avoids dropping old turns before compression has a chance to summarize them.
     let history = build_message_arr(usize::MAX, history_file)?;
     let out = if history_max_chars == 0 {
         if history_count >= history.len() {
@@ -112,6 +112,7 @@ pub(in crate::ai) fn build_context_history(
             history_max_chars,
             keep_last,
             history_summary_max_chars,
+            overflow_dir,
         )
     };
     store_cached_context_history(cache_key, out.clone());
@@ -124,6 +125,7 @@ fn try_build_context_history_sqlite_fastpath(
     history_max_chars: usize,
     history_keep_last: usize,
     history_summary_max_chars: usize,
+    overflow_dir: Option<&std::path::Path>,
 ) -> Result<Option<Vec<Message>>, Box<dyn std::error::Error>> {
     let keep_last = if history_count == 0 {
         history_keep_last
@@ -140,6 +142,7 @@ fn try_build_context_history_sqlite_fastpath(
             history_max_chars,
             keep_last,
             history_summary_max_chars,
+            overflow_dir.map(|p| p.to_path_buf()),
         )));
     }
 
@@ -160,6 +163,7 @@ fn try_build_context_history_sqlite_fastpath(
         history_max_chars,
         keep_last,
         history_summary_max_chars,
+        overflow_dir.map(|p| p.to_path_buf()),
     )))
 }
 

@@ -205,15 +205,41 @@ impl MarkdownStreamRenderer {
         out: &mut dyn Write,
         ch: char,
     ) -> io::Result<()> {
-        let block_indent = self.code_block_indent.as_str();
+        let block_indent = self.code_block_indent.clone();
         let line_num_str = format!("{:>3}", self.code_line_number + 1);
         let available_width =
-            code_block_content_width(block_indent, &line_num_str, self.show_line_gutter).max(1);
+            code_block_content_width(&block_indent, &line_num_str, self.show_line_gutter).max(1);
+
+        // Keep the realtime emit path aligned with `code_block_preview_height`
+        // (which strips `block_indent`) and with `render_line_no_table` (which
+        // also strips `block_indent` before wrapping). If the character just
+        // pushed into `line_buf` still belongs to the outer block_indent
+        // prefix, we must not emit it nor count it towards the segment width
+        // — the prefix is already produced by `code_block_preview_prefix`.
+        if !block_indent.is_empty()
+            && self.line_buf.len() <= block_indent.len()
+            && block_indent.starts_with(self.line_buf.as_str())
+        {
+            if !self.line_preview_emitted {
+                out.write_all(
+                    code_block_preview_prefix(
+                        &block_indent,
+                        &line_num_str,
+                        self.dimmed,
+                        self.show_line_gutter,
+                    )
+                    .as_bytes(),
+                )?;
+                out.flush()?;
+            }
+            return Ok(());
+        }
+
         let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
 
         if !self.line_preview_emitted {
             out.write_all(
-                code_block_preview_prefix(block_indent, &line_num_str, self.dimmed, self.show_line_gutter)
+                code_block_preview_prefix(&block_indent, &line_num_str, self.dimmed, self.show_line_gutter)
                     .as_bytes(),
             )?;
         } else if self.code_preview_segment_width > 0
@@ -221,7 +247,7 @@ impl MarkdownStreamRenderer {
         {
             out.write_all(b"\x1b[0m\n")?;
             out.write_all(
-                code_block_preview_continuation_prefix(block_indent, self.dimmed, self.show_line_gutter).as_bytes(),
+                code_block_preview_continuation_prefix(&block_indent, self.dimmed, self.show_line_gutter).as_bytes(),
             )?;
             self.code_preview_segment_width = 0;
         }
@@ -1069,5 +1095,49 @@ mod tests {
         let visible = strip_ansi_for_test(&out);
 
         assert!(visible.starts_with("  1 │let x = 1;"), "{visible:?}");
+    }
+
+    #[test]
+    fn nested_code_block_streaming_preview_does_not_double_emit_block_indent() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "40") };
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let _ = renderer.consume_line("  ```rust", false);
+
+        let streamed = renderer
+            .write_chunk_for_test("      if len", false)
+            .unwrap();
+        let visible = strip_ansi_for_test(&streamed);
+
+        assert!(
+            visible.starts_with("      if len"),
+            "streamed preview should render the source line verbatim once, got {visible:?}"
+        );
+        assert!(
+            !visible.starts_with("            "),
+            "block_indent must not be emitted twice during realtime preview, got {visible:?}"
+        );
+        assert_eq!(renderer.line_preview_height(), 1);
+    }
+
+    #[test]
+    fn nested_code_block_preview_height_matches_final_render_height() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "14") };
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let _ = renderer.consume_line("  ```rust", false);
+
+        renderer
+            .write_chunk_for_test("      if len_is_long", false)
+            .unwrap();
+        let streamed_height = renderer.line_preview_height();
+
+        let final_out = renderer.consume_line("      if len_is_long", true);
+        let move_up = format!("\x1b[{streamed_height}A\r\x1b[0J");
+        assert!(
+            final_out.contains(&move_up),
+            "final rewrite must move the cursor up by exactly the streamed preview height \
+             ({streamed_height}); got {final_out:?}"
+        );
     }
 }

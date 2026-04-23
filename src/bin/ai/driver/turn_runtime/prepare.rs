@@ -75,12 +75,18 @@ pub(super) async fn prepare_turn(
     next_model: &str,
     precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
 ) -> Result<TurnPreparation, Box<dyn std::error::Error>> {
+    let overflow_dir = {
+        use crate::ai::history::SessionStore;
+        let store = SessionStore::new(app.config.history_file.as_path());
+        Some(store.session_assets_dir(&app.session_id))
+    };
     let history = build_context_history(
         history_count,
         &app.session_history_file,
         app.config.history_max_chars,
         app.config.history_keep_last,
         app.config.history_summary_max_chars,
+        overflow_dir,
     )?;
     let mut skill_turn = {
         let mc = mcp_client.lock().unwrap();

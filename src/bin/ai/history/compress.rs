@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use serde_json::Value;
 
 use crate::ai::{request, types::App};
@@ -8,12 +10,100 @@ use super::types::{
 
 const PERSISTED_HISTORY_KEEP_RECENT_TURNS: usize = 160;
 const PERSISTED_HISTORY_SUMMARY_MAX_CHARS: usize = 8_000;
+const OVERFLOW_HISTORY_FILENAME: &str = "overflow-history.md";
+
+struct OverflowSink {
+    path: PathBuf,
+    buffer: String,
+}
+
+impl OverflowSink {
+    fn new(overflow_dir: &Path) -> Self {
+        let path = overflow_dir.join(OVERFLOW_HISTORY_FILENAME);
+        Self {
+            path,
+            buffer: String::new(),
+        }
+    }
+
+    fn push_messages(&mut self, messages: &[Message]) {
+        if messages.is_empty() {
+            return;
+        }
+        if self.buffer.is_empty() {
+            self.buffer.push_str(
+                "# 溢出对话历史\n\n以下内容因超出上下文窗口而被移出，模型可使用 read_file 工具读取此文件回顾。\n\n---\n\n",
+            );
+        }
+        for msg in messages {
+            let text = value_to_string(&msg.content);
+            match msg.role.as_str() {
+                "user" => {
+                    self.buffer.push_str("## 用户\n\n");
+                    self.buffer.push_str(&text);
+                    self.buffer.push_str("\n\n");
+                }
+                "assistant" => {
+                    self.buffer.push_str("## 助手\n\n");
+                    self.buffer.push_str(&text);
+                    self.buffer.push_str("\n\n");
+                }
+                "tool" => {
+                    self.buffer.push_str("### 工具结果\n\n");
+                    self.buffer.push_str(&text);
+                    self.buffer.push_str("\n\n");
+                }
+                _ => {
+                    self.buffer.push_str("### ");
+                    self.buffer.push_str(&msg.role);
+                    self.buffer.push_str("\n\n");
+                    self.buffer.push_str(&text);
+                    self.buffer.push_str("\n\n");
+                }
+            }
+        }
+    }
+
+    fn flush(&mut self) -> bool {
+        if self.buffer.is_empty() {
+            return false;
+        }
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        use std::io::Write;
+        std::fs::File::create(&self.path)
+            .and_then(|mut f| {
+                f.write_all(self.buffer.as_bytes())?;
+                f.sync_data()
+            })
+            .is_ok()
+    }
+
+    fn file_path(&self) -> &Path {
+        &self.path
+    }
+}
+
+fn build_overflow_placeholder(file_path: &str) -> String {
+    let mut out = String::new();
+    out.push_str("长期记忆归档：更早的原始对话未丢失。\n");
+    out.push_str("原始归档文件: ");
+    out.push_str(file_path);
+    out.push('\n');
+    out.push_str("先执行工具: read_file_lines\n参数: file_path=\"");
+    out.push_str(file_path);
+    out.push_str("\", offset=1, limit=200)\n");
+    out.push_str("若当前问题依赖前文细节、最初目标、之前决定、旧报错或更早工具输出，请先读该文件；未读完时继续增大 offset 分段读取。\n");
+    out
+}
 
 pub(in crate::ai) fn compress_messages_for_context(
     messages: Vec<Message>,
     max_chars: usize,
     keep_last: usize,
     summary_max_chars: usize,
+    overflow_dir: Option<PathBuf>,
 ) -> Vec<Message> {
     if max_chars == 0 || messages.is_empty() {
         return messages;
@@ -21,13 +111,13 @@ pub(in crate::ai) fn compress_messages_for_context(
 
     let keep_last = keep_last.min(messages.len());
     if keep_last == 0 {
-        return shrink_messages_to_fit(messages, max_chars);
+        return shrink_messages_to_fit_with_summary(messages, max_chars, summary_max_chars, overflow_dir.as_deref());
     }
 
     let split_at = retained_turn_start(&messages, keep_last);
     let (older, recent) = messages.split_at(split_at);
     if older.is_empty() {
-        return shrink_messages_to_fit(recent.to_vec(), max_chars);
+        return shrink_messages_to_fit_with_summary(recent.to_vec(), max_chars, summary_max_chars, overflow_dir.as_deref());
     }
 
     let mut out = Vec::new();
@@ -45,7 +135,7 @@ pub(in crate::ai) fn compress_messages_for_context(
         }
     }
     out.extend_from_slice(recent);
-    shrink_messages_to_fit(out, max_chars)
+    shrink_messages_to_fit_with_summary(out, max_chars, summary_max_chars, overflow_dir.as_deref())
 }
 
 pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Message> {
@@ -148,6 +238,177 @@ fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<M
     }
 
     messages
+}
+
+/// Same as [`shrink_messages_to_fit`] but, before dropping early messages
+/// outright, captures them into (or merges them with) a leading
+/// `internal_note` summary so that long conversations still retain a
+/// semantic memory of earlier user questions.
+fn shrink_messages_to_fit_with_summary(
+    mut messages: Vec<Message>,
+    max_chars: usize,
+    summary_max_chars: usize,
+    overflow_dir: Option<&Path>,
+) -> Vec<Message> {
+    if max_chars == 0 {
+        return messages;
+    }
+    if messages.is_empty() {
+        return Vec::new();
+    }
+
+    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES);
+    redact_images_except_last(&mut messages, 1);
+    dedup_adjacent(&mut messages);
+
+    if messages_total_chars(&messages) <= max_chars {
+        return messages;
+    }
+
+    let had_leading_summary = messages.first().map(is_summary_message).unwrap_or(false);
+    let mut dropped: Vec<Message> = Vec::new();
+
+    while messages_total_chars(&messages) > max_chars {
+        if let Some(group) = first_tool_call_group(&messages) {
+            let mut removed_group = Vec::with_capacity(group.len());
+            for idx in group.into_iter().rev() {
+                removed_group.push(messages.remove(idx));
+            }
+            removed_group.reverse();
+            dropped.extend(removed_group);
+            continue;
+        }
+        if let Some(idx) = first_trim_candidate(&messages) {
+            dropped.push(messages.remove(idx));
+            continue;
+        }
+        break;
+    }
+
+    let dropped_has_user_turn = dropped.iter().any(|m| m.role == "user");
+    let has_leading_summary_now = messages.first().map(is_summary_message).unwrap_or(false);
+
+    if !dropped.is_empty() {
+        if let Some(dir) = overflow_dir {
+            let mut sink = OverflowSink::new(dir);
+            sink.push_messages(&dropped);
+
+            if sink.flush() {
+                let file_path_str = sink.file_path().to_string_lossy().to_string();
+                let summary_body = if dropped_has_user_turn
+                    && !has_leading_summary_now
+                    && !had_leading_summary
+                    && summary_max_chars > 0
+                {
+                    let header_bytes = "对话摘要（自动压缩，以下为早期对话要点）：\n".len();
+                    let used = messages_total_chars(&messages);
+                    let body_byte_budget = max_chars.saturating_sub(used).saturating_sub(header_bytes);
+                    let body_budget = (body_byte_budget / 3).min(summary_max_chars);
+                    if body_budget >= 40 {
+                        let text = build_persisted_summary_text(&dropped, body_budget);
+                        if !text.trim().is_empty() {
+                            Some(text)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let archive_note = build_overflow_placeholder(&file_path_str);
+                let fallback_goal = dropped
+                    .iter()
+                    .find(|message| message.role == "user")
+                    .map(|message| summarize_text(&normalize_whitespace(&value_to_string(&message.content)), 160));
+                let memory_note = summary_body
+                    .as_ref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|summary| format!("长期记忆摘要（压缩保留）:\n{summary}"))
+                    .or_else(|| {
+                        fallback_goal
+                            .as_ref()
+                            .filter(|goal| !goal.trim().is_empty())
+                            .map(|goal| format!("长期记忆摘要（压缩保留）:\n初始目标: {goal}"))
+                    })
+                    .unwrap_or_else(|| {
+                        "长期记忆摘要（压缩保留）:\n较早原始对话已移出当前窗口；如果当前问题依赖前文细节，请读取归档文件。".to_string()
+                    });
+
+                if has_leading_summary_now {
+                    let archive_idx = messages.len().min(1);
+                    messages.insert(
+                        archive_idx,
+                        Message {
+                            role: ROLE_INTERNAL_NOTE.to_string(),
+                            content: Value::String(archive_note),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        },
+                    );
+                } else {
+                    messages.insert(
+                        0,
+                        Message {
+                            role: ROLE_INTERNAL_NOTE.to_string(),
+                            content: Value::String(memory_note),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        },
+                    );
+                    let archive_idx = messages.len().min(1);
+                    messages.insert(
+                        archive_idx,
+                        Message {
+                            role: ROLE_INTERNAL_NOTE.to_string(),
+                            content: Value::String(archive_note),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        },
+                    );
+                }
+            }
+        } else if dropped_has_user_turn
+            && !has_leading_summary_now
+            && !had_leading_summary
+            && summary_max_chars > 0
+        {
+            let header_prefix = "对话摘要（自动压缩，以下为早期对话要点）：\n";
+            let header_bytes = header_prefix.len();
+            let used = messages_total_chars(&messages);
+            let body_byte_budget = max_chars.saturating_sub(used).saturating_sub(header_bytes);
+            let body_budget = (body_byte_budget / 3).min(summary_max_chars);
+            if body_budget >= 40 {
+                let summary_text = build_persisted_summary_text(&dropped, body_budget);
+                if !summary_text.trim().is_empty() {
+                    let note = Message {
+                        role: ROLE_INTERNAL_NOTE.to_string(),
+                        content: Value::String(format!("{header_prefix}{summary_text}")),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    };
+                    messages.insert(0, note);
+                }
+            }
+        }
+    }
+
+    if messages_total_chars(&messages) > max_chars {
+        truncate_first_message_to_fit(&mut messages, max_chars);
+    }
+
+    messages
+}
+
+#[allow(dead_code)]
+fn take_leading_summary(messages: &mut Vec<Message>) -> Option<Message> {
+    if messages.first().map(is_summary_message).unwrap_or(false) {
+        Some(messages.remove(0))
+    } else {
+        None
+    }
 }
 
 fn truncate_first_message_to_fit(messages: &mut [Message], max_chars: usize) {
@@ -783,6 +1044,7 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
         }
     }
 
+    let mut initial_goal = String::new();
     let mut pre_summary_lines: Vec<String> = Vec::new();
     let mut turns: Vec<TurnSummary> = Vec::new();
     let mut current = TurnSummary::default();
@@ -809,6 +1071,9 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
             }
             "user" => {
                 finalize_turn(&mut turns, &mut current);
+                if initial_goal.is_empty() {
+                    initial_goal = summarize_text(&text, 240);
+                }
                 current.user = summarize_text(&text, 200);
                 current.user_key = truncate_to_chars(&normalize_semantic_key(&text), 160);
                 if let Some((k, label)) = extract_topic_from_text(&text) {
@@ -894,6 +1159,11 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
     };
     let body_budget = max_chars.saturating_sub(reserved_tool_chars).max(max_chars / 2);
     let mut lines: Vec<String> = Vec::new();
+    if !initial_goal.is_empty()
+        && !push_line_with_budget(&mut lines, format!("初始目标: {initial_goal}"), body_budget)
+    {
+        return summarize_text(&lines.join("\n"), max_chars);
+    }
     for s in pre_summary_lines.into_iter().take(3) {
         if !push_line_with_budget(&mut lines, s, body_budget) {
             return summarize_text(&lines.join("\n"), max_chars);
