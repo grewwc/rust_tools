@@ -155,6 +155,6 @@ fn base_no_ext(path: &str) -> String {
 fn read_stdin_all() -> String {
     use std::io::Read;
     let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf).ok();
+    std::io::stdin().read_to_string(&mut buf).unwrap_or_default();
     buf
 }

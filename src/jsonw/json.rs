@@ -21,6 +21,14 @@ impl Json {
         Ok(Self { value })
     }
 
+    pub fn from_bytes(
+        data: &[u8],
+        options: ParseOptions,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let s = String::from_utf8_lossy(data);
+        Ok(Self::from_str(&s, options)?)
+    }
+
     pub fn from_reader<R: Read>(
         mut reader: R,
         options: ParseOptions,
@@ -30,21 +38,12 @@ impl Json {
         Ok(Self::from_str(&s, options)?)
     }
 
-    pub fn from_bytes(
-        data: &[u8],
-        options: ParseOptions,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let s = String::from_utf8_lossy(data);
-        Ok(Self::from_str(&s, options)?)
-    }
-
     pub fn from_file<P: AsRef<Path>>(
         path: P,
         options: ParseOptions,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let s = fs::read_to_string(path)?;
-        let j = Self::from_str(&s, options)?;
-        Ok(j)
+        Ok(Self::from_str(&s, options)?)
     }
 
     pub fn from_clipboard(options: ParseOptions) -> Result<Self, serde_json::Error> {
@@ -222,12 +221,9 @@ impl Json {
             let mut out = Vec::new();
             let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
             let mut ser = serde_json::Serializer::with_formatter(&mut out, formatter);
-            if self.value.serialize(&mut ser).is_err() {
-                return String::new();
-            }
-            String::from_utf8_lossy(&out).to_string()
+            self.value.serialize(&mut ser).ok();
+            String::from_utf8_lossy(&out).into_owned()
         };
-
         let s = s
             .replace(r"\u0026", "&")
             .replace(r"\u003c", "<")

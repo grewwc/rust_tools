@@ -6,11 +6,12 @@ pub fn sanitize_json_input(s: &str, options: ParseOptions) -> String {
         out = strip_comments(&out);
     }
     if options.remove_special_chars {
+        // 移除控制字符，但保留换行和制表符
+        // 使用 chars() 而不是 bytes() 来正确处理 UTF-8 编码的多字节中文字符
         out = out
-            .bytes()
-            .filter(|b| *b > 31)
-            .map(|b| b as char)
-            .collect::<String>();
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n' || *c == '\r' || *c == '\t')
+            .collect();
     }
     out
 }
