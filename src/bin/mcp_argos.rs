@@ -108,12 +108,20 @@ fn call_argos_tool(
     }
 }
 
+fn region_to_env(region: &str) -> &'static str {
+    match region.to_lowercase().as_str() {
+        r if r.starts_with("i18n") || r.starts_with("sg") || r.starts_with("va") => "i18n",
+        r if r.starts_with("boe") => "boe",
+        _ => "cn",
+    }
+}
+
 fn tools_list() -> serde_json::Value {
     json!({
         "tools": [
             {
                 "name": "logid_search",
-                "description": "Search Argos logs by logid or requestId. Use this tool when: (1) user mentions a logid (format: 2026042311592019214102C61110FEDFF8 or 021742526761243fdbddc0100180041234054b2cb00000360e83e), (2) user wants to check/troubleshoot server logs, (3) user asks about request errors, traces, or service issues, (4) user mentions requestId. This tool queries the Argos log platform via the argos CLI and returns log entries with links.",
+                "description": "Search Argos logs by logid or requestId. Proactively use this tool when the user mentions one or more Argos logids/requestIds, asks to inspect server logs, analyze request failures, troubleshoot errors, inspect request paths, compare two Argos logids, analyze differences between multiple logids, or asks what happened for a specific request. If the user asks to compare multiple logids, call this tool once for each logid and then compare the returned results. Logid examples: 2026042311592019214102C61110FEDFF8 or 021742526761243fdbddc0100180041234054b2cb00000360e83e.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -146,7 +154,7 @@ fn tools_list() -> serde_json::Value {
             },
             {
                 "name": "logid_prune",
-                "description": "Query Argos logs by logid (compatible with Argos Skill tool format). Same as logid_search but uses the logid_prune tool name for compatibility with existing Argos Skill workflows. Use when the agent or skill explicitly calls logid_prune.",
+                "description": "Query Argos logs by logid (compatible with Argos Skill tool format). Same capability as logid_search, but keeps the historical logid_prune name for compatibility with existing Argos Skill workflows. Also use it for multi-logid comparison by calling it separately for each logid and then comparing the returned results.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -194,11 +202,7 @@ fn handle_tool_call(name: &str, args: &serde_json::Value) -> Result<serde_json::
                 .and_then(|v| v.as_str())
                 .unwrap_or("China-North");
 
-            let env = match region_arg.to_lowercase().as_str() {
-                r if r.starts_with("i18n") || r.starts_with("sg") || r.starts_with("va") => "i18n",
-                r if r.starts_with("boe") => "boe",
-                _ => "cn",
-            };
+            let env = region_to_env(region_arg);
 
             let mut input = json!({
                 "log_id": log_id,
