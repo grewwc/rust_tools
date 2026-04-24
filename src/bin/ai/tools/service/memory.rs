@@ -740,7 +740,7 @@ mod tests {
         execute_memory_delete, execute_memory_list_json, execute_memory_save, execute_memory_update,
         is_memory_visible_to,
     };
-    use crate::ai::kernel::{KernelInternal, Syscall};
+    use crate::ai::os::kernel::{KernelInternal, Syscall};
     use crate::ai::test_support::ENV_LOCK;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
     use chrono::Local;

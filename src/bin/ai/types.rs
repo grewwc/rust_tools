@@ -90,7 +90,7 @@ pub(super) struct App {
     pub(super) prompt_editor: Option<PromptEditor>,
     pub(super) agent_context: Option<AgentContext>,
     pub(super) last_skill_bias: Option<SkillBiasMemory>,
-    pub(super) os: crate::ai::kernel::SharedKernel,
+    pub(super) os: crate::ai::os::kernel::SharedKernel,
     pub(super) agent_reload_counter: Option<usize>,
     pub(super) observers: Vec<Box<dyn crate::ai::driver::observer::TurnObserver>>,
 }

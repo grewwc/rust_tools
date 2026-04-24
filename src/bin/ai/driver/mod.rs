@@ -52,7 +52,6 @@ pub mod intent_model;
 pub mod intent_recognition;
 pub mod mcp_init;
 pub mod model;
-pub mod os;
 pub mod observer;
 pub mod params;
 pub mod print;
@@ -74,8 +73,8 @@ pub use skill_matching::*;
 pub use skill_ranking::*;
 pub use text_similarity::*;
 
-pub(crate) fn new_local_kernel() -> crate::ai::kernel::SharedKernel {
-    crate::ai::kernel::new_shared_kernel(os::LocalOS::new())
+pub(crate) fn new_local_kernel() -> crate::ai::os::kernel::SharedKernel {
+    crate::ai::os::kernel::new_shared_kernel(crate::ai::os::local::LocalOS::new())
 }
 
 /// Default max LLM iterations allowed per turn (prevents infinite loops)
@@ -464,7 +463,7 @@ async fn run_loop(
         let mut history_count = usize::MAX;
         let mut question = String::new();
 
-        let background_procs: Vec<crate::ai::kernel::Process> = {
+        let background_procs: Vec<crate::ai::os::kernel::Process> = {
             let mut os = app.os.lock().unwrap();
             os.pop_all_ready(4)
         };
@@ -535,7 +534,7 @@ async fn run_loop(
                 let task_skills = skill_manifests.to_vec();
                 let next_model = app.current_model.clone();
 
-                join_set.spawn(crate::ai::kernel::TASK_PID.scope(Some(pid), async move {
+                join_set.spawn(crate::ai::os::kernel::TASK_PID.scope(Some(pid), async move {
                     crate::ai::tools::registry::common::clear_tool_cancel();
                     let result = turn_runtime::run_turn(
                         &mut task_app,
@@ -581,9 +580,9 @@ async fn run_loop(
                                 }
                                 if matches!(
                                     p.state,
-                                    crate::ai::kernel::ProcessState::Waiting { .. }
-                                        | crate::ai::kernel::ProcessState::Sleeping { .. }
-                                        | crate::ai::kernel::ProcessState::Stopped
+                                    crate::ai::os::kernel::ProcessState::Waiting { .. }
+                                        | crate::ai::os::kernel::ProcessState::Sleeping { .. }
+                                        | crate::ai::os::kernel::ProcessState::Stopped
                                 ) {
                                     should_terminate = false;
                                 }
@@ -693,7 +692,7 @@ async fn run_loop(
             os.current_process_id()
         };
 
-        let turn_outcome = crate::ai::kernel::TASK_PID
+        let turn_outcome = crate::ai::os::kernel::TASK_PID
             .scope(
                 fg_pid,
                 turn_runtime::run_turn(
@@ -729,9 +728,9 @@ async fn run_loop(
 
                         if matches!(
                             proc.state,
-                            crate::ai::kernel::ProcessState::Waiting { .. }
-                                | crate::ai::kernel::ProcessState::Sleeping { .. }
-                                | crate::ai::kernel::ProcessState::Stopped
+                            crate::ai::os::kernel::ProcessState::Waiting { .. }
+                                | crate::ai::os::kernel::ProcessState::Sleeping { .. }
+                                | crate::ai::os::kernel::ProcessState::Stopped
                         ) {
                             should_terminate = false;
                         }

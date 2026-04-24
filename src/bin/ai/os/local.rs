@@ -29,7 +29,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use rust_tools::commonw::{FastMap, FastSet};
 
-use crate::ai::kernel::{
+use super::kernel::{
     EventId, Kernel, KernelInternal, Process, ProcessCapabilities, ProcessState, ShmReadError,
     Signal, Syscall, WaitPolicy, WaitReason, DEFAULT_MAILBOX_CAPACITY,
 };
@@ -602,7 +602,7 @@ impl Syscall for LocalOS {
     }
 
     fn current_process_id(&self) -> Option<u64> {
-        crate::ai::kernel::TASK_PID
+        super::kernel::TASK_PID
             .try_with(|v| *v)
             .unwrap_or(None)
             .or(self.current_pid)
@@ -1307,7 +1307,7 @@ impl Kernel for LocalOS {}
 #[cfg(test)]
 mod tests {
     use super::{LocalOS, ShmReadError};
-    use crate::ai::kernel::{
+    use crate::ai::os::kernel::{
         EventId, KernelInternal, ProcessCapabilities, ProcessState, Signal, Syscall, WaitPolicy,
         WaitReason,
     };

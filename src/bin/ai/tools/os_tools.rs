@@ -2,7 +2,7 @@ use serde_json::Value;
 use std::sync::LazyLock;
 use crate::ai::tools::registry::common::{ToolRegistration, ToolSpec};
 use std::sync::Mutex;
-use crate::ai::kernel::{ProcessCapabilities, SharedKernel};
+use crate::ai::os::kernel::{ProcessCapabilities, SharedKernel};
 use rust_tools::commonw::FastSet;
 
 pub static GLOBAL_OS: LazyLock<Mutex<Option<SharedKernel>>> = LazyLock::new(|| Mutex::new(None));
@@ -432,12 +432,12 @@ fn execute_ps_processes(_args: &Value) -> Result<String, String> {
                 let ppid = p.parent_pid.map(|id| id.to_string()).unwrap_or("-".to_string());
                 let pgid = p.process_group.map(|id| id.to_string()).unwrap_or("-".to_string());
                 let state = match &p.state {
-                    crate::ai::kernel::ProcessState::Ready => "Ready",
-                    crate::ai::kernel::ProcessState::Running => "Running",
-                    crate::ai::kernel::ProcessState::Waiting { .. } => "Waiting",
-                    crate::ai::kernel::ProcessState::Sleeping { .. } => "Sleeping",
-                    crate::ai::kernel::ProcessState::Stopped => "Stopped",
-                    crate::ai::kernel::ProcessState::Terminated => "Term",
+                    crate::ai::os::kernel::ProcessState::Ready => "Ready",
+                    crate::ai::os::kernel::ProcessState::Running => "Running",
+                    crate::ai::os::kernel::ProcessState::Waiting { .. } => "Waiting",
+                    crate::ai::os::kernel::ProcessState::Sleeping { .. } => "Sleeping",
+                    crate::ai::os::kernel::ProcessState::Stopped => "Stopped",
+                    crate::ai::os::kernel::ProcessState::Terminated => "Term",
                 };
                 let daemon = if p.is_daemon { format!("{}({}/{})", "Y", p.restart_count, p.max_restarts) } else { "N".to_string() };
                 lines.push(format!("{:<5} {:<6} {:<5} {:<12} {:<4} {:<6} {:<5} {:<6} {:<6} {:<8} {}", 
@@ -482,10 +482,10 @@ fn execute_signal_process(args: &Value) -> Result<String, String> {
     let pid = args["pid"].as_u64().ok_or("Missing or invalid 'pid' parameter.")?;
     let signal_str = args["signal"].as_str().ok_or("Missing 'signal' parameter.")?;
     let signal = match signal_str.to_uppercase().as_str() {
-        "SIGTERM" => crate::ai::kernel::Signal::SigTerm,
-        "SIGSTOP" => crate::ai::kernel::Signal::SigStop,
-        "SIGCONT" => crate::ai::kernel::Signal::SigCont,
-        "SIGKILL" => crate::ai::kernel::Signal::SigKill,
+        "SIGTERM" => crate::ai::os::kernel::Signal::SigTerm,
+        "SIGSTOP" => crate::ai::os::kernel::Signal::SigStop,
+        "SIGCONT" => crate::ai::os::kernel::Signal::SigCont,
+        "SIGKILL" => crate::ai::os::kernel::Signal::SigKill,
         other => return Err(format!("Unknown signal: {}. Valid signals: SIGTERM, SIGSTOP, SIGCONT, SIGKILL", other)),
     };
 
@@ -566,10 +566,10 @@ fn execute_signal_process_group(args: &Value) -> Result<String, String> {
     let pgid = args["pgid"].as_u64().ok_or("Missing 'pgid'.")?;
     let signal_str = args["signal"].as_str().ok_or("Missing 'signal'.")?;
     let signal = match signal_str.to_uppercase().as_str() {
-        "SIGTERM" => crate::ai::kernel::Signal::SigTerm,
-        "SIGSTOP" => crate::ai::kernel::Signal::SigStop,
-        "SIGCONT" => crate::ai::kernel::Signal::SigCont,
-        "SIGKILL" => crate::ai::kernel::Signal::SigKill,
+        "SIGTERM" => crate::ai::os::kernel::Signal::SigTerm,
+        "SIGSTOP" => crate::ai::os::kernel::Signal::SigStop,
+        "SIGCONT" => crate::ai::os::kernel::Signal::SigCont,
+        "SIGKILL" => crate::ai::os::kernel::Signal::SigKill,
         other => return Err(format!("Unknown signal: {}", other)),
     };
     if let Ok(guard) = GLOBAL_OS.lock() {
@@ -647,16 +647,16 @@ fn execute_shm_read(args: &Value) -> Result<String, String> {
             let os = os.lock().unwrap();
             match os.shm_read(key) {
                 Ok(value) => Ok(value),
-                Err(crate::ai::kernel::ShmReadError::NotFound) => {
+                Err(crate::ai::os::kernel::ShmReadError::NotFound) => {
                     Err(format!("Shared memory key '{}' not found.", key))
                 }
-                Err(crate::ai::kernel::ShmReadError::PermissionDenied { owner_pid }) => {
+                Err(crate::ai::os::kernel::ShmReadError::PermissionDenied { owner_pid }) => {
                     Err(format!(
                         "Permission denied: cannot read shared memory key '{}' (owner: {}).",
                         key, owner_pid
                     ))
                 }
-                Err(crate::ai::kernel::ShmReadError::Corrupted { expected_checksum, actual_checksum }) => {
+                Err(crate::ai::os::kernel::ShmReadError::Corrupted { expected_checksum, actual_checksum }) => {
                     match os.shm_read_degraded(key) {
                         Some(degraded) => Ok(degraded),
                         None => Err(format!(
@@ -665,7 +665,7 @@ fn execute_shm_read(args: &Value) -> Result<String, String> {
                         )),
                     }
                 }
-                Err(crate::ai::kernel::ShmReadError::OwnerTerminated { owner_pid }) => {
+                Err(crate::ai::os::kernel::ShmReadError::OwnerTerminated { owner_pid }) => {
                     match os.shm_read_degraded(key) {
                         Some(degraded) => Ok(degraded),
                         None => Err(format!(

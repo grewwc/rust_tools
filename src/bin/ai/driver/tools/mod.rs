@@ -11,7 +11,7 @@ use crate::ai::tools::os_tools::GLOBAL_OS;
 use rust_tools::commonw::FastMap;
 
 use crate::ai::{
-    kernel::{EventId, WaitPolicy},
+    os::kernel::{EventId, WaitPolicy},
     mcp::{McpClient, SharedMcpClient},
     tools as builtin_tools,
     types::{ToolCall, ToolResult},
