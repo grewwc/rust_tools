@@ -99,11 +99,7 @@ static TOOL_INDEX: LazyLock<FastMap<&'static str, &'static ToolSpec>> = LazyLock
     index
 });
 
-/// Returns tool definitions for all registered tools that belong
-/// to at least one of the specified groups.
-pub(crate) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition> {
-    let mut tools: Box<SkipMap<String, ToolDefinition>> =
-        SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
+fn expanded_tool_groups<'a>(groups: &'a [&'a str]) -> Vec<&'a str> {
     let mut expanded_groups: Vec<&str> = groups.to_vec();
     if groups.contains(&"executor") && !expanded_groups.contains(&"openclaw") {
         expanded_groups.push("openclaw");
@@ -111,6 +107,15 @@ pub(crate) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition
     if groups.contains(&"openclaw") && !expanded_groups.contains(&"executor") {
         expanded_groups.push("executor");
     }
+    expanded_groups
+}
+
+/// Returns tool definitions for all registered tools that belong
+/// to at least one of the specified groups.
+pub(crate) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition> {
+    let mut tools: Box<SkipMap<String, ToolDefinition>> =
+        SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
+    let expanded_groups = expanded_tool_groups(groups);
 
     for reg in inventory::iter::<ToolRegistration> {
         if !reg
@@ -132,6 +137,26 @@ pub(crate) fn tool_definitions_for_groups(groups: &[&str]) -> Vec<ToolDefinition
         tools.insert(tool_def.function.name.clone(), tool_def);
     }
     tools.into_iter().map(|(_, v)| v).collect()
+}
+
+pub(crate) fn tool_summaries_for_groups(groups: &[&str]) -> Vec<(String, String)> {
+    let mut tools: Box<SkipMap<String, String>> =
+        SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
+    let expanded_groups = expanded_tool_groups(groups);
+
+    for reg in inventory::iter::<ToolRegistration> {
+        if !reg
+            .spec
+            .groups
+            .iter()
+            .any(|g| expanded_groups.iter().any(|x| x == g))
+        {
+            continue;
+        }
+        tools.insert(reg.spec.name.to_string(), reg.spec.description.to_string());
+    }
+
+    tools.into_iter().collect()
 }
 
 pub(crate) fn get_tool_definitions_by_names(names: &[String]) -> Vec<ToolDefinition> {

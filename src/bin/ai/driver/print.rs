@@ -225,19 +225,27 @@ fn truncate_terminal_detail(s: &str, max_chars: usize) -> String {
     format!("{kept}…")
 }
 
-pub fn print_builtin_tools(app: &App) {
+pub fn print_builtin_tool_summaries(tools: &[(String, String)]) {
     println!("{}", format_section_header("builtin tools", None));
+    for (name, description) in tools {
+        if name.starts_with("mcp_") {
+            continue;
+        }
+        println!("{}", format_section_item(name, description));
+    }
+}
+
+pub fn print_builtin_tools(app: &App) {
     let tools = app
         .agent_context
         .as_ref()
         .map(|c| c.tools.clone())
         .unwrap_or_default();
-    for t in tools {
-        if t.function.name.starts_with("mcp_") {
-            continue;
-        }
-        println!("{}", format_section_item(&t.function.name, &t.function.description));
-    }
+    let summaries = tools
+        .into_iter()
+        .map(|tool| (tool.function.name, tool.function.description))
+        .collect::<Vec<_>>();
+    print_builtin_tool_summaries(&summaries);
 }
 
 pub fn print_skills(skill_manifests: &[SkillManifest]) {

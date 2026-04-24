@@ -250,6 +250,24 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if cli.list_tools {
+        let tool_summaries = super::tools::tool_summaries_for_groups(&["core"]);
+        print::print_builtin_tool_summaries(&tool_summaries);
+        return Ok(());
+    }
+
+    if cli.list_skills {
+        let skill_manifests = load_skill_manifests(cli.no_skills);
+        print::print_skills(&skill_manifests);
+        return Ok(());
+    }
+
+    if cli.list_agents {
+        let agent_manifests = agents::load_all_agents();
+        commands::help::print_agents_list(&agent_manifests);
+        return Ok(());
+    }
+
     if let Err(err) = session_store.ensure_root_dir() {
         eprintln!("[Warning] Failed to create sessions dir: {}", err);
     }
@@ -307,7 +325,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         writer,
         prompt_editor,
         agent_context: Some(AgentContext {
-            tools: super::tools::tool_definitions_for_groups(&["core"]),
+            tools: Vec::new(),
             mcp_servers: rust_tools::commonw::FastMap::default(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
         }),
@@ -318,22 +336,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         };
 
     let mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
-    let skill_manifests = load_skill_manifests(app.cli.no_skills);
-
-    if app.cli.list_tools {
-        print::print_builtin_tools(&app);
-        return Ok(());
-    }
-    if app.cli.list_skills {
-        print::print_skills(&skill_manifests);
-        return Ok(());
-    }
-
-    let mut agent_manifests = agents::load_all_agents();
-    if app.cli.list_agents {
-        commands::help::print_agents_list(&agent_manifests);
-        return Ok(());
-    }
 
     let mcp_probe = probe_mcp_config(&app);
     let printed_mcp_loading = mcp_probe.exists && !app.cli.list_mcp_tools;
@@ -359,6 +361,31 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    if mcp_report.loaded {
+        let header = print::format_section_header(
+            "mcp",
+            Some(&format!(
+                "{} servers, {} tools",
+                mcp_report.server_count, mcp_report.tool_count
+            )),
+        );
+        if printed_mcp_loading {
+            print!("\r\x1b[2K{}\n", header);
+        } else {
+            println!("{header}");
+        }
+    }
+
+    if let Some(ctx) = app.agent_context.as_mut() {
+        let mcp_tools = std::mem::take(&mut ctx.tools);
+        let mut tools = super::tools::tool_definitions_for_groups(&["core"]);
+        tools.extend(mcp_tools);
+        ctx.tools = tools;
+    }
+
+    let skill_manifests = load_skill_manifests(app.cli.no_skills);
+    let mut agent_manifests = agents::load_all_agents();
+
     if let Some(default_agent) = agents::find_agent_by_name(&agent_manifests, &app.current_agent)
         && default_agent.is_primary()
         && !default_agent.disabled
@@ -382,20 +409,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    if mcp_report.loaded {
-        let header = print::format_section_header(
-            "mcp",
-            Some(&format!(
-                "{} servers, {} tools",
-                mcp_report.server_count, mcp_report.tool_count
-            )),
-        );
-        if printed_mcp_loading {
-            print!("\r\x1b[2K{}\n", header);
-        } else {
-            println!("{header}");
-        }
-    }
     run_loop(
         &mut app,
         &mcp_client,
