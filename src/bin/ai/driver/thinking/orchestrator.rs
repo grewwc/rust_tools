@@ -303,7 +303,7 @@ impl ThinkingOrchestrator {
                      Next actionable sub-goals: {}\n\
                      Focus on completing the next sub-goal before moving on.",
                     status,
-                    if next_actions.is_empty() { "none yet - decompose first" } else { &next_actions.join(", ") }
+                    if next_actions.is_empty() { "none yet - decompose first".to_string() } else { next_actions.join(", ") }
                 ));
             }
         }

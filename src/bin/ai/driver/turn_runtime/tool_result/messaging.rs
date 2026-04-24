@@ -1,6 +1,5 @@
 use rust_tools::cw::{SkipMap, SkipSet};
 use serde_json::Value;
-use std::collections::{BTreeSet};
 
 use crate::ai::{
     code_discovery_policy::{

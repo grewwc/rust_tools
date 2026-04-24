@@ -571,8 +571,8 @@ async fn run_loop(
             return Ok(());
         }
 
-        let mut history_count = usize::MAX;
-        let mut question = String::new();
+        let history_count;
+        let mut question;
 
         let background_procs: Vec<crate::ai::os::kernel::Process> = {
             let mut os = app.os.lock().unwrap();
