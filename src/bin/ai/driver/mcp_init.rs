@@ -8,6 +8,7 @@ use std::path::Path;
 use crate::ai::mcp::{McpClient, connection::McpServerConnection};
 use crate::ai::types::{App, McpServerConfig, McpTool, McpResource, McpPrompt};
 use std::process::{Command, Stdio};
+use rust_tools::commonw::FastMap;
 
 const FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS: u64 = 20_000;
 
@@ -27,6 +28,12 @@ pub struct McpInitReport {
     pub resource_count: usize,
     pub prompt_count: usize,
     pub failures: Vec<String>,
+}
+
+pub struct PreparedMcpInit {
+    pub report: McpInitReport,
+    pub loaded_servers: FastMap<String, McpServerConfig>,
+    pub client: McpClient,
 }
 
 pub fn probe_mcp_config(app: &App) -> McpConfigProbe {
@@ -91,8 +98,13 @@ pub async fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitRepor
     let mcp_path = crate::commonw::utils::expanduser(&mcp_path);
     let mcp_path = mcp_path.as_ref();
 
+    let prepared = prepare_mcp_initialization_from_path(mcp_path.to_string()).await;
+    apply_prepared_mcp_init(app, mcp_client, prepared)
+}
+
+pub async fn prepare_mcp_initialization_from_path(config_path: String) -> PreparedMcpInit {
     let mut report = McpInitReport {
-        config_path: mcp_path.to_string(),
+        config_path: config_path.clone(),
         loaded: false,
         server_count: 0,
         tool_count: 0,
@@ -100,23 +112,31 @@ pub async fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitRepor
         prompt_count: 0,
         failures: Vec::new(),
     };
-    if let Err(err) = fs::metadata(mcp_path) {
+
+    if let Err(err) = fs::metadata(&config_path) {
         if err.kind() != io::ErrorKind::NotFound {
-            eprintln!("[mcp] failed to access config file {}: {}", mcp_path, err);
+            eprintln!("[mcp] failed to access config file {}: {}", config_path, err);
         }
-        return report;
+        return PreparedMcpInit {
+            report,
+            loaded_servers: FastMap::default(),
+            client: McpClient::new(),
+        };
     }
 
-    let servers = match super::super::mcp::load_mcp_config_from_file(mcp_path) {
+    let servers = match super::super::mcp::load_mcp_config_from_file(&config_path) {
         Ok(s) => s,
         Err(err) => {
-            eprintln!("[mcp] failed to load config from {}: {}", mcp_path, err);
-            return report;
+            eprintln!("[mcp] failed to load config from {}: {}", config_path, err);
+            return PreparedMcpInit {
+                report,
+                loaded_servers: FastMap::default(),
+                client: McpClient::new(),
+            };
         }
     };
 
     let mut loaded_servers = servers;
-
     for (name, server_cfg) in &mut loaded_servers {
         if is_feishu_mcp_server(name, &server_cfg.command)
             && server_cfg.request_timeout_ms < FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS
@@ -129,7 +149,6 @@ pub async fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitRepor
         }
     }
 
-    // 异步并行连接所有 MCP 服务器
     let server_futures: Vec<_> = loaded_servers
         .iter()
         .map(|(name, cfg)| {
@@ -139,14 +158,14 @@ pub async fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitRepor
         })
         .collect();
 
-    // 使用 futures_util 而不是 futures
     use futures_util::future::join_all;
     let results = join_all(server_futures).await;
 
+    let mut client = McpClient::new();
     for (name, result) in results {
         match result {
             Ok(conn) => {
-                mcp_client.servers.insert(name.clone(), std::sync::Mutex::new(conn));
+                client.servers.insert(name.clone(), std::sync::Mutex::new(conn));
             }
             Err(err) => {
                 eprintln!("[mcp] failed to connect to server {}: {}", name, err);
@@ -155,22 +174,38 @@ pub async fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitRepor
         }
     }
 
-    // 统一重建缓存
-    mcp_client.rebuild_metadata_cache();
+    client.rebuild_metadata_cache();
+    report.loaded = true;
+    report.server_count = loaded_servers.len();
+    report.tool_count = client.get_all_tools().len();
+    report.resource_count = client.get_all_resources().len();
+    report.prompt_count = client.get_all_prompts().len();
+
+    PreparedMcpInit {
+        report,
+        loaded_servers,
+        client,
+    }
+}
+
+pub fn apply_prepared_mcp_init(
+    app: &mut App,
+    mcp_client: &mut McpClient,
+    prepared: PreparedMcpInit,
+) -> McpInitReport {
+    let PreparedMcpInit {
+        report,
+        loaded_servers,
+        client,
+    } = prepared;
+
+    *mcp_client = client;
 
     if let Some(ctx) = app.agent_context.as_mut() {
         ctx.mcp_servers = loaded_servers;
         ctx.tools.extend(mcp_client.get_all_tools());
     }
-    report.loaded = true;
-    report.server_count = app
-        .agent_context
-        .as_ref()
-        .map(|c| c.mcp_servers.len())
-        .unwrap_or(0);
-    report.tool_count = mcp_client.get_all_tools().len();
-    report.resource_count = mcp_client.get_all_resources().len();
-    report.prompt_count = mcp_client.get_all_prompts().len();
+
     report
 }
 

@@ -50,7 +50,7 @@ impl PromptEditor {
 
     pub(super) fn read_multi_line(&mut self) -> io::Result<Option<String>> {
         use std::io::IsTerminal;
-        if !io::stdout().is_terminal() {
+        if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
             return self.read_multi_line_no_tty();
         }
         self.read_multi_line_tui()

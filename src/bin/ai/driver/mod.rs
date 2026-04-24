@@ -218,6 +218,116 @@ fn reload_agent_manifests(agent_manifests: &mut Vec<AgentManifest>) {
     }
 }
 
+fn ensure_runtime_manifests_loaded(
+    app: &mut App,
+    skill_manifests: &mut Vec<SkillManifest>,
+    agent_manifests: &mut Vec<AgentManifest>,
+    manifests_loaded: &mut bool,
+) {
+    if *manifests_loaded {
+        return;
+    }
+
+    *skill_manifests = load_skill_manifests(app.cli.no_skills);
+    *agent_manifests = agents::load_all_agents();
+
+    if let Some(default_agent) = agents::find_agent_by_name(agent_manifests, &app.current_agent)
+        && default_agent.is_primary()
+        && !default_agent.disabled
+    {
+        activate_primary_agent(app, default_agent);
+    }
+
+    if let Some(agent_name) = &app.cli.agent {
+        if let Some(agent) = agents::find_agent_by_name(agent_manifests, agent_name) {
+            if agent.is_primary() && !agent.disabled {
+                activate_primary_agent(app, agent);
+                println!("[agent] using: {}", agent.name);
+            } else {
+                eprintln!(
+                    "[Warning] Agent '{}' is not available, using default",
+                    agent_name
+                );
+            }
+        } else {
+            eprintln!("[Warning] Agent '{}' not found, using default", agent_name);
+        }
+    }
+
+    *manifests_loaded = true;
+}
+
+fn apply_prepared_mcp_with_shared_client(
+    app: &mut App,
+    mcp_client: &SharedMcpClient,
+    prepared: PreparedMcpInit,
+) -> McpInitReport {
+    let mut guard = mcp_client.lock().unwrap_or_else(|err| err.into_inner());
+    apply_prepared_mcp_init(app, &mut guard, prepared)
+}
+
+fn announce_mcp_loading_if_needed(
+    mcp_probe: &McpConfigProbe,
+    mcp_initialized: bool,
+    mcp_loading_announced: &mut bool,
+) {
+    if *mcp_loading_announced || mcp_initialized || !mcp_probe.exists {
+        return;
+    }
+    print!(
+        "{}",
+        print::format_section_header(
+            "mcp",
+            Some(&format!("{} configured servers · loading...", mcp_probe.server_count))
+        )
+    );
+    std::io::stdout().flush().ok();
+    *mcp_loading_announced = true;
+}
+
+async fn try_finalize_mcp_preload(
+    app: &mut App,
+    mcp_client: &SharedMcpClient,
+    mcp_probe: &McpConfigProbe,
+    mcp_initialized: &mut bool,
+    mcp_loading_announced: &mut bool,
+    mcp_preload_task: &mut Option<tokio::task::JoinHandle<PreparedMcpInit>>,
+) {
+    if *mcp_initialized || !mcp_probe.exists {
+        return;
+    }
+
+    let Some(task) = mcp_preload_task.as_ref() else {
+        return;
+    };
+    if !task.is_finished() {
+        return;
+    }
+
+    let task = mcp_preload_task.take().unwrap();
+    let report = match task.await {
+        Ok(prepared) => apply_prepared_mcp_with_shared_client(app, mcp_client, prepared),
+        Err(err) => {
+            eprintln!("[mcp] background preload task failed: {}", err);
+            let fallback = prepare_mcp_initialization_from_path(mcp_probe.config_path.clone()).await;
+            apply_prepared_mcp_with_shared_client(app, mcp_client, fallback)
+        }
+    };
+
+    *mcp_initialized = true;
+    if report.loaded {
+        let header = print::format_section_header(
+            "mcp",
+            Some(&format!("{} servers, {} tools", report.server_count, report.tool_count)),
+        );
+        if *mcp_loading_announced {
+            print!("\r\x1b[2K{}\n", header);
+        } else {
+            println!("{header}");
+        }
+    }
+}
+
 /// Main entry point for AIOS.
 /// Initializes all components and starts the run_loop.
 /// 
@@ -233,8 +343,6 @@ fn reload_agent_manifests(agent_manifests: &mut Vec<AgentManifest>) {
 ///   9. Load and activate agents
 ///   10. Enter run_loop
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    use std::io::Write as _;
-
     let cli = cli::parse_cli_args(std::env::args());
     let config = config::load_config()?;
     let session_store = SessionStore::new(config.history_file.as_path());
@@ -338,81 +446,28 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
 
     let mcp_probe = probe_mcp_config(&app);
-    let printed_mcp_loading = mcp_probe.exists && !app.cli.list_mcp_tools;
-    if printed_mcp_loading {
-        print!(
-            "{}",
-            print::format_section_header(
-                "mcp",
-                Some(&format!("{} configured servers · loading...", mcp_probe.server_count))
-            )
-        );
-        std::io::stdout().flush().ok();
-    }
-
-    let mcp_report = init_mcp(
-        &mut app,
-        &mut mcp_client.lock().unwrap_or_else(|err| err.into_inner()),
-    )
-    .await;
-
     if app.cli.list_mcp_tools {
+        let mcp_report = init_mcp(
+            &mut app,
+            &mut mcp_client.lock().unwrap_or_else(|err| err.into_inner()),
+        )
+        .await;
         print::print_mcp_tools(&mcp_report, &mcp_client.lock().unwrap());
         return Ok(());
     }
 
-    if mcp_report.loaded {
-        let header = print::format_section_header(
-            "mcp",
-            Some(&format!(
-                "{} servers, {} tools",
-                mcp_report.server_count, mcp_report.tool_count
-            )),
-        );
-        if printed_mcp_loading {
-            print!("\r\x1b[2K{}\n", header);
-        } else {
-            println!("{header}");
-        }
-    }
-
     if let Some(ctx) = app.agent_context.as_mut() {
-        let mcp_tools = std::mem::take(&mut ctx.tools);
-        let mut tools = super::tools::tool_definitions_for_groups(&["core"]);
-        tools.extend(mcp_tools);
-        ctx.tools = tools;
+        ctx.tools = super::tools::tool_definitions_for_groups(&["core"]);
     }
 
-    let skill_manifests = load_skill_manifests(app.cli.no_skills);
-    let mut agent_manifests = agents::load_all_agents();
-
-    if let Some(default_agent) = agents::find_agent_by_name(&agent_manifests, &app.current_agent)
-        && default_agent.is_primary()
-        && !default_agent.disabled
-    {
-        activate_primary_agent(&mut app, default_agent);
-    }
-
-    if let Some(agent_name) = &app.cli.agent {
-        if let Some(agent) = agents::find_agent_by_name(&agent_manifests, agent_name) {
-            if agent.is_primary() && !agent.disabled {
-                activate_primary_agent(&mut app, agent);
-                println!("[agent] using: {}", agent.name);
-            } else {
-                eprintln!(
-                    "[Warning] Agent '{}' is not available, using default",
-                    agent_name
-                );
-            }
-        } else {
-            eprintln!("[Warning] Agent '{}' not found, using default", agent_name);
-        }
-    }
+    let mut skill_manifests = Vec::new();
+    let mut agent_manifests = Vec::new();
 
     run_loop(
         &mut app,
         &mcp_client,
-        &skill_manifests,
+        mcp_probe,
+        &mut skill_manifests,
         &mut agent_manifests,
     )
     .await
@@ -452,11 +507,23 @@ fn process_history_path(base: &Path, pid: u64) -> PathBuf {
 async fn run_loop(
     app: &mut App,
     mcp_client: &SharedMcpClient,
-    skill_manifests: &[SkillManifest],
+    mcp_probe: McpConfigProbe,
+    skill_manifests: &mut Vec<SkillManifest>,
     agent_manifests: &mut Vec<AgentManifest>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let one_shot_mode = !app.cli.args.is_empty();
     let mut should_quit = one_shot_mode;
+    let mut mcp_initialized = false;
+    let mut mcp_loading_announced = false;
+    let mut manifests_loaded = false;
+    let mut mcp_preload_task = if mcp_probe.exists {
+        let config_path = mcp_probe.config_path.clone();
+        Some(tokio::spawn(async move {
+            prepare_mcp_initialization_from_path(config_path).await
+        }))
+    } else {
+        None
+    };
 
     let cleanup_one_shot = |app: &App| {
         if one_shot_mode {
@@ -482,7 +549,7 @@ async fn run_loop(
 
         if let Some(counter) = app.agent_reload_counter.as_mut() {
             *counter += 1;
-            if *counter % 5 == 0 {
+            if manifests_loaded && *counter % 5 == 0 {
                 reload_agent_manifests(agent_manifests);
             }
         } else {
@@ -503,6 +570,13 @@ async fn run_loop(
         };
 
         if !background_procs.is_empty() {
+            ensure_runtime_manifests_loaded(
+                app,
+                skill_manifests,
+                agent_manifests,
+                &mut manifests_loaded,
+            );
+
             use colored::Colorize;
             for proc in &background_procs {
                 println!(
@@ -570,7 +644,7 @@ async fn run_loop(
                 task_app.session_history_file = history_path;
                 task_app.cancel_stream.store(false, Ordering::Relaxed);
                 let task_mcp = mcp_client.clone();
-                let task_skills = skill_manifests.to_vec();
+                let task_skills = skill_manifests.clone();
                 let task_os = app.os.clone();
                 if let Some(agent_name) = &agent_override
                     && let Some(agent) = agents::find_agent_by_name(agent_manifests, agent_name)
@@ -667,6 +741,15 @@ async fn run_loop(
             history_count = ctx.history_count;
         }
 
+        announce_mcp_loading_if_needed(&mcp_probe, mcp_initialized, &mut mcp_loading_announced);
+
+        ensure_runtime_manifests_loaded(
+            app,
+            skill_manifests,
+            agent_manifests,
+            &mut manifests_loaded,
+        );
+
         if try_handle_interactive_command(app, mcp_client, &question, agent_manifests)? {
             if handle_post_command(app, &mut should_quit) {
                 return Ok(());
@@ -674,6 +757,19 @@ async fn run_loop(
             continue;
         }
         maybe_auto_route_agent(app, &*agent_manifests, &question);
+
+        announce_mcp_loading_if_needed(&mcp_probe, mcp_initialized, &mut mcp_loading_announced);
+
+        try_finalize_mcp_preload(
+            app,
+            mcp_client,
+            &mcp_probe,
+            &mut mcp_initialized,
+            &mut mcp_loading_announced,
+            &mut mcp_preload_task,
+        )
+        .await;
+
         let precomputed_ocr = if !app.attached_image_files.is_empty()
             && !crate::ai::models::is_vl_model(&app.current_model)
         {
@@ -730,7 +826,7 @@ async fn run_loop(
                 turn_runtime::run_turn(
                     app,
                     mcp_client,
-                    skill_manifests,
+                    &*skill_manifests,
                     history_count,
                     question,
                     next_model,
