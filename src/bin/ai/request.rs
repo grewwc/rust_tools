@@ -1225,6 +1225,22 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
         }
     }
 
+    fn sanitize_tool_call_for_request(
+        tool_call: &crate::ai::types::ToolCall,
+    ) -> Option<crate::ai::types::ToolCall> {
+        let raw_args = tool_call.function.arguments.trim();
+        let normalized_arguments = if raw_args.is_empty() {
+            "{}".to_string()
+        } else {
+            serde_json::from_str::<Value>(raw_args).ok()?;
+            raw_args.to_string()
+        };
+
+        let mut sanitized = tool_call.clone();
+        sanitized.function.arguments = normalized_arguments;
+        Some(sanitized)
+    }
+
     fn sanitize_tool_message_sequence(messages: Vec<Message>) -> Vec<Message> {
         let mut out = Vec::with_capacity(messages.len());
         let mut idx = 0usize;
@@ -1242,13 +1258,31 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
                 continue;
             };
 
-            let expected_ids = tool_calls
+            let sanitized_tool_calls = tool_calls
+                .iter()
+                .filter_map(sanitize_tool_call_for_request)
+                .collect::<Vec<_>>();
+            let mut scan = idx + 1;
+
+            if sanitized_tool_calls.is_empty() {
+                while scan < messages.len() && messages[scan].role == "tool" {
+                    scan += 1;
+                }
+                let mut assistant_only = message.clone();
+                assistant_only.tool_calls = None;
+                if !content_is_effectively_empty(&assistant_only.content) {
+                    out.push(assistant_only);
+                }
+                idx = scan.max(idx + 1);
+                continue;
+            }
+
+            let expected_ids = sanitized_tool_calls
                 .iter()
                 .map(|tool_call| tool_call.id.as_str())
                 .collect::<Vec<_>>();
             let mut matched_ids = Vec::new();
             let mut matched_tool_messages = Vec::new();
-            let mut scan = idx + 1;
 
             while scan < messages.len() && messages[scan].role == "tool" {
                 let tool_message = &messages[scan];
@@ -1274,7 +1308,7 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
 
             let mut assistant_with_matched_calls = message.clone();
             assistant_with_matched_calls.tool_calls = Some(
-                tool_calls
+                sanitized_tool_calls
                     .iter()
                     .filter(|tool_call| matched_ids.iter().any(|id| id == &tool_call.id))
                     .cloned()
@@ -1856,6 +1890,57 @@ mod tests {
         );
         assert_eq!(normalized[3].role, "tool");
         assert_eq!(normalized[3].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn normalize_messages_drops_malformed_tool_calls_even_with_matching_tool_results() {
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: Value::String("base system".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String("question".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                tool_calls: Some(vec![crate::ai::types::ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: crate::ai::types::FunctionCall {
+                        name: "execute_command".to_string(),
+                        arguments: "{\"command\":".to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Value::String("Error: failed to parse arguments".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String("later answer".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+
+        let normalized = normalize_messages_for_request(&messages);
+
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[2].role, "assistant");
+        assert_eq!(normalized[2].content.as_str(), Some("later answer"));
+        assert!(normalized.iter().all(|message| message.role != "tool"));
+        assert!(normalized.iter().all(|message| message.tool_calls.is_none()));
     }
 
 

@@ -136,13 +136,7 @@ impl MemoryStore {
         })
     }
 
-    pub(crate) fn search(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<(AgentMemoryEntry, f64)>, String> {
-        let query_lc = query.to_lowercase();
-        let mut docs: Vec<(AgentMemoryEntry, String, Vec<String>)> = Vec::new();
+    fn memory_files_to_scan(&self) -> Result<Vec<PathBuf>, String> {
         let cfg = configw::get_all_config();
         let search_archives = cfg
             .get_opt("ai.memory.search_archives.enable")
@@ -177,16 +171,66 @@ impl MemoryStore {
                     let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                     archives.push((entry.path(), modified));
                 }
-                archives.sort_by_key(|(_, m)| *m);
+                archives.sort_by_key(|(_, modified)| *modified);
                 let take_from = archives.len().saturating_sub(keep_last_archives);
-                for (p, _) in archives.into_iter().skip(take_from) {
-                    files.push(p);
+                for (path, _) in archives.into_iter().skip(take_from) {
+                    files.push(path);
                 }
             }
         }
         files.push(self.path.clone());
+        Ok(files)
+    }
 
-        for p in files {
+    pub(crate) fn entries_by_category(
+        &self,
+        category: &str,
+        limit: usize,
+    ) -> Result<Vec<AgentMemoryEntry>, String> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut window: VecDeque<AgentMemoryEntry> = VecDeque::new();
+        for path in self.memory_files_to_scan()? {
+            if !path.exists() {
+                continue;
+            }
+            let file =
+                fs::File::open(&path).map_err(|e| format!("Failed to read memory file: {e}"))?;
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let line = line.map_err(|e| format!("Failed to read memory file: {e}"))?;
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) else {
+                    continue;
+                };
+                if entry.category != category {
+                    continue;
+                }
+                window.push_back(entry);
+                if window.len() > limit {
+                    window.pop_front();
+                }
+            }
+        }
+
+        let mut entries: Vec<AgentMemoryEntry> = window.into_iter().collect();
+        entries.reverse();
+        Ok(entries)
+    }
+
+    pub(crate) fn search(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<(AgentMemoryEntry, f64)>, String> {
+        let query_lc = query.to_lowercase();
+        let mut docs: Vec<(AgentMemoryEntry, String, Vec<String>)> = Vec::new();
+        for p in self.memory_files_to_scan()? {
             if !p.exists() {
                 continue;
             }

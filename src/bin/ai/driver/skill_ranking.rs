@@ -1,4 +1,7 @@
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Arc, LazyLock, Mutex},
+};
 
 use crate::ai::skills::SkillManifest;
 use crate::commonw::configw;
@@ -15,6 +18,10 @@ use super::{
 
 const LOCAL_MODEL_SCORE_SCALE: f64 = 8.0;
 pub const SKILL_NONE_LABEL: &str = "none";
+const RUNTIME_SKILL_MODEL_CACHE_LIMIT: usize = 16;
+
+static RUNTIME_SKILL_MODEL_CACHE: LazyLock<Mutex<FastMap<String, Arc<RuntimeSkillModel>>>> =
+    LazyLock::new(|| Mutex::new(FastMap::default()));
 
 #[derive(Debug, Clone)]
 pub struct ScoredSkill<'a> {
@@ -55,7 +62,7 @@ pub fn rank_skills_locally_with_model_path<'a>(
 
     let input_lower = input.to_lowercase();
     let model_probs = skill_match_model::predict_skill(input, model_path);
-    let runtime_model = RuntimeSkillModel::build(skills);
+    let runtime_model = RuntimeSkillModel::for_skills(skills);
     let query_features = TextSimilarityFeatures::from_text(&input_lower);
     let candidates = skills
         .iter()
@@ -80,7 +87,7 @@ pub fn rank_skills_locally_with_model_path<'a>(
             Some(result) => probability_for_label(result, &skill.name),
             None => 0.0,
         };
-        let fallback_semantic_score = runtime_model.similarity(skill, &query_features);
+        let fallback_semantic_score = runtime_model.similarity(skill.name.as_str(), &query_features);
         let (embedding_score, embedding_identity_score, embedding_capability_score, embedding_behavior_score) =
             embedding_hits
                 .get(skill.name.as_str())
@@ -157,40 +164,61 @@ fn skill_embedding_routing_enabled() -> bool {
         .unwrap_or(false)
 }
 
-struct RuntimeSkillDoc<'a> {
-    skill: &'a SkillManifest,
-    tf: FastMap<String, f64>,
-}
-
-struct RuntimeSkillModel<'a> {
-    docs: Vec<RuntimeSkillDoc<'a>>,
+struct RuntimeSkillModel {
+    docs: FastMap<String, FastMap<String, f64>>,
     idf: FastMap<String, f64>,
 }
 
-impl<'a> RuntimeSkillModel<'a> {
-    fn build(skills: &'a [SkillManifest]) -> Self {
-        let mut docs = Vec::with_capacity(skills.len());
+impl RuntimeSkillModel {
+    fn for_skills(skills: &[SkillManifest]) -> Arc<Self> {
+        let cache_key = runtime_skill_model_cache_key(skills);
+        if let Ok(cache) = RUNTIME_SKILL_MODEL_CACHE.lock()
+            && let Some(model) = cache.get(&cache_key)
+        {
+            return Arc::clone(model);
+        }
+
+        let model = Arc::new(Self::build(skills));
+        if let Ok(mut cache) = RUNTIME_SKILL_MODEL_CACHE.lock() {
+            if cache.len() >= RUNTIME_SKILL_MODEL_CACHE_LIMIT {
+                cache.clear();
+            }
+            cache.insert(cache_key, Arc::clone(&model));
+        }
+        model
+    }
+
+    fn build(skills: &[SkillManifest]) -> Self {
+        let mut docs = FastMap::default();
         for skill in skills {
             let text = skill_document_text(skill);
             let features = TextSimilarityFeatures::from_text(&text);
-            let tf = features.ngram_tf.clone();
-            docs.push(RuntimeSkillDoc { skill, tf });
+            docs.insert(skill.name.clone(), features.ngram_tf);
         }
 
-        let doc_refs = docs.iter().map(|doc| &doc.tf).collect::<Vec<_>>();
+        let doc_refs = docs.values().collect::<Vec<_>>();
         let idf = build_idf_from_documents(&doc_refs);
         Self { docs, idf }
     }
 
-    fn similarity(&self, skill: &SkillManifest, query: &TextSimilarityFeatures) -> f64 {
+    fn similarity(&self, skill_name: &str, query: &TextSimilarityFeatures) -> f64 {
         if query.ngram_tf.is_empty() {
             return 0.0;
         }
-        let Some(doc) = self.docs.iter().find(|doc| doc.skill.name == skill.name) else {
+        let Some(doc) = self.docs.get(skill_name) else {
             return 0.0;
         };
-        cosine_tfidf_similarity(&query.ngram_tf, &doc.tf, &self.idf)
+        cosine_tfidf_similarity(&query.ngram_tf, doc, &self.idf)
     }
+}
+
+fn runtime_skill_model_cache_key(skills: &[SkillManifest]) -> String {
+    let mut key = String::new();
+    for skill in skills {
+        key.push_str(skill.routing_source_hash().as_str());
+        key.push('\n');
+    }
+    key
 }
 
 fn skill_document_text(skill: &SkillManifest) -> String {
@@ -320,5 +348,28 @@ mod tests {
         );
         assert!(!ranked.is_empty());
         assert!(ranked[0].none_score > 0.0);
+    }
+
+    #[test]
+    fn runtime_model_cache_refreshes_when_skill_content_changes() {
+        let first_skills = [skill("helper", "Debug runtime failures")];
+        let first = rank_skills_locally_with_model_path(
+            &first_skills,
+            "帮我做一份 ppt 幻灯片",
+            Some(&UserIntent::new(CoreIntent::RequestAction)),
+            &skill_match_model::default_model_path(),
+        );
+        let second_skills = [skill("helper", "生成幻灯片 PPT 演示文稿")];
+        let second = rank_skills_locally_with_model_path(
+            &second_skills,
+            "帮我做一份 ppt 幻灯片",
+            Some(&UserIntent::new(CoreIntent::RequestAction)),
+            &skill_match_model::default_model_path(),
+        );
+
+        assert!(
+            second[0].fallback_semantic_score > first[0].fallback_semantic_score,
+            "expected changed skill content to refresh cached semantic features"
+        );
     }
 }

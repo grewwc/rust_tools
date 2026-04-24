@@ -60,12 +60,9 @@ impl ExperienceGeneralizer {
             Ok(s) => s,
             Err(_) => return,
         };
-        if let Ok(results) = store.search("generalized principle", 50) {
+        if let Ok(entries) = store.entries_by_category("generalized_principle", 200) {
             let mut deduped = HashMap::new();
-            for (entry, _score) in results {
-                if entry.category != "generalized_principle" {
-                    continue;
-                }
+            for entry in entries {
                 let principle = Self::decode_persisted_principle(&entry);
                 match deduped.get(&principle.id) {
                     Some(existing) if !Self::should_replace_loaded_principle(existing, &principle) => {}

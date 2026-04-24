@@ -1,5 +1,6 @@
+use rust_tools::cw::{SkipMap, SkipSet};
 use serde_json::Value;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet};
 
 use crate::ai::{
     code_discovery_policy::{
@@ -338,10 +339,10 @@ fn collect_repo_inspection_findings(turn_messages: &[Message]) -> Vec<RepoInspec
                 Some((id.clone(), content))
             })
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<SkipMap<_, _>>();
 
     let mut findings = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut seen = SkipSet::new(16);
 
     for message in turn_messages {
         let Some(tool_calls) = &message.tool_calls else {
@@ -358,7 +359,7 @@ fn collect_repo_inspection_findings(turn_messages: &[Message]) -> Vec<RepoInspec
                 continue;
             };
             let scope = describe_tool_call(tool_call);
-            let highlight = summarize_tool_result(tool_name, content);
+            let highlight = summarize_tool_result(tool_name, &content);
             if highlight.is_empty() {
                 continue;
             }

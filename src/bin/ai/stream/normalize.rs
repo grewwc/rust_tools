@@ -60,32 +60,54 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     if event_type.is_empty() {
         return None;
     }
-    if event_type == "done" || event_type == "[done]" || event_type == "response.completed" {
+    if event_type == "done" || event_type == "[done]" {
         return Some(ParsedStreamPayload::Done);
     }
-    if event_type.ends_with(".done") || event_type.ends_with(".added") || event_type.ends_with(".part.done") {
+    if event_type == "response.completed" {
         return Some(ParsedStreamPayload::Ignore);
     }
 
     let value: serde_json::Value = serde_json::from_str(payload).ok()?;
-    if event_type.contains("reasoning") && event_type.ends_with(".delta") {
+    if event_type.contains("reasoning")
+        && (event_type.ends_with(".delta") || event_type.ends_with(".done"))
+    {
         let text = extract_event_text(&value, &["delta", "text", "summary_text", "content"]);
         if text.is_empty() {
             return Some(ParsedStreamPayload::Ignore);
         }
-        return Some(ParsedStreamPayload::Chunk(single_delta_chunk("", &text)));
+        return Some(textual_event_chunk(event_type.as_str(), "", &text));
     }
     if (event_type.contains("output_text") || event_type.contains("content"))
-        && event_type.ends_with(".delta")
+        && (event_type.ends_with(".delta") || event_type.ends_with(".done"))
     {
         let text = extract_event_text(&value, &["delta", "text", "content"]);
         if text.is_empty() {
             return Some(ParsedStreamPayload::Ignore);
         }
-        return Some(ParsedStreamPayload::Chunk(single_delta_chunk(&text, "")));
+        return Some(textual_event_chunk(event_type.as_str(), &text, ""));
+    }
+
+    if event_type.ends_with(".done")
+        || event_type.ends_with(".added")
+        || event_type.ends_with(".part.done")
+    {
+        return Some(ParsedStreamPayload::Ignore);
     }
 
     None
+}
+
+fn textual_event_chunk(
+    event_type: &str,
+    content: &str,
+    reasoning_content: &str,
+) -> ParsedStreamPayload {
+    let chunk = single_delta_chunk(content, reasoning_content);
+    if event_type.ends_with(".done") {
+        ParsedStreamPayload::SnapshotChunk(chunk)
+    } else {
+        ParsedStreamPayload::Chunk(chunk)
+    }
 }
 
 fn single_delta_chunk(content: &str, reasoning_content: &str) -> StreamChunk {
@@ -258,6 +280,35 @@ mod tests {
                 assert_eq!(chunk.choices[0].delta.reasoning_content, "");
             }
             _ => panic!("expected content chunk"),
+        }
+    }
+
+    #[test]
+    fn output_text_done_event_maps_to_snapshot_chunk() {
+        let payload = r#"{"text":"hello world"}"#;
+        match parse_stream_payload(
+            StreamProviderAdapterKind::OpenCode,
+            payload,
+            Some("response.output_text.done"),
+        ) {
+            ParsedStreamPayload::SnapshotChunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.content, "hello world");
+                assert_eq!(chunk.choices[0].delta.reasoning_content, "");
+            }
+            _ => panic!("expected snapshot content chunk"),
+        }
+    }
+
+    #[test]
+    fn response_completed_event_is_not_treated_as_immediate_stop() {
+        let payload = r#"{"status":"completed"}"#;
+        match parse_stream_payload(
+            StreamProviderAdapterKind::OpenAi,
+            payload,
+            Some("response.completed"),
+        ) {
+            ParsedStreamPayload::Ignore => {}
+            _ => panic!("response.completed should not terminate stream before EOF"),
         }
     }
 }

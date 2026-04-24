@@ -936,12 +936,6 @@ pub(super) fn prepare_skill_for_turn(
 
     let intent = detect_turn_intent(question, &app.config.intent_model_path);
     let cross_turn_preference = cross_turn_preferred_skill_name(app, question, &intent);
-    let ranked = rank_skills_locally_with_model_path(
-        skill_manifests,
-        question,
-        Some(&intent),
-        &app.config.skill_match_model_path,
-    );
     let skill = select_skill_with_preference_strength(
         skill_manifests,
         question,
@@ -952,6 +946,12 @@ pub(super) fn prepare_skill_for_turn(
     );
 
     if debug {
+        let ranked = rank_skills_locally_with_model_path(
+            skill_manifests,
+            question,
+            Some(&intent),
+            &app.config.skill_match_model_path,
+        );
         if let Some(top) = ranked.first() {
             eprintln!(
                 "[skills] local top: {} total={:.3} embed={:.3} prior={:.3} fallback={:.3} blend={:.3} none={:.3}",

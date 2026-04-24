@@ -25,6 +25,8 @@ pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
 #[allow(unused_imports)]
+pub(in crate::ai) use sqlite::read_recent_messages_sqlite;
+#[allow(unused_imports)]
 pub(in crate::ai) use types::{COLON, MAX_HISTORY_TURNS, Message, NEWLINE};
 use crate::ai::types::App;
 

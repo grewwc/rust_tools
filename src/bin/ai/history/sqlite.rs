@@ -251,6 +251,47 @@ pub(in crate::ai) fn build_message_arr_sqlite(
     Ok(messages[messages.len() - history_count..].to_vec())
 }
 
+pub(in crate::ai) fn read_recent_messages_sqlite(
+    history_file: &Path,
+    limit: usize,
+) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let conn = match open_history_db(history_file) {
+        Ok(c) => c,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    init_history_schema(&conn)?;
+
+    let mut stmt = conn.prepare(
+        "SELECT role, content, tool_calls, tool_call_id
+         FROM messages
+         ORDER BY id DESC
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |row| {
+        let role: String = row.get(0)?;
+        let content: String = row.get(1)?;
+        let tool_calls: Option<String> = row.get(2)?;
+        let tool_call_id: Option<String> = row.get(3)?;
+        Ok(Message {
+            role,
+            content: decode_message_content(&content),
+            tool_calls: decode_tool_calls(tool_calls.as_deref()),
+            tool_call_id,
+        })
+    })?;
+
+    let mut messages = Vec::new();
+    for row in rows {
+        messages.push(row?);
+    }
+    Ok(messages)
+}
+
 pub(in crate::ai) fn read_recent_turn_window_sqlite(
     history_file: &Path,
     keep_last_user_turns: usize,

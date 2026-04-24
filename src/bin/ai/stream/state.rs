@@ -140,6 +140,7 @@ pub(super) enum ParsedStreamPayload {
     Ignore,
     Done,
     Chunk(StreamChunk),
+    SnapshotChunk(StreamChunk),
 }
 
 #[derive(Default)]
@@ -148,6 +149,7 @@ pub(super) struct ToolCallBuilder {
     pub(super) tool_type: String,
     pub(super) function_name: String,
     pub(super) arguments: String,
+    pub(super) printed_arguments_len: usize,
 }
 
 impl ToolCallBuilder {

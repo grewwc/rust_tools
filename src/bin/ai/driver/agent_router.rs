@@ -6,6 +6,7 @@ use std::{
 
 use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::ai::{
     agents::{self, AgentManifest},
@@ -31,6 +32,7 @@ const SEMANTIC_SWITCH_THRESHOLD: f64 = 0.085;
 const SEMANTIC_SWITCH_MARGIN: f64 = 0.015;
 const CURRENT_TURN_SEMANTIC_FLOOR: f64 = 0.05;
 const CURRENT_TURN_ADVANTAGE_MARGIN: f64 = 0.04;
+const AGENT_SEMANTIC_CORPUS_CACHE_LIMIT: usize = 16;
 
 pub trait AgentRouter: Send + Sync {
     fn route(
@@ -46,6 +48,9 @@ const DEFAULT_AGENT_ROUTE_MODEL_RELATIVE_PATH: &str =
     "src/bin/ai/config/agent_route/agent_route_model.json";
 
 static AGENT_ROUTE_MODEL_CACHE: LazyLock<Mutex<FastMap<PathBuf, Arc<AgentRouteModelFile>>>> =
+    LazyLock::new(|| Mutex::new(FastMap::default()));
+
+static AGENT_SEMANTIC_CORPUS_CACHE: LazyLock<Mutex<FastMap<String, Arc<AgentSemanticCorpus>>>> =
     LazyLock::new(|| Mutex::new(FastMap::default()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -278,6 +283,46 @@ struct ScoredAgent<'a> {
     history_score: f64,
 }
 
+struct AgentSemanticCorpus {
+    docs: FastMap<String, FastMap<String, f64>>,
+    idf: FastMap<String, f64>,
+}
+
+impl AgentSemanticCorpus {
+    fn for_candidates(candidates: &[&AgentManifest]) -> Arc<Self> {
+        let cache_key = agent_semantic_corpus_cache_key(candidates);
+        if let Ok(cache) = AGENT_SEMANTIC_CORPUS_CACHE.lock()
+            && let Some(corpus) = cache.get(&cache_key)
+        {
+            return Arc::clone(corpus);
+        }
+
+        let corpus = Arc::new(Self::build(candidates));
+        if let Ok(mut cache) = AGENT_SEMANTIC_CORPUS_CACHE.lock() {
+            if cache.len() >= AGENT_SEMANTIC_CORPUS_CACHE_LIMIT {
+                cache.clear();
+            }
+            cache.insert(cache_key, Arc::clone(&corpus));
+        }
+        corpus
+    }
+
+    fn build(candidates: &[&AgentManifest]) -> Self {
+        let mut docs = FastMap::default();
+        for agent in candidates {
+            let features = TextSimilarityFeatures::from_text(&agent_document_text(agent));
+            docs.insert(agent.name.clone(), features.ngram_tf);
+        }
+        let doc_refs = docs.values().collect::<Vec<_>>();
+        let idf = build_idf_from_documents(&doc_refs);
+        Self { docs, idf }
+    }
+
+    fn document(&self, agent_name: &str) -> Option<&FastMap<String, f64>> {
+        self.docs.get(agent_name)
+    }
+}
+
 fn rank_agents_by_semantics<'a>(
     agent_manifests: &'a [AgentManifest],
     question: &str,
@@ -295,20 +340,18 @@ fn rank_agents_by_semantics<'a>(
     let query = TextSimilarityFeatures::from_text(question);
     let history_text = recent_history_text(history);
     let history_features = TextSimilarityFeatures::from_text(&history_text);
-    let docs = candidates
-        .iter()
-        .map(|agent| TextSimilarityFeatures::from_text(&agent_document_text(agent)))
-        .collect::<Vec<_>>();
-    let doc_refs = docs.iter().map(|doc| &doc.ngram_tf).collect::<Vec<_>>();
-    let idf = build_idf_from_documents(&doc_refs);
+    let corpus = AgentSemanticCorpus::for_candidates(&candidates);
 
     let mut ranked = candidates
         .into_iter()
-        .zip(docs)
-        .map(|(agent, doc)| {
-            let question_score = cosine_tfidf_similarity(&query.ngram_tf, &doc.ngram_tf, &idf);
+        .map(|agent| {
+            let doc = corpus.document(agent.name.as_str());
+            let question_score = doc
+                .map(|doc| cosine_tfidf_similarity(&query.ngram_tf, doc, &corpus.idf))
+                .unwrap_or(0.0);
             let history_score =
-                cosine_tfidf_similarity(&history_features.ngram_tf, &doc.ngram_tf, &idf);
+                doc.map(|doc| cosine_tfidf_similarity(&history_features.ngram_tf, doc, &corpus.idf))
+                    .unwrap_or(0.0);
             let prior_boost = model_prior
                 .filter(|(label, _)| *label == agent.name)
                 .map(|(_, confidence)| confidence * 0.15)
@@ -324,6 +367,31 @@ fn rank_agents_by_semantics<'a>(
 
     ranked.sort_by(|left, right| right.score.total_cmp(&left.score));
     ranked
+}
+
+fn agent_semantic_corpus_cache_key(candidates: &[&AgentManifest]) -> String {
+    let mut key = String::new();
+    for agent in candidates {
+        key.push_str(agent_routing_source_hash(agent).as_str());
+        key.push('\n');
+    }
+    key
+}
+
+fn agent_routing_source_hash(agent: &AgentManifest) -> String {
+    let payload = serde_json::json!({
+        "name": agent.name,
+        "description": agent.description,
+        "prompt": agent.prompt,
+        "system_prompt": agent.system_prompt,
+        "tools": agent.tools,
+        "tool_groups": agent.tool_groups,
+        "mcp_servers": agent.mcp_servers,
+        "routing_tags": agent.routing_tags,
+    });
+    let mut hasher = Sha256::new();
+    hasher.update(payload.to_string().as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn choose_semantic_route(
@@ -504,5 +572,23 @@ mod tests {
         let decision = choose_semantic_route(ranked, "build", ROUTE_REASON_SEMANTIC_MATCH);
 
         assert!(decision.is_none());
+    }
+
+    #[test]
+    fn semantic_corpus_cache_refreshes_when_agent_content_changes() {
+        let first_agents = [primary_agent("helper", "Debug runtime failures", &[])];
+        let first = rank_agents_by_semantics(&first_agents, "帮我做一份 ppt 幻灯片", &[], None);
+
+        let second_agents = [primary_agent(
+            "helper",
+            "生成幻灯片 PPT 演示文稿",
+            &["ppt", "slides", "presentation"],
+        )];
+        let second = rank_agents_by_semantics(&second_agents, "帮我做一份 ppt 幻灯片", &[], None);
+
+        assert!(
+            second[0].question_score > first[0].question_score,
+            "expected changed agent content to refresh cached semantic features"
+        );
     }
 }

@@ -4,3 +4,4 @@ Cargo.lock
 /bin
 .fastembed_cache
 .DS_Store
+.cargo

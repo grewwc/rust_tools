@@ -196,11 +196,21 @@ fn maybe_auto_route_agent(app: &mut App, agent_manifests: &[AgentManifest], ques
 /// Read recent history entries from the session file.
 /// Used by auto-routing to understand conversation context.
 fn read_recent_history(app: &App) -> Vec<crate::ai::history::Message> {
-    use crate::ai::history::build_message_arr;
-    match build_message_arr(usize::MAX, &app.session_history_file) {
-        Ok(entries) => entries.into_iter().rev().take(10).collect(),
-        Err(_) => Vec::new(),
+    use crate::ai::history::{build_message_arr, read_recent_messages_sqlite};
+
+    let is_sqlite_history = matches!(
+        app.session_history_file.extension().and_then(|ext| ext.to_str()),
+        Some("sqlite") | Some("db")
+    );
+
+    if is_sqlite_history {
+        return read_recent_messages_sqlite(app.session_history_file.as_path(), 10)
+            .unwrap_or_default();
     }
+
+    build_message_arr(10, &app.session_history_file)
+        .map(|entries| entries.into_iter().rev().collect())
+        .unwrap_or_default()
 }
 
 /// Loads all agents fresh from disk, enabling hot-reload of newly added/modified agents.
@@ -942,8 +952,9 @@ async fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::maybe_auto_route_agent;
+    use super::{maybe_auto_route_agent, read_recent_history};
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
+    use crate::ai::history::{Message, append_history_messages};
     use crate::ai::cli::ParsedCli;
     use crate::ai::types::{AgentContext, App, AppConfig};
     use std::path::PathBuf;
@@ -1044,5 +1055,41 @@ mod tests {
                 .map(|agent| agent.name.as_str()),
             Some("build")
         );
+    }
+
+    #[test]
+    fn read_recent_history_sqlite_preserves_previous_ordering() {
+        let path = std::env::temp_dir().join(format!(
+            "rt_recent_history_{}_{}.sqlite",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+
+        let messages = (1..=12)
+            .map(|idx| Message {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String(format!("m{idx}")),
+                tool_calls: None,
+                tool_call_id: None,
+            })
+            .collect::<Vec<_>>();
+        append_history_messages(path.as_path(), &messages).unwrap();
+
+        let mut app = test_app("build");
+        app.session_history_file = path.clone();
+
+        let recent = read_recent_history(&app)
+            .into_iter()
+            .filter_map(|msg| msg.content.as_str().map(|s| s.to_string()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            recent,
+            vec!["m12", "m11", "m10", "m9", "m8", "m7", "m6", "m5", "m4", "m3"]
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 }

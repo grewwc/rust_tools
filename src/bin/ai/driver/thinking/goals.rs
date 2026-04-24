@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
 
 pub type GoalId = String;
@@ -229,7 +230,7 @@ impl Goal {
 }
 
 pub struct GoalManager {
-    goals: HashMap<GoalId, Goal>,
+    goals: FastMap<GoalId, Goal>,
     active_goal_id: Option<GoalId>,
     persistence_dir: Option<PathBuf>,
 }
@@ -237,7 +238,7 @@ pub struct GoalManager {
 impl GoalManager {
     pub fn new() -> Self {
         Self {
-            goals: HashMap::new(),
+            goals: FastMap::default(),
             active_goal_id: None,
             persistence_dir: None,
         }
@@ -324,7 +325,7 @@ impl GoalManager {
             return Ok(());
         }
         let data = std::fs::read_to_string(&path).map_err(|e| format!("{}", e))?;
-        self.goals = serde_json::from_str(&data).unwrap_or_default();
+        self.goals = serde_json::from_str(&data).map_err(|e| format!("{}", e))?;
         Ok(())
     }
 

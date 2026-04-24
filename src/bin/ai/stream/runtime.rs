@@ -16,7 +16,7 @@ use super::{
     extract::{StreamTextEvent, extract_chunk_events_with_tools, strip_ansi_codes},
     framing, normalize,
     splitter::StreamSplitSegment,
-    state::{StreamChunkStep, StreamMarkers, StreamProcessingState},
+    state::{StreamChunkStep, StreamMarkers, StreamProcessingState, ToolCallBuilder},
 };
 
 /// Maximum number of decode errors before giving up and returning partial content
@@ -258,12 +258,7 @@ fn finalize_stream_response(
         return Ok(cancelled_stream_result(false));
     }
 
-    let tool_calls: Vec<ToolCall> = state
-        .content
-        .tool_calls_map
-        .into_values()
-        .map(|builder| builder.build())
-        .collect();
+    let tool_calls = collect_valid_tool_calls(&mut state.content.tool_calls_map);
 
     let outcome = if !tool_calls.is_empty() {
         StreamOutcome::ToolCall
@@ -329,15 +324,38 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
 
     Some(StreamResult {
         outcome: StreamOutcome::Completed,
-        tool_calls: state
-            .content
-            .tool_calls_map
-            .drain()
-            .map(|(_, b)| b.build())
-            .collect(),
+        tool_calls: collect_valid_tool_calls(&mut state.content.tool_calls_map),
         assistant_text: std::mem::take(&mut state.content.assistant_text),
         hidden_meta: String::new(),
     })
+}
+
+fn normalize_tool_call_arguments(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some("{}".to_string());
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+    Some(trimmed.to_string())
+}
+
+fn collect_valid_tool_calls(
+    builders: &mut rust_tools::commonw::FastMap<usize, ToolCallBuilder>,
+) -> Vec<ToolCall> {
+    builders
+        .drain()
+        .filter_map(|(_, mut builder)| {
+            let Some(arguments) = normalize_tool_call_arguments(&builder.arguments) else {
+                eprintln!(
+                    "[Warning] dropping malformed tool call '{}' due to incomplete JSON arguments",
+                    builder.function_name
+                );
+                return None;
+            };
+            builder.arguments = arguments;
+            Some(builder.build())
+        })
+        .collect()
 }
 
 fn ensure_tool_calls_section_open(
@@ -365,6 +383,67 @@ fn ensure_tool_calls_section_open(
     state.render.printed_tool_calls_header = true;
 }
 
+struct ToolCallRenderChunk {
+    function_name: String,
+    arguments: String,
+    open_line: bool,
+}
+
+fn take_tool_call_render_chunk(
+    current_printing_index: Option<usize>,
+    index: usize,
+    builder: &mut ToolCallBuilder,
+) -> Option<ToolCallRenderChunk> {
+    if builder.function_name.is_empty() {
+        return None;
+    }
+
+    let start = builder.printed_arguments_len.min(builder.arguments.len());
+    let arguments = builder.arguments[start..].to_string();
+    builder.printed_arguments_len = builder.arguments.len();
+
+    Some(ToolCallRenderChunk {
+        function_name: builder.function_name.clone(),
+        arguments,
+        open_line: current_printing_index != Some(index),
+    })
+}
+
+fn open_tool_call_line(
+    state: &mut StreamProcessingState,
+    index: usize,
+    function_name: &str,
+) -> io::Result<()> {
+    if state.render.current_printing_index.is_some() {
+        println!("\x1b[0m)");
+    }
+    state.render.current_printing_index = Some(index);
+    print!(
+        "  {}│{} {}{}{}({}",
+        ACCENT_RULE, RESET, ACCENT_MUTED, function_name, RESET, DIM
+    );
+    io::stdout().flush()
+}
+
+fn write_tool_call_arguments_stream(arguments: &str) -> io::Result<()> {
+    if arguments.is_empty() {
+        return Ok(());
+    }
+
+    let mut stdout = io::stdout();
+    if stdout.is_terminal() {
+        for ch in arguments.chars() {
+            let mut buf = [0u8; 4];
+            stdout.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
+            stdout.flush()?;
+        }
+        return Ok(());
+    }
+
+    stdout.write_all(arguments.as_bytes())?;
+    stdout.flush()
+}
+
 fn process_external_tool_calls_delta(
     app: &mut App,
     markers: &StreamMarkers,
@@ -379,39 +458,30 @@ fn process_external_tool_calls_delta(
         let index = stream_tool_call.index;
         ensure_tool_calls_section_open(app, markers, state);
 
-        let builder = state.content.tool_calls_map.entry(index).or_default();
-        if !stream_tool_call.id.is_empty() {
-            builder.id.clone_from(&stream_tool_call.id);
-        }
-        if !stream_tool_call.tool_type.is_empty() {
-            builder.tool_type.clone_from(&stream_tool_call.tool_type);
-        }
-        if !stream_tool_call.function.name.is_empty() {
-            builder
-                .function_name
-                .clone_from(&stream_tool_call.function.name);
-        }
-        builder
-            .arguments
-            .push_str(&stream_tool_call.function.arguments);
-
-        if !builder.function_name.is_empty() {
-            if state.render.current_printing_index != Some(index) {
-                if state.render.current_printing_index.is_some() {
-                    println!("\x1b[0m)");
-                }
-                state.render.current_printing_index = Some(index);
-                print!(
-                    "  {}│{} {}{}{}({}",
-                    ACCENT_RULE, RESET, ACCENT_MUTED, builder.function_name, RESET, DIM
-                );
-                let _ = io::stdout().flush();
-                print!("{}", builder.arguments);
-                let _ = io::stdout().flush();
-            } else if !stream_tool_call.function.arguments.is_empty() {
-                print!("{}", stream_tool_call.function.arguments);
-                let _ = io::stdout().flush();
+        let render_chunk = {
+            let builder = state.content.tool_calls_map.entry(index).or_default();
+            if !stream_tool_call.id.is_empty() {
+                builder.id.clone_from(&stream_tool_call.id);
             }
+            if !stream_tool_call.tool_type.is_empty() {
+                builder.tool_type.clone_from(&stream_tool_call.tool_type);
+            }
+            if !stream_tool_call.function.name.is_empty() {
+                builder
+                    .function_name
+                    .clone_from(&stream_tool_call.function.name);
+            }
+            builder
+                .arguments
+                .push_str(&stream_tool_call.function.arguments);
+            take_tool_call_render_chunk(state.render.current_printing_index, index, builder)
+        };
+
+        if let Some(render_chunk) = render_chunk {
+            if render_chunk.open_line {
+                let _ = open_tool_call_line(state, index, &render_chunk.function_name);
+            }
+            let _ = write_tool_call_arguments_stream(&render_chunk.arguments);
         }
     }
 }
@@ -715,6 +785,109 @@ mod tests {
         assert!(written.contains("我判断这是首段"));
     }
 
+    #[test]
+    fn snapshot_content_only_appends_missing_suffix() {
+        assert_eq!(unseen_suffix("hello wor", "hello world"), "ld");
+        assert_eq!(unseen_suffix("hello world", "hello world"), "");
+        assert_eq!(unseen_suffix("prefix", "suffix"), "suffix");
+    }
+
+    #[test]
+    fn tool_call_render_chunk_only_streams_unprinted_suffix() {
+        let mut builder = ToolCallBuilder::default();
+
+        builder.arguments.push_str("{\"patch\":\"a");
+        assert!(take_tool_call_render_chunk(None, 0, &mut builder).is_none());
+
+        builder.function_name = "apply_patch".to_string();
+        let first = take_tool_call_render_chunk(None, 0, &mut builder).unwrap();
+        assert!(first.open_line);
+        assert_eq!(first.function_name, "apply_patch");
+        assert_eq!(first.arguments, "{\"patch\":\"a");
+
+        builder.arguments.push('你');
+        let second = take_tool_call_render_chunk(Some(0), 0, &mut builder).unwrap();
+        assert!(!second.open_line);
+        assert_eq!(second.arguments, "你");
+    }
+
+    #[test]
+    fn normalize_tool_call_arguments_rejects_incomplete_json_and_canonicalizes_empty() {
+        assert_eq!(normalize_tool_call_arguments(""), Some("{}".to_string()));
+        assert_eq!(
+            normalize_tool_call_arguments(" {\"command\":\"pwd\"} "),
+            Some("{\"command\":\"pwd\"}".to_string())
+        );
+        assert_eq!(normalize_tool_call_arguments("{\"command\":"), None);
+    }
+
+    #[test]
+    fn response_completed_event_does_not_block_late_snapshot_text() {
+        let markers = StreamMarkers::new();
+        let mut state = StreamProcessingState::new();
+        let mut app = test_app();
+        let mut current_history = String::new();
+
+        let should_stop = process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            normalize::StreamProviderAdapterKind::OpenAi,
+            Some("response.completed"),
+            r#"{"status":"completed"}"#,
+        )
+        .unwrap();
+        assert!(!should_stop);
+
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            normalize::StreamProviderAdapterKind::OpenAi,
+            Some("response.output_text.done"),
+            r#"{"text":"hello world"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(current_history, "hello world");
+        assert_eq!(state.content.assistant_text, "hello world");
+    }
+
+    #[test]
+    fn snapshot_done_chunk_does_not_duplicate_already_streamed_prefix() {
+        let markers = StreamMarkers::new();
+        let mut state = StreamProcessingState::new();
+        let mut app = test_app();
+        let mut current_history = String::new();
+
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            normalize::StreamProviderAdapterKind::OpenCode,
+            Some("response.output_text.delta"),
+            r#"{"delta":"hello wor"}"#,
+        )
+        .unwrap();
+
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            normalize::StreamProviderAdapterKind::OpenCode,
+            Some("response.output_text.done"),
+            r#"{"text":"hello world"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(current_history, "hello world");
+        assert_eq!(state.content.assistant_text, "hello world");
+    }
+
 }
 
 fn process_stream_payload(
@@ -726,10 +899,13 @@ fn process_stream_payload(
     event_type: Option<&str>,
     payload: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let chunk = match normalize::parse_stream_payload(adapter_kind, payload, event_type) {
+    let (chunk, merge_mode) = match normalize::parse_stream_payload(adapter_kind, payload, event_type) {
         super::state::ParsedStreamPayload::Ignore => return Ok(false),
         super::state::ParsedStreamPayload::Done => return Ok(true),
-        super::state::ParsedStreamPayload::Chunk(chunk) => chunk,
+        super::state::ParsedStreamPayload::Chunk(chunk) => (chunk, StreamEventMergeMode::Append),
+        super::state::ParsedStreamPayload::SnapshotChunk(chunk) => {
+            (chunk, StreamEventMergeMode::AppendMissingSuffix)
+        }
     };
 
     if chunk.choices.is_empty() {
@@ -768,7 +944,12 @@ fn process_stream_payload(
                 state.content.hidden_meta.push_str(&text);
             }
             other => {
-                let Some(content) = stream_text_event_to_content(&other, markers) else {
+                let Some(content) = stream_text_event_to_content(
+                    &other,
+                    markers,
+                    merge_mode,
+                    &state.content.assistant_text,
+                ) else {
                     continue;
                 };
                 if content.is_empty() {
@@ -784,18 +965,52 @@ fn process_stream_payload(
     Ok(false)
 }
 
+#[derive(Clone, Copy)]
+enum StreamEventMergeMode {
+    Append,
+    AppendMissingSuffix,
+}
+
 fn stream_text_event_to_content(
     event: &StreamTextEvent,
     markers: &StreamMarkers,
+    merge_mode: StreamEventMergeMode,
+    assistant_text: &str,
 ) -> Option<String> {
     match event {
         StreamTextEvent::OpenThinking => Some(format!("\n{}\n", markers.thinking_tag)),
-        StreamTextEvent::AppendThinking(text) | StreamTextEvent::AppendContent(text) => {
-            (!text.is_empty()).then(|| text.clone())
-        }
+        StreamTextEvent::AppendThinking(text) => (!text.is_empty()).then(|| text.clone()),
+        StreamTextEvent::AppendContent(text) => match merge_mode {
+            StreamEventMergeMode::Append => (!text.is_empty()).then(|| text.clone()),
+            StreamEventMergeMode::AppendMissingSuffix => {
+                let suffix = unseen_suffix(assistant_text, text);
+                (!suffix.is_empty()).then_some(suffix)
+            }
+        },
         StreamTextEvent::AppendHiddenMeta(_) => None,
         StreamTextEvent::CloseThinking => Some(format!("{}\n", markers.end_thinking_tag)),
     }
+}
+
+fn unseen_suffix(existing: &str, incoming: &str) -> String {
+    if incoming.is_empty() || existing.ends_with(incoming) {
+        return String::new();
+    }
+
+    let boundaries = incoming
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .chain(std::iter::once(incoming.len()))
+        .collect::<Vec<_>>();
+
+    for overlap_chars in (1..boundaries.len()).rev() {
+        let split_idx = boundaries[overlap_chars];
+        if existing.ends_with(&incoming[..split_idx]) {
+            return incoming[split_idx..].to_string();
+        }
+    }
+
+    incoming.to_string()
 }
 
 fn flush_sse_event(

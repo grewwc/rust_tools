@@ -1,3 +1,4 @@
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::marker::PhantomData;
 use std::ptr;
@@ -34,6 +35,51 @@ pub struct SkipMap<K, V> {
 // 那么可以安全地实现 Send + Sync
 unsafe impl<K: Send, V: Send> Send for SkipMap<K, V> {}
 unsafe impl<K: Send + Sync, V: Send + Sync> Sync for SkipMap<K, V> {}
+
+// ============== Serde implementations ==============
+
+impl<K, V> Serialize for SkipMap<K, V>
+where
+    K: Serialize,
+    V: Serialize,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        // 序列化为: (max_height, Vec<(K, V)>)
+        let mut seq = serializer.serialize_seq(Some(self.len() + 1))?;
+        // 第一个元素是 max_height
+        seq.serialize_element(&self.max_height)?;
+        // 后续元素是所有 key-value 对
+        for (k, v) in self.iter() {
+            seq.serialize_element(&(k, v))?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de, K, V> Deserialize<'de> for SkipMap<K, V>
+where
+    K: Deserialize<'de> + Ord,
+    V: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // 反序列化: (max_height, Vec<(K, V)>)
+        let (max_height, items): (usize, Vec<(K, V)>) =
+            Deserialize::deserialize(deserializer)?;
+        // 使用默认比较器重建 SkipMap
+        let mut map = *SkipMap::new(max_height, |a: &K, b: &K| a.cmp(b) as i32);
+        for (k, v) in items {
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+}
 
 impl<K, V> SkipMap<K, V> {
     unsafe fn free_chain(mut curr: *mut SkipNode<K, V>) {
@@ -105,6 +151,15 @@ impl<K, V> SkipMap<K, V> {
         self.get_ref(k).cloned()
     }
 
+    pub fn get_mut(&mut self, k: &K) -> Option<&mut V> {
+        let (_, found) = self.find(k, self.max_height - 1);
+        let found = found as *mut SkipNode<K, V>;
+        if found == ptr::null_mut() {
+            return None;
+        }
+        Some(unsafe { (&mut *found).v.assume_init_mut() })
+    }
+
     pub fn contains_key(&self, k: &K) -> bool {
         self.get_ref(k).is_some()
     }
@@ -143,6 +198,10 @@ impl<K, V> SkipMap<K, V> {
 
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn max_height(&self) -> usize {
+        self.max_height
     }
 
     pub fn is_empty(&self) -> bool {
@@ -204,6 +263,20 @@ where
         let mut map = *SkipMap::new(self.max_height, self.cmp);
         for (k, v) in self.iter() {
             map.insert(k.clone(), v.clone());
+        }
+        map
+    }
+}
+
+impl<K, V> FromIterator<(K, V)> for SkipMap<K, V>
+where
+    K: Ord,
+{
+    fn from_iter<T: IntoIterator<Item = (K, V)>>(iter: T) -> Self {
+        // 使用 max_height=16 作为默认值，通过解引用 Box 来创建
+        let mut map = *SkipMap::new(16, |a: &K, b: &K| a.cmp(b) as i32);
+        for (k, v) in iter {
+            map.insert(k, v);
         }
         map
     }
@@ -387,6 +460,46 @@ where
 unsafe impl<T: Ord + Send> Send for SkipSet<T> {}
 unsafe impl<T: Ord + Send + Sync> Sync for SkipSet<T> {}
 
+
+// ============== SkipSet Serde implementations ==============
+
+impl<T> Serialize for SkipSet<T>
+where
+    T: Serialize + Ord,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        // 序列化: (max_height, Vec<T>)
+        let mut seq = serializer.serialize_seq(Some(self.len() + 1))?;
+        seq.serialize_element(&self.inner.max_height())?;
+        for v in self.iter() {
+            seq.serialize_element(v)?;
+        }
+        seq.end()
+    }
+}
+
+impl<'de, T> Deserialize<'de> for SkipSet<T>
+where
+    T: Deserialize<'de> + Ord,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (max_height, items): (usize, Vec<T>) =
+            Deserialize::deserialize(deserializer)?;
+        let mut set = SkipSet::new(max_height);
+        for item in items {
+            set.insert(item);
+        }
+        Ok(set)
+    }
+}
+
 impl<T> SkipSet<T>
 where
     T: Ord,
@@ -440,6 +553,10 @@ where
 
     pub fn len(&self) -> usize {
         self.inner.len()
+    }
+
+    pub fn max_height(&self) -> usize {
+        self.inner.max_height()
     }
 
     pub fn is_empty(&self) -> bool {
