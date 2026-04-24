@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::ai::skills::SkillManifest;
+use crate::commonw::configw;
 use rust_tools::commonw::FastMap;
 
 use super::{
@@ -65,8 +66,7 @@ pub fn rank_skills_locally_with_model_path<'a>(
         })
         .cloned()
         .collect::<Vec<_>>();
-    let embedding_hits = build_embedding_hits(&candidates, input)
-        .unwrap_or_default();
+    let embedding_hits = build_embedding_hits(&candidates, input).unwrap_or_default();
     let mut ranked = Vec::new();
 
     for skill in skills {
@@ -135,7 +135,7 @@ fn build_embedding_hits(
     skills: &[SkillManifest],
     input: &str,
 ) -> Result<FastMap<String, SkillEmbeddingHit>, String> {
-    if skills.is_empty() {
+    if skills.is_empty() || !skill_embedding_routing_enabled() {
         return Ok(FastMap::default());
     }
     let documents = skills
@@ -148,6 +148,13 @@ fn build_embedding_hits(
         .into_iter()
         .map(|hit| (hit.skill_name.clone(), hit))
         .collect())
+}
+
+fn skill_embedding_routing_enabled() -> bool {
+    configw::get_all_config()
+        .get_opt("ai.skills.embedding_routing")
+        .map(|value| value.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 struct RuntimeSkillDoc<'a> {

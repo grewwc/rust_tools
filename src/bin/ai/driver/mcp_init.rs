@@ -12,6 +12,13 @@ use std::process::{Command, Stdio};
 const FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS: u64 = 20_000;
 
 #[derive(Debug, Clone)]
+pub struct McpConfigProbe {
+    pub config_path: String,
+    pub exists: bool,
+    pub server_count: usize,
+}
+
+#[derive(Debug, Clone)]
 pub struct McpInitReport {
     pub config_path: String,
     pub loaded: bool,
@@ -20,6 +27,33 @@ pub struct McpInitReport {
     pub resource_count: usize,
     pub prompt_count: usize,
     pub failures: Vec<String>,
+}
+
+pub fn probe_mcp_config(app: &App) -> McpConfigProbe {
+    let cfg = crate::commonw::configw::get_all_config();
+    let mcp_path = if !app.cli.mcp_config.trim().is_empty() {
+        app.cli.mcp_config.trim().to_string()
+    } else {
+        cfg.get_opt("ai.mcp.config")
+            .unwrap_or_else(|| "~/.config/mcp.json".to_string())
+    };
+    let mcp_path = crate::commonw::utils::expanduser(&mcp_path);
+    let mcp_path = mcp_path.as_ref().to_string();
+
+    let exists = fs::metadata(&mcp_path).is_ok();
+    let server_count = if exists {
+        super::super::mcp::load_mcp_config_from_file(&mcp_path)
+            .map(|servers| servers.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    McpConfigProbe {
+        config_path: mcp_path,
+        exists,
+        server_count,
+    }
 }
 
 fn is_feishu_mcp_server(name: &str, command: &str) -> bool {

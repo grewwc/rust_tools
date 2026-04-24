@@ -28,6 +28,20 @@ const RECENT_MEMORY_CACHE_TTL: Duration = Duration::from_secs(10);
 static RECENT_MEMORY_CACHE: LazyLock<Mutex<Option<RecentMemoryCacheEntry>>> =
     LazyLock::new(|| Mutex::new(None));
 
+fn sync_recall_enabled() -> bool {
+    crate::commonw::configw::get_all_config()
+        .get_opt("ai.prepare.sync_recall")
+        .map(|value| value.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn sync_prepare_observers_enabled() -> bool {
+    crate::commonw::configw::get_all_config()
+        .get_opt("ai.prepare.sync_observers")
+        .map(|value| value.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct RecentMemoryCacheKey {
     path: std::path::PathBuf,
@@ -130,25 +144,29 @@ pub(super) async fn prepare_turn(
         }
     }
 
-    let observer_outputs: Vec<crate::ai::driver::observer::PrepareOutput> = app.observers.iter_mut().filter_map(|obs| {
-        if obs.is_poisoned() {
-            return None;
-        }
-        let ctx = crate::ai::driver::observer::PrepareContext {
-            question: question.to_string(),
-        };
-        let obs_name = obs.name().to_string();
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            obs.on_prepare_rich(&ctx)
-        })) {
-            Ok(out) => Some(out),
-            Err(_) => {
-                eprintln!("[Warning] observer '{}' panicked in on_prepare; disabling for rest of conversation.", obs_name);
-                obs.mark_poisoned();
-                None
+    let observer_outputs: Vec<crate::ai::driver::observer::PrepareOutput> = if sync_prepare_observers_enabled() {
+        app.observers.iter_mut().filter_map(|obs| {
+            if obs.is_poisoned() {
+                return None;
             }
-        }
-    }).collect();
+            let ctx = crate::ai::driver::observer::PrepareContext {
+                question: question.to_string(),
+            };
+            let obs_name = obs.name().to_string();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                obs.on_prepare_rich(&ctx)
+            })) {
+                Ok(out) => Some(out),
+                Err(_) => {
+                    eprintln!("[Warning] observer '{}' panicked in on_prepare; disabling for rest of conversation.", obs_name);
+                    obs.mark_poisoned();
+                    None
+                }
+            }
+        }).collect()
+    } else {
+        Vec::new()
+    };
     for output in &observer_outputs {
         for (kind, label, content) in &output.sections {
             match kind {
@@ -185,7 +203,7 @@ pub(super) async fn prepare_turn(
     let recall_intent = skill_turn.intent().clone();
     let skip_recall_for_skill_context = skill_turn.skip_recall_by_skill();
     let matched_skill_name = skill_turn.matched_skill_name().map(|name| name.to_string());
-    let should_run_general_recall = should_run_general_recall(
+    let should_run_general_recall = sync_recall_enabled() && should_run_general_recall(
         question,
         &recall_intent,
         matched_skill_name.as_deref(),
@@ -239,7 +257,7 @@ pub(super) async fn prepare_turn(
         }
     }
 
-    if should_run_session_code_discovery_recall(
+    if sync_recall_enabled() && should_run_session_code_discovery_recall(
         question,
         &recall_intent,
         matched_skill_name.as_deref(),

@@ -233,6 +233,8 @@ fn reload_agent_manifests(agent_manifests: &mut Vec<AgentManifest>) {
 ///   9. Load and activate agents
 ///   10. Enter run_loop
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+
     let cli = cli::parse_cli_args(std::env::args());
     let config = config::load_config()?;
     let session_store = SessionStore::new(config.history_file.as_path());
@@ -317,11 +319,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
     let skill_manifests = load_skill_manifests(app.cli.no_skills);
-    let mcp_report = init_mcp(
-        &mut app,
-        &mut mcp_client.lock().unwrap_or_else(|err| err.into_inner()),
-    )
-    .await;
 
     if app.cli.list_tools {
         print::print_builtin_tools(&app);
@@ -331,14 +328,34 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         print::print_skills(&skill_manifests);
         return Ok(());
     }
-    if app.cli.list_mcp_tools {
-        print::print_mcp_tools(&mcp_report, &mcp_client.lock().unwrap());
-        return Ok(());
-    }
 
     let mut agent_manifests = agents::load_all_agents();
     if app.cli.list_agents {
         commands::help::print_agents_list(&agent_manifests);
+        return Ok(());
+    }
+
+    let mcp_probe = probe_mcp_config(&app);
+    let printed_mcp_loading = mcp_probe.exists && !app.cli.list_mcp_tools;
+    if printed_mcp_loading {
+        print!(
+            "{}",
+            print::format_section_header(
+                "mcp",
+                Some(&format!("{} configured servers · loading...", mcp_probe.server_count))
+            )
+        );
+        std::io::stdout().flush().ok();
+    }
+
+    let mcp_report = init_mcp(
+        &mut app,
+        &mut mcp_client.lock().unwrap_or_else(|err| err.into_inner()),
+    )
+    .await;
+
+    if app.cli.list_mcp_tools {
+        print::print_mcp_tools(&mcp_report, &mcp_client.lock().unwrap());
         return Ok(());
     }
 
@@ -366,16 +383,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if mcp_report.loaded {
-        println!(
-            "{}",
-            print::format_section_header(
-                "mcp",
-                Some(&format!(
-                    "{} servers, {} tools",
-                    mcp_report.server_count, mcp_report.tool_count
-                ))
-            )
+        let header = print::format_section_header(
+            "mcp",
+            Some(&format!(
+                "{} servers, {} tools",
+                mcp_report.server_count, mcp_report.tool_count
+            )),
         );
+        if printed_mcp_loading {
+            print!("\r\x1b[2K{}\n", header);
+        } else {
+            println!("{header}");
+        }
     }
     run_loop(
         &mut app,
@@ -533,18 +552,13 @@ async fn run_loop(
                 ));
             }
 
-            let mut join_set: tokio::task::JoinSet<(
-                u64,
-                Option<String>,
-                Result<turn_runtime::TurnOutcome, String>,
-            )> = tokio::task::JoinSet::new();
-
             for (pid, proc_question, history_path, agent_override, model_override, task_id) in task_specs {
                 let mut task_app = app.clone();
                 task_app.session_history_file = history_path;
                 task_app.cancel_stream.store(false, Ordering::Relaxed);
                 let task_mcp = mcp_client.clone();
                 let task_skills = skill_manifests.to_vec();
+                let task_os = app.os.clone();
                 if let Some(agent_name) = &agent_override
                     && let Some(agent) = agents::find_agent_by_name(agent_manifests, agent_name)
                     && !agent.disabled
@@ -553,7 +567,7 @@ async fn run_loop(
                 }
                 let next_model = model_override.unwrap_or_else(|| app.current_model.clone());
 
-                join_set.spawn(crate::ai::os::kernel::TASK_PID.scope(Some(pid), async move {
+                tokio::spawn(crate::ai::os::kernel::TASK_PID.scope(Some(pid), async move {
                     crate::ai::tools::registry::common::clear_tool_cancel();
                     let result = turn_runtime::run_turn(
                         &mut task_app,
@@ -568,21 +582,7 @@ async fn run_loop(
                     )
                     .await
                     .map_err(|e| format!("{}", e));
-                    (pid, task_id, result)
-                }));
-            }
-
-            while let Some(join_result) = join_set.join_next().await {
-                let (pid, task_id, turn_result) = match join_result {
-                    Ok(pair) => pair,
-                    Err(join_err) => {
-                        eprintln!("[OS] Task panicked: {}", join_err);
-                        continue;
-                    }
-                };
-
-                {
-                    let mut os = app.os.lock().unwrap();
+                    let mut os = task_os.lock().unwrap();
                     os.set_current_pid(Some(pid));
                     if let Some(task_id) = &task_id {
                         let key = task_result_shm_key(task_id);
@@ -590,15 +590,15 @@ async fn run_loop(
                             let _ = os.shm_create(
                                 key,
                                 serde_json::json!({
-                                    "status": if turn_result.is_ok() { "completed" } else { "failed" },
+                                    "status": if result.is_ok() { "completed" } else { "failed" },
                                     "output": "",
-                                    "error": turn_result.as_ref().err().cloned(),
+                                    "error": result.as_ref().err().cloned(),
                                 })
                                 .to_string(),
                             );
                         }
                     }
-                    match turn_result {
+                    match result {
                         Ok(_outcome) => {
                             os.increment_turns_used_for(pid);
                             let mut should_terminate = true;
@@ -637,22 +637,8 @@ async fn run_loop(
                             os.drop_terminated(pid);
                         }
                     }
-
-                    let restarted = os.check_daemon_restart();
-                    if !restarted.is_empty() {
-                        use colored::Colorize;
-                        for rid in &restarted {
-                            println!(
-                                "{} Daemon process {} restarted.",
-                                "[OS]".bright_blue().bold(),
-                                rid
-                            );
-                        }
-                    }
-                }
+                }));
             }
-
-            continue;
         }
 
         {
@@ -820,16 +806,18 @@ async fn run_loop(
         app.session_history_file = original_history_file;
         app.writer = original_writer;
         if matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Quit)) || should_quit {
-            for obs in app.observers.iter_mut() {
-                if obs.is_poisoned() {
-                    continue;
-                }
-                let obs_name = obs.name().to_string();
-                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    obs.on_conversation_end();
-                })).is_err() {
-                    eprintln!("[Warning] observer '{}' panicked in on_conversation_end; disabling.", obs_name);
-                    obs.mark_poisoned();
+            if !one_shot_mode {
+                for obs in app.observers.iter_mut() {
+                    if obs.is_poisoned() {
+                        continue;
+                    }
+                    let obs_name = obs.name().to_string();
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        obs.on_conversation_end();
+                    })).is_err() {
+                        eprintln!("[Warning] observer '{}' panicked in on_conversation_end; disabling.", obs_name);
+                        obs.mark_poisoned();
+                    }
                 }
             }
             cleanup_one_shot(app);

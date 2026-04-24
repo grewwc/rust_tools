@@ -808,13 +808,6 @@ fn select_skill_with_preference_strength<'a>(
         let effective_current = current.score + sticky_bonus;
         let best_clearly_wins = best.score >= effective_current + switch_margin;
         let best_has_positive_signal = is_positive_skill_winner(best);
-        let best_semantically_crushes_current =
-            best.embedding_score >= current.embedding_score + 0.12
-                && best.blended_score >= current.blended_score + 0.12
-                && best_has_positive_signal;
-        if best_semantically_crushes_current {
-            return Some(best.skill);
-        }
         if best_clearly_wins && best_has_positive_signal {
             return Some(best.skill);
         }
@@ -942,8 +935,13 @@ pub(super) fn prepare_skill_for_turn(
         .eq_ignore_ascii_case("true");
 
     let intent = detect_turn_intent(question, &app.config.intent_model_path);
-    let ranked = rank_skills_locally_with_model_path(skill_manifests, question, Some(&intent), &app.config.skill_match_model_path);
     let cross_turn_preference = cross_turn_preferred_skill_name(app, question, &intent);
+    let ranked = rank_skills_locally_with_model_path(
+        skill_manifests,
+        question,
+        Some(&intent),
+        &app.config.skill_match_model_path,
+    );
     let skill = select_skill_with_preference_strength(
         skill_manifests,
         question,
