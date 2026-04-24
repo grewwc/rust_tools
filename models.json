@@ -256,5 +256,15 @@
     "search_enabled": false,
     "tools_default_enabled": true,
     "enable_thinking": true
+  },
+  {
+    "key": "Hy3 Preview Free",
+    "name": "hy3-preview-free",
+    "provider": "opencode",
+    "quality_tier": "basic",
+    "is_vl": false,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": true
   }
 ]
