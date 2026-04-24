@@ -1,7 +1,7 @@
 use crate::ai::{
     driver::tools::{self, ExecuteToolCallsResult},
     history::Message,
-    mcp::McpClient,
+    mcp::{McpClient, SharedMcpClient},
     types::{App, ToolCall},
 };
 use std::io::Write;
@@ -90,11 +90,12 @@ pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
 fn execute_tool_calls_for_round(
     session_id: &str,
     mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
     tool_calls: &[ToolCall],
     observer: Option<&mut dyn tools::ToolExecutionObserver>,
     _iteration: usize,
 ) -> Result<ExecuteToolCallsResult, Box<dyn std::error::Error>> {
-    tools::execute_tool_calls(session_id, mcp_client, tool_calls, observer)
+    tools::execute_tool_calls(session_id, mcp_client, shared_mcp_client, tool_calls, observer)
 }
 
 struct TerminalToolObserver<'a> {
@@ -248,6 +249,7 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
 fn handle_tool_call_round(
     app: &mut App,
     mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
     stream_result: &crate::ai::types::StreamResult,
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
@@ -259,6 +261,7 @@ fn handle_tool_call_round(
     let exec_result = execute_tool_calls_for_round(
         &app.session_id,
         mcp_client,
+        shared_mcp_client,
         &stream_result.tool_calls,
         Some(&mut observer),
         iteration,
@@ -288,6 +291,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     app: &mut App,
     _question: &str,
     mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
     execution: IterationExecution,
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
@@ -321,6 +325,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             *terminal_dedupe_candidate = handle_tool_call_round(
                 app,
                 mcp_client,
+                shared_mcp_client,
                 &stream_result,
                 messages,
                 turn_messages,

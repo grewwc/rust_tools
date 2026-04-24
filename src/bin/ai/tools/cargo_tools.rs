@@ -59,6 +59,7 @@ inventory::submit!(ToolRegistration {
         description: "Run `cargo check` with optional workspace/all-features/package flags and return the output.",
         parameters: params_cargo_check,
         execute: execute_cargo_check,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["executor"],
     }
 });
@@ -69,6 +70,7 @@ inventory::submit!(ToolRegistration {
         description: "Run `cargo test` with optional workspace/all-features/package flags and return the output.",
         parameters: params_cargo_test,
         execute: execute_cargo_test,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["executor"],
     }
 });

@@ -30,8 +30,8 @@ use std::path::PathBuf;
 use rust_tools::commonw::{FastMap, FastSet};
 
 use crate::ai::kernel::{
-    Kernel, KernelInternal, Process, ProcessCapabilities, ProcessState, ShmReadError, Signal,
-    Syscall, DEFAULT_MAILBOX_CAPACITY,
+    EventId, Kernel, KernelInternal, Process, ProcessCapabilities, ProcessState, ShmReadError,
+    Signal, Syscall, WaitPolicy, WaitReason, DEFAULT_MAILBOX_CAPACITY,
 };
 
 pub(super) struct ShmEntry {
@@ -341,6 +341,22 @@ impl LocalOS {
 
         false
     }
+
+    fn event_wait_is_satisfied(
+        &self,
+        event_ids: &[EventId],
+        policy: &WaitPolicy,
+        completed_event_ids: &std::collections::HashSet<EventId>,
+    ) -> bool {
+        match policy {
+            WaitPolicy::Any => event_ids
+                .iter()
+                .any(|event_id| completed_event_ids.contains(event_id)),
+            WaitPolicy::All => event_ids
+                .iter()
+                .all(|event_id| completed_event_ids.contains(event_id)),
+        }
+    }
 }
 
 impl Syscall for LocalOS {
@@ -459,7 +475,9 @@ impl Syscall for LocalOS {
         }
 
         if let Some(current_proc) = self.processes.get_mut(&current) {
-            current_proc.state = ProcessState::Waiting { on_pid: target_pid };
+            current_proc.state = ProcessState::Waiting {
+                reason: WaitReason::ProcessExit { on_pid: target_pid },
+            };
         }
 
         self.wait_queue.entry(target_pid).or_default().push(current);
@@ -467,6 +485,40 @@ impl Syscall for LocalOS {
         self.yield_requested = true;
 
         Ok(())
+    }
+
+    fn wait_on_events(
+        &mut self,
+        event_ids: Vec<EventId>,
+        policy: WaitPolicy,
+        timeout_ticks: Option<u64>,
+    ) -> Result<Option<u64>, String> {
+        let current = self.current_pid.ok_or("No process currently running.")?;
+        self.require_capability(current, |caps| caps.wait, "wait on events")?;
+
+        let mut deduped = Vec::new();
+        for event_id in event_ids {
+            if !deduped.iter().any(|existing| existing == &event_id) {
+                deduped.push(event_id);
+            }
+        }
+        if deduped.is_empty() {
+            return Err("event_ids cannot be empty.".to_string());
+        }
+
+        let timeout_tick = timeout_ticks.map(|ticks| self.tick.saturating_add(ticks.max(1)));
+        if let Some(current_proc) = self.processes.get_mut(&current) {
+            current_proc.state = ProcessState::Waiting {
+                reason: WaitReason::Events {
+                    event_ids: deduped,
+                    policy,
+                    timeout_tick,
+                },
+            };
+        }
+        self.current_pid = None;
+        self.yield_requested = true;
+        Ok(timeout_tick)
     }
 
     fn send_ipc(&mut self, target_pid: u64, message: String) -> Result<(), String> {
@@ -996,19 +1048,42 @@ impl KernelInternal for LocalOS {
 
     fn advance_tick(&mut self) {
         self.tick = self.tick.saturating_add(1);
-        let mut wake_pids = Vec::new();
+        let mut wake_sleeping_pids = Vec::new();
+        let mut wake_async_timeout_pids = Vec::new();
         for (pid, proc) in self.processes.iter() {
             if let ProcessState::Sleeping { until_tick } = proc.state
                 && until_tick <= self.tick
             {
-                wake_pids.push(*pid);
+                wake_sleeping_pids.push(*pid);
+                continue;
+            }
+            if let ProcessState::Waiting {
+                reason:
+                    WaitReason::Events {
+                        timeout_tick: Some(until_tick),
+                        ..
+                    },
+            } = &proc.state
+                && *until_tick <= self.tick
+            {
+                wake_async_timeout_pids.push(*pid);
             }
         }
-        for pid in wake_pids {
+        for pid in wake_sleeping_pids {
             if let Some(proc) = self.processes.get_mut(&pid) {
                 proc.state = ProcessState::Ready;
                 proc.mailbox.push_back(format!(
                     "Sleep finished at scheduler tick {}.",
+                    self.tick
+                ));
+                self.ready_queue.push_back(pid);
+            }
+        }
+        for pid in wake_async_timeout_pids {
+            if let Some(proc) = self.processes.get_mut(&pid) {
+                proc.state = ProcessState::Ready;
+                proc.mailbox.push_back(format!(
+                        "Event wait timeout reached at scheduler tick {}.",
                     self.tick
                 ));
                 self.ready_queue.push_back(pid);
@@ -1107,6 +1182,45 @@ impl KernelInternal for LocalOS {
         false
     }
 
+    fn notify_events_completed(&mut self, completed_event_ids: &[EventId]) -> Vec<u64> {
+        if completed_event_ids.is_empty() {
+            return Vec::new();
+        }
+
+        let completed_set: std::collections::HashSet<EventId> =
+            completed_event_ids.iter().copied().collect();
+        let mut wake_pids = Vec::new();
+        for (pid, proc) in self.processes.iter() {
+            if let ProcessState::Waiting {
+                reason:
+                    WaitReason::Events {
+                        event_ids,
+                        policy,
+                        ..
+                    },
+            } = &proc.state
+                && self.event_wait_is_satisfied(event_ids, policy, &completed_set)
+            {
+                wake_pids.push(*pid);
+            }
+        }
+
+        for pid in &wake_pids {
+            if let Some(proc) = self.processes.get_mut(pid) {
+                proc.state = ProcessState::Ready;
+                proc.mailbox.push_back(format!(
+                    "[EVENT_WAKE]\nReason: event wait condition satisfied.\nCompleted event ids: {}\nRecommended next actions:\n1. Inspect the event-producing subsystem for fresh state.\n2. If these events came from async tool work, use tool_status or tool_wait to collect results.\n3. Cancel low-value still-running branches when appropriate.\n4. If enough results are already available, continue reasoning immediately.",
+                    completed_event_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ")
+                ));
+                self.ready_queue.push_back(*pid);
+            }
+        }
+        if !wake_pids.is_empty() {
+            self.sort_ready_queue();
+        }
+        wake_pids
+    }
+
     fn increment_turns_used_for(&mut self, pid: u64) {
         if let Some(proc) = self.processes.get_mut(&pid) {
             proc.turns_used += 1;
@@ -1193,7 +1307,10 @@ impl Kernel for LocalOS {}
 #[cfg(test)]
 mod tests {
     use super::{LocalOS, ShmReadError};
-    use crate::ai::kernel::{KernelInternal, ProcessCapabilities, ProcessState, Signal, Syscall};
+    use crate::ai::kernel::{
+        EventId, KernelInternal, ProcessCapabilities, ProcessState, Signal, Syscall, WaitPolicy,
+        WaitReason,
+    };
 
     #[test]
     fn foreground_process_can_wait_and_resume_on_child_exit() {
@@ -1216,7 +1333,7 @@ mod tests {
         assert!(os.current_process_id().is_none());
         assert!(matches!(
             os.get_process(root).map(|p| &p.state),
-            Some(ProcessState::Waiting { on_pid }) if *on_pid == child
+            Some(ProcessState::Waiting { reason: WaitReason::ProcessExit { on_pid } }) if *on_pid == child
         ));
 
         let resumed = os.pop_ready().unwrap();
@@ -1226,6 +1343,81 @@ mod tests {
         let root_proc = os.get_process(root).unwrap();
         assert_eq!(root_proc.state, ProcessState::Ready);
         assert_eq!(root_proc.mailbox.len(), 1);
+    }
+
+    #[test]
+    fn foreground_process_can_wait_on_events() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+
+        let timeout_tick = os
+            .wait_on_events(
+                vec![EventId::new(1), EventId::new(2)],
+                WaitPolicy::Any,
+                Some(3),
+            )
+            .unwrap();
+
+        assert_eq!(timeout_tick, Some(3));
+        assert!(os.consume_yield_requested());
+        assert!(os.current_process_id().is_none());
+        assert!(matches!(
+            os.get_process(root).map(|p| &p.state),
+            Some(ProcessState::Waiting {
+                reason: WaitReason::Events {
+                    event_ids,
+                    policy: WaitPolicy::Any,
+                    timeout_tick: Some(3),
+                }
+            }) if event_ids == &vec![EventId::new(1), EventId::new(2)]
+        ));
+    }
+
+    #[test]
+    fn event_wait_timeout_wakes_process() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+
+        os.wait_on_events(vec![EventId::new(1)], WaitPolicy::All, Some(2))
+            .unwrap();
+        os.advance_tick();
+        assert!(matches!(
+            os.get_process(root).map(|p| &p.state),
+            Some(ProcessState::Waiting {
+                reason: WaitReason::Events { .. }
+            })
+        ));
+
+        os.advance_tick();
+        let root_proc = os.get_process(root).unwrap();
+        assert_eq!(root_proc.state, ProcessState::Ready);
+        assert_eq!(
+            root_proc.mailbox.back().map(|s| s.as_str()),
+            Some("Event wait timeout reached at scheduler tick 2.")
+        );
+    }
+
+    #[test]
+    fn event_completion_wakes_waiting_process() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+
+        os.wait_on_events(
+            vec![EventId::new(1), EventId::new(2)],
+            WaitPolicy::Any,
+            None,
+        )
+        .unwrap();
+
+        let woke = os.notify_events_completed(&[EventId::new(2)]);
+        assert_eq!(woke, vec![root]);
+
+        let root_proc = os.get_process(root).unwrap();
+        assert_eq!(root_proc.state, ProcessState::Ready);
+        assert_eq!(
+            root_proc.mailbox.back().map(|s| s.as_str()),
+            Some("[EVENT_WAKE]\nReason: event wait condition satisfied.\nCompleted event ids: evt_2\nRecommended next actions:\n1. Inspect the event-producing subsystem for fresh state.\n2. If these events came from async tool work, use tool_status or tool_wait to collect results.\n3. Cancel low-value still-running branches when appropriate.\n4. If enough results are already available, continue reasoning immediately.")
+        );
     }
 
     #[test]

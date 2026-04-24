@@ -30,6 +30,7 @@ inventory::submit!(ToolRegistration {
         description: "Run a shell command with an optional working directory and timeout. Destructive/network/escalation commands are blocked; output is truncated and includes an exit code on failure.",
         parameters: params_execute_command,
         execute: execute_command,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });

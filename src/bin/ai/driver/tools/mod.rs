@@ -4,13 +4,15 @@ use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use serde_json::{Value, json};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, Mutex, atomic::{AtomicU64, Ordering}};
 use std::thread;
+use std::time::{Duration as StdDuration, Instant};
 use crate::ai::tools::os_tools::GLOBAL_OS;
 use rust_tools::commonw::FastMap;
 
 use crate::ai::{
-    mcp::McpClient,
+    kernel::{EventId, WaitPolicy},
+    mcp::{McpClient, SharedMcpClient},
     tools as builtin_tools,
     types::{ToolCall, ToolResult},
 };
@@ -68,6 +70,149 @@ struct ToolCachePayload {
 const TOOL_CACHE_RECENT_LIMIT: usize = 400;
 const TOOL_CACHE_MAX_RESULT_CHARS: usize = 12_000;
 const TOOL_CACHE_TTL_MINUTES: i64 = 30;
+const ASYNC_TOOL_REGISTRY_LIMIT: usize = 200;
+
+enum AsyncToolState {
+    Running,
+    Completed((ToolRoute, RunOneResult)),
+    Canceled { reason: String },
+}
+
+struct AsyncToolEntry {
+    event_id: EventId,
+    session_id: String,
+    tool_name: String,
+    started_at: Instant,
+    state: AsyncToolState,
+}
+
+static ASYNC_TOOL_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static ASYNC_EVENT_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+static ASYNC_TOOL_REGISTRY: LazyLock<Mutex<FastMap<String, AsyncToolEntry>>> =
+    LazyLock::new(|| Mutex::new(FastMap::default()));
+
+fn next_async_tool_id() -> String {
+    format!(
+        "tooltask_{}",
+        ASYNC_TOOL_NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn next_async_event_id() -> EventId {
+    EventId::new(ASYNC_EVENT_NEXT_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+fn prune_completed_async_tools(registry: &mut FastMap<String, AsyncToolEntry>) {
+    if registry.len() <= ASYNC_TOOL_REGISTRY_LIMIT {
+        return;
+    }
+    let completed_keys: Vec<String> = registry
+        .iter()
+        .filter(|(_, entry)| matches!(entry.state, AsyncToolState::Completed(_) | AsyncToolState::Canceled { .. }))
+        .map(|(key, _)| key.clone())
+        .collect();
+    for key in completed_keys {
+        registry.remove(&key);
+        if registry.len() <= ASYNC_TOOL_REGISTRY_LIMIT {
+            break;
+        }
+    }
+}
+
+fn completed_event_ids(registry: &FastMap<String, AsyncToolEntry>) -> Vec<EventId> {
+    registry
+        .iter()
+        .filter(|(_, entry)| matches!(entry.state, AsyncToolState::Completed(_) | AsyncToolState::Canceled { .. }))
+        .map(|(_, entry)| entry.event_id)
+        .collect()
+}
+
+fn notify_completed_events(completed_event_ids: &[EventId]) {
+    if completed_event_ids.is_empty() {
+        return;
+    }
+    if let Ok(guard) = GLOBAL_OS.lock()
+        && let Some(os) = guard.as_ref()
+        && let Ok(mut os) = os.lock()
+    {
+        let _ = os.notify_events_completed(completed_event_ids);
+    }
+}
+
+fn lookup_event_ids(session_id: &str, task_ids: &[String]) -> Result<Vec<EventId>, String> {
+    let registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
+    let mut event_ids = Vec::with_capacity(task_ids.len());
+    for task_id in task_ids {
+        let Some(entry) = registry.get(task_id) else {
+            return Err(format!("Unknown task_id: {}", task_id));
+        };
+        if entry.session_id != session_id {
+            return Err(format!("Task {} does not belong to this session.", task_id));
+        }
+        event_ids.push(entry.event_id);
+    }
+    Ok(event_ids)
+}
+
+fn parse_wait_policy(args: &Value) -> Result<WaitPolicy, String> {
+    match args
+        .get("wait_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("all")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "all" => Ok(WaitPolicy::All),
+        "any" => Ok(WaitPolicy::Any),
+        other => Err(format!(
+            "Invalid wait_policy '{}'. Expected 'all' or 'any'.",
+            other
+        )),
+    }
+}
+
+fn collect_async_task_snapshot(
+    session_id: &str,
+    task_ids: &[String],
+) -> Result<(Vec<Value>, Vec<Value>), String> {
+    let mut terminal_results = Vec::new();
+    let mut pending = Vec::new();
+    let registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
+    for task_id in task_ids {
+        let Some(entry) = registry.get(task_id) else {
+            return Err(format!("Unknown task_id: {}", task_id));
+        };
+        if entry.session_id != session_id {
+            return Err(format!("Task {} does not belong to this session.", task_id));
+        }
+        match &entry.state {
+            AsyncToolState::Running => pending.push(json!({
+                "task_id": task_id,
+                "tool_name": entry.tool_name,
+                "status": "running",
+                "elapsed_secs": entry.started_at.elapsed().as_secs_f64(),
+            })),
+            AsyncToolState::Completed((_route, run_result)) => terminal_results.push(json!({
+                "task_id": task_id,
+                "tool_name": entry.tool_name,
+                "status": if run_result.ok { "completed" } else { "failed" },
+                "ok": run_result.ok,
+                "cached": run_result.cached,
+                "executed": run_result.executed,
+                "elapsed_secs": entry.started_at.elapsed().as_secs_f64(),
+                "content": run_result.tool_result.content,
+            })),
+            AsyncToolState::Canceled { reason } => terminal_results.push(json!({
+                "task_id": task_id,
+                "tool_name": entry.tool_name,
+                "status": "canceled",
+                "reason": reason,
+                "elapsed_secs": entry.started_at.elapsed().as_secs_f64(),
+            })),
+        }
+    }
+    Ok((terminal_results, pending))
+}
 
 fn route_tool_call(mcp_client: &McpClient, tool_name: &str) -> ToolRoute {
     if let Some((server_name, tool_name)) = mcp_client.parse_tool_name_for_known_server(tool_name) {
@@ -181,14 +326,24 @@ fn format_tool_error(tool_call: &ToolCall, err: &str) -> ToolResult {
 }
 
 fn execute_prepared_tool_call(
+    session_id: &str,
     mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
     tool_call: &ToolCall,
     prepared: &PreparedToolCall,
     observer: &mut Option<&mut dyn ToolExecutionObserver>,
 ) -> Result<ToolResult, String> {
     match &prepared.route {
         ToolRoute::Builtin => {
-            if tool_call.function.name == "execute_command" {
+            if tool_call.function.name == "tool_spawn" {
+                execute_tool_spawn(session_id, mcp_client, shared_mcp_client, &tool_call.id, &prepared.args)
+            } else if tool_call.function.name == "tool_wait" {
+                execute_tool_wait(session_id, &tool_call.id, &prepared.args)
+            } else if tool_call.function.name == "tool_status" {
+                execute_tool_status(session_id, &tool_call.id, &prepared.args)
+            } else if tool_call.function.name == "tool_cancel" {
+                execute_tool_cancel(session_id, &tool_call.id, &prepared.args)
+            } else if tool_call.function.name == "execute_command" {
                 builtin_tools::command_tools::execute_command_streaming(&prepared.args, |chunk| {
                     if let Some(observer) = observer.as_deref_mut() {
                         observer.on_tool_stream(tool_call, chunk);
@@ -230,6 +385,451 @@ fn execute_prepared_builtin_tool_call(
         &prepared.args,
     )
     .map_err(|e| e.to_string())
+}
+
+fn validate_spawnable_tool(target_tool_name: &str, route: &ToolRoute) -> Result<(), String> {
+    if let ToolRoute::Mcp { tool_name, .. } = route {
+        if tool_name.starts_with("oauth_") {
+            return Err("OAuth helper MCP tools cannot be spawned asynchronously.".to_string());
+        }
+        if matches!(target_tool_name, "tool_spawn" | "tool_wait" | "tool_status") {
+            return Err(format!("Tool '{}' cannot be spawned recursively.", target_tool_name));
+        }
+        return Ok(());
+    }
+
+    let Some(spec) = crate::ai::tools::registry::common::get_tool_spec(target_tool_name) else {
+        return Err(format!("Unknown tool: {}", target_tool_name));
+    };
+
+    if spec.async_policy != crate::ai::tools::registry::common::ToolAsyncPolicy::Spawnable {
+        return Err(format!(
+            "Tool '{}' is not marked as spawnable for async execution.",
+            target_tool_name
+        ));
+    }
+
+    if matches!(target_tool_name, "tool_spawn" | "tool_wait" | "tool_status") {
+        return Err(format!("Tool '{}' cannot be spawned recursively.", target_tool_name));
+    }
+
+    Ok(())
+}
+
+fn execute_tool_spawn(
+    session_id: &str,
+    mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
+    tool_call_id: &str,
+    args: &Value,
+) -> Result<ToolResult, String> {
+    let target_tool_name = args
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .ok_or("Missing 'tool_name' parameter")?;
+    let target_args = args
+        .get("arguments")
+        .cloned()
+        .ok_or("Missing 'arguments' parameter")?;
+
+    let async_task_id = next_async_tool_id();
+    let synthetic_tool_call = ToolCall {
+        id: format!("async-call-{}", async_task_id),
+        tool_type: "function".to_string(),
+        function: crate::ai::types::FunctionCall {
+            name: target_tool_name.to_string(),
+            arguments: serde_json::to_string(&target_args)
+                .map_err(|e| format!("Failed to serialize arguments: {}", e))?,
+        },
+    };
+    let prepared = PreparedToolCall {
+        route: route_tool_call(mcp_client, target_tool_name),
+        args: target_args,
+    };
+
+    validate_spawnable_tool(target_tool_name, &prepared.route)?;
+    let event_id = next_async_event_id();
+
+    if let Some(tool_result) = load_cached_tool_result(session_id, &synthetic_tool_call, &prepared.args)
+    {
+        let run_result = RunOneResult {
+            tool_result,
+            ok: true,
+            executed: false,
+            cached: true,
+        };
+        let mut registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
+        registry.insert(
+            async_task_id.clone(),
+            AsyncToolEntry {
+                event_id,
+                session_id: session_id.to_string(),
+                tool_name: target_tool_name.to_string(),
+                started_at: Instant::now(),
+                state: AsyncToolState::Completed((prepared.route.clone(), run_result)),
+            },
+        );
+        prune_completed_async_tools(&mut registry);
+        let notify_ids = vec![event_id];
+        drop(registry);
+        notify_completed_events(&notify_ids);
+        return Ok(ToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            content: json!({
+                "task_id": async_task_id,
+                "tool_name": target_tool_name,
+                "status": "completed",
+                "cached": true,
+            })
+            .to_string(),
+        });
+    }
+
+    let session_id = session_id.to_string();
+    let session_id_for_registry = session_id.clone();
+    let tool_name = target_tool_name.to_string();
+    let prepared_for_thread = prepared.clone();
+    let tool_call_for_thread = synthetic_tool_call.clone();
+    let route_for_registry = prepared.route.clone();
+    let shared_mcp_client_for_thread = shared_mcp_client.clone();
+    let async_task_id_for_thread = async_task_id.clone();
+
+    thread::spawn(move || {
+        let result = match &prepared_for_thread.route {
+            ToolRoute::Builtin => {
+                execute_prepared_builtin_tool_call(&tool_call_for_thread, &prepared_for_thread)
+            }
+            ToolRoute::Mcp { .. } => {
+                let guard = shared_mcp_client_for_thread
+                    .lock()
+                    .map_err(|_| "Shared MCP client poisoned".to_string());
+                match guard {
+                    Ok(mc) => oauth::execute_mcp_tool_call(
+                        &mc,
+                        &tool_call_for_thread,
+                        match &prepared_for_thread.route {
+                            ToolRoute::Mcp { server_name, .. } => server_name,
+                            ToolRoute::Builtin => unreachable!(),
+                        },
+                        match &prepared_for_thread.route {
+                            ToolRoute::Mcp { tool_name, .. } => tool_name,
+                            ToolRoute::Builtin => unreachable!(),
+                        },
+                        &prepared_for_thread.args,
+                    )
+                    .map_err(|e| e.to_string()),
+                    Err(err) => Err(err),
+                }
+            }
+        };
+        let run_result = finalize_execution_result(
+            &session_id,
+            &tool_call_for_thread,
+            &prepared_for_thread,
+            result,
+            true,
+            false,
+        );
+
+        let mut completed_events = None;
+        if let Ok(mut registry) = ASYNC_TOOL_REGISTRY.lock() {
+            if let Some(entry) = registry.get_mut(&async_task_id_for_thread)
+                && matches!(entry.state, AsyncToolState::Running)
+            {
+                entry.state = AsyncToolState::Completed((route_for_registry, run_result));
+                completed_events = Some(completed_event_ids(&registry));
+            }
+        }
+        if let Some(event_ids) = completed_events {
+            notify_completed_events(&event_ids);
+        }
+    });
+
+    let mut registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
+    registry.insert(
+        async_task_id.clone(),
+        AsyncToolEntry {
+            event_id,
+            session_id: session_id_for_registry,
+            tool_name,
+            started_at: Instant::now(),
+            state: AsyncToolState::Running,
+        },
+    );
+    prune_completed_async_tools(&mut registry);
+
+    Ok(ToolResult {
+        tool_call_id: tool_call_id.to_string(),
+        content: json!({
+            "task_id": async_task_id,
+            "tool_name": target_tool_name,
+            "status": "running",
+            "cached": false,
+        })
+        .to_string(),
+    })
+}
+
+fn execute_tool_status(session_id: &str, tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
+    let filter_task_ids = args
+        .get("task_ids")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        });
+
+    let mut results = Vec::new();
+    {
+        let mut registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
+        let task_ids: Vec<String> = if let Some(ids) = filter_task_ids {
+            ids
+        } else {
+            registry
+                .iter()
+                .filter(|(_, entry)| entry.session_id == session_id)
+                .map(|(task_id, _)| task_id.clone())
+                .collect()
+        };
+
+        for task_id in task_ids {
+            let Some(entry) = registry.get_mut(&task_id) else {
+                continue;
+            };
+            if entry.session_id != session_id {
+                continue;
+            }
+            match &entry.state {
+                AsyncToolState::Running => results.push(json!({
+                    "task_id": task_id,
+                    "tool_name": entry.tool_name,
+                    "status": "running",
+                    "elapsed_secs": entry.started_at.elapsed().as_secs_f64(),
+                })),
+                AsyncToolState::Completed((_route, run_result)) => results.push(json!({
+                    "task_id": task_id,
+                    "tool_name": entry.tool_name,
+                    "status": if run_result.ok { "completed" } else { "failed" },
+                    "ok": run_result.ok,
+                    "cached": run_result.cached,
+                    "executed": run_result.executed,
+                    "elapsed_secs": entry.started_at.elapsed().as_secs_f64(),
+                })),
+                AsyncToolState::Canceled { reason } => results.push(json!({
+                    "task_id": task_id,
+                    "tool_name": entry.tool_name,
+                    "status": "canceled",
+                    "reason": reason,
+                    "elapsed_secs": entry.started_at.elapsed().as_secs_f64(),
+                })),
+            }
+        }
+    }
+
+    Ok(ToolResult {
+        tool_call_id: tool_call_id.to_string(),
+        content: json!({ "results": results }).to_string(),
+    })
+}
+
+fn execute_tool_cancel(session_id: &str, tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
+    let task_ids = args
+        .get("task_ids")
+        .and_then(Value::as_array)
+        .ok_or("Missing 'task_ids' array parameter")?
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect::<Vec<_>>();
+    if task_ids.is_empty() {
+        return Err("task_ids array cannot be empty".to_string());
+    }
+
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("canceled by model")
+        .to_string();
+
+    let mut results = Vec::new();
+    let mut notify_ids = Vec::new();
+    let mut registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
+    for task_id in task_ids {
+        let Some(entry) = registry.get_mut(&task_id) else {
+            return Err(format!("Unknown task_id: {}", task_id));
+        };
+        if entry.session_id != session_id {
+            return Err(format!("Task {} does not belong to this session.", task_id));
+        }
+
+        match &entry.state {
+            AsyncToolState::Running => {
+                entry.state = AsyncToolState::Canceled {
+                    reason: reason.clone(),
+                };
+                notify_ids.push(entry.event_id);
+                results.push(json!({
+                    "task_id": task_id,
+                    "tool_name": entry.tool_name,
+                    "status": "canceled",
+                    "reason": reason,
+                }));
+            }
+            AsyncToolState::Completed((_route, run_result)) => {
+                results.push(json!({
+                    "task_id": task_id,
+                    "tool_name": entry.tool_name,
+                    "status": if run_result.ok { "completed" } else { "failed" },
+                    "reason": "task already finished",
+                }));
+            }
+            AsyncToolState::Canceled { reason } => {
+                results.push(json!({
+                    "task_id": task_id,
+                    "tool_name": entry.tool_name,
+                    "status": "canceled",
+                    "reason": reason,
+                }));
+            }
+        }
+    }
+    prune_completed_async_tools(&mut registry);
+    drop(registry);
+    if !notify_ids.is_empty() {
+        notify_completed_events(&notify_ids);
+    }
+
+    Ok(ToolResult {
+        tool_call_id: tool_call_id.to_string(),
+        content: json!({ "results": results }).to_string(),
+    })
+}
+
+fn execute_tool_wait(session_id: &str, tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
+    let task_ids = args
+        .get("task_ids")
+        .and_then(Value::as_array)
+        .ok_or("Missing 'task_ids' array parameter")?
+        .iter()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect::<Vec<_>>();
+    if task_ids.is_empty() {
+        return Err("task_ids array cannot be empty".to_string());
+    }
+
+    let wait_policy = parse_wait_policy(args)?;
+    let timeout_ticks = args.get("timeout_ticks").and_then(Value::as_u64);
+    let (initial_terminal, initial_pending) = collect_async_task_snapshot(session_id, &task_ids)?;
+    let satisfied = match wait_policy {
+        WaitPolicy::Any => !initial_terminal.is_empty(),
+        WaitPolicy::All => initial_pending.is_empty(),
+    };
+    if satisfied {
+        let all_done = initial_pending.is_empty();
+        let completed_for_results = initial_terminal.clone();
+        let pending_for_results = initial_pending.clone();
+        let suggested_next_actions = if all_done {
+            vec!["continue_reasoning"]
+        } else if !initial_terminal.is_empty() {
+            vec!["continue_reasoning_with_partial_results", "use_tool_status", "use_tool_cancel"]
+        } else {
+            vec!["use_tool_status", "continue_reasoning", "use_tool_cancel"]
+        };
+        return Ok(ToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            content: json!({
+                "all_done": all_done,
+                "completed": initial_terminal,
+                "pending": initial_pending,
+                "results": {
+                    "completed": completed_for_results,
+                    "pending": pending_for_results,
+                },
+                "wait_policy": match wait_policy { WaitPolicy::Any => "any", WaitPolicy::All => "all" },
+                "suggested_next_actions": suggested_next_actions,
+            })
+            .to_string(),
+        });
+    }
+
+    if let Ok(guard) = GLOBAL_OS.lock()
+        && let Some(os) = guard.as_ref()
+        && let Ok(mut os) = os.lock()
+        && os.current_process_id().is_some()
+    {
+        let event_ids = lookup_event_ids(session_id, &task_ids)?;
+        let wake_tick = os.wait_on_events(event_ids.clone(), wait_policy.clone(), timeout_ticks)?;
+        return Ok(ToolResult {
+            tool_call_id: tool_call_id.to_string(),
+            content: json!({
+                "status": "suspended",
+                "wait_policy": match wait_policy { WaitPolicy::Any => "any", WaitPolicy::All => "all" },
+                "task_ids": task_ids,
+                "event_ids": event_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                "timeout_tick": wake_tick,
+                "message": "Current process suspended on event wait condition. Yield control now; after wake-up, inspect mailbox and use tool_status or tool_wait again if needed."
+            })
+            .to_string(),
+        });
+    }
+
+    let max_wait_ms = args
+        .get("max_wait_ms")
+        .and_then(Value::as_u64)
+        .or_else(|| args.get("timeout_secs").and_then(Value::as_u64).map(|secs| secs.saturating_mul(1000)))
+        .unwrap_or(1500);
+    let deadline = Instant::now() + StdDuration::from_millis(max_wait_ms);
+    while Instant::now() < deadline {
+        let registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
+        let mut has_terminal = false;
+        let mut has_running = false;
+        for task_id in &task_ids {
+            let Some(entry) = registry.get(task_id) else {
+                return Err(format!("Unknown task_id: {}", task_id));
+            };
+            if entry.session_id != session_id {
+                return Err(format!("Task {} does not belong to this session.", task_id));
+            }
+            match entry.state {
+                AsyncToolState::Running => has_running = true,
+                AsyncToolState::Completed(_) | AsyncToolState::Canceled { .. } => has_terminal = true,
+            }
+        }
+        drop(registry);
+        if has_terminal || !has_running {
+            break;
+        }
+        thread::sleep(StdDuration::from_millis(50));
+    }
+
+    let (terminal_results, pending) = collect_async_task_snapshot(session_id, &task_ids)?;
+
+    let all_done = pending.is_empty();
+    let completed_for_results = terminal_results.clone();
+    let pending_for_results = pending.clone();
+    let suggested_next_actions = if all_done {
+        vec!["continue_reasoning"]
+    } else if !terminal_results.is_empty() {
+        vec!["continue_reasoning_with_partial_results", "use_tool_status", "use_tool_cancel"]
+    } else {
+        vec!["use_tool_status", "continue_reasoning", "use_tool_cancel"]
+    };
+
+    Ok(ToolResult {
+        tool_call_id: tool_call_id.to_string(),
+        content: json!({
+            "all_done": all_done,
+            "wait_window_ms": max_wait_ms,
+            "completed": terminal_results,
+            "pending": pending,
+            "results": {
+                "completed": completed_for_results,
+                "pending": pending_for_results,
+            },
+            "suggested_next_actions": suggested_next_actions,
+        })
+        .to_string(),
+    })
 }
 
 fn record_tool_failure(tool_name: &str) {
@@ -405,6 +1005,7 @@ fn execute_parallel_task_batch(
 
 fn run_one(
     mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
     session_id: &str,
     tool_call: &ToolCall,
     observer: &mut Option<&mut dyn ToolExecutionObserver>,
@@ -482,7 +1083,14 @@ fn run_one(
         observer.on_tool_started(tool_call);
     }
 
-    let result = execute_prepared_tool_call(mcp_client, tool_call, &prepared, observer);
+    let result = execute_prepared_tool_call(
+        session_id,
+        mcp_client,
+        shared_mcp_client,
+        tool_call,
+        &prepared,
+        observer,
+    );
     let run_result = finalize_execution_result(session_id, tool_call, &prepared, result, true, false);
 
     (prepared.route, run_result)
@@ -491,20 +1099,22 @@ fn run_one(
 pub(super) fn execute_tool_calls(
     session_id: &str,
     mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
     tool_calls: &[ToolCall],
     observer: Option<&mut dyn ToolExecutionObserver>,
 ) -> Result<ExecuteToolCallsResult, Box<dyn Error>> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return tokio::task::block_in_place(|| {
-            execute_tool_calls_inner(session_id, mcp_client, tool_calls, observer)
+            execute_tool_calls_inner(session_id, mcp_client, shared_mcp_client, tool_calls, observer)
         });
     }
-    execute_tool_calls_inner(session_id, mcp_client, tool_calls, observer)
+    execute_tool_calls_inner(session_id, mcp_client, shared_mcp_client, tool_calls, observer)
 }
 
 fn execute_tool_calls_inner(
     session_id: &str,
     mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
     tool_calls: &[ToolCall],
     mut observer: Option<&mut dyn ToolExecutionObserver>,
 ) -> Result<ExecuteToolCallsResult, Box<dyn Error>> {
@@ -564,7 +1174,8 @@ fn execute_tool_calls_inner(
 
         let tool_call = &tool_calls[idx];
         let is_last = idx + 1 >= tool_calls.len();
-        let (route, run_result) = run_one(mcp_client, session_id, tool_call, &mut observer);
+        let (route, run_result) =
+            run_one(mcp_client, shared_mcp_client, session_id, tool_call, &mut observer);
         let should_barrier = barrier::should_barrier_after(
             &route,
             tool_call,

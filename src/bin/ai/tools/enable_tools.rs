@@ -253,6 +253,7 @@ inventory::submit!(ToolRegistration {
         description: "List or activate additional tools that are not loaded by default. Use 'list' to see available tools, 'enable' to activate specific tools by name. Enabled tools become available in subsequent calls. Use this when you need specialized capabilities like memory, knowledge base, undo, web browsing, or MCP server tools.",
         parameters: params_enable_tools,
         execute: execute_enable_tools,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });

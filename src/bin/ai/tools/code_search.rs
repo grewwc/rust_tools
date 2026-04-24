@@ -135,6 +135,7 @@ inventory::submit!(ToolRegistration {
         description: "High-level code navigation and search tool. Prefer this before raw grep/read tools. Internally routes to LSP for symbol/definition/reference lookups, to search_files for file discovery, to built-in content scanning for full-text search, and to built-in tree-sitter AST search for structural matching. For structural searches, set operation=structural and choose intent=find_functions|find_classes|find_methods|find_calls. Use name / contains_text / call_kind / receiver / qualified_name to narrow large result sets. Example: operation=structural, intent=find_calls, call_kind=method_call, receiver=app.view, name=render.",
         parameters: params_code_search,
         execute: execute_code_search,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin", "core"],
     }
 });

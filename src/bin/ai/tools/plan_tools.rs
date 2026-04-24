@@ -91,6 +91,7 @@ inventory::submit!(ToolRegistration {
         description: "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. Simple tasks (read one file, answer a question, run one command) do NOT need a plan — just act directly.",
         parameters: params_plan,
         execute: execute_plan,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });

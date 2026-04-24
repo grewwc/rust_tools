@@ -124,6 +124,7 @@ inventory::submit!(ToolRegistration {
         description: "List available skills by metadata only. Use this to discover skill names, descriptions, priorities, and optional capability summaries without loading full skill prompts.",
         parameters: params_discover_skills,
         execute: execute_discover_skills,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
@@ -199,6 +200,7 @@ inventory::submit!(ToolRegistration {
         description: "Render and save a .skill file (YAML front matter + prompt body) into the configured skills directory.",
         parameters: params_save_skill,
         execute: execute_save_skill,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });

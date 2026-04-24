@@ -135,6 +135,7 @@ inventory::submit!(ToolRegistration {
         description: "Save user-directed content to the global knowledge base with optional category and tags. The agent automatically checks the knowledge base at the start of each conversation.",
         parameters: params_knowledge_save,
         execute: execute_knowledge_save,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -204,6 +205,7 @@ inventory::submit!(ToolRegistration {
         description: "Delete a knowledge entry by id. Use knowledge_list or knowledge_search first to find the id.",
         parameters: params_knowledge_forget,
         execute: execute_knowledge_forget,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -286,6 +288,7 @@ inventory::submit!(ToolRegistration {
             "Search knowledge base entries by keyword. Returns matching entries with their ids.",
         parameters: params_knowledge_search,
         execute: execute_knowledge_search,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin"],
     }
 });
@@ -377,6 +380,7 @@ inventory::submit!(ToolRegistration {
         description: "List recent knowledge base entries. Shows id, category, and content preview.",
         parameters: params_knowledge_list,
         execute: execute_knowledge_list,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin"],
     }
 });

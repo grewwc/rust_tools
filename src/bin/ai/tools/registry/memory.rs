@@ -236,6 +236,7 @@ inventory::submit!(ToolRegistration {
         description: "Append content to the global memory store.",
         parameters: params_memory_append,
         execute: execute_memory_append,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -246,6 +247,7 @@ inventory::submit!(ToolRegistration {
         description: "Save user-directed content to the global memory store with optional category and tags.",
         parameters: params_memory_save,
         execute: execute_memory_save,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -256,6 +258,7 @@ inventory::submit!(ToolRegistration {
         description: "Search memory entries by keyword.",
         parameters: params_memory_search,
         execute: execute_memory_search,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin"],
     }
 });
@@ -266,6 +269,7 @@ inventory::submit!(ToolRegistration {
         description: "Update an existing memory entry by id.",
         parameters: params_memory_update,
         execute: execute_memory_update,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -276,6 +280,7 @@ inventory::submit!(ToolRegistration {
         description: "Get recent memory entries.",
         parameters: params_memory_recent,
         execute: execute_memory_recent,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin"],
     }
 });
@@ -286,6 +291,7 @@ inventory::submit!(ToolRegistration {
         description: "Delete a memory entry by id.",
         parameters: params_memory_delete,
         execute: execute_memory_delete,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -296,6 +302,7 @@ inventory::submit!(ToolRegistration {
         description: "List memory entries as JSON.",
         parameters: params_memory_list_json,
         execute: execute_memory_list_json,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin"],
     }
 });
@@ -306,6 +313,7 @@ inventory::submit!(ToolRegistration {
         description: "Rotate memory file to keep only recent entries.",
         parameters: params_memory_rotate,
         execute: execute_memory_rotate,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -316,6 +324,7 @@ inventory::submit!(ToolRegistration {
         description: "Garbage collect old memory entries.",
         parameters: params_memory_gc,
         execute: execute_memory_gc,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -326,6 +335,7 @@ inventory::submit!(ToolRegistration {
         description: "Remove duplicate memory entries.",
         parameters: params_memory_dedup,
         execute: execute_memory_dedup,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -336,6 +346,7 @@ inventory::submit!(ToolRegistration {
         description: "Manage knowledge cache: view stats, clear volatile cache, or force refresh.",
         parameters: params_knowledge_cache_manage,
         execute: execute_knowledge_cache_manage,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });

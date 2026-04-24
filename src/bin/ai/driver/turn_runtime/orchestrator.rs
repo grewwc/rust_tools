@@ -119,6 +119,7 @@ pub(in crate::ai::driver) async fn run_turn(
                 app,
                 &question,
                 &mc,
+                mcp_client,
                 execution,
                 &mut messages,
                 &mut turn_messages,

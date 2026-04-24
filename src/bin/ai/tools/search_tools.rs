@@ -65,6 +65,7 @@ inventory::submit!(ToolRegistration {
         description: "List direct children of a directory (non-recursive). Each line is a child name; directories are suffixed with '/'.",
         parameters: params_list_directory,
         execute: execute_list_directory,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin"],
     }
 });
@@ -75,6 +76,7 @@ inventory::submit!(ToolRegistration {
         description: "Find files under a directory by exact filename (fast) or glob pattern. Returns canonical absolute paths, one per line (empty output means no matches).",
         parameters: params_search_files,
         execute: execute_search_files,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin", "core"],
     }
 });
@@ -85,6 +87,7 @@ inventory::submit!(ToolRegistration {
         description: "Fast file-path search under a root directory using filename match or glob. Returns paths relative to the current working directory (may include ANSI highlighting).",
         parameters: params_grep_search,
         execute: execute_grep_search,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin", "core"],
     }
 });

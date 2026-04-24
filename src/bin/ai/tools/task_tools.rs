@@ -85,6 +85,7 @@ inventory::submit!(ToolRegistration {
         description: "Launch a specialized subagent to handle a focused task. Use this for complex work, codebase exploration, independent side investigations, or when multiple subtasks can be delegated. If agent is omitted, the runtime auto-selects a suitable subagent.",
         parameters: params_task,
         execute: execute_task,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
@@ -143,6 +144,7 @@ inventory::submit!(ToolRegistration {
         description: "Launch a subagent task asynchronously and return immediately with a task_id. Use this when you want to run multiple subagent tasks in parallel. Collect results later with task_wait.",
         parameters: params_task_spawn,
         execute: execute_task_spawn,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
@@ -232,15 +234,155 @@ fn params_task_wait() -> Value {
     })
 }
 
+fn params_tool_spawn() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "tool_name": {
+                "type": "string",
+                "description": "Builtin or MCP tool name to run asynchronously. The tool must support async spawning."
+            },
+            "arguments": {
+                "type": "object",
+                "description": "JSON arguments for the target tool."
+            }
+        },
+        "required": ["tool_name", "arguments"]
+    })
+}
+
+fn params_tool_wait() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "task_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Array of task ids returned by tool_spawn."
+            },
+            "max_wait_ms": {
+                "type": "integer",
+                "description": "Short wait window in milliseconds before returning control to the model. Default 1500."
+            },
+            "wait_policy": {
+                "type": "string",
+                "enum": ["any", "all"],
+                "description": "When used with AIOS suspend/resume, wake when any waited event finishes or only after all waited events finish. Default is all."
+            },
+            "timeout_ticks": {
+                "type": "integer",
+                "description": "Optional AIOS scheduler timeout in ticks when suspending on waited events."
+            },
+            "timeout_secs": {
+                "type": "integer",
+                "description": "Legacy alias for wait budget. If max_wait_ms is absent, timeout_secs will be converted to milliseconds."
+            }
+        },
+        "required": ["task_ids"]
+    })
+}
+
+fn params_tool_status() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "task_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Optional array of tool task ids. If omitted, returns all async tool tasks for the current session."
+            }
+        }
+    })
+}
+
+fn params_tool_cancel() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "task_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Array of async tool task ids to cancel."
+            },
+            "reason": {
+                "type": "string",
+                "description": "Optional reason for canceling these tasks."
+            }
+        },
+        "required": ["task_ids"]
+    })
+}
+
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_wait",
         description: "Wait for one or more asynchronously spawned tasks to complete and collect their results. Polls all tasks in parallel so total wait time equals the slowest task, not the sum. Use after task_spawn to gather results.",
         parameters: params_task_wait,
         execute: execute_task_wait,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "tool_spawn",
+        description: "Launch a builtin or MCP tool asynchronously and return immediately with a task id. Use this when the tool call is independent from the current step and you want to fan out multiple lookups in parallel. Preferred cases: reading multiple files, querying multiple MCP tools, fetching several URLs, or launching several unrelated searches before comparing results. Do NOT use this when the next tool depends on this result immediately, when the tool mutates state, or when the calls must happen in strict order. Typical pattern: call tool_spawn several times first, continue reasoning or launch other independent work, then use tool_status or tool_wait later.",
+        parameters: params_tool_spawn,
+        execute: execute_tool_spawn_placeholder,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "tool_wait",
+        description: "Wait for one or more async tool tasks started by tool_spawn. When running inside AIOS process scheduling, this tool suspends the current process by calling wait_on_events and yields control until the wait condition is satisfied or timeout_ticks is reached. When AIOS process context is unavailable, it falls back to a short non-blocking wait window and returns partial progress. Use wait_policy=all to join a batch, or wait_policy=any when you want to resume as soon as any branch finishes.",
+        parameters: params_tool_wait,
+        execute: execute_tool_wait_placeholder,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "tool_status",
+        description: "Inspect async tool tasks started by tool_spawn without blocking. Use this when you want to check progress before deciding whether to wait, continue other reasoning, or spawn more independent work. Preferred cases: long-running MCP requests, background searches, or when only some spawned tasks may have finished and you want to opportunistically use completed results first. Do NOT use this when you already know you must have the final outputs right now; use tool_wait instead.",
+        parameters: params_tool_status,
+        execute: execute_tool_status_placeholder,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core"],
+    }
+});
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "tool_cancel",
+        description: "Cancel one or more async tool tasks started by tool_spawn. Use this when a background lookup is no longer needed, when another result already answered the question, or when the model wants to stop waiting on a low-value branch. This is a best-effort cancel from the runtime perspective: the task becomes canceled and future wait/status calls report it as canceled, but already-running underlying work may continue in the background and its final result will be discarded.",
+        parameters: params_tool_cancel,
+        execute: execute_tool_cancel_placeholder,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core"],
+    }
+});
+
+fn execute_tool_spawn_placeholder(_args: &Value) -> Result<String, String> {
+    Err("tool_spawn is handled by the runtime".to_string())
+}
+
+fn execute_tool_wait_placeholder(_args: &Value) -> Result<String, String> {
+    Err("tool_wait is handled by the runtime".to_string())
+}
+
+fn execute_tool_status_placeholder(_args: &Value) -> Result<String, String> {
+    Err("tool_status is handled by the runtime".to_string())
+}
+
+fn execute_tool_cancel_placeholder(_args: &Value) -> Result<String, String> {
+    Err("tool_cancel is handled by the runtime".to_string())
+}
 
 pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     let task_ids = args["task_ids"]
@@ -415,6 +557,7 @@ inventory::submit!(ToolRegistration {
         description: "Show status of all asynchronously spawned tasks. Lists task_id, agent, model, and current state (running/completed/failed) without blocking.",
         parameters: params_task_status,
         execute: execute_task_status,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });
@@ -914,6 +1057,7 @@ inventory::submit!(ToolRegistration {
         description: "Ask the user questions during execution. Use this to gather preferences, clarify ambiguous instructions, get decisions on implementation choices, or offer choices about direction. Returns the user's selected answer(s).",
         parameters: params_question,
         execute: execute_question,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
 });

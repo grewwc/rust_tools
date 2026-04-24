@@ -85,6 +85,7 @@ inventory::submit!(ToolRegistration {
         description: "Search the public web using DuckDuckGo for real-time information including weather, news, stock prices, current events, documentation, and references. Returns up to num_results results with title, URL, and snippet.",
         parameters: params_web_search,
         execute: execute_web_search,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin"],
     }
 });
@@ -95,6 +96,7 @@ inventory::submit!(ToolRegistration {
         description: "Fetch the content of an http/https URL (5s timeout, 512KB cap). Blocks localhost/private network targets. Set extract_content=true to auto-remove nav, script, style and return clean article text. Returns URL, status, content-type, and content.",
         parameters: params_web_fetch,
         execute: execute_web_fetch,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin"],
     }
 });

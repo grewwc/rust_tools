@@ -20,14 +20,57 @@ use rust_tools::commonw::{FastMap, FastSet};
 /// Process lifecycle states - similar to OS process states
 /// Controls process scheduling and execution flow
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitPolicy {
+    Any,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EventId(u64);
+
+impl EventId {
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    pub const fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for EventId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "evt_{}", self.0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitReason {
+    /// Wait until another process terminates.
+    ProcessExit { on_pid: u64 },
+    /// Wait for one or more external events to reach a terminal state.
+    /// Runtime layers are responsible for mapping domain-specific async work
+    /// (tool tasks, background jobs, etc.) onto these opaque event ids.
+    Events {
+        event_ids: Vec<EventId>,
+        policy: WaitPolicy,
+        timeout_tick: Option<u64>,
+    },
+}
+
+/// Process lifecycle states - similar to OS process states
+/// Controls process scheduling and execution flow
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessState {
     /// Process is ready to be scheduled for execution
     Ready,
     /// Process is currently executing (in an LLM turn)
     Running,
-    /// Process is blocked waiting for another process to finish
-    /// Used by wait_on syscall - blocks until target_pid terminates
-    Waiting { on_pid: u64 },
+    /// Process is blocked waiting for an external condition to be satisfied.
+    /// Examples:
+    /// - another process terminates
+    /// - one or more external events finish
+    Waiting { reason: WaitReason },
     /// Process is sleeping for a number of scheduler ticks
     /// Used by sleep_current syscall - pause execution for N ticks
     Sleeping { until_tick: u64 },
@@ -161,6 +204,7 @@ pub struct Process {
 /// Process management:
 ///   - spawn(): Create a new child process (subagent)
 ///   - wait_on(): Block until another process terminates
+///   - wait_on_events(): Block until external events reach the desired completion condition
 ///   - kill_process(): Request termination of another process
 ///   - reap_process(): Collect terminated process result
 /// 
@@ -189,6 +233,12 @@ pub trait Syscall {
         allowed_tools: Option<FastSet<String>>,
     ) -> Result<u64, String>;
     fn wait_on(&mut self, target_pid: u64) -> Result<(), String>;  // 等待进程终止
+    fn wait_on_events(
+        &mut self,
+        event_ids: Vec<EventId>,
+        policy: WaitPolicy,
+        timeout_ticks: Option<u64>,
+    ) -> Result<Option<u64>, String>;  // 等待外部事件
     fn send_ipc(&mut self, target_pid: u64, message: String) -> Result<(), String>;  // 发送 IPC 消息
     fn read_mailbox(&mut self) -> Result<Vec<String>, String>;  // 读取邮箱
     fn set_env(&mut self, key: String, value: String) -> Result<(), String>;  // 设置环境变量
@@ -269,6 +319,9 @@ pub trait KernelInternal {
     fn requeue_current(&mut self) -> bool;
     /// 处理当前进程的所有待处理信号，返回是否处理了信号
     fn process_pending_signals(&mut self) -> bool;
+    /// 通知 kernel 某些外部事件已进入终态，用于唤醒等待这些事件的进程。
+    /// 返回被唤醒的 PID 列表。
+    fn notify_events_completed(&mut self, completed_event_ids: &[EventId]) -> Vec<u64>;
     /// 为指定进程增加已使用 turn 数（用于配额检查）
     fn increment_turns_used_for(&mut self, pid: u64);
     /// 为指定进程增加已使用 tool call 数（用于配额检查）

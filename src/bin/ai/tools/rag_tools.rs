@@ -142,6 +142,7 @@ inventory::submit!(ToolRegistration {
         description: "Search knowledge base using semantic (vector) similarity. Understands meaning beyond keywords. Use this when keyword search fails to find relevant results.",
         parameters: params_semantic_search,
         execute: execute_semantic_search,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin"],
     }
 });
@@ -173,6 +174,7 @@ inventory::submit!(ToolRegistration {
         description: "Rebuild the vector index from the current memory store. Use this after bulk changes or if the index seems out of sync.",
         parameters: params_rebuild_index,
         execute: execute_rebuild_index,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });

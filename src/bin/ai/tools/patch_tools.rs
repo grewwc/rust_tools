@@ -29,6 +29,7 @@ inventory::submit!(ToolRegistration {
         description: "Apply a unified-diff patch to a file (absolute path). Prefer this for updating an existing document or source file with the smallest localized change instead of rewriting the entire file. Creates missing parent directories; fails if context/removals do not match.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["executor", "builtin", "core"],
     }
 });

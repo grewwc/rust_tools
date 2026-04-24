@@ -31,6 +31,7 @@ inventory::submit!(ToolRegistration {
         description: "Manually trigger context compaction to reduce token usage. Compresses older conversation turns into a concise summary while keeping recent turns intact. Use this when the conversation gets long and you want to optimize for token efficiency.",
         parameters: params_compact_context,
         execute: execute_compact_context,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -42,6 +43,7 @@ inventory::submit!(ToolRegistration {
             "Show current context usage including approximate token count and compression status.",
         parameters: params_context_status,
         execute: execute_context_status,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });

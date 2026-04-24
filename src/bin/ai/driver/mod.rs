@@ -494,7 +494,7 @@ async fn run_loop(
                         }
                     }
                     format!(
-                        "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nResume execution based on the goal and these messages.",
+                        "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- If the mailbox indicates async tool wake-up, first decide whether you need `tool_status` for a full snapshot, `tool_wait` to collect newly finished results, or `tool_cancel` to stop low-value branches.\n- Do not blindly wait again if enough completed results already support the answer.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
                         pid,
                         proc.goal,
                         messages.join("\n---\n")

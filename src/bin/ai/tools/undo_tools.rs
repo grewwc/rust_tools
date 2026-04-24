@@ -108,6 +108,7 @@ inventory::submit!(ToolRegistration {
         description: "Undo the most recent file changes. Restores files to their state before the last modification. Use 'count' to undo multiple changes. Each undo can be reversed with redo.",
         parameters: params_undo,
         execute: execute_undo,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -118,6 +119,7 @@ inventory::submit!(ToolRegistration {
         description: "Redo previously undone changes. Restores changes that were undone. Use 'count' to redo multiple changes.",
         parameters: params_redo,
         execute: execute_redo,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
@@ -129,6 +131,7 @@ inventory::submit!(ToolRegistration {
             "Show the current undo/redo stack status, listing available undo and redo operations.",
         parameters: params_undo_status,
         execute: execute_undo_status,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin"],
     }
 });
