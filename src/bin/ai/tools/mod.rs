@@ -19,7 +19,7 @@ mod search_tools;
 pub(crate) mod service;
 mod skill_tools;
 pub(crate) mod storage;
-mod task_tools;
+pub(crate) mod task_tools;
 mod undo_tools;
 mod web_tools;
 

@@ -288,14 +288,18 @@ fn manifest_tool_definitions(
     None
 }
 
-fn is_executor_name(name: &str) -> bool {
-    matches!(name, "executor" | "openclaw")
+fn is_executor_agent(agent: &AgentManifest) -> bool {
+    agent.mode == crate::ai::agents::AgentMode::Primary
+        && agent
+            .tool_groups
+            .iter()
+            .any(|group| group.eq_ignore_ascii_case("executor") || group.eq_ignore_ascii_case("openclaw"))
 }
 
-fn has_executor_group(tool_groups: &[String]) -> bool {
-    tool_groups
+fn is_executor_skill(skill: &SkillManifest) -> bool {
+    skill.tool_groups
         .iter()
-        .any(|group| matches!(group.as_str(), "executor" | "openclaw"))
+        .any(|group| group.eq_ignore_ascii_case("executor") || group.eq_ignore_ascii_case("openclaw"))
 }
 
 fn resolve_max_iterations(active_agent: Option<&AgentManifest>, executor_active: bool) -> usize {
@@ -309,11 +313,10 @@ fn resolve_max_iterations(active_agent: Option<&AgentManifest>, executor_active:
 }
 
 fn builtin_tools_for_skill(
-    prompt_optimizer_active: bool,
     skill: Option<&SkillManifest>,
     active_agent: Option<&AgentManifest>,
 ) -> Vec<ToolDef> {
-    if prompt_optimizer_active {
+    if skill.is_some_and(|skill| skill.disable_builtin_tools) {
         return Vec::new();
     }
     if let Some(skill) = skill {
@@ -474,11 +477,10 @@ fn filter_mcp_tools_by_allowed_servers(
 
 fn mcp_tools_for_turn(
     mcp_client: &McpClient,
-    prompt_optimizer_active: bool,
     skill: Option<&SkillManifest>,
     active_agent: Option<&AgentManifest>,
 ) -> Vec<ToolDef> {
-    if prompt_optimizer_active {
+    if skill.is_some_and(|skill| skill.disable_mcp_tools) {
         return Vec::new();
     }
 
@@ -656,14 +658,7 @@ fn build_system_prompt(
 }
 
 fn should_skip_recall_for_skill(skill: Option<&SkillManifest>) -> bool {
-    let Some(skill) = skill else {
-        return false;
-    };
-    matches!(
-        skill.name.as_str(),
-        "debugger" | "code-review" | "refactor" | "prompt-optimizer"
-    ) || is_executor_name(skill.name.as_str())
-        || has_executor_group(&skill.tool_groups)
+    skill.is_some_and(|skill| skill.skip_recall || is_executor_skill(skill))
 }
 
 fn skill_selection_threshold(intent: &UserIntent, skill_count: usize) -> f64 {
@@ -797,12 +792,11 @@ fn select_skill_with_preference_strength<'a>(
                     CROSS_TURN_SKILL_KEEP_FLOOR_DELTA,
                     CROSS_TURN_SKILL_SWITCH_MARGIN,
                     true,
-                    false,
+                    true,
                 ),
             };
         let current_has_signal = current.score >= (threshold - keep_floor_delta).max(0.0)
-            || current.heuristic_score >= 3.0
-            || current.model_score >= 0.08;
+            || has_skill_signal(current);
         if best.skill.name == current.skill.name {
             return if keep_current_when_best || current.score >= threshold || current_has_signal {
                 Some(current.skill)
@@ -813,6 +807,17 @@ fn select_skill_with_preference_strength<'a>(
 
         let effective_current = current.score + sticky_bonus;
         let best_clearly_wins = best.score >= effective_current + switch_margin;
+        let best_has_positive_signal = is_positive_skill_winner(best);
+        let best_semantically_crushes_current =
+            best.embedding_score >= current.embedding_score + 0.12
+                && best.blended_score >= current.blended_score + 0.12
+                && best_has_positive_signal;
+        if best_semantically_crushes_current {
+            return Some(best.skill);
+        }
+        if best_clearly_wins && best_has_positive_signal {
+            return Some(best.skill);
+        }
         if keep_below_threshold && best.score < threshold {
             return Some(current.skill);
         }
@@ -828,7 +833,28 @@ fn select_skill_with_preference_strength<'a>(
         return None;
     }
 
+    if should_abstain_from_skill(best) {
+        return None;
+    }
     (best.score >= threshold).then_some(best.skill)
+}
+
+fn has_skill_signal(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
+    item.embedding_score >= 0.08
+        || item.fallback_semantic_score >= 0.08
+        || item.model_prior_score >= 0.08
+        || item.blended_score >= 0.08
+}
+
+fn is_positive_skill_winner(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
+    item.embedding_score >= 0.35
+        || item.fallback_semantic_score >= 0.18
+        || (item.model_prior_score >= 0.45 && item.model_prior_score > item.none_score)
+        || item.blended_score >= 0.35
+}
+
+fn should_abstain_from_skill(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
+    item.none_score >= item.blended_score && item.none_score >= 0.5
 }
 
 #[crate::ai::agent_hang_span(
@@ -861,20 +887,14 @@ fn build_skill_turn_guard(
     super::super::tools::enable_tools::set_available_mcp_tools(mcp_client.get_all_tools());
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
     let skip_recall_by_skill = should_skip_recall_for_skill(skill);
-    let prompt_optimizer_active = skill
-        .as_ref()
-        .is_some_and(|s| s.name.as_str() == "prompt-optimizer");
     let active_agent = app.current_agent_manifest.clone();
     let executor_active = skill.as_ref().is_some_and(|s| {
-        is_executor_name(s.name.as_str()) || has_executor_group(&s.tool_groups)
-    }) || active_agent.as_ref().is_some_and(|agent| {
-        is_executor_name(agent.name.as_str()) || has_executor_group(&agent.tool_groups)
-    });
+        is_executor_skill(s)
+    }) || active_agent.as_ref().is_some_and(is_executor_agent);
 
-    let builtin_tools = builtin_tools_for_skill(prompt_optimizer_active, skill, active_agent.as_ref());
+    let builtin_tools = builtin_tools_for_skill(skill, active_agent.as_ref());
     let mcp_tools = mcp_tools_for_turn(
         mcp_client,
-        prompt_optimizer_active,
         skill,
         active_agent.as_ref(),
     );
@@ -936,8 +956,14 @@ pub(super) fn prepare_skill_for_turn(
     if debug {
         if let Some(top) = ranked.first() {
             eprintln!(
-                "[skills] local top: {} total={:.3} heuristic={:.3} model={:.3}",
-                top.skill.name, top.score, top.heuristic_score, top.model_score
+                "[skills] local top: {} total={:.3} embed={:.3} prior={:.3} fallback={:.3} blend={:.3} none={:.3}",
+                top.skill.name,
+                top.score,
+                top.embedding_score,
+                top.model_prior_score,
+                top.fallback_semantic_score,
+                top.blended_score,
+                top.none_score
             );
         }
         if let Some(preferred) = cross_turn_preference.as_deref() {
@@ -1015,7 +1041,7 @@ mod tests {
 
     #[test]
     fn default_tools_start_with_core_discovery_and_editing() {
-        let tools = builtin_tools_for_skill(false, None, None);
+        let tools = builtin_tools_for_skill(None, None);
         let names = tools
             .into_iter()
             .map(|tool| tool.function.name)
@@ -1090,9 +1116,13 @@ mod tests {
             version: "1.0.0".to_string(),
             description: description.to_string(),
             author: None,
+            triggers: Vec::new(),
             tools: Vec::new(),
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),
+            skip_recall: false,
+            disable_builtin_tools: false,
+            disable_mcp_tools: false,
             prompt: String::new(),
             system_prompt: None,
             priority: 0,

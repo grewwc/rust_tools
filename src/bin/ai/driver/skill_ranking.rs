@@ -4,18 +4,29 @@ use crate::ai::skills::SkillManifest;
 use rust_tools::commonw::FastMap;
 
 use super::{
-    TextSimilarityFeatures, UserIntent, is_intent_excluded, normalize_text_for_similarity,
-    score_skill_smart, skill_match_model,
+    embedding::{
+        document::SkillEmbeddingDocument,
+        index::{SkillEmbeddingHit, SkillEmbeddingIndex},
+    },
+    TextSimilarityFeatures, UserIntent, build_idf_from_documents, cosine_tfidf_similarity,
+    is_intent_excluded, normalize_text_for_similarity, skill_match_model,
 };
 
 const LOCAL_MODEL_SCORE_SCALE: f64 = 8.0;
+pub const SKILL_NONE_LABEL: &str = "none";
 
 #[derive(Debug, Clone)]
 pub struct ScoredSkill<'a> {
     pub skill: &'a SkillManifest,
     pub score: f64,
-    pub heuristic_score: f64,
-    pub model_score: f64,
+    pub embedding_score: f64,
+    pub embedding_identity_score: f64,
+    pub embedding_capability_score: f64,
+    pub embedding_behavior_score: f64,
+    pub fallback_semantic_score: f64,
+    pub model_prior_score: f64,
+    pub blended_score: f64,
+    pub none_score: f64,
 }
 
 pub fn rank_skills_locally<'a>(
@@ -27,51 +38,8 @@ pub fn rank_skills_locally<'a>(
         return Vec::new();
     }
 
-    let input_lower = input.to_lowercase();
     let model_path = skill_match_model::default_model_path();
-    let model_probs = skill_match_model::predict_skill(input, &model_path);
-    let mut ranked = Vec::new();
-
-    for skill in skills {
-        if let Some(intent_ref) = intent
-            && is_intent_excluded(skill, intent_ref)
-        {
-            continue;
-        }
-
-        let heuristic_score = score_skill_smart(skill, &input_lower, intent);
-        let model_score = match &model_probs {
-            Some(result) => result
-                .probabilities
-                .iter()
-                .find(|(label, _)| label == &skill.name)
-                .map(|(_, prob)| *prob)
-                .unwrap_or(0.0),
-            None => 0.0,
-        };
-        let priority_bonus = (skill.priority.max(0) as f64).min(100.0) / 100.0;
-        let score = heuristic_score + model_score * LOCAL_MODEL_SCORE_SCALE + priority_bonus;
-        ranked.push(ScoredSkill {
-            skill,
-            score,
-            heuristic_score,
-            model_score,
-        });
-    }
-
-    ranked.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| {
-                b.model_score
-                    .partial_cmp(&a.model_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
-            .then_with(|| b.skill.priority.cmp(&a.skill.priority))
-            .then_with(|| a.skill.name.cmp(&b.skill.name))
-    });
-    ranked
+    rank_skills_locally_with_model_path(skills, input, intent, &model_path)
 }
 
 pub fn rank_skills_locally_with_model_path<'a>(
@@ -88,6 +56,17 @@ pub fn rank_skills_locally_with_model_path<'a>(
     let model_probs = skill_match_model::predict_skill(input, model_path);
     let runtime_model = RuntimeSkillModel::build(skills);
     let query_features = TextSimilarityFeatures::from_text(&input_lower);
+    let candidates = skills
+        .iter()
+        .filter(|skill| {
+            intent
+                .map(|intent_ref| !is_intent_excluded(skill, intent_ref))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let embedding_hits = build_embedding_hits(&candidates, input)
+        .unwrap_or_default();
     let mut ranked = Vec::new();
 
     for skill in skills {
@@ -97,25 +76,43 @@ pub fn rank_skills_locally_with_model_path<'a>(
             continue;
         }
 
-        let heuristic_score = score_skill_smart(skill, &input_lower, intent);
-        let static_model_score = match &model_probs {
-            Some(result) => result
-                .probabilities
-                .iter()
-                .find(|(label, _)| label == &skill.name)
-                .map(|(_, prob)| *prob)
-                .unwrap_or(0.0),
+        let model_prior_score = match &model_probs {
+            Some(result) => probability_for_label(result, &skill.name),
             None => 0.0,
         };
-        let runtime_model_score = runtime_model.similarity(skill, &query_features);
-        let model_score = static_model_score.max(runtime_model_score);
+        let fallback_semantic_score = runtime_model.similarity(skill, &query_features);
+        let (embedding_score, embedding_identity_score, embedding_capability_score, embedding_behavior_score) =
+            embedding_hits
+                .get(skill.name.as_str())
+                .map(|hit| {
+                    (
+                        hit.score,
+                        hit.identity_score,
+                        hit.capability_score,
+                        hit.behavior_score,
+                    )
+                })
+                .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let blended_score = embedding_score
+            .max(fallback_semantic_score)
+            .max(model_prior_score);
+        let none_score = match &model_probs {
+            Some(result) => probability_for_label(result, SKILL_NONE_LABEL),
+            None => 0.0,
+        };
         let priority_bonus = (skill.priority.max(0) as f64).min(100.0) / 100.0;
-        let score = heuristic_score + model_score * LOCAL_MODEL_SCORE_SCALE + priority_bonus;
+        let score = blended_score * LOCAL_MODEL_SCORE_SCALE + priority_bonus;
         ranked.push(ScoredSkill {
             skill,
             score,
-            heuristic_score,
-            model_score,
+            embedding_score,
+            embedding_identity_score,
+            embedding_capability_score,
+            embedding_behavior_score,
+            fallback_semantic_score,
+            model_prior_score,
+            blended_score,
+            none_score,
         });
     }
 
@@ -124,14 +121,33 @@ pub fn rank_skills_locally_with_model_path<'a>(
             .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| {
-                b.model_score
-                    .partial_cmp(&a.model_score)
+                b.blended_score
+                    .partial_cmp(&a.blended_score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .then_with(|| b.skill.priority.cmp(&a.skill.priority))
             .then_with(|| a.skill.name.cmp(&b.skill.name))
     });
     ranked
+}
+
+fn build_embedding_hits(
+    skills: &[SkillManifest],
+    input: &str,
+) -> Result<FastMap<String, SkillEmbeddingHit>, String> {
+    if skills.is_empty() {
+        return Ok(FastMap::default());
+    }
+    let documents = skills
+        .iter()
+        .map(SkillEmbeddingDocument::from_skill)
+        .collect::<Vec<_>>();
+    let index = SkillEmbeddingIndex::build(&documents)?;
+    let hits = index.search(input, documents.len())?;
+    Ok(hits
+        .into_iter()
+        .map(|hit| (hit.skill_name.clone(), hit))
+        .collect())
 }
 
 struct RuntimeSkillDoc<'a> {
@@ -147,24 +163,15 @@ struct RuntimeSkillModel<'a> {
 impl<'a> RuntimeSkillModel<'a> {
     fn build(skills: &'a [SkillManifest]) -> Self {
         let mut docs = Vec::with_capacity(skills.len());
-        let mut df: FastMap<String, usize> = FastMap::default();
         for skill in skills {
             let text = skill_document_text(skill);
             let features = TextSimilarityFeatures::from_text(&text);
             let tf = features.ngram_tf.clone();
-            let unique = tf.keys().cloned().collect::<Vec<_>>();
-            for token in unique {
-                *df.entry(token).or_insert(0) += 1;
-            }
             docs.push(RuntimeSkillDoc { skill, tf });
         }
 
-        let total_docs = skills.len().max(1) as f64;
-        let mut idf = FastMap::default();
-        for (token, freq) in df {
-            let value = ((1.0 + total_docs) / (1.0 + freq as f64)).ln() + 1.0;
-            idf.insert(token, value);
-        }
+        let doc_refs = docs.iter().map(|doc| &doc.tf).collect::<Vec<_>>();
+        let idf = build_idf_from_documents(&doc_refs);
         Self { docs, idf }
     }
 
@@ -181,6 +188,9 @@ impl<'a> RuntimeSkillModel<'a> {
 
 fn skill_document_text(skill: &SkillManifest) -> String {
     let mut parts = vec![skill.name.clone(), skill.description.clone()];
+    if !skill.triggers.is_empty() {
+        parts.push(skill.triggers.join(" "));
+    }
     if !skill.tools.is_empty() {
         parts.push(skill.tools.join(" "));
     }
@@ -196,38 +206,35 @@ fn skill_document_text(skill: &SkillManifest) -> String {
     normalize_text_for_similarity(&parts.join("\n"))
 }
 
-fn cosine_tfidf_similarity(
-    query_tf: &FastMap<String, f64>,
-    doc_tf: &FastMap<String, f64>,
-    idf: &FastMap<String, f64>,
-) -> f64 {
-    let mut dot = 0.0;
-    let mut query_norm = 0.0;
-    let mut doc_norm = 0.0;
-
-    for (token, tf) in query_tf {
-        let weight = *tf * idf.get(token.as_str()).copied().unwrap_or(1.0);
-        query_norm += weight * weight;
-        if let Some(doc_tf) = doc_tf.get(token.as_str()) {
-            let doc_weight = *doc_tf * idf.get(token.as_str()).copied().unwrap_or(1.0);
-            dot += weight * doc_weight;
-        }
-    }
-    for (token, tf) in doc_tf {
-        let weight = *tf * idf.get(token.as_str()).copied().unwrap_or(1.0);
-        doc_norm += weight * weight;
-    }
-    if query_norm <= f64::EPSILON || doc_norm <= f64::EPSILON {
-        return 0.0;
-    }
-    dot / (query_norm.sqrt() * doc_norm.sqrt())
-}
-
 fn truncate_chars(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
     }
     input.chars().take(max_chars).collect::<String>()
+}
+
+fn semantic_score_for_skill(skill: &SkillManifest, input_lower: &str) -> f64 {
+    let docs = [skill_document_text(skill)];
+    let query_features = TextSimilarityFeatures::from_text(input_lower);
+    let doc_features = docs
+        .iter()
+        .map(|doc| TextSimilarityFeatures::from_text(doc))
+        .collect::<Vec<_>>();
+    let doc_refs = doc_features.iter().map(|doc| &doc.ngram_tf).collect::<Vec<_>>();
+    let idf = build_idf_from_documents(&doc_refs);
+    doc_features
+        .iter()
+        .map(|doc| cosine_tfidf_similarity(&query_features.ngram_tf, &doc.ngram_tf, &idf))
+        .fold(0.0, f64::max)
+}
+
+fn probability_for_label(result: &skill_match_model::SkillMatchResult, label: &str) -> f64 {
+    result
+        .probabilities
+        .iter()
+        .find(|(candidate, _)| candidate == label)
+        .map(|(_, prob)| *prob)
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -241,9 +248,13 @@ mod tests {
             version: "1.0.0".to_string(),
             description: description.to_string(),
             author: None,
+            triggers: Vec::new(),
             tools: Vec::new(),
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),
+            skip_recall: false,
+            disable_builtin_tools: false,
+            disable_mcp_tools: false,
             prompt: String::new(),
             system_prompt: None,
             priority: 0,
@@ -266,8 +277,41 @@ mod tests {
         let top = ranked.first().expect("expected ranked result");
         assert_eq!(top.skill.name, "my-custom-slides");
         assert!(
-            top.model_score > 0.0,
+            top.blended_score > 0.0,
             "expected dynamic skill to receive runtime model score"
         );
+    }
+
+    #[test]
+    fn triggers_participate_in_runtime_ranking() {
+        let mut slide = skill("slides", "Create presentation artifacts");
+        slide.triggers = vec!["ppt".to_string(), "幻灯片".to_string()];
+        let skills = vec![
+            skill("code-review", "Review code quality and bugs"),
+            slide,
+        ];
+        let ranked = rank_skills_locally_with_model_path(
+            &skills,
+            "帮我做一份 ppt 汇报",
+            Some(&UserIntent::new(CoreIntent::RequestAction)),
+            &skill_match_model::default_model_path(),
+        );
+        assert_eq!(ranked.first().map(|item| item.skill.name.as_str()), Some("slides"));
+    }
+
+    #[test]
+    fn none_label_probability_is_exposed_in_ranked_results() {
+        let skills = vec![
+            skill("code-review", "Review code quality and bugs"),
+            skill("debugger", "Debug runtime failures"),
+        ];
+        let ranked = rank_skills_locally_with_model_path(
+            &skills,
+            "你好，今天天气怎么样",
+            Some(&UserIntent::new(CoreIntent::Casual)),
+            &skill_match_model::default_model_path(),
+        );
+        assert!(!ranked.is_empty());
+        assert!(ranked[0].none_score > 0.0);
     }
 }

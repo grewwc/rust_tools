@@ -32,12 +32,12 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::with_memory_file_lock;
+use crate::ai::knowledge::indexing::{embedder, similarity};
 use crate::ai::tools::service::memory::{execute_memory_dedup, execute_memory_gc};
 use crate::commonw::configw;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::ffi::OsStr;
-use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,14 +214,14 @@ impl MemoryStore {
                     full.push(' ');
                     full.push_str(&entry.tags.join(" "));
                 }
-                let tokens = expand_tokens(&tokenize(&full.to_lowercase()));
+                let tokens = similarity::expand_tokens(&similarity::tokenize(&full.to_lowercase()));
                 docs.push((entry, full, tokens));
             }
         }
         if docs.is_empty() {
             return Ok(Vec::new());
         }
-        let nq_tokens = expand_tokens(&tokenize(&query_lc));
+        let nq_tokens = similarity::expand_tokens(&similarity::tokenize(&query_lc));
         use rust_tools::commonw::FastMap;
         use rust_tools::commonw::FastSet;
         let mut df: FastMap<String, usize> = FastMap::default();
@@ -284,15 +284,15 @@ impl MemoryStore {
         let cap = limit.saturating_mul(10).min(200).max(limit);
         let mut top_idx: Vec<(f64, usize)> =
             scored.iter().take(cap).map(|(s, i)| (*s, *i)).collect();
-        let qv = embed_text(&query_lc);
+        let qv = embedder::embed_text(&query_lc);
         if let Some(qv) = qv {
             let mut rescored: Vec<(f64, usize)> = Vec::with_capacity(top_idx.len());
             for &(_s, i) in &top_idx {
                 let (_, full, _) = &docs[i];
-                let ev = embed_text(full);
+                let ev = embedder::embed_text(full);
                 let emb = ev
                     .as_ref()
-                    .map(|v| cosine_similarity(&qv, v))
+                    .map(|v| similarity::cosine_similarity(&qv, v))
                     .unwrap_or(0.0);
                 let base = _s;
                 let final_s = 0.85 * base + 0.15 * emb as f64;
@@ -443,129 +443,6 @@ mod tests {
     }
 }
 
-fn norm_text(s: &str) -> String {
-    s.chars()
-        .filter(|c| !c.is_whitespace())
-        .flat_map(|c| c.to_lowercase())
-        .collect()
-}
-
-fn bigrams(s: &str) -> Vec<(char, char)> {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() < 2 {
-        return Vec::new();
-    }
-    let mut v = Vec::with_capacity(chars.len() - 1);
-    for i in 0..(chars.len() - 1) {
-        v.push((chars[i], chars[i + 1]));
-    }
-    v
-}
-
-fn dice_coefficient(a: &[(char, char)], b: &[(char, char)]) -> f64 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-    use rust_tools::commonw::FastMap;
-    let mut count = 0usize;
-    let mut map: FastMap<(char, char), usize> = FastMap::default();
-    for x in a {
-        *map.entry(*x).or_insert(0) += 1;
-    }
-    for y in b {
-        if let Some(c) = map.get_mut(y) {
-            if *c > 0 {
-                count += 1;
-                *c -= 1;
-            }
-        }
-    }
-    (2.0 * count as f64) / ((a.len() + b.len()) as f64)
-}
-
-fn is_han_char(ch: char) -> bool {
-    matches!(
-        ch as u32,
-        0x3400..=0x4DBF
-            | 0x4E00..=0x9FFF
-            | 0xF900..=0xFAFF
-            | 0x20000..=0x2A6DF
-            | 0x2A700..=0x2B73F
-            | 0x2B740..=0x2B81F
-            | 0x2B820..=0x2CEAF
-            | 0x30000..=0x3134F
-    )
-}
-
-fn tokenize(s: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut buf = String::new();
-    for ch in s.chars() {
-        if ch.is_alphanumeric() {
-            buf.push(ch.to_ascii_lowercase());
-        } else {
-            if !buf.is_empty() {
-                tokens.push(buf.clone());
-                buf.clear();
-            }
-            if is_han_char(ch) {
-                tokens.push(ch.to_string());
-            }
-        }
-    }
-    if !buf.is_empty() {
-        tokens.push(buf);
-    }
-    tokens
-}
-
-fn expand_tokens(tokens: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(tokens.len());
-    use rust_tools::commonw::FastSet;
-    let mut seen: FastSet<String> = FastSet::default();
-    for t in tokens {
-        let tnorm = t.to_lowercase();
-        if seen.insert(tnorm.clone()) {
-            out.push(tnorm);
-        }
-    }
-    out
-}
-
-fn jaccard(a: &[String], b: &[String]) -> f64 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-    // 手动计算 Jaccard 相似度（不使用 SkipSet，避免生命周期问题）
-    use std::collections::HashSet;
-    let sa: HashSet<&String> = a.iter().collect();
-    let sb: HashSet<&String> = b.iter().collect();
-    let inter = sa.intersection(&sb).count() as f64;
-    let union = sa.union(&sb).count() as f64;
-    if union == 0.0 {
-        0.0
-    } else {
-        inter / union as f64
-    }
-}
-
-fn char_overlap(a: &str, b: &str) -> f64 {
-    if a.is_empty() || b.is_empty() {
-        return 0.0;
-    }
-    // 手动计算字符重叠度（不使用 SkipSet，避免 FromIterator 问题）
-    use std::collections::HashSet;
-    let sa: HashSet<char> = a.chars().collect();
-    let sb: HashSet<char> = b.chars().collect();
-    let inter = sa.intersection(&sb).count() as f64;
-    let denom = sa.len().min(sb.len()) as f64;
-    if denom == 0.0 {
-        0.0
-    } else {
-        inter / denom
-    }
-}
-
 fn compute_similarity(entry: &AgentMemoryEntry, query_lc: &str) -> f64 {
     let base_contains = if entry.note.to_lowercase().contains(query_lc)
         || entry.category.to_lowercase().contains(query_lc)
@@ -594,62 +471,18 @@ fn compute_similarity(entry: &AgentMemoryEntry, query_lc: &str) -> f64 {
         full.push(' ');
         full.push_str(&entry.tags.join(" "));
     }
-    let nq = norm_text(query_lc);
-    let ne = norm_text(&full);
-    let d = dice_coefficient(&bigrams(&nq), &bigrams(&ne));
-    let tq = expand_tokens(&tokenize(query_lc));
-    let te = expand_tokens(&tokenize(&full.to_lowercase()));
-    let j = jaccard(&tq, &te);
-    let co = char_overlap(&nq, &ne);
+    let nq = similarity::norm_text(query_lc);
+    let ne = similarity::norm_text(&full);
+    let d = similarity::dice_coefficient(&similarity::bigrams(&nq), &similarity::bigrams(&ne));
+    let tq = similarity::expand_tokens(&similarity::tokenize(query_lc));
+    let te = similarity::expand_tokens(&similarity::tokenize(&full.to_lowercase()));
+    let j = similarity::jaccard(&tq, &te);
+    let co = similarity::char_overlap(&nq, &ne);
     let s = 0.5 * d + 0.3 * j + 0.15 * co + base_contains;
     if s < 0.0 {
         0.0
     } else {
         s.min(1.0)
-    }
-}
-
-pub trait EmbeddingProvider {
-    fn embed(&self, text: &str) -> Option<Vec<f32>>;
-}
-
-struct NoopEmbeddingProvider;
-impl EmbeddingProvider for NoopEmbeddingProvider {
-    fn embed(&self, _text: &str) -> Option<Vec<f32>> {
-        None
-    }
-}
-
-static EMBEDDING_PROVIDER: OnceLock<Box<dyn EmbeddingProvider + Sync + Send>> = OnceLock::new();
-
-pub fn embed_text(text: &str) -> Option<Vec<f32>> {
-    if let Some(p) = EMBEDDING_PROVIDER.get() {
-        p.embed(text)
-    } else {
-        None
-    }
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let mut dot = 0.0f32;
-    let mut na = 0.0f32;
-    let mut nb = 0.0f32;
-    let len = a.len().min(b.len());
-    if len == 0 {
-        return 0.0;
-    }
-    for i in 0..len {
-        let x = a[i];
-        let y = b[i];
-        dot += x * y;
-        na += x * x;
-        nb += y * y;
-    }
-    let denom = na.sqrt() * nb.sqrt();
-    if denom == 0.0 {
-        0.0
-    } else {
-        (dot / denom).max(-1.0).min(1.0)
     }
 }
 

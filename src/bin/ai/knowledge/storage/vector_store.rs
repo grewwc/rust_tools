@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
 
-use super::super::indexing::similarity;
+use super::super::indexing::{embedder, similarity};
 
 /// Embedding dimension for the model.
 const EMBEDDING_DIM: usize = 384;
@@ -94,6 +94,18 @@ pub struct VectorStore {
     index_path: PathBuf,
 }
 
+struct GlobalEmbeddingAdapter;
+
+impl VectorEmbedder for GlobalEmbeddingAdapter {
+    fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+        embedder::embed_text(text).ok_or_else(|| "No embedding produced".to_string())
+    }
+
+    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+        embedder::embed_texts(texts).ok_or_else(|| "No embeddings produced".to_string())
+    }
+}
+
 impl VectorStore {
     pub fn new(path: &Path, embedder: Box<dyn VectorEmbedder>) -> Result<Self, String> {
         let db = sled::open(path)
@@ -103,6 +115,10 @@ impl VectorStore {
             embedder,
             index_path: path.to_path_buf(),
         })
+    }
+
+    pub fn with_global_provider(path: &Path) -> Result<Self, String> {
+        Self::new(path, Box::new(GlobalEmbeddingAdapter))
     }
 
     pub fn path(&self) -> &Path {

@@ -2,56 +2,101 @@ use serde_json::Value;
 use std::process::Command;
 use std::sync::LazyLock;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::ai::{
     agents::{self, AgentManifest, AgentModelTier},
     models,
+    os::kernel::ProcessState,
     tools::common::{ToolRegistration, ToolSpec},
 };
+use crate::ai::tools::os_tools::GLOBAL_OS;
 use rust_tools::commonw::FastMap;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-enum TaskState {
-    Running(std::process::Child),
-    Reaping,
-    Completed { stdout: String, stderr: String, duration_secs: f64 },
-    Failed { stdout: String, stderr: String, duration_secs: f64 },
-}
+const MAX_TASK_REGISTRY_SIZE: usize = 100;
+const DEFAULT_TASK_PRIORITY: u8 = 20;
+const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
+const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
 
 struct AsyncTaskEntry {
+    pid: u64,
     description: String,
     agent_name: String,
     model: String,
     selection_explanation: String,
     started_at: Instant,
-    state: TaskState,
 }
 
 static TASK_REGISTRY: LazyLock<Mutex<FastMap<String, AsyncTaskEntry>>> =
     LazyLock::new(|| Mutex::new(FastMap::default()));
 
-const MAX_TASK_REGISTRY_SIZE: usize = 100;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct OsTaskGoal {
+    pub(crate) task_id: String,
+    pub(crate) description: String,
+    pub(crate) prompt: String,
+    pub(crate) agent_name: String,
+    pub(crate) model: String,
+    pub(crate) selection_explanation: String,
+}
 
 fn prune_completed_tasks(registry: &mut FastMap<String, AsyncTaskEntry>) {
     if registry.len() <= MAX_TASK_REGISTRY_SIZE {
         return;
     }
-    let completed_keys: Vec<String> = registry
+    let mut oldest = registry
         .iter()
-        .filter(|(_, e)| matches!(e.state, TaskState::Completed { .. } | TaskState::Failed { .. }))
-        .map(|(k, _)| k.clone())
-        .collect();
-    for key in completed_keys {
-        registry.remove(&key);
-        if registry.len() <= MAX_TASK_REGISTRY_SIZE {
+        .min_by_key(|(_, entry)| entry.started_at)
+        .map(|(key, _)| key.clone());
+    while registry.len() > MAX_TASK_REGISTRY_SIZE {
+        let Some(key) = oldest.take() else {
             break;
-        }
+        };
+        registry.remove(&key);
+        oldest = registry
+            .iter()
+            .min_by_key(|(_, entry)| entry.started_at)
+            .map(|(next_key, _)| next_key.clone());
     }
 }
 
 fn next_task_id() -> String {
     format!("task_{}", Uuid::new_v4().simple())
+}
+
+pub(crate) fn encode_os_task_goal(goal: &OsTaskGoal) -> Result<String, String> {
+    serde_json::to_string(goal)
+        .map(|payload| format!("{TASK_GOAL_PREFIX}{payload}"))
+        .map_err(|err| format!("Failed to encode task goal: {err}"))
+}
+
+pub(crate) fn decode_os_task_goal(goal: &str) -> Option<OsTaskGoal> {
+    let payload = goal.strip_prefix(TASK_GOAL_PREFIX)?;
+    serde_json::from_str(payload).ok()
+}
+
+pub(crate) fn task_result_shm_key(task_id: &str) -> String {
+    format!("task_result:{task_id}")
+}
+
+fn with_os_kernel<T>(
+    f: impl FnOnce(&mut dyn crate::ai::os::kernel::Syscall) -> Result<T, String>,
+) -> Result<T, String> {
+    let shared = {
+        let guard = GLOBAL_OS
+            .lock()
+            .map_err(|e| format!("Failed to lock AIOS kernel handle: {e}"))?;
+        guard
+            .as_ref()
+            .cloned()
+            .ok_or("AIOS kernel is not initialized.".to_string())?
+    };
+    let mut kernel = shared
+        .lock()
+        .map_err(|e| format!("Failed to lock AIOS kernel: {e}"))?;
+    f(kernel.as_mut())
 }
 
 fn params_task() -> Value {
@@ -174,24 +219,32 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
     let selection_explanation = build_selection_explanation(&selected, &selected_model, model_override);
 
     let task_id = next_task_id();
-
-    let mut cmd_args = vec!["--".to_string(), "--no-skills".to_string()];
-    cmd_args.push("--model".to_string());
-    cmd_args.push(selected_model.clone());
-    cmd_args.push("--agent".to_string());
-    cmd_args.push(selected.agent.name.clone());
-    cmd_args.push(prompt.to_string());
-
-    let child = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-        .args(&cmd_args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("Failed to launch subagent: {}", e))?;
+    let process_goal = encode_os_task_goal(&OsTaskGoal {
+        task_id: task_id.clone(),
+        description: description.to_string(),
+        prompt: prompt.to_string(),
+        agent_name: selected.agent.name.clone(),
+        model: selected_model.clone(),
+        selection_explanation: selection_explanation.clone(),
+    })?;
+    let pid = with_os_kernel(|os| {
+        let _parent_pid = os
+            .current_process_id()
+            .ok_or("task_spawn requires an active AIOS process context.".to_string())?;
+        os.spawn(
+            None,
+            selected.agent.name.clone(),
+            process_goal,
+            DEFAULT_TASK_PRIORITY,
+            DEFAULT_TASK_QUOTA_TURNS,
+            None,
+            None,
+        )
+    })?;
 
     println!(
-        "\n[TaskSpawn] Launched subagent '{}' with model '{}' for: {} (task_id: {})",
-        selected.agent.name, selected_model, description, task_id
+        "\n[TaskSpawn] Launched AIOS task pid={} subagent '{}' with model '{}' for: {} (task_id: {})",
+        pid, selected.agent.name, selected_model, description, task_id
     );
 
     {
@@ -199,20 +252,20 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
         registry.insert(
             task_id.clone(),
             AsyncTaskEntry {
+                pid,
                 description: description.to_string(),
                 agent_name: selected.agent.name.clone(),
                 model: selected_model.clone(),
                 selection_explanation,
                 started_at: Instant::now(),
-                state: TaskState::Running(child),
             },
         );
         prune_completed_tasks(&mut registry);
     }
 
     Ok(format!(
-        "Task spawned: task_id={}, agent={}, model={}\nUse task_wait to collect results when ready.",
-        task_id, selected.agent.name, selected_model
+        "Task spawned: task_id={}, pid={}, agent={}, model={}\nUse task_wait to collect results when ready.",
+        task_id, pid, selected.agent.name, selected_model
     ))
 }
 
@@ -396,152 +449,50 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         return Err("task_ids array cannot be empty".to_string());
     }
 
-    let timeout_secs = args["timeout_secs"].as_u64().unwrap_or(120);
-    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-
-    {
-        let registry = TASK_REGISTRY.lock().unwrap();
-        for tid in &task_ids {
-            if !registry.contains_key(tid) {
-                return Err(format!("Unknown task_id: {}", tid));
-            }
+    let mut registry = TASK_REGISTRY.lock().unwrap();
+    for tid in &task_ids {
+        if !registry.contains_key(tid) {
+            return Err(format!("Unknown task_id: {}", tid));
         }
     }
 
-    loop {
-        let mut all_done = true;
-        {
-            let mut registry = TASK_REGISTRY.lock().unwrap();
-            for tid in &task_ids {
-                if let Some(entry) = registry.get_mut(tid) {
-                    let prev = std::mem::replace(&mut entry.state, TaskState::Reaping);
-                    match prev {
-                        TaskState::Running(mut child) => {
-                            match child.try_wait() {
-                                Ok(Some(status)) => {
-                                    let duration_secs = entry.started_at.elapsed().as_secs_f64();
-                                    match child.wait_with_output() {
-                                        Ok(out) => {
-                                            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                                            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                                            if status.success() {
-                                                entry.state = TaskState::Completed {
-                                                    stdout,
-                                                    stderr,
-                                                    duration_secs,
-                                                };
-                                            } else {
-                                                entry.state = TaskState::Failed {
-                                                    stdout,
-                                                    stderr,
-                                                    duration_secs,
-                                                };
-                                            }
-                                        }
-                                        Err(e) => {
-                                            entry.state = TaskState::Failed {
-                                                stdout: String::new(),
-                                                stderr: format!("Failed to read output: {}", e),
-                                                duration_secs,
-                                            };
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    entry.state = TaskState::Running(child);
-                                    all_done = false;
-                                }
-                                Err(e) => {
-                                    let duration_secs = entry.started_at.elapsed().as_secs_f64();
-                                    let _ = child.kill();
-                                    let _ = child.wait();
-                                    entry.state = TaskState::Failed {
-                                        stdout: String::new(),
-                                        stderr: format!("Process error: {}", e),
-                                        duration_secs,
-                                    };
-                                }
-                            }
-                        }
-                        other => {
-                            entry.state = other;
-                        }
-                    }
-                }
-            }
-        }
-
-        if all_done {
-            break;
-        }
-
-        if Instant::now() >= deadline {
-            let mut registry = TASK_REGISTRY.lock().unwrap();
-            for tid in &task_ids {
-                if let Some(entry) = registry.get_mut(tid) {
-                    let prev = std::mem::replace(&mut entry.state, TaskState::Reaping);
-                    if let TaskState::Running(mut child) = prev {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        entry.state = TaskState::Failed {
-                            stdout: String::new(),
-                            stderr: "Timed out: process killed".to_string(),
-                            duration_secs: entry.started_at.elapsed().as_secs_f64(),
-                        };
-                    } else {
-                        entry.state = prev;
-                    }
-                }
-            }
-            break;
-        }
-
-        std::thread::sleep(Duration::from_millis(200));
-    }
-
-    let mut results = Vec::new();
-    {
-        let mut registry = TASK_REGISTRY.lock().unwrap();
+    let mut ready = Vec::new();
+    let mut pending = Vec::new();
+    let wait_message = with_os_kernel(|os| {
         for tid in &task_ids {
-            let result_str = if let Some(entry) = registry.remove(tid) {
-                match entry.state {
-                    TaskState::Running(_) | TaskState::Reaping => {
-                        format!(
-                            "[Task: {} via {} @ {}] TIMED OUT after {:.1}s",
-                            entry.description, entry.agent_name, entry.model,
-                            entry.started_at.elapsed().as_secs_f64()
-                        )
-                    }
-                    TaskState::Completed { stdout, duration_secs, .. } => {
-                        format!(
-                            "[Task: {} via {} @ {}] (completed in {:.1}s)\n{}\n{}",
-                            entry.description, entry.agent_name, entry.model,
-                            duration_secs, entry.selection_explanation, stdout
-                        )
-                    }
-                    TaskState::Failed { stdout, stderr, duration_secs } => {
-                        let mut parts = vec![format!(
-                            "[Task: {} via {} @ {}] FAILED after {:.1}s",
-                            entry.description, entry.agent_name, entry.model, duration_secs
-                        )];
-                        parts.push(entry.selection_explanation.clone());
-                        if !stderr.is_empty() {
-                            parts.push(format!("Error: {}", stderr));
-                        }
-                        if !stdout.is_empty() {
-                            parts.push(format!("Partial output:\n{}", stdout));
-                        }
-                        parts.join("\n")
-                    }
-                }
+            let entry = registry.get(tid).expect("validated");
+            if let Some(result) = read_task_result(os, tid)? {
+                ready.push(format_task_result(&entry, result));
+                let _ = os.shm_delete(&task_result_shm_key(tid));
+            } else if is_task_pending(os, entry.pid)? {
+                pending.push((tid.clone(), entry.pid));
             } else {
-                format!("[Task {}] already collected", tid)
-            };
-            results.push(result_str);
+                ready.push(format!(
+                    "[Task: {} via {} @ {}] result not available yet; process pid={} has not published output.",
+                    entry.description, entry.agent_name, entry.model, entry.pid
+                ));
+            }
         }
+
+        if !pending.is_empty() {
+            let wait_pid = pending[0].1;
+            os.wait_on(wait_pid)?;
+            return Ok(Some(format!(
+                "Waiting on {} pending task(s). Suspended current process until task pid={} exits; call task_wait again after resume to collect results.",
+                pending.len(),
+                wait_pid
+            )));
+        }
+        Ok(None)
+    })?;
+    if let Some(message) = wait_message {
+        return Ok(message);
     }
 
-    Ok(results.join("\n\n---\n\n"))
+    for tid in &task_ids {
+        registry.remove(tid);
+    }
+    Ok(ready.join("\n\n---\n\n"))
 }
 
 fn params_task_status() -> Value {
@@ -563,77 +514,105 @@ inventory::submit!(ToolRegistration {
 });
 
 pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
-    let mut registry = TASK_REGISTRY.lock().unwrap();
+    let registry = TASK_REGISTRY.lock().unwrap();
     if registry.is_empty() {
         return Ok("No async tasks currently tracked.".to_string());
     }
 
-    let mut lines = vec!["TaskID              Agent          Model          State       Description".to_string()];
-
-    for (tid, entry) in registry.iter_mut() {
-        let prev = std::mem::replace(&mut entry.state, TaskState::Reaping);
-        let (state_str, new_state) = match prev {
-            TaskState::Running(mut child) => {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let duration_secs = entry.started_at.elapsed().as_secs_f64();
-                        match child.wait_with_output() {
-                            Ok(out) => {
-                                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                                if status.success() {
-                                    ("completed".to_string(), TaskState::Completed {
-                                        stdout,
-                                        stderr,
-                                        duration_secs,
-                                    })
-                                } else {
-                                    ("failed".to_string(), TaskState::Failed {
-                                        stdout,
-                                        stderr,
-                                        duration_secs,
-                                    })
-                                }
-                            }
-                            Err(e) => {
-                                ("error".to_string(), TaskState::Failed {
-                                    stdout: String::new(),
-                                    stderr: format!("wait_with_output failed: {}", e),
-                                    duration_secs: entry.started_at.elapsed().as_secs_f64(),
-                                })
-                            }
-                        }
-                    }
-                    Ok(None) => ("running".to_string(), TaskState::Running(child)),
-                    Err(e) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        ("error".to_string(), TaskState::Failed {
-                            stdout: String::new(),
-                            stderr: format!("try_wait failed: {}", e),
-                            duration_secs: entry.started_at.elapsed().as_secs_f64(),
-                        })
-                    }
-                }
-            }
-            TaskState::Completed { .. } => {
-                ("completed".to_string(), prev)
-            }
-            TaskState::Failed { .. } => {
-                ("failed".to_string(), prev)
-            }
-            TaskState::Reaping => ("reaping".to_string(), TaskState::Reaping),
-        };
-        entry.state = new_state;
-
-        let short_id = if tid.len() > 19 { &tid[..19] } else { tid };
-        lines.push(format!(
-            "{:<19} {:<14} {:<14} {:<11} {}",
-            short_id, entry.agent_name, entry.model, state_str, entry.description
-        ));
-    }
+    let mut lines = vec!["TaskID              PID      Agent          Model          State       Description".to_string()];
+    with_os_kernel(|os| {
+        for (tid, entry) in registry.iter() {
+            let state_str = task_state_string(os, tid, entry.pid)?;
+            let short_id = if tid.len() > 19 { &tid[..19] } else { tid };
+            lines.push(format!(
+                "{:<19} {:<8} {:<14} {:<14} {:<11} {}",
+                short_id, entry.pid, entry.agent_name, entry.model, state_str, entry.description
+            ));
+        }
+        Ok(())
+    })?;
 
     Ok(lines.join("\n"))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StoredTaskResult {
+    status: String,
+    output: String,
+    error: Option<String>,
+}
+
+fn read_task_result(
+    os: &mut dyn crate::ai::os::kernel::Syscall,
+    task_id: &str,
+) -> Result<Option<StoredTaskResult>, String> {
+    let key = task_result_shm_key(task_id);
+    let Some(payload) = os.shm_read_degraded(&key) else {
+        return Ok(None);
+    };
+    serde_json::from_str(&payload)
+        .map(Some)
+        .map_err(|err| format!("Failed to decode stored task result for {task_id}: {err}"))
+}
+
+fn is_task_pending(
+    os: &mut dyn crate::ai::os::kernel::Syscall,
+    pid: u64,
+) -> Result<bool, String> {
+    let Some(proc) = os.get_process(pid) else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        proc.state,
+        ProcessState::Ready
+            | ProcessState::Running
+            | ProcessState::Waiting { .. }
+            | ProcessState::Sleeping { .. }
+    ))
+}
+
+fn task_state_string(
+    os: &mut dyn crate::ai::os::kernel::Syscall,
+    task_id: &str,
+    pid: u64,
+) -> Result<String, String> {
+    if let Some(result) = read_task_result(os, task_id)? {
+        return Ok(result.status);
+    }
+    let state = match os.get_process(pid) {
+        Some(proc) => match proc.state {
+            ProcessState::Ready => "ready",
+            ProcessState::Running => "running",
+            ProcessState::Waiting { .. } => "waiting",
+            ProcessState::Sleeping { .. } => "sleeping",
+            ProcessState::Stopped => "stopped",
+            ProcessState::Terminated => "terminated",
+        },
+        None => "unknown",
+    };
+    Ok(state.to_string())
+}
+
+fn format_task_result(entry: &AsyncTaskEntry, result: StoredTaskResult) -> String {
+    let duration_secs = entry.started_at.elapsed().as_secs_f64();
+    let mut parts = vec![format!(
+        "[Task: {} via {} @ {}] {} after {:.1}s",
+        entry.description,
+        entry.agent_name,
+        entry.model,
+        result.status.to_uppercase(),
+        duration_secs
+    )];
+    parts.push(entry.selection_explanation.clone());
+    if let Some(error) = result.error
+        && !error.trim().is_empty()
+    {
+        parts.push(format!("Error: {}", error));
+    }
+    if !result.output.trim().is_empty() {
+        parts.push(result.output.trim().to_string());
+    }
+    parts.join("\n")
 }
 
 fn auto_subagent_score(agent: &AgentManifest, task_text: &str) -> i32 {

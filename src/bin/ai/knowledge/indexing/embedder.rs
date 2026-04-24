@@ -1,22 +1,13 @@
 /// Embedding provider trait and implementations.
 /// Single source for text embedding — replaces scattered EMBEDDING_PROVIDER globals.
-use std::sync::{Mutex, OnceLock};
+use std::{path::PathBuf, sync::{Mutex, OnceLock}};
+
+use dirs::cache_dir;
 
 /// Trait for embedding providers.
 pub trait EmbeddingProvider: Sync + Send {
     fn embed(&self, text: &str) -> Option<Vec<f32>>;
     fn embed_batch(&self, texts: &[String]) -> Option<Vec<Vec<f32>>>;
-}
-
-/// No-op provider (used when no model is loaded).
-struct NoopEmbeddingProvider;
-impl EmbeddingProvider for NoopEmbeddingProvider {
-    fn embed(&self, _text: &str) -> Option<Vec<f32>> {
-        None
-    }
-    fn embed_batch(&self, _texts: &[String]) -> Option<Vec<Vec<f32>>> {
-        None
-    }
 }
 
 /// FastEmbed-based provider (lazy-loaded).
@@ -75,6 +66,21 @@ impl EmbeddingProvider for FastEmbedProvider {
 /// Global embedding provider — set once at startup.
 static GLOBAL_PROVIDER: OnceLock<Box<dyn EmbeddingProvider>> = OnceLock::new();
 
+fn default_cache_dir() -> PathBuf {
+    cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("rust_tools")
+        .join("fastembed_cache")
+}
+
+fn default_provider() -> Box<dyn EmbeddingProvider> {
+    Box::new(FastEmbedProvider::new(default_cache_dir()))
+}
+
+fn global_provider() -> &'static dyn EmbeddingProvider {
+    GLOBAL_PROVIDER.get_or_init(default_provider).as_ref()
+}
+
 /// Set the global embedding provider. Must be called before first use.
 pub fn set_provider(provider: Box<dyn EmbeddingProvider>) {
     let _ = GLOBAL_PROVIDER.set(provider);
@@ -82,23 +88,16 @@ pub fn set_provider(provider: Box<dyn EmbeddingProvider>) {
 
 /// Embed text using the global provider.
 pub fn embed_text(text: &str) -> Option<Vec<f32>> {
-    if let Some(p) = GLOBAL_PROVIDER.get() {
-        p.embed(text)
-    } else {
-        None
-    }
+    global_provider().embed(text)
 }
 
 /// Embed multiple texts using the global provider.
 pub fn embed_texts(texts: &[String]) -> Option<Vec<Vec<f32>>> {
-    if let Some(p) = GLOBAL_PROVIDER.get() {
-        p.embed_batch(texts)
-    } else {
-        None
-    }
+    global_provider().embed_batch(texts)
 }
 
 /// Check if an embedding provider is available.
 pub fn has_provider() -> bool {
-    GLOBAL_PROVIDER.get().is_some()
+    let _ = GLOBAL_PROVIDER.get_or_init(default_provider);
+    true
 }

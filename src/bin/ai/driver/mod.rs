@@ -40,6 +40,7 @@ use crate::ai::{
     models,
     prompt::PromptEditor,
     skills::{self, SkillManifest},
+    tools::task_tools::{decode_os_task_goal, task_result_shm_key},
     types::{AgentContext, App},
 };
 use crate::commonw::configw;
@@ -47,6 +48,7 @@ use crate::commonw::configw;
 pub mod agent_router;
 pub mod commands;
 pub mod decision_log;
+pub mod embedding;
 pub mod input;
 pub mod intent_model;
 pub mod intent_recognition;
@@ -481,10 +483,13 @@ async fn run_loop(
 
             let original_history_file = app.session_history_file.clone();
 
-            let mut task_specs: Vec<(u64, String, PathBuf)> = Vec::new();
+            let mut task_specs: Vec<(u64, String, PathBuf, Option<String>, Option<String>, Option<String>)> = Vec::new();
             for proc in &background_procs {
                 let pid = proc.pid;
-                let proc_question = if !proc.mailbox.is_empty() {
+                let task_goal = decode_os_task_goal(&proc.goal);
+                let proc_question = if let Some(goal) = &task_goal {
+                    goal.prompt.clone()
+                } else if !proc.mailbox.is_empty() {
                     let messages: Vec<String> = proc.mailbox.iter().cloned().collect();
                     {
                         let mut os = app.os.lock().unwrap();
@@ -518,21 +523,35 @@ async fn run_loop(
                 }
 
                 let history_path = process_history_path(&original_history_file, pid);
-                task_specs.push((pid, proc_question, history_path));
+                task_specs.push((
+                    pid,
+                    proc_question,
+                    history_path,
+                    task_goal.as_ref().map(|goal| goal.agent_name.clone()),
+                    task_goal.as_ref().map(|goal| goal.model.clone()),
+                    task_goal.as_ref().map(|goal| goal.task_id.clone()),
+                ));
             }
 
             let mut join_set: tokio::task::JoinSet<(
                 u64,
+                Option<String>,
                 Result<turn_runtime::TurnOutcome, String>,
             )> = tokio::task::JoinSet::new();
 
-            for (pid, proc_question, history_path) in task_specs {
+            for (pid, proc_question, history_path, agent_override, model_override, task_id) in task_specs {
                 let mut task_app = app.clone();
                 task_app.session_history_file = history_path;
                 task_app.cancel_stream.store(false, Ordering::Relaxed);
                 let task_mcp = mcp_client.clone();
                 let task_skills = skill_manifests.to_vec();
-                let next_model = app.current_model.clone();
+                if let Some(agent_name) = &agent_override
+                    && let Some(agent) = agents::find_agent_by_name(agent_manifests, agent_name)
+                    && !agent.disabled
+                {
+                    activate_primary_agent(&mut task_app, agent);
+                }
+                let next_model = model_override.unwrap_or_else(|| app.current_model.clone());
 
                 join_set.spawn(crate::ai::os::kernel::TASK_PID.scope(Some(pid), async move {
                     crate::ai::tools::registry::common::clear_tool_cancel();
@@ -549,12 +568,12 @@ async fn run_loop(
                     )
                     .await
                     .map_err(|e| format!("{}", e));
-                    (pid, result)
+                    (pid, task_id, result)
                 }));
             }
 
             while let Some(join_result) = join_set.join_next().await {
-                let (pid, turn_result) = match join_result {
+                let (pid, task_id, turn_result) = match join_result {
                     Ok(pair) => pair,
                     Err(join_err) => {
                         eprintln!("[OS] Task panicked: {}", join_err);
@@ -565,6 +584,20 @@ async fn run_loop(
                 {
                     let mut os = app.os.lock().unwrap();
                     os.set_current_pid(Some(pid));
+                    if let Some(task_id) = &task_id {
+                        let key = task_result_shm_key(task_id);
+                        if os.shm_read_degraded(&key).is_none() {
+                            let _ = os.shm_create(
+                                key,
+                                serde_json::json!({
+                                    "status": if turn_result.is_ok() { "completed" } else { "failed" },
+                                    "output": "",
+                                    "error": turn_result.as_ref().err().cloned(),
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
                     match turn_result {
                         Ok(_outcome) => {
                             os.increment_turns_used_for(pid);

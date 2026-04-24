@@ -85,6 +85,8 @@ pub enum ProcessState {
 /// Signals - process control signals, mirroring POSIX signals
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
+    /// Cooperative cancellation request for the current turn/tool execution.
+    SigCancel,
     /// Graceful termination request - process should clean up and exit
     SigTerm,
     /// Stop execution - process pauses (similar to Ctrl+Z)

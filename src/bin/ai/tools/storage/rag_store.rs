@@ -1,19 +1,18 @@
 /// RAG (Retrieval-Augmented Generation) 向量存储
 ///
-/// 使用 fastembed 生成本地 embedding（all-MiniLM-L6-v2, 384维），
-/// 使用 sled 持久化存储向量索引。
+/// 使用 AIOS 统一 embedding provider，
+/// 使用 knowledge::storage::VectorStore 持久化存储向量索引。
 /// 支持余弦相似度检索和混合 BM25 + 向量检索。
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use dirs;
-use fastembed::{InitOptions, TextEmbedding};
-use rust_tools::commonw::{FastMap, FastSet};
 use serde::{Deserialize, Serialize};
 
+use crate::ai::knowledge::{
+    storage::vector_store::{VectorEntry, VectorStore},
+};
 use crate::ai::tools::storage::memory_store::MemoryStore;
-
-const EMBEDDING_DIM: usize = 384;
 
 /// 带向量的知识条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,61 +31,9 @@ pub struct RagEntry {
     pub timestamp: u64,
 }
 
-/// Embedder 包装 — 懒加载 (Mutex<Option> 模式)
-struct LazyEmbedder {
-    inner: Mutex<Option<TextEmbedding>>,
-}
-
-impl LazyEmbedder {
-    fn new() -> Self {
-        Self {
-            inner: Mutex::new(None),
-        }
-    }
-
-    fn get(&self) -> Result<&TextEmbedding, String> {
-        // 先尝试快速读取（不加锁的情况下检查）
-        {
-            let guard = self
-                .inner
-                .lock()
-                .map_err(|e| format!("Lock poisoned: {}", e))?;
-            if let Some(ref embedder) = *guard {
-                // Safety: embedder 存在且生命周期与 self 绑定
-                return Ok(unsafe {
-                    std::mem::transmute::<&TextEmbedding, &TextEmbedding>(embedder)
-                });
-            }
-        }
-
-        // 需要初始化
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| format!("Lock poisoned: {}", e))?;
-        if guard.is_none() {
-            let embedder = TextEmbedding::try_new({
-                let cache_dir = dirs::cache_dir()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
-                    .join("fastembed_cache");
-                InitOptions::default()
-                    .with_cache_dir(cache_dir)
-                    .with_show_download_progress(true)
-            })
-            .map_err(|e| format!("Failed to load embedding model: {}", e))?;
-            *guard = Some(embedder);
-        }
-
-        // Safety: 我们已经确保 Some 存在
-        let embedder = guard.as_ref().unwrap();
-        Ok(unsafe { std::mem::transmute::<&TextEmbedding, &TextEmbedding>(embedder) })
-    }
-}
-
 /// RAG 向量存储
 pub struct RagStore {
-    db: sled::Db,
-    embedder: LazyEmbedder,
+    store: VectorStore,
     index_path: PathBuf,
 }
 
@@ -100,71 +47,26 @@ impl RagStore {
 
     /// 从指定路径创建
     pub fn with_path(path: &Path) -> Result<Self, String> {
-        let db = sled::open(path)
-            .map_err(|e| format!("Failed to open RAG index at {:?}: {}", path, e))?;
-
         Ok(Self {
-            db,
-            embedder: LazyEmbedder::new(),
+            store: VectorStore::with_global_provider(path)?,
             index_path: path.to_path_buf(),
         })
     }
 
-    fn embedder(&self) -> Result<&TextEmbedding, String> {
-        self.embedder.get()
-    }
-
     pub fn embed_text(&self, text: &str) -> Result<Vec<f32>, String> {
-        let embedder = self.embedder()?;
-        let embeddings = embedder
-            .embed(vec![text], None)
-            .map_err(|e| format!("Failed to embed text: {}", e))?;
-
-        embeddings
-            .into_iter()
-            .next()
-            .ok_or_else(|| "No embedding generated".to_string())
+        self.store.embed_text(text)
     }
 
     pub fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let embedder = self.embedder()?;
-        embedder
-            .embed(texts.to_vec(), None)
-            .map_err(|e| format!("Failed to embed texts: {}", e))
+        self.store.embed_texts(texts)
     }
 
     pub fn upsert(&self, entry: RagEntry) -> Result<(), String> {
-        let key = format!("vec:{}", entry.id);
-        let value = serde_json::to_vec(&entry)
-            .map_err(|e| format!("Failed to serialize RagEntry: {}", e))?;
-
-        self.db
-            .insert(key.as_bytes(), value)
-            .map_err(|e| format!("Failed to write to sled: {}", e))?;
-        self.db
-            .flush()
-            .map_err(|e| format!("Failed to flush sled: {}", e))?;
-        Ok(())
+        self.store.upsert(entry.into())
     }
 
     pub fn delete(&self, id: &str) -> Result<bool, String> {
-        let key = format!("vec:{}", id);
-        let existed = self
-            .db
-            .contains_key(key.as_bytes())
-            .map_err(|e| format!("Failed to check key: {}", e))?;
-        if existed {
-            self.db
-                .remove(key.as_bytes())
-                .map_err(|e| format!("Failed to delete: {}", e))?;
-            self.db
-                .flush()
-                .map_err(|e| format!("Failed to flush: {}", e))?;
-        }
-        Ok(existed)
+        self.store.delete(id)
     }
 
     /// 语义搜索 — 余弦相似度 top-k
@@ -183,32 +85,14 @@ impl RagStore {
         }
 
         let query_embedding = self.embed_text(query)?;
-
-        let mut candidates = Vec::new();
-        for result in self.db.iter() {
-            let (key_bytes, val_bytes) =
-                result.map_err(|e| format!("Failed to iterate sled: {}", e))?;
-            let key = String::from_utf8_lossy(&key_bytes);
-            if !key.starts_with("vec:") {
-                continue;
-            }
-
-            let entry: RagEntry = serde_json::from_slice(&val_bytes)
-                .map_err(|e| format!("Failed to deserialize RagEntry: {}", e))?;
-
-            if let Some(cat) = category {
-                if entry.category != cat {
-                    continue;
-                }
-            }
-
-            let similarity = cosine_similarity(&query_embedding, &entry.embedding);
-            candidates.push((entry, similarity));
-        }
-
-        candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        candidates.truncate(limit);
-        Ok(candidates)
+        self.store
+            .semantic_search(&query_embedding, limit, category)
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|(entry, score)| (entry.into(), score))
+                    .collect()
+            })
     }
 
     /// 混合搜索 — BM25 + 语义加权融合
@@ -220,90 +104,27 @@ impl RagStore {
         category: Option<&str>,
         vector_weight: f32,
     ) -> Result<Vec<(String, RagEntry, f32)>, String> {
-        let semantic_results = self.semantic_search(query, limit * 3, category)?;
-        let semantic_scores: FastMap<String, f32> = semantic_results
-            .into_iter()
-            .map(|(entry, score)| (entry.id.clone(), score))
-            .collect();
-
-        let bm25_max = bm25_results.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
-        let bm25_normalized: FastMap<String, f32> = if bm25_max > 0.0 {
-            bm25_results
-                .into_iter()
-                .map(|(id, score)| (id, score / bm25_max))
-                .collect()
-        } else {
-            FastMap::default()
-        };
-
-        let mut all_ids: FastSet<String> = FastSet::default();
-        all_ids.extend(bm25_normalized.keys().cloned());
-        all_ids.extend(semantic_scores.keys().cloned());
-
-        let mut combined: Vec<(String, f32)> = Vec::new();
-        for id in all_ids {
-            let bm25 = bm25_normalized.get(&id).copied().unwrap_or(0.0);
-            let semantic = semantic_scores.get(&id).copied().unwrap_or(0.0);
-            let final_score = (1.0 - vector_weight) * bm25 + vector_weight * semantic;
-            combined.push((id, final_score));
-        }
-
-        combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        combined.truncate(limit);
-
-        let mut results = Vec::new();
-        for (id, score) in combined {
-            let key = format!("vec:{}", id);
-            if let Some(val_bytes) = self
-                .db
-                .get(key.as_bytes())
-                .map_err(|e| format!("Failed to get key: {}", e))?
-            {
-                let entry: RagEntry = serde_json::from_slice(&val_bytes)
-                    .map_err(|e| format!("Failed to deserialize: {}", e))?;
-                results.push((id, entry, score));
-            }
-        }
-        Ok(results)
+        let query_embedding = self.embed_text(query)?;
+        self.store
+            .hybrid_search(&query_embedding, bm25_results, limit, category, vector_weight)
+            .map(|results| {
+                results
+                    .into_iter()
+                    .map(|(id, entry, score)| (id, entry.into(), score))
+                    .collect()
+            })
     }
 
     pub fn count(&self) -> Result<usize, String> {
-        let mut count = 0;
-        for result in self.db.iter() {
-            let (key_bytes, _) = result.map_err(|e| format!("Failed to iterate: {}", e))?;
-            let key = String::from_utf8_lossy(&key_bytes);
-            if key.starts_with("vec:") {
-                count += 1;
-            }
-        }
-        Ok(count)
+        self.store.count()
     }
 
     pub fn list_ids(&self) -> Result<Vec<String>, String> {
-        let mut ids = Vec::new();
-        for result in self.db.iter() {
-            let (key_bytes, _) = result.map_err(|e| format!("Failed to iterate: {}", e))?;
-            let key = String::from_utf8_lossy(&key_bytes);
-            if key.starts_with("vec:") {
-                ids.push(key.trim_start_matches("vec:").to_string());
-            }
-        }
-        Ok(ids)
+        self.store.list_ids()
     }
 
     pub fn get_entry(&self, id: &str) -> Result<Option<RagEntry>, String> {
-        let key = format!("vec:{}", id);
-        if let Some(val_bytes) = self
-            .db
-            .get(key.as_bytes())
-            .map_err(|e| format!("Failed to get: {}", e))?
-        {
-            let entry: RagEntry = serde_json::from_slice(&val_bytes)
-                .map_err(|e| format!("Failed to deserialize: {}", e))?;
-            Ok(Some(entry))
-        } else {
-            Ok(None)
-        }
+        self.store.get(id).map(|entry| entry.map(Into::into))
     }
 
     /// 重建索引（从 memory_store 同步）
@@ -352,6 +173,32 @@ impl RagStore {
     }
 }
 
+impl From<RagEntry> for VectorEntry {
+    fn from(value: RagEntry) -> Self {
+        Self {
+            id: value.id,
+            content: value.content,
+            category: value.category,
+            tags: value.tags,
+            embedding: value.embedding,
+            timestamp: value.timestamp,
+        }
+    }
+}
+
+impl From<VectorEntry> for RagEntry {
+    fn from(value: VectorEntry) -> Self {
+        Self {
+            id: value.id,
+            content: value.content,
+            category: value.category,
+            tags: value.tags,
+            embedding: value.embedding,
+            timestamp: value.timestamp,
+        }
+    }
+}
+
 /// Implement the VectorStoreSync trait for compatibility with the new knowledge sync module.
 impl crate::ai::knowledge::sync::knowledge_sync::VectorStoreSync for RagStore {
     fn upsert_entry(
@@ -384,19 +231,6 @@ impl crate::ai::knowledge::sync::knowledge_sync::VectorStoreSync for RagStore {
         // Use the optimized batch embedding
         self.embed_texts(texts)
     }
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 0.0;
-    }
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a < 1e-8 || norm_b < 1e-8 {
-        return 0.0;
-    }
-    dot / (norm_a * norm_b)
 }
 
 /// 全局 RAG Store
@@ -445,26 +279,26 @@ mod tests {
     fn test_cosine_similarity_identical() {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
+        assert!((crate::ai::knowledge::indexing::similarity::cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_cosine_similarity_orthogonal() {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![0.0, 1.0, 0.0];
-        assert!(cosine_similarity(&a, &b).abs() < 1e-6);
+        assert!(crate::ai::knowledge::indexing::similarity::cosine_similarity(&a, &b).abs() < 1e-6);
     }
 
     #[test]
     fn test_cosine_similarity_opposite() {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![-1.0, 0.0, 0.0];
-        assert!((cosine_similarity(&a, &b) - (-1.0)).abs() < 1e-6);
+        assert!((crate::ai::knowledge::indexing::similarity::cosine_similarity(&a, &b) - (-1.0)).abs() < 1e-6);
     }
 
     #[test]
     fn test_cosine_similarity_empty() {
-        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(crate::ai::knowledge::indexing::similarity::cosine_similarity(&[], &[]), 0.0);
     }
 
     fn make_entry(

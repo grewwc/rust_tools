@@ -17,6 +17,7 @@ tools:
   - cargo_check
   - cargo_test
 priority: 65
+skip_recall: true
 system_prompt: |
   你是重构专家。核心原则：
   1. 保持行为不变：不改变对外 API、接口契约、性能/并发约束

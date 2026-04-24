@@ -233,6 +233,16 @@ impl LocalOS {
 
     fn deliver_signal(&mut self, target_pid: u64, signal: Signal) -> Result<(), String> {
         match signal {
+            Signal::SigCancel => {
+                if let Some(proc) = self.processes.get_mut(&target_pid) {
+                    if proc.state == ProcessState::Terminated {
+                        return Ok(());
+                    }
+                    if !proc.pending_signals.contains(&Signal::SigCancel) {
+                        proc.pending_signals.push_back(Signal::SigCancel);
+                    }
+                }
+            }
             Signal::SigKill => {
                 let descendants = self.collect_descendants(target_pid);
                 for pid in descendants.iter().rev() {
@@ -300,11 +310,15 @@ impl LocalOS {
             }
         };
 
+        let mut should_cancel = false;
         let mut should_terminate = false;
         let mut should_stop = false;
 
         for signal in signals {
             match signal {
+                Signal::SigCancel => {
+                    should_cancel = true;
+                }
                 Signal::SigKill => {
                     should_terminate = true;
                     break;
@@ -323,6 +337,10 @@ impl LocalOS {
 
         if let Some(proc) = self.processes.get_mut(&current) {
             proc.pending_signals.clear();
+        }
+
+        if should_cancel {
+            return true;
         }
 
         if should_terminate {
@@ -1140,11 +1158,15 @@ impl KernelInternal for LocalOS {
             }
         };
 
+        let mut should_cancel = false;
         let mut should_terminate = false;
         let mut should_stop = false;
 
         for signal in signals {
             match signal {
+                Signal::SigCancel => {
+                    should_cancel = true;
+                }
                 Signal::SigKill => {
                     should_terminate = true;
                     break;
@@ -1163,6 +1185,10 @@ impl KernelInternal for LocalOS {
 
         if let Some(proc) = self.processes.get_mut(&current) {
             proc.pending_signals.clear();
+        }
+
+        if should_cancel {
+            return true;
         }
 
         if should_terminate {
@@ -1599,6 +1625,24 @@ mod tests {
         os.signal_process(child, Signal::SigTerm).unwrap();
         let child_proc = os.get_process(child).unwrap();
         assert!(child_proc.pending_signals.contains(&Signal::SigTerm));
+    }
+
+    #[test]
+    fn sigcancel_is_consumed_without_terminating_process() {
+        let mut os = LocalOS::new();
+        let root =
+            os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+
+        os.signal_process(root, Signal::SigCancel).unwrap();
+        assert!(os.get_process(root).unwrap().pending_signals.contains(&Signal::SigCancel));
+
+        os.set_current_pid(Some(root));
+        assert!(os.process_pending_signals());
+        assert!(matches!(
+            os.get_process(root).map(|p| &p.state),
+            Some(ProcessState::Ready | ProcessState::Running)
+        ));
+        assert!(os.get_process(root).unwrap().pending_signals.is_empty());
     }
 
     #[test]

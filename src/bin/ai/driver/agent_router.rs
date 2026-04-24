@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex},
@@ -13,10 +12,25 @@ use crate::ai::{
     history::Message,
 };
 
+use super::{
+    build_idf_from_documents, cosine_tfidf_similarity, normalize_text_for_similarity,
+    TextSimilarityFeatures,
+};
+
 pub struct RoutingDecision {
     pub agent_name: String,
     pub reason: &'static str,
 }
+
+const ROUTE_REASON_MODEL_LOW_CONFIDENCE: &str = "model-low-confidence";
+const ROUTE_REASON_MODEL_PREDICT: &str = "model-predict";
+const ROUTE_REASON_SEMANTIC_MATCH: &str = "semantic-match";
+const ROUTE_REASON_SEMANTIC_FALLBACK: &str = "semantic-fallback";
+const MODEL_CONFIDENCE_THRESHOLD: f64 = 0.45;
+const SEMANTIC_SWITCH_THRESHOLD: f64 = 0.085;
+const SEMANTIC_SWITCH_MARGIN: f64 = 0.015;
+const CURRENT_TURN_SEMANTIC_FLOOR: f64 = 0.05;
+const CURRENT_TURN_ADVANTAGE_MARGIN: f64 = 0.04;
 
 pub trait AgentRouter: Send + Sync {
     fn route(
@@ -197,41 +211,46 @@ impl AgentRouter for ModelRouter {
         &self,
         agent_manifests: &[AgentManifest],
         question: &str,
-        _history: &[Message],
+        history: &[Message],
         current_agent: &str,
     ) -> Option<RoutingDecision> {
         let model = load_route_model(&self.model_path)?;
 
         let (predicted_agent, confidence) = predict_agent(question, &model)?;
-
-        let agent = agents::find_agent_by_name(agent_manifests, &predicted_agent)?;
-        if !agent.is_primary() || agent.disabled || agent.hidden {
-            return None;
-        }
-
-        if predicted_agent == current_agent {
-            return None;
-        }
-
+        let scored = rank_agents_by_semantics(
+            agent_manifests,
+            question,
+            history,
+            Some((predicted_agent.as_str(), confidence)),
+        );
         if confidence < self.confidence_threshold {
-            let fallback = agents::find_agent_by_name(agent_manifests, "build")
-                .filter(|a| a.is_primary() && !a.disabled && !a.hidden)
-                .map(|a| a.name.clone())
-                .unwrap_or_else(|| current_agent.to_string());
-
-            if fallback == current_agent {
-                return None;
-            }
-
-            return Some(RoutingDecision {
-                agent_name: fallback,
-                reason: "model-low-confidence",
-            });
+            return choose_semantic_route(scored, current_agent, ROUTE_REASON_MODEL_LOW_CONFIDENCE);
         }
 
+        let agent = agents::find_agent_by_name(agent_manifests, &predicted_agent)
+            .filter(|agent| agent.is_primary() && !agent.disabled && !agent.hidden)?;
+        if predicted_agent != current_agent {
+            let semantic_decision =
+                choose_semantic_route(scored.clone(), current_agent, ROUTE_REASON_MODEL_PREDICT);
+            if semantic_decision
+                .as_ref()
+                .is_some_and(|decision| decision.agent_name == predicted_agent)
+            {
+                return semantic_decision;
+            }
+        }
+
+        let semantic_fallback =
+            choose_semantic_route(scored, current_agent, ROUTE_REASON_SEMANTIC_FALLBACK);
+        if semantic_fallback.is_some() {
+            return semantic_fallback;
+        }
+        if agent.name == current_agent {
+            return None;
+        }
         Some(RoutingDecision {
             agent_name: predicted_agent,
-            reason: "model-predict",
+            reason: ROUTE_REASON_MODEL_PREDICT,
         })
     }
 }
@@ -246,220 +265,137 @@ impl AgentRouter for HeuristicRouter {
         history: &[Message],
         current_agent: &str,
     ) -> Option<RoutingDecision> {
-        let intent = super::intent_recognition::detect_intent_with_model_path(
-            question,
-            &super::config::load_config().ok()?.intent_model_path,
-        );
-
-        let legacy_target = if should_auto_route_to_executor(&intent, question) {
-            Some("executor")
-        } else {
-            None
-        };
-
-        let context_target = select_best_agent_by_context(agent_manifests, question, history);
-
-        let fallback_agent_name = agents::find_agent_by_name(agent_manifests, "build")
-            .filter(|agent| agent.is_primary() && !agent.disabled && !agent.hidden)
-            .map(|agent| agent.name.clone())
-            .unwrap_or_else(|| current_agent.to_string());
-
-        let target_agent_name: String = if let Some(name) = legacy_target {
-            if let Some(ctx_agent) = context_target {
-                if agents::canonical_agent_name(&ctx_agent.name) == name {
-                    name.to_string()
-                } else {
-                    ctx_agent.name.clone()
-                }
-            } else {
-                name.to_string()
-            }
-        } else if let Some(ctx_agent) = context_target {
-            ctx_agent.name.clone()
-        } else {
-            fallback_agent_name
-        };
-
-        if current_agent == target_agent_name {
-            return None;
-        }
-
-        let agent = agents::find_agent_by_name(agent_manifests, &target_agent_name)?;
-        if !agent.is_primary() || agent.disabled {
-            return None;
-        }
-
-        let reason = if legacy_target.is_some() && legacy_target.unwrap() == target_agent_name {
-            "complex-execution"
-        } else if let Some(ctx) = context_target {
-            if ctx.name == target_agent_name {
-                "context-match"
-            } else {
-                "unknown"
-            }
-        } else {
-            "fallback"
-        };
-
-        Some(RoutingDecision {
-            agent_name: target_agent_name,
-            reason,
-        })
+        let scored = rank_agents_by_semantics(agent_manifests, question, history, None);
+        choose_semantic_route(scored, current_agent, ROUTE_REASON_SEMANTIC_MATCH)
     }
 }
 
-fn should_auto_route_to_executor(
-    intent: &super::intent_recognition::UserIntent,
-    question: &str,
-) -> bool {
-    if intent.is_search_query() {
-        return false;
-    }
-    if !matches!(
-        intent.core,
-        super::intent_recognition::CoreIntent::RequestAction
-            | super::intent_recognition::CoreIntent::SeekSolution
-    ) {
-        return false;
-    }
-
-    let question = question.trim();
-    if question.is_empty() || !contains_code_action_marker(question) {
-        return false;
-    }
-
-    let char_count = question.chars().count();
-    let line_count = question.lines().count();
-    char_count >= auto_executor_length_threshold()
-        || line_count >= 2
-        || contains_complex_execution_marker(question)
+#[derive(Clone)]
+struct ScoredAgent<'a> {
+    agent: &'a AgentManifest,
+    score: f64,
+    question_score: f64,
+    history_score: f64,
 }
 
-fn select_best_agent_by_context<'a>(
+fn rank_agents_by_semantics<'a>(
     agent_manifests: &'a [AgentManifest],
     question: &str,
     history: &[Message],
-) -> Option<&'a AgentManifest> {
-    let question_lower = question.to_lowercase();
-
-    let mut best: Option<&AgentManifest> = None;
-    let mut best_score: f64 = 0.0;
-
-    for agent in agent_manifests.iter() {
-        if !agent.is_primary() || agent.disabled || agent.hidden {
-            continue;
-        }
-
-        let score = score_agent_for_question(agent, &question_lower, history);
-        if score > best_score {
-            best_score = score;
-            best = Some(agent);
-        }
+    model_prior: Option<(&str, f64)>,
+) -> Vec<ScoredAgent<'a>> {
+    let candidates = agent_manifests
+        .iter()
+        .filter(|agent| agent.is_primary() && !agent.disabled && !agent.hidden)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return Vec::new();
     }
 
-    if best_score >= 5.0 {
-        best
-    } else {
-        None
-    }
-}
+    let query = TextSimilarityFeatures::from_text(question);
+    let history_text = recent_history_text(history);
+    let history_features = TextSimilarityFeatures::from_text(&history_text);
+    let docs = candidates
+        .iter()
+        .map(|agent| TextSimilarityFeatures::from_text(&agent_document_text(agent)))
+        .collect::<Vec<_>>();
+    let doc_refs = docs.iter().map(|doc| &doc.ngram_tf).collect::<Vec<_>>();
+    let idf = build_idf_from_documents(&doc_refs);
 
-fn score_agent_for_question(
-    agent: &AgentManifest,
-    question_lower: &str,
-    history: &[Message],
-) -> f64 {
-    let question_ascii_terms = ascii_word_tokens(question_lower);
-    let desc_lower = agent.description.to_lowercase();
-    let desc_terms = description_terms(&desc_lower);
-    let mut current_turn_score = 0.0;
-
-    let agent_name_lower = agent.name.to_lowercase();
-    if question_lower.contains(&agent_name_lower) {
-        current_turn_score += 20.0;
-    }
-
-    for tag in agent.routing_tags_normalized() {
-        if contains_tag_match(question_lower, &tag) {
-            current_turn_score += 3.0;
-        }
-    }
-
-    let desc_overlap = description_overlap_count(&question_ascii_terms, &desc_terms);
-    if desc_overlap > 0 {
-        current_turn_score += desc_overlap.min(2) as f64;
-    }
-
-    let mut score = current_turn_score;
-
-    if current_turn_score > 0.0 && !history.is_empty() {
-        let recent_entries: Vec<_> = history.iter().rev().take(4).collect();
-        for entry in recent_entries {
-            if let Some(text) = extract_text_from_message(entry) {
-                let entry_lower = text.to_lowercase();
-                let agent_name_lower = agent.name.to_lowercase();
-                if entry_lower.contains(&agent_name_lower) {
-                    score += 2.0;
-                }
-                let history_terms = ascii_word_tokens(&entry_lower);
-                let history_overlap = description_overlap_count(&history_terms, &desc_terms);
-                if history_overlap > 0 {
-                    score += history_overlap.min(2) as f64 * 0.5;
-                }
+    let mut ranked = candidates
+        .into_iter()
+        .zip(docs)
+        .map(|(agent, doc)| {
+            let question_score = cosine_tfidf_similarity(&query.ngram_tf, &doc.ngram_tf, &idf);
+            let history_score =
+                cosine_tfidf_similarity(&history_features.ngram_tf, &doc.ngram_tf, &idf);
+            let prior_boost = model_prior
+                .filter(|(label, _)| *label == agent.name)
+                .map(|(_, confidence)| confidence * 0.15)
+                .unwrap_or(0.0);
+            ScoredAgent {
+                agent,
+                score: question_score + history_score * 0.35 + prior_boost,
+                question_score,
+                history_score,
             }
-        }
-    }
+        })
+        .collect::<Vec<_>>();
 
-    let word_count = question_ascii_terms.len();
-    if word_count <= 5
-        && agent
-            .model_tier
-            .as_ref()
-            .is_some_and(|t| matches!(t, agents::AgentModelTier::Light))
+    ranked.sort_by(|left, right| right.score.total_cmp(&left.score));
+    ranked
+}
+
+fn choose_semantic_route(
+    ranked: Vec<ScoredAgent<'_>>,
+    current_agent: &str,
+    reason: &'static str,
+) -> Option<RoutingDecision> {
+    let best = ranked.first()?;
+    if best.score < SEMANTIC_SWITCH_THRESHOLD {
+        return None;
+    }
+    if best.question_score < CURRENT_TURN_SEMANTIC_FLOOR {
+        return None;
+    }
+    if best.agent.name == current_agent {
+        return None;
+    }
+    let current_score = ranked
+        .iter()
+        .find(|item| item.agent.name == current_agent)
+        .map(|item| item.score)
+        .unwrap_or(0.0);
+    let current_question_score = ranked
+        .iter()
+        .find(|item| item.agent.name == current_agent)
+        .map(|item| item.question_score)
+        .unwrap_or(0.0);
+    if best.score <= current_score + SEMANTIC_SWITCH_MARGIN {
+        return None;
+    }
+    if best.question_score <= current_question_score + CURRENT_TURN_ADVANTAGE_MARGIN {
+        return None;
+    }
+    Some(RoutingDecision {
+        agent_name: best.agent.name.clone(),
+        reason,
+    })
+}
+
+fn agent_document_text(agent: &AgentManifest) -> String {
+    let mut parts = vec![agent.name.clone(), agent.description.clone()];
+    if !agent.routing_tags.is_empty() {
+        parts.push(agent.routing_tags.join(" "));
+    }
+    if !agent.tools.is_empty() {
+        parts.push(agent.tools.join(" "));
+    }
+    if !agent.tool_groups.is_empty() {
+        parts.push(agent.tool_groups.join(" "));
+    }
+    if !agent.mcp_servers.is_empty() {
+        parts.push(agent.mcp_servers.join(" "));
+    }
+    if !agent.prompt.trim().is_empty() {
+        parts.push(agent.prompt.chars().take(3000).collect());
+    }
+    if let Some(system_prompt) = &agent.system_prompt
+        && !system_prompt.trim().is_empty()
     {
-        score += 2.0;
+        parts.push(system_prompt.chars().take(1200).collect());
     }
-    if word_count >= 20
-        && agent
-            .model_tier
-            .as_ref()
-            .is_some_and(|t| matches!(t, agents::AgentModelTier::Heavy))
-    {
-        score += 2.0;
-    }
-
-    score
+    normalize_text_for_similarity(&parts.join("\n"))
 }
 
-fn auto_executor_length_threshold() -> usize {
-    let cfg = crate::commonw::configw::get_all_config();
-    cfg.get_opt("ai.agents.auto_route.executor_min_chars")
-        .or_else(|| cfg.get_opt("ai.agents.auto_route.openclaw_min_chars"))
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(48)
-}
-
-fn contains_complex_execution_marker(question: &str) -> bool {
-    let lower = question.to_lowercase();
-    [
-        "然后", "同时", "顺便", "一步步", "分步骤", "自动", "完整", "端到端", "闭环", "multi-step",
-        "end-to-end", "step by step", "across", "implement", "refactor", "debug", "fix", "repair",
-        "integrate", "migrate",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
-}
-
-fn contains_code_action_marker(question: &str) -> bool {
-    let lower = question.to_lowercase();
-    [
-        "帮我", "修", "修复", "修改", "改一下", "实现", "添加", "扩展", "重构", "排查", "调试", "处理",
-        "完成", "补", "优化", "迁移", "接入", "联调", "修一下", "报错", "panic", "error", "failing",
-        "test", "build", "cargo", "fix", "implement", "add", "extend", "refactor", "debug",
-        "update", "wire", "integrate", "migrate",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+fn recent_history_text(history: &[Message]) -> String {
+    history
+        .iter()
+        .rev()
+        .take(4)
+        .filter_map(extract_text_from_message)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn extract_text_from_message(msg: &Message) -> Option<String> {
@@ -488,50 +424,10 @@ fn extract_text_from_message(msg: &Message) -> Option<String> {
     }
 }
 
-fn ascii_word_tokens(text: &str) -> Vec<String> {
-    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-        .filter(|token| !token.is_empty())
-        .map(|token| token.to_ascii_lowercase())
-        .collect()
-}
-
-fn contains_tag_match(question_lower: &str, tag: &str) -> bool {
-    if tag.is_ascii()
-        && tag
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        ascii_word_tokens(question_lower)
-            .iter()
-            .any(|token| token == tag)
-    } else {
-        question_lower.contains(tag)
-    }
-}
-
-fn description_terms(desc_lower: &str) -> HashSet<String> {
-    ascii_word_tokens(desc_lower)
-        .into_iter()
-        .filter(|term| term.len() >= 5)
-        .collect()
-}
-
-fn description_overlap_count(question_terms: &[String], desc_terms: &HashSet<String>) -> usize {
-    question_terms
-        .iter()
-        .filter(|term| term.len() >= 5)
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .filter(|term| desc_terms.contains(*term))
-        .count()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
-    use crate::ai::driver::intent_recognition::{CoreIntent, IntentModifiers, UserIntent};
-
     fn primary_agent(name: &str, description: &str, routing_tags: &[&str]) -> AgentManifest {
         AgentManifest {
             name: name.to_string(),
@@ -555,69 +451,25 @@ mod tests {
     }
 
     #[test]
-    fn auto_routes_complex_execution_requests_to_executor() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
-        let question = "帮我实现这个 agent 的自动执行能力，然后跑检查并修掉相关报错";
-        assert!(should_auto_route_to_executor(&intent, question));
-    }
-
-    #[test]
-    fn does_not_route_simple_concept_questions_to_executor() {
-        let intent = UserIntent::new(CoreIntent::QueryConcept);
-        assert!(!should_auto_route_to_executor(&intent, "Rust 的 crate 是什么？"));
-    }
-
-    #[test]
-    fn does_not_route_search_queries_to_executor() {
-        let intent = UserIntent {
-            core: CoreIntent::RequestAction,
-            modifiers: IntentModifiers {
-                is_search_query: true,
-                target_resource: Some("tool".to_string()),
-                negation: false,
-            },
-        };
-        assert!(!should_auto_route_to_executor(&intent, "帮我找几个调试工具"));
-    }
-
-    #[test]
-    fn simple_file_line_query_does_not_get_pulled_to_plan_by_history() {
+    fn semantic_router_prefers_planning_agent_for_analysis_request() {
         let build = primary_agent("build", "Default agent for development work", &["fix", "debug"]);
         let plan = primary_agent(
             "plan",
             "Read-only agent for planning and analysis without making changes",
             &["plan", "planning", "review", "analyze", "analysis", "总结", "分析"],
         );
-
-        let history = vec![
-            Message {
-                role: "assistant".to_string(),
-                content: serde_json::Value::String(
-                    "plan agent can analyze and summarize".to_string(),
-                ),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-            Message {
-                role: "user".to_string(),
-                content: serde_json::Value::String("继续用 plan 分析".to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-            },
-        ];
-
         let agents = [build, plan];
-        let selected = select_best_agent_by_context(
+        let ranked = rank_agents_by_semantics(
             &agents,
-            "@/Users/bytedance/rust_tools/src/bin/ai/models.rs 这个文件有几行",
-            &history,
+            "先别改代码，帮我分析这次重构方案和风险",
+            &[],
+            None,
         );
-
-        assert!(selected.is_none());
+        assert_eq!(ranked.first().map(|item| item.agent.name.as_str()), Some("plan"));
     }
 
     #[test]
-    fn history_alone_cannot_route_to_plan_without_current_turn_signal() {
+    fn history_alone_cannot_override_current_turn_semantics() {
         let build = primary_agent("build", "Default agent for development work", &["fix", "debug"]);
         let plan = primary_agent(
             "plan",
@@ -643,8 +495,14 @@ mod tests {
         ];
 
         let agents = [build, plan];
-        let selected = select_best_agent_by_context(&agents, "你好", &history);
+        let ranked = rank_agents_by_semantics(
+            &agents,
+            "@/Users/bytedance/rust_tools/src/bin/ai/models.rs 这个文件有几行",
+            &history,
+            None,
+        );
+        let decision = choose_semantic_route(ranked, "build", ROUTE_REASON_SEMANTIC_MATCH);
 
-        assert!(selected.is_none());
+        assert!(decision.is_none());
     }
 }

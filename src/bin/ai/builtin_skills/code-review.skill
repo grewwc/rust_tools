@@ -19,6 +19,7 @@ tools:
   - web_search
   - web_fetch
 priority: 70
+skip_recall: true
 ---
 
 # 🔍 代码审查专家

@@ -1,10 +1,11 @@
 use rust_tools::commonw::FastMap;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use rust_tools::cw::SkipMap;
 use serde_json::Value;
 
+use crate::ai::os::kernel::Signal;
+use crate::ai::tools::os_tools::GLOBAL_OS;
 use crate::ai::tools::permissions::ToolPermissions;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use crate::ai::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
@@ -36,18 +37,58 @@ pub(crate) struct ToolRegistration {
 
 inventory::collect!(ToolRegistration);
 
-static TOOL_CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
-
 pub(crate) fn request_tool_cancel() {
-    TOOL_CANCEL_REQUESTED.store(true, Ordering::Relaxed);
+    with_current_process(|os, pid| {
+        os.signal_process(pid, Signal::SigCancel)?;
+        Ok(())
+    });
 }
 
 pub(crate) fn clear_tool_cancel() {
-    TOOL_CANCEL_REQUESTED.store(false, Ordering::Relaxed);
+    with_current_process_mut(|proc| {
+        proc.pending_signals.retain(|signal| *signal != Signal::SigCancel);
+    });
 }
 
 pub(crate) fn is_tool_cancel_requested() -> bool {
-    TOOL_CANCEL_REQUESTED.load(Ordering::Relaxed)
+    with_current_process_ref(|proc| proc.pending_signals.iter().any(|signal| *signal == Signal::SigCancel))
+        .unwrap_or(false)
+}
+
+fn with_current_process<T>(
+    f: impl FnOnce(&mut dyn crate::ai::os::kernel::Syscall, u64) -> Result<T, String>,
+) -> Option<T> {
+    let guard = GLOBAL_OS.lock().ok()?;
+    let os = guard.as_ref()?.clone();
+    let mut os = os.lock().ok()?;
+    let pid = os.current_process_id()?;
+    f(os.as_mut(), pid).ok()
+}
+
+fn with_current_process_mut(f: impl FnOnce(&mut crate::ai::os::kernel::Process)) {
+    let Ok(guard) = GLOBAL_OS.lock() else {
+        return;
+    };
+    let Some(os) = guard.as_ref() else {
+        return;
+    };
+    let Ok(mut os) = os.lock() else {
+        return;
+    };
+    let Some(pid) = os.current_process_id() else {
+        return;
+    };
+    if let Some(proc) = os.get_process_mut(pid) {
+        f(proc);
+    }
+}
+
+fn with_current_process_ref<T>(f: impl FnOnce(&crate::ai::os::kernel::Process) -> T) -> Option<T> {
+    let guard = GLOBAL_OS.lock().ok()?;
+    let os = guard.as_ref()?.clone();
+    let os = os.lock().ok()?;
+    let pid = os.current_process_id()?;
+    os.get_process(pid).map(f)
 }
 
 static TOOL_INDEX: LazyLock<FastMap<&'static str, &'static ToolSpec>> = LazyLock::new(|| {

@@ -19,10 +19,12 @@
 // =============================================================================
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 use rust_tools::cw::SkipMap;
 
+use crate::ai::config_schema::AiConfig;
 use crate::commonw::{configw, utils::expanduser};
 
 const BUILTIN_SKILLS: &[(&str, &str)] = &[
@@ -55,11 +57,19 @@ pub(super) struct SkillManifest {
     #[serde(default)]
     pub(super) author: Option<String>,
     #[serde(default)]
+    pub(super) triggers: Vec<String>,
+    #[serde(default)]
     pub(super) tools: Vec<String>,
     #[serde(default)]
     pub(super) tool_groups: Vec<String>,
     #[serde(default)]
     pub(super) mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub(super) skip_recall: bool,
+    #[serde(default)]
+    pub(super) disable_builtin_tools: bool,
+    #[serde(default)]
+    pub(super) disable_mcp_tools: bool,
     #[serde(default)]
     pub(super) prompt: String,
     #[serde(default)]
@@ -85,6 +95,29 @@ impl SkillManifest {
         }
 
         prompt
+    }
+
+    pub(super) fn routing_source_hash(&self) -> String {
+        let payload = serde_json::json!({
+            "name": self.name,
+            "version": self.version,
+            "description": self.description,
+            "author": self.author,
+            "triggers": self.triggers,
+            "tools": self.tools,
+            "tool_groups": self.tool_groups,
+            "mcp_servers": self.mcp_servers,
+            "skip_recall": self.skip_recall,
+            "disable_builtin_tools": self.disable_builtin_tools,
+            "disable_mcp_tools": self.disable_mcp_tools,
+            "prompt": self.prompt,
+            "system_prompt": self.system_prompt,
+            "priority": self.priority,
+            "source_path": self.source_path,
+        });
+        let mut hasher = Sha256::new();
+        hasher.update(payload.to_string().as_bytes());
+        format!("{:x}", hasher.finalize())
     }
 }
 
@@ -123,7 +156,7 @@ pub(super) fn load_all_skills() -> Vec<SkillManifest> {
 
 pub(super) fn skills_dir() -> PathBuf {
     let cfg = configw::get_all_config();
-    let raw = cfg.get_opt("ai.skills.dir").unwrap_or_default();
+    let raw = cfg.get_opt(AiConfig::SKILLS_DIR).unwrap_or_default();
     let path = if raw.trim().is_empty() {
         "~/.config/rust_tools/skills".to_string()
     } else {
@@ -156,6 +189,14 @@ fn parse_list_value(s: &str) -> Vec<String> {
         .collect()
 }
 
+fn parse_bool_value(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
 fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
     let mut lines = content.lines();
     let Some(first) = lines.next() else {
@@ -169,9 +210,13 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
     let mut version: Option<String> = None;
     let mut description: Option<String> = None;
     let mut author: Option<String> = None;
+    let mut triggers: Vec<String> = Vec::new();
     let mut tools: Vec<String> = Vec::new();
     let mut tool_groups: Vec<String> = Vec::new();
     let mut mcp_servers: Vec<String> = Vec::new();
+    let mut skip_recall = false;
+    let mut disable_builtin_tools = false;
+    let mut disable_mcp_tools = false;
     let mut system_prompt: Option<String> = None;
     let mut priority: i32 = 0;
 
@@ -202,6 +247,7 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
                 }
                 match key {
                     "tools" => tools.push(v),
+                    "triggers" => triggers.push(v),
                     "tool_groups" => tool_groups.push(v),
                     "mcp_servers" => mcp_servers.push(v),
                     _ => {}
@@ -228,6 +274,14 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
                 "version" => version = Some(unquoted.to_string()),
                 "description" => description = Some(unquoted.to_string()),
                 "author" => author = Some(unquoted.to_string()),
+                "triggers" => triggers = parse_list_value(unquoted),
+                "skip_recall" => skip_recall = parse_bool_value(unquoted).unwrap_or(false),
+                "disable_builtin_tools" => {
+                    disable_builtin_tools = parse_bool_value(unquoted).unwrap_or(false)
+                }
+                "disable_mcp_tools" => {
+                    disable_mcp_tools = parse_bool_value(unquoted).unwrap_or(false)
+                }
                 "system_prompt" => system_prompt = Some(unquoted.to_string()),
                 "priority" => {
                     priority = unquoted.parse::<i32>().unwrap_or(0);
@@ -256,9 +310,13 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
         version: version.unwrap_or_else(default_skill_version),
         description: description.unwrap_or_default(),
         author: author.filter(|s| !s.trim().is_empty()),
+        triggers,
         tools,
         tool_groups,
         mcp_servers,
+        skip_recall,
+        disable_builtin_tools,
+        disable_mcp_tools,
         prompt: body.trim().to_string(),
         system_prompt: system_prompt.filter(|s| !s.trim().is_empty()),
         priority,

@@ -470,8 +470,8 @@ fn params_signal_process() -> Value {
             },
             "signal": {
                 "type": "string",
-                "enum": ["SIGTERM", "SIGSTOP", "SIGCONT", "SIGKILL"],
-                "description": "Signal to send: SIGTERM=graceful termination, SIGSTOP=pause, SIGCONT=resume, SIGKILL=immediate termination with cascade."
+                "enum": ["SIGCANCEL", "SIGTERM", "SIGSTOP", "SIGCONT", "SIGKILL"],
+                "description": "Signal to send: SIGCANCEL=cooperative cancel current turn/tool work, SIGTERM=graceful termination, SIGSTOP=pause, SIGCONT=resume, SIGKILL=immediate termination with cascade."
             }
         },
         "required": ["pid", "signal"]
@@ -482,11 +482,12 @@ fn execute_signal_process(args: &Value) -> Result<String, String> {
     let pid = args["pid"].as_u64().ok_or("Missing or invalid 'pid' parameter.")?;
     let signal_str = args["signal"].as_str().ok_or("Missing 'signal' parameter.")?;
     let signal = match signal_str.to_uppercase().as_str() {
+        "SIGCANCEL" => crate::ai::os::kernel::Signal::SigCancel,
         "SIGTERM" => crate::ai::os::kernel::Signal::SigTerm,
         "SIGSTOP" => crate::ai::os::kernel::Signal::SigStop,
         "SIGCONT" => crate::ai::os::kernel::Signal::SigCont,
         "SIGKILL" => crate::ai::os::kernel::Signal::SigKill,
-        other => return Err(format!("Unknown signal: {}. Valid signals: SIGTERM, SIGSTOP, SIGCONT, SIGKILL", other)),
+        other => return Err(format!("Unknown signal: {}. Valid signals: SIGCANCEL, SIGTERM, SIGSTOP, SIGCONT, SIGKILL", other)),
     };
 
     if let Ok(guard) = GLOBAL_OS.lock() {
@@ -502,7 +503,7 @@ fn execute_signal_process(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "signal_process",
-        description: "Send a POSIX-like signal to a child or descendant process. SIGTERM=request graceful termination, SIGSTOP=pause execution, SIGCONT=resume paused process, SIGKILL=immediate forced termination (cascades to grandchildren).",
+        description: "Send a POSIX-like signal to a child or descendant process. SIGCANCEL=request cooperative cancellation of current turn/tool work, SIGTERM=request graceful termination, SIGSTOP=pause execution, SIGCONT=resume paused process, SIGKILL=immediate forced termination (cascades to grandchildren).",
         parameters: params_signal_process,
         execute: execute_signal_process,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

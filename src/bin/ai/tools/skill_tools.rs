@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::ai::config_schema::AiConfig;
 use crate::ai::skills::SkillManifest;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
@@ -35,6 +36,10 @@ fn skill_matches_query(skill: &SkillManifest, query: &str) -> bool {
     skill.name.to_ascii_lowercase().contains(&query)
         || skill.description.to_ascii_lowercase().contains(&query)
         || skill
+            .triggers
+            .iter()
+            .any(|item| item.to_ascii_lowercase().contains(&query))
+        || skill
             .tools
             .iter()
             .any(|item| item.to_ascii_lowercase().contains(&query))
@@ -66,6 +71,9 @@ fn summarize_skill(skill: &SkillManifest, include_capabilities: bool) -> String 
     if include_capabilities {
         if !skill.tools.is_empty() {
             line.push_str(&format!(" | tools={}", skill.tools.join(",")));
+        }
+        if !skill.triggers.is_empty() {
+            line.push_str(&format!(" | triggers={}", skill.triggers.join(",")));
         }
         if !skill.tool_groups.is_empty() {
             line.push_str(&format!(" | tool_groups={}", skill.tool_groups.join(",")));
@@ -207,7 +215,7 @@ inventory::submit!(ToolRegistration {
 
 fn resolve_configured_skills_dir() -> PathBuf {
     let cfg = crate::commonw::configw::get_all_config();
-    let raw = cfg.get_opt("ai.skills.dir").unwrap_or_default();
+    let raw = cfg.get_opt(AiConfig::SKILLS_DIR).unwrap_or_default();
     if raw.trim().is_empty() {
         return crate::ai::skills::skills_dir();
     }
