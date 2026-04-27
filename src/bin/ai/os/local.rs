@@ -62,6 +62,9 @@ pub struct LocalOS {
     pub(super) round_robin: bool,
     pub(super) shared_memory: FastMap<String, ShmEntry>,
     pub next_pgid: u64,
+    /// All event IDs that have ever been marked completed, used to detect
+    /// already-satisfied wait conditions in wait_on_events.
+    pub(super) completed_events: std::collections::HashSet<EventId>,
 }
 
 impl Default for LocalOS {
@@ -83,6 +86,7 @@ impl LocalOS {
             round_robin: true,
             shared_memory: FastMap::default(),
             next_pgid: 1,
+            completed_events: std::collections::HashSet::new(),
         }
     }
 
@@ -522,6 +526,25 @@ impl Syscall for LocalOS {
         }
         if deduped.is_empty() {
             return Err("event_ids cannot be empty.".to_string());
+        }
+
+        // Check if the wait condition is already satisfied by previously completed events.
+        // This avoids the TOCTOU race where events complete between the caller's snapshot
+        // check and this wait_on_events call, causing lost notifications and a permanent stall.
+        if self.event_wait_is_satisfied(&deduped, &policy, &self.completed_events) {
+            let completed_ids_str = deduped
+                .iter()
+                .filter(|id| self.completed_events.contains(id))
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Some(current_proc) = self.processes.get_mut(&current) {
+                current_proc.mailbox.push_back(format!(
+                    "[EVENT_WAKE]\nReason: event wait condition satisfied.\nCompleted event ids: {}\nRecommended next actions:\n1. Inspect the event-producing subsystem for fresh state.\n2. If these events came from async tool work, use tool_status or tool_wait to collect results.\n3. Cancel low-value still-running branches when appropriate.\n4. If enough results are already available, continue reasoning immediately.",
+                    completed_ids_str
+                ));
+            }
+            return Ok(None);
         }
 
         let timeout_tick = timeout_ticks.map(|ticks| self.tick.saturating_add(ticks.max(1)));
@@ -1213,8 +1236,14 @@ impl KernelInternal for LocalOS {
             return Vec::new();
         }
 
+        // Accumulate into the persistent completed-events set so that wait_on_events
+        // called after this notification can still detect the already-satisfied condition.
+        for &eid in completed_event_ids {
+            self.completed_events.insert(eid);
+        }
+
         let completed_set: std::collections::HashSet<EventId> =
-            completed_event_ids.iter().copied().collect();
+            self.completed_events.iter().copied().collect();
         let mut wake_pids = Vec::new();
         for (pid, proc) in self.processes.iter() {
             if let ProcessState::Waiting {

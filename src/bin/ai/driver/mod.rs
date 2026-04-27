@@ -27,6 +27,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Duration,
 };
 
 use uuid::Uuid;
@@ -114,6 +115,14 @@ fn activate_primary_agent(app: &mut App, agent: &AgentManifest) {
     if let Some(model) = &agent.model {
         app.current_model = model.clone();
     }
+}
+
+fn has_pending_foreground_process(app: &App) -> bool {
+    let os = app.os.lock().unwrap();
+    os.list_processes().into_iter().any(|proc| {
+        proc.is_foreground
+            && !matches!(proc.state, crate::ai::os::kernel::ProcessState::Terminated)
+    })
 }
 
 /// Check if auto-agent routing is enabled in config.
@@ -738,6 +747,11 @@ async fn run_loop(
             }
         }
 
+        if has_pending_foreground_process(app) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
+        }
+
         {
             let Some(ctx) = input::next_question(app)? else {
                 cleanup_one_shot(app);
@@ -952,10 +966,11 @@ async fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{maybe_auto_route_agent, read_recent_history};
+    use super::{has_pending_foreground_process, maybe_auto_route_agent, read_recent_history};
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::history::{Message, append_history_messages};
     use crate::ai::cli::ParsedCli;
+    use crate::ai::os::kernel::{EventId, ProcessState, Syscall, WaitPolicy};
     use crate::ai::types::{AgentContext, App, AppConfig};
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
@@ -1091,5 +1106,40 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{}-wal", path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn pending_foreground_process_blocks_new_prompt() {
+        let mut app = test_app("build");
+
+        {
+            let mut os = app.os.lock().unwrap();
+            let root = os.begin_foreground("foreground".to_string(), "goal".to_string(), 10, 8, None);
+            os.wait_on_events(vec![EventId::new(1)], WaitPolicy::All, None)
+                .unwrap();
+            assert!(matches!(
+                os.get_process(root).map(|proc| &proc.state),
+                Some(ProcessState::Waiting { .. })
+            ));
+        }
+
+        assert!(has_pending_foreground_process(&app));
+    }
+
+    #[test]
+    fn terminated_foreground_process_does_not_block_new_prompt() {
+        let mut app = test_app("build");
+
+        {
+            let mut os = app.os.lock().unwrap();
+            let root = os.begin_foreground("foreground".to_string(), "goal".to_string(), 10, 8, None);
+            os.terminate_current("done".to_string());
+            assert!(matches!(
+                os.get_process(root).map(|proc| &proc.state),
+                Some(ProcessState::Terminated)
+            ));
+        }
+
+        assert!(!has_pending_foreground_process(&app));
     }
 }

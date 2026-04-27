@@ -923,20 +923,34 @@ fn execute_tool_wait(session_id: &str, tool_call_id: &str, args: &Value) -> Resu
     {
         let event_ids = lookup_event_ids(session_id, &task_ids)?;
         let wake_tick = os.wait_on_events(event_ids.clone(), wait_policy.clone(), timeout_ticks)?;
-        return Ok(ToolResult {
-            tool_call_id: tool_call_id.to_string(),
-            content: json!({
-                "status": "suspended",
-                "wait_policy": match wait_policy { WaitPolicy::Any => "any", WaitPolicy::All => "all" },
-                "task_ids": task_ids,
-                "event_ids": event_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-                "timeout_tick": wake_tick,
-                "message": "Current process suspended on event wait condition. Yield control now; after wake-up, inspect mailbox and use tool_status or tool_wait again if needed."
-            })
-            .to_string(),
-        });
+        // wait_on_events returns Ok(None) without suspending when the condition was already
+        // satisfied (events completed before the wait was registered). In that case we do
+        // NOT yield; fall through after the block to collect results immediately.
+        if os.consume_yield_requested() || wake_tick.is_some() {
+            return Ok(ToolResult {
+                tool_call_id: tool_call_id.to_string(),
+                content: json!({
+                    "status": "suspended",
+                    "wait_policy": match wait_policy { WaitPolicy::Any => "any", WaitPolicy::All => "all" },
+                    "task_ids": task_ids,
+                    "event_ids": event_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                    "timeout_tick": wake_tick,
+                    "message": "Current process suspended on event wait condition. Yield control now; after wake-up, inspect mailbox and use tool_status or tool_wait again if needed."
+                })
+                .to_string(),
+            });
+        }
+        // Condition already satisfied; fall through to collect results.
+    } else {
+        // No OS context — use the inline polling path below.
+        let already_satisfied = false;
+        let _ = already_satisfied;
     }
 
+    // This point is reached in two cases:
+    //   1. OS context available but wait condition was already satisfied (no suspension needed).
+    //   2. No OS context — fall through to poll-based wait.
+    // In case 1 all tasks are done so the loop below exits immediately.
     let max_wait_ms = args
         .get("max_wait_ms")
         .and_then(Value::as_u64)
