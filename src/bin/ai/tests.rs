@@ -925,6 +925,7 @@ fn thinking_chunks_are_wrapped_once() {
             },
             finish_reason: None,
         }],
+        ..Default::default()
     };
     let mut thinking_open = false;
     let text =
@@ -942,6 +943,7 @@ fn thinking_chunks_are_wrapped_once() {
             },
             finish_reason: None,
         }],
+        ..Default::default()
     };
     let text =
         stream::extract_chunk_text(&chunk, "<thinking>", "<end thinking>", &mut thinking_open);

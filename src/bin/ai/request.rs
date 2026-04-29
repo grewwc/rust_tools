@@ -41,6 +41,35 @@ struct RequestBody<'a> {
 pub(super) struct StreamChunk {
     #[serde(default, deserialize_with = "vec_or_default")]
     pub(super) choices: Vec<StreamChoice>,
+    /// OpenAI-compatible usage block. Only present on the final chunk
+    /// (and only if `stream_options: { include_usage: true }` was requested,
+    /// though many providers include it unconditionally).
+    #[serde(default)]
+    pub(super) usage: Option<StreamUsage>,
+    /// Some providers echo the model name on every chunk.
+    #[serde(default, deserialize_with = "string_or_default")]
+    pub(super) model: String,
+}
+
+/// OpenAI-compatible `usage` object. We intentionally keep it permissive
+/// (all optional / default=0) so that varied providers do not break parsing.
+#[derive(Debug, Default, Clone, Deserialize)]
+pub(crate) struct StreamUsage {
+    #[serde(default)]
+    pub(crate) prompt_tokens: u64,
+    #[serde(default)]
+    pub(crate) completion_tokens: u64,
+    #[serde(default)]
+    pub(crate) total_tokens: u64,
+    /// OpenAI newer format: prompt_tokens_details.cached_tokens
+    #[serde(default)]
+    pub(crate) prompt_tokens_details: Option<StreamPromptTokensDetails>,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+pub(crate) struct StreamPromptTokensDetails {
+    #[serde(default)]
+    pub(crate) cached_tokens: u64,
 }
 
 impl StreamChunk {
@@ -1475,6 +1504,7 @@ pub async fn do_request_json(
     for attempt in 1..=REQUEST_MAX_ATTEMPTS {
         let endpoint = endpoint_for_request_model(app, model);
         let api_key = api_key_for_request_model(app, model);
+        let t0 = Instant::now();
         let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
             .header("Content-Type", "application/json")
             .json(&request_body)
@@ -1485,6 +1515,15 @@ pub async fn do_request_json(
             Ok(response) => {
                 if response.status().is_success() {
                     let json: serde_json::Value = response.json().await?;
+                    // AIOS: bridge non-stream usage to kernel `/dev/llm`.
+                    if let Some(usage_val) = json.get("usage") {
+                        if let Ok(usage) =
+                            serde_json::from_value::<StreamUsage>(usage_val.clone())
+                        {
+                            let latency_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                            let _ = charge_llm_usage_to_kernel(app, model, &usage, latency_ms);
+                        }
+                    }
                     return Ok(json);
                 }
                 let status = response.status();
@@ -1598,6 +1637,46 @@ pub(super) async fn summarize_history_via_model(
     let content = extract_router_content(&v)?;
     let trimmed = content.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// AIOS bridge: take a parsed OpenAI-compatible `StreamUsage` (plus the
+/// requested model name and latency) and hand it to the kernel's LLM device
+/// for accounting. This is the single chokepoint where agent-land meets
+/// `/dev/llm`; every LLM call site must route through here instead of
+/// dropping usage on the floor.
+///
+/// The kernel takes care of:
+///   - converting prompt/completion tokens to cost_micros (via `llm_price`)
+///   - calling `rusage_charge` so rlimit enforcement stays authoritative
+///   - emitting a `trace_event("llm.account", ...)` for observability
+pub(crate) fn charge_llm_usage_to_kernel(
+    app: &App,
+    requested_model: &str,
+    usage: &StreamUsage,
+    latency_ms: u64,
+) -> Option<aios_kernel::primitives::LlmAccountOutcome> {
+    // Fast path: a zero-usage report is noise.
+    if usage.prompt_tokens == 0 && usage.completion_tokens == 0 {
+        return None;
+    }
+    let cached = usage
+        .prompt_tokens_details
+        .as_ref()
+        .map(|d| d.cached_tokens)
+        .unwrap_or(0);
+    let report = aios_kernel::primitives::LlmUsageReport {
+        model: requested_model.to_string(),
+        prompt_tokens: usage.prompt_tokens,
+        completion_tokens: usage.completion_tokens,
+        cached_prompt_tokens: cached,
+        latency_ms,
+    };
+    let mut guard = match app.os.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let pid = guard.current_process_id()?;
+    Some(guard.llm_account(pid, report))
 }
 
 #[cfg(test)]

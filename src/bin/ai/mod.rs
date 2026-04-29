@@ -12,7 +12,6 @@ mod knowledge;
 mod mcp;
 mod model_names;
 mod models;
-pub(crate) mod os;
 mod provider;
 mod prompt;
 mod request;

@@ -41,7 +41,7 @@ use crate::ai::{
     models,
     prompt::PromptEditor,
     skills::{self, SkillManifest},
-    tools::task_tools::{decode_os_task_goal, task_result_shm_key},
+    tools::task_tools::decode_os_task_goal,
     types::{AgentContext, App},
 };
 use crate::commonw::configw;
@@ -76,8 +76,8 @@ pub use skill_matching::*;
 pub use skill_ranking::*;
 pub use text_similarity::*;
 
-pub(crate) fn new_local_kernel() -> crate::ai::os::kernel::SharedKernel {
-    crate::ai::os::kernel::new_shared_kernel(crate::ai::os::local::LocalOS::new())
+pub(crate) fn new_local_kernel() -> aios_kernel::kernel::SharedKernel {
+    aios_kernel::kernel::new_shared_kernel(aios_kernel::local::LocalOS::new())
 }
 
 /// Default max LLM iterations allowed per turn (prevents infinite loops)
@@ -121,7 +121,7 @@ fn has_pending_foreground_process(app: &App) -> bool {
     let os = app.os.lock().unwrap();
     os.list_processes().into_iter().any(|proc| {
         proc.is_foreground
-            && !matches!(proc.state, crate::ai::os::kernel::ProcessState::Terminated)
+            && !matches!(proc.state, aios_kernel::kernel::ProcessState::Terminated)
     })
 }
 
@@ -583,7 +583,7 @@ async fn run_loop(
         let history_count;
         let mut question;
 
-        let background_procs: Vec<crate::ai::os::kernel::Process> = {
+        let background_procs: Vec<aios_kernel::kernel::Process> = {
             let mut os = app.os.lock().unwrap();
             os.pop_all_ready(4)
         };
@@ -608,7 +608,7 @@ async fn run_loop(
 
             let original_history_file = app.session_history_file.clone();
 
-            let mut task_specs: Vec<(u64, String, PathBuf, Option<String>, Option<String>, Option<String>)> = Vec::new();
+            let mut task_specs: Vec<(u64, String, PathBuf, Option<String>, Option<String>, Option<u64>)> = Vec::new();
             for proc in &background_procs {
                 let pid = proc.pid;
                 let task_goal = decode_os_task_goal(&proc.goal);
@@ -654,11 +654,11 @@ async fn run_loop(
                     history_path,
                     task_goal.as_ref().map(|goal| goal.agent_name.clone()),
                     task_goal.as_ref().map(|goal| goal.model.clone()),
-                    task_goal.as_ref().map(|goal| goal.task_id.clone()),
+                    task_goal.as_ref().map(|goal| goal.result_channel_id),
                 ));
             }
 
-            for (pid, proc_question, history_path, agent_override, model_override, task_id) in task_specs {
+            for (pid, proc_question, history_path, agent_override, model_override, result_channel_id) in task_specs {
                 let mut task_app = app.clone();
                 task_app.session_history_file = history_path;
                 task_app.cancel_stream.store(false, Ordering::Relaxed);
@@ -673,7 +673,7 @@ async fn run_loop(
                 }
                 let next_model = model_override.unwrap_or_else(|| app.current_model.clone());
 
-                tokio::spawn(crate::ai::os::kernel::TASK_PID.scope(Some(pid), async move {
+                tokio::spawn(aios_kernel::kernel::TASK_PID.scope(Some(pid), async move {
                     crate::ai::tools::registry::common::clear_tool_cancel();
                     let result = turn_runtime::run_turn(
                         &mut task_app,
@@ -690,19 +690,26 @@ async fn run_loop(
                     .map_err(|e| format!("{}", e));
                     let mut os = task_os.lock().unwrap();
                     os.set_current_pid(Some(pid));
-                    if let Some(task_id) = &task_id {
-                        let key = task_result_shm_key(task_id);
-                        if os.shm_read_degraded(&key).is_none() {
-                            let _ = os.shm_create(
-                                key,
-                                serde_json::json!({
-                                    "status": if result.is_ok() { "completed" } else { "failed" },
-                                    "output": "",
-                                    "error": result.as_ref().err().cloned(),
-                                })
-                                .to_string(),
-                            );
-                        }
+                    if let Some(result_channel_id) = result_channel_id {
+                        let payload = serde_json::json!({
+                            "status": if result.is_ok() { "completed" } else { "failed" },
+                            "output": "",
+                            "error": result.as_ref().err().cloned(),
+                        })
+                        .to_string();
+                        let _ = os.channel_send(
+                            Some(pid),
+                            aios_kernel::primitives::ChannelId(result_channel_id),
+                            payload,
+                        );
+                        let _ = os.channel_close(
+                            Some(pid),
+                            aios_kernel::primitives::ChannelId(result_channel_id),
+                        );
+                        let _ = os.channel_release_named(
+                            aios_kernel::primitives::ChannelId(result_channel_id),
+                            "task_result.producer",
+                        );
                     }
                     match result {
                         Ok(_outcome) => {
@@ -719,9 +726,9 @@ async fn run_loop(
                                 }
                                 if matches!(
                                     p.state,
-                                    crate::ai::os::kernel::ProcessState::Waiting { .. }
-                                        | crate::ai::os::kernel::ProcessState::Sleeping { .. }
-                                        | crate::ai::os::kernel::ProcessState::Stopped
+                                    aios_kernel::kernel::ProcessState::Waiting { .. }
+                                        | aios_kernel::kernel::ProcessState::Sleeping { .. }
+                                        | aios_kernel::kernel::ProcessState::Stopped
                                 ) {
                                     should_terminate = false;
                                 }
@@ -844,7 +851,7 @@ async fn run_loop(
             os.current_process_id()
         };
 
-        let turn_outcome = crate::ai::os::kernel::TASK_PID
+        let turn_outcome = aios_kernel::kernel::TASK_PID
             .scope(
                 fg_pid,
                 turn_runtime::run_turn(
@@ -880,9 +887,9 @@ async fn run_loop(
 
                         if matches!(
                             proc.state,
-                            crate::ai::os::kernel::ProcessState::Waiting { .. }
-                                | crate::ai::os::kernel::ProcessState::Sleeping { .. }
-                                | crate::ai::os::kernel::ProcessState::Stopped
+                            aios_kernel::kernel::ProcessState::Waiting { .. }
+                                | aios_kernel::kernel::ProcessState::Sleeping { .. }
+                                | aios_kernel::kernel::ProcessState::Stopped
                         ) {
                             should_terminate = false;
                         }
@@ -970,7 +977,7 @@ mod tests {
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::history::{Message, append_history_messages};
     use crate::ai::cli::ParsedCli;
-    use crate::ai::os::kernel::{EventId, ProcessState, Syscall, WaitPolicy};
+    use aios_kernel::kernel::{EventId, ProcessState, WaitPolicy};
     use crate::ai::types::{AgentContext, App, AppConfig};
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};

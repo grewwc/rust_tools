@@ -2,7 +2,8 @@ use serde_json::Value;
 use std::sync::LazyLock;
 use crate::ai::tools::registry::common::{ToolRegistration, ToolSpec};
 use std::sync::Mutex;
-use crate::ai::os::kernel::{ProcessCapabilities, SharedKernel};
+use aios_kernel::kernel::{ProcessCapabilities, SharedKernel};
+use aios_kernel::primitives::{ChannelMetaSnapshot, ChannelOwnerTag};
 use rust_tools::commonw::FastSet;
 
 pub static GLOBAL_OS: LazyLock<Mutex<Option<SharedKernel>>> = LazyLock::new(|| Mutex::new(None));
@@ -432,12 +433,12 @@ fn execute_ps_processes(_args: &Value) -> Result<String, String> {
                 let ppid = p.parent_pid.map(|id| id.to_string()).unwrap_or("-".to_string());
                 let pgid = p.process_group.map(|id| id.to_string()).unwrap_or("-".to_string());
                 let state = match &p.state {
-                    crate::ai::os::kernel::ProcessState::Ready => "Ready",
-                    crate::ai::os::kernel::ProcessState::Running => "Running",
-                    crate::ai::os::kernel::ProcessState::Waiting { .. } => "Waiting",
-                    crate::ai::os::kernel::ProcessState::Sleeping { .. } => "Sleeping",
-                    crate::ai::os::kernel::ProcessState::Stopped => "Stopped",
-                    crate::ai::os::kernel::ProcessState::Terminated => "Term",
+                    aios_kernel::kernel::ProcessState::Ready => "Ready",
+                    aios_kernel::kernel::ProcessState::Running => "Running",
+                    aios_kernel::kernel::ProcessState::Waiting { .. } => "Waiting",
+                    aios_kernel::kernel::ProcessState::Sleeping { .. } => "Sleeping",
+                    aios_kernel::kernel::ProcessState::Stopped => "Stopped",
+                    aios_kernel::kernel::ProcessState::Terminated => "Term",
                 };
                 let daemon = if p.is_daemon { format!("{}({}/{})", "Y", p.restart_count, p.max_restarts) } else { "N".to_string() };
                 lines.push(format!("{:<5} {:<6} {:<5} {:<12} {:<4} {:<6} {:<5} {:<6} {:<6} {:<8} {}", 
@@ -455,6 +456,108 @@ inventory::submit!(ToolRegistration {
         description: "List all processes in the Agent OS with their PID, parent PID, state, priority, quota, and name. Use this to inspect the process tree before deciding to kill, wait, or reap.",
         parameters: params_ps_processes,
         execute: execute_ps_processes,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core", "executor"],
+    }
+});
+
+fn params_ps_ipc() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "scope": {
+                "type": "string",
+                "enum": ["result_pipes", "all"],
+                "description": "Which channels to show. result_pipes focuses on task/async tool result pipes. all shows every channel."
+            },
+            "only_hanging": {
+                "type": "boolean",
+                "description": "When true, only show channels that are still live or not yet reclaimable. Default is true."
+            }
+        }
+    })
+}
+
+fn is_hanging_channel(snapshot: &ChannelMetaSnapshot) -> bool {
+    snapshot.ref_count > 0 || snapshot.queued_len > 0 || !snapshot.closed
+}
+
+fn is_result_pipe(snapshot: &ChannelMetaSnapshot) -> bool {
+    !matches!(snapshot.owner_tag, ChannelOwnerTag::General)
+}
+
+fn execute_ps_ipc(args: &Value) -> Result<String, String> {
+    let scope = args["scope"].as_str().unwrap_or("result_pipes");
+    let only_hanging = args["only_hanging"].as_bool().unwrap_or(true);
+
+    if scope != "result_pipes" && scope != "all" {
+        return Err(format!(
+            "Invalid scope {:?}. Valid values: result_pipes, all.",
+            scope
+        ));
+    }
+
+    if let Ok(guard) = GLOBAL_OS.lock() {
+        if let Some(os) = guard.as_ref() {
+            let os = os.lock().unwrap();
+            let mut channels = os.list_channels();
+            if scope == "result_pipes" {
+                channels.retain(is_result_pipe);
+            }
+            if only_hanging {
+                channels.retain(is_hanging_channel);
+            }
+
+            if channels.is_empty() {
+                return Ok(match (scope, only_hanging) {
+                    ("result_pipes", true) => {
+                        "No hanging result pipes in the system.".to_string()
+                    }
+                    ("result_pipes", false) => "No result pipes in the system.".to_string(),
+                    ("all", true) => "No hanging IPC channels in the system.".to_string(),
+                    ("all", false) => "No IPC channels in the system.".to_string(),
+                    _ => unreachable!(),
+                });
+            }
+
+            let mut lines = vec![
+                "Chan   Tag               Owner  Refs  Queue  Closed  Label                     Holders"
+                    .to_string(),
+            ];
+            for ch in channels {
+                let owner = ch
+                    .owner_pid
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let holders = if ch.ref_holders.is_empty() {
+                    "-".to_string()
+                } else {
+                    ch.ref_holders.join(", ")
+                };
+                lines.push(format!(
+                    "{:<6} {:<17} {:<6} {:<5} {:<6} {:<7} {:<25} {}",
+                    ch.channel.raw(),
+                    ch.owner_tag.as_str(),
+                    owner,
+                    ch.ref_count,
+                    ch.queued_len,
+                    if ch.closed { "Y" } else { "N" },
+                    ch.label,
+                    holders
+                ));
+            }
+            return Ok(lines.join("\n"));
+        }
+    }
+    Err("OS not initialized.".to_string())
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "ps_ipc",
+        description: "List AIOS IPC channels and result pipes with owner tags, queued messages, and named ref holders. By default this shows only hanging result pipes that still have refs, buffered messages, or are not closed yet.",
+        parameters: params_ps_ipc,
+        execute: execute_ps_ipc,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core", "executor"],
     }
@@ -482,11 +585,11 @@ fn execute_signal_process(args: &Value) -> Result<String, String> {
     let pid = args["pid"].as_u64().ok_or("Missing or invalid 'pid' parameter.")?;
     let signal_str = args["signal"].as_str().ok_or("Missing 'signal' parameter.")?;
     let signal = match signal_str.to_uppercase().as_str() {
-        "SIGCANCEL" => crate::ai::os::kernel::Signal::SigCancel,
-        "SIGTERM" => crate::ai::os::kernel::Signal::SigTerm,
-        "SIGSTOP" => crate::ai::os::kernel::Signal::SigStop,
-        "SIGCONT" => crate::ai::os::kernel::Signal::SigCont,
-        "SIGKILL" => crate::ai::os::kernel::Signal::SigKill,
+        "SIGCANCEL" => aios_kernel::kernel::Signal::SigCancel,
+        "SIGTERM" => aios_kernel::kernel::Signal::SigTerm,
+        "SIGSTOP" => aios_kernel::kernel::Signal::SigStop,
+        "SIGCONT" => aios_kernel::kernel::Signal::SigCont,
+        "SIGKILL" => aios_kernel::kernel::Signal::SigKill,
         other => return Err(format!("Unknown signal: {}. Valid signals: SIGCANCEL, SIGTERM, SIGSTOP, SIGCONT, SIGKILL", other)),
     };
 
@@ -567,10 +670,10 @@ fn execute_signal_process_group(args: &Value) -> Result<String, String> {
     let pgid = args["pgid"].as_u64().ok_or("Missing 'pgid'.")?;
     let signal_str = args["signal"].as_str().ok_or("Missing 'signal'.")?;
     let signal = match signal_str.to_uppercase().as_str() {
-        "SIGTERM" => crate::ai::os::kernel::Signal::SigTerm,
-        "SIGSTOP" => crate::ai::os::kernel::Signal::SigStop,
-        "SIGCONT" => crate::ai::os::kernel::Signal::SigCont,
-        "SIGKILL" => crate::ai::os::kernel::Signal::SigKill,
+        "SIGTERM" => aios_kernel::kernel::Signal::SigTerm,
+        "SIGSTOP" => aios_kernel::kernel::Signal::SigStop,
+        "SIGCONT" => aios_kernel::kernel::Signal::SigCont,
+        "SIGKILL" => aios_kernel::kernel::Signal::SigKill,
         other => return Err(format!("Unknown signal: {}", other)),
     };
     if let Ok(guard) = GLOBAL_OS.lock() {
@@ -648,16 +751,16 @@ fn execute_shm_read(args: &Value) -> Result<String, String> {
             let os = os.lock().unwrap();
             match os.shm_read(key) {
                 Ok(value) => Ok(value),
-                Err(crate::ai::os::kernel::ShmReadError::NotFound) => {
+                Err(aios_kernel::kernel::ShmReadError::NotFound) => {
                     Err(format!("Shared memory key '{}' not found.", key))
                 }
-                Err(crate::ai::os::kernel::ShmReadError::PermissionDenied { owner_pid }) => {
+                Err(aios_kernel::kernel::ShmReadError::PermissionDenied { owner_pid }) => {
                     Err(format!(
                         "Permission denied: cannot read shared memory key '{}' (owner: {}).",
                         key, owner_pid
                     ))
                 }
-                Err(crate::ai::os::kernel::ShmReadError::Corrupted { expected_checksum, actual_checksum }) => {
+                Err(aios_kernel::kernel::ShmReadError::Corrupted { expected_checksum, actual_checksum }) => {
                     match os.shm_read_degraded(key) {
                         Some(degraded) => Ok(degraded),
                         None => Err(format!(
@@ -666,7 +769,7 @@ fn execute_shm_read(args: &Value) -> Result<String, String> {
                         )),
                     }
                 }
-                Err(crate::ai::os::kernel::ShmReadError::OwnerTerminated { owner_pid }) => {
+                Err(aios_kernel::kernel::ShmReadError::OwnerTerminated { owner_pid }) => {
                     match os.shm_read_degraded(key) {
                         Some(degraded) => Ok(degraded),
                         None => Err(format!(
@@ -849,3 +952,85 @@ inventory::submit!(ToolRegistration {
         groups: &["builtin", "core", "executor"],
     }
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aios_kernel::kernel::new_shared_kernel;
+    use aios_kernel::local::LocalOS;
+    use serde_json::json;
+
+    static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn with_test_kernel<T>(f: impl FnOnce(SharedKernel) -> T) -> T {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let kernel = new_shared_kernel(LocalOS::new());
+        init_os_tools_globals(kernel.clone());
+        let result = f(kernel);
+        if let Ok(mut global) = GLOBAL_OS.lock() {
+            *global = None;
+        }
+        result
+    }
+
+    #[test]
+    fn ps_ipc_defaults_to_hanging_result_pipes() {
+        with_test_kernel(|kernel| {
+            {
+                let mut os = kernel.lock().unwrap();
+                os.channel_create(Some(7), 1, "general:mailbox".to_string());
+                os.channel_create_tagged_with_holders(
+                    Some(42),
+                    1,
+                    "task_result:task_1".to_string(),
+                    ChannelOwnerTag::TaskResult,
+                    vec![
+                        "task_result.producer".to_string(),
+                        "task_result.consumer".to_string(),
+                    ],
+                );
+                os.channel_create_tagged_with_holders(
+                    Some(42),
+                    4,
+                    "async_tool_result:tool_1".to_string(),
+                    ChannelOwnerTag::AsyncToolResult,
+                    vec!["async_tool.consumer".to_string()],
+                );
+                let done = os.channel_create_tagged_with_holders(
+                    Some(42),
+                    1,
+                    "task_result:done".to_string(),
+                    ChannelOwnerTag::TaskResult,
+                    Vec::new(),
+                );
+                os.channel_close(None, done).unwrap();
+            }
+
+            let output = execute_ps_ipc(&json!({})).unwrap();
+            assert!(output.contains("task_result:task_1"));
+            assert!(output.contains("task_result.producer, task_result.consumer"));
+            assert!(output.contains("async_tool_result:tool_1"));
+            assert!(output.contains("async_tool.consumer"));
+            assert!(!output.contains("general:mailbox"));
+            assert!(!output.contains("task_result:done"));
+        });
+    }
+
+    #[test]
+    fn ps_ipc_all_scope_includes_general_channels() {
+        with_test_kernel(|kernel| {
+            {
+                let mut os = kernel.lock().unwrap();
+                os.channel_create(Some(9), 2, "general:mailbox".to_string());
+            }
+
+            let output = execute_ps_ipc(&json!({
+                "scope": "all",
+                "only_hanging": false
+            }))
+            .unwrap();
+            assert!(output.contains("general:mailbox"));
+            assert!(output.contains("general"));
+        });
+    }
+}

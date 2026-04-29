@@ -7,10 +7,13 @@ use std::time::Instant;
 use crate::ai::{
     agents::{self, AgentManifest, AgentModelTier},
     models,
-    os::kernel::ProcessState,
     tools::common::{ToolRegistration, ToolSpec},
 };
 use crate::ai::tools::os_tools::GLOBAL_OS;
+use aios_kernel::{
+    kernel::{Kernel, ProcessState, WaitPolicy},
+    primitives::{ChannelId, ChannelOwnerTag, IpcRecvResult},
+};
 use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -22,6 +25,7 @@ const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
 
 struct AsyncTaskEntry {
     pid: u64,
+    result_channel_id: u64,
     description: String,
     agent_name: String,
     model: String,
@@ -35,6 +39,7 @@ static TASK_REGISTRY: LazyLock<Mutex<FastMap<String, AsyncTaskEntry>>> =
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OsTaskGoal {
     pub(crate) task_id: String,
+    pub(crate) result_channel_id: u64,
     pub(crate) description: String,
     pub(crate) prompt: String,
     pub(crate) agent_name: String,
@@ -77,12 +82,8 @@ pub(crate) fn decode_os_task_goal(goal: &str) -> Option<OsTaskGoal> {
     serde_json::from_str(payload).ok()
 }
 
-pub(crate) fn task_result_shm_key(task_id: &str) -> String {
-    format!("task_result:{task_id}")
-}
-
 fn with_os_kernel<T>(
-    f: impl FnOnce(&mut dyn crate::ai::os::kernel::Syscall) -> Result<T, String>,
+    f: impl FnOnce(&mut dyn Kernel) -> Result<T, String>,
 ) -> Result<T, String> {
     let shared = {
         let guard = GLOBAL_OS
@@ -219,27 +220,39 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
     let selection_explanation = build_selection_explanation(&selected, &selected_model, model_override);
 
     let task_id = next_task_id();
-    let process_goal = encode_os_task_goal(&OsTaskGoal {
-        task_id: task_id.clone(),
-        description: description.to_string(),
-        prompt: prompt.to_string(),
-        agent_name: selected.agent.name.clone(),
-        model: selected_model.clone(),
-        selection_explanation: selection_explanation.clone(),
-    })?;
-    let pid = with_os_kernel(|os| {
-        let _parent_pid = os
+    let (pid, result_channel_id) = with_os_kernel(|os| {
+        let parent_pid = os
             .current_process_id()
             .ok_or("task_spawn requires an active AIOS process context.".to_string())?;
-        os.spawn(
-            None,
+        let result_channel = os.channel_create_tagged_with_holders(
+            Some(parent_pid),
+            1,
+            format!("task_result:{task_id}"),
+            ChannelOwnerTag::TaskResult,
+            vec![
+                "task_result.producer".to_string(),
+                "task_result.consumer".to_string(),
+            ],
+        );
+        let process_goal = encode_os_task_goal(&OsTaskGoal {
+            task_id: task_id.clone(),
+            result_channel_id: result_channel.raw(),
+            description: description.to_string(),
+            prompt: prompt.to_string(),
+            agent_name: selected.agent.name.clone(),
+            model: selected_model.clone(),
+            selection_explanation: selection_explanation.clone(),
+        })?;
+        let pid = os.spawn(
+            Some(parent_pid),
             selected.agent.name.clone(),
             process_goal,
             DEFAULT_TASK_PRIORITY,
             DEFAULT_TASK_QUOTA_TURNS,
             None,
             None,
-        )
+        )?;
+        Ok((pid, result_channel.raw()))
     })?;
 
     println!(
@@ -253,6 +266,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
             task_id.clone(),
             AsyncTaskEntry {
                 pid,
+                result_channel_id,
                 description: description.to_string(),
                 agent_name: selected.agent.name.clone(),
                 model: selected_model.clone(),
@@ -461,9 +475,14 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     let wait_message = with_os_kernel(|os| {
         for tid in &task_ids {
             let entry = registry.get(tid).expect("validated");
-            if let Some(result) = read_task_result(os, tid)? {
+            if let Some(result) = read_task_result(os, entry.result_channel_id, true)? {
                 ready.push(format_task_result(&entry, result));
-                let _ = os.shm_delete(&task_result_shm_key(tid));
+                let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
+                let _ = os.channel_release_named(
+                    ChannelId(entry.result_channel_id),
+                    "task_result.consumer",
+                );
+                let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
             } else if is_task_pending(os, entry.pid)? {
                 pending.push((tid.clone(), entry.pid));
             } else {
@@ -475,12 +494,17 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         }
 
         if !pending.is_empty() {
-            let wait_pid = pending[0].1;
-            os.wait_on(wait_pid)?;
+            let pending_ids = pending.iter().map(|(tid, _)| tid.clone()).collect::<Vec<_>>();
+            let event_ids = task_channel_event_ids(os, &pending_ids, &registry)?;
+            let _ = os.wait_on_events(event_ids.clone(), WaitPolicy::All, None)?;
             return Ok(Some(format!(
-                "Waiting on {} pending task(s). Suspended current process until task pid={} exits; call task_wait again after resume to collect results.",
+                "Waiting on {} pending task(s). Suspended current process until all result channels become ready; event_ids={}. Call task_wait again after resume to collect results.",
                 pending.len(),
-                wait_pid
+                event_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
         Ok(None)
@@ -522,7 +546,7 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     let mut lines = vec!["TaskID              PID      Agent          Model          State       Description".to_string()];
     with_os_kernel(|os| {
         for (tid, entry) in registry.iter() {
-            let state_str = task_state_string(os, tid, entry.pid)?;
+            let state_str = task_state_string(os, entry.result_channel_id, entry.pid)?;
             let short_id = if tid.len() > 19 { &tid[..19] } else { tid };
             lines.push(format!(
                 "{:<19} {:<8} {:<14} {:<14} {:<11} {}",
@@ -543,20 +567,53 @@ struct StoredTaskResult {
 }
 
 fn read_task_result(
-    os: &mut dyn crate::ai::os::kernel::Syscall,
-    task_id: &str,
+    os: &mut dyn Kernel,
+    result_channel_id: u64,
+    consume: bool,
 ) -> Result<Option<StoredTaskResult>, String> {
-    let key = task_result_shm_key(task_id);
-    let Some(payload) = os.shm_read_degraded(&key) else {
-        return Ok(None);
+    let payload = match if consume {
+        os.channel_try_recv(None, ChannelId(result_channel_id))
+    } else {
+        os.channel_peek(None, ChannelId(result_channel_id))
+    }? {
+        IpcRecvResult::Message(payload) => payload,
+        IpcRecvResult::Empty | IpcRecvResult::Closed => return Ok(None),
     };
     serde_json::from_str(&payload)
         .map(Some)
-        .map_err(|err| format!("Failed to decode stored task result for {task_id}: {err}"))
+        .map_err(|err| {
+            format!(
+                "Failed to decode stored task result from channel {}: {}",
+                result_channel_id, err
+            )
+        })
+}
+
+fn task_channel_event_ids(
+    os: &dyn Kernel,
+    task_ids: &[String],
+    registry: &FastMap<String, AsyncTaskEntry>,
+) -> Result<Vec<aios_kernel::kernel::EventId>, String> {
+    let mut event_ids = Vec::new();
+    for tid in task_ids {
+        let entry = registry
+            .get(tid)
+            .ok_or_else(|| format!("Unknown task_id: {}", tid))?;
+        let event_id = os
+            .channel_event_id(ChannelId(entry.result_channel_id))
+            .ok_or_else(|| {
+                format!(
+                    "Task {} result channel {} no longer exists.",
+                    tid, entry.result_channel_id
+                )
+            })?;
+        event_ids.push(event_id);
+    }
+    Ok(event_ids)
 }
 
 fn is_task_pending(
-    os: &mut dyn crate::ai::os::kernel::Syscall,
+    os: &mut dyn Kernel,
     pid: u64,
 ) -> Result<bool, String> {
     let Some(proc) = os.get_process(pid) else {
@@ -572,11 +629,11 @@ fn is_task_pending(
 }
 
 fn task_state_string(
-    os: &mut dyn crate::ai::os::kernel::Syscall,
-    task_id: &str,
+    os: &mut dyn Kernel,
+    result_channel_id: u64,
     pid: u64,
 ) -> Result<String, String> {
-    if let Some(result) = read_task_result(os, task_id)? {
+    if let Some(result) = read_task_result(os, result_channel_id, false)? {
         return Ok(result.status);
     }
     let state = match os.get_process(pid) {

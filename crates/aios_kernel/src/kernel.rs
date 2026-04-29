@@ -15,7 +15,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rust_tools::commonw::{FastMap, FastSet};
+use crate::types::{FastMap, FastSet};
 
 /// Process lifecycle states - similar to OS process states
 /// Controls process scheduling and execution flow
@@ -198,6 +198,11 @@ pub struct Process {
     pub allowed_tools: FastSet<String>,  // 允许的工具
     pub tool_calls_used: usize,  // 已使用 tool call 数
     pub working_dir: Option<PathBuf>,
+    /// 结构化资源上限（新）。旧字段 `quota_turns` 仍保留做为 max_turns 的视图；
+    /// 当 `limits` 被 sys_rlimit_set 修改时两者会保持同步。
+    pub limits: crate::primitives::ResourceLimit,
+    /// 结构化资源使用累计（新）。`turns_used / tool_calls_used` 仍与此同步。
+    pub usage: crate::primitives::ResourceUsage,
 }
 
 /// Syscall trait - system calls available to AIOS processes.
@@ -335,10 +340,21 @@ pub trait KernelInternal {
     fn cleanup_process_resources(&mut self, pid: u64);
 }
 
-/// Kernel trait - combines Syscall + KernelInternal.
+/// Kernel trait - combines Syscall + KernelInternal + Futex + Trace.
 /// Implement this trait to create a custom OS backend.
 /// The LocalOS implementation provides the actual process table management.
-pub trait Kernel: Syscall + KernelInternal {}
+pub trait Kernel:
+    Syscall
+    + KernelInternal
+    + crate::primitives::FutexOps
+    + crate::primitives::TraceOps
+    + crate::primitives::RlimitOps
+    + crate::primitives::LlmOps
+    + crate::primitives::VfsOps
+    + crate::primitives::DaemonOps
+    + crate::primitives::IpcOps
+{
+}
 
 /// SharedKernel - shared reference to kernel implementation.
 /// Wrapped in Arc<Mutex<>> for thread-safe access from multiple async tasks.

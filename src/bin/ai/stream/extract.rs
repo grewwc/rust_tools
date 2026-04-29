@@ -155,6 +155,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            ..Default::default()
         };
 
         let mut thinking_open = true;
@@ -184,6 +185,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            ..Default::default()
         };
 
         let mut thinking_open = false;
@@ -219,6 +221,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            ..Default::default()
         };
 
         let mut thinking_open = false;
@@ -253,6 +256,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            ..Default::default()
         };
         let second_chunk = StreamChunk {
             choices: vec![StreamChoice {
@@ -264,6 +268,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            ..Default::default()
         };
 
         let mut thinking_open = false;
@@ -305,6 +310,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            ..Default::default()
         };
         let content_chunk = StreamChunk {
             choices: vec![StreamChoice {
@@ -316,6 +322,7 @@ mod tests {
                 },
                 finish_reason: None,
             }],
+            ..Default::default()
         };
 
         let mut thinking_open = false;

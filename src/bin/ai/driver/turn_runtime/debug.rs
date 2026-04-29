@@ -1,5 +1,58 @@
 use serde_json::Value;
 
+/// Mirror an agent_hang_debug event into the AIOS kernel trace ring.
+///
+/// 这是 Phase 0 trace 下沉的接入点：所有 `agent_hang_debug!` / `agent_hang_span`
+/// 展开后最终都会走到 `report_agent_hang_debug`，在这里镜像一份到
+/// `TraceOps::trace_event`，从而让内核 trace ring 成为所有 span/event 的权威副本。
+/// 后续可以逐步删除 HTTP 上报，改由 kernel ring 消费者统一输出。
+fn mirror_to_aios_trace(
+    run_id: &str,
+    hypothesis_id: &str,
+    location: &str,
+    msg: &str,
+    data: &Value,
+) {
+    use aios_kernel::primitives::TraceLevel;
+    use rust_tools::commonw::FastMap;
+
+    let g = match crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let kernel = match g.as_ref() {
+        Some(k) => k.clone(),
+        None => return,
+    };
+    drop(g);
+
+    let mut fields: FastMap<String, String> = FastMap::default();
+    fields.insert("run_id".to_string(), run_id.to_string());
+    fields.insert("hypothesis_id".to_string(), hypothesis_id.to_string());
+    fields.insert("location".to_string(), location.to_string());
+    if let Value::Object(map) = data {
+        for (k, v) in map {
+            let s = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            fields.insert(k.clone(), s);
+        }
+    } else if !data.is_null() {
+        fields.insert("data".to_string(), data.to_string());
+    }
+
+    if let Ok(mut guard) = kernel.lock() {
+        guard.trace_event(
+            location.to_string(),
+            TraceLevel::Debug,
+            None,
+            fields,
+            Some(msg.to_string()),
+        );
+    }
+}
+
 #[cfg(feature = "agent-hang-debug")]
 pub(in crate::ai) fn report_agent_hang_debug(
     run_id: &'static str,
@@ -8,6 +61,7 @@ pub(in crate::ai) fn report_agent_hang_debug(
     msg: &'static str,
     data: Value,
 ) {
+    mirror_to_aios_trace(run_id, hypothesis_id, location, msg, &data);
     std::thread::spawn(move || {
         let mut debug_server_url = "http://127.0.0.1:7777/event".to_string();
         let mut debug_session_id = "agent-hang".to_string();
@@ -44,10 +98,11 @@ pub(in crate::ai) fn report_agent_hang_debug(
 
 #[cfg(not(feature = "agent-hang-debug"))]
 pub(in crate::ai) fn report_agent_hang_debug(
-    _run_id: &'static str,
-    _hypothesis_id: &'static str,
-    _location: &'static str,
-    _msg: &'static str,
-    _data: Value,
+    run_id: &'static str,
+    hypothesis_id: &'static str,
+    location: &'static str,
+    msg: &'static str,
+    data: Value,
 ) {
+    mirror_to_aios_trace(run_id, hypothesis_id, location, msg, &data);
 }

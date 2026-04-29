@@ -45,6 +45,7 @@ fastembed = "4"
 sled = "0.34"
 dirs = "5"
 rust_tools_macros = { path = "crates/rust_tools_macros" }
+aios_kernel = { path = "crates/aios_kernel" }
 tracing = "0.1"
 tree-sitter = "0.24"
 tree-sitter-rust = "0.23"

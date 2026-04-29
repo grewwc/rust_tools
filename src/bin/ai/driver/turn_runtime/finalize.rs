@@ -87,8 +87,38 @@ fn maybe_spawn_critic_revise_background(
         .unwrap_or_else(|| "qwen3.5-flash".to_string());
     let q_bg = question.to_string();
     let a_bg = final_assistant_text.to_string();
+
+    // 登记 daemon：critic/revise 是典型的后台反思类。
+    use aios_kernel::primitives::DaemonKind;
+    let kernel = app.os.clone();
+    let (handle, cancel_token) = {
+        let mut os = match kernel.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let parent_pid = os.current_process_id();
+        os.daemon_register(
+            "critic_revise_background".to_string(),
+            DaemonKind::Reflection,
+            parent_pid,
+        )
+    };
+
     tokio::spawn(async move {
+        if cancel_token.is_cancelled() {
+            let mut os = match kernel.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            os.daemon_exit(handle, None);
+            return;
+        }
         super::super::reflection::run_critic_revise_background(path, model_bg, q_bg, a_bg).await;
+        let mut os = match kernel.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        os.daemon_exit(handle, None);
     });
 }
 

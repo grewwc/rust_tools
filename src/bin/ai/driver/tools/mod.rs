@@ -8,10 +8,13 @@ use std::sync::{LazyLock, Mutex, atomic::{AtomicU64, Ordering}};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 use crate::ai::tools::os_tools::GLOBAL_OS;
+use aios_kernel::{
+    kernel::{EventId, WaitPolicy},
+    primitives::{ChannelId, ChannelOwnerTag},
+};
 use rust_tools::commonw::FastMap;
 
 use crate::ai::{
-    os::kernel::{EventId, WaitPolicy},
     mcp::{McpClient, SharedMcpClient},
     tools as builtin_tools,
     types::{ToolCall, ToolResult},
@@ -93,8 +96,44 @@ struct AsyncToolSnapshot {
     elapsed_secs: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AsyncToolPipeKind {
+    Started,
+    StreamChunk,
+    Final,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AsyncToolPipeMessage {
+    task_id: String,
+    session_id: String,
+    tool_name: String,
+    seq: u64,
+    kind: AsyncToolPipeKind,
+    content: Option<String>,
+    status: Option<String>,
+    ok: Option<bool>,
+    cached: Option<bool>,
+    executed: Option<bool>,
+    reason: Option<String>,
+    elapsed_secs: f64,
+}
+
+#[derive(Debug, Default)]
+struct AsyncToolPipeAggregate {
+    chunks: Vec<String>,
+    last_status: Option<String>,
+    ok: Option<bool>,
+    cached: Option<bool>,
+    executed: Option<bool>,
+    reason: Option<String>,
+    final_content: Option<String>,
+    stream_chunk_count: usize,
+}
+
 struct AsyncToolEntry {
-    event_id: EventId,
+    result_channel_id: Option<u64>,
     session_id: String,
     tool_name: String,
     started_at: Instant,
@@ -102,7 +141,6 @@ struct AsyncToolEntry {
 }
 
 static ASYNC_TOOL_NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static ASYNC_EVENT_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 static ASYNC_TOOL_REGISTRY: LazyLock<Mutex<FastMap<String, AsyncToolEntry>>> =
     LazyLock::new(|| Mutex::new(FastMap::default()));
 
@@ -113,8 +151,24 @@ fn next_async_tool_id() -> String {
     )
 }
 
-fn next_async_event_id() -> EventId {
-    EventId::new(ASYNC_EVENT_NEXT_ID.fetch_add(1, Ordering::Relaxed))
+fn create_async_tool_channel(task_id: &str) -> Option<u64> {
+    let guard = GLOBAL_OS.lock().ok()?;
+    let os = guard.as_ref()?;
+    let mut os = os.lock().ok()?;
+    let owner_pid = os.current_process_id();
+    Some(
+        os.channel_create_tagged_with_holders(
+            owner_pid,
+            4096,
+            format!("async_tool_result:{task_id}"),
+            ChannelOwnerTag::AsyncToolResult,
+            vec![
+                "async_tool.producer".to_string(),
+                "async_tool.consumer".to_string(),
+            ],
+        )
+        .raw(),
+    )
 }
 
 fn prune_completed_async_tools(registry: &mut FastMap<String, AsyncToolEntry>) {
@@ -132,37 +186,30 @@ fn prune_completed_async_tools(registry: &mut FastMap<String, AsyncToolEntry>) {
             break;
         }
     }
-}
-
-fn completed_event_ids(registry: &FastMap<String, AsyncToolEntry>) -> Vec<EventId> {
-    registry
-        .iter()
-        .filter(|(_, entry)| matches!(entry.state, AsyncToolState::Completed(_) | AsyncToolState::Canceled { .. }))
-        .map(|(_, entry)| entry.event_id)
-        .collect()
-}
-
-fn notify_completed_events(completed_event_ids: &[EventId]) {
-    if completed_event_ids.is_empty() {
-        return;
-    }
     if let Ok(guard) = GLOBAL_OS.lock()
         && let Some(os) = guard.as_ref()
         && let Ok(mut os) = os.lock()
     {
-        let _ = os.notify_events_completed(completed_event_ids);
+        let _ = os.channel_gc_closed_empty();
     }
 }
 
-fn async_tool_shm_key(task_id: &str) -> String {
-    format!("async_tool:{task_id}")
+fn async_tool_event_id(entry: &AsyncToolEntry) -> Option<EventId> {
+    let channel_id = entry.result_channel_id?;
+    let guard = GLOBAL_OS.lock().ok()?;
+    let os = guard.as_ref()?;
+    let os = os.lock().ok()?;
+    os.channel_event_id(ChannelId(channel_id))
 }
 
 fn async_tool_snapshot_from_entry(task_id: &str, entry: &AsyncToolEntry) -> AsyncToolSnapshot {
+    let event_id = async_tool_event_id(entry)
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "evt_unavailable".to_string());
     match &entry.state {
         AsyncToolState::Running => AsyncToolSnapshot {
             task_id: task_id.to_string(),
-            event_id: entry.event_id.to_string(),
+            event_id: event_id.clone(),
             session_id: entry.session_id.clone(),
             tool_name: entry.tool_name.clone(),
             status: "running".to_string(),
@@ -175,7 +222,7 @@ fn async_tool_snapshot_from_entry(task_id: &str, entry: &AsyncToolEntry) -> Asyn
         },
         AsyncToolState::Completed((_route, run_result)) => AsyncToolSnapshot {
             task_id: task_id.to_string(),
-            event_id: entry.event_id.to_string(),
+            event_id: event_id.clone(),
             session_id: entry.session_id.clone(),
             tool_name: entry.tool_name.clone(),
             status: if run_result.ok {
@@ -192,7 +239,7 @@ fn async_tool_snapshot_from_entry(task_id: &str, entry: &AsyncToolEntry) -> Asyn
         },
         AsyncToolState::Canceled { reason } => AsyncToolSnapshot {
             task_id: task_id.to_string(),
-            event_id: entry.event_id.to_string(),
+            event_id,
             session_id: entry.session_id.clone(),
             tool_name: entry.tool_name.clone(),
             status: "canceled".to_string(),
@@ -206,39 +253,368 @@ fn async_tool_snapshot_from_entry(task_id: &str, entry: &AsyncToolEntry) -> Asyn
     }
 }
 
-fn persist_async_tool_snapshot(task_id: &str, entry: &AsyncToolEntry) {
-    if let Ok(payload) = serde_json::to_string(&async_tool_snapshot_from_entry(task_id, entry))
+fn async_tool_pipe_message_from_started(
+    task_id: &str,
+    entry: &AsyncToolEntry,
+    seq: u64,
+) -> AsyncToolPipeMessage {
+    AsyncToolPipeMessage {
+        task_id: task_id.to_string(),
+        session_id: entry.session_id.clone(),
+        tool_name: entry.tool_name.clone(),
+        seq,
+        kind: AsyncToolPipeKind::Started,
+        content: None,
+        status: Some("running".to_string()),
+        ok: None,
+        cached: None,
+        executed: None,
+        reason: None,
+        elapsed_secs: entry.started_at.elapsed().as_secs_f64(),
+    }
+}
+
+fn async_tool_pipe_message_from_stream(
+    task_id: &str,
+    entry: &AsyncToolEntry,
+    seq: u64,
+    chunk: &[u8],
+) -> AsyncToolPipeMessage {
+    AsyncToolPipeMessage {
+        task_id: task_id.to_string(),
+        session_id: entry.session_id.clone(),
+        tool_name: entry.tool_name.clone(),
+        seq,
+        kind: AsyncToolPipeKind::StreamChunk,
+        content: Some(String::from_utf8_lossy(chunk).to_string()),
+        status: Some("running".to_string()),
+        ok: None,
+        cached: None,
+        executed: None,
+        reason: None,
+        elapsed_secs: entry.started_at.elapsed().as_secs_f64(),
+    }
+}
+
+fn async_tool_pipe_message_from_final(
+    task_id: &str,
+    entry: &AsyncToolEntry,
+    seq: u64,
+) -> AsyncToolPipeMessage {
+    let snapshot = async_tool_snapshot_from_entry(task_id, entry);
+    AsyncToolPipeMessage {
+        task_id: snapshot.task_id,
+        session_id: snapshot.session_id,
+        tool_name: snapshot.tool_name,
+        seq,
+        kind: AsyncToolPipeKind::Final,
+        content: snapshot.content,
+        status: Some(snapshot.status),
+        ok: snapshot.ok,
+        cached: snapshot.cached,
+        executed: snapshot.executed,
+        reason: snapshot.reason,
+        elapsed_secs: snapshot.elapsed_secs,
+    }
+}
+
+fn send_async_tool_pipe_message(entry: &AsyncToolEntry, msg: &AsyncToolPipeMessage) {
+    let Some(channel_id) = entry.result_channel_id else {
+        return;
+    };
+    if let Ok(payload) = serde_json::to_string(msg)
         && let Ok(guard) = GLOBAL_OS.lock()
         && let Some(os) = guard.as_ref()
         && let Ok(mut os) = os.lock()
     {
-        let key = async_tool_shm_key(task_id);
-        if os.shm_read_degraded(&key).is_some() {
-            let _ = os.shm_write(key, payload.clone());
-        } else {
-            let _ = os.shm_create(key, payload);
-        }
+        let _ = os.channel_send(None, ChannelId(channel_id), payload);
     }
 }
 
-fn load_async_tool_snapshot(task_id: &str) -> Option<AsyncToolSnapshot> {
-    let guard = GLOBAL_OS.lock().ok()?;
-    let os = guard.as_ref()?;
-    let os = os.lock().ok()?;
-    let payload = os.shm_read_degraded(&async_tool_shm_key(task_id))?;
-    let payload = payload
-        .strip_prefix("[DEGRADED: owner terminated] ")
-        .or_else(|| payload.strip_prefix("[DEGRADED: checksum mismatch] "))
-        .unwrap_or(payload.as_str());
-    serde_json::from_str(payload).ok()
-}
-
-fn delete_async_tool_snapshot(task_id: &str) {
+fn close_async_tool_pipe(entry: &AsyncToolEntry) {
+    let Some(channel_id) = entry.result_channel_id else {
+        return;
+    };
     if let Ok(guard) = GLOBAL_OS.lock()
         && let Some(os) = guard.as_ref()
         && let Ok(mut os) = os.lock()
     {
-        let _ = os.shm_delete(&async_tool_shm_key(task_id));
+        let _ = os.channel_close(None, ChannelId(channel_id));
+    }
+}
+
+fn release_async_tool_pipe_ref(entry: &AsyncToolEntry, holder: &str) {
+    let Some(channel_id) = entry.result_channel_id else {
+        return;
+    };
+    if let Ok(guard) = GLOBAL_OS.lock()
+        && let Some(os) = guard.as_ref()
+        && let Ok(mut os) = os.lock()
+    {
+        let _ = os.channel_release_named(ChannelId(channel_id), holder);
+    }
+}
+
+fn parse_async_tool_pipe_messages(payloads: &[String]) -> Vec<AsyncToolPipeMessage> {
+    payloads
+        .iter()
+        .filter_map(|payload| serde_json::from_str::<AsyncToolPipeMessage>(payload).ok())
+        .collect()
+}
+
+fn peek_async_tool_pipe_messages(entry: &AsyncToolEntry) -> Vec<AsyncToolPipeMessage> {
+    let Some(channel_id) = entry.result_channel_id else {
+        return Vec::new();
+    };
+    let Ok(guard) = GLOBAL_OS.lock() else {
+        return Vec::new();
+    };
+    let Some(os) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(os) = os.lock() else {
+        return Vec::new();
+    };
+    let Ok(payloads) = os.channel_peek_all(None, ChannelId(channel_id)) else {
+        return Vec::new();
+    };
+    parse_async_tool_pipe_messages(&payloads)
+}
+
+fn drain_async_tool_pipe_messages(entry: &AsyncToolEntry) -> Vec<AsyncToolPipeMessage> {
+    let Some(channel_id) = entry.result_channel_id else {
+        return Vec::new();
+    };
+    let Ok(guard) = GLOBAL_OS.lock() else {
+        return Vec::new();
+    };
+    let Some(os) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let Ok(mut os) = os.lock() else {
+        return Vec::new();
+    };
+    let Ok(payloads) = os.channel_try_recv_all(None, ChannelId(channel_id)) else {
+        return Vec::new();
+    };
+    parse_async_tool_pipe_messages(&payloads)
+}
+
+fn aggregate_async_tool_pipe_messages(messages: &[AsyncToolPipeMessage]) -> AsyncToolPipeAggregate {
+    let mut agg = AsyncToolPipeAggregate::default();
+    for msg in messages {
+        match msg.kind {
+            AsyncToolPipeKind::Started => {
+                agg.last_status = msg.status.clone();
+            }
+            AsyncToolPipeKind::StreamChunk => {
+                if let Some(content) = &msg.content {
+                    agg.chunks.push(content.clone());
+                    agg.stream_chunk_count += 1;
+                }
+                agg.last_status = msg.status.clone();
+            }
+            AsyncToolPipeKind::Final => {
+                agg.last_status = msg.status.clone();
+                agg.ok = msg.ok;
+                agg.cached = msg.cached;
+                agg.executed = msg.executed;
+                agg.reason = msg.reason.clone();
+                agg.final_content = msg.content.clone();
+            }
+        }
+    }
+    agg
+}
+
+fn truncate_stream_preview(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    let head = max_chars / 2;
+    let tail = max_chars.saturating_sub(head);
+    let prefix = text.chars().take(head).collect::<String>();
+    let suffix = text
+        .chars()
+        .skip(total.saturating_sub(tail))
+        .collect::<String>();
+    format!("{prefix}\n...[truncated]...\n{suffix}")
+}
+
+fn stream_preview_from_aggregate(agg: &AsyncToolPipeAggregate) -> Option<String> {
+    if agg.chunks.is_empty() {
+        return None;
+    }
+    Some(truncate_stream_preview(&agg.chunks.join(""), 2000))
+}
+
+fn async_tool_result_json(
+    task_id: &str,
+    tool_name: &str,
+    status: &str,
+    ok: Option<bool>,
+    cached: Option<bool>,
+    executed: Option<bool>,
+    reason: Option<&str>,
+    elapsed_secs: f64,
+    agg: &AsyncToolPipeAggregate,
+) -> Value {
+    json!({
+        "task_id": task_id,
+        "tool_name": tool_name,
+        "status": status,
+        "ok": ok,
+        "cached": cached,
+        "executed": executed,
+        "reason": reason,
+        "elapsed_secs": elapsed_secs,
+        "stream_chunk_count": agg.stream_chunk_count,
+        "stream_preview": stream_preview_from_aggregate(agg),
+        "has_final": agg.final_content.is_some(),
+    })
+}
+
+struct AsyncToolPipeObserver {
+    task_id: String,
+    session_id: String,
+    tool_name: String,
+    result_channel_id: Option<u64>,
+    started_at: Instant,
+    next_seq: u64,
+}
+
+impl AsyncToolPipeObserver {
+    fn running_entry(&self) -> AsyncToolEntry {
+        AsyncToolEntry {
+            result_channel_id: self.result_channel_id,
+            session_id: self.session_id.clone(),
+            tool_name: self.tool_name.clone(),
+            started_at: self.started_at,
+            state: AsyncToolState::Running,
+        }
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        seq
+    }
+
+    fn emit_started(&mut self) {
+        let entry = self.running_entry();
+        let task_id = self.task_id.clone();
+        let seq = self.next_seq();
+        let msg = async_tool_pipe_message_from_started(&task_id, &entry, seq);
+        send_async_tool_pipe_message(&entry, &msg);
+    }
+
+    fn emit_stream(&mut self, chunk: &[u8]) {
+        let entry = self.running_entry();
+        let task_id = self.task_id.clone();
+        let seq = self.next_seq();
+        let msg = async_tool_pipe_message_from_stream(&task_id, &entry, seq, chunk);
+        send_async_tool_pipe_message(&entry, &msg);
+    }
+
+    fn emit_finished(&mut self, run_result: &RunOneResult) {
+        let entry = AsyncToolEntry {
+            result_channel_id: self.result_channel_id,
+            session_id: self.session_id.clone(),
+            tool_name: self.tool_name.clone(),
+            started_at: self.started_at,
+            state: if run_result.ok {
+                AsyncToolState::Completed((ToolRoute::Builtin, RunOneResult {
+                    tool_result: run_result.tool_result.clone(),
+                    ok: run_result.ok,
+                    executed: run_result.executed,
+                    cached: run_result.cached,
+                }))
+            } else {
+                AsyncToolState::Completed((ToolRoute::Builtin, RunOneResult {
+                    tool_result: run_result.tool_result.clone(),
+                    ok: run_result.ok,
+                    executed: run_result.executed,
+                    cached: run_result.cached,
+                }))
+            },
+        };
+        let task_id = self.task_id.clone();
+        let seq = self.next_seq();
+        let msg = async_tool_pipe_message_from_final(&task_id, &entry, seq);
+        send_async_tool_pipe_message(&entry, &msg);
+        close_async_tool_pipe(&entry);
+        release_async_tool_pipe_ref(&entry, "async_tool.producer");
+    }
+}
+
+impl ToolExecutionObserver for AsyncToolPipeObserver {
+    fn on_tool_started(&mut self, _tool_call: &ToolCall) {
+        self.emit_started();
+    }
+
+    fn on_tool_stream(&mut self, _tool_call: &ToolCall, chunk: &[u8]) {
+        self.emit_stream(chunk);
+    }
+
+    fn on_tool_finished(&mut self, _tool_call: &ToolCall, run_result: &RunOneResult) {
+        self.emit_finished(run_result);
+    }
+}
+
+fn persist_async_tool_snapshot(task_id: &str, entry: &AsyncToolEntry) {
+    if !matches!(
+        entry.state,
+        AsyncToolState::Completed(_) | AsyncToolState::Canceled { .. }
+    ) {
+        return;
+    }
+    let msg = async_tool_pipe_message_from_final(task_id, entry, u64::MAX);
+    send_async_tool_pipe_message(entry, &msg);
+    close_async_tool_pipe(entry);
+    release_async_tool_pipe_ref(entry, "async_tool.producer");
+}
+
+fn load_async_tool_snapshot(entry: &AsyncToolEntry) -> Option<AsyncToolSnapshot> {
+    let messages = peek_async_tool_pipe_messages(entry);
+    let agg = aggregate_async_tool_pipe_messages(&messages);
+    Some(AsyncToolSnapshot {
+        task_id: messages.first()?.task_id.clone(),
+        event_id: async_tool_event_id(entry)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "evt_unavailable".to_string()),
+        session_id: messages.first()?.session_id.clone(),
+        tool_name: messages.first()?.tool_name.clone(),
+        status: agg
+            .last_status
+            .unwrap_or_else(|| "running".to_string()),
+        ok: agg.ok,
+        cached: agg.cached,
+        executed: agg.executed,
+        reason: agg.reason,
+        content: agg.final_content.or_else(|| {
+            if agg.chunks.is_empty() {
+                None
+            } else {
+                Some(agg.chunks.join(""))
+            }
+        }),
+        elapsed_secs: messages.last()?.elapsed_secs,
+    })
+}
+
+fn delete_async_tool_snapshot(entry: &AsyncToolEntry) {
+    let Some(channel_id) = entry.result_channel_id else {
+        return;
+    };
+    if let Ok(guard) = GLOBAL_OS.lock()
+        && let Some(os) = guard.as_ref()
+        && let Ok(mut os) = os.lock()
+    {
+        let _ = os.channel_try_recv_all(None, ChannelId(channel_id));
+        let _ = os.channel_close(None, ChannelId(channel_id));
+        let _ = os.channel_release_named(ChannelId(channel_id), "async_tool.consumer");
+        let _ = os.channel_destroy(None, ChannelId(channel_id));
     }
 }
 
@@ -252,7 +628,13 @@ fn lookup_event_ids(session_id: &str, task_ids: &[String]) -> Result<Vec<EventId
         if entry.session_id != session_id {
             return Err(format!("Task {} does not belong to this session.", task_id));
         }
-        event_ids.push(entry.event_id);
+        let event_id = async_tool_event_id(entry).ok_or_else(|| {
+            format!(
+                "Task {} has no available channel event id; async wait requires AIOS channel support.",
+                task_id
+            )
+        })?;
+        event_ids.push(event_id);
     }
     Ok(event_ids)
 }
@@ -282,68 +664,102 @@ fn collect_async_task_snapshot(
     let mut pending = Vec::new();
     let registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
     for task_id in task_ids {
-        if let Some(snapshot) = load_async_tool_snapshot(task_id) {
-            if snapshot.session_id != session_id {
-                return Err(format!("Task {} does not belong to this session.", task_id));
-            }
-            match snapshot.status.as_str() {
-                "running" => pending.push(json!({
-                    "task_id": snapshot.task_id,
-                    "tool_name": snapshot.tool_name,
-                    "status": snapshot.status,
-                    "elapsed_secs": snapshot.elapsed_secs,
-                })),
-                "completed" | "failed" => terminal_results.push(json!({
-                    "task_id": snapshot.task_id,
-                    "tool_name": snapshot.tool_name,
-                    "status": snapshot.status,
-                    "ok": snapshot.ok.unwrap_or(false),
-                    "cached": snapshot.cached.unwrap_or(false),
-                    "executed": snapshot.executed.unwrap_or(false),
-                    "elapsed_secs": snapshot.elapsed_secs,
-                    "content": snapshot.content.unwrap_or_default(),
-                })),
-                "canceled" => terminal_results.push(json!({
-                    "task_id": snapshot.task_id,
-                    "tool_name": snapshot.tool_name,
-                    "status": snapshot.status,
-                    "reason": snapshot.reason.unwrap_or_default(),
-                    "elapsed_secs": snapshot.elapsed_secs,
-                })),
-                _ => {}
-            }
-            continue;
-        }
         let Some(entry) = registry.get(task_id) else {
             return Err(format!("Unknown task_id: {}", task_id));
         };
         if entry.session_id != session_id {
             return Err(format!("Task {} does not belong to this session.", task_id));
         }
+        let pipe_messages = peek_async_tool_pipe_messages(entry);
+        let agg = aggregate_async_tool_pipe_messages(&pipe_messages);
+        if let Some(snapshot) = load_async_tool_snapshot(entry) {
+            if snapshot.session_id != session_id {
+                return Err(format!("Task {} does not belong to this session.", task_id));
+            }
+            match snapshot.status.as_str() {
+                "running" => pending.push(async_tool_result_json(
+                    &snapshot.task_id,
+                    &snapshot.tool_name,
+                    &snapshot.status,
+                    snapshot.ok,
+                    snapshot.cached,
+                    snapshot.executed,
+                    snapshot.reason.as_deref(),
+                    snapshot.elapsed_secs,
+                    &agg,
+                )),
+                "completed" | "failed" => {
+                    let mut value = async_tool_result_json(
+                        &snapshot.task_id,
+                        &snapshot.tool_name,
+                        &snapshot.status,
+                        snapshot.ok,
+                        snapshot.cached,
+                        snapshot.executed,
+                        snapshot.reason.as_deref(),
+                        snapshot.elapsed_secs,
+                        &agg,
+                    );
+                    if let Some(obj) = value.as_object_mut() {
+                        obj.insert("content".to_string(), json!(snapshot.content.unwrap_or_default()));
+                    }
+                    terminal_results.push(value);
+                }
+                "canceled" => terminal_results.push(async_tool_result_json(
+                    &snapshot.task_id,
+                    &snapshot.tool_name,
+                    &snapshot.status,
+                    Some(false),
+                    Some(false),
+                    Some(false),
+                    snapshot.reason.as_deref(),
+                    snapshot.elapsed_secs,
+                    &agg,
+                )),
+                _ => {}
+            }
+            continue;
+        }
         match &entry.state {
-            AsyncToolState::Running => pending.push(json!({
-                "task_id": task_id,
-                "tool_name": entry.tool_name,
-                "status": "running",
-                "elapsed_secs": entry.started_at.elapsed().as_secs_f64(),
-            })),
-            AsyncToolState::Completed((_route, run_result)) => terminal_results.push(json!({
-                "task_id": task_id,
-                "tool_name": entry.tool_name,
-                "status": if run_result.ok { "completed" } else { "failed" },
-                "ok": run_result.ok,
-                "cached": run_result.cached,
-                "executed": run_result.executed,
-                "elapsed_secs": entry.started_at.elapsed().as_secs_f64(),
-                "content": run_result.tool_result.content,
-            })),
-            AsyncToolState::Canceled { reason } => terminal_results.push(json!({
-                "task_id": task_id,
-                "tool_name": entry.tool_name,
-                "status": "canceled",
-                "reason": reason,
-                "elapsed_secs": entry.started_at.elapsed().as_secs_f64(),
-            })),
+            AsyncToolState::Running => pending.push(async_tool_result_json(
+                task_id,
+                &entry.tool_name,
+                "running",
+                None,
+                None,
+                None,
+                None,
+                entry.started_at.elapsed().as_secs_f64(),
+                &agg,
+            )),
+            AsyncToolState::Completed((_route, run_result)) => {
+                let mut value = async_tool_result_json(
+                    task_id,
+                    &entry.tool_name,
+                    if run_result.ok { "completed" } else { "failed" },
+                    Some(run_result.ok),
+                    Some(run_result.cached),
+                    Some(run_result.executed),
+                    None,
+                    entry.started_at.elapsed().as_secs_f64(),
+                    &agg,
+                );
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("content".to_string(), json!(run_result.tool_result.content));
+                }
+                terminal_results.push(value);
+            }
+            AsyncToolState::Canceled { reason } => terminal_results.push(async_tool_result_json(
+                task_id,
+                &entry.tool_name,
+                "canceled",
+                Some(false),
+                Some(false),
+                Some(false),
+                Some(reason),
+                entry.started_at.elapsed().as_secs_f64(),
+                &agg,
+            )),
         }
     }
     Ok((terminal_results, pending))
@@ -583,7 +999,8 @@ fn execute_tool_spawn(
     };
 
     validate_spawnable_tool(target_tool_name, &prepared.route)?;
-    let event_id = next_async_event_id();
+    let result_channel_id = create_async_tool_channel(&async_task_id);
+    let started_at = Instant::now();
 
     if let Some(tool_result) = load_cached_tool_result(session_id, &synthetic_tool_call, &prepared.args)
     {
@@ -597,20 +1014,19 @@ fn execute_tool_spawn(
         registry.insert(
             async_task_id.clone(),
             AsyncToolEntry {
-                event_id,
+                result_channel_id,
                 session_id: session_id.to_string(),
                 tool_name: target_tool_name.to_string(),
-                started_at: Instant::now(),
+                started_at,
                 state: AsyncToolState::Completed((prepared.route.clone(), run_result)),
             },
         );
         if let Some(entry) = registry.get(&async_task_id) {
+            let started = async_tool_pipe_message_from_started(&async_task_id, entry, 0);
+            send_async_tool_pipe_message(entry, &started);
             persist_async_tool_snapshot(&async_task_id, entry);
         }
         prune_completed_async_tools(&mut registry);
-        let notify_ids = vec![event_id];
-        drop(registry);
-        notify_completed_events(&notify_ids);
         return Ok(ToolResult {
             tool_call_id: tool_call_id.to_string(),
             content: json!({
@@ -631,11 +1047,33 @@ fn execute_tool_spawn(
     let route_for_registry = prepared.route.clone();
     let shared_mcp_client_for_thread = shared_mcp_client.clone();
     let async_task_id_for_thread = async_task_id.clone();
+    let tool_name_for_thread = tool_name.clone();
+    let result_channel_id_for_thread = result_channel_id;
+    let started_at_for_thread = started_at;
 
     thread::spawn(move || {
+        let mut pipe_observer = AsyncToolPipeObserver {
+            task_id: async_task_id_for_thread.clone(),
+            session_id: session_id.clone(),
+            tool_name: tool_name_for_thread.clone(),
+            result_channel_id: result_channel_id_for_thread,
+            started_at: started_at_for_thread,
+            next_seq: 0,
+        };
+        pipe_observer.on_tool_started(&tool_call_for_thread);
         let result = match &prepared_for_thread.route {
             ToolRoute::Builtin => {
-                execute_prepared_builtin_tool_call(&tool_call_for_thread, &prepared_for_thread)
+                if tool_call_for_thread.function.name == "execute_command" {
+                    builtin_tools::command_tools::execute_command_streaming(&prepared_for_thread.args, |chunk| {
+                        pipe_observer.on_tool_stream(&tool_call_for_thread, chunk);
+                    })
+                    .map(|content| ToolResult {
+                        tool_call_id: tool_call_for_thread.id.clone(),
+                        content,
+                    })
+                } else {
+                    execute_prepared_builtin_tool_call(&tool_call_for_thread, &prepared_for_thread)
+                }
             }
             ToolRoute::Mcp { .. } => {
                 let guard = shared_mcp_client_for_thread
@@ -668,19 +1106,14 @@ fn execute_tool_spawn(
             true,
             false,
         );
+        pipe_observer.on_tool_finished(&tool_call_for_thread, &run_result);
 
-        let mut completed_events = None;
         if let Ok(mut registry) = ASYNC_TOOL_REGISTRY.lock() {
             if let Some(entry) = registry.get_mut(&async_task_id_for_thread)
                 && matches!(entry.state, AsyncToolState::Running)
             {
                 entry.state = AsyncToolState::Completed((route_for_registry, run_result));
-                persist_async_tool_snapshot(&async_task_id_for_thread, entry);
-                completed_events = Some(completed_event_ids(&registry));
             }
-        }
-        if let Some(event_ids) = completed_events {
-            notify_completed_events(&event_ids);
         }
     });
 
@@ -688,16 +1121,13 @@ fn execute_tool_spawn(
     registry.insert(
         async_task_id.clone(),
         AsyncToolEntry {
-            event_id,
+            result_channel_id,
             session_id: session_id_for_registry,
             tool_name,
-            started_at: Instant::now(),
+            started_at,
             state: AsyncToolState::Running,
         },
     );
-    if let Some(entry) = registry.get(&async_task_id) {
-        persist_async_tool_snapshot(&async_task_id, entry);
-    }
     prune_completed_async_tools(&mut registry);
 
     Ok(ToolResult {
@@ -736,51 +1166,71 @@ fn execute_tool_status(session_id: &str, tool_call_id: &str, args: &Value) -> Re
         };
 
         for task_id in task_ids {
-            if let Some(snapshot) = load_async_tool_snapshot(&task_id) {
-                if snapshot.session_id != session_id {
-                    continue;
-                }
-                results.push(json!({
-                    "task_id": snapshot.task_id,
-                    "tool_name": snapshot.tool_name,
-                    "status": snapshot.status,
-                    "ok": snapshot.ok,
-                    "cached": snapshot.cached,
-                    "executed": snapshot.executed,
-                    "reason": snapshot.reason,
-                    "elapsed_secs": snapshot.elapsed_secs,
-                }));
-                continue;
-            }
             let Some(entry) = registry.get_mut(&task_id) else {
                 continue;
             };
+            let pipe_messages = peek_async_tool_pipe_messages(entry);
+            let agg = aggregate_async_tool_pipe_messages(&pipe_messages);
+            if let Some(snapshot) = load_async_tool_snapshot(entry) {
+                if snapshot.session_id != session_id {
+                    continue;
+                }
+                let mut value = async_tool_result_json(
+                    &snapshot.task_id,
+                    &snapshot.tool_name,
+                    &snapshot.status,
+                    snapshot.ok,
+                    snapshot.cached,
+                    snapshot.executed,
+                    snapshot.reason.as_deref(),
+                    snapshot.elapsed_secs,
+                    &agg,
+                );
+                if let Some(obj) = value.as_object_mut()
+                    && let Some(content) = snapshot.content
+                {
+                    obj.insert("content".to_string(), json!(content));
+                }
+                results.push(value);
+                continue;
+            }
             if entry.session_id != session_id {
                 continue;
             }
             match &entry.state {
-                AsyncToolState::Running => results.push(json!({
-                    "task_id": task_id,
-                    "tool_name": entry.tool_name,
-                    "status": "running",
-                    "elapsed_secs": entry.started_at.elapsed().as_secs_f64(),
-                })),
-                AsyncToolState::Completed((_route, run_result)) => results.push(json!({
-                    "task_id": task_id,
-                    "tool_name": entry.tool_name,
-                    "status": if run_result.ok { "completed" } else { "failed" },
-                    "ok": run_result.ok,
-                    "cached": run_result.cached,
-                    "executed": run_result.executed,
-                    "elapsed_secs": entry.started_at.elapsed().as_secs_f64(),
-                })),
-                AsyncToolState::Canceled { reason } => results.push(json!({
-                    "task_id": task_id,
-                    "tool_name": entry.tool_name,
-                    "status": "canceled",
-                    "reason": reason,
-                    "elapsed_secs": entry.started_at.elapsed().as_secs_f64(),
-                })),
+                AsyncToolState::Running => results.push(async_tool_result_json(
+                    &task_id,
+                    &entry.tool_name,
+                    "running",
+                    None,
+                    None,
+                    None,
+                    None,
+                    entry.started_at.elapsed().as_secs_f64(),
+                    &agg,
+                )),
+                AsyncToolState::Completed((_route, run_result)) => results.push(async_tool_result_json(
+                    &task_id,
+                    &entry.tool_name,
+                    if run_result.ok { "completed" } else { "failed" },
+                    Some(run_result.ok),
+                    Some(run_result.cached),
+                    Some(run_result.executed),
+                    None,
+                    entry.started_at.elapsed().as_secs_f64(),
+                    &agg,
+                )),
+                AsyncToolState::Canceled { reason } => results.push(async_tool_result_json(
+                    &task_id,
+                    &entry.tool_name,
+                    "canceled",
+                    Some(false),
+                    Some(false),
+                    Some(false),
+                    Some(reason),
+                    entry.started_at.elapsed().as_secs_f64(),
+                    &agg,
+                )),
             }
         }
     }
@@ -810,7 +1260,6 @@ fn execute_tool_cancel(session_id: &str, tool_call_id: &str, args: &Value) -> Re
         .to_string();
 
     let mut results = Vec::new();
-    let mut notify_ids = Vec::new();
     let mut registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
     for task_id in task_ids {
         let Some(entry) = registry.get_mut(&task_id) else {
@@ -826,7 +1275,6 @@ fn execute_tool_cancel(session_id: &str, tool_call_id: &str, args: &Value) -> Re
                     reason: reason.clone(),
                 };
                 persist_async_tool_snapshot(&task_id, entry);
-                notify_ids.push(entry.event_id);
                 results.push(json!({
                     "task_id": task_id,
                     "tool_name": entry.tool_name,
@@ -853,10 +1301,6 @@ fn execute_tool_cancel(session_id: &str, tool_call_id: &str, args: &Value) -> Re
         }
     }
     prune_completed_async_tools(&mut registry);
-    drop(registry);
-    if !notify_ids.is_empty() {
-        notify_completed_events(&notify_ids);
-    }
 
     Ok(ToolResult {
         tool_call_id: tool_call_id.to_string(),
@@ -885,8 +1329,11 @@ fn execute_tool_wait(session_id: &str, tool_call_id: &str, args: &Value) -> Resu
     };
     if satisfied {
         if initial_pending.is_empty() {
+            let registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
             for task_id in &task_ids {
-                delete_async_tool_snapshot(task_id);
+                if let Some(entry) = registry.get(task_id) {
+                    delete_async_tool_snapshot(entry);
+                }
             }
         }
         let all_done = initial_pending.is_empty();
@@ -982,8 +1429,11 @@ fn execute_tool_wait(session_id: &str, tool_call_id: &str, args: &Value) -> Resu
 
     let (terminal_results, pending) = collect_async_task_snapshot(session_id, &task_ids)?;
     if pending.is_empty() {
+        let registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
         for task_id in &task_ids {
-            delete_async_tool_snapshot(task_id);
+            if let Some(entry) = registry.get(task_id) {
+                delete_async_tool_snapshot(entry);
+            }
         }
     }
 
@@ -1512,14 +1962,77 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_tool_cache_key, is_cacheable_tool_name, is_tool_cache_entry_fresh,
-        parallel_task_batch_len, TOOL_CACHE_TTL_MINUTES,
+        aggregate_async_tool_pipe_messages, async_tool_pipe_message_from_final,
+        async_tool_pipe_message_from_started, async_tool_pipe_message_from_stream,
+        build_tool_cache_key, delete_async_tool_snapshot, is_cacheable_tool_name,
+        is_tool_cache_entry_fresh, load_async_tool_snapshot, lookup_event_ids,
+        parallel_task_batch_len, persist_async_tool_snapshot, send_async_tool_pipe_message,
+        stream_preview_from_aggregate, AsyncToolEntry, AsyncToolPipeKind, AsyncToolPipeMessage,
+        AsyncToolState, RunOneResult, ToolRoute, ASYNC_TOOL_REGISTRY, TOOL_CACHE_TTL_MINUTES,
     };
+    use aios_kernel::primitives::ChannelId;
     use crate::ai::mcp::McpClient;
     use crate::ai::types::{FunctionCall, ToolCall};
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
     use chrono::{Duration, Utc};
     use serde_json::json;
+    use std::sync::{LazyLock, Mutex, MutexGuard};
+
+    static ASYNC_TOOL_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct AsyncToolTestGuard {
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for AsyncToolTestGuard {
+        fn drop(&mut self) {
+            if let Ok(mut registry) = ASYNC_TOOL_REGISTRY.lock() {
+                registry.clear();
+            }
+            if let Ok(mut g) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+                *g = None;
+            }
+        }
+    }
+
+    fn setup_async_tool_kernel() -> (AsyncToolTestGuard, aios_kernel::kernel::SharedKernel, u64) {
+        let lock = ASYNC_TOOL_TEST_LOCK.lock().unwrap();
+        if let Ok(mut registry) = ASYNC_TOOL_REGISTRY.lock() {
+            registry.clear();
+        }
+        if let Ok(mut g) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+            *g = None;
+        }
+        let guard = AsyncToolTestGuard { _lock: lock };
+        let kernel = crate::ai::driver::new_local_kernel();
+        let root = {
+            let mut os = kernel.lock().unwrap();
+            os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None)
+        };
+        crate::ai::tools::os_tools::init_os_tools_globals(kernel.clone());
+        (guard, kernel, root)
+    }
+
+    fn sample_completed_entry(result_channel_id: Option<u64>) -> AsyncToolEntry {
+        AsyncToolEntry {
+            result_channel_id,
+            session_id: "sess-1".to_string(),
+            tool_name: "read_file".to_string(),
+            started_at: std::time::Instant::now(),
+            state: AsyncToolState::Completed((
+                ToolRoute::Builtin,
+                RunOneResult {
+                    tool_result: crate::ai::types::ToolResult {
+                        tool_call_id: "call-1".to_string(),
+                        content: "payload".to_string(),
+                    },
+                    ok: true,
+                    executed: true,
+                    cached: false,
+                },
+            )),
+        }
+    }
 
     #[test]
     fn cacheable_tool_name_prefers_read_only_tools() {
@@ -1578,6 +2091,167 @@ mod tests {
         assert_eq!(parallel_task_batch_len(&client, &tool_calls, 0), 2);
         assert_eq!(parallel_task_batch_len(&client, &tool_calls, 2), 0);
         assert_eq!(parallel_task_batch_len(&client, &tool_calls, 3), 1);
+    }
+
+    #[test]
+    fn async_tool_snapshot_roundtrip_uses_channel() {
+        let (_guard, kernel, root) = setup_async_tool_kernel();
+        let channel_id = {
+            let mut os = kernel.lock().unwrap();
+            os.channel_create(Some(root), 1, "async-tool-test".to_string()).raw()
+        };
+        let entry = sample_completed_entry(Some(channel_id));
+
+        persist_async_tool_snapshot("tooltask_1", &entry);
+        let snapshot = load_async_tool_snapshot(&entry).expect("snapshot should be readable via channel");
+        assert_eq!(snapshot.task_id, "tooltask_1");
+        assert_eq!(snapshot.status, "completed");
+        assert_eq!(snapshot.content.as_deref(), Some("payload"));
+
+        delete_async_tool_snapshot(&entry);
+        assert!(load_async_tool_snapshot(&entry).is_none());
+    }
+
+    #[test]
+    fn lookup_event_ids_uses_channel_event_id() {
+        let (_guard, kernel, root) = setup_async_tool_kernel();
+        let (channel_id, expected_event_id) = {
+            let mut os = kernel.lock().unwrap();
+            let channel = os.channel_create(Some(root), 1, "async-tool-event".to_string());
+            let event_id = os.channel_event_id(channel).expect("channel event id");
+            (channel.raw(), event_id)
+        };
+
+        let mut registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
+        registry.insert(
+            "tooltask_lookup".to_string(),
+            AsyncToolEntry {
+                result_channel_id: Some(channel_id),
+                session_id: "sess-lookup".to_string(),
+                tool_name: "read_file".to_string(),
+                started_at: std::time::Instant::now(),
+                state: AsyncToolState::Running,
+            },
+        );
+        drop(registry);
+
+        let event_ids = lookup_event_ids("sess-lookup", &["tooltask_lookup".to_string()]).unwrap();
+        assert_eq!(event_ids, vec![expected_event_id]);
+    }
+
+    #[test]
+    fn async_tool_pipe_aggregate_keeps_stream_and_final() {
+        let messages = vec![
+            AsyncToolPipeMessage {
+                task_id: "tooltask_pipe".to_string(),
+                session_id: "sess-pipe".to_string(),
+                tool_name: "execute_command".to_string(),
+                seq: 0,
+                kind: AsyncToolPipeKind::Started,
+                content: None,
+                status: Some("running".to_string()),
+                ok: None,
+                cached: None,
+                executed: None,
+                reason: None,
+                elapsed_secs: 0.1,
+            },
+            AsyncToolPipeMessage {
+                task_id: "tooltask_pipe".to_string(),
+                session_id: "sess-pipe".to_string(),
+                tool_name: "execute_command".to_string(),
+                seq: 1,
+                kind: AsyncToolPipeKind::StreamChunk,
+                content: Some("hello ".to_string()),
+                status: Some("running".to_string()),
+                ok: None,
+                cached: None,
+                executed: None,
+                reason: None,
+                elapsed_secs: 0.2,
+            },
+            AsyncToolPipeMessage {
+                task_id: "tooltask_pipe".to_string(),
+                session_id: "sess-pipe".to_string(),
+                tool_name: "execute_command".to_string(),
+                seq: 2,
+                kind: AsyncToolPipeKind::Final,
+                content: Some("hello world".to_string()),
+                status: Some("completed".to_string()),
+                ok: Some(true),
+                cached: Some(false),
+                executed: Some(true),
+                reason: None,
+                elapsed_secs: 0.3,
+            },
+        ];
+
+        let agg = aggregate_async_tool_pipe_messages(&messages);
+        assert_eq!(agg.stream_chunk_count, 1);
+        assert_eq!(agg.final_content.as_deref(), Some("hello world"));
+        assert_eq!(agg.last_status.as_deref(), Some("completed"));
+        assert_eq!(stream_preview_from_aggregate(&agg).as_deref(), Some("hello "));
+    }
+
+    #[test]
+    fn load_async_tool_snapshot_reads_streaming_pipe_messages() {
+        let (_guard, kernel, root) = setup_async_tool_kernel();
+        let channel_id = {
+            let mut os = kernel.lock().unwrap();
+            os.channel_create(Some(root), 8, "async-tool-pipe".to_string()).raw()
+        };
+        let entry = AsyncToolEntry {
+            result_channel_id: Some(channel_id),
+            session_id: "sess-stream".to_string(),
+            tool_name: "execute_command".to_string(),
+            started_at: std::time::Instant::now(),
+            state: AsyncToolState::Running,
+        };
+
+        send_async_tool_pipe_message(&entry, &async_tool_pipe_message_from_started("tooltask_stream", &entry, 0));
+        send_async_tool_pipe_message(
+            &entry,
+            &async_tool_pipe_message_from_stream("tooltask_stream", &entry, 1, b"partial "),
+        );
+        let final_entry = AsyncToolEntry {
+            state: AsyncToolState::Completed((
+                ToolRoute::Builtin,
+                RunOneResult {
+                    tool_result: crate::ai::types::ToolResult {
+                        tool_call_id: "call-stream".to_string(),
+                        content: "partial final".to_string(),
+                    },
+                    ok: true,
+                    executed: true,
+                    cached: false,
+                },
+            )),
+            ..entry
+        };
+        send_async_tool_pipe_message(
+            &final_entry,
+            &async_tool_pipe_message_from_final("tooltask_stream", &final_entry, 2),
+        );
+
+        let snapshot = load_async_tool_snapshot(&final_entry).expect("snapshot should decode from pipe");
+        assert_eq!(snapshot.status, "completed");
+        assert_eq!(snapshot.content.as_deref(), Some("partial final"));
+    }
+
+    #[test]
+    fn delete_async_tool_snapshot_destroys_result_pipe() {
+        let (_guard, kernel, root) = setup_async_tool_kernel();
+        let channel_id = {
+            let mut os = kernel.lock().unwrap();
+            os.channel_create(Some(root), 4, "async-tool-destroy".to_string()).raw()
+        };
+        let entry = sample_completed_entry(Some(channel_id));
+        persist_async_tool_snapshot("tooltask_destroy", &entry);
+
+        delete_async_tool_snapshot(&entry);
+
+        let os = kernel.lock().unwrap();
+        assert!(os.channel_event_id(ChannelId(channel_id)).is_none());
     }
 }
 

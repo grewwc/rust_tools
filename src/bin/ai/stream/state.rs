@@ -32,6 +32,9 @@ pub(super) struct StreamProcessingState {
     pub(super) framing: StreamFramingState,
     pub(super) render: StreamRenderState,
     pub(super) content: StreamContentState,
+    /// Last-seen `(echoed_model, usage)` from any chunk during this stream.
+    /// Handed to the kernel's `/dev/llm` when the stream finalizes.
+    pub(super) pending_llm_usage: Option<(String, super::super::request::StreamUsage)>,
 }
 
 impl StreamProcessingState {
@@ -40,6 +43,7 @@ impl StreamProcessingState {
             framing: StreamFramingState::new(),
             render: StreamRenderState::new(),
             content: StreamContentState::new(),
+            pending_llm_usage: None,
         }
     }
 }

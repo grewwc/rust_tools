@@ -13,6 +13,8 @@ use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use aios_kernel::kernel::SharedKernel;
+
 use super::{agents::AgentManifest, cli::ParsedCli, prompt::PromptEditor};
 
 /// Configuration for the AI application, including API credentials,
@@ -90,7 +92,7 @@ pub(super) struct App {
     pub(super) prompt_editor: Option<PromptEditor>,
     pub(super) agent_context: Option<AgentContext>,
     pub(super) last_skill_bias: Option<SkillBiasMemory>,
-    pub(super) os: crate::ai::os::kernel::SharedKernel,
+    pub(super) os: SharedKernel,
     pub(super) agent_reload_counter: Option<usize>,
     pub(super) observers: Vec<Box<dyn crate::ai::driver::observer::TurnObserver>>,
 }

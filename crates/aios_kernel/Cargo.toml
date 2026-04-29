@@ -1,0 +1,9 @@
+[package]
+name = "aios_kernel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rustc-hash = "*"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
+uuid = { version = "1.18.1", features = ["v4"] }

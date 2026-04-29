@@ -121,6 +121,8 @@ fn single_delta_chunk(content: &str, reasoning_content: &str) -> StreamChunk {
             },
             finish_reason: None,
         }],
+        usage: None,
+        model: String::new(),
     }
 }
 

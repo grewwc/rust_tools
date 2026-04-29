@@ -202,6 +202,19 @@ fn activate_skill_context(
         let prev_max_iterations = std::mem::replace(&mut ctx.max_iterations, max_iterations);
         restore = Some((prev_tools, prev_max_iterations));
     }
+    // AIOS: mirror the user-space max_iterations into kernel rlimit so that
+    // quota enforcement lives in one place (kernel), not scattered across driver.
+    // We map max_iterations -> ResourceLimit.max_tool_calls since each iteration
+    // typically issues <= 1 tool call batch.
+    {
+        use aios_kernel::primitives::ResourceLimit;
+        let mut os = app.os.lock().unwrap();
+        if let Some(pid) = os.current_process_id() {
+            let mut lim = os.rlimit_get(pid).unwrap_or_else(ResourceLimit::unlimited);
+            lim.max_tool_calls = max_iterations as u64;
+            let _ = os.rlimit_set(pid, lim);
+        }
+    }
     restore
 }
 

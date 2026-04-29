@@ -258,6 +258,22 @@ fn finalize_stream_response(
         return Ok(cancelled_stream_result(false));
     }
 
+    // AIOS: flush any pending LLM usage to kernel `/dev/llm` before returning.
+    // Prefer the model echoed by the provider; fall back to what we requested.
+    if let Some((echoed_model, usage)) = state.pending_llm_usage.take() {
+        let model_for_pricing = if echoed_model.is_empty() {
+            app.current_model.clone()
+        } else {
+            echoed_model
+        };
+        let _ = crate::ai::request::charge_llm_usage_to_kernel(
+            app,
+            &model_for_pricing,
+            &usage,
+            0,
+        );
+    }
+
     let tool_calls = collect_valid_tool_calls(&mut state.content.tool_calls_map);
 
     let outcome = if !tool_calls.is_empty() {
@@ -907,6 +923,13 @@ fn process_stream_payload(
             (chunk, StreamEventMergeMode::AppendMissingSuffix)
         }
     };
+
+    // AIOS: capture usage block from whichever chunk carries it. OpenAI emits
+    // the final `usage` on a chunk with `choices: []`, so we must pull it *before*
+    // the empty-choices early return below.
+    if let Some(ref usage) = chunk.usage {
+        state.pending_llm_usage = Some((chunk.model.clone(), usage.clone()));
+    }
 
     if chunk.choices.is_empty() {
         state.content.empty_choice_chunks += 1;

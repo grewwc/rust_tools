@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 use rust_tools::cw::SkipMap;
 use serde_json::Value;
 
-use crate::ai::os::kernel::Signal;
+use aios_kernel::kernel::Signal;
 use crate::ai::tools::os_tools::GLOBAL_OS;
 use crate::ai::tools::permissions::ToolPermissions;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
@@ -56,7 +56,7 @@ pub(crate) fn is_tool_cancel_requested() -> bool {
 }
 
 fn with_current_process<T>(
-    f: impl FnOnce(&mut dyn crate::ai::os::kernel::Syscall, u64) -> Result<T, String>,
+    f: impl FnOnce(&mut dyn aios_kernel::kernel::Syscall, u64) -> Result<T, String>,
 ) -> Option<T> {
     let guard = GLOBAL_OS.lock().ok()?;
     let os = guard.as_ref()?.clone();
@@ -65,7 +65,7 @@ fn with_current_process<T>(
     f(os.as_mut(), pid).ok()
 }
 
-fn with_current_process_mut(f: impl FnOnce(&mut crate::ai::os::kernel::Process)) {
+fn with_current_process_mut(f: impl FnOnce(&mut aios_kernel::kernel::Process)) {
     let Ok(guard) = GLOBAL_OS.lock() else {
         return;
     };
@@ -83,7 +83,7 @@ fn with_current_process_mut(f: impl FnOnce(&mut crate::ai::os::kernel::Process))
     }
 }
 
-fn with_current_process_ref<T>(f: impl FnOnce(&crate::ai::os::kernel::Process) -> T) -> Option<T> {
+fn with_current_process_ref<T>(f: impl FnOnce(&aios_kernel::kernel::Process) -> T) -> Option<T> {
     let guard = GLOBAL_OS.lock().ok()?;
     let os = guard.as_ref()?.clone();
     let os = os.lock().ok()?;

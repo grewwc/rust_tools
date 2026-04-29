@@ -353,6 +353,30 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                     return Ok(TurnLoopStep::Break);
                 }
                 *force_final_response = true;
+            } else {
+                // AIOS: kernel is the authoritative source for tool-call quota.
+                // If kernel says we've exceeded rlimit.max_tool_calls even when
+                // the stale user-space `iteration` counter hasn't tripped yet,
+                // honor the kernel verdict.
+                use aios_kernel::primitives::{RlimitDim, RlimitVerdict};
+                let os = app.os.lock().unwrap();
+                if let Some(pid) = os.current_process_id() {
+                    if let RlimitVerdict::Exceeded { dimension, used, limit } =
+                        os.rlimit_check(pid, &Default::default())
+                    {
+                        drop(os);
+                        if matches!(dimension, RlimitDim::ToolCalls | RlimitDim::Turns)
+                            && *force_final_response
+                        {
+                            *final_assistant_text = format!(
+                                "Agent exceeded kernel rlimit ({:?}: used={} limit={}).",
+                                dimension, used, limit
+                            );
+                            return Ok(TurnLoopStep::Break);
+                        }
+                        *force_final_response = true;
+                    }
+                }
             }
 
             Ok(TurnLoopStep::Continue)

@@ -32,9 +32,44 @@ pub(crate) async fn maybe_append_self_reflection(
     let model_s = model.to_string();
     let q_s = q.to_string();
     let a_s = a.to_string();
+
+    // 在内核 daemon 登记表注册此后台 future，获得 handle + cancel token。
+    // 用户态仍由 tokio::spawn 实际执行；退出时回调 daemon_exit 告知内核。
+    use aios_kernel::primitives::DaemonKind;
+    let (handle, cancel_token, kernel_arc) = {
+        let kernel = app.os.clone();
+        let (handle, token) = {
+            let mut os = match kernel.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            let parent_pid = os.current_process_id();
+            os.daemon_register(
+                format!("self_reflection:{}", session_id),
+                DaemonKind::Reflection,
+                parent_pid,
+            )
+        };
+        (handle, token, kernel)
+    };
+
     tokio::spawn(async move {
+        if cancel_token.is_cancelled() {
+            // spawn 前即被 cancel：直接标记退出即可。
+            let mut os = match kernel_arc.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            os.daemon_exit(handle, None);
+            return;
+        }
         run_self_reflection_background(history_path, session_id, model_s, q_s, a_s, had_tool)
             .await;
+        let mut os = match kernel_arc.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        os.daemon_exit(handle, None);
     });
 }
 
