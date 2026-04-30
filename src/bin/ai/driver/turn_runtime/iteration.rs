@@ -177,29 +177,13 @@ fn request_interrupt_futex_ready() -> bool {
 }
 
 async fn wait_for_request_interrupt(shutdown: Arc<AtomicBool>, cancel_stream: Arc<AtomicBool>) {
-    if request_interrupt_pending(shutdown.as_ref(), cancel_stream.as_ref())
-        || request_interrupt_futex_ready()
-    {
-        return;
-    }
-
-    if crate::ai::driver::signal::request_interrupt_futex().is_some() {
-        let _ = tokio::task::spawn_blocking(move || loop {
-            if request_interrupt_pending(shutdown.as_ref(), cancel_stream.as_ref())
-                || request_interrupt_futex_ready()
-            {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        })
-        .await;
-    } else {
-        loop {
-            if request_interrupt_pending(shutdown.as_ref(), cancel_stream.as_ref()) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+    loop {
+        if request_interrupt_pending(shutdown.as_ref(), cancel_stream.as_ref())
+            || request_interrupt_futex_ready()
+        {
+            return;
         }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -310,6 +294,7 @@ async fn stream_model_response(
                 tool_calls: Vec::new(),
                 assistant_text: "[响应解析失败，请重试]".to_string(),
                 hidden_meta: String::new(),
+                skip_response_drain: false,
             }
         }
     };
@@ -345,13 +330,15 @@ async fn finalize_stream_interaction(
         ));
     }
 
-    // Some providers keep HTTP connections alive even after emitting stream-done
-    // markers, so draining to EOF can block indefinitely and hang the turn.
-    match tokio::time::timeout(Duration::from_millis(200), drain_response(response)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => return Err(err),
-        Err(_) => {
-            eprintln!("[Warning] 响应流收尾 drain 超时，已跳过剩余字节读取以避免会话卡住。");
+    if !stream_result.skip_response_drain {
+        // Parse-error fallback may still leave bytes buffered. Keep this bounded
+        // so unusual provider behavior cannot hang the turn.
+        match tokio::time::timeout(Duration::from_millis(200), drain_response(response)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                eprintln!("[Warning] 响应流收尾 drain 超时，已跳过剩余字节读取以避免会话卡住。");
+            }
         }
     }
     app.streaming

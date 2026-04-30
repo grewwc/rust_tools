@@ -380,6 +380,10 @@ fn spawn_mcp_preload_task(config_path: String) -> tokio::task::JoinHandle<Option
     })
 }
 
+fn should_preload_mcp(one_shot_mode: bool, mcp_probe: &McpConfigProbe) -> bool {
+    mcp_probe.exists && !one_shot_mode
+}
+
 /// Main entry point for AIOS.
 /// Initializes all components and starts the run_loop.
 /// 
@@ -570,7 +574,7 @@ async fn run_loop(
     let mut mcp_initialized = false;
     let mut mcp_loading_announced = false;
     let mut manifests_loaded = false;
-    let mut mcp_preload_task = if mcp_probe.exists {
+    let mut mcp_preload_task = if should_preload_mcp(one_shot_mode, &mcp_probe) {
         Some(spawn_mcp_preload_task(mcp_probe.config_path.clone()))
     } else {
         None
@@ -612,7 +616,7 @@ async fn run_loop(
             return Ok(());
         }
 
-        if mcp_probe.exists
+        if should_preload_mcp(one_shot_mode, &mcp_probe)
             && !mcp_initialized
             && mcp_preload_task.is_none()
             && !signal::request_interrupt_ready()
@@ -830,7 +834,9 @@ async fn run_loop(
             history_count = ctx.history_count;
         }
 
-        announce_mcp_loading_if_needed(&mcp_probe, mcp_initialized, &mut mcp_loading_announced);
+        if !one_shot_mode {
+            announce_mcp_loading_if_needed(&mcp_probe, mcp_initialized, &mut mcp_loading_announced);
+        }
 
         ensure_runtime_manifests_loaded(
             app,
@@ -847,17 +853,19 @@ async fn run_loop(
         }
         maybe_auto_route_agent(app, &*agent_manifests, &question);
 
-        announce_mcp_loading_if_needed(&mcp_probe, mcp_initialized, &mut mcp_loading_announced);
+        if !one_shot_mode {
+            announce_mcp_loading_if_needed(&mcp_probe, mcp_initialized, &mut mcp_loading_announced);
 
-        try_finalize_mcp_preload(
-            app,
-            mcp_client,
-            &mcp_probe,
-            &mut mcp_initialized,
-            &mut mcp_loading_announced,
-            &mut mcp_preload_task,
-        )
-        .await;
+            try_finalize_mcp_preload(
+                app,
+                mcp_client,
+                &mcp_probe,
+                &mut mcp_initialized,
+                &mut mcp_loading_announced,
+                &mut mcp_preload_task,
+            )
+            .await;
+        }
 
         let precomputed_ocr = if !app.attached_image_files.is_empty()
             && !crate::ai::models::is_vl_model(&app.current_model)
@@ -1035,7 +1043,7 @@ async fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{has_pending_foreground_process, maybe_auto_route_agent, read_recent_history};
+    use super::{has_pending_foreground_process, maybe_auto_route_agent, read_recent_history, should_preload_mcp};
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::history::{Message, append_history_messages};
     use crate::ai::cli::ParsedCli;
@@ -1110,6 +1118,18 @@ mod tests {
             agent_reload_counter: None,
             observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
         }
+    }
+
+    #[test]
+    fn one_shot_mode_does_not_start_background_mcp_preload() {
+        let probe = super::McpConfigProbe {
+            config_path: "/tmp/mcp.json".to_string(),
+            exists: true,
+            server_count: 1,
+        };
+
+        assert!(!should_preload_mcp(true, &probe));
+        assert!(should_preload_mcp(false, &probe));
     }
 
     #[test]

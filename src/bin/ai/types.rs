@@ -266,6 +266,7 @@ pub(super) struct StreamResult {
     pub(super) tool_calls: Vec<ToolCall>,
     pub(super) assistant_text: String,
     pub(super) hidden_meta: String,
+    pub(super) skip_response_drain: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
