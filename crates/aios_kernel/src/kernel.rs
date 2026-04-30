@@ -12,7 +12,7 @@
 use std::{
     collections::VecDeque,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use crate::types::{FastMap, FastSet};
@@ -368,9 +368,19 @@ where
     Arc::new(Mutex::new(Box::new(kernel)))
 }
 
-// Task-local storage for the current process ID.
-// Used by spawn_process() to scope async blocks to specific processes.
-// This allows the turn runtime to know which process is currently executing.
-tokio::task_local! {
-    pub static TASK_PID: Option<u64>;
+/// Runtime hook used to resolve the current async task's PID.
+///
+/// `aios_kernel` intentionally avoids committing to a specific async runtime.
+/// Upper layers may register a provider backed by task-local state (for example,
+/// `tokio::task_local!`) so `current_process_id()` keeps working across `.await`.
+pub type CurrentPidProvider = fn() -> Option<u64>;
+
+static CURRENT_PID_PROVIDER: OnceLock<CurrentPidProvider> = OnceLock::new();
+
+pub fn register_current_pid_provider(provider: CurrentPidProvider) {
+    let _ = CURRENT_PID_PROVIDER.set(provider);
+}
+
+pub fn current_task_pid() -> Option<u64> {
+    CURRENT_PID_PROVIDER.get().and_then(|provider| provider())
 }

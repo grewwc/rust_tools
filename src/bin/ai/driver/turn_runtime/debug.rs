@@ -13,8 +13,7 @@ fn mirror_to_aios_trace(
     msg: &str,
     data: &Value,
 ) {
-    use aios_kernel::primitives::TraceLevel;
-    use rust_tools::commonw::FastMap;
+    use aios_kernel::{FastMap, primitives::TraceLevel};
 
     let g = match crate::ai::tools::os_tools::GLOBAL_OS.lock() {
         Ok(g) => g,

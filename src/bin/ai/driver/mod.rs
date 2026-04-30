@@ -76,6 +76,14 @@ pub use skill_matching::*;
 pub use skill_ranking::*;
 pub use text_similarity::*;
 
+tokio::task_local! {
+    static TASK_PID: Option<u64>;
+}
+
+fn current_task_pid() -> Option<u64> {
+    TASK_PID.try_with(|v| *v).unwrap_or(None)
+}
+
 pub(crate) fn new_local_kernel() -> aios_kernel::kernel::SharedKernel {
     aios_kernel::kernel::new_shared_kernel(aios_kernel::local::LocalOS::new())
 }
@@ -362,6 +370,8 @@ async fn try_finalize_mcp_preload(
 ///   9. Load and activate agents
 ///   10. Enter run_loop
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    aios_kernel::kernel::register_current_pid_provider(current_task_pid);
+
     let cli = cli::parse_cli_args(std::env::args());
     let config = config::load_config()?;
     let session_store = SessionStore::new(config.history_file.as_path());
@@ -673,7 +683,7 @@ async fn run_loop(
                 }
                 let next_model = model_override.unwrap_or_else(|| app.current_model.clone());
 
-                tokio::spawn(aios_kernel::kernel::TASK_PID.scope(Some(pid), async move {
+                tokio::spawn(TASK_PID.scope(Some(pid), async move {
                     crate::ai::tools::registry::common::clear_tool_cancel();
                     let result = turn_runtime::run_turn(
                         &mut task_app,
@@ -851,7 +861,7 @@ async fn run_loop(
             os.current_process_id()
         };
 
-        let turn_outcome = aios_kernel::kernel::TASK_PID
+        let turn_outcome = TASK_PID
             .scope(
                 fg_pid,
                 turn_runtime::run_turn(

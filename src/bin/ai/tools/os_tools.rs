@@ -4,8 +4,6 @@ use crate::ai::tools::registry::common::{ToolRegistration, ToolSpec};
 use std::sync::Mutex;
 use aios_kernel::kernel::{ProcessCapabilities, SharedKernel};
 use aios_kernel::primitives::{ChannelMetaSnapshot, ChannelOwnerTag};
-use rust_tools::commonw::FastSet;
-
 pub static GLOBAL_OS: LazyLock<Mutex<Option<SharedKernel>>> = LazyLock::new(|| Mutex::new(None));
 
 pub fn init_os_tools_globals(os: SharedKernel) {
@@ -94,7 +92,7 @@ fn execute_spawn_process(args: &Value) -> Result<String, String> {
     let capabilities = parse_capabilities(args);
 
     let allowed_tools = if let Some(tools_array) = args.get("allowed_tools").and_then(Value::as_array) {
-        let mut set = FastSet::default();
+        let mut set = aios_kernel::FastSet::default();
         for tool in tools_array {
             if let Some(tool_name) = tool.as_str() {
                 set.insert(tool_name.to_string());

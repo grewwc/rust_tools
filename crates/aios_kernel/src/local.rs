@@ -701,10 +701,7 @@ impl Syscall for LocalOS {
     }
 
     fn current_process_id(&self) -> Option<u64> {
-        crate::kernel::TASK_PID
-            .try_with(|v| *v)
-            .unwrap_or(None)
-            .or(self.current_pid)
+        crate::kernel::current_task_pid().or(self.current_pid)
     }
 
     fn get_process(&self, pid: u64) -> Option<&Process> {
@@ -1844,7 +1841,7 @@ impl LlmOps for LocalOS {
         // 2) trace: record the accounting event (best-effort; never fails)
         {
             use crate::types::FastMap;
-            let mut fields: FastMap<String, String> = FastMap::default();
+            let mut fields: FastMap<String, String> = FastMap::with_capacity(6);
             fields.insert("model".to_string(), report.model.clone());
             fields.insert("prompt_tokens".to_string(), report.prompt_tokens.to_string());
             fields.insert(
@@ -1928,7 +1925,7 @@ impl LocalOS {
         verdict: Option<&RlimitVerdict>,
     ) {
         use crate::types::FastMap;
-        let mut fields: FastMap<String, String> = FastMap::default();
+        let mut fields: FastMap<String, String> = FastMap::with_capacity(3);
         fields.insert("path".to_string(), path.display().to_string());
         fields.insert("bytes".to_string(), bytes.to_string());
         if let Some(v) = verdict {
@@ -2052,7 +2049,7 @@ impl LocalOS {
         err: Option<&str>,
     ) {
         use crate::types::FastMap;
-        let mut fields: FastMap<String, String> = FastMap::default();
+        let mut fields: FastMap<String, String> = FastMap::with_capacity(4);
         fields.insert("handle".to_string(), handle.raw().to_string());
         fields.insert("label".to_string(), label.to_string());
         fields.insert("kind".to_string(), kind.as_str().to_string());
@@ -2119,7 +2116,7 @@ impl LocalOS {
         depth: usize,
     ) {
         use crate::types::FastMap;
-        let mut fields: FastMap<String, String> = FastMap::default();
+        let mut fields: FastMap<String, String> = FastMap::with_capacity(3);
         fields.insert("channel".to_string(), channel.raw().to_string());
         fields.insert("label".to_string(), label.to_string());
         fields.insert("depth".to_string(), depth.to_string());
@@ -2617,6 +2614,9 @@ impl Kernel for LocalOS {}
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::{LocalOS, ShmReadError};
     use crate::kernel::{
         EventId, KernelInternal, ProcessCapabilities, ProcessState, Signal, Syscall, WaitPolicy,
@@ -3670,8 +3670,15 @@ mod tests {
     // ---- VfsOps (Phase 3) ----
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
+        static NEXT_TMP_ID: AtomicU64 = AtomicU64::new(1);
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let seq = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("aios_vfs_{}_{}", name, uuid::Uuid::new_v4()));
+        p.push(format!("aios_vfs_{}_{}_{}_{}", name, std::process::id(), nanos, seq));
         p
     }
 
