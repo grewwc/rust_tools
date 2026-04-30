@@ -146,6 +146,66 @@ impl LocalOS {
         }
     }
 
+    fn remove_process_entry_raw(&mut self, pid: u64) -> bool {
+        if self.processes.remove(&pid).is_none() {
+            return false;
+        }
+        self.ready_queue.retain(|queued_pid| *queued_pid != pid);
+        self.wait_queue.remove(&pid);
+
+        let orphaned_children: Vec<u64> = self
+            .processes
+            .iter()
+            .filter_map(|(child_pid, proc)| (proc.parent_pid == Some(pid)).then_some(*child_pid))
+            .collect();
+        let mut terminated_children = Vec::new();
+        for child_pid in orphaned_children {
+            if let Some(child) = self.processes.get_mut(&child_pid) {
+                if child.state == ProcessState::Terminated {
+                    terminated_children.push(child_pid);
+                } else {
+                    child.parent_pid = None;
+                    child.mailbox.push_back(format!(
+                        "Parent process {} exited; this process is now orphaned.",
+                        pid
+                    ));
+                }
+            }
+        }
+        for child_pid in terminated_children {
+            self.remove_process_entry_raw(child_pid);
+        }
+        true
+    }
+
+    fn cleanup_unreapable_zombies(&mut self) {
+        loop {
+            let zombies: Vec<u64> = self
+                .processes
+                .iter()
+                .filter_map(|(pid, proc)| {
+                    (proc.state == ProcessState::Terminated
+                        && proc.parent_pid.is_some_and(|parent| !self.processes.contains_key(&parent)))
+                    .then_some(*pid)
+                })
+                .collect();
+            if zombies.is_empty() {
+                break;
+            }
+            for pid in zombies {
+                self.remove_process_entry_raw(pid);
+            }
+        }
+    }
+
+    fn remove_process_entry(&mut self, pid: u64) -> bool {
+        let removed = self.remove_process_entry_raw(pid);
+        if removed {
+            self.cleanup_unreapable_zombies();
+        }
+        removed
+    }
+
     fn sort_ready_queue(&mut self) {
         let mut pids: Vec<u64> = self.ready_queue.drain(..).collect();
         pids.sort_by_key(|&pid| self.processes.get(&pid).map(|p| p.priority).unwrap_or(255));
@@ -767,9 +827,7 @@ impl Syscall for LocalOS {
             return Err(format!("Process {} is not terminated yet.", target_pid));
         }
         let result = proc.result.clone().unwrap_or_default();
-        self.processes.remove(&target_pid);
-        self.ready_queue.retain(|pid| *pid != target_pid);
-        self.wait_queue.remove(&target_pid);
+        self.remove_process_entry(target_pid);
         Ok(result)
     }
 
@@ -1138,10 +1196,7 @@ impl KernelInternal for LocalOS {
         ) {
             return false;
         }
-        self.processes.remove(&target_pid);
-        self.ready_queue.retain(|pid| *pid != target_pid);
-        self.wait_queue.remove(&target_pid);
-        true
+        self.remove_process_entry(target_pid)
     }
 
     fn advance_tick(&mut self) {
@@ -2813,6 +2868,44 @@ mod tests {
         let result = os.reap_process(child).unwrap();
         assert!(result.contains("no longer needed"));
         assert!(os.get_process(child).is_none());
+    }
+
+    #[test]
+    fn removing_parent_reparents_live_children_and_collects_unreapable_zombies() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+        let live_child = os
+            .spawn(
+                Some(root),
+                "live".to_string(),
+                "live goal".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let dead_child = os
+            .spawn(
+                Some(root),
+                "dead".to_string(),
+                "dead goal".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+
+        os.set_current_pid(Some(root));
+        os.kill_process(dead_child, "done".to_string()).unwrap();
+        os.terminate_pid(root, "root exited".to_string());
+        assert!(os.drop_terminated(root));
+
+        let live_proc = os.get_process(live_child).unwrap();
+        assert_eq!(live_proc.parent_pid, None);
+        assert!(live_proc.mailbox.iter().any(|msg| msg.contains("now orphaned")));
+        assert!(os.get_process(dead_child).is_none());
     }
 
     #[test]

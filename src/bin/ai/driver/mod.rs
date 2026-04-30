@@ -88,6 +88,15 @@ pub(crate) fn new_local_kernel() -> aios_kernel::kernel::SharedKernel {
     aios_kernel::kernel::new_shared_kernel(aios_kernel::local::LocalOS::new())
 }
 
+fn should_auto_drop_terminated(
+    os: &dyn aios_kernel::kernel::Syscall,
+    pid: u64,
+) -> bool {
+    os.get_process(pid)
+        .map(|proc| proc.parent_pid.is_none())
+        .unwrap_or(false)
+}
+
 /// Default max LLM iterations allowed per turn (prevents infinite loops)
 const DEFAULT_MAX_ITERATIONS: usize = 1024;
 
@@ -747,7 +756,9 @@ async fn run_loop(
                                 os.cleanup_process_resources(pid);
                                 os.set_current_pid(Some(pid));
                                 os.terminate_current(termination_result);
-                                os.drop_terminated(pid);
+                                if should_auto_drop_terminated(os.as_ref(), pid) {
+                                    os.drop_terminated(pid);
+                                }
                             } else if os.is_round_robin() {
                                 os.set_current_pid(Some(pid));
                                 os.requeue_current();
@@ -757,7 +768,9 @@ async fn run_loop(
                             os.cleanup_process_resources(pid);
                             os.set_current_pid(Some(pid));
                             os.terminate_current(format!("Failed: {}", err));
-                            os.drop_terminated(pid);
+                            if should_auto_drop_terminated(os.as_ref(), pid) {
+                                os.drop_terminated(pid);
+                            }
                         }
                     }
                 }));
@@ -910,7 +923,9 @@ async fn run_loop(
                     if let Some(pid) = current_pid {
                         os.cleanup_process_resources(pid);
                         os.terminate_current(termination_result);
-                        os.drop_terminated(pid);
+                        if should_auto_drop_terminated(os.as_ref(), pid) {
+                            os.drop_terminated(pid);
+                        }
                     }
                 }
 
@@ -939,7 +954,9 @@ async fn run_loop(
                 }
                 os.terminate_current(format!("Failed: {}", err));
                 if let Some(pid) = current_pid {
-                    os.drop_terminated(pid);
+                    if should_auto_drop_terminated(os.as_ref(), pid) {
+                        os.drop_terminated(pid);
+                    }
                 }
                 app.session_history_file = original_history_file;
                 app.writer = original_writer;
