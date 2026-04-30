@@ -92,7 +92,7 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
                     continue;
                 }
                 println!("Exit.");
-                app.shutdown.store(true, Ordering::Relaxed);
+                crate::ai::driver::signal::request_shutdown(app.shutdown.as_ref());
                 return Ok(None);
             }
             Err(_) if app.shutdown.load(Ordering::Relaxed) => {
@@ -103,7 +103,7 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
     };
     let Some(question) = question else {
         app.ignore_next_prompt_interrupt = false;
-        app.shutdown.store(true, Ordering::Relaxed);
+        crate::ai::driver::signal::request_shutdown(app.shutdown.as_ref());
         return Ok(None);
     };
     let (question, overrides) = parse_loop_overrides(&question);

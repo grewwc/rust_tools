@@ -240,7 +240,16 @@ pub(super) struct McpPromptArgument {
 }
 
 pub(super) fn take_stream_cancelled(app: &App) -> bool {
-    app.cancel_stream.swap(false, Ordering::Relaxed)
+    let cancelled = app.cancel_stream.swap(false, Ordering::Relaxed);
+    if cancelled {
+        crate::ai::driver::signal::clear_request_interrupt();
+    }
+    cancelled
+}
+
+pub(super) fn clear_stream_cancel(app: &App) {
+    app.cancel_stream.store(false, Ordering::Relaxed);
+    crate::ai::driver::signal::clear_request_interrupt();
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

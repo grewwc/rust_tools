@@ -91,34 +91,38 @@ fn maybe_spawn_critic_revise_background(
     // 登记 daemon：critic/revise 是典型的后台反思类。
     use aios_kernel::primitives::DaemonKind;
     let kernel = app.os.clone();
-    let (handle, cancel_token) = {
+    let (handle, cancel_token, interrupt_futex) = {
         let mut os = match kernel.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         let parent_pid = os.current_process_id();
-        os.daemon_register(
+        let (handle, cancel_token) = os.daemon_register(
             "critic_revise_background".to_string(),
             DaemonKind::Reflection,
             parent_pid,
-        )
+        );
+        let interrupt_futex =
+            crate::ai::driver::signal::alloc_interrupt_futex("critic_revise_interrupt");
+        (handle, cancel_token, interrupt_futex)
     };
 
     tokio::spawn(async move {
-        if cancel_token.is_cancelled() {
-            let mut os = match kernel.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            os.daemon_exit(handle, None);
-            return;
+        tokio::select! {
+            _ = crate::ai::driver::signal::wait_for_interrupt_sources(
+                Some(cancel_token.clone()),
+                interrupt_futex,
+            ) => {}
+            _ = super::super::reflection::run_critic_revise_background(path, model_bg, q_bg, a_bg) => {}
         }
-        super::super::reflection::run_critic_revise_background(path, model_bg, q_bg, a_bg).await;
         let mut os = match kernel.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         os.daemon_exit(handle, None);
+        if let Some(addr) = interrupt_futex {
+            crate::ai::driver::signal::destroy_interrupt_futex(addr);
+        }
     });
 }
 

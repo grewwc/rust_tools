@@ -469,18 +469,18 @@ fn retry_delay(attempt: usize) -> Duration {
 fn should_abort_retry_wait(app: &App) -> bool {
     app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
         || app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed)
+        || crate::ai::driver::signal::request_interrupt_ready()
 }
 
 async fn sleep_with_cancel(app: &App, delay: Duration) -> bool {
-    let started_at = std::time::Instant::now();
-    while started_at.elapsed() < delay {
-        if should_abort_retry_wait(app) {
-            return true;
-        }
-        let remaining = delay.saturating_sub(started_at.elapsed());
-        tokio::time::sleep(remaining.min(Duration::from_millis(50))).await;
+    if should_abort_retry_wait(app) {
+        return true;
     }
-    should_abort_retry_wait(app)
+
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => should_abort_retry_wait(app),
+        _ = crate::ai::driver::signal::wait_for_interrupt_sources(None, None) => true,
+    }
 }
 
 fn control_model_for_aux_tasks(app: &App) -> String {
@@ -1683,6 +1683,49 @@ pub(crate) fn charge_llm_usage_to_kernel(
 mod tests {
     use super::*;
     use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
+    use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
+    use crate::ai::{cli::ParsedCli, types::AppConfig};
+    use std::path::PathBuf;
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    fn test_app() -> App {
+        App {
+            cli: ParsedCli::default(),
+            config: AppConfig {
+                api_key: String::new(),
+                history_file: PathBuf::new(),
+                endpoint: String::new(),
+                vl_default_model: String::new(),
+                history_max_chars: 0,
+                history_keep_last: 0,
+                history_summary_max_chars: 0,
+                intent_model: None,
+                intent_model_path: PathBuf::new(),
+                agent_route_model_path: PathBuf::new(),
+                skill_match_model_path: PathBuf::new(),
+            },
+            session_id: String::new(),
+            session_history_file: PathBuf::new(),
+            client: reqwest::Client::builder().build().unwrap(),
+            current_model: String::new(),
+            current_agent: String::new(),
+            current_agent_manifest: None,
+            pending_files: None,
+            pending_short_output: false,
+            attached_image_files: Vec::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            streaming: Arc::new(AtomicBool::new(false)),
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            ignore_next_prompt_interrupt: false,
+            writer: None,
+            prompt_editor: None,
+            agent_context: None,
+            last_skill_bias: None,
+            os: crate::ai::driver::new_local_kernel(),
+            agent_reload_counter: None,
+            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
+        }
+    }
 
     #[test]
     fn test_parse_thinking_gate_output_bool() {
@@ -1730,6 +1773,29 @@ mod tests {
         let intent = UserIntent::new(CoreIntent::RequestAction);
         let decision = local_thinking_decision("帮我写个函数", &intent);
         assert_eq!(decision, None);
+    }
+
+    #[tokio::test]
+    async fn sleep_with_cancel_observes_request_interrupt_source() {
+        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let app = test_app();
+        init_os_tools_globals(app.os.clone());
+        crate::ai::driver::signal::clear_request_interrupt();
+
+        let waiter = tokio::spawn(async move { sleep_with_cancel(&app, Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        crate::ai::driver::signal::signal_request_interrupt();
+
+        let cancelled = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("retry wait should wake on interrupt")
+            .expect("waiter should complete");
+        assert!(cancelled);
+
+        crate::ai::driver::signal::clear_request_interrupt();
+        if let Ok(mut guard) = GLOBAL_OS.lock() {
+            *guard = None;
+        }
     }
 
     #[test]

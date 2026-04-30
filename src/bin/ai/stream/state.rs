@@ -104,6 +104,7 @@ pub(super) struct TerminalDedupeState {
 pub(super) struct StreamContentState {
     pub(super) thinking_open: bool,
     pub(super) empty_choice_chunks: usize,
+    pub(super) finish_reason_seen: bool,
     pub(super) saw_reasoning_output: bool,
     pub(super) tool_calls_map: FastMap<usize, ToolCallBuilder>,
     pub(super) assistant_text: String,
@@ -117,6 +118,7 @@ impl StreamContentState {
         Self {
             thinking_open: false,
             empty_choice_chunks: 0,
+            finish_reason_seen: false,
             saw_reasoning_output: false,
             tool_calls_map: FastMap::default(),
             assistant_text: String::new(),

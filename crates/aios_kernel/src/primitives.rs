@@ -63,18 +63,16 @@ pub(super) struct FutexState {
     pub(super) waiters: VecDeque<u64>,
     /// 每次 wake 自增，wait 可通过比对前后 seq 判断"是否被唤醒过"。
     pub(super) seq: u64,
-    pub(super) owner_pid: Option<u64>,
-    pub(super) label: String,
+    pub(super) event_id: crate::kernel::EventId,
 }
 
 impl FutexState {
-    pub(super) fn new(initial: u64, owner_pid: Option<u64>, label: String) -> Self {
+    pub(super) fn new(initial: u64, event_id: crate::kernel::EventId) -> Self {
         Self {
             value: AtomicU64::new(initial),
             waiters: VecDeque::new(),
             seq: 0,
-            owner_pid,
-            label,
+            event_id,
         }
     }
 }
@@ -88,13 +86,13 @@ pub trait FutexOps {
     fn futex_load(&self, addr: FutexAddr) -> Option<u64>;
 
     /// CAS 更新。返回 Ok(旧值) 成功，Err(当前值) 失败。
-    fn futex_cas(&self, addr: FutexAddr, expected: u64, new_value: u64) -> Result<u64, u64>;
+    fn futex_cas(&mut self, addr: FutexAddr, expected: u64, new_value: u64) -> Result<u64, u64>;
 
     /// 原子加 delta，返回旧值。
-    fn futex_fetch_add(&self, addr: FutexAddr, delta: u64) -> Option<u64>;
+    fn futex_fetch_add(&mut self, addr: FutexAddr, delta: u64) -> Option<u64>;
 
     /// 存储新值，返回旧值。
-    fn futex_store(&self, addr: FutexAddr, new_value: u64) -> Option<u64>;
+    fn futex_store(&mut self, addr: FutexAddr, new_value: u64) -> Option<u64>;
 
     /// 非阻塞检测：若 value != expected 立即返回 ValueChanged；若相等返回 None 表示需要外部等待。
     /// 返回 Some(reason) 时表示无需再阻塞。
@@ -115,6 +113,9 @@ pub trait FutexOps {
 
     /// 读当前 seq，用于 wait 的 "are we woken since seq0" 语义。
     fn futex_seq(&self, addr: FutexAddr) -> Option<u64>;
+
+    /// 读当前 futex 关联的内核事件 ID，供多路复用等待统一降到 event 集合。
+    fn futex_event_id(&self, addr: FutexAddr) -> Option<crate::kernel::EventId>;
 }
 
 // --------------------------------------------------------------------------
@@ -146,9 +147,22 @@ pub struct TraceRecord {
     pub parent_span_id: Option<u64>,
     /// 事件种类：span_enter / span_exit / event。
     pub kind: TraceKind,
-    /// 结构化字段（key -> json-like 字符串）。
-    pub fields: FastMap<String, String>,
+    /// 结构化字段（key -> json-like 字符串）。`None` 表示无字段，避免空 HashMap
+    /// 在每条记录上多占一个 raw_table 头。访问时建议使用 [`TraceRecord::fields`]。
+    pub fields: Option<FastMap<String, String>>,
     pub message: Option<String>,
+}
+
+impl TraceRecord {
+    /// 取 fields 的引用；空字段统一返回 `None`，调用方可用 `.unwrap_or(&EMPTY)` 简化。
+    pub fn fields(&self) -> Option<&FastMap<String, String>> {
+        self.fields.as_ref()
+    }
+
+    /// 把可能为空的 fields HashMap 装箱为存储形态：空集合归 None。
+    pub(super) fn pack_fields(fields: FastMap<String, String>) -> Option<FastMap<String, String>> {
+        if fields.is_empty() { None } else { Some(fields) }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,11 +258,7 @@ pub fn fields() -> FastMap<String, String> {
 }
 
 #[doc(hidden)]
-pub fn _field_insert<V: std::fmt::Display>(
-    map: &mut FastMap<String, String>,
-    key: &str,
-    value: V,
-) {
+pub fn _field_insert<V: std::fmt::Display>(map: &mut FastMap<String, String>, key: &str, value: V) {
     map.insert(key.to_string(), value.to_string());
 }
 
@@ -348,7 +358,11 @@ pub enum RlimitVerdict {
     /// 未越界。
     Ok,
     /// 越界，并指出具体维度。
-    Exceeded { dimension: RlimitDim, used: u64, limit: u64 },
+    Exceeded {
+        dimension: RlimitDim,
+        used: u64,
+        limit: u64,
+    },
     /// 进程不存在。
     NoSuchProcess,
 }
@@ -418,7 +432,10 @@ pub struct LlmModelPrice {
 
 impl LlmModelPrice {
     pub const fn zero() -> Self {
-        Self { prompt_per_1k_micros: 0, completion_per_1k_micros: 0 }
+        Self {
+            prompt_per_1k_micros: 0,
+            completion_per_1k_micros: 0,
+        }
     }
 }
 
@@ -479,7 +496,11 @@ pub enum VfsError {
     /// 文件/目录不存在。
     NotFound(String),
     /// 读写字节数超过 rlimit.max_fs_bytes（verdict 为 Exceeded）。
-    QuotaExceeded { dimension: RlimitDim, used: u64, limit: u64 },
+    QuotaExceeded {
+        dimension: RlimitDim,
+        used: u64,
+        limit: u64,
+    },
     /// 底层 I/O 失败（保留原 message）。
     Io(String),
 }
@@ -489,8 +510,16 @@ impl std::fmt::Display for VfsError {
         match self {
             VfsError::PermissionDenied(p) => write!(f, "Access blocked: sensitive path ({})", p),
             VfsError::NotFound(p) => write!(f, "File not found: {}", p),
-            VfsError::QuotaExceeded { dimension, used, limit } => {
-                write!(f, "VFS quota exceeded ({:?}): {}/{}", dimension, used, limit)
+            VfsError::QuotaExceeded {
+                dimension,
+                used,
+                limit,
+            } => {
+                write!(
+                    f,
+                    "VFS quota exceeded ({:?}): {}/{}",
+                    dimension, used, limit
+                )
             }
             VfsError::Io(e) => write!(f, "{}", e),
         }
@@ -834,9 +863,150 @@ pub trait IpcOps {
     fn channel_gc_closed_empty(&mut self) -> usize;
 
     /// 关闭 channel。关闭后不再允许 send，但剩余队列仍可被 recv/peek。
-    fn channel_close(
+    fn channel_close(&mut self, closer_pid: Option<u64>, channel: ChannelId) -> Result<(), String>;
+}
+
+// --------------------------------------------------------------------------
+// Epoll —— 内核态事件多路复用（Phase 6）
+// --------------------------------------------------------------------------
+// 设计说明：
+//   - 现有 wait_on_events 适合一次性等待一组 EventId，但 agent runtime 缺少一个
+//     可复用的“兴趣集”对象：注册多个源，反复 wait，像 epoll 一样只返回 ready 子集。
+//   - 这里的 epoll 不绑定宿主 OS fd，而是绑定 AIOS 内部可轮询源：
+//       1) 原始 EventId
+//       2) Channel 可读/关闭状态
+//       3) Futex 的“值不再等于 expected”或“seq 被 wake 推进”
+//   - 实现仍是同步内核态对象；真正 async 阻塞继续通过 wait_on_events 完成，
+//     因此不需要 tokio，也不依赖第三方库。
+
+/// epoll 实例 ID（不可伪造）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EpollId(pub u64);
+
+impl EpollId {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for EpollId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "epoll_{}", self.0)
+    }
+}
+
+/// epoll 关注的事件位。保持极小集合即可满足当前 agent 协调需求。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct EpollEventMask(pub u32);
+
+impl EpollEventMask {
+    pub const EMPTY: Self = Self(0);
+    pub const IN: Self = Self(1 << 0);
+    pub const HUP: Self = Self(1 << 1);
+    pub const ERR: Self = Self(1 << 2);
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    pub const fn intersects(self, other: Self) -> bool {
+        (self.0 & other.0) != 0
+    }
+}
+
+impl std::ops::BitOr for EpollEventMask {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for EpollEventMask {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl std::ops::BitAnd for EpollEventMask {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self::Output {
+        Self(self.0 & rhs.0)
+    }
+}
+
+/// epoll 可关注的源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EpollSource {
+    Event(crate::kernel::EventId),
+    Channel(ChannelId),
+    Futex { addr: FutexAddr, expected: u64 },
+}
+
+/// 一条 epoll 注册项的快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpollRegistrationSnapshot {
+    pub source: EpollSource,
+    pub events: EpollEventMask,
+    pub user_data: u64,
+}
+
+/// 一条 ready 结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpollReadyEvent {
+    pub source: EpollSource,
+    pub events: EpollEventMask,
+    pub user_data: u64,
+}
+
+/// epoll wait 的返回值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpollWaitResult {
+    Ready(Vec<EpollReadyEvent>),
+    Suspended { timeout_tick: Option<u64> },
+}
+
+/// epoll 元数据快照。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpollSnapshot {
+    pub epoll: EpollId,
+    pub label: String,
+    pub registrations: Vec<EpollRegistrationSnapshot>,
+}
+
+/// epoll 相关 syscall。
+pub trait EpollOps {
+    fn epoll_create(&mut self, label: String) -> EpollId;
+    fn epoll_ctl_add(
         &mut self,
-        closer_pid: Option<u64>,
-        channel: ChannelId,
+        epoll: EpollId,
+        source: EpollSource,
+        events: EpollEventMask,
+        user_data: u64,
     ) -> Result<(), String>;
+    fn epoll_ctl_mod(
+        &mut self,
+        epoll: EpollId,
+        source: EpollSource,
+        events: EpollEventMask,
+        user_data: u64,
+    ) -> Result<(), String>;
+    fn epoll_ctl_del(&mut self, epoll: EpollId, source: EpollSource) -> Result<(), String>;
+    fn epoll_wait(
+        &mut self,
+        epoll: EpollId,
+        max_events: usize,
+        timeout_ticks: Option<u64>,
+    ) -> Result<EpollWaitResult, String>;
+    fn epoll_snapshot(&self, epoll: EpollId) -> Option<EpollSnapshot>;
+    fn epoll_destroy(&mut self, epoll: EpollId) -> bool;
 }

@@ -1,6 +1,6 @@
 use colored::Colorize;
 use serde_json::Value;
-use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
 use crate::ai::{
@@ -172,12 +172,34 @@ fn request_interrupt_pending(shutdown: &AtomicBool, cancel_stream: &AtomicBool) 
         || cancel_stream.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-async fn wait_for_request_interrupt(shutdown: &AtomicBool, cancel_stream: &AtomicBool) {
-    loop {
-        if request_interrupt_pending(shutdown, cancel_stream) {
-            return;
+fn request_interrupt_futex_ready() -> bool {
+    crate::ai::driver::signal::request_interrupt_ready()
+}
+
+async fn wait_for_request_interrupt(shutdown: Arc<AtomicBool>, cancel_stream: Arc<AtomicBool>) {
+    if request_interrupt_pending(shutdown.as_ref(), cancel_stream.as_ref())
+        || request_interrupt_futex_ready()
+    {
+        return;
+    }
+
+    if crate::ai::driver::signal::request_interrupt_futex().is_some() {
+        let _ = tokio::task::spawn_blocking(move || loop {
+            if request_interrupt_pending(shutdown.as_ref(), cancel_stream.as_ref())
+                || request_interrupt_futex_ready()
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        })
+        .await;
+    } else {
+        loop {
+            if request_interrupt_pending(shutdown.as_ref(), cancel_stream.as_ref()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -283,7 +305,6 @@ async fn stream_model_response(
     let stream_result = match stream_ok {
         Some(result) => result,
         None => {
-            let _ = drain_response(response).await;
             StreamResult {
                 outcome: StreamOutcome::Completed,
                 tool_calls: Vec::new(),
@@ -324,7 +345,15 @@ async fn finalize_stream_interaction(
         ));
     }
 
-    drain_response(response).await?;
+    // Some providers keep HTTP connections alive even after emitting stream-done
+    // markers, so draining to EOF can block indefinitely and hang the turn.
+    match tokio::time::timeout(Duration::from_millis(200), drain_response(response)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => return Err(err),
+        Err(_) => {
+            eprintln!("[Warning] 响应流收尾 drain 超时，已跳过剩余字节读取以避免会话卡住。");
+        }
+    }
     app.streaming
         .store(false, std::sync::atomic::Ordering::Relaxed);
 
@@ -360,7 +389,7 @@ pub(super) async fn execute_turn_iteration(
             force_final_response,
             iteration,
         ) => response,
-        _ = wait_for_request_interrupt(shutdown.as_ref(), cancel_stream.as_ref()) => {
+        _ = wait_for_request_interrupt(shutdown.clone(), cancel_stream.clone()) => {
             return Ok(interrupted_iteration_execution(
                 app,
                 one_shot_mode,

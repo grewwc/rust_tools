@@ -1,6 +1,6 @@
 use crate::ai::{
     provider::ApiProvider,
-    request::{StreamChoice, StreamChunk, StreamDelta},
+    request::{StreamChoice, StreamChunk, StreamDelta, StreamFunctionCall, StreamToolCall},
 };
 
 use super::state::ParsedStreamPayload;
@@ -68,6 +68,18 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     }
 
     let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    if let Some(parsed) = parse_function_call_arguments_event(event_type.as_str(), &value) {
+        return Some(parsed);
+    }
+    if let Some(parsed) = parse_output_item_event(event_type.as_str(), &value) {
+        return Some(parsed);
+    }
+    if let Some(parsed) = parse_content_part_event(event_type.as_str(), &value) {
+        return Some(parsed);
+    }
+    if let Some(parsed) = parse_refusal_event(event_type.as_str(), &value) {
+        return Some(parsed);
+    }
     if event_type.contains("reasoning")
         && (event_type.ends_with(".delta") || event_type.ends_with(".done"))
     {
@@ -97,12 +109,104 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     None
 }
 
+fn parse_function_call_arguments_event(
+    event_type: &str,
+    value: &serde_json::Value,
+) -> Option<ParsedStreamPayload> {
+    if !event_type.contains("function_call_arguments")
+        || !(event_type.ends_with(".delta") || event_type.ends_with(".done"))
+    {
+        return None;
+    }
+
+    let mut tool_call = extract_function_call_item(value, extract_output_index(value));
+    let arguments = extract_event_text(value, &["delta", "arguments", "text", "content"]);
+    if let Some(existing) = tool_call.as_mut() {
+        if !arguments.is_empty() {
+            existing.function.arguments = arguments;
+        }
+    } else if !arguments.is_empty() {
+        tool_call = Some(StreamToolCall {
+            index: extract_output_index(value),
+            id: extract_call_identifier(value),
+            tool_type: "function".to_string(),
+            function: StreamFunctionCall {
+                name: extract_function_name(value),
+                arguments,
+            },
+        });
+    }
+
+    tool_call.map(|tool_call| tool_call_event_chunk(event_type, tool_call))
+}
+
+fn parse_output_item_event(
+    event_type: &str,
+    value: &serde_json::Value,
+) -> Option<ParsedStreamPayload> {
+    if !(event_type == "response.output_item.added" || event_type == "response.output_item.done") {
+        return None;
+    }
+
+    let item = value.get("item").unwrap_or(value);
+    let item_type = item
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+
+    if item_type != "function_call" && item_type != "function" {
+        return Some(ParsedStreamPayload::Ignore);
+    }
+
+    let Some(tool_call) = extract_function_call_item(item, extract_output_index(value)) else {
+        return Some(ParsedStreamPayload::Ignore);
+    };
+    Some(tool_call_event_chunk(event_type, tool_call))
+}
+
+fn parse_content_part_event(
+    event_type: &str,
+    value: &serde_json::Value,
+) -> Option<ParsedStreamPayload> {
+    if !(event_type == "response.content_part.added" || event_type == "response.content_part.done") {
+        return None;
+    }
+
+    let part = value.get("part").unwrap_or(value);
+    let text = extract_event_text(part, &["delta", "text", "content"]);
+    if text.is_empty() {
+        return Some(ParsedStreamPayload::Ignore);
+    }
+    Some(textual_event_chunk(event_type, &text, ""))
+}
+
+fn parse_refusal_event(event_type: &str, value: &serde_json::Value) -> Option<ParsedStreamPayload> {
+    if !event_type.contains("refusal")
+        || !(event_type.ends_with(".delta") || event_type.ends_with(".done"))
+    {
+        return None;
+    }
+
+    let text = extract_event_text(value, &["delta", "text", "content", "refusal"]);
+    if text.is_empty() {
+        return Some(ParsedStreamPayload::Ignore);
+    }
+    Some(textual_event_chunk(event_type, &text, ""))
+}
+
 fn textual_event_chunk(
     event_type: &str,
     content: &str,
     reasoning_content: &str,
 ) -> ParsedStreamPayload {
-    let chunk = single_delta_chunk(content, reasoning_content);
+    let chunk = stream_chunk_with_delta(StreamDelta {
+        content: content.to_string(),
+        reasoning_content: reasoning_content.to_string(),
+        reasoning_details: String::new(),
+        tool_calls: Vec::new(),
+    });
     if event_type.ends_with(".done") {
         ParsedStreamPayload::SnapshotChunk(chunk)
     } else {
@@ -111,19 +215,109 @@ fn textual_event_chunk(
 }
 
 fn single_delta_chunk(content: &str, reasoning_content: &str) -> StreamChunk {
+    stream_chunk_with_delta(StreamDelta {
+        content: content.to_string(),
+        reasoning_content: reasoning_content.to_string(),
+        reasoning_details: String::new(),
+        tool_calls: Vec::new(),
+    })
+}
+
+fn tool_call_event_chunk(event_type: &str, tool_call: StreamToolCall) -> ParsedStreamPayload {
+    let chunk = stream_chunk_with_delta(StreamDelta {
+        content: String::new(),
+        reasoning_content: String::new(),
+        reasoning_details: String::new(),
+        tool_calls: vec![tool_call],
+    });
+    if event_type.ends_with(".done") {
+        ParsedStreamPayload::SnapshotChunk(chunk)
+    } else {
+        ParsedStreamPayload::Chunk(chunk)
+    }
+}
+
+fn stream_chunk_with_delta(delta: StreamDelta) -> StreamChunk {
     StreamChunk {
         choices: vec![StreamChoice {
-            delta: StreamDelta {
-                content: content.to_string(),
-                reasoning_content: reasoning_content.to_string(),
-                reasoning_details: String::new(),
-                tool_calls: Vec::new(),
-            },
+            delta,
             finish_reason: None,
         }],
         usage: None,
         model: String::new(),
     }
+}
+
+fn extract_output_index(value: &serde_json::Value) -> usize {
+    value.get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize
+}
+
+fn extract_function_call_item(
+    value: &serde_json::Value,
+    fallback_index: usize,
+) -> Option<StreamToolCall> {
+    let item_type = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if !item_type.is_empty() && item_type != "function_call" && item_type != "function" {
+        return None;
+    }
+
+    let name = extract_function_name(value);
+    let arguments = extract_stringish_field(value, &["arguments"]);
+    let id = extract_call_identifier(value);
+    if name.is_empty() && arguments.is_empty() && id.is_empty() {
+        return None;
+    }
+
+    Some(StreamToolCall {
+        index: fallback_index,
+        id,
+        tool_type: "function".to_string(),
+        function: StreamFunctionCall { name, arguments },
+    })
+}
+
+fn extract_call_identifier(value: &serde_json::Value) -> String {
+    for key in ["call_id", "id", "item_id"] {
+        let extracted = extract_stringish_field(value, &[key]);
+        if !extracted.is_empty() {
+            return extracted;
+        }
+    }
+    String::new()
+}
+
+fn extract_function_name(value: &serde_json::Value) -> String {
+    let direct = extract_stringish_field(value, &["name"]);
+    if !direct.is_empty() {
+        return direct;
+    }
+    value.get("function")
+        .map(|function| extract_stringish_field(function, &["name"]))
+        .unwrap_or_default()
+}
+
+fn extract_stringish_field(value: &serde_json::Value, keys: &[&str]) -> String {
+    for key in keys {
+        let Some(inner) = value.get(*key) else {
+            continue;
+        };
+        let extracted = match inner {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::String(text) => text.clone(),
+            other => serde_json::to_string(other).unwrap_or_default(),
+        };
+        if !extracted.is_empty() {
+            return extracted;
+        }
+    }
+    String::new()
 }
 
 fn extract_event_text(value: &serde_json::Value, preferred_keys: &[&str]) -> String {
@@ -298,6 +492,110 @@ mod tests {
                 assert_eq!(chunk.choices[0].delta.reasoning_content, "");
             }
             _ => panic!("expected snapshot content chunk"),
+        }
+    }
+
+    #[test]
+    fn function_call_arguments_delta_maps_to_tool_call_chunk() {
+        let payload = r#"{"output_index":2,"item_id":"fc_item_1","delta":"{\"path\":\"a"}"#;
+        match parse_stream_payload(
+            StreamProviderAdapterKind::OpenAi,
+            payload,
+            Some("response.function_call_arguments.delta"),
+        ) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                let tool_call = &chunk.choices[0].delta.tool_calls[0];
+                assert_eq!(tool_call.index, 2);
+                assert_eq!(tool_call.id, "fc_item_1");
+                assert_eq!(tool_call.tool_type, "function");
+                assert_eq!(tool_call.function.arguments, "{\"path\":\"a");
+            }
+            _ => panic!("expected tool-call delta chunk"),
+        }
+    }
+
+    #[test]
+    fn function_call_arguments_done_maps_to_snapshot_tool_call_chunk() {
+        let payload = r#"{"output_index":2,"arguments":"{\"path\":\"abc\"}"}"#;
+        match parse_stream_payload(
+            StreamProviderAdapterKind::OpenAi,
+            payload,
+            Some("response.function_call_arguments.done"),
+        ) {
+            ParsedStreamPayload::SnapshotChunk(chunk) => {
+                let tool_call = &chunk.choices[0].delta.tool_calls[0];
+                assert_eq!(tool_call.index, 2);
+                assert_eq!(tool_call.function.arguments, "{\"path\":\"abc\"}");
+            }
+            _ => panic!("expected tool-call snapshot chunk"),
+        }
+    }
+
+    #[test]
+    fn output_item_added_maps_function_call_metadata() {
+        let payload = r#"{"output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"write_file","arguments":""}}"#;
+        match parse_stream_payload(
+            StreamProviderAdapterKind::OpenAi,
+            payload,
+            Some("response.output_item.added"),
+        ) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                let tool_call = &chunk.choices[0].delta.tool_calls[0];
+                assert_eq!(tool_call.index, 1);
+                assert_eq!(tool_call.id, "call_1");
+                assert_eq!(tool_call.function.name, "write_file");
+                assert_eq!(tool_call.function.arguments, "");
+            }
+            _ => panic!("expected tool-call metadata chunk"),
+        }
+    }
+
+    #[test]
+    fn output_item_done_maps_final_function_call_snapshot() {
+        let payload = r#"{"output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"write_file","arguments":"{\"path\":\"a.rs\"}"}}"#;
+        match parse_stream_payload(
+            StreamProviderAdapterKind::OpenAi,
+            payload,
+            Some("response.output_item.done"),
+        ) {
+            ParsedStreamPayload::SnapshotChunk(chunk) => {
+                let tool_call = &chunk.choices[0].delta.tool_calls[0];
+                assert_eq!(tool_call.index, 1);
+                assert_eq!(tool_call.id, "call_1");
+                assert_eq!(tool_call.function.name, "write_file");
+                assert_eq!(tool_call.function.arguments, "{\"path\":\"a.rs\"}");
+            }
+            _ => panic!("expected tool-call final snapshot chunk"),
+        }
+    }
+
+    #[test]
+    fn content_part_added_event_maps_to_content_chunk() {
+        let payload = r#"{"part":{"type":"output_text","text":"hello"}}"#;
+        match parse_stream_payload(
+            StreamProviderAdapterKind::OpenAi,
+            payload,
+            Some("response.content_part.added"),
+        ) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.content, "hello");
+            }
+            _ => panic!("expected content-part chunk"),
+        }
+    }
+
+    #[test]
+    fn refusal_done_event_maps_to_snapshot_content_chunk() {
+        let payload = r#"{"refusal":"cannot comply"}"#;
+        match parse_stream_payload(
+            StreamProviderAdapterKind::OpenAi,
+            payload,
+            Some("response.refusal.done"),
+        ) {
+            ParsedStreamPayload::SnapshotChunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.content, "cannot comply");
+            }
+            _ => panic!("expected refusal snapshot chunk"),
         }
     }
 

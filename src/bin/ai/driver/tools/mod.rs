@@ -10,12 +10,16 @@ use std::time::{Duration as StdDuration, Instant};
 use crate::ai::tools::os_tools::GLOBAL_OS;
 use aios_kernel::{
     kernel::{EventId, WaitPolicy},
-    primitives::{ChannelId, ChannelOwnerTag},
+    primitives::{ChannelId, ChannelOwnerTag, FutexAddr},
 };
 use rust_tools::commonw::FastMap;
 
 use crate::ai::{
     mcp::{McpClient, SharedMcpClient},
+    tools::task_tools::{
+        WaitManySource, append_current_process_cancel_source, epoll_wait_many,
+        wait_sources_for_channel_and_futex,
+    },
     tools as builtin_tools,
     types::{ToolCall, ToolResult},
 };
@@ -134,6 +138,7 @@ struct AsyncToolPipeAggregate {
 
 struct AsyncToolEntry {
     result_channel_id: Option<u64>,
+    completion_futex_addr: Option<FutexAddr>,
     session_id: String,
     tool_name: String,
     started_at: Instant,
@@ -169,6 +174,25 @@ fn create_async_tool_channel(task_id: &str) -> Option<u64> {
         )
         .raw(),
     )
+}
+
+fn create_async_tool_completion_futex(task_id: &str) -> Option<FutexAddr> {
+    let guard = GLOBAL_OS.lock().ok()?;
+    let os = guard.as_ref()?;
+    let mut os = os.lock().ok()?;
+    Some(os.futex_create(0, format!("async_tool_completion:{task_id}")))
+}
+
+fn signal_async_tool_completion(addr: Option<FutexAddr>) {
+    let Some(addr) = addr else {
+        return;
+    };
+    if let Ok(guard) = GLOBAL_OS.lock()
+        && let Some(os) = guard.as_ref()
+        && let Ok(mut os) = os.lock()
+    {
+        let _ = os.futex_store(addr, 1);
+    }
 }
 
 fn prune_completed_async_tools(registry: &mut FastMap<String, AsyncToolEntry>) {
@@ -480,6 +504,7 @@ struct AsyncToolPipeObserver {
     session_id: String,
     tool_name: String,
     result_channel_id: Option<u64>,
+    completion_futex_addr: Option<FutexAddr>,
     started_at: Instant,
     next_seq: u64,
 }
@@ -488,6 +513,7 @@ impl AsyncToolPipeObserver {
     fn running_entry(&self) -> AsyncToolEntry {
         AsyncToolEntry {
             result_channel_id: self.result_channel_id,
+            completion_futex_addr: self.completion_futex_addr,
             session_id: self.session_id.clone(),
             tool_name: self.tool_name.clone(),
             started_at: self.started_at,
@@ -520,6 +546,7 @@ impl AsyncToolPipeObserver {
     fn emit_finished(&mut self, run_result: &RunOneResult) {
         let entry = AsyncToolEntry {
             result_channel_id: self.result_channel_id,
+            completion_futex_addr: self.completion_futex_addr,
             session_id: self.session_id.clone(),
             tool_name: self.tool_name.clone(),
             started_at: self.started_at,
@@ -604,23 +631,29 @@ fn load_async_tool_snapshot(entry: &AsyncToolEntry) -> Option<AsyncToolSnapshot>
 }
 
 fn delete_async_tool_snapshot(entry: &AsyncToolEntry) {
-    let Some(channel_id) = entry.result_channel_id else {
-        return;
-    };
     if let Ok(guard) = GLOBAL_OS.lock()
         && let Some(os) = guard.as_ref()
         && let Ok(mut os) = os.lock()
     {
-        let _ = os.channel_try_recv_all(None, ChannelId(channel_id));
-        let _ = os.channel_close(None, ChannelId(channel_id));
-        let _ = os.channel_release_named(ChannelId(channel_id), "async_tool.consumer");
-        let _ = os.channel_destroy(None, ChannelId(channel_id));
+        if let Some(channel_id) = entry.result_channel_id {
+            let _ = os.channel_try_recv_all(None, ChannelId(channel_id));
+            let _ = os.channel_close(None, ChannelId(channel_id));
+            let _ = os.channel_release_named(ChannelId(channel_id), "async_tool.consumer");
+            let _ = os.channel_destroy(None, ChannelId(channel_id));
+        }
+        if let Some(addr) = entry.completion_futex_addr {
+            let _ = os.futex_destroy(addr);
+        }
     }
 }
 
-fn lookup_event_ids(session_id: &str, task_ids: &[String]) -> Result<Vec<EventId>, String> {
+fn lookup_wait_sources(
+    os: &mut dyn aios_kernel::kernel::Kernel,
+    session_id: &str,
+    task_ids: &[String],
+) -> Result<Vec<WaitManySource>, String> {
     let registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
-    let mut event_ids = Vec::with_capacity(task_ids.len());
+    let mut wait_sources = Vec::new();
     for task_id in task_ids {
         let Some(entry) = registry.get(task_id) else {
             return Err(format!("Unknown task_id: {}", task_id));
@@ -628,15 +661,20 @@ fn lookup_event_ids(session_id: &str, task_ids: &[String]) -> Result<Vec<EventId
         if entry.session_id != session_id {
             return Err(format!("Task {} does not belong to this session.", task_id));
         }
-        let event_id = async_tool_event_id(entry).ok_or_else(|| {
+        let channel_id = entry.result_channel_id.ok_or_else(|| {
             format!(
-                "Task {} has no available channel event id; async wait requires AIOS channel support.",
+                "Task {} has no available result channel; async wait requires AIOS channel support.",
                 task_id
             )
         })?;
-        event_ids.push(event_id);
+        wait_sources.extend(wait_sources_for_channel_and_futex(
+            os,
+            channel_id,
+            entry.completion_futex_addr,
+        )?);
     }
-    Ok(event_ids)
+    append_current_process_cancel_source(os, &mut wait_sources)?;
+    Ok(wait_sources)
 }
 
 fn parse_wait_policy(args: &Value) -> Result<WaitPolicy, String> {
@@ -1000,6 +1038,7 @@ fn execute_tool_spawn(
 
     validate_spawnable_tool(target_tool_name, &prepared.route)?;
     let result_channel_id = create_async_tool_channel(&async_task_id);
+    let completion_futex_addr = create_async_tool_completion_futex(&async_task_id);
     let started_at = Instant::now();
 
     if let Some(tool_result) = load_cached_tool_result(session_id, &synthetic_tool_call, &prepared.args)
@@ -1015,12 +1054,14 @@ fn execute_tool_spawn(
             async_task_id.clone(),
             AsyncToolEntry {
                 result_channel_id,
+                completion_futex_addr,
                 session_id: session_id.to_string(),
                 tool_name: target_tool_name.to_string(),
                 started_at,
                 state: AsyncToolState::Completed((prepared.route.clone(), run_result)),
             },
         );
+        signal_async_tool_completion(completion_futex_addr);
         if let Some(entry) = registry.get(&async_task_id) {
             let started = async_tool_pipe_message_from_started(&async_task_id, entry, 0);
             send_async_tool_pipe_message(entry, &started);
@@ -1049,6 +1090,7 @@ fn execute_tool_spawn(
     let async_task_id_for_thread = async_task_id.clone();
     let tool_name_for_thread = tool_name.clone();
     let result_channel_id_for_thread = result_channel_id;
+    let completion_futex_addr_for_thread = completion_futex_addr;
     let started_at_for_thread = started_at;
 
     thread::spawn(move || {
@@ -1057,6 +1099,7 @@ fn execute_tool_spawn(
             session_id: session_id.clone(),
             tool_name: tool_name_for_thread.clone(),
             result_channel_id: result_channel_id_for_thread,
+            completion_futex_addr: completion_futex_addr_for_thread,
             started_at: started_at_for_thread,
             next_seq: 0,
         };
@@ -1107,6 +1150,7 @@ fn execute_tool_spawn(
             false,
         );
         pipe_observer.on_tool_finished(&tool_call_for_thread, &run_result);
+        signal_async_tool_completion(completion_futex_addr_for_thread);
 
         if let Ok(mut registry) = ASYNC_TOOL_REGISTRY.lock() {
             if let Some(entry) = registry.get_mut(&async_task_id_for_thread)
@@ -1122,6 +1166,7 @@ fn execute_tool_spawn(
         async_task_id.clone(),
         AsyncToolEntry {
             result_channel_id,
+            completion_futex_addr,
             session_id: session_id_for_registry,
             tool_name,
             started_at,
@@ -1275,6 +1320,7 @@ fn execute_tool_cancel(session_id: &str, tool_call_id: &str, args: &Value) -> Re
                     reason: reason.clone(),
                 };
                 persist_async_tool_snapshot(&task_id, entry);
+                signal_async_tool_completion(entry.completion_futex_addr);
                 results.push(json!({
                     "task_id": task_id,
                     "tool_name": entry.tool_name,
@@ -1368,21 +1414,24 @@ fn execute_tool_wait(session_id: &str, tool_call_id: &str, args: &Value) -> Resu
         && let Ok(mut os) = os.lock()
         && os.current_process_id().is_some()
     {
-        let event_ids = lookup_event_ids(session_id, &task_ids)?;
-        let wake_tick = os.wait_on_events(event_ids.clone(), wait_policy.clone(), timeout_ticks)?;
-        // wait_on_events returns Ok(None) without suspending when the condition was already
-        // satisfied (events completed before the wait was registered). In that case we do
-        // NOT yield; fall through after the block to collect results immediately.
-        if os.consume_yield_requested() || wake_tick.is_some() {
+        let wait_sources = lookup_wait_sources(os.as_mut(), session_id, &task_ids)?;
+        let wait = epoll_wait_many(
+            os.as_mut(),
+            &format!("tool_wait:{}:{}", session_id, task_ids.join(",")),
+            &wait_sources,
+            wait_policy.clone(),
+            timeout_ticks,
+        )?;
+        if wait.suspended {
             return Ok(ToolResult {
                 tool_call_id: tool_call_id.to_string(),
                 content: json!({
                     "status": "suspended",
                     "wait_policy": match wait_policy { WaitPolicy::Any => "any", WaitPolicy::All => "all" },
                     "task_ids": task_ids,
-                    "event_ids": event_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-                    "timeout_tick": wake_tick,
-                    "message": "Current process suspended on event wait condition. Yield control now; after wake-up, inspect mailbox and use tool_status or tool_wait again if needed."
+                    "event_ids": wait.event_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                    "timeout_tick": wait.timeout_tick,
+                    "message": "Current process suspended via epoll_wait_many. Yield control now; after wake-up, inspect mailbox and use tool_status or tool_wait again if needed."
                 })
                 .to_string(),
             });
@@ -1965,12 +2014,14 @@ mod tests {
         aggregate_async_tool_pipe_messages, async_tool_pipe_message_from_final,
         async_tool_pipe_message_from_started, async_tool_pipe_message_from_stream,
         build_tool_cache_key, delete_async_tool_snapshot, is_cacheable_tool_name,
-        is_tool_cache_entry_fresh, load_async_tool_snapshot, lookup_event_ids,
+        is_tool_cache_entry_fresh, load_async_tool_snapshot, lookup_wait_sources,
         parallel_task_batch_len, persist_async_tool_snapshot, send_async_tool_pipe_message,
         stream_preview_from_aggregate, AsyncToolEntry, AsyncToolPipeKind, AsyncToolPipeMessage,
         AsyncToolState, RunOneResult, ToolRoute, ASYNC_TOOL_REGISTRY, TOOL_CACHE_TTL_MINUTES,
     };
-    use aios_kernel::primitives::ChannelId;
+    use aios_kernel::{kernel::EventId, primitives::ChannelId};
+    use crate::ai::tools::task_tools::WaitManySource;
+    use crate::ai::tools::registry::common::current_process_tool_cancel_futex;
     use crate::ai::mcp::McpClient;
     use crate::ai::types::{FunctionCall, ToolCall};
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
@@ -2016,6 +2067,7 @@ mod tests {
     fn sample_completed_entry(result_channel_id: Option<u64>) -> AsyncToolEntry {
         AsyncToolEntry {
             result_channel_id,
+            completion_futex_addr: None,
             session_id: "sess-1".to_string(),
             tool_name: "read_file".to_string(),
             started_at: std::time::Instant::now(),
@@ -2113,13 +2165,13 @@ mod tests {
     }
 
     #[test]
-    fn lookup_event_ids_uses_channel_event_id() {
+    fn lookup_wait_sources_include_channel_event_and_futex() {
         let (_guard, kernel, root) = setup_async_tool_kernel();
-        let (channel_id, expected_event_id) = {
+        let (channel_id, futex_addr) = {
             let mut os = kernel.lock().unwrap();
             let channel = os.channel_create(Some(root), 1, "async-tool-event".to_string());
-            let event_id = os.channel_event_id(channel).expect("channel event id");
-            (channel.raw(), event_id)
+            let futex = os.futex_create(0, "async-tool-futex".to_string());
+            (channel.raw(), futex)
         };
 
         let mut registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
@@ -2127,6 +2179,7 @@ mod tests {
             "tooltask_lookup".to_string(),
             AsyncToolEntry {
                 result_channel_id: Some(channel_id),
+                completion_futex_addr: Some(futex_addr),
                 session_id: "sess-lookup".to_string(),
                 tool_name: "read_file".to_string(),
                 started_at: std::time::Instant::now(),
@@ -2135,8 +2188,28 @@ mod tests {
         );
         drop(registry);
 
-        let event_ids = lookup_event_ids("sess-lookup", &["tooltask_lookup".to_string()]).unwrap();
-        assert_eq!(event_ids, vec![expected_event_id]);
+        let wait_sources = {
+            let mut os = kernel.lock().unwrap();
+            lookup_wait_sources(os.as_mut(), "sess-lookup", &["tooltask_lookup".to_string()]).unwrap()
+        };
+        let cancel_futex = {
+            let mut os = kernel.lock().unwrap();
+            current_process_tool_cancel_futex(os.as_mut()).unwrap().unwrap()
+        };
+        assert_eq!(
+            wait_sources,
+            vec![
+                WaitManySource::Channel(channel_id),
+                WaitManySource::Event(EventId::new(
+                    {
+                        let os = kernel.lock().unwrap();
+                        os.channel_event_id(ChannelId(channel_id)).unwrap().as_u64()
+                    }
+                )),
+                WaitManySource::Futex { addr: futex_addr, expected: 0 },
+                WaitManySource::Futex { addr: cancel_futex, expected: 0 },
+            ]
+        );
     }
 
     #[test]
@@ -2202,6 +2275,7 @@ mod tests {
         };
         let entry = AsyncToolEntry {
             result_channel_id: Some(channel_id),
+            completion_futex_addr: None,
             session_id: "sess-stream".to_string(),
             tool_name: "execute_command".to_string(),
             started_at: std::time::Instant::now(),

@@ -36,7 +36,7 @@ pub(crate) async fn maybe_append_self_reflection(
     // 在内核 daemon 登记表注册此后台 future，获得 handle + cancel token。
     // 用户态仍由 tokio::spawn 实际执行；退出时回调 daemon_exit 告知内核。
     use aios_kernel::primitives::DaemonKind;
-    let (handle, cancel_token, kernel_arc) = {
+    let (handle, cancel_token, kernel_arc, interrupt_futex) = {
         let kernel = app.os.clone();
         let (handle, token) = {
             let mut os = match kernel.lock() {
@@ -50,26 +50,29 @@ pub(crate) async fn maybe_append_self_reflection(
                 parent_pid,
             )
         };
-        (handle, token, kernel)
+        let interrupt_futex = crate::ai::driver::signal::alloc_interrupt_futex(format!(
+            "background_reflection_interrupt:{}",
+            session_id
+        ));
+        (handle, token, kernel, interrupt_futex)
     };
 
     tokio::spawn(async move {
-        if cancel_token.is_cancelled() {
-            // spawn 前即被 cancel：直接标记退出即可。
-            let mut os = match kernel_arc.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
-            os.daemon_exit(handle, None);
-            return;
+        tokio::select! {
+            _ = crate::ai::driver::signal::wait_for_interrupt_sources(
+                Some(cancel_token.clone()),
+                interrupt_futex,
+            ) => {}
+            _ = run_self_reflection_background(history_path, session_id, model_s, q_s, a_s, had_tool) => {}
         }
-        run_self_reflection_background(history_path, session_id, model_s, q_s, a_s, had_tool)
-            .await;
         let mut os = match kernel_arc.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         os.daemon_exit(handle, None);
+        if let Some(addr) = interrupt_futex {
+            crate::ai::driver::signal::destroy_interrupt_futex(addr);
+        }
     });
 }
 

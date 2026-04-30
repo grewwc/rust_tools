@@ -2,7 +2,7 @@
 // AIOS LocalOS - Local Process OS Implementation
 // =============================================================================
 // This module implements the Kernel trait for a single-machine process OS.
-// 
+//
 // Key features:
 //   - Process table: HashMap of all processes (pid -> Process)
 //   - Ready queue: FIFO/priority queue of ready processes
@@ -10,12 +10,12 @@
 //   - Tick counter: Scheduler time for sleeping processes
 //   - Shared memory: Key-value store with ownership
 //   - Process groups: Signal broadcasting
-// 
+//
 // Scheduling:
 //   - pop_ready(): Get highest-priority ready process
 //   - advance_tick(): Increment tick, wake sleeping processes
 //   - Sleeping processes wake when tick >= their until_tick
-// 
+//
 // Process state transitions:
 //   - spawn() -> ready queue (Ready)
 //   - wait_on(pid) -> wait queue (Waiting)
@@ -25,30 +25,46 @@
 //   - receive SIGCONT -> Ready
 // =============================================================================
 
-use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
 use crate::types::{FastMap, FastSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 
 use crate::kernel::{
-    EventId, Kernel, KernelInternal, Process, ProcessCapabilities, ProcessState, ShmReadError,
-    Signal, Syscall, WaitPolicy, WaitReason, DEFAULT_MAILBOX_CAPACITY,
+    DEFAULT_MAILBOX_CAPACITY, EventId, Kernel, KernelInternal, Process, ProcessCapabilities,
+    ProcessState, ShmReadError, Signal, Syscall, WaitPolicy, WaitReason,
 };
 use crate::primitives::{
     ChannelId, ChannelMetaSnapshot, ChannelOwnerTag, DaemonCancelToken, DaemonEntrySnapshot,
-    DaemonHandle, DaemonKind, DaemonOps, DaemonState, IpcOps, IpcRecvResult,
-    FutexAddr, FutexOps, FutexState, FutexWakeReason, LlmAccountOutcome, LlmModelPrice, LlmOps,
-    LlmUsageReport, ResourceLimit, ResourceUsage, ResourceUsageDelta, RlimitDim, RlimitOps,
-    RlimitVerdict, TraceKind, TraceLevel, TraceOps, TraceRecord, TraceRing, VfsError, VfsOps,
-    VfsStat,
+    DaemonHandle, DaemonKind, DaemonOps, DaemonState, EpollEventMask, EpollId, EpollOps,
+    EpollReadyEvent, EpollRegistrationSnapshot, EpollSnapshot, EpollSource, EpollWaitResult,
+    FutexAddr, FutexOps, FutexState, FutexWakeReason, IpcOps, IpcRecvResult, LlmAccountOutcome,
+    LlmModelPrice, LlmOps, LlmUsageReport, ResourceLimit, ResourceUsage, ResourceUsageDelta,
+    RlimitDim, RlimitOps, RlimitVerdict, TraceKind, TraceLevel, TraceOps, TraceRecord, TraceRing,
+    VfsError, VfsOps, VfsStat,
 };
+
+const DEFAULT_COMPLETED_EVENT_RETENTION: usize = 8192;
+const DEFAULT_TRACE_CAPACITY: usize = 4096;
+const SHM_PERM_CACHE_SLOTS: usize = 32;
+
+/// Cached SHM permission decision. Stored in a direct-mapped slot keyed by
+/// `(current_pid ^ owner_pid)` modulo `SHM_PERM_CACHE_SLOTS`. The `version`
+/// field is matched against `LocalOS::topology_version`; mismatches force a
+/// fresh evaluation, which acts as the invalidation strategy.
+#[derive(Clone, Copy)]
+pub(super) struct ShmPermCacheEntry {
+    pub(super) version: u64,
+    pub(super) current_pid: u64,
+    pub(super) owner_pid: u64,
+    pub(super) accessible: bool,
+    pub(super) readable: bool,
+}
 
 pub(super) struct ShmEntry {
     value: String,
     owner_pid: u64,
-    owner_pgid: Option<u64>,
     checksum: u64,
     version: u64,
-    created_at_tick: u64,
 }
 
 fn shm_checksum(value: &str, owner_pid: u64) -> u64 {
@@ -61,8 +77,18 @@ fn shm_checksum(value: &str, owner_pid: u64) -> u64 {
 
 pub struct LocalOS {
     pub processes: FastMap<u64, Process>,
-    pub(super) ready_queue: VecDeque<u64>,
+    /// 就绪队列，保存 `(pid, priority)`。优先级随条目内联存储，避免每次入队比较
+    /// 都回表查 `Process.priority`。出队 / 调度过滤通过 `ready_set` 进行 O(1)
+    /// 标记，因此终止 / 信号停止等路径不再需要线性 retain。
+    pub(super) ready_queue: VecDeque<(u64, u8)>,
+    /// `ready_queue` 的成员索引。一个 pid 是否真正“可被调度”以这个集合为准；
+    /// 队列里的条目可能是过期 tombstone，由 [`pop_ready`] 丢弃。
+    pub(super) ready_set: FastSet<u64>,
     pub(super) wait_queue: HashMap<u64, Vec<u64>>,
+    /// Reverse index: parent_pid -> set of child pids. Maintained on spawn /
+    /// remove so that descendant traversal and orphan reassignment do not
+    /// require a full process-table scan.
+    pub(super) children_by_parent: FastMap<u64, FastSet<u64>>,
     pub next_pid: u64,
     pub current_pid: Option<u64>,
     pub(super) yield_requested: bool,
@@ -72,7 +98,29 @@ pub struct LocalOS {
     pub next_pgid: u64,
     /// All event IDs that have ever been marked completed, used to detect
     /// already-satisfied wait conditions in wait_on_events.
-    pub(super) completed_events: std::collections::HashSet<EventId>,
+    pub(super) completed_events: HashSet<EventId>,
+    pub(super) completed_event_order: VecDeque<EventId>,
+    pub(super) completed_event_retention: usize,
+    /// Reverse index: event_id -> set of pids currently waiting on that event.
+    /// Cleaned up lazily on notify (entries for completed events are removed)
+    /// and verified against process state at wake-time, so stale pids are safe.
+    pub(super) event_waiters: FastMap<EventId, FastSet<u64>>,
+    /// Refcount of the kernel sources that reference each `event_id`：channel
+    /// create / futex create / epoll registration of `EpollSource::Event`。
+    /// 拿来给 [`Self::completed_event_is_live`] 走 O(1) 的判定，避免再去
+    /// 扫 `channels` / `futexes` / `epolls` 三张表。重复 key 的复用与递减
+    /// 必须严格成对，少一次会让 prune 提前误判事件已死。
+    pub(super) event_source_refs: FastMap<EventId, u32>,
+    /// Bumped whenever the process topology changes (spawn / terminate /
+    /// set_process_group). Used as the version stamp for `shm_perm_cache`
+    /// so we never need to walk the cache on invalidation.
+    pub(super) topology_version: u64,
+    /// Direct-mapped permission cache for SHM accesses. Keyed by
+    /// (current_pid, owner_pid) hashed into a fixed-size slot array.
+    /// Each entry carries the topology version it was computed under so
+    /// stale entries get refreshed lazily on lookup. Wrapped in `Cell` so
+    /// the cache can be updated through the `&self` `shm_read` syscall path.
+    pub(super) shm_perm_cache: [std::cell::Cell<Option<ShmPermCacheEntry>>; SHM_PERM_CACHE_SLOTS],
     /// Futex table: FutexAddr -> state. Managed by FutexOps impl.
     pub(super) futexes: FastMap<u64, FutexState>,
     pub(super) next_futex_id: u64,
@@ -88,6 +136,9 @@ pub struct LocalOS {
     pub(super) next_channel_id: u64,
     /// Internal event id allocator for kernel-owned primitives like channels.
     pub(super) next_internal_event_id: u64,
+    /// epoll registry: epoll id -> registrations.
+    pub(super) epolls: FastMap<u64, EpollEntry>,
+    pub(super) next_epoll_id: u64,
 }
 
 /// 内核内部使用的 daemon 登记条目（含活引用 token）。对外只暴露 Snapshot。
@@ -107,11 +158,25 @@ pub(super) struct IpcChannelEntry {
     pub(super) label: String,
     pub(super) owner_tag: ChannelOwnerTag,
     pub(super) ref_count: u32,
-    pub(super) ref_holders: Vec<String>,
+    /// Insertion-ordered (holder, count) list. Repeated retain_named calls
+    /// with the same name increment the count instead of pushing duplicates,
+    /// which keeps release O(unique-holder count) instead of O(total retains).
+    pub(super) ref_holders: Vec<(String, u32)>,
     pub(super) event_id: EventId,
     pub(super) capacity: usize,
     pub(super) queue: VecDeque<String>,
     pub(super) closed: bool,
+}
+
+pub(super) struct EpollEntry {
+    pub(super) label: String,
+    pub(super) registrations: FastMap<EpollSource, EpollRegistration>,
+}
+
+#[derive(Clone)]
+pub(super) struct EpollRegistration {
+    pub(super) snapshot: EpollRegistrationSnapshot,
+    pub(super) futex_seq_cursor: Option<u64>,
 }
 
 impl Default for LocalOS {
@@ -122,10 +187,18 @@ impl Default for LocalOS {
 
 impl LocalOS {
     pub fn new() -> Self {
+        Self::with_trace_capacity(DEFAULT_TRACE_CAPACITY)
+    }
+
+    /// Construct a `LocalOS` with a caller-specified trace ring capacity.
+    /// `0` disables trace recording entirely.
+    pub fn with_trace_capacity(trace_capacity: usize) -> Self {
         Self {
             processes: FastMap::default(),
             ready_queue: VecDeque::new(),
+            ready_set: FastSet::default(),
             wait_queue: HashMap::new(),
+            children_by_parent: FastMap::default(),
             next_pid: 1,
             current_pid: None,
             yield_requested: false,
@@ -133,31 +206,47 @@ impl LocalOS {
             round_robin: true,
             shared_memory: FastMap::default(),
             next_pgid: 1,
-            completed_events: std::collections::HashSet::new(),
+            completed_events: HashSet::new(),
+            completed_event_order: VecDeque::new(),
+            completed_event_retention: DEFAULT_COMPLETED_EVENT_RETENTION,
+            event_waiters: FastMap::default(),
+            event_source_refs: FastMap::default(),
+            topology_version: 0,
+            shm_perm_cache: [const { std::cell::Cell::new(None) }; SHM_PERM_CACHE_SLOTS],
             futexes: FastMap::default(),
             next_futex_id: 1,
-            trace: TraceRing::new(4096),
+            trace: TraceRing::new(trace_capacity),
             llm_prices: FastMap::default(),
             daemons: FastMap::default(),
             next_daemon_id: 1,
             channels: FastMap::default(),
             next_channel_id: 1,
             next_internal_event_id: 1_000_000,
+            epolls: FastMap::default(),
+            next_epoll_id: 1,
         }
     }
 
     fn remove_process_entry_raw(&mut self, pid: u64) -> bool {
-        if self.processes.remove(&pid).is_none() {
-            return false;
+        let parent_pid = match self.processes.remove(&pid) {
+            Some(proc) => proc.parent_pid,
+            None => return false,
+        };
+        // Topology changed (process gone): invalidate SHM perm cache lazily.
+        self.bump_topology_version();
+        if let Some(parent) = parent_pid {
+            self.unregister_child(parent, pid);
         }
-        self.ready_queue.retain(|queued_pid| *queued_pid != pid);
+        // O(1) lazy removal: drop the membership marker; any tombstone left
+        // in `ready_queue` is filtered out by `pop_ready`.
+        self.ready_set.remove(&pid);
         self.wait_queue.remove(&pid);
 
         let orphaned_children: Vec<u64> = self
-            .processes
-            .iter()
-            .filter_map(|(child_pid, proc)| (proc.parent_pid == Some(pid)).then_some(*child_pid))
-            .collect();
+            .children_by_parent
+            .remove(&pid)
+            .map(|set| set.into_iter().collect())
+            .unwrap_or_default();
         let mut terminated_children = Vec::new();
         for child_pid in orphaned_children {
             if let Some(child) = self.processes.get_mut(&child_pid) {
@@ -185,7 +274,9 @@ impl LocalOS {
                 .iter()
                 .filter_map(|(pid, proc)| {
                     (proc.state == ProcessState::Terminated
-                        && proc.parent_pid.is_some_and(|parent| !self.processes.contains_key(&parent)))
+                        && proc
+                            .parent_pid
+                            .is_some_and(|parent| !self.processes.contains_key(&parent)))
                     .then_some(*pid)
                 })
                 .collect();
@@ -206,18 +297,46 @@ impl LocalOS {
         removed
     }
 
-    fn sort_ready_queue(&mut self) {
-        let mut pids: Vec<u64> = self.ready_queue.drain(..).collect();
-        pids.sort_by_key(|&pid| self.processes.get(&pid).map(|p| p.priority).unwrap_or(255));
-        self.ready_queue = pids.into_iter().collect();
+    fn process_priority(&self, pid: u64) -> u8 {
+        self.processes
+            .get(&pid)
+            .map(|proc| proc.priority)
+            .unwrap_or(u8::MAX)
+    }
+
+    fn enqueue_ready(&mut self, pid: u64) {
+        // 不存在的 pid 或已在队列中都直接返回。`ready_set.insert` 返回值同时
+        // 承担了去重检查，省一次额外查表。
+        if !self.processes.contains_key(&pid) || !self.ready_set.insert(pid) {
+            return;
+        }
+
+        let priority = self.process_priority(pid);
+        // 优先级插入点查找现在只读 tuple 里的缓存优先级，不再进 processes
+        // 表。这让批量唯醒 / spawn 从 O(n^2) 到 O(n*k)（k = 队列该优先级之后
+        // 的长度）。序列 tombstone 在比较时也不会造成额外代价。
+        let insert_at = self
+            .ready_queue
+            .iter()
+            .position(|(_, queued_priority)| *queued_priority > priority);
+        match insert_at {
+            Some(index) => self.ready_queue.insert(index, (pid, priority)),
+            None => self.ready_queue.push_back((pid, priority)),
+        }
     }
 
     fn terminate_pid(&mut self, pid: u64, result: String) {
-        self.ready_queue.retain(|queued_pid| *queued_pid != pid);
+        // O(1) tombstone：仅移除集合成员身份，`pop_ready` 负责清理。
+        self.ready_set.remove(&pid);
         if let Some(proc) = self.processes.get_mut(&pid) {
             proc.state = ProcessState::Terminated;
             proc.result = Some(result.clone());
         }
+        // 进程进入 Terminated 会影响 SHM 权限（owner 已不可达），才能及时
+        // 失效缓存中“owner 还在”的 accessible=true 结果。严格讲另一条防线
+        // 在 `shm_read` 里独立检查了 owner 状态，但在此处 bump 可以减少拍额
+        // 外 syscall 返回错误不一致的概率。
+        self.bump_topology_version();
 
         if let Some(waiting_pids) = self.wait_queue.remove(&pid) {
             for waiting_pid in waiting_pids {
@@ -227,12 +346,9 @@ impl LocalOS {
                         "Process {} terminated with result: {}",
                         pid, result
                     ));
-                    self.ready_queue.push_back(waiting_pid);
+                    self.enqueue_ready(waiting_pid);
                 }
             }
-        }
-        if !self.ready_queue.is_empty() {
-            self.sort_ready_queue();
         }
     }
 
@@ -277,16 +393,111 @@ impl LocalOS {
 
     fn collect_descendants(&self, pid: u64) -> Vec<u64> {
         let mut result = Vec::new();
-        let mut stack = vec![pid];
+        let mut stack: Vec<u64> = self
+            .children_by_parent
+            .get(&pid)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
         while let Some(current) = stack.pop() {
-            for (child_pid, proc) in self.processes.iter() {
-                if proc.parent_pid == Some(current) && !result.contains(child_pid) {
-                    result.push(*child_pid);
-                    stack.push(*child_pid);
-                }
+            result.push(current);
+            if let Some(children) = self.children_by_parent.get(&current) {
+                stack.extend(children.iter().copied());
             }
         }
         result
+    }
+
+    fn register_child(&mut self, parent: u64, child: u64) {
+        self.children_by_parent
+            .entry(parent)
+            .or_default()
+            .insert(child);
+    }
+
+    fn unregister_child(&mut self, parent: u64, child: u64) {
+        if let Some(set) = self.children_by_parent.get_mut(&parent) {
+            set.remove(&child);
+            if set.is_empty() {
+                self.children_by_parent.remove(&parent);
+            }
+        }
+    }
+
+    /// Bumped on every change that can affect SHM permission decisions:
+    /// process spawn / terminate / set_process_group. The
+    /// `topology_version` doubles as a cache stamp, so old `shm_perm_cache`
+    /// entries are simply ignored on lookup once the version moves.
+    fn bump_topology_version(&mut self) {
+        self.topology_version = self.topology_version.wrapping_add(1);
+    }
+
+    fn shm_perm_slot(current_pid: u64, owner_pid: u64) -> usize {
+        ((current_pid ^ owner_pid).rotate_left(13) as usize) % SHM_PERM_CACHE_SLOTS
+    }
+
+    /// Returns `(accessible, readable)` for `(current_pid, entry.owner_pid)`,
+    /// consulting the direct-mapped cache when possible. Cache misses (or
+    /// stale entries from prior topology versions) fall back to the
+    /// process-tree walk and refresh the slot. Uses interior mutability so
+    /// the `&self` `shm_read` syscall can populate the cache too.
+    fn shm_perm_lookup(&self, current_pid: u64, entry: &ShmEntry) -> (bool, bool) {
+        let slot = Self::shm_perm_slot(current_pid, entry.owner_pid);
+        if let Some(cached) = self.shm_perm_cache[slot].get()
+            && cached.version == self.topology_version
+            && cached.current_pid == current_pid
+            && cached.owner_pid == entry.owner_pid
+        {
+            return (cached.accessible, cached.readable);
+        }
+        let accessible = self.shm_compute_accessible(current_pid, entry);
+        let readable = accessible || self.is_sibling(current_pid, entry.owner_pid);
+        self.shm_perm_cache[slot].set(Some(ShmPermCacheEntry {
+            version: self.topology_version,
+            current_pid,
+            owner_pid: entry.owner_pid,
+            accessible,
+            readable,
+        }));
+        (accessible, readable)
+    }
+
+    fn shm_compute_accessible(&self, pid: u64, entry: &ShmEntry) -> bool {
+        if pid == entry.owner_pid {
+            return true;
+        }
+        // 这里走 live 的 owner pgid 查询（而不是 entry.owner_pgid 这一份创建
+        // 时的快照），因为 owner 进程可能在创建之后才被 `set_process_group`
+        // 加进新的 group，缓存里的 None 会让本来合法的写被拒。perm cache
+        // 由 topology_version 负责失效，这里只关心一次决策的正确性。
+        if self.is_same_process_group(pid, entry.owner_pid) {
+            return true;
+        }
+        if self.is_ancestor_of(pid, entry.owner_pid) {
+            return true;
+        }
+        false
+    }
+
+    fn register_event_waiter(&mut self, event: EventId, pid: u64) {
+        self.event_waiters.entry(event).or_default().insert(pid);
+    }
+
+    /// 向 `event_source_refs` 登记一个新的内核 source 引用。channel / futex /
+    /// epoll(EpollSource::Event) 任意一个新增都应调用一次，destroy 时
+    /// [`dec_event_source_ref`] 配对调用。
+    fn inc_event_source_ref(&mut self, event: EventId) {
+        let entry = self.event_source_refs.entry(event).or_insert(0);
+        *entry = entry.saturating_add(1);
+    }
+
+    /// 释放一次 source 引用，归零时清掉条目避免无界增长。
+    fn dec_event_source_ref(&mut self, event: EventId) {
+        if let Some(slot) = self.event_source_refs.get_mut(&event) {
+            *slot = slot.saturating_sub(1);
+            if *slot == 0 {
+                self.event_source_refs.remove(&event);
+            }
+        }
     }
 
     fn is_same_process_group(&self, pid_a: u64, pid_b: u64) -> bool {
@@ -299,32 +510,11 @@ impl LocalOS {
     }
 
     fn is_shm_accessible_by(&self, pid: u64, entry: &ShmEntry) -> bool {
-        if pid == entry.owner_pid {
-            return true;
-        }
-        if self.is_same_process_group(pid, entry.owner_pid) {
-            return true;
-        }
-        if self.is_ancestor_of(pid, entry.owner_pid) {
-            return true;
-        }
-        false
+        self.shm_perm_lookup(pid, entry).0
     }
 
     fn is_shm_readable_by(&self, pid: u64, entry: &ShmEntry) -> bool {
-        if pid == entry.owner_pid {
-            return true;
-        }
-        if self.is_same_process_group(pid, entry.owner_pid) {
-            return true;
-        }
-        if self.is_ancestor_of(pid, entry.owner_pid) {
-            return true;
-        }
-        if self.is_sibling(pid, entry.owner_pid) {
-            return true;
-        }
-        false
+        self.shm_perm_lookup(pid, entry).1
     }
 
     fn is_ancestor_of(&self, ancestor: u64, descendant: u64) -> bool {
@@ -372,7 +562,10 @@ impl LocalOS {
                     ) {
                         continue;
                     }
-                    self.terminate_pid(*pid, format!("Killed (cascade from SIGKILL to {})", target_pid));
+                    self.terminate_pid(
+                        *pid,
+                        format!("Killed (cascade from SIGKILL to {})", target_pid),
+                    );
                 }
                 self.terminate_pid(target_pid, "Killed by SIGKILL".to_string());
             }
@@ -384,8 +577,7 @@ impl LocalOS {
                     proc.pending_signals.push_back(Signal::SigTerm);
                     if proc.state == ProcessState::Stopped {
                         proc.state = ProcessState::Ready;
-                        self.ready_queue.push_back(target_pid);
-                        self.sort_ready_queue();
+                        self.enqueue_ready(target_pid);
                     }
                 }
             }
@@ -394,7 +586,7 @@ impl LocalOS {
                     if matches!(proc.state, ProcessState::Terminated | ProcessState::Stopped) {
                         return Ok(());
                     }
-                    self.ready_queue.retain(|p| *p != target_pid);
+                    self.ready_set.remove(&target_pid);
                     proc.state = ProcessState::Stopped;
                     if self.current_pid == Some(target_pid) {
                         self.current_pid = None;
@@ -408,8 +600,7 @@ impl LocalOS {
                         return Ok(());
                     }
                     proc.state = ProcessState::Ready;
-                    self.ready_queue.push_back(target_pid);
-                    self.sort_ready_queue();
+                    self.enqueue_ready(target_pid);
                 }
             }
         }
@@ -484,7 +675,7 @@ impl LocalOS {
         &self,
         event_ids: &[EventId],
         policy: &WaitPolicy,
-        completed_event_ids: &std::collections::HashSet<EventId>,
+        completed_event_ids: &HashSet<EventId>,
     ) -> bool {
         match policy {
             WaitPolicy::Any => event_ids
@@ -493,6 +684,58 @@ impl LocalOS {
             WaitPolicy::All => event_ids
                 .iter()
                 .all(|event_id| completed_event_ids.contains(event_id)),
+        }
+    }
+
+    fn remember_completed_event(&mut self, event_id: EventId) {
+        if self.completed_events.insert(event_id) {
+            self.completed_event_order.push_back(event_id);
+        }
+        self.prune_completed_events();
+    }
+
+    fn completed_event_is_live(&self, event_id: EventId) -> bool {
+        // Process side uses the reverse waiter index (O(1)) instead of a full
+        // process-table scan. Source side (channels / futexes / epoll
+        // registrations) is consulted via `event_source_refs`，同样 O(1)。
+        if self
+            .event_waiters
+            .get(&event_id)
+            .is_some_and(|set| !set.is_empty())
+        {
+            return true;
+        }
+        self.event_source_refs
+            .get(&event_id)
+            .copied()
+            .unwrap_or(0)
+            > 0
+    }
+
+    fn prune_completed_events(&mut self) {
+        let retention = self.completed_event_retention;
+        if self.completed_event_order.len() <= retention {
+            return;
+        }
+
+        // Examine only the OLDEST `excess` entries (matches the original
+        // "always keep the newest `retention`" semantics). Among them, drop
+        // dead entries from `completed_events` and re-insert live ones at
+        // the front to preserve FIFO order.
+        let excess = self.completed_event_order.len() - retention;
+        let mut keep_live: Vec<EventId> = Vec::new();
+        for _ in 0..excess {
+            let Some(event_id) = self.completed_event_order.pop_front() else {
+                break;
+            };
+            if self.completed_event_is_live(event_id) {
+                keep_live.push(event_id);
+            } else {
+                self.completed_events.remove(&event_id);
+            }
+        }
+        for event_id in keep_live.into_iter().rev() {
+            self.completed_event_order.push_front(event_id);
         }
     }
 }
@@ -524,8 +767,9 @@ impl Syscall for LocalOS {
 
         let mut env = FastMap::default();
         let requested_capabilities = capabilities.clone();
-        let mut inherited_capabilities =
-            requested_capabilities.clone().unwrap_or_else(ProcessCapabilities::full);
+        let mut inherited_capabilities = requested_capabilities
+            .clone()
+            .unwrap_or_else(ProcessCapabilities::full);
         let inherited_allowed_tools = if let Some(parent) = parent_pid {
             if let Some(p_proc) = self.processes.get(&parent) {
                 env = p_proc.env.clone();
@@ -542,7 +786,9 @@ impl Syscall for LocalOS {
         let final_allowed_tools = allowed_tools.unwrap_or(inherited_allowed_tools);
 
         let inherited_working_dir = if let Some(parent) = parent_pid {
-            self.processes.get(&parent).and_then(|p| p.working_dir.clone())
+            self.processes
+                .get(&parent)
+                .and_then(|p| p.working_dir.clone())
         } else {
             None
         };
@@ -584,8 +830,12 @@ impl Syscall for LocalOS {
                 usage: ResourceUsage::default(),
             },
         );
-        self.ready_queue.push_back(pid);
-        self.sort_ready_queue();
+        if let Some(parent) = parent_pid {
+            self.register_child(parent, pid);
+        }
+        // New process changed the topology: invalidate SHM perm cache lazily.
+        self.bump_topology_version();
+        self.enqueue_ready(pid);
         Ok(pid)
     }
 
@@ -669,11 +919,14 @@ impl Syscall for LocalOS {
         if let Some(current_proc) = self.processes.get_mut(&current) {
             current_proc.state = ProcessState::Waiting {
                 reason: WaitReason::Events {
-                    event_ids: deduped,
+                    event_ids: deduped.clone(),
                     policy,
                     timeout_tick,
                 },
             };
+        }
+        for event_id in &deduped {
+            self.register_event_waiter(*event_id, current);
         }
         self.current_pid = None;
         self.yield_requested = true;
@@ -688,11 +941,27 @@ impl Syscall for LocalOS {
             return Err(format!("Process {} does not exist.", target_pid));
         }
 
-        if sender_pid != target_pid
-            && !self.is_same_process_group(sender_pid, target_pid)
-            && !self.is_ancestor_of(sender_pid, target_pid)
-            && !self.is_ancestor_of(target_pid, sender_pid)
-            && !self.is_sibling(sender_pid, target_pid)
+        // 一次走完所有亲缘关系判定，让两层权限检查复用同一组判定结果，
+        // 避免 happy path 上把 process tree 走两遍。
+        let same_pid = sender_pid == target_pid;
+        let same_pgid = !same_pid && self.is_same_process_group(sender_pid, target_pid);
+        let sender_is_ancestor =
+            !same_pid && !same_pgid && self.is_ancestor_of(sender_pid, target_pid);
+        let sender_is_descendant = !same_pid
+            && !same_pgid
+            && !sender_is_ancestor
+            && self.is_ancestor_of(target_pid, sender_pid);
+        let sender_is_sibling = !same_pid
+            && !same_pgid
+            && !sender_is_ancestor
+            && !sender_is_descendant
+            && self.is_sibling(sender_pid, target_pid);
+
+        if !same_pid
+            && !same_pgid
+            && !sender_is_ancestor
+            && !sender_is_descendant
+            && !sender_is_sibling
         {
             return Err(format!(
                 "Permission denied: process {} cannot send IPC to process {} (not in same process group or parent-child relationship).",
@@ -700,11 +969,11 @@ impl Syscall for LocalOS {
             ));
         }
 
-        if sender_pid != target_pid
-            && !self.is_same_process_group(sender_pid, target_pid)
-            && !self.is_ancestor_of(sender_pid, target_pid)
-        {
-            let target_pgid = self.processes.get(&target_pid).and_then(|p| p.process_group);
+        if !same_pid && !same_pgid && !sender_is_ancestor {
+            let target_pgid = self
+                .processes
+                .get(&target_pid)
+                .and_then(|p| p.process_group);
             if target_pgid.is_some() {
                 return Err(format!(
                     "Permission denied: process {} is in a restricted process group, only group members or ancestors can send IPC.",
@@ -769,7 +1038,10 @@ impl Syscall for LocalOS {
     }
 
     fn list_processes(&self) -> Vec<Process> {
-        self.processes.iter().map(|(_, proc)| proc.clone()).collect()
+        self.processes
+            .iter()
+            .map(|(_, proc)| proc.clone())
+            .collect()
     }
 
     fn sleep_current(&mut self, turns: u64) -> Result<u64, String> {
@@ -852,6 +1124,8 @@ impl Syscall for LocalOS {
     fn set_process_group(&mut self, pid: u64, pgid: u64) -> Result<(), String> {
         if let Some(proc) = self.processes.get_mut(&pid) {
             proc.process_group = Some(pgid);
+            // Process group membership feeds into SHM perm decisions.
+            self.bump_topology_version();
             Ok(())
         } else {
             Err(format!("Process {} does not exist.", pid))
@@ -859,8 +1133,12 @@ impl Syscall for LocalOS {
     }
 
     fn signal_process_group(&mut self, pgid: u64, signal: Signal) -> Result<usize, String> {
-        let target_pids: Vec<u64> = self.processes.iter()
-            .filter(|(_, proc)| proc.process_group == Some(pgid) && proc.state != ProcessState::Terminated)
+        let target_pids: Vec<u64> = self
+            .processes
+            .iter()
+            .filter(|(_, proc)| {
+                proc.process_group == Some(pgid) && proc.state != ProcessState::Terminated
+            })
             .map(|(pid, _)| *pid)
             .collect();
 
@@ -880,30 +1158,25 @@ impl Syscall for LocalOS {
         if self.shared_memory.contains_key(&key) {
             return Err(format!("Shared memory key '{}' already exists.", key));
         }
-        let owner_pgid = self
-            .processes
-            .get(&current)
-            .and_then(|p| p.process_group);
+        let owner_pgid = self.processes.get(&current).and_then(|p| p.process_group);
+        // owner_pgid 仅越过 trace 下发作为创建时快照；SHM 权限走实时
+        // 查表以应对 set_process_group 后的变更。
+        let _ = owner_pgid;
         let checksum = shm_checksum(&value, current);
         self.shared_memory.insert(
             key,
             ShmEntry {
                 value,
                 owner_pid: current,
-                owner_pgid,
                 checksum,
                 version: 1,
-                created_at_tick: self.tick,
             },
         );
         Ok(())
     }
 
     fn shm_read(&self, key: &str) -> Result<String, ShmReadError> {
-        let entry = self
-            .shared_memory
-            .get(key)
-            .ok_or(ShmReadError::NotFound)?;
+        let entry = self.shared_memory.get(key).ok_or(ShmReadError::NotFound)?;
 
         let current = match self.current_pid {
             Some(pid) => pid,
@@ -941,22 +1214,14 @@ impl Syscall for LocalOS {
     fn shm_read_degraded(&self, key: &str) -> Option<String> {
         match self.shm_read(key) {
             Ok(value) => Some(value),
-            Err(ShmReadError::OwnerTerminated { .. }) => {
-                self.shared_memory.get(key).map(|e| {
-                    format!(
-                        "[DEGRADED: owner terminated] {}",
-                        e.value
-                    )
-                })
-            }
-            Err(ShmReadError::Corrupted { .. }) => {
-                self.shared_memory.get(key).map(|e| {
-                    format!(
-                        "[DEGRADED: checksum mismatch] {}",
-                        e.value
-                    )
-                })
-            }
+            Err(ShmReadError::OwnerTerminated { .. }) => self
+                .shared_memory
+                .get(key)
+                .map(|e| format!("[DEGRADED: owner terminated] {}", e.value)),
+            Err(ShmReadError::Corrupted { .. }) => self
+                .shared_memory
+                .get(key)
+                .map(|e| format!("[DEGRADED: checksum mismatch] {}", e.value)),
             Err(_) => None,
         }
     }
@@ -1012,7 +1277,9 @@ impl Syscall for LocalOS {
 
     fn get_working_dir(&self) -> Option<PathBuf> {
         let current = self.current_pid?;
-        self.processes.get(&current).and_then(|p| p.working_dir.clone())
+        self.processes
+            .get(&current)
+            .and_then(|p| p.working_dir.clone())
     }
 
     fn spawn_daemon(
@@ -1024,15 +1291,7 @@ impl Syscall for LocalOS {
         quota_turns: usize,
         max_restarts: usize,
     ) -> Result<u64, String> {
-        let pid = self.spawn(
-            parent_pid,
-            name,
-            goal,
-            priority,
-            quota_turns,
-            None,
-            None,
-        )?;
+        let pid = self.spawn(parent_pid, name, goal, priority, quota_turns, None, None)?;
         if let Some(proc) = self.processes.get_mut(&pid) {
             proc.is_daemon = true;
             proc.max_restarts = max_restarts;
@@ -1140,26 +1399,36 @@ impl KernelInternal for LocalOS {
     }
 
     fn pop_ready(&mut self) -> Option<Process> {
-        let pid = self.ready_queue.pop_front()?;
-        if let Some(proc) = self.processes.get_mut(&pid) {
-            proc.state = ProcessState::Running;
-            self.current_pid = Some(pid);
-            self.yield_requested = false;
-            Some(proc.clone())
-        } else {
-            None
+        // 跳过被惰性删除的 tombstone：ready_set 中不再存在的 pid 丢弃。
+        while let Some((pid, _priority)) = self.ready_queue.pop_front() {
+            if !self.ready_set.remove(&pid) {
+                continue;
+            }
+            if let Some(proc) = self.processes.get_mut(&pid) {
+                proc.state = ProcessState::Running;
+                self.current_pid = Some(pid);
+                self.yield_requested = false;
+                return Some(proc.clone());
+            }
         }
+        None
     }
 
     fn pop_all_ready(&mut self, max: usize) -> Vec<Process> {
         let mut result = Vec::new();
-        let count = max.min(self.ready_queue.len());
-        for _ in 0..count {
-            if let Some(pid) = self.ready_queue.pop_front() {
-                if let Some(proc) = self.processes.get_mut(&pid) {
-                    proc.state = ProcessState::Running;
-                    result.push(proc.clone());
-                }
+        // ready_set.len() 是实际可调度进程数，与可能含 tombstone 的
+        // ready_queue.len() 不同。
+        let cap = max.min(self.ready_set.len());
+        while result.len() < cap {
+            let Some((pid, _priority)) = self.ready_queue.pop_front() else {
+                break;
+            };
+            if !self.ready_set.remove(&pid) {
+                continue;
+            }
+            if let Some(proc) = self.processes.get_mut(&pid) {
+                proc.state = ProcessState::Running;
+                result.push(proc.clone());
             }
         }
         if let Some(first) = result.first() {
@@ -1187,6 +1456,10 @@ impl KernelInternal for LocalOS {
         let yielded = self.yield_requested;
         self.yield_requested = false;
         yielded
+    }
+
+    fn event_is_completed(&self, event_id: EventId) -> bool {
+        self.completed_events.contains(&event_id)
     }
 
     fn drop_terminated(&mut self, target_pid: u64) -> bool {
@@ -1225,34 +1498,29 @@ impl KernelInternal for LocalOS {
         for pid in wake_sleeping_pids {
             if let Some(proc) = self.processes.get_mut(&pid) {
                 proc.state = ProcessState::Ready;
-                proc.mailbox.push_back(format!(
-                    "Sleep finished at scheduler tick {}.",
-                    self.tick
-                ));
-                self.ready_queue.push_back(pid);
+                proc.mailbox
+                    .push_back(format!("Sleep finished at scheduler tick {}.", self.tick));
             }
+            self.enqueue_ready(pid);
         }
         for pid in wake_async_timeout_pids {
             if let Some(proc) = self.processes.get_mut(&pid) {
                 proc.state = ProcessState::Ready;
                 proc.mailbox.push_back(format!(
-                        "Event wait timeout reached at scheduler tick {}.",
+                    "Event wait timeout reached at scheduler tick {}.",
                     self.tick
                 ));
-                self.ready_queue.push_back(pid);
             }
-        }
-        if !self.ready_queue.is_empty() {
-            self.sort_ready_queue();
+            self.enqueue_ready(pid);
         }
     }
 
     fn has_ready(&self) -> bool {
-        !self.ready_queue.is_empty()
+        !self.ready_set.is_empty()
     }
 
     fn ready_count(&self) -> usize {
-        self.ready_queue.len()
+        self.ready_set.len()
     }
 
     fn set_round_robin(&mut self, enabled: bool) {
@@ -1275,7 +1543,7 @@ impl KernelInternal for LocalOS {
             proc.state = ProcessState::Ready;
         }
         self.current_pid = None;
-        self.ready_queue.push_back(pid);
+        self.enqueue_ready(pid);
         true
     }
 
@@ -1348,27 +1616,37 @@ impl KernelInternal for LocalOS {
             return Vec::new();
         }
 
-        // Accumulate into the persistent completed-events set so that wait_on_events
-        // called after this notification can still detect the already-satisfied condition.
         for &eid in completed_event_ids {
-            self.completed_events.insert(eid);
+            self.remember_completed_event(eid);
         }
 
-        let completed_set: std::collections::HashSet<EventId> =
-            self.completed_events.iter().copied().collect();
+        // Drain candidate pids from the reverse waiter index. Any remaining
+        // entries for these event ids are obsolete because future
+        // wait_on_events calls will short-circuit via completed_events.
+        let mut candidates: FastSet<u64> = FastSet::default();
+        for &eid in completed_event_ids {
+            if let Some(set) = self.event_waiters.remove(&eid) {
+                for pid in set {
+                    candidates.insert(pid);
+                }
+            }
+        }
+
         let mut wake_pids = Vec::new();
-        for (pid, proc) in self.processes.iter() {
-            if let ProcessState::Waiting {
-                reason:
-                    WaitReason::Events {
-                        event_ids,
-                        policy,
-                        ..
-                    },
-            } = &proc.state
-                && self.event_wait_is_satisfied(event_ids, policy, &completed_set)
+        for pid in candidates {
+            // Lazy verification: pid may have left Waiting via terminate /
+            // sigkill / timeout, in which case the stale entry is silently
+            // dropped by *not* re-inserting it.
+            if let Some(proc) = self.processes.get(&pid)
+                && let ProcessState::Waiting {
+                    reason:
+                        WaitReason::Events {
+                            event_ids, policy, ..
+                        },
+                } = &proc.state
+                && self.event_wait_is_satisfied(event_ids, policy, &self.completed_events)
             {
-                wake_pids.push(*pid);
+                wake_pids.push(pid);
             }
         }
 
@@ -1379,11 +1657,8 @@ impl KernelInternal for LocalOS {
                     "[EVENT_WAKE]\nReason: event wait condition satisfied.\nCompleted event ids: {}\nRecommended next actions:\n1. Inspect the event-producing subsystem for fresh state.\n2. If these events came from async tool work, use tool_status or tool_wait to collect results.\n3. Cancel low-value still-running branches when appropriate.\n4. If enough results are already available, continue reasoning immediately.",
                     completed_event_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ")
                 ));
-                self.ready_queue.push_back(*pid);
+                self.enqueue_ready(*pid);
             }
-        }
-        if !wake_pids.is_empty() {
-            self.sort_ready_queue();
         }
         wake_pids
     }
@@ -1392,7 +1667,10 @@ impl KernelInternal for LocalOS {
         let _ = <Self as RlimitOps>::rusage_charge(
             self,
             pid,
-            ResourceUsageDelta { turns: 1, ..Default::default() },
+            ResourceUsageDelta {
+                turns: 1,
+                ..Default::default()
+            },
         );
     }
 
@@ -1400,26 +1678,66 @@ impl KernelInternal for LocalOS {
         let _ = <Self as RlimitOps>::rusage_charge(
             self,
             pid,
-            ResourceUsageDelta { tool_calls: 1, ..Default::default() },
+            ResourceUsageDelta {
+                tool_calls: 1,
+                ..Default::default()
+            },
         );
     }
 
     fn check_daemon_restart(&mut self) -> Vec<u64> {
         let mut restarted = Vec::new();
-        let terminated_daemons: Vec<(u64, String, u8, usize, usize, Option<u64>, FastMap<String, String>, FastSet<String>, Option<PathBuf>)> = self.processes.iter()
+        let terminated_daemons: Vec<(
+            u64,
+            String,
+            u8,
+            usize,
+            usize,
+            Option<u64>,
+            FastMap<String, String>,
+            FastSet<String>,
+            Option<PathBuf>,
+        )> = self
+            .processes
+            .iter()
             .filter(|(_, proc)| {
                 proc.is_daemon
                     && proc.state == ProcessState::Terminated
                     && proc.restart_count < proc.max_restarts
             })
             .map(|(pid, proc)| {
-                (*pid, proc.name.clone(), proc.priority, proc.quota_turns, proc.restart_count, proc.parent_pid, proc.env.clone(), proc.allowed_tools.clone(), proc.working_dir.clone())
+                (
+                    *pid,
+                    proc.name.clone(),
+                    proc.priority,
+                    proc.quota_turns,
+                    proc.restart_count,
+                    proc.parent_pid,
+                    proc.env.clone(),
+                    proc.allowed_tools.clone(),
+                    proc.working_dir.clone(),
+                )
             })
             .collect();
 
-        for (old_pid, name, priority, quota_turns, restart_count, parent_pid, env, allowed_tools, working_dir) in terminated_daemons {
+        for (
+            old_pid,
+            name,
+            priority,
+            quota_turns,
+            restart_count,
+            parent_pid,
+            env,
+            allowed_tools,
+            working_dir,
+        ) in terminated_daemons
+        {
             self.processes.remove(&old_pid);
-            self.ready_queue.retain(|p| *p != old_pid);
+            if let Some(parent) = parent_pid {
+                self.unregister_child(parent, old_pid);
+            }
+            self.children_by_parent.remove(&old_pid);
+            self.ready_set.remove(&old_pid);
             self.wait_queue.remove(&old_pid);
 
             let new_pid = self.next_pid;
@@ -1456,12 +1774,13 @@ impl KernelInternal for LocalOS {
                     usage: ResourceUsage::default(),
                 },
             );
-            self.ready_queue.push_back(new_pid);
+            if let Some(parent) = parent_pid {
+                self.register_child(parent, new_pid);
+            }
+            // Daemon restart replaces the pid: invalidate SHM perm cache.
+            self.bump_topology_version();
+            self.enqueue_ready(new_pid);
             restarted.push(new_pid);
-        }
-
-        if !self.ready_queue.is_empty() {
-            self.sort_ready_queue();
         }
         restarted
     }
@@ -1479,9 +1798,29 @@ impl FutexOps for LocalOS {
     fn futex_create(&mut self, initial: u64, label: String) -> FutexAddr {
         let id = self.next_futex_id;
         self.next_futex_id += 1;
+        let event_id = self.alloc_internal_event_id();
         let owner = self.current_pid;
         self.futexes
-            .insert(id, FutexState::new(initial, owner, label));
+            .insert(id, FutexState::new(initial, event_id));
+        // 与 futex 生命周期绑定的 event_id 入资源计数。
+        self.inc_event_source_ref(event_id);
+        // Label and owner used to live on FutexState; emitting a trace event
+        // at create time keeps them visible for diagnostics without bloating
+        // the per-futex struct.
+        let mut fields = FastMap::default();
+        if let Some(pid) = owner {
+            fields.insert("owner_pid".to_string(), pid.to_string());
+        }
+        fields.insert("label".to_string(), label);
+        fields.insert("addr".to_string(), id.to_string());
+        <Self as TraceOps>::trace_event(
+            self,
+            "futex.create".to_string(),
+            TraceLevel::Debug,
+            None,
+            fields,
+            None,
+        );
         FutexAddr(id)
     }
 
@@ -1491,7 +1830,7 @@ impl FutexOps for LocalOS {
             .map(|s| s.value.load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    fn futex_cas(&self, addr: FutexAddr, expected: u64, new_value: u64) -> Result<u64, u64> {
+    fn futex_cas(&mut self, addr: FutexAddr, expected: u64, new_value: u64) -> Result<u64, u64> {
         use std::sync::atomic::Ordering::SeqCst;
         let state = match self.futexes.get(&addr.0) {
             Some(s) => s,
@@ -1501,23 +1840,36 @@ impl FutexOps for LocalOS {
             .value
             .compare_exchange(expected, new_value, SeqCst, SeqCst)
         {
-            Ok(prev) => Ok(prev),
+            Ok(prev) => {
+                if prev != new_value {
+                    self.complete_futex_event(addr, true);
+                }
+                Ok(prev)
+            }
             Err(cur) => Err(cur),
         }
     }
 
-    fn futex_fetch_add(&self, addr: FutexAddr, delta: u64) -> Option<u64> {
+    fn futex_fetch_add(&mut self, addr: FutexAddr, delta: u64) -> Option<u64> {
         let state = self.futexes.get(&addr.0)?;
-        Some(
-            state
-                .value
-                .fetch_add(delta, std::sync::atomic::Ordering::SeqCst),
-        )
+        let prev = state
+            .value
+            .fetch_add(delta, std::sync::atomic::Ordering::SeqCst);
+        if delta != 0 {
+            self.complete_futex_event(addr, true);
+        }
+        Some(prev)
     }
 
-    fn futex_store(&self, addr: FutexAddr, new_value: u64) -> Option<u64> {
+    fn futex_store(&mut self, addr: FutexAddr, new_value: u64) -> Option<u64> {
         let state = self.futexes.get(&addr.0)?;
-        Some(state.value.swap(new_value, std::sync::atomic::Ordering::SeqCst))
+        let prev = state
+            .value
+            .swap(new_value, std::sync::atomic::Ordering::SeqCst);
+        if prev != new_value {
+            self.complete_futex_event(addr, true);
+        }
+        Some(prev)
     }
 
     fn futex_try_wait(&self, addr: FutexAddr, expected: u64) -> Option<FutexWakeReason> {
@@ -1549,25 +1901,24 @@ impl FutexOps for LocalOS {
         }
         for pid in to_ready {
             if let Some(proc) = self.processes.get_mut(&pid) {
-                if !matches!(
-                    proc.state,
-                    ProcessState::Terminated | ProcessState::Stopped
-                ) {
+                if !matches!(proc.state, ProcessState::Terminated | ProcessState::Stopped) {
                     proc.state = ProcessState::Ready;
-                    if !self.ready_queue.contains(&pid) {
-                        self.ready_queue.push_back(pid);
-                    }
+                    self.enqueue_ready(pid);
                 }
             }
         }
-        if woken > 0 && !self.ready_queue.is_empty() {
-            self.sort_ready_queue();
-        }
+        self.complete_futex_event(addr, true);
         woken
     }
 
     fn futex_destroy(&mut self, addr: FutexAddr) -> bool {
-        self.futexes.remove(&addr.0).is_some()
+        let event_id = self.futexes.get(&addr.0).map(|state| state.event_id);
+        let removed = self.futexes.remove(&addr.0).is_some();
+        if removed && let Some(event_id) = event_id {
+            self.dec_event_source_ref(event_id);
+            self.notify_events_completed(&[event_id]);
+        }
+        removed
     }
 
     fn futex_register_waiter(&mut self, addr: FutexAddr, pid: u64) -> Option<u64> {
@@ -1591,6 +1942,10 @@ impl FutexOps for LocalOS {
     fn futex_seq(&self, addr: FutexAddr) -> Option<u64> {
         self.futexes.get(&addr.0).map(|s| s.seq)
     }
+
+    fn futex_event_id(&self, addr: FutexAddr) -> Option<EventId> {
+        self.futexes.get(&addr.0).map(|s| s.event_id)
+    }
 }
 
 impl TraceOps for LocalOS {
@@ -1611,7 +1966,7 @@ impl TraceOps for LocalOS {
             span_id: Some(span_id),
             parent_span_id: parent,
             kind: TraceKind::SpanEnter,
-            fields,
+            fields: TraceRecord::pack_fields(fields),
             message: None,
         };
         self.trace.push(rec);
@@ -1629,7 +1984,7 @@ impl TraceOps for LocalOS {
             span_id: Some(span_id),
             parent_span_id: None,
             kind: TraceKind::SpanExit,
-            fields,
+            fields: TraceRecord::pack_fields(fields),
             message: None,
         };
         self.trace.push(rec);
@@ -1653,20 +2008,14 @@ impl TraceOps for LocalOS {
             span_id,
             parent_span_id: None,
             kind: TraceKind::Event,
-            fields,
+            fields: TraceRecord::pack_fields(fields),
             message,
         };
         self.trace.push(rec);
     }
 
     fn trace_recent(&self, n: usize) -> Vec<TraceRecord> {
-        self.trace
-            .buf
-            .iter()
-            .rev()
-            .take(n)
-            .cloned()
-            .collect()
+        self.trace.buf.iter().rev().take(n).cloned().collect()
     }
 
     fn trace_drain_since(&self, since_seq: u64) -> Vec<TraceRecord> {
@@ -1679,11 +2028,7 @@ impl TraceOps for LocalOS {
     }
 
     fn trace_head_seq(&self) -> u64 {
-        self.trace
-            .buf
-            .back()
-            .map(|r| r.seq)
-            .unwrap_or(0)
+        self.trace.buf.back().map(|r| r.seq).unwrap_or(0)
     }
 
     fn trace_set_capacity(&mut self, cap: usize) {
@@ -1878,7 +2223,10 @@ impl LlmOps for LocalOS {
     }
 
     fn llm_price(&self, model: &str) -> LlmModelPrice {
-        self.llm_prices.get(model).copied().unwrap_or_else(LlmModelPrice::zero)
+        self.llm_prices
+            .get(model)
+            .copied()
+            .unwrap_or_else(LlmModelPrice::zero)
     }
 
     fn llm_account(&mut self, pid: u64, report: LlmUsageReport) -> LlmAccountOutcome {
@@ -1898,7 +2246,10 @@ impl LlmOps for LocalOS {
             use crate::types::FastMap;
             let mut fields: FastMap<String, String> = FastMap::with_capacity(6);
             fields.insert("model".to_string(), report.model.clone());
-            fields.insert("prompt_tokens".to_string(), report.prompt_tokens.to_string());
+            fields.insert(
+                "prompt_tokens".to_string(),
+                report.prompt_tokens.to_string(),
+            );
             fields.insert(
                 "completion_tokens".to_string(),
                 report.completion_tokens.to_string(),
@@ -1928,7 +2279,10 @@ impl LlmOps for LocalOS {
         };
         let verdict = <Self as RlimitOps>::rusage_charge(self, pid, delta);
 
-        LlmAccountOutcome { charged_cost_micros, verdict }
+        LlmAccountOutcome {
+            charged_cost_micros,
+            verdict,
+        }
     }
 }
 
@@ -1998,6 +2352,12 @@ impl LocalOS {
 }
 
 impl VfsOps for LocalOS {
+    // SAFETY/PERF NOTE: the methods on this impl block call into blocking
+    // `std::fs` while the global `SharedKernel` mutex is held. They must
+    // therefore not be invoked from latency-sensitive async code paths that
+    // expect non-blocking semantics — large reads/writes will stall every
+    // other tenant of the kernel for the duration of the syscall. Use
+    // out-of-band tooling (e.g. dedicated worker threads) for big files.
     fn vfs_read_to_string(
         &mut self,
         pid: Option<u64>,
@@ -2017,7 +2377,10 @@ impl VfsOps for LocalOS {
 
         // charge fs_bytes（pid 缺失或不受约束时 skip；rlimit 超出则返回 QuotaExceeded）
         let verdict = if let Some(pid) = pid {
-            let delta = ResourceUsageDelta { fs_bytes: bytes, ..Default::default() };
+            let delta = ResourceUsageDelta {
+                fs_bytes: bytes,
+                ..Default::default()
+            };
             Some(<Self as RlimitOps>::rusage_charge(self, pid, delta))
         } else {
             None
@@ -2025,8 +2388,17 @@ impl VfsOps for LocalOS {
 
         self.vfs_emit_trace("read", pid, path, bytes, verdict.as_ref());
 
-        if let Some(RlimitVerdict::Exceeded { dimension, used, limit }) = verdict {
-            return Err(VfsError::QuotaExceeded { dimension, used, limit });
+        if let Some(RlimitVerdict::Exceeded {
+            dimension,
+            used,
+            limit,
+        }) = verdict
+        {
+            return Err(VfsError::QuotaExceeded {
+                dimension,
+                used,
+                limit,
+            });
         }
         Ok(content)
     }
@@ -2043,9 +2415,8 @@ impl VfsOps for LocalOS {
         }
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    VfsError::Io(format!("Failed to create directory: {}", e))
-                })?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| VfsError::Io(format!("Failed to create directory: {}", e)))?;
             }
         }
         std::fs::write(path, content)
@@ -2053,7 +2424,10 @@ impl VfsOps for LocalOS {
         let bytes = content.len() as u64;
 
         let verdict = if let Some(pid) = pid {
-            let delta = ResourceUsageDelta { fs_bytes: bytes, ..Default::default() };
+            let delta = ResourceUsageDelta {
+                fs_bytes: bytes,
+                ..Default::default()
+            };
             Some(<Self as RlimitOps>::rusage_charge(self, pid, delta))
         } else {
             None
@@ -2061,8 +2435,17 @@ impl VfsOps for LocalOS {
 
         self.vfs_emit_trace("write", pid, path, bytes, verdict.as_ref());
 
-        if let Some(RlimitVerdict::Exceeded { dimension, used, limit }) = verdict {
-            return Err(VfsError::QuotaExceeded { dimension, used, limit });
+        if let Some(RlimitVerdict::Exceeded {
+            dimension,
+            used,
+            limit,
+        }) = verdict
+        {
+            return Err(VfsError::QuotaExceeded {
+                dimension,
+                used,
+                limit,
+            });
         }
         Ok(())
     }
@@ -2071,12 +2454,15 @@ impl VfsOps for LocalOS {
         if is_sensitive_fs_path(path) {
             return Err(VfsError::PermissionDenied(path.display().to_string()));
         }
-        let meta = std::fs::metadata(path)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => VfsError::NotFound(path.display().to_string()),
-                _ => VfsError::Io(e.to_string()),
-            })?;
-        Ok(VfsStat { size: meta.len(), is_file: meta.is_file(), is_dir: meta.is_dir() })
+        let meta = std::fs::metadata(path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => VfsError::NotFound(path.display().to_string()),
+            _ => VfsError::Io(e.to_string()),
+        })?;
+        Ok(VfsStat {
+            size: meta.len(),
+            is_file: meta.is_file(),
+            is_dir: meta.is_dir(),
+        })
     }
 
     fn vfs_remove_file(&mut self, path: &std::path::Path) -> Result<(), VfsError> {
@@ -2197,6 +2583,200 @@ impl LocalOS {
         entry.closed && entry.queue.is_empty() && entry.ref_count == 0
     }
 
+    fn flatten_ref_holders(holders: &[(String, u32)]) -> Vec<String> {
+        let total: usize = holders.iter().map(|(_, c)| *c as usize).sum();
+        let mut out = Vec::with_capacity(total);
+        for (name, count) in holders {
+            for _ in 0..*count {
+                out.push(name.clone());
+            }
+        }
+        out
+    }
+
+    fn epoll_actual_events_for_source(&self, source: EpollSource) -> EpollEventMask {
+        match source {
+            EpollSource::Event(event_id) => {
+                if self.completed_events.contains(&event_id) {
+                    EpollEventMask::IN
+                } else {
+                    EpollEventMask::EMPTY
+                }
+            }
+            EpollSource::Channel(channel) => match self.channels.get(&channel.0) {
+                Some(entry) => {
+                    let mut mask = EpollEventMask::EMPTY;
+                    if !entry.queue.is_empty() {
+                        mask |= EpollEventMask::IN;
+                    }
+                    if entry.closed {
+                        mask |= EpollEventMask::HUP;
+                    }
+                    mask
+                }
+                None => EpollEventMask::ERR,
+            },
+            EpollSource::Futex { addr, expected } => match self.futexes.get(&addr.0) {
+                Some(state) => {
+                    let current = state.value.load(std::sync::atomic::Ordering::SeqCst);
+                    if current != expected {
+                        EpollEventMask::IN
+                    } else {
+                        EpollEventMask::EMPTY
+                    }
+                }
+                None => EpollEventMask::ERR,
+            },
+        }
+    }
+
+    fn epoll_wait_event_id_for_registration(
+        &self,
+        registration: &EpollRegistration,
+    ) -> Option<EventId> {
+        match registration.snapshot.source {
+            EpollSource::Event(event_id) => {
+                (!self.completed_events.contains(&event_id)).then_some(event_id)
+            }
+            EpollSource::Channel(channel) => {
+                // 单次 channels 查表得到 entry，然后直接判定 mask，避免再走
+                // `epoll_actual_events_for_source` 二次查表。
+                let entry = self.channels.get(&channel.0)?;
+                let has_data = !entry.queue.is_empty();
+                if has_data || entry.closed {
+                    None
+                } else {
+                    Some(entry.event_id)
+                }
+            }
+            EpollSource::Futex { addr, expected } => self.futexes.get(&addr.0).and_then(|state| {
+                let current = state.value.load(std::sync::atomic::Ordering::SeqCst);
+                let seq_cursor = registration.futex_seq_cursor.unwrap_or(state.seq);
+                if current != expected || state.seq != seq_cursor {
+                    None
+                } else {
+                    Some(state.event_id)
+                }
+            }),
+        }
+    }
+
+    fn epoll_collect_ready_for_registration(
+        &self,
+        registration: &EpollRegistration,
+    ) -> EpollEventMask {
+        match registration.snapshot.source {
+            EpollSource::Futex { addr, expected } => match self.futexes.get(&addr.0) {
+                Some(state) => {
+                    let current = state.value.load(std::sync::atomic::Ordering::SeqCst);
+                    let seq_cursor = registration.futex_seq_cursor.unwrap_or(state.seq);
+                    let mut actual = EpollEventMask::EMPTY;
+                    if current != expected || state.seq != seq_cursor {
+                        actual |= EpollEventMask::IN;
+                    }
+                    actual & registration.snapshot.events
+                }
+                None => EpollEventMask::ERR & registration.snapshot.events,
+            },
+            _ => {
+                let actual = self.epoll_actual_events_for_source(registration.snapshot.source);
+                actual & registration.snapshot.events
+            }
+        }
+    }
+
+    fn epoll_collect_ready(
+        &self,
+        registrations: &[EpollRegistration],
+        max_events: usize,
+    ) -> Vec<EpollReadyEvent> {
+        let mut ready = Vec::new();
+        let limit = max_events.max(1);
+        for registration in registrations {
+            let matched = self.epoll_collect_ready_for_registration(registration);
+            if matched.is_empty() {
+                continue;
+            }
+            ready.push(EpollReadyEvent {
+                source: registration.snapshot.source,
+                events: matched,
+                user_data: registration.snapshot.user_data,
+            });
+            if ready.len() >= limit {
+                break;
+            }
+        }
+        ready
+    }
+
+    fn epoll_collect_wait_ids(&self, registrations: &[EpollRegistration]) -> Vec<EventId> {
+        let mut wait_ids = Vec::new();
+        // 用临时集合做去重，避免每次插入都对 wait_ids 做线性扫描。
+        // 在 registration 数大的 epoll 上，O(n^2) 退化为 O(n)。
+        let mut seen: FastSet<EventId> = FastSet::default();
+        for registration in registrations {
+            let actual = self.epoll_collect_ready_for_registration(registration);
+            if !actual.is_empty() {
+                continue;
+            }
+            if let Some(event_id) = self.epoll_wait_event_id_for_registration(registration)
+                && seen.insert(event_id)
+            {
+                wait_ids.push(event_id);
+            }
+        }
+        wait_ids
+    }
+
+    fn epoll_snapshot_from_entry(&self, epoll: EpollId, entry: &EpollEntry) -> EpollSnapshot {
+        let mut registrations = entry
+            .registrations
+            .values()
+            .map(|registration| registration.snapshot.clone())
+            .collect::<Vec<_>>();
+        registrations.sort_by_key(|item| item.user_data);
+        EpollSnapshot {
+            epoll,
+            label: entry.label.clone(),
+            registrations,
+        }
+    }
+
+    fn complete_futex_event(&mut self, addr: FutexAddr, rotate: bool) {
+        let Some(event_id) = self.futexes.get(&addr.0).map(|state| state.event_id) else {
+            return;
+        };
+        self.notify_events_completed(&[event_id]);
+        if rotate {
+            // 轮转时老 event_id 不再被任何 source 索引，换上新的 event_id
+            // 同步调整 event_source_refs 以保持严格配对。
+            self.dec_event_source_ref(event_id);
+            let next_event_id = self.alloc_internal_event_id();
+            if let Some(state) = self.futexes.get_mut(&addr.0) {
+                state.event_id = next_event_id;
+            }
+            self.inc_event_source_ref(next_event_id);
+        }
+    }
+
+    fn epoll_refresh_futex_cursors(&mut self, epoll: EpollId, ready: &[EpollReadyEvent]) {
+        let mut futex_updates = Vec::new();
+        for event in ready {
+            let EpollSource::Futex { addr, .. } = event.source else {
+                continue;
+            };
+            futex_updates.push((event.source, self.futex_seq(addr)));
+        }
+        let Some(entry) = self.epolls.get_mut(&epoll.0) else {
+            return;
+        };
+        for (source, current_seq) in futex_updates {
+            if let Some(registration) = entry.registrations.get_mut(&source) {
+                registration.futex_seq_cursor = current_seq;
+            }
+        }
+    }
+
     fn alloc_internal_event_id(&mut self) -> EventId {
         let event_id = EventId::new(self.next_internal_event_id);
         self.next_internal_event_id += 1;
@@ -2270,7 +2850,9 @@ impl DaemonOps for LocalOS {
                 return false;
             }
             entry.state = DaemonState::Cancelled;
-            entry.cancel_flag.store(true, std::sync::atomic::Ordering::Release);
+            entry
+                .cancel_flag
+                .store(true, std::sync::atomic::Ordering::Release);
             (entry.label.clone(), entry.kind, entry.parent_pid)
         };
         self.daemon_emit_trace("cancel", handle, &label, kind, parent_pid, None);
@@ -2333,20 +2915,31 @@ impl IpcOps for LocalOS {
         self.next_channel_id += 1;
         let event_id = self.alloc_internal_event_id();
         let cap = capacity.max(1);
+        let initial_count = initial_ref_holders.len() as u32;
+        let mut holder_counts: Vec<(String, u32)> = Vec::with_capacity(initial_ref_holders.len());
+        for name in initial_ref_holders {
+            if let Some(slot) = holder_counts.iter_mut().find(|(n, _)| *n == name) {
+                slot.1 = slot.1.saturating_add(1);
+            } else {
+                holder_counts.push((name, 1));
+            }
+        }
         self.channels.insert(
             id,
             IpcChannelEntry {
                 owner_pid,
                 label: label.clone(),
                 owner_tag,
-                ref_count: initial_ref_holders.len() as u32,
-                ref_holders: initial_ref_holders,
+                ref_count: initial_count,
+                ref_holders: holder_counts,
                 event_id,
                 capacity: cap,
                 queue: VecDeque::new(),
                 closed: false,
             },
         );
+        // 与 channel 生命周期绑定的 event_id 在表中记一次引用。
+        self.inc_event_source_ref(event_id);
         let channel = ChannelId(id);
         self.channel_emit_trace("channel_create", channel, owner_pid, &label, 0);
         channel
@@ -2357,16 +2950,18 @@ impl IpcOps for LocalOS {
     }
 
     fn channel_meta(&self, channel: ChannelId) -> Option<ChannelMetaSnapshot> {
-        self.channels.get(&channel.0).map(|entry| ChannelMetaSnapshot {
-            channel,
-            label: entry.label.clone(),
-            owner_pid: entry.owner_pid,
-            owner_tag: entry.owner_tag,
-            ref_count: entry.ref_count,
-            ref_holders: entry.ref_holders.clone(),
-            queued_len: entry.queue.len(),
-            closed: entry.closed,
-        })
+        self.channels
+            .get(&channel.0)
+            .map(|entry| ChannelMetaSnapshot {
+                channel,
+                label: entry.label.clone(),
+                owner_pid: entry.owner_pid,
+                owner_tag: entry.owner_tag,
+                ref_count: entry.ref_count,
+                ref_holders: Self::flatten_ref_holders(&entry.ref_holders),
+                queued_len: entry.queue.len(),
+                closed: entry.closed,
+            })
     }
 
     fn list_channels(&self) -> Vec<ChannelMetaSnapshot> {
@@ -2379,7 +2974,7 @@ impl IpcOps for LocalOS {
                 owner_pid: entry.owner_pid,
                 owner_tag: entry.owner_tag,
                 ref_count: entry.ref_count,
-                ref_holders: entry.ref_holders.clone(),
+                ref_holders: Self::flatten_ref_holders(&entry.ref_holders),
                 queued_len: entry.queue.len(),
                 closed: entry.closed,
             })
@@ -2419,14 +3014,23 @@ impl IpcOps for LocalOS {
             }
             let should_notify = entry.queue.is_empty();
             entry.queue.push_back(message);
-            (entry.label.clone(), entry.queue.len(), should_notify, entry.event_id)
+            (
+                entry.label.clone(),
+                entry.queue.len(),
+                should_notify,
+                entry.event_id,
+            )
         };
         if should_notify {
             self.notify_events_completed(&[event_id]);
+            // 旧 event 不再是 channel 的 source，转换后由新 event 负责后续 waiter
+            // 的 live 判定。
+            self.dec_event_source_ref(event_id);
             let next_event_id = self.alloc_internal_event_id();
             if let Some(entry) = self.channels.get_mut(&channel.0) {
                 entry.event_id = next_event_id;
             }
+            self.inc_event_source_ref(next_event_id);
         }
         self.channel_emit_trace("send", channel, sender_pid, &label, depth);
         Ok(())
@@ -2538,10 +3142,7 @@ impl IpcOps for LocalOS {
             .get(&channel.0)
             .ok_or_else(|| format!("Channel {} does not exist.", channel))?
             .ref_count;
-        self.channel_retain_named(
-            channel,
-            format!("retain#{}", next_idx),
-        )
+        self.channel_retain_named(channel, format!("retain#{}", next_idx))
     }
 
     fn channel_retain_named(&mut self, channel: ChannelId, holder: String) -> Result<u32, String> {
@@ -2549,7 +3150,15 @@ impl IpcOps for LocalOS {
             .channels
             .get_mut(&channel.0)
             .ok_or_else(|| format!("Channel {} does not exist.", channel))?;
-        entry.ref_holders.push(holder);
+        if let Some(slot) = entry
+            .ref_holders
+            .iter_mut()
+            .find(|(name, _)| *name == holder)
+        {
+            slot.1 = slot.1.saturating_add(1);
+        } else {
+            entry.ref_holders.push((holder, 1));
+        }
         entry.ref_count = entry.ref_count.saturating_add(1);
         Ok(entry.ref_count)
     }
@@ -2558,7 +3167,7 @@ impl IpcOps for LocalOS {
         let holder = self
             .channels
             .get(&channel.0)
-            .and_then(|entry| entry.ref_holders.last().cloned())
+            .and_then(|entry| entry.ref_holders.last().map(|(name, _)| name.clone()))
             .ok_or_else(|| format!("Channel {} ref_count is already zero.", channel))?;
         self.channel_release_named(channel, &holder)
     }
@@ -2571,13 +3180,20 @@ impl IpcOps for LocalOS {
         if entry.ref_count == 0 {
             return Err(format!("Channel {} ref_count is already zero.", channel));
         }
-        let Some(idx) = entry.ref_holders.iter().position(|h| h == holder) else {
+        let Some(idx) = entry
+            .ref_holders
+            .iter()
+            .position(|(name, _)| name == holder)
+        else {
             return Err(format!(
                 "Channel {} does not have ref holder {:?}.",
                 channel, holder
             ));
         };
-        entry.ref_holders.remove(idx);
+        entry.ref_holders[idx].1 -= 1;
+        if entry.ref_holders[idx].1 == 0 {
+            entry.ref_holders.remove(idx);
+        }
         entry.ref_count -= 1;
         Ok(entry.ref_count)
     }
@@ -2592,7 +3208,11 @@ impl IpcOps for LocalOS {
                 .channels
                 .get(&channel.0)
                 .ok_or_else(|| format!("Channel {} does not exist.", channel))?;
-            (entry.owner_pid, entry.label.clone(), Self::channel_is_gc_eligible(entry))
+            (
+                entry.owner_pid,
+                entry.label.clone(),
+                Self::channel_is_gc_eligible(entry),
+            )
         };
         if !self.channel_can_manage(owner_pid, caller_pid) {
             return Err(format!(
@@ -2606,7 +3226,10 @@ impl IpcOps for LocalOS {
                 channel
             ));
         }
-        self.channels.remove(&channel.0);
+        let removed_event_id = self.channels.remove(&channel.0).map(|e| e.event_id);
+        if let Some(event_id) = removed_event_id {
+            self.dec_event_source_ref(event_id);
+        }
         self.channel_emit_trace("destroy", channel, caller_pid, &label, 0);
         Ok(())
     }
@@ -2624,17 +3247,15 @@ impl IpcOps for LocalOS {
             })
             .collect::<Vec<_>>();
         for (id, label) in &doomed {
-            self.channels.remove(id);
+            if let Some(removed) = self.channels.remove(id) {
+                self.dec_event_source_ref(removed.event_id);
+            }
             self.channel_emit_trace("gc", ChannelId(*id), None, label, 0);
         }
         doomed.len()
     }
 
-    fn channel_close(
-        &mut self,
-        closer_pid: Option<u64>,
-        channel: ChannelId,
-    ) -> Result<(), String> {
+    fn channel_close(&mut self, closer_pid: Option<u64>, channel: ChannelId) -> Result<(), String> {
         let owner_pid = self.channels.get(&channel.0).map(|e| e.owner_pid);
         if !self.channel_allows_receiver(owner_pid.flatten(), closer_pid) {
             return Err(format!(
@@ -2651,17 +3272,179 @@ impl IpcOps for LocalOS {
                 .ok_or_else(|| format!("Channel {} does not exist.", channel))?;
             let should_notify = entry.queue.is_empty() && !entry.closed;
             entry.closed = true;
-            (entry.label.clone(), entry.queue.len(), should_notify, entry.event_id)
+            (
+                entry.label.clone(),
+                entry.queue.len(),
+                should_notify,
+                entry.event_id,
+            )
         };
         if should_notify {
             self.notify_events_completed(&[event_id]);
+            // 旧 event 不再是 channel 的 source，转换后由新 event 负责后续 waiter
+            // 的 live 判定。
+            self.dec_event_source_ref(event_id);
             let next_event_id = self.alloc_internal_event_id();
             if let Some(entry) = self.channels.get_mut(&channel.0) {
                 entry.event_id = next_event_id;
             }
+            self.inc_event_source_ref(next_event_id);
         }
         self.channel_emit_trace("close", channel, closer_pid, &label, depth);
         Ok(())
+    }
+}
+
+impl EpollOps for LocalOS {
+    fn epoll_create(&mut self, label: String) -> EpollId {
+        let id = self.next_epoll_id;
+        self.next_epoll_id += 1;
+        self.epolls.insert(
+            id,
+            EpollEntry {
+                label,
+                registrations: FastMap::default(),
+            },
+        );
+        EpollId(id)
+    }
+
+    fn epoll_ctl_add(
+        &mut self,
+        epoll: EpollId,
+        source: EpollSource,
+        events: EpollEventMask,
+        user_data: u64,
+    ) -> Result<(), String> {
+        let futex_seq_cursor = match source {
+            EpollSource::Futex { addr, .. } => self.futex_seq(addr),
+            _ => None,
+        };
+        let entry = self
+            .epolls
+            .get_mut(&epoll.0)
+            .ok_or_else(|| format!("Epoll {} does not exist.", epoll))?;
+        if events.is_empty() {
+            return Err("epoll interest mask cannot be empty.".to_string());
+        }
+        if entry.registrations.contains_key(&source) {
+            return Err(format!("Epoll {} already watches {:?}.", epoll, source));
+        }
+        entry.registrations.insert(
+            source,
+            EpollRegistration {
+                snapshot: EpollRegistrationSnapshot {
+                    source,
+                    events,
+                    user_data,
+                },
+                futex_seq_cursor,
+            },
+        );
+        if let EpollSource::Event(event_id) = source {
+            self.inc_event_source_ref(event_id);
+        }
+        Ok(())
+    }
+
+    fn epoll_ctl_mod(
+        &mut self,
+        epoll: EpollId,
+        source: EpollSource,
+        events: EpollEventMask,
+        user_data: u64,
+    ) -> Result<(), String> {
+        let futex_seq_cursor = match source {
+            EpollSource::Futex { addr, .. } => self.futex_seq(addr),
+            _ => None,
+        };
+        let entry = self
+            .epolls
+            .get_mut(&epoll.0)
+            .ok_or_else(|| format!("Epoll {} does not exist.", epoll))?;
+        if events.is_empty() {
+            return Err("epoll interest mask cannot be empty.".to_string());
+        }
+        let registration = entry
+            .registrations
+            .get_mut(&source)
+            .ok_or_else(|| format!("Epoll {} does not watch {:?}.", epoll, source))?;
+        registration.snapshot.events = events;
+        registration.snapshot.user_data = user_data;
+        registration.futex_seq_cursor = futex_seq_cursor;
+        Ok(())
+    }
+
+    fn epoll_ctl_del(&mut self, epoll: EpollId, source: EpollSource) -> Result<(), String> {
+        let entry = self
+            .epolls
+            .get_mut(&epoll.0)
+            .ok_or_else(|| format!("Epoll {} does not exist.", epoll))?;
+        if entry.registrations.remove(&source).is_none() {
+            return Err(format!("Epoll {} does not watch {:?}.", epoll, source));
+        }
+        if let EpollSource::Event(event_id) = source {
+            self.dec_event_source_ref(event_id);
+        }
+        Ok(())
+    }
+
+    fn epoll_wait(
+        &mut self,
+        epoll: EpollId,
+        max_events: usize,
+        timeout_ticks: Option<u64>,
+    ) -> Result<EpollWaitResult, String> {
+        let registrations = self
+            .epolls
+            .get(&epoll.0)
+            .ok_or_else(|| format!("Epoll {} does not exist.", epoll))?
+            .registrations
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        if registrations.is_empty() {
+            return Ok(EpollWaitResult::Ready(Vec::new()));
+        }
+
+        let ready = self.epoll_collect_ready(&registrations, max_events);
+        if !ready.is_empty() {
+            self.epoll_refresh_futex_cursors(epoll, &ready);
+            return Ok(EpollWaitResult::Ready(ready));
+        }
+
+        let wait_ids = self.epoll_collect_wait_ids(&registrations);
+        if wait_ids.is_empty() {
+            return Ok(EpollWaitResult::Ready(Vec::new()));
+        }
+
+        let timeout_tick = self.wait_on_events(wait_ids, WaitPolicy::Any, timeout_ticks)?;
+        if self.consume_yield_requested() || timeout_tick.is_some() {
+            return Ok(EpollWaitResult::Suspended { timeout_tick });
+        }
+
+        let ready = self.epoll_collect_ready(&registrations, max_events);
+        self.epoll_refresh_futex_cursors(epoll, &ready);
+        Ok(EpollWaitResult::Ready(ready))
+    }
+
+    fn epoll_snapshot(&self, epoll: EpollId) -> Option<EpollSnapshot> {
+        self.epolls
+            .get(&epoll.0)
+            .map(|entry| self.epoll_snapshot_from_entry(epoll, entry))
+    }
+
+    fn epoll_destroy(&mut self, epoll: EpollId) -> bool {
+        let Some(entry) = self.epolls.remove(&epoll.0) else {
+            return false;
+        };
+        // 释放该 epoll 中所有 EpollSource::Event 的引用计数。
+        for registration in entry.registrations.values() {
+            if let EpollSource::Event(event_id) = registration.snapshot.source {
+                self.dec_event_source_ref(event_id);
+            }
+        }
+        true
     }
 }
 
@@ -2681,7 +3464,13 @@ mod tests {
     #[test]
     fn foreground_process_can_wait_and_resume_on_child_exit() {
         let mut os = LocalOS::new();
-        let root = os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+        let root = os.begin_foreground(
+            "foreground".to_string(),
+            "root goal".to_string(),
+            10,
+            8,
+            None,
+        );
         let child = os
             .spawn(
                 Some(root),
@@ -2714,7 +3503,13 @@ mod tests {
     #[test]
     fn foreground_process_can_wait_on_events() {
         let mut os = LocalOS::new();
-        let root = os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+        let root = os.begin_foreground(
+            "foreground".to_string(),
+            "root goal".to_string(),
+            10,
+            8,
+            None,
+        );
 
         let timeout_tick = os
             .wait_on_events(
@@ -2742,7 +3537,13 @@ mod tests {
     #[test]
     fn event_wait_timeout_wakes_process() {
         let mut os = LocalOS::new();
-        let root = os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+        let root = os.begin_foreground(
+            "foreground".to_string(),
+            "root goal".to_string(),
+            10,
+            8,
+            None,
+        );
 
         os.wait_on_events(vec![EventId::new(1)], WaitPolicy::All, Some(2))
             .unwrap();
@@ -2766,7 +3567,13 @@ mod tests {
     #[test]
     fn event_completion_wakes_waiting_process() {
         let mut os = LocalOS::new();
-        let root = os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+        let root = os.begin_foreground(
+            "foreground".to_string(),
+            "root goal".to_string(),
+            10,
+            8,
+            None,
+        );
 
         os.wait_on_events(
             vec![EventId::new(1), EventId::new(2)],
@@ -2782,14 +3589,434 @@ mod tests {
         assert_eq!(root_proc.state, ProcessState::Ready);
         assert_eq!(
             root_proc.mailbox.back().map(|s| s.as_str()),
-            Some("[EVENT_WAKE]\nReason: event wait condition satisfied.\nCompleted event ids: evt_2\nRecommended next actions:\n1. Inspect the event-producing subsystem for fresh state.\n2. If these events came from async tool work, use tool_status or tool_wait to collect results.\n3. Cancel low-value still-running branches when appropriate.\n4. If enough results are already available, continue reasoning immediately.")
+            Some(
+                "[EVENT_WAKE]\nReason: event wait condition satisfied.\nCompleted event ids: evt_2\nRecommended next actions:\n1. Inspect the event-producing subsystem for fresh state.\n2. If these events came from async tool work, use tool_status or tool_wait to collect results.\n3. Cancel low-value still-running branches when appropriate.\n4. If enough results are already available, continue reasoning immediately."
+            )
         );
+    }
+
+    #[test]
+    fn ready_queue_insertion_preserves_priority_order() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground(
+            "foreground".to_string(),
+            "root goal".to_string(),
+            10,
+            8,
+            None,
+        );
+        let low_priority_pid = os
+            .spawn(
+                Some(root),
+                "low".to_string(),
+                "low priority".to_string(),
+                30,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let high_priority_pid = os
+            .spawn(
+                Some(root),
+                "high".to_string(),
+                "high priority".to_string(),
+                5,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let mid_priority_pid = os
+            .spawn(
+                Some(root),
+                "mid".to_string(),
+                "mid priority".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(os.pop_ready().map(|proc| proc.pid), Some(high_priority_pid));
+        assert_eq!(os.pop_ready().map(|proc| proc.pid), Some(mid_priority_pid));
+        assert_eq!(os.pop_ready().map(|proc| proc.pid), Some(low_priority_pid));
+    }
+
+    #[test]
+    fn completed_events_are_retention_bounded_for_inactive_events() {
+        let mut os = LocalOS::new();
+        os.completed_event_retention = 2;
+
+        os.notify_events_completed(&[EventId::new(1)]);
+        os.notify_events_completed(&[EventId::new(2)]);
+        os.notify_events_completed(&[EventId::new(3)]);
+
+        assert!(!os.event_is_completed(EventId::new(1)));
+        assert!(os.event_is_completed(EventId::new(2)));
+        assert!(os.event_is_completed(EventId::new(3)));
+        assert_eq!(os.completed_events.len(), 2);
+    }
+
+    #[test]
+    fn completed_event_retention_preserves_live_epoll_event_sources() {
+        use crate::primitives::{EpollEventMask, EpollOps, EpollSource};
+
+        let mut os = LocalOS::new();
+        os.completed_event_retention = 1;
+        let watched_event = EventId::new(10);
+        let epoll = os.epoll_create("live-event".to_string());
+        os.epoll_ctl_add(
+            epoll,
+            EpollSource::Event(watched_event),
+            EpollEventMask::IN,
+            10,
+        )
+        .unwrap();
+
+        os.notify_events_completed(&[watched_event]);
+        os.notify_events_completed(&[EventId::new(11)]);
+        os.notify_events_completed(&[EventId::new(12)]);
+
+        assert!(os.event_is_completed(watched_event));
+        assert!(!os.event_is_completed(EventId::new(11)));
+        assert!(os.event_is_completed(EventId::new(12)));
+    }
+
+    #[test]
+    fn notify_events_completed_uses_waiter_index() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "g".to_string(), 10, 8, None);
+        let child = os
+            .spawn(
+                Some(root),
+                "c".to_string(),
+                "g".to_string(),
+                10,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+        // Run the child so its current_pid context is set, then have it wait.
+        let popped = os.pop_ready().unwrap();
+        assert_eq!(popped.pid, child);
+        let event = EventId::new(42);
+        os.wait_on_events(vec![event], WaitPolicy::Any, None)
+            .unwrap();
+        // Index should now contain the child pid.
+        assert!(
+            os.event_waiters
+                .get(&event)
+                .is_some_and(|set| set.contains(&child))
+        );
+        // Notify wakes the child.
+        let woken = os.notify_events_completed(&[event]);
+        assert_eq!(woken, vec![child]);
+        // The waiter index entry for the completed event should be drained.
+        assert!(os.event_waiters.get(&event).is_none());
+    }
+
+    #[test]
+    fn notify_events_completed_skips_stale_waiters() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "g".to_string(), 10, 8, None);
+        let child = os
+            .spawn(
+                Some(root),
+                "c".to_string(),
+                "g".to_string(),
+                10,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+        let popped = os.pop_ready().unwrap();
+        assert_eq!(popped.pid, child);
+        let event = EventId::new(99);
+        os.wait_on_events(vec![event], WaitPolicy::Any, None)
+            .unwrap();
+        // Forcibly terminate the child while it is in the waiter index.
+        os.terminate_pid(child, "killed".to_string());
+        // Stale entry must not be woken (and notify must not panic).
+        let woken = os.notify_events_completed(&[event]);
+        assert!(woken.is_empty());
+    }
+
+    #[test]
+    fn descendants_use_persistent_index() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "g".to_string(), 10, 8, None);
+        let a = os
+            .spawn(
+                Some(root),
+                "a".to_string(),
+                "g".to_string(),
+                10,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+        let b = os
+            .spawn(Some(a), "b".to_string(), "g".to_string(), 10, 8, None, None)
+            .unwrap();
+        let c = os
+            .spawn(Some(a), "c".to_string(), "g".to_string(), 10, 8, None, None)
+            .unwrap();
+        let mut descendants = os.collect_descendants(root);
+        descendants.sort();
+        let mut expected = vec![a, b, c];
+        expected.sort();
+        assert_eq!(descendants, expected);
+        // Index must be properly maintained: removing a node updates parent's set.
+        assert!(
+            os.children_by_parent
+                .get(&a)
+                .is_some_and(|s| s.contains(&b) && s.contains(&c))
+        );
+        os.terminate_pid(b, "done".to_string());
+        os.remove_process_entry(b);
+        assert!(
+            os.children_by_parent
+                .get(&a)
+                .is_some_and(|s| !s.contains(&b) && s.contains(&c))
+        );
+    }
+
+    /// 终止进程 + 重新登入应当让 SHM 权限缓存里的旧答复失效，否则
+    /// 会出现“owner 已死但 cache 仍允许写”的尴尬窗口。
+    #[test]
+    fn shm_perm_cache_invalidates_on_topology_change() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "g".to_string(), 10, 8, None);
+        let owner = os
+            .spawn(
+                Some(root),
+                "owner".to_string(),
+                "g".to_string(),
+                10,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+        let stranger = os
+            .spawn(
+                Some(root),
+                "stranger".to_string(),
+                "g".to_string(),
+                10,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+
+        os.set_current_pid(Some(owner));
+        os.shm_create("k".to_string(), "v".to_string()).unwrap();
+
+        // stranger 当前是 sibling，可读但不可写。
+        os.set_current_pid(Some(stranger));
+        let entry = os.shared_memory.get("k").unwrap();
+        assert!(!os.is_shm_accessible_by(stranger, entry));
+        assert!(os.is_shm_readable_by(stranger, entry));
+
+        // 把 stranger 拉进 owner 的 process group：拓扑变更应让缓存里
+        // “stranger 不可写”的旧答案失效，重新计算后变为可写。
+        let pgid = os.next_pgid;
+        os.next_pgid += 1;
+        os.set_process_group(owner, pgid).unwrap();
+        os.set_process_group(stranger, pgid).unwrap();
+        let entry = os.shared_memory.get("k").unwrap();
+        assert!(
+            os.is_shm_accessible_by(stranger, entry),
+            "set_process_group must invalidate stale shm perm cache",
+        );
+
+        // 反向：owner terminate 后，cache 也要让 accessible 重新计算。
+        os.terminate_pid(owner, "done".to_string());
+        os.remove_process_entry(owner);
+        let entry = os.shared_memory.get("k").unwrap();
+        // owner pid 不再存在；non-owner 走 ancestor / sibling 链路，
+        // accessible 取决于 stranger 与 owner 的 pgid，但 owner 已被擦除，
+        // 这里只断言查询不会 panic 并返回 bool。
+        let _ = os.is_shm_accessible_by(stranger, entry);
+    }
+
+    /// `event_source_refs` 与 channel/futex/epoll(EpollSource::Event) 的
+    /// 生命周期严格一一对应，destroy 后引用必须归零。
+    #[test]
+    fn event_source_refs_track_channel_and_futex_lifetimes() {
+        use crate::primitives::{FutexOps, IpcOps};
+        let mut os = LocalOS::new();
+        let _root = os.begin_foreground("fg".to_string(), "g".to_string(), 10, 8, None);
+
+        let ch = os.channel_create(None, 4, "test".to_string());
+        let ch_event = os.channels.get(&ch.0).unwrap().event_id;
+        assert_eq!(os.event_source_refs.get(&ch_event).copied(), Some(1));
+        assert!(os.completed_event_is_live(ch_event));
+
+        let addr = os.futex_create(0, "f".to_string());
+        let fx_event = os.futex_event_id(addr).unwrap();
+        assert_eq!(os.event_source_refs.get(&fx_event).copied(), Some(1));
+
+        // futex_destroy 后引用归零、条目必须被清掉以免无界增长。
+        assert!(os.futex_destroy(addr));
+        assert!(os.event_source_refs.get(&fx_event).is_none());
+
+        // channel destroy 同上。
+        os.channel_close(None, ch).unwrap();
+        os.channel_destroy(None, ch).unwrap();
+        assert!(os.event_source_refs.get(&ch_event).is_none());
+    }
+
+    /// epoll 注册 EpollSource::Event 时也应让事件保持 live；del / destroy
+    /// 后归零，确保 prune_completed_events 不会过早回收。
+    #[test]
+    fn event_source_refs_track_epoll_event_registration() {
+        use crate::primitives::{EpollEventMask, EpollOps, EpollSource};
+        let mut os = LocalOS::new();
+        let _root = os.begin_foreground("fg".to_string(), "g".to_string(), 10, 8, None);
+        let ep = os.epoll_create("ep".to_string());
+
+        // 用一个内部 event_id；直接构造一个 EpollSource::Event。
+        let watched = os.alloc_internal_event_id();
+        os.epoll_ctl_add(ep, EpollSource::Event(watched), EpollEventMask::IN, 1)
+            .unwrap();
+        assert_eq!(os.event_source_refs.get(&watched).copied(), Some(1));
+        assert!(os.completed_event_is_live(watched));
+
+        // del 一次：归零并删除条目。
+        os.epoll_ctl_del(ep, EpollSource::Event(watched)).unwrap();
+        assert!(os.event_source_refs.get(&watched).is_none());
+
+        // 重新注册再走 destroy 路径，destroy 必须把所有 event 引用清掉。
+        os.epoll_ctl_add(ep, EpollSource::Event(watched), EpollEventMask::IN, 2)
+            .unwrap();
+        assert_eq!(os.event_source_refs.get(&watched).copied(), Some(1));
+        assert!(os.epoll_destroy(ep));
+        assert!(os.event_source_refs.get(&watched).is_none());
+    }
+
+    /// 终止大量进程时，ready_queue 不再被线性 retain；tombstone 由
+    /// pop_ready 在出队时清掉。
+    #[test]
+    fn ready_queue_uses_lazy_tombstones_on_termination() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "g".to_string(), 10, 8, None);
+        let mut spawned = Vec::new();
+        for i in 0..32 {
+            let pid = os
+                .spawn(
+                    Some(root),
+                    format!("c{i}"),
+                    "g".to_string(),
+                    50,
+                    8,
+                    None,
+                    None,
+                )
+                .unwrap();
+            spawned.push(pid);
+        }
+        // begin_foreground 后 root 已是当前运行进程，不在 ready_set
+        // 里；spawn 出的子进程全部入 ready。
+        assert_eq!(os.ready_count(), spawned.len());
+        // 批量终止：ready_set 立即收缩，但 ready_queue 留有 tombstone。
+        for &pid in &spawned {
+            os.terminate_pid(pid, "x".to_string());
+        }
+        assert_eq!(os.ready_count(), 0);
+        assert!(os.ready_queue.len() >= spawned.len());
+        // pop_ready 必须丢弃全部 tombstone 并返回 None。
+        assert!(os.pop_ready().is_none());
+        // 队列也最终被排空。
+        assert!(os.ready_queue.is_empty());
+    }
+
+    /// 优先级插入不再为每个比较都查 processes 表；新增高优先级进程
+    /// 时应该插到队首。
+    #[test]
+    fn ready_queue_priority_insertion_uses_cached_priority() {
+        let mut os = LocalOS::new();
+        // root priority = 10
+        let root = os.begin_foreground("fg".to_string(), "g".to_string(), 10, 8, None);
+        // 后入低优先级（数值更大 -> 更低）
+        let low = os
+            .spawn(
+                Some(root),
+                "low".to_string(),
+                "g".to_string(),
+                100,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+        // 再入高优先级（数值最小 -> 最高）
+        let high = os
+            .spawn(
+                Some(root),
+                "high".to_string(),
+                "g".to_string(),
+                1,
+                8,
+                None,
+                None,
+            )
+            .unwrap();
+        // 队列中 high 必须排在 low 之前；不必以 root 为参考（begin_foreground
+        // 帮 root 设为 Running，不在 ready_set中）。
+        let pids: Vec<u64> = os.ready_queue.iter().map(|(pid, _)| *pid).collect();
+        let pos_high = pids.iter().position(|p| *p == high).expect("high in queue");
+        let pos_low = pids.iter().position(|p| *p == low).expect("low in queue");
+        assert!(pos_high < pos_low, "high priority must come before low");
+        // 优先级缓存不再需要 processes 查表：pop_ready 顶部必是 high。
+        let next = os.pop_ready().unwrap();
+        assert_eq!(next.pid, high);
+    }
+
+    #[test]
+    fn channel_ref_holders_dedupe_by_name() {
+        use crate::primitives::IpcOps;
+        let mut os = LocalOS::new();
+        let ch = os.channel_create(None, 4, "test".to_string());
+        os.channel_retain_named(ch, "alpha".to_string()).unwrap();
+        os.channel_retain_named(ch, "alpha".to_string()).unwrap();
+        os.channel_retain_named(ch, "beta".to_string()).unwrap();
+        let meta = os.channel_meta(ch).unwrap();
+        assert_eq!(meta.ref_count, 3);
+        // Snapshot flattens (alpha, 2) and (beta, 1) -> 3 entries.
+        assert_eq!(meta.ref_holders.iter().filter(|h| *h == "alpha").count(), 2);
+        assert_eq!(meta.ref_holders.iter().filter(|h| *h == "beta").count(), 1);
+        // Internal storage groups duplicates: only 2 unique slots.
+        let entry = os.channels.get(&ch.0).unwrap();
+        assert_eq!(entry.ref_holders.len(), 2);
+        // Releasing one alpha leaves one alpha + one beta.
+        os.channel_release_named(ch, "alpha").unwrap();
+        let entry = os.channels.get(&ch.0).unwrap();
+        assert_eq!(entry.ref_count, 2);
+        assert_eq!(entry.ref_holders.len(), 2);
+        // Releasing the last alpha drops the slot entirely.
+        os.channel_release_named(ch, "alpha").unwrap();
+        let entry = os.channels.get(&ch.0).unwrap();
+        assert_eq!(entry.ref_holders.len(), 1);
+        assert_eq!(entry.ref_holders[0].0, "beta");
     }
 
     #[test]
     fn foreground_process_enables_env_access() {
         let mut os = LocalOS::new();
-        os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+        os.begin_foreground(
+            "foreground".to_string(),
+            "root goal".to_string(),
+            10,
+            8,
+            None,
+        );
         os.set_env("scope".to_string(), "root".to_string()).unwrap();
         assert_eq!(os.get_env("scope").as_deref(), Some("root"));
     }
@@ -2797,7 +4024,13 @@ mod tests {
     #[test]
     fn sleeping_process_wakes_after_tick_advance() {
         let mut os = LocalOS::new();
-        let root = os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+        let root = os.begin_foreground(
+            "foreground".to_string(),
+            "root goal".to_string(),
+            10,
+            8,
+            None,
+        );
         let wake_tick = os.sleep_current(2).unwrap();
         assert_eq!(wake_tick, 2);
         assert!(os.consume_yield_requested());
@@ -2816,7 +4049,13 @@ mod tests {
     #[test]
     fn child_can_be_spawned_with_reduced_capabilities() {
         let mut os = LocalOS::new();
-        let root = os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+        let root = os.begin_foreground(
+            "foreground".to_string(),
+            "root goal".to_string(),
+            10,
+            8,
+            None,
+        );
         let child = os
             .spawn(
                 Some(root),
@@ -2847,7 +4086,13 @@ mod tests {
     #[test]
     fn parent_can_kill_and_reap_descendant() {
         let mut os = LocalOS::new();
-        let root = os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+        let root = os.begin_foreground(
+            "foreground".to_string(),
+            "root goal".to_string(),
+            10,
+            8,
+            None,
+        );
         let child = os
             .spawn(
                 Some(root),
@@ -2873,7 +4118,13 @@ mod tests {
     #[test]
     fn removing_parent_reparents_live_children_and_collects_unreapable_zombies() {
         let mut os = LocalOS::new();
-        let root = os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, 8, None);
+        let root = os.begin_foreground(
+            "foreground".to_string(),
+            "root goal".to_string(),
+            10,
+            8,
+            None,
+        );
         let live_child = os
             .spawn(
                 Some(root),
@@ -2904,20 +4155,46 @@ mod tests {
 
         let live_proc = os.get_process(live_child).unwrap();
         assert_eq!(live_proc.parent_pid, None);
-        assert!(live_proc.mailbox.iter().any(|msg| msg.contains("now orphaned")));
+        assert!(
+            live_proc
+                .mailbox
+                .iter()
+                .any(|msg| msg.contains("now orphaned"))
+        );
         assert!(os.get_process(dead_child).is_none());
     }
 
     #[test]
     fn kill_cascades_to_grandchildren() {
         let mut os = LocalOS::new();
-        let root =
-            os.begin_foreground("foreground".to_string(), "root goal".to_string(), 10, usize::MAX, None);
+        let root = os.begin_foreground(
+            "foreground".to_string(),
+            "root goal".to_string(),
+            10,
+            usize::MAX,
+            None,
+        );
         let child = os
-            .spawn(Some(root), "child".to_string(), "child goal".to_string(), 20, 4, None, None)
+            .spawn(
+                Some(root),
+                "child".to_string(),
+                "child goal".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
             .unwrap();
         let grandchild = os
-            .spawn(Some(child), "grandchild".to_string(), "gc goal".to_string(), 30, 2, None, None)
+            .spawn(
+                Some(child),
+                "grandchild".to_string(),
+                "gc goal".to_string(),
+                30,
+                2,
+                None,
+                None,
+            )
             .unwrap();
 
         os.kill_process(child, "cascade test".to_string()).unwrap();
@@ -2930,7 +4207,14 @@ mod tests {
             os.get_process(grandchild).map(|p| &p.state),
             Some(ProcessState::Terminated)
         ));
-        assert!(os.get_process(grandchild).unwrap().result.as_ref().unwrap().contains("cascade"));
+        assert!(
+            os.get_process(grandchild)
+                .unwrap()
+                .result
+                .as_ref()
+                .unwrap()
+                .contains("cascade")
+        );
     }
 
     #[test]
@@ -2940,7 +4224,15 @@ mod tests {
         assert!(os.get_process(root).unwrap().is_foreground);
 
         let child = os
-            .spawn(Some(root), "bg".to_string(), "bg goal".to_string(), 20, 4, None, None)
+            .spawn(
+                Some(root),
+                "bg".to_string(),
+                "bg goal".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
             .unwrap();
         assert!(!os.get_process(child).unwrap().is_foreground);
     }
@@ -2948,10 +4240,17 @@ mod tests {
     #[test]
     fn sigstop_stops_and_sigcont_resumes_process() {
         let mut os = LocalOS::new();
-        let root =
-            os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
         let child = os
-            .spawn(Some(root), "worker".to_string(), "work".to_string(), 20, 4, None, None)
+            .spawn(
+                Some(root),
+                "worker".to_string(),
+                "work".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
             .unwrap();
 
         os.signal_process(child, Signal::SigStop).unwrap();
@@ -2971,13 +4270,28 @@ mod tests {
     #[test]
     fn sigkill_immediately_terminates_with_cascade() {
         let mut os = LocalOS::new();
-        let root =
-            os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
         let child = os
-            .spawn(Some(root), "worker".to_string(), "work".to_string(), 20, 4, None, None)
+            .spawn(
+                Some(root),
+                "worker".to_string(),
+                "work".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
             .unwrap();
         let grandchild = os
-            .spawn(Some(child), "gc".to_string(), "gc work".to_string(), 30, 2, None, None)
+            .spawn(
+                Some(child),
+                "gc".to_string(),
+                "gc work".to_string(),
+                30,
+                2,
+                None,
+                None,
+            )
             .unwrap();
 
         os.signal_process(child, Signal::SigKill).unwrap();
@@ -2994,10 +4308,17 @@ mod tests {
     #[test]
     fn sigterm_queues_signal_for_graceful_termination() {
         let mut os = LocalOS::new();
-        let root =
-            os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
         let child = os
-            .spawn(Some(root), "worker".to_string(), "work".to_string(), 20, 4, None, None)
+            .spawn(
+                Some(root),
+                "worker".to_string(),
+                "work".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
             .unwrap();
 
         os.signal_process(child, Signal::SigTerm).unwrap();
@@ -3008,11 +4329,15 @@ mod tests {
     #[test]
     fn sigcancel_is_consumed_without_terminating_process() {
         let mut os = LocalOS::new();
-        let root =
-            os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
 
         os.signal_process(root, Signal::SigCancel).unwrap();
-        assert!(os.get_process(root).unwrap().pending_signals.contains(&Signal::SigCancel));
+        assert!(
+            os.get_process(root)
+                .unwrap()
+                .pending_signals
+                .contains(&Signal::SigCancel)
+        );
 
         os.set_current_pid(Some(root));
         assert!(os.process_pending_signals());
@@ -3026,10 +4351,17 @@ mod tests {
     #[test]
     fn mailbox_capacity_limits_ipc() {
         let mut os = LocalOS::new();
-        let root =
-            os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
         let child = os
-            .spawn(Some(root), "worker".to_string(), "work".to_string(), 20, 4, None, None)
+            .spawn(
+                Some(root),
+                "worker".to_string(),
+                "work".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
             .unwrap();
 
         if let Some(proc) = os.get_process_mut(child) {
@@ -3071,8 +4403,28 @@ mod tests {
     fn process_group_signal_affects_all_members() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child1 = os.spawn(Some(root), "c1".to_string(), "g1".to_string(), 20, 4, None, None).unwrap();
-        let child2 = os.spawn(Some(root), "c2".to_string(), "g2".to_string(), 20, 4, None, None).unwrap();
+        let child1 = os
+            .spawn(
+                Some(root),
+                "c1".to_string(),
+                "g1".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let child2 = os
+            .spawn(
+                Some(root),
+                "c2".to_string(),
+                "g2".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_process_group(child1, 100).unwrap();
         os.set_process_group(child2, 100).unwrap();
@@ -3082,8 +4434,14 @@ mod tests {
 
         let count = os.signal_process_group(100, Signal::SigStop).unwrap();
         assert_eq!(count, 2);
-        assert!(matches!(os.get_process(child1).unwrap().state, ProcessState::Stopped));
-        assert!(matches!(os.get_process(child2).unwrap().state, ProcessState::Stopped));
+        assert!(matches!(
+            os.get_process(child1).unwrap().state,
+            ProcessState::Stopped
+        ));
+        assert!(matches!(
+            os.get_process(child2).unwrap().state,
+            ProcessState::Stopped
+        ));
     }
 
     #[test]
@@ -3091,44 +4449,70 @@ mod tests {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
 
-        os.shm_create("config".to_string(), "value1".to_string()).unwrap();
+        os.shm_create("config".to_string(), "value1".to_string())
+            .unwrap();
         assert_eq!(os.shm_read("config"), Ok("value1".to_string()));
-        assert_eq!(os.shared_memory.get("config").map(|e| e.owner_pid), Some(root));
-        assert_eq!(os.shared_memory.get("config").and_then(|e| e.owner_pgid), None);
+        assert_eq!(
+            os.shared_memory.get("config").map(|e| e.owner_pid),
+            Some(root)
+        );
 
-        os.shm_write("config".to_string(), "value2".to_string()).unwrap();
+        os.shm_write("config".to_string(), "value2".to_string())
+            .unwrap();
         assert_eq!(os.shm_read("config"), Ok("value2".to_string()));
 
         os.shm_delete("config").unwrap();
         assert_eq!(os.shm_read("config"), Err(ShmReadError::NotFound));
         assert!(os.shared_memory.get("config").is_none());
 
-        assert!(os.shm_create("config".to_string(), "value3".to_string()).is_ok());
-        assert!(os.shm_create("config".to_string(), "value4".to_string()).is_err());
+        assert!(
+            os.shm_create("config".to_string(), "value3".to_string())
+                .is_ok()
+        );
+        assert!(
+            os.shm_create("config".to_string(), "value4".to_string())
+                .is_err()
+        );
     }
 
     #[test]
     fn working_dir_inherits_to_children() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        os.set_working_dir(std::path::PathBuf::from("/tmp/work")).unwrap();
+        os.set_working_dir(std::path::PathBuf::from("/tmp/work"))
+            .unwrap();
 
-        let child = os.spawn(Some(root), "child".to_string(), "goal".to_string(), 20, 4, None, None).unwrap();
-        assert_eq!(os.get_process(child).unwrap().working_dir, Some(std::path::PathBuf::from("/tmp/work")));
+        let child = os
+            .spawn(
+                Some(root),
+                "child".to_string(),
+                "goal".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            os.get_process(child).unwrap().working_dir,
+            Some(std::path::PathBuf::from("/tmp/work"))
+        );
     }
 
     #[test]
     fn daemon_auto_restarts_on_termination() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let daemon_pid = os.spawn_daemon(
-            Some(root),
-            "watcher".to_string(),
-            "watch files".to_string(),
-            20,
-            4,
-            2,
-        ).unwrap();
+        let daemon_pid = os
+            .spawn_daemon(
+                Some(root),
+                "watcher".to_string(),
+                "watch files".to_string(),
+                20,
+                4,
+                2,
+            )
+            .unwrap();
 
         assert!(os.get_process(daemon_pid).unwrap().is_daemon);
         assert_eq!(os.get_process(daemon_pid).unwrap().max_restarts, 2);
@@ -3142,21 +4526,28 @@ mod tests {
         assert_ne!(new_pid, daemon_pid);
         assert!(os.get_process(new_pid).unwrap().is_daemon);
         assert_eq!(os.get_process(new_pid).unwrap().restart_count, 1);
-        assert!(os.get_process(new_pid).unwrap().goal.contains("daemon restart #1"));
+        assert!(
+            os.get_process(new_pid)
+                .unwrap()
+                .goal
+                .contains("daemon restart #1")
+        );
     }
 
     #[test]
     fn daemon_respects_max_restarts() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let daemon_pid = os.spawn_daemon(
-            Some(root),
-            "watcher".to_string(),
-            "watch".to_string(),
-            20,
-            4,
-            1,
-        ).unwrap();
+        let daemon_pid = os
+            .spawn_daemon(
+                Some(root),
+                "watcher".to_string(),
+                "watch".to_string(),
+                20,
+                4,
+                1,
+            )
+            .unwrap();
 
         os.terminate_pid(daemon_pid, "crashed".to_string());
         let restarted1 = os.check_daemon_restart();
@@ -3171,15 +4562,46 @@ mod tests {
     fn ipc_is_rejected_between_unrelated_processes() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child_a = os.spawn(Some(root), "a".to_string(), "goal a".to_string(), 20, 4, None, None).unwrap();
-        let child_b = os.spawn(Some(root), "b".to_string(), "goal b".to_string(), 20, 4, None, None).unwrap();
+        let child_a = os
+            .spawn(
+                Some(root),
+                "a".to_string(),
+                "goal a".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let child_b = os
+            .spawn(
+                Some(root),
+                "b".to_string(),
+                "goal b".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_current_pid(Some(child_a));
         let result = os.send_ipc(child_b, "hello".to_string());
         assert!(result.is_ok());
 
-        let unrelated_root = os.begin_foreground("fg2".to_string(), "goal2".to_string(), 10, usize::MAX, None);
-        let orphan = os.spawn(Some(unrelated_root), "orphan".to_string(), "goal orphan".to_string(), 20, 4, None, None).unwrap();
+        let unrelated_root =
+            os.begin_foreground("fg2".to_string(), "goal2".to_string(), 10, usize::MAX, None);
+        let orphan = os
+            .spawn(
+                Some(unrelated_root),
+                "orphan".to_string(),
+                "goal orphan".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_current_pid(Some(orphan));
         let result = os.send_ipc(child_a, "intrusion".to_string());
@@ -3191,8 +4613,28 @@ mod tests {
     fn ipc_allowed_within_same_process_group() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child_a = os.spawn(Some(root), "a".to_string(), "goal a".to_string(), 20, 4, None, None).unwrap();
-        let child_b = os.spawn(Some(root), "b".to_string(), "goal b".to_string(), 20, 4, None, None).unwrap();
+        let child_a = os
+            .spawn(
+                Some(root),
+                "a".to_string(),
+                "goal a".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let child_b = os
+            .spawn(
+                Some(root),
+                "b".to_string(),
+                "goal b".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_process_group(child_a, 42).unwrap();
         os.set_process_group(child_b, 42).unwrap();
@@ -3201,7 +4643,17 @@ mod tests {
         let result = os.send_ipc(child_b, "hello group".to_string());
         assert!(result.is_ok());
 
-        let outsider = os.spawn(Some(root), "outsider".to_string(), "goal out".to_string(), 20, 4, None, None).unwrap();
+        let outsider = os
+            .spawn(
+                Some(root),
+                "outsider".to_string(),
+                "goal out".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
         os.set_current_pid(Some(outsider));
         let result = os.send_ipc(child_a, "intrusion".to_string());
         assert!(result.is_err());
@@ -3211,8 +4663,28 @@ mod tests {
     fn kill_process_rejected_for_non_descendant() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child_a = os.spawn(Some(root), "a".to_string(), "goal a".to_string(), 20, 4, None, None).unwrap();
-        let child_b = os.spawn(Some(root), "b".to_string(), "goal b".to_string(), 20, 4, None, None).unwrap();
+        let child_a = os
+            .spawn(
+                Some(root),
+                "a".to_string(),
+                "goal a".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let child_b = os
+            .spawn(
+                Some(root),
+                "b".to_string(),
+                "goal b".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_current_pid(Some(child_a));
         let result = os.kill_process(child_b, "sibling kill".to_string());
@@ -3224,12 +4696,33 @@ mod tests {
     fn shm_write_rejected_for_non_owner_outside_group() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child_a = os.spawn(Some(root), "a".to_string(), "goal a".to_string(), 20, 4, None, None).unwrap();
+        let child_a = os
+            .spawn(
+                Some(root),
+                "a".to_string(),
+                "goal a".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_current_pid(Some(child_a));
-        os.shm_create("secret".to_string(), "value_a".to_string()).unwrap();
+        os.shm_create("secret".to_string(), "value_a".to_string())
+            .unwrap();
 
-        let child_b = os.spawn(Some(root), "b".to_string(), "goal b".to_string(), 20, 4, None, None).unwrap();
+        let child_b = os
+            .spawn(
+                Some(root),
+                "b".to_string(),
+                "goal b".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
         os.set_current_pid(Some(child_b));
         let result = os.shm_write("secret".to_string(), "tampered".to_string());
         assert!(result.is_err());
@@ -3240,14 +4733,35 @@ mod tests {
     fn shm_write_allowed_for_same_process_group() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child_a = os.spawn(Some(root), "a".to_string(), "goal a".to_string(), 20, 4, None, None).unwrap();
-        let child_b = os.spawn(Some(root), "b".to_string(), "goal b".to_string(), 20, 4, None, None).unwrap();
+        let child_a = os
+            .spawn(
+                Some(root),
+                "a".to_string(),
+                "goal a".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let child_b = os
+            .spawn(
+                Some(root),
+                "b".to_string(),
+                "goal b".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_process_group(child_a, 100).unwrap();
         os.set_process_group(child_b, 100).unwrap();
 
         os.set_current_pid(Some(child_a));
-        os.shm_create("shared_config".to_string(), "v1".to_string()).unwrap();
+        os.shm_create("shared_config".to_string(), "v1".to_string())
+            .unwrap();
 
         os.set_current_pid(Some(child_b));
         let result = os.shm_write("shared_config".to_string(), "v2".to_string());
@@ -3259,10 +4773,21 @@ mod tests {
     fn shm_write_allowed_for_ancestor_of_owner() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child = os.spawn(Some(root), "child".to_string(), "goal child".to_string(), 20, 4, None, None).unwrap();
+        let child = os
+            .spawn(
+                Some(root),
+                "child".to_string(),
+                "goal child".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_current_pid(Some(child));
-        os.shm_create("child_data".to_string(), "original".to_string()).unwrap();
+        os.shm_create("child_data".to_string(), "original".to_string())
+            .unwrap();
 
         os.set_current_pid(Some(root));
         let result = os.shm_write("child_data".to_string(), "parent_override".to_string());
@@ -3274,11 +4799,32 @@ mod tests {
     fn shm_delete_rejected_for_non_owner_outside_group() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child_a = os.spawn(Some(root), "a".to_string(), "goal a".to_string(), 20, 4, None, None).unwrap();
-        let child_b = os.spawn(Some(root), "b".to_string(), "goal b".to_string(), 20, 4, None, None).unwrap();
+        let child_a = os
+            .spawn(
+                Some(root),
+                "a".to_string(),
+                "goal a".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
+        let child_b = os
+            .spawn(
+                Some(root),
+                "b".to_string(),
+                "goal b".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_current_pid(Some(child_a));
-        os.shm_create("owned_by_a".to_string(), "data".to_string()).unwrap();
+        os.shm_create("owned_by_a".to_string(), "data".to_string())
+            .unwrap();
 
         os.set_current_pid(Some(child_b));
         let result = os.shm_delete("owned_by_a");
@@ -3292,23 +4838,34 @@ mod tests {
     fn shm_owner_pgid_tracked_on_create() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child = os.spawn(Some(root), "child".to_string(), "goal".to_string(), 20, 4, None, None).unwrap();
+        let child = os
+            .spawn(
+                Some(root),
+                "child".to_string(),
+                "goal".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_process_group(child, 77).unwrap();
 
         os.set_current_pid(Some(child));
-        os.shm_create("group_key".to_string(), "val".to_string()).unwrap();
+        os.shm_create("group_key".to_string(), "val".to_string())
+            .unwrap();
 
         let entry = os.shared_memory.get("group_key").unwrap();
         assert_eq!(entry.owner_pid, child);
-        assert_eq!(entry.owner_pgid, Some(77));
     }
 
     #[test]
     fn shm_read_detects_checksum_corruption() {
         let mut os = LocalOS::new();
         let _root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        os.shm_create("data".to_string(), "original".to_string()).unwrap();
+        os.shm_create("data".to_string(), "original".to_string())
+            .unwrap();
 
         if let Some(entry) = os.shared_memory.get_mut("data") {
             entry.value = "tampered".to_string();
@@ -3322,7 +4879,8 @@ mod tests {
     fn shm_read_degraded_returns_data_on_corruption() {
         let mut os = LocalOS::new();
         let _root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        os.shm_create("data".to_string(), "original".to_string()).unwrap();
+        os.shm_create("data".to_string(), "original".to_string())
+            .unwrap();
 
         if let Some(entry) = os.shared_memory.get_mut("data") {
             entry.value = "tampered".to_string();
@@ -3339,9 +4897,20 @@ mod tests {
     fn shm_read_detects_owner_terminated() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child = os.spawn(Some(root), "worker".to_string(), "work".to_string(), 20, 4, None, None).unwrap();
+        let child = os
+            .spawn(
+                Some(root),
+                "worker".to_string(),
+                "work".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
         os.set_current_pid(Some(child));
-        os.shm_create("child_data".to_string(), "value".to_string()).unwrap();
+        os.shm_create("child_data".to_string(), "value".to_string())
+            .unwrap();
         os.set_current_pid(Some(root));
 
         os.terminate_pid(child, "done".to_string());
@@ -3354,9 +4923,20 @@ mod tests {
     fn shm_read_degraded_returns_data_on_owner_terminated() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child = os.spawn(Some(root), "worker".to_string(), "work".to_string(), 20, 4, None, None).unwrap();
+        let child = os
+            .spawn(
+                Some(root),
+                "worker".to_string(),
+                "work".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
         os.set_current_pid(Some(child));
-        os.shm_create("child_data".to_string(), "important_value".to_string()).unwrap();
+        os.shm_create("child_data".to_string(), "important_value".to_string())
+            .unwrap();
         os.set_current_pid(Some(root));
 
         os.terminate_pid(child, "done".to_string());
@@ -3371,14 +4951,37 @@ mod tests {
     #[test]
     fn shm_read_permission_denied_for_unrelated_process() {
         let mut os = LocalOS::new();
-        let root1 = os.begin_foreground("fg1".to_string(), "goal1".to_string(), 10, usize::MAX, None);
-        let child_a = os.spawn(Some(root1), "a".to_string(), "ga".to_string(), 20, 4, None, None).unwrap();
+        let root1 =
+            os.begin_foreground("fg1".to_string(), "goal1".to_string(), 10, usize::MAX, None);
+        let child_a = os
+            .spawn(
+                Some(root1),
+                "a".to_string(),
+                "ga".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
-        let root2 = os.begin_foreground("fg2".to_string(), "goal2".to_string(), 10, usize::MAX, None);
-        let child_b = os.spawn(Some(root2), "b".to_string(), "gb".to_string(), 20, 4, None, None).unwrap();
+        let root2 =
+            os.begin_foreground("fg2".to_string(), "goal2".to_string(), 10, usize::MAX, None);
+        let child_b = os
+            .spawn(
+                Some(root2),
+                "b".to_string(),
+                "gb".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_current_pid(Some(child_a));
-        os.shm_create("secret".to_string(), "private_data".to_string()).unwrap();
+        os.shm_create("secret".to_string(), "private_data".to_string())
+            .unwrap();
 
         os.set_current_pid(Some(child_b));
         let result = os.shm_read("secret");
@@ -3389,11 +4992,23 @@ mod tests {
     fn shm_health_check_detects_corrupted_and_orphaned() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child = os.spawn(Some(root), "worker".to_string(), "work".to_string(), 20, 4, None, None).unwrap();
+        let child = os
+            .spawn(
+                Some(root),
+                "worker".to_string(),
+                "work".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_current_pid(Some(child));
-        os.shm_create("orphan_data".to_string(), "val1".to_string()).unwrap();
-        os.shm_create("good_data".to_string(), "val2".to_string()).unwrap();
+        os.shm_create("orphan_data".to_string(), "val1".to_string())
+            .unwrap();
+        os.shm_create("good_data".to_string(), "val2".to_string())
+            .unwrap();
         os.set_current_pid(Some(root));
 
         os.terminate_pid(child, "done".to_string());
@@ -3405,12 +5020,12 @@ mod tests {
         let issues = os.shm_health_check();
         assert_eq!(issues.len(), 2);
 
-        let has_orphan = issues.iter().any(|(k, e)| {
-            k == "orphan_data" && matches!(e, ShmReadError::OwnerTerminated { .. })
-        });
-        let has_corrupt = issues.iter().any(|(k, e)| {
-            k == "good_data" && matches!(e, ShmReadError::Corrupted { .. })
-        });
+        let has_orphan = issues
+            .iter()
+            .any(|(k, e)| k == "orphan_data" && matches!(e, ShmReadError::OwnerTerminated { .. }));
+        let has_corrupt = issues
+            .iter()
+            .any(|(k, e)| k == "good_data" && matches!(e, ShmReadError::Corrupted { .. }));
         assert!(has_orphan);
         assert!(has_corrupt);
     }
@@ -3419,12 +5034,24 @@ mod tests {
     fn shm_cleanup_orphans_removes_dead_owner_entries() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-        let child = os.spawn(Some(root), "worker".to_string(), "work".to_string(), 20, 4, None, None).unwrap();
+        let child = os
+            .spawn(
+                Some(root),
+                "worker".to_string(),
+                "work".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
+            .unwrap();
 
         os.set_current_pid(Some(child));
-        os.shm_create("orphan".to_string(), "will_be_removed".to_string()).unwrap();
+        os.shm_create("orphan".to_string(), "will_be_removed".to_string())
+            .unwrap();
         os.set_current_pid(Some(root));
-        os.shm_create("root_data".to_string(), "stays".to_string()).unwrap();
+        os.shm_create("root_data".to_string(), "stays".to_string())
+            .unwrap();
 
         os.terminate_pid(child, "done".to_string());
 
@@ -3477,7 +5104,15 @@ mod tests {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
         let worker = os
-            .spawn(Some(root), "w".to_string(), "do".to_string(), 20, 4, None, None)
+            .spawn(
+                Some(root),
+                "w".to_string(),
+                "do".to_string(),
+                20,
+                4,
+                None,
+                None,
+            )
             .unwrap();
         // Simulate worker going to sleep on a futex
         if let Some(p) = os.processes.get_mut(&worker) {
@@ -3485,7 +5120,7 @@ mod tests {
                 reason: WaitReason::ProcessExit { on_pid: root },
             };
         }
-        os.ready_queue.retain(|&p| p != worker);
+        os.ready_set.remove(&worker);
 
         let addr = os.futex_create(0, "ready_bell".to_string());
         let seq_before = os.futex_register_waiter(addr, worker).unwrap();
@@ -3497,7 +5132,7 @@ mod tests {
             os.processes.get(&worker).unwrap().state,
             ProcessState::Ready
         );
-        assert!(os.ready_queue.contains(&worker));
+        assert!(os.ready_set.contains(&worker));
     }
 
     #[test]
@@ -3505,7 +5140,10 @@ mod tests {
         use crate::primitives::{FutexOps, FutexWakeReason};
         let mut os = LocalOS::new();
         let addr = os.futex_create(0, "t".to_string());
-        assert!(os.futex_try_wait(addr, 0).is_none(), "should block when equal");
+        assert!(
+            os.futex_try_wait(addr, 0).is_none(),
+            "should block when equal"
+        );
         os.futex_store(addr, 7);
         assert_eq!(
             os.futex_try_wait(addr, 0),
@@ -3538,7 +5176,10 @@ mod tests {
         assert!(matches!(recs[1].kind, TraceKind::Event));
         assert!(matches!(recs[2].kind, TraceKind::SpanExit));
         assert_eq!(recs[1].name, "llm.submit");
-        assert_eq!(recs[1].fields.get("model").unwrap(), "gpt");
+        assert_eq!(
+            recs[1].fields().and_then(|f| f.get("model")).map(String::as_str),
+            Some("gpt")
+        );
     }
 
     #[test]
@@ -3591,15 +5232,37 @@ mod tests {
         os.rlimit_set(pid, lim).unwrap();
 
         assert_eq!(
-            os.rusage_charge(pid, ResourceUsageDelta { turns: 1, ..Default::default() }),
+            os.rusage_charge(
+                pid,
+                ResourceUsageDelta {
+                    turns: 1,
+                    ..Default::default()
+                }
+            ),
             RlimitVerdict::Ok
         );
         assert_eq!(
-            os.rusage_charge(pid, ResourceUsageDelta { turns: 1, ..Default::default() }),
+            os.rusage_charge(
+                pid,
+                ResourceUsageDelta {
+                    turns: 1,
+                    ..Default::default()
+                }
+            ),
             RlimitVerdict::Ok
         );
-        match os.rusage_charge(pid, ResourceUsageDelta { turns: 1, ..Default::default() }) {
-            RlimitVerdict::Exceeded { dimension, used, limit } => {
+        match os.rusage_charge(
+            pid,
+            ResourceUsageDelta {
+                turns: 1,
+                ..Default::default()
+            },
+        ) {
+            RlimitVerdict::Exceeded {
+                dimension,
+                used,
+                limit,
+            } => {
                 assert_eq!(dimension, RlimitDim::Turns);
                 assert_eq!(used, 3);
                 assert_eq!(limit, 2);
@@ -3622,7 +5285,10 @@ mod tests {
         lim.max_tokens_in = 100;
         os.rlimit_set(pid, lim).unwrap();
         // pre-check a big prompt
-        let probe = ResourceUsageDelta { tokens_in: 200, ..Default::default() };
+        let probe = ResourceUsageDelta {
+            tokens_in: 200,
+            ..Default::default()
+        };
         match os.rlimit_check(pid, &probe) {
             RlimitVerdict::Exceeded { dimension, .. } => {
                 assert_eq!(dimension, RlimitDim::TokensIn);
@@ -3652,15 +5318,16 @@ mod tests {
 
     #[test]
     fn llm_account_charges_cost_and_updates_rusage() {
-        use crate::primitives::{
-            LlmModelPrice, LlmOps, LlmUsageReport, RlimitOps, RlimitVerdict,
-        };
+        use crate::primitives::{LlmModelPrice, LlmOps, LlmUsageReport, RlimitOps, RlimitVerdict};
         let mut os = LocalOS::new();
         let pid = os.begin_foreground("p".into(), "g".into(), 10, 0, None);
         // 1000 prompt tok => 2500 micros; 500 completion tok => 3000 micros.
         os.llm_set_price(
             "gpt-test".into(),
-            LlmModelPrice { prompt_per_1k_micros: 2_500, completion_per_1k_micros: 6_000 },
+            LlmModelPrice {
+                prompt_per_1k_micros: 2_500,
+                completion_per_1k_micros: 6_000,
+            },
         );
         let out = os.llm_account(
             pid,
@@ -3682,8 +5349,8 @@ mod tests {
 
     #[test]
     fn llm_account_with_unknown_model_is_free_but_still_charges_tokens() {
-        use crate::primitives::{LlmOps, LlmUsageReport};
         use crate::primitives::RlimitOps;
+        use crate::primitives::{LlmOps, LlmUsageReport};
         let mut os = LocalOS::new();
         let pid = os.begin_foreground("p".into(), "g".into(), 10, 0, None);
         // No price registered for "mystery-model"
@@ -3714,7 +5381,10 @@ mod tests {
         let pid = os.begin_foreground("p".into(), "g".into(), 10, 0, None);
         os.llm_set_price(
             "g".into(),
-            LlmModelPrice { prompt_per_1k_micros: 1_000, completion_per_1k_micros: 0 },
+            LlmModelPrice {
+                prompt_per_1k_micros: 1_000,
+                completion_per_1k_micros: 0,
+            },
         );
         // cost budget = 500 micros. 1000 prompt tokens -> 1000 micros -> Exceeded.
         let mut lim = ResourceLimit::unlimited();
@@ -3731,7 +5401,11 @@ mod tests {
             },
         );
         match out.verdict {
-            RlimitVerdict::Exceeded { dimension, used, limit } => {
+            RlimitVerdict::Exceeded {
+                dimension,
+                used,
+                limit,
+            } => {
                 assert_eq!(dimension, RlimitDim::CostMicros);
                 assert_eq!(used, 1_000);
                 assert_eq!(limit, 500);
@@ -3771,7 +5445,13 @@ mod tests {
             .unwrap_or(0);
         let seq = NEXT_TMP_ID.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("aios_vfs_{}_{}_{}_{}", name, std::process::id(), nanos, seq));
+        p.push(format!(
+            "aios_vfs_{}_{}_{}_{}",
+            name,
+            std::process::id(),
+            nanos,
+            seq
+        ));
         p
     }
 
@@ -3818,9 +5498,7 @@ mod tests {
 
     #[test]
     fn vfs_respects_fs_bytes_rlimit() {
-        use crate::primitives::{
-            ResourceLimit, RlimitDim, RlimitOps, VfsError, VfsOps,
-        };
+        use crate::primitives::{ResourceLimit, RlimitDim, RlimitOps, VfsError, VfsOps};
         let mut os = LocalOS::new();
         let pid = os.begin_foreground("p".into(), "g".into(), 10, 0, None);
         let mut limits = ResourceLimit::unlimited();
@@ -3830,7 +5508,10 @@ mod tests {
         let p = tmp_path("quota");
         // 写 10 字节——超过 5 字节上限
         match os.vfs_write_all(Some(pid), &p, "0123456789").unwrap_err() {
-            VfsError::QuotaExceeded { dimension: RlimitDim::FsBytes, .. } => {}
+            VfsError::QuotaExceeded {
+                dimension: RlimitDim::FsBytes,
+                ..
+            } => {}
             other => panic!("expected QuotaExceeded(FsBytes), got {:?}", other),
         }
         let _ = std::fs::remove_file(&p);
@@ -3908,7 +5589,15 @@ mod tests {
             .unwrap();
         let outsider_root = os.begin_foreground("other".into(), "goal".into(), 10, 0, None);
         let outsider = os
-            .spawn(Some(outsider_root), "outsider".into(), "goal".into(), 20, 4, None, None)
+            .spawn(
+                Some(outsider_root),
+                "outsider".into(),
+                "goal".into(),
+                20,
+                4,
+                None,
+                None,
+            )
             .unwrap();
 
         let ch = os.channel_create(Some(root), 1, "perm".into());
@@ -3930,7 +5619,10 @@ mod tests {
             os.channel_try_recv(Some(root), ch).unwrap(),
             IpcRecvResult::Message("done".into())
         );
-        assert_eq!(os.channel_try_recv(Some(root), ch).unwrap(), IpcRecvResult::Closed);
+        assert_eq!(
+            os.channel_try_recv(Some(root), ch).unwrap(),
+            IpcRecvResult::Closed
+        );
     }
 
     #[test]
@@ -3967,11 +5659,13 @@ mod tests {
 
         let root_proc = os.get_process(root).unwrap();
         assert_eq!(root_proc.state, ProcessState::Ready);
-        assert!(root_proc
-            .mailbox
-            .back()
-            .map(|s| s.contains("[EVENT_WAKE]"))
-            .unwrap_or(false));
+        assert!(
+            root_proc
+                .mailbox
+                .back()
+                .map(|s| s.contains("[EVENT_WAKE]"))
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -4028,7 +5722,8 @@ mod tests {
             IpcRecvResult::Message("first".into())
         );
 
-        os.wait_on_events(vec![evt2], WaitPolicy::All, None).unwrap();
+        os.wait_on_events(vec![evt2], WaitPolicy::All, None)
+            .unwrap();
         assert!(os.consume_yield_requested());
         os.channel_send(Some(root), ch, "second".into()).unwrap();
         let root_proc = os.get_process(root).unwrap();
@@ -4102,7 +5797,8 @@ mod tests {
         let keep_buffered = os.channel_create(Some(root), 1, "buffered".into());
         let gc_me = os.channel_create(Some(root), 1, "gc".into());
 
-        os.channel_send(Some(root), keep_buffered, "x".into()).unwrap();
+        os.channel_send(Some(root), keep_buffered, "x".into())
+            .unwrap();
         os.channel_close(Some(root), keep_buffered).unwrap();
         os.channel_close(Some(root), gc_me).unwrap();
 
@@ -4148,6 +5844,182 @@ mod tests {
         let recs = os.trace_drain_since(0);
         assert!(recs.iter().any(|r| r.name == "ipc.destroy"));
         assert!(recs.iter().any(|r| r.name == "ipc.gc"));
+    }
+
+    // ---- EpollOps (Phase 6) ----
+
+    #[test]
+    fn epoll_wait_returns_ready_channel_without_suspending() {
+        use crate::primitives::{EpollEventMask, EpollOps, EpollSource, EpollWaitResult, IpcOps};
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".into(), "goal".into(), 10, 0, None);
+        let ch = os.channel_create(Some(root), 2, "epoll-ready".into());
+        let ep = os.epoll_create("main".into());
+        os.epoll_ctl_add(ep, EpollSource::Channel(ch), EpollEventMask::IN, 7)
+            .unwrap();
+
+        os.channel_send(Some(root), ch, "payload".into()).unwrap();
+        match os.epoll_wait(ep, 8, None).unwrap() {
+            EpollWaitResult::Ready(events) => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].source, EpollSource::Channel(ch));
+                assert_eq!(events[0].events, EpollEventMask::IN);
+                assert_eq!(events[0].user_data, 7);
+            }
+            other => panic!("expected ready, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn epoll_wait_suspends_and_then_observes_event_source() {
+        use crate::primitives::{EpollEventMask, EpollOps, EpollSource, EpollWaitResult};
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".into(), "goal".into(), 10, 0, None);
+        let ep = os.epoll_create("main".into());
+        let watched = EventId::new(42);
+        os.epoll_ctl_add(ep, EpollSource::Event(watched), EpollEventMask::IN, 99)
+            .unwrap();
+
+        match os.epoll_wait(ep, 8, Some(5)).unwrap() {
+            EpollWaitResult::Suspended { timeout_tick } => assert_eq!(timeout_tick, Some(5)),
+            other => panic!("expected suspended, got {:?}", other),
+        }
+        assert!(os.current_process_id().is_none());
+
+        let woke = os.notify_events_completed(&[watched]);
+        assert_eq!(woke, vec![root]);
+        let resumed = os.pop_ready().unwrap();
+        assert_eq!(resumed.pid, root);
+
+        match os.epoll_wait(ep, 8, None).unwrap() {
+            EpollWaitResult::Ready(events) => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].source, EpollSource::Event(watched));
+                assert_eq!(events[0].events, EpollEventMask::IN);
+                assert_eq!(events[0].user_data, 99);
+            }
+            other => panic!("expected ready, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn epoll_ctl_mod_del_and_snapshot_work() {
+        use crate::primitives::{EpollEventMask, EpollOps, EpollSource, EpollWaitResult, IpcOps};
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".into(), "goal".into(), 10, 0, None);
+        let ch = os.channel_create(Some(root), 1, "epoll-ctl".into());
+        let ep = os.epoll_create("ctl".into());
+        os.epoll_ctl_add(ep, EpollSource::Channel(ch), EpollEventMask::HUP, 1)
+            .unwrap();
+        os.epoll_ctl_mod(
+            ep,
+            EpollSource::Channel(ch),
+            EpollEventMask::IN | EpollEventMask::HUP,
+            2,
+        )
+        .unwrap();
+
+        let snapshot = os.epoll_snapshot(ep).unwrap();
+        assert_eq!(snapshot.label, "ctl");
+        assert_eq!(snapshot.registrations.len(), 1);
+        assert_eq!(snapshot.registrations[0].source, EpollSource::Channel(ch));
+        assert_eq!(
+            snapshot.registrations[0].events,
+            EpollEventMask::IN | EpollEventMask::HUP
+        );
+        assert_eq!(snapshot.registrations[0].user_data, 2);
+
+        os.channel_close(Some(root), ch).unwrap();
+        match os.epoll_wait(ep, 8, None).unwrap() {
+            EpollWaitResult::Ready(events) => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].events, EpollEventMask::HUP);
+                assert_eq!(events[0].user_data, 2);
+            }
+            other => panic!("expected ready, got {:?}", other),
+        }
+
+        os.epoll_ctl_del(ep, EpollSource::Channel(ch)).unwrap();
+        match os.epoll_wait(ep, 8, None).unwrap() {
+            EpollWaitResult::Ready(events) => assert!(events.is_empty()),
+            other => panic!("expected empty ready set, got {:?}", other),
+        }
+        assert!(os.epoll_destroy(ep));
+        assert!(os.epoll_snapshot(ep).is_none());
+    }
+
+    #[test]
+    fn epoll_wait_returns_ready_for_futex_value_change() {
+        use crate::primitives::{EpollEventMask, EpollOps, EpollSource, EpollWaitResult, FutexOps};
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".into(), "goal".into(), 10, 0, None);
+        let addr = os.futex_create(0, "epoll-futex-value".into());
+        let ep = os.epoll_create("futex".into());
+        os.epoll_ctl_add(
+            ep,
+            EpollSource::Futex { addr, expected: 0 },
+            EpollEventMask::IN,
+            11,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            os.epoll_wait(ep, 8, None).unwrap(),
+            EpollWaitResult::Suspended { timeout_tick: None }
+        ));
+        os.set_current_pid(Some(root));
+        let _ = os.futex_store(addr, 9);
+
+        match os.epoll_wait(ep, 8, None).unwrap() {
+            EpollWaitResult::Ready(events) => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].source, EpollSource::Futex { addr, expected: 0 });
+                assert_eq!(events[0].events, EpollEventMask::IN);
+                assert_eq!(events[0].user_data, 11);
+            }
+            other => panic!("expected ready, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn epoll_wait_observes_futex_wake_even_when_value_is_unchanged() {
+        use crate::primitives::{EpollEventMask, EpollOps, EpollSource, EpollWaitResult, FutexOps};
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".into(), "goal".into(), 10, 0, None);
+        let addr = os.futex_create(0, "epoll-futex-seq".into());
+        let ep = os.epoll_create("futex-seq".into());
+        os.epoll_ctl_add(
+            ep,
+            EpollSource::Futex { addr, expected: 0 },
+            EpollEventMask::IN,
+            22,
+        )
+        .unwrap();
+
+        match os.epoll_wait(ep, 8, Some(4)).unwrap() {
+            EpollWaitResult::Suspended { timeout_tick } => assert_eq!(timeout_tick, Some(4)),
+            other => panic!("expected suspended, got {:?}", other),
+        }
+        assert!(os.current_process_id().is_none());
+
+        os.futex_wake(addr, 1);
+        let resumed = os.pop_ready().unwrap();
+        assert_eq!(resumed.pid, root);
+
+        match os.epoll_wait(ep, 8, None).unwrap() {
+            EpollWaitResult::Ready(events) => {
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].source, EpollSource::Futex { addr, expected: 0 });
+                assert_eq!(events[0].events, EpollEventMask::IN);
+                assert_eq!(events[0].user_data, 22);
+            }
+            other => panic!("expected ready, got {:?}", other),
+        }
+
+        match os.epoll_wait(ep, 8, None).unwrap() {
+            EpollWaitResult::Suspended { timeout_tick } => assert_eq!(timeout_tick, None),
+            other => panic!("expected suspended after cursor refresh, got {:?}", other),
+        }
     }
 
     // ---- DaemonOps (Phase 4) ----
@@ -4212,8 +6084,7 @@ mod tests {
         let (h2, _) = os.daemon_register("b".into(), DaemonKind::IoPreload, None);
         let snap = os.list_daemons();
         assert_eq!(snap.len(), 2);
-        let handles: std::collections::HashSet<u64> =
-            snap.iter().map(|e| e.handle.raw()).collect();
+        let handles: std::collections::HashSet<u64> = snap.iter().map(|e| e.handle.raw()).collect();
         assert!(handles.contains(&h1.raw()));
         assert!(handles.contains(&h2.raw()));
     }

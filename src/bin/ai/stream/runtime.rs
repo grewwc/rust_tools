@@ -23,6 +23,10 @@ use super::{
 const MAX_DECODE_ERRORS: usize = 3;
 /// Delay in milliseconds between retry attempts on transient errors
 const DECODE_ERROR_RETRY_DELAY_MS: u64 = 100;
+/// Grace window after an OpenAI-compatible `finish_reason` chunk. Some backends
+/// do not emit `[DONE]` or close the HTTP body, while others can still send a
+/// final snapshot immediately after the finish chunk.
+const FINISH_REASON_GRACE_MS: u64 = 200;
 
 pub(super) async fn stream_response(
     app: &mut App,
@@ -46,10 +50,20 @@ pub(super) async fn stream_response(
             return Ok(result);
         }
 
-        let chunk_result = tokio::select! {
-            chunk = response.chunk() => chunk,
-            _ = wait_for_interrupt(app) => {
-                return Ok(cancelled_stream_result(state.content.thinking_open));
+        let chunk_result = if state.content.finish_reason_seen {
+            tokio::select! {
+                chunk = response.chunk() => chunk,
+                _ = wait_for_interrupt(app) => {
+                    return Ok(cancelled_stream_result(state.content.thinking_open));
+                }
+                _ = tokio::time::sleep(Duration::from_millis(FINISH_REASON_GRACE_MS)) => break,
+            }
+        } else {
+            tokio::select! {
+                chunk = response.chunk() => chunk,
+                _ = wait_for_interrupt(app) => {
+                    return Ok(cancelled_stream_result(state.content.thinking_open));
+                }
             }
         };
 
@@ -124,9 +138,7 @@ fn clear_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
 }
 
 fn immediate_cancel_result(app: &App, thinking_open: bool) -> Option<StreamResult> {
-    app.cancel_stream
-        .load(std::sync::atomic::Ordering::Relaxed)
-        .then(|| cancelled_stream_result(thinking_open))
+    stream_interrupt_requested(app).then(|| cancelled_stream_result(thinking_open))
 }
 
 fn cancelled_stream_result(thinking_open: bool) -> StreamResult {
@@ -291,13 +303,31 @@ fn finalize_stream_response(
 }
 
 async fn wait_for_interrupt(app: &App) {
-    loop {
-        if app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
-            || app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            return;
+    let _ = wait_for_interrupt_or_timeout(app, None).await;
+}
+
+fn stream_interrupt_requested(app: &App) -> bool {
+    app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
+        || app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed)
+        || crate::ai::driver::signal::request_interrupt_ready()
+}
+
+async fn wait_for_interrupt_or_timeout(app: &App, delay: Option<Duration>) -> bool {
+    if stream_interrupt_requested(app) {
+        return true;
+    }
+
+    match delay {
+        Some(delay) => {
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => false,
+                _ = crate::ai::driver::signal::wait_for_interrupt_sources(None, None) => true,
+            }
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        None => {
+            crate::ai::driver::signal::wait_for_interrupt_sources(None, None).await;
+            true
+        }
     }
 }
 
@@ -319,7 +349,9 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
 
     if state.framing.decode_error_count <= MAX_DECODE_ERRORS {
         eprintln!("[Warning] 尝试继续读取...");
-        tokio::time::sleep(Duration::from_millis(DECODE_ERROR_RETRY_DELAY_MS)).await;
+        if wait_for_interrupt_or_timeout(app, Some(Duration::from_millis(DECODE_ERROR_RETRY_DELAY_MS))).await {
+            return Some(cancelled_stream_result(state.content.thinking_open));
+        }
         return None;
     }
 
@@ -465,6 +497,7 @@ fn process_external_tool_calls_delta(
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
     chunk: &StreamChunk,
+    merge_mode: StreamEventMergeMode,
 ) {
     let Some(choice) = chunk.choices.first() else {
         return;
@@ -487,9 +520,11 @@ fn process_external_tool_calls_delta(
                     .function_name
                     .clone_from(&stream_tool_call.function.name);
             }
-            builder
-                .arguments
-                .push_str(&stream_tool_call.function.arguments);
+            append_tool_call_arguments(
+                &mut builder.arguments,
+                &stream_tool_call.function.arguments,
+                merge_mode,
+            );
             take_tool_call_render_chunk(state.render.current_printing_index, index, builder)
         };
 
@@ -498,6 +533,24 @@ fn process_external_tool_calls_delta(
                 let _ = open_tool_call_line(state, index, &render_chunk.function_name);
             }
             let _ = write_tool_call_arguments_stream(&render_chunk.arguments);
+        }
+    }
+}
+
+fn append_tool_call_arguments(
+    existing: &mut String,
+    incoming: &str,
+    merge_mode: StreamEventMergeMode,
+) {
+    if incoming.is_empty() {
+        return;
+    }
+
+    match merge_mode {
+        StreamEventMergeMode::Append => existing.push_str(incoming),
+        StreamEventMergeMode::AppendMissingSuffix => {
+            let suffix = unseen_suffix(existing, incoming);
+            existing.push_str(&suffix);
         }
     }
 }
@@ -683,11 +736,14 @@ mod tests {
     use super::*;
     use crate::ai::{
         cli::ParsedCli,
+        tools::os_tools::{GLOBAL_OS, init_os_tools_globals},
         types::{App, AppConfig},
     };
     use std::fs::File;
+    use std::io::Read as _;
+    use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
 
     fn test_app() -> App {
         App {
@@ -725,6 +781,51 @@ mod tests {
             os: crate::ai::driver::new_local_kernel(),
             agent_reload_counter: None,
             observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_interrupt_observes_request_interrupt_source() {
+        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let app = test_app();
+        init_os_tools_globals(app.os.clone());
+        crate::ai::driver::signal::clear_request_interrupt();
+
+        let waiter = wait_for_interrupt(&app);
+        let trigger = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            crate::ai::driver::signal::signal_request_interrupt();
+        };
+
+        tokio::join!(waiter, trigger);
+        crate::ai::driver::signal::clear_request_interrupt();
+        if let Ok(mut guard) = GLOBAL_OS.lock() {
+            *guard = None;
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_for_interrupt_or_timeout_returns_true_on_request_interrupt() {
+        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let app = test_app();
+        init_os_tools_globals(app.os.clone());
+        crate::ai::driver::signal::clear_request_interrupt();
+
+        let waiter = tokio::spawn(async move {
+            wait_for_interrupt_or_timeout(&app, Some(Duration::from_secs(5))).await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        crate::ai::driver::signal::signal_request_interrupt();
+
+        let interrupted = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("stream retry wait should wake on interrupt")
+            .expect("waiter should complete");
+        assert!(interrupted);
+
+        crate::ai::driver::signal::clear_request_interrupt();
+        if let Ok(mut guard) = GLOBAL_OS.lock() {
+            *guard = None;
         }
     }
 
@@ -904,6 +1005,119 @@ mod tests {
         assert_eq!(state.content.assistant_text, "hello world");
     }
 
+    #[test]
+    fn tool_call_snapshot_done_does_not_duplicate_already_streamed_prefix() {
+        let markers = StreamMarkers::new();
+        let mut state = StreamProcessingState::new();
+        let mut app = test_app();
+        let mut current_history = String::new();
+
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            normalize::StreamProviderAdapterKind::OpenAi,
+            Some("response.output_item.added"),
+            r#"{"output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"write_file","arguments":""}}"#,
+        )
+        .unwrap();
+
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            normalize::StreamProviderAdapterKind::OpenAi,
+            Some("response.function_call_arguments.delta"),
+            r#"{"output_index":0,"delta":"{\"path\":\"a"}"#,
+        )
+        .unwrap();
+
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            normalize::StreamProviderAdapterKind::OpenAi,
+            Some("response.function_call_arguments.done"),
+            r#"{"output_index":0,"arguments":"{\"path\":\"abc\"}"}"#,
+        )
+        .unwrap();
+
+        let builder = state.content.tool_calls_map.get(&0).unwrap();
+        assert_eq!(builder.id, "call_1");
+        assert_eq!(builder.function_name, "write_file");
+        assert_eq!(builder.arguments, "{\"path\":\"abc\"}");
+    }
+
+    fn write_http_chunk(stream: &mut std::net::TcpStream, payload: &str) -> std::io::Result<()> {
+        write!(stream, "{:X}\r\n", payload.len())?;
+        stream.write_all(payload.as_bytes())?;
+        stream.write_all(b"\r\n")?;
+        stream.flush()
+    }
+
+    #[tokio::test]
+    async fn stream_response_returns_after_finish_reason_without_eof() {
+        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_buf = [0u8; 1024];
+            let _ = stream.read(&mut request_buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .unwrap();
+            write_http_chunk(
+                &mut stream,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            )
+            .unwrap();
+            write_http_chunk(
+                &mut stream,
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )
+            .unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(2));
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut response = client
+            .post(format!("http://{addr}/chat"))
+            .send()
+            .await
+            .unwrap();
+        let mut app = test_app();
+        init_os_tools_globals(app.os.clone());
+        crate::ai::driver::signal::clear_request_interrupt();
+        let mut current_history = String::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            stream_response(&mut app, &mut response, &mut current_history, None),
+        )
+        .await
+        .expect("stream_response must not wait for EOF after finish_reason")
+        .unwrap();
+
+        assert_eq!(result.outcome, StreamOutcome::Completed);
+        assert_eq!(result.assistant_text, "hello");
+        assert_eq!(current_history, "hello");
+
+        drop(response);
+        let _ = done_tx.send(());
+        server.join().unwrap();
+        crate::ai::driver::signal::clear_request_interrupt();
+        if let Ok(mut guard) = GLOBAL_OS.lock() {
+            *guard = None;
+        }
+    }
+
 }
 
 fn process_stream_payload(
@@ -931,6 +1145,15 @@ fn process_stream_payload(
         state.pending_llm_usage = Some((chunk.model.clone(), usage.clone()));
     }
 
+    if chunk.choices.iter().any(|choice| {
+        choice
+            .finish_reason
+            .as_deref()
+            .is_some_and(|reason| !reason.trim().is_empty())
+    }) {
+        state.content.finish_reason_seen = true;
+    }
+
     if chunk.choices.is_empty() {
         state.content.empty_choice_chunks += 1;
         if should_show_opencode_waiting_hint(app) && state.content.empty_choice_chunks >= 3 {
@@ -947,7 +1170,7 @@ fn process_stream_payload(
         }
     }
 
-    process_external_tool_calls_delta(app, markers, state, &chunk);
+    process_external_tool_calls_delta(app, markers, state, &chunk, merge_mode);
 
     let (events, internal_tool_calls) = extract_chunk_events_with_tools(
         &chunk,
@@ -983,8 +1206,9 @@ fn process_stream_payload(
         }
     }
 
-    // Keep streaming until explicit stream end ([DONE] or EOF). Some providers can
-    // set finish_reason before all visible content chunks are delivered.
+    // Keep streaming until explicit stream end ([DONE]/EOF) or the outer loop's
+    // short post-finish grace window expires. Some providers can set
+    // finish_reason before all visible content chunks are delivered.
     Ok(false)
 }
 

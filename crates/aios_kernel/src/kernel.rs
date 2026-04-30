@@ -105,7 +105,10 @@ pub enum ShmReadError {
     /// Caller is not the owner of this shared memory region
     PermissionDenied { owner_pid: u64 },
     /// Data corruption detected via checksum mismatch
-    Corrupted { expected_checksum: u64, actual_checksum: u64 },
+    Corrupted {
+        expected_checksum: u64,
+        actual_checksum: u64,
+    },
     /// The process that owns this region has terminated
     OwnerTerminated { owner_pid: u64 },
 }
@@ -117,8 +120,15 @@ impl std::fmt::Display for ShmReadError {
             ShmReadError::PermissionDenied { owner_pid } => {
                 write!(f, "permission denied (owner: {})", owner_pid)
             }
-            ShmReadError::Corrupted { expected_checksum, actual_checksum } => {
-                write!(f, "data corrupted (expected: {:#x}, actual: {:#x})", expected_checksum, actual_checksum)
+            ShmReadError::Corrupted {
+                expected_checksum,
+                actual_checksum,
+            } => {
+                write!(
+                    f,
+                    "data corrupted (expected: {:#x}, actual: {:#x})",
+                    expected_checksum, actual_checksum
+                )
             }
             ShmReadError::OwnerTerminated { owner_pid } => {
                 write!(f, "owner process {} terminated", owner_pid)
@@ -175,28 +185,28 @@ pub const DEFAULT_MAILBOX_CAPACITY: usize = 64;
 #[derive(Debug, Clone)]
 pub struct Process {
     pub pid: u64,
-    pub parent_pid: Option<u64>,  // 父进程 PID
+    pub parent_pid: Option<u64>, // 父进程 PID
     pub name: String,
-    pub goal: String,  // 任务描述
+    pub goal: String, // 任务描述
     pub state: ProcessState,
-    pub result: Option<String>,  // 终止结果
+    pub result: Option<String>, // 终止结果
     pub mailbox: VecDeque<String>,
     pub max_mailbox_capacity: usize,
-    pub pending_signals: VecDeque<Signal>,  // 待处理信号
+    pub pending_signals: VecDeque<Signal>, // 待处理信号
     pub priority: u8,
-    pub quota_turns: usize,  // 最大 LLM turn 数
+    pub quota_turns: usize, // 最大 LLM turn 数
     pub capabilities: ProcessCapabilities,
     pub is_foreground: bool,
-    pub turns_used: usize,  // 已使用 turn 数
+    pub turns_used: usize, // 已使用 turn 数
     pub created_at_tick: u64,
-    pub process_group: Option<u64>,  // 进程组 ID
-    pub is_daemon: bool,  // 是否守护进程
+    pub process_group: Option<u64>, // 进程组 ID
+    pub is_daemon: bool,            // 是否守护进程
     pub max_restarts: usize,
-    pub restart_count: usize,  // 重启计数
-    pub env: FastMap<String, String>,  // 环境变量
+    pub restart_count: usize,         // 重启计数
+    pub env: FastMap<String, String>, // 环境变量
     pub history_file: Option<PathBuf>,
-    pub allowed_tools: FastSet<String>,  // 允许的工具
-    pub tool_calls_used: usize,  // 已使用 tool call 数
+    pub allowed_tools: FastSet<String>, // 允许的工具
+    pub tool_calls_used: usize,         // 已使用 tool call 数
     pub working_dir: Option<PathBuf>,
     /// 结构化资源上限（新）。旧字段 `quota_turns` 仍保留做为 max_turns 的视图；
     /// 当 `limits` 被 sys_rlimit_set 修改时两者会保持同步。
@@ -207,29 +217,30 @@ pub struct Process {
 
 /// Syscall trait - system calls available to AIOS processes.
 /// These are invoked by AI agents via tool calls to interact with the OS.
-/// 
+///
 /// Process management:
 ///   - spawn(): Create a new child process (subagent)
 ///   - wait_on(): Block until another process terminates
 ///   - wait_on_events(): Block until external events reach the desired completion condition
 ///   - kill_process(): Request termination of another process
 ///   - reap_process(): Collect terminated process result
-/// 
+///
 /// IPC:
 ///   - send_ipc(): Send message to another process's mailbox
 ///   - read_mailbox(): Read messages from own mailbox
-/// 
+///
 /// Shared memory:
 ///   - shm_create(): Create new shared memory region (key/value)
 ///   - shm_read(): Read from shared memory (owner only)
 ///   - shm_write(): Write to shared memory (owner only)
 ///   - shm_delete(): Delete shared memory region
-/// 
+///
 /// Environment:
 ///   - set_env(): Set environment variable
 ///   - set_working_dir(): Change current working directory
 pub trait Syscall {
-    fn spawn(  // 创建子进程
+    fn spawn(
+        // 创建子进程
         &mut self,
         parent_pid: Option<u64>,
         name: String,
@@ -239,35 +250,35 @@ pub trait Syscall {
         capabilities: Option<ProcessCapabilities>,
         allowed_tools: Option<FastSet<String>>,
     ) -> Result<u64, String>;
-    fn wait_on(&mut self, target_pid: u64) -> Result<(), String>;  // 等待进程终止
+    fn wait_on(&mut self, target_pid: u64) -> Result<(), String>; // 等待进程终止
     fn wait_on_events(
         &mut self,
         event_ids: Vec<EventId>,
         policy: WaitPolicy,
         timeout_ticks: Option<u64>,
-    ) -> Result<Option<u64>, String>;  // 等待外部事件
-    fn send_ipc(&mut self, target_pid: u64, message: String) -> Result<(), String>;  // 发送 IPC 消息
-    fn read_mailbox(&mut self) -> Result<Vec<String>, String>;  // 读取邮箱
-    fn set_env(&mut self, key: String, value: String) -> Result<(), String>;  // 设置环境变量
-    fn get_env(&self, key: &str) -> Option<String>;  // 获取环境变量
-    fn current_process_id(&self) -> Option<u64>;  // 获取当前 PID
-    fn get_process(&self, pid: u64) -> Option<&Process>;  // 获取进程信息
-    fn list_processes(&self) -> Vec<Process>;  // 列出所有进程
-    fn sleep_current(&mut self, turns: u64) -> Result<u64, String>;  // 睡眠 N 个 tick
-    fn kill_process(&mut self, target_pid: u64, reason: String) -> Result<(), String>;  // 请求终止进程
-    fn reap_process(&mut self, target_pid: u64) -> Result<String, String>;  // 收集终止进程结果
-    fn signal_process(&mut self, target_pid: u64, signal: Signal) -> Result<(), String>;  // 发送信号
-    fn set_process_group(&mut self, pid: u64, pgid: u64) -> Result<(), String>;  // 设置进程组
-    fn signal_process_group(&mut self, pgid: u64, signal: Signal) -> Result<usize, String>;  // 组播信号
-    fn shm_create(&mut self, key: String, value: String) -> Result<(), String>;  // 创建共享内存
-    fn shm_read(&self, key: &str) -> Result<String, ShmReadError>;  // 读取共享内存
-    fn shm_read_degraded(&self, key: &str) -> Option<String>;  // 容错读取
-    fn shm_write(&mut self, key: String, value: String) -> Result<(), String>;  // 写入共享��存
-    fn shm_delete(&mut self, key: &str) -> Result<(), String>;  // 删除共享内存
-    fn shm_health_check(&self) -> Vec<(String, ShmReadError)>;  // 健康检查
-    fn shm_cleanup_orphans(&mut self) -> usize;  // 清理孤立共享内存
-    fn set_working_dir(&mut self, dir: PathBuf) -> Result<(), String>;  // 设置工作目录
-    fn get_working_dir(&self) -> Option<PathBuf>;  // 获取工作目录
+    ) -> Result<Option<u64>, String>; // 等待外部事件
+    fn send_ipc(&mut self, target_pid: u64, message: String) -> Result<(), String>; // 发送 IPC 消息
+    fn read_mailbox(&mut self) -> Result<Vec<String>, String>; // 读取邮箱
+    fn set_env(&mut self, key: String, value: String) -> Result<(), String>; // 设置环境变量
+    fn get_env(&self, key: &str) -> Option<String>; // 获取环境变量
+    fn current_process_id(&self) -> Option<u64>; // 获取当前 PID
+    fn get_process(&self, pid: u64) -> Option<&Process>; // 获取进程信息
+    fn list_processes(&self) -> Vec<Process>; // 列出所有进程
+    fn sleep_current(&mut self, turns: u64) -> Result<u64, String>; // 睡眠 N 个 tick
+    fn kill_process(&mut self, target_pid: u64, reason: String) -> Result<(), String>; // 请求终止进程
+    fn reap_process(&mut self, target_pid: u64) -> Result<String, String>; // 收集终止进程结果
+    fn signal_process(&mut self, target_pid: u64, signal: Signal) -> Result<(), String>; // 发送信号
+    fn set_process_group(&mut self, pid: u64, pgid: u64) -> Result<(), String>; // 设置进程组
+    fn signal_process_group(&mut self, pgid: u64, signal: Signal) -> Result<usize, String>; // 组播信号
+    fn shm_create(&mut self, key: String, value: String) -> Result<(), String>; // 创建共享内存
+    fn shm_read(&self, key: &str) -> Result<String, ShmReadError>; // 读取共享内存
+    fn shm_read_degraded(&self, key: &str) -> Option<String>; // 容错读取
+    fn shm_write(&mut self, key: String, value: String) -> Result<(), String>; // 写入共享��存
+    fn shm_delete(&mut self, key: &str) -> Result<(), String>; // 删除共享内存
+    fn shm_health_check(&self) -> Vec<(String, ShmReadError)>; // 健康检查
+    fn shm_cleanup_orphans(&mut self) -> usize; // 清理孤立共享内存
+    fn set_working_dir(&mut self, dir: PathBuf) -> Result<(), String>; // 设置工作目录
+    fn get_working_dir(&self) -> Option<PathBuf>; // 获取工作目录
     fn spawn_daemon(
         &mut self,
         parent_pid: Option<u64>,
@@ -282,7 +293,7 @@ pub trait Syscall {
 /// KernelInternal - internal kernel operations not exposed as syscalls.
 /// Used for process scheduling, state transitions, and cleanup.
 /// These are called by the turn runtime and driver, not by AI agents directly.
-/// 
+///
 /// Scheduling:
 ///   - begin_foreground(): Create foreground process for interactive input
 ///   - pop_ready(): Get next ready process (scheduling)
@@ -310,6 +321,8 @@ pub trait KernelInternal {
     /// 消费并清除 yield 请求标志，返回之前的值
     /// 进程可通过 yield_current 工具请求让出 CPU
     fn consume_yield_requested(&mut self) -> bool;
+    /// 查询某个内核事件是否已被标记为完成。
+    fn event_is_completed(&self, event_id: EventId) -> bool;
     /// 删除已终止的进程（非等待状态）
     fn drop_terminated(&mut self, target_pid: u64) -> bool;
     /// 推进调度器 tick，唤醒到期睡眠进程
@@ -348,6 +361,7 @@ pub trait Kernel:
     + KernelInternal
     + crate::primitives::FutexOps
     + crate::primitives::TraceOps
+    + crate::primitives::EpollOps
     + crate::primitives::RlimitOps
     + crate::primitives::LlmOps
     + crate::primitives::VfsOps

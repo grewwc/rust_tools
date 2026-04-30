@@ -1,10 +1,10 @@
 use rust_tools::commonw::FastMap;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 
 use rust_tools::cw::SkipMap;
 use serde_json::Value;
 
-use aios_kernel::kernel::Signal;
+use aios_kernel::{kernel::{Kernel, Signal}, primitives::FutexAddr};
 use crate::ai::tools::os_tools::GLOBAL_OS;
 use crate::ai::tools::permissions::ToolPermissions;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
@@ -37,14 +37,48 @@ pub(crate) struct ToolRegistration {
 
 inventory::collect!(ToolRegistration);
 
+static TOOL_CANCEL_FUTEXES: LazyLock<Mutex<FastMap<u64, FutexAddr>>> =
+    LazyLock::new(|| Mutex::new(FastMap::default()));
+
+pub(crate) fn ensure_process_tool_cancel_futex(
+    os: &mut dyn Kernel,
+    pid: u64,
+) -> Result<FutexAddr, String> {
+    let mut registry = TOOL_CANCEL_FUTEXES
+        .lock()
+        .map_err(|_| "tool cancel futex registry poisoned".to_string())?;
+    if let Some(addr) = registry.get(&pid).copied() {
+        return Ok(addr);
+    }
+    let addr = os.futex_create(0, format!("tool_cancel:pid={pid}"));
+    registry.insert(pid, addr);
+    Ok(addr)
+}
+
+pub(crate) fn current_process_tool_cancel_futex(
+    os: &mut dyn Kernel,
+) -> Result<Option<FutexAddr>, String> {
+    let Some(pid) = os.current_process_id() else {
+        return Ok(None);
+    };
+    ensure_process_tool_cancel_futex(os, pid).map(Some)
+}
+
 pub(crate) fn request_tool_cancel() {
-    with_current_process(|os, pid| {
+    with_current_process_kernel(|os, pid| {
+        let addr = ensure_process_tool_cancel_futex(os, pid)?;
+        let _ = os.futex_store(addr, 1);
         os.signal_process(pid, Signal::SigCancel)?;
         Ok(())
     });
 }
 
 pub(crate) fn clear_tool_cancel() {
+    with_current_process_kernel(|os, pid| {
+        let addr = ensure_process_tool_cancel_futex(os, pid)?;
+        let _ = os.futex_store(addr, 0);
+        Ok(())
+    });
     with_current_process_mut(|proc| {
         proc.pending_signals.retain(|signal| *signal != Signal::SigCancel);
     });
@@ -57,6 +91,16 @@ pub(crate) fn is_tool_cancel_requested() -> bool {
 
 fn with_current_process<T>(
     f: impl FnOnce(&mut dyn aios_kernel::kernel::Syscall, u64) -> Result<T, String>,
+) -> Option<T> {
+    let guard = GLOBAL_OS.lock().ok()?;
+    let os = guard.as_ref()?.clone();
+    let mut os = os.lock().ok()?;
+    let pid = os.current_process_id()?;
+    f(os.as_mut(), pid).ok()
+}
+
+fn with_current_process_kernel<T>(
+    f: impl FnOnce(&mut dyn Kernel, u64) -> Result<T, String>,
 ) -> Option<T> {
     let guard = GLOBAL_OS.lock().ok()?;
     let os = guard.as_ref()?.clone();

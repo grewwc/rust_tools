@@ -7,12 +7,16 @@ use std::time::Instant;
 use crate::ai::{
     agents::{self, AgentManifest, AgentModelTier},
     models,
+    tools::registry::common::current_process_tool_cancel_futex,
     tools::common::{ToolRegistration, ToolSpec},
 };
 use crate::ai::tools::os_tools::GLOBAL_OS;
 use aios_kernel::{
-    kernel::{Kernel, ProcessState, WaitPolicy},
-    primitives::{ChannelId, ChannelOwnerTag, IpcRecvResult},
+    kernel::{EventId, Kernel, ProcessState, WaitPolicy},
+    primitives::{
+        ChannelId, ChannelOwnerTag, EpollEventMask, EpollSource, EpollWaitResult, FutexAddr,
+        IpcRecvResult,
+    },
 };
 use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
@@ -26,6 +30,7 @@ const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
 struct AsyncTaskEntry {
     pid: u64,
     result_channel_id: u64,
+    completion_futex_addr: FutexAddr,
     description: String,
     agent_name: String,
     model: String,
@@ -40,6 +45,7 @@ static TASK_REGISTRY: LazyLock<Mutex<FastMap<String, AsyncTaskEntry>>> =
 pub(crate) struct OsTaskGoal {
     pub(crate) task_id: String,
     pub(crate) result_channel_id: u64,
+    pub(crate) completion_futex_addr: u64,
     pub(crate) description: String,
     pub(crate) prompt: String,
     pub(crate) agent_name: String,
@@ -98,6 +104,205 @@ fn with_os_kernel<T>(
         .lock()
         .map_err(|e| format!("Failed to lock AIOS kernel: {e}"))?;
     f(kernel.as_mut())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EpollWaitManyOutcome {
+    pub(crate) ready_sources: Vec<WaitManySource>,
+    pub(crate) pending_sources: Vec<WaitManySource>,
+    pub(crate) event_ids: Vec<EventId>,
+    pub(crate) suspended: bool,
+    pub(crate) timeout_tick: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum WaitManySource {
+    Channel(u64),
+    Event(EventId),
+    Futex { addr: FutexAddr, expected: u64 },
+}
+
+pub(crate) fn wait_sources_for_channel_and_futex(
+    os: &mut dyn Kernel,
+    channel_id: u64,
+    completion_futex_addr: Option<FutexAddr>,
+) -> Result<Vec<WaitManySource>, String> {
+    let mut sources = vec![WaitManySource::Channel(channel_id)];
+    let channel_event = os
+        .channel_event_id(ChannelId(channel_id))
+        .ok_or_else(|| format!("Channel {} has no waitable event id.", channel_id))?;
+    sources.push(WaitManySource::Event(channel_event));
+    if let Some(addr) = completion_futex_addr {
+        sources.push(WaitManySource::Futex { addr, expected: 0 });
+    }
+    Ok(sources)
+}
+
+pub(crate) fn append_current_process_cancel_source(
+    os: &mut dyn Kernel,
+    sources: &mut Vec<WaitManySource>,
+) -> Result<(), String> {
+    if let Some(addr) = current_process_tool_cancel_futex(os)? {
+        sources.push(WaitManySource::Futex { addr, expected: 0 });
+    }
+    Ok(())
+}
+
+impl WaitManySource {
+    fn epoll_source(self) -> EpollSource {
+        match self {
+            Self::Channel(channel_id) => EpollSource::Channel(ChannelId(channel_id)),
+            Self::Event(event_id) => EpollSource::Event(event_id),
+            Self::Futex { addr, expected } => EpollSource::Futex { addr, expected },
+        }
+    }
+
+    fn epoll_mask(self) -> EpollEventMask {
+        match self {
+            Self::Channel(_) => EpollEventMask::IN | EpollEventMask::HUP | EpollEventMask::ERR,
+            Self::Event(_) | Self::Futex { .. } => EpollEventMask::IN | EpollEventMask::ERR,
+        }
+    }
+}
+
+fn wait_many_snapshot(
+    os: &mut dyn Kernel,
+    sources: &[WaitManySource],
+) -> Result<(Vec<WaitManySource>, Vec<WaitManySource>, Vec<EventId>), String> {
+    let mut ready = Vec::new();
+    let mut pending = Vec::new();
+    let mut event_ids = Vec::new();
+    for source in sources {
+        let event_id = match *source {
+            WaitManySource::Channel(channel_id) => {
+                let channel = ChannelId(channel_id);
+                let meta = os
+                    .channel_meta(channel)
+                    .ok_or_else(|| format!("Channel {} no longer exists.", channel_id))?;
+                if meta.queued_len > 0 || meta.closed {
+                    ready.push(*source);
+                    continue;
+                }
+                os.channel_event_id(channel)
+                    .ok_or_else(|| format!("Channel {} has no waitable event id.", channel_id))?
+            }
+            WaitManySource::Event(event_id) => {
+                if os.event_is_completed(event_id) {
+                    ready.push(*source);
+                    continue;
+                }
+                event_id
+            }
+            WaitManySource::Futex { addr, expected } => {
+                if os.futex_try_wait(addr, expected).is_some() {
+                    ready.push(*source);
+                    continue;
+                }
+                os.futex_event_id(addr)
+                    .ok_or_else(|| format!("Futex {} has no waitable event id.", addr.raw()))?
+            }
+        };
+        pending.push(*source);
+        event_ids.push(event_id);
+    }
+    Ok((ready, pending, event_ids))
+}
+
+pub(crate) fn epoll_wait_many(
+    os: &mut dyn Kernel,
+    label: &str,
+    sources: &[WaitManySource],
+    wait_policy: WaitPolicy,
+    timeout_ticks: Option<u64>,
+) -> Result<EpollWaitManyOutcome, String> {
+    if sources.is_empty() {
+        return Ok(EpollWaitManyOutcome {
+            ready_sources: Vec::new(),
+            pending_sources: Vec::new(),
+            event_ids: Vec::new(),
+            suspended: false,
+            timeout_tick: None,
+        });
+    }
+
+    let epoll = os.epoll_create(label.to_string());
+    let result = (|| {
+        for (index, source) in sources.iter().enumerate() {
+            os.epoll_ctl_add(
+                epoll,
+                source.epoll_source(),
+                source.epoll_mask(),
+                index as u64,
+            )?;
+        }
+
+        let (ready_sources, pending_sources, event_ids) = wait_many_snapshot(os, sources)?;
+        let satisfied = match wait_policy {
+            WaitPolicy::Any => !ready_sources.is_empty(),
+            WaitPolicy::All => pending_sources.is_empty(),
+        };
+        if satisfied {
+            return Ok(EpollWaitManyOutcome {
+                ready_sources,
+                pending_sources,
+                event_ids,
+                suspended: false,
+                timeout_tick: None,
+            });
+        }
+
+        match wait_policy {
+            WaitPolicy::Any => match os.epoll_wait(epoll, sources.len(), timeout_ticks)? {
+                EpollWaitResult::Ready(_) => {
+                    let (ready_sources, pending_sources, event_ids) = wait_many_snapshot(os, sources)?;
+                    Ok(EpollWaitManyOutcome {
+                        ready_sources,
+                        pending_sources,
+                        event_ids,
+                        suspended: false,
+                        timeout_tick: None,
+                    })
+                }
+                EpollWaitResult::Suspended { timeout_tick } => Ok(EpollWaitManyOutcome {
+                    ready_sources,
+                    pending_sources,
+                    event_ids,
+                    suspended: true,
+                    timeout_tick,
+                }),
+            },
+            WaitPolicy::All => {
+                let wake_tick = os.wait_on_events(event_ids.clone(), WaitPolicy::All, timeout_ticks)?;
+                let suspended = os.consume_yield_requested() || wake_tick.is_some();
+                let (ready_sources, pending_sources, refreshed_event_ids) =
+                    wait_many_snapshot(os, sources)?;
+                Ok(EpollWaitManyOutcome {
+                    ready_sources,
+                    pending_sources,
+                    event_ids: if suspended { event_ids } else { refreshed_event_ids },
+                    suspended,
+                    timeout_tick: wake_tick,
+                })
+            }
+        }
+    })();
+    let _ = os.epoll_destroy(epoll);
+    result
+}
+
+pub(crate) fn epoll_wait_many_channels(
+    os: &mut dyn Kernel,
+    label: &str,
+    channel_ids: &[u64],
+    wait_policy: WaitPolicy,
+    timeout_ticks: Option<u64>,
+) -> Result<EpollWaitManyOutcome, String> {
+    let sources = channel_ids
+        .iter()
+        .copied()
+        .map(WaitManySource::Channel)
+        .collect::<Vec<_>>();
+    epoll_wait_many(os, label, &sources, wait_policy, timeout_ticks)
 }
 
 fn params_task() -> Value {
@@ -220,7 +425,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
     let selection_explanation = build_selection_explanation(&selected, &selected_model, model_override);
 
     let task_id = next_task_id();
-    let (pid, result_channel_id) = with_os_kernel(|os| {
+    let (pid, result_channel_id, completion_futex_addr) = with_os_kernel(|os| {
         let parent_pid = os
             .current_process_id()
             .ok_or("task_spawn requires an active AIOS process context.".to_string())?;
@@ -234,9 +439,11 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
                 "task_result.consumer".to_string(),
             ],
         );
+        let completion_futex = os.futex_create(0, format!("task_completion:{task_id}"));
         let process_goal = encode_os_task_goal(&OsTaskGoal {
             task_id: task_id.clone(),
             result_channel_id: result_channel.raw(),
+            completion_futex_addr: completion_futex.raw(),
             description: description.to_string(),
             prompt: prompt.to_string(),
             agent_name: selected.agent.name.clone(),
@@ -252,7 +459,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
             None,
             None,
         )?;
-        Ok((pid, result_channel.raw()))
+        Ok((pid, result_channel.raw(), completion_futex))
     })?;
 
     println!(
@@ -267,6 +474,7 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
             AsyncTaskEntry {
                 pid,
                 result_channel_id,
+                completion_futex_addr,
                 description: description.to_string(),
                 agent_name: selected.agent.name.clone(),
                 model: selected_model.clone(),
@@ -483,6 +691,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     "task_result.consumer",
                 );
                 let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
+                let _ = os.futex_destroy(entry.completion_futex_addr);
             } else if is_task_pending(os, entry.pid)? {
                 pending.push((tid.clone(), entry.pid));
             } else {
@@ -495,22 +704,57 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
 
         if !pending.is_empty() {
             let pending_ids = pending.iter().map(|(tid, _)| tid.clone()).collect::<Vec<_>>();
-            let event_ids = task_channel_event_ids(os, &pending_ids, &registry)?;
-            let _ = os.wait_on_events(event_ids.clone(), WaitPolicy::All, None)?;
-            return Ok(Some(format!(
-                "Waiting on {} pending task(s). Suspended current process until all result channels become ready; event_ids={}. Call task_wait again after resume to collect results.",
-                pending.len(),
-                event_ids
-                    .iter()
-                    .map(|id| id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
+            let wait_sources = task_wait_sources(os, &pending_ids, &registry)?;
+            let wait = epoll_wait_many(
+                os,
+                &format!("task_wait:{}", pending_ids.join(",")),
+                &wait_sources,
+                WaitPolicy::All,
+                None,
+            )?;
+            if wait.suspended {
+                return Ok(Some(format!(
+                    "Waiting on {} pending task(s) via epoll_wait_many. Suspended current process until all remaining result channels become ready; event_ids={}. Call task_wait again after resume to collect results.",
+                    pending_ids.len(),
+                    wait.event_ids
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )));
+            }
+            pending.clear();
+            for tid in &pending_ids {
+                let entry = registry.get(tid).expect("validated after wait");
+                if let Some(result) = read_task_result(os, entry.result_channel_id, true)? {
+                    ready.push(format_task_result(entry, result));
+                    let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
+                    let _ = os.channel_release_named(
+                        ChannelId(entry.result_channel_id),
+                        "task_result.consumer",
+                    );
+                    let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
+                    let _ = os.futex_destroy(entry.completion_futex_addr);
+                } else if is_task_pending(os, entry.pid)? {
+                    pending.push((tid.clone(), entry.pid));
+                } else {
+                    ready.push(format!(
+                        "[Task: {} via {} @ {}] result not available yet; process pid={} has not published output.",
+                        entry.description, entry.agent_name, entry.model, entry.pid
+                    ));
+                }
+            }
         }
         Ok(None)
     })?;
     if let Some(message) = wait_message {
         return Ok(message);
+    }
+    if !pending.is_empty() {
+        return Ok(format!(
+            "Waiting on {} pending task(s) via epoll_wait_many. Call task_wait again after progress is reported.",
+            pending.len()
+        ));
     }
 
     for tid in &task_ids {
@@ -589,27 +833,24 @@ fn read_task_result(
         })
 }
 
-fn task_channel_event_ids(
-    os: &dyn Kernel,
+fn task_wait_sources(
+    os: &mut dyn Kernel,
     task_ids: &[String],
     registry: &FastMap<String, AsyncTaskEntry>,
-) -> Result<Vec<aios_kernel::kernel::EventId>, String> {
-    let mut event_ids = Vec::new();
+) -> Result<Vec<WaitManySource>, String> {
+    let mut sources = Vec::new();
     for tid in task_ids {
         let entry = registry
             .get(tid)
             .ok_or_else(|| format!("Unknown task_id: {}", tid))?;
-        let event_id = os
-            .channel_event_id(ChannelId(entry.result_channel_id))
-            .ok_or_else(|| {
-                format!(
-                    "Task {} result channel {} no longer exists.",
-                    tid, entry.result_channel_id
-                )
-            })?;
-        event_ids.push(event_id);
+        sources.extend(wait_sources_for_channel_and_futex(
+            os,
+            entry.result_channel_id,
+            Some(entry.completion_futex_addr),
+        )?);
     }
-    Ok(event_ids)
+    append_current_process_cancel_source(os, &mut sources)?;
+    Ok(sources)
 }
 
 fn is_task_pending(
@@ -910,8 +1151,16 @@ fn execute_subagent_task(
 
 #[cfg(test)]
 mod tests {
-    use super::{SelectedSubagent, build_selection_explanation, select_subagent};
+    use super::{
+        SelectedSubagent, WaitManySource, build_selection_explanation, epoll_wait_many,
+        epoll_wait_many_channels, select_subagent,
+    };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
+    use aios_kernel::{
+        kernel::{EventId, KernelInternal, Syscall, WaitPolicy},
+        local::LocalOS,
+        primitives::{FutexOps, IpcOps},
+    };
 
     fn manifest(name: &str, description: &str, mode: AgentMode) -> AgentManifest {
         AgentManifest {
@@ -1045,6 +1294,128 @@ mod tests {
 
         assert!(explanation.contains("explicit agent override"));
         assert!(explanation.contains("explicit model override"));
+    }
+
+    #[test]
+    fn epoll_wait_many_channels_returns_ready_without_suspending() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+        let channel = os.channel_create(Some(root), 1, "task-ready".to_string());
+        os.channel_send(Some(root), channel, "payload".to_string()).unwrap();
+
+        let wait = epoll_wait_many_channels(
+            &mut os,
+            "task_wait:test-ready",
+            &[channel.raw()],
+            WaitPolicy::All,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(wait.ready_sources, vec![WaitManySource::Channel(channel.raw())]);
+        assert!(wait.pending_sources.is_empty());
+        assert!(!wait.suspended);
+        assert!(wait.event_ids.is_empty());
+    }
+
+    #[test]
+    fn epoll_wait_many_channels_preserves_all_wait_suspension() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+        let channel_a = os.channel_create(Some(root), 1, "task-a".to_string());
+        let channel_b = os.channel_create(Some(root), 1, "task-b".to_string());
+
+        let wait = epoll_wait_many_channels(
+            &mut os,
+            "task_wait:test-suspend",
+            &[channel_a.raw(), channel_b.raw()],
+            WaitPolicy::All,
+            None,
+        )
+        .unwrap();
+
+        assert!(wait.ready_sources.is_empty());
+        assert_eq!(
+            wait.pending_sources,
+            vec![
+                WaitManySource::Channel(channel_a.raw()),
+                WaitManySource::Channel(channel_b.raw())
+            ]
+        );
+        assert_eq!(wait.event_ids.len(), 2);
+        assert!(wait.suspended);
+        assert!(os.current_process_id().is_none());
+    }
+
+    #[test]
+    fn epoll_wait_many_supports_mixed_ready_sources() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+        let channel = os.channel_create(Some(root), 1, "mixed-channel".to_string());
+        let futex = os.futex_create(0, "mixed-futex".to_string());
+        let event = EventId::new(77);
+        os.channel_send(Some(root), channel, "payload".to_string()).unwrap();
+        let _ = os.futex_store(futex, 1);
+        os.notify_events_completed(&[event]);
+
+        let wait = epoll_wait_many(
+            &mut os,
+            "mixed-ready",
+            &[
+                WaitManySource::Channel(channel.raw()),
+                WaitManySource::Futex { addr: futex, expected: 0 },
+                WaitManySource::Event(event),
+            ],
+            WaitPolicy::Any,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            wait.ready_sources,
+            vec![
+                WaitManySource::Channel(channel.raw()),
+                WaitManySource::Futex { addr: futex, expected: 0 },
+                WaitManySource::Event(event),
+            ]
+        );
+        assert!(wait.pending_sources.is_empty());
+        assert!(!wait.suspended);
+    }
+
+    #[test]
+    fn epoll_wait_many_supports_mixed_all_wait_suspension() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+        let channel = os.channel_create(Some(root), 1, "mixed-channel".to_string());
+        let futex = os.futex_create(0, "mixed-futex".to_string());
+        let event = EventId::new(88);
+        os.notify_events_completed(&[event]);
+
+        let wait = epoll_wait_many(
+            &mut os,
+            "mixed-all",
+            &[
+                WaitManySource::Channel(channel.raw()),
+                WaitManySource::Futex { addr: futex, expected: 0 },
+                WaitManySource::Event(event),
+            ],
+            WaitPolicy::All,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(wait.ready_sources, vec![WaitManySource::Event(event)]);
+        assert_eq!(
+            wait.pending_sources,
+            vec![
+                WaitManySource::Channel(channel.raw()),
+                WaitManySource::Futex { addr: futex, expected: 0 },
+            ]
+        );
+        assert_eq!(wait.event_ids.len(), 2);
+        assert!(wait.suspended);
+        assert!(os.current_process_id().is_none());
     }
 }
 

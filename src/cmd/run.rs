@@ -7,11 +7,14 @@ use crate::{commonw::utils::expanduser, strw::split::split_space_keep_symbol};
 use std::{
     ffi::OsString,
     io::{self, Read},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::mpsc::{self, RecvTimeoutError, Sender},
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 /// 命令执行选项
 ///
@@ -184,6 +187,35 @@ fn build_no_shell_command(command: &str, opts: RunCmdOptions<'_>) -> io::Result<
     Ok(cmd)
 }
 
+#[cfg(unix)]
+fn configure_child_process_group(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_child_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn terminate_child(child: &mut Child) {
+    let pgid = child.id() as libc::pid_t;
+    unsafe {
+        let _ = libc::kill(-pgid, libc::SIGKILL);
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn terminate_child(child: &mut Child) {
+    let _ = child.kill();
+}
+
 /// 执行命令并返回输出
 ///
 /// 执行命令并捕获标准输出和标准错误。
@@ -258,7 +290,10 @@ pub fn run_cmd_output_with_timeout(
     run_cmd_output_streaming_with_timeout(command, opts, timeout, |_| {}, || false)
 }
 
-fn spawn_pipe_reader<R>(mut reader: R, tx: Sender<Vec<u8>>) -> thread::JoinHandle<io::Result<Vec<u8>>>
+fn spawn_pipe_reader<R>(
+    mut reader: R,
+    tx: Sender<Vec<u8>>,
+) -> thread::JoinHandle<io::Result<Vec<u8>>>
 where
     R: Read + Send + 'static,
 {
@@ -305,6 +340,7 @@ where
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    configure_child_process_group(&mut cmd);
 
     let mut child = cmd.spawn()?;
     let stdout = child
@@ -330,7 +366,7 @@ where
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if should_cancel() {
-                    let _ = child.kill();
+                    terminate_child(&mut child);
                     let _ = child.wait();
                     let _ = join_pipe_reader(stdout_handle);
                     let _ = join_pipe_reader(stderr_handle);
@@ -340,7 +376,7 @@ where
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
                 }
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    terminate_child(&mut child);
                     let _ = child.wait();
                     let _ = join_pipe_reader(stdout_handle);
                     let _ = join_pipe_reader(stderr_handle);
@@ -415,7 +451,7 @@ pub fn run_cmd(command: &str) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::{run_cmd, run_cmd_output, run_cmd_output_streaming_with_timeout, RunCmdOptions};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_run_cmd_basic() {
@@ -457,6 +493,30 @@ mod tests {
             .unwrap();
             assert!(output.status.success());
             assert_eq!(String::from_utf8_lossy(&streamed), "hello\nworld");
+        }
+    }
+
+    #[test]
+    fn test_timeout_kills_shell_descendants_without_waiting_for_them() {
+        #[cfg(unix)]
+        {
+            let started = Instant::now();
+            let result = run_cmd_output_streaming_with_timeout(
+                "sh -c 'sleep 5'",
+                RunCmdOptions::default(),
+                Duration::from_millis(200),
+                |_| {},
+                || false,
+            );
+
+            assert!(matches!(
+                result.as_ref().map_err(|err| err.kind()),
+                Err(std::io::ErrorKind::TimedOut)
+            ));
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "timeout waited for shell descendant to exit"
+            );
         }
     }
 }

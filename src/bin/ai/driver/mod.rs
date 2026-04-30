@@ -327,7 +327,7 @@ async fn try_finalize_mcp_preload(
     mcp_probe: &McpConfigProbe,
     mcp_initialized: &mut bool,
     mcp_loading_announced: &mut bool,
-    mcp_preload_task: &mut Option<tokio::task::JoinHandle<PreparedMcpInit>>,
+    mcp_preload_task: &mut Option<tokio::task::JoinHandle<Option<PreparedMcpInit>>>,
 ) {
     if *mcp_initialized || !mcp_probe.exists {
         return;
@@ -342,8 +342,12 @@ async fn try_finalize_mcp_preload(
 
     let task = mcp_preload_task.take().unwrap();
     let report = match task.await {
-        Ok(prepared) => apply_prepared_mcp_with_shared_client(app, mcp_client, prepared),
+        Ok(Some(prepared)) => apply_prepared_mcp_with_shared_client(app, mcp_client, prepared),
+        Ok(None) => return,
         Err(err) => {
+            if app.shutdown.load(Ordering::Relaxed) || signal::request_interrupt_ready() {
+                return;
+            }
             eprintln!("[mcp] background preload task failed: {}", err);
             let fallback = prepare_mcp_initialization_from_path(mcp_probe.config_path.clone()).await;
             apply_prepared_mcp_with_shared_client(app, mcp_client, fallback)
@@ -362,6 +366,18 @@ async fn try_finalize_mcp_preload(
             println!("{header}");
         }
     }
+}
+
+fn spawn_mcp_preload_task(config_path: String) -> tokio::task::JoinHandle<Option<PreparedMcpInit>> {
+    tokio::spawn(async move {
+        let interrupt_futex = signal::alloc_interrupt_futex("mcp_preload_interrupt");
+        let prepared =
+            prepare_mcp_initialization_from_path_interruptible(config_path, interrupt_futex).await;
+        if let Some(addr) = interrupt_futex {
+            signal::destroy_interrupt_futex(addr);
+        }
+        prepared
+    })
 }
 
 /// Main entry point for AIOS.
@@ -555,10 +571,7 @@ async fn run_loop(
     let mut mcp_loading_announced = false;
     let mut manifests_loaded = false;
     let mut mcp_preload_task = if mcp_probe.exists {
-        let config_path = mcp_probe.config_path.clone();
-        Some(tokio::spawn(async move {
-            prepare_mcp_initialization_from_path(config_path).await
-        }))
+        Some(spawn_mcp_preload_task(mcp_probe.config_path.clone()))
     } else {
         None
     };
@@ -599,6 +612,14 @@ async fn run_loop(
             return Ok(());
         }
 
+        if mcp_probe.exists
+            && !mcp_initialized
+            && mcp_preload_task.is_none()
+            && !signal::request_interrupt_ready()
+        {
+            mcp_preload_task = Some(spawn_mcp_preload_task(mcp_probe.config_path.clone()));
+        }
+
         let history_count;
         let mut question;
 
@@ -627,7 +648,15 @@ async fn run_loop(
 
             let original_history_file = app.session_history_file.clone();
 
-            let mut task_specs: Vec<(u64, String, PathBuf, Option<String>, Option<String>, Option<u64>)> = Vec::new();
+            let mut task_specs: Vec<(
+                u64,
+                String,
+                PathBuf,
+                Option<String>,
+                Option<String>,
+                Option<u64>,
+                Option<aios_kernel::primitives::FutexAddr>,
+            )> = Vec::new();
             for proc in &background_procs {
                 let pid = proc.pid;
                 let task_goal = decode_os_task_goal(&proc.goal);
@@ -674,13 +703,16 @@ async fn run_loop(
                     task_goal.as_ref().map(|goal| goal.agent_name.clone()),
                     task_goal.as_ref().map(|goal| goal.model.clone()),
                     task_goal.as_ref().map(|goal| goal.result_channel_id),
+                    task_goal
+                        .as_ref()
+                        .map(|goal| aios_kernel::primitives::FutexAddr(goal.completion_futex_addr)),
                 ));
             }
 
-            for (pid, proc_question, history_path, agent_override, model_override, result_channel_id) in task_specs {
+            for (pid, proc_question, history_path, agent_override, model_override, result_channel_id, completion_futex_addr) in task_specs {
                 let mut task_app = app.clone();
                 task_app.session_history_file = history_path;
-                task_app.cancel_stream.store(false, Ordering::Relaxed);
+                crate::ai::types::clear_stream_cancel(&task_app);
                 let task_mcp = mcp_client.clone();
                 let task_skills = skill_manifests.clone();
                 let task_os = app.os.clone();
@@ -729,6 +761,9 @@ async fn run_loop(
                             aios_kernel::primitives::ChannelId(result_channel_id),
                             "task_result.producer",
                         );
+                    }
+                    if let Some(addr) = completion_futex_addr {
+                        let _ = os.futex_store(addr, 1);
                     }
                     match result {
                         Ok(_outcome) => {
@@ -857,7 +892,7 @@ async fn run_loop(
         let original_history_file = app.session_history_file.clone();
         let original_writer = app.writer.clone();
 
-        app.cancel_stream.store(false, Ordering::Relaxed);
+        crate::ai::types::clear_stream_cancel(app);
         crate::ai::tools::registry::common::clear_tool_cancel();
 
         {

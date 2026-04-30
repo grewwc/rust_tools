@@ -36,6 +36,14 @@ pub struct PreparedMcpInit {
     pub client: McpClient,
 }
 
+fn empty_prepared_mcp_init(report: McpInitReport) -> PreparedMcpInit {
+    PreparedMcpInit {
+        report,
+        loaded_servers: FastMap::default(),
+        client: McpClient::new(),
+    }
+}
+
 pub fn probe_mcp_config(app: &App) -> McpConfigProbe {
     let cfg = crate::commonw::configw::get_all_config();
     let mcp_path = if !app.cli.mcp_config.trim().is_empty() {
@@ -103,6 +111,34 @@ pub async fn init_mcp(app: &mut App, mcp_client: &mut McpClient) -> McpInitRepor
 }
 
 pub async fn prepare_mcp_initialization_from_path(config_path: String) -> PreparedMcpInit {
+    let fallback_config_path = config_path.clone();
+    prepare_mcp_initialization_from_path_inner(config_path, false, None)
+        .await
+        .unwrap_or_else(|| {
+            empty_prepared_mcp_init(McpInitReport {
+                config_path: fallback_config_path,
+                loaded: false,
+                server_count: 0,
+                tool_count: 0,
+                resource_count: 0,
+                prompt_count: 0,
+                failures: Vec::new(),
+            })
+        })
+}
+
+pub async fn prepare_mcp_initialization_from_path_interruptible(
+    config_path: String,
+    local_interrupt_futex: Option<aios_kernel::primitives::FutexAddr>,
+) -> Option<PreparedMcpInit> {
+    prepare_mcp_initialization_from_path_inner(config_path, true, local_interrupt_futex).await
+}
+
+async fn prepare_mcp_initialization_from_path_inner(
+    config_path: String,
+    interruptible: bool,
+    local_interrupt_futex: Option<aios_kernel::primitives::FutexAddr>,
+) -> Option<PreparedMcpInit> {
     let mut report = McpInitReport {
         config_path: config_path.clone(),
         loaded: false,
@@ -117,22 +153,14 @@ pub async fn prepare_mcp_initialization_from_path(config_path: String) -> Prepar
         if err.kind() != io::ErrorKind::NotFound {
             eprintln!("[mcp] failed to access config file {}: {}", config_path, err);
         }
-        return PreparedMcpInit {
-            report,
-            loaded_servers: FastMap::default(),
-            client: McpClient::new(),
-        };
+        return Some(empty_prepared_mcp_init(report));
     }
 
     let servers = match super::super::mcp::load_mcp_config_from_file(&config_path) {
         Ok(s) => s,
         Err(err) => {
             eprintln!("[mcp] failed to load config from {}: {}", config_path, err);
-            return PreparedMcpInit {
-                report,
-                loaded_servers: FastMap::default(),
-                client: McpClient::new(),
-            };
+            return Some(empty_prepared_mcp_init(report));
         }
     };
 
@@ -149,20 +177,22 @@ pub async fn prepare_mcp_initialization_from_path(config_path: String) -> Prepar
         }
     }
 
-    let server_futures: Vec<_> = loaded_servers
-        .iter()
-        .map(|(name, cfg)| {
-            let name = name.clone();
-            let cfg = cfg.clone();
-            async move { (name.clone(), connect_single_server_async(name, cfg).await) }
-        })
-        .collect();
-
-    use futures_util::future::join_all;
-    let results = join_all(server_futures).await;
-
     let mut client = McpClient::new();
-    for (name, result) in results {
+    for (name, cfg) in &loaded_servers {
+        if interruptible
+            && crate::ai::driver::signal::interrupt_sources_ready(local_interrupt_futex)
+        {
+            return None;
+        }
+
+        let result = connect_single_server_async(name.clone(), cfg.clone()).await;
+
+        if interruptible
+            && crate::ai::driver::signal::interrupt_sources_ready(local_interrupt_futex)
+        {
+            return None;
+        }
+
         match result {
             Ok(conn) => {
                 client.servers.insert(name.clone(), std::sync::Mutex::new(conn));
@@ -181,11 +211,11 @@ pub async fn prepare_mcp_initialization_from_path(config_path: String) -> Prepar
     report.resource_count = client.get_all_resources().len();
     report.prompt_count = client.get_all_prompts().len();
 
-    PreparedMcpInit {
+    Some(PreparedMcpInit {
         report,
         loaded_servers,
         client,
-    }
+    })
 }
 
 pub fn apply_prepared_mcp_init(
@@ -217,6 +247,52 @@ async fn connect_single_server_async(
     tokio::task::spawn_blocking(move || connect_single_server(&name, &config))
         .await
         .map_err(|e| format!("Task join error: {}", e))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
+
+    #[tokio::test]
+    async fn interruptible_prepare_mcp_init_stops_before_connecting_servers() {
+        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let kernel = crate::ai::driver::new_local_kernel();
+        init_os_tools_globals(kernel.clone());
+        crate::ai::driver::signal::clear_request_interrupt();
+
+        let config_path = std::env::temp_dir().join(format!(
+            "mcp-interruptible-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(
+            &config_path,
+            r#"{
+                "mcpServers": {
+                    "demo": {
+                        "command": "/definitely/not/run",
+                        "args": ["--demo"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        crate::ai::driver::signal::signal_request_interrupt();
+        let prepared = prepare_mcp_initialization_from_path_interruptible(
+            config_path.to_string_lossy().to_string(),
+            None,
+        )
+        .await;
+
+        assert!(prepared.is_none());
+
+        crate::ai::driver::signal::clear_request_interrupt();
+        let _ = std::fs::remove_file(config_path);
+        if let Ok(mut guard) = GLOBAL_OS.lock() {
+            *guard = None;
+        }
+    }
 }
 
 /// 同步连接单个 MCP 服务器（提取自 McpClient::connect_server）

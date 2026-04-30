@@ -1,0 +1,25 @@
+[package]
+name = "redis_lock"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Redis 客户端，支持异步操作
+redis = { version = "1.2", features = ["tokio-comp", "connection-manager"] }
+# 异步运行时
+tokio = { version = "1", features = ["sync", "time", "rt-multi-thread"] }
+# UUID 用于生成唯一标识
+uuid = { version = "1", features = ["v4"] }
+async-trait = "0.1"
+# 序列化支持
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 日志
+tracing = "0.1"
+# 错误处理
+thiserror = "2"
+
+[dev-dependencies]
+# 测试用
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = "0.3"
