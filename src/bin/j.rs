@@ -87,7 +87,7 @@ fn main() {
     if let Some(fname) = cli.format.as_deref() {
         let options = jsonw::ParseOptions::default();
         let j = if fname.is_empty() {
-            jsonw::Json::from_clipboard(options).unwrap()
+            parse_clipboard_json(options)
         } else {
             jsonw::Json::from_file(fname, options).unwrap()
         };
@@ -157,4 +157,35 @@ fn read_stdin_all() -> String {
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf).unwrap_or_default();
     buf
+}
+
+/// 从剪贴板解析 JSON，支持处理双重转义的 JSON 字符串
+///
+/// 该函数会尝试解析剪贴板内容。如果解析结果是一个字符串（说明剪贴板内容是
+/// 一个 JSON 字符串，如 `"{\"key\":\"value\"}"`），则会尝试将该字符串再次
+/// 解析为 JSON，以处理用户复制了 JSON 字符串的情况。
+fn parse_clipboard_json(options: jsonw::ParseOptions) -> jsonw::Json {
+    let s = string_content::get_clipboard_content();
+    let j = jsonw::Json::from_str(&s, options)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to parse clipboard content as JSON: {e}");
+            std::process::exit(1);
+        });
+    
+    // 如果解析结果是一个字符串，尝试将其作为 JSON 再次解析
+    // 这处理了剪贴板内容是 "{\"key\":...}" 这种 JSON 字符串的情况
+    let val = j.raw_value();
+    if val.is_string() {
+        if let Some(inner_str) = val.as_str() {
+            match jsonw::Json::from_str(inner_str, options) {
+                Ok(inner_j) => return inner_j,
+                Err(_) => {
+                    // 如果内部字符串无法解析为 JSON，返回原始的 j
+                    // （可能剪贴板内容就是一个普通的 JSON 字符串）
+                }
+            }
+        }
+    }
+    
+    j
 }
