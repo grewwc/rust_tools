@@ -364,12 +364,9 @@ fn parse_opencode_payload(payload: &str) -> ParsedStreamPayload {
         return ParsedStreamPayload::Ignore;
     }
 
-    match serde_json::from_str::<StreamChunk>(trimmed) {
-        Ok(mut chunk) => {
-            chunk.merge_reasoning();
-            ParsedStreamPayload::Chunk(chunk)
-        }
-        Err(_) => {
+    match try_parse_stream_chunk_loose(trimmed) {
+        Some(chunk) => ParsedStreamPayload::Chunk(chunk),
+        None => {
             eprintln!(
                 "[opencode] ignored payload, length: {}, starts_with: {:.30}",
                 trimmed.len(),
@@ -381,12 +378,13 @@ fn parse_opencode_payload(payload: &str) -> ParsedStreamPayload {
 }
 
 fn parse_stream_chunk(adapter_label: &str, payload: &str) -> ParsedStreamPayload {
-    match serde_json::from_str::<StreamChunk>(payload) {
-        Ok(mut chunk) => {
-            chunk.merge_reasoning();
-            ParsedStreamPayload::Chunk(chunk)
-        }
-        Err(err) => {
+    match try_parse_stream_chunk_loose(payload) {
+        Some(chunk) => ParsedStreamPayload::Chunk(chunk),
+        None => {
+            let err = serde_json::from_str::<serde_json::Value>(payload)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unable to parse stream payload".to_string());
             eprintln!("handleResponse error [{adapter_label}] {err}");
             eprintln!("======> response: ");
             eprintln!("{payload}");
@@ -400,6 +398,23 @@ fn try_parse_stream_chunk(payload: &str) -> Option<StreamChunk> {
     let mut chunk = serde_json::from_str::<StreamChunk>(payload).ok()?;
     chunk.merge_reasoning();
     Some(chunk)
+}
+
+fn try_parse_stream_chunk_loose(payload: &str) -> Option<StreamChunk> {
+    if let Some(chunk) = try_parse_stream_chunk(payload) {
+        return Some(chunk);
+    }
+
+    let trimmed = payload.trim();
+    let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) else {
+        return None;
+    };
+    if start >= end {
+        return None;
+    }
+
+    let candidate = &trimmed[start..=end];
+    try_parse_stream_chunk(candidate)
 }
 
 #[cfg(test)]
@@ -442,6 +457,17 @@ mod tests {
         match parse_stream_payload(StreamProviderAdapterKind::OpenCode, payload, None) {
             ParsedStreamPayload::Chunk(chunk) => {
                 assert_eq!(chunk.choices[0].delta.content, "hi");
+            }
+            _ => panic!("expected parsed chunk"),
+        }
+    }
+
+    #[test]
+    fn opencode_payload_with_wrapped_json_still_parses() {
+        let payload = r#"noise {"choices":[{"delta":{"content":"hello"}}]} trailing"#;
+        match parse_stream_payload(StreamProviderAdapterKind::OpenCode, payload, None) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.content, "hello");
             }
             _ => panic!("expected parsed chunk"),
         }

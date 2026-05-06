@@ -26,7 +26,7 @@ const DECODE_ERROR_RETRY_DELAY_MS: u64 = 100;
 /// Grace window after an OpenAI-compatible `finish_reason` chunk. Some backends
 /// do not emit `[DONE]` or close the HTTP body, while others can still send a
 /// final snapshot immediately after the finish chunk.
-const FINISH_REASON_GRACE_MS: u64 = 200;
+const FINISH_REASON_GRACE_MS: u64 = 10_000;
 
 pub(super) async fn stream_response(
     app: &mut App,
@@ -189,15 +189,7 @@ async fn consume_pending_complete_lines(
 ) -> Result<StreamChunkStep, Box<dyn std::error::Error>> {
     // Move the pending buffer out so line slices can borrow from it while `state`
     // remains available for mutation inside `process_stream_line()`.
-    let lines = match framing::take_complete_lines(&mut state.framing) {
-        Ok(lines) => lines,
-        Err(err) => {
-            if let Some(result) = handle_stream_decode_error(app, markers, state, err).await {
-                return Ok(StreamChunkStep::Return(result));
-            }
-            return Ok(StreamChunkStep::Continue);
-        }
-    };
+    let lines = framing::take_complete_lines(&mut state.framing);
     let mut should_stop = false;
     for line in lines {
         if process_stream_line(app, current_history, markers, state, adapter_kind, &line)? {
@@ -223,15 +215,8 @@ async fn process_pending_tail(
         return Ok(None);
     }
 
-    let line = match framing::take_pending_tail(&mut state.framing) {
-        Ok(Some(line)) => line,
-        Ok(None) => return Ok(None),
-        Err(err) => {
-            if let Some(result) = handle_stream_decode_error(app, markers, state, err).await {
-                return Ok(Some(result));
-            }
-            return Ok(None);
-        }
+    let Some(line) = framing::take_pending_tail(&mut state.framing) else {
+        return Ok(None);
     };
     if !line.is_empty() {
         let _ = process_stream_line(app, current_history, markers, state, adapter_kind, &line)?;
@@ -1101,16 +1086,84 @@ mod tests {
         let mut current_history = String::new();
 
         let result = tokio::time::timeout(
-            Duration::from_secs(1),
+            Duration::from_secs(12),
             stream_response(&mut app, &mut response, &mut current_history, None),
         )
         .await
-        .expect("stream_response must not wait for EOF after finish_reason")
+        .expect("stream_response should return after the configured finish_reason grace window")
         .unwrap();
 
         assert_eq!(result.outcome, StreamOutcome::Completed);
         assert_eq!(result.assistant_text, "hello");
         assert_eq!(current_history, "hello");
+        assert!(result.skip_response_drain);
+
+        drop(response);
+        let _ = done_tx.send(());
+        server.join().unwrap();
+        crate::ai::driver::signal::clear_request_interrupt();
+        if let Ok(mut guard) = GLOBAL_OS.lock() {
+            *guard = None;
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_response_keeps_reading_delayed_chunks_after_finish_reason() {
+        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_buf = [0u8; 1024];
+            let _ = stream.read(&mut request_buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .unwrap();
+            write_http_chunk(
+                &mut stream,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            )
+            .unwrap();
+            write_http_chunk(
+                &mut stream,
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            write_http_chunk(
+                &mut stream,
+                "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
+            )
+            .unwrap();
+            write_http_chunk(&mut stream, "data: [DONE]\n\n").unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(2));
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut response = client
+            .post(format!("http://{addr}/chat"))
+            .send()
+            .await
+            .unwrap();
+        let mut app = test_app();
+        init_os_tools_globals(app.os.clone());
+        crate::ai::driver::signal::clear_request_interrupt();
+        let mut current_history = String::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            stream_response(&mut app, &mut response, &mut current_history, None),
+        )
+        .await
+        .expect("stream_response should keep reading delayed chunks after finish_reason")
+        .unwrap();
+
+        assert_eq!(result.outcome, StreamOutcome::Completed);
+        assert_eq!(result.assistant_text, "hello world");
+        assert_eq!(current_history, "hello world");
         assert!(result.skip_response_drain);
 
         drop(response);

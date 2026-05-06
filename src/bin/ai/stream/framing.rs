@@ -6,15 +6,15 @@ pub(super) fn push_chunk(state: &mut StreamFramingState, chunk: &[u8]) {
 
 pub(super) fn take_complete_lines(
     state: &mut StreamFramingState,
-) -> Result<Vec<String>, std::str::Utf8Error> {
+) -> Vec<String> {
     let mut pending = std::mem::take(&mut state.pending);
     let mut lines = Vec::new();
     let mut consumed = 0usize;
 
     while let Some(line_end_rel) = pending[consumed..].iter().position(|b| *b == b'\n') {
         let line_end = consumed + line_end_rel + 1;
-        let line = std::str::from_utf8(&pending[consumed..line_end])?;
-        lines.push(line.to_string());
+        let line = String::from_utf8_lossy(&pending[consumed..line_end]).into_owned();
+        lines.push(line);
         consumed = line_end;
     }
 
@@ -22,19 +22,19 @@ pub(super) fn take_complete_lines(
         pending.drain(..consumed);
     }
     state.pending = pending;
-    Ok(lines)
+    lines
 }
 
 pub(super) fn take_pending_tail(
     state: &mut StreamFramingState,
-) -> Result<Option<String>, std::str::Utf8Error> {
+) -> Option<String> {
     if state.pending.is_empty() {
-        return Ok(None);
+        return None;
     }
     let pending = std::mem::take(&mut state.pending);
-    let line = std::str::from_utf8(&pending)?.to_string();
+    let line = String::from_utf8_lossy(&pending).into_owned();
     state.pending = pending;
-    Ok(Some(line))
+    Some(line)
 }
 
 pub(super) fn consume_sse_line(state: &mut StreamFramingState, line: &str) -> Option<SseEvent> {
