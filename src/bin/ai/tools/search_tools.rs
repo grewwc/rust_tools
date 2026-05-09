@@ -125,7 +125,8 @@ pub(crate) fn execute_search_files(args: &Value) -> Result<String, String> {
     let pattern = args["pattern"].as_str().ok_or("Missing pattern")?;
     let path = args["path"].as_str().unwrap_or(".");
 
-    let cwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {}", e))?;
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
+        .map_err(|e| format!("Failed to get cwd: {}", e))?;
     let base_dir = {
         let p = PathBuf::from(path);
         if p.is_absolute() {
@@ -244,10 +245,12 @@ pub(crate) fn execute_grep_search(args: &Value) -> Result<String, String> {
         || target.contains('{')
         || target.contains('}');
 
-    let wd = std::env::current_dir()
+    let wd = crate::ai::driver::runtime_ctx::effective_cwd()
         .ok()
         .and_then(|p| fs::canonicalize(&p).ok())
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        .unwrap_or_else(|| {
+            crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."))
+        });
 
     let opts = crate::ai::ff_embed::cli::Options {
         verbose: false,

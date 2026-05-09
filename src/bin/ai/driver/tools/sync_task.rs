@@ -22,7 +22,9 @@
 //      surface the sub-agent's terminal status to the caller.
 // =============================================================================
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Instant;
 
 use serde_json::Value;
@@ -48,8 +50,12 @@ pub(super) fn execute_sync_task(
     let mut task_app = ctx.app_proto.clone();
     crate::ai::types::clear_stream_cancel(&task_app);
 
+    let parent_history_path = ctx.app_proto.session_history_file.clone();
+    let task_id = uuid::Uuid::new_v4().simple().to_string();
+
     if !prepared.inherit.history {
-        task_app.session_history_file = subagent_history_path(&task_app.session_history_file);
+        task_app.session_history_file =
+            subagent_history_path(&task_app.session_history_file, &task_id);
     }
 
     if let Some(agent) =
@@ -103,7 +109,9 @@ pub(super) fn execute_sync_task(
         task_agent_manifests_for_spawn.clone(),
     );
 
-    tokio::spawn(runtime_ctx::DRIVER_CTX.scope(spawn_driver_ctx, async move {
+    let inherit = prepared.inherit;
+
+    let inner_fut = async move {
         let mut subagent_app = subagent_app;
         crate::ai::tools::registry::common::clear_tool_cancel();
         let result = turn_runtime::run_turn(
@@ -121,7 +129,28 @@ pub(super) fn execute_sync_task(
         .map(|_outcome| ())
         .map_err(|e| format!("{}", e));
         let _ = tx.send(result);
-    }));
+    };
+
+    type BoxedSubagentFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+    let mut wrapped: BoxedSubagentFuture = Box::pin(inner_fut);
+
+    if !inherit.memory {
+        let mem_path =
+            runtime_ctx::make_subagent_memory_path(&parent_history_path, &task_id);
+        wrapped = Box::pin(runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped));
+    }
+
+    if !inherit.cwd {
+        let scratch_base = parent_history_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        if let Some(scratch) = runtime_ctx::make_subagent_cwd(&scratch_base, &task_id) {
+            wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
+        }
+    }
+
+    tokio::spawn(runtime_ctx::DRIVER_CTX.scope(spawn_driver_ctx, wrapped));
 
     let join_result: Result<Result<(), String>, String> =
         tokio::task::block_in_place(|| {
@@ -162,12 +191,11 @@ pub(super) fn execute_sync_task(
     }
 }
 
-fn subagent_history_path(base: &std::path::Path) -> PathBuf {
-    let suffix = uuid::Uuid::new_v4().simple().to_string();
+fn subagent_history_path(base: &std::path::Path, task_id: &str) -> PathBuf {
     let file_name = base
         .file_name()
         .and_then(|name| name.to_str())
-        .map(|name| format!("{name}.subagent-{suffix}"))
-        .unwrap_or_else(|| format!("session.subagent-{suffix}"));
+        .map(|name| format!("{name}.subagent-{task_id}"))
+        .unwrap_or_else(|| format!("session.subagent-{task_id}"));
     base.with_file_name(file_name)
 }

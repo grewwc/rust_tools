@@ -661,6 +661,7 @@ async fn run_loop(
                 Option<String>,
                 Option<u64>,
                 Option<aios_kernel::primitives::FutexAddr>,
+                Option<String>,
             )> = Vec::new();
             for proc in &background_procs {
                 let pid = proc.pid;
@@ -711,10 +712,11 @@ async fn run_loop(
                     task_goal
                         .as_ref()
                         .map(|goal| aios_kernel::primitives::FutexAddr(goal.completion_futex_addr)),
+                    task_goal.as_ref().map(|goal| goal.task_id.clone()),
                 ));
             }
 
-            for (pid, proc_question, history_path, agent_override, model_override, result_channel_id, completion_futex_addr) in task_specs {
+            for (pid, proc_question, history_path, agent_override, model_override, result_channel_id, completion_futex_addr, task_id) in task_specs {
                 let mut task_app = app.clone();
                 task_app.session_history_file = history_path;
                 crate::ai::types::clear_stream_cancel(&task_app);
@@ -736,9 +738,18 @@ async fn run_loop(
                     Arc::new(agent_manifests.clone()),
                 );
 
-                tokio::spawn(runtime_ctx::DRIVER_CTX.scope(
-                    task_driver_ctx,
-                    TASK_PID.scope(Some(pid), async move {
+                let inherit = task_id
+                    .as_deref()
+                    .and_then(|tid| {
+                        crate::ai::tools::task_tools::with_task_entry(tid, |e| e.inherit)
+                    })
+                    .unwrap_or_default();
+                let scope_task_id = task_id
+                    .clone()
+                    .unwrap_or_else(|| format!("pid-{pid}"));
+                let parent_history_for_scopes = original_history_file.clone();
+
+                let inner_fut = TASK_PID.scope(Some(pid), async move {
                     crate::ai::tools::registry::common::clear_tool_cancel();
                     let result = turn_runtime::run_turn(
                         &mut task_app,
@@ -822,7 +833,35 @@ async fn run_loop(
                             }
                         }
                     }
-                })));
+                });
+
+                type BoxedTaskFuture = std::pin::Pin<
+                    Box<dyn std::future::Future<Output = ()> + Send>,
+                >;
+                let mut wrapped: BoxedTaskFuture = Box::pin(inner_fut);
+                if !inherit.memory {
+                    let mem_path = runtime_ctx::make_subagent_memory_path(
+                        &parent_history_for_scopes,
+                        &scope_task_id,
+                    );
+                    wrapped = Box::pin(
+                        runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped),
+                    );
+                }
+                if !inherit.cwd {
+                    let scratch_base = parent_history_for_scopes
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    if let Some(scratch) =
+                        runtime_ctx::make_subagent_cwd(&scratch_base, &scope_task_id)
+                    {
+                        wrapped =
+                            Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
+                    }
+                }
+
+                tokio::spawn(runtime_ctx::DRIVER_CTX.scope(task_driver_ctx, wrapped));
             }
         }
 

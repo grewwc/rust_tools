@@ -243,7 +243,7 @@ fn workspace_agents_dir() -> Option<PathBuf> {
 fn discover_project_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Ok(cwd) = crate::ai::driver::runtime_ctx::effective_cwd() {
         let dot_agents = cwd.join(".agents");
         if dot_agents.is_dir() {
             dirs.push(dot_agents.clone());

@@ -49,7 +49,7 @@ pub fn validate_execute_command(command: &str) -> Result<(), String> {
     };
 
     if program == "rm" || program == "mv" {
-        let base_dir = std::env::current_dir()
+        let base_dir = crate::ai::driver::runtime_ctx::effective_cwd()
             .map_err(|err| format!("failed to resolve current directory: {err}"))?;
         let base_dir = normalize_path(&base_dir);
         let mut path_args: Vec<String> = Vec::new();

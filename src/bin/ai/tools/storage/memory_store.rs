@@ -531,6 +531,9 @@ fn compute_similarity(entry: &AgentMemoryEntry, query_lc: &str) -> f64 {
 }
 
 fn resolve_memory_file() -> PathBuf {
+    if let Some(path) = crate::ai::driver::runtime_ctx::override_memory_path() {
+        return path;
+    }
     if let Ok(path) = std::env::var("RUST_TOOLS_MEMORY_FILE") {
         let path = path.trim();
         if !path.is_empty() {

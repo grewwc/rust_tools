@@ -323,7 +323,7 @@ fn policy_override_paths() -> Vec<PathBuf> {
     paths.push(PathBuf::from(
         expanduser("~/.config/rust_tools/code_discovery_policy.json").as_ref(),
     ));
-    if let Ok(cwd) = std::env::current_dir() {
+    if let Ok(cwd) = crate::ai::driver::runtime_ctx::effective_cwd() {
         paths.push(cwd.join(".rust_tools/code_discovery_policy.json"));
     }
     paths

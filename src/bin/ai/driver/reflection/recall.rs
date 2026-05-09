@@ -44,7 +44,7 @@ struct RecallBundleCacheEntry {
 }
 
 fn current_project_hint() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok()?;
     let name = cwd.file_name()?.to_str()?.trim();
     if name.is_empty() {
         None
