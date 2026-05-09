@@ -59,6 +59,7 @@ pub mod observer;
 pub mod params;
 pub mod print;
 pub mod reflection;
+pub mod runtime_ctx;
 pub mod signal;
 pub mod skill_match_model;
 pub mod skill_matching;
@@ -728,7 +729,16 @@ async fn run_loop(
                 }
                 let next_model = model_override.unwrap_or_else(|| app.current_model.clone());
 
-                tokio::spawn(TASK_PID.scope(Some(pid), async move {
+                let task_driver_ctx = runtime_ctx::DriverContext::new(
+                    task_app.clone(),
+                    task_mcp.clone(),
+                    Arc::new(task_skills.clone()),
+                    Arc::new(agent_manifests.clone()),
+                );
+
+                tokio::spawn(runtime_ctx::DRIVER_CTX.scope(
+                    task_driver_ctx,
+                    TASK_PID.scope(Some(pid), async move {
                     crate::ai::tools::registry::common::clear_tool_cancel();
                     let result = turn_runtime::run_turn(
                         &mut task_app,
@@ -812,7 +822,7 @@ async fn run_loop(
                             }
                         }
                     }
-                }));
+                })));
             }
         }
 
@@ -917,19 +927,29 @@ async fn run_loop(
             os.current_process_id()
         };
 
-        let turn_outcome = TASK_PID
+        let driver_ctx = runtime_ctx::DriverContext::new(
+            app.clone(),
+            mcp_client.clone(),
+            Arc::new(skill_manifests.clone()),
+            Arc::new(agent_manifests.clone()),
+        );
+
+        let turn_outcome = runtime_ctx::DRIVER_CTX
             .scope(
-                fg_pid,
-                turn_runtime::run_turn(
-                    app,
-                    mcp_client,
-                    &*skill_manifests,
-                    history_count,
-                    question,
-                    next_model,
-                    precomputed_ocr,
-                    one_shot_mode,
-                    should_quit,
+                driver_ctx,
+                TASK_PID.scope(
+                    fg_pid,
+                    turn_runtime::run_turn(
+                        app,
+                        mcp_client,
+                        &*skill_manifests,
+                        history_count,
+                        question,
+                        next_model,
+                        precomputed_ocr,
+                        one_shot_mode,
+                        should_quit,
+                    ),
                 ),
             )
             .await;

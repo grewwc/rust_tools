@@ -27,6 +27,7 @@ use crate::commonw::prompt::prompt_yes_or_no_interruptible;
 
 mod barrier;
 mod oauth;
+mod sync_task;
 
 static TOOL_FAILURES: LazyLock<Mutex<FastMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(FastMap::default()));
@@ -924,7 +925,9 @@ fn execute_prepared_tool_call(
 ) -> Result<ToolResult, String> {
     match &prepared.route {
         ToolRoute::Builtin => {
-            if tool_call.function.name == "tool_spawn" {
+            if tool_call.function.name == "task" {
+                sync_task::execute_sync_task(&tool_call.id, &prepared.args).map(|tr| tr)
+            } else if tool_call.function.name == "tool_spawn" {
                 execute_tool_spawn(session_id, mcp_client, shared_mcp_client, &tool_call.id, &prepared.args)
             } else if tool_call.function.name == "tool_wait" {
                 execute_tool_wait(session_id, &tool_call.id, &prepared.args)
@@ -1554,10 +1557,6 @@ fn finalize_execution_result(
     run_result
 }
 
-fn is_parallel_task_tool_call(tool_call: &ToolCall, prepared: &PreparedToolCall) -> bool {
-    matches!(prepared.route, ToolRoute::Builtin) && tool_call.function.name == "task"
-}
-
 fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
     let name = &tool_call.function.name;
     if run_result.cached {
@@ -1569,120 +1568,6 @@ fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
     } else {
         println!("\n[Failed] {}", name.red());
     }
-}
-
-fn parallel_task_batch_len(mcp_client: &McpClient, tool_calls: &[ToolCall], start: usize) -> usize {
-    let mut len = 0usize;
-    for tool_call in &tool_calls[start..] {
-        let Ok(prepared) = prepare_tool_call(mcp_client, tool_call) else {
-            break;
-        };
-        if !is_parallel_task_tool_call(tool_call, &prepared) {
-            break;
-        }
-        len += 1;
-    }
-    len
-}
-
-fn execute_parallel_task_batch(
-    session_id: &str,
-    mcp_client: &McpClient,
-    tool_calls: &[ToolCall],
-) -> Vec<(ToolRoute, RunOneResult)> {
-    let mut ordered_results: Vec<Option<(ToolRoute, RunOneResult)>> =
-        std::iter::repeat_with(|| None).take(tool_calls.len()).collect();
-    let mut pending = Vec::new();
-
-    for (idx, tool_call) in tool_calls.iter().enumerate() {
-        let prepared = match prepare_tool_call(mcp_client, tool_call) {
-            Ok(prepared) => prepared,
-            Err(tool_result) => {
-                ordered_results[idx] = Some((
-                    route_tool_call(mcp_client, &tool_call.function.name),
-                    RunOneResult {
-                        tool_result,
-                        ok: false,
-                        executed: true,
-                        cached: false,
-                    },
-                ));
-                continue;
-            }
-        };
-
-        if let Err(result) = confirm_tool_execution(tool_call, &prepared.args) {
-            ordered_results[idx] = Some((prepared.route, result));
-            continue;
-        }
-
-        if let Some(tool_result) = load_cached_tool_result(session_id, tool_call, &prepared.args) {
-            ordered_results[idx] = Some((
-                prepared.route,
-                RunOneResult {
-                    tool_result,
-                    ok: true,
-                    executed: false,
-                    cached: true,
-                },
-            ));
-            continue;
-        }
-
-        pending.push((idx, tool_call.clone(), prepared));
-    }
-
-    thread::scope(|scope| {
-        let mut handles = Vec::with_capacity(pending.len());
-        for (idx, tool_call, prepared) in pending {
-            handles.push(scope.spawn(move || {
-                let result = execute_prepared_builtin_tool_call(&tool_call, &prepared);
-                (idx, tool_call, prepared, result)
-            }));
-        }
-
-        for handle in handles {
-            match handle.join() {
-                Ok((idx, tool_call, prepared, result)) => {
-                    let run_result = finalize_execution_result(
-                        session_id,
-                        &tool_call,
-                        &prepared,
-                        result,
-                        true,
-                        false,
-                    );
-                    ordered_results[idx] = Some((prepared.route, run_result));
-                }
-                Err(_) => {
-                    // This path should be unreachable in normal operation, but keep the
-                    // batch resilient if one worker panics.
-                }
-            }
-        }
-    });
-
-    ordered_results
-        .into_iter()
-        .enumerate()
-        .map(|(idx, item)| {
-            item.unwrap_or_else(|| {
-                let tool_call = &tool_calls[idx];
-                (
-                    route_tool_call(mcp_client, &tool_call.function.name),
-                    RunOneResult {
-                        tool_result: format_tool_error(
-                            tool_call,
-                            "parallel task worker panicked before producing a result",
-                        ),
-                        ok: false,
-                        executed: true,
-                        cached: false,
-                    },
-                )
-            })
-        })
-        .collect()
 }
 
 fn run_one(
@@ -1811,47 +1696,6 @@ fn execute_tool_calls_inner(
                 println!("\n[Deferred] {}", deferred.function.name.yellow());
             }
             break;
-        }
-
-        let batch_len = parallel_task_batch_len(mcp_client, tool_calls, idx);
-        if batch_len > 1 {
-            let batch = &tool_calls[idx..idx + batch_len];
-            let batch_results = execute_parallel_task_batch(session_id, mcp_client, batch);
-            for (tool_call, (route, run_result)) in batch.iter().zip(batch_results.into_iter()) {
-                executed_tool_calls.push(tool_call.clone());
-                cached_hits.push(run_result.cached);
-                let should_barrier = barrier::should_barrier_after(
-                    &route,
-                    tool_call,
-                    run_result.ok,
-                    &run_result.tool_result.content,
-                );
-                notify_tool_finished(&mut observer, tool_call, &run_result);
-                print_run_status(tool_call, &run_result);
-                tool_results.push(run_result.tool_result);
-                if should_barrier {
-                    for deferred in &tool_calls[idx + batch_len..] {
-                        println!("\n[Deferred] {}", deferred.function.name.yellow());
-                    }
-                    return Ok(ExecuteToolCallsResult {
-                        executed_tool_calls,
-                        tool_results,
-                        cached_hits,
-                    });
-                }
-                if crate::ai::tools::registry::common::is_tool_cancel_requested() {
-                    for deferred in &tool_calls[idx + batch_len..] {
-                        println!("\n[Deferred] {}", deferred.function.name.yellow());
-                    }
-                    return Ok(ExecuteToolCallsResult {
-                        executed_tool_calls,
-                        tool_results,
-                        cached_hits,
-                    });
-                }
-            }
-            idx += batch_len;
-            continue;
         }
 
         let tool_call = &tool_calls[idx];
@@ -2015,14 +1859,13 @@ mod tests {
         async_tool_pipe_message_from_started, async_tool_pipe_message_from_stream,
         build_tool_cache_key, delete_async_tool_snapshot, is_cacheable_tool_name,
         is_tool_cache_entry_fresh, load_async_tool_snapshot, lookup_wait_sources,
-        parallel_task_batch_len, persist_async_tool_snapshot, send_async_tool_pipe_message,
+        persist_async_tool_snapshot, send_async_tool_pipe_message,
         stream_preview_from_aggregate, AsyncToolEntry, AsyncToolPipeKind, AsyncToolPipeMessage,
         AsyncToolState, RunOneResult, ToolRoute, ASYNC_TOOL_REGISTRY, TOOL_CACHE_TTL_MINUTES,
     };
     use aios_kernel::{kernel::EventId, primitives::ChannelId};
     use crate::ai::tools::task_tools::WaitManySource;
     use crate::ai::tools::registry::common::current_process_tool_cancel_futex;
-    use crate::ai::mcp::McpClient;
     use crate::ai::types::{FunctionCall, ToolCall};
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
     use chrono::{Duration, Utc};
@@ -2133,16 +1976,6 @@ mod tests {
                 arguments: "{}".to_string(),
             },
         }
-    }
-
-    #[test]
-    fn parallel_task_batch_len_only_groups_contiguous_task_calls() {
-        let client = McpClient::new();
-        let tool_calls = vec![tool_call("task"), tool_call("task"), tool_call("read_file"), tool_call("task")];
-
-        assert_eq!(parallel_task_batch_len(&client, &tool_calls, 0), 2);
-        assert_eq!(parallel_task_batch_len(&client, &tool_calls, 2), 0);
-        assert_eq!(parallel_task_batch_len(&client, &tool_calls, 3), 1);
     }
 
     #[test]

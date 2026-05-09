@@ -1,5 +1,4 @@
 use serde_json::Value;
-use std::process::Command;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -27,15 +26,105 @@ const DEFAULT_TASK_PRIORITY: u8 = 20;
 const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
 
-struct AsyncTaskEntry {
-    pid: u64,
-    result_channel_id: u64,
-    completion_futex_addr: FutexAddr,
-    description: String,
-    agent_name: String,
-    model: String,
-    selection_explanation: String,
-    started_at: Instant,
+/// Granular control over which slices of the parent agent's execution
+/// context are inherited by a spawned sub-agent. All flags default to true
+/// (i.e. full inheritance, matching the previous behaviour) unless the
+/// caller specifies a `inherit` argument on the tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InheritOptions {
+    pub(crate) history: bool,
+    pub(crate) memory: bool,
+    pub(crate) cwd: bool,
+    pub(crate) skills: bool,
+}
+
+impl Default for InheritOptions {
+    fn default() -> Self {
+        Self {
+            history: true,
+            memory: true,
+            cwd: true,
+            skills: true,
+        }
+    }
+}
+
+impl InheritOptions {
+    /// Parse the optional `inherit` field from a tool call.
+    /// Recognised forms:
+    ///   - missing / null -> full inheritance (default)
+    ///   - "all"          -> full inheritance
+    ///   - "none"         -> no inheritance (fresh sub-agent)
+    ///   - comma-separated list of: history, memory, cwd, skills
+    pub(crate) fn from_value(value: &Value) -> Result<Self, String> {
+        let Some(raw) = value.as_str() else {
+            if value.is_null() {
+                return Ok(Self::default());
+            }
+            return Err("'inherit' must be a string".to_string());
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
+            return Ok(Self::default());
+        }
+        if trimmed.eq_ignore_ascii_case("none") {
+            return Ok(Self {
+                history: false,
+                memory: false,
+                cwd: false,
+                skills: false,
+            });
+        }
+        let mut opts = Self {
+            history: false,
+            memory: false,
+            cwd: false,
+            skills: false,
+        };
+        for part in trimmed.split(',') {
+            match part.trim().to_ascii_lowercase().as_str() {
+                "history" => opts.history = true,
+                "memory" => opts.memory = true,
+                "cwd" => opts.cwd = true,
+                "skills" => opts.skills = true,
+                "" => {}
+                other => {
+                    return Err(format!(
+                        "Unknown inherit option '{}'. Allowed: history, memory, cwd, skills, all, none",
+                        other
+                    ));
+                }
+            }
+        }
+        Ok(opts)
+    }
+
+    pub(crate) fn describe(&self) -> String {
+        if self.history && self.memory && self.cwd && self.skills {
+            return "all".to_string();
+        }
+        if !self.history && !self.memory && !self.cwd && !self.skills {
+            return "none".to_string();
+        }
+        let mut parts = Vec::new();
+        if self.history { parts.push("history"); }
+        if self.memory { parts.push("memory"); }
+        if self.cwd { parts.push("cwd"); }
+        if self.skills { parts.push("skills"); }
+        parts.join(",")
+    }
+}
+
+pub(crate) struct AsyncTaskEntry {
+    pub(crate) pid: u64,
+    pub(crate) result_channel_id: u64,
+    pub(crate) completion_futex_addr: FutexAddr,
+    pub(crate) description: String,
+    pub(crate) agent_name: String,
+    pub(crate) model: String,
+    pub(crate) selection_explanation: String,
+    pub(crate) inherit: InheritOptions,
+    pub(crate) started_at: Instant,
 }
 
 static TASK_REGISTRY: LazyLock<Mutex<FastMap<String, AsyncTaskEntry>>> =
@@ -305,6 +394,10 @@ pub(crate) fn epoll_wait_many_channels(
     epoll_wait_many(os, label, &sources, wait_policy, timeout_ticks)
 }
 
+fn task_inherit_schema_description() -> &'static str {
+    "Optional inheritance control. Accepts 'all' (default - inherit history, memory, cwd, skills), 'none' (fresh sub-agent context), or a comma-separated list selecting some of: history, memory, cwd, skills."
+}
+
 fn params_task() -> Value {
     serde_json::json!({
         "type": "object",
@@ -324,6 +417,10 @@ fn params_task() -> Value {
             "model": {
                 "type": "string",
                 "description": "Optional model override for this subagent task."
+            },
+            "inherit": {
+                "type": "string",
+                "description": task_inherit_schema_description()
             }
         },
         "required": ["description", "prompt"]
@@ -333,7 +430,7 @@ fn params_task() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task",
-        description: "Launch a specialized subagent to handle a focused task. Use this for complex work, codebase exploration, independent side investigations, or when multiple subtasks can be delegated. If agent is omitted, the runtime auto-selects a suitable subagent.",
+        description: "Launch a specialized subagent synchronously and return its final output. The current agent blocks until the subagent finishes. Use this for a single focused side investigation when you need the result before continuing. For multiple parallel subagents prefer task_spawn + task_wait. The runtime auto-selects a subagent when 'agent' is omitted.",
         parameters: params_task,
         execute: execute_task,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -341,27 +438,8 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-pub(crate) fn execute_task(args: &Value) -> Result<String, String> {
-    let description = args["description"]
-        .as_str()
-        .ok_or("Missing 'description' parameter")?;
-
-    let prompt = args["prompt"]
-        .as_str()
-        .ok_or("Missing 'prompt' parameter")?;
-
-    let agent = args["agent"].as_str().map(str::trim).filter(|s| !s.is_empty());
-    let model_override = args["model"].as_str();
-
-    if description.trim().is_empty() {
-        return Err("description cannot be empty".to_string());
-    }
-
-    if prompt.trim().is_empty() {
-        return Err("prompt cannot be empty".to_string());
-    }
-
-    execute_subagent_task(description, prompt, agent, model_override)
+pub(crate) fn execute_task(_args: &Value) -> Result<String, String> {
+    Err("task is handled by the runtime".to_string())
 }
 
 fn params_task_spawn() -> Value {
@@ -383,6 +461,10 @@ fn params_task_spawn() -> Value {
             "model": {
                 "type": "string",
                 "description": "Optional model override for this subagent task."
+            },
+            "inherit": {
+                "type": "string",
+                "description": task_inherit_schema_description()
             }
         },
         "required": ["description", "prompt"]
@@ -400,7 +482,21 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
+/// Pre-flight subagent task spec produced from a `task` / `task_spawn` tool
+/// call before the kernel actually spawns the new process.
+pub(crate) struct PreparedSubagentTask {
+    pub(crate) description: String,
+    pub(crate) prompt: String,
+    pub(crate) agent_name: String,
+    pub(crate) model: String,
+    pub(crate) selection_explanation: String,
+    pub(crate) inherit: InheritOptions,
+}
+
+/// Parse and validate a `task` / `task_spawn` tool call payload, run subagent
+/// auto-selection, and resolve the model. Used both by the async `task_spawn`
+/// path and by the synchronous `task` interception in the driver.
+pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask, String> {
     let description = args["description"]
         .as_str()
         .ok_or("Missing 'description' parameter")?;
@@ -417,6 +513,8 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
         return Err("prompt cannot be empty".to_string());
     }
 
+    let inherit = InheritOptions::from_value(&args["inherit"])?;
+
     let all_agents = agents::load_all_agents();
     let selected = select_subagent(&all_agents, agent, description, prompt)?;
     let selected_model = model_override
@@ -424,11 +522,35 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
         .unwrap_or_else(|| models::auto_subagent_model_for_agent(selected.agent, description, prompt));
     let selection_explanation = build_selection_explanation(&selected, &selected_model, model_override);
 
+    Ok(PreparedSubagentTask {
+        description: description.to_string(),
+        prompt: prompt.to_string(),
+        agent_name: selected.agent.name.clone(),
+        model: selected_model,
+        selection_explanation,
+        inherit,
+    })
+}
+
+pub(crate) struct SpawnedSubagentTask {
+    pub(crate) task_id: String,
+    pub(crate) pid: u64,
+    pub(crate) result_channel_id: u64,
+    pub(crate) completion_futex_addr: FutexAddr,
+}
+
+/// Spawn a subagent kernel process and register it in `TASK_REGISTRY`. The
+/// returned handle exposes the IPC channel + futex that the caller can wait
+/// on. Used by both `task_spawn` (async) and the synchronous `task` runtime
+/// interception path.
+pub(crate) fn spawn_subagent_kernel_task(
+    prepared: &PreparedSubagentTask,
+) -> Result<SpawnedSubagentTask, String> {
     let task_id = next_task_id();
     let (pid, result_channel_id, completion_futex_addr) = with_os_kernel(|os| {
         let parent_pid = os
             .current_process_id()
-            .ok_or("task_spawn requires an active AIOS process context.".to_string())?;
+            .ok_or("subagent task requires an active AIOS process context.".to_string())?;
         let result_channel = os.channel_create_tagged_with_holders(
             Some(parent_pid),
             1,
@@ -444,15 +566,15 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
             task_id: task_id.clone(),
             result_channel_id: result_channel.raw(),
             completion_futex_addr: completion_futex.raw(),
-            description: description.to_string(),
-            prompt: prompt.to_string(),
-            agent_name: selected.agent.name.clone(),
-            model: selected_model.clone(),
-            selection_explanation: selection_explanation.clone(),
+            description: prepared.description.clone(),
+            prompt: prepared.prompt.clone(),
+            agent_name: prepared.agent_name.clone(),
+            model: prepared.model.clone(),
+            selection_explanation: prepared.selection_explanation.clone(),
         })?;
         let pid = os.spawn(
             Some(parent_pid),
-            selected.agent.name.clone(),
+            prepared.agent_name.clone(),
             process_goal,
             DEFAULT_TASK_PRIORITY,
             DEFAULT_TASK_QUOTA_TURNS,
@@ -462,11 +584,6 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
         Ok((pid, result_channel.raw(), completion_futex))
     })?;
 
-    println!(
-        "\n[TaskSpawn] Launched AIOS task pid={} subagent '{}' with model '{}' for: {} (task_id: {})",
-        pid, selected.agent.name, selected_model, description, task_id
-    );
-
     {
         let mut registry = TASK_REGISTRY.lock().unwrap();
         registry.insert(
@@ -475,19 +592,66 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
                 pid,
                 result_channel_id,
                 completion_futex_addr,
-                description: description.to_string(),
-                agent_name: selected.agent.name.clone(),
-                model: selected_model.clone(),
-                selection_explanation,
+                description: prepared.description.clone(),
+                agent_name: prepared.agent_name.clone(),
+                model: prepared.model.clone(),
+                selection_explanation: prepared.selection_explanation.clone(),
+                inherit: prepared.inherit,
                 started_at: Instant::now(),
             },
         );
         prune_completed_tasks(&mut registry);
     }
 
+    Ok(SpawnedSubagentTask {
+        task_id,
+        pid,
+        result_channel_id,
+        completion_futex_addr,
+    })
+}
+
+/// Look up a registered async task entry. Used by the driver-side sync `task`
+/// interception to retrieve the channel/futex/inherit info after spawning.
+pub(crate) fn with_task_entry<R>(
+    task_id: &str,
+    f: impl FnOnce(&AsyncTaskEntry) -> R,
+) -> Option<R> {
+    let registry = TASK_REGISTRY.lock().unwrap();
+    registry.get(task_id).map(f)
+}
+
+/// Remove a task entry from the registry. Called by the synchronous `task`
+/// interception once it has consumed the result.
+pub(crate) fn remove_task_entry(task_id: &str) -> Option<AsyncTaskEntry> {
+    let mut registry = TASK_REGISTRY.lock().unwrap();
+    registry.remove(task_id)
+}
+
+/// Format a finished task result that came in through the kernel result
+/// channel. Re-exported for the synchronous `task` interception so that both
+/// paths produce identical output.
+pub(crate) fn format_finished_task(entry: &AsyncTaskEntry, result: StoredTaskResult) -> String {
+    format_task_result(entry, result)
+}
+
+pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
+    let prepared = prepare_subagent_task(args)?;
+    let spawned = spawn_subagent_kernel_task(&prepared)?;
+
+    println!(
+        "\n[TaskSpawn] Launched AIOS task pid={} subagent '{}' with model '{}' inherit={} for: {} (task_id: {})",
+        spawned.pid,
+        prepared.agent_name,
+        prepared.model,
+        prepared.inherit.describe(),
+        prepared.description,
+        spawned.task_id,
+    );
+
     Ok(format!(
-        "Task spawned: task_id={}, pid={}, agent={}, model={}\nUse task_wait to collect results when ready.",
-        task_id, pid, selected.agent.name, selected_model
+        "Task spawned: task_id={}, pid={}, agent={}, model={}, inherit={}\nUse task_wait to collect results when ready.",
+        spawned.task_id, spawned.pid, prepared.agent_name, prepared.model, prepared.inherit.describe()
     ))
 }
 
@@ -804,10 +968,10 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct StoredTaskResult {
-    status: String,
-    output: String,
-    error: Option<String>,
+pub(crate) struct StoredTaskResult {
+    pub(crate) status: String,
+    pub(crate) output: String,
+    pub(crate) error: Option<String>,
 }
 
 fn read_task_result(
@@ -1085,68 +1249,6 @@ fn build_selection_explanation(
     };
 
     format!("{agent_reason}\n{model_reason}")
-}
-
-fn execute_subagent_task(
-    description: &str,
-    prompt: &str,
-    agent: Option<&str>,
-    model: Option<&str>,
-) -> Result<String, String> {
-    use std::time::Instant;
-
-    let start = Instant::now();
-    let all_agents = agents::load_all_agents();
-    let selected = select_subagent(&all_agents, agent, description, prompt)?;
-    let selected_model = model
-        .map(models::determine_model)
-        .unwrap_or_else(|| models::auto_subagent_model_for_agent(selected.agent, description, prompt));
-    let selection_explanation = build_selection_explanation(&selected, &selected_model, model);
-
-    println!(
-        "\n[Task] Launching subagent '{}' with model '{}' for: {}\n{}",
-        selected.agent.name, selected_model, description, selection_explanation
-    );
-
-    let mut cmd_args = vec!["--".to_string(), "--no-skills".to_string()];
-
-    cmd_args.push("--model".to_string());
-    cmd_args.push(selected_model.clone());
-    cmd_args.push("--agent".to_string());
-    cmd_args.push(selected.agent.name.clone());
-    cmd_args.push(prompt.to_string());
-
-    let output = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-        .args(&cmd_args)
-        .output()
-        .map_err(|e| format!("Failed to launch subagent: {}", e))?;
-
-    let duration = start.elapsed();
-
-    if output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let result = format!(
-            "[Task: {} via {} @ {}] (completed in {:.1}s)\n{}\n{}",
-            description,
-            selected.agent.name,
-            selected_model,
-            duration.as_secs_f64(),
-            selection_explanation,
-            stdout.trim()
-        );
-        Ok(result)
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!(
-            "[Task: {} via {} @ {}] failed after {:.1}s:\n{}\n{}",
-            description,
-            selected.agent.name,
-            selected_model,
-            duration.as_secs_f64(),
-            selection_explanation,
-            stderr.trim()
-        ))
-    }
 }
 
 #[cfg(test)]
