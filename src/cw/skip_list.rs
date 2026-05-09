@@ -1,5 +1,5 @@
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::marker::PhantomData;
 use std::ptr;
 use std::sync::Mutex;
@@ -70,8 +70,7 @@ where
         D: Deserializer<'de>,
     {
         // 反序列化: (max_height, Vec<(K, V)>)
-        let (max_height, items): (usize, Vec<(K, V)>) =
-            Deserialize::deserialize(deserializer)?;
+        let (max_height, items): (usize, Vec<(K, V)>) = Deserialize::deserialize(deserializer)?;
         // 使用默认比较器重建 SkipMap
         let mut map = *SkipMap::new(max_height, |a: &K, b: &K| a.cmp(b) as i32);
         for (k, v) in items {
@@ -460,7 +459,6 @@ where
 unsafe impl<T: Ord + Send> Send for SkipSet<T> {}
 unsafe impl<T: Ord + Send + Sync> Sync for SkipSet<T> {}
 
-
 // ============== SkipSet Serde implementations ==============
 
 impl<T> Serialize for SkipSet<T>
@@ -472,9 +470,8 @@ where
         S: Serializer,
     {
         use serde::ser::SerializeSeq;
-        // 序列化: (max_height, Vec<T>)
+        // 序列化: (Vec<T>)
         let mut seq = serializer.serialize_seq(Some(self.len() + 1))?;
-        seq.serialize_element(&self.inner.max_height())?;
         for v in self.iter() {
             seq.serialize_element(v)?;
         }
@@ -490,8 +487,7 @@ where
     where
         D: Deserializer<'de>,
     {
-        let (max_height, items): (usize, Vec<T>) =
-            Deserialize::deserialize(deserializer)?;
+        let (max_height, items): (usize, Vec<T>) = Deserialize::deserialize(deserializer)?;
         let mut set = SkipSet::new(max_height);
         for item in items {
             set.insert(item);
@@ -614,6 +610,50 @@ where
     {
         self.iter().cloned().collect()
     }
+
+    pub fn intersect(&mut self, other: &Self) {
+        for e in other.iter() {
+            if !self.contains(e) {
+                self.remove(e);
+            }
+        }
+    }
+}
+
+impl<T> Clone for SkipSet<T>
+where
+    T: Ord + Clone,
+{
+    fn clone(&self) -> Self {
+        let mut ret = SkipSet::new(self.max_height());
+        for e in self.iter() {
+            ret.insert(e.clone());
+        }
+        ret
+    }
+}
+
+impl<T> SkipSet<T>
+where
+    T: Ord + Clone,
+{
+    pub fn union(&mut self, other: &Self) {
+        for e in other.iter() {
+            self.insert(e.clone());
+        }
+    }
+
+    pub fn union_copy(&self, other: &Self) -> Self {
+        let mut ret = self.clone();
+        ret.union(other);
+        ret
+    }
+
+    pub fn intersect_copy(&self, other: &Self) -> Self {
+        let mut ret = self.clone();
+        ret.intersect(other);
+        ret
+    }
 }
 
 impl<T> FromIterator<T> for Box<SkipSet<T>>
@@ -626,6 +666,19 @@ where
             set.insert(item);
         }
         Box::new(set)
+    }
+}
+
+impl<T> FromIterator<T> for SkipSet<T>
+where
+    T: Ord,
+{
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        let mut set = SkipSet::new(16);
+        for item in iter {
+            set.insert(item);
+        }
+        set
     }
 }
 
@@ -812,19 +865,16 @@ mod tests {
         map.insert(1, "one");
         map.insert(2, "two");
         map.insert(3, "three");
-        
+
         let cloned = map.clone();
         assert_eq!(cloned.get_ref(&1), Some(&"one"));
         assert_eq!(cloned.get_ref(&2), Some(&"two"));
         assert_eq!(cloned.get_ref(&3), Some(&"three"));
         assert_eq!(cloned.len(), 3);
-        
+
         // 原 map 不受影响
         map.insert(4, "four");
         assert_eq!(map.len(), 4);
         assert_eq!(cloned.len(), 3);
     }
 }
-
-
-
