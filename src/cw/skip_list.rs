@@ -618,6 +618,12 @@ where
             }
         }
     }
+
+    pub fn diff(&mut self, other: &Self){
+        for e in other.iter(){
+            self.remove(e);
+        }
+    }
 }
 
 impl<T> Clone for SkipSet<T>
