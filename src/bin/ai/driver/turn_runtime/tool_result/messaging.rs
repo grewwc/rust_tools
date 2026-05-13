@@ -49,6 +49,7 @@ pub(super) fn record_hidden_self_note(app: &App, turn_messages: &mut Vec<Message
         content: Value::String(format!("self_note:\n{hidden_meta}")),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     };
     turn_messages.push(record);
 
@@ -91,6 +92,7 @@ pub(super) fn append_cached_tool_results_note(
         )),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     };
     append_message_pair(messages, turn_messages, cache_note);
 }
@@ -103,6 +105,7 @@ pub(super) fn print_tool_result_preview(_tool_name: &str, prepared: &PreparedToo
 pub(super) fn append_tool_result_messages(
     app: &mut App,
     stream_assistant_text: &str,
+    stream_reasoning_text: &str,
     exec_result: &ExecuteToolCallsResult,
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
@@ -112,6 +115,8 @@ pub(super) fn append_tool_result_messages(
         content: Value::String(stream_assistant_text.to_string()),
         tool_calls: Some(exec_result.executed_tool_calls.clone()),
         tool_call_id: None,
+        reasoning_content: (!stream_reasoning_text.is_empty())
+            .then(|| stream_reasoning_text.to_string()),
     };
     append_message_pair(messages, turn_messages, assistant_msg);
 
@@ -156,6 +161,7 @@ pub(super) fn append_tool_result_messages(
             content: Value::String(prepared.content_for_model),
             tool_calls: None,
             tool_call_id: Some(result.tool_call_id.clone()),
+            reasoning_content: None,
         };
         append_message_pair(messages, turn_messages, tool_message);
     }
@@ -189,6 +195,7 @@ pub(super) fn append_code_inspection_working_memory(
         content: Value::String(note),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     });
 }
 
@@ -218,6 +225,7 @@ pub(super) fn record_persistent_code_discoveries(
         content: Value::String(format!("{CODE_DISCOVERY_PREFIX}\n{body}")),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     };
     append_message_pair(messages, turn_messages, record);
 
@@ -259,6 +267,8 @@ pub(super) fn record_final_stream_response(
         content: Value::String(stream_result.assistant_text.clone()),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: (!stream_result.reasoning_text.is_empty())
+            .then(|| stream_result.reasoning_text.clone()),
     };
     append_message_pair(messages, turn_messages, assistant_msg);
     *final_assistant_text = stream_result.assistant_text;
@@ -568,24 +578,28 @@ mod tests {
                     ),
                 ]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "tool".to_string(),
                 content: Value::String("    10\tfn load_config() {".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("1".to_string()),
+                reasoning_content: None,
             },
             Message {
                 role: "tool".to_string(),
                 content: Value::String("src/main.rs:42: panic!(\"boom\")".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("2".to_string()),
+                reasoning_content: None,
             },
             Message {
                 role: "tool".to_string(),
                 content: Value::String("     1\tmod main;".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("3".to_string()),
+                reasoning_content: None,
             },
         ];
 
@@ -609,6 +623,7 @@ mod tests {
                     serde_json::json!({"operation":"text_search","query":"load_config"}),
                 )]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "tool".to_string(),
@@ -618,6 +633,7 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: Some("1".to_string()),
+                reasoning_content: None,
             },
         ];
 
@@ -646,18 +662,21 @@ mod tests {
                     ),
                 ]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "tool".to_string(),
                 content: Value::String("    10\tfn load_config() {".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("1".to_string()),
+                reasoning_content: None,
             },
             Message {
                 role: "tool".to_string(),
                 content: Value::String("main.rs\nlib.rs".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("2".to_string()),
+                reasoning_content: None,
             },
         ];
 
@@ -676,6 +695,7 @@ mod tests {
             ),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
 
         assert!(persistent_code_discovery_already_present(

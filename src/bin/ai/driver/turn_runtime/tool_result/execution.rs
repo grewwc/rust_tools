@@ -270,6 +270,7 @@ fn handle_tool_call_round(
     append_tool_result_messages(
         app,
         &stream_result.assistant_text,
+        &stream_result.reasoning_text,
         &exec_result,
         messages,
         turn_messages,

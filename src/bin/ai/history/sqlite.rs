@@ -31,6 +31,7 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
             content TEXT NOT NULL,
             tool_calls TEXT,
             tool_call_id TEXT,
+            reasoning_content TEXT,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
         CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at);
@@ -43,6 +44,7 @@ fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
     .map_err(|e| io::Error::other(e.to_string()))?;
     add_column_if_missing(conn, "messages", "tool_calls", "TEXT")?;
     add_column_if_missing(conn, "messages", "tool_call_id", "TEXT")?;
+    add_column_if_missing(conn, "messages", "reasoning_content", "TEXT")?;
     Ok(())
 }
 
@@ -103,7 +105,7 @@ pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -
     }
     let messages = read_messages_with_sql(
         &tx,
-        "SELECT role, content, tool_calls, tool_call_id
+        "SELECT role, content, tool_calls, tool_call_id, reasoning_content
          FROM messages
          ORDER BY id ASC",
     )
@@ -179,8 +181,8 @@ pub(in crate::ai) fn replace_all_messages_sqlite(path: &Path, messages: &[Messag
 fn insert_messages(conn: &Connection, messages: Vec<Message>) -> io::Result<()> {
     let mut stmt = conn
         .prepare(
-            "INSERT INTO messages (role, content, tool_calls, tool_call_id)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO messages (role, content, tool_calls, tool_call_id, reasoning_content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
     for message in messages {
@@ -196,7 +198,8 @@ fn insert_messages(conn: &Connection, messages: Vec<Message>) -> io::Result<()> 
             message.role,
             content,
             tool_calls,
-            message.tool_call_id
+            message.tool_call_id,
+            message.reasoning_content
         ])
         .map_err(|e| io::Error::other(e.to_string()))?;
     }
@@ -213,16 +216,18 @@ fn read_messages_with_sql(
         let content: String = row.get(1)?;
         let tool_calls: Option<String> = row.get(2)?;
         let tool_call_id: Option<String> = row.get(3)?;
-        Ok((role, content, tool_calls, tool_call_id))
+        let reasoning_content: Option<String> = row.get(4)?;
+        Ok((role, content, tool_calls, tool_call_id, reasoning_content))
     })?;
     let mut messages = Vec::new();
     for row in rows {
-        let (role, content, tool_calls, tool_call_id) = row?;
+        let (role, content, tool_calls, tool_call_id, reasoning_content) = row?;
         messages.push(Message {
             role,
             content: decode_message_content(&content),
             tool_calls: decode_tool_calls(tool_calls.as_deref()),
             tool_call_id,
+            reasoning_content,
         });
     }
     Ok(messages)
@@ -241,7 +246,7 @@ pub(in crate::ai) fn build_message_arr_sqlite(
 
     let messages = read_messages_with_sql(
         &conn,
-        "SELECT role, content, tool_calls, tool_call_id
+        "SELECT role, content, tool_calls, tool_call_id, reasoning_content
          FROM messages
          ORDER BY id ASC",
     )?;
@@ -267,7 +272,7 @@ pub(in crate::ai) fn read_recent_messages_sqlite(
     init_history_schema(&conn)?;
 
     let mut stmt = conn.prepare(
-        "SELECT role, content, tool_calls, tool_call_id
+        "SELECT role, content, tool_calls, tool_call_id, reasoning_content
          FROM messages
          ORDER BY id DESC
          LIMIT ?1",
@@ -277,11 +282,13 @@ pub(in crate::ai) fn read_recent_messages_sqlite(
         let content: String = row.get(1)?;
         let tool_calls: Option<String> = row.get(2)?;
         let tool_call_id: Option<String> = row.get(3)?;
+        let reasoning_content: Option<String> = row.get(4)?;
         Ok(Message {
             role,
             content: decode_message_content(&content),
             tool_calls: decode_tool_calls(tool_calls.as_deref()),
             tool_call_id,
+            reasoning_content,
         })
     })?;
 
@@ -312,7 +319,7 @@ pub(in crate::ai) fn read_recent_turn_window_sqlite(
     if keep_last_user_turns == 0 {
         let messages = read_messages_with_sql(
             &conn,
-            "SELECT role, content, tool_calls, tool_call_id
+            "SELECT role, content, tool_calls, tool_call_id, reasoning_content
              FROM messages
              ORDER BY id ASC",
         )?;
@@ -337,7 +344,7 @@ pub(in crate::ai) fn read_recent_turn_window_sqlite(
     let Some(start_message_id) = threshold_user_id else {
         let messages = read_messages_with_sql(
             &conn,
-            "SELECT role, content, tool_calls, tool_call_id
+            "SELECT role, content, tool_calls, tool_call_id, reasoning_content
              FROM messages
              ORDER BY id ASC",
         )?;
@@ -377,7 +384,7 @@ pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
     init_history_schema(&conn)?;
 
     let mut stmt = conn.prepare(
-        "SELECT role, content, tool_calls, tool_call_id
+        "SELECT role, content, tool_calls, tool_call_id, reasoning_content
          FROM messages
          WHERE id < ?1 AND role = ?2
          ORDER BY id DESC
@@ -388,11 +395,13 @@ pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
         let content: String = row.get(1)?;
         let tool_calls: Option<String> = row.get(2)?;
         let tool_call_id: Option<String> = row.get(3)?;
+        let reasoning_content: Option<String> = row.get(4)?;
         Ok(Message {
             role,
             content: decode_message_content(&content),
             tool_calls: decode_tool_calls(tool_calls.as_deref()),
             tool_call_id,
+            reasoning_content,
         })
     })?;
 
@@ -461,7 +470,7 @@ pub(in crate::ai) fn read_all_messages_sqlite(path: &Path) -> io::Result<Vec<Mes
 
     read_messages_with_sql(
         &conn,
-        "SELECT role, content, tool_calls, tool_call_id
+        "SELECT role, content, tool_calls, tool_call_id, reasoning_content
          FROM messages
          ORDER BY id ASC",
     )
@@ -473,7 +482,7 @@ fn read_messages_since_id(
     start_message_id: i64,
 ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
     let mut stmt = conn.prepare(
-        "SELECT role, content, tool_calls, tool_call_id
+        "SELECT role, content, tool_calls, tool_call_id, reasoning_content
          FROM messages
          WHERE id >= ?1
          ORDER BY id ASC",
@@ -483,16 +492,18 @@ fn read_messages_since_id(
         let content: String = row.get(1)?;
         let tool_calls: Option<String> = row.get(2)?;
         let tool_call_id: Option<String> = row.get(3)?;
-        Ok((role, content, tool_calls, tool_call_id))
+        let reasoning_content: Option<String> = row.get(4)?;
+        Ok((role, content, tool_calls, tool_call_id, reasoning_content))
     })?;
     let mut messages = Vec::new();
     for row in rows {
-        let (role, content, tool_calls, tool_call_id) = row?;
+        let (role, content, tool_calls, tool_call_id, reasoning_content) = row?;
         messages.push(Message {
             role,
             content: decode_message_content(&content),
             tool_calls: decode_tool_calls(tool_calls.as_deref()),
             tool_call_id,
+            reasoning_content,
         });
     }
     Ok(messages)

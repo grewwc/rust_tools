@@ -23,6 +23,7 @@ fn ensure_final_assistant_recorded(
         content: Value::String(final_assistant_text.to_string()),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     });
 }
 

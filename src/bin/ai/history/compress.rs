@@ -131,6 +131,7 @@ pub(in crate::ai) fn compress_messages_for_context(
                 )),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
     }
@@ -160,6 +161,7 @@ pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Me
             )),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
     }
     out.extend_from_slice(&messages[split_at..]);
@@ -196,6 +198,7 @@ pub(in crate::ai) async fn compact_persisted_history_with_app(
             )),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
     }
     out.extend_from_slice(&messages[split_at..]);
@@ -346,6 +349,7 @@ fn shrink_messages_to_fit_with_summary(
                             content: Value::String(archive_note),
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning_content: None,
                         },
                     );
                 } else {
@@ -356,6 +360,7 @@ fn shrink_messages_to_fit_with_summary(
                             content: Value::String(memory_note),
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning_content: None,
                         },
                     );
                     let archive_idx = messages.len().min(1);
@@ -366,6 +371,7 @@ fn shrink_messages_to_fit_with_summary(
                             content: Value::String(archive_note),
                             tool_calls: None,
                             tool_call_id: None,
+                            reasoning_content: None,
                         },
                     );
                 }
@@ -388,6 +394,7 @@ fn shrink_messages_to_fit_with_summary(
                         content: Value::String(format!("{header_prefix}{summary_text}")),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     };
                     messages.insert(0, note);
                 }

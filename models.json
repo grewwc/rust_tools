@@ -11,6 +11,16 @@
     "enable_thinking": true
   },
   {
+    "key": "DEEPSEEK_V3",
+    "name": "deepseek-v4-flash-free",
+    "provider": "opencode",
+    "quality_tier": "basic",
+    "is_vl": false,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": true
+  },
+  {
     "key": "GLM",
     "name": "glm-5",
     "provider": "openai",

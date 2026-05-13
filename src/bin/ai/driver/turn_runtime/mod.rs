@@ -114,6 +114,7 @@ mod tests {
             content: Value::String("hello".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let mut persisted = 0usize;
 
@@ -125,12 +126,14 @@ mod tests {
             content: Value::String("tool output".to_string()),
             tool_calls: None,
             tool_call_id: Some("call_1".to_string()),
+            reasoning_content: None,
         });
         turn_messages.push(Message {
             role: "assistant".to_string(),
             content: Value::String("done".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
 
         persist_pending_turn_messages(&app, false, &turn_messages, &mut persisted);

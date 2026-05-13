@@ -576,6 +576,7 @@ fn structured_history_messages() -> Vec<Message> {
             content: Value::String("system prompt".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "user".to_string(),
@@ -585,6 +586,7 @@ fn structured_history_messages() -> Vec<Message> {
             })]),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "assistant".to_string(),
@@ -598,18 +600,21 @@ fn structured_history_messages() -> Vec<Message> {
                 },
             }]),
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "tool".to_string(),
             content: Value::String("tool output".to_string()),
             tool_calls: None,
             tool_call_id: Some("call_1".to_string()),
+            reasoning_content: None,
         },
         Message {
             role: "assistant".to_string(),
             content: Value::String("done".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
     ]
 }
@@ -629,12 +634,14 @@ fn history_retains_turns_under_cap() {
                         content: Value::String(format!("u{i}")),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     },
                     Message {
                         role: "assistant".to_string(),
                         content: Value::String(format!("a{i}")),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     },
                 ],
             )
@@ -668,24 +675,28 @@ fn history_compacts_old_turns_into_summary() {
                         content: Value::String(format!("u{i}")),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     },
                     Message {
                         role: "assistant".to_string(),
                         content: Value::String(format!("a{i}")),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     },
                     Message {
                         role: "tool".to_string(),
                         content: Value::String(format!("t{i}")),
                         tool_calls: None,
                         tool_call_id: Some(format!("call_{i}")),
+                        reasoning_content: None,
                     },
                     Message {
                         role: "assistant".to_string(),
                         content: Value::String(format!("a{i}_final")),
                         tool_calls: None,
                         tool_call_id: None,
+                        reasoning_content: None,
                     },
                 ],
             )
@@ -724,12 +735,14 @@ fn context_history_summarizes_beyond_history_count_instead_of_dropping() {
                     content: Value::String(format!("question-{i}")),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 Message {
                     role: "assistant".to_string(),
                     content: Value::String(format!("answer-{i}")),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
             ],
         )
@@ -767,6 +780,7 @@ fn context_history_keep_last_counts_user_turns_not_raw_messages() {
                     content: Value::String(format!("question-{i}")),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 Message {
                     role: "assistant".to_string(),
@@ -780,18 +794,21 @@ fn context_history_keep_last_counts_user_turns_not_raw_messages() {
                         },
                     }]),
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 Message {
                     role: "tool".to_string(),
                     content: Value::String(format!("tool-output-{i}")),
                     tool_calls: None,
                     tool_call_id: Some(format!("call_{i}")),
+                    reasoning_content: None,
                 },
                 Message {
                     role: "assistant".to_string(),
                     content: Value::String(format!("answer-{i}")),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
             ],
         )
@@ -833,6 +850,7 @@ fn context_history_summary_keeps_tool_names_and_results() {
                     content: Value::String(format!("请分析 issue-{i}")),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 Message {
                     role: "assistant".to_string(),
@@ -846,6 +864,7 @@ fn context_history_summary_keeps_tool_names_and_results() {
                         },
                     }]),
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
                 Message {
                     role: "tool".to_string(),
@@ -855,12 +874,14 @@ fn context_history_summary_keeps_tool_names_and_results() {
                     )),
                     tool_calls: None,
                     tool_call_id: Some(format!("call_{i}")),
+                    reasoning_content: None,
                 },
                 Message {
                     role: "assistant".to_string(),
                     content: Value::String(format!("结论 issue-{i}")),
                     tool_calls: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 },
             ],
         )
@@ -917,12 +938,14 @@ fn sqlite_recent_turn_window_reads_only_recent_user_turns() {
             content: serde_json::Value::String(format!("u{i}")),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
         messages.push(Message {
             role: "assistant".to_string(),
             content: serde_json::Value::String(format!("a{i}")),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
     }
     append_history_messages(&path, &messages).unwrap();
@@ -951,30 +974,35 @@ fn sqlite_context_fastpath_keeps_existing_history_summary() {
             ),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "user".to_string(),
             content: serde_json::Value::String("u1".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "assistant".to_string(),
             content: serde_json::Value::String("a1".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "user".to_string(),
             content: serde_json::Value::String("u2".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "assistant".to_string(),
             content: serde_json::Value::String("a2".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
     ];
     append_history_messages(&path, &messages).unwrap();

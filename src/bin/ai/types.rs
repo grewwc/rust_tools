@@ -266,6 +266,9 @@ pub(super) struct StreamResult {
     pub(super) tool_calls: Vec<ToolCall>,
     pub(super) assistant_text: String,
     pub(super) hidden_meta: String,
+    /// 模型在 thinking 模式下输出的 reasoning_content 原文，
+    /// 用于多轮请求时按服务端要求回传给后端。
+    pub(super) reasoning_text: String,
     pub(super) skip_response_drain: bool,
 }
 

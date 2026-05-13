@@ -277,6 +277,7 @@ pub(super) async fn prepare_turn(
         content: Value::String(skill_turn.system_prompt().to_string()),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     });
     messages.extend(history);
     let context_reminder = skill_turn.context_reminder();
@@ -286,12 +287,14 @@ pub(super) async fn prepare_turn(
             content: Value::String(reminder.clone()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
         messages.push(Message {
             role: "assistant".to_string(),
             content: Value::String("Understood. I will use the provided context when relevant.".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
     }
     let user_message = Message {
@@ -313,6 +316,7 @@ pub(super) async fn prepare_turn(
         },
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     };
     messages.push(user_message.clone());
     let mut turn_messages = Vec::with_capacity(8);
@@ -588,6 +592,7 @@ mod tests {
             ),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
 
         let lines = extract_existing_code_discoveries(&history);

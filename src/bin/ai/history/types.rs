@@ -17,6 +17,11 @@ pub(in crate::ai) struct Message {
     pub(in crate::ai) tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(in crate::ai) tool_call_id: Option<String>,
+    /// 模型在 thinking/reasoning 模式下返回的 reasoning_content。
+    /// 部分服务端（如 DeepSeek thinking-mode）要求把上一轮 assistant 的
+    /// reasoning_content 原样回传，否则会返回 400 invalid_request_error。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::ai) reasoning_content: Option<String>,
 }
 
 pub(crate) fn is_internal_note_role(role: &str) -> bool {

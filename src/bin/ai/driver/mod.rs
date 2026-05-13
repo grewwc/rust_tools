@@ -1234,6 +1234,7 @@ mod tests {
                 content: serde_json::Value::String(format!("m{idx}")),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             })
             .collect::<Vec<_>>();
         append_history_messages(path.as_path(), &messages).unwrap();

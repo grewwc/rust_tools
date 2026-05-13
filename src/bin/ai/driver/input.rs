@@ -932,18 +932,21 @@ mod tests {
                 content: Value::String("first question".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "assistant".to_string(),
                 content: Value::String("first answer".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "user".to_string(),
                 content: Value::String("second question".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         ];
         append_history_messages(&history_path, &messages).unwrap();
@@ -979,18 +982,21 @@ mod tests {
                 content: Value::String("first user".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "assistant".to_string(),
                 content: Value::String("assistant reply".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "user".to_string(),
                 content: Value::String("second user".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         ];
         append_history_messages(&history_path, &messages).unwrap();
@@ -1026,12 +1032,14 @@ mod tests {
                 content: Value::String("panic in fetch_messages".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "system".to_string(),
                 content: Value::String("stable note".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         ];
         append_history_messages(&history_path, &messages).unwrap();

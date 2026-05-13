@@ -82,6 +82,7 @@ pub(super) async fn model_should_reflect(
             content: Value::String(system.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "user".to_string(),
@@ -89,6 +90,7 @@ pub(super) async fn model_should_reflect(
                 .unwrap_or(Value::String(user)),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
     ];
     let fut = request::do_request_messages(app, model, &messages, false);
@@ -191,6 +193,7 @@ pub(super) async fn model_should_revise(
             content: Value::String(system.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "user".to_string(),
@@ -198,6 +201,7 @@ pub(super) async fn model_should_revise(
                 .unwrap_or(Value::String(user)),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
     ];
     let resp = request::do_request_messages(app, model, &messages, false)

@@ -553,12 +553,14 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "user".to_string(),
                 content: serde_json::Value::String("继续 plan".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         ];
 

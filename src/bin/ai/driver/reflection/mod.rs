@@ -343,12 +343,14 @@ mod tests {
                     },
                 }]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "tool".to_string(),
                 content: Value::String("...".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".to_string()),
+                reasoning_content: None,
             },
         ];
         assert!(turn_uses_repo_inspection_tools(&messages));

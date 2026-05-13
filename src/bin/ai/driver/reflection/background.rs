@@ -126,6 +126,7 @@ pub(crate) async fn maybe_critic_and_revise(
             content: Value::String(critic_system.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "user".to_string(),
@@ -133,6 +134,7 @@ pub(crate) async fn maybe_critic_and_revise(
                 .unwrap_or(Value::String(critic_user.clone())),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
     ];
     let critic_fut = request::do_request_messages(app, model, &critic_req, false);
@@ -163,6 +165,7 @@ pub(crate) async fn maybe_critic_and_revise(
             content: Value::String(revise_system.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "user".to_string(),
@@ -170,6 +173,7 @@ pub(crate) async fn maybe_critic_and_revise(
                 .unwrap_or(Value::String(revise_user.clone())),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
     ];
     let revise_fut = request::do_request_messages(app, model, &revise_req, false);
@@ -253,6 +257,7 @@ pub(crate) async fn run_critic_revise_background(
         )),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     };
     let _ = append_history_messages(&history_path, &[record]);
 }
@@ -333,6 +338,7 @@ pub(crate) async fn run_self_reflection_background(
         content: Value::String(format!("self_note:\n{}", note)),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     };
     let _ = append_history_messages(&history_path, &[record]);
     let entry = AgentMemoryEntry {

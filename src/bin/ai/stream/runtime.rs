@@ -151,6 +151,7 @@ fn cancelled_stream_result(thinking_open: bool) -> StreamResult {
         tool_calls: Vec::new(),
         assistant_text: String::new(),
         hidden_meta: String::new(),
+        reasoning_text: String::new(),
         skip_response_drain: true,
     }
 }
@@ -285,6 +286,7 @@ fn finalize_stream_response(
         tool_calls,
         assistant_text: state.content.assistant_text,
         hidden_meta: state.content.hidden_meta,
+        reasoning_text: state.content.reasoning_text,
         skip_response_drain: true,
     })
 }
@@ -362,6 +364,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         tool_calls: collect_valid_tool_calls(&mut state.content.tool_calls_map),
         assistant_text: std::mem::take(&mut state.content.assistant_text),
         hidden_meta: String::new(),
+        reasoning_text: std::mem::take(&mut state.content.reasoning_text),
         skip_response_drain: true,
     })
 }
@@ -1224,6 +1227,10 @@ fn process_stream_payload(
     if let Some(choice) = chunk.choices.first() {
         if !choice.delta.reasoning_content.is_empty() {
             state.content.saw_reasoning_output = true;
+            state
+                .content
+                .reasoning_text
+                .push_str(&choice.delta.reasoning_content);
         }
     }
 

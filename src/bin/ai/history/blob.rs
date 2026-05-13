@@ -187,5 +187,6 @@ fn parse_history_line(line: &str) -> Option<Message> {
         content: serde_json::Value::String(content.to_string()),
         tool_calls: None,
         tool_call_id: None,
+        reasoning_content: None,
     })
 }

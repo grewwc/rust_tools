@@ -690,12 +690,14 @@ async fn decide_thinking_via_model(
             ),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "user".to_string(),
             content: Value::String(clipped),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
     ];
 
@@ -1021,12 +1023,14 @@ Skills:
             content: Value::String(system_prompt),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "user".to_string(),
             content: Value::String(question.to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
     ];
 
@@ -1599,6 +1603,7 @@ pub(super) async fn summarize_history_via_model(
             )),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
         Message {
             role: "user".to_string(),
@@ -1608,6 +1613,7 @@ pub(super) async fn summarize_history_via_model(
             )),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         },
     ];
 
@@ -1805,6 +1811,7 @@ mod tests {
             content: Value::String("hello".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let body = build_request_body(
             "gpt-4o",
@@ -1829,6 +1836,7 @@ mod tests {
             content: Value::String("hello".to_string()),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         }];
         let body = build_request_body(
             "qwen",
@@ -1853,30 +1861,35 @@ mod tests {
                 content: Value::String("base system".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "user".to_string(),
                 content: Value::String("question".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
                 content: Value::String("history summary".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "assistant".to_string(),
                 content: Value::String("answer".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
                 content: Value::String("working memory".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         ];
 
@@ -1900,12 +1913,14 @@ mod tests {
                 content: Value::String("base system".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
                 content: Value::String("self_note:\nremember style".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -1914,6 +1929,7 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -1922,6 +1938,7 @@ mod tests {
                 ),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         ];
 
@@ -1942,12 +1959,14 @@ mod tests {
                 content: Value::String("base system".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "user".to_string(),
                 content: Value::String("question".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "assistant".to_string(),
@@ -1961,18 +1980,21 @@ mod tests {
                     },
                 }]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "assistant".to_string(),
                 content: Value::String("later answer".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "tool".to_string(),
                 content: Value::String("stale tool output".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".to_string()),
+                reasoning_content: None,
             },
         ];
 
@@ -1994,12 +2016,14 @@ mod tests {
                 content: Value::String("base system".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "user".to_string(),
                 content: Value::String("question".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "assistant".to_string(),
@@ -2013,12 +2037,14 @@ mod tests {
                     },
                 }]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "tool".to_string(),
                 content: Value::String("fresh tool output".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".to_string()),
+                reasoning_content: None,
             },
         ];
 
@@ -2045,12 +2071,14 @@ mod tests {
                 content: Value::String("base system".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "user".to_string(),
                 content: Value::String("question".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "assistant".to_string(),
@@ -2064,18 +2092,21 @@ mod tests {
                     },
                 }]),
                 tool_call_id: None,
+                reasoning_content: None,
             },
             Message {
                 role: "tool".to_string(),
                 content: Value::String("Error: failed to parse arguments".to_string()),
                 tool_calls: None,
                 tool_call_id: Some("call_1".to_string()),
+                reasoning_content: None,
             },
             Message {
                 role: "assistant".to_string(),
                 content: Value::String("later answer".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
+                reasoning_content: None,
             },
         ];
 

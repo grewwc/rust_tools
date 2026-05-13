@@ -109,6 +109,10 @@ pub(super) struct StreamContentState {
     pub(super) tool_calls_map: FastMap<usize, ToolCallBuilder>,
     pub(super) assistant_text: String,
     pub(super) hidden_meta: String,
+    /// 累积模型返回的 reasoning_content 原文（不含展示用的 thinking 标记），
+    /// 终轮结束后通过 StreamResult 透传给 history，
+    /// 以便下一轮请求把它原样回传给后端（DeepSeek thinking-mode 必须）。
+    pub(super) reasoning_text: String,
     pub(super) hidden_meta_parse: HiddenMetaParseState,
     pub(super) internal_tool_call_idx: usize,
 }
@@ -123,6 +127,7 @@ impl StreamContentState {
             tool_calls_map: FastMap::default(),
             assistant_text: String::new(),
             hidden_meta: String::new(),
+            reasoning_text: String::new(),
             hidden_meta_parse: HiddenMetaParseState::default(),
             internal_tool_call_idx: 0,
         }

@@ -219,6 +219,7 @@ async fn request_model_response(
             ),
             tool_calls: None,
             tool_call_id: None,
+            reasoning_content: None,
         });
     }
 
@@ -294,6 +295,7 @@ async fn stream_model_response(
                 tool_calls: Vec::new(),
                 assistant_text: "[响应解析失败，请重试]".to_string(),
                 hidden_meta: String::new(),
+                reasoning_text: String::new(),
                 skip_response_drain: false,
             }
         }
