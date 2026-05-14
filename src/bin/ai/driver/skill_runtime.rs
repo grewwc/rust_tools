@@ -488,8 +488,8 @@ fn filter_mcp_tools_by_allowed_servers(
         .collect()
 }
 
-fn mcp_tools_for_turn(
-    mcp_client: &McpClient,
+fn select_mcp_tools(
+    all_tools: Vec<ToolDef>,
     skill: Option<&SkillManifest>,
     active_agent: Option<&AgentManifest>,
 ) -> Vec<ToolDef> {
@@ -499,10 +499,18 @@ fn mcp_tools_for_turn(
 
     let allowed_servers = resolved_mcp_servers(skill, active_agent);
     if allowed_servers.is_empty() {
-        return Vec::new();
+        return all_tools;
     }
 
-    filter_mcp_tools_by_allowed_servers(mcp_client.get_all_tools(), &allowed_servers)
+    filter_mcp_tools_by_allowed_servers(all_tools, &allowed_servers)
+}
+
+fn mcp_tools_for_turn(
+    mcp_client: &McpClient,
+    skill: Option<&SkillManifest>,
+    active_agent: Option<&AgentManifest>,
+) -> Vec<ToolDef> {
+    select_mcp_tools(mcp_client.get_all_tools(), skill, active_agent)
 }
 
 struct CapabilityEntry {
@@ -1001,7 +1009,8 @@ mod tests {
     use super::{
         build_system_prompt, builtin_tools_for_skill, ensure_required_discovery_tools,
         filter_mcp_tools_by_allowed_servers, looks_like_follow_up_or_same_topic,
-        merge_with_runtime_enabled_tools, resolve_max_iterations, select_skill_with_preference,
+        merge_with_runtime_enabled_tools, resolve_max_iterations, select_mcp_tools,
+        select_skill_with_preference,
         select_skill_with_preference_strength, tool_uses_mcp_server, PreferenceStrength,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
@@ -1182,6 +1191,75 @@ mod tests {
         assert!(names.contains(&"mcp_feishu_docs_search".to_string()));
         assert!(names.contains(&"mcp_feishu_docs_get_text_by_url".to_string()));
         assert!(!names.contains(&"mcp_other_lookup".to_string()));
+    }
+
+    #[test]
+    fn agent_without_mcp_servers_field_exposes_all_mcp_tools() {
+        let all_tools = vec![
+            tool("mcp_feishu_docs_search"),
+            tool("mcp_ocr_extract"),
+            tool("mcp_other_lookup"),
+        ];
+        let build_agent = agent("build", vec![]);
+
+        let tools = select_mcp_tools(all_tools, None, Some(&build_agent));
+        let names = tools
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.contains(&"mcp_feishu_docs_search".to_string()));
+        assert!(names.contains(&"mcp_ocr_extract".to_string()));
+        assert!(names.contains(&"mcp_other_lookup".to_string()));
+    }
+
+    #[test]
+    fn no_active_agent_or_skill_falls_back_to_all_mcp_tools() {
+        let all_tools = vec![
+            tool("mcp_feishu_docs_search"),
+            tool("mcp_other_lookup"),
+        ];
+
+        let tools = select_mcp_tools(all_tools, None, None);
+        let names = tools
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"mcp_feishu_docs_search".to_string()));
+        assert!(names.contains(&"mcp_other_lookup".to_string()));
+    }
+
+    #[test]
+    fn skill_disable_mcp_tools_overrides_agent_default_fallback() {
+        let all_tools = vec![
+            tool("mcp_feishu_docs_search"),
+            tool("mcp_other_lookup"),
+        ];
+        let build_agent = agent("build", vec![]);
+        let mut s = skill("focus", "");
+        s.disable_mcp_tools = true;
+
+        let tools = select_mcp_tools(all_tools, Some(&s), Some(&build_agent));
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn explicit_agent_whitelist_still_narrows_when_set() {
+        let all_tools = vec![
+            tool("mcp_feishu_docs_search"),
+            tool("mcp_ocr_extract"),
+        ];
+        let agent = agent("build", vec!["feishu"]);
+
+        let tools = select_mcp_tools(all_tools, None, Some(&agent));
+        let names = tools
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["mcp_feishu_docs_search".to_string()]);
     }
 
     #[test]
