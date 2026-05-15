@@ -337,6 +337,9 @@ pub trait KernelInternal {
     fn is_round_robin(&self) -> bool;
     /// 将当前进程重新放回就绪队列（用于轮转调度）
     fn requeue_current(&mut self) -> bool;
+    /// 如果前台进程处于 Ready 状态（被唤醒），将其从就绪队列中取出并设为 Running。
+    /// 返回被激活的前台进程，若无则返回 None。
+    fn pop_foreground_ready(&mut self) -> Option<Process>;
     /// 处理当前进程的所有待处理信号，返回是否处理了信号
     fn process_pending_signals(&mut self) -> bool;
     /// 通知 kernel 某些外部事件已进入终态，用于唤醒等待这些事件的进程。

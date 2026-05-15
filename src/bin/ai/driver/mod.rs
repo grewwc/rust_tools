@@ -139,7 +139,11 @@ fn has_pending_foreground_process(app: &App) -> bool {
     let os = app.os.lock().unwrap();
     os.list_processes().into_iter().any(|proc| {
         proc.is_foreground
-            && !matches!(proc.state, aios_kernel::kernel::ProcessState::Terminated)
+            && !matches!(
+                proc.state,
+                aios_kernel::kernel::ProcessState::Terminated
+                    | aios_kernel::kernel::ProcessState::Ready
+            )
     })
 }
 
@@ -863,6 +867,116 @@ async fn run_loop(
 
                 tokio::spawn(runtime_ctx::DRIVER_CTX.scope(task_driver_ctx, wrapped));
             }
+        }
+
+        let fg_proc = {
+            let mut os = app.os.lock().unwrap();
+            os.pop_foreground_ready()
+        };
+        if let Some(proc) = fg_proc {
+            let pid = proc.pid;
+            let proc_question = if !proc.mailbox.is_empty() {
+                let messages: Vec<String> = proc.mailbox.iter().cloned().collect();
+                {
+                    let mut os = app.os.lock().unwrap();
+                    if let Some(actual) = os.get_process_mut(pid) {
+                        actual.mailbox.clear();
+                    }
+                }
+                format!(
+                    "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- If the mailbox indicates async tool wake-up, first decide whether you need `tool_status` for a full snapshot, `tool_wait` to collect newly finished results, or `tool_cancel` to stop low-value branches.\n- Do not blindly wait again if enough completed results already support the answer.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
+                    pid,
+                    proc.goal,
+                    messages.join("\n---\n")
+                )
+            } else {
+                format!(
+                    "[Process {} Resumed] Goal: {}\nContinue execution.",
+                    pid, proc.goal
+                )
+            };
+
+            {
+                let mut os = app.os.lock().unwrap();
+                os.set_current_pid(Some(pid));
+                let _ = os.process_pending_signals();
+            }
+
+            let next_model = app.current_model.clone();
+            crate::ai::types::clear_stream_cancel(app);
+            crate::ai::tools::registry::common::clear_tool_cancel();
+
+            let driver_ctx = runtime_ctx::DriverContext::new(
+                app.clone(),
+                mcp_client.clone(),
+                Arc::new(skill_manifests.clone()),
+                Arc::new(agent_manifests.clone()),
+            );
+
+            let turn_outcome = runtime_ctx::DRIVER_CTX
+                .scope(
+                    driver_ctx,
+                    TASK_PID.scope(
+                        Some(pid),
+                        turn_runtime::run_turn(
+                            app,
+                            mcp_client,
+                            &*skill_manifests,
+                            usize::MAX,
+                            proc_question,
+                            next_model,
+                            None,
+                            false,
+                            false,
+                        ),
+                    ),
+                )
+                .await;
+
+            match turn_outcome {
+                Ok(_outcome) => {
+                    let mut os = app.os.lock().unwrap();
+                    os.set_current_pid(Some(pid));
+                    os.increment_turns_used_for(pid);
+                    let mut should_terminate = true;
+                    let mut termination_result = "Completed".to_string();
+                    if let Some(p) = os.get_process_mut(pid) {
+                        if p.quota_turns > 0 {
+                            p.quota_turns -= 1;
+                        }
+                        if p.quota_turns == 0 {
+                            termination_result =
+                                "Terminated: Max LLM quota reached.".to_string();
+                        }
+                        if matches!(
+                            p.state,
+                            aios_kernel::kernel::ProcessState::Waiting { .. }
+                                | aios_kernel::kernel::ProcessState::Sleeping { .. }
+                                | aios_kernel::kernel::ProcessState::Stopped
+                        ) {
+                            should_terminate = false;
+                        }
+                    }
+                    if should_terminate {
+                        os.cleanup_process_resources(pid);
+                        os.set_current_pid(Some(pid));
+                        os.terminate_current(termination_result);
+                        if should_auto_drop_terminated(os.as_ref(), pid) {
+                            os.drop_terminated(pid);
+                        }
+                    }
+                }
+                Err(err) => {
+                    let mut os = app.os.lock().unwrap();
+                    os.cleanup_process_resources(pid);
+                    os.set_current_pid(Some(pid));
+                    os.terminate_current(format!("Failed: {}", err));
+                    if should_auto_drop_terminated(os.as_ref(), pid) {
+                        os.drop_terminated(pid);
+                    }
+                }
+            }
+            continue;
         }
 
         if has_pending_foreground_process(app) {

@@ -1416,8 +1416,6 @@ impl KernelInternal for LocalOS {
 
     fn pop_all_ready(&mut self, max: usize) -> Vec<Process> {
         let mut result = Vec::new();
-        // ready_set.len() 是实际可调度进程数，与可能含 tombstone 的
-        // ready_queue.len() 不同。
         let cap = max.min(self.ready_set.len());
         while result.len() < cap {
             let Some((pid, _priority)) = self.ready_queue.pop_front() else {
@@ -1427,6 +1425,10 @@ impl KernelInternal for LocalOS {
                 continue;
             }
             if let Some(proc) = self.processes.get_mut(&pid) {
+                if proc.is_foreground {
+                    self.ready_set.insert(pid);
+                    continue;
+                }
                 proc.state = ProcessState::Running;
                 result.push(proc.clone());
             }
@@ -1545,6 +1547,23 @@ impl KernelInternal for LocalOS {
         self.current_pid = None;
         self.enqueue_ready(pid);
         true
+    }
+
+    fn pop_foreground_ready(&mut self) -> Option<Process> {
+        let fg_pid = self
+            .processes
+            .iter()
+            .find(|(pid, proc)| proc.is_foreground && self.ready_set.contains(pid))
+            .map(|(pid, _)| *pid)?;
+        self.ready_set.remove(&fg_pid);
+        if let Some(proc) = self.processes.get_mut(&fg_pid) {
+            proc.state = ProcessState::Running;
+            self.current_pid = Some(fg_pid);
+            self.yield_requested = false;
+            Some(proc.clone())
+        } else {
+            None
+        }
     }
 
     fn process_pending_signals(&mut self) -> bool {
