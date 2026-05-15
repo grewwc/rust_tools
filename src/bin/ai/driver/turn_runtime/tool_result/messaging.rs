@@ -281,6 +281,7 @@ fn build_code_inspection_working_memory(turn_messages: &[Message]) -> Option<Str
 
     let mut raw_repo_tool_count = 0usize;
     let mut code_search_count = 0usize;
+    let mut write_tool_count = 0usize;
     for message in turn_messages {
         let Some(tool_calls) = &message.tool_calls else {
             continue;
@@ -293,13 +294,16 @@ fn build_code_inspection_working_memory(turn_messages: &[Message]) -> Option<Str
             if is_raw_repo_tool(tool_name) {
                 raw_repo_tool_count += 1;
             }
+            if is_write_tool(tool_name) {
+                write_tool_count += 1;
+            }
             if tool_name == "code_search" {
                 code_search_count += 1;
             }
         }
     }
 
-    if findings.is_empty() && raw_repo_tool_count < 2 {
+    if findings.is_empty() && raw_repo_tool_count < 2 && write_tool_count == 0 {
         return None;
     }
 
@@ -310,11 +314,11 @@ fn build_code_inspection_working_memory(turn_messages: &[Message]) -> Option<Str
         note.push('\n');
     }
     note.push_str(
-        "Treat these findings as already-known context for the current debugging turn. Avoid re-running the same raw file/search reads unless you need verification or a narrower slice.\n",
+        "Treat these findings as already-known context. Avoid re-running the same reads unless you need verification.\n",
     );
     if raw_repo_tool_count >= 2 && code_search_count == 0 {
         note.push_str(
-            "Code-navigation correction: you have used raw inspection tools without `code_search`. STOP using `read_file`, `read_file_lines`, `search_files`, or `grep_search` for exploration. Use `code_search` first to locate the relevant file/symbol/definition before reading specific lines.\n",
+            "Code-navigation correction: you have used raw inspection tools without `code_search`. Use `code_search` first to locate the relevant file/symbol/definition before reading specific lines.\n",
         );
     } else if raw_repo_tool_count >= 3 && code_search_count <= 1 {
         note.push_str(
@@ -394,6 +398,8 @@ fn is_repo_inspection_tool(tool_name: &str) -> bool {
             | "search_files"
             | "grep_search"
             | "list_directory"
+            | "apply_patch"
+            | "write_file"
     )
 }
 
@@ -402,6 +408,10 @@ fn is_raw_repo_tool(tool_name: &str) -> bool {
         tool_name,
         "read_file" | "read_file_lines" | "search_files" | "grep_search" | "list_directory"
     )
+}
+
+fn is_write_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "apply_patch" | "write_file")
 }
 
 fn persistent_code_discovery_already_present(messages: &[Message], body: &str) -> bool {
@@ -463,11 +473,37 @@ fn describe_tool_call(tool_call: &ToolCall) -> String {
             .and_then(|v| v.as_str())
             .map(|path| format!("(path={})", truncate_inline(path, 64)))
             .unwrap_or_default(),
+        "apply_patch" => {
+            let path = args
+                .get("file_path")
+                .or_else(|| args.get("path"))
+                .and_then(|v| v.as_str())
+                .map(|v| truncate_inline(v, 64))
+                .unwrap_or_else(|| "?".to_string());
+            format!("(file={})", path)
+        }
+        "write_file" => {
+            let path = args
+                .get("file_path")
+                .or_else(|| args.get("path"))
+                .and_then(|v| v.as_str())
+                .map(|v| truncate_inline(v, 64))
+                .unwrap_or_else(|| "?".to_string());
+            format!("(file={})", path)
+        }
         _ => String::new(),
     }
 }
 
 fn summarize_tool_result(tool_name: &str, content: &str) -> String {
+    if is_write_tool(tool_name) {
+        let first_line = content.lines().next().unwrap_or("").trim();
+        if first_line.is_empty() {
+            return "OK".to_string();
+        }
+        return truncate_inline(first_line, 120);
+    }
+
     let mut lines = content
         .lines()
         .map(str::trim)

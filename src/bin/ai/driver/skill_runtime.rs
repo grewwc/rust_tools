@@ -622,7 +622,7 @@ fn build_system_prompt(
 ) -> SystemPromptBuilder {
     let mut b = SystemPromptBuilder::new();
 
-    b.push(ContextKind::Identity, "You are a helpful assistant.");
+    b.push(ContextKind::Identity, "You are a highly capable programming assistant. You help users write, debug, and understand code with precision and thoroughness.");
 
     if let Some(agent) = active_agent {
         let extra = agent.build_system_prompt();
@@ -641,14 +641,11 @@ fn build_system_prompt(
     b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- If the answer depends on repo/code facts, inspect with tools before concluding.\n- If the user asks for edits, perform edits with tools instead of only describing them.\n- If the user asks to run/build/test/reproduce, run commands with tools when available.\n- On tool failure, read the error and correct course before answering. Retry with fixed args or switch tools; avoid repeating the same failing call.\n- If `code_search` returns only `No ...` results, broaden scope instead of rerunning unchanged.");
 
     if has_tool(available_tools, "enable_tools") {
-        let mut discovery_policy = String::from(
-            "Tool discovery:\n- Do NOT assume all tools are already loaded.\n- Before answering a non-trivial request from scratch, especially an action request or a task that may benefit from a specialized workflow, check whether a skill fits the task. Call `discover_skills` early instead of guessing.\n- If you are unsure how to solve the user's request, feel stuck, or do not know the best next step, use `discover_skills` before continuing. Use `discover_skills` to inspect the currently available skills.\n- If a capability is missing, call `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.\n- This also applies to MCP tools. For external systems such as Feishu/Lark, docs/wiki/sheets, media generation, presentations, or third-party services, discover and enable the matching `mcp_*` tools before proceeding.",
-        );
-        if skill.is_none() {
-            discovery_policy.push_str(
-                "\n- No skill is active yet. For any request that is not obviously a simple direct answer, prefer calling `discover_skills` before giving a freeform response.",
-            );
-        }
+        let discovery_policy = if skill.is_none() {
+            "Tool discovery:\n- Not all tools are loaded. Use `discover_skills` for specialized workflows, or `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for specific tools.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first.\n- No skill is active yet. For non-trivial requests, prefer calling `discover_skills` before giving a freeform response."
+        } else {
+            "Tool discovery:\n- Not all tools are loaded. If a capability is missing, use `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first."
+        };
         b.push(ContextKind::Policy, discovery_policy);
         if let Some(catalog) = build_capability_catalog(available_tools) {
             b.push(ContextKind::Fact, catalog);
@@ -1095,7 +1092,7 @@ mod tests {
         let mut available = SkipSet::new(16);
         available.insert("enable_tools".to_string());
         let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
-        assert!(prompt.contains("This also applies to MCP tools"));
+        assert!(prompt.contains("discover and enable matching `mcp_*` tools first"));
     }
 
     #[test]
@@ -1104,8 +1101,8 @@ mod tests {
         available.insert("enable_tools".to_string());
         available.insert("discover_skills".to_string());
         let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
-        assert!(prompt.contains("If you are unsure how to solve the user's request"));
-        assert!(prompt.contains("Use `discover_skills` to inspect the currently available skills"));
+        assert!(prompt.contains("discover_skills"));
+        assert!(prompt.contains("enable_tools"));
     }
 
     #[test]
@@ -1114,7 +1111,7 @@ mod tests {
         available.insert("enable_tools".to_string());
         available.insert("discover_skills".to_string());
         let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
-        assert!(prompt.contains("Call `discover_skills` early instead of guessing"));
+        assert!(prompt.contains("discover_skills"));
         assert!(prompt.contains("No skill is active yet"));
         assert!(prompt.contains("prefer calling `discover_skills` before giving a freeform response"));
     }

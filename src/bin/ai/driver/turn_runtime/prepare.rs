@@ -130,7 +130,12 @@ pub(super) async fn prepare_turn(
             .unwrap_or_else(|| "true".to_string())
             .trim()
             .ne("false");
-        if integrated || reflect_integrated {
+        let intent_needs_reflection = matches!(
+            skill_turn.intent().core,
+            crate::ai::driver::intent_recognition::CoreIntent::RequestAction
+                | crate::ai::driver::intent_recognition::CoreIntent::SeekSolution
+        );
+        if (integrated || reflect_integrated) && intent_needs_reflection {
             let mut sys = String::new();
             if integrated {
                 sys.push_str("Before replying, internally perform a brief CRITIC→REVISE pass to ensure correctness, missing steps, and clear structure. Do not output the critic. Output only the final improved answer.\n");

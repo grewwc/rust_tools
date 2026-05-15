@@ -8,14 +8,13 @@ model_tier: heavy
 routing_tags:
   - executor
   - autonomous
-  - end-to-end
   - execute
   - debug
   - implement
   - repair
-  - run tests
-  - 端到端
-  - 自动执行
+  - verify
+  - 自动
+  - 执行
   - 修复
   - 调试
 tool_groups:

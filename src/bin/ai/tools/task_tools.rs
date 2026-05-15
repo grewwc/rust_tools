@@ -5,6 +5,10 @@ use std::time::Instant;
 
 use crate::ai::{
     agents::{self, AgentManifest, AgentModelTier},
+    driver::{
+        TextSimilarityFeatures, build_idf_from_documents, cosine_tfidf_similarity,
+        normalize_text_for_similarity,
+    },
     models,
     tools::registry::common::current_process_tool_cancel_futex,
     tools::common::{ToolRegistration, ToolSpec},
@@ -1077,29 +1081,21 @@ fn format_task_result(entry: &AsyncTaskEntry, result: StoredTaskResult) -> Strin
     parts.join("\n")
 }
 
-fn auto_subagent_score(agent: &AgentManifest, task_text: &str) -> i32 {
-    let task = task_text.to_ascii_lowercase();
-    let mut score = 0i32;
-
-    for tag in agent.routing_tags_normalized() {
-        if tag.is_empty() {
-            continue;
-        }
-        if task.contains(&tag) {
-            score += 24;
-        } else if tag.contains('-') || tag.contains(' ') {
-            let parts = tag
-                .split(['-', ' '])
-                .map(str::trim)
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>();
-            if !parts.is_empty() && parts.iter().all(|part| task.contains(part)) {
-                score += 14;
-            }
-        }
+fn subagent_document_text(agent: &AgentManifest) -> String {
+    let mut parts = vec![agent.name.clone(), agent.description.clone()];
+    if !agent.routing_tags.is_empty() {
+        parts.push(agent.routing_tags.join(" "));
     }
+    if !agent.prompt.trim().is_empty() {
+        parts.push(agent.prompt.chars().take(1500).collect());
+    }
+    normalize_text_for_similarity(&parts.join("\n"))
+}
 
-    score
+fn auto_subagent_score(agent: &AgentManifest, task_text: &str, idf: &FastMap<String, f64>) -> f64 {
+    let query = TextSimilarityFeatures::from_text(task_text);
+    let doc = TextSimilarityFeatures::from_text(&subagent_document_text(agent));
+    cosine_tfidf_similarity(&query.ngram_tf, &doc.ngram_tf, idf)
 }
 
 #[derive(Debug)]
@@ -1115,20 +1111,7 @@ fn matched_routing_tags(agent: &AgentManifest, task_text: &str) -> Vec<String> {
     agent
         .routing_tags_normalized()
         .into_iter()
-        .filter(|tag| {
-            if task.contains(tag) {
-                return true;
-            }
-            if tag.contains('-') || tag.contains(' ') {
-                let parts = tag
-                    .split(['-', ' '])
-                    .map(str::trim)
-                    .filter(|part| !part.is_empty())
-                    .collect::<Vec<_>>();
-                return !parts.is_empty() && parts.iter().all(|part| task.contains(part));
-            }
-            false
-        })
+        .filter(|tag| task.contains(tag.as_str()))
         .collect()
 }
 
@@ -1177,18 +1160,28 @@ fn select_subagent<'a>(
     }
 
     let task_text = format!("{description}\n{prompt}");
+    let doc_tfs: Vec<FastMap<String, f64>> = subagents
+        .iter()
+        .map(|agent| TextSimilarityFeatures::from_text(&subagent_document_text(agent)).ngram_tf)
+        .collect();
+    let doc_refs: Vec<&FastMap<String, f64>> = doc_tfs.iter().collect();
+    let idf = build_idf_from_documents(&doc_refs);
+
     subagents
         .into_iter()
         .max_by(|a, b| {
-            auto_subagent_score(a, &task_text)
-                .cmp(&auto_subagent_score(b, &task_text))
+            auto_subagent_score(a, &task_text, &idf)
+                .total_cmp(&auto_subagent_score(b, &task_text, &idf))
                 .then_with(|| b.name.cmp(&a.name))
         })
-        .map(|agent| SelectedSubagent {
-            agent,
-            auto_selected: true,
-            matched_tags: matched_routing_tags(agent, &task_text),
-            score: auto_subagent_score(agent, &task_text),
+        .map(|agent| {
+            let score = auto_subagent_score(agent, &task_text, &idf);
+            SelectedSubagent {
+                agent,
+                auto_selected: true,
+                matched_tags: matched_routing_tags(agent, &task_text),
+                score: (score * 100.0) as i32,
+            }
         })
         .ok_or_else(|| "No subagents are available.".to_string())
 }
