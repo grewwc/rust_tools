@@ -86,6 +86,7 @@ pub(super) async fn prepare_turn(
     skill_manifests: &[crate::ai::skills::SkillManifest],
     history_count: usize,
     question: &str,
+    attachments_text: &str,
     next_model: &str,
     precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
 ) -> Result<TurnPreparation, Box<dyn std::error::Error>> {
@@ -306,7 +307,13 @@ pub(super) async fn prepare_turn(
         role: "user".to_string(), 
         content: {
             let has_images = !app.attached_image_files.is_empty();
-            let mut final_question = question.to_string();
+            let mut final_question = if attachments_text.is_empty() {
+                question.to_string()
+            } else if attachments_text.ends_with('\n') {
+                format!("{}{}", attachments_text, question)
+            } else {
+                format!("{}\n{}", attachments_text, question)
+            };
             if has_images
                 && !crate::ai::models::supports_image_input(next_model)
                 && let Some(ocr) = precomputed_ocr

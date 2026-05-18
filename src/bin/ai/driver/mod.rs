@@ -631,6 +631,7 @@ async fn run_loop(
 
         let history_count;
         let mut question;
+        let attachments_text;
 
         let background_procs: Vec<aios_kernel::kernel::Process> = {
             let mut os = app.os.lock().unwrap();
@@ -761,6 +762,7 @@ async fn run_loop(
                         &task_skills,
                         usize::MAX,
                         proc_question,
+                        String::new(),
                         next_model,
                         None,
                         false,
@@ -924,6 +926,7 @@ async fn run_loop(
                             &*skill_manifests,
                             usize::MAX,
                             proc_question,
+                            String::new(),
                             next_model,
                             None,
                             false,
@@ -994,6 +997,7 @@ async fn run_loop(
                 continue;
             }
             question = ctx.question;
+            attachments_text = ctx.attachments_text;
             history_count = ctx.history_count;
         }
 
@@ -1098,6 +1102,7 @@ async fn run_loop(
                         &*skill_manifests,
                         history_count,
                         question,
+                        attachments_text,
                         next_model,
                         precomputed_ocr,
                         one_shot_mode,

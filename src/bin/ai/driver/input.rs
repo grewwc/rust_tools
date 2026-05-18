@@ -552,7 +552,7 @@ fn extract_inline_image_paths(question: &mut String) -> Vec<String> {
 }
 
 fn apply_text_files_prefix(
-    question: &mut String,
+    attachments: &mut String,
     text_files: &[String],
 ) -> Result<(), Box<dyn Error>> {
     if text_files.is_empty() {
@@ -560,7 +560,10 @@ fn apply_text_files_prefix(
     }
     let prefix = files::text_file_contents(text_files)?;
     if !prefix.is_empty() {
-        *question = format!("{prefix}\n{question}");
+        if !attachments.is_empty() && !attachments.ends_with('\n') {
+            attachments.push('\n');
+        }
+        attachments.push_str(&prefix);
     }
     Ok(())
 }
@@ -615,7 +618,7 @@ fn build_pdf_text_prefix(pdfs: &[String]) -> String {
 }
 
 fn handle_binary_files(
-    question: &mut String,
+    attachments: &mut String,
     binary_files: Vec<String>,
 ) -> Result<(), Box<dyn Error>> {
     if binary_files.is_empty() {
@@ -626,7 +629,10 @@ fn handle_binary_files(
     if !pdfs.is_empty() {
         let prefix = build_pdf_text_prefix(&pdfs);
         if !prefix.trim().is_empty() {
-            *question = format!("{prefix}\n{question}");
+            if !attachments.is_empty() && !attachments.ends_with('\n') {
+                attachments.push('\n');
+            }
+            attachments.push_str(&prefix);
         }
     }
 
@@ -644,18 +650,19 @@ fn finalize_question(
 ) -> Result<QuestionContext, Box<dyn Error>> {
     let inline_files = extract_at_file_references(&mut question);
     let mut inline_images = extract_inline_image_paths(&mut question);
-    apply_text_files_prefix(&mut question, &inline_files.text_files)?;
+    let mut attachments_text = String::new();
+    apply_text_files_prefix(&mut attachments_text, &inline_files.text_files)?;
     if !inline_files.image_files.is_empty() {
         inline_images.extend(inline_files.image_files);
     }
-    handle_binary_files(&mut question, inline_files.binary_files)?;
+    handle_binary_files(&mut attachments_text, inline_files.binary_files)?;
     if let Some(files) = app.pending_files.take() {
         let parsed = files::parse_files(&files);
-        apply_text_files_prefix(&mut question, &parsed.text_files)?;
+        apply_text_files_prefix(&mut attachments_text, &parsed.text_files)?;
         if !parsed.image_files.is_empty() {
             inline_images.extend(parsed.image_files);
         }
-        handle_binary_files(&mut question, parsed.binary_files)?;
+        handle_binary_files(&mut attachments_text, parsed.binary_files)?;
     }
     if !inline_images.is_empty() {
         app.attached_image_files = inline_images;
@@ -671,6 +678,7 @@ fn finalize_question(
 
     Ok(QuestionContext {
         question,
+        attachments_text,
         history_count,
     })
 }
@@ -783,7 +791,8 @@ mod tests {
         let question = format!("Summarize @\"{}\"", path.display());
         let ctx = finalize_question(&mut app, question, 6, false).unwrap();
 
-        assert!(ctx.question.contains("hello from file"));
+        assert!(ctx.attachments_text.contains("hello from file"));
+        assert!(!ctx.question.contains("hello from file"));
         assert!(!ctx.question.contains(path.to_string_lossy().as_ref()));
     }
 

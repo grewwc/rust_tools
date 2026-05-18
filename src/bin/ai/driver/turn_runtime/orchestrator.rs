@@ -51,6 +51,7 @@ pub(in crate::ai::driver) async fn run_turn(
     skill_manifests: &[crate::ai::skills::SkillManifest],
     history_count: usize,
     question: String,
+    attachments_text: String,
     next_model: String,
     precomputed_ocr: Option<crate::ai::driver::model::OcrExtraction>,
     one_shot_mode: bool,
@@ -68,6 +69,7 @@ pub(in crate::ai::driver) async fn run_turn(
         skill_manifests,
         history_count,
         &question,
+        &attachments_text,
         &next_model,
         precomputed_ocr,
     )

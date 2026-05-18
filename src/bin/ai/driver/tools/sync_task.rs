@@ -120,6 +120,7 @@ pub(super) fn execute_sync_task(
             task_skill_manifests_for_spawn.as_slice(),
             usize::MAX,
             prompt,
+            String::new(),
             model,
             None,
             false,

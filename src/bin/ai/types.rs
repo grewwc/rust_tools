@@ -274,7 +274,12 @@ pub(super) struct StreamResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct QuestionContext {
+    /// 用户输入的纯 prompt（不包含 @file 注入的内容）。
+    /// 用于路由 / 意图识别 / 技能匹配等需要看"用户意图"的场景。
     pub(super) question: String,
+    /// 通过 @file、二进制（pdf）、pending_files 等渠道注入的附加文本。
+    /// 仅在最终发给 LLM 的 user_message 里拼接，不参与路由/特征提取。
+    pub(super) attachments_text: String,
     pub(super) history_count: usize,
 }
 
