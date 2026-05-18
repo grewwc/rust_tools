@@ -1,5 +1,240 @@
 use super::state::InternalToolCall;
 
+const TOOL_CALL_BEGIN_MARKER: &str = "<|tool_call_begin|>";
+const TOOL_CALL_ARGS_MARKER: &str = "<|tool_call_args|>";
+const TOOL_CALL_END_MARKER: &str = "<|tool_call_end|>";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum InternalToolCallStreamEvent {
+    Begin(String),
+    Args(String),
+    End,
+}
+
+#[derive(Default)]
+enum InternalToolCallStreamerPhase {
+    #[default]
+    Idle,
+    AwaitingName,
+    StreamingArgs,
+    SkipUntilEnd,
+}
+
+#[derive(Default)]
+pub(super) struct InternalToolCallStreamer {
+    pending: String,
+    phase: InternalToolCallStreamerPhase,
+}
+
+impl InternalToolCallStreamer {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn push(&mut self, chunk: &str) -> (String, Vec<InternalToolCallStreamEvent>) {
+        self.pending.push_str(chunk);
+        let mut cleaned = String::new();
+        let mut events = Vec::new();
+
+        loop {
+            match &self.phase {
+                InternalToolCallStreamerPhase::Idle => {
+                    if let Some(pos) = self.pending.find(TOOL_CALL_BEGIN_MARKER) {
+                        cleaned.push_str(&self.pending[..pos]);
+                        let after = pos + TOOL_CALL_BEGIN_MARKER.len();
+                        self.pending.drain(..after);
+                        self.phase = InternalToolCallStreamerPhase::AwaitingName;
+                        continue;
+                    }
+                    let keep = longest_marker_suffix_prefix(&self.pending, &[TOOL_CALL_BEGIN_MARKER]);
+                    let emit_len = self.pending.len().saturating_sub(keep);
+                    if emit_len > 0 {
+                        cleaned.push_str(&self.pending[..emit_len]);
+                        self.pending.drain(..emit_len);
+                    }
+                    break;
+                }
+                InternalToolCallStreamerPhase::AwaitingName => {
+                    let candidates = [
+                        TOOL_CALL_ARGS_MARKER,
+                        TOOL_CALL_END_MARKER,
+                        TOOL_CALL_BEGIN_MARKER,
+                    ];
+                    let brace_pos = self.pending.find('{');
+                    let marker_hit = earliest_substring_match(&self.pending, &candidates);
+                    let boundary = match (brace_pos, marker_hit) {
+                        (Some(b), Some((m_pos, m_idx, m_len))) => {
+                            if b <= m_pos {
+                                Some(BoundaryHit::Brace(b))
+                            } else {
+                                Some(BoundaryHit::Marker {
+                                    pos: m_pos,
+                                    marker: candidates[m_idx],
+                                    len: m_len,
+                                })
+                            }
+                        }
+                        (Some(b), None) => Some(BoundaryHit::Brace(b)),
+                        (None, Some((m_pos, m_idx, m_len))) => Some(BoundaryHit::Marker {
+                            pos: m_pos,
+                            marker: candidates[m_idx],
+                            len: m_len,
+                        }),
+                        (None, None) => None,
+                    };
+
+                    match boundary {
+                        Some(BoundaryHit::Brace(pos)) => {
+                            let raw_before = self.pending[..pos].to_string();
+                            self.pending.drain(..pos);
+                            let name = sanitize_internal_tool_call_name(&raw_before);
+                            if name.is_empty() {
+                                self.phase = InternalToolCallStreamerPhase::SkipUntilEnd;
+                            } else {
+                                events.push(InternalToolCallStreamEvent::Begin(name));
+                                self.phase = InternalToolCallStreamerPhase::StreamingArgs;
+                            }
+                            continue;
+                        }
+                        Some(BoundaryHit::Marker { pos, marker, len })
+                            if marker == TOOL_CALL_ARGS_MARKER =>
+                        {
+                            let raw_before = self.pending[..pos].to_string();
+                            let after = pos + len;
+                            self.pending.drain(..after);
+                            let name = sanitize_internal_tool_call_name(&raw_before);
+                            if name.is_empty() {
+                                self.phase = InternalToolCallStreamerPhase::SkipUntilEnd;
+                            } else {
+                                events.push(InternalToolCallStreamEvent::Begin(name));
+                                self.phase = InternalToolCallStreamerPhase::StreamingArgs;
+                            }
+                            continue;
+                        }
+                        Some(BoundaryHit::Marker { pos, marker, len })
+                            if marker == TOOL_CALL_END_MARKER =>
+                        {
+                            let raw_before = self.pending[..pos].to_string();
+                            let after = pos + len;
+                            self.pending.drain(..after);
+                            let name = sanitize_internal_tool_call_name(&raw_before);
+                            if !name.is_empty() {
+                                events.push(InternalToolCallStreamEvent::Begin(name));
+                                events.push(InternalToolCallStreamEvent::End);
+                            }
+                            self.phase = InternalToolCallStreamerPhase::Idle;
+                            continue;
+                        }
+                        Some(BoundaryHit::Marker { pos, len, .. }) => {
+                            let after = pos + len;
+                            self.pending.drain(..after);
+                            self.phase = InternalToolCallStreamerPhase::AwaitingName;
+                            continue;
+                        }
+                        None => {
+                            let keep = longest_marker_suffix_prefix(&self.pending, &candidates);
+                            let _ = keep;
+                            break;
+                        }
+                    }
+                }
+                InternalToolCallStreamerPhase::StreamingArgs => {
+                    if let Some(pos) = self.pending.find(TOOL_CALL_END_MARKER) {
+                        if pos > 0 {
+                            let chunk = self.pending[..pos].to_string();
+                            events.push(InternalToolCallStreamEvent::Args(chunk));
+                        }
+                        let after = pos + TOOL_CALL_END_MARKER.len();
+                        self.pending.drain(..after);
+                        events.push(InternalToolCallStreamEvent::End);
+                        self.phase = InternalToolCallStreamerPhase::Idle;
+                        continue;
+                    }
+                    let keep = longest_marker_suffix_prefix(&self.pending, &[TOOL_CALL_END_MARKER]);
+                    let emit_len = self.pending.len().saturating_sub(keep);
+                    if emit_len > 0 {
+                        let chunk = self.pending[..emit_len].to_string();
+                        self.pending.drain(..emit_len);
+                        events.push(InternalToolCallStreamEvent::Args(chunk));
+                    }
+                    break;
+                }
+                InternalToolCallStreamerPhase::SkipUntilEnd => {
+                    if let Some(pos) = self.pending.find(TOOL_CALL_END_MARKER) {
+                        let after = pos + TOOL_CALL_END_MARKER.len();
+                        self.pending.drain(..after);
+                        self.phase = InternalToolCallStreamerPhase::Idle;
+                        continue;
+                    }
+                    let keep = longest_marker_suffix_prefix(&self.pending, &[TOOL_CALL_END_MARKER]);
+                    let emit_len = self.pending.len().saturating_sub(keep);
+                    if emit_len > 0 {
+                        self.pending.drain(..emit_len);
+                    }
+                    break;
+                }
+            }
+        }
+
+        (cleaned, events)
+    }
+}
+
+enum BoundaryHit {
+    Brace(usize),
+    Marker { pos: usize, marker: &'static str, len: usize },
+}
+
+fn sanitize_internal_tool_call_name(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            let mut peeked = String::new();
+            for next in chars.by_ref() {
+                peeked.push(next);
+                if next == '>' {
+                    break;
+                }
+            }
+            let _ = peeked;
+            continue;
+        }
+        out.push(ch);
+    }
+    out.trim().to_string()
+}
+
+fn earliest_substring_match(s: &str, needles: &[&str]) -> Option<(usize, usize, usize)> {
+    needles
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, needle)| s.find(needle).map(|pos| (pos, idx, needle.len())))
+        .min_by_key(|(pos, _, _)| *pos)
+}
+
+fn longest_marker_suffix_prefix(s: &str, markers: &[&str]) -> usize {
+    if s.is_empty() || markers.is_empty() {
+        return 0;
+    }
+    let mut best = 0usize;
+    let mut starts = s.char_indices().map(|(idx, _)| idx).collect::<Vec<_>>();
+    starts.push(s.len());
+    for start in starts {
+        let suffix = &s[start..];
+        if suffix.is_empty() {
+            continue;
+        }
+        if markers
+            .iter()
+            .any(|marker| marker.starts_with(suffix) && marker.len() > suffix.len())
+        {
+            best = best.max(suffix.len());
+        }
+    }
+    best
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum StreamSplitSegment {
     Text(String),
@@ -258,8 +493,8 @@ fn parse_tool_call_args(s: &str) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        StreamSplitSegment, StreamSplitter, WrappedSplitSegment, extract_internal_tool_calls,
-        split_wrapped_markers,
+        InternalToolCallStreamEvent, InternalToolCallStreamer, StreamSplitSegment, StreamSplitter,
+        WrappedSplitSegment, extract_internal_tool_calls, split_wrapped_markers,
     };
 
     #[test]
@@ -367,5 +602,90 @@ mod tests {
 
         assert_eq!(cleaned, "ab");
         assert!(tool_calls.is_empty());
+    }
+
+    #[test]
+    fn internal_tool_call_streamer_emits_args_incrementally_across_chunks() {
+        let mut streamer = InternalToolCallStreamer::new();
+
+        let (cleaned1, events1) = streamer.push("intro<|tool_call_begin|>write_file<|tool_call_args|>{\"path\":\"a\"");
+        assert_eq!(cleaned1, "intro");
+        assert_eq!(
+            events1,
+            vec![
+                InternalToolCallStreamEvent::Begin("write_file".to_string()),
+                InternalToolCallStreamEvent::Args("{\"path\":\"a\"".to_string()),
+            ]
+        );
+
+        let (cleaned2, events2) = streamer.push(",\"content\":\"hi\"}");
+        assert_eq!(cleaned2, "");
+        assert_eq!(
+            events2,
+            vec![InternalToolCallStreamEvent::Args(
+                ",\"content\":\"hi\"}".to_string()
+            )]
+        );
+
+        let (cleaned3, events3) = streamer.push("<|tool_call_end|>after");
+        assert_eq!(cleaned3, "after");
+        assert_eq!(events3, vec![InternalToolCallStreamEvent::End]);
+    }
+
+    #[test]
+    fn internal_tool_call_streamer_handles_split_begin_marker() {
+        let mut streamer = InternalToolCallStreamer::new();
+
+        let (cleaned1, events1) = streamer.push("hello<|tool_call_be");
+        assert_eq!(cleaned1, "hello");
+        assert!(events1.is_empty());
+
+        let (cleaned2, events2) =
+            streamer.push("gin|>do_work<|tool_call_args|>{\"x\":1}<|tool_call_end|>");
+        assert_eq!(cleaned2, "");
+        assert_eq!(
+            events2,
+            vec![
+                InternalToolCallStreamEvent::Begin("do_work".to_string()),
+                InternalToolCallStreamEvent::Args("{\"x\":1}".to_string()),
+                InternalToolCallStreamEvent::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn internal_tool_call_streamer_falls_back_when_args_marker_missing() {
+        let mut streamer = InternalToolCallStreamer::new();
+
+        let (cleaned, events) = streamer
+            .push("<|tool_call_begin|>execute_command {\"command\":\"pwd\"}<|tool_call_end|>");
+        assert_eq!(cleaned, "");
+        assert_eq!(
+            events,
+            vec![
+                InternalToolCallStreamEvent::Begin("execute_command".to_string()),
+                InternalToolCallStreamEvent::Args("{\"command\":\"pwd\"}".to_string()),
+                InternalToolCallStreamEvent::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn internal_tool_call_streamer_does_not_leak_partial_end_marker() {
+        let mut streamer = InternalToolCallStreamer::new();
+
+        let (_, events1) = streamer.push("<|tool_call_begin|>tool<|tool_call_args|>{\"a\":1}");
+        assert!(matches!(
+            events1.last(),
+            Some(InternalToolCallStreamEvent::Args(_))
+        ));
+
+        let (cleaned2, events2) = streamer.push("<|tool_call_e");
+        assert_eq!(cleaned2, "");
+        assert!(events2.is_empty());
+
+        let (cleaned3, events3) = streamer.push("nd|>tail");
+        assert_eq!(cleaned3, "tail");
+        assert_eq!(events3, vec![InternalToolCallStreamEvent::End]);
     }
 }

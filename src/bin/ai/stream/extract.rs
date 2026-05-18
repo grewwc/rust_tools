@@ -1,5 +1,5 @@
 use super::{
-    splitter,
+    splitter::{self, InternalToolCallStreamEvent, InternalToolCallStreamer},
     state::{HiddenMetaParseState, InternalToolCall},
 };
 use crate::ai::request::StreamChunk;
@@ -64,6 +64,65 @@ pub(super) fn extract_chunk_events_with_tools(
             );
         }
         return (events, tool_calls);
+    }
+
+    let mut events = Vec::new();
+    if *thinking_open {
+        *thinking_open = false;
+        events.push(StreamTextEvent::CloseThinking);
+    }
+    if !delta.content.is_empty() {
+        let content = normalize_stream_text(delta.content.clone());
+        push_text_with_hidden_meta(
+            &mut events,
+            content,
+            false,
+            hidden_begin,
+            hidden_end,
+            hidden_meta_parse,
+        );
+    }
+    (events, Vec::new())
+}
+
+/// Stateful streaming variant that incrementally emits internal tool call
+/// Begin/Args/End events as soon as bytes arrive, instead of buffering until
+/// the closing `<|tool_call_end|>` marker is observed.
+pub(super) fn extract_chunk_events_streaming(
+    chunk: &StreamChunk,
+    hidden_begin: &str,
+    hidden_end: &str,
+    thinking_open: &mut bool,
+    hidden_meta_parse: &mut HiddenMetaParseState,
+    streamer: &mut InternalToolCallStreamer,
+) -> (Vec<StreamTextEvent>, Vec<InternalToolCallStreamEvent>) {
+    let Some(choice) = chunk.choices.first() else {
+        return (Vec::new(), Vec::new());
+    };
+    let delta = &choice.delta;
+
+    if delta.content.is_empty() && !delta.reasoning_content.is_empty() {
+        let (cleaned, tool_events) = streamer.push(&delta.reasoning_content);
+        let cleaned = normalize_stream_text(cleaned);
+        if cleaned.is_empty() && tool_events.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let mut events = Vec::new();
+        if !cleaned.is_empty() {
+            if !*thinking_open {
+                *thinking_open = true;
+                events.push(StreamTextEvent::OpenThinking);
+            }
+            push_text_with_hidden_meta(
+                &mut events,
+                cleaned,
+                true,
+                hidden_begin,
+                hidden_end,
+                hidden_meta_parse,
+            );
+        }
+        return (events, tool_events);
     }
 
     let mut events = Vec::new();

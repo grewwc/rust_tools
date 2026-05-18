@@ -5,7 +5,7 @@ use crate::ai::{
     types::{FunctionCall, StreamResult, ToolCall},
 };
 
-use super::{MarkdownStreamRenderer, splitter::StreamSplitter};
+use super::{MarkdownStreamRenderer, splitter::{InternalToolCallStreamer, StreamSplitter}};
 
 pub(super) const THINKING_TAG_TEXT: &str = "╭─ thinking";
 pub(super) const END_THINKING_TAG_TEXT: &str = "╰─ done thinking";
@@ -115,6 +115,7 @@ pub(super) struct StreamContentState {
     pub(super) reasoning_text: String,
     pub(super) hidden_meta_parse: HiddenMetaParseState,
     pub(super) internal_tool_call_idx: usize,
+    pub(super) internal_tool_call_streamer: InternalToolCallStreamer,
 }
 
 impl StreamContentState {
@@ -130,6 +131,7 @@ impl StreamContentState {
             reasoning_text: String::new(),
             hidden_meta_parse: HiddenMetaParseState::default(),
             internal_tool_call_idx: 0,
+            internal_tool_call_streamer: InternalToolCallStreamer::new(),
         }
     }
 }

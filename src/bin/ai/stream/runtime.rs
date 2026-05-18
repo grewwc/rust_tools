@@ -13,9 +13,9 @@ use crate::ai::{
 
 use super::{
     MarkdownStreamRenderer,
-    extract::{StreamTextEvent, extract_chunk_events_with_tools, strip_ansi_codes},
+    extract::{StreamTextEvent, extract_chunk_events_streaming, strip_ansi_codes},
     framing, normalize,
-    splitter::StreamSplitSegment,
+    splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{StreamChunkStep, StreamMarkers, StreamProcessingState, ToolCallBuilder},
 };
 
@@ -550,46 +550,58 @@ fn process_internal_tool_calls(
     app: &mut App,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
-    internal_tool_calls: Vec<super::state::InternalToolCall>,
+    internal_tool_call_events: Vec<InternalToolCallStreamEvent>,
 ) {
-    for tc in internal_tool_calls {
-        let super::state::InternalToolCall {
-            id,
-            tool_type,
-            function_name,
-            arguments,
-        } = tc;
-        ensure_tool_calls_section_open(app, markers, state);
+    for event in internal_tool_call_events {
+        match event {
+            InternalToolCallStreamEvent::Begin(function_name) => {
+                if function_name.trim().is_empty() {
+                    continue;
+                }
+                ensure_tool_calls_section_open(app, markers, state);
 
-        let builder = state
-            .content
-            .tool_calls_map
-            .entry(state.content.internal_tool_call_idx)
-            .or_default();
-        builder.id = id;
-        builder.tool_type = tool_type;
-        builder.function_name = function_name;
-        builder.arguments = arguments;
+                let index = state.content.internal_tool_call_idx;
+                let builder = state
+                    .content
+                    .tool_calls_map
+                    .entry(index)
+                    .or_default();
+                builder.id = format!("internal_{index}");
+                builder.tool_type = "function".to_string();
+                builder.function_name = function_name.clone();
 
-        if state.render.current_printing_index.is_some() {
-            println!("\x1b[0m)");
-            state.render.current_printing_index = None;
+                let _ = open_tool_call_line(state, index, &function_name);
+            }
+            InternalToolCallStreamEvent::Args(chunk) => {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let index = state.content.internal_tool_call_idx;
+                let builder = state
+                    .content
+                    .tool_calls_map
+                    .entry(index)
+                    .or_default();
+                if builder.function_name.is_empty() {
+                    builder.id = format!("internal_{index}");
+                    builder.tool_type = "function".to_string();
+                }
+                builder.arguments.push_str(&chunk);
+                builder.printed_arguments_len = builder.arguments.len();
+
+                let _ = write_tool_call_arguments_stream(&chunk);
+            }
+            InternalToolCallStreamEvent::End => {
+                if state.render.current_printing_index
+                    == Some(state.content.internal_tool_call_idx)
+                {
+                    println!("\x1b[0m)");
+                    state.render.current_printing_index = None;
+                    let _ = io::stdout().flush();
+                }
+                state.content.internal_tool_call_idx += 1;
+            }
         }
-
-        print!(
-            "  {}│{} {}{}{}({}{}\x1b[0m)",
-            ACCENT_RULE,
-            RESET,
-            ACCENT_MUTED,
-            builder.function_name,
-            RESET,
-            DIM,
-            builder.arguments
-        );
-        println!();
-        let _ = io::stdout().flush();
-
-        state.content.internal_tool_call_idx += 1;
     }
 }
 
@@ -1236,14 +1248,15 @@ fn process_stream_payload(
 
     process_external_tool_calls_delta(app, markers, state, &chunk, merge_mode);
 
-    let (events, internal_tool_calls) = extract_chunk_events_with_tools(
+    let (events, internal_tool_call_events) = extract_chunk_events_streaming(
         &chunk,
         markers.hidden_begin,
         markers.hidden_end,
         &mut state.content.thinking_open,
         &mut state.content.hidden_meta_parse,
+        &mut state.content.internal_tool_call_streamer,
     );
-    process_internal_tool_calls(app, markers, state, internal_tool_calls);
+    process_internal_tool_calls(app, markers, state, internal_tool_call_events);
 
     if events.is_empty() {
         return Ok(false);
