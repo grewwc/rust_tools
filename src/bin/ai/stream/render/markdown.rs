@@ -105,6 +105,54 @@ impl MarkdownStreamRenderer {
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
+    #[cfg(test)]
+    fn flush_pending_for_test(&mut self) -> io::Result<String> {
+        let mut out = Vec::new();
+
+        if !self.line_buf.is_empty() {
+            if self.line_preview_emitted {
+                if self.in_code_block {
+                    out.write_all(b"\x1b[0m\n")?;
+                } else {
+                    out.write_all(b"\n")?;
+                }
+                self.bol = true;
+            }
+            let line = std::mem::take(&mut self.line_buf);
+            let rendered = self.consume_line(&line, self.line_preview_emitted);
+            self.line_preview_emitted = false;
+            self.line_preview_height = 0;
+            self.code_preview_segment_width = 0;
+            if !rendered.is_empty() {
+                out.write_all(rendered.as_bytes())?;
+                self.bol = rendered.ends_with('\n');
+            }
+        }
+
+        let state = std::mem::replace(&mut self.table_state, TableState::None);
+        let rendered = match state {
+            TableState::None => String::new(),
+            TableState::PendingHeader {
+                indent,
+                header_line,
+                preview_height: _,
+            } => self.consume_line(&format!("{indent}{header_line}"), false),
+            TableState::InTable {
+                indent,
+                header,
+                align,
+                rows,
+                preview_height,
+            } => self.rewrite_table_preview(&indent, preview_height, &header, &align, &rows),
+        };
+        if !rendered.is_empty() {
+            out.write_all(rendered.as_bytes())?;
+            self.bol = rendered.ends_with('\n');
+        }
+        out.flush()?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
     pub(in crate::ai::stream::render) fn line_preview_height(&self) -> usize {
         self.line_preview_height
     }
@@ -264,6 +312,14 @@ impl MarkdownStreamRenderer {
         live_preview_cursor_rows(&self.line_buf)
     }
 
+    fn streamed_or_measured_preview_height(&self, line: &str, preview_emitted: bool) -> usize {
+        if preview_emitted {
+            self.line_preview_height.max(1)
+        } else {
+            table_preview_height(line)
+        }
+    }
+
     fn code_block_preview_height(&self, line: &str) -> usize {
         let block_indent = self.code_block_indent.as_str();
         let line_num_str = format!("{:>3}", self.code_line_number + 1);
@@ -349,7 +405,8 @@ impl MarkdownStreamRenderer {
                     }
                     let (indent, rest) = split_indent(line);
                     let raw = format!("{indent}{}", rest.trim_end());
-                    let mut preview_height = table_preview_height(&raw);
+                    let mut preview_height =
+                        self.streamed_or_measured_preview_height(&raw, preview_emitted);
                     if out.starts_with('\n') {
                         preview_height += 1;
                     }
@@ -384,7 +441,8 @@ impl MarkdownStreamRenderer {
                         out.push_str(&raw);
                         out.push('\n');
                     }
-                    preview_height += table_preview_height(&raw);
+                    preview_height +=
+                        self.streamed_or_measured_preview_height(&raw, preview_emitted);
 
                     let header_cells = parse_table_row(&header_line);
                     let align = parse_table_align(line, header_cells.len());
@@ -428,7 +486,8 @@ impl MarkdownStreamRenderer {
                         out.push_str(&raw);
                         out.push('\n');
                     }
-                    preview_height += table_preview_height(&raw);
+                    preview_height +=
+                        self.streamed_or_measured_preview_height(&raw, preview_emitted);
                     self.table_state = TableState::InTable {
                         indent,
                         header,
@@ -1138,6 +1197,27 @@ mod tests {
             final_out.contains(&move_up),
             "final rewrite must move the cursor up by exactly the streamed preview height \
              ({streamed_height}); got {final_out:?}"
+        );
+    }
+
+    #[test]
+    fn table_flush_uses_streamed_preview_height_for_rewrite() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        renderer.bol = true;
+
+        renderer.set_line_preview_height(5);
+        assert_eq!(renderer.consume_line("| Header | Value |", true), "");
+
+        renderer.set_line_preview_height(7);
+        assert_eq!(renderer.consume_line("| --- | --- |", true), "");
+
+        renderer.set_line_preview_height(9);
+        assert_eq!(renderer.consume_line("| foo | bar |", true), "");
+
+        let flushed = renderer.flush_pending_for_test().unwrap();
+        assert!(
+            flushed.contains("\x1b[21A\r\x1b[0J"),
+            "expected table rewrite to clear exactly the streamed preview height; got {flushed:?}"
         );
     }
 }
