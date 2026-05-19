@@ -3,10 +3,12 @@ use colored::Colorize;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use serde_json::{Value, json};
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::error::Error;
+use std::path::Path;
 use std::sync::{LazyLock, Mutex, atomic::{AtomicU64, Ordering}};
 use std::thread;
-use std::time::{Duration as StdDuration, Instant};
+use std::time::{Duration as StdDuration, Instant, UNIX_EPOCH};
 use crate::ai::tools::os_tools::GLOBAL_OS;
 use aios_kernel::{
     kernel::{EventId, WaitPolicy},
@@ -73,6 +75,15 @@ struct ToolCachePayload {
     tool_name: String,
     args: Value,
     result: String,
+    #[serde(default)]
+    file_fingerprints: Vec<CachedFileFingerprint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CachedFileFingerprint {
+    path: String,
+    size: u64,
+    modified_ms: Option<u64>,
 }
 
 const TOOL_CACHE_RECENT_LIMIT: usize = 400;
@@ -1776,6 +1787,9 @@ fn load_cached_tool_result(session_id: &str, tool_call: &ToolCall, args: &Value)
         if payload.tool_name != tool_call.function.name || payload.args != *args {
             continue;
         }
+        if !tool_cache_validation_matches(&payload) {
+            continue;
+        }
         return Some(ToolResult {
             tool_call_id: tool_call.id.clone(),
             content: payload.result,
@@ -1803,6 +1817,7 @@ fn store_tool_cache_result(session_id: &str, tool_call: &ToolCall, args: &Value,
         tool_name: tool_call.function.name.clone(),
         args: args.clone(),
         result: truncate_chars(&tool_result.content, TOOL_CACHE_MAX_RESULT_CHARS),
+        file_fingerprints: collect_tool_cache_file_fingerprints(&tool_call.function.name, args),
     };
     let Ok(note) = serde_json::to_string(&payload) else {
         return;
@@ -1843,6 +1858,39 @@ fn build_tool_cache_key(name: &str, args: &Value) -> String {
     format!("{:x}", md5::compute(format!("{name}\n{args_json}")))
 }
 
+fn tool_cache_validation_matches(payload: &ToolCachePayload) -> bool {
+    let current = collect_tool_cache_file_fingerprints(&payload.tool_name, &payload.args);
+    current == payload.file_fingerprints
+}
+
+fn collect_tool_cache_file_fingerprints(tool_name: &str, args: &Value) -> Vec<CachedFileFingerprint> {
+    let path = match tool_name {
+        "read_file" | "read_file_lines" => args
+            .get("file_path")
+            .or_else(|| args.get("path"))
+            .and_then(Value::as_str),
+        _ => None,
+    };
+    path.and_then(cached_file_fingerprint_for_path).into_iter().collect()
+}
+
+fn cached_file_fingerprint_for_path(path: &str) -> Option<CachedFileFingerprint> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let modified_ms = meta
+        .modified()
+        .ok()
+        .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64);
+    Some(CachedFileFingerprint {
+        path: Path::new(path).display().to_string(),
+        size: meta.len(),
+        modified_ms,
+    })
+}
+
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     if max_chars == 0 || s.chars().count() <= max_chars {
         return s.to_string();
@@ -1857,8 +1905,10 @@ mod tests {
     use super::{
         aggregate_async_tool_pipe_messages, async_tool_pipe_message_from_final,
         async_tool_pipe_message_from_started, async_tool_pipe_message_from_stream,
-        build_tool_cache_key, delete_async_tool_snapshot, is_cacheable_tool_name,
-        is_tool_cache_entry_fresh, load_async_tool_snapshot, lookup_wait_sources,
+        build_tool_cache_key, collect_tool_cache_file_fingerprints, delete_async_tool_snapshot,
+        is_cacheable_tool_name, is_tool_cache_entry_fresh, load_async_tool_snapshot,
+        lookup_wait_sources, tool_cache_validation_matches, CachedFileFingerprint,
+        ToolCachePayload,
         persist_async_tool_snapshot, send_async_tool_pipe_message,
         stream_preview_from_aggregate, AsyncToolEntry, AsyncToolPipeKind, AsyncToolPipeMessage,
         AsyncToolState, RunOneResult, ToolRoute, ASYNC_TOOL_REGISTRY, TOOL_CACHE_TTL_MINUTES,
@@ -1870,7 +1920,9 @@ mod tests {
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
     use chrono::{Duration, Utc};
     use serde_json::json;
+    use std::fs;
     use std::sync::{LazyLock, Mutex, MutexGuard};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     static ASYNC_TOOL_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -1965,6 +2017,62 @@ mod tests {
         };
         assert!(is_tool_cache_entry_fresh(&fresh));
         assert!(!is_tool_cache_entry_fresh(&stale));
+    }
+
+    fn temp_file_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        path.push(format!("rust_tools_{name}_{}_{}", std::process::id(), nanos));
+        path
+    }
+
+    #[test]
+    fn file_backed_cache_validation_rejects_stale_entries() {
+        let path = temp_file_path("tool_cache_validation");
+        fs::write(&path, "hello").unwrap();
+
+        let args = json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "limit": 10
+        });
+        let payload = ToolCachePayload {
+            tool_name: "read_file".to_string(),
+            args: args.clone(),
+            result: "cached".to_string(),
+            file_fingerprints: collect_tool_cache_file_fingerprints("read_file", &args),
+        };
+        assert!(tool_cache_validation_matches(&payload));
+
+        fs::write(&path, "hello, updated").unwrap();
+        assert!(!tool_cache_validation_matches(&payload));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_file_cache_entries_without_fingerprint_are_rejected() {
+        let path = temp_file_path("tool_cache_legacy");
+        fs::write(&path, "hello").unwrap();
+
+        let args = json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "limit": 10
+        });
+        let payload = ToolCachePayload {
+            tool_name: "read_file".to_string(),
+            args,
+            result: "cached".to_string(),
+            file_fingerprints: Vec::<CachedFileFingerprint>::new(),
+        };
+
+        assert!(!tool_cache_validation_matches(&payload));
+
+        let _ = fs::remove_file(path);
     }
 
     fn tool_call(name: &str) -> ToolCall {
