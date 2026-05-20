@@ -330,12 +330,13 @@ impl MemoryStore {
             scored.iter().take(cap).map(|(s, i)| (*s, *i)).collect();
         let qv = embedder::embed_text(&query_lc);
         if let Some(qv) = qv {
+            let texts: Vec<String> = top_idx.iter().map(|&(_, i)| docs[i].1.clone()).collect();
+            let batch = embedder::embed_texts(&texts);
             let mut rescored: Vec<(f64, usize)> = Vec::with_capacity(top_idx.len());
-            for &(_s, i) in &top_idx {
-                let (_, full, _) = &docs[i];
-                let ev = embedder::embed_text(full);
-                let emb = ev
+            for (idx, &(_s, i)) in top_idx.iter().enumerate() {
+                let emb = batch
                     .as_ref()
+                    .and_then(|v| v.get(idx))
                     .map(|v| similarity::cosine_similarity(&qv, v))
                     .unwrap_or(0.0);
                 let base = _s;

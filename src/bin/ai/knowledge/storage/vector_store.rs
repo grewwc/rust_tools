@@ -1,7 +1,6 @@
 /// Vector store — pure vector CRUD operations.
 /// Decoupled from JSONL store; sync is handled by the sync module.
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
@@ -28,82 +27,22 @@ pub trait VectorEmbedder: Sync + Send {
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String>;
 }
 
-/// FastEmbed-based embedder (lazy-loaded).
-pub struct LazyEmbedder {
-    inner: Mutex<Option<fastembed::TextEmbedding>>,
-    cache_dir: PathBuf,
-}
-
-impl LazyEmbedder {
-    pub fn new(cache_dir: PathBuf) -> Self {
-        Self {
-            inner: Mutex::new(None),
-            cache_dir,
-        }
-    }
-
-    fn get(&self) -> Result<&fastembed::TextEmbedding, String> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|e| format!("Lock poisoned: {}", e))?;
-        if guard.is_none() {
-            let embedder = fastembed::TextEmbedding::try_new(
-                fastembed::InitOptions::new(fastembed::EmbeddingModel::MultilingualE5Small)
-                    .with_cache_dir(self.cache_dir.clone())
-                    .with_show_download_progress(true),
-            )
-            .map_err(|e| format!("Failed to load embedding model: {}", e))?;
-            *guard = Some(embedder);
-        }
-        Ok(unsafe {
-            std::mem::transmute::<&fastembed::TextEmbedding, &fastembed::TextEmbedding>(
-                guard.as_ref().unwrap(),
-            )
-        })
-    }
-}
-
-impl VectorEmbedder for LazyEmbedder {
-    fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
-        let embedder = self.get()?;
-        let embeddings = embedder
-            .embed(vec![text], None)
-            .map_err(|e| format!("Failed to embed: {}", e))?;
-        embeddings
-            .into_iter()
-            .next()
-            .ok_or_else(|| "No embedding produced".to_string())
-    }
-
-    fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-        if texts.is_empty() {
-            return Ok(Vec::new());
-        }
-        let embedder = self.get()?;
-        embedder
-            .embed(texts.to_vec(), None)
-            .map_err(|e| format!("Failed to embed texts: {}", e))
-    }
-}
-
-/// Vector store backed by sled.
-pub struct VectorStore {
-    db: sled::Db,
-    embedder: Box<dyn VectorEmbedder>,
-    index_path: PathBuf,
-}
-
 struct GlobalEmbeddingAdapter;
 
 impl VectorEmbedder for GlobalEmbeddingAdapter {
     fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
-        embedder::embed_text(text).ok_or_else(|| "No embedding produced".to_string())
+        embedder::embed_text(text).ok_or_else(|| "embedding not available".to_string())
     }
 
     fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
-        embedder::embed_texts(texts).ok_or_else(|| "No embeddings produced".to_string())
+        embedder::embed_texts(texts).ok_or_else(|| "embedding not available".to_string())
     }
+}
+
+pub struct VectorStore {
+    db: sled::Db,
+    embedder: Box<dyn VectorEmbedder>,
+    index_path: PathBuf,
 }
 
 impl VectorStore {

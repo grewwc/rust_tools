@@ -68,11 +68,13 @@ pub fn keyword_search(
     let mut top_idx: Vec<(f64, usize)> = scored.iter().take(cap).copied().collect();
 
     if let Some(qv) = super::super::indexing::embedder::embed_text(&query_lc) {
+        let texts: Vec<String> = top_idx.iter().map(|&(_, i)| entries[i].search_text()).collect();
+        let batch = super::super::indexing::embedder::embed_texts(&texts);
         let mut rescored: Vec<(f64, usize)> = Vec::with_capacity(top_idx.len());
-        for &(_s, i) in &top_idx {
-            let full = entries[i].search_text();
-            let emb = super::super::indexing::embedder::embed_text(&full)
+        for (idx, &(_s, i)) in top_idx.iter().enumerate() {
+            let emb = batch
                 .as_ref()
+                .and_then(|v| v.get(idx))
                 .map(|v| similarity::cosine_similarity(&qv, v))
                 .unwrap_or(0.0);
             let final_s = (1.0 - config.similarity.embedding_blend) * _s
