@@ -18,7 +18,7 @@ struct CachedIndex {
     skills_hash: String,
     store: Arc<VectorStore>,
     section_count: usize,
-    snapshot: Vec<(VectorEntry, SkillEmbeddingDocumentSection, String)>,
+    snapshot: Arc<Vec<(VectorEntry, SkillEmbeddingDocumentSection, String)>>,
 }
 
 static CACHED_INDEX: LazyLock<Mutex<Option<CachedIndex>>> =
@@ -36,7 +36,7 @@ pub struct SkillEmbeddingHit {
 pub struct SkillEmbeddingIndex {
     store: Arc<VectorStore>,
     section_count: usize,
-    snapshot: Vec<(VectorEntry, SkillEmbeddingDocumentSection, String)>,
+    snapshot: Arc<Vec<(VectorEntry, SkillEmbeddingDocumentSection, String)>>,
 }
 
 impl SkillEmbeddingIndex {
@@ -50,7 +50,7 @@ impl SkillEmbeddingIndex {
                     return Ok(Self {
                         store: Arc::clone(&cached.store),
                         section_count: cached.section_count,
-                        snapshot: cached.snapshot.clone(),
+                        snapshot: Arc::clone(&cached.snapshot),
                     });
                 }
             }
@@ -58,14 +58,14 @@ impl SkillEmbeddingIndex {
 
         let store = Arc::new(VectorStore::with_global_provider(&default_skill_index_path())?);
         sync_documents(&store, documents)?;
-        let snapshot = load_snapshot(&store)?;
+        let snapshot = Arc::new(load_snapshot(&store)?);
 
         if let Ok(mut cache) = CACHED_INDEX.lock() {
             *cache = Some(CachedIndex {
                 skills_hash,
                 store: Arc::clone(&store),
                 section_count,
-                snapshot: snapshot.clone(),
+                snapshot: Arc::clone(&snapshot),
             });
         }
 
@@ -77,11 +77,18 @@ impl SkillEmbeddingIndex {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SkillEmbeddingHit>, String> {
-        let expanded_query = expand_query_bilingual(query);
+        if self.snapshot.is_empty() {
+            return Ok(Vec::new());
+        }
+        let trimmed = query.trim();
+        if trimmed.chars().count() < 4 {
+            return Ok(Vec::new());
+        }
+        let expanded_query = expand_query_bilingual(trimmed);
         let query_embedding = cached_embed(&self.store, &expanded_query)?;
 
         let mut by_skill: FastMap<String, SkillEmbeddingHit> = FastMap::default();
-        for (entry, section, skill_name) in &self.snapshot {
+        for (entry, section, skill_name) in self.snapshot.iter() {
             let sim = cosine_similarity_f32(&query_embedding, &entry.embedding);
             let score = sim as f64;
             let item = by_skill
@@ -282,22 +289,35 @@ fn section_name(section: SkillEmbeddingDocumentSection) -> &'static str {
 }
 
 fn cached_embed(store: &VectorStore, text: &str) -> Result<Vec<f32>, String> {
+    let cache_key = normalize_cache_key(text);
     if let Ok(cache) = QUERY_EMBEDDING_CACHE.lock() {
-        if let Some((_key, embedding)) = cache.iter().find(|(k, _)| k == text) {
+        if let Some((_key, embedding)) = cache.iter().find(|(k, _)| *k == cache_key) {
             return Ok(embedding.clone());
         }
     }
 
-    let embedding = store.embed_text(text)?;
+    let embedding = store.embed_text(&cache_key)?;
 
     if let Ok(mut cache) = QUERY_EMBEDDING_CACHE.lock() {
         if cache.len() >= QUERY_EMBEDDING_CACHE_LIMIT {
             cache.remove(0);
         }
-        cache.push((text.to_string(), embedding.clone()));
+        cache.push((cache_key, embedding.clone()));
     }
 
     Ok(embedding)
+}
+
+fn normalize_cache_key(text: &str) -> String {
+    let normalized: String = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.chars().count() > 256 {
+        normalized.chars().take(256).collect()
+    } else {
+        normalized
+    }
 }
 
 fn expand_query_bilingual(query: &str) -> String {
@@ -333,18 +353,26 @@ fn expand_query_bilingual(query: &str) -> String {
         ("analyze", "分析"),
     ];
 
-    let lower = query.to_lowercase();
+    let truncated: String = if query.chars().count() > 120 {
+        query.chars().take(120).collect()
+    } else {
+        query.to_string()
+    };
+    let lower = truncated.to_lowercase();
     let mut expansions: Vec<&str> = Vec::new();
 
     for (keyword, expansion) in BILINGUAL_MAP {
         if lower.contains(keyword) {
             expansions.push(expansion);
+            if expansions.len() >= 3 {
+                break;
+            }
         }
     }
 
     if expansions.is_empty() {
-        return query.to_string();
+        return truncated;
     }
 
-    format!("{} {}", query, expansions.join(" "))
+    format!("{} {}", truncated, expansions.join(" "))
 }

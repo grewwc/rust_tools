@@ -64,16 +64,7 @@ pub fn rank_skills_locally_with_model_path<'a>(
     let model_probs = skill_match_model::predict_skill(input, model_path);
     let runtime_model = RuntimeSkillModel::for_skills(skills);
     let query_features = TextSimilarityFeatures::from_text(&input_lower);
-    let candidates = skills
-        .iter()
-        .filter(|skill| {
-            intent
-                .map(|intent_ref| !is_intent_excluded(skill, intent_ref))
-                .unwrap_or(true)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let embedding_hits = build_embedding_hits(&candidates, input).unwrap_or_default();
+    let embedding_hits = build_embedding_hits(skills, input).unwrap_or_default();
     let mut ranked = Vec::new();
 
     for skill in skills {
