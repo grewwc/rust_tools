@@ -1,5 +1,5 @@
 use crate::ai::{
-    agents::AgentManifest,
+    agents::{AgentManifest, load_project_instruction_docs},
     mcp::McpClient,
     skills::SkillManifest,
     types::{App, SkillBiasMemory, ToolDefinition},
@@ -615,6 +615,27 @@ fn build_capability_catalog(available_tools: &Box<SkipSet<String>>) -> Option<St
     Some(out)
 }
 
+fn build_project_instruction_prompt() -> Option<String> {
+    let docs = load_project_instruction_docs();
+    if docs.is_empty() {
+        return None;
+    }
+
+    let mut out = String::from(
+        "Project-local instructions:\n\
+         - The current working directory provides project-specific instruction documents.\n\
+         - Follow these repo-local constraints and preferences unless they conflict with higher-priority system, developer, or user instructions.\n",
+    );
+    for doc in docs {
+        out.push_str(&format!(
+            "\nFrom {}:\n{}\n",
+            doc.path,
+            doc.content.trim()
+        ));
+    }
+    Some(out)
+}
+
 fn build_system_prompt(
     active_agent: Option<&AgentManifest>,
     skill: Option<&SkillManifest>,
@@ -639,6 +660,10 @@ fn build_system_prompt(
     }
 
     b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- If the answer depends on repo/code facts, inspect with tools before concluding.\n- If the user asks for edits, perform edits with tools instead of only describing them.\n- If the user asks to run/build/test/reproduce, run commands with tools when available.\n- On tool failure, read the error and correct course before answering. Retry with fixed args or switch tools; avoid repeating the same failing call.\n- If `code_search` returns only `No ...` results, broaden scope instead of rerunning unchanged.");
+
+    if let Some(project_prompt) = build_project_instruction_prompt() {
+        b.push(ContextKind::Policy, project_prompt);
+    }
 
     if has_tool(available_tools, "enable_tools") {
         let discovery_policy = if skill.is_none() {
@@ -1004,19 +1029,23 @@ pub(super) fn prepare_skill_for_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_system_prompt, builtin_tools_for_skill, ensure_required_discovery_tools,
-        filter_mcp_tools_by_allowed_servers, looks_like_follow_up_or_same_topic,
-        merge_with_runtime_enabled_tools, resolve_max_iterations, select_mcp_tools,
-        select_skill_with_preference,
+        build_project_instruction_prompt, build_system_prompt, builtin_tools_for_skill,
+        ensure_required_discovery_tools, filter_mcp_tools_by_allowed_servers,
+        looks_like_follow_up_or_same_topic, merge_with_runtime_enabled_tools,
+        resolve_max_iterations, select_mcp_tools, select_skill_with_preference,
         select_skill_with_preference_strength, tool_uses_mcp_server, PreferenceStrength,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
+    use crate::ai::driver::runtime_ctx::SUBAGENT_CWD;
     use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
     use crate::ai::skills::SkillManifest;
     use crate::ai::tools::enable_tools::set_explicit_enabled_tool_names;
     use crate::ai::types::{FunctionDefinition, ToolDefinition};
     use rust_tools::cw::SkipSet;
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::{LazyLock, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     static EXPLICIT_TOOL_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     
@@ -1114,6 +1143,37 @@ mod tests {
         assert!(prompt.contains("discover_skills"));
         assert!(prompt.contains("No skill is active yet"));
         assert!(prompt.contains("prefer calling `discover_skills` before giving a freeform response"));
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        path.push(format!("rust_tools_skill_runtime_{name}_{}_{}", std::process::id(), nanos));
+        path
+    }
+
+    #[test]
+    fn project_instruction_prompt_includes_repo_docs_from_cwd_scope() {
+        let root = temp_dir("project_prompt");
+        let nested = root.join("apps/web/src");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("AGENTS.md"), "Use cargo fmt before commit.\n").unwrap();
+        fs::write(root.join("apps/web/claude.md"), "Web app uses pnpm.\n").unwrap();
+
+        let prompt = SUBAGENT_CWD.sync_scope(nested.clone(), build_project_instruction_prompt)
+            .expect("project instruction prompt");
+
+        assert!(prompt.contains("Project-local instructions:"));
+        assert!(prompt.contains("AGENTS.md"));
+        assert!(prompt.contains("Use cargo fmt before commit."));
+        assert!(prompt.contains("claude.md"));
+        assert!(prompt.contains("Web app uses pnpm."));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn tool(name: &str) -> ToolDefinition {

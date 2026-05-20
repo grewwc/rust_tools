@@ -22,6 +22,7 @@
 // =============================================================================
 
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use rust_tools::cw::SkipMap;
@@ -50,6 +51,25 @@ const BUILTIN_AGENTS: &[(&str, &str)] = &[
         include_str!("builtin_agents/prompt-skill.agent"),
     ),
 ];
+const PROJECT_INSTRUCTION_FILENAMES: &[&str] = &[
+    "AGENTS.md",
+    "Agent.md",
+    "agent.md",
+    "CLAUDE.md",
+    "Claude.md",
+    "claude.md",
+];
+const PROJECT_ROOT_MARKERS: &[&str] = &[
+    ".git",
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "pom.xml",
+    "Gemfile",
+];
+const PROJECT_INSTRUCTION_MAX_DOC_CHARS: usize = 8_000;
+const PROJECT_INSTRUCTION_MAX_TOTAL_CHARS: usize = 16_000;
 
 /// Categorizes an agent's role: `Primary` for main conversation,
 /// `Subagent` for delegated tasks, or `All` for both.
@@ -147,6 +167,12 @@ impl AgentManifest {
             .filter(|tag| !tag.is_empty())
             .collect()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ProjectInstructionDoc {
+    pub(super) path: String,
+    pub(super) content: String,
 }
 
 /// Discovery level for an agent, used to determine precedence.
@@ -255,6 +281,104 @@ fn discover_project_dirs() -> Vec<PathBuf> {
     }
 
     dirs
+}
+
+pub(super) fn load_project_instruction_docs() -> Vec<ProjectInstructionDoc> {
+    let Ok(cwd) = crate::ai::driver::runtime_ctx::effective_cwd() else {
+        return Vec::new();
+    };
+    load_project_instruction_docs_from(&cwd)
+}
+
+fn load_project_instruction_docs_from(cwd: &Path) -> Vec<ProjectInstructionDoc> {
+    let mut docs = Vec::new();
+    let mut used = 0usize;
+    let mut seen_paths = std::collections::BTreeSet::new();
+
+    for dir in project_instruction_search_scope(cwd) {
+        for name in PROJECT_INSTRUCTION_FILENAMES {
+            let path = dir.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let canonical_key = canonical.display().to_string();
+            if !seen_paths.insert(canonical_key.clone()) {
+                continue;
+            }
+            let Ok(content) = fs::read_to_string(&path) else {
+                continue;
+            };
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if used >= PROJECT_INSTRUCTION_MAX_TOTAL_CHARS {
+                return docs;
+            }
+            let budget = PROJECT_INSTRUCTION_MAX_TOTAL_CHARS.saturating_sub(used);
+            let limited = truncate_instruction_doc(
+                trimmed,
+                PROJECT_INSTRUCTION_MAX_DOC_CHARS.min(budget),
+            );
+            if limited.is_empty() {
+                continue;
+            }
+            used += limited.chars().count();
+            docs.push(ProjectInstructionDoc {
+                path: canonical_key,
+                content: limited,
+            });
+        }
+    }
+
+    docs
+}
+
+fn project_instruction_search_scope(cwd: &Path) -> Vec<PathBuf> {
+    let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+    let mut ancestors = Vec::new();
+    for dir in cwd.ancestors() {
+        if home_dir.as_deref() == Some(dir) && dir != cwd {
+            break;
+        }
+        ancestors.push(dir.to_path_buf());
+    }
+
+    let boundary = ancestors
+        .iter()
+        .rposition(|dir| has_project_root_marker(dir))
+        .or_else(|| ancestors.iter().rposition(|dir| has_project_instruction_doc(dir)));
+
+    match boundary {
+        Some(idx) => ancestors[..=idx].iter().rev().cloned().collect(),
+        None => vec![cwd.to_path_buf()],
+    }
+}
+
+fn has_project_root_marker(dir: &Path) -> bool {
+    PROJECT_ROOT_MARKERS.iter().any(|name| dir.join(name).exists())
+}
+
+fn has_project_instruction_doc(dir: &Path) -> bool {
+    PROJECT_INSTRUCTION_FILENAMES
+        .iter()
+        .any(|name| dir.join(name).is_file())
+}
+
+fn truncate_instruction_doc(content: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for (idx, ch) in content.chars().enumerate() {
+        if idx >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 /// Filters agents that can serve as primary agents, excluding
@@ -528,7 +652,22 @@ fn load_agents_from_dir(dir: &Path) -> Vec<AgentManifest> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_agent_front_matter, AgentModelTier};
+    use super::{
+        load_project_instruction_docs_from, parse_agent_front_matter, AgentModelTier,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        path.push(format!("rust_tools_agents_{name}_{}_{}", std::process::id(), nanos));
+        path
+    }
 
     #[test]
     fn parses_routing_tags_and_model_tier_from_front_matter() {
@@ -572,5 +711,51 @@ noop
 
         let err = parse_agent_front_matter(content).unwrap_err();
         assert!(err.contains("invalid model_tier"));
+    }
+
+    #[test]
+    fn project_instruction_docs_include_root_and_nested_scope() {
+        let root = temp_dir("project_docs");
+        let nested = root.join("packages/app/src");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            root.join("AGENTS.md"),
+            "# Root rules\nUse pnpm.\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("packages/app/CLAUDE.md"),
+            "# App rules\nRun app tests only.\n",
+        )
+        .unwrap();
+
+        let docs = load_project_instruction_docs_from(&nested);
+        assert_eq!(docs.len(), 2);
+        assert!(docs[0].path.ends_with("AGENTS.md"));
+        assert!(docs[0].content.contains("Use pnpm."));
+        assert!(docs[1].path.ends_with("CLAUDE.md"));
+        assert!(docs[1].content.contains("Run app tests only."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_instruction_docs_fall_back_to_doc_ancestors_without_repo_markers() {
+        let root = temp_dir("project_docs_nomarker");
+        let nested = root.join("services/api/src");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            root.join("claude.md"),
+            "# Project rules\nPrefer make targets.\n",
+        )
+        .unwrap();
+
+        let docs = load_project_instruction_docs_from(&nested);
+        assert_eq!(docs.len(), 1);
+        assert!(docs[0].path.ends_with("claude.md"));
+        assert!(docs[0].content.contains("Prefer make targets."));
+
+        let _ = fs::remove_dir_all(root);
     }
 }
