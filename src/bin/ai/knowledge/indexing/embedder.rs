@@ -101,3 +101,9 @@ pub fn has_provider() -> bool {
     let _ = GLOBAL_PROVIDER.get_or_init(default_provider);
     true
 }
+
+pub fn warm_up() {
+    std::thread::spawn(|| {
+        let _ = embed_text("warm up");
+    });
+}

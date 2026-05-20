@@ -272,6 +272,10 @@ fn ensure_runtime_manifests_loaded(
     *skill_manifests = load_skill_manifests(app.cli.no_skills);
     *agent_manifests = agents::load_all_agents();
 
+    if !skill_manifests.is_empty() {
+        crate::ai::knowledge::indexing::embedder::warm_up();
+    }
+
     if let Some(default_agent) = agents::find_agent_by_name(agent_manifests, &app.current_agent)
         && default_agent.is_primary()
         && !default_agent.disabled

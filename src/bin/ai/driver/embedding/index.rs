@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use dirs::config_dir;
 use rust_tools::commonw::{FastMap, FastSet};
@@ -14,6 +14,16 @@ const QUERY_EMBEDDING_CACHE_LIMIT: usize = 32;
 static QUERY_EMBEDDING_CACHE: LazyLock<Mutex<Vec<(String, Vec<f32>)>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
+struct CachedIndex {
+    skills_hash: String,
+    store: Arc<VectorStore>,
+    section_count: usize,
+    snapshot: Vec<(VectorEntry, SkillEmbeddingDocumentSection, String)>,
+}
+
+static CACHED_INDEX: LazyLock<Mutex<Option<CachedIndex>>> =
+    LazyLock::new(|| Mutex::new(None));
+
 #[derive(Debug, Clone)]
 pub struct SkillEmbeddingHit {
     pub skill_name: String,
@@ -24,38 +34,60 @@ pub struct SkillEmbeddingHit {
 }
 
 pub struct SkillEmbeddingIndex {
-    store: VectorStore,
+    store: Arc<VectorStore>,
     section_count: usize,
+    snapshot: Vec<(VectorEntry, SkillEmbeddingDocumentSection, String)>,
 }
 
 impl SkillEmbeddingIndex {
     pub fn build(documents: &[SkillEmbeddingDocument]) -> Result<Self, String> {
-        let store = VectorStore::with_global_provider(&default_skill_index_path())?;
+        let skills_hash = compute_skills_hash(documents);
+        let section_count = documents.len() * 3;
+
+        if let Ok(cache) = CACHED_INDEX.lock() {
+            if let Some(cached) = cache.as_ref() {
+                if cached.skills_hash == skills_hash {
+                    return Ok(Self {
+                        store: Arc::clone(&cached.store),
+                        section_count: cached.section_count,
+                        snapshot: cached.snapshot.clone(),
+                    });
+                }
+            }
+        }
+
+        let store = Arc::new(VectorStore::with_global_provider(&default_skill_index_path())?);
         sync_documents(&store, documents)?;
+        let snapshot = load_snapshot(&store)?;
+
+        if let Ok(mut cache) = CACHED_INDEX.lock() {
+            *cache = Some(CachedIndex {
+                skills_hash,
+                store: Arc::clone(&store),
+                section_count,
+                snapshot: snapshot.clone(),
+            });
+        }
+
         Ok(Self {
             store,
-            section_count: documents.len() * 3,
+            section_count,
+            snapshot,
         })
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SkillEmbeddingHit>, String> {
         let expanded_query = expand_query_bilingual(query);
         let query_embedding = cached_embed(&self.store, &expanded_query)?;
-        let raw_hits = self.store.semantic_search(
-            &query_embedding,
-            self.section_count.max(limit * 3),
-            Some(SKILL_ROUTING_CATEGORY),
-        )?;
+
         let mut by_skill: FastMap<String, SkillEmbeddingHit> = FastMap::default();
-        for (entry, score) in raw_hits {
-            let Some((skill_name, section)) = parse_skill_entry(&entry) else {
-                continue;
-            };
-            let score = score as f64;
+        for (entry, section, skill_name) in &self.snapshot {
+            let sim = cosine_similarity_f32(&query_embedding, &entry.embedding);
+            let score = sim as f64;
             let item = by_skill
                 .entry(skill_name.clone())
                 .or_insert_with(|| SkillEmbeddingHit {
-                    skill_name,
+                    skill_name: skill_name.clone(),
                     score: 0.0,
                     identity_score: 0.0,
                     capability_score: 0.0,
@@ -86,11 +118,64 @@ impl SkillEmbeddingIndex {
     }
 }
 
+fn compute_skills_hash(documents: &[SkillEmbeddingDocument]) -> String {
+    let mut combined = String::new();
+    for doc in documents {
+        combined.push_str(&doc.source_hash);
+        combined.push('\n');
+    }
+    combined
+}
+
+fn load_snapshot(
+    store: &VectorStore,
+) -> Result<Vec<(VectorEntry, SkillEmbeddingDocumentSection, String)>, String> {
+    let mut snapshot = Vec::new();
+    for id in store.list_ids()? {
+        if !id.starts_with("skill-routing:") {
+            continue;
+        }
+        let Some(entry) = store.get(&id)? else {
+            continue;
+        };
+        if entry.embedding.is_empty() {
+            continue;
+        }
+        let Some((skill_name, section)) = parse_skill_entry(&entry) else {
+            continue;
+        };
+        snapshot.push((entry, section, skill_name));
+    }
+    Ok(snapshot)
+}
+
+fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0f32;
+    let mut norm_a = 0.0f32;
+    let mut norm_b = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom < f32::EPSILON {
+        0.0
+    } else {
+        dot / denom
+    }
+}
+
 fn sync_documents(
     store: &VectorStore,
     documents: &[SkillEmbeddingDocument],
 ) -> Result<(), String> {
     let mut desired_ids: FastSet<String> = FastSet::default();
+    let mut texts_to_embed: Vec<(String, VectorEntry)> = Vec::new();
+
     for doc in documents {
         for (section, text) in doc.sections() {
             let id = skill_section_id(doc, section);
@@ -101,9 +186,16 @@ fn sync_documents(
                 .map(|existing| !entry_matches_document(&existing, doc))
                 .unwrap_or(true);
             if needs_upsert {
-                let embedding = store.embed_text(&entry.content)?;
-                store.upsert(VectorEntry { embedding, ..entry })?;
+                texts_to_embed.push((entry.content.clone(), entry));
             }
+        }
+    }
+
+    if !texts_to_embed.is_empty() {
+        let texts: Vec<String> = texts_to_embed.iter().map(|(t, _)| t.clone()).collect();
+        let embeddings = store.embed_texts(&texts)?;
+        for ((_, entry), embedding) in texts_to_embed.into_iter().zip(embeddings.into_iter()) {
+            store.upsert(VectorEntry { embedding, ..entry })?;
         }
     }
 
