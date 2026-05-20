@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::{LazyLock, Mutex};
 
 use dirs::config_dir;
 use rust_tools::commonw::{FastMap, FastSet};
@@ -8,6 +9,10 @@ use crate::ai::knowledge::storage::vector_store::{VectorEntry, VectorStore};
 use super::document::{SkillEmbeddingDocument, SkillEmbeddingDocumentSection};
 
 const SKILL_ROUTING_CATEGORY: &str = "skill-routing";
+const QUERY_EMBEDDING_CACHE_LIMIT: usize = 32;
+
+static QUERY_EMBEDDING_CACHE: LazyLock<Mutex<Vec<(String, Vec<f32>)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
 
 #[derive(Debug, Clone)]
 pub struct SkillEmbeddingHit {
@@ -34,7 +39,8 @@ impl SkillEmbeddingIndex {
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SkillEmbeddingHit>, String> {
-        let query_embedding = self.store.embed_text(query)?;
+        let expanded_query = expand_query_bilingual(query);
+        let query_embedding = cached_embed(&self.store, &expanded_query)?;
         let raw_hits = self.store.semantic_search(
             &query_embedding,
             self.section_count.max(limit * 3),
@@ -68,8 +74,8 @@ impl SkillEmbeddingIndex {
             }
             item.score = item
                 .identity_score
-                .max(item.capability_score * 0.9)
-                .max(item.behavior_score * 0.75);
+                .max(item.capability_score * 0.3)
+                .max(item.behavior_score);
         }
         let mut hits = by_skill.into_values().collect::<Vec<_>>();
         hits.sort_by(|left, right| right.score.total_cmp(&left.score));
@@ -181,4 +187,72 @@ fn section_name(section: SkillEmbeddingDocumentSection) -> &'static str {
         SkillEmbeddingDocumentSection::Capability => "capability",
         SkillEmbeddingDocumentSection::Behavior => "behavior",
     }
+}
+
+fn cached_embed(store: &VectorStore, text: &str) -> Result<Vec<f32>, String> {
+    if let Ok(cache) = QUERY_EMBEDDING_CACHE.lock() {
+        if let Some((_key, embedding)) = cache.iter().find(|(k, _)| k == text) {
+            return Ok(embedding.clone());
+        }
+    }
+
+    let embedding = store.embed_text(text)?;
+
+    if let Ok(mut cache) = QUERY_EMBEDDING_CACHE.lock() {
+        if cache.len() >= QUERY_EMBEDDING_CACHE_LIMIT {
+            cache.remove(0);
+        }
+        cache.push((text.to_string(), embedding.clone()));
+    }
+
+    Ok(embedding)
+}
+
+fn expand_query_bilingual(query: &str) -> String {
+    static BILINGUAL_MAP: &[(&str, &str)] = &[
+        ("review", "代码审查 code review"),
+        ("审查", "review code review"),
+        ("代码审查", "review code review"),
+        ("调试", "debug debugging"),
+        ("debug", "调试 debugging"),
+        ("重构", "refactor restructure"),
+        ("refactor", "重构 restructure"),
+        ("修复", "fix repair bug"),
+        ("fix", "修复 repair bug"),
+        ("报错", "error compile error runtime error"),
+        ("error", "报错 错误"),
+        ("panic", "崩溃 crash panic"),
+        ("崩溃", "crash panic"),
+        ("crash", "崩溃 panic"),
+        ("测试", "test unit test"),
+        ("test", "测试 unit test"),
+        ("性能", "performance optimization"),
+        ("performance", "性能 优化"),
+        ("优化", "optimize performance improvement"),
+        ("安全", "security vulnerability"),
+        ("security", "安全 漏洞"),
+        ("部署", "deploy deployment CI/CD"),
+        ("deploy", "部署 deployment"),
+        ("文档", "documentation docs"),
+        ("documentation", "文档"),
+        ("生成", "generate create"),
+        ("generate", "生成 创建"),
+        ("分析", "analyze analysis"),
+        ("analyze", "分析"),
+    ];
+
+    let lower = query.to_lowercase();
+    let mut expansions: Vec<&str> = Vec::new();
+
+    for (keyword, expansion) in BILINGUAL_MAP {
+        if lower.contains(keyword) {
+            expansions.push(expansion);
+        }
+    }
+
+    if expansions.is_empty() {
+        return query.to_string();
+    }
+
+    format!("{} {}", query, expansions.join(" "))
 }

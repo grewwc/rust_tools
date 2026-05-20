@@ -83,10 +83,10 @@ fn build_capability_text(skill: &SkillManifest) -> String {
 fn build_behavior_text(skill: &SkillManifest) -> String {
     let mut lines = Vec::new();
     if let Some(system_prompt) = &skill.system_prompt {
-        lines.push(summarize_text(system_prompt, 12, 800));
+        lines.push(summarize_text(system_prompt, 20, 1500));
     }
     if !skill.prompt.trim().is_empty() {
-        lines.push(summarize_text(&skill.prompt, 18, 1400));
+        lines.push(summarize_text(&skill.prompt, 40, 3000));
     }
     normalize_section(lines)
 }

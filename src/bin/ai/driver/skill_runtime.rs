@@ -100,12 +100,12 @@ impl SystemPromptBuilder {
 
 const TOOL_SCORE_CACHE_TTL: Duration = Duration::from_secs(20);
 const DEFAULT_TURN_TOOL_GROUPS: &[&str] = &["core"];
-const CURRENT_SKILL_STICKY_BONUS: f64 = 1.25;
-const CURRENT_SKILL_KEEP_FLOOR_DELTA: f64 = 0.75;
-const SKILL_SWITCH_MARGIN: f64 = 1.5;
-const CROSS_TURN_SKILL_STICKY_BONUS: f64 = 0.35;
-const CROSS_TURN_SKILL_KEEP_FLOOR_DELTA: f64 = 0.25;
-const CROSS_TURN_SKILL_SWITCH_MARGIN: f64 = 0.6;
+const CURRENT_SKILL_STICKY_BONUS: f64 = 0.7;
+const CURRENT_SKILL_KEEP_FLOOR_DELTA: f64 = 0.4;
+const SKILL_SWITCH_MARGIN: f64 = 0.8;
+const CROSS_TURN_SKILL_STICKY_BONUS: f64 = 0.2;
+const CROSS_TURN_SKILL_KEEP_FLOOR_DELTA: f64 = 0.15;
+const CROSS_TURN_SKILL_SWITCH_MARGIN: f64 = 0.35;
 
 static TOOL_SCORE_CACHE: LazyLock<Mutex<Option<(Instant, Arc<Box<ToolScoreMap>>)>>> =
     LazyLock::new(|| Mutex::new(None));
@@ -706,17 +706,17 @@ fn should_skip_recall_for_skill(skill: Option<&SkillManifest>) -> bool {
 
 fn skill_selection_threshold(intent: &UserIntent, skill_count: usize) -> f64 {
     let base: f64 = if skill_count > 10 {
-        5.0
+        3.0
     } else if skill_count > 5 {
-        4.5
+        2.5
     } else {
-        4.0
+        2.0
     };
     match intent.core {
-        intent_recognition::CoreIntent::RequestAction => base.max(4.5),
-        intent_recognition::CoreIntent::SeekSolution => base.max(4.25),
-        intent_recognition::CoreIntent::QueryConcept => base.max(5.5),
-        intent_recognition::CoreIntent::Casual => base.max(5.5),
+        intent_recognition::CoreIntent::RequestAction => base.max(2.5),
+        intent_recognition::CoreIntent::SeekSolution => base.max(2.25),
+        intent_recognition::CoreIntent::QueryConcept => base.max(3.5),
+        intent_recognition::CoreIntent::Casual => base.max(3.5),
     }
 }
 
@@ -851,7 +851,11 @@ fn select_skill_with_preference_strength<'a>(
         let effective_current = current.score + sticky_bonus;
         let best_clearly_wins = best.score >= effective_current + switch_margin;
         let best_has_positive_signal = is_positive_skill_winner(best);
-        if best_clearly_wins && best_has_positive_signal {
+        let allow_switch = match strength {
+            PreferenceStrength::StrongSticky => best_clearly_wins && best_has_positive_signal,
+            PreferenceStrength::CrossTurnBias => best_clearly_wins,
+        };
+        if allow_switch {
             return Some(best.skill);
         }
         if keep_below_threshold && best.score < threshold {
@@ -878,19 +882,17 @@ fn select_skill_with_preference_strength<'a>(
 fn has_skill_signal(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
     item.embedding_score >= 0.08
         || item.fallback_semantic_score >= 0.08
-        || item.model_prior_score >= 0.08
         || item.blended_score >= 0.08
 }
 
 fn is_positive_skill_winner(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
-    item.embedding_score >= 0.35
-        || item.fallback_semantic_score >= 0.18
-        || (item.model_prior_score >= 0.45 && item.model_prior_score > item.none_score)
-        || item.blended_score >= 0.35
+    item.embedding_score >= 0.30
+        || item.fallback_semantic_score >= 0.15
+        || item.blended_score >= 0.30
 }
 
 fn should_abstain_from_skill(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
-    item.none_score >= item.blended_score && item.none_score >= 0.5
+    item.blended_score < 0.15
 }
 
 #[crate::ai::agent_hang_span(
@@ -1203,6 +1205,7 @@ mod tests {
             prompt: String::new(),
             system_prompt: None,
             priority: 0,
+            excludes: Vec::new(),
             source_path: Some(format!("builtin:{name}.skill")),
         }
     }
@@ -1402,9 +1405,17 @@ mod tests {
     #[test]
     fn local_selector_switches_when_new_skill_is_significantly_better() {
         let intent = UserIntent::new(CoreIntent::RequestAction);
+        let mut debugger = skill("debugger", "Debug panic crash stack trace runtime failure logs");
+        debugger.triggers = vec![
+            "panic".to_string(),
+            "crash".to_string(),
+            "stack trace".to_string(),
+            "调试".to_string(),
+            "debug".to_string(),
+        ];
         let skills = vec![
             skill("code-review", "Review code changes and summarize defects"),
-            skill("debugger", "Debug panic crash stack trace runtime failure logs"),
+            debugger,
         ];
         let selected = select_skill_with_preference(
             &skills,

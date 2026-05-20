@@ -20,6 +20,8 @@ pub(crate) mod service;
 mod skill_tools;
 pub(crate) mod storage;
 pub(crate) mod task_tools;
+mod text_grep_tools;
+mod tree_tools;
 mod undo_tools;
 mod web_tools;
 

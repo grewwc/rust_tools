@@ -102,13 +102,18 @@ pub fn rank_skills_locally_with_model_path<'a>(
                 .unwrap_or((0.0, 0.0, 0.0, 0.0));
         let blended_score = embedding_score
             .max(fallback_semantic_score)
-            .max(model_prior_score);
+            + fallback_semantic_score * 0.3;
         let none_score = match &model_probs {
             Some(result) => probability_for_label(result, SKILL_NONE_LABEL),
             None => 0.0,
         };
+        let excluded = is_excluded_by_skill(skill, &input_lower);
         let priority_bonus = (skill.priority.max(0) as f64).min(100.0) / 100.0;
-        let score = blended_score * LOCAL_MODEL_SCORE_SCALE + priority_bonus;
+        let score = if excluded {
+            0.0
+        } else {
+            blended_score * LOCAL_MODEL_SCORE_SCALE + priority_bonus
+        };
         ranked.push(ScoredSkill {
             skill,
             score,
@@ -160,8 +165,9 @@ fn build_embedding_hits(
 fn skill_embedding_routing_enabled() -> bool {
     configw::get_all_config()
         .get_opt("ai.skills.embedding_routing")
-        .map(|value| value.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+        .map(|value| value.trim().eq_ignore_ascii_case("false"))
+        .map(|is_false| !is_false)
+        .unwrap_or(true)
 }
 
 struct RuntimeSkillModel {
@@ -272,6 +278,16 @@ fn probability_for_label(result: &skill_match_model::SkillMatchResult, label: &s
         .unwrap_or(0.0)
 }
 
+fn is_excluded_by_skill(skill: &SkillManifest, input_lower: &str) -> bool {
+    if skill.excludes.is_empty() {
+        return false;
+    }
+    skill.excludes.iter().any(|pattern| {
+        let pattern_lower = pattern.to_lowercase();
+        input_lower.contains(&pattern_lower)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +309,7 @@ mod tests {
             prompt: String::new(),
             system_prompt: None,
             priority: 0,
+            excludes: Vec::new(),
             source_path: Some(format!("custom:{name}.skill")),
         }
     }

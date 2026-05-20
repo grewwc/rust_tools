@@ -1,8 +1,8 @@
 ---
 name: debugger
-description: 代码调试专家：ONLY for debugging SOURCE CODE issues (compile errors, runtime bugs, test failures, panic, exceptions). 如果用户询问的不是代码问题（如数据分析、业务问题、新闻体育等），切勿选择此技能。
+description: Debug source code issues including compile errors, runtime bugs, test failures, panics, crashes, and exceptions. Locate root cause, apply minimal fix, and verify the solution.
 author: system
-version: 2.1
+version: 3.0
 tools:
   - read_file
   - write_file

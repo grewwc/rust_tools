@@ -1,8 +1,8 @@
 ---
 name: refactor
-description: 代码重构专家：ONLY for refactoring SOURCE CODE (improve structure, naming, readability, testability without changing behavior). 如果用户询问的不是代码（如数据整理、文档优化、新闻体育等），切勿选择此技能。不适用于修复报错、调试、处理异常等情况。
+description: Refactor source code to improve structure, naming, readability, and testability without changing external behavior. Extract functions, reduce duplication, simplify control flow, and enforce consistent patterns.
 author: system
-version: 3.0
+version: 4.0
 tools:
   - read_file
   - write_file

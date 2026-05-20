@@ -1,8 +1,8 @@
 ---
 name: code-review
-description: 代码审查专家：仅针对源代码文件进行质量、安全、性能与可维护性评估。 ONLY for reviewing SOURCE CODE files (e.g., .rs, .py, .js, .java, etc.). 如果用户询问的不是代码（如新闻、体育、数据、文档等），切勿选择此技能。
+description: Review source code for quality, security, performance, and maintainability. Identify bugs, anti-patterns, and provide actionable improvement suggestions with severity ratings.
 author: system
-version: 2.0
+version: 3.0
 tools:
   - read_file
   - read_file_lines

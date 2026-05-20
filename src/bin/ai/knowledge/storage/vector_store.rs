@@ -49,7 +49,7 @@ impl LazyEmbedder {
             .map_err(|e| format!("Lock poisoned: {}", e))?;
         if guard.is_none() {
             let embedder = fastembed::TextEmbedding::try_new(
-                fastembed::InitOptions::default()
+                fastembed::InitOptions::new(fastembed::EmbeddingModel::MultilingualE5Small)
                     .with_cache_dir(self.cache_dir.clone())
                     .with_show_download_progress(true),
             )

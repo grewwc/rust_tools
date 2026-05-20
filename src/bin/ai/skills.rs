@@ -77,6 +77,8 @@ pub(super) struct SkillManifest {
     /// 优先级：仅在多个技能匹配度相近时使用
     #[serde(default)]
     pub(super) priority: i32,
+    #[serde(default)]
+    pub(super) excludes: Vec<String>,
     #[serde(skip)]
     pub(super) source_path: Option<String>,
 }
@@ -214,6 +216,7 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
     let mut tools: Vec<String> = Vec::new();
     let mut tool_groups: Vec<String> = Vec::new();
     let mut mcp_servers: Vec<String> = Vec::new();
+    let mut excludes: Vec<String> = Vec::new();
     let mut skip_recall = false;
     let mut disable_builtin_tools = false;
     let mut disable_mcp_tools = false;
@@ -250,6 +253,7 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
                     "triggers" => triggers.push(v),
                     "tool_groups" => tool_groups.push(v),
                     "mcp_servers" => mcp_servers.push(v),
+                    "excludes" => excludes.push(v),
                     _ => {}
                 }
                 continue;
@@ -289,6 +293,7 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
                 "tools" => tools = parse_list_value(unquoted),
                 "tool_groups" => tool_groups = parse_list_value(unquoted),
                 "mcp_servers" => mcp_servers = parse_list_value(unquoted),
+                "excludes" => excludes = parse_list_value(unquoted),
                 _ => {}
             }
         } else {
@@ -320,6 +325,7 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
         prompt: body.trim().to_string(),
         system_prompt: system_prompt.filter(|s| !s.trim().is_empty()),
         priority,
+        excludes,
         source_path: None,
     })
 }

@@ -7,11 +7,11 @@ use super::rank_skills_locally;
 mod thresholds {
     pub fn skill_count_threshold(skill_count: usize) -> f64 {
         if skill_count > 10 {
-            5.0
+            3.0
         } else if skill_count > 5 {
-            4.0
+            2.5
         } else {
-            3.5
+            2.0
         }
     }
 }
@@ -40,13 +40,13 @@ pub fn match_skill<'a>(
     // 提高阈值防止通用词导致误匹配
     let threshold = if let Some(intent_ref) = intent {
         match intent_ref.core {
-            CoreIntent::RequestAction => base_threshold.max(5.0),
-            CoreIntent::SeekSolution => base_threshold.max(4.5),
-            CoreIntent::QueryConcept => base_threshold.max(6.0),
-            CoreIntent::Casual => base_threshold.max(6.0),
+            CoreIntent::RequestAction => base_threshold.max(2.5),
+            CoreIntent::SeekSolution => base_threshold.max(2.25),
+            CoreIntent::QueryConcept => base_threshold.max(3.5),
+            CoreIntent::Casual => base_threshold.max(3.5),
         }
     } else {
-        base_threshold.max(5.0)
+        base_threshold.max(2.5)
     };
 
     if best_score >= threshold {
