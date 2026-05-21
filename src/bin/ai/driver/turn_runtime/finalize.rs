@@ -139,6 +139,11 @@ pub(super) async fn finalize_turn(
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
     if !final_assistant_text.trim().is_empty() {
+        // Publish to the optional sub-agent result slot before doing the
+        // (potentially long) post-turn work below, so a parent that is
+        // waiting on us can race ahead even if reflection / writeback take
+        // a while.
+        crate::ai::driver::runtime_ctx::publish_subagent_result(final_assistant_text);
         ensure_final_assistant_recorded(
             final_assistant_text,
             final_assistant_recorded,

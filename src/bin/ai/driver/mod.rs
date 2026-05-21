@@ -758,6 +758,15 @@ async fn run_loop(
                     .unwrap_or_else(|| format!("pid-{pid}"));
                 let parent_history_for_scopes = original_history_file.clone();
 
+                // Slot used by the sub-agent's `finalize_turn` to publish
+                // its final assistant text. Cloned into the result-channel
+                // payload below so `task_wait` can surface what the
+                // sub-agent actually produced (instead of just "completed
+                // with empty output").
+                let result_slot_for_payload: runtime_ctx::SubagentResultSlot =
+                    std::sync::Arc::new(std::sync::Mutex::new(None));
+                let result_slot_for_scope = result_slot_for_payload.clone();
+
                 let inner_fut = TASK_PID.scope(Some(pid), async move {
                     crate::ai::tools::registry::common::clear_tool_cancel();
                     let result = turn_runtime::run_turn(
@@ -777,9 +786,14 @@ async fn run_loop(
                     let mut os = task_os.lock().unwrap();
                     os.set_current_pid(Some(pid));
                     if let Some(result_channel_id) = result_channel_id {
+                        let captured_output = result_slot_for_payload
+                            .lock()
+                            .ok()
+                            .and_then(|guard| guard.clone())
+                            .unwrap_or_default();
                         let payload = serde_json::json!({
                             "status": if result.is_ok() { "completed" } else { "failed" },
-                            "output": "",
+                            "output": captured_output,
                             "error": result.as_ref().err().cloned(),
                         })
                         .to_string();
@@ -849,6 +863,10 @@ async fn run_loop(
                     Box<dyn std::future::Future<Output = ()> + Send>,
                 >;
                 let mut wrapped: BoxedTaskFuture = Box::pin(inner_fut);
+                wrapped = Box::pin(
+                    runtime_ctx::SUBAGENT_RESULT_SLOT
+                        .scope(result_slot_for_scope, wrapped),
+                );
                 if !inherit.memory {
                     let mem_path = runtime_ctx::make_subagent_memory_path(
                         &parent_history_for_scopes,

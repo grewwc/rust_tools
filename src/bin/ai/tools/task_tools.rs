@@ -29,6 +29,12 @@ const MAX_TASK_REGISTRY_SIZE: usize = 100;
 const DEFAULT_TASK_PRIORITY: u8 = 20;
 const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
+/// Default seconds to wait for all tasks in `task_wait`. Matches the
+/// schema documentation. Used when the model does not pass `timeout_secs`.
+const DEFAULT_TASK_WAIT_TIMEOUT_SECS: u64 = 120;
+/// Hard upper bound on `timeout_secs` to keep a runaway sub-agent from
+/// wedging the parent indefinitely.
+const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 3600;
 
 /// Granular control over which slices of the parent agent's execution
 /// context are inherited by a spawned sub-agent. All flags default to true
@@ -839,6 +845,20 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         return Err("task_ids array cannot be empty".to_string());
     }
 
+    // Default 120s matches the schema documentation. Hard upper bound of
+    // 3600s prevents the model from accidentally hanging the wait
+    // indefinitely.
+    let timeout_secs = args
+        .get("timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_TASK_WAIT_TIMEOUT_SECS)
+        .clamp(1, MAX_TASK_WAIT_TIMEOUT_SECS);
+    // Heuristic: the driver loop calls advance_tick() roughly every 10ms
+    // (idle path uses `tokio::time::sleep(Duration::from_millis(10))`),
+    // so ~100 ticks ≈ 1s. We err on the side of waking up sooner rather
+    // than later by using 100 ticks/sec.
+    let timeout_ticks = Some(timeout_secs.saturating_mul(100));
+
     let mut registry = TASK_REGISTRY.lock().unwrap();
     for tid in &task_ids {
         if !registry.contains_key(tid) {
@@ -848,9 +868,33 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
 
     let mut ready = Vec::new();
     let mut pending = Vec::new();
+    let mut timed_out = Vec::new();
     let wait_message = with_os_kernel(|os| {
         for tid in &task_ids {
             let entry = registry.get(tid).expect("validated");
+            // Honour a hard wallclock timeout per task. Sub-agent wedged
+            // for >timeout_secs is reported as a timeout to the parent
+            // agent so it can decide to retry / cancel instead of waiting
+            // forever.
+            if entry.started_at.elapsed().as_secs() >= timeout_secs {
+                timed_out.push(tid.clone());
+                let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
+                let _ = os.channel_release_named(
+                    ChannelId(entry.result_channel_id),
+                    "task_result.consumer",
+                );
+                let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
+                let _ = os.futex_destroy(entry.completion_futex_addr);
+                ready.push(format!(
+                    "[Task: {} via {} @ {}] TIMEOUT after {}s (process pid={} still running; consider cancelling explicitly).",
+                    entry.description,
+                    entry.agent_name,
+                    entry.model,
+                    timeout_secs,
+                    entry.pid,
+                ));
+                continue;
+            }
             if let Some(result) = read_task_result(os, entry.result_channel_id, true)? {
                 ready.push(format_task_result(&entry, result));
                 let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
@@ -863,8 +907,18 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             } else if is_task_pending(os, entry.pid)? {
                 pending.push((tid.clone(), entry.pid));
             } else {
+                // Process is no longer pending and never wrote a result.
+                // Treat as failed-without-output and free the kernel
+                // resources so we do not leak channels/futexes.
+                let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
+                let _ = os.channel_release_named(
+                    ChannelId(entry.result_channel_id),
+                    "task_result.consumer",
+                );
+                let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
+                let _ = os.futex_destroy(entry.completion_futex_addr);
                 ready.push(format!(
-                    "[Task: {} via {} @ {}] result not available yet; process pid={} has not published output.",
+                    "[Task: {} via {} @ {}] FAILED: process pid={} terminated without publishing any output.",
                     entry.description, entry.agent_name, entry.model, entry.pid
                 ));
             }
@@ -878,18 +932,30 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 &format!("task_wait:{}", pending_ids.join(",")),
                 &wait_sources,
                 WaitPolicy::All,
-                None,
+                timeout_ticks,
             )?;
             if wait.suspended {
-                return Ok(Some(format!(
-                    "Waiting on {} pending task(s) via epoll_wait_many. Suspended current process until all remaining result channels become ready; event_ids={}. Call task_wait again after resume to collect results.",
+                // The current process has been suspended waiting on the
+                // remaining channels. Surface what we already collected
+                // (instead of throwing it away), and let the model resume
+                // task_wait after wake-up to drain the rest. The parent's
+                // timeout_secs is enforced at the next call via
+                // entry.started_at above.
+                let mut parts = Vec::new();
+                if !ready.is_empty() {
+                    parts.push(ready.join("\n\n---\n\n"));
+                }
+                parts.push(format!(
+                    "Waiting on {} pending task(s) via epoll_wait_many. Suspended current process until all remaining result channels become ready or timeout fires (timeout_secs={}); event_ids={}. Call task_wait again after resume to collect remaining results.",
                     pending_ids.len(),
+                    timeout_secs,
                     wait.event_ids
                         .iter()
                         .map(|id| id.to_string())
                         .collect::<Vec<_>>()
                         .join(", ")
-                )));
+                ));
+                return Ok(Some(parts.join("\n\n---\n\n")));
             }
             pending.clear();
             for tid in &pending_ids {
@@ -906,8 +972,15 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 } else if is_task_pending(os, entry.pid)? {
                     pending.push((tid.clone(), entry.pid));
                 } else {
+                    let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
+                    let _ = os.channel_release_named(
+                        ChannelId(entry.result_channel_id),
+                        "task_result.consumer",
+                    );
+                    let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
+                    let _ = os.futex_destroy(entry.completion_futex_addr);
                     ready.push(format!(
-                        "[Task: {} via {} @ {}] result not available yet; process pid={} has not published output.",
+                        "[Task: {} via {} @ {}] FAILED: process pid={} terminated without publishing any output.",
                         entry.description, entry.agent_name, entry.model, entry.pid
                     ));
                 }
@@ -919,15 +992,22 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         return Ok(message);
     }
     if !pending.is_empty() {
-        return Ok(format!(
+        // Surface partial progress instead of dropping it on the floor.
+        let mut parts = Vec::new();
+        if !ready.is_empty() {
+            parts.push(ready.join("\n\n---\n\n"));
+        }
+        parts.push(format!(
             "Waiting on {} pending task(s) via epoll_wait_many. Call task_wait again after progress is reported.",
             pending.len()
         ));
+        return Ok(parts.join("\n\n---\n\n"));
     }
 
     for tid in &task_ids {
         registry.remove(tid);
     }
+    let _ = timed_out;
     Ok(ready.join("\n\n---\n\n"))
 }
 

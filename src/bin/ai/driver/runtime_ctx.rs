@@ -28,7 +28,7 @@
 // =============================================================================
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::ai::{
     agents::AgentManifest,
@@ -36,6 +36,14 @@ use crate::ai::{
     skills::SkillManifest,
     types::App,
 };
+
+/// Slot used by a sub-agent's `finalize_turn` to publish its final
+/// assistant text back to the caller. The parent task installs a fresh
+/// `Mutex<Option<String>>` via `SUBAGENT_RESULT_SLOT.scope(...)` before
+/// invoking `run_turn`, then reads the slot once `run_turn` returns. This
+/// lets `task` / `task_spawn` actually surface the sub-agent's answer
+/// instead of just an "OK / FAILED" status line.
+pub(crate) type SubagentResultSlot = Arc<Mutex<Option<String>>>;
 
 /// Snapshot of the live runtime that a sub-agent dispatch needs.
 ///
@@ -80,6 +88,24 @@ tokio::task_local! {
     /// instead of `std::env::current_dir()`. Used by `inherit.cwd ==
     /// false` to scope the sub-agent to a per-task scratch workspace.
     pub(crate) static SUBAGENT_CWD: PathBuf;
+    /// When set, the sub-agent's `finalize_turn` publishes its final
+    /// assistant text into this slot so the spawning tool can return it
+    /// to the parent agent. Absence means "no parent is interested".
+    pub(crate) static SUBAGENT_RESULT_SLOT: SubagentResultSlot;
+}
+
+/// Publish the sub-agent's final assistant text into the active result
+/// slot if one was installed by the spawning tool. Silent no-op when no
+/// slot is set (e.g. top-level foreground turn).
+pub(crate) fn publish_subagent_result(text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    let _ = SUBAGENT_RESULT_SLOT.try_with(|slot| {
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(text.to_string());
+        }
+    });
 }
 
 /// Try to read the current `DRIVER_CTX`. Returns `None` when called from a

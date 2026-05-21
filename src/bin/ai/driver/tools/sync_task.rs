@@ -25,7 +25,8 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -37,6 +38,15 @@ use crate::ai::{
 };
 
 use super::super::runtime_ctx::DriverContext;
+
+/// Hard upper bound on how long a synchronous `task` tool call may block
+/// the parent agent. Keeps a runaway sub-agent from wedging the foreground
+/// turn forever. 10 minutes is generous for a single subagent invocation
+/// while still being shorter than typical interactive patience.
+const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(600);
+/// How often the parent thread checks for cancellation/shutdown while
+/// blocking on the sub-agent. Short enough to feel responsive to ctrl-c.
+const SYNC_TASK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(super) fn execute_sync_task(
     tool_call_id: &str,
@@ -109,6 +119,19 @@ pub(super) fn execute_sync_task(
         task_agent_manifests_for_spawn.clone(),
     );
 
+    // Capture the parent's shutdown / cancel flags so the wait loop below
+    // can react to ctrl-c instead of pinning a tokio worker thread for the
+    // entire sub-agent run.
+    let parent_shutdown = ctx.app_proto.shutdown.clone();
+    let parent_cancel = ctx.app_proto.cancel_stream.clone();
+
+    // Slot used by the sub-agent's `finalize_turn` to publish its final
+    // assistant text. Created here, scoped via `SUBAGENT_RESULT_SLOT` over
+    // the spawned future, and read once the sub-agent returns.
+    let result_slot: runtime_ctx::SubagentResultSlot =
+        Arc::new(Mutex::new(None));
+    let result_slot_for_scope = result_slot.clone();
+
     let inherit = prepared.inherit;
 
     let inner_fut = async move {
@@ -135,6 +158,12 @@ pub(super) fn execute_sync_task(
     type BoxedSubagentFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
     let mut wrapped: BoxedSubagentFuture = Box::pin(inner_fut);
 
+    // Always install the result slot scope so `finalize_turn` can publish
+    // the answer back to us regardless of inherit settings.
+    wrapped = Box::pin(
+        runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped),
+    );
+
     if !inherit.memory {
         let mem_path =
             runtime_ctx::make_subagent_memory_path(&parent_history_path, &task_id);
@@ -153,43 +182,122 @@ pub(super) fn execute_sync_task(
 
     tokio::spawn(runtime_ctx::DRIVER_CTX.scope(spawn_driver_ctx, wrapped));
 
+    // Wait for the sub-agent in a loop that also honours shutdown,
+    // cancel_stream and a hard timeout. Using `tokio::select!` here would
+    // require an Unpin-able rx, but more importantly we want the same
+    // behaviour whether the runtime context is multi-thread or current-
+    // thread, so we drive the wait with `block_in_place` + `block_on`.
     let join_result: Result<Result<(), String>, String> =
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
-                rx.await
-                    .map_err(|e| format!("subagent task channel closed before result: {e}"))
+                let mut rx = rx;
+                loop {
+                    if parent_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err("subagent task aborted: parent shutdown requested".to_string());
+                    }
+                    if parent_cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                        return Err("subagent task aborted: stream cancel requested".to_string());
+                    }
+                    if started.elapsed() >= SYNC_TASK_HARD_TIMEOUT {
+                        return Err(format!(
+                            "subagent task exceeded hard timeout of {}s",
+                            SYNC_TASK_HARD_TIMEOUT.as_secs()
+                        ));
+                    }
+                    match tokio::time::timeout(SYNC_TASK_POLL_INTERVAL, &mut rx).await {
+                        Ok(Ok(inner)) => return Ok(inner),
+                        Ok(Err(e)) => {
+                            return Err(format!(
+                                "subagent task channel closed before result: {e}"
+                            ));
+                        }
+                        Err(_) => continue,
+                    }
+                }
             })
         });
 
     let duration = started.elapsed();
     let elapsed_secs = duration.as_secs_f64();
 
+    let captured_output = result_slot
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone())
+        .unwrap_or_default();
+
     match join_result {
         Ok(Ok(())) => Ok(ToolResult {
             tool_call_id: tool_call_id.to_string(),
-            content: format!(
-                "[Task: {} via {} @ {}] COMPLETED after {:.1}s\n{}",
-                log_description,
-                log_agent_name,
-                log_model,
+            content: format_subagent_output(
+                "COMPLETED",
+                &log_description,
+                &log_agent_name,
+                &log_model,
                 elapsed_secs,
-                log_selection_explanation,
+                &log_selection_explanation,
+                &captured_output,
+                None,
             ),
         }),
-        Ok(Err(err)) => Err(format!(
-            "[Task: {} via {} @ {}] FAILED after {:.1}s\n{}\n{}",
-            log_description,
-            log_agent_name,
-            log_model,
+        Ok(Err(err)) => Err(format_subagent_output(
+            "FAILED",
+            &log_description,
+            &log_agent_name,
+            &log_model,
             elapsed_secs,
-            log_selection_explanation,
-            err,
+            &log_selection_explanation,
+            &captured_output,
+            Some(&err),
         )),
-        Err(err) => Err(format!(
-            "[Task: {} via {} @ {}] internal failure after {:.1}s: {}",
-            log_description, log_agent_name, log_model, elapsed_secs, err,
+        Err(err) => Err(format_subagent_output(
+            "INTERNAL_ERROR",
+            &log_description,
+            &log_agent_name,
+            &log_model,
+            elapsed_secs,
+            &log_selection_explanation,
+            &captured_output,
+            Some(&err),
         )),
     }
+}
+
+/// Build the textual representation returned to the parent agent. Always
+/// includes the captured sub-agent output when available, so the parent
+/// actually sees what the sub-agent produced instead of just a status
+/// header.
+fn format_subagent_output(
+    status: &str,
+    description: &str,
+    agent: &str,
+    model: &str,
+    elapsed_secs: f64,
+    selection_explanation: &str,
+    captured_output: &str,
+    error: Option<&str>,
+) -> String {
+    let mut parts = vec![format!(
+        "[Task: {} via {} @ {}] {} after {:.1}s",
+        description, agent, model, status, elapsed_secs
+    )];
+    if !selection_explanation.is_empty() {
+        parts.push(selection_explanation.to_string());
+    }
+    if let Some(err) = error
+        && !err.trim().is_empty()
+    {
+        parts.push(format!("Error: {}", err));
+    }
+    let trimmed_output = captured_output.trim();
+    if !trimmed_output.is_empty() {
+        parts.push(trimmed_output.to_string());
+    } else {
+        parts.push(
+            "(subagent did not produce any final assistant text)".to_string(),
+        );
+    }
+    parts.join("\n")
 }
 
 fn subagent_history_path(base: &std::path::Path, task_id: &str) -> PathBuf {
