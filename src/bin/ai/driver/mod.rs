@@ -464,6 +464,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let writer =
         config::open_output_writer(cli.out.as_deref())?.map(|f| Arc::new(std::sync::Mutex::new(f)));
     let current_model = models::initial_model(&cli);
+    models::log_subagent_preferred_keys_health();
     let client = reqwest::Client::builder().build()?;
     let prompt_editor = if cli.args.is_empty() {
         Some(PromptEditor::new(

@@ -14,7 +14,7 @@
     "key": "QWEN_PLUS_LATEST",
     "name": "qwen3.6-plus",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-    "quality_tier": "flagship",
+    "quality_tier": "strong",
     "is_vl": true,
     "search_enabled": true,
     "tools_default_enabled": true,
@@ -22,7 +22,7 @@
   },
   {
     "key": "QWEN3_MAX",
-    "name": "qwen3-max",
+    "name": "qwen3.7-max",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "flagship",
     "is_vl": false,

@@ -1362,9 +1362,21 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
         return sanitize_tool_message_sequence(messages.to_vec());
     };
 
+    // Only merge system-like notes that sit BEFORE the first conversational
+    // (user/assistant/tool) message — those are produced by history
+    // compression at the very top and stay stable across turns. Notes that
+    // arrive later (working memory / code discovery / self_note / cached
+    // tool results, etc.) are kept in their original positions with role
+    // rewritten to "system", so growing tail notes only invalidate the
+    // suffix of the provider's prompt cache instead of the whole request.
+    let first_body_idx = messages
+        .iter()
+        .position(|m| !is_system_like_role(&m.role))
+        .unwrap_or(messages.len());
+
     let mut merged_notes: Vec<(usize, InternalNoteKind, String)> = Vec::new();
-    for (idx, message) in messages.iter().enumerate() {
-        if idx == first_system_idx || !is_system_like_role(&message.role) {
+    for (idx, message) in messages.iter().enumerate().take(first_body_idx) {
+        if idx == first_system_idx {
             continue;
         }
         let text = message
@@ -1407,7 +1419,20 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
     let mut out = Vec::with_capacity(messages.len());
     out.push(merged_first);
     for (idx, message) in messages.iter().enumerate() {
-        if idx == first_system_idx || is_system_like_role(&message.role) {
+        if idx == first_system_idx {
+            continue;
+        }
+        if idx < first_body_idx {
+            // Already folded into merged_first above.
+            continue;
+        }
+        if is_internal_note_role(&message.role) {
+            // Keep the note in-place but normalize the role so the API
+            // accepts it. Stable position preserves prompt-cache prefix:
+            // older notes don't move when newer ones get appended.
+            let mut promoted = message.clone();
+            promoted.role = ROLE_SYSTEM.to_string();
+            out.push(promoted);
             continue;
         }
         out.push(message.clone());
@@ -1855,6 +1880,11 @@ mod tests {
 
     #[test]
     fn normalize_messages_merges_non_leading_system_messages() {
+        // Internal notes that appear AFTER the first conversational message
+        // must remain in their original positions (with role normalized to
+        // "system") so that older prompt-cache prefixes stay valid when new
+        // notes are appended. Only notes that sit at the very top, before
+        // any user/assistant/tool message, get folded into the first system.
         let messages = vec![
             Message {
                 role: "system".to_string(),
@@ -1864,15 +1894,15 @@ mod tests {
                 reasoning_content: None,
             },
             Message {
-                role: "user".to_string(),
-                content: Value::String("question".to_string()),
+                role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+                content: Value::String("history summary".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
             },
             Message {
-                role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
-                content: Value::String("history summary".to_string()),
+                role: "user".to_string(),
+                content: Value::String("question".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,
@@ -1896,13 +1926,18 @@ mod tests {
         let normalized = normalize_messages_for_request(&messages);
 
         assert_eq!(normalized[0].role, "system");
-        assert_eq!(normalized.iter().filter(|m| m.role == "system").count(), 1);
-        let text = normalized[0].content.as_str().unwrap();
-        assert!(text.contains("base system"));
-        assert!(text.contains("history summary"));
-        assert!(text.contains("working memory"));
+        let head_text = normalized[0].content.as_str().unwrap();
+        assert!(head_text.contains("base system"));
+        assert!(head_text.contains("history summary"));
+        assert!(!head_text.contains("working memory"));
+
         assert_eq!(normalized[1].role, "user");
         assert_eq!(normalized[2].role, "assistant");
+        assert_eq!(normalized[3].role, "system");
+        assert_eq!(
+            normalized[3].content.as_str(),
+            Some("working memory")
+        );
     }
 
     #[test]

@@ -358,22 +358,21 @@ fn has_tool(available: &Box<SkipSet<String>>, name: &str) -> bool {
 }
 
 fn reorder_tools_by_stats(mut builtin: Vec<ToolDef>, mut mcp: Vec<ToolDef>) -> Vec<ToolDef> {
-    let mut all = Vec::new();
+    // Tools are part of the request payload that providers hash for prompt
+    // caching. Reordering on every turn (e.g. by sliding 14-day usage stats)
+    // silently invalidates the tools-section of the prompt cache. Pick a
+    // deterministic order instead: keep the natural builtin-first/MCP-second
+    // grouping and sort each bucket alphabetically by tool name. This is
+    // stable across turns regardless of recent tool_stat memory.
+    rust_tools::sortw::stable_sort_by(&mut builtin, |a, b| a.function.name.cmp(&b.function.name));
+    rust_tools::sortw::stable_sort_by(&mut mcp, |a, b| a.function.name.cmp(&b.function.name));
+    let mut all = Vec::with_capacity(builtin.len() + mcp.len());
     all.append(&mut builtin);
     all.append(&mut mcp);
-    if all.is_empty() {
-        return all;
-    }
-    let scores = load_tool_scores();
-    all.sort_by(|a, b| {
-        let sa = scores.get_ref(&a.function.name).copied().unwrap_or(0.0);
-        let sb = scores.get_ref(&b.function.name).copied().unwrap_or(0.0);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.function.name.cmp(&b.function.name))
-    });
     all
 }
 
+#[allow(dead_code)]
 fn load_tool_scores() -> Box<ToolScoreMap> {
     if let Ok(cache) = TOOL_SCORE_CACHE.lock()
         && let Some((created_at, scores)) = cache.as_ref()
@@ -428,6 +427,7 @@ fn load_tool_scores() -> Box<ToolScoreMap> {
     result
 }
 
+#[allow(dead_code)]
 fn recency_weight(ts: &str) -> f64 {
     let parsed: Option<DateTime<Utc>> = chrono::DateTime::parse_from_rfc3339(ts).ok().map(|dt| dt.with_timezone(&Utc));
     let Some(t) = parsed else { return 1.0; };

@@ -286,25 +286,19 @@ pub(super) async fn prepare_turn(
         reasoning_content: None,
     });
     messages.extend(history);
+    // Per-turn context reminder (Current Date / Recalled Knowledge / Code
+    // Discovery, …) used to be injected as a synthetic user+assistant pair
+    // between `history` and the current user message. Because the reminder
+    // text changes every turn, that pair sat right between two cache-stable
+    // segments and caused providers to lose the prompt-cache hit on
+    // everything from the reminder onward. Fold it into the **current**
+    // user message instead: the current message is always a cache miss
+    // anyway, so reminder churn no longer truncates the cached prefix.
+    // The `turn_messages` list (what gets persisted to long-term history)
+    // intentionally keeps the original user question without the reminder.
     let context_reminder = skill_turn.context_reminder();
-    if let Some(reminder) = &context_reminder {
-        messages.push(Message {
-            role: "user".to_string(),
-            content: Value::String(reminder.clone()),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        });
-        messages.push(Message {
-            role: "assistant".to_string(),
-            content: Value::String("Understood. I will use the provided context when relevant.".to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        });
-    }
     let user_message = Message {
-        role: "user".to_string(), 
+        role: "user".to_string(),
         content: {
             let has_images = !app.attached_image_files.is_empty();
             let mut final_question = if attachments_text.is_empty() {
@@ -330,7 +324,27 @@ pub(super) async fn prepare_turn(
         tool_call_id: None,
         reasoning_content: None,
     };
-    messages.push(user_message.clone());
+    let request_user_message = if let Some(reminder) = context_reminder.as_deref() {
+        let mut decorated = user_message.clone();
+        decorated.content = match decorated.content {
+            Value::String(text) => Value::String(format!("{}\n\n{}", reminder, text)),
+            Value::Array(mut parts) => {
+                parts.insert(
+                    0,
+                    serde_json::json!({
+                        "type": "text",
+                        "text": reminder,
+                    }),
+                );
+                Value::Array(parts)
+            }
+            other => other,
+        };
+        decorated
+    } else {
+        user_message.clone()
+    };
+    messages.push(request_user_message);
     let mut turn_messages = Vec::with_capacity(8);
     turn_messages.push(user_message);
 
