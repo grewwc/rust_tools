@@ -18,6 +18,11 @@ use super::{
     TextSimilarityFeatures,
 };
 
+// 与 `normalize_text_for_similarity` 行为相同的本地别名，便于本文件保留旧调用形式。
+fn normalize_text(input: &str) -> String {
+    normalize_text_for_similarity(input)
+}
+
 pub struct RoutingDecision {
     pub agent_name: String,
     pub reason: &'static str,
@@ -27,10 +32,20 @@ const ROUTE_REASON_MODEL_LOW_CONFIDENCE: &str = "model-low-confidence";
 const ROUTE_REASON_MODEL_PREDICT: &str = "model-predict";
 const ROUTE_REASON_SEMANTIC_MATCH: &str = "semantic-match";
 const ROUTE_REASON_SEMANTIC_FALLBACK: &str = "semantic-fallback";
+/// 模型分类置信度阈值：低于此值时不再相信模型预测，转而走语义匹配 fallback。
+/// 经验值：基于 logistic regression 在校验集上的 ROC 曲线选取。
 const MODEL_CONFIDENCE_THRESHOLD: f64 = 0.45;
+/// 跨 agent 语义切换的最低绝对相似度门槛。
+/// 当最佳候选的语义得分低于此值时，禁止从当前 agent 切走，避免 agent 频繁抖动。
 const SEMANTIC_SWITCH_THRESHOLD: f64 = 0.085;
+/// 跨 agent 语义切换的相对优势：候选必须比当前 agent 高 `MARGIN` 才允许切换，
+/// 防止得分接近时来回跳。
 const SEMANTIC_SWITCH_MARGIN: f64 = 0.015;
+/// 当前轮次（仅看 question 自身）的语义最低分。
+/// 历史相关性可以带来"惯性加分"，但本轮 question 本身仍需达到此底线。
 const CURRENT_TURN_SEMANTIC_FLOOR: f64 = 0.05;
+/// 当前轮次相对优势 margin：与 SEMANTIC_SWITCH_MARGIN 类似，但仅作用在
+/// "当前轮次 question 维度"，避免"历史强、当前弱"的候选被误推上去。
 const CURRENT_TURN_ADVANTAGE_MARGIN: f64 = 0.04;
 const AGENT_SEMANTIC_CORPUS_CACHE_LIMIT: usize = 16;
 
@@ -81,7 +96,7 @@ fn default_model_path() -> PathBuf {
 
 fn load_route_model(path: &Path) -> Option<Arc<AgentRouteModelFile>> {
     let path_buf = path.to_path_buf();
-    if let Ok(cache) = AGENT_ROUTE_MODEL_CACHE.lock()
+    if let Some(cache) = lock_recover(&AGENT_ROUTE_MODEL_CACHE)
         && let Some(model) = cache.get(&path_buf)
     {
         return Some(Arc::clone(model));
@@ -91,11 +106,24 @@ fn load_route_model(path: &Path) -> Option<Arc<AgentRouteModelFile>> {
     let model: AgentRouteModelFile = serde_json::from_str(&text).ok()?;
     let model = Arc::new(model);
 
-    if let Ok(mut cache) = AGENT_ROUTE_MODEL_CACHE.lock() {
+    if let Some(mut cache) = lock_recover(&AGENT_ROUTE_MODEL_CACHE) {
         cache.insert(path_buf, Arc::clone(&model));
     }
 
     Some(model)
+}
+
+/// 获取 Mutex 锁，遇到中毒时恢复，避免后续所有缓存操作静默失败。
+fn lock_recover<'a, T>(m: &'a Mutex<T>) -> Option<std::sync::MutexGuard<'a, T>> {
+    match m.lock() {
+        Ok(g) => Some(g),
+        Err(poisoned) => {
+            eprintln!(
+                "[agent_router] cache mutex poisoned, recovering inner state"
+            );
+            Some(poisoned.into_inner())
+        }
+    }
 }
 
 fn predict_agent(input: &str, model: &AgentRouteModelFile) -> Option<(String, f64)> {
@@ -175,27 +203,6 @@ fn extract_char_ngrams(input: &str, min_n: usize, max_n: usize) -> Vec<String> {
     out
 }
 
-fn normalize_text(input: &str) -> String {
-    let mut normalized = String::new();
-    let mut prev_space = false;
-
-    for ch in input.to_lowercase().chars() {
-        if ch == '\r' {
-            continue;
-        }
-        if ch.is_whitespace() {
-            if !prev_space {
-                normalized.push(' ');
-            }
-            prev_space = true;
-        } else {
-            normalized.push(ch);
-            prev_space = false;
-        }
-    }
-
-    normalized.trim().to_string()
-}
 
 pub struct ModelRouter {
     model_path: PathBuf,
@@ -291,14 +298,14 @@ struct AgentSemanticCorpus {
 impl AgentSemanticCorpus {
     fn for_candidates(candidates: &[&AgentManifest]) -> Arc<Self> {
         let cache_key = agent_semantic_corpus_cache_key(candidates);
-        if let Ok(cache) = AGENT_SEMANTIC_CORPUS_CACHE.lock()
+        if let Some(cache) = lock_recover(&AGENT_SEMANTIC_CORPUS_CACHE)
             && let Some(corpus) = cache.get(&cache_key)
         {
             return Arc::clone(corpus);
         }
 
         let corpus = Arc::new(Self::build(candidates));
-        if let Ok(mut cache) = AGENT_SEMANTIC_CORPUS_CACHE.lock() {
+        if let Some(mut cache) = lock_recover(&AGENT_SEMANTIC_CORPUS_CACHE) {
             if cache.len() >= AGENT_SEMANTIC_CORPUS_CACHE_LIMIT {
                 cache.clear();
             }

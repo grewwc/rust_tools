@@ -56,16 +56,12 @@ pub fn match_skill<'a>(
     }
 }
 
-/// 检查技能描述是否明确排除了某种意图
-pub(super) fn is_intent_excluded(_skill: &SkillManifest, intent: &UserIntent) -> bool {
+/// 当用户意图本身是"列出/搜索 skill 资源"（如"有哪些 skill"）时，
+/// 不应再把任何具体 skill 路由出去——上游的 `select_skill_with_preference`
+/// 已经在更早期短路了，这里仅作为最后一道防线。
+///
+/// 函数与具体 skill 无关，只取决于意图。命名上不再带 `skill` 参数，
+/// 避免误以为有按 skill 区分的逻辑。
+pub(super) fn intent_excludes_all_skills(intent: &UserIntent) -> bool {
     intent.is_searching_resource("skill")
-}
-
-/// 语义评分：由 local model + runtime semantic index 提供。
-pub(super) fn score_skill_smart(
-    _skill: &SkillManifest,
-    _input_lower: &str,
-    _intent: Option<&UserIntent>,
-) -> f64 {
-    0.0
 }

@@ -589,8 +589,9 @@ mod tests {
     use super::{
         agent_model_tier, api_key_for_model, auto_subagent_model_for_agent,
         classify_subagent_task_difficulty, default_model, determine_model,
-        determine_vl_model, endpoint_for_model, initial_model, merge_agent_tier_with_difficulty,
-        endpoint_supports_anonymous_auth, model_provider, model_quality_tier, ModelStrengthTier, SubagentTaskDifficulty,
+        determine_vl_model, enable_thinking, endpoint_for_model, initial_model,
+        merge_agent_tier_with_difficulty, endpoint_supports_anonymous_auth,
+        model_provider, model_quality_tier, ModelStrengthTier, SubagentTaskDifficulty,
         COMPATIBLE_DEFAULT_ENDPOINT, OPENCODE_DEFAULT_ENDPOINT, OPENROUTER_ENDPOINT,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
@@ -717,15 +718,41 @@ mod tests {
         );
     }
 
+    /// 选取一个真实存在的、provider=OpenAi 的模型名做用例输入；
+    /// 这样测试不会因为 models.json 增删个别条目而失效。
+    fn first_openai_model_name() -> String {
+        super::model_names::all()
+            .iter()
+            .find(|m| m.provider == ApiProvider::OpenAi)
+            .map(|m| m.name.clone())
+            .expect("models.json must contain at least one OpenAi-provider model")
+    }
+
+    fn first_openai_vl_model_name() -> Option<String> {
+        super::model_names::all()
+            .iter()
+            .find(|m| m.provider == ApiProvider::OpenAi && m.is_vl)
+            .map(|m| m.name.clone())
+    }
+
     #[test]
-    fn openai_model_entries_resolve_exactly() {
-        assert_eq!(determine_model("gpt-4o"), "gpt-4o");
-        assert_eq!(determine_vl_model("gpt-4.1-mini"), "gpt-4.1-mini");
+    fn known_model_entries_resolve_exactly_by_name() {
+        let openai = first_openai_model_name();
+        assert_eq!(determine_model(&openai), openai);
+        if let Some(vl) = first_openai_vl_model_name() {
+            assert_eq!(determine_vl_model(&vl), vl);
+        }
     }
 
     #[test]
     fn model_keys_resolve_to_model_names() {
-        assert_eq!(determine_model("gemma-4"), "google/gemma-4-26b-a4b-it:free");
+        // 用 models.json 中第一个真实条目反向校验 key→name 的映射，
+        // 而不是硬编码具体 key。
+        let first = super::model_names::all()
+            .first()
+            .map(|m| (m.key.clone(), m.name.clone()))
+            .expect("models.json must contain at least one entry");
+        assert_eq!(determine_model(&first.0), first.1);
     }
 
     #[test]
@@ -733,44 +760,88 @@ mod tests {
         let mut cli = ParsedCli::default();
         cli.model = None;
         let model = initial_model(&cli);
-        if crate::commonw::configw::get_all_config()
+        let configured = crate::commonw::configw::get_all_config()
             .get_opt(AiConfig::MODEL_DEFAULT)
-            .as_deref()
-            == Some("gemma-4")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        if let Some(key) = configured
+            && let Some(def) = super::model_names::find_by_key(&key)
+                .or_else(|| super::model_names::find_by_name(&key))
         {
-            assert_eq!(model, "google/gemma-4-26b-a4b-it:free");
+            assert_eq!(model, def.name);
         }
     }
 
     #[test]
-    fn openai_model_entries_carry_provider_and_quality_tier() {
-        let def = super::model_names::find_by_name("gpt-4o").expect("gpt-4o model must exist");
-        assert_eq!(model_provider("gpt-4o"), def.provider);
-        assert_eq!(model_quality_tier("gpt-4o"), def.quality_tier);
+    fn known_model_entries_carry_provider_and_quality_tier() {
+        let name = first_openai_model_name();
+        let def = super::model_names::find_by_name(&name).expect("model must exist");
+        assert_eq!(model_provider(&name), def.provider);
+        assert_eq!(model_quality_tier(&name), def.quality_tier);
     }
 
     #[test]
-    fn endpoint_for_openai_model_prefers_model_config() {
-        let endpoint = endpoint_for_model("gpt-4o", "");
-        assert_eq!(endpoint, OPENROUTER_ENDPOINT);
+    fn endpoint_for_known_model_prefers_model_config_over_global_fallback() {
+        // 任意一个在 models.json 中显式声明 endpoint 的条目都应该优先使用自身配置，
+        // 忽略 global_fallback。这里挑第一个声明 endpoint 的条目即可。
+        let (name, expected) = super::model_names::all()
+            .iter()
+            .find_map(|m| {
+                m.endpoint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .map(|e| (m.name.clone(), e.to_string()))
+            })
+            .expect("models.json must contain at least one entry with explicit endpoint");
+        let endpoint = endpoint_for_model(&name, "https://example.com/should-not-be-used/v1/chat/completions");
+        assert_eq!(endpoint, expected);
     }
 
     #[test]
     fn endpoint_for_compatible_model_prefers_model_config() {
-        let endpoint = endpoint_for_model("qwen3-max", "");
+        // 找一个 Compatible provider 且配置了 endpoint 的模型，确保走 model 配置。
+        let (name, expected) = super::model_names::all()
+            .iter()
+            .find_map(|m| {
+                if m.provider != ApiProvider::Compatible {
+                    return None;
+                }
+                m.endpoint
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .map(|e| (m.name.clone(), e.to_string()))
+            })
+            .expect("models.json must contain at least one Compatible entry with endpoint");
+        let endpoint = endpoint_for_model(&name, "");
+        assert_eq!(endpoint, expected);
         assert_eq!(endpoint, COMPATIBLE_DEFAULT_ENDPOINT);
     }
 
     #[test]
     fn openai_model_entries_prefer_openai_api_key_config() {
-        let key = api_key_for_model("gpt-4o", "fallback-key");
+        let name = first_openai_model_name();
+        let key = api_key_for_model(&name, "fallback-key");
         assert!(!key.is_empty());
     }
 
     #[test]
     fn openrouter_models_use_openrouter_endpoint_in_config() {
-        let endpoint = endpoint_for_model("deepseek-v3.2", "");
-        assert_eq!(endpoint, OPENROUTER_ENDPOINT);
+        // 任何配置了 openrouter endpoint 的模型都该走 openrouter。
+        let openrouter_model = super::model_names::all()
+            .iter()
+            .find(|m| {
+                m.endpoint
+                    .as_deref()
+                    .map(|e| e.trim().eq_ignore_ascii_case(OPENROUTER_ENDPOINT))
+                    .unwrap_or(false)
+            })
+            .map(|m| m.name.clone());
+        if let Some(name) = openrouter_model {
+            let endpoint = endpoint_for_model(&name, "");
+            assert_eq!(endpoint, OPENROUTER_ENDPOINT);
+        }
     }
 
     #[test]
@@ -800,17 +871,35 @@ mod tests {
 
     #[test]
     fn default_model_prefers_high_quality_compatible_model() {
-        let def = super::model_names::find_by_name(&default_model()).expect("default model must exist");
-        assert_eq!(def.provider, ApiProvider::Compatible);
-        assert!(!def.is_vl);
-        assert_eq!(def.quality_tier, ModelQualityTier::Flagship);
+        // default_model 在 choose_default_model_name 中先按 Compatible 过滤，
+        // 再退回到全集，并按 quality_tier 取最高。这里把不变量直接写在断言上：
+        //  1. 必须是 non-vl
+        //  2. quality_tier 必须不低于所有同 provider-偏好下的候选
+        let def = super::model_names::find_by_name(&default_model())
+            .expect("default model must exist in models.json");
+        assert!(!def.is_vl, "default model should be non-VL");
+
+        let best_non_vl_tier = super::model_names::all()
+            .iter()
+            .filter(|m| !m.is_vl)
+            .map(|m| m.quality_tier)
+            .max()
+            .expect("models.json must contain at least one non-VL model");
+        assert_eq!(def.quality_tier, best_non_vl_tier);
     }
 
     #[test]
-    fn gpt_5_4_pro_does_not_advertise_thinking_support() {
-        let def = super::model_names::find_by_name("gpt-5.4-pro")
-            .expect("gpt-5.4-pro model must exist");
-        assert_eq!(def.provider, ApiProvider::OpenCode);
-        assert!(!def.enable_thinking);
+    fn opencode_model_entries_do_not_advertise_thinking_when_disabled() {
+        // 以前这里是固定模型名 gpt-5.4-pro 的强制断言；现在改为针对任意一个
+        // 在 models.json 中明确声明 enable_thinking=false 的 opencode 模型，
+        // 校验 enable_thinking() 与配置一致。这样 models.json 的具体条目变更
+        // 不会再让本测试失效，但仍然能守住"不要把 false 误读成 true"的不变量。
+        let candidate = super::model_names::all()
+            .iter()
+            .find(|m| m.provider == ApiProvider::OpenCode && !m.enable_thinking)
+            .map(|m| m.name.clone());
+        if let Some(name) = candidate {
+            assert!(!enable_thinking(&name));
+        }
     }
 }

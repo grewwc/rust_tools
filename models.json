@@ -25,7 +25,7 @@
     "name": "qwen3.7-max",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "flagship",
-    "is_vl": false,
+    "is_vl": true,
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true

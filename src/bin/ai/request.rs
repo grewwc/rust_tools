@@ -1954,6 +1954,23 @@ mod tests {
         }
     }
 
+    /// 找一个真实存在的 OpenAi-provider 模型名做测试输入，避免硬编码
+    /// 具体模型字符串导致 models.json 变更后测试失效。
+    fn first_openai_model_name() -> String {
+        crate::ai::model_names::all()
+            .iter()
+            .find(|m| m.provider == crate::ai::provider::ApiProvider::OpenAi)
+            .map(|m| m.name.clone())
+            .expect("models.json must contain at least one OpenAi-provider model")
+    }
+
+    fn first_openai_vl_model_name() -> Option<String> {
+        crate::ai::model_names::all()
+            .iter()
+            .find(|m| m.provider == crate::ai::provider::ApiProvider::OpenAi && m.is_vl)
+            .map(|m| m.name.clone())
+    }
+
     #[test]
     fn openai_request_body_omits_nonstandard_flags() {
         let messages = vec![Message {
@@ -1963,8 +1980,9 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         }];
+        let model = first_openai_model_name();
         let body = build_request_body(
-            "gpt-4o",
+            &model,
             &messages,
             true,
             true,
@@ -1976,7 +1994,10 @@ mod tests {
 
         assert!(value.get("enable_thinking").is_none());
         assert!(value.get("enable_search").is_none());
-        assert_eq!(value.get("model").and_then(|v| v.as_str()), Some("gpt-4o"));
+        assert_eq!(
+            value.get("model").and_then(|v| v.as_str()),
+            Some(model.as_str())
+        );
     }
 
     #[test]
@@ -2283,11 +2304,23 @@ mod tests {
 
     #[test]
     fn openai_image_content_uses_object_image_url_shape() {
+        // 仅当 models.json 中存在一个 OpenAi-provider 且 is_vl=true 的模型时
+        // 才能验证"以 {image_url:{url:...}} 对象形状下发图像"的协议契约。
+        // 真实环境下没有这种模型时（例如 models.json 只有 Compatible VL），
+        // 这条契约无从验证，跳过即可。
+        let Some(model) = first_openai_vl_model_name() else {
+            eprintln!(
+                "[test] skipping openai_image_content_uses_object_image_url_shape: \
+                 no OpenAi+VL model present in models.json"
+            );
+            return;
+        };
+
         let path = std::env::temp_dir().join(format!("ai-openai-image-{}.png", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"fake").unwrap();
 
         let value = build_content(
-            "gpt-4o",
+            &model,
             "describe",
             &[path.to_string_lossy().to_string()],
         )

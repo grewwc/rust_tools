@@ -14,6 +14,7 @@ use crate::ai::{
     tools::common::{ToolRegistration, ToolSpec},
 };
 use crate::ai::tools::os_tools::GLOBAL_OS;
+use aios_kernel::SharedKernel;
 use aios_kernel::{
     kernel::{EventId, Kernel, ProcessState, WaitPolicy},
     primitives::{
@@ -139,18 +140,45 @@ impl InheritOptions {
     }
 }
 
+/// Agent 层为每个异步子任务维护的注册表条目，用于 `task_spawn` / `task_wait` 流程。
+///
+/// **与 AIOS Kernel `Process` 的关系**：本结构体的部分字段（`pid`、`agent_name`、
+/// `description`、`started_at`）在 kernel `Process` 中已有等价物（`pid` / `name` /
+/// `goal` / `created_at_tick`），存在 **概念重叠**。重叠保留的原因：
+///
+/// 1. agent 特有字段（`result_channel_id`、`completion_futex_addr`、`inherit`、
+///    `selection_explanation`、`model`）在 kernel 进程表中没有对应位置；
+/// 2. agent 层需要在 task_id 这个稳定字符串键下做查询，而 kernel 用的是数值 pid；
+/// 3. kernel `created_at_tick` 是 logical tick，不能直接换算回 wall-clock 用于
+///    `prune_completed_tasks` 的 LRU 决策。
+///
+/// **不变量**：本注册表中的 `pid` 必须始终对应 kernel process table 里同一个
+/// 进程；如果 kernel 端进程被 reap，此注册表里的对应条目应在
+/// `prune_completed_tasks`（容量上限）或 `task_wait` 完成时被移除。
 pub(crate) struct AsyncTaskEntry {
+    /// 与 kernel `Process.pid` 一致；agent 端额外保存便于通过 task_id 反查 pid。
     pub(crate) pid: u64,
     pub(crate) result_channel_id: u64,
     pub(crate) completion_futex_addr: FutexAddr,
+    /// 描述性文本；与 kernel `Process.goal` 不同——后者会带 TASK_GOAL_PREFIX
+    /// 前缀和完整 prompt。
     pub(crate) description: String,
+    /// 子 agent 的逻辑名（"explore" / "plan" 等）；与 kernel `Process.name` 同源
+    /// 但 kernel 端 name 仅作显示。
     pub(crate) agent_name: String,
     pub(crate) model: String,
     pub(crate) selection_explanation: String,
     pub(crate) inherit: InheritOptions,
+    /// wall-clock 起始时间，用于 `prune_completed_tasks` LRU；不能由 kernel
+    /// `created_at_tick` 替代。
     pub(crate) started_at: Instant,
 }
 
+/// 异步子任务注册表，键为 task_id（UUID 字符串），值见 [`AsyncTaskEntry`]。
+///
+/// 与 AIOS kernel process table 是 **平行存储**：两者通过 `pid` 字段关联，但
+/// 各自有独立的字段集（参见 `AsyncTaskEntry` 注释）。访问方应通过 `with_task_entry`
+/// / `take_task_entry` 等 helper 函数来读写这里，避免直接持有 lock guard。
 static TASK_REGISTRY: LazyLock<Mutex<FastMap<String, AsyncTaskEntry>>> =
     LazyLock::new(|| Mutex::new(FastMap::default()));
 
@@ -170,19 +198,16 @@ fn prune_completed_tasks(registry: &mut FastMap<String, AsyncTaskEntry>) {
     if registry.len() <= MAX_TASK_REGISTRY_SIZE {
         return;
     }
-    let mut oldest = registry
+    // 收集 (key, started_at) 后按时间排序，一次性删除最老的 N 个，
+    // 避免每次循环都做 O(n) 的 min_by_key 全量扫描造成的 O(n²) 复杂度。
+    let mut entries: Vec<(String, Instant)> = registry
         .iter()
-        .min_by_key(|(_, entry)| entry.started_at)
-        .map(|(key, _)| key.clone());
-    while registry.len() > MAX_TASK_REGISTRY_SIZE {
-        let Some(key) = oldest.take() else {
-            break;
-        };
+        .map(|(k, v)| (k.clone(), v.started_at))
+        .collect();
+    entries.sort_by_key(|(_, t)| *t);
+    let to_remove = registry.len() - MAX_TASK_REGISTRY_SIZE;
+    for (key, _) in entries.into_iter().take(to_remove) {
         registry.remove(&key);
-        oldest = registry
-            .iter()
-            .min_by_key(|(_, entry)| entry.started_at)
-            .map(|(next_key, _)| next_key.clone());
     }
 }
 
@@ -201,17 +226,28 @@ pub(crate) fn decode_os_task_goal(goal: &str) -> Option<OsTaskGoal> {
     serde_json::from_str(payload).ok()
 }
 
+/// 在 AIOS kernel 上执行一段 mutable 操作。
+///
+/// 优先路径：从 `DRIVER_CTX` task-local 取出当前 turn 持有的 `SharedKernel`，
+/// 这样 `task_wait` / `task_spawn` 等高频路径直接复用 turn scope 已经持有的 Arc，
+/// 避免 `GLOBAL_OS` 这个全局 static 的额外锁与间接寻址。
+///
+/// 回退路径：当调用方不在 `DRIVER_CTX` scope 中（例如 driver 启动早期或单测从同步
+/// 上下文调用 tool），仍使用 `GLOBAL_OS`，保证向后兼容。
 fn with_os_kernel<T>(
     f: impl FnOnce(&mut dyn Kernel) -> Result<T, String>,
 ) -> Result<T, String> {
-    let shared = {
-        let guard = GLOBAL_OS
-            .lock()
-            .map_err(|e| format!("Failed to lock AIOS kernel handle: {e}"))?;
-        guard
-            .as_ref()
-            .cloned()
-            .ok_or("AIOS kernel is not initialized.".to_string())?
+    let shared: SharedKernel = match crate::ai::driver::runtime_ctx::try_current() {
+        Some(ctx) => ctx.app_proto.os.clone(),
+        None => {
+            let guard = GLOBAL_OS
+                .lock()
+                .map_err(|e| format!("Failed to lock AIOS kernel handle: {e}"))?;
+            guard
+                .as_ref()
+                .cloned()
+                .ok_or("AIOS kernel is not initialized.".to_string())?
+        }
     };
     let mut kernel = shared
         .lock()
@@ -321,6 +357,23 @@ fn wait_many_snapshot(
     Ok((ready, pending, event_ids))
 }
 
+/// 在 agent 层组合 kernel 提供的 epoll / channel / futex / event 原语，实现
+/// **跨多种等待源** 的 "等待任意一个完成" 语义，主要服务于 `task_wait` 工具。
+///
+/// **设计定位**：本函数 *不是* 重新实现 kernel 的等待原语，而是把若干低层 API
+/// （`epoll_create` / `epoll_ctl` / `epoll_wait` / `wait_on_events`）按 agent
+/// 业务语义拼装：
+/// 1. 为 channel/futex 类等待源建立短暂的 epoll 集合，再 `epoll_wait` 取就绪集合；
+/// 2. 为 event 类等待源直接 `wait_on_events`；
+/// 3. 把两类结果归一化到 `EpollWaitManyOutcome`。
+///
+/// **未来下沉建议**：当 kernel 加入对 `Vec<WaitManySource>` 的原生 syscall 支持
+/// （类似 epoll_pwait2 + EVENTFD 的混合模式）后，本函数可以变成对单次 syscall
+/// 的轻量包装。在迁移前，本函数保留当前的多步组合实现；任何对其行为的修改
+/// **必须保证 task_wait 在如下场景的回归**：
+/// - 全部 ready 立即返回（不会调用 epoll_wait）；
+/// - 全部 pending 时按 `wait_policy` 决定是否真正 suspend；
+/// - 混合就绪 + pending 时只返回就绪集，不引入额外阻塞。
 pub(crate) fn epoll_wait_many(
     os: &mut dyn Kernel,
     label: &str,
@@ -539,8 +592,18 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
 
     let inherit = InheritOptions::from_value(&args["inherit"])?;
 
-    let all_agents = agents::load_all_agents();
-    let selected = select_subagent(&all_agents, agent, description, prompt)?;
+    // 优先从 DRIVER_CTX 中拿已缓存的 agent_manifests，避免每次 task_spawn 都重读磁盘。
+    // 当不在 DRIVER_CTX scope 中（极少见，例如单测），回退到 load_all_agents()。
+    let cached = crate::ai::driver::runtime_ctx::try_current()
+        .map(|ctx| ctx.agent_manifests.clone());
+    let owned_fallback;
+    let all_agents: &[AgentManifest] = if let Some(ref arc_vec) = cached {
+        arc_vec.as_slice()
+    } else {
+        owned_fallback = agents::load_all_agents();
+        &owned_fallback
+    };
+    let selected = select_subagent(all_agents, agent, description, prompt)?;
     let selected_model = model_override
         .map(models::determine_model)
         .unwrap_or_else(|| models::auto_subagent_model_for_agent(selected.agent, description, prompt));
@@ -1453,6 +1516,25 @@ mod tests {
 
     #[test]
     fn selection_explanation_mentions_quality_tier_for_auto_model_choice() {
+        // 之前这里硬编码 "qwen3-max"；该模型已经从 models.json 移除。
+        // 改为从真实条目中找一个 Compatible+flagship 的模型，确保解释里出现
+        // "flagship" 和 "compatible" 这两个 tier/provider 关键字。
+        use crate::ai::provider::{ApiProvider, ModelQualityTier};
+        let model = crate::ai::model_names::all()
+            .iter()
+            .find(|m| {
+                m.provider == ApiProvider::Compatible
+                    && m.quality_tier == ModelQualityTier::Flagship
+            })
+            .map(|m| m.name.clone());
+        let Some(model) = model else {
+            eprintln!(
+                "[test] skipping selection_explanation_mentions_quality_tier_for_auto_model_choice: \
+                 no Compatible+Flagship model present in models.json"
+            );
+            return;
+        };
+
         let agent = manifest("build", "Main build agent", AgentMode::Subagent);
         let selected = SelectedSubagent {
             agent: &agent,
@@ -1461,7 +1543,7 @@ mod tests {
             score: 48,
         };
 
-        let explanation = build_selection_explanation(&selected, "qwen3-max", None);
+        let explanation = build_selection_explanation(&selected, &model, None);
 
         assert!(explanation.contains("routing_tags [implement, fix]"));
         assert!(explanation.contains("quality_tier"));

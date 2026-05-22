@@ -671,6 +671,49 @@ fn process_history_path(base: &Path, pid: u64) -> PathBuf {
     base.with_file_name(file_name)
 }
 
+/// 构造进程被唤醒（mailbox 非空）时的 wake-up prompt。
+/// foreground / background 路径共享同一段 prompt，避免双份硬编码漂移。
+fn format_wakeup_prompt(pid: u64, goal: &str, messages: &[String]) -> String {
+    format!(
+        "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- If the mailbox indicates async tool wake-up, first decide whether you need `tool_status` for a full snapshot, `tool_wait` to collect newly finished results, or `tool_cancel` to stop low-value branches.\n- Do not blindly wait again if enough completed results already support the answer.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
+        pid,
+        goal,
+        messages.join("\n---\n")
+    )
+}
+
+/// 一轮 turn 执行成功后对目标进程的 quota 收尾逻辑。
+/// 行为与改造前完全一致：扣减 `quota_turns` 一次，如果归零则准备 "Max LLM quota reached"
+/// 终止理由；如果进程已经处于 Waiting/Sleeping/Stopped 则保持其挂起状态、不触发终止。
+///
+/// 返回 `(should_terminate, termination_result)`，由调用方决定是否真的调用
+/// `terminate_and_cleanup`，从而保留 foreground / background 各自后续的特殊处理
+/// （如 round-robin requeue 等）。
+fn finalize_turn_quota(
+    os: &mut dyn aios_kernel::kernel::Kernel,
+    pid: u64,
+) -> (bool, String) {
+    let mut should_terminate = true;
+    let mut termination_result = "Completed".to_string();
+    if let Some(p) = os.get_process_mut(pid) {
+        if p.quota_turns > 0 {
+            p.quota_turns -= 1;
+        }
+        if p.quota_turns == 0 {
+            termination_result = "Terminated: Max LLM quota reached.".to_string();
+        }
+        if matches!(
+            p.state,
+            aios_kernel::kernel::ProcessState::Waiting { .. }
+                | aios_kernel::kernel::ProcessState::Sleeping { .. }
+                | aios_kernel::kernel::ProcessState::Stopped
+        ) {
+            should_terminate = false;
+        }
+    }
+    (should_terminate, termination_result)
+}
+
 /// 处理一个 foreground ready 进程的恢复执行：构造 wake-up prompt、跑一轮 run_turn、
 /// 然后根据结果走 quota / 终止 / 失败收尾流程。
 async fn run_foreground_resume(
@@ -689,12 +732,7 @@ async fn run_foreground_resume(
                 actual.mailbox.clear();
             }
         }
-        format!(
-            "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- If the mailbox indicates async tool wake-up, first decide whether you need `tool_status` for a full snapshot, `tool_wait` to collect newly finished results, or `tool_cancel` to stop low-value branches.\n- Do not blindly wait again if enough completed results already support the answer.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
-            pid,
-            proc.goal,
-            messages.join("\n---\n")
-        )
+        format_wakeup_prompt(pid, &proc.goal, &messages)
     } else {
         format!(
             "[Process {} Resumed] Goal: {}\nContinue execution.",
@@ -745,24 +783,7 @@ async fn run_foreground_resume(
             let mut os = app.os.lock().unwrap();
             os.set_current_pid(Some(pid));
             os.increment_turns_used_for(pid);
-            let mut should_terminate = true;
-            let mut termination_result = "Completed".to_string();
-            if let Some(p) = os.get_process_mut(pid) {
-                if p.quota_turns > 0 {
-                    p.quota_turns -= 1;
-                }
-                if p.quota_turns == 0 {
-                    termination_result = "Terminated: Max LLM quota reached.".to_string();
-                }
-                if matches!(
-                    p.state,
-                    aios_kernel::kernel::ProcessState::Waiting { .. }
-                        | aios_kernel::kernel::ProcessState::Sleeping { .. }
-                        | aios_kernel::kernel::ProcessState::Stopped
-                ) {
-                    should_terminate = false;
-                }
-            }
+            let (should_terminate, termination_result) = finalize_turn_quota(os.as_mut(), pid);
             if should_terminate {
                 terminate_and_cleanup(os.as_mut(), pid, termination_result, true);
             }
@@ -908,12 +929,7 @@ async fn run_loop(
                             actual.mailbox.clear();
                         }
                     }
-                    format!(
-                        "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- If the mailbox indicates async tool wake-up, first decide whether you need `tool_status` for a full snapshot, `tool_wait` to collect newly finished results, or `tool_cancel` to stop low-value branches.\n- Do not blindly wait again if enough completed results already support the answer.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
-                        pid,
-                        proc.goal,
-                        messages.join("\n---\n")
-                    )
+                    format_wakeup_prompt(pid, &proc.goal, &messages)
                 } else {
                     format!(
                         "[Process {}] Goal: {}\nExecute this goal autonomously and provide the final result.",
@@ -1040,25 +1056,8 @@ async fn run_loop(
                     match result {
                         Ok(_outcome) => {
                             os.increment_turns_used_for(pid);
-                            let mut should_terminate = true;
-                            let mut termination_result = "Completed".to_string();
-                            if let Some(p) = os.get_process_mut(pid) {
-                                if p.quota_turns > 0 {
-                                    p.quota_turns -= 1;
-                                }
-                                if p.quota_turns == 0 {
-                                    termination_result =
-                                        "Terminated: Max LLM quota reached.".to_string();
-                                }
-                                if matches!(
-                                    p.state,
-                                    aios_kernel::kernel::ProcessState::Waiting { .. }
-                                        | aios_kernel::kernel::ProcessState::Sleeping { .. }
-                                        | aios_kernel::kernel::ProcessState::Stopped
-                                ) {
-                                    should_terminate = false;
-                                }
-                            }
+                            let (should_terminate, termination_result) =
+                                finalize_turn_quota(os.as_mut(), pid);
                             if should_terminate {
                                 terminate_and_cleanup(
                                     os.as_mut(),
@@ -1281,29 +1280,12 @@ async fn run_loop(
             Ok(outcome) => {
                 let mut os = app.os.lock().unwrap();
                 let current_pid = os.current_process_id();
-                let mut should_terminate = true;
-                let mut termination_result = "Completed".to_string();
-
-                if let Some(pid) = current_pid {
+                let (should_terminate, termination_result) = if let Some(pid) = current_pid {
                     os.increment_turns_used_for(pid);
-                    if let Some(proc) = os.get_process_mut(pid) {
-                        if proc.quota_turns > 0 {
-                            proc.quota_turns -= 1;
-                        }
-                        if proc.quota_turns == 0 {
-                            termination_result = "Terminated: Max LLM quota reached.".to_string();
-                        }
-
-                        if matches!(
-                            proc.state,
-                            aios_kernel::kernel::ProcessState::Waiting { .. }
-                                | aios_kernel::kernel::ProcessState::Sleeping { .. }
-                                | aios_kernel::kernel::ProcessState::Stopped
-                        ) {
-                            should_terminate = false;
-                        }
-                    }
-                }
+                    finalize_turn_quota(os.as_mut(), pid)
+                } else {
+                    (true, "Completed".to_string())
+                };
 
                 if should_terminate {
                     if let Some(pid) = current_pid {

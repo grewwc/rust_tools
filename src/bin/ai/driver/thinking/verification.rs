@@ -1,5 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+/// 按字符边界安全截断字符串，避免 `&s[..n]` 在 UTF-8 多字节字符中间 panic。
+/// `max_bytes` 是字节预算上限：截断后不会超过该字节数。
+fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    // floor_char_boundary 从 max_bytes 向下找到合法字符边界
+    let mut boundary = max_bytes;
+    while boundary > 0 && !s.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    &s[..boundary]
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum VerificationStep {
     GenerateHypothesis,
@@ -169,7 +183,7 @@ impl VerificationWorkflow {
              3. Focused on a single claim\n\n\
              Output STRICT JSON: {{\"hypothesis\":\"...\",\"confidence\":0.8}}",
             question,
-            if context.len() > 2000 { &context[..2000] } else { context }
+            safe_truncate(context, 2000)
         )
     }
 
@@ -192,8 +206,8 @@ impl VerificationWorkflow {
                 result.command,
                 result.exit_code,
                 result.passed,
-                if result.stdout_preview.len() > 600 { &result.stdout_preview[..600] } else { &result.stdout_preview },
-                if result.stderr_preview.len() > 600 { &result.stderr_preview[..600] } else { &result.stderr_preview },
+                safe_truncate(&result.stdout_preview, 600),
+                safe_truncate(&result.stderr_preview, 600),
             ));
         }
         if cycle.test_results.is_empty() {
@@ -249,6 +263,27 @@ mod tests {
         assert_eq!(wf.current_step, VerificationStep::GenerateHypothesis);
         wf.advance_step();
         assert_eq!(wf.current_step, VerificationStep::DesignTest);
+    }
+
+    #[test]
+    fn safe_truncate_handles_utf8_boundary() {
+        // 单个中文 3 字节，6 个中文 = 18 字节
+        let s = "中文测试字符";
+        // max_bytes=7 落在第 3 个字符的中间字节，应回退到字符边界
+        let out = safe_truncate(s, 7);
+        assert!(out.len() <= 7);
+        assert!(s.starts_with(out));
+        // 不会 panic 且不会出现非法 UTF-8
+        let _ = out.chars().count();
+
+        // emoji 也不会 panic
+        let emoji = "abc🎉🎉🎉";
+        let out = safe_truncate(emoji, 5);
+        assert!(out.len() <= 5);
+        assert!(emoji.starts_with(out));
+
+        // 字节预算足够时原样返回
+        assert_eq!(safe_truncate("hi", 100), "hi");
     }
 
     #[test]

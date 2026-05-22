@@ -271,23 +271,40 @@ fn successful_ocr_keeps_text_model_for_images() {
 
 #[test]
 fn determine_vl_model_supports_selector_and_fuzzy_name() {
-    assert_eq!(models::determine_vl_model(""), any_vl_model_name());
-    assert_eq!(models::determine_vl_model("0"), any_vl_model_name());
+    // 空输入走 default_vl_model（quality_tier 优先）；数字索引走"按 is_vl 过滤后的第 N 个"。
+    // 两条路径并不等价，这里分别按各自的不变量来断言，避免硬编码具体模型名。
+    let empty = models::determine_vl_model("");
+    let zero = models::determine_vl_model("0");
+    let first_vl = any_vl_model_name();
+    assert_eq!(zero, first_vl, "selector \"0\" should pick first VL in models.json");
+    // empty 仅要求是 VL 模型即可（best-by-tier 可能与 first_vl 不同）。
+    assert!(super::model_names::find_by_name(&empty).map(|m| m.is_vl).unwrap_or(false));
+
     if let Some(vl1) = vl_model_name_at(1) {
         assert_eq!(models::determine_vl_model("1"), vl1);
     } else {
-        assert_eq!(models::determine_vl_model("1"), any_vl_model_name());
+        // 越界时回退到 default_vl_model
+        assert_eq!(models::determine_vl_model("1"), empty);
     }
 
-    let vl = any_vl_model_name();
-    let canonical = models::determine_vl_model(&vl);
-    assert_eq!(canonical, vl);
+    // 直接以已知 VL 模型名作输入时，应返回原名（exact match）。
+    let canonical = models::determine_vl_model(&first_vl);
+    assert_eq!(canonical, first_vl);
 }
 
 #[test]
-fn tools_are_disabled_for_qwen_flash() {
-    assert!(!models::tools_enabled("qwen3.5-flash"));
-    assert!(models::tools_enabled("qwen3-max"));
+fn tools_default_flag_is_respected_per_model_entry() {
+    // 以前这里硬编码 qwen3.5-flash / qwen3-max 的 tools_enabled 行为；这两个模型
+    // 已经从 models.json 中移除。改成扫描真实条目，校验 models::tools_enabled
+    // 与 ModelDef.tools_default_enabled 的对齐关系，仍能守住"配置即真相"的不变量。
+    for def in super::model_names::all() {
+        assert_eq!(
+            models::tools_enabled(&def.name),
+            def.tools_default_enabled,
+            "model {} tools_enabled should match its tools_default_enabled flag",
+            def.name
+        );
+    }
 }
 
 #[test]

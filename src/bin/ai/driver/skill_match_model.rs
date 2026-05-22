@@ -7,6 +7,8 @@ use std::{
 use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
 
+use super::normalize_text_for_similarity as normalize_text;
+
 const DEFAULT_SKILL_MATCH_MODEL_RELATIVE_PATH: &str =
     "src/bin/ai/config/skill_match/skill_match_model.json";
 
@@ -50,7 +52,7 @@ fn load_model_file(path: &Path) -> Result<SkillMatchModelFile, String> {
 
 fn load_model_cached(path: &Path) -> Option<Arc<SkillMatchModelFile>> {
     let path_buf = path.to_path_buf();
-    if let Ok(cache) = SKILL_MATCH_MODEL_CACHE.lock()
+    if let Some(cache) = lock_recover(&SKILL_MATCH_MODEL_CACHE)
         && let Some(model) = cache.get(&path_buf)
     {
         return Some(Arc::clone(model));
@@ -59,11 +61,23 @@ fn load_model_cached(path: &Path) -> Option<Arc<SkillMatchModelFile>> {
     let model = load_model_file(&path).ok()?;
     let model = Arc::new(model);
 
-    if let Ok(mut cache) = SKILL_MATCH_MODEL_CACHE.lock() {
+    if let Some(mut cache) = lock_recover(&SKILL_MATCH_MODEL_CACHE) {
         cache.insert(path_buf, Arc::clone(&model));
     }
 
     Some(model)
+}
+
+fn lock_recover<'a, T>(m: &'a Mutex<T>) -> Option<std::sync::MutexGuard<'a, T>> {
+    match m.lock() {
+        Ok(g) => Some(g),
+        Err(poisoned) => {
+            eprintln!(
+                "[skill_match_model] cache mutex poisoned, recovering inner state"
+            );
+            Some(poisoned.into_inner())
+        }
+    }
 }
 
 fn validate_model(model: &SkillMatchModelFile) -> Result<(), String> {
@@ -90,28 +104,6 @@ fn validate_model(model: &SkillMatchModelFile) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn normalize_text(input: &str) -> String {
-    let mut normalized = String::new();
-    let mut prev_space = false;
-
-    for ch in input.to_lowercase().chars() {
-        if ch == '\r' {
-            continue;
-        }
-        if ch.is_whitespace() {
-            if !prev_space {
-                normalized.push(' ');
-            }
-            prev_space = true;
-        } else {
-            normalized.push(ch);
-            prev_space = false;
-        }
-    }
-
-    normalized.trim().to_string()
 }
 
 fn extract_char_ngrams(input: &str, min_n: usize, max_n: usize) -> Vec<String> {

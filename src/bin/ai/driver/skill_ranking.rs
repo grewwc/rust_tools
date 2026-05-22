@@ -13,7 +13,7 @@ use super::{
         index::{SkillEmbeddingHit, SkillEmbeddingIndex},
     },
     TextSimilarityFeatures, UserIntent, build_idf_from_documents, cosine_tfidf_similarity,
-    is_intent_excluded, normalize_text_for_similarity, skill_match_model,
+    intent_excludes_all_skills, normalize_text_for_similarity, skill_match_model,
 };
 
 const LOCAL_MODEL_SCORE_SCALE: f64 = 8.0;
@@ -60,6 +60,12 @@ pub fn rank_skills_locally_with_model_path<'a>(
         return Vec::new();
     }
 
+    if let Some(intent_ref) = intent
+        && intent_excludes_all_skills(intent_ref)
+    {
+        return Vec::new();
+    }
+
     let input_lower = input.to_lowercase();
     let model_probs = skill_match_model::predict_skill(input, model_path);
     let runtime_model = RuntimeSkillModel::for_skills(skills);
@@ -68,12 +74,6 @@ pub fn rank_skills_locally_with_model_path<'a>(
     let mut ranked = Vec::new();
 
     for skill in skills {
-        if let Some(intent_ref) = intent
-            && is_intent_excluded(skill, intent_ref)
-        {
-            continue;
-        }
-
         let model_prior_score = match &model_probs {
             Some(result) => probability_for_label(result, &skill.name),
             None => 0.0,
@@ -269,13 +269,26 @@ fn probability_for_label(result: &skill_match_model::SkillMatchResult, label: &s
         .unwrap_or(0.0)
 }
 
+/// 判断 skill 的 `excludes` 模式是否命中输入。
+///
+/// 设计原则：
+/// - 对 ASCII 字母数字组成的模式（如 `"test"`, `"http"`）做词边界匹配，
+///   避免 `"test"` 误匹配 `"protest" / "latest" / "contest"`。
+/// - 对 CJK 等不存在词边界概念的模式，回退为子串包含。
 fn is_excluded_by_skill(skill: &SkillManifest, input_lower: &str) -> bool {
     if skill.excludes.is_empty() {
         return false;
     }
     skill.excludes.iter().any(|pattern| {
         let pattern_lower = pattern.to_lowercase();
-        input_lower.contains(&pattern_lower)
+        if pattern_lower.is_empty() {
+            return false;
+        }
+        if super::pattern_is_ascii_word(&pattern_lower) {
+            super::ascii_word_contains(input_lower, &pattern_lower)
+        } else {
+            input_lower.contains(&pattern_lower)
+        }
     })
 }
 
@@ -379,5 +392,40 @@ mod tests {
             second[0].fallback_semantic_score > first[0].fallback_semantic_score,
             "expected changed skill content to refresh cached semantic features"
         );
+    }
+
+    #[test]
+    fn ascii_word_contains_respects_word_boundary() {
+        use crate::ai::driver::ascii_word_contains;
+        assert!(ascii_word_contains("run the test", "test"));
+        assert!(ascii_word_contains("test now", "test"));
+        assert!(ascii_word_contains("test", "test"));
+        assert!(ascii_word_contains("a-test-b", "test"));
+        assert!(!ascii_word_contains("protest the decision", "test"));
+        assert!(!ascii_word_contains("latest update", "test"));
+        assert!(!ascii_word_contains("contest", "test"));
+        assert!(!ascii_word_contains("attestation", "test"));
+        assert!(!ascii_word_contains("tested", "test"));
+        // 边界包含 CJK 也算合法分隔（因 CJK 不属于 ASCII word char）
+        assert!(ascii_word_contains("跑 test 看一下", "test"));
+    }
+
+    #[test]
+    fn excludes_word_boundary_for_ascii_pattern() {
+        let mut s = skill("foo", "");
+        s.excludes = vec!["test".to_string()];
+        assert!(is_excluded_by_skill(&s, "run the test"));
+        assert!(!is_excluded_by_skill(&s, "protest the decision"));
+        assert!(!is_excluded_by_skill(&s, "latest update"));
+        assert!(!is_excluded_by_skill(&s, "contest"));
+    }
+
+    #[test]
+    fn excludes_substring_for_cjk_pattern() {
+        let mut s = skill("foo", "");
+        s.excludes = vec!["测试".to_string()];
+        // CJK 没有词边界概念，回退为 substring 匹配
+        assert!(is_excluded_by_skill(&s, "运行测试"));
+        assert!(is_excluded_by_skill(&s, "测试一下"));
     }
 }

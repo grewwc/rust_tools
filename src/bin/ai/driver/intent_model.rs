@@ -8,6 +8,7 @@ use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
 
 use super::intent_recognition::{CoreIntent, IntentModifiers, UserIntent};
+use super::normalize_text_for_similarity as normalize_text;
 
 const DEFAULT_INTENT_MODEL_RELATIVE_PATH: &str = "src/bin/ai/config/intent/intent_model.json";
 
@@ -89,7 +90,8 @@ pub(crate) fn load_model_file(path: &Path) -> Result<IntentModelFile, String> {
 
 fn load_model_cached(path: &Path) -> Option<Arc<IntentModelFile>> {
     let path = path.to_path_buf();
-    if let Ok(cache) = INTENT_MODEL_CACHE.lock()
+    // Mutex 中毒（持锁线程 panic）时仍能恢复，避免反复重新加载模型。
+    if let Some(cache) = lock_recover(&INTENT_MODEL_CACHE)
         && let Some(model) = cache.get(&path)
     {
         return Some(Arc::clone(model));
@@ -98,11 +100,25 @@ fn load_model_cached(path: &Path) -> Option<Arc<IntentModelFile>> {
     let model = load_model_file(&path).ok()?;
     let model = Arc::new(model);
 
-    if let Ok(mut cache) = INTENT_MODEL_CACHE.lock() {
+    if let Some(mut cache) = lock_recover(&INTENT_MODEL_CACHE) {
         cache.insert(path, Arc::clone(&model));
     }
 
     Some(model)
+}
+
+/// 获取 Mutex 锁，遇到中毒（poisoned）时记录一次 warning 并恢复，
+/// 而不是把后续所有缓存读写静默吞掉。
+fn lock_recover<'a, T>(m: &'a Mutex<T>) -> Option<std::sync::MutexGuard<'a, T>> {
+    match m.lock() {
+        Ok(g) => Some(g),
+        Err(poisoned) => {
+            eprintln!(
+                "[intent_model] cache mutex poisoned, recovering inner state"
+            );
+            Some(poisoned.into_inner())
+        }
+    }
 }
 
 fn validate_model(model: &IntentModelFile) -> Result<(), String> {
@@ -143,11 +159,17 @@ fn detect_modifiers(input: &str, rules: &RuntimeRules) -> IntentModifiers {
     modifiers
 }
 
+/// 提取查询目标资源类型。
+///
+/// 当多个 `resource_keywords` 同时命中时（如同时出现 "skill" 和 "tool"），
+/// 选择 `pattern` 最长的那个 —— 长 pattern 通常更具体，冲突解决比"按数组顺序
+/// 取第一个"更稳定。规则数据本身没有 priority 字段，无需改 schema。
 fn extract_target_resource(input: &str, rules: &RuntimeRules) -> Option<String> {
     rules
         .resource_keywords
         .iter()
-        .find(|rule| !rule.pattern.trim().is_empty() && input.contains(rule.pattern.as_str()))
+        .filter(|rule| !rule.pattern.trim().is_empty() && input.contains(rule.pattern.as_str()))
+        .max_by_key(|rule| rule.pattern.chars().count())
         .map(|rule| rule.resource.clone())
 }
 
@@ -220,33 +242,19 @@ fn extract_char_ngrams(input: &str, min_n: usize, max_n: usize) -> Vec<String> {
     out
 }
 
-fn normalize_text(input: &str) -> String {
-    let mut normalized = String::new();
-    let mut prev_space = false;
-
-    for ch in input.to_lowercase().chars() {
-        if ch == '\r' {
-            continue;
-        }
-        if ch.is_whitespace() {
-            if !prev_space {
-                normalized.push(' ');
-            }
-            prev_space = true;
-        } else {
-            normalized.push(ch);
-            prev_space = false;
-        }
-    }
-
-    normalized.trim().to_string()
-}
-
 fn label_to_core(label: Option<&str>) -> CoreIntent {
     match label.unwrap_or("casual") {
         "query_concept" => CoreIntent::QueryConcept,
         "request_action" => CoreIntent::RequestAction,
         "seek_solution" => CoreIntent::SeekSolution,
-        _ => CoreIntent::Casual,
+        "casual" => CoreIntent::Casual,
+        unknown => {
+            // 模型文件升级后新增标签若没有同步处理逻辑，会无声 fallback 到 Casual。
+            // 输出警告便于调试，避免静默降级。
+            eprintln!(
+                "[intent_model] unknown intent label '{unknown}', falling back to Casual"
+            );
+            CoreIntent::Casual
+        }
     }
 }

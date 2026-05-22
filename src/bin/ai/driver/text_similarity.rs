@@ -1,5 +1,57 @@
+//! 面向 **skill / agent routing** 的轻量文本相似度工具。
+//!
+//! 与 `knowledge::indexing::similarity` 是两个并列、独立的相似度库，使用场景与
+//! 数据结构完全不同，**调用方不可混用**：
+//!
+//! | 模块                                       | 主要用户                       | 归一化            | 集合数据结构 |
+//! |--------------------------------------------|--------------------------------|-------------------|--------------|
+//! | `driver::text_similarity` (本文件)         | skill_match / agent_router     | 保留单空格        | `SkipSet`    |
+//! | `knowledge::indexing::similarity`          | memory / RAG 检索              | 完全去除空格      | `Vec`/`HashSet` |
+//!
+//! 两套实现历史上来自不同代码路径，目前算法精度也不同（本文件用 `cosine_tfidf` 结合
+//! 2-4 元 char-ngram，knowledge 端用基于词的 jaccard / dice）。如果将来要合并，
+//! 必须同时验证 routing 与召回两个 pipeline 的回归数据。
+
 use rust_tools::commonw::FastMap;
 use rust_tools::cw::SkipSet;
+
+/// 在 `haystack` 中按 ASCII 词边界查找 `needle`。
+///
+/// 词边界 = 该位置左右两侧不是 ASCII 字母 / 数字 / `_`。
+/// 该函数仅适用于 ASCII needle；对包含 CJK / emoji 的 needle，
+/// 调用方应自行回退到子串匹配，因为这些字符并无"词"的概念。
+pub fn ascii_word_contains(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let needle_bytes = needle.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut start = 0usize;
+    while let Some(rel) = haystack[start..].find(needle) {
+        let pos = start + rel;
+        let left_ok = pos == 0 || !is_word(bytes[pos - 1]);
+        let right = pos + needle_bytes.len();
+        let right_ok = right >= bytes.len() || !is_word(bytes[right]);
+        if left_ok && right_ok {
+            return true;
+        }
+        start = pos + 1;
+        if start >= bytes.len() {
+            break;
+        }
+    }
+    false
+}
+
+/// `pattern` 是否完全由 ASCII 字母 / 数字 / `_` / `-` 组成。
+/// 若是，调用方可使用 `ascii_word_contains`；否则应回退为 `contains`。
+pub fn pattern_is_ascii_word(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
 
 pub struct TextSimilarityFeatures {
     pub normalized: String,

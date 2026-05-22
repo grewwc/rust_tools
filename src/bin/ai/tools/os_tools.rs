@@ -4,6 +4,25 @@ use crate::ai::tools::registry::common::{ToolRegistration, ToolSpec};
 use std::sync::Mutex;
 use aios_kernel::kernel::{ProcessCapabilities, SharedKernel};
 use aios_kernel::primitives::{ChannelMetaSnapshot, ChannelOwnerTag};
+
+/// 全局 AIOS kernel 句柄，由 driver 启动时通过 [`init_os_tools_globals`] 注入。
+///
+/// **同步语义**：`GLOBAL_OS` 与 [`crate::ai::types::App::os`] 持有的是
+/// **同一个 `Arc<Mutex<Box<dyn Kernel>>>`**（即 `SharedKernel`），二者只是同一
+/// 内核句柄的两种取用方式：
+/// - `App.os`：driver 流程（foreground / background loop、turn_runtime）使用
+/// - `GLOBAL_OS`：tool 实现（位于 `os_tools.rs` 等）使用，因为 tool 没有
+///   `App` 引用
+///
+/// 由于底层是同一个 `Arc<Mutex<...>>`，两条路径**互斥**地拿同一把锁；这意味着
+/// 不会出现"两把不同的锁"导致的真死锁，但**会触发 `std::sync::Mutex` 的重入死锁**
+/// （在持有 `app.os.lock()` 的同时，从同一线程进入调用 `GLOBAL_OS.lock()` 的
+/// tool 会立即阻塞或 panic）。所有同步调用方必须保证：在调用 tool 之前先释放
+/// `app.os` 的 lock guard。
+///
+/// 高频路径推荐通过 [`task_tools::with_os_kernel`](crate::ai::tools::task_tools)
+/// 访问，它会优先使用 `DRIVER_CTX` 中的引用而不是这个 static，从而减少
+/// 间接寻址。
 pub static GLOBAL_OS: LazyLock<Mutex<Option<SharedKernel>>> = LazyLock::new(|| Mutex::new(None));
 
 pub fn init_os_tools_globals(os: SharedKernel) {

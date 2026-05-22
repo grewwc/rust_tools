@@ -1,5 +1,15 @@
-/// Similarity functions — single source for all text/vector similarity calculations.
-/// Extracted from memory_store.rs and rag_store.rs to eliminate duplication.
+//! 面向 **memory / knowledge / RAG 检索** 的相似度库（向量、Jaccard、Dice、Han
+//! 分词）。本模块抽自 `memory_store.rs` / `rag_store.rs` 以消除两份重复实现。
+//!
+//! 与 `driver::text_similarity` 是两个并列、独立的相似度库，使用场景与数据结构
+//! 完全不同，**调用方不可混用**。详见 `driver::text_similarity` 模块顶部说明。
+//! 简要差异：本模块归一化时 **完全删除空格**（适合中文 token 粒度的相似度），
+//! 而 `driver::text_similarity` 归一化时 **保留单个空格**（适合英文/路由风格的
+//! token 比较）。
+//!
+//! 注意：如果将来要将两套实现合并，需要同时验证 RAG / memory 召回 与 skill /
+//! agent routing 两侧的回归数据。
+
 use rust_tools::commonw::FastMap;
 use rust_tools::commonw::FastSet;
 

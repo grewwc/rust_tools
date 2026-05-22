@@ -99,7 +99,13 @@ pub async fn upgrade_intent_via_model(
 }
 
 /// 触发 LLM fallback 的启发式：本地分到 Casual，但问题本身明显
-/// 是个非平凡请求（带代码、带 ?、动词驱动、长度足够）。
+/// 是个非平凡请求（带代码、长问题、含明显操作动词或问题信号）。
+///
+/// 实现策略：
+/// 1. 优先依赖结构化信号（代码块、错误堆栈痕迹、问号、长度），它们与语种无关。
+/// 2. 仅在结构化信号不足时，退化到关键词匹配；此时 ASCII 关键词使用 ASCII
+///    词边界（避免 `"fn "` 漏掉 `"fn("`、`"how"` 误匹配 `"however"`），
+///    CJK 关键词只做子串匹配。
 fn looks_non_casual(question: &str) -> bool {
     let q = question.trim();
     if q.is_empty() {
@@ -109,24 +115,65 @@ fn looks_non_casual(question: &str) -> bool {
     if len < 8 {
         return false;
     }
-    let has_code = q.contains("```") || q.contains("::") || q.contains("fn ");
-    let has_error_words = q.contains("error")
-        || q.contains("Error")
-        || q.contains("panic")
-        || q.contains("traceback")
-        || q.contains("报错")
-        || q.contains("失败");
-    let has_action_verbs = q.contains("帮我")
-        || q.contains("修复")
-        || q.contains("实现")
-        || q.contains("怎么")
-        || q.contains("如何")
-        || q.contains("为什么")
-        || q.contains("fix")
-        || q.contains("implement")
-        || q.contains("how ")
-        || q.contains("why ");
-    has_code || has_error_words || has_action_verbs || len >= 60
+    // ---- 结构化信号 ----
+    if has_structural_code_signal(q) {
+        return true;
+    }
+    if has_question_punctuation(q) {
+        return true;
+    }
+    if len >= 60 {
+        return true;
+    }
+
+    // ---- 关键词信号（带词边界 / 大小写不敏感）----
+    let lower = q.to_ascii_lowercase();
+    has_ascii_action_signal(&lower) || has_cjk_action_signal(q)
+}
+
+/// 是否包含明显的"代码 / 错误堆栈"结构信号。
+fn has_structural_code_signal(q: &str) -> bool {
+    if q.contains("```") {
+        return true;
+    }
+    // Rust path / namespace 形式：`module::item`
+    if q.contains("::") {
+        return true;
+    }
+    // 各语言常见函数声明前缀（带词边界）
+    let lower = q.to_ascii_lowercase();
+    for kw in ["fn ", "fn(", "def ", "func ", "function "] {
+        if lower.contains(kw) {
+            return true;
+        }
+    }
+    false
+}
+
+fn has_question_punctuation(q: &str) -> bool {
+    q.contains('?') || q.contains('？')
+}
+
+fn has_ascii_action_signal(lower: &str) -> bool {
+    // 一律按 ASCII 词边界匹配，避免 "implement" 误匹配 "reimplementation"、
+    // "how" 误匹配 "however" 等情况。
+    const KEYWORDS: &[&str] = &[
+        "error", "panic", "traceback", "exception", "stacktrace",
+        "fix", "implement", "refactor", "review", "debug", "optimize",
+        "how", "why", "what",
+    ];
+    KEYWORDS
+        .iter()
+        .any(|kw| super::ascii_word_contains(lower, kw))
+}
+
+fn has_cjk_action_signal(q: &str) -> bool {
+    // CJK 没有词边界概念，但这些词足够具体，子串匹配误杀率低。
+    const PATTERNS: &[&str] = &[
+        "帮我", "修复", "实现", "重构", "优化", "怎么", "如何", "为什么",
+        "报错", "失败", "异常",
+    ];
+    PATTERNS.iter().any(|p| q.contains(p))
 }
 
 #[cfg(test)]
