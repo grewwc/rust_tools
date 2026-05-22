@@ -348,7 +348,8 @@ pub(crate) async fn run_self_reflection_background(
         note: note.to_string(),
         tags: vec!["agent".to_string(), "policy".to_string()],
         source: Some(format!("session:{}", session_id)),
-        priority: Some(255),
+        // self_note 是会话期短期反思，不应作为永久记忆，让其参与正常 GC
+        priority: Some(150),
         owner_pid: None,
         owner_pgid: None,
     };

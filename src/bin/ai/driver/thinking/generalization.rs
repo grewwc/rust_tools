@@ -50,6 +50,7 @@ impl ExperienceGeneralizer {
             min_experiences_for_generalization: 3,
         };
         generalizer.load_principles_from_store();
+        generalizer.load_experience_buffer_from_store();
         generalizer
     }
 
@@ -77,6 +78,71 @@ impl ExperienceGeneralizer {
         }
     }
 
+    /// 从存储加载未泛化的经验缓冲区，恢复跨会话的待泛化数据
+    fn load_experience_buffer_from_store(&mut self) {
+        let store = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config()
+        })) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if let Ok(entries) = store.entries_by_category("raw_experience", self.max_buffer_size) {
+            for entry in entries {
+                let exp = RawExperience {
+                    id: entry.id.clone().unwrap_or_else(|| {
+                        format!("exp_{}", uuid::Uuid::new_v4().simple())
+                    }),
+                    category: entry
+                        .tags
+                        .iter()
+                        .find(|t| t.as_str() != "raw_experience")
+                        .cloned()
+                        .unwrap_or_else(|| "general".to_string()),
+                    note: entry.note.clone(),
+                    tags: entry.tags.clone(),
+                    source: entry.source.clone(),
+                };
+                self.experience_buffer.push(exp);
+                if self.experience_buffer.len() >= self.max_buffer_size {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 持久化单条经验到 store，使经验缓冲区跨进程保留
+    fn persist_experience(&self, exp: &RawExperience) {
+        let entry = crate::ai::tools::storage::memory_store::AgentMemoryEntry {
+            id: Some(exp.id.clone()),
+            timestamp: chrono::Local::now().to_rfc3339(),
+            category: "raw_experience".to_string(),
+            note: exp.note.clone(),
+            tags: {
+                let mut t = exp.tags.clone();
+                if !t.iter().any(|x| x == "raw_experience") {
+                    t.push("raw_experience".to_string());
+                }
+                t
+            },
+            source: exp.source.clone(),
+            priority: Some(80),
+            owner_pid: None,
+            owner_pgid: None,
+        };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
+            let _ = store.append(&entry);
+        }));
+    }
+
+    /// 从存储中删除一条已泛化的经验，避免重复消费
+    fn forget_experience(&self, exp_id: &str) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
+            let _ = store.delete_by_id(exp_id);
+        }));
+    }
+
     pub fn ingest_experience(
         &mut self,
         category: &str,
@@ -97,9 +163,11 @@ impl ExperienceGeneralizer {
             tags: tags.to_vec(),
             source: source.map(|s| s.to_string()),
         };
+        self.persist_experience(&experience);
         self.experience_buffer.push(experience);
         if self.experience_buffer.len() > self.max_buffer_size {
-            self.experience_buffer.remove(0);
+            let evicted = self.experience_buffer.remove(0);
+            self.forget_experience(&evicted.id);
         }
     }
 
@@ -136,9 +204,9 @@ impl ExperienceGeneralizer {
                 confidence: (existing.confidence + 0.1).min(1.0),
                 source_experiences: {
                     let mut sources = existing.source_experiences.clone();
-                    for id in source_ids {
-                        if !sources.contains(&id) {
-                            sources.push(id);
+                    for id in &source_ids {
+                        if !sources.contains(id) {
+                            sources.push(id.clone());
                         }
                     }
                     sources
@@ -148,13 +216,14 @@ impl ExperienceGeneralizer {
             if let Some(pos) = self.principles.iter().position(|p| p.id == updated.id) {
                 self.principles[pos] = updated.clone();
             }
+            self.consume_experiences(&source_ids);
             return Some(updated);
         }
 
         let principle = GeneralizedPrinciple {
             id: format!("principle_{}", uuid::Uuid::new_v4().simple()),
             principle: principle_text,
-            source_experiences: source_ids,
+            source_experiences: source_ids.clone(),
             domain: domain.clone(),
             abstraction_level: 1,
             confidence: 0.6,
@@ -164,7 +233,16 @@ impl ExperienceGeneralizer {
             cross_domain_links: Vec::new(),
         };
         self.principles.push(principle.clone());
+        self.consume_experiences(&source_ids);
         Some(principle)
+    }
+
+    /// 已被泛化吸收的经验从 buffer 和 store 中移除，避免重复参与下一次泛化
+    fn consume_experiences(&mut self, ids: &[String]) {
+        self.experience_buffer.retain(|e| !ids.contains(&e.id));
+        for id in ids {
+            self.forget_experience(id);
+        }
     }
 
     pub fn try_cross_domain_link(&mut self) -> Option<(String, String)> {
@@ -234,6 +312,8 @@ impl ExperienceGeneralizer {
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
+            // 先删除同 id 的旧记录，再追加，避免每次 reinforce 都向 JSONL 追加重复条目
+            let _ = store.delete_by_id(&principle.id);
             let _ = store.append(&entry);
         }));
     }

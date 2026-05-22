@@ -142,15 +142,8 @@ impl JsonlStore {
             return Ok(None);
         }
 
-        let mut output = String::new();
-        for entry in &entries {
-            if let Ok(s) = serde_json::to_string(entry) {
-                output.push_str(&s);
-                output.push('\n');
-            }
-        }
-
-        std::fs::write(&self.path, output).map_err(|e| format!("Failed to write file: {}", e))?;
+        // 复用 rewrite 的 tmp+rename 原子写路径，避免崩溃后丢失整个文件。
+        self.rewrite(&entries)?;
 
         Ok(deleted_entry)
     }

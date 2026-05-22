@@ -29,7 +29,6 @@ pub trait VectorStoreSync {
 
 /// Sync a single entry to the vector store.
 pub fn sync_entry_to_vector(
-    _jsonl_store: &JsonlStore,
     vector_store: &dyn VectorStoreSync,
     entry: &KnowledgeEntry,
 ) -> Result<(), String> {

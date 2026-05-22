@@ -105,7 +105,7 @@ pub(crate) fn build_recall_bundle(
     }
 
     let config = KnowledgeConfig::from_config_file();
-    RecallBundle {
+    let bundle = RecallBundle {
         guidelines: build_persistent_guidelines_from_parts(
             &jsonl_store,
             question,
@@ -118,8 +118,9 @@ pub(crate) fn build_recall_bundle(
             recall_max_chars,
             &config,
         ),
-    }
-    .tap(|bundle| store_cached_recall_bundle(cache_key, bundle.clone()))
+    };
+    store_cached_recall_bundle(cache_key, bundle.clone());
+    bundle
 }
 
 fn build_persistent_guidelines_from_parts(
@@ -226,12 +227,3 @@ fn store_cached_recall_bundle(key: RecallBundleCacheKey, value: RecallBundle) {
         cache.truncate(RECALL_BUNDLE_CACHE_LIMIT);
     }
 }
-
-trait Tap: Sized {
-    fn tap<F: FnOnce(&Self)>(self, f: F) -> Self {
-        f(&self);
-        self
-    }
-}
-
-impl<T> Tap for T {}

@@ -229,12 +229,16 @@ impl VectorStore {
         }
 
         combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        combined.truncate(limit);
 
+        // 先按 entry_map 过滤掉孤儿 ID（FTS 命中但向量表已删除的条目），
+        // 再做 truncate(limit)，避免最终返回数量远小于请求的 limit
         let mut results = Vec::new();
         for (id, score) in combined {
             if let Some(entry) = entry_map.get(&id) {
                 results.push((id, entry.clone(), score));
+                if results.len() >= limit {
+                    break;
+                }
             }
         }
         Ok(results)

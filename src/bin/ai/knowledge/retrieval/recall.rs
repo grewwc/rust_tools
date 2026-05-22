@@ -357,7 +357,11 @@ fn current_project_hint() -> Option<String> {
 fn should_include_in_auto_recall(entry: &KnowledgeEntry) -> bool {
     matches!(
         entry.category_enum(),
-        Category::UserMemory | Category::ProjectInfo | Category::Architecture | Category::DecisionLog
+        Category::UserMemory
+            | Category::ProjectInfo
+            | Category::Architecture
+            | Category::DecisionLog
+            | Category::ProjectWriteback
     )
 }
 

@@ -982,7 +982,8 @@ impl MemoryStore {
                 }
             }
 
-            std::fs::write(&self.path, output)
+            // 与 enforce_max_entries 保持一致：tmp + rename 原子写，避免崩溃后留下不完整主文件。
+            atomic_write_file(&self.path, output.as_bytes())
                 .map_err(|e| format!("Failed to write memory file: {}", e))?;
 
             Ok(deleted_entry)

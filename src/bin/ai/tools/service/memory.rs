@@ -169,16 +169,21 @@ fn default_priority_for_category(category: &str) -> u8 {
 ///   - 用户偏好 / coding_guideline / project_memory 等长期资产 priority 是 210/180，
 ///     30 天没刷新就有概率被 GC 掉，与"长期记忆应该保留"的直觉不符。
 ///
-/// 新策略：priority==255 仍然豁免（safety_rules / reflection self_note 等永远 hold），
+/// 新策略：priority==255 仍然豁免（safety_rules 等显式声明的永久记忆），
 /// 同时把以下 category 视为长期资产，无论 priority 多少都豁免：
-///   - 所有 guideline 类（safety/preference/user_preference/coding_guideline/
-///     best_practice/common_sense/self_note）
+///   - 多数 guideline 类（safety/preference/user_preference/coding_guideline/
+///     best_practice/common_sense）
 ///   - `project_memory`：项目级事实，writeback 路径会主动 upsert，不应被时间淘汰
+///
+/// 注意 self_note 虽属于 guideline 用于召回，但属于会话期反思，应参与 GC。
 pub(crate) fn is_permanent_memory(entry: &AgentMemoryEntry) -> bool {
     if entry.priority.unwrap_or(100) == 255 {
         return true;
     }
-    if crate::ai::knowledge::retrieval::recall::is_guideline_category(&entry.category) {
+    // self_note 是会话期反思，虽然属于 guideline 用于 recall，但应参与 GC
+    if entry.category.as_str() != "self_note"
+        && crate::ai::knowledge::retrieval::recall::is_guideline_category(&entry.category)
+    {
         return true;
     }
     matches!(entry.category.as_str(), "project_memory")

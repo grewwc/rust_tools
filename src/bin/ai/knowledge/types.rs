@@ -48,6 +48,9 @@ impl Category {
             "decision_log" => Self::DecisionLog,
             "tool_cache" => Self::ToolCache,
             "project_writeback" => Self::ProjectWriteback,
+            // 历史/兼容：reflection/writeback 模块写入的 category 字符串是 "project_memory"，
+            // 与 ProjectWriteback 在语义上同源，统一映射避免落到 Other 而被 auto-recall 漏掉。
+            "project_memory" => Self::ProjectWriteback,
             _ => Self::Other,
         }
     }

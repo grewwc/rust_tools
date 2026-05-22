@@ -11,6 +11,33 @@ use chrono::Local;
 use super::gates::{answer_looks_unstable_for_writeback, turn_uses_repo_inspection_tools};
 use super::recall::current_project_name_hint;
 
+/// 把 reflection 写入的 AgentMemoryEntry 同步到向量索引，让 semantic search 能召回。
+/// 失败仅打印 warning，不阻塞 JSONL 写入流程。
+fn sync_agent_entry_to_vector(entry: &AgentMemoryEntry) {
+    let knowledge_entry = crate::ai::knowledge::entry::KnowledgeEntry {
+        id: entry.id.clone(),
+        timestamp: entry.timestamp.clone(),
+        category: entry.category.clone(),
+        note: entry.note.clone(),
+        tags: entry.tags.clone(),
+        source: entry.source.clone(),
+        priority: entry.priority,
+    };
+    let guard = match crate::ai::tools::storage::rag_store::get_rag_store() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let Some(store) = guard.as_ref() else {
+        return;
+    };
+    if let Err(err) = crate::ai::knowledge::sync::knowledge_sync::sync_entry_to_vector(
+        store,
+        &knowledge_entry,
+    ) {
+        eprintln!("[Memory] writeback vector sync failed: {}", err);
+    }
+}
+
 pub(super) async fn maybe_write_back_project_knowledge(
     _app: &mut App,
     model: &str,
@@ -151,6 +178,19 @@ pub(super) fn upsert_project_writeback_entry(
             "source": source,
             "priority": priority,
         }))?;
+        // 同步向量索引：用最新内容覆盖向量库中同 id 的条目，避免 semantic search 拿到旧版本。
+        let updated = AgentMemoryEntry {
+            id: Some(id.to_string()),
+            timestamp: Local::now().to_rfc3339(),
+            category: "project_memory".to_string(),
+            note: content.to_string(),
+            tags: tags.clone(),
+            source: Some(source.to_string()),
+            priority: Some(priority),
+            owner_pid: None,
+            owner_pgid: None,
+        };
+        sync_agent_entry_to_vector(&updated);
         return Ok(ProjectWritebackUpsert::Updated);
     }
 
@@ -166,6 +206,8 @@ pub(super) fn upsert_project_writeback_entry(
         owner_pgid: None,
     };
     store.append(&entry)?;
+    // 同步向量索引：让 semantic search 能立刻召回新写入的项目记忆。
+    sync_agent_entry_to_vector(&entry);
     Ok(ProjectWritebackUpsert::Saved)
 }
 
