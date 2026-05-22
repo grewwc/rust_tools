@@ -1854,8 +1854,14 @@ fn is_cacheable_tool_name(name: &str) -> bool {
 }
 
 fn build_tool_cache_key(name: &str, args: &Value) -> String {
+    use sha2::{Digest, Sha256};
     let args_json = serde_json::to_string(args).unwrap_or_else(|_| args.to_string());
-    format!("{:x}", md5::compute(format!("{name}\n{args_json}")))
+    let digest = Sha256::digest(format!("{name}\n{args_json}").as_bytes());
+    let mut s = String::with_capacity(32);
+    for b in &digest[..16] {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
 }
 
 fn tool_cache_validation_matches(payload: &ToolCachePayload) -> bool {

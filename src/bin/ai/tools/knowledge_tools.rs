@@ -26,6 +26,16 @@ use crate::ai::tools::common::ToolSpec;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use crate::ai::tools::storage::rag_store::{ensure_rag_store, get_rag_store, RagEntry};
 
+/// 32 字符短指纹（取 SHA-256 前 16 字节）。
+fn short_rag_id(bytes: &[u8]) -> String {
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(bytes);
+    let mut s = String::with_capacity(32);
+    for b in &digest[..16] {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
 // ─── knowledge_save ──────────────────────────────────────────────────────────
 
 fn params_knowledge_save() -> Value {
@@ -95,10 +105,7 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
     if let Ok(_) = ensure_rag_store() {
         if let Ok(guard) = get_rag_store() {
             if let Some(rag) = guard.as_ref() {
-                let id = format!(
-                    "{:x}",
-                    md5::compute(&format!("{}:{}", entry.timestamp, content))
-                );
+                let id = short_rag_id(format!("{}:{}", entry.timestamp, content).as_bytes());
                 let embedding_text = format!("{}: {}", entry.category, entry.note);
                 if let Ok(embeddings) = rag.embed_texts(&[embedding_text.clone()]) {
                     if let Some(embedding) = embeddings.into_iter().next() {
@@ -184,10 +191,8 @@ fn execute_knowledge_forget(args: &Value) -> Result<String, String> {
     if let Ok(_) = ensure_rag_store() {
         if let Ok(guard) = get_rag_store() {
             if let Some(rag) = guard.as_ref() {
-                let rag_id = format!(
-                    "{:x}",
-                    md5::compute(&format!("{}:{}", deleted.timestamp, deleted.note))
-                );
+                let rag_id =
+                    short_rag_id(format!("{}:{}", deleted.timestamp, deleted.note).as_bytes());
                 let _ = rag.delete(&rag_id);
             }
         }

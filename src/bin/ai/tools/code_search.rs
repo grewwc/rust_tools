@@ -20,23 +20,7 @@ const EXTRA_TEXT_EXTENSIONS: &[&str] = &[
     "json", "yaml", "yml", "toml", "md", "txt", "sql", "sh",
 ];
 
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    "__pycache__",
-    ".venv",
-    "venv",
-    ".tox",
-    "dist",
-    "build",
-    ".next",
-    ".nuxt",
-    "vendor",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".cargo",
-];
+const SKIP_DIRS: &[&str] = rust_tools::commonw::SKIP_DIRS;
 
 fn params_code_search() -> Value {
     serde_json::json!({
@@ -425,7 +409,7 @@ fn execute_content_text_search(
     let files = collect_text_search_files(target, file_pattern)?;
     
     // Parallel text search across files
-    let max_threads = (num_cpus::get() / 2).max(1);
+    let max_threads = rust_tools::commonw::half_parallelism();
     let chunk_size = (files.len() / max_threads).max(1);
     let chunks: Vec<Vec<PathBuf>> = files.chunks(chunk_size).map(|c| c.to_vec()).collect();
     

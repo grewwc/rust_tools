@@ -177,13 +177,25 @@ fn request_interrupt_futex_ready() -> bool {
 }
 
 async fn wait_for_request_interrupt(shutdown: Arc<AtomicBool>, cancel_stream: Arc<AtomicBool>) {
+    let notify = crate::ai::driver::signal::request_interrupt_notify();
     loop {
         if request_interrupt_pending(shutdown.as_ref(), cancel_stream.as_ref())
             || request_interrupt_futex_ready()
         {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // 注册等待 future 后再次检查，避免 signal_request_interrupt 与注册之间的 race。
+        let notified = notify.notified();
+        if request_interrupt_pending(shutdown.as_ref(), cancel_stream.as_ref())
+            || request_interrupt_futex_ready()
+        {
+            return;
+        }
+        // 50ms 兜底兼容外部 futex 唤醒（不经 Notify 通道）。
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
     }
 }
 

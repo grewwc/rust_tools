@@ -52,6 +52,42 @@ fn execute_semantic_search(args: &Value) -> Result<String, String> {
     let limit = args["limit"].as_u64().map(|v| v as usize).unwrap_or(5);
     let use_hybrid = args["hybrid"].as_bool().unwrap_or(true);
 
+    // 嵌入模型已经不再静态链接（fastembed/ONNX runtime 25MB 移除），
+    // 当本地 embedder::is_ready() == false 时直接降级为 BM25/lexical 检索，
+    // 不再返回错误，并在结果前缀里标记 [retrieval:bm25-fallback]。
+    let semantic_available = crate::ai::knowledge::indexing::embedder::is_ready();
+    if !semantic_available {
+        let mem_store = MemoryStore::from_env_or_config();
+        let jsonl_store = JsonlStore::new(mem_store.path().to_path_buf());
+        let config = KnowledgeConfig::default();
+        let bm25_results = crate::ai::knowledge::retrieval::keyword_search::keyword_search(
+            &jsonl_store,
+            query,
+            limit,
+            &config,
+        )?;
+        if bm25_results.is_empty() {
+            return Ok(format!("No results found for: '{}'", query));
+        }
+        let mut output = format!(
+            "[retrieval:bm25-fallback] semantic embedding unavailable, using BM25 + lexical similarity\n\nResults for '{}':\n\n",
+            query
+        );
+        for (idx, (entry, score)) in bm25_results.iter().enumerate() {
+            output.push_str(&format!(
+                "{}. [score: {:.3}] [{}] {}\n",
+                idx + 1,
+                score,
+                entry.category,
+                entry.note
+            ));
+            if !entry.tags.is_empty() {
+                output.push_str(&format!("   Tags: {}\n", entry.tags.join(", ")));
+            }
+        }
+        return Ok(output);
+    }
+
     if use_hybrid {
         // Hybrid search: combine BM25 with vector
         let mem_store = MemoryStore::from_env_or_config();

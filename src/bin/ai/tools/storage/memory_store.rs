@@ -31,6 +31,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use super::memory_index::MemoryIndex;
 use super::with_memory_file_lock;
 use crate::ai::knowledge::indexing::{embedder, similarity};
 use crate::ai::tools::service::memory::{execute_memory_dedup, execute_memory_gc};
@@ -38,7 +39,118 @@ use crate::commonw::configw;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::ffi::OsStr;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
+
+/// 全局 (source_path, MemoryIndex) 注册表，懒加载、按 path 复用。
+/// 第一次访问某条 source 路径时打开 / 重建 SQLite 索引；后续都拿到同一个
+/// `Arc<MemoryIndex>`，跨调用共享 LFU 计数与 FTS 索引。
+fn memory_index_for(source_path: &Path) -> Option<Arc<MemoryIndex>> {
+    use std::sync::Mutex;
+    static REG: OnceLock<Mutex<Vec<(PathBuf, Arc<MemoryIndex>)>>> = OnceLock::new();
+    let reg = REG.get_or_init(|| Mutex::new(Vec::new()));
+    let mut guard = reg.lock().ok()?;
+    if let Some((_, idx)) = guard.iter().find(|(p, _)| p == source_path) {
+        return Some(idx.clone());
+    }
+    let db_path = derive_db_path(source_path)?;
+    match MemoryIndex::open_or_init(db_path.clone(), source_path.to_path_buf()) {
+        Ok(idx) => {
+            let arc = Arc::new(idx);
+            guard.push((source_path.to_path_buf(), arc.clone()));
+            Some(arc)
+        }
+        Err(e) => {
+            // 索引不可用时降级到 BM25 路径，不阻断主存储。
+            trace_memory_event(
+                "memory.index.open_failed",
+                "MemoryIndex unavailable; falling back to BM25",
+                &[
+                    ("source", source_path.display().to_string()),
+                    ("db", db_path.display().to_string()),
+                    ("error", e),
+                ],
+            );
+            None
+        }
+    }
+}
+
+/// 由 source jsonl 路径派生出对应的 sqlite 路径：
+/// `agent_memory.jsonl` -> `agent_memory.db`
+/// `agent_memory.subagent-xxx.jsonl` -> `agent_memory.subagent-xxx.db`
+fn derive_db_path(source: &Path) -> Option<PathBuf> {
+    let stem = source.file_stem()?.to_str()?;
+    let parent = source.parent()?;
+    Some(parent.join(format!("{stem}.db")))
+}
+
+/// 把 memory 子系统的关键运维事件镜像到 AIOS kernel trace ring，
+/// 让 rotate / enforce / GC 等"会动数据"的动作在 AIOS 侧可观测。
+/// 任何获取不到内核或锁失败的情况都静默返回——不能影响主流程。
+pub(crate) fn trace_memory_event(
+    location: &'static str,
+    msg: &str,
+    fields: &[(&str, String)],
+) {
+    use aios_kernel::{FastMap, primitives::TraceLevel};
+
+    let g = match crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let kernel = match g.as_ref() {
+        Some(k) => k.clone(),
+        None => return,
+    };
+    drop(g);
+
+    let mut map: FastMap<String, String> = FastMap::default();
+    for (k, v) in fields {
+        map.insert((*k).to_string(), v.clone());
+    }
+    if let Ok(mut guard) = kernel.lock() {
+        guard.trace_event(
+            location.to_string(),
+            TraceLevel::Info,
+            None,
+            map,
+            Some(msg.to_string()),
+        );
+    }
+}
+
+/// 原子地把内容写入 `path`：先写到同目录下的 tmp 文件，fsync 后 rename。
+/// 进程在中途崩溃也只会留下被 rename 替换前的旧主文件，不会写出半截 JSONL。
+fn atomic_write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("memory");
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = parent.join(format!(".{}.tmp.{}.{}", file_name, pid, nanos));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(contents)?;
+        f.flush()?;
+        let _ = f.sync_all();
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // rename 失败时尽力清理 tmp，避免遗留半成品
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AgentMemoryEntry {
@@ -131,6 +243,24 @@ impl MemoryStore {
             file.write_all(serialized.as_bytes())
                 .and_then(|_| file.write_all(b"\n"))
                 .map_err(|e| format!("Failed to write memory file: {e}"))?;
+
+            // JSONL 是 source of truth；下面的 SQLite 索引同步是 best-effort，
+            // 失败只 trace 不冒泡。这样即使 rusqlite 出问题也不会阻断主存储。
+            if let Some(idx) = memory_index_for(&self.path) {
+                if let Err(e) = idx.upsert_entry(entry) {
+                    trace_memory_event(
+                        "memory.index.upsert_failed",
+                        "MemoryIndex upsert failed; index may drift",
+                        &[
+                            ("path", self.path.display().to_string()),
+                            ("entry_id", entry.id.clone().unwrap_or_default()),
+                            ("error", e),
+                        ],
+                    );
+                } else {
+                    let _ = idx.refresh_signature();
+                }
+            }
 
             Ok(())
         })
@@ -229,6 +359,19 @@ impl MemoryStore {
         limit: usize,
     ) -> Result<Vec<(AgentMemoryEntry, f64)>, String> {
         let query_lc = query.to_lowercase();
+
+        // Fast-path: 先用 SQLite FTS5 拿候选 id 集合（O(log N) MATCH），
+        // 再回到 JSONL 把候选条目精确加载，跑现有 BM25 + embedding 计分。
+        // 这样把 search 从 "全文件扫描 + 全文件 tokenize" 降为 "命中行 + tokenize"，
+        // 输出格式 / 分数权重 / 排序逻辑全部不变。
+        // FTS 不可用 / 候选过少时回到原扫描路径，行为完全等价。
+        let fts_candidate_cap = limit.saturating_mul(20).max(60).min(400);
+        let fts_ids: Option<std::collections::HashSet<String>> = memory_index_for(&self.path)
+            .and_then(|idx| match idx.search_ids(&query_lc, fts_candidate_cap) {
+                Ok(v) if v.len() >= limit => Some(v.into_iter().collect()),
+                _ => None,
+            });
+
         let mut docs: Vec<(AgentMemoryEntry, String, Vec<String>)> = Vec::new();
         for p in self.memory_files_to_scan()? {
             if !p.exists() {
@@ -246,6 +389,16 @@ impl MemoryStore {
                 let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) else {
                     continue;
                 };
+                if let Some(ids) = &fts_ids {
+                    // fast-path：只保留 FTS 命中的条目
+                    if let Some(id) = entry.id.as_deref() {
+                        if !ids.contains(id) {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
+                }
                 let mut full = String::new();
                 full.push_str(&entry.category);
                 full.push(' ');
@@ -352,6 +505,23 @@ impl MemoryStore {
         for (s, i) in top_idx {
             out.push((docs[i].0.clone(), s));
         }
+        // 给被命中的条目计 LFU；失败只 trace。注意只对 top-N（已截到 limit）计数，
+        // 而不是 cap=200 的中间集合，避免 score 很低的边缘条目刷出 hits。
+        if let Some(idx) = memory_index_for(&self.path) {
+            let ids: Vec<String> = out
+                .iter()
+                .filter_map(|(e, _)| e.id.clone())
+                .collect();
+            if !ids.is_empty() {
+                if let Err(e) = idx.record_hits(&ids) {
+                    trace_memory_event(
+                        "memory.index.hits_failed",
+                        "MemoryIndex record_hits failed",
+                        &[("path", self.path.display().to_string()), ("error", e)],
+                    );
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -391,6 +561,12 @@ impl MemoryStore {
     pub(crate) fn for_tests_with_path(path: PathBuf) -> Self {
         Self { path }
     }
+}
+
+/// 直接基于一个明确路径构建 store，绕过 task_local override / env / config。
+/// 用于父任务在 sub-agent finalize 后把白名单条目写回主 memory 文件。
+pub(crate) fn store_for_path(path: PathBuf) -> MemoryStore {
+    MemoryStore { path }
 }
 
 #[cfg(test)]
@@ -552,25 +728,87 @@ impl MemoryStore {
     pub(crate) fn rotate_if_exceeds(&self, max_bytes: u64) -> Result<bool, String> {
         let path = self.path().to_path_buf();
         with_memory_file_lock(&path, || {
-            let meta = std::fs::metadata(&path).ok();
-            if let Some(meta) = meta {
-                if meta.len() > max_bytes {
-                    let ts = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
-                    let mut new_name = path.clone();
-                    let ext = new_name
-                        .extension()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("jsonl")
-                        .to_string();
-                    new_name.set_extension(format!("{ext}.{}", ts));
-                    std::fs::rename(&path, &new_name)
-                        .map_err(|e| format!("Failed to rotate file: {}", e))?;
-                    std::fs::File::create(&path)
-                        .map_err(|e| format!("Failed to create new memory file: {}", e))?;
-                    return Ok(true);
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => return Ok(false),
+            };
+            if meta.len() <= max_bytes {
+                return Ok(false);
+            }
+
+            // 修复点 P0-2：原实现直接 `rename` + `File::create`，category 白名单内的
+            // 永久条目（safety_rules / reflection self_note / coding_guideline /
+            // user_preference / project_memory ...）也会被一起冻进归档，之后默认
+            // 不参与召回——等于把"长期记忆"的核心规则丢掉。
+            //
+            // 现在先把所有条目读出来，把白名单条目留在新主文件，其余写入归档：
+            //   - 新主文件 = 原内容 ∩ {is_permanent_memory}
+            //   - 归档文件 = 原内容（保持不变，与旧实现一致）
+            // 这样无论召回器是否启用 search_archives，长期资产都不会丢。
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| format!("Failed to read memory file before rotate: {}", e))?;
+
+            let entries: Vec<AgentMemoryEntry> = content
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        return None;
+                    }
+                    serde_json::from_str::<AgentMemoryEntry>(line).ok()
+                })
+                .collect();
+            let permanent: Vec<&AgentMemoryEntry> = entries
+                .iter()
+                .filter(|e| crate::ai::tools::service::memory::is_permanent_memory(e))
+                .collect();
+            let preserved_total = permanent.len();
+            let archived_total = entries.len();
+
+            let ts = chrono::Local::now().format("%Y%m%d%H%M%S").to_string();
+            let mut new_name = path.clone();
+            let ext = new_name
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("jsonl")
+                .to_string();
+            new_name.set_extension(format!("{ext}.{}", ts));
+            std::fs::rename(&path, &new_name)
+                .map_err(|e| format!("Failed to rotate file: {}", e))?;
+
+            // 重建主文件：写回所有 priority=255 的条目（保留原 timestamp 顺序）
+            let mut head = String::new();
+            for entry in &permanent {
+                if let Ok(s) = serde_json::to_string(*entry) {
+                    head.push_str(&s);
+                    head.push('\n');
                 }
             }
-            Ok(false)
+            atomic_write_file(&path, head.as_bytes()).map_err(|e| {
+                format!(
+                    "Failed to recreate memory file with permanent entries after rotate: {}",
+                    e
+                )
+            })?;
+
+            trace_memory_event(
+                "memory.rotate",
+                "memory file rotated; permanent entries preserved in head",
+                &[
+                    ("path", path.display().to_string()),
+                    ("archive", new_name.display().to_string()),
+                    ("archived_total", archived_total.to_string()),
+                    ("preserved_permanent", preserved_total.to_string()),
+                    ("max_bytes", max_bytes.to_string()),
+                    ("file_size", meta.len().to_string()),
+                ],
+            );
+            // rotate 把绝大多数条目搬到归档，索引内容已经严重失效。
+            // 这里直接触发一次 rebuild —— 现在主文件只剩永久条目，rebuild 很轻。
+            if let Some(idx) = memory_index_for(&path) {
+                let _ = idx.rebuild_from_source();
+            }
+            Ok(true)
         })
     }
 
@@ -627,39 +865,49 @@ impl MemoryStore {
                 })
                 .collect();
 
-            if entries.len() <= max_entries {
+            let original_total = entries.len();
+            if original_total <= max_entries {
                 return Ok(());
             }
 
+            // 排序键：永久条目（白名单：safety/preference/coding_guideline/
+            // project_memory/...）永远靠后，其余按 priority 升序、ts 升序。
+            // 这样删除的时候从头开始砍最低优先级、最旧的条目。
             entries.sort_by(|a, b| {
-                let pa = a.priority.unwrap_or(100);
-                let pb = b.priority.unwrap_or(100);
-                if pa == 255 && pb != 255 {
+                let perm_a = crate::ai::tools::service::memory::is_permanent_memory(a);
+                let perm_b = crate::ai::tools::service::memory::is_permanent_memory(b);
+                if perm_a && !perm_b {
                     return std::cmp::Ordering::Greater;
                 }
-                if pb == 255 && pa != 255 {
+                if perm_b && !perm_a {
                     return std::cmp::Ordering::Less;
                 }
+                let pa = a.priority.unwrap_or(100);
+                let pb = b.priority.unwrap_or(100);
                 pa.cmp(&pb).then_with(|| a.timestamp.cmp(&b.timestamp))
             });
 
+            // 修复点 P0-1：原实现用 `while … { remove(i); if … { remove(i); } }`
+            // 在同一个下标位置删了两次——第二次删的其实是已经"前移"上来的下一条，
+            // 而且没有跳过永久条目检查，可能误伤白名单条目。这里改成单删 +
+            // i 保持不动（remove(i) 后下一条自动落到 i），同时白名单条目跳过。
+            //
+            // target 字段保留只是为了"达到配额尽快收手"，不再用来触发第二次删除。
             let target = max_entries.saturating_sub(min_keep);
-            if target == 0 {
-                entries.truncate(min_keep);
-            } else {
-                let mut removed = 0;
-                let mut i = 0;
-                while i < entries.len() && entries.len() > max_entries {
-                    if entries[i].priority.unwrap_or(100) == 255 {
-                        i += 1;
-                        continue;
-                    }
-                    entries.remove(i);
-                    removed += 1;
-                    if removed >= target && entries.len() > max_entries {
-                        entries.remove(i);
-                        removed += 1;
-                    }
+            let mut removed = 0usize;
+            let mut skipped_permanent = 0usize;
+            let mut i = 0usize;
+            while i < entries.len() && entries.len() > max_entries {
+                if crate::ai::tools::service::memory::is_permanent_memory(&entries[i]) {
+                    // 永久条目永远跳过，不能 remove。
+                    skipped_permanent += 1;
+                    i += 1;
+                    continue;
+                }
+                entries.remove(i);
+                removed += 1;
+                if target > 0 && removed >= target && entries.len() <= max_entries {
+                    break;
                 }
             }
 
@@ -671,8 +919,30 @@ impl MemoryStore {
                 }
             }
 
-            std::fs::write(&self.path, output)
-                .map_err(|e| format!("Failed to write memory file after quota enforcement: {}", e))
+            // 修复点 P1-1：原实现 `fs::write(&path, output)` 是 truncate-then-write，
+            // 中途崩溃会留下不完整的主文件。改成 tmp+rename，文件系统层面原子。
+            atomic_write_file(&self.path, output.as_bytes())
+                .map_err(|e| format!("Failed to write memory file after quota enforcement: {}", e))?;
+
+            // 文件已被整体重写，触发索引重建以保持一致；rebuild 内部包事务，失败只 trace。
+            if let Some(idx) = memory_index_for(&self.path) {
+                let _ = idx.rebuild_from_source();
+            }
+
+            trace_memory_event(
+                "memory.enforce_max_entries",
+                "memory quota enforced",
+                &[
+                    ("path", self.path.display().to_string()),
+                    ("before", original_total.to_string()),
+                    ("after", entries.len().to_string()),
+                    ("removed", removed.to_string()),
+                    ("skipped_permanent", skipped_permanent.to_string()),
+                    ("max_entries", max_entries.to_string()),
+                    ("min_keep", min_keep.to_string()),
+                ],
+            );
+            Ok(())
         })
     }
 
@@ -991,6 +1261,12 @@ impl MemoryStore {
                     .map_err(|e| format!("Failed to write memory entry: {e}"))?;
             }
 
+            // 同步删除 SQLite 索引；失败只 trace，下次 search 启动时漂移检测会重建。
+            if let Some(idx) = memory_index_for(&self.path) {
+                let _ = idx.delete_id(id);
+                let _ = idx.refresh_signature();
+            }
+
             Ok(())
         })
     }
@@ -1001,10 +1277,16 @@ impl MemoryStore {
             .map(|results| results.into_iter().map(|(e, _score)| e).collect())
     }
 
-    /// 记录记忆被使用（增加引用次数）
-    pub fn record_usage(&self, _entry_id: &str) -> Result<(), String> {
-        // 这里可以扩展为在单独的元数据文件中记录使用次数
-        // 简化版本：暂时不实现，留给未来扩展
+    /// 记录记忆被使用（增加引用次数）。
+    /// 真正落地点是 SQLite 索引的 `hits` 列；JSONL 没法原地 update。
+    /// 索引不可用时静默返回 Ok，与历史行为兼容。
+    pub fn record_usage(&self, entry_id: &str) -> Result<(), String> {
+        if entry_id.is_empty() {
+            return Ok(());
+        }
+        if let Some(idx) = memory_index_for(&self.path) {
+            let _ = idx.record_hits(&[entry_id.to_string()]);
+        }
         Ok(())
     }
 }
@@ -1095,5 +1377,150 @@ mod importance_tests {
         low_importance.recency = 0.1;
         low_importance.generality = 0.2;
         assert!(low_importance.should_prune(0.3));
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_path(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("rt_mem_retention_{tag}_{nanos}.jsonl"))
+    }
+
+    fn entry(category: &str, note: &str, ts: &str, priority: u8) -> AgentMemoryEntry {
+        AgentMemoryEntry {
+            id: None,
+            timestamp: ts.to_string(),
+            category: category.to_string(),
+            note: note.to_string(),
+            tags: vec![],
+            source: None,
+            priority: Some(priority),
+            owner_pid: None,
+            owner_pgid: None,
+        }
+    }
+
+    fn write_lines(path: &Path, entries: &[AgentMemoryEntry]) {
+        let mut buf = String::new();
+        for e in entries {
+            buf.push_str(&serde_json::to_string(e).unwrap());
+            buf.push('\n');
+        }
+        std::fs::write(path, buf).unwrap();
+    }
+
+    fn read_entries(path: &Path) -> Vec<AgentMemoryEntry> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<AgentMemoryEntry>(l.trim()).ok())
+            .collect()
+    }
+
+    /// P0-1 回归：原实现的双删 bug 会在配额满后误删紧邻 priority=255 的条目，
+    /// 这里制造一份"低优先级 + 永久"混合，断言 enforce 后所有 priority=255
+    /// 都还在，且配额被压回 max_entries 之内。
+    #[test]
+    fn enforce_max_entries_keeps_all_permanent_entries() {
+        let path = unique_path("enforce_perm");
+        let mut all = Vec::new();
+        // 100 条普通低优先级，按时间从旧到新
+        for i in 0..100 {
+            all.push(entry(
+                "tool_stat",
+                &format!("note-{i}"),
+                &format!("2025-01-01T00:00:{:02}Z", i % 60),
+                50,
+            ));
+        }
+        // 5 条永久条目（safety_rules）
+        for i in 0..5 {
+            all.push(entry(
+                "safety_rules",
+                &format!("perm-{i}"),
+                &format!("2025-02-01T00:00:{:02}Z", i),
+                255,
+            ));
+        }
+        write_lines(&path, &all);
+
+        let store = MemoryStore::for_tests_with_path(path.clone());
+        store.enforce_max_entries(50, 10).unwrap();
+
+        let kept = read_entries(&path);
+        assert!(kept.len() <= 50, "expected <=50 entries, got {}", kept.len());
+        let perm_kept = kept.iter().filter(|e| e.priority == Some(255)).count();
+        assert_eq!(perm_kept, 5, "all permanent entries must survive");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// P0-2 回归：rotate 后新主文件只能含 priority=255 的条目，
+    /// 归档文件包含全部原条目。
+    #[test]
+    fn rotate_preserves_permanent_entries_in_main_file() {
+        let path = unique_path("rotate_perm");
+        let mut all = Vec::new();
+        // 用足够大的 note 把文件膨胀到几 KB
+        let big = "x".repeat(2048);
+        for i in 0..20 {
+            all.push(entry(
+                "tool_cache",
+                &format!("{}-{}", big, i),
+                &format!("2025-01-01T00:00:{:02}Z", i),
+                80,
+            ));
+        }
+        all.push(entry(
+            "safety_rules",
+            "do not run rm -rf /",
+            "2025-02-02T00:00:00Z",
+            255,
+        ));
+        all.push(entry(
+            "self_note",
+            "always read before edit",
+            "2025-02-02T00:00:01Z",
+            255,
+        ));
+        write_lines(&path, &all);
+
+        let store = MemoryStore::for_tests_with_path(path.clone());
+        // 阈值故意比当前 size 小，强制 rotate
+        let rotated = store.rotate_if_exceeds(1024).unwrap();
+        assert!(rotated, "expected rotate to happen");
+
+        // 主文件只剩永久
+        let head = read_entries(&path);
+        assert_eq!(head.len(), 2);
+        assert!(head.iter().all(|e| e.priority == Some(255)));
+
+        // 归档文件存在，且包含所有原条目
+        let parent = path.parent().unwrap();
+        let archives: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                let head_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                name.starts_with(head_name) && p != &path
+            })
+            .collect();
+        assert_eq!(archives.len(), 1, "expected exactly one archive");
+        let archived = read_entries(&archives[0]);
+        assert_eq!(archived.len(), all.len());
+
+        let _ = std::fs::remove_file(&path);
+        for a in archives {
+            let _ = std::fs::remove_file(a);
+        }
     }
 }

@@ -36,8 +36,7 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         && openai_api_key.trim().is_empty()
         && !models::endpoint_supports_anonymous_auth(&default_endpoint)
     {
-        println!("set api_key / opencode.api_key / openrouter.api_key / compatible.api_key / aliyun.api_key / openai.api_key in ~/.configW");
-        std::process::exit(0);
+        return Err("set api_key / opencode.api_key / openrouter.api_key / compatible.api_key / aliyun.api_key / openai.api_key in ~/.configW".into());
     }
     let history_file = cfg
         .get_opt("history_file")

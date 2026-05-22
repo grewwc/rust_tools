@@ -1710,6 +1710,131 @@ pub(crate) fn charge_llm_usage_to_kernel(
     Some(guard.llm_account(pid, report))
 }
 
+/// 通过 LLM 做用户意图识别（fallback 路径）。
+///
+/// 调用条件：本地 TF-IDF 给出 `Casual` 但问题文本看起来"非闲聊"
+/// （比如带代码块、中等长度、显式问号 + 动词等）。这种情况下旧实现
+/// 会被错分到 Casual，影响 thinking gate / skill 路由 / recall。
+///
+/// 接入要求：每次走到这里都会通过 [eprintln!] 打印 `[intent:llm]`
+/// 标识，方便用户在终端可见地区分本地分类 vs 大模型分类。
+///
+/// 返回 `Some(core)` 仅当：
+///   - HTTP 调用成功
+///   - 返回的 JSON 能解析出 `intent` 字段
+///   - confidence ≥ 0.6（与 thinking gate 一致的保守阈值）
+pub async fn classify_intent_via_model(
+    app: &App,
+    question: &str,
+) -> Option<crate::ai::driver::intent_recognition::CoreIntent> {
+    use crate::ai::driver::intent_recognition::CoreIntent;
+
+    let q = question.trim();
+    if q.is_empty() {
+        return None;
+    }
+    let clipped = if q.chars().count() > 800 {
+        q.chars().take(800).collect::<String>()
+    } else {
+        q.to_string()
+    };
+
+    let gate_messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String(
+                "You are a user intent classifier. Output STRICT JSON only: \
+{\"intent\":\"query_concept\"|\"request_action\"|\"seek_solution\"|\"casual\",\"confidence\":0.0}\n\
+Definitions:\n\
+- query_concept: 询问概念/定义（“是什么”、“什么意思”）\n\
+- request_action: 请求执行操作（“帮我做”、“修复”、“实现”）\n\
+- seek_solution: 寻求解决方案（“怎么处理”、“如何解决”、报错诊断）\n\
+- casual: 闲聊或无明确意图\n\
+confidence ∈ [0,1]，对边界样本请给低值（<0.6）。"
+                    .to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(clipped),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let control_model = control_model_for_aux_tasks(app);
+
+    // 用户可见标识：本次意图识别走的是 LLM 而非本地 TF-IDF。
+    eprintln!(
+        "[intent:llm] using model='{}' (local TF-IDF fell back to Casual on a non-trivial question)",
+        control_model
+    );
+
+    let request_body = build_request_body(
+        &control_model,
+        &gate_messages,
+        false,
+        false,
+        None,
+        None,
+        None,
+    );
+
+    let endpoint = endpoint_for_request_model(app, &control_model);
+    let api_key = api_key_for_request_model(app, &control_model);
+    let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        eprintln!(
+            "[intent:llm] http non-success status={}",
+            response.status()
+        );
+        return None;
+    }
+    let text = response.text().await.ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let content = extract_router_content(&v)?;
+
+    let s = strip_json_fence(&content);
+    let candidate = if let (Some(l), Some(r)) = (s.find('{'), s.rfind('}'))
+        && r >= l
+    {
+        &s[l..=r]
+    } else {
+        s
+    };
+    let parsed: Value = serde_json::from_str(candidate).ok()?;
+    let intent_str = parsed.get("intent").and_then(|v| v.as_str())?;
+    let confidence = parsed.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    if confidence < 0.6 {
+        eprintln!(
+            "[intent:llm] low confidence ({:.2}); ignoring -> Casual",
+            confidence
+        );
+        return None;
+    }
+    let core = match intent_str.to_ascii_lowercase().as_str() {
+        "query_concept" => CoreIntent::QueryConcept,
+        "request_action" => CoreIntent::RequestAction,
+        "seek_solution" => CoreIntent::SeekSolution,
+        "casual" => CoreIntent::Casual,
+        _ => return None,
+    };
+    eprintln!(
+        "[intent:llm] -> {:?} (confidence={:.2})",
+        core, confidence
+    );
+    Some(core)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

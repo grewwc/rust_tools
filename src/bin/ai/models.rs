@@ -142,10 +142,26 @@ fn vl_model_names() -> Vec<String> {
 }
 
 fn default_model() -> String {
-    choose_default_model_name(false).unwrap_or_else(|| {
-        eprintln!("[model_names] models.json is empty");
-        std::process::exit(1);
-    })
+    // 依赖前置 [`ensure_models_available`] 在 run() 入口就检查过 models.json，
+    // 这里的 fallback 路径（vl 模型缺失时）总会拿到至少一个候选。
+    // 最后兜底返回空串避免 process::exit；上层若真的拿到空串会立即报错。
+    choose_default_model_name(false)
+        .or_else(|| choose_default_model_name(true))
+        .unwrap_or_default()
+}
+
+/// 启动时调用，确保至少存在一个可用 model。
+/// 在 run() 入口集中报错，避免 [`default_model`] 在更深的调用链里 panic / exit。
+pub(super) fn ensure_models_available() -> Result<(), String> {
+    if model_names::all().is_empty() {
+        return Err("[model_names] models.json is empty; please populate it before launching ai".to_string());
+    }
+    if choose_default_model_name(false).is_none()
+        && choose_default_model_name(true).is_none()
+    {
+        return Err("[model_names] no usable default model; check models.json entries".to_string());
+    }
+    Ok(())
 }
 
 fn default_vl_model() -> String {

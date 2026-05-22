@@ -163,9 +163,13 @@ pub fn print_match(
 
     if print_md5 {
         let bytes = fs::read(abs).map_err(|e| e.to_string())?;
-        let digest = md5::compute(bytes);
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
         out.push('\t');
-        out.push_str(&format!("{:x}", digest));
+        let mut hex = String::with_capacity(32);
+        for b in &digest[..16] {
+            hex.push_str(&format!("{:02x}", b));
+        }
+        out.push_str(&hex);
     }
 
     if let Ok(mut guard) = CAPTURED.lock()

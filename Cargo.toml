@@ -6,7 +6,6 @@ edition = "2024"
 [workspace]
 members = [
     ".",
-    "crates/redis_lock",
     "crates/rust_tools_macros",
     "crates/aios_kernel",
 ]
@@ -19,16 +18,16 @@ agent-hang-debug = []
 [dependencies]
 arboard = "3.3"
 image = {version = "0.25.8", features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico", "qoi"]}
-clap = { version = "*", features = ["derive"] }
-rustc-hash = "*"
+clap = { version = "4", features = ["derive"] }
+rustc-hash = "2"
 colored = "3.0.0"
 regex = "1.12.2"
 base64 = "0.22.1"
 libc = "0.2"
-sha2 = "0.10"
+sha2 = "0.10.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-rusqlite = { version = "0.32.1", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 chrono = "0.4"
 ctrlc = "3.4"
@@ -40,22 +39,16 @@ mongodb = "3.4"
 ratatui = { version = "0.30.0", default-features = false, features = ["crossterm_0_28"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls", "stream"] }
 rust_decimal = "1"
-rustyline = "15"
+rustyline = "15.0"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
 tui-textarea = { package = "tui-textarea-2", version = "0.10.2", default-features = false, features = ["crossterm_0_28"] }
 unicode-width = "0.2"
-md5 = "0.7"
-num_cpus = "1.16"
-lopdf = "*"
-pdf-extract = "*"
+lopdf = "0.40"
+pdf-extract = "0.10"
 rand = "0.10.0"
-fastembed = "4"
-sled = "0.34"
-dirs = "5"
+dirs = "6"
 rust_tools_macros = { path = "crates/rust_tools_macros" }
 aios_kernel = { path = "crates/aios_kernel" }
-redis_lock = { path = "crates/redis_lock" }
-tracing = "0.1"
 tree-sitter = "0.24"
 tree-sitter-rust = "0.23"
 tree-sitter-python = "0.23"
@@ -65,11 +58,13 @@ tree-sitter-go = "0.23"
 tree-sitter-javascript = "0.23"
 tree-sitter-typescript = "0.23"
 tree-sitter-c = "0.23"
-tree-sitter-c-sharp = "0.23"
-tree-sitter-php = "0.23"
 streaming-iterator = "0.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "*"
-objc2-foundation = "*"
-objc2-vision = { version = "*", features = ["VNRequest", "VNObservation"] }
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-vision = { version = "0.3", features = ["VNRequest", "VNObservation"] }
+
+[profile.release]
+strip = true
+panic = "abort"

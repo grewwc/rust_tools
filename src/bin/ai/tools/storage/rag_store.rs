@@ -8,11 +8,22 @@ use std::sync::{Mutex, OnceLock};
 
 use dirs;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::ai::knowledge::{
     storage::vector_store::{VectorEntry, VectorStore},
 };
 use crate::ai::tools::storage::memory_store::MemoryStore;
+
+/// 32 字符短指纹（取 SHA-256 前 16 字节，hex 编码）。
+fn short_hex_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut s = String::with_capacity(32);
+    for b in &digest[..16] {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
 
 /// 带向量的知识条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,7 +164,7 @@ impl RagStore {
             let id = entry
                 .id
                 .clone()
-                .unwrap_or_else(|| format!("{:x}", md5::compute(&entry.note)));
+                .unwrap_or_else(|| short_hex_digest(entry.note.as_bytes()));
             let content = format!("{}: {}", entry.category, entry.note);
             self.upsert(RagEntry {
                 id,

@@ -70,6 +70,65 @@ pub fn detect_intent_fallback(input: &str) -> UserIntent {
     detect_intent(input)
 }
 
+/// 对"本地 TF-IDF 给出 Casual 但内容不像闲聊"的请求做 LLM 二次判定。
+///
+/// 调用时机（caller 决定）：在 prepare_turn / skill_runtime 这种异步路径上，
+/// 当 `local.core == CoreIntent::Casual` 且 `looks_non_casual(question)` 时，
+/// 调用本函数升级。本地分类失败时 LLM 也失败，那就保留 `local`，避免阻塞。
+///
+/// 本函数会在 stderr 打印 `[intent:llm]` 标记（在 request.rs 内部完成），
+/// 终端用户能直接看到"这一轮意图识别用了大模型"。
+pub async fn upgrade_intent_via_model(
+    app: &crate::ai::types::App,
+    question: &str,
+    local: UserIntent,
+) -> UserIntent {
+    if local.core != CoreIntent::Casual {
+        return local;
+    }
+    if !looks_non_casual(question) {
+        return local;
+    }
+    match crate::ai::request::classify_intent_via_model(app, question).await {
+        Some(core) => UserIntent {
+            core,
+            modifiers: local.modifiers,
+        },
+        None => local,
+    }
+}
+
+/// 触发 LLM fallback 的启发式：本地分到 Casual，但问题本身明显
+/// 是个非平凡请求（带代码、带 ?、动词驱动、长度足够）。
+fn looks_non_casual(question: &str) -> bool {
+    let q = question.trim();
+    if q.is_empty() {
+        return false;
+    }
+    let len = q.chars().count();
+    if len < 8 {
+        return false;
+    }
+    let has_code = q.contains("```") || q.contains("::") || q.contains("fn ");
+    let has_error_words = q.contains("error")
+        || q.contains("Error")
+        || q.contains("panic")
+        || q.contains("traceback")
+        || q.contains("报错")
+        || q.contains("失败");
+    let has_action_verbs = q.contains("帮我")
+        || q.contains("修复")
+        || q.contains("实现")
+        || q.contains("怎么")
+        || q.contains("如何")
+        || q.contains("为什么")
+        || q.contains("fix")
+        || q.contains("implement")
+        || q.contains("how ")
+        || q.contains("why ");
+    has_code || has_error_words || has_action_verbs || len >= 60
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

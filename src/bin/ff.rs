@@ -14,7 +14,7 @@ fn main() {
     };
 
     let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads((num_cpus::get() / 2).max(1))
+        .worker_threads(rust_tools::commonw::half_parallelism())
         .enable_io()
         .enable_time()
         .build()

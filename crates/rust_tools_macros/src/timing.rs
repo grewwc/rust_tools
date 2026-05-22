@@ -2,22 +2,9 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{ItemFn, LitStr, parse::Parser, parse_macro_input};
 
-pub(crate) enum TimingMode {
-    Eprintln,
-    Tracing,
-}
-
-fn timing_stmt(label: &str, debug_only: bool, mode: &TimingMode) -> proc_macro2::TokenStream {
-    match (mode, debug_only) {
-        (TimingMode::Eprintln, false) => quote! {
-            let __measure_elapsed = __measure_start.elapsed();
-            ::std::eprintln!(
-                "[timing] {} took {:.2} ms",
-                #label,
-                __measure_elapsed.as_secs_f64() * 1000.0
-            );
-        },
-        (TimingMode::Eprintln, true) => quote! {
+fn timing_stmt(label: &str, debug_only: bool) -> proc_macro2::TokenStream {
+    if debug_only {
+        quote! {
             if cfg!(debug_assertions) {
                 let __measure_elapsed = __measure_start.elapsed();
                 ::std::eprintln!(
@@ -26,34 +13,22 @@ fn timing_stmt(label: &str, debug_only: bool, mode: &TimingMode) -> proc_macro2:
                     __measure_elapsed.as_secs_f64() * 1000.0
                 );
             }
-        },
-        (TimingMode::Tracing, false) => quote! {
+        }
+    } else {
+        quote! {
             let __measure_elapsed = __measure_start.elapsed();
-            ::tracing::info!(
-                target: "timing",
-                label = #label,
-                elapsed_ms = __measure_elapsed.as_secs_f64() * 1000.0,
-                "timing"
+            ::std::eprintln!(
+                "[timing] {} took {:.2} ms",
+                #label,
+                __measure_elapsed.as_secs_f64() * 1000.0
             );
-        },
-        (TimingMode::Tracing, true) => quote! {
-            if cfg!(debug_assertions) {
-                let __measure_elapsed = __measure_start.elapsed();
-                ::tracing::info!(
-                    target: "timing",
-                    label = #label,
-                    elapsed_ms = __measure_elapsed.as_secs_f64() * 1000.0,
-                    "timing"
-                );
-            }
-        },
+        }
     }
 }
 
 pub(crate) fn expand_timing_attr(
     attr: TokenStream,
     item: TokenStream,
-    mode: TimingMode,
     debug_only: bool,
 ) -> TokenStream {
     let parser = syn::punctuated::Punctuated::<LitStr, syn::Token![,]>::parse_terminated;
@@ -69,7 +44,7 @@ pub(crate) fn expand_timing_attr(
         .first()
         .map(|lit| lit.value())
         .unwrap_or_else(|| fn_name.clone());
-    let timing_stmt = timing_stmt(&label, debug_only, &mode);
+    let timing_stmt = timing_stmt(&label, debug_only);
 
     let wrapped_block = if sig.asyncness.is_some() {
         quote!({

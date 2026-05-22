@@ -52,7 +52,7 @@ pub(crate) fn execute_structural_search(
 
     
     // Parallel AST structural search across files
-    let max_threads = (num_cpus::get() / 2).max(1);
+    let max_threads = rust_tools::commonw::half_parallelism();
     let chunk_size = (files.len() / max_threads).max(1);
     let chunks: Vec<Vec<PathBuf>> = files.chunks(chunk_size).map(|c| c.to_vec()).collect();
     
@@ -293,16 +293,13 @@ fn normalize_match(
     }
 }
 
-fn normalize_call_name(language_name: &str, raw: &str) -> String {
+fn normalize_call_name(_language_name: &str, raw: &str) -> String {
     let s = raw.trim();
     if s.is_empty() {
         return String::new();
     }
 
-    let candidate = match language_name {
-        "php" => s.trim_start_matches('\\'),
-        _ => s,
-    };
+    let candidate = s;
 
     if let Some(last) = last_identifier(candidate) {
         return last;
@@ -311,15 +308,12 @@ fn normalize_call_name(language_name: &str, raw: &str) -> String {
     candidate.to_string()
 }
 
-fn normalize_qualified_name(language_name: &str, raw: &str) -> String {
+fn normalize_qualified_name(_language_name: &str, raw: &str) -> String {
     let s = raw.trim();
     if s.is_empty() {
         return String::new();
     }
-    match language_name {
-        "php" => s.trim_start_matches('\\').to_string(),
-        _ => s.to_string(),
-    }
+    s.to_string()
 }
 
 fn extract_receiver(qualified_name: &str) -> Option<String> {
@@ -513,42 +507,6 @@ fn structural_query_for_intent(language_name: &str, intent: &str) -> Result<Opti
             "(call_expression function: (_) @name)".to_string()
         }
 
-        ("csharp", "find_functions") | ("csharp", "find_methods") => [
-            "(method_declaration name: (identifier) @name)",
-            "(constructor_declaration name: (identifier) @name)",
-        ]
-        .join("\n"),
-        ("csharp", "find_classes") => [
-            "(class_declaration name: (identifier) @name)",
-            "(struct_declaration name: (identifier) @name)",
-            "(interface_declaration name: (identifier) @name)",
-            "(enum_declaration name: (identifier) @name)",
-            "(record_declaration name: (identifier) @name)",
-        ]
-        .join("\n"),
-        ("csharp", "find_calls") => [
-            "(invocation_expression function: (_) @name)",
-            "(object_creation_expression type: (_) @constructor_name)",
-        ]
-        .join("\n"),
-
-        ("php", "find_functions") => {
-            "(function_definition name: (name) @name)".to_string()
-        }
-        ("php", "find_classes") => [
-            "(class_declaration name: (name) @name)",
-            "(interface_declaration name: (name) @name)",
-            "(trait_declaration name: (name) @name)",
-            "(enum_declaration name: (name) @name)",
-        ]
-        .join("\n"),
-        ("php", "find_methods") => {
-            "(method_declaration name: (name) @name)".to_string()
-        }
-        ("php", "find_calls") => {
-            "(function_call_expression function: (_) @name)".to_string()
-        }
-
         ("cpp", "find_functions") => {
             "(function_definition declarator: (_) @name)".to_string()
         }
@@ -577,9 +535,7 @@ fn structural_query_for_intent(language_name: &str, intent: &str) -> Result<Opti
             | "go"
             | "javascript"
             | "typescript"
-            | "c"
-            | "csharp"
-            | "php",
+            | "c",
             other,
         ) => {
             return Err(format!("Unsupported structural intent: {}", other));
@@ -729,8 +685,6 @@ fn language_for_path(path: &Path) -> Option<(&'static str, Language)> {
             Language::from(tree_sitter_typescript::LANGUAGE_TSX),
         )),
         "java" => Some(("java", Language::from(tree_sitter_java::LANGUAGE))),
-        "cs" => Some(("csharp", Language::from(tree_sitter_c_sharp::LANGUAGE))),
-        "php" => Some(("php", Language::from(tree_sitter_php::LANGUAGE_PHP))),
         "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => {
             Some(("cpp", Language::from(tree_sitter_cpp::LANGUAGE)))
         }
@@ -840,7 +794,6 @@ mod tests {
     fn call_name_normalization_uses_last_identifier() {
         assert_eq!(normalize_call_name("rust", "foo::bar::baz"), "baz");
         assert_eq!(normalize_call_name("javascript", "obj?.render"), "render");
-        assert_eq!(normalize_call_name("php", "\\App\\Http\\Kernel"), "Kernel");
     }
 
     #[test]

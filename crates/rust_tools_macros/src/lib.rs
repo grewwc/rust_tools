@@ -5,22 +5,12 @@ mod timing;
 
 #[proc_macro_attribute]
 pub fn measure_time(attr: TokenStream, item: TokenStream) -> TokenStream {
-    timing::expand_timing_attr(attr, item, timing::TimingMode::Eprintln, false)
+    timing::expand_timing_attr(attr, item, false)
 }
 
 #[proc_macro_attribute]
 pub fn debug_measure_time(attr: TokenStream, item: TokenStream) -> TokenStream {
-    timing::expand_timing_attr(attr, item, timing::TimingMode::Eprintln, true)
-}
-
-#[proc_macro_attribute]
-pub fn measure_time_tracing(attr: TokenStream, item: TokenStream) -> TokenStream {
-    timing::expand_timing_attr(attr, item, timing::TimingMode::Tracing, false)
-}
-
-#[proc_macro_attribute]
-pub fn debug_measure_time_tracing(attr: TokenStream, item: TokenStream) -> TokenStream {
-    timing::expand_timing_attr(attr, item, timing::TimingMode::Tracing, true)
+    timing::expand_timing_attr(attr, item, true)
 }
 
 #[proc_macro]

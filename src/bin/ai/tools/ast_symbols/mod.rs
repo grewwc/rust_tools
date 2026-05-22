@@ -1,10 +1,8 @@
 mod c;
 mod cpp;
-mod csharp;
 mod go;
 mod java;
 mod javascript;
-mod php;
 mod python;
 mod rust;
 mod typescript;
@@ -52,8 +50,6 @@ pub(crate) fn extract_document_symbols(
         "go" => Some(go::extract(file_path, content)),
         "javascript" => Some(javascript::extract(file_path, content)),
         "typescript" => Some(typescript::extract(file_path, content)),
-        "csharp" => Some(csharp::extract(file_path, content)),
-        "php" => Some(php::extract(file_path, content)),
         _ => None,
     }
 }

@@ -167,7 +167,19 @@ pub(super) fn execute_sync_task(
     if !inherit.memory {
         let mem_path =
             runtime_ctx::make_subagent_memory_path(&parent_history_path, &task_id);
+        // sub-agent 默认私有 memory：merge 白名单条目回主文件
+        let main_path = crate::ai::tools::storage::memory_store::
+            MemoryStore::from_env_or_config().path().to_path_buf();
+        let private_for_merge = mem_path.clone();
         wrapped = Box::pin(runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped));
+        let inner = wrapped;
+        wrapped = Box::pin(async move {
+            inner.await;
+            let _ = crate::ai::tools::service::memory::merge_subagent_whitelist(
+                &private_for_merge,
+                &main_path,
+            );
+        });
     }
 
     if !inherit.cwd {

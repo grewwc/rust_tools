@@ -165,6 +165,12 @@ impl SkillTurnGuard {
         &self.intent
     }
 
+    /// 用于 LLM intent fallback 路径：本地 TF-IDF 给 Casual 但 question
+    /// 明显不像闲聊时，turn 准备阶段会调 LLM 升级，结果通过这里回写。
+    pub(super) fn set_intent(&mut self, intent: UserIntent) {
+        self.intent = intent;
+    }
+
     pub(super) fn skip_recall_by_skill(&self) -> bool {
         self.skip_recall_by_skill
     }

@@ -69,15 +69,6 @@ pub use rust_tools_macros::measure_time;
 /// Release 模式下不会产生任何性能开销或输出。
 pub use rust_tools_macros::debug_measure_time;
 
-/// 测量并记录函数执行时间，使用 `tracing::info!` 输出日志而不是直接打印到控制台。
-/// 
-/// 日志的 target 为 `"timing"`，并附带 `label` 和 `elapsed_ms` 字段。
-/// 同样可以指定标签：`#[measure_time_tracing("custom_label")]`。
-pub use rust_tools_macros::measure_time_tracing;
-
-/// 与 `measure_time_tracing` 类似，但只在 Debug 模式下生效。
-pub use rust_tools_macros::debug_measure_time_tracing;
-
 /// 为函数添加 LRU（最近最少使用）缓存机制，自动缓存给定参数的返回结果。
 /// 
 /// 需要指定 `cap`（容量），还可以可选地指定 `ttl_ms`（缓存过期时间，毫秒）。
@@ -97,3 +88,53 @@ pub use rust_tools_macros::debug_measure_time_tracing;
 pub use rust_tools_macros::lru_cache;
 
 pub use types::{FastMap, FastSet};
+
+/// 返回 `available_parallelism / 2`，至少为 1。
+///
+/// 项目里多处沿用此模式来配置并行度（避免 100% 占满 CPU）。统一封装后
+/// 不再依赖 `num_cpus` crate；`available_parallelism` 失败时退回到 1。
+#[inline]
+pub fn half_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get() / 2)
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// 文件遍历时应当整体跳过的目录名（构建产物 / 依赖缓存 / VCS 元信息）。
+///
+/// 这些目录通常体积巨大且不含用户源码，扫描进去会让 search/glob 类工具
+/// 单线程吃满 CPU（典型如 `target/`、`node_modules/`）。各处 walker /
+/// glob 后处理都应统一调用 [`is_skip_dir`] 过滤。
+pub const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    "vendor",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".cargo",
+];
+
+/// 判断目录名是否在 [`SKIP_DIRS`] 黑名单中。
+#[inline]
+pub fn is_skip_dir(name: &str) -> bool {
+    SKIP_DIRS.iter().any(|d| *d == name)
+}
+
+/// 判断给定路径中是否含有任何 [`SKIP_DIRS`] 段；用于 glob 结果后置过滤。
+pub fn path_contains_skip_dir(path: &std::path::Path) -> bool {
+    use std::path::Component;
+    path.components().any(|c| match c {
+        Component::Normal(s) => s.to_str().map(is_skip_dir).unwrap_or(false),
+        _ => false,
+    })
+}

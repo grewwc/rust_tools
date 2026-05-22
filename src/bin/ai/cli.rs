@@ -8,7 +8,6 @@ pub(super) struct ParsedCli {
     pub(super) history: usize,
     pub(super) model: Option<String>,
     pub(super) agent: Option<String>,
-    pub(super) multi_line: bool,
     pub(super) clear: bool,
     pub(super) session: Option<String>,
     pub(super) clipboard: bool,
@@ -32,7 +31,6 @@ impl Default for ParsedCli {
             history: DEFAULT_NUM_HISTORY,
             model: None,
             agent: None,
-            multi_line: true,
             clear: false,
             session: None,
             clipboard: false,
@@ -63,7 +61,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     let mut parser = TermParser::new();
 
     // 定义所有 bool 选项
-    parser.add_bool("clear", false, "clear history");
+    parser.add_bool("clear", false, "clear specified session history (use with --session)");
     parser.add_bool("clipboard", false, "prepend content in clipboard");
     parser.add_bool("thinking", false, "force enable thinking (auto-enabled by default for complex questions)");
     parser.alias("t", "thinking");
@@ -140,7 +138,11 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         }
     }
 
-    // 处理 multi-line
+    // 处理 clipboard
+    cli.clipboard = parser.contains_flag_strict("clipboard");
+
+    // 处理 clear（与 --session 联用，清空对应 session 的 history）
+    cli.clear = parser.contains_flag_strict("clear");
 
     // 处理 session
     if parser.contains_flag_strict("session") {
@@ -197,8 +199,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 pub(super) fn print_help() {
     let mut parser = TermParser::new();
 
-    parser.add_bool("multi-line", false, "input with multline");
-    parser.alias("mul", "multi-line");
     parser.add_bool("clipboard", false, "prepend content in clipboard");
     parser.add_bool("thinking", false, "force enable thinking (auto-enabled by default for complex questions)");
     parser.alias("t", "thinking");

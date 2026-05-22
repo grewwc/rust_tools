@@ -166,9 +166,10 @@ pub(crate) fn execute_search_files(args: &Value) -> Result<String, String> {
         .map(|s| {
             let p = PathBuf::from(s.trim());
             let abs = if p.is_absolute() { p } else { base_dir.join(p) };
-            let abs = fs::canonicalize(&abs).unwrap_or(abs);
-            abs.to_string_lossy().to_string()
+            fs::canonicalize(&abs).unwrap_or(abs)
         })
+        .filter(|abs| !rust_tools::commonw::path_contains_skip_dir(abs))
+        .map(|abs| abs.to_string_lossy().to_string())
         .collect();
     Ok(out.join("\n").trim().to_string())
 }
@@ -212,7 +213,10 @@ fn find_first_file_by_name(root: &Path, filename: &str) -> Option<PathBuf> {
             }
 
             let ft = entry.file_type().ok()?;
-            if ft.is_dir() && !ft.is_symlink() {
+            if ft.is_dir()
+                && !ft.is_symlink()
+                && !rust_tools::commonw::is_skip_dir(file_name)
+            {
                 queue.push_back(entry.path());
             }
         }
@@ -260,7 +264,7 @@ pub(crate) fn execute_grep_search(args: &Value) -> Result<String, String> {
         case_insensitive: false,
         relative: true,
         num_print: i64::MAX,
-        thread_count: (num_cpus::get() / 2).max(1),
+        thread_count: rust_tools::commonw::half_parallelism(),
         wd,
         root_pat,
         targets: vec![target.to_string()],
@@ -269,7 +273,7 @@ pub(crate) fn execute_grep_search(args: &Value) -> Result<String, String> {
 
     crate::ai::ff_embed::output::begin_capture();
     let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads((num_cpus::get() / 2).max(1))
+        .worker_threads(rust_tools::commonw::half_parallelism())
         .enable_io()
         .enable_time()
         .build()

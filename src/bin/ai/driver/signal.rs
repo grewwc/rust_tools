@@ -3,12 +3,18 @@ use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use aios_kernel::primitives::{DaemonCancelToken, FutexAddr};
+use tokio::sync::Notify;
 
 use crate::ai::tools::os_tools::GLOBAL_OS;
 
 static REQUEST_INTERRUPT_FUTEX: LazyLock<Mutex<Option<(usize, FutexAddr)>>> =
     LazyLock::new(|| Mutex::new(None));
 static REQUEST_INTERRUPT_FLAG: AtomicBool = AtomicBool::new(false);
+static REQUEST_INTERRUPT_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+
+pub(in crate::ai) fn request_interrupt_notify() -> &'static Notify {
+    &REQUEST_INTERRUPT_NOTIFY
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SigintAction {
@@ -72,6 +78,7 @@ pub(in crate::ai) fn request_interrupt_futex() -> Option<FutexAddr> {
 
 pub(in crate::ai) fn signal_request_interrupt() {
     REQUEST_INTERRUPT_FLAG.store(true, Ordering::Release);
+    REQUEST_INTERRUPT_NOTIFY.notify_waiters();
     let Some(addr) = request_interrupt_futex() else {
         return;
     };
@@ -179,7 +186,12 @@ pub(in crate::ai) async fn wait_for_interrupt_sources(
             }
             return;
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // 主信号通过 Notify 唤醒；本地 futex 仍需短轮询兜底（无对应通知通道）。
+        let notified = REQUEST_INTERRUPT_NOTIFY.notified();
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
     }
 }
 

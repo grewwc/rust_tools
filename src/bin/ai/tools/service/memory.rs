@@ -163,6 +163,27 @@ fn default_priority_for_category(category: &str) -> u8 {
     }
 }
 
+/// 判断一条记忆是否豁免 30d 时间窗 GC / 配额淘汰。
+///
+/// 历史实现只看 `priority == 255`：
+///   - 用户偏好 / coding_guideline / project_memory 等长期资产 priority 是 210/180，
+///     30 天没刷新就有概率被 GC 掉，与"长期记忆应该保留"的直觉不符。
+///
+/// 新策略：priority==255 仍然豁免（safety_rules / reflection self_note 等永远 hold），
+/// 同时把以下 category 视为长期资产，无论 priority 多少都豁免：
+///   - 所有 guideline 类（safety/preference/user_preference/coding_guideline/
+///     best_practice/common_sense/self_note）
+///   - `project_memory`：项目级事实，writeback 路径会主动 upsert，不应被时间淘汰
+pub(crate) fn is_permanent_memory(entry: &AgentMemoryEntry) -> bool {
+    if entry.priority.unwrap_or(100) == 255 {
+        return true;
+    }
+    if crate::ai::knowledge::retrieval::recall::is_guideline_category(&entry.category) {
+        return true;
+    }
+    matches!(entry.category.as_str(), "project_memory")
+}
+
 fn parse_priority_arg(args: &Value, field: &str) -> Result<Option<u8>, String> {
     match args.get(field).and_then(|value| value.as_u64()) {
         Some(priority) if priority > u8::MAX as u64 => Err("priority out of range".to_string()),
@@ -438,26 +459,41 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
             return Ok("No entries".to_string());
         }
         
-        // Separate permanent entries (priority=255) - these are never deleted
+        // Separate permanent entries (whitelist) - never deleted by GC
         let mut permanent: Vec<AgentMemoryEntry> = entries
             .iter()
-            .filter(|e| e.priority.unwrap_or(100) == 255)
+            .filter(|e| is_permanent_memory(e))
             .cloned()
             .collect();
         let mut deletable: Vec<AgentMemoryEntry> = entries
             .into_iter()
-            .filter(|e| e.priority.unwrap_or(100) != 255)
+            .filter(|e| !is_permanent_memory(&e))
             .collect();
         
         let now = Utc::now();
         let cutoff_secs = max_days * 86400;
         
-        // Apply age filter to deletable entries
+        // 摘要回写（writeback）：原始实现把"过期的 deletable"直接丢掉，丢失了
+        // 与项目相关但不是永久白名单的事实（例如 30 天前的 task_event）。
+        // 现在把过期项按 (category, source) 分组，每组合成 1 条 summary
+        // 写回 permanent 区——以"sum:"前缀标记，priority 沿用该组最高，
+        // 后续不会被时间窗 GC（summary 自身永远是新创建，时间 = now）。
+        let mut evicted: Vec<AgentMemoryEntry> = Vec::new();
         deletable.retain(|e| {
-            parse_rfc3339_ts(&e.timestamp)
+            let keep = parse_rfc3339_ts(&e.timestamp)
                 .map(|ts| (now - ts).num_seconds() <= cutoff_secs)
-                .unwrap_or(true)
+                .unwrap_or(true);
+            if !keep {
+                evicted.push(e.clone());
+            }
+            keep
         });
+        let summaries = if evicted.is_empty() {
+            Vec::new()
+        } else {
+            build_gc_summaries(&evicted, max_days)
+        };
+        let summary_count = summaries.len();
         
         // Sort deletable entries by priority (ascending) then by timestamp (ascending)
         // This ensures low priority and old entries are deleted first
@@ -473,26 +509,27 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
         
         // Ensure minimum keep count (but never delete permanent entries)
         let total_permanent = permanent.len();
-        if deletable.len() + total_permanent < min_keep {
+        if deletable.len() + total_permanent + summary_count < min_keep {
             // Need to restore some entries, but prefer higher priority ones
             let all_entries = store.recent(min_keep)?;
             let new_deletable: Vec<AgentMemoryEntry> = all_entries
                 .iter()
-                .filter(|e| e.priority.unwrap_or(100) != 255)
+                .filter(|e| !is_permanent_memory(e))
                 .cloned()
                 .collect();
             let new_permanent: Vec<AgentMemoryEntry> = all_entries
                 .iter()
-                .filter(|e| e.priority.unwrap_or(100) == 255)
+                .filter(|e| is_permanent_memory(e))
                 .cloned()
                 .collect();
             permanent = new_permanent;
             deletable = new_deletable;
         }
         
-        // Combine permanent and deletable entries
+        // Combine permanent + summaries (新生成) + deletable
         let permanent_count = permanent.len();
         let mut final_entries = permanent;
+        final_entries.extend(summaries);
         final_entries.append(&mut deletable);
         
         let tmp = path.with_extension("jsonl.tmp");
@@ -507,14 +544,173 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
             }
         }
         std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to replace memory file: {}", e))?;
-        Ok(format!("GC done: {} entries kept (including {} permanent)", final_entries.len(), permanent_count))
+        crate::ai::tools::storage::memory_store::trace_memory_event(
+            "memory.gc",
+            "GC pass with summary writeback",
+            &[
+                ("kept", final_entries.len().to_string()),
+                ("permanent", permanent_count.to_string()),
+                ("summaries", summary_count.to_string()),
+                ("max_days", max_days.to_string()),
+            ],
+        );
+        Ok(format!(
+            "GC done: {} entries kept (including {} permanent, {} summary writeback)",
+            final_entries.len(),
+            permanent_count,
+            summary_count
+        ))
     })
+}
+
+/// 把过期 evicted 条目按 (category, source) 分组，每组聚合成一条 summary。
+///
+/// summary 设计：
+///   - category 沿用原 category（这样跟原条目处于同一个召回桶里）
+///   - tags 取首个被合并条目的 tags + 加 "summary"
+///   - source 沿用原 source
+///   - priority = 该组最高 priority（保留原本的重要性信号）
+///   - note = "[summary of N entries from <ts1> to <ts2>] " + 截断的代表性内容
+///   - timestamp = 当前时间（让它进入"最新区域"，不会立即又被时间窗 GC）
+///
+/// 不调外部模型——以本地拼接为主，避免 GC 路径阻塞。
+fn build_gc_summaries(
+    evicted: &[AgentMemoryEntry],
+    max_days: i64,
+) -> Vec<AgentMemoryEntry> {
+    use std::collections::BTreeMap;
+
+    // (category, source) -> Vec<&entry>
+    let mut groups: BTreeMap<(String, Option<String>), Vec<&AgentMemoryEntry>> = BTreeMap::new();
+    for e in evicted {
+        groups
+            .entry((e.category.clone(), e.source.clone()))
+            .or_default()
+            .push(e);
+    }
+
+    let mut out: Vec<AgentMemoryEntry> = Vec::with_capacity(groups.len());
+    let now_iso = Local::now().to_rfc3339();
+    for ((category, source), items) in groups.into_iter() {
+        if items.is_empty() {
+            continue;
+        }
+        let count = items.len();
+        // 时间范围
+        let mut ts_min = items[0].timestamp.as_str();
+        let mut ts_max = items[0].timestamp.as_str();
+        let mut max_prio: u8 = 0;
+        let mut sample_tags: Vec<String> = Vec::new();
+        for it in &items {
+            if it.timestamp.as_str() < ts_min {
+                ts_min = it.timestamp.as_str();
+            }
+            if it.timestamp.as_str() > ts_max {
+                ts_max = it.timestamp.as_str();
+            }
+            let p = it.priority.unwrap_or(100);
+            if p > max_prio {
+                max_prio = p;
+            }
+            if sample_tags.is_empty() && !it.tags.is_empty() {
+                sample_tags = it.tags.clone();
+            }
+        }
+
+        // 摘要正文：取每条 note 的前 80 字符，最多拼 5 条，用 "; " 连接
+        const PER_ITEM_CHARS: usize = 80;
+        const MAX_SAMPLES: usize = 5;
+        let mut samples: Vec<String> = Vec::new();
+        for it in items.iter().take(MAX_SAMPLES) {
+            let snippet: String = it.note.chars().take(PER_ITEM_CHARS).collect();
+            samples.push(snippet);
+        }
+        let extra = count.saturating_sub(samples.len());
+        let body = if extra > 0 {
+            format!("{}; …(+{} more)", samples.join("; "), extra)
+        } else {
+            samples.join("; ")
+        };
+
+        let header = format!(
+            "[summary] {} entries in '{}' aged out of {}d window ({}..{}): ",
+            count, category, max_days, ts_min, ts_max
+        );
+        let note = format!("{}{}", header, body);
+
+        let mut tags = sample_tags;
+        if !tags.iter().any(|t| t == "summary") {
+            tags.push("summary".to_string());
+        }
+
+        out.push(AgentMemoryEntry {
+            id: Some(next_memory_id()),
+            timestamp: now_iso.clone(),
+            category,
+            note,
+            tags,
+            source,
+            priority: Some(max_prio.max(150)),
+            owner_pid: None,
+            owner_pgid: None,
+        });
+    }
+    out
 }
 
 fn parse_rfc3339_ts(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// 把 sub-agent 的私有 memory 文件按白名单 merge 回主 memory 文件。
+///
+/// - `private_path`：sub-agent 的 jsonl（make_subagent_memory_path 生成）
+/// - `main_path`：主 agent 的 memory jsonl（resolve 时不能再走 task_local override，
+///   所以由调用方传入实际目标路径）
+///
+/// 仅 `is_permanent_memory` 命中的条目（safety/preference/coding_guideline/
+/// project_memory/...）会被 append；普通对话级 task_event 留在私有文件，不污染主记忆。
+/// 写入复用 MemoryStore::append（自带 lock + index upsert）。
+pub(crate) fn merge_subagent_whitelist(
+    private_path: &std::path::Path,
+    main_path: &std::path::Path,
+) -> Result<usize, String> {
+    if !private_path.exists() {
+        return Ok(0);
+    }
+    let entries = load_memory_entries(private_path)?;
+    if entries.is_empty() {
+        return Ok(0);
+    }
+    let main_store = crate::ai::tools::storage::memory_store::store_for_path(
+        main_path.to_path_buf(),
+    );
+    let mut merged = 0usize;
+    for entry in entries {
+        if !is_permanent_memory(&entry) {
+            continue;
+        }
+        // 把 owner pid/pgid 重置：sub-agent 可能已经退出，
+        // 主 store 重新打 owner tag 没意义，留 None 即可。
+        let mut e = entry;
+        e.owner_pid = None;
+        e.owner_pgid = None;
+        if main_store.append(&e).is_ok() {
+            merged += 1;
+        }
+    }
+    crate::ai::tools::storage::memory_store::trace_memory_event(
+        "memory.subagent_merge",
+        "merged sub-agent whitelist entries back to main memory",
+        &[
+            ("private", private_path.display().to_string()),
+            ("main", main_path.display().to_string()),
+            ("merged", merged.to_string()),
+        ],
+    );
+    Ok(merged)
 }
 
 pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
@@ -528,6 +724,10 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
         if entries.is_empty() {
             return Ok("No entries".to_string());
         }
+        let total_before = entries.len();
+
+        // Step 1: 严格去重——note + category + tags + source 完全一致的，
+        // 只保留时间最新（reverse 遍历后写回）。
         let mut seen: FastSet<(String, String, Vec<String>, Option<String>)> = FastSet::default();
         let mut deduped: Vec<AgentMemoryEntry> = Vec::with_capacity(entries.len());
         for e in entries.into_iter().rev() {
@@ -546,8 +746,82 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
             }
         }
         deduped.reverse();
-        write_memory_entries(&path, &deduped)?;
-        Ok("Dedup done".to_string())
+        let exact_dedup_removed = total_before.saturating_sub(deduped.len());
+
+        // Step 2: 同 category 内 cosine ≥ 0.85 的语义重复合并保留较新一条。
+        // 复用 ai::knowledge::indexing::embedder + similarity::cosine_similarity，
+        // embedding 不可用时（fastembed 模型未就绪）静默退化为只做严格去重。
+        let cosine_threshold = 0.85f32;
+        let texts: Vec<String> = deduped
+            .iter()
+            .map(|e| format!("[{}] {}", e.category, e.note))
+            .collect();
+        let mut cosine_removed = 0usize;
+        let final_entries = if let Some(vectors) =
+            crate::ai::knowledge::indexing::embedder::embed_texts(&texts)
+        {
+            // 时间排序：保留较新的优先策略 = 先按 timestamp 降序遍历，
+            // 若与已保留集合中同 category 的某条 cosine ≥ 阈值，则丢弃当前。
+            use crate::ai::knowledge::indexing::similarity::cosine_similarity;
+            let mut indexed: Vec<usize> = (0..deduped.len()).collect();
+            indexed.sort_by(|&a, &b| deduped[b].timestamp.cmp(&deduped[a].timestamp));
+
+            // kept: Vec<(原 idx, 同 cat 标记)>；用 idx 引用 deduped/vectors 避免 clone embedding
+            let mut kept_idx: Vec<usize> = Vec::with_capacity(deduped.len());
+            for &i in &indexed {
+                let cat_i = deduped[i].category.as_str();
+                let v_i = &vectors[i];
+                let mut merged = false;
+                for &j in &kept_idx {
+                    if deduped[j].category != cat_i {
+                        continue;
+                    }
+                    let sim = cosine_similarity(v_i, &vectors[j]);
+                    if sim >= cosine_threshold {
+                        merged = true;
+                        break;
+                    }
+                }
+                if merged {
+                    cosine_removed += 1;
+                } else {
+                    kept_idx.push(i);
+                }
+            }
+            // 还原原始顺序（按原 idx 升序）
+            kept_idx.sort();
+            let mut out: Vec<AgentMemoryEntry> = Vec::with_capacity(kept_idx.len());
+            // 用 swap_remove 思路不行（会乱序），直接 clone：
+            for i in kept_idx {
+                out.push(deduped[i].clone());
+            }
+            out
+        } else {
+            deduped
+        };
+
+        write_memory_entries(&path, &final_entries)?;
+
+        crate::ai::tools::storage::memory_store::trace_memory_event(
+            "memory.dedup",
+            "dedup pass completed (exact + cosine)",
+            &[
+                ("total_before", total_before.to_string()),
+                ("exact_removed", exact_dedup_removed.to_string()),
+                ("cosine_removed", cosine_removed.to_string()),
+                ("kept", final_entries.len().to_string()),
+                ("threshold", cosine_threshold.to_string()),
+            ],
+        );
+
+        Ok(format!(
+            "Dedup done: {} -> {} (exact: {}, cosine≥{}: {})",
+            total_before,
+            final_entries.len(),
+            exact_dedup_removed,
+            cosine_threshold,
+            cosine_removed
+        ))
     })
 }
 

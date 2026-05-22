@@ -50,9 +50,15 @@ pub(crate) struct InheritOptions {
 
 impl Default for InheritOptions {
     fn default() -> Self {
+        // 修复点：sub-agent 默认私有 memory。
+        // 历史默认 `memory: true` 会让所有 sub-agent 直接写到主 memory 文件，
+        // 一次大型 sub-agent run 产生的 task_event/log 会污染主记忆，
+        // 也削弱了召回准确性。现在默认私有：sub-agent 写入独立 jsonl，
+        // finalize 时只把白名单条目（is_permanent_memory）merge 回主文件。
+        // 调用方仍可显式传 `inherit: "all"` 或 `inherit: "memory"` 退回旧行为。
         Self {
             history: true,
-            memory: true,
+            memory: false,
             cwd: true,
             skills: true,
         }
@@ -62,8 +68,8 @@ impl Default for InheritOptions {
 impl InheritOptions {
     /// Parse the optional `inherit` field from a tool call.
     /// Recognised forms:
-    ///   - missing / null -> full inheritance (default)
-    ///   - "all"          -> full inheritance
+    ///   - missing / null -> default (history+cwd+skills, **memory private**)
+    ///   - "all"          -> full inheritance (incl. memory)
     ///   - "none"         -> no inheritance (fresh sub-agent)
     ///   - comma-separated list of: history, memory, cwd, skills
     pub(crate) fn from_value(value: &Value) -> Result<Self, String> {
@@ -74,8 +80,16 @@ impl InheritOptions {
             return Err("'inherit' must be a string".to_string());
         };
         let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("all") {
+        if trimmed.is_empty() {
             return Ok(Self::default());
+        }
+        if trimmed.eq_ignore_ascii_case("all") {
+            return Ok(Self {
+                history: true,
+                memory: true,
+                cwd: true,
+                skills: true,
+            });
         }
         if trimmed.eq_ignore_ascii_case("none") {
             return Ok(Self {

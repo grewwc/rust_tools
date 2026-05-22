@@ -108,6 +108,23 @@ pub(super) async fn prepare_turn(
         skill_runtime::prepare_skill_for_turn(app, &mc, skill_manifests, question)
     };
 
+    // LLM 意图识别 fallback：当本地 TF-IDF 把 question 划到 Casual 但内容明显
+    // 不是闲聊（带代码 / 报错关键词 / 动作动词 / 长度足够）时，调用大模型
+    // 二次判定。LLM 调用本身在 stderr 打印 [intent:llm] 标识，方便用户区分
+    // "本地分类" vs "大模型分类"。
+    {
+        let local = skill_turn.intent().clone();
+        let upgraded = crate::ai::driver::intent_recognition::upgrade_intent_via_model(
+            app,
+            question,
+            local.clone(),
+        )
+        .await;
+        if upgraded.core != local.core {
+            skill_turn.set_intent(upgraded);
+        }
+    }
+
     {
         let now = chrono::Local::now();
         let date_str = now.format("%Y-%m-%d").to_string();

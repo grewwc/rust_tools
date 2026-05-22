@@ -98,6 +98,26 @@ fn should_auto_drop_terminated(
         .unwrap_or(false)
 }
 
+/// 进程终止 + 清理 + 自动 drop 的统一收尾流程。
+///
+/// `set_current` 为 `true` 时，会先把 `pid` 标记为当前 pid（适用于先前调度切换走、
+/// 现在要终止它的场景）；为 `false` 时假设调用方已经在 `pid` 的上下文里。
+fn terminate_and_cleanup(
+    os: &mut (dyn aios_kernel::kernel::Kernel + Send),
+    pid: u64,
+    result: String,
+    set_current: bool,
+) {
+    os.cleanup_process_resources(pid);
+    if set_current {
+        os.set_current_pid(Some(pid));
+    }
+    os.terminate_current(result);
+    if should_auto_drop_terminated(os, pid) {
+        os.drop_terminated(pid);
+    }
+}
+
 /// Default max LLM iterations allowed per turn (prevents infinite loops)
 const DEFAULT_MAX_ITERATIONS: usize = 1024;
 
@@ -248,15 +268,81 @@ fn read_recent_history(app: &App) -> Vec<crate::ai::history::Message> {
 /// Returns the updated manifests.
 fn reload_agent_manifests(agent_manifests: &mut Vec<AgentManifest>) {
     let new_agents = agents::load_all_agents();
-    if new_agents.len() != agent_manifests.len() {
-        let added = new_agents.len() as i64 - agent_manifests.len() as i64;
-        if added > 0 {
-            println!("[Agent 发现] 新发现 {} 个 agent(s)，已自动加载", added);
-        } else {
-            println!("[Agent 发现] agent 列表已更新，共 {} 个", new_agents.len());
-        }
-        *agent_manifests = new_agents;
+    let old_fingerprint = agent_manifests_fingerprint(agent_manifests.as_slice());
+    let new_fingerprint = agent_manifests_fingerprint(new_agents.as_slice());
+    if old_fingerprint == new_fingerprint {
+        return;
     }
+    let added = new_agents.len() as i64 - agent_manifests.len() as i64;
+    if added > 0 {
+        println!("[Agent 发现] 新发现 {} 个 agent(s)，已自动加载", added);
+    } else if added < 0 {
+        println!(
+            "[Agent 发现] 移除 {} 个 agent(s)，共 {} 个",
+            -added,
+            new_agents.len()
+        );
+    } else {
+        println!("[Agent 发现] 检测到 agent 内容变更，已重新加载，共 {} 个", new_agents.len());
+    }
+    *agent_manifests = new_agents;
+}
+
+/// 基于 manifest 关键字段计算稳定指纹，用于检测增删改三类变更。
+fn agent_manifests_fingerprint(agents: &[AgentManifest]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut entries: Vec<&AgentManifest> = agents.iter().collect();
+    entries.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.source_path.cmp(&b.source_path))
+    });
+    let mut hasher = Sha256::new();
+    for m in entries {
+        hasher.update(m.name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(m.source_path.as_deref().unwrap_or("").as_bytes());
+        hasher.update(b"\0");
+        hasher.update(m.description.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(m.prompt.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(m.system_prompt.as_deref().unwrap_or("").as_bytes());
+        hasher.update(b"\0");
+        hasher.update(m.model.as_deref().unwrap_or("").as_bytes());
+        hasher.update(b"\0");
+        hasher.update(format!("{:?}", m.mode).as_bytes());
+        hasher.update(b"\0");
+        hasher.update(format!("{:?}", m.temperature).as_bytes());
+        hasher.update(b"\0");
+        hasher.update(format!("{:?}", m.max_steps).as_bytes());
+        hasher.update(b"\0");
+        for t in &m.tools {
+            hasher.update(t.as_bytes());
+            hasher.update(b",");
+        }
+        hasher.update(b"\0");
+        for g in &m.tool_groups {
+            hasher.update(g.as_bytes());
+            hasher.update(b",");
+        }
+        hasher.update(b"\0");
+        for s in &m.mcp_servers {
+            hasher.update(s.as_bytes());
+            hasher.update(b",");
+        }
+        hasher.update(b"\0");
+        for tag in &m.routing_tags {
+            hasher.update(tag.as_bytes());
+            hasher.update(b",");
+        }
+        hasher.update(b"\0");
+        hasher.update([m.disabled as u8, m.hidden as u8]);
+        hasher.update(b"\0");
+        hasher.update(m.color.as_deref().unwrap_or("").as_bytes());
+        hasher.update(b"|");
+    }
+    hasher.finalize().into()
 }
 
 fn ensure_runtime_manifests_loaded(
@@ -410,7 +496,10 @@ fn should_preload_mcp(one_shot_mode: bool, mcp_probe: &McpConfigProbe) -> bool {
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     aios_kernel::kernel::register_current_pid_provider(current_task_pid);
 
-    let cli = cli::parse_cli_args(std::env::args());
+    let mut cli = cli::parse_cli_args(std::env::args());
+    if let Err(err) = models::ensure_models_available() {
+        return Err(err.into());
+    }
     let config = config::load_config()?;
     let session_store = SessionStore::new(config.history_file.as_path());
     let session_arg = cli.session.clone().unwrap_or_default();
@@ -440,6 +529,20 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if cli.list_agents {
         let agent_manifests = agents::load_all_agents();
         commands::help::print_agents_list(&agent_manifests);
+        return Ok(());
+    }
+
+    // 处理 --clear --session <id>：启动前清空指定 session 的 history
+    if cli.clear {
+        let target = cli.session.as_deref().map(str::trim).unwrap_or("");
+        if target.is_empty() {
+            eprintln!("[clear] --clear 需要配合 --session <id> 使用");
+        } else {
+            match session_store.clear_session_history(target) {
+                Ok(()) => println!("[clear] session {} 的历史已清空", target),
+                Err(err) => eprintln!("[clear] 清空 session {} 失败: {}", target, err),
+            }
+        }
         return Ok(());
     }
 
@@ -474,6 +577,22 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+
+    // 处理 --clipboard：把当前剪贴板内容拼接到首轮提问头部
+    if cli.clipboard {
+        let clip = crate::clipboardw::string_content::get_clipboard_content();
+        if !clip.trim().is_empty() {
+            if cli.args.is_empty() {
+                cli.args.push(clip);
+            } else {
+                let original = std::mem::take(&mut cli.args);
+                let combined = format!("{}\n\n{}", clip, original.join(" "));
+                cli.args.push(combined);
+            }
+        } else {
+            eprintln!("[clipboard] 剪贴板为空，已忽略 --clipboard");
+        }
+    }
 
     let os_arc = new_local_kernel();
     crate::ai::tools::os_tools::init_os_tools_globals(os_arc.clone());
@@ -550,6 +669,109 @@ fn process_history_path(base: &Path, pid: u64) -> PathBuf {
         .map(|name| format!("{name}.proc-{pid}"))
         .unwrap_or_else(|| format!("session.proc-{pid}"));
     base.with_file_name(file_name)
+}
+
+/// 处理一个 foreground ready 进程的恢复执行：构造 wake-up prompt、跑一轮 run_turn、
+/// 然后根据结果走 quota / 终止 / 失败收尾流程。
+async fn run_foreground_resume(
+    app: &mut App,
+    mcp_client: &SharedMcpClient,
+    skill_manifests: &[SkillManifest],
+    agent_manifests: &[AgentManifest],
+    proc: aios_kernel::kernel::Process,
+) {
+    let pid = proc.pid;
+    let proc_question = if !proc.mailbox.is_empty() {
+        let messages: Vec<String> = proc.mailbox.iter().cloned().collect();
+        {
+            let mut os = app.os.lock().unwrap();
+            if let Some(actual) = os.get_process_mut(pid) {
+                actual.mailbox.clear();
+            }
+        }
+        format!(
+            "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- If the mailbox indicates async tool wake-up, first decide whether you need `tool_status` for a full snapshot, `tool_wait` to collect newly finished results, or `tool_cancel` to stop low-value branches.\n- Do not blindly wait again if enough completed results already support the answer.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
+            pid,
+            proc.goal,
+            messages.join("\n---\n")
+        )
+    } else {
+        format!(
+            "[Process {} Resumed] Goal: {}\nContinue execution.",
+            pid, proc.goal
+        )
+    };
+
+    {
+        let mut os = app.os.lock().unwrap();
+        os.set_current_pid(Some(pid));
+        let _ = os.process_pending_signals();
+    }
+
+    let next_model = app.current_model.clone();
+    crate::ai::types::clear_stream_cancel(app);
+    crate::ai::tools::registry::common::clear_tool_cancel();
+
+    let driver_ctx = runtime_ctx::DriverContext::new(
+        app.clone(),
+        mcp_client.clone(),
+        Arc::new(skill_manifests.to_vec()),
+        Arc::new(agent_manifests.to_vec()),
+    );
+
+    let turn_outcome = runtime_ctx::DRIVER_CTX
+        .scope(
+            driver_ctx,
+            TASK_PID.scope(
+                Some(pid),
+                turn_runtime::run_turn(
+                    app,
+                    mcp_client,
+                    skill_manifests,
+                    usize::MAX,
+                    proc_question,
+                    String::new(),
+                    next_model,
+                    None,
+                    false,
+                    false,
+                ),
+            ),
+        )
+        .await;
+
+    match turn_outcome {
+        Ok(_outcome) => {
+            let mut os = app.os.lock().unwrap();
+            os.set_current_pid(Some(pid));
+            os.increment_turns_used_for(pid);
+            let mut should_terminate = true;
+            let mut termination_result = "Completed".to_string();
+            if let Some(p) = os.get_process_mut(pid) {
+                if p.quota_turns > 0 {
+                    p.quota_turns -= 1;
+                }
+                if p.quota_turns == 0 {
+                    termination_result = "Terminated: Max LLM quota reached.".to_string();
+                }
+                if matches!(
+                    p.state,
+                    aios_kernel::kernel::ProcessState::Waiting { .. }
+                        | aios_kernel::kernel::ProcessState::Sleeping { .. }
+                        | aios_kernel::kernel::ProcessState::Stopped
+                ) {
+                    should_terminate = false;
+                }
+            }
+            if should_terminate {
+                terminate_and_cleanup(os.as_mut(), pid, termination_result, true);
+            }
+        }
+        Err(err) => {
+            let mut os = app.os.lock().unwrap();
+            terminate_and_cleanup(os.as_mut(), pid, format!("Failed: {}", err), true);
+        }
+    }
 }
 
 /// Main event loop for AIOS.
@@ -838,24 +1060,24 @@ async fn run_loop(
                                 }
                             }
                             if should_terminate {
-                                os.cleanup_process_resources(pid);
-                                os.set_current_pid(Some(pid));
-                                os.terminate_current(termination_result);
-                                if should_auto_drop_terminated(os.as_ref(), pid) {
-                                    os.drop_terminated(pid);
-                                }
+                                terminate_and_cleanup(
+                                    os.as_mut(),
+                                    pid,
+                                    termination_result,
+                                    true,
+                                );
                             } else if os.is_round_robin() {
                                 os.set_current_pid(Some(pid));
                                 os.requeue_current();
                             }
                         }
                         Err(err) => {
-                            os.cleanup_process_resources(pid);
-                            os.set_current_pid(Some(pid));
-                            os.terminate_current(format!("Failed: {}", err));
-                            if should_auto_drop_terminated(os.as_ref(), pid) {
-                                os.drop_terminated(pid);
-                            }
+                            terminate_and_cleanup(
+                                os.as_mut(),
+                                pid,
+                                format!("Failed: {}", err),
+                                true,
+                            );
                         }
                     }
                 });
@@ -873,9 +1095,31 @@ async fn run_loop(
                         &parent_history_for_scopes,
                         &scope_task_id,
                     );
+                    // sub-agent 默认私有 memory：finalize 后把白名单条目
+                    // (is_permanent_memory) 合并回主 memory 文件，让 long-term
+                    // assets 能跨 task 共享，但普通 task_event 留在私有文件，
+                    // 不污染主记忆。
+                    //
+                    // 主 memory 路径在父任务作用域内解析，这里 task_local 还没装上
+                    // SUBAGENT_MEMORY_PATH，所以 from_env_or_config 拿到的是主路径。
+                    let main_path = crate::ai::tools::storage::memory_store::
+                        MemoryStore::from_env_or_config().path().to_path_buf();
+                    let private_for_merge = mem_path.clone();
                     wrapped = Box::pin(
                         runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped),
                     );
+                    // 这里包一层 outer future：sub-agent run 完成后 merge。
+                    // merge_subagent_whitelist 内部用 for_tests_with_path
+                    // 直接绑定 main_path，绕过 SUBAGENT_MEMORY_PATH override，
+                    // 避免白名单条目又被写回私有文件（=死循环）。
+                    let inner = wrapped;
+                    wrapped = Box::pin(async move {
+                        inner.await;
+                        let _ = crate::ai::tools::service::memory::merge_subagent_whitelist(
+                            &private_for_merge,
+                            &main_path,
+                        );
+                    });
                 }
                 if !inherit.cwd {
                     let scratch_base = parent_history_for_scopes
@@ -899,109 +1143,7 @@ async fn run_loop(
             os.pop_foreground_ready()
         };
         if let Some(proc) = fg_proc {
-            let pid = proc.pid;
-            let proc_question = if !proc.mailbox.is_empty() {
-                let messages: Vec<String> = proc.mailbox.iter().cloned().collect();
-                {
-                    let mut os = app.os.lock().unwrap();
-                    if let Some(actual) = os.get_process_mut(pid) {
-                        actual.mailbox.clear();
-                    }
-                }
-                format!(
-                    "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- If the mailbox indicates async tool wake-up, first decide whether you need `tool_status` for a full snapshot, `tool_wait` to collect newly finished results, or `tool_cancel` to stop low-value branches.\n- Do not blindly wait again if enough completed results already support the answer.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
-                    pid,
-                    proc.goal,
-                    messages.join("\n---\n")
-                )
-            } else {
-                format!(
-                    "[Process {} Resumed] Goal: {}\nContinue execution.",
-                    pid, proc.goal
-                )
-            };
-
-            {
-                let mut os = app.os.lock().unwrap();
-                os.set_current_pid(Some(pid));
-                let _ = os.process_pending_signals();
-            }
-
-            let next_model = app.current_model.clone();
-            crate::ai::types::clear_stream_cancel(app);
-            crate::ai::tools::registry::common::clear_tool_cancel();
-
-            let driver_ctx = runtime_ctx::DriverContext::new(
-                app.clone(),
-                mcp_client.clone(),
-                Arc::new(skill_manifests.clone()),
-                Arc::new(agent_manifests.clone()),
-            );
-
-            let turn_outcome = runtime_ctx::DRIVER_CTX
-                .scope(
-                    driver_ctx,
-                    TASK_PID.scope(
-                        Some(pid),
-                        turn_runtime::run_turn(
-                            app,
-                            mcp_client,
-                            &*skill_manifests,
-                            usize::MAX,
-                            proc_question,
-                            String::new(),
-                            next_model,
-                            None,
-                            false,
-                            false,
-                        ),
-                    ),
-                )
-                .await;
-
-            match turn_outcome {
-                Ok(_outcome) => {
-                    let mut os = app.os.lock().unwrap();
-                    os.set_current_pid(Some(pid));
-                    os.increment_turns_used_for(pid);
-                    let mut should_terminate = true;
-                    let mut termination_result = "Completed".to_string();
-                    if let Some(p) = os.get_process_mut(pid) {
-                        if p.quota_turns > 0 {
-                            p.quota_turns -= 1;
-                        }
-                        if p.quota_turns == 0 {
-                            termination_result =
-                                "Terminated: Max LLM quota reached.".to_string();
-                        }
-                        if matches!(
-                            p.state,
-                            aios_kernel::kernel::ProcessState::Waiting { .. }
-                                | aios_kernel::kernel::ProcessState::Sleeping { .. }
-                                | aios_kernel::kernel::ProcessState::Stopped
-                        ) {
-                            should_terminate = false;
-                        }
-                    }
-                    if should_terminate {
-                        os.cleanup_process_resources(pid);
-                        os.set_current_pid(Some(pid));
-                        os.terminate_current(termination_result);
-                        if should_auto_drop_terminated(os.as_ref(), pid) {
-                            os.drop_terminated(pid);
-                        }
-                    }
-                }
-                Err(err) => {
-                    let mut os = app.os.lock().unwrap();
-                    os.cleanup_process_resources(pid);
-                    os.set_current_pid(Some(pid));
-                    os.terminate_current(format!("Failed: {}", err));
-                    if should_auto_drop_terminated(os.as_ref(), pid) {
-                        os.drop_terminated(pid);
-                    }
-                }
-            }
+            run_foreground_resume(app, mcp_client, &*skill_manifests, agent_manifests, proc).await;
             continue;
         }
 
@@ -1165,11 +1307,7 @@ async fn run_loop(
 
                 if should_terminate {
                     if let Some(pid) = current_pid {
-                        os.cleanup_process_resources(pid);
-                        os.terminate_current(termination_result);
-                        if should_auto_drop_terminated(os.as_ref(), pid) {
-                            os.drop_terminated(pid);
-                        }
+                        terminate_and_cleanup(os.as_mut(), pid, termination_result, false);
                     }
                 }
 
@@ -1194,13 +1332,9 @@ async fn run_loop(
                 let mut os = app.os.lock().unwrap();
                 let current_pid = os.current_process_id();
                 if let Some(pid) = current_pid {
-                    os.cleanup_process_resources(pid);
-                }
-                os.terminate_current(format!("Failed: {}", err));
-                if let Some(pid) = current_pid {
-                    if should_auto_drop_terminated(os.as_ref(), pid) {
-                        os.drop_terminated(pid);
-                    }
+                    terminate_and_cleanup(os.as_mut(), pid, format!("Failed: {}", err), false);
+                } else {
+                    os.terminate_current(format!("Failed: {}", err));
                 }
                 app.session_history_file = original_history_file;
                 app.writer = original_writer;
