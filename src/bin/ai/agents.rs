@@ -71,6 +71,101 @@ const PROJECT_ROOT_MARKERS: &[&str] = &[
 const PROJECT_INSTRUCTION_MAX_DOC_CHARS: usize = 8_000;
 const PROJECT_INSTRUCTION_MAX_TOTAL_CHARS: usize = 16_000;
 
+/// 已识别的项目语言/构建体系类型，用来在 system prompt 里给 agent 一些
+/// 默认约定（构建/测试命令、惯用工具等），减少"摸索式"工具调用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProjectKind {
+    Rust,
+    NodeJs,
+    Python,
+    Go,
+    JavaMaven,
+    JavaGradle,
+    Ruby,
+}
+
+impl ProjectKind {
+    /// system prompt 里展示给 LLM 的简短描述（语言 + 推荐构建/测试命令）。
+    /// 注意：这里只是默认建议，仓库根的 AGENTS.md 等指令文件可覆盖。
+    pub(super) fn prompt_hint(self) -> &'static str {
+        match self {
+            ProjectKind::Rust => {
+                "Rust project (Cargo.toml). Prefer: `cargo check` for fast type-check, \
+                 `cargo test` for tests, `cargo clippy` for lint. \
+                 Use Rust idioms (Result, ?, Box<dyn Error>)."
+            }
+            ProjectKind::NodeJs => {
+                "Node.js / TypeScript project (package.json). Prefer: `npm test` / \
+                 `pnpm test` / `yarn test` based on lockfile. Check scripts in package.json \
+                 before guessing build commands."
+            }
+            ProjectKind::Python => {
+                "Python project (pyproject.toml). Prefer: `pytest` for tests, \
+                 `python -m build` or project-defined entrypoints. Respect virtualenv if active."
+            }
+            ProjectKind::Go => {
+                "Go project (go.mod). Prefer: `go build ./...`, `go test ./...`, \
+                 `go vet ./...`. Module path is in go.mod."
+            }
+            ProjectKind::JavaMaven => {
+                "Java project (pom.xml, Maven). Prefer: `mvn -q compile` / `mvn -q test`."
+            }
+            ProjectKind::JavaGradle => {
+                "Java project (build.gradle / build.gradle.kts, Gradle). Prefer: \
+                 `./gradlew build` / `./gradlew test`."
+            }
+            ProjectKind::Ruby => {
+                "Ruby project (Gemfile). Prefer: `bundle exec rspec` / `bundle exec rake`."
+            }
+        }
+    }
+}
+
+/// 从 `cwd` 起向上查找直到 root marker，根据命中的 manifest 文件推断项目类型。
+/// 返回首个命中的类型；若全部不命中返回 None。
+/// 与 `project_instruction_search_scope` 共用 ancestor 遍历语义。
+pub(super) fn detect_project_kind(cwd: &Path) -> Option<ProjectKind> {
+    let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+    for dir in cwd.ancestors() {
+        if home_dir.as_deref() == Some(dir) && dir != cwd {
+            break;
+        }
+        // 优先级：Cargo > go.mod > pyproject > package.json > pom > gradle > Gemfile
+        if dir.join("Cargo.toml").is_file() {
+            return Some(ProjectKind::Rust);
+        }
+        if dir.join("go.mod").is_file() {
+            return Some(ProjectKind::Go);
+        }
+        if dir.join("pyproject.toml").is_file() {
+            return Some(ProjectKind::Python);
+        }
+        if dir.join("package.json").is_file() {
+            return Some(ProjectKind::NodeJs);
+        }
+        if dir.join("pom.xml").is_file() {
+            return Some(ProjectKind::JavaMaven);
+        }
+        if dir.join("build.gradle").is_file() || dir.join("build.gradle.kts").is_file() {
+            return Some(ProjectKind::JavaGradle);
+        }
+        if dir.join("Gemfile").is_file() {
+            return Some(ProjectKind::Ruby);
+        }
+        // 命中 root marker（如裸 .git）但没有上述 manifest 时停止上溯。
+        if has_project_root_marker(dir) {
+            return None;
+        }
+    }
+    None
+}
+
+pub(super) fn detect_project_kind_from_cwd() -> Option<ProjectKind> {
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok()?;
+    detect_project_kind(&cwd)
+}
+
+
 /// Categorizes an agent's role: `Primary` for main conversation,
 /// `Subagent` for delegated tasks, or `All` for both.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

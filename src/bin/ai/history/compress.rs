@@ -172,8 +172,28 @@ pub(in crate::ai) async fn compact_persisted_history_with_app(
     app: &App,
     messages: Vec<Message>,
 ) -> Vec<Message> {
+    compact_persisted_history_with_app_inner(app, messages, MAX_HISTORY_TURNS).await
+}
+
+/// 任务边界（一轮 turn 结束且没有再调工具，意味着 agent 给出了最终答案）触发的
+/// 主动压缩。阈值从 `MAX_HISTORY_TURNS`(200) 下调到 `PERSISTED_HISTORY_KEEP_RECENT_TURNS`(160)，
+/// 让"任务做完"这种自然分界点提前触发摘要，避免一直堆到硬上限才被动切。
+/// 仍然不会摘出还没到 160 的对话，所以短对话不受影响。
+pub(in crate::ai) async fn compact_persisted_history_at_boundary_with_app(
+    app: &App,
+    messages: Vec<Message>,
+) -> Vec<Message> {
+    compact_persisted_history_with_app_inner(app, messages, PERSISTED_HISTORY_KEEP_RECENT_TURNS)
+        .await
+}
+
+async fn compact_persisted_history_with_app_inner(
+    app: &App,
+    messages: Vec<Message>,
+    threshold_turns: usize,
+) -> Vec<Message> {
     let user_turns = messages.iter().filter(|message| message.role == "user").count();
-    if user_turns <= MAX_HISTORY_TURNS {
+    if user_turns <= threshold_turns {
         return messages;
     }
 

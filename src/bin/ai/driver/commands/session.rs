@@ -43,6 +43,9 @@ pub fn try_handle_session_command(
             println!("  /sessions export <id> [output.md]       export session to Markdown");
             println!("  /sessions export-current [output.md]    export current session to Markdown");
             println!("  /sessions export-last [output.md]       export latest session to Markdown");
+            println!("  /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
+            println!("  /sessions branch <keep_messages> [src=<id>] [as=<id>]");
+            println!("                                          fork then truncate to first N messages");
             println!();
         }
         "list" | "ls" | "" => {
@@ -213,6 +216,73 @@ pub fn try_handle_session_command(
             app.session_id = new_id.clone();
             app.session_history_file = store.session_history_file(&new_id);
             println!("Deleted {deleted} session(s). Switched to new session: {new_id}");
+        }
+        "fork" => {
+            // 解析 src=<id> / as=<id>，未指定 src 时默认基于当前 session。
+            let mut src: Option<String> = None;
+            let mut dst: Option<String> = None;
+            for arg in parts.by_ref() {
+                if let Some(v) = arg.strip_prefix("src=") {
+                    src = Some(v.to_string());
+                } else if let Some(v) = arg.strip_prefix("as=") {
+                    dst = Some(v.to_string());
+                }
+            }
+            let src_id = src.unwrap_or_else(|| app.session_id.clone());
+            let dst_id = dst.unwrap_or_else(|| Uuid::new_v4().to_string());
+            match store.fork_session(&src_id, &dst_id) {
+                Ok(()) => {
+                    app.session_id = dst_id.clone();
+                    app.session_history_file = store.session_history_file(&dst_id);
+                    if let Some(ctx) = app.agent_context.as_mut() {
+                        ctx.tools.clear();
+                    }
+                    println!("Forked '{}' -> '{}', switched to new branch.", src_id, dst_id);
+                }
+                Err(err) => {
+                    eprintln!("Failed to fork session: {}", err);
+                }
+            }
+        }
+        "branch" => {
+            // 用法: /sessions branch <keep_messages> [src=<id>] [as=<id>]
+            let Some(keep_str) = parts.next() else {
+                println!(
+                    "missing keep count. try: /sessions branch <keep_messages> [src=<id>] [as=<id>]"
+                );
+                return Ok(true);
+            };
+            let Ok(keep) = keep_str.parse::<usize>() else {
+                println!("invalid keep count: '{}'", keep_str);
+                return Ok(true);
+            };
+            let mut src: Option<String> = None;
+            let mut dst: Option<String> = None;
+            for arg in parts.by_ref() {
+                if let Some(v) = arg.strip_prefix("src=") {
+                    src = Some(v.to_string());
+                } else if let Some(v) = arg.strip_prefix("as=") {
+                    dst = Some(v.to_string());
+                }
+            }
+            let src_id = src.unwrap_or_else(|| app.session_id.clone());
+            let dst_id = dst.unwrap_or_else(|| Uuid::new_v4().to_string());
+            match store.branch_session(&src_id, &dst_id, keep) {
+                Ok(()) => {
+                    app.session_id = dst_id.clone();
+                    app.session_history_file = store.session_history_file(&dst_id);
+                    if let Some(ctx) = app.agent_context.as_mut() {
+                        ctx.tools.clear();
+                    }
+                    println!(
+                        "Branched '{}' -> '{}' (kept first {} message(s)), switched to new branch.",
+                        src_id, dst_id, keep
+                    );
+                }
+                Err(err) => {
+                    eprintln!("Failed to branch session: {}", err);
+                }
+            }
         }
         _ => {
             println!("unknown action: '{}'. try: /sessions help", action);

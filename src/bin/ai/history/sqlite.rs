@@ -433,6 +433,36 @@ pub(in crate::ai) fn clear_session_history_sqlite(path: &Path) -> io::Result<()>
     Ok(())
 }
 
+/// 把 messages 表保留到前 `keep` 条（按 id 升序）。用于 session branch：
+/// 复制完整 sqlite 后再回滚到指定消息数。`keep == 0` 等价于 clear。
+pub(in crate::ai) fn truncate_messages_sqlite(path: &Path, keep: usize) -> io::Result<()> {
+    let conn = match open_history_db(path) {
+        Ok(c) => c,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    init_history_schema(&conn)?;
+    if keep == 0 {
+        conn.execute("DELETE FROM messages", [])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        return Ok(());
+    }
+    // 取前 `keep` 条的最大 id，删掉其后的所有行。
+    let cutoff: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM messages ORDER BY id ASC LIMIT 1 OFFSET ?1",
+            params![(keep as i64) - 1],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    if let Some(cutoff_id) = cutoff {
+        conn.execute("DELETE FROM messages WHERE id > ?1", params![cutoff_id])
+            .map_err(|e| io::Error::other(e.to_string()))?;
+    }
+    Ok(())
+}
+
 pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
     let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
     let meta: Option<String> = conn

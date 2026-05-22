@@ -30,11 +30,15 @@ const MAX_TASK_REGISTRY_SIZE: usize = 100;
 const DEFAULT_TASK_PRIORITY: u8 = 20;
 const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
-/// Default seconds to wait for all tasks in `task_wait`. Matches the
-/// schema documentation. Used when the model does not pass `timeout_secs`.
-const DEFAULT_TASK_WAIT_TIMEOUT_SECS: u64 = 120;
-/// Hard upper bound on `timeout_secs` to keep a runaway sub-agent from
-/// wedging the parent indefinitely.
+/// 单次 `task_wait` 调用的默认等待预算（秒）。这只是 **本次调用的最长阻塞时间**，
+/// 不是 subagent 的总寿命：超时仅意味着"这次没等到结果"，主 agent 可以继续调
+/// `task_wait` 续等，subagent 仍在后台运行，channel/futex 也不会被销毁。
+///
+/// 之前默认 120s，太容易被 LLM 误判为"subagent 卡住"——很多正常 subagent 跑一轮
+/// LLM + 多个工具调用就需要 2~5 分钟。提高到 600s 让等待与正常运行时长更匹配。
+const DEFAULT_TASK_WAIT_TIMEOUT_SECS: u64 = 600;
+/// `task_wait.timeout_secs` 的硬上限，避免模型把 timeout 设成天文数字时彻底
+/// 阻塞 driver。
 const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 3600;
 
 /// Granular control over which slices of the parent agent's execution
@@ -551,7 +555,7 @@ fn params_task_spawn() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_spawn",
-        description: "Launch a subagent task asynchronously and return immediately with a task_id. Use this when you want to run multiple subagent tasks in parallel. Collect results later with task_wait.",
+        description: "Launch a subagent task asynchronously and return immediately with a task_id. Use this when you want to run multiple subagent tasks in parallel. The returned task_id is a long-lived handle: collect results with task_wait (re-callable until the result is consumed) or peek non-blockingly with task_status. Hitting task_wait's timeout does NOT mean the subagent is stuck — it only means the wait budget for that single call elapsed.",
         parameters: params_task_spawn,
         execute: execute_task_spawn,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -749,11 +753,16 @@ fn params_task_wait() -> Value {
             "task_ids": {
                 "type": "array",
                 "items": { "type": "string" },
-                "description": "Array of task_id strings returned by task_spawn. Waits for ALL to complete."
+                "description": "Array of task_id strings returned by task_spawn."
             },
             "timeout_secs": {
                 "type": "integer",
-                "description": "Maximum seconds to wait for all tasks. Default 120."
+                "description": "Wait budget for THIS call (clamped to [1, 1800], default 600). Hitting this budget does NOT cancel or stall the subagent — it only means the wait policy was not satisfied within this call. The subagent keeps running, its result channel/futex stay alive, and you can call task_wait again with the same task_ids to keep waiting (or use task_status for a non-blocking snapshot)."
+            },
+            "wait_policy": {
+                "type": "string",
+                "enum": ["all", "any"],
+                "description": "Optional. 'all' (default) returns when every pending task has finished. 'any' returns as soon as the first task finishes — useful for fan-out where you want to start processing the fastest result while others continue. Remaining tasks stay alive and can be retrieved by another task_wait call."
             }
         },
         "required": ["task_ids"]
@@ -842,7 +851,7 @@ fn params_tool_cancel() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_wait",
-        description: "Wait for one or more asynchronously spawned tasks to complete and collect their results. Polls all tasks in parallel so total wait time equals the slowest task, not the sum. Use after task_spawn to gather results.",
+        description: "Wait for one or more asynchronously spawned subagent tasks to complete and collect their results. Polls all tasks in parallel so total wait time equals the slowest task, not the sum. The `timeout_secs` argument is a per-call wait budget — when it elapses without satisfying the policy, the call returns with already-collected results AND a clear note that the remaining subagents are still running; you can call task_wait again with the same task_ids to keep waiting (or pass `wait_policy=\"any\"` to wake on the first finisher). Use task_status for a non-blocking snapshot.",
         parameters: params_task_wait,
         execute: execute_task_wait,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -922,19 +931,31 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         return Err("task_ids array cannot be empty".to_string());
     }
 
-    // Default 120s matches the schema documentation. Hard upper bound of
-    // 3600s prevents the model from accidentally hanging the wait
-    // indefinitely.
+    // 单次 task_wait 调用的等待预算。详见 DEFAULT_TASK_WAIT_TIMEOUT_SECS 注释——
+    // 超时只意味着本次没等到，subagent 仍在跑、资源不会被释放。
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(Value::as_u64)
         .unwrap_or(DEFAULT_TASK_WAIT_TIMEOUT_SECS)
         .clamp(1, MAX_TASK_WAIT_TIMEOUT_SECS);
-    // Heuristic: the driver loop calls advance_tick() roughly every 10ms
-    // (idle path uses `tokio::time::sleep(Duration::from_millis(10))`),
-    // so ~100 ticks ≈ 1s. We err on the side of waking up sooner rather
-    // than later by using 100 ticks/sec.
+    // 启发式：driver 主循环 idle 路径每 ~10ms 调一次 advance_tick()，故 100
+    // ticks ≈ 1 秒。这里宁可早醒不晚醒，使用 100 ticks/sec。
     let timeout_ticks = Some(timeout_secs.saturating_mul(100));
+
+    // wait_policy: "any" | "all"，默认 "all"（与历史行为一致）。
+    // - all  — 等到所有 pending 任务都完成才返回（适合需要汇总）；
+    // - any  — 任一 pending 任务完成即返回，其余仍在跑、可继续 task_wait
+    //          （适合 fan-out 后想边收边推进）。
+    let wait_policy = match args.get("wait_policy").and_then(Value::as_str) {
+        Some("any") => WaitPolicy::Any,
+        Some("all") | None => WaitPolicy::All,
+        Some(other) => {
+            return Err(format!(
+                "Unknown wait_policy: {} (expected 'any' or 'all')",
+                other
+            ))
+        }
+    };
 
     let mut registry = TASK_REGISTRY.lock().unwrap();
     for tid in &task_ids {
@@ -945,33 +966,26 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
 
     let mut ready = Vec::new();
     let mut pending = Vec::new();
-    let mut timed_out = Vec::new();
+    // 收集本次调用中已完成（成功 / 失败、channel/futex 已销毁、需要从 registry
+    // 删除）的 task_id；suspended 与 budget-elapsed 早返回路径也会用它清理。
+    let mut finished: Vec<String> = Vec::new();
+    // closure 默认按引用借用 wait_policy / registry / pending / ready / finished，
+    // 不加 `move`，保证 closure 返回后外层 `if !pending.is_empty()` 等代码仍可访问。
     let wait_message = with_os_kernel(|os| {
         for tid in &task_ids {
             let entry = registry.get(tid).expect("validated");
-            // Honour a hard wallclock timeout per task. Sub-agent wedged
-            // for >timeout_secs is reported as a timeout to the parent
-            // agent so it can decide to retry / cancel instead of waiting
-            // forever.
-            if entry.started_at.elapsed().as_secs() >= timeout_secs {
-                timed_out.push(tid.clone());
-                let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
-                let _ = os.channel_release_named(
-                    ChannelId(entry.result_channel_id),
-                    "task_result.consumer",
-                );
-                let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
-                let _ = os.futex_destroy(entry.completion_futex_addr);
-                ready.push(format!(
-                    "[Task: {} via {} @ {}] TIMEOUT after {}s (process pid={} still running; consider cancelling explicitly).",
-                    entry.description,
-                    entry.agent_name,
-                    entry.model,
-                    timeout_secs,
-                    entry.pid,
-                ));
-                continue;
-            }
+            // ⚠️ 这里之前曾按 `entry.started_at.elapsed() >= timeout_secs`
+            // 直接把任务标记为 TIMEOUT 并销毁 channel/futex —— 这是 bug：
+            // `started_at` 是 spawn 时间，不是本次 task_wait 的开始时间。如果
+            // 主 agent 在 spawn 后 600s 才第一次调 task_wait，所有任务都会
+            // **立刻** 被报为 TIMEOUT 且 result_channel 被销毁，subagent
+            // 真实结果永久丢失，主 agent 自然会以为 "subagent 卡住"。
+            //
+            // 现在的做法：只看 channel 上有没有就绪 payload；如果还没有，统一
+            // 走 pending 分支，让 epoll_wait_many 在本次调用 budget 内挂起。
+            // 真正的"等待预算耗尽"只在 epoll_wait_many 的 wait.suspended /
+            // 返回空 ready 时体现，并且 **绝不销毁 channel/futex**，主 agent
+            // 可以继续调 task_wait 续等。
             if let Some(result) = read_task_result(os, entry.result_channel_id, true)? {
                 ready.push(format_task_result(&entry, result));
                 let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
@@ -981,6 +995,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 );
                 let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
                 let _ = os.futex_destroy(entry.completion_futex_addr);
+                finished.push(tid.clone());
             } else if is_task_pending(os, entry.pid)? {
                 pending.push((tid.clone(), entry.pid));
             } else {
@@ -998,6 +1013,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     "[Task: {} via {} @ {}] FAILED: process pid={} terminated without publishing any output.",
                     entry.description, entry.agent_name, entry.model, entry.pid
                 ));
+                finished.push(tid.clone());
             }
         }
 
@@ -1008,24 +1024,33 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 os,
                 &format!("task_wait:{}", pending_ids.join(",")),
                 &wait_sources,
-                WaitPolicy::All,
+                wait_policy.clone(),
                 timeout_ticks,
             )?;
             if wait.suspended {
-                // The current process has been suspended waiting on the
-                // remaining channels. Surface what we already collected
-                // (instead of throwing it away), and let the model resume
-                // task_wait after wake-up to drain the rest. The parent's
-                // timeout_secs is enforced at the next call via
-                // entry.started_at above.
+                // 当前进程已经被挂起等待剩余 channel ready。把已收集到的结果
+                // 透出（不丢失），并明确告诉主 agent：subagent 仍在后台运行、
+                // 资源未销毁、可以再次 task_wait 续等——避免主 agent 把这次
+                // 等待预算耗尽误判为"卡住"。
                 let mut parts = Vec::new();
                 if !ready.is_empty() {
                     parts.push(ready.join("\n\n---\n\n"));
                 }
+                let policy_label = match wait_policy {
+                    WaitPolicy::Any => "any",
+                    WaitPolicy::All => "all",
+                };
                 parts.push(format!(
-                    "Waiting on {} pending task(s) via epoll_wait_many. Suspended current process until all remaining result channels become ready or timeout fires (timeout_secs={}); event_ids={}. Call task_wait again after resume to collect remaining results.",
+                    "[task_wait BUDGET ELAPSED] {} pending subagent task(s) still running in the background. \
+                    The wait budget for THIS call ({timeout_secs}s, wait_policy={policy_label}) \
+                    has elapsed before the policy was satisfied — this is NOT a stall and the subagent(s) are NOT cancelled. \
+                    Their result channels and completion futexes are kept alive. \
+                    Pending task_ids: [{}]. event_ids={}. \
+                    Recommended next steps: (a) call `task_status` for a non-blocking snapshot, \
+                    (b) call `task_wait` again with the same task_ids to keep waiting (optionally pass `wait_policy=\"any\"` to wake on the first finisher), \
+                    or (c) continue with other reasoning if the already collected results are sufficient.",
                     pending_ids.len(),
-                    timeout_secs,
+                    pending_ids.join(", "),
                     wait.event_ids
                         .iter()
                         .map(|id| id.to_string())
@@ -1074,17 +1099,35 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         if !ready.is_empty() {
             parts.push(ready.join("\n\n---\n\n"));
         }
+        let pending_ids: Vec<&str> = pending.iter().map(|(tid, _)| tid.as_str()).collect();
+        let policy_label = match wait_policy {
+            WaitPolicy::Any => "any",
+            WaitPolicy::All => "all",
+        };
         parts.push(format!(
-            "Waiting on {} pending task(s) via epoll_wait_many. Call task_wait again after progress is reported.",
-            pending.len()
+            "[task_wait BUDGET ELAPSED] {} pending subagent task(s) still running in the background. \
+            wait_policy={policy_label}, timeout_secs={timeout_secs}. The subagent(s) are NOT stalled and NOT cancelled; \
+            their result channels and completion futexes remain alive. \
+            Pending task_ids: [{}]. \
+            Next steps: call `task_status` for a snapshot, or call `task_wait` again with the same task_ids to keep waiting \
+            (consider `wait_policy=\"any\"` if you only need the first finisher).",
+            pending.len(),
+            pending_ids.join(", ")
         ));
+        // 仅清理已经 ready 的 task_id 对应的 registry 条目；pending 任务必须保留，
+        // 否则下次 task_wait 会因 "Unknown task_id" 失败。
+        let pending_set: rust_tools::commonw::FastSet<&str> = pending_ids.iter().copied().collect();
+        for tid in &task_ids {
+            if !pending_set.contains(tid.as_str()) {
+                registry.remove(tid);
+            }
+        }
         return Ok(parts.join("\n\n---\n\n"));
     }
 
     for tid in &task_ids {
         registry.remove(tid);
     }
-    let _ = timed_out;
     Ok(ready.join("\n\n---\n\n"))
 }
 

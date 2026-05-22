@@ -225,6 +225,21 @@ fn store_cached_context_history(key: ContextHistoryCacheKey, value: Vec<Message>
 pub(in crate::ai) async fn compact_session_history_with_app(
     app: &App,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    compact_session_history_with_app_inner(app, false).await
+}
+
+/// 任务边界触发的压缩：阈值更激进（160 vs 200），适合 turn 收尾且 agent 没有
+/// 再调工具的"答案已交付"时刻调用。
+pub(in crate::ai) async fn compact_session_history_at_boundary_with_app(
+    app: &App,
+) -> Result<(), Box<dyn std::error::Error>> {
+    compact_session_history_with_app_inner(app, true).await
+}
+
+async fn compact_session_history_with_app_inner(
+    app: &App,
+    at_boundary: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let history_file = &app.session_history_file;
     let messages = if blob::is_sqlite_path(history_file) {
         sqlite::build_message_arr_sqlite(usize::MAX, history_file.as_path())?
@@ -237,7 +252,11 @@ pub(in crate::ai) async fn compact_session_history_with_app(
         blob::parse_history_blob(&history)
     };
 
-    let compacted = compress::compact_persisted_history_with_app(app, messages.clone()).await;
+    let compacted = if at_boundary {
+        compress::compact_persisted_history_at_boundary_with_app(app, messages.clone()).await
+    } else {
+        compress::compact_persisted_history_with_app(app, messages.clone()).await
+    };
     if compacted == messages {
         return Ok(());
     }

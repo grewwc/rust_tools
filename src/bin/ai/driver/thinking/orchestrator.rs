@@ -314,6 +314,53 @@ impl ThinkingOrchestrator {
             Some(parts.join("\n\n"))
         }
     }
+
+    /// 构造一段精简的 Working Memory 文本，注入下一轮 Fact 段。
+    /// 内容仅包含真正"跨 turn 还需要被 LLM 看到"的状态：
+    ///   - 当前 active goal（描述 + 下一步可执行的 sub-goal 列表）
+    ///   - 当前激活的 thinking 模式
+    ///   - 推理树当前节点 ID（如有）
+    /// 任一项都没有时返回 None，避免在 prompt 里塞空段。
+    fn build_working_memory_section(&self) -> Option<String> {
+        let mut parts: Vec<String> = Vec::new();
+
+        if let Some(goal) = self.goal_manager.active_goal() {
+            let next_actions: Vec<&str> = goal
+                .get_next_actionable()
+                .iter()
+                .map(|s| s.description.as_str())
+                .collect();
+            let next_str = if next_actions.is_empty() {
+                "(none yet — decompose first)".to_string()
+            } else {
+                next_actions.join("; ")
+            };
+            parts.push(format!(
+                "Active goal: {}\nNext actionable sub-goals: {}",
+                goal.description.trim(),
+                next_str
+            ));
+        }
+
+        if !self.active_modes.is_empty() {
+            let modes: Vec<String> = self
+                .active_modes
+                .iter()
+                .map(|m| format!("{:?}", m))
+                .collect();
+            parts.push(format!("Active thinking modes: {}", modes.join(", ")));
+        }
+
+        if let Some(node_id) = self.current_tree_node_id {
+            parts.push(format!("Reasoning tree current node: {:?}", node_id));
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
+    }
 }
 
 pub struct GeneralizeResult {
@@ -483,6 +530,18 @@ impl TurnObserver for ThinkingOrchestrator {
                 ));
             }
         }
+
+        // Working Memory：把 active goal + 最近一个推理节点 ID + 当前激活模式
+        // 作为一个 Fact 段注入下一轮 system prompt，这样 LLM 在 turn 间不必
+        // 重新猜"我之前在做什么"。仅在确实有内容时注入，避免空段。
+        if let Some(working_memory) = self.build_working_memory_section() {
+            sections.push((
+                SectionKind::Fact,
+                "Working Memory".to_string(),
+                working_memory,
+            ));
+        }
+
         let suggested_tool_calls = std::mem::take(&mut self.pending_suggested_tool_calls);
         PrepareOutput {
             sections,
@@ -560,7 +619,6 @@ impl TurnObserver for ThinkingOrchestrator {
     fn name(&self) -> &str {
         "thinking"
     }
-
     fn is_poisoned(&self) -> bool {
         self.poisoned
     }

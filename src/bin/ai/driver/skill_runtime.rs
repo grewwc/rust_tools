@@ -671,6 +671,16 @@ fn build_system_prompt(
         b.push(ContextKind::Policy, project_prompt);
     }
 
+    if let Some(kind) = crate::ai::agents::detect_project_kind_from_cwd() {
+        // 把识别出的项目类型 + 默认构建/测试约定作为 Fact 段注入，
+        // 让 LLM 不必猜测 `cargo` / `npm` / `go` 该用哪个。
+        b.push_labeled(
+            ContextKind::Fact,
+            "Project Type",
+            kind.prompt_hint().to_string(),
+        );
+    }
+
     if has_tool(available_tools, "enable_tools") {
         let discovery_policy = if skill.is_none() {
             "Tool discovery:\n- Not all tools are loaded. Use `discover_skills` for specialized workflows, or `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for specific tools.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first.\n- No skill is active yet. For non-trivial requests, prefer calling `discover_skills` before giving a freeform response."
@@ -693,6 +703,10 @@ fn build_system_prompt(
 
     if has_tool(available_tools, "tool_spawn") || has_tool(available_tools, "tool_wait") {
         b.push(ContextKind::Behavior, "Async Tool Orchestration:\n- Use `tool_spawn` to launch independent builtin or MCP tool calls in parallel.\n- Use `tool_wait` with `wait_policy=all` to join a full batch, or `wait_policy=any` to resume when any branch finishes.\n- When a process wakes because async tools finished, inspect the wake-up mailbox message carefully.\n- After wake-up, prefer `tool_status` to inspect all task states, `tool_wait` to collect newly finished results, or `tool_cancel` to stop low-value still-running branches.\n- Do not blindly wait again if the completed results already support an answer.\n- If mailbox messages already identify the relevant finished tasks, continue reasoning immediately instead of re-querying everything.");
+    }
+
+    if has_tool(available_tools, "task_spawn") || has_tool(available_tools, "task_wait") {
+        b.push(ContextKind::Behavior, "Async Subagent Orchestration (task_*):\n- `task_spawn` launches a subagent task asynchronously and returns a task_id immediately. Fan out multiple subagent tasks in parallel when their work is independent.\n- `task_wait` collects results. Its `timeout_secs` is a per-call wait budget — when it elapses without satisfying the policy, the call returns the already-collected results plus a clear note that the remaining subagents are still running. This is NOT a stall: re-call `task_wait` with the same task_ids to keep waiting (or pass `wait_policy=\"any\"` to wake on the first finisher).\n- `task_status` is non-blocking: use it to peek at progress without consuming results.\n- There is NO `task_cancel`. Do not invent it. If you need to abandon work, just stop calling `task_wait` and let the subagent run to completion in the background; its result will be reaped by the kernel.\n- Do not confuse the `task_*` family with `tool_*` — they are distinct. `tool_wait` cannot consume a task_id, and `task_wait` cannot consume a tool ticket.");
     }
 
     if has_tool(available_tools, "knowledge_search") || has_tool(available_tools, "knowledge_semantic_search") {

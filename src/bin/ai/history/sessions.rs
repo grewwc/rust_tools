@@ -149,6 +149,58 @@ impl SessionStore {
         read_all_messages_sqlite(&path)
     }
 
+    /// 把 `src` session 整体复制到 `dst` 作为新分支。原 session 不动。
+    /// 拒绝覆盖已有 dst（避免误覆盖）。assets 目录如果存在也一并复制。
+    pub(in crate::ai) fn fork_session(&self, src: &str, dst: &str) -> io::Result<()> {
+        let src_path = self.session_history_file(src);
+        if !src_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("source session '{src}' not found"),
+            ));
+        }
+        let dst_path = self.session_history_file(dst);
+        if dst_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("destination session '{dst}' already exists"),
+            ));
+        }
+        self.ensure_root_dir()?;
+        fs::copy(&src_path, &dst_path)?;
+
+        // assets 目录是可选的；存在则尽力浅复制
+        let src_assets = self.session_assets_dir(src);
+        if src_assets.is_dir() {
+            let dst_assets = self.session_assets_dir(dst);
+            let _ = fs::create_dir_all(&dst_assets);
+            if let Ok(entries) = fs::read_dir(&src_assets) {
+                for entry in entries.flatten() {
+                    let from = entry.path();
+                    if let Some(name) = entry.file_name().to_str() {
+                        let to = dst_assets.join(name);
+                        let _ = fs::copy(&from, &to);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 在 `src` 之上分支，并把分支保留到第 `keep_messages` 条消息（按 id 升序）。
+    /// 适合"我想从某轮回滚后换个方向继续"的场景。
+    pub(in crate::ai) fn branch_session(
+        &self,
+        src: &str,
+        dst: &str,
+        keep_messages: usize,
+    ) -> io::Result<()> {
+        self.fork_session(src, dst)?;
+        let dst_path = self.session_history_file(dst);
+        super::sqlite::truncate_messages_sqlite(&dst_path, keep_messages)?;
+        Ok(())
+    }
+
     pub(in crate::ai) fn export_session_to_markdown(
         &self,
         session_id: &str,

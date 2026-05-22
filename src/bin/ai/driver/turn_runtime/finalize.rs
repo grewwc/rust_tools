@@ -2,7 +2,7 @@ use colored::Colorize;
 use serde_json::Value;
 use crate::ai::{
     driver::{print::format_empty_state, reflection},
-    history::{Message, compact_session_history_with_app},
+    history::{Message, compact_session_history_at_boundary_with_app, compact_session_history_with_app},
     types::App,
 };
 
@@ -171,13 +171,21 @@ pub(super) async fn finalize_turn(
             turn_messages,
             persisted_turn_messages,
         );
-        if let Err(err) = compact_session_history_with_app(app).await {
+        // 任务边界判定：当前 turn 没有再调工具，意味着 agent 已经把答案交付，
+        // 这是一个自然的"任务完成"切点；用更激进的阈值（160 turns）触发摘要，
+        // 避免对话一直堆到硬上限（200 turns）才被动压缩。
+        let had_tool_calls = turn_messages.iter().any(|m| m.role == "tool" || m.tool_calls.as_ref().map_or(false, |c| !c.is_empty()));
+        let compact_result = if had_tool_calls {
+            compact_session_history_with_app(app).await
+        } else {
+            compact_session_history_at_boundary_with_app(app).await
+        };
+        if let Err(err) = compact_result {
             eprintln!("[Warning] Failed to compact persisted history: {}", err);
         }
         println!();
         maybe_spawn_critic_revise_background(app, question, final_assistant_text);
 
-        let had_tool_calls = turn_messages.iter().any(|m| m.role == "tool" || m.tool_calls.as_ref().map_or(false, |c| !c.is_empty()));
         let mut first_observer_emitted = false;
         let mut poisoned: Vec<String> = Vec::new();
         for obs in app.observers.iter_mut() {

@@ -898,6 +898,14 @@ fn remediation_hint(tool_name: &str, err: &str) -> Option<String> {
     }
 
     if err_lower.contains("no such file") || err_lower.contains("not found") {
+        // 文件类工具在 "not found" 时优先建议先用搜索类工具确认目标
+        if let Some(fallback) = equivalent_tools(tool_name) {
+            return Some(format!(
+                "Suggestion: verify the path or identifier first. Equivalent tools you can try \
+                 instead of retrying with the same args: {}.",
+                fallback
+            ));
+        }
         return Some(
             "Suggestion: verify the path or identifier first, or use a search/list tool to discover the correct target before retrying.".to_string(),
         );
@@ -909,8 +917,39 @@ fn remediation_hint(tool_name: &str, err: &str) -> Option<String> {
         );
     }
 
+    // 通用 fallback：如果工具名在等价表里，提示可改用的备选工具
+    if let Some(fallback) = equivalent_tools(tool_name) {
+        return Some(format!(
+            "Suggestion: if this failure is intrinsic (not a transient I/O error), \
+             try an equivalent tool instead of repeating: {}.",
+            fallback
+        ));
+    }
+
     None
 }
+
+/// 当某个工具失败时，提示 LLM 可以尝试的等价工具列表。
+/// 故意只保留"语义等价 + 输入兼容"的对子，避免误导 LLM 切到不同语义的工具。
+fn equivalent_tools(tool_name: &str) -> Option<&'static str> {
+    match tool_name {
+        // 文件读取链路
+        "read_file" => Some("`read_file_lines` (line-range read), `code_search` (locate first)"),
+        "read_file_lines" => Some("`read_file` (full file)"),
+        // 代码/文本搜索链路
+        "code_search" => {
+            Some("`text_grep` (regex over files), `find_file` (filename glob)")
+        }
+        "text_grep" => Some("`code_search` (semantic), `find_file` (filename only)"),
+        "find_file" => Some("`code_search` (semantic), `text_grep` (content)"),
+        // shell 执行类
+        "execute_command" => {
+            Some("Break the command into smaller pieces, or read files directly with `read_file` instead of running shell to inspect them.")
+        }
+        _ => None,
+    }
+}
+
 
 fn format_tool_error(tool_call: &ToolCall, err: &str) -> ToolResult {
     ToolResult {
