@@ -2,7 +2,7 @@ use std::{
     fs,
     io::{self, BufRead},
     path::{Path, PathBuf},
-    sync::{LazyLock, RwLock},
+    sync::{Arc, LazyLock, RwLock},
 };
 
 use crate::commonw::types::FastMap;
@@ -92,7 +92,7 @@ fn normalize_value(v: &str) -> String {
     out.trim().to_string()
 }
 
-static CACHE: LazyLock<RwLock<Option<ConfigW>>> = LazyLock::new(|| RwLock::new(None));
+static CACHE: LazyLock<RwLock<Option<Arc<ConfigW>>>> = LazyLock::new(|| RwLock::new(None));
 
 pub fn config_path() -> PathBuf {
     if let Ok(path) = std::env::var("CONFIGW_PATH") {
@@ -110,16 +110,19 @@ pub fn refresh() {
     }
 }
 
-pub fn get_all_config() -> ConfigW {
+/// 返回当前配置的 Arc 共享视图。`ConfigW` 的 entries / index 都不小，
+/// 且 `get_all_config` 在 ai 模块单 turn 会被调到数十次；如果按值返回会
+/// 反复深拷贝。改为 Arc 后，调用方共享只读引用、命中缓存几乎零成本。
+pub fn get_all_config() -> Arc<ConfigW> {
     if let Ok(lock) = CACHE.read()
-        && let Some(cfg) = lock.clone()
+        && let Some(cfg) = lock.as_ref()
     {
-        return cfg;
+        return Arc::clone(cfg);
     }
 
-    let cfg = ConfigW::from_file(config_path()).unwrap_or_default();
+    let cfg = Arc::new(ConfigW::from_file(config_path()).unwrap_or_default());
     if let Ok(mut lock) = CACHE.write() {
-        *lock = Some(cfg.clone());
+        *lock = Some(Arc::clone(&cfg));
     }
     cfg
 }

@@ -387,6 +387,11 @@ fn restore_tools(app: &mut App, saved_tools: Option<Vec<ToolDefinition>>) {
     }
 }
 
+/// 共享的 reqwest 客户端：避免 background_call 每次重建连接池/TLS/DNS。
+/// 后台 reflection / critic / revise 都走这里，给 50–300ms latency 让出。
+static BACKGROUND_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(reqwest::Client::new);
+
 pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Option<Value> {
     let cfg = configw::get_all_config();
     let endpoint =
@@ -411,8 +416,7 @@ pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Optio
             "stream": false
         }),
     };
-    let client = reqwest::Client::new();
-    let req = client.post(&endpoint);
+    let req = BACKGROUND_HTTP_CLIENT.post(&endpoint);
     let req = if api_key.trim().is_empty()
         && crate::ai::models::endpoint_supports_anonymous_auth(&endpoint)
     {

@@ -38,7 +38,7 @@ fn main() {
         let cfg = if cli.path.trim().is_empty() {
             configw::get_all_config()
         } else {
-            configw::ConfigW::from_file(cli.path.trim()).unwrap_or_default()
+            std::sync::Arc::new(configw::ConfigW::from_file(cli.path.trim()).unwrap_or_default())
         };
         if cli.json {
             let mut map = serde_json::Map::new();

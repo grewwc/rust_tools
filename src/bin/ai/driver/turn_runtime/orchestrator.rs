@@ -208,7 +208,8 @@ pub(in crate::ai::driver) async fn run_turn(
     let mut last_compress_iteration: usize = 0;
     let mut last_compress_after_chars: usize = 0;
     // 收集本 turn 实际调用过的 explicit-enabled tool 名字，turn 末用于老化未用项。
-    let mut tools_used_this_turn: Vec<String> = Vec::new();
+    let mut tools_used_this_turn: crate::commonw::FastSet<String> =
+        crate::commonw::FastSet::default();
     let loop_result = 'turn: loop {
         iteration += 1;
         {
@@ -292,10 +293,7 @@ pub(in crate::ai::driver) async fn run_turn(
                         && let Some(tool_calls) = &last_assistant.tool_calls
                     {
                         for tc in tool_calls {
-                            let name = tc.function.name.clone();
-                            if !tools_used_this_turn.contains(&name) {
-                                tools_used_this_turn.push(name);
-                            }
+                            tools_used_this_turn.insert(tc.function.name.clone());
                         }
                     }
                 }
@@ -394,7 +392,7 @@ pub(in crate::ai::driver) async fn run_turn(
 
     // 老化未在本 turn 使用的 explicit-enabled tool。
     // 连续 N 个 turn 闲置就 demote，避免"启用一次永久焊接"。
-    crate::ai::tools::enable_tools::age_unused_explicit_tools(&tools_used_this_turn);
+    crate::ai::tools::enable_tools::age_unused_explicit_tools(tools_used_this_turn.iter());
 
     skill_turn.restore_agent_context(app);
 

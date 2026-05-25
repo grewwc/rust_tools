@@ -5,11 +5,8 @@ use crate::ai::{
     types::{App, SkillBiasMemory, ToolDefinition},
 };
 use crate::commonw::configw;
-use rust_tools::cw::SkipMap;
 use rust_tools::cw::SkipSet;
-use chrono::{DateTime, Utc};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::{LazyLock, Mutex};
 
 use super::{
     DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS, TextSimilarityFeatures,
@@ -18,7 +15,6 @@ use super::{
 use super::intent_recognition::{self, UserIntent};
 
 type ToolDef = ToolDefinition;
-type ToolScoreMap = SkipMap<String, f64>;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum ContextKind {
@@ -98,7 +94,6 @@ impl SystemPromptBuilder {
     }
 }
 
-const TOOL_SCORE_CACHE_TTL: Duration = Duration::from_secs(20);
 const DEFAULT_TURN_TOOL_GROUPS: &[&str] = &["core"];
 const CURRENT_SKILL_STICKY_BONUS: f64 = 0.7;
 const CURRENT_SKILL_KEEP_FLOOR_DELTA: f64 = 0.4;
@@ -106,9 +101,6 @@ const SKILL_SWITCH_MARGIN: f64 = 0.8;
 const CROSS_TURN_SKILL_STICKY_BONUS: f64 = 0.2;
 const CROSS_TURN_SKILL_KEEP_FLOOR_DELTA: f64 = 0.15;
 const CROSS_TURN_SKILL_SWITCH_MARGIN: f64 = 0.35;
-
-static TOOL_SCORE_CACHE: LazyLock<Mutex<Option<(Instant, Arc<Box<ToolScoreMap>>)>>> =
-    LazyLock::new(|| Mutex::new(None));
 
 #[derive(Clone, Copy)]
 enum PreferenceStrength {
@@ -376,69 +368,6 @@ fn reorder_tools_by_stats(mut builtin: Vec<ToolDef>, mut mcp: Vec<ToolDef>) -> V
     all.append(&mut builtin);
     all.append(&mut mcp);
     all
-}
-
-#[allow(dead_code)]
-fn load_tool_scores() -> Box<ToolScoreMap> {
-    if let Ok(cache) = TOOL_SCORE_CACHE.lock()
-        && let Some((created_at, scores)) = cache.as_ref()
-        && created_at.elapsed() < TOOL_SCORE_CACHE_TTL
-    {
-        return (**scores).clone();
-    }
-
-    use crate::ai::tools::storage::memory_store::MemoryStore;
-    let store = MemoryStore::from_env_or_config();
-    let entries = store.recent(600).unwrap_or_default();
-    let mut ok: Box<SkipMap<String, f64>> = SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
-    let mut err: Box<SkipMap<String, f64>> = SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
-    for e in entries {
-        if e.category.to_lowercase() != "tool_stat" {
-            continue;
-        }
-        if e.tags.is_empty() {
-            continue;
-        }
-        let name = e.tags[0].clone();
-        let is_ok = e.tags.iter().any(|t| t == "ok");
-        let is_err = e.tags.iter().any(|t| t == "err");
-        let weight = recency_weight(&e.timestamp);
-        if is_ok {
-            let cur = ok.get(&name).unwrap_or(0.0);
-            ok.insert(name.clone(), cur + 1.0 * weight);
-        }
-        if is_err {
-            let cur = err.get(&name).unwrap_or(0.0);
-            err.insert(name.clone(), cur + 1.0 * weight);
-        }
-    }
-    let mut score: Box<SkipMap<String, f64>> =
-        SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
-    for (k, v) in (&*ok).into_iter() {
-        let cur = score.get(k).unwrap_or(0.0);
-        score.insert(k.clone(), cur + *v);
-    }
-    for (k, v) in (&*err).into_iter() {
-        let cur = score.get(k).unwrap_or(0.0);
-        score.insert(k.clone(), cur - 1.5 * *v);
-    }
-    let scores: Box<SkipMap<String, f64>> = (&*score)
-        .iter()
-        .map(|(k, v)| (k.clone(), *v))
-        .collect::<Box<SkipMap<_, _>>>();
-    let result = scores.clone();
-    if let Ok(mut cache) = TOOL_SCORE_CACHE.lock() {
-        *cache = Some((Instant::now(), Arc::new(scores)));
-    }
-    result
-}
-
-#[allow(dead_code)]
-fn recency_weight(ts: &str) -> f64 {
-    let parsed: Option<DateTime<Utc>> = chrono::DateTime::parse_from_rfc3339(ts).ok().map(|dt| dt.with_timezone(&Utc));
-    let Some(t) = parsed else { return 1.0; };
-    let age_days = (Utc::now() - t).num_seconds().max(0) as f64 / 86400.0;
-    f64::exp(-age_days / 14.0)
 }
 
 fn tool_uses_mcp_server(tool_name: &str, allowed_servers: &[String]) -> bool {

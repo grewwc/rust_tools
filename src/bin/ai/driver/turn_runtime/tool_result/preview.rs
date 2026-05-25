@@ -44,17 +44,19 @@ fn terminal_preview_policy(tool_name: &str) -> ToolTerminalPreviewPolicy {
 }
 
 pub(super) fn truncate_chars(content: &str, max_chars: usize) -> String {
-    if content.chars().count() <= max_chars {
-        return content.to_string();
-    }
-    let mut out = String::with_capacity(max_chars + 32);
-    for (i, ch) in content.chars().enumerate() {
-        if i >= max_chars {
-            break;
+    // 单次扫描：避免先 count() 再 enumerate() 两次 O(n)。take(max_chars) 之后
+    // 再 next() 探测是否还有剩余字符——有则补省略号。
+    let mut iter = content.chars();
+    let mut out = String::new();
+    for _ in 0..max_chars {
+        match iter.next() {
+            Some(ch) => out.push(ch),
+            None => return out,
         }
-        out.push(ch);
     }
-    out.push('…');
+    if iter.next().is_some() {
+        out.push('…');
+    }
     out
 }
 
@@ -63,15 +65,10 @@ pub(super) fn tail_chars(content: &str, max_chars: usize) -> String {
     if total <= max_chars {
         return content.to_string();
     }
-    let skip = total.saturating_sub(max_chars);
-    let mut out = String::with_capacity(max_chars + 32);
+    let skip = total - max_chars;
+    let mut out = String::with_capacity(max_chars + 4);
     out.push('…');
-    for (i, ch) in content.chars().enumerate() {
-        if i < skip {
-            continue;
-        }
-        out.push(ch);
-    }
+    out.extend(content.chars().skip(skip));
     out
 }
 

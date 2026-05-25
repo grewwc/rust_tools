@@ -140,8 +140,10 @@ pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
 
     if char_count <= MAX_TOOL_RESULT_INLINE_CHARS && supports_line_trim(tool_name) {
         let trimmed = line_trim_middle(content);
-        // 只有真正缩短才采用，否则保持原文
-        if trimmed.chars().count() < char_count {
+        // 复用 trimmed 的字节长度做廉价短路：trimmed 是从 content 里挑选若干行
+        // 拼接出来的（可能改动；保留 ASCII / UTF-8 不变），如果字节更短就一定是
+        // 字符更短，不必再做完整 chars().count() 双扫描。
+        if trimmed.len() < content.len() && trimmed.chars().count() < char_count {
             return PreparedToolResult {
                 content_for_model: trimmed,
                 content_for_terminal: build_terminal_preview(tool_name, content),

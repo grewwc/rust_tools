@@ -44,9 +44,11 @@ use super::super::runtime_ctx::DriverContext;
 /// turn forever. 10 minutes is generous for a single subagent invocation
 /// while still being shorter than typical interactive patience.
 const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(600);
-/// How often the parent thread checks for cancellation/shutdown while
-/// blocking on the sub-agent. Short enough to feel responsive to ctrl-c.
-const SYNC_TASK_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// 兜底周期，覆盖外部代码直接 `.store(true)` 但未触发 `REQUEST_INTERRUPT_NOTIFY`
+/// 的边缘情况。绝大多数场景由 oneshot 完成或 Notify 即时唤醒，无需依赖此兜底。
+/// 旧实现是 50ms 紧凑轮询；改成 500ms 后空闲 wake-up 频次降低 10×，
+/// 同时保留对未发 Notify 的 atomic 写入的最坏 500ms 反应延迟。
+const SYNC_TASK_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(super) fn execute_sync_task(
     tool_call_id: &str,
@@ -195,14 +197,19 @@ pub(super) fn execute_sync_task(
     tokio::spawn(runtime_ctx::DRIVER_CTX.scope(spawn_driver_ctx, wrapped));
 
     // Wait for the sub-agent in a loop that also honours shutdown,
-    // cancel_stream and a hard timeout. Using `tokio::select!` here would
-    // require an Unpin-able rx, but more importantly we want the same
-    // behaviour whether the runtime context is multi-thread or current-
-    // thread, so we drive the wait with `block_in_place` + `block_on`.
+    // cancel_stream and a hard timeout. 之前是 50ms 紧凑轮询，改成
+    // `tokio::select!` 监听三路事件：
+    //   1) sub-agent 的 oneshot::Receiver 完成；
+    //   2) 信号模块的 REQUEST_INTERRUPT_NOTIFY（ctrl-c → cancel_stream/shutdown 同时发 notify）；
+    //   3) 兜底 `tokio::time::sleep(SYNC_TASK_FALLBACK_POLL_INTERVAL)`，覆盖
+    //      外部代码直接 `.store(true)` 但未触发 Notify 的极少数场景，并兜底 hard timeout。
+    // 这样空闲时不再每 50ms 醒来一次，硬中断能立刻感知。
     let join_result: Result<Result<(), String>, String> =
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let mut rx = rx;
+                let interrupt_notify =
+                    crate::ai::driver::signal::request_interrupt_notify();
                 loop {
                     if parent_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
                         return Err("subagent task aborted: parent shutdown requested".to_string());
@@ -210,20 +217,35 @@ pub(super) fn execute_sync_task(
                     if parent_cancel.load(std::sync::atomic::Ordering::Relaxed) {
                         return Err("subagent task aborted: stream cancel requested".to_string());
                     }
-                    if started.elapsed() >= SYNC_TASK_HARD_TIMEOUT {
+                    let elapsed = started.elapsed();
+                    if elapsed >= SYNC_TASK_HARD_TIMEOUT {
                         return Err(format!(
                             "subagent task exceeded hard timeout of {}s",
                             SYNC_TASK_HARD_TIMEOUT.as_secs()
                         ));
                     }
-                    match tokio::time::timeout(SYNC_TASK_POLL_INTERVAL, &mut rx).await {
-                        Ok(Ok(inner)) => return Ok(inner),
-                        Ok(Err(e)) => {
-                            return Err(format!(
-                                "subagent task channel closed before result: {e}"
-                            ));
+                    let remaining = SYNC_TASK_HARD_TIMEOUT - elapsed;
+                    let fallback = SYNC_TASK_FALLBACK_POLL_INTERVAL.min(remaining);
+                    // 注册 notified 之前再做一次 atomic 检查，避免 Notify 与
+                    // store(true) 之间的 race。
+                    let notified = interrupt_notify.notified();
+                    if parent_shutdown.load(std::sync::atomic::Ordering::Relaxed)
+                        || parent_cancel.load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        continue;
+                    }
+                    tokio::select! {
+                        biased;
+                        res = &mut rx => {
+                            return match res {
+                                Ok(inner) => Ok(inner),
+                                Err(e) => Err(format!(
+                                    "subagent task channel closed before result: {e}"
+                                )),
+                            };
                         }
-                        Err(_) => continue,
+                        _ = notified => { continue; }
+                        _ = tokio::time::sleep(fallback) => { continue; }
                     }
                 }
             })

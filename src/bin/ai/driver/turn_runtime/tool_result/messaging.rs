@@ -170,7 +170,7 @@ pub(super) fn append_tool_result_messages(
             }
             let ctx = crate::ai::driver::observer::ToolResultContext {
                 tool_name: tool_call.function.name.clone(),
-                result_content: result.content.clone(),
+                result_content: result.content.as_str(),
                 success: {
                     let content_lower = result.content.to_lowercase();
                     let is_execution_tool = tool_call.function.name == "execute_command"

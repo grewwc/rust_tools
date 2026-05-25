@@ -3,6 +3,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use dirs::config_dir;
 use rust_tools::commonw::{FastMap, FastSet};
+use rust_tools::cw::LruCache;
 
 use crate::ai::knowledge::storage::vector_store::{VectorEntry, VectorStore};
 
@@ -11,18 +12,28 @@ use super::document::{SkillEmbeddingDocument, SkillEmbeddingDocumentSection};
 const SKILL_ROUTING_CATEGORY: &str = "skill-routing";
 const QUERY_EMBEDDING_CACHE_LIMIT: usize = 32;
 
-static QUERY_EMBEDDING_CACHE: LazyLock<Mutex<Vec<(String, Vec<f32>)>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+/// 短词条 query embedding 缓存：discover_skills / skill_match 每个 turn 都会查。
+/// 用项目自带的 cw::LruCache（FxHashMap O(1) 查询 + 双向链表 O(1) 淘汰），
+/// 替代之前 Vec 线性扫描 + remove(0) 双 O(n) 实现。
+/// Value 用 Arc 避免命中时 clone 整个 f32 向量。
+static QUERY_EMBEDDING_CACHE: LazyLock<Mutex<LruCache<String, Arc<Vec<f32>>>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(QUERY_EMBEDDING_CACHE_LIMIT)));
 
+/// 同时缓存最近若干 skills_hash 对应的 VectorStore + snapshot。
+/// 单槽缓存在 user 来回切 agent（每个 agent 暴露不同 skill 子集）时会
+/// thrash：一旦 hash 变了就要重建 SQLite + embedding。改为小型 LRU
+/// 后，常用的 4 套 skill 子集都能命中而无需重建。
+const CACHED_INDEX_CAPACITY: usize = 4;
+
+#[derive(Clone)]
 struct CachedIndex {
-    skills_hash: String,
     store: Arc<VectorStore>,
     section_count: usize,
     snapshot: Arc<Vec<(VectorEntry, SkillEmbeddingDocumentSection, String)>>,
 }
 
-static CACHED_INDEX: LazyLock<Mutex<Option<CachedIndex>>> =
-    LazyLock::new(|| Mutex::new(None));
+static CACHED_INDEX: LazyLock<Mutex<LruCache<String, CachedIndex>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(CACHED_INDEX_CAPACITY)));
 
 #[derive(Debug, Clone)]
 pub struct SkillEmbeddingHit {
@@ -44,16 +55,14 @@ impl SkillEmbeddingIndex {
         let skills_hash = compute_skills_hash(documents);
         let section_count = documents.len() * 3;
 
-        if let Ok(cache) = CACHED_INDEX.lock() {
-            if let Some(cached) = cache.as_ref() {
-                if cached.skills_hash == skills_hash {
-                    return Ok(Self {
-                        store: Arc::clone(&cached.store),
-                        section_count: cached.section_count,
-                        snapshot: Arc::clone(&cached.snapshot),
-                    });
-                }
-            }
+        if let Ok(mut cache) = CACHED_INDEX.lock()
+            && let Some(cached) = cache.get_ref(&skills_hash)
+        {
+            return Ok(Self {
+                store: Arc::clone(&cached.store),
+                section_count: cached.section_count,
+                snapshot: Arc::clone(&cached.snapshot),
+            });
         }
 
         let store = Arc::new(VectorStore::with_global_provider(&default_skill_index_path())?);
@@ -61,12 +70,14 @@ impl SkillEmbeddingIndex {
         let snapshot = Arc::new(load_snapshot(&store)?);
 
         if let Ok(mut cache) = CACHED_INDEX.lock() {
-            *cache = Some(CachedIndex {
+            cache.put(
                 skills_hash,
-                store: Arc::clone(&store),
-                section_count,
-                snapshot: Arc::clone(&snapshot),
-            });
+                CachedIndex {
+                    store: Arc::clone(&store),
+                    section_count,
+                    snapshot: Arc::clone(&snapshot),
+                },
+            );
         }
 
         Ok(Self {
@@ -290,22 +301,20 @@ fn section_name(section: SkillEmbeddingDocumentSection) -> &'static str {
 
 fn cached_embed(store: &VectorStore, text: &str) -> Result<Vec<f32>, String> {
     let cache_key = normalize_cache_key(text);
-    if let Ok(cache) = QUERY_EMBEDDING_CACHE.lock() {
-        if let Some((_key, embedding)) = cache.iter().find(|(k, _)| *k == cache_key) {
-            return Ok(embedding.clone());
-        }
+    if let Ok(mut cache) = QUERY_EMBEDDING_CACHE.lock()
+        && let Some(arc) = cache.get_ref(&cache_key)
+    {
+        return Ok((*arc).clone());
     }
 
     let embedding = store.embed_text(&cache_key)?;
+    let arc = Arc::new(embedding);
 
     if let Ok(mut cache) = QUERY_EMBEDDING_CACHE.lock() {
-        if cache.len() >= QUERY_EMBEDDING_CACHE_LIMIT {
-            cache.remove(0);
-        }
-        cache.push((cache_key, embedding.clone()));
+        cache.put(cache_key, Arc::clone(&arc));
     }
 
-    Ok(embedding)
+    Ok((*arc).clone())
 }
 
 fn normalize_cache_key(text: &str) -> String {

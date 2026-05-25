@@ -4,9 +4,11 @@ pub struct PrepareContext {
     pub question: String,
 }
 
-pub struct ToolResultContext {
+pub struct ToolResultContext<'a> {
     pub tool_name: String,
-    pub result_content: String,
+    /// 工具结果原文：用借用而非 clone，避免 N 个 observer × 256K markdown
+    /// 时把内存复制成 O(N·M)。observer 内部如需保存可自行 to_string。
+    pub result_content: &'a str,
     pub success: bool,
 }
 
@@ -71,7 +73,7 @@ pub trait TurnObserver: Send + Sync {
         }
     }
 
-    fn on_tool_result(&mut self, ctx: &ToolResultContext) {
+    fn on_tool_result(&mut self, ctx: &ToolResultContext<'_>) {
         let _ = ctx;
     }
 

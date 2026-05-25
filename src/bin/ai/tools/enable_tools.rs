@@ -1,52 +1,54 @@
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, RwLock};
 
 use serde_json::Value;
 
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 use crate::ai::types::ToolDefinition;
 
-static PENDING_ENABLE: LazyLock<Mutex<Vec<String>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
+/// 把以前 6 把独立的 Mutex（pending_enable/pending_mcp_enable/active_tool_names/
+/// explicit_enabled_tool_names/explicit_tool_age/available_mcp_tools）合并到单个
+/// `RwLock<EnableState>`：
+///   - 减少锁加解次数与潜在的锁顺序隐患；
+///   - 读多写少的场景（available_tools_not_active 等）允许并发读；
+///   - execute_enable_tools 是 SyncOnly，所有持锁路径都不跨 await，使用
+///     std::sync::RwLock 安全。
+#[derive(Default)]
+struct EnableState {
+    /// 等待激活的内置 tool 名称
+    pending_enable: Vec<String>,
+    /// 等待激活的 MCP tool 名称
+    pending_mcp_enable: Vec<String>,
+    /// 已经激活、出现在请求 tools 数组里的 tool 名称
+    active_tool_names: Vec<String>,
+    /// 通过 enable_tools 显式启用、应该跨 turn 保留的 tool 名称
+    explicit_enabled_tool_names: Vec<String>,
+    /// 每个 explicit-enabled tool 的"未使用计数"
+    explicit_tool_age: rustc_hash::FxHashMap<String, u32>,
+    /// MCP server 暴露但当前未必已启用的全部 tool 列表
+    available_mcp_tools: Vec<ToolDefinition>,
+}
 
-static PENDING_MCP_ENABLE: LazyLock<Mutex<Vec<String>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
-
-static ACTIVE_TOOL_NAMES: LazyLock<Mutex<Vec<String>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
-
-static EXPLICIT_ENABLED_TOOL_NAMES: LazyLock<Mutex<Vec<String>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
-
-/// 每个 explicit-enabled tool 的"未使用计数"。
-/// 每个 turn 末由调度器调用 `age_unused_explicit_tools` 老化：
-///   - 在本 turn 被实际调用过的 tool → 计数清零
-///   - 没用过 → 计数 +1，达到 EXPLICIT_TOOL_DEMOTE_AGE 就从 explicit list demote
-/// 这样可以让"启用一次后永久焊接到所有 turn"的旧行为变成"用就保留，闲置就降级"，
-/// 减少 prompt cache 失效与 tool schema 占用。
-static EXPLICIT_TOOL_AGE: LazyLock<Mutex<rustc_hash::FxHashMap<String, u32>>> =
-    LazyLock::new(|| Mutex::new(rustc_hash::FxHashMap::default()));
+static STATE: LazyLock<RwLock<EnableState>> =
+    LazyLock::new(|| RwLock::new(EnableState::default()));
 
 const EXPLICIT_TOOL_DEMOTE_AGE: u32 = 4;
 
-static AVAILABLE_MCP_TOOLS: LazyLock<Mutex<Vec<ToolDefinition>>> =
-    LazyLock::new(|| Mutex::new(Vec::new()));
-
 pub(crate) fn set_active_tool_names(names: Vec<String>) {
-    if let Ok(mut guard) = ACTIVE_TOOL_NAMES.lock() {
-        *guard = names;
+    if let Ok(mut s) = STATE.write() {
+        s.active_tool_names = names;
     }
 }
 
 pub(crate) fn set_available_mcp_tools(tools: Vec<ToolDefinition>) {
-    if let Ok(mut guard) = AVAILABLE_MCP_TOOLS.lock() {
-        *guard = tools;
+    if let Ok(mut s) = STATE.write() {
+        s.available_mcp_tools = tools;
     }
 }
 
 pub(crate) fn explicit_enabled_tool_names() -> Vec<String> {
-    EXPLICIT_ENABLED_TOOL_NAMES
-        .lock()
-        .map(|guard| guard.clone())
+    STATE
+        .read()
+        .map(|s| s.explicit_enabled_tool_names.clone())
         .unwrap_or_default()
 }
 
@@ -55,11 +57,9 @@ pub(crate) fn explicit_enabled_tool_names() -> Vec<String> {
 /// 永久焊接到后续所有 session 的请求 tools 数组（每个 schema 几百~上千 token，
 /// 还会让 prompt cache 失效）。
 pub(crate) fn clear_explicitly_enabled_tools() {
-    if let Ok(mut guard) = EXPLICIT_ENABLED_TOOL_NAMES.lock() {
-        guard.clear();
-    }
-    if let Ok(mut guard) = EXPLICIT_TOOL_AGE.lock() {
-        guard.clear();
+    if let Ok(mut s) = STATE.write() {
+        s.explicit_enabled_tool_names.clear();
+        s.explicit_tool_age.clear();
     }
 }
 
@@ -68,20 +68,33 @@ pub(crate) fn clear_explicitly_enabled_tools() {
 /// list 中 demote。
 ///
 /// 这是对"enable_tools 一旦启用就永久挂载"行为的温和约束：用就保留，闲置就降级。
-pub(crate) fn age_unused_explicit_tools(used_in_turn: &[String]) {
-    let Ok(mut names) = EXPLICIT_ENABLED_TOOL_NAMES.lock() else {
-        return;
-    };
-    let Ok(mut ages) = EXPLICIT_TOOL_AGE.lock() else {
+pub(crate) fn age_unused_explicit_tools<I, S>(used_in_turn: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    // 把 used_in_turn 收成 FxHashSet，O(1) 查询；调用方可能传 Vec/HashSet/迭代器。
+    let used: rustc_hash::FxHashSet<String> = used_in_turn
+        .into_iter()
+        .map(|s| s.as_ref().to_string())
+        .collect();
+    let Ok(mut s) = STATE.write() else {
         return;
     };
     // 1. 老化或清零
     let mut to_remove: Vec<String> = Vec::new();
-    for name in names.iter() {
-        if used_in_turn.iter().any(|u| u == name) {
-            ages.insert(name.clone(), 0);
+    // 这里需要同时可变借用 s.explicit_enabled_tool_names 和 s.explicit_tool_age，
+    // 通过 split borrow 拆出来避免借用冲突。
+    let EnableState {
+        explicit_enabled_tool_names,
+        explicit_tool_age,
+        ..
+    } = &mut *s;
+    for name in explicit_enabled_tool_names.iter() {
+        if used.contains(name) {
+            explicit_tool_age.insert(name.clone(), 0);
         } else {
-            let entry = ages.entry(name.clone()).or_insert(0);
+            let entry = explicit_tool_age.entry(name.clone()).or_insert(0);
             *entry = entry.saturating_add(1);
             if *entry >= EXPLICIT_TOOL_DEMOTE_AGE {
                 to_remove.push(name.clone());
@@ -90,45 +103,43 @@ pub(crate) fn age_unused_explicit_tools(used_in_turn: &[String]) {
     }
     // 2. demote
     if !to_remove.is_empty() {
-        names.retain(|n| !to_remove.contains(n));
+        explicit_enabled_tool_names.retain(|n| !to_remove.contains(n));
         for n in &to_remove {
-            ages.remove(n);
+            explicit_tool_age.remove(n);
         }
     }
 }
 
-fn mark_explicitly_enabled_tools(names: &[String]) {
+fn mark_explicitly_enabled_tools(s: &mut EnableState, names: &[String]) {
     if names.is_empty() {
         return;
     }
-    if let Ok(mut guard) = EXPLICIT_ENABLED_TOOL_NAMES.lock() {
-        for name in names {
-            if !guard.contains(name) {
-                guard.push(name.clone());
-            }
+    for name in names {
+        if !s.explicit_enabled_tool_names.contains(name) {
+            s.explicit_enabled_tool_names.push(name.clone());
         }
     }
 }
 
 #[cfg(test)]
 pub(crate) fn set_explicit_enabled_tool_names(names: Vec<String>) {
-    if let Ok(mut guard) = EXPLICIT_ENABLED_TOOL_NAMES.lock() {
-        *guard = names;
+    if let Ok(mut s) = STATE.write() {
+        s.explicit_enabled_tool_names = names;
     }
 }
 
 pub(crate) fn drain_pending_mcp_names() -> Vec<String> {
-    PENDING_MCP_ENABLE
-        .lock()
-        .map(|mut guard| guard.drain(..).collect())
+    STATE
+        .write()
+        .map(|mut s| s.pending_mcp_enable.drain(..).collect())
         .unwrap_or_default()
 }
 
 pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
-    let names: Vec<String> = PENDING_ENABLE
-        .lock()
-        .map(|mut guard| guard.drain(..).collect())
-        .unwrap_or_default();
+    let names: Vec<String> = match STATE.write() {
+        Ok(mut s) => s.pending_enable.drain(..).collect(),
+        Err(_) => return Vec::new(),
+    };
     if names.is_empty() {
         return Vec::new();
     }
@@ -145,10 +156,10 @@ pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
             });
         }
     }
-    if let Ok(mut guard) = ACTIVE_TOOL_NAMES.lock() {
+    if let Ok(mut s) = STATE.write() {
         for d in &defs {
-            if !guard.contains(&d.function.name) {
-                guard.push(d.function.name.clone());
+            if !s.active_tool_names.contains(&d.function.name) {
+                s.active_tool_names.push(d.function.name.clone());
             }
         }
     }
@@ -156,9 +167,9 @@ pub(crate) fn drain_pending_enable() -> Vec<ToolDefinition> {
 }
 
 fn available_tools_not_active() -> Vec<(String, String)> {
-    let active = ACTIVE_TOOL_NAMES
-        .lock()
-        .map(|g| g.clone())
+    let (active, mcp_tools) = STATE
+        .read()
+        .map(|s| (s.active_tool_names.clone(), s.available_mcp_tools.clone()))
         .unwrap_or_default();
     let mut result = Vec::new();
     for reg in inventory::iter::<ToolRegistration> {
@@ -166,10 +177,6 @@ fn available_tools_not_active() -> Vec<(String, String)> {
             result.push((reg.spec.name.to_string(), reg.spec.description.to_string()));
         }
     }
-    let mcp_tools = AVAILABLE_MCP_TOOLS
-        .lock()
-        .map(|g| g.clone())
-        .unwrap_or_default();
     for tool in mcp_tools {
         if !active.iter().any(|a| a == &tool.function.name) {
             result.push((tool.function.name, tool.function.description));
@@ -232,18 +239,22 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             if tool_names.is_empty() {
                 return Err("'tools' array is empty".to_string());
             }
-            let active = ACTIVE_TOOL_NAMES
-                .lock()
-                .map(|g| g.clone())
-                .unwrap_or_default();
+            // 一次写锁内完成读 active/known_mcp + 写 pending_enable/pending_mcp_enable
+            // + mark_explicitly_enabled，避免多次锁切换造成的状态拼接错位。
             let mut known_builtin: Vec<&str> = Vec::new();
             for reg in inventory::iter::<ToolRegistration> {
                 known_builtin.push(reg.spec.name);
             }
-            let known_mcp: Vec<String> = AVAILABLE_MCP_TOOLS
-                .lock()
-                .map(|g| g.iter().map(|t| t.function.name.clone()).collect())
-                .unwrap_or_default();
+            let mut s = match STATE.write() {
+                Ok(g) => g,
+                Err(_) => return Err("enable_tools state poisoned".to_string()),
+            };
+            let active = s.active_tool_names.clone();
+            let known_mcp: Vec<String> = s
+                .available_mcp_tools
+                .iter()
+                .map(|t| t.function.name.clone())
+                .collect();
             let already: Vec<String> = tool_names
                 .iter()
                 .filter(|n| active.iter().any(|a| a == n.as_str()))
@@ -270,21 +281,18 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
                 .iter()
                 .cloned()
                 .partition(|n| n.starts_with("mcp_"));
-            if let Ok(mut guard) = PENDING_ENABLE.lock() {
-                for name in &builtin_names {
-                    if !guard.contains(name) {
-                        guard.push(name.clone());
-                    }
+            for name in &builtin_names {
+                if !s.pending_enable.contains(name) {
+                    s.pending_enable.push(name.clone());
                 }
             }
-            if let Ok(mut guard) = PENDING_MCP_ENABLE.lock() {
-                for name in &mcp_names {
-                    if !guard.contains(name) {
-                        guard.push(name.clone());
-                    }
+            for name in &mcp_names {
+                if !s.pending_mcp_enable.contains(name) {
+                    s.pending_mcp_enable.push(name.clone());
                 }
             }
-            mark_explicitly_enabled_tools(&explicitly_requested);
+            mark_explicitly_enabled_tools(&mut s, &explicitly_requested);
+            drop(s);
             let mut msg = Vec::new();
             if !to_enable.is_empty() {
                 msg.push(format!(
