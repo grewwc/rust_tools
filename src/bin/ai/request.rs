@@ -1458,24 +1458,17 @@ pub(super) fn build_content(
         return Ok(Value::String(question.to_string()));
     }
 
-    let provider = models::model_provider(model);
     let mut parts = Vec::new();
     for file in image_files {
         let bytes = fs::read(file)?;
         let mime = files::image_mime_type(file);
         let image = base64::engine::general_purpose::STANDARD.encode(bytes);
-        parts.push(match provider {
-            ApiProvider::Compatible => json!({
-                "type": "image_url",
-                "image_url": format!("data:{mime};base64,{image}"),
-            }),
-            _ => json!({
-                "type": "image_url",
-                "image_url": {
-                    "url": format!("data:{mime};base64,{image}")
-                },
-            }),
-        });
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:{mime};base64,{image}")
+            },
+        }));
     }
     parts.push(json!({
         "type": "text",
@@ -2037,6 +2030,13 @@ mod tests {
             .map(|m| m.name.clone())
     }
 
+    fn first_compatible_vl_model_name() -> Option<String> {
+        crate::ai::model_names::all()
+            .iter()
+            .find(|m| m.provider == crate::ai::provider::ApiProvider::Compatible && m.is_vl)
+            .map(|m| m.name.clone())
+    }
+
     #[test]
     fn openai_request_body_omits_nonstandard_flags() {
         let messages = vec![Message {
@@ -2383,6 +2383,37 @@ mod tests {
         };
 
         let path = std::env::temp_dir().join(format!("ai-openai-image-{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"fake").unwrap();
+
+        let value = build_content(
+            &model,
+            "describe",
+            &[path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        let first = value.as_array().and_then(|items| items.first()).unwrap();
+        assert_eq!(first.get("type").and_then(|v| v.as_str()), Some("image_url"));
+        assert!(first
+            .get("image_url")
+            .and_then(|v| v.get("url"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.starts_with("data:image/png;base64,"))
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn compatible_image_content_also_uses_object_image_url_shape() {
+        let Some(model) = first_compatible_vl_model_name() else {
+            eprintln!(
+                "[test] skipping compatible_image_content_also_uses_object_image_url_shape: \
+                 no Compatible+VL model present in models.json"
+            );
+            return;
+        };
+
+        let path =
+            std::env::temp_dir().join(format!("ai-compatible-image-{}.png", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"fake").unwrap();
 
         let value = build_content(

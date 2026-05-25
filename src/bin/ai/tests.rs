@@ -270,6 +270,41 @@ fn successful_ocr_keeps_text_model_for_images() {
 }
 
 #[test]
+fn partial_ocr_success_still_counts_as_usable_for_text_models() {
+    let ocr = super::driver::model::OcrExtraction {
+        tool_name: "mcp_ocr_ocr_image".to_string(),
+        content: "ok".to_string(),
+        images: vec![
+            super::driver::model::OcrImageSummary {
+                file_name: "ok.png".to_string(),
+                extracted_chars: 2,
+                error: None,
+            },
+            super::driver::model::OcrImageSummary {
+                file_name: "bad.png".to_string(),
+                extracted_chars: 0,
+                error: Some("failed".to_string()),
+            },
+        ],
+    };
+    assert!(ocr.has_usable_text());
+}
+
+#[test]
+fn all_failed_ocr_does_not_keep_text_model() {
+    let ocr = super::driver::model::OcrExtraction {
+        tool_name: "mcp_ocr_ocr_image".to_string(),
+        content: String::new(),
+        images: vec![super::driver::model::OcrImageSummary {
+            file_name: "bad.png".to_string(),
+            extracted_chars: 0,
+            error: Some("failed".to_string()),
+        }],
+    };
+    assert!(!ocr.has_usable_text());
+}
+
+#[test]
 fn determine_vl_model_supports_selector_and_fuzzy_name() {
     // 空输入走 default_vl_model（quality_tier 优先）；数字索引走"按 is_vl 过滤后的第 N 个"。
     // 两条路径并不等价，这里分别按各自的不变量来断言，避免硬编码具体模型名。

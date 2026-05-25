@@ -1210,11 +1210,11 @@ async fn run_loop(
         } else {
             None
         };
-        let ocr_succeeded_for_images = precomputed_ocr
+        let has_usable_ocr_for_images = precomputed_ocr
             .as_ref()
-            .map(|ocr| ocr.images.iter().all(|image| image.error.is_none()))
+            .map(|ocr| ocr.has_usable_text())
             .unwrap_or(false);
-        let next_model = resolve_model_for_input(app, ocr_succeeded_for_images, &mut question);
+        let next_model = resolve_model_for_input(app, has_usable_ocr_for_images, &mut question);
         app.current_model = next_model.clone();
 
         {

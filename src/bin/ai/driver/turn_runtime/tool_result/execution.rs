@@ -1,6 +1,6 @@
 use crate::ai::{
     driver::tools::{self, ExecuteToolCallsResult},
-    history::Message,
+    history::{Message, ROLE_INTERNAL_NOTE},
     mcp::{McpClient, SharedMcpClient},
     types::{App, ToolCall},
 };
@@ -9,6 +9,7 @@ use std::io::Write;
 use super::{
     messaging::{
         append_cached_tool_results_note, append_code_inspection_working_memory,
+        append_message_pair,
         append_tool_result_messages, record_final_stream_response,
         record_persistent_code_discoveries,
     },
@@ -408,9 +409,130 @@ fn handle_tool_call_round(
     Ok(None)
 }
 
+const DISCOVER_SKILLS_FOLLOWUP_NOTE: &str = "tool_followup:discover_skills\n\
+`discover_skills` only listed metadata and did not activate any skill.\n\
+This is not a final answer. Continue the current turn:\n\
+- pick the best matching skill if one is clearly relevant;\n\
+- otherwise enable the missing tools you need;\n\
+- if no skill is actually needed, answer the user directly.\n\
+Do not end the turn immediately after only listing skills.";
+
+fn requested_only_discover_skills(tool_calls: &[ToolCall]) -> bool {
+    !tool_calls.is_empty()
+        && tool_calls
+            .iter()
+            .all(|tool_call| tool_call.function.name == "discover_skills")
+}
+
+fn append_discover_skills_followup_note(
+    messages: &mut Vec<Message>,
+    turn_messages: &mut Vec<Message>,
+) {
+    let already_present = messages.iter().chain(turn_messages.iter()).any(|message| {
+        message.role == ROLE_INTERNAL_NOTE
+            && message.content.as_str() == Some(DISCOVER_SKILLS_FOLLOWUP_NOTE)
+    });
+    if already_present {
+        return;
+    }
+    append_message_pair(
+        messages,
+        turn_messages,
+        Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: serde_json::Value::String(DISCOVER_SKILLS_FOLLOWUP_NOTE.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    );
+}
+
+fn extract_image_paths_from_file_read_tool_calls(tool_calls: &[ToolCall]) -> Vec<String> {
+    let mut out = Vec::new();
+    for tool_call in tool_calls {
+        if !matches!(
+            tool_call.function.name.as_str(),
+            "read_file" | "read_file_lines"
+        ) {
+            continue;
+        }
+        let Ok(args) = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments) else {
+            continue;
+        };
+        let Some(path) = args
+            .get("file_path")
+            .or_else(|| args.get("path"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if crate::ai::files::is_image_path(path) && !out.iter().any(|existing| existing == path) {
+            out.push(path.to_string());
+        }
+    }
+    out
+}
+
+fn append_auto_image_followup_message(
+    app: &App,
+    question: &str,
+    shared_mcp_client: &SharedMcpClient,
+    image_paths: &[String],
+    messages: &mut Vec<Message>,
+    turn_messages: &mut Vec<Message>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if image_paths.is_empty() {
+        return Ok(());
+    }
+
+    let question = if question.trim().is_empty() {
+        "Analyze the requested image file.".to_string()
+    } else {
+        question.to_string()
+    };
+
+    let content = if crate::ai::models::supports_image_input(&app.current_model) {
+        crate::ai::request::build_content(&app.current_model, &question, image_paths)?
+    } else if let Some(ocr) =
+        crate::ai::driver::model::ocr_images_for_attached_input(shared_mcp_client, image_paths)?
+    {
+        let prompt = if ocr.has_usable_text() {
+            format!(
+                "{}\n\n[Auto OCR From Image File Read via {}]\n{}",
+                question, ocr.tool_name, ocr.content
+            )
+        } else {
+            format!(
+                "{}\n\n[Image file read was auto-upgraded to attachment semantics, but OCR did not produce usable text.]",
+                question
+            )
+        };
+        serde_json::Value::String(prompt)
+    } else {
+        serde_json::Value::String(format!(
+            "{}\n\n[Image file read was auto-upgraded to attachment semantics, but no OCR tool was available for this text-only model.]",
+            question
+        ))
+    };
+
+    append_message_pair(
+        messages,
+        turn_messages,
+        Message {
+            role: "user".to_string(),
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    );
+    Ok(())
+}
+
 pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     app: &mut App,
-    _question: &str,
+    question: &str,
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
     execution: IterationExecution,
@@ -422,6 +544,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     final_assistant_recorded: &mut bool,
     force_final_response: &mut bool,
     terminal_dedupe_candidate: &mut Option<String>,
+    no_active_skill: bool,
     iteration: usize,
     max_iterations: usize,
 ) -> Result<TurnLoopStep, Box<dyn std::error::Error>> {
@@ -443,6 +566,10 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::ToolCall(stream_result) => {
+            let discover_skills_only = no_active_skill
+                && requested_only_discover_skills(&stream_result.tool_calls);
+            let image_read_paths =
+                extract_image_paths_from_file_read_tool_calls(&stream_result.tool_calls);
             *terminal_dedupe_candidate = handle_tool_call_round(
                 app,
                 mcp_client,
@@ -453,6 +580,18 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 one_shot_mode,
                 persisted_turn_messages,
                 iteration,
+            )?;
+
+            if discover_skills_only {
+                append_discover_skills_followup_note(messages, turn_messages);
+            }
+            append_auto_image_followup_message(
+                app,
+                question,
+                shared_mcp_client,
+                &image_read_paths,
+                messages,
+                turn_messages,
             )?;
 
             crate::ai::driver::input::clear_stdin_buffer();
@@ -592,5 +731,114 @@ mod tests {
 
         assert_eq!(exec_result.executed_tool_calls.len(), 1);
         assert_eq!(exec_result.tool_results.len(), 1);
+    }
+
+    #[test]
+    fn requested_only_discover_skills_detects_single_tool_round() {
+        let tool_calls = vec![ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "discover_skills".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }];
+        assert!(requested_only_discover_skills(&tool_calls));
+    }
+
+    #[test]
+    fn requested_only_discover_skills_rejects_mixed_rounds() {
+        let tool_calls = vec![
+            ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "discover_skills".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            },
+            ToolCall {
+                id: "call_2".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "enable_tools".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            },
+        ];
+        assert!(!requested_only_discover_skills(&tool_calls));
+    }
+
+    #[test]
+    fn discover_skills_followup_note_is_deduplicated() {
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+        append_discover_skills_followup_note(&mut messages, &mut turn_messages);
+        append_discover_skills_followup_note(&mut messages, &mut turn_messages);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(turn_messages.len(), 1);
+        assert_eq!(messages[0].role, ROLE_INTERNAL_NOTE);
+        assert_eq!(
+            messages[0].content.as_str(),
+            Some(DISCOVER_SKILLS_FOLLOWUP_NOTE)
+        );
+    }
+
+    #[test]
+    fn extract_image_paths_from_file_read_tool_calls_collects_image_reads() {
+        let tool_calls = vec![
+            ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: r#"{"file_path":"/tmp/shot.png"}"#.to_string(),
+                },
+            },
+            ToolCall {
+                id: "call_2".to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file_lines".to_string(),
+                    arguments: r#"{"file_path":"/tmp/notes.txt"}"#.to_string(),
+                },
+            },
+        ];
+        assert_eq!(
+            extract_image_paths_from_file_read_tool_calls(&tool_calls),
+            vec!["/tmp/shot.png".to_string()]
+        );
+    }
+
+    #[test]
+    fn auto_image_followup_uses_multimodal_message_for_vl_model() {
+        let mut app = test_app_with_tools(&[]);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tool-followup-{}.png", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"fake").unwrap();
+        app.current_model = crate::ai::model_names::all()
+            .iter()
+            .find(|m| m.is_vl)
+            .map(|m| m.name.clone())
+            .expect("models.json must contain at least one VL model");
+
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+        append_auto_image_followup_message(
+            &app,
+            "describe the file",
+            &shared_mcp,
+            &[path.to_string_lossy().to_string()],
+            &mut messages,
+            &mut turn_messages,
+        )
+        .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "user");
+        assert!(messages[0].content.is_array());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -120,7 +120,7 @@ pub(crate) fn execute_discover_skills(args: &Value) -> Result<String, String> {
             .map(|skill| summarize_skill(skill, include_capabilities)),
     );
     lines.push(
-        "This tool returns skill metadata only. Skill prompts stay unloaded until routing selects a skill."
+        "This tool returns skill metadata only. Skill prompts stay unloaded until routing selects a skill.\nIf you called this during an active task, do not stop here: continue the turn by selecting the best matching skill, enabling missing tools, or answering directly if no skill is actually needed."
             .to_string(),
     );
     Ok(lines.join("\n"))

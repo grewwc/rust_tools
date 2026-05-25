@@ -15,11 +15,21 @@ fn render_lines(content: &str, start: usize, end: usize, max_lines: usize) -> St
     result.join("\n")
 }
 
+fn image_read_redirect_message(file_path: &str) -> String {
+    format!(
+        "Image file detected at {}. This read request has been auto-upgraded to image-input semantics (same intent as attaching it with `-f`). Continue by analyzing the image directly instead of reading it as UTF-8 text.",
+        file_path
+    )
+}
+
 pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
     let store = FileStore::new(PathBuf::from(file_path));
     store.validate_access().map_err(|e| e.to_string())?;
     store.ensure_exists().map_err(|e| e.to_string())?;
+    if crate::ai::files::is_image_path(file_path) {
+        return Ok(image_read_redirect_message(file_path));
+    }
 
     let offset = args["offset"].as_u64().unwrap_or(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(1000) as usize;
@@ -36,6 +46,9 @@ pub(crate) fn execute_read_file_lines(args: &Value) -> Result<String, String> {
     let store = FileStore::new(PathBuf::from(file_path));
     store.validate_access().map_err(|e| e.to_string())?;
     store.ensure_exists().map_err(|e| e.to_string())?;
+    if crate::ai::files::is_image_path(file_path) {
+        return Ok(image_read_redirect_message(file_path));
+    }
 
     let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(200).clamp(1, 400) as usize;
@@ -130,6 +143,23 @@ mod tests {
         assert!(output.contains("line 9"));
         assert!(output.contains("line 10"));
         assert!(!output.contains("line 11"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_file_image_returns_redirect_message() {
+        let path = make_temp_path("image");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"fake image bytes").unwrap();
+        let path = path.with_extension("png");
+        fs::write(&path, b"fake image bytes").unwrap();
+
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+        });
+        let result = execute_read_file(&args).unwrap();
+        assert!(result.contains("auto-upgraded to image-input semantics"));
 
         let _ = fs::remove_file(&path);
     }

@@ -4,7 +4,7 @@ use std::path::Path;
 
 pub fn resolve_model_for_input(
     app: &App,
-    ocr_succeeded_for_images: bool,
+    has_usable_ocr_for_images: bool,
     _question: &mut String,
 ) -> String {
     // Resolution order:
@@ -16,7 +16,7 @@ pub fn resolve_model_for_input(
         &app.current_model,
         !app.attached_image_files.is_empty(),
         &app.config.vl_default_model,
-        ocr_succeeded_for_images,
+        has_usable_ocr_for_images,
     ) {
         return model;
     }
@@ -27,11 +27,12 @@ pub fn attachment_forced_model(
     current_model: &str,
     has_image_files: bool,
     vl_default_model: &str,
-    ocr_succeeded_for_images: bool,
+    has_usable_ocr_for_images: bool,
 ) -> Option<String> {
     // Many models are text-only. When there are images, we route to a VL model to avoid
-    // provider-side errors.
-    if has_image_files && !models::is_vl_model(current_model) && !ocr_succeeded_for_images {
+    // provider-side errors. If OCR already extracted usable text, prefer staying on the
+    // current text model instead of needlessly forcing a VL model.
+    if has_image_files && !models::is_vl_model(current_model) && !has_usable_ocr_for_images {
         return Some(models::determine_vl_model(vl_default_model));
     }
     None
@@ -83,6 +84,14 @@ pub(in crate::ai) struct OcrExtraction {
     pub(in crate::ai) tool_name: String,
     pub(in crate::ai) content: String,
     pub(in crate::ai) images: Vec<OcrImageSummary>,
+}
+
+impl OcrExtraction {
+    pub(in crate::ai) fn has_usable_text(&self) -> bool {
+        self.images
+            .iter()
+            .any(|image| image.error.is_none() && image.extracted_chars > 0)
+    }
 }
 
 pub(in crate::ai) struct OcrImageSummary {

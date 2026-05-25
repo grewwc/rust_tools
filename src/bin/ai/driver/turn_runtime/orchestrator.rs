@@ -257,6 +257,7 @@ pub(in crate::ai::driver) async fn run_turn(
                 &mut final_assistant_recorded,
                 &mut force_final_response,
                 &mut terminal_dedupe_candidate,
+                skill_turn.matched_skill_name().is_none(),
                 iteration,
                 max_iterations,
             ) {

@@ -328,6 +328,7 @@ pub(super) async fn prepare_turn(
             if has_images
                 && !crate::ai::models::supports_image_input(next_model)
                 && let Some(ocr) = precomputed_ocr
+                && ocr.has_usable_text()
             {
                 print_ocr_summary(&ocr);
                 final_question = format!(
