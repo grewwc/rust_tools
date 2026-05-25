@@ -68,7 +68,7 @@ fn params_web_fetch() -> Value {
         "properties": {
             "url": {
                 "type": "string",
-                "description": "http/https URL to fetch. Localhost and private network targets are blocked; response body is capped at 512KB."
+                "description": "http/https URL to fetch. Localhost and private network targets are blocked; response body is capped at 96KB."
             },
             "extract_content": {
                 "type": "boolean",
@@ -93,7 +93,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "web_fetch",
-        description: "Fetch the content of an http/https URL (5s timeout, 512KB cap). Blocks localhost/private network targets. Set extract_content=true to auto-remove nav, script, style and return clean article text. Returns URL, status, content-type, and content.",
+        description: "Fetch the content of an http/https URL (5s timeout, 96KB cap). Blocks localhost/private network targets. Set extract_content=true to auto-remove nav, script, style and return clean article text. Returns URL, status, content-type, and content.",
         parameters: params_web_fetch,
         execute: execute_web_fetch,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
@@ -421,7 +421,7 @@ pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
         .send()
         .map_err(|e| format!("Failed to fetch URL: {}", e))?;
 
-    const MAX_BYTES: usize = 512 * 1024;
+    const MAX_BYTES: usize = 96 * 1024;
 
     // Extract metadata before consuming response (clone to avoid borrow issues)
     let status = response.status().as_u16();
@@ -451,7 +451,7 @@ pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
     result.push_str(&format!("Content-Type: {}\n", content_type));
     result.push_str(&format!("Size: {} bytes", buf.len()));
     if truncated {
-        result.push_str(" (truncated at 512KB)");
+        result.push_str(" (truncated at 96KB)");
     }
     result.push_str("\n\n--- Content ---\n\n");
     if extract_content && content_type.starts_with("text/html") {

@@ -22,8 +22,11 @@
 // =============================================================================
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use rust_tools::cw::SkipMap;
 
@@ -385,7 +388,70 @@ pub(super) fn load_project_instruction_docs() -> Vec<ProjectInstructionDoc> {
     load_project_instruction_docs_from(&cwd)
 }
 
+/// 用 (path, len, mtime) 指纹缓存项目指令文档，避免每个 turn 都重新做磁盘
+/// I/O + truncate。实测中 AGENTS.md / CLAUDE.md 在一个会话里几乎不会变化，
+/// 但 build_system_prompt 每个 turn / 每个 iteration 都要拿一次它们，单
+/// 次最大 16KB×ancestors，token 与 syscall 都不便宜。
+///
+/// 缓存语义保证：只要任一参与文件的 (len, mtime) 发生变化，或扫描范围里
+/// 出现/消失了文件，就重新加载。命中时返回的是上次构建好的 Vec 的 clone，
+/// 内容与未缓存路径完全一致。
+type ProjectInstructionFingerprint = Vec<(PathBuf, u64, Option<SystemTime>)>;
+
+struct ProjectInstructionCacheEntry {
+    fingerprint: ProjectInstructionFingerprint,
+    docs: Vec<ProjectInstructionDoc>,
+}
+
+fn project_instruction_cache() -> &'static Mutex<HashMap<PathBuf, ProjectInstructionCacheEntry>> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, ProjectInstructionCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fingerprint_project_instruction_files(cwd: &Path) -> ProjectInstructionFingerprint {
+    let mut entries: ProjectInstructionFingerprint = Vec::new();
+    for dir in project_instruction_search_scope(cwd) {
+        for name in PROJECT_INSTRUCTION_FILENAMES {
+            let path = dir.join(name);
+            // 注意：与 load_project_instruction_docs_uncached 保持完全一致的发现顺序；
+            // 这里不做 canonicalize（原实现仅对去重做 canonicalize，发现顺序仍按
+            // path），fingerprint 比较的是"扫描看到的文件序列+元数据"。
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let len = meta.len();
+            let mtime = meta.modified().ok();
+            entries.push((path, len, mtime));
+        }
+    }
+    entries
+}
+
 fn load_project_instruction_docs_from(cwd: &Path) -> Vec<ProjectInstructionDoc> {
+    let fingerprint = fingerprint_project_instruction_files(cwd);
+
+    if let Ok(mut cache) = project_instruction_cache().lock() {
+        if let Some(entry) = cache.get(cwd) {
+            if entry.fingerprint == fingerprint {
+                return entry.docs.clone();
+            }
+        }
+        let docs = load_project_instruction_docs_uncached(cwd);
+        cache.insert(
+            cwd.to_path_buf(),
+            ProjectInstructionCacheEntry { fingerprint, docs: docs.clone() },
+        );
+        return docs;
+    }
+
+    // 锁中毒走 uncached 路径，不影响正确性。
+    load_project_instruction_docs_uncached(cwd)
+}
+
+fn load_project_instruction_docs_uncached(cwd: &Path) -> Vec<ProjectInstructionDoc> {
     let mut docs = Vec::new();
     let mut used = 0usize;
     let mut seen_paths = std::collections::BTreeSet::new();
@@ -850,6 +916,39 @@ noop
         assert_eq!(docs.len(), 1);
         assert!(docs[0].path.ends_with("claude.md"));
         assert!(docs[0].content.contains("Prefer make targets."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_instruction_docs_cache_invalidates_on_content_change() {
+        // 该测试锁住缓存语义：只要文件 mtime/len 变化就必须重新读盘，缓存
+        // 不能让 LLM 看到旧版指令。
+        let root = temp_dir("project_docs_cache");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let agents_md = root.join("AGENTS.md");
+        fs::write(&agents_md, "v1: use pnpm.\n").unwrap();
+
+        let first = load_project_instruction_docs_from(&root);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].content.contains("v1: use pnpm."));
+
+        // 同样输入再调一次，结果应等价（命中缓存或不命中都允许，只要内容一致）。
+        let cached = load_project_instruction_docs_from(&root);
+        assert_eq!(cached, first);
+
+        // 改文件并睡眠确保 mtime 推进；同时显式让 len 变化，双重保险触发
+        // fingerprint 失配。
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(&agents_md, "v2: use cargo and longer content for len change.\n").unwrap();
+
+        let after = load_project_instruction_docs_from(&root);
+        assert_eq!(after.len(), 1);
+        assert!(
+            after[0].content.contains("v2: use cargo"),
+            "cache must invalidate on file change, got: {}",
+            after[0].content
+        );
 
         let _ = fs::remove_dir_all(root);
     }

@@ -406,6 +406,9 @@ fn push_entry_lines(
     max_chars: usize,
     entry: &KnowledgeEntry,
 ) -> bool {
+    // 单条 recall bullet 的硬上限：避免某条历史 note 被外部以大段文本写入后
+    // 直接吃掉整段 recall 预算。超过上限的尾部用省略号截断。
+    const MAX_BULLET_CHARS: usize = 200;
     let note = entry.note.trim();
     if note.is_empty() {
         return false;
@@ -416,10 +419,14 @@ fn push_entry_lines(
         if line.is_empty() {
             continue;
         }
-        let bullet = if line.starts_with('-') {
-            format!("{line}\n")
+        let mut display: String = line.chars().take(MAX_BULLET_CHARS).collect();
+        if line.chars().count() > MAX_BULLET_CHARS {
+            display.push('…');
+        }
+        let bullet = if display.starts_with('-') {
+            format!("{display}\n")
         } else {
-            format!("- {line}\n")
+            format!("- {display}\n")
         };
         if *used + bullet.len() > max_chars {
             if !wrote_any && *used + 40 <= max_chars {

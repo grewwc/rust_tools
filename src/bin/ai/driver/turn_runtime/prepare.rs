@@ -23,7 +23,7 @@ use super::types::TurnPreparation;
 const CODE_DISCOVERY_PREFIX: &str = "code_discovery:";
 const CODE_DISCOVERY_CATEGORY: &str = "code_discovery";
 const SESSION_CODE_DISCOVERY_RECALL_PREFIX: &str = "Recent session code discoveries:";
-const RECENT_MEMORY_CACHE_TTL: Duration = Duration::from_secs(10);
+const RECENT_MEMORY_CACHE_TTL: Duration = Duration::from_secs(60);
 
 static RECENT_MEMORY_CACHE: LazyLock<Mutex<Option<RecentMemoryCacheEntry>>> =
     LazyLock::new(|| Mutex::new(None));

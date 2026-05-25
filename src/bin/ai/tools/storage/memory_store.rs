@@ -207,12 +207,35 @@ impl MemoryStore {
     }
 
     pub(crate) fn append(&self, entry: &AgentMemoryEntry) -> Result<(), String> {
+        // 单条 note 字节 cap：避免 LLM 把巨型 tool 输出整段写进 long-term memory，
+        // 导致下次 recall 时把 8KB+ 单条直接拉回上下文。
+        const MAX_NOTE_BYTES: usize = 4_096;
+        let mut entry_owned;
+        let entry_ref: &AgentMemoryEntry = if entry.note.len() > MAX_NOTE_BYTES {
+            entry_owned = entry.clone();
+            // 按字符边界裁剪到大约 MAX_NOTE_BYTES，并加省略提示
+            let mut truncated = String::with_capacity(MAX_NOTE_BYTES + 64);
+            let mut used = 0usize;
+            for ch in entry_owned.note.chars() {
+                let extra = ch.len_utf8();
+                if used + extra > MAX_NOTE_BYTES {
+                    break;
+                }
+                truncated.push(ch);
+                used += extra;
+            }
+            truncated.push_str("\n…[note truncated to fit memory store cap]");
+            entry_owned.note = truncated;
+            &entry_owned
+        } else {
+            entry
+        };
         super::with_memory_file_lock(&self.path, || {
             if let Some(parent) = self.path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|e| format!("Failed to create memory dir: {e}"))?;
             }
-            let serialized = serde_json::to_string(entry)
+            let serialized = serde_json::to_string(entry_ref)
                 .map_err(|e| format!("Failed to serialize memory entry: {e}"))?;
 
             let mut file = fs::OpenOptions::new()
@@ -247,13 +270,13 @@ impl MemoryStore {
             // JSONL 是 source of truth；下面的 SQLite 索引同步是 best-effort，
             // 失败只 trace 不冒泡。这样即使 rusqlite 出问题也不会阻断主存储。
             if let Some(idx) = memory_index_for(&self.path) {
-                if let Err(e) = idx.upsert_entry(entry) {
+                if let Err(e) = idx.upsert_entry(entry_ref) {
                     trace_memory_event(
                         "memory.index.upsert_failed",
                         "MemoryIndex upsert failed; index may drift",
                         &[
                             ("path", self.path.display().to_string()),
-                            ("entry_id", entry.id.clone().unwrap_or_default()),
+                            ("entry_id", entry_ref.id.clone().unwrap_or_default()),
                             ("error", e),
                         ],
                     );

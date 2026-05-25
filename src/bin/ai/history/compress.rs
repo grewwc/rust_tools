@@ -237,6 +237,7 @@ fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<M
     prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES);
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
+    dedup_repeated_tool_results(&mut messages);
 
     if messages_total_chars(&messages) <= max_chars {
         return messages;
@@ -244,6 +245,21 @@ fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<M
 
     while messages_total_chars(&messages) > max_chars {
         if let Some(group) = first_tool_call_group(&messages) {
+            // 渐进式卸载：先尝试折叠为单行 stub 而不是整组删除，
+            // 让模型仍能"看见"早期发生过哪些工具调用、以什么结果收尾，
+            // 避免后续轮次因为完全失忆而重复工作。
+            if let Some(stub) = fold_tool_call_group_to_stub(&messages, &group) {
+                let stub_idx = group[0];
+                for idx in group.iter().rev() {
+                    messages.remove(*idx);
+                }
+                messages.insert(stub_idx, stub);
+                if messages_total_chars(&messages) <= max_chars {
+                    break;
+                }
+                continue;
+            }
+            // 兜底：极端情况（无法构造 stub）才整组删除
             for idx in group.into_iter().rev() {
                 messages.remove(idx);
             }
@@ -259,6 +275,8 @@ fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<M
     if messages_total_chars(&messages) > max_chars {
         truncate_first_message_to_fit(&mut messages, max_chars);
     }
+
+    keep_only_recent_reasoning_content(&mut messages);
 
     messages
 }
@@ -283,6 +301,7 @@ fn shrink_messages_to_fit_with_summary(
     prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES);
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
+    dedup_repeated_tool_results(&mut messages);
 
     if messages_total_chars(&messages) <= max_chars {
         return messages;
@@ -425,6 +444,8 @@ fn shrink_messages_to_fit_with_summary(
     if messages_total_chars(&messages) > max_chars {
         truncate_first_message_to_fit(&mut messages, max_chars);
     }
+
+    keep_only_recent_reasoning_content(&mut messages);
 
     messages
 }
@@ -1370,6 +1391,60 @@ fn first_trim_candidate(messages: &[Message]) -> Option<usize> {
     None
 }
 
+/// 渐进式卸载：把一个 (assistant tool_calls + 配套 tool 结果) 整组折叠成单条
+/// `internal_note`，保留"工具列表 + 每个工具结果首句"，便于后续轮次知道
+/// 之前发生过什么、避免重复劳动；同时大幅压缩 token 占用。
+fn fold_tool_call_group_to_stub(messages: &[Message], group: &[usize]) -> Option<Message> {
+    if group.is_empty() {
+        return None;
+    }
+    let assistant_idx = group[0];
+    let assistant = messages.get(assistant_idx)?;
+    let tool_calls = assistant.tool_calls.as_ref()?;
+    if tool_calls.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::with_capacity(tool_calls.len() + 1);
+    lines.push(format!(
+        "compressed_tool_round: {} tool calls (folded for context budget)",
+        tool_calls.len()
+    ));
+
+    for tc in tool_calls.iter().take(8) {
+        let result_text = group
+            .iter()
+            .skip(1)
+            .find_map(|idx| {
+                let m = messages.get(*idx)?;
+                if m.tool_call_id.as_deref() == Some(tc.id.as_str()) {
+                    Some(value_to_string(&m.content))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let first_meaningful = result_text
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or("");
+        let one_liner = truncate_to_chars(&normalize_whitespace(first_meaningful), 160);
+        lines.push(format!("- {} => {}", tc.function.name, one_liner));
+    }
+    if tool_calls.len() > 8 {
+        lines.push(format!("- ... ({} more tools omitted)", tool_calls.len() - 8));
+    }
+
+    Some(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(lines.join("\n")),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    })
+}
+
 fn is_summary_message(message: &Message) -> bool {
     if !is_system_like_role(&message.role) {
         return false;
@@ -1415,14 +1490,116 @@ fn dedup_adjacent(messages: &mut Vec<Message>) {
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     let mut prev_role = String::new();
     let mut prev_content = String::new();
+    let mut prev_signature = String::new();
     for m in messages.drain(..) {
         let text = value_to_string(&m.content);
+        // 完全相等：直接丢弃
         if m.role == prev_role && text == prev_content {
+            continue;
+        }
+        // 模糊去重：仅对 tool 角色启用，避免误伤 assistant/user 中观感相近但实质不同的回复。
+        // 同 role 且整段 text 的 tool_line_signature 相同（去掉空白噪音 + 关键 token 一致）才丢弃。
+        let signature = if m.role == "tool" {
+            tool_line_signature(&text)
+        } else {
+            String::new()
+        };
+        if m.role == "tool"
+            && !signature.is_empty()
+            && m.role == prev_role
+            && signature == prev_signature
+        {
             continue;
         }
         prev_role = m.role.clone();
         prev_content = text;
+        prev_signature = signature;
         out.push(m);
     }
     *messages = out;
+}
+
+/// 只保留最近一条 assistant 的 reasoning_content。
+/// 较老的 reasoning chain 对后续 turn 决策几乎没有帮助，但每条都要回传给厂商
+/// 才能避免 400 invalid_request_error。把旧 reasoning_content 置 None 后，
+/// 厂商侧并不强制要求历史 reasoning 全程保留（OpenAI 仅要求与最近一次 tool_call
+/// 同回合的 reasoning 配对）。
+fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
+    let last_with_reasoning = messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, m)| m.role == "assistant" && m.reasoning_content.is_some())
+        .map(|(idx, _)| idx);
+    let Some(keep_idx) = last_with_reasoning else {
+        return;
+    };
+    for (idx, m) in messages.iter_mut().enumerate() {
+        if idx == keep_idx {
+            continue;
+        }
+        if m.role == "assistant" && m.reasoning_content.is_some() {
+            m.reasoning_content = None;
+        }
+    }
+}
+
+/// 跨轮 tool 结果去重：同一 (tool_name, normalized_args) 在历史中出现多次时，
+/// 把较早的 tool 结果替换为单行 stub（保留 tool_call_id 以维持 OpenAI tool-calls 协议正确性）。
+/// 仅压缩内容，不删除消息，避免 assistant tool_calls 与 tool 响应的配对断裂。
+/// 最近 KEEP_RECENT_TOOL_MESSAGES 条 tool 消息一律保留全文。
+fn dedup_repeated_tool_results(messages: &mut [Message]) {
+    use std::collections::HashMap;
+
+    // 收集 (tool_name, args_signature) → 出现次数与索引
+    // 通过 assistant.tool_calls 关联 tool_call_id → (name, args)
+    let mut id_to_signature: HashMap<String, (String, String)> = HashMap::new();
+    for message in messages.iter() {
+        if let Some(tool_calls) = &message.tool_calls {
+            for tc in tool_calls {
+                let args_norm = serde_json::from_str::<Value>(&tc.function.arguments)
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|_| tc.function.arguments.clone());
+                id_to_signature.insert(
+                    tc.id.clone(),
+                    (tc.function.name.clone(), args_norm),
+                );
+            }
+        }
+    }
+
+    let tool_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| (m.role == "tool").then_some(i))
+        .collect();
+    if tool_indices.len() <= KEEP_RECENT_TOOL_MESSAGES {
+        return;
+    }
+    let protected_from = tool_indices.len().saturating_sub(KEEP_RECENT_TOOL_MESSAGES);
+
+    let mut seen: HashMap<(String, String), usize> = HashMap::new();
+    for (rank, &idx) in tool_indices.iter().enumerate() {
+        let signature = match messages[idx]
+            .tool_call_id
+            .as_ref()
+            .and_then(|id| id_to_signature.get(id))
+        {
+            Some(sig) => sig.clone(),
+            None => continue,
+        };
+        let count = seen.entry(signature.clone()).or_insert(0);
+        *count += 1;
+        if rank >= protected_from {
+            continue;
+        }
+        // 保留首次出现，把后续重复的旧 tool 结果折叠为 stub
+        if *count > 1 {
+            let stub = format!(
+                "[deduped: identical {} call earlier in this conversation; full result preserved at first occurrence]",
+                signature.0
+            );
+            messages[idx].content = Value::String(stub);
+        }
+    }
 }

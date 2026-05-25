@@ -5448,26 +5448,18 @@ fn md_node_to_block_ops(node: MdNode, id_counter: &mut usize) -> Vec<BlockOp> {
                 all_descendants.extend(descs);
             }
 
-            let mut quote_block = json!({
+            let quote_block = json!({
                 "block_id": quote_id,
                 "block_type": 15,
                 "quote": { "elements": [make_text_element("", false, false, false)] },
                 "children": child_ids
             });
-            if child_ids.is_empty() {
-                quote_block["quote"] = json!({ "elements": [make_text_element("", false, false, false)] });
-                vec![BlockOp::Simple(json!({
-                    "block_type": 15,
-                    "quote": { "elements": [make_text_element("", false, false, false)] }
-                }))]
-            } else {
-                let mut descendants = vec![quote_block];
-                descendants.extend(all_descendants);
-                vec![BlockOp::Descendant {
-                    children_id: vec![quote_id],
-                    descendants,
-                }]
-            }
+            let mut descendants = vec![quote_block];
+            descendants.extend(all_descendants);
+            vec![BlockOp::Descendant {
+                children_id: vec![quote_id],
+                descendants,
+            }]
         }
         MdNode::Table { rows } => {
             vec![build_table_descendant(&rows, id_counter)]
@@ -5663,10 +5655,7 @@ fn build_list_block_content(item: &ListItem, block_type: i64) -> Value {
 
 fn build_code_block_style(lang: Option<&str>) -> Value {
     let mut style = json!({ "wrap": true });
-    let normalized = lang.map(|value| value.trim().to_ascii_lowercase());
-    if matches!(normalized.as_deref(), Some("mermaid")) {
-        style["language"] = json!("mermaid");
-    } else if let Some(language) = map_feishu_code_language(lang) {
+    if let Some(language) = map_feishu_code_language(lang) {
         style["language"] = json!(language);
     }
     style
@@ -5771,7 +5760,7 @@ fn build_table_descendant_data(
             "property": {
                 "row_size": row_size,
                 "column_size": column_size,
-                "header_row": row_size > 1
+                "header_row": true
             }
         },
         "children": cell_ids
@@ -5827,19 +5816,10 @@ fn feishu_doc_create_from_markdown(args: &Value) -> Result<String, JsonRpcErr> {
     }
 
     let base_url = resolve_base_url();
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| {
-            json_rpc_error(
-                -32000,
-                "Failed to build http client",
-                Some(json!({ "error": e.to_string() })),
-            )
-        })?;
+    let client = feishu_docs_http_client()?;
 
     let document_id = with_user_access_token(
-        &client,
+        client,
         &base_url,
         "Missing user_access_token. Create document requires OAuth once.",
         |token| {
@@ -5920,118 +5900,225 @@ fn feishu_doc_create_from_markdown(args: &Value) -> Result<String, JsonRpcErr> {
     )?;
 
     let block_ops = convert_markdown_to_docx_blocks(&markdown_content);
+    let doc_url = format!("{}/docx/{}", resolve_docs_web_base_url(&base_url), document_id);
     if block_ops.is_empty() {
-        let doc_url = format!("{}/docx/{}", resolve_docs_web_base_url(&base_url), document_id);
-        return Ok(format!(
-            "Created document (empty): {}\nID: {}",
-            doc_url, document_id
-        ));
+        return Ok(empty_doc_result(&document_id, &doc_url));
     }
 
+    // 飞书 children/descendant 接口对单次写入数量有限制，每批最多 50 个直接子块。
+    const MAX_CHILDREN_PER_BATCH: usize = 50;
+
     let mut index: i64 = 0;
-    let mut simple_batch: Vec<Value> = Vec::new();
+    let mut simple_buf: Vec<Value> = Vec::new();
+    let mut desc_children_id: Vec<String> = Vec::new();
+    let mut desc_descendants: Vec<Value> = Vec::new();
+    let mut blocks_inserted: i64 = 0;
 
     for op in &block_ops {
         match op {
             BlockOp::Simple(block) => {
-                simple_batch.push(block.clone());
-                if simple_batch.len() >= 50 {
-                    let batch = simple_batch.clone();
-                    with_user_access_token(
-                        &client,
+                if !desc_children_id.is_empty() {
+                    flush_descendant_batch(
+                        client,
                         &base_url,
-                        "Missing user_access_token. Update document requires OAuth.",
-                        |token| {
-                            create_children_batch(
-                                &client,
-                                &base_url,
-                                token,
-                                &document_id,
-                                &batch,
-                                index,
-                            )?;
-                            Ok(())
-                        },
+                        &document_id,
+                        &mut desc_children_id,
+                        &mut desc_descendants,
+                        &mut index,
+                        &mut blocks_inserted,
                     )?;
-                    index += batch.len() as i64;
-                    simple_batch.clear();
+                }
+                simple_buf.push(block.clone());
+                if simple_buf.len() >= MAX_CHILDREN_PER_BATCH {
+                    flush_simple_batch(
+                        client,
+                        &base_url,
+                        &document_id,
+                        &mut simple_buf,
+                        &mut index,
+                        &mut blocks_inserted,
+                    )?;
                 }
             }
             BlockOp::Descendant {
                 children_id,
                 descendants,
             } => {
-                if !simple_batch.is_empty() {
-                    let batch = simple_batch.clone();
-                    with_user_access_token(
-                        &client,
+                if !simple_buf.is_empty() {
+                    flush_simple_batch(
+                        client,
                         &base_url,
-                        "Missing user_access_token. Update document requires OAuth.",
-                        |token| {
-                            create_children_batch(
-                                &client,
-                                &base_url,
-                                token,
-                                &document_id,
-                                &batch,
-                                index,
-                            )?;
-                            Ok(())
-                        },
+                        &document_id,
+                        &mut simple_buf,
+                        &mut index,
+                        &mut blocks_inserted,
                     )?;
-                    index += batch.len() as i64;
-                    simple_batch.clear();
                 }
-                let desc = descendants.clone();
-                let cids = children_id.clone();
-                with_user_access_token(
-                    &client,
-                    &base_url,
-                    "Missing user_access_token. Update document requires OAuth.",
-                    |token| {
-                        create_descendant_batch(
-                            &client,
-                            &base_url,
-                            token,
-                            &document_id,
-                            &cids,
-                            &desc,
-                            index,
-                        )?;
-                        Ok(())
-                    },
-                )?;
-                index += 1;
+                if !desc_children_id.is_empty()
+                    && desc_children_id.len() + children_id.len() > MAX_CHILDREN_PER_BATCH
+                {
+                    flush_descendant_batch(
+                        client,
+                        &base_url,
+                        &document_id,
+                        &mut desc_children_id,
+                        &mut desc_descendants,
+                        &mut index,
+                        &mut blocks_inserted,
+                    )?;
+                }
+                desc_children_id.extend(children_id.iter().cloned());
+                desc_descendants.extend(descendants.iter().cloned());
+                if desc_children_id.len() >= MAX_CHILDREN_PER_BATCH {
+                    flush_descendant_batch(
+                        client,
+                        &base_url,
+                        &document_id,
+                        &mut desc_children_id,
+                        &mut desc_descendants,
+                        &mut index,
+                        &mut blocks_inserted,
+                    )?;
+                }
             }
         }
     }
 
-    if !simple_batch.is_empty() {
-        let batch = simple_batch.clone();
-        with_user_access_token(
-            &client,
+    if !simple_buf.is_empty() {
+        flush_simple_batch(
+            client,
             &base_url,
-            "Missing user_access_token. Update document requires OAuth.",
-            |token| {
-                create_children_batch(
-                    &client,
-                    &base_url,
-                    token,
-                    &document_id,
-                    &batch,
-                    index,
-                )?;
-                Ok(())
-            },
+            &document_id,
+            &mut simple_buf,
+            &mut index,
+            &mut blocks_inserted,
+        )?;
+    }
+    if !desc_children_id.is_empty() {
+        flush_descendant_batch(
+            client,
+            &base_url,
+            &document_id,
+            &mut desc_children_id,
+            &mut desc_descendants,
+            &mut index,
+            &mut blocks_inserted,
         )?;
     }
 
-    let doc_url = format!("{}/docx/{}", resolve_docs_web_base_url(&base_url), document_id);
+    Ok(success_doc_result(&document_id, &doc_url, blocks_inserted))
+}
 
-    Ok(format!(
-        "Created document: {}\nID: {}",
-        doc_url, document_id
-    ))
+/// 进程级共享 HTTP client，针对文档批量写入场景使用 60s 超时，避免大批量
+/// payload 在 30s 限制下因网络抖动失败。
+fn feishu_docs_http_client() -> Result<&'static Client, JsonRpcErr> {
+    static CLIENT: OnceLock<Client> = OnceLock::new();
+    if let Some(c) = CLIENT.get() {
+        return Ok(c);
+    }
+    let client = Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| {
+            json_rpc_error(
+                -32000,
+                "Failed to build http client",
+                Some(json!({ "error": e.to_string() })),
+            )
+        })?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+fn flush_simple_batch(
+    client: &Client,
+    base_url: &str,
+    document_id: &str,
+    buf: &mut Vec<Value>,
+    index: &mut i64,
+    blocks_inserted: &mut i64,
+) -> Result<(), JsonRpcErr> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let batch = std::mem::take(buf);
+    let count = batch.len() as i64;
+    let start_index = *index;
+    with_user_access_token(
+        client,
+        base_url,
+        "Missing user_access_token. Update document requires OAuth.",
+        |token| {
+            create_children_batch(
+                client,
+                base_url,
+                token,
+                document_id,
+                &batch,
+                start_index,
+            )?;
+            Ok(())
+        },
+    )?;
+    *index += count;
+    *blocks_inserted += count;
+    Ok(())
+}
+
+fn flush_descendant_batch(
+    client: &Client,
+    base_url: &str,
+    document_id: &str,
+    children_id: &mut Vec<String>,
+    descendants: &mut Vec<Value>,
+    index: &mut i64,
+    blocks_inserted: &mut i64,
+) -> Result<(), JsonRpcErr> {
+    if children_id.is_empty() {
+        return Ok(());
+    }
+    let cids = std::mem::take(children_id);
+    let descs = std::mem::take(descendants);
+    let count = cids.len() as i64;
+    let start_index = *index;
+    with_user_access_token(
+        client,
+        base_url,
+        "Missing user_access_token. Update document requires OAuth.",
+        |token| {
+            create_descendant_batch(
+                client,
+                base_url,
+                token,
+                document_id,
+                &cids,
+                &descs,
+                start_index,
+            )?;
+            Ok(())
+        },
+    )?;
+    *index += count;
+    *blocks_inserted += count;
+    Ok(())
+}
+
+fn empty_doc_result(document_id: &str, doc_url: &str) -> String {
+    json!({
+        "document_id": document_id,
+        "url": doc_url,
+        "blocks_inserted": 0,
+        "empty": true
+    })
+    .to_string()
+}
+
+fn success_doc_result(document_id: &str, doc_url: &str, blocks_inserted: i64) -> String {
+    json!({
+        "document_id": document_id,
+        "url": doc_url,
+        "blocks_inserted": blocks_inserted
+    })
+    .to_string()
 }
 
 fn create_children_batch(
@@ -6671,7 +6758,7 @@ mod tests {
         );
         assert_eq!(
             build_code_block_style(Some("mermaid"))["language"],
-            serde_json::json!("mermaid")
+            serde_json::json!(39)
         );
     }
 

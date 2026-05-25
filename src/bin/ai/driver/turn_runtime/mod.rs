@@ -38,6 +38,9 @@ pub(super) use types::TurnOutcome;
 
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;
 const TOOL_OVERFLOW_PREVIEW_CHARS: usize = 800;
+/// 中等大输出阈值：超过此值但未到 overflow 阈值的工具结果，对结构化的 read/grep/tree
+/// 类工具走"头 + 关键命中 + 尾"的按行裁剪，避免完整 32KB 全部进上下文。
+const MAX_TOOL_RESULT_LINE_TRIM_CHARS: usize = 8_000;
 
 pub(in crate::ai) use debug::report_agent_hang_debug;
 

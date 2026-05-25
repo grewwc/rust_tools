@@ -1432,6 +1432,15 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
             // older notes don't move when newer ones get appended.
             let mut promoted = message.clone();
             promoted.role = ROLE_SYSTEM.to_string();
+            // Cap mid-stream notes to a reasonable budget to avoid bloating
+            // the request with stale long notes (working memory / code
+            // discoveries / self_note / cached-tool notes accumulated over
+            // many tool rounds).
+            if let Value::String(text) = &promoted.content {
+                if text.chars().count() > MERGED_SINGLE_NOTE_MAX_CHARS {
+                    promoted.content = Value::String(truncate_chars(text, MERGED_SINGLE_NOTE_MAX_CHARS));
+                }
+            }
             out.push(promoted);
             continue;
         }
@@ -1597,8 +1606,11 @@ pub(super) async fn summarize_history_via_model(
     }
 
     let transcript = messages_to_markdown(messages, &app.session_id);
+    // 三段式截断：head 12k + middle 关键命中 4k + tail 6k，总计 22k 字符。
+    // 比原先 head 16k + tail 6k 多保留中段的 error/fix/decision 行，避免
+    // 摘要器只看见"开头任务陈述 + 末尾收尾"而漏掉中段关键改动。
     let transcript = if transcript.chars().count() > 24_000 {
-        let head: String = transcript.chars().take(16_000).collect();
+        let head: String = transcript.chars().take(12_000).collect();
         let tail: String = transcript
             .chars()
             .rev()
@@ -1607,7 +1619,61 @@ pub(super) async fn summarize_history_via_model(
             .chars()
             .rev()
             .collect();
-        format!("{head}\n\n[... older transcript omitted for summary budget ...]\n\n{tail}")
+
+        // 中段关键行抽取：从 head 之后、tail 之前的中间部分挑选 error/fail/panic/
+        // fix/diff/apply_patch/decision 等关键标记行，控制在 4k 字符内。
+        let total_chars = transcript.chars().count();
+        let mid_start_chars = 12_000usize;
+        let mid_end_chars = total_chars.saturating_sub(6_000);
+        let middle_segment: String = if mid_end_chars > mid_start_chars {
+            transcript
+                .chars()
+                .skip(mid_start_chars)
+                .take(mid_end_chars - mid_start_chars)
+                .collect()
+        } else {
+            String::new()
+        };
+        let mut keypoints = String::new();
+        let mut keypoint_chars = 0usize;
+        const MID_KEYPOINTS_BUDGET: usize = 4_000;
+        for line in middle_segment.lines() {
+            let lower = line.to_lowercase();
+            let is_key = lower.contains("error")
+                || lower.contains("fail")
+                || lower.contains("panic")
+                || lower.contains("fix")
+                || lower.contains("diff")
+                || lower.contains("apply_patch")
+                || lower.contains("write_file")
+                || lower.contains("decision")
+                || lower.contains("conclusion")
+                || lower.contains("结论")
+                || lower.contains("修复")
+                || lower.contains("错误");
+            if !is_key {
+                continue;
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let chunk_len = trimmed.chars().count() + 1;
+            if keypoint_chars + chunk_len > MID_KEYPOINTS_BUDGET {
+                break;
+            }
+            keypoints.push_str(trimmed);
+            keypoints.push('\n');
+            keypoint_chars += chunk_len;
+        }
+
+        if keypoints.trim().is_empty() {
+            format!("{head}\n\n[... older transcript omitted for summary budget ...]\n\n{tail}")
+        } else {
+            format!(
+                "{head}\n\n[... middle segment compressed; keypoints below ...]\n{keypoints}\n[... end of middle keypoints ...]\n\n{tail}"
+            )
+        }
     } else {
         transcript
     };

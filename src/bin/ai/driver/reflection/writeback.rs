@@ -1,4 +1,7 @@
 use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
 
 use crate::ai::history::Message;
@@ -10,6 +13,38 @@ use chrono::Local;
 
 use super::gates::{answer_looks_unstable_for_writeback, turn_uses_repo_inspection_tools};
 use super::recall::current_project_name_hint;
+
+/// 短期写回去重缓存：(project, q_hash, a_hash) -> last_seen_instant。
+/// 5 分钟内相同 question+answer 不再触发 LLM 调用，避免连续多轮重复问答时
+/// 反复发起 writeback LLM 请求；MemoryStore upsert 仍然是幂等的，这里只是省 token。
+static WRITEBACK_RECENT: LazyLock<Mutex<HashMap<(String, u64, u64), Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+const WRITEBACK_DEDUP_TTL: StdDuration = StdDuration::from_secs(5 * 60);
+
+fn writeback_dedup_key(project: &str, question: &str, answer: &str) -> (String, u64, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut q_h = rustc_hash::FxHasher::default();
+    question.trim().hash(&mut q_h);
+    let mut a_h = rustc_hash::FxHasher::default();
+    answer.trim().hash(&mut a_h);
+    (project.to_string(), q_h.finish(), a_h.finish())
+}
+
+fn writeback_recently_seen(key: &(String, u64, u64)) -> bool {
+    let mut guard = match WRITEBACK_RECENT.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let now = Instant::now();
+    guard.retain(|_, t| now.duration_since(*t) < WRITEBACK_DEDUP_TTL);
+    if let Some(t) = guard.get(key) {
+        if now.duration_since(*t) < WRITEBACK_DEDUP_TTL {
+            return true;
+        }
+    }
+    guard.insert(key.clone(), now);
+    false
+}
 
 /// 把 reflection 写入的 AgentMemoryEntry 同步到向量索引，让 semantic search 能召回。
 /// 失败仅打印 warning，不阻塞 JSONL 写入流程。
@@ -69,6 +104,11 @@ pub(super) async fn maybe_write_back_project_knowledge(
     let Some(project_name) = current_project_name_hint() else {
         return;
     };
+    // 5 分钟内已对相同 (project, question, answer) 跑过 writeback：直接跳过 LLM 调用。
+    let dedup_key = writeback_dedup_key(&project_name, q, a);
+    if writeback_recently_seen(&dedup_key) {
+        return;
+    }
     let model_s = cfg
         .get_opt("ai.project_writeback.model")
         .unwrap_or_else(|| model.to_string());

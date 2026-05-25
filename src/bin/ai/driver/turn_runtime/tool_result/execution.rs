@@ -22,16 +22,134 @@ use crate::ai::driver::print::{
 use super::messaging::print_tool_result_preview;
 use super::super::persistence::persist_pending_turn_messages;
 use super::super::{
-    MAX_TOOL_RESULT_INLINE_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
+    MAX_TOOL_RESULT_INLINE_CHARS, MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
     types::{IterationExecution, PreparedToolResult, TurnLoopStep},
 };
+
+/// 适合"中段按行裁剪"的工具：输出本身是搜索/列表类（head+命中+tail 信息密度高、
+/// 中段冗余多）。read_file / read_file_lines 不在此列——agent 显式要求读这些行，
+/// 必须把请求的全部内容回传，不能擅自压缩，否则会影响 agent 效果。
+fn supports_line_trim(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "grep_search"
+            | "search_files"
+            | "list_directory"
+            | "tree"
+            | "code_search"
+            | "ast_outline"
+    )
+}
+
+/// 把"中等大"（介于 MAX_TOOL_RESULT_LINE_TRIM_CHARS 和 MAX_TOOL_RESULT_INLINE_CHARS 之间）
+/// 的结构化输出折叠为：头 N 行 + 命中关键词的若干行 + 尾 M 行 + 中段标注。
+/// 不写盘、不破坏整体语义，只是把"中段冗余"压掉。
+fn line_trim_middle(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let total_lines = lines.len();
+    if total_lines <= 80 {
+        return content.to_string();
+    }
+
+    let head_lines = 40usize;
+    let tail_lines = 20usize;
+
+    let mut head = Vec::with_capacity(head_lines);
+    for line in lines.iter().take(head_lines) {
+        head.push(*line);
+    }
+    let tail_start = total_lines.saturating_sub(tail_lines);
+    let mut tail = Vec::with_capacity(tail_lines);
+    if tail_start > head_lines {
+        for line in lines.iter().skip(tail_start) {
+            tail.push(*line);
+        }
+    }
+
+    // 在中段（head_lines..tail_start）按关键字采样 8 行
+    let mut key_lines: Vec<(usize, &str)> = Vec::new();
+    if tail_start > head_lines {
+        for (i, line) in lines.iter().enumerate().take(tail_start).skip(head_lines) {
+            let lower = line.to_ascii_lowercase();
+            let important = lower.contains("error")
+                || lower.contains("fail")
+                || lower.contains("panic")
+                || lower.contains("warn")
+                || lower.contains("todo")
+                || lower.contains("fixme")
+                || lower.contains("//!")
+                || lower.contains("///")
+                || lower.starts_with("fn ")
+                || lower.starts_with("pub fn ")
+                || lower.starts_with("impl ")
+                || lower.starts_with("struct ")
+                || lower.starts_with("trait ")
+                || lower.starts_with("enum ")
+                || lower.starts_with("#[")
+                || lower.contains(": error")
+                || lower.contains(": warning");
+            if important {
+                key_lines.push((i, *line));
+                if key_lines.len() >= 8 {
+                    break;
+                }
+            }
+        }
+    }
+
+    let omitted_count = total_lines.saturating_sub(head_lines + tail.len());
+    let mut out = String::with_capacity(content.len() / 2);
+    for line in &head {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !key_lines.is_empty() {
+        out.push_str(&format!(
+            "\n... [middle trimmed: {} lines folded; key-match samples below]\n",
+            omitted_count.saturating_sub(key_lines.len())
+        ));
+        for (idx, line) in &key_lines {
+            out.push_str(&format!("L{idx}: {line}\n"));
+        }
+        out.push_str("...\n");
+    } else {
+        out.push_str(&format!(
+            "\n... [middle trimmed: {} lines folded]\n",
+            omitted_count
+        ));
+    }
+    for line in &tail {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
 
 pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
     app: &App,
     tool_name: &str,
     content: &str,
 ) -> PreparedToolResult {
-    if content.chars().count() <= MAX_TOOL_RESULT_INLINE_CHARS {
+    let char_count = content.chars().count();
+    if char_count <= MAX_TOOL_RESULT_LINE_TRIM_CHARS {
+        return PreparedToolResult {
+            content_for_model: content.to_string(),
+            content_for_terminal: build_terminal_preview(tool_name, content),
+        };
+    }
+
+    if char_count <= MAX_TOOL_RESULT_INLINE_CHARS && supports_line_trim(tool_name) {
+        let trimmed = line_trim_middle(content);
+        // 只有真正缩短才采用，否则保持原文
+        if trimmed.chars().count() < char_count {
+            return PreparedToolResult {
+                content_for_model: trimmed,
+                content_for_terminal: build_terminal_preview(tool_name, content),
+            };
+        }
+    }
+
+    if char_count <= MAX_TOOL_RESULT_INLINE_CHARS {
         return PreparedToolResult {
             content_for_model: content.to_string(),
             content_for_terminal: build_terminal_preview(tool_name, content),

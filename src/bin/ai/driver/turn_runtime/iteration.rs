@@ -60,7 +60,15 @@ pub(super) fn refresh_skill_turn_for_iteration(
 
     *skill_turn = new_skill_turn;
     if let Some(system_message) = messages.first_mut() {
-        system_message.content = Value::String(skill_turn.system_prompt().to_string());
+        // 仅当新旧 system prompt 文本不同才覆写。
+        // 同一段字符串的覆写不仅没用，还会让上游 prompt cache（例如 anthropic
+        // 的 cache_control 命中、或者 driver 内部的字符串 hash 复用）连续失效，
+        // 在长 turn 多 iteration 场景里是无声的 token 浪费。
+        let next_prompt = skill_turn.system_prompt();
+        let same = matches!(&system_message.content, Value::String(s) if s == next_prompt);
+        if !same {
+            system_message.content = Value::String(next_prompt.to_string());
+        }
     }
 }
 

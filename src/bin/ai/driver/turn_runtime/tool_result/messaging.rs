@@ -110,9 +110,22 @@ pub(super) fn append_tool_result_messages(
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
 ) {
+    // 截断 tool-call 前的 assistant narration：纯叙述对后续轮次价值有限，
+    // 多轮叠加后会大幅膨胀上下文，对最终回答几乎没有帮助。保留前 800 字。
+    const TOOL_CALL_NARRATION_MAX_CHARS: usize = 800;
+    let narration = if stream_assistant_text.chars().count() > TOOL_CALL_NARRATION_MAX_CHARS {
+        let mut out: String = stream_assistant_text
+            .chars()
+            .take(TOOL_CALL_NARRATION_MAX_CHARS)
+            .collect();
+        out.push('…');
+        out
+    } else {
+        stream_assistant_text.to_string()
+    };
     let assistant_msg = Message {
         role: "assistant".to_string(),
-        content: Value::String(stream_assistant_text.to_string()),
+        content: Value::String(narration),
         tool_calls: Some(exec_result.executed_tool_calls.clone()),
         tool_call_id: None,
         reasoning_content: (!stream_reasoning_text.is_empty())
@@ -175,18 +188,27 @@ pub(super) fn append_code_inspection_working_memory(
         return;
     };
 
-    let duplicate = messages.iter().rev().find_map(|message| {
+    // In-place 替换：working memory 是"当前轮工具调用的总结"，
+    // 每轮都会重新生成。把旧的同前缀 note 原地替换，避免多轮叠加堆出 N 条
+    // 大体相同、但都被持久化的 internal_note。
+    let mut found_prior = false;
+    for message in messages.iter_mut() {
         if !is_system_like_role(&message.role) {
-            return None;
+            continue;
         }
-        match &message.content {
-            Value::String(content) if content.starts_with(CODE_INSPECTION_MEMORY_PREFIX) => {
-                Some(content == &note)
+        if let Value::String(content) = &message.content {
+            if content.starts_with(CODE_INSPECTION_MEMORY_PREFIX) {
+                // 完全相同则什么都不做（保持 prompt cache 命中）
+                if content == &note {
+                    return;
+                }
+                message.content = Value::String(note.clone());
+                found_prior = true;
+                break;
             }
-            _ => None,
         }
-    });
-    if duplicate == Some(true) {
+    }
+    if found_prior {
         return;
     }
 
@@ -214,20 +236,22 @@ pub(super) fn record_persistent_code_discoveries(
         .map(render_record)
         .collect::<Vec<_>>()
         .join("\n");
-    if persistent_code_discovery_already_present(messages, &body)
-        || persistent_code_discovery_already_present(turn_messages, &body)
-    {
-        return;
-    }
 
-    let record = Message {
-        role: ROLE_INTERNAL_NOTE.to_string(),
-        content: Value::String(format!("{CODE_DISCOVERY_PREFIX}\n{body}")),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    };
-    append_message_pair(messages, turn_messages, record);
+    // 渐进式合并：把新 discoveries 合并到已有的 code_discovery internal_note，
+    // 避免多轮 push 出 N 条 code_discovery 记录堆在 messages 里。
+    // 行级去重保留首次出现，新发现追加到尾部。
+    let merged_into_existing = merge_into_existing_code_discovery(messages, &body)
+        || merge_into_existing_code_discovery(turn_messages, &body);
+    if !merged_into_existing {
+        let record = Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(format!("{CODE_DISCOVERY_PREFIX}\n{body}")),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        append_message_pair(messages, turn_messages, record);
+    }
 
     let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
     let session_source = format!("session:{}", app.session_id);
@@ -252,6 +276,50 @@ pub(super) fn record_persistent_code_discoveries(
         let _ = store.append(&entry);
     }
     store.maintain_after_append();
+}
+
+/// 把 new_body 行级追加到已有 code_discovery internal_note 末尾（去重保留首次）。
+/// 命中已有 note 时 in-place 替换其内容并返回 true；否则返回 false（调用方走 push 路径）。
+fn merge_into_existing_code_discovery(messages: &mut [Message], new_body: &str) -> bool {
+    for message in messages.iter_mut().rev() {
+        if message.role != ROLE_INTERNAL_NOTE {
+            continue;
+        }
+        let Value::String(content) = &message.content else {
+            continue;
+        };
+        if !content.starts_with(CODE_DISCOVERY_PREFIX) {
+            continue;
+        }
+        let existing_body = content[CODE_DISCOVERY_PREFIX.len()..].trim_start().to_string();
+        let mut seen: std::collections::HashSet<String> = existing_body
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut merged = existing_body.clone();
+        let mut appended_any = false;
+        for line in new_body.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if seen.insert(trimmed.to_string()) {
+                if !merged.is_empty() && !merged.ends_with('\n') {
+                    merged.push('\n');
+                }
+                merged.push_str(trimmed);
+                appended_any = true;
+            }
+        }
+        if !appended_any {
+            // 完全是已记录过的行：什么都不做，返回 true 表示无需新增 message
+            return true;
+        }
+        message.content = Value::String(format!("{CODE_DISCOVERY_PREFIX}\n{merged}"));
+        return true;
+    }
+    false
 }
 
 pub(super) fn record_final_stream_response(

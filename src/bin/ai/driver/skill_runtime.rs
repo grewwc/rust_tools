@@ -588,6 +588,12 @@ const CAPABILITY_CATALOG: &[CapabilityEntry] = &[
 ];
 
 fn build_capability_catalog(available_tools: &Box<SkipSet<String>>) -> Option<String> {
+    // 缓存键：可用工具集合的哈希。同一会话/同一 agent 在工具集不变时复用。
+    let cache_key = capability_catalog_cache_key(available_tools);
+    if let Some(hit) = capability_catalog_cache_get(cache_key) {
+        return hit;
+    }
+
     let mut lines = Vec::new();
     for entry in CAPABILITY_CATALOG {
         let missing: Vec<String> = entry
@@ -606,19 +612,51 @@ fn build_capability_catalog(available_tools: &Box<SkipSet<String>>) -> Option<St
         }
         lines.push(line);
     }
-    if lines.is_empty() {
-        return None;
+    let result = if lines.is_empty() {
+        None
+    } else {
+        let mut out = String::from(
+            "Capability catalog (not yet loaded — enable as needed):\n\
+             When the user's request matches a trigger below, call `enable_tools(operation=enable, tools=[...])` \
+             with the listed tools before proceeding.\n",
+        );
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        Some(out)
+    };
+    capability_catalog_cache_put(cache_key, result.clone());
+    result
+}
+
+fn capability_catalog_cache_key(available_tools: &Box<SkipSet<String>>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut tools: Vec<String> = available_tools.iter().map(|s| s.to_string()).collect();
+    tools.sort();
+    let mut hasher = rustc_hash::FxHasher::default();
+    for t in &tools {
+        t.hash(&mut hasher);
+        0u8.hash(&mut hasher);
     }
-    let mut out = String::from(
-        "Capability catalog (not yet loaded — enable as needed):\n\
-         When the user's request matches a trigger below, call `enable_tools(operation=enable, tools=[...])` \
-         with the listed tools before proceeding.\n",
-    );
-    for line in lines {
-        out.push_str(&line);
-        out.push('\n');
+    hasher.finish()
+}
+
+static CAPABILITY_CATALOG_CACHE: LazyLock<Mutex<Option<(u64, Option<String>)>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+fn capability_catalog_cache_get(key: u64) -> Option<Option<String>> {
+    let cache = CAPABILITY_CATALOG_CACHE.lock().ok()?;
+    cache
+        .as_ref()
+        .filter(|(k, _)| *k == key)
+        .map(|(_, v)| v.clone())
+}
+
+fn capability_catalog_cache_put(key: u64, value: Option<String>) {
+    if let Ok(mut cache) = CAPABILITY_CATALOG_CACHE.lock() {
+        *cache = Some((key, value));
     }
-    Some(out)
 }
 
 fn build_project_instruction_prompt() -> Option<String> {
@@ -649,7 +687,7 @@ fn build_system_prompt(
 ) -> SystemPromptBuilder {
     let mut b = SystemPromptBuilder::new();
 
-    b.push(ContextKind::Identity, "You are a highly capable programming assistant. You help users write, debug, and understand code with precision and thoroughness.");
+    b.push(ContextKind::Identity, "You are a highly capable general-purpose AI assistant. You help users plan, research, write, analyze, and act across any domain — code is one of many, not the only one. Adapt your approach to the task at hand: use code/tooling when the request is technical, and plain reasoning or research when it is not. Aim to be sharp and to the point — answer what was asked, not more.");
 
     if let Some(agent) = active_agent {
         let extra = agent.build_system_prompt();
@@ -665,6 +703,7 @@ fn build_system_prompt(
         }
     }
 
+    b.push(ContextKind::Behavior, "Response style:\n- Lead with the answer or the action; skip preamble, restating the question, and meta commentary like \"Let me…\" / \"I'll now…\".\n- One sentence beats three. Drop filler, transitions, and recaps the user can already see.\n- Default to short, direct prose. Use lists/sections only when they materially help; never pad output to look thorough.\n- Do not narrate tool calls before or after running them — let the calls and their results speak. A brief status line is only appropriate at real milestones or when a plan changes.\n- Conciseness must NOT come at the cost of correctness: for non-trivial requests, think the problem through (read code, check facts) BEFORE answering. If you are uncertain, say so in one line and gather evidence rather than guessing tersely.\n- When stating a conclusion that depends on code, cite the exact file/line; do not summarize from memory.");
     b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- If the answer depends on repo/code facts, inspect with tools before concluding.\n- If the user asks for edits, perform edits with tools instead of only describing them.\n- If the user asks to run/build/test/reproduce, run commands with tools when available.\n- On tool failure, read the error and correct course before answering. Retry with fixed args or switch tools; avoid repeating the same failing call.\n- If `code_search` returns only `No ...` results, broaden scope instead of rerunning unchanged.");
 
     if let Some(project_prompt) = build_project_instruction_prompt() {
@@ -1136,6 +1175,17 @@ mod tests {
         assert!(prompt.contains("Tool discovery:"));
         assert!(!prompt.contains("Web search:"));
         assert!(!prompt.contains("Knowledge retrieval:"));
+    }
+
+    #[test]
+    fn system_prompt_enforces_concise_response_style_with_correctness_safeguard() {
+        let available = SkipSet::new(16);
+        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        // 风格段必须存在，且要求"先答后说、不啰嗦"
+        assert!(prompt.contains("Response style:"));
+        assert!(prompt.contains("Lead with the answer"));
+        // 必须保留"简洁不能换错"的安全垫，避免过度精简导致错误判断
+        assert!(prompt.contains("Conciseness must NOT come at the cost of correctness"));
     }
 
     #[test]
