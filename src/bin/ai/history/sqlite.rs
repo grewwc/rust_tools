@@ -62,6 +62,46 @@ fn add_column_if_missing(
     }
 }
 
+/// 读取 SQLite 的 `PRAGMA data_version`：每次该 DB 被任何连接修改后递增，
+/// 不依赖文件 mtime/len（WAL 模式下主文件可能长时间不变）。
+/// 用于 CONTEXT_HISTORY_CACHE 失效判定，比文件元数据可靠。
+pub(in crate::ai) fn read_data_version(path: &Path) -> Option<i64> {
+    let conn = Connection::open(path).ok()?;
+    conn.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+        .ok()
+}
+
+/// 廉价查询当前 history DB 中 role='user' 的消息数。
+/// 用于 boundary compact 在 hot path 上"先 count 再决定是否全量读"，
+/// 避免每个 turn 收尾都把几万条消息（含大块 tool 输出）反序列化一遍。
+pub(in crate::ai) fn count_user_turns_sqlite(path: &Path) -> io::Result<usize> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
+    // schema 可能尚未创建（全新 session），messages 表不存在时直接返 0。
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .unwrap_or(false);
+    if !table_exists {
+        return Ok(0);
+    }
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(1) FROM messages WHERE role = 'user'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(count.max(0) as usize)
+}
+
 pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -> io::Result<()> {
     let mut conn = open_history_db(path)?;
     init_history_schema(&conn)?;

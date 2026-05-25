@@ -21,6 +21,7 @@ use super::{
     prepare::prepare_turn,
     tool_result::handle_iteration_execution,
     types::{TurnLoopStep, TurnOutcome, TurnPreparation},
+    MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
     MID_TURN_COMPRESS_HARD_THRESHOLD, MID_TURN_COMPRESS_SOFT_THRESHOLD,
     MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
 };
@@ -202,6 +203,12 @@ pub(in crate::ai::driver) async fn run_turn(
     let mut tool_signature_history: Vec<Vec<String>> = Vec::new();
     let mut loop_breaker_injected = false;
     let mut iteration_limit_note_injected = false;
+    // Mid-turn 压缩节流：上次压缩时的 iteration 与压缩后的字符数。
+    // 用于实现：①冷却（至少隔 N 轮再判）②增量门槛（messages 增量不够大不重压）。
+    let mut last_compress_iteration: usize = 0;
+    let mut last_compress_after_chars: usize = 0;
+    // 收集本 turn 实际调用过的 explicit-enabled tool 名字，turn 末用于老化未用项。
+    let mut tools_used_this_turn: Vec<String> = Vec::new();
     let loop_result = 'turn: loop {
         iteration += 1;
         {
@@ -276,6 +283,21 @@ pub(in crate::ai::driver) async fn run_turn(
                             }
                         }
                     }
+                    // 记录本轮 assistant 实际调用过的 tool 名字（去重），
+                    // 留给 turn 末用于老化未用 explicit tool。
+                    if let Some(last_assistant) = messages
+                        .iter()
+                        .rev()
+                        .find(|m| m.role == "assistant")
+                        && let Some(tool_calls) = &last_assistant.tool_calls
+                    {
+                        for tc in tool_calls {
+                            let name = tc.function.name.clone();
+                            if !tools_used_this_turn.contains(&name) {
+                                tools_used_this_turn.push(name);
+                            }
+                        }
+                    }
                 }
                 TurnLoopStep::Break => break 'turn Ok(None),
                 TurnLoopStep::Return(outcome) => break 'turn Ok(Some(outcome)),
@@ -286,14 +308,26 @@ pub(in crate::ai::driver) async fn run_turn(
         // === Mid-turn 渐进式压缩 ===
         // 每轮 tool 执行完毕后检查 messages 总字符；超过软阈值时
         // 复用跨 turn 压缩管线，避免长链工具调用把上下文撑爆。
+        // 节流：①冷却 N 轮 ②增量小于 DELTA 时跳过，避免 no-op 反复压缩。
         let total_chars = crate::ai::history::messages_total_chars_pub(&messages);
-        if total_chars > MID_TURN_COMPRESS_SOFT_THRESHOLD {
+        let cooldown_passed = iteration
+            .saturating_sub(last_compress_iteration)
+            >= MID_TURN_COMPRESS_COOLDOWN_ITERATIONS;
+        let delta_significant = total_chars
+            .saturating_sub(last_compress_after_chars)
+            >= MID_TURN_COMPRESS_DELTA_THRESHOLD;
+        if total_chars > MID_TURN_COMPRESS_SOFT_THRESHOLD
+            && cooldown_passed
+            && (last_compress_after_chars == 0 || delta_significant)
+        {
             let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
             let (compressed, before, after) = crate::ai::history::mid_turn_compress(
                 drained,
                 MID_TURN_COMPRESS_SOFT_THRESHOLD,
             );
             messages = compressed;
+            last_compress_iteration = iteration;
+            last_compress_after_chars = after;
             if after < before {
                 print_compress_status("mid-turn", before, after);
             }
@@ -357,6 +391,10 @@ pub(in crate::ai::driver) async fn run_turn(
             inject_iteration_limit_reflect_note(&mut messages, max_iterations);
         }
     };
+
+    // 老化未在本 turn 使用的 explicit-enabled tool。
+    // 连续 N 个 turn 闲置就 demote，避免"启用一次永久焊接"。
+    crate::ai::tools::enable_tools::age_unused_explicit_tools(&tools_used_this_turn);
 
     skill_turn.restore_agent_context(app);
 

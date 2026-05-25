@@ -55,6 +55,12 @@ pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_HARD_THRESHOLD: 
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS: usize = 2;
 /// LLM 摘要文本的最大字符数。
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_MAX_CHARS: usize = 4_000;
+/// Mid-turn 压缩冷却：触发一次后至少间隔 N 轮才再次重判，避免在阈值附近徘徊
+/// 时每轮都跑一次（实际无变化）。
+pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_COOLDOWN_ITERATIONS: usize = 2;
+/// Mid-turn 压缩增量门槛：自上次压缩后 messages 增量小于此值则跳过（避免
+/// 大 tool result 留在 messages 末尾时反复触发 no-op 压缩）。
+pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_DELTA_THRESHOLD: usize = 4_000;
 
 pub(in crate::ai) use debug::report_agent_hang_debug;
 

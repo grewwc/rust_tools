@@ -664,9 +664,9 @@ fn finalize_question(
         }
         handle_binary_files(&mut attachments_text, parsed.binary_files)?;
     }
-    if !inline_images.is_empty() {
-        app.attached_image_files = inline_images;
-    }
+    // 图片是 per-turn 状态：每个 turn 重置，避免上一轮图片被无声地拼到
+    // 后续 turn 的 user message（重复 token + 重复 OCR + 把 model 锁在 VL）。
+    app.attached_image_files = inline_images;
 
     if app.pending_short_output || loop_short_output {
         if !question.ends_with('\n') {

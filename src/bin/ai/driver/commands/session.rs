@@ -86,6 +86,10 @@ pub fn try_handle_session_command(
         }
         "new" | "create" => {
             let new_id = Uuid::new_v4().to_string();
+            // 切换前清掉旧 session 的 history cache 与 explicit-enabled tools，
+            // 防止下个 turn 携带跨 session 脏状态。
+            crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
+            crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
             app.session_id = new_id.clone();
             app.session_history_file = store.session_history_file(&new_id);
             println!("Switched to new session: {}", new_id);
@@ -95,6 +99,8 @@ pub fn try_handle_session_command(
                 println!("missing session id. try: /sessions use <id>");
                 return Ok(true);
             };
+            crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
+            crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
             app.session_id = id.to_string();
             app.session_history_file = store.session_history_file(id);
             println!("Switched session: {}", id);
@@ -111,9 +117,12 @@ pub fn try_handle_session_command(
                 println!("missing session id. try: /sessions delete <id>");
                 return Ok(true);
             };
+            let deleted_path = store.session_history_file(id);
             let deleted = store.delete_session(id)?;
             if deleted {
+                crate::ai::history::invalidate_context_history_cache_for(&deleted_path);
                 if id == app.session_id {
+                    crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
                     let new_id = Uuid::new_v4().to_string();
                     app.session_id = new_id.clone();
                     app.session_history_file = store.session_history_file(&new_id);
@@ -194,6 +203,10 @@ pub fn try_handle_session_command(
             }
 
             store.clear_session_history(&app.session_id)?;
+            // 清掉关联的 history cache 与 explicit-enabled tools，避免下个 turn
+            // 命中陈旧缓存或携带已经无意义的工具列表。
+            crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
+            crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
             if let Some(ctx) = app.agent_context.as_mut() {
                 ctx.tools.clear();
             }
@@ -212,6 +225,8 @@ pub fn try_handle_session_command(
             }
 
             let deleted = store.clear_all_sessions()?;
+            crate::ai::history::clear_context_history_cache();
+            crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
             let new_id = Uuid::new_v4().to_string();
             app.session_id = new_id.clone();
             app.session_history_file = store.session_history_file(&new_id);
@@ -232,6 +247,10 @@ pub fn try_handle_session_command(
             let dst_id = dst.unwrap_or_else(|| Uuid::new_v4().to_string());
             match store.fork_session(&src_id, &dst_id) {
                 Ok(()) => {
+                    crate::ai::history::invalidate_context_history_cache_for(
+                        &app.session_history_file,
+                    );
+                    crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
                     app.session_id = dst_id.clone();
                     app.session_history_file = store.session_history_file(&dst_id);
                     if let Some(ctx) = app.agent_context.as_mut() {

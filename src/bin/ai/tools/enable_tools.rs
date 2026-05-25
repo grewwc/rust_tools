@@ -17,6 +17,17 @@ static ACTIVE_TOOL_NAMES: LazyLock<Mutex<Vec<String>>> =
 static EXPLICIT_ENABLED_TOOL_NAMES: LazyLock<Mutex<Vec<String>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
+/// 每个 explicit-enabled tool 的"未使用计数"。
+/// 每个 turn 末由调度器调用 `age_unused_explicit_tools` 老化：
+///   - 在本 turn 被实际调用过的 tool → 计数清零
+///   - 没用过 → 计数 +1，达到 EXPLICIT_TOOL_DEMOTE_AGE 就从 explicit list demote
+/// 这样可以让"启用一次后永久焊接到所有 turn"的旧行为变成"用就保留，闲置就降级"，
+/// 减少 prompt cache 失效与 tool schema 占用。
+static EXPLICIT_TOOL_AGE: LazyLock<Mutex<rustc_hash::FxHashMap<String, u32>>> =
+    LazyLock::new(|| Mutex::new(rustc_hash::FxHashMap::default()));
+
+const EXPLICIT_TOOL_DEMOTE_AGE: u32 = 4;
+
 static AVAILABLE_MCP_TOOLS: LazyLock<Mutex<Vec<ToolDefinition>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -37,6 +48,53 @@ pub(crate) fn explicit_enabled_tool_names() -> Vec<String> {
         .lock()
         .map(|guard| guard.clone())
         .unwrap_or_default()
+}
+
+/// 清空 explicit-enabled tool 列表。
+/// 由 session 切换 / clear-history 等流程调用，避免上一 session 启用过的 tool
+/// 永久焊接到后续所有 session 的请求 tools 数组（每个 schema 几百~上千 token，
+/// 还会让 prompt cache 失效）。
+pub(crate) fn clear_explicitly_enabled_tools() {
+    if let Ok(mut guard) = EXPLICIT_ENABLED_TOOL_NAMES.lock() {
+        guard.clear();
+    }
+    if let Ok(mut guard) = EXPLICIT_TOOL_AGE.lock() {
+        guard.clear();
+    }
+}
+
+/// 在 turn 末调用：把"本 turn 被实际调用过"的 explicit tool 计数清零，
+/// 其它 explicit tool 计数 +1；超过 `EXPLICIT_TOOL_DEMOTE_AGE` 就从 explicit
+/// list 中 demote。
+///
+/// 这是对"enable_tools 一旦启用就永久挂载"行为的温和约束：用就保留，闲置就降级。
+pub(crate) fn age_unused_explicit_tools(used_in_turn: &[String]) {
+    let Ok(mut names) = EXPLICIT_ENABLED_TOOL_NAMES.lock() else {
+        return;
+    };
+    let Ok(mut ages) = EXPLICIT_TOOL_AGE.lock() else {
+        return;
+    };
+    // 1. 老化或清零
+    let mut to_remove: Vec<String> = Vec::new();
+    for name in names.iter() {
+        if used_in_turn.iter().any(|u| u == name) {
+            ages.insert(name.clone(), 0);
+        } else {
+            let entry = ages.entry(name.clone()).or_insert(0);
+            *entry = entry.saturating_add(1);
+            if *entry >= EXPLICIT_TOOL_DEMOTE_AGE {
+                to_remove.push(name.clone());
+            }
+        }
+    }
+    // 2. demote
+    if !to_remove.is_empty() {
+        names.retain(|n| !to_remove.contains(n));
+        for n in &to_remove {
+            ages.remove(n);
+        }
+    }
 }
 
 fn mark_explicitly_enabled_tools(names: &[String]) {

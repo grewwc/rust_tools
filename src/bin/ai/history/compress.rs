@@ -9,6 +9,50 @@ use super::types::{
 };
 
 const PERSISTED_HISTORY_KEEP_RECENT_TURNS: usize = 160;
+
+/// 暴露给同 crate 的常量访问器，避免在 mod.rs 中复制阈值数字。
+pub(in crate::ai) fn persisted_history_keep_recent_turns() -> usize {
+    PERSISTED_HISTORY_KEEP_RECENT_TURNS
+}
+
+/// messages 数组中保留的 self_note 最大条数。
+/// self_note 已经被持久化到 MemoryStore（`memory_store::AgentMemoryEntry`），
+/// messages 里那条仅是同 turn 内被 LLM 看到的"冗余 inline 副本"。
+/// 长 session 累计上千 turn 时这些 inline 副本会单调膨胀，需要滑窗剪裁。
+const MAX_SELF_NOTES_IN_MESSAGES: usize = 8;
+
+/// 仅保留最近 `keep_recent` 条 internal_note 中的 `self_note:` 条目。
+/// 其他 internal_note（如 cache 提示、loop-breaker、历史摘要）不在剪裁范围。
+fn trim_self_notes_to_recent(messages: Vec<Message>, keep_recent: usize) -> Vec<Message> {
+    let total_self_notes = messages
+        .iter()
+        .filter(|m| is_self_note_message(m))
+        .count();
+    if total_self_notes <= keep_recent {
+        return messages;
+    }
+    let drop_count = total_self_notes - keep_recent;
+    let mut dropped = 0usize;
+    messages
+        .into_iter()
+        .filter(|m| {
+            if is_self_note_message(m) && dropped < drop_count {
+                dropped += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .collect()
+}
+
+fn is_self_note_message(m: &Message) -> bool {
+    if m.role != ROLE_INTERNAL_NOTE {
+        return false;
+    }
+    let s = value_to_string(&m.content);
+    s.trim_start().starts_with("self_note:")
+}
 const PERSISTED_HISTORY_SUMMARY_MAX_CHARS: usize = 8_000;
 const OVERFLOW_HISTORY_FILENAME: &str = "overflow-history.md";
 
@@ -108,6 +152,11 @@ pub(in crate::ai) fn compress_messages_for_context(
     if max_chars == 0 || messages.is_empty() {
         return messages;
     }
+
+    // 在做大块压缩前先剪 self_note 滑动上限，避免上千轮 turn 累积的
+    // self_note（已写入 MemoryStore，messages 里那条仅是冗余备份）
+    // 单调膨胀。MemoryStore 仍保留全部记录。
+    let messages = trim_self_notes_to_recent(messages, MAX_SELF_NOTES_IN_MESSAGES);
 
     let keep_last = keep_last.min(messages.len());
     if keep_last == 0 {
@@ -503,6 +552,14 @@ pub(in crate::ai) fn mid_turn_compress(
         return (messages, before, before);
     }
     let mut out = messages;
+    // 0. 清理过期 reasoning_content：单 turn 内 LLM 多次返回的 reasoning chain
+    //    对后续决策无益，但部分厂商要求历史 reasoning 与 tool_calls 配对。
+    //    只保留最后一条 assistant 的 reasoning_content，其余置 None。
+    keep_only_recent_reasoning_content(&mut out);
+    if messages_total_chars(&out) <= soft_threshold {
+        let after = messages_total_chars(&out);
+        return (out, before, after);
+    }
     // 1. 同 signature 工具结果去重
     dedup_repeated_tool_results(&mut out);
     if messages_total_chars(&out) <= soft_threshold {
@@ -567,10 +624,17 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     (out, before, after, true)
 }
 
+/// 返回 Value 内容的字符数（Unicode scalar 数）。
+/// 历史上这里返回的是 byte length，导致中文/emoji 场景下字符预算被高估 ~3 倍：
+/// 例如 36K 字符的软阈值在中文 turn 下会被 12K 字符就误触发，反复跑压缩管线。
+/// 现在统一按 `chars().count()` 计量，与外层 `cap_chars`、`max_chars`
+/// 阈值的命名保持一致。
 fn value_len_chars(v: &Value) -> usize {
-    v.as_str()
-        .map(|s| s.len())
-        .unwrap_or_else(|| v.to_string().len())
+    if let Some(s) = v.as_str() {
+        s.chars().count()
+    } else {
+        v.to_string().chars().count()
+    }
 }
 
 pub(in crate::ai) fn value_to_string(v: &Value) -> String {
@@ -1549,11 +1613,25 @@ fn tool_message_indices(messages: &[Message]) -> Vec<usize> {
         .collect()
 }
 
+/// 判断 message content 是否包含真正的图片附件（OpenAI Vision schema）。
+/// 图片必须以 multimodal `Value::Array` 形式存在，且数组中含
+/// `{"type":"image_url", "image_url":{...}}`。
+/// 旧实现用 `text.contains("data:image/")` 误判：agent 在普通文本里讨论
+/// `data:image/png` 字串就会被整条替换，丢信息。
+fn message_contains_image(content: &Value) -> bool {
+    let Some(arr) = content.as_array() else {
+        return false;
+    };
+    arr.iter().any(|item| {
+        item.get("type").and_then(|v| v.as_str()) == Some("image_url")
+            || item.get("image_url").is_some()
+    })
+}
+
 fn redact_images_except_last(messages: &mut [Message], keep_last: usize) {
     let mut indices = Vec::new();
     for (i, m) in messages.iter().enumerate() {
-        let text = value_to_string(&m.content);
-        if text.contains("data:image/") {
+        if message_contains_image(&m.content) {
             indices.push(i);
         }
     }

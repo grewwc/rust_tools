@@ -687,21 +687,29 @@ fn build_system_prompt(
 ) -> SystemPromptBuilder {
     let mut b = SystemPromptBuilder::new();
 
-    b.push(ContextKind::Identity, "You are a highly capable general-purpose AI assistant. You help users plan, research, write, analyze, and act across any domain — code is one of many, not the only one. Adapt your approach to the task at hand: use code/tooling when the request is technical, and plain reasoning or research when it is not. Aim to be sharp and to the point — answer what was asked, not more.");
+    // Identity 段：合并通用 identity + agent / skill enforcement，避免 4 段
+    // 重复 "you must follow ..." 充斥 prompt cache。
+    let mut identity = String::from("You are a highly capable general-purpose AI assistant. You help users plan, research, write, analyze, and act across any domain — code is one of many, not the only one. Adapt your approach to the task at hand: use code/tooling when the request is technical, and plain reasoning or research when it is not. Aim to be sharp and to the point — answer what was asked, not more.");
 
-    if let Some(agent) = active_agent {
-        let extra = agent.build_system_prompt();
-        if !extra.trim().is_empty() {
-            b.push(ContextKind::Identity, format!("Agent enforcement:\n- You MUST follow the active agent profile for behavior, workflow, and safety boundaries.\n- Treat the active agent as the default operating mode for this turn.\n- When a skill is also active, satisfy both the agent profile and the skill instructions.\n\n{}", extra.trim()));
-        }
+    let agent_extra = active_agent
+        .map(|agent| agent.build_system_prompt())
+        .filter(|s| !s.trim().is_empty());
+    let skill_extra = skill
+        .map(|skill| skill.build_system_prompt())
+        .filter(|s| !s.trim().is_empty());
+
+    if agent_extra.is_some() || skill_extra.is_some() {
+        identity.push_str("\n\nEnforcement: follow the active agent profile (if any) and skill instructions (if any) precisely; if both are active, satisfy both; on conflict with the user request, ask one brief clarification aligned with the more specific (skill > agent) layer.");
     }
-    if let Some(skill) = skill {
-        b.push(ContextKind::Identity, "Skill enforcement:\n- You MUST follow the active skill instructions precisely.\n- Do not ignore, weaken, or bypass the skill behavior.\n- If the user request conflicts with the skill, ask a brief clarification aligned with the skill.");
-        let extra = skill.build_system_prompt();
-        if !extra.trim().is_empty() {
-            b.push(ContextKind::Identity, extra.trim());
-        }
+    if let Some(extra) = agent_extra {
+        identity.push_str("\n\n[Agent profile]\n");
+        identity.push_str(extra.trim());
     }
+    if let Some(extra) = skill_extra {
+        identity.push_str("\n\n[Skill instructions]\n");
+        identity.push_str(extra.trim());
+    }
+    b.push(ContextKind::Identity, identity);
 
     b.push(ContextKind::Behavior, "Response style:\n- Lead with the answer or the action; skip preamble, restating the question, and meta commentary like \"Let me…\" / \"I'll now…\".\n- One sentence beats three. Drop filler, transitions, and recaps the user can already see.\n- Default to short, direct prose. Use lists/sections only when they materially help; never pad output to look thorough.\n- Do not narrate tool calls before or after running them — let the calls and their results speak. A brief status line is only appropriate at real milestones or when a plan changes.\n- Conciseness must NOT come at the cost of correctness: for non-trivial requests, think the problem through (read code, check facts) BEFORE answering. If you are uncertain, say so in one line and gather evidence rather than guessing tersely.\n- When stating a conclusion that depends on code, cite the exact file/line; do not summarize from memory.");
     b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- If the answer depends on repo/code facts, inspect with tools before concluding.\n- If the user asks for edits, perform edits with tools instead of only describing them.\n- If the user asks to run/build/test/reproduce, run commands with tools when available.\n- On tool failure, read the error and correct course before answering. Retry with fixed args or switch tools; avoid repeating the same failing call.\n- If `code_search` returns only `No ...` results, broaden scope instead of rerunning unchanged.");
@@ -721,15 +729,20 @@ fn build_system_prompt(
     }
 
     if has_tool(available_tools, "enable_tools") {
+        // Capability catalog（如有）按 trigger→tool 给出事实性精确映射；
+        // discovery 段是 actionable 政策。两者 ContextKind 不同，挂在一起
+        // 重叠较小且各自承担不同职责（catalog 让模型知道有什么，policy
+        // 告诉模型何时去发现/启用）。保持双挂以避免回归测试用例期望的
+        // mcp 提示与 "No skill is active yet" 提示丢失。
+        if let Some(catalog) = build_capability_catalog(available_tools) {
+            b.push(ContextKind::Fact, catalog);
+        }
         let discovery_policy = if skill.is_none() {
             "Tool discovery:\n- Not all tools are loaded. Use `discover_skills` for specialized workflows, or `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for specific tools.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first.\n- No skill is active yet. For non-trivial requests, prefer calling `discover_skills` before giving a freeform response."
         } else {
             "Tool discovery:\n- Not all tools are loaded. If a capability is missing, use `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first."
         };
         b.push(ContextKind::Policy, discovery_policy);
-        if let Some(catalog) = build_capability_catalog(available_tools) {
-            b.push(ContextKind::Fact, catalog);
-        }
     }
 
     if has_tool(available_tools, "memory_save") {

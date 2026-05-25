@@ -47,8 +47,14 @@ struct ContextHistoryCacheKey {
     history_max_chars: usize,
     history_keep_last: usize,
     history_summary_max_chars: usize,
+    overflow_dir: Option<PathBuf>,
     file_len: Option<u64>,
     modified_unix_ms: Option<u128>,
+    /// SQLite `PRAGMA data_version`：每次 DB 被修改后递增。
+    /// WAL 模式下主文件 len/mtime 可能长时间不变，单独依赖文件元数据
+    /// 会让 cache 错误命中已删/已改的历史；data_version 是 SQLite
+    /// 内建的强失效信号。
+    sqlite_data_version: Option<i64>,
 }
 
 struct ContextHistoryCacheEntry {
@@ -78,6 +84,7 @@ pub(in crate::ai) fn build_context_history(
         history_max_chars,
         history_keep_last,
         history_summary_max_chars,
+        overflow_dir.as_ref(),
     );
     if let Some(cached) = try_get_cached_context_history(&cache_key) {
         return Ok(cached);
@@ -177,6 +184,7 @@ fn context_history_cache_key(
     history_max_chars: usize,
     history_keep_last: usize,
     history_summary_max_chars: usize,
+    overflow_dir: Option<&PathBuf>,
 ) -> ContextHistoryCacheKey {
     let metadata = std::fs::metadata(history_file).ok();
     let file_len = metadata.as_ref().map(|m| m.len());
@@ -184,14 +192,21 @@ fn context_history_cache_key(
         .as_ref()
         .and_then(|m| m.modified().ok())
         .and_then(system_time_millis);
+    let sqlite_data_version = if blob::is_sqlite_path(history_file) {
+        sqlite::read_data_version(history_file.as_path())
+    } else {
+        None
+    };
     ContextHistoryCacheKey {
         history_file: history_file.clone(),
         history_count,
         history_max_chars,
         history_keep_last,
         history_summary_max_chars,
+        overflow_dir: overflow_dir.cloned(),
         file_len,
         modified_unix_ms,
+        sqlite_data_version,
     }
 }
 
@@ -224,6 +239,24 @@ fn store_cached_context_history(key: ContextHistoryCacheKey, value: Vec<Message>
     }
 }
 
+/// 清除指定 history_file 的所有 context 缓存条目。
+/// session 切换 / clear-history / delete 时调用，避免下个 turn 命中
+/// 已经被删/被替换的旧历史。
+pub(in crate::ai) fn invalidate_context_history_cache_for(history_file: &std::path::Path) {
+    let Ok(mut cache) = CONTEXT_HISTORY_CACHE.lock() else {
+        return;
+    };
+    cache.retain(|entry| entry.key.history_file != history_file);
+}
+
+/// 全量清空 context history 缓存。极端场景（如清理任务、单测）使用。
+#[allow(dead_code)]
+pub(in crate::ai) fn clear_context_history_cache() {
+    if let Ok(mut cache) = CONTEXT_HISTORY_CACHE.lock() {
+        cache.clear();
+    }
+}
+
 pub(in crate::ai) async fn compact_session_history_with_app(
     app: &App,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -243,6 +276,21 @@ async fn compact_session_history_with_app_inner(
     at_boundary: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let history_file = &app.session_history_file;
+    // === 增量游标式快路径 ===
+    // 99% 的 turn 收尾时，user_turns 远低于压缩阈值，根本不需要全量读。
+    // 这里先做廉价的 COUNT，未达阈值直接返回，避免反序列化几十 MB 的 tool 输出。
+    if blob::is_sqlite_path(history_file) {
+        let user_turns = sqlite::count_user_turns_sqlite(history_file.as_path())?;
+        let threshold = if at_boundary {
+            crate::ai::history::compress::persisted_history_keep_recent_turns()
+        } else {
+            MAX_HISTORY_TURNS
+        };
+        if user_turns <= threshold {
+            return Ok(());
+        }
+    }
+
     let messages = if blob::is_sqlite_path(history_file) {
         sqlite::build_message_arr_sqlite(usize::MAX, history_file.as_path())?
     } else {
