@@ -102,6 +102,33 @@ pub(super) fn print_tool_result_preview(_tool_name: &str, prepared: &PreparedToo
     print_tool_output_block(&prepared.content_for_terminal);
 }
 
+/// 智能截断到最近一处句子边界（中英文兼容），并附 `…[truncated: N chars omitted]`
+/// 显式标记，避免后续 agent 误以为这是完整 narration。
+/// 在目标 cap 附近的 [cap*0.6, cap] 区间里找句号/换行；如果找不到则退化为按字符 cap 切。
+fn smart_truncate_to_sentence(text: &str, cap_chars: usize) -> String {
+    let total = text.chars().count();
+    if total <= cap_chars {
+        return text.to_string();
+    }
+    // 句子边界候选字符（中英文都覆盖）
+    const BOUNDARY_CHARS: &[char] = &['。', '！', '？', '\n', '.', '!', '?'];
+    // 在 [cap*0.6, cap] 区间里找最靠右的边界——窗口宽到 40% 才能在
+    // 较短 narration 里大概率命中至少一个 sentence break。
+    let lower = cap_chars * 6 / 10;
+    let mut last_boundary: Option<usize> = None;
+    let chars: Vec<char> = text.chars().take(cap_chars).collect();
+    for (i, ch) in chars.iter().enumerate() {
+        if i >= lower && BOUNDARY_CHARS.contains(ch) {
+            last_boundary = Some(i + 1); // 含边界字符本身
+        }
+    }
+    let cut = last_boundary.unwrap_or(cap_chars);
+    let mut out: String = text.chars().take(cut).collect();
+    let omitted = total - cut;
+    out.push_str(&format!("…[truncated: {omitted} chars omitted]"));
+    out
+}
+
 pub(super) fn append_tool_result_messages(
     app: &mut App,
     stream_assistant_text: &str,
@@ -111,15 +138,13 @@ pub(super) fn append_tool_result_messages(
     turn_messages: &mut Vec<Message>,
 ) {
     // 截断 tool-call 前的 assistant narration：纯叙述对后续轮次价值有限，
-    // 多轮叠加后会大幅膨胀上下文，对最终回答几乎没有帮助。保留前 800 字。
+    // 多轮叠加后会大幅膨胀上下文，对最终回答几乎没有帮助。
+    // 智能截断：优先回退到最近一处句子边界（。！？.!?\n），保证不腰斩半句话；
+    // 仍然把 cap 控制在 800 字附近，且加 `…[truncated]` 显式标记，
+    // 避免后续 agent 误以为这是完整 narration。
     const TOOL_CALL_NARRATION_MAX_CHARS: usize = 800;
     let narration = if stream_assistant_text.chars().count() > TOOL_CALL_NARRATION_MAX_CHARS {
-        let mut out: String = stream_assistant_text
-            .chars()
-            .take(TOOL_CALL_NARRATION_MAX_CHARS)
-            .collect();
-        out.push('…');
-        out
+        smart_truncate_to_sentence(stream_assistant_text, TOOL_CALL_NARRATION_MAX_CHARS)
     } else {
         stream_assistant_text.to_string()
     };
@@ -632,6 +657,7 @@ fn truncate_note(value: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::smart_truncate_to_sentence;
     use super::{
         build_code_inspection_working_memory, build_persistent_code_discoveries,
         classify_code_discovery, is_repo_inspection_tool, persistent_code_discovery_already_present,
@@ -656,6 +682,41 @@ mod tests {
     #[test]
     fn repo_inspection_tools_include_code_search() {
         assert!(is_repo_inspection_tool("code_search"));
+    }
+
+    #[test]
+    fn smart_truncate_falls_back_to_sentence_boundary() {
+        // cap=80, lower=80*6/7≈68. 句号位置：22 / 49 / 71 / 后续。
+        let text =
+            "Step one finished ok. Step two searched repo. Step three is running. \
+             Step four extends well beyond the cap.";
+        let out = smart_truncate_to_sentence(text, 80);
+        assert!(out.contains("[truncated: "), "expected marker, got: {out}");
+        // 应切到位置 71（"is running."）之后，包含 "is running."；
+        // 不应留下半句 "Step four"
+        assert!(
+            out.contains("is running."),
+            "expected boundary fallback to '. ', got: {out}"
+        );
+        assert!(
+            !out.contains("Step four"),
+            "should not include next sentence, got: {out}"
+        );
+    }
+
+    #[test]
+    fn smart_truncate_falls_back_to_char_cap_when_no_boundary() {
+        // 整段没有任何句号/换行：必须退化为按字符 cap 切并加显式标记。
+        let text = "x".repeat(200);
+        let out = smart_truncate_to_sentence(&text, 50);
+        assert!(out.starts_with(&"x".repeat(50)));
+        assert!(out.contains("[truncated:"));
+    }
+
+    #[test]
+    fn smart_truncate_returns_input_when_under_cap() {
+        let text = "short text";
+        assert_eq!(smart_truncate_to_sentence(text, 100), text);
     }
 
     #[test]

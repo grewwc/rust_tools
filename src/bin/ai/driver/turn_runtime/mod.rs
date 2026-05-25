@@ -42,6 +42,20 @@ const TOOL_OVERFLOW_PREVIEW_CHARS: usize = 800;
 /// 类工具走"头 + 关键命中 + 尾"的按行裁剪，避免完整 32KB 全部进上下文。
 const MAX_TOOL_RESULT_LINE_TRIM_CHARS: usize = 8_000;
 
+/// Mid-turn 渐进式压缩：messages 总字符数超过该阈值时，在 iteration loop 内
+/// 复用跨 turn 压缩管线，避免单 turn 长链工具调用把上下文撑爆。
+/// 设为 history_max_chars 默认值的 1.5 倍（24K * 1.5 = 36K），低于这个值时
+/// 几乎所有典型 turn（≤16 轮，每轮 1.5K）都不会触发，零开销。
+pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_SOFT_THRESHOLD: usize = 36_000;
+/// Mid-turn LLM 摘要硬阈值：经过无损/弱损压缩后仍超过该值，触发 LLM summary
+/// 兜底（会调用一次模型，并显示 "🗜️ compressing context..." 状态行）。
+pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_HARD_THRESHOLD: usize = 80_000;
+/// LLM 摘要兜底时保留尾部窗口的 user 起始轮数。早期超过此窗口的对话被压成
+/// 一条 internal_note 摘要插入到尾部窗口前。
+pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS: usize = 2;
+/// LLM 摘要文本的最大字符数。
+pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_MAX_CHARS: usize = 4_000;
+
 pub(in crate::ai) use debug::report_agent_hang_debug;
 
 #[cfg(test)]

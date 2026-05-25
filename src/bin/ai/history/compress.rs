@@ -481,6 +481,92 @@ fn messages_total_chars(messages: &[Message]) -> usize {
         .sum::<usize>()
 }
 
+/// Public proxy of [`messages_total_chars`] for callers in other ai modules
+/// (e.g. mid-turn compression in `turn_runtime`) that need to check budget
+/// without re-implementing the same accounting.
+pub(in crate::ai) fn messages_total_chars_pub(messages: &[Message]) -> usize {
+    messages_total_chars(messages)
+}
+
+/// Mid-turn 渐进式压缩：在 iteration loop 中复用跨 turn 压缩管线的前几档。
+/// 只做"无损/弱损"操作，不动 system / 不删除最近 keep_recent 条工具消息：
+///   1. dedup_repeated_tool_results — 同 (tool, args) 旧结果折叠为 stub
+///   2. prepare_tool_messages_structured — 远端 tool 结果按行裁剪到 480 字
+///   3. fold_tool_call_group_to_stub  — 仍超额：远端整组 (assistant + tool) 折叠
+/// 返回：(messages_after, before_chars, after_chars)
+pub(in crate::ai) fn mid_turn_compress(
+    messages: Vec<Message>,
+    soft_threshold: usize,
+) -> (Vec<Message>, usize, usize) {
+    let before = messages_total_chars(&messages);
+    if before <= soft_threshold {
+        return (messages, before, before);
+    }
+    let mut out = messages;
+    // 1. 同 signature 工具结果去重
+    dedup_repeated_tool_results(&mut out);
+    if messages_total_chars(&out) <= soft_threshold {
+        let after = messages_total_chars(&out);
+        return (out, before, after);
+    }
+    // 2. 远端结构化裁剪：tool 结果中段按行折叠到 480 字/条，最近 6 条保留全文
+    prepare_tool_messages_structured(&mut out, 480, 6);
+    if messages_total_chars(&out) <= soft_threshold {
+        let after = messages_total_chars(&out);
+        return (out, before, after);
+    }
+    // 3. 仍超额：用 shrink_messages_to_fit 走"折叠 tool group + 整体兜底"
+    out = shrink_messages_to_fit(out, soft_threshold);
+    let after = messages_total_chars(&out);
+    (out, before, after)
+}
+
+/// Mid-turn LLM 摘要兜底：当无损管线后仍超过 hard_threshold 时调用。
+/// 行为：
+///   - 保留 system + 最近 `keep_recent_turns` 个 user 起始的尾部窗口
+///   - 把更早的部分（仅当至少含一个 user/assistant 时）调 LLM 摘要器压缩
+///   - 摘要文本作为单条 `internal_note` 注入到尾部窗口前
+///   - 如果 LLM 调用失败或没有可摘要的早期部分，原样返回
+/// 返回 `(messages_after, before, after, did_summarize)`
+pub(in crate::ai) async fn mid_turn_llm_summarize(
+    app: &App,
+    messages: Vec<Message>,
+    keep_recent_turns: usize,
+    summary_max_chars: usize,
+) -> (Vec<Message>, usize, usize, bool) {
+    let before = messages_total_chars(&messages);
+    let split_at = retained_turn_start(&messages, keep_recent_turns);
+    if split_at == 0 || split_at >= messages.len() {
+        return (messages, before, before, false);
+    }
+    let earlier = &messages[..split_at];
+    let has_dialog = earlier
+        .iter()
+        .any(|m| m.role == "user" || m.role == "assistant");
+    if !has_dialog {
+        return (messages, before, before, false);
+    }
+
+    let summary = build_persisted_summary_text_with_app(app, earlier, summary_max_chars).await;
+    if summary.trim().is_empty() {
+        return (messages, before, before, false);
+    }
+
+    let mut out = Vec::with_capacity(messages.len() - split_at + 1);
+    out.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(format!(
+            "[mid-turn-summary] 早期工具调用与对话已被 LLM 摘要：\n{summary}"
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    out.extend_from_slice(&messages[split_at..]);
+    let after = messages_total_chars(&out);
+    (out, before, after, true)
+}
+
 fn value_len_chars(v: &Value) -> usize {
     v.as_str()
         .map(|s| s.len())

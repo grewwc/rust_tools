@@ -19,6 +19,8 @@ pub(in crate::ai) use compress::compress_messages_for_context;
 #[allow(unused_imports)]
 pub(in crate::ai) use compress::value_to_string;
 #[allow(unused_imports)]
+pub(in crate::ai) use compress::{messages_total_chars_pub, mid_turn_compress, mid_turn_llm_summarize};
+#[allow(unused_imports)]
 pub(in crate::ai) use markdown::messages_to_markdown;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
