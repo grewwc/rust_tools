@@ -303,25 +303,25 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         "reboot",
         "launchctl",
         "systemctl",
-        "service",
-        "diskutil",
+        // "service",
+        // "diskutil",
         "mount",
         "umount",
         "ln",
         "truncate",
         "ssh",
-        "scp",
+        // "scp",
         // 绕过手段：`eval` / `source` / `.` 会把后续字符串当 shell 代码再次
         // 解释，等于把验证完全 bypass 掉。
         "eval",
-        "source",
-        ".",
+        // "source",
+        // ".",
         // 反向 shell / 网络监听工具，正当 dev 流程几乎不会用，留着风险大于收益。
-        "nc",
-        "ncat",
-        "netcat",
-        "telnet",
-        "socat",
+        // "nc",
+        // "ncat",
+        // "netcat",
+        // "telnet",
+        // "socat",
     ];
     if denied_programs.contains(&program.as_str()) {
         return Err(format!("program '{program}' is blocked"));

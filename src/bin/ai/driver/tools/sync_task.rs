@@ -25,7 +25,10 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -44,11 +47,6 @@ use super::super::runtime_ctx::DriverContext;
 /// turn forever. 10 minutes is generous for a single subagent invocation
 /// while still being shorter than typical interactive patience.
 const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(600);
-/// 兜底周期，覆盖外部代码直接 `.store(true)` 但未触发 `REQUEST_INTERRUPT_NOTIFY`
-/// 的边缘情况。绝大多数场景由 oneshot 完成或 Notify 即时唤醒，无需依赖此兜底。
-/// 旧实现是 50ms 紧凑轮询；改成 500ms 后空闲 wake-up 频次降低 10×，
-/// 同时保留对未发 Notify 的 atomic 写入的最坏 500ms 反应延迟。
-const SYNC_TASK_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(super) fn execute_sync_task(
     tool_call_id: &str,
@@ -196,59 +194,21 @@ pub(super) fn execute_sync_task(
 
     tokio::spawn(runtime_ctx::DRIVER_CTX.scope(spawn_driver_ctx, wrapped));
 
-    // Wait for the sub-agent in a loop that also honours shutdown,
-    // cancel_stream and a hard timeout. 之前是 50ms 紧凑轮询，改成
-    // `tokio::select!` 监听三路事件：
-    //   1) sub-agent 的 oneshot::Receiver 完成；
-    //   2) 信号模块的 REQUEST_INTERRUPT_NOTIFY（ctrl-c → cancel_stream/shutdown 同时发 notify）；
-    //   3) 兜底 `tokio::time::sleep(SYNC_TASK_FALLBACK_POLL_INTERVAL)`，覆盖
-    //      外部代码直接 `.store(true)` 但未触发 Notify 的极少数场景，并兜底 hard timeout。
-    // 这样空闲时不再每 50ms 醒来一次，硬中断能立刻感知。
+    // 等待 sub-agent：只由三个事件驱动，不再 50ms 轮询。
+    //   1. sub-agent oneshot 返回；
+    //   2. 父 agent 的 cancel/shutdown 通过 REQUEST_INTERRUPT_NOTIFY 唤醒；
+    //   3. hard timeout 到期。
+    //
+    // atomic flag 只作为条件判断，不作为唤醒机制；正常写入 cancel/shutdown 的入口
+    // 必须调用 signal_request_interrupt()/request_shutdown() 发送 Notify。
     let join_result: Result<Result<(), String>, String> =
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async move {
-                let mut rx = rx;
-                let interrupt_notify =
-                    crate::ai::driver::signal::request_interrupt_notify();
-                loop {
-                    if parent_shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-                        return Err("subagent task aborted: parent shutdown requested".to_string());
-                    }
-                    if parent_cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        return Err("subagent task aborted: stream cancel requested".to_string());
-                    }
-                    let elapsed = started.elapsed();
-                    if elapsed >= SYNC_TASK_HARD_TIMEOUT {
-                        return Err(format!(
-                            "subagent task exceeded hard timeout of {}s",
-                            SYNC_TASK_HARD_TIMEOUT.as_secs()
-                        ));
-                    }
-                    let remaining = SYNC_TASK_HARD_TIMEOUT - elapsed;
-                    let fallback = SYNC_TASK_FALLBACK_POLL_INTERVAL.min(remaining);
-                    // 注册 notified 之前再做一次 atomic 检查，避免 Notify 与
-                    // store(true) 之间的 race。
-                    let notified = interrupt_notify.notified();
-                    if parent_shutdown.load(std::sync::atomic::Ordering::Relaxed)
-                        || parent_cancel.load(std::sync::atomic::Ordering::Relaxed)
-                    {
-                        continue;
-                    }
-                    tokio::select! {
-                        biased;
-                        res = &mut rx => {
-                            return match res {
-                                Ok(inner) => Ok(inner),
-                                Err(e) => Err(format!(
-                                    "subagent task channel closed before result: {e}"
-                                )),
-                            };
-                        }
-                        _ = notified => { continue; }
-                        _ = tokio::time::sleep(fallback) => { continue; }
-                    }
-                }
-            })
+            tokio::runtime::Handle::current().block_on(wait_for_sync_task_completion(
+                rx,
+                parent_shutdown,
+                parent_cancel,
+                SYNC_TASK_HARD_TIMEOUT,
+            ))
         });
 
     let duration = started.elapsed();
@@ -297,6 +257,55 @@ pub(super) fn execute_sync_task(
     }
 }
 
+async fn wait_for_sync_task_completion(
+    mut rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    parent_shutdown: Arc<AtomicBool>,
+    parent_cancel: Arc<AtomicBool>,
+    hard_timeout: Duration,
+) -> Result<Result<(), String>, String> {
+    let wait_for_result = async {
+        let interrupt_notify = crate::ai::driver::signal::request_interrupt_notify();
+        loop {
+            if parent_shutdown.load(Ordering::Relaxed) {
+                return Err("subagent task aborted: parent shutdown requested".to_string());
+            }
+            if parent_cancel.load(Ordering::Relaxed) {
+                return Err("subagent task aborted: stream cancel requested".to_string());
+            }
+
+            // 先注册 Notify future，再复查 atomic，避免 signal 在检查和
+            // 注册之间发生时丢唤醒。
+            let notified = interrupt_notify.notified();
+            if parent_shutdown.load(Ordering::Relaxed) || parent_cancel.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            tokio::select! {
+                biased;
+                res = &mut rx => {
+                    return match res {
+                        Ok(inner) => Ok(inner),
+                        Err(e) => Err(format!(
+                            "subagent task channel closed before result: {e}"
+                        )),
+                    };
+                }
+                _ = notified => {
+                    continue;
+                }
+            }
+        }
+    };
+
+    match tokio::time::timeout(hard_timeout, wait_for_result).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "subagent task exceeded hard timeout of {}s",
+            hard_timeout.as_secs()
+        )),
+    }
+}
+
 /// Build the textual representation returned to the parent agent. Always
 /// includes the captured sub-agent output when available, so the parent
 /// actually sees what the sub-agent produced instead of just a status
@@ -341,4 +350,71 @@ fn subagent_history_path(base: &std::path::Path, task_id: &str) -> PathBuf {
         .map(|name| format!("{name}.subagent-{task_id}"))
         .unwrap_or_else(|| format!("session.subagent-{task_id}"));
     base.with_file_name(file_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn flags() -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+        (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    #[tokio::test]
+    async fn sync_task_wait_returns_subagent_result() {
+        let (shutdown, cancel) = flags();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(Ok(())).unwrap();
+
+        let result =
+            wait_for_sync_task_completion(rx, shutdown, cancel, Duration::from_secs(1)).await;
+
+        assert_eq!(result, Ok(Ok(())));
+    }
+
+    #[tokio::test]
+    async fn sync_task_wait_wakes_on_cancel_notify() {
+        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        crate::ai::driver::signal::clear_request_interrupt();
+        let (shutdown, cancel) = flags();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let cancel_for_trigger = cancel.clone();
+
+        let waiter = tokio::spawn(wait_for_sync_task_completion(
+            rx,
+            shutdown,
+            cancel,
+            Duration::from_secs(5),
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel_for_trigger.store(true, Ordering::Relaxed);
+        crate::ai::driver::signal::signal_request_interrupt();
+
+        let result = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("sync task wait should wake from Notify")
+            .expect("wait task should not panic");
+        assert_eq!(
+            result,
+            Err("subagent task aborted: stream cancel requested".to_string())
+        );
+        crate::ai::driver::signal::clear_request_interrupt();
+    }
+
+    #[tokio::test]
+    async fn sync_task_wait_respects_hard_timeout() {
+        let (shutdown, cancel) = flags();
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+
+        let result =
+            wait_for_sync_task_completion(rx, shutdown, cancel, Duration::from_millis(10)).await;
+
+        assert_eq!(
+            result,
+            Err("subagent task exceeded hard timeout of 0s".to_string())
+        );
+    }
 }
