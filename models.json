@@ -54,16 +54,6 @@
     "enable_thinking": false
   },
   {
-    "key": "MINIMAX",
-    "name": "MiniMax-M2.5",
-    "provider": "opencode",
-    "quality_tier": "strong",
-    "is_vl": true,
-    "search_enabled": false,
-    "tools_default_enabled": true,
-    "enable_thinking": true
-  },
-  {
     "key": "qwen-open",
     "name": "qwen3.5-397b-a17b",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
@@ -74,29 +64,8 @@
     "enable_thinking": true
   },
   {
-    "key": "LOCAL_QWEN3.5_4B",
-    "name": "qwen3.5:4b",
-    "provider": "openai",
-    "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
-    "quality_tier": "basic",
-    "is_vl": true,
-    "search_enabled": false,
-    "tools_default_enabled": true,
-    "enable_thinking": false
-  },
-  {
     "key": "MiniMax M2.5 Free",
     "name": "minimax-m2.5-free",
-    "provider": "opencode",
-    "quality_tier": "basic",
-    "is_vl": false,
-    "search_enabled": false,
-    "tools_default_enabled": true,
-    "enable_thinking": true
-  },
-  {
-    "key": "Nemotron 3 Super Free",
-    "name": "nemotron-3-super-free",
     "provider": "opencode",
     "quality_tier": "basic",
     "is_vl": false,

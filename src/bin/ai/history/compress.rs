@@ -9,6 +9,20 @@ use super::types::{
 };
 
 const PERSISTED_HISTORY_KEEP_RECENT_TURNS: usize = 160;
+/// 压缩兜底（first_trim_candidate）时保护最近 user 起始尾窗的动态上下限。
+/// 小上下文优先保留 3 轮提升多阶段任务连续性；超大上下文回退到 2 轮控预算。
+const KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MIN: usize = 2;
+const KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX: usize = 3;
+/// 当上下文字符数不超过该阈值时，优先保留 3 轮 user。
+const KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS: usize = 48_000;
+
+fn keep_recent_user_turns_when_trimming(messages: &[Message]) -> usize {
+    if messages_total_chars(messages) <= KEEP_THREE_RECENT_USER_TURNS_MAX_CHARS {
+        KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MAX
+    } else {
+        KEEP_RECENT_USER_TURNS_WHEN_TRIMMING_MIN
+    }
+}
 
 /// 暴露给同 crate 的常量访问器，避免在 mod.rs 中复制阈值数字。
 pub(in crate::ai) fn persisted_history_keep_recent_turns() -> usize {
@@ -1550,17 +1564,15 @@ fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> {
 }
 
 fn first_trim_candidate(messages: &[Message]) -> Option<usize> {
-    let protected_tail_start = messages
-        .iter()
-        .rposition(|m| m.role == "user")
-        .unwrap_or(messages.len());
+    let keep_recent_user_turns = keep_recent_user_turns_when_trimming(messages);
+    let protected_tail_start = retained_turn_start(messages, keep_recent_user_turns);
 
     // 跳过头部所有 system-like（system / internal_note）消息：它们承载 agent
     // 指令、工具列表、历史摘要等关键上下文，不能被裁掉。
     // 旧实现只跳过以"对话摘要/历史摘要"前缀开头的条目，会把普通 system prompt
     // 当成可裁削目标，触发"上下文压缩后回复戛然而止"。
-    // 同时把最新 user 起始的整段尾部窗口都设为保护区，避免把最新任务与其
-    // 后续 assistant/tool 上下文切开。
+    // 同时把最近 N 轮 user 起始的整段尾部窗口都设为保护区，避免把多阶段任务
+    // 的上一个子目标与当前子目标切开。
     let mut index = 0usize;
     while index < messages.len() && is_system_like_role(&messages[index].role) {
         index += 1;

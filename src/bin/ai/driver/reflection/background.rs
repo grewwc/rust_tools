@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 
 use crate::ai::history::{Message, append_history_messages};
 use crate::ai::request::{self, build_content};
+use crate::ai::tools::service::memory::execute_memory_update;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use crate::ai::types::{App, ToolDefinition};
 use crate::commonw::configw;
@@ -213,9 +214,8 @@ pub(crate) async fn run_critic_revise_background(
         json!({"role":"system","content":system_c}),
         json!({"role":"user","content":critic_user}),
     ];
-    let resp_c = match background_call(&model, &messages_c).await {
-        Some(v) => v,
-        None => return,
+    let Some(resp_c) = background_call(&model, &messages_c).await else {
+        return;
     };
     let content_c = extract_back_content(&resp_c).unwrap_or_default();
     if content_c.trim().is_empty() {
@@ -259,7 +259,7 @@ pub(crate) async fn run_critic_revise_background(
         tool_call_id: None,
         reasoning_content: None,
     };
-    let _ = append_history_messages(&history_path, &[record]);
+    let _ = append_history_messages(history_path.as_path(), &[record]);
 }
 
 pub(crate) async fn run_self_reflection_background(
@@ -340,7 +340,7 @@ pub(crate) async fn run_self_reflection_background(
         tool_call_id: None,
         reasoning_content: None,
     };
-    let _ = append_history_messages(&history_path, &[record]);
+    let _ = append_history_messages(history_path.as_path(), &[record]);
     // ReflectionQuality 评分：低分仍写入但降低 priority，避免劣化召回排序
     // （只降不丢，保持原有"自我增强"行为；高分维持 150）。
     let quality = assess_reflection_quality(note);
@@ -367,7 +367,459 @@ pub(crate) async fn run_self_reflection_background(
     // 让 GC 回收它，避免新旧策略同时被召回造成 agent 行为摇摆。
     demote_contradicting_self_notes(&store, note);
     let _ = store.append(&entry);
+
+    // 用真实 turn 信号更新进化策略健康度（pass/fail），驱动 canary 升级与回滚。
+    apply_evolution_feedback(&store, q, a, had_tool);
+
+    // 若新 note 与当前激活的进化 guideline 明显冲突，回滚到上一版稳定策略。
+    maybe_rollback_promoted_guideline(&store, note);
+
+    // 经验晋升：高质量且跨轮重复出现的 self_note 提升为稳定 guideline，
+    // 让有效经验真正沉淀到长期策略层，而不是仅在短期反思层漂移。
+    maybe_promote_stable_self_note(&store, note, &quality);
+
     store.maintain_after_append();
+}
+
+fn maybe_promote_stable_self_note(
+    store: &MemoryStore,
+    note: &str,
+    quality: &super::ReflectionQuality,
+) {
+    if !quality.is_high_quality() {
+        return;
+    }
+
+    let signature = normalize_evolution_note(note);
+    if signature.is_empty() {
+        return;
+    }
+
+    let recent_self_notes = match store.entries_by_category("self_note", 200) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    let repeated_count = recent_self_notes
+        .iter()
+        .filter(|entry| normalize_evolution_note(&entry.note) == signature)
+        .count();
+    if repeated_count < 3 {
+        return;
+    }
+
+    let guidelines = reflection_evolution_guidelines(store);
+
+    // 同签名 guideline 已存在则不重复晋升。
+    let exists = guidelines
+        .iter()
+        .any(|entry| {
+            entry
+                .tags
+                .iter()
+                .any(|tag| tag == &format!("evo_sig:{signature}"))
+        });
+    if exists {
+        return;
+    }
+
+    let next_ver = next_evolution_version_from(&guidelines);
+    let has_active = has_active_guideline(&guidelines);
+    let has_canary = has_canary_guideline(&guidelines);
+    // 有 active 时只允许单 canary 在评估中，避免并发试验导致策略抖动。
+    if has_active && has_canary {
+        return;
+    }
+    let next_state = if has_active { "canary" } else { "active" };
+    let next_priority = if has_active { 155 } else { 170 };
+
+    let promoted = AgentMemoryEntry {
+        id: None,
+        timestamp: Local::now().to_rfc3339(),
+        category: "coding_guideline".to_string(),
+        note: note.trim().to_string(),
+        tags: vec![
+            "agent".to_string(),
+            "policy".to_string(),
+            "evolution_promoted".to_string(),
+            "evo:v1".to_string(),
+            "evo_stream:reflection".to_string(),
+            format!("evo_ver:{next_ver}"),
+            format!("evo_state:{next_state}"),
+            "evo_pass:0".to_string(),
+            "evo_fail:0".to_string(),
+            format!("evo_sig:{signature}"),
+        ],
+        source: Some(format!("auto_reflection_promotion:v{next_ver}")),
+        priority: Some(next_priority),
+        owner_pid: None,
+        owner_pgid: None,
+    };
+    let _ = store.append(&promoted);
+}
+
+fn apply_evolution_feedback(store: &MemoryStore, question: &str, answer: &str, had_tool: bool) {
+    let signal = evaluate_turn_feedback(question, answer, had_tool);
+
+    let guidelines = reflection_evolution_guidelines(store);
+    let target = current_canary_evolution_guideline_from(&guidelines)
+        .or_else(|| current_active_evolution_guideline_from(&guidelines));
+    let Some(target) = target else {
+        return;
+    };
+    let Some(id) = target.id.as_deref() else {
+        return;
+    };
+
+    let pass = parse_tag_u32(&target.tags, "evo_pass").unwrap_or(0);
+    let fail = parse_tag_u32(&target.tags, "evo_fail").unwrap_or(0);
+    let (pass, fail) = next_feedback_counters(pass, fail, signal);
+
+    let mut tags = upsert_tag(&target.tags, "evo_pass", &pass.to_string());
+    tags = upsert_tag(&tags, "evo_fail", &fail.to_string());
+    let _ = execute_memory_update(&serde_json::json!({
+        "id": id,
+        "tags": tags,
+    }));
+
+    let state = tag_value(&target.tags, "evo_state").unwrap_or_default();
+    if state == "canary" {
+        let active = current_active_evolution_guideline_from(&guidelines);
+        maybe_activate_canary(active, &target, pass, fail);
+    } else if state == "active" {
+        let active_ver = parse_evo_ver(&target.tags).unwrap_or(0);
+        let previous = previous_evolution_guideline_from(&guidelines, active_ver);
+        maybe_rollback_on_feedback(previous, &target, pass, fail);
+    }
+}
+
+const EVO_FEEDBACK_COUNTER_WINDOW: u32 = 12;
+const EVO_CANARY_REJECT_FAILS: u32 = 2;
+const EVO_CANARY_ACTIVATE_PASSES: u32 = 3;
+const EVO_ACTIVE_ROLLBACK_FAILS_MIN: u32 = 3;
+const EVO_ACTIVE_FAIL_MARGIN: u32 = 2;
+
+fn next_feedback_counters(pass: u32, fail: u32, signal: EvolutionFeedback) -> (u32, u32) {
+    let mut pass = pass;
+    let mut fail = fail;
+    // 固定窗口衰减：把历史累计压缩到近似最近 N 次反馈，避免旧失败长期污染。
+    if pass.saturating_add(fail) >= EVO_FEEDBACK_COUNTER_WINDOW {
+        pass /= 2;
+        fail /= 2;
+    }
+    match signal {
+        EvolutionFeedback::Pass => (pass.saturating_add(1), fail),
+        EvolutionFeedback::Fail => (pass, fail.saturating_add(1)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvolutionFeedback {
+    Pass,
+    Fail,
+}
+
+fn evaluate_turn_feedback(question: &str, answer: &str, had_tool: bool) -> EvolutionFeedback {
+    let q = question.to_lowercase();
+    let a = answer.to_lowercase();
+
+    if question_looks_like_user_correction(q.as_str()) {
+        return EvolutionFeedback::Fail;
+    }
+
+    let failure_markers = [
+        "error", "failed", "failure", "panic", "exception", "traceback", "exit code",
+        "超时", "失败", "报错", "异常", "未找到", "permission denied",
+    ];
+    if had_tool && failure_markers.iter().any(|m| a.contains(m)) {
+        return EvolutionFeedback::Fail;
+    }
+
+    if a.trim().is_empty() {
+        return EvolutionFeedback::Fail;
+    }
+    EvolutionFeedback::Pass
+}
+
+fn question_looks_like_user_correction(lower_q: &str) -> bool {
+    const CORRECTION_MARKERS: &[&str] = &[
+        "你错",
+        "不对",
+        "还是不对",
+        "请重试",
+        "重试一下",
+        "重新回答",
+        "重新生成",
+        "纠正一下",
+        "改正一下",
+        "wrong answer",
+        "incorrect",
+        "not correct",
+        "try again",
+        "redo",
+    ];
+    CORRECTION_MARKERS.iter().any(|m| lower_q.contains(m))
+}
+
+fn maybe_activate_canary(
+    active: Option<AgentMemoryEntry>,
+    canary: &AgentMemoryEntry,
+    pass: u32,
+    fail: u32,
+) {
+    // 灰度策略：连续积累正反馈后再转 active；失败过多则拒绝该 canary。
+    if fail >= EVO_CANARY_REJECT_FAILS {
+        if let Some(id) = canary.id.as_deref() {
+            let mut tags = upsert_tag(&canary.tags, "evo_state", "rejected");
+            tags = upsert_tag(&tags, "evo_reject", &Local::now().format("%Y%m%d%H%M%S").to_string());
+            let _ = execute_memory_update(&serde_json::json!({
+                "id": id,
+                "priority": 90,
+                "tags": tags,
+            }));
+        }
+        return;
+    }
+
+    if pass < EVO_CANARY_ACTIVATE_PASSES {
+        return;
+    }
+
+    deactivate_active_evolution_guideline(active);
+    if let Some(id) = canary.id.as_deref() {
+        let tags = upsert_tag(&canary.tags, "evo_state", "active");
+        let _ = execute_memory_update(&serde_json::json!({
+            "id": id,
+            "priority": 175,
+            "tags": tags,
+        }));
+    }
+}
+
+fn maybe_rollback_on_feedback(
+    previous: Option<AgentMemoryEntry>,
+    active: &AgentMemoryEntry,
+    pass: u32,
+    fail: u32,
+) {
+    // 真实负反馈触发：失败累计达到阈值且明显劣于成功。
+    if fail < EVO_ACTIVE_ROLLBACK_FAILS_MIN || fail < pass.saturating_add(EVO_ACTIVE_FAIL_MARGIN) {
+        return;
+    }
+    if let Some(id) = active.id.as_deref() {
+        let mut tags = upsert_tag(&active.tags, "evo_state", "rolled_back");
+        tags = upsert_tag(&tags, "evo_feedback_rollback", &Local::now().format("%Y%m%d%H%M%S").to_string());
+        let _ = execute_memory_update(&serde_json::json!({
+            "id": id,
+            "priority": 85,
+            "tags": tags,
+        }));
+    }
+    if let Some(previous) = previous
+        && let Some(prev_id) = previous.id.as_deref()
+    {
+        let tags = upsert_tag(&previous.tags, "evo_state", "active");
+        let _ = execute_memory_update(&serde_json::json!({
+            "id": prev_id,
+            "priority": 175,
+            "tags": tags,
+        }));
+    }
+}
+
+fn maybe_rollback_promoted_guideline(store: &MemoryStore, new_note: &str) {
+    let guidelines = reflection_evolution_guidelines(store);
+    let Some(active) = current_active_evolution_guideline_from(&guidelines) else {
+        return;
+    };
+
+    if !evolution_notes_conflict(new_note, &active.note) {
+        return;
+    }
+
+    let active_ver = parse_evo_ver(&active.tags).unwrap_or(0);
+    if let Some(id) = active.id.as_deref() {
+        let mut tags = upsert_tag(&active.tags, "evo_state", "rolled_back");
+        let ts = Local::now().format("%Y%m%d%H%M%S").to_string();
+        tags = upsert_tag(&tags, "evo_rollback", &ts);
+        let _ = execute_memory_update(&serde_json::json!({
+            "id": id,
+            "priority": 80,
+            "tags": tags,
+        }));
+    }
+
+    if let Some(previous) = previous_evolution_guideline_from(&guidelines, active_ver)
+        && let Some(prev_id) = previous.id.as_deref()
+    {
+        let tags = upsert_tag(&previous.tags, "evo_state", "active");
+        let _ = execute_memory_update(&serde_json::json!({
+            "id": prev_id,
+            "priority": 175,
+            "tags": tags,
+        }));
+    }
+}
+
+fn next_evolution_version(store: &MemoryStore) -> u32 {
+    let entries = reflection_evolution_guidelines(store);
+    next_evolution_version_from(&entries)
+}
+
+fn next_evolution_version_from(entries: &[AgentMemoryEntry]) -> u32 {
+    let max_ver = entries
+        .iter()
+        .filter_map(|entry| parse_evo_ver(&entry.tags))
+        .max()
+        .unwrap_or(0);
+    max_ver.saturating_add(1)
+}
+
+fn deactivate_active_evolution_guideline(active: Option<AgentMemoryEntry>) {
+    let Some(active) = active else {
+        return;
+    };
+    let Some(id) = active.id.as_deref() else {
+        return;
+    };
+    let tags = upsert_tag(&active.tags, "evo_state", "superseded");
+    let _ = execute_memory_update(&serde_json::json!({
+        "id": id,
+        "priority": 140,
+        "tags": tags,
+    }));
+}
+
+fn current_active_evolution_guideline(store: &MemoryStore) -> Option<AgentMemoryEntry> {
+    let entries = reflection_evolution_guidelines(store);
+    current_active_evolution_guideline_from(&entries)
+}
+
+fn current_active_evolution_guideline_from(
+    entries: &[AgentMemoryEntry],
+) -> Option<AgentMemoryEntry> {
+    entries
+        .iter()
+        .filter(|entry| tag_value(&entry.tags, "evo_state").as_deref() == Some("active"))
+        .cloned()
+        .max_by_key(|entry| parse_evo_ver(&entry.tags).unwrap_or(0))
+}
+
+fn current_canary_evolution_guideline(store: &MemoryStore) -> Option<AgentMemoryEntry> {
+    let entries = reflection_evolution_guidelines(store);
+    current_canary_evolution_guideline_from(&entries)
+}
+
+fn current_canary_evolution_guideline_from(
+    entries: &[AgentMemoryEntry],
+) -> Option<AgentMemoryEntry> {
+    entries
+        .iter()
+        .filter(|entry| tag_value(&entry.tags, "evo_state").as_deref() == Some("canary"))
+        .cloned()
+        .max_by_key(|entry| parse_evo_ver(&entry.tags).unwrap_or(0))
+}
+
+fn previous_evolution_guideline(store: &MemoryStore, current_ver: u32) -> Option<AgentMemoryEntry> {
+    let entries = reflection_evolution_guidelines(store);
+    previous_evolution_guideline_from(&entries, current_ver)
+}
+
+fn previous_evolution_guideline_from(
+    entries: &[AgentMemoryEntry],
+    current_ver: u32,
+) -> Option<AgentMemoryEntry> {
+    entries
+        .iter()
+        .filter(|entry| parse_evo_ver(&entry.tags).unwrap_or(0) < current_ver)
+        .cloned()
+        .max_by_key(|entry| parse_evo_ver(&entry.tags).unwrap_or(0))
+}
+
+fn reflection_evolution_guidelines(store: &MemoryStore) -> Vec<AgentMemoryEntry> {
+    store
+        .entries_by_category("coding_guideline", 500)
+        .ok()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(is_reflection_evolution_guideline)
+        .collect()
+}
+
+fn is_reflection_evolution_guideline(entry: &AgentMemoryEntry) -> bool {
+    entry.tags.iter().any(|tag| tag == "evolution_promoted")
+        && tag_value(&entry.tags, "evo_stream").as_deref() == Some("reflection")
+}
+
+fn parse_evo_ver(tags: &[String]) -> Option<u32> {
+    tag_value(tags, "evo_ver")?.parse::<u32>().ok()
+}
+
+fn parse_tag_u32(tags: &[String], key: &str) -> Option<u32> {
+    tag_value(tags, key)?.parse::<u32>().ok()
+}
+
+fn tag_value(tags: &[String], key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    tags.iter().find_map(|tag| {
+        if tag.starts_with(&prefix) {
+            Some(tag[prefix.len()..].to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn upsert_tag(tags: &[String], key: &str, value: &str) -> Vec<String> {
+    let prefix = format!("{key}:");
+    let mut out = Vec::with_capacity(tags.len() + 1);
+    let mut replaced = false;
+    for tag in tags {
+        if tag.starts_with(&prefix) {
+            if !replaced {
+                out.push(format!("{key}:{value}"));
+                replaced = true;
+            }
+            continue;
+        }
+        out.push(tag.clone());
+    }
+    if !replaced {
+        out.push(format!("{key}:{value}"));
+    }
+    out
+}
+
+fn has_active_guideline(entries: &[AgentMemoryEntry]) -> bool {
+    entries
+        .iter()
+        .any(|entry| tag_value(&entry.tags, "evo_state").as_deref() == Some("active"))
+}
+
+fn has_canary_guideline(entries: &[AgentMemoryEntry]) -> bool {
+    entries
+        .iter()
+        .any(|entry| tag_value(&entry.tags, "evo_state").as_deref() == Some("canary"))
+}
+
+fn evolution_notes_conflict(a_note: &str, b_note: &str) -> bool {
+    let Some((a_do, a_avoid)) = split_do_avoid(a_note) else {
+        return false;
+    };
+    let Some((b_do, b_avoid)) = split_do_avoid(b_note) else {
+        return false;
+    };
+    has_polarity_conflict(&a_do, &b_avoid) || has_polarity_conflict(&a_avoid, &b_do)
+}
+
+fn normalize_evolution_note(note: &str) -> String {
+    note
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// 扫描近期 self_note，检测与新 note 的"反向极性"重复并降级旧条目。
@@ -604,4 +1056,82 @@ async fn background_model_should_reflect(
     let resp = background_call(model, &messages).await?;
     let text = extract_back_content(&resp).unwrap_or_default();
     parse_reflect_flag(&text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upsert_tag_replaces_existing_value() {
+        let tags = vec![
+            "evo_stream:reflection".to_string(),
+            "evo_state:active".to_string(),
+        ];
+        let out = upsert_tag(&tags, "evo_state", "rolled_back");
+        assert!(out.iter().any(|tag| tag == "evo_state:rolled_back"));
+        assert!(!out.iter().any(|tag| tag == "evo_state:active"));
+    }
+
+    #[test]
+    fn parse_evo_ver_reads_numeric_tag() {
+        let tags = vec![
+            "evo_stream:reflection".to_string(),
+            "evo_ver:7".to_string(),
+        ];
+        assert_eq!(parse_evo_ver(&tags), Some(7));
+    }
+
+    #[test]
+    fn evolution_notes_conflict_detects_do_avoid_flip() {
+        let newer = "Do: validate tool arguments before calling tools\nAvoid: guessing";
+        let older = "Do: guessing quickly\nAvoid: validate tool arguments";
+        assert!(evolution_notes_conflict(newer, older));
+    }
+
+    #[test]
+    fn evaluate_turn_feedback_flags_tool_failures() {
+        let feedback = evaluate_turn_feedback(
+            "继续执行",
+            "Error: command failed with exit code 1",
+            true,
+        );
+        assert_eq!(feedback, EvolutionFeedback::Fail);
+    }
+
+    #[test]
+    fn evaluate_turn_feedback_flags_user_corrections() {
+        let feedback = evaluate_turn_feedback(
+            "这个不对，请重试并修复",
+            "我会继续处理",
+            false,
+        );
+        assert_eq!(feedback, EvolutionFeedback::Fail);
+    }
+
+    #[test]
+    fn evaluate_turn_feedback_keeps_normal_fix_requests_as_pass() {
+        let feedback = evaluate_turn_feedback(
+            "请帮我 fix 这个 rust 编译错误",
+            "可以，我先定位报错并修复",
+            false,
+        );
+        assert_eq!(feedback, EvolutionFeedback::Pass);
+    }
+
+    #[test]
+    fn parse_tag_u32_reads_counter_tags() {
+        let tags = vec!["evo_pass:3".to_string(), "evo_fail:1".to_string()];
+        assert_eq!(parse_tag_u32(&tags, "evo_pass"), Some(3));
+        assert_eq!(parse_tag_u32(&tags, "evo_fail"), Some(1));
+    }
+
+    #[test]
+    fn next_feedback_counters_decay_then_add_new_signal() {
+        let (pass, fail) = next_feedback_counters(10, 2, EvolutionFeedback::Fail);
+        assert_eq!((pass, fail), (5, 2));
+
+        let (pass, fail) = next_feedback_counters(2, 1, EvolutionFeedback::Pass);
+        assert_eq!((pass, fail), (3, 1));
+    }
 }

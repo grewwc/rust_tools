@@ -654,6 +654,173 @@ fn mid_turn_compress_preserves_latest_user_message() {
 }
 
 #[test]
+fn mid_turn_compress_preserves_recent_two_user_messages() {
+    let previous_user = "先定位 streaming 中断的根因";
+    let latest_user = "再补上修复并验证回归";
+    let filler = "x".repeat(14_000);
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("更早需求：梳理模块结构".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(filler.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(previous_user.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(filler),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(latest_user.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("收到，我会按顺序处理".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let (compressed, before, after) = mid_turn_compress(messages, 4_000);
+    assert!(after <= before, "compression should not expand payload");
+
+    let has_previous_user = compressed
+        .iter()
+        .any(|m| m.role == "user" && m.content.as_str() == Some(previous_user));
+    let has_latest_user = compressed
+        .iter()
+        .any(|m| m.role == "user" && m.content.as_str() == Some(latest_user));
+
+    assert!(
+        has_previous_user,
+        "mid-turn compression must preserve the previous user turn"
+    );
+    assert!(
+        has_latest_user,
+        "mid-turn compression must preserve the latest user turn"
+    );
+}
+
+#[test]
+fn mid_turn_compress_prefers_three_recent_user_turns_when_context_is_small_enough() {
+    let user2 = "第二阶段：定位流式卡住点";
+    let user3 = "第三阶段：修复压缩策略";
+    let user4 = "第四阶段：补测试并复盘";
+    let filler = "x".repeat(8_000);
+
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("第一阶段：读取代码结构".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(filler.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(user2.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(filler.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(user3.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(filler),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(user4.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("收到，按 2->3->4 顺序执行".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let (compressed, _before, _after) = mid_turn_compress(messages, 4_000);
+
+    let has_user2 = compressed
+        .iter()
+        .any(|m| m.role == "user" && m.content.as_str() == Some(user2));
+    let has_user3 = compressed
+        .iter()
+        .any(|m| m.role == "user" && m.content.as_str() == Some(user3));
+    let has_user4 = compressed
+        .iter()
+        .any(|m| m.role == "user" && m.content.as_str() == Some(user4));
+
+    assert!(has_user2, "should preserve previous-2 user turn when context is moderate");
+    assert!(has_user3, "should preserve previous-1 user turn when context is moderate");
+    assert!(has_user4, "should preserve latest user turn when context is moderate");
+}
+
+#[test]
 fn mid_turn_compress_keeps_tool_pairs_consistent() {
     let huge = "x".repeat(18_000);
     let tool_call = ToolCall {

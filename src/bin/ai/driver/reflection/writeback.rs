@@ -178,6 +178,42 @@ fn parse_project_writeback_payload(s: &str) -> Option<ProjectWritebackPayload> {
     })
 }
 
+fn project_writeback_quality_ok(content: &str) -> bool {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.chars().count() < 40 {
+        return false;
+    }
+
+    let lines = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() < 2 {
+        return false;
+    }
+
+    let lower = trimmed.to_lowercase();
+    let uncertainty_markers = [
+        "maybe",
+        "might",
+        "unsure",
+        "probably",
+        "not sure",
+        "猜测",
+        "可能",
+        "不确定",
+    ];
+    let uncertain_hits = uncertainty_markers
+        .iter()
+        .filter(|marker| lower.contains(**marker))
+        .count();
+    uncertain_hits == 0
+}
+
 fn find_existing_project_writeback_entry(
     store: &MemoryStore,
     source: &str,
@@ -290,6 +326,9 @@ pub(super) async fn run_project_knowledge_writeback_background(
     let Some(payload) = parse_project_writeback_payload(&content) else {
         return;
     };
+    if !project_writeback_quality_ok(&payload.content) {
+        return;
+    }
 
     let source = format!("auto_project_writeback:{project_name}");
     let store = MemoryStore::from_env_or_config();

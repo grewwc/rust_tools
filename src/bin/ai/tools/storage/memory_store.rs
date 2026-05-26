@@ -230,6 +230,14 @@ impl MemoryStore {
         } else {
             entry
         };
+        if should_dedup_learning_entry(entry_ref)
+            && self
+                .has_recent_duplicate(entry_ref, 200)
+                .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
         super::with_memory_file_lock(&self.path, || {
             if let Some(parent) = self.path.parent() {
                 fs::create_dir_all(parent)
@@ -287,6 +295,25 @@ impl MemoryStore {
 
             Ok(())
         })
+    }
+
+    fn has_recent_duplicate(
+        &self,
+        target: &AgentMemoryEntry,
+        recent_limit: usize,
+    ) -> Result<bool, String> {
+        let target_norm = normalize_learning_note(&target.note);
+        let target_source = target.source.as_deref().unwrap_or("");
+        let recent = self.recent(recent_limit)?;
+        Ok(recent.into_iter().any(|entry| {
+            if entry.category != target.category {
+                return false;
+            }
+            if entry.source.as_deref().unwrap_or("") != target_source {
+                return false;
+            }
+            normalize_learning_note(&entry.note) == target_norm
+        }))
     }
 
     fn memory_files_to_scan(&self) -> Result<Vec<PathBuf>, String> {
@@ -579,6 +606,23 @@ impl MemoryStore {
     }
 }
 
+fn should_dedup_learning_entry(entry: &AgentMemoryEntry) -> bool {
+    matches!(
+        entry.category.as_str(),
+        "self_note" | "project_memory" | "coding_guideline" | "code_discovery"
+    )
+}
+
+fn normalize_learning_note(note: &str) -> String {
+    note
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 #[cfg(test)]
 impl MemoryStore {
     pub(crate) fn for_tests_with_path(path: PathBuf) -> Self {
@@ -683,6 +727,42 @@ mod tests {
         let out = store.search("登陆失败", 3).unwrap();
         assert!(!out.is_empty());
         assert!(out.iter().any(|(x, _)| x.note.contains("登录失败")));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn learning_entries_deduplicate_recent_exact_writes() {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_mem_dedup_{ts}.jsonl"));
+        let store = MemoryStore::for_tests_with_path(path.clone());
+
+        let entry = AgentMemoryEntry {
+            id: None,
+            timestamp: "2025-01-05T00:00:00Z".to_string(),
+            category: "self_note".to_string(),
+            note: "Do: verify before write".to_string(),
+            tags: vec!["agent".to_string()],
+            source: Some("session:test".to_string()),
+            priority: Some(120),
+            owner_pid: None,
+            owner_pgid: None,
+        };
+
+        store.append(&entry).unwrap();
+        store.append(&entry).unwrap();
+
+        let recent = store.recent(10).unwrap();
+        assert_eq!(
+            recent
+                .iter()
+                .filter(|e| e.category == "self_note" && e.note == "Do: verify before write")
+                .count(),
+            1
+        );
+
         let _ = std::fs::remove_file(&path);
     }
 }
