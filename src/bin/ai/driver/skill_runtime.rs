@@ -671,7 +671,7 @@ fn build_system_prompt(
     }
 
     if has_tool(available_tools, "knowledge_save") {
-        b.push(ContextKind::Policy, "Knowledge save:\n- When the user explicitly asks to remember/save/store something for later use, call `knowledge_save`. Do NOT skip the save step.\n- When the user asks what has been remembered or asks to recall saved information, use `knowledge_search` or `knowledge_list`.");
+        b.push(ContextKind::Policy, "Knowledge save:\n- When the user explicitly asks to remember/save/store something for later use, call `knowledge_save`. Do NOT skip the save step.\n- If the user states a durable preference, standing constraint, or stable decision that will likely matter later, proactively call `knowledge_save` even without explicit remember wording.\n- When the user asks what has been remembered or asks to recall saved information, use `knowledge_search` or `knowledge_list`.");
     }
 
     if has_tool(available_tools, "plan") || has_tool(available_tools, "spawn_process") {
@@ -1105,8 +1105,9 @@ mod tests {
         assert!(names.iter().any(|name| name == "discover_skills"));
         assert!(names.iter().any(|name| name == "code_search"));
         assert!(names.iter().any(|name| name == "read_file"));
+        assert!(names.iter().any(|name| name == "knowledge_save"));
+        assert!(names.iter().any(|name| name == "knowledge_search"));
         assert!(!names.iter().any(|name| name == "web_search"));
-        assert!(!names.iter().any(|name| name == "knowledge_search"));
     }
 
     #[test]

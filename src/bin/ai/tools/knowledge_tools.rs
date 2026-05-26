@@ -143,7 +143,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_knowledge_save,
         execute: execute_knowledge_save,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin"],
+        groups: &["builtin", "core"],
     }
 });
 
@@ -293,7 +293,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_knowledge_search,
         execute: execute_knowledge_search,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
-        groups: &["builtin"],
+        groups: &["builtin", "core"],
     }
 });
 
@@ -385,7 +385,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_knowledge_list,
         execute: execute_knowledge_list,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
-        groups: &["builtin"],
+        groups: &["builtin", "core"],
     }
 });
 
