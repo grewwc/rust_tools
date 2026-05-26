@@ -488,6 +488,17 @@ async fn sleep_with_cancel(app: &App, delay: Duration) -> bool {
     }
 }
 
+pub(super) fn clear_stale_request_interrupt_before_request(app: &App) {
+    // 若上一次 turn 的中断信号残留（但当前并未处于显式 cancel/shutdown），
+    // 会导致本次网络重试在 attempt1 就被短路为 canceled。
+    if !app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
+        && !app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed)
+        && crate::ai::driver::signal::request_interrupt_ready()
+    {
+        crate::ai::driver::signal::clear_request_interrupt();
+    }
+}
+
 fn control_model_for_aux_tasks(app: &App) -> String {
     app.config
         .intent_model
@@ -806,6 +817,8 @@ pub(super) async fn do_request_messages(
     messages: &[Message],
     stream: bool,
 ) -> Result<Response, RequestError> {
+    clear_stale_request_interrupt_before_request(app);
+
     let normalized_messages = normalize_messages_for_request(messages);
     let (tools_value, tool_choice) = agent_tools_for_request(app, model);
     let thinking_start = Instant::now();
@@ -1619,6 +1632,8 @@ pub async fn do_request_json(
     messages: &[serde_json::Value],
     stream: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    clear_stale_request_interrupt_before_request(app);
+
     let request_body = json!({
         "model": model,
         "messages": messages,
@@ -2102,6 +2117,32 @@ mod tests {
             .expect("waiter should complete");
         assert!(cancelled);
 
+        crate::ai::driver::signal::clear_request_interrupt();
+        if let Ok(mut guard) = GLOBAL_OS.lock() {
+            *guard = None;
+        }
+    }
+
+    #[test]
+    fn clears_stale_interrupt_for_new_request_but_keeps_active_cancel() {
+        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let app = test_app();
+        init_os_tools_globals(app.os.clone());
+        crate::ai::driver::signal::clear_request_interrupt();
+
+        crate::ai::driver::signal::signal_request_interrupt();
+        assert!(crate::ai::driver::signal::request_interrupt_ready());
+        clear_stale_request_interrupt_before_request(&app);
+        assert!(!crate::ai::driver::signal::request_interrupt_ready());
+
+        app.cancel_stream
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::ai::driver::signal::signal_request_interrupt();
+        clear_stale_request_interrupt_before_request(&app);
+        assert!(crate::ai::driver::signal::request_interrupt_ready());
+
+        app.cancel_stream
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         crate::ai::driver::signal::clear_request_interrupt();
         if let Ok(mut guard) = GLOBAL_OS.lock() {
             *guard = None;

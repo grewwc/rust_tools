@@ -385,6 +385,7 @@ pub(super) async fn execute_turn_iteration(
     iteration: usize,
 ) -> Result<IterationExecution, Box<dyn std::error::Error>> {
     let mut current_history = String::new();
+    request::clear_stale_request_interrupt_before_request(app);
     app.streaming
         .store(true, std::sync::atomic::Ordering::Relaxed);
 
