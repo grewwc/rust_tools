@@ -13,7 +13,7 @@
 //   4. Return TurnOutcome (Quit, Success, or Error)
 // =============================================================================
 
-use crate::ai::{mcp::SharedMcpClient, models, types::App};
+use crate::ai::{mcp::SharedMcpClient, types::App};
 
 use super::{
     finalize::finalize_turn,
@@ -71,49 +71,6 @@ fn print_compress_status(stage: &str, before: usize, after: usize) {
         "compress",
         &format!("{stage}: {} → {} chars", before, after),
     );
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MidTurnCompressBudget {
-    soft_chars: usize,
-    hard_trigger_chars: usize,
-    llm_keep_recent_turns: usize,
-    llm_summary_max_chars: usize,
-}
-
-fn resolve_mid_turn_compress_budget(app: &App, model: &str) -> MidTurnCompressBudget {
-    // 粗略换算：在中英文混合上下文里 1 token 约 2 chars（保守）
-    let context_window_chars = models::context_window_tokens(model).saturating_mul(2);
-
-    let base_soft = MID_TURN_COMPRESS_SOFT_THRESHOLD
-        .max(app.config.history_max_chars.saturating_mul(3).saturating_div(2));
-    let soft_cap_by_context = context_window_chars
-        .saturating_mul(35)
-        .saturating_div(100)
-        .max(12_000);
-    let soft_chars = base_soft.min(soft_cap_by_context).max(12_000);
-
-    let mut hard_trigger_chars = MID_TURN_COMPRESS_HARD_THRESHOLD.max(soft_chars.saturating_add(8_000));
-    let hard_cap_by_context = context_window_chars
-        .saturating_mul(60)
-        .saturating_div(100)
-        .max(soft_chars.saturating_add(2_000));
-    hard_trigger_chars = hard_trigger_chars.min(hard_cap_by_context);
-    if hard_trigger_chars <= soft_chars {
-        hard_trigger_chars = soft_chars.saturating_add(2_000);
-    }
-
-    let llm_keep_recent_turns = MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS
-        .max((app.config.history_keep_last / 32).clamp(2, 8));
-    let llm_summary_max_chars = MID_TURN_LLM_SUMMARY_MAX_CHARS
-        .max((soft_chars / 8).clamp(2_000, 8_000));
-
-    MidTurnCompressBudget {
-        soft_chars,
-        hard_trigger_chars,
-        llm_keep_recent_turns,
-        llm_summary_max_chars,
-    }
 }
 
 /// 工具循环检测命中后，向 messages 注入一条 internal_note 让 agent 自我反思
@@ -290,7 +247,6 @@ async fn run_turn_body(
     // 收集本 turn 实际调用过的 explicit-enabled tool 名字，turn 末用于老化未用项。
     let mut tools_used_this_turn: crate::commonw::FastSet<String> =
         crate::commonw::FastSet::default();
-    let compress_budget = resolve_mid_turn_compress_budget(app, &next_model);
     let loop_result = 'turn: loop {
         iteration += 1;
         {
@@ -396,21 +352,29 @@ async fn run_turn_body(
         let delta_significant = total_chars
             .saturating_sub(last_compress_after_chars)
             >= MID_TURN_COMPRESS_DELTA_THRESHOLD;
-        if total_chars > compress_budget.soft_chars
+        if total_chars > MID_TURN_COMPRESS_SOFT_THRESHOLD
             && cooldown_passed
             && (last_compress_after_chars == 0 || delta_significant)
         {
-            let mut attempted_llm_summary = false;
-
-            // 对超大上下文优先做 LLM 摘要，尽量保留语义而非先删消息。
-            if total_chars > compress_budget.hard_trigger_chars {
-                attempted_llm_summary = true;
+            let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
+            let (compressed, before, after) = crate::ai::history::mid_turn_compress(
+                drained,
+                MID_TURN_COMPRESS_SOFT_THRESHOLD,
+            );
+            messages = compressed;
+            last_compress_iteration = iteration;
+            last_compress_after_chars = after;
+            if after < before {
+                print_compress_status("mid-turn", before, after);
+            }
+            // 硬阈值：无损 + 弱损管线之后仍超额，调用 LLM 摘要兜底，
+            // 把早期对话压成单条 internal_note，并在终端打 status line。
+            if after > MID_TURN_COMPRESS_HARD_THRESHOLD {
                 crate::ai::driver::print::print_tool_note_line(
                     "compress",
                     &format!(
-                        "hard threshold exceeded ({total_chars} > {}), \
+                        "hard threshold exceeded ({after} > {MID_TURN_COMPRESS_HARD_THRESHOLD}), \
                          requesting LLM summary…"
-                        , compress_budget.hard_trigger_chars
                     ),
                 );
                 let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
@@ -418,8 +382,8 @@ async fn run_turn_body(
                     crate::ai::history::mid_turn_llm_summarize(
                         app,
                         drained,
-                        compress_budget.llm_keep_recent_turns,
-                        compress_budget.llm_summary_max_chars,
+                        MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+                        MID_TURN_LLM_SUMMARY_MAX_CHARS,
                     )
                     .await;
                 messages = after_msgs;
@@ -428,35 +392,11 @@ async fn run_turn_body(
                 } else {
                     crate::ai::driver::print::print_tool_note_line(
                         "compress",
-                        "llm summary skipped/failed; applying deterministic fallback compression",
+                        "llm summary skipped (no early dialog or call failed); \
+                         agent may hit context limit",
                     );
                 }
             }
-
-            let chars_before_fallback = crate::ai::history::messages_total_chars_pub(&messages);
-            if chars_before_fallback > compress_budget.soft_chars {
-                let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
-                let (compressed, before, after) = crate::ai::history::mid_turn_compress(
-                    drained,
-                    compress_budget.soft_chars,
-                );
-                messages = compressed;
-                if after < before {
-                    print_compress_status(
-                        if attempted_llm_summary {
-                            "mid-turn (fallback)"
-                        } else {
-                            "mid-turn"
-                        },
-                        before,
-                        after,
-                    );
-                }
-                last_compress_after_chars = after;
-            } else {
-                last_compress_after_chars = chars_before_fallback;
-            }
-            last_compress_iteration = iteration;
         }
 
         // === 工具循环检测 ===
