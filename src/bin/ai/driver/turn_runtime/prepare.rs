@@ -295,6 +295,19 @@ pub(super) async fn prepare_turn(
         skill_turn.push_labeled_section(skill_runtime::ContextKind::Fact, "Code Discovery", &code_discovery_recall);
     }
 
+    // C3: 复杂任务自动提示（不强制激活 Thinking 引擎，仅作为软引导）
+    // 当检测到问题包含"重构/设计/架构/系统/拆分/refactor/design/architecture/multi-step"等关键词时，
+    // 注入一段 Policy 提示，鼓励 agent 自行拆解并先列出验证步骤再动手。
+    if detect_complex_task(question) {
+        skill_turn.push_section(
+            skill_runtime::ContextKind::Policy,
+            "Complex task hint:\n\
+             - This request looks multi-step (refactor / design / architecture / cross-module).\n\
+             - Before editing, briefly outline the plan: what to read, what to change, how to verify.\n\
+             - Prefer small reversible steps; surface assumptions explicitly.",
+        );
+    }
+
     messages.push(Message {
         role: "system".to_string(),
         content: Value::String(skill_turn.system_prompt().to_string()),
@@ -458,6 +471,52 @@ fn looks_like_code_or_repo_question(question: &str) -> bool {
             || token.ends_with(".yml")
             || token.ends_with(".toml")
     })
+}
+
+/// C3: 复杂任务检测——基于关键词的轻量启发式。
+/// 命中后只会注入一段 Policy 提示鼓励 agent 自行拆解，不强制激活 Thinking 引擎。
+fn detect_complex_task(question: &str) -> bool {
+    let q = question.trim();
+    if q.is_empty() {
+        return false;
+    }
+    // 过短的请求不视为复杂任务，避免对简单问题施加额外提示
+    if q.chars().count() < 12 {
+        return false;
+    }
+    let lower = q.to_lowercase();
+    const ASCII_KEYWORDS: &[&str] = &[
+        "refactor",
+        "redesign",
+        "architecture",
+        "architect",
+        "multi-step",
+        "multi step",
+        "cross-module",
+        "cross module",
+        "migrate",
+        "migration",
+        "rewrite",
+    ];
+    if ASCII_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return true;
+    }
+    const CJK_KEYWORDS: &[&str] = &[
+        "重构",
+        "架构",
+        "设计方案",
+        "整体设计",
+        "系统设计",
+        "拆分",
+        "拆解",
+        "梳理",
+        "全部修复",
+        "全量",
+        "多步",
+        "迁移",
+        "重写",
+    ];
+    CJK_KEYWORDS.iter().any(|kw| q.contains(kw))
 }
 
 fn build_session_code_discovery_recall(app: &App, history: &[Message]) -> Option<String> {

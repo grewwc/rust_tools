@@ -92,6 +92,22 @@ tokio::task_local! {
     /// assistant text into this slot so the spawning tool can return it
     /// to the parent agent. Absence means "no parent is interested".
     pub(crate) static SUBAGENT_RESULT_SLOT: SubagentResultSlot;
+    /// 当前 turn 的 (session_id, turn_id) 元组。由 driver run_loop 在每
+    /// 轮调度前 enter，被 DecisionLog / 反馈写入路径读取，把工具调用结
+    /// 果对回到正确的 (session, turn)。未设置时下游获取到 ("", 0)。
+    pub(crate) static TURN_IDENTITY: (String, usize);
+}
+
+/// 读取当前 turn 的 session_id；未在 turn 内调用时返回空串。
+pub(crate) fn current_session_id_or_empty() -> String {
+    TURN_IDENTITY
+        .try_with(|(s, _)| s.clone())
+        .unwrap_or_default()
+}
+
+/// 读取当前 turn 的 turn_id；未在 turn 内调用时返回 0。
+pub(crate) fn current_turn_id_or_zero() -> usize {
+    TURN_IDENTITY.try_with(|(_, t)| *t).unwrap_or(0)
 }
 
 /// Publish the sub-agent's final assistant text into the active result

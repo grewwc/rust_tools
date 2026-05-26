@@ -1226,6 +1226,54 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
         out
     }
 
+    fn truncate_note_text(text: &str, max_chars: usize) -> String {
+        if text.chars().count() <= max_chars {
+            return text.to_string();
+        }
+
+        let lines = text
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        if lines.is_empty() {
+            return truncate_chars(text, max_chars);
+        }
+
+        // 结构化裁剪：优先保留头部条目 + 尾部少量最新条目，避免硬切半句。
+        let mut selected = Vec::new();
+        let mut used = 0usize;
+        let head_budget = max_chars.saturating_mul(2).saturating_div(3);
+        for line in lines.iter().take(24) {
+            let line_chars = line.chars().count();
+            let extra = if selected.is_empty() { 0 } else { 1 };
+            if used + extra + line_chars > head_budget {
+                break;
+            }
+            used += extra + line_chars;
+            selected.push((*line).to_string());
+        }
+
+        let mut tail = Vec::new();
+        for line in lines.iter().rev().take(6).rev() {
+            if selected.iter().any(|existing| existing == line) {
+                continue;
+            }
+            tail.push((*line).to_string());
+        }
+
+        let omitted = text
+            .chars()
+            .count()
+            .saturating_sub(selected.iter().map(|line| line.chars().count()).sum::<usize>());
+        if !tail.is_empty() {
+            selected.push(format!("... [truncated: {omitted} chars omitted]"));
+            selected.extend(tail);
+        }
+
+        truncate_chars(&selected.join("\n"), max_chars)
+    }
+
     fn detect_note_kind(text: &str) -> InternalNoteKind {
         let trimmed = text.trim();
         if trimmed.starts_with("Current code-inspection working memory:") {
@@ -1398,7 +1446,7 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
             merged_notes.push((
                 idx,
                 detect_note_kind(text),
-                truncate_chars(text, MERGED_SINGLE_NOTE_MAX_CHARS),
+                truncate_note_text(text, MERGED_SINGLE_NOTE_MAX_CHARS),
             ));
         }
     }
@@ -1447,7 +1495,10 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
             // many tool rounds).
             if let Value::String(text) = &promoted.content {
                 if text.chars().count() > MERGED_SINGLE_NOTE_MAX_CHARS {
-                    promoted.content = Value::String(truncate_chars(text, MERGED_SINGLE_NOTE_MAX_CHARS));
+                    promoted.content = Value::String(truncate_note_text(
+                        text,
+                        MERGED_SINGLE_NOTE_MAX_CHARS,
+                    ));
                 }
             }
             out.push(promoted);
@@ -2410,6 +2461,47 @@ mod tests {
         assert_eq!(normalized[2].content.as_str(), Some("later answer"));
         assert!(normalized.iter().all(|message| message.role != "tool"));
         assert!(normalized.iter().all(|message| message.tool_calls.is_none()));
+    }
+
+    #[test]
+    fn normalize_messages_truncates_long_internal_notes_structurally() {
+        let mut long_note_lines = Vec::new();
+        long_note_lines.push("Current code-inspection working memory:".to_string());
+        for i in 0..80usize {
+            long_note_lines.push(format!("- finding {i:02}: {}", "x".repeat(40)));
+        }
+
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: Value::String("base system".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String("question".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+                content: Value::String(long_note_lines.join("\n")),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        let normalized = normalize_messages_for_request(&messages);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[2].role, "system");
+        let text = normalized[2].content.as_str().unwrap_or_default();
+        assert!(text.contains("Current code-inspection working memory:"));
+        assert!(text.contains("[truncated:"));
+        assert!(text.chars().count() <= 1_200);
     }
 
 

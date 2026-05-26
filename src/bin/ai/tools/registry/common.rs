@@ -252,12 +252,16 @@ pub(crate) fn execute_tool_call_with_args(
 ) -> Result<ToolResult, String> {
     let Some(spec) = TOOL_INDEX.get(name).copied() else {
         record_tool_stat(name, false);
+        record_tool_decision(name, false, "unknown_tool");
         return Err(format!("Unknown tool: {}", name));
     };
+    let started = std::time::Instant::now();
     let exec = (spec.execute)(args);
+    let elapsed_ms = started.elapsed().as_millis() as u64;
     match exec {
         Ok(result) => {
             record_tool_stat(name, true);
+            record_tool_decision_with_time(name, true, "ok", elapsed_ms);
             Ok(ToolResult {
                 tool_call_id: tool_call_id.to_string(),
                 content: result,
@@ -265,9 +269,80 @@ pub(crate) fn execute_tool_call_with_args(
         }
         Err(err) => {
             record_tool_stat(name, false);
+            // Tier B2: 工具失败也作为 raw_experience 沉淀，供后续 generalization
+            // 总结成 Avoid: 经验。5 分钟节流避免噪声。
+            record_tool_failure_experience(name, &err);
+            record_tool_decision_with_time(name, false, &err, elapsed_ms);
             Err(err)
         }
     }
+}
+
+/// Tier A1：把工具调用结果写进 DecisionLog（只写，下游消费另起 PR）。
+fn record_tool_decision(name: &str, success: bool, message: &str) {
+    record_tool_decision_with_time(name, success, message, 0);
+}
+
+fn record_tool_decision_with_time(name: &str, success: bool, message: &str, elapsed_ms: u64) {
+    let store = crate::ai::driver::decision_log::get_decision_log_store();
+    let session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
+    let turn_id = crate::ai::driver::runtime_ctx::current_turn_id_or_zero();
+    store.log(crate::ai::driver::decision_log::DecisionLog {
+        timestamp: 0,
+        session_id,
+        turn_id,
+        decision_type: crate::ai::driver::decision_log::DecisionType::ToolInvocation,
+        context: String::new(),
+        alternatives_considered: Vec::new(),
+        chosen_option: name.to_string(),
+        reasoning: String::new(),
+        confidence: None,
+        outcome: Some(crate::ai::driver::decision_log::Outcome {
+            success,
+            message: {
+                // 截断长错误，避免 DecisionLog 内存膨胀
+                if message.len() > 240 {
+                    let mut end = 240;
+                    while !message.is_char_boundary(end) && end > 0 {
+                        end -= 1;
+                    }
+                    format!("{}...", &message[..end])
+                } else {
+                    message.to_string()
+                }
+            },
+            user_feedback: None,
+        }),
+        execution_time_ms: Some(elapsed_ms),
+    });
+}
+
+/// Tier B2：工具失败 → ingest 一条 Avoid: 体的 raw_experience。
+/// - 同名工具 5 分钟内只记一次，避免暴雨日志放大
+/// - 错误消息截断到 200 字符
+fn record_tool_failure_experience(name: &str, err: &str) {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static LAST: OnceLock<Mutex<FastMap<String, Instant>>> = OnceLock::new();
+    let map = LAST.get_or_init(|| Mutex::new(FastMap::default()));
+    {
+        let Ok(mut g) = map.lock() else { return; };
+        if let Some(prev) = g.get(name)
+            && prev.elapsed() < std::time::Duration::from_secs(300)
+        {
+            return;
+        }
+        g.insert(name.to_string(), Instant::now());
+    }
+    let trimmed: String = err.chars().take(200).collect();
+    let note = format!("Avoid: tool '{}' failed: {}", name, trimmed);
+    crate::ai::driver::thinking::ingest_raw_experience_global(
+        "tool_failure",
+        &note,
+        &["tool_failure".to_string(), name.to_string()],
+        None,
+    );
 }
 
 fn record_tool_stat(name: &str, ok: bool) {

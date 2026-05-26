@@ -25,6 +25,22 @@ pub struct GeneralizedPrinciple {
     pub cross_domain_links: Vec<String>,
 }
 
+impl GeneralizedPrinciple {
+    /// 基于 `last_reinforced` 的时间衰减；保守半衰期 30 天。
+    /// 30 天衰减到 0.5 倍，60 天到 0.25 倍。下界 0.2，避免完全淹没。
+    pub fn effective_confidence(&self) -> f64 {
+        let days_since_reinforced = chrono::DateTime::parse_from_rfc3339(&self.last_reinforced)
+            .map(|t| {
+                let now = chrono::Local::now().with_timezone(t.offset());
+                (now - t).num_days().max(0) as f64
+            })
+            .unwrap_or(0.0);
+        let half_life_days: f64 = 30.0;
+        let decay = 0.5_f64.powf(days_since_reinforced / half_life_days);
+        (self.confidence * decay).max(self.confidence * 0.2)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RawExperience {
     id: String,
@@ -306,7 +322,7 @@ impl ExperienceGeneralizer {
             ),
             tags: vec!["generalized".to_string(), "principle".to_string(), principle.domain.clone()],
             source: Some("experience_generalizer".to_string()),
-            priority: Some(self.priority_for_abstraction(principle.abstraction_level)),
+            priority: Some(self.priority_for_principle(principle)),
             owner_pid: None,
             owner_pgid: None,
         };
@@ -559,12 +575,28 @@ impl ExperienceGeneralizer {
             a.split_whitespace().map(|w| w.to_lowercase()).collect();
         let words_b: std::collections::HashSet<String> =
             b.split_whitespace().map(|w| w.to_lowercase()).collect();
-        if words_a.is_empty() || words_b.is_empty() {
-            return 0.0;
+        let token_score = if words_a.is_empty() || words_b.is_empty() {
+            0.0
+        } else {
+            let intersection = words_a.intersection(&words_b).count();
+            let union = words_a.union(&words_b).count();
+            intersection as f64 / union as f64
+        };
+        // C2 CJK 友好：当至少一侧 token 数 < 4（典型 CJK / 短句 token 化稀疏）时，
+        // 用 char-trigram Jaccard 兜底，并取两者最大值。阈值由调用方维持不变。
+        let needs_fallback = words_a.len() < 4 || words_b.len() < 4;
+        if !needs_fallback {
+            return token_score;
         }
-        let intersection = words_a.intersection(&words_b).count();
-        let union = words_a.union(&words_b).count();
-        intersection as f64 / union as f64
+        let trig_a = char_trigrams(a);
+        let trig_b = char_trigrams(b);
+        if trig_a.is_empty() || trig_b.is_empty() {
+            return token_score;
+        }
+        let inter = trig_a.intersection(&trig_b).count();
+        let uni = trig_a.union(&trig_b).count();
+        let trig_score = inter as f64 / uni as f64;
+        token_score.max(trig_score)
     }
 
     fn priority_for_abstraction(&self, level: u8) -> u8 {
@@ -577,6 +609,30 @@ impl ExperienceGeneralizer {
             _ => 255,
         }
     }
+
+    /// 在抽象层级基础上叠加 effective_confidence 衰减。
+    /// effective_confidence 在 [0.2*conf, conf] 区间，乘到优先级上。
+    /// 长期未强化的 principle 召回排序自然靠后，新 principle 维持原值。
+    fn priority_for_principle(&self, principle: &GeneralizedPrinciple) -> u8 {
+        let base = self.priority_for_abstraction(principle.abstraction_level) as f64;
+        // 衰减系数：confidence 越低 / 越久未强化越接近 0.5
+        // 保守下界 0.5，确保即使最老的 principle 也不会沉到普通 self_note 之下。
+        let factor = (principle.effective_confidence().max(0.0).min(1.0) * 0.5 + 0.5).clamp(0.5, 1.0);
+        (base * factor).round().clamp(0.0, 255.0) as u8
+    }
+}
+
+/// 用于 CJK / 短文本兜底相似度：把字符串切成 char-trigram 集合（首尾用空格 padding 一格）。
+fn char_trigrams(s: &str) -> std::collections::HashSet<String> {
+    let chars: Vec<char> = format!(" {} ", s.to_lowercase()).chars().collect();
+    let mut out = std::collections::HashSet::new();
+    if chars.len() < 3 {
+        return out;
+    }
+    for w in chars.windows(3) {
+        out.insert(w.iter().collect::<String>());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -702,6 +758,9 @@ mod tests {
     #[test]
     fn too_few_experiences_no_generalization() {
         let mut generalizer = ExperienceGeneralizer::new();
+        // 防御：跨进程持久化的 raw_experience 可能让 buffer 已经超过最小阈值，
+        // 这里手动清空，确保仅以本测试 ingest 的两条经验为准。
+        generalizer.experience_buffer.clear();
         generalizer.ingest_experience("test", "one note", &[], None);
         generalizer.ingest_experience("test", "two note", &[], None);
         assert!(generalizer.try_generalize().is_none());

@@ -349,6 +349,10 @@ fn rank_agents_by_semantics<'a>(
     let history_features = TextSimilarityFeatures::from_text(&history_text);
     let corpus = AgentSemanticCorpus::for_candidates(&candidates);
 
+    // C1: 从 DecisionLog 聚合最近的整体成功率，作为 prior_boost 的放大系数。
+    // 没有数据 / 数据稀少时 reliability=1.0（不动原行为），最大 1.2 / 最小 0.85。
+    let reliability = recent_tool_invocation_reliability();
+
     let mut ranked = candidates
         .into_iter()
         .map(|agent| {
@@ -361,7 +365,7 @@ fn rank_agents_by_semantics<'a>(
                     .unwrap_or(0.0);
             let prior_boost = model_prior
                 .filter(|(label, _)| *label == agent.name)
-                .map(|(_, confidence)| confidence * 0.15)
+                .map(|(_, confidence)| confidence * 0.15 * reliability)
                 .unwrap_or(0.0);
             ScoredAgent {
                 agent,
@@ -374,6 +378,31 @@ fn rank_agents_by_semantics<'a>(
 
     ranked.sort_by(|left, right| right.score.total_cmp(&left.score));
     ranked
+}
+
+/// 从 DecisionLog 取最近 50 条 ToolInvocation 记录，估算工具调用成功率，
+/// 并把它映射到 [0.85, 1.2] 区间作为路由 prior 的放大系数。
+/// 样本不足（< 10 条）时返回 1.0，保持原有行为。
+fn recent_tool_invocation_reliability() -> f64 {
+    use crate::ai::driver::decision_log::{DecisionType, get_decision_log_store};
+    let logs = get_decision_log_store().by_type(&DecisionType::ToolInvocation);
+    let total = logs.len();
+    if total < 10 {
+        return 1.0;
+    }
+    let take_from = total.saturating_sub(50);
+    let recent = &logs[take_from..];
+    let success = recent
+        .iter()
+        .filter(|l| l.outcome.as_ref().map(|o| o.success).unwrap_or(false))
+        .count();
+    let rate = success as f64 / recent.len() as f64;
+    // 0.5 → 1.0；0.0 → 0.85；1.0 → 1.2
+    if rate >= 0.5 {
+        1.0 + (rate - 0.5) * 0.4
+    } else {
+        0.85 + rate * 0.3
+    }
 }
 
 fn agent_semantic_corpus_cache_key(candidates: &[&AgentManifest]) -> String {

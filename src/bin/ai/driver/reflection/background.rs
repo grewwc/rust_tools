@@ -341,6 +341,14 @@ pub(crate) async fn run_self_reflection_background(
         reasoning_content: None,
     };
     let _ = append_history_messages(&history_path, &[record]);
+    // ReflectionQuality 评分：低分仍写入但降低 priority，避免劣化召回排序
+    // （只降不丢，保持原有"自我增强"行为；高分维持 150）。
+    let quality = assess_reflection_quality(note);
+    let priority = match quality.score() {
+        0 => 90,  // 空泛/重复内容，几乎不会进 guideline 召回
+        1 => 120, // 中等，参与召回但排序靠后
+        _ => 150, // 高分，沿用原默认值
+    };
     let entry = AgentMemoryEntry {
         id: None,
         timestamp: Local::now().to_rfc3339(),
@@ -349,13 +357,134 @@ pub(crate) async fn run_self_reflection_background(
         tags: vec!["agent".to_string(), "policy".to_string()],
         source: Some(format!("session:{}", session_id)),
         // self_note 是会话期短期反思，不应作为永久记忆，让其参与正常 GC
-        priority: Some(150),
+        priority: Some(priority),
         owner_pid: None,
         owner_pgid: None,
     };
     let store = MemoryStore::from_env_or_config();
+    // 矛盾检测：扫描近 100 条 self_note，若新 note 与既有条目语义相反
+    // （Do/Avoid 翻转、关键短语相同极性相反），把旧条目降到 priority 60
+    // 让 GC 回收它，避免新旧策略同时被召回造成 agent 行为摇摆。
+    demote_contradicting_self_notes(&store, note);
     let _ = store.append(&entry);
     store.maintain_after_append();
+}
+
+/// 扫描近期 self_note，检测与新 note 的"反向极性"重复并降级旧条目。
+///
+/// 朴素启发式（保守，宁可漏报不可误伤）：
+/// - 提取双方 "do:" / "avoid:" 之后的短语 token 集合
+/// - 若 A.do ∩ B.avoid 中某 token 长度 ≥ 4 且非停用词，判定矛盾
+/// - 把旧条目 priority 降到 60（低于普通 self_note 召回门槛）
+fn demote_contradicting_self_notes(store: &MemoryStore, new_note: &str) {
+    let Some((new_do, new_avoid)) = split_do_avoid(new_note) else {
+        return;
+    };
+    let recent = match store.entries_by_category("self_note", 100) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for old in recent {
+        let Some(id) = old.id.as_deref() else { continue };
+        // 已经被降过的不再重复处理
+        if old.priority.unwrap_or(150) <= 60 {
+            continue;
+        }
+        let Some((old_do, old_avoid)) = split_do_avoid(&old.note) else {
+            continue;
+        };
+        if has_polarity_conflict(&new_do, &old_avoid)
+            || has_polarity_conflict(&new_avoid, &old_do)
+        {
+            // 用现有 update API 重写 priority，保持其他字段不变
+            let _ = crate::ai::tools::service::memory::execute_memory_update(&serde_json::json!({
+                "id": id,
+                "priority": 60,
+            }));
+        }
+    }
+}
+
+fn split_do_avoid(text: &str) -> Option<(Vec<String>, Vec<String>)> {
+    let lower = text.to_lowercase();
+    if !lower.contains("do:") && !lower.contains("avoid:") {
+        return None;
+    }
+    let mut do_tokens: Vec<String> = Vec::new();
+    let mut avoid_tokens: Vec<String> = Vec::new();
+    for line in lower.lines() {
+        let t = line.trim_start_matches(['-', '*', ' ', '\t']);
+        if let Some(rest) = t.strip_prefix("do:") {
+            do_tokens.extend(extract_keyword_tokens(rest));
+        } else if let Some(rest) = t.strip_prefix("avoid:") {
+            avoid_tokens.extend(extract_keyword_tokens(rest));
+        }
+    }
+    Some((do_tokens, avoid_tokens))
+}
+
+fn extract_keyword_tokens(s: &str) -> Vec<String> {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "with", "without", "into", "onto", "from", "this", "that",
+        "your", "you", "are", "was", "were", "have", "has", "had", "but", "not", "can",
+        "should", "would", "could", "may", "might", "will", "shall", "before", "after",
+        "when", "where", "what", "which", "who", "whom",
+    ];
+    s.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter_map(|tok| {
+            let t = tok.trim().to_string();
+            if t.len() < 4 {
+                None
+            } else if STOP.contains(&t.as_str()) {
+                None
+            } else {
+                Some(t)
+            }
+        })
+        .collect()
+}
+
+fn has_polarity_conflict(a: &[String], b: &[String]) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let set_a: std::collections::HashSet<&String> = a.iter().collect();
+    b.iter().any(|t| set_a.contains(t))
+}
+
+/// 启发式评估 self-note 的"可执行性 / 具体性 / 可泛化性"。
+///
+/// 设计原则（保守，不丢弃）：
+/// - actionable：包含 "Do:"/"Avoid:" 或动词导向的祈使句关键词
+/// - specific：包含工具名 / 文件路径 / 函数名等具体标记（含 ` ` 反引号、
+///   "()"、"::"、"/"、"."），或长度大于 80 字符
+/// - generalizable：包含描述习惯/原则的关键词，且不是纯一次性事实
+fn assess_reflection_quality(note: &str) -> super::ReflectionQuality {
+    let lower = note.to_lowercase();
+    let actionable = lower.contains("do:")
+        || lower.contains("avoid:")
+        || lower.contains("prefer ")
+        || lower.contains("always ")
+        || lower.contains("never ")
+        || lower.contains("ensure ");
+    let specific = note.contains('`')
+        || note.contains("::")
+        || note.contains("()")
+        || note.contains('/')
+        || note.chars().count() >= 80;
+    let generalizable = lower.contains("when ")
+        || lower.contains("before ")
+        || lower.contains("after ")
+        || lower.contains("instead ")
+        || lower.contains("rather ")
+        || lower.contains("habit")
+        || lower.contains("policy")
+        || lower.contains("pattern");
+    super::ReflectionQuality {
+        actionable,
+        specific,
+        generalizable,
+    }
 }
 
 pub(super) fn extract_content(v: &Value) -> Option<String> {

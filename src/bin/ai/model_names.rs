@@ -24,6 +24,10 @@ pub struct ModelDef {
     pub tools_default_enabled: bool,
     #[serde(default)]
     pub enable_thinking: bool,
+    /// 可选：模型上下文窗口（token 数）。
+    /// 用于 driver 的动态压缩预算估算；缺省时按 quality_tier 回退。
+    #[serde(default, alias = "context_window", alias = "max_context_tokens")]
+    pub context_window_tokens: Option<usize>,
     /// 可选：默认推理强度档位。仅对 OpenAI/OpenCode 兼容协议生效，
     /// `Compatible` provider 会忽略。CLI / `/model effort` 命令的覆盖优先级
     /// 高于这里。

@@ -7,7 +7,8 @@ use super::{
     files,
     history::{
         append_history, append_history_messages, build_context_history, build_message_arr,
-        compress_messages_for_context, Message, SessionStore, COLON, MAX_HISTORY_TURNS, NEWLINE,
+        compress_messages_for_context, mid_turn_compress, Message, SessionStore, COLON,
+        MAX_HISTORY_TURNS, NEWLINE,
     },
     models,
     prompt::MultilineHistoryState,
@@ -596,6 +597,161 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
 
     let _ = std::fs::remove_file(path);
     let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+#[test]
+fn mid_turn_compress_preserves_latest_user_message() {
+    let latest_user = "请继续修复 request.rs 的流式中断问题";
+    let filler = "x".repeat(12000);
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("早期需求：实现 streaming".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(filler),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(latest_user.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("收到，我继续处理".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let (compressed, before, after) = mid_turn_compress(messages, 4000);
+    assert!(after <= before, "compression should not expand payload");
+
+    let has_latest_user = compressed.iter().any(|m| {
+        m.role == "user" && m.content.as_str() == Some(latest_user)
+    });
+    assert!(
+        has_latest_user,
+        "mid-turn compression must preserve the latest user message"
+    );
+}
+
+#[test]
+fn mid_turn_compress_keeps_tool_pairs_consistent() {
+    let huge = "x".repeat(18_000);
+    let tool_call = ToolCall {
+        id: "call_pair_1".to_string(),
+        tool_type: "function".to_string(),
+        function: FunctionCall {
+            name: "read_file".to_string(),
+            arguments: "{\"file_path\":\"src/main.rs\"}".to_string(),
+        },
+    };
+
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("先分析历史错误".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![tool_call.clone()]),
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "tool".to_string(),
+            content: Value::String(huge.clone()),
+            tool_calls: None,
+            tool_call_id: Some(tool_call.id.clone()),
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("我继续排查".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("请继续修复并验证".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(huge),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let (compressed, _before, _after) = mid_turn_compress(messages, 4_000);
+
+    let mut assistant_tool_ids = std::collections::HashSet::new();
+    for message in &compressed {
+        if message.role == "assistant" {
+            if let Some(calls) = &message.tool_calls {
+                for call in calls {
+                    assistant_tool_ids.insert(call.id.clone());
+                }
+            }
+        }
+    }
+
+    let mut tool_message_ids = std::collections::HashSet::new();
+    for message in &compressed {
+        if message.role == "tool" {
+            if let Some(id) = &message.tool_call_id {
+                tool_message_ids.insert(id.clone());
+            }
+        }
+    }
+
+    for id in &assistant_tool_ids {
+        assert!(
+            tool_message_ids.contains(id),
+            "assistant tool_call '{id}' must have a paired tool message"
+        );
+    }
+
+    for id in &tool_message_ids {
+        assert!(
+            assistant_tool_ids.contains(id),
+            "tool message '{id}' must be referenced by an assistant tool_call"
+        );
+    }
 }
 
 #[test]

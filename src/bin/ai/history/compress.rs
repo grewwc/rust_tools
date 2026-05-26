@@ -1550,19 +1550,47 @@ fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> {
 }
 
 fn first_trim_candidate(messages: &[Message]) -> Option<usize> {
+    let protected_tail_start = messages
+        .iter()
+        .rposition(|m| m.role == "user")
+        .unwrap_or(messages.len());
+
     // 跳过头部所有 system-like（system / internal_note）消息：它们承载 agent
     // 指令、工具列表、历史摘要等关键上下文，不能被裁掉。
     // 旧实现只跳过以"对话摘要/历史摘要"前缀开头的条目，会把普通 system prompt
     // 当成可裁削目标，触发"上下文压缩后回复戛然而止"。
+    // 同时把最新 user 起始的整段尾部窗口都设为保护区，避免把最新任务与其
+    // 后续 assistant/tool 上下文切开。
     let mut index = 0usize;
     while index < messages.len() && is_system_like_role(&messages[index].role) {
         index += 1;
     }
-    if index >= messages.len() {
-        None
-    } else {
-        Some(index)
+
+    while index < protected_tail_start {
+        let message = &messages[index];
+
+        // tool 不单删：否则可能破坏 assistant(tool_calls) ↔ tool 的配对关系。
+        if message.role == "tool" {
+            index += 1;
+            continue;
+        }
+
+        // 带 tool_calls 的 assistant 不单删：保持协议配对一致性。
+        if message.role == "assistant"
+            && message
+                .tool_calls
+                .as_ref()
+                .map(|calls| !calls.is_empty())
+                .unwrap_or(false)
+        {
+            index += 1;
+            continue;
+        }
+
+        return Some(index);
     }
+
+    None
 }
 
 /// 渐进式卸载：把一个 (assistant tool_calls + 配套 tool 结果) 整组折叠成单条

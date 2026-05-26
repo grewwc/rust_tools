@@ -568,7 +568,7 @@ pub(super) fn canonical_agent_name(name: &str) -> &str {
     }
 }
 
-pub(super) fn agents_dir() -> PathBuf {
+pub(crate) fn agents_dir() -> PathBuf {
     let cfg = configw::get_all_config();
     let raw = cfg.get_opt("ai.agents.dir").unwrap_or_default();
     let path = if raw.trim().is_empty() {
@@ -577,6 +577,19 @@ pub(super) fn agents_dir() -> PathBuf {
         raw
     };
     PathBuf::from(expanduser(&path).as_ref())
+}
+
+/// 返回 builtin agent 的文件名集合（如 "build.agent"）。供 save_agent
+/// 工具校验，禁止覆盖编译进二进制的 builtin。
+pub(crate) fn builtin_agent_filenames() -> &'static [&'static str] {
+    const NAMES: &[&str] = &[
+        "build.agent",
+        "executor.agent",
+        "plan.agent",
+        "explore.agent",
+        "prompt-skill.agent",
+    ];
+    NAMES
 }
 
 fn looks_like_front_matter_agent(content: &str) -> bool {

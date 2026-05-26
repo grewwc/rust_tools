@@ -16,6 +16,7 @@ routing_tags:
   - 生成
 tools:
   - save_skill
+  - save_agent
   - read_file_lines
   - write_file
   - apply_patch

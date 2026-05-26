@@ -136,6 +136,27 @@ pub(super) fn model_quality_tier(model: &str) -> ModelQualityTier {
         .unwrap_or_default()
 }
 
+fn default_context_window_tokens_for_tier(tier: ModelQualityTier) -> usize {
+    match tier {
+        ModelQualityTier::Flagship => 256_000,
+        ModelQualityTier::Strong => 128_000,
+        ModelQualityTier::Standard => 96_000,
+        ModelQualityTier::Basic => 64_000,
+    }
+}
+
+/// 返回模型上下文窗口（token）。
+/// 若 models.json 未声明，按质量档位给出保守默认值，供压缩预算动态估算使用。
+pub(super) fn context_window_tokens(model: &str) -> usize {
+    if let Some(def) = model_names::find_by_name(model) {
+        return def
+            .context_window_tokens
+            .filter(|v| *v > 0)
+            .unwrap_or_else(|| default_context_window_tokens_for_tier(def.quality_tier));
+    }
+    default_context_window_tokens_for_tier(model_quality_tier(model))
+}
+
 fn all_model_names() -> Vec<String> {
     model_names::all().iter().map(|m| m.name.clone()).collect()
 }
