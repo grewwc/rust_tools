@@ -1,3 +1,4 @@
+use crate::ai::provider::ReasoningEffort;
 use crate::terminalw::parser::Parser as TermParser;
 
 pub(super) const DEFAULT_NUM_HISTORY: usize = 256;
@@ -23,6 +24,13 @@ pub(super) struct ParsedCli {
     pub(super) no_skills: bool,
     pub(super) mcp_config: String,
     pub(super) help: bool,
+    /// 用户对推理强度档位的会话级覆盖。语义说明：
+    /// - `None`：未设置，遵循 [models.json](../../../models.json) 的模型默认值；
+    /// - `Some(Some(level))`：强制使用该档位（minimal/low/medium/high）；
+    /// - `Some(None)`：用户显式关闭，请求里不带 `reasoning_effort` 字段。
+    ///
+    /// `/model effort <x>` 与 `--reasoning-effort` 都写入此字段。
+    pub(super) reasoning_effort_override: Option<Option<ReasoningEffort>>,
 }
 
 impl Default for ParsedCli {
@@ -46,6 +54,7 @@ impl Default for ParsedCli {
             no_skills: false,
             mcp_config: String::new(),
             help: false,
+            reasoning_effort_override: None,
         }
     }
 }
@@ -89,6 +98,12 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     parser.add_string("out", "", "write output to file");
     parser.alias("o", "out");
     parser.add_string("mcp-config", "", "mcp config json path override");
+    parser.add_string(
+        "reasoning-effort",
+        "",
+        "reasoning effort: minimal | low | medium | high | off (clears default; only effective on OpenAI/OpenRouter/OpenCode providers)",
+    );
+    parser.alias("re", "reasoning-effort");
 
     // 解析 argv（跳过 program name）
     let mut argv: Vec<String> = if raw.len() > 1 {
@@ -189,6 +204,35 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         cli.mcp_config = parser.flag_value_or_default("mcp-config");
     }
 
+    // 处理 reasoning-effort
+    // 字面量映射：
+    //   minimal/min -> Minimal
+    //   low         -> Low
+    //   medium/mid  -> Medium
+    //   high        -> High
+    //   off/none/no/false -> 显式关闭（请求里不带字段）
+    //   其他非空字符串：保留为未设置 + stderr 提示
+    if parser.contains_flag_strict("reasoning-effort") {
+        let raw = parser.flag_value_or_default("reasoning-effort");
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            // 用户给了 --reasoning-effort=（空），等价于显式关闭。
+            cli.reasoning_effort_override = Some(None);
+        } else if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "off" | "none" | "no" | "false" | "disable" | "disabled"
+        ) {
+            cli.reasoning_effort_override = Some(None);
+        } else if let Some(level) = ReasoningEffort::parse(trimmed) {
+            cli.reasoning_effort_override = Some(Some(level));
+        } else {
+            eprintln!(
+                "[Warn] unknown --reasoning-effort value '{}'. Expected: minimal | low | medium | high | off",
+                trimmed
+            );
+        }
+    }
+
     // 处理位置参数（prompt args）
     cli.args = parser.positional_args(false);
 
@@ -225,6 +269,12 @@ pub(super) fn print_help() {
     parser.add_string("out", "", "write output to file");
     parser.alias("o", "out");
     parser.add_string("mcp-config", "", "mcp config json path override");
+    parser.add_string(
+        "reasoning-effort",
+        "",
+        "reasoning effort: minimal | low | medium | high | off (clears default; only effective on OpenAI/OpenRouter/OpenCode providers)",
+    );
+    parser.alias("re", "reasoning-effort");
 
     println!("AI CLI - Interactive AI Assistant");
     println!("Usage: a [OPTIONS] [PROMPT]");
@@ -246,6 +296,8 @@ pub(super) fn print_help() {
     println!("  General:");
     println!("    /help, /h                 show this help message");
     println!("    /model [name]             list or switch models");
+    println!("    /model effort [<value>]   show or override reasoning effort");
+    println!("                                (minimal|low|medium|high|off|auto)");
     println!("    /feishu-auth              authenticate with Feishu");
     println!("    /share [output.md]        export current session as shareable markdown");
     println!();

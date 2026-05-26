@@ -5,7 +5,7 @@ use rust_tools::commonw::FastMap;
 use rust_tools::cw::SkipSet;
 use crate::commonw::utils::expanduser;
 
-use super::provider::{ApiProvider, ModelQualityTier};
+use super::provider::{ApiProvider, ModelQualityTier, ReasoningEffort};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ModelDef {
@@ -24,6 +24,50 @@ pub struct ModelDef {
     pub tools_default_enabled: bool,
     #[serde(default)]
     pub enable_thinking: bool,
+    /// 可选：默认推理强度档位。仅对 OpenAI/OpenCode 兼容协议生效，
+    /// `Compatible` provider 会忽略。CLI / `/model effort` 命令的覆盖优先级
+    /// 高于这里。
+    ///
+    /// 在 `models.json` 中可填以下值（大小写不敏感）：
+    /// - `"auto"` / `"none"` / `"off"` 或字段省略：等同 `None`，请求中不带
+    ///   `reasoning_effort` 字段（与历史行为兼容）；
+    /// - `"minimal"` / `"low"` / `"medium"` / `"high"`：对应档位。
+    #[serde(
+        default,
+        alias = "reasoning_effort",
+        rename = "default_reasoning_effort",
+        deserialize_with = "deserialize_default_reasoning_effort"
+    )]
+    pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// 从字符串反序列化推理强度档位；接受 `auto` / `none` / `off` 等字面量作为
+/// "未设置"语义，等同字段省略。
+fn deserialize_default_reasoning_effort<'de, D>(
+    deserializer: D,
+) -> Result<Option<ReasoningEffort>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    match trimmed.to_ascii_lowercase().as_str() {
+        "auto" | "none" | "off" | "default" | "null" => Ok(None),
+        _ => match ReasoningEffort::parse(trimmed) {
+            Some(level) => Ok(Some(level)),
+            None => Err(serde::de::Error::custom(format!(
+                "unknown default_reasoning_effort '{}': expected auto/minimal/low/medium/high/off",
+                trimmed
+            ))),
+        },
+    }
 }
 
 static USER_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_user_models);

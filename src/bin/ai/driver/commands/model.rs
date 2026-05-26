@@ -1,16 +1,49 @@
-use crate::ai::{model_names, models, types::App};
+use crate::ai::{
+    model_names, models,
+    provider::ReasoningEffort,
+    types::App,
+};
 
 fn print_model_help() {
     println!("Model commands:");
     println!();
-    println!("  /model                     list available models");
-    println!("  /model current             show current model");
-    println!("  /model <name>              switch to a model");
+    println!("  /model                              list available models");
+    println!("  /model current                      show current model & effort");
+    println!("  /model <name>                       switch to a model");
+    println!("  /model effort                       show current reasoning effort");
+    println!("  /model effort <minimal|low|medium|high>");
+    println!("                                      override reasoning effort");
+    println!("  /model effort off|none|auto         clear override (use model default)");
     println!();
+}
+
+/// 计算当前生效的推理强度（与 [`request::resolve_reasoning_effort`] 同语义，
+/// 但本模块不依赖 request.rs 内部结构，所以在这里复刻一份纯查询逻辑）。
+fn effective_effort(app: &App, model: &str) -> Option<ReasoningEffort> {
+    if let Some(override_value) = app.cli.reasoning_effort_override.as_ref() {
+        return *override_value;
+    }
+    models::default_reasoning_effort(model)
+}
+
+fn format_effort(effort: Option<ReasoningEffort>) -> &'static str {
+    match effort {
+        Some(e) => e.as_str(),
+        None => "auto",
+    }
 }
 
 fn print_model_list(app: &App) {
     println!("Current model: {}", app.current_model);
+    println!(
+        "Reasoning effort: {} (override: {})",
+        format_effort(effective_effort(app, &app.current_model)),
+        match app.cli.reasoning_effort_override {
+            None => "none".to_string(),
+            Some(None) => "off".to_string(),
+            Some(Some(e)) => e.as_str().to_string(),
+        }
+    );
     println!();
     println!("Available models:");
     for model in model_names::all() {
@@ -24,6 +57,14 @@ fn print_model_list(app: &App) {
             model.search_enabled.then_some("search"),
             model.tools_default_enabled.then_some("tools"),
             model.enable_thinking.then_some("thinking"),
+            model
+                .reasoning_effort
+                .map(|e| match e {
+                    ReasoningEffort::Minimal => "effort:minimal",
+                    ReasoningEffort::Low => "effort:low",
+                    ReasoningEffort::Medium => "effort:medium",
+                    ReasoningEffort::High => "effort:high",
+                }),
         ]
         .into_iter()
         .flatten()
@@ -86,7 +127,63 @@ pub fn try_handle_model_command(
                 if def.tools_default_enabled { "yes" } else { "no" }
             );
             println!("Thinking: {}", if def.enable_thinking { "yes" } else { "no" });
+            println!(
+                "Reasoning effort: {} (model default: {}, override: {})",
+                format_effort(effective_effort(app, &app.current_model)),
+                format_effort(def.reasoning_effort),
+                match app.cli.reasoning_effort_override {
+                    None => "none".to_string(),
+                    Some(None) => "off".to_string(),
+                    Some(Some(e)) => e.as_str().to_string(),
+                }
+            );
             println!("Endpoint: {}", models::endpoint_for_model(&def.name, ""));
+        }
+        return Ok(true);
+    }
+
+    // /model effort [<value>]
+    if let Some(rest) = remainder.strip_prefix("effort") {
+        let arg = rest.trim();
+        if arg.is_empty() {
+            println!(
+                "Reasoning effort: {} (override: {})",
+                format_effort(effective_effort(app, &app.current_model)),
+                match app.cli.reasoning_effort_override {
+                    None => "none".to_string(),
+                    Some(None) => "off".to_string(),
+                    Some(Some(e)) => e.as_str().to_string(),
+                }
+            );
+            return Ok(true);
+        }
+        match arg.to_ascii_lowercase().as_str() {
+            "auto" | "clear" | "default" | "reset" => {
+                app.cli.reasoning_effort_override = None;
+                println!(
+                    "Cleared reasoning_effort override; now using model default ({}).",
+                    format_effort(models::default_reasoning_effort(&app.current_model))
+                );
+                return Ok(true);
+            }
+            "off" | "none" | "no" | "false" | "disable" | "disabled" => {
+                app.cli.reasoning_effort_override = Some(None);
+                println!("Reasoning effort disabled (no field will be sent).");
+                return Ok(true);
+            }
+            _ => {}
+        }
+        match ReasoningEffort::parse(arg) {
+            Some(level) => {
+                app.cli.reasoning_effort_override = Some(Some(level));
+                println!("Reasoning effort overridden: {}", level.as_str());
+            }
+            None => {
+                println!(
+                    "Unknown reasoning effort '{}'. Allowed: minimal, low, medium, high, off, auto.",
+                    arg
+                );
+            }
         }
         return Ok(true);
     }

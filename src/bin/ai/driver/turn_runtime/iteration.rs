@@ -435,7 +435,7 @@ pub(super) async fn execute_turn_iteration(
         ));
     }
 
-    request::print_info(next_model);
+    request::print_info(app, next_model);
     let stream_result =
         stream_model_response(
             app,

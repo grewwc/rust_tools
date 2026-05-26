@@ -14,7 +14,7 @@ use super::{
     files,
     history::{Message, ROLE_SYSTEM, is_internal_note_role, is_system_like_role, messages_to_markdown},
     models,
-    provider::ApiProvider,
+    provider::{ApiProvider, ReasoningEffort},
     skills::SkillManifest,
     types::App,
 };
@@ -35,6 +35,11 @@ struct RequestBody<'a> {
     tools: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
+    /// OpenAI / OpenRouter / OpenCode 兼容协议的推理强度顶层字段。
+    /// 仅对 `provider.is_openai()` 为真的模型注入；其它 provider 会
+    /// 跳过，避免被服务端拒绝（部分网关对未知字段返回 400）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'a str>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -710,6 +715,7 @@ async fn decide_thinking_via_model(
         None,
         None,
         None,
+        None,
     );
 
     let endpoint = endpoint_for_request_model(app, &control_model);
@@ -821,6 +827,7 @@ pub(super) async fn do_request_messages(
             model
         );
     }
+    let reasoning_effort = resolve_reasoning_effort(app, model).map(|e| e.as_str());
     let request_body = build_request_body(
         model,
         &normalized_messages,
@@ -829,6 +836,7 @@ pub(super) async fn do_request_messages(
         models::search_enabled(model).then_some(true),
         tools_value,
         tool_choice,
+        reasoning_effort,
     );
 
     for attempt in 1..=REQUEST_MAX_ATTEMPTS_429 {
@@ -1040,6 +1048,7 @@ Skills:
         &messages,
         false,
         false,
+        None,
         None,
         None,
         None,
@@ -1477,14 +1486,23 @@ pub(super) fn build_content(
     Ok(Value::Array(parts))
 }
 
-pub(super) fn print_info(model: &str) {
+pub(super) fn print_info(app: &App, model: &str) {
     let search = if models::search_enabled(model) {
         "true"
     } else {
         "false"
     };
+    let effort_label = match resolve_reasoning_effort(app, model) {
+        Some(e) => e.as_str(),
+        None => "auto",
+    };
     // 使用 println! 避免手动 flush 的权限问题
-    println!("[{} (search: {})]", model.green(), search.red());
+    println!(
+        "[{} (search: {}, effort: {})]",
+        model.green(),
+        search.red(),
+        effort_label.cyan()
+    );
 }
 
 fn build_request_body<'a>(
@@ -1495,8 +1513,17 @@ fn build_request_body<'a>(
     enable_search: Option<bool>,
     tools: Option<Value>,
     tool_choice: Option<Value>,
+    reasoning_effort: Option<&'a str>,
 ) -> RequestBody<'a> {
     let provider = models::model_provider(model);
+    // `reasoning_effort` 仅对 OpenAI / OpenRouter / OpenCode 等
+    // OpenAI-兼容网关有效；阿里云 DashScope `Compatible` provider 当前
+    // 不识别这个字段，提交后会被拒或忽略，所以这里强制清空。
+    let effective_effort = if provider.is_openai() {
+        reasoning_effort
+    } else {
+        None
+    };
     match provider {
         ApiProvider::Compatible => RequestBody {
             model,
@@ -1506,6 +1533,7 @@ fn build_request_body<'a>(
             enable_search,
             tools,
             tool_choice,
+            reasoning_effort: effective_effort,
         },
         _ => RequestBody {
             model,
@@ -1515,8 +1543,22 @@ fn build_request_body<'a>(
             enable_search: None,
             tools,
             tool_choice,
+            reasoning_effort: effective_effort,
         },
     }
+}
+
+/// 解析当前会话生效的推理强度档位，按优先级从高到低：
+/// 1. CLI 参数 `--reasoning-effort` 或 `/model effort <x>` 留下的覆盖
+///    （存储在 [`App.cli.reasoning_effort_override`]，其中 `Some(None)`
+///    表示用户显式关闭，`None` 表示未设置）；
+/// 2. [models.json](../../../models.json) 中该模型的默认 `reasoning_effort`；
+/// 3. `None` —— 不注入字段，保持服务端默认行为。
+pub(super) fn resolve_reasoning_effort(app: &App, model: &str) -> Option<ReasoningEffort> {
+    if let Some(override_value) = app.cli.reasoning_effort_override.as_ref() {
+        return *override_value;
+    }
+    models::default_reasoning_effort(model)
 }
 
 /// 使用 LLM 进行 JSON 格式的请求（用于意图识别等场景）
@@ -1710,6 +1752,7 @@ pub(super) async fn summarize_history_via_model(
         None,
         None,
         None,
+        None,
     );
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
@@ -1838,6 +1881,7 @@ confidence ∈ [0,1]，对边界样本请给低值（<0.6）。"
         &gate_messages,
         false,
         false,
+        None,
         None,
         None,
         None,
@@ -2055,6 +2099,7 @@ mod tests {
             Some(true),
             None,
             None,
+            None,
         );
         let value = serde_json::to_value(&body).unwrap();
 
@@ -2081,6 +2126,7 @@ mod tests {
             false,
             true,
             Some(true),
+            None,
             None,
             None,
         );

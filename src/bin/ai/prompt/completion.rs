@@ -156,6 +156,20 @@ impl CommandCompleter {
         &["help", "list", "current", "use", "auto"]
     }
 
+    /// `/model` 的二级子命令字面量。注意：这些子命令与"模型名"互斥地占据
+    /// 第二个 token；为了让 Tab 既能补出子命令也能补出模型名，
+    /// `complete_for_line` 会把它们合并到候选列表中（前缀过滤）。
+    fn model_subcommands() -> &'static [&'static str] {
+        &[
+            "current", "list", "help", "use", "select", "switch", "effort",
+        ]
+    }
+
+    /// `/model effort` 的第三个 token 候选：推理强度档位 + auto/off。
+    fn model_effort_levels() -> &'static [&'static str] {
+        &["minimal", "low", "medium", "high", "auto", "off"]
+    }
+
     fn session_subcommands() -> &'static [&'static str] {
         &[
             "list",
@@ -219,10 +233,46 @@ impl CommandCompleter {
                 return (token_start, Vec::new());
             };
             if Self::is_model_command(first) {
-                Self::model_name_candidates()
-                    .into_iter()
-                    .filter(|candidate| candidate.replacement.starts_with(token))
-                    .collect()
+                // 第二个 token 之后还有更深层补全（目前只有 `/model effort <level>`）。
+                // 这里检查"`/model` 后面已经有几个非空 token"。
+                let second = words.next();
+                match second {
+                    None => {
+                        // 第二个 token：模型名（带 current 置顶）+ `/model` 子命令字面量。
+                        // 模型名放在前面以保留"当前模型 == 第一项"的体验。
+                        let mut merged: Vec<CompletionCandidate> = Self::model_name_candidates()
+                            .into_iter()
+                            .filter(|candidate| candidate.replacement.starts_with(token))
+                            .collect();
+                        merged.extend(
+                            Self::model_subcommands()
+                                .iter()
+                                .filter(|candidate| candidate.starts_with(token))
+                                .map(|candidate| CompletionCandidate {
+                                    display: format!("{} · subcommand", candidate),
+                                    replacement: (*candidate).to_string(),
+                                }),
+                        );
+                        merged
+                    }
+                    Some("effort") => {
+                        // `/model effort <TAB>` -> 列出档位字面量。
+                        Self::plain_candidates(
+                            Self::model_effort_levels()
+                                .iter()
+                                .filter(|candidate| candidate.starts_with(token))
+                                .map(|candidate| (*candidate).to_string()),
+                        )
+                    }
+                    Some("use") | Some("select") | Some("switch") => {
+                        // `/model use <TAB>` -> 列出模型名。
+                        Self::model_name_candidates()
+                            .into_iter()
+                            .filter(|candidate| candidate.replacement.starts_with(token))
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                }
             } else {
                 let source = match first {
                     "/agents" | ":agents" | "/agent" | ":agent" => Self::agent_subcommands(),
@@ -603,6 +653,71 @@ mod tests {
         let (_, candidates) = CommandCompleter::complete_for_line("/model ", 7);
 
         assert_eq!(candidates.first().map(|c| c.replacement.as_str()), Some(current.as_str()));
+    }
+
+    #[test]
+    fn model_completion_includes_effort_subcommand() {
+        let (_, candidates) = CommandCompleter::complete_for_line("/model ef", 9);
+        assert!(
+            candidates.iter().any(|c| c.replacement == "effort"),
+            "expected `effort` in candidates: {:?}",
+            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn model_completion_includes_current_help_list_subcommands() {
+        let (_, candidates) = CommandCompleter::complete_for_line("/model ", 7);
+        let labels: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
+        for sub in ["current", "list", "help", "use", "effort"] {
+            assert!(
+                labels.iter().any(|x| x == sub),
+                "expected subcommand `{}` in candidates: {:?}",
+                sub,
+                labels
+            );
+        }
+    }
+
+    #[test]
+    fn model_effort_completion_lists_levels() {
+        let (start, candidates) = CommandCompleter::complete_for_line("/model effort ", 14);
+        assert_eq!(start, 14);
+        let labels: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
+        for level in ["minimal", "low", "medium", "high", "auto", "off"] {
+            assert!(
+                labels.iter().any(|x| x == level),
+                "expected level `{}` in candidates: {:?}",
+                level,
+                labels
+            );
+        }
+    }
+
+    #[test]
+    fn model_effort_completion_filters_by_prefix() {
+        let (_, candidates) = CommandCompleter::complete_for_line("/model effort m", 15);
+        let labels: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
+        assert!(labels.iter().any(|x| x == "minimal"));
+        assert!(labels.iter().any(|x| x == "medium"));
+        assert!(!labels.iter().any(|x| x == "high"));
+        assert!(!labels.iter().any(|x| x == "low"));
+    }
+
+    #[test]
+    fn model_use_completion_lists_models() {
+        let current = crate::ai::model_names::all()
+            .first()
+            .expect("models.json is empty")
+            .name
+            .clone();
+        CommandCompleter::set_current_model_hint(&current);
+
+        let (_, candidates) = CommandCompleter::complete_for_line("/model use ", 11);
+        assert!(
+            candidates.iter().any(|c| c.replacement == current),
+            "expected current model in `/model use ` candidates"
+        );
     }
 
     #[test]

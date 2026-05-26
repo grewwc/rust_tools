@@ -28,7 +28,8 @@
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
-    "enable_thinking": true
+    "enable_thinking": true,
+    "default_reasoning_effort": "high"
   },
   {
     "key": "KIMI",

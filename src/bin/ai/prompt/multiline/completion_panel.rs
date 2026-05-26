@@ -68,12 +68,30 @@ fn should_open_popup_on_first_tab(ctx: &PendingTabCompletion) -> bool {
 
 fn should_submit_immediately(line: &str) -> bool {
     let trimmed = line.trim();
-    (trimmed.starts_with("/model ") || trimmed.starts_with(":model "))
-        && trimmed.split_whitespace().nth(1).is_some()
-        && !matches!(
-            trimmed.split_whitespace().nth(1),
-            Some("help" | "current" | "list")
-        )
+    if !(trimmed.starts_with("/model ") || trimmed.starts_with(":model ")) {
+        return false;
+    }
+    let mut tokens = trimmed.split_whitespace();
+    let _ = tokens.next(); // 跳过 `/model`
+    let Some(second) = tokens.next() else {
+        return false;
+    };
+    // 这些子命令本身完整：选中后立即执行（与之前 `/model <name>` 行为一致）。
+    if matches!(second, "current" | "help" | "list") {
+        return false;
+    }
+    // `use|select|switch` 需要第三个 token (模型名) 才完整。
+    if matches!(second, "use" | "select" | "switch") {
+        return tokens.next().is_some();
+    }
+    // `effort` 单独使用（查询）OK；带 level 时也 OK；
+    // 但当用户只选中"effort"自身时，下一步还要选 level，
+    // 所以这里要求 `effort` 后必须有第三个 token 才提交。
+    if second == "effort" {
+        return tokens.next().is_some();
+    }
+    // 其余视为模型名，立即提交。
+    true
 }
 
 pub(in crate::ai::prompt::multiline) fn move_completion_selection(

@@ -2,7 +2,7 @@ use super::agents::{AgentManifest, AgentModelTier};
 use super::cli::ParsedCli;
 use super::config_schema::AiConfig;
 use super::model_names::{self, ModelDef};
-use super::provider::{ApiProvider, ModelQualityTier};
+use super::provider::{ApiProvider, ModelQualityTier, ReasoningEffort};
 use crate::commonw::configw;
 
 const COMPATIBLE_DEFAULT_ENDPOINT: &str =
@@ -33,6 +33,13 @@ pub(super) fn enable_thinking(model: &str) -> bool {
     model_names::find_by_name(model)
         .map(|m| m.enable_thinking)
         .unwrap_or(false)
+}
+
+/// 返回该模型在 [models.json](../../../models.json) 中声明的默认推理强度
+/// （`reasoning_effort`）。CLI / `/model effort` 命令的覆盖会在
+/// `request::resolve_reasoning_effort` 里优先生效，此处仅给出"模型默认"。
+pub(super) fn default_reasoning_effort(model: &str) -> Option<ReasoningEffort> {
+    model_names::find_by_name(model).and_then(|m| m.reasoning_effort)
 }
 
 pub(super) fn model_provider(model: &str) -> ApiProvider {
