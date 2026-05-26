@@ -175,15 +175,13 @@ fn default_priority_for_category(category: &str) -> u8 {
 ///     best_practice/common_sense）
 ///   - `project_memory`：项目级事实，writeback 路径会主动 upsert，不应被时间淘汰
 ///
-/// 注意 self_note 虽属于 guideline 用于召回，但属于会话期反思，应参与 GC。
+/// 注意 self_note 是会话期反思，已从 `guideline_categories()` 中移除，
+/// 不再被全局召回，也不在此处豁免 GC（自然落入正常时间淘汰）。
 pub(crate) fn is_permanent_memory(entry: &AgentMemoryEntry) -> bool {
     if entry.priority.unwrap_or(100) == 255 {
         return true;
     }
-    // self_note 是会话期反思，虽然属于 guideline 用于 recall，但应参与 GC
-    if entry.category.as_str() != "self_note"
-        && crate::ai::knowledge::retrieval::recall::is_guideline_category(&entry.category)
-    {
+    if crate::ai::knowledge::retrieval::recall::is_guideline_category(&entry.category) {
         return true;
     }
     matches!(entry.category.as_str(), "project_memory")

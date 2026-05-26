@@ -254,7 +254,9 @@ mod tests {
         let guidelines =
             build_persistent_guidelines("delete files safely", 1200).expect("guidelines");
 
-        assert!(guidelines.contains("Do: validate tool arguments"));
+        // self_note 已从 guideline_categories 移除（避免跨 session 污染），
+        // 不再应出现在 persistent guidelines 中
+        assert!(!guidelines.contains("Do: validate tool arguments"));
         assert!(guidelines.contains("Avoid: delete files without double checking"));
         assert!(guidelines.contains("Keep broadly applicable engineering habits in memory."));
         assert!(guidelines.contains("Prefer cargo check before cargo test for quick feedback."));

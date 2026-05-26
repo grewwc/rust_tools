@@ -596,11 +596,24 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     if split_at == 0 || split_at >= messages.len() {
         return (messages, before, before, false);
     }
-    let earlier = &messages[..split_at];
+
+    // 关键：保留头部所有 system / internal_note 类消息（agent 指令、工具列表、
+    // 全局指引等）。早期版本直接 `out = [summary, ..messages[split_at..]]`，
+    // 把 messages[0] 的真正 system prompt 整段丢弃，模型立刻失去 agent 行为
+    // 指令，表现为"上下文压缩后回复戛然而止 / 极短 / 跑偏"。
+    // 新策略：把 [0..split_at) 区段中前缀连续的 system-like 消息原样保留，
+    // 只摘要其后的 user/assistant/tool 对话区段。
+    let preserved_system_end = messages[..split_at]
+        .iter()
+        .position(|m| !is_system_like_role(&m.role))
+        .unwrap_or(split_at);
+
+    let earlier = &messages[preserved_system_end..split_at];
     let has_dialog = earlier
         .iter()
         .any(|m| m.role == "user" || m.role == "assistant");
     if !has_dialog {
+        // 早段全是 system-like，没什么可摘要的；直接放弃压缩，避免无意义改写。
         return (messages, before, before, false);
     }
 
@@ -609,7 +622,11 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         return (messages, before, before, false);
     }
 
-    let mut out = Vec::with_capacity(messages.len() - split_at + 1);
+    let mut out = Vec::with_capacity(preserved_system_end + 1 + (messages.len() - split_at));
+    // 1. 头部 system / internal_note（agent 指令等）原样保留
+    out.extend_from_slice(&messages[..preserved_system_end]);
+    // 2. 摘要本身作为 internal_note 注入（normalize_messages_for_request 会把它
+    //    归类成 Summary heading 并合并进 system 消息）
     out.push(Message {
         role: ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(format!(
@@ -619,6 +636,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         tool_call_id: None,
         reasoning_content: None,
     });
+    // 3. 尾部最近 keep_recent_turns 个 user 起始的窗口
     out.extend_from_slice(&messages[split_at..]);
     let after = messages_total_chars(&out);
     (out, before, after, true)
@@ -1532,13 +1550,19 @@ fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> {
 }
 
 fn first_trim_candidate(messages: &[Message]) -> Option<usize> {
-    for (index, message) in messages.iter().enumerate() {
-        if index == 0 && is_summary_message(message) {
-            continue;
-        }
-        return Some(index);
+    // 跳过头部所有 system-like（system / internal_note）消息：它们承载 agent
+    // 指令、工具列表、历史摘要等关键上下文，不能被裁掉。
+    // 旧实现只跳过以"对话摘要/历史摘要"前缀开头的条目，会把普通 system prompt
+    // 当成可裁削目标，触发"上下文压缩后回复戛然而止"。
+    let mut index = 0usize;
+    while index < messages.len() && is_system_like_role(&messages[index].role) {
+        index += 1;
     }
-    None
+    if index >= messages.len() {
+        None
+    } else {
+        Some(index)
+    }
 }
 
 /// 渐进式卸载：把一个 (assistant tool_calls + 配套 tool 结果) 整组折叠成单条
