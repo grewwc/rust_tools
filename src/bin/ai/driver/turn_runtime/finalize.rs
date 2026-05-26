@@ -2,6 +2,7 @@ use crate::ai::{
     driver::{print::format_empty_state, reflection},
     history::{
         Message, compact_session_history_at_boundary_with_app, compact_session_history_with_app,
+        value_to_string,
     },
     types::App,
 };
@@ -31,13 +32,6 @@ fn ensure_final_assistant_recorded(
         tool_call_id: None,
         reasoning_content: None,
     });
-}
-
-fn value_to_plain_text(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        other => other.to_string(),
-    }
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -88,7 +82,7 @@ fn collect_subagent_tool_evidence(turn_messages: &[Message]) -> Vec<String> {
         let Some((tool_name, args)) = id_to_call.get(tool_call_id) else {
             continue;
         };
-        let content = value_to_plain_text(&message.content);
+        let content = value_to_string(&message.content);
         let content = content.trim();
         if content.is_empty() {
             continue;
@@ -110,10 +104,10 @@ fn format_subagent_result_for_parent(
     final_assistant_text: &str,
     turn_messages: &[Message],
 ) -> String {
-    let mut output = final_assistant_text.trim().to_string();
+    let final_assistant_text = final_assistant_text.trim();
     let evidence = collect_subagent_tool_evidence(turn_messages);
     if evidence.is_empty() {
-        return output;
+        return final_assistant_text.to_string();
     }
 
     let mut evidence_block = String::from("[Subagent tool evidence]\n");
@@ -122,11 +116,13 @@ fn format_subagent_result_for_parent(
     );
     evidence_block.push_str(&evidence.join("\n"));
 
+    let mut output = truncate_chars(&evidence_block, SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS);
+    if final_assistant_text.is_empty() {
+        return output;
+    }
     output.push_str("\n\n");
-    output.push_str(&truncate_chars(
-        &evidence_block,
-        SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS,
-    ));
+    output.push_str("[Subagent final answer]\n");
+    output.push_str(final_assistant_text);
     output
 }
 
@@ -373,11 +369,12 @@ mod tests {
         ];
 
         let output = format_subagent_result_for_parent("done", &turn_messages);
-        assert!(output.contains("done"));
+        assert!(output.starts_with("[Subagent tool evidence]"));
         assert!(output.contains("[Subagent tool evidence]"));
         assert!(output.contains("read_file_lines("));
         assert!(output.contains("\"file_path\":\"src/lib.rs\""));
         assert!(output.contains("fn load_config()"));
+        assert!(output.contains("[Subagent final answer]\ndone"));
     }
 
     #[test]
@@ -410,10 +407,12 @@ mod tests {
         ];
 
         let long_final = "x".repeat(SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS + 100);
-        let output = format_subagent_result_for_parent(&long_final, &turn_messages);
-        assert!(output.starts_with(&long_final));
+        let output = format_subagent_result_for_parent(long_final.as_str(), &turn_messages);
+        assert!(output.starts_with("[Subagent tool evidence]"));
         assert!(output.contains("[Subagent tool evidence]"));
         assert!(output.contains("read_file("));
         assert!(output.contains("pub mod ai;"));
+        assert!(output.contains("[Subagent final answer]\n"));
+        assert!(output.ends_with(&long_final));
     }
 }
