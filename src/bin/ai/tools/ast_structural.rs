@@ -1,10 +1,17 @@
 use std::collections::VecDeque;
 use std::fs;
-use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{Language, Parser, Query, QueryCursor};
+
+const MAX_STRUCTURAL_FILES: usize = 5_000;
+const MAX_STRUCTURAL_MATCHES: usize = 200;
+const MAX_STRUCTURAL_FILE_SIZE: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum StructuralSearch<'a> {
@@ -49,36 +56,46 @@ pub(crate) fn execute_structural_search(
         ));
     }
 
-
-    
-    // Parallel AST structural search across files
+    // 并行 AST 搜索，但结果必须全局限流；否则宽泛查询会把依赖/生成代码
+    // 的所有 capture 都堆进内存，最后在格式化输出前就可能把进程打爆。
     let max_threads = rust_tools::commonw::half_parallelism();
     let chunk_size = (files.len() / max_threads).max(1);
     let chunks: Vec<Vec<PathBuf>> = files.chunks(chunk_size).map(|c| c.to_vec()).collect();
-    
-    let all_matches: Arc<Mutex<Vec<(String, Vec<StructuralMatch>)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let all_matches: Arc<Mutex<Vec<(String, Vec<StructuralMatch>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let error_occurred: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let unsupported_count: Arc<std::sync::atomic::AtomicUsize> = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    
+    let unsupported_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let match_count: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
+    let limit_reached: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
     std::thread::scope(|scope| {
         for chunk in chunks {
             let matches_ref = Arc::clone(&all_matches);
             let error_ref = Arc::clone(&error_occurred);
             let unsupported_ref = Arc::clone(&unsupported_count);
+            let match_count_ref = Arc::clone(&match_count);
+            let limit_ref = Arc::clone(&limit_reached);
             scope.spawn(move || {
                 let mut local_results: Vec<(String, Vec<StructuralMatch>)> = Vec::new();
                 for file in chunk {
+                    if limit_ref.load(Ordering::Relaxed)
+                        || match_count_ref.load(Ordering::Relaxed) >= MAX_STRUCTURAL_MATCHES
+                    {
+                        limit_ref.store(true, Ordering::Relaxed);
+                        break;
+                    }
                     if error_ref.lock().unwrap().is_some() {
                         break;
                     }
                     let Some((language_name, language)) = language_for_path(&file) else {
-                        unsupported_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        unsupported_ref.fetch_add(1, Ordering::Relaxed);
                         continue;
                     };
                     let query = match resolve_query_for_language(request, language_name) {
                         Ok(Some(query)) => query,
                         Ok(None) => {
-                            unsupported_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            unsupported_ref.fetch_add(1, Ordering::Relaxed);
                             continue;
                         }
                         Err(err) => {
@@ -86,11 +103,26 @@ pub(crate) fn execute_structural_search(
                             return;
                         }
                     };
+                    let Ok(metadata) = fs::metadata(&file) else {
+                        continue;
+                    };
+                    if metadata.len() > MAX_STRUCTURAL_FILE_SIZE {
+                        continue;
+                    }
                     let content = match fs::read_to_string(&file) {
                         Ok(content) => content,
                         Err(_) => continue,
                     };
-                    let file_matches = match run_query_on_file(language, &query, &file, &content) {
+                    let filtered = match run_query_on_file(
+                        language_name,
+                        request,
+                        filters,
+                        language,
+                        &query,
+                        &file,
+                        &content,
+                        &match_count_ref,
+                    ) {
                         Ok(file_matches) => file_matches,
                         Err(err) => {
                             *error_ref.lock().unwrap() = Some(format!(
@@ -102,13 +134,12 @@ pub(crate) fn execute_structural_search(
                             return;
                         }
                     };
-                    let filtered: Vec<StructuralMatch> = file_matches
-                        .into_iter()
-                        .map(|m| normalize_match(language_name, request, m))
-                        .filter(|m| match_filters(m, filters))
-                        .collect();
                     if !filtered.is_empty() {
                         local_results.push((language_name.to_string(), filtered));
+                    }
+                    if match_count_ref.load(Ordering::Relaxed) >= MAX_STRUCTURAL_MATCHES {
+                        limit_ref.store(true, Ordering::Relaxed);
+                        break;
                     }
                 }
                 if !local_results.is_empty() {
@@ -117,18 +148,18 @@ pub(crate) fn execute_structural_search(
             });
         }
     });
-    
+
     // Check for errors
     if let Some(err) = error_occurred.lock().unwrap().as_ref() {
         return Err(err.clone());
     }
-    
+
     let all_results = all_matches.lock().unwrap();
     let mut matches: Vec<StructuralMatch> = Vec::new();
     for (_, file_matches) in all_results.iter() {
         matches.extend(file_matches.iter().cloned());
     }
-    let unsupported_files = unsupported_count.load(std::sync::atomic::Ordering::Relaxed);
+    let unsupported_files = unsupported_count.load(Ordering::Relaxed);
 
     if matches.is_empty() {
         return Ok(format!(
@@ -147,7 +178,18 @@ pub(crate) fn execute_structural_search(
         ));
     }
 
-    Ok(format_structural_matches(&matches))
+    matches.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then_with(|| a.line.cmp(&b.line))
+    });
+    matches.truncate(MAX_STRUCTURAL_MATCHES);
+
+    Ok(format_structural_matches(
+        &matches,
+        limit_reached.load(Ordering::Relaxed)
+            || match_count.load(Ordering::Relaxed) >= MAX_STRUCTURAL_MATCHES,
+    ))
 }
 
 fn describe_filters(filters: StructuralFilters<'_>) -> String {
@@ -240,8 +282,7 @@ fn normalize_match(
     let mut primary_capture: Option<(String, String)> = None;
     let mut normalized = Vec::with_capacity(item.captures.len() + 5);
     for (capture_name, text) in item.captures {
-        if primary_capture.is_none()
-            && matches!(capture_name.as_str(), "name" | "constructor_name")
+        if primary_capture.is_none() && matches!(capture_name.as_str(), "name" | "constructor_name")
         {
             primary_capture = Some((capture_name, text));
             continue;
@@ -385,7 +426,10 @@ fn resolve_query_for_language(
     }
 }
 
-fn structural_query_for_intent(language_name: &str, intent: &str) -> Result<Option<String>, String> {
+fn structural_query_for_intent(
+    language_name: &str,
+    intent: &str,
+) -> Result<Option<String>, String> {
     let query = match (language_name, intent) {
         ("rust", "find_functions") => {
             "(function_item name: (identifier) @name)".to_string()
@@ -546,10 +590,14 @@ fn structural_query_for_intent(language_name: &str, intent: &str) -> Result<Opti
 }
 
 fn run_query_on_file(
+    language_name: &str,
+    request: StructuralSearch<'_>,
+    filters: StructuralFilters<'_>,
     language: Language,
     query_src: &str,
     file_path: &Path,
     content: &str,
+    match_count: &AtomicUsize,
 ) -> Result<Vec<StructuralMatch>, String> {
     let mut parser = Parser::new();
     parser
@@ -570,6 +618,9 @@ fn run_query_on_file(
         matches.advance();
         matches.get().is_some()
     } {
+        if match_count.load(Ordering::Relaxed) >= MAX_STRUCTURAL_MATCHES {
+            break;
+        }
         let m = matches.get().expect("checked is_some above");
         let mut captures = Vec::new();
         let mut line = None;
@@ -589,17 +640,36 @@ fn run_query_on_file(
             captures.push((name, text));
         }
         if !captures.is_empty() {
-            out.push(StructuralMatch {
-                file_path: file_path.to_string_lossy().to_string(),
-                line: line.unwrap_or(1),
-                captures,
-            });
+            let item = normalize_match(
+                language_name,
+                request,
+                StructuralMatch {
+                    file_path: file_path.to_string_lossy().to_string(),
+                    line: line.unwrap_or(1),
+                    captures,
+                },
+            );
+            if !match_filters(&item, filters) {
+                continue;
+            }
+            if !try_reserve_match_slot(match_count) {
+                break;
+            }
+            out.push(item);
         }
     }
     Ok(out)
 }
 
-fn format_structural_matches(matches: &[StructuralMatch]) -> String {
+fn try_reserve_match_slot(match_count: &AtomicUsize) -> bool {
+    match_count
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < MAX_STRUCTURAL_MATCHES).then_some(count + 1)
+        })
+        .is_ok()
+}
+
+fn format_structural_matches(matches: &[StructuralMatch], limit_reached: bool) -> String {
     let mut out = String::new();
     out.push_str("AST structural matches:\n");
     for item in matches {
@@ -607,6 +677,12 @@ fn format_structural_matches(matches: &[StructuralMatch]) -> String {
         for (name, text) in &item.captures {
             out.push_str(&format!("  @{} = {}\n", name, text));
         }
+    }
+    if limit_reached {
+        out.push_str(&format!(
+            "\n... (match limit reached; showing first {} matches, narrow path/file_pattern/name/contains_text to continue)",
+            MAX_STRUCTURAL_MATCHES
+        ));
     }
     out.trim_end().to_string()
 }
@@ -619,7 +695,10 @@ fn collect_target_files(target: &Path, file_pattern: Option<&str>) -> Result<Vec
         return Err(format!("Path not found: {}", target.display()));
     }
     if !target.is_dir() {
-        return Err(format!("Target is not a file or directory: {}", target.display()));
+        return Err(format!(
+            "Target is not a file or directory: {}",
+            target.display()
+        ));
     }
 
     if let Some(pattern) = file_pattern.filter(|p| !p.trim().is_empty()) {
@@ -629,7 +708,8 @@ fn collect_target_files(target: &Path, file_pattern: Option<&str>) -> Result<Vec
         let files = matches
             .into_iter()
             .map(PathBuf::from)
-            .filter(|p| p.is_file())
+            .filter(|p| p.is_file() && !path_contains_skipped_dir(p))
+            .take(MAX_STRUCTURAL_FILES)
             .collect::<Vec<_>>();
         return Ok(files);
     }
@@ -641,6 +721,9 @@ fn collect_target_files(target: &Path, file_pattern: Option<&str>) -> Result<Vec
     let max_dirs = 10_000usize;
 
     while let Some(dir) = queue.pop_front() {
+        if out.len() >= MAX_STRUCTURAL_FILES {
+            break;
+        }
         scanned_dirs += 1;
         if scanned_dirs > max_dirs {
             break;
@@ -650,6 +733,9 @@ fn collect_target_files(target: &Path, file_pattern: Option<&str>) -> Result<Vec
             Err(_) => continue,
         };
         for entry in entries.flatten() {
+            if out.len() >= MAX_STRUCTURAL_FILES {
+                break;
+            }
             let path = entry.path();
             let ft = match entry.file_type() {
                 Ok(ft) => ft,
@@ -658,11 +744,26 @@ fn collect_target_files(target: &Path, file_pattern: Option<&str>) -> Result<Vec
             if ft.is_file() && language_for_path(&path).is_some() {
                 out.push(path);
             } else if ft.is_dir() && !ft.is_symlink() {
-                queue.push_back(path);
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !should_skip_dir(name) {
+                    queue.push_back(path);
+                }
             }
         }
     }
     Ok(out)
+}
+
+fn should_skip_dir(name: &str) -> bool {
+    name.starts_with('.') || rust_tools::commonw::is_skip_dir(name)
+}
+
+fn path_contains_skipped_dir(path: &Path) -> bool {
+    use std::path::Component;
+    path.components().any(|component| match component {
+        Component::Normal(name) => name.to_str().map(should_skip_dir).unwrap_or(false),
+        _ => false,
+    })
 }
 
 fn language_for_path(path: &Path) -> Option<(&'static str, Language)> {
@@ -710,6 +811,18 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    fn make_temp_dir(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "ai_ast_structural_test_{}_{}",
+            name,
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&path).expect("failed to create temp dir");
+        path
+    }
 
     #[test]
     fn language_for_rust_path_is_detected() {
@@ -737,6 +850,67 @@ mod tests {
     fn unsupported_intent_returns_error() {
         let err = structural_query_for_intent("rust", "find_whatever").unwrap_err();
         assert!(err.contains("Unsupported structural intent"));
+    }
+
+    #[test]
+    fn collect_target_files_skips_hidden_and_dependency_dirs() {
+        let dir = make_temp_dir("skip_dirs");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("target/debug")).unwrap();
+        fs::create_dir_all(dir.join(".opencode/cache")).unwrap();
+        fs::write(dir.join("src/lib.rs"), "fn keep() {}\n").unwrap();
+        fs::write(dir.join("target/debug/generated.rs"), "fn generated() {}\n").unwrap();
+        fs::write(
+            dir.join(".opencode/cache/generated.js"),
+            "function generated() {}\n",
+        )
+        .unwrap();
+
+        let files = collect_target_files(&dir, None).unwrap();
+        let rendered = files
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("src/lib.rs"), "{}", rendered);
+        assert!(
+            !rendered.contains("target/debug/generated.rs"),
+            "{}",
+            rendered
+        );
+        assert!(
+            !rendered.contains(".opencode/cache/generated.js"),
+            "{}",
+            rendered
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn structural_search_caps_broad_results() {
+        let dir = make_temp_dir("limit");
+        let file = dir.join("many.rs");
+        let mut source = String::new();
+        for idx in 0..(MAX_STRUCTURAL_MATCHES + 50) {
+            source.push_str(&format!("fn f_{idx}() {{}}\n"));
+        }
+        fs::write(&file, source).unwrap();
+
+        let result = execute_structural_search(
+            StructuralSearch::Intent("find_functions"),
+            &dir.to_string_lossy(),
+            None,
+            StructuralFilters::default(),
+        )
+        .unwrap();
+
+        let names = result.matches("@name =").count();
+        assert_eq!(names, MAX_STRUCTURAL_MATCHES, "{}", result);
+        assert!(result.contains("match limit reached"), "{}", result);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -803,17 +977,27 @@ mod tests {
             line: 1,
             captures: vec![("name".to_string(), "foo.bar.baz".to_string())],
         };
-        let normalized = normalize_match("javascript", StructuralSearch::Intent("find_calls"), item);
-        assert_eq!(normalized.captures[0], ("name".to_string(), "baz".to_string()));
-        assert!(normalized
-            .captures
-            .contains(&("call_kind".to_string(), "method_call".to_string())));
-        assert!(normalized
-            .captures
-            .contains(&("qualified_name".to_string(), "foo.bar.baz".to_string())));
-        assert!(normalized
-            .captures
-            .contains(&("receiver".to_string(), "foo.bar".to_string())));
+        let normalized =
+            normalize_match("javascript", StructuralSearch::Intent("find_calls"), item);
+        assert_eq!(
+            normalized.captures[0],
+            ("name".to_string(), "baz".to_string())
+        );
+        assert!(
+            normalized
+                .captures
+                .contains(&("call_kind".to_string(), "method_call".to_string()))
+        );
+        assert!(
+            normalized
+                .captures
+                .contains(&("qualified_name".to_string(), "foo.bar.baz".to_string()))
+        );
+        assert!(
+            normalized
+                .captures
+                .contains(&("receiver".to_string(), "foo.bar".to_string()))
+        );
         assert_eq!(
             normalized
                 .captures
@@ -833,12 +1017,16 @@ mod tests {
             captures: vec![("constructor_name".to_string(), "Foo".to_string())],
         };
         let normalized = normalize_match("java", StructuralSearch::Intent("find_calls"), item);
-        assert!(normalized
-            .captures
-            .contains(&("call_kind".to_string(), "constructor_call".to_string())));
-        assert!(normalized
-            .captures
-            .contains(&("name".to_string(), "Foo".to_string())));
+        assert!(
+            normalized
+                .captures
+                .contains(&("call_kind".to_string(), "constructor_call".to_string()))
+        );
+        assert!(
+            normalized
+                .captures
+                .contains(&("name".to_string(), "Foo".to_string()))
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fs;
-use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use regex::RegexBuilder;
 use serde_json::Value;
@@ -12,15 +12,15 @@ use crate::ai::tools::lsp_tools::execute_lsp;
 use crate::ai::tools::search_tools::execute_search_files;
 
 const CODE_EXTENSIONS: &[&str] = &[
-    "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "h", "cpp", "cc", "cxx", "hpp",
-    "rb", "php", "cs",
+    "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "h", "cpp", "cc", "cxx", "hpp", "rb",
+    "php", "cs",
 ];
 
-const EXTRA_TEXT_EXTENSIONS: &[&str] = &[
-    "json", "yaml", "yml", "toml", "md", "txt", "sql", "sh",
-];
+const EXTRA_TEXT_EXTENSIONS: &[&str] = &["json", "yaml", "yml", "toml", "md", "txt", "sql", "sh"];
 
 const SKIP_DIRS: &[&str] = rust_tools::commonw::SKIP_DIRS;
+const MAX_TEXT_SEARCH_FILE_SIZE: u64 = 2 * 1024 * 1024;
+const MAX_WALK_FILES: usize = 10_000;
 
 fn params_code_search() -> Value {
     serde_json::json!({
@@ -47,7 +47,7 @@ fn params_code_search() -> Value {
             },
             "path": {
                 "type": "string",
-                "description": "Root directory for file, text, or structural search. Also used to auto-pick an anchor file for workspace_symbol when file_path is omitted. Defaults to current directory."
+                "description": "Root directory for file, text, or structural search. Also used to auto-pick an anchor file for workspace_symbol when file_path is omitted. Defaults to the current project (\".\"). Must be inside the active workspace — passing the filesystem root \"/\" or system paths like \"/System\", \"/Library\", \"/usr\" is rejected."
             },
             "query": {
                 "type": "string",
@@ -167,6 +167,17 @@ fn nonempty_str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+/// 守卫一个 `path` 字符串参数：解析为绝对路径后调用
+/// [`text_grep_tools::validate_search_root`]，拒绝 `/` 与系统目录。
+/// 路径不存在时不在这里报错，留给下游函数按各自语义处理。
+fn guard_path_arg(raw: &str) -> Result<(), String> {
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
+        .map_err(|e| format!("Failed to get cwd: {}", e))?;
+    let p = PathBuf::from(raw);
+    let abs = if p.is_absolute() { p } else { cwd.join(p) };
+    super::text_grep_tools::validate_search_root(&abs, &cwd)
+}
+
 fn build_text_search_args(args: &Value, query: &str, forced_path: Option<&str>) -> Value {
     let mut forwarded = serde_json::json!({
         "operation": "text_search",
@@ -220,7 +231,11 @@ fn derive_structural_fallback_query<'a>(args: &'a Value) -> Option<&'a str> {
     nonempty_str_arg(args, "name")
         .or_else(|| nonempty_str_arg(args, "contains_text"))
         .or_else(|| {
-            if args.get("intent").and_then(|value| value.as_str()).is_some() {
+            if args
+                .get("intent")
+                .and_then(|value| value.as_str())
+                .is_some()
+            {
                 nonempty_str_arg(args, "query")
             } else {
                 None
@@ -310,6 +325,7 @@ fn execute_code_find_file(args: &Value) -> Result<String, String> {
         .or_else(|| args["query"].as_str())
         .ok_or("find_file requires 'pattern' or 'query'")?;
     let path = args["path"].as_str().unwrap_or(".");
+    guard_path_arg(path)?;
     let forwarded = serde_json::json!({
         "pattern": pattern,
         "path": path,
@@ -319,11 +335,7 @@ fn execute_code_find_file(args: &Value) -> Result<String, String> {
         let guidance = render_guidance_lines(&find_file_guidance(pattern, path));
         Ok(format!(
             "code_search route=search_files operation=find_file\nsummary: No files matched '{}' under '{}'.\nNo files matched '{}' under '{}'.\n{}",
-            pattern,
-            path,
-            pattern,
-            path,
-            guidance
+            pattern, path, pattern, path, guidance
         ))
     } else {
         Ok(format!(
@@ -377,15 +389,25 @@ fn text_search_target(args: &Value) -> Result<PathBuf, String> {
             return Err(format!("File not found: {}", file_path));
         }
         if !path.is_file() {
-            return Err(format!("text_search file_path is not a file: {}", file_path));
+            return Err(format!(
+                "text_search file_path is not a file: {}",
+                file_path
+            ));
         }
         return Ok(path);
     }
 
-    let path = PathBuf::from(args["path"].as_str().unwrap_or("."));
+    let raw = args["path"].as_str().unwrap_or(".");
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
+        .map_err(|e| format!("Failed to get cwd: {}", e))?;
+    let path = {
+        let p = PathBuf::from(raw);
+        if p.is_absolute() { p } else { cwd.join(p) }
+    };
     if !path.exists() {
         return Err(format!("Path not found: {}", path.display()));
     }
+    super::text_grep_tools::validate_search_root(&path, &cwd)?;
     Ok(path)
 }
 
@@ -400,22 +422,27 @@ fn execute_content_text_search(
         return Err("text_search query is empty".to_string());
     }
 
-    let pattern = if is_regex { query.to_string() } else { regex::escape(query) };
+    let pattern = if is_regex {
+        query.to_string()
+    } else {
+        regex::escape(query)
+    };
     let re = RegexBuilder::new(&pattern)
         .case_insensitive(!case_sensitive)
         .build()
         .map_err(|e| format!("Invalid regex pattern: {}", e))?;
 
     let files = collect_text_search_files(target, file_pattern)?;
-    
+
     // Parallel text search across files
     let max_threads = rust_tools::commonw::half_parallelism();
     let chunk_size = (files.len() / max_threads).max(1);
     let chunks: Vec<Vec<PathBuf>> = files.chunks(chunk_size).map(|c| c.to_vec()).collect();
-    
+
     let all_matches: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let found_enough: Arc<std::sync::atomic::AtomicBool> = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    
+    let found_enough: Arc<std::sync::atomic::AtomicBool> =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     std::thread::scope(|scope| {
         for chunk in chunks {
             let re_ref = &re;
@@ -426,6 +453,12 @@ fn execute_content_text_search(
                 for file in chunk {
                     if done_ref.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
+                    }
+                    let Ok(metadata) = fs::metadata(&file) else {
+                        continue;
+                    };
+                    if metadata.len() > MAX_TEXT_SEARCH_FILE_SIZE {
+                        continue;
                     }
                     let Ok(content) = fs::read_to_string(&file) else {
                         continue;
@@ -449,21 +482,27 @@ fn execute_content_text_search(
                     guard.extend(local_matches);
                 }
             });
-        };
+        }
     });
-    
+
     let mut matches = all_matches.lock().unwrap().clone();
     matches.truncate(200);
 
     Ok(truncate_chars(&matches.join("\n"), 16_000))
 }
 
-fn collect_text_search_files(target: &Path, file_pattern: Option<&str>) -> Result<Vec<PathBuf>, String> {
+fn collect_text_search_files(
+    target: &Path,
+    file_pattern: Option<&str>,
+) -> Result<Vec<PathBuf>, String> {
     if target.is_file() {
         return Ok(vec![target.to_path_buf()]);
     }
     if !target.is_dir() {
-        return Err(format!("text_search target is neither file nor directory: {}", target.display()));
+        return Err(format!(
+            "text_search target is neither file nor directory: {}",
+            target.display()
+        ));
     }
 
     if let Some(pattern) = file_pattern.filter(|value| !value.trim().is_empty()) {
@@ -472,7 +511,8 @@ fn collect_text_search_files(target: &Path, file_pattern: Option<&str>) -> Resul
         let files = matches
             .into_iter()
             .map(PathBuf::from)
-            .filter(|path| path.is_file())
+            .filter(|path| path.is_file() && !path_contains_skipped_dir(path))
+            .take(MAX_WALK_FILES)
             .collect::<Vec<_>>();
         return Ok(files);
     }
@@ -651,7 +691,10 @@ fn execute_code_structural(args: &Value) -> Result<String, String> {
     if let Some(query) = derive_structural_fallback_query(args) {
         let fallback_args = build_text_search_args(args, query, Some(&target));
         let fallback = execute_code_text_search(&fallback_args)?;
-        sections.push(format!("Fallback content search for '{}':\n{}", query, fallback));
+        sections.push(format!(
+            "Fallback content search for '{}':\n{}",
+            query, fallback
+        ));
     }
 
     let guidance = render_guidance_lines(&structural_guidance(args, &target));
@@ -674,9 +717,15 @@ fn require_file_path<'a>(args: &'a Value, operation: &str) -> Result<&'a str, St
 
 fn structural_target(args: &Value) -> Result<String, String> {
     if let Some(file_path) = args["file_path"].as_str() {
+        let p = PathBuf::from(file_path);
+        if p.is_dir() {
+            guard_path_arg(file_path)?;
+        }
         return Ok(file_path.to_string());
     }
-    Ok(args["path"].as_str().unwrap_or(".").to_string())
+    let path = args["path"].as_str().unwrap_or(".");
+    guard_path_arg(path)?;
+    Ok(path.to_string())
 }
 
 fn resolve_anchor_file(args: &Value) -> Result<String, String> {
@@ -687,7 +736,9 @@ fn resolve_anchor_file(args: &Value) -> Result<String, String> {
         return Err(format!("File not found: {}", file_path));
     }
 
-    let root = PathBuf::from(args["path"].as_str().unwrap_or("."));
+    let raw_path = args["path"].as_str().unwrap_or(".");
+    guard_path_arg(raw_path)?;
+    let root = PathBuf::from(raw_path);
     let anchor = find_code_anchor_file(&root).ok_or_else(|| {
         format!(
             "Could not find a source file under '{}' to use as an LSP workspace anchor.",
@@ -714,7 +765,15 @@ fn is_code_file(path: &Path) -> bool {
 }
 
 fn should_skip_dir(dir_name: &str) -> bool {
-    SKIP_DIRS.contains(&dir_name)
+    dir_name.starts_with('.') || SKIP_DIRS.contains(&dir_name)
+}
+
+fn path_contains_skipped_dir(path: &Path) -> bool {
+    use std::path::Component;
+    path.components().any(|component| match component {
+        Component::Normal(name) => name.to_str().map(should_skip_dir).unwrap_or(false),
+        _ => false,
+    })
 }
 
 fn walk_files(root: &Path, predicate: fn(&Path) -> bool) -> Vec<PathBuf> {
@@ -728,6 +787,9 @@ fn walk_files(root: &Path, predicate: fn(&Path) -> bool) -> Vec<PathBuf> {
     let max_dirs = 10_000usize;
 
     while let Some(dir) = queue.pop_front() {
+        if files.len() >= MAX_WALK_FILES {
+            break;
+        }
         scanned_dirs += 1;
         if scanned_dirs > max_dirs {
             break;
@@ -737,6 +799,9 @@ fn walk_files(root: &Path, predicate: fn(&Path) -> bool) -> Vec<PathBuf> {
             Err(_) => continue,
         };
         for entry in entries.flatten() {
+            if files.len() >= MAX_WALK_FILES {
+                break;
+            }
             let path = entry.path();
             let ft = match entry.file_type() {
                 Ok(ft) => ft,
@@ -762,7 +827,11 @@ mod tests {
 
     fn make_temp_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("ai_code_search_test_{}_{}", name, uuid::Uuid::new_v4()));
+        path.push(format!(
+            "ai_code_search_test_{}_{}",
+            name,
+            uuid::Uuid::new_v4()
+        ));
         fs::create_dir_all(&path).expect("failed to create temp dir");
         path
     }
@@ -770,17 +839,28 @@ mod tests {
     #[test]
     fn code_search_params_require_operation() {
         let params = params_code_search();
-        assert!(params["required"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::String("operation".to_string())));
+        assert!(
+            params["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("operation".to_string()))
+        );
     }
 
     #[test]
     fn legacy_structural_operation_is_mapped_to_intent() {
-        assert_eq!(legacy_structural_intent("find_functions"), Some("find_functions"));
-        assert_eq!(legacy_structural_intent("find_classes"), Some("find_classes"));
-        assert_eq!(legacy_structural_intent("find_methods"), Some("find_methods"));
+        assert_eq!(
+            legacy_structural_intent("find_functions"),
+            Some("find_functions")
+        );
+        assert_eq!(
+            legacy_structural_intent("find_classes"),
+            Some("find_classes")
+        );
+        assert_eq!(
+            legacy_structural_intent("find_methods"),
+            Some("find_methods")
+        );
         assert_eq!(legacy_structural_intent("find_calls"), Some("find_calls"));
         assert_eq!(legacy_structural_intent("text_search"), None);
     }
@@ -936,5 +1016,120 @@ mod tests {
         assert!(result.contains("alpha"));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn walk_files_skips_hidden_and_dependency_dirs() {
+        let dir = make_temp_dir("walk_skip_dirs");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("target/debug")).unwrap();
+        fs::create_dir_all(dir.join(".opencode/cache")).unwrap();
+        fs::write(dir.join("src/lib.rs"), "fn keep() {}\n").unwrap();
+        fs::write(dir.join("target/debug/generated.rs"), "fn generated() {}\n").unwrap();
+        fs::write(
+            dir.join(".opencode/cache/generated.js"),
+            "function generated() {}\n",
+        )
+        .unwrap();
+
+        let files = walk_files(&dir, is_text_search_file);
+        let rendered = files
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("src/lib.rs"), "{}", rendered);
+        assert!(
+            !rendered.contains("target/debug/generated.rs"),
+            "{}",
+            rendered
+        );
+        assert!(
+            !rendered.contains(".opencode/cache/generated.js"),
+            "{}",
+            rendered
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_search_file_pattern_skips_hidden_and_dependency_dirs() {
+        let dir = make_temp_dir("glob_skip_dirs");
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::create_dir_all(dir.join("target/debug")).unwrap();
+        fs::create_dir_all(dir.join(".opencode/cache")).unwrap();
+        fs::write(dir.join("src/lib.rs"), "fn keep() {}\n").unwrap();
+        fs::write(dir.join("target/debug/generated.rs"), "fn generated() {}\n").unwrap();
+        fs::write(
+            dir.join(".opencode/cache/generated.js"),
+            "function generated() {}\n",
+        )
+        .unwrap();
+
+        let files = collect_text_search_files(&dir, Some("**/*")).unwrap();
+        let rendered = files
+            .iter()
+            .map(|path| path.to_string_lossy().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("src/lib.rs"), "{}", rendered);
+        assert!(
+            !rendered.contains("target/debug/generated.rs"),
+            "{}",
+            rendered
+        );
+        assert!(
+            !rendered.contains(".opencode/cache/generated.js"),
+            "{}",
+            rendered
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_search_rejects_filesystem_root() {
+        let args = serde_json::json!({
+            "operation": "text_search",
+            "path": "/",
+            "query": "anything"
+        });
+        let err = execute_code_text_search(&args).expect_err("must reject /");
+        assert!(err.contains("Refusing to search"), "{}", err);
+    }
+
+    #[test]
+    fn find_file_rejects_filesystem_root() {
+        let args = serde_json::json!({
+            "operation": "find_file",
+            "path": "/",
+            "pattern": "Cargo.toml"
+        });
+        let err = execute_code_find_file(&args).expect_err("must reject /");
+        assert!(err.contains("Refusing to search"), "{}", err);
+    }
+
+    #[test]
+    fn resolve_anchor_file_rejects_filesystem_root() {
+        let args = serde_json::json!({
+            "path": "/",
+            "query": "anything"
+        });
+        let err = resolve_anchor_file(&args).expect_err("must reject /");
+        assert!(err.contains("Refusing to search"), "{}", err);
+    }
+
+    #[test]
+    fn structural_rejects_directory_file_path_root() {
+        let args = serde_json::json!({
+            "operation": "structural",
+            "file_path": "/",
+            "intent": "find_functions"
+        });
+        let err = execute_code_search(&args).expect_err("must reject directory file_path=/");
+        assert!(err.contains("Refusing to search"), "{}", err);
     }
 }

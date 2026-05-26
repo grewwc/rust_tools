@@ -29,6 +29,56 @@ const MAX_OUTPUT_CHARS: usize = 32_000;
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
 const MAX_MATCHES: usize = 200;
 
+/// 系统级目录黑名单：搜索根落在这些前缀内一律拒绝，避免误把整个磁盘扫了。
+/// 仅列出明确的"系统/平台"目录；故意不收 `/var`、`/private`、`/tmp`，因为
+/// macOS 的临时目录就在 `/var/folders/...`（canonicalize 后为
+/// `/private/var/folders/...`），收进去会误伤合法的临时工作目录。
+const FORBIDDEN_ROOT_PREFIXES: &[&str] = &[
+    "/System",
+    "/Library",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/etc",
+    "/Applications",
+    "/cores",
+    "/Network",
+];
+
+/// 校验搜索根目录是否合法，拒绝文件系统根 `/` 与系统级目录。
+///
+/// 设计目标：阻止 LLM 误传 `path="/"` 或 `path="/System"` 这类会导致全盘扫描、
+/// CPU 100% 的调用。`root` 必须已经是绝对路径（调用方先 join 过 cwd）。
+pub(crate) fn validate_search_root(root: &Path, cwd: &Path) -> Result<(), String> {
+    // 1. 拒绝文件系统根（`/` 或 Windows 盘根）。
+    let component_count = root.components().count();
+    if component_count <= 1 {
+        return Err(format!(
+            "Refusing to search filesystem root '{}'. Pass a path inside the current project (cwd: {}).",
+            root.display(),
+            cwd.display()
+        ));
+    }
+
+    // 2. 拒绝系统级前缀。比较时优先用 canonicalize，失败则按字面比较。
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let canonical_str = canonical.to_string_lossy();
+    for prefix in FORBIDDEN_ROOT_PREFIXES {
+        if canonical_str == *prefix || canonical_str.starts_with(&format!("{}/", prefix)) {
+            return Err(format!(
+                "Refusing to search system path '{}'. Pass a path inside the current project (cwd: {}).",
+                root.display(),
+                cwd.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn params_text_grep() -> Value {
     serde_json::json!({
         "type": "object",
@@ -39,7 +89,7 @@ fn params_text_grep() -> Value {
             },
             "path": {
                 "type": "string",
-                "description": "Root directory or file to search in (default: \".\")."
+                "description": "Root directory or file to search in. Defaults to the current project (\".\"). Passing the filesystem root \"/\" or system paths like \"/System\", \"/Library\", \"/usr\" is rejected. Prefer a relative path or a subdirectory of the project."
             },
             "file_pattern": {
                 "type": "string",
@@ -90,22 +140,23 @@ pub(crate) fn execute_text_grep(args: &Value) -> Result<String, String> {
     let is_regex = args["is_regex"].as_bool().unwrap_or(false);
     let case_sensitive = args["case_sensitive"].as_bool().unwrap_or(true);
     let context_lines = args["context_lines"].as_u64().unwrap_or(2).min(5) as usize;
-    let max_results = args["max_results"].as_u64().unwrap_or(50).min(MAX_MATCHES as u64) as usize;
+    let max_results = args["max_results"]
+        .as_u64()
+        .unwrap_or(50)
+        .min(MAX_MATCHES as u64) as usize;
 
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
         .map_err(|e| format!("Failed to get cwd: {}", e))?;
     let root = {
         let p = PathBuf::from(path);
-        if p.is_absolute() {
-            p
-        } else {
-            cwd.join(p)
-        }
+        if p.is_absolute() { p } else { cwd.join(p) }
     };
 
     if !root.exists() {
         return Err(format!("Path not found: {}", root.display()));
     }
+
+    validate_search_root(&root, &cwd)?;
 
     let regex = if is_regex {
         RegexBuilder::new(pattern)
@@ -215,7 +266,8 @@ fn format_results(results: &[MatchResult], total_matches: usize, max_results: us
         out.push_str(&result.file);
         out.push('\n');
 
-        let ranges = merge_context_ranges(&result.matches, result.context_lines, result.lines.len());
+        let ranges =
+            merge_context_ranges(&result.matches, result.context_lines, result.lines.len());
 
         for range in &ranges {
             if range.start > 0 {
@@ -240,7 +292,11 @@ struct LineRange {
     end: usize,
 }
 
-fn merge_context_ranges(matches: &[LineMatch], context: usize, total_lines: usize) -> Vec<LineRange> {
+fn merge_context_ranges(
+    matches: &[LineMatch],
+    context: usize,
+    total_lines: usize,
+) -> Vec<LineRange> {
     if matches.is_empty() {
         return Vec::new();
     }
@@ -376,7 +432,11 @@ mod tests {
 
     fn make_temp_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("ai_text_grep_test_{}_{}", name, uuid::Uuid::new_v4()));
+        path.push(format!(
+            "ai_text_grep_test_{}_{}",
+            name,
+            uuid::Uuid::new_v4()
+        ));
         fs::create_dir_all(&path).expect("failed to create temp dir");
         path
     }
@@ -398,7 +458,10 @@ mod tests {
         assert!(result.is_ok());
         let output = result.unwrap();
         assert!(output.contains("hello.rs"), "should show file name");
-        assert!(output.contains("hello world"), "should show matched content");
+        assert!(
+            output.contains("hello world"),
+            "should show matched content"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -449,7 +512,11 @@ mod tests {
     #[test]
     fn test_text_grep_case_insensitive() {
         let dir = make_temp_dir("case");
-        fs::write(dir.join("test.txt"), "Hello World\nhello world\nHELLO WORLD\n").unwrap();
+        fs::write(
+            dir.join("test.txt"),
+            "Hello World\nhello world\nHELLO WORLD\n",
+        )
+        .unwrap();
 
         let args = serde_json::json!({
             "pattern": "hello world",
@@ -478,5 +545,40 @@ mod tests {
         assert_eq!(result.unwrap(), "No matches found.");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_validate_search_root_rejects_filesystem_root() {
+        let cwd = std::env::temp_dir();
+        let err = validate_search_root(Path::new("/"), &cwd).expect_err("must reject /");
+        assert!(err.contains("Refusing to search"), "{}", err);
+    }
+
+    #[test]
+    fn test_validate_search_root_rejects_system_prefix() {
+        let cwd = std::env::temp_dir();
+        let err = validate_search_root(Path::new("/System/Library"), &cwd)
+            .expect_err("must reject /System/...");
+        assert!(err.contains("system path"), "{}", err);
+    }
+
+    #[test]
+    fn test_validate_search_root_allows_user_dir() {
+        let dir = make_temp_dir("allow");
+        let cwd = std::env::temp_dir();
+        validate_search_root(&dir, &cwd).expect("user temp dir should be allowed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_text_grep_rejects_filesystem_root() {
+        let args = serde_json::json!({
+            "pattern": "anything",
+            "path": "/"
+        });
+        let result = execute_text_grep(&args);
+        assert!(result.is_err(), "expected error for path=/");
+        let msg = result.unwrap_err();
+        assert!(msg.contains("Refusing to search"), "{}", msg);
     }
 }
