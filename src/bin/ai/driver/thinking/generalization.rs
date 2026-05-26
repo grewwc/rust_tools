@@ -104,16 +104,28 @@ impl ExperienceGeneralizer {
         };
         if let Ok(entries) = store.entries_by_category("raw_experience", self.max_buffer_size) {
             for entry in entries {
+                // 优先从专门标签 `cat:<原 category>` 还原真实 category；
+                // 老数据兼容：回退到 tags 中第一个非内置标签；再不行用 "general"
+                let category = entry
+                    .tags
+                    .iter()
+                    .find_map(|t| t.strip_prefix("cat:").map(str::to_string))
+                    .or_else(|| {
+                        entry
+                            .tags
+                            .iter()
+                            .find(|t| {
+                                let s = t.as_str();
+                                s != "raw_experience" && !s.starts_with("cat:")
+                            })
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| "general".to_string());
                 let exp = RawExperience {
                     id: entry.id.clone().unwrap_or_else(|| {
                         format!("exp_{}", uuid::Uuid::new_v4().simple())
                     }),
-                    category: entry
-                        .tags
-                        .iter()
-                        .find(|t| t.as_str() != "raw_experience")
-                        .cloned()
-                        .unwrap_or_else(|| "general".to_string()),
+                    category,
                     note: entry.note.clone(),
                     tags: entry.tags.clone(),
                     source: entry.source.clone(),
@@ -137,6 +149,13 @@ impl ExperienceGeneralizer {
                 let mut t = exp.tags.clone();
                 if !t.iter().any(|x| x == "raw_experience") {
                     t.push("raw_experience".to_string());
+                }
+                // 把真实 category 编码成 `cat:<value>` 标签，避免 reload 时丢失
+                if !exp.category.is_empty() && exp.category != "raw_experience" {
+                    let cat_tag = format!("cat:{}", exp.category);
+                    if !t.iter().any(|x| x == &cat_tag) {
+                        t.push(cat_tag);
+                    }
                 }
                 t
             },
@@ -500,18 +519,28 @@ impl ExperienceGeneralizer {
     fn infer_domain(&self, experiences: &[&RawExperience]) -> String {
         // No more keyword guessing. Prefer explicit tags; fall back to
         // category; fall back to a single neutral bucket.
+        // 排除内置/管线性质的 tag（包括 raw_experience 和 `cat:` 编码标签），
+        // 否则 reload 后会把 "raw_experience" 当成 domain 显示出来。
         for e in experiences {
             for tag in &e.tags {
                 let t = tag.trim();
-                if !t.is_empty() && t != "agent" && t != "policy" && t != "generalized" && t != "principle" {
-                    return t.to_string();
+                if t.is_empty() {
+                    continue;
                 }
+                if matches!(t, "agent" | "policy" | "generalized" | "principle" | "raw_experience") {
+                    continue;
+                }
+                if t.starts_with("cat:") {
+                    continue;
+                }
+                return t.to_string();
             }
         }
-        if let Some(first) = experiences.first() {
-            if !first.category.is_empty() {
-                return first.category.clone();
-            }
+        if let Some(first) = experiences.first()
+            && !first.category.is_empty()
+            && first.category != "raw_experience"
+        {
+            return first.category.clone();
         }
         "general_engineering".to_string()
     }
@@ -523,21 +552,32 @@ impl ExperienceGeneralizer {
         // keyword co-occurrence — that would be pattern theater, not
         // generalization.
         let notes: Vec<&str> = experiences.iter().map(|e| e.note.as_str()).collect();
-        let do_items: Vec<&str> = notes
+        // 剥掉每条经验自带的极性前缀，避免拼接出 "Do: Do: xxx" / "Avoid: Avoid: xxx"
+        fn strip_polarity_prefix(note: &str) -> String {
+            let trimmed = note.trim();
+            let lower = trimmed.to_lowercase();
+            for prefix in ["do:", "avoid:", "always:", "never:", "always ", "never "] {
+                if lower.starts_with(prefix) {
+                    return trimmed[prefix.len()..].trim_start().to_string();
+                }
+            }
+            trimmed.to_string()
+        }
+        let do_items: Vec<String> = notes
             .iter()
             .filter(|n| {
                 let lower = n.trim_start().to_lowercase();
                 lower.starts_with("do:") || lower.starts_with("always")
             })
-            .map(|n| *n)
+            .map(|n| strip_polarity_prefix(n))
             .collect();
-        let avoid_items: Vec<&str> = notes
+        let avoid_items: Vec<String> = notes
             .iter()
             .filter(|n| {
                 let lower = n.trim_start().to_lowercase();
                 lower.starts_with("avoid:") || lower.starts_with("never")
             })
-            .map(|n| *n)
+            .map(|n| strip_polarity_prefix(n))
             .collect();
 
         if do_items.is_empty() && avoid_items.is_empty() {
@@ -642,7 +682,19 @@ mod tests {
 
     #[test]
     fn ingest_and_generalize() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "rt_generalization_ingest_{}_{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
         let mut generalizer = ExperienceGeneralizer::new();
+        // 隔离潜在的跨进程持久化残留，确保仅以本测试 ingest 的三条经验为准
+        generalizer.experience_buffer.clear();
         generalizer.ingest_experience(
             "error_handling",
             "Do: always check Option before unwrap in async code",
@@ -668,6 +720,11 @@ mod tests {
         // bucket, so "async" (the tag) wins over the keyword-guessed
         // "async_patterns" from before.
         assert_eq!(p.domain, "async");
+
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
     }
 
     #[test]
@@ -764,5 +821,61 @@ mod tests {
         generalizer.ingest_experience("test", "one note", &[], None);
         generalizer.ingest_experience("test", "two note", &[], None);
         assert!(generalizer.try_generalize().is_none());
+    }
+
+    #[test]
+    fn synthesize_principle_strips_polarity_prefixes() {
+        let generalizer = ExperienceGeneralizer::new();
+        let exps = vec![
+            RawExperience {
+                id: "a".into(),
+                category: "async_handling".into(),
+                note: "Do: verify async results before use".into(),
+                tags: vec![],
+                source: None,
+            },
+            RawExperience {
+                id: "b".into(),
+                category: "async_handling".into(),
+                note: "Do: check None before unwrap".into(),
+                tags: vec![],
+                source: None,
+            },
+            RawExperience {
+                id: "c".into(),
+                category: "async_handling".into(),
+                note: "Avoid: skip validation in concurrent code".into(),
+                tags: vec![],
+                source: None,
+            },
+        ];
+        let refs: Vec<&RawExperience> = exps.iter().collect();
+        let principle = generalizer
+            .synthesize_principle(&refs, "async_handling")
+            .expect("principle");
+        // 不应再出现 "Do: Do:" / "Avoid: Avoid:"
+        assert!(!principle.contains("Do: Do:"), "got: {principle}");
+        assert!(!principle.contains("Avoid: Avoid:"), "got: {principle}");
+        // 应保留前缀剥掉之后的真实正文
+        assert!(principle.contains("verify async results before use"));
+        assert!(principle.contains("skip validation in concurrent code"));
+    }
+
+    #[test]
+    fn infer_domain_ignores_pipeline_tags() {
+        let generalizer = ExperienceGeneralizer::new();
+        // 模拟 reload 后的情形：tags 中包含管线标签 raw_experience 和编码后的 cat:tool_failure
+        let exp = RawExperience {
+            id: "e".into(),
+            category: "tool_failure".into(),
+            note: "Avoid: invoking text_grep with filesystem root".into(),
+            tags: vec!["raw_experience".into(), "cat:tool_failure".into()],
+            source: Some("text_grep".into()),
+        };
+        let refs = vec![&exp];
+        let domain = generalizer.infer_domain(&refs);
+        assert_ne!(domain, "raw_experience", "管线标签不应被当作 domain");
+        assert!(!domain.starts_with("cat:"), "cat: 编码标签不应直接作为 domain");
+        assert_eq!(domain, "tool_failure");
     }
 }

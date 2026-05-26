@@ -34,6 +34,15 @@ mod sync_task;
 static TOOL_FAILURES: LazyLock<Mutex<FastMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(FastMap::default()));
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolFailureKind {
+    Argument,
+    Permission,
+    Canceled,
+    Transient,
+    Permanent,
+}
+
 #[derive(Debug, Clone)]
 enum ToolRoute {
     Builtin,
@@ -1157,43 +1166,50 @@ fn execute_tool_spawn(
             next_seq: 0,
         };
         pipe_observer.on_tool_started(&tool_call_for_thread);
-        let result = match &prepared_for_thread.route {
-            ToolRoute::Builtin => {
-                if tool_call_for_thread.function.name == "execute_command" {
-                    builtin_tools::command_tools::execute_command_streaming(&prepared_for_thread.args, |chunk| {
-                        pipe_observer.on_tool_stream(&tool_call_for_thread, chunk);
-                    })
-                    .map(|content| ToolResult {
-                        tool_call_id: tool_call_for_thread.id.clone(),
-                        content,
-                    })
-                } else {
-                    execute_prepared_builtin_tool_call(&tool_call_for_thread, &prepared_for_thread)
+        let result = execute_with_safe_retry(
+            &prepared_for_thread.route,
+            &tool_call_for_thread.function.name,
+            || match &prepared_for_thread.route {
+                ToolRoute::Builtin => {
+                    if tool_call_for_thread.function.name == "execute_command" {
+                        builtin_tools::command_tools::execute_command_streaming(
+                            &prepared_for_thread.args,
+                            |chunk| {
+                                pipe_observer.on_tool_stream(&tool_call_for_thread, chunk);
+                            },
+                        )
+                        .map(|content| ToolResult {
+                            tool_call_id: tool_call_for_thread.id.clone(),
+                            content,
+                        })
+                    } else {
+                        execute_prepared_builtin_tool_call(&tool_call_for_thread, &prepared_for_thread)
+                    }
                 }
-            }
-            ToolRoute::Mcp { .. } => {
-                let guard = shared_mcp_client_for_thread
-                    .lock()
-                    .map_err(|_| "Shared MCP client poisoned".to_string());
-                match guard {
-                    Ok(mc) => oauth::execute_mcp_tool_call(
-                        &mc,
-                        &tool_call_for_thread,
-                        match &prepared_for_thread.route {
-                            ToolRoute::Mcp { server_name, .. } => server_name,
-                            ToolRoute::Builtin => unreachable!(),
-                        },
-                        match &prepared_for_thread.route {
-                            ToolRoute::Mcp { tool_name, .. } => tool_name,
-                            ToolRoute::Builtin => unreachable!(),
-                        },
-                        &prepared_for_thread.args,
-                    )
-                    .map_err(|e| e.to_string()),
-                    Err(err) => Err(err),
+                ToolRoute::Mcp { .. } => {
+                    let guard = shared_mcp_client_for_thread
+                        .lock()
+                        .map_err(|_| "Shared MCP client poisoned".to_string());
+                    match guard {
+                        Ok(mc) => oauth::execute_mcp_tool_call(
+                            &mc,
+                            &tool_call_for_thread,
+                            match &prepared_for_thread.route {
+                                ToolRoute::Mcp { server_name, .. } => server_name,
+                                ToolRoute::Builtin => unreachable!(),
+                            },
+                            match &prepared_for_thread.route {
+                                ToolRoute::Mcp { tool_name, .. } => tool_name,
+                                ToolRoute::Builtin => unreachable!(),
+                            },
+                            &prepared_for_thread.args,
+                        )
+                        .map_err(|e| e.to_string()),
+                        Err(err) => Err(err),
+                    }
                 }
-            }
-        };
+            },
+        );
         let run_result = finalize_execution_result(
             &session_id,
             &tool_call_for_thread,
@@ -1574,6 +1590,67 @@ fn record_tool_failure(tool_name: &str) {
     }
 }
 
+fn classify_tool_error(err: &str) -> ToolFailureKind {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("failed to parse arguments")
+        || lower.contains("invalid type")
+        || lower.contains("missing '")
+        || lower.contains("missing parameter")
+    {
+        return ToolFailureKind::Argument;
+    }
+    if lower.contains("permission denied")
+        || lower.contains("not in the allowed whitelist")
+        || lower.contains("forbidden")
+    {
+        return ToolFailureKind::Permission;
+    }
+    if lower.contains("canceled by user") || lower.contains("cancelled by user") {
+        return ToolFailureKind::Canceled;
+    }
+    if lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("temporar")
+        || lower.contains("connection reset")
+        || lower.contains("connection refused")
+        || lower.contains("broken pipe")
+        || lower.contains("eof")
+        || lower.contains("dns")
+        || lower.contains("unavailable")
+        || lower.contains("rate limit")
+    {
+        return ToolFailureKind::Transient;
+    }
+    ToolFailureKind::Permanent
+}
+
+fn should_retry_once(route: &ToolRoute, tool_name: &str, err: &str) -> bool {
+    if classify_tool_error(err) != ToolFailureKind::Transient {
+        return false;
+    }
+    // 仅对本地只读工具做一次重试，避免副作用工具重复执行。
+    matches!(route, ToolRoute::Builtin)
+        && is_cacheable_tool_name(tool_name)
+        && tool_name != "execute_command"
+}
+
+fn execute_with_safe_retry<F>(route: &ToolRoute, tool_name: &str, mut exec: F) -> Result<ToolResult, String>
+where
+    F: FnMut() -> Result<ToolResult, String>,
+{
+    let mut result = exec();
+    if let Err(err) = result.as_ref() {
+        if should_retry_once(route, tool_name, err) {
+            println!(
+                "\n[Retry] {} (transient error; one safe retry)",
+                tool_name.cyan()
+            );
+            result = exec();
+        }
+    }
+    result
+}
+
 fn finalize_execution_result(
     session_id: &str,
     tool_call: &ToolCall,
@@ -1582,6 +1659,10 @@ fn finalize_execution_result(
     executed: bool,
     cached: bool,
 ) -> RunOneResult {
+    let failure_kind = result
+        .as_ref()
+        .err()
+        .map(|err| classify_tool_error(err));
     let run_result = match result {
         Ok(tool_result) => {
             if executed && !cached {
@@ -1602,7 +1683,11 @@ fn finalize_execution_result(
         },
     };
     if run_result.executed && !run_result.ok {
-        record_tool_failure(&tool_call.function.name);
+        // 仅统计会反映到"工具可靠性"的失败，避免把参数错误/用户取消
+        // 错误地当作工具本身不稳定，导致路由/惩罚劣化。
+        if matches!(failure_kind, Some(ToolFailureKind::Transient | ToolFailureKind::Permanent)) {
+            record_tool_failure(&tool_call.function.name);
+        }
     }
     run_result
 }
@@ -1700,14 +1785,16 @@ fn run_one(
         observer.on_tool_started(tool_call);
     }
 
-    let result = execute_prepared_tool_call(
-        session_id,
-        mcp_client,
-        shared_mcp_client,
-        tool_call,
-        &prepared,
-        observer,
-    );
+    let result = execute_with_safe_retry(&prepared.route, &tool_call.function.name, || {
+        execute_prepared_tool_call(
+            session_id,
+            mcp_client,
+            shared_mcp_client,
+            tool_call,
+            &prepared,
+            observer,
+        )
+    });
     let run_result = finalize_execution_result(session_id, tool_call, &prepared, result, true, false);
 
     (prepared.route, run_result)
@@ -1951,9 +2038,11 @@ mod tests {
         aggregate_async_tool_pipe_messages, async_tool_pipe_message_from_final,
         async_tool_pipe_message_from_started, async_tool_pipe_message_from_stream,
         build_tool_cache_key, collect_tool_cache_file_fingerprints, delete_async_tool_snapshot,
-        is_cacheable_tool_name, is_tool_cache_entry_fresh, load_async_tool_snapshot,
+        classify_tool_error, is_cacheable_tool_name, is_tool_cache_entry_fresh,
+        load_async_tool_snapshot,
+        execute_with_safe_retry,
         lookup_wait_sources, tool_cache_validation_matches, CachedFileFingerprint,
-        ToolCachePayload,
+        ToolCachePayload, ToolFailureKind, should_retry_once,
         persist_async_tool_snapshot, send_async_tool_pipe_message,
         stream_preview_from_aggregate, AsyncToolEntry, AsyncToolPipeKind, AsyncToolPipeMessage,
         AsyncToolState, RunOneResult, ToolRoute, ASYNC_TOOL_REGISTRY, TOOL_CACHE_TTL_MINUTES,
@@ -2032,6 +2121,68 @@ mod tests {
         assert!(is_cacheable_tool_name("grep_search"));
         assert!(!is_cacheable_tool_name("create_file"));
         assert!(!is_cacheable_tool_name("execute_command"));
+    }
+
+    #[test]
+    fn classify_tool_error_distinguishes_argument_and_transient_cases() {
+        assert_eq!(
+            classify_tool_error("failed to parse arguments: expected value"),
+            ToolFailureKind::Argument
+        );
+        assert_eq!(
+            classify_tool_error("request timeout while fetching data"),
+            ToolFailureKind::Transient
+        );
+        assert_eq!(
+            classify_tool_error("Error: execute_command canceled by user"),
+            ToolFailureKind::Canceled
+        );
+    }
+
+    #[test]
+    fn should_retry_once_only_for_safe_builtin_read_only_tools() {
+        let builtin = ToolRoute::Builtin;
+        let mcp = ToolRoute::Mcp {
+            server_name: "demo".to_string(),
+            tool_name: "read_file".to_string(),
+        };
+        assert!(should_retry_once(&builtin, "read_file", "timeout while reading"));
+        assert!(!should_retry_once(
+            &builtin,
+            "execute_command",
+            "timeout while reading"
+        ));
+        assert!(!should_retry_once(&builtin, "create_file", "timeout while writing"));
+        assert!(!should_retry_once(&mcp, "read_file", "timeout while reading"));
+    }
+
+    #[test]
+    fn execute_with_safe_retry_retries_once_for_safe_transient_error() {
+        let mut calls = 0usize;
+        let result = execute_with_safe_retry(&ToolRoute::Builtin, "read_file", || {
+            calls += 1;
+            if calls == 1 {
+                Err("request timed out".to_string())
+            } else {
+                Ok(crate::ai::types::ToolResult {
+                    tool_call_id: "tc-1".to_string(),
+                    content: "ok".to_string(),
+                })
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn execute_with_safe_retry_does_not_retry_non_safe_tools() {
+        let mut calls = 0usize;
+        let result = execute_with_safe_retry(&ToolRoute::Builtin, "create_file", || {
+            calls += 1;
+            Err("request timed out".to_string())
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
     }
 
     #[test]

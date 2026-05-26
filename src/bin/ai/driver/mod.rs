@@ -25,12 +25,14 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        LazyLock, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 use uuid::Uuid;
+use aios_kernel::primitives::{ResourceUsageDelta, RlimitDim, RlimitVerdict};
 
 use crate::ai::{
     agents::{self, AgentManifest},
@@ -45,6 +47,7 @@ use crate::ai::{
     types::{AgentContext, App},
 };
 use crate::commonw::configw;
+use crate::commonw::FastMap;
 
 pub mod agent_router;
 pub mod commands;
@@ -109,6 +112,9 @@ fn terminate_and_cleanup(
     set_current: bool,
 ) {
     os.cleanup_process_resources(pid);
+    if let Ok(mut map) = SCHEDULER_DISPATCH_META.lock() {
+        map.remove(&pid);
+    }
     if set_current {
         os.set_current_pid(Some(pid));
     }
@@ -118,11 +124,495 @@ fn terminate_and_cleanup(
     }
 }
 
+fn format_rlimit_termination_result(verdict: RlimitVerdict) -> String {
+    match verdict {
+        RlimitVerdict::Exceeded {
+            dimension,
+            used,
+            limit,
+        } => {
+            let dim = match dimension {
+                RlimitDim::Turns => "turns",
+                RlimitDim::ToolCalls => "tool_calls",
+                RlimitDim::TokensIn => "tokens_in",
+                RlimitDim::TokensOut => "tokens_out",
+                RlimitDim::CostMicros => "cost_micros",
+                RlimitDim::WallclockTicks => "wallclock_ticks",
+                RlimitDim::ToolCallBytes => "tool_call_bytes",
+                RlimitDim::FsBytes => "fs_bytes",
+            };
+            format!(
+                "Terminated: Resource limit exceeded ({dim}: used={used}, limit={limit})."
+            )
+        }
+        _ => "Completed".to_string(),
+    }
+}
+
 /// Default max LLM iterations allowed per turn (prevents infinite loops)
 const DEFAULT_MAX_ITERATIONS: usize = 1024;
 
 /// Max iterations for subagent (executor) processes
 const EXECUTOR_MAX_ITERATIONS: usize = 64;
+
+const BG_DISPATCH_BASE_BATCH_DEFAULT: usize = 4;
+const BG_DISPATCH_MAX_BATCH_DEFAULT: usize = 8;
+const BG_DISPATCH_EXECUTE_MAX_DEFAULT: usize = 6;
+const SCHED_FAIL_STREAK_OPEN_THRESHOLD_DEFAULT: u32 = 3;
+const SCHED_COOLDOWN_EPOCHS_DEFAULT: u64 = 6;
+const SCHED_EVAL_PERIOD_EPOCHS_DEFAULT: u64 = 24;
+const SCHED_EVAL_MIN_SAMPLES_DEFAULT: usize = 8;
+const SCHED_COST_PENALTY_DIVISOR_DEFAULT: u64 = 50_000;
+const SCHED_TOKEN_PENALTY_DIVISOR_DEFAULT: u64 = 4_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchOutcomeTag {
+    Advanced,
+    Blocked,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProcessDispatchMeta {
+    failure_streak: u32,
+    success_streak: u32,
+    cooldown_until_epoch: u64,
+    last_dispatch_epoch: u64,
+    last_outcome: DispatchOutcomeTag,
+}
+
+impl Default for ProcessDispatchMeta {
+    fn default() -> Self {
+        Self {
+            failure_streak: 0,
+            success_streak: 0,
+            cooldown_until_epoch: 0,
+            last_dispatch_epoch: 0,
+            last_outcome: DispatchOutcomeTag::Advanced,
+        }
+    }
+}
+
+static SCHEDULER_DISPATCH_META: LazyLock<Mutex<FastMap<u64, ProcessDispatchMeta>>> =
+    LazyLock::new(|| Mutex::new(FastMap::default()));
+static SCHEDULER_EPOCH: AtomicU64 = AtomicU64::new(0);
+static SCHEDULER_LAST_EVAL_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn scheduler_cfg_usize(key: &str, default: usize) -> usize {
+    if cfg!(test) {
+        return default;
+    }
+    configw::get_all_config()
+        .get_opt(key)
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn scheduler_cfg_u32(key: &str, default: u32) -> u32 {
+    if cfg!(test) {
+        return default;
+    }
+    configw::get_all_config()
+        .get_opt(key)
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn scheduler_cfg_u64(key: &str, default: u64) -> u64 {
+    if cfg!(test) {
+        return default;
+    }
+    configw::get_all_config()
+        .get_opt(key)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn sched_base_batch() -> usize {
+    scheduler_cfg_usize("ai.scheduler.base_batch", BG_DISPATCH_BASE_BATCH_DEFAULT).max(1)
+}
+
+fn sched_max_batch() -> usize {
+    scheduler_cfg_usize("ai.scheduler.max_batch", BG_DISPATCH_MAX_BATCH_DEFAULT)
+        .max(sched_base_batch())
+}
+
+fn sched_execute_max() -> usize {
+    scheduler_cfg_usize("ai.scheduler.execute_max", BG_DISPATCH_EXECUTE_MAX_DEFAULT)
+        .max(sched_base_batch())
+}
+
+fn sched_fail_threshold() -> u32 {
+    scheduler_cfg_u32(
+        "ai.scheduler.fail_streak_threshold",
+        SCHED_FAIL_STREAK_OPEN_THRESHOLD_DEFAULT,
+    )
+    .max(1)
+}
+
+fn sched_cooldown_epochs() -> u64 {
+    scheduler_cfg_u64("ai.scheduler.cooldown_epochs", SCHED_COOLDOWN_EPOCHS_DEFAULT).max(1)
+}
+
+fn sched_eval_period_epochs() -> u64 {
+    scheduler_cfg_u64("ai.scheduler.eval_period_epochs", SCHED_EVAL_PERIOD_EPOCHS_DEFAULT).max(1)
+}
+
+fn sched_eval_min_samples() -> usize {
+    scheduler_cfg_usize("ai.scheduler.eval_min_samples", SCHED_EVAL_MIN_SAMPLES_DEFAULT).max(1)
+}
+
+fn sched_cost_penalty_divisor() -> u64 {
+    scheduler_cfg_u64(
+        "ai.scheduler.cost_penalty_divisor_micros",
+        SCHED_COST_PENALTY_DIVISOR_DEFAULT,
+    )
+    .max(1)
+}
+
+fn sched_token_penalty_divisor() -> u64 {
+    scheduler_cfg_u64(
+        "ai.scheduler.token_penalty_divisor",
+        SCHED_TOKEN_PENALTY_DIVISOR_DEFAULT,
+    )
+    .max(1)
+}
+
+fn next_scheduler_epoch() -> u64 {
+    SCHEDULER_EPOCH
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1)
+}
+
+fn current_scheduler_epoch() -> u64 {
+    SCHEDULER_EPOCH.load(Ordering::Relaxed)
+}
+
+fn background_pop_limit(ready_count: usize) -> usize {
+    let base = sched_base_batch();
+    let max_batch = sched_max_batch();
+    if ready_count <= base {
+        return base;
+    }
+    if ready_count <= 8 {
+        return (base + 2).min(max_batch);
+    }
+    max_batch
+}
+
+fn background_execute_limit(ready_count: usize) -> usize {
+    let base = sched_base_batch();
+    let execute_max = sched_execute_max();
+    if ready_count <= base {
+        return base;
+    }
+    if ready_count <= 10 {
+        return (base + 1).min(execute_max);
+    }
+    execute_max
+}
+
+fn scheduler_score(
+    proc: &aios_kernel::kernel::Process,
+    meta: ProcessDispatchMeta,
+    epoch: u64,
+) -> i64 {
+    // 更高优先级（更小 priority 值）+ 更久未被调度 + 更低失败 streak。
+    let priority_score = (255u16.saturating_sub(proc.priority as u16) as i64) * 4;
+    let quota_score = (proc.quota_turns.min(32) as i64) * 2;
+    let age = epoch.saturating_sub(meta.last_dispatch_epoch).min(64) as i64;
+    let age_score = age * 3;
+    let failure_penalty = (meta.failure_streak as i64) * 40;
+    let cost_penalty = (proc.usage.cost_micros / sched_cost_penalty_divisor()) as i64;
+    let token_penalty = ((proc.usage.tokens_in + proc.usage.tokens_out)
+        / sched_token_penalty_divisor()) as i64;
+    let outcome_bias = match meta.last_outcome {
+        DispatchOutcomeTag::Advanced => 12,
+        DispatchOutcomeTag::Blocked => 6,
+        DispatchOutcomeTag::Failed => -20,
+    };
+    priority_score + quota_score + age_score + outcome_bias - failure_penalty - cost_penalty - token_penalty
+}
+
+fn update_dispatch_meta(
+    mut meta: ProcessDispatchMeta,
+    outcome: DispatchOutcomeTag,
+    epoch: u64,
+) -> ProcessDispatchMeta {
+    meta.last_outcome = outcome;
+    match outcome {
+        DispatchOutcomeTag::Advanced => {
+            meta.failure_streak = 0;
+            meta.success_streak = meta.success_streak.saturating_add(1).min(100);
+        }
+        DispatchOutcomeTag::Blocked => {
+            meta.failure_streak = meta.failure_streak.saturating_sub(1);
+            meta.success_streak = 0;
+        }
+        DispatchOutcomeTag::Failed => {
+            meta.success_streak = 0;
+            meta.failure_streak = meta.failure_streak.saturating_add(1).min(100);
+            if meta.failure_streak >= sched_fail_threshold() {
+                meta.cooldown_until_epoch = epoch.saturating_add(sched_cooldown_epochs());
+            }
+        }
+    }
+    meta
+}
+
+fn maybe_promote_half_open(meta: ProcessDispatchMeta, epoch: u64) -> ProcessDispatchMeta {
+    if meta.cooldown_until_epoch > 0 && epoch >= meta.cooldown_until_epoch {
+        ProcessDispatchMeta {
+            cooldown_until_epoch: 0,
+            failure_streak: meta.failure_streak.saturating_sub(1),
+            ..meta
+        }
+    } else {
+        meta
+    }
+}
+
+fn classify_process_outcome(
+    os: &dyn aios_kernel::kernel::Kernel,
+    pid: u64,
+) -> DispatchOutcomeTag {
+    let Some(proc) = os.get_process(pid) else {
+        return DispatchOutcomeTag::Advanced;
+    };
+    if matches!(
+        proc.state,
+        aios_kernel::kernel::ProcessState::Waiting { .. }
+            | aios_kernel::kernel::ProcessState::Sleeping { .. }
+            | aios_kernel::kernel::ProcessState::Stopped
+    ) {
+        DispatchOutcomeTag::Blocked
+    } else {
+        DispatchOutcomeTag::Advanced
+    }
+}
+
+fn apply_priority_handoff(
+    proc: &mut aios_kernel::kernel::Process,
+    outcome: DispatchOutcomeTag,
+) {
+    match outcome {
+        DispatchOutcomeTag::Advanced => {
+            proc.priority = proc.priority.saturating_sub(1);
+        }
+        DispatchOutcomeTag::Blocked => {}
+        DispatchOutcomeTag::Failed => {
+            proc.priority = proc.priority.saturating_add(8);
+        }
+    }
+}
+
+fn record_scheduler_outcome(
+    os: &mut dyn aios_kernel::kernel::Kernel,
+    pid: u64,
+    outcome: DispatchOutcomeTag,
+) {
+    let epoch = current_scheduler_epoch();
+    let mut meta_map = SCHEDULER_DISPATCH_META
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let prev = *meta_map.get(&pid).unwrap_or(&ProcessDispatchMeta::default());
+    let next = update_dispatch_meta(prev, outcome, epoch);
+    meta_map.insert(pid, next);
+
+    if let Some(proc) = os.get_process_mut(pid) {
+        apply_priority_handoff(proc, outcome);
+        if outcome == DispatchOutcomeTag::Failed
+            && next.failure_streak >= sched_fail_threshold()
+        {
+            proc.mailbox.push_back(format!(
+                "[scheduler-circuit-open] Consecutive failures reached {}. Cooling down for {} dispatch epochs.",
+                next.failure_streak,
+                sched_cooldown_epochs()
+            ));
+        }
+    }
+}
+
+fn mark_dispatched_pids(pids: &[u64], epoch: u64) {
+    let mut meta_map = SCHEDULER_DISPATCH_META
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    for pid in pids {
+        let mut meta = *meta_map.get(pid).unwrap_or(&ProcessDispatchMeta::default());
+        meta.last_dispatch_epoch = epoch;
+        meta_map.insert(*pid, meta);
+    }
+}
+
+fn log_scheduler_decision(
+    session_id: &str,
+    epoch: u64,
+    chosen: &str,
+    alternatives: Vec<String>,
+    reasoning: String,
+    success: bool,
+) {
+    let store = crate::ai::driver::decision_log::get_decision_log_store();
+    crate::ai::driver::decision_log::log_scheduler_dispatch(
+        store,
+        session_id,
+        epoch as usize,
+        &format!("scheduler_epoch={epoch}"),
+        alternatives,
+        chosen,
+        &reasoning,
+        success,
+    );
+}
+
+fn maybe_emit_scheduler_eval(epoch: u64, session_id: &str) {
+    let last = SCHEDULER_LAST_EVAL_EPOCH.load(Ordering::Relaxed);
+    if epoch.saturating_sub(last) < sched_eval_period_epochs() {
+        return;
+    }
+    let map = SCHEDULER_DISPATCH_META
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if map.len() < sched_eval_min_samples() {
+        return;
+    }
+    let mut failing = 0usize;
+    let mut cooling = 0usize;
+    let mut blocked = 0usize;
+    for meta in map.values() {
+        if meta.failure_streak > 0 {
+            failing += 1;
+        }
+        if meta.cooldown_until_epoch > epoch {
+            cooling += 1;
+        }
+        if matches!(meta.last_outcome, DispatchOutcomeTag::Blocked) {
+            blocked += 1;
+        }
+    }
+    let total = map.len();
+    drop(map);
+    let failing_rate = failing as f64 / total as f64;
+    let cooling_rate = cooling as f64 / total as f64;
+    let blocked_rate = blocked as f64 / total as f64;
+    let healthy = failing_rate < 0.35 && cooling_rate < 0.20;
+
+    crate::ai::driver::print::print_tool_note_line(
+        "scheduler-eval",
+        &format!(
+            "epoch={epoch} total={total} failing={failing} cooling={cooling} blocked={blocked}"
+        ),
+    );
+    log_scheduler_decision(
+        session_id,
+        epoch,
+        if healthy { "scheduler_healthy" } else { "scheduler_attention" },
+        vec![
+            format!("failing_rate={:.3}", failing_rate),
+            format!("cooling_rate={:.3}", cooling_rate),
+            format!("blocked_rate={:.3}", blocked_rate),
+        ],
+        "periodic scheduler health evaluation".to_string(),
+        healthy,
+    );
+    SCHEDULER_LAST_EVAL_EPOCH.store(epoch, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn reset_scheduler_test_state() {
+    SCHEDULER_EPOCH.store(0, Ordering::Relaxed);
+    if let Ok(mut map) = SCHEDULER_DISPATCH_META.lock() {
+        map.clear();
+    }
+}
+
+fn select_background_batch(
+    os: &mut dyn aios_kernel::kernel::Kernel,
+    epoch: u64,
+    session_id: &str,
+) -> Vec<aios_kernel::kernel::Process> {
+    let ready_count = os.ready_count();
+    let pop_limit = background_pop_limit(ready_count);
+    let execute_limit = background_execute_limit(ready_count);
+    let popped = os.pop_all_ready(pop_limit);
+    if popped.is_empty() {
+        return Vec::new();
+    }
+
+    let meta_snapshot = {
+        let map = SCHEDULER_DISPATCH_META
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        map.clone()
+    };
+
+    let mut eligible = Vec::new();
+    let mut deferred = Vec::new();
+    let mut alt_notes = Vec::new();
+    for proc in popped {
+        let meta = maybe_promote_half_open(
+            *meta_snapshot
+            .get(&proc.pid)
+            .unwrap_or(&ProcessDispatchMeta::default()),
+            epoch,
+        );
+        let score = scheduler_score(&proc, meta, epoch);
+        alt_notes.push(format!(
+            "pid={} score={} cooldown_until={} fail_streak={}",
+            proc.pid, score, meta.cooldown_until_epoch, meta.failure_streak
+        ));
+        if meta.cooldown_until_epoch > epoch {
+            deferred.push(proc);
+        } else {
+            eligible.push(proc);
+        }
+    }
+
+    eligible.sort_by(|a, b| {
+        let a_meta = maybe_promote_half_open(
+            *meta_snapshot
+            .get(&a.pid)
+            .unwrap_or(&ProcessDispatchMeta::default()),
+            epoch,
+        );
+        let b_meta = maybe_promote_half_open(
+            *meta_snapshot
+            .get(&b.pid)
+            .unwrap_or(&ProcessDispatchMeta::default()),
+            epoch,
+        );
+        scheduler_score(b, b_meta, epoch).cmp(&scheduler_score(a, a_meta, epoch))
+    });
+
+    let keep = execute_limit.min(eligible.len());
+    let mut selected = eligible;
+    let mut spill = selected.split_off(keep);
+    deferred.append(&mut spill);
+
+    let deferred_count = deferred.len();
+    // pop_all_ready 会把进程置 Running；对未执行者需要显式回到 ready。
+    for proc in deferred {
+        os.set_current_pid(Some(proc.pid));
+        let _ = os.requeue_current();
+    }
+
+    if let Some(first) = selected.first() {
+        os.set_current_pid(Some(first.pid));
+    }
+    let selected_pids: Vec<u64> = selected.iter().map(|p| p.pid).collect();
+    mark_dispatched_pids(&selected_pids, epoch);
+    if !selected_pids.is_empty() {
+        log_scheduler_decision(
+            session_id,
+            epoch,
+            &format!("selected={:?}", selected_pids),
+            alt_notes,
+            format!("eligible={} deferred={}", selected.len(), deferred_count),
+            true,
+        );
+    }
+    selected
+}
 
 #[crate::ai::agent_hang_span(
     "pre-fix",
@@ -630,6 +1120,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
         };
 
+    let decision_log_path = app
+        .session_history_file
+        .with_extension("decision-log.jsonl");
+    crate::ai::driver::decision_log::set_decision_log_persist_path(decision_log_path);
+
     let mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
 
     let mcp_probe = probe_mcp_config(&app);
@@ -693,23 +1188,31 @@ fn finalize_turn_quota(
     os: &mut dyn aios_kernel::kernel::Kernel,
     pid: u64,
 ) -> (bool, String) {
+    let verdict = os.rusage_charge(
+        pid,
+        ResourceUsageDelta {
+            turns: 1,
+            ..Default::default()
+        },
+    );
     let mut should_terminate = true;
-    let mut termination_result = "Completed".to_string();
-    if let Some(p) = os.get_process_mut(pid) {
-        if p.quota_turns > 0 {
-            p.quota_turns -= 1;
-        }
-        if p.quota_turns == 0 {
-            termination_result = "Terminated: Max LLM quota reached.".to_string();
-        }
-        if matches!(
+    let mut termination_result = format_rlimit_termination_result(verdict.clone());
+    if let Some(p) = os.get_process_mut(pid)
+        && matches!(
             p.state,
             aios_kernel::kernel::ProcessState::Waiting { .. }
                 | aios_kernel::kernel::ProcessState::Sleeping { .. }
                 | aios_kernel::kernel::ProcessState::Stopped
-        ) {
-            should_terminate = false;
+        )
+    {
+        should_terminate = false;
+        if matches!(verdict, RlimitVerdict::Exceeded { .. }) {
+            p.mailbox.push_back(format!(
+                "[rlimit-warning] {}",
+                format_rlimit_termination_result(verdict)
+            ));
         }
+        termination_result = "Completed".to_string();
     }
     (should_terminate, termination_result)
 }
@@ -782,7 +1285,8 @@ async fn run_foreground_resume(
         Ok(_outcome) => {
             let mut os = app.os.lock().unwrap();
             os.set_current_pid(Some(pid));
-            os.increment_turns_used_for(pid);
+            let outcome = classify_process_outcome(&**os, pid);
+            record_scheduler_outcome(os.as_mut(), pid, outcome);
             let (should_terminate, termination_result) = finalize_turn_quota(os.as_mut(), pid);
             if should_terminate {
                 terminate_and_cleanup(os.as_mut(), pid, termination_result, true);
@@ -790,6 +1294,7 @@ async fn run_foreground_resume(
         }
         Err(err) => {
             let mut os = app.os.lock().unwrap();
+            record_scheduler_outcome(os.as_mut(), pid, DispatchOutcomeTag::Failed);
             terminate_and_cleanup(os.as_mut(), pid, format!("Failed: {}", err), true);
         }
     }
@@ -803,7 +1308,6 @@ async fn run_foreground_resume(
 ///   2. Agent hot-reload: check for new agents every 5 ticks
 ///   3. Shutdown check: exit if shutdown flag is set
 ///   4. Background execution:
-///      - pop_all_ready() to get ready processes
 ///      - spawn async tasks for each
 ///      - wait for all to complete
 ///   5. Foreground input:
@@ -850,6 +1354,7 @@ async fn run_loop(
     };
 
     loop {
+        let epoch = next_scheduler_epoch();
         {
             let mut os = app.os.lock().unwrap_or_else(|err| err.into_inner());
             os.advance_tick();
@@ -883,8 +1388,9 @@ async fn run_loop(
 
         let background_procs: Vec<aios_kernel::kernel::Process> = {
             let mut os = app.os.lock().unwrap();
-            os.pop_all_ready(4)
+            select_background_batch(os.as_mut(), epoch, app.session_id.as_str())
         };
+        maybe_emit_scheduler_eval(epoch, app.session_id.as_str());
 
         if !background_procs.is_empty() {
             ensure_runtime_manifests_loaded(
@@ -1055,6 +1561,8 @@ async fn run_loop(
                     }
                     match result {
                         Ok(_outcome) => {
+                            let outcome = classify_process_outcome(&**os, pid);
+                            record_scheduler_outcome(os.as_mut(), pid, outcome);
                             os.increment_turns_used_for(pid);
                             let (should_terminate, termination_result) =
                                 finalize_turn_quota(os.as_mut(), pid);
@@ -1071,6 +1579,11 @@ async fn run_loop(
                             }
                         }
                         Err(err) => {
+                            record_scheduler_outcome(
+                                os.as_mut(),
+                                pid,
+                                DispatchOutcomeTag::Failed,
+                            );
                             terminate_and_cleanup(
                                 os.as_mut(),
                                 pid,
@@ -1281,7 +1794,8 @@ async fn run_loop(
                 let mut os = app.os.lock().unwrap();
                 let current_pid = os.current_process_id();
                 let (should_terminate, termination_result) = if let Some(pid) = current_pid {
-                    os.increment_turns_used_for(pid);
+                    let outcome_tag = classify_process_outcome(&**os, pid);
+                    record_scheduler_outcome(os.as_mut(), pid, outcome_tag);
                     finalize_turn_quota(os.as_mut(), pid)
                 } else {
                     (true, "Completed".to_string())
@@ -1314,6 +1828,7 @@ async fn run_loop(
                 let mut os = app.os.lock().unwrap();
                 let current_pid = os.current_process_id();
                 if let Some(pid) = current_pid {
+                    record_scheduler_outcome(os.as_mut(), pid, DispatchOutcomeTag::Failed);
                     terminate_and_cleanup(os.as_mut(), pid, format!("Failed: {}", err), false);
                 } else {
                     os.terminate_current(format!("Failed: {}", err));
@@ -1360,14 +1875,108 @@ async fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::{has_pending_foreground_process, maybe_auto_route_agent, read_recent_history, should_preload_mcp};
+    use super::{
+        background_execute_limit, background_pop_limit, has_pending_foreground_process,
+        maybe_auto_route_agent, read_recent_history, reset_scheduler_test_state,
+        should_preload_mcp, update_dispatch_meta, DispatchOutcomeTag, ProcessDispatchMeta,
+        SCHEDULER_DISPATCH_META,
+        SCHED_COOLDOWN_EPOCHS_DEFAULT,
+    };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::history::{Message, append_history_messages};
     use crate::ai::cli::ParsedCli;
     use aios_kernel::kernel::{EventId, ProcessState, WaitPolicy};
     use crate::ai::types::{AgentContext, App, AppConfig};
+    use aios_kernel::primitives::ResourceLimit;
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn background_dispatch_limits_scale_with_backlog() {
+        assert_eq!(background_pop_limit(0), 4);
+        assert_eq!(background_pop_limit(7), 6);
+        assert_eq!(background_pop_limit(20), 8);
+
+        assert_eq!(background_execute_limit(0), 4);
+        assert_eq!(background_execute_limit(9), 5);
+        assert_eq!(background_execute_limit(30), 6);
+    }
+
+    #[test]
+    fn scheduler_meta_opens_circuit_after_consecutive_failures() {
+        reset_scheduler_test_state();
+        let mut meta = ProcessDispatchMeta::default();
+        meta = update_dispatch_meta(meta, DispatchOutcomeTag::Failed, 10);
+        assert_eq!(meta.failure_streak, 1);
+        assert_eq!(meta.cooldown_until_epoch, 0);
+
+        meta = update_dispatch_meta(meta, DispatchOutcomeTag::Failed, 11);
+        assert_eq!(meta.failure_streak, 2);
+        assert_eq!(meta.cooldown_until_epoch, 0);
+
+        meta = update_dispatch_meta(meta, DispatchOutcomeTag::Failed, 12);
+        assert_eq!(meta.failure_streak, 3);
+        assert_eq!(
+            meta.cooldown_until_epoch,
+            12 + SCHED_COOLDOWN_EPOCHS_DEFAULT
+        );
+
+        meta = update_dispatch_meta(meta, DispatchOutcomeTag::Advanced, 13);
+        assert_eq!(meta.failure_streak, 0);
+    }
+
+    #[test]
+    fn finalize_turn_quota_charges_turn_usage_once() {
+        let mut app = test_app("build");
+        let pid = {
+            let mut os = app.os.lock().unwrap();
+            os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None)
+        };
+
+        {
+            let mut os = app.os.lock().unwrap();
+            let mut lim = ResourceLimit::unlimited();
+            lim.max_turns = 2;
+            os.rlimit_set(pid, lim).unwrap();
+            assert_eq!(os.rusage_get(pid).unwrap().turns, 0);
+
+            let (terminate1, msg1) = super::finalize_turn_quota(os.as_mut(), pid);
+            assert!(terminate1);
+            assert_eq!(msg1, "Completed");
+            assert_eq!(os.rusage_get(pid).unwrap().turns, 1);
+
+            let (terminate2, msg2) = super::finalize_turn_quota(os.as_mut(), pid);
+            assert!(terminate2);
+            assert_eq!(msg2, "Completed");
+            assert_eq!(os.rusage_get(pid).unwrap().turns, 2);
+
+            let (terminate3, msg3) = super::finalize_turn_quota(os.as_mut(), pid);
+            assert!(terminate3);
+            assert!(msg3.contains("Resource limit exceeded"));
+            assert_eq!(os.rusage_get(pid).unwrap().turns, 3);
+        }
+    }
+
+    #[test]
+    fn terminate_and_cleanup_removes_scheduler_meta_entry() {
+        reset_scheduler_test_state();
+        let mut app = test_app("build");
+        let pid = {
+            let mut os = app.os.lock().unwrap();
+            os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None)
+        };
+        {
+            let mut map = SCHEDULER_DISPATCH_META.lock().unwrap();
+            map.insert(pid, ProcessDispatchMeta::default());
+            assert!(map.contains_key(&pid));
+        }
+        {
+            let mut os = app.os.lock().unwrap();
+            super::terminate_and_cleanup(os.as_mut(), pid, "Completed".to_string(), true);
+        }
+        let map = SCHEDULER_DISPATCH_META.lock().unwrap();
+        assert!(!map.contains_key(&pid));
+    }
 
     fn primary_agent(name: &str, description: &str, routing_tags: &[&str]) -> AgentManifest {
         AgentManifest {

@@ -5,7 +5,12 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use rust_tools::commonw::FastMap;
-use std::sync::{Arc, Mutex};
+use std::{
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 /// 决策类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -22,6 +27,8 @@ pub enum DecisionType {
     ReflectionTrigger,
     /// 用户意图识别
     IntentRecognition,
+    /// 调度器分发与评估
+    SchedulerDispatch,
 }
 
 /// 决策记录
@@ -71,6 +78,7 @@ pub enum UserFeedback {
 pub struct DecisionLogStore {
     logs: Arc<Mutex<Vec<DecisionLog>>>,
     max_capacity: usize,
+    persist_path: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl DecisionLogStore {
@@ -78,7 +86,37 @@ impl DecisionLogStore {
         Self {
             logs: Arc::new(Mutex::new(Vec::with_capacity(max_capacity))),
             max_capacity,
+            persist_path: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn set_persist_path<P: AsRef<Path>>(&self, path: P) {
+        let mut guard = self.persist_path.lock().unwrap();
+        *guard = Some(path.as_ref().to_path_buf());
+    }
+
+    fn persist_log_if_enabled(&self, log: &DecisionLog) {
+        let path = {
+            let guard = self.persist_path.lock().unwrap();
+            guard.clone()
+        };
+        let Some(path) = path else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return;
+        };
+        let Ok(line) = serde_json::to_string(log) else {
+            return;
+        };
+        let _ = writeln!(file, "{}", line);
     }
 
     /// 记录一个决策
@@ -94,7 +132,10 @@ impl DecisionLogStore {
             logs.drain(0..remove_count);
         }
         
+        let persist_copy = log.clone();
         logs.push(log);
+        drop(logs);
+        self.persist_log_if_enabled(&persist_copy);
     }
 
     /// 获取最近的 N 条日志
@@ -102,6 +143,41 @@ impl DecisionLogStore {
         let logs = self.logs.lock().unwrap();
         let start = logs.len().saturating_sub(n);
         logs[start..].to_vec()
+    }
+
+    pub fn recent_by_session(&self, session_id: &str, n: usize) -> Vec<DecisionLog> {
+        let logs = self.logs.lock().unwrap();
+        let filtered = logs
+            .iter()
+            .filter(|log| log.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let start = filtered.len().saturating_sub(n);
+        filtered[start..].to_vec()
+    }
+
+    pub fn replay_recent_from_disk(&self, session_id: &str, n: usize) -> Vec<DecisionLog> {
+        let path = {
+            let guard = self.persist_path.lock().unwrap();
+            guard.clone()
+        };
+        let Some(path) = path else {
+            return Vec::new();
+        };
+        let Ok(file) = std::fs::File::open(path) else {
+            return Vec::new();
+        };
+        let reader = BufReader::new(file);
+        let mut out = Vec::new();
+        for line in reader.lines().map_while(Result::ok) {
+            if let Ok(log) = serde_json::from_str::<DecisionLog>(&line)
+                && log.session_id == session_id
+            {
+                out.push(log);
+            }
+        }
+        let start = out.len().saturating_sub(n);
+        out[start..].to_vec()
     }
 
     /// 按类型筛选日志
@@ -358,9 +434,54 @@ pub fn log_intent_recognition(
     });
 }
 
+/// 辅助函数：记录调度器分发决策（含 defer/selected 与评分摘要）
+pub fn log_scheduler_dispatch(
+    store: &DecisionLogStore,
+    session_id: &str,
+    turn_id: usize,
+    context: &str,
+    alternatives: Vec<String>,
+    chosen: &str,
+    reasoning: &str,
+    success: bool,
+) {
+    store.log(DecisionLog {
+        timestamp: 0,
+        session_id: session_id.to_string(),
+        turn_id,
+        decision_type: DecisionType::SchedulerDispatch,
+        context: context.to_string(),
+        alternatives_considered: alternatives,
+        chosen_option: chosen.to_string(),
+        reasoning: reasoning.to_string(),
+        confidence: None,
+        outcome: Some(Outcome {
+            success,
+            message: if success {
+                "scheduler decision accepted".to_string()
+            } else {
+                "scheduler decision indicates risk".to_string()
+            },
+            user_feedback: None,
+        }),
+        execution_time_ms: None,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_log_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        path.push(format!("rust_tools_{name}_{}_{}.jsonl", std::process::id(), ts));
+        path
+    }
 
     #[test]
     fn test_log_store_basic() {
@@ -495,6 +616,44 @@ mod tests {
         assert_eq!(stats.failures, 5);
         assert!((stats.success_rate - 0.5).abs() < 0.01);
     }
+
+    #[test]
+    fn test_persist_and_replay_recent_by_session() {
+        let store = DecisionLogStore::new(100);
+        let path = temp_log_path("decision_log_persist");
+        store.set_persist_path(&path);
+
+        for turn in 0..5usize {
+            log_scheduler_dispatch(
+                &store,
+                "sess-a",
+                turn,
+                "ctx",
+                vec!["a".to_string()],
+                "chosen",
+                "reason",
+                true,
+            );
+        }
+        for turn in 0..3usize {
+            log_scheduler_dispatch(
+                &store,
+                "sess-b",
+                turn,
+                "ctx",
+                vec!["b".to_string()],
+                "chosen",
+                "reason",
+                false,
+            );
+        }
+
+        let replay = store.replay_recent_from_disk("sess-a", 3);
+        assert_eq!(replay.len(), 3);
+        assert!(replay.iter().all(|item| item.session_id == "sess-a"));
+
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 // 全局单例访问
@@ -510,4 +669,17 @@ pub fn get_decision_log_store() -> &'static DecisionLogStore {
 /// 初始化决策日志存储（可选，用于自定义容量）
 pub fn init_decision_log_store(capacity: usize) -> &'static DecisionLogStore {
     DECISION_LOG_STORE.get_or_init(|| DecisionLogStore::new(capacity))
+}
+
+pub fn init_decision_log_store_with_path<P: AsRef<Path>>(
+    capacity: usize,
+    path: P,
+) -> &'static DecisionLogStore {
+    let store = DECISION_LOG_STORE.get_or_init(|| DecisionLogStore::new(capacity));
+    store.set_persist_path(path);
+    store
+}
+
+pub fn set_decision_log_persist_path<P: AsRef<Path>>(path: P) {
+    get_decision_log_store().set_persist_path(path);
 }

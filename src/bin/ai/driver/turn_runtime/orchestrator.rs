@@ -29,6 +29,8 @@ use super::{
 /// 工具调用循环检测窗口：连续 N 轮调用 (tool_name, normalized_args) 完全一致
 /// 视为 agent 卡死，提前介入，避免到 max_iterations 才举手投降。
 const TOOL_LOOP_WINDOW: usize = 4;
+const TOOL_SIGNATURE_HISTORY_LIMIT: usize = TOOL_LOOP_WINDOW + 2;
+const TASK_ANCHOR_MAX_QUESTION_CHARS: usize = 220;
 
 /// 提取最近一轮 assistant 消息中的 (tool_name, args_json) 签名集合。
 /// 任何一个签名与窗口内某轮完全一致即认为有循环倾向。
@@ -63,6 +65,120 @@ fn detect_tool_loop(history: &[Vec<String>]) -> bool {
         return false;
     }
     tail.iter().all(|sigs| sigs == first)
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    for ch in s.chars().take(max_chars.saturating_sub(1)) {
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+fn inject_task_anchor_note(
+    messages: &mut Vec<crate::ai::history::Message>,
+    question: &str,
+    iteration: usize,
+    reason: &str,
+) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let goal = truncate_chars(question.trim(), TASK_ANCHOR_MAX_QUESTION_CHARS);
+    let note = format!(
+        "[task-anchor] reason={reason}, iteration={iteration}.\n主任务目标: {goal}\n\
+请优先保持目标连续性：\n- 先总结目前已确认事实\n- 明确下一步唯一动作\n- 若信息不足，说明阻塞点并停止重复工具调用"
+    );
+    messages.push(Message {
+        role: "system".to_string(),
+        content: Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+#[derive(Default)]
+struct TurnSupervisor {
+    iteration: usize,
+    loop_breaker_injected: bool,
+    iteration_limit_note_injected: bool,
+    task_anchor_injected: bool,
+    last_compress_iteration: usize,
+    last_compress_after_chars: usize,
+    tool_signature_history: Vec<Vec<String>>,
+}
+
+impl TurnSupervisor {
+    fn next_iteration(&mut self) -> usize {
+        self.iteration = self.iteration.saturating_add(1);
+        self.iteration
+    }
+
+    fn should_try_mid_turn_compress(&self, total_chars: usize) -> bool {
+        let cooldown_passed = self
+            .iteration
+            .saturating_sub(self.last_compress_iteration)
+            >= MID_TURN_COMPRESS_COOLDOWN_ITERATIONS;
+        let delta_significant = total_chars
+            .saturating_sub(self.last_compress_after_chars)
+            >= MID_TURN_COMPRESS_DELTA_THRESHOLD;
+        total_chars > MID_TURN_COMPRESS_SOFT_THRESHOLD
+            && cooldown_passed
+            && (self.last_compress_after_chars == 0 || delta_significant)
+    }
+
+    fn mark_compress(&mut self, after_chars: usize) {
+        self.last_compress_iteration = self.iteration;
+        self.last_compress_after_chars = after_chars;
+    }
+
+    fn record_tool_signatures_and_should_break_loop(
+        &mut self,
+        messages: &[crate::ai::history::Message],
+    ) -> bool {
+        let Some(sigs) = extract_round_tool_signatures(messages) else {
+            return false;
+        };
+        self.tool_signature_history.push(sigs);
+        if self.tool_signature_history.len() > TOOL_SIGNATURE_HISTORY_LIMIT {
+            let drop = self.tool_signature_history.len() - TOOL_SIGNATURE_HISTORY_LIMIT;
+            self.tool_signature_history.drain(0..drop);
+        }
+        !self.loop_breaker_injected && detect_tool_loop(&self.tool_signature_history)
+    }
+
+    fn mark_loop_breaker_injected(&mut self) {
+        self.loop_breaker_injected = true;
+    }
+
+    fn maybe_inject_iteration_limit_note(
+        &mut self,
+        messages: &mut Vec<crate::ai::history::Message>,
+        max_iterations: usize,
+        force_final_response: bool,
+    ) {
+        if force_final_response && !self.iteration_limit_note_injected {
+            self.iteration_limit_note_injected = true;
+            inject_iteration_limit_reflect_note(messages, max_iterations);
+        }
+    }
+
+    fn maybe_inject_task_anchor(
+        &mut self,
+        messages: &mut Vec<crate::ai::history::Message>,
+        question: &str,
+        reason: &str,
+    ) {
+        if self.task_anchor_injected {
+            return;
+        }
+        self.task_anchor_injected = true;
+        inject_task_anchor_note(messages, question, self.iteration, reason);
+    }
 }
 
 /// 把 mid-turn 压缩状态以 status line 形式输出到终端。
@@ -134,6 +250,35 @@ mod tests {
     fn detect_tool_loop_ignores_empty_signatures() {
         let history = vec![Vec::<String>::new(); TOOL_LOOP_WINDOW];
         assert!(!detect_tool_loop(&history));
+    }
+
+    #[test]
+    fn turn_supervisor_compress_gate_respects_cooldown_and_delta() {
+        let mut s = TurnSupervisor::default();
+        s.iteration = 3;
+        assert!(s.should_try_mid_turn_compress(MID_TURN_COMPRESS_SOFT_THRESHOLD + 10));
+
+        s.mark_compress(MID_TURN_COMPRESS_SOFT_THRESHOLD + 10);
+        assert!(!s.should_try_mid_turn_compress(MID_TURN_COMPRESS_SOFT_THRESHOLD + 20));
+
+        s.iteration += MID_TURN_COMPRESS_COOLDOWN_ITERATIONS;
+        assert!(!s.should_try_mid_turn_compress(
+            s.last_compress_after_chars + MID_TURN_COMPRESS_DELTA_THRESHOLD - 1,
+        ));
+        assert!(s.should_try_mid_turn_compress(
+            s.last_compress_after_chars + MID_TURN_COMPRESS_DELTA_THRESHOLD,
+        ));
+    }
+
+    #[test]
+    fn task_anchor_note_truncates_goal_text() {
+        let mut messages = Vec::new();
+        let long_q = "x".repeat(TASK_ANCHOR_MAX_QUESTION_CHARS + 30);
+        inject_task_anchor_note(&mut messages, long_q.as_str(), 5, "test");
+        let text = messages[0].content.as_str().unwrap_or_default().to_string();
+        assert!(text.contains("[task-anchor]"));
+        assert!(text.contains("iteration=5"));
+        assert!(text.contains("…"));
     }
 }
 
@@ -230,25 +375,16 @@ async fn run_turn_body(
         Err(err) => return Err(err),
     };
 
-    let mut iteration = 0usize;
+    let mut supervisor = TurnSupervisor::default();
     let mut force_final_response = false;
     let mut final_assistant_text = String::new();
     let mut final_assistant_recorded = false;
     let mut terminal_dedupe_candidate = None;
-    // 工具循环检测：每轮结束后记录 assistant tool_calls 的归一化签名集合，
-    // 滑动窗口达到 TOOL_LOOP_WINDOW 且全部相同 → 注入 loop-breaker note。
-    let mut tool_signature_history: Vec<Vec<String>> = Vec::new();
-    let mut loop_breaker_injected = false;
-    let mut iteration_limit_note_injected = false;
-    // Mid-turn 压缩节流：上次压缩时的 iteration 与压缩后的字符数。
-    // 用于实现：①冷却（至少隔 N 轮再判）②增量门槛（messages 增量不够大不重压）。
-    let mut last_compress_iteration: usize = 0;
-    let mut last_compress_after_chars: usize = 0;
     // 收集本 turn 实际调用过的 explicit-enabled tool 名字，turn 末用于老化未用项。
     let mut tools_used_this_turn: crate::commonw::FastSet<String> =
         crate::commonw::FastSet::default();
     let loop_result = 'turn: loop {
-        iteration += 1;
+        let iteration = supervisor.next_iteration();
         {
             let mc = mcp_client.lock().unwrap();
             refresh_skill_turn_for_iteration(
@@ -346,24 +482,14 @@ async fn run_turn_body(
         // 复用跨 turn 压缩管线，避免长链工具调用把上下文撑爆。
         // 节流：①冷却 N 轮 ②增量小于 DELTA 时跳过，避免 no-op 反复压缩。
         let total_chars = crate::ai::history::messages_total_chars_pub(&messages);
-        let cooldown_passed = iteration
-            .saturating_sub(last_compress_iteration)
-            >= MID_TURN_COMPRESS_COOLDOWN_ITERATIONS;
-        let delta_significant = total_chars
-            .saturating_sub(last_compress_after_chars)
-            >= MID_TURN_COMPRESS_DELTA_THRESHOLD;
-        if total_chars > MID_TURN_COMPRESS_SOFT_THRESHOLD
-            && cooldown_passed
-            && (last_compress_after_chars == 0 || delta_significant)
-        {
+        if supervisor.should_try_mid_turn_compress(total_chars) {
             let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
             let (compressed, before, after) = crate::ai::history::mid_turn_compress(
                 drained,
                 MID_TURN_COMPRESS_SOFT_THRESHOLD,
             );
             messages = compressed;
-            last_compress_iteration = iteration;
-            last_compress_after_chars = after;
+            supervisor.mark_compress(after);
             if after < before {
                 print_compress_status("mid-turn", before, after);
             }
@@ -400,21 +526,15 @@ async fn run_turn_body(
         }
 
         // === 工具循环检测 ===
-        if let Some(sigs) = extract_round_tool_signatures(&messages) {
-            tool_signature_history.push(sigs);
-            if tool_signature_history.len() > TOOL_LOOP_WINDOW + 2 {
-                // 仅保留最近 6 轮签名即可
-                let drop = tool_signature_history.len() - (TOOL_LOOP_WINDOW + 2);
-                tool_signature_history.drain(0..drop);
-            }
-            if !loop_breaker_injected && detect_tool_loop(&tool_signature_history) {
-                loop_breaker_injected = true;
-                crate::ai::driver::print::print_tool_note_line(
-                    "agent-health",
-                    "tool-loop detected: injecting self-reflect prompt",
-                );
-                inject_loop_breaker_note(&mut messages);
-            }
+        if supervisor.record_tool_signatures_and_should_break_loop(&messages) {
+            supervisor.mark_loop_breaker_injected();
+            crate::ai::driver::print::print_tool_note_line(
+                "agent-health",
+                "tool-loop detected: injecting self-reflect prompt",
+            );
+            inject_loop_breaker_note(&mut messages);
+            // 高风险异常才注入一次任务锚点，降低目标漂移概率。
+            supervisor.maybe_inject_task_anchor(&mut messages, &question, "tool-loop");
         }
 
         // === Iteration limit 自反思 ===
@@ -422,9 +542,13 @@ async fn run_turn_body(
         // force_final_response 置 true。此时除原有的 "Tool limit reached"
         // system prompt 外，再额外补一条更具体的反思 prompt
         // （只注入一次，避免重复刷屏）。
-        if force_final_response && !iteration_limit_note_injected {
-            iteration_limit_note_injected = true;
-            inject_iteration_limit_reflect_note(&mut messages, max_iterations);
+        supervisor.maybe_inject_iteration_limit_note(
+            &mut messages,
+            max_iterations,
+            force_final_response,
+        );
+        if force_final_response {
+            supervisor.maybe_inject_task_anchor(&mut messages, &question, "iteration-limit");
         }
     };
 
@@ -438,7 +562,7 @@ async fn run_turn_body(
 
     match loop_result {
         Ok(Some(outcome)) => Ok(outcome),
-        Ok(None) => finalize_turn(
+        Ok(_) => finalize_turn(
             app,
             &next_model,
             &question,
