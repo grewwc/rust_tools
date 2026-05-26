@@ -19,7 +19,7 @@ fn params_read_file() -> Value {
             },
             "limit": {
                 "type": "integer",
-                "description": "Requested number of lines to read; output is capped (currently 10 lines) and may be truncated."
+                "description": "Requested number of lines to read for a broad local excerpt. Prefer this when you already know the file and need more than a tiny snippet."
             }
         },
         "required": ["file_path"]
@@ -40,7 +40,7 @@ fn params_read_file_lines() -> Value {
             },
             "limit": {
                 "type": "integer",
-                "description": "Number of lines to return (1-400; default: 200)."
+                "description": "Number of lines to return (1-400; default: 200). Use this after you have already located the relevant line range or symbol."
             }
         },
         "required": ["file_path"]
@@ -67,7 +67,7 @@ fn params_write_file() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "read_file",
-        description: "Read a small, line-numbered excerpt from a local file (regular files only; directories are not supported; absolute paths only). Use offset/limit to choose a range; output is capped (currently 10 lines) and may be truncated.",
+        description: "Read a line-numbered excerpt from a local file (regular files only; directories are not supported; absolute paths only). Prefer this when you already know the file and want a broader local chunk before deciding whether a narrower follow-up read is necessary.",
         parameters: params_read_file,
         execute: execute_read_file,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
@@ -78,7 +78,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "read_file_lines",
-        description: "Read line-numbered text from a local file with configurable offset/limit (limit capped at 400). Prefer this before patching an existing file so edits can target the exact local region instead of rewriting the whole file.",
+        description: "Read line-numbered text from a local file with configurable offset/limit (limit capped at 400). Prefer this only when you already know the relevant region and need a precise line-range read for inspection or patching.",
         parameters: params_read_file_lines,
         execute: execute_read_file_lines,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
@@ -89,7 +89,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "write_file",
-        description: "Create a new file or intentionally replace an entire file at an absolute path. For modifying an existing document or source file, prefer read_file_lines + apply_patch with the smallest localized diff instead of rewriting the whole file.",
+        description: "Create a new file or intentionally replace an entire file at an absolute path. For modifying an existing document or source file, prefer locating the target first, then use a precise read plus apply_patch with the smallest localized diff instead of rewriting the whole file.",
         parameters: params_write_file,
         execute: execute_write_file,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

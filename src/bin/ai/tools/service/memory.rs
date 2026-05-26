@@ -163,6 +163,60 @@ fn default_priority_for_category(category: &str) -> u8 {
     }
 }
 
+fn is_long_term_learning_category(category: &str) -> bool {
+    matches!(
+        category,
+        "common_sense"
+            | "coding_guideline"
+            | "best_practice"
+            | "safety_rules"
+            | "user_preference"
+            | "preference"
+            | "project_memory"
+    )
+}
+
+fn maybe_downgrade_memory_save(
+    category: &str,
+    note: &str,
+    tags: &mut Vec<String>,
+    source: &mut Option<String>,
+    priority: Option<u8>,
+) -> (
+    String,
+    Option<u8>,
+    crate::ai::driver::reflection::LearningNoteAssessment,
+) {
+    if !is_long_term_learning_category(category) {
+        let assessment = crate::ai::driver::reflection::assess_learning_note_quality(note);
+        return (category.to_string(), priority, assessment);
+    }
+
+    let assessment = crate::ai::driver::reflection::assess_learning_note_quality(note);
+    if assessment.high_quality {
+        return (category.to_string(), priority, assessment);
+    }
+
+    if !tags.iter().any(|tag| tag == "auto_downgraded") {
+        tags.push("auto_downgraded".to_string());
+    }
+    if !tags.iter().any(|tag| tag == "low_signal") {
+        tags.push("low_signal".to_string());
+    }
+    if let Some(src) = source.as_mut() {
+        if !src.contains("memory_save_downgraded") {
+            src.push_str(":memory_save_downgraded");
+        }
+    } else {
+        *source = Some("agent_memory_save:memory_save_downgraded".to_string());
+    }
+    (
+        "self_note".to_string(),
+        Some(priority.unwrap_or(120).min(120)),
+        assessment,
+    )
+}
+
 /// 判断一条记忆是否豁免 30d 时间窗 GC / 配额淘汰。
 ///
 /// 历史实现只看 `priority == 255`：
@@ -969,8 +1023,8 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
         return Err("content is empty".to_string());
     }
 
-    let category = normalized_category(args["category"].as_str(), "user_memory");
-    let tags = args["tags"]
+    let requested_category = normalized_category(args["category"].as_str(), "self_note");
+    let mut tags = args["tags"]
         .as_array()
         .map(|arr| {
             arr.iter()
@@ -979,15 +1033,23 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
                 .filter(|s| !s.is_empty())
                 .collect()
         })
-        .unwrap_or_else(|| vec!["user_directed".to_string()]);
+        .unwrap_or_else(|| vec!["agent".to_string(), "memory_save".to_string()]);
     
-    let source = args["source"]
+    let mut source = args["source"]
         .as_str()
         .map(|s| s.trim().to_string())
-        .or(Some("user_command".to_string()));
+        .or(Some("agent_memory_save".to_string()));
 
-    let priority = parse_priority_arg(args, "priority")?
-        .or_else(|| Some(default_priority_for_category(&category)));
+    let requested_priority = parse_priority_arg(args, "priority")?
+        .or_else(|| Some(default_priority_for_category(&requested_category)));
+    let (category, priority, assessment) = maybe_downgrade_memory_save(
+        &requested_category,
+        content,
+        &mut tags,
+        &mut source,
+        requested_priority,
+    );
+    let downgraded = category != requested_category;
     let (owner_pid, owner_pgid) = current_owner_tags();
     let entry = AgentMemoryEntry {
         id: Some(next_memory_id()),
@@ -1003,6 +1065,16 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
     
     let store = MemoryStore::from_env_or_config();
     store.append(&entry)?;
+    crate::ai::driver::decision_log::log_memory_save_assessment(
+        crate::ai::driver::decision_log::get_decision_log_store(),
+        &crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
+        crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
+        &requested_category,
+        &entry.category,
+        content,
+        &assessment,
+        downgraded,
+    );
     Ok(format!(
         "Memory saved: {} (category: {}, id: {})",
         store.path().display(),
@@ -1105,6 +1177,63 @@ mod tests {
         let list_after = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
         let after: serde_json::Value = serde_json::from_str(&list_after).unwrap();
         assert!(after.as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn memory_save_defaults_to_short_term_self_note() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_memory_save_default_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let save_args = serde_json::json!({
+            "content": "Prefer code_search before repeated raw reads"
+        });
+        execute_memory_save(&save_args).unwrap();
+
+        let list = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
+        let items: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(items[0]["category"].as_str().unwrap(), "self_note");
+
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn memory_save_downgrades_low_signal_long_term_entries_to_self_note() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_memory_save_downgrade_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let save_args = serde_json::json!({
+            "content": "be careful",
+            "category": "common_sense"
+        });
+        execute_memory_save(&save_args).unwrap();
+
+        let list = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
+        let items: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(items[0]["category"].as_str().unwrap(), "self_note");
+        assert!(items[0]["tags"].as_array().unwrap().iter().any(|v| v.as_str() == Some("auto_downgraded")));
+        assert_eq!(items[0]["priority"].as_u64().unwrap(), 120);
 
         let _ = std::fs::remove_file(&path);
         unsafe {

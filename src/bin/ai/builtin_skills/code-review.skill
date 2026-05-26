@@ -28,7 +28,7 @@ skip_recall: true
 
 ## 🧰 工具使用约定
 
-- 读取代码：优先用 `read_file_lines` 获取足够上下文（`read_file` 行数很少，适合快速确认文件头/小片段）。
+- 读取代码：先用 `search_files` / `grep_search` / `code_search` 定位；已知文件但还需要较宽上下文时用 `read_file`，只有在已定位到具体区域后再用 `read_file_lines` 做精确读取。
 - 搜索定位：用 `search_files` 找文件；用 `grep_search` 做路径/模式检索；变更对比优先用 `git_status`/`git_diff`。
 - 修改方式：默认只给建议；当用户明确要求"直接改代码"时，优先用 `apply_patch` 做最小改动，必要时再用 `write_file` 覆盖写入。
 - 验证：Rust 项目优先 `cargo_check`/`cargo_test`；其他项目用 `execute_command` 跑现有的 lint/test 命令（注意危险命令会被拦截，输出也会截断）。

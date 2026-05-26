@@ -50,11 +50,7 @@ impl SkillEmbeddingDocument {
 }
 
 fn build_identity_text(skill: &SkillManifest) -> String {
-    let mut lines = vec![skill.name.clone(), skill.description.clone()];
-    if !skill.triggers.is_empty() {
-        lines.push(skill.triggers.join("\n"));
-    }
-    normalize_section(lines)
+    normalize_section(vec![skill.name.clone(), skill.description.clone()])
 }
 
 fn build_capability_text(skill: &SkillManifest) -> String {

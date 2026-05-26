@@ -148,29 +148,10 @@ fn validate_model(model: &IntentModelFile) -> Result<(), String> {
 }
 
 fn detect_modifiers(input: &str, rules: &RuntimeRules) -> IntentModifiers {
-    let mut modifiers = IntentModifiers::default();
-
-    if rules.search_patterns.iter().any(|p| input.contains(p)) {
-        modifiers.is_search_query = true;
-        modifiers.target_resource = extract_target_resource(input, rules);
-    }
-
-    modifiers.negation = rules.negation_patterns.iter().any(|p| input.contains(p));
-    modifiers
-}
-
-/// 提取查询目标资源类型。
-///
-/// 当多个 `resource_keywords` 同时命中时（如同时出现 "skill" 和 "tool"），
-/// 选择 `pattern` 最长的那个 —— 长 pattern 通常更具体，冲突解决比"按数组顺序
-/// 取第一个"更稳定。规则数据本身没有 priority 字段，无需改 schema。
-fn extract_target_resource(input: &str, rules: &RuntimeRules) -> Option<String> {
-    rules
-        .resource_keywords
-        .iter()
-        .filter(|rule| !rule.pattern.trim().is_empty() && input.contains(rule.pattern.as_str()))
-        .max_by_key(|rule| rule.pattern.chars().count())
-        .map(|rule| rule.resource.clone())
+    let _ = (input, rules);
+    // 词面 modifier 规则已退役：意图只由模型本身决定，避免 search/negation/
+    // resource 这类手写字符串模式继续影响路由。
+    IntentModifiers::default()
 }
 
 fn predict_core_intent(input: &str, model: &IntentModelFile) -> CoreIntent {

@@ -66,10 +66,9 @@ pub fn rank_skills_locally_with_model_path<'a>(
         return Vec::new();
     }
 
-    let input_lower = input.to_lowercase();
     let model_probs = skill_match_model::predict_skill(input, model_path);
     let runtime_model = RuntimeSkillModel::for_skills(skills);
-    let query_features = TextSimilarityFeatures::from_text(&input_lower);
+    let query_features = TextSimilarityFeatures::from_text(input);
     let embedding_hits = build_embedding_hits(skills, input).unwrap_or_default();
     let mut ranked = Vec::new();
 
@@ -98,13 +97,8 @@ pub fn rank_skills_locally_with_model_path<'a>(
             Some(result) => probability_for_label(result, SKILL_NONE_LABEL),
             None => 0.0,
         };
-        let excluded = is_excluded_by_skill(skill, &input_lower);
         let priority_bonus = (skill.priority.max(0) as f64).min(100.0) / 100.0;
-        let score = if excluded {
-            0.0
-        } else {
-            blended_score * LOCAL_MODEL_SCORE_SCALE + priority_bonus
-        };
+        let score = blended_score * LOCAL_MODEL_SCORE_SCALE + priority_bonus;
         ranked.push(ScoredSkill {
             skill,
             score,
@@ -220,9 +214,6 @@ fn runtime_skill_model_cache_key(skills: &[SkillManifest]) -> String {
 
 fn skill_document_text(skill: &SkillManifest) -> String {
     let mut parts = vec![skill.name.clone(), skill.description.clone()];
-    if !skill.triggers.is_empty() {
-        parts.push(skill.triggers.join(" "));
-    }
     if !skill.tools.is_empty() {
         parts.push(skill.tools.join(" "));
     }
@@ -267,29 +258,6 @@ fn probability_for_label(result: &skill_match_model::SkillMatchResult, label: &s
         .find(|(candidate, _)| candidate == label)
         .map(|(_, prob)| *prob)
         .unwrap_or(0.0)
-}
-
-/// 判断 skill 的 `excludes` 模式是否命中输入。
-///
-/// 设计原则：
-/// - 对 ASCII 字母数字组成的模式（如 `"test"`, `"http"`）做词边界匹配，
-///   避免 `"test"` 误匹配 `"protest" / "latest" / "contest"`。
-/// - 对 CJK 等不存在词边界概念的模式，回退为子串包含。
-fn is_excluded_by_skill(skill: &SkillManifest, input_lower: &str) -> bool {
-    if skill.excludes.is_empty() {
-        return false;
-    }
-    skill.excludes.iter().any(|pattern| {
-        let pattern_lower = pattern.to_lowercase();
-        if pattern_lower.is_empty() {
-            return false;
-        }
-        if super::pattern_is_ascii_word(&pattern_lower) {
-            super::ascii_word_contains(input_lower, &pattern_lower)
-        } else {
-            input_lower.contains(&pattern_lower)
-        }
-    })
 }
 
 #[cfg(test)]
@@ -339,9 +307,11 @@ mod tests {
     }
 
     #[test]
-    fn triggers_participate_in_runtime_ranking() {
-        let mut slide = skill("slides", "Create presentation artifacts");
-        slide.triggers = vec!["ppt".to_string(), "幻灯片".to_string()];
+    fn descriptive_skill_content_participates_in_runtime_ranking() {
+        let slide = skill(
+            "slides",
+            "Create presentation artifacts, slide decks, PPT exports, and narrated reports",
+        );
         let skills = vec![
             skill("code-review", "Review code quality and bugs"),
             slide,
@@ -410,22 +380,4 @@ mod tests {
         assert!(ascii_word_contains("跑 test 看一下", "test"));
     }
 
-    #[test]
-    fn excludes_word_boundary_for_ascii_pattern() {
-        let mut s = skill("foo", "");
-        s.excludes = vec!["test".to_string()];
-        assert!(is_excluded_by_skill(&s, "run the test"));
-        assert!(!is_excluded_by_skill(&s, "protest the decision"));
-        assert!(!is_excluded_by_skill(&s, "latest update"));
-        assert!(!is_excluded_by_skill(&s, "contest"));
-    }
-
-    #[test]
-    fn excludes_substring_for_cjk_pattern() {
-        let mut s = skill("foo", "");
-        s.excludes = vec!["测试".to_string()];
-        // CJK 没有词边界概念，回退为 substring 匹配
-        assert!(is_excluded_by_skill(&s, "运行测试"));
-        assert!(is_excluded_by_skill(&s, "测试一下"));
-    }
 }

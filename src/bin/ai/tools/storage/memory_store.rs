@@ -609,7 +609,13 @@ impl MemoryStore {
 fn should_dedup_learning_entry(entry: &AgentMemoryEntry) -> bool {
     matches!(
         entry.category.as_str(),
-        "self_note" | "project_memory" | "coding_guideline" | "code_discovery"
+        "self_note"
+            | "project_memory"
+            | "coding_guideline"
+            | "code_discovery"
+            | "common_sense"
+            | "best_practice"
+            | "safety_rules"
     )
 }
 

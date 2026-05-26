@@ -574,7 +574,7 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
         })
         .expect("should include an explicit archive note");
     assert!(
-        archive_text.contains("read_file_lines"),
+        archive_text.contains("read_file"),
         "archive note should give an explicit file-read action, got: {archive_text:?}"
     );
 

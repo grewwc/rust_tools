@@ -149,10 +149,10 @@ fn build_overflow_placeholder(file_path: &str) -> String {
     out.push_str("原始归档文件: ");
     out.push_str(file_path);
     out.push('\n');
-    out.push_str("先执行工具: read_file_lines\n参数: file_path=\"");
+    out.push_str("优先执行工具: read_file\n参数: file_path=\"");
     out.push_str(file_path);
     out.push_str("\", offset=1, limit=200)\n");
-    out.push_str("若当前问题依赖前文细节、最初目标、之前决定、旧报错或更早工具输出，请先读该文件；未读完时继续增大 offset 分段读取。\n");
+    out.push_str("若当前问题依赖前文细节、最初目标、之前决定、旧报错或更早工具输出，请先分段读取该归档；只有在已经定位到相关位置后，再改用更精确的行范围读取。\n");
     out
 }
 

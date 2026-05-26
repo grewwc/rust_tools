@@ -23,6 +23,8 @@ pub enum DecisionType {
     ModelRouting,
     /// Memory 检索
     MemoryRetrieval,
+    /// Memory 保存门禁
+    MemorySave,
     /// 反思触发
     ReflectionTrigger,
     /// 用户意图识别
@@ -408,6 +410,51 @@ pub fn log_memory_retrieval(
     });
 }
 
+pub fn log_memory_save_assessment(
+    store: &DecisionLogStore,
+    session_id: &str,
+    turn_id: usize,
+    requested_category: &str,
+    final_category: &str,
+    note: &str,
+    assessment: &crate::ai::driver::reflection::LearningNoteAssessment,
+    downgraded: bool,
+) {
+    let note_chars = note.chars().count();
+    let preview: String = note.chars().take(160).collect();
+    let context = serde_json::json!({
+        "requested_category": requested_category,
+        "final_category": final_category,
+        "downgraded": downgraded,
+        "note_chars": note_chars,
+        "note_preview": preview,
+    })
+    .to_string();
+    let reasoning = serde_json::to_string(assessment).unwrap_or_else(|_| "{}".to_string());
+    let outcome_message = if downgraded {
+        "memory_save downgraded to short-term self_note"
+    } else {
+        "memory_save accepted for requested category"
+    };
+    store.log(DecisionLog {
+        timestamp: 0,
+        session_id: session_id.to_string(),
+        turn_id,
+        decision_type: DecisionType::MemorySave,
+        context,
+        alternatives_considered: vec![requested_category.to_string(), "self_note".to_string()],
+        chosen_option: final_category.to_string(),
+        reasoning,
+        confidence: Some(assessment.confidence()),
+        outcome: Some(Outcome {
+            success: !downgraded,
+            message: outcome_message.to_string(),
+            user_feedback: None,
+        }),
+        execution_time_ms: None,
+    });
+}
+
 /// 辅助函数：创建意图识别日志
 pub fn log_intent_recognition(
     store: &DecisionLogStore,
@@ -653,6 +700,45 @@ mod tests {
         assert!(replay.iter().all(|item| item.session_id == "sess-a"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_log_memory_save_assessment_records_structured_reasoning() {
+        let store = DecisionLogStore::new(100);
+        let assessment = crate::ai::driver::reflection::LearningNoteAssessment {
+            actionable: false,
+            specific: false,
+            generalizable: false,
+            score: 0,
+            high_quality: false,
+            char_count: 10,
+            word_count: 2,
+            nonempty_lines: 1,
+            unique_token_ratio: 1.0,
+            directive_signals: 0,
+            code_signals: 0,
+            artifact_signals: 0,
+            abstraction_signals: 0,
+            condition_signals: 0,
+            one_off_signals: 0,
+        };
+
+        log_memory_save_assessment(
+            &store,
+            "sess-test",
+            7,
+            "common_sense",
+            "self_note",
+            "be careful",
+            &assessment,
+            true,
+        );
+
+        let recent = store.recent(1);
+        assert_eq!(recent[0].decision_type, DecisionType::MemorySave);
+        assert_eq!(recent[0].chosen_option, "self_note");
+        assert!(recent[0].reasoning.contains("\"score\":0"));
+        assert!(recent[0].context.contains("requested_category"));
     }
 }
 

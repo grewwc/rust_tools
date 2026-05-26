@@ -599,24 +599,44 @@ fn local_thinking_decision(
     }
 
     let question_len = question.chars().count();
-    let line_count = question.lines().count();
+    let nonempty_lines: Vec<&str> = question
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let line_count = nonempty_lines.len();
     let has_code_like_content = question.contains("```")
         || question.contains("::")
-        || question.contains("fn ")
-        || question.contains("panic")
-        || question.contains("traceback")
-        || question.contains("Exception")
-        || question.contains("Error")
-        || question.contains("error");
+        || question.split_whitespace().any(|token| {
+            token.contains('/')
+                || token.contains('\\')
+                || token.ends_with(".rs")
+                || token.ends_with(".ts")
+                || token.ends_with(".tsx")
+                || token.ends_with(".js")
+                || token.ends_with(".jsx")
+                || token.ends_with(".py")
+                || token.ends_with(".go")
+                || token.ends_with(".java")
+        });
+    // 结构化诊断痕迹：后续行出现 `label: details` / 堆栈路径样式，
+    // 不依赖具体错误关键词。
+    let has_diagnostic_shape = line_count >= 2
+        && nonempty_lines.iter().skip(1).any(|line| {
+            line.contains(": ")
+                || line.contains(" at ")
+                || line.contains("->")
+                || line.contains("::")
+                || line.contains('/')
+                || line.contains('\\')
+        });
     let has_multistep_shape = line_count >= 3
         || question.contains("\n- ")
-        || question.contains("\n1.")
-        || question.contains("步骤")
-        || question.contains("step by step");
+        || question.contains("\n1.");
     let looks_like_complex_solution_request = matches!(
         intent.core,
         intent_recognition::CoreIntent::SeekSolution
-    ) && (question_len >= 48 || has_code_like_content || has_multistep_shape);
+    ) && (question_len >= 48 || has_code_like_content || has_multistep_shape || has_diagnostic_shape);
     let looks_like_complex_action_request = matches!(
         intent.core,
         intent_recognition::CoreIntent::RequestAction
@@ -627,7 +647,6 @@ fn local_thinking_decision(
         intent_recognition::CoreIntent::Casual | intent_recognition::CoreIntent::QueryConcept
     ) && question_len <= 120
         && !has_code_like_content
-        && !intent.is_search_query()
     {
         return Some(false);
     }
@@ -1013,19 +1032,15 @@ async fn select_skill_candidate_via_model(
         return None;
     }
 
-    let mut system_prompt = r#"You are a skill router for a CODE development assistant. Your ONLY job is to route SOURCE CODE programming questions to appropriate skills.
-ALL skills are for PROGRAMMING/CODING tasks only (writing, reviewing, debugging, refactoring code).
+    let mut system_prompt = r#"You are a skill router for a code-focused assistant.
+Your job is to decide whether the current request clearly needs one of the available skills.
 Output schema: {"skill":"<exact skill name or empty>","confidence":0.0}
-Critical Rules:
-- MANDATORY CHECK 1: Is the user asking to WRITE/REVIEW/DEBUG/REFACTOR specific SOURCE CODE (files or snippets)? If NO → return empty skill.
-- MANDATORY CHECK 2: Is this a GENERAL KNOWLEDGE question about programming concepts/APIs/libraries (e.g., 'What is X?', 'How to use X?', 'X 是什么')? If YES → return empty skill. These are documentation/knowledge questions, NOT code tasks.
-- NON-CODE TOPICS (ALWAYS return empty): documents/docs (文档，云文档，飞书文档), notes, wikis, data analysis, business questions, news, sports, weather, stocks, music, movies, general knowledge, project management, architecture design (without code), programming concept questions (API 说明，库的用法，框架特性).
-- KEY INDICATOR: Does the question include ACTUAL CODE SNIPPET or SPECIFIC FILE PATH and ask to operate on it (review, fix, refactor, write)? If NO → likely not a code task.
-- QUESTION TYPE MATTERS: 'X 是什么' / 'What is X' / '怎么用 X' / 'How to use X' = knowledge question (NO skill). '帮我 review 这段代码' / 'Fix this bug' / 'Refactor this function' = code task (YES skill).
-- Chinese word traps: '看一下'、'检查'、'分析'、'审查'、'文档'、'架构' do NOT mean code tasks unless explicitly about operating on SOURCE CODE files/snippets.
-- If unsure, return empty skill with confidence < 0.5. Better to skip than misroute.
-- Use EXACT skill name from the list below.
-- Return ONLY valid JSON, no explanations.
+Rules:
+- Route only when the request is explicitly about operating on source code, code artifacts, or a coding workflow that matches a listed skill.
+- Abstain for general knowledge, documentation lookup, high-level discussion, non-code work, or ambiguous requests.
+- Prefer abstaining over misrouting when the evidence is weak.
+- Use only the exact skill names listed below.
+- Return only valid JSON.
 Skills:
 "#.to_string();
 

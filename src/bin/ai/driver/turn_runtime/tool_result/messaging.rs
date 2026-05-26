@@ -409,13 +409,13 @@ fn build_code_inspection_working_memory(turn_messages: &[Message]) -> Option<Str
     note.push_str(
         "Treat these findings as already-known context. Avoid re-running the same reads unless you need verification.\n",
     );
-    if raw_repo_tool_count >= 2 && code_search_count == 0 {
+    if raw_repo_tool_count >= 1 && code_search_count == 0 {
         note.push_str(
-            "Code-navigation correction: you have used raw inspection tools without `code_search`. Use `code_search` first to locate the relevant file/symbol/definition before reading specific lines.\n",
+            "Code-navigation correction: you have started raw inspection without `code_search`. Before another raw read, use `code_search` first to locate the relevant file/symbol/definition, then read only the specific region you need.\n",
         );
-    } else if raw_repo_tool_count >= 3 && code_search_count <= 1 {
+    } else if raw_repo_tool_count >= 2 && code_search_count <= 1 {
         note.push_str(
-            "Code-navigation correction: too many raw reads/searches. Use `code_search` for the next step instead of another `read_file_lines` or `grep_search`.\n",
+            "Code-navigation correction: too many raw reads/searches. Prefer one `code_search` hop plus one targeted local read instead of another `read_file_lines` or `grep_search`.\n",
         );
     }
     Some(truncate_note(&note, 1800))
@@ -773,7 +773,7 @@ mod tests {
         assert!(note.contains("read_file_lines(file=src/lib.rs, lines=10..29)"));
         assert!(note.contains("grep_search(query=panic!)"));
         assert!(note.contains("Code-navigation correction"));
-        assert!(note.contains("Use `code_search`"));
+        assert!(note.contains("use `code_search` first") || note.contains("Before another raw read, use `code_search` first"));
     }
 
     #[test]

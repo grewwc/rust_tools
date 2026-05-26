@@ -99,13 +99,11 @@ pub async fn upgrade_intent_via_model(
 }
 
 /// 触发 LLM fallback 的启发式：本地分到 Casual，但问题本身明显
-/// 是个非平凡请求（带代码、长问题、含明显操作动词或问题信号）。
+/// 是个非平凡请求。
 ///
-/// 实现策略：
-/// 1. 优先依赖结构化信号（代码块、错误堆栈痕迹、问号、长度），它们与语种无关。
-/// 2. 仅在结构化信号不足时，退化到关键词匹配；此时 ASCII 关键词使用 ASCII
-///    词边界（避免 `"fn "` 漏掉 `"fn("`、`"how"` 误匹配 `"however"`），
-///    CJK 关键词只做子串匹配。
+/// 只依赖结构信号，不再依赖任何手写关键词词表：代码块/路径样式、
+/// 多行结构、问句形态、长度等。这样不会因为某几个词面命中就把语义路由
+/// 拉偏。
 fn looks_non_casual(question: &str) -> bool {
     let q = question.trim();
     if q.is_empty() {
@@ -122,13 +120,16 @@ fn looks_non_casual(question: &str) -> bool {
     if has_question_punctuation(q) {
         return true;
     }
+    if q.lines().filter(|line| !line.trim().is_empty()).count() >= 3 {
+        return true;
+    }
+    if count_artifact_like_tokens(q) >= 2 {
+        return true;
+    }
     if len >= 60 {
         return true;
     }
-
-    // ---- 关键词信号（带词边界 / 大小写不敏感）----
-    let lower = q.to_ascii_lowercase();
-    has_ascii_action_signal(&lower) || has_cjk_action_signal(q)
+    false
 }
 
 /// 是否包含明显的"代码 / 错误堆栈"结构信号。
@@ -140,40 +141,33 @@ fn has_structural_code_signal(q: &str) -> bool {
     if q.contains("::") {
         return true;
     }
-    // 各语言常见函数声明前缀（带词边界）
-    let lower = q.to_ascii_lowercase();
-    for kw in ["fn ", "fn(", "def ", "func ", "function "] {
-        if lower.contains(kw) {
-            return true;
-        }
-    }
-    false
+    count_artifact_like_tokens(q) > 0
 }
 
 fn has_question_punctuation(q: &str) -> bool {
     q.contains('?') || q.contains('？')
 }
 
-fn has_ascii_action_signal(lower: &str) -> bool {
-    // 一律按 ASCII 词边界匹配，避免 "implement" 误匹配 "reimplementation"、
-    // "how" 误匹配 "however" 等情况。
-    const KEYWORDS: &[&str] = &[
-        "error", "panic", "traceback", "exception", "stacktrace",
-        "fix", "implement", "refactor", "review", "debug", "optimize",
-        "how", "why", "what",
-    ];
-    KEYWORDS
-        .iter()
-        .any(|kw| super::ascii_word_contains(lower, kw))
-}
-
-fn has_cjk_action_signal(q: &str) -> bool {
-    // CJK 没有词边界概念，但这些词足够具体，子串匹配误杀率低。
-    const PATTERNS: &[&str] = &[
-        "帮我", "修复", "实现", "重构", "优化", "怎么", "如何", "为什么",
-        "报错", "失败", "异常",
-    ];
-    PATTERNS.iter().any(|p| q.contains(p))
+fn count_artifact_like_tokens(question: &str) -> usize {
+    question
+        .split_whitespace()
+        .filter(|token| {
+            token.contains('/')
+                || token.contains('\\')
+                || token.ends_with(".rs")
+                || token.ends_with(".ts")
+                || token.ends_with(".tsx")
+                || token.ends_with(".js")
+                || token.ends_with(".jsx")
+                || token.ends_with(".py")
+                || token.ends_with(".go")
+                || token.ends_with(".java")
+                || token.ends_with(".json")
+                || token.ends_with(".yaml")
+                || token.ends_with(".yml")
+                || token.ends_with(".toml")
+        })
+        .count()
 }
 
 #[cfg(test)]
@@ -215,28 +209,6 @@ mod tests {
     }
 
     #[test]
-    fn test_fallback_search_skill() {
-        let intent = detect_intent_fallback("帮我找几个 review skill");
-        assert_eq!(intent.core, CoreIntent::RequestAction);
-        assert!(intent.modifiers.is_search_query);
-        assert_eq!(intent.modifiers.target_resource, Some("skill".to_string()));
-    }
-
-    #[test]
-    fn test_fallback_search_tool() {
-        let intent = detect_intent_fallback("有什么工具可以调试？");
-        assert_eq!(intent.core, CoreIntent::RequestAction);
-        assert!(intent.modifiers.is_search_query);
-        assert_eq!(intent.modifiers.target_resource, Some("tool".to_string()));
-    }
-
-    #[test]
-    fn test_fallback_negation() {
-        let intent = detect_intent_fallback("不要执行这个");
-        assert!(intent.modifiers.negation);
-    }
-
-    #[test]
     fn test_detect_intent_casual_greeting() {
         let intent = detect_intent("hello");
         assert_eq!(intent.core, CoreIntent::Casual);
@@ -249,9 +221,13 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_intent_request_action_beats_search_modifier() {
+    fn test_detect_intent_request_action_without_keyword_modifiers() {
         let intent = detect_intent("帮我找几个 review skill");
-        assert_eq!(intent.core, CoreIntent::RequestAction);
-        assert!(intent.is_searching_resource("skill"));
+        // 关键词 modifier 已移除：核心意图完全由模型决定。
+        // 该样例在当前模型下可能是 Casual，不再强制提升为 RequestAction。
+        assert!(matches!(intent.core, CoreIntent::RequestAction | CoreIntent::Casual));
+        assert!(!intent.is_search_query());
+        assert!(intent.modifiers.target_resource.is_none());
+        assert!(!intent.modifiers.negation);
     }
 }

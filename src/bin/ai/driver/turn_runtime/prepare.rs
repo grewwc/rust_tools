@@ -473,7 +473,7 @@ fn looks_like_code_or_repo_question(question: &str) -> bool {
     })
 }
 
-/// C3: 复杂任务检测——基于关键词的轻量启发式。
+/// C3: 复杂任务检测——仅基于结构信号的轻量启发式。
 /// 命中后只会注入一段 Policy 提示鼓励 agent 自行拆解，不强制激活 Thinking 引擎。
 fn detect_complex_task(question: &str) -> bool {
     let q = question.trim();
@@ -484,39 +484,32 @@ fn detect_complex_task(question: &str) -> bool {
     if q.chars().count() < 12 {
         return false;
     }
-    let lower = q.to_lowercase();
-    const ASCII_KEYWORDS: &[&str] = &[
-        "refactor",
-        "redesign",
-        "architecture",
-        "architect",
-        "multi-step",
-        "multi step",
-        "cross-module",
-        "cross module",
-        "migrate",
-        "migration",
-        "rewrite",
-    ];
-    if ASCII_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+    let nonempty_lines = q.lines().filter(|line| !line.trim().is_empty()).count();
+    if nonempty_lines >= 3 {
         return true;
     }
-    const CJK_KEYWORDS: &[&str] = &[
-        "重构",
-        "架构",
-        "设计方案",
-        "整体设计",
-        "系统设计",
-        "拆分",
-        "拆解",
-        "梳理",
-        "全部修复",
-        "全量",
-        "多步",
-        "迁移",
-        "重写",
-    ];
-    CJK_KEYWORDS.iter().any(|kw| q.contains(kw))
+    if q.contains("\n- ") || q.contains("\n1.") {
+        return true;
+    }
+    if q.chars().count() >= 180 {
+        return true;
+    }
+    let artifact_tokens = q
+        .split_whitespace()
+        .filter(|token| {
+            token.contains('/')
+                || token.contains('\\')
+                || token.ends_with(".rs")
+                || token.ends_with(".ts")
+                || token.ends_with(".tsx")
+                || token.ends_with(".js")
+                || token.ends_with(".jsx")
+                || token.ends_with(".py")
+                || token.ends_with(".go")
+                || token.ends_with(".java")
+        })
+        .count();
+    artifact_tokens >= 2
 }
 
 fn build_session_code_discovery_recall(app: &App, history: &[Message]) -> Option<String> {

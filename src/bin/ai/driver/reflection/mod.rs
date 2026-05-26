@@ -6,8 +6,10 @@ mod writeback;
 use std::path::PathBuf;
 
 use crate::ai::{history::Message, types::App};
+use serde::{Deserialize, Serialize};
 
 pub(crate) use recall::{AutoRecalledKnowledge, RecallBundle};
+pub(crate) use background::assess_learning_note_quality;
 
 pub(super) async fn maybe_append_self_reflection(
     app: &mut App,
@@ -131,10 +133,36 @@ impl ReflectionQuality {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LearningNoteAssessment {
+    pub actionable: bool,
+    pub specific: bool,
+    pub generalizable: bool,
+    pub score: u8,
+    pub high_quality: bool,
+    pub char_count: usize,
+    pub word_count: usize,
+    pub nonempty_lines: usize,
+    pub unique_token_ratio: f32,
+    pub directive_signals: usize,
+    pub code_signals: usize,
+    pub artifact_signals: usize,
+    pub abstraction_signals: usize,
+    pub condition_signals: usize,
+    pub one_off_signals: usize,
+}
+
+impl LearningNoteAssessment {
+    pub fn confidence(&self) -> f64 {
+        (self.score as f64 / 3.0).clamp(0.0, 1.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        build_auto_recalled_knowledge_with_project, build_persistent_guidelines,
+        assess_learning_note_quality, build_auto_recalled_knowledge_with_project,
+        build_persistent_guidelines,
         gates::turn_uses_repo_inspection_tools, writeback::ProjectWritebackUpsert,
         writeback::upsert_project_writeback_entry,
     };
@@ -576,5 +604,21 @@ mod tests {
         unsafe {
             std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
         }
+    }
+
+    #[test]
+    fn shared_quality_pipeline_rejects_short_generic_note() {
+        let assessment = assess_learning_note_quality("be careful");
+        assert_eq!(assessment.score, 0);
+        assert!(!assessment.high_quality);
+    }
+
+    #[test]
+    fn shared_quality_pipeline_accepts_actionable_general_rule() {
+        let assessment = assess_learning_note_quality(
+            "Files should end with a trailing newline before write_file commits the edit",
+        );
+        assert!(assessment.high_quality);
+        assert!(assessment.directive_signals > 0);
     }
 }

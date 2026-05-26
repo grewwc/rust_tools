@@ -449,39 +449,39 @@ fn mcp_tools_for_turn(
 }
 
 struct CapabilityEntry {
-    trigger: &'static str,
+    use_case: &'static str,
     tools: &'static [&'static str],
     hint: &'static str,
 }
 
 const CAPABILITY_CATALOG: &[CapabilityEntry] = &[
     CapabilityEntry {
-        trigger: "remember, memorize, save, store, 记住, 记忆, 保存",
-        tools: &["memory_save"],
-        hint: "Do NOT just acknowledge — actually call memory_save so the information persists.",
+        use_case: "Persist user-facing facts, preferences, or decisions for later recall.",
+        tools: &["knowledge_save"],
+        hint: "Do NOT just acknowledge — actually call knowledge_save so the information persists in the user-facing knowledge base.",
     },
     CapabilityEntry {
-        trigger: "recall, search memory, 回忆, 查找记忆",
-        tools: &["memory_search", "memory_recent"],
-        hint: "",
-    },
-    CapabilityEntry {
-        trigger: "knowledge, decisions, preferences, 知识库, 决策, 偏好",
+        use_case: "Recall previously saved user-facing information.",
         tools: &["knowledge_search", "knowledge_list"],
         hint: "",
     },
     CapabilityEntry {
-        trigger: "semantic search, vector search, 语义搜索",
+        use_case: "Inspect saved knowledge such as prior decisions, preferences, or known context.",
+        tools: &["knowledge_search", "knowledge_list"],
+        hint: "",
+    },
+    CapabilityEntry {
+        use_case: "Search remembered knowledge by semantic similarity rather than exact wording.",
         tools: &["knowledge_semantic_search"],
         hint: "",
     },
     CapabilityEntry {
-        trigger: "web, real-time, URL, 实时, 网页, 链接",
+        use_case: "Handle live web information, current events, or URL-based research.",
         tools: &["web_search", "web_fetch"],
         hint: "",
     },
     CapabilityEntry {
-        trigger: "Feishu, Lark, 飞书, 文档, docx, wiki, sheet, 多维表格",
+        use_case: "Work with Feishu/Lark documents, wikis, sheets, or doc exports.",
         tools: &[
             "mcp_feishu_docs_search",
             "mcp_feishu_docs_get_text_by_url",
@@ -490,27 +490,27 @@ const CAPABILITY_CATALOG: &[CapabilityEntry] = &[
         hint: "For Feishu/Lark docs or sheets, enable the relevant MCP tools before proceeding.",
     },
     CapabilityEntry {
-        trigger: "git status, git diff",
+        use_case: "Inspect repository status or diffs.",
         tools: &["git_status", "git_diff"],
         hint: "",
     },
     CapabilityEntry {
-        trigger: "cargo check, cargo test, 编译, 测试",
+        use_case: "Build, compile, or run Rust test workflows.",
         tools: &["cargo_check", "cargo_test"],
         hint: "",
     },
     CapabilityEntry {
-        trigger: "undo, redo, 撤销, 重做",
+        use_case: "Undo or redo prior editor changes.",
         tools: &["undo", "redo"],
         hint: "",
     },
     CapabilityEntry {
-        trigger: "compact context, 压缩上下文",
+        use_case: "Compact or trim conversation context to recover token budget.",
         tools: &["compact_context"],
         hint: "",
     },
     CapabilityEntry {
-        trigger: "list directory, 列出目录",
+        use_case: "Inspect directory contents or enumerate files in a folder.",
         tools: &["list_directory"],
         hint: "",
     },
@@ -534,7 +534,7 @@ fn build_capability_catalog(available_tools: &Box<SkipSet<String>>) -> Option<St
         if missing.is_empty() {
             continue;
         }
-        let mut line = format!("- \"{}\" → enable {:?}", entry.trigger, missing);
+        let mut line = format!("- Need: {} → enable {:?}", entry.use_case, missing);
         if !entry.hint.is_empty() {
             line.push_str(" — ");
             line.push_str(entry.hint);
@@ -546,7 +546,7 @@ fn build_capability_catalog(available_tools: &Box<SkipSet<String>>) -> Option<St
     } else {
         let mut out = String::from(
             "Capability catalog (not yet loaded — enable as needed):\n\
-             When the user's request matches a trigger below, call `enable_tools(operation=enable, tools=[...])` \
+             When the task clearly requires one of the capabilities below, call `enable_tools(operation=enable, tools=[...])` \
              with the listed tools before proceeding.\n",
         );
         for line in lines {
@@ -674,8 +674,8 @@ fn build_system_prompt(
         b.push(ContextKind::Policy, discovery_policy);
     }
 
-    if has_tool(available_tools, "memory_save") {
-        b.push(ContextKind::Policy, "Memory:\n- When the user asks to remember/save something, call `memory_save`. Do NOT skip the save step.\n- When the user asks to recall saved memory, call `memory_search` or `memory_recent`.");
+    if has_tool(available_tools, "knowledge_save") {
+        b.push(ContextKind::Policy, "Knowledge save:\n- When the user explicitly asks to remember/save/store something for later use, call `knowledge_save`. Do NOT skip the save step.\n- When the user asks what has been remembered or asks to recall saved information, use `knowledge_search` or `knowledge_list`.");
     }
 
     if has_tool(available_tools, "plan") || has_tool(available_tools, "spawn_process") {
@@ -767,9 +767,7 @@ fn cross_turn_preferred_skill_name(
     question: &str,
     intent: &UserIntent,
 ) -> Option<String> {
-    if intent.is_searching_resource("skill") {
-        return None;
-    }
+    let _ = intent;
     let memory = app.last_skill_bias.as_ref()?;
     if looks_like_follow_up_or_same_topic(question, &memory.question) {
         Some(memory.skill_name.clone())
@@ -810,7 +808,7 @@ fn select_skill_with_preference_strength<'a>(
     strength: PreferenceStrength,
     model_path: &std::path::Path,
 ) -> Option<&'a SkillManifest> {
-    if question.trim().is_empty() || skill_manifests.is_empty() || intent.is_searching_resource("skill") {
+    if question.trim().is_empty() || skill_manifests.is_empty() {
         return None;
     }
 
@@ -1159,6 +1157,30 @@ mod tests {
         assert!(prompt.contains("prefer calling `discover_skills` before giving a freeform response"));
     }
 
+    #[test]
+    fn system_prompt_uses_knowledge_save_for_user_memory_requests() {
+        let mut available = SkipSet::new(16);
+        available.insert("knowledge_save".to_string());
+        available.insert("knowledge_search".to_string());
+        available.insert("knowledge_list".to_string());
+
+        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        assert!(prompt.contains("Knowledge save:"));
+        assert!(prompt.contains("call `knowledge_save`"));
+        assert!(prompt.contains("`knowledge_search` or `knowledge_list`"));
+        assert!(!prompt.contains("call `memory_save`"));
+    }
+
+    #[test]
+    fn capability_catalog_routes_remember_requests_to_knowledge_save() {
+        let mut available = SkipSet::new(16);
+        available.insert("enable_tools".to_string());
+
+        let catalog = super::build_capability_catalog(&Box::new(available)).expect("catalog");
+        assert!(catalog.contains("knowledge_save"));
+        assert!(!catalog.contains("memory_save"));
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         let nanos = SystemTime::now()
@@ -1417,14 +1439,7 @@ mod tests {
     #[test]
     fn local_selector_switches_when_new_skill_is_significantly_better() {
         let intent = UserIntent::new(CoreIntent::RequestAction);
-        let mut debugger = skill("debugger", "Debug panic crash stack trace runtime failure logs");
-        debugger.triggers = vec![
-            "panic".to_string(),
-            "crash".to_string(),
-            "stack trace".to_string(),
-            "调试".to_string(),
-            "debug".to_string(),
-        ];
+        let debugger = skill("debugger", "Debug panic crash stack trace runtime failure logs");
         let skills = vec![
             skill("code-review", "Review code changes and summarize defects"),
             debugger,
