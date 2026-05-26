@@ -1,9 +1,10 @@
 use std::io;
+use std::time::Duration;
 
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size},
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size as terminal_size},
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use tui_textarea::TextArea;
@@ -15,6 +16,36 @@ use super::{
     render::render_multiline_popup,
 };
 use crate::ai::prompt::{PromptEditor, interrupted_error};
+
+/// ?? `Event::Resize`????????? Resize ????????
+/// ?????? inline viewport???????"??????"??
+/// ???? draw ??????????? full redraw?
+///
+/// ?????? VS Code ???? / ????? ratatui inline viewport
+/// ?????? `Borders::TOP/BOTTOM` ???? scrollback?????
+/// ??????????
+fn handle_resize_burst<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+) -> io::Result<()> {
+    // 1) drain????????? Resize ???????
+    while event::poll(Duration::ZERO).unwrap_or(false) {
+        match event::read() {
+            Ok(Event::Resize(_, _)) => continue,
+            // ???? case?resize ?????????? Resize ???
+            // ?? UI ???????
+            Ok(_) | Err(_) => break,
+        }
+    }
+
+    // 2) ?????????????????????????
+    //    ratatui ? terminal.clear() ? Inline ???????? buffer?
+    //    ???? crossterm `FromCursorDown`????????
+    //    "???????"?????????? draw ????????
+    //    ?????????
+    let _ = terminal.clear();
+    let _ = execute!(io::stdout(), Clear(ClearType::FromCursorDown));
+    Ok(())
+}
 
 impl PromptEditor {
     pub(in crate::ai::prompt) fn read_multi_line_tui(&mut self) -> io::Result<Option<String>> {
@@ -61,7 +92,7 @@ impl PromptEditor {
 
                 let event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
                 if let Event::Resize(_, _) = &event {
-                    let _ = terminal.clear();
+                    handle_resize_burst(&mut terminal)?;
                 }
 
                 match handle_multiline_event(
@@ -80,7 +111,10 @@ impl PromptEditor {
             }
         })();
 
+        // ?? TUI?? ratatui ? inline viewport ?????????
+        // `FromCursorDown` ????????????????? scrollback?
         let _ = terminal.clear();
+        let _ = execute!(io::stdout(), Clear(ClearType::FromCursorDown));
         let _ = terminal.show_cursor();
         let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = disable_raw_mode();
@@ -96,10 +130,10 @@ impl PromptEditor {
             self.save_history_entry(content);
             let mut lines = content.lines();
             if let Some(first) = lines.next() {
-                println!("[2m> {first}[0m");
+                println!("\x1b[2m> {first}\x1b[0m");
             }
             for line in lines {
-                println!("[2m  {line}[0m");
+                println!("\x1b[2m  {line}\x1b[0m");
             }
         }
         Ok(result)
