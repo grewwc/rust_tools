@@ -450,6 +450,16 @@ pub(super) fn render_table_row(
 }
 
 fn terminal_width() -> usize {
+    // 与 markdown.rs::preview_terminal_width 保持一致：保留 4 列右安全边距，
+    // 避免表格 │ 边框紧贴终端右缘触发自动换行，破坏 box-drawing。
+    const RIGHT_MARGIN: usize = 4;
+    const MIN_WIDTH: usize = 20;
+
+    let raw = raw_cols();
+    raw.saturating_sub(RIGHT_MARGIN).max(MIN_WIDTH)
+}
+
+fn raw_cols() -> usize {
     if let Some(cols) = std::env::var("COLUMNS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())

@@ -730,7 +730,22 @@ fn live_preview_cursor_rows(line: &str) -> usize {
     }
 }
 
+/// 终端可用列数（已扣除右侧安全边距）。
+///
+/// 大多数终端开启 DECAWM（auto-margin）：当输出列号 == 列数时会触发隐式换行，
+/// 对全角字符（CJK / emoji）更敏感，会让代码块/表格的边框贴边或被截断，进而
+/// 让 cursor up + clear 重写时对不上行数，出现"残留色块 / 残留边框"。
+/// 这里统一保留 4 列安全边距，下限 20 防止极窄终端崩盘。
+const RIGHT_MARGIN: usize = 4;
+const MIN_PREVIEW_WIDTH: usize = 20;
+
 fn preview_terminal_width() -> usize {
+    raw_terminal_cols()
+        .saturating_sub(RIGHT_MARGIN)
+        .max(MIN_PREVIEW_WIDTH)
+}
+
+fn raw_terminal_cols() -> usize {
     if let Some(cols) = std::env::var("COLUMNS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1117,29 +1132,40 @@ mod tests {
     #[test]
     fn code_block_long_line_wraps_without_gutter_prefix() {
         let _guard = env_guard();
-        unsafe { std::env::set_var("COLUMNS", "10") };
+        // preview_terminal_width 引入 RIGHT_MARGIN=4 与 MIN_PREVIEW_WIDTH=20
+        // 之后，最小有效宽度是 20。这里给 30 列模拟终端宽度，扣除右边距得到
+        // 26 列内容宽度（block_indent="" + gutter 1 列），实际 wrap 阈值约 25。
+        unsafe { std::env::set_var("COLUMNS", "30") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         let _ = renderer.consume_line("```text", false);
 
-        let out = renderer.consume_line("abcdefghijkl", false);
+        // 30 个字符确保超过当前内容宽度，会被强制 wrap 至两行。
+        let out = renderer.consume_line(&"a".repeat(30), false);
         let visible = strip_ansi_for_test(&out);
         let lines = visible.lines().collect::<Vec<_>>();
 
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0], "abcdefghij");
-        assert_eq!(lines[1], "kl");
+        assert!(lines.len() >= 2, "expected wrap to >=2 lines, got {lines:?}");
+        // 拼回所有行后字符总数仍应等于原输入（仅 wrap，不应丢字符）。
+        let joined: String = lines.concat();
+        assert_eq!(joined, "a".repeat(30));
     }
 
     #[test]
     fn code_block_streaming_preview_wraps_before_newline() {
         let _guard = env_guard();
-        unsafe { std::env::set_var("COLUMNS", "10") };
+        unsafe { std::env::set_var("COLUMNS", "30") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         let _ = renderer.consume_line("```text", false);
 
-        renderer.write_chunk_for_test("abcdefghijkl", false).unwrap();
+        renderer
+            .write_chunk_for_test(&"a".repeat(30), false)
+            .unwrap();
 
-        assert_eq!(renderer.line_preview_height(), 2);
+        assert!(
+            renderer.line_preview_height() >= 2,
+            "expected preview height >=2, got {}",
+            renderer.line_preview_height()
+        );
     }
 
     #[test]

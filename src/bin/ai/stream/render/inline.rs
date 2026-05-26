@@ -7,9 +7,8 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
     let mut bold = false;
     let mut italic = false;
     let mut code = false;
+    // math 状态在新实现里只在配对成功的局部分支内短暂为 true，循环外恒为 false。
     let mut math = false;
-    let mut math_delim = "$";
-    let mut math_buf = String::new();
 
     fn apply_style(out: &mut String, base: &str, bold: bool, italic: bool, code: bool, math: bool) {
         out.push_str("\x1b[0m");
@@ -57,23 +56,57 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
     }
 
     while i < bytes.len() {
-        if bytes[i] == b'`' {
-            code = !code;
-            apply_style(&mut out, base, bold, italic, code, math);
+        // 反引号 `code`：必须找到配对的闭合反引号才开启样式，否则按字面字符输出。
+        // 旧实现是无脑切换 `code = !code`，模型若输出"use `cargo run to test"
+        // （单个未闭合反引号），剩余整行都会被着上代码块背景色。
+        if bytes[i] == b'`' && !math {
+            if let Some(close) = find_unescaped_delim(s, i + 1, "`") {
+                let content = &s[i + 1..close - 1];
+                code = true;
+                apply_style(&mut out, base, bold, italic, code, math);
+                out.push_str(content);
+                code = false;
+                apply_style(&mut out, base, bold, italic, code, math);
+                i = close;
+                continue;
+            }
+            out.push('`');
             i += 1;
             continue;
         }
 
+        // **bold**：同样要求配对。模型常输出未闭合的 "**Note:" 或 "5 ** 3"，
+        // 旧实现会让其后整段都加粗。
         if !code && !math && bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
-            bold = !bold;
-            apply_style(&mut out, base, bold, italic, code, math);
+            if let Some(close) = find_unescaped_delim(s, i + 2, "**") {
+                let content = &s[i + 2..close - 2];
+                bold = true;
+                apply_style(&mut out, base, bold, italic, code, math);
+                // bold 内部仍可能含 italic / code，递归处理保证嵌套样式正确。
+                out.push_str(&render_inline_md(content, base));
+                bold = false;
+                apply_style(&mut out, base, bold, italic, code, math);
+                i = close;
+                continue;
+            }
+            out.push_str("**");
             i += 2;
             continue;
         }
 
+        // *italic*：同上。"5 * 3 = 15" 不应被当成 italic 触发。
         if !code && !math && bytes[i] == b'*' {
-            italic = !italic;
-            apply_style(&mut out, base, bold, italic, code, math);
+            if let Some(close) = find_unescaped_delim(s, i + 1, "*") {
+                let content = &s[i + 1..close - 1];
+                italic = true;
+                apply_style(&mut out, base, bold, italic, code, math);
+                out.push_str(&render_inline_md(content, base));
+                italic = false;
+                apply_style(&mut out, base, bold, italic, code, math);
+                i = close;
+                continue;
+            }
+            out.push('*');
             i += 1;
             continue;
         }
@@ -111,27 +144,27 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
             continue;
         }
 
-        if !code && bytes[i] == b'$' {
+        // $math$ / $$display$$：要求配对，避免把单独的"$5"、"$PATH"等 $ 字符
+        // 误识为公式起点，把行尾全部当成 LaTeX 渲染。
+        if !code && bytes[i] == b'$' && !math {
             let is_double = i + 1 < bytes.len() && bytes[i + 1] == b'$';
             let delim = if is_double { "$$" } else { "$" };
-
-            if math {
-                if delim == math_delim {
-                    let rendered = crate::ai::stream::render_math_tex_to_unicode(math_buf.trim());
-                    out.push_str(&rendered);
-                    math_buf.clear();
-                    math = false;
-                    apply_style(&mut out, base, bold, italic, code, math);
-                    i += delim.len();
-                    continue;
-                }
-            } else {
+            if let Some(close) = find_unescaped_delim(s, i + delim.len(), delim) {
+                let content = &s[i + delim.len()..close - delim.len()];
                 math = true;
-                math_delim = delim;
                 apply_style(&mut out, base, bold, italic, code, math);
-                i += delim.len();
+                out.push_str(&crate::ai::stream::render_math_tex_to_unicode(
+                    content.trim(),
+                ));
+                math = false;
+                apply_style(&mut out, base, bold, italic, code, math);
+                i = close;
                 continue;
             }
+            // 未配对：按字面输出
+            out.push('$');
+            i += 1;
+            continue;
         }
 
         if !math && is_url_start(bytes, i) {
@@ -164,16 +197,8 @@ pub(super) fn render_inline_md(s: &str, base: &str) -> String {
         }
 
         let ch = s[i..].chars().next().unwrap();
-        if math && !code {
-            math_buf.push(ch);
-        } else {
-            out.push(ch);
-        }
+        out.push(ch);
         i += ch.len_utf8();
-    }
-
-    if math && !math_buf.is_empty() {
-        out.push_str(&crate::ai::stream::render_math_tex_to_unicode(math_buf.trim()));
     }
 
     out.push_str("\x1b[0m");
@@ -455,5 +480,37 @@ mod tests {
     fn strip_markers_with_strikethrough() {
         let stripped = strip_inline_md_markers("~~text~~");
         assert_eq!(stripped, "text");
+    }
+
+    #[test]
+    fn unclosed_backtick_is_not_styled() {
+        // 未配对反引号：应原样输出为字面字符，绝不开启 code 背景色。
+        let rendered = render_inline_md("use `cargo to test", "");
+        assert!(!rendered.contains(MONOKAI_BG));
+        assert!(!rendered.contains(MONOKAI_FG));
+        assert!(rendered.contains("`cargo to test"));
+    }
+
+    #[test]
+    fn unclosed_asterisk_does_not_italicize_rest_of_line() {
+        // "5 * 3 = 15"：单 * 不应触发 italic，整段不应包含 \x1b[3m。
+        let rendered = render_inline_md("5 * 3 = 15", "");
+        assert!(!rendered.contains("\x1b[3m"));
+        assert!(rendered.contains("5 * 3 = 15"));
+    }
+
+    #[test]
+    fn unclosed_double_asterisk_does_not_bold_rest_of_line() {
+        let rendered = render_inline_md("note: **important things to do later", "");
+        assert!(!rendered.contains("\x1b[1m"));
+        assert!(rendered.contains("**important things"));
+    }
+
+    #[test]
+    fn standalone_dollar_sign_is_literal() {
+        // "$5 USD" 不应被当成 math 起点，整段不应触发 math 颜色 \x1b[95m。
+        let rendered = render_inline_md("price: $5 USD", "");
+        assert!(!rendered.contains("\x1b[95m"));
+        assert!(rendered.contains("$5 USD"));
     }
 }
