@@ -39,8 +39,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "context_status",
-        description:
-            "Show current context usage including approximate token count and compression status.",
+        description: "Show current context usage including approximate token count and compression status.",
         parameters: params_context_status,
         execute: execute_context_status,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

@@ -763,10 +763,14 @@ fn fuzzy_match(text: &str, pattern: &str, max_distance: usize) -> bool {
     let p_chars: Vec<char> = pattern.chars().collect();
     let t_len = t_chars.len();
     let p_len = p_chars.len();
-    
-    if p_len == 0 { return true; }
-    if t_len == 0 { return false; }
-    
+
+    if p_len == 0 {
+        return true;
+    }
+    if t_len == 0 {
+        return false;
+    }
+
     // Use sliding window for efficiency when pattern is much shorter than text
     let mut min_dist = usize::MAX;
     for i in 0..=(t_len.saturating_sub(p_len)) {
@@ -774,7 +778,9 @@ fn fuzzy_match(text: &str, pattern: &str, max_distance: usize) -> bool {
         let window = &t_chars[i..end];
         let dist = levenshtein(window, &p_chars);
         min_dist = min_dist.min(dist);
-        if min_dist <= max_distance { return true; }
+        if min_dist <= max_distance {
+            return true;
+        }
     }
     min_dist <= max_distance
 }
@@ -784,14 +790,14 @@ fn levenshtein(a: &[char], b: &[char]) -> usize {
     let (m, n) = (a.len(), b.len());
     let mut prev: Vec<usize> = (0..=n).collect();
     let mut curr = vec![0usize; n + 1];
-    
+
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)          // deletion
-                .min(curr[j - 1] + 1)         // insertion
-                .min(prev[j - 1] + cost);     // substitution
+            curr[j] = (prev[j] + 1) // deletion
+                .min(curr[j - 1] + 1) // insertion
+                .min(prev[j - 1] + cost); // substitution
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -823,7 +829,8 @@ fn list_recent_chats(
     let mut page_token = String::new();
 
     for _ in 0..max_chat_pages {
-        let mut req = client.get(&url)
+        let mut req = client
+            .get(&url)
             .header("Authorization", format!("Bearer {}", access_token))
             .query(&[("page_size", "50")]);
 
@@ -832,27 +839,56 @@ fn list_recent_chats(
         }
 
         let resp = req.send().map_err(|e| {
-            json_rpc_error(-32000, "Failed to fetch chats", Some(json!({ "error": e.to_string() })))
+            json_rpc_error(
+                -32000,
+                "Failed to fetch chats",
+                Some(json!({ "error": e.to_string() })),
+            )
         })?;
 
         let (status, content_type, body_text) = read_response_text(resp, "chats response")?;
-        let body = parse_json_response_body("chats response", status, content_type.as_deref(), &body_text)?;
+        let body = parse_json_response_body(
+            "chats response",
+            status,
+            content_type.as_deref(),
+            &body_text,
+        )?;
 
         if !status.is_success() {
-            return Err(json_rpc_error(-32000, "Chats list API returned error code", Some(body)));
+            return Err(json_rpc_error(
+                -32000,
+                "Chats list API returned error code",
+                Some(body),
+            ));
         }
 
         let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
         if code != 0 {
-            return Err(json_rpc_error(-32000, &format!("Chats API error: code={}", code), Some(body)));
+            return Err(json_rpc_error(
+                -32000,
+                &format!("Chats API error: code={}", code),
+                Some(body),
+            ));
         }
 
         let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
-        let items = data.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let items = data
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
 
         for item in &items {
-            let chat_id = item.get("chat_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let chat_id = item
+                .get("chat_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let name = item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let chat_mode = item.get("chat_mode").and_then(|v| v.as_str()).unwrap_or("");
 
             if !chat_mode_matches(chat_mode, include_p2p, include_group) {
@@ -871,7 +907,11 @@ fn list_recent_chats(
             break;
         }
 
-        page_token = data.get("page_token").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        page_token = data
+            .get("page_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if page_token.is_empty() || items.is_empty() {
             break;
         }
@@ -939,13 +979,17 @@ fn fetch_chat_messages(
                 Some(body),
             ));
         }
-        
+
         let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
-        let items = data.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
-        
+        let items = data
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+
         let is_empty = items.is_empty();
         all_messages.extend(items);
-        
+
         page_token = data
             .get("page_token")
             .and_then(|v| v.as_str())
@@ -955,7 +999,7 @@ fn fetch_chat_messages(
             break;
         }
     }
-    
+
     Ok(all_messages)
 }
 
@@ -1025,15 +1069,41 @@ fn feishu_messages_global_search(args: &Value) -> Result<String, JsonRpcErr> {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if search_key.is_empty() {
-        return Err(json_rpc_error(-32602, "Invalid params: search_key is empty", None));
+        return Err(json_rpc_error(
+            -32602,
+            "Invalid params: search_key is empty",
+            None,
+        ));
     }
 
-    let max_chats: usize = args.get("max_chats").and_then(|v| v.as_u64()).unwrap_or(50).min(200) as usize;
-    let msgs_per_chat: u64 = args.get("msgs_per_chat").and_then(|v| v.as_u64()).unwrap_or(50).min(50);
-    let max_pages: u64 = args.get("max_pages").and_then(|v| v.as_u64()).unwrap_or(10).min(50);
-    let limit: usize = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20).min(100) as usize;
-    let include_p2p = args.get("include_p2p").and_then(|v| v.as_bool()).unwrap_or(true);
-    let include_group = args.get("include_group").and_then(|v| v.as_bool()).unwrap_or(true);
+    let max_chats: usize = args
+        .get("max_chats")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .min(200) as usize;
+    let msgs_per_chat: u64 = args
+        .get("msgs_per_chat")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50)
+        .min(50);
+    let max_pages: u64 = args
+        .get("max_pages")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10)
+        .min(50);
+    let limit: usize = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .min(100) as usize;
+    let include_p2p = args
+        .get("include_p2p")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let include_group = args
+        .get("include_group")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let msg_type_filters = extract_string_array(args.get("msg_types"));
 
     let search_mode = args
@@ -1042,13 +1112,14 @@ fn feishu_messages_global_search(args: &Value) -> Result<String, JsonRpcErr> {
         .unwrap_or("substring");
 
     // Prepare matcher based on search_mode
-    let regex_opt = if search_mode == "regex" {
-        Some(regex::Regex::new(&search_key).map_err(|e| {
-            json_rpc_error(-32602, &format!("Invalid regex pattern: {}", e), None)
-        })?)
-    } else {
-        None
-    };
+    let regex_opt =
+        if search_mode == "regex" {
+            Some(regex::Regex::new(&search_key).map_err(|e| {
+                json_rpc_error(-32602, &format!("Invalid regex pattern: {}", e), None)
+            })?)
+        } else {
+            None
+        };
     let needle_lower = search_key.to_lowercase();
     let fuzzy_threshold = if search_mode == "fuzzy" { 2 } else { 0 };
 
@@ -1057,7 +1128,11 @@ fn feishu_messages_global_search(args: &Value) -> Result<String, JsonRpcErr> {
         .timeout(Duration::from_secs(12))
         .build()
         .map_err(|e| {
-            json_rpc_error(-32000, "Failed to build http client", Some(json!({ "error": e.to_string() })))
+            json_rpc_error(
+                -32000,
+                "Failed to build http client",
+                Some(json!({ "error": e.to_string() })),
+            )
         })?;
 
     with_user_access_token(
@@ -1124,7 +1199,11 @@ fn feishu_messages_global_search_with_token(
         .enable_all()
         .build()
         .map_err(|e| {
-            json_rpc_error(-32000, "Failed to build tokio runtime", Some(json!({ "error": e.to_string() })))
+            json_rpc_error(
+                -32000,
+                "Failed to build tokio runtime",
+                Some(json!({ "error": e.to_string() })),
+            )
         })?;
 
     let base_url_owned = base_url.to_string();
@@ -1137,56 +1216,63 @@ fn feishu_messages_global_search_with_token(
     for batch in chats.chunks(concurrency) {
         let batch_chats: Vec<ChatInfo> = batch.to_vec();
 
-        let batch_results: Vec<Result<(usize, Vec<(i64, String)>), JsonRpcErr>> = rt.block_on(async {
-            let mut handles = Vec::with_capacity(batch_chats.len());
-            for chat in batch_chats {
-                let base_url_c = base_url_owned.clone();
-                let access_token_c = access_token_owned.clone();
-                let msg_type_filters_c = msg_type_filters_owned.clone();
-                let search_mode_c = search_mode_owned.clone();
-                let needle_lower_c = needle_lower_owned.clone();
-                let regex_pattern_c = regex_pattern_owned.clone();
-                handles.push(tokio::task::spawn_blocking(move || {
-                    let thread_client = Client::builder()
-                        .timeout(Duration::from_secs(12))
-                        .build()
-                        .map_err(|e| {
-                            json_rpc_error(
-                                -32000,
-                                "Failed to build http client",
-                                Some(json!({ "error": e.to_string() })),
-                            )
-                        })?;
-                    let re = regex_pattern_c.as_deref().map(|p| regex::Regex::new(p).unwrap());
-                    let mut local_matches: Vec<(i64, String)> = Vec::new();
-                    let mut local_scanned_messages = 0usize;
-                    scan_chat_messages_for_matches(
-                        &thread_client,
-                        &base_url_c,
-                        &access_token_c,
-                        &chat,
-                        msgs_per_chat,
-                        max_pages,
-                        &msg_type_filters_c,
-                        &search_mode_c,
-                        re.as_ref(),
-                        &needle_lower_c,
-                        fuzzy_threshold,
-                        limit,
-                        &mut local_scanned_messages,
-                        &mut local_matches,
-                    )?;
-                    Ok((local_scanned_messages, local_matches))
-                }));
-            }
-            let mut results = Vec::with_capacity(handles.len());
-            for h in handles {
-                results.push(h.await.unwrap_or_else(|e| {
-                    Err(json_rpc_error(-32000, "Task panicked", Some(json!({ "error": e.to_string() }))))
-                }));
-            }
-            results
-        });
+        let batch_results: Vec<Result<(usize, Vec<(i64, String)>), JsonRpcErr>> =
+            rt.block_on(async {
+                let mut handles = Vec::with_capacity(batch_chats.len());
+                for chat in batch_chats {
+                    let base_url_c = base_url_owned.clone();
+                    let access_token_c = access_token_owned.clone();
+                    let msg_type_filters_c = msg_type_filters_owned.clone();
+                    let search_mode_c = search_mode_owned.clone();
+                    let needle_lower_c = needle_lower_owned.clone();
+                    let regex_pattern_c = regex_pattern_owned.clone();
+                    handles.push(tokio::task::spawn_blocking(move || {
+                        let thread_client = Client::builder()
+                            .timeout(Duration::from_secs(12))
+                            .build()
+                            .map_err(|e| {
+                                json_rpc_error(
+                                    -32000,
+                                    "Failed to build http client",
+                                    Some(json!({ "error": e.to_string() })),
+                                )
+                            })?;
+                        let re = regex_pattern_c
+                            .as_deref()
+                            .map(|p| regex::Regex::new(p).unwrap());
+                        let mut local_matches: Vec<(i64, String)> = Vec::new();
+                        let mut local_scanned_messages = 0usize;
+                        scan_chat_messages_for_matches(
+                            &thread_client,
+                            &base_url_c,
+                            &access_token_c,
+                            &chat,
+                            msgs_per_chat,
+                            max_pages,
+                            &msg_type_filters_c,
+                            &search_mode_c,
+                            re.as_ref(),
+                            &needle_lower_c,
+                            fuzzy_threshold,
+                            limit,
+                            &mut local_scanned_messages,
+                            &mut local_matches,
+                        )?;
+                        Ok((local_scanned_messages, local_matches))
+                    }));
+                }
+                let mut results = Vec::with_capacity(handles.len());
+                for h in handles {
+                    results.push(h.await.unwrap_or_else(|e| {
+                        Err(json_rpc_error(
+                            -32000,
+                            "Task panicked",
+                            Some(json!({ "error": e.to_string() })),
+                        ))
+                    }));
+                }
+                results
+            });
 
         for result in batch_results {
             let (sm, local_matches) = result?;
@@ -1209,7 +1295,12 @@ fn feishu_messages_global_search_with_token(
     let mut out = String::new();
     out.push_str(&format!(
         "search_key: {} (mode: {})\nscanned_chats: {}/{}\nscanned_messages: {}\nmatched: {}",
-        search_key, search_mode, scanned_chats, total_chats, scanned_messages, matches.len()
+        search_key,
+        search_mode,
+        scanned_chats,
+        total_chats,
+        scanned_messages,
+        matches.len()
     ));
     if !msg_type_filters.is_empty() {
         out.push_str(&format!("\nfiltered_msg_types: {:?}", msg_type_filters));
@@ -1259,10 +1350,14 @@ fn scan_chat_messages_for_matches(
             None,
         )?;
         if !status.is_success() {
-            return Err(json_rpc_error(-32000, "Messages list API returned error code", Some(json!({
-                "status": status.as_u16(),
-                "body": body_text
-            }))));
+            return Err(json_rpc_error(
+                -32000,
+                "Messages list API returned error code",
+                Some(json!({
+                    "status": status.as_u16(),
+                    "body": body_text
+                })),
+            ));
         }
         let body = parse_json_response_body(
             "messages response",
@@ -1279,7 +1374,11 @@ fn scan_chat_messages_for_matches(
             ));
         }
         let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
-        let items = data.get("items").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let items = data
+            .get("items")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         let is_empty = items.is_empty();
         let oldest_in_page = items.iter().map(message_create_time).min();
 
@@ -1296,7 +1395,9 @@ fn scan_chat_messages_for_matches(
                 continue;
             }
             let matched = match search_mode {
-                "regex" => regex_opt.map(|re| re.is_match(&searchable_text)).unwrap_or(false),
+                "regex" => regex_opt
+                    .map(|re| re.is_match(&searchable_text))
+                    .unwrap_or(false),
                 "fuzzy" => fuzzy_match(&searchable_text, needle_lower, fuzzy_threshold),
                 _ => searchable_text.to_lowercase().contains(needle_lower),
             };
@@ -1749,22 +1850,10 @@ fn feishu_docs_get_text(args: &Value) -> Result<String, JsonRpcErr> {
                         feishu_wiki_resolve_obj(&client, &base_url, token, &docs_token)?;
                     match obj_type.as_str() {
                         "doc" | "docx" => feishu_fetch_raw_content(
-                            &client,
-                            &base_url,
-                            token,
-                            &obj_type,
-                            &obj_token,
-                            lang,
-                            None,
+                            &client, &base_url, token, &obj_type, &obj_token, lang, None,
                         ),
                         "sheet" | "sheets" => feishu_fetch_sheet_preview_text(
-                            &client,
-                            &base_url,
-                            token,
-                            &obj_token,
-                            max_rows,
-                            max_cols,
-                            max_sheets,
+                            &client, &base_url, token, &obj_token, max_rows, max_cols, max_sheets,
                         ),
                         other => Err(json_rpc_error(
                             -32000,
@@ -1794,7 +1883,9 @@ fn feishu_docs_get_text(args: &Value) -> Result<String, JsonRpcErr> {
                 other => Err(json_rpc_error(
                     -32602,
                     "Unsupported docs_type",
-                    Some(json!({ "docs_type": other, "supported": ["doc", "docx", "wiki", "sheet"] })),
+                    Some(
+                        json!({ "docs_type": other, "supported": ["doc", "docx", "wiki", "sheet"] }),
+                    ),
                 )),
             }
         },
@@ -2837,9 +2928,7 @@ fn render_docx_table_cells(
             continue;
         };
         let cell_text = render_docx_table_cell_text(cell_id, by_id, default_origin);
-        let escaped = cell_text
-            .replace('|', "\\|")
-            .replace('\n', "<br>");
+        let escaped = cell_text.replace('|', "\\|").replace('\n', "<br>");
         row.push(escaped);
         if row.len() >= col_size {
             rows.push(row);
@@ -2909,7 +2998,11 @@ fn render_docx_table_cell_text(
     parts.join("<br>")
 }
 
-fn render_docx_block_line(block: &Value, default_origin: Option<&str>, list_depth: usize) -> String {
+fn render_docx_block_line(
+    block: &Value,
+    default_origin: Option<&str>,
+    list_depth: usize,
+) -> String {
     let block_type = block
         .get("block_type")
         .and_then(|v| v.as_i64())
@@ -3504,11 +3597,19 @@ fn resolve_client_credentials() -> Option<(String, String)> {
     let env_id = std::env::var("FEISHU_CLIENT_ID")
         .ok()
         .map(|v| v.trim().to_string())
-        .or_else(|| std::env::var("FEISHU_APP_ID").ok().map(|v| v.trim().to_string()));
+        .or_else(|| {
+            std::env::var("FEISHU_APP_ID")
+                .ok()
+                .map(|v| v.trim().to_string())
+        });
     let env_secret = std::env::var("FEISHU_CLIENT_SECRET")
         .ok()
         .map(|v| v.trim().to_string())
-        .or_else(|| std::env::var("FEISHU_APP_SECRET").ok().map(|v| v.trim().to_string()));
+        .or_else(|| {
+            std::env::var("FEISHU_APP_SECRET")
+                .ok()
+                .map(|v| v.trim().to_string())
+        });
     if let (Some(id), Some(secret)) = (env_id, env_secret)
         && !id.is_empty()
         && !secret.is_empty()
@@ -3524,7 +3625,10 @@ fn resolve_client_credentials() -> Option<(String, String)> {
     let secret = cfg
         .get_opt("feishu.client_secret")
         .map(|v| v.trim().to_string())
-        .or_else(|| cfg.get_opt("feishu.app_secret").map(|v| v.trim().to_string()));
+        .or_else(|| {
+            cfg.get_opt("feishu.app_secret")
+                .map(|v| v.trim().to_string())
+        });
     match (id, secret) {
         (Some(id), Some(secret)) if !id.is_empty() && !secret.is_empty() => Some((id, secret)),
         _ => None,
@@ -4812,19 +4916,40 @@ fn parse_inline_elements(text: &str) -> Vec<Value> {
 #[derive(Clone)]
 enum BlockOp {
     Simple(Value),
-    Descendant { children_id: Vec<String>, descendants: Vec<Value> },
+    Descendant {
+        children_id: Vec<String>,
+        descendants: Vec<Value>,
+    },
 }
 
 #[derive(Clone)]
 enum MdNode {
-    Heading { level: u8, elements: Vec<Value> },
-    Paragraph { elements: Vec<Value> },
-    BulletList { items: Vec<ListItem> },
-    OrderedList { items: Vec<ListItem> },
-    TodoList { items: Vec<ListItem> },
-    CodeBlock { lang: Option<String>, content: String },
-    BlockQuote { children: Vec<MdNode> },
-    Table { rows: Vec<Vec<String>> },
+    Heading {
+        level: u8,
+        elements: Vec<Value>,
+    },
+    Paragraph {
+        elements: Vec<Value>,
+    },
+    BulletList {
+        items: Vec<ListItem>,
+    },
+    OrderedList {
+        items: Vec<ListItem>,
+    },
+    TodoList {
+        items: Vec<ListItem>,
+    },
+    CodeBlock {
+        lang: Option<String>,
+        content: String,
+    },
+    BlockQuote {
+        children: Vec<MdNode>,
+    },
+    Table {
+        rows: Vec<Vec<String>>,
+    },
     Divider,
 }
 
@@ -4917,7 +5042,10 @@ fn detect_list_marker(trimmed: &str) -> Option<(ListKind, &str)> {
     if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
         return Some((ListKind::Todo(false), rest));
     }
-    if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+    if let Some(rest) = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+    {
         return Some((ListKind::Bullet, rest));
     }
     if let Some(rest) = strip_ordered_list_prefix(trimmed) {
@@ -4935,7 +5063,10 @@ enum ListKind {
 
 fn parse_markdown_ast(markdown: &str) -> Vec<MdNode> {
     let lines: Vec<&str> = markdown.lines().collect();
-    let mut ctx = ParseCtx { lines: &lines, pos: 0 };
+    let mut ctx = ParseCtx {
+        lines: &lines,
+        pos: 0,
+    };
     let mut nodes = Vec::new();
     while ctx.pos < lines.len() {
         if let Some(node) = parse_next_node(&mut ctx) {
@@ -5010,11 +5141,12 @@ fn parse_code_block_node_with_indent(ctx: &mut ParseCtx, base_indent: usize) -> 
         if !content.is_empty() {
             content.push('\n');
         }
-        let code_line = if line.len() > base_indent && line.chars().take(base_indent).all(|c| c == ' ') {
-            &line[base_indent..]
-        } else {
-            line.trim_start()
-        };
+        let code_line =
+            if line.len() > base_indent && line.chars().take(base_indent).all(|c| c == ' ') {
+                &line[base_indent..]
+            } else {
+                line.trim_start()
+            };
         content.push_str(code_line);
         ctx.pos += 1;
     }
@@ -5098,8 +5230,8 @@ fn parse_block_quote_node(ctx: &mut ParseCtx) -> MdNode {
 
 fn parse_list_node(ctx: &mut ParseCtx, base_indent: usize) -> MdNode {
     let first_trimmed = ctx.lines[ctx.pos].trim_start();
-    let (first_kind, first_rest) = detect_list_marker(first_trimmed)
-        .expect("parse_list_node called on non-list line");
+    let (first_kind, first_rest) =
+        detect_list_marker(first_trimmed).expect("parse_list_node called on non-list line");
 
     let mut items: Vec<ListItem> = Vec::new();
     items.push(ListItem {
@@ -5111,7 +5243,6 @@ fn parse_list_node(ctx: &mut ParseCtx, base_indent: usize) -> MdNode {
         },
     });
     ctx.pos += 1;
-
 
     while ctx.pos < ctx.lines.len() {
         let line = ctx.lines[ctx.pos];
@@ -5506,10 +5637,7 @@ fn list_item_to_block_ops(
     }
 }
 
-fn md_node_to_descendant_blocks(
-    node: MdNode,
-    id_counter: &mut usize,
-) -> (Vec<String>, Vec<Value>) {
+fn md_node_to_descendant_blocks(node: MdNode, id_counter: &mut usize) -> (Vec<String>, Vec<Value>) {
     match node {
         MdNode::Heading { level, elements } => {
             let id = alloc_id(id_counter);
@@ -5828,10 +5956,7 @@ fn feishu_doc_create_from_markdown(args: &Value) -> Result<String, JsonRpcErr> {
                 "folder_token": folder_token
             });
             if folder_token.is_empty() {
-                create_body
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("folder_token");
+                create_body.as_object_mut().unwrap().remove("folder_token");
             }
 
             let url = format!(
@@ -5840,10 +5965,7 @@ fn feishu_doc_create_from_markdown(args: &Value) -> Result<String, JsonRpcErr> {
             );
             let resp = client
                 .post(&url)
-                .header(
-                    "Authorization",
-                    format!("Bearer {}", token.trim()),
-                )
+                .header("Authorization", format!("Bearer {}", token.trim()))
                 .header("Content-Type", "application/json; charset=utf-8")
                 .json(&create_body)
                 .send()
@@ -5900,7 +6022,11 @@ fn feishu_doc_create_from_markdown(args: &Value) -> Result<String, JsonRpcErr> {
     )?;
 
     let block_ops = convert_markdown_to_docx_blocks(&markdown_content);
-    let doc_url = format!("{}/docx/{}", resolve_docs_web_base_url(&base_url), document_id);
+    let doc_url = format!(
+        "{}/docx/{}",
+        resolve_docs_web_base_url(&base_url),
+        document_id
+    );
     if block_ops.is_empty() {
         return Ok(empty_doc_result(&document_id, &doc_url));
     }
@@ -6048,14 +6174,7 @@ fn flush_simple_batch(
         base_url,
         "Missing user_access_token. Update document requires OAuth.",
         |token| {
-            create_children_batch(
-                client,
-                base_url,
-                token,
-                document_id,
-                &batch,
-                start_index,
-            )?;
+            create_children_batch(client, base_url, token, document_id, &batch, start_index)?;
             Ok(())
         },
     )?;
@@ -6484,7 +6603,7 @@ mod tests {
                     "elements": [{ "text_run": { "content": "先检查输入", "text_element_style": {} } }],
                     "style": { "done": false }
                 }
-            })
+            }),
         ];
 
         let rendered = render_docx_blocks_as_text(&items, None);
@@ -6545,7 +6664,7 @@ mod tests {
                 "parent_id": "cell2",
                 "text": { "elements": [{ "text_run": { "content": "值", "text_element_style": {} } }] },
                 "children": []
-            })
+            }),
         ];
 
         let rendered = render_docx_blocks_as_text(&items, None);
@@ -6572,7 +6691,7 @@ mod tests {
                     "style": { "sequence": "3" }
                 },
                 "children": []
-            })
+            }),
         ];
 
         let rendered = render_docx_blocks_as_text(&items, None);
@@ -6689,11 +6808,13 @@ mod tests {
         .unwrap();
 
         assert!(result.contains("matched: 1"));
-        assert!(seen_auth
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|line| line.contains("Bearer u-test-user-token")));
+        assert!(
+            seen_auth
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|line| line.contains("Bearer u-test-user-token"))
+        );
 
         unsafe {
             if let Some(v) = old_base {
@@ -6775,7 +6896,9 @@ mod tests {
                 seen_auth_clone.lock().unwrap().push(line.to_string());
             }
             let first_line = request.lines().next().unwrap_or_default().to_string();
-            if first_line.contains("/open-apis/im/v1/chats?") || first_line.contains("/open-apis/im/v1/chats ") {
+            if first_line.contains("/open-apis/im/v1/chats?")
+                || first_line.contains("/open-apis/im/v1/chats ")
+            {
                 return serde_json::json!({
                     "code": 0,
                     "msg": "ok",
@@ -6827,11 +6950,13 @@ mod tests {
         assert!(result.contains("scanned_chats: 1/1"));
         assert!(result.contains("matched: 1"));
         assert!(result.contains("\"chat_name\": \"dataagent\""));
-        assert!(seen_auth
-            .lock()
-            .unwrap()
-            .iter()
-            .all(|line| line.contains("Bearer u-test-user-token")));
+        assert!(
+            seen_auth
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|line| line.contains("Bearer u-test-user-token"))
+        );
 
         unsafe {
             if let Some(v) = old_base {
@@ -6852,7 +6977,9 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let base_url = start_mock_http_server(move |request| {
             let first_line = request.lines().next().unwrap_or_default().to_string();
-            if first_line.contains("/open-apis/im/v1/chats?") || first_line.contains("/open-apis/im/v1/chats ") {
+            if first_line.contains("/open-apis/im/v1/chats?")
+                || first_line.contains("/open-apis/im/v1/chats ")
+            {
                 return serde_json::json!({
                     "code": 0,
                     "msg": "ok",
@@ -6880,7 +7007,8 @@ mod tests {
                         }],
                         "has_more": false
                     }
-                }).to_string();
+                })
+                .to_string();
             }
             serde_json::json!({
                 "code": 0,
@@ -6896,7 +7024,8 @@ mod tests {
                     }],
                     "has_more": false
                 }
-            }).to_string()
+            })
+            .to_string()
         });
 
         let old_base = std::env::var("FEISHU_BASE_URL").ok();
@@ -6939,7 +7068,9 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let base_url = start_mock_http_server(move |request| {
             let first_line = request.lines().next().unwrap_or_default().to_string();
-            if first_line.contains("/open-apis/im/v1/chats?") || first_line.contains("/open-apis/im/v1/chats ") {
+            if first_line.contains("/open-apis/im/v1/chats?")
+                || first_line.contains("/open-apis/im/v1/chats ")
+            {
                 return serde_json::json!({
                     "code": 0,
                     "msg": "ok",
@@ -6977,7 +7108,8 @@ mod tests {
                         ],
                         "has_more": false
                     }
-                }).to_string();
+                })
+                .to_string();
             }
             serde_json::json!({
                 "code": 0,
@@ -6993,7 +7125,8 @@ mod tests {
                     }],
                     "has_more": false
                 }
-            }).to_string()
+            })
+            .to_string()
         });
 
         let old_base = std::env::var("FEISHU_BASE_URL").ok();

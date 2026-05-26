@@ -9,7 +9,7 @@
 // - MCP client initialization
 // - Agent loading and auto-routing
 // - The main run_loop() that coordinates foreground and background processes
-// 
+//
 // Key concepts:
 //   - App: Main application state holding all runtime information
 //   - run(): Async entry point, initializes everything and starts run_loop
@@ -24,15 +24,14 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        Arc,
-        LazyLock, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
-use uuid::Uuid;
 use aios_kernel::primitives::{ResourceUsageDelta, RlimitDim, RlimitVerdict};
+use uuid::Uuid;
 
 use crate::ai::{
     agents::{self, AgentManifest},
@@ -46,8 +45,8 @@ use crate::ai::{
     tools::task_tools::decode_os_task_goal,
     types::{AgentContext, App},
 };
-use crate::commonw::configw;
 use crate::commonw::FastMap;
+use crate::commonw::configw;
 
 pub mod agent_router;
 pub mod commands;
@@ -92,10 +91,7 @@ pub(crate) fn new_local_kernel() -> aios_kernel::kernel::SharedKernel {
     aios_kernel::kernel::new_shared_kernel(aios_kernel::local::LocalOS::new())
 }
 
-fn should_auto_drop_terminated(
-    os: &dyn aios_kernel::kernel::Syscall,
-    pid: u64,
-) -> bool {
+fn should_auto_drop_terminated(os: &dyn aios_kernel::kernel::Syscall, pid: u64) -> bool {
     os.get_process(pid)
         .map(|proc| proc.parent_pid.is_none())
         .unwrap_or(false)
@@ -141,9 +137,7 @@ fn format_rlimit_termination_result(verdict: RlimitVerdict) -> String {
                 RlimitDim::ToolCallBytes => "tool_call_bytes",
                 RlimitDim::FsBytes => "fs_bytes",
             };
-            format!(
-                "Terminated: Resource limit exceeded ({dim}: used={used}, limit={limit})."
-            )
+            format!("Terminated: Resource limit exceeded ({dim}: used={used}, limit={limit}).")
         }
         _ => "Completed".to_string(),
     }
@@ -251,15 +245,27 @@ fn sched_fail_threshold() -> u32 {
 }
 
 fn sched_cooldown_epochs() -> u64 {
-    scheduler_cfg_u64("ai.scheduler.cooldown_epochs", SCHED_COOLDOWN_EPOCHS_DEFAULT).max(1)
+    scheduler_cfg_u64(
+        "ai.scheduler.cooldown_epochs",
+        SCHED_COOLDOWN_EPOCHS_DEFAULT,
+    )
+    .max(1)
 }
 
 fn sched_eval_period_epochs() -> u64 {
-    scheduler_cfg_u64("ai.scheduler.eval_period_epochs", SCHED_EVAL_PERIOD_EPOCHS_DEFAULT).max(1)
+    scheduler_cfg_u64(
+        "ai.scheduler.eval_period_epochs",
+        SCHED_EVAL_PERIOD_EPOCHS_DEFAULT,
+    )
+    .max(1)
 }
 
 fn sched_eval_min_samples() -> usize {
-    scheduler_cfg_usize("ai.scheduler.eval_min_samples", SCHED_EVAL_MIN_SAMPLES_DEFAULT).max(1)
+    scheduler_cfg_usize(
+        "ai.scheduler.eval_min_samples",
+        SCHED_EVAL_MIN_SAMPLES_DEFAULT,
+    )
+    .max(1)
 }
 
 fn sched_cost_penalty_divisor() -> u64 {
@@ -324,14 +330,17 @@ fn scheduler_score(
     let age_score = age * 3;
     let failure_penalty = (meta.failure_streak as i64) * 40;
     let cost_penalty = (proc.usage.cost_micros / sched_cost_penalty_divisor()) as i64;
-    let token_penalty = ((proc.usage.tokens_in + proc.usage.tokens_out)
-        / sched_token_penalty_divisor()) as i64;
+    let token_penalty =
+        ((proc.usage.tokens_in + proc.usage.tokens_out) / sched_token_penalty_divisor()) as i64;
     let outcome_bias = match meta.last_outcome {
         DispatchOutcomeTag::Advanced => 12,
         DispatchOutcomeTag::Blocked => 6,
         DispatchOutcomeTag::Failed => -20,
     };
-    priority_score + quota_score + age_score + outcome_bias - failure_penalty - cost_penalty - token_penalty
+    priority_score + quota_score + age_score + outcome_bias
+        - failure_penalty
+        - cost_penalty
+        - token_penalty
 }
 
 fn update_dispatch_meta(
@@ -372,10 +381,7 @@ fn maybe_promote_half_open(meta: ProcessDispatchMeta, epoch: u64) -> ProcessDisp
     }
 }
 
-fn classify_process_outcome(
-    os: &dyn aios_kernel::kernel::Kernel,
-    pid: u64,
-) -> DispatchOutcomeTag {
+fn classify_process_outcome(os: &dyn aios_kernel::kernel::Kernel, pid: u64) -> DispatchOutcomeTag {
     let Some(proc) = os.get_process(pid) else {
         return DispatchOutcomeTag::Advanced;
     };
@@ -391,10 +397,7 @@ fn classify_process_outcome(
     }
 }
 
-fn apply_priority_handoff(
-    proc: &mut aios_kernel::kernel::Process,
-    outcome: DispatchOutcomeTag,
-) {
+fn apply_priority_handoff(proc: &mut aios_kernel::kernel::Process, outcome: DispatchOutcomeTag) {
     match outcome {
         DispatchOutcomeTag::Advanced => {
             proc.priority = proc.priority.saturating_sub(1);
@@ -415,15 +418,15 @@ fn record_scheduler_outcome(
     let mut meta_map = SCHEDULER_DISPATCH_META
         .lock()
         .unwrap_or_else(|err| err.into_inner());
-    let prev = *meta_map.get(&pid).unwrap_or(&ProcessDispatchMeta::default());
+    let prev = *meta_map
+        .get(&pid)
+        .unwrap_or(&ProcessDispatchMeta::default());
     let next = update_dispatch_meta(prev, outcome, epoch);
     meta_map.insert(pid, next);
 
     if let Some(proc) = os.get_process_mut(pid) {
         apply_priority_handoff(proc, outcome);
-        if outcome == DispatchOutcomeTag::Failed
-            && next.failure_streak >= sched_fail_threshold()
-        {
+        if outcome == DispatchOutcomeTag::Failed && next.failure_streak >= sched_fail_threshold() {
             proc.mailbox.push_back(format!(
                 "[scheduler-circuit-open] Consecutive failures reached {}. Cooling down for {} dispatch epochs.",
                 next.failure_streak,
@@ -506,7 +509,11 @@ fn maybe_emit_scheduler_eval(epoch: u64, session_id: &str) {
     log_scheduler_decision(
         session_id,
         epoch,
-        if healthy { "scheduler_healthy" } else { "scheduler_attention" },
+        if healthy {
+            "scheduler_healthy"
+        } else {
+            "scheduler_attention"
+        },
         vec![
             format!("failing_rate={:.3}", failing_rate),
             format!("cooling_rate={:.3}", cooling_rate),
@@ -552,8 +559,8 @@ fn select_background_batch(
     for proc in popped {
         let meta = maybe_promote_half_open(
             *meta_snapshot
-            .get(&proc.pid)
-            .unwrap_or(&ProcessDispatchMeta::default()),
+                .get(&proc.pid)
+                .unwrap_or(&ProcessDispatchMeta::default()),
             epoch,
         );
         let score = scheduler_score(&proc, meta, epoch);
@@ -571,14 +578,14 @@ fn select_background_batch(
     eligible.sort_by(|a, b| {
         let a_meta = maybe_promote_half_open(
             *meta_snapshot
-            .get(&a.pid)
-            .unwrap_or(&ProcessDispatchMeta::default()),
+                .get(&a.pid)
+                .unwrap_or(&ProcessDispatchMeta::default()),
             epoch,
         );
         let b_meta = maybe_promote_half_open(
             *meta_snapshot
-            .get(&b.pid)
-            .unwrap_or(&ProcessDispatchMeta::default()),
+                .get(&b.pid)
+                .unwrap_or(&ProcessDispatchMeta::default()),
             epoch,
         );
         scheduler_score(b, b_meta, epoch).cmp(&scheduler_score(a, a_meta, epoch))
@@ -681,7 +688,7 @@ fn auto_route_strategy() -> String {
 ///   1. No explicit agent specified via CLI (-a/--agent)
 ///   2. Auto-routing is enabled in config
 ///   3. A suitable agent is found based on the question
-/// 
+///
 /// Uses either:
 ///   - model strategy: Use ML model to predict best agent
 ///   - heuristic strategy: Rule-based routing
@@ -740,7 +747,9 @@ fn read_recent_history(app: &App) -> Vec<crate::ai::history::Message> {
     use crate::ai::history::{build_message_arr, read_recent_messages_sqlite};
 
     let is_sqlite_history = matches!(
-        app.session_history_file.extension().and_then(|ext| ext.to_str()),
+        app.session_history_file
+            .extension()
+            .and_then(|ext| ext.to_str()),
         Some("sqlite") | Some("db")
     );
 
@@ -773,7 +782,10 @@ fn reload_agent_manifests(agent_manifests: &mut Vec<AgentManifest>) {
             new_agents.len()
         );
     } else {
-        println!("[Agent 发现] 检测到 agent 内容变更，已重新加载，共 {} 个", new_agents.len());
+        println!(
+            "[Agent 发现] 检测到 agent 内容变更，已重新加载，共 {} 个",
+            new_agents.len()
+        );
     }
     *agent_manifests = new_agents;
 }
@@ -899,7 +911,10 @@ fn announce_mcp_loading_if_needed(
         "{}",
         print::format_section_header(
             "mcp",
-            Some(&format!("{} configured servers · loading...", mcp_probe.server_count))
+            Some(&format!(
+                "{} configured servers · loading...",
+                mcp_probe.server_count
+            ))
         )
     );
     std::io::stdout().flush().ok();
@@ -934,7 +949,8 @@ async fn try_finalize_mcp_preload(
                 return;
             }
             eprintln!("[mcp] background preload task failed: {}", err);
-            let fallback = prepare_mcp_initialization_from_path(mcp_probe.config_path.clone()).await;
+            let fallback =
+                prepare_mcp_initialization_from_path(mcp_probe.config_path.clone()).await;
             apply_prepared_mcp_with_shared_client(app, mcp_client, fallback)
         }
     };
@@ -943,7 +959,10 @@ async fn try_finalize_mcp_preload(
     if report.loaded {
         let header = print::format_section_header(
             "mcp",
-            Some(&format!("{} servers, {} tools", report.server_count, report.tool_count)),
+            Some(&format!(
+                "{} servers, {} tools",
+                report.server_count, report.tool_count
+            )),
         );
         if *mcp_loading_announced {
             print!("\r\x1b[2K{}\n", header);
@@ -971,7 +990,7 @@ fn should_preload_mcp(one_shot_mode: bool, mcp_probe: &McpConfigProbe) -> bool {
 
 /// Main entry point for AIOS.
 /// Initializes all components and starts the run_loop.
-/// 
+///
 /// Initialization steps:
 ///   1. Parse CLI arguments
 ///   2. Load config
@@ -1117,8 +1136,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         last_skill_bias: None,
         os: os_arc,
         agent_reload_counter: None,
-            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
-        };
+        observers: vec![Box::new(
+            crate::ai::driver::thinking::ThinkingOrchestrator::new(),
+        )],
+    };
 
     let decision_log_path = app
         .session_history_file
@@ -1184,10 +1205,7 @@ fn format_wakeup_prompt(pid: u64, goal: &str, messages: &[String]) -> String {
 /// 返回 `(should_terminate, termination_result)`，由调用方决定是否真的调用
 /// `terminate_and_cleanup`，从而保留 foreground / background 各自后续的特殊处理
 /// （如 round-robin requeue 等）。
-fn finalize_turn_quota(
-    os: &mut dyn aios_kernel::kernel::Kernel,
-    pid: u64,
-) -> (bool, String) {
+fn finalize_turn_quota(os: &mut dyn aios_kernel::kernel::Kernel, pid: u64) -> (bool, String) {
     let verdict = os.rusage_charge(
         pid,
         ResourceUsageDelta {
@@ -1302,7 +1320,7 @@ async fn run_foreground_resume(
 
 /// Main event loop for AIOS.
 /// Coordinates execution of both foreground and background processes.
-/// 
+///
 /// Loop structure per iteration:
 ///   1. Scheduler tick: advance_tick() to wake sleeping processes
 ///   2. Agent hot-reload: check for new agents every 5 ticks
@@ -1315,7 +1333,7 @@ async fn run_foreground_resume(
 ///      - handle interactive commands
 ///      - run turn via turn_runtime::run_turn()
 ///   6. Termination check: exit if quit requested
-/// 
+///
 /// one_shot_mode: When CLI args provided (non-interactive)
 ///   - runs once and exits
 ///   - deletes session after completion
@@ -1470,7 +1488,17 @@ async fn run_loop(
                 ));
             }
 
-            for (pid, proc_question, history_path, agent_override, model_override, result_channel_id, completion_futex_addr, task_id) in task_specs {
+            for (
+                pid,
+                proc_question,
+                history_path,
+                agent_override,
+                model_override,
+                result_channel_id,
+                completion_futex_addr,
+                task_id,
+            ) in task_specs
+            {
                 let mut task_app = app.clone();
                 task_app.session_history_file = history_path;
                 crate::ai::types::clear_stream_cancel(&task_app);
@@ -1498,9 +1526,7 @@ async fn run_loop(
                         crate::ai::tools::task_tools::with_task_entry(tid, |e| e.inherit)
                     })
                     .unwrap_or_default();
-                let scope_task_id = task_id
-                    .clone()
-                    .unwrap_or_else(|| format!("pid-{pid}"));
+                let scope_task_id = task_id.clone().unwrap_or_else(|| format!("pid-{pid}"));
                 let parent_history_for_scopes = original_history_file.clone();
 
                 // Slot used by the sub-agent's `finalize_turn` to publish
@@ -1567,23 +1593,14 @@ async fn run_loop(
                             let (should_terminate, termination_result) =
                                 finalize_turn_quota(os.as_mut(), pid);
                             if should_terminate {
-                                terminate_and_cleanup(
-                                    os.as_mut(),
-                                    pid,
-                                    termination_result,
-                                    true,
-                                );
+                                terminate_and_cleanup(os.as_mut(), pid, termination_result, true);
                             } else if os.is_round_robin() {
                                 os.set_current_pid(Some(pid));
                                 os.requeue_current();
                             }
                         }
                         Err(err) => {
-                            record_scheduler_outcome(
-                                os.as_mut(),
-                                pid,
-                                DispatchOutcomeTag::Failed,
-                            );
+                            record_scheduler_outcome(os.as_mut(), pid, DispatchOutcomeTag::Failed);
                             terminate_and_cleanup(
                                 os.as_mut(),
                                 pid,
@@ -1594,13 +1611,11 @@ async fn run_loop(
                     }
                 });
 
-                type BoxedTaskFuture = std::pin::Pin<
-                    Box<dyn std::future::Future<Output = ()> + Send>,
-                >;
+                type BoxedTaskFuture =
+                    std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
                 let mut wrapped: BoxedTaskFuture = Box::pin(inner_fut);
                 wrapped = Box::pin(
-                    runtime_ctx::SUBAGENT_RESULT_SLOT
-                        .scope(result_slot_for_scope, wrapped),
+                    runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped),
                 );
                 if !inherit.memory {
                     let mem_path = runtime_ctx::make_subagent_memory_path(
@@ -1614,12 +1629,12 @@ async fn run_loop(
                     //
                     // 主 memory 路径在父任务作用域内解析，这里 task_local 还没装上
                     // SUBAGENT_MEMORY_PATH，所以 from_env_or_config 拿到的是主路径。
-                    let main_path = crate::ai::tools::storage::memory_store::
-                        MemoryStore::from_env_or_config().path().to_path_buf();
+                    let main_path =
+                        crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config()
+                            .path()
+                            .to_path_buf();
                     let private_for_merge = mem_path.clone();
-                    wrapped = Box::pin(
-                        runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped),
-                    );
+                    wrapped = Box::pin(runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped));
                     // 这里包一层 outer future：sub-agent run 完成后 merge。
                     // merge_subagent_whitelist 内部用 for_tests_with_path
                     // 直接绑定 main_path，绕过 SUBAGENT_MEMORY_PATH override，
@@ -1641,8 +1656,7 @@ async fn run_loop(
                     if let Some(scratch) =
                         runtime_ctx::make_subagent_cwd(&scratch_base, &scope_task_id)
                     {
-                        wrapped =
-                            Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
+                        wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
                     }
                 }
 
@@ -1856,8 +1870,13 @@ async fn run_loop(
                     let obs_name = obs.name().to_string();
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         obs.on_conversation_end();
-                    })).is_err() {
-                        eprintln!("[Warning] observer '{}' panicked in on_conversation_end; disabling.", obs_name);
+                    }))
+                    .is_err()
+                    {
+                        eprintln!(
+                            "[Warning] observer '{}' panicked in on_conversation_end; disabling.",
+                            obs_name
+                        );
                         obs.mark_poisoned();
                     }
                 }
@@ -1876,17 +1895,16 @@ async fn run_loop(
 #[cfg(test)]
 mod tests {
     use super::{
-        background_execute_limit, background_pop_limit, has_pending_foreground_process,
-        maybe_auto_route_agent, read_recent_history, reset_scheduler_test_state,
-        should_preload_mcp, update_dispatch_meta, DispatchOutcomeTag, ProcessDispatchMeta,
-        SCHEDULER_DISPATCH_META,
-        SCHED_COOLDOWN_EPOCHS_DEFAULT,
+        DispatchOutcomeTag, ProcessDispatchMeta, SCHED_COOLDOWN_EPOCHS_DEFAULT,
+        SCHEDULER_DISPATCH_META, background_execute_limit, background_pop_limit,
+        has_pending_foreground_process, maybe_auto_route_agent, read_recent_history,
+        reset_scheduler_test_state, should_preload_mcp, update_dispatch_meta,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
-    use crate::ai::history::{Message, append_history_messages};
     use crate::ai::cli::ParsedCli;
-    use aios_kernel::kernel::{EventId, ProcessState, WaitPolicy};
+    use crate::ai::history::{Message, append_history_messages};
     use crate::ai::types::{AgentContext, App, AppConfig};
+    use aios_kernel::kernel::{EventId, ProcessState, WaitPolicy};
     use aios_kernel::primitives::ResourceLimit;
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
@@ -2042,7 +2060,9 @@ mod tests {
             last_skill_bias: None,
             os: super::new_local_kernel(),
             agent_reload_counter: None,
-            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
+            observers: vec![Box::new(
+                crate::ai::driver::thinking::ThinkingOrchestrator::new(),
+            )],
         }
     }
 
@@ -2116,7 +2136,9 @@ mod tests {
 
         assert_eq!(
             recent,
-            vec!["m12", "m11", "m10", "m9", "m8", "m7", "m6", "m5", "m4", "m3"]
+            vec![
+                "m12", "m11", "m10", "m9", "m8", "m7", "m6", "m5", "m4", "m3"
+            ]
         );
 
         let _ = std::fs::remove_file(&path);
@@ -2130,7 +2152,8 @@ mod tests {
 
         {
             let mut os = app.os.lock().unwrap();
-            let root = os.begin_foreground("foreground".to_string(), "goal".to_string(), 10, 8, None);
+            let root =
+                os.begin_foreground("foreground".to_string(), "goal".to_string(), 10, 8, None);
             os.wait_on_events(vec![EventId::new(1)], WaitPolicy::All, None)
                 .unwrap();
             assert!(matches!(
@@ -2148,7 +2171,8 @@ mod tests {
 
         {
             let mut os = app.os.lock().unwrap();
-            let root = os.begin_foreground("foreground".to_string(), "goal".to_string(), 10, 8, None);
+            let root =
+                os.begin_foreground("foreground".to_string(), "goal".to_string(), 10, 8, None);
             os.terminate_current("done".to_string());
             assert!(matches!(
                 os.get_process(root).map(|proc| &proc.state),

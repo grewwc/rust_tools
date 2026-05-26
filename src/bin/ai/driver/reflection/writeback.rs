@@ -65,10 +65,9 @@ fn sync_agent_entry_to_vector(entry: &AgentMemoryEntry) {
     let Some(store) = guard.as_ref() else {
         return;
     };
-    if let Err(err) = crate::ai::knowledge::sync::knowledge_sync::sync_entry_to_vector(
-        store,
-        &knowledge_entry,
-    ) {
+    if let Err(err) =
+        crate::ai::knowledge::sync::knowledge_sync::sync_entry_to_vector(store, &knowledge_entry)
+    {
         eprintln!("[Memory] writeback vector sync failed: {}", err);
     }
 }

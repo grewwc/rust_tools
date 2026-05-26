@@ -44,8 +44,12 @@ pub(crate) fn default_model_path() -> PathBuf {
 fn load_model_file(path: &Path) -> Result<SkillMatchModelFile, String> {
     let text = fs::read_to_string(path)
         .map_err(|err| format!("failed to read skill match model {}: {err}", path.display()))?;
-    let model: SkillMatchModelFile = serde_json::from_str(&text)
-        .map_err(|err| format!("failed to parse skill match model {}: {err}", path.display()))?;
+    let model: SkillMatchModelFile = serde_json::from_str(&text).map_err(|err| {
+        format!(
+            "failed to parse skill match model {}: {err}",
+            path.display()
+        )
+    })?;
     validate_model(&model)?;
     Ok(model)
 }
@@ -72,9 +76,7 @@ fn lock_recover<'a, T>(m: &'a Mutex<T>) -> Option<std::sync::MutexGuard<'a, T>> 
     match m.lock() {
         Ok(g) => Some(g),
         Err(poisoned) => {
-            eprintln!(
-                "[skill_match_model] cache mutex poisoned, recovering inner state"
-            );
+            eprintln!("[skill_match_model] cache mutex poisoned, recovering inner state");
             Some(poisoned.into_inner())
         }
     }

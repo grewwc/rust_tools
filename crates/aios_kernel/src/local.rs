@@ -705,11 +705,7 @@ impl LocalOS {
         {
             return true;
         }
-        self.event_source_refs
-            .get(&event_id)
-            .copied()
-            .unwrap_or(0)
-            > 0
+        self.event_source_refs.get(&event_id).copied().unwrap_or(0) > 0
     }
 
     fn prune_completed_events(&mut self) {
@@ -1819,8 +1815,7 @@ impl FutexOps for LocalOS {
         self.next_futex_id += 1;
         let event_id = self.alloc_internal_event_id();
         let owner = self.current_pid;
-        self.futexes
-            .insert(id, FutexState::new(initial, event_id));
+        self.futexes.insert(id, FutexState::new(initial, event_id));
         // 与 futex 生命周期绑定的 event_id 入资源计数。
         self.inc_event_source_ref(event_id);
         // Label and owner used to live on FutexState; emitting a trace event
@@ -5196,7 +5191,10 @@ mod tests {
         assert!(matches!(recs[2].kind, TraceKind::SpanExit));
         assert_eq!(recs[1].name, "llm.submit");
         assert_eq!(
-            recs[1].fields().and_then(|f| f.get("model")).map(String::as_str),
+            recs[1]
+                .fields()
+                .and_then(|f| f.get("model"))
+                .map(String::as_str),
             Some("gpt")
         );
     }

@@ -7,7 +7,11 @@ use crate::ai::{
 };
 use crate::commonw::configw;
 
-pub(super) fn reflection_filtered(question: &str, answer: &str, turn_messages: &Vec<Message>) -> bool {
+pub(super) fn reflection_filtered(
+    question: &str,
+    answer: &str,
+    turn_messages: &Vec<Message>,
+) -> bool {
     let cfg = configw::get_all_config();
     let enabled = !cfg
         .get_opt("ai.reflection.filter.enable")
@@ -86,8 +90,7 @@ pub(super) async fn model_should_reflect(
         },
         Message {
             role: "user".to_string(),
-            content: build_content(model, &user, &[])
-                .unwrap_or(Value::String(user)),
+            content: build_content(model, &user, &[]).unwrap_or(Value::String(user)),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -323,8 +326,7 @@ pub(super) async fn model_should_revise(
         },
         Message {
             role: "user".to_string(),
-            content: build_content(model, &user, &[])
-                .unwrap_or(Value::String(user)),
+            content: build_content(model, &user, &[]).unwrap_or(Value::String(user)),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -445,4 +447,3 @@ mod tests {
         assert!(!answer_looks_unstable_for_writeback("好的，已修复 bug"));
     }
 }
-

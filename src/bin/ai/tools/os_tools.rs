@@ -1,9 +1,9 @@
-use serde_json::Value;
-use std::sync::LazyLock;
 use crate::ai::tools::registry::common::{ToolRegistration, ToolSpec};
-use std::sync::Mutex;
 use aios_kernel::kernel::{ProcessCapabilities, SharedKernel};
 use aios_kernel::primitives::{ChannelMetaSnapshot, ChannelOwnerTag};
+use serde_json::Value;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 
 /// 全局 AIOS kernel 句柄，由 driver 启动时通过 [`init_os_tools_globals`] 注入。
 ///
@@ -104,23 +104,28 @@ fn params_spawn_process() -> Value {
 }
 
 fn execute_spawn_process(args: &Value) -> Result<String, String> {
-    let name = args["name"].as_str().ok_or("Missing 'name' string parameter.")?;
-    let goal = args["goal"].as_str().ok_or("Missing 'goal' string parameter.")?;
+    let name = args["name"]
+        .as_str()
+        .ok_or("Missing 'name' string parameter.")?;
+    let goal = args["goal"]
+        .as_str()
+        .ok_or("Missing 'goal' string parameter.")?;
     let priority = args["priority"].as_u64().unwrap_or(10) as u8;
     let quota_turns = args["quota_turns"].as_u64().unwrap_or(10) as usize;
     let capabilities = parse_capabilities(args);
 
-    let allowed_tools = if let Some(tools_array) = args.get("allowed_tools").and_then(Value::as_array) {
-        let mut set = aios_kernel::FastSet::default();
-        for tool in tools_array {
-            if let Some(tool_name) = tool.as_str() {
-                set.insert(tool_name.to_string());
+    let allowed_tools =
+        if let Some(tools_array) = args.get("allowed_tools").and_then(Value::as_array) {
+            let mut set = aios_kernel::FastSet::default();
+            for tool in tools_array {
+                if let Some(tool_name) = tool.as_str() {
+                    set.insert(tool_name.to_string());
+                }
             }
-        }
-        Some(set)
-    } else {
-        None
-    };
+            Some(set)
+        } else {
+            None
+        };
 
     if let Ok(guard) = GLOBAL_OS.lock() {
         if let Some(os) = guard.as_ref() {
@@ -135,10 +140,13 @@ fn execute_spawn_process(args: &Value) -> Result<String, String> {
                 capabilities,
                 allowed_tools,
             )?;
-            return Ok(format!("Sub-process spawned successfully. PID: {}, Name: {}. The scheduler will execute it autonomously.", pid, name));
+            return Ok(format!(
+                "Sub-process spawned successfully. PID: {}, Name: {}. The scheduler will execute it autonomously.",
+                pid, name
+            ));
         }
     }
-    
+
     Err("OS Scheduler not initialized.".to_string())
 }
 
@@ -207,16 +215,21 @@ fn params_wait_process() -> Value {
 }
 
 fn execute_wait_process(args: &Value) -> Result<String, String> {
-    let pid = args["pid"].as_u64().ok_or("Missing or invalid 'pid' parameter.")?;
+    let pid = args["pid"]
+        .as_u64()
+        .ok_or("Missing or invalid 'pid' parameter.")?;
 
     if let Ok(guard) = GLOBAL_OS.lock() {
         if let Some(os) = guard.as_ref() {
             let mut os = os.lock().unwrap();
             os.wait_on(pid)?;
-            return Ok(format!("Current process suspended. Will be awakened when PID {} terminates. Note: Do not emit further output in this turn, just yield control.", pid));
+            return Ok(format!(
+                "Current process suspended. Will be awakened when PID {} terminates. Note: Do not emit further output in this turn, just yield control.",
+                pid
+            ));
         }
     }
-    
+
     Err("OS Scheduler not initialized.".to_string())
 }
 
@@ -249,7 +262,9 @@ fn params_kill_process() -> Value {
 }
 
 fn execute_kill_process(args: &Value) -> Result<String, String> {
-    let pid = args["pid"].as_u64().ok_or("Missing or invalid 'pid' parameter.")?;
+    let pid = args["pid"]
+        .as_u64()
+        .ok_or("Missing or invalid 'pid' parameter.")?;
     let reason = args["reason"]
         .as_str()
         .unwrap_or("terminated by parent process")
@@ -296,8 +311,12 @@ fn params_send_ipc() -> Value {
 }
 
 fn execute_send_ipc(args: &Value) -> Result<String, String> {
-    let pid = args["pid"].as_u64().ok_or("Missing or invalid 'pid' parameter.")?;
-    let message = args["message"].as_str().ok_or("Missing 'message' string parameter.")?;
+    let pid = args["pid"]
+        .as_u64()
+        .ok_or("Missing or invalid 'pid' parameter.")?;
+    let message = args["message"]
+        .as_str()
+        .ok_or("Missing 'message' string parameter.")?;
 
     if let Ok(guard) = GLOBAL_OS.lock() {
         if let Some(os) = guard.as_ref() {
@@ -306,7 +325,7 @@ fn execute_send_ipc(args: &Value) -> Result<String, String> {
             return Ok(format!("Message sent successfully to PID {}.", pid));
         }
     }
-    
+
     Err("OS Scheduler not initialized.".to_string())
 }
 
@@ -335,7 +354,9 @@ fn params_reap_process() -> Value {
 }
 
 fn execute_reap_process(args: &Value) -> Result<String, String> {
-    let pid = args["pid"].as_u64().ok_or("Missing or invalid 'pid' parameter.")?;
+    let pid = args["pid"]
+        .as_u64()
+        .ok_or("Missing or invalid 'pid' parameter.")?;
     if let Ok(guard) = GLOBAL_OS.lock() {
         if let Some(os) = guard.as_ref() {
             let mut os = os.lock().unwrap();
@@ -378,7 +399,7 @@ fn execute_read_mailbox(_args: &Value) -> Result<String, String> {
             }
         }
     }
-    
+
     Err("OS Scheduler not initialized.".to_string())
 }
 
@@ -445,10 +466,19 @@ fn execute_ps_processes(_args: &Value) -> Result<String, String> {
             if procs.is_empty() {
                 return Ok("No processes in the system.".to_string());
             }
-            let mut lines = vec!["PID   PPID   PGID  State       Pri  Quota  Used  Tools  Ticks  Daemon  Name".to_string()];
+            let mut lines = vec![
+                "PID   PPID   PGID  State       Pri  Quota  Used  Tools  Ticks  Daemon  Name"
+                    .to_string(),
+            ];
             for p in &procs {
-                let ppid = p.parent_pid.map(|id| id.to_string()).unwrap_or("-".to_string());
-                let pgid = p.process_group.map(|id| id.to_string()).unwrap_or("-".to_string());
+                let ppid = p
+                    .parent_pid
+                    .map(|id| id.to_string())
+                    .unwrap_or("-".to_string());
+                let pgid = p
+                    .process_group
+                    .map(|id| id.to_string())
+                    .unwrap_or("-".to_string());
                 let state = match &p.state {
                     aios_kernel::kernel::ProcessState::Ready => "Ready",
                     aios_kernel::kernel::ProcessState::Running => "Running",
@@ -457,9 +487,25 @@ fn execute_ps_processes(_args: &Value) -> Result<String, String> {
                     aios_kernel::kernel::ProcessState::Stopped => "Stopped",
                     aios_kernel::kernel::ProcessState::Terminated => "Term",
                 };
-                let daemon = if p.is_daemon { format!("{}({}/{})", "Y", p.restart_count, p.max_restarts) } else { "N".to_string() };
-                lines.push(format!("{:<5} {:<6} {:<5} {:<12} {:<4} {:<6} {:<5} {:<6} {:<6} {:<8} {}", 
-                    p.pid, ppid, pgid, state, p.priority, p.quota_turns, p.turns_used, p.tool_calls_used, p.created_at_tick, daemon, p.name));
+                let daemon = if p.is_daemon {
+                    format!("{}({}/{})", "Y", p.restart_count, p.max_restarts)
+                } else {
+                    "N".to_string()
+                };
+                lines.push(format!(
+                    "{:<5} {:<6} {:<5} {:<12} {:<4} {:<6} {:<5} {:<6} {:<6} {:<8} {}",
+                    p.pid,
+                    ppid,
+                    pgid,
+                    state,
+                    p.priority,
+                    p.quota_turns,
+                    p.turns_used,
+                    p.tool_calls_used,
+                    p.created_at_tick,
+                    daemon,
+                    p.name
+                ));
             }
             return Ok(lines.join("\n"));
         }
@@ -527,9 +573,7 @@ fn execute_ps_ipc(args: &Value) -> Result<String, String> {
 
             if channels.is_empty() {
                 return Ok(match (scope, only_hanging) {
-                    ("result_pipes", true) => {
-                        "No hanging result pipes in the system.".to_string()
-                    }
+                    ("result_pipes", true) => "No hanging result pipes in the system.".to_string(),
                     ("result_pipes", false) => "No result pipes in the system.".to_string(),
                     ("all", true) => "No hanging IPC channels in the system.".to_string(),
                     ("all", false) => "No IPC channels in the system.".to_string(),
@@ -599,22 +643,35 @@ fn params_signal_process() -> Value {
 }
 
 fn execute_signal_process(args: &Value) -> Result<String, String> {
-    let pid = args["pid"].as_u64().ok_or("Missing or invalid 'pid' parameter.")?;
-    let signal_str = args["signal"].as_str().ok_or("Missing 'signal' parameter.")?;
+    let pid = args["pid"]
+        .as_u64()
+        .ok_or("Missing or invalid 'pid' parameter.")?;
+    let signal_str = args["signal"]
+        .as_str()
+        .ok_or("Missing 'signal' parameter.")?;
     let signal = match signal_str.to_uppercase().as_str() {
         "SIGCANCEL" => aios_kernel::kernel::Signal::SigCancel,
         "SIGTERM" => aios_kernel::kernel::Signal::SigTerm,
         "SIGSTOP" => aios_kernel::kernel::Signal::SigStop,
         "SIGCONT" => aios_kernel::kernel::Signal::SigCont,
         "SIGKILL" => aios_kernel::kernel::Signal::SigKill,
-        other => return Err(format!("Unknown signal: {}. Valid signals: SIGCANCEL, SIGTERM, SIGSTOP, SIGCONT, SIGKILL", other)),
+        other => {
+            return Err(format!(
+                "Unknown signal: {}. Valid signals: SIGCANCEL, SIGTERM, SIGSTOP, SIGCONT, SIGKILL",
+                other
+            ));
+        }
     };
 
     if let Ok(guard) = GLOBAL_OS.lock() {
         if let Some(os) = guard.as_ref() {
             let mut os = os.lock().unwrap();
             os.signal_process(pid, signal)?;
-            return Ok(format!("Signal {} sent to process {}.", signal_str.to_uppercase(), pid));
+            return Ok(format!(
+                "Signal {} sent to process {}.",
+                signal_str.to_uppercase(),
+                pid
+            ));
         }
     }
     Err("OS not initialized.".to_string())
@@ -697,7 +754,12 @@ fn execute_signal_process_group(args: &Value) -> Result<String, String> {
         if let Some(os) = guard.as_ref() {
             let mut os = os.lock().unwrap();
             let count = os.signal_process_group(pgid, signal)?;
-            return Ok(format!("Signal {} sent to {} processes in group {}.", signal_str.to_uppercase(), count, pgid));
+            return Ok(format!(
+                "Signal {} sent to {} processes in group {}.",
+                signal_str.to_uppercase(),
+                count,
+                pgid
+            ));
         }
     }
     Err("OS not initialized.".to_string())
@@ -777,15 +839,16 @@ fn execute_shm_read(args: &Value) -> Result<String, String> {
                         key, owner_pid
                     ))
                 }
-                Err(aios_kernel::kernel::ShmReadError::Corrupted { expected_checksum, actual_checksum }) => {
-                    match os.shm_read_degraded(key) {
-                        Some(degraded) => Ok(degraded),
-                        None => Err(format!(
-                            "Data corrupted in shared memory key '{}' (expected: {:#x}, actual: {:#x}).",
-                            key, expected_checksum, actual_checksum
-                        )),
-                    }
-                }
+                Err(aios_kernel::kernel::ShmReadError::Corrupted {
+                    expected_checksum,
+                    actual_checksum,
+                }) => match os.shm_read_degraded(key) {
+                    Some(degraded) => Ok(degraded),
+                    None => Err(format!(
+                        "Data corrupted in shared memory key '{}' (expected: {:#x}, actual: {:#x}).",
+                        key, expected_checksum, actual_checksum
+                    )),
+                },
                 Err(aios_kernel::kernel::ShmReadError::OwnerTerminated { owner_pid }) => {
                     match os.shm_read_degraded(key) {
                         Some(degraded) => Ok(degraded),
@@ -953,7 +1016,10 @@ fn execute_spawn_daemon(args: &Value) -> Result<String, String> {
                 quota_turns,
                 max_restarts,
             )?;
-            return Ok(format!("Daemon process spawned. PID: {}, Name: {}, Max restarts: {}. Will auto-restart on termination.", pid, name, max_restarts));
+            return Ok(format!(
+                "Daemon process spawned. PID: {}, Name: {}, Max restarts: {}. Will auto-restart on termination.",
+                pid, name, max_restarts
+            ));
         }
     }
     Err("OS not initialized.".to_string())

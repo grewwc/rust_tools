@@ -8,11 +8,11 @@ use crate::commonw::configw;
 use rust_tools::commonw::FastMap;
 
 use super::{
+    TextSimilarityFeatures, UserIntent, build_idf_from_documents, cosine_tfidf_similarity,
     embedding::{
         document::SkillEmbeddingDocument,
         index::{SkillEmbeddingHit, SkillEmbeddingIndex},
     },
-    TextSimilarityFeatures, UserIntent, build_idf_from_documents, cosine_tfidf_similarity,
     intent_excludes_all_skills, normalize_text_for_similarity, skill_match_model,
 };
 
@@ -77,22 +77,26 @@ pub fn rank_skills_locally_with_model_path<'a>(
             Some(result) => probability_for_label(result, &skill.name),
             None => 0.0,
         };
-        let fallback_semantic_score = runtime_model.similarity(skill.name.as_str(), &query_features);
-        let (embedding_score, embedding_identity_score, embedding_capability_score, embedding_behavior_score) =
-            embedding_hits
-                .get(skill.name.as_str())
-                .map(|hit| {
-                    (
-                        hit.score,
-                        hit.identity_score,
-                        hit.capability_score,
-                        hit.behavior_score,
-                    )
-                })
-                .unwrap_or((0.0, 0.0, 0.0, 0.0));
-        let blended_score = embedding_score
-            .max(fallback_semantic_score)
-            + fallback_semantic_score * 0.3;
+        let fallback_semantic_score =
+            runtime_model.similarity(skill.name.as_str(), &query_features);
+        let (
+            embedding_score,
+            embedding_identity_score,
+            embedding_capability_score,
+            embedding_behavior_score,
+        ) = embedding_hits
+            .get(skill.name.as_str())
+            .map(|hit| {
+                (
+                    hit.score,
+                    hit.identity_score,
+                    hit.capability_score,
+                    hit.behavior_score,
+                )
+            })
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        let blended_score =
+            embedding_score.max(fallback_semantic_score) + fallback_semantic_score * 0.3;
         let none_score = match &model_probs {
             Some(result) => probability_for_label(result, SKILL_NONE_LABEL),
             None => 0.0,
@@ -243,7 +247,10 @@ fn semantic_score_for_skill(skill: &SkillManifest, input_lower: &str) -> f64 {
         .iter()
         .map(|doc| TextSimilarityFeatures::from_text(doc))
         .collect::<Vec<_>>();
-    let doc_refs = doc_features.iter().map(|doc| &doc.ngram_tf).collect::<Vec<_>>();
+    let doc_refs = doc_features
+        .iter()
+        .map(|doc| &doc.ngram_tf)
+        .collect::<Vec<_>>();
     let idf = build_idf_from_documents(&doc_refs);
     doc_features
         .iter()
@@ -290,7 +297,10 @@ mod tests {
     fn unknown_dynamic_skill_still_gets_runtime_model_score() {
         let skills = vec![
             skill("code-review", "Review code quality and bugs"),
-            skill("my-custom-slides", "生成幻灯片 PPT 演示文稿 slides presentation"),
+            skill(
+                "my-custom-slides",
+                "生成幻灯片 PPT 演示文稿 slides presentation",
+            ),
         ];
         let ranked = rank_skills_locally_with_model_path(
             &skills,
@@ -312,17 +322,17 @@ mod tests {
             "slides",
             "Create presentation artifacts, slide decks, PPT exports, and narrated reports",
         );
-        let skills = vec![
-            skill("code-review", "Review code quality and bugs"),
-            slide,
-        ];
+        let skills = vec![skill("code-review", "Review code quality and bugs"), slide];
         let ranked = rank_skills_locally_with_model_path(
             &skills,
             "帮我做一份 ppt 汇报",
             Some(&UserIntent::new(CoreIntent::RequestAction)),
             &skill_match_model::default_model_path(),
         );
-        assert_eq!(ranked.first().map(|item| item.skill.name.as_str()), Some("slides"));
+        assert_eq!(
+            ranked.first().map(|item| item.skill.name.as_str()),
+            Some("slides")
+        );
     }
 
     #[test]
@@ -379,5 +389,4 @@ mod tests {
         // 边界包含 CJK 也算合法分隔（因 CJK 不属于 ASCII word char）
         assert!(ascii_word_contains("跑 test 看一下", "test"));
     }
-
 }

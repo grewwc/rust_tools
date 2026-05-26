@@ -33,9 +33,17 @@ fn visit_node(
         }
         "namespace_definition" => {
             let name = name_from_field(node, "name", source)
-                .or_else(|| first_named_child_text(node, source, &["namespace_identifier", "identifier"]))
+                .or_else(|| {
+                    first_named_child_text(node, source, &["namespace_identifier", "identifier"])
+                })
                 .unwrap_or_else(|| "<anonymous>".to_string());
-            out.push(SymbolEntry::new("namespace", name, line(node), None, indent));
+            out.push(SymbolEntry::new(
+                "namespace",
+                name,
+                line(node),
+                None,
+                indent,
+            ));
             recurse_named(node, source, indent + 1, in_type, out);
         }
         "class_specifier" => {
@@ -90,19 +98,21 @@ fn recurse_named(
 
 fn extract_cpp_name(node: tree_sitter::Node<'_>, source: &str) -> Option<String> {
     node.child_by_field_name("declarator")
-        .and_then(|n| first_named_child_text(
-            n,
-            source,
-            &[
-                "identifier",
-                "field_identifier",
-                "qualified_identifier",
-                "scoped_identifier",
-                "operator_name",
-                "destructor_name",
-                "type_identifier",
-            ],
-        ))
+        .and_then(|n| {
+            first_named_child_text(
+                n,
+                source,
+                &[
+                    "identifier",
+                    "field_identifier",
+                    "qualified_identifier",
+                    "scoped_identifier",
+                    "operator_name",
+                    "destructor_name",
+                    "type_identifier",
+                ],
+            )
+        })
         .or_else(|| name_from_field(node, "name", source))
         .or_else(|| {
             first_named_child_text(

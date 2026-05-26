@@ -1,8 +1,4 @@
-use crate::ai::{
-    model_names, models,
-    provider::ReasoningEffort,
-    types::App,
-};
+use crate::ai::{model_names, models, provider::ReasoningEffort, types::App};
 
 fn print_model_help() {
     println!("Model commands:");
@@ -57,14 +53,12 @@ fn print_model_list(app: &App) {
             model.search_enabled.then_some("search"),
             model.tools_default_enabled.then_some("tools"),
             model.enable_thinking.then_some("thinking"),
-            model
-                .reasoning_effort
-                .map(|e| match e {
-                    ReasoningEffort::Minimal => "effort:minimal",
-                    ReasoningEffort::Low => "effort:low",
-                    ReasoningEffort::Medium => "effort:medium",
-                    ReasoningEffort::High => "effort:high",
-                }),
+            model.reasoning_effort.map(|e| match e {
+                ReasoningEffort::Minimal => "effort:minimal",
+                ReasoningEffort::Low => "effort:low",
+                ReasoningEffort::Medium => "effort:medium",
+                ReasoningEffort::High => "effort:high",
+            }),
         ]
         .into_iter()
         .flatten()
@@ -124,9 +118,16 @@ pub fn try_handle_model_command(
             println!("Search: {}", if def.search_enabled { "yes" } else { "no" });
             println!(
                 "Tools default enabled: {}",
-                if def.tools_default_enabled { "yes" } else { "no" }
+                if def.tools_default_enabled {
+                    "yes"
+                } else {
+                    "no"
+                }
             );
-            println!("Thinking: {}", if def.enable_thinking { "yes" } else { "no" });
+            println!(
+                "Thinking: {}",
+                if def.enable_thinking { "yes" } else { "no" }
+            );
             println!(
                 "Reasoning effort: {} (model default: {}, override: {})",
                 format_effort(effective_effort(app, &app.current_model)),
@@ -224,8 +225,16 @@ pub fn try_handle_model_command(
         "Capabilities: {}{}{}{}",
         if model.is_vl { "vl " } else { "" },
         if model.search_enabled { "search " } else { "" },
-        if model.tools_default_enabled { "tools " } else { "" },
-        if model.enable_thinking { "thinking" } else { "" },
+        if model.tools_default_enabled {
+            "tools "
+        } else {
+            ""
+        },
+        if model.enable_thinking {
+            "thinking"
+        } else {
+            ""
+        },
     );
     Ok(true)
 }
@@ -279,7 +288,9 @@ mod tests {
             last_skill_bias: None,
             os: crate::ai::driver::new_local_kernel(),
             agent_reload_counter: None,
-            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
+            observers: vec![Box::new(
+                crate::ai::driver::thinking::ThinkingOrchestrator::new(),
+            )],
         }
     }
 

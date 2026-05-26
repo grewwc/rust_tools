@@ -83,7 +83,11 @@ pub(super) fn build_terminal_preview(tool_name: &str, content: &str) -> String {
     if policy.summary_first {
         let mut preview = String::new();
         let mut kept = 0usize;
-        for line in content.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        for line in content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
             preview.push_str(line);
             preview.push('\n');
             kept += 1;

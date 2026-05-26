@@ -442,7 +442,7 @@ mod tests {
         c.add("a", 1);
         c.add("b", 2);
         c.add("c", 3);
-        
+
         let mut total = 0;
         for (_, &count) in c.iter() {
             total += count;

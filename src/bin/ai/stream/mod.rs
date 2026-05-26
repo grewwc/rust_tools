@@ -8,7 +8,10 @@ mod state;
 
 pub(super) use render::markdown::MarkdownStreamRenderer;
 
-use crate::ai::{request::StreamChunk, types::{App, StreamResult}};
+use crate::ai::{
+    request::StreamChunk,
+    types::{App, StreamResult},
+};
 
 pub(super) fn extract_chunk_text(
     chunk: &StreamChunk,

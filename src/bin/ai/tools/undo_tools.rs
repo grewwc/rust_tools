@@ -127,8 +127,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "undo_status",
-        description:
-            "Show the current undo/redo stack status, listing available undo and redo operations.",
+        description: "Show the current undo/redo stack status, listing available undo and redo operations.",
         parameters: params_undo_status,
         execute: execute_undo_status,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

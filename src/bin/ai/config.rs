@@ -20,11 +20,13 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     let compatible_api_key = cfg
         .get_opt(AiConfig::MODEL_COMPATIBLE_API_KEY)
         .unwrap_or_default();
-    let aliyun_api_key = cfg.get_opt(AiConfig::MODEL_ALIYUN_API_KEY).unwrap_or_default();
-    let openai_api_key = cfg.get_opt(AiConfig::MODEL_OPENAI_API_KEY).unwrap_or_default();
-    let endpoint = cfg
-        .get_opt(AiConfig::MODEL_ENDPOINT)
+    let aliyun_api_key = cfg
+        .get_opt(AiConfig::MODEL_ALIYUN_API_KEY)
         .unwrap_or_default();
+    let openai_api_key = cfg
+        .get_opt(AiConfig::MODEL_OPENAI_API_KEY)
+        .unwrap_or_default();
+    let endpoint = cfg.get_opt(AiConfig::MODEL_ENDPOINT).unwrap_or_default();
     let default_model =
         models::determine_model(&cfg.get_opt(AiConfig::MODEL_DEFAULT).unwrap_or_default());
     let default_endpoint = models::endpoint_for_model(&default_model, &endpoint);
@@ -56,14 +58,12 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(4000);
     let intent_model = cfg.get_opt(AiConfig::INTENT_MODEL);
-    let intent_model_path = cfg
-        .get_opt(AiConfig::INTENT_MODEL_PATH)
-        .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("src/bin/ai/config/intent/intent_model.json")
-                .display()
-                .to_string()
-        });
+    let intent_model_path = cfg.get_opt(AiConfig::INTENT_MODEL_PATH).unwrap_or_else(|| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/bin/ai/config/intent/intent_model.json")
+            .display()
+            .to_string()
+    });
     let agent_route_model_path = cfg
         .get_opt("ai.agents.auto_route.model_path")
         .unwrap_or_else(|| {

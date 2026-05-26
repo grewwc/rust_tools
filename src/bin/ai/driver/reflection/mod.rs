@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use crate::ai::{history::Message, types::App};
 use serde::{Deserialize, Serialize};
 
-pub(crate) use recall::{AutoRecalledKnowledge, RecallBundle};
 pub(crate) use background::assess_learning_note_quality;
+pub(crate) use recall::{AutoRecalledKnowledge, RecallBundle};
 
 pub(super) async fn maybe_append_self_reflection(
     app: &mut App,
@@ -92,8 +92,7 @@ pub(super) async fn maybe_write_back_project_knowledge(
     answer: &str,
     turn_messages: &Vec<Message>,
 ) {
-    writeback::maybe_write_back_project_knowledge(app, model, question, answer, turn_messages)
-        .await
+    writeback::maybe_write_back_project_knowledge(app, model, question, answer, turn_messages).await
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -162,9 +161,8 @@ impl LearningNoteAssessment {
 mod tests {
     use super::{
         assess_learning_note_quality, build_auto_recalled_knowledge_with_project,
-        build_persistent_guidelines,
-        gates::turn_uses_repo_inspection_tools, writeback::ProjectWritebackUpsert,
-        writeback::upsert_project_writeback_entry,
+        build_persistent_guidelines, gates::turn_uses_repo_inspection_tools,
+        writeback::ProjectWritebackUpsert, writeback::upsert_project_writeback_entry,
     };
     use crate::ai::history::Message;
     use crate::ai::test_support::ENV_LOCK;

@@ -2,8 +2,8 @@ use std::{
     fs::File,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -107,9 +107,7 @@ impl App {
         // Only dedup by name when the observer provides a non-default name.
         // "anonymous" is the trait's default fallback — multiple anonymous
         // observers are legitimate and must NOT be collapsed into one.
-        if new_name != "anonymous"
-            && self.observers.iter().any(|o| o.name() == new_name)
-        {
+        if new_name != "anonymous" && self.observers.iter().any(|o| o.name() == new_name) {
             return;
         }
         self.observers.push(observer);

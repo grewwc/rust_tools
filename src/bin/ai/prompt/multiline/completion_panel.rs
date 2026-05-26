@@ -391,11 +391,15 @@ mod tests {
         let status = apply_multiline_completion(&mut textarea, &mut pending, &mut panel).unwrap();
         assert!(status.contains("发现"));
         let items = panel.as_ref().map(|panel| panel.items.clone()).unwrap();
-        assert!(items
-            .iter()
-            .any(|item| item.replacement == format!("@{}", image.display())));
-        assert!(items
-            .iter()
-            .any(|item| item.replacement == format!("@{}", other.display())));
+        assert!(
+            items
+                .iter()
+                .any(|item| item.replacement == format!("@{}", image.display()))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.replacement == format!("@{}", other.display()))
+        );
     }
 }

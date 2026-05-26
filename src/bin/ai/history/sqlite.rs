@@ -206,7 +206,10 @@ pub(in crate::ai) fn append_history_sqlite_uncompacted(
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
-pub(in crate::ai) fn replace_all_messages_sqlite(path: &Path, messages: &[Message]) -> io::Result<()> {
+pub(in crate::ai) fn replace_all_messages_sqlite(
+    path: &Path,
+    messages: &[Message],
+) -> io::Result<()> {
     let mut conn = open_history_db(path)?;
     init_history_schema(&conn)?;
     let tx = conn
@@ -450,8 +453,7 @@ pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
         let Some(text) = message.content.as_str() else {
             continue;
         };
-        if text.starts_with("历史摘要（自动压缩")
-            || text.starts_with("对话摘要（自动压缩")
+        if text.starts_with("历史摘要（自动压缩") || text.starts_with("对话摘要（自动压缩")
         {
             return Ok(Some(message));
         }

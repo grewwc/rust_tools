@@ -20,7 +20,6 @@ macro_rules! lookup_match {
     };
 }
 
-
 fn is_control_word_boundary(s: &str, index: usize) -> bool {
     match s.get(index..) {
         Some(rest) => match rest.chars().next() {

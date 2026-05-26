@@ -38,8 +38,12 @@ fn visit_node(
             recurse_named(node, source, indent + 1, true, out);
         }
         "method_definition" => push_named(node, source, "method", indent, out),
-        "public_field_definition" | "field_definition" => push_named(node, source, "field", indent, out),
-        "lexical_declaration" | "variable_declaration" => recurse_named(node, source, indent, in_class, out),
+        "public_field_definition" | "field_definition" => {
+            push_named(node, source, "field", indent, out)
+        }
+        "lexical_declaration" | "variable_declaration" => {
+            recurse_named(node, source, indent, in_class, out)
+        }
         "variable_declarator" => {
             if let Some(name) = name_from_field(node, "name", source) {
                 out.push(SymbolEntry::new("var", name, line(node), None, indent));
@@ -70,7 +74,8 @@ fn push_named(
     out: &mut Vec<SymbolEntry>,
 ) {
     if let Some(name) = name_from_field(node, "name", source)
-        .or_else(|| first_named_child_text(node, source, &["property_identifier", "identifier"])) {
+        .or_else(|| first_named_child_text(node, source, &["property_identifier", "identifier"]))
+    {
         out.push(SymbolEntry::new(kind, name, line(node), None, indent));
     }
 }

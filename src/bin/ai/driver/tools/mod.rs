@@ -1,28 +1,31 @@
-use chrono::{DateTime, Duration, Local, Utc};
-use colored::Colorize;
-use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
-use serde_json::{Value, json};
-use serde::{Deserialize, Serialize};
-use std::fs;
-use std::error::Error;
-use std::path::Path;
-use std::sync::{LazyLock, Mutex, atomic::{AtomicU64, Ordering}};
-use std::thread;
-use std::time::{Duration as StdDuration, Instant, UNIX_EPOCH};
 use crate::ai::tools::os_tools::GLOBAL_OS;
+use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use aios_kernel::{
     kernel::{EventId, WaitPolicy},
     primitives::{ChannelId, ChannelOwnerTag, FutexAddr},
 };
+use chrono::{DateTime, Duration, Local, Utc};
+use colored::Colorize;
 use rust_tools::commonw::FastMap;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::error::Error;
+use std::fs;
+use std::path::Path;
+use std::sync::{
+    LazyLock, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use std::thread;
+use std::time::{Duration as StdDuration, Instant, UNIX_EPOCH};
 
 use crate::ai::{
     mcp::{McpClient, SharedMcpClient},
+    tools as builtin_tools,
     tools::task_tools::{
         WaitManySource, append_current_process_cancel_source, epoll_wait_many,
         wait_sources_for_channel_and_futex,
     },
-    tools as builtin_tools,
     types::{ToolCall, ToolResult},
 };
 use crate::commonw::prompt::prompt_yes_or_no_interruptible;
@@ -222,7 +225,12 @@ fn prune_completed_async_tools(registry: &mut FastMap<String, AsyncToolEntry>) {
     }
     let completed_keys: Vec<String> = registry
         .iter()
-        .filter(|(_, entry)| matches!(entry.state, AsyncToolState::Completed(_) | AsyncToolState::Canceled { .. }))
+        .filter(|(_, entry)| {
+            matches!(
+                entry.state,
+                AsyncToolState::Completed(_) | AsyncToolState::Canceled { .. }
+            )
+        })
         .map(|(key, _)| key.clone())
         .collect();
     for key in completed_keys {
@@ -572,19 +580,25 @@ impl AsyncToolPipeObserver {
             tool_name: self.tool_name.clone(),
             started_at: self.started_at,
             state: if run_result.ok {
-                AsyncToolState::Completed((ToolRoute::Builtin, RunOneResult {
-                    tool_result: run_result.tool_result.clone(),
-                    ok: run_result.ok,
-                    executed: run_result.executed,
-                    cached: run_result.cached,
-                }))
+                AsyncToolState::Completed((
+                    ToolRoute::Builtin,
+                    RunOneResult {
+                        tool_result: run_result.tool_result.clone(),
+                        ok: run_result.ok,
+                        executed: run_result.executed,
+                        cached: run_result.cached,
+                    },
+                ))
             } else {
-                AsyncToolState::Completed((ToolRoute::Builtin, RunOneResult {
-                    tool_result: run_result.tool_result.clone(),
-                    ok: run_result.ok,
-                    executed: run_result.executed,
-                    cached: run_result.cached,
-                }))
+                AsyncToolState::Completed((
+                    ToolRoute::Builtin,
+                    RunOneResult {
+                        tool_result: run_result.tool_result.clone(),
+                        ok: run_result.ok,
+                        executed: run_result.executed,
+                        cached: run_result.cached,
+                    },
+                ))
             },
         };
         let task_id = self.task_id.clone();
@@ -633,9 +647,7 @@ fn load_async_tool_snapshot(entry: &AsyncToolEntry) -> Option<AsyncToolSnapshot>
             .unwrap_or_else(|| "evt_unavailable".to_string()),
         session_id: messages.first()?.session_id.clone(),
         tool_name: messages.first()?.tool_name.clone(),
-        status: agg
-            .last_status
-            .unwrap_or_else(|| "running".to_string()),
+        status: agg.last_status.unwrap_or_else(|| "running".to_string()),
         ok: agg.ok,
         cached: agg.cached,
         executed: agg.executed,
@@ -760,7 +772,10 @@ fn collect_async_task_snapshot(
                         &agg,
                     );
                     if let Some(obj) = value.as_object_mut() {
-                        obj.insert("content".to_string(), json!(snapshot.content.unwrap_or_default()));
+                        obj.insert(
+                            "content".to_string(),
+                            json!(snapshot.content.unwrap_or_default()),
+                        );
                     }
                     terminal_results.push(value);
                 }
@@ -946,19 +961,16 @@ fn equivalent_tools(tool_name: &str) -> Option<&'static str> {
         "read_file" => Some("`read_file_lines` (line-range read), `code_search` (locate first)"),
         "read_file_lines" => Some("`read_file` (full file)"),
         // 代码/文本搜索链路
-        "code_search" => {
-            Some("`text_grep` (regex over files), `find_file` (filename glob)")
-        }
+        "code_search" => Some("`text_grep` (regex over files), `find_file` (filename glob)"),
         "text_grep" => Some("`code_search` (semantic), `find_file` (filename only)"),
         "find_file" => Some("`code_search` (semantic), `text_grep` (content)"),
         // shell 执行类
-        "execute_command" => {
-            Some("Break the command into smaller pieces, or read files directly with `read_file` instead of running shell to inspect them.")
-        }
+        "execute_command" => Some(
+            "Break the command into smaller pieces, or read files directly with `read_file` instead of running shell to inspect them.",
+        ),
         _ => None,
     }
 }
-
 
 fn format_tool_error(tool_call: &ToolCall, err: &str) -> ToolResult {
     ToolResult {
@@ -987,7 +999,13 @@ fn execute_prepared_tool_call(
             if tool_call.function.name == "task" {
                 sync_task::execute_sync_task(&tool_call.id, &prepared.args).map(|tr| tr)
             } else if tool_call.function.name == "tool_spawn" {
-                execute_tool_spawn(session_id, mcp_client, shared_mcp_client, &tool_call.id, &prepared.args)
+                execute_tool_spawn(
+                    session_id,
+                    mcp_client,
+                    shared_mcp_client,
+                    &tool_call.id,
+                    &prepared.args,
+                )
             } else if tool_call.function.name == "tool_wait" {
                 execute_tool_wait(session_id, &tool_call.id, &prepared.args)
             } else if tool_call.function.name == "tool_status" {
@@ -1044,7 +1062,10 @@ fn validate_spawnable_tool(target_tool_name: &str, route: &ToolRoute) -> Result<
             return Err("OAuth helper MCP tools cannot be spawned asynchronously.".to_string());
         }
         if matches!(target_tool_name, "tool_spawn" | "tool_wait" | "tool_status") {
-            return Err(format!("Tool '{}' cannot be spawned recursively.", target_tool_name));
+            return Err(format!(
+                "Tool '{}' cannot be spawned recursively.",
+                target_tool_name
+            ));
         }
         return Ok(());
     }
@@ -1061,7 +1082,10 @@ fn validate_spawnable_tool(target_tool_name: &str, route: &ToolRoute) -> Result<
     }
 
     if matches!(target_tool_name, "tool_spawn" | "tool_wait" | "tool_status") {
-        return Err(format!("Tool '{}' cannot be spawned recursively.", target_tool_name));
+        return Err(format!(
+            "Tool '{}' cannot be spawned recursively.",
+            target_tool_name
+        ));
     }
 
     Ok(())
@@ -1103,7 +1127,8 @@ fn execute_tool_spawn(
     let completion_futex_addr = create_async_tool_completion_futex(&async_task_id);
     let started_at = Instant::now();
 
-    if let Some(tool_result) = load_cached_tool_result(session_id, &synthetic_tool_call, &prepared.args)
+    if let Some(tool_result) =
+        load_cached_tool_result(session_id, &synthetic_tool_call, &prepared.args)
     {
         let run_result = RunOneResult {
             tool_result,
@@ -1183,7 +1208,10 @@ fn execute_tool_spawn(
                             content,
                         })
                     } else {
-                        execute_prepared_builtin_tool_call(&tool_call_for_thread, &prepared_for_thread)
+                        execute_prepared_builtin_tool_call(
+                            &tool_call_for_thread,
+                            &prepared_for_thread,
+                        )
                     }
                 }
                 ToolRoute::Mcp { .. } => {
@@ -1256,15 +1284,17 @@ fn execute_tool_spawn(
     })
 }
 
-fn execute_tool_status(session_id: &str, tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
-    let filter_task_ids = args
-        .get("task_ids")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect::<Vec<_>>()
-        });
+fn execute_tool_status(
+    session_id: &str,
+    tool_call_id: &str,
+    args: &Value,
+) -> Result<ToolResult, String> {
+    let filter_task_ids = args.get("task_ids").and_then(Value::as_array).map(|items| {
+        items
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect::<Vec<_>>()
+    });
 
     let mut results = Vec::new();
     {
@@ -1323,17 +1353,19 @@ fn execute_tool_status(session_id: &str, tool_call_id: &str, args: &Value) -> Re
                     entry.started_at.elapsed().as_secs_f64(),
                     &agg,
                 )),
-                AsyncToolState::Completed((_route, run_result)) => results.push(async_tool_result_json(
-                    &task_id,
-                    &entry.tool_name,
-                    if run_result.ok { "completed" } else { "failed" },
-                    Some(run_result.ok),
-                    Some(run_result.cached),
-                    Some(run_result.executed),
-                    None,
-                    entry.started_at.elapsed().as_secs_f64(),
-                    &agg,
-                )),
+                AsyncToolState::Completed((_route, run_result)) => {
+                    results.push(async_tool_result_json(
+                        &task_id,
+                        &entry.tool_name,
+                        if run_result.ok { "completed" } else { "failed" },
+                        Some(run_result.ok),
+                        Some(run_result.cached),
+                        Some(run_result.executed),
+                        None,
+                        entry.started_at.elapsed().as_secs_f64(),
+                        &agg,
+                    ))
+                }
                 AsyncToolState::Canceled { reason } => results.push(async_tool_result_json(
                     &task_id,
                     &entry.tool_name,
@@ -1355,7 +1387,11 @@ fn execute_tool_status(session_id: &str, tool_call_id: &str, args: &Value) -> Re
     })
 }
 
-fn execute_tool_cancel(session_id: &str, tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
+fn execute_tool_cancel(
+    session_id: &str,
+    tool_call_id: &str,
+    args: &Value,
+) -> Result<ToolResult, String> {
     let task_ids = args
         .get("task_ids")
         .and_then(Value::as_array)
@@ -1423,7 +1459,11 @@ fn execute_tool_cancel(session_id: &str, tool_call_id: &str, args: &Value) -> Re
     })
 }
 
-fn execute_tool_wait(session_id: &str, tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
+fn execute_tool_wait(
+    session_id: &str,
+    tool_call_id: &str,
+    args: &Value,
+) -> Result<ToolResult, String> {
     let task_ids = args
         .get("task_ids")
         .and_then(Value::as_array)
@@ -1457,7 +1497,11 @@ fn execute_tool_wait(session_id: &str, tool_call_id: &str, args: &Value) -> Resu
         let suggested_next_actions = if all_done {
             vec!["continue_reasoning"]
         } else if !initial_terminal.is_empty() {
-            vec!["continue_reasoning_with_partial_results", "use_tool_status", "use_tool_cancel"]
+            vec![
+                "continue_reasoning_with_partial_results",
+                "use_tool_status",
+                "use_tool_cancel",
+            ]
         } else {
             vec!["use_tool_status", "continue_reasoning", "use_tool_cancel"]
         };
@@ -1519,7 +1563,11 @@ fn execute_tool_wait(session_id: &str, tool_call_id: &str, args: &Value) -> Resu
     let max_wait_ms = args
         .get("max_wait_ms")
         .and_then(Value::as_u64)
-        .or_else(|| args.get("timeout_secs").and_then(Value::as_u64).map(|secs| secs.saturating_mul(1000)))
+        .or_else(|| {
+            args.get("timeout_secs")
+                .and_then(Value::as_u64)
+                .map(|secs| secs.saturating_mul(1000))
+        })
         .unwrap_or(1500);
     let deadline = Instant::now() + StdDuration::from_millis(max_wait_ms);
     while Instant::now() < deadline {
@@ -1535,7 +1583,9 @@ fn execute_tool_wait(session_id: &str, tool_call_id: &str, args: &Value) -> Resu
             }
             match entry.state {
                 AsyncToolState::Running => has_running = true,
-                AsyncToolState::Completed(_) | AsyncToolState::Canceled { .. } => has_terminal = true,
+                AsyncToolState::Completed(_) | AsyncToolState::Canceled { .. } => {
+                    has_terminal = true
+                }
             }
         }
         drop(registry);
@@ -1561,7 +1611,11 @@ fn execute_tool_wait(session_id: &str, tool_call_id: &str, args: &Value) -> Resu
     let suggested_next_actions = if all_done {
         vec!["continue_reasoning"]
     } else if !terminal_results.is_empty() {
-        vec!["continue_reasoning_with_partial_results", "use_tool_status", "use_tool_cancel"]
+        vec![
+            "continue_reasoning_with_partial_results",
+            "use_tool_status",
+            "use_tool_cancel",
+        ]
     } else {
         vec!["use_tool_status", "continue_reasoning", "use_tool_cancel"]
     };
@@ -1634,7 +1688,11 @@ fn should_retry_once(route: &ToolRoute, tool_name: &str, err: &str) -> bool {
         && tool_name != "execute_command"
 }
 
-fn execute_with_safe_retry<F>(route: &ToolRoute, tool_name: &str, mut exec: F) -> Result<ToolResult, String>
+fn execute_with_safe_retry<F>(
+    route: &ToolRoute,
+    tool_name: &str,
+    mut exec: F,
+) -> Result<ToolResult, String>
 where
     F: FnMut() -> Result<ToolResult, String>,
 {
@@ -1659,10 +1717,7 @@ fn finalize_execution_result(
     executed: bool,
     cached: bool,
 ) -> RunOneResult {
-    let failure_kind = result
-        .as_ref()
-        .err()
-        .map(|err| classify_tool_error(err));
+    let failure_kind = result.as_ref().err().map(|err| classify_tool_error(err));
     let run_result = match result {
         Ok(tool_result) => {
             if executed && !cached {
@@ -1685,7 +1740,10 @@ fn finalize_execution_result(
     if run_result.executed && !run_result.ok {
         // 仅统计会反映到"工具可靠性"的失败，避免把参数错误/用户取消
         // 错误地当作工具本身不稳定，导致路由/惩罚劣化。
-        if matches!(failure_kind, Some(ToolFailureKind::Transient | ToolFailureKind::Permanent)) {
+        if matches!(
+            failure_kind,
+            Some(ToolFailureKind::Transient | ToolFailureKind::Permanent)
+        ) {
             record_tool_failure(&tool_call.function.name);
         }
     }
@@ -1736,8 +1794,13 @@ fn run_one(
             if let Ok(os) = os_arc.lock() {
                 if let Some(current_pid) = os.current_process_id() {
                     if let Some(proc) = os.get_process(current_pid) {
-                        if !proc.allowed_tools.is_empty() && !proc.allowed_tools.contains(&tool_call.function.name) {
-                            let content = format!("Error: tool '{}' is not in the allowed whitelist for this process.", tool_call.function.name);
+                        if !proc.allowed_tools.is_empty()
+                            && !proc.allowed_tools.contains(&tool_call.function.name)
+                        {
+                            let content = format!(
+                                "Error: tool '{}' is not in the allowed whitelist for this process.",
+                                tool_call.function.name
+                            );
                             return (
                                 prepared.route,
                                 RunOneResult {
@@ -1795,7 +1858,8 @@ fn run_one(
             observer,
         )
     });
-    let run_result = finalize_execution_result(session_id, tool_call, &prepared, result, true, false);
+    let run_result =
+        finalize_execution_result(session_id, tool_call, &prepared, result, true, false);
 
     (prepared.route, run_result)
 }
@@ -1809,10 +1873,22 @@ pub(super) fn execute_tool_calls(
 ) -> Result<ExecuteToolCallsResult, Box<dyn Error>> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return tokio::task::block_in_place(|| {
-            execute_tool_calls_inner(session_id, mcp_client, shared_mcp_client, tool_calls, observer)
+            execute_tool_calls_inner(
+                session_id,
+                mcp_client,
+                shared_mcp_client,
+                tool_calls,
+                observer,
+            )
         });
     }
-    execute_tool_calls_inner(session_id, mcp_client, shared_mcp_client, tool_calls, observer)
+    execute_tool_calls_inner(
+        session_id,
+        mcp_client,
+        shared_mcp_client,
+        tool_calls,
+        observer,
+    )
 }
 
 fn execute_tool_calls_inner(
@@ -1837,8 +1913,13 @@ fn execute_tool_calls_inner(
 
         let tool_call = &tool_calls[idx];
         let is_last = idx + 1 >= tool_calls.len();
-        let (route, run_result) =
-            run_one(mcp_client, shared_mcp_client, session_id, tool_call, &mut observer);
+        let (route, run_result) = run_one(
+            mcp_client,
+            shared_mcp_client,
+            session_id,
+            tool_call,
+            &mut observer,
+        );
         let should_barrier = barrier::should_barrier_after(
             &route,
             tool_call,
@@ -1885,7 +1966,11 @@ fn notify_tool_finished(
     }
 }
 
-fn load_cached_tool_result(session_id: &str, tool_call: &ToolCall, args: &Value) -> Option<ToolResult> {
+fn load_cached_tool_result(
+    session_id: &str,
+    tool_call: &ToolCall,
+    args: &Value,
+) -> Option<ToolResult> {
     if !is_cacheable_tool_name(&tool_call.function.name) {
         return None;
     }
@@ -1932,7 +2017,12 @@ fn is_tool_cache_entry_fresh(entry: &AgentMemoryEntry) -> bool {
     Utc::now().signed_duration_since(timestamp) <= Duration::minutes(TOOL_CACHE_TTL_MINUTES)
 }
 
-fn store_tool_cache_result(session_id: &str, tool_call: &ToolCall, args: &Value, tool_result: &ToolResult) {
+fn store_tool_cache_result(
+    session_id: &str,
+    tool_call: &ToolCall,
+    args: &Value,
+    tool_result: &ToolResult,
+) {
     if !is_cacheable_tool_name(&tool_call.function.name) {
         return;
     }
@@ -1968,9 +2058,26 @@ fn store_tool_cache_result(session_id: &str, tool_call: &ToolCall, args: &Value,
 fn is_cacheable_tool_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let mutating = [
-        "create", "delete", "remove", "update", "write", "save", "append", "insert",
-        "rename", "move", "install", "run", "execute", "oauth", "open_browser",
-        "report_event", "memory", "kill_terminal", "edit", "apply_patch",
+        "create",
+        "delete",
+        "remove",
+        "update",
+        "write",
+        "save",
+        "append",
+        "insert",
+        "rename",
+        "move",
+        "install",
+        "run",
+        "execute",
+        "oauth",
+        "open_browser",
+        "report_event",
+        "memory",
+        "kill_terminal",
+        "edit",
+        "apply_patch",
     ];
     if mutating.iter().any(|needle| lower.contains(needle)) {
         return false;
@@ -1995,7 +2102,10 @@ fn tool_cache_validation_matches(payload: &ToolCachePayload) -> bool {
     current == payload.file_fingerprints
 }
 
-fn collect_tool_cache_file_fingerprints(tool_name: &str, args: &Value) -> Vec<CachedFileFingerprint> {
+fn collect_tool_cache_file_fingerprints(
+    tool_name: &str,
+    args: &Value,
+) -> Vec<CachedFileFingerprint> {
     let path = match tool_name {
         "read_file" | "read_file_lines" => args
             .get("file_path")
@@ -2003,7 +2113,9 @@ fn collect_tool_cache_file_fingerprints(tool_name: &str, args: &Value) -> Vec<Ca
             .and_then(Value::as_str),
         _ => None,
     };
-    path.and_then(cached_file_fingerprint_for_path).into_iter().collect()
+    path.and_then(cached_file_fingerprint_for_path)
+        .into_iter()
+        .collect()
 }
 
 fn cached_file_fingerprint_for_path(path: &str) -> Option<CachedFileFingerprint> {
@@ -2035,23 +2147,21 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_async_tool_pipe_messages, async_tool_pipe_message_from_final,
-        async_tool_pipe_message_from_started, async_tool_pipe_message_from_stream,
-        build_tool_cache_key, collect_tool_cache_file_fingerprints, delete_async_tool_snapshot,
-        classify_tool_error, is_cacheable_tool_name, is_tool_cache_entry_fresh,
-        load_async_tool_snapshot,
-        execute_with_safe_retry,
-        lookup_wait_sources, tool_cache_validation_matches, CachedFileFingerprint,
-        ToolCachePayload, ToolFailureKind, should_retry_once,
-        persist_async_tool_snapshot, send_async_tool_pipe_message,
-        stream_preview_from_aggregate, AsyncToolEntry, AsyncToolPipeKind, AsyncToolPipeMessage,
-        AsyncToolState, RunOneResult, ToolRoute, ASYNC_TOOL_REGISTRY, TOOL_CACHE_TTL_MINUTES,
+        ASYNC_TOOL_REGISTRY, AsyncToolEntry, AsyncToolPipeKind, AsyncToolPipeMessage,
+        AsyncToolState, CachedFileFingerprint, RunOneResult, TOOL_CACHE_TTL_MINUTES,
+        ToolCachePayload, ToolFailureKind, ToolRoute, aggregate_async_tool_pipe_messages,
+        async_tool_pipe_message_from_final, async_tool_pipe_message_from_started,
+        async_tool_pipe_message_from_stream, build_tool_cache_key, classify_tool_error,
+        collect_tool_cache_file_fingerprints, delete_async_tool_snapshot, execute_with_safe_retry,
+        is_cacheable_tool_name, is_tool_cache_entry_fresh, load_async_tool_snapshot,
+        lookup_wait_sources, persist_async_tool_snapshot, send_async_tool_pipe_message,
+        should_retry_once, stream_preview_from_aggregate, tool_cache_validation_matches,
     };
-    use aios_kernel::{kernel::EventId, primitives::ChannelId};
-    use crate::ai::tools::task_tools::WaitManySource;
     use crate::ai::tools::registry::common::current_process_tool_cancel_futex;
-    use crate::ai::types::{FunctionCall, ToolCall};
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
+    use crate::ai::tools::task_tools::WaitManySource;
+    use crate::ai::types::{FunctionCall, ToolCall};
+    use aios_kernel::{kernel::EventId, primitives::ChannelId};
     use chrono::{Duration, Utc};
     use serde_json::json;
     use std::fs;
@@ -2146,14 +2256,26 @@ mod tests {
             server_name: "demo".to_string(),
             tool_name: "read_file".to_string(),
         };
-        assert!(should_retry_once(&builtin, "read_file", "timeout while reading"));
+        assert!(should_retry_once(
+            &builtin,
+            "read_file",
+            "timeout while reading"
+        ));
         assert!(!should_retry_once(
             &builtin,
             "execute_command",
             "timeout while reading"
         ));
-        assert!(!should_retry_once(&builtin, "create_file", "timeout while writing"));
-        assert!(!should_retry_once(&mcp, "read_file", "timeout while reading"));
+        assert!(!should_retry_once(
+            &builtin,
+            "create_file",
+            "timeout while writing"
+        ));
+        assert!(!should_retry_once(
+            &mcp,
+            "read_file",
+            "timeout while reading"
+        ));
     }
 
     #[test]
@@ -2221,7 +2343,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        path.push(format!("rust_tools_{name}_{}_{}", std::process::id(), nanos));
+        path.push(format!(
+            "rust_tools_{name}_{}_{}",
+            std::process::id(),
+            nanos
+        ));
         path
     }
 
@@ -2287,12 +2413,14 @@ mod tests {
         let (_guard, kernel, root) = setup_async_tool_kernel();
         let channel_id = {
             let mut os = kernel.lock().unwrap();
-            os.channel_create(Some(root), 1, "async-tool-test".to_string()).raw()
+            os.channel_create(Some(root), 1, "async-tool-test".to_string())
+                .raw()
         };
         let entry = sample_completed_entry(Some(channel_id));
 
         persist_async_tool_snapshot("tooltask_1", &entry);
-        let snapshot = load_async_tool_snapshot(&entry).expect("snapshot should be readable via channel");
+        let snapshot =
+            load_async_tool_snapshot(&entry).expect("snapshot should be readable via channel");
         assert_eq!(snapshot.task_id, "tooltask_1");
         assert_eq!(snapshot.status, "completed");
         assert_eq!(snapshot.content.as_deref(), Some("payload"));
@@ -2327,24 +2455,31 @@ mod tests {
 
         let wait_sources = {
             let mut os = kernel.lock().unwrap();
-            lookup_wait_sources(os.as_mut(), "sess-lookup", &["tooltask_lookup".to_string()]).unwrap()
+            lookup_wait_sources(os.as_mut(), "sess-lookup", &["tooltask_lookup".to_string()])
+                .unwrap()
         };
         let cancel_futex = {
             let mut os = kernel.lock().unwrap();
-            current_process_tool_cancel_futex(os.as_mut()).unwrap().unwrap()
+            current_process_tool_cancel_futex(os.as_mut())
+                .unwrap()
+                .unwrap()
         };
         assert_eq!(
             wait_sources,
             vec![
                 WaitManySource::Channel(channel_id),
-                WaitManySource::Event(EventId::new(
-                    {
-                        let os = kernel.lock().unwrap();
-                        os.channel_event_id(ChannelId(channel_id)).unwrap().as_u64()
-                    }
-                )),
-                WaitManySource::Futex { addr: futex_addr, expected: 0 },
-                WaitManySource::Futex { addr: cancel_futex, expected: 0 },
+                WaitManySource::Event(EventId::new({
+                    let os = kernel.lock().unwrap();
+                    os.channel_event_id(ChannelId(channel_id)).unwrap().as_u64()
+                })),
+                WaitManySource::Futex {
+                    addr: futex_addr,
+                    expected: 0
+                },
+                WaitManySource::Futex {
+                    addr: cancel_futex,
+                    expected: 0
+                },
             ]
         );
     }
@@ -2400,7 +2535,10 @@ mod tests {
         assert_eq!(agg.stream_chunk_count, 1);
         assert_eq!(agg.final_content.as_deref(), Some("hello world"));
         assert_eq!(agg.last_status.as_deref(), Some("completed"));
-        assert_eq!(stream_preview_from_aggregate(&agg).as_deref(), Some("hello "));
+        assert_eq!(
+            stream_preview_from_aggregate(&agg).as_deref(),
+            Some("hello ")
+        );
     }
 
     #[test]
@@ -2408,7 +2546,8 @@ mod tests {
         let (_guard, kernel, root) = setup_async_tool_kernel();
         let channel_id = {
             let mut os = kernel.lock().unwrap();
-            os.channel_create(Some(root), 8, "async-tool-pipe".to_string()).raw()
+            os.channel_create(Some(root), 8, "async-tool-pipe".to_string())
+                .raw()
         };
         let entry = AsyncToolEntry {
             result_channel_id: Some(channel_id),
@@ -2419,7 +2558,10 @@ mod tests {
             state: AsyncToolState::Running,
         };
 
-        send_async_tool_pipe_message(&entry, &async_tool_pipe_message_from_started("tooltask_stream", &entry, 0));
+        send_async_tool_pipe_message(
+            &entry,
+            &async_tool_pipe_message_from_started("tooltask_stream", &entry, 0),
+        );
         send_async_tool_pipe_message(
             &entry,
             &async_tool_pipe_message_from_stream("tooltask_stream", &entry, 1, b"partial "),
@@ -2444,7 +2586,8 @@ mod tests {
             &async_tool_pipe_message_from_final("tooltask_stream", &final_entry, 2),
         );
 
-        let snapshot = load_async_tool_snapshot(&final_entry).expect("snapshot should decode from pipe");
+        let snapshot =
+            load_async_tool_snapshot(&final_entry).expect("snapshot should decode from pipe");
         assert_eq!(snapshot.status, "completed");
         assert_eq!(snapshot.content.as_deref(), Some("partial final"));
     }
@@ -2454,7 +2597,8 @@ mod tests {
         let (_guard, kernel, root) = setup_async_tool_kernel();
         let channel_id = {
             let mut os = kernel.lock().unwrap();
-            os.channel_create(Some(root), 4, "async-tool-destroy".to_string()).raw()
+            os.channel_create(Some(root), 4, "async-tool-destroy".to_string())
+                .raw()
         };
         let entry = sample_completed_entry(Some(channel_id));
         persist_async_tool_snapshot("tooltask_destroy", &entry);

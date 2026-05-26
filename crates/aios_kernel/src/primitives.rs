@@ -161,7 +161,11 @@ impl TraceRecord {
 
     /// 把可能为空的 fields HashMap 装箱为存储形态：空集合归 None。
     pub(super) fn pack_fields(fields: FastMap<String, String>) -> Option<FastMap<String, String>> {
-        if fields.is_empty() { None } else { Some(fields) }
+        if fields.is_empty() {
+            None
+        } else {
+            Some(fields)
+        }
     }
 }
 

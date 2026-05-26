@@ -21,7 +21,12 @@ pub(crate) fn extract(_file_path: &str, content: &str) -> Result<Vec<SymbolEntry
     Ok(symbols)
 }
 
-fn visit_node(node: tree_sitter::Node<'_>, source: &str, indent: usize, out: &mut Vec<SymbolEntry>) {
+fn visit_node(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    indent: usize,
+    out: &mut Vec<SymbolEntry>,
+) {
     match node.kind() {
         "function_item" => {
             if let Some(name) = name_from_field(node, "name", source) {
@@ -43,13 +48,20 @@ fn visit_node(node: tree_sitter::Node<'_>, source: &str, indent: usize, out: &mu
         "static_item" => push_named(node, source, "static", indent, out),
         "macro_definition" => {
             if let Some(name) = name_from_field(node, "name", source)
-                .or_else(|| first_named_child_text(node, source, &["identifier"])) {
+                .or_else(|| first_named_child_text(node, source, &["identifier"]))
+            {
                 out.push(SymbolEntry::new("macro", name, line(node), None, indent));
             }
         }
         "impl_item" => {
             let target = impl_target(node, source);
-            out.push(SymbolEntry::new("impl", target, line(node), impl_detail(node, source), indent));
+            out.push(SymbolEntry::new(
+                "impl",
+                target,
+                line(node),
+                impl_detail(node, source),
+                indent,
+            ));
             recurse_named(node, source, indent + 1, out);
         }
         "declaration_list" => {
@@ -57,7 +69,13 @@ fn visit_node(node: tree_sitter::Node<'_>, source: &str, indent: usize, out: &mu
         }
         "associated_type" => {
             if let Some(name) = name_from_field(node, "name", source) {
-                out.push(SymbolEntry::new("assoc type", name, line(node), None, indent));
+                out.push(SymbolEntry::new(
+                    "assoc type",
+                    name,
+                    line(node),
+                    None,
+                    indent,
+                ));
             }
         }
         "function_signature_item" => {
@@ -119,7 +137,9 @@ fn push_named(
 fn impl_target(node: tree_sitter::Node<'_>, source: &str) -> String {
     node.child_by_field_name("type")
         .and_then(|n| text_for_node(n, source))
-        .or_else(|| first_named_child_text(node, source, &["type_identifier", "scoped_type_identifier"]))
+        .or_else(|| {
+            first_named_child_text(node, source, &["type_identifier", "scoped_type_identifier"])
+        })
         .unwrap_or_else(|| "<unknown>".to_string())
 }
 

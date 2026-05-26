@@ -236,7 +236,9 @@ fn strip_inline_md_markers(s: &str) -> String {
             let delim = if is_double { "$$" } else { "$" };
             if math {
                 if delim == math_delim {
-                    out.push_str(&crate::ai::stream::render_math_tex_to_unicode(math_buf.trim()));
+                    out.push_str(&crate::ai::stream::render_math_tex_to_unicode(
+                        math_buf.trim(),
+                    ));
                     math_buf.clear();
                     math = false;
                     i += delim.len();
@@ -258,7 +260,9 @@ fn strip_inline_md_markers(s: &str) -> String {
         i += ch.len_utf8();
     }
     if math && !math_buf.is_empty() {
-        out.push_str(&crate::ai::stream::render_math_tex_to_unicode(math_buf.trim()));
+        out.push_str(&crate::ai::stream::render_math_tex_to_unicode(
+            math_buf.trim(),
+        ));
     }
     out
 }

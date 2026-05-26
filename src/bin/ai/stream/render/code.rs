@@ -89,7 +89,10 @@ fn classify_identifier_color(ident: &str, lang: Option<&str>) -> &'static str {
     if is_type_like(ident, lang) {
         return MONOKAI_TYPE;
     }
-    if matches!(ident, "true" | "false" | "nil" | "null" | "None" | "nullptr") {
+    if matches!(
+        ident,
+        "true" | "false" | "nil" | "null" | "None" | "nullptr"
+    ) {
         return MONOKAI_NUMBER;
     }
     MONOKAI_IDENT
@@ -106,32 +109,77 @@ const PYTHON_KEYWORDS: &[&str] = &[
 ];
 
 const GO_KEYWORDS: &[&str] = &[
-    "case", "chan", "const", "default", "defer", "else", "fallthrough", "for", "func", "go",
-    "if", "import", "interface", "map", "package", "range", "return", "select", "struct",
-    "switch", "type", "var",
+    "case",
+    "chan",
+    "const",
+    "default",
+    "defer",
+    "else",
+    "fallthrough",
+    "for",
+    "func",
+    "go",
+    "if",
+    "import",
+    "interface",
+    "map",
+    "package",
+    "range",
+    "return",
+    "select",
+    "struct",
+    "switch",
+    "type",
+    "var",
 ];
 
 const CPP_KEYWORDS: &[&str] = &[
-    "auto", "case", "class", "const", "constexpr", "default", "delete", "else", "enum", "for",
-    "if", "inline", "namespace", "new", "private", "protected", "public", "return", "struct",
-    "switch", "template", "typedef", "typename", "using", "virtual", "void", "while",
+    "auto",
+    "case",
+    "class",
+    "const",
+    "constexpr",
+    "default",
+    "delete",
+    "else",
+    "enum",
+    "for",
+    "if",
+    "inline",
+    "namespace",
+    "new",
+    "private",
+    "protected",
+    "public",
+    "return",
+    "struct",
+    "switch",
+    "template",
+    "typedef",
+    "typename",
+    "using",
+    "virtual",
+    "void",
+    "while",
 ];
 
 const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "else", "enum", "extern",
-    "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
-    "ref", "return", "Self", "self", "static", "struct", "super", "trait", "type", "unsafe",
-    "use", "where", "while",
+    "as", "async", "await", "break", "const", "continue", "crate", "else", "enum", "extern", "fn",
+    "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+    "return", "Self", "self", "static", "struct", "super", "trait", "type", "unsafe", "use",
+    "where", "while",
 ];
 
 const PYTHON_TYPES: &[&str] = &["bool", "dict", "float", "int", "list", "str", "tuple"];
-const GO_TYPES: &[&str] = &["bool", "byte", "error", "int", "int64", "rune", "string", "uint64"];
+const GO_TYPES: &[&str] = &[
+    "bool", "byte", "error", "int", "int64", "rune", "string", "uint64",
+];
 const CPP_TYPES: &[&str] = &[
     "bool", "char", "double", "float", "int", "long", "short", "size_t", "std", "string",
 ];
 const RUST_TYPES: &[&str] = &[
-    "Option", "Result", "Self", "String", "Vec", "bool", "char", "f32", "f64", "i16", "i32",
-    "i64", "i8", "isize", "str", "u16", "u32", "u64", "u8", "usize",
+    "Option", "Result", "Self", "String", "Vec", "bool", "char", "f32", "f64", "i16", "i32", "i64",
+    "i8", "isize", "str", "u16", "u32", "u64", "u8", "usize",
 ];
 
 fn is_keyword(ident: &str, lang: Option<&str>) -> bool {
@@ -291,7 +339,10 @@ mod tests {
 
     #[test]
     fn test_parse_py_alias() {
-        assert_eq!(parse_code_block_language("~~~py"), Some("python".to_string()));
+        assert_eq!(
+            parse_code_block_language("~~~py"),
+            Some("python".to_string())
+        );
     }
 
     #[test]
@@ -430,7 +481,11 @@ mod tests {
     fn test_highlight_no_double_color_leak() {
         let out = highlight_code_line("fn main() {}", Some("rust"));
         let reset_count = out.matches(MONOKAI_DEFAULT).count();
-        assert!(reset_count >= 2, "expected multiple resets, got {}", reset_count);
+        assert!(
+            reset_count >= 2,
+            "expected multiple resets, got {}",
+            reset_count
+        );
     }
 
     #[test]

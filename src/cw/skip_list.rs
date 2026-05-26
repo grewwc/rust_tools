@@ -619,8 +619,8 @@ where
         }
     }
 
-    pub fn diff(&mut self, other: &Self){
-        for e in other.iter(){
+    pub fn diff(&mut self, other: &Self) {
+        for e in other.iter() {
             self.remove(e);
         }
     }

@@ -65,7 +65,9 @@ impl SkillEmbeddingIndex {
             });
         }
 
-        let store = Arc::new(VectorStore::with_global_provider(&default_skill_index_path())?);
+        let store = Arc::new(VectorStore::with_global_provider(
+            &default_skill_index_path(),
+        )?);
         sync_documents(&store, documents)?;
         let snapshot = Arc::new(load_snapshot(&store)?);
 
@@ -187,10 +189,7 @@ fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
-fn sync_documents(
-    store: &VectorStore,
-    documents: &[SkillEmbeddingDocument],
-) -> Result<(), String> {
+fn sync_documents(store: &VectorStore, documents: &[SkillEmbeddingDocument]) -> Result<(), String> {
     let mut desired_ids: FastSet<String> = FastSet::default();
     let mut texts_to_embed: Vec<(String, VectorEntry)> = Vec::new();
 
@@ -218,9 +217,7 @@ fn sync_documents(
     }
 
     for id in store.list_ids()? {
-        if id.starts_with("skill-routing:")
-            && !desired_ids.contains(&id)
-        {
+        if id.starts_with("skill-routing:") && !desired_ids.contains(&id) {
             let _ = store.delete(&id)?;
         }
     }
@@ -287,7 +284,10 @@ fn parse_skill_entry(entry: &VectorEntry) -> Option<(String, SkillEmbeddingDocum
     Some((skill_name, section))
 }
 
-fn skill_section_id(doc: &SkillEmbeddingDocument, section: SkillEmbeddingDocumentSection) -> String {
+fn skill_section_id(
+    doc: &SkillEmbeddingDocument,
+    section: SkillEmbeddingDocumentSection,
+) -> String {
     format!("skill-routing:{}:{}", doc.source_key, section_name(section))
 }
 
@@ -318,10 +318,7 @@ fn cached_embed(store: &VectorStore, text: &str) -> Result<Vec<f32>, String> {
 }
 
 fn normalize_cache_key(text: &str) -> String {
-    let normalized: String = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let normalized: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.chars().count() > 256 {
         normalized.chars().take(256).collect()
     } else {

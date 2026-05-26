@@ -1,6 +1,6 @@
 use crate::{matcher, output};
-use rust_tools::{strw::indices::substring_quiet, terminalw};
 use rust_tools::cw::SkipSet;
+use rust_tools::{strw::indices::substring_quiet, terminalw};
 use std::{
     fs::File,
     io::{BufRead, BufReader},

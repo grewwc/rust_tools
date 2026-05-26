@@ -300,11 +300,11 @@ pub(super) fn compute_table_widths(
                     max_idx = i;
                 }
             }
-            
+
             if max_w <= min_w {
                 break; // Cannot reduce further
             }
-            
+
             widths[max_idx] -= 1;
             excess -= 1;
         }
@@ -485,8 +485,8 @@ fn raw_cols() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::test_support::ENV_LOCK;
     use crate::ai::stream::render::inline::visible_width;
+    use crate::ai::test_support::ENV_LOCK;
 
     #[test]
     fn parse_table_row_ignores_embedded_pipes() {
@@ -521,14 +521,14 @@ mod tests {
         let w1 = visible_width("🌧️天气");
         let w2 = visible_width("💧湿度");
         let w3 = visible_width("🍃空气质量");
-        
+
         assert_eq!(w1, 5); // 1 + 2 + 2
         assert_eq!(w2, 6); // 2 + 2 + 2
         assert_eq!(w3, 10); // 2 + 2 + 2 + 2 + 2
-        
+
         let p1 = pad_cell("🌧️天气", 10, TableAlign::Left);
         let p2 = pad_cell("💧湿度", 10, TableAlign::Left);
-        
+
         assert_eq!(p1, "🌧️天气     "); // padded 5 spaces
         assert_eq!(p2, "💧湿度    "); // padded 4 spaces
     }

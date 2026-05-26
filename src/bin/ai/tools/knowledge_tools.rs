@@ -24,7 +24,7 @@ use serde_json::Value;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
-use crate::ai::tools::storage::rag_store::{ensure_rag_store, get_rag_store, RagEntry};
+use crate::ai::tools::storage::rag_store::{RagEntry, ensure_rag_store, get_rag_store};
 
 /// 32 字符短指纹（取 SHA-256 前 16 字节）。
 fn short_rag_id(bytes: &[u8]) -> String {
@@ -289,8 +289,7 @@ fn execute_knowledge_search(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_search",
-        description:
-            "Search knowledge base entries by keyword. Returns matching entries with their ids.",
+        description: "Search knowledge base entries by keyword. Returns matching entries with their ids.",
         parameters: params_knowledge_search,
         execute: execute_knowledge_search,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
@@ -397,38 +396,46 @@ mod tests {
     #[test]
     fn test_knowledge_save_params() {
         let params = params_knowledge_save();
-        assert!(params["required"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::String("content".to_string())));
+        assert!(
+            params["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("content".to_string()))
+        );
         assert!(params["properties"]["content"].is_object());
     }
 
     #[test]
     fn test_knowledge_forget_params() {
         let params = params_knowledge_forget();
-        assert!(params["required"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::String("id".to_string())));
+        assert!(
+            params["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("id".to_string()))
+        );
     }
 
     #[test]
     fn test_knowledge_search_params() {
         let params = params_knowledge_search();
-        assert!(params["required"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::String("query".to_string())));
+        assert!(
+            params["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("query".to_string()))
+        );
     }
 
     #[test]
     fn test_knowledge_list_params() {
         let params = params_knowledge_list();
         // limit is optional, so no required
-        assert!(params["required"]
-            .as_array()
-            .map(|a| a.is_empty())
-            .unwrap_or(true));
+        assert!(
+            params["required"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(true)
+        );
     }
 }

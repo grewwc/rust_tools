@@ -104,7 +104,11 @@ where
         }
 
         let key = Arc::new(k);
-        let new_node = Arc::new(Mutex::new(Node::new(key.clone(), v, self.calc_expires_at(now))));
+        let new_node = Arc::new(Mutex::new(Node::new(
+            key.clone(),
+            v,
+            self.calc_expires_at(now),
+        )));
         if self.len == self.cap {
             if let Some(removed) = self.remove_tail_node() {
                 if let Some(rkey) = removed.lock().unwrap().key.clone() {
@@ -285,10 +289,7 @@ where
     }
 
     fn remove_node(&mut self, node: Arc<Mutex<Node<K, V>>>) {
-        if self.len == 0
-            || Arc::ptr_eq(&node, &self.head)
-            || Arc::ptr_eq(&node, &self.tail)
-        {
+        if self.len == 0 || Arc::ptr_eq(&node, &self.head) || Arc::ptr_eq(&node, &self.tail) {
             return;
         }
         let key = node.lock().unwrap().key.clone();

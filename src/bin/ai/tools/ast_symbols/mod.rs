@@ -90,7 +90,11 @@ pub(crate) fn text_for_node(node: tree_sitter::Node<'_>, source: &str) -> Option
         .filter(|s| !s.is_empty())
 }
 
-pub(crate) fn name_from_field(node: tree_sitter::Node<'_>, field: &str, source: &str) -> Option<String> {
+pub(crate) fn name_from_field(
+    node: tree_sitter::Node<'_>,
+    field: &str,
+    source: &str,
+) -> Option<String> {
     node.child_by_field_name(field)
         .and_then(|name| text_for_node(name, source))
 }

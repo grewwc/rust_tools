@@ -4,9 +4,7 @@ pub(super) fn push_chunk(state: &mut StreamFramingState, chunk: &[u8]) {
     state.pending.extend_from_slice(chunk);
 }
 
-pub(super) fn take_complete_lines(
-    state: &mut StreamFramingState,
-) -> Vec<String> {
+pub(super) fn take_complete_lines(state: &mut StreamFramingState) -> Vec<String> {
     let mut pending = std::mem::take(&mut state.pending);
     let mut lines = Vec::new();
     let mut consumed = 0usize;
@@ -25,9 +23,7 @@ pub(super) fn take_complete_lines(
     lines
 }
 
-pub(super) fn take_pending_tail(
-    state: &mut StreamFramingState,
-) -> Option<String> {
+pub(super) fn take_pending_tail(state: &mut StreamFramingState) -> Option<String> {
     if state.pending.is_empty() {
         return None;
     }
@@ -119,7 +115,10 @@ mod tests {
             consume_sse_line(&mut state, "event: response.reasoning_text.delta"),
             None
         );
-        assert_eq!(consume_sse_line(&mut state, "data: {\"delta\":\"step\"}"), None);
+        assert_eq!(
+            consume_sse_line(&mut state, "data: {\"delta\":\"step\"}"),
+            None
+        );
         assert_eq!(
             flush_sse_event(&mut state),
             Some(SseEvent {

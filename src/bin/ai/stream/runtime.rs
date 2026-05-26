@@ -93,7 +93,8 @@ pub(super) async fn stream_response(
 }
 
 fn should_show_opencode_waiting_hint(app: &App) -> bool {
-    io::stdout().is_terminal() && models::model_provider(&app.current_model) == ApiProvider::OpenCode
+    io::stdout().is_terminal()
+        && models::model_provider(&app.current_model) == ApiProvider::OpenCode
 }
 
 fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
@@ -102,7 +103,10 @@ fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
     }
     println!(
         "{}",
-        format_section_header("stream", Some("waiting for first visible chunk from provider..."))
+        format_section_header(
+            "stream",
+            Some("waiting for first visible chunk from provider...")
+        )
     );
     io::stdout().flush()?;
     state.render.waiting_hint_active = true;
@@ -265,12 +269,7 @@ fn finalize_stream_response(
         } else {
             echoed_model
         };
-        let _ = crate::ai::request::charge_llm_usage_to_kernel(
-            app,
-            &model_for_pricing,
-            &usage,
-            0,
-        );
+        let _ = crate::ai::request::charge_llm_usage_to_kernel(app, &model_for_pricing, &usage, 0);
     }
 
     let tool_calls = collect_valid_tool_calls(&mut state.content.tool_calls_map);
@@ -338,7 +337,12 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
 
     if state.framing.decode_error_count <= MAX_DECODE_ERRORS {
         eprintln!("[Warning] 尝试继续读取...");
-        if wait_for_interrupt_or_timeout(app, Some(Duration::from_millis(DECODE_ERROR_RETRY_DELAY_MS))).await {
+        if wait_for_interrupt_or_timeout(
+            app,
+            Some(Duration::from_millis(DECODE_ERROR_RETRY_DELAY_MS)),
+        )
+        .await
+        {
             return Some(cancelled_stream_result(state.content.thinking_open));
         }
         return None;
@@ -561,11 +565,7 @@ fn process_internal_tool_calls(
                 ensure_tool_calls_section_open(app, markers, state);
 
                 let index = state.content.internal_tool_call_idx;
-                let builder = state
-                    .content
-                    .tool_calls_map
-                    .entry(index)
-                    .or_default();
+                let builder = state.content.tool_calls_map.entry(index).or_default();
                 builder.id = format!("internal_{index}");
                 builder.tool_type = "function".to_string();
                 builder.function_name = function_name.clone();
@@ -577,11 +577,7 @@ fn process_internal_tool_calls(
                     continue;
                 }
                 let index = state.content.internal_tool_call_idx;
-                let builder = state
-                    .content
-                    .tool_calls_map
-                    .entry(index)
-                    .or_default();
+                let builder = state.content.tool_calls_map.entry(index).or_default();
                 if builder.function_name.is_empty() {
                     builder.id = format!("internal_{index}");
                     builder.tool_type = "function".to_string();
@@ -592,8 +588,7 @@ fn process_internal_tool_calls(
                 let _ = write_tool_call_arguments_stream(&chunk);
             }
             InternalToolCallStreamEvent::End => {
-                if state.render.current_printing_index
-                    == Some(state.content.internal_tool_call_idx)
+                if state.render.current_printing_index == Some(state.content.internal_tool_call_idx)
                 {
                     println!("\x1b[0m)");
                     state.render.current_printing_index = None;
@@ -683,9 +678,10 @@ fn write_stream_split_segment(
 ) -> io::Result<()> {
     match segment {
         StreamSplitSegment::Text(text) => maybe_write_plain_stream_text(&text, state, false),
-        StreamSplitSegment::Marker { marker_index: _, text } => {
-            write_stream_content_to_terminal(&text, &mut state.render.markdown, false)
-        }
+        StreamSplitSegment::Marker {
+            marker_index: _,
+            text,
+        } => write_stream_content_to_terminal(&text, &mut state.render.markdown, false),
     }
 }
 
@@ -724,10 +720,10 @@ fn maybe_write_stream_content(
 
     let marker_line = format!("{}\n", markers.end_thinking_tag);
     let marker_line_with_prefix = format!("\n{}\n", markers.end_thinking_tag);
-    let segments = state
-        .render
-        .terminal_splitter
-        .push(content, &[marker_line_with_prefix.as_str(), marker_line.as_str()]);
+    let segments = state.render.terminal_splitter.push(
+        content,
+        &[marker_line_with_prefix.as_str(), marker_line.as_str()],
+    );
     for segment in segments {
         write_stream_split_segment(segment, state)?;
     }
@@ -783,7 +779,9 @@ mod tests {
             last_skill_bias: None,
             os: crate::ai::driver::new_local_kernel(),
             agent_reload_counter: None,
-            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
+            observers: vec![Box::new(
+                crate::ai::driver::thinking::ThinkingOrchestrator::new(),
+            )],
         }
     }
 
@@ -837,9 +835,15 @@ mod tests {
         let markers = StreamMarkers::new();
         let mut state = StreamProcessingState::new();
 
-        state.render.markdown.write_chunk("still thinking", true).unwrap();
+        state
+            .render
+            .markdown
+            .write_chunk("still thinking", true)
+            .unwrap();
         let mut content = format!("{}\nfinal", markers.end_thinking_tag);
-        if content.starts_with(&markers.end_thinking_tag) && state.render.markdown.has_unfinished_line() {
+        if content.starts_with(&markers.end_thinking_tag)
+            && state.render.markdown.has_unfinished_line()
+        {
             content.insert(0, '\n');
         }
 
@@ -851,7 +855,11 @@ mod tests {
         let markers = StreamMarkers::new();
         let mut state = StreamProcessingState::new();
 
-        state.render.markdown.write_chunk("still thinking\n", true).unwrap();
+        state
+            .render
+            .markdown
+            .write_chunk("still thinking\n", true)
+            .unwrap();
         let mut content = format!("{}\nfinal", markers.end_thinking_tag);
         normalize_end_thinking_boundary(&mut content, &markers, &state.render.markdown);
 
@@ -863,7 +871,11 @@ mod tests {
         let markers = StreamMarkers::new();
         let mut state = StreamProcessingState::new();
 
-        state.render.markdown.write_chunk("still thinking", true).unwrap();
+        state
+            .render
+            .markdown
+            .write_chunk("still thinking", true)
+            .unwrap();
 
         assert_eq!(
             format_end_thinking_line(&markers, &state.render.markdown),
@@ -877,10 +889,8 @@ mod tests {
         let mut state = StreamProcessingState::new();
         let mut app = test_app();
         let mut current_history = String::new();
-        let path = std::env::temp_dir().join(format!(
-            "ai-stream-thinking-{}.log",
-            uuid::Uuid::new_v4()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ai-stream-thinking-{}.log", uuid::Uuid::new_v4()));
         let file = File::create(&path).unwrap();
         app.writer = Some(Arc::new(Mutex::new(file)));
         let payload = r#"{"choices":[{"delta":{"reasoning_content":"我判断这是首段"}}]}"#;
@@ -1189,7 +1199,6 @@ mod tests {
             *guard = None;
         }
     }
-
 }
 
 fn process_stream_payload(
@@ -1201,14 +1210,17 @@ fn process_stream_payload(
     event_type: Option<&str>,
     payload: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let (chunk, merge_mode) = match normalize::parse_stream_payload(adapter_kind, payload, event_type) {
-        super::state::ParsedStreamPayload::Ignore => return Ok(false),
-        super::state::ParsedStreamPayload::Done => return Ok(true),
-        super::state::ParsedStreamPayload::Chunk(chunk) => (chunk, StreamEventMergeMode::Append),
-        super::state::ParsedStreamPayload::SnapshotChunk(chunk) => {
-            (chunk, StreamEventMergeMode::AppendMissingSuffix)
-        }
-    };
+    let (chunk, merge_mode) =
+        match normalize::parse_stream_payload(adapter_kind, payload, event_type) {
+            super::state::ParsedStreamPayload::Ignore => return Ok(false),
+            super::state::ParsedStreamPayload::Done => return Ok(true),
+            super::state::ParsedStreamPayload::Chunk(chunk) => {
+                (chunk, StreamEventMergeMode::Append)
+            }
+            super::state::ParsedStreamPayload::SnapshotChunk(chunk) => {
+                (chunk, StreamEventMergeMode::AppendMissingSuffix)
+            }
+        };
 
     // AIOS: capture usage block from whichever chunk carries it. OpenAI emits
     // the final `usage` on a chunk with `choices: []`, so we must pull it *before*

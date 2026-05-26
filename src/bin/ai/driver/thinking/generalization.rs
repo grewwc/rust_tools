@@ -82,7 +82,8 @@ impl ExperienceGeneralizer {
             for entry in entries {
                 let principle = Self::decode_persisted_principle(&entry);
                 match deduped.get(&principle.id) {
-                    Some(existing) if !Self::should_replace_loaded_principle(existing, &principle) => {}
+                    Some(existing)
+                        if !Self::should_replace_loaded_principle(existing, &principle) => {}
                     _ => {
                         deduped.insert(principle.id.clone(), principle);
                     }
@@ -122,9 +123,10 @@ impl ExperienceGeneralizer {
                     })
                     .unwrap_or_else(|| "general".to_string());
                 let exp = RawExperience {
-                    id: entry.id.clone().unwrap_or_else(|| {
-                        format!("exp_{}", uuid::Uuid::new_v4().simple())
-                    }),
+                    id: entry
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| format!("exp_{}", uuid::Uuid::new_v4().simple())),
                     category,
                     note: entry.note.clone(),
                     tags: entry.tags.clone(),
@@ -214,8 +216,10 @@ impl ExperienceGeneralizer {
         // synthesize_principle would return None anyway — skip the grouping work.
         let has_structured = self.experience_buffer.iter().any(|e| {
             let lower = e.note.trim_start().to_lowercase();
-            lower.starts_with("do:") || lower.starts_with("avoid:")
-                || lower.starts_with("always") || lower.starts_with("never")
+            lower.starts_with("do:")
+                || lower.starts_with("avoid:")
+                || lower.starts_with("always")
+                || lower.starts_with("never")
         });
         if !has_structured {
             return None;
@@ -290,7 +294,10 @@ impl ExperienceGeneralizer {
                 if self.principles[i].domain == self.principles[j].domain {
                     continue;
                 }
-                if self.principles[i].cross_domain_links.contains(&self.principles[j].id) {
+                if self.principles[i]
+                    .cross_domain_links
+                    .contains(&self.principles[j].id)
+                {
                     continue;
                 }
                 let similarity = self.compute_text_similarity(
@@ -339,7 +346,11 @@ impl ExperienceGeneralizer {
                 principle.principle,
                 principle.cross_domain_links.join(", ")
             ),
-            tags: vec!["generalized".to_string(), "principle".to_string(), principle.domain.clone()],
+            tags: vec![
+                "generalized".to_string(),
+                "principle".to_string(),
+                principle.domain.clone(),
+            ],
             source: Some("experience_generalizer".to_string()),
             priority: Some(self.priority_for_principle(principle)),
             owner_pid: None,
@@ -357,13 +368,8 @@ impl ExperienceGeneralizer {
         entry: &crate::ai::tools::storage::memory_store::AgentMemoryEntry,
     ) -> GeneralizedPrinciple {
         let (note_text, cross_domain_links) = Self::split_cross_domain_links(&entry.note);
-        let (
-            principle_body,
-            domain,
-            abstraction_level,
-            confidence,
-            reinforcement_count,
-        ) = Self::parse_persisted_principle_note(note_text, &entry.tags);
+        let (principle_body, domain, abstraction_level, confidence, reinforcement_count) =
+            Self::parse_persisted_principle_note(note_text, &entry.tags);
 
         GeneralizedPrinciple {
             id: entry
@@ -527,7 +533,10 @@ impl ExperienceGeneralizer {
                 if t.is_empty() {
                     continue;
                 }
-                if matches!(t, "agent" | "policy" | "generalized" | "principle" | "raw_experience") {
+                if matches!(
+                    t,
+                    "agent" | "policy" | "generalized" | "principle" | "raw_experience"
+                ) {
                     continue;
                 }
                 if t.starts_with("cat:") {
@@ -657,7 +666,8 @@ impl ExperienceGeneralizer {
         let base = self.priority_for_abstraction(principle.abstraction_level) as f64;
         // 衰减系数：confidence 越低 / 越久未强化越接近 0.5
         // 保守下界 0.5，确保即使最老的 principle 也不会沉到普通 self_note 之下。
-        let factor = (principle.effective_confidence().max(0.0).min(1.0) * 0.5 + 0.5).clamp(0.5, 1.0);
+        let factor =
+            (principle.effective_confidence().max(0.0).min(1.0) * 0.5 + 0.5).clamp(0.5, 1.0);
         (base * factor).round().clamp(0.0, 255.0) as u8
     }
 }
@@ -875,7 +885,10 @@ mod tests {
         let refs = vec![&exp];
         let domain = generalizer.infer_domain(&refs);
         assert_ne!(domain, "raw_experience", "管线标签不应被当作 domain");
-        assert!(!domain.starts_with("cat:"), "cat: 编码标签不应直接作为 domain");
+        assert!(
+            !domain.starts_with("cat:"),
+            "cat: 编码标签不应直接作为 domain"
+        );
         assert_eq!(domain, "tool_failure");
     }
 }

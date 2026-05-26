@@ -11,8 +11,7 @@ use crate::ai::types::{App, ToolDefinition};
 use crate::commonw::configw;
 
 use super::gates::{
-    critic_filtered, model_should_revise, parse_reflect_flag, reflection_filtered_bg,
-    turn_has_tool,
+    critic_filtered, model_should_revise, parse_reflect_flag, reflection_filtered_bg, turn_has_tool,
 };
 
 pub(crate) async fn maybe_append_self_reflection(
@@ -411,14 +410,12 @@ fn maybe_promote_stable_self_note(
     let guidelines = reflection_evolution_guidelines(store);
 
     // 同签名 guideline 已存在则不重复晋升。
-    let exists = guidelines
-        .iter()
-        .any(|entry| {
-            entry
-                .tags
-                .iter()
-                .any(|tag| tag == &format!("evo_sig:{signature}"))
-        });
+    let exists = guidelines.iter().any(|entry| {
+        entry
+            .tags
+            .iter()
+            .any(|tag| tag == &format!("evo_sig:{signature}"))
+    });
     if exists {
         return;
     }
@@ -528,8 +525,19 @@ fn evaluate_turn_feedback(question: &str, answer: &str, had_tool: bool) -> Evolu
     }
 
     let failure_markers = [
-        "error", "failed", "failure", "panic", "exception", "traceback", "exit code",
-        "超时", "失败", "报错", "异常", "未找到", "permission denied",
+        "error",
+        "failed",
+        "failure",
+        "panic",
+        "exception",
+        "traceback",
+        "exit code",
+        "超时",
+        "失败",
+        "报错",
+        "异常",
+        "未找到",
+        "permission denied",
     ];
     if had_tool && failure_markers.iter().any(|m| a.contains(m)) {
         return EvolutionFeedback::Fail;
@@ -571,7 +579,11 @@ fn maybe_activate_canary(
     if fail >= EVO_CANARY_REJECT_FAILS {
         if let Some(id) = canary.id.as_deref() {
             let mut tags = upsert_tag(&canary.tags, "evo_state", "rejected");
-            tags = upsert_tag(&tags, "evo_reject", &Local::now().format("%Y%m%d%H%M%S").to_string());
+            tags = upsert_tag(
+                &tags,
+                "evo_reject",
+                &Local::now().format("%Y%m%d%H%M%S").to_string(),
+            );
             let _ = execute_memory_update(&serde_json::json!({
                 "id": id,
                 "priority": 90,
@@ -608,7 +620,11 @@ fn maybe_rollback_on_feedback(
     }
     if let Some(id) = active.id.as_deref() {
         let mut tags = upsert_tag(&active.tags, "evo_state", "rolled_back");
-        tags = upsert_tag(&tags, "evo_feedback_rollback", &Local::now().format("%Y%m%d%H%M%S").to_string());
+        tags = upsert_tag(
+            &tags,
+            "evo_feedback_rollback",
+            &Local::now().format("%Y%m%d%H%M%S").to_string(),
+        );
         let _ = execute_memory_update(&serde_json::json!({
             "id": id,
             "priority": 85,
@@ -813,8 +829,7 @@ fn evolution_notes_conflict(a_note: &str, b_note: &str) -> bool {
 }
 
 fn normalize_evolution_note(note: &str) -> String {
-    note
-        .lines()
+    note.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
@@ -837,7 +852,9 @@ fn demote_contradicting_self_notes(store: &MemoryStore, new_note: &str) {
         Err(_) => return,
     };
     for old in recent {
-        let Some(id) = old.id.as_deref() else { continue };
+        let Some(id) = old.id.as_deref() else {
+            continue;
+        };
         // 已经被降过的不再重复处理
         if old.priority.unwrap_or(150) <= 60 {
             continue;
@@ -845,8 +862,7 @@ fn demote_contradicting_self_notes(store: &MemoryStore, new_note: &str) {
         let Some((old_do, old_avoid)) = split_do_avoid(&old.note) else {
             continue;
         };
-        if has_polarity_conflict(&new_do, &old_avoid)
-            || has_polarity_conflict(&new_avoid, &old_do)
+        if has_polarity_conflict(&new_do, &old_avoid) || has_polarity_conflict(&new_avoid, &old_do)
         {
             // 用现有 update API 重写 priority，保持其他字段不变
             let _ = crate::ai::tools::service::memory::execute_memory_update(&serde_json::json!({
@@ -877,10 +893,10 @@ fn split_do_avoid(text: &str) -> Option<(Vec<String>, Vec<String>)> {
 
 fn extract_keyword_tokens(s: &str) -> Vec<String> {
     const STOP: &[&str] = &[
-        "the", "and", "for", "with", "without", "into", "onto", "from", "this", "that",
-        "your", "you", "are", "was", "were", "have", "has", "had", "but", "not", "can",
-        "should", "would", "could", "may", "might", "will", "shall", "before", "after",
-        "when", "where", "what", "which", "who", "whom",
+        "the", "and", "for", "with", "without", "into", "onto", "from", "this", "that", "your",
+        "you", "are", "was", "were", "have", "has", "had", "but", "not", "can", "should", "would",
+        "could", "may", "might", "will", "shall", "before", "after", "when", "where", "what",
+        "which", "who", "whom",
     ];
     s.split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter_map(|tok| {
@@ -997,29 +1013,55 @@ impl LearningNoteQualityFeatures {
         let unique_token_ratio = if word_count == 0 {
             0.0
         } else {
-            let unique = tokens.iter().collect::<std::collections::HashSet<_>>().len();
+            let unique = tokens
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
             unique as f32 / word_count as f32
         };
 
         let directive_signals = count_contains(
             &lower,
             &[
-                "do:", "avoid:", "prefer ", "should ", "must ", "always ", "never ",
-                "ensure ", "应该", "必须", "不要", "避免", "优先", "确保",
+                "do:", "avoid:", "prefer ", "should ", "must ", "always ", "never ", "ensure ",
+                "应该", "必须", "不要", "避免", "优先", "确保",
             ],
         );
         let condition_signals = count_contains(
             &lower,
             &[
-                "when ", "if ", "before ", "after ", "instead ", "rather than ",
-                "unless ", "当", "如果", "之前", "之后", "而不是", "否则",
+                "when ",
+                "if ",
+                "before ",
+                "after ",
+                "instead ",
+                "rather than ",
+                "unless ",
+                "当",
+                "如果",
+                "之前",
+                "之后",
+                "而不是",
+                "否则",
             ],
         );
         let abstraction_signals = count_contains(
             &lower,
             &[
-                "habit", "policy", "pattern", "rule", "guideline", "principle",
-                "workflow", "strategy", "习惯", "规则", "准则", "原则", "策略", "流程",
+                "habit",
+                "policy",
+                "pattern",
+                "rule",
+                "guideline",
+                "principle",
+                "workflow",
+                "strategy",
+                "习惯",
+                "规则",
+                "准则",
+                "原则",
+                "策略",
+                "流程",
             ],
         );
         let code_signals = count_code_signals(trimmed);
@@ -1029,7 +1071,10 @@ impl LearningNoteQualityFeatures {
         Self {
             char_count: trimmed.chars().count(),
             word_count,
-            nonempty_lines: trimmed.lines().filter(|line| !line.trim().is_empty()).count(),
+            nonempty_lines: trimmed
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
             unique_token_ratio,
             directive_signals,
             code_signals,
@@ -1050,14 +1095,18 @@ fn quality_tokens(note: &str) -> Vec<String> {
 }
 
 fn count_contains(haystack: &str, needles: &[&str]) -> usize {
-    needles.iter().filter(|needle| haystack.contains(**needle)).count()
+    needles
+        .iter()
+        .filter(|needle| haystack.contains(**needle))
+        .count()
 }
 
 fn count_code_signals(note: &str) -> usize {
-    let markers = [
-        '`', '/', '\\', '(', ')', ':', '[', ']', '{', '}',
-    ];
-    let mut count = markers.iter().filter(|marker| note.contains(**marker)).count();
+    let markers = ['`', '/', '\\', '(', ')', ':', '[', ']', '{', '}'];
+    let mut count = markers
+        .iter()
+        .filter(|marker| note.contains(**marker))
+        .count();
     if note.contains("::") {
         count += 1;
     }
@@ -1069,7 +1118,8 @@ fn count_code_signals(note: &str) -> usize {
 
 fn count_artifact_signals(note: &str, tokens: &[String]) -> usize {
     let mut count = 0usize;
-    if note.contains(".rs") || note.contains(".ts") || note.contains(".py") || note.contains(".md") {
+    if note.contains(".rs") || note.contains(".ts") || note.contains(".py") || note.contains(".md")
+    {
         count += 1;
     }
     count += tokens
@@ -1091,11 +1141,15 @@ fn count_one_off_signals(note: &str, tokens: &[String]) -> usize {
     }
     count += tokens
         .iter()
-        .filter(|token| token.len() >= 12 && token.chars().filter(|ch| ch.is_ascii_digit()).count() >= 4)
+        .filter(|token| {
+            token.len() >= 12 && token.chars().filter(|ch| ch.is_ascii_digit()).count() >= 4
+        })
         .count();
     count += tokens
         .iter()
-        .filter(|token| token.len() >= 16 && token.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-'))
+        .filter(|token| {
+            token.len() >= 16 && token.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-')
+        })
         .count();
     count
 }
@@ -1136,12 +1190,13 @@ static BACKGROUND_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
 
 pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Option<Value> {
     let cfg = configw::get_all_config();
-    let endpoint =
-        crate::ai::models::endpoint_for_model(model, &cfg.get_opt("ai.model.endpoint").unwrap_or_default());
+    let endpoint = crate::ai::models::endpoint_for_model(
+        model,
+        &cfg.get_opt("ai.model.endpoint").unwrap_or_default(),
+    );
     let api_key =
         crate::ai::models::api_key_for_model(model, &cfg.get_opt("api_key").unwrap_or_default());
-    if api_key.trim().is_empty()
-        && !crate::ai::models::endpoint_supports_anonymous_auth(&endpoint)
+    if api_key.trim().is_empty() && !crate::ai::models::endpoint_supports_anonymous_auth(&endpoint)
     {
         return None;
     }
@@ -1236,10 +1291,7 @@ mod tests {
 
     #[test]
     fn parse_evo_ver_reads_numeric_tag() {
-        let tags = vec![
-            "evo_stream:reflection".to_string(),
-            "evo_ver:7".to_string(),
-        ];
+        let tags = vec!["evo_stream:reflection".to_string(), "evo_ver:7".to_string()];
         assert_eq!(parse_evo_ver(&tags), Some(7));
     }
 
@@ -1252,21 +1304,14 @@ mod tests {
 
     #[test]
     fn evaluate_turn_feedback_flags_tool_failures() {
-        let feedback = evaluate_turn_feedback(
-            "继续执行",
-            "Error: command failed with exit code 1",
-            true,
-        );
+        let feedback =
+            evaluate_turn_feedback("继续执行", "Error: command failed with exit code 1", true);
         assert_eq!(feedback, EvolutionFeedback::Fail);
     }
 
     #[test]
     fn evaluate_turn_feedback_flags_user_corrections() {
-        let feedback = evaluate_turn_feedback(
-            "这个不对，请重试并修复",
-            "我会继续处理",
-            false,
-        );
+        let feedback = evaluate_turn_feedback("这个不对，请重试并修复", "我会继续处理", false);
         assert_eq!(feedback, EvolutionFeedback::Fail);
     }
 

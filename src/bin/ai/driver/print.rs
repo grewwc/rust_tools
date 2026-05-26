@@ -1,6 +1,6 @@
 use crate::ai::{
-    driver::model::OcrExtraction,
     driver::McpInitReport,
+    driver::model::OcrExtraction,
     mcp::McpClient,
     skills::SkillManifest,
     theme::{ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SUCCESS, BOLD, DIM, RESET},
@@ -12,7 +12,10 @@ pub fn print_assistant_banner() {
 }
 
 pub fn print_assistant_banner_with_app(app: Option<&App>) {
-    println!("\n{}", format_assistant_banner(app.map(|a| a.current_agent.as_str())));
+    println!(
+        "\n{}",
+        format_assistant_banner(app.map(|a| a.current_agent.as_str()))
+    );
 }
 
 pub fn print_tool_output_block(content: &str) {
@@ -57,29 +60,30 @@ pub(in crate::ai) fn format_section_header(title: &str, detail: Option<&str>) ->
 }
 
 pub(in crate::ai) fn format_section_note(note: &str) -> String {
-    format!("  {}│{} {}{}{}", ACCENT_RULE, RESET, ACCENT_MUTED, note, RESET)
+    format!(
+        "  {}│{} {}{}{}",
+        ACCENT_RULE, RESET, ACCENT_MUTED, note, RESET
+    )
 }
 
 pub(in crate::ai) fn format_section_item(label: &str, description: &str) -> String {
     if description.is_empty() {
-        return format!("  {}│{} {}{}{}", ACCENT_RULE, RESET, ACCENT_PRIMARY, label, RESET);
+        return format!(
+            "  {}│{} {}{}{}",
+            ACCENT_RULE, RESET, ACCENT_PRIMARY, label, RESET
+        );
     }
     format!(
         "  {}│{} {}{}{} {}· {}{}{}",
-        ACCENT_RULE,
-        RESET,
-        ACCENT_PRIMARY,
-        label,
-        RESET,
-        ACCENT_MUTED,
-        RESET,
-        DIM,
-        description
+        ACCENT_RULE, RESET, ACCENT_PRIMARY, label, RESET, ACCENT_MUTED, RESET, DIM, description
     ) + RESET
 }
 
 pub(in crate::ai) fn format_empty_state(label: &str) -> String {
-    format!("{}╰─{} {}{}{}", ACCENT_RULE, RESET, ACCENT_MUTED, label, RESET)
+    format!(
+        "{}╰─{} {}{}{}",
+        ACCENT_RULE, RESET, ACCENT_MUTED, label, RESET
+    )
 }
 
 pub(in crate::ai) fn format_assistant_banner(agent_name: Option<&str>) -> String {
@@ -124,7 +128,9 @@ pub(in crate::ai) fn sanitize_for_terminal(text: &str) -> String {
             } else if i + 1 < bytes.len() && bytes[i + 1] == b']' {
                 i += 2;
                 while i < bytes.len() {
-                    if bytes[i] == 0x07 || (bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\') {
+                    if bytes[i] == 0x07
+                        || (bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\')
+                    {
                         i += 1;
                         break;
                     }
@@ -189,10 +195,18 @@ pub(in crate::ai) fn format_tool_output_block(content: &str) -> Vec<String> {
 
 pub(in crate::ai) fn format_ocr_summary_block(extraction: &OcrExtraction) -> Vec<String> {
     let mut lines = Vec::with_capacity(extraction.images.len() + 1);
-    let ok_count = extraction.images.iter().filter(|img| img.error.is_none()).count();
+    let ok_count = extraction
+        .images
+        .iter()
+        .filter(|img| img.error.is_none())
+        .count();
     let failed_count = extraction.images.len().saturating_sub(ok_count);
     let detail = if failed_count == 0 {
-        format!("{} images · {}", extraction.images.len(), extraction.tool_name)
+        format!(
+            "{} images · {}",
+            extraction.images.len(),
+            extraction.tool_name
+        )
     } else {
         format!(
             "{} images · {} ok · {} failed · {}",
@@ -280,14 +294,20 @@ pub fn print_mcp_tools(report: &McpInitReport, mcp_client: &McpClient) {
         "{}",
         format_section_header(
             "mcp",
-            Some(&format!("{} servers, {} tools", report.server_count, report.tool_count))
+            Some(&format!(
+                "{} servers, {} tools",
+                report.server_count, report.tool_count
+            ))
         )
     );
     for failure in &report.failures {
         println!("{}", format_section_note(&format!("failed: {failure}")));
     }
     for t in mcp_client.get_all_tools() {
-        println!("{}", format_section_item(&t.function.name, &t.function.description));
+        println!(
+            "{}",
+            format_section_item(&t.function.name, &t.function.description)
+        );
     }
 }
 
@@ -351,7 +371,10 @@ mod tests {
     fn section_helpers_keep_text_content_stable() {
         let header = strip_ansi_for_test(&format_section_header("mcp", Some("2 servers, 5 tools")));
         let note = strip_ansi_for_test(&format_section_note("config path: ~/.config/mcp.json"));
-        let item = strip_ansi_for_test(&format_section_item("search_codebase", "semantic code search"));
+        let item = strip_ansi_for_test(&format_section_item(
+            "search_codebase",
+            "semantic code search",
+        ));
         let empty = strip_ansi_for_test(&format_empty_state("no response"));
 
         assert_eq!(header, "╭─ mcp · 2 servers, 5 tools");
@@ -384,7 +407,10 @@ mod tests {
             .map(|line| strip_ansi_for_test(&line))
             .collect::<Vec<_>>();
 
-        assert_eq!(visible[0], "╭─ ocr · 2 images · 1 ok · 1 failed · mcp_ocr_extract_ocr_image");
+        assert_eq!(
+            visible[0],
+            "╭─ ocr · 2 images · 1 ok · 1 failed · mcp_ocr_extract_ocr_image"
+        );
         assert_eq!(visible[1], "  │ a.png · ok · 128 chars");
         assert!(visible[2].starts_with("  │ b.png · failed · timeout talking to OCR service"));
     }

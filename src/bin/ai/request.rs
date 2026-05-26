@@ -12,7 +12,9 @@ use serde_json::{Value, json};
 
 use super::{
     files,
-    history::{Message, ROLE_SYSTEM, is_internal_note_role, is_system_like_role, messages_to_markdown},
+    history::{
+        Message, ROLE_SYSTEM, is_internal_note_role, is_system_like_role, messages_to_markdown,
+    },
     models,
     provider::{ApiProvider, ReasoningEffort},
     skills::SkillManifest,
@@ -314,13 +316,24 @@ fn looks_like_continuation(prefix: &str, continuation: &str) -> bool {
 fn is_continuation_punctuation(ch: char) -> bool {
     matches!(
         ch,
-        ',' | '.' | ';' | ':'
-        | '!' | '?'
-        | ')' | ']' | '}'
-        | '，' | '。' | '；' | '：'
-        | '！' | '？'
-        | '）' | '】' | '》'
-        | '…'
+        ',' | '.'
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+            | ')'
+            | ']'
+            | '}'
+            | '，'
+            | '。'
+            | '；'
+            | '：'
+            | '！'
+            | '？'
+            | '）'
+            | '】'
+            | '》'
+            | '…'
     )
 }
 
@@ -536,7 +549,8 @@ pub(super) fn is_transient_error(err: &RequestError) -> bool {
 #[commonw::debug_measure_time("resolve_thinking")]
 async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool {
     let cfg = configw::get_all_config();
-    let force_thinking = app.cli.thinking || config_bool_is_true(cfg.get_opt(AiConfig::MODEL_THINKING));
+    let force_thinking =
+        app.cli.thinking || config_bool_is_true(cfg.get_opt(AiConfig::MODEL_THINKING));
 
     if force_thinking {
         return models::enable_thinking(model);
@@ -565,8 +579,10 @@ async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool 
         .join("\n");
     let question = question.trim();
     if !question.is_empty() {
-        let local_intent =
-            intent_recognition::detect_intent_with_model_path(question, &app.config.intent_model_path);
+        let local_intent = intent_recognition::detect_intent_with_model_path(
+            question,
+            &app.config.intent_model_path,
+        );
         if let Some(local_decision) = local_thinking_decision(question, &local_intent) {
             crate::ai::agent_hang_debug!(
                 "post-fix",
@@ -630,17 +646,17 @@ fn local_thinking_decision(
                 || line.contains('/')
                 || line.contains('\\')
         });
-    let has_multistep_shape = line_count >= 3
-        || question.contains("\n- ")
-        || question.contains("\n1.");
-    let looks_like_complex_solution_request = matches!(
-        intent.core,
-        intent_recognition::CoreIntent::SeekSolution
-    ) && (question_len >= 48 || has_code_like_content || has_multistep_shape || has_diagnostic_shape);
-    let looks_like_complex_action_request = matches!(
-        intent.core,
-        intent_recognition::CoreIntent::RequestAction
-    ) && (question_len >= 96 || has_code_like_content || has_multistep_shape);
+    let has_multistep_shape =
+        line_count >= 3 || question.contains("\n- ") || question.contains("\n1.");
+    let looks_like_complex_solution_request =
+        matches!(intent.core, intent_recognition::CoreIntent::SeekSolution)
+            && (question_len >= 48
+                || has_code_like_content
+                || has_multistep_shape
+                || has_diagnostic_shape);
+    let looks_like_complex_action_request =
+        matches!(intent.core, intent_recognition::CoreIntent::RequestAction)
+            && (question_len >= 96 || has_code_like_content || has_multistep_shape);
 
     if matches!(
         intent.core,
@@ -684,11 +700,7 @@ fn local_thinking_decision(
         "elapsed_ms": __agent_hang_elapsed_ms,
     }
 )]
-async fn decide_thinking_via_model(
-    app: &App,
-    _model: &str,
-    messages: &[Message],
-) -> Option<bool> {
+async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]) -> Option<bool> {
     let gate_start = Instant::now();
     let user_text: String = messages
         .iter()
@@ -819,11 +831,7 @@ fn extract_message_text(msg: &Message) -> Option<String> {
                     out.push_str(s);
                 }
             }
-            if out.is_empty() {
-                None
-            } else {
-                Some(out)
-            }
+            if out.is_empty() { None } else { Some(out) }
         }
         _ => None,
     }
@@ -1162,7 +1170,8 @@ pub(super) async fn select_skill_via_model(
     } else {
         let mut chunk_best: Vec<(String, f64)> = Vec::new();
         for chunk in skills.chunks(SKILL_ROUTER_CHUNK_SIZE) {
-            let Some(decision) = select_skill_candidate_via_model(app, question, chunk).await else {
+            let Some(decision) = select_skill_candidate_via_model(app, question, chunk).await
+            else {
                 continue;
             };
             let Some(name) = decision.skill else {
@@ -1193,12 +1202,14 @@ pub(super) async fn select_skill_via_model(
                 .iter()
                 .filter_map(|(name, _)| skills.iter().find(|s| s.name == *name).cloned())
                 .collect::<Vec<_>>();
-            select_skill_candidate_via_model(app, question, &finalists).await.or_else(|| {
-                Some(SkillRouterDecision {
-                    skill: Some(chunk_best[0].0.clone()),
-                    confidence: chunk_best[0].1,
+            select_skill_candidate_via_model(app, question, &finalists)
+                .await
+                .or_else(|| {
+                    Some(SkillRouterDecision {
+                        skill: Some(chunk_best[0].0.clone()),
+                        confidence: chunk_best[0].1,
+                    })
                 })
-            })
         }
     };
     let Some(decision) = decision else {
@@ -1290,10 +1301,12 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
             tail.push((*line).to_string());
         }
 
-        let omitted = text
-            .chars()
-            .count()
-            .saturating_sub(selected.iter().map(|line| line.chars().count()).sum::<usize>());
+        let omitted = text.chars().count().saturating_sub(
+            selected
+                .iter()
+                .map(|line| line.chars().count())
+                .sum::<usize>(),
+        );
         if !tail.is_empty() {
             selected.push(format!("... [truncated: {omitted} chars omitted]"));
             selected.extend(tail);
@@ -1313,7 +1326,8 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
         if trimmed.starts_with("Context note: reused cached tool results") {
             return InternalNoteKind::CachedTools;
         }
-        if trimmed.starts_with("对话摘要（自动压缩") || trimmed.starts_with("历史摘要（自动压缩") {
+        if trimmed.starts_with("对话摘要（自动压缩") || trimmed.starts_with("历史摘要（自动压缩")
+        {
             return InternalNoteKind::Summary;
         }
         if trimmed.starts_with("self_note:") {
@@ -1370,7 +1384,11 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
                 continue;
             }
 
-            let Some(tool_calls) = message.tool_calls.as_ref().filter(|calls| !calls.is_empty()) else {
+            let Some(tool_calls) = message
+                .tool_calls
+                .as_ref()
+                .filter(|calls| !calls.is_empty())
+            else {
                 out.push(message.clone());
                 idx += 1;
                 continue;
@@ -1405,7 +1423,9 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
             while scan < messages.len() && messages[scan].role == "tool" {
                 let tool_message = &messages[scan];
                 if let Some(tool_call_id) = tool_message.tool_call_id.as_deref()
-                    && expected_ids.iter().any(|expected| *expected == tool_call_id)
+                    && expected_ids
+                        .iter()
+                        .any(|expected| *expected == tool_call_id)
                     && !matched_ids.iter().any(|seen| seen == tool_call_id)
                 {
                     matched_ids.push(tool_call_id.to_string());
@@ -1523,10 +1543,8 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
             // many tool rounds).
             if let Value::String(text) = &promoted.content {
                 if text.chars().count() > MERGED_SINGLE_NOTE_MAX_CHARS {
-                    promoted.content = Value::String(truncate_note_text(
-                        text,
-                        MERGED_SINGLE_NOTE_MAX_CHARS,
-                    ));
+                    promoted.content =
+                        Value::String(truncate_note_text(text, MERGED_SINGLE_NOTE_MAX_CHARS));
                 }
             }
             out.push(promoted);
@@ -1671,8 +1689,7 @@ pub async fn do_request_json(
                     let json: serde_json::Value = response.json().await?;
                     // AIOS: bridge non-stream usage to kernel `/dev/llm`.
                     if let Some(usage_val) = json.get("usage") {
-                        if let Ok(usage) =
-                            serde_json::from_value::<StreamUsage>(usage_val.clone())
+                        if let Ok(usage) = serde_json::from_value::<StreamUsage>(usage_val.clone())
                         {
                             let latency_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
                             let _ = charge_llm_usage_to_kernel(app, model, &usage, latency_ms);
@@ -1806,7 +1823,8 @@ pub(super) async fn summarize_history_via_model(
 - 使用下面这些标题，并且每个标题下用 `- ` 开头的短行：\n\
 主要请求:\n关键上下文:\n错误与修复:\n当前工作:\n待办任务:\n已知工具结论:\n\
 - 如果某项没有内容，写 `- 无`。\n\
-- 总长度尽量控制在 {} 个字符以内。", max_chars
+- 总长度尽量控制在 {} 个字符以内。",
+                max_chars
             )),
             tool_calls: None,
             tool_call_id: None,
@@ -1814,10 +1832,7 @@ pub(super) async fn summarize_history_via_model(
         },
         Message {
             role: "user".to_string(),
-            content: Value::String(format!(
-                "请压缩下面的较早对话：\n\n{}",
-                transcript
-            )),
+            content: Value::String(format!("请压缩下面的较早对话：\n\n{}", transcript)),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -1977,10 +1992,7 @@ confidence ∈ [0,1]，对边界样本请给低值（<0.6）。"
         .await
         .ok()?;
     if !response.status().is_success() {
-        eprintln!(
-            "[intent:llm] http non-success status={}",
-            response.status()
-        );
+        eprintln!("[intent:llm] http non-success status={}", response.status());
         return None;
     }
     let text = response.text().await.ok()?;
@@ -1997,7 +2009,10 @@ confidence ∈ [0,1]，对边界样本请给低值（<0.6）。"
     };
     let parsed: Value = serde_json::from_str(candidate).ok()?;
     let intent_str = parsed.get("intent").and_then(|v| v.as_str())?;
-    let confidence = parsed.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let confidence = parsed
+        .get("confidence")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
     if confidence < 0.6 {
         eprintln!(
             "[intent:llm] low confidence ({:.2}); ignoring -> Casual",
@@ -2012,10 +2027,7 @@ confidence ∈ [0,1]，对边界样本请给低值（<0.6）。"
         "casual" => CoreIntent::Casual,
         _ => return None,
     };
-    eprintln!(
-        "[intent:llm] -> {:?} (confidence={:.2})",
-        core, confidence
-    );
+    eprintln!("[intent:llm] -> {:?} (confidence={:.2})", core, confidence);
     Some(core)
 }
 
@@ -2063,7 +2075,9 @@ mod tests {
             last_skill_bias: None,
             os: crate::ai::driver::new_local_kernel(),
             agent_reload_counter: None,
-            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
+            observers: vec![Box::new(
+                crate::ai::driver::thinking::ThinkingOrchestrator::new(),
+            )],
         }
     }
 
@@ -2122,7 +2136,8 @@ mod tests {
         init_os_tools_globals(app.os.clone());
         crate::ai::driver::signal::clear_request_interrupt();
 
-        let waiter = tokio::spawn(async move { sleep_with_cancel(&app, Duration::from_secs(5)).await });
+        let waiter =
+            tokio::spawn(async move { sleep_with_cancel(&app, Duration::from_secs(5)).await });
         tokio::time::sleep(Duration::from_millis(20)).await;
         crate::ai::driver::signal::signal_request_interrupt();
 
@@ -2198,16 +2213,7 @@ mod tests {
             reasoning_content: None,
         }];
         let model = first_openai_model_name();
-        let body = build_request_body(
-            &model,
-            &messages,
-            true,
-            true,
-            Some(true),
-            None,
-            None,
-            None,
-        );
+        let body = build_request_body(&model, &messages, true, true, Some(true), None, None, None);
         let value = serde_json::to_value(&body).unwrap();
 
         assert!(value.get("enable_thinking").is_none());
@@ -2227,20 +2233,17 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         }];
-        let body = build_request_body(
-            "qwen",
-            &messages,
-            false,
-            true,
-            Some(true),
-            None,
-            None,
-            None,
-        );
+        let body = build_request_body("qwen", &messages, false, true, Some(true), None, None, None);
         let value = serde_json::to_value(&body).unwrap();
 
-        assert_eq!(value.get("enable_thinking").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(value.get("enable_search").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            value.get("enable_thinking").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            value.get("enable_search").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     #[test]
@@ -2299,10 +2302,7 @@ mod tests {
         assert_eq!(normalized[1].role, "user");
         assert_eq!(normalized[2].role, "assistant");
         assert_eq!(normalized[3].role, "system");
-        assert_eq!(
-            normalized[3].content.as_str(),
-            Some("working memory")
-        );
+        assert_eq!(normalized[3].content.as_str(), Some("working memory"));
     }
 
     #[test]
@@ -2453,10 +2453,7 @@ mod tests {
         assert_eq!(normalized.len(), 4);
         assert_eq!(normalized[2].role, "assistant");
         assert_eq!(
-            normalized[2]
-                .tool_calls
-                .as_ref()
-                .map(|calls| calls.len()),
+            normalized[2].tool_calls.as_ref().map(|calls| calls.len()),
             Some(1)
         );
         assert_eq!(normalized[3].role, "tool");
@@ -2516,7 +2513,11 @@ mod tests {
         assert_eq!(normalized[2].role, "assistant");
         assert_eq!(normalized[2].content.as_str(), Some("later answer"));
         assert!(normalized.iter().all(|message| message.role != "tool"));
-        assert!(normalized.iter().all(|message| message.tool_calls.is_none()));
+        assert!(
+            normalized
+                .iter()
+                .all(|message| message.tool_calls.is_none())
+        );
     }
 
     #[test]
@@ -2560,8 +2561,6 @@ mod tests {
         assert!(text.chars().count() <= 1_200);
     }
 
-
-
     #[test]
     fn openai_image_content_uses_object_image_url_shape() {
         // 仅当 models.json 中存在一个 OpenAi-provider 且 is_vl=true 的模型时
@@ -2576,24 +2575,26 @@ mod tests {
             return;
         };
 
-        let path = std::env::temp_dir().join(format!("ai-openai-image-{}.png", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("ai-openai-image-{}.png", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"fake").unwrap();
 
-        let value = build_content(
-            &model,
-            "describe",
-            &[path.to_string_lossy().to_string()],
-        )
-        .unwrap();
+        let value =
+            build_content(&model, "describe", &[path.to_string_lossy().to_string()]).unwrap();
 
         let first = value.as_array().and_then(|items| items.first()).unwrap();
-        assert_eq!(first.get("type").and_then(|v| v.as_str()), Some("image_url"));
-        assert!(first
-            .get("image_url")
-            .and_then(|v| v.get("url"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.starts_with("data:image/png;base64,"))
-            .unwrap_or(false));
+        assert_eq!(
+            first.get("type").and_then(|v| v.as_str()),
+            Some("image_url")
+        );
+        assert!(
+            first
+                .get("image_url")
+                .and_then(|v| v.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.starts_with("data:image/png;base64,"))
+                .unwrap_or(false)
+        );
     }
 
     #[test]
@@ -2610,20 +2611,21 @@ mod tests {
             std::env::temp_dir().join(format!("ai-compatible-image-{}.png", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"fake").unwrap();
 
-        let value = build_content(
-            &model,
-            "describe",
-            &[path.to_string_lossy().to_string()],
-        )
-        .unwrap();
+        let value =
+            build_content(&model, "describe", &[path.to_string_lossy().to_string()]).unwrap();
 
         let first = value.as_array().and_then(|items| items.first()).unwrap();
-        assert_eq!(first.get("type").and_then(|v| v.as_str()), Some("image_url"));
-        assert!(first
-            .get("image_url")
-            .and_then(|v| v.get("url"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.starts_with("data:image/png;base64,"))
-            .unwrap_or(false));
+        assert_eq!(
+            first.get("type").and_then(|v| v.as_str()),
+            Some("image_url")
+        );
+        assert!(
+            first
+                .get("image_url")
+                .and_then(|v| v.get("url"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.starts_with("data:image/png;base64,"))
+                .unwrap_or(false)
+        );
     }
 }

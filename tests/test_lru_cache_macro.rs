@@ -16,11 +16,11 @@ mod tests {
         // First call - computes and caches
         let result1 = cached_add(1, 2);
         assert_eq!(result1, 3);
-        
+
         // Second call with same args - should hit cache
         let result2 = cached_add(1, 2);
         assert_eq!(result2, 3);
-        
+
         // Different args - computes again
         let result3 = cached_add(3, 4);
         assert_eq!(result3, 7);
@@ -36,7 +36,7 @@ mod tests {
     fn test_lru_cache_macro_with_ttl() {
         let result1 = cached_mult(2, 3);
         assert_eq!(result1, 6);
-        
+
         // Should hit cache
         let result2 = cached_mult(2, 3);
         assert_eq!(result2, 6);
@@ -81,10 +81,10 @@ mod tests {
     fn test_lru_cache_macro_eviction() {
         assert_eq!(cached_triple(1, 2, 3), 6);
         assert_eq!(cached_triple(1, 2, 3), 6); // cache hit
-        
+
         // Different args should compute
         assert_eq!(cached_triple(4, 5, 6), 15);
-        
+
         // After 3 entries with cap=2, first entry should be evicted
         // Call first args again - should recompute
         assert_eq!(cached_triple(1, 2, 3), 6);

@@ -7,8 +7,7 @@ use std::{
 use crate::commonw::utils::open_file_for_append;
 
 use super::{
-    compress,
-    sqlite,
+    compress, sqlite,
     types::{COLON, Message, NEWLINE},
 };
 

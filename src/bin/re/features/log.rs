@@ -67,7 +67,8 @@ pub fn insert_records(
     } else if from_editor {
         print!("input the title: ");
         rust_tools::commonw::editor::flush_stdout();
-        let title = rust_tools::commonw::editor::input_with_editor("", use_vscode).unwrap_or_default();
+        let title =
+            rust_tools::commonw::editor::input_with_editor("", use_vscode).unwrap_or_default();
         println!();
         title_list.push(title);
     } else {
@@ -133,7 +134,9 @@ pub fn update_record_impl(
         }
         println!();
     } else {
-        let mut title = rust_tools::commonw::prompt::read_line("").trim().to_string();
+        let mut title = rust_tools::commonw::prompt::read_line("")
+            .trim()
+            .to_string();
         if from_file && !title.is_empty() {
             title = std::fs::read_to_string(&title)
                 .unwrap_or_default()

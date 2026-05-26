@@ -5,11 +5,7 @@ pub mod model;
 pub mod session;
 pub mod share;
 
-use crate::ai::{
-    agents::AgentManifest,
-    mcp::SharedMcpClient,
-    types::App,
-};
+use crate::ai::{agents::AgentManifest, mcp::SharedMcpClient, types::App};
 
 pub use agent::try_handle_agent_command;
 pub use feishu::try_handle_feishu_auth_command;

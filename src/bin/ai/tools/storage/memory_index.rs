@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use super::memory_store::AgentMemoryEntry;
 
@@ -43,10 +43,7 @@ pub(crate) struct MemoryIndex {
 impl MemoryIndex {
     /// 打开 / 初始化索引；schema 不一致或 source 文件 mtime/len 与记录漂移时
     /// **同步**重建。调用方应在持有 `with_memory_file_lock` 之内调用。
-    pub(crate) fn open_or_init(
-        db_path: PathBuf,
-        source_path: PathBuf,
-    ) -> Result<Self, String> {
+    pub(crate) fn open_or_init(db_path: PathBuf, source_path: PathBuf) -> Result<Self, String> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("create db parent dir failed: {e}"))?;
@@ -120,10 +117,8 @@ impl MemoryIndex {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(-1);
         if stored_v != SCHEMA_VERSION {
-            conn.execute_batch(
-                "DELETE FROM entries; DELETE FROM entries_fts; DELETE FROM meta;",
-            )
-            .map_err(|e| format!("clear stale schema: {e}"))?;
+            conn.execute_batch("DELETE FROM entries; DELETE FROM entries_fts; DELETE FROM meta;")
+                .map_err(|e| format!("clear stale schema: {e}"))?;
             conn.execute(
                 "INSERT INTO meta(k,v) VALUES ('schema_version', ?1)",
                 params![SCHEMA_VERSION.to_string()],
@@ -141,7 +136,9 @@ impl MemoryIndex {
             .lock()
             .map_err(|e| format!("conn lock poisoned: {e}"))?;
         let prev_mtime: Option<String> = conn
-            .query_row("SELECT v FROM meta WHERE k='source_mtime'", [], |r| r.get(0))
+            .query_row("SELECT v FROM meta WHERE k='source_mtime'", [], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(|e| format!("read source_mtime: {e}"))?;
         let prev_len: Option<String> = conn
@@ -195,9 +192,7 @@ impl MemoryIndex {
             .conn
             .lock()
             .map_err(|e| format!("conn lock poisoned: {e}"))?;
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("begin tx: {e}"))?;
+        let tx = conn.transaction().map_err(|e| format!("begin tx: {e}"))?;
         tx.execute("DELETE FROM entries", [])
             .map_err(|e| format!("clear entries: {e}"))?;
         tx.execute("DELETE FROM entries_fts", [])
@@ -205,7 +200,9 @@ impl MemoryIndex {
 
         for entry in &entries {
             // 没有 id 的条目无法稳定建索引——跳过；search 路径会回退扫 JSONL。
-            let Some(id) = entry.id.as_deref() else { continue };
+            let Some(id) = entry.id.as_deref() else {
+                continue;
+            };
             let tags_json = serde_json::to_string(&entry.tags).unwrap_or_else(|_| "[]".into());
             let tags_text = entry.tags.join(" ");
             let prio = entry.priority.unwrap_or(100) as i64;
@@ -311,11 +308,7 @@ impl MemoryIndex {
 
     /// FTS5 全文检索；返回按 `bm25(entries_fts) + priority + recency + LFU` 综合排序后的 id 列表。
     /// caller 拿 id 之后用 `MemoryStore::all()` 或后续传 id 的精确读取拿到完整条目。
-    pub(crate) fn search_ids(
-        &self,
-        query: &str,
-        limit: usize,
-    ) -> Result<Vec<String>, String> {
+    pub(crate) fn search_ids(&self, query: &str, limit: usize) -> Result<Vec<String>, String> {
         let conn = self
             .conn
             .lock()
@@ -339,7 +332,9 @@ impl MemoryIndex {
             )
             .map_err(|e| format!("prepare search: {e}"))?;
         let ids = stmt
-            .query_map(params![escaped, limit as i64], |row| row.get::<_, String>(0))
+            .query_map(params![escaped, limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|e| format!("exec search: {e}"))?
             .filter_map(Result::ok)
             .collect::<Vec<_>>();
@@ -360,9 +355,7 @@ impl MemoryIndex {
             .conn
             .lock()
             .map_err(|e| format!("conn lock poisoned: {e}"))?;
-        let tx = conn
-            .transaction()
-            .map_err(|e| format!("begin tx: {e}"))?;
+        let tx = conn.transaction().map_err(|e| format!("begin tx: {e}"))?;
         for id in ids {
             tx.execute(
                 "UPDATE entries SET hits = hits + 1, last_access = ?2 WHERE id = ?1",
@@ -381,11 +374,9 @@ impl MemoryIndex {
             .conn
             .lock()
             .map_err(|e| format!("conn lock poisoned: {e}"))?;
-        conn.query_row(
-            "SELECT hits FROM entries WHERE id=?1",
-            params![id],
-            |r| r.get::<_, i64>(0),
-        )
+        conn.query_row("SELECT hits FROM entries WHERE id=?1", params![id], |r| {
+            r.get::<_, i64>(0)
+        })
         .optional()
         .map_err(|e| format!("query hits: {e}"))
         .map(|v| v.unwrap_or(0))
@@ -483,7 +474,12 @@ mod tests {
         write_jsonl(
             &jsonl,
             &[
-                entry("e1", "user_preference", "prefer concise commit messages", 210),
+                entry(
+                    "e1",
+                    "user_preference",
+                    "prefer concise commit messages",
+                    210,
+                ),
                 entry("e2", "project_memory", "the build script is build.sh", 180),
                 entry("e3", "tool_stat", "ripgrep used 5 times", 50),
             ],

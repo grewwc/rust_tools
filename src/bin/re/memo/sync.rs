@@ -1,8 +1,8 @@
 use std::path::Path;
 use std::process::Command;
 
-use rust_tools::commonw::types::FastSet;
 use crate::memo::{MemoBackend, db::MemoDb, history};
+use rust_tools::commonw::types::FastSet;
 
 const REMOTE_SQLITE_PATH: &str = "~/.go_tools_memo.sqlite3";
 

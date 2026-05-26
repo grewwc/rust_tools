@@ -43,7 +43,9 @@ fn params_plan() -> Value {
 }
 
 fn execute_plan(args: &Value) -> Result<String, String> {
-    let steps = args["steps"].as_array().ok_or("Missing 'steps' array. Provide a JSON array of plan steps.")?;
+    let steps = args["steps"]
+        .as_array()
+        .ok_or("Missing 'steps' array. Provide a JSON array of plan steps.")?;
     let summary = args["summary"].as_str().unwrap_or("");
 
     if steps.is_empty() {
@@ -56,21 +58,27 @@ fn execute_plan(args: &Value) -> Result<String, String> {
     }
 
     for step_val in steps {
-        let step_obj = step_val.as_object().ok_or("Each step must be a JSON object.")?;
-        
-        let step_num = step_obj.get("step")
+        let step_obj = step_val
+            .as_object()
+            .ok_or("Each step must be a JSON object.")?;
+
+        let step_num = step_obj
+            .get("step")
             .and_then(|v| v.as_u64())
             .ok_or("Each step must have a numeric 'step' field.")?;
-        
-        let action = step_obj.get("action")
+
+        let action = step_obj
+            .get("action")
             .and_then(|v| v.as_str())
             .ok_or("Each step must have a 'action' string field.")?;
-        
-        let reason = step_obj.get("reason")
+
+        let reason = step_obj
+            .get("reason")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        
-        let tool = step_obj.get("tool")
+
+        let tool = step_obj
+            .get("tool")
             .and_then(|v| v.as_str())
             .unwrap_or("unspecified");
 
@@ -80,7 +88,10 @@ fn execute_plan(args: &Value) -> Result<String, String> {
         }
     }
 
-    formatted.push_str(&format!("\n---\n{} step(s) planned. Proceed to execute.\n", steps.len()));
+    formatted.push_str(&format!(
+        "\n---\n{} step(s) planned. Proceed to execute.\n",
+        steps.len()
+    ));
 
     Ok(formatted)
 }

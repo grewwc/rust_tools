@@ -2,10 +2,10 @@
 mod completion_panel;
 #[path = "multiline/events.rs"]
 mod events;
-#[path = "multiline/render.rs"]
-mod render;
 #[path = "multiline/multiline_ui.rs"]
 mod multiline_ui;
+#[path = "multiline/render.rs"]
+mod render;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(in super::super) struct MultilineHistoryState {

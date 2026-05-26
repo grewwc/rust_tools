@@ -44,7 +44,9 @@ impl SubGoal {
     }
 
     pub fn is_ready(&self, completed_ids: &std::collections::HashSet<&GoalId>) -> bool {
-        self.depends_on.iter().all(|dep| completed_ids.contains(dep))
+        self.depends_on
+            .iter()
+            .all(|dep| completed_ids.contains(dep))
     }
 }
 
@@ -81,9 +83,15 @@ impl Goal {
         }
     }
 
-    pub fn add_sub_goal(&mut self, description: String, depends_on_indices: Vec<usize>, priority: u8) -> GoalId {
+    pub fn add_sub_goal(
+        &mut self,
+        description: String,
+        depends_on_indices: Vec<usize>,
+        priority: u8,
+    ) -> GoalId {
         let sub_id = format!("{}_{}", self.id, self.sub_goals.len());
-        let depends_on: Vec<GoalId> = depends_on_indices.iter()
+        let depends_on: Vec<GoalId> = depends_on_indices
+            .iter()
             .filter_map(|&idx| self.sub_goals.get(idx).map(|s| s.id.clone()))
             .collect();
         let mut sub = SubGoal::new(sub_id.clone(), description, Some(self.id.clone()), priority);
@@ -100,7 +108,12 @@ impl Goal {
         self.updated_at = chrono::Local::now().to_rfc3339();
     }
 
-    pub fn update_sub_goal_progress(&mut self, sub_id: &GoalId, progress: f64, context: Option<String>) {
+    pub fn update_sub_goal_progress(
+        &mut self,
+        sub_id: &GoalId,
+        progress: f64,
+        context: Option<String>,
+    ) {
         if let Some(sub) = self.sub_goals.iter_mut().find(|s| &s.id == sub_id) {
             sub.progress = progress.clamp(0.0, 1.0);
             if let Some(ctx) = context {
@@ -117,25 +130,33 @@ impl Goal {
             sub.result = Some(result);
         }
         self.recalculate_progress();
-        if self.sub_goals.iter().all(|s| s.state == GoalState::Completed) {
+        if self
+            .sub_goals
+            .iter()
+            .all(|s| s.state == GoalState::Completed)
+        {
             self.state = GoalState::Completed;
         }
         self.updated_at = chrono::Local::now().to_rfc3339();
     }
 
     pub fn get_next_actionable(&self) -> Vec<&SubGoal> {
-        let completed: std::collections::HashSet<&GoalId> = self.sub_goals.iter()
+        let completed: std::collections::HashSet<&GoalId> = self
+            .sub_goals
+            .iter()
             .filter(|s| s.state == GoalState::Completed)
             .map(|s| &s.id)
             .collect();
-        self.sub_goals.iter()
+        self.sub_goals
+            .iter()
             .filter(|s| matches!(s.state, GoalState::Proposed | GoalState::InProgress))
             .filter(|s| s.is_ready(&completed))
             .collect()
     }
 
     pub fn get_blocked(&self) -> Vec<&SubGoal> {
-        self.sub_goals.iter()
+        self.sub_goals
+            .iter()
             .filter(|s| matches!(s.state, GoalState::Blocked { .. }))
             .collect()
     }
@@ -156,24 +177,33 @@ impl Goal {
              Use empty array for depends_on_indices if no dependencies. \
              depends_on_indices uses 0-based index of previously listed sub-goals.",
             self.description,
-            if self.context.len() > 1000 { &self.context[..1000] } else { &self.context },
+            if self.context.len() > 1000 {
+                &self.context[..1000]
+            } else {
+                &self.context
+            },
             self.strategy.as_deref().unwrap_or("none"),
             self.max_depth
         )
     }
 
     pub fn generate_strategy_prompt(&self) -> String {
-        let sub_goals_summary: Vec<String> = self.sub_goals.iter()
-            .map(|s| format!("- [{}] {} (progress: {:.0}%)", 
-                match &s.state {
-                    GoalState::Completed => "✓",
-                    GoalState::InProgress => "→",
-                    GoalState::Blocked { .. } => "✗",
-                    _ => "○",
-                },
-                s.description,
-                s.progress * 100.0
-            ))
+        let sub_goals_summary: Vec<String> = self
+            .sub_goals
+            .iter()
+            .map(|s| {
+                format!(
+                    "- [{}] {} (progress: {:.0}%)",
+                    match &s.state {
+                        GoalState::Completed => "✓",
+                        GoalState::InProgress => "→",
+                        GoalState::Blocked { .. } => "✗",
+                        _ => "○",
+                    },
+                    s.description,
+                    s.progress * 100.0
+                )
+            })
             .collect();
         format!(
             "You are a strategic planner. Given the current goal state, propose a strategy.\n\n\
@@ -206,23 +236,37 @@ impl Goal {
 
     pub fn render_status(&self) -> String {
         let mut status = format!("Goal: {}\n", self.description);
-        status.push_str(&format!("State: {:?} | Progress: {:.0}%\n", self.state, self.overall_progress * 100.0));
+        status.push_str(&format!(
+            "State: {:?} | Progress: {:.0}%\n",
+            self.state,
+            self.overall_progress * 100.0
+        ));
         status.push_str("Sub-goals:\n");
         for sub in &self.sub_goals {
             let icon = match &sub.state {
                 GoalState::Completed => "✓",
                 GoalState::InProgress => "→",
-                GoalState::Blocked { reason } => &format!("✗({})", reason.chars().take(20).collect::<String>()),
+                GoalState::Blocked { reason } => {
+                    &format!("✗({})", reason.chars().take(20).collect::<String>())
+                }
                 GoalState::Proposed => "○",
                 GoalState::Active => "●",
-                GoalState::Abandoned { reason } => &format!("⊘({})", reason.chars().take(20).collect::<String>()),
+                GoalState::Abandoned { reason } => {
+                    &format!("⊘({})", reason.chars().take(20).collect::<String>())
+                }
             };
             let deps = if sub.depends_on.is_empty() {
                 String::new()
             } else {
                 format!(" [after: {}]", sub.depends_on.join(","))
             };
-            status.push_str(&format!("  {} {} ({}%){}\n", icon, sub.description, (sub.progress * 100.0) as u8, deps));
+            status.push_str(&format!(
+                "  {} {} ({}%){}\n",
+                icon,
+                sub.description,
+                (sub.progress * 100.0) as u8,
+                deps
+            ));
         }
         status
     }
@@ -277,7 +321,9 @@ impl GoalManager {
     }
 
     pub fn active_goal(&self) -> Option<&Goal> {
-        self.active_goal_id.as_ref().and_then(|id| self.goals.get(id))
+        self.active_goal_id
+            .as_ref()
+            .and_then(|id| self.goals.get(id))
     }
 
     pub fn deactivate_active_goal(&mut self) {
@@ -285,7 +331,9 @@ impl GoalManager {
     }
 
     pub fn active_goal_mut(&mut self) -> Option<&mut Goal> {
-        self.active_goal_id.as_ref().and_then(|id| self.goals.get_mut(id))
+        self.active_goal_id
+            .as_ref()
+            .and_then(|id| self.goals.get_mut(id))
     }
 
     pub fn decompose_active(&mut self, sub_goals: Vec<(String, Vec<usize>, u8)>) {

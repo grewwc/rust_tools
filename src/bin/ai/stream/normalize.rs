@@ -170,7 +170,8 @@ fn parse_content_part_event(
     event_type: &str,
     value: &serde_json::Value,
 ) -> Option<ParsedStreamPayload> {
-    if !(event_type == "response.content_part.added" || event_type == "response.content_part.done") {
+    if !(event_type == "response.content_part.added" || event_type == "response.content_part.done")
+    {
         return None;
     }
 
@@ -249,7 +250,8 @@ fn stream_chunk_with_delta(delta: StreamDelta) -> StreamChunk {
 }
 
 fn extract_output_index(value: &serde_json::Value) -> usize {
-    value.get("output_index")
+    value
+        .get("output_index")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0) as usize
 }
@@ -298,7 +300,8 @@ fn extract_function_name(value: &serde_json::Value) -> String {
     if !direct.is_empty() {
         return direct;
     }
-    value.get("function")
+    value
+        .get("function")
         .map(|function| extract_stringish_field(function, &["name"]))
         .unwrap_or_default()
 }

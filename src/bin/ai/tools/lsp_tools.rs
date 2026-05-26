@@ -393,10 +393,7 @@ fn lsp_document_symbols(file_path: &str) -> Result<String, String> {
             Ok(symbols) => return Ok(ast_symbols::format_symbols_output(file_path, &symbols)),
             Err(err) => {
                 let fallback = fallback_document_symbols(file_path, &content, &language);
-                return Ok(format!(
-                    "{}\n\n[AST parser fallback: {}]",
-                    fallback, err
-                ));
+                return Ok(format!("{}\n\n[AST parser fallback: {}]", fallback, err));
             }
         }
     }

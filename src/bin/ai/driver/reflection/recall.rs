@@ -207,7 +207,10 @@ fn try_get_cached_recall_bundle(key: &RecallBundleCacheKey) -> Option<RecallBund
         return None;
     };
     cache.retain(|entry| entry.created_at.elapsed() < RECALL_BUNDLE_CACHE_TTL);
-    cache.iter().find(|entry| &entry.key == key).map(|entry| entry.value.clone())
+    cache
+        .iter()
+        .find(|entry| &entry.key == key)
+        .map(|entry| entry.value.clone())
 }
 
 fn store_cached_recall_bundle(key: RecallBundleCacheKey, value: RecallBundle) {

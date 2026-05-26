@@ -91,7 +91,10 @@ impl VerificationCycle {
     pub fn revise(&mut self, new_hypothesis: String, feedback: String) -> Result<(), String> {
         if self.revision_count >= self.max_revisions {
             self.outcome = Some(VerificationOutcome::Rejected {
-                reason: format!("Max revisions ({}) reached. Last feedback: {}", self.max_revisions, feedback),
+                reason: format!(
+                    "Max revisions ({}) reached. Last feedback: {}",
+                    self.max_revisions, feedback
+                ),
             });
             return Err("max revisions reached".to_string());
         }
@@ -154,7 +157,8 @@ impl VerificationWorkflow {
                     let old_hypothesis = self.cycles[self.current_cycle_idx].hypothesis.clone();
                     let revised_hypothesis = format!("{} (revised: {})", old_hypothesis, feedback);
                     let mut new_cycle = VerificationCycle::new(revised_hypothesis, 3);
-                    new_cycle.revision_count = self.cycles[self.current_cycle_idx].revision_count + 1;
+                    new_cycle.revision_count =
+                        self.cycles[self.current_cycle_idx].revision_count + 1;
                     self.cycles.push(new_cycle);
                     self.current_cycle_idx += 1;
                     self.current_step = VerificationStep::GenerateHypothesis;
@@ -211,7 +215,9 @@ impl VerificationWorkflow {
             ));
         }
         if cycle.test_results.is_empty() {
-            results_str.push_str("(no test results captured yet - be explicit that evidence is missing)\n");
+            results_str.push_str(
+                "(no test results captured yet - be explicit that evidence is missing)\n",
+            );
         }
         format!(
             "Analyze these test results against the hypothesis. Ground your judgment in the stdout/stderr content, not just pass/fail booleans.\n\n\
@@ -223,8 +229,7 @@ impl VerificationWorkflow {
              3. If needs revision, what should the new hypothesis be?\n\
              4. What specific feedback led to this conclusion?\n\n\
              Output STRICT JSON: {{\"verdict\":\"confirmed\"|\"rejected\"|\"needs_revision\"|\"inconclusive\",\"reason\":\"...\",\"evidence\":\"...\",\"new_hypothesis\":\"...\",\"feedback\":\"...\"}}",
-            cycle.hypothesis,
-            results_str
+            cycle.hypothesis, results_str
         )
     }
 
@@ -239,8 +244,10 @@ impl VerificationWorkflow {
                 cycle.test_results.len(),
                 match &cycle.outcome {
                     Some(VerificationOutcome::Confirmed) => "✓ Confirmed".to_string(),
-                    Some(VerificationOutcome::Rejected { reason }) => format!("✗ Rejected: {}", reason),
-                    Some(VerificationOutcome::NeedsRevision { feedback }) => format!("↻ Needs revision: {}", feedback),
+                    Some(VerificationOutcome::Rejected { reason }) =>
+                        format!("✗ Rejected: {}", reason),
+                    Some(VerificationOutcome::NeedsRevision { feedback }) =>
+                        format!("↻ Needs revision: {}", feedback),
                     Some(VerificationOutcome::Inconclusive) => "? Inconclusive".to_string(),
                     None => "... In progress".to_string(),
                 }
@@ -289,7 +296,9 @@ mod tests {
     #[test]
     fn cycle_revision() {
         let mut cycle = VerificationCycle::new("h1".to_string(), 3);
-        cycle.revise("h2".to_string(), "evidence against h1".to_string()).unwrap();
+        cycle
+            .revise("h2".to_string(), "evidence against h1".to_string())
+            .unwrap();
         assert_eq!(cycle.revision_count, 1);
         assert_eq!(cycle.hypothesis, "h2");
     }

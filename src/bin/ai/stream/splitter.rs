@@ -46,7 +46,8 @@ impl InternalToolCallStreamer {
                         self.phase = InternalToolCallStreamerPhase::AwaitingName;
                         continue;
                     }
-                    let keep = longest_marker_suffix_prefix(&self.pending, &[TOOL_CALL_BEGIN_MARKER]);
+                    let keep =
+                        longest_marker_suffix_prefix(&self.pending, &[TOOL_CALL_BEGIN_MARKER]);
                     let emit_len = self.pending.len().saturating_sub(keep);
                     if emit_len > 0 {
                         cleaned.push_str(&self.pending[..emit_len]);
@@ -182,7 +183,11 @@ impl InternalToolCallStreamer {
 
 enum BoundaryHit {
     Brace(usize),
-    Marker { pos: usize, marker: &'static str, len: usize },
+    Marker {
+        pos: usize,
+        marker: &'static str,
+        len: usize,
+    },
 }
 
 fn sanitize_internal_tool_call_name(raw: &str) -> String {
@@ -273,7 +278,9 @@ impl StreamSplitter {
                 earliest_marker_match(&self.pending, markers)
             {
                 if marker_pos > 0 {
-                    segments.push(StreamSplitSegment::Text(self.pending[..marker_pos].to_string()));
+                    segments.push(StreamSplitSegment::Text(
+                        self.pending[..marker_pos].to_string(),
+                    ));
                 }
                 let marker_end = marker_pos + marker_len;
                 segments.push(StreamSplitSegment::Marker {
@@ -294,7 +301,9 @@ impl StreamSplitter {
                 break;
             }
 
-            segments.push(StreamSplitSegment::Text(self.pending[..emit_len].to_string()));
+            segments.push(StreamSplitSegment::Text(
+                self.pending[..emit_len].to_string(),
+            ));
             self.pending.drain(..emit_len);
             if !flush_all {
                 break;
@@ -377,7 +386,9 @@ fn split_wrapped_markers(s: &str, start: &str, end: &str) -> Vec<WrappedSplitSeg
     while let Some(start_rel) = s[offset..].find(start) {
         let marker_start = offset + start_rel;
         if marker_start > offset {
-            segments.push(WrappedSplitSegment::Text(s[offset..marker_start].to_string()));
+            segments.push(WrappedSplitSegment::Text(
+                s[offset..marker_start].to_string(),
+            ));
         }
 
         let body_start = marker_start + start.len();
@@ -608,7 +619,8 @@ mod tests {
     fn internal_tool_call_streamer_emits_args_incrementally_across_chunks() {
         let mut streamer = InternalToolCallStreamer::new();
 
-        let (cleaned1, events1) = streamer.push("intro<|tool_call_begin|>write_file<|tool_call_args|>{\"path\":\"a\"");
+        let (cleaned1, events1) =
+            streamer.push("intro<|tool_call_begin|>write_file<|tool_call_args|>{\"path\":\"a\"");
         assert_eq!(cleaned1, "intro");
         assert_eq!(
             events1,

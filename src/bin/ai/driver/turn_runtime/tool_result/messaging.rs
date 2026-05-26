@@ -11,12 +11,12 @@ use crate::ai::{
         tools::ExecuteToolCallsResult,
     },
     history::{Message, ROLE_INTERNAL_NOTE, is_system_like_role},
-    types::ToolCall,
     types::App,
+    types::ToolCall,
 };
 
-use super::execution::prepare_tool_result;
 use super::super::types::PreparedToolResult;
+use super::execution::prepare_tool_result;
 
 const CODE_INSPECTION_MEMORY_PREFIX: &str = "Current code-inspection working memory:";
 const CODE_DISCOVERY_PREFIX: &str = "code_discovery:";
@@ -38,7 +38,11 @@ pub(super) fn append_message_pair(
     turn_messages.push(message);
 }
 
-pub(super) fn record_hidden_self_note(app: &App, turn_messages: &mut Vec<Message>, hidden_meta: &str) {
+pub(super) fn record_hidden_self_note(
+    app: &App,
+    turn_messages: &mut Vec<Message>,
+    hidden_meta: &str,
+) {
     let hidden_meta = hidden_meta.trim();
     if hidden_meta.is_empty() {
         return;
@@ -178,19 +182,26 @@ pub(super) fn append_tool_result_messages(
                         || tool_call.function.name == "shell"
                         || tool_call.function.name == "bash";
                     if is_execution_tool {
-                        !content_lower.contains("error:") && !content_lower.contains("exit code")
+                        !content_lower.contains("error:")
+                            && !content_lower.contains("exit code")
                             && !content_lower.contains("command not found")
                             && !content_lower.contains("permission denied")
                     } else {
-                        !content_lower.starts_with("error:") && !content_lower.starts_with("failed:")
+                        !content_lower.starts_with("error:")
+                            && !content_lower.starts_with("failed:")
                     }
                 },
             };
             let obs_name = obs.name().to_string();
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 obs.on_tool_result(&ctx);
-            })).is_err() {
-                eprintln!("[Warning] observer '{}' panicked in on_tool_result; disabling for rest of conversation.", obs_name);
+            }))
+            .is_err()
+            {
+                eprintln!(
+                    "[Warning] observer '{}' panicked in on_tool_result; disabling for rest of conversation.",
+                    obs_name
+                );
                 obs.mark_poisoned();
             }
         }
@@ -316,7 +327,9 @@ fn merge_into_existing_code_discovery(messages: &mut [Message], new_body: &str) 
         if !content.starts_with(CODE_DISCOVERY_PREFIX) {
             continue;
         }
-        let existing_body = content[CODE_DISCOVERY_PREFIX.len()..].trim_start().to_string();
+        let existing_body = content[CODE_DISCOVERY_PREFIX.len()..]
+            .trim_start()
+            .to_string();
         let mut seen: std::collections::HashSet<String> = existing_body
             .lines()
             .map(|l| l.trim().to_string())
@@ -371,6 +384,7 @@ pub(super) fn record_final_stream_response(
 
 fn build_code_inspection_working_memory(turn_messages: &[Message]) -> Option<String> {
     let findings = collect_repo_inspection_findings(turn_messages);
+    let exact_calls = collect_completed_repo_inspection_calls(turn_messages);
 
     let mut raw_repo_tool_count = 0usize;
     let mut code_search_count = 0usize;
@@ -396,12 +410,24 @@ fn build_code_inspection_working_memory(turn_messages: &[Message]) -> Option<Str
         }
     }
 
-    if findings.is_empty() && raw_repo_tool_count < 2 && write_tool_count == 0 {
+    if findings.is_empty()
+        && exact_calls.is_empty()
+        && raw_repo_tool_count < 2
+        && write_tool_count == 0
+    {
         return None;
     }
 
     let mut note = String::from(CODE_INSPECTION_MEMORY_PREFIX);
     note.push('\n');
+    if !exact_calls.is_empty() {
+        note.push_str("Completed exact tool calls in this turn; do not repeat identical args unless the file/data changed or the previous result was unusable:\n");
+        for call in exact_calls.iter().rev().take(8).rev() {
+            note.push_str("- ");
+            note.push_str(call);
+            note.push('\n');
+        }
+    }
     for finding in findings.iter().rev().take(6).rev() {
         note.push_str(&finding.rendered);
         note.push('\n');
@@ -419,6 +445,49 @@ fn build_code_inspection_working_memory(turn_messages: &[Message]) -> Option<Str
         );
     }
     Some(truncate_note(&note, 1800))
+}
+
+fn collect_completed_repo_inspection_calls(turn_messages: &[Message]) -> Vec<String> {
+    let completed_ids = turn_messages
+        .iter()
+        .filter_map(|message| {
+            (message.role == "tool")
+                .then(|| message.tool_call_id.clone())
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    if completed_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let mut seen = SkipSet::new(16);
+    for message in turn_messages {
+        let Some(tool_calls) = &message.tool_calls else {
+            continue;
+        };
+        for tool_call in tool_calls {
+            if !completed_ids.iter().any(|id| id == &tool_call.id) {
+                continue;
+            }
+            let tool_name = tool_call.function.name.as_str();
+            if !is_repo_inspection_tool(tool_name) {
+                continue;
+            }
+            let args = normalized_tool_arguments(&tool_call.function.arguments);
+            let rendered = format!("{tool_name}({args})");
+            if seen.insert(rendered.clone()) {
+                out.push(rendered);
+            }
+        }
+    }
+    out
+}
+
+fn normalized_tool_arguments(raw: &str) -> String {
+    serde_json::from_str::<Value>(raw)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|_| raw.trim().to_string())
 }
 
 fn build_persistent_code_discoveries(turn_messages: &[Message]) -> Vec<CodeDiscoveryRecord> {
@@ -528,10 +597,15 @@ fn describe_tool_call(tool_call: &ToolCall) -> String {
     };
     match tool_call.function.name.as_str() {
         "code_search" => {
-            let operation = args.get("operation").and_then(|v| v.as_str()).unwrap_or("search");
+            let operation = args
+                .get("operation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("search");
             let mut parts = vec![format!("operation={operation}")];
             for key in ["query", "symbol", "file_path", "path", "intent"] {
-                if let Some(value) = args.get(key).and_then(|v| v.as_str()) && !value.is_empty() {
+                if let Some(value) = args.get(key).and_then(|v| v.as_str())
+                    && !value.is_empty()
+                {
                     parts.push(format!("{key}={}", truncate_inline(value, 48)));
                 }
             }
@@ -547,7 +621,12 @@ fn describe_tool_call(tool_call: &ToolCall) -> String {
             let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1);
             let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(0);
             if limit > 0 {
-                format!("(file={}, lines={}..{})", path, offset, offset + limit.saturating_sub(1))
+                format!(
+                    "(file={}, lines={}..{})",
+                    path,
+                    offset,
+                    offset + limit.saturating_sub(1)
+                )
             } else {
                 format!("(file={path})")
             }
@@ -659,9 +738,9 @@ fn truncate_note(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::smart_truncate_to_sentence;
     use super::{
-        build_code_inspection_working_memory, build_persistent_code_discoveries,
-        classify_code_discovery, is_repo_inspection_tool, persistent_code_discovery_already_present,
-        RepoInspectionFinding,
+        RepoInspectionFinding, build_code_inspection_working_memory,
+        build_persistent_code_discoveries, classify_code_discovery, is_repo_inspection_tool,
+        persistent_code_discovery_already_present,
     };
     use crate::ai::code_discovery_policy::{CodeDiscoveryConfidence, CodeDiscoveryKind};
     use crate::ai::history::Message;
@@ -687,8 +766,7 @@ mod tests {
     #[test]
     fn smart_truncate_falls_back_to_sentence_boundary() {
         // cap=80, lower=80*6/7≈68. 句号位置：22 / 49 / 71 / 后续。
-        let text =
-            "Step one finished ok. Step two searched repo. Step three is running. \
+        let text = "Step one finished ok. Step two searched repo. Step three is running. \
              Step four extends well beyond the cap.";
         let out = smart_truncate_to_sentence(text, 80);
         assert!(out.contains("[truncated: "), "expected marker, got: {out}");
@@ -770,10 +848,19 @@ mod tests {
 
         let note = build_code_inspection_working_memory(&turn_messages).expect("note");
         assert!(note.contains("Current code-inspection working memory"));
+        assert!(note.contains("Completed exact tool calls in this turn"));
+        assert!(note.contains("read_file_lines("));
+        assert!(note.contains("\"file_path\":\"src/lib.rs\""));
+        assert!(note.contains("\"offset\":10"));
+        assert!(note.contains("read_file("));
+        assert!(note.contains("\"file_path\":\"src/main.rs\""));
         assert!(note.contains("read_file_lines(file=src/lib.rs, lines=10..29)"));
         assert!(note.contains("grep_search(query=panic!)"));
         assert!(note.contains("Code-navigation correction"));
-        assert!(note.contains("use `code_search` first") || note.contains("Before another raw read, use `code_search` first"));
+        assert!(
+            note.contains("use `code_search` first")
+                || note.contains("Before another raw read, use `code_search` first")
+        );
     }
 
     #[test]
@@ -820,11 +907,7 @@ mod tests {
                         "read_file_lines",
                         serde_json::json!({"file_path":"src/lib.rs","offset":10,"limit":20}),
                     ),
-                    tool_call(
-                        "2",
-                        "list_directory",
-                        serde_json::json!({"path":"src"}),
-                    ),
+                    tool_call("2", "list_directory", serde_json::json!({"path":"src"})),
                 ]),
                 tool_call_id: None,
                 reasoning_content: None,

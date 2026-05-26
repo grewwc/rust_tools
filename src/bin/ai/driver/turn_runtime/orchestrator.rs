@@ -2,7 +2,7 @@
 // Turn Orchestrator - Main Turn Execution Coordinator
 // =============================================================================
 // This module contains run_turn(), the main entry point for executing a single turn.
-// 
+//
 // Flow:
 //   1. prepare_turn(): Build initial messages
 //   2. Loop (max_iterations):
@@ -16,20 +16,22 @@
 use crate::ai::{mcp::SharedMcpClient, types::App};
 
 use super::{
+    MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
+    MID_TURN_COMPRESS_HARD_THRESHOLD, MID_TURN_COMPRESS_SOFT_THRESHOLD,
+    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
     finalize::finalize_turn,
     iteration::{execute_turn_iteration, refresh_skill_turn_for_iteration},
     prepare::prepare_turn,
     tool_result::handle_iteration_execution,
     types::{TurnLoopStep, TurnOutcome, TurnPreparation},
-    MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
-    MID_TURN_COMPRESS_HARD_THRESHOLD, MID_TURN_COMPRESS_SOFT_THRESHOLD,
-    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
 };
 
-/// 工具调用循环检测窗口：连续 N 轮调用 (tool_name, normalized_args) 完全一致
-/// 视为 agent 卡死，提前介入，避免到 max_iterations 才举手投降。
-const TOOL_LOOP_WINDOW: usize = 4;
-const TOOL_SIGNATURE_HISTORY_LIMIT: usize = TOOL_LOOP_WINDOW + 2;
+/// 工具调用循环检测窗口：
+/// - soft: 连续 2 轮调用 (tool_name, normalized_args) 完全一致，先注入反思提示
+/// - hard: 连续 3 轮完全一致，直接强制收敛，不再继续工具循环
+const TOOL_LOOP_SOFT_WINDOW: usize = 2;
+const TOOL_LOOP_HARD_WINDOW: usize = 3;
+const TOOL_SIGNATURE_HISTORY_LIMIT: usize = TOOL_LOOP_HARD_WINDOW + 2;
 const TASK_ANCHOR_MAX_QUESTION_CHARS: usize = 220;
 
 /// 提取最近一轮 assistant 消息中的 (tool_name, args_json) 签名集合。
@@ -55,11 +57,11 @@ fn extract_round_tool_signatures(messages: &[crate::ai::history::Message]) -> Op
     Some(sigs)
 }
 
-fn detect_tool_loop(history: &[Vec<String>]) -> bool {
-    if history.len() < TOOL_LOOP_WINDOW {
+fn detect_tool_loop(history: &[Vec<String>], window: usize) -> bool {
+    if window == 0 || history.len() < window {
         return false;
     }
-    let tail = &history[history.len() - TOOL_LOOP_WINDOW..];
+    let tail = &history[history.len() - window..];
     let first = &tail[0];
     if first.is_empty() {
         return false;
@@ -105,11 +107,18 @@ fn inject_task_anchor_note(
 struct TurnSupervisor {
     iteration: usize,
     loop_breaker_injected: bool,
+    hard_loop_stop_injected: bool,
     iteration_limit_note_injected: bool,
     task_anchor_injected: bool,
     last_compress_iteration: usize,
     last_compress_after_chars: usize,
     tool_signature_history: Vec<Vec<String>>,
+}
+
+enum ToolLoopSignal {
+    None,
+    Soft,
+    Hard,
 }
 
 impl TurnSupervisor {
@@ -119,12 +128,9 @@ impl TurnSupervisor {
     }
 
     fn should_try_mid_turn_compress(&self, total_chars: usize) -> bool {
-        let cooldown_passed = self
-            .iteration
-            .saturating_sub(self.last_compress_iteration)
+        let cooldown_passed = self.iteration.saturating_sub(self.last_compress_iteration)
             >= MID_TURN_COMPRESS_COOLDOWN_ITERATIONS;
-        let delta_significant = total_chars
-            .saturating_sub(self.last_compress_after_chars)
+        let delta_significant = total_chars.saturating_sub(self.last_compress_after_chars)
             >= MID_TURN_COMPRESS_DELTA_THRESHOLD;
         total_chars > MID_TURN_COMPRESS_SOFT_THRESHOLD
             && cooldown_passed
@@ -136,23 +142,31 @@ impl TurnSupervisor {
         self.last_compress_after_chars = after_chars;
     }
 
-    fn record_tool_signatures_and_should_break_loop(
+    fn record_tool_signatures(
         &mut self,
         messages: &[crate::ai::history::Message],
-    ) -> bool {
+    ) -> ToolLoopSignal {
         let Some(sigs) = extract_round_tool_signatures(messages) else {
-            return false;
+            return ToolLoopSignal::None;
         };
         self.tool_signature_history.push(sigs);
         if self.tool_signature_history.len() > TOOL_SIGNATURE_HISTORY_LIMIT {
             let drop = self.tool_signature_history.len() - TOOL_SIGNATURE_HISTORY_LIMIT;
             self.tool_signature_history.drain(0..drop);
         }
-        !self.loop_breaker_injected && detect_tool_loop(&self.tool_signature_history)
-    }
-
-    fn mark_loop_breaker_injected(&mut self) {
-        self.loop_breaker_injected = true;
+        if !self.hard_loop_stop_injected
+            && detect_tool_loop(&self.tool_signature_history, TOOL_LOOP_HARD_WINDOW)
+        {
+            self.hard_loop_stop_injected = true;
+            return ToolLoopSignal::Hard;
+        }
+        if !self.loop_breaker_injected
+            && detect_tool_loop(&self.tool_signature_history, TOOL_LOOP_SOFT_WINDOW)
+        {
+            self.loop_breaker_injected = true;
+            return ToolLoopSignal::Soft;
+        }
+        ToolLoopSignal::None
     }
 
     fn maybe_inject_iteration_limit_note(
@@ -206,6 +220,21 @@ fn inject_loop_breaker_note(messages: &mut Vec<crate::ai::history::Message>) {
     });
 }
 
+fn inject_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let note = "[loop-hard-stop] 你已连续 3 轮用相同参数调用相同工具，判定为无效循环。\n\
+        从现在起不要再发起任何工具调用：请基于已有信息直接回答用户；\n\
+        如果信息仍不足，明确说明缺口与建议的下一步。";
+    messages.push(Message {
+        role: "system".to_string(),
+        content: Value::String(note.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
 /// max_iterations 触发后的自反思 prompt（替代纯 force_final 举手投降）。
 fn inject_iteration_limit_reflect_note(
     messages: &mut Vec<crate::ai::history::Message>,
@@ -236,20 +265,58 @@ mod tests {
         let sig = vec!["read_file::{\"path\":\"a.rs\"}".to_string()];
         // 不足窗口
         let history = vec![sig.clone(), sig.clone()];
-        assert!(!detect_tool_loop(&history));
+        assert!(detect_tool_loop(&history, TOOL_LOOP_SOFT_WINDOW));
+        assert!(!detect_tool_loop(&history, TOOL_LOOP_HARD_WINDOW));
         // 满窗口且完全相同
-        let history = vec![sig.clone(); TOOL_LOOP_WINDOW];
-        assert!(detect_tool_loop(&history));
+        let history = vec![sig.clone(); TOOL_LOOP_HARD_WINDOW];
+        assert!(detect_tool_loop(&history, TOOL_LOOP_HARD_WINDOW));
         // 满窗口但有一轮不同
-        let mut history = vec![sig.clone(); TOOL_LOOP_WINDOW];
+        let mut history = vec![sig.clone(); TOOL_LOOP_HARD_WINDOW];
         history[1] = vec!["read_file::{\"path\":\"b.rs\"}".to_string()];
-        assert!(!detect_tool_loop(&history));
+        assert!(!detect_tool_loop(&history, TOOL_LOOP_HARD_WINDOW));
     }
 
     #[test]
     fn detect_tool_loop_ignores_empty_signatures() {
-        let history = vec![Vec::<String>::new(); TOOL_LOOP_WINDOW];
-        assert!(!detect_tool_loop(&history));
+        let history = vec![Vec::<String>::new(); TOOL_LOOP_HARD_WINDOW];
+        assert!(!detect_tool_loop(&history, TOOL_LOOP_SOFT_WINDOW));
+        assert!(!detect_tool_loop(&history, TOOL_LOOP_HARD_WINDOW));
+    }
+
+    #[test]
+    fn turn_supervisor_emits_soft_then_hard_loop_signal() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let assistant_with_same_read = |id: &str| crate::ai::history::Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{\"path\":\"src/main.rs\",\"offset\":140,\"limit\":80}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+
+        messages.push(assistant_with_same_read("tc-1"));
+        assert!(matches!(
+            supervisor.record_tool_signatures(&messages),
+            ToolLoopSignal::None
+        ));
+        messages.push(assistant_with_same_read("tc-2"));
+        assert!(matches!(
+            supervisor.record_tool_signatures(&messages),
+            ToolLoopSignal::Soft
+        ));
+        messages.push(assistant_with_same_read("tc-3"));
+        assert!(matches!(
+            supervisor.record_tool_signatures(&messages),
+            ToolLoopSignal::Hard
+        ));
     }
 
     #[test]
@@ -452,7 +519,11 @@ async fn run_turn_body(
                     if !new_tools.is_empty() {
                         if let Some(ctx) = app.agent_context.as_mut() {
                             for tool in new_tools {
-                                if !ctx.tools.iter().any(|t| t.function.name == tool.function.name) {
+                                if !ctx
+                                    .tools
+                                    .iter()
+                                    .any(|t| t.function.name == tool.function.name)
+                                {
                                     ctx.tools.push(tool);
                                 }
                             }
@@ -460,10 +531,8 @@ async fn run_turn_body(
                     }
                     // 记录本轮 assistant 实际调用过的 tool 名字（去重），
                     // 留给 turn 末用于老化未用 explicit tool。
-                    if let Some(last_assistant) = messages
-                        .iter()
-                        .rev()
-                        .find(|m| m.role == "assistant")
+                    if let Some(last_assistant) =
+                        messages.iter().rev().find(|m| m.role == "assistant")
                         && let Some(tool_calls) = &last_assistant.tool_calls
                     {
                         for tc in tool_calls {
@@ -484,10 +553,8 @@ async fn run_turn_body(
         let total_chars = crate::ai::history::messages_total_chars_pub(&messages);
         if supervisor.should_try_mid_turn_compress(total_chars) {
             let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
-            let (compressed, before, after) = crate::ai::history::mid_turn_compress(
-                drained,
-                MID_TURN_COMPRESS_SOFT_THRESHOLD,
-            );
+            let (compressed, before, after) =
+                crate::ai::history::mid_turn_compress(drained, MID_TURN_COMPRESS_SOFT_THRESHOLD);
             messages = compressed;
             supervisor.mark_compress(after);
             if after < before {
@@ -526,15 +593,30 @@ async fn run_turn_body(
         }
 
         // === 工具循环检测 ===
-        if supervisor.record_tool_signatures_and_should_break_loop(&messages) {
-            supervisor.mark_loop_breaker_injected();
-            crate::ai::driver::print::print_tool_note_line(
-                "agent-health",
-                "tool-loop detected: injecting self-reflect prompt",
-            );
-            inject_loop_breaker_note(&mut messages);
-            // 高风险异常才注入一次任务锚点，降低目标漂移概率。
-            supervisor.maybe_inject_task_anchor(&mut messages, &question, "tool-loop");
+        match supervisor.record_tool_signatures(&messages) {
+            ToolLoopSignal::None => {}
+            ToolLoopSignal::Soft => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    "tool-loop detected: injecting self-reflect prompt",
+                );
+                inject_loop_breaker_note(&mut messages);
+                // 高风险异常才注入一次任务锚点，降低目标漂移概率。
+                supervisor.maybe_inject_task_anchor(&mut messages, &question, "tool-loop");
+            }
+            ToolLoopSignal::Hard => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    "tool-loop hard-stop: forcing final response",
+                );
+                inject_hard_loop_stop_note(&mut messages);
+                supervisor.maybe_inject_task_anchor(
+                    &mut messages,
+                    &question,
+                    "tool-loop-hard-stop",
+                );
+                force_final_response = true;
+            }
         }
 
         // === Iteration limit 自反思 ===
@@ -562,18 +644,20 @@ async fn run_turn_body(
 
     match loop_result {
         Ok(Some(outcome)) => Ok(outcome),
-        Ok(_) => finalize_turn(
-            app,
-            &next_model,
-            &question,
-            &final_assistant_text,
-            final_assistant_recorded,
-            &mut turn_messages,
-            one_shot_mode,
-            &mut persisted_turn_messages,
-            should_quit,
-        )
-        .await,
+        Ok(_) => {
+            finalize_turn(
+                app,
+                &next_model,
+                &question,
+                &final_assistant_text,
+                final_assistant_recorded,
+                &mut turn_messages,
+                one_shot_mode,
+                &mut persisted_turn_messages,
+                should_quit,
+            )
+            .await
+        }
         Err(err_str) => Err(err_str.into()),
     }
 }

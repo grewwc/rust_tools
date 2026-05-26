@@ -88,11 +88,7 @@ fn derive_db_path(source: &Path) -> Option<PathBuf> {
 /// 把 memory 子系统的关键运维事件镜像到 AIOS kernel trace ring，
 /// 让 rotate / enforce / GC 等"会动数据"的动作在 AIOS 侧可观测。
 /// 任何获取不到内核或锁失败的情况都静默返回——不能影响主流程。
-pub(crate) fn trace_memory_event(
-    location: &'static str,
-    msg: &str,
-    fields: &[(&str, String)],
-) {
+pub(crate) fn trace_memory_event(location: &'static str, msg: &str, fields: &[(&str, String)]) {
     use aios_kernel::{FastMap, primitives::TraceLevel};
 
     let g = match crate::ai::tools::os_tools::GLOBAL_OS.lock() {
@@ -231,9 +227,7 @@ impl MemoryStore {
             entry
         };
         if should_dedup_learning_entry(entry_ref)
-            && self
-                .has_recent_duplicate(entry_ref, 200)
-                .unwrap_or(false)
+            && self.has_recent_duplicate(entry_ref, 200).unwrap_or(false)
         {
             return Ok(());
         }
@@ -558,10 +552,7 @@ impl MemoryStore {
         // 给被命中的条目计 LFU；失败只 trace。注意只对 top-N（已截到 limit）计数，
         // 而不是 cap=200 的中间集合，避免 score 很低的边缘条目刷出 hits。
         if let Some(idx) = memory_index_for(&self.path) {
-            let ids: Vec<String> = out
-                .iter()
-                .filter_map(|(e, _)| e.id.clone())
-                .collect();
+            let ids: Vec<String> = out.iter().filter_map(|(e, _)| e.id.clone()).collect();
             if !ids.is_empty() {
                 if let Err(e) = idx.record_hits(&ids) {
                     trace_memory_event(
@@ -620,8 +611,7 @@ fn should_dedup_learning_entry(entry: &AgentMemoryEntry) -> bool {
 }
 
 fn normalize_learning_note(note: &str) -> String {
-    note
-        .lines()
+    note.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
@@ -809,11 +799,7 @@ fn compute_similarity(entry: &AgentMemoryEntry, query_lc: &str) -> f64 {
     let j = similarity::jaccard(&tq, &te);
     let co = similarity::char_overlap(&nq, &ne);
     let s = 0.5 * d + 0.3 * j + 0.15 * co + base_contains;
-    if s < 0.0 {
-        0.0
-    } else {
-        s.min(1.0)
-    }
+    if s < 0.0 { 0.0 } else { s.min(1.0) }
 }
 
 fn resolve_memory_file() -> PathBuf {
@@ -1030,8 +1016,9 @@ impl MemoryStore {
 
             // 修复点 P1-1：原实现 `fs::write(&path, output)` 是 truncate-then-write，
             // 中途崩溃会留下不完整的主文件。改成 tmp+rename，文件系统层面原子。
-            atomic_write_file(&self.path, output.as_bytes())
-                .map_err(|e| format!("Failed to write memory file after quota enforcement: {}", e))?;
+            atomic_write_file(&self.path, output.as_bytes()).map_err(|e| {
+                format!("Failed to write memory file after quota enforcement: {}", e)
+            })?;
 
             // 文件已被整体重写，触发索引重建以保持一致；rebuild 内部包事务，失败只 trace。
             if let Some(idx) = memory_index_for(&self.path) {
@@ -1565,7 +1552,11 @@ mod retention_tests {
         store.enforce_max_entries(50, 10).unwrap();
 
         let kept = read_entries(&path);
-        assert!(kept.len() <= 50, "expected <=50 entries, got {}", kept.len());
+        assert!(
+            kept.len() <= 50,
+            "expected <=50 entries, got {}",
+            kept.len()
+        );
         let perm_kept = kept.iter().filter(|e| e.priority == Some(255)).count();
         assert_eq!(perm_kept, 5, "all permanent entries must survive");
 

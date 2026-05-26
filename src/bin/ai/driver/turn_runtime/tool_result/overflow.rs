@@ -4,8 +4,8 @@ use serde_json::Value;
 
 use crate::ai::{history::SessionStore, types::App};
 
-use super::preview::{tail_chars, truncate_chars};
 use super::super::{TOOL_OVERFLOW_PREVIEW_CHARS, types::LargeToolSummary};
+use super::preview::{tail_chars, truncate_chars};
 
 pub(super) fn summarize_large_tool_output(content: &str) -> LargeToolSummary {
     let trimmed = content.trim();
@@ -89,7 +89,9 @@ pub(super) fn write_tool_overflow_file(
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let store = SessionStore::new(app.session_history_file.as_path());
     store.ensure_root_dir()?;
-    let dir = store.session_assets_dir(&app.session_id).join("tool-overflow");
+    let dir = store
+        .session_assets_dir(&app.session_id)
+        .join("tool-overflow");
     fs::create_dir_all(&dir)?;
     let sanitized_name = tool_name
         .chars()

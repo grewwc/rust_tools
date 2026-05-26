@@ -229,7 +229,10 @@ fn parse_mod_edges(content: &str, current_file: &Path) -> Vec<PathBuf> {
 
 fn implicit_module_dir(current_file: &Path) -> PathBuf {
     let current_dir = current_file.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = current_file.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let file_name = current_file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     if file_name == "mod.rs" || is_crate_root_file(current_file) {
         return current_dir.to_path_buf();
     }
@@ -244,7 +247,10 @@ fn is_crate_root_file(current_file: &Path) -> bool {
     let Some(parent) = current_file.parent() else {
         return false;
     };
-    let file_name = current_file.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let file_name = current_file
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
     if matches!(file_name, "lib.rs" | "main.rs") {
         return true;
     }
@@ -332,20 +338,16 @@ fn extra_build_inputs(repo_root: &Path) -> Vec<PathBuf> {
 
 fn extract_lib_roots_from_bin(content: &str) -> Vec<String> {
     let mut out = SkipSet::new(16);
-    for prefix in [
-        "rust_tools::",
-        "use rust_tools::",
-        "use crate::",
-    ] {
+    for prefix in ["rust_tools::", "use rust_tools::", "use crate::"] {
         let mut start = 0usize;
         while let Some(idx) = content[start..].find(prefix) {
             let offset = start + idx + prefix.len();
             let rest = &content[offset..];
-            
+
             // Extract until the next semicolon to bound the search
             let end_stmt = rest.find(';').unwrap_or(rest.len());
             let stmt = &rest[..end_stmt];
-            
+
             // Extract all alphanumeric segments within the statement
             let mut word = String::new();
             for c in stmt.chars() {
@@ -361,7 +363,7 @@ fn extract_lib_roots_from_bin(content: &str) -> Vec<String> {
             if !word.is_empty() {
                 out.insert(word);
             }
-            
+
             start = offset + end_stmt;
         }
     }
@@ -490,12 +492,14 @@ mod tests {
 
         assert!(deps_set.contains(&bin_dir.join("ai").join("prompt.rs")));
         assert!(deps_set.contains(&bin_dir.join("ai").join("prompt").join("multiline.rs")));
-        assert!(deps_set.contains(
-            &bin_dir
-                .join("ai")
-                .join("prompt")
-                .join("multiline")
-                .join("render.rs")
-        ));
+        assert!(
+            deps_set.contains(
+                &bin_dir
+                    .join("ai")
+                    .join("prompt")
+                    .join("multiline")
+                    .join("render.rs")
+            )
+        );
     }
 }

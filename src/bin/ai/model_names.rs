@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+use crate::commonw::utils::expanduser;
 use rust_tools::commonw::FastMap;
 use rust_tools::cw::SkipSet;
-use crate::commonw::utils::expanduser;
 
 use super::provider::{ApiProvider, ModelQualityTier, ReasoningEffort};
 
@@ -76,10 +76,8 @@ where
 
 static USER_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_user_models);
 static BUILTIN_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_builtin_models);
-static USER_BY_NAME: LazyLock<FastMap<String, usize>> =
-    LazyLock::new(build_user_name_index);
-static BUILTIN_BY_NAME: LazyLock<FastMap<String, usize>> =
-    LazyLock::new(build_builtin_name_index);
+static USER_BY_NAME: LazyLock<FastMap<String, usize>> = LazyLock::new(build_user_name_index);
+static BUILTIN_BY_NAME: LazyLock<FastMap<String, usize>> = LazyLock::new(build_builtin_name_index);
 
 fn user_config_path() -> PathBuf {
     let home = expanduser("~/.config/rust_tools/models.json");

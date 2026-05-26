@@ -50,14 +50,14 @@ pub mod utils;
 // 重新导出常用类型
 
 /// 测量并打印函数执行时间（使用 `eprintln!` 输出）。
-/// 
+///
 /// 每次调用函数时，会自动计算执行耗时并打印类似 `[timing] my_function took 1.23 ms`。
 /// 可以接受一个可选的字符串参数作为标签，例如：`#[measure_time("custom_label")]`。
 ///
 /// # Example
 /// ```rust
 /// use rust_tools::commonw::measure_time;
-/// 
+///
 /// #[measure_time]
 /// fn compute() {
 ///     // ... 耗时操作
@@ -70,14 +70,14 @@ pub use rust_tools_macros::measure_time;
 pub use rust_tools_macros::debug_measure_time;
 
 /// 为函数添加 LRU（最近最少使用）缓存机制，自动缓存给定参数的返回结果。
-/// 
+///
 /// 需要指定 `cap`（容量），还可以可选地指定 `ttl_ms`（缓存过期时间，毫秒）。
 /// 函数的参数必须实现 `Clone`, `Hash`, 和 `Eq`，返回值必须实现 `Clone`。
 ///
 /// # Example
 /// ```rust
 /// use rust_tools::commonw::lru_cache;
-/// 
+///
 /// // 容量为 100，缓存过期时间为 5000 毫秒
 /// #[lru_cache(cap = 100, ttl_ms = 5000)]
 /// fn heavy_computation(a: i32, b: i32) -> i32 {

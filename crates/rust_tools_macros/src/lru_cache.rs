@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, LitInt, Ident};
+use syn::{Ident, LitInt, parse_macro_input};
 
 pub fn expand_lru_cache(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as CacheArgs);
@@ -13,17 +13,21 @@ pub fn expand_lru_cache(attr: TokenStream, item: TokenStream) -> TokenStream {
     let sig = &input_fn.sig;
 
     // Check if function has arguments (we need at least one for caching)
-    let arg_count = fn_args.iter().filter(|arg| match arg {
-        syn::FnArg::Receiver(_) => false,
-        syn::FnArg::Typed(_) => true,
-    }).count();
+    let arg_count = fn_args
+        .iter()
+        .filter(|arg| match arg {
+            syn::FnArg::Receiver(_) => false,
+            syn::FnArg::Typed(_) => true,
+        })
+        .count();
 
     if arg_count == 0 {
         return TokenStream::from(
             syn::Error::new_spanned(
                 &input_fn.sig,
                 "#[lru_cache] requires function with at least one argument to use as cache key",
-            ).into_compile_error()
+            )
+            .into_compile_error(),
         );
     }
 
@@ -33,7 +37,8 @@ pub fn expand_lru_cache(attr: TokenStream, item: TokenStream) -> TokenStream {
     let cache_name = quote::format_ident!("__LRU_CACHE_{}", fn_name_upper);
 
     // Collect argument patterns for key generation
-    let key_fields: Vec<_> = fn_args.iter()
+    let key_fields: Vec<_> = fn_args
+        .iter()
         .filter_map(|arg| match arg {
             syn::FnArg::Receiver(_) => None,
             syn::FnArg::Typed(pat_type) => Some(pat_type.pat.clone()),
@@ -42,7 +47,8 @@ pub fn expand_lru_cache(attr: TokenStream, item: TokenStream) -> TokenStream {
 
     // Generate tuple key type using references for get_ref
     let key_ref_type = if arg_count == 1 {
-        let ty = fn_args.iter()
+        let ty = fn_args
+            .iter()
             .filter_map(|arg| match arg {
                 syn::FnArg::Typed(pat_type) => Some(pat_type.ty.clone()),
                 _ => None,
@@ -51,7 +57,8 @@ pub fn expand_lru_cache(attr: TokenStream, item: TokenStream) -> TokenStream {
             .unwrap();
         quote! { #ty }
     } else {
-        let types: Vec<syn::Type> = fn_args.iter()
+        let types: Vec<syn::Type> = fn_args
+            .iter()
             .filter_map(|arg| match arg {
                 syn::FnArg::Typed(pat_type) => Some((*pat_type.ty).clone()),
                 _ => None,
@@ -82,7 +89,7 @@ pub fn expand_lru_cache(attr: TokenStream, item: TokenStream) -> TokenStream {
             use rust_tools::cw::lru_cache::LruCache;
 
             // Use LazyLock for lazy initialization of the Mutex<LruCache<...>>
-            static #cache_name: std::sync::LazyLock<std::sync::Mutex<LruCache<#key_ref_type, #ret_type>>> = 
+            static #cache_name: std::sync::LazyLock<std::sync::Mutex<LruCache<#key_ref_type, #ret_type>>> =
                 std::sync::LazyLock::new(|| #cache_init);
 
             let mut cache = #cache_name.lock().unwrap();
@@ -138,6 +145,9 @@ impl syn::parse::Parse for CacheArgs {
 
 impl Default for CacheArgs {
     fn default() -> Self {
-        CacheArgs { cap: 100, ttl_ms: -1 }
+        CacheArgs {
+            cap: 100,
+            ttl_ms: -1,
+        }
     }
 }

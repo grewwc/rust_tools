@@ -1,10 +1,9 @@
 /// 决策日志模块 - 记录 AI Agent 的关键决策过程
-/// 
+///
 /// 用于元认知（Meta-Cognition）：追溯"为什么做了某个选择"，便于调试和优化
-
 use chrono::Local;
-use serde::{Deserialize, Serialize};
 use rust_tools::commonw::FastMap;
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, Write},
@@ -108,11 +107,7 @@ impl DecisionLogStore {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        else {
+        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
             return;
         };
         let Ok(line) = serde_json::to_string(log) else {
@@ -124,16 +119,16 @@ impl DecisionLogStore {
     /// 记录一个决策
     pub fn log(&self, mut log: DecisionLog) {
         let mut logs = self.logs.lock().unwrap();
-        
+
         // 设置时间戳
         log.timestamp = Local::now().timestamp_millis();
-        
+
         // 如果超出容量，删除最旧的 10%
         if logs.len() >= self.max_capacity {
             let remove_count = self.max_capacity / 10;
             logs.drain(0..remove_count);
         }
-        
+
         let persist_copy = log.clone();
         logs.push(log);
         drop(logs);
@@ -195,9 +190,7 @@ impl DecisionLogStore {
     pub fn failures(&self) -> Vec<DecisionLog> {
         let logs = self.logs.lock().unwrap();
         logs.iter()
-            .filter(|log| {
-                log.outcome.as_ref().map(|o| !o.success).unwrap_or(false)
-            })
+            .filter(|log| log.outcome.as_ref().map(|o| !o.success).unwrap_or(false))
             .cloned()
             .collect()
     }
@@ -206,39 +199,29 @@ impl DecisionLogStore {
     pub fn low_confidence(&self, threshold: f64) -> Vec<DecisionLog> {
         let logs = self.logs.lock().unwrap();
         logs.iter()
-            .filter(|log| {
-                log.confidence.map(|c| c < threshold).unwrap_or(false)
-            })
+            .filter(|log| log.confidence.map(|c| c < threshold).unwrap_or(false))
             .cloned()
             .collect()
     }
 
     /// 更新某个决策的结果
-    pub fn update_outcome(
-        &self,
-        session_id: &str,
-        turn_id: usize,
-        outcome: Outcome,
-    ) {
+    pub fn update_outcome(&self, session_id: &str, turn_id: usize, outcome: Outcome) {
         let mut logs = self.logs.lock().unwrap();
-        if let Some(log) = logs.iter_mut().find(|log| {
-            log.session_id == session_id && log.turn_id == turn_id
-        }) {
+        if let Some(log) = logs
+            .iter_mut()
+            .find(|log| log.session_id == session_id && log.turn_id == turn_id)
+        {
             log.outcome = Some(outcome);
         }
     }
 
     /// 记录用户反馈
-    pub fn add_feedback(
-        &self,
-        session_id: &str,
-        turn_id: usize,
-        feedback: UserFeedback,
-    ) {
+    pub fn add_feedback(&self, session_id: &str, turn_id: usize, feedback: UserFeedback) {
         let mut logs = self.logs.lock().unwrap();
-        if let Some(log) = logs.iter_mut().find(|log| {
-            log.session_id == session_id && log.turn_id == turn_id
-        }) {
+        if let Some(log) = logs
+            .iter_mut()
+            .find(|log| log.session_id == session_id && log.turn_id == turn_id)
+        {
             if let Some(outcome) = &mut log.outcome {
                 outcome.user_feedback = Some(feedback);
             } else {
@@ -260,22 +243,22 @@ impl DecisionLogStore {
         } else {
             &logs[..]
         };
-        
-        serde_json::to_string_pretty(logs_to_export).unwrap_or_else(|e| {
-            format!("Error serializing logs: {}", e)
-        })
+
+        serde_json::to_string_pretty(logs_to_export)
+            .unwrap_or_else(|e| format!("Error serializing logs: {}", e))
     }
 
     /// 统计信息
     pub fn stats(&self) -> DecisionStats {
         let logs = self.logs.lock().unwrap();
-        
+
         let total = logs.len();
-        let successes = logs.iter().filter(|log| {
-            log.outcome.as_ref().map(|o| o.success).unwrap_or(false)
-        }).count();
+        let successes = logs
+            .iter()
+            .filter(|log| log.outcome.as_ref().map(|o| o.success).unwrap_or(false))
+            .count();
         let failures = total - successes;
-        
+
         let by_type: FastMap<String, usize> = logs
             .iter()
             .map(|log| format!("{:?}", log.decision_type))
@@ -283,30 +266,36 @@ impl DecisionLogStore {
                 *acc.entry(t).or_insert(0) += 1;
                 acc
             });
-        
+
         let confidence_count = logs.iter().filter(|log| log.confidence.is_some()).count();
         let avg_confidence = if confidence_count > 0 {
-            logs.iter()
-                .filter_map(|log| log.confidence)
-                .sum::<f64>() / (confidence_count as f64)
+            logs.iter().filter_map(|log| log.confidence).sum::<f64>() / (confidence_count as f64)
         } else {
             0.0
         };
-        
-        let exec_time_count = logs.iter().filter(|log| log.execution_time_ms.is_some()).count();
+
+        let exec_time_count = logs
+            .iter()
+            .filter(|log| log.execution_time_ms.is_some())
+            .count();
         let avg_execution_time_ms = if exec_time_count > 0 {
             logs.iter()
                 .filter_map(|log| log.execution_time_ms)
-                .sum::<u64>() as f64 / (exec_time_count as f64)
+                .sum::<u64>() as f64
+                / (exec_time_count as f64)
         } else {
             0.0
         };
-        
+
         DecisionStats {
             total,
             successes,
             failures,
-            success_rate: if total > 0 { successes as f64 / total as f64 } else { 0.0 },
+            success_rate: if total > 0 {
+                successes as f64 / total as f64
+            } else {
+                0.0
+            },
             by_type,
             avg_confidence,
             avg_execution_time_ms,
@@ -526,14 +515,18 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        path.push(format!("rust_tools_{name}_{}_{}.jsonl", std::process::id(), ts));
+        path.push(format!(
+            "rust_tools_{name}_{}_{}.jsonl",
+            std::process::id(),
+            ts
+        ));
         path
     }
 
     #[test]
     fn test_log_store_basic() {
         let store = DecisionLogStore::new(100);
-        
+
         store.log(DecisionLog {
             timestamp: 0,
             session_id: "test-session".to_string(),
@@ -547,7 +540,7 @@ mod tests {
             outcome: None,
             execution_time_ms: Some(10),
         });
-        
+
         let recent = store.recent(10);
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].chosen_option, "skill_a");
@@ -556,7 +549,7 @@ mod tests {
     #[test]
     fn test_log_store_capacity() {
         let store = DecisionLogStore::new(10);
-        
+
         // 添加 15 条日志
         for i in 0..15 {
             store.log(DecisionLog {
@@ -573,7 +566,7 @@ mod tests {
                 execution_time_ms: None,
             });
         }
-        
+
         // 应该只保留最近的 10 条（实际上会保留 9-10 条，因为会删除 10%）
         let recent = store.recent(100);
         assert!(recent.len() <= 10);
@@ -583,7 +576,7 @@ mod tests {
     #[test]
     fn test_outcome_update() {
         let store = DecisionLogStore::new(100);
-        
+
         store.log(DecisionLog {
             timestamp: 0,
             session_id: "test-session".to_string(),
@@ -597,7 +590,7 @@ mod tests {
             outcome: None,
             execution_time_ms: None,
         });
-        
+
         store.update_outcome(
             "test-session",
             1,
@@ -607,7 +600,7 @@ mod tests {
                 user_feedback: None,
             },
         );
-        
+
         let recent = store.recent(1);
         assert!(recent[0].outcome.as_ref().unwrap().success);
     }
@@ -615,7 +608,7 @@ mod tests {
     #[test]
     fn test_stats() {
         let store = DecisionLogStore::new(100);
-        
+
         // 添加成功和失败的日志
         for i in 0..5 {
             store.log(DecisionLog {
@@ -636,7 +629,7 @@ mod tests {
                 execution_time_ms: Some(10),
             });
         }
-        
+
         for i in 5..10 {
             store.log(DecisionLog {
                 timestamp: 0,
@@ -656,7 +649,7 @@ mod tests {
                 execution_time_ms: Some(20),
             });
         }
-        
+
         let stats = store.stats();
         assert_eq!(stats.total, 10);
         assert_eq!(stats.successes, 5);

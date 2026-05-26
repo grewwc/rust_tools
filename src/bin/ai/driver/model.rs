@@ -1,4 +1,8 @@
-use crate::ai::{mcp::{McpClient, SharedMcpClient}, models, types::App};
+use crate::ai::{
+    mcp::{McpClient, SharedMcpClient},
+    models,
+    types::App,
+};
 use serde_json::json;
 use std::path::Path;
 

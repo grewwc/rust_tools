@@ -177,7 +177,11 @@ mod tests {
     #[test]
     fn test_default_model_exists() {
         let path = super::super::intent_model::default_model_path();
-        assert!(path.exists(), "missing bundled intent model: {}", path.display());
+        assert!(
+            path.exists(),
+            "missing bundled intent model: {}",
+            path.display()
+        );
     }
 
     #[test]
@@ -225,7 +229,10 @@ mod tests {
         let intent = detect_intent("帮我找几个 review skill");
         // 关键词 modifier 已移除：核心意图完全由模型决定。
         // 该样例在当前模型下可能是 Casual，不再强制提升为 RequestAction。
-        assert!(matches!(intent.core, CoreIntent::RequestAction | CoreIntent::Casual));
+        assert!(matches!(
+            intent.core,
+            CoreIntent::RequestAction | CoreIntent::Casual
+        ));
         assert!(!intent.is_search_query());
         assert!(intent.modifiers.target_resource.is_none());
         assert!(!intent.modifiers.negation);

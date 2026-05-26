@@ -1,14 +1,14 @@
 use std::path::PathBuf;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{Arc, atomic::AtomicBool};
 
 use serde_json::Value;
 
 use super::{
     files,
     history::{
-        append_history, append_history_messages, build_context_history, build_message_arr,
-        compress_messages_for_context, mid_turn_compress, Message, SessionStore, COLON,
-        MAX_HISTORY_TURNS, NEWLINE,
+        COLON, MAX_HISTORY_TURNS, Message, NEWLINE, SessionStore, append_history,
+        append_history_messages, build_context_history, build_message_arr,
+        compress_messages_for_context, mid_turn_compress,
     },
     models,
     prompt::MultilineHistoryState,
@@ -74,7 +74,9 @@ fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::
         last_skill_bias: None,
         os: crate::ai::driver::new_local_kernel(),
         agent_reload_counter: None,
-        observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
+        observers: vec![Box::new(
+            crate::ai::driver::thinking::ThinkingOrchestrator::new(),
+        )],
     }
 }
 
@@ -141,7 +143,9 @@ fn resolve_model_is_unicode_safe() {
         last_skill_bias: None,
         os: crate::ai::driver::new_local_kernel(),
         agent_reload_counter: None,
-        observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
+        observers: vec![Box::new(
+            crate::ai::driver::thinking::ThinkingOrchestrator::new(),
+        )],
     };
 
     let mut question = "a 什么是rust的一个crate？".to_string();
@@ -230,8 +234,9 @@ async fn wait_for_interrupt_sources_returns_after_daemon_cancel() {
     let app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
     crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();
-    let local_interrupt = crate::ai::driver::signal::alloc_interrupt_futex("background_cancel_test")
-        .expect("local interrupt futex");
+    let local_interrupt =
+        crate::ai::driver::signal::alloc_interrupt_futex("background_cancel_test")
+            .expect("local interrupt futex");
     let (handle, cancel_token) = {
         let mut os = app.os.lock().unwrap();
         os.daemon_register(
@@ -242,8 +247,11 @@ async fn wait_for_interrupt_sources_returns_after_daemon_cancel() {
     };
 
     let waiter = tokio::spawn(async move {
-        crate::ai::driver::signal::wait_for_interrupt_sources(Some(cancel_token), Some(local_interrupt))
-            .await;
+        crate::ai::driver::signal::wait_for_interrupt_sources(
+            Some(cancel_token),
+            Some(local_interrupt),
+        )
+        .await;
     });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     {
@@ -312,9 +320,16 @@ fn determine_vl_model_supports_selector_and_fuzzy_name() {
     let empty = models::determine_vl_model("");
     let zero = models::determine_vl_model("0");
     let first_vl = any_vl_model_name();
-    assert_eq!(zero, first_vl, "selector \"0\" should pick first VL in models.json");
+    assert_eq!(
+        zero, first_vl,
+        "selector \"0\" should pick first VL in models.json"
+    );
     // empty 仅要求是 VL 模型即可（best-by-tier 可能与 first_vl 不同）。
-    assert!(super::model_names::find_by_name(&empty).map(|m| m.is_vl).unwrap_or(false));
+    assert!(
+        super::model_names::find_by_name(&empty)
+            .map(|m| m.is_vl)
+            .unwrap_or(false)
+    );
 
     if let Some(vl1) = vl_model_name_at(1) {
         assert_eq!(models::determine_vl_model("1"), vl1);
@@ -437,16 +452,20 @@ fn history_compression_inserts_summary_and_keeps_recent() {
 
     assert!(!compressed.is_empty());
     assert_eq!(compressed[0].role, crate::ai::history::ROLE_INTERNAL_NOTE);
-    assert!(compressed[0]
-        .content
-        .as_str()
-        .unwrap_or_default()
-        .contains("对话摘要"));
-    assert!(compressed[0]
-        .content
-        .as_str()
-        .unwrap_or_default()
-        .contains("初始目标: u0"));
+    assert!(
+        compressed[0]
+            .content
+            .as_str()
+            .unwrap_or_default()
+            .contains("对话摘要")
+    );
+    assert!(
+        compressed[0]
+            .content
+            .as_str()
+            .unwrap_or_default()
+            .contains("初始目标: u0")
+    );
     assert_eq!(
         compressed.last().unwrap().content,
         Value::String(format!("a9 {long}"))
@@ -473,9 +492,7 @@ fn history_compression_summarizes_when_keep_last_exceeds_turns_but_budget_overfl
     let long = "y".repeat(260);
     let mut blob = String::new();
     for i in 0..30usize {
-        blob.push_str(&format!(
-            "user{COLON}QUESTION_{i:02} {long}{NEWLINE}"
-        ));
+        blob.push_str(&format!("user{COLON}QUESTION_{i:02} {long}{NEWLINE}"));
         blob.push_str(&format!("assistant{COLON}ANSWER_{i:02} {long}{NEWLINE}"));
     }
     append_history(&path, &blob).unwrap();
@@ -533,10 +550,8 @@ fn history_compression_summarizes_when_keep_last_exceeds_turns_but_budget_overfl
 
 #[test]
 fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context() {
-    let path = std::env::temp_dir().join(format!(
-        "ai-overflow-test-{}.sqlite",
-        uuid::Uuid::new_v4()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("ai-overflow-test-{}.sqlite", uuid::Uuid::new_v4()));
     let overflow_dir =
         std::env::temp_dir().join(format!("ai-overflow-dir-{}", uuid::Uuid::new_v4()));
 
@@ -554,7 +569,8 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
 
     let first_msg = compressed.first().expect("should have messages");
     assert_eq!(
-        first_msg.role, crate::ai::history::ROLE_INTERNAL_NOTE,
+        first_msg.role,
+        crate::ai::history::ROLE_INTERNAL_NOTE,
         "first message should be an internal note with compressed long-term memory"
     );
     let memory_text = first_msg.content.as_str().unwrap_or_default();
@@ -644,9 +660,9 @@ fn mid_turn_compress_preserves_latest_user_message() {
     let (compressed, before, after) = mid_turn_compress(messages, 4000);
     assert!(after <= before, "compression should not expand payload");
 
-    let has_latest_user = compressed.iter().any(|m| {
-        m.role == "user" && m.content.as_str() == Some(latest_user)
-    });
+    let has_latest_user = compressed
+        .iter()
+        .any(|m| m.role == "user" && m.content.as_str() == Some(latest_user));
     assert!(
         has_latest_user,
         "mid-turn compression must preserve the latest user message"
@@ -815,9 +831,18 @@ fn mid_turn_compress_prefers_three_recent_user_turns_when_context_is_small_enoug
         .iter()
         .any(|m| m.role == "user" && m.content.as_str() == Some(user4));
 
-    assert!(has_user2, "should preserve previous-2 user turn when context is moderate");
-    assert!(has_user3, "should preserve previous-1 user turn when context is moderate");
-    assert!(has_user4, "should preserve latest user turn when context is moderate");
+    assert!(
+        has_user2,
+        "should preserve previous-2 user turn when context is moderate"
+    );
+    assert!(
+        has_user3,
+        "should preserve previous-1 user turn when context is moderate"
+    );
+    assert!(
+        has_user4,
+        "should preserve latest user turn when context is moderate"
+    );
 }
 
 #[test]
@@ -924,21 +949,31 @@ fn mid_turn_compress_keeps_tool_pairs_consistent() {
 #[test]
 fn session_delete_cleans_up_overflow_history_file() {
     let session_id = format!("test-{}", uuid::Uuid::new_v4());
-    let history_file = std::env::temp_dir().join(format!("ai-session-cleanup-{}.sqlite", uuid::Uuid::new_v4()));
+    let history_file = std::env::temp_dir().join(format!(
+        "ai-session-cleanup-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
     let store = SessionStore::new(&history_file);
     store.ensure_root_dir().unwrap();
 
     let db = store.session_history_file(&session_id);
     let assets = store.session_assets_dir(&session_id);
     std::fs::create_dir_all(&assets).unwrap();
-    std::fs::write(assets.join("overflow-history.md"), "# test overflow content").unwrap();
+    std::fs::write(
+        assets.join("overflow-history.md"),
+        "# test overflow content",
+    )
+    .unwrap();
     std::fs::write(&db, b"test").unwrap();
 
     assert!(assets.join("overflow-history.md").exists());
 
     store.delete_session(&session_id).unwrap();
 
-    assert!(!assets.exists(), "assets dir (including overflow file) should be deleted");
+    assert!(
+        !assets.exists(),
+        "assets dir (including overflow file) should be deleted"
+    );
     assert!(!db.exists(), "sqlite file should be deleted");
 
     let _ = std::fs::remove_dir_all(store.session_assets_dir("__cleanup__"));
@@ -1078,12 +1113,17 @@ fn history_compacts_old_turns_into_summary() {
             .unwrap();
         }
         let loaded = build_message_arr(10_000, &path).unwrap();
-        assert_eq!(loaded.first().unwrap().role, crate::ai::history::ROLE_INTERNAL_NOTE);
-        assert!(loaded
-            .first()
-            .and_then(|m| m.content.as_str())
-            .unwrap_or_default()
-            .contains("历史摘要"));
+        assert_eq!(
+            loaded.first().unwrap().role,
+            crate::ai::history::ROLE_INTERNAL_NOTE
+        );
+        assert!(
+            loaded
+                .first()
+                .and_then(|m| m.content.as_str())
+                .unwrap_or_default()
+                .contains("历史摘要")
+        );
         let first_user = loaded.iter().find(|m| m.role == "user").unwrap();
         assert_ne!(first_user.content, Value::String("u0".to_string()));
         let user_count = loaded.iter().filter(|m| m.role == "user").count();
@@ -1127,12 +1167,17 @@ fn context_history_summarizes_beyond_history_count_instead_of_dropping() {
     let context = build_context_history(32, &path, 6000, 32, 2000, None).unwrap();
 
     assert!(!context.is_empty());
-    assert_eq!(context.first().unwrap().role, crate::ai::history::ROLE_INTERNAL_NOTE);
-    assert!(context
-        .first()
-        .and_then(|m| m.content.as_str())
-        .unwrap_or_default()
-        .contains("摘要"));
+    assert_eq!(
+        context.first().unwrap().role,
+        crate::ai::history::ROLE_INTERNAL_NOTE
+    );
+    assert!(
+        context
+            .first()
+            .and_then(|m| m.content.as_str())
+            .unwrap_or_default()
+            .contains("摘要")
+    );
     assert_eq!(context.iter().filter(|m| m.role == "user").count(), 32);
     assert_eq!(
         context.last().unwrap().content,
@@ -1279,7 +1324,8 @@ fn context_history_summary_keeps_tool_names_and_results() {
 
 #[test]
 fn context_history_cache_invalidates_after_history_changes() {
-    let path = std::env::temp_dir().join(format!("ai-history-cache-{}.sqlite", uuid::Uuid::new_v4()));
+    let path =
+        std::env::temp_dir().join(format!("ai-history-cache-{}.sqlite", uuid::Uuid::new_v4()));
     append_history(
         &path,
         &format!("user{COLON}first{NEWLINE}assistant{COLON}one{NEWLINE}"),
@@ -1298,14 +1344,18 @@ fn context_history_cache_invalidates_after_history_changes() {
 
     let second = build_context_history(8, &path, 10_000, 8, 2_000, None).unwrap();
     assert_eq!(second.len(), 4);
-    assert_eq!(second.last().unwrap().content, serde_json::Value::String("two".to_string()));
+    assert_eq!(
+        second.last().unwrap().content,
+        serde_json::Value::String("two".to_string())
+    );
 
     let _ = std::fs::remove_file(path);
 }
 
 #[test]
 fn sqlite_recent_turn_window_reads_only_recent_user_turns() {
-    let path = std::env::temp_dir().join(format!("ai-history-window-{}.sqlite", uuid::Uuid::new_v4()));
+    let path =
+        std::env::temp_dir().join(format!("ai-history-window-{}.sqlite", uuid::Uuid::new_v4()));
     let mut messages = Vec::new();
     for i in 0..5 {
         messages.push(Message {
@@ -1340,7 +1390,10 @@ fn sqlite_recent_turn_window_reads_only_recent_user_turns() {
 
 #[test]
 fn sqlite_context_fastpath_keeps_existing_history_summary() {
-    let path = std::env::temp_dir().join(format!("ai-history-fastpath-{}.sqlite", uuid::Uuid::new_v4()));
+    let path = std::env::temp_dir().join(format!(
+        "ai-history-fastpath-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
     let messages = vec![
         Message {
             role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -1384,11 +1437,13 @@ fn sqlite_context_fastpath_keeps_existing_history_summary() {
 
     let context = build_context_history(2, &path, 10_000, 2, 2_000, None).unwrap();
     assert_eq!(context[0].role, crate::ai::history::ROLE_INTERNAL_NOTE);
-    assert!(context[0]
-        .content
-        .as_str()
-        .unwrap_or_default()
-        .contains("older summary"));
+    assert!(
+        context[0]
+            .content
+            .as_str()
+            .unwrap_or_default()
+            .contains("older summary")
+    );
 
     let _ = std::fs::remove_file(path);
 }
@@ -1650,7 +1705,8 @@ fn stream_chunk_accepts_reasoning_text_alias() {
 
 #[test]
 fn stream_chunk_ignores_structured_reasoning_object_without_text() {
-    let payload = r#"{"choices":[{"delta":{"content":"","reasoning":{"confidence":0.9,"thinking":true}}}]}"#;
+    let payload =
+        r#"{"choices":[{"delta":{"content":"","reasoning":{"confidence":0.9,"thinking":true}}}]}"#;
     let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
     assert_eq!(parsed.choices[0].delta.reasoning_content, "");
 }
@@ -1664,8 +1720,7 @@ fn stream_chunk_extracts_text_from_reasoning_object() {
 
 #[test]
 fn stream_chunk_extracts_nested_reasoning_delta_text() {
-    let payload =
-        r#"{"choices":[{"delta":{"content":"","reasoning":{"type":"reasoning_text","delta":"No"}}}]}"#;
+    let payload = r#"{"choices":[{"delta":{"content":"","reasoning":{"type":"reasoning_text","delta":"No"}}}]}"#;
     let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
     assert_eq!(parsed.choices[0].delta.reasoning_content, "No");
 }
@@ -1705,9 +1760,15 @@ fn stream_chunk_merges_reasoning_details_prefix_with_punctuation_continuation() 
 fn stream_chunk_reasoning_content_takes_priority_over_details() {
     let payload = r#"{"choices":[{"delta":{"content":"","reasoning":"from reasoning field","reasoning_details":[{"text":"from details"}]}}]}"#;
     let mut parsed: StreamChunk = serde_json::from_str(payload).unwrap();
-    assert_eq!(parsed.choices[0].delta.reasoning_content, "from reasoning field");
+    assert_eq!(
+        parsed.choices[0].delta.reasoning_content,
+        "from reasoning field"
+    );
     parsed.merge_reasoning();
-    assert_eq!(parsed.choices[0].delta.reasoning_content, "from reasoning field");
+    assert_eq!(
+        parsed.choices[0].delta.reasoning_content,
+        "from reasoning field"
+    );
 }
 
 #[test]
@@ -1726,10 +1787,7 @@ fn merge_reasoning_fragments_cjk_punctuation_continuation() {
         merge_reasoning_fragments("是的", "，这很重要"),
         "是的，这很重要"
     );
-    assert_eq!(
-        merge_reasoning_fragments("注意", "！危险"),
-        "注意！危险"
-    );
+    assert_eq!(merge_reasoning_fragments("注意", "！危险"), "注意！危险");
 }
 
 #[test]
@@ -1804,7 +1862,8 @@ fn stream_chunk_accepts_structured_content_arrays() {
 fn stream_tool_call_accepts_object_arguments() {
     let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"apply_patch","arguments":{"file":"a.rs","patch":"..."}}}]}}]}"#;
     let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
-    let args: Value = serde_json::from_str(&parsed.choices[0].delta.tool_calls[0].function.arguments).unwrap();
+    let args: Value =
+        serde_json::from_str(&parsed.choices[0].delta.tool_calls[0].function.arguments).unwrap();
     assert_eq!(args["file"], "a.rs");
     assert_eq!(args["patch"], "...");
 }

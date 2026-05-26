@@ -8,11 +8,11 @@ use crate::commonw::configw;
 use rust_tools::cw::SkipSet;
 use std::sync::{LazyLock, Mutex};
 
+use super::intent_recognition::{self, UserIntent};
 use super::{
     DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS, TextSimilarityFeatures,
     jaccard_similarity_for_sets, rank_skills_locally_with_model_path, set_intersection_count,
 };
-use super::intent_recognition::{self, UserIntent};
 
 type ToolDef = ToolDefinition;
 
@@ -31,7 +31,9 @@ pub(super) struct SystemPromptBuilder {
 
 impl SystemPromptBuilder {
     fn new() -> Self {
-        Self { sections: Vec::new() }
+        Self {
+            sections: Vec::new(),
+        }
     }
 
     fn push(&mut self, kind: ContextKind, content: impl Into<String>) {
@@ -81,7 +83,9 @@ impl SystemPromptBuilder {
         if facts.is_empty() {
             return None;
         }
-        let mut out = String::from("<system-reminder>\nAs you answer the user's questions, you can use the following context:\n");
+        let mut out = String::from(
+            "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n",
+        );
         for (label, content) in &facts {
             if let Some(key) = label {
                 out.push_str(&format!("# {}\n{}\n\n", key, content.trim()));
@@ -258,10 +262,7 @@ fn dedupe_tools_by_name(tools: Vec<ToolDef>) -> Vec<ToolDef> {
 }
 
 fn required_discovery_tool_names() -> Vec<String> {
-    vec![
-        "discover_skills".to_string(),
-        "enable_tools".to_string(),
-    ]
+    vec!["discover_skills".to_string(), "enable_tools".to_string()]
 }
 
 fn ensure_required_discovery_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
@@ -281,10 +282,7 @@ fn ensure_required_discovery_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
     dedupe_tools_by_name(tools)
 }
 
-fn manifest_tool_definitions(
-    tool_groups: &[String],
-    tools: &[String],
-) -> Option<Vec<ToolDef>> {
+fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option<Vec<ToolDef>> {
     if !tool_groups.is_empty() {
         let groups: Vec<&str> = tool_groups.iter().map(|s| s.as_str()).collect();
         return Some(ensure_required_discovery_tools(
@@ -301,16 +299,15 @@ fn manifest_tool_definitions(
 
 fn is_executor_agent(agent: &AgentManifest) -> bool {
     agent.mode == crate::ai::agents::AgentMode::Primary
-        && agent
-            .tool_groups
-            .iter()
-            .any(|group| group.eq_ignore_ascii_case("executor") || group.eq_ignore_ascii_case("openclaw"))
+        && agent.tool_groups.iter().any(|group| {
+            group.eq_ignore_ascii_case("executor") || group.eq_ignore_ascii_case("openclaw")
+        })
 }
 
 fn is_executor_skill(skill: &SkillManifest) -> bool {
-    skill.tool_groups
-        .iter()
-        .any(|group| group.eq_ignore_ascii_case("executor") || group.eq_ignore_ascii_case("openclaw"))
+    skill.tool_groups.iter().any(|group| {
+        group.eq_ignore_ascii_case("executor") || group.eq_ignore_ascii_case("openclaw")
+    })
 }
 
 fn resolve_max_iterations(active_agent: Option<&AgentManifest>, executor_active: bool) -> usize {
@@ -418,7 +415,8 @@ fn filter_mcp_tools_by_allowed_servers(
     tools: Vec<ToolDef>,
     allowed_servers: &[String],
 ) -> Vec<ToolDef> {
-    tools.into_iter()
+    tools
+        .into_iter()
         .filter(|tool| tool_uses_mcp_server(&tool.function.name, allowed_servers))
         .collect()
 }
@@ -600,11 +598,7 @@ fn build_project_instruction_prompt() -> Option<String> {
          - Follow these repo-local constraints and preferences unless they conflict with higher-priority system, developer, or user instructions.\n",
     );
     for doc in docs {
-        out.push_str(&format!(
-            "\nFrom {}:\n{}\n",
-            doc.path,
-            doc.content.trim()
-        ));
+        out.push_str(&format!("\nFrom {}:\n{}\n", doc.path, doc.content.trim()));
     }
     Some(out)
 }
@@ -618,7 +612,9 @@ fn build_system_prompt(
 
     // Identity 段：合并通用 identity + agent / skill enforcement，避免 4 段
     // 重复 "you must follow ..." 充斥 prompt cache。
-    let mut identity = String::from("You are a highly capable general-purpose AI assistant. You help users plan, research, write, analyze, and act across any domain — code is one of many, not the only one. Adapt your approach to the task at hand: use code/tooling when the request is technical, and plain reasoning or research when it is not. Aim to be sharp and to the point — answer what was asked, not more.");
+    let mut identity = String::from(
+        "You are a highly capable general-purpose AI assistant. You help users plan, research, write, analyze, and act across any domain — code is one of many, not the only one. Adapt your approach to the task at hand: use code/tooling when the request is technical, and plain reasoning or research when it is not. Aim to be sharp and to the point — answer what was asked, not more.",
+    );
 
     let agent_extra = active_agent
         .map(|agent| agent.build_system_prompt())
@@ -690,7 +686,9 @@ fn build_system_prompt(
         b.push(ContextKind::Behavior, "Async Subagent Orchestration (task_*):\n- `task_spawn` launches a subagent task asynchronously and returns a task_id immediately. Fan out multiple subagent tasks in parallel when their work is independent.\n- `task_wait` collects results. Its `timeout_secs` is a per-call wait budget — when it elapses without satisfying the policy, the call returns the already-collected results plus a clear note that the remaining subagents are still running. This is NOT a stall: re-call `task_wait` with the same task_ids to keep waiting (or pass `wait_policy=\"any\"` to wake on the first finisher).\n- `task_status` is non-blocking: use it to peek at progress without consuming results.\n- There is NO `task_cancel`. Do not invent it. If you need to abandon work, just stop calling `task_wait` and let the subagent run to completion in the background; its result will be reaped by the kernel.\n- Do not confuse the `task_*` family with `tool_*` — they are distinct. `tool_wait` cannot consume a task_id, and `task_wait` cannot consume a tool ticket.");
     }
 
-    if has_tool(available_tools, "knowledge_search") || has_tool(available_tools, "knowledge_semantic_search") {
+    if has_tool(available_tools, "knowledge_search")
+        || has_tool(available_tools, "knowledge_semantic_search")
+    {
         b.push(ContextKind::Policy, "Knowledge retrieval:\n- If the request involves prior decisions/context/preferences, use `knowledge_search` or `knowledge_semantic_search`.\n- Use `knowledge_list` when the user asks what is remembered.\n- If semantic index seems stale, run `knowledge_rebuild_index`.");
     }
 
@@ -730,10 +728,8 @@ fn looks_like_follow_up_or_same_topic(question: &str, previous_question: &str) -
 
     let current_features = TextSimilarityFeatures::from_text(current);
     let previous_features = TextSimilarityFeatures::from_text(previous);
-    let token_similarity = jaccard_similarity_for_sets(
-        &current_features.token_set,
-        &previous_features.token_set,
-    );
+    let token_similarity =
+        jaccard_similarity_for_sets(&current_features.token_set, &previous_features.token_set);
     if token_similarity >= 0.34 {
         return true;
     }
@@ -750,8 +746,7 @@ fn looks_like_follow_up_or_same_topic(question: &str, previous_question: &str) -
         return false;
     }
 
-    let overlap =
-        set_intersection_count(&current_features.token_set, &previous_features.token_set);
+    let overlap = set_intersection_count(&current_features.token_set, &previous_features.token_set);
     let new_tokens = current_features.token_set.len().saturating_sub(overlap);
     let new_token_ratio = new_tokens as f64 / current_features.token_set.len().max(1) as f64;
     let current_chars = current.chars().count();
@@ -812,33 +807,40 @@ fn select_skill_with_preference_strength<'a>(
         return None;
     }
 
-    let ranked = rank_skills_locally_with_model_path(skill_manifests, question, Some(intent), model_path);
+    let ranked =
+        rank_skills_locally_with_model_path(skill_manifests, question, Some(intent), model_path);
     let Some(best) = ranked.first() else {
         return None;
     };
     let threshold = skill_selection_threshold(intent, skill_manifests.len());
-    let preferred = preferred_skill_name.and_then(|name| ranked.iter().find(|item| item.skill.name == name));
+    let preferred =
+        preferred_skill_name.and_then(|name| ranked.iter().find(|item| item.skill.name == name));
 
     if let Some(current) = preferred {
-        let (sticky_bonus, keep_floor_delta, switch_margin, keep_current_when_best, keep_below_threshold) =
-            match strength {
-                PreferenceStrength::StrongSticky => (
-                    CURRENT_SKILL_STICKY_BONUS,
-                    CURRENT_SKILL_KEEP_FLOOR_DELTA,
-                    SKILL_SWITCH_MARGIN,
-                    true,
-                    true,
-                ),
-                PreferenceStrength::CrossTurnBias => (
-                    CROSS_TURN_SKILL_STICKY_BONUS,
-                    CROSS_TURN_SKILL_KEEP_FLOOR_DELTA,
-                    CROSS_TURN_SKILL_SWITCH_MARGIN,
-                    true,
-                    true,
-                ),
-            };
-        let current_has_signal = current.score >= (threshold - keep_floor_delta).max(0.0)
-            || has_skill_signal(current);
+        let (
+            sticky_bonus,
+            keep_floor_delta,
+            switch_margin,
+            keep_current_when_best,
+            keep_below_threshold,
+        ) = match strength {
+            PreferenceStrength::StrongSticky => (
+                CURRENT_SKILL_STICKY_BONUS,
+                CURRENT_SKILL_KEEP_FLOOR_DELTA,
+                SKILL_SWITCH_MARGIN,
+                true,
+                true,
+            ),
+            PreferenceStrength::CrossTurnBias => (
+                CROSS_TURN_SKILL_STICKY_BONUS,
+                CROSS_TURN_SKILL_KEEP_FLOOR_DELTA,
+                CROSS_TURN_SKILL_SWITCH_MARGIN,
+                true,
+                true,
+            ),
+        };
+        let current_has_signal =
+            current.score >= (threshold - keep_floor_delta).max(0.0) || has_skill_signal(current);
         if best.skill.name == current.skill.name {
             return if keep_current_when_best || current.score >= threshold || current_has_signal {
                 Some(current.skill)
@@ -925,16 +927,11 @@ fn build_skill_turn_guard(
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
     let skip_recall_by_skill = should_skip_recall_for_skill(skill);
     let active_agent = app.current_agent_manifest.clone();
-    let executor_active = skill.as_ref().is_some_and(|s| {
-        is_executor_skill(s)
-    }) || active_agent.as_ref().is_some_and(is_executor_agent);
+    let executor_active = skill.as_ref().is_some_and(|s| is_executor_skill(s))
+        || active_agent.as_ref().is_some_and(is_executor_agent);
 
     let builtin_tools = builtin_tools_for_skill(skill, active_agent.as_ref());
-    let mcp_tools = mcp_tools_for_turn(
-        mcp_client,
-        skill,
-        active_agent.as_ref(),
-    );
+    let mcp_tools = mcp_tools_for_turn(mcp_client, skill, active_agent.as_ref());
     let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
     let builder = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
     let max_iterations = resolve_max_iterations(active_agent.as_ref(), executor_active);
@@ -960,8 +957,13 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
     preferred_skill_name: Option<&str>,
     intent: &UserIntent,
 ) -> SkillTurnGuard {
-    let skill =
-        select_skill_with_preference(skill_manifests, question, intent, preferred_skill_name, &app.config.skill_match_model_path);
+    let skill = select_skill_with_preference(
+        skill_manifests,
+        question,
+        intent,
+        preferred_skill_name,
+        &app.config.skill_match_model_path,
+    );
     build_skill_turn_guard(app, mcp_client, skill, intent.clone())
 }
 
@@ -1030,15 +1032,15 @@ pub(super) fn prepare_skill_for_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_project_instruction_prompt, build_system_prompt, builtin_tools_for_skill,
-        ensure_required_discovery_tools, filter_mcp_tools_by_allowed_servers,
-        looks_like_follow_up_or_same_topic, merge_with_runtime_enabled_tools,
-        resolve_max_iterations, select_mcp_tools, select_skill_with_preference,
-        select_skill_with_preference_strength, tool_uses_mcp_server, PreferenceStrength,
+        PreferenceStrength, build_project_instruction_prompt, build_system_prompt,
+        builtin_tools_for_skill, ensure_required_discovery_tools,
+        filter_mcp_tools_by_allowed_servers, looks_like_follow_up_or_same_topic,
+        merge_with_runtime_enabled_tools, resolve_max_iterations, select_mcp_tools,
+        select_skill_with_preference, select_skill_with_preference_strength, tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
-    use crate::ai::driver::runtime_ctx::SUBAGENT_CWD;
     use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
+    use crate::ai::driver::runtime_ctx::SUBAGENT_CWD;
     use crate::ai::skills::SkillManifest;
     use crate::ai::tools::enable_tools::set_explicit_enabled_tool_names;
     use crate::ai::types::{FunctionDefinition, ToolDefinition};
@@ -1049,7 +1051,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static EXPLICIT_TOOL_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-    
+
     #[test]
     fn mcp_server_filter_matches_longest_server_name_prefix() {
         let allowed = vec!["foo".to_string(), "foo_bar".to_string()];
@@ -1082,8 +1084,14 @@ mod tests {
 
         assert_eq!(resolve_max_iterations(Some(&agent), false), 17);
         assert_eq!(resolve_max_iterations(Some(&agent), true), 17);
-        assert_eq!(resolve_max_iterations(None, true), super::super::EXECUTOR_MAX_ITERATIONS);
-        assert_eq!(resolve_max_iterations(None, false), super::super::DEFAULT_MAX_ITERATIONS);
+        assert_eq!(
+            resolve_max_iterations(None, true),
+            super::super::EXECUTOR_MAX_ITERATIONS
+        );
+        assert_eq!(
+            resolve_max_iterations(None, false),
+            super::super::DEFAULT_MAX_ITERATIONS
+        );
     }
 
     #[test]
@@ -1154,7 +1162,9 @@ mod tests {
         let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
         assert!(prompt.contains("discover_skills"));
         assert!(prompt.contains("No skill is active yet"));
-        assert!(prompt.contains("prefer calling `discover_skills` before giving a freeform response"));
+        assert!(
+            prompt.contains("prefer calling `discover_skills` before giving a freeform response")
+        );
     }
 
     #[test]
@@ -1187,7 +1197,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        path.push(format!("rust_tools_skill_runtime_{name}_{}_{}", std::process::id(), nanos));
+        path.push(format!(
+            "rust_tools_skill_runtime_{name}_{}_{}",
+            std::process::id(),
+            nanos
+        ));
         path
     }
 
@@ -1200,7 +1214,8 @@ mod tests {
         fs::write(root.join("AGENTS.md"), "Use cargo fmt before commit.\n").unwrap();
         fs::write(root.join("apps/web/claude.md"), "Web app uses pnpm.\n").unwrap();
 
-        let prompt = SUBAGENT_CWD.sync_scope(nested.clone(), build_project_instruction_prompt)
+        let prompt = SUBAGENT_CWD
+            .sync_scope(nested.clone(), build_project_instruction_prompt)
             .expect("project instruction prompt");
 
         assert!(prompt.contains("Project-local instructions:"));
@@ -1309,10 +1324,7 @@ mod tests {
 
     #[test]
     fn no_active_agent_or_skill_falls_back_to_all_mcp_tools() {
-        let all_tools = vec![
-            tool("mcp_feishu_docs_search"),
-            tool("mcp_other_lookup"),
-        ];
+        let all_tools = vec![tool("mcp_feishu_docs_search"), tool("mcp_other_lookup")];
 
         let tools = select_mcp_tools(all_tools, None, None);
         let names = tools
@@ -1327,10 +1339,7 @@ mod tests {
 
     #[test]
     fn skill_disable_mcp_tools_overrides_agent_default_fallback() {
-        let all_tools = vec![
-            tool("mcp_feishu_docs_search"),
-            tool("mcp_other_lookup"),
-        ];
+        let all_tools = vec![tool("mcp_feishu_docs_search"), tool("mcp_other_lookup")];
         let build_agent = agent("build", vec![]);
         let mut s = skill("focus", "");
         s.disable_mcp_tools = true;
@@ -1341,10 +1350,7 @@ mod tests {
 
     #[test]
     fn explicit_agent_whitelist_still_narrows_when_set() {
-        let all_tools = vec![
-            tool("mcp_feishu_docs_search"),
-            tool("mcp_ocr_extract"),
-        ];
+        let all_tools = vec![tool("mcp_feishu_docs_search"), tool("mcp_ocr_extract")];
         let agent = agent("build", vec!["feishu"]);
 
         let tools = select_mcp_tools(all_tools, None, Some(&agent));
@@ -1363,7 +1369,11 @@ mod tests {
         let merged = merge_with_runtime_enabled_tools(
             vec![tool("code_search"), tool("read_file"), tool("enable_tools")],
             vec![],
-            &[tool("code_search"), tool("enable_tools"), tool("web_search")],
+            &[
+                tool("code_search"),
+                tool("enable_tools"),
+                tool("web_search"),
+            ],
         );
         let names = merged
             .into_iter()
@@ -1420,7 +1430,13 @@ mod tests {
             skill("code-review", "Review code changes and highlight bugs"),
             skill("debugger", "Debug runtime failures and collect traces"),
         ];
-        let selected = select_skill_with_preference(&skills, "帮我 review 这段 Rust 代码", &intent, None, &model_path());
+        let selected = select_skill_with_preference(
+            &skills,
+            "帮我 review 这段 Rust 代码",
+            &intent,
+            None,
+            &model_path(),
+        );
         assert_eq!(selected.map(|item| item.name.as_str()), Some("code-review"));
     }
 
@@ -1429,17 +1445,28 @@ mod tests {
         let intent = UserIntent::new(CoreIntent::RequestAction);
         let skills = vec![
             skill("code-review", "Review code changes and summarize defects"),
-            skill("debugger", "Debug runtime failures, panic, and stack traces"),
+            skill(
+                "debugger",
+                "Debug runtime failures, panic, and stack traces",
+            ),
         ];
-        let selected =
-            select_skill_with_preference(&skills, "帮我看一下这段代码哪里有问题", &intent, Some("code-review"), &model_path());
+        let selected = select_skill_with_preference(
+            &skills,
+            "帮我看一下这段代码哪里有问题",
+            &intent,
+            Some("code-review"),
+            &model_path(),
+        );
         assert_eq!(selected.map(|item| item.name.as_str()), Some("code-review"));
     }
 
     #[test]
     fn local_selector_switches_when_new_skill_is_significantly_better() {
         let intent = UserIntent::new(CoreIntent::RequestAction);
-        let debugger = skill("debugger", "Debug panic crash stack trace runtime failure logs");
+        let debugger = skill(
+            "debugger",
+            "Debug panic crash stack trace runtime failure logs",
+        );
         let skills = vec![
             skill("code-review", "Review code changes and summarize defects"),
             debugger,
@@ -1485,7 +1512,10 @@ mod tests {
         let intent = UserIntent::new(CoreIntent::RequestAction);
         let skills = vec![
             skill("code-review", "Review code changes and summarize defects"),
-            skill("debugger", "Debug panic crash stack trace runtime failure logs"),
+            skill(
+                "debugger",
+                "Debug panic crash stack trace runtime failure logs",
+            ),
         ];
         let selected = select_skill_with_preference_strength(
             &skills,

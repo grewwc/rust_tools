@@ -59,7 +59,9 @@ fn visit_node(
         "public_field_definition" | "field_definition" | "property_signature" => {
             push_named(node, source, "field", indent, out)
         }
-        "lexical_declaration" | "variable_declaration" => recurse_named(node, source, indent, in_class, out),
+        "lexical_declaration" | "variable_declaration" => {
+            recurse_named(node, source, indent, in_class, out)
+        }
         "variable_declarator" => {
             if let Some(name) = name_from_field(node, "name", source) {
                 out.push(SymbolEntry::new("var", name, line(node), None, indent));

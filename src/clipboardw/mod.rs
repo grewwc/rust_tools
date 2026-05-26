@@ -65,9 +65,6 @@ pub mod string_content;
 
 // 重新导出常用函数
 pub use string_content::{
-    copy_from_file,
-    get_clipboard_content,
-    get_clipboard_raw_bytes_via_osc52,
-    save_to_file,
+    copy_from_file, get_clipboard_content, get_clipboard_raw_bytes_via_osc52, save_to_file,
     set_clipboard_content,
 };

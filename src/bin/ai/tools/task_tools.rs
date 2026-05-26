@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::time::Instant;
 
+use crate::ai::tools::os_tools::GLOBAL_OS;
 use crate::ai::{
     agents::{self, AgentManifest, AgentModelTier},
     driver::{
@@ -10,10 +11,9 @@ use crate::ai::{
         normalize_text_for_similarity,
     },
     models,
-    tools::registry::common::current_process_tool_cancel_futex,
     tools::common::{ToolRegistration, ToolSpec},
+    tools::registry::common::current_process_tool_cancel_futex,
 };
-use crate::ai::tools::os_tools::GLOBAL_OS;
 use aios_kernel::SharedKernel;
 use aios_kernel::{
     kernel::{EventId, Kernel, ProcessState, WaitPolicy},
@@ -136,10 +136,18 @@ impl InheritOptions {
             return "none".to_string();
         }
         let mut parts = Vec::new();
-        if self.history { parts.push("history"); }
-        if self.memory { parts.push("memory"); }
-        if self.cwd { parts.push("cwd"); }
-        if self.skills { parts.push("skills"); }
+        if self.history {
+            parts.push("history");
+        }
+        if self.memory {
+            parts.push("memory");
+        }
+        if self.cwd {
+            parts.push("cwd");
+        }
+        if self.skills {
+            parts.push("skills");
+        }
         parts.join(",")
     }
 }
@@ -238,9 +246,7 @@ pub(crate) fn decode_os_task_goal(goal: &str) -> Option<OsTaskGoal> {
 ///
 /// 回退路径：当调用方不在 `DRIVER_CTX` scope 中（例如 driver 启动早期或单测从同步
 /// 上下文调用 tool），仍使用 `GLOBAL_OS`，保证向后兼容。
-fn with_os_kernel<T>(
-    f: impl FnOnce(&mut dyn Kernel) -> Result<T, String>,
-) -> Result<T, String> {
+fn with_os_kernel<T>(f: impl FnOnce(&mut dyn Kernel) -> Result<T, String>) -> Result<T, String> {
     let shared: SharedKernel = match crate::ai::driver::runtime_ctx::try_current() {
         Some(ctx) => ctx.app_proto.os.clone(),
         None => {
@@ -424,7 +430,8 @@ pub(crate) fn epoll_wait_many(
         match wait_policy {
             WaitPolicy::Any => match os.epoll_wait(epoll, sources.len(), timeout_ticks)? {
                 EpollWaitResult::Ready(_) => {
-                    let (ready_sources, pending_sources, event_ids) = wait_many_snapshot(os, sources)?;
+                    let (ready_sources, pending_sources, event_ids) =
+                        wait_many_snapshot(os, sources)?;
                     Ok(EpollWaitManyOutcome {
                         ready_sources,
                         pending_sources,
@@ -442,14 +449,19 @@ pub(crate) fn epoll_wait_many(
                 }),
             },
             WaitPolicy::All => {
-                let wake_tick = os.wait_on_events(event_ids.clone(), WaitPolicy::All, timeout_ticks)?;
+                let wake_tick =
+                    os.wait_on_events(event_ids.clone(), WaitPolicy::All, timeout_ticks)?;
                 let suspended = os.consume_yield_requested() || wake_tick.is_some();
                 let (ready_sources, pending_sources, refreshed_event_ids) =
                     wait_many_snapshot(os, sources)?;
                 Ok(EpollWaitManyOutcome {
                     ready_sources,
                     pending_sources,
-                    event_ids: if suspended { event_ids } else { refreshed_event_ids },
+                    event_ids: if suspended {
+                        event_ids
+                    } else {
+                        refreshed_event_ids
+                    },
                     suspended,
                     timeout_tick: wake_tick,
                 })
@@ -584,7 +596,10 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
     let prompt = args["prompt"]
         .as_str()
         .ok_or("Missing 'prompt' parameter")?;
-    let agent = args["agent"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let agent = args["agent"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let model_override = args["model"].as_str();
 
     if description.trim().is_empty() {
@@ -598,8 +613,8 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
 
     // 优先从 DRIVER_CTX 中拿已缓存的 agent_manifests，避免每次 task_spawn 都重读磁盘。
     // 当不在 DRIVER_CTX scope 中（极少见，例如单测），回退到 load_all_agents()。
-    let cached = crate::ai::driver::runtime_ctx::try_current()
-        .map(|ctx| ctx.agent_manifests.clone());
+    let cached =
+        crate::ai::driver::runtime_ctx::try_current().map(|ctx| ctx.agent_manifests.clone());
     let owned_fallback;
     let all_agents: &[AgentManifest] = if let Some(ref arc_vec) = cached {
         arc_vec.as_slice()
@@ -610,8 +625,11 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
     let selected = select_subagent(all_agents, agent, description, prompt)?;
     let selected_model = model_override
         .map(models::determine_model)
-        .unwrap_or_else(|| models::auto_subagent_model_for_agent(selected.agent, description, prompt));
-    let selection_explanation = build_selection_explanation(&selected, &selected_model, model_override);
+        .unwrap_or_else(|| {
+            models::auto_subagent_model_for_agent(selected.agent, description, prompt)
+        });
+    let selection_explanation =
+        build_selection_explanation(&selected, &selected_model, model_override);
 
     Ok(PreparedSubagentTask {
         description: description.to_string(),
@@ -704,10 +722,7 @@ pub(crate) fn spawn_subagent_kernel_task(
 
 /// Look up a registered async task entry. Used by the driver-side sync `task`
 /// interception to retrieve the channel/futex/inherit info after spawning.
-pub(crate) fn with_task_entry<R>(
-    task_id: &str,
-    f: impl FnOnce(&AsyncTaskEntry) -> R,
-) -> Option<R> {
+pub(crate) fn with_task_entry<R>(task_id: &str, f: impl FnOnce(&AsyncTaskEntry) -> R) -> Option<R> {
     let registry = TASK_REGISTRY.lock().unwrap();
     registry.get(task_id).map(f)
 }
@@ -742,7 +757,11 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
 
     Ok(format!(
         "Task spawned: task_id={}, pid={}, agent={}, model={}, inherit={}\nUse task_wait to collect results when ready.",
-        spawned.task_id, spawned.pid, prepared.agent_name, prepared.model, prepared.inherit.describe()
+        spawned.task_id,
+        spawned.pid,
+        prepared.agent_name,
+        prepared.model,
+        prepared.inherit.describe()
     ))
 }
 
@@ -953,7 +972,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             return Err(format!(
                 "Unknown wait_policy: {} (expected 'any' or 'all')",
                 other
-            ))
+            ));
         }
     };
 
@@ -1018,7 +1037,10 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         }
 
         if !pending.is_empty() {
-            let pending_ids = pending.iter().map(|(tid, _)| tid.clone()).collect::<Vec<_>>();
+            let pending_ids = pending
+                .iter()
+                .map(|(tid, _)| tid.clone())
+                .collect::<Vec<_>>();
             let wait_sources = task_wait_sources(os, &pending_ids, &registry)?;
             let wait = epoll_wait_many(
                 os,
@@ -1155,7 +1177,10 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
         return Ok("No async tasks currently tracked.".to_string());
     }
 
-    let mut lines = vec!["TaskID              PID      Agent          Model          State       Description".to_string()];
+    let mut lines = vec![
+        "TaskID              PID      Agent          Model          State       Description"
+            .to_string(),
+    ];
     with_os_kernel(|os| {
         for (tid, entry) in registry.iter() {
             let state_str = task_state_string(os, entry.result_channel_id, entry.pid)?;
@@ -1191,14 +1216,12 @@ fn read_task_result(
         IpcRecvResult::Message(payload) => payload,
         IpcRecvResult::Empty | IpcRecvResult::Closed => return Ok(None),
     };
-    serde_json::from_str(&payload)
-        .map(Some)
-        .map_err(|err| {
-            format!(
-                "Failed to decode stored task result from channel {}: {}",
-                result_channel_id, err
-            )
-        })
+    serde_json::from_str(&payload).map(Some).map_err(|err| {
+        format!(
+            "Failed to decode stored task result from channel {}: {}",
+            result_channel_id, err
+        )
+    })
 }
 
 fn task_wait_sources(
@@ -1221,10 +1244,7 @@ fn task_wait_sources(
     Ok(sources)
 }
 
-fn is_task_pending(
-    os: &mut dyn Kernel,
-    pid: u64,
-) -> Result<bool, String> {
+fn is_task_pending(os: &mut dyn Kernel, pid: u64) -> Result<bool, String> {
     let Some(proc) = os.get_process(pid) else {
         return Ok(false);
     };
@@ -1323,8 +1343,10 @@ fn select_subagent<'a>(
 ) -> Result<SelectedSubagent<'a>, String> {
     let subagents = agents::get_subagents(all_agents);
     if subagents.is_empty() {
-        return Err("No subagents are available. Add at least one agent with mode: subagent or all."
-            .to_string());
+        return Err(
+            "No subagents are available. Add at least one agent with mode: subagent or all."
+                .to_string(),
+        );
     }
 
     if let Some(requested) = requested_agent {
@@ -1430,7 +1452,11 @@ fn build_selection_explanation(
         "agent_reason=explicit agent override".to_string()
     };
 
-    let model_reason = if model_override.map(str::trim).filter(|value| !value.is_empty()).is_some() {
+    let model_reason = if model_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
         "model_reason=explicit model override".to_string()
     } else {
         format!(
@@ -1539,7 +1565,11 @@ mod tests {
             "Read-only codebase exploration agent",
             AgentMode::Subagent,
         );
-        explore.routing_tags = vec!["find".to_string(), "search".to_string(), "locate".to_string()];
+        explore.routing_tags = vec![
+            "find".to_string(),
+            "search".to_string(),
+            "locate".to_string(),
+        ];
         explore.model_tier = Some(AgentModelTier::Light);
 
         let mut review = manifest("critic", "Code review agent", AgentMode::Subagent);
@@ -1596,7 +1626,11 @@ mod tests {
 
     #[test]
     fn selection_explanation_mentions_explicit_overrides() {
-        let agent = manifest("explore", "Read-only codebase exploration agent", AgentMode::Subagent);
+        let agent = manifest(
+            "explore",
+            "Read-only codebase exploration agent",
+            AgentMode::Subagent,
+        );
         let selected = SelectedSubagent {
             agent: &agent,
             auto_selected: false,
@@ -1615,7 +1649,8 @@ mod tests {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
         let channel = os.channel_create(Some(root), 1, "task-ready".to_string());
-        os.channel_send(Some(root), channel, "payload".to_string()).unwrap();
+        os.channel_send(Some(root), channel, "payload".to_string())
+            .unwrap();
 
         let wait = epoll_wait_many_channels(
             &mut os,
@@ -1626,7 +1661,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(wait.ready_sources, vec![WaitManySource::Channel(channel.raw())]);
+        assert_eq!(
+            wait.ready_sources,
+            vec![WaitManySource::Channel(channel.raw())]
+        );
         assert!(wait.pending_sources.is_empty());
         assert!(!wait.suspended);
         assert!(wait.event_ids.is_empty());
@@ -1668,7 +1706,8 @@ mod tests {
         let channel = os.channel_create(Some(root), 1, "mixed-channel".to_string());
         let futex = os.futex_create(0, "mixed-futex".to_string());
         let event = EventId::new(77);
-        os.channel_send(Some(root), channel, "payload".to_string()).unwrap();
+        os.channel_send(Some(root), channel, "payload".to_string())
+            .unwrap();
         let _ = os.futex_store(futex, 1);
         os.notify_events_completed(&[event]);
 
@@ -1677,7 +1716,10 @@ mod tests {
             "mixed-ready",
             &[
                 WaitManySource::Channel(channel.raw()),
-                WaitManySource::Futex { addr: futex, expected: 0 },
+                WaitManySource::Futex {
+                    addr: futex,
+                    expected: 0,
+                },
                 WaitManySource::Event(event),
             ],
             WaitPolicy::Any,
@@ -1689,7 +1731,10 @@ mod tests {
             wait.ready_sources,
             vec![
                 WaitManySource::Channel(channel.raw()),
-                WaitManySource::Futex { addr: futex, expected: 0 },
+                WaitManySource::Futex {
+                    addr: futex,
+                    expected: 0
+                },
                 WaitManySource::Event(event),
             ]
         );
@@ -1711,7 +1756,10 @@ mod tests {
             "mixed-all",
             &[
                 WaitManySource::Channel(channel.raw()),
-                WaitManySource::Futex { addr: futex, expected: 0 },
+                WaitManySource::Futex {
+                    addr: futex,
+                    expected: 0,
+                },
                 WaitManySource::Event(event),
             ],
             WaitPolicy::All,
@@ -1724,7 +1772,10 @@ mod tests {
             wait.pending_sources,
             vec![
                 WaitManySource::Channel(channel.raw()),
-                WaitManySource::Futex { addr: futex, expected: 0 },
+                WaitManySource::Futex {
+                    addr: futex,
+                    expected: 0
+                },
             ]
         );
         assert_eq!(wait.event_ids.len(), 2);

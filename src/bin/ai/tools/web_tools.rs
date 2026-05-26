@@ -278,8 +278,10 @@ fn search_all_parallel(
     let errors: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Build list of search tasks to run in parallel
-    let mut tasks: Vec<(&str, Box<dyn FnOnce() -> Result<Vec<WebSearchHit>, String> + Send>)> =
-        Vec::new();
+    let mut tasks: Vec<(
+        &str,
+        Box<dyn FnOnce() -> Result<Vec<WebSearchHit>, String> + Send>,
+    )> = Vec::new();
 
     tasks.push((
         "ddg_primary",
@@ -302,9 +304,7 @@ fn search_all_parallel(
         let instance = instance.clone();
         tasks.push((
             "searxng_env",
-            Box::new(move || {
-                searxng_search(&instance, query, region, time_range, limit, timeout)
-            }),
+            Box::new(move || searxng_search(&instance, query, region, time_range, limit, timeout)),
         ));
     } else {
         for (i, instance) in SEARXNG_PUBLIC_INSTANCES
@@ -348,7 +348,10 @@ fn search_all_parallel(
                     }
                     Err(e) => {
                         eprintln!("[web_search] {} failed: {}", name, e);
-                        errors_ref.lock().unwrap().push((name.to_string(), e.clone()));
+                        errors_ref
+                            .lock()
+                            .unwrap()
+                            .push((name.to_string(), e.clone()));
                     }
                 }
             });
@@ -382,9 +385,7 @@ fn remaining_search_timeout(deadline: std::time::Instant) -> Option<Duration> {
 
 pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
     let url = args["url"].as_str().ok_or("Missing url")?;
-    let extract_content = args["extract_content"]
-        .as_bool()
-        .unwrap_or(false);
+    let extract_content = args["extract_content"].as_bool().unwrap_or(false);
     let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid url".to_string())?;
     let scheme = parsed.scheme();
     if scheme != "http" && scheme != "https" {
@@ -482,7 +483,8 @@ fn extract_main_content(html: &str) -> String {
     // Decode HTML entities
     let decoded = decode_html_entities(&text);
     // Remove excessive blank lines
-    let clean: Vec<&str> = decoded.lines()
+    let clean: Vec<&str> = decoded
+        .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();

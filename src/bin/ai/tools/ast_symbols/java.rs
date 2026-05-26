@@ -53,7 +53,8 @@ fn visit_node(
         }
         "method_declaration" => {
             if let Some(name) = name_from_field(node, "name", source)
-                .or_else(|| first_named_child_text(node, source, &["identifier"])) {
+                .or_else(|| first_named_child_text(node, source, &["identifier"]))
+            {
                 out.push(SymbolEntry::new(
                     if in_type { "method" } else { "function" },
                     name,
@@ -65,8 +66,15 @@ fn visit_node(
         }
         "constructor_declaration" => {
             if let Some(name) = name_from_field(node, "name", source)
-                .or_else(|| first_named_child_text(node, source, &["identifier"])) {
-                out.push(SymbolEntry::new("constructor", name, line(node), None, indent));
+                .or_else(|| first_named_child_text(node, source, &["identifier"]))
+            {
+                out.push(SymbolEntry::new(
+                    "constructor",
+                    name,
+                    line(node),
+                    None,
+                    indent,
+                ));
             }
         }
         "field_declaration" => {
@@ -83,7 +91,12 @@ fn visit_node(
     }
 }
 
-fn recurse_body(node: tree_sitter::Node<'_>, source: &str, indent: usize, out: &mut Vec<SymbolEntry>) {
+fn recurse_body(
+    node: tree_sitter::Node<'_>,
+    source: &str,
+    indent: usize,
+    out: &mut Vec<SymbolEntry>,
+) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         if matches!(child.kind(), "class_body" | "interface_body" | "enum_body") {
@@ -100,7 +113,8 @@ fn push_named(
     out: &mut Vec<SymbolEntry>,
 ) {
     if let Some(name) = name_from_field(node, "name", source)
-        .or_else(|| first_named_child_text(node, source, &["identifier", "type_identifier"])) {
+        .or_else(|| first_named_child_text(node, source, &["identifier", "type_identifier"]))
+    {
         out.push(SymbolEntry::new(kind, name, line(node), None, indent));
     }
 }

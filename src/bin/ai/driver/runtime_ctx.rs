@@ -30,12 +30,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::ai::{
-    agents::AgentManifest,
-    mcp::SharedMcpClient,
-    skills::SkillManifest,
-    types::App,
-};
+use crate::ai::{agents::AgentManifest, mcp::SharedMcpClient, skills::SkillManifest, types::App};
 
 /// Slot used by a sub-agent's `finalize_turn` to publish its final
 /// assistant text back to the caller. The parent task installs a fresh
@@ -189,8 +184,7 @@ mod tests {
     #[test]
     fn effective_cwd_honours_subagent_override() {
         let want = std::env::temp_dir();
-        let got =
-            SUBAGENT_CWD.sync_scope(want.clone(), || effective_cwd().unwrap());
+        let got = SUBAGENT_CWD.sync_scope(want.clone(), || effective_cwd().unwrap());
         assert_eq!(got, want);
     }
 

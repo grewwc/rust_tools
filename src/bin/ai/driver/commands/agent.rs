@@ -112,11 +112,20 @@ pub fn try_handle_agent_command(
             let new_count = agent_manifests.len();
             let delta = new_count as i64 - old_count as i64;
             if delta > 0 {
-                println!("[Agent 发现] 重新扫描完成，新发现 {} 个 agent(s)，当前共 {} 个", delta, new_count);
+                println!(
+                    "[Agent 发现] 重新扫描完成，新发现 {} 个 agent(s)，当前共 {} 个",
+                    delta, new_count
+                );
             } else if delta < 0 {
-                println!("[Agent 发现] 重新扫描完成，{} 个 agent 已移除，当前共 {} 个", -delta, new_count);
+                println!(
+                    "[Agent 发现] 重新扫描完成，{} 个 agent 已移除，当前共 {} 个",
+                    -delta, new_count
+                );
             } else {
-                println!("[Agent 发现] 重新扫描完成，共 {} 个 agent (无变化)", new_count);
+                println!(
+                    "[Agent 发现] 重新扫描完成，共 {} 个 agent (无变化)",
+                    new_count
+                );
             }
         }
         "use" | "select" | "switch" => {

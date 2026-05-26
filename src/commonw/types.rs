@@ -102,7 +102,7 @@ mod tests {
         let mut map: FastMap<&str, i32> = FastMap::default();
         map.insert("a", 1);
         map.insert("b", 2);
-        
+
         assert_eq!(map.get(&"a"), Some(&1));
         assert_eq!(map.get(&"b"), Some(&2));
         assert_eq!(map.get(&"c"), None);
@@ -115,7 +115,7 @@ mod tests {
         set.insert(1);
         set.insert(2);
         set.insert(3);
-        
+
         assert!(set.contains(&1));
         assert!(set.contains(&2));
         assert!(!set.contains(&4));

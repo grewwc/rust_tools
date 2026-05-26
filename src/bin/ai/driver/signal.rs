@@ -23,7 +23,11 @@ pub enum SigintAction {
     Exit,
 }
 
-pub(in crate::ai) fn handle_sigint(shutdown: &AtomicBool, streaming: &AtomicBool, cancel_stream: &AtomicBool) {
+pub(in crate::ai) fn handle_sigint(
+    shutdown: &AtomicBool,
+    streaming: &AtomicBool,
+    cancel_stream: &AtomicBool,
+) {
     match sigint_action(shutdown, streaming, cancel_stream) {
         SigintAction::CancelStream => {
             crate::ai::tools::registry::common::request_tool_cancel();

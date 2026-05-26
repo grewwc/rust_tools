@@ -1,13 +1,13 @@
 use std::collections::HashSet;
 
+use crate::ai::driver::observer::{
+    FinalizeContext, ObserverOutput, PrepareContext, ToolResultContext, TurnObserver,
+};
 use crate::ai::driver::thinking::{
     engine::ThoughtTree,
     generalization::ExperienceGeneralizer,
     goals::GoalManager,
     verification::{VerificationOutcome, VerificationStep, VerificationWorkflow},
-};
-use crate::ai::driver::observer::{
-    FinalizeContext, ObserverOutput, PrepareContext, ToolResultContext, TurnObserver,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -50,7 +50,8 @@ fn default_goal_persistence_dir() -> Option<std::path::PathBuf> {
 
 impl ThinkingOrchestrator {
     pub fn new() -> Self {
-        let goal_manager = GoalManager::new().with_persistence_dir_opt(default_goal_persistence_dir());
+        let goal_manager =
+            GoalManager::new().with_persistence_dir_opt(default_goal_persistence_dir());
         Self {
             thought_tree: None,
             verification: None,
@@ -87,7 +88,10 @@ impl ThinkingOrchestrator {
         let inject = self.build_system_prompt_injection();
 
         let next_sub_goal = if self.active_modes.contains(&ThinkingMode::GoalDirected) {
-            self.goal_manager.get_next_actions().first().map(|s| s.description.clone())
+            self.goal_manager
+                .get_next_actions()
+                .first()
+                .map(|s| s.description.clone())
         } else {
             None
         };
@@ -125,14 +129,13 @@ impl ThinkingOrchestrator {
         if self.active_modes.contains(&ThinkingMode::VerificationLoop) {
             if let Some(ref mut wf) = self.verification {
                 if matches!(wf.current_step, VerificationStep::ExecuteTest) {
-                    let test_result =
-                        crate::ai::driver::thinking::verification::TestResult {
-                            command: tool_name.to_string(),
-                            exit_code: if success { 0 } else { 1 },
-                            stdout_preview: result.chars().take(500).collect(),
-                            stderr_preview: String::new(),
-                            passed: success,
-                        };
+                    let test_result = crate::ai::driver::thinking::verification::TestResult {
+                        command: tool_name.to_string(),
+                        exit_code: if success { 0 } else { 1 },
+                        stdout_preview: result.chars().take(500).collect(),
+                        stderr_preview: String::new(),
+                        passed: success,
+                    };
                     wf.current_cycle_mut().record_test_result(test_result);
                     wf.advance_step();
                 }
@@ -143,11 +146,7 @@ impl ThinkingOrchestrator {
             let safe_snippet: String = result.chars().take(200).collect();
             self.generalizer.ingest_experience(
                 "failure",
-                &format!(
-                    "Avoid: {} led to failure - {}",
-                    tool_name,
-                    safe_snippet
-                ),
+                &format!("Avoid: {} led to failure - {}", tool_name, safe_snippet),
                 &[tool_name.to_string()],
                 None,
             );
@@ -251,7 +250,8 @@ impl ThinkingOrchestrator {
                  | <meta:begin_verification>H</meta:begin_verification> \
                  | <meta:begin_goal>G</meta:begin_goal> \
                  | <meta:reset_thinking/> \
-                 | <meta:self_note>Do:/Avoid: ...</meta:self_note>.".to_string()
+                 | <meta:self_note>Do:/Avoid: ...</meta:self_note>."
+                    .to_string(),
             );
         }
 
@@ -271,18 +271,24 @@ impl ThinkingOrchestrator {
             if let Some(ref wf) = self.verification {
                 if !wf.is_complete() {
                     let step_instruction = match wf.current_step {
-                        VerificationStep::GenerateHypothesis =>
-                            "Formulate a specific, falsifiable hypothesis about the issue.",
-                        VerificationStep::DesignTest =>
-                            "Design a concrete test (command or file inspection) to verify your hypothesis.",
-                        VerificationStep::ExecuteTest =>
-                            "Execute the test you designed and observe the result.",
-                        VerificationStep::AnalyzeResult =>
-                            "Analyze the test results: does the evidence confirm or refute your hypothesis?",
-                        VerificationStep::ReviseHypothesis =>
-                            "Based on the analysis, revise your hypothesis if needed.",
-                        VerificationStep::ConfirmOrReject =>
-                            "Make a final judgment: is the hypothesis confirmed or rejected?",
+                        VerificationStep::GenerateHypothesis => {
+                            "Formulate a specific, falsifiable hypothesis about the issue."
+                        }
+                        VerificationStep::DesignTest => {
+                            "Design a concrete test (command or file inspection) to verify your hypothesis."
+                        }
+                        VerificationStep::ExecuteTest => {
+                            "Execute the test you designed and observe the result."
+                        }
+                        VerificationStep::AnalyzeResult => {
+                            "Analyze the test results: does the evidence confirm or refute your hypothesis?"
+                        }
+                        VerificationStep::ReviseHypothesis => {
+                            "Based on the analysis, revise your hypothesis if needed."
+                        }
+                        VerificationStep::ConfirmOrReject => {
+                            "Make a final judgment: is the hypothesis confirmed or rejected?"
+                        }
                     };
                     parts.push(format!(
                         "[Verification Loop Active] Current step: {:?}. {} \
@@ -296,14 +302,21 @@ impl ThinkingOrchestrator {
         if self.active_modes.contains(&ThinkingMode::GoalDirected) {
             if let Some(goal) = self.goal_manager.active_goal() {
                 let status = goal.render_status();
-                let next_actions: Vec<&str> = goal.get_next_actionable()
-                    .iter().map(|s| s.description.as_str()).collect();
+                let next_actions: Vec<&str> = goal
+                    .get_next_actionable()
+                    .iter()
+                    .map(|s| s.description.as_str())
+                    .collect();
                 parts.push(format!(
                     "[Goal-Directed Mode Active]\n{}\n\
                      Next actionable sub-goals: {}\n\
                      Focus on completing the next sub-goal before moving on.",
                     status,
-                    if next_actions.is_empty() { "none yet - decompose first".to_string() } else { next_actions.join(", ") }
+                    if next_actions.is_empty() {
+                        "none yet - decompose first".to_string()
+                    } else {
+                        next_actions.join(", ")
+                    }
                 ));
             }
         }
@@ -431,7 +444,10 @@ impl TurnObserver for ThinkingOrchestrator {
             .collect()
     }
 
-    fn on_prepare_rich(&mut self, ctx: &PrepareContext) -> crate::ai::driver::observer::PrepareOutput {
+    fn on_prepare_rich(
+        &mut self,
+        ctx: &PrepareContext,
+    ) -> crate::ai::driver::observer::PrepareOutput {
         use crate::ai::driver::observer::{PrepareOutput, SectionKind};
 
         // Activate existing state (creation happens in on_finalize via meta-tags).
@@ -450,7 +466,10 @@ impl TurnObserver for ThinkingOrchestrator {
         if let Some(injection) = decision.inject_into_system_prompt {
             sections.push((SectionKind::Behavior, "Behavior".to_string(), injection));
         }
-        if decision.active_modes.contains(&ThinkingMode::TreeOfThoughts) {
+        if decision
+            .active_modes
+            .contains(&ThinkingMode::TreeOfThoughts)
+        {
             if let Some(ref tree) = self.thought_tree {
                 if let Some(current) = tree.ucb_select(1.414) {
                     self.current_tree_node_id = Some(current);
@@ -462,7 +481,10 @@ impl TurnObserver for ThinkingOrchestrator {
                 }
             }
         }
-        if decision.active_modes.contains(&ThinkingMode::VerificationLoop) {
+        if decision
+            .active_modes
+            .contains(&ThinkingMode::VerificationLoop)
+        {
             let verification_data: Option<(VerificationStep, String, String)> = self.verification.as_ref().map(|wf| {
                 let prompt = match wf.current_step {
                     VerificationStep::GenerateHypothesis => {
@@ -564,7 +586,10 @@ impl TurnObserver for ThinkingOrchestrator {
 
         let generalized = self.try_generalize();
         if let Some(result) = &generalized {
-            display_lines.push(format!("[Thinking] Generalized principle: {}", result.principle_text));
+            display_lines.push(format!(
+                "[Thinking] Generalized principle: {}",
+                result.principle_text
+            ));
         }
 
         if generalized.is_some() && self.try_cross_domain_link().is_some() {
@@ -597,9 +622,7 @@ impl TurnObserver for ThinkingOrchestrator {
         self.active_modes.clear();
         self.current_tree_node_id = None;
 
-        ObserverOutput {
-            display_lines,
-        }
+        ObserverOutput { display_lines }
     }
 
     fn on_conversation_end(&mut self) {
@@ -612,7 +635,8 @@ impl TurnObserver for ThinkingOrchestrator {
             self.active_modes.clear();
             self.current_tree_node_id = None;
             self.generalizer = ExperienceGeneralizer::new();
-            self.goal_manager = GoalManager::new().with_persistence_dir_opt(default_goal_persistence_dir());
+            self.goal_manager =
+                GoalManager::new().with_persistence_dir_opt(default_goal_persistence_dir());
         }
     }
 
@@ -635,15 +659,23 @@ mod tests {
     #[test]
     fn explicit_meta_tag_activates_verification() {
         let mut orch = ThinkingOrchestrator::new();
-        orch.apply_meta_tags("<meta:begin_verification>server crashes under high load</meta:begin_verification>");
+        orch.apply_meta_tags(
+            "<meta:begin_verification>server crashes under high load</meta:begin_verification>",
+        );
         let decision = orch.analyze_question("anything");
-        assert!(decision.active_modes.contains(&ThinkingMode::VerificationLoop));
+        assert!(
+            decision
+                .active_modes
+                .contains(&ThinkingMode::VerificationLoop)
+        );
     }
 
     #[test]
     fn explicit_meta_tag_activates_goal() {
         let mut orch = ThinkingOrchestrator::new();
-        orch.apply_meta_tags("<meta:begin_goal>Refactor the entire networking layer</meta:begin_goal>");
+        orch.apply_meta_tags(
+            "<meta:begin_goal>Refactor the entire networking layer</meta:begin_goal>",
+        );
         let decision = orch.analyze_question("anything");
         assert!(decision.active_modes.contains(&ThinkingMode::GoalDirected));
         assert!(orch.goal_manager.active_goal().is_some());
@@ -654,10 +686,14 @@ mod tests {
         let mut orch = ThinkingOrchestrator::new();
         orch.apply_meta_tags(
             "<meta:begin_verification>bug hypothesis</meta:begin_verification>\
-             <meta:begin_goal>refactor error handling</meta:begin_goal>"
+             <meta:begin_goal>refactor error handling</meta:begin_goal>",
         );
         let decision = orch.analyze_question("anything");
-        assert!(decision.active_modes.contains(&ThinkingMode::VerificationLoop));
+        assert!(
+            decision
+                .active_modes
+                .contains(&ThinkingMode::VerificationLoop)
+        );
         assert!(decision.active_modes.contains(&ThinkingMode::GoalDirected));
     }
 
@@ -744,10 +780,12 @@ mod tests {
             final_text: "hello".to_string(),
             had_tool_calls: false,
         });
-        assert!(!output
-            .display_lines
-            .iter()
-            .any(|line| line.contains("Cross-domain link discovered")));
+        assert!(
+            !output
+                .display_lines
+                .iter()
+                .any(|line| line.contains("Cross-domain link discovered"))
+        );
     }
 
     #[test]

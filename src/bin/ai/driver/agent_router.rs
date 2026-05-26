@@ -14,8 +14,8 @@ use crate::ai::{
 };
 
 use super::{
-    build_idf_from_documents, cosine_tfidf_similarity, normalize_text_for_similarity,
-    TextSimilarityFeatures,
+    TextSimilarityFeatures, build_idf_from_documents, cosine_tfidf_similarity,
+    normalize_text_for_similarity,
 };
 
 // 与 `normalize_text_for_similarity` 行为相同的本地别名，便于本文件保留旧调用形式。
@@ -118,9 +118,7 @@ fn lock_recover<'a, T>(m: &'a Mutex<T>) -> Option<std::sync::MutexGuard<'a, T>> 
     match m.lock() {
         Ok(g) => Some(g),
         Err(poisoned) => {
-            eprintln!(
-                "[agent_router] cache mutex poisoned, recovering inner state"
-            );
+            eprintln!("[agent_router] cache mutex poisoned, recovering inner state");
             Some(poisoned.into_inner())
         }
     }
@@ -202,7 +200,6 @@ fn extract_char_ngrams(input: &str, min_n: usize, max_n: usize) -> Vec<String> {
 
     out
 }
-
 
 pub struct ModelRouter {
     model_path: PathBuf,
@@ -360,9 +357,9 @@ fn rank_agents_by_semantics<'a>(
             let question_score = doc
                 .map(|doc| cosine_tfidf_similarity(&query.ngram_tf, doc, &corpus.idf))
                 .unwrap_or(0.0);
-            let history_score =
-                doc.map(|doc| cosine_tfidf_similarity(&history_features.ngram_tf, doc, &corpus.idf))
-                    .unwrap_or(0.0);
+            let history_score = doc
+                .map(|doc| cosine_tfidf_similarity(&history_features.ngram_tf, doc, &corpus.idf))
+                .unwrap_or(0.0);
             let prior_boost = model_prior
                 .filter(|(label, _)| *label == agent.name)
                 .map(|(_, confidence)| confidence * 0.15 * reliability)
@@ -556,37 +553,46 @@ mod tests {
 
     #[test]
     fn semantic_router_prefers_planning_agent_for_analysis_request() {
-        let build = primary_agent("build", "Default agent for development work", &["fix", "debug"]);
+        let build = primary_agent(
+            "build",
+            "Default agent for development work",
+            &["fix", "debug"],
+        );
         let plan = primary_agent(
             "plan",
             "Read-only agent for planning and analysis without making changes",
-            &["plan", "planning", "review", "analyze", "analysis", "总结", "分析"],
+            &[
+                "plan", "planning", "review", "analyze", "analysis", "总结", "分析",
+            ],
         );
         let agents = [build, plan];
-        let ranked = rank_agents_by_semantics(
-            &agents,
-            "先别改代码，帮我分析这次重构方案和风险",
-            &[],
-            None,
+        let ranked =
+            rank_agents_by_semantics(&agents, "先别改代码，帮我分析这次重构方案和风险", &[], None);
+        assert_eq!(
+            ranked.first().map(|item| item.agent.name.as_str()),
+            Some("plan")
         );
-        assert_eq!(ranked.first().map(|item| item.agent.name.as_str()), Some("plan"));
     }
 
     #[test]
     fn history_alone_cannot_override_current_turn_semantics() {
-        let build = primary_agent("build", "Default agent for development work", &["fix", "debug"]);
+        let build = primary_agent(
+            "build",
+            "Default agent for development work",
+            &["fix", "debug"],
+        );
         let plan = primary_agent(
             "plan",
             "Read-only agent for planning and analysis without making changes",
-            &["plan", "planning", "review", "analyze", "analysis", "总结", "分析"],
+            &[
+                "plan", "planning", "review", "analyze", "analysis", "总结", "分析",
+            ],
         );
 
         let history = vec![
             Message {
                 role: "assistant".to_string(),
-                content: serde_json::Value::String(
-                    "plan plan plan analyze summarize".to_string(),
-                ),
+                content: serde_json::Value::String("plan plan plan analyze summarize".to_string()),
                 tool_calls: None,
                 tool_call_id: None,
                 reasoning_content: None,

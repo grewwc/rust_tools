@@ -1,8 +1,8 @@
 mod engine;
-mod verification;
 mod generalization;
 mod goals;
 mod orchestrator;
+mod verification;
 
 pub use orchestrator::ThinkingOrchestrator;
 

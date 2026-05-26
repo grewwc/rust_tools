@@ -393,7 +393,11 @@ fn safe_agent_file_name(name: &str) -> String {
         out = out.replace("--", "-");
     }
     let out = out.trim_matches('-').to_string();
-    let out = if out.is_empty() { "agent".to_string() } else { out };
+    let out = if out.is_empty() {
+        "agent".to_string()
+    } else {
+        out
+    };
     if out.ends_with(".agent") {
         out
     } else {
@@ -403,7 +407,10 @@ fn safe_agent_file_name(name: &str) -> String {
 
 fn build_agent_file_content(args: &Value) -> Result<String, String> {
     let name = args["name"].as_str().ok_or("Missing name")?.trim();
-    let description = args["description"].as_str().ok_or("Missing description")?.trim();
+    let description = args["description"]
+        .as_str()
+        .ok_or("Missing description")?
+        .trim();
     let prompt = args["prompt"].as_str().ok_or("Missing prompt")?.trim();
     if name.is_empty() {
         return Err("name is empty".to_string());
@@ -418,7 +425,9 @@ fn build_agent_file_content(args: &Value) -> Result<String, String> {
     let system_prompt = args["system_prompt"].as_str().unwrap_or("").trim();
     let mode = args["mode"].as_str().unwrap_or("primary").trim();
     if !matches!(mode, "primary" | "subagent" | "all") {
-        return Err(format!("invalid mode '{mode}': expected primary | subagent | all"));
+        return Err(format!(
+            "invalid mode '{mode}': expected primary | subagent | all"
+        ));
     }
     let model = args["model"].as_str().unwrap_or("").trim();
     let model_tier = args["model_tier"].as_str().unwrap_or("").trim();

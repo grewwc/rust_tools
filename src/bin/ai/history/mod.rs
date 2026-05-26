@@ -9,28 +9,30 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
+use crate::ai::types::App;
 #[allow(unused_imports)]
 pub(in crate::ai) use blob::{
-    append_history, append_history_messages, append_history_messages_uncompacted, build_message_arr,
-    delete_history_artifacts,
+    append_history, append_history_messages, append_history_messages_uncompacted,
+    build_message_arr, delete_history_artifacts,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use compress::compress_messages_for_context;
 #[allow(unused_imports)]
 pub(in crate::ai) use compress::value_to_string;
 #[allow(unused_imports)]
-pub(in crate::ai) use compress::{messages_total_chars_pub, mid_turn_compress, mid_turn_llm_summarize};
+pub(in crate::ai) use compress::{
+    messages_total_chars_pub, mid_turn_compress, mid_turn_llm_summarize,
+};
 #[allow(unused_imports)]
 pub(in crate::ai) use markdown::messages_to_markdown;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
 #[allow(unused_imports)]
-pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
-#[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_messages_sqlite;
 #[allow(unused_imports)]
+pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
+#[allow(unused_imports)]
 pub(in crate::ai) use types::{COLON, MAX_HISTORY_TURNS, Message, NEWLINE};
-use crate::ai::types::App;
 
 pub(in crate::ai) const ROLE_SYSTEM: &str = types::ROLE_SYSTEM;
 pub(in crate::ai) const ROLE_INTERNAL_NOTE: &str = types::ROLE_INTERNAL_NOTE;
@@ -160,8 +162,10 @@ fn try_build_context_history_sqlite_fastpath(
     let Some(start_message_id) = recent.start_message_id else {
         return Ok(None);
     };
-    let Some(summary) =
-        sqlite::read_latest_history_summary_before_id_sqlite(history_file.as_path(), start_message_id)?
+    let Some(summary) = sqlite::read_latest_history_summary_before_id_sqlite(
+        history_file.as_path(),
+        start_message_id,
+    )?
     else {
         return Ok(None);
     };
@@ -219,7 +223,10 @@ fn system_time_millis(value: SystemTime) -> Option<u128> {
 
 fn try_get_cached_context_history(key: &ContextHistoryCacheKey) -> Option<Vec<Message>> {
     let cache = CONTEXT_HISTORY_CACHE.lock().ok()?;
-    cache.iter().find(|entry| &entry.key == key).map(|entry| (*entry.value).clone())
+    cache
+        .iter()
+        .find(|entry| &entry.key == key)
+        .map(|entry| (*entry.value).clone())
 }
 
 fn store_cached_context_history(key: ContextHistoryCacheKey, value: Vec<Message>) {

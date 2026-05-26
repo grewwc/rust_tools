@@ -182,11 +182,12 @@ fn default_model() -> String {
 /// 在 run() 入口集中报错，避免 [`default_model`] 在更深的调用链里 panic / exit。
 pub(super) fn ensure_models_available() -> Result<(), String> {
     if model_names::all().is_empty() {
-        return Err("[model_names] models.json is empty; please populate it before launching ai".to_string());
+        return Err(
+            "[model_names] models.json is empty; please populate it before launching ai"
+                .to_string(),
+        );
     }
-    if choose_default_model_name(false).is_none()
-        && choose_default_model_name(true).is_none()
-    {
+    if choose_default_model_name(false).is_none() && choose_default_model_name(true).is_none() {
         return Err("[model_names] no usable default model; check models.json entries".to_string());
     }
     Ok(())
@@ -240,7 +241,11 @@ pub(super) fn determine_model(model: &str) -> String {
     if let Some(def) = model_names::find_by_name(raw) {
         return def.name.as_str().to_owned();
     }
-    best_match_model_name(&raw.to_lowercase(), all_model_names().into_iter(), default_model())
+    best_match_model_name(
+        &raw.to_lowercase(),
+        all_model_names().into_iter(),
+        default_model(),
+    )
 }
 
 pub(super) fn determine_vl_model(model: &str) -> String {
@@ -289,12 +294,24 @@ pub(super) fn auto_subagent_model_for_agent(
             target_tier,
         ),
         ModelStrengthTier::Standard => pick_subagent_model(
-            &["QWEN_PLUS_LATEST", "KIMI", "GLM 5.1", "MINIMAX", "DEEPSEEK_V3"],
+            &[
+                "QWEN_PLUS_LATEST",
+                "KIMI",
+                "GLM 5.1",
+                "MINIMAX",
+                "DEEPSEEK_V3",
+            ],
             true,
             target_tier,
         ),
         ModelStrengthTier::Heavy => pick_subagent_model(
-            &["QWEN3_MAX", "QWEN_PLUS_LATEST", "MINIMAX", "GLM 5.1", "KIMI"],
+            &[
+                "QWEN3_MAX",
+                "QWEN_PLUS_LATEST",
+                "MINIMAX",
+                "GLM 5.1",
+                "KIMI",
+            ],
             true,
             target_tier,
         ),
@@ -308,11 +325,23 @@ fn subagent_preferred_keys_all() -> &'static [(&'static str, &'static [&'static 
         ("Light", &["DEEPSEEK_V3", "KIMI", "GLM 5.1", "MINIMAX"]),
         (
             "Standard",
-            &["QWEN_PLUS_LATEST", "KIMI", "GLM 5.1", "MINIMAX", "DEEPSEEK_V3"],
+            &[
+                "QWEN_PLUS_LATEST",
+                "KIMI",
+                "GLM 5.1",
+                "MINIMAX",
+                "DEEPSEEK_V3",
+            ],
         ),
         (
             "Heavy",
-            &["QWEN3_MAX", "QWEN_PLUS_LATEST", "MINIMAX", "GLM 5.1", "KIMI"],
+            &[
+                "QWEN3_MAX",
+                "QWEN_PLUS_LATEST",
+                "MINIMAX",
+                "GLM 5.1",
+                "KIMI",
+            ],
         ),
     ]
 }
@@ -367,10 +396,7 @@ fn merge_agent_tier_with_difficulty(
     }
 }
 
-fn classify_subagent_task_difficulty(
-    description: &str,
-    prompt: &str,
-) -> SubagentTaskDifficulty {
+fn classify_subagent_task_difficulty(description: &str, prompt: &str) -> SubagentTaskDifficulty {
     let combined = format!("{}\n{}", description.trim(), prompt.trim());
     let lower = combined.to_lowercase();
     let char_count = combined.chars().count();
@@ -528,12 +554,18 @@ fn choose_default_model_name(require_vl: bool) -> Option<String> {
 fn choose_best_default_candidate<'a>(
     candidates: &[(usize, &'a ModelDef)],
 ) -> Option<(usize, &'a ModelDef)> {
-    candidates.iter().copied().max_by(|(left_idx, left), (right_idx, right)| {
-        default_candidate_rank(left, *left_idx).cmp(&default_candidate_rank(right, *right_idx))
-    })
+    candidates
+        .iter()
+        .copied()
+        .max_by(|(left_idx, left), (right_idx, right)| {
+            default_candidate_rank(left, *left_idx).cmp(&default_candidate_rank(right, *right_idx))
+        })
 }
 
-fn default_candidate_rank(model: &ModelDef, preferred_index: usize) -> (ModelQualityTier, u8, usize) {
+fn default_candidate_rank(
+    model: &ModelDef,
+    preferred_index: usize,
+) -> (ModelQualityTier, u8, usize) {
     (
         model.quality_tier,
         model.tools_default_enabled as u8,
@@ -545,9 +577,16 @@ fn choose_best_candidate<'a>(
     candidates: &[(usize, &'a ModelDef)],
     target_tier: ModelStrengthTier,
 ) -> Option<(usize, &'a ModelDef)> {
-    candidates.iter().copied().max_by(|(left_idx, left), (right_idx, right)| {
-        candidate_rank(left, *left_idx, target_tier).cmp(&candidate_rank(right, *right_idx, target_tier))
-    })
+    candidates
+        .iter()
+        .copied()
+        .max_by(|(left_idx, left), (right_idx, right)| {
+            candidate_rank(left, *left_idx, target_tier).cmp(&candidate_rank(
+                right,
+                *right_idx,
+                target_tier,
+            ))
+        })
 }
 
 fn candidate_rank(
@@ -615,19 +654,23 @@ fn levenshtein(left: &[u8], right: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_model_tier, api_key_for_model, auto_subagent_model_for_agent,
-        classify_subagent_task_difficulty, default_model, determine_model,
-        determine_vl_model, enable_thinking, endpoint_for_model, initial_model,
-        merge_agent_tier_with_difficulty, endpoint_supports_anonymous_auth,
-        model_provider, model_quality_tier, ModelStrengthTier, SubagentTaskDifficulty,
-        COMPATIBLE_DEFAULT_ENDPOINT, OPENCODE_DEFAULT_ENDPOINT, OPENROUTER_ENDPOINT,
+        COMPATIBLE_DEFAULT_ENDPOINT, ModelStrengthTier, OPENCODE_DEFAULT_ENDPOINT,
+        OPENROUTER_ENDPOINT, SubagentTaskDifficulty, agent_model_tier, api_key_for_model,
+        auto_subagent_model_for_agent, classify_subagent_task_difficulty, default_model,
+        determine_model, determine_vl_model, enable_thinking, endpoint_for_model,
+        endpoint_supports_anonymous_auth, initial_model, merge_agent_tier_with_difficulty,
+        model_provider, model_quality_tier,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
     use crate::ai::config_schema::AiConfig;
     use crate::ai::provider::{ApiProvider, ModelQualityTier};
 
-    fn manifest(name: &str, description: &str, model_tier: Option<AgentModelTier>) -> AgentManifest {
+    fn manifest(
+        name: &str,
+        description: &str,
+        model_tier: Option<AgentModelTier>,
+    ) -> AgentManifest {
         AgentManifest {
             name: name.to_string(),
             description: description.to_string(),
@@ -822,7 +865,10 @@ mod tests {
                     .map(|e| (m.name.clone(), e.to_string()))
             })
             .expect("models.json must contain at least one entry with explicit endpoint");
-        let endpoint = endpoint_for_model(&name, "https://example.com/should-not-be-used/v1/chat/completions");
+        let endpoint = endpoint_for_model(
+            &name,
+            "https://example.com/should-not-be-used/v1/chat/completions",
+        );
         assert_eq!(endpoint, expected);
     }
 
@@ -874,13 +920,17 @@ mod tests {
 
     #[test]
     fn known_model_without_endpoint_uses_provider_default_before_global_fallback() {
-        let endpoint = endpoint_for_model("minimax-m2.5-free", "https://example.com/v1/chat/completions");
+        let endpoint = endpoint_for_model(
+            "minimax-m2.5-free",
+            "https://example.com/v1/chat/completions",
+        );
         assert_eq!(endpoint, OPENCODE_DEFAULT_ENDPOINT);
     }
 
     #[test]
     fn unknown_model_uses_global_fallback_endpoint() {
-        let endpoint = endpoint_for_model("custom-model", "https://example.com/v1/chat/completions");
+        let endpoint =
+            endpoint_for_model("custom-model", "https://example.com/v1/chat/completions");
         assert_eq!(endpoint, "https://example.com/v1/chat/completions");
     }
 

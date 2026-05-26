@@ -167,8 +167,9 @@ pub(super) async fn prepare_turn(
         }
     }
 
-    let observer_outputs: Vec<crate::ai::driver::observer::PrepareOutput> = if sync_prepare_observers_enabled() {
-        app.observers.iter_mut().filter_map(|obs| {
+    let observer_outputs: Vec<crate::ai::driver::observer::PrepareOutput> =
+        if sync_prepare_observers_enabled() {
+            app.observers.iter_mut().filter_map(|obs| {
             if obs.is_poisoned() {
                 return None;
             }
@@ -187,9 +188,9 @@ pub(super) async fn prepare_turn(
                 }
             }
         }).collect()
-    } else {
-        Vec::new()
-    };
+        } else {
+            Vec::new()
+        };
     for output in &observer_outputs {
         for (kind, label, content) in &output.sections {
             match kind {
@@ -198,7 +199,11 @@ pub(super) async fn prepare_turn(
                     let _ = label;
                 }
                 crate::ai::driver::observer::SectionKind::Fact => {
-                    skill_turn.push_labeled_section(skill_runtime::ContextKind::Fact, label, content);
+                    skill_turn.push_labeled_section(
+                        skill_runtime::ContextKind::Fact,
+                        label,
+                        content,
+                    );
                 }
             }
         }
@@ -210,14 +215,12 @@ pub(super) async fn prepare_turn(
     if !suggested_tool_calls_aggregated.is_empty() {
         let mut block = String::from(
             "Thinking engine proposes the following verification-driven tool calls BEFORE answering. \
-             Consider them as high-priority candidates:\n"
+             Consider them as high-priority candidates:\n",
         );
         for sc in &suggested_tool_calls_aggregated {
             block.push_str(&format!(
                 "- {} (rationale: {})\n  args: {}\n",
-                sc.tool_name,
-                sc.rationale,
-                sc.arguments
+                sc.tool_name, sc.rationale, sc.arguments
             ));
         }
         skill_turn.push_section(skill_runtime::ContextKind::Behavior, &block);
@@ -226,17 +229,22 @@ pub(super) async fn prepare_turn(
     let recall_intent = skill_turn.intent().clone();
     let skip_recall_for_skill_context = skill_turn.skip_recall_by_skill();
     let matched_skill_name = skill_turn.matched_skill_name().map(|name| name.to_string());
-    let should_run_general_recall = sync_recall_enabled() && should_run_general_recall(
-        question,
-        &recall_intent,
-        matched_skill_name.as_deref(),
-        skip_recall_for_skill_context,
-    );
+    let should_run_general_recall = sync_recall_enabled()
+        && should_run_general_recall(
+            question,
+            &recall_intent,
+            matched_skill_name.as_deref(),
+            skip_recall_for_skill_context,
+        );
     if should_run_general_recall {
         let recall_bundle = reflection::build_recall_bundle(question, 1200, 2000);
         if let Some(guidelines) = recall_bundle.guidelines {
             if !guidelines.trim().is_empty() {
-                skill_turn.push_labeled_section(skill_runtime::ContextKind::Fact, "Guidelines", &guidelines);
+                skill_turn.push_labeled_section(
+                    skill_runtime::ContextKind::Fact,
+                    "Guidelines",
+                    &guidelines,
+                );
             }
         }
         if let Some(recalled) = recall_bundle.recalled
@@ -265,7 +273,11 @@ pub(super) async fn prepare_turn(
                 category_part,
                 confidence_part
             );
-            skill_turn.push_labeled_section(skill_runtime::ContextKind::Fact, "Recalled Knowledge", &recalled.content);
+            skill_turn.push_labeled_section(
+                skill_runtime::ContextKind::Fact,
+                "Recalled Knowledge",
+                &recalled.content,
+            );
             if recalled.high_confidence_project_memory {
                 skill_turn.push_section(
                     skill_runtime::ContextKind::Policy,
@@ -280,19 +292,25 @@ pub(super) async fn prepare_turn(
         }
     }
 
-    if sync_recall_enabled() && should_run_session_code_discovery_recall(
-        question,
-        &recall_intent,
-        matched_skill_name.as_deref(),
-        skip_recall_for_skill_context,
-    ) && let Some(code_discovery_recall) = build_session_code_discovery_recall(app, &history)
+    if sync_recall_enabled()
+        && should_run_session_code_discovery_recall(
+            question,
+            &recall_intent,
+            matched_skill_name.as_deref(),
+            skip_recall_for_skill_context,
+        )
+        && let Some(code_discovery_recall) = build_session_code_discovery_recall(app, &history)
     {
         println!(
             "{} session={}",
             "[Memory] code_discovery recalled".bright_blue().bold(),
             app.session_id
         );
-        skill_turn.push_labeled_section(skill_runtime::ContextKind::Fact, "Code Discovery", &code_discovery_recall);
+        skill_turn.push_labeled_section(
+            skill_runtime::ContextKind::Fact,
+            "Code Discovery",
+            &code_discovery_recall,
+        );
     }
 
     // C3: 复杂任务自动提示（不强制激活 Thinking 引擎，仅作为软引导）
@@ -648,7 +666,9 @@ fn render_session_code_discovery_recall(discoveries: &[CodeDiscoveryRecord]) -> 
     Some(out)
 }
 
-fn code_discovery_record_from_memory_entry(entry: &AgentMemoryEntry) -> Option<CodeDiscoveryRecord> {
+fn code_discovery_record_from_memory_entry(
+    entry: &AgentMemoryEntry,
+) -> Option<CodeDiscoveryRecord> {
     let mut confidence = None;
     let mut kind = None;
     for tag in &entry.tags {
@@ -672,8 +692,8 @@ mod tests {
         render_session_code_discovery_recall, should_run_general_recall,
         should_run_session_code_discovery_recall,
     };
-    use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
     use crate::ai::code_discovery_policy::parse_record_line;
+    use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
     use crate::ai::history::Message;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
     use serde_json::Value;

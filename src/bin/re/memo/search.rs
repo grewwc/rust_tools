@@ -2,8 +2,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use rust_tools::commonw::types::{FastMap, FastSet};
 use crate::memo::model::MemoRecord;
+use rust_tools::commonw::types::{FastMap, FastSet};
 
 const SEARCH_MIN_INFORMATIVE_COVERAGE: f64 = 0.2;
 const SEARCH_MIN_INFORMATIVE_COVERAGE_WITH_URL: f64 = 0.26;

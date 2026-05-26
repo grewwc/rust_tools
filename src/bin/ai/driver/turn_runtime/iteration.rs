@@ -4,11 +4,7 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
 use crate::ai::{
-    driver::{
-        drain_response, input,
-        print::print_assistant_banner_with_app,
-        skill_runtime,
-    },
+    driver::{drain_response, input, print::print_assistant_banner_with_app, skill_runtime},
     history::Message,
     mcp::McpClient,
     request::{self, do_request_messages},
@@ -16,11 +12,7 @@ use crate::ai::{
     types::{App, StreamOutcome, StreamResult},
 };
 
-use super::{
-    TurnOutcome,
-    persistence::persist_pending_turn_messages,
-    types::IterationExecution,
-};
+use super::{TurnOutcome, persistence::persist_pending_turn_messages, types::IterationExecution};
 
 pub(super) fn refresh_skill_turn_for_iteration(
     app: &mut App,
@@ -120,12 +112,7 @@ fn finish_interrupted_turn(
     app.streaming
         .store(false, std::sync::atomic::Ordering::Relaxed);
     app.ignore_next_prompt_interrupt = true;
-    persist_pending_turn_messages(
-        app,
-        one_shot_mode,
-        turn_messages,
-        persisted_turn_messages,
-    );
+    persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
     println!("\nInterrupted.");
     continue_or_quit(should_quit)
 }
@@ -136,12 +123,7 @@ fn finish_shutdown_turn(
     turn_messages: &[Message],
     persisted_turn_messages: &mut usize,
 ) -> TurnOutcome {
-    persist_pending_turn_messages(
-        app,
-        one_shot_mode,
-        turn_messages,
-        persisted_turn_messages,
-    );
+    persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
     println!();
     TurnOutcome::Quit
 }
@@ -155,12 +137,7 @@ fn handle_request_error(
 ) -> String {
     app.streaming
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    persist_pending_turn_messages(
-        app,
-        one_shot_mode,
-        turn_messages,
-        persisted_turn_messages,
-    );
+    persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
     let err_text = err.to_string();
     if request::is_transient_error(&err) {
         eprintln!("[Warning] {}", err_text);
@@ -290,35 +267,29 @@ async fn stream_model_response(
     _iteration: usize,
 ) -> StreamResult {
     print_assistant_banner_with_app(Some(app));
-    let stream_ok = match stream::stream_response(
-        app,
-        response,
-        current_history,
-        terminal_dedupe_candidate,
-    )
-    .await
-    {
-        Ok(result) => Some(result),
-        Err(err) => {
-            app.streaming
-                .store(false, std::sync::atomic::Ordering::Relaxed);
-            eprintln!("\n[Error] 流式响应处理失败：{}", err);
-            eprintln!("[Info] 尝试继续对话...");
-            None
-        }
-    };
+    let stream_ok =
+        match stream::stream_response(app, response, current_history, terminal_dedupe_candidate)
+            .await
+        {
+            Ok(result) => Some(result),
+            Err(err) => {
+                app.streaming
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("\n[Error] 流式响应处理失败：{}", err);
+                eprintln!("[Info] 尝试继续对话...");
+                None
+            }
+        };
     let stream_result = match stream_ok {
         Some(result) => result,
-        None => {
-            StreamResult {
-                outcome: StreamOutcome::Completed,
-                tool_calls: Vec::new(),
-                assistant_text: "[响应解析失败，请重试]".to_string(),
-                hidden_meta: String::new(),
-                reasoning_text: String::new(),
-                skip_response_drain: false,
-            }
-        }
+        None => StreamResult {
+            outcome: StreamOutcome::Completed,
+            tool_calls: Vec::new(),
+            assistant_text: "[响应解析失败，请重试]".to_string(),
+            hidden_meta: String::new(),
+            reasoning_text: String::new(),
+            skip_response_drain: false,
+        },
     };
     stream_result
 }
@@ -437,15 +408,14 @@ pub(super) async fn execute_turn_iteration(
     }
 
     request::print_info(app, next_model);
-    let stream_result =
-        stream_model_response(
-            app,
-            &mut response,
-            &mut current_history,
-            terminal_dedupe_candidate,
-            iteration,
-        )
-        .await;
+    let stream_result = stream_model_response(
+        app,
+        &mut response,
+        &mut current_history,
+        terminal_dedupe_candidate,
+        iteration,
+    )
+    .await;
     finalize_stream_interaction(
         app,
         &mut response,

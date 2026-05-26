@@ -39,12 +39,18 @@ impl SkillEmbeddingDocument {
 
     pub fn sections(&self) -> [(SkillEmbeddingDocumentSection, &str); 3] {
         [
-            (SkillEmbeddingDocumentSection::Identity, self.identity_text.as_str()),
+            (
+                SkillEmbeddingDocumentSection::Identity,
+                self.identity_text.as_str(),
+            ),
             (
                 SkillEmbeddingDocumentSection::Capability,
                 self.capability_text.as_str(),
             ),
-            (SkillEmbeddingDocumentSection::Behavior, self.behavior_text.as_str()),
+            (
+                SkillEmbeddingDocumentSection::Behavior,
+                self.behavior_text.as_str(),
+            ),
         ]
     }
 }

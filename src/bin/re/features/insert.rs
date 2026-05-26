@@ -44,7 +44,8 @@ pub fn insert_records(
     } else if from_editor {
         print!("input the title: ");
         rust_tools::commonw::editor::flush_stdout();
-        let title = rust_tools::commonw::editor::input_with_editor("", use_vscode).unwrap_or_default();
+        let title =
+            rust_tools::commonw::editor::input_with_editor("", use_vscode).unwrap_or_default();
         println!();
         title_list.push(title);
     } else {

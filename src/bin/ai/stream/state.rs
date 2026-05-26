@@ -5,7 +5,10 @@ use crate::ai::{
     types::{FunctionCall, StreamResult, ToolCall},
 };
 
-use super::{MarkdownStreamRenderer, splitter::{InternalToolCallStreamer, StreamSplitter}};
+use super::{
+    MarkdownStreamRenderer,
+    splitter::{InternalToolCallStreamer, StreamSplitter},
+};
 
 pub(super) const THINKING_TAG_TEXT: &str = "╭─ thinking";
 pub(super) const END_THINKING_TAG_TEXT: &str = "╰─ done thinking";

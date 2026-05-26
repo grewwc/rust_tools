@@ -20,10 +20,7 @@ pub fn try_handle_feishu_auth_command(
     } else {
         return Ok(false);
     };
-    if normalized != "feishu-auth"
-        && normalized != "feishu auth"
-        && normalized != "feishu_auth"
-    {
+    if normalized != "feishu-auth" && normalized != "feishu auth" && normalized != "feishu_auth" {
         return Ok(false);
     }
 

@@ -6,9 +6,9 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 
 use crate::ai::mcp::{McpClient, connection::McpServerConnection};
-use crate::ai::types::{App, McpServerConfig, McpTool, McpResource, McpPrompt};
-use std::process::{Command, Stdio};
+use crate::ai::types::{App, McpPrompt, McpResource, McpServerConfig, McpTool};
 use rust_tools::commonw::FastMap;
+use std::process::{Command, Stdio};
 
 const FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS: u64 = 20_000;
 
@@ -151,7 +151,10 @@ async fn prepare_mcp_initialization_from_path_inner(
 
     if let Err(err) = fs::metadata(&config_path) {
         if err.kind() != io::ErrorKind::NotFound {
-            eprintln!("[mcp] failed to access config file {}: {}", config_path, err);
+            eprintln!(
+                "[mcp] failed to access config file {}: {}",
+                config_path, err
+            );
         }
         return Some(empty_prepared_mcp_init(report));
     }
@@ -195,7 +198,9 @@ async fn prepare_mcp_initialization_from_path_inner(
 
         match result {
             Ok(conn) => {
-                client.servers.insert(name.clone(), std::sync::Mutex::new(conn));
+                client
+                    .servers
+                    .insert(name.clone(), std::sync::Mutex::new(conn));
             }
             Err(err) => {
                 eprintln!("[mcp] failed to connect to server {}: {}", name, err);
@@ -261,10 +266,8 @@ mod tests {
         init_os_tools_globals(kernel.clone());
         crate::ai::driver::signal::clear_request_interrupt();
 
-        let config_path = std::env::temp_dir().join(format!(
-            "mcp-interruptible-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let config_path =
+            std::env::temp_dir().join(format!("mcp-interruptible-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(
             &config_path,
             r#"{
@@ -296,7 +299,10 @@ mod tests {
 }
 
 /// 同步连接单个 MCP 服务器（提取自 McpClient::connect_server）
-fn connect_single_server(name: &str, config: &McpServerConfig) -> Result<McpServerConnection, String> {
+fn connect_single_server(
+    name: &str,
+    config: &McpServerConfig,
+) -> Result<McpServerConnection, String> {
     if config.disabled {
         return Err("Server is disabled".to_string());
     }
@@ -341,7 +347,7 @@ fn connect_single_server(name: &str, config: &McpServerConfig) -> Result<McpServ
 
     // 使用独立的请求 ID 计数器
     let next_id = std::sync::atomic::AtomicU64::new(1);
-    
+
     initialize_server(&mut conn, &next_id)?;
     conn.tools = list_tools(&mut conn, &next_id)?;
     conn.resources = list_resources(&mut conn, &next_id)?;
@@ -351,10 +357,13 @@ fn connect_single_server(name: &str, config: &McpServerConfig) -> Result<McpServ
 }
 
 // 以下函数提取自 McpClient，使用独立的 AtomicU64 计数器
-fn initialize_server(conn: &mut McpServerConnection, next_id: &std::sync::atomic::AtomicU64) -> Result<(), String> {
-    use serde_json::json;
+fn initialize_server(
+    conn: &mut McpServerConnection,
+    next_id: &std::sync::atomic::AtomicU64,
+) -> Result<(), String> {
     use crate::ai::mcp::send_request_to_conn;
-    
+    use serde_json::json;
+
     let params = json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {
@@ -381,7 +390,10 @@ fn initialize_server(conn: &mut McpServerConnection, next_id: &std::sync::atomic
     Ok(())
 }
 
-fn list_tools(conn: &mut McpServerConnection, next_id: &std::sync::atomic::AtomicU64) -> Result<Vec<McpTool>, String> {
+fn list_tools(
+    conn: &mut McpServerConnection,
+    next_id: &std::sync::atomic::AtomicU64,
+) -> Result<Vec<McpTool>, String> {
     use crate::ai::mcp::send_request_to_conn;
     let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = send_request_to_conn(conn, id, "tools/list", None)?;
@@ -394,7 +406,10 @@ fn list_tools(conn: &mut McpServerConnection, next_id: &std::sync::atomic::Atomi
     Ok(tools)
 }
 
-fn list_resources(conn: &mut McpServerConnection, next_id: &std::sync::atomic::AtomicU64) -> Result<Vec<McpResource>, String> {
+fn list_resources(
+    conn: &mut McpServerConnection,
+    next_id: &std::sync::atomic::AtomicU64,
+) -> Result<Vec<McpResource>, String> {
     use crate::ai::mcp::send_request_to_conn;
     let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = match send_request_to_conn(conn, id, "resources/list", None) {
@@ -418,7 +433,10 @@ fn list_resources(conn: &mut McpServerConnection, next_id: &std::sync::atomic::A
     Ok(resources)
 }
 
-fn list_prompts(conn: &mut McpServerConnection, next_id: &std::sync::atomic::AtomicU64) -> Result<Vec<McpPrompt>, String> {
+fn list_prompts(
+    conn: &mut McpServerConnection,
+    next_id: &std::sync::atomic::AtomicU64,
+) -> Result<Vec<McpPrompt>, String> {
     use crate::ai::mcp::send_request_to_conn;
     let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let result = match send_request_to_conn(conn, id, "prompts/list", None) {

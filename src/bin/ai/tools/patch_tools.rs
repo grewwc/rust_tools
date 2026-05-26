@@ -195,8 +195,8 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
         };
 
         out.extend_from_slice(&orig_lines[cursor..apply_at]);
-        let (hunk_out, new_idx) = try_apply_hunk_at(&orig_lines, hunk, apply_at)
-            .ok_or("context mismatch")?;
+        let (hunk_out, new_idx) =
+            try_apply_hunk_at(&orig_lines, hunk, apply_at).ok_or("context mismatch")?;
         out.extend(hunk_out);
         cursor = new_idx;
     }

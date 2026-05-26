@@ -38,14 +38,20 @@ pub fn try_handle_session_command(
             println!("  /sessions new             create and switch to new session");
             println!("  /sessions use <id>        switch to specified session");
             println!("  /sessions delete <id>     delete specified session");
-            println!("  /sessions clear-history   clear current session history (keeps session alive)");
+            println!(
+                "  /sessions clear-history   clear current session history (keeps session alive)"
+            );
             println!("  /sessions clear-all       delete all sessions");
             println!("  /sessions export <id> [output.md]       export session to Markdown");
-            println!("  /sessions export-current [output.md]    export current session to Markdown");
+            println!(
+                "  /sessions export-current [output.md]    export current session to Markdown"
+            );
             println!("  /sessions export-last [output.md]       export latest session to Markdown");
             println!("  /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
             println!("  /sessions branch <keep_messages> [src=<id>] [as=<id>]");
-            println!("                                          fork then truncate to first N messages");
+            println!(
+                "                                          fork then truncate to first N messages"
+            );
             println!();
         }
         "list" | "ls" | "" => {
@@ -256,7 +262,10 @@ pub fn try_handle_session_command(
                     if let Some(ctx) = app.agent_context.as_mut() {
                         ctx.tools.clear();
                     }
-                    println!("Forked '{}' -> '{}', switched to new branch.", src_id, dst_id);
+                    println!(
+                        "Forked '{}' -> '{}', switched to new branch.",
+                        src_id, dst_id
+                    );
                 }
                 Err(err) => {
                     eprintln!("Failed to fork session: {}", err);

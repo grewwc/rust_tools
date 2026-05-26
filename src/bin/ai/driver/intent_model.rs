@@ -113,9 +113,7 @@ fn lock_recover<'a, T>(m: &'a Mutex<T>) -> Option<std::sync::MutexGuard<'a, T>> 
     match m.lock() {
         Ok(g) => Some(g),
         Err(poisoned) => {
-            eprintln!(
-                "[intent_model] cache mutex poisoned, recovering inner state"
-            );
+            eprintln!("[intent_model] cache mutex poisoned, recovering inner state");
             Some(poisoned.into_inner())
         }
     }
@@ -232,9 +230,7 @@ fn label_to_core(label: Option<&str>) -> CoreIntent {
         unknown => {
             // 模型文件升级后新增标签若没有同步处理逻辑，会无声 fallback 到 Casual。
             // 输出警告便于调试，避免静默降级。
-            eprintln!(
-                "[intent_model] unknown intent label '{unknown}', falling back to Casual"
-            );
+            eprintln!("[intent_model] unknown intent label '{unknown}', falling back to Casual");
             CoreIntent::Casual
         }
     }

@@ -41,10 +41,13 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     );
 
     // 计算各区域高度
-    let panel_lines: u16 = completion_panel
-        .map_or(0u16, |p| (p.items.len().min(5) as u16).saturating_add(2));
+    let panel_lines: u16 =
+        completion_panel.map_or(0u16, |p| (p.items.len().min(5) as u16).saturating_add(2));
     let help_lines: u16 = 2;
-    let textarea_lines = inner.height.saturating_sub(panel_lines).saturating_sub(help_lines);
+    let textarea_lines = inner
+        .height
+        .saturating_sub(panel_lines)
+        .saturating_sub(help_lines);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -135,11 +138,26 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 
     // 状态栏信息：字符数 + 光标位置
     let status_info = if char_count > MAX_INPUT_CHARS {
-        format!(" Chars: {} (exceeded) | Ln {}, Col {} ", char_count, cursor_row + 1, cursor_col + 1)
+        format!(
+            " Chars: {} (exceeded) | Ln {}, Col {} ",
+            char_count,
+            cursor_row + 1,
+            cursor_col + 1
+        )
     } else if char_count > MAX_INPUT_CHARS * 90 / 100 {
-        format!(" Chars: {} (⚠) | Ln {}, Col {} ", char_count, cursor_row + 1, cursor_col + 1)
+        format!(
+            " Chars: {} (⚠) | Ln {}, Col {} ",
+            char_count,
+            cursor_row + 1,
+            cursor_col + 1
+        )
     } else {
-        format!(" Ln {}, Col {} | Chars: {} ", cursor_row + 1, cursor_col + 1, char_count)
+        format!(
+            " Ln {}, Col {} | Chars: {} ",
+            cursor_row + 1,
+            cursor_col + 1,
+            char_count
+        )
     };
 
     // 渲染帮助行

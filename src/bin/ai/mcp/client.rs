@@ -2,19 +2,18 @@ use std::{
     io::BufReader,
     process::{Command, Stdio},
     sync::{
-        Arc,
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
 
 #[cfg(unix)]
-use std::os::unix::process::CommandExt;
-#[cfg(unix)]
 use libc;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
-use serde_json::{Value, json};
 use rust_tools::commonw::FastMap;
+use serde_json::{Value, json};
 
 use crate::ai::types::{
     FunctionDefinition, McpPrompt, McpResource, McpServerConfig, McpTool, ToolDefinition,
@@ -27,7 +26,6 @@ pub(in crate::ai) fn send_request_to_conn(
     method: &str,
     params: Option<Value>,
 ) -> Result<Value, String> {
-    
     let request = JsonRpcRequest {
         jsonrpc: "2.0".to_string(),
         id,
@@ -481,7 +479,10 @@ impl McpClient {
                 let restart_res = self.restart_connection(&mut conn);
                 drop(conn);
                 return match restart_res {
-                    Ok(()) => Err(format!("MCP tool call canceled by user (Ctrl+C): {}", tool_name)),
+                    Ok(()) => Err(format!(
+                        "MCP tool call canceled by user (Ctrl+C): {}",
+                        tool_name
+                    )),
                     Err(restart_err) => Err(format!(
                         "MCP tool call canceled by user (Ctrl+C): {} | restart failed: {}",
                         tool_name, restart_err
@@ -498,8 +499,12 @@ impl McpClient {
                             .lock()
                             .map_err(|_| format!("Server connection poisoned: {}", server_name))?;
                         let (id2, params2) = make_params();
-                        let result =
-                            Self::send_request_to_conn(&mut conn2, id2, "tools/call", Some(params2))?;
+                        let result = Self::send_request_to_conn(
+                            &mut conn2,
+                            id2,
+                            "tools/call",
+                            Some(params2),
+                        )?;
                         let content = result["content"]
                             .as_array()
                             .and_then(|arr| arr.first())

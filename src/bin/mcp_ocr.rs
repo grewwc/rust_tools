@@ -2,7 +2,7 @@ use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 
 use rust_tools::pdfw::ocr_image_to_text;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn main() {
     let stdin = io::stdin();
@@ -177,19 +177,16 @@ fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcErr> {
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from)
                 .ok_or_else(|| json_rpc_error(-32602, "missing image_path", None))?;
-            
+
             let langs = args
                 .get("langs")
                 .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                })
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                 .unwrap_or_else(|| vec!["zh-Hans", "en-US"]);
 
-            let text = ocr_image_file(&image_path, &langs).map_err(|e| json_rpc_error(-32000, &e, None))?;
-            
+            let text = ocr_image_file(&image_path, &langs)
+                .map_err(|e| json_rpc_error(-32000, &e, None))?;
+
             Ok(json!({ "content": [{ "type": "text", "text": text }] }))
         }
         "ocr_pdf" => {
@@ -198,26 +195,19 @@ fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcErr> {
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from)
                 .ok_or_else(|| json_rpc_error(-32602, "missing pdf_path", None))?;
-            
+
             let langs = args
                 .get("langs")
                 .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                })
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                 .unwrap_or_else(|| vec!["zh-Hans", "en-US"]);
-            
-            let pages = args
-                .get("pages")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_u64())
-                        .map(|v| v as u32)
-                        .collect::<Vec<u32>>()
-                });
+
+            let pages = args.get("pages").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|v| v as u32)
+                    .collect::<Vec<u32>>()
+            });
 
             let text = if let Some(ps) = pages {
                 rust_tools::pdfw::ocr_pdf_to_markdown_pages(&pdf_path, &langs, Some(ps.as_slice()))
@@ -234,15 +224,11 @@ fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcErr> {
                 .get("image_base64")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| json_rpc_error(-32602, "missing image_base64", None))?;
-            
+
             let langs = args
                 .get("langs")
                 .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                })
+                .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>())
                 .unwrap_or_else(|| vec!["zh-Hans", "en-US"]);
 
             let text = ocr_base64_image(image_base64, &langs)
@@ -250,7 +236,11 @@ fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcErr> {
 
             Ok(json!({ "content": [{ "type": "text", "text": text }] }))
         }
-        _ => Err(json_rpc_error(-32601, "Unknown tool", Some(json!({ "tool": name })))),
+        _ => Err(json_rpc_error(
+            -32601,
+            "Unknown tool",
+            Some(json!({ "tool": name })),
+        )),
     }
 }
 
@@ -259,15 +249,18 @@ fn ocr_image_file(path: &PathBuf, langs: &[&str]) -> Result<String, String> {
     ocr_image_to_text(&img, langs)
 }
 
-
 fn ocr_base64_image(base64_str: &str, langs: &[&str]) -> Result<String, String> {
     use base64::Engine;
 
     let data = if let Some(pos) = base64_str.find("base64,") {
         let stripped = &base64_str[pos + 7..];
-        base64::engine::general_purpose::STANDARD.decode(stripped).map_err(|e| e.to_string())?
+        base64::engine::general_purpose::STANDARD
+            .decode(stripped)
+            .map_err(|e| e.to_string())?
     } else {
-        base64::engine::general_purpose::STANDARD.decode(base64_str).map_err(|e| e.to_string())?
+        base64::engine::general_purpose::STANDARD
+            .decode(base64_str)
+            .map_err(|e| e.to_string())?
     };
     let img = image::load_from_memory(&data).map_err(|e| e.to_string())?;
     ocr_image_to_text(&img, langs)
@@ -296,7 +289,13 @@ fn write_json_rpc_result(stdout: &mut io::Stdout, id: Option<&Value>, result: Va
     writeln!(stdout, "{}", resp).ok();
 }
 
-fn write_json_rpc_error(stdout: &mut io::Stdout, id: Option<&Value>, code: i32, message: &str, data: Option<Value>) {
+fn write_json_rpc_error(
+    stdout: &mut io::Stdout,
+    id: Option<&Value>,
+    code: i32,
+    message: &str,
+    data: Option<Value>,
+) {
     let mut err_obj = json!({
         "code": code,
         "message": message

@@ -1,12 +1,12 @@
 use serde_json::Value;
 
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
-use crate::ai::tools::service::memory::{
-    execute_memory_append, execute_memory_dedup, execute_memory_gc, execute_memory_list_json,
-    execute_memory_delete, execute_memory_recent, execute_memory_rotate, execute_memory_search,
-    execute_memory_save, execute_memory_update,
-};
 use crate::ai::tools::service::knowledge_update::execute_knowledge_cache_manage;
+use crate::ai::tools::service::memory::{
+    execute_memory_append, execute_memory_dedup, execute_memory_delete, execute_memory_gc,
+    execute_memory_list_json, execute_memory_recent, execute_memory_rotate, execute_memory_save,
+    execute_memory_search, execute_memory_update,
+};
 
 fn params_memory_append() -> Value {
     serde_json::json!({

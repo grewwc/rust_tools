@@ -137,8 +137,8 @@ impl CommandCompleter {
         let current = Self::current_model_hint().map(|m| m.to_lowercase());
         let mut candidates = Vec::new();
         for name in Self::ordered_model_names() {
-            let model = crate::ai::model_names::find_by_name(&name)
-                .expect("ordered model name must exist");
+            let model =
+                crate::ai::model_names::find_by_name(&name).expect("ordered model name must exist");
             let display = if current.as_deref() == Some(&name.to_lowercase()) {
                 format!("{} · current", Self::model_candidate_detail(model))
             } else {
@@ -314,8 +314,7 @@ fn find_file_reference_token(before: &str) -> Option<(usize, &str, Option<char>)
     }
     let at_index = last_at?;
     let prev = before[..at_index].chars().next_back();
-    if prev.is_some_and(|ch| !(ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '"' | '\'')))
-    {
+    if prev.is_some_and(|ch| !(ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '"' | '\''))) {
         return None;
     }
 
@@ -388,7 +387,10 @@ fn complete_path_fragment(fragment: &str, quote: Option<char>) -> Vec<String> {
 
     matches.sort_by(compare_file_completion_candidates);
     matches.dedup_by(|left, right| left.replacement == right.replacement);
-    matches.into_iter().map(|candidate| candidate.replacement).collect()
+    matches
+        .into_iter()
+        .map(|candidate| candidate.replacement)
+        .collect()
 }
 
 fn split_fragment(fragment: &str) -> (&str, &str) {
@@ -468,7 +470,11 @@ fn compare_file_completion_candidates(
 ) -> Ordering {
     file_completion_rank(left)
         .cmp(&file_completion_rank(right))
-        .then_with(|| left.replacement.to_ascii_lowercase().cmp(&right.replacement.to_ascii_lowercase()))
+        .then_with(|| {
+            left.replacement
+                .to_ascii_lowercase()
+                .cmp(&right.replacement.to_ascii_lowercase())
+        })
         .then_with(|| left.replacement.cmp(&right.replacement))
 }
 
@@ -487,7 +493,11 @@ fn file_completion_rank(candidate: &FileCompletionCandidate) -> (u8, u8, u8) {
 fn relative_navigation_candidates(fragment: &str, quote: Option<char>) -> Vec<String> {
     let mut candidates = Vec::new();
     for candidate in ["./", "../"] {
-        if candidate.starts_with(fragment) || fragment.is_empty() || fragment == "." || fragment == ".." {
+        if candidate.starts_with(fragment)
+            || fragment.is_empty()
+            || fragment == "."
+            || fragment == ".."
+        {
             candidates.push(format_file_completion(candidate, quote, true));
         }
     }
@@ -620,9 +630,11 @@ mod tests {
             .complete("/model", 6, &Context::new(&history))
             .unwrap();
 
-        assert!(pairs
-            .iter()
-            .any(|pair| pair.replacement == format!("/model {model}")));
+        assert!(
+            pairs
+                .iter()
+                .any(|pair| pair.replacement == format!("/model {model}"))
+        );
     }
 
     #[test]
@@ -636,7 +648,9 @@ mod tests {
 
         let (_, candidates) = CommandCompleter::complete_for_line("/model ", 7);
 
-        let first = candidates.first().expect("model candidates should not be empty");
+        let first = candidates
+            .first()
+            .expect("model candidates should not be empty");
         assert_eq!(first.replacement, current);
         assert!(first.display.contains("current"));
     }
@@ -652,7 +666,10 @@ mod tests {
 
         let (_, candidates) = CommandCompleter::complete_for_line("/model ", 7);
 
-        assert_eq!(candidates.first().map(|c| c.replacement.as_str()), Some(current.as_str()));
+        assert_eq!(
+            candidates.first().map(|c| c.replacement.as_str()),
+            Some(current.as_str())
+        );
     }
 
     #[test]
@@ -661,7 +678,10 @@ mod tests {
         assert!(
             candidates.iter().any(|c| c.replacement == "effort"),
             "expected `effort` in candidates: {:?}",
-            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+            candidates
+                .iter()
+                .map(|c| &c.replacement)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -731,9 +751,11 @@ mod tests {
         let (start, candidates) = CommandCompleter::complete_for_line(&line, line.len());
 
         assert_eq!(start, 0);
-        assert!(candidates
-            .iter()
-            .any(|candidate| candidate.replacement == format!("@{}", image.display())));
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.replacement == format!("@{}", image.display()))
+        );
     }
 
     #[test]
@@ -746,9 +768,11 @@ mod tests {
 
         let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
 
-        assert!(candidates.iter().any(|candidate| {
-            candidate.replacement == format!("@\"{}\"", image.display())
-        }));
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| { candidate.replacement == format!("@\"{}\"", image.display()) })
+        );
     }
 
     #[test]

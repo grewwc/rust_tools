@@ -69,4 +69,4 @@
 pub mod run;
 
 // 重新导出常用类型和函数
-pub use run::{run_cmd, run_cmd_output, run_cmd_output_with_timeout, RunCmdOptions};
+pub use run::{RunCmdOptions, run_cmd, run_cmd_output, run_cmd_output_with_timeout};

@@ -21,7 +21,13 @@ pub struct ThoughtNode {
 }
 
 impl ThoughtNode {
-    fn new(id: ThoughtNodeId, parent_id: Option<ThoughtNodeId>, hypothesis: String, reasoning: String, depth: usize) -> Self {
+    fn new(
+        id: ThoughtNodeId,
+        parent_id: Option<ThoughtNodeId>,
+        hypothesis: String,
+        reasoning: String,
+        depth: usize,
+    ) -> Self {
         Self {
             id,
             parent_id,
@@ -70,7 +76,13 @@ pub struct ExplorationResult {
 
 impl ThoughtTree {
     pub fn new(question: &str, max_depth: usize, max_branches: usize) -> Self {
-        let root = ThoughtNode::new(0, None, question.to_string(), "Initial question".to_string(), 0);
+        let root = ThoughtNode::new(
+            0,
+            None,
+            question.to_string(),
+            "Initial question".to_string(),
+            0,
+        );
         let mut nodes = HashMap::new();
         nodes.insert(0, root);
         Self {
@@ -84,7 +96,12 @@ impl ThoughtTree {
         }
     }
 
-    pub fn add_branch(&mut self, parent_id: ThoughtNodeId, hypothesis: String, reasoning: String) -> ThoughtNodeId {
+    pub fn add_branch(
+        &mut self,
+        parent_id: ThoughtNodeId,
+        hypothesis: String,
+        reasoning: String,
+    ) -> ThoughtNodeId {
         let parent = match self.nodes.get(&parent_id) {
             Some(p) => p.clone(),
             None => return parent_id,
@@ -114,7 +131,12 @@ impl ThoughtTree {
         self.update_best_path();
     }
 
-    pub fn record_outcome(&mut self, node_id: ThoughtNodeId, summary: String, tool_calls: Vec<String>) {
+    pub fn record_outcome(
+        &mut self,
+        node_id: ThoughtNodeId,
+        summary: String,
+        tool_calls: Vec<String>,
+    ) {
         if let Some(node) = self.nodes.get_mut(&node_id) {
             node.outcome_summary = Some(summary);
             node.tool_calls_snapshot = tool_calls;
@@ -143,11 +165,16 @@ impl ThoughtTree {
 
         let best_unexplored = candidates
             .iter()
-            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .unwrap();
 
         let current_best_score = self.find_best_scored_node().score;
-        let should_backtrack = best_unexplored.score < current_best_score - self.exploration_threshold;
+        let should_backtrack =
+            best_unexplored.score < current_best_score - self.exploration_threshold;
 
         let backtrack_to = if should_backtrack {
             let best_scored = self.find_best_scored_node();
@@ -167,7 +194,9 @@ impl ThoughtTree {
     }
 
     pub fn ucb_select(&self, exploration_constant: f64) -> Option<ThoughtNodeId> {
-        let candidates: Vec<&ThoughtNode> = self.nodes.values()
+        let candidates: Vec<&ThoughtNode> = self
+            .nodes
+            .values()
             .filter(|n| !n.pruned && !n.is_terminal() && n.depth < self.max_depth)
             .collect();
         if candidates.is_empty() {
@@ -177,7 +206,9 @@ impl ThoughtTree {
         let best = candidates.iter().max_by(|a, b| {
             let ucb_a = self.ucb_score(a, total_visits, exploration_constant);
             let ucb_b = self.ucb_score(b, total_visits, exploration_constant);
-            ucb_a.partial_cmp(&ucb_b).unwrap_or(std::cmp::Ordering::Equal)
+            ucb_a
+                .partial_cmp(&ucb_b)
+                .unwrap_or(std::cmp::Ordering::Equal)
         })?;
         Some(best.id)
     }
@@ -190,15 +221,21 @@ impl ThoughtTree {
     }
 
     fn find_explorable_nodes(&self) -> Vec<&ThoughtNode> {
-        self.nodes.values()
+        self.nodes
+            .values()
             .filter(|n| !n.pruned && !n.explored && !n.is_terminal())
             .collect()
     }
 
     fn find_best_scored_node(&self) -> &ThoughtNode {
-        self.nodes.values()
+        self.nodes
+            .values()
             .filter(|n| n.explored && !n.pruned)
-            .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.score
+                    .partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .unwrap_or_else(|| self.nodes.get(&self.root_id).unwrap())
     }
 
@@ -240,13 +277,27 @@ impl ThoughtTree {
         lines.join("\n")
     }
 
-    fn render_node_recursive(&self, node_id: ThoughtNodeId, lines: &mut Vec<String>, indent: usize) {
+    fn render_node_recursive(
+        &self,
+        node_id: ThoughtNodeId,
+        lines: &mut Vec<String>,
+        indent: usize,
+    ) {
         if let Some(node) = self.nodes.get(&node_id) {
             let prefix = "  ".repeat(indent);
-            let status = if node.pruned { "✗" } else if node.outcome_summary.is_some() { "✓" } else { "○" };
+            let status = if node.pruned {
+                "✗"
+            } else if node.outcome_summary.is_some() {
+                "✓"
+            } else {
+                "○"
+            };
             let score_str = format!("{:.2}", node.score);
             let truncated: String = node.hypothesis.chars().take(60).collect();
-            lines.push(format!("{}{} [{}] {} (depth={})", prefix, status, score_str, truncated, node.depth));
+            lines.push(format!(
+                "{}{} [{}] {} (depth={})",
+                prefix, status, score_str, truncated, node.depth
+            ));
             for &child_id in &node.children {
                 self.render_node_recursive(child_id, lines, indent + 1);
             }
@@ -259,7 +310,12 @@ impl ThoughtTree {
         prompt.push_str("Path taken so far:\n");
         for (i, &node_id) in path.iter().enumerate() {
             if let Some(node) = self.nodes.get(&node_id) {
-                prompt.push_str(&format!("  Step {}: {} (score: {:.2})\n", i + 1, node.hypothesis, node.score));
+                prompt.push_str(&format!(
+                    "  Step {}: {} (score: {:.2})\n",
+                    i + 1,
+                    node.hypothesis,
+                    node.score
+                ));
                 if let Some(outcome) = &node.outcome_summary {
                     prompt.push_str(&format!("    Outcome: {}\n", outcome));
                 }
@@ -272,7 +328,9 @@ impl ThoughtTree {
         prompt.push_str("\nGenerate 2-3 alternative hypotheses to explore. For each, provide:\n");
         prompt.push_str("1. hypothesis: A specific approach or assumption to test\n");
         prompt.push_str("2. reasoning: Why this might be better than the current path\n");
-        prompt.push_str("3. estimated_score: Your confidence (0.0-1.0) that this leads to a correct solution\n");
+        prompt.push_str(
+            "3. estimated_score: Your confidence (0.0-1.0) that this leads to a correct solution\n",
+        );
         prompt.push_str("\nOutput STRICT JSON array: [{\"hypothesis\":\"...\",\"reasoning\":\"...\",\"estimated_score\":0.8}]\n");
         prompt
     }
@@ -296,7 +354,11 @@ impl ThoughtTree {
              Output STRICT JSON: {{\"score\":0.8,\"reason\":\"...\"}}",
             node.hypothesis,
             node.reasoning,
-            if tool_results.len() > 2000 { &tool_results[..2000] } else { tool_results }
+            if tool_results.len() > 2000 {
+                &tool_results[..2000]
+            } else {
+                tool_results
+            }
         )
     }
 }

@@ -110,11 +110,7 @@ pub(crate) fn execute_list_directory(args: &Value) -> Result<String, String> {
         .map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
             let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-            if is_dir {
-                format!("{}/", name)
-            } else {
-                name
-            }
+            if is_dir { format!("{}/", name) } else { name }
         })
         .collect();
 
@@ -129,11 +125,7 @@ pub(crate) fn execute_search_files(args: &Value) -> Result<String, String> {
         .map_err(|e| format!("Failed to get cwd: {}", e))?;
     let base_dir = {
         let p = PathBuf::from(path);
-        if p.is_absolute() {
-            p
-        } else {
-            cwd.join(p)
-        }
+        if p.is_absolute() { p } else { cwd.join(p) }
     };
 
     let is_exact_name = !pattern.contains('/')
@@ -213,10 +205,7 @@ fn find_first_file_by_name(root: &Path, filename: &str) -> Option<PathBuf> {
             }
 
             let ft = entry.file_type().ok()?;
-            if ft.is_dir()
-                && !ft.is_symlink()
-                && !rust_tools::commonw::is_skip_dir(file_name)
-            {
+            if ft.is_dir() && !ft.is_symlink() && !rust_tools::commonw::is_skip_dir(file_name) {
                 queue.push_back(entry.path());
             }
         }

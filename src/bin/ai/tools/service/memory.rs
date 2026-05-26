@@ -1,8 +1,8 @@
 use chrono::{DateTime, Local, Utc};
-use std::io::{BufRead, Write};
-use serde_json::Value;
-use uuid::Uuid;
 use rust_tools::commonw::FastSet;
+use serde_json::Value;
+use std::io::{BufRead, Write};
+use uuid::Uuid;
 
 use crate::ai::tools::os_tools::GLOBAL_OS;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
@@ -68,22 +68,41 @@ struct ViewerContext {
 impl ViewerContext {
     fn current() -> Self {
         let (pid, pgid) = current_owner_tags();
-        Self { viewer_pid: pid, viewer_pgid: pgid }
+        Self {
+            viewer_pid: pid,
+            viewer_pgid: pgid,
+        }
     }
 
     fn can_see(&self, entry: &AgentMemoryEntry) -> bool {
-        let Some(viewer) = self.viewer_pid else { return true; };
-        let Some(owner) = entry.owner_pid else { return true; };
-        if owner == viewer { return true; }
-        if let (Some(entry_pgid), Some(vpgid)) = (entry.owner_pgid, self.viewer_pgid) {
-            if entry_pgid == vpgid { return true; }
+        let Some(viewer) = self.viewer_pid else {
+            return true;
+        };
+        let Some(owner) = entry.owner_pid else {
+            return true;
+        };
+        if owner == viewer {
+            return true;
         }
-        let Ok(guard) = GLOBAL_OS.lock() else { return false; };
-        let Some(os_arc) = guard.as_ref() else { return false; };
-        let Ok(os) = os_arc.lock() else { return false; };
+        if let (Some(entry_pgid), Some(vpgid)) = (entry.owner_pgid, self.viewer_pgid) {
+            if entry_pgid == vpgid {
+                return true;
+            }
+        }
+        let Ok(guard) = GLOBAL_OS.lock() else {
+            return false;
+        };
+        let Some(os_arc) = guard.as_ref() else {
+            return false;
+        };
+        let Ok(os) = os_arc.lock() else {
+            return false;
+        };
         let mut cursor = owner;
         while let Some(proc) = os.get_process(cursor) {
-            if proc.parent_pid == Some(viewer) { return true; }
+            if proc.parent_pid == Some(viewer) {
+                return true;
+            }
             match proc.parent_pid {
                 Some(parent) => cursor = parent,
                 None => break,
@@ -155,9 +174,8 @@ fn normalized_category(raw: Option<&str>, fallback: &str) -> String {
 
 fn default_priority_for_category(category: &str) -> u8 {
     match category {
-        "common_sense" | "coding_guideline" | "best_practice" | "user_preference" | "preference" => {
-            210
-        }
+        "common_sense" | "coding_guideline" | "best_practice" | "user_preference"
+        | "preference" => 210,
         "safety_rules" => 255,
         _ => 150,
     }
@@ -439,10 +457,8 @@ pub(crate) fn execute_memory_recent(args: &Value) -> Result<String, String> {
     let store = MemoryStore::from_env_or_config();
     let entries = store.recent(limit)?;
     let viewer = ViewerContext::current();
-    let visible: Vec<AgentMemoryEntry> = entries
-        .into_iter()
-        .filter(|e| viewer.can_see(e))
-        .collect();
+    let visible: Vec<AgentMemoryEntry> =
+        entries.into_iter().filter(|e| viewer.can_see(e)).collect();
     Ok(render_memory_entries(&visible))
 }
 
@@ -452,10 +468,8 @@ pub(crate) fn execute_memory_list_json(args: &Value) -> Result<String, String> {
     let store = MemoryStore::from_env_or_config();
     let entries = store.recent(limit + offset)?;
     let viewer = ViewerContext::current();
-    let visible: Vec<AgentMemoryEntry> = entries
-        .into_iter()
-        .filter(|e| viewer.can_see(e))
-        .collect();
+    let visible: Vec<AgentMemoryEntry> =
+        entries.into_iter().filter(|e| viewer.can_see(e)).collect();
     let sliced = if offset >= visible.len() {
         Vec::new()
     } else {
@@ -515,7 +529,7 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
         if entries.is_empty() {
             return Ok("No entries".to_string());
         }
-        
+
         // Separate permanent entries (whitelist) - never deleted by GC
         let mut permanent: Vec<AgentMemoryEntry> = entries
             .iter()
@@ -526,10 +540,10 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
             .into_iter()
             .filter(|e| !is_permanent_memory(&e))
             .collect();
-        
+
         let now = Utc::now();
         let cutoff_secs = max_days * 86400;
-        
+
         // 摘要回写（writeback）：原始实现把"过期的 deletable"直接丢掉，丢失了
         // 与项目相关但不是永久白名单的事实（例如 30 天前的 task_event）。
         // 现在把过期项按 (category, source) 分组，每组合成 1 条 summary
@@ -551,7 +565,7 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
             build_gc_summaries(&evicted, max_days)
         };
         let summary_count = summaries.len();
-        
+
         // Sort deletable entries by priority (ascending) then by timestamp (ascending)
         // This ensures low priority and old entries are deleted first
         deletable.sort_by(|a, b| {
@@ -563,7 +577,7 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
                 ts_a.cmp(&ts_b)
             })
         });
-        
+
         // Ensure minimum keep count (but never delete permanent entries)
         let total_permanent = permanent.len();
         if deletable.len() + total_permanent + summary_count < min_keep {
@@ -582,13 +596,13 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
             permanent = new_permanent;
             deletable = new_deletable;
         }
-        
+
         // Combine permanent + summaries (新生成) + deletable
         let permanent_count = permanent.len();
         let mut final_entries = permanent;
         final_entries.extend(summaries);
         final_entries.append(&mut deletable);
-        
+
         let tmp = path.with_extension("jsonl.tmp");
         {
             let mut f =
@@ -600,7 +614,8 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
                     .map_err(|e| format!("Failed to write tmp: {}", e))?;
             }
         }
-        std::fs::rename(&tmp, &path).map_err(|e| format!("Failed to replace memory file: {}", e))?;
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| format!("Failed to replace memory file: {}", e))?;
         crate::ai::tools::storage::memory_store::trace_memory_event(
             "memory.gc",
             "GC pass with summary writeback",
@@ -631,10 +646,7 @@ pub(crate) fn execute_memory_gc(args: &Value) -> Result<String, String> {
 ///   - timestamp = 当前时间（让它进入"最新区域"，不会立即又被时间窗 GC）
 ///
 /// 不调外部模型——以本地拼接为主，避免 GC 路径阻塞。
-fn build_gc_summaries(
-    evicted: &[AgentMemoryEntry],
-    max_days: i64,
-) -> Vec<AgentMemoryEntry> {
+fn build_gc_summaries(evicted: &[AgentMemoryEntry], max_days: i64) -> Vec<AgentMemoryEntry> {
     use std::collections::BTreeMap;
 
     // (category, source) -> Vec<&entry>
@@ -741,9 +753,8 @@ pub(crate) fn merge_subagent_whitelist(
     if entries.is_empty() {
         return Ok(0);
     }
-    let main_store = crate::ai::tools::storage::memory_store::store_for_path(
-        main_path.to_path_buf(),
-    );
+    let main_store =
+        crate::ai::tools::storage::memory_store::store_for_path(main_path.to_path_buf());
     let mut merged = 0usize;
     for entry in entries {
         if !is_permanent_memory(&entry) {
@@ -814,48 +825,47 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
             .map(|e| format!("[{}] {}", e.category, e.note))
             .collect();
         let mut cosine_removed = 0usize;
-        let final_entries = if let Some(vectors) =
-            crate::ai::knowledge::indexing::embedder::embed_texts(&texts)
-        {
-            // 时间排序：保留较新的优先策略 = 先按 timestamp 降序遍历，
-            // 若与已保留集合中同 category 的某条 cosine ≥ 阈值，则丢弃当前。
-            use crate::ai::knowledge::indexing::similarity::cosine_similarity;
-            let mut indexed: Vec<usize> = (0..deduped.len()).collect();
-            indexed.sort_by(|&a, &b| deduped[b].timestamp.cmp(&deduped[a].timestamp));
+        let final_entries =
+            if let Some(vectors) = crate::ai::knowledge::indexing::embedder::embed_texts(&texts) {
+                // 时间排序：保留较新的优先策略 = 先按 timestamp 降序遍历，
+                // 若与已保留集合中同 category 的某条 cosine ≥ 阈值，则丢弃当前。
+                use crate::ai::knowledge::indexing::similarity::cosine_similarity;
+                let mut indexed: Vec<usize> = (0..deduped.len()).collect();
+                indexed.sort_by(|&a, &b| deduped[b].timestamp.cmp(&deduped[a].timestamp));
 
-            // kept: Vec<(原 idx, 同 cat 标记)>；用 idx 引用 deduped/vectors 避免 clone embedding
-            let mut kept_idx: Vec<usize> = Vec::with_capacity(deduped.len());
-            for &i in &indexed {
-                let cat_i = deduped[i].category.as_str();
-                let v_i = &vectors[i];
-                let mut merged = false;
-                for &j in &kept_idx {
-                    if deduped[j].category != cat_i {
-                        continue;
+                // kept: Vec<(原 idx, 同 cat 标记)>；用 idx 引用 deduped/vectors 避免 clone embedding
+                let mut kept_idx: Vec<usize> = Vec::with_capacity(deduped.len());
+                for &i in &indexed {
+                    let cat_i = deduped[i].category.as_str();
+                    let v_i = &vectors[i];
+                    let mut merged = false;
+                    for &j in &kept_idx {
+                        if deduped[j].category != cat_i {
+                            continue;
+                        }
+                        let sim = cosine_similarity(v_i, &vectors[j]);
+                        if sim >= cosine_threshold {
+                            merged = true;
+                            break;
+                        }
                     }
-                    let sim = cosine_similarity(v_i, &vectors[j]);
-                    if sim >= cosine_threshold {
-                        merged = true;
-                        break;
+                    if merged {
+                        cosine_removed += 1;
+                    } else {
+                        kept_idx.push(i);
                     }
                 }
-                if merged {
-                    cosine_removed += 1;
-                } else {
-                    kept_idx.push(i);
+                // 还原原始顺序（按原 idx 升序）
+                kept_idx.sort();
+                let mut out: Vec<AgentMemoryEntry> = Vec::with_capacity(kept_idx.len());
+                // 用 swap_remove 思路不行（会乱序），直接 clone：
+                for i in kept_idx {
+                    out.push(deduped[i].clone());
                 }
-            }
-            // 还原原始顺序（按原 idx 升序）
-            kept_idx.sort();
-            let mut out: Vec<AgentMemoryEntry> = Vec::with_capacity(kept_idx.len());
-            // 用 swap_remove 思路不行（会乱序），直接 clone：
-            for i in kept_idx {
-                out.push(deduped[i].clone());
-            }
-            out
-        } else {
-            deduped
-        };
+                out
+            } else {
+                deduped
+            };
 
         write_memory_entries(&path, &final_entries)?;
 
@@ -898,7 +908,10 @@ pub(crate) fn execute_memory_update(args: &Value) -> Result<String, String> {
     }
 
     let new_content = if has_content {
-        let value = args["content"].as_str().ok_or("content must be a string")?.trim();
+        let value = args["content"]
+            .as_str()
+            .ok_or("content must be a string")?
+            .trim();
         if value.is_empty() {
             return Err("content is empty".to_string());
         }
@@ -1034,7 +1047,7 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
                 .collect()
         })
         .unwrap_or_else(|| vec!["agent".to_string(), "memory_save".to_string()]);
-    
+
     let mut source = args["source"]
         .as_str()
         .map(|s| s.trim().to_string())
@@ -1062,7 +1075,7 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
         owner_pid,
         owner_pgid,
     };
-    
+
     let store = MemoryStore::from_env_or_config();
     store.append(&entry)?;
     crate::ai::driver::decision_log::log_memory_save_assessment(
@@ -1086,12 +1099,12 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_memory_delete, execute_memory_list_json, execute_memory_save, execute_memory_update,
-        is_memory_visible_to,
+        execute_memory_delete, execute_memory_list_json, execute_memory_save,
+        execute_memory_update, is_memory_visible_to,
     };
-    use aios_kernel::kernel::{KernelInternal, Syscall};
     use crate::ai::test_support::ENV_LOCK;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
+    use aios_kernel::kernel::{KernelInternal, Syscall};
     use chrono::Local;
 
     #[test]
@@ -1232,7 +1245,13 @@ mod tests {
         let list = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
         let items: serde_json::Value = serde_json::from_str(&list).unwrap();
         assert_eq!(items[0]["category"].as_str().unwrap(), "self_note");
-        assert!(items[0]["tags"].as_array().unwrap().iter().any(|v| v.as_str() == Some("auto_downgraded")));
+        assert!(
+            items[0]["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v.as_str() == Some("auto_downgraded"))
+        );
         assert_eq!(items[0]["priority"].as_u64().unwrap(), 120);
 
         let _ = std::fs::remove_file(&path);
@@ -1298,9 +1317,30 @@ mod tests {
         let kernel = crate::ai::driver::new_local_kernel();
         let (root, child_a, child_b) = {
             let mut os = kernel.lock().unwrap();
-            let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-            let child_a = os.spawn(Some(root), "a".to_string(), "goal a".to_string(), 20, 4, None, None).unwrap();
-            let child_b = os.spawn(Some(root), "b".to_string(), "goal b".to_string(), 20, 4, None, None).unwrap();
+            let root =
+                os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+            let child_a = os
+                .spawn(
+                    Some(root),
+                    "a".to_string(),
+                    "goal a".to_string(),
+                    20,
+                    4,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let child_b = os
+                .spawn(
+                    Some(root),
+                    "b".to_string(),
+                    "goal b".to_string(),
+                    20,
+                    4,
+                    None,
+                    None,
+                )
+                .unwrap();
             os.set_process_group(child_a, 100).unwrap();
             os.set_process_group(child_b, 100).unwrap();
             (root, child_a, child_b)
@@ -1334,8 +1374,19 @@ mod tests {
         let kernel = crate::ai::driver::new_local_kernel();
         let (root, child) = {
             let mut os = kernel.lock().unwrap();
-            let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
-            let child = os.spawn(Some(root), "child".to_string(), "goal child".to_string(), 20, 4, None, None).unwrap();
+            let root =
+                os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+            let child = os
+                .spawn(
+                    Some(root),
+                    "child".to_string(),
+                    "goal child".to_string(),
+                    20,
+                    4,
+                    None,
+                    None,
+                )
+                .unwrap();
             (root, child)
         };
         crate::ai::tools::os_tools::init_os_tools_globals(kernel.clone());
@@ -1367,11 +1418,33 @@ mod tests {
         let kernel = crate::ai::driver::new_local_kernel();
         let (child_a, child_b) = {
             let mut os = kernel.lock().unwrap();
-            let root1 = os.begin_foreground("fg1".to_string(), "goal1".to_string(), 10, usize::MAX, None);
-            let child_a = os.spawn(Some(root1), "a".to_string(), "goal a".to_string(), 20, 4, None, None).unwrap();
+            let root1 =
+                os.begin_foreground("fg1".to_string(), "goal1".to_string(), 10, usize::MAX, None);
+            let child_a = os
+                .spawn(
+                    Some(root1),
+                    "a".to_string(),
+                    "goal a".to_string(),
+                    20,
+                    4,
+                    None,
+                    None,
+                )
+                .unwrap();
 
-            let root2 = os.begin_foreground("fg2".to_string(), "goal2".to_string(), 10, usize::MAX, None);
-            let child_b = os.spawn(Some(root2), "b".to_string(), "goal b".to_string(), 20, 4, None, None).unwrap();
+            let root2 =
+                os.begin_foreground("fg2".to_string(), "goal2".to_string(), 10, usize::MAX, None);
+            let child_b = os
+                .spawn(
+                    Some(root2),
+                    "b".to_string(),
+                    "goal b".to_string(),
+                    20,
+                    4,
+                    None,
+                    None,
+                )
+                .unwrap();
             (child_a, child_b)
         };
         crate::ai::tools::os_tools::init_os_tools_globals(kernel.clone());

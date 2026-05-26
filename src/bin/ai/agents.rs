@@ -2,7 +2,7 @@
 // AIOS Agents - Agent Definitions and Loading
 // =============================================================================
 // Agents are LLM-powered assistants with specific personalities and capabilities.
-// 
+//
 // Agent files (.agent) contain YAML front-matter and a prompt body:
 //   - name: Agent identifier
 //   - description: For agent routing selection
@@ -12,7 +12,7 @@
 //   - tools/tool_groups/mcp_servers: Available tools
 //   - routing_tags: For ML-based routing
 //   - model_tier: light/standard/heavy preference
-// 
+//
 // Builtin agents:
 //   - build: Default code-writing agent
 //   - executor: Background task execution
@@ -33,18 +33,12 @@ use rust_tools::cw::SkipMap;
 use crate::commonw::{configw, utils::expanduser};
 
 const BUILTIN_AGENTS: &[(&str, &str)] = &[
-    (
-        "build.agent",
-        include_str!("builtin_agents/build.agent"),
-    ),
+    ("build.agent", include_str!("builtin_agents/build.agent")),
     (
         "executor.agent",
         include_str!("builtin_agents/executor.agent"),
     ),
-    (
-        "plan.agent",
-        include_str!("builtin_agents/plan.agent"),
-    ),
+    ("plan.agent", include_str!("builtin_agents/plan.agent")),
     (
         "explore.agent",
         include_str!("builtin_agents/explore.agent"),
@@ -167,7 +161,6 @@ pub(super) fn detect_project_kind_from_cwd() -> Option<ProjectKind> {
     let cwd = crate::ai::driver::runtime_ctx::effective_cwd().ok()?;
     detect_project_kind(&cwd)
 }
-
 
 /// Categorizes an agent's role: `Primary` for main conversation,
 /// `Subagent` for delegated tasks, or `All` for both.
@@ -442,7 +435,10 @@ fn load_project_instruction_docs_from(cwd: &Path) -> Vec<ProjectInstructionDoc> 
         let docs = load_project_instruction_docs_uncached(cwd);
         cache.insert(
             cwd.to_path_buf(),
-            ProjectInstructionCacheEntry { fingerprint, docs: docs.clone() },
+            ProjectInstructionCacheEntry {
+                fingerprint,
+                docs: docs.clone(),
+            },
         );
         return docs;
     }
@@ -478,10 +474,8 @@ fn load_project_instruction_docs_uncached(cwd: &Path) -> Vec<ProjectInstructionD
                 return docs;
             }
             let budget = PROJECT_INSTRUCTION_MAX_TOTAL_CHARS.saturating_sub(used);
-            let limited = truncate_instruction_doc(
-                trimmed,
-                PROJECT_INSTRUCTION_MAX_DOC_CHARS.min(budget),
-            );
+            let limited =
+                truncate_instruction_doc(trimmed, PROJECT_INSTRUCTION_MAX_DOC_CHARS.min(budget));
             if limited.is_empty() {
                 continue;
             }
@@ -509,7 +503,11 @@ fn project_instruction_search_scope(cwd: &Path) -> Vec<PathBuf> {
     let boundary = ancestors
         .iter()
         .rposition(|dir| has_project_root_marker(dir))
-        .or_else(|| ancestors.iter().rposition(|dir| has_project_instruction_doc(dir)));
+        .or_else(|| {
+            ancestors
+                .iter()
+                .rposition(|dir| has_project_instruction_doc(dir))
+        });
 
     match boundary {
         Some(idx) => ancestors[..=idx].iter().rev().cloned().collect(),
@@ -518,7 +516,9 @@ fn project_instruction_search_scope(cwd: &Path) -> Vec<PathBuf> {
 }
 
 fn has_project_root_marker(dir: &Path) -> bool {
-    PROJECT_ROOT_MARKERS.iter().any(|name| dir.join(name).exists())
+    PROJECT_ROOT_MARKERS
+        .iter()
+        .any(|name| dir.join(name).exists())
 }
 
 fn has_project_instruction_doc(dir: &Path) -> bool {
@@ -545,16 +545,25 @@ fn truncate_instruction_doc(content: &str, max_chars: usize) -> String {
 /// Filters agents that can serve as primary agents, excluding
 /// disabled and hidden ones.
 pub(super) fn get_primary_agents(agents: &[AgentManifest]) -> Vec<&AgentManifest> {
-    agents.iter().filter(|a| a.is_primary() && !a.disabled && !a.hidden).collect()
+    agents
+        .iter()
+        .filter(|a| a.is_primary() && !a.disabled && !a.hidden)
+        .collect()
 }
 
 /// Filters agents that can be spawned as subagents, excluding
 /// disabled and hidden ones.
 pub(super) fn get_subagents(agents: &[AgentManifest]) -> Vec<&AgentManifest> {
-    agents.iter().filter(|a| a.is_subagent() && !a.disabled && !a.hidden).collect()
+    agents
+        .iter()
+        .filter(|a| a.is_subagent() && !a.disabled && !a.hidden)
+        .collect()
 }
 
-pub(super) fn find_agent_by_name<'a>(agents: &'a [AgentManifest], name: &str) -> Option<&'a AgentManifest> {
+pub(super) fn find_agent_by_name<'a>(
+    agents: &'a [AgentManifest],
+    name: &str,
+) -> Option<&'a AgentManifest> {
     let canonical = canonical_agent_name(name);
     agents
         .iter()
@@ -826,9 +835,7 @@ fn load_agents_from_dir(dir: &Path) -> Vec<AgentManifest> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        load_project_instruction_docs_from, parse_agent_front_matter, AgentModelTier,
-    };
+    use super::{AgentModelTier, load_project_instruction_docs_from, parse_agent_front_matter};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -839,7 +846,11 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        path.push(format!("rust_tools_agents_{name}_{}_{}", std::process::id(), nanos));
+        path.push(format!(
+            "rust_tools_agents_{name}_{}_{}",
+            std::process::id(),
+            nanos
+        ));
         path
     }
 
@@ -893,11 +904,7 @@ noop
         let nested = root.join("packages/app/src");
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::create_dir_all(&nested).unwrap();
-        fs::write(
-            root.join("AGENTS.md"),
-            "# Root rules\nUse pnpm.\n",
-        )
-        .unwrap();
+        fs::write(root.join("AGENTS.md"), "# Root rules\nUse pnpm.\n").unwrap();
         fs::write(
             root.join("packages/app/CLAUDE.md"),
             "# App rules\nRun app tests only.\n",
@@ -953,7 +960,11 @@ noop
         // 改文件并睡眠确保 mtime 推进；同时显式让 len 变化，双重保险触发
         // fingerprint 失配。
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        fs::write(&agents_md, "v2: use cargo and longer content for len change.\n").unwrap();
+        fs::write(
+            &agents_md,
+            "v2: use cargo and longer content for len change.\n",
+        )
+        .unwrap();
 
         let after = load_project_instruction_docs_from(&root);
         assert_eq!(after.len(), 1);

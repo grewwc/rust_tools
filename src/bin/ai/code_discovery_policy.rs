@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    path::PathBuf,
-    sync::OnceLock,
-};
+use std::{fs, path::PathBuf, sync::OnceLock};
 
 use serde::{Deserialize, Serialize};
 
@@ -455,7 +451,13 @@ fn default_policy() -> CodeDiscoveryPolicy {
             ),
             rule(
                 &["read_file", "read_file_lines", "code_search"],
-                &["entry point", "bootstrap", "startup", "fn main(", "app::run("],
+                &[
+                    "entry point",
+                    "bootstrap",
+                    "startup",
+                    "fn main(",
+                    "app::run(",
+                ],
                 &[],
                 &[],
                 CodeDiscoveryKind::EntryPoint,
@@ -549,7 +551,10 @@ fn rule(
         tool_names: tool_names.iter().map(|value| value.to_string()).collect(),
         any_contains: any_contains.iter().map(|value| value.to_string()).collect(),
         all_contains: all_contains.iter().map(|value| value.to_string()).collect(),
-        none_contains: none_contains.iter().map(|value| value.to_string()).collect(),
+        none_contains: none_contains
+            .iter()
+            .map(|value| value.to_string())
+            .collect(),
         kind,
         confidence,
     }

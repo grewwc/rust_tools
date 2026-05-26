@@ -47,11 +47,15 @@ fn visit_node(
         "method_spec" => push_named(node, source, "method", indent, out),
         "struct_type" => recurse_named(node, source, indent + 1, true, out),
         "field_declaration" if in_type => {
-            if let Some(name) = first_named_child_text(node, source, &["field_identifier", "identifier"]) {
+            if let Some(name) =
+                first_named_child_text(node, source, &["field_identifier", "identifier"])
+            {
                 out.push(SymbolEntry::new("field", name, line(node), None, indent));
             }
         }
-        "const_declaration" | "var_declaration" => recurse_named(node, source, indent, in_type, out),
+        "const_declaration" | "var_declaration" => {
+            recurse_named(node, source, indent, in_type, out)
+        }
         "const_spec" => push_named(node, source, "const", indent, out),
         "var_spec" => push_named(node, source, "var", indent, out),
         _ => {}
@@ -78,8 +82,13 @@ fn push_named(
     indent: usize,
     out: &mut Vec<SymbolEntry>,
 ) {
-    if let Some(name) = name_from_field(node, "name", source)
-        .or_else(|| first_named_child_text(node, source, &["identifier", "field_identifier", "type_identifier"])) {
+    if let Some(name) = name_from_field(node, "name", source).or_else(|| {
+        first_named_child_text(
+            node,
+            source,
+            &["identifier", "field_identifier", "type_identifier"],
+        )
+    }) {
         out.push(SymbolEntry::new(kind, name, line(node), None, indent));
     }
 }

@@ -450,7 +450,7 @@ pub fn run_cmd(command: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{run_cmd, run_cmd_output, run_cmd_output_streaming_with_timeout, RunCmdOptions};
+    use super::{RunCmdOptions, run_cmd, run_cmd_output, run_cmd_output_streaming_with_timeout};
     use std::time::{Duration, Instant};
 
     #[test]

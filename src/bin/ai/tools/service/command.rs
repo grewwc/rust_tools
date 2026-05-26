@@ -137,9 +137,7 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
         }
         // 进程替换 `<(...)` / `>(...)`
         if (b == b'<' || b == b'>') && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
-            return Err(
-                "process substitution `<(...)` / `>(...)` is not allowed".to_string(),
-            );
+            return Err("process substitution `<(...)` / `>(...)` is not allowed".to_string());
         }
         // heredoc / herestring `<<` / `<<<`
         if b == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
@@ -418,7 +416,10 @@ mod tests {
     #[test]
     fn split_handles_chained_operators() {
         let segs = split_unquoted_segments("echo ok && rm -rf /tmp/foo");
-        assert_eq!(segs, vec!["echo ok".to_string(), "rm -rf /tmp/foo".to_string()]);
+        assert_eq!(
+            segs,
+            vec!["echo ok".to_string(), "rm -rf /tmp/foo".to_string()]
+        );
     }
 
     #[test]
@@ -426,7 +427,12 @@ mod tests {
         let segs = split_unquoted_segments("a | b ; c || d");
         assert_eq!(
             segs,
-            vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ]
         );
     }
 
@@ -442,10 +448,7 @@ mod tests {
     #[test]
     fn split_does_not_break_inside_double_quotes() {
         let segs = split_unquoted_segments("echo \"a | b\" && true");
-        assert_eq!(
-            segs,
-            vec!["echo \"a | b\"".to_string(), "true".to_string()]
-        );
+        assert_eq!(segs, vec!["echo \"a | b\"".to_string(), "true".to_string()]);
     }
 
     // ---- injection surface ----

@@ -48,10 +48,7 @@ use super::super::runtime_ctx::DriverContext;
 /// while still being shorter than typical interactive patience.
 const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(600);
 
-pub(super) fn execute_sync_task(
-    tool_call_id: &str,
-    args: &Value,
-) -> Result<ToolResult, String> {
+pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
     let prepared = task_tools::prepare_subagent_task(args)?;
     let ctx = runtime_ctx::try_current().ok_or_else(|| {
         "task tool requires an active driver turn (DRIVER_CTX is not set)".to_string()
@@ -128,8 +125,7 @@ pub(super) fn execute_sync_task(
     // Slot used by the sub-agent's `finalize_turn` to publish its final
     // assistant text. Created here, scoped via `SUBAGENT_RESULT_SLOT` over
     // the spawned future, and read once the sub-agent returns.
-    let result_slot: runtime_ctx::SubagentResultSlot =
-        Arc::new(Mutex::new(None));
+    let result_slot: runtime_ctx::SubagentResultSlot = Arc::new(Mutex::new(None));
     let result_slot_for_scope = result_slot.clone();
 
     let inherit = prepared.inherit;
@@ -160,16 +156,14 @@ pub(super) fn execute_sync_task(
 
     // Always install the result slot scope so `finalize_turn` can publish
     // the answer back to us regardless of inherit settings.
-    wrapped = Box::pin(
-        runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped),
-    );
+    wrapped = Box::pin(runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped));
 
     if !inherit.memory {
-        let mem_path =
-            runtime_ctx::make_subagent_memory_path(&parent_history_path, &task_id);
+        let mem_path = runtime_ctx::make_subagent_memory_path(&parent_history_path, &task_id);
         // sub-agent 默认私有 memory：merge 白名单条目回主文件
-        let main_path = crate::ai::tools::storage::memory_store::
-            MemoryStore::from_env_or_config().path().to_path_buf();
+        let main_path = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config()
+            .path()
+            .to_path_buf();
         let private_for_merge = mem_path.clone();
         wrapped = Box::pin(runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped));
         let inner = wrapped;
@@ -201,15 +195,14 @@ pub(super) fn execute_sync_task(
     //
     // atomic flag 只作为条件判断，不作为唤醒机制；正常写入 cancel/shutdown 的入口
     // 必须调用 signal_request_interrupt()/request_shutdown() 发送 Notify。
-    let join_result: Result<Result<(), String>, String> =
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(wait_for_sync_task_completion(
-                rx,
-                parent_shutdown,
-                parent_cancel,
-                SYNC_TASK_HARD_TIMEOUT,
-            ))
-        });
+    let join_result: Result<Result<(), String>, String> = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(wait_for_sync_task_completion(
+            rx,
+            parent_shutdown,
+            parent_cancel,
+            SYNC_TASK_HARD_TIMEOUT,
+        ))
+    });
 
     let duration = started.elapsed();
     let elapsed_secs = duration.as_secs_f64();
@@ -336,9 +329,7 @@ fn format_subagent_output(
     if !trimmed_output.is_empty() {
         parts.push(trimmed_output.to_string());
     } else {
-        parts.push(
-            "(subagent did not produce any final assistant text)".to_string(),
-        );
+        parts.push("(subagent did not produce any final assistant text)".to_string());
     }
     parts.join("\n")
 }

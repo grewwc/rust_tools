@@ -68,7 +68,10 @@ pub fn keyword_search(
     let mut top_idx: Vec<(f64, usize)> = scored.iter().take(cap).copied().collect();
 
     if let Some(qv) = super::super::indexing::embedder::embed_text(&query_lc) {
-        let texts: Vec<String> = top_idx.iter().map(|&(_, i)| entries[i].search_text()).collect();
+        let texts: Vec<String> = top_idx
+            .iter()
+            .map(|&(_, i)| entries[i].search_text())
+            .collect();
         let batch = super::super::indexing::embedder::embed_texts(&texts);
         let mut rescored: Vec<(f64, usize)> = Vec::with_capacity(top_idx.len());
         for (idx, &(_s, i)) in top_idx.iter().enumerate() {

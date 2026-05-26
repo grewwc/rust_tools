@@ -84,7 +84,9 @@ pub fn update_record_impl(
         }
         println!();
     } else {
-        let mut title = rust_tools::commonw::prompt::read_line("").trim().to_string();
+        let mut title = rust_tools::commonw::prompt::read_line("")
+            .trim()
+            .to_string();
         if from_file && !title.is_empty() {
             title = std::fs::read_to_string(&title)
                 .unwrap_or_default()

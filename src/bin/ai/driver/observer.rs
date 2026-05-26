@@ -84,8 +84,7 @@ pub trait TurnObserver: Send + Sync {
         }
     }
 
-    fn on_conversation_end(&mut self) {
-    }
+    fn on_conversation_end(&mut self) {}
 
     fn name(&self) -> &str {
         "anonymous"
@@ -95,6 +94,5 @@ pub trait TurnObserver: Send + Sync {
         false
     }
 
-    fn mark_poisoned(&mut self) {
-    }
+    fn mark_poisoned(&mut self) {}
 }

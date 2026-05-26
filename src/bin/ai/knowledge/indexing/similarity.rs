@@ -140,11 +140,7 @@ pub fn jaccard(a: &[String], b: &[String]) -> f64 {
     let sb: HashSet<&String> = b.iter().collect();
     let inter = sa.intersection(&sb).count() as f64;
     let union = sa.union(&sb).count() as f64;
-    if union == 0.0 {
-        0.0
-    } else {
-        inter / union
-    }
+    if union == 0.0 { 0.0 } else { inter / union }
 }
 
 /// Character overlap ratio.
@@ -157,11 +153,7 @@ pub fn char_overlap(a: &str, b: &str) -> f64 {
     let sb: HashSet<char> = b.chars().collect();
     let inter = sa.intersection(&sb).count() as f64;
     let denom = sa.len().min(sb.len()) as f64;
-    if denom == 0.0 {
-        0.0
-    } else {
-        inter / denom
-    }
+    if denom == 0.0 { 0.0 } else { inter / denom }
 }
 
 /// Jaccard similarity for note deduplication.

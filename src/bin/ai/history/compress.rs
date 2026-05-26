@@ -38,10 +38,7 @@ const MAX_SELF_NOTES_IN_MESSAGES: usize = 8;
 /// 仅保留最近 `keep_recent` 条 internal_note 中的 `self_note:` 条目。
 /// 其他 internal_note（如 cache 提示、loop-breaker、历史摘要）不在剪裁范围。
 fn trim_self_notes_to_recent(messages: Vec<Message>, keep_recent: usize) -> Vec<Message> {
-    let total_self_notes = messages
-        .iter()
-        .filter(|m| is_self_note_message(m))
-        .count();
+    let total_self_notes = messages.iter().filter(|m| is_self_note_message(m)).count();
     if total_self_notes <= keep_recent {
         return messages;
     }
@@ -174,13 +171,23 @@ pub(in crate::ai) fn compress_messages_for_context(
 
     let keep_last = keep_last.min(messages.len());
     if keep_last == 0 {
-        return shrink_messages_to_fit_with_summary(messages, max_chars, summary_max_chars, overflow_dir.as_deref());
+        return shrink_messages_to_fit_with_summary(
+            messages,
+            max_chars,
+            summary_max_chars,
+            overflow_dir.as_deref(),
+        );
     }
 
     let split_at = retained_turn_start(&messages, keep_last);
     let (older, recent) = messages.split_at(split_at);
     if older.is_empty() {
-        return shrink_messages_to_fit_with_summary(recent.to_vec(), max_chars, summary_max_chars, overflow_dir.as_deref());
+        return shrink_messages_to_fit_with_summary(
+            recent.to_vec(),
+            max_chars,
+            summary_max_chars,
+            overflow_dir.as_deref(),
+        );
     }
 
     let mut out = Vec::new();
@@ -203,7 +210,10 @@ pub(in crate::ai) fn compress_messages_for_context(
 }
 
 pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Message> {
-    let user_turns = messages.iter().filter(|message| message.role == "user").count();
+    let user_turns = messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .count();
     if user_turns <= MAX_HISTORY_TURNS {
         return messages;
     }
@@ -214,7 +224,8 @@ pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Me
         return messages;
     }
 
-    let summary = build_persisted_summary_text(&messages[..split_at], PERSISTED_HISTORY_SUMMARY_MAX_CHARS);
+    let summary =
+        build_persisted_summary_text(&messages[..split_at], PERSISTED_HISTORY_SUMMARY_MAX_CHARS);
     let mut out = Vec::with_capacity(messages.len() - split_at + 1);
     if !summary.is_empty() {
         out.push(Message {
@@ -255,7 +266,10 @@ async fn compact_persisted_history_with_app_inner(
     messages: Vec<Message>,
     threshold_turns: usize,
 ) -> Vec<Message> {
-    let user_turns = messages.iter().filter(|message| message.role == "user").count();
+    let user_turns = messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .count();
     if user_turns <= threshold_turns {
         return messages;
     }
@@ -407,7 +421,8 @@ fn shrink_messages_to_fit_with_summary(
                 {
                     let header_bytes = "对话摘要（自动压缩，以下为早期对话要点）：\n".len();
                     let used = messages_total_chars(&messages);
-                    let body_byte_budget = max_chars.saturating_sub(used).saturating_sub(header_bytes);
+                    let body_byte_budget =
+                        max_chars.saturating_sub(used).saturating_sub(header_bytes);
                     let body_budget = (body_byte_budget / 3).min(summary_max_chars);
                     if body_budget >= 40 {
                         let text = build_persisted_summary_text(&dropped, body_budget);
@@ -424,10 +439,16 @@ fn shrink_messages_to_fit_with_summary(
                 };
 
                 let archive_note = build_overflow_placeholder(&file_path_str);
-                let fallback_goal = dropped
-                    .iter()
-                    .find(|message| message.role == "user")
-                    .map(|message| summarize_text(&normalize_whitespace(&value_to_string(&message.content)), 160));
+                let fallback_goal =
+                    dropped
+                        .iter()
+                        .find(|message| message.role == "user")
+                        .map(|message| {
+                            summarize_text(
+                                &normalize_whitespace(&value_to_string(&message.content)),
+                                160,
+                            )
+                        });
                 let memory_note = summary_body
                     .as_ref()
                     .filter(|s| !s.trim().is_empty())
@@ -847,7 +868,11 @@ fn summarize_tool_chunk(chunk_index: usize, chunk: &[&str]) -> String {
     if !first.is_empty() {
         push_unique_limited_global(&mut picks, first, 4);
     }
-    for line in chunk.iter().filter(|line| is_important_tool_line(line)).take(2) {
+    for line in chunk
+        .iter()
+        .filter(|line| is_important_tool_line(line))
+        .take(2)
+    {
         let sig = tool_line_signature(line);
         if !sig.is_empty() {
             push_unique_limited_global(&mut picks, sig, 4);
@@ -880,7 +905,10 @@ fn tool_line_signature(line: &str) -> String {
     for word in words.iter().rev() {
         let token = word.trim_matches(|ch: char| {
             ch.is_whitespace()
-                || matches!(ch, ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'')
+                || matches!(
+                    ch,
+                    ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\''
+                )
         });
         if token.is_empty() {
             continue;
@@ -920,7 +948,10 @@ fn extract_path_like_tokens(line: &str) -> Vec<String> {
     for raw in line.split_whitespace() {
         let token = raw.trim_matches(|ch: char| {
             ch.is_whitespace()
-                || matches!(ch, ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'')
+                || matches!(
+                    ch,
+                    ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\''
+                )
         });
         if token.len() > 160 || token.is_empty() {
             continue;
@@ -930,8 +961,8 @@ fn extract_path_like_tokens(line: &str) -> Vec<String> {
         }
         let looks_like_path = token.contains('/')
             || [
-                ".rs", ".tsx", ".ts", ".jsx", ".js", ".py", ".go", ".java", ".kt", ".swift",
-                ".c", ".cc", ".cpp", ".h", ".hpp", ".toml", ".yaml", ".yml", ".json",
+                ".rs", ".tsx", ".ts", ".jsx", ".js", ".py", ".go", ".java", ".kt", ".swift", ".c",
+                ".cc", ".cpp", ".h", ".hpp", ".toml", ".yaml", ".yml", ".json",
             ]
             .iter()
             .any(|suffix| token.ends_with(suffix));
@@ -944,9 +975,7 @@ fn extract_path_like_tokens(line: &str) -> Vec<String> {
 
 fn looks_like_error_code(token: &str) -> bool {
     let bytes = token.as_bytes();
-    bytes.len() == 5
-        && bytes[0] == b'E'
-        && bytes[1..].iter().all(|byte| byte.is_ascii_digit())
+    bytes.len() == 5 && bytes[0] == b'E' && bytes[1..].iter().all(|byte| byte.is_ascii_digit())
 }
 
 fn push_unique_limited_global(target: &mut Vec<String>, value: String, max_items: usize) {
@@ -1003,8 +1032,22 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
                 ch.is_whitespace()
                     || matches!(
                         ch,
-                        ',' | '.' | ';' | ':' | '!' | '?' | '(' | ')' | '[' | ']' | '{' | '}'
-                            | '<' | '>' | '"' | '\'' | '`'
+                        ',' | '.'
+                            | ';'
+                            | ':'
+                            | '!'
+                            | '?'
+                            | '('
+                            | ')'
+                            | '['
+                            | ']'
+                            | '{'
+                            | '}'
+                            | '<'
+                            | '>'
+                            | '"'
+                            | '\''
+                            | '`'
                     )
             })
         }
@@ -1021,8 +1064,8 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
             let token = token.split('?').next().unwrap_or(token);
             let token = token.split_once(':').map(|(a, _)| a).unwrap_or(token);
             let suffixes = [
-                ".rs", ".tsx", ".ts", ".jsx", ".js", ".py", ".go", ".java", ".kt", ".swift",
-                ".c", ".cc", ".cpp", ".h", ".hpp", ".toml", ".yaml", ".yml", ".json",
+                ".rs", ".tsx", ".ts", ".jsx", ".js", ".py", ".go", ".java", ".kt", ".swift", ".c",
+                ".cc", ".cpp", ".h", ".hpp", ".toml", ".yaml", ".yml", ".json",
             ];
             if suffixes.iter().any(|suf| token.ends_with(suf)) {
                 return Some(token);
@@ -1077,7 +1120,8 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
     }
 
     fn push_unique_limited(target: &mut Vec<String>, value: String, max_items: usize) {
-        if value.is_empty() || target.iter().any(|item| item == &value) || target.len() >= max_items {
+        if value.is_empty() || target.iter().any(|item| item == &value) || target.len() >= max_items
+        {
             return;
         }
         target.push(value);
@@ -1288,10 +1332,8 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
                     continue;
                 }
                 if normalized.contains("历史摘要") || normalized.contains("对话摘要") {
-                    pre_summary_lines.push(format!(
-                        "- 更早摘要: {}",
-                        summarize_text(&normalized, 400)
-                    ));
+                    pre_summary_lines
+                        .push(format!("- 更早摘要: {}", summarize_text(&normalized, 400)));
                     continue;
                 }
                 let normalized = summarize_text(&normalized, 400);
@@ -1326,7 +1368,11 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
                 }
                 if let Some(tool_calls) = &message.tool_calls {
                     for tool_call in tool_calls {
-                        push_unique_limited(&mut current.tool_names, tool_call.function.name.clone(), 6);
+                        push_unique_limited(
+                            &mut current.tool_names,
+                            tool_call.function.name.clone(),
+                            6,
+                        );
                         if current.topic_key.is_empty() {
                             current.topic_key = tool_call.function.name.to_ascii_lowercase();
                             current.topic_label = tool_call.function.name.clone();
@@ -1387,7 +1433,9 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
         let tool_blob = format!("已知工具结论:\n{}", known_tool_lines.join("\n"));
         tool_blob.chars().count().min(max_chars / 3)
     };
-    let body_budget = max_chars.saturating_sub(reserved_tool_chars).max(max_chars / 2);
+    let body_budget = max_chars
+        .saturating_sub(reserved_tool_chars)
+        .max(max_chars / 2);
     let mut lines: Vec<String> = Vec::new();
     if !initial_goal.is_empty()
         && !push_line_with_budget(&mut lines, format!("初始目标: {initial_goal}"), body_budget)
@@ -1502,7 +1550,9 @@ fn summarize_text(text: &str, target_chars: usize) -> String {
         selected_chars += line.chars().count() + 1;
     }
 
-    let tail_budget = target_chars.saturating_sub(selected_chars).max(target_chars / 3);
+    let tail_budget = target_chars
+        .saturating_sub(selected_chars)
+        .max(target_chars / 3);
     let tail_count = lines.len().min(3).min(tail_budget / 20);
     let tail_start = lines.len().saturating_sub(tail_count);
     if tail_start > head_count {
@@ -1535,7 +1585,10 @@ fn keep_ends_by_chars(text: &str, target_chars: usize) -> String {
     let head_budget = target_chars * 3 / 5;
     let tail_budget = target_chars - head_budget - 1;
     let head: String = text.chars().take(head_budget).collect();
-    let tail: String = text.chars().skip(char_count.saturating_sub(tail_budget)).collect();
+    let tail: String = text
+        .chars()
+        .skip(char_count.saturating_sub(tail_budget))
+        .collect();
     format!("{}…{}", head, tail)
 }
 
@@ -1647,7 +1700,10 @@ fn fold_tool_call_group_to_stub(messages: &[Message], group: &[usize]) -> Option
         lines.push(format!("- {} => {}", tc.function.name, one_liner));
     }
     if tool_calls.len() > 8 {
-        lines.push(format!("- ... ({} more tools omitted)", tool_calls.len() - 8));
+        lines.push(format!(
+            "- ... ({} more tools omitted)",
+            tool_calls.len() - 8
+        ));
     }
 
     Some(Message {
@@ -1788,10 +1844,7 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
                 let args_norm = serde_json::from_str::<Value>(&tc.function.arguments)
                     .map(|v| v.to_string())
                     .unwrap_or_else(|_| tc.function.arguments.clone());
-                id_to_signature.insert(
-                    tc.id.clone(),
-                    (tc.function.name.clone(), args_norm),
-                );
+                id_to_signature.insert(tc.id.clone(), (tc.function.name.clone(), args_norm));
             }
         }
     }

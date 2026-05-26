@@ -14,9 +14,7 @@ use super::{
         confirm_completion_selection, dismiss_completion_panel, move_completion_selection,
     },
 };
-use crate::{
-    clipboardw::{image_content, string_content},
-};
+use crate::clipboardw::{image_content, string_content};
 
 pub(in crate::ai::prompt::multiline) enum EventLoopAction {
     Continue,
@@ -113,9 +111,7 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
                         Some(trimmed)
                     }))
                 }
-                (KeyCode::Char('v'), modifiers)
-                    if modifiers.contains(KeyModifiers::CONTROL) =>
-                {
+                (KeyCode::Char('v'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
                     match save_clipboard_images(session_image_dir) {
                         Ok(paths) if !paths.is_empty() => {
                             for path in paths {

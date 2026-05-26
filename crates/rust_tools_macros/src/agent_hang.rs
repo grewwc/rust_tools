@@ -2,8 +2,7 @@ use proc_macro::TokenStream;
 use proc_macro2::{TokenStream as TokenStream2, TokenTree};
 use quote::quote;
 use syn::{
-    Expr, ItemFn, LitStr, Token,
-    braced,
+    Expr, ItemFn, LitStr, Token, braced,
     parse::{Parse, ParseStream},
     parse_macro_input,
 };
@@ -151,14 +150,8 @@ pub(crate) fn expand_agent_hang_span(attr: TokenStream, item: TokenStream) -> To
     let end_data_tokens = args.end_data_tokens;
 
     let location_base = args.location.value();
-    let begin_location = LitStr::new(
-        &format!("{location_base}:begin"),
-        args.location.span(),
-    );
-    let end_location = LitStr::new(
-        &format!("{location_base}:end"),
-        args.location.span(),
-    );
+    let begin_location = LitStr::new(&format!("{location_base}:begin"), args.location.span());
+    let end_location = LitStr::new(&format!("{location_base}:end"), args.location.span());
 
     let wrapped_block = if sig.asyncness.is_some() {
         quote!({

@@ -347,7 +347,10 @@ mod tests {
             &mut hidden_meta_parse,
         );
 
-        assert_eq!(first_events, vec![StreamTextEvent::AppendContent("before".to_string())]);
+        assert_eq!(
+            first_events,
+            vec![StreamTextEvent::AppendContent("before".to_string())]
+        );
         assert_eq!(
             second_events,
             vec![
@@ -435,17 +438,18 @@ fn push_text_with_hidden_meta(
     let mut visible = String::new();
     let mut hidden = String::new();
 
-    let flush_visible = |events: &mut Vec<StreamTextEvent>, visible: &mut String, is_thinking: bool| {
-        if visible.is_empty() {
-            return;
-        }
-        let chunk = std::mem::take(visible);
-        if is_thinking {
-            events.push(StreamTextEvent::AppendThinking(chunk));
-        } else {
-            events.push(StreamTextEvent::AppendContent(chunk));
-        }
-    };
+    let flush_visible =
+        |events: &mut Vec<StreamTextEvent>, visible: &mut String, is_thinking: bool| {
+            if visible.is_empty() {
+                return;
+            }
+            let chunk = std::mem::take(visible);
+            if is_thinking {
+                events.push(StreamTextEvent::AppendThinking(chunk));
+            } else {
+                events.push(StreamTextEvent::AppendContent(chunk));
+            }
+        };
     let flush_hidden = |events: &mut Vec<StreamTextEvent>, hidden: &mut String| {
         if hidden.is_empty() {
             return;

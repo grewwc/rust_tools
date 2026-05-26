@@ -16,7 +16,7 @@ pub trait VectorStoreSync {
     ) -> Result<(), String>;
     fn delete_entry(&self, id: &str) -> Result<bool, String>;
     fn embed_text(&self, text: &str) -> Result<Vec<f32>, String>;
-    
+
     /// Batch embed multiple texts (default implementation calls embed_text individually)
     fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
         let mut embeddings = Vec::with_capacity(texts.len());
@@ -70,21 +70,33 @@ pub fn rebuild_vector_index(
         .iter()
         .filter(|e| !e.note.trim().is_empty())
         .collect();
-    
+
     if valid_entries.is_empty() {
         return Ok(0);
     }
-    
+
     // Batch embed all texts at once (much faster than individual API calls)
     let texts: Vec<String> = valid_entries.iter().map(|e| e.search_text()).collect();
     let embeddings = vector_store.embed_texts(&texts)?;
-    
+
     // Upsert all entries with their embeddings
     let mut count = 0;
     for (entry, embedding) in valid_entries.iter().zip(embeddings.iter()) {
-        let id = entry.id.clone().unwrap_or_else(|| id_generator::generate_id(entry));
+        let id = entry
+            .id
+            .clone()
+            .unwrap_or_else(|| id_generator::generate_id(entry));
         let content = entry.search_text();
-        if vector_store.upsert_entry(id, content, entry.category.clone(), entry.tags.clone(), embedding.clone()).is_ok() {
+        if vector_store
+            .upsert_entry(
+                id,
+                content,
+                entry.category.clone(),
+                entry.tags.clone(),
+                embedding.clone(),
+            )
+            .is_ok()
+        {
             count += 1;
         }
     }

@@ -2,13 +2,13 @@
 // AIOS Turn Runtime - Core Execution Engine
 // =============================================================================
 // This module handles the core execution loop where the LLM repeatedly calls tools.
-// 
+//
 // The turn execution follows this flow:
 //   1. Prepare: Build messages, select skills, initial request
 //   2. Iterate: LLM generates response with potential tool calls
 //   3. Execute: Run each tool call and collect results
 //   4. Finalize: Build final response and persist history
-// 
+//
 // Submodules:
 //   - prepare: Prepare turn (build messages, select skills)
 //   - iteration: Execute one LLM turn (call LLM, execute tools)
@@ -116,7 +116,9 @@ mod tests {
             last_skill_bias: None,
             os: crate::ai::driver::new_local_kernel(),
             agent_reload_counter: None,
-            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
+            observers: vec![Box::new(
+                crate::ai::driver::thinking::ThinkingOrchestrator::new(),
+            )],
         }
     }
 
@@ -246,11 +248,21 @@ mod tests {
 
         eprintln!("DEBUG: content chars = {}", content.chars().count());
         eprintln!("DEBUG: content lines = {}", content.lines().count());
-        eprintln!("DEBUG: terminal preview len = {}", prepared.content_for_terminal.len());
-        eprintln!("DEBUG: terminal preview first 300 chars:\n{}", &prepared.content_for_terminal[..300.min(prepared.content_for_terminal.len())]);
-        
+        eprintln!(
+            "DEBUG: terminal preview len = {}",
+            prepared.content_for_terminal.len()
+        );
+        eprintln!(
+            "DEBUG: terminal preview first 300 chars:\n{}",
+            &prepared.content_for_terminal[..300.min(prepared.content_for_terminal.len())]
+        );
+
         assert_eq!(prepared.content_for_model, content);
-        assert!(prepared.content_for_terminal.contains("truncated for terminal preview"));
+        assert!(
+            prepared
+                .content_for_terminal
+                .contains("truncated for terminal preview")
+        );
         assert!(prepared.content_for_terminal.len() < prepared.content_for_model.len());
         assert!(prepared.content_for_terminal.contains("0→"));
         assert!(prepared.content_for_terminal.contains("159→"));
@@ -272,7 +284,11 @@ mod tests {
         let prepared = prepare_tool_result(&app, "read_file_lines", &content);
 
         assert_eq!(prepared.content_for_model, content);
-        assert!(prepared.content_for_terminal.contains("truncated for terminal preview"));
+        assert!(
+            prepared
+                .content_for_terminal
+                .contains("truncated for terminal preview")
+        );
         assert!(prepared.content_for_terminal.contains("0→"));
         assert!(prepared.content_for_terminal.contains("89→"));
         assert!(!prepared.content_for_terminal.contains("39→"));
@@ -281,8 +297,10 @@ mod tests {
 
     #[test]
     fn web_search_uses_summary_first_terminal_preview() {
-        let history_file =
-            std::env::temp_dir().join(format!("ai-tool-preview-web-search-{}.sqlite", uuid::Uuid::new_v4()));
+        let history_file = std::env::temp_dir().join(format!(
+            "ai-tool-preview-web-search-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
         let app = test_app(history_file);
 
         let mut content = String::new();
@@ -293,7 +311,11 @@ mod tests {
         let prepared = prepare_tool_result(&app, "web_search", &content);
 
         assert_eq!(prepared.content_for_model, content);
-        assert!(prepared.content_for_terminal.contains("summary-first terminal preview"));
+        assert!(
+            prepared
+                .content_for_terminal
+                .contains("summary-first terminal preview")
+        );
         assert!(prepared.content_for_terminal.contains("result 0"));
         assert!(!prepared.content_for_terminal.contains("result 39"));
     }

@@ -5,10 +5,10 @@ use regex::Regex;
 
 use rust_tools::terminalw;
 
+use crate::memo::{MemoBackend, MemoBackendMode, MemoMongo, MemoRecord, MemoTag, history};
 use rust_tools::commonw::configw;
 use rust_tools::commonw::prompt;
 use rust_tools::commonw::types::{FastMap, FastSet};
-use crate::memo::{MemoBackend, MemoBackendMode, MemoMongo, MemoRecord, MemoTag, history};
 
 pub static WRAPPED_NUMBERED_ITEM_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?P<head>.*?)[ ]{2,}(?P<tail>\d+\.\s.*)$")
@@ -201,9 +201,7 @@ fn build_re_parser() -> terminalw::Parser {
     p.add_bool("pre", false, "tag prefix (short for -prefix)");
     p.add_bool("binary", false, "if the title is binary file");
     p.add_bool("b", false, "shortcut for -binary");
-    p.add_bool(
-        "cp", false, "copy output to clipboard",
-    );
+    p.add_bool("cp", false, "copy output to clipboard");
     p.add_bool("force", false, "force overwrite");
     p.add_bool(
         "sp",
@@ -402,7 +400,9 @@ pub fn get_tag_query_raw(cli: &Cli) -> Option<String> {
             '^'
         } else if cli.a || cli.all {
             '~'
-        } else { '=' };
+        } else {
+            '='
+        };
         return Some(
             tags.into_iter()
                 .map(|t| {

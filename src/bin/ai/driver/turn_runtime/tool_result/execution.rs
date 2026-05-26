@@ -6,25 +6,23 @@ use crate::ai::{
 };
 use std::io::Write;
 
+use super::super::persistence::persist_pending_turn_messages;
+use super::super::{
+    MAX_TOOL_RESULT_INLINE_CHARS, MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
+    types::{IterationExecution, PreparedToolResult, TurnLoopStep},
+};
+use super::messaging::print_tool_result_preview;
 use super::{
     messaging::{
         append_cached_tool_results_note, append_code_inspection_working_memory,
-        append_message_pair,
-        append_tool_result_messages, record_final_stream_response,
+        append_message_pair, append_tool_result_messages, record_final_stream_response,
         record_persistent_code_discoveries,
     },
     overflow::{build_model_overflow_stub, summarize_large_tool_output, write_tool_overflow_file},
     preview::{build_terminal_preview, tail_chars},
 };
 use crate::ai::driver::print::{
-    format_tool_output_prefix, print_tool_note_line, print_tool_output_block,
-    sanitize_for_terminal,
-};
-use super::messaging::print_tool_result_preview;
-use super::super::persistence::persist_pending_turn_messages;
-use super::super::{
-    MAX_TOOL_RESULT_INLINE_CHARS, MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
-    types::{IterationExecution, PreparedToolResult, TurnLoopStep},
+    format_tool_output_prefix, print_tool_note_line, print_tool_output_block, sanitize_for_terminal,
 };
 
 /// 适合"中段按行裁剪"的工具：输出本身是搜索/列表类（head+命中+tail 信息密度高、
@@ -33,12 +31,7 @@ use super::super::{
 fn supports_line_trim(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "grep_search"
-            | "search_files"
-            | "list_directory"
-            | "tree"
-            | "code_search"
-            | "ast_outline"
+        "grep_search" | "search_files" | "list_directory" | "tree" | "code_search" | "ast_outline"
     )
 }
 
@@ -172,7 +165,10 @@ pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
             path.display()
         )
     } else {
-        build_terminal_preview(tool_name, &tail_chars(&summary.body, TOOL_OVERFLOW_PREVIEW_CHARS))
+        build_terminal_preview(
+            tool_name,
+            &tail_chars(&summary.body, TOOL_OVERFLOW_PREVIEW_CHARS),
+        )
     };
 
     PreparedToolResult {
@@ -216,7 +212,13 @@ fn execute_tool_calls_for_round(
     observer: Option<&mut dyn tools::ToolExecutionObserver>,
     _iteration: usize,
 ) -> Result<ExecuteToolCallsResult, Box<dyn std::error::Error>> {
-    tools::execute_tool_calls(session_id, mcp_client, shared_mcp_client, tool_calls, observer)
+    tools::execute_tool_calls(
+        session_id,
+        mcp_client,
+        shared_mcp_client,
+        tool_calls,
+        observer,
+    )
 }
 
 struct TerminalToolObserver<'a> {
@@ -325,7 +327,8 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
                         break;
                     }
 
-                    let text = String::from_utf8_lossy(&self.pending_utf8[..valid_up_to]).into_owned();
+                    let text =
+                        String::from_utf8_lossy(&self.pending_utf8[..valid_up_to]).into_owned();
                     self.pending_utf8.drain(..valid_up_to);
                     self.push_stream_text(&text);
 
@@ -362,7 +365,11 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
             return;
         }
 
-        let prepared = prepare_tool_result(self.app, &tool_call.function.name, &run_result.tool_result.content);
+        let prepared = prepare_tool_result(
+            self.app,
+            &tool_call.function.name,
+            &run_result.tool_result.content,
+        );
         print_tool_result_preview(&tool_call.function.name, &prepared);
     }
 }
@@ -399,12 +406,7 @@ fn handle_tool_call_round(
     append_code_inspection_working_memory(messages, turn_messages);
     record_persistent_code_discoveries(app, messages, turn_messages);
 
-    persist_pending_turn_messages(
-        app,
-        one_shot_mode,
-        turn_messages,
-        persisted_turn_messages,
-    );
+    persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
 
     Ok(None)
 }
@@ -457,7 +459,8 @@ fn extract_image_paths_from_file_read_tool_calls(tool_calls: &[ToolCall]) -> Vec
         ) {
             continue;
         }
-        let Ok(args) = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments) else {
+        let Ok(args) = serde_json::from_str::<serde_json::Value>(&tool_call.function.arguments)
+        else {
             continue;
         };
         let Some(path) = args
@@ -566,8 +569,8 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::ToolCall(stream_result) => {
-            let discover_skills_only = no_active_skill
-                && requested_only_discover_skills(&stream_result.tool_calls);
+            let discover_skills_only =
+                no_active_skill && requested_only_discover_skills(&stream_result.tool_calls);
             let image_read_paths =
                 extract_image_paths_from_file_read_tool_calls(&stream_result.tool_calls);
             *terminal_dedupe_candidate = handle_tool_call_round(
@@ -621,8 +624,11 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 use aios_kernel::primitives::{RlimitDim, RlimitVerdict};
                 let os = app.os.lock().unwrap();
                 if let Some(pid) = os.current_process_id() {
-                    if let RlimitVerdict::Exceeded { dimension, used, limit } =
-                        os.rlimit_check(pid, &Default::default())
+                    if let RlimitVerdict::Exceeded {
+                        dimension,
+                        used,
+                        limit,
+                    } = os.rlimit_check(pid, &Default::default())
                     {
                         drop(os);
                         if matches!(dimension, RlimitDim::ToolCalls | RlimitDim::Turns)
@@ -707,7 +713,9 @@ mod tests {
             last_skill_bias: None,
             os: crate::ai::driver::new_local_kernel(),
             agent_reload_counter: None,
-            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
+            observers: vec![Box::new(
+                crate::ai::driver::thinking::ThinkingOrchestrator::new(),
+            )],
         }
     }
 
@@ -824,7 +832,8 @@ mod tests {
 
         let mut messages = Vec::new();
         let mut turn_messages = Vec::new();
-        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+        let shared_mcp =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
         append_auto_image_followup_message(
             &app,
             "describe the file",

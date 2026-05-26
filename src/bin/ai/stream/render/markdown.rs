@@ -1,19 +1,19 @@
 use std::io::{self, Write};
 
 use crate::ai::stream::extract::strip_ansi_codes;
-use crate::ai::theme::{
-    ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS,
-};
-use crate::ai::stream::state::{END_THINKING_TAG_TEXT, THINKING_TAG_TEXT};
 use crate::ai::stream::render::code::{
     MONOKAI_BG, MONOKAI_DIM, highlight_code_line, parse_code_block_language,
 };
 use crate::ai::stream::render::inline::render_inline_md;
 use crate::ai::stream::render::table::{
-    TableAlign, TableState, is_table_row, is_table_row_candidate, is_table_separator,
-    line_looks_like_table_preview, parse_table_align, parse_table_row, render_table_bottom,
-    render_table_header, render_table_mid, render_table_row, render_table_top, split_indent,
-    table_preview_height, compute_table_widths,
+    TableAlign, TableState, compute_table_widths, is_table_row, is_table_row_candidate,
+    is_table_separator, line_looks_like_table_preview, parse_table_align, parse_table_row,
+    render_table_bottom, render_table_header, render_table_mid, render_table_row, render_table_top,
+    split_indent, table_preview_height,
+};
+use crate::ai::stream::state::{END_THINKING_TAG_TEXT, THINKING_TAG_TEXT};
+use crate::ai::theme::{
+    ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS,
 };
 
 pub(in crate::ai) struct MarkdownStreamRenderer {
@@ -77,12 +77,7 @@ impl MarkdownStreamRenderer {
         self.write_chunk_to(&mut out, chunk, dimmed)
     }
 
-    fn write_chunk_to(
-        &mut self,
-        out: &mut dyn Write,
-        chunk: &str,
-        dimmed: bool,
-    ) -> io::Result<()> {
+    fn write_chunk_to(&mut self, out: &mut dyn Write, chunk: &str, dimmed: bool) -> io::Result<()> {
         self.dimmed = dimmed;
         for ch in chunk.chars() {
             if ch == '\n' {
@@ -287,15 +282,25 @@ impl MarkdownStreamRenderer {
 
         if !self.line_preview_emitted {
             out.write_all(
-                code_block_preview_prefix(&block_indent, &line_num_str, self.dimmed, self.show_line_gutter)
-                    .as_bytes(),
+                code_block_preview_prefix(
+                    &block_indent,
+                    &line_num_str,
+                    self.dimmed,
+                    self.show_line_gutter,
+                )
+                .as_bytes(),
             )?;
         } else if self.code_preview_segment_width > 0
             && self.code_preview_segment_width + ch_width > available_width
         {
             out.write_all(b"\x1b[0m\n")?;
             out.write_all(
-                code_block_preview_continuation_prefix(&block_indent, self.dimmed, self.show_line_gutter).as_bytes(),
+                code_block_preview_continuation_prefix(
+                    &block_indent,
+                    self.dimmed,
+                    self.show_line_gutter,
+                )
+                .as_bytes(),
             )?;
             self.code_preview_segment_width = 0;
         }
@@ -565,10 +570,12 @@ impl MarkdownStreamRenderer {
             } else {
                 "done thinking"
             };
-            let glyph = if trimmed == THINKING_TAG_TEXT { "╭─" } else { "╰─" };
-            return format!(
-                "{indent}{ACCENT_RULE}{glyph}\x1b[0m {ACCENT_MUTED}{label}\x1b[0m\n"
-            );
+            let glyph = if trimmed == THINKING_TAG_TEXT {
+                "╭─"
+            } else {
+                "╰─"
+            };
+            return format!("{indent}{ACCENT_RULE}{glyph}\x1b[0m {ACCENT_MUTED}{label}\x1b[0m\n");
         }
 
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
@@ -622,7 +629,10 @@ impl MarkdownStreamRenderer {
                     out.push_str(" │");
                 }
                 out.push_str(base);
-                out.push_str(&highlight_code_line(segment, self.code_block_lang.as_deref()));
+                out.push_str(&highlight_code_line(
+                    segment,
+                    self.code_block_lang.as_deref(),
+                ));
                 out.push_str("\x1b[0m\n");
             }
             return out;
@@ -722,7 +732,10 @@ impl MarkdownStreamRenderer {
 fn live_preview_cursor_rows(line: &str) -> usize {
     let cols = preview_terminal_width().max(1);
     let visible = strip_ansi_codes(line);
-    let width: usize = visible.chars().map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)).sum();
+    let width: usize = visible
+        .chars()
+        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum();
     if width == 0 {
         1
     } else {
@@ -1112,7 +1125,9 @@ mod tests {
         let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "20") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
-        renderer.write_chunk_for_test("你好你好你好你好你好", true).unwrap();
+        renderer
+            .write_chunk_for_test("你好你好你好你好你好", true)
+            .unwrap();
 
         assert_eq!(renderer.line_preview_height(), 1);
     }
@@ -1144,7 +1159,10 @@ mod tests {
         let visible = strip_ansi_for_test(&out);
         let lines = visible.lines().collect::<Vec<_>>();
 
-        assert!(lines.len() >= 2, "expected wrap to >=2 lines, got {lines:?}");
+        assert!(
+            lines.len() >= 2,
+            "expected wrap to >=2 lines, got {lines:?}"
+        );
         // 拼回所有行后字符总数仍应等于原输入（仅 wrap，不应丢字符）。
         let joined: String = lines.concat();
         assert_eq!(joined, "a".repeat(30));

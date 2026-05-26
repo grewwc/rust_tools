@@ -121,11 +121,11 @@ pub mod ordered_map;
 pub mod ordered_set;
 pub mod priority_queue;
 pub mod queue;
+pub mod rb_tree;
+pub mod skip_list;
 pub mod stack;
 pub mod tree_map;
 pub mod tree_set;
-pub mod rb_tree;
-pub mod skip_list;
 pub mod trie;
 pub mod uf;
 pub mod zset;
@@ -134,7 +134,9 @@ pub mod zset;
 pub use bloom_filter::BloomFilter;
 pub use counter::Counter;
 pub use deque_list::DequeList;
-pub use graph::{DirectedGraph, Edge, Mst, UndirectedGraph, WeightedDirectedGraph, WeightedUndirectedGraph};
+pub use graph::{
+    DirectedGraph, Edge, Mst, UndirectedGraph, WeightedDirectedGraph, WeightedUndirectedGraph,
+};
 pub use lru_cache::LruCache;
 pub use ordered_map::OrderedMap;
 pub use ordered_set::OrderedSet;

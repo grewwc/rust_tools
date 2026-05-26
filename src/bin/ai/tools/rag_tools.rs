@@ -222,19 +222,23 @@ mod tests {
     #[test]
     fn test_semantic_search_params() {
         let params = params_semantic_search();
-        assert!(params["required"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::String("query".to_string())));
+        assert!(
+            params["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("query".to_string()))
+        );
     }
 
     #[test]
     fn test_rebuild_index_params() {
         let params = params_rebuild_index();
         // No required parameters
-        assert!(params["required"]
-            .as_array()
-            .map(|a| a.is_empty())
-            .unwrap_or(true));
+        assert!(
+            params["required"]
+                .as_array()
+                .map(|a| a.is_empty())
+                .unwrap_or(true)
+        );
     }
 }

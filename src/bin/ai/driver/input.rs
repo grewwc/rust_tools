@@ -201,7 +201,9 @@ fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Bo
     Ok(Some(match action {
         HistoryAction::Show => LocalCommand::ShowHistory(options),
         HistoryAction::Help => LocalCommand::HelpHistory,
-        HistoryAction::Export(path) => LocalCommand::ExportHistory(options, path.map(PathBuf::from)),
+        HistoryAction::Export(path) => {
+            LocalCommand::ExportHistory(options, path.map(PathBuf::from))
+        }
         HistoryAction::Copy => LocalCommand::CopyHistory(options),
     }))
 }
@@ -311,15 +313,13 @@ fn render_history_preview(
     }
 
     let total = shown.len();
-    let mut out = format!("[history] Showing {} recent {}{}:\n", total, label, grep_suffix);
+    let mut out = format!(
+        "[history] Showing {} recent {}{}:\n",
+        total, label, grep_suffix
+    );
     for (idx, message) in shown.iter().enumerate() {
         let content = summarize_history_content(&message.content, max_chars, grep.as_deref());
-        out.push_str(&format!(
-            "{}. [{}] {}\n",
-            idx + 1,
-            message.role,
-            content
-        ));
+        out.push_str(&format!("{}. [{}] {}\n", idx + 1, message.role, content));
     }
     Ok(out.trim_end().to_string())
 }
@@ -377,7 +377,9 @@ fn summarize_history_content(
 fn searchable_history_content(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(s) => s.clone(),
-        other => serde_json::to_string(other).unwrap_or_else(|_| "<non-string content>".to_string()),
+        other => {
+            serde_json::to_string(other).unwrap_or_else(|_| "<non-string content>".to_string())
+        }
     }
 }
 
@@ -411,9 +413,7 @@ fn highlight_history_keyword(value: &str, grep: Option<&str>) -> String {
         .replace_all(value, |caps: &regex::Captures| {
             format!(
                 "{}{}{}",
-                HISTORY_GREP_HIGHLIGHT_START,
-                &caps[0],
-                HISTORY_GREP_HIGHLIGHT_END
+                HISTORY_GREP_HIGHLIGHT_START, &caps[0], HISTORY_GREP_HIGHLIGHT_END
             )
         })
         .into_owned()
@@ -460,8 +460,14 @@ fn extract_at_file_references(question: &mut String) -> crate::ai::types::FilePa
 
         files::classify_file_reference(&mut parsed, &path);
         if !parsed.text_files.iter().any(|candidate| candidate == &path)
-            && !parsed.image_files.iter().any(|candidate| candidate == &path)
-            && !parsed.binary_files.iter().any(|candidate| candidate == &path)
+            && !parsed
+                .image_files
+                .iter()
+                .any(|candidate| candidate == &path)
+            && !parsed
+                .binary_files
+                .iter()
+                .any(|candidate| candidate == &path)
         {
             rewritten.push(chars[i]);
             i += 1;
@@ -686,10 +692,10 @@ fn finalize_question(
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_at_file_references, finalize_question, parse_history_preview_options,
-        highlight_history_keyword, parse_local_command, render_history_preview,
-        summarize_history_content, truncate_for_terminal, HistoryAction,
-        HistoryPreviewOptions, HistoryRoleFilter, LocalCommand,
+        HistoryAction, HistoryPreviewOptions, HistoryRoleFilter, LocalCommand,
+        extract_at_file_references, finalize_question, highlight_history_keyword,
+        parse_history_preview_options, parse_local_command, render_history_preview,
+        summarize_history_content, truncate_for_terminal,
     };
     use crate::ai::{
         history::{Message, append_history_messages},
@@ -754,7 +760,9 @@ mod tests {
             last_skill_bias: None,
             os: crate::ai::driver::new_local_kernel(),
             agent_reload_counter: None,
-            observers: vec![Box::new(crate::ai::driver::thinking::ThinkingOrchestrator::new())],
+            observers: vec![Box::new(
+                crate::ai::driver::thinking::ThinkingOrchestrator::new(),
+            )],
         }
     }
 
@@ -768,7 +776,10 @@ mod tests {
         let ctx = finalize_question(&mut app, question, 6, false).unwrap();
 
         assert!(!ctx.question.contains(path.to_string_lossy().as_ref()));
-        assert_eq!(app.attached_image_files, vec![path.to_string_lossy().to_string()]);
+        assert_eq!(
+            app.attached_image_files,
+            vec![path.to_string_lossy().to_string()]
+        );
     }
 
     #[test]
@@ -806,7 +817,10 @@ mod tests {
         let ctx = finalize_question(&mut app, "describe this".to_string(), 6, false).unwrap();
 
         assert_eq!(ctx.question, "describe this");
-        assert_eq!(app.attached_image_files, vec![path.to_string_lossy().to_string()]);
+        assert_eq!(
+            app.attached_image_files,
+            vec![path.to_string_lossy().to_string()]
+        );
     }
 
     #[test]

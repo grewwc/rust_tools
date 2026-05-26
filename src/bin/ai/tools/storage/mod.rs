@@ -1,18 +1,18 @@
-use std::path::Path;
-use std::sync::{LazyLock, Mutex};
+#[cfg(unix)]
+use libc::{LOCK_EX, LOCK_UN, flock};
+use std::fs;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use libc::{flock, LOCK_EX, LOCK_UN};
-use std::fs;
+use std::path::Path;
+use std::sync::{LazyLock, Mutex};
 
 pub(crate) mod command_runner;
 pub(crate) mod file_store;
-pub(crate) mod memory_index;
-pub(crate) mod memory_store;
 pub(crate) mod knowledge_cache;
 pub(crate) mod knowledge_fingerprint;
 pub(crate) mod knowledge_types;
+pub(crate) mod memory_index;
+pub(crate) mod memory_store;
 pub(crate) mod rag_store;
 
 /// 文件锁，用于并发访问 memory 文件
@@ -26,7 +26,7 @@ where
     let _guard = MEMORY_FILE_LOCK
         .lock()
         .map_err(|e| format!("Failed to acquire memory file lock: {}", e))?;
-    
+
     #[cfg(unix)]
     {
         // Unix: 使用 flock 进行文件级锁
@@ -41,7 +41,7 @@ where
             return result;
         }
     }
-    
+
     // 回退：仅使用互斥锁
     f()
 }

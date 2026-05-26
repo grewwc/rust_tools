@@ -76,11 +76,7 @@ pub(crate) fn execute_tree(args: &Value) -> Result<String, String> {
         .map_err(|e| format!("Failed to get cwd: {}", e))?;
     let root = {
         let p = PathBuf::from(path);
-        if p.is_absolute() {
-            p
-        } else {
-            cwd.join(p)
-        }
+        if p.is_absolute() { p } else { cwd.join(p) }
     };
 
     if !root.exists() {
@@ -195,12 +191,10 @@ fn build_tree(
         Err(_) => return,
     };
 
-    entries.sort_by(|a, b| {
-        match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
     });
 
     let count = entries.len();

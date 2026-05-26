@@ -6,7 +6,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use rust_tools::commonw::FastMap;
 use serde::{Deserialize, Serialize};
 

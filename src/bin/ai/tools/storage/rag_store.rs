@@ -10,9 +10,7 @@ use dirs;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::ai::knowledge::{
-    storage::vector_store::{VectorEntry, VectorStore},
-};
+use crate::ai::knowledge::storage::vector_store::{VectorEntry, VectorStore};
 use crate::ai::tools::storage::memory_store::MemoryStore;
 
 /// 32 字符短指纹（取 SHA-256 前 16 字节，hex 编码）。
@@ -117,7 +115,13 @@ impl RagStore {
     ) -> Result<Vec<(String, RagEntry, f32)>, String> {
         let query_embedding = self.embed_text(query)?;
         self.store
-            .hybrid_search(&query_embedding, bm25_results, limit, category, vector_weight)
+            .hybrid_search(
+                &query_embedding,
+                bm25_results,
+                limit,
+                category,
+                vector_weight,
+            )
             .map(|results| {
                 results
                     .into_iter()
@@ -237,7 +241,7 @@ impl crate::ai::knowledge::sync::knowledge_sync::VectorStoreSync for RagStore {
     fn embed_text(&self, text: &str) -> Result<Vec<f32>, String> {
         self.embed_text(text)
     }
-    
+
     fn embed_texts(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
         // Use the optimized batch embedding
         self.embed_texts(texts)
@@ -290,7 +294,10 @@ mod tests {
     fn test_cosine_similarity_identical() {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
-        assert!((crate::ai::knowledge::indexing::similarity::cosine_similarity(&a, &b) - 1.0).abs() < 1e-6);
+        assert!(
+            (crate::ai::knowledge::indexing::similarity::cosine_similarity(&a, &b) - 1.0).abs()
+                < 1e-6
+        );
     }
 
     #[test]
@@ -304,12 +311,18 @@ mod tests {
     fn test_cosine_similarity_opposite() {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![-1.0, 0.0, 0.0];
-        assert!((crate::ai::knowledge::indexing::similarity::cosine_similarity(&a, &b) - (-1.0)).abs() < 1e-6);
+        assert!(
+            (crate::ai::knowledge::indexing::similarity::cosine_similarity(&a, &b) - (-1.0)).abs()
+                < 1e-6
+        );
     }
 
     #[test]
     fn test_cosine_similarity_empty() {
-        assert_eq!(crate::ai::knowledge::indexing::similarity::cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(
+            crate::ai::knowledge::indexing::similarity::cosine_similarity(&[], &[]),
+            0.0
+        );
     }
 
     fn make_entry(

@@ -155,7 +155,9 @@ fn base_no_ext(path: &str) -> String {
 fn read_stdin_all() -> String {
     use std::io::Read;
     let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf).unwrap_or_default();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .unwrap_or_default();
     buf
 }
 
@@ -166,12 +168,11 @@ fn read_stdin_all() -> String {
 /// 解析为 JSON，以处理用户复制了 JSON 字符串的情况。
 fn parse_clipboard_json(options: jsonw::ParseOptions) -> jsonw::Json {
     let s = string_content::get_clipboard_content();
-    let j = jsonw::Json::from_str(&s, options)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to parse clipboard content as JSON: {e}");
-            std::process::exit(1);
-        });
-    
+    let j = jsonw::Json::from_str(&s, options).unwrap_or_else(|e| {
+        eprintln!("Failed to parse clipboard content as JSON: {e}");
+        std::process::exit(1);
+    });
+
     // 如果解析结果是一个字符串，尝试将其作为 JSON 再次解析
     // 这处理了剪贴板内容是 "{\"key\":...}" 这种 JSON 字符串的情况
     let val = j.raw_value();
@@ -186,6 +187,6 @@ fn parse_clipboard_json(options: jsonw::ParseOptions) -> jsonw::Json {
             }
         }
     }
-    
+
     j
 }

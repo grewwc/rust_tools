@@ -4,11 +4,14 @@ use std::sync::{LazyLock, Mutex};
 use rust_tools::cw::SkipMap;
 use serde_json::Value;
 
-use aios_kernel::{kernel::{Kernel, Signal}, primitives::FutexAddr};
 use crate::ai::tools::os_tools::GLOBAL_OS;
 use crate::ai::tools::permissions::ToolPermissions;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use crate::ai::types::{FunctionDefinition, ToolCall, ToolDefinition, ToolResult};
+use aios_kernel::{
+    kernel::{Kernel, Signal},
+    primitives::FutexAddr,
+};
 use chrono::Local;
 
 /// Static specification for a builtin tool, including its name,
@@ -80,13 +83,18 @@ pub(crate) fn clear_tool_cancel() {
         Ok(())
     });
     with_current_process_mut(|proc| {
-        proc.pending_signals.retain(|signal| *signal != Signal::SigCancel);
+        proc.pending_signals
+            .retain(|signal| *signal != Signal::SigCancel);
     });
 }
 
 pub(crate) fn is_tool_cancel_requested() -> bool {
-    with_current_process_ref(|proc| proc.pending_signals.iter().any(|signal| *signal == Signal::SigCancel))
-        .unwrap_or(false)
+    with_current_process_ref(|proc| {
+        proc.pending_signals
+            .iter()
+            .any(|signal| *signal == Signal::SigCancel)
+    })
+    .unwrap_or(false)
 }
 
 fn with_current_process<T>(
@@ -327,7 +335,9 @@ fn record_tool_failure_experience(name: &str, err: &str) {
     static LAST: OnceLock<Mutex<FastMap<String, Instant>>> = OnceLock::new();
     let map = LAST.get_or_init(|| Mutex::new(FastMap::default()));
     {
-        let Ok(mut g) = map.lock() else { return; };
+        let Ok(mut g) = map.lock() else {
+            return;
+        };
         if let Some(prev) = g.get(name)
             && prev.elapsed() < std::time::Duration::from_secs(300)
         {

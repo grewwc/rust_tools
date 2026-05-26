@@ -70,9 +70,17 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     let mut parser = TermParser::new();
 
     // 定义所有 bool 选项
-    parser.add_bool("clear", false, "clear specified session history (use with --session)");
+    parser.add_bool(
+        "clear",
+        false,
+        "clear specified session history (use with --session)",
+    );
     parser.add_bool("clipboard", false, "prepend content in clipboard");
-    parser.add_bool("thinking", false, "force enable thinking (auto-enabled by default for complex questions)");
+    parser.add_bool(
+        "thinking",
+        false,
+        "force enable thinking (auto-enabled by default for complex questions)",
+    );
     parser.alias("t", "thinking");
     parser.add_bool("short-output", false, "short output");
     parser.alias("s", "short-output");
@@ -244,7 +252,11 @@ pub(super) fn print_help() {
     let mut parser = TermParser::new();
 
     parser.add_bool("clipboard", false, "prepend content in clipboard");
-    parser.add_bool("thinking", false, "force enable thinking (auto-enabled by default for complex questions)");
+    parser.add_bool(
+        "thinking",
+        false,
+        "force enable thinking (auto-enabled by default for complex questions)",
+    );
     parser.alias("t", "thinking");
     parser.add_bool("short-output", false, "short output");
     parser.alias("s", "short-output");
@@ -283,7 +295,9 @@ pub(super) fn print_help() {
     parser.print_defaults();
     println!();
     println!("Agent (CLI):");
-    println!("  --agent <name>            start with specified agent (build/executor/plan/explore)");
+    println!(
+        "  --agent <name>            start with specified agent (build/executor/plan/explore)"
+    );
     println!("  --list-agents             list available agents and exit");
     println!();
     println!("Session (CLI):");
@@ -327,10 +341,16 @@ pub(super) fn print_help() {
     println!("Config (.configW):");
     println!("  ai.intent_model                    light model for thinking gate / skill router");
     println!("  ai.intent.model_path               local TF-IDF + LR intent model json");
-    println!("  ai.agents.auto_route.enable        auto switch primary agent by turn intent (default: true)");
-    println!("  ai.agents.auto_route.executor_min_chars   min chars before routing complex tasks to executor (default: 48)");
+    println!(
+        "  ai.agents.auto_route.enable        auto switch primary agent by turn intent (default: true)"
+    );
+    println!(
+        "  ai.agents.auto_route.executor_min_chars   min chars before routing complex tasks to executor (default: 48)"
+    );
     println!("  ai.agents.auto_route.openclaw_min_chars   legacy alias for executor_min_chars");
-    println!("  ai.model.thinking                 force enable thinking when the selected model supports it");
+    println!(
+        "  ai.model.thinking                 force enable thinking when the selected model supports it"
+    );
     println!("  ai.model.auto_thinking.enable      auto gate switch (default: true)");
     println!("  ai.model.auto_thinking.threshold   model gate confidence threshold (default: 0.7)");
 }

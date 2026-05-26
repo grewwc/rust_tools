@@ -15,7 +15,18 @@ impl ApiProvider {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Deserialize,
+    serde::Serialize,
+    Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ModelQualityTier {
     Basic,
@@ -104,11 +115,20 @@ mod tests {
 
     #[test]
     fn reasoning_effort_parses_canonical_aliases() {
-        assert_eq!(ReasoningEffort::parse("minimal"), Some(ReasoningEffort::Minimal));
-        assert_eq!(ReasoningEffort::parse("MIN"), Some(ReasoningEffort::Minimal));
+        assert_eq!(
+            ReasoningEffort::parse("minimal"),
+            Some(ReasoningEffort::Minimal)
+        );
+        assert_eq!(
+            ReasoningEffort::parse("MIN"),
+            Some(ReasoningEffort::Minimal)
+        );
         assert_eq!(ReasoningEffort::parse("low"), Some(ReasoningEffort::Low));
         assert_eq!(ReasoningEffort::parse("Mid"), Some(ReasoningEffort::Medium));
-        assert_eq!(ReasoningEffort::parse("medium"), Some(ReasoningEffort::Medium));
+        assert_eq!(
+            ReasoningEffort::parse("medium"),
+            Some(ReasoningEffort::Medium)
+        );
         assert_eq!(ReasoningEffort::parse("HIGH"), Some(ReasoningEffort::High));
         assert_eq!(ReasoningEffort::parse(""), None);
         assert_eq!(ReasoningEffort::parse("bogus"), None);

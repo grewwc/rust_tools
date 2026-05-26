@@ -28,8 +28,7 @@ struct EnableState {
     available_mcp_tools: Vec<ToolDefinition>,
 }
 
-static STATE: LazyLock<RwLock<EnableState>> =
-    LazyLock::new(|| RwLock::new(EnableState::default()));
+static STATE: LazyLock<RwLock<EnableState>> = LazyLock::new(|| RwLock::new(EnableState::default()));
 
 const EXPLICIT_TOOL_DEMOTE_AGE: u32 = 4;
 
@@ -309,7 +308,10 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             }
             Ok(msg.join("\n"))
         }
-        other => Err(format!("Unknown operation '{}'. Use 'list' or 'enable'.", other)),
+        other => Err(format!(
+            "Unknown operation '{}'. Use 'list' or 'enable'.",
+            other
+        )),
     }
 }
 

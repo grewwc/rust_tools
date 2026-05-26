@@ -3,7 +3,7 @@ use std::{fs::File, io::Write, path::Path};
 use chrono::Local;
 
 use crate::ai::{
-    history::{value_to_string, Message, SessionStore},
+    history::{Message, SessionStore, value_to_string},
     types::{App, ToolCall},
 };
 
