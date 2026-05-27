@@ -448,7 +448,7 @@ fn history_compression_inserts_summary_and_keeps_recent() {
     append_history(&path, &blob).unwrap();
 
     let messages = build_message_arr(100, &path).unwrap();
-    let compressed = compress_messages_for_context(messages, 1200, 4, 200, None);
+    let compressed = compress_messages_for_context(messages, 1800, 4, 200, None);
 
     assert!(!compressed.is_empty());
     assert_eq!(compressed[0].role, crate::ai::history::ROLE_INTERNAL_NOTE);
@@ -472,9 +472,9 @@ fn history_compression_inserts_summary_and_keeps_recent() {
     );
     let total = compressed
         .iter()
-        .map(|m| m.content.as_str().map(|s| s.len()).unwrap_or(0))
+        .map(|m| m.content.as_str().map(|s| s.chars().count()).unwrap_or(0))
         .sum::<usize>();
-    assert!(total <= 1200);
+    assert!(total <= 1800);
 
     let _ = std::fs::remove_file(path);
 }

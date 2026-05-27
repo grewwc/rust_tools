@@ -86,9 +86,15 @@ impl OverflowSink {
             return;
         }
         if self.buffer.is_empty() {
-            self.buffer.push_str(
-                "# 溢出对话历史\n\n以下内容因超出上下文窗口而被移出，模型可使用 read_file 工具读取此文件回顾。\n\n---\n\n",
-            );
+            // 仅在归档文件尚未存在时写入头部说明；后续调用走 append 模式追加新批次。
+            // 每个新批次再加一个分隔行，方便人工/工具分块读取。
+            if !self.path.exists() {
+                self.buffer.push_str(
+                    "# 溢出对话历史\n\n以下内容因超出上下文窗口而被移出，模型可使用 read_file 工具读取此文件回顾。\n\n---\n\n",
+                );
+            } else {
+                self.buffer.push_str("\n---\n\n");
+            }
         }
         for msg in messages {
             let text = value_to_string(&msg.content);
@@ -127,7 +133,13 @@ impl OverflowSink {
             let _ = std::fs::create_dir_all(parent);
         }
         use std::io::Write;
-        std::fs::File::create(&self.path)
+        // append 模式：避免每次压缩都把之前归档的更早历史覆盖丢失。
+        // 之前用 File::create 会清空文件，导致同一会话经历多轮压缩后只剩
+        // 最后一次 flush 的内容，长期记忆退化为短期记忆。
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
             .and_then(|mut f| {
                 f.write_all(self.buffer.as_bytes())?;
                 f.sync_data()
@@ -389,6 +401,21 @@ fn shrink_messages_to_fit_with_summary(
 
     while messages_total_chars(&messages) > max_chars {
         if let Some(group) = first_tool_call_group(&messages) {
+            // 与 shrink_messages_to_fit 保持一致：先尝试折叠成单条 stub，
+            // 让模型仍能"看见"早期发生过哪些工具调用、以什么结果收尾，
+            // 避免后续轮次完全失忆而重复工作。折叠仍超额或无法构造 stub
+            // 时，才把整组移入 dropped 由 OverflowSink 归档。
+            if let Some(stub) = fold_tool_call_group_to_stub(&messages, &group) {
+                let stub_idx = group[0];
+                for idx in group.iter().rev() {
+                    messages.remove(*idx);
+                }
+                messages.insert(stub_idx, stub);
+                if messages_total_chars(&messages) <= max_chars {
+                    break;
+                }
+                continue;
+            }
             let mut removed_group = Vec::with_capacity(group.len());
             for idx in group.into_iter().rev() {
                 removed_group.push(messages.remove(idx));
@@ -548,14 +575,25 @@ fn truncate_first_message_to_fit(messages: &mut [Message], max_chars: usize) {
         return;
     }
 
-    let remaining_chars = max_chars
-        .saturating_sub(messages_total_chars(&messages[1..]))
-        .max(50);
+    // 找到第一个可被截断的消息：跳过 system 消息（agent 指令不能被截断）。
+    // summary 类型的 internal_note 可以截断（它是压缩生成的文本）。
+    let target_idx = messages.iter().position(|m| m.role != "system");
+    let Some(target_idx) = target_idx else {
+        return; // 全是 system，没有可截断的目标
+    };
 
-    let first = &mut messages[0];
-    let text = value_to_string(&first.content);
+    let others_chars: usize = messages
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != target_idx)
+        .map(|(_, m)| value_len_chars(&m.content))
+        .sum();
+    let remaining_chars = max_chars.saturating_sub(others_chars).max(50);
+
+    let target = &mut messages[target_idx];
+    let text = value_to_string(&target.content);
     let truncated = truncate_to_chars(&text, remaining_chars);
-    first.content = Value::String(truncated);
+    target.content = Value::String(truncated);
 }
 
 fn messages_total_chars(messages: &[Message]) -> usize {
@@ -1604,14 +1642,24 @@ fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> {
         .map(|tc| tc.id.clone())
         .collect();
     let mut group = vec![assistant_idx];
-    for (i, m) in messages.iter().enumerate() {
-        if m.role == "tool" {
-            if let Some(ref id) = m.tool_call_id {
-                if tool_call_ids.contains(id) {
-                    group.push(i);
-                }
+    // 仅收集紧跟 assistant 之后、连续出现的 tool 消息，遇到任何非 tool（含
+    // 下一个 assistant/user/system/internal_note）即停。这样可以防止把
+    // 不同 turn 中残留的同 id stub（来自 dedup_repeated_tool_results 替换）
+    // 一并卷入同一 group，导致跨 turn 整组被折叠/删除。
+    let mut i = assistant_idx + 1;
+    while i < messages.len() && messages[i].role == "tool" {
+        if let Some(ref id) = messages[i].tool_call_id {
+            if tool_call_ids.contains(id) {
+                group.push(i);
+            } else {
+                // 同位置出现了不属于本 assistant 的 tool 消息（理论上不应该
+                // 发生，但若发生，停止扫描以避免破坏 OpenAI 配对协议）。
+                break;
             }
+        } else {
+            break;
         }
+        i += 1;
     }
     Some(group)
 }
@@ -1720,7 +1768,9 @@ fn is_summary_message(message: &Message) -> bool {
         return false;
     }
     let text = value_to_string(&message.content);
-    text.starts_with("对话摘要（自动压缩") || text.starts_with("历史摘要（自动压缩")
+    text.starts_with("对话摘要（自动压缩")
+        || text.starts_with("历史摘要（自动压缩")
+        || text.starts_with("[mid-turn-summary]")
 }
 
 const KEEP_RECENT_TOOL_MESSAGES: usize = 6;
@@ -1861,13 +1911,33 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
 
     let mut seen: HashMap<(String, String), usize> = HashMap::new();
     for (rank, &idx) in tool_indices.iter().enumerate() {
-        let signature = match messages[idx]
+        let signature = messages[idx]
             .tool_call_id
             .as_ref()
             .and_then(|id| id_to_signature.get(id))
-        {
-            Some(sig) => sig.clone(),
-            None => continue,
+            .cloned();
+        let signature = match signature {
+            Some(sig) => sig,
+            None => {
+                // 孤儿 tool：找不到对应的 assistant.tool_calls（可能因为 assistant 消息
+                // 已被早期裁剪/丢弃，或写入历史时配对就已经断裂）。这些消息在
+                // normalize_messages_for_request 阶段会被丢掉，但在压缩阶段仍占用
+                // 字符预算。最近 KEEP_RECENT_TOOL_MESSAGES 条保留全文以防误伤；
+                // 较旧的孤儿一律折叠为短 stub，避免阻塞后续压缩判断。
+                if rank < protected_from {
+                    let tool_call_id = messages[idx].tool_call_id.clone().unwrap_or_default();
+                    let stub = if tool_call_id.is_empty() {
+                        "[orphan tool result: corresponding assistant.tool_calls missing; content dropped]".to_string()
+                    } else {
+                        format!(
+                            "[orphan tool result for {}: corresponding assistant.tool_calls missing; content dropped]",
+                            tool_call_id
+                        )
+                    };
+                    messages[idx].content = Value::String(stub);
+                }
+                continue;
+            }
         };
         let count = seen.entry(signature.clone()).or_insert(0);
         *count += 1;

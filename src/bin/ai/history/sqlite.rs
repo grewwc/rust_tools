@@ -453,7 +453,9 @@ pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
         let Some(text) = message.content.as_str() else {
             continue;
         };
-        if text.starts_with("历史摘要（自动压缩") || text.starts_with("对话摘要（自动压缩")
+        if text.starts_with("历史摘要（自动压缩")
+            || text.starts_with("对话摘要（自动压缩")
+            || text.starts_with("[mid-turn-summary]")
         {
             return Ok(Some(message));
         }

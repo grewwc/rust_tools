@@ -44,12 +44,39 @@ const MAX_TOOL_RESULT_LINE_TRIM_CHARS: usize = 8_000;
 
 /// Mid-turn 渐进式压缩：messages 总字符数超过该阈值时，在 iteration loop 内
 /// 复用跨 turn 压缩管线，避免单 turn 长链工具调用把上下文撑爆。
-/// 设为 history_max_chars 默认值的 1.5 倍（24K * 1.5 = 36K），低于这个值时
-/// 几乎所有典型 turn（≤16 轮，每轮 1.5K）都不会触发，零开销。
-pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_SOFT_THRESHOLD: usize = 36_000;
-/// Mid-turn LLM 摘要硬阈值：经过无损/弱损压缩后仍超过该值，触发 LLM summary
+///
+/// 阈值默认按 `app.config.history_max_chars` 动态计算（详见
+/// [`mid_turn_compress_soft_threshold`] / [`mid_turn_compress_hard_threshold`]）。
+/// 这两个常量仅作为 floor 兜底（防止用户把 history_max_chars 设得过小，
+/// 导致 mid-turn 压缩在单条 tool 结果就被触发，反而不停 no-op）。
+pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_SOFT_FLOOR: usize = 36_000;
+/// Mid-turn LLM 摘要硬阈值 floor：经过无损/弱损压缩后仍超过该值，触发 LLM summary
 /// 兜底（会调用一次模型，并显示 "🗜️ compressing context..." 状态行）。
-pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_HARD_THRESHOLD: usize = 80_000;
+pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_HARD_FLOOR: usize = 80_000;
+
+/// 软阈值：min 36K，否则取 history_max_chars * 1.5。
+/// history_max_chars 默认 120K，对应软阈值 180K。
+pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_soft_threshold(
+    history_max_chars: usize,
+) -> usize {
+    history_max_chars
+        .saturating_mul(3)
+        .saturating_div(2)
+        .max(MID_TURN_COMPRESS_SOFT_FLOOR)
+}
+
+/// 硬阈值：min 80K，否则取 history_max_chars * 3.5。
+/// history_max_chars 默认 120K，对应硬阈值 420K（远超模型 context window，
+/// 实际硬阈值会被模型 4xx 之前的 normalize_messages_for_request 拦截）。
+/// 但相对软阈值留出明显 gap，避免软阈值边界连续触发 LLM summary。
+pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_hard_threshold(
+    history_max_chars: usize,
+) -> usize {
+    history_max_chars
+        .saturating_mul(7)
+        .saturating_div(2)
+        .max(MID_TURN_COMPRESS_HARD_FLOOR)
+}
 /// LLM 摘要兜底时保留尾部窗口的 user 起始轮数。早期超过此窗口的对话被压成
 /// 一条 internal_note 摘要插入到尾部窗口前。
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS: usize = 2;

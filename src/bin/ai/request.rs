@@ -1326,7 +1326,9 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
         if trimmed.starts_with("Context note: reused cached tool results") {
             return InternalNoteKind::CachedTools;
         }
-        if trimmed.starts_with("对话摘要（自动压缩") || trimmed.starts_with("历史摘要（自动压缩")
+        if trimmed.starts_with("对话摘要（自动压缩")
+            || trimmed.starts_with("历史摘要（自动压缩")
+            || trimmed.starts_with("[mid-turn-summary]")
         {
             return InternalNoteKind::Summary;
         }

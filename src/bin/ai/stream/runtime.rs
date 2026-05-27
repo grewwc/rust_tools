@@ -272,7 +272,28 @@ fn finalize_stream_response(
         let _ = crate::ai::request::charge_llm_usage_to_kernel(app, &model_for_pricing, &usage, 0);
     }
 
-    let tool_calls = collect_valid_tool_calls(&mut state.content.tool_calls_map);
+    let mut tool_calls = collect_valid_tool_calls(&mut state.content.tool_calls_map);
+
+    // Fallback：部分 provider（已知 qwen3.7-max thinking 模式）会把 function call
+    // 以纯 content JSON 的形式输出而不走 delta.tool_calls[]，导致 turn 在打印完
+    // 那段 JSON 后被判定为 Completed 直接结束。这里做一次保守的反向识别：仅当
+    // assistant_text 整体（去掉代码围栏 / <tool_call> 标签后）就是一个含 name 和
+    // arguments 的 JSON 对象/数组时，才升级为 tool_call。
+    if tool_calls.is_empty() {
+        if let Some(recovered) = recover_inline_tool_calls(&state.content.assistant_text) {
+            tool_calls = recovered;
+            // 把误打成 content 的那段 JSON 从可见输出里挪走，避免被持久化为
+            // 真正的 assistant 文本——否则下一轮请求模型会看到"自己上一轮回答
+            // 了一段 JSON"，进一步混乱。
+            let stripped = std::mem::take(&mut state.content.assistant_text);
+            if state.content.hidden_meta.is_empty() {
+                state.content.hidden_meta = stripped;
+            } else {
+                state.content.hidden_meta.push('\n');
+                state.content.hidden_meta.push_str(&stripped);
+            }
+        }
+    }
 
     let outcome = if !tool_calls.is_empty() {
         StreamOutcome::ToolCall
@@ -288,6 +309,107 @@ fn finalize_stream_response(
         reasoning_text: state.content.reasoning_text,
         skip_response_drain: true,
     })
+}
+
+/// 尝试把整段 assistant 文本反向识别为一个/多个 tool_call。仅在文本经过
+/// 围栏剥离后能完整解析成 JSON 对象（含 `name` + `arguments`）或这种对象
+/// 的数组时才会成功，避免误伤普通文本回答。
+fn recover_inline_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let stripped = strip_inline_tool_call_wrappers(text);
+    let trimmed = stripped.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let raw_calls: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Object(_) => vec![&value],
+        serde_json::Value::Array(items) if !items.is_empty() => items.iter().collect(),
+        _ => return None,
+    };
+
+    let mut out = Vec::with_capacity(raw_calls.len());
+    for (idx, raw) in raw_calls.into_iter().enumerate() {
+        let obj = raw.as_object()?;
+        // 兼容 OpenAI 风格 {"function": {"name", "arguments"}, "id"} 与
+        // 简化风格 {"name", "arguments"}。
+        let (name, arguments_value, id) = if let Some(func) = obj.get("function") {
+            let func_obj = func.as_object()?;
+            let name = func_obj.get("name")?.as_str()?.to_string();
+            let args = func_obj.get("arguments").cloned().unwrap_or_else(|| {
+                serde_json::Value::Object(serde_json::Map::new())
+            });
+            let id = obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            (name, args, id)
+        } else {
+            let name = obj.get("name")?.as_str()?.to_string();
+            let args = obj.get("arguments").cloned().unwrap_or_else(|| {
+                serde_json::Value::Object(serde_json::Map::new())
+            });
+            let id = obj
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            (name, args, id)
+        };
+        if name.trim().is_empty() {
+            return None;
+        }
+        let arguments = match arguments_value {
+            serde_json::Value::String(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() {
+                    "{}".to_string()
+                } else {
+                    // 校验内层字符串确实是 JSON，避免把任意字符串当 args 透传。
+                    serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+                    trimmed.to_string()
+                }
+            }
+            other => other.to_string(),
+        };
+        out.push(ToolCall {
+            id: id.unwrap_or_else(|| format!("inline_{idx}")),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall { name, arguments },
+        });
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// 剥掉模型常见的包裹形态：```json ... ```、``` ... ```、
+/// `<tool_call> ... </tool_call>`、`<|tool_call_begin|> ... <|tool_call_end|>`。
+/// 仅当输入整体被这些包裹时才剥离一层；否则原样返回。
+fn strip_inline_tool_call_wrappers(text: &str) -> String {
+    let mut s = text.trim().to_string();
+    // markdown fenced code block
+    if let Some(rest) = s.strip_prefix("```") {
+        if let Some(end) = rest.rfind("```") {
+            let inner = &rest[..end];
+            // 去掉首行可能的语言标签（json / JSON）
+            let inner_trimmed = inner.trim_start();
+            let inner_no_lang = inner_trimmed
+                .strip_prefix("json")
+                .or_else(|| inner_trimmed.strip_prefix("JSON"))
+                .unwrap_or(inner_trimmed);
+            s = inner_no_lang.trim().to_string();
+        }
+    }
+    // <tool_call>...</tool_call>
+    if let Some(rest) = s.strip_prefix("<tool_call>") {
+        if let Some(end) = rest.rfind("</tool_call>") {
+            s = rest[..end].trim().to_string();
+        }
+    }
+    // <|tool_call_begin|>...<|tool_call_end|>
+    if let Some(rest) = s.strip_prefix("<|tool_call_begin|>") {
+        if let Some(end) = rest.rfind("<|tool_call_end|>") {
+            s = rest[..end].trim().to_string();
+        }
+    }
+    s
 }
 
 async fn wait_for_interrupt(app: &App) {
@@ -949,6 +1071,74 @@ mod tests {
             Some("{\"command\":\"pwd\"}".to_string())
         );
         assert_eq!(normalize_tool_call_arguments("{\"command\":"), None);
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_handles_bare_object() {
+        // 模拟 qwen3.7-max 把 tool call 当成 content 输出的情况。
+        let raw = r#"{"name":"read_file","arguments":{"path":"/tmp/x"}}"#;
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"/tmp/x"}"#);
+        assert_eq!(calls[0].tool_type, "function");
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_handles_arguments_as_json_string() {
+        let raw = r#"{"name":"read_file","arguments":"{\"path\":\"/tmp/x\"}"}"#;
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.arguments, r#"{"path":"/tmp/x"}"#);
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_handles_fenced_code_block() {
+        let raw = "```json\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"/tmp/x\"}}\n```";
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+        assert_eq!(calls[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_handles_tool_call_xml_wrapper() {
+        let raw =
+            r#"<tool_call>{"name":"read_file","arguments":{"path":"/tmp/x"}}</tool_call>"#;
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+        assert_eq!(calls[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_handles_array_of_calls() {
+        let raw = r#"[{"name":"a","arguments":{}},{"name":"b","arguments":{"x":1}}]"#;
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "a");
+        assert_eq!(calls[1].function.name, "b");
+        assert_eq!(calls[1].function.arguments, r#"{"x":1}"#);
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_handles_openai_function_wrapper() {
+        let raw = r#"{"id":"call_123","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"/tmp/x\"}"}}"#;
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+        assert_eq!(calls[0].id, "call_123");
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"/tmp/x"}"#);
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_rejects_plain_text() {
+        // 普通文本回答绝不能被误判为 tool call。
+        assert!(recover_inline_tool_calls("Hello world").is_none());
+        assert!(recover_inline_tool_calls("").is_none());
+        // 仅有 name 没有 arguments，且 name 不在合法对象中——这里应该也是不解析的，
+        // 但为保留兼容性我们允许 name 单独存在时仍然识别。下面是真正的负样本：
+        assert!(recover_inline_tool_calls("{\"foo\":\"bar\"}").is_none());
+        assert!(recover_inline_tool_calls("12345").is_none());
+        // 字符串形式的 args 必须本身也是合法 JSON，否则拒绝。
+        assert!(
+            recover_inline_tool_calls(r#"{"name":"x","arguments":"not-json"}"#).is_none()
+        );
     }
 
     #[test]

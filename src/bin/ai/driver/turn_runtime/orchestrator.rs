@@ -17,10 +17,10 @@ use crate::ai::{mcp::SharedMcpClient, types::App};
 
 use super::{
     MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
-    MID_TURN_COMPRESS_HARD_THRESHOLD, MID_TURN_COMPRESS_SOFT_THRESHOLD,
     MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
     finalize::finalize_turn,
     iteration::{execute_turn_iteration, refresh_skill_turn_for_iteration},
+    mid_turn_compress_hard_threshold, mid_turn_compress_soft_threshold,
     prepare::prepare_turn,
     tool_result::handle_iteration_execution,
     types::{TurnLoopStep, TurnOutcome, TurnPreparation},
@@ -127,12 +127,12 @@ impl TurnSupervisor {
         self.iteration
     }
 
-    fn should_try_mid_turn_compress(&self, total_chars: usize) -> bool {
+    fn should_try_mid_turn_compress(&self, total_chars: usize, soft_threshold: usize) -> bool {
         let cooldown_passed = self.iteration.saturating_sub(self.last_compress_iteration)
             >= MID_TURN_COMPRESS_COOLDOWN_ITERATIONS;
         let delta_significant = total_chars.saturating_sub(self.last_compress_after_chars)
             >= MID_TURN_COMPRESS_DELTA_THRESHOLD;
-        total_chars > MID_TURN_COMPRESS_SOFT_THRESHOLD
+        total_chars > soft_threshold
             && cooldown_passed
             && (self.last_compress_after_chars == 0 || delta_significant)
     }
@@ -321,19 +321,22 @@ mod tests {
 
     #[test]
     fn turn_supervisor_compress_gate_respects_cooldown_and_delta() {
+        const SOFT: usize = super::super::MID_TURN_COMPRESS_SOFT_FLOOR;
         let mut s = TurnSupervisor::default();
         s.iteration = 3;
-        assert!(s.should_try_mid_turn_compress(MID_TURN_COMPRESS_SOFT_THRESHOLD + 10));
+        assert!(s.should_try_mid_turn_compress(SOFT + 10, SOFT));
 
-        s.mark_compress(MID_TURN_COMPRESS_SOFT_THRESHOLD + 10);
-        assert!(!s.should_try_mid_turn_compress(MID_TURN_COMPRESS_SOFT_THRESHOLD + 20));
+        s.mark_compress(SOFT + 10);
+        assert!(!s.should_try_mid_turn_compress(SOFT + 20, SOFT));
 
         s.iteration += MID_TURN_COMPRESS_COOLDOWN_ITERATIONS;
         assert!(!s.should_try_mid_turn_compress(
             s.last_compress_after_chars + MID_TURN_COMPRESS_DELTA_THRESHOLD - 1,
+            SOFT,
         ));
         assert!(s.should_try_mid_turn_compress(
             s.last_compress_after_chars + MID_TURN_COMPRESS_DELTA_THRESHOLD,
+            SOFT,
         ));
     }
 
@@ -550,11 +553,16 @@ async fn run_turn_body(
         // 每轮 tool 执行完毕后检查 messages 总字符；超过软阈值时
         // 复用跨 turn 压缩管线，避免长链工具调用把上下文撑爆。
         // 节流：①冷却 N 轮 ②增量小于 DELTA 时跳过，避免 no-op 反复压缩。
+        // 阈值按 history_max_chars 动态计算（floor 兜底），避免用户调整
+        // history_max_chars 后 mid-turn 阈值依旧死锁在 36K/80K。
+        let history_max_chars = app.config.history_max_chars;
+        let mid_turn_soft = mid_turn_compress_soft_threshold(history_max_chars);
+        let mid_turn_hard = mid_turn_compress_hard_threshold(history_max_chars);
         let total_chars = crate::ai::history::messages_total_chars_pub(&messages);
-        if supervisor.should_try_mid_turn_compress(total_chars) {
+        if supervisor.should_try_mid_turn_compress(total_chars, mid_turn_soft) {
             let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
             let (compressed, before, after) =
-                crate::ai::history::mid_turn_compress(drained, MID_TURN_COMPRESS_SOFT_THRESHOLD);
+                crate::ai::history::mid_turn_compress(drained, mid_turn_soft);
             messages = compressed;
             supervisor.mark_compress(after);
             if after < before {
@@ -562,11 +570,11 @@ async fn run_turn_body(
             }
             // 硬阈值：无损 + 弱损管线之后仍超额，调用 LLM 摘要兜底，
             // 把早期对话压成单条 internal_note，并在终端打 status line。
-            if after > MID_TURN_COMPRESS_HARD_THRESHOLD {
+            if after > mid_turn_hard {
                 crate::ai::driver::print::print_tool_note_line(
                     "compress",
                     &format!(
-                        "hard threshold exceeded ({after} > {MID_TURN_COMPRESS_HARD_THRESHOLD}), \
+                        "hard threshold exceeded ({after} > {mid_turn_hard}), \
                          requesting LLM summary…"
                     ),
                 );
