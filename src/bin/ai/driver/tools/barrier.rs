@@ -73,6 +73,14 @@ pub(super) fn should_barrier_after(
     }
 }
 
+/// True only when the tool can never trigger a barrier regardless of its
+/// output. Used to decide whether a read-only tool is safe to run inside a
+/// parallel batch (a tool that may barrier must stay in the sequential path
+/// so its result can gate the calls that follow it).
+pub(super) fn rule_is_never(route: &ToolRoute, tool_name: &str) -> bool {
+    matches!(barrier_rule(route, tool_name), BarrierRule::Never)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

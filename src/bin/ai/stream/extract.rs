@@ -1,5 +1,5 @@
 use super::{
-    splitter::{self, InternalToolCallStreamEvent, InternalToolCallStreamer},
+    splitter::{self, HermesXmlToolCallStreamer, InternalToolCallStreamEvent, InternalToolCallStreamer},
     state::{HiddenMetaParseState, InternalToolCall},
 };
 use crate::ai::request::StreamChunk;
@@ -95,6 +95,7 @@ pub(super) fn extract_chunk_events_streaming(
     thinking_open: &mut bool,
     hidden_meta_parse: &mut HiddenMetaParseState,
     streamer: &mut InternalToolCallStreamer,
+    hermes_streamer: &mut HermesXmlToolCallStreamer,
 ) -> (Vec<StreamTextEvent>, Vec<InternalToolCallStreamEvent>) {
     let Some(choice) = chunk.choices.first() else {
         return (Vec::new(), Vec::new());
@@ -131,15 +132,19 @@ pub(super) fn extract_chunk_events_streaming(
         events.push(StreamTextEvent::CloseThinking);
     }
     if !delta.content.is_empty() {
-        let content = normalize_stream_text(delta.content.clone());
-        push_text_with_hidden_meta(
-            &mut events,
-            content,
-            false,
-            hidden_begin,
-            hidden_end,
-            hidden_meta_parse,
-        );
+        let (cleaned, hermes_events) = hermes_streamer.push(&delta.content);
+        if !cleaned.is_empty() {
+            let content = normalize_stream_text(cleaned);
+            push_text_with_hidden_meta(
+                &mut events,
+                content,
+                false,
+                hidden_begin,
+                hidden_end,
+                hidden_meta_parse,
+            );
+        }
+        return (events, hermes_events);
     }
     (events, Vec::new())
 }

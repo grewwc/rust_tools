@@ -765,7 +765,7 @@ fn read_recent_history(app: &App) -> Vec<crate::ai::history::Message> {
 
 /// Loads all agents fresh from disk, enabling hot-reload of newly added/modified agents.
 /// Returns the updated manifests.
-fn reload_agent_manifests(agent_manifests: &mut Vec<AgentManifest>) {
+fn reload_agent_manifests(agent_manifests: &mut Arc<Vec<AgentManifest>>) {
     let new_agents = agents::load_all_agents();
     let old_fingerprint = agent_manifests_fingerprint(agent_manifests.as_slice());
     let new_fingerprint = agent_manifests_fingerprint(new_agents.as_slice());
@@ -787,7 +787,7 @@ fn reload_agent_manifests(agent_manifests: &mut Vec<AgentManifest>) {
             new_agents.len()
         );
     }
-    *agent_manifests = new_agents;
+    *agent_manifests = Arc::new(new_agents);
 }
 
 /// 基于 manifest 关键字段计算稳定指纹，用于检测增删改三类变更。
@@ -849,16 +849,16 @@ fn agent_manifests_fingerprint(agents: &[AgentManifest]) -> [u8; 32] {
 
 fn ensure_runtime_manifests_loaded(
     app: &mut App,
-    skill_manifests: &mut Vec<SkillManifest>,
-    agent_manifests: &mut Vec<AgentManifest>,
+    skill_manifests: &mut Arc<Vec<SkillManifest>>,
+    agent_manifests: &mut Arc<Vec<AgentManifest>>,
     manifests_loaded: &mut bool,
 ) {
     if *manifests_loaded {
         return;
     }
 
-    *skill_manifests = load_skill_manifests(app.cli.no_skills);
-    *agent_manifests = agents::load_all_agents();
+    *skill_manifests = Arc::new(load_skill_manifests(app.cli.no_skills));
+    *agent_manifests = Arc::new(agents::load_all_agents());
 
     if !skill_manifests.is_empty() {
         crate::ai::knowledge::indexing::embedder::warm_up();
@@ -1163,8 +1163,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ctx.tools = super::tools::tool_definitions_for_groups(&["core"]);
     }
 
-    let mut skill_manifests = Vec::new();
-    let mut agent_manifests = Vec::new();
+    // 用 Arc 持有 manifests：每个 foreground turn / 后台子 agent 派发都要给
+    // DriverContext 一份快照，过去用 Arc::new(x.to_vec()) / Arc::new(x.clone())
+    // 会把全部 agent+skill 的 prompt 正文深拷贝一遍。改成 Arc 后这些快照退化
+    // 成廉价的指针 clone；reload 时整体替换 Arc 即可。
+    let mut skill_manifests: Arc<Vec<SkillManifest>> = Arc::new(Vec::new());
+    let mut agent_manifests: Arc<Vec<AgentManifest>> = Arc::new(Vec::new());
 
     run_loop(
         &mut app,
@@ -1240,8 +1244,8 @@ fn finalize_turn_quota(os: &mut dyn aios_kernel::kernel::Kernel, pid: u64) -> (b
 async fn run_foreground_resume(
     app: &mut App,
     mcp_client: &SharedMcpClient,
-    skill_manifests: &[SkillManifest],
-    agent_manifests: &[AgentManifest],
+    skill_manifests: &Arc<Vec<SkillManifest>>,
+    agent_manifests: &Arc<Vec<AgentManifest>>,
     proc: aios_kernel::kernel::Process,
 ) {
     let pid = proc.pid;
@@ -1274,8 +1278,8 @@ async fn run_foreground_resume(
     let driver_ctx = runtime_ctx::DriverContext::new(
         app.clone(),
         mcp_client.clone(),
-        Arc::new(skill_manifests.to_vec()),
-        Arc::new(agent_manifests.to_vec()),
+        skill_manifests.clone(),
+        agent_manifests.clone(),
     );
 
     let turn_outcome = runtime_ctx::DRIVER_CTX
@@ -1341,8 +1345,8 @@ async fn run_loop(
     app: &mut App,
     mcp_client: &SharedMcpClient,
     mcp_probe: McpConfigProbe,
-    skill_manifests: &mut Vec<SkillManifest>,
-    agent_manifests: &mut Vec<AgentManifest>,
+    skill_manifests: &mut Arc<Vec<SkillManifest>>,
+    agent_manifests: &mut Arc<Vec<AgentManifest>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let one_shot_mode = !app.cli.args.is_empty();
     let mut should_quit = one_shot_mode;
@@ -1516,8 +1520,8 @@ async fn run_loop(
                 let task_driver_ctx = runtime_ctx::DriverContext::new(
                     task_app.clone(),
                     task_mcp.clone(),
-                    Arc::new(task_skills.clone()),
-                    Arc::new(agent_manifests.clone()),
+                    task_skills.clone(),
+                    agent_manifests.clone(),
                 );
 
                 let inherit = task_id
@@ -1669,7 +1673,7 @@ async fn run_loop(
             os.pop_foreground_ready()
         };
         if let Some(proc) = fg_proc {
-            run_foreground_resume(app, mcp_client, &*skill_manifests, agent_manifests, proc).await;
+            run_foreground_resume(app, mcp_client, skill_manifests, agent_manifests, proc).await;
             continue;
         }
 
@@ -1778,8 +1782,8 @@ async fn run_loop(
         let driver_ctx = runtime_ctx::DriverContext::new(
             app.clone(),
             mcp_client.clone(),
-            Arc::new(skill_manifests.clone()),
-            Arc::new(agent_manifests.clone()),
+            skill_manifests.clone(),
+            agent_manifests.clone(),
         );
 
         let turn_outcome = runtime_ctx::DRIVER_CTX

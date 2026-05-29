@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use rust_tools::cw::SkipMap;
 
 use crate::ai::{
@@ -7,7 +9,7 @@ use crate::ai::{
 
 use super::{
     MarkdownStreamRenderer,
-    splitter::{InternalToolCallStreamer, StreamSplitter},
+    splitter::{HermesXmlToolCallStreamer, InternalToolCallStreamer, StreamSplitter},
 };
 
 pub(super) const THINKING_TAG_TEXT: &str = "╭─ thinking";
@@ -83,6 +85,7 @@ pub(super) struct StreamRenderState {
     pub(super) current_printing_index: Option<usize>,
     pub(super) terminal_dedupe: Option<TerminalDedupeState>,
     pub(super) terminal_splitter: StreamSplitter,
+    pub(super) thinking_fold: ThinkingFoldState,
 }
 
 impl StreamRenderState {
@@ -95,7 +98,54 @@ impl StreamRenderState {
             current_printing_index: None,
             terminal_dedupe: None,
             terminal_splitter: StreamSplitter::new(),
+            thinking_fold: ThinkingFoldState::new(),
         }
+    }
+}
+
+/// Thinking 折叠状态：维护一个滚动窗口，只在终端展示最近 N 行 thinking 内容，
+/// 旧的行被折叠起来，同时保持流式实时输出。
+pub(super) struct ThinkingFoldState {
+    /// 最大可见行数（不含折叠提示行）
+    pub(super) max_visible_lines: usize,
+    /// 已完成的 thinking 行（ring buffer，只保留最近 max_visible_lines 行）
+    pub(super) recent_lines: VecDeque<String>,
+    /// 当前正在流式输出的不完整行
+    pub(super) current_line: String,
+    /// 总完成行数（含已被折叠的）
+    pub(super) total_lines: usize,
+    /// 正常输出阶段（折叠前）已打印的数据行数（\n 次数）
+    pub(super) terminal_rows: usize,
+    /// 折叠模式下滚动窗口占用的行数（折叠指示器 + 可见数据行）
+    pub(super) window_rows: usize,
+    /// 是否已输出了 "╭─ thinking" 标题行
+    pub(super) header_printed: bool,
+    /// 是否处于活跃的 thinking 折叠模式
+    pub(super) active: bool,
+}
+
+impl ThinkingFoldState {
+    pub(super) fn new() -> Self {
+        Self {
+            max_visible_lines: 5,
+            recent_lines: VecDeque::new(),
+            current_line: String::new(),
+            total_lines: 0,
+            terminal_rows: 0,
+            window_rows: 0,
+            header_printed: false,
+            active: false,
+        }
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.recent_lines.clear();
+        self.current_line.clear();
+        self.total_lines = 0;
+        self.terminal_rows = 0;
+        self.window_rows = 0;
+        self.header_printed = false;
+        self.active = false;
     }
 }
 
@@ -119,6 +169,7 @@ pub(super) struct StreamContentState {
     pub(super) hidden_meta_parse: HiddenMetaParseState,
     pub(super) internal_tool_call_idx: usize,
     pub(super) internal_tool_call_streamer: InternalToolCallStreamer,
+    pub(super) hermes_tool_call_streamer: HermesXmlToolCallStreamer,
 }
 
 impl StreamContentState {
@@ -135,6 +186,7 @@ impl StreamContentState {
             hidden_meta_parse: HiddenMetaParseState::default(),
             internal_tool_call_idx: 0,
             internal_tool_call_streamer: InternalToolCallStreamer::new(),
+            hermes_tool_call_streamer: HermesXmlToolCallStreamer::new(),
         }
     }
 }

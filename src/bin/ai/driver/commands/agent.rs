@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use crate::ai::{
     agents::{self, AgentManifest},
     types::App,
@@ -6,7 +8,7 @@ use crate::ai::{
 pub fn try_handle_agent_command(
     app: &mut App,
     input: &str,
-    agent_manifests: &mut Vec<AgentManifest>,
+    agent_manifests: &mut Arc<Vec<AgentManifest>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -108,7 +110,7 @@ pub fn try_handle_agent_command(
         }
         "reload" => {
             let old_count = agent_manifests.len();
-            *agent_manifests = agents::load_all_agents();
+            *agent_manifests = Arc::new(agents::load_all_agents());
             let new_count = agent_manifests.len();
             let delta = new_count as i64 - old_count as i64;
             if delta > 0 {

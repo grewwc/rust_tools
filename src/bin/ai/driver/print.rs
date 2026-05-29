@@ -18,9 +18,23 @@ pub fn print_assistant_banner_with_app(app: Option<&App>) {
     );
 }
 
+const TOOL_OUTPUT_BLOCK_MAX_VISIBLE: usize = 8;
+
 pub fn print_tool_output_block(content: &str) {
-    for line in format_tool_output_block(content) {
-        println!("{line}");
+    let lines: Vec<String> = format_tool_output_block(content);
+    if lines.len() <= TOOL_OUTPUT_BLOCK_MAX_VISIBLE {
+        for line in lines {
+            println!("{line}");
+        }
+    } else {
+        // 折叠：显示最后 N 行 + 折叠指示器
+        let folded_count = lines.len() - TOOL_OUTPUT_BLOCK_MAX_VISIBLE;
+        println!(
+            "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded_count} lines folded ···{RESET}"
+        );
+        for line in &lines[lines.len() - TOOL_OUTPUT_BLOCK_MAX_VISIBLE..] {
+            println!("{line}");
+        }
     }
 }
 

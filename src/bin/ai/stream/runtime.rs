@@ -241,12 +241,16 @@ fn finalize_stream_response(
     clear_waiting_hint(&mut state)?;
 
     if state.content.thinking_open {
-        write_stream_content(
-            &format!("\n{}\n", markers.end_thinking_tag),
-            app.writer.as_ref(),
-            &mut state.render.markdown,
-            false,
-        )?;
+        if state.render.thinking_fold.active {
+            finalize_thinking_fold(&mut state)?;
+        } else {
+            write_stream_content(
+                &format!("\n{}\n", markers.end_thinking_tag),
+                app.writer.as_ref(),
+                &mut state.render.markdown,
+                false,
+            )?;
+        }
     }
 
     flush_terminal_splitter(&mut state, markers)?;
@@ -315,6 +319,18 @@ fn finalize_stream_response(
 /// 围栏剥离后能完整解析成 JSON 对象（含 `name` + `arguments`）或这种对象
 /// 的数组时才会成功，避免误伤普通文本回答。
 fn recover_inline_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    // 优先尝试 Hermes / Qwen 风格的 XML tool call：
+    //   <tool_call><function=read_file>{"path":"/x"}</function></tool_call>
+    // 或 parameter 标签形式：
+    //   <function=read_file><parameter=path>/x</parameter></function>
+    // 这种形态不是合法 JSON，旧实现会解析失败 → 原样打印 markup 且不执行工具，
+    // turn 直接 dead-end。`<function=` 是极强的信号，普通散文不会出现，安全。
+    if text.contains("<function=") {
+        if let Some(calls) = recover_hermes_xml_tool_calls(text) {
+            return Some(calls);
+        }
+    }
+
     let stripped = strip_inline_tool_call_wrappers(text);
     let trimmed = stripped.trim();
     if trimmed.is_empty() {
@@ -377,6 +393,102 @@ fn recover_inline_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         });
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// 解析 Hermes / Qwen 风格的 XML tool call。支持：
+///   - 多个 `<function=NAME> ... </function>` 块（并行工具调用）
+///   - body 为 JSON：`<function=read_file>{"path":"/x"}</function>`
+///   - body 为 parameter 标签：`<function=read_file><parameter=path>/x</parameter></function>`
+///   - 外层可有可无 `<tool_call>...</tool_call>` 包裹
+/// 任意一个 `<function=...>` 块解析成功即返回；全部失败返回 None。
+fn recover_hermes_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let mut out: Vec<ToolCall> = Vec::new();
+    let mut rest = text;
+    let mut idx = 0usize;
+    while let Some(open_rel) = rest.find("<function=") {
+        let after_open = &rest[open_rel + "<function=".len()..];
+        // 函数名到第一个 '>' 为止。
+        let Some(name_end) = after_open.find('>') else {
+            break;
+        };
+        let name = after_open[..name_end].trim().to_string();
+        let body_start = name_end + 1;
+        // body 到配套 </function> 为止；缺失闭合标签时取剩余全部。
+        let body_region = &after_open[body_start..];
+        let (body, consumed_to) = match body_region.find("</function>") {
+            Some(close_rel) => (
+                &body_region[..close_rel],
+                body_start + close_rel + "</function>".len(),
+            ),
+            None => (body_region, body_region.len() + body_start),
+        };
+        if !name.is_empty() {
+            if let Some(arguments) = parse_hermes_function_body(body) {
+                out.push(ToolCall {
+                    id: format!("inline_xml_{idx}"),
+                    tool_type: "function".to_string(),
+                    function: crate::ai::types::FunctionCall {
+                        name,
+                        arguments,
+                    },
+                });
+                idx += 1;
+            }
+        }
+        // 前进到本块结束之后，继续扫描后续并行块。
+        let advance = open_rel + "<function=".len() + consumed_to;
+        if advance >= rest.len() {
+            break;
+        }
+        rest = &rest[advance..];
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// 把单个 `<function=...>` 的 body 解析为 JSON arguments 字符串。
+/// body 既可能直接是 JSON 对象，也可能是若干 `<parameter=key>value</parameter>`。
+pub(super) fn parse_hermes_function_body(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        // 无参数工具调用（如 `<function=list_dir></function>`）合法，返回空对象。
+        return Some("{}".to_string());
+    }
+    // 形态 1：body 本身就是 JSON 对象。
+    if trimmed.starts_with('{') {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if value.is_object() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    // 形态 2：<parameter=key>value</parameter> 标签集合。
+    if trimmed.contains("<parameter=") {
+        let mut map = serde_json::Map::new();
+        let mut rest = trimmed;
+        while let Some(open_rel) = rest.find("<parameter=") {
+            let after_open = &rest[open_rel + "<parameter=".len()..];
+            let Some(key_end) = after_open.find('>') else {
+                break;
+            };
+            let key = after_open[..key_end].trim().to_string();
+            let value_region = &after_open[key_end + 1..];
+            let Some(close_rel) = value_region.find("</parameter>") else {
+                break;
+            };
+            let raw_value = value_region[..close_rel].trim();
+            // 尝试把值解析成 JSON 标量/结构（数字、bool、对象、数组）；否则当字符串。
+            let value = serde_json::from_str::<serde_json::Value>(raw_value)
+                .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
+            if !key.is_empty() {
+                map.insert(key, value);
+            }
+            rest = &value_region[close_rel + "</parameter>".len()..];
+        }
+        if !map.is_empty() {
+            return Some(serde_json::Value::Object(map).to_string());
+        }
+    }
+    None
 }
 
 /// 剥掉模型常见的包裹形态：```json ... ```、``` ... ```、
@@ -535,12 +647,17 @@ fn ensure_tool_calls_section_open(
     let _ = clear_waiting_hint(state);
 
     if state.content.thinking_open {
-        let _ = write_stream_content(
-            &format_end_thinking_line(markers, &state.render.markdown),
-            app.writer.as_ref(),
-            &mut state.render.markdown,
-            false,
-        );
+        // 如果折叠模式活跃，先执行折叠结束渲染
+        if state.render.thinking_fold.active {
+            let _ = finalize_thinking_fold(state);
+        } else {
+            let _ = write_stream_content(
+                &format_end_thinking_line(markers, &state.render.markdown),
+                app.writer.as_ref(),
+                &mut state.render.markdown,
+                false,
+            );
+        }
         state.content.thinking_open = false;
     }
     let _ = state.render.markdown.flush_pending();
@@ -737,6 +854,22 @@ fn commit_visible_content(
 
     clear_waiting_hint(state)?;
 
+    // 当 thinking 折叠模式活跃且遇到 end_thinking_tag 时，做最终的折叠渲染
+    if !state.content.thinking_open
+        && state.render.thinking_fold.active
+        && content.contains(&markers.end_thinking_tag)
+    {
+        finalize_thinking_fold(state)?;
+        // end_thinking_tag 内容只用于视觉分隔，不需要追加到 assistant_text
+        let text = content.replace(&markers.end_thinking_tag, "");
+        let text = text.trim_matches('\n');
+        if !text.is_empty() {
+            current_history.push_str(text);
+            state.content.assistant_text.push_str(text);
+        }
+        return Ok(());
+    }
+
     maybe_write_stream_content(
         content.as_str(),
         app.writer.as_ref(),
@@ -822,6 +955,151 @@ fn maybe_write_plain_stream_text(
     write_stream_content_to_terminal(content, &mut state.render.markdown, false)
 }
 
+/// Thinking 内容的折叠渲染：所有内容都先正常输出（进入 scrollback），
+/// 超出限制后维护一个底部滚动窗口，只覆盖最近的 N 行区域。
+/// 早期内容保留在 terminal scrollback 中，用户可以向上滚动查看。
+fn write_thinking_content_folded(
+    content: &str,
+    state: &mut StreamProcessingState,
+    markers: &StreamMarkers,
+) -> io::Result<()> {
+    if content.is_empty() {
+        return Ok(());
+    }
+    let fold = &mut state.render.thinking_fold;
+
+    // 检测 thinking 标题行（╭─ thinking）—— 直接输出不参与折叠计数
+    if content.contains(&markers.thinking_tag) {
+        fold.active = true;
+        fold.header_printed = true;
+        // 让 markdown renderer 处理标题行的样式
+        return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
+    }
+
+    if !fold.active {
+        return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
+    }
+
+    // 逐字符处理
+    for ch in content.chars() {
+        if ch == '\n' {
+            // 一行完成
+            fold.total_lines += 1;
+            let completed_line = std::mem::take(&mut fold.current_line);
+            fold.recent_lines.push_back(completed_line);
+            // 只保留最近 max_visible_lines 行
+            while fold.recent_lines.len() > fold.max_visible_lines {
+                fold.recent_lines.pop_front();
+            }
+
+            if fold.total_lines <= fold.max_visible_lines {
+                // 还没超限，正常输出换行
+                print!("{DIM}\n{RESET}");
+                // terminal_rows 记录从第一个数据行开始的已打印行数
+                fold.terminal_rows += 1;
+            } else {
+                // 超限：覆盖底部滚动窗口区域
+                thinking_fold_redraw(fold)?;
+            }
+        } else {
+            fold.current_line.push(ch);
+            // 实时流式输出字符（无论是否在折叠模式都输出，保证实时性）
+            print!("{DIM}{ch}{RESET}");
+        }
+    }
+    io::stdout().flush()?;
+    Ok(())
+}
+
+/// 只覆盖底部的滚动窗口区域，不触碰 header 和早期已输出内容。
+/// 窗口内容 = 折叠指示器(1行) + 最近 N 行数据。
+fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
+    let mut out = io::stdout();
+
+    // 计算需要回退的行数：
+    // - 首次进入折叠模式：回退 max_visible_lines 行（之前正常输出的数据行 + 刚完成的行）
+    // - 后续折叠：回退 window_rows 行（上次重绘的窗口）+ 1 行（当前刚完成的流式行）
+    let erase_rows = if fold.window_rows == 0 {
+        // 首次折叠：cursor 在刚完成行的 \n 之后（该行的字符已经用 print! 输出了）
+        // 需要回退到最初打印的数据行位置
+        // terminal_rows = 之前正常 print!(\n) 的次数 = max_visible_lines
+        // 加上当前行（字符已输出但 \n 没输出）所以当前行算 1 行
+        fold.terminal_rows + 1
+    } else {
+        // 后续折叠：回退窗口高度 + 当前流式行（字符已输出，无 \n）
+        fold.window_rows + 1
+    };
+
+    if erase_rows > 0 {
+        // 光标上移，回到行首，清除到屏幕末尾
+        write!(out, "\x1b[{}A\r\x1b[0J", erase_rows)?;
+    }
+
+    let folded_count = fold.total_lines.saturating_sub(fold.max_visible_lines);
+
+    // 折叠指示器
+    write!(
+        out,
+        "{ACCENT_MUTED}  ··· {folded_count} lines folded ···\x1b[0m\n"
+    )?;
+
+    // 输出最近的 max_visible_lines 行（全部已完成）
+    for line in &fold.recent_lines {
+        write!(out, "{DIM}{line}{RESET}\n")?;
+    }
+
+    out.flush()?;
+
+    // 更新 window_rows = 折叠指示器(1) + 可见数据行数
+    fold.window_rows = 1 + fold.recent_lines.len();
+
+    Ok(())
+}
+
+/// Thinking 结束时的最终渲染：覆盖底部窗口，输出最终折叠摘要 + "done thinking"。
+fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::Result<()> {
+    let fold = &mut state.render.thinking_fold;
+    if !fold.active {
+        return Ok(());
+    }
+
+    let mut out = io::stdout();
+
+    // 擦除当前底部窗口区域（如果折叠已激活）
+    let erase_rows = if fold.window_rows > 0 {
+        // 有当前不完整行时多加 1
+        fold.window_rows + if fold.current_line.is_empty() { 0 } else { 1 }
+    } else {
+        // 还没进入过折叠模式（thinking 行数 <= max_visible_lines），不需要特殊处理
+        0
+    };
+
+    if erase_rows > 0 {
+        write!(out, "\x1b[{}A\r\x1b[0J", erase_rows)?;
+    }
+
+    if fold.total_lines > fold.max_visible_lines {
+        let folded_count = fold.total_lines.saturating_sub(fold.max_visible_lines);
+        write!(
+            out,
+            "{ACCENT_MUTED}  ··· {folded_count} lines folded ···\x1b[0m\n"
+        )?;
+
+        // 输出最近可见行
+        for line in &fold.recent_lines {
+            write!(out, "{DIM}{line}{RESET}\n")?;
+        }
+    }
+
+    // "done thinking" 结尾标记
+    write!(out, "{ACCENT_RULE}╰─\x1b[0m {ACCENT_MUTED}done thinking\x1b[0m\n")?;
+    out.flush()?;
+
+    // 重置折叠状态
+    fold.reset();
+    Ok(())
+}
+
 fn maybe_write_stream_content(
     content: &str,
     writer: Option<&Arc<std::sync::Mutex<std::fs::File>>>,
@@ -837,7 +1115,7 @@ fn maybe_write_stream_content(
     }
 
     if dimmed {
-        return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
+        return write_thinking_content_folded(content, state, markers);
     }
 
     let marker_line = format!("{}\n", markers.end_thinking_tag);
@@ -1105,6 +1383,47 @@ mod tests {
             r#"<tool_call>{"name":"read_file","arguments":{"path":"/tmp/x"}}</tool_call>"#;
         let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
         assert_eq!(calls[0].function.name, "read_file");
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_handles_hermes_xml_json_body() {
+        // 截图中模型实际输出的 Hermes/Qwen XML 形态（body 为 JSON）。
+        let raw = "<tool_call>\n<function=read_file>\n{\"path\":\"/tmp/x\"}\n</function>\n</tool_call>";
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"/tmp/x"}"#);
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_handles_hermes_xml_parameter_tags() {
+        let raw = "<function=read_file><parameter=path>/tmp/x</parameter><parameter=limit>200</parameter></function>";
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["path"], "/tmp/x");
+        // 数字参数被识别为 JSON 数字而非字符串。
+        assert_eq!(args["limit"], 200);
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_handles_hermes_xml_no_args() {
+        let raw = "<tool_call><function=list_agents></function></tool_call>";
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "list_agents");
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_handles_hermes_xml_parallel_calls() {
+        let raw = "<function=read_file>{\"path\":\"/a\"}</function><function=read_file>{\"path\":\"/b\"}</function>";
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool calls");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.arguments, r#"{"path":"/a"}"#);
+        assert_eq!(calls[1].function.arguments, r#"{"path":"/b"}"#);
     }
 
     #[test]
@@ -1457,6 +1776,7 @@ fn process_stream_payload(
         &mut state.content.thinking_open,
         &mut state.content.hidden_meta_parse,
         &mut state.content.internal_tool_call_streamer,
+        &mut state.content.hermes_tool_call_streamer,
     );
     process_internal_tool_calls(app, markers, state, internal_tool_call_events);
 

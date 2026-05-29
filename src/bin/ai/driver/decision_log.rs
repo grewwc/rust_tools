@@ -1,8 +1,7 @@
 /// 决策日志模块 - 记录 AI Agent 的关键决策过程
 ///
 /// 用于元认知（Meta-Cognition）：追溯"为什么做了某个选择"，便于调试和优化
-use chrono::Local;
-use rust_tools::cw::SkipMap;
+use chrono::Local;use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
@@ -10,6 +9,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
+
+/// 磁盘决策日志的字节上限；超过即触发一次保留尾部的压缩。约 8MB。
+const DECISION_LOG_MAX_PERSIST_BYTES: u64 = 8 * 1024 * 1024;
+/// 压缩后保留的最近行数（与内存 max_capacity 同量级，足够回放当前会话）。
+const DECISION_LOG_RETAIN_LINES: usize = 2000;
 
 /// 决策类型
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -107,13 +111,61 @@ impl DecisionLogStore {
         if let Some(parent) = path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) else {
             return;
         };
         let Ok(line) = serde_json::to_string(log) else {
             return;
         };
         let _ = writeln!(file, "{}", line);
+        drop(file);
+
+        // 决策日志是 append-only JSONL：内存缓冲受 max_capacity 限制，但磁盘文件
+        // 若不轮转会无限增长，且 `replay_recent_from_disk` 每次都全量逐行读取。
+        // 这里用一次 O(1) 的 metadata 探测，仅当超过上限时才做一次保留尾部的压缩。
+        if let Ok(meta) = fs::metadata(&path)
+            && meta.len() > DECISION_LOG_MAX_PERSIST_BYTES
+        {
+            self.compact_persist_file(&path);
+        }
+    }
+
+    /// 把磁盘日志文件压缩到最近 `DECISION_LOG_RETAIN_LINES` 行，使用临时文件
+    /// + 原子 rename，避免读到半截内容。best-effort：任意一步失败即放弃，不影响
+    /// 主流程。并发写入时遵循 last-writer-wins，最多丢失少量尚未压缩的尾行。
+    fn compact_persist_file(&self, path: &Path) {
+        let Ok(file) = std::fs::File::open(path) else {
+            return;
+        };
+        let reader = BufReader::new(file);
+        let mut lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+        if lines.len() <= DECISION_LOG_RETAIN_LINES {
+            return;
+        }
+        let start = lines.len() - DECISION_LOG_RETAIN_LINES;
+        let retained = lines.split_off(start);
+
+        let tmp_path = path.with_extension("jsonl.tmp");
+        let Ok(mut tmp) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+        else {
+            return;
+        };
+        for line in &retained {
+            if writeln!(tmp, "{}", line).is_err() {
+                let _ = fs::remove_file(&tmp_path);
+                return;
+            }
+        }
+        if tmp.flush().is_err() {
+            let _ = fs::remove_file(&tmp_path);
+            return;
+        }
+        drop(tmp);
+        let _ = fs::rename(&tmp_path, path);
     }
 
     /// 记录一个决策
@@ -691,6 +743,55 @@ mod tests {
         let replay = store.replay_recent_from_disk("sess-a", 3);
         assert_eq!(replay.len(), 3);
         assert!(replay.iter().all(|item| item.session_id == "sess-a"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_compact_persist_file_retains_recent_tail() {
+        let store = DecisionLogStore::new(100);
+        let path = temp_log_path("decision_log_compact");
+
+        // 直接写入超过保留上限的行数，再手动触发压缩。
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let total = DECISION_LOG_RETAIN_LINES + 500;
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .unwrap();
+            for i in 0..total {
+                let log = DecisionLog {
+                    timestamp: i as i64,
+                    session_id: "sess".to_string(),
+                    turn_id: i,
+                    decision_type: DecisionType::SchedulerDispatch,
+                    context: "ctx".to_string(),
+                    alternatives_considered: vec![],
+                    chosen_option: "c".to_string(),
+                    reasoning: "r".to_string(),
+                    confidence: None,
+                    outcome: None,
+                    execution_time_ms: None,
+                };
+                writeln!(file, "{}", serde_json::to_string(&log).unwrap()).unwrap();
+            }
+        }
+
+        store.compact_persist_file(&path);
+
+        let reader = BufReader::new(std::fs::File::open(&path).unwrap());
+        let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+        assert_eq!(lines.len(), DECISION_LOG_RETAIN_LINES);
+        // 应保留最新的尾部：最后一行 turn_id == total - 1。
+        let last: DecisionLog = serde_json::from_str(lines.last().unwrap()).unwrap();
+        assert_eq!(last.turn_id, total - 1);
+        // 最旧保留行应为 total - RETAIN_LINES。
+        let first: DecisionLog = serde_json::from_str(&lines[0]).unwrap();
+        assert_eq!(first.turn_id, total - DECISION_LOG_RETAIN_LINES);
 
         let _ = std::fs::remove_file(path);
     }

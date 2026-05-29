@@ -5,6 +5,8 @@ pub mod model;
 pub mod session;
 pub mod share;
 
+use std::sync::Arc;
+
 use crate::ai::{agents::AgentManifest, mcp::SharedMcpClient, types::App};
 
 pub use agent::try_handle_agent_command;
@@ -18,7 +20,7 @@ pub fn try_handle_interactive_command(
     app: &mut App,
     mcp_client: &SharedMcpClient,
     input: &str,
-    agent_manifests: &mut Vec<AgentManifest>,
+    agent_manifests: &mut Arc<Vec<AgentManifest>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if try_handle_help_command(input) {
         return Ok(true);

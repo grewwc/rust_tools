@@ -53,16 +53,12 @@ where
     where
         S: Serializer,
     {
-        use serde::ser::SerializeSeq;
-        // 序列化为: (max_height, Vec<(K, V)>)
-        let mut seq = serializer.serialize_seq(Some(self.len() + 1))?;
-        // 第一个元素是 max_height
-        seq.serialize_element(&self.max_height)?;
-        // 后续元素是所有 key-value 对
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.len()))?;
         for (k, v) in self.iter() {
-            seq.serialize_element(&(k, v))?;
+            map.serialize_entry(k, v)?;
         }
-        seq.end()
+        map.end()
     }
 }
 
@@ -75,14 +71,34 @@ where
     where
         D: Deserializer<'de>,
     {
-        // 反序列化: (max_height, Vec<(K, V)>)
-        let (max_height, items): (usize, Vec<(K, V)>) = Deserialize::deserialize(deserializer)?;
-        // 使用默认比较器重建 SkipMap
-        let mut map = *SkipMap::new(max_height, |a: &K, b: &K| a.cmp(b) as i32);
-        for (k, v) in items {
-            map.insert(k, v);
+        use serde::de::{MapAccess, Visitor};
+
+        struct SkipMapVisitor<K, V>(PhantomData<(K, V)>);
+
+        impl<'de, K, V> Visitor<'de> for SkipMapVisitor<K, V>
+        where
+            K: Deserialize<'de> + Ord,
+            V: Deserialize<'de>,
+        {
+            type Value = SkipMap<K, V>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut map = SkipMap::default();
+                while let Some((key, value)) = access.next_entry()? {
+                    map.insert(key, value);
+                }
+                Ok(map)
+            }
         }
-        Ok(map)
+
+        deserializer.deserialize_map(SkipMapVisitor(PhantomData))
     }
 }
 
@@ -502,8 +518,7 @@ where
         S: Serializer,
     {
         use serde::ser::SerializeSeq;
-        // 序列化: (Vec<T>)
-        let mut seq = serializer.serialize_seq(Some(self.len() + 1))?;
+        let mut seq = serializer.serialize_seq(Some(self.len()))?;
         for v in self.iter() {
             seq.serialize_element(v)?;
         }
@@ -519,8 +534,8 @@ where
     where
         D: Deserializer<'de>,
     {
-        let (max_height, items): (usize, Vec<T>) = Deserialize::deserialize(deserializer)?;
-        let mut set = SkipSet::new(max_height);
+        let items: Vec<T> = Deserialize::deserialize(deserializer)?;
+        let mut set = SkipSet::default();
         for item in items {
             set.insert(item);
         }

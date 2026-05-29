@@ -1911,6 +1911,30 @@ fn execute_tool_calls_inner(
             break;
         }
 
+        // 当模型在一轮里批量发出多个只读、无副作用、且永不触发 barrier 的工具
+        // 调用（如同时 read_file 多个文件）时，把这些连续调用并行执行以降低延迟。
+        // 任何带副作用 / 需要 barrier / 流式输出的工具都走原有的顺序路径。
+        let batch_len = parallel_safe_batch_len(mcp_client, &tool_calls[idx..]);
+        if batch_len >= 2 {
+            let batch = &tool_calls[idx..idx + batch_len];
+            let batch_results = run_parallel_readonly_batch(
+                mcp_client,
+                shared_mcp_client,
+                session_id,
+                batch,
+                &mut observer,
+            );
+            for (tool_call, (_route, run_result)) in batch.iter().zip(batch_results.into_iter()) {
+                executed_tool_calls.push(tool_call.clone());
+                cached_hits.push(run_result.cached);
+                notify_tool_finished(&mut observer, tool_call, &run_result);
+                print_run_status(tool_call, &run_result);
+                tool_results.push(run_result.tool_result);
+            }
+            idx += batch_len;
+            continue;
+        }
+
         let tool_call = &tool_calls[idx];
         let is_last = idx + 1 >= tool_calls.len();
         let (route, run_result) = run_one(
@@ -1955,6 +1979,98 @@ fn execute_tool_calls_inner(
         cached_hits,
     })
 }
+
+/// 上限：单批并行只读工具的并发度，避免模型一次发起几十个调用时打满线程。
+const PARALLEL_READONLY_MAX_CONCURRENCY: usize = 8;
+
+/// 判断一个工具调用是否可安全并行执行：必须是 builtin 路由、只读（命中
+/// `is_cacheable_tool_name` 的复用白名单且不在 mutating 列表）、且永不触发
+/// barrier。MCP 工具（始终 barrier）、写类工具、命令执行、子 agent / 异步任务
+/// 工具都会被排除，因此并行批次与顺序执行在语义上完全等价，只是更快。
+fn is_parallel_safe_tool_call(mcp_client: &McpClient, tool_call: &ToolCall) -> bool {
+    let name = &tool_call.function.name;
+    if !is_cacheable_tool_name(name) {
+        return false;
+    }
+    let route = route_tool_call(mcp_client, name);
+    if !matches!(route, ToolRoute::Builtin) {
+        return false;
+    }
+    barrier::rule_is_never(&route, name)
+}
+
+/// 返回从切片头部开始、连续可并行执行的工具数量（上限受并发度约束）。
+fn parallel_safe_batch_len(mcp_client: &McpClient, tool_calls: &[ToolCall]) -> usize {
+    let mut len = 0usize;
+    for tool_call in tool_calls {
+        if len >= PARALLEL_READONLY_MAX_CONCURRENCY {
+            break;
+        }
+        if !is_parallel_safe_tool_call(mcp_client, tool_call) {
+            break;
+        }
+        len += 1;
+    }
+    len
+}
+
+/// 并行执行一批只读工具，结果按输入顺序返回。每个线程使用独立的、无 observer
+/// 的 `run_one`（只读工具不产生流式输出），共享的 `mcp_client` / `session_id`
+/// 均为不可变引用，安全跨 `thread::scope` 线程共享。observer 的 started/finished
+/// 回调仍由调用方按顺序触发，以保持原有契约。
+fn run_parallel_readonly_batch(
+    mcp_client: &McpClient,
+    shared_mcp_client: &SharedMcpClient,
+    session_id: &str,
+    batch: &[ToolCall],
+    observer: &mut Option<&mut dyn ToolExecutionObserver>,
+) -> Vec<(ToolRoute, RunOneResult)> {
+    // 在并发执行前，按顺序触发 on_tool_started，保持观察者看到的启动顺序稳定。
+    if let Some(observer) = observer.as_deref_mut() {
+        for tool_call in batch {
+            observer.on_tool_started(tool_call);
+        }
+    }
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = batch
+            .iter()
+            .map(|tool_call| {
+                scope.spawn(move || {
+                    let mut no_observer: Option<&mut dyn ToolExecutionObserver> = None;
+                    run_one(
+                        mcp_client,
+                        shared_mcp_client,
+                        session_id,
+                        tool_call,
+                        &mut no_observer,
+                    )
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
+                    (
+                        ToolRoute::Builtin,
+                        RunOneResult {
+                            tool_result: ToolResult {
+                                tool_call_id: String::new(),
+                                content: "Error: parallel tool execution thread panicked"
+                                    .to_string(),
+                            },
+                            ok: false,
+                            executed: true,
+                            cached: false,
+                        },
+                    )
+                })
+            })
+            .collect()
+    })
+}
+
 
 fn notify_tool_finished(
     observer: &mut Option<&mut dyn ToolExecutionObserver>,
@@ -2153,10 +2269,12 @@ mod tests {
         async_tool_pipe_message_from_final, async_tool_pipe_message_from_started,
         async_tool_pipe_message_from_stream, build_tool_cache_key, classify_tool_error,
         collect_tool_cache_file_fingerprints, delete_async_tool_snapshot, execute_with_safe_retry,
-        is_cacheable_tool_name, is_tool_cache_entry_fresh, load_async_tool_snapshot,
-        lookup_wait_sources, persist_async_tool_snapshot, send_async_tool_pipe_message,
-        should_retry_once, stream_preview_from_aggregate, tool_cache_validation_matches,
+        is_cacheable_tool_name, is_parallel_safe_tool_call, is_tool_cache_entry_fresh,
+        load_async_tool_snapshot, lookup_wait_sources, parallel_safe_batch_len,
+        persist_async_tool_snapshot, send_async_tool_pipe_message, should_retry_once,
+        stream_preview_from_aggregate, tool_cache_validation_matches,
     };
+    use crate::ai::mcp::McpClient;
     use crate::ai::tools::registry::common::current_process_tool_cancel_futex;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
     use crate::ai::tools::task_tools::WaitManySource;
@@ -2201,6 +2319,57 @@ mod tests {
         };
         crate::ai::tools::os_tools::init_os_tools_globals(kernel.clone());
         (guard, kernel, root)
+    }
+
+    #[test]
+    fn parallel_batch_groups_consecutive_readonly_builtin_tools() {
+        let mcp = McpClient::new();
+        let calls = vec![
+            tool_call("read_file"),
+            tool_call("grep_search"),
+            tool_call("get_symbol_info"),
+        ];
+        assert!(is_parallel_safe_tool_call(&mcp, &calls[0]));
+        assert_eq!(parallel_safe_batch_len(&mcp, &calls), 3);
+    }
+
+    #[test]
+    fn parallel_batch_stops_at_mutating_tool() {
+        let mcp = McpClient::new();
+        // write_file / execute_command 带副作用，不可并行，应在其处截断。
+        assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("write_file")));
+        assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("execute_command")));
+        let calls = vec![tool_call("read_file"), tool_call("write_file")];
+        assert_eq!(parallel_safe_batch_len(&mcp, &calls), 1);
+    }
+
+    #[test]
+    fn parallel_batch_excludes_barriering_tools() {
+        let mcp = McpClient::new();
+        // search_files / list_directory / web_search 会触发 barrier，必须顺序执行。
+        assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("search_files")));
+        assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("list_directory")));
+        assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("web_search")));
+    }
+
+    #[test]
+    fn parallel_batch_caps_at_max_concurrency() {
+        let mcp = McpClient::new();
+        let calls: Vec<ToolCall> = (0..super::PARALLEL_READONLY_MAX_CONCURRENCY + 4)
+            .map(|_| tool_call("read_file"))
+            .collect();
+        assert_eq!(
+            parallel_safe_batch_len(&mcp, &calls),
+            super::PARALLEL_READONLY_MAX_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn parallel_batch_not_formed_for_single_readonly_call() {
+        let mcp = McpClient::new();
+        let calls = vec![tool_call("read_file"), tool_call("write_file")];
+        // 仅 1 个可并行调用，调用方应回退到顺序路径（batch_len == 1 < 2）。
+        assert_eq!(parallel_safe_batch_len(&mcp, &calls), 1);
     }
 
     fn sample_completed_entry(result_channel_id: Option<u64>) -> AsyncToolEntry {

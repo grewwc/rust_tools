@@ -190,6 +190,118 @@ enum BoundaryHit {
     },
 }
 
+const FN_OPEN_MARKER: &str = "<function=";
+const FN_CLOSE_MARKER: &str = "</function>";
+const TC_OPEN_MARKER: &str = "<tool_call>";
+const TC_CLOSE_MARKER: &str = "</tool_call>";
+
+#[derive(Default)]
+enum HermesXmlPhase {
+    #[default]
+    Idle,
+    /// 已吞掉 `<function=`，正在等待函数名后的 `>`。
+    AwaitingName,
+    /// 已捕获函数名，正在缓冲 body 直到 `</function>`（期间不外显任何字符）。
+    InBody {
+        name: String,
+    },
+}
+
+/// 流式抑制 Hermes / Qwen 风格的 XML tool call（`<function=NAME>...</function>`，
+/// 可被 `<tool_call>` 包裹），在生成期间就把这段标记从可见输出里剥掉，并即时
+/// 转换成与 `<|tool_call_begin|>` 相同的 Begin/Args/End 事件交由统一管线渲染。
+/// 这样模型每轮调用工具时，终端不会先闪现一段 `<function=...>` 原始标记。
+#[derive(Default)]
+pub(super) struct HermesXmlToolCallStreamer {
+    pending: String,
+    phase: HermesXmlPhase,
+}
+
+impl HermesXmlToolCallStreamer {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn push(&mut self, chunk: &str) -> (String, Vec<InternalToolCallStreamEvent>) {
+        self.pending.push_str(chunk);
+        let mut cleaned = String::new();
+        let mut events = Vec::new();
+
+        loop {
+            match &self.phase {
+                HermesXmlPhase::Idle => {
+                    let candidates = [FN_OPEN_MARKER, TC_OPEN_MARKER, TC_CLOSE_MARKER];
+                    match earliest_substring_match(&self.pending, &candidates) {
+                        Some((pos, idx, len)) => {
+                            // marker 之前的内容是正常可见文本；但紧邻 marker 的尾随
+                            // 空白只是包裹/调用前的噪声，去掉以免出现多余空行。
+                            let before = self.pending[..pos]
+                                .trim_end_matches([' ', '\t', '\r', '\n']);
+                            cleaned.push_str(before);
+                            let after = pos + len;
+                            self.pending.drain(..after);
+                            if candidates[idx] == FN_OPEN_MARKER {
+                                self.phase = HermesXmlPhase::AwaitingName;
+                            }
+                            // `<tool_call>` / `</tool_call>` 仅作包裹标记，直接抑制后继续。
+                            continue;
+                        }
+                        None => {
+                            // 仅保留可能是 marker 前缀的尾巴，其余安全外显。
+                            let mut keep = longest_marker_suffix_prefix(&self.pending, &candidates);
+                            // 若正握着一个潜在 marker 前缀，则把紧邻其前的空白也一起
+                            // 暂存，避免 `<tool_call>\n<func` 这类拆包时把中间的 `\n`
+                            // 先闪出来。空白只是被推迟一帧，顺序不变。
+                            if keep > 0 {
+                                let head = &self.pending[..self.pending.len() - keep];
+                                let trimmed = head.trim_end_matches([' ', '\t', '\r', '\n']);
+                                keep += head.len() - trimmed.len();
+                            }
+                            let emit_len = self.pending.len().saturating_sub(keep);
+                            if emit_len > 0 {
+                                cleaned.push_str(&self.pending[..emit_len]);
+                                self.pending.drain(..emit_len);
+                            }
+                            break;
+                        }
+                    }
+                }
+                HermesXmlPhase::AwaitingName => {
+                    if let Some(pos) = self.pending.find('>') {
+                        let name = self.pending[..pos].trim().to_string();
+                        self.pending.drain(..pos + 1);
+                        self.phase = HermesXmlPhase::InBody { name };
+                        continue;
+                    }
+                    // 函数名尚未完整到达，等待后续 chunk（不外显半截名字）。
+                    break;
+                }
+                HermesXmlPhase::InBody { name } => {
+                    if let Some(pos) = self.pending.find(FN_CLOSE_MARKER) {
+                        let body = self.pending[..pos].to_string();
+                        let after = pos + FN_CLOSE_MARKER.len();
+                        self.pending.drain(..after);
+                        let name = name.clone();
+                        if !name.is_empty() {
+                            let args = super::runtime::parse_hermes_function_body(&body)
+                                .unwrap_or_else(|| "{}".to_string());
+                            events.push(InternalToolCallStreamEvent::Begin(name));
+                            events.push(InternalToolCallStreamEvent::Args(args));
+                            events.push(InternalToolCallStreamEvent::End);
+                        }
+                        self.phase = HermesXmlPhase::Idle;
+                        continue;
+                    }
+                    // body 未闭合，整体继续缓冲（不外显），等待 `</function>`。
+                    break;
+                }
+            }
+        }
+
+        (cleaned, events)
+    }
+}
+
 fn sanitize_internal_tool_call_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
@@ -504,9 +616,80 @@ fn parse_tool_call_args(s: &str) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        InternalToolCallStreamEvent, InternalToolCallStreamer, StreamSplitSegment, StreamSplitter,
-        WrappedSplitSegment, extract_internal_tool_calls, split_wrapped_markers,
+        HermesXmlToolCallStreamer, InternalToolCallStreamEvent, InternalToolCallStreamer,
+        StreamSplitSegment, StreamSplitter, WrappedSplitSegment, extract_internal_tool_calls,
+        split_wrapped_markers,
     };
+
+    #[test]
+    fn hermes_streamer_suppresses_markup_and_emits_events_single_chunk() {
+        let mut s = HermesXmlToolCallStreamer::new();
+        let (cleaned, events) =
+            s.push("<tool_call><function=read_file>{\"path\":\"/x\"}</function></tool_call>");
+        assert_eq!(cleaned, "", "markup must not appear in visible output");
+        assert_eq!(
+            events,
+            vec![
+                InternalToolCallStreamEvent::Begin("read_file".to_string()),
+                InternalToolCallStreamEvent::Args("{\"path\":\"/x\"}".to_string()),
+                InternalToolCallStreamEvent::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn hermes_streamer_emits_visible_text_before_call() {
+        let mut s = HermesXmlToolCallStreamer::new();
+        let (cleaned, events) = s.push("done.<function=list_agents></function>");
+        assert_eq!(cleaned, "done.");
+        assert_eq!(events.first(), Some(&InternalToolCallStreamEvent::Begin("list_agents".to_string())));
+        // 无参数 → 空对象。
+        assert!(events.contains(&InternalToolCallStreamEvent::Args("{}".to_string())));
+    }
+
+    #[test]
+    fn hermes_streamer_holds_markup_split_across_chunks() {
+        let mut s = HermesXmlToolCallStreamer::new();
+        // marker 被切成两半到达，中途不得外显任何半截标记。
+        let (c1, e1) = s.push("<tool_call>\n<func");
+        assert_eq!(c1, "");
+        assert!(e1.is_empty());
+        let (c2, e2) = s.push("tion=read_file>\n{\"path\":");
+        assert_eq!(c2, "", "body must be buffered, not shown");
+        assert!(e2.is_empty(), "no events until </function> arrives");
+        let (c3, e3) = s.push("\"/x\"}\n</function>\n</tool_call>");
+        assert_eq!(c3, "");
+        assert_eq!(
+            e3,
+            vec![
+                InternalToolCallStreamEvent::Begin("read_file".to_string()),
+                InternalToolCallStreamEvent::Args("{\"path\":\"/x\"}".to_string()),
+                InternalToolCallStreamEvent::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn hermes_streamer_passes_through_plain_prose() {
+        let mut s = HermesXmlToolCallStreamer::new();
+        let (cleaned, events) = s.push("just some normal text with a < bracket and 2 < 3");
+        assert_eq!(cleaned, "just some normal text with a < bracket and 2 < 3");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn hermes_streamer_handles_parameter_tags() {
+        let mut s = HermesXmlToolCallStreamer::new();
+        let (cleaned, events) =
+            s.push("<function=read_file><parameter=path>/x</parameter></function>");
+        assert_eq!(cleaned, "");
+        assert_eq!(events[0], InternalToolCallStreamEvent::Begin("read_file".to_string()));
+        let InternalToolCallStreamEvent::Args(args) = &events[1] else {
+            panic!("expected args event");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(args).unwrap();
+        assert_eq!(parsed["path"], "/x");
+    }
 
     #[test]
     fn push_splits_marker_and_text_in_same_chunk() {

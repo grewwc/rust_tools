@@ -24,6 +24,7 @@ use super::{
 use crate::ai::driver::print::{
     format_tool_output_prefix, print_tool_note_line, print_tool_output_block, sanitize_for_terminal,
 };
+use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
 /// 适合"中段按行裁剪"的工具：输出本身是搜索/列表类（head+命中+tail 信息密度高、
 /// 中段冗余多）。read_file / read_file_lines 不在此列——agent 显式要求读这些行，
@@ -227,7 +228,14 @@ struct TerminalToolObserver<'a> {
     pending_utf8: Vec<u8>,
     at_line_start: bool,
     streamed_any_output: bool,
+    // 流式输出折叠状态
+    fold_total_lines: usize,
+    fold_recent_lines: std::collections::VecDeque<String>,
+    fold_current_line: String,
+    fold_window_rows: usize,
 }
+
+const TOOL_OUTPUT_FOLD_MAX_VISIBLE: usize = 8;
 
 impl<'a> TerminalToolObserver<'a> {
     fn new(app: &'a App) -> Self {
@@ -237,6 +245,10 @@ impl<'a> TerminalToolObserver<'a> {
             pending_utf8: Vec::new(),
             at_line_start: true,
             streamed_any_output: false,
+            fold_total_lines: 0,
+            fold_recent_lines: std::collections::VecDeque::new(),
+            fold_current_line: String::new(),
+            fold_window_rows: 0,
         }
     }
 
@@ -245,29 +257,80 @@ impl<'a> TerminalToolObserver<'a> {
         self.pending_utf8.clear();
         self.at_line_start = true;
         self.streamed_any_output = false;
+        self.fold_total_lines = 0;
+        self.fold_recent_lines.clear();
+        self.fold_current_line.clear();
+        self.fold_window_rows = 0;
     }
 
     fn push_stream_text(&mut self, text: &str) {
+        use std::io::Write;
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         let sanitized = sanitize_for_terminal(&normalized);
-        let mut rendered = String::new();
+
         for ch in sanitized.chars() {
-            if self.at_line_start {
-                rendered.push_str(&format_tool_output_prefix());
-                self.at_line_start = false;
-            }
             if ch == '\n' {
-                rendered.push_str("\x1b[0m\n");
-                self.at_line_start = true;
+                // 完成一行
+                self.fold_total_lines += 1;
+                let completed_line = std::mem::take(&mut self.fold_current_line);
+                self.fold_recent_lines.push_back(completed_line);
+                while self.fold_recent_lines.len() > TOOL_OUTPUT_FOLD_MAX_VISIBLE {
+                    self.fold_recent_lines.pop_front();
+                }
+
+                if self.fold_total_lines <= TOOL_OUTPUT_FOLD_MAX_VISIBLE {
+                    // 还没超限，正常输出换行
+                    print!("\x1b[0m\n");
+                    self.at_line_start = true;
+                } else {
+                    // 超限：覆盖底部滚动窗口
+                    self.tool_output_fold_redraw();
+                    self.at_line_start = true;
+                }
             } else {
-                rendered.push(ch);
+                if self.at_line_start {
+                    print!("{}", format_tool_output_prefix());
+                    self.at_line_start = false;
+                }
+                self.fold_current_line.push(ch);
+                print!("{ch}");
             }
         }
-        if !rendered.is_empty() {
-            print!("{rendered}");
+        if !sanitized.is_empty() {
             let _ = std::io::stdout().flush();
             self.streamed_any_output = true;
         }
+    }
+
+    /// 覆盖底部滚动窗口：折叠指示器 + 最近 N 行
+    fn tool_output_fold_redraw(&mut self) {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+
+        let erase_rows = if self.fold_window_rows == 0 {
+            // 首次折叠：回退之前正常打印的行数 + 当前行
+            TOOL_OUTPUT_FOLD_MAX_VISIBLE + 1
+        } else {
+            // 后续折叠：回退窗口 + 当前流式行
+            self.fold_window_rows + 1
+        };
+
+        if erase_rows > 0 {
+            let _ = write!(out, "\x1b[{}A\r\x1b[0J", erase_rows);
+        }
+
+        let folded_count = self.fold_total_lines.saturating_sub(TOOL_OUTPUT_FOLD_MAX_VISIBLE);
+        let _ = write!(
+            out,
+            "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded_count} lines folded ···\x1b[0m\n"
+        );
+
+        for line in &self.fold_recent_lines {
+            let _ = write!(out, "{}{}\x1b[0m\n", format_tool_output_prefix(), line);
+        }
+
+        let _ = out.flush();
+        self.fold_window_rows = 1 + self.fold_recent_lines.len();
     }
 
     fn flush_pending_utf8(&mut self) {

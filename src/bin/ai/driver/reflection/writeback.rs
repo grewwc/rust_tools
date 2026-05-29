@@ -73,7 +73,7 @@ fn sync_agent_entry_to_vector(entry: &AgentMemoryEntry) {
 }
 
 pub(super) async fn maybe_write_back_project_knowledge(
-    _app: &mut App,
+    app: &mut App,
     model: &str,
     question: &str,
     answer: &str,
@@ -113,7 +113,47 @@ pub(super) async fn maybe_write_back_project_knowledge(
         .unwrap_or_else(|| model.to_string());
     let q_s = q.to_string();
     let a_s = a.to_string();
-    run_project_knowledge_writeback_background(project_name, model_s, q_s, a_s).await;
+
+    // 项目知识写回需要一次 LLM 调用（默认 timeout 3s）。过去这里直接 `.await`，
+    // 会在用户已看到流式答案后、返回输入提示符之前阻塞整个 turn —— 对几乎每个
+    // 用到仓库检查类工具（read_file/grep 等）的回合都生效，造成"答案已出却迟迟
+    // 不能继续输入"的明显卡顿。改为登记 daemon 后台执行，与 self-reflection /
+    // critic-revise 的后台模式保持一致；dedup 缓存已在上方同步写入，不会重复 spawn。
+    use aios_kernel::primitives::DaemonKind;
+    let kernel = app.os.clone();
+    let (handle, cancel_token, interrupt_futex) = {
+        let mut os = match kernel.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let parent_pid = os.current_process_id();
+        let (handle, cancel_token) = os.daemon_register(
+            format!("project_writeback:{project_name}"),
+            DaemonKind::Reflection,
+            parent_pid,
+        );
+        let interrupt_futex =
+            crate::ai::driver::signal::alloc_interrupt_futex("project_writeback_interrupt");
+        (handle, cancel_token, interrupt_futex)
+    };
+
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = crate::ai::driver::signal::wait_for_interrupt_sources(
+                Some(cancel_token.clone()),
+                interrupt_futex,
+            ) => {}
+            _ = run_project_knowledge_writeback_background(project_name, model_s, q_s, a_s) => {}
+        }
+        let mut os = match kernel.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        os.daemon_exit(handle, None);
+        if let Some(addr) = interrupt_futex {
+            crate::ai::driver::signal::destroy_interrupt_futex(addr);
+        }
+    });
 }
 
 #[derive(Debug)]
