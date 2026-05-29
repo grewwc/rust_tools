@@ -28,6 +28,12 @@ pub struct ModelDef {
     /// 用于 driver 的动态压缩预算估算；缺省时按 quality_tier 回退。
     #[serde(default, alias = "context_window", alias = "max_context_tokens")]
     pub context_window_tokens: Option<usize>,
+    /// 子 agent 模型选择优先级（越大越优先）。同 tier 内按此值降序排列。
+    /// 缺省为 0，用户可在 ~/.config/rust_tools/models.json 中覆盖以调整偏好，
+    /// 无需重新编译。
+    #[serde(default)]
+    pub subagent_priority: i32,
+
     /// 可选：默认推理强度档位。仅对 OpenAI/OpenCode 兼容协议生效，
     /// `Compatible` provider 会忽略。CLI / `/model effort` 命令的覆盖优先级
     /// 高于这里。

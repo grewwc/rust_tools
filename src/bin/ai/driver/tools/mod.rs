@@ -1917,6 +1917,13 @@ fn execute_tool_calls_inner(
         let batch_len = parallel_safe_batch_len(mcp_client, &tool_calls[idx..]);
         if batch_len >= 2 {
             let batch = &tool_calls[idx..idx + batch_len];
+            for tool_call in batch.iter() {
+                crate::ai::driver::hooks::run_lifecycle_hook(
+                    crate::ai::driver::hooks::HookEvent::BeforeTool,
+                    Some(&tool_call.function.name),
+                    None,
+                );
+            }
             let batch_results = run_parallel_readonly_batch(
                 mcp_client,
                 shared_mcp_client,
@@ -1929,6 +1936,11 @@ fn execute_tool_calls_inner(
                 cached_hits.push(run_result.cached);
                 notify_tool_finished(&mut observer, tool_call, &run_result);
                 print_run_status(tool_call, &run_result);
+                crate::ai::driver::hooks::run_lifecycle_hook(
+                    crate::ai::driver::hooks::HookEvent::AfterTool,
+                    Some(&tool_call.function.name),
+                    Some(run_result.ok),
+                );
                 tool_results.push(run_result.tool_result);
             }
             idx += batch_len;
@@ -1937,6 +1949,11 @@ fn execute_tool_calls_inner(
 
         let tool_call = &tool_calls[idx];
         let is_last = idx + 1 >= tool_calls.len();
+        crate::ai::driver::hooks::run_lifecycle_hook(
+            crate::ai::driver::hooks::HookEvent::BeforeTool,
+            Some(&tool_call.function.name),
+            None,
+        );
         let (route, run_result) = run_one(
             mcp_client,
             shared_mcp_client,
@@ -1955,6 +1972,11 @@ fn execute_tool_calls_inner(
         cached_hits.push(run_result.cached);
         notify_tool_finished(&mut observer, tool_call, &run_result);
         print_run_status(tool_call, &run_result);
+        crate::ai::driver::hooks::run_lifecycle_hook(
+            crate::ai::driver::hooks::HookEvent::AfterTool,
+            Some(&tool_call.function.name),
+            Some(run_result.ok),
+        );
         tool_results.push(run_result.tool_result);
 
         if should_barrier && !is_last {

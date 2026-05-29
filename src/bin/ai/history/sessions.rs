@@ -49,6 +49,12 @@ impl SessionStore {
         self.root.join(format!("{id}.assets"))
     }
 
+    /// 该 session 的 checkpoint 存放目录：`<sessions_root>/checkpoints/<id>/`。
+    pub(in crate::ai) fn checkpoints_dir(&self, session_id: &str) -> PathBuf {
+        let id = sanitize_session_id(session_id);
+        self.root.join("checkpoints").join(id)
+    }
+
     pub(in crate::ai) fn list_sessions(&self) -> io::Result<Vec<SessionInfo>> {
         let entries = match fs::read_dir(&self.root) {
             Ok(v) => v,

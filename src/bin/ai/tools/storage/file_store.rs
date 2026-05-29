@@ -24,6 +24,12 @@ impl FileStore {
                 "Access blocked: sensitive path",
             ));
         }
+        if !path_within_allowed_roots(&self.path) {
+            return Err(AiError::file(
+                self.path.display().to_string(),
+                "Access blocked: path is outside the sandbox allowed roots (ai.sandbox.allowed_roots)",
+            ));
+        }
         Ok(())
     }
 
@@ -114,6 +120,12 @@ fn is_sensitive_fs_path(path: &Path) -> bool {
     {
         return true;
     }
+    // 用户在 `ai.sandbox.extra_sensitive_paths` 中追加的敏感子串。
+    for needle in config_extra_sensitive_substrings() {
+        if rendered.contains(&needle) {
+            return true;
+        }
+    }
     let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
         return false;
     };
@@ -133,3 +145,132 @@ fn is_sensitive_fs_path(path: &Path) -> bool {
             | "config.json"
     )
 }
+
+/// 词法归一化路径：解析 `.`/`..` 而不触盘（路径可能尚不存在，如写入新文件）。
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+/// 读取 `ai.sandbox.extra_sensitive_paths`（逗号分隔，去空白）。
+fn config_extra_sensitive_substrings() -> Vec<String> {
+    let raw = crate::commonw::configw::get_all_config()
+        .get(crate::ai::config_schema::AiConfig::SANDBOX_EXTRA_SENSITIVE_PATHS, "");
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 当 `ai.sandbox.allowed_roots` 非空时，文件路径必须位于其中某个根之下。
+/// 为空（默认）时不施加额外限制，保持既有行为。
+fn path_within_allowed_roots(path: &Path) -> bool {
+    let raw = crate::commonw::configw::get_all_config()
+        .get(crate::ai::config_schema::AiConfig::SANDBOX_ALLOWED_ROOTS, "");
+    let roots: Vec<PathBuf> = raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| normalize_lexical(Path::new(s)))
+        .collect();
+    if roots.is_empty() {
+        return true;
+    }
+    // 相对路径基于 effective_cwd 解析为绝对路径后再归一化。
+    let base =
+        crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."));
+    path_within_roots(path, &base, &roots)
+}
+
+/// 纯函数：归一化 `path`（相对则基于 `base`）后判断是否落在任一 `roots` 之下。
+fn path_within_roots(path: &Path, base: &Path, roots: &[PathBuf]) -> bool {
+    if roots.is_empty() {
+        return true;
+    }
+    let resolved = if path.is_absolute() {
+        normalize_lexical(path)
+    } else {
+        normalize_lexical(&base.join(path))
+    };
+    roots.iter().any(|root| resolved.starts_with(root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_sensitive_fs_path, normalize_lexical, path_within_roots};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn normalize_lexical_resolves_dot_and_dotdot() {
+        assert_eq!(
+            normalize_lexical(Path::new("/home/user/proj/../proj/./src")),
+            PathBuf::from("/home/user/proj/src")
+        );
+    }
+
+    #[test]
+    fn path_within_roots_empty_allows_everything() {
+        assert!(path_within_roots(
+            Path::new("/anywhere/file.txt"),
+            Path::new("/base"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn path_within_roots_accepts_inside_and_rejects_outside() {
+        let roots = vec![PathBuf::from("/home/user/proj")];
+        assert!(path_within_roots(
+            Path::new("/home/user/proj/src/main.rs"),
+            Path::new("/home/user/proj"),
+            &roots
+        ));
+        // 越界绝对路径
+        assert!(!path_within_roots(
+            Path::new("/etc/passwd"),
+            Path::new("/home/user/proj"),
+            &roots
+        ));
+        // 通过 `..` 逃逸应被归一化后拦截
+        assert!(!path_within_roots(
+            Path::new("/home/user/proj/../secret"),
+            Path::new("/home/user/proj"),
+            &roots
+        ));
+    }
+
+    #[test]
+    fn path_within_roots_resolves_relative_against_base() {
+        let roots = vec![PathBuf::from("/home/user/proj")];
+        assert!(path_within_roots(
+            Path::new("src/lib.rs"),
+            Path::new("/home/user/proj"),
+            &roots
+        ));
+        assert!(!path_within_roots(
+            Path::new("../other/x"),
+            Path::new("/home/user/proj"),
+            &roots
+        ));
+    }
+
+    #[test]
+    fn sensitive_path_blocks_known_secrets() {
+        assert!(is_sensitive_fs_path(Path::new("/home/u/.ssh/id_rsa")));
+        assert!(is_sensitive_fs_path(Path::new("/home/u/.aws/credentials")));
+        assert!(!is_sensitive_fs_path(Path::new("/home/u/proj/src/main.rs")));
+    }
+}
+
+

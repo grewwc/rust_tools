@@ -1,9 +1,51 @@
 use serde_json::Value;
 use std::process::Output;
 
+use crate::ai::config_schema::AiConfig;
 use crate::ai::tools::storage::command_runner;
 
 const MAX_COMMAND_OUTPUT_CHARS: usize = 16_000;
+
+/// 内置默认超时与上限（秒），可被 sandbox 配置覆盖。
+const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_COMMAND_TIMEOUT_MAX_SECS: u64 = 300;
+
+/// 读取用户在 `ai.sandbox.blocked_commands` 中追加的禁用程序名（小写、去空白）。
+fn config_blocked_commands() -> Vec<String> {
+    let raw = crate::commonw::configw::get_all_config().get(AiConfig::SANDBOX_BLOCKED_COMMANDS, "");
+    raw.split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 返回 `execute_command` 的 (默认超时, 超时上限)，由 sandbox 配置覆盖。
+/// 非法/缺省值回退到内置常量；上限至少为 1 秒且不小于默认值。
+fn config_command_timeout_bounds() -> (u64, u64) {
+    let cfg = crate::commonw::configw::get_all_config();
+    let default_timeout = cfg
+        .get(AiConfig::SANDBOX_COMMAND_TIMEOUT_DEFAULT, "")
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|v| *v >= 1)
+        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS);
+    let max_timeout = cfg
+        .get(AiConfig::SANDBOX_COMMAND_TIMEOUT_MAX, "")
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|v| *v >= 1)
+        .unwrap_or(DEFAULT_COMMAND_TIMEOUT_MAX_SECS)
+        .max(default_timeout);
+    (default_timeout, max_timeout)
+}
+
+/// 纯函数：把请求的超时秒数夹在 `[1, max]` 范围内，缺省时用 `default`。
+fn resolve_command_timeout(requested: Option<u64>, default: u64, max: u64) -> u64 {
+    requested.unwrap_or(default).clamp(1, max)
+}
+
 
 fn truncate_chars(content: &str, max_chars: usize) -> String {
     if content.chars().count() <= max_chars {
@@ -325,6 +367,13 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         return Err(format!("program '{program}' is blocked"));
     }
 
+    // 用户可通过 `ai.sandbox.blocked_commands` 追加自定义黑名单程序。
+    if config_blocked_commands().iter().any(|p| p == &program) {
+        return Err(format!(
+            "program '{program}' is blocked by sandbox policy (ai.sandbox.blocked_commands)"
+        ));
+    }
+
     // 拦下 `bash -c "..."` / `sh -c` / `zsh -c` 这种"二次解释"形式。
     // 直接执行脚本（`bash script.sh`）仍然允许，避免破坏正常工作流。
     if matches!(program.as_str(), "bash" | "sh" | "zsh" | "ksh" | "dash") {
@@ -386,7 +435,8 @@ where
 {
     let command = args["command"].as_str().ok_or("Missing command")?;
     let cwd = args["cwd"].as_str().filter(|dir| !dir.trim().is_empty());
-    let timeout = args["timeout"].as_u64().unwrap_or(60).clamp(1, 300);
+    let (default_timeout, max_timeout) = config_command_timeout_bounds();
+    let timeout = resolve_command_timeout(args["timeout"].as_u64(), default_timeout, max_timeout);
 
     if let Err(reason) = validate_execute_command(command) {
         return Ok(format!("Command blocked: {reason}"));
@@ -409,7 +459,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{split_unquoted_segments, validate_no_injection_surface};
+    use super::{resolve_command_timeout, split_unquoted_segments, validate_no_injection_surface};
+
+    // ---- resolve_command_timeout ----
+
+    #[test]
+    fn timeout_uses_default_when_unset() {
+        assert_eq!(resolve_command_timeout(None, 60, 300), 60);
+    }
+
+    #[test]
+    fn timeout_clamps_to_max_and_floor() {
+        assert_eq!(resolve_command_timeout(Some(10_000), 60, 300), 300);
+        assert_eq!(resolve_command_timeout(Some(0), 60, 300), 1);
+        assert_eq!(resolve_command_timeout(Some(120), 60, 300), 120);
+    }
 
     // ---- split_unquoted_segments ----
 

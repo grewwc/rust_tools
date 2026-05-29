@@ -274,6 +274,7 @@ fn finalize_stream_response(
             echoed_model
         };
         let _ = crate::ai::request::charge_llm_usage_to_kernel(app, &model_for_pricing, &usage, 0);
+        maybe_print_prompt_cache_metrics(&usage);
     }
 
     let mut tool_calls = collect_valid_tool_calls(&mut state.content.tool_calls_map);
@@ -313,6 +314,40 @@ fn finalize_stream_response(
         reasoning_text: state.content.reasoning_text,
         skip_response_drain: true,
     })
+}
+
+/// 当开启 `ai.prompt_cache.show_metrics`（默认开）且本次请求命中了 prompt
+/// 缓存时，打印一行缓存命中指标。OpenAI / DashScope 等是服务端自动缓存，
+/// 这里只是把它们已经上报的 `cached_tokens` 可视化出来。
+fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::StreamUsage) {
+    let show = crate::commonw::configw::get_all_config()
+        .get(crate::ai::config_schema::AiConfig::PROMPT_CACHE_SHOW_METRICS, "true")
+        .trim()
+        .eq_ignore_ascii_case("true");
+    if !show {
+        return;
+    }
+    let cached = usage
+        .prompt_tokens_details
+        .as_ref()
+        .map(|d| d.cached_tokens)
+        .unwrap_or(0);
+    if let Some(line) = format_prompt_cache_metrics(usage.prompt_tokens, cached) {
+        use colored::Colorize;
+        println!("{}", line.dimmed());
+    }
+}
+
+/// 纯函数：根据 prompt_tokens / cached_tokens 生成可读的缓存命中行。
+/// 仅当确实有缓存命中（cached > 0）时返回 Some，避免无意义噪声。
+fn format_prompt_cache_metrics(prompt_tokens: u64, cached_tokens: u64) -> Option<String> {
+    if cached_tokens == 0 || prompt_tokens == 0 {
+        return None;
+    }
+    let pct = (cached_tokens as f64 / prompt_tokens as f64 * 100.0).min(100.0);
+    Some(format!(
+        "[prompt cache] {cached_tokens}/{prompt_tokens} prompt tokens cached ({pct:.0}% hit)"
+    ))
 }
 
 /// 尝试把整段 assistant 文本反向识别为一个/多个 tool_call。仅在文本经过
@@ -1143,6 +1178,19 @@ mod tests {
     use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
+
+    #[test]
+    fn prompt_cache_metrics_none_without_hit() {
+        assert_eq!(format_prompt_cache_metrics(1000, 0), None);
+        assert_eq!(format_prompt_cache_metrics(0, 0), None);
+    }
+
+    #[test]
+    fn prompt_cache_metrics_reports_hit_rate() {
+        let line = format_prompt_cache_metrics(1000, 750).unwrap();
+        assert!(line.contains("750/1000"));
+        assert!(line.contains("75% hit"));
+    }
 
     fn test_app() -> App {
         App {

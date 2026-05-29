@@ -846,7 +846,10 @@ pub(super) async fn do_request_messages(
 ) -> Result<Response, RequestError> {
     clear_stale_request_interrupt_before_request(app);
 
-    let normalized_messages = normalize_messages_for_request(messages);
+    let mut normalized_messages = normalize_messages_for_request(messages);
+    if prompt_cache_enabled() {
+        apply_prompt_cache_breakpoint(&mut normalized_messages);
+    }
     let (tools_value, tool_choice) = agent_tools_for_request(app, model);
     let thinking_start = Instant::now();
     let force_thinking_requested = app.cli.thinking || config_forces_thinking();
@@ -1651,6 +1654,38 @@ fn build_request_body<'a>(
     }
 }
 
+/// 是否开启 opt-in 的 prompt cache 断点注入（`ai.prompt_cache.enable`，默认关）。
+/// 仅对 Anthropic 兼容网关（如 OpenRouter 转发的 Claude）有实际意义；OpenAI /
+/// DashScope 等是服务端自动缓存，无需也不应注入 `cache_control`。
+fn prompt_cache_enabled() -> bool {
+    crate::commonw::configw::get_all_config()
+        .get(crate::ai::config_schema::AiConfig::PROMPT_CACHE_ENABLE, "false")
+        .trim()
+        .eq_ignore_ascii_case("true")
+}
+
+/// 把首条 system / internal_note 消息的纯文本内容改写为带 `cache_control`
+/// 的内容块数组，作为 Anthropic 兼容网关的 prompt 缓存断点。仅在内容当前是
+/// 字符串时转换，幂等且不会触碰其它消息。
+fn apply_prompt_cache_breakpoint(messages: &mut [Message]) {
+    for message in messages.iter_mut() {
+        if !is_system_like_role(&message.role) {
+            continue;
+        }
+        if let Value::String(text) = &message.content {
+            message.content = json!([
+                {
+                    "type": "text",
+                    "text": text,
+                    "cache_control": { "type": "ephemeral" }
+                }
+            ]);
+        }
+        // 只在第一条 system-like 消息上设置断点即可。
+        break;
+    }
+}
+
 /// 解析当前会话生效的推理强度档位，按优先级从高到低：
 /// 1. CLI 参数 `--reasoning-effort` 或 `/model effort <x>` 留下的覆盖
 ///    （存储在 [`App.cli.reasoning_effort_override`]，其中 `Some(None)`
@@ -2045,6 +2080,49 @@ mod tests {
     use crate::ai::{cli::ParsedCli, types::AppConfig};
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn prompt_cache_breakpoint_wraps_first_system_message() {
+        let mut messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: Value::String("you are helpful".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String("hi".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+        apply_prompt_cache_breakpoint(&mut messages);
+
+        // 第一条 system 消息被改写为内容块数组并带 cache_control。
+        let blocks = messages[0].content.as_array().expect("array content");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "you are helpful");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        // user 消息保持原样。
+        assert_eq!(messages[1].content, Value::String("hi".to_string()));
+    }
+
+    #[test]
+    fn prompt_cache_breakpoint_noop_without_system_message() {
+        let mut messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("hi".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        apply_prompt_cache_breakpoint(&mut messages);
+        assert_eq!(messages[0].content, Value::String("hi".to_string()));
+    }
 
     fn test_app() -> App {
         App {

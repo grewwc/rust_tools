@@ -284,93 +284,8 @@ pub(super) fn auto_subagent_model_for_agent(
 ) -> String {
     let difficulty = classify_subagent_task_difficulty(description, prompt);
     let target_tier = merge_agent_tier_with_difficulty(agent_model_tier(agent), difficulty);
-    // preferred_keys 必须与 models.json 中真实存在的 key 对齐，否则 find_by_key
-    // 会静默 None，这里的偏好就完全失效。新增/重命名时记得同步更新启动日志
-    // log_subagent_preferred_keys_health()。
-    match target_tier {
-        ModelStrengthTier::Light => pick_subagent_model(
-            &["DEEPSEEK_V3", "KIMI", "GLM 5.1", "MINIMAX"],
-            false,
-            target_tier,
-        ),
-        ModelStrengthTier::Standard => pick_subagent_model(
-            &[
-                "QWEN_PLUS_LATEST",
-                "KIMI",
-                "GLM 5.1",
-                "MINIMAX",
-                "DEEPSEEK_V3",
-            ],
-            true,
-            target_tier,
-        ),
-        ModelStrengthTier::Heavy => pick_subagent_model(
-            &[
-                "QWEN3_MAX",
-                "QWEN_PLUS_LATEST",
-                "MINIMAX",
-                "GLM 5.1",
-                "KIMI",
-            ],
-            true,
-            target_tier,
-        ),
-    }
-}
-
-/// 子 agent 模型选择策略中所有 tier 用到的 preferred_keys 集合，启动时
-/// 用来做存在性体检。请保持与 auto_subagent_model_for_agent 中的列表一致。
-fn subagent_preferred_keys_all() -> &'static [(&'static str, &'static [&'static str])] {
-    &[
-        ("Light", &["DEEPSEEK_V3", "KIMI", "GLM 5.1", "MINIMAX"]),
-        (
-            "Standard",
-            &[
-                "QWEN_PLUS_LATEST",
-                "KIMI",
-                "GLM 5.1",
-                "MINIMAX",
-                "DEEPSEEK_V3",
-            ],
-        ),
-        (
-            "Heavy",
-            &[
-                "QWEN3_MAX",
-                "QWEN_PLUS_LATEST",
-                "MINIMAX",
-                "GLM 5.1",
-                "KIMI",
-            ],
-        ),
-    ]
-}
-
-/// 启动时检查子 agent 模型偏好列表中是否有 key 在 models.json 中不存在，
-/// 把缺失的 key 打一行警告，方便在删除/重命名模型时及时发现配置漂移。
-/// 永远不会 panic 或退出：缺失只会让对应 tier 自动降级到下一候选或全局
-/// fallback，不应阻塞启动。
-pub(super) fn log_subagent_preferred_keys_health() {
-    let mut missing: Vec<(&'static str, &'static str)> = Vec::new();
-    for (tier, keys) in subagent_preferred_keys_all() {
-        for key in *keys {
-            if model_names::find_by_key(key).is_none() {
-                missing.push((tier, *key));
-            }
-        }
-    }
-    if missing.is_empty() {
-        return;
-    }
-    let mut msg =
-        String::from("[models] subagent preferred_keys missing in models.json (will fallback): ");
-    for (i, (tier, key)) in missing.iter().enumerate() {
-        if i > 0 {
-            msg.push_str(", ");
-        }
-        msg.push_str(&format!("{}::{}", tier, key));
-    }
-    eprintln!("{}", msg);
+    let require_thinking = !matches!(target_tier, ModelStrengthTier::Light);
+    pick_subagent_model(require_thinking, target_tier)
 }
 
 fn agent_model_tier(agent: &AgentManifest) -> ModelStrengthTier {
@@ -488,37 +403,42 @@ fn classify_subagent_task_difficulty(description: &str, prompt: &str) -> Subagen
     SubagentTaskDifficulty::Standard
 }
 
-fn pick_subagent_model(
-    preferred_keys: &[&str],
-    require_thinking: bool,
-    target_tier: ModelStrengthTier,
-) -> String {
-    let preferred = preferred_keys
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, key)| model_names::find_by_key(key).map(|model| (idx, model)))
-        .filter(|(_, model)| subagent_model_eligible(model, require_thinking))
-        .collect::<Vec<_>>();
-    if let Some((_, model)) = choose_best_candidate(&preferred, target_tier) {
-        return model.name.clone();
-    }
-
-    let fallback = model_names::all()
+/// 基于 models.json 中的 subagent_priority 字段选择子 agent 模型。
+/// priority 越大越优先；同 priority 时按 quality_tier 和 target_tier 适配度排序。
+fn pick_subagent_model(require_thinking: bool, target_tier: ModelStrengthTier) -> String {
+    let mut candidates: Vec<&ModelDef> = model_names::all()
         .into_iter()
-        .enumerate()
-        .filter(|(_, model)| subagent_model_eligible(model, require_thinking))
-        .collect::<Vec<_>>();
-    if let Some((_, model)) = choose_best_candidate(&fallback, target_tier) {
+        .filter(|model| subagent_model_eligible(model, require_thinking))
+        .collect();
+
+    // 按 (满足 target_tier, priority, quality_tier) 降序排列
+    candidates.sort_by(|a, b| {
+        let a_satisfies =
+            quality_tier_satisfies_target(a.quality_tier, target_tier) as u8;
+        let b_satisfies =
+            quality_tier_satisfies_target(b.quality_tier, target_tier) as u8;
+        b_satisfies
+            .cmp(&a_satisfies)
+            .then(b.subagent_priority.cmp(&a.subagent_priority))
+            .then(b.quality_tier.cmp(&a.quality_tier))
+    });
+
+    if let Some(model) = candidates.first() {
         return model.name.clone();
     }
 
+    // fallback: 放宽 thinking 要求，只要求 tools 可用
     if require_thinking {
-        let tools_only = model_names::all()
+        let mut tools_only: Vec<&ModelDef> = model_names::all()
             .into_iter()
-            .enumerate()
-            .filter(|(_, model)| model.tools_default_enabled)
-            .collect::<Vec<_>>();
-        if let Some((_, model)) = choose_best_candidate(&tools_only, target_tier) {
+            .filter(|model| model.tools_default_enabled)
+            .collect();
+        tools_only.sort_by(|a, b| {
+            b.subagent_priority
+                .cmp(&a.subagent_priority)
+                .then(b.quality_tier.cmp(&a.quality_tier))
+        });
+        if let Some(model) = tools_only.first() {
             return model.name.clone();
         }
     }
@@ -569,34 +489,6 @@ fn default_candidate_rank(
     (
         model.quality_tier,
         model.tools_default_enabled as u8,
-        usize::MAX - preferred_index,
-    )
-}
-
-fn choose_best_candidate<'a>(
-    candidates: &[(usize, &'a ModelDef)],
-    target_tier: ModelStrengthTier,
-) -> Option<(usize, &'a ModelDef)> {
-    candidates
-        .iter()
-        .copied()
-        .max_by(|(left_idx, left), (right_idx, right)| {
-            candidate_rank(left, *left_idx, target_tier).cmp(&candidate_rank(
-                right,
-                *right_idx,
-                target_tier,
-            ))
-        })
-}
-
-fn candidate_rank(
-    model: &ModelDef,
-    preferred_index: usize,
-    target_tier: ModelStrengthTier,
-) -> (u8, ModelQualityTier, usize) {
-    (
-        quality_tier_satisfies_target(model.quality_tier, target_tier) as u8,
-        model.quality_tier,
         usize::MAX - preferred_index,
     )
 }

@@ -9,7 +9,8 @@
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
-    "enable_thinking": true
+    "enable_thinking": true,
+    "subagent_priority": 100
   },
   {
     "key": "QWEN_PLUS_LATEST",
@@ -21,7 +22,8 @@
     "search_enabled": true,
     "default_reasoning_effort": "high",
     "tools_default_enabled": true,
-    "enable_thinking": true
+    "enable_thinking": true,
+    "subagent_priority": 90
   },
   {
     "key": "QWEN3_MAX",
@@ -33,7 +35,8 @@
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,
-    "default_reasoning_effort": "high"
+    "default_reasoning_effort": "high",
+    "subagent_priority": 80
   },
   {
     "key": "KIMI",
@@ -45,7 +48,8 @@
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
-    "enable_thinking": true
+    "enable_thinking": true,
+    "subagent_priority": 70
   },
   {
     "key": "QWEN_VL_FLASH",
@@ -55,7 +59,8 @@
     "is_vl": true,
     "search_enabled": false,
     "tools_default_enabled": false,
-    "enable_thinking": false
+    "enable_thinking": false,
+    "subagent_priority": 0
   },
   {
     "key": "qwen-open",
@@ -65,7 +70,8 @@
     "is_vl": true,
     "search_enabled": true,
     "tools_default_enabled": true,
-    "enable_thinking": true
+    "enable_thinking": true,
+    "subagent_priority": 75
   },
   {
     "key": "MiniMax M2.5 Free",
@@ -75,7 +81,8 @@
     "is_vl": false,
     "search_enabled": false,
     "tools_default_enabled": true,
-    "enable_thinking": true
+    "enable_thinking": true,
+    "subagent_priority": 10
   },
   {
     "key": "GLM 5.1",
@@ -87,16 +94,7 @@
     "search_enabled": false,
     "tools_default_enabled": true,
     "default_reasoning_effort": "high",
-    "enable_thinking": false
-  },
-  {
-    "key": "MiniMax M2.5",
-    "name": "minimax-m2.5",
-    "provider": "opencode",
-    "quality_tier": "basic",
-    "is_vl": false,
-    "search_enabled": false,
-    "tools_default_enabled": true,
-    "enable_thinking": true
+    "enable_thinking": false,
+    "subagent_priority": 60
   }
 ]

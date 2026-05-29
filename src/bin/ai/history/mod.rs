@@ -1,4 +1,5 @@
 mod blob;
+mod checkpoint;
 mod compress;
 mod markdown;
 mod sessions;
@@ -27,6 +28,8 @@ pub(in crate::ai) use compress::{
 pub(in crate::ai) use markdown::messages_to_markdown;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
+#[allow(unused_imports)]
+pub(in crate::ai) use checkpoint::{CheckpointInfo, CheckpointStore};
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_messages_sqlite;
 #[allow(unused_imports)]

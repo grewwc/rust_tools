@@ -94,4 +94,49 @@ impl AiConfig {
     pub const PROJECT_WRITEBACK_ENABLE: &str = "ai.project_writeback.enable";
     pub const PROJECT_WRITEBACK_MODEL: &str = "ai.project_writeback.model";
     pub const PROJECT_WRITEBACK_TIMEOUT_MS: &str = "ai.project_writeback.timeout_ms";
+
+    // ── Sandbox ────────────────────────────────────────────
+    /// Comma-separated extra program names to block in `execute_command`
+    /// (merged with the built-in deny list). Empty = no extras.
+    pub const SANDBOX_BLOCKED_COMMANDS: &str = "ai.sandbox.blocked_commands";
+    /// Default timeout (seconds) applied to `execute_command` when the call
+    /// does not specify one. Falls back to 60 when unset/invalid.
+    pub const SANDBOX_COMMAND_TIMEOUT_DEFAULT: &str = "ai.sandbox.command_timeout_default";
+    /// Hard upper bound (seconds) for any `execute_command` timeout. Falls
+    /// back to 300 when unset/invalid.
+    pub const SANDBOX_COMMAND_TIMEOUT_MAX: &str = "ai.sandbox.command_timeout_max";
+    /// Comma-separated absolute roots that file read/write tools are confined
+    /// to. Empty = no extra confinement (preserves default behavior).
+    pub const SANDBOX_ALLOWED_ROOTS: &str = "ai.sandbox.allowed_roots";
+    /// Comma-separated extra path substrings to treat as sensitive (blocked
+    /// for file read/write), merged with the built-in sensitive list.
+    pub const SANDBOX_EXTRA_SENSITIVE_PATHS: &str = "ai.sandbox.extra_sensitive_paths";
+
+    // ── Hooks (lifecycle) ──────────────────────────────────
+    /// Shell command executed before each turn starts. Receives env
+    /// `AI_HOOK_EVENT=on_turn_start`. Empty = disabled.
+    pub const HOOK_ON_TURN_START: &str = "ai.hooks.on_turn_start";
+    /// Shell command executed after each turn finishes. Env
+    /// `AI_HOOK_EVENT=on_turn_end`. Empty = disabled.
+    pub const HOOK_ON_TURN_END: &str = "ai.hooks.on_turn_end";
+    /// Shell command executed before each tool call. Env `AI_HOOK_EVENT`,
+    /// `AI_TOOL_NAME`. Empty = disabled.
+    pub const HOOK_BEFORE_TOOL: &str = "ai.hooks.before_tool";
+    /// Shell command executed after each tool call. Env `AI_HOOK_EVENT`,
+    /// `AI_TOOL_NAME`, `AI_TOOL_OK` (true/false). Empty = disabled.
+    pub const HOOK_AFTER_TOOL: &str = "ai.hooks.after_tool";
+    /// Shell command executed when the interactive session ends. Env
+    /// `AI_HOOK_EVENT=on_session_end`. Empty = disabled.
+    pub const HOOK_ON_SESSION_END: &str = "ai.hooks.on_session_end";
+    /// Timeout (seconds) for each lifecycle hook command. Defaults to 30.
+    pub const HOOK_TIMEOUT_SECS: &str = "ai.hooks.timeout_secs";
+
+    // ── Prompt cache ───────────────────────────────────────
+    /// When true, inject an Anthropic-style `cache_control` breakpoint on the
+    /// system prompt for gateways that honor it (e.g. OpenRouter→Anthropic).
+    /// Default false (OpenAI/DashScope cache automatically server-side).
+    pub const PROMPT_CACHE_ENABLE: &str = "ai.prompt_cache.enable";
+    /// When true, print prompt-cache hit metrics (cached tokens / hit rate)
+    /// after each request when the provider reports them. Default true.
+    pub const PROMPT_CACHE_SHOW_METRICS: &str = "ai.prompt_cache.show_metrics";
 }

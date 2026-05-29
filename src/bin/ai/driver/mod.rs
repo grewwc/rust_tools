@@ -52,6 +52,7 @@ pub mod agent_router;
 pub mod commands;
 pub mod decision_log;
 pub mod embedding;
+pub mod hooks;
 pub mod input;
 pub mod intent_model;
 pub mod intent_recognition;
@@ -1076,7 +1077,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let writer =
         config::open_output_writer(cli.out.as_deref())?.map(|f| Arc::new(std::sync::Mutex::new(f)));
     let current_model = models::initial_model(&cli);
-    models::log_subagent_preferred_keys_health();
     let client = reqwest::Client::builder().build()?;
     let prompt_editor = if cli.args.is_empty() {
         Some(PromptEditor::new(
@@ -1786,6 +1786,8 @@ async fn run_loop(
             agent_manifests.clone(),
         );
 
+        hooks::run_lifecycle_hook(hooks::HookEvent::TurnStart, None, None);
+
         let turn_outcome = runtime_ctx::DRIVER_CTX
             .scope(
                 driver_ctx,
@@ -1806,6 +1808,8 @@ async fn run_loop(
                 ),
             )
             .await;
+
+        hooks::run_lifecycle_hook(hooks::HookEvent::TurnEnd, None, None);
 
         match turn_outcome {
             Ok(outcome) => {
@@ -1885,6 +1889,7 @@ async fn run_loop(
                     }
                 }
             }
+            hooks::run_lifecycle_hook(hooks::HookEvent::SessionEnd, None, None);
             cleanup_one_shot(app);
             return Ok(());
         }
