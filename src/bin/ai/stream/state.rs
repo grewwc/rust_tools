@@ -127,7 +127,7 @@ pub(super) struct ThinkingFoldState {
 impl ThinkingFoldState {
     pub(super) fn new() -> Self {
         Self {
-            max_visible_lines: 5,
+            max_visible_lines: usize::MAX,
             recent_lines: VecDeque::new(),
             current_line: String::new(),
             total_lines: 0,
