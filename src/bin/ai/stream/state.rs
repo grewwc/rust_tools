@@ -172,7 +172,13 @@ impl ToolCallBuilder {
     pub(super) fn build(self) -> ToolCall {
         ToolCall {
             id: self.id,
-            tool_type: self.tool_type,
+            // 部分 provider 在 stream delta 中不返回 type 字段，默认为 "function"
+            // 以符合 OpenAI 协议要求，避免发送 "type":"" 导致 400 错误。
+            tool_type: if self.tool_type.is_empty() {
+                "function".to_string()
+            } else {
+                self.tool_type
+            },
             function: FunctionCall {
                 name: self.function_name,
                 arguments: self.arguments,

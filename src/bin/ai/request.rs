@@ -1372,6 +1372,10 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
 
         let mut sanitized = tool_call.clone();
         sanitized.function.arguments = normalized_arguments;
+        // 确保 tool_type 不为空（部分 provider 在 stream 中不返回 type）
+        if sanitized.tool_type.is_empty() {
+            sanitized.tool_type = "function".to_string();
+        }
         Some(sanitized)
     }
 
