@@ -12,8 +12,7 @@
 //! 2-4 元 char-ngram，knowledge 端用基于词的 jaccard / dice）。如果将来要合并，
 //! 必须同时验证 routing 与召回两个 pipeline 的回归数据。
 
-use rust_tools::cw::SkipMap;
-use rust_tools::cw::SkipSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// 在 `haystack` 中按 ASCII 词边界查找 `needle`。
 ///
@@ -55,9 +54,9 @@ pub fn pattern_is_ascii_word(pattern: &str) -> bool {
 
 pub struct TextSimilarityFeatures {
     pub normalized: String,
-    pub token_set: SkipSet<String>,
-    pub char_bigrams: SkipSet<String>,
-    pub ngram_tf: SkipMap<String, f64>,
+    pub token_set: FxHashSet<String>,
+    pub char_bigrams: FxHashSet<String>,
+    pub ngram_tf: FxHashMap<String, f64>,
 }
 
 impl TextSimilarityFeatures {
@@ -95,12 +94,12 @@ pub fn normalize_text_for_similarity(input: &str) -> String {
     normalized.trim().to_string()
 }
 
-pub fn extract_ngram_tf_from_normalized(normalized: &str) -> SkipMap<String, f64> {
+pub fn extract_ngram_tf_from_normalized(normalized: &str) -> FxHashMap<String, f64> {
     if normalized.is_empty() {
-        return SkipMap::default();
+        return FxHashMap::default();
     }
     let chars = format!("^{normalized}$").chars().collect::<Vec<_>>();
-    let mut counts = SkipMap::default();
+    let mut counts = FxHashMap::default();
     for n in 2..=4 {
         if chars.len() < n {
             continue;
@@ -122,8 +121,10 @@ pub fn extract_ngram_tf_from_normalized(normalized: &str) -> SkipMap<String, f64
     counts
 }
 
-pub fn build_idf_from_documents(docs: &[&SkipMap<String, f64>]) -> SkipMap<String, f64> {
-    let mut df = SkipMap::default();
+pub fn build_idf_from_documents(docs: &[&FxHashMap<String, f64>]) -> FxHashMap<String, f64> {
+    let estimated = docs.first().map(|d| d.len()).unwrap_or(0);
+    let mut df: FxHashMap<String, usize> = FxHashMap::default();
+    df.reserve(estimated);
     for doc in docs {
         for token in doc.keys() {
             *df.entry(token.clone()).or_insert(0usize) += 1;
@@ -131,7 +132,8 @@ pub fn build_idf_from_documents(docs: &[&SkipMap<String, f64>]) -> SkipMap<Strin
     }
 
     let total_docs = docs.len().max(1) as f64;
-    let mut idf = SkipMap::default();
+    let mut idf: FxHashMap<String, f64> = FxHashMap::default();
+    idf.reserve(df.len());
     for (token, freq) in df {
         let value = ((1.0 + total_docs) / (1.0 + freq as f64)).ln() + 1.0;
         idf.insert(token, value);
@@ -140,24 +142,24 @@ pub fn build_idf_from_documents(docs: &[&SkipMap<String, f64>]) -> SkipMap<Strin
 }
 
 pub fn cosine_tfidf_similarity(
-    query_tf: &SkipMap<String, f64>,
-    doc_tf: &SkipMap<String, f64>,
-    idf: &SkipMap<String, f64>,
+    query_tf: &FxHashMap<String, f64>,
+    doc_tf: &FxHashMap<String, f64>,
+    idf: &FxHashMap<String, f64>,
 ) -> f64 {
     let mut dot = 0.0;
     let mut query_norm = 0.0;
     let mut doc_norm = 0.0;
 
     for (token, tf) in query_tf {
-        let weight = *tf * idf.get(token).unwrap_or(1.0);
+        let weight = *tf * idf.get(token).copied().unwrap_or(1.0);
         query_norm += weight * weight;
-        if let Some(doc_tf_val) = doc_tf.get(token) {
-            let doc_weight = doc_tf_val * idf.get(token).unwrap_or(1.0);
+        if let Some(doc_tf_val) = doc_tf.get(token).copied() {
+            let doc_weight = doc_tf_val * idf.get(token).copied().unwrap_or(1.0);
             dot += weight * doc_weight;
         }
     }
     for (token, tf) in doc_tf {
-        let weight = *tf * idf.get(token).unwrap_or(1.0);
+        let weight = *tf * idf.get(token).copied().unwrap_or(1.0);
         doc_norm += weight * weight;
     }
     if query_norm <= f64::EPSILON || doc_norm <= f64::EPSILON {
@@ -166,17 +168,17 @@ pub fn cosine_tfidf_similarity(
     dot / (query_norm.sqrt() * doc_norm.sqrt())
 }
 
-pub fn token_set_from_normalized(normalized: &str) -> SkipSet<String> {
-    let mut set = SkipSet::new(16);
+pub fn token_set_from_normalized(normalized: &str) -> FxHashSet<String> {
+    let mut set = FxHashSet::default();
     for token in normalized.split_whitespace() {
         set.insert(token.to_string());
     }
     set
 }
 
-pub fn char_ngram_set(normalized: &str, n: usize) -> SkipSet<String> {
+pub fn char_ngram_set(normalized: &str, n: usize) -> FxHashSet<String> {
     let chars = normalized.chars().collect::<Vec<_>>();
-    let mut set = SkipSet::new(chars.len().max(4));
+    let mut set = FxHashSet::default();
     if n == 0 {
         return set;
     }
@@ -192,11 +194,11 @@ pub fn char_ngram_set(normalized: &str, n: usize) -> SkipSet<String> {
     set
 }
 
-pub fn set_intersection_count(a: &SkipSet<String>, b: &SkipSet<String>) -> usize {
-    a.iter().filter(|item| b.contains(item)).count()
+pub fn set_intersection_count(a: &FxHashSet<String>, b: &FxHashSet<String>) -> usize {
+    a.iter().filter(|item| b.contains(*item)).count()
 }
 
-pub fn jaccard_similarity_for_sets(a: &SkipSet<String>, b: &SkipSet<String>) -> f64 {
+pub fn jaccard_similarity_for_sets(a: &FxHashSet<String>, b: &FxHashSet<String>) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }

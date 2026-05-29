@@ -35,13 +35,17 @@ fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>)
         }
     }
 
-    // 2) 全部消耗完后，对整个界面做一次完整的清屏重绘。
-    //    ratatui 的 terminal.clear() 在 Inline 模式下会重置内部 buffer，
-    //    再用 crossterm `FromCursorDown` 清掉光标以下的视觉残留即可。
-    //    "清残留 + 重绘"比逐个处理 draw 调用更简洁也更稳定，
-    //    不会有明显闪烁。
+    // 2) 清除整个 viewport 区域。ratatui inline viewport 在 resize 时
+    //    旧的 Borders::TOP 可能残留在光标上方，仅 FromCursorDown 不够。
+    //    先将光标移到 viewport 顶部，再清除到底部，确保旧边框不残留。
+    let viewport_h = terminal.size().map(|s| s.height).unwrap_or(20);
+    let _ = execute!(
+        io::stdout(),
+        crossterm::cursor::MoveUp(viewport_h),
+        crossterm::cursor::MoveToColumn(0),
+        Clear(ClearType::FromCursorDown)
+    );
     let _ = terminal.clear();
-    let _ = execute!(io::stdout(), Clear(ClearType::FromCursorDown));
     Ok(())
 }
 

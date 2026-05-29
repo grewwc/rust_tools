@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
+use rustc_hash::FxHashMap;
 use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -137,7 +138,7 @@ fn predict_agent(input: &str, model: &AgentRouteModelFile) -> Option<(String, f6
 
     let mut scores = model.bias.clone();
     for feature in &model.features {
-        if let Some(tf_value) = tf.get_ref(&feature.token) {
+        if let Some(tf_value) = tf.get(&feature.token) {
             let weighted_tf = tf_value * feature.idf;
             for (idx, score) in scores.iter_mut().enumerate() {
                 *score += weighted_tf * feature.weights[idx];
@@ -163,8 +164,8 @@ fn predict_agent(input: &str, model: &AgentRouteModelFile) -> Option<(String, f6
     Some((label, best_prob))
 }
 
-fn extract_tfidf_features(input: &str, cfg: &FeatureConfig) -> SkipMap<String, f64> {
-    let mut counts = SkipMap::default();
+fn extract_tfidf_features(input: &str, cfg: &FeatureConfig) -> FxHashMap<String, f64> {
+    let mut counts = FxHashMap::default();
     for ngram in extract_char_ngrams(input, cfg.char_ngram_min, cfg.char_ngram_max) {
         *counts.entry(ngram).or_insert(0.0) += 1.0;
     }
@@ -288,8 +289,8 @@ struct ScoredAgent<'a> {
 }
 
 struct AgentSemanticCorpus {
-    docs: SkipMap<String, SkipMap<String, f64>>,
-    idf: SkipMap<String, f64>,
+    docs: FxHashMap<String, FxHashMap<String, f64>>,
+    idf: FxHashMap<String, f64>,
 }
 
 impl AgentSemanticCorpus {
@@ -312,7 +313,7 @@ impl AgentSemanticCorpus {
     }
 
     fn build(candidates: &[&AgentManifest]) -> Self {
-        let mut docs = SkipMap::default();
+        let mut docs = FxHashMap::default();
         for agent in candidates {
             let features = TextSimilarityFeatures::from_text(&agent_document_text(agent));
             docs.insert(agent.name.clone(), features.ngram_tf);
@@ -322,8 +323,8 @@ impl AgentSemanticCorpus {
         Self { docs, idf }
     }
 
-    fn document(&self, agent_name: &str) -> Option<&SkipMap<String, f64>> {
-        self.docs.get_str_ref(agent_name)
+    fn document(&self, agent_name: &str) -> Option<&FxHashMap<String, f64>> {
+        self.docs.get(agent_name)
     }
 }
 

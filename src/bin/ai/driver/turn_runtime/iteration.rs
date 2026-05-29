@@ -14,6 +14,26 @@ use crate::ai::{
 
 use super::{TurnOutcome, persistence::persist_pending_turn_messages, types::IterationExecution};
 
+struct StreamingFlagGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl StreamingFlagGuard {
+    fn new(flag: &Arc<AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            flag: Arc::clone(flag),
+        }
+    }
+}
+
+impl Drop for StreamingFlagGuard {
+    fn drop(&mut self) {
+        self.flag
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(super) fn refresh_skill_turn_for_iteration(
     app: &mut App,
     mcp_client: &McpClient,
@@ -357,8 +377,7 @@ pub(super) async fn execute_turn_iteration(
 ) -> Result<IterationExecution, Box<dyn std::error::Error>> {
     let mut current_history = String::new();
     request::clear_stale_request_interrupt_before_request(app);
-    app.streaming
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let _streaming_guard = StreamingFlagGuard::new(&app.streaming);
 
     let shutdown = app.shutdown.clone();
     let cancel_stream = app.cancel_stream.clone();
@@ -430,8 +449,19 @@ pub(super) async fn execute_turn_iteration(
 
 #[cfg(test)]
 mod tests {
-    use super::request_interrupt_pending;
+    use super::{StreamingFlagGuard, request_interrupt_pending};
     use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, atomic::Ordering};
+
+    #[test]
+    fn streaming_flag_guard_resets_on_drop() {
+        let streaming = Arc::new(AtomicBool::new(false));
+        {
+            let _guard = StreamingFlagGuard::new(&streaming);
+            assert!(streaming.load(Ordering::Relaxed));
+        }
+        assert!(!streaming.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn request_interrupt_pending_tracks_shutdown_or_stream_cancel() {

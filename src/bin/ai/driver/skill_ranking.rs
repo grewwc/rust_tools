@@ -3,6 +3,8 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
+use rustc_hash::FxHashMap;
+
 use crate::ai::skills::SkillManifest;
 use crate::commonw::configw;
 use rust_tools::cw::SkipMap;
@@ -160,8 +162,8 @@ fn skill_embedding_routing_enabled() -> bool {
 }
 
 struct RuntimeSkillModel {
-    docs: SkipMap<String, SkipMap<String, f64>>,
-    idf: SkipMap<String, f64>,
+    docs: FxHashMap<String, FxHashMap<String, f64>>,
+    idf: FxHashMap<String, f64>,
 }
 
 impl RuntimeSkillModel {
@@ -184,13 +186,12 @@ impl RuntimeSkillModel {
     }
 
     fn build(skills: &[SkillManifest]) -> Self {
-        let mut docs = SkipMap::default();
+        let mut docs = FxHashMap::default();
         for skill in skills {
             let text = skill_document_text(skill);
             let features = TextSimilarityFeatures::from_text(&text);
             docs.insert(skill.name.clone(), features.ngram_tf);
         }
-
         let doc_refs = docs.values().collect::<Vec<_>>();
         let idf = build_idf_from_documents(&doc_refs);
         Self { docs, idf }
@@ -200,7 +201,7 @@ impl RuntimeSkillModel {
         if query.ngram_tf.is_empty() {
             return 0.0;
         }
-        let Some(doc) = self.docs.get_str_ref(skill_name) else {
+        let Some(doc) = self.docs.get(skill_name) else {
             return 0.0;
         };
         cosine_tfidf_similarity(&query.ngram_tf, doc, &self.idf)

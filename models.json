@@ -60,7 +60,7 @@
     "search_enabled": false,
     "tools_default_enabled": false,
     "enable_thinking": false,
-    "subagent_priority": 0
+    "subagent_priority": 150
   },
   {
     "key": "qwen-open",

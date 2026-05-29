@@ -23,6 +23,7 @@ use aios_kernel::{
     },
 };
 use rust_tools::cw::{SkipMap, SkipSet};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -1310,7 +1311,7 @@ fn subagent_document_text(agent: &AgentManifest) -> String {
     normalize_text_for_similarity(&parts.join("\n"))
 }
 
-fn auto_subagent_score(agent: &AgentManifest, task_text: &str, idf: &SkipMap<String, f64>) -> f64 {
+fn auto_subagent_score(agent: &AgentManifest, task_text: &str, idf: &FxHashMap<String, f64>) -> f64 {
     let query = TextSimilarityFeatures::from_text(task_text);
     let doc = TextSimilarityFeatures::from_text(&subagent_document_text(agent));
     cosine_tfidf_similarity(&query.ngram_tf, &doc.ngram_tf, idf)
@@ -1380,11 +1381,11 @@ fn select_subagent<'a>(
     }
 
     let task_text = format!("{description}\n{prompt}");
-    let doc_tfs: Vec<SkipMap<String, f64>> = subagents
+    let doc_tfs: Vec<FxHashMap<String, f64>> = subagents
         .iter()
         .map(|agent| TextSimilarityFeatures::from_text(&subagent_document_text(agent)).ngram_tf)
         .collect();
-    let doc_refs: Vec<&SkipMap<String, f64>> = doc_tfs.iter().collect();
+    let doc_refs: Vec<&FxHashMap<String, f64>> = doc_tfs.iter().collect();
     let idf = build_idf_from_documents(&doc_refs);
 
     subagents

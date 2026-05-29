@@ -4,6 +4,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
+use rustc_hash::FxHashMap;
 use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 
@@ -129,8 +130,8 @@ fn extract_char_ngrams(input: &str, min_n: usize, max_n: usize) -> Vec<String> {
     out
 }
 
-fn extract_tfidf_features(input: &str, cfg: &FeatureConfig) -> SkipMap<String, f64> {
-    let mut counts = SkipMap::default();
+fn extract_tfidf_features(input: &str, cfg: &FeatureConfig) -> FxHashMap<String, f64> {
+    let mut counts = FxHashMap::default();
     for ngram in extract_char_ngrams(input, cfg.char_ngram_min, cfg.char_ngram_max) {
         *counts.entry(ngram).or_insert(0.0) += 1.0;
     }

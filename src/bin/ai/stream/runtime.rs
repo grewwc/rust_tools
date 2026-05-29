@@ -26,7 +26,7 @@ const DECODE_ERROR_RETRY_DELAY_MS: u64 = 100;
 /// Grace window after an OpenAI-compatible `finish_reason` chunk. Some backends
 /// do not emit `[DONE]` or close the HTTP body, while others can still send a
 /// final snapshot immediately after the finish chunk.
-const FINISH_REASON_GRACE_MS: u64 = 10_000;
+const FINISH_REASON_GRACE_MS: u64 = 750;
 
 pub(super) async fn stream_response(
     app: &mut App,
@@ -750,6 +750,10 @@ fn write_tool_call_arguments_stream(arguments: &str) -> io::Result<()> {
     let mut stdout = io::stdout();
     if stdout.is_terminal() {
         for ch in arguments.chars() {
+            // 跳过换行符：模型可能输出 pretty-printed JSON，在终端上需要保持单行显示
+            if ch == '\n' || ch == '\r' {
+                continue;
+            }
             let mut buf = [0u8; 4];
             stdout.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
             stdout.flush()?;
@@ -1111,6 +1115,11 @@ fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::Result<()> {
 
     if erase_rows > 0 {
         write!(out, "\x1b[{}A\r\x1b[0J", erase_rows)?;
+    }
+
+    // 确保 "done thinking" 从新行开始：如果有未完成的当前行或之前有输出过内容
+    if !fold.current_line.is_empty() || (fold.total_lines > 0 && erase_rows == 0) {
+        write!(out, "\n")?;
     }
 
     if fold.total_lines > fold.max_visible_lines {
@@ -1668,7 +1677,7 @@ mod tests {
         let mut current_history = String::new();
 
         let result = tokio::time::timeout(
-            Duration::from_secs(12),
+            Duration::from_secs(2),
             stream_response(&mut app, &mut response, &mut current_history, None),
         )
         .await

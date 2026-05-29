@@ -37,6 +37,10 @@ pub(in crate::ai) fn handle_sigint(
         SigintAction::Shutdown => {
             crate::ai::tools::registry::common::request_tool_cancel();
             request_shutdown(shutdown);
+            #[cfg(unix)]
+            unsafe {
+                let _ = libc::close(libc::STDIN_FILENO);
+            }
         }
         SigintAction::Exit => {
             crate::ai::tools::registry::common::request_tool_cancel();
@@ -201,14 +205,70 @@ pub(in crate::ai) async fn wait_for_interrupt_sources(
 
 pub(in crate::ai) fn sigint_action(
     shutdown: &AtomicBool,
-    _streaming: &AtomicBool,
+    streaming: &AtomicBool,
     _cancel_stream: &AtomicBool,
 ) -> SigintAction {
     if shutdown.load(Ordering::Relaxed) {
         SigintAction::Exit
-    } else {
-        // Always cancel the current turn/output and keep the REPL session alive.
-        // Repeated Ctrl+C should keep cancelling, not escalate to shutdown.
+    } else if streaming.load(Ordering::Relaxed) {
         SigintAction::CancelStream
+    } else {
+        SigintAction::Shutdown
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SigintAction, sigint_action};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn sigint_cancels_streaming_turn() {
+        let shutdown = AtomicBool::new(false);
+        let streaming = AtomicBool::new(true);
+        let cancel_stream = AtomicBool::new(false);
+        assert_eq!(
+            sigint_action(&shutdown, &streaming, &cancel_stream),
+            SigintAction::CancelStream
+        );
+    }
+
+    #[test]
+    fn sigint_requests_shutdown_when_idle() {
+        let shutdown = AtomicBool::new(false);
+        let streaming = AtomicBool::new(false);
+        let cancel_stream = AtomicBool::new(false);
+        assert_eq!(
+            sigint_action(&shutdown, &streaming, &cancel_stream),
+            SigintAction::Shutdown
+        );
+    }
+
+    #[test]
+    fn stale_cancel_flag_does_not_block_idle_shutdown() {
+        let shutdown = AtomicBool::new(false);
+        let streaming = AtomicBool::new(false);
+        let cancel_stream = AtomicBool::new(true);
+        assert_eq!(
+            sigint_action(&shutdown, &streaming, &cancel_stream),
+            SigintAction::Shutdown
+        );
+    }
+
+    #[test]
+    fn second_sigint_exits_after_shutdown_requested() {
+        let shutdown = AtomicBool::new(true);
+        let streaming = AtomicBool::new(false);
+        let cancel_stream = AtomicBool::new(false);
+        assert_eq!(
+            sigint_action(&shutdown, &streaming, &cancel_stream),
+            SigintAction::Exit
+        );
+
+        streaming.store(true, Ordering::Relaxed);
+        assert_eq!(
+            sigint_action(&shutdown, &streaming, &cancel_stream),
+            SigintAction::Exit
+        );
     }
 }
