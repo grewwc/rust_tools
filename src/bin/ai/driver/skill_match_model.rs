@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 
 use super::normalize_text_for_similarity as normalize_text;
@@ -12,8 +12,8 @@ use super::normalize_text_for_similarity as normalize_text;
 const DEFAULT_SKILL_MATCH_MODEL_RELATIVE_PATH: &str =
     "src/bin/ai/config/skill_match/skill_match_model.json";
 
-static SKILL_MATCH_MODEL_CACHE: LazyLock<Mutex<FastMap<PathBuf, Arc<SkillMatchModelFile>>>> =
-    LazyLock::new(|| Mutex::new(FastMap::default()));
+static SKILL_MATCH_MODEL_CACHE: LazyLock<Mutex<SkipMap<PathBuf, Arc<SkillMatchModelFile>>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SkillMatchModelFile {
@@ -57,7 +57,7 @@ fn load_model_file(path: &Path) -> Result<SkillMatchModelFile, String> {
 fn load_model_cached(path: &Path) -> Option<Arc<SkillMatchModelFile>> {
     let path_buf = path.to_path_buf();
     if let Some(cache) = lock_recover(&SKILL_MATCH_MODEL_CACHE)
-        && let Some(model) = cache.get(&path_buf)
+        && let Some(model) = cache.get_ref(&path_buf)
     {
         return Some(Arc::clone(model));
     }
@@ -129,8 +129,8 @@ fn extract_char_ngrams(input: &str, min_n: usize, max_n: usize) -> Vec<String> {
     out
 }
 
-fn extract_tfidf_features(input: &str, cfg: &FeatureConfig) -> FastMap<String, f64> {
-    let mut counts = FastMap::default();
+fn extract_tfidf_features(input: &str, cfg: &FeatureConfig) -> SkipMap<String, f64> {
+    let mut counts = SkipMap::default();
     for ngram in extract_char_ngrams(input, cfg.char_ngram_min, cfg.char_ngram_max) {
         *counts.entry(ngram).or_insert(0.0) += 1.0;
     }
@@ -166,7 +166,7 @@ pub(crate) fn predict_skill(input: &str, model_path: &Path) -> Option<SkillMatch
 
     let mut scores = model.bias.clone();
     for feature in &model.features {
-        if let Some(tf_value) = tf.get(feature.token.as_str()) {
+        if let Some(tf_value) = tf.get(&feature.token) {
             let weighted_tf = tf_value * feature.idf;
             for (idx, score) in scores.iter_mut().enumerate() {
                 *score += weighted_tf * feature.weights[idx];

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use dirs::config_dir;
-use rust_tools::commonw::{FastMap, FastSet};
+use rust_tools::cw::{SkipMap, SkipSet};
 use rust_tools::cw::LruCache;
 
 use crate::ai::knowledge::storage::vector_store::{VectorEntry, VectorStore};
@@ -100,7 +100,7 @@ impl SkillEmbeddingIndex {
         let expanded_query = expand_query_bilingual(trimmed);
         let query_embedding = cached_embed(&self.store, &expanded_query)?;
 
-        let mut by_skill: FastMap<String, SkillEmbeddingHit> = FastMap::default();
+        let mut by_skill: SkipMap<String, SkillEmbeddingHit> = SkipMap::default();
         for (entry, section, skill_name) in self.snapshot.iter() {
             let sim = cosine_similarity_f32(&query_embedding, &entry.embedding);
             let score = sim as f64;
@@ -129,7 +129,7 @@ impl SkillEmbeddingIndex {
                 .max(item.capability_score * 0.3)
                 .max(item.behavior_score);
         }
-        let mut hits = by_skill.into_values().collect::<Vec<_>>();
+        let mut hits = by_skill.drain().map(|(_, v)| v).collect::<Vec<_>>();
         hits.sort_by(|left, right| right.score.total_cmp(&left.score));
         if hits.len() > limit {
             hits.truncate(limit);
@@ -190,7 +190,7 @@ fn cosine_similarity_f32(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn sync_documents(store: &VectorStore, documents: &[SkillEmbeddingDocument]) -> Result<(), String> {
-    let mut desired_ids: FastSet<String> = FastSet::default();
+    let mut desired_ids: SkipSet<String> = SkipSet::default();
     let mut texts_to_embed: Vec<(String, VectorEntry)> = Vec::new();
 
     for doc in documents {

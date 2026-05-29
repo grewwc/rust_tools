@@ -22,7 +22,7 @@ use aios_kernel::{
         IpcRecvResult,
     },
 };
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::{SkipMap, SkipSet};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -191,8 +191,8 @@ pub(crate) struct AsyncTaskEntry {
 /// 与 AIOS kernel process table 是 **平行存储**：两者通过 `pid` 字段关联，但
 /// 各自有独立的字段集（参见 `AsyncTaskEntry` 注释）。访问方应通过 `with_task_entry`
 /// / `take_task_entry` 等 helper 函数来读写这里，避免直接持有 lock guard。
-static TASK_REGISTRY: LazyLock<Mutex<FastMap<String, AsyncTaskEntry>>> =
-    LazyLock::new(|| Mutex::new(FastMap::default()));
+static TASK_REGISTRY: LazyLock<Mutex<SkipMap<String, AsyncTaskEntry>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OsTaskGoal {
@@ -206,7 +206,7 @@ pub(crate) struct OsTaskGoal {
     pub(crate) selection_explanation: String,
 }
 
-fn prune_completed_tasks(registry: &mut FastMap<String, AsyncTaskEntry>) {
+fn prune_completed_tasks(registry: &mut SkipMap<String, AsyncTaskEntry>) {
     if registry.len() <= MAX_TASK_REGISTRY_SIZE {
         return;
     }
@@ -724,17 +724,15 @@ pub(crate) fn spawn_subagent_kernel_task(
 /// interception to retrieve the channel/futex/inherit info after spawning.
 pub(crate) fn with_task_entry<R>(task_id: &str, f: impl FnOnce(&AsyncTaskEntry) -> R) -> Option<R> {
     let registry = TASK_REGISTRY.lock().unwrap();
-    registry.get(task_id).map(f)
+    registry.get_ref(&task_id.to_string()).map(f)
 }
 
 /// Remove a task entry from the registry. Called by the synchronous `task`
 /// interception once it has consumed the result.
 pub(crate) fn remove_task_entry(task_id: &str) -> Option<AsyncTaskEntry> {
     let mut registry = TASK_REGISTRY.lock().unwrap();
-    registry.remove(task_id)
+    registry.take(&task_id.to_string())
 }
-
-/// Format a finished task result that came in through the kernel result
 /// channel. Re-exported for the synchronous `task` interception so that both
 /// paths produce identical output.
 pub(crate) fn format_finished_task(entry: &AsyncTaskEntry, result: StoredTaskResult) -> String {
@@ -992,7 +990,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     // 不加 `move`，保证 closure 返回后外层 `if !pending.is_empty()` 等代码仍可访问。
     let wait_message = with_os_kernel(|os| {
         for tid in &task_ids {
-            let entry = registry.get(tid).expect("validated");
+            let entry = registry.get_ref(tid).expect("validated");
             // ⚠️ 这里之前曾按 `entry.started_at.elapsed() >= timeout_secs`
             // 直接把任务标记为 TIMEOUT 并销毁 channel/futex —— 这是 bug：
             // `started_at` 是 spawn 时间，不是本次 task_wait 的开始时间。如果
@@ -1006,7 +1004,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             // 返回空 ready 时体现，并且 **绝不销毁 channel/futex**，主 agent
             // 可以继续调 task_wait 续等。
             if let Some(result) = read_task_result(os, entry.result_channel_id, true)? {
-                ready.push(format_task_result(&entry, result));
+                ready.push(format_task_result(entry, result));
                 let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
                 let _ = os.channel_release_named(
                     ChannelId(entry.result_channel_id),
@@ -1083,7 +1081,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
             }
             pending.clear();
             for tid in &pending_ids {
-                let entry = registry.get(tid).expect("validated after wait");
+                let entry = registry.get_ref(tid).expect("validated after wait");
                 if let Some(result) = read_task_result(os, entry.result_channel_id, true)? {
                     ready.push(format_task_result(entry, result));
                     let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
@@ -1138,9 +1136,9 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
         ));
         // 仅清理已经 ready 的 task_id 对应的 registry 条目；pending 任务必须保留，
         // 否则下次 task_wait 会因 "Unknown task_id" 失败。
-        let pending_set: rust_tools::commonw::FastSet<&str> = pending_ids.iter().copied().collect();
+        let pending_set: SkipSet<&str> = pending_ids.iter().copied().collect();
         for tid in &task_ids {
-            if !pending_set.contains(tid.as_str()) {
+            if !pending_set.contains(&tid.as_str()) {
                 registry.remove(tid);
             }
         }
@@ -1227,12 +1225,12 @@ fn read_task_result(
 fn task_wait_sources(
     os: &mut dyn Kernel,
     task_ids: &[String],
-    registry: &FastMap<String, AsyncTaskEntry>,
+    registry: &SkipMap<String, AsyncTaskEntry>,
 ) -> Result<Vec<WaitManySource>, String> {
     let mut sources = Vec::new();
     for tid in task_ids {
         let entry = registry
-            .get(tid)
+            .get_ref(tid)
             .ok_or_else(|| format!("Unknown task_id: {}", tid))?;
         sources.extend(wait_sources_for_channel_and_futex(
             os,
@@ -1312,7 +1310,7 @@ fn subagent_document_text(agent: &AgentManifest) -> String {
     normalize_text_for_similarity(&parts.join("\n"))
 }
 
-fn auto_subagent_score(agent: &AgentManifest, task_text: &str, idf: &FastMap<String, f64>) -> f64 {
+fn auto_subagent_score(agent: &AgentManifest, task_text: &str, idf: &SkipMap<String, f64>) -> f64 {
     let query = TextSimilarityFeatures::from_text(task_text);
     let doc = TextSimilarityFeatures::from_text(&subagent_document_text(agent));
     cosine_tfidf_similarity(&query.ngram_tf, &doc.ngram_tf, idf)
@@ -1382,11 +1380,11 @@ fn select_subagent<'a>(
     }
 
     let task_text = format!("{description}\n{prompt}");
-    let doc_tfs: Vec<FastMap<String, f64>> = subagents
+    let doc_tfs: Vec<SkipMap<String, f64>> = subagents
         .iter()
         .map(|agent| TextSimilarityFeatures::from_text(&subagent_document_text(agent)).ngram_tf)
         .collect();
-    let doc_refs: Vec<&FastMap<String, f64>> = doc_tfs.iter().collect();
+    let doc_refs: Vec<&SkipMap<String, f64>> = doc_tfs.iter().collect();
     let idf = build_idf_from_documents(&doc_refs);
 
     subagents

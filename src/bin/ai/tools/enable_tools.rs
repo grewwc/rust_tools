@@ -1,5 +1,6 @@
 use std::sync::{LazyLock, RwLock};
 
+use rust_tools::cw::{SkipMap, SkipSet};
 use serde_json::Value;
 
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
@@ -23,7 +24,7 @@ struct EnableState {
     /// 通过 enable_tools 显式启用、应该跨 turn 保留的 tool 名称
     explicit_enabled_tool_names: Vec<String>,
     /// 每个 explicit-enabled tool 的"未使用计数"
-    explicit_tool_age: rustc_hash::FxHashMap<String, u32>,
+    explicit_tool_age: SkipMap<String, u32>,
     /// MCP server 暴露但当前未必已启用的全部 tool 列表
     available_mcp_tools: Vec<ToolDefinition>,
 }
@@ -72,8 +73,8 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    // 把 used_in_turn 收成 FxHashSet，O(1) 查询；调用方可能传 Vec/HashSet/迭代器。
-    let used: rustc_hash::FxHashSet<String> = used_in_turn
+    // 把 used_in_turn 收成 SkipSet，O(log n) 查询；调用方可能传 Vec/HashSet/迭代器。
+    let used: SkipSet<String> = used_in_turn
         .into_iter()
         .map(|s| s.as_ref().to_string())
         .collect();

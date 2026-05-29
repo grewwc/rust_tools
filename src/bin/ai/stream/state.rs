@@ -1,4 +1,4 @@
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 
 use crate::ai::{
     request::StreamChunk,
@@ -109,7 +109,7 @@ pub(super) struct StreamContentState {
     pub(super) empty_choice_chunks: usize,
     pub(super) finish_reason_seen: bool,
     pub(super) saw_reasoning_output: bool,
-    pub(super) tool_calls_map: FastMap<usize, ToolCallBuilder>,
+    pub(super) tool_calls_map: SkipMap<usize, ToolCallBuilder>,
     pub(super) assistant_text: String,
     pub(super) hidden_meta: String,
     /// 累积模型返回的 reasoning_content 原文（不含展示用的 thinking 标记），
@@ -128,7 +128,7 @@ impl StreamContentState {
             empty_choice_chunks: 0,
             finish_reason_seen: false,
             saw_reasoning_output: false,
-            tool_calls_map: FastMap::default(),
+            tool_calls_map: SkipMap::default(),
             assistant_text: String::new(),
             hidden_meta: String::new(),
             reasoning_text: String::new(),

@@ -505,16 +505,10 @@ fn normalize_tool_call_arguments(raw: &str) -> Option<String> {
 }
 
 fn collect_valid_tool_calls(
-    builders: &mut rust_tools::commonw::FastMap<usize, ToolCallBuilder>,
+    builders: &mut rust_tools::cw::SkipMap<usize, ToolCallBuilder>,
 ) -> Vec<ToolCall> {
-    // drain() on FxHashMap does NOT preserve insertion order. We must sort by
-    // the original stream index so that tool calls are executed in the order
-    // the model intended — this affects barrier logic (which may defer
-    // subsequent calls) and keeps the history consistent with model expectations.
-    let mut indexed: Vec<(usize, ToolCallBuilder)> = builders.drain().collect();
-    indexed.sort_by_key(|(idx, _)| *idx);
-    indexed
-        .into_iter()
+    builders
+        .drain()
         .filter_map(|(_, mut builder)| {
             let Some(arguments) = normalize_tool_call_arguments(&builder.arguments) else {
                 eprintln!(
@@ -1254,7 +1248,7 @@ mod tests {
         )
         .unwrap();
 
-        let builder = state.content.tool_calls_map.get(&0).unwrap();
+        let builder = state.content.tool_calls_map.get_ref(&0).unwrap();
         assert_eq!(builder.id, "call_1");
         assert_eq!(builder.function_name, "write_file");
         assert_eq!(builder.arguments, "{\"path\":\"abc\"}");

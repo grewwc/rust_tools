@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rust_tools::cw::SkipMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -78,10 +78,10 @@ impl ExperienceGeneralizer {
             Err(_) => return,
         };
         if let Ok(entries) = store.entries_by_category("generalized_principle", 200) {
-            let mut deduped = HashMap::new();
+            let mut deduped = SkipMap::default();
             for entry in entries {
                 let principle = Self::decode_persisted_principle(&entry);
-                match deduped.get(&principle.id) {
+                match deduped.get_ref(&principle.id) {
                     Some(existing)
                         if !Self::should_replace_loaded_principle(existing, &principle) => {}
                     _ => {
@@ -89,7 +89,7 @@ impl ExperienceGeneralizer {
                     }
                 }
             }
-            let mut principles = deduped.into_values().collect::<Vec<_>>();
+            let mut principles = deduped.drain().map(|(_, v)| v).collect::<Vec<_>>();
             principles.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
             self.principles.extend(principles);
         }
@@ -225,17 +225,28 @@ impl ExperienceGeneralizer {
             return None;
         }
 
-        let grouped = self.group_by_semantic_similarity();
-        let best_group = grouped
-            .into_values()
-            .filter(|g| g.len() >= self.min_experiences_for_generalization)
-            .max_by_key(|g| g.len())?;
+        let (source_ids, domain, principle_text) = {
+            let mut grouped = self.group_by_semantic_similarity();
+            let best_group = match grouped
+                .drain()
+                .map(|(_, v)| v)
+                .filter(|g| g.len() >= self.min_experiences_for_generalization)
+                .max_by_key(|g| g.len())
+            {
+                Some(g) => g,
+                None => return None,
+            };
 
-        let domain = self.infer_domain(&best_group);
-        let source_ids: Vec<String> = best_group.iter().map(|e| e.id.clone()).collect();
-        let principle_text = self.synthesize_principle(&best_group, &domain)?;
+            let domain = self.infer_domain(&best_group);
+            let source_ids: Vec<String> = best_group.iter().map(|e| e.id.clone()).collect();
+            let principle_text = match self.synthesize_principle(&best_group, &domain) {
+                Some(t) => t,
+                None => return None,
+            };
+            (source_ids, domain, principle_text)
+        };
 
-        let existing = self.find_similar_principle(&principle_text);
+        let existing = self.find_similar_principle(&principle_text).cloned();
         if let Some(existing) = existing {
             let updated = GeneralizedPrinciple {
                 reinforcement_count: existing.reinforcement_count + 1,
@@ -250,7 +261,7 @@ impl ExperienceGeneralizer {
                     }
                     sources
                 },
-                ..existing.clone()
+                ..existing
             };
             if let Some(pos) = self.principles.iter().position(|p| p.id == updated.id) {
                 self.principles[pos] = updated.clone();
@@ -496,8 +507,8 @@ impl ExperienceGeneralizer {
         )
     }
 
-    fn group_by_semantic_similarity(&self) -> HashMap<String, Vec<&RawExperience>> {
-        let mut groups: HashMap<String, Vec<&RawExperience>> = HashMap::new();
+    fn group_by_semantic_similarity(&self) -> SkipMap<String, Vec<&RawExperience>> {
+        let mut groups: SkipMap<String, Vec<&RawExperience>> = SkipMap::default();
         for exp in &self.experience_buffer {
             let key = self.semantic_group_key(exp);
             groups.entry(key).or_default().push(exp);

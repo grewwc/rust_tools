@@ -142,7 +142,7 @@ pub use ordered_map::OrderedMap;
 pub use ordered_set::OrderedSet;
 pub use priority_queue::{MaxPriorityQueue, MinPriorityQueue};
 pub use queue::Queue;
-pub use skip_list::{SkipMap, SkipSet};
+pub use skip_list::{Entry as SkipMapEntry, SkipMap, SkipSet};
 pub use stack::Stack;
 pub use tree_map::TreeMap;
 pub use tree_set::TreeSet;

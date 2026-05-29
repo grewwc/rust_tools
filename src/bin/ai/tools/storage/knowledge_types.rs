@@ -6,7 +6,7 @@
 /// 3. 外部依赖类 → 外部状态检查
 /// 4. 会话相关类 → 会话绑定
 /// 5. 稳定知识类 → 永不过期
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -152,7 +152,7 @@ pub struct KnowledgeMetadata {
     pub validation_failures: u32,
 
     /// 额外上下文
-    pub context: FastMap<String, String>,
+    pub context: SkipMap<String, String>,
 
     /// 人类可读的描述
     pub description: Option<String>,
@@ -162,7 +162,7 @@ impl KnowledgeMetadata {
     /// 创建新的元数据（基于知识类型）
     pub fn new(
         knowledge_type: KnowledgeType,
-        context: FastMap<String, String>,
+        context: SkipMap<String, String>,
         description: Option<String>,
     ) -> Self {
         let now = Self::current_timestamp();
@@ -184,7 +184,7 @@ impl KnowledgeMetadata {
             KnowledgeType::ExternalDependent => {
                 let check_interval = 60; // 1 分钟检查一次
                 ValidationStrategy::ExternalCheck {
-                    source: context.get("source").cloned().unwrap_or_default(),
+                    source: context.get_ref(&"source".to_string()).cloned().unwrap_or_default(),
                     last_check: now,
                     check_interval,
                 }
@@ -192,7 +192,7 @@ impl KnowledgeMetadata {
 
             KnowledgeType::SessionScoped => ValidationStrategy::SessionBound {
                 session_id: context
-                    .get("session_id")
+                    .get_ref(&"session_id".to_string())
                     .cloned()
                     .unwrap_or_else(|| format!("session_{}", now)),
             },
@@ -336,7 +336,7 @@ pub enum ValidationSuggestion {
 /// 为时间敏感知识创建元数据
 pub fn create_time_sensitive_metadata(
     description: &str,
-    context: FastMap<String, String>,
+    context: SkipMap<String, String>,
     custom_ttl: Option<u64>,
 ) -> KnowledgeMetadata {
     let mut metadata = KnowledgeMetadata::new(
@@ -363,7 +363,7 @@ pub fn create_time_sensitive_metadata(
 pub fn create_external_metadata(
     source: &str,
     description: &str,
-    context: FastMap<String, String>,
+    context: SkipMap<String, String>,
     check_interval: Option<u64>,
 ) -> KnowledgeMetadata {
     let mut ctx = context.clone();
@@ -389,7 +389,7 @@ pub fn create_external_metadata(
 pub fn create_session_metadata(
     session_id: &str,
     description: &str,
-    context: FastMap<String, String>,
+    context: SkipMap<String, String>,
 ) -> KnowledgeMetadata {
     let mut ctx = context.clone();
     ctx.insert("session_id".to_string(), session_id.to_string());
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_time_sensitive_validation() {
-        let ctx = FastMap::default();
+        let ctx = SkipMap::default();
         let metadata = create_time_sensitive_metadata(
             "今天天气",
             ctx.clone(),

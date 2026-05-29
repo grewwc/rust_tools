@@ -2,7 +2,7 @@
 ///
 /// 用于元认知（Meta-Cognition）：追溯"为什么做了某个选择"，便于调试和优化
 use chrono::Local;
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
@@ -259,10 +259,10 @@ impl DecisionLogStore {
             .count();
         let failures = total - successes;
 
-        let by_type: FastMap<String, usize> = logs
+        let by_type: SkipMap<String, usize> = logs
             .iter()
             .map(|log| format!("{:?}", log.decision_type))
-            .fold(FastMap::default(), |mut acc, t| {
+            .fold(SkipMap::default(), |mut acc, t| {
                 *acc.entry(t).or_insert(0) += 1;
                 acc
             });
@@ -316,7 +316,7 @@ pub struct DecisionStats {
     pub successes: usize,
     pub failures: usize,
     pub success_rate: f64,
-    pub by_type: FastMap<String, usize>,
+    pub by_type: SkipMap<String, usize>,
     pub avg_confidence: f64,
     pub avg_execution_time_ms: f64,
 }

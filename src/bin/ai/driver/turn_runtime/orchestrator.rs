@@ -451,8 +451,8 @@ async fn run_turn_body(
     let mut final_assistant_recorded = false;
     let mut terminal_dedupe_candidate = None;
     // 收集本 turn 实际调用过的 explicit-enabled tool 名字，turn 末用于老化未用项。
-    let mut tools_used_this_turn: crate::commonw::FastSet<String> =
-        crate::commonw::FastSet::default();
+    let mut tools_used_this_turn: rust_tools::cw::SkipSet<String> =
+        rust_tools::cw::SkipSet::default();
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
         {

@@ -1,5 +1,5 @@
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use rust_tools::cw::SkipMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration as StdDuration, Instant};
 use uuid::Uuid;
@@ -17,8 +17,8 @@ use super::recall::current_project_name_hint;
 /// 短期写回去重缓存：(project, q_hash, a_hash) -> last_seen_instant。
 /// 5 分钟内相同 question+answer 不再触发 LLM 调用，避免连续多轮重复问答时
 /// 反复发起 writeback LLM 请求；MemoryStore upsert 仍然是幂等的，这里只是省 token。
-static WRITEBACK_RECENT: LazyLock<Mutex<HashMap<(String, u64, u64), Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static WRITEBACK_RECENT: LazyLock<Mutex<SkipMap<(String, u64, u64), Instant>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
 const WRITEBACK_DEDUP_TTL: StdDuration = StdDuration::from_secs(5 * 60);
 
 fn writeback_dedup_key(project: &str, question: &str, answer: &str) -> (String, u64, u64) {
@@ -37,7 +37,7 @@ fn writeback_recently_seen(key: &(String, u64, u64)) -> bool {
     };
     let now = Instant::now();
     guard.retain(|_, t| now.duration_since(*t) < WRITEBACK_DEDUP_TTL);
-    if let Some(t) = guard.get(key) {
+    if let Some(t) = guard.get_ref(key) {
         if now.duration_since(*t) < WRITEBACK_DEDUP_TTL {
             return true;
         }

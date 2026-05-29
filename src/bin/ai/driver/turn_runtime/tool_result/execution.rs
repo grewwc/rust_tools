@@ -660,7 +660,7 @@ mod tests {
             ToolResult,
         },
     };
-    use rust_tools::commonw::FastMap;
+    use rust_tools::cw::SkipMap;
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
 
@@ -707,7 +707,7 @@ mod tests {
                         },
                     })
                     .collect(),
-                mcp_servers: FastMap::default(),
+                mcp_servers: SkipMap::default(),
                 max_iterations: 16,
             }),
             last_skill_bias: None,

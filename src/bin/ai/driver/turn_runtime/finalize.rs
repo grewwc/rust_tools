@@ -53,9 +53,9 @@ fn normalized_tool_args(raw: &str) -> String {
 }
 
 fn collect_subagent_tool_evidence(turn_messages: &[Message]) -> Vec<String> {
-    use std::collections::HashMap;
+    use rust_tools::cw::SkipMap;
 
-    let mut id_to_call = HashMap::new();
+    let mut id_to_call = SkipMap::default();
     for message in turn_messages {
         let Some(tool_calls) = &message.tool_calls else {
             continue;

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 
 use super::super::indexing::{embedder, similarity};
@@ -197,35 +197,35 @@ impl VectorStore {
             })
             .collect();
 
-        let semantic_scores: FastMap<String, f32> = all_entries
+        let semantic_scores: SkipMap<String, f32> = all_entries
             .iter()
             .map(|(id, _, score)| (id.clone(), *score))
             .collect();
-        let entry_map: FastMap<String, VectorEntry> = all_entries
+        let entry_map: SkipMap<String, VectorEntry> = all_entries
             .drain(..)
             .map(|(id, entry, _)| (id, entry))
             .collect();
 
         let bm25_max = bm25_results.iter().map(|(_, s)| *s).fold(0.0f32, f32::max);
-        let bm25_normalized: FastMap<String, f32> = if bm25_max > 0.0 {
+        let bm25_normalized: SkipMap<String, f32> = if bm25_max > 0.0 {
             bm25_results
                 .into_iter()
                 .map(|(id, score)| (id, score / bm25_max))
                 .collect()
         } else {
-            FastMap::default()
+            SkipMap::default()
         };
 
-        let mut all_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut all_ids: rust_tools::cw::SkipSet<String> = rust_tools::cw::SkipSet::default();
         all_ids.extend(bm25_normalized.keys().cloned());
         all_ids.extend(semantic_scores.keys().cloned());
 
         let mut combined: Vec<(String, f32)> = Vec::new();
-        for id in all_ids {
-            let bm25 = bm25_normalized.get(&id).copied().unwrap_or(0.0);
-            let semantic = semantic_scores.get(&id).copied().unwrap_or(0.0);
+        for id in all_ids.iter() {
+            let bm25 = bm25_normalized.get_ref(id).copied().unwrap_or(0.0);
+            let semantic = semantic_scores.get_ref(id).copied().unwrap_or(0.0);
             let final_score = (1.0 - vector_weight) * bm25 + vector_weight * semantic;
-            combined.push((id, final_score));
+            combined.push((id.clone(), final_score));
         }
 
         combined.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Local, Utc};
-use rust_tools::commonw::FastSet;
+use rust_tools::cw::SkipSet;
+
 use serde_json::Value;
 use std::io::{BufRead, Write};
 use uuid::Uuid;
@@ -796,7 +797,7 @@ pub(crate) fn execute_memory_dedup(_args: &Value) -> Result<String, String> {
 
         // Step 1: 严格去重——note + category + tags + source 完全一致的，
         // 只保留时间最新（reverse 遍历后写回）。
-        let mut seen: FastSet<(String, String, Vec<String>, Option<String>)> = FastSet::default();
+        let mut seen: SkipSet<(String, String, Vec<String>, Option<String>)> = SkipSet::default();
         let mut deduped: Vec<AgentMemoryEntry> = Vec::with_capacity(entries.len());
         for e in entries.into_iter().rev() {
             let key = (

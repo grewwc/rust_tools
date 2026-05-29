@@ -6,7 +6,7 @@
 /// 1. 缓存时记录相关文件的指纹（hash/mtime）
 /// 2. 使用前验证指纹是否匹配
 /// 3. 指纹不匹配 → 即使 TTL 未过期也刷新
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
@@ -35,14 +35,14 @@ pub struct KnowledgeFingerprint {
     /// 指纹生成时间
     pub created_at: u64,
     /// 关联的上下文（如项目路径）
-    pub context: FastMap<String, String>,
+    pub context: SkipMap<String, String>,
     /// Git 提交 hash（如果在 Git 仓库中）
     pub git_commit: Option<String>,
 }
 
 impl KnowledgeFingerprint {
     /// 创建新的指纹
-    pub fn new(context: &FastMap<String, String>) -> Self {
+    pub fn new(context: &SkipMap<String, String>) -> Self {
         Self {
             files: Vec::new(),
             created_at: SystemTime::now()
@@ -305,7 +305,7 @@ pub struct GitStatus {
 /// 为特定主题生成指纹
 pub fn create_fingerprint_for_topic(
     topic: &str,
-    context: &FastMap<String, String>,
+    context: &SkipMap<String, String>,
 ) -> Result<KnowledgeFingerprint, String> {
     let mut fingerprint = KnowledgeFingerprint::new(context);
 
@@ -313,8 +313,8 @@ pub fn create_fingerprint_for_topic(
     match topic {
         "project_structure" | "project_info" => {
             // 跟踪项目根目录的结构
-            if let Some(project_path) = context.get("project_path") {
-                let path = Path::new(project_path);
+            if let Some(project_path) = context.get_ref(&"project_path".to_string()) {
+                let path = Path::new(project_path.as_str());
 
                 // 添加关键目录
                 for dir in &["src", "Cargo.toml", "package.json", "README.md"] {
@@ -334,14 +334,14 @@ pub fn create_fingerprint_for_topic(
         }
         "code_content" => {
             // 跟踪特定文件的内容
-            if let Some(file_path) = context.get("file_path") {
+            if let Some(file_path) = context.get_ref(&"file_path".to_string()) {
                 fingerprint.add_file(Path::new(file_path), true)?;
             }
         }
         "project_config" => {
             // 跟踪配置文件
-            if let Some(project_path) = context.get("project_path") {
-                let path = Path::new(project_path);
+            if let Some(project_path) = context.get_ref(&"project_path".to_string()) {
+                let path = Path::new(project_path.as_str());
                 for config_file in &["Cargo.toml", "package.json", "config.json", ".env"] {
                     let full_path = path.join(config_file);
                     if full_path.exists() {
@@ -392,7 +392,7 @@ mod tests {
 
         std::fs::write(&test_file, "initial content").unwrap();
 
-        let mut fingerprint = KnowledgeFingerprint::new(&FastMap::default());
+        let mut fingerprint = KnowledgeFingerprint::new(&SkipMap::default());
         fingerprint.add_file(&test_file, true).unwrap();
 
         // 初始验证应该通过

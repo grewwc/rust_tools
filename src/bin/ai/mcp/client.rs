@@ -12,7 +12,7 @@ use libc;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 use serde_json::{Value, json};
 
 use crate::ai::types::{
@@ -80,7 +80,7 @@ pub(in crate::ai) type SharedMcpClient = Arc<std::sync::Mutex<McpClient>>;
 type ServerId = String;
 
 pub(in crate::ai) struct McpClient {
-    pub(in crate::ai) servers: FastMap<ServerId, Mutex<McpServerConnection>>,
+    pub(in crate::ai) servers: SkipMap<ServerId, Mutex<McpServerConnection>>,
     next_id: AtomicU64,
     cached_tool_definitions: Vec<ToolDefinition>,
     cached_resources: Vec<(String, McpResource)>,
@@ -91,7 +91,7 @@ pub(in crate::ai) struct McpClient {
 impl McpClient {
     pub(in crate::ai) fn new() -> Self {
         Self {
-            servers: FastMap::default(),
+            servers: SkipMap::default(),
             next_id: AtomicU64::new(1),
             cached_tool_definitions: Vec::new(),
             cached_resources: Vec::new(),
@@ -235,7 +235,7 @@ impl McpClient {
     pub(in crate::ai) fn reset_server(&self, server_name: &str) -> Result<(), String> {
         let conn_cell = self
             .servers
-            .get(server_name)
+            .get_str_ref(server_name)
             .ok_or_else(|| format!("Server not found: {}", server_name))?;
         let mut conn = conn_cell
             .lock()
@@ -456,7 +456,7 @@ impl McpClient {
 
         let conn_cell = self
             .servers
-            .get(server_name)
+            .get_str_ref(server_name)
             .ok_or_else(|| format!("Server not found: {}", server_name))?;
 
         // First attempt

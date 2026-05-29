@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 
 use super::intent_recognition::{CoreIntent, IntentModifiers, UserIntent};
@@ -12,8 +12,8 @@ use super::normalize_text_for_similarity as normalize_text;
 
 const DEFAULT_INTENT_MODEL_RELATIVE_PATH: &str = "src/bin/ai/config/intent/intent_model.json";
 
-static INTENT_MODEL_CACHE: LazyLock<Mutex<FastMap<PathBuf, Arc<IntentModelFile>>>> =
-    LazyLock::new(|| Mutex::new(FastMap::default()));
+static INTENT_MODEL_CACHE: LazyLock<Mutex<SkipMap<PathBuf, Arc<IntentModelFile>>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct IntentModelFile {
@@ -92,7 +92,7 @@ fn load_model_cached(path: &Path) -> Option<Arc<IntentModelFile>> {
     let path = path.to_path_buf();
     // Mutex 中毒（持锁线程 panic）时仍能恢复，避免反复重新加载模型。
     if let Some(cache) = lock_recover(&INTENT_MODEL_CACHE)
-        && let Some(model) = cache.get(&path)
+        && let Some(model) = cache.get_ref(&path)
     {
         return Some(Arc::clone(model));
     }
@@ -164,7 +164,7 @@ fn predict_core_intent(input: &str, model: &IntentModelFile) -> CoreIntent {
 
     let mut scores = model.bias.clone();
     for feature in &model.features {
-        if let Some(tf_value) = tf.get(feature.token.as_str()) {
+        if let Some(tf_value) = tf.get(&feature.token) {
             let weighted_tf = tf_value * feature.idf;
             for (idx, score) in scores.iter_mut().enumerate() {
                 *score += weighted_tf * feature.weights[idx];
@@ -183,8 +183,8 @@ fn predict_core_intent(input: &str, model: &IntentModelFile) -> CoreIntent {
     label_to_core(model.labels.get(best_idx).map(|s| s.as_str()))
 }
 
-fn extract_tfidf_features(input: &str, cfg: &FeatureConfig) -> FastMap<String, f64> {
-    let mut counts = FastMap::default();
+fn extract_tfidf_features(input: &str, cfg: &FeatureConfig) -> SkipMap<String, f64> {
+    let mut counts = SkipMap::default();
     for ngram in extract_char_ngrams(input, cfg.char_ngram_min, cfg.char_ngram_max) {
         *counts.entry(ngram).or_insert(0.0) += 1.0;
     }

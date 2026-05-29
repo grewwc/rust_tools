@@ -8,7 +8,7 @@ use std::{
 };
 
 use reqwest::Client;
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -180,7 +180,7 @@ pub(super) struct ToolResult {
 #[derive(Debug, Clone, Default)]
 pub(super) struct AgentContext {
     pub(super) tools: Vec<ToolDefinition>,
-    pub(super) mcp_servers: FastMap<String, McpServerConfig>,
+    pub(super) mcp_servers: SkipMap<String, McpServerConfig>,
     pub(super) max_iterations: usize,
 }
 
@@ -190,7 +190,7 @@ pub(in crate::ai) struct McpServerConfig {
     #[serde(default)]
     pub(in crate::ai) args: Vec<String>,
     #[serde(default)]
-    pub(in crate::ai) env: FastMap<String, String>,
+    pub(in crate::ai) env: SkipMap<String, String>,
     #[serde(default = "default_mcp_request_timeout_ms")]
     pub(in crate::ai) request_timeout_ms: u64,
     #[serde(default)]

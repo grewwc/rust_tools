@@ -36,6 +36,12 @@ pub struct SkipMap<K, V> {
 unsafe impl<K: Send, V: Send> Send for SkipMap<K, V> {}
 unsafe impl<K: Send + Sync, V: Send + Sync> Sync for SkipMap<K, V> {}
 
+impl<K: std::fmt::Debug, V: std::fmt::Debug> std::fmt::Debug for SkipMap<K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
 // ============== Serde implementations ==============
 
 impl<K, V> Serialize for SkipMap<K, V>
@@ -219,9 +225,14 @@ impl<K, V> SkipMap<K, V> {
     }
 
     pub fn remove(&mut self, k: &K) -> bool {
+        self.take(k).is_some()
+    }
+
+    /// 移除 key 并返回对应的 value（兼容 HashMap::remove 语义）
+    pub fn take(&mut self, k: &K) -> Option<V> {
         let (updates, found) = self.find(k, self.max_height - 1);
         if found.is_null() {
-            return false;
+            return None;
         }
         unsafe {
             for i in 0..self.max_height {
@@ -232,10 +243,13 @@ impl<K, V> SkipMap<K, V> {
                 }
                 (&mut *prev).forward[i] = *(&*next).forward.get_unchecked(i);
             }
-            drop(Box::from_raw(found as *mut SkipNode<K, V>));
+            let boxed = Box::from_raw(found as *mut SkipNode<K, V>);
+            // MaybeUninit 不会自动 drop 内容，需要手动读出以触发析构
+            let _k = ptr::read(boxed.k.as_ptr());
+            let v = ptr::read(boxed.v.as_ptr());
+            self.len -= 1;
+            Some(v)
         }
-        self.len -= 1;
-        true
     }
 }
 
@@ -345,6 +359,18 @@ impl<'a, K, V> IntoIterator for &'a SkipMap<K, V> {
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
+    }
+}
+
+impl<K, V> IntoIterator for SkipMap<K, V> {
+    type Item = (K, V);
+    type IntoIter = IntoSkipMapIter<K, V>;
+
+    fn into_iter(mut self) -> Self::IntoIter {
+        let first = self.head.forward.first().copied().unwrap_or(ptr::null_mut());
+        self.head.forward.fill(ptr::null_mut());
+        self.len = 0;
+        IntoSkipMapIter { curr_node: first }
     }
 }
 
@@ -458,6 +484,12 @@ where
 // SkipSet 的 Send + Sync 实现
 unsafe impl<T: Ord + Send> Send for SkipSet<T> {}
 unsafe impl<T: Ord + Send + Sync> Sync for SkipSet<T> {}
+
+impl<T: Ord + std::fmt::Debug> std::fmt::Debug for SkipSet<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
 
 // ============== SkipSet Serde implementations ==============
 
@@ -662,6 +694,15 @@ where
     }
 }
 
+impl<'a, T: Ord> IntoIterator for &'a SkipSet<T> {
+    type Item = &'a T;
+    type IntoIter = std::iter::Map<SkipListIter<'a, T, ()>, fn((&'a T, &'a ())) -> &'a T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.iter().map(|(k, _)| k)
+    }
+}
+
 impl<T> FromIterator<T> for Box<SkipSet<T>>
 where
     T: Ord,
@@ -692,6 +733,287 @@ impl<T> Extend<T> for Box<SkipSet<T>>
 where
     T: Ord,
 {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for item in iter {
+            self.insert(item);
+        }
+    }
+}
+
+// ============== SkipMap: Entry API ==============
+
+pub enum Entry<'a, K, V> {
+    Occupied(OccupiedEntry<'a, K, V>),
+    Vacant(VacantEntry<'a, K, V>),
+}
+
+pub struct OccupiedEntry<'a, K, V> {
+    node: *mut SkipNode<K, V>,
+    _marker: PhantomData<&'a mut SkipMap<K, V>>,
+}
+
+pub struct VacantEntry<'a, K, V> {
+    map: &'a mut SkipMap<K, V>,
+    key: K,
+}
+
+impl<'a, K, V> Entry<'a, K, V> {
+    pub fn or_insert(self, default: V) -> &'a mut V {
+        match self {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(default),
+        }
+    }
+
+    pub fn or_insert_with(self, f: impl FnOnce() -> V) -> &'a mut V {
+        match self {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => e.insert(f()),
+        }
+    }
+
+    pub fn or_insert_with_key(self, f: impl FnOnce(&K) -> V) -> &'a mut V {
+        match self {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(e) => {
+                let v = f(&e.key);
+                e.insert(v)
+            }
+        }
+    }
+
+    pub fn or_default(self) -> &'a mut V
+    where
+        V: Default,
+    {
+        self.or_insert_with(V::default)
+    }
+
+    pub fn and_modify(self, f: impl FnOnce(&mut V)) -> Self {
+        match self {
+            Entry::Occupied(mut e) => {
+                f(e.get_mut());
+                Entry::Occupied(e)
+            }
+            Entry::Vacant(e) => Entry::Vacant(e),
+        }
+    }
+
+    pub fn key(&self) -> &K {
+        match self {
+            Entry::Occupied(e) => e.key(),
+            Entry::Vacant(e) => e.key(),
+        }
+    }
+}
+
+impl<'a, K, V> OccupiedEntry<'a, K, V> {
+    pub fn key(&self) -> &K {
+        unsafe { (*self.node).k.assume_init_ref() }
+    }
+
+    pub fn get(&self) -> &V {
+        unsafe { (*self.node).v.assume_init_ref() }
+    }
+
+    pub fn get_mut(&mut self) -> &mut V {
+        unsafe { (*self.node).v.assume_init_mut() }
+    }
+
+    pub fn into_mut(self) -> &'a mut V {
+        unsafe { (*self.node).v.assume_init_mut() }
+    }
+
+    pub fn insert(&mut self, value: V) -> V {
+        unsafe {
+            let old = ptr::read((*self.node).v.as_ptr());
+            (*self.node).v = std::mem::MaybeUninit::new(value);
+            old
+        }
+    }
+}
+
+impl<'a, K, V> VacantEntry<'a, K, V> {
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    pub fn into_key(self) -> K {
+        self.key
+    }
+
+    pub fn insert(self, value: V) -> &'a mut V {
+        self.map.insert_entry(self.key, value)
+    }
+}
+
+// ============== SkipMap: 补充方法 ==============
+
+impl<K, V> SkipMap<K, V> {
+    /// 插入键值对并返回值的可变引用
+    pub fn insert_entry(&mut self, k: K, v: V) -> &mut V {
+        let level = self.level().min(self.max_height - 1);
+        unsafe {
+            let (updates, found) = self.find(&k, level);
+            let found = found as *mut SkipNode<K, V>;
+            if !found.is_null() {
+                let val_ptr = (&mut *found).v.as_mut_ptr();
+                *val_ptr = v;
+                return &mut *val_ptr;
+            }
+            let new_node = SkipNode::new(k, v, self.max_height);
+            for i in (0..=level).rev() {
+                let prev = *updates.get_unchecked(i) as *mut SkipNode<K, V>;
+                if prev == &mut self.head as *mut SkipNode<K, V> {
+                    let tmp = self.head.forward[i];
+                    self.head.forward[i] = new_node;
+                    (&mut *new_node).forward[i] = tmp;
+                } else {
+                    let next = (&*prev).forward[i];
+                    (&mut *prev).forward[i] = new_node;
+                    (&mut *new_node).forward[i] = next;
+                }
+            }
+            self.len += 1;
+            (&mut *new_node).v.assume_init_mut()
+        }
+    }
+
+    /// Entry API，兼容 HashMap 的 entry() 用法
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V> {
+        let found = self.find(&key, self.max_height - 1).1;
+        if found.is_null() {
+            Entry::Vacant(VacantEntry { map: self, key })
+        } else {
+            Entry::Occupied(OccupiedEntry {
+                node: found as *mut SkipNode<K, V>,
+                _marker: PhantomData,
+            })
+        }
+    }
+
+    /// 消耗所有元素，返回迭代器（类似 HashMap::drain）
+    pub fn drain(&mut self) -> IntoSkipMapIter<K, V> {
+        let first = self.head.forward.first().copied().unwrap_or(ptr::null_mut());
+        self.head.forward.fill(ptr::null_mut());
+        self.len = 0;
+        IntoSkipMapIter { curr_node: first }
+    }
+
+    /// 返回 keys 迭代器
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.iter().map(|(k, _)| k)
+    }
+
+    /// 返回 values 迭代器
+    pub fn values(&self) -> impl Iterator<Item = &V> {
+        self.iter().map(|(_, v)| v)
+    }
+
+    /// 返回 values 的可变迭代器
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
+        self.iter_mut().map(|(_, v)| v)
+    }
+
+    /// 返回消耗所有 value 的迭代器
+    pub fn into_values(mut self) -> impl Iterator<Item = V>
+    where
+        K: Ord,
+    {
+        self.drain().map(|(_, v)| v)
+    }
+
+    /// 保留满足条件的元素（需要 K: Clone）
+    pub fn retain(&mut self, mut f: impl FnMut(&K, &mut V) -> bool)
+    where
+        K: Clone,
+    {
+        let keys_to_remove: Vec<K> = self
+            .iter_mut()
+            .filter_map(|(k, v)| if !f(k, v) { Some(k.clone()) } else { None })
+            .collect();
+        for key in &keys_to_remove {
+            self.remove(key);
+        }
+    }
+}
+
+// String-keyed convenience methods
+impl<V> SkipMap<String, V> {
+    /// Convenience lookup for String-keyed maps using &str (allocates a temp String for comparison).
+    pub fn get_str_ref(&self, k: &str) -> Option<&V> {
+        let key = k.to_string();
+        self.get_ref(&key)
+    }
+
+    /// Convenience lookup returning owned value for String-keyed maps using &str.
+    pub fn get_str(&self, k: &str) -> Option<V>
+    where
+        V: Clone,
+    {
+        self.get_str_ref(k).cloned()
+    }
+
+    /// Convenience mutable lookup for String-keyed maps using &str.
+    pub fn get_str_mut(&mut self, k: &str) -> Option<&mut V> {
+        let key = k.to_string();
+        self.get_mut(&key)
+    }
+}
+
+impl<K: Ord, V> Default for SkipMap<K, V> {
+    fn default() -> Self {
+        *SkipMap::new(16, |a: &K, b: &K| a.cmp(b) as i32)
+    }
+}
+
+impl<K: Ord, V> Extend<(K, V)> for SkipMap<K, V> {
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        for (k, v) in iter {
+            self.insert(k, v);
+        }
+    }
+}
+
+impl<K: Ord, V> Extend<(K, V)> for Box<SkipMap<K, V>> {
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        for (k, v) in iter {
+            self.insert(k, v);
+        }
+    }
+}
+
+// ============== SkipSet: 补充方法 ==============
+
+impl<T: Ord> SkipSet<T> {
+    /// 消耗所有元素，返回迭代器
+    pub fn drain(&mut self) -> impl Iterator<Item = T> {
+        self.inner.drain().map(|(k, _)| k)
+    }
+
+    /// 保留满足条件的元素（需要 T: Clone）
+    pub fn retain(&mut self, mut f: impl FnMut(&T) -> bool)
+    where
+        T: Clone,
+    {
+        let to_remove: Vec<T> = self
+            .iter()
+            .filter(|v| !f(v))
+            .cloned()
+            .collect();
+        for v in &to_remove {
+            self.remove(v);
+        }
+    }
+}
+
+impl<T: Ord> Default for SkipSet<T> {
+    fn default() -> Self {
+        SkipSet::new(16)
+    }
+}
+
+impl<T: Ord> Extend<T> for SkipSet<T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         for item in iter {
             self.insert(item);

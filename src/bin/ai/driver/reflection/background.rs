@@ -916,8 +916,8 @@ fn has_polarity_conflict(a: &[String], b: &[String]) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
     }
-    let set_a: std::collections::HashSet<&String> = a.iter().collect();
-    b.iter().any(|t| set_a.contains(t))
+    let set_a: rust_tools::cw::SkipSet<&String> = a.iter().collect();
+    b.iter().any(|t| set_a.contains(&t))
 }
 
 /// 共享的学习/反思质量评估：
@@ -1015,7 +1015,7 @@ impl LearningNoteQualityFeatures {
         } else {
             let unique = tokens
                 .iter()
-                .collect::<std::collections::HashSet<_>>()
+                .collect::<rust_tools::cw::SkipSet<_>>()
                 .len();
             unique as f32 / word_count as f32
         };

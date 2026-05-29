@@ -1,3 +1,4 @@
+use rust_tools::cw::SkipMap;
 use crate::ai::tools::storage::knowledge_cache::{
     CachedKnowledge, KnowledgeType, SessionKnowledgeCache, make_cache_key,
 };
@@ -12,7 +13,7 @@ use crate::ai::tools::storage::memory_store::MemoryStore;
 /// 1. 检查缓存是否过期
 /// 2. 如果过期，重新检索并更新
 /// 3. 根据知识类型决定更新策略
-use rust_tools::commonw::FastMap;
+
 use serde_json::Value;
 
 /// 检查并获取知识（自动处理缓存和过期）
@@ -27,7 +28,7 @@ use serde_json::Value;
 /// * `Err(String)` - 错误信息
 pub fn get_knowledge_with_cache(
     topic: &str,
-    context: &FastMap<String, String>,
+    context: &SkipMap<String, String>,
     force_refresh: bool,
 ) -> Result<String, String> {
     let mut cache = SessionKnowledgeCache::new();
@@ -44,7 +45,7 @@ pub fn get_knowledge_with_cache(
 
         // 推断知识类型（支持新知识类型）
         let description = context
-            .get("description")
+            .get_ref(&"description".to_string())
             .map(|s| s.as_str())
             .unwrap_or(topic);
         let inferred_type = NewKnowledgeType::infer_from_description(description);
@@ -81,7 +82,7 @@ pub fn get_knowledge_with_cache(
                     let knowledge = retrieve_knowledge_for_topic(topic, context)?;
                     let knowledge_type = KnowledgeType::from_category(
                         context
-                            .get("category")
+                            .get_ref(&"category".to_string())
                             .map(|s| s.as_str())
                             .unwrap_or("other"),
                     );
@@ -113,7 +114,7 @@ pub fn get_knowledge_with_cache(
                 // 缓存未命中，重新检索并写回缓存
                 let knowledge = retrieve_knowledge_for_topic(topic, context)?;
                 let description = context
-                    .get("description")
+                    .get_ref(&"description".to_string())
                     .map(|s| s.as_str())
                     .unwrap_or(topic);
                 let inferred_type = NewKnowledgeType::infer_from_description(description);
@@ -142,15 +143,15 @@ pub fn get_knowledge_with_cache(
 /// 为特定主题检索知识
 fn retrieve_knowledge_for_topic(
     topic: &str,
-    context: &FastMap<String, String>,
+    context: &SkipMap<String, String>,
 ) -> Result<String, String> {
     let store = MemoryStore::from_env_or_config();
 
     // 根据主题和上下文构建查询
-    let query = context.get("query").map(|s| s.as_str()).unwrap_or(topic);
-    let category = context.get("category");
+    let query = context.get_ref(&"query".to_string()).map(|s| s.as_str()).unwrap_or(topic);
+    let category = context.get_ref(&"category".to_string());
     let limit = context
-        .get("limit")
+        .get_ref(&"limit".to_string())
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(10);
 
@@ -253,7 +254,7 @@ pub fn execute_knowledge_cache_manage(args: &Value) -> Result<String, String> {
                 .as_str()
                 .ok_or("topic is required for refresh action")?;
 
-            let mut context = FastMap::default();
+            let mut context: SkipMap<String, String> = SkipMap::default();
             if let Some(cat) = args["category"].as_str() {
                 context.insert("category".to_string(), cat.to_string());
             }
@@ -280,10 +281,10 @@ mod tests {
 
     #[test]
     fn test_cache_key_generation() {
-        let mut ctx1 = FastMap::default();
+        let mut ctx1 = SkipMap::default();
         ctx1.insert("project".to_string(), "rust_tools".to_string());
 
-        let mut ctx2 = FastMap::default();
+        let mut ctx2 = SkipMap::default();
         ctx2.insert("project".to_string(), "rust_tools".to_string());
 
         // 相同的上下文应该生成相同的键

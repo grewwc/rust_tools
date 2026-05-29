@@ -6,7 +6,7 @@ use aios_kernel::{
 };
 use chrono::{DateTime, Duration, Local, Utc};
 use colored::Colorize;
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::error::Error;
@@ -34,8 +34,8 @@ mod barrier;
 mod oauth;
 mod sync_task;
 
-static TOOL_FAILURES: LazyLock<Mutex<FastMap<String, usize>>> =
-    LazyLock::new(|| Mutex::new(FastMap::default()));
+static TOOL_FAILURES: LazyLock<Mutex<SkipMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolFailureKind {
@@ -170,8 +170,8 @@ struct AsyncToolEntry {
 }
 
 static ASYNC_TOOL_NEXT_ID: AtomicU64 = AtomicU64::new(1);
-static ASYNC_TOOL_REGISTRY: LazyLock<Mutex<FastMap<String, AsyncToolEntry>>> =
-    LazyLock::new(|| Mutex::new(FastMap::default()));
+static ASYNC_TOOL_REGISTRY: LazyLock<Mutex<SkipMap<String, AsyncToolEntry>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
 
 fn next_async_tool_id() -> String {
     format!(
@@ -219,7 +219,7 @@ fn signal_async_tool_completion(addr: Option<FutexAddr>) {
     }
 }
 
-fn prune_completed_async_tools(registry: &mut FastMap<String, AsyncToolEntry>) {
+fn prune_completed_async_tools(registry: &mut SkipMap<String, AsyncToolEntry>) {
     if registry.len() <= ASYNC_TOOL_REGISTRY_LIMIT {
         return;
     }
@@ -688,7 +688,7 @@ fn lookup_wait_sources(
     let registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
     let mut wait_sources = Vec::new();
     for task_id in task_ids {
-        let Some(entry) = registry.get(task_id) else {
+        let Some(entry) = registry.get_ref(task_id) else {
             return Err(format!("Unknown task_id: {}", task_id));
         };
         if entry.session_id != session_id {
@@ -735,7 +735,7 @@ fn collect_async_task_snapshot(
     let mut pending = Vec::new();
     let registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
     for task_id in task_ids {
-        let Some(entry) = registry.get(task_id) else {
+        let Some(entry) = registry.get_ref(task_id) else {
             return Err(format!("Unknown task_id: {}", task_id));
         };
         if entry.session_id != session_id {
@@ -1149,7 +1149,7 @@ fn execute_tool_spawn(
             },
         );
         signal_async_tool_completion(completion_futex_addr);
-        if let Some(entry) = registry.get(&async_task_id) {
+        if let Some(entry) = registry.get_ref(&async_task_id) {
             let started = async_tool_pipe_message_from_started(&async_task_id, entry, 0);
             send_async_tool_pipe_message(entry, &started);
             persist_async_tool_snapshot(&async_task_id, entry);
@@ -1486,7 +1486,7 @@ fn execute_tool_wait(
         if initial_pending.is_empty() {
             let registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
             for task_id in &task_ids {
-                if let Some(entry) = registry.get(task_id) {
+                if let Some(entry) = registry.get_ref(task_id) {
                     delete_async_tool_snapshot(entry);
                 }
             }
@@ -1575,7 +1575,7 @@ fn execute_tool_wait(
         let mut has_terminal = false;
         let mut has_running = false;
         for task_id in &task_ids {
-            let Some(entry) = registry.get(task_id) else {
+            let Some(entry) = registry.get_ref(task_id) else {
                 return Err(format!("Unknown task_id: {}", task_id));
             };
             if entry.session_id != session_id {
@@ -1599,7 +1599,7 @@ fn execute_tool_wait(
     if pending.is_empty() {
         let registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
         for task_id in &task_ids {
-            if let Some(entry) = registry.get(task_id) {
+            if let Some(entry) = registry.get_ref(task_id) {
                 delete_async_tool_snapshot(entry);
             }
         }
@@ -2620,7 +2620,7 @@ pub(super) fn penalty_for_skill_tools(skill: &crate::ai::skills::SkillManifest) 
     };
     let mut score = 0.0f64;
     for t in tools {
-        if let Some(c) = map.get(t) {
+        if let Some(c) = map.get_ref(t) {
             score += (*c as f64).min(10.0);
         }
     }

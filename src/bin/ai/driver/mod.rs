@@ -31,6 +31,7 @@ use std::{
 };
 
 use aios_kernel::primitives::{ResourceUsageDelta, RlimitDim, RlimitVerdict};
+use rust_tools::cw::SkipMap;
 use uuid::Uuid;
 
 use crate::ai::{
@@ -45,7 +46,6 @@ use crate::ai::{
     tools::task_tools::decode_os_task_goal,
     types::{AgentContext, App},
 };
-use crate::commonw::FastMap;
 use crate::commonw::configw;
 
 pub mod agent_router;
@@ -187,8 +187,8 @@ impl Default for ProcessDispatchMeta {
     }
 }
 
-static SCHEDULER_DISPATCH_META: LazyLock<Mutex<FastMap<u64, ProcessDispatchMeta>>> =
-    LazyLock::new(|| Mutex::new(FastMap::default()));
+static SCHEDULER_DISPATCH_META: LazyLock<Mutex<SkipMap<u64, ProcessDispatchMeta>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
 static SCHEDULER_EPOCH: AtomicU64 = AtomicU64::new(0);
 static SCHEDULER_LAST_EVAL_EPOCH: AtomicU64 = AtomicU64::new(0);
 
@@ -419,7 +419,7 @@ fn record_scheduler_outcome(
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     let prev = *meta_map
-        .get(&pid)
+        .get_ref(&pid)
         .unwrap_or(&ProcessDispatchMeta::default());
     let next = update_dispatch_meta(prev, outcome, epoch);
     meta_map.insert(pid, next);
@@ -441,7 +441,7 @@ fn mark_dispatched_pids(pids: &[u64], epoch: u64) {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     for pid in pids {
-        let mut meta = *meta_map.get(pid).unwrap_or(&ProcessDispatchMeta::default());
+        let mut meta = meta_map.get(pid).unwrap_or(ProcessDispatchMeta::default());
         meta.last_dispatch_epoch = epoch;
         meta_map.insert(*pid, meta);
     }
@@ -558,9 +558,9 @@ fn select_background_batch(
     let mut alt_notes = Vec::new();
     for proc in popped {
         let meta = maybe_promote_half_open(
-            *meta_snapshot
+            meta_snapshot
                 .get(&proc.pid)
-                .unwrap_or(&ProcessDispatchMeta::default()),
+                .unwrap_or(ProcessDispatchMeta::default()),
             epoch,
         );
         let score = scheduler_score(&proc, meta, epoch);
@@ -577,15 +577,15 @@ fn select_background_batch(
 
     eligible.sort_by(|a, b| {
         let a_meta = maybe_promote_half_open(
-            *meta_snapshot
+            meta_snapshot
                 .get(&a.pid)
-                .unwrap_or(&ProcessDispatchMeta::default()),
+                .unwrap_or(ProcessDispatchMeta::default()),
             epoch,
         );
         let b_meta = maybe_promote_half_open(
-            *meta_snapshot
+            meta_snapshot
                 .get(&b.pid)
-                .unwrap_or(&ProcessDispatchMeta::default()),
+                .unwrap_or(ProcessDispatchMeta::default()),
             epoch,
         );
         scheduler_score(b, b_meta, epoch).cmp(&scheduler_score(a, a_meta, epoch))
@@ -1130,7 +1130,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         prompt_editor,
         agent_context: Some(AgentContext {
             tools: Vec::new(),
-            mcp_servers: rust_tools::commonw::FastMap::default(),
+            mcp_servers: rust_tools::cw::SkipMap::default(),
             max_iterations: DEFAULT_MAX_ITERATIONS,
         }),
         last_skill_bias: None,

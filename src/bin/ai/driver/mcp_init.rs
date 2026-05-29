@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::ai::mcp::{McpClient, connection::McpServerConnection};
 use crate::ai::types::{App, McpPrompt, McpResource, McpServerConfig, McpTool};
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 use std::process::{Command, Stdio};
 
 const FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS: u64 = 20_000;
@@ -32,14 +32,14 @@ pub struct McpInitReport {
 
 pub struct PreparedMcpInit {
     pub report: McpInitReport,
-    pub loaded_servers: FastMap<String, McpServerConfig>,
+    pub loaded_servers: SkipMap<String, McpServerConfig>,
     pub client: McpClient,
 }
 
 fn empty_prepared_mcp_init(report: McpInitReport) -> PreparedMcpInit {
     PreparedMcpInit {
         report,
-        loaded_servers: FastMap::default(),
+        loaded_servers: SkipMap::default(),
         client: McpClient::new(),
     }
 }
@@ -168,7 +168,7 @@ async fn prepare_mcp_initialization_from_path_inner(
     };
 
     let mut loaded_servers = servers;
-    for (name, server_cfg) in &mut loaded_servers {
+    for (name, server_cfg) in loaded_servers.iter_mut() {
         if is_feishu_mcp_server(name, &server_cfg.command)
             && server_cfg.request_timeout_ms < FEISHU_MCP_MIN_REQUEST_TIMEOUT_MS
         {
@@ -180,8 +180,9 @@ async fn prepare_mcp_initialization_from_path_inner(
         }
     }
 
+    let server_entries: Vec<_> = loaded_servers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let mut client = McpClient::new();
-    for (name, cfg) in &loaded_servers {
+    for (name, cfg) in &server_entries {
         if interruptible
             && crate::ai::driver::signal::interrupt_sources_ready(local_interrupt_futex)
         {

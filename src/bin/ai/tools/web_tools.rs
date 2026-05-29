@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rust_tools::cw::SkipSet;
 use std::io::Read;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -633,7 +633,7 @@ fn duckduckgo_search_fallback(
 /// Parse DuckDuckGo lite HTML format
 fn parse_duckduckgo_lite(html: &str, limit: usize) -> Vec<WebSearchHit> {
     let mut out = Vec::new();
-    let mut seen_urls = HashSet::new();
+    let mut seen_urls = SkipSet::default();
 
     // Use a more robust regex for lite parsing
     let lite_result_re = Regex::new(
@@ -713,7 +713,7 @@ fn parse_duckduckgo_lite(html: &str, limit: usize) -> Vec<WebSearchHit> {
 /// Parse DuckDuckGo JSON API response
 fn parse_duckduckgo_api(json_str: &str, limit: usize) -> Vec<WebSearchHit> {
     let mut out = Vec::new();
-    let mut seen_urls = HashSet::new();
+    let mut seen_urls = SkipSet::default();
 
     if let Ok(value) = serde_json::from_str::<Value>(json_str) {
         // Extract AbstractURL and Abstract
@@ -822,7 +822,7 @@ fn duckduckgo_search(
 
 fn parse_duckduckgo_html(html: &str, limit: usize) -> Vec<WebSearchHit> {
     let mut out = Vec::new();
-    let mut seen_urls = HashSet::new();
+    let mut seen_urls = SkipSet::default();
 
     // Multiple patterns for robustness
     let title_patterns = [
@@ -1058,7 +1058,7 @@ fn decode_single_entity(entity: &str) -> Option<String> {
 /// Parse SearXNG JSON API response
 fn parse_searxng_json(json_str: &str, limit: usize) -> Vec<WebSearchHit> {
     let mut out = Vec::new();
-    let mut seen_urls = HashSet::new();
+    let mut seen_urls = SkipSet::default();
 
     if let Ok(value) = serde_json::from_str::<Value>(json_str) {
         if let Some(results) = value["results"].as_array() {

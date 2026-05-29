@@ -22,13 +22,11 @@
 // =============================================================================
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use rust_tools::cw::SkipMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
-
-use rust_tools::cw::SkipMap;
 
 use crate::commonw::{configw, utils::expanduser};
 
@@ -396,9 +394,9 @@ struct ProjectInstructionCacheEntry {
     docs: Vec<ProjectInstructionDoc>,
 }
 
-fn project_instruction_cache() -> &'static Mutex<HashMap<PathBuf, ProjectInstructionCacheEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, ProjectInstructionCacheEntry>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn project_instruction_cache() -> &'static Mutex<SkipMap<PathBuf, ProjectInstructionCacheEntry>> {
+    static CACHE: OnceLock<Mutex<SkipMap<PathBuf, ProjectInstructionCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(SkipMap::default()))
 }
 
 fn fingerprint_project_instruction_files(cwd: &Path) -> ProjectInstructionFingerprint {
@@ -427,14 +425,15 @@ fn load_project_instruction_docs_from(cwd: &Path) -> Vec<ProjectInstructionDoc> 
     let fingerprint = fingerprint_project_instruction_files(cwd);
 
     if let Ok(mut cache) = project_instruction_cache().lock() {
-        if let Some(entry) = cache.get(cwd) {
+        let key = cwd.to_path_buf();
+        if let Some(entry) = cache.get_ref(&key) {
             if entry.fingerprint == fingerprint {
                 return entry.docs.clone();
             }
         }
         let docs = load_project_instruction_docs_uncached(cwd);
         cache.insert(
-            cwd.to_path_buf(),
+            key,
             ProjectInstructionCacheEntry {
                 fingerprint,
                 docs: docs.clone(),

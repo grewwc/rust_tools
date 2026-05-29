@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
 
+use rust_tools::cw::SkipSet;
 use serde_json::Value;
 
 use super::{
@@ -911,7 +912,7 @@ fn mid_turn_compress_keeps_tool_pairs_consistent() {
 
     let (compressed, _before, _after) = mid_turn_compress(messages, 4_000);
 
-    let mut assistant_tool_ids = std::collections::HashSet::new();
+    let mut assistant_tool_ids = SkipSet::default();
     for message in &compressed {
         if message.role == "assistant" {
             if let Some(calls) = &message.tool_calls {
@@ -922,7 +923,7 @@ fn mid_turn_compress_keeps_tool_pairs_consistent() {
         }
     }
 
-    let mut tool_message_ids = std::collections::HashSet::new();
+    let mut tool_message_ids = SkipSet::default();
     for message in &compressed {
         if message.role == "tool" {
             if let Some(id) = &message.tool_call_id {

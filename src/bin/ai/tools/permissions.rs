@@ -1,4 +1,4 @@
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 
 /// Permission level for a tool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,7 +14,7 @@ pub enum ToolPermission {
 /// Tool permission manager.
 pub struct ToolPermissions {
     /// Per-tool overrides (tool_name -> permission).
-    overrides: FastMap<String, ToolPermission>,
+    overrides: SkipMap<String, ToolPermission>,
     /// Default permission for unknown tools.
     default: ToolPermission,
     /// Patterns with wildcards (e.g. "execute_*" → Deny).
@@ -25,7 +25,7 @@ impl ToolPermissions {
     /// Create a new manager with default Allow for all tools.
     pub fn new() -> Self {
         Self {
-            overrides: FastMap::default(),
+            overrides: SkipMap::default(),
             default: ToolPermission::Allow,
             patterns: Vec::new(),
         }
@@ -49,7 +49,7 @@ impl ToolPermissions {
 
     /// Check permission for a tool. Most specific match wins: exact > pattern > default.
     pub fn check(&self, name: &str) -> ToolPermission {
-        if let Some(&perm) = self.overrides.get(name) {
+        if let Some(&perm) = self.overrides.get_ref(&name.to_string()) {
             return perm;
         }
         for (pattern, perm) in &self.patterns {

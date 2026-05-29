@@ -330,7 +330,7 @@ fn merge_into_existing_code_discovery(messages: &mut [Message], new_body: &str) 
         let existing_body = content[CODE_DISCOVERY_PREFIX.len()..]
             .trim_start()
             .to_string();
-        let mut seen: std::collections::HashSet<String> = existing_body
+        let mut seen: rust_tools::cw::SkipSet<String> = existing_body
             .lines()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())

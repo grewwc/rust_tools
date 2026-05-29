@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rust_tools::cw::SkipMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -53,15 +53,27 @@ impl ThoughtNode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ThoughtTree {
-    nodes: HashMap<ThoughtNodeId, ThoughtNode>,
+    nodes: SkipMap<ThoughtNodeId, ThoughtNode>,
     next_id: ThoughtNodeId,
     root_id: ThoughtNodeId,
     max_depth: usize,
     max_branches: usize,
     exploration_threshold: f64,
     best_path: Vec<ThoughtNodeId>,
+}
+
+impl std::fmt::Debug for ThoughtTree {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ThoughtTree")
+            .field("next_id", &self.next_id)
+            .field("root_id", &self.root_id)
+            .field("max_depth", &self.max_depth)
+            .field("max_branches", &self.max_branches)
+            .field("nodes_len", &self.nodes.len())
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,7 +95,7 @@ impl ThoughtTree {
             "Initial question".to_string(),
             0,
         );
-        let mut nodes = HashMap::new();
+        let mut nodes = SkipMap::default();
         nodes.insert(0, root);
         Self {
             nodes,
@@ -102,7 +114,7 @@ impl ThoughtTree {
         hypothesis: String,
         reasoning: String,
     ) -> ThoughtNodeId {
-        let parent = match self.nodes.get(&parent_id) {
+        let parent = match self.nodes.get_ref(&parent_id) {
             Some(p) => p.clone(),
             None => return parent_id,
         };
@@ -236,7 +248,7 @@ impl ThoughtTree {
                     .partial_cmp(&b.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
-            .unwrap_or_else(|| self.nodes.get(&self.root_id).unwrap())
+            .unwrap_or_else(|| self.nodes.get_ref(&self.root_id).unwrap())
     }
 
     fn path_to(&self, node_id: ThoughtNodeId) -> Vec<ThoughtNodeId> {
@@ -256,7 +268,7 @@ impl ThoughtTree {
     }
 
     pub fn get_node(&self, id: ThoughtNodeId) -> Option<&ThoughtNode> {
-        self.nodes.get(&id)
+        self.nodes.get_ref(&id)
     }
 
     pub fn get_node_mut(&mut self, id: ThoughtNodeId) -> Option<&mut ThoughtNode> {
@@ -283,7 +295,7 @@ impl ThoughtTree {
         lines: &mut Vec<String>,
         indent: usize,
     ) {
-        if let Some(node) = self.nodes.get(&node_id) {
+        if let Some(node) = self.nodes.get_ref(&node_id) {
             let prefix = "  ".repeat(indent);
             let status = if node.pruned {
                 "✗"
@@ -309,7 +321,7 @@ impl ThoughtTree {
         let mut prompt = String::from("You are in a Tree-of-Thoughts reasoning process.\n\n");
         prompt.push_str("Path taken so far:\n");
         for (i, &node_id) in path.iter().enumerate() {
-            if let Some(node) = self.nodes.get(&node_id) {
+            if let Some(node) = self.nodes.get_ref(&node_id) {
                 prompt.push_str(&format!(
                     "  Step {}: {} (score: {:.2})\n",
                     i + 1,
@@ -321,7 +333,7 @@ impl ThoughtTree {
                 }
             }
         }
-        if let Some(current) = self.nodes.get(&current_node_id) {
+        if let Some(current) = self.nodes.get_ref(&current_node_id) {
             prompt.push_str(&format!("\nCurrent hypothesis: {}\n", current.hypothesis));
             prompt.push_str(&format!("Current reasoning: {}\n", current.reasoning));
         }

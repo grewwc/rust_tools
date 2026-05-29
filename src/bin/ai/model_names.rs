@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::LazyLock;
 
 use crate::commonw::utils::expanduser;
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 use rust_tools::cw::SkipSet;
 
 use super::provider::{ApiProvider, ModelQualityTier, ReasoningEffort};
@@ -76,8 +76,8 @@ where
 
 static USER_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_user_models);
 static BUILTIN_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_builtin_models);
-static USER_BY_NAME: LazyLock<FastMap<String, usize>> = LazyLock::new(build_user_name_index);
-static BUILTIN_BY_NAME: LazyLock<FastMap<String, usize>> = LazyLock::new(build_builtin_name_index);
+static USER_BY_NAME: LazyLock<SkipMap<String, usize>> = LazyLock::new(build_user_name_index);
+static BUILTIN_BY_NAME: LazyLock<SkipMap<String, usize>> = LazyLock::new(build_builtin_name_index);
 
 fn user_config_path() -> PathBuf {
     let home = expanduser("~/.config/rust_tools/models.json");
@@ -130,16 +130,16 @@ fn load_builtin_models() -> Vec<ModelDef> {
     })
 }
 
-fn build_user_name_index() -> FastMap<String, usize> {
-    let mut index = FastMap::default();
+fn build_user_name_index() -> SkipMap<String, usize> {
+    let mut index = SkipMap::default();
     for (i, m) in USER_MODELS.iter().enumerate() {
         index.insert(m.name.clone().to_lowercase(), i);
     }
     index
 }
 
-fn build_builtin_name_index() -> FastMap<String, usize> {
-    let mut index = FastMap::default();
+fn build_builtin_name_index() -> SkipMap<String, usize> {
+    let mut index = SkipMap::default();
     for (i, m) in BUILTIN_MODELS.iter().enumerate() {
         index.insert(m.name.clone().to_lowercase(), i);
     }
@@ -170,12 +170,12 @@ pub fn all() -> Vec<&'static ModelDef> {
 pub fn find_by_name(name: &str) -> Option<&'static ModelDef> {
     let name_lower = name.trim().to_lowercase();
 
-    if let Some(&i) = USER_BY_NAME.get(&name_lower) {
+    if let Some(&i) = USER_BY_NAME.get_ref(&name_lower) {
         return Some(&USER_MODELS[i]);
     }
 
     BUILTIN_BY_NAME
-        .get(&name_lower)
+        .get_ref(&name_lower)
         .map(|&i| &BUILTIN_MODELS[i])
 }
 

@@ -1,4 +1,3 @@
-use rust_tools::commonw::FastMap;
 use std::sync::{LazyLock, Mutex};
 
 use rust_tools::cw::SkipMap;
@@ -40,8 +39,8 @@ pub(crate) struct ToolRegistration {
 
 inventory::collect!(ToolRegistration);
 
-static TOOL_CANCEL_FUTEXES: LazyLock<Mutex<FastMap<u64, FutexAddr>>> =
-    LazyLock::new(|| Mutex::new(FastMap::default()));
+static TOOL_CANCEL_FUTEXES: LazyLock<Mutex<SkipMap<u64, FutexAddr>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
 
 pub(crate) fn ensure_process_tool_cancel_futex(
     os: &mut dyn Kernel,
@@ -50,7 +49,7 @@ pub(crate) fn ensure_process_tool_cancel_futex(
     let mut registry = TOOL_CANCEL_FUTEXES
         .lock()
         .map_err(|_| "tool cancel futex registry poisoned".to_string())?;
-    if let Some(addr) = registry.get(&pid).copied() {
+    if let Some(addr) = registry.get_ref(&pid).copied() {
         return Ok(addr);
     }
     let addr = os.futex_create(0, format!("tool_cancel:pid={pid}"));
@@ -143,10 +142,13 @@ fn with_current_process_ref<T>(f: impl FnOnce(&aios_kernel::kernel::Process) -> 
     os.get_process(pid).map(f)
 }
 
-static TOOL_INDEX: LazyLock<FastMap<&'static str, &'static ToolSpec>> = LazyLock::new(|| {
-    let mut index: FastMap<&'static str, &'static ToolSpec> = FastMap::default();
+static TOOL_INDEX: LazyLock<SkipMap<String, &'static ToolSpec>> = LazyLock::new(|| {
+    let mut index: SkipMap<String, &'static ToolSpec> = SkipMap::default();
     for reg in inventory::iter::<ToolRegistration> {
-        index.entry(reg.spec.name).or_insert(&reg.spec);
+        let name = reg.spec.name.to_string();
+        if !index.contains_key(&name) {
+            index.insert(name, &reg.spec);
+        }
     }
     index
 });
@@ -216,7 +218,7 @@ pub(crate) fn get_tool_definitions_by_names(names: &[String]) -> Vec<ToolDefinit
         SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
 
     for name in names {
-        let Some(spec) = TOOL_INDEX.get(name.as_str()).copied() else {
+        let Some(spec) = TOOL_INDEX.get_ref(&name.to_string()).copied() else {
             continue;
         };
         let tool_def = ToolDefinition {
@@ -237,7 +239,7 @@ pub(crate) fn get_builtin_tool_definitions() -> Vec<ToolDefinition> {
 }
 
 pub(crate) fn get_tool_spec(name: &str) -> Option<&'static ToolSpec> {
-    TOOL_INDEX.get(name).copied()
+    TOOL_INDEX.get_ref(&name.to_string()).copied()
 }
 
 /// Executes a tool call by parsing its arguments and dispatching
@@ -258,7 +260,7 @@ pub(crate) fn execute_tool_call_with_args(
     name: &str,
     args: &Value,
 ) -> Result<ToolResult, String> {
-    let Some(spec) = TOOL_INDEX.get(name).copied() else {
+    let Some(spec) = TOOL_INDEX.get_ref(&name.to_string()).copied() else {
         record_tool_stat(name, false);
         record_tool_decision(name, false, "unknown_tool");
         return Err(format!("Unknown tool: {}", name));
@@ -332,13 +334,13 @@ fn record_tool_failure_experience(name: &str, err: &str) {
     use std::sync::Mutex;
     use std::sync::OnceLock;
     use std::time::Instant;
-    static LAST: OnceLock<Mutex<FastMap<String, Instant>>> = OnceLock::new();
-    let map = LAST.get_or_init(|| Mutex::new(FastMap::default()));
+    static LAST: OnceLock<Mutex<SkipMap<String, Instant>>> = OnceLock::new();
+    let map = LAST.get_or_init(|| Mutex::new(SkipMap::default()));
     {
         let Ok(mut g) = map.lock() else {
             return;
         };
-        if let Some(prev) = g.get(name)
+        if let Some(prev) = g.get_ref(&name.to_string())
             && prev.elapsed() < std::time::Duration::from_secs(300)
         {
             return;

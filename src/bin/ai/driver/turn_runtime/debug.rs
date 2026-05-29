@@ -13,7 +13,8 @@ fn mirror_to_aios_trace(
     msg: &str,
     data: &Value,
 ) {
-    use aios_kernel::{FastMap, primitives::TraceLevel};
+    use aios_kernel::primitives::TraceLevel;
+    use std::collections::HashMap;
 
     let g = match crate::ai::tools::os_tools::GLOBAL_OS.lock() {
         Ok(g) => g,
@@ -25,7 +26,7 @@ fn mirror_to_aios_trace(
     };
     drop(g);
 
-    let mut fields: FastMap<String, String> = FastMap::default();
+    let mut fields: HashMap<String, String> = HashMap::new();
     fields.insert("run_id".to_string(), run_id.to_string());
     fields.insert("hypothesis_id".to_string(), hypothesis_id.to_string());
     fields.insert("location".to_string(), location.to_string());

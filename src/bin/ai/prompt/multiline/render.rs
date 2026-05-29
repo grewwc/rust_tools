@@ -61,6 +61,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // textarea 的渲染区域
     let textarea_area = chunks[0];
 
+    // 在渲染 popup 前清除该区域，防止 resize 时旧内容残留
     f.render_widget(Clear, popup);
 
     let popup_block = Block::default()

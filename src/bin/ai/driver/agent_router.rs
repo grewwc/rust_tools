@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -62,11 +62,11 @@ pub trait AgentRouter: Send + Sync {
 const DEFAULT_AGENT_ROUTE_MODEL_RELATIVE_PATH: &str =
     "src/bin/ai/config/agent_route/agent_route_model.json";
 
-static AGENT_ROUTE_MODEL_CACHE: LazyLock<Mutex<FastMap<PathBuf, Arc<AgentRouteModelFile>>>> =
-    LazyLock::new(|| Mutex::new(FastMap::default()));
+static AGENT_ROUTE_MODEL_CACHE: LazyLock<Mutex<SkipMap<PathBuf, Arc<AgentRouteModelFile>>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
 
-static AGENT_SEMANTIC_CORPUS_CACHE: LazyLock<Mutex<FastMap<String, Arc<AgentSemanticCorpus>>>> =
-    LazyLock::new(|| Mutex::new(FastMap::default()));
+static AGENT_SEMANTIC_CORPUS_CACHE: LazyLock<Mutex<SkipMap<String, Arc<AgentSemanticCorpus>>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct AgentRouteModelFile {
@@ -99,7 +99,7 @@ fn load_route_model(path: &Path) -> Option<Arc<AgentRouteModelFile>> {
     if let Some(cache) = lock_recover(&AGENT_ROUTE_MODEL_CACHE)
         && let Some(model) = cache.get(&path_buf)
     {
-        return Some(Arc::clone(model));
+        return Some(Arc::clone(&model));
     }
 
     let text = fs::read_to_string(path).ok()?;
@@ -137,7 +137,7 @@ fn predict_agent(input: &str, model: &AgentRouteModelFile) -> Option<(String, f6
 
     let mut scores = model.bias.clone();
     for feature in &model.features {
-        if let Some(tf_value) = tf.get(feature.token.as_str()) {
+        if let Some(tf_value) = tf.get_ref(&feature.token) {
             let weighted_tf = tf_value * feature.idf;
             for (idx, score) in scores.iter_mut().enumerate() {
                 *score += weighted_tf * feature.weights[idx];
@@ -163,8 +163,8 @@ fn predict_agent(input: &str, model: &AgentRouteModelFile) -> Option<(String, f6
     Some((label, best_prob))
 }
 
-fn extract_tfidf_features(input: &str, cfg: &FeatureConfig) -> FastMap<String, f64> {
-    let mut counts = FastMap::default();
+fn extract_tfidf_features(input: &str, cfg: &FeatureConfig) -> SkipMap<String, f64> {
+    let mut counts = SkipMap::default();
     for ngram in extract_char_ngrams(input, cfg.char_ngram_min, cfg.char_ngram_max) {
         *counts.entry(ngram).or_insert(0.0) += 1.0;
     }
@@ -288,15 +288,15 @@ struct ScoredAgent<'a> {
 }
 
 struct AgentSemanticCorpus {
-    docs: FastMap<String, FastMap<String, f64>>,
-    idf: FastMap<String, f64>,
+    docs: SkipMap<String, SkipMap<String, f64>>,
+    idf: SkipMap<String, f64>,
 }
 
 impl AgentSemanticCorpus {
     fn for_candidates(candidates: &[&AgentManifest]) -> Arc<Self> {
         let cache_key = agent_semantic_corpus_cache_key(candidates);
         if let Some(cache) = lock_recover(&AGENT_SEMANTIC_CORPUS_CACHE)
-            && let Some(corpus) = cache.get(&cache_key)
+            && let Some(corpus) = cache.get_ref(&cache_key)
         {
             return Arc::clone(corpus);
         }
@@ -312,7 +312,7 @@ impl AgentSemanticCorpus {
     }
 
     fn build(candidates: &[&AgentManifest]) -> Self {
-        let mut docs = FastMap::default();
+        let mut docs = SkipMap::default();
         for agent in candidates {
             let features = TextSimilarityFeatures::from_text(&agent_document_text(agent));
             docs.insert(agent.name.clone(), features.ngram_tf);
@@ -322,8 +322,8 @@ impl AgentSemanticCorpus {
         Self { docs, idf }
     }
 
-    fn document(&self, agent_name: &str) -> Option<&FastMap<String, f64>> {
-        self.docs.get(agent_name)
+    fn document(&self, agent_name: &str) -> Option<&SkipMap<String, f64>> {
+        self.docs.get_str_ref(agent_name)
     }
 }
 

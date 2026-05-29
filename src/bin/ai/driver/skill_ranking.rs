@@ -5,7 +5,7 @@ use std::{
 
 use crate::ai::skills::SkillManifest;
 use crate::commonw::configw;
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 
 use super::{
     TextSimilarityFeatures, UserIntent, build_idf_from_documents, cosine_tfidf_similarity,
@@ -20,8 +20,8 @@ const LOCAL_MODEL_SCORE_SCALE: f64 = 8.0;
 pub const SKILL_NONE_LABEL: &str = "none";
 const RUNTIME_SKILL_MODEL_CACHE_LIMIT: usize = 16;
 
-static RUNTIME_SKILL_MODEL_CACHE: LazyLock<Mutex<FastMap<String, Arc<RuntimeSkillModel>>>> =
-    LazyLock::new(|| Mutex::new(FastMap::default()));
+static RUNTIME_SKILL_MODEL_CACHE: LazyLock<Mutex<SkipMap<String, Arc<RuntimeSkillModel>>>> =
+    LazyLock::new(|| Mutex::new(SkipMap::default()));
 
 #[derive(Debug, Clone)]
 pub struct ScoredSkill<'a> {
@@ -85,7 +85,7 @@ pub fn rank_skills_locally_with_model_path<'a>(
             embedding_capability_score,
             embedding_behavior_score,
         ) = embedding_hits
-            .get(skill.name.as_str())
+            .get(&skill.name)
             .map(|hit| {
                 (
                     hit.score,
@@ -135,9 +135,9 @@ pub fn rank_skills_locally_with_model_path<'a>(
 fn build_embedding_hits(
     skills: &[SkillManifest],
     input: &str,
-) -> Result<FastMap<String, SkillEmbeddingHit>, String> {
+) -> Result<SkipMap<String, SkillEmbeddingHit>, String> {
     if skills.is_empty() || !skill_embedding_routing_enabled() {
-        return Ok(FastMap::default());
+        return Ok(SkipMap::default());
     }
     let documents = skills
         .iter()
@@ -160,8 +160,8 @@ fn skill_embedding_routing_enabled() -> bool {
 }
 
 struct RuntimeSkillModel {
-    docs: FastMap<String, FastMap<String, f64>>,
-    idf: FastMap<String, f64>,
+    docs: SkipMap<String, SkipMap<String, f64>>,
+    idf: SkipMap<String, f64>,
 }
 
 impl RuntimeSkillModel {
@@ -170,7 +170,7 @@ impl RuntimeSkillModel {
         if let Ok(cache) = RUNTIME_SKILL_MODEL_CACHE.lock()
             && let Some(model) = cache.get(&cache_key)
         {
-            return Arc::clone(model);
+            return Arc::clone(&model);
         }
 
         let model = Arc::new(Self::build(skills));
@@ -184,7 +184,7 @@ impl RuntimeSkillModel {
     }
 
     fn build(skills: &[SkillManifest]) -> Self {
-        let mut docs = FastMap::default();
+        let mut docs = SkipMap::default();
         for skill in skills {
             let text = skill_document_text(skill);
             let features = TextSimilarityFeatures::from_text(&text);
@@ -200,7 +200,7 @@ impl RuntimeSkillModel {
         if query.ngram_tf.is_empty() {
             return 0.0;
         }
-        let Some(doc) = self.docs.get(skill_name) else {
+        let Some(doc) = self.docs.get_str_ref(skill_name) else {
             return 0.0;
         };
         cosine_tfidf_similarity(&query.ngram_tf, doc, &self.idf)

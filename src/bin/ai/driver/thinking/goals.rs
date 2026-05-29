@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::{SkipMap, SkipSet};
 use serde::{Deserialize, Serialize};
 
 pub type GoalId = String;
@@ -43,10 +43,10 @@ impl SubGoal {
         }
     }
 
-    pub fn is_ready(&self, completed_ids: &std::collections::HashSet<&GoalId>) -> bool {
+    pub fn is_ready<'a>(&'a self, completed_ids: &SkipSet<&'a GoalId>) -> bool {
         self.depends_on
             .iter()
-            .all(|dep| completed_ids.contains(dep))
+            .all(|dep| completed_ids.contains(&dep))
     }
 }
 
@@ -141,7 +141,7 @@ impl Goal {
     }
 
     pub fn get_next_actionable(&self) -> Vec<&SubGoal> {
-        let completed: std::collections::HashSet<&GoalId> = self
+        let completed: SkipSet<&GoalId> = self
             .sub_goals
             .iter()
             .filter(|s| s.state == GoalState::Completed)
@@ -273,7 +273,7 @@ impl Goal {
 }
 
 pub struct GoalManager {
-    goals: FastMap<GoalId, Goal>,
+    goals: SkipMap<GoalId, Goal>,
     active_goal_id: Option<GoalId>,
     persistence_dir: Option<PathBuf>,
 }
@@ -281,7 +281,7 @@ pub struct GoalManager {
 impl GoalManager {
     pub fn new() -> Self {
         Self {
-            goals: FastMap::default(),
+            goals: SkipMap::default(),
             active_goal_id: None,
             persistence_dir: None,
         }
@@ -323,7 +323,7 @@ impl GoalManager {
     pub fn active_goal(&self) -> Option<&Goal> {
         self.active_goal_id
             .as_ref()
-            .and_then(|id| self.goals.get(id))
+            .and_then(|id| self.goals.get_ref(id))
     }
 
     pub fn deactivate_active_goal(&mut self) {

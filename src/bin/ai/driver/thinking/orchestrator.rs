@@ -1,8 +1,9 @@
-use std::collections::HashSet;
+use rust_tools::cw::SkipSet;
 
 use crate::ai::driver::observer::{
     FinalizeContext, ObserverOutput, PrepareContext, ToolResultContext, TurnObserver,
 };
+
 use crate::ai::driver::thinking::{
     engine::ThoughtTree,
     generalization::ExperienceGeneralizer,
@@ -10,7 +11,7 @@ use crate::ai::driver::thinking::{
     verification::{VerificationOutcome, VerificationStep, VerificationWorkflow},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ThinkingMode {
     TreeOfThoughts,
     VerificationLoop,
@@ -19,7 +20,7 @@ pub enum ThinkingMode {
 
 #[derive(Debug, Clone, Default)]
 pub struct ThinkingDecision {
-    pub active_modes: HashSet<ThinkingMode>,
+    pub active_modes: SkipSet<ThinkingMode>,
     pub inject_into_system_prompt: Option<String>,
     pub next_sub_goal: Option<String>,
     pub verification_step: Option<VerificationStep>,
@@ -30,7 +31,7 @@ pub struct ThinkingOrchestrator {
     pub verification: Option<VerificationWorkflow>,
     pub generalizer: ExperienceGeneralizer,
     pub goal_manager: GoalManager,
-    pub active_modes: HashSet<ThinkingMode>,
+    pub active_modes: SkipSet<ThinkingMode>,
     pub enabled: bool,
     pub current_tree_node_id: Option<crate::ai::driver::thinking::engine::ThoughtNodeId>,
     pub poisoned: bool,
@@ -57,7 +58,7 @@ impl ThinkingOrchestrator {
             verification: None,
             generalizer: ExperienceGeneralizer::new(),
             goal_manager,
-            active_modes: HashSet::new(),
+            active_modes: SkipSet::default(),
             enabled: true,
             current_tree_node_id: None,
             poisoned: false,

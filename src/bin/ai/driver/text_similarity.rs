@@ -12,7 +12,7 @@
 //! 2-4 元 char-ngram，knowledge 端用基于词的 jaccard / dice）。如果将来要合并，
 //! 必须同时验证 routing 与召回两个 pipeline 的回归数据。
 
-use rust_tools::commonw::FastMap;
+use rust_tools::cw::SkipMap;
 use rust_tools::cw::SkipSet;
 
 /// 在 `haystack` 中按 ASCII 词边界查找 `needle`。
@@ -57,7 +57,7 @@ pub struct TextSimilarityFeatures {
     pub normalized: String,
     pub token_set: SkipSet<String>,
     pub char_bigrams: SkipSet<String>,
-    pub ngram_tf: FastMap<String, f64>,
+    pub ngram_tf: SkipMap<String, f64>,
 }
 
 impl TextSimilarityFeatures {
@@ -95,12 +95,12 @@ pub fn normalize_text_for_similarity(input: &str) -> String {
     normalized.trim().to_string()
 }
 
-pub fn extract_ngram_tf_from_normalized(normalized: &str) -> FastMap<String, f64> {
+pub fn extract_ngram_tf_from_normalized(normalized: &str) -> SkipMap<String, f64> {
     if normalized.is_empty() {
-        return FastMap::default();
+        return SkipMap::default();
     }
     let chars = format!("^{normalized}$").chars().collect::<Vec<_>>();
-    let mut counts = FastMap::default();
+    let mut counts = SkipMap::default();
     for n in 2..=4 {
         if chars.len() < n {
             continue;
@@ -122,8 +122,8 @@ pub fn extract_ngram_tf_from_normalized(normalized: &str) -> FastMap<String, f64
     counts
 }
 
-pub fn build_idf_from_documents(docs: &[&FastMap<String, f64>]) -> FastMap<String, f64> {
-    let mut df = FastMap::default();
+pub fn build_idf_from_documents(docs: &[&SkipMap<String, f64>]) -> SkipMap<String, f64> {
+    let mut df = SkipMap::default();
     for doc in docs {
         for token in doc.keys() {
             *df.entry(token.clone()).or_insert(0usize) += 1;
@@ -131,7 +131,7 @@ pub fn build_idf_from_documents(docs: &[&FastMap<String, f64>]) -> FastMap<Strin
     }
 
     let total_docs = docs.len().max(1) as f64;
-    let mut idf = FastMap::default();
+    let mut idf = SkipMap::default();
     for (token, freq) in df {
         let value = ((1.0 + total_docs) / (1.0 + freq as f64)).ln() + 1.0;
         idf.insert(token, value);
@@ -140,24 +140,24 @@ pub fn build_idf_from_documents(docs: &[&FastMap<String, f64>]) -> FastMap<Strin
 }
 
 pub fn cosine_tfidf_similarity(
-    query_tf: &FastMap<String, f64>,
-    doc_tf: &FastMap<String, f64>,
-    idf: &FastMap<String, f64>,
+    query_tf: &SkipMap<String, f64>,
+    doc_tf: &SkipMap<String, f64>,
+    idf: &SkipMap<String, f64>,
 ) -> f64 {
     let mut dot = 0.0;
     let mut query_norm = 0.0;
     let mut doc_norm = 0.0;
 
     for (token, tf) in query_tf {
-        let weight = *tf * idf.get(token.as_str()).copied().unwrap_or(1.0);
+        let weight = *tf * idf.get(token).unwrap_or(1.0);
         query_norm += weight * weight;
-        if let Some(doc_tf) = doc_tf.get(token.as_str()) {
-            let doc_weight = *doc_tf * idf.get(token.as_str()).copied().unwrap_or(1.0);
+        if let Some(doc_tf_val) = doc_tf.get(token) {
+            let doc_weight = doc_tf_val * idf.get(token).unwrap_or(1.0);
             dot += weight * doc_weight;
         }
     }
     for (token, tf) in doc_tf {
-        let weight = *tf * idf.get(token.as_str()).copied().unwrap_or(1.0);
+        let weight = *tf * idf.get(token).unwrap_or(1.0);
         doc_norm += weight * weight;
     }
     if query_norm <= f64::EPSILON || doc_norm <= f64::EPSILON {

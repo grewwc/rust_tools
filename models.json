@@ -19,6 +19,7 @@
     "provider": "openai",
     "is_vl": true,
     "search_enabled": true,
+    "default_reasoning_effort": "high",
     "tools_default_enabled": true,
     "enable_thinking": true
   },
