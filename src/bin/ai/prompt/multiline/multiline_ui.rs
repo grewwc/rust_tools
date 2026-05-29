@@ -37,11 +37,12 @@ fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>)
 
     // 2) 清除整个 viewport 区域。ratatui inline viewport 在 resize 时
     //    旧的 Borders::TOP 可能残留在光标上方，仅 FromCursorDown 不够。
-    //    先将光标移到 viewport 顶部，再清除到底部，确保旧边框不残留。
-    let viewport_h = terminal.size().map(|s| s.height).unwrap_or(20);
+    //    使用实际终端高度而非 viewport 高度来上移光标，确保行回绕后仍然
+    //    能覆盖到旧边框位置。
+    let clear_rows = terminal_size().map(|(_, h)| h).unwrap_or(40);
     let _ = execute!(
         io::stdout(),
-        crossterm::cursor::MoveUp(viewport_h),
+        crossterm::cursor::MoveUp(clear_rows),
         crossterm::cursor::MoveToColumn(0),
         Clear(ClearType::FromCursorDown)
     );

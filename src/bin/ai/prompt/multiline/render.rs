@@ -61,12 +61,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // textarea 的渲染区域
     let textarea_area = chunks[0];
 
-    // 清除整个终端区域，确保 resize 时任何旧 popup 位置的内容都被清除
-    // 如果 popup 在 resize 后缩小或偏移，旧的边框/文本会留在旧位置
-    // Clear 通过写入空格覆盖整个 buffer，防止残留积累
-    f.render_widget(Clear, popup);
-    // 额外清除 popup 区域，确保 popup 边框所在位置被强制清除
-    // 防止 resize 时旧横线积累（终端后端在快速 resize 时可能延迟处理清除序列）
+    // 清除 popup 区域，确保 resize 后旧边框/文本不残留
     f.render_widget(Clear, popup);
 
     let popup_block = Block::default()

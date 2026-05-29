@@ -55,7 +55,7 @@
     "key": "QWEN_VL_FLASH",
     "name": "qwen3.6-flash",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-    "quality_tier": "basic",
+    "quality_tier": "strong",
     "is_vl": true,
     "search_enabled": false,
     "tools_default_enabled": false,
