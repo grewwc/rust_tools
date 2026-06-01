@@ -647,8 +647,62 @@ fn normalize_tool_call_arguments(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return Some("{}".to_string());
     }
-    serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
-    Some(trimmed.to_string())
+    // 标准路径：整体就是合法 JSON。
+    if serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
+        return Some(trimmed.to_string());
+    }
+    // 部分 provider（qwen3.7 等）在 delta.tool_calls.arguments 中混入 XML
+    // parameter 标签（如 `{"k":"v"}</parameter><parameter-langs>...</parameter></function>`）。
+    // 尝试用 Hermes body 解析器提取参数。
+    if trimmed.contains("<parameter=") || trimmed.contains("</parameter>") {
+        if let Some(args) = parse_hermes_function_body(trimmed) {
+            return Some(args);
+        }
+    }
+    // 尝试截取 JSON 对象前缀：从 '{' 开始找到最后一个配对的 '}'。
+    if trimmed.starts_with('{') {
+        if let Some(end) = find_json_object_end(trimmed) {
+            let candidate = &trimmed[..=end];
+            if serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// 从字符串开头的 `{` 开始，追踪大括号嵌套深度，跳过字符串字面量，返回配对 `}` 的索引。
+fn find_json_object_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_string {
+            if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn collect_valid_tool_calls(
