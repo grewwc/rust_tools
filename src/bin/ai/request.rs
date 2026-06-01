@@ -1718,11 +1718,28 @@ pub async fn do_request_json(
         let endpoint = endpoint_for_request_model(app, model);
         let api_key = api_key_for_request_model(app, model);
         let t0 = Instant::now();
-        let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await;
+        // 非流式辅助请求：每次尝试 60 秒超时
+        let send_future = async {
+            let resp = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .send()
+                .await?;
+            Ok::<_, reqwest::Error>(resp)
+        };
+        let response = match tokio::time::timeout(Duration::from_secs(60), send_future).await {
+            Ok(result) => result,
+            Err(_) => {
+                if attempt < REQUEST_MAX_ATTEMPTS {
+                    eprintln!(
+                        "[Warning] do_request_json timeout (60s), retrying (attempt {}/{})",
+                        attempt, REQUEST_MAX_ATTEMPTS
+                    );
+                    continue;
+                }
+                return Err("do_request_json: all attempts timed out".into());
+            }
+        };
 
         match response {
             Ok(response) => {
@@ -2026,17 +2043,29 @@ confidence ∈ [0,1]，对边界样本请给低值（<0.6）。"
 
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
-    let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
-        .header("Content-Type", "application/json")
-        .json(&request_body)
-        .send()
-        .await
-        .ok()?;
-    if !response.status().is_success() {
-        eprintln!("[intent:llm] http non-success status={}", response.status());
-        return None;
-    }
-    let text = response.text().await.ok()?;
+
+    // 意图分类是辅助请求，给 15 秒超时足够；避免因 API 无响应卡住整个 turn
+    let request_future = async {
+        let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            eprintln!("[intent:llm] http non-success status={}", response.status());
+            return None;
+        }
+        response.text().await.ok()
+    };
+    let text = match tokio::time::timeout(Duration::from_secs(15), request_future).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return None,
+        Err(_) => {
+            eprintln!("[intent:llm] timeout (15s), skipping");
+            return None;
+        }
+    };
     let v: Value = serde_json::from_str(&text).ok()?;
     let content = extract_router_content(&v)?;
 

@@ -1189,7 +1189,6 @@ static BACKGROUND_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(300))
             .build()
             .unwrap_or_default()
     });
@@ -1227,13 +1226,29 @@ pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Optio
     } else {
         req.bearer_auth(api_key)
     };
-    let resp = req
+    // 后台反射请求：60 秒超时，避免永久阻塞 daemon 任务
+    let send_future = req
         .header("Content-Type", "application/json")
         .json(&body)
-        .send()
-        .await
-        .ok()?;
-    let text = resp.text().await.ok()?;
+        .send();
+    let resp = match tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        send_future,
+    )
+    .await
+    {
+        Ok(r) => r.ok()?,
+        Err(_) => return None,
+    };
+    let text = match tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        resp.text(),
+    )
+    .await
+    {
+        Ok(r) => r.ok()?,
+        Err(_) => return None,
+    };
     serde_json::from_str::<Value>(&text).ok()
 }
 

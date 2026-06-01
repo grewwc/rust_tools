@@ -1079,7 +1079,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let current_model = models::initial_model(&cli);
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(300))
         .build()?;
     let prompt_editor = if cli.args.is_empty() {
         Some(PromptEditor::new(
