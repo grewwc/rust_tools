@@ -1077,7 +1077,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let writer =
         config::open_output_writer(cli.out.as_deref())?.map(|f| Arc::new(std::sync::Mutex::new(f)));
     let current_model = models::initial_model(&cli);
-    let client = reqwest::Client::builder().build()?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?;
     let prompt_editor = if cli.args.is_empty() {
         Some(PromptEditor::new(
             &session_id,

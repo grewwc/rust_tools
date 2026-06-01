@@ -1,6 +1,6 @@
 use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::ai::{
     driver::print::format_section_header,
@@ -28,6 +28,13 @@ const DECODE_ERROR_RETRY_DELAY_MS: u64 = 100;
 /// final snapshot immediately after the finish chunk.
 const FINISH_REASON_GRACE_MS: u64 = 750;
 
+/// 空闲超时：已收到内容后长时间无新 chunk 到达，视为服务端已静默结束。
+/// 部分 provider 在输出完毕后既不发送 finish_reason 也不关闭连接，只能靠此超时兜底。
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
+/// 首 chunk 超时：请求已发出但服务端迟迟不发第一个字节（排队/网关卡住等）。
+/// 比 idle 超时更长，因为某些模型冷启动或排队需要时间。
+const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
+
 pub(super) async fn stream_response(
     app: &mut App,
     response: &mut reqwest::Response,
@@ -45,11 +52,24 @@ pub(super) async fn stream_response(
         print_waiting_hint(&mut state)?;
     }
 
+    let mut last_chunk_at = Instant::now();
+    let has_content = |s: &StreamProcessingState| -> bool {
+        !s.content.assistant_text.is_empty()
+            || !s.content.reasoning_text.is_empty()
+            || !s.content.tool_calls_map.is_empty()
+    };
+
     while !app.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         if let Some(result) = immediate_cancel_result(app, state.content.thinking_open) {
             return Ok(result);
         }
 
+        // 已有内容时用较短的 idle 超时，无内容时用较长的首 chunk 超时
+        let timeout_secs = if has_content(&state) {
+            STREAM_IDLE_TIMEOUT_SECS
+        } else {
+            STREAM_FIRST_CHUNK_TIMEOUT_SECS
+        };
         let chunk_result = if state.content.finish_reason_seen {
             tokio::select! {
                 chunk = response.chunk() => chunk,
@@ -59,10 +79,14 @@ pub(super) async fn stream_response(
                 _ = tokio::time::sleep(Duration::from_millis(FINISH_REASON_GRACE_MS)) => break,
             }
         } else {
+            let idle_remaining = Duration::from_secs(timeout_secs).saturating_sub(last_chunk_at.elapsed());
             tokio::select! {
                 chunk = response.chunk() => chunk,
                 _ = wait_for_interrupt(app) => {
                     return Ok(cancelled_stream_result(state.content.thinking_open));
+                }
+                _ = tokio::time::sleep(idle_remaining) => {
+                    break;
                 }
             }
         };
@@ -77,7 +101,9 @@ pub(super) async fn stream_response(
         )
         .await?
         {
-            StreamChunkStep::Continue => {}
+            StreamChunkStep::Continue => {
+                last_chunk_at = Instant::now();
+            }
             StreamChunkStep::Stop => break,
             StreamChunkStep::Return(result) => return Ok(result),
         }
