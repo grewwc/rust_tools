@@ -437,6 +437,14 @@ const REQUEST_MAX_ATTEMPTS: usize = 6;
 const REQUEST_MAX_ATTEMPTS_429: usize = 16; // 429 错误重试 16 次
 const REQUEST_RETRY_BASE_MS: u64 = 500;
 const REQUEST_RETRY_MAX_MS: u64 = 4000;
+/// 流式请求等待响应头（首字节）的超时。
+///
+/// 主 `app.client` 仅保留 `connect_timeout`（不设置整体 `.timeout()`，
+/// 否则会误杀长时间的流式 body 读取）。但 `connect_timeout` 只覆盖 TCP/TLS
+/// 握手，不覆盖“连接已建立、服务端迟迟不返回响应头”的场景——此时
+/// `.send().await` 会永久阻塞、CPU 占用为 0，表现为 agent 卡死。
+/// 因此对流式 `send()` 单独加一个响应头等待超时兜底。
+const STREAM_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 90;
 const DEFAULT_AUTO_THINKING_THRESHOLD: f64 = 0.7;
 const DEFAULT_CONTROL_MODEL: &str = "qwen3.5-flash";
 
@@ -885,11 +893,45 @@ pub(super) async fn do_request_messages(
     for attempt in 1..=REQUEST_MAX_ATTEMPTS_429 {
         let endpoint = endpoint_for_request_model(app, model);
         let api_key = api_key_for_request_model(app, model);
-        let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+        let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
             .header("Content-Type", "application/json")
             .json(&request_body)
-            .send()
-            .await;
+            .send();
+        // 给“等待响应头”加超时兜底：connect_timeout 只覆盖握手，无法拦截
+        // 服务端接受连接后迟迟不返回响应头导致的永久阻塞（CPU 0 卡死）。
+        let response = match tokio::time::timeout(
+            Duration::from_secs(STREAM_RESPONSE_HEADER_TIMEOUT_SECS),
+            send_future,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                if attempt < REQUEST_MAX_ATTEMPTS {
+                    let delay = retry_delay(attempt);
+                    eprintln!(
+                        "[Warning] 等待响应头超时 ({}s) - sleep {} 秒后重试 (attempt {}/{})",
+                        STREAM_RESPONSE_HEADER_TIMEOUT_SECS,
+                        delay.as_secs_f32(),
+                        attempt,
+                        REQUEST_MAX_ATTEMPTS
+                    );
+                    if sleep_with_cancel(app, delay).await {
+                        return Err(RequestError::cancelled(
+                            "request canceled by user during retry wait",
+                        ));
+                    }
+                    continue;
+                }
+                return Err(RequestError {
+                    kind: RequestErrorKind::Network,
+                    message: format!(
+                        "request timed out waiting for response headers after {} attempts",
+                        REQUEST_MAX_ATTEMPTS
+                    ),
+                });
+            }
+        };
 
         match response {
             Ok(response) => {
@@ -1910,16 +1952,32 @@ pub(super) async fn summarize_history_via_model(
     );
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
-    let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+    // 历史摘要是 turn 收尾的后台辅助请求（任务边界压缩会在每次答案交付后触发）。
+    // 主 client 只有 connect_timeout、没有整体 timeout，若摘要模型接受连接后迟迟
+    // 不返回响应头，这里的裸 .send()/.text() 会永久阻塞、CPU 0，表现为“答案已输出
+    // 但迟迟不回到提示符”的卡死。用显式超时兜底，超时即放弃摘要（保持原始历史）。
+    let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
         .json(&request_body)
-        .send()
-        .await
-        .ok()?;
+        .send();
+    let response =
+        match tokio::time::timeout(Duration::from_secs(60), send_future).await {
+            Ok(r) => r.ok()?,
+            Err(_) => {
+                eprintln!("[summary] timeout (60s) waiting for response headers, skipping");
+                return None;
+            }
+        };
     if !response.status().is_success() {
         return None;
     }
-    let text = response.text().await.ok()?;
+    let text = match tokio::time::timeout(Duration::from_secs(30), response.text()).await {
+        Ok(r) => r.ok()?,
+        Err(_) => {
+            eprintln!("[summary] timeout (30s) reading response body, skipping");
+            return None;
+        }
+    };
     let v: Value = serde_json::from_str(&text).ok()?;
     let content = extract_router_content(&v)?;
     let trimmed = content.trim();
