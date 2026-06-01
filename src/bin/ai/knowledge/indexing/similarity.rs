@@ -10,8 +10,7 @@
 //! 注意：如果将来要将两套实现合并，需要同时验证 RAG / memory 召回 与 skill /
 //! agent routing 两侧的回归数据。
 
-use rust_tools::cw::SkipMap;
-use rust_tools::cw::SkipSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Cosine similarity between two f32 vectors.
 /// Returns 0.0 for empty or mismatched vectors.
@@ -64,7 +63,7 @@ pub fn dice_coefficient(a: &[(char, char)], b: &[(char, char)]) -> f64 {
         return 0.0;
     }
     let mut count = 0usize;
-    let mut map: SkipMap<(char, char), usize> = SkipMap::default();
+    let mut map: FxHashMap<(char, char), usize> = FxHashMap::default();
     for x in a {
         *map.entry(*x).or_insert(0) += 1;
     }
@@ -120,7 +119,7 @@ pub fn tokenize(s: &str) -> Vec<String> {
 /// Expand tokens by deduplicating (preserving order).
 pub fn expand_tokens(tokens: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(tokens.len());
-    let mut seen: SkipSet<String> = SkipSet::default();
+    let mut seen: FxHashSet<String> = FxHashSet::default();
     for t in tokens {
         let tnorm = t.to_lowercase();
         if seen.insert(tnorm.clone()) {

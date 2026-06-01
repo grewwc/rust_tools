@@ -7,7 +7,6 @@ use rustc_hash::FxHashMap;
 
 use crate::ai::skills::SkillManifest;
 use crate::commonw::configw;
-use rust_tools::cw::SkipMap;
 
 use super::{
     TextSimilarityFeatures, UserIntent, build_idf_from_documents, cosine_tfidf_similarity,
@@ -22,8 +21,8 @@ const LOCAL_MODEL_SCORE_SCALE: f64 = 8.0;
 pub const SKILL_NONE_LABEL: &str = "none";
 const RUNTIME_SKILL_MODEL_CACHE_LIMIT: usize = 16;
 
-static RUNTIME_SKILL_MODEL_CACHE: LazyLock<Mutex<SkipMap<String, Arc<RuntimeSkillModel>>>> =
-    LazyLock::new(|| Mutex::new(SkipMap::default()));
+static RUNTIME_SKILL_MODEL_CACHE: LazyLock<Mutex<FxHashMap<String, Arc<RuntimeSkillModel>>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 #[derive(Debug, Clone)]
 pub struct ScoredSkill<'a> {
@@ -137,9 +136,9 @@ pub fn rank_skills_locally_with_model_path<'a>(
 fn build_embedding_hits(
     skills: &[SkillManifest],
     input: &str,
-) -> Result<SkipMap<String, SkillEmbeddingHit>, String> {
+) -> Result<FxHashMap<String, SkillEmbeddingHit>, String> {
     if skills.is_empty() || !skill_embedding_routing_enabled() {
-        return Ok(SkipMap::default());
+        return Ok(FxHashMap::default());
     }
     let documents = skills
         .iter()

@@ -1,4 +1,4 @@
-use rust_tools::cw::{SkipMap, SkipSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
 use crate::ai::{
@@ -330,7 +330,7 @@ fn merge_into_existing_code_discovery(messages: &mut [Message], new_body: &str) 
         let existing_body = content[CODE_DISCOVERY_PREFIX.len()..]
             .trim_start()
             .to_string();
-        let mut seen: rust_tools::cw::SkipSet<String> = existing_body
+        let mut seen: FxHashSet<String> = existing_body
             .lines()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty())
@@ -461,7 +461,7 @@ fn collect_completed_repo_inspection_calls(turn_messages: &[Message]) -> Vec<Str
     }
 
     let mut out = Vec::new();
-    let mut seen = SkipSet::new(16);
+    let mut seen = FxHashSet::default();
     for message in turn_messages {
         let Some(tool_calls) = &message.tool_calls else {
             continue;
@@ -514,10 +514,10 @@ fn collect_repo_inspection_findings(turn_messages: &[Message]) -> Vec<RepoInspec
                 Some((id.clone(), content))
             })
         })
-        .collect::<SkipMap<_, _>>();
+        .collect::<FxHashMap<_, _>>();
 
     let mut findings = Vec::new();
-    let mut seen = SkipSet::new(16);
+    let mut seen = FxHashSet::default();
 
     for message in turn_messages {
         let Some(tool_calls) = &message.tool_calls else {

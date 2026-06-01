@@ -1,7 +1,6 @@
 /// BM25 indexing and scoring — extracted from memory_store.rs.
 /// Pure BM25 implementation, no embedding or similarity logic.
-use rust_tools::cw::SkipMap;
-use rust_tools::cw::SkipSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::similarity;
 
@@ -38,12 +37,12 @@ pub fn compute_bm25_scores(
     let nq_tokens = similarity::expand_tokens(&similarity::tokenize(&query_lc));
 
     // Compute document frequency and average document length
-    let mut df: SkipMap<String, usize> = SkipMap::default();
+    let mut df: FxHashMap<String, usize> = FxHashMap::default();
     let mut avgdl = 0.0f64;
 
     for doc in docs {
         avgdl += doc.tokens.len() as f64;
-        let mut set = SkipSet::default();
+        let mut set: FxHashSet<String> = FxHashSet::default();
         for t in &doc.tokens {
             if set.insert(t.clone()) {
                 *df.entry(t.clone()).or_insert(0) += 1;
@@ -56,7 +55,7 @@ pub fn compute_bm25_scores(
     let mut scored: Vec<(usize, f64)> = Vec::with_capacity(docs.len());
 
     for doc in docs {
-        let mut tf: SkipMap<&str, usize> = SkipMap::default();
+        let mut tf: FxHashMap<&str, usize> = FxHashMap::default();
         for t in &doc.tokens {
             *tf.entry(t.as_str()).or_insert(0) += 1;
         }
@@ -65,13 +64,13 @@ pub fn compute_bm25_scores(
         let dl = doc.tokens.len() as f64;
 
         for qt in &nq_tokens {
-            let dfv = *df.get_ref(qt).unwrap_or(&0) as f64;
+            let dfv = *df.get(qt).unwrap_or(&0) as f64;
             if dfv <= 0.0 {
                 continue;
             }
             let idf = ((n_docs - dfv + 0.5) / (dfv + 0.5) + 1.0).ln();
             let qt_s: &str = qt.as_str();
-            let tfv = *tf.get_ref(&qt_s).unwrap_or(&0) as f64;
+            let tfv = *tf.get(qt_s).unwrap_or(&0) as f64;
             if tfv <= 0.0 {
                 continue;
             }

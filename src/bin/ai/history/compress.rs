@@ -1883,11 +1883,11 @@ fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
 /// 仅压缩内容，不删除消息，避免 assistant tool_calls 与 tool 响应的配对断裂。
 /// 最近 KEEP_RECENT_TOOL_MESSAGES 条 tool 消息一律保留全文。
 fn dedup_repeated_tool_results(messages: &mut [Message]) {
-    use rust_tools::cw::SkipMap;
+    use rustc_hash::FxHashMap;
 
     // 收集 (tool_name, args_signature) → 出现次数与索引
     // 通过 assistant.tool_calls 关联 tool_call_id → (name, args)
-    let mut id_to_signature: SkipMap<String, (String, String)> = SkipMap::default();
+    let mut id_to_signature: FxHashMap<String, (String, String)> = FxHashMap::default();
     for message in messages.iter() {
         if let Some(tool_calls) = &message.tool_calls {
             for tc in tool_calls {
@@ -1909,12 +1909,12 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
     }
     let protected_from = tool_indices.len().saturating_sub(KEEP_RECENT_TOOL_MESSAGES);
 
-    let mut seen: SkipMap<(String, String), usize> = SkipMap::default();
+    let mut seen: FxHashMap<(String, String), usize> = FxHashMap::default();
     for (rank, &idx) in tool_indices.iter().enumerate() {
         let signature = messages[idx]
             .tool_call_id
             .as_ref()
-            .and_then(|id| id_to_signature.get_ref(id))
+            .and_then(|id| id_to_signature.get(id))
             .cloned();
         let signature = match signature {
             Some(sig) => sig,

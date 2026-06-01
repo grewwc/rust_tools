@@ -30,7 +30,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use rust_tools::cw::{SkipMap, SkipSet};
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::memory_index::MemoryIndex;
 use super::with_memory_file_lock;
@@ -464,13 +464,13 @@ impl MemoryStore {
             return Ok(Vec::new());
         }
         let nq_tokens = similarity::expand_tokens(&similarity::tokenize(&query_lc));
-        let mut df: SkipMap<String, usize> = SkipMap::default();
+        let mut df: FxHashMap<String, usize> = FxHashMap::default();
         let mut avgdl = 0.0f64;
         for (_, _, toks) in &docs {
             avgdl += toks.len() as f64;
-            let mut set = SkipSet::default();
+            let mut set: FxHashSet<&str> = FxHashSet::default();
             for t in toks {
-                if set.insert(t) {
+                if set.insert(t.as_str()) {
                     *df.entry(t.clone()).or_insert(0) += 1;
                 }
             }
@@ -482,23 +482,23 @@ impl MemoryStore {
         let mut scored: Vec<(f64, usize)> = Vec::with_capacity(docs.len());
         let mut bm25_vals: Vec<f64> = Vec::with_capacity(docs.len());
         for (idx, (entry, _full, toks)) in docs.iter().enumerate() {
-            let mut tf: SkipMap<&str, usize> = SkipMap::default();
+            let mut tf: FxHashMap<&str, usize> = FxHashMap::default();
             for t in toks {
                 *tf.entry(t.as_str()).or_insert(0) += 1;
             }
             let mut bm25 = 0.0f64;
             let dl = toks.len() as f64;
-            let mut seenq = SkipSet::default();
+            let mut seenq: FxHashSet<&str> = FxHashSet::default();
             for qt in &nq_tokens {
-                if !seenq.insert(qt) {
+                if !seenq.insert(qt.as_str()) {
                     continue;
                 }
-                let dfv = *df.get_ref(qt).unwrap_or(&0) as f64;
+                let dfv = *df.get(qt.as_str()).unwrap_or(&0) as f64;
                 if dfv <= 0.0 {
                     continue;
                 }
                 let idf = ((n_docs - dfv + 0.5) / (dfv + 0.5) + 1.0).ln();
-                let tfv = *tf.get_ref(&qt.as_str()).unwrap_or(&0) as f64;
+                let tfv = *tf.get(qt.as_str()).unwrap_or(&0) as f64;
                 if tfv <= 0.0 {
                     continue;
                 }
