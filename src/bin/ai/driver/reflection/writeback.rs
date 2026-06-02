@@ -121,21 +121,22 @@ pub(super) async fn maybe_write_back_project_knowledge(
     // critic-revise 的后台模式保持一致；dedup 缓存已在上方同步写入，不会重复 spawn。
     use aios_kernel::primitives::DaemonKind;
     let kernel = app.os.clone();
-    let (handle, cancel_token, interrupt_futex) = {
+    let (handle, cancel_token) = {
         let mut os = match kernel.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         let parent_pid = os.current_process_id();
-        let (handle, cancel_token) = os.daemon_register(
+        os.daemon_register(
             format!("project_writeback:{project_name}"),
             DaemonKind::Reflection,
             parent_pid,
-        );
-        let interrupt_futex =
-            crate::ai::driver::signal::alloc_interrupt_futex("project_writeback_interrupt");
-        (handle, cancel_token, interrupt_futex)
+        )
     };
+    // 必须在释放 kernel 锁之后再调用：alloc_interrupt_futex 内部会再次锁同一把
+    // Arc<Mutex<Kernel>>（GLOBAL_OS 与 app.os 共享），在持锁时调用会自死锁。
+    let interrupt_futex =
+        crate::ai::driver::signal::alloc_interrupt_futex("project_writeback_interrupt");
 
     tokio::spawn(async move {
         tokio::select! {

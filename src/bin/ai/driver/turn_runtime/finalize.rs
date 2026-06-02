@@ -187,21 +187,22 @@ fn maybe_spawn_critic_revise_background(app: &App, question: &str, final_assista
     // 登记 daemon：critic/revise 是典型的后台反思类。
     use aios_kernel::primitives::DaemonKind;
     let kernel = app.os.clone();
-    let (handle, cancel_token, interrupt_futex) = {
+    let (handle, cancel_token) = {
         let mut os = match kernel.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         let parent_pid = os.current_process_id();
-        let (handle, cancel_token) = os.daemon_register(
+        os.daemon_register(
             "critic_revise_background".to_string(),
             DaemonKind::Reflection,
             parent_pid,
-        );
-        let interrupt_futex =
-            crate::ai::driver::signal::alloc_interrupt_futex("critic_revise_interrupt");
-        (handle, cancel_token, interrupt_futex)
+        )
     };
+    // 必须在释放 kernel 锁之后再调用：alloc_interrupt_futex 内部会再次锁同一把
+    // Arc<Mutex<Kernel>>（GLOBAL_OS 与 app.os 共享），在持锁时调用会自死锁。
+    let interrupt_futex =
+        crate::ai::driver::signal::alloc_interrupt_futex("critic_revise_interrupt");
 
     tokio::spawn(async move {
         tokio::select! {
