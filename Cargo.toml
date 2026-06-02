@@ -66,5 +66,5 @@ objc2-foundation = "0.3"
 objc2-vision = { version = "0.3", features = ["VNRequest", "VNObservation"] }
 
 [profile.release]
-strip = true
+strip = false
 panic = "abort"

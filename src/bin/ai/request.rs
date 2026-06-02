@@ -770,12 +770,16 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
 
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
-    let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+    // 辅助请求（thinking gate），15 秒超时兜底：主 client 无整体 timeout，
+    // 仅 connect_timeout 不覆盖“连上但服务端不回响应头”的永久阻塞。
+    let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
         .json(&request_body)
-        .send()
-        .await
-        .ok()?;
+        .send();
+    let response = match tokio::time::timeout(Duration::from_secs(15), send_future).await {
+        Ok(r) => r.ok()?,
+        Err(_) => return None,
+    };
 
     if !response.status().is_success() {
         crate::ai::agent_hang_debug!(
@@ -790,7 +794,10 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
         return None;
     }
 
-    let text = response.text().await.ok()?;
+    let text = match tokio::time::timeout(Duration::from_secs(15), response.text()).await {
+        Ok(r) => r.ok()?,
+        Err(_) => return None,
+    };
     let v: Value = serde_json::from_str(&text).ok()?;
     let content = extract_router_content(&v)?;
     let (thinking, confidence) = parse_thinking_gate_output(&content)?;
@@ -1137,17 +1144,23 @@ Skills:
 
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
-    let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+    // 辅助请求（skill 路由），15 秒超时兜底，理由同上。
+    let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
         .json(&request_body)
-        .send()
-        .await
-        .ok()?;
+        .send();
+    let response = match tokio::time::timeout(Duration::from_secs(15), send_future).await {
+        Ok(r) => r.ok()?,
+        Err(_) => return None,
+    };
     if !response.status().is_success() {
         return None;
     }
 
-    let text = response.text().await.ok()?;
+    let text = match tokio::time::timeout(Duration::from_secs(15), response.text()).await {
+        Ok(r) => r.ok()?,
+        Err(_) => return None,
+    };
     let v: Value = serde_json::from_str(&text).ok()?;
     let content = extract_router_content(&v).unwrap_or_default();
     let (name, confidence) = parse_router_output(&content);
