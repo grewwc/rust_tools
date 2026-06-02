@@ -70,6 +70,9 @@ pub(crate) async fn maybe_append_self_reflection(
             Err(p) => p.into_inner(),
         };
         os.daemon_exit(handle, None);
+        // 必须先释放 kernel 锁再 destroy：destroy_interrupt_futex 内部会再次锁同一把
+        // Arc<Mutex<Kernel>>（GLOBAL_OS 与 app.os 共享），在持锁时调用会自死锁。
+        drop(os);
         if let Some(addr) = interrupt_futex {
             crate::ai::driver::signal::destroy_interrupt_futex(addr);
         }
