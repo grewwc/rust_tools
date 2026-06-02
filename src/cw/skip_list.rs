@@ -133,7 +133,11 @@ impl<K, V> SkipMap<K, V> {
     pub fn insert(&mut self, k: K, v: V) {
         let level = self.level().min(self.max_height - 1);
         unsafe {
-            let (updates, found) = self.find(&k, level);
+            // 必须从最高层开始查找（max_height - 1），才能借助跳表的高层指针
+            // 跳跃前进，得到 O(log n) 的查找。若仅从新节点的随机层 `level` 开始
+            // （`level` 有约 50% 概率为 0），查找会退化成在底层链表上的线性扫描，
+            // 使每次 insert 变成 O(n)、整体建表 O(n²)，表现为单线程长时间 100% CPU。
+            let (updates, found) = self.find(&k, self.max_height - 1);
             let found = found as *mut SkipNode<K, V>;
             if !found.is_null() {
                 (&mut *found).v.write(v);
@@ -869,7 +873,8 @@ impl<K, V> SkipMap<K, V> {
     pub fn insert_entry(&mut self, k: K, v: V) -> &mut V {
         let level = self.level().min(self.max_height - 1);
         unsafe {
-            let (updates, found) = self.find(&k, level);
+            // 同 insert：必须从最高层开始查找，否则退化为 O(n) 线性扫描。
+            let (updates, found) = self.find(&k, self.max_height - 1);
             let found = found as *mut SkipNode<K, V>;
             if !found.is_null() {
                 let val_ptr = (&mut *found).v.as_mut_ptr();
