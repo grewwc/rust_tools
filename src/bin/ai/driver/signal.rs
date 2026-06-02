@@ -43,14 +43,20 @@ pub(in crate::ai) fn handle_sigint(
             }
         }
         SigintAction::Exit => {
-            crate::ai::tools::registry::common::request_tool_cancel();
-            request_shutdown(shutdown);
+            // 用户已二次 Ctrl+C，明确要求退出：必须无条件、优先退出。
+            // 不能在此之前调用任何会锁 kernel 的函数（request_tool_cancel /
+            // request_shutdown 都会 os.lock()）——若某个后台任务正持有 kernel 锁，
+            // 这里会阻塞，导致 std::process::exit 永远执行不到，表现为"Ctrl+C 关不掉"。
             #[cfg(unix)]
             unsafe {
                 let _ = libc::close(libc::STDIN_FILENO);
             }
             #[cfg(not(test))]
             std::process::exit(130);
+            #[cfg(test)]
+            {
+                shutdown.store(true, Ordering::Relaxed);
+            }
         }
     }
 }
