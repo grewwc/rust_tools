@@ -1143,8 +1143,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )],
     };
 
-    // 处理 --note / -n：快速保存 memo 到知识库并退出
-    if app.cli.note.is_some() {
+    // 处理 --note / -n：快速保存 memo 到知识库并退出。
+    // 即使没有文本（只想保存剪贴板图片），只要传了 -n 也要进入保存流程。
+    if app.cli.note_flag {
         return handle_note_save(&app).await;
     }
 
@@ -1196,8 +1197,19 @@ async fn handle_note_save(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     use image::buffer::ConvertBuffer;
     use std::fs;
 
-    // 尝试从剪贴板获取图片
-    let clipboard_image_path = match Clipboard::new() {
+    let store = MemoryStore::from_env_or_config();
+
+    // 图片持久化目录：与 memory 文件同目录下的 note_images/。
+    // 之前的实现把截图写进 /tmp 然后立即删除、并存 image_path: None，
+    // 导致图片彻底丢失、memo 永远无法再引用原图。改成持久化保存。
+    let images_dir = store
+        .path()
+        .parent()
+        .map(|parent| parent.join("note_images"))
+        .unwrap_or_else(|| PathBuf::from("note_images"));
+
+    // 尝试从剪贴板获取图片并持久化保存
+    let clipboard_image_path: Option<String> = match Clipboard::new() {
         Ok(mut clipboard) => {
             if let Ok(image) = clipboard.get_image() {
                 let data = image.bytes;
@@ -1209,11 +1221,21 @@ async fn handle_note_save(app: &App) -> Result<(), Box<dyn std::error::Error>> {
                     );
                     if let Some(buf) = image_buf {
                         let rgb_buf: ImageBuffer<Rgb<u8>, Vec<u8>> = buf.convert();
-                        let temp_path = format!("/tmp/a_note_image_{}.png", std::process::id());
-                        if rgb_buf.save(&temp_path).is_ok() {
-                            Some(temp_path)
-                        } else {
+                        if let Err(err) = fs::create_dir_all(&images_dir) {
+                            eprintln!("[note] Failed to create image dir: {}", err);
                             None
+                        } else {
+                            let file_name = format!(
+                                "note_{}_{}.png",
+                                chrono::Local::now().format("%Y%m%d_%H%M%S"),
+                                std::process::id()
+                            );
+                            let save_path = images_dir.join(file_name);
+                            if rgb_buf.save(&save_path).is_ok() {
+                                Some(save_path.to_string_lossy().into_owned())
+                            } else {
+                                None
+                            }
                         }
                     } else {
                         None
@@ -1269,12 +1291,7 @@ async fn handle_note_save(app: &App) -> Result<(), Box<dyn std::error::Error>> {
         return Err("no content to save".into());
     };
 
-    // 清理临时图片文件
-    if let Some(image_path) = &clipboard_image_path {
-        let _ = fs::remove_file(image_path);
-    }
-
-    // 保存到知识库
+    // 保存到知识库（图片已持久化，路径写入 image_path 以便后续引用）
     let now = chrono::Local::now().to_rfc3339();
     let entry = AgentMemoryEntry {
         id: None,
@@ -1286,19 +1303,18 @@ async fn handle_note_save(app: &App) -> Result<(), Box<dyn std::error::Error>> {
         priority: Some(150),
         owner_pid: None,
         owner_pgid: None,
-        image_path: None,
+        image_path: clipboard_image_path.clone(),
     };
 
-    let store = MemoryStore::from_env_or_config();
     match store.append(&entry) {
         Ok(()) => {
-            if clipboard_image_path.is_some() {
-                println!("[note] Image content saved to knowledge base [memo]:");
+            if let Some(image_path) = &clipboard_image_path {
+                println!("[note] Image content saved to knowledge base [memo] (image: {}):", image_path);
             } else {
                 println!("[note] Saved to knowledge base [memo]:");
             }
             println!("  {}", note_content.chars().take(200).collect::<String>());
-            if note_content.len() > 200 {
+            if note_content.chars().count() > 200 {
                 println!("  ...");
             }
         }

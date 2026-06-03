@@ -38,6 +38,8 @@ pub(super) struct ParsedCli {
     /// 快速保存 memo 到知识库。
     /// 通过 `--note` 或 `-n` 指定内容，保存后直接退出。
     pub(super) note: Option<String>,
+    /// 是否传入了 `--note` / `-n`（即便没有文本，例如只想保存剪贴板图片）。
+    pub(super) note_flag: bool,
 }
 
 impl Default for ParsedCli {
@@ -64,6 +66,7 @@ impl Default for ParsedCli {
             reasoning_effort_override: None,
             memo_search: false,
             note: None,
+            note_flag: false,
         }
     }
 }
@@ -226,6 +229,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     // 处理 note
     if parser.contains_flag_strict("note") {
+        cli.note_flag = true;
         let val = parser.flag_value_or_default("note");
         if !val.trim().is_empty() {
             cli.note = Some(val);
