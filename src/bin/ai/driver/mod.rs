@@ -1317,22 +1317,24 @@ async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::error::Error
                 return Err(err);
             }
         }
-    } else if let Some(text) = provided_text.filter(|t| !t.trim().is_empty()) {
-        // 没有图片，但 -n 后面带了文本，直接使用该文本
-        text
     } else {
-        // 既没有图片也没有文本：进入多行输入框，让用户手动输入要保存的内容，
-        // 然后交给模型整理 / 改写后再保存。
-        println!("[note] 剪贴板没有图片，请输入要保存的内容（多行；提交后保存，留空取消）：");
-        let input = match app.prompt_editor.as_mut() {
-            Some(editor) => editor.read_multi_line().ok().flatten(),
-            None => None,
-        };
-        let raw = match input {
-            Some(s) if !s.trim().is_empty() => s,
-            _ => {
-                eprintln!("[note] 未输入任何内容，已取消");
-                return Err("no content to save".into());
+        // 没有图片：取得原始文本（来自 -n 后面的文本，或多行输入框），
+        // 统一先交给模型理解、整理后再保存，避免直接堆原文。
+        let raw = if let Some(text) = provided_text.filter(|t| !t.trim().is_empty()) {
+            text
+        } else {
+            // 既没有图片也没有文本：进入多行输入框，让用户手动输入要保存的内容。
+            println!("[note] 剪贴板没有图片，请输入要保存的内容（多行；提交后保存，留空取消）：");
+            let input = match app.prompt_editor.as_mut() {
+                Some(editor) => editor.read_multi_line().ok().flatten(),
+                None => None,
+            };
+            match input {
+                Some(s) if !s.trim().is_empty() => s,
+                _ => {
+                    eprintln!("[note] 未输入任何内容，已取消");
+                    return Err("no content to save".into());
+                }
             }
         };
 
@@ -1342,7 +1344,7 @@ async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::error::Error
         let messages = vec![
             serde_json::json!({
                 "role": "system",
-                "content": "你是一个笔记整理助手。请把用户输入的内容整理、改写为一条清晰、结构化、便于日后检索的笔记。\
+                "content": "你是一个笔记整理助手。请把用户输入的内容理解、整理、改写为一条清晰、结构化、便于日后检索的笔记。\
                             保留所有关键信息和事实，去除口语化冗余，必要时用简洁的要点组织。直接输出整理后的笔记正文，不要添加任何解释或前后缀。用中文回答。",
             }),
             serde_json::json!({
