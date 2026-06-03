@@ -1210,7 +1210,28 @@ async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::error::Error
     use std::fs;
 
     let store = MemoryStore::from_env_or_config();
-    let provided_text = app.cli.note.clone();
+    // -n 是字符串 flag，只会捕获其后的第一个 token（如 `a -n aeolus 线上日志路径：...`
+    // 只会把 "aeolus" 当作 note 值），其余 token 落到位置参数里。这里把位置参数拼接回来，
+    // 避免内容被截断、导致后续检索不到完整笔记。
+    let provided_text = {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(text) = app.cli.note.clone() {
+            let text = text.trim();
+            if !text.is_empty() {
+                parts.push(text.to_string());
+            }
+        }
+        let extra = app.cli.args.join(" ");
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            parts.push(extra.to_string());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
+    };
 
     // 图片持久化目录：与 memory 文件同目录下的 note_images/。
     // 之前的实现把截图写进 /tmp 然后立即删除、并存 image_path: None，
