@@ -1193,6 +1193,27 @@ fn process_history_path(base: &Path, pid: u64) -> PathBuf {
     base.with_file_name(file_name)
 }
 
+fn resolve_background_subagent_context(
+    history_path: PathBuf,
+    original_history_file: &Path,
+    skill_manifests: &Arc<Vec<SkillManifest>>,
+    task_id: Option<&str>,
+    inherit: crate::ai::tools::task_tools::InheritOptions,
+) -> (PathBuf, Arc<Vec<SkillManifest>>) {
+    let is_task_subagent = task_id.is_some();
+    let effective_history = if is_task_subagent && inherit.history {
+        original_history_file.to_path_buf()
+    } else {
+        history_path
+    };
+    let effective_skills = if is_task_subagent && !inherit.skills {
+        Arc::new(Vec::new())
+    } else {
+        skill_manifests.clone()
+    };
+    (effective_history, effective_skills)
+}
+
 /// 构造进程被唤醒（mailbox 非空）时的 wake-up prompt。
 /// foreground / background 路径共享同一段 prompt，避免双份硬编码漂移。
 fn format_wakeup_prompt(pid: u64, goal: &str, messages: &[String]) -> String {
@@ -1506,10 +1527,8 @@ async fn run_loop(
             ) in task_specs
             {
                 let mut task_app = app.clone();
-                task_app.session_history_file = history_path;
                 crate::ai::types::clear_stream_cancel(&task_app);
                 let task_mcp = mcp_client.clone();
-                let task_skills = skill_manifests.clone();
                 let task_os = app.os.clone();
                 if let Some(agent_name) = &agent_override
                     && let Some(agent) = agents::find_agent_by_name(agent_manifests, agent_name)
@@ -1519,19 +1538,26 @@ async fn run_loop(
                 }
                 let next_model = model_override.unwrap_or_else(|| app.current_model.clone());
 
-                let task_driver_ctx = runtime_ctx::DriverContext::new(
-                    task_app.clone(),
-                    task_mcp.clone(),
-                    task_skills.clone(),
-                    agent_manifests.clone(),
-                );
-
                 let inherit = task_id
                     .as_deref()
                     .and_then(|tid| {
                         crate::ai::tools::task_tools::with_task_entry(tid, |e| e.inherit)
                     })
                     .unwrap_or_default();
+                let (effective_history, task_skills) = resolve_background_subagent_context(
+                    history_path,
+                    original_history_file.as_path(),
+                    skill_manifests,
+                    task_id.as_deref(),
+                    inherit,
+                );
+                task_app.session_history_file = effective_history;
+                let task_driver_ctx = runtime_ctx::DriverContext::new(
+                    task_app.clone(),
+                    task_mcp.clone(),
+                    task_skills.clone(),
+                    agent_manifests.clone(),
+                );
                 let scope_task_id = task_id.clone().unwrap_or_else(|| format!("pid-{pid}"));
                 let parent_history_for_scopes = original_history_file.clone();
 
@@ -1914,9 +1940,11 @@ mod tests {
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
     use crate::ai::history::{Message, append_history_messages};
+    use crate::ai::skills::SkillManifest;
     use crate::ai::types::{AgentContext, App, AppConfig};
     use aios_kernel::kernel::{EventId, ProcessState, WaitPolicy};
     use aios_kernel::primitives::ResourceLimit;
+    use crate::ai::tools::task_tools::InheritOptions;
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
 
@@ -2192,5 +2220,77 @@ mod tests {
         }
 
         assert!(!has_pending_foreground_process(&app));
+    }
+
+    fn sample_skill(name: &str) -> SkillManifest {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "description": "sample"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn background_task_inherit_history_uses_parent_history_file() {
+        let original = PathBuf::from("/tmp/session.sqlite");
+        let process = PathBuf::from("/tmp/session.sqlite.proc-42");
+        let skills = Arc::new(vec![sample_skill("s1")]);
+
+        let (effective_history, effective_skills) = super::resolve_background_subagent_context(
+            process,
+            original.as_path(),
+            &skills,
+            Some("task_1"),
+            InheritOptions {
+                history: true,
+                memory: false,
+                cwd: true,
+                skills: true,
+            },
+        );
+
+        assert_eq!(effective_history, original);
+        assert_eq!(effective_skills.len(), 1);
+    }
+
+    #[test]
+    fn background_task_disable_skills_uses_empty_skill_set() {
+        let original = PathBuf::from("/tmp/session.sqlite");
+        let process = PathBuf::from("/tmp/session.sqlite.proc-43");
+        let skills = Arc::new(vec![sample_skill("s1")]);
+
+        let (effective_history, effective_skills) = super::resolve_background_subagent_context(
+            process.clone(),
+            original.as_path(),
+            &skills,
+            Some("task_2"),
+            InheritOptions {
+                history: false,
+                memory: false,
+                cwd: true,
+                skills: false,
+            },
+        );
+
+        assert_eq!(effective_history, process);
+        assert!(effective_skills.is_empty());
+    }
+
+    #[test]
+    fn non_task_background_process_keeps_process_history_and_skills() {
+        let original = PathBuf::from("/tmp/session.sqlite");
+        let process = PathBuf::from("/tmp/session.sqlite.proc-99");
+        let skills = Arc::new(vec![sample_skill("s1")]);
+
+        let (effective_history, effective_skills) = super::resolve_background_subagent_context(
+            process.clone(),
+            original.as_path(),
+            &skills,
+            None,
+            InheritOptions::default(),
+        );
+
+        assert_eq!(effective_history, process);
+        assert_eq!(effective_skills.len(), 1);
     }
 }

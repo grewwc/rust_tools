@@ -375,6 +375,7 @@ fn record_tool_stat(name: &str, ok: bool) {
         priority: Some(50),
         owner_pid: None,
         owner_pgid: None,
+        image_path: None,
     };
     let store = MemoryStore::from_env_or_config();
     let _ = store.append(&entry);

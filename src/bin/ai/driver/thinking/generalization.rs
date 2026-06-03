@@ -165,6 +165,7 @@ impl ExperienceGeneralizer {
             priority: Some(80),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
@@ -366,6 +367,7 @@ impl ExperienceGeneralizer {
             priority: Some(self.priority_for_principle(principle)),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         };
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();

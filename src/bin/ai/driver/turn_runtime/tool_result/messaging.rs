@@ -67,6 +67,7 @@ pub(super) fn record_hidden_self_note(
         priority: Some(255),
         owner_pid: None,
         owner_pgid: None,
+        image_path: None,
     };
     let store = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config();
     let _ = store.append(&entry);
@@ -308,6 +309,7 @@ pub(super) fn record_persistent_code_discoveries(
             priority: Some(priority_for_confidence(discovery.confidence)),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         };
         let _ = store.append(&entry);
     }

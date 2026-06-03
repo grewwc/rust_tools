@@ -362,6 +362,7 @@ pub(crate) async fn run_self_reflection_background(
         priority: Some(priority),
         owner_pid: None,
         owner_pgid: None,
+        image_path: None,
     };
     let store = MemoryStore::from_env_or_config();
     // 矛盾检测：扫描近 100 条 self_note，若新 note 与既有条目语义相反
@@ -454,6 +455,7 @@ fn maybe_promote_stable_self_note(
         priority: Some(next_priority),
         owner_pid: None,
         owner_pgid: None,
+        image_path: None,
     };
     let _ = store.append(&promoted);
 }

@@ -17,6 +17,11 @@ pub struct KnowledgeEntry {
     /// Priority level: 0-255. Higher = more important. 255 = permanent.
     #[serde(default = "default_priority")]
     pub priority: Option<u8>,
+
+    /// Optional image path (for memo entries that include screenshots/images).
+    /// When set, OCR text is extracted and stored in `note` for search indexing.
+    #[serde(default)]
+    pub image_path: Option<String>,
 }
 
 fn default_priority() -> Option<u8> {
@@ -40,6 +45,9 @@ impl KnowledgeEntry {
         }
         if let Some(src) = &self.source {
             text.push_str(&format!(" (source: {})", src));
+        }
+        if let Some(img) = &self.image_path {
+            text.push_str(&format!(" [image: {}]", img));
         }
         text
     }

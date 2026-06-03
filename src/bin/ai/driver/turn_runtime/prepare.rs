@@ -729,6 +729,7 @@ mod tests {
                 priority: Some(180),
                 owner_pid: None,
                 owner_pgid: None,
+                image_path: None,
             },
             AgentMemoryEntry {
                 id: None,
@@ -740,6 +741,7 @@ mod tests {
                 priority: Some(180),
                 owner_pid: None,
                 owner_pgid: None,
+                image_path: None,
             },
             AgentMemoryEntry {
                 id: None,
@@ -751,6 +753,7 @@ mod tests {
                 priority: Some(180),
                 owner_pid: None,
                 owner_pgid: None,
+                image_path: None,
             },
         ];
         let mut existing = BTreeSet::new();

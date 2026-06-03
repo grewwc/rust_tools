@@ -131,6 +131,9 @@ fn finish_interrupted_turn(
 ) -> TurnOutcome {
     app.streaming
         .store(false, std::sync::atomic::Ordering::Relaxed);
+    // 仅消费“本轮由 cancel_stream 触发”的中断，避免误清其它来源
+    // （例如 shutdown/request-level interrupt）的全局中断位。
+    let _ = crate::ai::types::take_stream_cancelled(app);
     app.ignore_next_prompt_interrupt = true;
     persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
     println!("\nInterrupted.");

@@ -51,6 +51,7 @@ pub fn hybrid_search(
             tags: ve.tags.clone(),
             source: None,
             priority: Some(100),
+            image_path: None,
         };
         results.push(HybridResult {
             entry,

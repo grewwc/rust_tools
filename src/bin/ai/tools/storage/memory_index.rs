@@ -456,6 +456,7 @@ mod tests {
             priority: Some(prio),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         }
     }
 

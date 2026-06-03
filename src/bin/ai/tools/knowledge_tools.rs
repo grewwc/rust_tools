@@ -96,6 +96,7 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
         priority: Some(priority),
         owner_pid: None,
         owner_pgid: None,
+        image_path: None,
     };
 
     let store = MemoryStore::from_env_or_config();

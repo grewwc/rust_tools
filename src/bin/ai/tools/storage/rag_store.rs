@@ -571,6 +571,7 @@ mod tests {
             priority: Some(100),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         };
         store.append(&entry).unwrap();
 
@@ -584,6 +585,7 @@ mod tests {
             priority: Some(100),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         };
         store.append(&entry2).unwrap();
 

@@ -130,3 +130,18 @@ cargo test --bin a test_xxx       # Filter tests by name
 When AI Agent runs in this project, it auto-discovers and loads these files as context:
 `AGENTS.md`, `Agent.md`, `CLAUDE.md` (case variants).
 Max 8,000 chars per file, 16,000 total. Project root detected via `.git`/`Cargo.toml` markers.
+
+## Maintaining AGENTS.md
+
+**This document MUST be kept in sync whenever new features are added.** Specifically:
+
+1. **New modules/directories** → update the `Directory Layout` tree
+2. **New tools** → document in `Tool system` or `AI Module`
+3. **New agents/skills** → update counts and names in `builtin_agents/` / `builtin_skills/`
+4. **New dependencies** → add to the `Key Dependencies` table
+5. **New config keys** → document in `Configuration`
+6. **Architecture changes** → update the relevant `Architecture` section
+7. **Build/test changes** → update commands or test counts in `Build & Test`
+8. **New pitfalls** → add to `Pitfalls` when encountered
+
+> Principle: Keep AGENTS.md consistent with the actual codebase so the AI Agent always loads accurate project context.

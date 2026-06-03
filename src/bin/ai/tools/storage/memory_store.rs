@@ -166,6 +166,11 @@ pub(crate) struct AgentMemoryEntry {
     pub(crate) owner_pid: Option<u64>,
     #[serde(default)]
     pub(crate) owner_pgid: Option<u64>,
+
+    /// Optional image path (for memo entries that include screenshots/images).
+    /// When set, OCR text is extracted and stored in `note` for search indexing.
+    #[serde(default)]
+    pub(crate) image_path: Option<String>,
 }
 
 fn default_priority() -> Option<u8> {
@@ -184,6 +189,7 @@ impl Default for AgentMemoryEntry {
             priority: Some(100),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         }
     }
 }
@@ -653,6 +659,7 @@ mod tests {
             priority: Some(100),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         };
         let e2 = AgentMemoryEntry {
             id: None,
@@ -664,6 +671,7 @@ mod tests {
             priority: Some(100),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         };
         store.append(&e1).unwrap();
         store.append(&e2).unwrap();
@@ -691,6 +699,7 @@ mod tests {
             priority: Some(100),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         };
         store.append(&e).unwrap();
         let out = store.search("signin failure", 3).unwrap();
@@ -717,6 +726,7 @@ mod tests {
             priority: Some(100),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         };
         store.append(&e).unwrap();
         let out = store.search("登陆失败", 3).unwrap();
@@ -744,6 +754,7 @@ mod tests {
             priority: Some(120),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         };
 
         store.append(&entry).unwrap();
@@ -1500,6 +1511,7 @@ mod retention_tests {
             priority: Some(priority),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         }
     }
 

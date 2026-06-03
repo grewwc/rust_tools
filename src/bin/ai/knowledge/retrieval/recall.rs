@@ -529,6 +529,7 @@ mod tests {
                 tags: vec!["rust_tools".to_string()],
                 source: Some(source.to_string()),
                 priority: Some(priority),
+                image_path: None,
             })
             .unwrap();
     }

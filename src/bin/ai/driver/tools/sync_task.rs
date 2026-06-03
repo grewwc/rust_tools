@@ -48,6 +48,10 @@ use super::super::runtime_ctx::DriverContext;
 /// while still being shorter than typical interactive patience.
 const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// 子代理"运行中"心跳的刷新间隔。仅在 subagent 尚未产出任何流式输出
+/// 的等待窗口里使用（首个 token 到达前），用于消除"看似卡死"的死寂感。
+const SUBAGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
+
 pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
     let prepared = task_tools::prepare_subagent_task(args)?;
     let ctx = runtime_ctx::try_current().ok_or_else(|| {
@@ -121,7 +125,12 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
     // entire sub-agent run.
     let parent_shutdown = ctx.app_proto.shutdown.clone();
     let parent_cancel = ctx.app_proto.cancel_stream.clone();
-
+    // `streaming` 是 `Arc<AtomicBool>`，clone 时共享同一个标志位；subagent 的
+    // `run_turn` 一旦开始流式响应就会把它置 true（见 iteration.rs 的
+    // `StreamingFlagGuard`）。父 agent 此刻阻塞在工具执行里、自身不流式，所以
+    // 这个共享标志可以精确地当作"subagent 首个输出已到达"的信号，用来在恰当
+    // 时机关闭等待心跳，避免心跳与 subagent 正文交错。
+    let parent_streaming = ctx.app_proto.streaming.clone();
     // Slot used by the sub-agent's `finalize_turn` to publish its final
     // assistant text. Created here, scoped via `SUBAGENT_RESULT_SLOT` over
     // the spawned future, and read once the sub-agent returns.
@@ -200,6 +209,8 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
             rx,
             parent_shutdown,
             parent_cancel,
+            parent_streaming,
+            started,
             SYNC_TASK_HARD_TIMEOUT,
         ))
     });
@@ -254,15 +265,31 @@ async fn wait_for_sync_task_completion(
     mut rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
     parent_shutdown: Arc<AtomicBool>,
     parent_cancel: Arc<AtomicBool>,
+    streaming_flag: Arc<AtomicBool>,
+    started: Instant,
     hard_timeout: Duration,
 ) -> Result<Result<(), String>, String> {
+    // 心跳只在交互式 TTY 下显示：它用 `\r` + 清行做单行原地刷新，管道/重定向
+    // 场景下这些控制序列会污染输出，所以非 TTY 直接关闭。
+    let show_heartbeat = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let wait_for_result = async {
         let interrupt_notify = crate::ai::driver::signal::request_interrupt_notify();
+        let mut heartbeat = tokio::time::interval(SUBAGENT_HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // interval 的第一次 tick 立即就绪，先吃掉它，让首个心跳延后一个间隔出现，
+        // 避免 subagent 很快就出首包时还闪一下心跳。
+        heartbeat.tick().await;
+        let mut heartbeat_visible = false;
+        // 一旦 subagent 开始流式输出就永久停止心跳：之后它会持续打印正文/工具
+        // 调用，用户能直接看到活动，心跳只会和正文交错添乱。
+        let mut subagent_started = false;
         loop {
             if parent_shutdown.load(Ordering::Relaxed) {
+                clear_heartbeat_line(show_heartbeat, &mut heartbeat_visible);
                 return Err("subagent task aborted: parent shutdown requested".to_string());
             }
             if parent_cancel.load(Ordering::Relaxed) {
+                clear_heartbeat_line(show_heartbeat, &mut heartbeat_visible);
                 return Err("subagent task aborted: stream cancel requested".to_string());
             }
 
@@ -276,6 +303,7 @@ async fn wait_for_sync_task_completion(
             tokio::select! {
                 biased;
                 res = &mut rx => {
+                    clear_heartbeat_line(show_heartbeat, &mut heartbeat_visible);
                     return match res {
                         Ok(inner) => Ok(inner),
                         Err(e) => Err(format!(
@@ -285,6 +313,16 @@ async fn wait_for_sync_task_completion(
                 }
                 _ = notified => {
                     continue;
+                }
+                _ = heartbeat.tick(), if show_heartbeat && !subagent_started => {
+                    if streaming_flag.load(Ordering::Relaxed) {
+                        // subagent 已开始产出：清掉心跳行并永久停用心跳。
+                        subagent_started = true;
+                        clear_heartbeat_line(show_heartbeat, &mut heartbeat_visible);
+                        continue;
+                    }
+                    print_heartbeat_line(started.elapsed());
+                    heartbeat_visible = true;
                 }
             }
         }
@@ -296,6 +334,26 @@ async fn wait_for_sync_task_completion(
             "subagent task exceeded hard timeout of {}s",
             hard_timeout.as_secs()
         )),
+    }
+}
+
+/// 原地刷新一行 subagent 运行心跳（不换行）。用 `\r` 回到行首 + `\x1b[2K`
+/// 清整行，保证多次心跳只占同一行；暗色显示以免喧宾夺主。
+fn print_heartbeat_line(elapsed: Duration) {
+    use std::io::Write;
+    let secs = elapsed.as_secs();
+    print!("\r\x1b[2K\x1b[2m⏳ subagent running… {secs}s (Ctrl+C to cancel)\x1b[0m");
+    let _ = std::io::stdout().flush();
+}
+
+/// 清除当前心跳行（如果有）。在 subagent 开始输出 / 任务结束 / 被取消时调用，
+/// 确保心跳不残留、也不会和后续真实输出粘在同一行。
+fn clear_heartbeat_line(show_heartbeat: bool, heartbeat_visible: &mut bool) {
+    if show_heartbeat && *heartbeat_visible {
+        use std::io::Write;
+        print!("\r\x1b[2K");
+        let _ = std::io::stdout().flush();
+        *heartbeat_visible = false;
     }
 }
 
@@ -357,11 +415,19 @@ mod tests {
     #[tokio::test]
     async fn sync_task_wait_returns_subagent_result() {
         let (shutdown, cancel) = flags();
+        let streaming = Arc::new(AtomicBool::new(false));
         let (tx, rx) = tokio::sync::oneshot::channel();
         tx.send(Ok(())).unwrap();
 
-        let result =
-            wait_for_sync_task_completion(rx, shutdown, cancel, Duration::from_secs(1)).await;
+        let result = wait_for_sync_task_completion(
+            rx,
+            shutdown,
+            cancel,
+            streaming,
+            Instant::now(),
+            Duration::from_secs(1),
+        )
+        .await;
 
         assert_eq!(result, Ok(Ok(())));
     }
@@ -371,6 +437,7 @@ mod tests {
         let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
         crate::ai::driver::signal::clear_request_interrupt();
         let (shutdown, cancel) = flags();
+        let streaming = Arc::new(AtomicBool::new(false));
         let (_tx, rx) = tokio::sync::oneshot::channel();
         let cancel_for_trigger = cancel.clone();
 
@@ -378,6 +445,8 @@ mod tests {
             rx,
             shutdown,
             cancel,
+            streaming,
+            Instant::now(),
             Duration::from_secs(5),
         ));
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -398,10 +467,18 @@ mod tests {
     #[tokio::test]
     async fn sync_task_wait_respects_hard_timeout() {
         let (shutdown, cancel) = flags();
+        let streaming = Arc::new(AtomicBool::new(false));
         let (_tx, rx) = tokio::sync::oneshot::channel();
 
-        let result =
-            wait_for_sync_task_completion(rx, shutdown, cancel, Duration::from_millis(10)).await;
+        let result = wait_for_sync_task_completion(
+            rx,
+            shutdown,
+            cancel,
+            streaming,
+            Instant::now(),
+            Duration::from_millis(10),
+        )
+        .await;
 
         assert_eq!(
             result,

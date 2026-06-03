@@ -617,6 +617,326 @@ fn overflow_history_file_preserves_dropped_messages_and_placeholder_in_context()
 }
 
 #[test]
+fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-preserve-overflow-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![Message {
+        role: "system".to_string(),
+        content: Value::String("system prompt".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    for i in 0..8usize {
+        let id = format!("call_{i}");
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: id.clone(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: format!(r#"{{"filePath":"src/lib.rs","startLine":{},"endLine":{}}}"#, i + 1, i + 20),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        messages.push(Message {
+            role: "tool".to_string(),
+            content: Value::String("x".repeat(4000)),
+            tool_calls: None,
+            tool_call_id: Some(id),
+            reasoning_content: None,
+        });
+    }
+
+    let compressed = compress_messages_for_context(messages, 20_000, 256, 400, Some(overflow_dir));
+
+    let stub = compressed
+        .iter()
+        .find_map(|m| {
+            let text = m.content.as_str()?;
+            text.contains("Output preserved for non-compressible tool `read_file`")
+                .then_some(text.to_string())
+        })
+        .expect("expected preserved read_file overflow stub");
+
+    let file_path = stub
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("- file_path: "))
+        .expect("stub should contain overflow file path");
+    assert!(
+        std::path::Path::new(file_path).exists(),
+        "overflow file path from stub should exist: {file_path}"
+    );
+}
+
+#[test]
+fn compression_spills_recent_non_compressible_tool_output() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-preserve-overflow-recent-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![Message {
+        role: "system".to_string(),
+        content: Value::String("system prompt".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    messages.push(Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![ToolCall {
+            id: "call_recent".to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: r#"{"filePath":"src/lib.rs","startLine":1,"endLine":300}"#.to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    messages.push(Message {
+        role: "tool".to_string(),
+        content: Value::String("y".repeat(12_000)),
+        tool_calls: None,
+        tool_call_id: Some("call_recent".to_string()),
+        reasoning_content: None,
+    });
+
+    let compressed =
+        compress_messages_for_context(messages, 32_000, 256, 400, Some(overflow_dir.clone()));
+
+    let stub = compressed
+        .iter()
+        .find_map(|m| {
+            let text = m.content.as_str()?;
+            text.contains("Output preserved for non-compressible tool `read_file`")
+                .then_some(text.to_string())
+        })
+        .expect("expected preserved read_file overflow stub for recent tool output");
+
+    let file_path = stub
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("- file_path: "))
+        .expect("stub should contain overflow file path");
+    assert!(
+        std::path::Path::new(file_path).exists(),
+        "recent overflow file path from stub should exist: {file_path}"
+    );
+
+    let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+fn extract_stub_file_path(stub: &str) -> Option<String> {
+    const PREFIX: &str = "[[PRESERVED_CONTENT_STUB_V1]]";
+    let payload = stub.strip_prefix(PREFIX)?;
+    let value = serde_json::from_str::<Value>(payload).ok()?;
+    value.get("file_path")?.as_str().map(str::to_string)
+}
+
+#[test]
+fn compression_spills_old_user_message_to_session_temp_file() {
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-preserve-user-overflow-{}", uuid::Uuid::new_v4()));
+    let old_user = "U".repeat(20_000);
+    let latest_user = "继续处理当前问题";
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(old_user.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("收到".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("阶段一：先定位".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("继续".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("阶段二：验证".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("继续".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String(latest_user.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("继续执行".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let compressed =
+        compress_messages_for_context(messages, 2_000, 256, 400, Some(overflow_dir.clone()));
+
+    let stub = compressed
+        .iter()
+        .find_map(|m| {
+            let text = m.content.as_str()?;
+            extract_stub_file_path(text).map(|_| text.to_string())
+        })
+        .expect("expected preserved user overflow stub");
+    let file_path = extract_stub_file_path(&stub).expect("stub should contain overflow file path");
+    assert!(
+        std::path::Path::new(&file_path).exists(),
+        "user overflow file path from stub should exist: {file_path}"
+    );
+    let persisted = std::fs::read_to_string(&file_path).expect("should read persisted user file");
+    assert!(
+        persisted.contains(&old_user[..64]),
+        "persisted user file should contain original user content"
+    );
+
+    let has_latest_user = compressed
+        .iter()
+        .any(|m| m.role == "user" && m.content.as_str() == Some(latest_user));
+    assert!(
+        has_latest_user,
+        "latest user turn should remain inline and not be spilled"
+    );
+
+    let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+#[test]
+fn compression_spills_old_image_message_to_session_temp_file() {
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-preserve-image-overflow-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let image_payload = format!("data:image/png;base64,{}", "A".repeat(16_000));
+    let messages = vec![
+        Message {
+            role: "system".to_string(),
+            content: Value::String("system prompt".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::Array(vec![serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": image_payload }
+            })]),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("收到图片".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("阶段一".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("继续".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("阶段二".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("继续".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("请继续".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let compressed =
+        compress_messages_for_context(messages, 2_000, 256, 400, Some(overflow_dir.clone()));
+
+    let stub = compressed
+        .iter()
+        .find_map(|m| {
+            let text = m.content.as_str()?;
+            extract_stub_file_path(text).map(|_| text.to_string())
+        })
+        .expect("expected preserved image overflow stub");
+    let file_path = extract_stub_file_path(&stub).expect("stub should contain overflow file path");
+    assert!(
+        std::path::Path::new(&file_path).exists(),
+        "image overflow file path from stub should exist: {file_path}"
+    );
+    let persisted = std::fs::read_to_string(&file_path).expect("should read persisted image file");
+    assert!(
+        persisted.contains("data:image/png;base64,"),
+        "persisted image file should contain original image payload"
+    );
+
+    let _ = std::fs::remove_dir_all(&overflow_dir);
+}
+
+#[test]
 fn mid_turn_compress_preserves_latest_user_message() {
     let latest_user = "请继续修复 request.rs 的流式中断问题";
     let filler = "x".repeat(12000);
@@ -668,6 +988,81 @@ fn mid_turn_compress_preserves_latest_user_message() {
         has_latest_user,
         "mid-turn compression must preserve the latest user message"
     );
+}
+
+#[test]
+fn large_image_does_not_evict_tool_history_from_budget() {
+    // 回归测试：一张大 base64 图片不应把 agent 的工具结果（工作记忆）
+    // 挤出上下文。历史 bug：value_len_chars 按 base64 文本长度计费，
+    // 一张 ~900K 字符的图片让 messages_total_chars 暴涨，压缩管线每轮
+    // 都把工具结果删掉 -> agent 失忆 -> 反复重复同样的探索。
+    let huge_base64 = "A".repeat(900_000);
+    let image_content = serde_json::json!([
+        {
+            "type": "image_url",
+            "image_url": { "url": format!("data:image/png;base64,{huge_base64}") }
+        }
+    ]);
+
+    let messages = vec![
+        Message {
+            role: "user".to_string(),
+            content: image_content,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("我先探索代码结构".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        Message {
+            role: "tool".to_string(),
+            content: Value::String("code_search 结果：found memo.rs at src/bin/re/memo".to_string()),
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            reasoning_content: None,
+        },
+        Message {
+            role: "user".to_string(),
+            content: Value::String("继续实现".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    // soft_threshold 36K：若图片仍按 base64 长度计费（900K），会判为超额并
+    // 触发压缩，把 tool 结果删掉。修复后图片仅计 ~1K，总预算远低于阈值。
+    let (compressed, before, after) = mid_turn_compress(messages, 36_000);
+    assert!(
+        before <= 36_000,
+        "image must not dominate the char budget (got {before})"
+    );
+    assert_eq!(before, after, "no compression should trigger for image-only payload");
+
+    let kept_tool_result = compressed
+        .iter()
+        .any(|m| m.role == "tool" && m.content.as_str() == Some("code_search 结果：found memo.rs at src/bin/re/memo"));
+    assert!(
+        kept_tool_result,
+        "tool result (agent working memory) must survive; otherwise the agent re-explores"
+    );
+
+    let image_intact = compressed.iter().any(|m| {
+        m.content
+            .as_array()
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("image_url"))
+            .and_then(|iu| iu.get("url"))
+            .and_then(|u| u.as_str())
+            .map(|u| u.len() > 100_000)
+            .unwrap_or(false)
+    });
+    assert!(image_intact, "image content itself must remain zero-compressed");
 }
 
 #[test]
@@ -963,6 +1358,13 @@ fn session_delete_cleans_up_overflow_history_file() {
     std::fs::write(
         assets.join("overflow-history.md"),
         "# test overflow content",
+    )
+    .unwrap();
+    let preserved_tool_dir = assets.join("tool-overflow-compressed");
+    std::fs::create_dir_all(&preserved_tool_dir).unwrap();
+    std::fs::write(
+        preserved_tool_dir.join("read_file-test.txt"),
+        "temporary preserved tool output",
     )
     .unwrap();
     std::fs::write(&db, b"test").unwrap();

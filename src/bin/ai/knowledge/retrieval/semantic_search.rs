@@ -26,6 +26,7 @@ pub fn vector_to_knowledge_entries(entries: &[(VectorEntry, f32)]) -> Vec<(Knowl
                 tags: ve.tags.clone(),
                 source: None,
                 priority: Some(100),
+                image_path: None,
             };
             (ke, *score as f64)
         })

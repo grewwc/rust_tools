@@ -196,6 +196,7 @@ mod tests {
                 priority: Some(100),
                 owner_pid: None,
                 owner_pgid: None,
+                image_path: None,
             })
             .unwrap();
         store
@@ -209,6 +210,7 @@ mod tests {
                 priority: Some(255),
                 owner_pid: None,
                 owner_pgid: None,
+                image_path: None,
             })
             .unwrap();
         store
@@ -222,6 +224,7 @@ mod tests {
                 priority: Some(150),
                 owner_pid: None,
                 owner_pgid: None,
+                image_path: None,
             })
             .unwrap();
         store
@@ -235,6 +238,7 @@ mod tests {
                 priority: Some(150),
                 owner_pid: None,
                 owner_pgid: None,
+                image_path: None,
             })
             .unwrap();
         store
@@ -248,6 +252,7 @@ mod tests {
                 priority: Some(150),
                 owner_pid: None,
                 owner_pgid: None,
+                image_path: None,
             })
             .unwrap();
         store
@@ -261,6 +266,7 @@ mod tests {
                 priority: Some(200),
                 owner_pid: None,
                 owner_pgid: None,
+                image_path: None,
             })
             .unwrap();
         store
@@ -274,6 +280,7 @@ mod tests {
                 priority: Some(150),
                 owner_pid: None,
                 owner_pgid: None,
+                image_path: None,
             })
             .unwrap();
 
@@ -321,6 +328,7 @@ mod tests {
                 priority: Some(150),
                 owner_pid: None,
                 owner_pgid: None,
+                image_path: None,
             })
             .unwrap();
         store
@@ -334,6 +342,7 @@ mod tests {
                 priority: Some(80),
                 owner_pid: None,
                 owner_pgid: None,
+                image_path: None,
             })
             .unwrap();
 

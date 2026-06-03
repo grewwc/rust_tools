@@ -43,9 +43,9 @@ const DEFAULT_TASK_WAIT_TIMEOUT_SECS: u64 = 600;
 const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 3600;
 
 /// Granular control over which slices of the parent agent's execution
-/// context are inherited by a spawned sub-agent. All flags default to true
-/// (i.e. full inheritance, matching the previous behaviour) unless the
-/// caller specifies a `inherit` argument on the tool call.
+/// context are inherited by a spawned sub-agent. Defaults are
+/// history+cwd+skills=true and memory=false (private memory) unless the
+/// caller specifies an `inherit` argument on the tool call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InheritOptions {
     pub(crate) history: bool,
@@ -489,7 +489,7 @@ pub(crate) fn epoll_wait_many_channels(
 }
 
 fn task_inherit_schema_description() -> &'static str {
-    "Optional inheritance control. Accepts 'all' (default - inherit history, memory, cwd, skills), 'none' (fresh sub-agent context), or a comma-separated list selecting some of: history, memory, cwd, skills."
+    "Optional inheritance control. Accepts 'all' (inherit history, memory, cwd, skills), 'none' (fresh sub-agent context), or a comma-separated list selecting some of: history, memory, cwd, skills. If omitted, defaults to history+cwd+skills with private memory (memory not inherited)."
 }
 
 fn params_task() -> Value {
@@ -1092,6 +1092,7 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     );
                     let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
                     let _ = os.futex_destroy(entry.completion_futex_addr);
+                    finished.push(tid.clone());
                 } else if is_task_pending(os, entry.pid)? {
                     pending.push((tid.clone(), entry.pid));
                 } else {
@@ -1106,11 +1107,15 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                         "[Task: {} via {} @ {}] FAILED: process pid={} terminated without publishing any output.",
                         entry.description, entry.agent_name, entry.model, entry.pid
                     ));
+                    finished.push(tid.clone());
                 }
             }
         }
         Ok(None)
     })?;
+    for tid in &finished {
+        registry.remove(tid);
+    }
     if let Some(message) = wait_message {
         return Ok(message);
     }

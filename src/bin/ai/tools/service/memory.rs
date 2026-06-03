@@ -328,6 +328,7 @@ pub(crate) fn execute_memory_append(args: &Value) -> Result<String, String> {
         priority,
         owner_pid,
         owner_pgid,
+        image_path: None,
     };
 
     let store = MemoryStore::from_env_or_config();
@@ -723,6 +724,7 @@ fn build_gc_summaries(evicted: &[AgentMemoryEntry], max_days: i64) -> Vec<AgentM
             priority: Some(max_prio.max(150)),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         });
     }
     out
@@ -1075,6 +1077,7 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
         priority,
         owner_pid,
         owner_pgid,
+        image_path: None,
     };
 
     let store = MemoryStore::from_env_or_config();
@@ -1273,6 +1276,7 @@ mod tests {
             priority: Some(100),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         };
         assert!(is_memory_visible_to(&entry, None));
         assert!(is_memory_visible_to(&entry, Some(1)));
@@ -1291,6 +1295,7 @@ mod tests {
             priority: Some(100),
             owner_pid: Some(42),
             owner_pgid: None,
+            image_path: None,
         };
         assert!(is_memory_visible_to(&entry, Some(42)));
         assert!(!is_memory_visible_to(&entry, Some(99)));
@@ -1308,6 +1313,7 @@ mod tests {
             priority: Some(100),
             owner_pid: Some(42),
             owner_pgid: Some(10),
+            image_path: None,
         };
         assert!(is_memory_visible_to(&entry, None));
     }
@@ -1358,6 +1364,7 @@ mod tests {
             priority: Some(100),
             owner_pid: Some(child_a),
             owner_pgid: Some(100),
+            image_path: None,
         };
 
         assert!(is_memory_visible_to(&entry_a, Some(child_b)));
@@ -1402,6 +1409,7 @@ mod tests {
             priority: Some(100),
             owner_pid: Some(child),
             owner_pgid: None,
+            image_path: None,
         };
 
         assert!(is_memory_visible_to(&child_entry, Some(root)));
@@ -1460,6 +1468,7 @@ mod tests {
             priority: Some(100),
             owner_pid: Some(child_a),
             owner_pgid: None,
+            image_path: None,
         };
 
         assert!(!is_memory_visible_to(&entry_a, Some(child_b)));

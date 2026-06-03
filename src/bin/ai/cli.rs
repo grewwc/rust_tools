@@ -31,6 +31,10 @@ pub(super) struct ParsedCli {
     ///
     /// `/model effort <x>` 与 `--reasoning-effort` 都写入此字段。
     pub(super) reasoning_effort_override: Option<Option<ReasoningEffort>>,
+    /// 是否只搜索 memo 类别的记录。
+    /// 通过 `--memo-search` 开启，用于快速查找用户手动记录的内容（如截图、笔记等）。
+    /// 默认 false，即走正常的知识召回流程。
+    pub(super) memo_search: bool,
 }
 
 impl Default for ParsedCli {
@@ -55,6 +59,7 @@ impl Default for ParsedCli {
             mcp_config: String::new(),
             help: false,
             reasoning_effort_override: None,
+            memo_search: false,
         }
     }
 }
@@ -91,6 +96,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     parser.add_bool("list-agents", false, "list available agents and exit");
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
+    parser.add_bool("memo-search", false, "restrict knowledge recall to memo category only");
     parser.alias("h", "help");
 
     // 定义所有 string/int 选项
@@ -207,6 +213,9 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     // 处理 no-skills
     cli.no_skills = parser.contains_flag_strict("no-skills");
 
+    // 处理 memo-search
+    cli.memo_search = parser.contains_flag_strict("memo-search");
+
     // 处理 mcp-config
     if parser.contains_flag_strict("mcp-config") {
         cli.mcp_config = parser.flag_value_or_default("mcp-config");
@@ -267,6 +276,7 @@ pub(super) fn print_help() {
     parser.add_bool("list-agents", false, "list available agents and exit");
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
+    parser.add_bool("memo-search", false, "restrict knowledge recall to memo category only");
     parser.alias("h", "help");
 
     parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history");
@@ -333,6 +343,10 @@ pub(super) fn print_help() {
     println!("    /sessions export <id> [output.md]       export session to Markdown");
     println!("    /sessions export-current [output.md]    export current session to Markdown");
     println!("    /sessions export-last [output.md]       export latest session to Markdown");
+    println!();
+    println!("  Memo search (CLI):");
+    println!("    --memo-search               restrict knowledge recall to memo entries only");
+    println!("                                (use with knowledge_save category=memo to build a personal note database)");
     println!();
     println!("  Notes:");
     println!("    - Commands support both / and : prefix (e.g., /help or :help)");

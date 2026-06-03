@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use rustc_hash::FxHashMap;
 use serde_json::Value;
 
 use crate::ai::{request, types::App};
@@ -66,6 +67,12 @@ fn is_self_note_message(m: &Message) -> bool {
 }
 const PERSISTED_HISTORY_SUMMARY_MAX_CHARS: usize = 8_000;
 const OVERFLOW_HISTORY_FILENAME: &str = "overflow-history.md";
+const PRESERVED_TOOL_OVERFLOW_DIR: &str = "tool-overflow-compressed";
+const PRESERVED_USER_OVERFLOW_DIR: &str = "user-overflow-preserved";
+const PRESERVED_IMAGE_OVERFLOW_DIR: &str = "image-overflow-preserved";
+const PRESERVED_CONTENT_STUB_PREFIX: &str = "[[PRESERVED_CONTENT_STUB_V1]]";
+const USER_OVERFLOW_SPILL_MIN_CHARS: usize = 1_024;
+const IMAGE_OVERFLOW_SPILL_MIN_CHARS: usize = 512;
 
 struct OverflowSink {
     path: PathBuf,
@@ -323,7 +330,7 @@ fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<M
         return Vec::new();
     }
 
-    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES);
+    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES, None);
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
     dedup_repeated_tool_results(&mut messages);
@@ -387,15 +394,26 @@ fn shrink_messages_to_fit_with_summary(
         return Vec::new();
     }
 
-    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES);
+    prepare_tool_messages_structured(
+        &mut messages,
+        480,
+        KEEP_RECENT_TOOL_MESSAGES,
+        overflow_dir,
+    );
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
     dedup_repeated_tool_results(&mut messages);
 
+    // 先无条件外溢体量过大的旧 user/图片消息（最新一轮保护尾窗除外）。
+    // 图片在预算里只按名义成本计费，单张大图不再触发超预算循环，因此必须
+    // 在预算判断之前就把它们零压缩搬到文件，避免每轮请求都携带完整 base64。
+    if let Some(dir) = overflow_dir {
+        spill_oversized_preserved_messages(&mut messages, dir);
+    }
+
     if messages_total_chars(&messages) <= max_chars {
         return messages;
     }
-
     let had_leading_summary = messages.first().map(is_summary_message).unwrap_or(false);
     let mut dropped: Vec<Message> = Vec::new();
 
@@ -426,6 +444,11 @@ fn shrink_messages_to_fit_with_summary(
         }
         if let Some(idx) = first_trim_candidate(&messages) {
             dropped.push(messages.remove(idx));
+            continue;
+        }
+        if let Some(dir) = overflow_dir
+            && try_spill_preserved_message_to_stub(&mut messages, dir)
+        {
             continue;
         }
         break;
@@ -575,9 +598,13 @@ fn truncate_first_message_to_fit(messages: &mut [Message], max_chars: usize) {
         return;
     }
 
-    // 找到第一个可被截断的消息：跳过 system 消息（agent 指令不能被截断）。
-    // summary 类型的 internal_note 可以截断（它是压缩生成的文本）。
-    let target_idx = messages.iter().position(|m| m.role != "system");
+    // 找到第一个可被截断的消息：
+    // - 跳过 system（agent 指令不能被截断）；
+    // - 跳过 user（用户原文零压缩）；
+    // - 跳过图片消息（图片引用零压缩）。
+    let target_idx = messages
+        .iter()
+        .position(|m| m.role != "system" && m.role != "user" && !message_contains_image(&m.content));
     let Some(target_idx) = target_idx else {
         return; // 全是 system，没有可截断的目标
     };
@@ -640,7 +667,7 @@ pub(in crate::ai) fn mid_turn_compress(
         return (out, before, after);
     }
     // 2. 远端结构化裁剪：tool 结果中段按行折叠到 480 字/条，最近 6 条保留全文
-    prepare_tool_messages_structured(&mut out, 480, 6);
+    prepare_tool_messages_structured(&mut out, 480, 6, None);
     if messages_total_chars(&out) <= soft_threshold {
         let after = messages_total_chars(&out);
         return (out, before, after);
@@ -715,17 +742,54 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     (out, before, after, true)
 }
 
-/// 返回 Value 内容的字符数（Unicode scalar 数）。
+/// 单张图片在「字符预算」里的名义计费。
+///
+/// 视觉模型把一张图 tokenize 成几百~一两千 token，与其 base64 文本长度
+/// （动辄数十万字符）完全脱钩。历史上 `value_len_chars` 直接按 base64 文本
+/// 长度计费，导致**一张大图就把整个上下文预算吃光**：`messages_total_chars`
+/// 暴涨到远超 max_chars / soft_threshold，压缩管线于是每轮都把 agent 自己的
+/// 工具结果（工作记忆）挤出窗口 —— 单 turn 内表现为「失忆 + 反复重复之前的
+/// 探索/计划」。这里给图片一个固定名义成本，让预算回归文本主导。
+/// 注意：这只改预算**计量**，不改消息内容本身（图片仍零压缩原样发送）。
+const IMAGE_BUDGET_CHARS: usize = 1_024;
+
+/// 判断裸字符串是否是内联图片 data URL（极少数 provider 会把图片放进纯字符串）。
+fn is_inline_image_data_url(s: &str) -> bool {
+    let t = s.trim_start();
+    t.starts_with("data:image/") && t.contains(";base64,")
+}
+
+/// 计算多模态 content 数组中单个 part 的预算字符数：图片按名义成本计费，
+/// 文本按其实际字符数计费。
+fn content_part_budget_chars(item: &Value) -> usize {
+    let is_image = item.get("type").and_then(|t| t.as_str()) == Some("image_url")
+        || item.get("image_url").is_some();
+    if is_image {
+        return IMAGE_BUDGET_CHARS;
+    }
+    if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
+        return text.chars().count();
+    }
+    item.to_string().chars().count()
+}
+
+/// 返回 Value 内容的「预算字符数」（Unicode scalar 数）。
 /// 历史上这里返回的是 byte length，导致中文/emoji 场景下字符预算被高估 ~3 倍：
 /// 例如 36K 字符的软阈值在中文 turn 下会被 12K 字符就误触发，反复跑压缩管线。
 /// 现在统一按 `chars().count()` 计量，与外层 `cap_chars`、`max_chars`
-/// 阈值的命名保持一致。
+/// 阈值的命名保持一致。图片 part 按 [`IMAGE_BUDGET_CHARS`] 名义计费，避免
+/// base64 文本长度污染预算（见该常量文档）。
 fn value_len_chars(v: &Value) -> usize {
     if let Some(s) = v.as_str() {
-        s.chars().count()
-    } else {
-        v.to_string().chars().count()
+        if is_inline_image_data_url(s) {
+            return IMAGE_BUDGET_CHARS;
+        }
+        return s.chars().count();
     }
+    if let Some(arr) = v.as_array() {
+        return arr.iter().map(content_part_budget_chars).sum();
+    }
+    v.to_string().chars().count()
 }
 
 pub(in crate::ai) fn value_to_string(v: &Value) -> String {
@@ -757,7 +821,7 @@ async fn build_persisted_summary_text_with_app(
     max_chars: usize,
 ) -> String {
     let mut prepared = messages.to_vec();
-    prepare_tool_messages_structured(&mut prepared, 360, KEEP_RECENT_TOOL_MESSAGES);
+    prepare_tool_messages_structured(&mut prepared, 360, KEEP_RECENT_TOOL_MESSAGES, None);
     redact_images_except_last(&mut prepared, 0);
     dedup_adjacent(&mut prepared);
 
@@ -775,23 +839,250 @@ fn prepare_tool_messages_structured(
     messages: &mut [Message],
     max_chars_per_msg: usize,
     keep_recent: usize,
+    overflow_dir: Option<&Path>,
 ) {
+    let id_to_tool_name = build_tool_call_name_index(messages);
     let indices = tool_message_indices(messages);
     let protect_from = indices.len().saturating_sub(keep_recent);
     for (rank, &idx) in indices.iter().enumerate() {
-        if rank >= protect_from {
-            break;
-        }
         let message = &mut messages[idx];
         let text = value_to_string(&message.content);
         if text.trim().is_empty() {
             continue;
         }
+
+        let tool_name = message
+            .tool_call_id
+            .as_deref()
+            .and_then(|id| id_to_tool_name.get(id))
+            .map(|s| s.as_str());
+        if let Some(name) = tool_name
+            && is_non_compressible_tool(name)
+        {
+            if text.chars().count() > max_chars_per_msg
+                && let Some(path) =
+                    overflow_dir.and_then(|dir| write_preserved_tool_overflow_file(dir, name, &text))
+            {
+                message.content = Value::String(build_preserved_tool_overflow_stub(&path, name));
+            }
+            continue;
+        }
+
+        if rank >= protect_from {
+            // 最近 keep_recent 条普通工具结果仍保留全文，避免误伤近端上下文。
+            continue;
+        }
+
         let summary = structured_tool_output_summary(&text, max_chars_per_msg);
         if !summary.is_empty() && summary != text {
             message.content = Value::String(summary);
         }
     }
+}
+
+fn build_tool_call_name_index(messages: &[Message]) -> FxHashMap<String, String> {
+    let mut out = FxHashMap::default();
+    for message in messages {
+        let Some(tool_calls) = &message.tool_calls else {
+            continue;
+        };
+        for tool_call in tool_calls {
+            out.insert(tool_call.id.clone(), tool_call.function.name.clone());
+        }
+    }
+    out
+}
+
+/// 「读取/检索」类工具的输出零压缩（不行裁剪、不去重折叠、不整组删除），
+/// 超阈值时只做"零压缩外溢到会话文件 + 留指针 stub"。这类输出复现代价高，
+/// 一旦被压掉模型就会反复重跑同一次检索（典型失忆/原地打转症状）。
+///
+/// 注意：这里的名字必须与本 agent **实际注册**的工具名一致
+/// （见 `src/bin/ai/tools/`）。早期版本误用了 VS Code Copilot 的工具名
+/// （`file_search` / `semantic_search` / `fetch_webpage` / `read_page` /
+/// `read_notebook_cell_output`）——这些工具在本 agent 里根本不存在，导致
+/// `code_search` / `search_files` / `web_search` / `web_fetch` / `text_grep`
+/// 等真正昂贵的检索结果统统被当作可压缩内容裁掉，引发重复检索。
+fn is_non_compressible_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "read_file"
+            | "read_file_lines"
+            | "grep_search"
+            | "text_grep"
+            | "search_files"
+            | "code_search"
+            | "web_search"
+            | "web_fetch"
+    )
+}
+
+fn write_preserved_tool_overflow_file(
+    overflow_dir: &Path,
+    tool_name: &str,
+    content: &str,
+) -> Option<PathBuf> {
+    let dir = overflow_dir.join(PRESERVED_TOOL_OVERFLOW_DIR);
+    std::fs::create_dir_all(&dir).ok()?;
+    let safe_tool = tool_name
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let file_name = format!(
+        "{}-{}-{}.txt",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        safe_tool,
+        uuid::Uuid::new_v4().simple()
+    );
+    let path = dir.join(file_name);
+    std::fs::write(&path, content).ok()?;
+    Some(path)
+}
+
+fn build_preserved_tool_overflow_stub(path: &Path, tool_name: &str) -> String {
+    format!(
+        "Output preserved for non-compressible tool `{tool_name}`. Full result moved to session temp file:\n- file_path: {}\n- use read_file to inspect exact content.",
+        path.display()
+    )
+}
+
+fn is_preserved_user_or_image_stub(text: &str) -> bool {
+    parse_preserved_message_stub(text).is_some()
+}
+
+fn parse_preserved_message_stub(text: &str) -> Option<(String, String)> {
+    let payload = text.strip_prefix(PRESERVED_CONTENT_STUB_PREFIX)?;
+    let value = serde_json::from_str::<Value>(payload).ok()?;
+    let kind = value.get("kind")?.as_str()?.to_string();
+    let file_path = value.get("file_path")?.as_str()?.to_string();
+    if (kind == "user" || kind == "image") && !file_path.is_empty() {
+        Some((kind, file_path))
+    } else {
+        None
+    }
+}
+
+fn first_preserved_content_spill_candidate(messages: &[Message]) -> Option<usize> {
+    let keep_recent_user_turns = keep_recent_user_turns_when_trimming(messages);
+    let protected_tail_start = retained_turn_start(messages, keep_recent_user_turns);
+    for (idx, message) in messages.iter().enumerate() {
+        if idx >= protected_tail_start {
+            break;
+        }
+        if is_system_like_role(&message.role) || message.role == "tool" {
+            continue;
+        }
+        if message.role == "assistant"
+            && message
+                .tool_calls
+                .as_ref()
+                .map(|calls| !calls.is_empty())
+                .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let text = value_to_string(&message.content);
+        if is_preserved_user_or_image_stub(&text) {
+            continue;
+        }
+
+        let char_count = text.chars().count();
+        if message_contains_image(&message.content) && char_count >= IMAGE_OVERFLOW_SPILL_MIN_CHARS {
+            return Some(idx);
+        }
+        if message.role == "user" && char_count >= USER_OVERFLOW_SPILL_MIN_CHARS {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+fn write_preserved_message_overflow_file(
+    overflow_dir: &Path,
+    message: &Message,
+    kind: &str,
+) -> Option<PathBuf> {
+    let subdir = if kind == "image" {
+        PRESERVED_IMAGE_OVERFLOW_DIR
+    } else {
+        PRESERVED_USER_OVERFLOW_DIR
+    };
+    let dir = overflow_dir.join(subdir);
+    std::fs::create_dir_all(&dir).ok()?;
+    let file_name = format!(
+        "{}-{}-{}.json",
+        chrono::Utc::now().format("%Y%m%dT%H%M%SZ"),
+        kind,
+        uuid::Uuid::new_v4().simple()
+    );
+    let path = dir.join(file_name);
+
+    let mut payload = serde_json::Map::new();
+    payload.insert("role".to_string(), Value::String(message.role.clone()));
+    payload.insert("kind".to_string(), Value::String(kind.to_string()));
+    payload.insert("content".to_string(), message.content.clone());
+    if let Some(tool_calls) = &message.tool_calls {
+        payload.insert(
+            "tool_calls".to_string(),
+            serde_json::to_value(tool_calls).ok()?,
+        );
+    }
+    if let Some(tool_call_id) = &message.tool_call_id {
+        payload.insert(
+            "tool_call_id".to_string(),
+            Value::String(tool_call_id.clone()),
+        );
+    }
+
+    let serialized = serde_json::to_string_pretty(&Value::Object(payload)).ok()?;
+    std::fs::write(&path, serialized).ok()?;
+    Some(path)
+}
+
+fn build_preserved_message_overflow_stub(path: &Path, kind: &str) -> String {
+    let payload = serde_json::json!({
+        "kind": kind,
+        "file_path": path.display().to_string(),
+        "encoding": "original",
+        "zero_compression": true,
+        "hint": "use read_file to inspect exact content before continuing"
+    });
+    format!("{PRESERVED_CONTENT_STUB_PREFIX}{payload}")
+}
+
+fn try_spill_preserved_message_to_stub(messages: &mut [Message], overflow_dir: &Path) -> bool {
+    let Some(idx) = first_preserved_content_spill_candidate(messages) else {
+        return false;
+    };
+    let kind = if message_contains_image(&messages[idx].content) {
+        "image"
+    } else {
+        "user"
+    };
+    let Some(path) = write_preserved_message_overflow_file(overflow_dir, &messages[idx], kind) else {
+        return false;
+    };
+    messages[idx].content = Value::String(build_preserved_message_overflow_stub(&path, kind));
+    true
+}
+
+/// 主动把体量过大的旧 user / 图片消息（保护尾窗之前的）搬到会话临时文件，
+/// 原地替换为紧凑 stub。原文零压缩保存在磁盘上，但不再占用每轮请求的 payload。
+///
+/// 这与预算驱动的循环内 spill 互补：自从图片在预算里只按 [`IMAGE_BUDGET_CHARS`]
+/// 名义计费后，单张大图本身不再触发 `messages_total_chars > max_chars`，于是
+/// 循环内的 spill 永远不会被调用。这里改为「无论是否超预算，只要旧消息原始
+/// 体量超过阈值就外溢」，既保证大图/大段用户原文被零压缩归档，又避免它们污染
+/// 后续每一轮请求。最新一轮（保护尾窗内）的 user/图片永不外溢。
+fn spill_oversized_preserved_messages(messages: &mut [Message], overflow_dir: &Path) {
+    while try_spill_preserved_message_to_stub(messages, overflow_dir) {}
 }
 
 fn structured_tool_output_summary(text: &str, max_chars: usize) -> String {
@@ -1632,7 +1923,18 @@ fn keep_ends_by_chars(text: &str, target_chars: usize) -> String {
 
 fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> {
     let assistant_idx = messages.iter().position(|m| {
-        m.role == "assistant" && m.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty())
+        if m.role != "assistant" {
+            return false;
+        }
+        let Some(tool_calls) = &m.tool_calls else {
+            return false;
+        };
+        if tool_calls.is_empty() {
+            return false;
+        }
+        !tool_calls
+            .iter()
+            .any(|tc| is_non_compressible_tool(&tc.function.name))
     })?;
     let tool_call_ids: Vec<String> = messages[assistant_idx]
         .tool_calls
@@ -1681,6 +1983,16 @@ fn first_trim_candidate(messages: &[Message]) -> Option<usize> {
 
     while index < protected_tail_start {
         let message = &messages[index];
+
+        // 已外溢到会话文件的 user/image 占位 stub 不删：它只是一个指向归档
+        // 文件的指针（原文零压缩保存在磁盘上），删掉会让模型彻底失去线索。
+        // 普通的 user / 含图片消息仍可被裁剪：大体量内容已由 proactive spill
+        // 提前搬到文件，剩下的小体量旧 user 轮次应进入「丢弃 + 摘要」路径，
+        // 否则 30+ 轮纯文本对话永远无法收敛进预算，且早期目标会被静默丢失。
+        if is_preserved_user_or_image_stub(&value_to_string(&message.content)) {
+            index += 1;
+            continue;
+        }
 
         // tool 不单删：否则可能破坏 assistant(tool_calls) ↔ tool 的配对关系。
         if message.role == "tool" {
@@ -1799,22 +2111,8 @@ fn message_contains_image(content: &Value) -> bool {
 }
 
 fn redact_images_except_last(messages: &mut [Message], keep_last: usize) {
-    let mut indices = Vec::new();
-    for (i, m) in messages.iter().enumerate() {
-        if message_contains_image(&m.content) {
-            indices.push(i);
-        }
-    }
-    if indices.len() <= keep_last {
-        return;
-    }
-    let cutoff = indices.len().saturating_sub(keep_last);
-    for i in 0..cutoff {
-        let idx = indices[i];
-        if let Some(m) = messages.get_mut(idx) {
-            m.content = Value::String("[[image omitted]]".to_string());
-        }
-    }
+    let _ = (messages, keep_last);
+    // 用户要求图片内容零压缩：历史压缩阶段不再把旧图片替换成 [[image omitted]]。
 }
 
 fn dedup_adjacent(messages: &mut Vec<Message>) {
@@ -1827,8 +2125,8 @@ fn dedup_adjacent(messages: &mut Vec<Message>) {
     let mut prev_signature = String::new();
     for m in messages.drain(..) {
         let text = value_to_string(&m.content);
-        // 完全相等：直接丢弃
-        if m.role == prev_role && text == prev_content {
+        // 完全相等去重仅对 tool 启用：用户/助手/system 原文不做去重。
+        if m.role == "tool" && m.role == prev_role && text == prev_content {
             continue;
         }
         // 模糊去重：仅对 tool 角色启用，避免误伤 assistant/user 中观感相近但实质不同的回复。
@@ -1942,6 +2240,9 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
         let count = seen.entry(signature.clone()).or_insert(0);
         *count += 1;
         if rank >= protected_from {
+            continue;
+        }
+        if is_non_compressible_tool(&signature.0) {
             continue;
         }
         // 保留首次出现，把后续重复的旧 tool 结果折叠为 stub

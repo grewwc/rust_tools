@@ -26,6 +26,9 @@ pub enum Category {
     ToolCache,
     ProjectWriteback,
 
+    // User memos (quick notes, screenshots, reminders)
+    Memo,
+
     // Fallback for unknown categories
     #[serde(other)]
     Other,
@@ -48,6 +51,7 @@ impl Category {
             "decision_log" => Self::DecisionLog,
             "tool_cache" => Self::ToolCache,
             "project_writeback" => Self::ProjectWriteback,
+            "memo" => Self::Memo,
             // 历史/兼容：reflection/writeback 模块写入的 category 字符串是 "project_memory"，
             // 与 ProjectWriteback 在语义上同源，统一映射避免落到 Other 而被 auto-recall 漏掉。
             "project_memory" => Self::ProjectWriteback,
@@ -77,7 +81,7 @@ impl Category {
 
     /// Whether this is a knowledge category (used for auto-recall)
     pub fn is_knowledge(&self) -> bool {
-        !self.is_guideline() && !matches!(self, Self::ToolCache)
+        !self.is_guideline() && !matches!(self, Self::ToolCache | Self::Memo)
     }
 
     /// Default priority for this category
@@ -105,6 +109,7 @@ impl Category {
             Self::CommonSense | Self::UserPreference | Self::Preference => KnowledgeType::LongTerm,
             Self::SelfNote => KnowledgeType::ShortLived,
             Self::ProjectWriteback => KnowledgeType::FileBased,
+            Self::Memo => KnowledgeType::UserDirected,
             Self::Other => KnowledgeType::General,
         }
     }
@@ -125,6 +130,7 @@ impl Category {
             Self::DecisionLog => "decision_log",
             Self::ToolCache => "tool_cache",
             Self::ProjectWriteback => "project_writeback",
+            Self::Memo => "memo",
             Self::Other => "other",
         }
     }

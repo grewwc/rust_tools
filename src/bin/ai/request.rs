@@ -1438,6 +1438,53 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
     }
 
     fn sanitize_tool_message_sequence(messages: Vec<Message>) -> Vec<Message> {
+        fn build_unpaired_tool_evidence_note(
+            reason: &str,
+            tool_messages: &[Message],
+        ) -> Option<Message> {
+            if tool_messages.is_empty() {
+                return None;
+            }
+            let mut lines = vec![
+                "Context note: preserved unmatched tool outputs from prior rounds.".to_string(),
+                format!("reason: {reason}"),
+            ];
+            for message in tool_messages.iter().take(8) {
+                let tool_call_id = message
+                    .tool_call_id
+                    .as_deref()
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or("unknown");
+                let text = message
+                    .content
+                    .as_str()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    continue;
+                }
+                let preview = if text.chars().count() > 240 {
+                    let mut p = text.chars().take(239).collect::<String>();
+                    p.push('…');
+                    p
+                } else {
+                    text.to_string()
+                };
+                lines.push(format!("- tool_call_id={tool_call_id}: {preview}"));
+            }
+            if lines.len() <= 2 {
+                return None;
+            }
+            Some(Message {
+                role: "internal_note".to_string(),
+                content: Value::String(lines.join("\n")),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            })
+        }
+
         let mut out = Vec::with_capacity(messages.len());
         let mut idx = 0usize;
 
@@ -1465,13 +1512,21 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
             let mut scan = idx + 1;
 
             if sanitized_tool_calls.is_empty() {
+                let mut raw_tool_messages = Vec::new();
                 while scan < messages.len() && messages[scan].role == "tool" {
+                    raw_tool_messages.push(messages[scan].clone());
                     scan += 1;
                 }
                 let mut assistant_only = message.clone();
                 assistant_only.tool_calls = None;
                 if !content_is_effectively_empty(&assistant_only.content) {
                     out.push(assistant_only);
+                }
+                if let Some(note) = build_unpaired_tool_evidence_note(
+                    "tool_calls dropped because arguments failed request sanitization",
+                    &raw_tool_messages,
+                ) {
+                    out.push(note);
                 }
                 idx = scan.max(idx + 1);
                 continue;
@@ -1483,6 +1538,7 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
                 .collect::<Vec<_>>();
             let mut matched_ids = Vec::new();
             let mut matched_tool_messages = Vec::new();
+            let mut unmatched_tool_messages = Vec::new();
 
             while scan < messages.len() && messages[scan].role == "tool" {
                 let tool_message = &messages[scan];
@@ -1494,6 +1550,8 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
                 {
                     matched_ids.push(tool_call_id.to_string());
                     matched_tool_messages.push(tool_message.clone());
+                } else {
+                    unmatched_tool_messages.push(tool_message.clone());
                 }
                 scan += 1;
             }
@@ -1503,6 +1561,12 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
                 assistant_only.tool_calls = None;
                 if !content_is_effectively_empty(&assistant_only.content) {
                     out.push(assistant_only);
+                }
+                if let Some(note) = build_unpaired_tool_evidence_note(
+                    "tool_call ids could not be matched with sanitized assistant tool_calls",
+                    &unmatched_tool_messages,
+                ) {
+                    out.push(note);
                 }
                 idx = scan.max(idx + 1);
                 continue;
@@ -1518,6 +1582,12 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
             );
             out.push(assistant_with_matched_calls);
             out.extend(matched_tool_messages);
+            if let Some(note) = build_unpaired_tool_evidence_note(
+                "some tool outputs were unmatched and preserved as context note",
+                &unmatched_tool_messages,
+            ) {
+                out.push(note);
+            }
             idx = scan;
         }
 
@@ -2645,7 +2715,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_messages_drops_malformed_tool_calls_even_with_matching_tool_results() {
+    fn normalize_messages_preserves_tool_evidence_when_malformed_tool_calls_are_dropped() {
         let messages = vec![
             Message {
                 role: "system".to_string(),
@@ -2693,14 +2763,19 @@ mod tests {
 
         let normalized = normalize_messages_for_request(&messages);
 
-        assert_eq!(normalized.len(), 3);
-        assert_eq!(normalized[2].role, "assistant");
-        assert_eq!(normalized[2].content.as_str(), Some("later answer"));
+        assert_eq!(normalized.len(), 4);
+        assert_eq!(normalized[2].role, "internal_note");
+        let note = normalized[2].content.as_str().unwrap_or_default();
+        assert!(note.contains("preserved unmatched tool outputs"));
+        assert!(note.contains("failed to parse arguments"));
+        assert_eq!(normalized[3].role, "assistant");
+        assert_eq!(normalized[3].content.as_str(), Some("later answer"));
         assert!(normalized.iter().all(|message| message.role != "tool"));
         assert!(
             normalized
                 .iter()
-                .all(|message| message.tool_calls.is_none())
+            .skip(1)
+            .all(|message| message.tool_calls.is_none())
         );
     }
 

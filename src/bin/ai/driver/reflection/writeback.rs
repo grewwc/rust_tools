@@ -57,6 +57,7 @@ fn sync_agent_entry_to_vector(entry: &AgentMemoryEntry) {
         tags: entry.tags.clone(),
         source: entry.source.clone(),
         priority: entry.priority,
+        image_path: entry.image_path.clone(),
     };
     let guard = match crate::ai::tools::storage::rag_store::get_rag_store() {
         Ok(g) => g,
@@ -308,6 +309,7 @@ pub(super) fn upsert_project_writeback_entry(
             priority: Some(priority),
             owner_pid: None,
             owner_pgid: None,
+            image_path: None,
         };
         sync_agent_entry_to_vector(&updated);
         return Ok(ProjectWritebackUpsert::Updated);
@@ -323,6 +325,7 @@ pub(super) fn upsert_project_writeback_entry(
         priority: Some(priority),
         owner_pid: None,
         owner_pgid: None,
+        image_path: None,
     };
     store.append(&entry)?;
     // 同步向量索引：让 semantic search 能立刻召回新写入的项目记忆。

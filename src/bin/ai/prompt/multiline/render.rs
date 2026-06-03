@@ -64,11 +64,12 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // 清除 popup 区域，确保 resize 后旧边框/文本不残留
     f.render_widget(Clear, popup);
 
-    let popup_block = Block::default()
-        .borders(Borders::TOP.union(Borders::BOTTOM))
-        .border_style(Style::default().fg(Color::DarkGray));
-    f.render_widget(popup_block, popup);
-
+    // 注意：这里**故意不画** `Borders::TOP/BOTTOM` 全宽横线。
+    // 在 ratatui inline viewport 下，每当 viewport 重新锚定（resize 突发、
+    // 上方有新输出、退出清屏）时，顶部/底部的全宽横线会被推入终端的
+    // 永久 scrollback，表现为「输入框上方堆叠多条横线」的 bug——而退出时
+    // 的 `Clear(FromCursorDown)` 无法擦除光标上方的历史行。去掉装饰性横线
+    // 即可根除该污染；底部 help 行已提供足够的区域分隔。
     let _n = textarea.lines().len();
     let current_content = textarea.lines().join("\n");
     let char_count = current_content.chars().count();
