@@ -193,7 +193,7 @@ pub(super) fn ensure_models_available() -> Result<(), String> {
     Ok(())
 }
 
-fn default_vl_model() -> String {
+pub(super) fn default_vl_model() -> String {
     choose_default_model_name(true).unwrap_or_else(default_model)
 }
 

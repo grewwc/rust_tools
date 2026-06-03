@@ -35,6 +35,9 @@ pub(super) struct ParsedCli {
     /// 通过 `--memo-search` 开启，用于快速查找用户手动记录的内容（如截图、笔记等）。
     /// 默认 false，即走正常的知识召回流程。
     pub(super) memo_search: bool,
+    /// 快速保存 memo 到知识库。
+    /// 通过 `--note` 或 `-n` 指定内容，保存后直接退出。
+    pub(super) note: Option<String>,
 }
 
 impl Default for ParsedCli {
@@ -60,6 +63,7 @@ impl Default for ParsedCli {
             help: false,
             reasoning_effort_override: None,
             memo_search: false,
+            note: None,
         }
     }
 }
@@ -97,6 +101,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
     parser.add_bool("memo-search", false, "restrict knowledge recall to memo category only");
+    parser.alias("ms", "memo-search");
     parser.alias("h", "help");
 
     // 定义所有 string/int 选项
@@ -118,6 +123,9 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         "reasoning effort: minimal | low | medium | high | off (clears default; only effective on OpenAI/OpenRouter/OpenCode providers)",
     );
     parser.alias("re", "reasoning-effort");
+
+    parser.add_string("note", "", "save text as memo to knowledge base and exit");
+    parser.alias("n", "note");
 
     // 解析 argv（跳过 program name）
     let mut argv: Vec<String> = if raw.len() > 1 {
@@ -216,6 +224,14 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     // 处理 memo-search
     cli.memo_search = parser.contains_flag_strict("memo-search");
 
+    // 处理 note
+    if parser.contains_flag_strict("note") {
+        let val = parser.flag_value_or_default("note");
+        if !val.trim().is_empty() {
+            cli.note = Some(val);
+        }
+    }
+
     // 处理 mcp-config
     if parser.contains_flag_strict("mcp-config") {
         cli.mcp_config = parser.flag_value_or_default("mcp-config");
@@ -277,6 +293,7 @@ pub(super) fn print_help() {
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
     parser.add_bool("memo-search", false, "restrict knowledge recall to memo category only");
+    parser.alias("ms", "memo-search");
     parser.alias("h", "help");
 
     parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history");
@@ -297,6 +314,9 @@ pub(super) fn print_help() {
         "reasoning effort: minimal | low | medium | high | off (clears default; only effective on OpenAI/OpenRouter/OpenCode providers)",
     );
     parser.alias("re", "reasoning-effort");
+
+    parser.add_string("note", "", "save text as memo to knowledge base and exit");
+    parser.alias("n", "note");
 
     println!("AI CLI - Interactive AI Assistant");
     println!("Usage: a [OPTIONS] [PROMPT]");
@@ -345,8 +365,11 @@ pub(super) fn print_help() {
     println!("    /sessions export-last [output.md]       export latest session to Markdown");
     println!();
     println!("  Memo search (CLI):");
-    println!("    --memo-search               restrict knowledge recall to memo entries only");
-    println!("                                (use with knowledge_save category=memo to build a personal note database)");
+    println!("    --memo-search, -ms          restrict knowledge recall to memo entries only");
+    println!("                                (use with --note to build a personal note database)");
+    println!("  Memo save (CLI):");
+    println!("    --note <text>, -n <text>    save text or clipboard image as memo and exit");
+    println!("                                (if image detected in clipboard, uses VL model to analyze)");
     println!();
     println!("  Notes:");
     println!("    - Commands support both / and : prefix (e.g., /help or :help)");

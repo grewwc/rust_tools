@@ -1143,6 +1143,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )],
     };
 
+    // 处理 --note / -n：快速保存 memo 到知识库并退出
+    if app.cli.note.is_some() {
+        return handle_note_save(&app).await;
+    }
+
     let decision_log_path = app
         .session_history_file
         .with_extension("decision-log.jsonl");
@@ -1180,6 +1185,129 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         &mut agent_manifests,
     )
     .await
+}
+
+/// 处理 --note / -n 参数：快速保存 memo 到知识库并退出。
+/// 如果剪贴板有图片，使用视觉模型理解内容；否则使用提供的文本。
+async fn handle_note_save(app: &App) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
+    use arboard::Clipboard;
+    use image::{ImageBuffer, Rgb, Rgba};
+    use image::buffer::ConvertBuffer;
+    use std::fs;
+
+    // 尝试从剪贴板获取图片
+    let clipboard_image_path = match Clipboard::new() {
+        Ok(mut clipboard) => {
+            if let Ok(image) = clipboard.get_image() {
+                let data = image.bytes;
+                if !data.is_empty() {
+                    let image_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
+                        image.width as u32,
+                        image.height as u32,
+                        data.to_vec(),
+                    );
+                    if let Some(buf) = image_buf {
+                        let rgb_buf: ImageBuffer<Rgb<u8>, Vec<u8>> = buf.convert();
+                        let temp_path = format!("/tmp/a_note_image_{}.png", std::process::id());
+                        if rgb_buf.save(&temp_path).is_ok() {
+                            Some(temp_path)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        Err(_) => None,
+    };
+
+    let note_content = if let Some(image_path) = &clipboard_image_path {
+        // 有图片，调用视觉模型理解内容
+        println!("[note] Detected image in clipboard, analyzing...");
+        
+        let model = crate::ai::models::default_vl_model();
+        
+        // 构建包含图片的消息
+        let content = crate::ai::request::build_content(
+            &model,
+            "请详细描述这张图片的内容，包括关键信息、文字、数据等。用中文回答。",
+            &[image_path.clone()],
+        )?;
+        
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": content,
+        })];
+        
+        // 调用模型
+        match crate::ai::request::do_request_json(app, &model, &messages, false).await {
+            Ok(response) => {
+                if let Some(content) = response.pointer("/choices/0/message/content") {
+                    content.as_str().unwrap_or("无法解析图片内容").to_string()
+                } else {
+                    "无法获取模型响应".to_string()
+                }
+            }
+            Err(err) => {
+                eprintln!("[note] Failed to analyze image: {}", err);
+                let _ = fs::remove_file(image_path);
+                return Err(err);
+            }
+        }
+    } else if let Some(text) = app.cli.note.as_deref() {
+        // 没有图片，使用提供的文本
+        text.to_string()
+    } else {
+        eprintln!("[note] No image in clipboard and no text provided");
+        return Err("no content to save".into());
+    };
+
+    // 清理临时图片文件
+    if let Some(image_path) = &clipboard_image_path {
+        let _ = fs::remove_file(image_path);
+    }
+
+    // 保存到知识库
+    let now = chrono::Local::now().to_rfc3339();
+    let entry = AgentMemoryEntry {
+        id: None,
+        timestamp: now,
+        category: "memo".to_string(),
+        note: note_content.clone(),
+        tags: vec![],
+        source: Some("cli_note".to_string()),
+        priority: Some(150),
+        owner_pid: None,
+        owner_pgid: None,
+        image_path: None,
+    };
+
+    let store = MemoryStore::from_env_or_config();
+    match store.append(&entry) {
+        Ok(()) => {
+            if clipboard_image_path.is_some() {
+                println!("[note] Image content saved to knowledge base [memo]:");
+            } else {
+                println!("[note] Saved to knowledge base [memo]:");
+            }
+            println!("  {}", note_content.chars().take(200).collect::<String>());
+            if note_content.len() > 200 {
+                println!("  ...");
+            }
+        }
+        Err(err) => {
+            eprintln!("[note] Failed to save: {}", err);
+            return Err(err.into());
+        }
+    }
+    Ok(())
 }
 
 /// Generate history file path for a background process.
