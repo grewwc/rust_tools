@@ -1149,6 +1149,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return handle_note_save(&app).await;
     }
 
+    // 处理 --memo-search / -ms：只从知识库中检索 memo，不调用 LLM / 任何工具，
+    // 直接打印结果并退出。
+    if app.cli.memo_search {
+        return handle_memo_search(&app);
+    }
+
     let decision_log_path = app
         .session_history_file
         .with_extension("decision-log.jsonl");
@@ -1324,6 +1330,37 @@ async fn handle_note_save(app: &App) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// 处理 --memo-search / -ms：只从知识库中检索 memo 类条目，不调用 LLM / 任何工具。
+/// 直接打印检索结果并退出。
+fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>> {
+    let query = app.cli.args.join(" ");
+    let query = query.trim();
+    if query.is_empty() {
+        eprintln!("[memo-search] 用法: a -ms <查询内容>");
+        return Err("memo-search requires a query".into());
+    }
+
+    let args = serde_json::json!({
+        "query": query,
+        "category": "memo",
+        "limit": 20,
+    });
+
+    match crate::ai::tools::service::memory::execute_memory_search(&args) {
+        Ok(output) => {
+            print!("{output}");
+            if !output.ends_with('\n') {
+                println!();
+            }
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("[memo-search] 检索失败: {}", err);
+            Err(err.into())
+        }
+    }
 }
 
 /// Generate history file path for a background process.
