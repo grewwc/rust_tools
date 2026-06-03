@@ -13,6 +13,15 @@ use crate::ai::{
     types::{App, StreamResult},
 };
 
+/// 一次性把一段完整 Markdown 文本渲染到 stdout（非流式场景使用，例如 `-ms` 检索结果）。
+pub(crate) fn render_markdown_block(text: &str) -> std::io::Result<()> {
+    use std::io::IsTerminal;
+    let tty = std::io::stdout().is_terminal();
+    let mut renderer = MarkdownStreamRenderer::new_with_tty(tty);
+    renderer.write_chunk(text, false)?;
+    renderer.flush_pending()
+}
+
 pub(super) fn extract_chunk_text(
     chunk: &StreamChunk,
     thinking_tag: &str,

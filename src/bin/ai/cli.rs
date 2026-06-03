@@ -40,6 +40,8 @@ pub(super) struct ParsedCli {
     pub(super) note: Option<String>,
     /// 是否传入了 `--note` / `-n`（即便没有文本，例如只想保存剪贴板图片）。
     pub(super) note_flag: bool,
+    /// 通过 `--note-delete` / `-nd <id>` 指定要删除的 memo 条目 ID。
+    pub(super) note_delete: Option<String>,
 }
 
 impl Default for ParsedCli {
@@ -67,6 +69,7 @@ impl Default for ParsedCli {
             memo_search: false,
             note: None,
             note_flag: false,
+            note_delete: None,
         }
     }
 }
@@ -129,6 +132,8 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     parser.add_string("note", "", "save text as memo to knowledge base and exit");
     parser.alias("n", "note");
+    parser.add_string("note-delete", "", "describe a memo to delete; AI matches it, confirm to delete");
+    parser.alias("nd", "note-delete");
 
     // 解析 argv（跳过 program name）
     let mut argv: Vec<String> = if raw.len() > 1 {
@@ -236,6 +241,13 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         }
     }
 
+    // 处理 note-delete：只要传了 --note-delete / -nd 就进入删除流程，
+    // 没带文本时上层会进入多行输入框让用户描述要删除的内容。
+    if parser.contains_flag_strict("note-delete") {
+        let val = parser.flag_value_or_default("note-delete");
+        cli.note_delete = Some(val.trim().to_string());
+    }
+
     // 处理 mcp-config
     if parser.contains_flag_strict("mcp-config") {
         cli.mcp_config = parser.flag_value_or_default("mcp-config");
@@ -321,6 +333,8 @@ pub(super) fn print_help() {
 
     parser.add_string("note", "", "save text as memo to knowledge base and exit");
     parser.alias("n", "note");
+    parser.add_string("note-delete", "", "describe a memo to delete; AI matches it, confirm to delete");
+    parser.alias("nd", "note-delete");
 
     println!("AI CLI - Interactive AI Assistant");
     println!("Usage: a [OPTIONS] [PROMPT]");
@@ -368,30 +382,4 @@ pub(super) fn print_help() {
     println!("    /sessions export-current [output.md]    export current session to Markdown");
     println!("    /sessions export-last [output.md]       export latest session to Markdown");
     println!();
-    println!("  Memo search (CLI):");
-    println!("    --memo-search, -ms          restrict knowledge recall to memo entries only");
-    println!("                                (use with --note to build a personal note database)");
-    println!("  Memo save (CLI):");
-    println!("    --note <text>, -n <text>    save text or clipboard image as memo and exit");
-    println!("                                (if image detected in clipboard, uses VL model to analyze)");
-    println!();
-    println!("  Notes:");
-    println!("    - Commands support both / and : prefix (e.g., /help or :help)");
-    println!("    - Press Ctrl+C to interrupt streaming or exit");
-    println!();
-    println!("Config (.configW):");
-    println!("  ai.intent_model                    light model for thinking gate / skill router");
-    println!("  ai.intent.model_path               local TF-IDF + LR intent model json");
-    println!(
-        "  ai.agents.auto_route.enable        auto switch primary agent by turn intent (default: true)"
-    );
-    println!(
-        "  ai.agents.auto_route.executor_min_chars   min chars before routing complex tasks to executor (default: 48)"
-    );
-    println!("  ai.agents.auto_route.openclaw_min_chars   legacy alias for executor_min_chars");
-    println!(
-        "  ai.model.thinking                 force enable thinking when the selected model supports it"
-    );
-    println!("  ai.model.auto_thinking.enable      auto gate switch (default: true)");
-    println!("  ai.model.auto_thinking.threshold   model gate confidence threshold (default: 0.7)");
 }

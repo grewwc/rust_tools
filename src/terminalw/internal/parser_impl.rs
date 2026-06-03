@@ -171,20 +171,22 @@ pub(crate) fn parse_argv(p: &mut Parser, argv: &[String], bool_optionals: &[&str
 fn process_alias_defs(p: &mut Parser) {
     let defs = p.flags.values().cloned().collect::<Vec<_>>();
     for def in defs {
-        let Some(target) = p.alias_map.get(&def.name).cloned() else {
+        let Some(targets) = p.alias_map.get(&def.name).cloned() else {
             continue;
         };
-        if p.flags.contains_key(&target) {
-            continue;
-        }
-        let usage = if def.usage.trim().is_empty() {
-            format!("(alias for {:?})", def.name)
-        } else {
-            format!("{} (alias for {:?})", def.usage, def.name)
-        };
-        define_flag(p, &target, def.ty, def.default_value.clone(), &usage);
-        if def.ty == FlagType::Bool {
-            p.bool_option_set.insert(target);
+        for target in targets {
+            if p.flags.contains_key(&target) {
+                continue;
+            }
+            let usage = if def.usage.trim().is_empty() {
+                format!("(alias for {:?})", def.name)
+            } else {
+                format!("{} (alias for {:?})", def.usage, def.name)
+            };
+            define_flag(p, &target, def.ty, def.default_value.clone(), &usage);
+            if def.ty == FlagType::Bool {
+                p.bool_option_set.insert(target);
+            }
         }
     }
 }

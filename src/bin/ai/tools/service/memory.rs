@@ -454,6 +454,45 @@ pub(crate) fn execute_memory_search(args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// 根据查询文本检索 memo 候选条目，返回结构化条目（按相关度排序）。
+/// 用于 `-nd` 删除流程：让上层用模型挑选最匹配的条目再确认删除。
+pub(crate) fn search_memo_candidates(
+    query: &str,
+    limit: usize,
+) -> Result<Vec<AgentMemoryEntry>, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("query is empty".to_string());
+    }
+    let limit = limit.clamp(1, 50);
+    let store = MemoryStore::from_env_or_config();
+    let results = store.search(query, 10_000)?;
+    let viewer = ViewerContext::current();
+    let qlc = query.to_lowercase();
+
+    let mut scored: Vec<(f64, AgentMemoryEntry)> = Vec::new();
+    for (e, _search_score) in results {
+        if !viewer.can_see(&e) {
+            continue;
+        }
+        if e.category.to_lowercase() != "memo" {
+            continue;
+        }
+        let mut score = 0.0_f64;
+        if e.note.to_lowercase().contains(&qlc) {
+            score += 3.0;
+            score += (qlc.len() as f64).min(20.0) * 0.05;
+        }
+        if e.tags.iter().any(|t| t.to_lowercase().contains(&qlc)) {
+            score += 1.2;
+        }
+        scored.push((score, e));
+    }
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    scored.truncate(limit);
+    Ok(scored.into_iter().map(|(_, e)| e).collect())
+}
+
 pub(crate) fn execute_memory_recent(args: &Value) -> Result<String, String> {
     let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 50) as usize;
     let store = MemoryStore::from_env_or_config();
@@ -1029,6 +1068,49 @@ pub(crate) fn execute_memory_delete(args: &Value) -> Result<String, String> {
 
         write_memory_entries(&path, &entries)?;
         Ok(format!("Memory deleted: {} (id: {})", path.display(), id))
+    })
+}
+
+/// 删除一条 memo 条目：优先按 id 匹配；若条目没有 id（历史数据），
+/// 则按 (timestamp, note) 精确匹配删除。返回删除结果描述。
+pub(crate) fn delete_memo_entry(target: &AgentMemoryEntry) -> Result<String, String> {
+    let store = MemoryStore::from_env_or_config();
+    let path = store.path().to_path_buf();
+    let target_id = target.id.clone().filter(|s| !s.is_empty());
+    let target_ts = target.timestamp.clone();
+    let target_note = target.note.clone();
+
+    super::super::storage::with_memory_file_lock(&path, || {
+        if !path.exists() {
+            return Err("No memory file".to_string());
+        }
+        let mut entries = load_memory_entries(&path)?;
+        let before_len = entries.len();
+
+        if let Some(id) = target_id.as_deref() {
+            entries.retain(|e| e.id.as_deref() != Some(id));
+        } else {
+            // 无 id：按时间戳 + 内容精确匹配，只删第一条匹配项，避免误删重复内容。
+            let mut removed = false;
+            entries.retain(|e| {
+                if !removed
+                    && e.id.as_deref().map(|s| s.is_empty()).unwrap_or(true)
+                    && e.timestamp == target_ts
+                    && e.note == target_note
+                {
+                    removed = true;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+
+        if entries.len() == before_len {
+            return Err("matching memo entry not found".to_string());
+        }
+        write_memory_entries(&path, &entries)?;
+        Ok(format!("Memory deleted: {}", path.display()))
     })
 }
 

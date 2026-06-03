@@ -45,7 +45,8 @@ pub struct Parser {
     flags: FxHashMap<String, FlagDef>,
     default_val_map: FxHashMap<String, String>,
     bool_option_set: FastSet<String>,
-    alias_map: FxHashMap<String, String>,
+    alias_map: FxHashMap<String, Vec<String>>,
+    short_aliases: FastSet<String>,
 
     cmd: String,
     enable_parse_num: bool,
@@ -83,6 +84,7 @@ impl Parser {
             default_val_map: FxHashMap::default(),
             bool_option_set: FastSet::default(),
             alias_map: FxHashMap::default(),
+            short_aliases: FastSet::default(),
             cmd: String::new(),
             enable_parse_num: true,
             num_arg: None,
@@ -112,10 +114,26 @@ impl Parser {
     }
 
     pub fn alias(&mut self, target: &str, original: &str) {
+        // 避免重复添加
+        if let Some(existing) = self.alias_map.get(original) {
+            if existing.contains(&target.to_string()) {
+                return;
+            }
+        }
+        if let Some(existing) = self.alias_map.get(target) {
+            if existing.contains(&original.to_string()) {
+                return;
+            }
+        }
         self.alias_map
-            .insert(original.to_string(), target.to_string());
+            .entry(original.to_string())
+            .or_default()
+            .push(target.to_string());
+        self.short_aliases.insert(target.to_string());
         self.alias_map
-            .insert(target.to_string(), original.to_string());
+            .entry(target.to_string())
+            .or_default()
+            .push(original.to_string());
     }
 
     pub fn add_bool(&mut self, name: &str, value: bool, usage: &str) -> &mut Parser {
@@ -236,11 +254,12 @@ impl Parser {
                 continue;
             }
             let mut aliases = vec![name.clone()];
-            if let Some(other) = self.alias_map.get(&name).cloned()
-                && other != name
-                && self.flags.contains_key(&other)
-            {
-                aliases.push(other);
+            if let Some(others) = self.alias_map.get(&name) {
+                for other in others {
+                    if other != &name && !aliases.contains(other) {
+                        aliases.push(other.clone());
+                    }
+                }
             }
             for a in &aliases {
                 visited.insert(a.clone());
@@ -333,7 +352,7 @@ impl Parser {
     }
 
     fn format_flag_name(&self, name: &str) -> String {
-        if name.len() == 1 {
+        if name.len() == 1 || self.short_aliases.contains(name) {
             format!("-{name}")
         } else {
             format!("--{name}")
@@ -357,8 +376,12 @@ impl Parser {
         if let Some(v) = self.optional.get(&key) {
             return Ok(v.clone());
         }
-        if let Some(alias) = self.alias_map.get(key.trim_start_matches('-')) {
-            return self.flag_value(alias);
+        if let Some(aliases) = self.alias_map.get(key.trim_start_matches('-')) {
+            for alias in aliases {
+                if let Ok(v) = self.flag_value(alias) {
+                    return Ok(v);
+                }
+            }
         }
         Err(format!("GetFlagVal: flagName ({}) not exist", key))
     }
@@ -378,14 +401,15 @@ impl Parser {
         if v != default_val {
             return v;
         }
-        let Some(alias) = self.alias_map.get(key.trim_start_matches('-')) else {
-            return v;
-        };
-        let alias_key = parser_impl::normalize_flag_key(alias);
-        self.optional
-            .get(&alias_key)
-            .cloned()
-            .unwrap_or_else(|| default_val.to_string())
+        if let Some(aliases) = self.alias_map.get(key.trim_start_matches('-')) {
+            for alias in aliases {
+                let alias_key = parser_impl::normalize_flag_key(alias);
+                if let Some(v) = self.optional.get(&alias_key) {
+                    return v.clone();
+                }
+            }
+        }
+        v
     }
 
     pub fn default_value(&self, key: &str) -> String {
@@ -393,8 +417,12 @@ impl Parser {
         if let Some(v) = self.default_val_map.get(name) {
             return v.clone();
         }
-        if let Some(alias) = self.alias_map.get(name) {
-            return self.default_val_map.get(alias).cloned().unwrap_or_default();
+        if let Some(aliases) = self.alias_map.get(name) {
+            for alias in aliases {
+                if let Some(v) = self.default_val_map.get(alias) {
+                    return v.clone();
+                }
+            }
         }
         String::new()
     }
@@ -407,9 +435,11 @@ impl Parser {
     pub fn remove_flag_value(&mut self, flag_name: &str) {
         let key = parser_impl::normalize_flag_key(flag_name);
         self.optional.remove(&key);
-        if let Some(alias) = self.alias_map.get(key.trim_start_matches('-')).cloned() {
-            let alias_key = parser_impl::normalize_flag_key(&alias);
-            self.optional.remove(&alias_key);
+        if let Some(aliases) = self.alias_map.get(key.trim_start_matches('-')).cloned() {
+            for alias in aliases {
+                let alias_key = parser_impl::normalize_flag_key(&alias);
+                self.optional.remove(&alias_key);
+            }
         }
     }
 
@@ -459,12 +489,15 @@ impl Parser {
         for (k, _) in self.optional.iter() {
             buf.push_str(k);
         }
-        let alias = self
+        let aliases = self
             .alias_map
             .get(needle)
             .cloned()
-            .unwrap_or_else(|| needle.to_string());
-        buf.contains(needle) || buf.contains(&alias)
+            .unwrap_or_default();
+        if buf.contains(needle) {
+            return true;
+        }
+        aliases.iter().any(|alias| buf.contains(alias))
     }
 
     pub fn contains_flag_strict(&self, flag_name: &str) -> bool {
@@ -472,11 +505,15 @@ impl Parser {
         if self.optional.contains_key(&key) {
             return true;
         }
-        let Some(alias) = self.alias_map.get(key.trim_start_matches('-')) else {
-            return false;
-        };
-        let alias_key = parser_impl::normalize_flag_key(alias);
-        self.optional.contains_key(&alias_key)
+        if let Some(aliases) = self.alias_map.get(key.trim_start_matches('-')) {
+            for alias in aliases {
+                let alias_key = parser_impl::normalize_flag_key(alias);
+                if self.optional.contains_key(&alias_key) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub fn contains_any_flag_strict(&self, flag_names: &[&str]) -> bool {

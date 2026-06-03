@@ -1143,16 +1143,21 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )],
     };
 
+    // 处理 --note-delete / -nd：输入一段话，模型自动匹配知识库条目，确认后删除。
+    if let Some(query) = app.cli.note_delete.clone() {
+        return handle_note_delete(&mut app, &query).await;
+    }
+
     // 处理 --note / -n：快速保存 memo 到知识库并退出。
     // 即使没有文本（只想保存剪贴板图片），只要传了 -n 也要进入保存流程。
     if app.cli.note_flag {
-        return handle_note_save(&app).await;
+        return handle_note_save(&mut app).await;
     }
 
     // 处理 --memo-search / -ms：只从知识库中检索 memo，不调用 LLM / 任何工具，
     // 直接打印结果并退出。
     if app.cli.memo_search {
-        return handle_memo_search(&app);
+        return handle_memo_search(&app).await;
     }
 
     let decision_log_path = app
@@ -1195,8 +1200,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// 处理 --note / -n 参数：快速保存 memo 到知识库并退出。
-/// 如果剪贴板有图片，使用视觉模型理解内容；否则使用提供的文本。
-async fn handle_note_save(app: &App) -> Result<(), Box<dyn std::error::Error>> {
+/// 如果剪贴板有图片，使用视觉模型理解内容；
+/// 否则使用 `-n` 后面提供的文本；若也没有文本，则进入多行输入框让用户输入。
+async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
     use arboard::Clipboard;
     use image::{ImageBuffer, Rgb, Rgba};
@@ -1204,6 +1210,7 @@ async fn handle_note_save(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     use std::fs;
 
     let store = MemoryStore::from_env_or_config();
+    let provided_text = app.cli.note.clone();
 
     // 图片持久化目录：与 memory 文件同目录下的 note_images/。
     // 之前的实现把截图写进 /tmp 然后立即删除、并存 image_path: None，
@@ -1289,18 +1296,58 @@ async fn handle_note_save(app: &App) -> Result<(), Box<dyn std::error::Error>> {
                 return Err(err);
             }
         }
-    } else if let Some(text) = app.cli.note.as_deref() {
-        // 没有图片，使用提供的文本
-        text.to_string()
+    } else if let Some(text) = provided_text.filter(|t| !t.trim().is_empty()) {
+        // 没有图片，但 -n 后面带了文本，直接使用该文本
+        text
     } else {
-        eprintln!("[note] No image in clipboard and no text provided");
-        return Err("no content to save".into());
+        // 既没有图片也没有文本：进入多行输入框，让用户手动输入要保存的内容，
+        // 然后交给模型整理 / 改写后再保存。
+        println!("[note] 剪贴板没有图片，请输入要保存的内容（多行；提交后保存，留空取消）：");
+        let input = match app.prompt_editor.as_mut() {
+            Some(editor) => editor.read_multi_line().ok().flatten(),
+            None => None,
+        };
+        let raw = match input {
+            Some(s) if !s.trim().is_empty() => s,
+            _ => {
+                eprintln!("[note] 未输入任何内容，已取消");
+                return Err("no content to save".into());
+            }
+        };
+
+        // 调用模型理解并整理用户输入，使其更适合作为知识库 memo。
+        println!("[note] 正在整理内容...");
+        let model = crate::ai::models::initial_model(&app.cli);
+        let messages = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "你是一个笔记整理助手。请把用户输入的内容整理、改写为一条清晰、结构化、便于日后检索的笔记。\
+                            保留所有关键信息和事实，去除口语化冗余，必要时用简洁的要点组织。直接输出整理后的笔记正文，不要添加任何解释或前后缀。用中文回答。",
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": raw,
+            }),
+        ];
+        match crate::ai::request::do_request_json(app, &model, &messages, false).await {
+            Ok(response) => response
+                .pointer("/choices/0/message/content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or(raw),
+            Err(err) => {
+                // 整理失败时退回保存原始输入，避免丢失用户内容。
+                eprintln!("[note] 整理失败，保存原始输入: {}", err);
+                raw
+            }
+        }
     };
 
     // 保存到知识库（图片已持久化，路径写入 image_path 以便后续引用）
     let now = chrono::Local::now().to_rfc3339();
     let entry = AgentMemoryEntry {
-        id: None,
+        id: Some(format!("mem_{}", uuid::Uuid::new_v4().simple())),
         timestamp: now,
         category: "memo".to_string(),
         note: note_content.clone(),
@@ -1332,35 +1379,279 @@ async fn handle_note_save(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 处理 --memo-search / -ms：只从知识库中检索 memo 类条目，不调用 LLM / 任何工具。
-/// 直接打印检索结果并退出。
-fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>> {
+/// 处理 --memo-search / -ms：从知识库中检索 memo 类条目，再用模型根据检索到的
+/// 内容总结、回答用户的问题（而不是直接堆砌原始条目）。
+async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     let query = app.cli.args.join(" ");
-    let query = query.trim();
+    let query = query.trim().to_string();
     if query.is_empty() {
         eprintln!("[memo-search] 用法: a -ms <查询内容>");
         return Err("memo-search requires a query".into());
     }
 
-    let args = serde_json::json!({
-        "query": query,
-        "category": "memo",
-        "limit": 20,
-    });
+    // 检索相关 memo 条目作为上下文。
+    let candidates = match crate::ai::tools::service::memory::search_memo_candidates(&query, 20) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("[memo-search] 检索失败: {}", err);
+            return Err(err.into());
+        }
+    };
+    if candidates.is_empty() {
+        crate::ai::stream::render_markdown_block(&format!(
+            "没有在知识库中找到与「{}」相关的内容。",
+            query
+        ))
+        .ok();
+        return Ok(());
+    }
 
-    match crate::ai::tools::service::memory::execute_memory_search(&args) {
-        Ok(output) => {
-            print!("{output}");
-            if !output.ends_with('\n') {
-                println!();
+    // 把检索到的条目作为上下文，让模型基于这些内容回答用户的问题。
+    let mut context = String::new();
+    for (idx, e) in candidates.iter().enumerate() {
+        context.push_str(&format!("[{}] {}\n", idx + 1, e.note));
+    }
+
+    let model = crate::ai::models::initial_model(&app.cli);
+    let messages = vec![
+        serde_json::json!({
+            "role": "system",
+            "content": "你是一个知识库问答助手。下面会给出用户的问题，以及从用户私人知识库检索到的若干条相关笔记。\
+                        请仅基于这些笔记的内容，直接、简洁地回答用户的问题，必要时用要点组织。\
+                        如果笔记中没有足够信息回答，就如实说明。用中文回答，使用 Markdown 格式。",
+        }),
+        serde_json::json!({
+            "role": "user",
+            "content": format!("问题：{}\n\n知识库检索结果：\n{}", query, context),
+        }),
+    ];
+
+    match crate::ai::request::do_request_json(app, &model, &messages, false).await {
+        Ok(response) => {
+            let answer = response
+                .pointer("/choices/0/message/content")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if answer.is_empty() {
+                // 模型无输出时退回展示原始条目。
+                let raw = crate::ai::tools::service::memory::search_memo_candidates(&query, 20)
+                    .map(|cands| {
+                        cands
+                            .iter()
+                            .enumerate()
+                            .map(|(i, e)| format!("{}. {}", i + 1, e.note))
+                            .collect::<Vec<_>>()
+                            .join("\n\n")
+                    })
+                    .unwrap_or_default();
+                crate::ai::stream::render_markdown_block(&raw).ok();
+            } else {
+                crate::ai::stream::render_markdown_block(&answer).ok();
             }
             Ok(())
         }
         Err(err) => {
-            eprintln!("[memo-search] 检索失败: {}", err);
+            eprintln!("[memo-search] 总结失败: {}", err);
             Err(err.into())
         }
     }
+}
+
+/// 处理 --note-delete / -nd <一段话>：用模型在知识库中匹配最相关的 memo 条目，
+/// 找到对应 id，删除前请用户确认。
+async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    // 拼接查询：flag 的值 + 其余位置参数；都为空时进入多行输入框。
+    let mut query = query.trim().to_string();
+    if !app.cli.args.is_empty() {
+        let extra = app.cli.args.join(" ");
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        query.push_str(extra.trim());
+    }
+    let query = query.trim().to_string();
+    let query = if query.is_empty() {
+        println!("[note-delete] 请描述你想删除的内容（多行；提交后开始匹配，留空取消）：");
+        let input = match app.prompt_editor.as_mut() {
+            Some(editor) => editor.read_multi_line().ok().flatten(),
+            None => None,
+        };
+        match input {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => {
+                eprintln!("[note-delete] 未输入任何内容，已取消");
+                return Ok(());
+            }
+        }
+    } else {
+        query
+    };
+
+    // 检索候选条目。
+    let candidates = match crate::ai::tools::service::memory::search_memo_candidates(&query, 10) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("[note-delete] 检索失败: {}", err);
+            return Err(err.into());
+        }
+    };
+    if candidates.is_empty() {
+        println!("[note-delete] 没有找到与「{}」相关的可删除 memo 条目。", query);
+        return Ok(());
+    }
+
+    // 让模型从候选中挑选最匹配的一条（返回其序号，或 NONE）。
+    let mut listing = String::new();
+    for (idx, e) in candidates.iter().enumerate() {
+        let note_preview: String = e.note.chars().take(300).collect();
+        listing.push_str(&format!("{}. {}\n", idx + 1, note_preview));
+    }
+
+    let model = crate::ai::models::initial_model(&app.cli);
+    let messages = vec![
+        serde_json::json!({
+            "role": "system",
+            "content": "你是一个知识库删除助手。用户会给出一段描述，以及若干条带编号的候选笔记。\
+                        请判断哪些条目符合用户想删除的内容——可能是一条，也可能是多条。\
+                        只输出这些条目的编号，用英文逗号分隔（如 1 或 1,3,4）。\
+                        如果没有任何一条明显匹配，只输出 NONE。不要输出任何解释或多余字符。",
+        }),
+        serde_json::json!({
+            "role": "user",
+            "content": format!("用户描述：{}\n\n候选条目：\n{}", query, listing),
+        }),
+    ];
+
+    let chosen = match crate::ai::request::do_request_json(app, &model, &messages, false).await {
+        Ok(response) => response
+            .pointer("/choices/0/message/content")
+            .and_then(|c| c.as_str())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default(),
+        Err(err) => {
+            eprintln!("[note-delete] 模型匹配失败: {}", err);
+            String::new()
+        }
+    };
+
+    // 解析模型返回的若干编号（支持逗号 / 空格 / 顿号等分隔），去重并保持升序。
+    let mut chosen_indices: Vec<usize> = Vec::new();
+    {
+        let mut num = String::new();
+        let mut flush = |num: &mut String, out: &mut Vec<usize>| {
+            if let Ok(n) = num.parse::<usize>() {
+                if n >= 1 && n <= candidates.len() {
+                    let idx = n - 1;
+                    if !out.contains(&idx) {
+                        out.push(idx);
+                    }
+                }
+            }
+            num.clear();
+        };
+        for c in chosen.chars() {
+            if c.is_ascii_digit() {
+                num.push(c);
+            } else {
+                flush(&mut num, &mut chosen_indices);
+            }
+        }
+        flush(&mut num, &mut chosen_indices);
+    }
+    chosen_indices.sort_unstable();
+
+    if chosen_indices.is_empty() {
+        println!("[note-delete] 模型未能从候选中确定要删除的条目，已取消。可换个更具体的描述重试。");
+        return Ok(());
+    }
+
+    let targets: Vec<&crate::ai::tools::storage::memory_store::AgentMemoryEntry> =
+        chosen_indices.iter().map(|&i| &candidates[i]).collect();
+
+    // 删除前确认 + 精选。列出条目后，用户可以：
+    //   - 直接回车 / y / all / a：删除全部列出条目
+    //   - 输入编号（如 1,3）：只删除指定编号
+    //   - n / 回车以外的取消词：取消
+    println!("\n[note-delete] 匹配到以下 {} 条条目：", targets.len());
+    for (n, target) in targets.iter().enumerate() {
+        println!("  [{}]", n + 1);
+        if let Some(id) = target.id.as_deref().filter(|s| !s.is_empty()) {
+            println!("    id: {}", id);
+        }
+        println!("    时间: {}", target.timestamp);
+        println!(
+            "    内容: {}",
+            target.note.chars().take(500).collect::<String>()
+        );
+    }
+    print!(
+        "\n请输入要删除的编号（如 1,3；输入 all 删除全部，直接回车=全部，n=取消）: "
+    );
+    std::io::stdout().flush().ok();
+
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).ok();
+    let answer = answer.trim().to_lowercase();
+
+    // 解析用户选择，得到最终要删除的 targets 子集。
+    let selected: Vec<&crate::ai::tools::storage::memory_store::AgentMemoryEntry> =
+        if answer.is_empty() || answer == "y" || answer == "yes" || answer == "all" || answer == "a"
+        {
+            targets.clone()
+        } else if answer == "n" || answer == "no" || answer == "q" || answer == "cancel" {
+            println!("[note-delete] 已取消，未删除任何内容。");
+            return Ok(());
+        } else {
+            // 解析编号列表（针对上面列出的 1..=targets.len()）。
+            let mut picks: Vec<usize> = Vec::new();
+            let mut num = String::new();
+            let mut flush = |num: &mut String, out: &mut Vec<usize>| {
+                if let Ok(n) = num.parse::<usize>() {
+                    if n >= 1 && n <= targets.len() {
+                        let idx = n - 1;
+                        if !out.contains(&idx) {
+                            out.push(idx);
+                        }
+                    }
+                }
+                num.clear();
+            };
+            for c in answer.chars() {
+                if c.is_ascii_digit() {
+                    num.push(c);
+                } else {
+                    flush(&mut num, &mut picks);
+                }
+            }
+            flush(&mut num, &mut picks);
+            picks.sort_unstable();
+            if picks.is_empty() {
+                println!("[note-delete] 未识别到有效编号，已取消，未删除任何内容。");
+                return Ok(());
+            }
+            picks.into_iter().map(|i| targets[i]).collect()
+        };
+
+    let mut deleted = 0usize;
+    let mut failed = 0usize;
+    for target in &selected {
+        match crate::ai::tools::service::memory::delete_memo_entry(target) {
+            Ok(_) => deleted += 1,
+            Err(err) => {
+                failed += 1;
+                eprintln!("[note-delete] 删除失败 (时间 {}): {}", target.timestamp, err);
+            }
+        }
+    }
+    println!("[note-delete] 完成：已删除 {} 条，失败 {} 条。", deleted, failed);
+    if failed > 0 && deleted == 0 {
+        return Err("all deletions failed".into());
+    }
+    Ok(())
 }
 
 /// Generate history file path for a background process.
