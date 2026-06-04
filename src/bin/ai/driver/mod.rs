@@ -1402,6 +1402,62 @@ async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
+/// 一个轻量的终端 "Searching..." 动画提示。
+///
+/// 在 stderr 上用回车 `\r` 原地刷新一帧帧 spinner，`stop()` / drop 时清除当前行，
+/// 不会污染随后的正式输出（正式结果走 stdout）。仅在 stderr 为 TTY 时启用，
+/// 管道 / 重定向场景自动静默，避免写入垃圾字符。
+struct SearchSpinner {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SearchSpinner {
+    fn start(label: &str) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        // 非 TTY（被管道/重定向）时不画动画，返回一个空 spinner。
+        if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            return Self { stop, handle: None };
+        }
+        let label = label.to_string();
+        let stop_cloned = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            use std::io::Write as _;
+            const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut i = 0usize;
+            while !stop_cloned.load(Ordering::Relaxed) {
+                let mut err = std::io::stderr();
+                let _ = write!(err, "\r{} {}...", FRAMES[i % FRAMES.len()], label);
+                let _ = err.flush();
+                i += 1;
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            // 清除当前行（足够覆盖 "<frame> <label>..."）。
+            let mut err = std::io::stderr();
+            let _ = write!(err, "\r{}\r", " ".repeat(label.len() + 8));
+            let _ = err.flush();
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(self) {
+        // 显式消费，触发 Drop。
+        drop(self);
+    }
+}
+
+impl Drop for SearchSpinner {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// 处理 --memo-search / -ms：从知识库中检索 memo 类条目，再用模型根据检索到的
 /// 内容总结、回答用户的问题（而不是直接堆砌原始条目）。
 async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>> {
@@ -1412,15 +1468,20 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
         return Err("memo-search requires a query".into());
     }
 
+    // 检索 + 模型总结都可能耗时，给一个 "Searching..." 动画提示（输出前自动清除）。
+    let spinner = SearchSpinner::start("Searching memo");
+
     // 检索相关 memo 条目作为上下文。
     let candidates = match crate::ai::tools::service::memory::search_memo_candidates(&query, 20) {
         Ok(c) => c,
         Err(err) => {
+            spinner.stop();
             eprintln!("[memo-search] 检索失败: {}", err);
             return Err(err.into());
         }
     };
     if candidates.is_empty() {
+        spinner.stop();
         crate::ai::stream::render_markdown_block(&format!(
             "没有在知识库中找到与「{}」相关的内容。",
             query
@@ -1451,6 +1512,7 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
 
     match crate::ai::request::do_request_json(app, &model, &messages, false, true).await {
         Ok(response) => {
+            spinner.stop();
             let answer = response
                 .pointer("/choices/0/message/content")
                 .and_then(|c| c.as_str())
@@ -1476,6 +1538,7 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
             Ok(())
         }
         Err(err) => {
+            spinner.stop();
             eprintln!("[memo-search] 总结失败: {}", err);
             Err(err.into())
         }

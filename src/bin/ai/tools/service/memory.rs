@@ -466,16 +466,17 @@ pub(crate) fn search_memo_candidates(
     }
     let limit = limit.clamp(1, 50);
     let store = MemoryStore::from_env_or_config();
-    let results = store.search(query, 10_000)?;
+    // 只加载 memo 类别条目即可：memo 是用户手工记录的类别，量很小。
+    // 这里直接按类别扫描（跳过全量 BM25 + embedding 重排——那套分数在本函数里
+    // 会被完全丢弃，仅用下面的子串打分），打分 / 排序 / 截断逻辑保持不变，
+    // 结果与旧实现一致但快得多。category 写入恒为小写 "memo"。
+    let results = store.entries_by_category("memo", 100_000)?;
     let viewer = ViewerContext::current();
     let qlc = query.to_lowercase();
 
     let mut scored: Vec<(f64, AgentMemoryEntry)> = Vec::new();
-    for (e, _search_score) in results {
+    for e in results {
         if !viewer.can_see(&e) {
-            continue;
-        }
-        if e.category.to_lowercase() != "memo" {
             continue;
         }
         let mut score = 0.0_f64;
