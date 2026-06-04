@@ -1824,20 +1824,33 @@ pub(super) fn resolve_reasoning_effort(app: &App, model: &str) -> Option<Reasoni
     models::default_reasoning_effort(model)
 }
 
-/// 使用 LLM 进行 JSON 格式的请求（用于意图识别等场景）
+/// 使用 LLM 进行 JSON 格式的请求（用于意图识别、知识库问答等场景）。
+///
+/// `skip_reasoning_effort`：为 `true` 时强制不注入 `reasoning_effort` 字段，
+/// 即使模型默认配置了该参数也会被忽略。适用于知识库问答等轻量场景。
 pub async fn do_request_json(
     app: &App,
     model: &str,
     messages: &[serde_json::Value],
     stream: bool,
+    skip_reasoning_effort: bool,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     clear_stale_request_interrupt_before_request(app);
 
-    let request_body = json!({
+    let mut request_body = json!({
         "model": model,
         "messages": messages,
         "stream": stream,
     });
+
+    // reasoning_effort：仅在未跳过且 provider 为 OpenAI 兼容时注入。
+    if !skip_reasoning_effort {
+        if let Some(effort) = resolve_reasoning_effort(app, model) {
+            if models::model_provider(model).is_openai() {
+                request_body["reasoning_effort"] = json!(effort.as_str());
+            }
+        }
+    }
 
     for attempt in 1..=REQUEST_MAX_ATTEMPTS {
         let endpoint = endpoint_for_request_model(app, model);

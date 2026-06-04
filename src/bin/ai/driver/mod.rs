@@ -1303,7 +1303,7 @@ async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::error::Error
         })];
         
         // 调用模型
-        match crate::ai::request::do_request_json(app, &model, &messages, false).await {
+        match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
             Ok(response) => {
                 if let Some(content) = response.pointer("/choices/0/message/content") {
                     content.as_str().unwrap_or("无法解析图片内容").to_string()
@@ -1352,7 +1352,7 @@ async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::error::Error
                 "content": raw,
             }),
         ];
-        match crate::ai::request::do_request_json(app, &model, &messages, false).await {
+        match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
             Ok(response) => response
                 .pointer("/choices/0/message/content")
                 .and_then(|c| c.as_str())
@@ -1449,7 +1449,7 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
         }),
     ];
 
-    match crate::ai::request::do_request_json(app, &model, &messages, false).await {
+    match crate::ai::request::do_request_json(app, &model, &messages, false, true).await {
         Ok(response) => {
             let answer = response
                 .pointer("/choices/0/message/content")
@@ -1549,7 +1549,7 @@ async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn st
         }),
     ];
 
-    let chosen = match crate::ai::request::do_request_json(app, &model, &messages, false).await {
+    let chosen = match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
         Ok(response) => response
             .pointer("/choices/0/message/content")
             .and_then(|c| c.as_str())
