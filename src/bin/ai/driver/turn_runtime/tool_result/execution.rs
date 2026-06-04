@@ -602,6 +602,18 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::FinalResponse(stream_result) => {
+            let reasoning_only_completion = stream_result.assistant_text.trim().is_empty()
+                && !stream_result.reasoning_text.trim().is_empty()
+                && stream_result.tool_calls.is_empty();
+            if reasoning_only_completion {
+                if *force_final_response {
+                    *final_assistant_text =
+                        "[模型只返回了思考内容，没有给出最终回答，请重试或切换模型]".to_string();
+                    return Ok(TurnLoopStep::Break);
+                }
+                *force_final_response = true;
+                return Ok(TurnLoopStep::Continue);
+            }
             record_final_stream_response(
                 app,
                 stream_result,
@@ -861,6 +873,105 @@ mod tests {
             vec!["/tmp/shot.png".to_string()]
         );
     }
+
+    #[test]
+    fn reasoning_only_final_response_retries_once_with_forced_final() {
+        let mut app = test_app_with_tools(&["read_file"]);
+        let mcp = crate::ai::mcp::McpClient::new();
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+        let mut persisted_turn_messages = 0usize;
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut force_final_response = false;
+        let mut terminal_dedupe_candidate = None;
+
+        let step = handle_iteration_execution(
+            &mut app,
+            "compare two yaml files",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+                outcome: crate::ai::types::StreamOutcome::Completed,
+                tool_calls: Vec::new(),
+                assistant_text: String::new(),
+                hidden_meta: String::new(),
+                reasoning_text: "I should read both files first.".to_string(),
+                skip_response_drain: true,
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            1,
+            16,
+        )
+        .unwrap();
+
+        assert!(matches!(step, TurnLoopStep::Continue));
+        assert!(force_final_response);
+        assert!(final_assistant_text.is_empty());
+        assert!(!final_assistant_recorded);
+        assert!(messages.is_empty());
+        assert!(turn_messages.is_empty());
+    }
+
+    #[test]
+    fn reasoning_only_final_response_stops_after_forced_retry() {
+        let mut app = test_app_with_tools(&["read_file"]);
+        let mcp = crate::ai::mcp::McpClient::new();
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+        let mut persisted_turn_messages = 0usize;
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut force_final_response = true;
+        let mut terminal_dedupe_candidate = None;
+
+        let step = handle_iteration_execution(
+            &mut app,
+            "compare two yaml files",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+                outcome: crate::ai::types::StreamOutcome::Completed,
+                tool_calls: Vec::new(),
+                assistant_text: String::new(),
+                hidden_meta: String::new(),
+                reasoning_text: "I should read both files first.".to_string(),
+                skip_response_drain: true,
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            2,
+            16,
+        )
+        .unwrap();
+
+        assert!(matches!(step, TurnLoopStep::Break));
+        assert_eq!(
+            final_assistant_text,
+            "[模型只返回了思考内容，没有给出最终回答，请重试或切换模型]"
+        );
+        assert!(!final_assistant_recorded);
+        assert!(messages.is_empty());
+        assert!(turn_messages.is_empty());
+    }
+
 
     #[test]
     fn auto_image_followup_uses_multimodal_message_for_vl_model() {
