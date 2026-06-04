@@ -139,4 +139,15 @@ impl AiConfig {
     /// When true, print prompt-cache hit metrics (cached tokens / hit rate)
     /// after each request when the provider reports them. Default true.
     pub const PROMPT_CACHE_SHOW_METRICS: &str = "ai.prompt_cache.show_metrics";
+
+    // ── Token usage stats ──────────────────────────────────
+    /// When false, disable recording LLM token usage to the SQLite stats
+    /// table. Default true.
+    pub const TOKEN_USAGE_ENABLE: &str = "ai.token_usage.enable";
+    /// SQLite database path for token usage stats. Defaults to
+    /// `~/.config/rust_tools/token_usage.db`.
+    pub const TOKEN_USAGE_DB: &str = "ai.token_usage.db";
+    /// Retain token usage rows for this many days; older rows are purged
+    /// during periodic cleanup. Defaults to 90.
+    pub const TOKEN_USAGE_RETAIN_DAYS: &str = "ai.token_usage.retain_days";
 }

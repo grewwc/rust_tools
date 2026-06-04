@@ -45,6 +45,9 @@ use crate::primitives::{
 
 const DEFAULT_COMPLETED_EVENT_RETENTION: usize = 8192;
 const DEFAULT_TRACE_CAPACITY: usize = 4096;
+/// LLM 用量审计账本默认容量。account 落账后由 agent 侧定期 drain 落库，
+/// 这里只需足够缓冲两次 drain 之间的记录即可。
+const DEFAULT_LLM_USAGE_CAPACITY: usize = 4096;
 const SHM_PERM_CACHE_SLOTS: usize = 32;
 
 /// Cached SHM permission decision. Stored in a direct-mapped slot keyed by
@@ -128,6 +131,8 @@ pub struct LocalOS {
     pub(super) trace: TraceRing,
     /// LLM device: model name -> price table. See `LlmOps`.
     pub(super) llm_prices: FastMap<String, crate::primitives::LlmModelPrice>,
+    /// LLM 用量审计账本（有界 ring）。每次 `llm_account` 追加一条，供外部 drain 落库。
+    pub(super) llm_usage: crate::primitives::LlmUsageRing,
     /// Daemon registry: handle -> entry. See `DaemonOps`.
     pub(super) daemons: FastMap<u64, DaemonEntry>,
     pub(super) next_daemon_id: u64,
@@ -217,6 +222,7 @@ impl LocalOS {
             next_futex_id: 1,
             trace: TraceRing::new(trace_capacity),
             llm_prices: FastMap::default(),
+            llm_usage: crate::primitives::LlmUsageRing::new(DEFAULT_LLM_USAGE_CAPACITY),
             daemons: FastMap::default(),
             next_daemon_id: 1,
             channels: FastMap::default(),
@@ -2293,10 +2299,42 @@ impl LlmOps for LocalOS {
         };
         let verdict = <Self as RlimitOps>::rusage_charge(self, pid, delta);
 
+        // 4) 追加一条审计记录到有界账本（供外部 drain 落库）。
+        {
+            let seq = self.llm_usage.alloc_seq();
+            let total_tokens = report
+                .prompt_tokens
+                .saturating_add(report.completion_tokens);
+            self.llm_usage.push(crate::primitives::LlmUsageRecord {
+                seq,
+                tick: self.tick,
+                pid,
+                model: report.model,
+                prompt_tokens: report.prompt_tokens,
+                completion_tokens: report.completion_tokens,
+                total_tokens,
+                cached_prompt_tokens: report.cached_prompt_tokens,
+                latency_ms: report.latency_ms,
+                cost_micros: charged_cost_micros,
+            });
+        }
+
         LlmAccountOutcome {
             charged_cost_micros,
             verdict,
         }
+    }
+
+    fn llm_usage_drain_since(&self, since_seq: u64) -> Vec<crate::primitives::LlmUsageRecord> {
+        self.llm_usage.drain_since(since_seq)
+    }
+
+    fn llm_usage_head_seq(&self) -> u64 {
+        self.llm_usage.head_seq()
+    }
+
+    fn llm_usage_set_capacity(&mut self, cap: usize) {
+        self.llm_usage.set_capacity(cap);
     }
 }
 
@@ -5449,6 +5487,94 @@ mod tests {
         let recs = os.trace_drain_since(0);
         let found = recs.iter().any(|r| r.name == "llm.account");
         assert!(found, "expected a trace event named llm.account");
+    }
+
+    #[test]
+    fn llm_usage_ledger_records_and_drains() {
+        use crate::primitives::{LlmModelPrice, LlmOps, LlmUsageReport};
+        let mut os = LocalOS::new();
+        let pid = os.begin_foreground("p".into(), "g".into(), 10, 0, None);
+        os.llm_set_price(
+            "m".into(),
+            LlmModelPrice {
+                prompt_per_1k_micros: 1_000,
+                completion_per_1k_micros: 2_000,
+            },
+        );
+        // 初始账本为空。
+        assert_eq!(os.llm_usage_head_seq(), 0);
+        assert!(os.llm_usage_drain_since(0).is_empty());
+
+        os.llm_account(
+            pid,
+            LlmUsageReport {
+                model: "m".into(),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                cached_prompt_tokens: 10,
+                latency_ms: 7,
+            },
+        );
+        os.llm_account(
+            pid,
+            LlmUsageReport {
+                model: "m".into(),
+                prompt_tokens: 200,
+                completion_tokens: 80,
+                cached_prompt_tokens: 0,
+                latency_ms: 0,
+            },
+        );
+
+        // 全量 drain：两条，升序，字段正确。
+        let all = os.llm_usage_drain_since(0);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].seq, 1);
+        assert_eq!(all[0].pid, pid);
+        assert_eq!(all[0].model, "m");
+        assert_eq!(all[0].prompt_tokens, 100);
+        assert_eq!(all[0].completion_tokens, 50);
+        assert_eq!(all[0].total_tokens, 150);
+        assert_eq!(all[0].cached_prompt_tokens, 10);
+        assert_eq!(all[0].latency_ms, 7);
+        // 100 prompt -> 100 micros; 50 completion -> 100 micros。
+        assert_eq!(all[0].cost_micros, 200);
+        assert_eq!(all[1].seq, 2);
+        assert_eq!(all[1].total_tokens, 280);
+
+        // 游标 drain：只拿 seq>1 的记录。
+        assert_eq!(os.llm_usage_head_seq(), 2);
+        let tail = os.llm_usage_drain_since(1);
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].seq, 2);
+        // drain 不消费，重复 drain 结果一致。
+        assert_eq!(os.llm_usage_drain_since(0).len(), 2);
+    }
+
+    #[test]
+    fn llm_usage_ledger_capacity_evicts_oldest() {
+        use crate::primitives::{LlmOps, LlmUsageReport};
+        let mut os = LocalOS::new();
+        let pid = os.begin_foreground("p".into(), "g".into(), 10, 0, None);
+        os.llm_usage_set_capacity(2);
+        for i in 0..5u64 {
+            os.llm_account(
+                pid,
+                LlmUsageReport {
+                    model: "m".into(),
+                    prompt_tokens: i,
+                    completion_tokens: 0,
+                    cached_prompt_tokens: 0,
+                    latency_ms: 0,
+                },
+            );
+        }
+        // seq 仍单调到 5，但只保留最后两条。
+        assert_eq!(os.llm_usage_head_seq(), 5);
+        let recs = os.llm_usage_drain_since(0);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].seq, 4);
+        assert_eq!(recs[1].seq, 5);
     }
 
     // ---- VfsOps (Phase 3) ----

@@ -7,6 +7,7 @@ pub fn print_interactive_help() {
     println!("  General:");
     println!("    /help, /h                 show this help message");
     println!("    /model [name]             list or switch models");
+    println!("    /usage [today|7d|all]     show LLM token usage statistics");
     println!("    /history [full|user|assistant|tool|system] [N]     show recent session messages");
     println!("    /history grep <keyword>      search recent messages by keyword");
     println!("    /history export [file.txt]   export current preview to a file");

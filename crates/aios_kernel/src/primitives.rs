@@ -465,6 +465,30 @@ pub struct LlmAccountOutcome {
     pub verdict: RlimitVerdict,
 }
 
+/// 一条 LLM 用量审计记录。每次 `llm_account` 落账时由内核追加到有界账本中，
+/// agent 侧据此 drain 落库（独立 SQLite 表）。这是"审计由 OS 提供"的体现。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LlmUsageRecord {
+    /// 单调递增序号，用作 drain 游标（与 trace 的 seq 独立）。
+    pub seq: u64,
+    /// 落账时的内核逻辑时钟（scheduler tick），非墙钟时间。
+    pub tick: u64,
+    /// 发起调用的进程。
+    pub pid: u64,
+    /// provider 返回的模型名称。
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    /// 总 token 数（prompt + completion）。
+    pub total_tokens: u64,
+    /// cached prompt tokens（如果 provider 支持）。
+    pub cached_prompt_tokens: u64,
+    /// 本次调用延迟（毫秒），0 表示未知。
+    pub latency_ms: u64,
+    /// 本次折算成本（微元）。
+    pub cost_micros: u64,
+}
+
 /// LLM 设备接口。`/dev/llm` 的内核态表达。
 pub trait LlmOps {
     /// 设置/覆盖某个模型的价格。
@@ -477,7 +501,73 @@ pub trait LlmOps {
     ///   1) 折算为 cost_micros（按 llm_price(model)）
     ///   2) 走 rusage_charge 推进 tokens_in/tokens_out/cost_micros
     ///   3) 在 trace ring 写一条 name="llm.account" 的事件
+    ///   4) 在有界 LLM 用量账本里追加一条 [`LlmUsageRecord`]（供外部 drain 落库）
     fn llm_account(&mut self, pid: u64, report: LlmUsageReport) -> LlmAccountOutcome;
+
+    /// 自 `since_seq` 起的所有 LLM 用量记录（升序）。用于外部 drain 落库。
+    /// 返回的记录 seq 严格大于 `since_seq`。
+    fn llm_usage_drain_since(&self, since_seq: u64) -> Vec<LlmUsageRecord>;
+
+    /// 当前账本最新 seq（用于 drain 游标的初始化/对齐）。
+    fn llm_usage_head_seq(&self) -> u64;
+
+    /// 设置 LLM 用量账本的 ring buffer 容量（超出会丢弃最旧记录）。
+    fn llm_usage_set_capacity(&mut self, cap: usize);
+}
+
+/// LLM 用量审计账本：有界 ring buffer，模式与 [`TraceRing`] 一致。
+#[derive(Debug)]
+pub(super) struct LlmUsageRing {
+    pub(super) buf: VecDeque<LlmUsageRecord>,
+    pub(super) capacity: usize,
+    pub(super) next_seq: u64,
+}
+
+impl LlmUsageRing {
+    pub(super) fn new(capacity: usize) -> Self {
+        Self {
+            buf: VecDeque::with_capacity(capacity.min(4096)),
+            capacity,
+            next_seq: 1,
+        }
+    }
+
+    pub(super) fn alloc_seq(&mut self) -> u64 {
+        let s = self.next_seq;
+        self.next_seq += 1;
+        s
+    }
+
+    pub(super) fn push(&mut self, rec: LlmUsageRecord) {
+        if self.capacity == 0 {
+            return;
+        }
+        while self.buf.len() >= self.capacity {
+            self.buf.pop_front();
+        }
+        self.buf.push_back(rec);
+    }
+
+    /// 自 `since_seq` 起（不含）的记录，升序。
+    pub(super) fn drain_since(&self, since_seq: u64) -> Vec<LlmUsageRecord> {
+        self.buf
+            .iter()
+            .filter(|r| r.seq > since_seq)
+            .cloned()
+            .collect()
+    }
+
+    /// 当前最新已分配 seq（无记录时为 0）。
+    pub(super) fn head_seq(&self) -> u64 {
+        self.next_seq.saturating_sub(1)
+    }
+
+    pub(super) fn set_capacity(&mut self, cap: usize) {
+        self.capacity = cap;
+        while self.buf.len() > self.capacity {
+            self.buf.pop_front();
+        }
+    }
 }
 
 // --------------------------------------------------------------------------

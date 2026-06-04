@@ -14,6 +14,7 @@ pub(crate) mod knowledge_types;
 pub(crate) mod memory_index;
 pub(crate) mod memory_store;
 pub(crate) mod rag_store;
+pub(crate) mod token_usage_store;
 
 /// 文件锁，用于并发访问 memory 文件
 static MEMORY_FILE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));

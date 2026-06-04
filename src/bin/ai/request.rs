@@ -2112,12 +2112,23 @@ pub(crate) fn charge_llm_usage_to_kernel(
         cached_prompt_tokens: cached,
         latency_ms,
     };
-    let mut guard = match app.os.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
+    // 在内核里落账（计费 + rusage + trace + 追加审计账本），同时拿出本次需要
+    // drain 落库的增量记录。SQLite I/O 放到 guard 释放之后，避免持内核锁做磁盘写。
+    let (outcome, drained, head) = {
+        let mut guard = match app.os.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let pid = guard.current_process_id()?;
+        let outcome = guard.llm_account(pid, report);
+        let cursor = crate::ai::tools::storage::token_usage_store::drain_cursor();
+        let drained = guard.llm_usage_drain_since(cursor);
+        let head = guard.llm_usage_head_seq();
+        (outcome, drained, head)
     };
-    let pid = guard.current_process_id()?;
-    Some(guard.llm_account(pid, report))
+    // best-effort 落库到独立的 token 用量统计表，失败不影响主流程。
+    crate::ai::tools::storage::token_usage_store::persist_drained(&drained, head);
+    Some(outcome)
 }
 
 /// 通过 LLM 做用户意图识别（fallback 路径）。

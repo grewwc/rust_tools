@@ -5,6 +5,7 @@ pub mod help;
 pub mod model;
 pub mod session;
 pub mod share;
+pub mod usage;
 
 use std::sync::Arc;
 
@@ -17,6 +18,7 @@ pub use help::try_handle_help_command;
 pub use model::try_handle_model_command;
 pub use session::try_handle_session_command;
 pub use share::try_handle_share_command;
+pub use usage::try_handle_usage_command;
 
 pub fn try_handle_interactive_command(
     app: &mut App,
@@ -28,6 +30,9 @@ pub fn try_handle_interactive_command(
         return Ok(true);
     }
     if try_handle_model_command(app, input)? {
+        return Ok(true);
+    }
+    if try_handle_usage_command(input)? {
         return Ok(true);
     }
     if try_handle_session_command(app, input)? {
