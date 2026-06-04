@@ -1872,7 +1872,7 @@ fn process_stream_payload(
     // the final `usage` on a chunk with `choices: []`, so we must pull it *before*
     // the empty-choices early return below.
     if let Some(ref usage) = chunk.usage {
-        state.pending_llm_usage = Some((chunk.model.clone(), usage.clone()));
+        state.pending_llm_usage = Some((chunk.model.clone(), usage.clone().normalized()));
     }
 
     if chunk.choices.iter().any(|choice| {
