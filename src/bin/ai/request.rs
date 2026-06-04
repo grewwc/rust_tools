@@ -861,7 +861,7 @@ pub(super) async fn do_request_messages(
 ) -> Result<Response, RequestError> {
     clear_stale_request_interrupt_before_request(app);
 
-    let mut normalized_messages = normalize_messages_for_request(messages);
+    let mut normalized_messages = normalize_messages_for_model(model, messages);
     if prompt_cache_enabled() {
         apply_prompt_cache_breakpoint(&mut normalized_messages);
     }
@@ -1369,7 +1369,6 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
             selected.push(format!("... [truncated: {omitted} chars omitted]"));
             selected.extend(tail);
         }
-
         truncate_chars(&selected.join("\n"), max_chars)
     }
 
@@ -1687,6 +1686,55 @@ fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
         out.push(message.clone());
     }
     sanitize_tool_message_sequence(out)
+}
+
+fn normalize_message_content_for_text_only_model(content: &Value) -> Value {
+    const IMAGE_PLACEHOLDER: &str = "[image omitted]";
+
+    match content {
+        Value::Array(items) => {
+            let mut segments = Vec::new();
+            for item in items {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    if !text.trim().is_empty() {
+                        segments.push(text.to_string());
+                    }
+                    continue;
+                }
+
+                if item.get("image_url").is_some()
+                    || item.get("type").and_then(|v| v.as_str()) == Some("image_url")
+                {
+                    segments.push(IMAGE_PLACEHOLDER.to_string());
+                    continue;
+                }
+
+                let fallback = extract_displayable_text(item);
+                if !fallback.trim().is_empty() {
+                    segments.push(fallback);
+                }
+            }
+
+            if segments.is_empty() {
+                Value::String(IMAGE_PLACEHOLDER.to_string())
+            } else {
+                Value::String(segments.join("\n"))
+            }
+        }
+        _ => content.clone(),
+    }
+}
+
+fn normalize_messages_for_model(model: &str, messages: &[Message]) -> Vec<Message> {
+    let mut normalized = normalize_messages_for_request(messages);
+    if models::supports_image_input(model) {
+        return normalized;
+    }
+
+    for message in &mut normalized {
+        message.content = normalize_message_content_for_text_only_model(&message.content);
+    }
+    normalized
 }
 
 pub(super) fn build_content(
@@ -2910,5 +2958,54 @@ mod tests {
                 .map(|s| s.starts_with("data:image/png;base64,"))
                 .unwrap_or(false)
         );
+    }
+
+    #[test]
+    fn normalize_messages_downgrades_image_content_for_text_only_models() {
+        let Some(model) = crate::ai::model_names::all()
+            .iter()
+            .find(|m| !m.is_vl)
+            .map(|m| m.name.clone())
+        else {
+            eprintln!(
+                "[test] skipping normalize_messages_downgrades_image_content_for_text_only_models: no text-only model present in models.json"
+            );
+            return;
+        };
+
+        let messages = vec![
+            Message {
+                role: "system".to_string(),
+                content: Value::String("base system".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::Array(vec![
+                    serde_json::json!({
+                        "type": "image_url",
+                        "image_url": { "url": "data:image/png;base64,AAAA" }
+                    }),
+                    serde_json::json!({
+                        "type": "text",
+                        "text": "please explain"
+                    }),
+                ]),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        let normalized = normalize_messages_for_model(&model, &messages);
+
+        assert!(normalized
+            .iter()
+            .all(|message| !matches!(message.content, Value::Array(_))));
+        let content = normalized[1].content.as_str().unwrap();
+        assert!(content.contains("[image omitted]"));
+        assert!(content.contains("please explain"));
     }
 }
