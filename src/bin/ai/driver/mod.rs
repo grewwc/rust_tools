@@ -1468,11 +1468,18 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
         return Err("memo-search requires a query".into());
     }
 
+    // 安装远程 embedding provider（若已配置）。必须在任何 embedder::is_ready()
+    // 调用之前执行——GLOBAL_PROVIDER 是 OnceLock，首次读取即定型。
+    // 未配置 / 配置不全时此调用无副作用，检索退回 BM25/lexical。
+    crate::ai::knowledge::indexing::embedder::warm_up();
+
     // 检索 + 模型总结都可能耗时，给一个 "Searching..." 动画提示（输出前自动清除）。
     let spinner = SearchSpinner::start("Searching memo");
 
     // 检索相关 memo 条目作为上下文。
-    let candidates = match crate::ai::tools::service::memory::search_memo_candidates(&query, 20) {
+    let candidates = match crate::ai::tools::service::memory::search_memo_candidates_scored(
+        &query, 20,
+    ) {
         Ok(c) => c,
         Err(err) => {
             spinner.stop();
@@ -1490,10 +1497,30 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
         return Ok(());
     }
 
+    // 按语义分数收紧喂给 LLM 的条数，进一步防止大知识库撑爆上下文。
+    // 仅在本次确实用了语义打分（embedding 可用）时收紧——此时分数可比较、
+    // 排序可信；否则保持全部 20 条交给 LLM（与历史行为一致，不丢候选）。
+    // 收紧策略：保留 top1 锚点；其余条目要求语义分数 >= top1 的 60% 才纳入，
+    // 至多 8 条。这样只砍掉明显不相关的长尾，不影响真正相关的笔记。
+    let selected: Vec<&crate::ai::tools::service::memory::ScoredMemo> =
+        if candidates.first().is_some_and(|c| c.semantic) {
+            let top = candidates[0].score.max(1e-6);
+            let threshold = top * 0.6;
+            candidates
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| *i == 0 || c.score >= threshold)
+                .take(8)
+                .map(|(_, c)| c)
+                .collect()
+        } else {
+            candidates.iter().collect()
+        };
+
     // 把检索到的条目作为上下文，让模型基于这些内容回答用户的问题。
     let mut context = String::new();
-    for (idx, e) in candidates.iter().enumerate() {
-        context.push_str(&format!("[{}] {}\n", idx + 1, e.note));
+    for (idx, c) in selected.iter().enumerate() {
+        context.push_str(&format!("[{}] {}\n", idx + 1, c.entry.note));
     }
 
     let model = crate::ai::models::initial_model(&app.cli);
@@ -1520,17 +1547,13 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
                 .trim()
                 .to_string();
             if answer.is_empty() {
-                // 模型无输出时退回展示原始条目。
-                let raw = crate::ai::tools::service::memory::search_memo_candidates(&query, 20)
-                    .map(|cands| {
-                        cands
-                            .iter()
-                            .enumerate()
-                            .map(|(i, e)| format!("{}. {}", i + 1, e.note))
-                            .collect::<Vec<_>>()
-                            .join("\n\n")
-                    })
-                    .unwrap_or_default();
+                // 模型无输出时退回展示已选中的原始条目（复用上面的检索结果，不重复检索）。
+                let raw = selected
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| format!("{}. {}", i + 1, c.entry.note))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
                 crate::ai::stream::render_markdown_block(&raw).ok();
             } else {
                 crate::ai::stream::render_markdown_block(&answer).ok();

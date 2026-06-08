@@ -454,12 +454,31 @@ pub(crate) fn execute_memory_search(args: &Value) -> Result<String, String> {
     Ok(out)
 }
 
+/// 带分数的 memo 检索结果。`semantic` 表示本次是否用到了语义（embedding）打分——
+/// 上层据此决定能否按语义分数做上下文收紧。
+pub(crate) struct ScoredMemo {
+    pub entry: AgentMemoryEntry,
+    pub score: f64,
+    pub semantic: bool,
+}
+
 /// 根据查询文本检索 memo 候选条目，返回结构化条目（按相关度排序）。
 /// 用于 `-nd` 删除流程：让上层用模型挑选最匹配的条目再确认删除。
 pub(crate) fn search_memo_candidates(
     query: &str,
     limit: usize,
 ) -> Result<Vec<AgentMemoryEntry>, String> {
+    Ok(search_memo_candidates_scored(query, limit)?
+        .into_iter()
+        .map(|s| s.entry)
+        .collect())
+}
+
+/// 与 `search_memo_candidates` 同源，但保留分数与"是否用了语义"标记。
+pub(crate) fn search_memo_candidates_scored(
+    query: &str,
+    limit: usize,
+) -> Result<Vec<ScoredMemo>, String> {
     let query = query.trim();
     if query.is_empty() {
         return Err("query is empty".to_string());
@@ -467,18 +486,16 @@ pub(crate) fn search_memo_candidates(
     let limit = limit.clamp(1, 50);
     let store = MemoryStore::from_env_or_config();
     // 只加载 memo 类别条目即可：memo 是用户手工记录的类别，量很小。
-    // 这里直接按类别扫描（跳过全量 BM25 + embedding 重排——那套分数在本函数里
-    // 会被完全丢弃，仅用下面的子串打分），打分 / 排序 / 截断逻辑保持不变，
-    // 结果与旧实现一致但快得多。category 写入恒为小写 "memo"。
+    // category 写入恒为小写 "memo"。
     let results = store.entries_by_category("memo", 100_000)?;
     let viewer = ViewerContext::current();
     let qlc = query.to_lowercase();
 
-    let mut scored: Vec<(f64, AgentMemoryEntry)> = Vec::new();
-    for e in results {
-        if !viewer.can_see(&e) {
-            continue;
-        }
+    let visible: Vec<AgentMemoryEntry> =
+        results.into_iter().filter(|e| viewer.can_see(e)).collect();
+
+    // 字面打分（子串命中），任何情况下都计算——作为基础信号 / embedding 不可用时的唯一信号。
+    let lexical = |e: &AgentMemoryEntry| -> f64 {
         let mut score = 0.0_f64;
         if e.note.to_lowercase().contains(&qlc) {
             score += 3.0;
@@ -487,11 +504,50 @@ pub(crate) fn search_memo_candidates(
         if e.tags.iter().any(|t| t.to_lowercase().contains(&qlc)) {
             score += 1.2;
         }
-        scored.push((score, e));
+        score
+    };
+
+    // 语义重排：仅当远程 embedding 可用时启用。任意一步拿不到向量都整体回退到
+    // 纯字面打分（即历史行为），绝不因为 embedding 故障而改变/中断检索结果。
+    let semantic: Option<Vec<f64>> = if crate::ai::knowledge::indexing::embedder::is_ready() {
+        let qv = crate::ai::knowledge::indexing::embedder::embed_text(&qlc);
+        match qv {
+            Some(qv) => {
+                let texts: Vec<String> = visible.iter().map(|e| e.note.clone()).collect();
+                crate::ai::knowledge::indexing::embedder::embed_texts(&texts).map(|batch| {
+                    batch
+                        .iter()
+                        .map(|v| {
+                            crate::ai::knowledge::indexing::similarity::cosine_similarity(&qv, v)
+                                as f64
+                        })
+                        .collect()
+                })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let used_semantic = semantic.is_some();
+    let mut scored: Vec<ScoredMemo> = Vec::with_capacity(visible.len());
+    for (i, e) in visible.into_iter().enumerate() {
+        let lex = lexical(&e);
+        // 有 embedding 时语义为主、字面为辅；无 embedding 时退回纯字面。
+        let score = match &semantic {
+            Some(sims) => sims.get(i).copied().unwrap_or(0.0) * 10.0 + lex,
+            None => lex,
+        };
+        scored.push(ScoredMemo {
+            entry: e,
+            score,
+            semantic: used_semantic,
+        });
     }
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
     scored.truncate(limit);
-    Ok(scored.into_iter().map(|(_, e)| e).collect())
+    Ok(scored)
 }
 
 pub(crate) fn execute_memory_recent(args: &Value) -> Result<String, String> {

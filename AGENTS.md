@@ -78,6 +78,7 @@ cargo test --bin a test_xxx       # Filter tests by name
    - Keys defined in `config_schema.rs` (`AiConfig` constants) — never use raw string literals
    - Runtime config via `configw::get_all_config()`
    - Model registry: `models.json` (endpoints, quality tiers, VL support)
+   - Embedding (optional, off by default): set `ai.embedding.enable=true` + `aliyun.api_key` (or `ai.embedding.api_key`) to enable semantic recall via Aliyun 百炼 OpenAI-compatible `/embeddings` (`text-embedding-v4`). Any failure degrades to BM25/lexical — see [embedder.rs](src/bin/ai/knowledge/indexing/embedder.rs).
 
 ## Coding Standards
 

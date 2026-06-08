@@ -106,19 +106,6 @@ fn execute_semantic_search(args: &Value) -> Result<String, String> {
             .filter_map(|(entry, score)| entry.id.as_ref().map(|id| (id.clone(), *score as f32)))
             .collect();
 
-        let _results = store.hybrid_search(
-            query,
-            bm25_for_hybrid,
-            limit,
-            category,
-            config.hybrid_vector_weight,
-        )?;
-
-        let bm25_for_hybrid: Vec<(String, f32)> = bm25_results
-            .iter()
-            .filter_map(|(entry, score)| entry.id.as_ref().map(|id| (id.clone(), *score as f32)))
-            .collect();
-
         let results = store.hybrid_search(
             query,
             bm25_for_hybrid,

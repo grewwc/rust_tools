@@ -66,6 +66,13 @@ impl AiConfig {
         "ai.knowledge.maintenance.guidelines_max_chars";
     pub const KNOWLEDGE_SEARCH_DEFAULT_LIMIT: &str = "ai.knowledge.search.default_limit";
 
+    // ── Embedding (remote provider) ────────────────────────
+    pub const EMBEDDING_ENABLE: &str = "ai.embedding.enable";
+    pub const EMBEDDING_ENDPOINT: &str = "ai.embedding.endpoint";
+    pub const EMBEDDING_API_KEY: &str = "ai.embedding.api_key";
+    pub const EMBEDDING_MODEL: &str = "ai.embedding.model";
+    pub const EMBEDDING_TIMEOUT_MS: &str = "ai.embedding.timeout_ms";
+
     // ── Reflection ─────────────────────────────────────────
     pub const REFLECTION_ENABLE: &str = "ai.reflection.enable";
     pub const REFLECTION_INTEGRATED: &str = "ai.reflection.integrated";
