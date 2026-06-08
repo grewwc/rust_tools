@@ -141,9 +141,24 @@ fn check_file(
             return;
         };
 
-        let preview = substring_quiet(&src, 0, max_len as isize);
-        let preview = preview.trim().to_string();
-        let preview = output::highlight_ranges(&preview, ranges);
+        let preview_raw = substring_quiet(&src, 0, max_len as isize);
+        let trimmed = preview_raw.trim();
+        // `ranges` are byte offsets in `src`/`preview_raw`, but we highlight `trimmed`.
+        // Subtract the leading-trim offset so highlights land on the right chars.
+        let trim_offset = preview_raw.find(trimmed).unwrap_or(0);
+        let adjusted_ranges: Vec<(usize, usize)> = ranges
+            .iter()
+            .filter_map(|&(s, e)| {
+                let s2 = s.checked_sub(trim_offset)?;
+                let e2 = e.checked_sub(trim_offset)?;
+                if e2 <= trimmed.len() {
+                    Some((s2, e2))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let preview = output::highlight_ranges(trimmed, adjusted_ranges);
         output::print_hit(&abs, hit_line, &preview);
     }
 }
@@ -206,5 +221,26 @@ mod tests {
         let mut buf = String::new();
         assert_eq!(read_line_trim_newline(&mut buf, &mut reader).unwrap(), "a");
         assert_eq!(read_line_trim_newline(&mut buf, &mut reader).unwrap(), "b");
+    }
+
+    #[test]
+    fn test_highlight_trim_offset() {
+        // Simulate: line has leading whitespace, ranges are in original coords
+        let src = "    __tablename__ = \"aeolus_ada_messages\"";
+        let preview_raw = substring_quiet(src, 0, src.len() as isize);
+        let trimmed = preview_raw.trim();
+        let trim_offset = preview_raw.find(trimmed).unwrap_or(0);
+        // Match "aeolus_ada_messages" in original src: starts at byte 21
+        let ranges: Vec<(usize, usize)> = vec![(21, 40)];
+        let adjusted: Vec<(usize, usize)> = ranges
+            .iter()
+            .filter_map(|&(s, e)| {
+                let s2 = s.checked_sub(trim_offset)?;
+                let e2 = e.checked_sub(trim_offset)?;
+                if e2 <= trimmed.len() { Some((s2, e2)) } else { None }
+            })
+            .collect();
+        assert_eq!(adjusted, vec![(17, 36)]);
+        assert_eq!(&trimmed[17..36], "aeolus_ada_messages");
     }
 }
