@@ -1128,6 +1128,52 @@ pub(crate) fn execute_memory_delete(args: &Value) -> Result<String, String> {
     })
 }
 
+/// 修改一条已存在的 memo：定位 target（优先 id，否则时间戳+原文精确匹配），
+/// 把内容替换为 `new_note`，保留原 id，timestamp 更新为当前时间（体现最近被编辑）。
+/// 只改第一条匹配项，避免误改重复内容。
+pub(crate) fn update_memo_entry(
+    target: &AgentMemoryEntry,
+    new_note: &str,
+) -> Result<String, String> {
+    let new_note = new_note.trim();
+    if new_note.is_empty() {
+        return Err("new note is empty".to_string());
+    }
+    let store = MemoryStore::from_env_or_config();
+    let path = store.path().to_path_buf();
+    let target_id = target.id.clone().filter(|s| !s.is_empty());
+    let target_ts = target.timestamp.clone();
+    let target_note = target.note.clone();
+
+    super::super::storage::with_memory_file_lock(&path, || {
+        if !path.exists() {
+            return Err("No memory file".to_string());
+        }
+        let mut entries = load_memory_entries(&path)?;
+        let mut updated = false;
+        for e in entries.iter_mut() {
+            let hit = if let Some(id) = target_id.as_deref() {
+                e.id.as_deref() == Some(id)
+            } else {
+                e.id.as_deref().map(|s| s.is_empty()).unwrap_or(true)
+                    && e.timestamp == target_ts
+                    && e.note == target_note
+            };
+            if hit {
+                e.note = new_note.to_string();
+                e.timestamp = Local::now().to_rfc3339();
+                updated = true;
+                break;
+            }
+        }
+        if !updated {
+            return Err("matching memo entry not found".to_string());
+        }
+        write_memory_entries(&path, &entries)?;
+        Ok(format!("Memory updated: {}", path.display()))
+    })
+}
+
 /// 删除一条 memo 条目：优先按 id 匹配；若条目没有 id（历史数据），
 /// 则按 (timestamp, note) 精确匹配删除。返回删除结果描述。
 pub(crate) fn delete_memo_entry(target: &AgentMemoryEntry) -> Result<String, String> {
@@ -1243,7 +1289,7 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
 mod tests {
     use super::{
         execute_memory_delete, execute_memory_list_json, execute_memory_save,
-        execute_memory_update, is_memory_visible_to,
+        execute_memory_update, is_memory_visible_to, update_memo_entry,
     };
     use crate::ai::test_support::ENV_LOCK;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
@@ -1333,6 +1379,57 @@ mod tests {
         let list_after = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
         let after: serde_json::Value = serde_json::from_str(&list_after).unwrap();
         assert!(after.as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn memo_update_preserves_id_and_replaces_note() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_memory_update_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let save_args = serde_json::json!({
+            "content": "ida 交接文档 原始内容",
+            "category": "memo",
+            "tags": ["handoff"]
+        });
+        execute_memory_save(&save_args).unwrap();
+
+        let list_before = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
+        let before: serde_json::Value = serde_json::from_str(&list_before).unwrap();
+        let id = before[0]["id"].as_str().unwrap().to_string();
+
+        let target = AgentMemoryEntry {
+            id: Some(id.clone()),
+            timestamp: before[0]["timestamp"].as_str().unwrap().to_string(),
+            category: "memo".to_string(),
+            note: "ida 交接文档 原始内容".to_string(),
+            tags: vec!["handoff".to_string()],
+            source: None,
+            priority: None,
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        };
+        let msg = update_memo_entry(&target, "ida 交接文档 更新后的内容").unwrap();
+        assert!(msg.contains("Memory updated"));
+
+        let list_after = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&list_after).unwrap();
+        // id 保持不变；内容被替换；条目数不变。
+        assert_eq!(after.as_array().unwrap().len(), 1);
+        assert_eq!(after[0]["id"].as_str().unwrap(), id);
+        assert_eq!(after[0]["note"].as_str().unwrap(), "ida 交接文档 更新后的内容");
 
         let _ = std::fs::remove_file(&path);
         unsafe {

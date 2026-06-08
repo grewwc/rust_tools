@@ -1148,6 +1148,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return handle_note_delete(&mut app, &query).await;
     }
 
+    // 处理 --note-edit / -ne：输入一段话，模型匹配知识库条目，在编辑器中改写后保存。
+    if let Some(query) = app.cli.note_edit.clone() {
+        return handle_note_edit(&mut app, &query).await;
+    }
+
     // 处理 --note / -n：快速保存 memo 到知识库并退出。
     // 即使没有文本（只想保存剪贴板图片），只要传了 -n 也要进入保存流程。
     if app.cli.note_flag {
@@ -1761,6 +1766,192 @@ async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn st
         return Err("all deletions failed".into());
     }
     Ok(())
+}
+
+/// 处理 --note-edit / -ne <一段话>：用模型在知识库中匹配相关 memo 条目，
+/// 匹配到多条时让用户选定一条，在编辑器中预填原文改写后保存（保留 id、更新时间戳）。
+async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    // 拼接查询：flag 的值 + 其余位置参数；都为空时进入多行输入框。
+    let mut query = query.trim().to_string();
+    if !app.cli.args.is_empty() {
+        let extra = app.cli.args.join(" ");
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        query.push_str(extra.trim());
+    }
+    let query = query.trim().to_string();
+    let query = if query.is_empty() {
+        println!("[note-edit] 请描述你想修改的内容（多行；提交后开始匹配，留空取消）：");
+        let input = match app.prompt_editor.as_mut() {
+            Some(editor) => editor.read_multi_line().ok().flatten(),
+            None => None,
+        };
+        match input {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => {
+                eprintln!("[note-edit] 未输入任何内容，已取消");
+                return Ok(());
+            }
+        }
+    } else {
+        query
+    };
+
+    // 检索候选条目。
+    let candidates = match crate::ai::tools::service::memory::search_memo_candidates(&query, 10) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("[note-edit] 检索失败: {}", err);
+            return Err(err.into());
+        }
+    };
+    if candidates.is_empty() {
+        println!("[note-edit] 没有找到与「{}」相关的可修改 memo 条目。", query);
+        return Ok(());
+    }
+
+    // 让模型从候选中挑选匹配的条目（可能多条），返回编号。
+    let mut listing = String::new();
+    for (idx, e) in candidates.iter().enumerate() {
+        let note_preview: String = e.note.chars().take(300).collect();
+        listing.push_str(&format!("{}. {}\n", idx + 1, note_preview));
+    }
+
+    let model = crate::ai::models::initial_model(&app.cli);
+    let messages = vec![
+        serde_json::json!({
+            "role": "system",
+            "content": "你是一个知识库编辑助手。用户会给出一段描述，以及若干条带编号的候选笔记。\
+                        请判断哪些条目符合用户想修改的内容——可能是一条，也可能是多条。\
+                        只输出这些条目的编号，用英文逗号分隔（如 1 或 1,3,4）。\
+                        如果没有任何一条明显匹配，只输出 NONE。不要输出任何解释或多余字符。",
+        }),
+        serde_json::json!({
+            "role": "user",
+            "content": format!("用户描述：{}\n\n候选条目：\n{}", query, listing),
+        }),
+    ];
+
+    let chosen =
+        match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
+            Ok(response) => response
+                .pointer("/choices/0/message/content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default(),
+            Err(err) => {
+                eprintln!("[note-edit] 模型匹配失败: {}", err);
+                String::new()
+            }
+        };
+
+    // 解析模型返回的编号集合。
+    let parse_indices = |s: &str, max: usize| -> Vec<usize> {
+        let mut out: Vec<usize> = Vec::new();
+        let mut num = String::new();
+        let mut flush = |num: &mut String, out: &mut Vec<usize>| {
+            if let Ok(n) = num.parse::<usize>() {
+                if n >= 1 && n <= max {
+                    let idx = n - 1;
+                    if !out.contains(&idx) {
+                        out.push(idx);
+                    }
+                }
+            }
+            num.clear();
+        };
+        for c in s.chars() {
+            if c.is_ascii_digit() {
+                num.push(c);
+            } else {
+                flush(&mut num, &mut out);
+            }
+        }
+        flush(&mut num, &mut out);
+        out.sort_unstable();
+        out
+    };
+
+    let mut matched = parse_indices(&chosen, candidates.len());
+    if matched.is_empty() {
+        println!("[note-edit] 模型未能从候选中确定要修改的条目，已取消。可换个更具体的描述重试。");
+        return Ok(());
+    }
+
+    // 匹配到多条：列出后让用户选定恰好一条来编辑（编辑是针对单条内容的）。
+    let target_idx = if matched.len() == 1 {
+        matched[0]
+    } else {
+        println!("\n[note-edit] 匹配到以下 {} 条条目：", matched.len());
+        for (n, &ci) in matched.iter().enumerate() {
+            let e = &candidates[ci];
+            println!("  [{}]", n + 1);
+            if let Some(id) = e.id.as_deref().filter(|s| !s.is_empty()) {
+                println!("    id: {}", id);
+            }
+            println!("    时间: {}", e.timestamp);
+            println!("    内容: {}", e.note.chars().take(500).collect::<String>());
+        }
+        print!("\n请输入要修改的编号（只能选一条；n=取消）: ");
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).ok();
+        let answer = answer.trim().to_lowercase();
+        if answer == "n" || answer == "no" || answer == "q" || answer == "cancel" {
+            println!("[note-edit] 已取消，未修改任何内容。");
+            return Ok(());
+        }
+        let picks = parse_indices(&answer, matched.len());
+        match picks.first() {
+            Some(&p) => matched.remove(p),
+            None => {
+                println!("[note-edit] 未识别到有效编号，已取消，未修改任何内容。");
+                return Ok(());
+            }
+        }
+    };
+
+    let target = candidates[target_idx].clone();
+
+    // 在编辑器中预填原文，让用户改写。
+    println!("\n[note-edit] 将打开编辑器修改以下条目（原文已预填；留空或不改动即取消）：");
+    if let Some(id) = target.id.as_deref().filter(|s| !s.is_empty()) {
+        println!("    id: {}", id);
+    }
+    println!("    时间: {}", target.timestamp);
+
+    let new_note = match app.prompt_editor.as_mut() {
+        Some(editor) => {
+            editor.set_prefill(target.note.clone());
+            editor.read_multi_line().ok().flatten()
+        }
+        None => None,
+    };
+    let new_note = match new_note {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => {
+            println!("[note-edit] 未输入新内容，已取消。");
+            return Ok(());
+        }
+    };
+    if new_note == target.note.trim() {
+        println!("[note-edit] 内容未变化，已取消。");
+        return Ok(());
+    }
+
+    match crate::ai::tools::service::memory::update_memo_entry(&target, &new_note) {
+        Ok(_) => {
+            println!("[note-edit] 已更新该条目。");
+            Ok(())
+        }
+        Err(err) => {
+            eprintln!("[note-edit] 更新失败: {}", err);
+            Err(err.into())
+        }
+    }
 }
 
 /// Generate history file path for a background process.

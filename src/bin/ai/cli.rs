@@ -42,6 +42,8 @@ pub(super) struct ParsedCli {
     pub(super) note_flag: bool,
     /// 通过 `--note-delete` / `-nd <id>` 指定要删除的 memo 条目 ID。
     pub(super) note_delete: Option<String>,
+    /// 通过 `--note-edit` / `-ne <描述>` 指定要修改的 memo：AI 匹配后在编辑器中改写。
+    pub(super) note_edit: Option<String>,
 }
 
 impl Default for ParsedCli {
@@ -70,6 +72,7 @@ impl Default for ParsedCli {
             note: None,
             note_flag: false,
             note_delete: None,
+            note_edit: None,
         }
     }
 }
@@ -134,6 +137,8 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     parser.alias("n", "note");
     parser.add_string("note-delete", "", "describe a memo to delete; AI matches it, confirm to delete");
     parser.alias("nd", "note-delete");
+    parser.add_string("note-edit", "", "describe a memo to edit; AI matches it, edit in editor and save");
+    parser.alias("ne", "note-edit");
 
     // 解析 argv（跳过 program name）
     let mut argv: Vec<String> = if raw.len() > 1 {
@@ -248,6 +253,13 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         cli.note_delete = Some(val.trim().to_string());
     }
 
+    // 处理 note-edit：传了 --note-edit / -ne 就进入修改流程，
+    // 没带文本时上层进入多行输入框让用户描述要修改的内容。
+    if parser.contains_flag_strict("note-edit") {
+        let val = parser.flag_value_or_default("note-edit");
+        cli.note_edit = Some(val.trim().to_string());
+    }
+
     // 处理 mcp-config
     if parser.contains_flag_strict("mcp-config") {
         cli.mcp_config = parser.flag_value_or_default("mcp-config");
@@ -335,6 +347,8 @@ pub(super) fn print_help() {
     parser.alias("n", "note");
     parser.add_string("note-delete", "", "describe a memo to delete; AI matches it, confirm to delete");
     parser.alias("nd", "note-delete");
+    parser.add_string("note-edit", "", "describe a memo to edit; AI matches it, edit in editor and save");
+    parser.alias("ne", "note-edit");
 
     println!("AI CLI - Interactive AI Assistant");
     println!("Usage: a [OPTIONS] [PROMPT]");

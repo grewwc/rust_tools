@@ -74,7 +74,11 @@ impl PromptEditor {
         };
 
         let result: io::Result<Option<String>> = (|| {
-            let mut textarea: TextArea = TextArea::default();
+            // 预填内容（编辑已有 memo 场景）：按行载入 textarea，读取后清空。
+            let mut textarea: TextArea = match self.pending_prefill.take() {
+                Some(text) => TextArea::from(text.lines().map(|l| l.to_string())),
+                None => TextArea::default(),
+            };
             let mut history = MultilineHistoryState::new(self.multiline_history_entries());
             let mut accept_release = false;
             let mut status_msg: Option<String> = None;

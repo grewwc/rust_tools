@@ -23,6 +23,8 @@ pub(super) struct PromptEditor {
     editor: Option<LineEditor>,
     pub(super) history_path: PathBuf,
     session_image_dir: PathBuf,
+    /// 下一次 `read_multi_line` 的预填文本（用于编辑已有内容场景，读取后清空）。
+    pending_prefill: Option<String>,
 }
 
 impl PromptEditor {
@@ -45,7 +47,13 @@ impl PromptEditor {
             editor,
             history_path,
             session_image_dir,
+            pending_prefill: None,
         }
+    }
+
+    /// 设置下一次多行输入的预填内容（编辑已有 memo 时用，读取一次后自动清空）。
+    pub(super) fn set_prefill(&mut self, text: impl Into<String>) {
+        self.pending_prefill = Some(text.into());
     }
 
     pub(super) fn read_multi_line(&mut self) -> io::Result<Option<String>> {
@@ -57,13 +65,15 @@ impl PromptEditor {
     }
 
     fn read_multi_line_no_tty(&mut self) -> io::Result<Option<String>> {
+        // 非 TTY 无法交互编辑：有预填且无管道输入时，直接返回预填原文。
+        let prefill = self.pending_prefill.take();
         let stdin = io::stdin();
         let mut lines = Vec::new();
         for line in stdin.lock().lines() {
             lines.push(line?);
         }
         if lines.is_empty() {
-            return Ok(None);
+            return Ok(prefill);
         }
         let content = lines.join("\n");
         self.save_history_entry(&content);
