@@ -22,6 +22,10 @@ pub struct ModelDef {
     pub is_vl: bool,
     pub search_enabled: bool,
     pub tools_default_enabled: bool,
+    /// 是否支持在 message content block 上注入
+    /// `cache_control: {"type":"ephemeral"}` 以启用显式 prompt cache。
+    #[serde(default, alias = "supports_explicit_prompt_cache")]
+    pub explicit_prompt_cache: bool,
     #[serde(default)]
     pub enable_thinking: bool,
     /// 可选：模型上下文窗口（token 数）。
@@ -34,9 +38,9 @@ pub struct ModelDef {
     #[serde(default)]
     pub subagent_priority: i32,
 
-    /// 可选：默认推理强度档位。仅对 OpenAI/OpenCode 兼容协议生效，
-    /// `Compatible` provider 会忽略。CLI / `/model effort` 命令的覆盖优先级
-    /// 高于这里。
+    /// 可选：默认推理强度档位。OpenAI/OpenCode 兼容协议使用顶层
+    /// `reasoning_effort`，DashScope compatible provider 使用嵌套
+    /// `reasoning.effort`。CLI / `/model effort` 命令的覆盖优先级高于这里。
     ///
     /// 在 `models.json` 中可填以下值（大小写不敏感）：
     /// - `"auto"` / `"none"` / `"off"` 或字段省略：等同 `None`，请求中不带

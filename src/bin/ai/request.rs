@@ -38,10 +38,11 @@ struct RequestBody<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<Value>,
     /// OpenAI / OpenRouter / OpenCode 兼容协议的推理强度顶层字段。
-    /// 仅对 `provider.is_openai()` 为真的模型注入；其它 provider 会
-    /// 跳过，避免被服务端拒绝（部分网关对未知字段返回 400）。
+    /// DashScope compatible provider 使用下方的嵌套 `reasoning.effort`。
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -924,7 +925,7 @@ pub(super) async fn do_request_messages(
     clear_stale_request_interrupt_before_request(app);
 
     let mut normalized_messages = normalize_messages_for_model(model, messages);
-    if prompt_cache_enabled() {
+    if prompt_cache_enabled_for_model(model) {
         apply_prompt_cache_breakpoint(&mut normalized_messages);
     }
     let (tools_value, tool_choice) = agent_tools_for_request(app, model);
@@ -1857,14 +1858,6 @@ fn build_request_body<'a>(
     reasoning_effort: Option<&'a str>,
 ) -> RequestBody<'a> {
     let provider = models::model_provider(model);
-    // `reasoning_effort` 仅对 OpenAI / OpenRouter / OpenCode 等
-    // OpenAI-兼容网关有效；阿里云 DashScope `Compatible` provider 当前
-    // 不识别这个字段，提交后会被拒或忽略，所以这里强制清空。
-    let effective_effort = if provider.is_openai() {
-        reasoning_effort
-    } else {
-        None
-    };
     match provider {
         ApiProvider::Compatible => RequestBody {
             model,
@@ -1874,7 +1867,8 @@ fn build_request_body<'a>(
             enable_search,
             tools,
             tool_choice,
-            reasoning_effort: effective_effort,
+            reasoning_effort: None,
+            reasoning: reasoning_effort.map(|effort| json!({ "effort": effort })),
         },
         _ => RequestBody {
             model,
@@ -1884,24 +1878,30 @@ fn build_request_body<'a>(
             enable_search: None,
             tools,
             tool_choice,
-            reasoning_effort: effective_effort,
+            reasoning_effort: reasoning_effort.filter(|_| provider.is_openai()),
+            reasoning: None,
         },
     }
 }
 
-/// 是否开启 opt-in 的 prompt cache 断点注入（`ai.prompt_cache.enable`，默认关）。
-/// 仅对 Anthropic 兼容网关（如 OpenRouter 转发的 Claude）有实际意义；OpenAI /
-/// DashScope 等是服务端自动缓存，无需也不应注入 `cache_control`。
-fn prompt_cache_enabled() -> bool {
-    crate::commonw::configw::get_all_config()
+/// 是否开启 opt-in 的显式 prompt cache 断点注入。
+///
+/// `cache_control` 是 provider/model 级能力，由 `models.json` 的
+/// `explicit_prompt_cache` 字段声明；普通 OpenAI 兼容模型不一定接受该扩展字段。
+fn prompt_cache_enabled_for_model(model: &str) -> bool {
+    prompt_cache_config_enabled() && models::explicit_prompt_cache_enabled(model)
+}
+
+fn prompt_cache_config_enabled() -> bool {
+    configw::get_all_config()
         .get(crate::ai::config_schema::AiConfig::PROMPT_CACHE_ENABLE, "false")
         .trim()
         .eq_ignore_ascii_case("true")
 }
 
 /// 把首条 system / internal_note 消息的纯文本内容改写为带 `cache_control`
-/// 的内容块数组，作为 Anthropic 兼容网关的 prompt 缓存断点。仅在内容当前是
-/// 字符串时转换，幂等且不会触碰其它消息。
+/// 的内容块数组，作为显式 prompt 缓存断点。仅在内容当前是字符串时转换，
+/// 幂等且不会触碰其它消息。
 fn apply_prompt_cache_breakpoint(messages: &mut [Message]) {
     for message in messages.iter_mut() {
         if !is_system_like_role(&message.role) {
@@ -2482,6 +2482,27 @@ mod tests {
         assert_eq!(messages[0].content, Value::String("hi".to_string()));
     }
 
+    #[test]
+    fn prompt_cache_model_support_uses_models_json_flag() {
+        assert!(models::explicit_prompt_cache_enabled("qwen3.7-max"));
+        assert!(models::explicit_prompt_cache_enabled("qwen3.7-plus"));
+        assert!(models::explicit_prompt_cache_enabled("glm-5.1"));
+    }
+
+    #[test]
+    fn prompt_cache_model_support_does_not_guess_by_name() {
+        assert!(!models::explicit_prompt_cache_enabled(
+            "anthropic/claude-sonnet-4"
+        ));
+        assert!(!models::explicit_prompt_cache_enabled("claude-3-5-sonnet"));
+    }
+
+    #[test]
+    fn prompt_cache_model_support_rejects_plain_openai_model() {
+        let model = first_openai_model_name();
+        assert!(!models::explicit_prompt_cache_enabled(&model));
+    }
+
     fn test_app() -> App {
         App {
             cli: ParsedCli::default(),
@@ -2655,11 +2676,25 @@ mod tests {
             reasoning_content: None,
         }];
         let model = first_openai_model_name();
-        let body = build_request_body(&model, &messages, true, true, Some(true), None, None, None);
+        let body = build_request_body(
+            &model,
+            &messages,
+            true,
+            true,
+            Some(true),
+            None,
+            None,
+            Some("high"),
+        );
         let value = serde_json::to_value(&body).unwrap();
 
         assert!(value.get("enable_thinking").is_none());
         assert!(value.get("enable_search").is_none());
+        assert_eq!(
+            value.get("reasoning_effort").and_then(|v| v.as_str()),
+            Some("high")
+        );
+        assert!(value.get("reasoning").is_none());
         assert_eq!(
             value.get("model").and_then(|v| v.as_str()),
             Some(model.as_str())
@@ -2675,7 +2710,16 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         }];
-        let body = build_request_body("qwen", &messages, false, true, Some(true), None, None, None);
+        let body = build_request_body(
+            "qwen",
+            &messages,
+            false,
+            true,
+            Some(true),
+            None,
+            None,
+            Some("high"),
+        );
         let value = serde_json::to_value(&body).unwrap();
 
         assert_eq!(
@@ -2685,6 +2729,14 @@ mod tests {
         assert_eq!(
             value.get("enable_search").and_then(|v| v.as_bool()),
             Some(true)
+        );
+        assert!(value.get("reasoning_effort").is_none());
+        assert_eq!(
+            value
+                .get("reasoning")
+                .and_then(|v| v.get("effort"))
+                .and_then(|v| v.as_str()),
+            Some("high")
         );
     }
 

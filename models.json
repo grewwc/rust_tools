@@ -17,11 +17,12 @@
     "name": "qwen3.7-plus",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "strong",
-    "provider": "openai",
+    "provider": "compatible",
     "is_vl": true,
     "search_enabled": true,
     "default_reasoning_effort": "high",
     "tools_default_enabled": true,
+    "explicit_prompt_cache": true,
     "enable_thinking": true,
     "subagent_priority": 90
   },
@@ -30,10 +31,11 @@
     "name": "qwen3.7-max",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "flagship",
-    "provider": "openai",
+    "provider": "compatible",
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
+    "explicit_prompt_cache": true,
     "enable_thinking": true,
     "default_reasoning_effort": "high",
     "subagent_priority": 80
@@ -59,6 +61,7 @@
     "is_vl": true,
     "search_enabled": false,
     "tools_default_enabled": false,
+    "explicit_prompt_cache": true,
     "enable_thinking": false,
     "subagent_priority": 150
   },
@@ -70,6 +73,7 @@
     "is_vl": true,
     "search_enabled": true,
     "tools_default_enabled": true,
+    "explicit_prompt_cache": true,
     "enable_thinking": true,
     "subagent_priority": 75
   },
@@ -94,6 +98,7 @@
     "search_enabled": false,
     "tools_default_enabled": true,
     "default_reasoning_effort": "high",
+    "explicit_prompt_cache": true,
     "enable_thinking": false,
     "subagent_priority": 60
   }

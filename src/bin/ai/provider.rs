@@ -36,9 +36,9 @@ pub(super) enum ModelQualityTier {
     Flagship,
 }
 
-/// LLM 推理强度档位，对应 OpenAI / OpenRouter / OpenCode 等兼容协议的
-/// `reasoning_effort` 顶层字段。Qwen DashScope (`Compatible` provider) 当前
-/// 不支持此字段，所以只对 `is_openai()` 为真的 provider 注入。
+/// LLM 推理强度档位。OpenAI / OpenRouter / OpenCode 等协议使用顶层
+/// `reasoning_effort`；DashScope compatible provider 使用嵌套
+/// `reasoning.effort`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(super) enum ReasoningEffort {

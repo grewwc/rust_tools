@@ -29,6 +29,12 @@ pub(super) fn tools_enabled(model: &str) -> bool {
         .unwrap_or(true)
 }
 
+pub(super) fn explicit_prompt_cache_enabled(model: &str) -> bool {
+    model_names::find_by_name(model)
+        .map(|m| m.explicit_prompt_cache)
+        .unwrap_or(false)
+}
+
 pub(super) fn enable_thinking(model: &str) -> bool {
     model_names::find_by_name(model)
         .map(|m| m.enable_thinking)
