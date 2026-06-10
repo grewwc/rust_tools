@@ -2,8 +2,10 @@ pub(in crate::ai) const RESET: &str = "\x1b[0m";
 pub(in crate::ai) const BOLD: &str = "\x1b[1m";
 pub(in crate::ai) const DIM: &str = "\x1b[2m";
 
-pub(in crate::ai) const ACCENT_PRIMARY: &str = "\x1b[38;2;125;211;252m";
-pub(in crate::ai) const ACCENT_SECONDARY: &str = "\x1b[38;2;167;139;250m";
+pub(in crate::ai) const ACCENT_PRIMARY: &str = "\x1b[38;2;147;197;253m";
+pub(in crate::ai) const ACCENT_SECONDARY: &str = "\x1b[38;2;196;181;253m";
 pub(in crate::ai) const ACCENT_MUTED: &str = "\x1b[38;2;148;163;184m";
-pub(in crate::ai) const ACCENT_SUCCESS: &str = "\x1b[38;2;134;239;172m";
-pub(in crate::ai) const ACCENT_RULE: &str = "\x1b[38;2;71;85;105m";
+pub(in crate::ai) const ACCENT_SUCCESS: &str = "\x1b[38;2;134;194;166m";
+pub(in crate::ai) const ACCENT_WARN: &str = "\x1b[38;2;245;158;11m";
+pub(in crate::ai) const ACCENT_DANGER: &str = "\x1b[38;2;251;113;133m";
+pub(in crate::ai) const ACCENT_RULE: &str = "\x1b[38;2;51;65;85m";

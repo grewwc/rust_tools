@@ -3,7 +3,6 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use colored::Colorize;
 use reqwest::{Response, StatusCode};
 use rust_tools::commonw;
 use serde::de::Deserializer;
@@ -22,6 +21,7 @@ use super::{
 };
 use crate::ai::config_schema::AiConfig;
 use crate::ai::driver::intent_recognition;
+use crate::ai::theme::{ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_SUCCESS, ACCENT_WARN, RESET};
 use crate::commonw::configw;
 
 #[derive(Debug, Serialize)]
@@ -1840,10 +1840,7 @@ pub(super) fn print_info(app: &App, model: &str) {
     };
     // 使用 println! 避免手动 flush 的权限问题
     println!(
-        "[{} (search: {}, effort: {})]",
-        model.green(),
-        search.red(),
-        effort_label.cyan()
+        "{ACCENT_MUTED}[{ACCENT_SUCCESS}{model}{ACCENT_MUTED} (search: {ACCENT_WARN}{search}{ACCENT_MUTED}, effort: {ACCENT_PRIMARY}{effort_label}{ACCENT_MUTED})]{RESET}",
     );
 }
 

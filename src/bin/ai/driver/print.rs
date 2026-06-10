@@ -3,7 +3,10 @@ use crate::ai::{
     driver::model::OcrExtraction,
     mcp::McpClient,
     skills::SkillManifest,
-    theme::{ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SUCCESS, BOLD, DIM, RESET},
+    theme::{
+        ACCENT_DANGER, ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS,
+        ACCENT_WARN, BOLD, DIM, RESET,
+    },
     types::App,
 };
 
@@ -109,6 +112,37 @@ pub(in crate::ai) fn format_tool_header(tool_name: &str) -> String {
         "{}├─{} {}{}tool{} {}{}{}",
         ACCENT_RULE, RESET, BOLD, ACCENT_SUCCESS, RESET, ACCENT_PRIMARY, tool_name, RESET
     )
+}
+
+pub(in crate::ai) fn format_tool_status(status: &str, tool_name: &str, accent: &str) -> String {
+    format!(
+        "{}[{}{}{}]{} {}{}{}",
+        ACCENT_MUTED, accent, status, ACCENT_MUTED, RESET, ACCENT_PRIMARY, tool_name, RESET
+    )
+}
+
+pub(in crate::ai) fn format_tool_status_running(tool_name: &str) -> String {
+    format_tool_status("Running", tool_name, ACCENT_PRIMARY)
+}
+
+pub(in crate::ai) fn format_tool_status_cached(tool_name: &str) -> String {
+    format_tool_status("Cached", tool_name, ACCENT_SECONDARY)
+}
+
+pub(in crate::ai) fn format_tool_status_skipped(tool_name: &str) -> String {
+    format_tool_status("Skipped", tool_name, ACCENT_WARN)
+}
+
+pub(in crate::ai) fn format_tool_status_completed(tool_name: &str) -> String {
+    format_tool_status("Completed", tool_name, ACCENT_SUCCESS)
+}
+
+pub(in crate::ai) fn format_tool_status_failed(tool_name: &str) -> String {
+    format_tool_status("Failed", tool_name, ACCENT_DANGER)
+}
+
+pub(in crate::ai) fn format_tool_status_deferred(tool_name: &str) -> String {
+    format_tool_status("Deferred", tool_name, ACCENT_WARN)
 }
 
 pub(in crate::ai) fn format_tool_output_prefix() -> String {

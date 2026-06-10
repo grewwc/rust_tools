@@ -5,7 +5,6 @@ use aios_kernel::{
     primitives::{ChannelId, ChannelOwnerTag, FutexAddr},
 };
 use chrono::{DateTime, Duration, Local, Utc};
-use colored::Colorize;
 use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,6 +19,10 @@ use std::thread;
 use std::time::{Duration as StdDuration, Instant, UNIX_EPOCH};
 
 use crate::ai::{
+    driver::print::{
+        format_tool_status_cached, format_tool_status_completed, format_tool_status_deferred,
+        format_tool_status_failed, format_tool_status_running, format_tool_status_skipped,
+    },
     mcp::{McpClient, SharedMcpClient},
     tools as builtin_tools,
     tools::task_tools::{
@@ -1700,8 +1703,12 @@ where
     if let Err(err) = result.as_ref() {
         if should_retry_once(route, tool_name, err) {
             println!(
-                "\n[Retry] {} (transient error; one safe retry)",
-                tool_name.cyan()
+                "\n{} (transient error; one safe retry)",
+                crate::ai::driver::print::format_tool_status(
+                    "Retry",
+                    tool_name,
+                    crate::ai::theme::ACCENT_WARN
+                )
             );
             result = exec();
         }
@@ -1753,13 +1760,13 @@ fn finalize_execution_result(
 fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
     let name = &tool_call.function.name;
     if run_result.cached {
-        println!("\n[Cached] {}", name.bright_blue());
+        println!("\n{}", format_tool_status_cached(name));
     } else if !run_result.executed {
-        println!("\n[Skipped] {}", name.yellow());
+        println!("\n{}", format_tool_status_skipped(name));
     } else if run_result.ok {
-        println!("\n[Completed] {}", name.green());
+        println!("\n{}", format_tool_status_completed(name));
     } else {
-        println!("\n[Failed] {}", name.red());
+        println!("\n{}", format_tool_status_failed(name));
     }
 }
 
@@ -1832,7 +1839,7 @@ fn run_one(
         );
     }
 
-    println!("\n[Running] {}", tool_call.function.name.cyan());
+    println!("\n{}", format_tool_status_running(&tool_call.function.name));
 
     if let Ok(guard) = GLOBAL_OS.lock() {
         if let Some(os_arc) = guard.as_ref() {
@@ -1906,7 +1913,7 @@ fn execute_tool_calls_inner(
     while idx < tool_calls.len() {
         if crate::ai::tools::registry::common::is_tool_cancel_requested() {
             for deferred in &tool_calls[idx..] {
-                println!("\n[Deferred] {}", deferred.function.name.yellow());
+                println!("\n{}", format_tool_status_deferred(&deferred.function.name));
             }
             break;
         }
@@ -1981,14 +1988,14 @@ fn execute_tool_calls_inner(
 
         if should_barrier && !is_last {
             for deferred in &tool_calls[idx + 1..] {
-                println!("\n[Deferred] {}", deferred.function.name.yellow());
+                println!("\n{}", format_tool_status_deferred(&deferred.function.name));
             }
             break;
         }
 
         if crate::ai::tools::registry::common::is_tool_cancel_requested() {
             for deferred in &tool_calls[idx + 1..] {
-                println!("\n[Deferred] {}", deferred.function.name.yellow());
+                println!("\n{}", format_tool_status_deferred(&deferred.function.name));
             }
             break;
         }

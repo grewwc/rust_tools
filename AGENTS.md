@@ -90,6 +90,7 @@ cargo test --bin a test_xxx       # Filter tests by name
 4. **SkipMap**: Custom concurrent skip-list for ordered iteration (Agent/Skill loading)
 5. **Error handling**: Library code → `Result<T, Box<dyn Error>>`; Agent tools → `Result<String, String>`
 6. **Tests**: Inline `#[cfg(test)] mod tests` in modules; cross-crate in `tests/`; use `ENV_LOCK` for serial tests
+7. **Scope**: Do not reformat or reorder files unrelated to the task. Only modify files that need to change — no incidental formatting.
 
 ### AI Module
 

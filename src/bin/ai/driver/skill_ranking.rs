@@ -218,6 +218,14 @@ fn runtime_skill_model_cache_key(skills: &[SkillManifest]) -> String {
 
 fn skill_document_text(skill: &SkillManifest) -> String {
     let mut parts = vec![skill.name.clone(), skill.description.clone()];
+    if let Some(source_path) = &skill.source_path
+        && !source_path.trim().is_empty()
+    {
+        parts.push(source_path.clone());
+    }
+    if !skill.triggers.is_empty() {
+        parts.push(skill.triggers.join(" "));
+    }
     if !skill.tools.is_empty() {
         parts.push(skill.tools.join(" "));
     }

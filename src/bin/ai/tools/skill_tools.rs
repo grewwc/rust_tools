@@ -32,31 +32,36 @@ fn skill_matches_query(skill: &SkillManifest, query: &str) -> bool {
     if query.trim().is_empty() {
         return true;
     }
+    let haystack = skill_search_haystack(skill);
     let query = query.to_ascii_lowercase();
-    skill.name.to_ascii_lowercase().contains(&query)
-        || skill.description.to_ascii_lowercase().contains(&query)
-        || skill
-            .triggers
-            .iter()
-            .any(|item| item.to_ascii_lowercase().contains(&query))
-        || skill
-            .tools
-            .iter()
-            .any(|item| item.to_ascii_lowercase().contains(&query))
-        || skill
-            .tool_groups
-            .iter()
-            .any(|item| item.to_ascii_lowercase().contains(&query))
-        || skill
-            .mcp_servers
-            .iter()
-            .any(|item| item.to_ascii_lowercase().contains(&query))
-        || skill
-            .source_path
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .contains(&query)
+    if haystack.contains(&query) {
+        return true;
+    }
+    query_tokens(&query)
+        .into_iter()
+        .any(|token| haystack.contains(token.as_str()))
+}
+
+fn skill_search_haystack(skill: &SkillManifest) -> String {
+    let mut parts = vec![
+        skill.name.clone(),
+        skill.description.clone(),
+        skill.source_path.clone().unwrap_or_default(),
+    ];
+    parts.extend(skill.triggers.iter().cloned());
+    parts.extend(skill.tools.iter().cloned());
+    parts.extend(skill.tool_groups.iter().cloned());
+    parts.extend(skill.mcp_servers.iter().cloned());
+    parts.join("\n").to_ascii_lowercase()
+}
+
+fn query_tokens(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '-' || ch == '.'))
+        .map(str::trim)
+        .filter(|token| token.chars().count() >= 2)
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn summarize_skill(skill: &SkillManifest, include_capabilities: bool) -> String {
@@ -535,7 +540,8 @@ inventory::submit!(ToolRegistration {
 
 #[cfg(test)]
 mod tests {
-    use super::execute_discover_skills;
+    use super::{execute_discover_skills, query_tokens, skill_matches_query};
+    use crate::ai::skills::SkillManifest;
     #[test]
     fn discover_skills_returns_builtin_skill_metadata() {
         let args = serde_json::json!({
@@ -558,5 +564,38 @@ mod tests {
         let out = execute_discover_skills(&args).unwrap();
         assert!(out.contains("code-review"));
         assert!(out.contains("tools=") || out.contains("tool_groups="));
+    }
+
+    #[test]
+    fn discover_query_extracts_meaningful_tokens_from_sentence() {
+        assert!(query_tokens("帮我查一个 argos 日志").contains(&"argos".to_string()));
+    }
+
+    #[test]
+    fn skill_query_matches_sentence_token_against_source_path() {
+        let mut skill = test_skill("argos", "Inspect Argos logs and traces");
+        skill.source_path = Some("/tmp/argos.skill".to_string());
+        assert!(skill_matches_query(&skill, "帮我查一个 argos 日志"));
+    }
+
+    fn test_skill(name: &str, description: &str) -> SkillManifest {
+        SkillManifest {
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            description: description.to_string(),
+            author: None,
+            triggers: Vec::new(),
+            tools: Vec::new(),
+            tool_groups: Vec::new(),
+            mcp_servers: Vec::new(),
+            skip_recall: false,
+            disable_builtin_tools: false,
+            disable_mcp_tools: false,
+            prompt: String::new(),
+            system_prompt: None,
+            priority: 0,
+            excludes: Vec::new(),
+            source_path: None,
+        }
     }
 }
