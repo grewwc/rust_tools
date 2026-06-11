@@ -1115,6 +1115,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Some(cli.files.clone())
         },
         pending_short_output: cli.short_output,
+        forced_skill: None,
         current_model,
         current_agent: "build".to_string(),
         current_agent_manifest: None,
@@ -2856,6 +2857,7 @@ mod tests {
             current_agent_manifest: None,
             pending_files: None,
             pending_short_output: false,
+            forced_skill: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),

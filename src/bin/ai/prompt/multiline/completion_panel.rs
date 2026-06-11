@@ -64,6 +64,18 @@ fn should_open_popup_on_first_tab(ctx: &PendingTabCompletion) -> bool {
     matches!(trimmed, "/model" | ":model")
         || trimmed.starts_with("/model ")
         || trimmed.starts_with(":model ")
+        || is_skill_reference_trigger(trimmed)
+}
+
+/// `@ski`/`@skill`/`@skills`（含 `:<filter>` 与无冒号 `@skillhum` 等写法）与 `/model`
+/// 一样，第一次 Tab 就直接弹出候选面板，而不是走"第一次静默、第二次弹出"的歧义流程。
+/// 直接复用 `completion::skill_token_filters` 的解析规则，保证触发判断与候选生成一致。
+fn is_skill_reference_trigger(trimmed: &str) -> bool {
+    let last_token = trimmed.split_whitespace().next_back().unwrap_or("");
+    let Some(rest) = last_token.strip_prefix('@') else {
+        return false;
+    };
+    crate::ai::prompt::completion::skill_token_filters(rest).is_some()
 }
 
 fn should_submit_immediately(line: &str) -> bool {

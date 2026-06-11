@@ -744,6 +744,7 @@ mod tests {
             current_agent_manifest: None,
             pending_files: None,
             pending_short_output: false,
+            forced_skill: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),

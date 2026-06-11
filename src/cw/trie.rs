@@ -183,6 +183,62 @@ impl Trie {
         true
     }
 
+    /// Collects all complete words stored in the Trie that start with the given
+    /// prefix.
+    ///
+    /// Returns the matching words (including any word equal to the prefix itself
+    /// if it was inserted). If no word matches, an empty vector is returned. The
+    /// prefix itself does not need to be a complete word.
+    ///
+    /// # Arguments
+    ///
+    /// * `prefix` - The prefix to enumerate words for
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rust_tools::cw::Trie;
+    ///
+    /// let mut trie = Trie::new();
+    /// trie.insert("hello");
+    /// trie.insert("help");
+    /// trie.insert("world");
+    ///
+    /// let mut words = trie.words_with_prefix("hel");
+    /// words.sort();
+    /// assert_eq!(words, vec!["hello".to_string(), "help".to_string()]);
+    /// assert!(trie.words_with_prefix("xyz").is_empty());
+    /// ```
+    pub fn words_with_prefix(&self, prefix: &str) -> Vec<String> {
+        // Descend to the node corresponding to the prefix.
+        let mut curr = self;
+        for ch in prefix.chars() {
+            match curr.children.get(&ch) {
+                Some(child) => curr = child,
+                None => return Vec::new(),
+            }
+        }
+
+        // Depth-first collection of every complete word under this node.
+        let mut results = Vec::new();
+        let mut buf: String = prefix.to_string();
+        curr.collect_words(&mut buf, &mut results);
+        results
+    }
+
+    /// Recursively appends every complete word in this subtree to `results`,
+    /// using `buf` as the accumulated path from the root.
+    fn collect_words(&self, buf: &mut String, results: &mut Vec<String>) {
+        if self.end_count > 0 {
+            results.push(buf.clone());
+        }
+        for (ch, child) in &self.children {
+            buf.push(*ch);
+            child.collect_words(buf, results);
+            buf.pop();
+        }
+    }
+
     /// Deletes a string from the Trie.
     ///
     /// Returns `true` if the word was found and deleted, `false` if the word
@@ -341,5 +397,34 @@ mod tests {
 
         // The shorter word should still exist (currently commented out)
         // assert!(t.contains("hell"));
+    }
+
+    /// Test prefix enumeration
+    #[test]
+    fn test_words_with_prefix() {
+        let mut t = Trie::new();
+        for s in ["hello", "help", "hero", "world"] {
+            t.insert(s);
+        }
+
+        let mut hel = t.words_with_prefix("hel");
+        hel.sort();
+        assert_eq!(hel, vec!["hello".to_string(), "help".to_string()]);
+
+        let mut he = t.words_with_prefix("he");
+        he.sort();
+        assert_eq!(
+            he,
+            vec!["hello".to_string(), "help".to_string(), "hero".to_string()]
+        );
+
+        // Empty prefix returns every word.
+        assert_eq!(t.words_with_prefix("").len(), 4);
+
+        // A prefix equal to a complete word includes that word.
+        assert_eq!(t.words_with_prefix("world"), vec!["world".to_string()]);
+
+        // No match.
+        assert!(t.words_with_prefix("xyz").is_empty());
     }
 }

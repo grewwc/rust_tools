@@ -481,6 +481,58 @@ fn extract_at_file_references(question: &mut String) -> crate::ai::types::FilePa
     parsed
 }
 
+/// 从输入中提取并移除 `@skills:<name>` / `@skill:<name>` 引用（用户通过补全选择的
+/// 强制 skill）。返回最后一个命中的 skill 名（多次出现以最后一个为准）。被提取的
+/// token 从 `question` 中删除，避免污染发送给模型的文本。
+fn extract_forced_skill_reference(question: &mut String) -> Option<String> {
+    let chars: Vec<char> = question.chars().collect();
+    let mut rewritten = String::with_capacity(question.len());
+    let mut i = 0usize;
+    let mut selected: Option<String> = None;
+
+    while i < chars.len() {
+        if chars[i] != '@' || !at_ref_can_start(&chars, i) {
+            rewritten.push(chars[i]);
+            i += 1;
+            continue;
+        }
+
+        // 读取 `@` 之后的非空白 token。
+        let mut idx = i + 1;
+        let mut token = String::new();
+        while idx < chars.len() && !chars[idx].is_whitespace() {
+            token.push(chars[idx]);
+            idx += 1;
+        }
+
+        let lower = token.to_ascii_lowercase();
+        let name = lower
+            .strip_prefix("skills:")
+            .or_else(|| lower.strip_prefix("skill:"));
+        let prefix_len = if lower.starts_with("skills:") {
+            "skills:".len()
+        } else {
+            "skill:".len()
+        };
+        if name.is_some_and(|n| !n.is_empty()) {
+            // 用原始大小写截取 skill 名（保持与 manifest 匹配时的展示一致）。
+            let raw_name: String = token.chars().skip(prefix_len).collect();
+            selected = Some(raw_name);
+            i = idx;
+            continue;
+        }
+
+        rewritten.push(chars[i]);
+        i += 1;
+    }
+
+    if selected.is_some() {
+        // 清理因移除 token 可能残留的多余空白。
+        *question = rewritten.trim().to_string();
+    }
+    selected
+}
+
 fn at_ref_can_start(chars: &[char], index: usize) -> bool {
     if index == 0 {
         return true;
@@ -671,6 +723,11 @@ fn finalize_question(
     history_count: usize,
     loop_short_output: bool,
 ) -> Result<QuestionContext, Box<dyn Error>> {
+    // 先提取 `@skills:<name>`（用户经补全显式选择、仅本轮强制注入的 skill），
+    // 再做普通 `@file` 引用提取，避免 skill 引用被误当作文件路径处理。
+    if let Some(name) = extract_forced_skill_reference(&mut question) {
+        app.forced_skill = Some(name);
+    }
     let inline_files = extract_at_file_references(&mut question);
     let mut inline_images = extract_inline_image_paths(&mut question);
     let mut attachments_text = String::new();
@@ -719,9 +776,10 @@ fn finalize_question(
 mod tests {
     use super::{
         HistoryAction, HistoryPreviewOptions, HistoryRoleFilter, LocalCommand,
-        extract_at_file_references, finalize_question, highlight_history_keyword,
-        parse_history_preview_options, parse_local_command, render_history_preview,
-        resolve_inline_image_path, summarize_history_content, truncate_for_terminal,
+        extract_at_file_references, extract_forced_skill_reference, finalize_question,
+        highlight_history_keyword, parse_history_preview_options, parse_local_command,
+        render_history_preview, resolve_inline_image_path, summarize_history_content,
+        truncate_for_terminal,
     };
     use crate::ai::{
         history::{Message, append_history_messages},
@@ -762,6 +820,34 @@ mod tests {
             .expect("models.json is empty")
     }
 
+    #[test]
+    fn extract_forced_skill_reference_strips_token_and_returns_name() {
+        let mut q = "请帮我 @skills:code-review 看看这段代码".to_string();
+        let name = extract_forced_skill_reference(&mut q);
+        assert_eq!(name.as_deref(), Some("code-review"));
+        assert!(!q.contains("@skills:"));
+        assert!(q.contains("请帮我"));
+        assert!(q.contains("看看这段代码"));
+    }
+
+    #[test]
+    fn extract_forced_skill_reference_supports_singular_and_keeps_case() {
+        let mut q = "@skill:MySkill do it".to_string();
+        let name = extract_forced_skill_reference(&mut q);
+        assert_eq!(name.as_deref(), Some("MySkill"));
+        assert_eq!(q, "do it");
+    }
+
+    #[test]
+    fn extract_forced_skill_reference_ignores_midword_and_bare() {
+        // 词中间的 `@` 不是边界，不应被当作技能引用。
+        let mut q = "email@skills:foo".to_string();
+        assert!(extract_forced_skill_reference(&mut q).is_none());
+        // 裸 `@skills`（无 `:name`）不构成显式选择。
+        let mut q2 = "@skills".to_string();
+        assert!(extract_forced_skill_reference(&mut q2).is_none());
+    }
+
     fn any_vl_model_name() -> String {
         crate::ai::model_names::all()
             .iter()
@@ -798,6 +884,7 @@ mod tests {
             current_agent_manifest: None,
             pending_files: None,
             pending_short_output: false,
+            forced_skill: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),

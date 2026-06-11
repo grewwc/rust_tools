@@ -1017,6 +1017,33 @@ pub(super) fn prepare_skill_for_turn(
         .eq_ignore_ascii_case("true");
 
     let intent = detect_turn_intent(question, &app.config.intent_model_path);
+
+    // 用户通过 `@skills:<name>` 在输入框中显式选择的强制 skill 优先于自动路由。
+    // 这是 per-turn 语义：消费后立即清空，下一轮不再强制注入。
+    if let Some(forced) = app.forced_skill.take() {
+        if let Some(skill) = skill_manifests
+            .iter()
+            .find(|s| s.name == forced)
+            .or_else(|| {
+                skill_manifests
+                    .iter()
+                    .find(|s| s.name.eq_ignore_ascii_case(&forced))
+            })
+        {
+            let name = skill.name.clone();
+            if let Some(guard) =
+                force_activate_named_skill(app, mcp_client, skill_manifests, question, &name, &intent)
+            {
+                if debug {
+                    eprintln!("[skills] forced via @skills: {}", name);
+                }
+                return guard;
+            }
+        } else if debug {
+            eprintln!("[skills] forced @skills:{} not found, falling back to auto-route", forced);
+        }
+    }
+
     let cross_turn_preference = cross_turn_preferred_skill_name(app, question, &intent);
     let skill = select_skill_with_preference_strength(
         skill_manifests,

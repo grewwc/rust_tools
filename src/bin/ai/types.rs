@@ -49,6 +49,7 @@ impl Clone for App {
             current_agent_manifest: self.current_agent_manifest.clone(),
             pending_files: self.pending_files.clone(),
             pending_short_output: self.pending_short_output,
+            forced_skill: self.forced_skill.clone(),
             attached_image_files: self.attached_image_files.clone(),
             shutdown: self.shutdown.clone(),
             streaming: self.streaming.clone(),
@@ -83,6 +84,9 @@ pub(super) struct App {
     pub(super) current_agent_manifest: Option<AgentManifest>,
     pub(super) pending_files: Option<String>,
     pub(super) pending_short_output: bool,
+    /// 用户通过 `@skills:<name>` 在输入框中显式选择、仅对**本轮**生效的强制 skill。
+    /// turn 准备阶段读取后强制注入该 skill，并在该 turn 结束后清空，下一轮不再强制。
+    pub(super) forced_skill: Option<String>,
     pub(super) attached_image_files: Vec<String>,
     pub(super) shutdown: Arc<AtomicBool>,
     pub(super) streaming: Arc<AtomicBool>,

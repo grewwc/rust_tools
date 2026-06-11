@@ -204,6 +204,11 @@ impl CommandCompleter {
     pub(super) fn complete_for_line(line: &str, pos: usize) -> (usize, Vec<CompletionCandidate>) {
         let pos = pos.min(line.len());
         let before = &line[..pos];
+        // `@skills` / `@skill[:prefix]` 触发技能补全，必须先于普通 `@file` 补全，
+        // 否则 `complete_file_reference` 会把 `@skills` 当成文件路径片段处理。
+        if let Some((token_start, candidates)) = complete_skill_reference(before) {
+            return (token_start, candidates);
+        }
         if let Some((token_start, candidates)) = Self::complete_file_reference(before) {
             return (token_start, candidates);
         }
@@ -303,6 +308,117 @@ impl CommandCompleter {
         let candidates = Self::plain_candidates(complete_path_fragment(fragment, quote));
         Some((token_start, candidates))
     }
+}
+
+/// 技能补全。触发与过滤规则（`<filter>` 大小写不敏感）：
+/// - `@ski` / `@skil` / `@skill` / `@skills`（"skills" 的前缀，≥3 字符）：列出全部 skill；
+/// - `@skill<filter>` / `@skills<filter>`：输完关键字后直接续打字母即按前缀过滤，
+///   例如 `@skillhum` → 匹配以 `hum` 开头的 skill；
+/// - `@skill:<filter>` / `@skills:<filter>`：带冒号的等价写法（补全选中后插入的规范形式）。
+///
+/// 前缀匹配用项目内的 [`Trie`](rust_tools::cw::Trie) 实现：把全部 skill 名（小写）插入
+/// 字典树，再用 `words_with_prefix` 取出命中集合。选中后行内变成 `@skills:<name>`，
+/// 本轮对话将强制注入该 skill。返回 `(token_start, candidates)`，token_start 是 `@` 的字节偏移。
+fn complete_skill_reference(before: &str) -> Option<(usize, Vec<CompletionCandidate>)> {
+    let (token_start, token) = find_skill_reference_token(before)?;
+    let rest = token.strip_prefix('@')?;
+    let filters = skill_token_filters(rest)?;
+
+    let skills = crate::ai::skills::load_all_skills();
+
+    // 任一切分得到空过滤词 ⇒ 仍在输入关键字（如 `@skill`/`@skills`），列出全部。
+    let list_all = filters.iter().any(|f| f.is_empty());
+
+    // 否则用 Trie 做前缀匹配：小写 skill 名 → 命中集合（多种切分取并集）。
+    let matched: Option<rust_tools::commonw::FastSet<String>> = if list_all {
+        None
+    } else {
+        let mut trie = rust_tools::cw::Trie::new();
+        for skill in &skills {
+            trie.insert(&skill.name.to_ascii_lowercase());
+        }
+        let mut set = rust_tools::commonw::FastSet::default();
+        for filter in &filters {
+            for word in trie.words_with_prefix(filter) {
+                set.insert(word);
+            }
+        }
+        Some(set)
+    };
+
+    let mut candidates = Vec::new();
+    for skill in &skills {
+        if let Some(set) = &matched {
+            if !set.contains(&skill.name.to_ascii_lowercase()) {
+                continue;
+            }
+        }
+        let display = if skill.description.trim().is_empty() {
+            skill.name.clone()
+        } else {
+            format!("{} · {}", skill.name, skill.description.trim())
+        };
+        candidates.push(CompletionCandidate {
+            display,
+            replacement: format!("@skills:{}", skill.name),
+        });
+    }
+    Some((token_start, candidates))
+}
+
+/// 解析 `@` 之后的内容，判断是否为技能引用并返回所有可能的过滤前缀（小写）。
+/// 返回 `None` 表示不是技能引用 token；返回的 Vec 中含空串表示"列出全部"。
+///
+/// `@skillsec` 这类无冒号写法对关键字 `skill`/`skills` 存在切分歧义，故同时返回
+/// 两种解释（如 `["ec", "sec"]`）取并集，避免漏掉用户想要的候选。
+pub(in crate::ai::prompt) fn skill_token_filters(rest: &str) -> Option<Vec<String>> {
+    const MIN_TRIGGER_LEN: usize = 3;
+    // 冒号写法：`<keyword>:<filter>`，keyword 须为 "skills" 的非空前缀（≥3 字符）。
+    if let Some((keyword, filter)) = rest.split_once(':') {
+        let keyword_lower = keyword.to_ascii_lowercase();
+        if keyword_lower.len() >= MIN_TRIGGER_LEN && "skills".starts_with(&keyword_lower) {
+            return Some(vec![filter.to_ascii_lowercase()]);
+        }
+        return None;
+    }
+
+    let rest_lower = rest.to_ascii_lowercase();
+    // 仍在输入关键字途中（`ski`/`skil`/`skill`/`skills`）⇒ 列出全部。
+    if rest_lower.len() >= MIN_TRIGGER_LEN && "skills".starts_with(&rest_lower) {
+        return Some(vec![String::new()]);
+    }
+
+    // 关键字已输完，其后字母即过滤前缀。两种切分都收集，取并集。
+    let mut filters = Vec::new();
+    if let Some(filter) = rest_lower.strip_prefix("skills") {
+        filters.push(filter.to_string());
+    }
+    if let Some(filter) = rest_lower.strip_prefix("skill") {
+        filters.push(filter.to_string());
+    }
+    if filters.is_empty() { None } else { Some(filters) }
+}
+
+/// 定位行尾的技能引用 token。要求 `@` 前是空白或行首、token 内无空白（与 `@file`
+/// 边界规则一致），且 `@` 之后内容能被 [`skill_token_filters`] 识别为技能引用。
+fn find_skill_reference_token(before: &str) -> Option<(usize, &str)> {
+    let mut last_at = None;
+    for (idx, ch) in before.char_indices() {
+        if ch == '@' {
+            last_at = Some(idx);
+        }
+    }
+    let at_index = last_at?;
+    let prev = before[..at_index].chars().next_back();
+    if prev.is_some_and(|ch| !(ch.is_whitespace() || matches!(ch, '(' | '[' | '{' | '"' | '\''))) {
+        return None;
+    }
+    let token = &before[at_index..];
+    if token.chars().skip(1).any(char::is_whitespace) {
+        return None;
+    }
+    skill_token_filters(&token[1..])?;
+    Some((at_index, token))
 }
 
 fn find_file_reference_token(before: &str) -> Option<(usize, &str, Option<char>)> {
@@ -653,6 +769,106 @@ mod tests {
             .expect("model candidates should not be empty");
         assert_eq!(first.replacement, current);
         assert!(first.display.contains("current"));
+    }
+
+    #[test]
+    fn skill_reference_completion_lists_skills() {
+        let (start, candidates) = CommandCompleter::complete_for_line("@skills", 7);
+        assert_eq!(start, 0);
+        let expected: Vec<String> = crate::ai::skills::load_all_skills()
+            .into_iter()
+            .map(|s| format!("@skills:{}", s.name))
+            .collect();
+        assert!(!expected.is_empty(), "no skills available to complete");
+        for replacement in expected {
+            assert!(
+                candidates.iter().any(|c| c.replacement == replacement),
+                "missing candidate {replacement}"
+            );
+        }
+    }
+
+    #[test]
+    fn skill_reference_completion_triggers_on_short_prefix() {
+        // 输入 `@ski`（"skills" 的前缀）即应触发，列出全部 skill。
+        let (start, candidates) = CommandCompleter::complete_for_line("@ski", 4);
+        assert_eq!(start, 0);
+        let total = crate::ai::skills::load_all_skills().len();
+        assert_eq!(candidates.len(), total);
+        // `@sk`（<3 字符）不触发，避免劫持普通文件路径补全。
+        assert!(complete_skill_reference("@sk").is_none());
+        // `@skq` 不是 "skills" 的前缀，不触发。
+        assert!(complete_skill_reference("@skq").is_none());
+    }
+
+    #[test]
+    fn skill_reference_completion_filters_by_prefix() {
+        let skills = crate::ai::skills::load_all_skills();
+        let Some(first) = skills.first() else {
+            return;
+        };
+        // 取首字母作为前缀，结果里所有候选名都应以该前缀开头。
+        let ch = first.name.chars().next().unwrap();
+        let line = format!("@skills:{ch}");
+        let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+        assert!(!candidates.is_empty());
+        for c in &candidates {
+            let name = c.replacement.strip_prefix("@skills:").unwrap();
+            assert!(
+                name.to_ascii_lowercase()
+                    .starts_with(&ch.to_ascii_lowercase().to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn skill_reference_completion_ignores_midword_at() {
+        // `foo@skills` 中的 `@` 前不是边界字符，不应触发技能补全。
+        let result = complete_skill_reference("foo@skills");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn skill_reference_completion_filters_without_colon() {
+        let skills = crate::ai::skills::load_all_skills();
+        let Some(target) = skills.first() else {
+            return;
+        };
+        // 取某个真实 skill 名的前 3 个字符作为过滤前缀，用无冒号写法 `@skill<prefix>`。
+        let name_lower = target.name.to_ascii_lowercase();
+        let take = name_lower.chars().take(3).collect::<String>();
+        if take.chars().count() < 3 {
+            return;
+        }
+        let line = format!("@skill{take}");
+        let (_, candidates) = CommandCompleter::complete_for_line(&line, line.len());
+        // 目标 skill 必须在候选里，且所有候选名都以该前缀开头（取并集的两种切分均符合）。
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.replacement == format!("@skills:{}", target.name)),
+            "expected {} in candidates for line {line}",
+            target.name
+        );
+        for c in &candidates {
+            let name = c.replacement.strip_prefix("@skills:").unwrap();
+            assert!(name.to_ascii_lowercase().starts_with(&take));
+        }
+    }
+
+    #[test]
+    fn skill_token_filters_parses_variants() {
+        // 关键字途中：列出全部（空过滤词）。
+        assert_eq!(skill_token_filters("ski"), Some(vec![String::new()]));
+        assert_eq!(skill_token_filters("skill"), Some(vec![String::new()]));
+        assert_eq!(skill_token_filters("skills"), Some(vec![String::new()]));
+        // 无冒号过滤：`skillhum` → 关键字 `skill` + 前缀 `hum`。
+        assert_eq!(skill_token_filters("skillhum"), Some(vec!["hum".to_string()]));
+        // 冒号过滤。
+        assert_eq!(skill_token_filters("skills:deb"), Some(vec!["deb".to_string()]));
+        // 太短或非前缀：不识别。
+        assert_eq!(skill_token_filters("sk"), None);
+        assert_eq!(skill_token_filters("skq"), None);
     }
 
     #[test]

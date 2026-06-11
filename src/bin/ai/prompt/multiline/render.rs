@@ -44,19 +44,34 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     );
 
     // 计算各区域高度
-    // 补全面板可视窗口：最多展示 COMPLETION_WINDOW 项（含上下边框 +2）。
-    let panel_lines: u16 = completion_panel
-        .map_or(0u16, |p| (p.items.len().min(COMPLETION_WINDOW) as u16).saturating_add(2));
     let help_lines: u16 = 2;
-    // 补全面板激活时优先保证面板完整显示：textarea 退让到最小 1 行
-    // （此时用户在选列表，不需要大编辑区），避免矮 viewport 下面板被挤成 1~2 行
-    // 而"只看到一个候选"。无面板时 textarea 至少保留 3 行。
+    // 面板激活时优先占满高度：先扣掉 help 行与 textarea 最小行，余下的尽量给面板
+    // （面板期望高度 = min(候选数, COMPLETION_WINDOW) + 上下边框 2，但不超过可用空间）。
+    // textarea 退让到最小 1 行（此时用户在选列表，不需要大编辑区）。
+    // 无面板时 textarea 至少保留 3 行。
     let min_textarea_lines: u16 = if completion_panel.is_some() { 1 } else { 3 };
-    let textarea_lines = inner
-        .height
-        .saturating_sub(panel_lines)
-        .saturating_sub(help_lines)
-        .max(min_textarea_lines);
+    let (textarea_lines, panel_lines) = match completion_panel {
+        Some(panel) => {
+            let desired_panel =
+                (panel.items.len().min(COMPLETION_WINDOW) as u16).saturating_add(2);
+            // 面板可用上限 = 总高度 - help - textarea 最小行。
+            let panel_cap = inner
+                .height
+                .saturating_sub(help_lines)
+                .saturating_sub(min_textarea_lines);
+            let panel = desired_panel.min(panel_cap).max(1.min(panel_cap));
+            let textarea = inner
+                .height
+                .saturating_sub(panel)
+                .saturating_sub(help_lines)
+                .max(min_textarea_lines);
+            (textarea, panel)
+        }
+        None => {
+            let textarea = inner.height.saturating_sub(help_lines).max(min_textarea_lines);
+            (textarea, 0)
+        }
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -90,7 +105,12 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 
     // 渲染 completion panel
     if let Some(panel) = completion_panel {
-        let window_size = COMPLETION_WINDOW;
+        // 滚动窗口必须用面板**实际可见行数**（chunk 高度减去上下边框），
+        // 而不是固定 COMPLETION_WINDOW：在矮终端下 layout 会把面板挤压成
+        // 比 COMPLETION_WINDOW 更少的行，若仍按固定值算 `start`，选中项一旦
+        // 越过可见区就会落到屏幕外，表现为"卡在前几项、无法滚动"。
+        let visible_rows = (chunks[1].height as usize).saturating_sub(2).max(1);
+        let window_size = visible_rows.min(panel.items.len()).max(1);
         let start = panel
             .selected_index
             .saturating_sub(window_size.saturating_sub(1))
