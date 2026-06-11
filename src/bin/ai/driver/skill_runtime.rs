@@ -261,16 +261,30 @@ fn dedupe_tools_by_name(tools: Vec<ToolDef>) -> Vec<ToolDef> {
     result
 }
 
-fn required_discovery_tool_names() -> Vec<String> {
-    vec!["discover_skills".to_string(), "enable_tools".to_string()]
+fn required_baseline_tool_names() -> Vec<String> {
+    vec![
+        // discovery / 自助能力：让模型在白名单 skill 下仍能发现并启用更多工具。
+        "discover_skills".to_string(),
+        "enable_tools".to_string(),
+        // 子 Agent 编排：task_* 属于 core 组的常驻能力。skill 用 tools:/tool_groups:
+        // 白名单替换工具集时，若不补回，主 Agent 在 skill 激活期间就完全失去委派
+        // 子 Agent 的能力（且 :685 的 has_tool 提示门也会一并消失），导致"skill
+        // 用得多 → 子 Agent 用得少"。这里像 discover/enable 一样常驻补回。
+        // 注意：skill 显式 disable_builtin_tools 时 builtin_tools_for_skill 会提前
+        // 返回空集，根本不会走到这里，故该退出语义自然得到尊重。
+        "task".to_string(),
+        "task_spawn".to_string(),
+        "task_wait".to_string(),
+        "task_status".to_string(),
+    ]
 }
 
-fn ensure_required_discovery_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
+fn ensure_required_baseline_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
     let existing = tools
         .iter()
         .map(|tool| tool.function.name.clone())
         .collect::<Box<SkipSet<_>>>();
-    let missing = required_discovery_tool_names()
+    let missing = required_baseline_tool_names()
         .into_iter()
         .filter(|name| !existing.contains(name))
         .collect::<Vec<_>>();
@@ -285,12 +299,12 @@ fn ensure_required_discovery_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
 fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option<Vec<ToolDef>> {
     if !tool_groups.is_empty() {
         let groups: Vec<&str> = tool_groups.iter().map(|s| s.as_str()).collect();
-        return Some(ensure_required_discovery_tools(
+        return Some(ensure_required_baseline_tools(
             super::super::tools::tool_definitions_for_groups(&groups),
         ));
     }
     if !tools.is_empty() {
-        return Some(ensure_required_discovery_tools(
+        return Some(ensure_required_baseline_tools(
             super::super::tools::get_tool_definitions_by_names(tools),
         ));
     }
@@ -1055,7 +1069,7 @@ pub(super) fn prepare_skill_for_turn(
 mod tests {
     use super::{
         PreferenceStrength, build_project_instruction_prompt, build_system_prompt,
-        builtin_tools_for_skill, ensure_required_discovery_tools,
+        builtin_tools_for_skill, ensure_required_baseline_tools,
         filter_mcp_tools_by_allowed_servers, looks_like_follow_up_or_same_topic,
         merge_with_runtime_enabled_tools, resolve_max_iterations, select_mcp_tools,
         select_skill_with_preference, select_skill_with_preference_strength, tool_uses_mcp_server,
@@ -1429,8 +1443,8 @@ mod tests {
     }
 
     #[test]
-    fn explicit_tool_lists_keep_only_discovery_entry_available() {
-        let merged = ensure_required_discovery_tools(vec![tool("code_search")]);
+    fn explicit_tool_lists_keep_baseline_entries_available() {
+        let merged = ensure_required_baseline_tools(vec![tool("code_search")]);
         let names = merged
             .into_iter()
             .map(|tool| tool.function.name)
@@ -1438,6 +1452,13 @@ mod tests {
         assert!(names.contains(&"enable_tools".to_string()));
         assert!(names.contains(&"discover_skills".to_string()));
         assert!(names.contains(&"code_search".to_string()));
+        // 子 Agent 编排能力应作为 baseline 常驻补回，避免 skill 白名单把 task_*
+        // 全部剔除导致主 Agent 失去委派子 Agent 的能力。
+        assert!(names.contains(&"task".to_string()));
+        assert!(names.contains(&"task_spawn".to_string()));
+        assert!(names.contains(&"task_wait".to_string()));
+        assert!(names.contains(&"task_status".to_string()));
+        // 其它非 baseline 的内置工具仍不应被无端带入白名单。
         assert!(!names.contains(&"plan".to_string()));
         assert!(!names.contains(&"read_file".to_string()));
         assert!(!names.contains(&"search_files".to_string()));
