@@ -138,6 +138,83 @@ fn find_hunk_offset(orig_lines: &[String], hunk: &UnifiedHunk) -> Option<usize> 
     None
 }
 
+/// 提取 hunk 的 context+remove 行（即"期望在原文件中匹配到"的行）。
+fn hunk_expected_lines(hunk: &UnifiedHunk) -> Vec<&str> {
+    hunk.lines
+        .iter()
+        .filter_map(|line| match line {
+            UnifiedLine::Context(s) | UnifiedLine::Remove(s) => Some(s.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 在全文件范围内统计 hunk 的 context+remove 块能匹配到的位置（0-based 行号）。
+/// 用于检测"多处匹配"歧义，避免静默改错地方。
+fn all_hunk_match_positions(orig_lines: &[String], hunk: &UnifiedHunk) -> Vec<usize> {
+    let expected = hunk_expected_lines(hunk);
+    if expected.is_empty() {
+        return Vec::new();
+    }
+    let mut positions = Vec::new();
+    let mut candidate = 0usize;
+    while candidate + expected.len() <= orig_lines.len() {
+        let all_match = expected
+            .iter()
+            .enumerate()
+            .all(|(i, exp)| lines_match(&orig_lines[candidate + i], exp));
+        if all_match {
+            positions.push(candidate);
+        }
+        candidate += 1;
+    }
+    positions
+}
+
+/// 构造带上下文的 "context mismatch" 错误：列出 patch 期望匹配的行，以及原文件
+/// 在标称位置附近的实际行，帮助模型快速自我修正，而不是只看到一句 "context mismatch"。
+fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> String {
+    let expected = hunk_expected_lines(hunk);
+    let nominal = hunk.old_start.saturating_sub(1);
+
+    let mut msg = String::from("context mismatch: patch hunk could not be located.\n");
+    msg.push_str(&format!(
+        "Hunk header declared @@ -{} (1-based line {}).\n",
+        hunk.old_start, hunk.old_start
+    ));
+
+    msg.push_str("Patch expected these lines (context/removed):\n");
+    for (i, line) in expected.iter().take(10).enumerate() {
+        msg.push_str(&format!("  expected[{}]: {}\n", i, line));
+    }
+    if expected.len() > 10 {
+        msg.push_str(&format!("  ... ({} more expected lines)\n", expected.len() - 10));
+    }
+
+    // 标称位置附近的实际文件内容（前后各 3 行窗口）。
+    let win_start = nominal.saturating_sub(3);
+    let win_end = (nominal + expected.len().max(1) + 3).min(orig_lines.len());
+    if win_start < win_end {
+        msg.push_str(&format!(
+            "Actual file content around line {} (1-based):\n",
+            win_start + 1
+        ));
+        for (offset, line) in orig_lines[win_start..win_end].iter().enumerate() {
+            msg.push_str(&format!("  {:>6}: {}\n", win_start + offset + 1, line));
+        }
+    } else {
+        msg.push_str(&format!(
+            "File has {} line(s); declared position is out of range.\n",
+            orig_lines.len()
+        ));
+    }
+
+    msg.push_str(
+        "Hint: re-read the file with read_file to get exact current content, then rebuild the patch with matching context lines.",
+    );
+    msg
+}
+
 fn try_apply_hunk_at(
     orig_lines: &[String],
     hunk: &UnifiedHunk,
@@ -180,23 +257,42 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
 
     for hunk in &hunks {
         let nominal = hunk.old_start.saturating_sub(1);
-        let apply_at = if nominal <= orig_lines.len()
+        let nominal_ok = nominal <= orig_lines.len()
             && nominal >= cursor
-            && try_apply_hunk_at(&orig_lines, hunk, nominal).is_some()
-        {
+            && try_apply_hunk_at(&orig_lines, hunk, nominal).is_some();
+
+        let apply_at = if nominal_ok {
             nominal
-        } else if let Some(offset) = find_hunk_offset(&orig_lines, hunk) {
-            if offset < cursor {
-                return Err("hunks out of order".to_string());
-            }
-            offset
         } else {
-            return Err("context mismatch".to_string());
+            // 标称位置匹配不上时，先检查全文件范围内有多少处能匹配：
+            // 多处匹配说明 hunk 的 context 不足以唯一定位，强行用第一处会改错地方。
+            let positions = all_hunk_match_positions(&orig_lines, hunk);
+            let forward: Vec<usize> = positions.iter().copied().filter(|&p| p >= cursor).collect();
+            if forward.len() > 1 {
+                let shown: Vec<String> =
+                    forward.iter().take(5).map(|p| (p + 1).to_string()).collect();
+                return Err(format!(
+                    "ambiguous patch: hunk context matches {} locations (1-based lines: {}{}). \
+                     Add more surrounding context lines to the hunk so it uniquely identifies the target.",
+                    forward.len(),
+                    shown.join(", "),
+                    if forward.len() > 5 { ", ..." } else { "" }
+                ));
+            }
+            match find_hunk_offset(&orig_lines, hunk) {
+                Some(offset) => {
+                    if offset < cursor {
+                        return Err("hunks out of order".to_string());
+                    }
+                    offset
+                }
+                None => return Err(describe_context_mismatch(&orig_lines, hunk)),
+            }
         };
 
         out.extend_from_slice(&orig_lines[cursor..apply_at]);
-        let (hunk_out, new_idx) =
-            try_apply_hunk_at(&orig_lines, hunk, apply_at).ok_or("context mismatch")?;
+        let (hunk_out, new_idx) = try_apply_hunk_at(&orig_lines, hunk, apply_at)
+            .ok_or_else(|| describe_context_mismatch(&orig_lines, hunk))?;
         out.extend(hunk_out);
         cursor = new_idx;
     }
@@ -269,11 +365,40 @@ pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_unified_hunks;
+    use super::{apply_unified_patch, parse_unified_hunks};
 
     #[test]
     fn parse_unified_hunks_rejects_empty_hunk_line_instead_of_panicking() {
         let patch = "@@ -1,1 +1,1 @@\n\n-foo\n+bar\n";
         assert!(parse_unified_hunks(patch).is_err());
+    }
+
+    #[test]
+    fn apply_unified_patch_applies_simple_hunk() {
+        let original = "line1\nline2\nline3\n";
+        let patch = "@@ -2,1 +2,1 @@\n-line2\n+changed\n";
+        let result = apply_unified_patch(original, patch).unwrap();
+        assert_eq!(result, "line1\nchanged\nline3\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_context_mismatch_includes_actual_content() {
+        let original = "alpha\nbeta\ngamma\n";
+        // 期望删除一行不存在的内容，应触发带上下文的 context mismatch。
+        let patch = "@@ -2,1 +2,1 @@\n-not_present\n+changed\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("context mismatch"), "err was: {err}");
+        // 错误里应回显期望行与实际文件内容，便于模型自我修正。
+        assert!(err.contains("not_present"), "err was: {err}");
+        assert!(err.contains("beta"), "err was: {err}");
+    }
+
+    #[test]
+    fn apply_unified_patch_detects_ambiguous_match() {
+        // 同样的行在文件里出现多次，且标称位置匹配不上，应报歧义错误。
+        let original = "dup\nmid\ndup\ntail\n";
+        let patch = "@@ -9,1 +9,1 @@\n-dup\n+changed\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("ambiguous patch"), "err was: {err}");
     }
 }

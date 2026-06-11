@@ -486,9 +486,16 @@ fn execute_content_text_search(
     });
 
     let mut matches = all_matches.lock().unwrap().clone();
+    let limit_reached = matches.len() >= 200;
     matches.truncate(200);
 
-    Ok(truncate_chars(&matches.join("\n"), 16_000))
+    let mut body = matches.join("\n");
+    if limit_reached {
+        body.push_str(
+            "\n... (match limit reached: showing first 200 matches, more may exist; narrow the query or scope to a subdirectory)",
+        );
+    }
+    Ok(truncate_chars(&body, 16_000))
 }
 
 fn collect_text_search_files(

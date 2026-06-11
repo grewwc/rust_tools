@@ -458,7 +458,7 @@ fn handle_tool_call_round(
 const DISCOVER_SKILLS_FOLLOWUP_NOTE: &str = "tool_followup:discover_skills\n\
 `discover_skills` only listed metadata and did not activate any skill.\n\
 This is not a final answer. Continue the current turn:\n\
-- pick the best matching skill if one is clearly relevant;\n\
+- if one listed skill clearly matches the user's task, call `activate_skill` with its name to load its prompt and tools;\n\
 - otherwise enable the missing tools you need;\n\
 - if no skill is actually needed, answer the user directly.\n\
 Do not end the turn immediately after only listing skills.";

@@ -13,6 +13,9 @@ use unicode_width::UnicodeWidthStr;
 use super::completion_panel::CompletionPanel;
 use crate::ai::prompt::MAX_INPUT_CHARS;
 
+/// 补全面板一次最多显示的候选行数（超出部分随选中项滚动）。
+const COMPLETION_WINDOW: usize = 8;
+
 pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     f: &mut ratatui::Frame<'_>,
     textarea: &mut TextArea<'_>,
@@ -41,18 +44,24 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     );
 
     // 计算各区域高度
-    let panel_lines: u16 =
-        completion_panel.map_or(0u16, |p| (p.items.len().min(5) as u16).saturating_add(2));
+    // 补全面板可视窗口：最多展示 COMPLETION_WINDOW 项（含上下边框 +2）。
+    let panel_lines: u16 = completion_panel
+        .map_or(0u16, |p| (p.items.len().min(COMPLETION_WINDOW) as u16).saturating_add(2));
     let help_lines: u16 = 2;
+    // 补全面板激活时优先保证面板完整显示：textarea 退让到最小 1 行
+    // （此时用户在选列表，不需要大编辑区），避免矮 viewport 下面板被挤成 1~2 行
+    // 而"只看到一个候选"。无面板时 textarea 至少保留 3 行。
+    let min_textarea_lines: u16 = if completion_panel.is_some() { 1 } else { 3 };
     let textarea_lines = inner
         .height
         .saturating_sub(panel_lines)
-        .saturating_sub(help_lines);
+        .saturating_sub(help_lines)
+        .max(min_textarea_lines);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(textarea_lines.max(3)),
+            Constraint::Length(textarea_lines),
             Constraint::Length(panel_lines),
             Constraint::Length(help_lines),
         ])
@@ -81,7 +90,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 
     // 渲染 completion panel
     if let Some(panel) = completion_panel {
-        let window_size = 5usize;
+        let window_size = COMPLETION_WINDOW;
         let start = panel
             .selected_index
             .saturating_sub(window_size.saturating_sub(1))
@@ -166,45 +175,55 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     let help_lines = if completion_panel.is_some() {
         vec![
             Line::from(vec![
-                Span::styled("↵", Style::default().fg(Color::Blue)),
-                Span::raw("select "),
-                Span::styled("Esc", Style::default().fg(Color::Green)),
-                Span::raw("close "),
-                Span::styled("⌨C+C", Style::default().fg(Color::Yellow)),
-                Span::raw("cancel "),
+                Span::styled("选择：", Style::default().fg(Color::DarkGray)),
+                Span::styled("", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("关闭：", Style::default().fg(Color::DarkGray)),
+                Span::styled("Esc", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("取消：", Style::default().fg(Color::DarkGray)),
+                Span::styled("Ctrl+C", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
                 Span::styled(status_info, Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(vec![
-                Span::styled("↑↓", Style::default().fg(Color::Blue)),
-                Span::raw(" move "),
-                Span::styled("Tab", Style::default().fg(Color::Blue)),
-                Span::raw(" refresh "),
-                Span::styled("↵+Alt/F2", Style::default().fg(Color::Green)),
-                Span::raw(" send "),
+                Span::styled("移动：", Style::default().fg(Color::DarkGray)),
+                Span::styled("↑↓", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("刷新：", Style::default().fg(Color::DarkGray)),
+                Span::styled("Tab", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("发送：", Style::default().fg(Color::DarkGray)),
+                Span::styled("+Alt/F2", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             ]),
         ]
     } else {
         vec![
             Line::from(vec![
-                Span::styled("↵", Style::default().fg(Color::Blue)),
-                Span::raw("newline "),
-                Span::styled("Alt+↵/F2", Style::default().fg(Color::Green)),
-                Span::raw("send "),
-                Span::styled("⌨C+C", Style::default().fg(Color::Yellow)),
-                Span::raw("cancel "),
+                Span::styled("换行：", Style::default().fg(Color::DarkGray)),
+                Span::styled("↵", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("发送：", Style::default().fg(Color::DarkGray)),
+                Span::styled("Alt+↵/F2", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("取消：", Style::default().fg(Color::DarkGray)),
+                Span::styled("Ctrl+C", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
                 Span::styled(status_info, Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(vec![
-                Span::styled("↑↓/⌨P/N", Style::default().fg(Color::Blue)),
-                Span::raw(" hist "),
-                Span::styled("⌫", Style::default().fg(Color::Blue)),
-                Span::raw(" edit "),
-                Span::styled("⌨V", Style::default().fg(Color::Blue)),
-                Span::raw(" paste "),
-                Span::styled("F9", Style::default().fg(Color::Blue)),
-                Span::raw(" last "),
-                Span::styled("F10", Style::default().fg(Color::Blue)),
-                Span::raw(" full "),
+                Span::styled("历史：", Style::default().fg(Color::DarkGray)),
+                Span::styled("↑↓/Ctrl+P/N", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("删行：", Style::default().fg(Color::DarkGray)),
+                Span::styled("⌘/Ctrl+U", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("粘贴：", Style::default().fg(Color::DarkGray)),
+                Span::styled("Ctrl+V", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("复制回答：", Style::default().fg(Color::DarkGray)),
+                Span::styled("F9", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled("复制全部：", Style::default().fg(Color::DarkGray)),
+                Span::styled("F10", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
             ]),
         ]
     };

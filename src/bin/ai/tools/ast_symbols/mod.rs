@@ -36,6 +36,74 @@ impl SymbolEntry {
     }
 }
 
+/// 按扩展名推断 AST 支持的语言；不支持的返回 None。
+/// 与 lsp_tools::detect_language 不同，这里只覆盖 ast_symbols 真正能解析的 8 种语言，
+/// 供 read_file 等路径判断是否值得生成符号大纲。
+pub(crate) fn language_for_path(file_path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|e| e.to_str())?;
+    let lang = match ext {
+        "rs" => "rust",
+        "ts" | "tsx" => "typescript",
+        "js" | "jsx" => "javascript",
+        "py" => "python",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" => "cpp",
+        _ => return None,
+    };
+    Some(lang)
+}
+
+/// 为受支持的语言生成一段紧凑的符号大纲，供 read_file 输出时附带，
+/// 让模型无需逐行 grep 即可获得结构化代码视图。
+/// - 无法解析、无符号或语言不支持时返回 None；
+/// - 大纲条目数上限为 `max_symbols`，超出时截断并提示。
+pub(crate) fn document_symbol_outline(
+    file_path: &str,
+    content: &str,
+    max_symbols: usize,
+) -> Option<String> {
+    let language = language_for_path(file_path)?;
+    let symbols = extract_document_symbols(language, file_path, content)?.ok()?;
+    if symbols.is_empty() {
+        return None;
+    }
+
+    let total = symbols.len();
+    let mut out = String::new();
+    let _ = writeln!(&mut out, "Symbol outline ({} symbols):", total);
+    for symbol in symbols.iter().take(max_symbols) {
+        let indent = "  ".repeat(symbol.indent);
+        match symbol.detail.as_deref() {
+            Some(detail) if !detail.trim().is_empty() => {
+                let _ = writeln!(
+                    &mut out,
+                    "{}{} {} [{}] (line {})",
+                    indent, symbol.kind, symbol.name, detail, symbol.line
+                );
+            }
+            _ => {
+                let _ = writeln!(
+                    &mut out,
+                    "{}{} {} (line {})",
+                    indent, symbol.kind, symbol.name, symbol.line
+                );
+            }
+        }
+    }
+    if total > max_symbols {
+        let _ = writeln!(
+            &mut out,
+            "... [{} more symbol(s) omitted; use the document_symbol LSP operation for the full list]",
+            total - max_symbols
+        );
+    }
+    Some(out.trim_end().to_string())
+}
+
 pub(crate) fn extract_document_symbols(
     language: &str,
     file_path: &str,

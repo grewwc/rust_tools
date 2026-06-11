@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{LazyLock, RwLock};
 
 use serde_json::Value;
 
@@ -7,6 +8,29 @@ use crate::ai::config_schema::AiConfig;
 use crate::ai::skills::SkillManifest;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
+
+/// 模型通过 `activate_skill` 工具显式请求激活的 skill 名称（待 driver 在下一个
+/// iteration 读取并应用）。
+///
+/// 工具是纯函数 `fn(&Value) -> Result<String, String>`，拿不到 `App`，因此沿用
+/// `enable_tools.rs` 的"工具写全局状态 → driver 读取"桥接模式。这里只需要一个
+/// 极小的待激活槽位，故用单个 `RwLock<Option<String>>` 而非完整状态结构。
+static PENDING_SKILL_ACTIVATION: LazyLock<RwLock<Option<String>>> =
+    LazyLock::new(|| RwLock::new(None));
+
+fn set_pending_skill_activation(name: String) {
+    if let Ok(mut slot) = PENDING_SKILL_ACTIVATION.write() {
+        *slot = Some(name);
+    }
+}
+
+/// driver 侧调用：取出并清空待激活的 skill 名称。
+pub(crate) fn take_pending_skill_activation() -> Option<String> {
+    PENDING_SKILL_ACTIVATION
+        .write()
+        .ok()
+        .and_then(|mut slot| slot.take())
+}
 
 fn params_discover_skills() -> Value {
     serde_json::json!({
@@ -43,12 +67,13 @@ fn skill_matches_query(skill: &SkillManifest, query: &str) -> bool {
 }
 
 fn skill_search_haystack(skill: &SkillManifest) -> String {
+    // triggers 不再参与任何匹配/检索：关键词堆砌跨语言失效，且容易误导。
+    // 检索仅基于 name/description/能力字段等真实语义来源。
     let mut parts = vec![
         skill.name.clone(),
         skill.description.clone(),
         skill.source_path.clone().unwrap_or_default(),
     ];
-    parts.extend(skill.triggers.iter().cloned());
     parts.extend(skill.tools.iter().cloned());
     parts.extend(skill.tool_groups.iter().cloned());
     parts.extend(skill.mcp_servers.iter().cloned());
@@ -137,6 +162,61 @@ inventory::submit!(ToolRegistration {
         description: "List available skills by metadata only. Use this to discover skill names, descriptions, priorities, and optional capability summaries without loading full skill prompts.",
         parameters: params_discover_skills,
         execute: execute_discover_skills,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core"],
+    }
+});
+
+fn params_activate_skill() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Exact name of the skill to activate (as returned by discover_skills)."
+            }
+        },
+        "required": ["name"]
+    })
+}
+
+pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
+    let name = args["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return Err("activate_skill requires a non-empty 'name'.".to_string());
+    }
+
+    // 校验"别乱用"：请求的 skill 名必须真实存在。未命中则拒绝，并回列可用
+    // skill 名，引导模型纠正而不是凭空激活。
+    let skills = crate::ai::skills::load_all_skills();
+    let matched = skills.iter().find(|s| s.name == name);
+    let Some(skill) = matched else {
+        let available = skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "No skill named '{name}'. Use discover_skills first. Available skills: {available}"
+        ));
+    };
+
+    set_pending_skill_activation(skill.name.clone());
+    Ok(format!(
+        "Skill '{}' will be activated on the next step: its prompt and tool set load into the current turn. \
+         Only continue if this skill clearly matches the user's task; otherwise proceed without it.",
+        skill.name
+    ))
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "activate_skill",
+        description: "Activate a specific skill by name so its full prompt and tool set load into the current turn. \
+                      Only use this after discover_skills when one listed skill clearly matches the user's task. \
+                      Do not activate a skill speculatively or for tasks that need no skill.",
+        parameters: params_activate_skill,
+        execute: execute_activate_skill,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
@@ -540,8 +620,15 @@ inventory::submit!(ToolRegistration {
 
 #[cfg(test)]
 mod tests {
-    use super::{execute_discover_skills, query_tokens, skill_matches_query};
+    use super::{
+        execute_activate_skill, execute_discover_skills, query_tokens, skill_matches_query,
+        take_pending_skill_activation,
+    };
     use crate::ai::skills::SkillManifest;
+    use std::sync::{LazyLock, Mutex};
+
+    // activate_skill 系列测试共享同一个全局待激活槽位，串行化避免并发污染。
+    static ACTIVATION_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
     #[test]
     fn discover_skills_returns_builtin_skill_metadata() {
         let args = serde_json::json!({
@@ -576,6 +663,40 @@ mod tests {
         let mut skill = test_skill("argos", "Inspect Argos logs and traces");
         skill.source_path = Some("/tmp/argos.skill".to_string());
         assert!(skill_matches_query(&skill, "帮我查一个 argos 日志"));
+    }
+
+    #[test]
+    fn activate_skill_rejects_empty_name() {
+        let _g = ACTIVATION_TEST_GUARD.lock().unwrap();
+        let err = execute_activate_skill(&serde_json::json!({"name": "  "})).unwrap_err();
+        assert!(err.contains("non-empty"));
+        assert!(take_pending_skill_activation().is_none());
+    }
+
+    #[test]
+    fn activate_skill_rejects_unknown_name() {
+        let _g = ACTIVATION_TEST_GUARD.lock().unwrap();
+        let err =
+            execute_activate_skill(&serde_json::json!({"name": "definitely-not-a-skill"}))
+                .unwrap_err();
+        assert!(err.contains("No skill named"));
+        // 未命中不应写入待激活槽位，避免乱激活。
+        assert!(take_pending_skill_activation().is_none());
+    }
+
+    #[test]
+    fn activate_skill_queues_existing_skill() {
+        let _g = ACTIVATION_TEST_GUARD.lock().unwrap();
+        // 取一个真实存在的 builtin skill 名字。
+        let skills = crate::ai::skills::load_all_skills();
+        let Some(name) = skills.first().map(|s| s.name.clone()) else {
+            return;
+        };
+        let out = execute_activate_skill(&serde_json::json!({"name": name})).unwrap();
+        assert!(out.contains(&name));
+        assert_eq!(take_pending_skill_activation().as_deref(), Some(name.as_str()));
+        // take 应清空槽位。
+        assert!(take_pending_skill_activation().is_none());
     }
 
     fn test_skill(name: &str, description: &str) -> SkillManifest {

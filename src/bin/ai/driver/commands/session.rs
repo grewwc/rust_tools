@@ -59,22 +59,22 @@ pub fn try_handle_session_command(
             if sessions.is_empty() {
                 println!("No sessions.");
             } else {
-                for s in sessions {
+                // 计算最大 ID 长度用于对齐
+                let max_id_len = sessions.iter().map(|s| s.id.len()).max().unwrap_or(36);
+                for s in &sessions {
                     let mark = if s.id == app.session_id { "*" } else { " " };
                     let time = s
                         .modified_local
-                        .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                         .unwrap_or_else(|| "-".to_string());
-                    let prompt = s
-                        .first_user_prompt
+                    let summary = s
+                        .summary
                         .as_deref()
-                        .map(sanitize_session_prompt)
                         .filter(|v| !v.is_empty())
-                        .unwrap_or_else(|| "-".to_string());
-                    let prompt = truncate_session_prompt(&prompt, 80);
+                        .unwrap_or("-");
                     println!(
-                        "{mark} {:<36}  {}  {:>8}B  {}",
-                        s.id, time, s.size_bytes, prompt
+                        "{} {:<width$}  {}  {:>8}  {}",
+                        mark, s.id, time, format_size(s.size_bytes), summary, width = max_id_len
                     );
                 }
             }
@@ -82,11 +82,15 @@ pub fn try_handle_session_command(
         "current" | "cur" => {
             println!("session: {}", app.session_id);
             println!("history: {}", app.session_history_file.display());
-            let first = store.first_user_prompt(&app.session_id).unwrap_or(None);
-            if let Some(v) = first {
-                let prompt = sanitize_session_prompt(&v);
-                if !prompt.is_empty() {
-                    println!("first: {}", truncate_session_prompt(&prompt, 160));
+            // 显示 session 摘要
+            let sessions = store.list_sessions().unwrap_or_default();
+            if let Some(current) = sessions.iter().find(|s| s.id == app.session_id) {
+                if let Some(summary) = &current.summary {
+                    println!("summary: {}", summary);
+                }
+                println!("size: {}", format_size(current.size_bytes));
+                if let Some(t) = current.modified_local {
+                    println!("modified: {}", t.format("%Y-%m-%d %H:%M:%S"));
                 }
             }
         }
@@ -110,11 +114,11 @@ pub fn try_handle_session_command(
             app.session_id = id.to_string();
             app.session_history_file = store.session_history_file(id);
             println!("Switched session: {}", id);
-            let first = store.first_user_prompt(id).unwrap_or(None);
-            if let Some(v) = first {
-                let prompt = sanitize_session_prompt(&v);
-                if !prompt.is_empty() {
-                    println!("first: {}", truncate_session_prompt(&prompt, 160));
+            // 显示 session 摘要
+            let sessions = store.list_sessions().unwrap_or_default();
+            if let Some(session) = sessions.iter().find(|s| s.id == id) {
+                if let Some(summary) = &session.summary {
+                    println!("summary: {}", summary);
                 }
             }
         }
@@ -338,4 +342,20 @@ fn truncate_session_prompt(s: &str, max_len: usize) -> String {
     let mut out: String = s.chars().take(max_len).collect();
     out.push_str("...");
     out
+}
+
+/// 格式化文件大小为人类可读格式（KB/MB/GB）。
+fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.1}GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1}MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1}KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{}B", bytes)
+    }
 }

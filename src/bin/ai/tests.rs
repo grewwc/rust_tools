@@ -672,6 +672,11 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
         std::path::Path::new(file_path).exists(),
         "overflow file path from stub should exist: {file_path}"
     );
+    // stub 内应保留一段内容预览作为召回锚点，避免后续 turn "失忆"。
+    assert!(
+        stub.contains("Preview (for recall"),
+        "stub should contain a content preview: {stub}"
+    );
 }
 
 #[test]

@@ -18,7 +18,7 @@ mod request;
 mod skills;
 mod stream;
 mod theme;
-mod tools;
+pub(crate) mod tools;
 mod types;
 
 pub(in crate::ai) use rust_tools_macros::{agent_hang_debug, agent_hang_span};

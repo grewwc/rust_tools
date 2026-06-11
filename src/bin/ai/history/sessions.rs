@@ -26,6 +26,7 @@ pub(in crate::ai) struct SessionInfo {
     pub(in crate::ai) modified_local: Option<DateTime<Local>>,
     pub(in crate::ai) size_bytes: u64,
     pub(in crate::ai) first_user_prompt: Option<String>,
+    pub(in crate::ai) summary: Option<String>,
 }
 
 impl SessionStore {
@@ -85,6 +86,7 @@ impl SessionStore {
             let modified_local = metadata.modified().ok().map(DateTime::<Local>::from);
             let first_user_prompt = read_first_user_prompt_sqlite(&path).unwrap_or(None);
             let id = stem.to_string();
+            let summary = first_user_prompt.as_deref().map(generate_session_summary);
             let timestamp = modified_local
                 .map(|dt| dt.timestamp_millis() as u64)
                 .unwrap_or(0);
@@ -95,6 +97,7 @@ impl SessionStore {
                     modified_local,
                     size_bytes: metadata.len(),
                     first_user_prompt,
+                    summary,
                 },
             );
         }
@@ -259,4 +262,104 @@ fn sanitize_session_id(session_id: &str) -> String {
     } else {
         out
     }
+}
+
+/// 从第一条用户消息生成一个简洁的 session 标题/摘要。
+/// 处理 JSON 内容（如图片数据）、长文本截断、清理空白。
+fn generate_session_summary(first_prompt: &str) -> String {
+    let text = first_prompt.trim();
+    if text.is_empty() {
+        return "(空会话)".to_string();
+    }
+
+    // 处理多条消息合并的情况（用 \n---\n 分隔）
+    let messages: Vec<&str> = text.split("\n---\n").collect();
+    let mut all_text_parts = Vec::new();
+    let mut has_any_image = false;
+
+    for msg in &messages {
+        let msg = msg.trim();
+        if msg.is_empty() {
+            continue;
+        }
+
+        // 尝试解析为 JSON 数组（多模态消息）
+        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(msg) {
+            let (parts, has_image) = extract_from_json_array(&arr);
+            all_text_parts.extend(parts);
+            if has_image {
+                has_any_image = true;
+            }
+        }
+        // 尝试解析为单个 JSON 对象
+        else if let Ok(obj) = serde_json::from_str::<serde_json::Value>(msg) {
+            if let Some(obj) = obj.as_object() {
+                let item_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match item_type {
+                    "text" => {
+                        if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                            let cleaned = t.trim();
+                            if !cleaned.is_empty() {
+                                all_text_parts.push(cleaned.to_string());
+                            }
+                        }
+                    }
+                    "image_url" => has_any_image = true,
+                    _ => {}
+                }
+            }
+        }
+        // 普通文本
+        else {
+            let first_line = msg.lines().next().unwrap_or(msg).trim();
+            if !first_line.is_empty() {
+                all_text_parts.push(first_line.to_string());
+            }
+        }
+    }
+
+    if all_text_parts.is_empty() && has_any_image {
+        return "[图片]".to_string();
+    }
+    if all_text_parts.is_empty() {
+        return "(无文本内容)".to_string();
+    }
+
+    let combined = all_text_parts.join(" ");
+    truncate_summary(&combined, 60)
+}
+
+/// 从 JSON 数组中提取文本部分和图片标记。
+fn extract_from_json_array(arr: &[serde_json::Value]) -> (Vec<String>, bool) {
+    let mut parts = Vec::new();
+    let mut has_image = false;
+    for item in arr {
+        if let Some(obj) = item.as_object() {
+            let item_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            match item_type {
+                "text" => {
+                    if let Some(t) = obj.get("text").and_then(|v| v.as_str()) {
+                        let cleaned = t.trim();
+                        if !cleaned.is_empty() {
+                            parts.push(cleaned.to_string());
+                        }
+                    }
+                }
+                "image_url" => has_image = true,
+                _ => {}
+            }
+        }
+    }
+    (parts, has_image)
+}
+
+/// 截断摘要到指定长度，添加省略号。
+fn truncate_summary(s: &str, max_len: usize) -> String {
+    let char_count = s.chars().count();
+    if char_count <= max_len {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max_len).collect();
+    out.push_str("…");
+    out
 }

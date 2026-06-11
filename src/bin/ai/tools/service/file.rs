@@ -35,10 +35,48 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     let limit = args["limit"].as_u64().unwrap_or(1000) as usize;
     let content = store.read_to_string().map_err(|e| e.to_string())?;
     let lines: Vec<&str> = content.lines().collect();
-    let start = offset.saturating_sub(1).min(lines.len());
-    let end = (start + limit).min(lines.len());
+    let total = lines.len();
+    let start = offset.saturating_sub(1).min(total);
+    let end = (start + limit).min(total);
 
-    Ok(render_lines(&content, start, end, usize::MAX))
+    let rendered = render_lines(&content, start, end, usize::MAX);
+    let rendered = append_truncation_notice(rendered, start, end, total);
+    Ok(append_symbol_outline(rendered, file_path, &content))
+}
+
+/// 为受支持的语言在读取结果末尾附加一段紧凑的符号大纲，让模型每次读文件都能
+/// 获得结构化代码视图，而不必逐行 grep。不支持的语言或无符号时原样返回。
+fn append_symbol_outline(mut rendered: String, file_path: &str, content: &str) -> String {
+    const MAX_OUTLINE_SYMBOLS: usize = 60;
+    if let Some(outline) =
+        crate::ai::tools::ast_symbols::document_symbol_outline(file_path, content, MAX_OUTLINE_SYMBOLS)
+    {
+        if !rendered.is_empty() {
+            rendered.push_str("\n\n");
+        }
+        rendered.push_str(&outline);
+    }
+    rendered
+}
+
+/// 当本次读取没有覆盖到文件末尾时，追加一条明确提示，告知模型文件仍有
+/// 剩余行未显示以及如何继续读取。避免模型把"截断结果"误判为"完整文件"。
+fn append_truncation_notice(mut rendered: String, start: usize, end: usize, total: usize) -> String {
+    let remaining = total.saturating_sub(end);
+    if remaining > 0 {
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str(&format!(
+            "... [truncated: showing lines {}-{} of {}; {} more line(s) not shown. Continue with offset={} to read the rest.]",
+            start + 1,
+            end,
+            total,
+            remaining,
+            end + 1
+        ));
+    }
+    rendered
 }
 
 pub(crate) fn execute_read_file_lines(args: &Value) -> Result<String, String> {
@@ -53,15 +91,17 @@ pub(crate) fn execute_read_file_lines(args: &Value) -> Result<String, String> {
     let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
     let limit = args["limit"].as_u64().unwrap_or(200).clamp(1, 400) as usize;
     let content = store.read_to_string().map_err(|e| e.to_string())?;
-    // let lines: Vec<&str> = content.lines().collect();
-    let num_lines = content.bytes().filter(|&b| b == b'\n').count();
+    // 用 lines() 统计总行数，避免按 '\n' 计数在"末尾无换行符"时漏掉最后一行。
+    let total = content.lines().count();
     let start = offset.saturating_sub(1);
-    if start >= num_lines {
+    if start >= total {
         return Ok(String::new());
     }
-    let end = (start + limit).min(num_lines);
+    let end = (start + limit).min(total);
 
-    Ok(render_lines(&content, start, end, usize::MAX))
+    let rendered = render_lines(&content, start, end, usize::MAX);
+    let rendered = append_truncation_notice(rendered, start, end, total);
+    Ok(append_symbol_outline(rendered, file_path, &content))
 }
 
 pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
@@ -114,6 +154,64 @@ mod tests {
         assert!(output.contains("Hello, integration test!"));
         assert!(output.contains("Line 2"));
         assert!(output.contains("Line 3"));
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_file_truncation_notice_when_limit_hit() {
+        let path = make_temp_path("truncate");
+        let content = (1..=50)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, &content).unwrap();
+
+        let read_args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "limit": 10
+        });
+        let output = execute_read_file(&read_args).unwrap();
+        assert!(output.contains("line10"), "output: {output}");
+        assert!(!output.contains("line11"), "output: {output}");
+        // 截断时必须提示还有剩余行以及如何继续读取。
+        assert!(output.contains("truncated"), "output: {output}");
+        assert!(output.contains("40 more line"), "output: {output}");
+        assert!(output.contains("offset=11"), "output: {output}");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_file_no_notice_when_fully_read() {
+        let path = make_temp_path("full");
+        fs::write(&path, "a\nb\nc").unwrap();
+
+        let read_args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "limit": 100
+        });
+        let output = execute_read_file(&read_args).unwrap();
+        assert!(!output.contains("truncated"), "output: {output}");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_file_lines_reads_last_line_without_trailing_newline() {
+        // 文件末尾无换行符时，旧实现按 '\n' 计数会漏掉最后一行。
+        let path = make_temp_path("lastline");
+        fs::write(&path, "first\nsecond\nthird").unwrap();
+
+        let read_args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "limit": 100
+        });
+        let output = execute_read_file_lines(&read_args).unwrap();
+        assert!(output.contains("third"), "output: {output}");
 
         let _ = fs::remove_file(&path);
     }
@@ -193,5 +291,43 @@ mod tests {
             })
             .unwrap_or_else(|| path.parent().unwrap());
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_read_file_appends_symbol_outline_for_supported_language() {
+        let path = make_temp_path("outline").with_extension("rs");
+        let content = "fn alpha() {}\n\nstruct Beta {\n    x: i32,\n}\n\nfn gamma() {}\n";
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, content).unwrap();
+
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "limit": 100
+        });
+        let output = execute_read_file(&args).unwrap();
+        assert!(output.contains("Symbol outline"), "output: {output}");
+        assert!(output.contains("alpha"), "output: {output}");
+        assert!(output.contains("Beta"), "output: {output}");
+        assert!(output.contains("gamma"), "output: {output}");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_read_file_no_outline_for_unsupported_language() {
+        let path = make_temp_path("plain").with_extension("txt");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "just some plain text\nno symbols here\n").unwrap();
+
+        let args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "limit": 100
+        });
+        let output = execute_read_file(&args).unwrap();
+        assert!(!output.contains("Symbol outline"), "output: {output}");
+
+        let _ = fs::remove_file(&path);
     }
 }

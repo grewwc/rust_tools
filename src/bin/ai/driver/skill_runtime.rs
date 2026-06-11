@@ -663,7 +663,7 @@ fn build_system_prompt(
             b.push(ContextKind::Fact, catalog);
         }
         let discovery_policy = if skill.is_none() {
-            "Tool discovery:\n- Not all tools are loaded. Use `discover_skills` for specialized workflows, or `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for specific tools.\n- If the user names a workflow/tool/domain that may have a local skill (for example an internal service, CLI, log system, or incident workflow), call `discover_skills` with the named keyword before inventing commands.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first.\n- No skill is active yet. For non-trivial requests, prefer calling `discover_skills` before giving a freeform response."
+            "Tool discovery:\n- Not all tools are loaded. Use `discover_skills` for specialized workflows, or `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for specific tools.\n- If the user names a workflow/tool/domain that may have a local skill (for example an internal service, CLI, log system, or incident workflow), call `discover_skills` with the named keyword before inventing commands.\n- After `discover_skills`, if one listed skill clearly matches the task, call `activate_skill(name=...)` to load its prompt and tools. Do not activate a skill that does not clearly match.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first.\n- No skill is active yet. For non-trivial requests, prefer calling `discover_skills` before giving a freeform response."
         } else {
             "Tool discovery:\n- Not all tools are loaded. If a capability is missing, use `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first."
         };
@@ -705,17 +705,17 @@ fn should_skip_recall_for_skill(skill: Option<&SkillManifest>) -> bool {
 
 fn skill_selection_threshold(intent: &UserIntent, skill_count: usize) -> f64 {
     let base: f64 = if skill_count > 10 {
-        3.0
-    } else if skill_count > 5 {
         2.5
-    } else {
+    } else if skill_count > 5 {
         2.0
+    } else {
+        1.75
     };
     match intent.core {
-        intent_recognition::CoreIntent::RequestAction => base.max(2.5),
-        intent_recognition::CoreIntent::SeekSolution => base.max(2.25),
-        intent_recognition::CoreIntent::QueryConcept => base.max(3.5),
-        intent_recognition::CoreIntent::Casual => base.max(3.5),
+        intent_recognition::CoreIntent::RequestAction => base.max(2.0),
+        intent_recognition::CoreIntent::SeekSolution => base.max(1.85),
+        intent_recognition::CoreIntent::QueryConcept => base.max(2.5),
+        intent_recognition::CoreIntent::Casual => base.max(2.5),
     }
 }
 
@@ -893,7 +893,7 @@ fn is_positive_skill_winner(item: &super::skill_ranking::ScoredSkill<'_>) -> boo
 }
 
 fn should_abstain_from_skill(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
-    item.blended_score < 0.15
+    item.blended_score < 0.08
 }
 
 #[crate::ai::agent_hang_span(
@@ -965,6 +965,28 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
         &app.config.skill_match_model_path,
     );
     build_skill_turn_guard(app, mcp_client, skill, intent.clone())
+}
+
+/// 模型通过 `activate_skill` 工具显式请求激活某个 skill 时走这里：直接按名字
+/// 命中并强制激活其 prompt + 工具集，跳过自动路由的打分/阈值/门控。
+///
+/// "别乱用"由工具侧（名字必须真实存在、描述明确要求"clearly matches"才调用）和
+/// 这里的名字校验共同兜底；命中后写入 cross-turn bias，让后续 iteration 通过
+/// sticky 机制保持，不会被自动路由立刻切走。
+pub(super) fn force_activate_named_skill(
+    app: &mut App,
+    mcp_client: &McpClient,
+    skill_manifests: &[SkillManifest],
+    question: &str,
+    requested_name: &str,
+    intent: &UserIntent,
+) -> Option<SkillTurnGuard> {
+    let skill = skill_manifests.iter().find(|s| s.name == requested_name)?;
+    update_cross_turn_skill_bias(app, question, Some(skill));
+    let mut guard = build_skill_turn_guard(app, mcp_client, Some(skill), intent.clone());
+    guard.matched_skill_name = Some(skill.name.clone());
+    guard.skip_recall_by_skill = should_skip_recall_for_skill(Some(skill));
+    Some(guard)
 }
 
 pub(super) fn prepare_skill_for_turn(

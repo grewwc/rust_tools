@@ -520,15 +520,25 @@ pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Op
     if meta.is_some() {
         return Ok(meta);
     }
-    let fallback: Option<String> = conn
-        .query_row(
-            "SELECT content FROM messages WHERE role='user' ORDER BY id ASC LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
+    // 读取前 3 条用户消息，用于生成更完整的摘要
+    let fallback: Vec<String> = conn
+        .prepare(
+            "SELECT content FROM messages WHERE role='user' ORDER BY id ASC LIMIT 3",
         )
-        .optional()
-        .unwrap_or(None);
-    Ok(fallback.map(|content| value_to_string(&decode_message_content(&content))))
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|e| io::Error::other(e.to_string()))?
+        .filter_map(|r| r.ok())
+        .collect();
+    if fallback.is_empty() {
+        return Ok(None);
+    }
+    // 合并前几条消息的内容
+    let combined: Vec<String> = fallback
+        .iter()
+        .map(|content| value_to_string(&decode_message_content(content)))
+        .collect();
+    Ok(Some(combined.join("\n---\n")))
 }
 
 fn decode_message_content(content: &str) -> Value {

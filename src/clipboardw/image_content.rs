@@ -85,7 +85,6 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
         // Case 1: raw_bytes are directly a valid image (native clipboard copy).
         if let Ok(img) = image::load_from_memory(&raw_bytes) {
             img.save(fname)?;
-            println!("save to file: {fname}");
             return Ok(());
         }
 
@@ -106,7 +105,6 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
             io::Error::new(io::ErrorKind::InvalidData, msg)
         })?;
         img.save(fname)?;
-        println!("save to file: {fname}");
         Ok(())
     }
 
@@ -122,7 +120,6 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("failed to create image")?;
                 let image: ImageBuffer<Rgb<u8>, Vec<u8>> = image.convert();
                 image.save(fname.as_str())?;
-                println!("save to file: {fname}");
                 Ok(())
             } else {
                 // Try fallback if arboard works but has no image

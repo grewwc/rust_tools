@@ -50,14 +50,33 @@ pub(super) fn refresh_skill_turn_for_iteration(
     let prev_skill = skill_turn.matched_skill_name().map(|s| s.to_string());
     let intent = skill_turn.intent().clone();
     let inherited_restore = skill_turn.take_restore_agent_context();
-    let mut new_skill_turn = skill_runtime::rebuild_skill_turn_with_existing_selection(
-        app,
-        mcp_client,
-        skill_manifests,
-        question,
-        prev_skill.as_deref(),
-        &intent,
-    );
+
+    // 模型通过 activate_skill 工具显式请求激活某个 skill 时优先采纳：直接按名字
+    // 强制激活，跳过自动路由打分。名字校验在工具侧已做（必须真实存在），这里
+    // 用 skill_manifests 再兜一次，未命中则回退到自动路由。
+    let requested = crate::ai::tools::skill_tools::take_pending_skill_activation();
+    let mut new_skill_turn = requested
+        .as_deref()
+        .and_then(|name| {
+            skill_runtime::force_activate_named_skill(
+                app,
+                mcp_client,
+                skill_manifests,
+                question,
+                name,
+                &intent,
+            )
+        })
+        .unwrap_or_else(|| {
+            skill_runtime::rebuild_skill_turn_with_existing_selection(
+                app,
+                mcp_client,
+                skill_manifests,
+                question,
+                prev_skill.as_deref(),
+                &intent,
+            )
+        });
     if inherited_restore.is_some() {
         new_skill_turn.set_restore_agent_context(inherited_restore);
     }

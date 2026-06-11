@@ -863,7 +863,8 @@ fn prepare_tool_messages_structured(
                 && let Some(path) =
                     overflow_dir.and_then(|dir| write_preserved_tool_overflow_file(dir, name, &text))
             {
-                message.content = Value::String(build_preserved_tool_overflow_stub(&path, name));
+                message.content =
+                    Value::String(build_preserved_tool_overflow_stub(&path, name, &text));
             }
             continue;
         }
@@ -945,11 +946,56 @@ fn write_preserved_tool_overflow_file(
     Some(path)
 }
 
-fn build_preserved_tool_overflow_stub(path: &Path, tool_name: &str) -> String {
+fn build_preserved_tool_overflow_stub(path: &Path, tool_name: &str, full_content: &str) -> String {
+    // 仍把全文外溢到磁盘以控制上下文体积，但在 stub 内保留 head+tail 预览，
+    // 让后续 turn 拥有"召回锚点"——模型据此判断是否真的需要重新 read_file，
+    // 避免早期读到的代码被搬走后出现"失忆/反复重读"。
+    let preview = build_overflow_content_preview(full_content);
     format!(
-        "Output preserved for non-compressible tool `{tool_name}`. Full result moved to session temp file:\n- file_path: {}\n- use read_file to inspect exact content.",
+        "Output preserved for non-compressible tool `{tool_name}`. Full result moved to session temp file:\n- file_path: {}\n- use read_file to inspect exact content.\n{preview}",
         path.display()
     )
+}
+
+/// 为外溢内容生成 head+tail 预览。短内容直接全量保留；长内容保留前后各若干行，
+/// 中间用占位行折叠，并标注省略的行数。
+fn build_overflow_content_preview(content: &str) -> String {
+    const HEAD_LINES: usize = 8;
+    const TAIL_LINES: usize = 4;
+    const MAX_LINE_CHARS: usize = 200;
+
+    let truncate_line = |line: &str| -> String {
+        if line.chars().count() > MAX_LINE_CHARS {
+            let kept: String = line.chars().take(MAX_LINE_CHARS).collect();
+            format!("{kept} …")
+        } else {
+            line.to_string()
+        }
+    };
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let mut out = String::from("Preview (for recall; not exhaustive):\n");
+    if total <= HEAD_LINES + TAIL_LINES {
+        for line in &lines {
+            out.push_str(&truncate_line(line));
+            out.push('\n');
+        }
+    } else {
+        for line in &lines[..HEAD_LINES] {
+            out.push_str(&truncate_line(line));
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "... [{} line(s) omitted; read the file above for full content] ...\n",
+            total - HEAD_LINES - TAIL_LINES
+        ));
+        for line in &lines[total - TAIL_LINES..] {
+            out.push_str(&truncate_line(line));
+            out.push('\n');
+        }
+    }
+    out.trim_end().to_string()
 }
 
 fn is_preserved_user_or_image_stub(text: &str) -> bool {

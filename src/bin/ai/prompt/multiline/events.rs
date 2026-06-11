@@ -287,8 +287,15 @@ fn insert_text(textarea: &mut TextArea<'_>, text: &str) {
     }
 }
 
+/// Generate a compact but clear placeholder for pasted images.
+/// Shows only the filename (not full path) to keep it readable in the editor.
 fn image_placeholder(path: &Path) -> String {
-    format!("[[image:{}]]", path.display())
+    let filename = path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "image.png".to_string());
+    // Format: [[image:paste-xxxx.png]] — short enough to read at a glance,
+    // still uniquely identifies the saved asset.
+    format!("[[image:{}]]", filename)
 }
 
 fn save_clipboard_images(dir: &Path) -> io::Result<Vec<PathBuf>> {

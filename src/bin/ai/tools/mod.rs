@@ -17,7 +17,7 @@ mod rag_tools;
 pub(crate) mod registry;
 mod search_tools;
 pub(crate) mod service;
-mod skill_tools;
+pub(crate) mod skill_tools;
 pub(crate) mod storage;
 pub(crate) mod task_tools;
 mod text_grep_tools;

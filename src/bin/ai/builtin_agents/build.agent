@@ -27,6 +27,9 @@ routing_tags:
   - 优化
   - 解释
   - 编写
+tool_groups:
+  - core
+  - executor
 ---
 
 You are a senior software engineer AI assistant specialized in writing, modifying, debugging, and explaining code.

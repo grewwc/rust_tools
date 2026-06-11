@@ -217,15 +217,15 @@ fn runtime_skill_model_cache_key(skills: &[SkillManifest]) -> String {
 }
 
 fn skill_document_text(skill: &SkillManifest) -> String {
-    let mut parts = vec![skill.name.clone(), skill.description.clone()];
-    if let Some(source_path) = &skill.source_path
-        && !source_path.trim().is_empty()
-    {
-        parts.push(source_path.clone());
-    }
-    if !skill.triggers.is_empty() {
-        parts.push(skill.triggers.join(" "));
-    }
+    // 匹配文档以 name + description 为主：description 是 skill 的核心语义字段，
+    // 这里重复一次以提升其在 n-gram TF-IDF 中的权重，避免被其他字段稀释。
+    // 刻意不再拼接 source_path（纯路径噪音）与 triggers（关键词堆砌、跨语言失效），
+    // prompt 也只保留很短的前缀，防止长 prompt 主导 n-gram 空间。
+    let mut parts = vec![
+        skill.name.clone(),
+        skill.description.clone(),
+        skill.description.clone(),
+    ];
     if !skill.tools.is_empty() {
         parts.push(skill.tools.join(" "));
     }
@@ -236,7 +236,7 @@ fn skill_document_text(skill: &SkillManifest) -> String {
         parts.push(skill.mcp_servers.join(" "));
     }
     if !skill.prompt.trim().is_empty() {
-        parts.push(truncate_chars(&skill.prompt, 6000));
+        parts.push(truncate_chars(&skill.prompt, 200));
     }
     normalize_text_for_similarity(&parts.join("\n"))
 }

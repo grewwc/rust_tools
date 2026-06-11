@@ -557,6 +557,23 @@ fn extract_inline_image_paths(question: &mut String) -> Vec<String> {
     images
 }
 
+/// 粘贴图片的占位符只保留文件名（`paste-xxxx.png`，便于在编辑器中阅读），
+/// 实际文件保存在 `<session>.assets/` 目录下。这里把这类裸文件名回挂到
+/// 会话 assets 目录，得到可读取的绝对路径；已是存在的绝对/相对路径则原样保留。
+fn resolve_inline_image_path(raw: &str, assets_dir: &Path) -> String {
+    if Path::new(raw).is_file() {
+        return raw.to_string();
+    }
+    // 仅对"纯文件名"（不含路径分隔符）做 assets 目录回挂，避免误改用户显式给出的路径。
+    if !raw.contains('/') && !raw.contains('\\') {
+        let candidate = assets_dir.join(raw);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    raw.to_string()
+}
+
 fn apply_text_files_prefix(
     attachments: &mut String,
     text_files: &[String],
@@ -672,7 +689,16 @@ fn finalize_question(
     }
     // 图片是 per-turn 状态：每个 turn 重置，避免上一轮图片被无声地拼到
     // 后续 turn 的 user message（重复 token + 重复 OCR + 把 model 锁在 VL）。
-    app.attached_image_files = inline_images;
+    // 内联图片占位符仅存文件名，这里回挂到 session assets 目录解析出真实路径。
+    let assets_dir = {
+        use crate::ai::history::SessionStore;
+        let store = SessionStore::new(app.config.history_file.as_path());
+        store.session_assets_dir(&app.session_id)
+    };
+    app.attached_image_files = inline_images
+        .into_iter()
+        .map(|raw| resolve_inline_image_path(&raw, &assets_dir))
+        .collect();
 
     if app.pending_short_output || loop_short_output {
         if !question.ends_with('\n') {
@@ -695,7 +721,7 @@ mod tests {
         HistoryAction, HistoryPreviewOptions, HistoryRoleFilter, LocalCommand,
         extract_at_file_references, finalize_question, highlight_history_keyword,
         parse_history_preview_options, parse_local_command, render_history_preview,
-        summarize_history_content, truncate_for_terminal,
+        resolve_inline_image_path, summarize_history_content, truncate_for_terminal,
     };
     use crate::ai::{
         history::{Message, append_history_messages},
@@ -705,6 +731,29 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
     use uuid::Uuid;
+
+    #[test]
+    fn resolve_inline_image_remaps_bare_filename_to_assets_dir() {
+        let dir = std::env::temp_dir().join(format!("ai-img-resolve-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file_name = "paste-abc.png";
+        let full = dir.join(file_name);
+        std::fs::write(&full, b"x").unwrap();
+
+        // 裸文件名应回挂到 assets 目录的真实路径。
+        let resolved = resolve_inline_image_path(file_name, &dir);
+        assert_eq!(resolved, full.to_string_lossy());
+
+        // 不存在的文件名保持原样（不臆造路径）。
+        let missing = resolve_inline_image_path("paste-missing.png", &dir);
+        assert_eq!(missing, "paste-missing.png");
+
+        // 已是存在的绝对路径原样保留。
+        let abs = resolve_inline_image_path(&full.to_string_lossy(), &dir);
+        assert_eq!(abs, full.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn any_model_name() -> String {
         crate::ai::model_names::all()
