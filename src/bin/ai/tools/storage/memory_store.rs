@@ -1052,6 +1052,39 @@ impl MemoryStore {
         })
     }
 
+    /// 批量删除多条记忆（原子操作：一次性读 → 过滤 → 写回）。
+    /// 返回实际删除的条数。
+    pub(crate) fn delete_by_ids(&self, ids: &[&str]) -> Result<usize, String> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let id_set: FxHashSet<&str> = ids.iter().copied().collect();
+        super::with_memory_file_lock(&self.path, || {
+            let content = std::fs::read_to_string(&self.path)
+                .map_err(|e| format!("Failed to read memory file: {}", e))?;
+            let mut kept = Vec::new();
+            let mut removed = 0usize;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() { continue; }
+                if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
+                    if entry.id.as_deref().map_or(false, |id| id_set.contains(id)) {
+                        removed += 1;
+                        continue;
+                    }
+                    kept.push(entry);
+                }
+            }
+            Self::write_all_entries(&self.path, &kept)?;
+            // 同步删除 SQLite 索引
+            if let Some(idx) = memory_index_for(&self.path) {
+                for id in ids { let _ = idx.delete_id(id); }
+                let _ = idx.refresh_signature();
+            }
+            Ok(removed)
+        })
+    }
+
     /// 根据 id 删除条目（返回被删除的条目）
     pub(crate) fn delete_by_id(&self, id: &str) -> Result<Option<AgentMemoryEntry>, String> {
         super::with_memory_file_lock(&self.path, || {
@@ -1093,6 +1126,31 @@ impl MemoryStore {
                 .map_err(|e| format!("Failed to write memory file: {}", e))?;
 
             Ok(deleted_entry)
+        })
+    }
+
+    /// 批量追加多条记忆（原子操作：一次序列化 → 一次写）。
+    /// 截断规则与单条 `append` 一致（每条 note 最大 4KB）。
+    pub(crate) fn append_batch(&self, entries: &[AgentMemoryEntry]) -> Result<usize, String> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let mut serialized = String::new();
+        for entry in entries {
+            if let Ok(s) = serde_json::to_string(entry) {
+                serialized.push_str(&s);
+                serialized.push('\n');
+            }
+        }
+        super::with_memory_file_lock(&self.path, || {
+            let mut file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.path)
+                .map_err(|e| format!("Failed to open memory file: {}", e))?;
+            file.write_all(serialized.as_bytes())
+                .map_err(|e| format!("Failed to write memory entries: {}", e))?;
+            Ok(entries.len())
         })
     }
 
@@ -1376,6 +1434,19 @@ impl MemoryStore {
 
             Ok(())
         })
+    }
+
+    /// 重写整个 JSONL 文件（原子写：tmp → rename）。
+    fn write_all_entries(path: &Path, entries: &[AgentMemoryEntry]) -> Result<(), String> {
+        let mut output = String::new();
+        for entry in entries {
+            if let Ok(s) = serde_json::to_string(entry) {
+                output.push_str(&s);
+                output.push('\n');
+            }
+        }
+        atomic_write_file(path, output.as_bytes())
+            .map_err(|e| format!("Failed to write memory file: {}", e))
     }
 
     /// 获取所有记忆

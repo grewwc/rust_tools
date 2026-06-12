@@ -13,7 +13,7 @@ use crate::ai::{
     types::{App, StreamResult},
 };
 
-/// 一次性把一段完整 Markdown 文本渲染到 stdout（非流式场景使用，例如 `-ms` 检索结果）。
+/// 一次性把一段完整 Markdown 文本渲染到 stdout（非流式场景使用，例如 `-ns` 检索结果）。
 pub(crate) fn render_markdown_block(text: &str) -> std::io::Result<()> {
     use std::io::IsTerminal;
     let tty = std::io::stdout().is_terminal();

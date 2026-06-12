@@ -2197,28 +2197,43 @@ fn dedup_adjacent(messages: &mut Vec<Message>) {
     *messages = out;
 }
 
-/// 只保留最近一条 assistant 的 reasoning_content。
-/// 较老的 reasoning chain 对后续 turn 决策几乎没有帮助，但每条都要回传给厂商
-/// 才能避免 400 invalid_request_error。把旧 reasoning_content 置 None 后，
-/// 厂商侧并不强制要求历史 reasoning 全程保留（OpenAI 仅要求与最近一次 tool_call
-/// 同回合的 reasoning 配对）。
+/// 裁剪历史中的 reasoning_content，只保留确有必要回传给厂商的那些。
+///
+/// 较老的 reasoning chain 对后续 turn 决策几乎没有帮助，去掉可节省上下文预算。
+/// 但 DeepSeek thinking-mode 有一个硬约束：**凡是触发过 tool_calls 的那一回合，
+/// 其 assistant 消息的 reasoning_content 必须在后续所有请求中原样回传**，否则
+/// 会返回 `400 invalid_request_error: The reasoning_content in the thinking mode
+/// must be passed back to the API`。因此这里的策略是：
+/// - 带 `tool_calls` 的 assistant 消息：一律保留 reasoning_content（DeepSeek 强制）；
+/// - 不带 tool_calls 的纯回答 assistant 消息：只保留最近一条的 reasoning_content，
+///   其余置 None（OpenAI 等仅要求与最近一次 tool_call 同回合的 reasoning 配对，
+///   旧的纯回答 reasoning 可安全丢弃）。
 fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
-    let last_with_reasoning = messages
+    // 最近一条「不带 tool_calls」的 assistant reasoning 索引——这一条予以保留。
+    let keep_plain_idx = messages
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, m)| m.role == "assistant" && m.reasoning_content.is_some())
+        .find(|(_, m)| {
+            m.role == "assistant"
+                && m.reasoning_content.is_some()
+                && m.tool_calls.is_none()
+        })
         .map(|(idx, _)| idx);
-    let Some(keep_idx) = last_with_reasoning else {
-        return;
-    };
+
     for (idx, m) in messages.iter_mut().enumerate() {
-        if idx == keep_idx {
+        if m.role != "assistant" || m.reasoning_content.is_none() {
             continue;
         }
-        if m.role == "assistant" && m.reasoning_content.is_some() {
-            m.reasoning_content = None;
+        // 带 tool_calls 的回合：DeepSeek 要求必须回传，保留。
+        if m.tool_calls.is_some() {
+            continue;
         }
+        // 纯回答回合：只保留最近一条。
+        if Some(idx) == keep_plain_idx {
+            continue;
+        }
+        m.reasoning_content = None;
     }
 }
 

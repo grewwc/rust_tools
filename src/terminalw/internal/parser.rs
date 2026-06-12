@@ -621,6 +621,37 @@ impl Parser {
     pub fn parse_argv(&mut self, argv: &[String], bool_optionals: &[&str]) {
         parser_impl::parse_argv(self, argv, bool_optionals);
     }
+
+    /// 返回所有已注册的 flag 信息，用于生成 shell 补全脚本。
+    /// 返回 `Vec<(name, type_name, usage, aliases)>`，按 name 排序。
+    /// type_name 为 "bool" | "string" | "int" | "float"。
+    pub fn collect_completion_info(&self) -> Vec<(String, String, String, Vec<String>)> {
+        use std::collections::HashSet;
+        let mut result = Vec::new();
+        let mut seen = HashSet::new();
+        for (name, def) in &self.flags {
+            // 跳过短别名（如 `-t`），只保留 canonical name
+            if self.short_aliases.contains(name) {
+                continue;
+            }
+            let ty = match def.ty {
+                FlagType::Bool => "bool",
+                FlagType::String => "string",
+                FlagType::Int | FlagType::Int64 => "int",
+                FlagType::Float64 => "float",
+            };
+            let aliases: Vec<String> = self
+                .alias_map
+                .get(name)
+                .map(|v| v.iter().cloned().collect())
+                .unwrap_or_default();
+            result.push((name.clone(), ty.to_string(), def.usage.clone(), aliases));
+            seen.insert(name.clone());
+        }
+        // 按 canonical name 排序，保证脚本稳定
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        result
+    }
 }
 
 struct OptionEntry {

@@ -11,6 +11,16 @@ use serde::{Deserialize, Serialize};
 pub(crate) use background::assess_learning_note_quality;
 pub(crate) use recall::{AutoRecalledKnowledge, RecallBundle};
 
+/// 通用后台 LLM 调用（非流式，带内置超时）。供经验泛化的 LLM 二次提炼等
+/// 后台反思类任务复用，避免各处重复实现 endpoint/auth/超时逻辑。
+pub(crate) async fn background_llm_call(
+    model: &str,
+    messages: &Vec<serde_json::Value>,
+) -> Option<String> {
+    let resp = background::background_call(model, messages).await?;
+    background::extract_back_content(&resp)
+}
+
 pub(super) async fn maybe_append_self_reflection(
     app: &mut App,
     model: &str,

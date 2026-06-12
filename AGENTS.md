@@ -41,7 +41,7 @@ make all                          # Full build (all binaries)
 make install                      # Incremental install (changed binaries only)
 cargo build --release --bin a     # Build AI Agent
 cargo check --bin a               # Type-check (fast validation)
-cargo test --lib --bin a          # Run tests (531 tests)
+cargo test --lib --bin a          # Run tests (709 tests)
 cargo test --bin a test_xxx       # Filter tests by name
 ```
 
@@ -73,6 +73,12 @@ cargo test --bin a test_xxx       # Filter tests by name
    - MCP integration: stdio JSON-RPC transport
    - Tool groups: core, builtin, executor, etc.
    - `ast_symbols/`: multi-language AST extraction (Rust/Python/Java/Go/TS/JS/C/C++)
+   - Knowledge tools: `knowledge_save`, `knowledge_forget`, `knowledge_search`, `knowledge_list`, `knowledge_consolidate`
+   - `knowledge_consolidate` — two-phase AI-driven consolidation:
+     `action: "read_all"` → returns all entries for LLM analysis;
+     `action: "execute"` → batch-deletes obsolete IDs + batch-saves entries.
+     Backed by `MemoryStore::delete_by_ids` / `append_batch`.
+   - Memory tools: `memory_save`, `memory_search`, `memory_recent` (agent internal)
 
 5. **Configuration**
    - Keys defined in `config_schema.rs` (`AiConfig` constants) — never use raw string literals
@@ -91,7 +97,8 @@ cargo test --bin a test_xxx       # Filter tests by name
 5. **Error handling**: Library code → `Result<T, Box<dyn Error>>`; Agent tools → `Result<String, String>`
 6. **Tests**: Inline `#[cfg(test)] mod tests` in modules; cross-crate in `tests/`; use `ENV_LOCK` for serial tests
 7. **Scope**: Do not reformat or reorder files unrelated to the task. Only modify files that need to change — no incidental formatting.
-
+8. **No unrelated changes**: Do not make any changes that are not required by the current task. This includes refactoring, reformatting, renaming, reorganizing, commenting, or any other modification to files, symbols, or code that is not directly relevant to the feature or fix being implemented.
+ 
 ### AI Module
 
 1. **Agent files** (`.agent`): Required: `name`/`description`. Optional: `mode`/`model`/`tools`/`tool_groups`/`routing_tags`/`model_tier`/`color`
@@ -99,12 +106,13 @@ cargo test --bin a test_xxx       # Filter tests by name
 3. **Tool naming**: snake_case, verb-first (`read_file`, `execute_command`)
 4. **Tool registration**: Define schema in `tools/registry/`, implement in `tools/service/`
 5. **Config keys**: Add to `config_schema.rs` `AiConfig` — no scattered string literals
+6. **Knowledge consolidation**: `knowledge_consolidate` tool provides two-phase AI-driven consolidation: `read_all` returns all entries for LLM analysis; `execute` batch-deletes + batch-saves. Backed by `MemoryStore::delete_by_ids` / `append_batch`.
 
 ### Testing
 
 - Naming: `test_feature_description` (snake_case)
 - Integration tests with `_go_compat` suffix = Go compatibility layer tests
-- Full suite: `cargo test --lib --bin a` (currently 531 tests)
+- Full suite: `cargo test --lib --bin a` (currently 709 tests)
 - Serial tests: guard with `test_support::ENV_LOCK`
 
 ## Pitfalls

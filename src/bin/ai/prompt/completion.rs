@@ -52,10 +52,16 @@ impl CommandCompleter {
             ":h",
             "/history",
             ":history",
+            "/usage",
+            ":usage",
             "/feishu-auth",
             ":feishu-auth",
             "/share",
             ":share",
+            "/checkpoint",
+            ":checkpoint",
+            "/cp",
+            ":cp",
             "/model",
             ":model",
             "/agents",
@@ -184,6 +190,16 @@ impl CommandCompleter {
         ]
     }
 
+    /// `/usage` 的子命令。
+    fn usage_subcommands() -> &'static [&'static str] {
+        &["today", "7d", "30d", "all", "daily", "trend", "days", "help"]
+    }
+
+    /// `/checkpoint` / `/cp` 的子命令。
+    fn checkpoint_subcommands() -> &'static [&'static str] {
+        &["save", "list", "rollback", "delete", "help"]
+    }
+
     fn history_subcommands() -> &'static [&'static str] {
         &[
             "full",
@@ -281,6 +297,14 @@ impl CommandCompleter {
             } else {
                 let source = match first {
                     "/agents" | ":agents" | "/agent" | ":agent" => Self::agent_subcommands(),
+                    "/usage" | ":usage" => Self::usage_subcommands(),
+                    "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => {
+                        Self::checkpoint_subcommands()
+                    }
+                    "/model" | ":model" => {
+                        // `/model` already has separate handling (model names + subcommands mixed)
+                        Self::model_subcommands()
+                    }
                     "/sessions" | ":sessions" => Self::session_subcommands(),
                     "/history" | ":history" => Self::history_subcommands(),
                     _ => &[],

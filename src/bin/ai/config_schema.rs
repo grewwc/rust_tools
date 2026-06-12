@@ -97,6 +97,11 @@ impl AiConfig {
     pub const CRITIC_REVISE_FILTER_MIN_ANSWER_CHARS: &str =
         "ai.critic_revise.filter.min_answer_chars";
 
+    // ── Experience Generalization (LLM 二次提炼) ────────────
+    pub const GENERALIZE_LLM_REFINE_ENABLE: &str = "ai.generalize.llm_refine.enable";
+    pub const GENERALIZE_LLM_REFINE_MODEL: &str = "ai.generalize.llm_refine.model";
+    pub const GENERALIZE_LLM_REFINE_TIMEOUT_MS: &str = "ai.generalize.llm_refine.timeout_ms";
+
     // ── Project Writeback ──────────────────────────────────
     pub const PROJECT_WRITEBACK_ENABLE: &str = "ai.project_writeback.enable";
     pub const PROJECT_WRITEBACK_MODEL: &str = "ai.project_writeback.model";

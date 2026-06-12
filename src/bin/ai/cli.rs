@@ -31,9 +31,9 @@ pub(super) struct ParsedCli {
     /// `/model effort <x>` 与 `--reasoning-effort` 都写入此字段。
     pub(super) reasoning_effort_override: Option<Option<ReasoningEffort>>,
     /// 是否只搜索 memo 类别的记录。
-    /// 通过 `--memo-search` 开启，用于快速查找用户手动记录的内容（如截图、笔记等）。
+    /// 通过 `--note-search` / `-ns` 开启，用于快速查找用户手动记录的内容（如截图、笔记等）。
     /// 默认 false，即走正常的知识召回流程。
-    pub(super) memo_search: bool,
+    pub(super) note_search: bool,
     /// 快速保存 memo 到知识库。
     /// 通过 `--note` 或 `-n` 指定内容，保存后直接退出。
     pub(super) note: Option<String>,
@@ -43,6 +43,10 @@ pub(super) struct ParsedCli {
     pub(super) note_delete: Option<String>,
     /// 通过 `--note-edit` / `-ne <描述>` 指定要修改的 memo：AI 匹配后在编辑器中改写。
     pub(super) note_edit: Option<String>,
+    /// AI 驱动的知识库整理：读取全部条目 → 模型分析 → 执行整理。
+    pub(super) consolidate_knowledge: bool,
+    /// --generate-completions
+    pub(super) generate_completions: bool,
 }
 
 impl Default for ParsedCli {
@@ -66,11 +70,13 @@ impl Default for ParsedCli {
             mcp_config: String::new(),
             help: false,
             reasoning_effort_override: None,
-            memo_search: false,
+            note_search: false,
             note: None,
             note_flag: false,
             note_delete: None,
             note_edit: None,
+            consolidate_knowledge: false,
+            generate_completions: false,
         }
     }
 }
@@ -94,7 +100,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     parser.add_bool(
         "thinking",
         false,
-        "force enable thinking (auto-enabled by default for complex questions)",
+        "enable chain-of-thought reasoning",
     );
     parser.alias("t", "thinking");
     parser.add_bool("short-output", false, "short output");
@@ -106,12 +112,19 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     parser.add_bool("list-agents", false, "list available agents and exit");
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
-    parser.add_bool("memo-search", false, "restrict knowledge recall to memo category only");
-    parser.alias("ms", "memo-search");
+    parser.add_bool(
+        "consolidate-knowledge",
+        false,
+        "AI-driven consolidation of all knowledge entries",
+    );
+    parser.add_bool("note-search", false, "search knowledge base (memo category) and answer");
+    parser.alias("ns", "note-search");
     parser.alias("h", "help");
+    parser.add_bool("generate-completions", false,
+        "generate shell completion script (bash/zsh/fish) and exit");
 
     // 定义所有 string/int 选项
-    parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history");
+    parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history entries to keep");
     parser.add_string("model", "", "model name");
     parser.alias("m", "model");
     parser.add_string("agent", "", "agent name");
@@ -145,7 +158,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     };
 
     // 预处理：将 --ss 转换为 --session，避免与 -s 冲突
-    // 这是必要的，因为 terminalw::Parser 的布尔簇检测会将 -ss 分解为 -s + -s
     for arg in &mut argv {
         if arg == "--ss" || arg.starts_with("--ss=") {
             *arg = arg.replace("--ss", "--session");
@@ -210,6 +222,12 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     // 处理 thinking
     cli.thinking = parser.contains_flag_strict("thinking");
 
+    // 处理 consolidate-knowledge
+    cli.consolidate_knowledge = parser.contains_flag_strict("consolidate-knowledge");
+
+    // 处理 generate-completions
+    cli.generate_completions = parser.contains_flag_strict("generate-completions");
+
     // 处理 short-output
     cli.short_output = parser.contains_flag_strict("short-output");
 
@@ -228,8 +246,8 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     // 处理 no-skills
     cli.no_skills = parser.contains_flag_strict("no-skills");
 
-    // 处理 memo-search
-    cli.memo_search = parser.contains_flag_strict("memo-search");
+    // 处理 note-search
+    cli.note_search = parser.contains_flag_strict("note-search");
 
     // 处理 note
     if parser.contains_flag_strict("note") {
@@ -240,15 +258,13 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         }
     }
 
-    // 处理 note-delete：只要传了 --note-delete / -nd 就进入删除流程，
-    // 没带文本时上层会进入多行输入框让用户描述要删除的内容。
+    // 处理 note-delete
     if parser.contains_flag_strict("note-delete") {
         let val = parser.flag_value_or_default("note-delete");
         cli.note_delete = Some(val.trim().to_string());
     }
 
-    // 处理 note-edit：传了 --note-edit / -ne 就进入修改流程，
-    // 没带文本时上层进入多行输入框让用户描述要修改的内容。
+    // 处理 note-edit
     if parser.contains_flag_strict("note-edit") {
         let val = parser.flag_value_or_default("note-edit");
         cli.note_edit = Some(val.trim().to_string());
@@ -260,18 +276,10 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     }
 
     // 处理 reasoning-effort
-    // 字面量映射：
-    //   minimal/min -> Minimal
-    //   low         -> Low
-    //   medium/mid  -> Medium
-    //   high        -> High
-    //   off/none/no/false -> 显式关闭（请求里不带字段）
-    //   其他非空字符串：保留为未设置 + stderr 提示
     if parser.contains_flag_strict("reasoning-effort") {
         let raw = parser.flag_value_or_default("reasoning-effort");
         let trimmed = raw.trim();
         if trimmed.is_empty() {
-            // 用户给了 --reasoning-effort=（空），等价于显式关闭。
             cli.reasoning_effort_override = Some(None);
         } else if matches!(
             trimmed.to_ascii_lowercase().as_str(),
@@ -301,7 +309,7 @@ pub(super) fn print_help() {
     parser.add_bool(
         "thinking",
         false,
-        "force enable thinking (auto-enabled by default for complex questions)",
+        "enable chain-of-thought reasoning",
     );
     parser.alias("t", "thinking");
     parser.add_bool("short-output", false, "short output");
@@ -313,11 +321,16 @@ pub(super) fn print_help() {
     parser.add_bool("list-agents", false, "list available agents and exit");
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
-    parser.add_bool("memo-search", false, "restrict knowledge recall to memo category only");
-    parser.alias("ms", "memo-search");
+    parser.add_bool(
+        "consolidate-knowledge",
+        false,
+        "AI-driven consolidation of all knowledge entries",
+    );
+    parser.add_bool("note-search", false, "search knowledge base (memo category) and answer");
+    parser.alias("ns", "note-search");
     parser.alias("h", "help");
 
-    parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history");
+    parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history entries to keep");
     parser.add_string("model", "", "model name");
     parser.alias("m", "model");
     parser.add_string("agent", "", "agent name");
@@ -346,12 +359,17 @@ pub(super) fn print_help() {
     println!("AI CLI - Interactive AI Assistant");
     println!("Usage: a [OPTIONS] [PROMPT]");
     println!();
+    println!("Quick Actions:");
+    println!("  --consolidate-knowledge  read all knowledge entries, analyze with LLM, clean up obsolete ones");
+    println!("  -n, --note <text>        save text as memo to knowledge base and exit");
+    println!("  -ns, --note-search <q>   search memo category and answer with LLM");
+    println!();
     println!("Options:");
     parser.print_defaults();
     println!();
     println!("Agent (CLI):");
     println!(
-        "  --agent <name>            start with specified agent (build/executor/plan/explore)"
+        "  --agent <name>            start with a specific agent (alias: -a)"
     );
     println!("  --list-agents             list available agents and exit");
     println!();
@@ -369,6 +387,11 @@ pub(super) fn print_help() {
     println!("                                (minimal|low|medium|high|off|auto)");
     println!("    /feishu-auth              authenticate with Feishu");
     println!("    /share [output.md]        export current session as shareable markdown");
+    println!();
+    println!("  Knowledge:");
+    println!("    /usage                   show token usage statistics");
+    println!("    /usage daily             show daily token usage breakdown");
+    println!("    /usage help              show usage command help");
     println!();
     println!("  Agent management:");
     println!("    /agents                   list available agents");
@@ -389,4 +412,161 @@ pub(super) fn print_help() {
     println!("    /sessions export-current [output.md]    export current session to Markdown");
     println!("    /sessions export-last [output.md]       export latest session to Markdown");
     println!();
+    println!("  Debug:");
+    println!("    /hang                    state dump (debug)");
+}
+
+/// 生成 shell 补全脚本并打印到 stdout。
+/// `shell` 取值 "bash" | "zsh" | "fish"，不区分大小写。
+/// 通过 --generate-completions 触发。
+pub fn generate_completion_script(shell: &str) {
+    // 用同样的 flag 定义重建 parser（与 parse_cli_args 保持一致）
+    let mut parser = TermParser::new();
+
+    // ===== bool 选项 =====
+    parser.add_bool("clear", false, "clear specified session history (use with --session)");
+    parser.add_bool("thinking", false, "enable chain-of-thought reasoning");
+    parser.alias("t", "thinking");
+    parser.add_bool("short-output", false, "short output");
+    parser.alias("s", "short-output");
+    parser.add_bool("list-tools", false, "list builtin tools and exit");
+    parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
+    parser.alias("list-mcp-servers", "list-mcp-tools");
+    parser.add_bool("list-skills", false, "list skills and exit");
+    parser.add_bool("list-agents", false, "list available agents and exit");
+    parser.add_bool("no-skills", false, "disable loading all skills");
+    parser.add_bool("help", false, "print help");
+    parser.alias("h", "help");
+    parser.add_bool("consolidate-knowledge", false,
+        "AI-driven consolidation of all knowledge entries");
+    parser.add_bool("note-search", false, "search knowledge base (memo category) and answer");
+    parser.alias("ns", "note-search");
+    parser.add_bool("generate-completions", false,
+        "generate shell completion script (bash/zsh/fish) and exit");
+
+    // ===== string / int 选项 =====
+    parser.add_int("history", 256, "number of history entries to keep");
+    parser.add_string("model", "", "model name");
+    parser.alias("m", "model");
+    parser.add_string("agent", "", "agent name");
+    parser.alias("a", "agent");
+    parser.add_string("session", "", "session id");
+    parser.alias("ss", "session");
+    parser.add_string("files", "", "input file names");
+    parser.alias("f", "files");
+    parser.add_string("out", "", "write output to file");
+    parser.alias("o", "out");
+    parser.add_string("mcp-config", "", "mcp config json path override");
+    parser.add_string("reasoning-effort", "",
+        "reasoning effort: minimal | low | medium | high | off");
+    parser.alias("re", "reasoning-effort");
+    parser.add_string("note", "", "save text as memo to knowledge base and exit");
+    parser.alias("n", "note");
+    parser.add_string("note-delete", "",
+        "describe a memo to delete; AI matches it, confirm to delete");
+    parser.alias("nd", "note-delete");
+    parser.add_string("note-edit", "",
+        "describe a memo to edit; AI matches it, edit in editor and save");
+    parser.alias("ne", "note-edit");
+
+    let info = parser.collect_completion_info();
+
+    let is_bool = |ty: &str| ty == "bool";
+    let has_value = |ty: &str| ty == "string" || ty == "int" || ty == "float";
+
+    match shell.to_ascii_lowercase().as_str() {
+        "bash" => generate_bash(&info, is_bool, has_value),
+        "zsh" => generate_zsh(&info, is_bool, has_value),
+        "fish" => generate_fish(&info, is_bool, has_value),
+        _ => {
+            eprintln!("Unsupported shell: {shell}. Use: bash, zsh, or fish.");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn generate_bash(
+    info: &[(String, String, String, Vec<String>)],
+    _is_bool: fn(&str) -> bool,
+    _has_value: fn(&str) -> bool,
+) {
+    println!("_a_completions() {{");
+    println!("  local cur prev words cword");
+    println!("  _get_comp_words_by_ref -n = cur prev words cword 2>/dev/null || true");
+    println!();
+    println!("  cur=\"${{COMP_WORDS[COMP_CWORD]}}\"");
+    println!("  prev=\"${{COMP_WORDS[COMP_CWORD-1]}}\"");
+    let flag_name = |name: &str| -> String {
+        if name.len() > 1 { format!("--{}", name) } else { format!("-{}", name) }
+    };
+    let mut opts = String::new();
+    for (name, _ty, _usage, aliases) in info {
+        opts.push_str(&flag_name(name));
+        opts.push(' ');
+        for a in aliases {
+            opts.push_str(&flag_name(a));
+            opts.push(' ');
+        }
+    }
+    println!("  COMPREPLY=($(compgen -W \"{}\" -- \"$cur\"))", opts.trim());
+    println!("  return 0");
+    println!("}}");
+    println!("complete -F _a_completions a");
+}
+
+fn generate_zsh(
+    info: &[(String, String, String, Vec<String>)],
+    is_bool: fn(&str) -> bool,
+    _has_value: fn(&str) -> bool,
+) {
+    println!("#compdef a");
+    println!();
+    println!("_a() {{");
+    println!("  local -a _a_args");
+    println!();
+    let emit_flag = |flag: &str, ty: &str, usage: &str| {
+        let escaped = usage.replace('\'', "'\\''");
+        if is_bool(ty) {
+            format!("'{}[{}]'", flag, escaped)
+        } else {
+            format!("'{}:{}: '", flag, escaped)
+        }
+    };
+    for (name, ty, usage, aliases) in info {
+        let prefix = if name.len() > 1 { "--" } else { "-" };
+        println!("  _a_args+=({})", emit_flag(&format!("{}{}", prefix, name), ty, usage));
+        for a in aliases {
+            let a_prefix = if a.len() > 1 { "--" } else { "-" };
+            println!("  _a_args+=({})", emit_flag(&format!("{}{}", a_prefix, a), ty, usage));
+        }
+    }
+    println!("  _arguments $_a_args");
+    println!("}}");
+    println!();
+    println!("compdef _a a");
+}
+
+fn generate_fish(
+    info: &[(String, String, String, Vec<String>)],
+    is_bool: fn(&str) -> bool,
+    has_value: fn(&str) -> bool,
+) {
+    for (name, ty, usage, aliases) in info {
+        let escaped = usage.replace('\'', "'\\''");
+        if is_bool(ty) {
+            println!("complete -c a -l '{name}' -d '{escaped}'");
+            for a in aliases {
+                if a.len() > 1 {
+                    println!("complete -c a -l {a} -d '{escaped}'");
+                }
+            }
+        } else {
+            println!("complete -c a -l {name} -d '{escaped}' -r");
+            for a in aliases {
+                if a.len() > 1 {
+                    println!("complete -c a -l {a} -d '{escaped}' -r");
+                }
+            }
+        }
+    }
 }

@@ -1,7 +1,8 @@
 /// 知识库工具 — 为用户提供知识管理功能
 ///
 /// ## 与 Memory 系统的区别
-/// - **Knowledge (知识库)**: 用户主动保存的项目知识、决策记录、偏好设置等
+/// - **Knowledge (知识库)**:
+///   用户主动保存的项目知识、决策记录、偏好设置等
 ///   - 工具: `knowledge_save`, `knowledge_forget`, `knowledge_search`, `knowledge_list`
 ///   - 用途: 用户显式管理的事实性知识，如项目结构、技术决策、用户偏好
 ///   - 类别: `user_memory`, `project_info`, `architecture`, `decision_log` 等
@@ -18,12 +19,41 @@
 /// - `knowledge_save` — 保存用户知识（自动同步到 RAG 向量索引）
 /// - `knowledge_forget` — 删除指定知识（同步删除 RAG 向量）
 /// - `knowledge_search` — 按关键词搜索知识
-/// - `knowledge_list` — 列出最近的知识条目
+/// - `knowledge_list` — 列出最近的知识条目（默认 20 条，最多 100）
+/// - `knowledge_consolidate` — AI 驱动的记忆整理（读全部 → 分析 → 执行整理）
+///
+/// ## 记忆整理流程（`knowledge_consolidate`）
+///
+/// `knowledge_consolidate` 是一个**双阶段工具**，由 Agent 协调完成：
+///
+/// **第一阶段 — 读取全部**
+/// ```
+/// knowledge_consolidate(action: "read_all")
+/// ```
+/// 工具返回所有知识条目（id, category, tags, source, priority, content, timestamp），
+/// Agent 据此分析哪些条目有用、哪些过时、哪些可以合并。
+///
+/// **第二阶段 — 执行整理**
+/// ```
+/// knowledge_consolidate(
+///   action: "execute",
+///   delete_ids: ["id1", "id2"],
+///   save_entries: [{ content: "合并后的内容", category: "user_memory", ... }]
+/// )
+/// ```
+/// 工具先批量删除指定 ID 的条目，再批量保存新条目（原子操作顺序：先删后增）。
+///
+/// ## 整理原则（Agent 自行判断）
+/// - **保留**：仍有参考价值的决策、偏好、项目信息、安全规则
+/// - **删除**：过时的记录、重复的内容、不再相关的临时信息、低优先级的琐碎笔记
+/// - **合并**：多条相关的内容可以合并为一条概括性的条目
+///
 use serde_json::Value;
 
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
+use chrono::Local;
 use crate::ai::tools::storage::rag_store::{RagEntry, ensure_rag_store, get_rag_store};
 
 /// 32 字符短指纹（取 SHA-256 前 16 字节）。
@@ -390,6 +420,222 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+// ─── knowledge_consolidate ─────────────────────────────────────────────────
+
+fn params_knowledge_consolidate() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["read_all", "execute"],
+                "description": "\"read_all\" returns every knowledge entry for analysis; \"execute\" deletes & saves entries per your consolidation plan."
+            },
+            "delete_ids": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "List of entry IDs to delete (only used when action=\"execute\")."
+            },
+            "save_entries": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "The consolidated note content." },
+                        "category": { "type": "string", "description": "Category (default: user_memory)." },
+                        "tags": { "type": "array", "items": { "type": "string" } },
+                        "source": { "type": "string" },
+                        "priority": { "type": "integer", "description": "0-255. 255=permanent." }
+                    },
+                    "required": ["content"]
+                },
+                "description": "New entries to save (only used when action=\"execute\"). Saved after deletions."
+            }
+        },
+        "required": ["action"]
+    })
+}
+
+fn execute_knowledge_consolidate(args: &Value) -> Result<String, String> {
+    let action = args["action"].as_str().ok_or("Missing 'action'.")?;
+
+    match action {
+        "read_all" => read_all_entries(),
+        "execute" => execute_consolidation(args),
+        _ => Err(format!("Unknown action '{}'. Use 'read_all' or 'execute'.", action)),
+    }
+}
+
+fn read_all_entries() -> Result<String, String> {
+    let store = MemoryStore::from_env_or_config();
+    let entries = store.all()?;
+
+    if entries.is_empty() {
+        return Ok("Knowledge base is empty. Nothing to consolidate.".to_string());
+    }
+
+    let mut result = format!(
+        "📚 Total knowledge entries: {}\n\n",
+        entries.len()
+    );
+
+    // Group by category for better readability
+    let mut by_category: std::collections::BTreeMap<String, Vec<&AgentMemoryEntry>> =
+        std::collections::BTreeMap::new();
+    for entry in &entries {
+        by_category
+            .entry(entry.category.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    for (cat, cat_entries) in &by_category {
+        result.push_str(&format!("── [{}] ({} entries) ──\n", cat, cat_entries.len()));
+        for entry in cat_entries {
+            let entry_id = entry.id.as_deref().unwrap_or("N/A");
+            let ts = &entry.timestamp;
+            let prio = entry.priority.unwrap_or(100);
+            // 截断过长的内容用于预览
+            let preview: String = if entry.note.chars().count() > 200 {
+                entry.note.chars().take(200).collect::<String>()
+                    + &format!("\n       …[truncated, total {} chars]", entry.note.chars().count())
+            } else {
+                entry.note.clone()
+            };
+
+            result.push_str(&format!("   id: {}\n", entry_id));
+            if !entry.tags.is_empty() {
+                result.push_str(&format!("   tags: {}\n", entry.tags.join(", ")));
+            }
+            if let Some(src) = &entry.source {
+                result.push_str(&format!("   source: {}\n", src));
+            }
+            result.push_str(&format!("   priority: {}  |  timestamp: {}\n", prio, ts));
+            result.push_str(&format!("   content: {}\n\n", preview));
+        }
+    }
+
+    result.push_str("──\n");
+    result.push_str("Analysis: Review the entries above. Identify which to keep, delete (obsolete/duplicate), or merge into consolidated summaries.\n");
+    result.push_str("Then call knowledge_consolidate with action=\"execute\" to apply your plan.\n");
+
+    Ok(result)
+}
+
+fn execute_consolidation(args: &Value) -> Result<String, String> {
+    let store = MemoryStore::from_env_or_config();
+
+    // 收集待删除的 ID
+    let delete_ids: Vec<String> = args["delete_ids"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 收集待保存的新条目
+    let save_entries_raw: Vec<&Value> = args["save_entries"]
+        .as_array()
+        .map(|arr| arr.iter().collect())
+        .unwrap_or_default();
+
+    if delete_ids.is_empty() && save_entries_raw.is_empty() {
+        return Err("No changes specified. Provide delete_ids, save_entries, or both.".to_string());
+    }
+
+    let mut report = String::new();
+    report.push_str("📦 Consolidation report:\n");
+
+    // 第一阶段：批量删除
+    let deleted_count = if !delete_ids.is_empty() {
+        let id_refs: Vec<&str> = delete_ids.iter().map(String::as_str).collect();
+        match store.delete_by_ids(&id_refs) {
+            Ok(n) => {
+                report.push_str(&format!("   Deleted: {} entries\n", n));
+                n
+            }
+            Err(e) => {
+                report.push_str(&format!("   Delete error: {}\n", e));
+                0
+            }
+        }
+    } else {
+        0
+    };
+
+    // 第二阶段：构建新条目
+    let mut new_entries: Vec<AgentMemoryEntry> = Vec::new();
+    for entry_val in &save_entries_raw {
+        let content = entry_val["content"]
+            .as_str()
+            .ok_or("Each save_entries item must have a 'content' field.")?;
+        let category = entry_val["category"]
+            .as_str()
+            .unwrap_or("user_memory");
+        let tags: Vec<String> = entry_val["tags"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let source = entry_val["source"].as_str().map(String::from);
+        let priority = entry_val["priority"]
+            .as_u64()
+            .map(|p| p as u8)
+            .unwrap_or(150);
+
+        new_entries.push(AgentMemoryEntry {
+            id: None,
+            timestamp: Local::now().to_rfc3339(),
+            category: category.to_string(),
+            note: content.to_string(),
+            tags,
+            source,
+            priority: Some(priority),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        });
+    }
+
+    // 第三阶段：批量保存新条目
+    let saved_count = if !new_entries.is_empty() {
+        match store.append_batch(&new_entries) {
+            Ok(n) => {
+                report.push_str(&format!("   Saved: {} new entries\n", n));
+                n
+            }
+            Err(e) => {
+                report.push_str(&format!("   Save error: {}\n", e));
+                0
+            }
+        }
+    } else {
+        0
+    };
+
+    if deleted_count == 0 && saved_count == 0 {
+        report.push_str("   No changes were made.\n");
+    }
+
+    Ok(report)
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "knowledge_consolidate",
+        description: "Two-phase knowledge consolidation. First call with action=\"read_all\" to get all entries; then call with action=\"execute\", delete_ids=[...], and/or save_entries=[...] to apply a consolidation plan. The agent analyzes which entries are useful, obsolete, or mergeable.",
+        parameters: params_knowledge_consolidate,
+        execute: execute_knowledge_consolidate,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin"],
+    }
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,5 +684,23 @@ mod tests {
                 .map(|a| a.is_empty())
                 .unwrap_or(true)
         );
+    }
+
+    #[test]
+    fn test_knowledge_consolidate_params() {
+        let params = params_knowledge_consolidate();
+        assert!(params["required"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String("action".to_string())));
+        assert_eq!(
+            params["properties"]["action"]["enum"].as_array().unwrap().len(),
+            2
+        );
+        let actions: Vec<&str> = params["properties"]["action"]["enum"]
+            .as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert!(actions.contains(&"read_all"));
+        assert!(actions.contains(&"execute"));
     }
 }

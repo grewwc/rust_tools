@@ -1,7 +1,20 @@
 [
   {
-    "key": "DEEPSEEK_V3",
+    "key": "DEEPSEEK_V4_PRO",
     "name": "deepseek-v4-pro",
+    "default_reasoning_effort": "high",
+    "provider": "openai",
+    "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+    "quality_tier": "strong",
+    "is_vl": false,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": true,
+    "subagent_priority": 100
+  },
+  {
+    "key": "DEEPSEEK_V4_FLASH",
+    "name": "deepseek-v4-flash",
     "default_reasoning_effort": "high",
     "provider": "openai",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",

@@ -40,7 +40,7 @@ const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
 const DEFAULT_TASK_WAIT_TIMEOUT_SECS: u64 = 600;
 /// `task_wait.timeout_secs` 的硬上限，避免模型把 timeout 设成天文数字时彻底
 /// 阻塞 driver。
-const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 3600;
+const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 600;
 
 /// Granular control over which slices of the parent agent's execution
 /// context are inherited by a spawned sub-agent. Defaults are

@@ -26,3 +26,35 @@ install: $(INSTALLW)
 		cargo build --release $$args; \
 	fi; \
 	sh ./move_executable.sh $(INSTALL_BINS)
+	@$(MAKE) install-completions
+# -- shell completions --
+.PHONY: install-completions
+install-completions:
+	@SHELL_NAME=$$(basename "$${SHELL:-/bin/bash}"); \
+	A_BIN="$${INSTALL_DIR:-$$(pwd)/bin}/a"; \
+	if [ ! -x "$$A_BIN" ]; then \
+		echo "  skip completions: a not found at $$A_BIN"; \
+		exit 0; \
+	fi; \
+	case "$$SHELL_NAME" in \
+	  zsh) \
+		DST="$${HOME}/.zfunc"; \
+		mkdir -p "$$DST"; \
+		"$$A_BIN" --generate-completions zsh > "$$DST/_a"; \
+		echo "  completions -> $$DST/_a"; \
+		echo "  add to ~/.zshrc: fpath=($$DST \$$fpath) && autoload -Uz compinit && compinit"; \
+		;; \
+	  fish) \
+		DST="$${HOME}/.config/fish/completions"; \
+		mkdir -p "$$DST"; \
+		"$$A_BIN" --generate-completions fish > "$$DST/a.fish"; \
+		echo "  completions -> $$DST/a.fish"; \
+		;; \
+	  *) \
+		DST="$${HOME}/.bash_completion.d"; \
+		mkdir -p "$$DST"; \
+		"$$A_BIN" --generate-completions bash > "$$DST/a"; \
+		echo "  completions -> $$DST/a"; \
+		echo "  add to ~/.bashrc: source $$DST/a"; \
+		;; \
+	esac

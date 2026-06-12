@@ -1236,6 +1236,7 @@ pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Optio
         .header("Content-Type", "application/json")
         .json(&body)
         .send();
+    let t0 = std::time::Instant::now();
     let resp = match tokio::time::timeout(
         std::time::Duration::from_secs(60),
         send_future,
@@ -1254,7 +1255,35 @@ pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Optio
         Ok(r) => r.ok()?,
         Err(_) => return None,
     };
-    serde_json::from_str::<Value>(&text).ok()
+    let parsed = serde_json::from_str::<Value>(&text).ok()?;
+
+    // AIOS: 把后台 reflection / critic / revise 这类辅助 LLM 调用的 token 用量
+    // 也落账到内核，与主链路一致，避免 `/usage` 漏计。background_call 没有 App
+    // 句柄，但 GLOBAL_OS 与 App.os 共享同一把内核锁，落账语义相同。
+    if let Some(usage_val) = parsed.get("usage")
+        && let Ok(usage) = serde_json::from_value::<request::StreamUsage>(usage_val.clone())
+    {
+        let echoed_model = parsed
+            .get("model")
+            .and_then(|m| m.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(model);
+        let latency_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        if let Some(os) = crate::ai::tools::os_tools::GLOBAL_OS
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+        {
+            let _ = request::charge_llm_usage_via_kernel(
+                &os,
+                echoed_model,
+                &usage.normalized(),
+                latency_ms,
+            );
+        }
+    }
+
+    Some(parsed)
 }
 
 pub(super) fn extract_back_content(v: &Value) -> Option<String> {

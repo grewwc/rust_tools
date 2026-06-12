@@ -55,6 +55,9 @@ pub struct ExperienceGeneralizer {
     pub(crate) experience_buffer: Vec<RawExperience>,
     max_buffer_size: usize,
     min_experiences_for_generalization: usize,
+    /// 最近一次 `try_generalize` 实际参与泛化的原始经验 `(category, note)`。
+    /// 用于在同步拼接结果之外，异步发起 LLM 二次提炼。
+    last_generalization_inputs: Vec<(String, String)>,
 }
 
 impl ExperienceGeneralizer {
@@ -64,6 +67,7 @@ impl ExperienceGeneralizer {
             experience_buffer: Vec::new(),
             max_buffer_size: 50,
             min_experiences_for_generalization: 3,
+            last_generalization_inputs: Vec::new(),
         };
         generalizer.load_principles_from_store();
         generalizer.load_experience_buffer_from_store();
@@ -226,7 +230,7 @@ impl ExperienceGeneralizer {
             return None;
         }
 
-        let (source_ids, domain, principle_text) = {
+        let (source_ids, domain, principle_text, source_notes) = {
             let mut grouped = self.group_by_semantic_similarity();
             let best_group = match grouped
                 .drain()
@@ -240,12 +244,19 @@ impl ExperienceGeneralizer {
 
             let domain = self.infer_domain(&best_group);
             let source_ids: Vec<String> = best_group.iter().map(|e| e.id.clone()).collect();
+            // 采集参与本次泛化的原始经验文本，供 LLM 二次提炼时作为上下文输入。
+            let source_notes: Vec<(String, String)> = best_group
+                .iter()
+                .map(|e| (e.category.clone(), e.note.clone()))
+                .collect();
             let principle_text = match self.synthesize_principle(&best_group, &domain) {
                 Some(t) => t,
                 None => return None,
             };
-            (source_ids, domain, principle_text)
+            (source_ids, domain, principle_text, source_notes)
         };
+        // 记录本次泛化的原始输入；调用方可在同步拼接结果之外，据此异步发起 LLM 二次提炼。
+        self.last_generalization_inputs = source_notes;
 
         let existing = self.find_similar_principle(&principle_text).cloned();
         if let Some(existing) = existing {
@@ -490,10 +501,17 @@ impl ExperienceGeneralizer {
         self.principles = principles;
     }
 
-    pub fn generate_generalization_prompt(&self, experiences: &[RawExperience]) -> String {
+    /// 取出最近一次泛化参与的原始经验（消费式：取走后清空），供异步 LLM 二次提炼。
+    pub(crate) fn take_last_generalization_inputs(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.last_generalization_inputs)
+    }
+
+    /// 构造 LLM 二次提炼的 prompt：把多条具体经验抽象成一条更高层、可跨场景复用的原则。
+    /// 入参为 `(category, note)` 列表，避免对外暴露内部 `RawExperience` 类型。
+    pub(crate) fn build_generalization_prompt(experiences: &[(String, String)]) -> String {
         let mut exp_text = String::new();
-        for (i, exp) in experiences.iter().enumerate() {
-            exp_text.push_str(&format!("{}. [{}] {}\n", i + 1, exp.category, exp.note));
+        for (i, (category, note)) in experiences.iter().enumerate() {
+            exp_text.push_str(&format!("{}. [{}] {}\n", i + 1, category, note));
         }
         format!(
             "You are an experience generalization engine. Given these specific experiences, \
@@ -508,6 +526,74 @@ impl ExperienceGeneralizer {
             exp_text
         )
     }
+
+    /// 用 LLM 二次提炼的结果覆写已存在的某条 principle（按 id 定位）。
+    /// 只更新 `principle` 文本与 `domain`，并将 abstraction_level 提升一档以反映"更高层抽象"；
+    /// confidence 取 LLM 给出值与原值的较大者，避免提炼反而降低可信度。重新持久化（同 id 覆写）。
+    pub(crate) fn refine_principle_in_place(
+        &mut self,
+        id: &str,
+        refined_principle: &str,
+        refined_domain: &str,
+        refined_confidence: Option<f64>,
+    ) {
+        let Some(p) = self.principles.iter_mut().find(|p| p.id == id) else {
+            return;
+        };
+        p.principle = refined_principle.to_string();
+        if !refined_domain.trim().is_empty() {
+            p.domain = refined_domain.to_string();
+        }
+        p.abstraction_level = p.abstraction_level.saturating_add(1).min(5);
+        if let Some(c) = refined_confidence {
+            p.confidence = c.clamp(0.0, 1.0).max(p.confidence);
+        }
+        p.last_reinforced = Local::now().to_rfc3339();
+        let snapshot = p.clone();
+        self.persist_principle(&snapshot);
+    }
+
+    /// 后台 LLM 二次提炼任务（自包含，可直接 `tokio::spawn`）。
+    ///
+    /// 同步路径产出的 principle 只是把若干条经验的 `Do:`/`Avoid:` 文本机械拼接，缺乏真正的
+    /// 抽象。这里用 LLM 把这些原始经验提炼成一条"更高层、可跨场景复用"的原则，并按同 id
+    /// 覆写持久化（召回从 MemoryStore 读取，因此覆写即生效）。
+    ///
+    /// 任何失败（无 API key、超时、JSON 不合法、principle 已被淘汰）都安静降级——同步拼接的
+    /// principle 仍然有效，与项目其余反思类能力一致的"优雅降级"哲学。
+    pub(crate) async fn run_llm_refine_background(
+        principle_id: String,
+        source_notes: Vec<(String, String)>,
+        model: String,
+        timeout_ms: u64,
+    ) {
+        if source_notes.is_empty() || principle_id.trim().is_empty() {
+            return;
+        }
+        let prompt = Self::build_generalization_prompt(&source_notes);
+        let messages = vec![serde_json::json!({"role": "user", "content": prompt})];
+        let content = match tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            crate::ai::driver::reflection::background_llm_call(&model, &messages),
+        )
+        .await
+        {
+            Ok(Some(c)) => c,
+            _ => return,
+        };
+        let Some((principle, domain, confidence)) = parse_refined_principle_json(&content) else {
+            return;
+        };
+        if principle.trim().is_empty() {
+            return;
+        }
+        // 重新加载（从 store 读取当前 principles），就地提炼后覆写同 id 条目。
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut generalizer = ExperienceGeneralizer::new();
+            generalizer.refine_principle_in_place(&principle_id, &principle, &domain, confidence);
+        }));
+    }
+
 
     fn group_by_semantic_similarity(&self) -> SkipMap<String, Vec<&RawExperience>> {
         let mut groups: SkipMap<String, Vec<&RawExperience>> = SkipMap::default();
@@ -683,6 +769,28 @@ impl ExperienceGeneralizer {
             (principle.effective_confidence().max(0.0).min(1.0) * 0.5 + 0.5).clamp(0.5, 1.0);
         (base * factor).round().clamp(0.0, 255.0) as u8
     }
+}
+
+/// 解析 LLM 二次提炼返回的 JSON：`{"principle":"...","domain":"...","confidence":0.7}`。
+/// 容忍 ```json ``` 代码围栏与前后多余文本——只截取第一个 `{` 到最后一个 `}`。
+/// 返回 `(principle, domain, confidence)`；解析失败返回 None。
+fn parse_refined_principle_json(content: &str) -> Option<(String, String, Option<f64>)> {
+    let start = content.find('{')?;
+    let end = content.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    let json_slice = &content[start..=end];
+    let v: serde_json::Value = serde_json::from_str(json_slice).ok()?;
+    let principle = v.get("principle")?.as_str()?.trim().to_string();
+    let domain = v
+        .get("domain")
+        .and_then(|d| d.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let confidence = v.get("confidence").and_then(|c| c.as_f64());
+    Some((principle, domain, confidence))
 }
 
 /// 用于 CJK / 短文本兜底相似度：把字符串切成 char-trigram 集合（首尾用空格 padding 一格）。
@@ -903,5 +1011,78 @@ mod tests {
             "cat: 编码标签不应直接作为 domain"
         );
         assert_eq!(domain, "tool_failure");
+    }
+
+    #[test]
+    fn parse_refined_principle_json_plain() {
+        let s = r#"{"principle":"Do: validate inputs at boundaries","domain":"api_design","confidence":0.8}"#;
+        let (p, d, c) = parse_refined_principle_json(s).expect("parsed");
+        assert_eq!(p, "Do: validate inputs at boundaries");
+        assert_eq!(d, "api_design");
+        assert_eq!(c, Some(0.8));
+    }
+
+    #[test]
+    fn parse_refined_principle_json_tolerates_fences_and_prose() {
+        let s = "Here is the result:\n```json\n{\"principle\":\"Avoid: unwrap on async results\",\"domain\":\"async_patterns\",\"confidence\":0.7}\n```\nDone.";
+        let (p, d, _c) = parse_refined_principle_json(s).expect("parsed");
+        assert_eq!(p, "Avoid: unwrap on async results");
+        assert_eq!(d, "async_patterns");
+    }
+
+    #[test]
+    fn parse_refined_principle_json_rejects_garbage() {
+        assert!(parse_refined_principle_json("not json at all").is_none());
+        assert!(parse_refined_principle_json("{\"domain\":\"x\"}").is_none()); // 缺 principle
+    }
+
+    #[test]
+    fn refine_principle_in_place_overwrites_and_bumps_abstraction() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "rt_generalization_refine_{}_{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let mut generalizer = ExperienceGeneralizer::new();
+        generalizer.principles.clear();
+        generalizer.principles.push(GeneralizedPrinciple {
+            id: "p_refine".to_string(),
+            principle: "Avoid: x led to failure; y led to failure".to_string(),
+            source_experiences: vec![],
+            domain: "tool_failure".to_string(),
+            abstraction_level: 1,
+            confidence: 0.6,
+            created_at: Local::now().to_rfc3339(),
+            last_reinforced: Local::now().to_rfc3339(),
+            reinforcement_count: 1,
+            cross_domain_links: vec![],
+        });
+
+        generalizer.refine_principle_in_place(
+            "p_refine",
+            "Avoid: relying on brittle exact-string matching; prefer structured checks",
+            "robustness",
+            Some(0.9),
+        );
+
+        let p = generalizer
+            .principles
+            .iter()
+            .find(|p| p.id == "p_refine")
+            .expect("principle still present");
+        assert!(p.principle.contains("structured checks"));
+        assert_eq!(p.domain, "robustness");
+        assert_eq!(p.abstraction_level, 2, "抽象层级应提升一档");
+        assert!((p.confidence - 0.9).abs() < f64::EPSILON);
+
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
     }
 }

@@ -1048,6 +1048,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // --generate-completions: 生成 shell 补全脚本（纯本地，不调 LLM）
+    if cli.generate_completions {
+        let shell = cli.args.first().cloned().unwrap_or_else(||
+            std::env::var("SHELL").unwrap_or_default().rsplit('/').next().unwrap_or("bash").to_string());
+        cli::generate_completion_script(&shell);
+        return Ok(());
+    }
+
     if cli.list_tools {
         let tool_summaries = super::tools::tool_summaries_for_groups(&["core"]);
         print::print_builtin_tool_summaries(&tool_summaries);
@@ -1063,6 +1071,20 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if cli.list_agents {
         let agent_manifests = agents::load_all_agents();
         commands::help::print_agents_list(&agent_manifests);
+        return Ok(());
+    }
+
+    // --generate-completions：输出 shell 补全脚本后退出。
+    // 必须在 ensure_models_available / load_config 之前处理，
+    // 这样即使 models.json 为空也能生成补全脚本。
+    if cli.generate_completions {
+        let shell = std::env::var("SHELL")
+            .unwrap_or_default()
+            .rsplit('/')
+            .next()
+            .unwrap_or("bash")
+            .to_string();
+        cli::generate_completion_script(&shell);
         return Ok(());
     }
 
@@ -1180,10 +1202,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return handle_note_save(&mut app).await;
     }
 
-    // 处理 --memo-search / -ms：只从知识库中检索 memo，不调用 LLM / 任何工具，
+    // 处理 --note-search / -ns：只从知识库中检索 memo，不调用 LLM / 任何工具，
     // 直接打印结果并退出。
-    if app.cli.memo_search {
+    if app.cli.note_search {
         return handle_memo_search(&app).await;
+    }
+    if app.cli.consolidate_knowledge {
+        return handle_consolidate_knowledge(&app).await;
     }
 
     let decision_log_path = app
@@ -1487,14 +1512,14 @@ impl Drop for SearchSpinner {
     }
 }
 
-/// 处理 --memo-search / -ms：从知识库中检索 memo 类条目，再用模型根据检索到的
+/// 处理 --note-search / -ns：从知识库中检索 memo 类条目，再用模型根据检索到的
 /// 内容总结、回答用户的问题（而不是直接堆砌原始条目）。
 async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     let query = app.cli.args.join(" ");
     let query = query.trim().to_string();
     if query.is_empty() {
-        eprintln!("[memo-search] 用法: a -ms <查询内容>");
-        return Err("memo-search requires a query".into());
+        eprintln!("[note-search] 用法: a -ns <查询内容>");
+        return Err("note-search requires a query".into());
     }
 
     // 安装远程 embedding provider（若已配置）。必须在任何 embedder::is_ready()
@@ -1512,7 +1537,7 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
         Ok(c) => c,
         Err(err) => {
             spinner.stop();
-            eprintln!("[memo-search] 检索失败: {}", err);
+            eprintln!("[note-search] 检索失败: {}", err);
             return Err(err.into());
         }
     };
@@ -1591,12 +1616,171 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
         }
         Err(err) => {
             spinner.stop();
-            eprintln!("[memo-search] 总结失败: {}", err);
+            eprintln!("[note-search] 总结失败: {}", err);
             Err(err.into())
         }
     }
 }
 
+/// 处理 --consolidate-knowledge：读取全部知识条目 → 模型分析 → 执行整理。
+///
+/// **优化策略**（避免 60s 超时）：
+/// 1. 只分析优先级 < 200 的条目（≥200 受保护）
+/// 2. 按时间倒序取**最近 15 条**（之前 30 条还是太多）
+/// 3. 每条内容截断到**40 字**（之前 80 字）
+/// 4. 用 JSON 数组格式（比文本格式更省 token）
+/// 5. 英文 system prompt（模型响应更快）
+async fn handle_consolidate_knowledge(app: &App) -> Result<(), Box<dyn std::error::Error>> {
+    use chrono::Local;
+    use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
+    use serde_json::Value;
+
+    let store = MemoryStore::from_env_or_config();
+    let all_entries = store.all().map_err(|e| format!("读取失败：{}", e))?;
+
+    if all_entries.is_empty() {
+        println!("📭 知识库为空，无需整理。");
+        return Ok(());
+    }
+
+    // 过滤：优先级 < 200 的才分析；按时间倒序；取最近 15 条
+    let mut candidates: Vec<&AgentMemoryEntry> = all_entries.iter()
+        .filter(|e| e.priority.unwrap_or(100) < 200)
+        .collect();
+    candidates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    candidates.truncate(15);
+
+    if candidates.is_empty() {
+        println!("📭 没有可整理的条目（全部优先级 ≥ 200，已保护）。");
+        return Ok(());
+    }
+
+    // 构建紧凑的 JSON 数组（比文本格式更省 token）
+    let mut entries_json = Vec::new();
+    for entry in &candidates {
+        let id = entry.id.as_deref().unwrap_or("unknown");
+        let prio = entry.priority.unwrap_or(100);
+        let ts_short: String = entry.timestamp.chars().take(10).collect();
+        let preview: String = if entry.note.chars().count() > 40 {
+            entry.note.chars().take(40).collect::<String>() + "…"
+        } else { entry.note.clone() };
+        entries_json.push(serde_json::json!({
+            "id": id,
+            "cat": entry.category,
+            "pri": prio,
+            "tags": entry.tags,
+            "date": ts_short,
+            "src": entry.source.as_deref().unwrap_or(""),
+            "text": preview,
+        }));
+    }
+
+    let sys = "You are a knowledge curator. Analyze entries and suggest deletions/merges.\n\
+        Return ONLY valid JSON:\n\
+        {\"reasoning\":\"1-sentence summary\",\"delete_ids\":[\"id1\",\"id2\"],\"merge_plan\":[{\"ids\":[\"id1\",\"id2\"],\"merged_content\":\"...\"}]}\n\
+        Rules: delete duplicates/obsolete; merge related; keep useful. Priority>=200 already filtered out.";
+
+    let prompt = format!("Analyze these {} entries:\n{}", candidates.len(), serde_json::to_string(&entries_json).unwrap());
+    let messages = vec![
+        serde_json::json!({"role": "system", "content": sys}),
+        serde_json::json!({"role": "user", "content": prompt})
+    ];
+
+    // 知识整理用主模型（用户的默认对话模型）。走流式链路：响应头立即返回、
+    // 数据按 chunk 增量到达，避免非流式"等整段 body 生成完"被 60s 超时撑爆。
+    let model = crate::ai::models::initial_model(&app.cli);
+    let spinner = SearchSpinner::start("整理知识库");
+    let raw = match crate::ai::request::do_request_text_streaming(app, &model, &messages).await {
+        Ok(text) => {
+            spinner.stop();
+            text
+        }
+        Err(err) => {
+            spinner.stop();
+            eprintln!("[consolidate] Request failed: {}", err);
+            return Err(err);
+        }
+    };
+
+    let raw = raw.trim();
+    let cleaned = raw
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+
+    if cleaned.is_empty() || raw.is_empty() {
+        println!("⚠  Empty response. No changes.");
+        return Ok(());
+    }
+
+    let plan: Value = match serde_json::from_str(cleaned) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[consolidate] JSON parse error: {}", e);
+            eprintln!("[consolidate] Raw: {}", raw.chars().take(200).collect::<String>());
+            return Ok(());
+        }
+    };
+
+    if let Some(reasoning) = plan["reasoning"].as_str() {
+        println!("\n🔍 {}\n", reasoning);
+    }
+
+    let delete_ids: Vec<&str> = plan["delete_ids"]
+        .as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let merge_plan: Vec<&Value> = plan["merge_plan"]
+        .as_array().map(|a| a.iter().collect())
+        .unwrap_or_default();
+
+    if delete_ids.is_empty() && merge_plan.is_empty() {
+        println!("✅ Already well-organized. Nothing to change.");
+        return Ok(());
+    }
+
+    // 执行删除
+    if !delete_ids.is_empty() {
+        let refs: Vec<&str> = delete_ids;
+        match store.delete_by_ids(&refs) {
+            Ok(n) => println!("🗑  Deleted {} entries", n),
+            Err(e) => eprintln!("  Delete error: {}", e),
+        }
+    }
+
+    // 执行合并（merge_plan 里的每组 IDs 合并为一条）
+    if !merge_plan.is_empty() {
+        let mut merged_count = 0;
+        let mut new: Vec<AgentMemoryEntry> = Vec::new();
+        for item in &merge_plan {
+            let ids: Vec<&str> = item["ids"].as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            let content = item["merged_content"].as_str().unwrap_or("");
+            if ids.is_empty() || content.is_empty() { continue; }
+            merged_count += ids.len();
+            new.push(AgentMemoryEntry {
+                id: None,
+                timestamp: Local::now().to_rfc3339(),
+                category: "user_memory".into(),
+                note: content.into(),
+                tags: vec!["consolidated".into()],
+                source: None,
+                priority: Some(150),
+                owner_pid: None, owner_pgid: None, image_path: None,
+            });
+        }
+        if !new.is_empty() {
+            match store.append_batch(&new) {
+                Ok(n) => println!("💾 Merged {} entries into {} new", merged_count, n),
+                Err(e) => eprintln!("  Merge save error: {}", e),
+            }
+        }
+    }
+
+    println!("\n✨ Done.");
+    Ok(())
+}
 /// 处理 --note-delete / -nd <一段话>：用模型在知识库中匹配最相关的 memo 条目，
 /// 找到对应 id，删除前请用户确认。
 async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -1797,6 +1981,13 @@ async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn st
 async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
+    // 状态行着色：与黑底白字的 note 正文区分开。
+    const NE: &str = "\x1b[1;36m[note-edit]\x1b[0m"; // 青色加粗标签
+    const FIELD: &str = "\x1b[2m"; // 字段名（id/时间/内容）暗灰
+    const HINT: &str = "\x1b[1;32m"; // 操作提示绿色加粗
+    const IDX: &str = "\x1b[1;33m"; // 候选编号黄色加粗
+    const RST: &str = "\x1b[0m";
+
     // 拼接查询：flag 的值 + 其余位置参数；都为空时进入多行输入框。
     let mut query = query.trim().to_string();
     if !app.cli.args.is_empty() {
@@ -1808,7 +1999,7 @@ async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std:
     }
     let query = query.trim().to_string();
     let query = if query.is_empty() {
-        println!("[note-edit] 请描述你想修改的内容（多行；提交后开始匹配，留空取消）：");
+        println!("{NE} 请描述你想修改的内容（多行；提交后开始匹配，留空取消）：");
         let input = match app.prompt_editor.as_mut() {
             Some(editor) => editor.read_multi_line().ok().flatten(),
             None => None,
@@ -1816,7 +2007,7 @@ async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std:
         match input {
             Some(s) if !s.trim().is_empty() => s.trim().to_string(),
             _ => {
-                eprintln!("[note-edit] 未输入任何内容，已取消");
+                eprintln!("{NE} 未输入任何内容，已取消");
                 return Ok(());
             }
         }
@@ -1824,16 +2015,21 @@ async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std:
         query
     };
 
+    // 检索 + 模型匹配都可能耗时，给一个状态条动画（输出前自动清除），与 -ns 一致。
+    let spinner = SearchSpinner::start("匹配知识库条目");
+
     // 检索候选条目。
     let candidates = match crate::ai::tools::service::memory::search_memo_candidates(&query, 10) {
         Ok(c) => c,
         Err(err) => {
-            eprintln!("[note-edit] 检索失败: {}", err);
+            spinner.stop();
+            eprintln!("{NE} 检索失败: {}", err);
             return Err(err.into());
         }
     };
     if candidates.is_empty() {
-        println!("[note-edit] 没有找到与「{}」相关的可修改 memo 条目。", query);
+        spinner.stop();
+        println!("{NE} 没有找到与「{}」相关的可修改 memo 条目。", query);
         return Ok(());
     }
 
@@ -1859,6 +2055,7 @@ async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std:
         }),
     ];
 
+    let mut matched_err: Option<String> = None;
     let chosen =
         match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
             Ok(response) => response
@@ -1867,10 +2064,14 @@ async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std:
                 .map(|s| s.trim().to_string())
                 .unwrap_or_default(),
             Err(err) => {
-                eprintln!("[note-edit] 模型匹配失败: {}", err);
+                matched_err = Some(format!("{}", err));
                 String::new()
             }
         };
+    spinner.stop();
+    if let Some(err) = matched_err {
+        eprintln!("{NE} 模型匹配失败: {}", err);
+    }
 
     // 解析模型返回的编号集合。
     let parse_indices = |s: &str, max: usize| -> Vec<usize> {
@@ -1901,7 +2102,7 @@ async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std:
 
     let mut matched = parse_indices(&chosen, candidates.len());
     if matched.is_empty() {
-        println!("[note-edit] 模型未能从候选中确定要修改的条目，已取消。可换个更具体的描述重试。");
+        println!("{NE} 模型未能从候选中确定要修改的条目，已取消。可换个更具体的描述重试。");
         return Ok(());
     }
 
@@ -1909,30 +2110,30 @@ async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std:
     let target_idx = if matched.len() == 1 {
         matched[0]
     } else {
-        println!("\n[note-edit] 匹配到以下 {} 条条目：", matched.len());
+        println!("\n{NE} 匹配到以下 {IDX}{}{RST} 条条目：", matched.len());
         for (n, &ci) in matched.iter().enumerate() {
             let e = &candidates[ci];
-            println!("  [{}]", n + 1);
+            println!("  {IDX}[{}]{RST}", n + 1);
             if let Some(id) = e.id.as_deref().filter(|s| !s.is_empty()) {
-                println!("    id: {}", id);
+                println!("    {FIELD}id:{RST} {}", id);
             }
-            println!("    时间: {}", e.timestamp);
-            println!("    内容: {}", e.note.chars().take(500).collect::<String>());
+            println!("    {FIELD}时间:{RST} {}", e.timestamp);
+            println!("    {FIELD}内容:{RST} {}", e.note.chars().take(500).collect::<String>());
         }
-        print!("\n请输入要修改的编号（只能选一条；n=取消）: ");
+        print!("\n{HINT}请输入要修改的编号（只能选一条；n=取消）:{RST} ");
         std::io::stdout().flush().ok();
         let mut answer = String::new();
         std::io::stdin().read_line(&mut answer).ok();
         let answer = answer.trim().to_lowercase();
         if answer == "n" || answer == "no" || answer == "q" || answer == "cancel" {
-            println!("[note-edit] 已取消，未修改任何内容。");
+            println!("{NE} 已取消，未修改任何内容。");
             return Ok(());
         }
         let picks = parse_indices(&answer, matched.len());
         match picks.first() {
             Some(&p) => matched.remove(p),
             None => {
-                println!("[note-edit] 未识别到有效编号，已取消，未修改任何内容。");
+                println!("{NE} 未识别到有效编号，已取消，未修改任何内容。");
                 return Ok(());
             }
         }
@@ -1941,11 +2142,11 @@ async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std:
     let target = candidates[target_idx].clone();
 
     // 在编辑器中预填原文，让用户改写。
-    println!("\n[note-edit] 将打开编辑器修改以下条目（原文已预填；留空或不改动即取消）：");
+    println!("\n{NE} 将打开编辑器修改以下条目（原文已预填；留空或不改动即取消）：");
     if let Some(id) = target.id.as_deref().filter(|s| !s.is_empty()) {
-        println!("    id: {}", id);
+        println!("    {FIELD}id:{RST} {}", id);
     }
-    println!("    时间: {}", target.timestamp);
+    println!("    {FIELD}时间:{RST} {}", target.timestamp);
 
     let new_note = match app.prompt_editor.as_mut() {
         Some(editor) => {
@@ -1957,22 +2158,22 @@ async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std:
     let new_note = match new_note {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => {
-            println!("[note-edit] 未输入新内容，已取消。");
+            println!("{NE} 未输入新内容，已取消。");
             return Ok(());
         }
     };
     if new_note == target.note.trim() {
-        println!("[note-edit] 内容未变化，已取消。");
+        println!("{NE} 内容未变化，已取消。");
         return Ok(());
     }
 
     match crate::ai::tools::service::memory::update_memo_entry(&target, &new_note) {
         Ok(_) => {
-            println!("[note-edit] 已更新该条目。");
+            println!("{NE} 已更新该条目。");
             Ok(())
         }
         Err(err) => {
-            eprintln!("[note-edit] 更新失败: {}", err);
+            eprintln!("{NE} 更新失败: {}", err);
             Err(err.into())
         }
     }

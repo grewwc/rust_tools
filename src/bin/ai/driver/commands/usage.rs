@@ -109,9 +109,14 @@ fn print_window(window: Option<u64>) {
     let label = window_label(window);
     match store::query_totals(window) {
         Some(t) => {
+            // 表头行的标签列宽度与下方模型行的列宽度对齐：
+            // 表头 = 2 空格 + 22 宽标签 = 24；模型行 = 6 空格 + 18 宽模型名 = 24。
+            // 这样 calls/in/out/total 各列在表头与模型行之间垂直对齐。列宽收窄到
+            // 实际内容尺寸（模型名 ≤17 字符、缩写数字 ≤5 字符），整行约 77 列，
+            // 避免在 80 列终端里把 total= 的值折到下一行。
             println!(
-                "  [{}] calls={:>6}  in={:>10}  out={:>10}  total={:>10}",
-                label,
+                "  {:<22} calls={:>6}  in={:>7}  out={:>7}  total={:>7}",
+                format!("[{}]", label),
                 format_number(t.calls),
                 format_number(t.input),
                 format_number(t.output),
@@ -120,7 +125,7 @@ fn print_window(window: Option<u64>) {
             if let Some(rows) = store::query_by_model(window) {
                 for r in rows.iter().filter(|r| r.calls > 0) {
                     println!(
-                        "      {:<28} calls={:>6}  in={:>10}  out={:>10}  total={:>10}",
+                        "      {:<18} calls={:>6}  in={:>7}  out={:>7}  total={:>7}",
                         r.model,
                         format_number(r.calls),
                         format_number(r.input),
@@ -144,12 +149,12 @@ fn print_daily_breakdown(days: u64) {
         Some(rows) => {
             println!("  [daily last {}d]", days);
             println!(
-                "      {:<12} {:>6}  {:>10}  {:>10}  {:>10}",
+                "      {:<12} {:>6}  {:>7}  {:>7}  {:>7}",
                 "date", "calls", "in", "out", "total"
             );
             for r in &rows {
                 println!(
-                    "      {:<12} {:>6}  {:>10}  {:>10}  {:>10}",
+                    "      {:<12} {:>6}  {:>7}  {:>7}  {:>7}",
                     r.day,
                     format_number(r.calls),
                     format_number(r.input),

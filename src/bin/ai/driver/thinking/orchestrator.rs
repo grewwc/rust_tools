@@ -143,15 +143,16 @@ impl ThinkingOrchestrator {
             }
         }
 
-        if !success {
-            let safe_snippet: String = result.chars().take(200).collect();
-            self.generalizer.ingest_experience(
-                "failure",
-                &format!("Avoid: {} led to failure - {}", tool_name, safe_snippet),
-                &[tool_name.to_string()],
-                None,
-            );
-        }
+        // 注意：这里**不再**把工具失败自动 ingest 成经验。
+        //
+        // 之前的做法是把失败结果截 200 字、拼成 `Avoid: <tool> led to failure - <原始报错>`
+        // 喂给 generalizer。但这类输入本质是"实例特定"的噪音——退出码、具体用例名、路径、
+        // 行号都只属于那一次运行，对未来零复用价值；而 synthesize_principle 又只做字符串
+        // 拼接、不做抽象，于是这些噪音会原样流进"泛化原则"并在后续 turn 注入，反而误导模型。
+        //
+        // 真正可泛化的经验只应来自模型**有意识总结**的 self-note（process_self_note 里以
+        // `Do:`/`Avoid:` 开头的结构化记录）。工具失败的运行时信号交给 TreeOfThoughts 打分
+        // 与 VerificationLoop 记录即可，不进入长期记忆。
     }
 
     pub fn process_self_note(&mut self, note: &str) {
@@ -177,8 +178,12 @@ impl ThinkingOrchestrator {
     pub fn try_generalize(&mut self) -> Option<GeneralizeResult> {
         let principle = self.generalizer.try_generalize()?;
         self.generalizer.persist_principle(&principle);
+        // 取出本次参与泛化的原始经验，供调用方异步发起 LLM 二次提炼。
+        let source_notes = self.generalizer.take_last_generalization_inputs();
         Some(GeneralizeResult {
             principle_text: principle.principle.clone(),
+            principle_id: principle.id.clone(),
+            source_notes,
         })
     }
 
@@ -379,6 +384,55 @@ impl ThinkingOrchestrator {
 
 pub struct GeneralizeResult {
     pub principle_text: String,
+    /// 本次泛化产出/强化的 principle id（用于 LLM 二次提炼时按 id 覆写）。
+    pub principle_id: String,
+    /// 本次参与泛化的原始经验 `(category, note)`，作为 LLM 二次提炼的上下文。
+    pub source_notes: Vec<(String, String)>,
+}
+
+/// 读取配置并在后台 spawn LLM 二次提炼任务。
+///
+/// 仅在存在 tokio 运行时（即真实 agent 运行环境）且配置开启时生效；单测等无运行时的
+/// 同步上下文会直接跳过，不影响同步拼接的 principle。
+fn maybe_spawn_llm_refine(result: &GeneralizeResult) {
+    use crate::ai::config_schema::AiConfig;
+
+    if result.source_notes.is_empty() {
+        return;
+    }
+    let cfg = crate::commonw::configw::get_all_config();
+    // 默认开启；显式设为 false 时关闭。
+    let enabled = cfg
+        .get_opt(AiConfig::GENERALIZE_LLM_REFINE_ENABLE)
+        .map(|v| !v.trim().eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    if !enabled {
+        return;
+    }
+    // 只有在 tokio 运行时内才能 spawn；无运行时（单测）直接跳过。
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let model = cfg
+        .get_opt(AiConfig::GENERALIZE_LLM_REFINE_MODEL)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "qwen3.5-flash".to_string());
+    let timeout_ms = cfg
+        .get_opt(AiConfig::GENERALIZE_LLM_REFINE_TIMEOUT_MS)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(8000);
+
+    let principle_id = result.principle_id.clone();
+    let source_notes = result.source_notes.clone();
+    handle.spawn(async move {
+        crate::ai::driver::thinking::generalization::ExperienceGeneralizer::run_llm_refine_background(
+            principle_id,
+            source_notes,
+            model,
+            timeout_ms,
+        )
+        .await;
+    });
 }
 
 #[derive(Debug, Clone)]
@@ -591,6 +645,10 @@ impl TurnObserver for ThinkingOrchestrator {
                 "[Thinking] Generalized principle: {}",
                 result.principle_text
             ));
+            // 同步拼接出的 principle 缺乏真正抽象。若开启 LLM 二次提炼，则在后台用 LLM 把
+            // 参与本次泛化的原始经验提炼成更高层、可复用的原则，并按同 id 覆写持久化。
+            // 后台失败时安静降级，已落库的同步 principle 仍有效。
+            maybe_spawn_llm_refine(result);
         }
 
         if generalized.is_some() && self.try_cross_domain_link().is_some() {

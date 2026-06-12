@@ -43,6 +43,11 @@ struct RequestBody<'a> {
     reasoning_effort: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<Value>,
+    /// 流式请求显式索取 usage 统计：`{ "include_usage": true }`。
+    /// 部分 provider（已知 DashScope compatible-mode）流式下默认不返回 `usage`，
+    /// 必须显式声明，否则 token 用量无法统计、`/usage` 会漏计。非流式时为 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<Value>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -583,7 +588,7 @@ pub(super) fn clear_stale_request_interrupt_before_request(app: &App) {
     }
 }
 
-fn control_model_for_aux_tasks(app: &App) -> String {
+pub(super) fn control_model_for_aux_tasks(app: &App) -> String {
     app.config
         .intent_model
         .as_deref()
@@ -1855,6 +1860,9 @@ fn build_request_body<'a>(
     reasoning_effort: Option<&'a str>,
 ) -> RequestBody<'a> {
     let provider = models::model_provider(model);
+    // 流式请求显式索取 usage：部分 provider（DashScope compatible-mode）流式下
+    // 默认不返回 usage，必须声明 stream_options.include_usage 才能统计 token。
+    let stream_options = stream.then(|| json!({ "include_usage": true }));
     match provider {
         ApiProvider::Compatible => RequestBody {
             model,
@@ -1866,6 +1874,7 @@ fn build_request_body<'a>(
             tool_choice,
             reasoning_effort: None,
             reasoning: reasoning_effort.map(|effort| json!({ "effort": effort })),
+            stream_options,
         },
         _ => RequestBody {
             model,
@@ -1877,6 +1886,7 @@ fn build_request_body<'a>(
             tool_choice,
             reasoning_effort: reasoning_effort.filter(|_| provider.is_openai()),
             reasoning: None,
+            stream_options,
         },
     }
 }
@@ -1949,6 +1959,14 @@ pub async fn do_request_json(
         "messages": messages,
         "stream": stream,
     });
+
+    // 兼容（Qwen 等）provider 默认开启 thinking，会生成超长推理链。
+    // 非流式辅助请求（意图识别、知识整理等）必须等整段生成完才返回响应头，
+    // thinking 链一长就撑爆 60s 超时、重试也只是重复同样的慢生成。
+    // 因此这里显式关闭 thinking，与后台 background_call 保持一致。
+    if models::model_provider(model) == ApiProvider::Compatible {
+        request_body["enable_thinking"] = json!(false);
+    }
 
     // reasoning_effort：仅在未跳过且 provider 为 OpenAI 兼容时注入。
     if !skip_reasoning_effort {
@@ -2031,6 +2049,167 @@ pub async fn do_request_json(
     }
 
     Err("request failed after all attempts".into())
+}
+
+/// 流式聚合请求：发起 `stream: true` 请求，逐 chunk 累积 `delta.content`，
+/// 最终返回拼接好的完整文本。
+///
+/// 相比非流式的 [`do_request_json`]，流式链路的响应头会立即返回、数据按
+/// chunk 增量到达，因此**不会**被"等服务端整段 body 生成完"撑爆超时。
+/// 这里用「单 chunk 空闲超时」兜底：只要持续有数据到达就一直读，连续
+/// `STREAM_RESPONSE_HEADER_TIMEOUT_SECS` 秒没有任何 chunk 才判定卡死。
+///
+/// 适用于知识整理这类「只需要最终完整 JSON、不需要实时终端渲染」的辅助任务。
+pub async fn do_request_text_streaming(
+    app: &App,
+    model: &str,
+    messages: &[serde_json::Value],
+) -> Result<String, Box<dyn std::error::Error>> {
+    clear_stale_request_interrupt_before_request(app);
+
+    let mut request_body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+        // 显式索取流式 usage：DashScope compatible-mode 流式默认不返回 usage，
+        // 不声明 include_usage 就无法统计 token、`/usage` 会漏计本次调用。
+        "stream_options": { "include_usage": true },
+    });
+
+    // 兼容（Qwen 等）provider 默认开启 thinking：流式下推理链以 reasoning_content
+    // 分片到达，而本函数只聚合 delta.content。思考阶段会让 content 长时间为空、
+    // spinner 一直转，表现为"卡死"。consolidate 是结构化 JSON 任务，关闭 thinking。
+    if models::model_provider(model) == ApiProvider::Compatible {
+        request_body["enable_thinking"] = json!(false);
+    }
+
+    for attempt in 1..=REQUEST_MAX_ATTEMPTS {
+        let endpoint = endpoint_for_request_model(app, model);
+        let api_key = api_key_for_request_model(app, model);
+        let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send();
+        // 等待响应头：握手 + 服务端开始返回。流式下这一步很快。
+        let mut response = match tokio::time::timeout(
+            Duration::from_secs(STREAM_RESPONSE_HEADER_TIMEOUT_SECS),
+            send_future,
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
+                if resp.status().is_success() {
+                    resp
+                } else {
+                    let status = resp.status();
+                    let body = (resp.text().await).unwrap_or_default();
+                    let err = RequestError::status(status, body);
+                    if should_retry_status(status) && attempt < REQUEST_MAX_ATTEMPTS {
+                        let delay = retry_delay(attempt);
+                        if sleep_with_cancel(app, delay).await {
+                            return Err(Box::new(RequestError::cancelled(
+                                "request canceled by user during retry wait",
+                            )));
+                        }
+                        continue;
+                    }
+                    return Err(err.into());
+                }
+            }
+            Ok(Err(err)) => {
+                if is_retryable_reqwest_error(&err) && attempt < REQUEST_MAX_ATTEMPTS {
+                    let delay = retry_delay(attempt);
+                    if sleep_with_cancel(app, delay).await {
+                        return Err(Box::new(RequestError::cancelled(
+                            "request canceled by user during retry wait",
+                        )));
+                    }
+                    continue;
+                }
+                return Err(err.into());
+            }
+            Err(_) => {
+                if attempt < REQUEST_MAX_ATTEMPTS {
+                    eprintln!(
+                        "[Warning] do_request_text_streaming 等待响应头超时 ({}s), retrying (attempt {}/{})",
+                        STREAM_RESPONSE_HEADER_TIMEOUT_SECS, attempt, REQUEST_MAX_ATTEMPTS
+                    );
+                    continue;
+                }
+                return Err("do_request_text_streaming: all attempts timed out".into());
+            }
+        };
+
+        // 逐 chunk 读取并聚合 delta.content。
+        let mut content = String::new();
+        let mut buffer: Vec<u8> = Vec::new();
+        let mut idle_timed_out = false;
+        // final chunk 携带的 usage（OpenAI 兼容流式：通常在 choices 为空的尾包返回）。
+        let mut pending_usage: Option<(String, StreamUsage)> = None;
+        let t0 = std::time::Instant::now();
+        loop {
+            let chunk = match tokio::time::timeout(
+                Duration::from_secs(STREAM_RESPONSE_HEADER_TIMEOUT_SECS),
+                response.chunk(),
+            )
+            .await
+            {
+                Ok(Ok(Some(bytes))) => bytes,
+                Ok(Ok(None)) => break, // 流正常结束
+                Ok(Err(_)) => break,   // 读取错误：用已聚合内容
+                Err(_) => {
+                    idle_timed_out = true;
+                    break;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+            // 按行切分，逐行解析 SSE `data:` 负载。
+            while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = buffer.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&line);
+                let trimmed = line.trim();
+                let Some(payload) = trimmed.strip_prefix("data:") else {
+                    continue;
+                };
+                let payload = payload.trim();
+                if payload.is_empty() || payload == "[DONE]" {
+                    continue;
+                }
+                if let Ok(chunk) = serde_json::from_str::<StreamChunk>(payload) {
+                    // 捕获 usage：OpenAI 兼容流式把最终 usage 放在 choices 为空的尾包，
+                    // 必须在取 choice 之前先 take 出来，否则会漏计。
+                    if let Some(usage) = chunk.usage {
+                        pending_usage = Some((chunk.model.clone(), usage.normalized()));
+                    }
+                    if let Some(choice) = chunk.choices.into_iter().next() {
+                        content.push_str(&choice.delta.content);
+                    }
+                }
+            }
+        }
+
+        // AIOS: 把本次流式辅助请求的 usage 落账到内核 `/dev/llm`，与主链路一致。
+        if let Some((echoed_model, usage)) = pending_usage {
+            let model_for_pricing = if echoed_model.is_empty() {
+                model
+            } else {
+                echoed_model.as_str()
+            };
+            let latency_ms = t0.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            let _ = charge_llm_usage_to_kernel(app, model_for_pricing, &usage, latency_ms);
+        }
+
+        if idle_timed_out && content.is_empty() && attempt < REQUEST_MAX_ATTEMPTS {
+            eprintln!(
+                "[Warning] do_request_text_streaming chunk 空闲超时 ({}s) 且无内容, retrying (attempt {}/{})",
+                STREAM_RESPONSE_HEADER_TIMEOUT_SECS, attempt, REQUEST_MAX_ATTEMPTS
+            );
+            continue;
+        }
+        return Ok(content);
+    }
+
+    Err("do_request_text_streaming: failed after all attempts".into())
 }
 
 pub(super) async fn summarize_history_via_model(
@@ -2204,6 +2383,18 @@ pub(crate) fn charge_llm_usage_to_kernel(
     usage: &StreamUsage,
     latency_ms: u64,
 ) -> Option<aios_kernel::primitives::LlmAccountOutcome> {
+    charge_llm_usage_via_kernel(&app.os, requested_model, usage, latency_ms)
+}
+
+/// 与 [`charge_llm_usage_to_kernel`] 等价，但直接接受一个 `SharedKernel`。
+/// 供没有 `App` 句柄的调用方（如后台 reflection 的 `background_call`）使用——
+/// `GLOBAL_OS` 与 `App.os` 共享同一把 `Arc<Mutex<Kernel>>`，落账语义一致。
+pub(crate) fn charge_llm_usage_via_kernel(
+    os: &aios_kernel::kernel::SharedKernel,
+    requested_model: &str,
+    usage: &StreamUsage,
+    latency_ms: u64,
+) -> Option<aios_kernel::primitives::LlmAccountOutcome> {
     // Fast path: a zero-usage report is noise.
     if usage.prompt_tokens == 0 && usage.completion_tokens == 0 {
         return None;
@@ -2223,7 +2414,7 @@ pub(crate) fn charge_llm_usage_to_kernel(
     // 在内核里落账（计费 + rusage + trace + 追加审计账本），同时拿出本次需要
     // drain 落库的增量记录。SQLite I/O 放到 guard 释放之后，避免持内核锁做磁盘写。
     let (outcome, drained, head) = {
-        let mut guard = match app.os.lock() {
+        let mut guard = match os.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
