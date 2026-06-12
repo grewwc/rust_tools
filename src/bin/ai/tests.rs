@@ -985,7 +985,7 @@ fn mid_turn_compress_preserves_latest_user_message() {
         },
     ];
 
-    let (compressed, before, after) = mid_turn_compress(messages, 4000);
+    let (compressed, before, after) = mid_turn_compress(messages, 4000, None);
     assert!(after <= before, "compression should not expand payload");
 
     let has_latest_user = compressed
@@ -995,6 +995,85 @@ fn mid_turn_compress_preserves_latest_user_message() {
         has_latest_user,
         "mid-turn compression must preserve the latest user message"
     );
+}
+
+#[test]
+fn mid_turn_compress_spills_non_compressible_outputs_when_overflow_dir_present() {
+    // 回归测试：mid-turn 压缩传入 overflow_dir 后，read_file 等「不可压缩」
+    // 工具的大输出应被零压缩外溢到会话文件 + 留预览 stub，从而真正降低字符数。
+    // 历史 bug：mid-turn 走 None overflow_dir，这类输出既不能裁剪也不能外溢，
+    // 只能原样堆在上下文里，导致每轮只压掉零星几 K（用户报告"压不动"）。
+    let overflow_dir =
+        std::env::temp_dir().join(format!("ai-midturn-overflow-{}", uuid::Uuid::new_v4()));
+    let mut messages = vec![Message {
+        role: "system".to_string(),
+        content: Value::String("system prompt".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    // 10 组 read_file 调用，每条结果 8000 字符，远端组（非最近 6 条）应被外溢。
+    for i in 0..10usize {
+        let id = format!("call_{i}");
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: id.clone(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: format!(
+                        r#"{{"filePath":"src/lib.rs","startLine":{},"endLine":{}}}"#,
+                        i + 1,
+                        i + 40
+                    ),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+        messages.push(Message {
+            role: "tool".to_string(),
+            content: Value::String("y".repeat(8000)),
+            tool_calls: None,
+            tool_call_id: Some(id),
+            reasoning_content: None,
+        });
+    }
+
+    let before = messages
+        .iter()
+        .map(|m| m.content.as_str().map(|s| s.chars().count()).unwrap_or(0))
+        .sum::<usize>();
+    let (compressed, reported_before, reported_after) =
+        mid_turn_compress(messages, 36_000, Some(overflow_dir.as_path()));
+
+    assert!(reported_before >= before);
+    assert!(
+        reported_after < reported_before,
+        "mid-turn compression with overflow_dir must shrink payload \
+         (before={reported_before}, after={reported_after})"
+    );
+    // 应出现 read_file 外溢 stub，且其指向的文件真实存在（全文零压缩保存）。
+    let stub = compressed
+        .iter()
+        .find_map(|m| {
+            let text = m.content.as_str()?;
+            text.contains("Output preserved for non-compressible tool `read_file`")
+                .then_some(text.to_string())
+        })
+        .expect("expected preserved read_file overflow stub in mid-turn compression");
+    let file_path = stub
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("- file_path: "))
+        .expect("stub should contain overflow file path");
+    assert!(
+        std::path::Path::new(file_path).exists(),
+        "overflow file from mid-turn stub should exist: {file_path}"
+    );
+
+    let _ = std::fs::remove_dir_all(&overflow_dir);
 }
 
 #[test]
@@ -1044,7 +1123,7 @@ fn large_image_does_not_evict_tool_history_from_budget() {
 
     // soft_threshold 36K：若图片仍按 base64 长度计费（900K），会判为超额并
     // 触发压缩，把 tool 结果删掉。修复后图片仅计 ~1K，总预算远低于阈值。
-    let (compressed, before, after) = mid_turn_compress(messages, 36_000);
+    let (compressed, before, after) = mid_turn_compress(messages, 36_000, None);
     assert!(
         before <= 36_000,
         "image must not dominate the char budget (got {before})"
@@ -1129,7 +1208,7 @@ fn mid_turn_compress_preserves_recent_two_user_messages() {
         },
     ];
 
-    let (compressed, before, after) = mid_turn_compress(messages, 4_000);
+    let (compressed, before, after) = mid_turn_compress(messages, 4_000, None);
     assert!(after <= before, "compression should not expand payload");
 
     let has_previous_user = compressed
@@ -1222,7 +1301,7 @@ fn mid_turn_compress_prefers_three_recent_user_turns_when_context_is_small_enoug
         },
     ];
 
-    let (compressed, _before, _after) = mid_turn_compress(messages, 4_000);
+    let (compressed, _before, _after) = mid_turn_compress(messages, 4_000, None);
 
     let has_user2 = compressed
         .iter()
@@ -1312,7 +1391,7 @@ fn mid_turn_compress_keeps_tool_pairs_consistent() {
         },
     ];
 
-    let (compressed, _before, _after) = mid_turn_compress(messages, 4_000);
+    let (compressed, _before, _after) = mid_turn_compress(messages, 4_000, None);
 
     let mut assistant_tool_ids = SkipSet::default();
     for message in &compressed {

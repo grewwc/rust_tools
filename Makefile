@@ -40,9 +40,16 @@ install-completions:
 	  zsh) \
 		DST="$${HOME}/.zfunc"; \
 		mkdir -p "$$DST"; \
-		"$$A_BIN" --generate-completions zsh > "$$DST/_a"; \
+		"$$A_BIN" --generate-completions zsh > "$$DST/_a" && \
+		line="fpath=($$DST \$$fpath)"; \
+		if ! grep -qF "fpath=($$DST " "$${HOME}/.zshrc" 2>/dev/null; then \
+			{ echo ""; echo "# a 命令补全"; echo "$$line"; echo "autoload -U compinit && compinit"; } >> "$${HOME}/.zshrc"; \
+			echo "  added fpath to ~/.zshrc"; \
+		else \
+			echo "  ~/.zshrc already configured"; \
+		fi; \
 		echo "  completions -> $$DST/_a"; \
-		echo "  add to ~/.zshrc: fpath=($$DST \$$fpath) && autoload -Uz compinit && compinit"; \
+		echo "  add to ~/.zshrc: $$line"; \
 		;; \
 	  fish) \
 		DST="$${HOME}/.config/fish/completions"; \
@@ -50,10 +57,21 @@ install-completions:
 		"$$A_BIN" --generate-completions fish > "$$DST/a.fish"; \
 		echo "  completions -> $$DST/a.fish"; \
 		;; \
-	  *) \
+	  bash|*) \
 		DST="$${HOME}/.bash_completion.d"; \
 		mkdir -p "$$DST"; \
-		"$$A_BIN" --generate-completions bash > "$$DST/a"; \
+		"$$A_BIN" --generate-completions bash > "$$DST/a" && \
+		line='source '"$$DST/a"; \
+		for rc in "$${HOME}/.bashrc" "$${HOME}/.bash_profile"; do \
+			if [ -f "$$rc" ] || [ "$$rc" = "$${HOME}/.bashrc" ]; then \
+				if ! grep -qF "$$DST/a" "$$rc" 2>/dev/null; then \
+					{ echo ""; echo "# a 命令补全"; echo "$$line"; } >> "$$rc"; \
+					echo "  added source to $$rc"; \
+				else \
+					echo "  $$rc already configured"; \
+				fi; \
+			fi; \
+		done; \
 		echo "  completions -> $$DST/a"; \
 		echo "  add to ~/.bashrc: source $$DST/a"; \
 		;; \

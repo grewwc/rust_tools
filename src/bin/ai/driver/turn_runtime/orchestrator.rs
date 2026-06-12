@@ -560,9 +560,20 @@ async fn run_turn_body(
         let mid_turn_hard = mid_turn_compress_hard_threshold(history_max_chars);
         let total_chars = crate::ai::history::messages_total_chars_pub(&messages);
         if supervisor.should_try_mid_turn_compress(total_chars, mid_turn_soft) {
+            // 与跨 turn 压缩（prepare.rs）一致地解析会话 overflow 目录：mid-turn
+            // 压缩据此把 read_file/grep 等「不可压缩」工具的大输出零压缩外溢到
+            // 文件 + 留预览 stub，既释放上下文又不丢信息（模型可重新 read_file）。
+            let overflow_dir = {
+                use crate::ai::history::SessionStore;
+                let store = SessionStore::new(app.config.history_file.as_path());
+                store.session_assets_dir(&app.session_id)
+            };
             let drained: Vec<crate::ai::history::Message> = std::mem::take(&mut messages);
-            let (compressed, before, after) =
-                crate::ai::history::mid_turn_compress(drained, mid_turn_soft);
+            let (compressed, before, after) = crate::ai::history::mid_turn_compress(
+                drained,
+                mid_turn_soft,
+                Some(overflow_dir.as_path()),
+            );
             messages = compressed;
             supervisor.mark_compress(after);
             if after < before {

@@ -14,11 +14,64 @@ use rustyline::{
     validate::Validator,
 };
 
-use crate::commonw::utils::expanduser;
+use crate::{commonw::utils::expanduser, cw::Trie};
 
 pub(super) type LineEditor = Editor<CommandCompleter, DefaultHistory>;
 
 static CURRENT_MODEL_HINT: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::new(String::new()));
+
+/// Trie 存储所有 "/" 和 ":" 开头的顶层命令，替换原先的线性 starts_with 过滤。
+static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
+    let mut trie = Trie::new();
+    for &cmd in &[
+        "/help", ":help", "/h", ":h",
+        "/history", ":history",
+        "/usage", ":usage",
+        "/feishu-auth", ":feishu-auth",
+        "/share", ":share",
+        "/checkpoint", ":checkpoint",
+        "/cp", ":cp",
+        "/model", ":model",
+        "/agents", ":agents",
+        "/agent", ":agent",
+        "/sessions", ":sessions",
+    ] {
+        trie.insert(cmd);
+    }
+    trie
+});
+
+/// Trie 存储所有 "--" 和 "-" 开头的 CLI 选项（含简写），支持选项补全。
+static FLAGS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
+    let mut trie = Trie::new();
+    for flag in &[
+        // bool 选项
+        "--clear",
+        "--thinking", "-t",
+        "--short-output", "-s",
+        "--list-tools", "--list-mcp-tools", "--list-skills",
+        "--list-agents", "--no-skills",
+        "--help", "-h",
+        "--consolidate-knowledge",
+        "--note-search", "-ns",
+        "--generate-completions",
+        // string/int 选项
+        "--history",
+        "--model", "-m",
+        "--agent", "-a",
+        "--session", "-ss",
+        "--files", "-f",
+        "--out", "-o",
+        "--mcp-config",
+        "--reasoning-effort", "-re",
+        "--note", "-n",
+        "--note-delete", "-nd",
+        "--note-edit", "-ne",
+    ] {
+        trie.insert(flag);
+    }
+    trie
+});
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::ai) struct CompletionCandidate {
@@ -242,12 +295,19 @@ impl CommandCompleter {
         }
 
         let candidates = if token_start == 0 {
-            Self::plain_candidates(
-                Self::top_level_commands()
-                    .iter()
-                    .filter(|candidate| candidate.starts_with(token))
-                    .map(|candidate| (*candidate).to_string()),
-            )
+            // 用 Trie 做前缀匹配："/" / ":" 走命令 Trie，"--" / "-" 走选项 Trie；
+            // 排序结果以保证确定性（HashMap 迭代无序）。
+            if token.starts_with('/') || token.starts_with(':') {
+                let mut words = COMMANDS_TRIE.words_with_prefix(token);
+                words.sort();
+                Self::plain_candidates(words)
+            } else if token.starts_with('-') {
+                let mut words = FLAGS_TRIE.words_with_prefix(token);
+                words.sort();
+                Self::plain_candidates(words)
+            } else {
+                Vec::new()
+            }
         } else {
             let mut words = before[..token_start].split_whitespace();
             let Some(first) = words.next() else {
@@ -793,6 +853,38 @@ mod tests {
             .expect("model candidates should not be empty");
         assert_eq!(first.replacement, current);
         assert!(first.display.contains("current"));
+    }
+
+    #[test]
+    fn trie_command_completion_expands_usage_prefix() {
+        // /usa → /usage（Trie 前缀匹配）
+        let (_, candidates) = CommandCompleter::complete_for_line("/usa", 4);
+        assert!(
+            candidates.iter().any(|c| c.replacement == "/usage"),
+            "expected /usage for /usa, got: {:?}",
+            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trie_flag_completion_expands_model_prefix() {
+        // --mod → --model（选项 Trie 前缀匹配）
+        let (_, candidates) = CommandCompleter::complete_for_line("--mod", 5);
+        assert!(
+            candidates.iter().any(|c| c.replacement == "--model"),
+            "expected --model for --mod, got: {:?}",
+            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trie_flag_completion_expands_h_flag() {
+        // -h → -h（短选项精确匹配）
+        let (_, candidates) = CommandCompleter::complete_for_line("-h", 2);
+        assert!(candidates.iter().any(|c| c.replacement == "-h"));
+        // --h → --help 也匹配
+        let (_, candidates) = CommandCompleter::complete_for_line("--h", 3);
+        assert!(candidates.iter().any(|c| c.replacement == "--help"));
     }
 
     #[test]

@@ -49,6 +49,21 @@ pub(super) struct ParsedCli {
     pub(super) generate_completions: bool,
 }
 
+/// `a` 内部 "/" / ":" 命令列表，用于 shell 补全。
+const INTERNAL_COMMANDS: &[&str] = &[
+    "/help", ":help", "/h", ":h",
+    "/history", ":history",
+    "/usage", ":usage",
+    "/feishu-auth", ":feishu-auth",
+    "/share", ":share",
+    "/checkpoint", ":checkpoint",
+    "/cp", ":cp",
+    "/model", ":model",
+    "/agents", ":agents",
+    "/agent", ":agent",
+    "/sessions", ":sessions",
+];
+
 impl Default for ParsedCli {
     fn default() -> Self {
         Self {
@@ -508,7 +523,40 @@ fn generate_bash(
             opts.push(' ');
         }
     }
-    println!("  COMPREPLY=($(compgen -W \"{}\" -- \"$cur\"))", opts.trim());
+    // 追加 "/" / ":" 内部命令
+    let mut all = opts;
+    for cmd in INTERNAL_COMMANDS {
+        all.push_str(cmd);
+        all.push(' ');
+    }
+    // 子命令映射（与 zsh 分支保持一致）。当第一个参数是内部命令时，
+    // 第二个参数补全对应的子命令而不是顶层 flags/命令列表。
+    println!("  local usage_sub='today 7d 30d all daily trend days help'");
+    println!("  local checkpoint_sub='save list rollback delete help'");
+    println!("  local history_sub='full user assistant tool system grep export copy 3 6 10 20'");
+    println!("  local session_sub='list current new use delete clear-all export export-current export-last'");
+    println!("  local agent_sub='help list current use auto'");
+    println!("  local model_sub='current list help use select switch effort'");
+    println!();
+    // COMP_WORDS[0] 是命令名 a，内部命令位于 COMP_WORDS[1]。
+    println!("  if [ \"$COMP_CWORD\" -ge 2 ]; then");
+    println!("    case \"${{COMP_WORDS[1]}}\" in");
+    println!("      /usage|:usage)");
+    println!("        COMPREPLY=($(compgen -W \"$usage_sub\" -- \"$cur\")); return 0 ;;");
+    println!("      /checkpoint|:checkpoint|/cp|:cp)");
+    println!("        COMPREPLY=($(compgen -W \"$checkpoint_sub\" -- \"$cur\")); return 0 ;;");
+    println!("      /history|:history)");
+    println!("        COMPREPLY=($(compgen -W \"$history_sub\" -- \"$cur\")); return 0 ;;");
+    println!("      /sessions|:sessions)");
+    println!("        COMPREPLY=($(compgen -W \"$session_sub\" -- \"$cur\")); return 0 ;;");
+    println!("      /agent|:agent|/agents|:agents)");
+    println!("        COMPREPLY=($(compgen -W \"$agent_sub\" -- \"$cur\")); return 0 ;;");
+    println!("      /model|:model)");
+    println!("        COMPREPLY=($(compgen -W \"$model_sub\" -- \"$cur\")); return 0 ;;");
+    println!("    esac");
+    println!("  fi");
+    println!();
+    println!("  COMPREPLY=($(compgen -W \"{}\" -- \"$cur\"))", all.trim());
     println!("  return 0");
     println!("}}");
     println!("complete -F _a_completions a");
@@ -540,7 +588,48 @@ fn generate_zsh(
             println!("  _a_args+=({})", emit_flag(&format!("{}{}", a_prefix, a), ty, usage));
         }
     }
-    println!("  _arguments $_a_args");
+    // 内部命令作为第一层 position args
+    println!("  local -a _a_internal_cmds=({})", INTERNAL_COMMANDS.join(" "));
+    println!();
+    // 子命令映射
+    println!("  local -a _a_usage_subcmds=(today 7d 30d all daily trend days help)");
+    println!("  local -a _a_checkpoint_subcmds=(save list rollback delete help)");
+    println!("  local -a _a_history_subcmds=(full user assistant tool system grep export copy 3 6 10 20)");
+    println!("  local -a _a_session_subcmds=(list current new use delete clear-all export export-current export-last)");
+    println!("  local -a _a_agent_subcmds=(help list current use auto)");
+    println!("  local -a _a_model_subcmds=(current list help use select switch effort)");
+    println!("  local -a _a_effort_levels=(minimal low medium high auto off)");
+    println!();
+    // 若正在补全内部命令的子命令（第 2 个词是 /usage 等，光标在第 3+ 词），
+    // 先按子命令处理并 return，避免回落到 flags 补全。
+    // 注意：zsh 补全里 $words[1] 是命令名 a 本身，内部命令位于 $words[2]。
+    println!("  if (( CURRENT >= 3 )); then");
+    println!("    case \"$words[2]\" in");
+    println!("      /usage|:usage)");
+    println!("        _describe 'usage subcommand' _a_usage_subcmds && return");
+    println!("        ;;");
+    println!("      /checkpoint|:checkpoint|/cp|:cp)");
+    println!("        _describe 'checkpoint subcommand' _a_checkpoint_subcmds && return");
+    println!("        ;;");
+    println!("      /history|:history)");
+    println!("        _describe 'history subcommand' _a_history_subcmds && return");
+    println!("        ;;");
+    println!("      /sessions|:sessions)");
+    println!("        _describe 'session subcommand' _a_session_subcmds && return");
+    println!("        ;;");
+    println!("      /agent|:agent|/agents|:agents)");
+    println!("        _describe 'agent subcommand' _a_agent_subcmds && return");
+    println!("        ;;");
+    println!("      /model|:model)");
+    println!("        _describe 'model subcommand or model name' _a_model_subcmds && return");
+    println!("        ;;");
+    println!("    esac");
+    println!("  fi");
+    println!();
+    // _arguments: flags + 第一个 position arg 是内部命令。
+    // 用 ($_a_internal_cmds) 展开数组成员作为候选；早期写成 (_a_internal_cmds)
+    // 会把字面量字符串 "_a_internal_cmds" 当成唯一候选，导致 /usa<tab> 无反应。
+    println!("  _arguments $_a_args ':first command:(($_a_internal_cmds))'");
     println!("}}");
     println!();
     println!("compdef _a a");
@@ -568,5 +657,9 @@ fn generate_fish(
                 }
             }
         }
+    }
+    // 追加 "/" / ":" 内部命令
+    for cmd in INTERNAL_COMMANDS {
+        println!("complete -c a -a '{cmd}' -d 'internal command'");
     }
 }

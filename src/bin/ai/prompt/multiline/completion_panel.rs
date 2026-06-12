@@ -331,11 +331,10 @@ mod tests {
 
         let _ = apply_multiline_completion(&mut textarea, &mut pending, &mut panel);
         let _ = apply_multiline_completion(&mut textarea, &mut pending, &mut panel);
-        move_completion_selection(&mut panel, 1);
 
         let result = confirm_completion_selection(&mut textarea, &mut pending, &mut panel);
 
-        assert_eq!(textarea.lines(), vec!["/agent"]);
+        assert_eq!(textarea.lines(), vec!["/agent"]);  // 第一个候选 /agent（字典序 < /agents）
         assert!(pending.is_none());
         assert!(panel.is_none());
         assert_eq!(result.submit, None);

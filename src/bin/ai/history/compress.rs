@@ -321,7 +321,11 @@ async fn compact_persisted_history_with_app_inner(
     out
 }
 
-fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<Message> {
+fn shrink_messages_to_fit(
+    mut messages: Vec<Message>,
+    max_chars: usize,
+    overflow_dir: Option<&Path>,
+) -> Vec<Message> {
     if max_chars == 0 {
         return messages;
     }
@@ -330,7 +334,7 @@ fn shrink_messages_to_fit(mut messages: Vec<Message>, max_chars: usize) -> Vec<M
         return Vec::new();
     }
 
-    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES, None);
+    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES, overflow_dir);
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
     dedup_repeated_tool_results(&mut messages);
@@ -646,6 +650,7 @@ pub(in crate::ai) fn messages_total_chars_pub(messages: &[Message]) -> usize {
 pub(in crate::ai) fn mid_turn_compress(
     messages: Vec<Message>,
     soft_threshold: usize,
+    overflow_dir: Option<&Path>,
 ) -> (Vec<Message>, usize, usize) {
     let before = messages_total_chars(&messages);
     if before <= soft_threshold {
@@ -666,14 +671,17 @@ pub(in crate::ai) fn mid_turn_compress(
         let after = messages_total_chars(&out);
         return (out, before, after);
     }
-    // 2. 远端结构化裁剪：tool 结果中段按行折叠到 480 字/条，最近 6 条保留全文
-    prepare_tool_messages_structured(&mut out, 480, 6, None);
+    // 2. 远端结构化裁剪：tool 结果中段按行折叠到 480 字/条，最近 6 条保留全文。
+    //    传入 overflow_dir 后，read_file/grep 等「不可压缩」工具的大输出会被
+    //    零压缩外溢到会话文件并留 head+tail 预览 stub（与跨 turn 压缩一致），
+    //    既释放上下文体积又不丢信息——模型可按 stub 里的 file_path 重新 read_file。
+    prepare_tool_messages_structured(&mut out, 480, KEEP_RECENT_TOOL_MESSAGES, overflow_dir);
     if messages_total_chars(&out) <= soft_threshold {
         let after = messages_total_chars(&out);
         return (out, before, after);
     }
     // 3. 仍超额：用 shrink_messages_to_fit 走"折叠 tool group + 整体兜底"
-    out = shrink_messages_to_fit(out, soft_threshold);
+    out = shrink_messages_to_fit(out, soft_threshold, overflow_dir);
     let after = messages_total_chars(&out);
     (out, before, after)
 }

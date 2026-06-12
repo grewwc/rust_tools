@@ -3,7 +3,7 @@ name: executor
 description: Autonomous execution agent for end-to-end development tasks with progressive tool loading
 mode: primary
 color: danger
-max_steps: 64
+max_steps: 128
 model_tier: heavy
 routing_tags:
   - executor
