@@ -2,6 +2,8 @@
 //!
 //! 数据来源是内核 LLM 设备的审计账本，由 agent 落库到独立的 `token_usage` 表
 //! （见 [`crate::ai::tools::storage::token_usage_store`]）。本命令只做只读查询展示。
+//!
+//! 输出优化：大数字带千位分隔符，超过 1M 的自动缩写为 K/M/B 单位。
 
 use crate::ai::tools::storage::token_usage_store as store;
 
@@ -16,6 +18,49 @@ fn print_usage_help() {
     println!("  /usage daily           show daily breakdown for the last 14 days");
     println!("  /usage help            show this help");
     println!();
+}
+
+/// 格式化数字：≥1B 用 B，≥1M 用 M，≥1K 用 K，否则带千位分隔符。
+fn format_number(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        let b = n as f64 / 1_000_000_000.0;
+        if b >= 100.0 {
+            format!("{:.0}B", b)
+        } else if b >= 10.0 {
+            format!("{:.1}B", b)
+        } else {
+            format!("{:.2}B", b)
+        }
+    } else if n >= 1_000_000 {
+        let m = n as f64 / 1_000_000.0;
+        if m >= 100.0 {
+            format!("{:.0}M", m)
+        } else if m >= 10.0 {
+            format!("{:.1}M", m)
+        } else {
+            format!("{:.2}M", m)
+        }
+    } else if n >= 1_000 {
+        let k = n as f64 / 1_000.0;
+        if k >= 100.0 {
+            format!("{:.0}K", k)
+        } else if k >= 10.0 {
+            format!("{:.1}K", k)
+        } else {
+            format!("{:.2}K", k)
+        }
+    } else {
+        // < 1K：带千位分隔符
+        let s = n.to_string();
+        let mut out = String::new();
+        for (i, c) in s.chars().rev().enumerate() {
+            if i > 0 && i % 3 == 0 {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out.chars().rev().collect()
+    }
 }
 
 /// 把秒数解析成时间窗口；返回 `Some(None)`=全部历史，`Some(Some(secs))`=最近 secs 秒，`None`=无法解析。
@@ -65,14 +110,22 @@ fn print_window(window: Option<u64>) {
     match store::query_totals(window) {
         Some(t) => {
             println!(
-                "  [{}] calls={}  in={}  out={}  total={}",
-                label, t.calls, t.input, t.output, t.total
+                "  [{}] calls={:>6}  in={:>10}  out={:>10}  total={:>10}",
+                label,
+                format_number(t.calls),
+                format_number(t.input),
+                format_number(t.output),
+                format_number(t.total)
             );
             if let Some(rows) = store::query_by_model(window) {
                 for r in rows.iter().filter(|r| r.calls > 0) {
                     println!(
-                        "      {:<28} calls={:<5} in={:<9} out={:<9} total={}",
-                        r.model, r.calls, r.input, r.output, r.total
+                        "      {:<28} calls={:>6}  in={:>10}  out={:>10}  total={:>10}",
+                        r.model,
+                        format_number(r.calls),
+                        format_number(r.input),
+                        format_number(r.output),
+                        format_number(r.total)
                     );
                 }
             }
@@ -91,13 +144,17 @@ fn print_daily_breakdown(days: u64) {
         Some(rows) => {
             println!("  [daily last {}d]", days);
             println!(
-                "      {:<12} {:>6} {:>10} {:>10} {:>10}",
+                "      {:<12} {:>6}  {:>10}  {:>10}  {:>10}",
                 "date", "calls", "in", "out", "total"
             );
             for r in &rows {
                 println!(
-                    "      {:<12} {:>6} {:>10} {:>10} {:>10}",
-                    r.day, r.calls, r.input, r.output, r.total
+                    "      {:<12} {:>6}  {:>10}  {:>10}  {:>10}",
+                    r.day,
+                    format_number(r.calls),
+                    format_number(r.input),
+                    format_number(r.output),
+                    format_number(r.total)
                 );
             }
         }
