@@ -1049,10 +1049,17 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 timeout_ticks,
             )?;
             if wait.suspended {
-                // 当前进程已经被挂起等待剩余 channel ready。把已收集到的结果
-                // 透出（不丢失），并明确告诉主 agent：subagent 仍在后台运行、
-                // 资源未销毁、可以再次 task_wait 续等——避免主 agent 把这次
-                // 等待预算耗尽误判为"卡住"。
+                // 当前进程是 **协作式让出（suspend）**：kernel 已把前台进程置为
+                // Waiting 并交还调度权，好让后台 subagent 真正获得 CPU 去跑。等
+                // subagent 把结果写回 channel / 触发 futex 后，调度器会重新唤醒本
+                // 进程并 **自动重入 task_wait**。
+                //
+                // ⚠️ 这里 **绝不能** 用 "BUDGET ELAPSED" 之类的终态措辞：suspend 是
+                // 毫秒级同步返回的（不是真的等满 timeout_secs），如果告诉模型
+                // "等待预算已耗尽、子任务仍在后台" ，模型会把"刚发起等待就超时"
+                // 误判成"子任务卡住"，从而提前放弃并转手动分析（本 bug 的根因）。
+                // 所以这里只透出已收集到的结果（如有），并用中性的 "PARKED" 措辞
+                // 说明这是正常的调度让出。
                 let mut parts = Vec::new();
                 if !ready.is_empty() {
                     parts.push(ready.join("\n\n---\n\n"));
@@ -1062,14 +1069,14 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     WaitPolicy::All => "all",
                 };
                 parts.push(format!(
-                    "[task_wait BUDGET ELAPSED] {} pending subagent task(s) still running in the background. \
-                    The wait budget for THIS call ({timeout_secs}s, wait_policy={policy_label}) \
-                    has elapsed before the policy was satisfied — this is NOT a stall and the subagent(s) are NOT cancelled. \
-                    Their result channels and completion futexes are kept alive. \
+                    "[task_wait PARKED] Yielded CPU so {} pending subagent task(s) can run. \
+                    This is normal cooperative scheduling, NOT a timeout and NOT a stall — the wait budget \
+                    ({timeout_secs}s, wait_policy={policy_label}) has NOT elapsed. The scheduler will wake this \
+                    agent and resume the wait automatically as soon as a result is ready. \
                     Pending task_ids: [{}]. event_ids={}. \
-                    Recommended next steps: (a) call `task_status` for a non-blocking snapshot, \
-                    (b) call `task_wait` again with the same task_ids to keep waiting (optionally pass `wait_policy=\"any\"` to wake on the first finisher), \
-                    or (c) continue with other reasoning if the already collected results are sufficient.",
+                    Do NOT assume the subagents are stuck and do NOT abandon them to work around this; \
+                    just let the wait resume (you may re-call `task_wait` with the same task_ids, or use \
+                    `task_status` for a non-blocking snapshot).",
                     pending_ids.len(),
                     pending_ids.join(", "),
                     wait.event_ids
@@ -1167,7 +1174,7 @@ fn params_task_status() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_status",
-        description: "Show status of all asynchronously spawned tasks. Lists task_id, agent, model, and current state (running/completed/failed) without blocking.",
+        description: "Show status of all asynchronously spawned tasks. Lists task_id, agent, model, and current state (running/completed/failed) without blocking. For tasks that have already finished, their output is included inline so you can use completed results immediately without calling task_wait.",
         parameters: params_task_status,
         execute: execute_task_status,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -1185,6 +1192,12 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
         "TaskID              PID      Agent          Model          State       Description"
             .to_string(),
     ];
+    // 对已经把结果写回 channel 的子任务，额外用 **非消费式 peek** 读出正文，附在
+    // 表格后面。否则模型即使看到 state=completed，也只能回头再调 task_wait 才能拿到
+    // 输出——而 task_wait 在协作让出时又只会回一条 PARKED 提示，形成"看得到完成、
+    // 拿不到结果"的踢皮球，是诱发"子任务卡住"误判的次要原因。peek 不消费消息，
+    // 后续 task_wait 仍能正常 consume 并清理资源。
+    let mut completed_outputs: Vec<String> = Vec::new();
     with_os_kernel(|os| {
         for (tid, entry) in registry.iter() {
             let state_str = task_state_string(os, entry.result_channel_id, entry.pid)?;
@@ -1193,9 +1206,21 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
                 "{:<19} {:<8} {:<14} {:<14} {:<11} {}",
                 short_id, entry.pid, entry.agent_name, entry.model, state_str, entry.description
             ));
+            if let Some(result) = read_task_result(os, entry.result_channel_id, false)? {
+                completed_outputs.push(format_task_result(entry, result));
+            }
         }
         Ok(())
     })?;
+
+    if !completed_outputs.is_empty() {
+        lines.push(String::new());
+        lines.push(
+            "Completed task results below (already available — no need to wait for these):"
+                .to_string(),
+        );
+        lines.push(completed_outputs.join("\n\n---\n\n"));
+    }
 
     Ok(lines.join("\n"))
 }

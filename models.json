@@ -83,7 +83,18 @@
     "provider": "opencode",
     "quality_tier": "basic",
     "is_vl": false,
-    "search_enabled": false,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": true,
+    "subagent_priority": 10
+  },
+  {
+    "key": "DeepSeek V4 Flash Free",
+    "name": "deepseek-v4-flash-free",
+    "provider": "opencode",
+    "quality_tier": "basic",
+    "is_vl": false,
+    "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,
     "subagent_priority": 10

@@ -11,7 +11,6 @@ pub(super) struct ParsedCli {
     pub(super) agent: Option<String>,
     pub(super) clear: bool,
     pub(super) session: Option<String>,
-    pub(super) clipboard: bool,
     pub(super) files: String,
     pub(super) out: Option<String>,
     pub(super) thinking: bool,
@@ -54,7 +53,6 @@ impl Default for ParsedCli {
             agent: None,
             clear: false,
             session: None,
-            clipboard: false,
             files: String::new(),
             out: None,
             thinking: false,
@@ -93,7 +91,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         false,
         "clear specified session history (use with --session)",
     );
-    parser.add_bool("clipboard", false, "prepend content in clipboard");
     parser.add_bool(
         "thinking",
         false,
@@ -187,9 +184,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
             cli.agent = Some(val);
         }
     }
-
-    // 处理 clipboard
-    cli.clipboard = parser.contains_flag_strict("clipboard");
 
     // 处理 clear（与 --session 联用，清空对应 session 的 history）
     cli.clear = parser.contains_flag_strict("clear");
@@ -304,7 +298,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 pub(super) fn print_help() {
     let mut parser = TermParser::new();
 
-    parser.add_bool("clipboard", false, "prepend content in clipboard");
     parser.add_bool(
         "thinking",
         false,

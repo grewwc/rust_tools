@@ -8,16 +8,17 @@ use crate::ai::tools::storage::token_usage_store as store;
 fn print_usage_help() {
     println!("Usage commands:");
     println!();
-    println!("  /usage                 show token usage (all-time + last 24h, by model)");
-    println!("  /usage today           show usage for the last 24 hours");
+    println!("  /usage                 show token usage (all-time + 7d + 24h + daily trend)");
+    println!("  /usage today           show usage for the last 24 hours (by model)");
     println!("  /usage 7d              show usage for the last 7 days");
+    println!("  /usage 30d             show usage for the last 30 days");
     println!("  /usage all             show all-time usage");
+    println!("  /usage daily           show daily breakdown for the last 14 days");
     println!("  /usage help            show this help");
     println!();
 }
 
-/// 把秒数解析成时间窗口；返回 `Some(None)` 表示全部历史，`Some(Some(secs))`
-/// 表示最近 secs 秒，`None` 表示无法解析。
+/// 把秒数解析成时间窗口；返回 `Some(None)`=全部历史，`Some(Some(secs))`=最近 secs 秒，`None`=无法解析。
 fn parse_window(arg: &str) -> Option<Option<u64>> {
     let a = arg.trim().to_ascii_lowercase();
     match a.as_str() {
@@ -39,6 +40,17 @@ fn parse_window(arg: &str) -> Option<Option<u64>> {
     }
 }
 
+fn parse_daily_arg(arg: &str) -> Option<u64> {
+    let a = arg.trim().to_ascii_lowercase();
+    if a.is_empty() || a == "daily" || a == "days" || a == "trend" {
+        Some(14)
+    } else if let Some(n) = a.strip_suffix('d').and_then(|s| s.parse::<u64>().ok()) {
+        Some(n)
+    } else {
+        a.parse::<u64>().ok().or(Some(14))
+    }
+}
+
 fn window_label(window: Option<u64>) -> String {
     match window {
         None => "all-time".to_string(),
@@ -53,13 +65,13 @@ fn print_window(window: Option<u64>) {
     match store::query_totals(window) {
         Some(t) => {
             println!(
-                "  [{}] calls={}  input={}  output={}  total={}",
+                "  [{}] calls={}  in={}  out={}  total={}",
                 label, t.calls, t.input, t.output, t.total
             );
             if let Some(rows) = store::query_by_model(window) {
-                for r in rows.iter().filter(|r| r.total > 0) {
+                for r in rows.iter().filter(|r| r.calls > 0) {
                     println!(
-                        "      {:<28} calls={:<5} in={:<10} out={:<10} total={}",
+                        "      {:<28} calls={:<5} in={:<9} out={:<9} total={}",
                         r.model, r.calls, r.input, r.output, r.total
                     );
                 }
@@ -67,6 +79,30 @@ fn print_window(window: Option<u64>) {
         }
         None => {
             println!("  [{}] (no usage store available)", label);
+        }
+    }
+}
+
+fn print_daily_breakdown(days: u64) {
+    match store::query_daily_breakdown(days) {
+        Some(rows) if rows.is_empty() => {
+            println!("  [daily last {}d] 无数据", days);
+        }
+        Some(rows) => {
+            println!("  [daily last {}d]", days);
+            println!(
+                "      {:<12} {:>6} {:>10} {:>10} {:>10}",
+                "date", "calls", "in", "out", "total"
+            );
+            for r in &rows {
+                println!(
+                    "      {:<12} {:>6} {:>10} {:>10} {:>10}",
+                    r.day, r.calls, r.input, r.output, r.total
+                );
+            }
+        }
+        None => {
+            println!("  [daily] (no usage store available)");
         }
     }
 }
@@ -98,16 +134,26 @@ pub fn try_handle_usage_command(input: &str) -> Result<bool, Box<dyn std::error:
         return Ok(true);
     }
 
-    println!("Token usage  (store: {})", store::store_path().display());
+    println!(
+        "Token usage  store: {}",
+        store::store_path().display()
+    );
     if !store::is_enabled() {
         println!("  统计已关闭（ai.token_usage.enable=false）。");
         return Ok(true);
     }
 
     if arg.is_empty() {
-        // 默认：全部历史 + 最近 24h 概览，并按模型拆分。
+        // 默认：全部历史 + 最近 7d + 最近 24h 概览，并按模型拆分 + 近 14 天趋势。
+        println!();
         print_window(None);
+        print_window(Some(7 * 86_400));
         print_window(Some(86_400));
+        println!();
+        print_daily_breakdown(14);
+    } else if matches!(arg, "daily" | "days" | "trend") || arg.ends_with("d") && arg.len() <= 4 {
+        let days = parse_daily_arg(arg).unwrap_or(14);
+        print_daily_breakdown(days);
     } else if let Some(window) = parse_window(arg) {
         print_window(window);
     } else {

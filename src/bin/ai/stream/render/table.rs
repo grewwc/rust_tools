@@ -460,14 +460,9 @@ fn terminal_width() -> usize {
 }
 
 fn raw_cols() -> usize {
-    if let Some(cols) = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        && cols > 0
-    {
-        return cols;
-    }
-
+    // 与 markdown.rs::raw_terminal_cols 保持一致：实时 ioctl 优先，COLUMNS 仅作非 tty
+    // 回退。常驻进程在面板里被拖窄后 COLUMNS 是过时快照，用它算表格宽度会超出真实
+    // 面板、被终端硬折行，导致 │ 边框错位。
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -477,6 +472,14 @@ fn raw_cols() -> usize {
         if rc == 0 && ws.ws_col > 0 {
             return ws.ws_col as usize;
         }
+    }
+
+    if let Some(cols) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        && cols > 0
+    {
+        return cols;
     }
 
     80

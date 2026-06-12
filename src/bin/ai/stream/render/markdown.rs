@@ -759,14 +759,12 @@ fn preview_terminal_width() -> usize {
 }
 
 fn raw_terminal_cols() -> usize {
-    if let Some(cols) = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        && cols > 0
-    {
-        return cols;
-    }
-
+    // 优先用 ioctl(TIOCGWINSZ) 拿 **实时** 列数：`a` 是常驻进程，运行在 VS Code 等
+    // 面板里时，环境变量 COLUMNS 是进程启动那一刻的快照（shell 只在每次提示符前刷新
+    // 它），面板被拖窄后 COLUMNS 往往比真实宽度大。若用过大的列数计算预览行数 / 表格
+    // 宽度，会导致 cursor-up 重写的行数算少（残留预览）以及表格超宽被终端硬折行
+    // （边框错位）。因此真实 tty 一律以 ioctl 为准，COLUMNS 仅作为非 tty（如测试、
+    // 管道）时的回退。
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -776,6 +774,14 @@ fn raw_terminal_cols() -> usize {
         if rc == 0 && ws.ws_col > 0 {
             return ws.ws_col as usize;
         }
+    }
+
+    if let Some(cols) = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        && cols > 0
+    {
+        return cols;
     }
 
     80

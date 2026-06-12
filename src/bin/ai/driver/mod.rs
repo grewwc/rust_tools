@@ -25,7 +25,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -86,6 +86,38 @@ tokio::task_local! {
 
 fn current_task_pid() -> Option<u64> {
     TASK_PID.try_with(|v| *v).unwrap_or(None)
+}
+
+/// 当前已派发、尚未结束的后台子 agent tokio 任务数量。
+///
+/// 后台子 agent 通过 `tokio::spawn` 跑在 worker 线程上，会用 `println!`（裸 `\n`）
+/// 流式写终端。而交互式输入框（multiline TUI）会开启 raw mode，关闭 TTY 的 ONLCR，
+/// 此时裸 `\n` 不再补 `\r`，子 agent 的输出就会逐行右移（阶梯式错位）。
+///
+/// 用这个计数器在"打开输入框前"判断是否仍有后台子 agent 在跑：只要 > 0 就不进入
+/// raw mode 输入框，让调度循环继续 tick、子 agent 在 cooked 模式下正常输出，避免
+/// 并发写终端造成的显示混乱（同时不丢失任何子 agent 输出）。
+static BG_SUBAGENT_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+fn bg_subagents_inflight() -> bool {
+    BG_SUBAGENT_INFLIGHT.load(Ordering::Acquire) > 0
+}
+
+/// RAII 守卫：派发后台子 agent 前 `inc`，子 agent 任务结束（含 panic）时自动 `dec`，
+/// 保证计数不泄漏。
+struct BgSubagentGuard;
+
+impl BgSubagentGuard {
+    fn new() -> Self {
+        BG_SUBAGENT_INFLIGHT.fetch_add(1, Ordering::AcqRel);
+        BgSubagentGuard
+    }
+}
+
+impl Drop for BgSubagentGuard {
+    fn drop(&mut self) {
+        BG_SUBAGENT_INFLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 pub(crate) fn new_local_kernel() -> aios_kernel::kernel::SharedKernel {
@@ -1007,18 +1039,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     aios_kernel::kernel::register_current_pid_provider(current_task_pid);
 
     let mut cli = cli::parse_cli_args(std::env::args());
-    if let Err(err) = models::ensure_models_available() {
-        return Err(err.into());
-    }
-    let config = config::load_config()?;
-    let session_store = SessionStore::new(config.history_file.as_path());
-    let session_arg = cli.session.clone().unwrap_or_default();
-    let session_id = if session_arg.trim().is_empty() {
-        Uuid::new_v4().to_string()
-    } else {
-        session_arg.trim().to_string()
-    };
 
+    // 纯本地命令（帮助、列工具/技能/agent）不调用 LLM，必须在 ensure_models_available /
+    // load_config 之前处理：否则 models.json 为空或配置损坏时，连 `a --help` 都跑不起来，
+    // 形成“想看帮助先得把环境配好”的死循环。
     if cli.help {
         cli::print_help();
         return Ok(());
@@ -1041,6 +1065,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         commands::help::print_agents_list(&agent_manifests);
         return Ok(());
     }
+
+    if let Err(err) = models::ensure_models_available() {
+        return Err(err.into());
+    }
+    let config = config::load_config()?;
+    let session_store = SessionStore::new(config.history_file.as_path());
+    let session_arg = cli.session.clone().unwrap_or_default();
+    let session_id = if session_arg.trim().is_empty() {
+        Uuid::new_v4().to_string()
+    } else {
+        session_arg.trim().to_string()
+    };
 
     // 处理 --clear --session <id>：启动前清空指定 session 的 history
     if cli.clear {
@@ -1088,22 +1124,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
-
-    // 处理 --clipboard：把当前剪贴板内容拼接到首轮提问头部
-    if cli.clipboard {
-        let clip = crate::clipboardw::string_content::get_clipboard_content();
-        if !clip.trim().is_empty() {
-            if cli.args.is_empty() {
-                cli.args.push(clip);
-            } else {
-                let original = std::mem::take(&mut cli.args);
-                let combined = format!("{}\n\n{}", clip, original.join(" "));
-                cli.args.push(combined);
-            }
-        } else {
-            eprintln!("[clipboard] 剪贴板为空，已忽略 --clipboard");
-        }
-    }
 
     let os_arc = new_local_kernel();
     crate::ai::tools::os_tools::init_os_tools_globals(os_arc.clone());
@@ -1180,7 +1200,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             &mut mcp_client.lock().unwrap_or_else(|err| err.into_inner()),
         )
         .await;
-        print::print_mcp_tools(&mcp_report, &mcp_client.lock().unwrap());
+        print::print_mcp_tools(
+            &mcp_report,
+            &mcp_client.lock().unwrap_or_else(|err| err.into_inner()),
+        );
         return Ok(());
     }
 
@@ -2465,7 +2488,14 @@ async fn run_loop(
                     }
                 }
 
-                tokio::spawn(runtime_ctx::DRIVER_CTX.scope(task_driver_ctx, wrapped));
+                // 计入在途后台子 agent：guard 随 spawned future 一同 move 进任务，
+                // 任务结束（正常 / 错误 / panic）时 Drop 自动 dec，避免输入框被永久门控。
+                let inflight_guard = BgSubagentGuard::new();
+                let guarded_fut = async move {
+                    let _guard = inflight_guard;
+                    wrapped.await
+                };
+                tokio::spawn(runtime_ctx::DRIVER_CTX.scope(task_driver_ctx, guarded_fut));
             }
         }
 
@@ -2480,6 +2510,14 @@ async fn run_loop(
 
         if has_pending_foreground_process(app) {
             tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
+        }
+
+        // 仍有后台子 agent 在途时，不打开交互式输入框（它会进入 raw mode，导致子 agent
+        // 的流式输出 `\n` 缺 `\r` 而逐行右移）。继续 tick 调度循环，等子 agent 在 cooked
+        // 模式下把输出写完、计数归零后再接收新输入。one-shot 模式没有交互输入框，不受影响。
+        if !one_shot_mode && bg_subagents_inflight() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
             continue;
         }
 
