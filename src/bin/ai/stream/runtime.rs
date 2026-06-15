@@ -392,6 +392,16 @@ fn recover_inline_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         }
     }
 
+    // Anthropic / Claude 风格：<invoke name="read_file"><parameter name="path">/x</parameter></invoke>
+    // 可被 <function_calls>/<tool_calls> 包裹，标签可带命名空间前缀。某些模型
+    // （deepseek-v4-flash）用这种格式输出工具调用；若流式解析漏掉则在 finalize
+    // 兜底救回，避免 turn 被误判为 Completed 而工具从未执行。
+    if text.contains("<invoke") {
+        if let Some(calls) = recover_anthropic_xml_tool_calls(text) {
+            return Some(calls);
+        }
+    }
+
     let stripped = strip_inline_tool_call_wrappers(text);
     let trimmed = stripped.trim();
     if trimmed.is_empty() {
@@ -504,6 +514,110 @@ fn recover_hermes_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         rest = &rest[advance..];
     }
     if out.is_empty() { None } else { Some(out) }
+}
+
+/// 解析 Anthropic / Claude 风格的 XML tool call。支持：
+///   - 多个 `<invoke name="NAME"> ... </invoke>` 块（并行工具调用）
+///   - 参数为 `<parameter name="key">value</parameter>` 标签集合
+///   - 外层可有可无 `<function_calls>` / `<tool_calls>` 包裹
+///   - 标签可带命名空间前缀（如 `antml:invoke`）
+/// 任意一个 `<invoke ...>` 块解析成功即返回；全部失败返回 None。
+fn recover_anthropic_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let mut out: Vec<ToolCall> = Vec::new();
+    let mut rest = text;
+    let mut idx = 0usize;
+    while let Some(open_rel) = rest.find("<invoke") {
+        let after_tag = &rest[open_rel..];
+        // 定位本 invoke 开标签的 '>'。
+        let Some(open_gt) = after_tag.find('>') else {
+            break;
+        };
+        let open_tag = &after_tag[..=open_gt];
+        let name = parse_anthropic_xml_name_attr(open_tag);
+        let body_start = open_rel + open_gt + 1;
+        let body_region = &rest[body_start..];
+        let (body, consumed_to) = match body_region.find("</invoke>") {
+            Some(close_rel) => (
+                &body_region[..close_rel],
+                body_start + close_rel + "</invoke>".len(),
+            ),
+            None => (body_region, rest.len()),
+        };
+        if !name.trim().is_empty() {
+            let arguments = parse_anthropic_invoke_body(body);
+            out.push(ToolCall {
+                id: format!("inline_anthropic_{idx}"),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall { name, arguments },
+            });
+            idx += 1;
+        }
+        if consumed_to >= rest.len() {
+            break;
+        }
+        rest = &rest[consumed_to..];
+    }
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// 把 `<invoke>` body 里的 `<parameter name="key">value</parameter>` 解析为 JSON
+/// arguments 字符串；无参数返回 `{}`。
+fn parse_anthropic_invoke_body(body: &str) -> String {
+    let mut map = serde_json::Map::new();
+    let mut rest = body;
+    while let Some(open_rel) = rest.find("<parameter") {
+        let after_tag = &rest[open_rel..];
+        let Some(open_gt) = after_tag.find('>') else {
+            break;
+        };
+        let open_tag = &after_tag[..=open_gt];
+        let key = parse_anthropic_xml_name_attr(open_tag);
+        let value_region = &after_tag[open_gt + 1..];
+        let (raw_value, consumed_in_after) = match value_region.find("</parameter>") {
+            Some(close_rel) => (
+                &value_region[..close_rel],
+                open_gt + 1 + close_rel + "</parameter>".len(),
+            ),
+            None => break,
+        };
+        let raw_value = raw_value.trim();
+        if !key.trim().is_empty() {
+            let value = serde_json::from_str::<serde_json::Value>(raw_value)
+                .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
+            map.insert(key, value);
+        }
+        let advance = open_rel + consumed_in_after;
+        if advance >= rest.len() {
+            break;
+        }
+        rest = &rest[advance..];
+    }
+    if map.is_empty() {
+        "{}".to_string()
+    } else {
+        serde_json::Value::Object(map).to_string()
+    }
+}
+
+/// 从 `<invoke name="x">` / `<parameter name="y">` 开标签里抽取 `name` 属性值，
+/// 支持双引号或单引号。
+fn parse_anthropic_xml_name_attr(open_tag: &str) -> String {
+    let Some(pos) = open_tag.find("name") else {
+        return String::new();
+    };
+    let after = open_tag[pos + "name".len()..].trim_start();
+    let after = after.strip_prefix('=').unwrap_or(after).trim_start();
+    let (quote, body) = if let Some(b) = after.strip_prefix('"') {
+        ('"', b)
+    } else if let Some(b) = after.strip_prefix('\'') {
+        ('\'', b)
+    } else {
+        return String::new();
+    };
+    match body.find(quote) {
+        Some(end) => body[..end].to_string(),
+        None => String::new(),
+    }
 }
 
 /// 把单个 `<function=...>` 的 body 解析为 JSON arguments 字符串。
@@ -1599,6 +1713,95 @@ mod tests {
     }
 
     #[test]
+    fn recover_inline_tool_calls_handles_anthropic_xml_parameter_tags() {
+        // deepseek-v4-flash 实际输出的 Anthropic 风格：<invoke name=...>/<parameter name=...>。
+        let raw = r#"<function_calls><invoke name="read_file"><parameter name="path">/tmp/x</parameter><parameter name="limit">200</parameter></invoke></function_calls>"#;
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "read_file");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["path"], "/tmp/x");
+        assert_eq!(args["limit"], 200);
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_handles_anthropic_xml_namespaced_tags() {
+        // 带命名空间前缀（antml:）且无外层包裹。
+        let raw = r#"<invoke name="list_agents"></invoke>"#;
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "list_agents");
+        assert_eq!(calls[0].function.arguments, "{}");
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_handles_anthropic_xml_parallel_calls() {
+        let raw = r#"<tool_calls><invoke name="read_file"><parameter name="path">/a</parameter></invoke><invoke name="read_file"><parameter name="path">/b</parameter></invoke></tool_calls>"#;
+        let calls = recover_inline_tool_calls(raw).expect("should recover tool calls");
+        assert_eq!(calls.len(), 2);
+        let a: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&calls[1].function.arguments).unwrap();
+        assert_eq!(a["path"], "/a");
+        assert_eq!(b["path"], "/b");
+    }
+
+    #[test]
+    fn anthropic_xml_streamer_suppresses_markup_and_emits_events() {
+        let mut streamer = super::super::splitter::AnthropicXmlToolCallStreamer::new();
+        let (cleaned, events) = streamer.push(
+            r#"Let me check.<invoke name="read_file"><parameter name="path">/tmp/x</parameter></invoke>"#,
+        );
+        // invoke 标记不外显，仅保留前置散文。
+        assert_eq!(cleaned, "Let me check.");
+        // 产出 Begin/Args/End 事件，与内部 tool_call 管线一致。
+        assert_eq!(events.len(), 3);
+        match (&events[0], &events[1], &events[2]) {
+            (
+                InternalToolCallStreamEvent::Begin(name),
+                InternalToolCallStreamEvent::Args(args),
+                InternalToolCallStreamEvent::End,
+            ) => {
+                assert_eq!(name, "read_file");
+                let v: serde_json::Value = serde_json::from_str(args).unwrap();
+                assert_eq!(v["path"], "/tmp/x");
+            }
+            _ => panic!("unexpected events: {events:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_xml_streamer_handles_split_chunks() {
+        let mut streamer = super::super::splitter::AnthropicXmlToolCallStreamer::new();
+        let mut all_events = Vec::new();
+        let mut all_cleaned = String::new();
+        for chunk in [
+            "pre <inv",
+            "oke name=\"read_file\"><parameter name=\"pa",
+            "th\">/tmp/x</parameter></in",
+            "voke> post",
+        ] {
+            let (cleaned, events) = streamer.push(chunk);
+            all_cleaned.push_str(&cleaned);
+            all_events.extend(events);
+        }
+        assert_eq!(all_cleaned, "pre  post");
+        assert_eq!(all_events.len(), 3);
+        match &all_events[0] {
+            InternalToolCallStreamEvent::Begin(name) => assert_eq!(name, "read_file"),
+            other => panic!("unexpected first event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn anthropic_xml_streamer_leaves_prose_angle_brackets_intact() {
+        let mut streamer = super::super::splitter::AnthropicXmlToolCallStreamer::new();
+        let (cleaned, events) = streamer.push("a < b and c > d, also <div> here");
+        assert_eq!(cleaned, "a < b and c > d, also <div> here");
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn response_completed_event_does_not_block_late_snapshot_text() {
         let markers = StreamMarkers::new();
         let mut state = StreamProcessingState::new();
@@ -1915,6 +2118,7 @@ fn process_stream_payload(
         &mut state.content.hidden_meta_parse,
         &mut state.content.internal_tool_call_streamer,
         &mut state.content.hermes_tool_call_streamer,
+        &mut state.content.anthropic_tool_call_streamer,
     );
     process_internal_tool_calls(app, markers, state, internal_tool_call_events);
 

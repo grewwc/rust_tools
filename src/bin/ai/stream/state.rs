@@ -9,7 +9,7 @@ use crate::ai::{
 
 use super::{
     MarkdownStreamRenderer,
-    splitter::{HermesXmlToolCallStreamer, InternalToolCallStreamer, StreamSplitter},
+    splitter::{AnthropicXmlToolCallStreamer, HermesXmlToolCallStreamer, InternalToolCallStreamer, StreamSplitter},
 };
 
 pub(super) const THINKING_TAG_TEXT: &str = "╭─ thinking";
@@ -170,6 +170,7 @@ pub(super) struct StreamContentState {
     pub(super) internal_tool_call_idx: usize,
     pub(super) internal_tool_call_streamer: InternalToolCallStreamer,
     pub(super) hermes_tool_call_streamer: HermesXmlToolCallStreamer,
+    pub(super) anthropic_tool_call_streamer: AnthropicXmlToolCallStreamer,
 }
 
 impl StreamContentState {
@@ -187,6 +188,7 @@ impl StreamContentState {
             internal_tool_call_idx: 0,
             internal_tool_call_streamer: InternalToolCallStreamer::new(),
             hermes_tool_call_streamer: HermesXmlToolCallStreamer::new(),
+            anthropic_tool_call_streamer: AnthropicXmlToolCallStreamer::new(),
         }
     }
 }

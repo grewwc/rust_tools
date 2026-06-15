@@ -302,6 +302,315 @@ impl HermesXmlToolCallStreamer {
     }
 }
 
+/// Anthropic / Claude 风格的 XML tool call：
+/// ```text
+/// <function_calls>
+///   <invoke name="read_file">
+///     <parameter name="path">/x</parameter>
+///   </invoke>
+/// </function_calls>
+/// ```
+/// 与 Hermes 形态（`<function=NAME>` / `<parameter=key>`）不同，这里用的是
+/// `name="..."` 属性，且外层包裹标签可能是 `function_calls` 或 `tool_calls`，
+/// 标签还可能带命名空间前缀（如 `antml:invoke`）。某些模型（deepseek-v4-flash）
+/// 会用这种格式输出工具调用，若不识别就会被当成普通文本原样打印，且 turn 被判
+/// 定为 Completed 直接结束 —— 表现为"突然停止且工具从未执行"。
+#[derive(Default)]
+enum AnthropicXmlPhase {
+    #[default]
+    Idle,
+    InInvoke {
+        name: String,
+        params: serde_json::Map<String, serde_json::Value>,
+    },
+    InParamValue {
+        name: String,
+        params: serde_json::Map<String, serde_json::Value>,
+        key: String,
+        value: String,
+    },
+}
+
+#[derive(Default)]
+pub(super) struct AnthropicXmlToolCallStreamer {
+    pending: String,
+    phase: AnthropicXmlPhase,
+}
+
+enum AnthropicTagClass {
+    /// `function_calls` / `tool_calls`（开或闭），仅作包裹，直接抑制。
+    Wrapper,
+    InvokeOpen(String),
+    InvokeClose,
+    ParamOpen(String),
+    ParamClose,
+    /// 非工具标签（普通散文里的 `<...>`），原样外显。
+    Other,
+}
+
+impl AnthropicXmlToolCallStreamer {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn push(&mut self, chunk: &str) -> (String, Vec<InternalToolCallStreamEvent>) {
+        self.pending.push_str(chunk);
+        let mut cleaned = String::new();
+        let mut events = Vec::new();
+
+        loop {
+            let phase_kind = match &self.phase {
+                AnthropicXmlPhase::Idle => 0,
+                AnthropicXmlPhase::InInvoke { .. } => 1,
+                AnthropicXmlPhase::InParamValue { .. } => 2,
+            };
+
+            match phase_kind {
+                0 => {
+                    let Some(lt) = self.pending.find('<') else {
+                        cleaned.push_str(&self.pending);
+                        self.pending.clear();
+                        break;
+                    };
+                    let before = self.pending[..lt].to_string();
+
+                    let gt_rel = self.pending[lt..].find('>');
+                    let Some(gt_rel) = gt_rel else {
+                        // 标签未闭合：判断这截 `<...` 是否还可能成为工具/普通标签。
+                        if could_be_tag_name_prefix(&self.pending[lt..]) {
+                            // 像在写标签名，先把 `<` 前的可见文本放出，剩余 hold。
+                            if lt > 0 {
+                                cleaned.push_str(&before);
+                                self.pending.drain(..lt);
+                            }
+                            break;
+                        }
+                        // 不是标签（如散文里的 `<` ），把 `<` 当普通字符外显。
+                        cleaned.push_str(&before);
+                        cleaned.push('<');
+                        self.pending.drain(..lt + '<'.len_utf8());
+                        continue;
+                    };
+
+                    let tag_start = lt;
+                    let tag_end = lt + gt_rel; // 指向 '>'
+                    let tag = self.pending[tag_start..=tag_end].to_string();
+                    let class = classify_anthropic_tag(&tag);
+                    let is_tool_tag = !matches!(class, AnthropicTagClass::Other);
+
+                    if is_tool_tag {
+                        // 工具标签前的尾随空白只是排版噪声，去掉避免多余空行。
+                        let trimmed = before.trim_end_matches([' ', '\t', '\r', '\n']);
+                        cleaned.push_str(trimmed);
+                    } else {
+                        cleaned.push_str(&before);
+                        cleaned.push_str(&tag);
+                    }
+                    self.pending.drain(..=tag_end);
+
+                    match class {
+                        AnthropicTagClass::InvokeOpen(name) if !name.is_empty() => {
+                            self.phase = AnthropicXmlPhase::InInvoke {
+                                name,
+                                params: serde_json::Map::new(),
+                            };
+                        }
+                        // Wrapper / 空名 invoke / 杂散闭合标签 / Other：已处理，继续。
+                        _ => {}
+                    }
+                    continue;
+                }
+                1 => {
+                    let Some(lt) = self.pending.find('<') else {
+                        // invoke 内标签之间的空白/换行直接抑制。
+                        self.pending.clear();
+                        break;
+                    };
+                    if lt > 0 {
+                        self.pending.drain(..lt);
+                    }
+                    let Some(gt_rel) = self.pending.find('>') else {
+                        break;
+                    };
+                    let tag = self.pending[..=gt_rel].to_string();
+                    let class = classify_anthropic_tag(&tag);
+                    self.pending.drain(..=gt_rel);
+                    match class {
+                        AnthropicTagClass::ParamOpen(key) => {
+                            if let AnthropicXmlPhase::InInvoke { name, params } =
+                                std::mem::take(&mut self.phase)
+                            {
+                                self.phase = AnthropicXmlPhase::InParamValue {
+                                    name,
+                                    params,
+                                    key,
+                                    value: String::new(),
+                                };
+                            }
+                        }
+                        AnthropicTagClass::InvokeClose => {
+                            if let AnthropicXmlPhase::InInvoke { name, params } =
+                                std::mem::take(&mut self.phase)
+                            {
+                                emit_anthropic_invoke(&mut events, name, params);
+                            }
+                            self.phase = AnthropicXmlPhase::Idle;
+                        }
+                        // 其它标签（含未知）在 invoke 内一律抑制。
+                        _ => {}
+                    }
+                    continue;
+                }
+                _ => {
+                    // InParamValue：累积原始值，直到遇到 `</parameter>` 闭合标签。
+                    let Some(lt) = self.pending.find('<') else {
+                        if let AnthropicXmlPhase::InParamValue { value, .. } = &mut self.phase {
+                            value.push_str(&self.pending);
+                        }
+                        self.pending.clear();
+                        break;
+                    };
+                    let Some(gt_rel) = self.pending.find('>') else {
+                        // 有 `<` 但标签未闭合：`<` 前是值内容，从 `<` 起 hold。
+                        if lt > 0 {
+                            if let AnthropicXmlPhase::InParamValue { value, .. } = &mut self.phase {
+                                value.push_str(&self.pending[..lt]);
+                            }
+                            self.pending.drain(..lt);
+                        }
+                        break;
+                    };
+                    let tag = self.pending[lt..=gt_rel].to_string();
+                    if matches!(classify_anthropic_tag(&tag), AnthropicTagClass::ParamClose) {
+                        if let AnthropicXmlPhase::InParamValue {
+                            name,
+                            params,
+                            key,
+                            value,
+                        } = std::mem::take(&mut self.phase)
+                        {
+                            let mut value = value;
+                            value.push_str(&self.pending[..lt]);
+                            let mut params = params;
+                            insert_anthropic_param(&mut params, key, &value);
+                            self.phase = AnthropicXmlPhase::InInvoke { name, params };
+                        }
+                        self.pending.drain(..=gt_rel);
+                    } else {
+                        // `<...>` 属于值内容（如代码片段），并入值后继续。
+                        if let AnthropicXmlPhase::InParamValue { value, .. } = &mut self.phase {
+                            value.push_str(&self.pending[..=gt_rel]);
+                        }
+                        self.pending.drain(..=gt_rel);
+                    }
+                    continue;
+                }
+            }
+        }
+
+        (cleaned, events)
+    }
+}
+
+fn emit_anthropic_invoke(
+    events: &mut Vec<InternalToolCallStreamEvent>,
+    name: String,
+    params: serde_json::Map<String, serde_json::Value>,
+) {
+    if name.trim().is_empty() {
+        return;
+    }
+    let args = if params.is_empty() {
+        "{}".to_string()
+    } else {
+        serde_json::Value::Object(params).to_string()
+    };
+    events.push(InternalToolCallStreamEvent::Begin(name));
+    events.push(InternalToolCallStreamEvent::Args(args));
+    events.push(InternalToolCallStreamEvent::End);
+}
+
+fn insert_anthropic_param(
+    params: &mut serde_json::Map<String, serde_json::Value>,
+    key: String,
+    raw_value: &str,
+) {
+    if key.is_empty() {
+        return;
+    }
+    let raw = raw_value.trim();
+    // 尝试把值解析成 JSON 标量/结构（数字、bool、对象、数组）；否则当字符串。
+    let value = serde_json::from_str::<serde_json::Value>(raw)
+        .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+    params.insert(key, value);
+}
+
+/// 判断未闭合的 `<...` 片段是否还可能是一个标签名前缀（用于跨 chunk 缓冲决策）。
+/// 真正的标签名是连续的 name 字符；一旦出现空白或其它字符就不是标签起始（散文）。
+fn could_be_tag_name_prefix(after_lt: &str) -> bool {
+    let body = after_lt.strip_prefix('<').unwrap_or(after_lt);
+    let body = body.strip_prefix('/').unwrap_or(body);
+    if body.is_empty() {
+        return true;
+    }
+    if body.len() > 40 {
+        return false;
+    }
+    body.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-')
+}
+
+/// 把单个 `<...>` 标签分类。标签名允许命名空间前缀（取最后一个 `:` 之后的本地名）。
+fn classify_anthropic_tag(tag: &str) -> AnthropicTagClass {
+    let inner = tag.trim_start_matches('<').trim_end_matches('>').trim();
+    let is_close = inner.starts_with('/');
+    let inner = inner.trim_start_matches('/').trim_start();
+    let inner = inner.trim_end_matches('/').trim_end();
+    let (raw_name, attrs) = match inner.find(char::is_whitespace) {
+        Some(i) => (&inner[..i], inner[i..].trim()),
+        None => (inner, ""),
+    };
+    let local = raw_name.rsplit(':').next().unwrap_or(raw_name);
+    match local {
+        "function_calls" | "tool_calls" => AnthropicTagClass::Wrapper,
+        "invoke" => {
+            if is_close {
+                AnthropicTagClass::InvokeClose
+            } else {
+                AnthropicTagClass::InvokeOpen(parse_anthropic_name_attr(attrs))
+            }
+        }
+        "parameter" => {
+            if is_close {
+                AnthropicTagClass::ParamClose
+            } else {
+                AnthropicTagClass::ParamOpen(parse_anthropic_name_attr(attrs))
+            }
+        }
+        _ => AnthropicTagClass::Other,
+    }
+}
+
+/// 从标签属性串里解析 `name="..."` 或 `name='...'` 的值。
+fn parse_anthropic_name_attr(attrs: &str) -> String {
+    let Some(pos) = attrs.find("name") else {
+        return String::new();
+    };
+    let after = attrs[pos + "name".len()..].trim_start();
+    let after = after.strip_prefix('=').unwrap_or(after).trim_start();
+    let (quote, rest) = if let Some(rest) = after.strip_prefix('"') {
+        ('"', rest)
+    } else if let Some(rest) = after.strip_prefix('\'') {
+        ('\'', rest)
+    } else {
+        return String::new();
+    };
+    match rest.find(quote) {
+        Some(end) => rest[..end].to_string(),
+        None => String::new(),
+    }
+}
+
 fn sanitize_internal_tool_call_name(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();

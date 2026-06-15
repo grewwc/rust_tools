@@ -1,5 +1,5 @@
 use super::{
-    splitter::{self, HermesXmlToolCallStreamer, InternalToolCallStreamEvent, InternalToolCallStreamer},
+    splitter::{self, AnthropicXmlToolCallStreamer, HermesXmlToolCallStreamer, InternalToolCallStreamEvent, InternalToolCallStreamer},
     state::{HiddenMetaParseState, InternalToolCall},
 };
 use crate::ai::request::StreamChunk;
@@ -96,6 +96,7 @@ pub(super) fn extract_chunk_events_streaming(
     hidden_meta_parse: &mut HiddenMetaParseState,
     streamer: &mut InternalToolCallStreamer,
     hermes_streamer: &mut HermesXmlToolCallStreamer,
+    anthropic_streamer: &mut AnthropicXmlToolCallStreamer,
 ) -> (Vec<StreamTextEvent>, Vec<InternalToolCallStreamEvent>) {
     let Some(choice) = chunk.choices.first() else {
         return (Vec::new(), Vec::new());
@@ -132,7 +133,11 @@ pub(super) fn extract_chunk_events_streaming(
         events.push(StreamTextEvent::CloseThinking);
     }
     if !delta.content.is_empty() {
-        let (cleaned, hermes_events) = hermes_streamer.push(&delta.content);
+        let (cleaned, mut hermes_events) = hermes_streamer.push(&delta.content);
+        // 再把 Hermes 抽离后的可见文本交给 Anthropic（`<invoke name=...>`）解析器，
+        // 兼容 deepseek-v4-flash 等用该格式输出工具调用的模型。
+        let (cleaned, anthropic_events) = anthropic_streamer.push(&cleaned);
+        hermes_events.extend(anthropic_events);
         if !cleaned.is_empty() {
             let content = normalize_stream_text(cleaned);
             push_text_with_hidden_meta(
