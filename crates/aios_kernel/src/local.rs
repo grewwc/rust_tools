@@ -310,6 +310,21 @@ impl LocalOS {
             .unwrap_or(u8::MAX)
     }
 
+    /// 解析"当前调用进程"的 pid。
+    ///
+    /// 后台子 agent 各自跑在独立的 `tokio::spawn` 任务里，却共享同一个
+    /// `Arc<Mutex<Kernel>>`。`self.current_pid` 是单个标量，任一并发任务在完成 /
+    /// 让出时会把它改成 `None` 或别的 pid，于是另一任务正在执行的阻塞 syscall
+    /// （如 `wait_on_events`）读到的 `self.current_pid` 可能已被并发清空，导致
+    /// 误报 "No process currently running."。
+    ///
+    /// `TASK_PID` task-local 才是每个任务自身权威的调用者身份（`current_process_id`
+    /// 也据此解析）。这里统一优先读 task-local，缺失时再回退到 `self.current_pid`，
+    /// 保证身份类 syscall 在并发子 agent 场景下读到的始终是真正的调用者。
+    fn effective_current_pid(&self) -> Option<u64> {
+        crate::kernel::current_task_pid().or(self.current_pid)
+    }
+
     fn enqueue_ready(&mut self, pid: u64) {
         // 不存在的 pid 或已在队列中都直接返回。`ready_set.insert` 返回值同时
         // 承担了去重检查，省一次额外查表。
@@ -842,7 +857,9 @@ impl Syscall for LocalOS {
     }
 
     fn wait_on(&mut self, target_pid: u64) -> Result<(), String> {
-        let current = self.current_pid.ok_or("No process currently running.")?;
+        let current = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         self.require_capability(current, |caps| caps.wait, "wait")?;
         if target_pid == current {
             return Err("Current process cannot wait on itself.".to_string());
@@ -885,7 +902,9 @@ impl Syscall for LocalOS {
         policy: WaitPolicy,
         timeout_ticks: Option<u64>,
     ) -> Result<Option<u64>, String> {
-        let current = self.current_pid.ok_or("No process currently running.")?;
+        let current = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         self.require_capability(current, |caps| caps.wait, "wait on events")?;
 
         let mut deduped = Vec::new();
@@ -936,7 +955,9 @@ impl Syscall for LocalOS {
     }
 
     fn send_ipc(&mut self, target_pid: u64, message: String) -> Result<(), String> {
-        let sender_pid = self.current_pid.ok_or("No process currently running.")?;
+        let sender_pid = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         self.require_capability(sender_pid, |caps| caps.ipc_send, "send ipc")?;
 
         if !self.processes.contains_key(&target_pid) {
@@ -1004,7 +1025,9 @@ impl Syscall for LocalOS {
     }
 
     fn read_mailbox(&mut self) -> Result<Vec<String>, String> {
-        let current = self.current_pid.ok_or("No process currently running.")?;
+        let current = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         self.require_capability(current, |caps| caps.ipc_receive, "read mailbox")?;
         if let Some(current_proc) = self.processes.get_mut(&current) {
             let messages: Vec<String> = current_proc.mailbox.drain(..).collect();
@@ -1015,7 +1038,9 @@ impl Syscall for LocalOS {
     }
 
     fn set_env(&mut self, key: String, value: String) -> Result<(), String> {
-        let current = self.current_pid.ok_or("No process currently running.")?;
+        let current = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         self.require_capability(current, |caps| caps.env_write, "set env")?;
         if let Some(current_proc) = self.processes.get_mut(&current) {
             current_proc.env.insert(key, value);
@@ -1026,13 +1051,13 @@ impl Syscall for LocalOS {
     }
 
     fn get_env(&self, key: &str) -> Option<String> {
-        let current = self.current_pid?;
+        let current = self.effective_current_pid()?;
         let current_proc = self.processes.get(&current)?;
         current_proc.env.get(key).cloned()
     }
 
     fn current_process_id(&self) -> Option<u64> {
-        crate::kernel::current_task_pid().or(self.current_pid)
+        self.effective_current_pid()
     }
 
     fn get_process(&self, pid: u64) -> Option<&Process> {
@@ -1047,7 +1072,9 @@ impl Syscall for LocalOS {
     }
 
     fn sleep_current(&mut self, turns: u64) -> Result<u64, String> {
-        let current = self.current_pid.ok_or("No process currently running.")?;
+        let current = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         self.require_capability(current, |caps| caps.sleep, "sleep")?;
         let until_tick = self.tick.saturating_add(turns.max(1));
         if let Some(proc) = self.processes.get_mut(&current) {
@@ -1059,7 +1086,9 @@ impl Syscall for LocalOS {
     }
 
     fn kill_process(&mut self, target_pid: u64, reason: String) -> Result<(), String> {
-        let current = self.current_pid.ok_or("No process currently running.")?;
+        let current = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         self.require_capability(current, |caps| caps.manage_children, "kill process")?;
         self.ensure_child_scope(current, target_pid)?;
         if target_pid == current {
@@ -1090,7 +1119,9 @@ impl Syscall for LocalOS {
     }
 
     fn reap_process(&mut self, target_pid: u64) -> Result<String, String> {
-        let current = self.current_pid.ok_or("No process currently running.")?;
+        let current = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         self.require_capability(current, |caps| caps.reap, "reap process")?;
         self.ensure_child_scope(current, target_pid)?;
         let proc = self
@@ -1106,7 +1137,9 @@ impl Syscall for LocalOS {
     }
 
     fn signal_process(&mut self, target_pid: u64, signal: Signal) -> Result<(), String> {
-        let current = self.current_pid.ok_or("No process currently running.")?;
+        let current = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         self.require_capability(current, |caps| caps.signal, "send signal")?;
         self.ensure_child_scope(current, target_pid)?;
 
@@ -1156,7 +1189,9 @@ impl Syscall for LocalOS {
     }
 
     fn shm_create(&mut self, key: String, value: String) -> Result<(), String> {
-        let current = self.current_pid.ok_or("No process currently running.")?;
+        let current = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         if self.shared_memory.contains_key(&key) {
             return Err(format!("Shared memory key '{}' already exists.", key));
         }
@@ -1180,7 +1215,7 @@ impl Syscall for LocalOS {
     fn shm_read(&self, key: &str) -> Result<String, ShmReadError> {
         let entry = self.shared_memory.get(key).ok_or(ShmReadError::NotFound)?;
 
-        let current = match self.current_pid {
+        let current = match self.effective_current_pid() {
             Some(pid) => pid,
             None => return Ok(entry.value.clone()),
         };
@@ -1229,7 +1264,9 @@ impl Syscall for LocalOS {
     }
 
     fn shm_write(&mut self, key: String, value: String) -> Result<(), String> {
-        let current = self.current_pid.ok_or("No process currently running.")?;
+        let current = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         let entry = self
             .shared_memory
             .get(&key)
@@ -1251,7 +1288,9 @@ impl Syscall for LocalOS {
     }
 
     fn shm_delete(&mut self, key: &str) -> Result<(), String> {
-        let current = self.current_pid.ok_or("No process currently running.")?;
+        let current = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         let entry = self
             .shared_memory
             .get(key)
@@ -1268,7 +1307,9 @@ impl Syscall for LocalOS {
     }
 
     fn set_working_dir(&mut self, dir: PathBuf) -> Result<(), String> {
-        let current = self.current_pid.ok_or("No process currently running.")?;
+        let current = self
+            .effective_current_pid()
+            .ok_or("No process currently running.")?;
         if let Some(proc) = self.processes.get_mut(&current) {
             proc.working_dir = Some(dir);
             Ok(())
@@ -1278,7 +1319,7 @@ impl Syscall for LocalOS {
     }
 
     fn get_working_dir(&self) -> Option<PathBuf> {
-        let current = self.current_pid?;
+        let current = self.effective_current_pid()?;
         self.processes
             .get(&current)
             .and_then(|p| p.working_dir.clone())
@@ -1460,6 +1501,10 @@ impl KernelInternal for LocalOS {
         let yielded = self.yield_requested;
         self.yield_requested = false;
         yielded
+    }
+
+    fn request_yield(&mut self) {
+        self.yield_requested = true;
     }
 
     fn event_is_completed(&self, event_id: EventId) -> bool {
@@ -3584,6 +3629,55 @@ mod tests {
                 }
             }) if event_ids == &vec![EventId::new(1), EventId::new(2)]
         ));
+    }
+
+    // 回归测试：并发后台子 agent 各跑在独立 tokio 任务里、共享同一个 kernel。
+    // 当某个任务把共享标量 `self.current_pid` 清空 / 改写后，另一个任务正在执行的
+    // 阻塞 syscall（如 task_wait → wait_on_events）必须仍能从 task-local 解析出真正
+    // 的调用者，而不是误报 "No process currently running."（主 / 子 agent 调度卡死的根因）。
+    #[test]
+    fn blocking_syscall_resolves_caller_from_task_local_when_current_pid_cleared() {
+        use std::cell::Cell;
+
+        thread_local! {
+            static TEST_TASK_PID: Cell<Option<u64>> = const { Cell::new(None) };
+        }
+        fn provider() -> Option<u64> {
+            TEST_TASK_PID.with(|c| c.get())
+        }
+        crate::kernel::register_current_pid_provider(provider);
+
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground(
+            "foreground".to_string(),
+            "root goal".to_string(),
+            10,
+            8,
+            None,
+        );
+
+        // 模拟并发任务在收尾时把共享 current_pid 清空。
+        os.set_current_pid(None);
+        assert!(os.current_pid.is_none());
+
+        // 但 task-local 仍指向 root（即"本任务"权威身份）。
+        TEST_TASK_PID.with(|c| c.set(Some(root)));
+
+        // wait_on_events 必须按 task-local 解析出 root 并正常挂起，而不是报错。
+        let timeout_tick = os
+            .wait_on_events(vec![EventId::new(7)], WaitPolicy::Any, Some(5))
+            .expect("wait_on_events must resolve caller from task-local");
+        assert_eq!(timeout_tick, Some(5));
+        assert!(os.consume_yield_requested());
+        assert!(matches!(
+            os.get_process(root).map(|p| &p.state),
+            Some(ProcessState::Waiting {
+                reason: WaitReason::Events { .. }
+            })
+        ));
+
+        // 复位 task-local，避免污染同线程后续测试。
+        TEST_TASK_PID.with(|c| c.set(None));
     }
 
     #[test]

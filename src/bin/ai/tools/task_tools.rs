@@ -441,18 +441,29 @@ pub(crate) fn epoll_wait_many(
                         timeout_tick: None,
                     })
                 }
-                EpollWaitResult::Suspended { timeout_tick } => Ok(EpollWaitManyOutcome {
-                    ready_sources,
-                    pending_sources,
-                    event_ids,
-                    suspended: true,
-                    timeout_tick,
-                }),
+                EpollWaitResult::Suspended { timeout_tick } => {
+                    // epoll_wait 内部已 consume 了 yield_requested 标志用于判定挂起；
+                    // 必须把它重新置位，否则 turn-loop 的 consume_yield_requested()
+                    // 读到 false，控制权无法交还调度器，已就绪的子 agent 永远不被派发。
+                    os.request_yield();
+                    Ok(EpollWaitManyOutcome {
+                        ready_sources,
+                        pending_sources,
+                        event_ids,
+                        suspended: true,
+                        timeout_tick,
+                    })
+                }
             },
             WaitPolicy::All => {
                 let wake_tick =
                     os.wait_on_events(event_ids.clone(), WaitPolicy::All, timeout_ticks)?;
                 let suspended = os.consume_yield_requested() || wake_tick.is_some();
+                if suspended {
+                    // 同上：本分支用 consume_yield_requested() 探测挂起，会清掉让出
+                    // 意图。确认挂起后重新置位，保证 turn-loop 能感知并交还调度权。
+                    os.request_yield();
+                }
                 let (ready_sources, pending_sources, refreshed_event_ids) =
                     wait_many_snapshot(os, sources)?;
                 Ok(EpollWaitManyOutcome {

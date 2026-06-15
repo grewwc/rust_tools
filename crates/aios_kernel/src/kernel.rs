@@ -321,6 +321,14 @@ pub trait KernelInternal {
     /// 消费并清除 yield 请求标志，返回之前的值
     /// 进程可通过 yield_current 工具请求让出 CPU
     fn consume_yield_requested(&mut self) -> bool;
+    /// 重新置位 yield 请求标志。
+    ///
+    /// 某些上层封装（如 `epoll_wait_many`）会先 `consume_yield_requested()` 读取
+    /// 挂起状态用于自身决策，这会把内核里的让出意图清掉，导致后续 turn-loop 再调
+    /// `consume_yield_requested()` 时读到 false、无法把控制权交还调度器（子 agent
+    /// 因此永远停在 Ready）。这些封装在确认确实发生挂起后，必须用本方法把标志重新
+    /// 置位，保证让出意图不丢失。
+    fn request_yield(&mut self);
     /// 查询某个内核事件是否已被标记为完成。
     fn event_is_completed(&self, event_id: EventId) -> bool;
     /// 删除已终止的进程（非等待状态）

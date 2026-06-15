@@ -2909,7 +2909,17 @@ async fn run_loop(
         };
         app.session_history_file = original_history_file;
         app.writer = original_writer;
-        if matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Quit)) || should_quit {
+        // task_wait / tool_wait 等协作式让出会让本轮 run_turn 以 `Continue` 返回，
+        // 而前台进程此时停在 Waiting（park），等后台子 agent 写回结果再被唤醒。
+        // one-shot 模式下 `should_quit` 恒为 true，若此处直接退出，就会在子 agent
+        // 还没被调度的瞬间结束进程（子 agent 永远停在 Ready）。因此：只要本轮是
+        // 让出（Continue）且仍有未终止的前台进程在等待，就继续 loop，让调度器派发
+        // 子 agent、收集结果并唤醒前台续跑，直到前台真正产出最终回答后再退出。
+        let parked_awaiting_subagents = matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Continue))
+            && has_pending_foreground_process(app);
+        if (matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Quit)) || should_quit)
+            && !parked_awaiting_subagents
+        {
             if !one_shot_mode {
                 for obs in app.observers.iter_mut() {
                     if obs.is_poisoned() {
