@@ -1759,6 +1759,7 @@ impl KernelInternal for LocalOS {
             u8,
             usize,
             usize,
+            usize,
             Option<u64>,
             FastMap<String, String>,
             FastSet<String>,
@@ -1778,6 +1779,7 @@ impl KernelInternal for LocalOS {
                     proc.priority,
                     proc.quota_turns,
                     proc.restart_count,
+                    proc.max_restarts,
                     proc.parent_pid,
                     proc.env.clone(),
                     proc.allowed_tools.clone(),
@@ -1792,6 +1794,7 @@ impl KernelInternal for LocalOS {
             priority,
             quota_turns,
             restart_count,
+            max_restarts,
             parent_pid,
             env,
             allowed_tools,
@@ -1829,7 +1832,7 @@ impl KernelInternal for LocalOS {
                     created_at_tick: self.tick,
                     process_group: None,
                     is_daemon: true,
-                    max_restarts: 0,
+                    max_restarts,
                     restart_count: restart_count + 1,
                     env,
                     history_file: None,
@@ -1865,7 +1868,7 @@ impl FutexOps for LocalOS {
         let id = self.next_futex_id;
         self.next_futex_id += 1;
         let event_id = self.alloc_internal_event_id();
-        let owner = self.current_pid;
+        let owner = self.effective_current_pid();
         self.futexes.insert(id, FutexState::new(initial, event_id));
         // 与 futex 生命周期绑定的 event_id 入资源计数。
         self.inc_event_source_ref(event_id);
@@ -4702,6 +4705,38 @@ mod tests {
         os.terminate_pid(restarted1[0], "crashed again".to_string());
         let restarted2 = os.check_daemon_restart();
         assert!(restarted2.is_empty());
+    }
+
+    #[test]
+    fn daemon_restarts_up_to_max_restarts_then_stops() {
+        // 回归：重启后的进程必须保留原始 max_restarts，否则只会重启一次。
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+        let daemon_pid = os
+            .spawn_daemon(
+                Some(root),
+                "watcher".to_string(),
+                "watch".to_string(),
+                20,
+                4,
+                3,
+            )
+            .unwrap();
+
+        let mut current = daemon_pid;
+        for expected_count in 1..=3 {
+            os.terminate_pid(current, "crashed".to_string());
+            let restarted = os.check_daemon_restart();
+            assert_eq!(restarted.len(), 1, "restart #{expected_count} should occur");
+            current = restarted[0];
+            let proc = os.get_process(current).unwrap();
+            assert_eq!(proc.restart_count, expected_count);
+            assert_eq!(proc.max_restarts, 3);
+        }
+
+        // 第 4 次终止后已达上限，不再重启。
+        os.terminate_pid(current, "crashed".to_string());
+        assert!(os.check_daemon_restart().is_empty());
     }
 
     #[test]
