@@ -2,14 +2,11 @@ use super::agents::{AgentManifest, AgentModelTier};
 use super::cli::ParsedCli;
 use super::config_schema::AiConfig;
 use super::model_names::{self, ModelDef};
-use super::provider::{ApiProvider, ModelQualityTier, ReasoningEffort};
+use super::provider::{
+    self, ApiProvider, COMPATIBLE_DEFAULT_ENDPOINT, ModelQualityTier, OPENAI_DEFAULT_ENDPOINT,
+    OPENCODE_DEFAULT_ENDPOINT, OPENROUTER_ENDPOINT, ReasoningEffort,
+};
 use crate::commonw::configw;
-
-const COMPATIBLE_DEFAULT_ENDPOINT: &str =
-    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
-const OPENAI_DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
-const OPENCODE_DEFAULT_ENDPOINT: &str = "https://opencode.ai/zen/v1/chat/completions";
-const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 pub(super) fn is_vl_model(model: &str) -> bool {
     model_names::find_by_name(model)
@@ -55,27 +52,11 @@ pub(super) fn model_provider(model: &str) -> ApiProvider {
 }
 
 fn default_endpoint_for_provider(provider: ApiProvider) -> &'static str {
-    match provider {
-        ApiProvider::Compatible => COMPATIBLE_DEFAULT_ENDPOINT,
-        ApiProvider::OpenAi => OPENAI_DEFAULT_ENDPOINT,
-        ApiProvider::OpenCode => OPENCODE_DEFAULT_ENDPOINT,
-    }
+    provider::adapter_for(provider, "").default_endpoint()
 }
 
 fn default_api_key_config_candidates(provider: ApiProvider) -> &'static [&'static str] {
-    match provider {
-        ApiProvider::Compatible => &[
-            AiConfig::MODEL_COMPATIBLE_API_KEY,
-            AiConfig::MODEL_ALIYUN_API_KEY,
-            AiConfig::MODEL_API_KEY,
-        ],
-        ApiProvider::OpenAi => &[
-            AiConfig::MODEL_OPENROUTER_API_KEY,
-            AiConfig::MODEL_OPENAI_API_KEY,
-            AiConfig::MODEL_API_KEY,
-        ],
-        ApiProvider::OpenCode => &[AiConfig::MODEL_OPENCODE_API_KEY, AiConfig::MODEL_API_KEY],
-    }
+    provider::adapter_for(provider, "").api_key_candidates()
 }
 
 pub(super) fn endpoint_for_model(model: &str, global_fallback: &str) -> String {

@@ -1,5 +1,5 @@
 use crate::ai::{
-    provider::ApiProvider,
+    provider::{self, ApiProvider},
     request::{StreamChoice, StreamChunk, StreamDelta, StreamFunctionCall, StreamToolCall},
 };
 
@@ -48,11 +48,12 @@ pub(super) fn parse_stream_payload(
     }
 
     match adapter_kind {
-        StreamProviderAdapterKind::Compatible => parse_compatible_payload(payload),
-        StreamProviderAdapterKind::OpenAi => parse_openai_payload(payload),
-        StreamProviderAdapterKind::OpenRouter => parse_openrouter_payload(payload),
-        StreamProviderAdapterKind::OpenCode => parse_opencode_payload(payload),
+        StreamProviderAdapterKind::Compatible => provider::compatible_adapter(),
+        StreamProviderAdapterKind::OpenAi => provider::openai_adapter(),
+        StreamProviderAdapterKind::OpenRouter => provider::openrouter_adapter(),
+        StreamProviderAdapterKind::OpenCode => provider::opencode_adapter(),
     }
+    .parse_provider_chunk(payload)
 }
 
 fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStreamPayload> {
@@ -349,61 +350,13 @@ fn extract_event_text(value: &serde_json::Value, preferred_keys: &[&str]) -> Str
     }
 }
 
-fn parse_compatible_payload(payload: &str) -> ParsedStreamPayload {
-    parse_stream_chunk("compatible", payload)
-}
-
-fn parse_openai_payload(payload: &str) -> ParsedStreamPayload {
-    parse_stream_chunk("openai", payload)
-}
-
-fn parse_openrouter_payload(payload: &str) -> ParsedStreamPayload {
-    parse_stream_chunk("openrouter", payload)
-}
-
-fn parse_opencode_payload(payload: &str) -> ParsedStreamPayload {
-    let trimmed = payload.trim();
-    if trimmed.is_empty() || trimmed == "[DONE]" {
-        return ParsedStreamPayload::Ignore;
-    }
-
-    match try_parse_stream_chunk_loose(trimmed) {
-        Some(chunk) => ParsedStreamPayload::Chunk(chunk),
-        None => {
-            eprintln!(
-                "[opencode] ignored payload, length: {}, starts_with: {:.30}",
-                trimmed.len(),
-                trimmed
-            );
-            ParsedStreamPayload::Ignore
-        }
-    }
-}
-
-fn parse_stream_chunk(adapter_label: &str, payload: &str) -> ParsedStreamPayload {
-    match try_parse_stream_chunk_loose(payload) {
-        Some(chunk) => ParsedStreamPayload::Chunk(chunk),
-        None => {
-            let err = serde_json::from_str::<serde_json::Value>(payload)
-                .err()
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "unable to parse stream payload".to_string());
-            eprintln!("handleResponse error [{adapter_label}] {err}");
-            eprintln!("======> response: ");
-            eprintln!("{payload}");
-            eprintln!("<======");
-            ParsedStreamPayload::Ignore
-        }
-    }
-}
-
 fn try_parse_stream_chunk(payload: &str) -> Option<StreamChunk> {
     let mut chunk = serde_json::from_str::<StreamChunk>(payload).ok()?;
     chunk.merge_reasoning();
     Some(chunk)
 }
 
-fn try_parse_stream_chunk_loose(payload: &str) -> Option<StreamChunk> {
+pub(in crate::ai) fn try_parse_stream_chunk_loose(payload: &str) -> Option<StreamChunk> {
     if let Some(chunk) = try_parse_stream_chunk(payload) {
         return Some(chunk);
     }

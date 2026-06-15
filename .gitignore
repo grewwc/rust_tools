@@ -5,3 +5,4 @@ Cargo.lock
 .fastembed_cache
 .DS_Store
 .cargo
+.trae

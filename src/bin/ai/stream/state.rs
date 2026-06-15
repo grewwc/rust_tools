@@ -206,7 +206,7 @@ pub(super) enum StreamChunkStep {
     Return(StreamResult),
 }
 
-pub(super) enum ParsedStreamPayload {
+pub(in crate::ai) enum ParsedStreamPayload {
     Ignore,
     Done,
     Chunk(StreamChunk),

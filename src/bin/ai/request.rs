@@ -535,7 +535,7 @@ fn api_key_for_request_model(app: &App, model: &str) -> String {
     models::api_key_for_model(model, &app.config.api_key)
 }
 
-fn apply_request_auth(
+pub(in crate::ai) fn apply_request_auth(
     builder: reqwest::RequestBuilder,
     endpoint: &str,
     api_key: &str,
@@ -1860,35 +1860,30 @@ fn build_request_body<'a>(
     reasoning_effort: Option<&'a str>,
 ) -> RequestBody<'a> {
     let provider = models::model_provider(model);
+    // OpenRouter 与 OpenAI 的请求体字段完全一致，endpoint 维度只影响流式解析，
+    // 这里用 provider 选 adapter 即可（传空 endpoint 不会误判 OpenRouter）。
+    let adapter = super::provider::adapter_for(provider, "");
     // 流式请求显式索取 usage：部分 provider（DashScope compatible-mode）流式下
     // 默认不返回 usage，必须声明 stream_options.include_usage 才能统计 token。
     let stream_options = stream.then(|| json!({ "include_usage": true }));
-    match provider {
-        ApiProvider::Compatible => RequestBody {
-            model,
-            messages,
-            stream,
-            enable_thinking: Some(enable_thinking),
-            enable_search,
-            tools,
-            tool_choice,
-            reasoning_effort: None,
-            reasoning: reasoning_effort.map(|effort| json!({ "effort": effort })),
-            stream_options,
-        },
-        _ => RequestBody {
-            model,
-            messages,
-            stream,
-            enable_thinking: None,
-            enable_search: None,
-            tools,
-            tool_choice,
-            reasoning_effort: reasoning_effort.filter(|_| provider.is_openai()),
-            reasoning: None,
-            stream_options,
-        },
+    RequestBody {
+        model,
+        messages,
+        stream,
+        enable_thinking: adapter.enable_thinking_field(enable_thinking),
+        enable_search: adapter.enable_search_field(enable_search),
+        tools,
+        tool_choice,
+        reasoning_effort: adapter.reasoning_top_level(reasoning_effort),
+        reasoning: adapter.reasoning_nested(reasoning_effort),
+        stream_options,
     }
+}
+
+/// 辅助（非主链路）请求是否需要显式关闭 `enable_thinking`。
+/// 由 provider adapter 决定：Compatible 返回 `Some(false)`，其余返回 `None`。
+pub(in crate::ai) fn aux_disable_thinking_for_model(model: &str) -> Option<bool> {
+    super::provider::adapter_for(models::model_provider(model), "").aux_disable_thinking()
 }
 
 /// 是否开启 opt-in 的显式 prompt cache 断点注入。
@@ -1964,8 +1959,8 @@ pub async fn do_request_json(
     // 非流式辅助请求（意图识别、知识整理等）必须等整段生成完才返回响应头，
     // thinking 链一长就撑爆 60s 超时、重试也只是重复同样的慢生成。
     // 因此这里显式关闭 thinking，与后台 background_call 保持一致。
-    if models::model_provider(model) == ApiProvider::Compatible {
-        request_body["enable_thinking"] = json!(false);
+    if let Some(disabled) = aux_disable_thinking_for_model(model) {
+        request_body["enable_thinking"] = json!(disabled);
     }
 
     // reasoning_effort：仅在未跳过且 provider 为 OpenAI 兼容时注入。
@@ -2079,8 +2074,8 @@ pub async fn do_request_text_streaming(
     // 兼容（Qwen 等）provider 默认开启 thinking：流式下推理链以 reasoning_content
     // 分片到达，而本函数只聚合 delta.content。思考阶段会让 content 长时间为空、
     // spinner 一直转，表现为"卡死"。consolidate 是结构化 JSON 任务，关闭 thinking。
-    if models::model_provider(model) == ApiProvider::Compatible {
-        request_body["enable_thinking"] = json!(false);
+    if let Some(disabled) = aux_disable_thinking_for_model(model) {
+        request_body["enable_thinking"] = json!(disabled);
     }
 
     for attempt in 1..=REQUEST_MAX_ATTEMPTS {
@@ -2853,6 +2848,90 @@ mod tests {
             .iter()
             .find(|m| m.provider == crate::ai::provider::ApiProvider::Compatible && m.is_vl)
             .map(|m| m.name.clone())
+    }
+
+    fn first_model_name_for_provider(
+        provider: crate::ai::provider::ApiProvider,
+    ) -> Option<String> {
+        crate::ai::model_names::all()
+            .iter()
+            .find(|m| m.provider == provider)
+            .map(|m| m.name.clone())
+    }
+
+    /// 逐字节 wire guard：锁死各 provider 的 `build_request_body` 序列化结果，
+    /// 作为 provider adapter 重构「不破坏对外 wire 行为」的可执行回归网。
+    /// 字段顺序由 [`RequestBody`] 声明顺序决定，serde 输出稳定可断言整串。
+    #[test]
+    fn build_request_body_wire_format_is_byte_stable_per_provider() {
+        use crate::ai::provider::ApiProvider;
+
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("hi".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        // Compatible：嵌套 reasoning.effort + enable_thinking/enable_search，无 stream_options（非流式）。
+        let compatible_model = first_model_name_for_provider(ApiProvider::Compatible)
+            .expect("models.json must contain a Compatible model");
+        let compatible = build_request_body(
+            &compatible_model,
+            &messages,
+            false,
+            true,
+            Some(true),
+            None,
+            None,
+            Some("high"),
+        );
+        assert_eq!(
+            serde_json::to_string(&compatible).unwrap(),
+            format!(
+                r#"{{"model":"{compatible_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"enable_thinking":true,"enable_search":true,"reasoning":{{"effort":"high"}}}}"#
+            )
+        );
+
+        // OpenAI：顶层 reasoning_effort，省略扩展字段，流式追加 stream_options。
+        let openai_model = first_openai_model_name();
+        let openai = build_request_body(
+            &openai_model,
+            &messages,
+            true,
+            true,
+            Some(true),
+            None,
+            None,
+            Some("high"),
+        );
+        assert_eq!(
+            serde_json::to_string(&openai).unwrap(),
+            format!(
+                r#"{{"model":"{openai_model}","messages":[{{"role":"user","content":"hi"}}],"stream":true,"reasoning_effort":"high","stream_options":{{"include_usage":true}}}}"#
+            )
+        );
+
+        // OpenCode：与 OpenAI 兼容族字段一致（顶层 reasoning_effort、省略扩展字段）。
+        if let Some(opencode_model) = first_model_name_for_provider(ApiProvider::OpenCode) {
+            let opencode = build_request_body(
+                &opencode_model,
+                &messages,
+                false,
+                true,
+                Some(true),
+                None,
+                None,
+                Some("medium"),
+            );
+            assert_eq!(
+                serde_json::to_string(&opencode).unwrap(),
+                format!(
+                    r#"{{"model":"{opencode_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"reasoning_effort":"medium"}}"#
+                )
+            );
+        }
     }
 
     #[test]

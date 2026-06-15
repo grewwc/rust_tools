@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use crate::ai::{
     driver::print::format_section_header,
     models,
-    provider::ApiProvider,
+    provider,
     request::StreamChunk,
     theme::{ACCENT_MUTED, ACCENT_RULE, DIM, RESET},
     types::{App, StreamOutcome, StreamResult, ToolCall, take_stream_cancelled},
@@ -119,8 +119,12 @@ pub(super) async fn stream_response(
 }
 
 fn should_show_opencode_waiting_hint(app: &App) -> bool {
-    io::stdout().is_terminal()
-        && models::model_provider(&app.current_model) == ApiProvider::OpenCode
+    if !io::stdout().is_terminal() {
+        return false;
+    }
+    let provider = models::model_provider(&app.current_model);
+    let endpoint = models::endpoint_for_model(&app.current_model, &app.config.endpoint);
+    provider::adapter_for(provider, &endpoint).shows_waiting_hint()
 }
 
 fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {

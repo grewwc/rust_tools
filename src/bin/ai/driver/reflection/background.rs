@@ -1210,27 +1210,19 @@ pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Optio
     {
         return None;
     }
-    let body = match crate::ai::models::model_provider(model) {
-        crate::ai::provider::ApiProvider::Compatible => json!({
-            "model": model,
-            "messages": messages,
-            "stream": false,
-            "enable_thinking": false
-        }),
-        _ => json!({
-            "model": model,
-            "messages": messages,
-            "stream": false
-        }),
-    };
-    let req = BACKGROUND_HTTP_CLIENT.post(&endpoint);
-    let req = if api_key.trim().is_empty()
-        && crate::ai::models::endpoint_supports_anonymous_auth(&endpoint)
-    {
-        req
-    } else {
-        req.bearer_auth(api_key)
-    };
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "stream": false
+    });
+    if let Some(disabled) = request::aux_disable_thinking_for_model(model) {
+        body["enable_thinking"] = json!(disabled);
+    }
+    let req = request::apply_request_auth(
+        BACKGROUND_HTTP_CLIENT.post(&endpoint),
+        &endpoint,
+        &api_key,
+    );
     // 后台反射请求：60 秒超时，避免永久阻塞 daemon 任务
     let send_future = req
         .header("Content-Type", "application/json")

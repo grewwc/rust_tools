@@ -22,7 +22,7 @@ src/
     │   ├── builtin_agents/   # 5 agents: build, executor, explore, plan, prompt-skill
     │   ├── builtin_skills/   # 3 skills: debugger, code-review, refactor
     │   ├── agents.rs skills.rs models.rs config.rs types.rs cli.rs
-    │   ├── history/ knowledge/ mcp/ prompt/ stream/ config/
+    │   ├── history/ knowledge/ mcp/ prompt/ stream/ config/ provider/
     │   └── config_schema.rs  # All config key constants (AiConfig)
     ├── ff/ fk/               # File search tools
     └── c.rs j.rs gx.rs ...   # Other CLI utilities
@@ -85,6 +85,12 @@ cargo test --bin a test_xxx       # Filter tests by name
    - Runtime config via `configw::get_all_config()`
    - Model registry: `models.json` (endpoints, quality tiers, VL support)
    - Embedding (optional, off by default): set `ai.embedding.enable=true` + `aliyun.api_key` (or `ai.embedding.api_key`) to enable semantic recall via Aliyun 百炼 OpenAI-compatible `/embeddings` (`text-embedding-v4`). Any failure degrades to BM25/lexical — see [embedder.rs](src/bin/ai/knowledge/indexing/embedder.rs).
+
+6. **Provider adapter layer** (`src/bin/ai/provider/`)
+   - `ApiProvider` enum { Compatible, OpenAi, OpenCode } + `ModelQualityTier` / `ReasoningEffort` live in `provider/mod.rs`
+   - `provider/adapter.rs`: `trait ProviderAdapter` (template-method + override) collapses all per-provider behavior differences into one place — request-body fields (`enable_thinking`/`enable_search`/`reasoning_effort`/nested `reasoning`), aux-task thinking disable, default endpoint, API-key candidate chain, stream-chunk parsing, and the waiting-hint UX flag
+   - Zero-state static singletons: `CompatibleAdapter` / `OpenAiAdapter` / `OpenRouterAdapter` / `OpenCodeAdapter`; dispatch via `adapter_for(provider, endpoint)` (OpenRouter detected by endpoint containing `openrouter.ai`)
+   - Main pipeline (`request.rs` / `models.rs` / `stream/normalize.rs` / `stream/runtime.rs` / `driver/reflection/background.rs`) keeps free-function skeletons and only calls adapter hooks at difference points — wire format stays byte-identical (locked by per-provider `build_request_body` wire-guard tests)
 
 ## Coding Standards
 
