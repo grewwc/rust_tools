@@ -626,10 +626,6 @@ fn build_system_prompt(
 
     // Identity 段：合并通用 identity + agent / skill enforcement，避免 4 段
     // 重复 "you must follow ..." 充斥 prompt cache。
-    let mut identity = String::from(
-        "You are a highly capable general-purpose AI assistant. You help users plan, research, write, analyze, and act across any domain — code is one of many, not the only one. Adapt your approach to the task at hand: use code/tooling when the request is technical, and plain reasoning or research when it is not. Aim to be sharp and to the point — answer what was asked, not more.",
-    );
-
     let agent_extra = active_agent
         .map(|agent| agent.build_system_prompt())
         .filter(|s| !s.trim().is_empty());
@@ -637,21 +633,29 @@ fn build_system_prompt(
         .map(|skill| skill.build_system_prompt())
         .filter(|s| !s.trim().is_empty());
 
-    if agent_extra.is_some() || skill_extra.is_some() {
-        identity.push_str("\n\nEnforcement: follow the active agent profile (if any) and skill instructions (if any) precisely; if both are active, satisfy both; on conflict with the user request, ask one brief clarification aligned with the more specific (skill > agent) layer.");
-    }
-    if let Some(extra) = agent_extra {
-        identity.push_str("\n\n[Agent profile]\n");
-        identity.push_str(extra.trim());
-    }
-    if let Some(extra) = skill_extra {
-        identity.push_str("\n\n[Skill instructions]\n");
-        identity.push_str(extra.trim());
-    }
+    let identity = if let Some(extra) = &agent_extra {
+        // Agent provides its own identity — use it directly, no generic fallback
+        let mut s = extra.trim().to_string();
+        if let Some(skill_text) = &skill_extra {
+            s.push_str("\n\n[Skill instructions]\n");
+            s.push_str(skill_text.trim());
+        }
+        s.push_str("\n\nEnforcement: agent/skill instructions above take precedence. On conflict, skill > agent > generic guidelines.");
+        s
+    } else if let Some(extra) = &skill_extra {
+        let mut s = String::from("You are a capable AI assistant following the active skill instructions.");
+        s.push_str("\n\n[Skill instructions]\n");
+        s.push_str(extra.trim());
+        s
+    } else {
+        String::from(
+            "You are a highly capable general-purpose AI assistant. Adapt your approach to the task at hand: use code/tooling when the request is technical, and plain reasoning or research when it is not. Aim to be sharp and to the point — answer what was asked, not more.",
+        )
+    };
     b.push(ContextKind::Identity, identity);
 
-    b.push(ContextKind::Behavior, "Response style:\n- Lead with the answer or the action; skip preamble, restating the question, and meta commentary like \"Let me…\" / \"I'll now…\".\n- One sentence beats three. Drop filler, transitions, and recaps the user can already see.\n- Default to short, direct prose. Use lists/sections only when they materially help; never pad output to look thorough.\n- Do not narrate tool calls before or after running them — let the calls and their results speak. A brief status line is only appropriate at real milestones or when a plan changes.\n- Conciseness must NOT come at the cost of correctness: for non-trivial requests, think the problem through (read code, check facts) BEFORE answering. If you are uncertain, say so in one line and gather evidence rather than guessing tersely.\n- When stating a conclusion that depends on code, cite the exact file/line; do not summarize from memory.");
-    b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- If the answer depends on repo/code facts, inspect with tools before concluding.\n- If the user asks for edits, perform edits with tools instead of only describing them.\n- If the user asks to run/build/test/reproduce, run commands with tools when available.\n- On tool failure, read the error and correct course before answering. Retry with fixed args or switch tools; avoid repeating the same failing call.\n- If `code_search` returns only `No ...` results, broaden scope instead of rerunning unchanged.");
+    b.push(ContextKind::Behavior, "Response style:\n- Lead with answer or action; skip preamble, restatements, and meta-commentary.\n- Default to short, direct prose. Use lists/sections only when they materially improve clarity.\n- Be concise but not at the cost of correctness: verify facts with tools before concluding. When citing code, include file/line.\n- Do not narrate tool calls before/during execution — let their output speak. Brief status lines only at real milestones or when the plan changes.");
+    b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Prefer tools over speculation: inspect code, run commands, search before concluding.\n- If the user asks to run/build/test/reproduce, use tools (execute_command / cargo_test) when available.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- Make minimal, targeted edits (apply_patch) rather than rewriting entire files.");
 
     if let Some(project_prompt) = build_project_instruction_prompt() {
         b.push(ContextKind::Policy, project_prompt);
@@ -685,29 +689,29 @@ fn build_system_prompt(
     }
 
     if has_tool(available_tools, "knowledge_save") {
-        b.push(ContextKind::Policy, "Knowledge save:\n- When the user explicitly asks to remember/save/store something for later use, call `knowledge_save`. Do NOT skip the save step.\n- If the user states a durable preference, standing constraint, or stable decision that will likely matter later, proactively call `knowledge_save` even without explicit remember wording.\n- When the user asks what has been remembered or asks to recall saved information, use `knowledge_search` or `knowledge_list`.");
+        b.push(ContextKind::Policy, "Knowledge save:\n- If the user asks to remember or states a durable preference/constraint, call `knowledge_save`.\n- When asked about remembered info, use `knowledge_search` or `knowledge_list`.");
     }
 
     if has_tool(available_tools, "plan") || has_tool(available_tools, "spawn_process") {
-        b.push(ContextKind::Behavior, "Planning & Sub-process Execution:\n- Simple tasks: act directly without `plan`.\n- Complex multi-step tasks: use `plan` first.\n- If a task can be delegated or run autonomously in the background (e.g. searching broadly, running a heavy test suite), use `spawn_process` to let the Agent OS handle it asynchronously.\n- Child processes can be created with reduced capabilities for least-privilege execution.\n- After spawning, you can either continue your work in parallel, or use `wait_process` to yield control until the child finishes.\n- Use `sleep_process` to suspend yourself for future scheduler ticks.\n- Use `kill_process` to terminate a descendant that is no longer needed.\n- Use `reap_process` to collect a terminated descendant and remove it from the process table.\n- Use `send_ipc_message` and `read_mailbox` to communicate across processes.");
+        b.push(ContextKind::Behavior, "Planning & Sub-process Execution:\n- Simple tasks: act directly. Complex ones: call `plan` first.\n- Use `spawn_process` for work that can run autonomously in the background.\n- Use `wait_process` to yield until a child finishes, `kill_process` to stop one, `reap_process` to collect it.\n- Use `send_ipc_message`/`read_mailbox` for cross-process communication.");
     }
 
     if has_tool(available_tools, "tool_spawn") || has_tool(available_tools, "tool_wait") {
-        b.push(ContextKind::Behavior, "Async Tool Orchestration:\n- Use `tool_spawn` to launch independent builtin or MCP tool calls in parallel.\n- Use `tool_wait` with `wait_policy=all` to join a full batch, or `wait_policy=any` to resume when any branch finishes.\n- When a process wakes because async tools finished, inspect the wake-up mailbox message carefully.\n- After wake-up, prefer `tool_status` to inspect all task states, `tool_wait` to collect newly finished results, or `tool_cancel` to stop low-value still-running branches.\n- Do not blindly wait again if the completed results already support an answer.\n- If mailbox messages already identify the relevant finished tasks, continue reasoning immediately instead of re-querying everything.");
+        b.push(ContextKind::Behavior, "Async Tool Orchestration:\n- Use `tool_spawn` for parallel independent tool calls.\n- Use `tool_wait` (all/any) to join results, `tool_status` to peek, `tool_cancel` to drop low-value branches.\n- If wake-up messages identify finished tasks, act on them immediately instead of re-querying.");
     }
 
     if has_tool(available_tools, "task_spawn") || has_tool(available_tools, "task_wait") {
-        b.push(ContextKind::Behavior, "Async Subagent Orchestration (task_*):\n- `task_spawn` launches a subagent task asynchronously and returns a task_id immediately. Fan out multiple subagent tasks in parallel when their work is independent.\n- `task_wait` collects results. Its `timeout_secs` is a per-call wait budget — when it elapses without satisfying the policy, the call returns the already-collected results plus a clear note that the remaining subagents are still running. This is NOT a stall: re-call `task_wait` with the same task_ids to keep waiting (or pass `wait_policy=\"any\"` to wake on the first finisher).\n- `task_status` is non-blocking: use it to peek at progress without consuming results.\n- There is NO `task_cancel`. Do not invent it. If you need to abandon work, just stop calling `task_wait` and let the subagent run to completion in the background; its result will be reaped by the kernel.\n- Do not confuse the `task_*` family with `tool_*` — they are distinct. `tool_wait` cannot consume a task_id, and `task_wait` cannot consume a tool ticket.");
+        b.push(ContextKind::Behavior, "Async Subagent Orchestration (task_*):\n- `task_spawn`: launch a subagent task; fan out parallel independent subtasks.\n- `task_wait`: collect results. Timeout is per-call — re-call or use `wait_policy=\"any\"` for early wake-up.\n- `task_status`: non-blocking peek. No `task_cancel` — just let orphaned tasks finish.\n- `task_*` and `tool_*` are distinct families: don't confuse their IDs.");
     }
 
     if has_tool(available_tools, "knowledge_search")
         || has_tool(available_tools, "knowledge_semantic_search")
     {
-        b.push(ContextKind::Policy, "Knowledge retrieval:\n- If the request involves prior decisions/context/preferences, use `knowledge_search` or `knowledge_semantic_search`.\n- Use `knowledge_list` when the user asks what is remembered.\n- If semantic index seems stale, run `knowledge_rebuild_index`.");
+        b.push(ContextKind::Policy, "Knowledge retrieval:\n- Before answering from memory, search with `knowledge_search`/`knowledge_semantic_search`.\n- Use `knowledge_list` when asked what is remembered.");
     }
 
     if has_tool(available_tools, "web_search") || has_tool(available_tools, "web_fetch") {
-        b.push(ContextKind::Policy, "Web search:\n- For real-time or time-sensitive topics, use `web_search` first. Do not answer from memory alone.\n- Use `web_fetch` for detailed content from selected URLs.");
+        b.push(ContextKind::Policy, "Web search:\n- For real-time or time-sensitive topics, use `web_search` first (not memory).\n- Use `web_fetch` for detailed content from selected URLs.");
     }
 
     b
@@ -1195,9 +1199,9 @@ mod tests {
         let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
         // 风格段必须存在，且要求"先答后说、不啰嗦"
         assert!(prompt.contains("Response style:"));
-        assert!(prompt.contains("Lead with the answer"));
+        assert!(prompt.contains("Lead with answer"));
         // 必须保留"简洁不能换错"的安全垫，避免过度精简导致错误判断
-        assert!(prompt.contains("Conciseness must NOT come at the cost of correctness"));
+        assert!(prompt.contains("concise but not at the cost of correctness"));
     }
 
     #[test]

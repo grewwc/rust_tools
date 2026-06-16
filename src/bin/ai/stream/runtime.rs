@@ -1,6 +1,8 @@
 use std::io::{self, IsTerminal, Write};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
+
+use regex::Regex;
 
 use crate::ai::{
     driver::print::format_section_header,
@@ -380,32 +382,68 @@ fn format_prompt_cache_metrics(prompt_tokens: u64, cached_tokens: u64) -> Option
     ))
 }
 
-/// 尝试把整段 assistant 文本反向识别为一个/多个 tool_call。仅在文本经过
-/// 围栏剥离后能完整解析成 JSON 对象（含 `name` + `arguments`）或这种对象
-/// 的数组时才会成功，避免误伤普通文本回答。
+type InlineToolCallParser = fn(&str) -> Option<Vec<ToolCall>>;
+
+const INLINE_PARSERS: &[InlineToolCallParser] = &[
+    recover_hermes_xml_tool_calls,
+    recover_anthropic_xml_tool_calls,
+    recover_json_tool_calls,
+];
+
+/// 把模型输出里的命名空间前缀 XML 标签归一化为标准 XML 标签，例如
+/// `<|DSML|invoke name="x">` / `<｜｜DSML｜｜invoke name="x">` → `<invoke name="x">`，
+/// `</|DSML|invoke>` / `</｜｜DSML｜｜invoke>` → `</invoke>`。
+/// 这样 Hermes / Anthropic 解析器无需为每个 `<|PREFIX|>` 协议单独适配。
+pub(super) fn normalize_inline_tool_call_markup(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("<|") && !text.contains("<｜｜") && !text.contains("</｜｜") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    static OPEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"<(?:\|([^>|]+)\|([^\s>]+)|｜｜([^＞>]+)｜｜([^\s>]+))"#)
+            .expect("valid open-tag regex")
+    });
+    static CLOSE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"</(?:\|([^>|]+)\|([^\s>]+)|｜｜([^＞>]+)｜｜([^\s>]+))>"#)
+            .expect("valid close-tag regex")
+    });
+    let s = OPEN_RE.replace_all(text, |caps: &regex::Captures<'_>| {
+        let local = caps
+            .get(2)
+            .or_else(|| caps.get(4))
+            .map(|m| m.as_str())
+            .unwrap_or("");
+        format!("<{local}")
+    });
+    std::borrow::Cow::Owned(
+        CLOSE_RE
+            .replace_all(&s, |caps: &regex::Captures<'_>| {
+                let local = caps
+                    .get(2)
+                    .or_else(|| caps.get(4))
+                    .map(|m| m.as_str())
+                    .unwrap_or("");
+                format!("</{local}>")
+            })
+            .into_owned(),
+    )
+}
+
+/// 尝试把整段 assistant 文本反向识别为一个/多个 tool_call。
+/// 通过 parser 注册表 + 前置 XML 命名空间归一化，统一处理不同模型产出的
+/// inline tool call 形态（Hermes XML、Anthropic XML、JSON、`<|PREFIX|>` 包装）。
+/// 任一 parser 成功即返回；全部失败则视为普通文本回答。
 fn recover_inline_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
-    // 优先尝试 Hermes / Qwen 风格的 XML tool call：
-    //   <tool_call><function=read_file>{"path":"/x"}</function></tool_call>
-    // 或 parameter 标签形式：
-    //   <function=read_file><parameter=path>/x</parameter></function>
-    // 这种形态不是合法 JSON，旧实现会解析失败 → 原样打印 markup 且不执行工具，
-    // turn 直接 dead-end。`<function=` 是极强的信号，普通散文不会出现，安全。
-    if text.contains("<function=") {
-        if let Some(calls) = recover_hermes_xml_tool_calls(text) {
+    let normalized = normalize_inline_tool_call_markup(text);
+    for parser in INLINE_PARSERS {
+        if let Some(calls) = parser(&normalized) {
             return Some(calls);
         }
     }
+    None
+}
 
-    // Anthropic / Claude 风格：<invoke name="read_file"><parameter name="path">/x</parameter></invoke>
-    // 可被 <function_calls>/<tool_calls> 包裹，标签可带命名空间前缀。某些模型
-    // （deepseek-v4-flash）用这种格式输出工具调用；若流式解析漏掉则在 finalize
-    // 兜底救回，避免 turn 被误判为 Completed 而工具从未执行。
-    if text.contains("<invoke") {
-        if let Some(calls) = recover_anthropic_xml_tool_calls(text) {
-            return Some(calls);
-        }
-    }
-
+/// 从 assistant 文本里识别 JSON 形态的工具调用（单个对象或数组）。
+fn recover_json_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let stripped = strip_inline_tool_call_wrappers(text);
     let trimmed = stripped.trim();
     if trimmed.is_empty() {
@@ -2052,6 +2090,34 @@ mod tests {
         if let Ok(mut guard) = GLOBAL_OS.lock() {
             *guard = None;
         }
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_normalizes_namespaced_xml_prefix() {
+        // 某些前端/模型会把 Anthropic 风格的 invoke 包在 <|DSML|> 协议里输出。
+        // 归一化后应被 Anthropic XML 解析器识别，无需为每种 <|PREFIX|> 单独写 parser。
+        let raw = r#"<|DSML|tool_calls><|DSML|invoke name="apply_patch"><|DSML|parameter name="file_path">/tmp/x</|DSML|parameter><|DSML|parameter name="patch">---</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>"#;
+        let calls = recover_inline_tool_calls(raw).expect("should recover DSML-wrapped tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "apply_patch");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["file_path"], "/tmp/x");
+        assert_eq!(args["patch"], "---");
+    }
+
+    #[test]
+    fn recover_inline_tool_calls_normalizes_fullwidth_dsml_prefix() {
+        // debug.md 里的 DeepSeek 实际会输出全角竖线版本：<｜｜DSML｜｜...>。
+        let raw = r#"<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="apply_patch"><｜｜DSML｜｜parameter name="file_path">/tmp/x</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name="patch">---</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"#;
+        let calls =
+            recover_inline_tool_calls(raw).expect("should recover fullwidth-DSML tool calls");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "apply_patch");
+        let args: serde_json::Value =
+            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["file_path"], "/tmp/x");
+        assert_eq!(args["patch"], "---");
     }
 }
 

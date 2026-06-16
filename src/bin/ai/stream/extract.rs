@@ -133,7 +133,8 @@ pub(super) fn extract_chunk_events_streaming(
         events.push(StreamTextEvent::CloseThinking);
     }
     if !delta.content.is_empty() {
-        let (cleaned, mut hermes_events) = hermes_streamer.push(&delta.content);
+        let normalized = super::runtime::normalize_inline_tool_call_markup(&delta.content);
+        let (cleaned, mut hermes_events) = hermes_streamer.push(&normalized);
         // 再把 Hermes 抽离后的可见文本交给 Anthropic（`<invoke name=...>`）解析器，
         // 兼容 deepseek-v4-flash 等用该格式输出工具调用的模型。
         let (cleaned, anthropic_events) = anthropic_streamer.push(&cleaned);
@@ -428,6 +429,53 @@ mod tests {
                 StreamTextEvent::AppendContent("line 1\nline 2\nline 3".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn streaming_extract_normalizes_fullwidth_dsml_markup_before_tool_parsing() {
+        let chunk = StreamChunk {
+            choices: vec![StreamChoice {
+                delta: StreamDelta {
+                    content: r#"prefix<｜｜DSML｜｜tool_calls><｜｜DSML｜｜invoke name="read_file"><｜｜DSML｜｜parameter name="path">/tmp/x</｜｜DSML｜｜parameter></｜｜DSML｜｜invoke></｜｜DSML｜｜tool_calls>"#.to_string(),
+                    reasoning_content: String::new(),
+                    reasoning_details: String::new(),
+                    tool_calls: Vec::new(),
+                },
+                finish_reason: None,
+            }],
+            ..Default::default()
+        };
+
+        let mut thinking_open = false;
+        let mut hidden_meta_parse = HiddenMetaParseState::default();
+        let mut streamer = InternalToolCallStreamer::new();
+        let mut hermes_streamer = HermesXmlToolCallStreamer::new();
+        let mut anthropic_streamer = AnthropicXmlToolCallStreamer::new();
+        let (events, tool_events) = extract_chunk_events_streaming(
+            &chunk,
+            "<meta:self_note>",
+            "</meta:self_note>",
+            &mut thinking_open,
+            &mut hidden_meta_parse,
+            &mut streamer,
+            &mut hermes_streamer,
+            &mut anthropic_streamer,
+        );
+
+        assert_eq!(events, vec![StreamTextEvent::AppendContent("prefix".to_string())]);
+        assert_eq!(tool_events.len(), 3);
+        match (&tool_events[0], &tool_events[1], &tool_events[2]) {
+            (
+                InternalToolCallStreamEvent::Begin(name),
+                InternalToolCallStreamEvent::Args(args),
+                InternalToolCallStreamEvent::End,
+            ) => {
+                assert_eq!(name, "read_file");
+                let v: serde_json::Value = serde_json::from_str(args).unwrap();
+                assert_eq!(v["path"], "/tmp/x");
+            }
+            other => panic!("unexpected tool events: {other:?}"),
+        }
     }
 }
 
