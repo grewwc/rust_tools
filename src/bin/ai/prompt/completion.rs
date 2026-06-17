@@ -47,8 +47,6 @@ static FLAGS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
     for flag in &[
         // bool 选项
         "--clear",
-        "--thinking", "-t",
-        "--short-output", "-s",
         "--list-tools", "--list-mcp-tools", "--list-skills",
         "--list-agents", "--no-skills",
         "--help", "-h",
@@ -56,12 +54,10 @@ static FLAGS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         "--note-search", "-ns",
         "--generate-completions",
         // string/int 选项
-        "--history",
         "--model", "-m",
         "--agent", "-a",
         "--session", "-ss",
         "--files", "-f",
-        "--out", "-o",
         "--mcp-config",
         "--reasoning-effort", "-re",
         "--note", "-n",

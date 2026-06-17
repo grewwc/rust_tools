@@ -635,16 +635,14 @@ pub(super) fn should_try_model_fallback(err: &RequestError) -> bool {
 /// Resolve whether to enable thinking mode for this request.
 ///
 /// Decision order:
-/// 1. CLI `--thinking` flag always wins
-/// 2. Config `ai.model.thinking=true` forces thinking when the model supports it
-/// 3. If model doesn't support thinking, return false
-/// 4. If auto-thinking is disabled by config, return false
-/// 5. Auto-detect based on question complexity
+/// 1. Config `ai.model.thinking=true` forces thinking when the model supports it
+/// 2. If model doesn't support thinking, return false
+/// 3. If auto-thinking is disabled by config, return false
+/// 4. Auto-detect based on question complexity
 #[commonw::debug_measure_time("resolve_thinking")]
 async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool {
     let cfg = configw::get_all_config();
-    let force_thinking =
-        app.cli.thinking || config_bool_is_true(cfg.get_opt(AiConfig::MODEL_THINKING));
+    let force_thinking = config_bool_is_true(cfg.get_opt(AiConfig::MODEL_THINKING));
 
     if force_thinking {
         return models::enable_thinking(model);
@@ -665,12 +663,7 @@ async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool 
         return false;
     }
 
-    let question = messages
-        .iter()
-        .filter(|m| m.role == "user")
-        .filter_map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
+    let question = latest_user_message_text(messages).unwrap_or_default();
     let question = question.trim();
     if !question.is_empty() {
         let local_intent = intent_recognition::detect_intent_with_model_path(
@@ -697,6 +690,14 @@ async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool 
     decide_thinking_via_model(app, model, messages)
         .await
         .unwrap_or(false)
+}
+
+fn latest_user_message_text(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(extract_message_text)
 }
 
 fn local_thinking_decision(
@@ -796,12 +797,7 @@ fn local_thinking_decision(
 )]
 async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]) -> Option<bool> {
     let gate_start = Instant::now();
-    let user_text: String = messages
-        .iter()
-        .filter(|m| m.role == "user")
-        .filter_map(extract_message_text)
-        .collect::<Vec<_>>()
-        .join("\n");
+    let user_text = latest_user_message_text(messages).unwrap_or_default();
     let question = user_text.trim();
     if question.is_empty() {
         crate::ai::agent_hang_debug!(
@@ -953,7 +949,7 @@ pub(super) async fn do_request_messages(
     }
     let (tools_value, tool_choice) = agent_tools_for_request(app, model);
     let thinking_start = Instant::now();
-    let force_thinking_requested = app.cli.thinking || config_forces_thinking();
+    let force_thinking_requested = config_forces_thinking();
     let enable_thinking = resolve_thinking(app, model, &normalized_messages).await;
     crate::ai::agent_hang_debug!(
         "pre-fix",
@@ -2746,14 +2742,12 @@ mod tests {
             current_agent: String::new(),
             current_agent_manifest: None,
             pending_files: None,
-            pending_short_output: false,
             forced_skill: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
             cancel_stream: Arc::new(AtomicBool::new(false)),
             ignore_next_prompt_interrupt: false,
-            writer: None,
             prompt_editor: None,
             agent_context: None,
             last_skill_bias: None,
@@ -2811,6 +2805,41 @@ mod tests {
         let intent = UserIntent::new(CoreIntent::RequestAction);
         let decision = local_thinking_decision("帮我写个函数", &intent);
         assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn thinking_gate_uses_latest_user_message_only() {
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Value::String(
+                    "请帮我排查这个复杂报错，并分析可能的修复方案\npanic: index out of bounds"
+                        .to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String("之前的复杂问题已经回答完毕。".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: Value::String("为什么天是蓝的？".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        assert_eq!(
+            latest_user_message_text(&messages).as_deref(),
+            Some("为什么天是蓝的？")
+        );
     }
 
     #[tokio::test]

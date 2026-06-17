@@ -1,9 +1,9 @@
-use std::{fs, fs::File, io, path::Path, path::PathBuf};
+use std::{fs, path::PathBuf};
 
 use crate::ai::config_schema::AiConfig;
 use crate::commonw::{
     configw,
-    utils::{expanduser, open_file_for_write_truncate},
+    utils::expanduser,
 };
 
 use super::{models, types::AppConfig};
@@ -93,13 +93,6 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         agent_route_model_path: PathBuf::from(expanduser(&agent_route_model_path).as_ref()),
         skill_match_model_path: PathBuf::from(expanduser(&skill_match_model_path).as_ref()),
     })
-}
-
-pub(super) fn open_output_writer(path: Option<&str>) -> io::Result<Option<File>> {
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    open_file_for_write_truncate(Path::new(path), 0o644).map(Some)
 }
 
 #[allow(dead_code)]

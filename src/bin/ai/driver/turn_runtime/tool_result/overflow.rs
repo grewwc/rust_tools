@@ -120,7 +120,11 @@ pub(super) fn build_model_overflow_stub(
 ) -> String {
     let overflow_notice = if let Some(path) = path {
         format!(
-            "Output too large; full result saved to session file.\n- file_path: {}\n- summary: {}\n",
+            "Output too large; full result saved to a file. The COMPLETE output is NOT in context.\n\
+             To read it, call read_file on this path (read in chunks, e.g. offset=1, limit=200), \
+             then narrow to precise line ranges once located.\n\
+             The summary / tail_preview below are PARTIAL — do not rely on them if you need full detail.\n\
+             - file_path: {}\n- summary: {}\n",
             path.display(),
             summary.summary
         )

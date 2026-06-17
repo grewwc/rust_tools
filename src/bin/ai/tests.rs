@@ -63,14 +63,12 @@ fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::
         current_agent: "build".to_string(),
         current_agent_manifest: None,
         pending_files: None,
-        pending_short_output: false,
         forced_skill: None,
         attached_image_files: Vec::new(),
         shutdown: Arc::new(AtomicBool::new(false)),
         streaming: Arc::new(AtomicBool::new(false)),
         cancel_stream,
         ignore_next_prompt_interrupt: false,
-        writer: None,
         prompt_editor: None,
         agent_context: None,
         last_skill_bias: None,
@@ -133,14 +131,12 @@ fn resolve_model_is_unicode_safe() {
         current_agent: "build".to_string(),
         current_agent_manifest: None,
         pending_files: None,
-        pending_short_output: false,
         forced_skill: None,
         attached_image_files: Vec::new(),
         shutdown,
         streaming,
         cancel_stream,
         ignore_next_prompt_interrupt: false,
-        writer: None,
         prompt_editor: None,
         agent_context: None,
         last_skill_bias: None,
@@ -493,7 +489,7 @@ fn history_compression_summarizes_when_keep_last_exceeds_turns_but_budget_overfl
     append_history(&path, &blob).unwrap();
 
     let messages = build_message_arr(300, &path).unwrap();
-    // keep_last=256 models the CLI default `--history 256`; max_chars=4000
+    // keep_last=256 models the default configured history window; max_chars=4000
     // is far smaller than the raw history size (30 turns * ~560 bytes ~= 17k).
     let compressed = compress_messages_for_context(messages, 4000, 256, 600, None);
 

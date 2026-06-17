@@ -1,10 +1,7 @@
 use rustc_hash::FxHashSet;
 use serde_json::Value;
 
-use crate::ai::{
-    history::{Message, messages_total_chars_pub},
-    types::App,
-};
+use crate::ai::{history::Message, types::App};
 
 use super::mid_turn_compress_soft_threshold;
 
@@ -84,32 +81,40 @@ pub(super) fn apply_pre_request_context_budget(
     app: &App,
     messages: &mut Vec<Message>,
 ) -> ContextBudgetReport {
-    let before_chars = messages_total_chars_pub(messages);
     let target_chars = mid_turn_compress_soft_threshold(app.config.history_max_chars);
-    let segments = classify_segments(messages);
-    let mut report = summarize_segments(before_chars, target_chars, &segments);
-    let protected = collect_protected_messages(messages);
-    let original_before_lossless = messages.clone();
+    let scan = quick_scan(messages);
+    let mut report = ContextBudgetReport {
+        before_chars: scan.total_chars,
+        after_chars: scan.total_chars,
+        target_chars,
+        ..ContextBudgetReport::default()
+    };
 
-    let lossless = apply_lossless_prepass(messages);
-    report.lossless_removed_messages = lossless.removed_messages;
-    report.lossless_saved_chars = lossless.saved_chars;
-    if lossless.removed_messages > 0 {
-        report.changed = true;
+    if scan.total_chars <= target_chars && !scan.has_lossless_candidate {
+        return report;
     }
 
-    let after_lossless_chars = messages_total_chars_pub(messages);
+    let mut after_lossless_chars = scan.total_chars;
+    if scan.has_lossless_candidate {
+        let lossless = apply_lossless_prepass(messages);
+        report.lossless_removed_messages = lossless.removed_messages;
+        report.lossless_saved_chars = lossless.saved_chars;
+        if lossless.removed_messages > 0 {
+            report.changed = true;
+            after_lossless_chars = scan.total_chars.saturating_sub(lossless.saved_chars);
+            report.after_chars = after_lossless_chars;
+        }
+    }
+
     if after_lossless_chars <= target_chars {
-        report.after_chars = after_lossless_chars;
-        if !protected_messages_preserved(messages, &protected) {
-            *messages = original_before_lossless;
-            report.after_chars = before_chars;
-            report.changed = false;
-            report.rolled_back = true;
+        if report.changed {
+            fill_segment_summary(&mut report, messages);
         }
         return report;
     }
 
+    fill_segment_summary(&mut report, messages);
+    let protected = collect_protected_messages(messages);
     let overflow_dir = {
         use crate::ai::history::SessionStore;
         let store = SessionStore::new(app.config.history_file.as_path());
@@ -126,10 +131,34 @@ pub(super) fn apply_pre_request_context_budget(
     if after_chars >= after_lossless_chars || !protected_messages_preserved(messages, &protected) {
         *messages = original;
         report.after_chars = after_lossless_chars;
-        report.changed = lossless.removed_messages > 0;
-        report.rolled_back = after_chars < before_chars;
+        report.changed = report.lossless_removed_messages > 0;
+        report.rolled_back = after_chars < scan.total_chars;
     }
     report
+}
+
+#[derive(Debug, Default)]
+struct QuickScan {
+    total_chars: usize,
+    has_lossless_candidate: bool,
+}
+
+fn quick_scan(messages: &[Message]) -> QuickScan {
+    let mut scan = QuickScan::default();
+    let mut seen_internal_notes: FxHashSet<&Value> = FxHashSet::default();
+    for message in messages {
+        scan.total_chars = scan.total_chars.saturating_add(message_chars(message));
+        if !scan.has_lossless_candidate {
+            if is_empty_non_protocol_message(message) {
+                scan.has_lossless_candidate = true;
+            } else if message.role == crate::ai::history::ROLE_INTERNAL_NOTE
+                && !seen_internal_notes.insert(&message.content)
+            {
+                scan.has_lossless_candidate = true;
+            }
+        }
+    }
+    scan
 }
 
 #[derive(Debug, Default)]
@@ -139,24 +168,25 @@ struct LosslessStats {
 }
 
 fn apply_lossless_prepass(messages: &mut Vec<Message>) -> LosslessStats {
-    let before = messages_total_chars_pub(messages);
-    let before_len = messages.len();
     let mut seen_internal_notes: FxHashSet<String> = FxHashSet::default();
+    let mut stats = LosslessStats::default();
     messages.retain(|message| {
         if is_empty_non_protocol_message(message) {
+            stats.removed_messages += 1;
+            stats.saved_chars = stats.saved_chars.saturating_add(message_chars(message));
             return false;
         }
         if message.role == crate::ai::history::ROLE_INTERNAL_NOTE {
             let key = stable_message_key(message);
-            return seen_internal_notes.insert(key);
+            if !seen_internal_notes.insert(key) {
+                stats.removed_messages += 1;
+                stats.saved_chars = stats.saved_chars.saturating_add(message_chars(message));
+                return false;
+            }
         }
         true
     });
-    let after = messages_total_chars_pub(messages);
-    LosslessStats {
-        removed_messages: before_len.saturating_sub(messages.len()),
-        saved_chars: before.saturating_sub(after),
-    }
+    stats
 }
 
 fn is_empty_non_protocol_message(message: &Message) -> bool {
@@ -177,7 +207,7 @@ fn is_empty_non_protocol_message(message: &Message) -> bool {
     {
         return false;
     }
-    message_text(&message.content).trim().is_empty()
+    content_text_is_empty(&message.content)
 }
 
 fn stable_message_key(message: &Message) -> String {
@@ -222,6 +252,15 @@ fn summarize_segments(
         lossless_removed_messages: 0,
         lossless_saved_chars: 0,
     }
+}
+
+fn fill_segment_summary(report: &mut ContextBudgetReport, messages: &[Message]) {
+    let segments = classify_segments(messages);
+    let summary = summarize_segments(report.before_chars, report.target_chars, &segments);
+    report.critical_segments = summary.critical_segments;
+    report.offload_only_segments = summary.offload_only_segments;
+    report.lossy_candidate_segments = summary.lossy_candidate_segments;
+    report.lossy_candidate_chars = summary.lossy_candidate_chars;
 }
 
 fn classify_segments(messages: &[Message]) -> Vec<ContextSegment> {
@@ -369,6 +408,18 @@ fn message_chars(message: &Message) -> usize {
     }
 }
 
+fn content_text_is_empty(content: &Value) -> bool {
+    match content {
+        Value::String(text) => text.trim().is_empty(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .all(|text| text.trim().is_empty()),
+        other => other.to_string().trim().is_empty(),
+    }
+}
+
+#[cfg(test)]
 fn message_text(content: &Value) -> String {
     match content {
         Value::String(text) => text.clone(),
@@ -431,14 +482,12 @@ mod tests {
             current_agent: "build".to_string(),
             current_agent_manifest: None,
             pending_files: None,
-            pending_short_output: false,
             forced_skill: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
             cancel_stream: Arc::new(AtomicBool::new(false)),
             ignore_next_prompt_interrupt: false,
-            writer: None,
             prompt_editor: None,
             agent_context: None,
             last_skill_bias: None,

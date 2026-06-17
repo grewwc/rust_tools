@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal, Write};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
@@ -15,7 +15,7 @@ use crate::ai::{
 
 use super::{
     MarkdownStreamRenderer,
-    extract::{StreamTextEvent, extract_chunk_events_streaming, strip_ansi_codes},
+    extract::{StreamTextEvent, extract_chunk_events_streaming},
     framing, normalize,
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{StreamChunkStep, StreamMarkers, StreamProcessingState, ToolCallBuilder},
@@ -278,7 +278,6 @@ fn finalize_stream_response(
         } else {
             write_stream_content(
                 &format!("\n{}\n", markers.end_thinking_tag),
-                app.writer.as_ref(),
                 &mut state.render.markdown,
                 false,
             )?;
@@ -804,7 +803,6 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     if state.content.thinking_open {
         let _ = write_stream_content(
             &format!("\n{}\n", markers.end_thinking_tag),
-            app.writer.as_ref(),
             &mut state.render.markdown,
             false,
         );
@@ -907,7 +905,7 @@ fn collect_valid_tool_calls(
 }
 
 fn ensure_tool_calls_section_open(
-    app: &mut App,
+    _app: &mut App,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
 ) {
@@ -924,7 +922,6 @@ fn ensure_tool_calls_section_open(
         } else {
             let _ = write_stream_content(
                 &format_end_thinking_line(markers, &state.render.markdown),
-                app.writer.as_ref(),
                 &mut state.render.markdown,
                 false,
             );
@@ -1115,7 +1112,7 @@ fn process_internal_tool_calls(
 }
 
 fn commit_visible_content(
-    app: &mut App,
+    _app: &mut App,
     current_history: &mut String,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
@@ -1147,7 +1144,6 @@ fn commit_visible_content(
 
     maybe_write_stream_content(
         content.as_str(),
-        app.writer.as_ref(),
         state,
         markers,
         state.content.thinking_open,
@@ -1382,18 +1378,10 @@ fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::Result<()> {
 
 fn maybe_write_stream_content(
     content: &str,
-    writer: Option<&Arc<std::sync::Mutex<std::fs::File>>>,
     state: &mut StreamProcessingState,
     markers: &StreamMarkers,
     dimmed: bool,
 ) -> io::Result<()> {
-    if let Some(w) = writer {
-        let mut guard = w.lock().unwrap();
-        let clean = strip_ansi_codes(content);
-        guard.write_all(clean.as_bytes())?;
-        guard.flush()?;
-    }
-
     if dimmed {
         return write_thinking_content_folded(content, state, markers);
     }
@@ -1418,11 +1406,10 @@ mod tests {
         tools::os_tools::{GLOBAL_OS, init_os_tools_globals},
         types::{App, AppConfig},
     };
-    use std::fs::File;
     use std::io::Read as _;
     use std::net::TcpListener;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
+    use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
     #[test]
     fn prompt_cache_metrics_none_without_hit() {
@@ -1460,14 +1447,12 @@ mod tests {
             current_agent: String::new(),
             current_agent_manifest: None,
             pending_files: None,
-            pending_short_output: false,
             forced_skill: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
             cancel_stream: Arc::new(AtomicBool::new(false)),
             ignore_next_prompt_interrupt: false,
-            writer: None,
             prompt_editor: None,
             agent_context: None,
             last_skill_bias: None,
@@ -1575,38 +1560,6 @@ mod tests {
             format_end_thinking_line(&markers, &state.render.markdown),
             format!("\n{}\n", markers.end_thinking_tag)
         );
-    }
-
-    #[test]
-    fn first_reasoning_chunk_keeps_open_marker_and_first_text() {
-        let markers = StreamMarkers::new();
-        let mut state = StreamProcessingState::new();
-        let mut app = test_app();
-        let mut current_history = String::new();
-        let path =
-            std::env::temp_dir().join(format!("ai-stream-thinking-{}.log", uuid::Uuid::new_v4()));
-        let file = File::create(&path).unwrap();
-        app.writer = Some(Arc::new(Mutex::new(file)));
-        let payload = r#"{"choices":[{"delta":{"reasoning_content":"我判断这是首段"}}]}"#;
-
-        process_stream_payload(
-            &mut app,
-            &mut current_history,
-            &markers,
-            &mut state,
-            normalize::StreamProviderAdapterKind::Compatible,
-            None,
-            payload,
-        )
-        .unwrap();
-
-        assert!(state.content.thinking_open);
-        assert!(current_history.is_empty());
-        drop(app.writer.take());
-        let written = std::fs::read_to_string(&path).unwrap();
-        std::fs::remove_file(&path).unwrap();
-        assert!(written.contains(&markers.thinking_tag));
-        assert!(written.contains("我判断这是首段"));
     }
 
     #[test]
@@ -2317,29 +2270,10 @@ fn process_stream_line(
 
 fn write_stream_content(
     content: &str,
-    writer: Option<&Arc<std::sync::Mutex<std::fs::File>>>,
     markdown: &mut MarkdownStreamRenderer,
     dimmed: bool,
 ) -> io::Result<()> {
-    if let Some(w) = writer {
-        let mut guard = w.lock().unwrap();
-        let clean = strip_ansi_codes(content);
-        guard.write_all(clean.as_bytes())?;
-        guard.flush()?;
-    }
     write_stream_content_to_terminal(content, markdown, dimmed)
-}
-
-fn write_stream_content_to_file(
-    content: &str,
-    mut writer: Option<&mut std::fs::File>,
-) -> io::Result<()> {
-    if let Some(file) = writer.as_mut() {
-        let clean = strip_ansi_codes(content);
-        file.write_all(clean.as_bytes())?;
-        file.flush()?;
-    }
-    Ok(())
 }
 
 fn write_stream_content_to_terminal(

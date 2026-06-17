@@ -6,7 +6,7 @@ mod sessions;
 mod sqlite;
 mod types;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
@@ -14,7 +14,7 @@ use crate::ai::types::App;
 #[allow(unused_imports)]
 pub(in crate::ai) use blob::{
     append_history, append_history_messages, append_history_messages_uncompacted,
-    build_message_arr, delete_history_artifacts,
+    build_message_arr, delete_history_artifacts, replace_history_messages,
 };
 #[allow(unused_imports)]
 pub(in crate::ai) use compress::compress_messages_for_context;
@@ -77,7 +77,7 @@ pub(in crate::ai) fn is_system_like_role(role: &str) -> bool {
 
 pub(in crate::ai) fn build_context_history(
     history_count: usize,
-    history_file: &PathBuf,
+    history_file: &Path,
     history_max_chars: usize,
     history_keep_last: usize,
     history_summary_max_chars: usize,
@@ -89,7 +89,7 @@ pub(in crate::ai) fn build_context_history(
         history_max_chars,
         history_keep_last,
         history_summary_max_chars,
-        overflow_dir.as_ref(),
+        overflow_dir.as_deref(),
     );
     if let Some(cached) = try_get_cached_context_history(&cache_key) {
         return Ok(cached);
@@ -136,7 +136,7 @@ pub(in crate::ai) fn build_context_history(
 }
 
 fn try_build_context_history_sqlite_fastpath(
-    history_file: &PathBuf,
+    history_file: &Path,
     history_count: usize,
     history_max_chars: usize,
     history_keep_last: usize,
@@ -148,7 +148,7 @@ fn try_build_context_history_sqlite_fastpath(
     } else {
         history_count
     };
-    let recent = sqlite::read_recent_turn_window_sqlite(history_file.as_path(), keep_last)?;
+    let recent = sqlite::read_recent_turn_window_sqlite(history_file, keep_last)?;
     if recent.messages.is_empty() {
         return Ok(Some(Vec::new()));
     }
@@ -166,7 +166,7 @@ fn try_build_context_history_sqlite_fastpath(
         return Ok(None);
     };
     let Some(summary) = sqlite::read_latest_history_summary_before_id_sqlite(
-        history_file.as_path(),
+        history_file,
         start_message_id,
     )?
     else {
@@ -186,12 +186,12 @@ fn try_build_context_history_sqlite_fastpath(
 }
 
 fn context_history_cache_key(
-    history_file: &PathBuf,
+    history_file: &Path,
     history_count: usize,
     history_max_chars: usize,
     history_keep_last: usize,
     history_summary_max_chars: usize,
-    overflow_dir: Option<&PathBuf>,
+    overflow_dir: Option<&Path>,
 ) -> ContextHistoryCacheKey {
     let metadata = std::fs::metadata(history_file).ok();
     let file_len = metadata.as_ref().map(|m| m.len());
@@ -200,17 +200,17 @@ fn context_history_cache_key(
         .and_then(|m| m.modified().ok())
         .and_then(system_time_millis);
     let sqlite_data_version = if blob::is_sqlite_path(history_file) {
-        sqlite::read_data_version(history_file.as_path())
+        sqlite::read_data_version(history_file)
     } else {
         None
     };
     ContextHistoryCacheKey {
-        history_file: history_file.clone(),
+        history_file: history_file.to_path_buf(),
         history_count,
         history_max_chars,
         history_keep_last,
         history_summary_max_chars,
-        overflow_dir: overflow_dir.cloned(),
+        overflow_dir: overflow_dir.map(Path::to_path_buf),
         file_len,
         modified_unix_ms,
         sqlite_data_version,

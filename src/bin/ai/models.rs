@@ -1,6 +1,7 @@
-use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
+
+use rustc_hash::FxHashMap;
 
 use super::agents::{AgentManifest, AgentModelTier};
 use super::cli::ParsedCli;
@@ -305,8 +306,8 @@ pub(super) fn supports_image_input(model: &str) -> bool {
 
 const MODEL_RUNTIME_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
-static RUNTIME_DISABLED_MODELS: LazyLock<Mutex<HashMap<String, Instant>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static RUNTIME_DISABLED_MODELS: LazyLock<Mutex<FxHashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 fn normalize_model_token(value: &str) -> String {
     value.trim().to_ascii_lowercase()

@@ -742,14 +742,12 @@ mod tests {
             current_agent: "build".to_string(),
             current_agent_manifest: None,
             pending_files: None,
-            pending_short_output: false,
             forced_skill: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
             cancel_stream: Arc::new(AtomicBool::new(false)),
             ignore_next_prompt_interrupt: false,
-            writer: None,
             prompt_editor: None,
             agent_context: Some(AgentContext {
                 tools: tool_names

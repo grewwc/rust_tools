@@ -26,7 +26,7 @@
 // =============================================================================
 
 use crate::types::{FastMap, FastSet};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use crate::kernel::{
@@ -87,7 +87,7 @@ pub struct LocalOS {
     /// `ready_queue` 的成员索引。一个 pid 是否真正“可被调度”以这个集合为准；
     /// 队列里的条目可能是过期 tombstone，由 [`pop_ready`] 丢弃。
     pub(super) ready_set: FastSet<u64>,
-    pub(super) wait_queue: HashMap<u64, Vec<u64>>,
+    pub(super) wait_queue: FastMap<u64, Vec<u64>>,
     /// Reverse index: parent_pid -> set of child pids. Maintained on spawn /
     /// remove so that descendant traversal and orphan reassignment do not
     /// require a full process-table scan.
@@ -101,7 +101,7 @@ pub struct LocalOS {
     pub next_pgid: u64,
     /// All event IDs that have ever been marked completed, used to detect
     /// already-satisfied wait conditions in wait_on_events.
-    pub(super) completed_events: HashSet<EventId>,
+    pub(super) completed_events: FastSet<EventId>,
     pub(super) completed_event_order: VecDeque<EventId>,
     pub(super) completed_event_retention: usize,
     /// Reverse index: event_id -> set of pids currently waiting on that event.
@@ -202,7 +202,7 @@ impl LocalOS {
             processes: FastMap::default(),
             ready_queue: VecDeque::new(),
             ready_set: FastSet::default(),
-            wait_queue: HashMap::new(),
+            wait_queue: FastMap::default(),
             children_by_parent: FastMap::default(),
             next_pid: 1,
             current_pid: None,
@@ -211,7 +211,7 @@ impl LocalOS {
             round_robin: true,
             shared_memory: FastMap::default(),
             next_pgid: 1,
-            completed_events: HashSet::new(),
+            completed_events: FastSet::default(),
             completed_event_order: VecDeque::new(),
             completed_event_retention: DEFAULT_COMPLETED_EVENT_RETENTION,
             event_waiters: FastMap::default(),
@@ -696,7 +696,7 @@ impl LocalOS {
         &self,
         event_ids: &[EventId],
         policy: &WaitPolicy,
-        completed_event_ids: &HashSet<EventId>,
+        completed_event_ids: &FastSet<EventId>,
     ) -> bool {
         match policy {
             WaitPolicy::Any => event_ids
@@ -2312,7 +2312,7 @@ impl LlmOps for LocalOS {
         // 2) trace: record the accounting event (best-effort; never fails)
         {
             use crate::types::FastMap;
-            let mut fields: FastMap<String, String> = FastMap::with_capacity(6);
+            let mut fields: FastMap<String, String> = FastMap::default();
             fields.insert("model".to_string(), report.model.clone());
             fields.insert(
                 "prompt_tokens".to_string(),
@@ -2434,7 +2434,7 @@ impl LocalOS {
         verdict: Option<&RlimitVerdict>,
     ) {
         use crate::types::FastMap;
-        let mut fields: FastMap<String, String> = FastMap::with_capacity(3);
+        let mut fields: FastMap<String, String> = FastMap::default();
         fields.insert("path".to_string(), path.display().to_string());
         fields.insert("bytes".to_string(), bytes.to_string());
         if let Some(v) = verdict {
@@ -2590,7 +2590,7 @@ impl LocalOS {
         err: Option<&str>,
     ) {
         use crate::types::FastMap;
-        let mut fields: FastMap<String, String> = FastMap::with_capacity(4);
+        let mut fields: FastMap<String, String> = FastMap::default();
         fields.insert("handle".to_string(), handle.raw().to_string());
         fields.insert("label".to_string(), label.to_string());
         fields.insert("kind".to_string(), kind.as_str().to_string());
@@ -2657,7 +2657,7 @@ impl LocalOS {
         depth: usize,
     ) {
         use crate::types::FastMap;
-        let mut fields: FastMap<String, String> = FastMap::with_capacity(3);
+        let mut fields: FastMap<String, String> = FastMap::default();
         fields.insert("channel".to_string(), channel.raw().to_string());
         fields.insert("label".to_string(), label.to_string());
         fields.insert("depth".to_string(), depth.to_string());
@@ -3739,7 +3739,7 @@ mod tests {
         assert_eq!(
             root_proc.mailbox.back().map(|s| s.as_str()),
             Some(
-                "[EVENT_WAKE]\nReason: event wait condition satisfied.\nCompleted event ids: evt_2\nRecommended next actions:\n1. Inspect the event-producing subsystem for fresh state.\n2. If these events came from async tool work, use tool_status or tool_wait to collect results.\n3. Cancel low-value still-running branches when appropriate.\n4. If enough results are already available, continue reasoning immediately."
+                "[EVENT_WAKE]\nReason: event wait condition satisfied.\nCompleted event ids: evt_2\nRecommended next actions:\n1. If you were parked by task_wait, re-call task_wait with the same task_ids and wait_policy to collect subagent results.\n2. If these events came from async tool work, use tool_status or tool_wait to collect results.\n3. Inspect the event-producing subsystem for fresh state when unsure.\n4. Cancel low-value still-running tool branches when appropriate.\n5. If enough results are already available, continue reasoning immediately."
             )
         );
     }

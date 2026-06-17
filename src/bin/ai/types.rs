@@ -1,5 +1,4 @@
 use std::{
-    fs::File,
     path::PathBuf,
     sync::{
         Arc,
@@ -48,14 +47,12 @@ impl Clone for App {
             current_agent: self.current_agent.clone(),
             current_agent_manifest: self.current_agent_manifest.clone(),
             pending_files: self.pending_files.clone(),
-            pending_short_output: self.pending_short_output,
             forced_skill: self.forced_skill.clone(),
             attached_image_files: self.attached_image_files.clone(),
             shutdown: self.shutdown.clone(),
             streaming: self.streaming.clone(),
             cancel_stream: self.cancel_stream.clone(),
             ignore_next_prompt_interrupt: self.ignore_next_prompt_interrupt,
-            writer: self.writer.clone(),
             prompt_editor: None,
             agent_context: self.agent_context.clone(),
             last_skill_bias: self.last_skill_bias.clone(),
@@ -83,7 +80,6 @@ pub(super) struct App {
     pub(super) current_agent: String,
     pub(super) current_agent_manifest: Option<AgentManifest>,
     pub(super) pending_files: Option<String>,
-    pub(super) pending_short_output: bool,
     /// 用户通过 `@skills:<name>` 在输入框中显式选择、仅对**本轮**生效的强制 skill。
     /// turn 准备阶段读取后强制注入该 skill，并在该 turn 结束后清空，下一轮不再强制。
     pub(super) forced_skill: Option<String>,
@@ -92,7 +88,6 @@ pub(super) struct App {
     pub(super) streaming: Arc<AtomicBool>,
     pub(super) cancel_stream: Arc<AtomicBool>,
     pub(super) ignore_next_prompt_interrupt: bool,
-    pub(super) writer: Option<Arc<std::sync::Mutex<File>>>,
     pub(super) prompt_editor: Option<PromptEditor>,
     pub(super) agent_context: Option<AgentContext>,
     pub(super) last_skill_bias: Option<SkillBiasMemory>,
@@ -283,12 +278,6 @@ pub(super) struct QuestionContext {
     /// 仅在最终发给 LLM 的 user_message 里拼接，不参与路由/特征提取。
     pub(super) attachments_text: String,
     pub(super) history_count: usize,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct LoopOverrides {
-    pub(super) short_output: bool,
-    pub(super) history_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

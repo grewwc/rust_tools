@@ -634,6 +634,17 @@ impl TurnObserver for ThinkingOrchestrator {
         // because the LLM emits them in its reply, not in the user question.
         self.apply_meta_tags(&ctx.final_text);
 
+        // 自我学习（吸收 self-note → 泛化 → 展示 [Thinking] 行）只应发生在"确实做了
+        // 事"的 turn 上：本轮调用过工具，或当前有激活的思考模式（目标/验证/思维树）。
+        // 纯常识 / 概念问答既不调用工具也没有激活模式，不应触发自我学习——否则会把此前
+        // 编码 turn 积累的经验泛化后，原样打印在一个毫不相关的简单问题之后。
+        let is_work_turn = ctx.had_tool_calls || !self.active_modes.is_empty();
+        if !is_work_turn {
+            self.active_modes.clear();
+            self.current_tree_node_id = None;
+            return ObserverOutput { display_lines };
+        }
+
         // Extract ALL self-notes (LLM may emit multiple in one reply).
         for note in extract_all_self_notes_from_text(&ctx.final_text) {
             self.process_self_note(&note);
@@ -802,6 +813,45 @@ mod tests {
             had_tool_calls: false,
         });
         let _ = output.display_lines;
+    }
+
+    #[test]
+    fn on_finalize_skips_self_learning_on_no_work_turn() {
+        let mut orch = ThinkingOrchestrator::new();
+        // 预置足以触发泛化的结构化自我经验（模拟此前编码 turn 的积累）。
+        orch.process_self_note("Avoid: apply_patch failed with empty hunk line");
+        orch.process_self_note("Avoid: apply_patch failed with context mismatch");
+        orch.process_self_note("Avoid: apply_patch failed when hunk not located");
+        orch.process_self_note("Avoid: apply_patch failed on stale line numbers");
+        // 一个纯常识问答 turn：没有工具调用，也没有激活任何思考模式。
+        let output = orch.on_finalize(&FinalizeContext {
+            question: "rust 是什么？".to_string(),
+            final_text: "Rust 是一门系统编程语言。".to_string(),
+            had_tool_calls: false,
+        });
+        assert!(
+            output.display_lines.is_empty(),
+            "no-work turn must not emit any [Thinking] line, got: {:?}",
+            output.display_lines
+        );
+    }
+
+    #[test]
+    fn on_finalize_runs_self_learning_when_tools_were_called() {
+        let mut orch = ThinkingOrchestrator::new();
+        orch.process_self_note("Do: always validate inputs in async handlers");
+        orch.process_self_note("Do: check for None before unwrap in async code");
+        orch.process_self_note("Do: verify async results before use");
+        orch.process_self_note("Avoid: unwrap on async results without checking");
+        let output = orch.on_finalize(&FinalizeContext {
+            question: "fix the async handler".to_string(),
+            final_text: "<meta:self_note>Do: write a regression test first</meta:self_note>"
+                .to_string(),
+            had_tool_calls: true,
+        });
+        let _ = output.display_lines;
+        // 工作 turn 不会被提前 return 跳过：final_text 中的 self-note 应被吸收进 buffer。
+        assert!(!orch.generalizer.experience_buffer.is_empty());
     }
 
     #[test]

@@ -28,6 +28,40 @@ const RECENT_MEMORY_CACHE_TTL: Duration = Duration::from_secs(60);
 static RECENT_MEMORY_CACHE: LazyLock<Mutex<Option<RecentMemoryCacheEntry>>> =
     LazyLock::new(|| Mutex::new(None));
 
+fn question_has_code_or_task_shape(question: &str) -> bool {
+    let trimmed = question.trim();
+    let chars = trimmed.chars().count();
+    let line_count = trimmed
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    let lower = trimmed.to_ascii_lowercase();
+    chars >= 80
+        || line_count >= 2
+        || trimmed.contains("```")
+        || trimmed.contains("::")
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || [
+            ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", "cargo", "实现",
+            "修复", "排查", "调试", "报错", "测试", "单测", "验证", "review", "重构", "优化",
+            "架构",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+fn should_inject_integrated_reflection(
+    question: &str,
+    intent: &crate::ai::driver::intent_recognition::UserIntent,
+) -> bool {
+    matches!(
+        intent.core,
+        crate::ai::driver::intent_recognition::CoreIntent::RequestAction
+            | crate::ai::driver::intent_recognition::CoreIntent::SeekSolution
+    ) && question_has_code_or_task_shape(question)
+}
+
 fn sync_recall_enabled() -> bool {
     crate::commonw::configw::get_all_config()
         .get_opt("ai.prepare.sync_recall")
@@ -148,11 +182,8 @@ pub(super) async fn prepare_turn(
             .unwrap_or_else(|| "true".to_string())
             .trim()
             .ne("false");
-        let intent_needs_reflection = matches!(
-            skill_turn.intent().core,
-            crate::ai::driver::intent_recognition::CoreIntent::RequestAction
-                | crate::ai::driver::intent_recognition::CoreIntent::SeekSolution
-        );
+        let intent_needs_reflection =
+            should_inject_integrated_reflection(question, skill_turn.intent());
         if (integrated || reflect_integrated) && intent_needs_reflection {
             let mut sys = String::new();
             if integrated {
@@ -686,8 +717,8 @@ fn code_discovery_record_from_memory_entry(
 mod tests {
     use super::{
         collect_session_code_discovery_records, extract_existing_code_discoveries,
-        render_session_code_discovery_recall, should_run_general_recall,
-        should_run_session_code_discovery_recall,
+        render_session_code_discovery_recall, should_inject_integrated_reflection,
+        should_run_general_recall, should_run_session_code_discovery_recall,
     };
     use crate::ai::code_discovery_policy::parse_record_line;
     use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
@@ -841,6 +872,33 @@ mod tests {
             &intent,
             None,
             false
+        ));
+    }
+
+    #[test]
+    fn simple_common_sense_turn_skips_integrated_reflection_even_if_misclassified() {
+        let intent = UserIntent::new(CoreIntent::SeekSolution);
+        assert!(!should_inject_integrated_reflection(
+            "为什么天是蓝的？",
+            &intent
+        ));
+    }
+
+    #[test]
+    fn simple_technical_concept_turn_skips_integrated_reflection_even_if_misclassified() {
+        let intent = UserIntent::new(CoreIntent::SeekSolution);
+        assert!(!should_inject_integrated_reflection(
+            "Rust 的函数是什么？",
+            &intent
+        ));
+    }
+
+    #[test]
+    fn coding_task_keeps_integrated_reflection() {
+        let intent = UserIntent::new(CoreIntent::RequestAction);
+        assert!(should_inject_integrated_reflection(
+            "帮我修复 cargo test 的 failure",
+            &intent
         ));
     }
 

@@ -1,20 +1,14 @@
 use crate::ai::provider::ReasoningEffort;
 use crate::terminalw::parser::Parser as TermParser;
 
-pub(super) const DEFAULT_NUM_HISTORY: usize = 256;
-
 /// 解析后的 CLI 参数结构体
 #[derive(Debug, Clone)]
 pub(super) struct ParsedCli {
-    pub(super) history: usize,
     pub(super) model: Option<String>,
     pub(super) agent: Option<String>,
     pub(super) clear: bool,
     pub(super) session: Option<String>,
     pub(super) files: String,
-    pub(super) out: Option<String>,
-    pub(super) thinking: bool,
-    pub(super) short_output: bool,
     pub(super) args: Vec<String>,
     pub(super) list_tools: bool,
     pub(super) list_mcp_tools: bool,
@@ -67,15 +61,11 @@ const INTERNAL_COMMANDS: &[&str] = &[
 impl Default for ParsedCli {
     fn default() -> Self {
         Self {
-            history: DEFAULT_NUM_HISTORY,
             model: None,
             agent: None,
             clear: false,
             session: None,
             files: String::new(),
-            out: None,
-            thinking: false,
-            short_output: false,
             args: Vec::new(),
             list_tools: false,
             list_mcp_tools: false,
@@ -112,14 +102,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         false,
         "clear specified session history (use with --session)",
     );
-    parser.add_bool(
-        "thinking",
-        false,
-        "enable chain-of-thought reasoning",
-    );
-    parser.alias("t", "thinking");
-    parser.add_bool("short-output", false, "short output");
-    parser.alias("s", "short-output");
     parser.add_bool("list-tools", false, "list builtin tools and exit");
     parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
     parser.alias("list-mcp-servers", "list-mcp-tools");
@@ -139,7 +121,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         "generate shell completion script (bash/zsh/fish) and exit");
 
     // 定义所有 string/int 选项
-    parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history entries to keep");
     parser.add_string("model", "", "model name");
     parser.alias("m", "model");
     parser.add_string("agent", "", "agent name");
@@ -148,8 +129,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     parser.alias("ss", "session");
     parser.add_string("files", "", "input file names");
     parser.alias("f", "files");
-    parser.add_string("out", "", "write output to file");
-    parser.alias("o", "out");
     parser.add_string("mcp-config", "", "mcp config json path override");
     parser.add_string(
         "reasoning-effort",
@@ -172,7 +151,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         Vec::new()
     };
 
-    // 预处理：将 --ss 转换为 --session，避免与 -s 冲突
+    // 预处理：将 --ss 转换为 --session，兼容历史用法。
     for arg in &mut argv {
         if arg == "--ss" || arg.starts_with("--ss=") {
             *arg = arg.replace("--ss", "--session");
@@ -190,11 +169,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     // 处理 help（需要特殊处理，因为它是别名）
     cli.help = parser.contains_flag_strict("help") || parser.contains_flag_strict("h");
-
-    // 处理 history
-    if parser.contains_flag_strict("history") {
-        cli.history = parser.flag_value_i32("history") as usize;
-    }
 
     // 处理 model
     if parser.contains_flag_strict("model") {
@@ -226,25 +200,11 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         cli.files = parser.flag_value_or_default("files");
     }
 
-    // 处理 out
-    if parser.contains_flag_strict("out") {
-        let val = parser.flag_value_or_default("out");
-        if !val.trim().is_empty() {
-            cli.out = Some(val);
-        }
-    }
-
-    // 处理 thinking
-    cli.thinking = parser.contains_flag_strict("thinking");
-
     // 处理 consolidate-knowledge
     cli.consolidate_knowledge = parser.contains_flag_strict("consolidate-knowledge");
 
     // 处理 generate-completions
     cli.generate_completions = parser.contains_flag_strict("generate-completions");
-
-    // 处理 short-output
-    cli.short_output = parser.contains_flag_strict("short-output");
 
     // 处理 list-tools
     cli.list_tools = parser.contains_flag_strict("list-tools");
@@ -321,14 +281,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 pub(super) fn print_help() {
     let mut parser = TermParser::new();
 
-    parser.add_bool(
-        "thinking",
-        false,
-        "enable chain-of-thought reasoning",
-    );
-    parser.alias("t", "thinking");
-    parser.add_bool("short-output", false, "short output");
-    parser.alias("s", "short-output");
     parser.add_bool("list-tools", false, "list builtin tools and exit");
     parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
     parser.alias("list-mcp-servers", "list-mcp-tools");
@@ -345,7 +297,6 @@ pub(super) fn print_help() {
     parser.alias("ns", "note-search");
     parser.alias("h", "help");
 
-    parser.add_int("history", DEFAULT_NUM_HISTORY as i32, "number of history entries to keep");
     parser.add_string("model", "", "model name");
     parser.alias("m", "model");
     parser.add_string("agent", "", "agent name");
@@ -354,8 +305,6 @@ pub(super) fn print_help() {
     parser.alias("ss", "session");
     parser.add_string("files", "", "input file names");
     parser.alias("f", "files");
-    parser.add_string("out", "", "write output to file");
-    parser.alias("o", "out");
     parser.add_string("mcp-config", "", "mcp config json path override");
     parser.add_string(
         "reasoning-effort",
@@ -400,6 +349,11 @@ pub(super) fn print_help() {
     println!("    /model [name]             list or switch models");
     println!("    /model effort [<value>]   show or override reasoning effort");
     println!("                                (minimal|low|medium|high|off|auto)");
+    println!("    /history [user|N]         show recent session messages");
+    println!("    /history user             show user inputs with u<N> markers");
+    println!("    /history rewind u<N>      remove user input u<N> and everything after it");
+    println!("    /history rewind last      remove latest user input and everything after it");
+    println!("    /history rewind grep <q>  rewind the only user input matching keyword");
     println!("    /feishu-auth              authenticate with Feishu");
     println!("    /share [output.md]        export current session as shareable markdown");
     println!();
@@ -440,10 +394,6 @@ pub fn generate_completion_script(shell: &str) {
 
     // ===== bool 选项 =====
     parser.add_bool("clear", false, "clear specified session history (use with --session)");
-    parser.add_bool("thinking", false, "enable chain-of-thought reasoning");
-    parser.alias("t", "thinking");
-    parser.add_bool("short-output", false, "short output");
-    parser.alias("s", "short-output");
     parser.add_bool("list-tools", false, "list builtin tools and exit");
     parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
     parser.alias("list-mcp-servers", "list-mcp-tools");
@@ -460,7 +410,6 @@ pub fn generate_completion_script(shell: &str) {
         "generate shell completion script (bash/zsh/fish) and exit");
 
     // ===== string / int 选项 =====
-    parser.add_int("history", 256, "number of history entries to keep");
     parser.add_string("model", "", "model name");
     parser.alias("m", "model");
     parser.add_string("agent", "", "agent name");
@@ -469,8 +418,6 @@ pub fn generate_completion_script(shell: &str) {
     parser.alias("ss", "session");
     parser.add_string("files", "", "input file names");
     parser.alias("f", "files");
-    parser.add_string("out", "", "write output to file");
-    parser.alias("o", "out");
     parser.add_string("mcp-config", "", "mcp config json path override");
     parser.add_string("reasoning-effort", "",
         "reasoning effort: minimal | low | medium | high | off");
@@ -533,7 +480,9 @@ fn generate_bash(
     // 第二个参数补全对应的子命令而不是顶层 flags/命令列表。
     println!("  local usage_sub='today 7d 30d all daily trend days help'");
     println!("  local checkpoint_sub='save list rollback delete help'");
-    println!("  local history_sub='full user assistant tool system grep export copy 3 6 10 20'");
+    println!(
+        "  local history_sub='full user assistant tool system grep rewind undo last export copy 3 6 10 20'"
+    );
     println!("  local session_sub='list current new use delete clear-all export export-current export-last'");
     println!("  local agent_sub='help list current use auto'");
     println!("  local model_sub='current list help use select switch effort'");
@@ -594,7 +543,9 @@ fn generate_zsh(
     // 子命令映射
     println!("  local -a _a_usage_subcmds=(today 7d 30d all daily trend days help)");
     println!("  local -a _a_checkpoint_subcmds=(save list rollback delete help)");
-    println!("  local -a _a_history_subcmds=(full user assistant tool system grep export copy 3 6 10 20)");
+    println!(
+        "  local -a _a_history_subcmds=(full user assistant tool system grep rewind undo last export copy 3 6 10 20)"
+    );
     println!("  local -a _a_session_subcmds=(list current new use delete clear-all export export-current export-last)");
     println!("  local -a _a_agent_subcmds=(help list current use auto)");
     println!("  local -a _a_model_subcmds=(current list help use select switch effort)");
@@ -638,7 +589,7 @@ fn generate_zsh(
 fn generate_fish(
     info: &[(String, String, String, Vec<String>)],
     is_bool: fn(&str) -> bool,
-    has_value: fn(&str) -> bool,
+    _has_value: fn(&str) -> bool,
 ) {
     for (name, ty, usage, aliases) in info {
         let escaped = usage.replace('\'', "'\\''");

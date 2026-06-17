@@ -1,7 +1,7 @@
 use std::{
     fs::{self},
     io,
-    path::{Path, PathBuf},
+    path::Path,
 };
 
 use crate::commonw::utils::open_file_for_append;
@@ -13,10 +13,10 @@ use super::{
 
 pub(in crate::ai) fn build_message_arr(
     history_count: usize,
-    history_file: &PathBuf,
+    history_file: &Path,
 ) -> Result<Vec<Message>, Box<dyn std::error::Error>> {
     if is_sqlite_path(history_file) {
-        return sqlite::build_message_arr_sqlite(history_count, history_file.as_path());
+        return sqlite::build_message_arr_sqlite(history_count, history_file);
     }
     let history = match fs::read_to_string(history_file) {
         Ok(history) => history,
@@ -94,6 +94,16 @@ pub(in crate::ai) fn append_history_messages_uncompacted(
         return sqlite::append_history_sqlite_uncompacted(path, messages.to_vec());
     }
     append_history_blob(path, &blob)
+}
+
+pub(in crate::ai) fn replace_history_messages(path: &Path, messages: &[Message]) -> io::Result<()> {
+    if is_sqlite_path(path) {
+        return sqlite::replace_all_messages_sqlite(path, messages);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, serialize_history_messages(messages))
 }
 
 fn append_history_blob(path: &Path, content: &str) -> io::Result<()> {

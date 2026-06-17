@@ -1,4 +1,4 @@
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
 use rust_tools::cw::SkipMap;
 use serde_json::Value;
@@ -39,21 +39,28 @@ pub(crate) struct ToolRegistration {
 
 inventory::collect!(ToolRegistration);
 
-static TOOL_CANCEL_FUTEXES: LazyLock<Mutex<SkipMap<u64, FutexAddr>>> =
-    LazyLock::new(|| Mutex::new(SkipMap::default()));
+const TOOL_CANCEL_FUTEX_ENV: &str = "__ai_tool_cancel_futex_addr";
 
 pub(crate) fn ensure_process_tool_cancel_futex(
     os: &mut dyn Kernel,
     pid: u64,
 ) -> Result<FutexAddr, String> {
-    let mut registry = TOOL_CANCEL_FUTEXES
-        .lock()
-        .map_err(|_| "tool cancel futex registry poisoned".to_string())?;
-    if let Some(addr) = registry.get_ref(&pid).copied() {
-        return Ok(addr);
+    if let Some(addr) = os
+        .get_process(pid)
+        .and_then(|proc| proc.env.get(TOOL_CANCEL_FUTEX_ENV))
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .map(FutexAddr)
+    {
+        if os.futex_load(addr).is_some() {
+            return Ok(addr);
+        }
     }
     let addr = os.futex_create(0, format!("tool_cancel:pid={pid}"));
-    registry.insert(pid, addr);
+    let Some(proc) = os.get_process_mut(pid) else {
+        return Err(format!("process {pid} not found for tool cancel futex"));
+    };
+    proc.env
+        .insert(TOOL_CANCEL_FUTEX_ENV.to_string(), addr.raw().to_string());
     Ok(addr)
 }
 

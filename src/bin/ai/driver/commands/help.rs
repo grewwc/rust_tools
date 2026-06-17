@@ -10,6 +10,7 @@ pub fn print_interactive_help() {
     println!("    /usage [today|7d|all]     show LLM token usage statistics");
     println!("    /history [full|user|assistant|tool|system] [N]     show recent session messages");
     println!("    /history grep <keyword>      search recent messages by keyword");
+    println!("    /history rewind u<N>|last    remove a user input and all following messages");
     println!("    /history export [file.txt]   export current preview to a file");
     println!("    /history copy                copy current preview to clipboard");
     println!("    /feishu-auth              authenticate with Feishu");

@@ -6,7 +6,6 @@ use std::sync::atomic::Ordering;
 
 use regex::RegexBuilder;
 
-use super::params::parse_loop_overrides;
 use crate::ai::history;
 use crate::ai::types::{App, QuestionContext};
 use crate::clipboardw::string_content;
@@ -24,7 +23,7 @@ const HISTORY_GREP_HIGHLIGHT_END: &str = "\x1b[0m";
 
 fn print_history_help() {
     println!(
-        "/history usage:\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history grep <keyword>  Search messages\n  /history export [path] Export to file\n  /history copy          Copy to clipboard\n  /history help            Show this help",
+        "/history usage:\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history grep <keyword>  Search messages\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history export [path] Export to file\n  /history copy          Copy to clipboard\n  /history help            Show this help",
         HISTORY_PREVIEW_DEFAULT_COUNT
     );
 }
@@ -67,9 +66,11 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
     if !app.cli.args.is_empty() {
         let base_question = app.cli.args.join(" ");
         app.cli.args.clear();
-        let (question, overrides) = parse_loop_overrides(&base_question);
-        let history_count = overrides.history_count.unwrap_or(app.cli.history);
-        let ctx = finalize_question(app, question, history_count, overrides.short_output)?;
+        if handle_local_command(app, &base_question)? {
+            crate::ai::driver::signal::request_shutdown(app.shutdown.as_ref());
+            return Ok(None);
+        }
+        let ctx = finalize_question(app, base_question, 0)?;
         return Ok(Some(ctx));
     }
 
@@ -106,9 +107,7 @@ pub(crate) fn next_question(app: &mut App) -> Result<Option<QuestionContext>, Bo
         crate::ai::driver::signal::request_shutdown(app.shutdown.as_ref());
         return Ok(None);
     };
-    let (question, overrides) = parse_loop_overrides(&question);
-    let history_count = overrides.history_count.unwrap_or(app.cli.history);
-    let ctx = finalize_question(app, question, history_count, overrides.short_output)?;
+    let ctx = finalize_question(app, question, 0)?;
     Ok(Some(ctx))
 }
 
@@ -118,6 +117,7 @@ enum LocalCommand {
     HelpHistory,
     ExportHistory(HistoryPreviewOptions, Option<PathBuf>),
     CopyHistory(HistoryPreviewOptions),
+    RewindHistory(HistoryRewindTarget),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,17 +137,30 @@ struct HistoryPreviewOptions {
     grep: Option<String>,
 }
 
-fn handle_local_command(app: &App, input: &str) -> io::Result<bool> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HistoryRewindTarget {
+    UserOrdinal(usize),
+    LatestUser,
+    Grep(String),
+}
+
+#[derive(Debug, Clone)]
+struct HistoryPreviewItem {
+    message: history::Message,
+    user_ordinal: Option<usize>,
+}
+
+fn handle_local_command(app: &mut App, input: &str) -> io::Result<bool> {
     match handle_local_command_inner(app, input) {
         Ok(v) => Ok(v),
         Err(e) => {
             eprintln!("local command error: {e}");
-            Ok(false)
+            Ok(true)
         }
     }
 }
 
-fn handle_local_command_inner(app: &App, input: &str) -> Result<bool, Box<dyn Error>> {
+fn handle_local_command_inner(app: &mut App, input: &str) -> Result<bool, Box<dyn Error>> {
     let Some(command) = parse_local_command(input)? else {
         return Ok(false);
     };
@@ -169,6 +182,22 @@ fn handle_local_command_inner(app: &App, input: &str) -> Result<bool, Box<dyn Er
             let rendered = render_history_preview(app, options)?;
             string_content::set_clipboard_content(&rendered)?;
             println!("[history] Copied preview to clipboard.");
+        }
+        LocalCommand::RewindHistory(target) => {
+            let plan = plan_history_rewind(app, target)?;
+            if plan.removed_messages == 0 {
+                println!("[history] Nothing to rewind.");
+                return Ok(true);
+            }
+            let confirm = crate::commonw::prompt::prompt_yes_or_no_interruptible(&format!(
+                "Rewind from user input u{} and remove {} message(s)? (y/n): ",
+                plan.user_ordinal, plan.removed_messages
+            ));
+            if confirm != Some(true) {
+                println!("canceled by user.");
+                return Ok(true);
+            }
+            apply_history_rewind(app, plan)?;
         }
     }
     Ok(true)
@@ -197,6 +226,10 @@ fn parse_local_command(input: &str) -> Result<Option<LocalCommand>, Box<dyn Erro
 }
 
 fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Box<dyn Error>> {
+    if args.first().copied() == Some("rewind") || args.first().copied() == Some("undo") {
+        return parse_history_rewind_command(&args[1..])
+            .map(|target| Some(LocalCommand::RewindHistory(target)));
+    }
     let (options, action) = parse_history_preview_options(args)?;
     Ok(Some(match action {
         HistoryAction::Show => LocalCommand::ShowHistory(options),
@@ -206,6 +239,33 @@ fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Bo
         }
         HistoryAction::Copy => LocalCommand::CopyHistory(options),
     }))
+}
+
+fn parse_history_rewind_command(args: &[&str]) -> Result<HistoryRewindTarget, Box<dyn Error>> {
+    let Some(first) = args.first().copied() else {
+        return Err("missing rewind target. try: /history rewind u3".into());
+    };
+    if first == "last" || first == "latest" {
+        return Ok(HistoryRewindTarget::LatestUser);
+    }
+    if first == "grep" {
+        let keyword = args[1..].join(" ");
+        if keyword.trim().is_empty() {
+            return Err("`/history rewind grep` requires a keyword".into());
+        }
+        return Ok(HistoryRewindTarget::Grep(keyword));
+    }
+    let raw = first
+        .strip_prefix('u')
+        .or_else(|| first.strip_prefix('U'))
+        .unwrap_or(first);
+    let ordinal = raw
+        .parse::<usize>()
+        .map_err(|_| format!("invalid rewind target: {first}. try: /history rewind u3"))?;
+    if ordinal == 0 {
+        return Err("user ordinal must be >= 1".into());
+    }
+    Ok(HistoryRewindTarget::UserOrdinal(ordinal))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,9 +377,19 @@ fn render_history_preview(
         "[history] Showing {} recent {}{}:\n",
         total, label, grep_suffix
     );
-    for (idx, message) in shown.iter().enumerate() {
-        let content = summarize_history_content(&message.content, max_chars, grep.as_deref());
-        out.push_str(&format!("{}. [{}] {}\n", idx + 1, message.role, content));
+    for (idx, item) in shown.iter().enumerate() {
+        let content = summarize_history_content(&item.message.content, max_chars, grep.as_deref());
+        let marker = item
+            .user_ordinal
+            .map(|ordinal| format!(" (u{ordinal})"))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "{}. [{}] {}{}\n",
+            idx + 1,
+            item.message.role,
+            content,
+            marker
+        ));
     }
     Ok(out.trim_end().to_string())
 }
@@ -327,22 +397,35 @@ fn render_history_preview(
 fn collect_history_messages(
     app: &App,
     options: HistoryPreviewOptions,
-) -> Result<Vec<history::Message>, Box<dyn Error>> {
+) -> Result<Vec<HistoryPreviewItem>, Box<dyn Error>> {
     let history_file = active_history_path(app);
-    let messages =
-        history::build_message_arr(HISTORY_PREVIEW_MAX_COUNT.max(options.count), &history_file)?;
+    let messages = history::build_message_arr(usize::MAX, &history_file)?;
+    let mut user_ordinal = 0usize;
     let filtered = messages
         .into_iter()
-        .filter(|message| match options.role_filter {
-            HistoryRoleFilter::All => true,
-            HistoryRoleFilter::User => message.role == "user",
-            HistoryRoleFilter::Assistant => message.role == "assistant",
-            HistoryRoleFilter::Tool => message.role == "tool",
-            HistoryRoleFilter::System => crate::ai::history::is_system_like_role(&message.role),
+        .filter_map(|message| {
+            let ordinal = if message.role == "user" {
+                user_ordinal += 1;
+                Some(user_ordinal)
+            } else {
+                None
+            };
+            let role_matches = match options.role_filter {
+                HistoryRoleFilter::All => true,
+                HistoryRoleFilter::User => message.role == "user",
+                HistoryRoleFilter::Assistant => message.role == "assistant",
+                HistoryRoleFilter::Tool => message.role == "tool",
+                HistoryRoleFilter::System => crate::ai::history::is_system_like_role(&message.role),
+            };
+            role_matches.then_some(HistoryPreviewItem {
+                message,
+                user_ordinal: ordinal,
+            })
         })
-        .filter(|message| {
+        .filter(|item| {
             options.grep.as_deref().is_none_or(|needle| {
-                let haystack = searchable_history_content(&message.content).to_ascii_lowercase();
+                let haystack =
+                    searchable_history_content(&item.message.content).to_ascii_lowercase();
                 haystack.contains(&needle.to_ascii_lowercase())
             })
         })
@@ -353,6 +436,135 @@ fn collect_history_messages(
         filtered
     };
     Ok(shown)
+}
+
+#[derive(Debug, Clone)]
+struct HistoryRewindPlan {
+    user_ordinal: usize,
+    keep_messages: Vec<history::Message>,
+    removed_messages: usize,
+    preview: String,
+}
+
+fn plan_history_rewind(
+    app: &App,
+    target: HistoryRewindTarget,
+) -> Result<HistoryRewindPlan, Box<dyn Error>> {
+    let history_file = active_history_path(app);
+    let messages = history::build_message_arr(usize::MAX, &history_file)?;
+    let target_ordinal = resolve_rewind_target(&messages, target)?;
+    let Some((target_index, preview)) = find_user_message_by_ordinal(&messages, target_ordinal)
+    else {
+        return Err(format!("user input u{target_ordinal} not found").into());
+    };
+    let keep_messages = messages[..target_index].to_vec();
+    Ok(HistoryRewindPlan {
+        user_ordinal: target_ordinal,
+        removed_messages: messages.len().saturating_sub(target_index),
+        keep_messages,
+        preview,
+    })
+}
+
+fn apply_history_rewind(app: &mut App, plan: HistoryRewindPlan) -> Result<(), Box<dyn Error>> {
+    let history_file = active_history_path(app);
+    history::replace_history_messages(&history_file, &plan.keep_messages)?;
+    history::invalidate_context_history_cache_for(&history_file);
+    crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
+    if let Some(ctx) = app.agent_context.as_mut() {
+        ctx.tools.clear();
+    }
+    println!(
+        "[history] Rewound from u{}: {}",
+        plan.user_ordinal, plan.preview
+    );
+    println!(
+        "[history] Removed {} message(s); kept {} message(s).",
+        plan.removed_messages,
+        plan.keep_messages.len()
+    );
+    Ok(())
+}
+
+fn resolve_rewind_target(
+    messages: &[history::Message],
+    target: HistoryRewindTarget,
+) -> Result<usize, Box<dyn Error>> {
+    match target {
+        HistoryRewindTarget::UserOrdinal(ordinal) => Ok(ordinal),
+        HistoryRewindTarget::LatestUser => {
+            let count = messages
+                .iter()
+                .filter(|message| message.role == "user")
+                .count();
+            if count == 0 {
+                Err("no user input found in history".into())
+            } else {
+                Ok(count)
+            }
+        }
+        HistoryRewindTarget::Grep(keyword) => {
+            let needle = keyword.to_ascii_lowercase();
+            let mut matches = Vec::new();
+            let mut ordinal = 0usize;
+            for message in messages {
+                if message.role != "user" {
+                    continue;
+                }
+                ordinal += 1;
+                let text = searchable_history_content(&message.content);
+                if text.to_ascii_lowercase().contains(&needle) {
+                    matches.push((ordinal, text));
+                }
+            }
+            match matches.len() {
+                0 => Err(format!("no user input matching {:?}", keyword).into()),
+                1 => Ok(matches[0].0),
+                _ => {
+                    let mut msg = format!(
+                        "{} user inputs match {:?}; use /history rewind u<N>:\n",
+                        matches.len(),
+                        keyword
+                    );
+                    for (ordinal, text) in matches.into_iter().take(8) {
+                        msg.push_str(&format!(
+                            "  u{} {}\n",
+                            ordinal,
+                            truncate_for_terminal(
+                                &text.split_whitespace().collect::<Vec<_>>().join(" "),
+                                120
+                            )
+                        ));
+                    }
+                    Err(msg.trim_end().to_string().into())
+                }
+            }
+        }
+    }
+}
+
+fn find_user_message_by_ordinal(
+    messages: &[history::Message],
+    target_ordinal: usize,
+) -> Option<(usize, String)> {
+    let mut ordinal = 0usize;
+    for (idx, message) in messages.iter().enumerate() {
+        if message.role != "user" {
+            continue;
+        }
+        ordinal += 1;
+        if ordinal == target_ordinal {
+            let preview = truncate_for_terminal(
+                &searchable_history_content(&message.content)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                120,
+            );
+            return Some((idx, preview));
+        }
+    }
+    None
 }
 
 fn active_history_path(app: &App) -> std::path::PathBuf {
@@ -721,7 +933,6 @@ fn finalize_question(
     app: &mut App,
     mut question: String,
     history_count: usize,
-    loop_short_output: bool,
 ) -> Result<QuestionContext, Box<dyn Error>> {
     // 先提取 `@skills:<name>`（用户经补全显式选择、仅本轮强制注入的 skill），
     // 再做普通 `@file` 引用提取，避免 skill 引用被误当作文件路径处理。
@@ -754,16 +965,8 @@ fn finalize_question(
     };
     app.attached_image_files = inline_images
         .into_iter()
-        .map(|raw| resolve_inline_image_path(&raw, &assets_dir))
+        .map(|raw| resolve_inline_image_path(&raw, assets_dir.as_path()))
         .collect();
-
-    if app.pending_short_output || loop_short_output {
-        if !question.ends_with('\n') {
-            question.push('\n');
-        }
-        question.push_str("Be Concise.");
-        app.pending_short_output = false;
-    }
 
     Ok(QuestionContext {
         question,
@@ -775,14 +978,15 @@ fn finalize_question(
 #[cfg(test)]
 mod tests {
     use super::{
-        HistoryAction, HistoryPreviewOptions, HistoryRoleFilter, LocalCommand,
-        extract_at_file_references, extract_forced_skill_reference, finalize_question,
-        highlight_history_keyword, parse_history_preview_options, parse_local_command,
-        render_history_preview, resolve_inline_image_path, summarize_history_content,
+        HistoryAction, HistoryPreviewOptions, HistoryRewindTarget, HistoryRoleFilter, LocalCommand,
+        apply_history_rewind, extract_at_file_references, extract_forced_skill_reference,
+        finalize_question, highlight_history_keyword, parse_history_preview_options,
+        parse_local_command, plan_history_rewind, render_history_preview,
+        resolve_inline_image_path, searchable_history_content, summarize_history_content,
         truncate_for_terminal,
     };
     use crate::ai::{
-        history::{Message, append_history_messages},
+        history::{self, Message, append_history_messages},
         types::{App, AppConfig},
     };
     use serde_json::Value;
@@ -883,14 +1087,12 @@ mod tests {
             current_agent: "build".to_string(),
             current_agent_manifest: None,
             pending_files: None,
-            pending_short_output: false,
             forced_skill: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
             cancel_stream: Arc::new(AtomicBool::new(false)),
             ignore_next_prompt_interrupt: false,
-            writer: None,
             prompt_editor: None,
             agent_context: None,
             last_skill_bias: None,
@@ -902,6 +1104,16 @@ mod tests {
         }
     }
 
+    fn test_message(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
     #[test]
     fn at_image_reference_is_attached_and_removed_from_question() {
         let path = std::env::temp_dir().join(format!("ai-image-{}.png", Uuid::new_v4()));
@@ -909,7 +1121,7 @@ mod tests {
 
         let mut app = test_app();
         let question = format!("Please inspect @{} now", path.display());
-        let ctx = finalize_question(&mut app, question, 6, false).unwrap();
+        let ctx = finalize_question(&mut app, question, 6).unwrap();
 
         assert!(!ctx.question.contains(path.to_string_lossy().as_ref()));
         assert_eq!(
@@ -936,7 +1148,7 @@ mod tests {
 
         let mut app = test_app();
         let question = format!("Summarize @\"{}\"", path.display());
-        let ctx = finalize_question(&mut app, question, 6, false).unwrap();
+        let ctx = finalize_question(&mut app, question, 6).unwrap();
 
         assert!(ctx.attachments_text.contains("hello from file"));
         assert!(!ctx.question.contains("hello from file"));
@@ -950,7 +1162,7 @@ mod tests {
 
         let mut app = test_app();
         app.pending_files = Some(path.to_string_lossy().to_string());
-        let ctx = finalize_question(&mut app, "describe this".to_string(), 6, false).unwrap();
+        let ctx = finalize_question(&mut app, "describe this".to_string(), 6).unwrap();
 
         assert_eq!(ctx.question, "describe this");
         assert_eq!(
@@ -1026,6 +1238,22 @@ mod tests {
                 full: false,
                 grep: None,
             }))
+        );
+        assert_eq!(
+            parse_local_command("/history rewind u3").unwrap(),
+            Some(LocalCommand::RewindHistory(
+                HistoryRewindTarget::UserOrdinal(3)
+            ))
+        );
+        assert_eq!(
+            parse_local_command("/history rewind last").unwrap(),
+            Some(LocalCommand::RewindHistory(HistoryRewindTarget::LatestUser))
+        );
+        assert_eq!(
+            parse_local_command("/history rewind grep wrong turn").unwrap(),
+            Some(LocalCommand::RewindHistory(HistoryRewindTarget::Grep(
+                "wrong turn".to_string()
+            )))
         );
         assert_eq!(parse_local_command("hello").unwrap(), None);
     }
@@ -1172,8 +1400,103 @@ mod tests {
         .unwrap();
         assert!(rendered.contains("recent user message(s)"));
         assert!(rendered.contains("[user] first user"));
+        assert!(rendered.contains("(u1)"));
         assert!(rendered.contains("[user] second user"));
+        assert!(rendered.contains("(u2)"));
         assert!(!rendered.contains("assistant reply"));
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn history_rewind_removes_target_user_and_following_messages() {
+        let history_path =
+            std::env::temp_dir().join(format!("ai-history-rewind-{}.sqlite", Uuid::new_v4()));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+
+        let messages = vec![
+            test_message("user", "first user"),
+            test_message("assistant", "first answer"),
+            test_message("user", "bad middle user"),
+            test_message("assistant", "bad answer"),
+            test_message("user", "later user"),
+        ];
+        append_history_messages(&history_path, &messages).unwrap();
+
+        let before_context = history::build_context_history(
+            usize::MAX,
+            history_path.as_path(),
+            0,
+            8,
+            4000,
+            None,
+        )
+        .unwrap();
+        assert!(
+            before_context
+                .iter()
+                .any(|message| searchable_history_content(&message.content) == "bad middle user")
+        );
+
+        let plan = plan_history_rewind(&app, HistoryRewindTarget::UserOrdinal(2)).unwrap();
+        assert_eq!(plan.user_ordinal, 2);
+        assert_eq!(plan.removed_messages, 3);
+        apply_history_rewind(&mut app, plan).unwrap();
+
+        let remaining = history::build_message_arr(usize::MAX, history_path.as_path()).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(
+            searchable_history_content(&remaining[0].content),
+            "first user"
+        );
+        assert_eq!(
+            searchable_history_content(&remaining[1].content),
+            "first answer"
+        );
+        let after_context = history::build_context_history(
+            usize::MAX,
+            history_path.as_path(),
+            0,
+            8,
+            4000,
+            None,
+        )
+        .unwrap();
+        assert_eq!(after_context.len(), 2);
+        assert!(!after_context.iter().any(|message| {
+            let content = searchable_history_content(&message.content);
+            content.contains("bad middle") || content.contains("later user")
+        }));
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn history_rewind_grep_requires_unique_user_match() {
+        let history_path =
+            std::env::temp_dir().join(format!("ai-history-rewind-grep-{}.sqlite", Uuid::new_v4()));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+
+        let messages = vec![
+            test_message("user", "fix login panic"),
+            test_message("assistant", "ok"),
+            test_message("user", "fix cache panic"),
+        ];
+        append_history_messages(&history_path, &messages).unwrap();
+
+        let err = plan_history_rewind(&app, HistoryRewindTarget::Grep("panic".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("user inputs match"));
+        assert!(err.contains("u1"));
+        assert!(err.contains("u2"));
+
+        let plan =
+            plan_history_rewind(&app, HistoryRewindTarget::Grep("cache".to_string())).unwrap();
+        assert_eq!(plan.user_ordinal, 2);
+        assert_eq!(plan.removed_messages, 1);
 
         let _ = std::fs::remove_file(history_path);
     }

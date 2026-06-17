@@ -217,7 +217,10 @@ pub(in crate::ai) fn replace_all_messages_sqlite(
         .map_err(|e| io::Error::other(e.to_string()))?;
     tx.execute("DELETE FROM messages", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
+    tx.execute("DELETE FROM meta WHERE key='first_user_prompt'", [])
+        .map_err(|e| io::Error::other(e.to_string()))?;
     insert_messages(&tx, messages.to_vec())?;
+    refresh_first_user_prompt_meta(&tx, messages)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
@@ -246,6 +249,22 @@ fn insert_messages(conn: &Connection, messages: Vec<Message>) -> io::Result<()> 
         ])
         .map_err(|e| io::Error::other(e.to_string()))?;
     }
+    Ok(())
+}
+
+fn refresh_first_user_prompt_meta(conn: &Connection, messages: &[Message]) -> io::Result<()> {
+    let Some(first_user_prompt) = messages
+        .iter()
+        .find(|message| message.role == "user")
+        .map(|message| value_to_string(&message.content))
+    else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES ('first_user_prompt', ?1)",
+        params![first_user_prompt],
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
     Ok(())
 }
 
@@ -522,9 +541,7 @@ pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Op
     }
     // 读取前 3 条用户消息，用于生成更完整的摘要
     let fallback: Vec<String> = conn
-        .prepare(
-            "SELECT content FROM messages WHERE role='user' ORDER BY id ASC LIMIT 3",
-        )
+        .prepare("SELECT content FROM messages WHERE role='user' ORDER BY id ASC LIMIT 3")
         .map_err(|e| io::Error::other(e.to_string()))?
         .query_map([], |row| row.get::<_, String>(0))
         .map_err(|e| io::Error::other(e.to_string()))?

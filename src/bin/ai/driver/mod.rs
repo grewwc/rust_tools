@@ -60,7 +60,6 @@ pub mod intent_recognition;
 pub mod mcp_init;
 pub mod model;
 pub mod observer;
-pub mod params;
 pub mod print;
 pub mod reflection;
 pub mod runtime_ctx;
@@ -1022,12 +1021,11 @@ fn should_preload_mcp(one_shot_mode: bool, mcp_probe: &McpConfigProbe) -> bool {
 ///   2. Load config
 ///   3. Create session store and session ID
 ///   4. Setup signal handlers (Ctrl+C)
-///   5. Create output writer (for -o flag)
-///   6. Initialize HTTP client
-///   7. Create local kernel (process OS)
-///   8. Load skills and MCP clients
-///   9. Load and activate agents
-///   10. Enter run_loop
+///   5. Initialize HTTP client
+///   6. Create local kernel (process OS)
+///   7. Load skills and MCP clients
+///   8. Load and activate agents
+///   9. Enter run_loop
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     aios_kernel::kernel::register_current_pid_provider(current_task_pid);
 
@@ -1111,8 +1109,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     })?;
 
-    let writer =
-        config::open_output_writer(cli.out.as_deref())?.map(|f| Arc::new(std::sync::Mutex::new(f)));
     let current_model = models::initial_model(&cli);
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
@@ -1135,7 +1131,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             Some(cli.files.clone())
         },
-        pending_short_output: cli.short_output,
         forced_skill: None,
         current_model,
         current_agent: "build".to_string(),
@@ -1150,7 +1145,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         streaming,
         cancel_stream,
         ignore_next_prompt_interrupt: false,
-        writer,
         prompt_editor,
         agent_context: Some(AgentContext {
             tools: Vec::new(),
@@ -2359,7 +2353,7 @@ async fn run_loop(
     };
 
     let cleanup_one_shot = |app: &App| {
-        if one_shot_mode {
+        if one_shot_mode && app.cli.session.is_none() {
             let store = SessionStore::new(app.config.history_file.as_path());
             let _ = store.delete_session(&app.session_id);
         }
@@ -2792,7 +2786,6 @@ async fn run_loop(
         }
 
         let original_history_file = app.session_history_file.clone();
-        let original_writer = app.writer.clone();
 
         crate::ai::types::clear_stream_cancel(app);
         crate::ai::tools::registry::common::clear_tool_cancel();
@@ -2801,7 +2794,6 @@ async fn run_loop(
             let mut os = app.os.lock().unwrap();
             if os.process_pending_signals() {
                 app.session_history_file = original_history_file;
-                app.writer = original_writer;
                 continue;
             }
         }
@@ -2888,7 +2880,6 @@ async fn run_loop(
                     os.terminate_current(format!("Failed: {}", err));
                 }
                 app.session_history_file = original_history_file;
-                app.writer = original_writer;
                 eprintln!("[Error] 当前轮请求失败：{}", err);
                 if one_shot_mode || should_quit {
                     cleanup_one_shot(app);
@@ -2900,7 +2891,6 @@ async fn run_loop(
             }
         };
         app.session_history_file = original_history_file;
-        app.writer = original_writer;
         // task_wait / tool_wait 等协作式让出会让本轮 run_turn 以 `Continue` 返回，
         // 而前台进程此时停在 Waiting（park），等后台子 agent 写回结果再被唤醒。
         // one-shot 模式下 `should_quit` 恒为 true，若此处直接退出，就会在子 agent
@@ -2934,11 +2924,6 @@ async fn run_loop(
             hooks::run_lifecycle_hook(hooks::HookEvent::SessionEnd, None, None);
             cleanup_one_shot(app);
             return Ok(());
-        }
-        if let Some(writer) = app.writer.as_ref() {
-            let mut guard = writer.lock().unwrap();
-            guard.write_all(b"\n---\n")?;
-            guard.flush()?;
         }
     }
 }
@@ -3097,14 +3082,12 @@ mod tests {
             current_agent: current_agent.to_string(),
             current_agent_manifest: None,
             pending_files: None,
-            pending_short_output: false,
             forced_skill: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
             cancel_stream: Arc::new(AtomicBool::new(false)),
             ignore_next_prompt_interrupt: false,
-            writer: None,
             prompt_editor: None,
             agent_context: Some(AgentContext {
                 tools: Vec::new(),

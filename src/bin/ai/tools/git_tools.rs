@@ -119,7 +119,8 @@ pub(crate) fn execute_git_diff(args: &Value) -> Result<String, String> {
 
     const MAX_CHARS: usize = 16_000;
     if out.len() > MAX_CHARS {
-        out.truncate(MAX_CHARS);
+        let boundary = out.floor_char_boundary(MAX_CHARS);
+        out.truncate(boundary);
         out.push_str("\n... (truncated)");
     }
     Ok(out.trim().to_string())
