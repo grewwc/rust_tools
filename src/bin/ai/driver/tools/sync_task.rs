@@ -26,7 +26,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -135,7 +135,7 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
     // Slot used by the sub-agent's `finalize_turn` to publish its final
     // assistant text. Created here, scoped via `SUBAGENT_RESULT_SLOT` over
     // the spawned future, and read once the sub-agent returns.
-    let result_slot: runtime_ctx::SubagentResultSlot = Arc::new(Mutex::new(None));
+    let result_slot: runtime_ctx::SubagentResultSlot = Arc::new(tokio::sync::Mutex::new(None));
     let result_slot_for_scope = result_slot.clone();
 
     let inherit = prepared.inherit;
@@ -224,7 +224,7 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
     let elapsed_secs = duration.as_secs_f64();
 
     let captured_output = result_slot
-        .lock()
+        .try_lock()
         .ok()
         .and_then(|guard| guard.clone())
         .unwrap_or_default();

@@ -32,16 +32,17 @@
 // =============================================================================
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use crate::ai::{
     agents::AgentManifest, mcp::SharedMcpClient, models::AutoModelFallbackSpec,
     skills::SkillManifest, types::App,
 };
+use tokio::sync::Mutex;
 
 /// Slot used by a sub-agent's `finalize_turn` to publish its final
 /// assistant text back to the caller. The parent task installs a fresh
-/// `Mutex<Option<String>>` via `SUBAGENT_RESULT_SLOT.scope(...)` before
+/// async `Mutex<Option<String>>` via `SUBAGENT_RESULT_SLOT.scope(...)` before
 /// invoking `run_turn`, then reads the slot once `run_turn` returns. This
 /// lets `task` / `task_spawn` actually surface the sub-agent's answer
 /// instead of just an "OK / FAILED" status line.
@@ -116,15 +117,16 @@ pub(crate) fn current_turn_id_or_zero() -> usize {
 /// Publish the sub-agent's final assistant text into the active result
 /// slot if one was installed by the spawning tool. Silent no-op when no
 /// slot is set (e.g. top-level foreground turn).
-pub(crate) fn publish_subagent_result(text: &str) {
+pub(crate) async fn publish_subagent_result(text: &str) {
     if text.trim().is_empty() {
         return;
     }
-    let _ = SUBAGENT_RESULT_SLOT.try_with(|slot| {
-        if let Ok(mut guard) = slot.lock() {
-            *guard = Some(text.to_string());
-        }
-    });
+    let slot = match SUBAGENT_RESULT_SLOT.try_with(|slot| slot.clone()) {
+        Ok(slot) => slot,
+        Err(_) => return,
+    };
+    let mut guard = slot.lock().await;
+    *guard = Some(text.to_string());
 }
 
 /// Try to read the current `DRIVER_CTX`. Returns `None` when called from a

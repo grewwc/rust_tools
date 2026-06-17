@@ -12,7 +12,10 @@ use crate::ai::{
     types::{App, StreamOutcome, StreamResult},
 };
 
-use super::{TurnOutcome, persistence::persist_pending_turn_messages, types::IterationExecution};
+use super::{
+    TurnOutcome, context_budget, persistence::persist_pending_turn_messages,
+    types::IterationExecution,
+};
 
 struct StreamingFlagGuard {
     flag: Arc<AtomicBool>,
@@ -29,8 +32,7 @@ impl StreamingFlagGuard {
 
 impl Drop for StreamingFlagGuard {
     fn drop(&mut self) {
-        self.flag
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.flag.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -271,6 +273,30 @@ async fn request_model_response(
     } else {
         None
     };
+
+    let budget_report = context_budget::apply_pre_request_context_budget(app, messages);
+    if budget_report.rolled_back {
+        crate::ai::driver::print::print_tool_note_line(
+            "context-budget",
+            "compression rolled back because protected system/current-user context changed",
+        );
+    } else if budget_report.changed {
+        crate::ai::driver::print::print_tool_note_line(
+            "context-budget",
+            &format!(
+                "compressed {} -> {} chars (target={}, lossless_removed={} messages/{} chars, critical={}, offload_only={}, lossy_candidates={} segments/{} chars)",
+                budget_report.before_chars,
+                budget_report.after_chars,
+                budget_report.target_chars,
+                budget_report.lossless_removed_messages,
+                budget_report.lossless_saved_chars,
+                budget_report.critical_segments,
+                budget_report.offload_only_segments,
+                budget_report.lossy_candidate_segments,
+                budget_report.lossy_candidate_chars
+            ),
+        );
+    }
 
     let mut actual_model = next_model.to_string();
     let mut request_result = do_request_messages(app, next_model, messages, true).await;

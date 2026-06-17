@@ -637,9 +637,6 @@ fn collect_session_code_discovery_records(
             continue;
         }
         discoveries.push(record);
-        if discoveries.len() >= 16 {
-            break;
-        }
     }
     discoveries.sort_by(|a, b| {
         recall_rank(b)
@@ -698,6 +695,26 @@ mod tests {
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
     use serde_json::Value;
     use std::collections::BTreeSet;
+
+    fn memory_entry(
+        note: impl Into<String>,
+        source: &str,
+        kind: &str,
+        confidence: &str,
+    ) -> AgentMemoryEntry {
+        AgentMemoryEntry {
+            id: None,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            category: "code_discovery".to_string(),
+            note: note.into(),
+            tags: vec![format!("kind:{kind}"), format!("confidence:{confidence}")],
+            source: Some(source.to_string()),
+            priority: Some(180),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        }
+    }
 
     #[test]
     fn extract_existing_code_discovery_lines_reads_history_messages() {
@@ -772,6 +789,34 @@ mod tests {
                 "- [confidence=high kind=error_site] code_search(operation=text_search, query=panic) => src/main.rs:42: panic!(\"boom\")",
             )
             .unwrap()
+        );
+    }
+
+    #[test]
+    fn collect_session_code_discovery_ranks_all_recent_candidates_before_truncating() {
+        let mut entries = (0..16)
+            .map(|idx| {
+                memory_entry(
+                    format!("grep_search(query=todo-{idx}) => TODO item {idx}"),
+                    "session:abc",
+                    "todo",
+                    "low",
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.push(memory_entry(
+            "read_file_lines(file=src/main.rs, lines=10..20) => root cause: missing config",
+            "session:abc",
+            "root_cause",
+            "high",
+        ));
+
+        let lines =
+            collect_session_code_discovery_records(&entries, "session:abc", &BTreeSet::new());
+        assert!(
+            lines
+                .iter()
+                .any(|record| { record.finding.contains("root cause: missing config") })
         );
     }
 

@@ -20,6 +20,7 @@
 //   - persistence: SQLite history management
 // =============================================================================
 
+mod context_budget;
 mod debug;
 mod finalize;
 mod iteration;
@@ -38,8 +39,9 @@ pub(super) use types::TurnOutcome;
 
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;
 const TOOL_OVERFLOW_PREVIEW_CHARS: usize = 800;
-/// 中等大输出阈值：超过此值但未到 overflow 阈值的工具结果，对结构化的 read/grep/tree
-/// 类工具走"头 + 关键命中 + 尾"的按行裁剪，避免完整 32KB 全部进上下文。
+/// 中等大输出阈值：超过此值但未到 overflow 阈值的工具结果，仅对非精确概览类
+/// 工具走"头 + 关键命中 + 尾"的按行裁剪，避免完整 32KB 全部进上下文。
+/// grep/code_search/search_files/read_file(_lines) 等精确证据工具不走该有损路径。
 const MAX_TOOL_RESULT_LINE_TRIM_CHARS: usize = 8_000;
 
 /// Mid-turn 渐进式压缩：messages 总字符数超过该阈值时，在 iteration loop 内
@@ -321,6 +323,68 @@ mod tests {
         assert!(prepared.content_for_terminal.contains("89→"));
         assert!(!prepared.content_for_terminal.contains("39→"));
         assert!(prepared.content_for_terminal.len() < 3000);
+    }
+
+    #[test]
+    fn precision_search_tools_keep_medium_output_exact_for_model() {
+        let history_file = std::env::temp_dir().join(format!(
+            "ai-tool-preview-grep-exact-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let app = test_app(history_file);
+
+        let mut content = String::new();
+        for i in 0..160usize {
+            content.push_str(&format!(
+                "src/example_{i}.rs:{}: matched precise line {}\n",
+                i + 1,
+                "x".repeat(90)
+            ));
+        }
+        assert!(content.chars().count() > MAX_TOOL_RESULT_LINE_TRIM_CHARS);
+        assert!(content.chars().count() < MAX_TOOL_RESULT_INLINE_CHARS);
+
+        for tool_name in ["grep_search", "code_search", "search_files"] {
+            let prepared = prepare_tool_result(&app, tool_name, &content);
+            assert_eq!(prepared.content_for_model, content);
+            assert!(!prepared.content_for_model.contains("middle trimmed"));
+        }
+    }
+
+    #[test]
+    fn precision_search_tools_offload_large_output_instead_of_lossy_trimming() {
+        let history_file = std::env::temp_dir().join(format!(
+            "ai-tool-overflow-grep-exact-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let app = test_app(history_file.clone());
+        let store = SessionStore::new(history_file.as_path());
+        store.ensure_root_dir().unwrap();
+        std::fs::write(store.session_history_file(&app.session_id), b"test").unwrap();
+
+        let content = (0..420usize)
+            .map(|i| {
+                format!(
+                    "src/example_{i}.rs:{}: matched precise line {}\n",
+                    i + 1,
+                    "x".repeat(90)
+                )
+            })
+            .collect::<String>();
+        assert!(content.chars().count() > MAX_TOOL_RESULT_INLINE_CHARS);
+
+        let prepared = prepare_tool_result(&app, "grep_search", &content);
+
+        assert!(
+            prepared
+                .content_for_model
+                .contains("Output too large; full result saved")
+        );
+        assert!(!prepared.content_for_model.contains("middle trimmed"));
+        let path = extract_stub_path(&prepared.content_for_model).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+
+        let _ = store.delete_session(&app.session_id);
     }
 
     #[test]

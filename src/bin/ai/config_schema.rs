@@ -165,4 +165,16 @@ impl AiConfig {
     /// Retain token usage rows for this many days; older rows are purged
     /// during periodic cleanup. Defaults to 90.
     pub const TOKEN_USAGE_RETAIN_DAYS: &str = "ai.token_usage.retain_days";
+
+    // ── Scheduler ──────────────────────────────────────────
+    pub const SCHEDULER_BASE_BATCH: &str = "ai.scheduler.base_batch";
+    pub const SCHEDULER_MAX_BATCH: &str = "ai.scheduler.max_batch";
+    pub const SCHEDULER_EXECUTE_MAX: &str = "ai.scheduler.execute_max";
+    pub const SCHEDULER_FAIL_STREAK_THRESHOLD: &str = "ai.scheduler.fail_streak_threshold";
+    pub const SCHEDULER_COOLDOWN_EPOCHS: &str = "ai.scheduler.cooldown_epochs";
+    pub const SCHEDULER_EVAL_PERIOD_EPOCHS: &str = "ai.scheduler.eval_period_epochs";
+    pub const SCHEDULER_EVAL_MIN_SAMPLES: &str = "ai.scheduler.eval_min_samples";
+    pub const SCHEDULER_COST_PENALTY_DIVISOR_MICROS: &str =
+        "ai.scheduler.cost_penalty_divisor_micros";
+    pub const SCHEDULER_TOKEN_PENALTY_DIVISOR: &str = "ai.scheduler.token_penalty_divisor";
 }

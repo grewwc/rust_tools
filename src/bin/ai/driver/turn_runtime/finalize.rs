@@ -244,7 +244,7 @@ pub(super) async fn finalize_turn(
         // a while.
         let subagent_output_for_parent =
             format_subagent_result_for_parent(final_assistant_text, turn_messages);
-        crate::ai::driver::runtime_ctx::publish_subagent_result(&subagent_output_for_parent);
+        crate::ai::driver::runtime_ctx::publish_subagent_result(&subagent_output_for_parent).await;
         ensure_final_assistant_recorded(
             final_assistant_text,
             final_assistant_recorded,

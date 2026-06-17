@@ -38,6 +38,7 @@ use crate::ai::{
     agents::{self, AgentManifest},
     cli::{self},
     config,
+    config_schema::AiConfig,
     history::SessionStore,
     mcp::{McpClient, SharedMcpClient},
     models,
@@ -256,54 +257,46 @@ fn scheduler_cfg_u64(key: &str, default: u64) -> u64 {
 }
 
 fn sched_base_batch() -> usize {
-    scheduler_cfg_usize("ai.scheduler.base_batch", BG_DISPATCH_BASE_BATCH_DEFAULT).max(1)
+    scheduler_cfg_usize(AiConfig::SCHEDULER_BASE_BATCH, BG_DISPATCH_BASE_BATCH_DEFAULT).max(1)
 }
 
 fn sched_max_batch() -> usize {
-    scheduler_cfg_usize("ai.scheduler.max_batch", BG_DISPATCH_MAX_BATCH_DEFAULT)
+    scheduler_cfg_usize(AiConfig::SCHEDULER_MAX_BATCH, BG_DISPATCH_MAX_BATCH_DEFAULT)
         .max(sched_base_batch())
 }
 
 fn sched_execute_max() -> usize {
-    scheduler_cfg_usize("ai.scheduler.execute_max", BG_DISPATCH_EXECUTE_MAX_DEFAULT)
+    scheduler_cfg_usize(AiConfig::SCHEDULER_EXECUTE_MAX, BG_DISPATCH_EXECUTE_MAX_DEFAULT)
         .max(sched_base_batch())
 }
 
 fn sched_fail_threshold() -> u32 {
     scheduler_cfg_u32(
-        "ai.scheduler.fail_streak_threshold",
+        AiConfig::SCHEDULER_FAIL_STREAK_THRESHOLD,
         SCHED_FAIL_STREAK_OPEN_THRESHOLD_DEFAULT,
     )
     .max(1)
 }
 
 fn sched_cooldown_epochs() -> u64 {
-    scheduler_cfg_u64(
-        "ai.scheduler.cooldown_epochs",
-        SCHED_COOLDOWN_EPOCHS_DEFAULT,
-    )
-    .max(1)
+    scheduler_cfg_u64(AiConfig::SCHEDULER_COOLDOWN_EPOCHS, SCHED_COOLDOWN_EPOCHS_DEFAULT).max(1)
 }
 
 fn sched_eval_period_epochs() -> u64 {
     scheduler_cfg_u64(
-        "ai.scheduler.eval_period_epochs",
+        AiConfig::SCHEDULER_EVAL_PERIOD_EPOCHS,
         SCHED_EVAL_PERIOD_EPOCHS_DEFAULT,
     )
     .max(1)
 }
 
 fn sched_eval_min_samples() -> usize {
-    scheduler_cfg_usize(
-        "ai.scheduler.eval_min_samples",
-        SCHED_EVAL_MIN_SAMPLES_DEFAULT,
-    )
-    .max(1)
+    scheduler_cfg_usize(AiConfig::SCHEDULER_EVAL_MIN_SAMPLES, SCHED_EVAL_MIN_SAMPLES_DEFAULT).max(1)
 }
 
 fn sched_cost_penalty_divisor() -> u64 {
     scheduler_cfg_u64(
-        "ai.scheduler.cost_penalty_divisor_micros",
+        AiConfig::SCHEDULER_COST_PENALTY_DIVISOR_MICROS,
         SCHED_COST_PENALTY_DIVISOR_DEFAULT,
     )
     .max(1)
@@ -311,7 +304,7 @@ fn sched_cost_penalty_divisor() -> u64 {
 
 fn sched_token_penalty_divisor() -> u64 {
     scheduler_cfg_u64(
-        "ai.scheduler.token_penalty_divisor",
+        AiConfig::SCHEDULER_TOKEN_PENALTY_DIVISOR,
         SCHED_TOKEN_PENALTY_DIVISOR_DEFAULT,
     )
     .max(1)
@@ -1038,7 +1031,7 @@ fn should_preload_mcp(one_shot_mode: bool, mcp_probe: &McpConfigProbe) -> bool {
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     aios_kernel::kernel::register_current_pid_provider(current_task_pid);
 
-    let mut cli = cli::parse_cli_args(std::env::args());
+    let cli = cli::parse_cli_args(std::env::args());
 
     // 纯本地命令（帮助、列工具/技能/agent）不调用 LLM，必须在 ensure_models_available /
     // load_config 之前处理：否则 models.json 为空或配置损坏时，连 `a --help` 都跑不起来，
@@ -1071,20 +1064,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if cli.list_agents {
         let agent_manifests = agents::load_all_agents();
         commands::help::print_agents_list(&agent_manifests);
-        return Ok(());
-    }
-
-    // --generate-completions：输出 shell 补全脚本后退出。
-    // 必须在 ensure_models_available / load_config 之前处理，
-    // 这样即使 models.json 为空也能生成补全脚本。
-    if cli.generate_completions {
-        let shell = std::env::var("SHELL")
-            .unwrap_or_default()
-            .rsplit('/')
-            .next()
-            .unwrap_or("bash")
-            .to_string();
-        cli::generate_completion_script(&shell);
         return Ok(());
     }
 
@@ -2569,7 +2548,7 @@ async fn run_loop(
                 // sub-agent actually produced (instead of just "completed
                 // with empty output").
                 let result_slot_for_payload: runtime_ctx::SubagentResultSlot =
-                    std::sync::Arc::new(std::sync::Mutex::new(None));
+                    std::sync::Arc::new(tokio::sync::Mutex::new(None));
                 let result_slot_for_scope = result_slot_for_payload.clone();
 
                 let inner_fut = TASK_PID.scope(Some(pid), async move {
@@ -2592,14 +2571,18 @@ async fn run_loop(
                         run.await
                     }
                     .map_err(|e| format!("{}", e));
+                    let captured_output = if result_channel_id.is_some() {
+                        result_slot_for_payload
+                            .lock()
+                            .await
+                            .clone()
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     let mut os = task_os.lock().unwrap();
                     os.set_current_pid(Some(pid));
                     if let Some(result_channel_id) = result_channel_id {
-                        let captured_output = result_slot_for_payload
-                            .lock()
-                            .ok()
-                            .and_then(|guard| guard.clone())
-                            .unwrap_or_default();
                         let payload = serde_json::json!({
                             "status": if result.is_ok() { "completed" } else { "failed" },
                             "output": captured_output,
