@@ -2215,7 +2215,7 @@ fn resolve_background_subagent_context(
 /// foreground / background 路径共享同一段 prompt，避免双份硬编码漂移。
 fn format_wakeup_prompt(pid: u64, goal: &str, messages: &[String]) -> String {
     format!(
-        "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- The async machinery has TWO families with similar but distinct semantics:\n    * subagent tasks  — `task_spawn` / `task_wait` / `task_status` (no cancel; long-lived task_id; task_wait's `timeout_secs` is a per-call wait budget, NOT a stall signal — re-call task_wait or pass wait_policy=\"any\" to keep waiting)\n    * generic tools   — `tool_spawn` / `tool_wait` / `tool_status` / `tool_cancel`\n  Pick the family that matches what you actually spawned; do NOT call task_cancel (it does not exist) or tool_wait on a task_id.\n- If the mailbox indicates async wake-up, first decide whether you need `task_status` / `tool_status` for a snapshot, `task_wait` / `tool_wait` to collect newly finished results, or `tool_cancel` to stop low-value branches.\n- Do not blindly wait again if enough completed results already support the answer.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
+        "[Process {} Woke Up] Original goal: {}\nNew mailbox messages:\n{}\n\nWake-up handling rules:\n- The async machinery has TWO families with similar but distinct semantics:\n    * subagent tasks  — `task_spawn` / `task_wait` / `task_status` (no cancel; long-lived task_id; task_wait's `timeout_secs` is a per-call wait budget, NOT a stall signal — re-call task_wait or pass wait_policy=\"any\" to keep waiting)\n    * generic tools   — `tool_spawn` / `tool_wait` / `tool_status` / `tool_cancel`\n  Pick the family that matches what you actually spawned; do NOT call task_cancel (it does not exist) or tool_wait on a task_id.\n- If the mailbox indicates event wake-up after `task_wait PARKED`, immediately re-call `task_wait` with the same task_ids and wait_policy to collect results from task result channels. Use `task_status` only if you need a non-blocking snapshot.\n- If the mailbox indicates generic async tool wake-up, use `tool_status` / `tool_wait` / `tool_cancel` as appropriate.\n- Do not abandon parked subagent tasks as stuck merely because the previous `task_wait` returned PARKED.\n- Prefer continuing reasoning immediately when the wake-up messages already identify the relevant finished tasks.\n\nResume execution based on the goal and these messages.",
         pid,
         goal,
         messages.join("\n---\n")
@@ -2463,6 +2463,7 @@ async fn run_loop(
                 Option<u64>,
                 Option<aios_kernel::primitives::FutexAddr>,
                 Option<String>,
+                Option<crate::ai::models::AutoModelFallbackSpec>,
             )> = Vec::new();
             for proc in &background_procs {
                 let pid = proc.pid;
@@ -2509,6 +2510,9 @@ async fn run_loop(
                         .as_ref()
                         .map(|goal| aios_kernel::primitives::FutexAddr(goal.completion_futex_addr)),
                     task_goal.as_ref().map(|goal| goal.task_id.clone()),
+                    task_goal
+                        .as_ref()
+                        .and_then(|goal| goal.auto_model_fallback),
                 ));
             }
 
@@ -2521,6 +2525,7 @@ async fn run_loop(
                 result_channel_id,
                 completion_futex_addr,
                 task_id,
+                auto_model_fallback,
             ) in task_specs
             {
                 let mut task_app = app.clone();
@@ -2569,7 +2574,7 @@ async fn run_loop(
 
                 let inner_fut = TASK_PID.scope(Some(pid), async move {
                     crate::ai::tools::registry::common::clear_tool_cancel();
-                    let result = turn_runtime::run_turn(
+                    let run = turn_runtime::run_turn(
                         &mut task_app,
                         &task_mcp,
                         &task_skills,
@@ -2580,8 +2585,12 @@ async fn run_loop(
                         None,
                         false,
                         false,
-                    )
-                    .await
+                    );
+                    let result = if let Some(spec) = auto_model_fallback {
+                        runtime_ctx::AUTO_MODEL_FALLBACK.scope(spec, run).await
+                    } else {
+                        run.await
+                    }
                     .map_err(|e| format!("{}", e));
                     let mut os = task_os.lock().unwrap();
                     os.set_current_pid(Some(pid));

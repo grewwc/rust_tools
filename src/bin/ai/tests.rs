@@ -158,17 +158,9 @@ fn resolve_model_is_unicode_safe() {
 }
 
 #[test]
-fn image_files_auto_route_to_vl() {
-    let vl = any_vl_model_name();
-    let model = super::driver::attachment_forced_model("qwen3.5-flash", true, vl.as_str(), false);
-    assert_eq!(model, Some(vl));
-}
-
-#[test]
-fn configured_vl_model_is_used_for_images() {
-    let vl = any_vl_model_name();
-    let model = super::driver::attachment_forced_model("qwen3.5-flash", true, vl.as_str(), false);
-    assert_eq!(model, Some(vl));
+fn image_files_keep_text_model() {
+    let model = super::driver::attachment_forced_model("qwen3.5-flash", true, "any", false);
+    assert_eq!(model, None);
 }
 
 #[test]

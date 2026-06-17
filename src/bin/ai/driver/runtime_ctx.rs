@@ -25,12 +25,19 @@
 //   - `SUBAGENT_CWD` overrides the project-wide `effective_cwd()` helper
 //     so tools that consult it (e.g. ripgrep / find / fingerprint) honour
 //     the sub-agent's scoped working directory instead of the parent's.
+//
+//   - `AUTO_MODEL_FALLBACK` marks sub-agent turns whose model was chosen
+//     automatically. Request failures in that scope may retry with another
+//     healthy auto-selected model; explicit model overrides do not.
 // =============================================================================
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::ai::{agents::AgentManifest, mcp::SharedMcpClient, skills::SkillManifest, types::App};
+use crate::ai::{
+    agents::AgentManifest, mcp::SharedMcpClient, models::AutoModelFallbackSpec,
+    skills::SkillManifest, types::App,
+};
 
 /// Slot used by a sub-agent's `finalize_turn` to publish its final
 /// assistant text back to the caller. The parent task installs a fresh
@@ -91,6 +98,7 @@ tokio::task_local! {
     /// 轮调度前 enter，被 DecisionLog / 反馈写入路径读取，把工具调用结
     /// 果对回到正确的 (session, turn)。未设置时下游获取到 ("", 0)。
     pub(crate) static TURN_IDENTITY: (String, usize);
+    pub(crate) static AUTO_MODEL_FALLBACK: AutoModelFallbackSpec;
 }
 
 /// 读取当前 turn 的 session_id；未在 turn 内调用时返回空串。
@@ -124,6 +132,10 @@ pub(crate) fn publish_subagent_result(text: &str) {
 /// invocations outside a turn).
 pub(crate) fn try_current() -> Option<Arc<DriverContext>> {
     DRIVER_CTX.try_with(Arc::clone).ok()
+}
+
+pub(crate) fn auto_model_fallback_spec() -> Option<AutoModelFallbackSpec> {
+    AUTO_MODEL_FALLBACK.try_with(|value| *value).ok()
 }
 
 /// Read the optional sub-agent memory path override. `None` means

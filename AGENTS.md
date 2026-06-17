@@ -73,6 +73,7 @@ cargo test --bin a test_xxx       # Filter tests by name
    - MCP integration: stdio JSON-RPC transport
    - Tool groups: core, builtin, executor, etc.
    - `ast_symbols/`: multi-language AST extraction (Rust/Python/Java/Go/TS/JS/C/C++)
+   - Agent teams: `agent_team` launches parent-mediated multi-agent deliberation phases (`start` → `challenge` → `synthesize`) on top of existing `task_spawn` / `task_wait` kernel process, channel, and futex plumbing.
    - Knowledge tools: `knowledge_save`, `knowledge_forget`, `knowledge_search`, `knowledge_list`, `knowledge_consolidate`
    - `knowledge_consolidate` — two-phase AI-driven consolidation:
      `action: "read_all"` → returns all entries for LLM analysis;
@@ -84,6 +85,7 @@ cargo test --bin a test_xxx       # Filter tests by name
    - Keys defined in `config_schema.rs` (`AiConfig` constants) — never use raw string literals
    - Runtime config via `configw::get_all_config()`
    - Model registry: `models.json` (endpoints, quality tiers, VL support)
+   - Automatic model selection skips runtime-unhealthy models after request failures; `ai.model.disabled` can still exclude known unavailable or too-expensive model keys/names without editing `models.json`.
    - Embedding (optional, off by default): set `ai.embedding.enable=true` + `aliyun.api_key` (or `ai.embedding.api_key`) to enable semantic recall via Aliyun 百炼 OpenAI-compatible `/embeddings` (`text-embedding-v4`). Any failure degrades to BM25/lexical — see [embedder.rs](src/bin/ai/knowledge/indexing/embedder.rs).
 
 6. **Provider adapter layer** (`src/bin/ai/provider/`)

@@ -10,7 +10,7 @@ use crate::ai::{
         TextSimilarityFeatures, build_idf_from_documents, cosine_tfidf_similarity,
         normalize_text_for_similarity,
     },
-    models,
+    model_names, models,
     tools::common::{ToolRegistration, ToolSpec},
     tools::registry::common::current_process_tool_cancel_futex,
 };
@@ -31,6 +31,7 @@ const MAX_TASK_REGISTRY_SIZE: usize = 100;
 const DEFAULT_TASK_PRIORITY: u8 = 20;
 const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
+const MAX_AGENT_TEAM_MEMBERS: usize = 8;
 /// 单次 `task_wait` 调用的默认等待预算（秒）。这只是 **本次调用的最长阻塞时间**，
 /// 不是 subagent 的总寿命：超时仅意味着"这次没等到结果"，主 agent 可以继续调
 /// `task_wait` 续等，subagent 仍在后台运行，channel/futex 也不会被销毁。
@@ -180,6 +181,8 @@ pub(crate) struct AsyncTaskEntry {
     /// 但 kernel 端 name 仅作显示。
     pub(crate) agent_name: String,
     pub(crate) model: String,
+    pub(crate) is_model_auto_selected: bool,
+    pub(crate) auto_model_fallback: Option<models::AutoModelFallbackSpec>,
     pub(crate) selection_explanation: String,
     pub(crate) inherit: InheritOptions,
     /// wall-clock 起始时间，用于 `prune_completed_tasks` LRU；不能由 kernel
@@ -204,6 +207,10 @@ pub(crate) struct OsTaskGoal {
     pub(crate) prompt: String,
     pub(crate) agent_name: String,
     pub(crate) model: String,
+    #[serde(default)]
+    pub(crate) is_model_auto_selected: bool,
+    #[serde(default)]
+    pub(crate) auto_model_fallback: Option<models::AutoModelFallbackSpec>,
     pub(crate) selection_explanation: String,
 }
 
@@ -587,6 +594,69 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+fn params_agent_team() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": ["start", "challenge", "synthesize"],
+                "description": "Team phase to launch. 'start' fans out independent members. 'challenge' asks members to critique a transcript. 'synthesize' asks one or more members to produce a final conclusion from a transcript."
+            },
+            "goal": {
+                "type": "string",
+                "description": "Shared objective for the team deliberation."
+            },
+            "members": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "role": {
+                            "type": "string",
+                            "description": "Role name for this team member, for example implementer, reviewer, skeptic, domain expert, synthesizer."
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "description": "Role-specific instructions. For start, this is the member's investigation brief. For challenge/synthesize, this describes the critique or synthesis angle."
+                        },
+                        "agent": {
+                            "type": "string",
+                            "description": "Optional subagent name. Leave empty to auto-select."
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Optional model override for this member."
+                        }
+                    },
+                    "required": ["role"]
+                },
+                "description": "Team members to launch in this phase. Use 2-8 members for start; challenge/synthesize may use 1-8."
+            },
+            "transcript": {
+                "type": "string",
+                "description": "Collected outputs from prior team phases. Required for challenge/synthesize so no agent relies on direct peer messaging."
+            },
+            "inherit": {
+                "type": "string",
+                "description": task_inherit_schema_description()
+            }
+        },
+        "required": ["operation", "goal", "members"]
+    })
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "agent_team",
+        description: "Launch a parent-mediated multi-agent team phase over the existing task_spawn/task_wait substrate. Use operation='start' to fan out multiple members, then task_wait to collect all outputs; use operation='challenge' with that transcript to have agents challenge assumptions; use operation='synthesize' with the updated transcript for final consensus. Team members do NOT message each other directly: the parent passes full transcripts between phases, avoiding mailbox/drain/routing bugs while reusing AIOS kernel processes, result channels, futex wakeups, and task_wait.",
+        parameters: params_agent_team,
+        execute: execute_agent_team,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core"],
+    }
+});
+
 /// Pre-flight subagent task spec produced from a `task` / `task_spawn` tool
 /// call before the kernel actually spawns the new process.
 pub(crate) struct PreparedSubagentTask {
@@ -594,6 +664,8 @@ pub(crate) struct PreparedSubagentTask {
     pub(crate) prompt: String,
     pub(crate) agent_name: String,
     pub(crate) model: String,
+    pub(crate) is_model_auto_selected: bool,
+    pub(crate) auto_model_fallback: Option<models::AutoModelFallbackSpec>,
     pub(crate) selection_explanation: String,
     pub(crate) inherit: InheritOptions,
 }
@@ -612,7 +684,10 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let model_override = args["model"].as_str();
+    let model_override = args["model"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     if description.trim().is_empty() {
         return Err("description cannot be empty".to_string());
@@ -635,11 +710,14 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
         &owned_fallback
     };
     let selected = select_subagent(all_agents, agent, description, prompt)?;
-    let selected_model = model_override
-        .map(models::determine_model)
-        .unwrap_or_else(|| {
-            models::auto_subagent_model_for_agent(selected.agent, description, prompt)
-        });
+    let (selected_model, is_model_auto_selected, auto_model_fallback) =
+        if let Some(model_override) = model_override {
+            (models::determine_model(model_override), false, None)
+        } else {
+            let choice =
+                models::auto_subagent_model_choice_for_agent(selected.agent, description, prompt);
+            (choice.model, true, Some(choice.fallback))
+        };
     let selection_explanation =
         build_selection_explanation(&selected, &selected_model, model_override);
 
@@ -648,6 +726,8 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
         prompt: prompt.to_string(),
         agent_name: selected.agent.name.clone(),
         model: selected_model,
+        is_model_auto_selected,
+        auto_model_fallback,
         selection_explanation,
         inherit,
     })
@@ -691,6 +771,8 @@ pub(crate) fn spawn_subagent_kernel_task(
             prompt: prepared.prompt.clone(),
             agent_name: prepared.agent_name.clone(),
             model: prepared.model.clone(),
+            is_model_auto_selected: prepared.is_model_auto_selected,
+            auto_model_fallback: prepared.auto_model_fallback,
             selection_explanation: prepared.selection_explanation.clone(),
         })?;
         let pid = os.spawn(
@@ -716,6 +798,8 @@ pub(crate) fn spawn_subagent_kernel_task(
                 description: prepared.description.clone(),
                 agent_name: prepared.agent_name.clone(),
                 model: prepared.model.clone(),
+                is_model_auto_selected: prepared.is_model_auto_selected,
+                auto_model_fallback: prepared.auto_model_fallback,
                 selection_explanation: prepared.selection_explanation.clone(),
                 inherit: prepared.inherit,
                 started_at: Instant::now(),
@@ -773,6 +857,402 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
         prepared.model,
         prepared.inherit.describe()
     ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentTeamOperation {
+    Start,
+    Challenge,
+    Synthesize,
+}
+
+impl AgentTeamOperation {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value
+            .unwrap_or("start")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "start" => Ok(Self::Start),
+            "challenge" => Ok(Self::Challenge),
+            "synthesize" => Ok(Self::Synthesize),
+            other => Err(format!(
+                "Unknown agent_team operation '{}'. Expected start, challenge, or synthesize.",
+                other
+            )),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Challenge => "challenge",
+            Self::Synthesize => "synthesize",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AgentTeamMemberSpec {
+    role: String,
+    prompt: String,
+    agent: Option<String>,
+    model: Option<String>,
+}
+
+struct PreparedAgentTeamMember {
+    role: String,
+    prepared: PreparedSubagentTask,
+}
+
+pub(crate) fn execute_agent_team(args: &Value) -> Result<String, String> {
+    let operation = AgentTeamOperation::parse(args["operation"].as_str())?;
+    let goal = required_nonempty_str(args, "goal")?;
+    let inherit = InheritOptions::from_value(&args["inherit"])?;
+    let transcript = args["transcript"].as_str().unwrap_or("").trim();
+    if matches!(
+        operation,
+        AgentTeamOperation::Challenge | AgentTeamOperation::Synthesize
+    ) && transcript.is_empty()
+    {
+        return Err(
+            "agent_team transcript is required for challenge/synthesize phases.".to_string(),
+        );
+    }
+
+    let members = parse_agent_team_members(args, operation)?;
+    let prepared_members = members
+        .iter()
+        .map(|member| {
+            let team_prompt = build_agent_team_prompt(operation, goal, member, transcript);
+            let selection_prompt = build_agent_team_selection_prompt(operation, member);
+            let description = format_agent_team_description(operation, &member.role);
+            let mut task_args = serde_json::json!({
+                "description": description,
+                "prompt": selection_prompt,
+                "agent": member.agent.as_deref().unwrap_or(""),
+                "inherit": inherit.describe(),
+            });
+            if let Some(model) = member.model.as_deref() {
+                task_args["model"] = serde_json::json!(resolve_agent_team_model_override(model)?);
+            }
+            prepare_subagent_task(&task_args).map(|mut prepared| {
+                // 完整 team prompt 可能包含大段 transcript/模板，容易把每个成员都误判
+                // 成 heavy 任务而选到高成本模型；agent/model 选择用上面的短 prompt，
+                // 实际运行仍使用完整 prompt。
+                prepared.prompt = team_prompt;
+                PreparedAgentTeamMember {
+                    role: member.role.clone(),
+                    prepared,
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let team_id = format!("team_{}", Uuid::new_v4().simple());
+    let mut launched = Vec::with_capacity(prepared_members.len());
+    for member in &prepared_members {
+        let spawned = match spawn_subagent_kernel_task(&member.prepared) {
+            Ok(spawned) => spawned,
+            Err(err) => {
+                cleanup_launched_agent_team_members(&launched);
+                let partial = if launched.is_empty() {
+                    "no members were launched".to_string()
+                } else {
+                    format!(
+                        "cleaned up already launched task_ids: {}",
+                        launched
+                            .iter()
+                            .map(|item: &LaunchedAgentTeamMember| item.task_id.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                return Err(format!(
+                    "Failed to launch agent_team member '{}': {} ({})",
+                    member.role, err, partial
+                ));
+            }
+        };
+        launched.push(LaunchedAgentTeamMember {
+            role: member.role.clone(),
+            task_id: spawned.task_id,
+            pid: spawned.pid,
+            result_channel_id: spawned.result_channel_id,
+            completion_futex_addr: spawned.completion_futex_addr,
+            agent_name: member.prepared.agent_name.clone(),
+            model: member.prepared.model.clone(),
+        });
+    }
+
+    Ok(format_agent_team_launch_result(
+        &team_id, operation, goal, inherit, &launched,
+    ))
+}
+
+struct LaunchedAgentTeamMember {
+    role: String,
+    task_id: String,
+    pid: u64,
+    result_channel_id: u64,
+    completion_futex_addr: FutexAddr,
+    agent_name: String,
+    model: String,
+}
+
+fn resolve_agent_team_model_override(model: &str) -> Result<String, String> {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return Err("agent_team member model override cannot be empty".to_string());
+    }
+    if let Some(def) = model_names::find_by_key(trimmed) {
+        return Ok(def.name.clone());
+    }
+    if let Some(def) = model_names::find_by_name(trimmed) {
+        return Ok(def.name.clone());
+    }
+    Err(format!(
+        "Unknown agent_team member model '{}'. Team model overrides require an exact model key/name to avoid accidentally selecting an expensive fallback.",
+        trimmed
+    ))
+}
+
+fn cleanup_launched_agent_team_members(launched: &[LaunchedAgentTeamMember]) {
+    for member in launched {
+        let _ = remove_task_entry(&member.task_id);
+        let _ = with_os_kernel(|os| {
+            if let Err(err) = os.kill_process(
+                member.pid,
+                "agent_team launch failed; cleaning up partial phase".to_string(),
+            ) {
+                eprintln!(
+                    "[agent_team] cleanup failed to kill pid {} for task_id {}: {}",
+                    member.pid, member.task_id, err
+                );
+            }
+            if let Err(err) = os.channel_close(None, ChannelId(member.result_channel_id)) {
+                eprintln!(
+                    "[agent_team] cleanup failed to close result channel {} for task_id {}: {}",
+                    member.result_channel_id, member.task_id, err
+                );
+            }
+            if let Err(err) = os.channel_release_named(
+                ChannelId(member.result_channel_id),
+                "task_result.consumer",
+            ) {
+                eprintln!(
+                    "[agent_team] cleanup failed to release consumer holder on channel {} for task_id {}: {}",
+                    member.result_channel_id, member.task_id, err
+                );
+            }
+            if let Err(err) = os.channel_release_named(
+                ChannelId(member.result_channel_id),
+                "task_result.producer",
+            ) {
+                eprintln!(
+                    "[agent_team] cleanup failed to release producer holder on channel {} for task_id {}: {}",
+                    member.result_channel_id, member.task_id, err
+                );
+            }
+            if let Err(err) = os.channel_destroy(None, ChannelId(member.result_channel_id)) {
+                eprintln!(
+                    "[agent_team] cleanup failed to destroy result channel {} for task_id {}: {}",
+                    member.result_channel_id, member.task_id, err
+                );
+            }
+            if !os.futex_destroy(member.completion_futex_addr) {
+                eprintln!(
+                    "[agent_team] cleanup failed to destroy completion futex {:?} for task_id {}",
+                    member.completion_futex_addr, member.task_id
+                );
+            }
+            Ok(())
+        });
+    }
+}
+
+fn required_nonempty_str<'a>(args: &'a Value, field: &str) -> Result<&'a str, String> {
+    let value = args[field]
+        .as_str()
+        .ok_or_else(|| format!("Missing '{}' parameter", field))?
+        .trim();
+    if value.is_empty() {
+        return Err(format!("{} cannot be empty", field));
+    }
+    Ok(value)
+}
+
+fn parse_agent_team_members(
+    args: &Value,
+    operation: AgentTeamOperation,
+) -> Result<Vec<AgentTeamMemberSpec>, String> {
+    let values = args["members"]
+        .as_array()
+        .ok_or("Missing 'members' array parameter")?;
+    let min_members = if operation == AgentTeamOperation::Start {
+        2
+    } else {
+        1
+    };
+    if values.len() < min_members {
+        return Err(format!(
+            "agent_team operation '{}' requires at least {} member(s).",
+            operation.label(),
+            min_members
+        ));
+    }
+    if values.len() > MAX_AGENT_TEAM_MEMBERS {
+        return Err(format!(
+            "agent_team supports at most {} members per phase.",
+            MAX_AGENT_TEAM_MEMBERS
+        ));
+    }
+
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let role = value["role"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("members[{index}].role cannot be empty"))?;
+            let prompt = value["prompt"]
+                .as_str()
+                .map(str::trim)
+                .unwrap_or("")
+                .to_string();
+            let agent = value["agent"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            let model = value["model"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            Ok(AgentTeamMemberSpec {
+                role: role.to_string(),
+                prompt,
+                agent,
+                model,
+            })
+        })
+        .collect()
+}
+
+fn build_agent_team_prompt(
+    operation: AgentTeamOperation,
+    goal: &str,
+    member: &AgentTeamMemberSpec,
+    transcript: &str,
+) -> String {
+    let role_prompt = if member.prompt.trim().is_empty() {
+        "(No additional role-specific instructions.)"
+    } else {
+        member.prompt.trim()
+    };
+    let mut prompt = format!(
+        "You are a member of an AIOS agent team.\n\nTeam goal:\n{goal}\n\nYour role:\n{}\n\nRole-specific instructions:\n{role_prompt}\n\nCommunication contract:\n- Do not wait for direct messages from peer agents.\n- The parent agent coordinates the team and will pass complete transcripts between phases.\n- Make your output self-contained so it can be forwarded to later challenge/synthesis phases.\n",
+        member.role
+    );
+    match operation {
+        AgentTeamOperation::Start => {
+            prompt.push_str(
+                "\nPhase: initial independent analysis.\n- Provide your best answer from this role.\n- State assumptions, evidence, risks, and unresolved questions.\n- Explicitly list points that another agent should challenge.\n",
+            );
+        }
+        AgentTeamOperation::Challenge => {
+            prompt.push_str(
+                "\nPhase: challenge.\nReview the transcript below. Challenge weak assumptions, missing evidence, contradictions, unsafe proposals, and overconfident conclusions. Keep valid points and propose concrete corrections.\n\nPrior team transcript:\n",
+            );
+            prompt.push_str(transcript.trim());
+        }
+        AgentTeamOperation::Synthesize => {
+            prompt.push_str(
+                "\nPhase: synthesis.\nUse the transcript below to produce the strongest final answer. Resolve disagreements explicitly, cite which arguments survived challenge, and call out residual uncertainty.\n\nPrior team transcript:\n",
+            );
+            prompt.push_str(transcript.trim());
+        }
+    }
+    prompt
+}
+
+fn build_agent_team_selection_prompt(
+    operation: AgentTeamOperation,
+    member: &AgentTeamMemberSpec,
+) -> String {
+    let role_prompt = if member.prompt.trim().is_empty() {
+        "Use the role name as the main specialization signal."
+    } else {
+        member.prompt.trim()
+    };
+    format!(
+        "agent_team phase: {}\nrole: {}\nrole instructions: {}",
+        operation.label(),
+        member.role,
+        role_prompt
+    )
+}
+
+fn format_agent_team_description(operation: AgentTeamOperation, role: &str) -> String {
+    let compact_role = role.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("agent_team {} {}", operation.label(), compact_role)
+}
+
+fn format_agent_team_launch_result(
+    team_id: &str,
+    operation: AgentTeamOperation,
+    goal: &str,
+    inherit: InheritOptions,
+    launched: &[LaunchedAgentTeamMember],
+) -> String {
+    let task_ids = launched
+        .iter()
+        .map(|member| member.task_id.as_str())
+        .collect::<Vec<_>>();
+    let mut lines = vec![
+        format!(
+            "Agent team phase launched: team_id={}, operation={}, members={}, inherit={}",
+            team_id,
+            operation.label(),
+            launched.len(),
+            inherit.describe()
+        ),
+        format!("Goal: {}", goal),
+        "Members:".to_string(),
+    ];
+    for member in launched {
+        lines.push(format!(
+            "- role='{}' task_id={} pid={} agent={} model={}",
+            member.role, member.task_id, member.pid, member.agent_name, member.model
+        ));
+    }
+    lines.push(format!(
+        "Next: call task_wait with task_ids=[{}] and wait_policy=\"all\" to collect this phase.",
+        task_ids
+            .iter()
+            .map(|id| format!("\"{}\"", id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    match operation {
+        AgentTeamOperation::Start => lines.push(
+            "After collection, call agent_team operation=\"challenge\" with transcript=<all member outputs> to make agents challenge each other."
+                .to_string(),
+        ),
+        AgentTeamOperation::Challenge => lines.push(
+            "After collection, call agent_team operation=\"synthesize\" with transcript=<initial outputs + challenges> for the final conclusion."
+                .to_string(),
+        ),
+        AgentTeamOperation::Synthesize => lines.push(
+            "After collection, use the synthesis output as the team conclusion; no direct peer messages are expected."
+                .to_string(),
+        ),
+    }
+    lines.join("\n")
 }
 
 fn params_task_wait() -> Value {
@@ -1052,18 +1532,23 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 .map(|(tid, _)| tid.clone())
                 .collect::<Vec<_>>();
             let wait_sources = task_wait_sources(os, &pending_ids, &registry)?;
+            // `task_wait` 的 `wait_policy=all` 是工具层语义：返回前要收齐所有
+            // task 结果。但底层 park 不能用 `WaitPolicy::All` 等所有事件源，
+            // 因为 sources 里还包含用于中断当前进程的 cancel futex，它在正常路径
+            // 不会完成。这里等待“任一 task 事件”唤醒，再重新扫描所有 task 状态；
+            // 若还没收齐，模型可用相同 task_ids 继续调用 task_wait。
             let wait = epoll_wait_many(
                 os,
                 &format!("task_wait:{}", pending_ids.join(",")),
                 &wait_sources,
-                wait_policy.clone(),
+                WaitPolicy::Any,
                 timeout_ticks,
             )?;
             if wait.suspended {
                 // 当前进程是 **协作式让出（suspend）**：kernel 已把前台进程置为
                 // Waiting 并交还调度权，好让后台 subagent 真正获得 CPU 去跑。等
                 // subagent 把结果写回 channel / 触发 futex 后，调度器会重新唤醒本
-                // 进程并 **自动重入 task_wait**。
+                // 进程；被唤醒后应重新调用 task_wait 收集 channel 中的结果。
                 //
                 // ⚠️ 这里 **绝不能** 用 "BUDGET ELAPSED" 之类的终态措辞：suspend 是
                 // 毫秒级同步返回的（不是真的等满 timeout_secs），如果告诉模型
@@ -1083,11 +1568,11 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     "[task_wait PARKED] Yielded CPU so {} pending subagent task(s) can run. \
                     This is normal cooperative scheduling, NOT a timeout and NOT a stall — the wait budget \
                     ({timeout_secs}s, wait_policy={policy_label}) has NOT elapsed. The scheduler will wake this \
-                    agent and resume the wait automatically as soon as a result is ready. \
+                    agent as soon as a result is ready. \
                     Pending task_ids: [{}]. event_ids={}. \
                     Do NOT assume the subagents are stuck and do NOT abandon them to work around this; \
-                    just let the wait resume (you may re-call `task_wait` with the same task_ids, or use \
-                    `task_status` for a non-blocking snapshot).",
+                    when woken, re-call `task_wait` with the same task_ids to collect results, or use \
+                    `task_status` for a non-blocking snapshot.",
                     pending_ids.len(),
                     pending_ids.join(", "),
                     wait.event_ids
@@ -1513,8 +1998,11 @@ fn build_selection_explanation(
 #[cfg(test)]
 mod tests {
     use super::{
-        SelectedSubagent, WaitManySource, build_selection_explanation, epoll_wait_many,
-        epoll_wait_many_channels, select_subagent,
+        AgentTeamMemberSpec, AgentTeamOperation, SelectedSubagent, WaitManySource,
+        append_current_process_cancel_source, build_agent_team_prompt,
+        build_agent_team_selection_prompt, build_selection_explanation, epoll_wait_many,
+        epoll_wait_many_channels, parse_agent_team_members, resolve_agent_team_model_override,
+        select_subagent, wait_sources_for_channel_and_futex,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use aios_kernel::{
@@ -1685,6 +2173,90 @@ mod tests {
     }
 
     #[test]
+    fn blank_model_override_is_treated_as_auto_selection() {
+        let agent = manifest(
+            "explore",
+            "Read-only codebase exploration agent",
+            AgentMode::Subagent,
+        );
+        let selected = SelectedSubagent {
+            agent: &agent,
+            auto_selected: true,
+            matched_tags: Vec::new(),
+            score: 0,
+        };
+
+        let explanation = build_selection_explanation(&selected, "deepseek-v4-flash", Some(" "));
+
+        assert!(explanation.contains("auto-selected"));
+        assert!(!explanation.contains("explicit model override"));
+    }
+
+    #[test]
+    fn agent_team_start_requires_multiple_members() {
+        let args = serde_json::json!({
+            "operation": "start",
+            "goal": "Decide the safest implementation",
+            "members": [
+                { "role": "reviewer" }
+            ]
+        });
+
+        let err = parse_agent_team_members(&args, AgentTeamOperation::Start).unwrap_err();
+
+        assert!(err.contains("requires at least 2"));
+    }
+
+    #[test]
+    fn agent_team_challenge_prompt_uses_parent_mediated_transcript() {
+        let member = AgentTeamMemberSpec {
+            role: "skeptic".to_string(),
+            prompt: "Focus on concurrency and missing evidence.".to_string(),
+            agent: None,
+            model: None,
+        };
+
+        let prompt = build_agent_team_prompt(
+            AgentTeamOperation::Challenge,
+            "Review the design",
+            &member,
+            "member A: looks safe\nmember B: maybe races",
+        );
+
+        assert!(prompt.contains("Do not wait for direct messages from peer agents"));
+        assert!(prompt.contains("parent agent coordinates"));
+        assert!(prompt.contains("Phase: challenge"));
+        assert!(prompt.contains("member A: looks safe"));
+        assert!(prompt.contains("concurrency"));
+    }
+
+    #[test]
+    fn agent_team_selection_prompt_stays_cost_aware() {
+        let member = AgentTeamMemberSpec {
+            role: "skeptic".to_string(),
+            prompt: "Focus on assumptions and risks.".to_string(),
+            agent: None,
+            model: None,
+        };
+
+        let selection_prompt =
+            build_agent_team_selection_prompt(AgentTeamOperation::Challenge, &member);
+
+        assert!(selection_prompt.contains("agent_team phase: challenge"));
+        assert!(selection_prompt.contains("role: skeptic"));
+        assert!(!selection_prompt.contains("Prior team transcript"));
+        assert!(!selection_prompt.contains("Team goal"));
+    }
+
+    #[test]
+    fn agent_team_model_override_requires_exact_match() {
+        let err = resolve_agent_team_model_override("__missing_model_for_team__").unwrap_err();
+
+        assert!(err.contains("exact model key/name"));
+        assert!(err.contains("expensive fallback"));
+    }
+
+    #[test]
     fn epoll_wait_many_channels_returns_ready_without_suspending() {
         let mut os = LocalOS::new();
         let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
@@ -1821,6 +2393,35 @@ mod tests {
         assert_eq!(wait.event_ids.len(), 2);
         assert!(wait.suspended);
         assert!(os.current_process_id().is_none());
+    }
+
+    #[test]
+    fn task_wait_low_level_wait_wakes_on_task_result_even_with_cancel_source() {
+        let mut os = LocalOS::new();
+        let root = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+        let channel = os.channel_create(Some(root), 1, "task-result".to_string());
+        let futex = os.futex_create(0, "task-complete".to_string());
+        let mut sources =
+            wait_sources_for_channel_and_futex(&mut os, channel.raw(), Some(futex)).unwrap();
+        append_current_process_cancel_source(&mut os, &mut sources).unwrap();
+
+        let wait = epoll_wait_many(
+            &mut os,
+            "task_wait:with-cancel-source",
+            &sources,
+            WaitPolicy::Any,
+            None,
+        )
+        .unwrap();
+
+        assert!(wait.suspended);
+        assert!(os.current_process_id().is_none());
+
+        os.channel_send(Some(root), channel, "payload".to_string())
+            .unwrap();
+
+        let root_proc = os.get_process(root).unwrap();
+        assert_eq!(root_proc.state, aios_kernel::kernel::ProcessState::Ready);
     }
 }
 

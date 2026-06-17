@@ -25,6 +25,9 @@ impl AiConfig {
     pub const MODEL_THINKING: &str = "ai.model.thinking";
     pub const MODEL_AUTO_THINKING_ENABLE: &str = "ai.model.auto_thinking.enable";
     pub const MODEL_AUTO_THINKING_THRESHOLD: &str = "ai.model.auto_thinking.threshold";
+    /// Comma-separated model keys/names excluded from automatic model selection.
+    /// Explicit model overrides still resolve normally.
+    pub const MODEL_DISABLED: &str = "ai.model.disabled";
 
     // ── History ────────────────────────────────────────────
     pub const HISTORY_MAX_CHARS: &str = "ai.history.max_chars";

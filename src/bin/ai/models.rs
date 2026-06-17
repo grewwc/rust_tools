@@ -1,10 +1,13 @@
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
 use super::agents::{AgentManifest, AgentModelTier};
 use super::cli::ParsedCli;
 use super::config_schema::AiConfig;
 use super::model_names::{self, ModelDef};
 use super::provider::{
-    self, ApiProvider, COMPATIBLE_DEFAULT_ENDPOINT, ModelQualityTier, OPENAI_DEFAULT_ENDPOINT,
-    OPENCODE_DEFAULT_ENDPOINT, OPENROUTER_ENDPOINT, ReasoningEffort,
+    self, ApiProvider, ModelQualityTier, ReasoningEffort,
 };
 use crate::commonw::configw;
 
@@ -165,6 +168,31 @@ fn default_model() -> String {
         .unwrap_or_default()
 }
 
+fn disabled_model_tokens() -> Vec<String> {
+    let raw = configw::get_all_config()
+        .get_opt(AiConfig::MODEL_DISABLED)
+        .unwrap_or_default();
+    parse_disabled_model_tokens(&raw)
+}
+
+fn parse_disabled_model_tokens(raw: &str) -> Vec<String> {
+    raw.split([',', '\n', ';'])
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .collect()
+}
+
+fn model_matches_disabled_tokens(model: &ModelDef, disabled: &[String]) -> bool {
+    disabled.iter().any(|token| {
+        token.eq_ignore_ascii_case(&model.key) || token.eq_ignore_ascii_case(&model.name)
+    })
+}
+
+fn model_auto_select_enabled(model: &ModelDef, disabled: &[String]) -> bool {
+    !model_matches_disabled_tokens(model, disabled) && !runtime_model_disabled(model)
+}
+
 /// 启动时调用，确保至少存在一个可用 model。
 /// 在 run() 入口集中报错，避免 [`default_model`] 在更深的调用链里 panic / exit。
 pub(super) fn ensure_models_available() -> Result<(), String> {
@@ -197,11 +225,22 @@ enum SubagentTaskDifficulty {
     Heavy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum ModelStrengthTier {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ModelStrengthTier {
     Light,
     Standard,
     Heavy,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AutoModelFallbackSpec {
+    pub(super) require_thinking: bool,
+    pub(super) target_tier: ModelStrengthTier,
+}
+
+pub(super) struct AutoSubagentModelChoice {
+    pub(super) model: String,
+    pub(super) fallback: AutoModelFallbackSpec,
 }
 
 pub(super) fn initial_model(cli: &ParsedCli) -> String {
@@ -264,15 +303,79 @@ pub(super) fn supports_image_input(model: &str) -> bool {
     is_vl_model(model)
 }
 
+const MODEL_RUNTIME_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+static RUNTIME_DISABLED_MODELS: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn normalize_model_token(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+pub(super) fn mark_model_temporarily_unavailable(model: &str, reason: &str) {
+    let trimmed = model.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let until = Instant::now() + MODEL_RUNTIME_COOLDOWN;
+    if let Ok(mut disabled) = RUNTIME_DISABLED_MODELS.lock() {
+        if let Some(def) = model_names::find_by_name(trimmed).or_else(|| model_names::find_by_key(trimmed)) {
+            disabled.insert(normalize_model_token(&def.name), until);
+            disabled.insert(normalize_model_token(&def.key), until);
+        } else {
+            disabled.insert(normalize_model_token(trimmed), until);
+        }
+    }
+    eprintln!(
+        "[model] temporarily disabled '{}' for auto-selection: {}",
+        trimmed, reason
+    );
+}
+
+fn runtime_model_disabled(model: &ModelDef) -> bool {
+    let now = Instant::now();
+    let Ok(mut disabled) = RUNTIME_DISABLED_MODELS.lock() else {
+        return false;
+    };
+    disabled.retain(|_, until| *until > now);
+    disabled.contains_key(&normalize_model_token(&model.name))
+        || disabled.contains_key(&normalize_model_token(&model.key))
+}
+
 pub(super) fn auto_subagent_model_for_agent(
     agent: &AgentManifest,
     description: &str,
     prompt: &str,
 ) -> String {
+    auto_subagent_model_choice_for_agent(agent, description, prompt).model
+}
+
+pub(super) fn auto_subagent_model_choice_for_agent(
+    agent: &AgentManifest,
+    description: &str,
+    prompt: &str,
+) -> AutoSubagentModelChoice {
     let difficulty = classify_subagent_task_difficulty(description, prompt);
     let target_tier = merge_agent_tier_with_difficulty(agent_model_tier(agent), difficulty);
     let require_thinking = !matches!(target_tier, ModelStrengthTier::Light);
-    pick_subagent_model(require_thinking, target_tier)
+    AutoSubagentModelChoice {
+        model: pick_subagent_model(require_thinking, target_tier),
+        fallback: AutoModelFallbackSpec {
+            require_thinking,
+            target_tier,
+        },
+    }
+}
+
+pub(super) fn fallback_subagent_model_after_failure(
+    failed_model: &str,
+    spec: AutoModelFallbackSpec,
+) -> Option<String> {
+    pick_subagent_model_excluding(
+        spec.require_thinking,
+        spec.target_tier,
+        Some(failed_model),
+    )
 }
 
 fn agent_model_tier(agent: &AgentManifest) -> ModelStrengthTier {
@@ -393,9 +496,33 @@ fn classify_subagent_task_difficulty(description: &str, prompt: &str) -> Subagen
 /// 基于 models.json 中的 subagent_priority 字段选择子 agent 模型。
 /// priority 越大越优先；同 priority 时按 quality_tier 和 target_tier 适配度排序。
 fn pick_subagent_model(require_thinking: bool, target_tier: ModelStrengthTier) -> String {
+    pick_subagent_model_excluding(require_thinking, target_tier, None).unwrap_or_else(default_model)
+}
+
+fn pick_subagent_model_excluding(
+    require_thinking: bool,
+    target_tier: ModelStrengthTier,
+    excluded_model: Option<&str>,
+) -> Option<String> {
+    let disabled = disabled_model_tokens();
+    let excluded = excluded_model.and_then(|model| {
+        model_names::find_by_name(model)
+            .or_else(|| model_names::find_by_key(model))
+            .map(|def| {
+                [
+                    normalize_model_token(&def.name),
+                    normalize_model_token(&def.key),
+                ]
+            })
+            .or_else(|| Some([normalize_model_token(model), normalize_model_token(model)]))
+    });
     let mut candidates: Vec<&ModelDef> = model_names::all()
         .into_iter()
-        .filter(|model| subagent_model_eligible(model, require_thinking))
+        .filter(|model| {
+            model_auto_select_enabled(model, &disabled)
+                && subagent_model_eligible(model, require_thinking)
+                && !model_matches_excluded_tokens(model, excluded.as_ref())
+        })
         .collect();
 
     // 按 (满足 target_tier, priority, quality_tier) 降序排列
@@ -411,14 +538,17 @@ fn pick_subagent_model(require_thinking: bool, target_tier: ModelStrengthTier) -
     });
 
     if let Some(model) = candidates.first() {
-        return model.name.clone();
+        return Some(model.name.clone());
     }
 
     // fallback: 放宽 thinking 要求，只要求 tools 可用
     if require_thinking {
         let mut tools_only: Vec<&ModelDef> = model_names::all()
             .into_iter()
-            .filter(|model| model.tools_default_enabled)
+            .filter(|model| {
+                model_auto_select_enabled(model, &disabled) && model.tools_default_enabled
+                    && !model_matches_excluded_tokens(model, excluded.as_ref())
+            })
             .collect();
         tools_only.sort_by(|a, b| {
             b.subagent_priority
@@ -426,11 +556,19 @@ fn pick_subagent_model(require_thinking: bool, target_tier: ModelStrengthTier) -
                 .then(b.quality_tier.cmp(&a.quality_tier))
         });
         if let Some(model) = tools_only.first() {
-            return model.name.clone();
+            return Some(model.name.clone());
         }
     }
 
-    default_model()
+    None
+}
+
+fn model_matches_excluded_tokens(model: &ModelDef, excluded: Option<&[String; 2]>) -> bool {
+    excluded.is_some_and(|tokens| {
+        tokens.iter().any(|token| {
+            token.eq_ignore_ascii_case(&model.key) || token.eq_ignore_ascii_case(&model.name)
+        })
+    })
 }
 
 fn subagent_model_eligible(model: &ModelDef, require_thinking: bool) -> bool {
@@ -438,10 +576,13 @@ fn subagent_model_eligible(model: &ModelDef, require_thinking: bool) -> bool {
 }
 
 fn choose_default_model_name(require_vl: bool) -> Option<String> {
+    let disabled = disabled_model_tokens();
     let candidates = model_names::all()
         .into_iter()
         .enumerate()
-        .filter(|(_, model)| model.is_vl == require_vl)
+        .filter(|(_, model)| {
+            model.is_vl == require_vl && model_auto_select_enabled(model, &disabled)
+        })
         .collect::<Vec<_>>();
     if candidates.is_empty() {
         return None;
@@ -533,17 +674,19 @@ fn levenshtein(left: &[u8], right: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPATIBLE_DEFAULT_ENDPOINT, ModelStrengthTier, OPENCODE_DEFAULT_ENDPOINT,
-        OPENROUTER_ENDPOINT, SubagentTaskDifficulty, agent_model_tier, api_key_for_model,
+        ModelStrengthTier, SubagentTaskDifficulty, agent_model_tier, api_key_for_model,
         auto_subagent_model_for_agent, classify_subagent_task_difficulty, default_model,
         determine_model, determine_vl_model, enable_thinking, endpoint_for_model,
         endpoint_supports_anonymous_auth, initial_model, merge_agent_tier_with_difficulty,
-        model_provider, model_quality_tier,
+        model_matches_disabled_tokens, model_provider, model_quality_tier, parse_disabled_model_tokens,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
     use crate::ai::config_schema::AiConfig;
-    use crate::ai::provider::{ApiProvider, ModelQualityTier};
+    use crate::ai::provider::{
+        ApiProvider, COMPATIBLE_DEFAULT_ENDPOINT, ModelQualityTier, OPENCODE_DEFAULT_ENDPOINT,
+        OPENROUTER_ENDPOINT,
+    };
 
     fn manifest(
         name: &str,
@@ -666,6 +809,22 @@ mod tests {
             ),
             ModelStrengthTier::Standard
         );
+    }
+
+    #[test]
+    fn disabled_model_tokens_accept_names_and_keys() {
+        let disabled = parse_disabled_model_tokens(" deepseek-v4-pro, QWEN3_MAX\nfoo ");
+        assert!(disabled.contains(&"deepseek-v4-pro".to_string()));
+        assert!(disabled.contains(&"qwen3_max".to_string()));
+        assert!(disabled.contains(&"foo".to_string()));
+
+        let model = super::model_names::find_by_name("deepseek-v4-pro")
+            .expect("models.json should contain deepseek-v4-pro");
+        assert!(model_matches_disabled_tokens(model, &disabled));
+
+        let by_key = super::model_names::find_by_key("QWEN3_MAX")
+            .expect("models.json should contain QWEN3_MAX");
+        assert!(model_matches_disabled_tokens(by_key, &disabled));
     }
 
     /// 选取一个真实存在的、provider=OpenAi 的模型名做用例输入；

@@ -276,6 +276,7 @@ fn required_baseline_tool_names() -> Vec<String> {
         "task_spawn".to_string(),
         "task_wait".to_string(),
         "task_status".to_string(),
+        "agent_team".to_string(),
     ]
 }
 
@@ -702,6 +703,10 @@ fn build_system_prompt(
 
     if has_tool(available_tools, "task_spawn") || has_tool(available_tools, "task_wait") {
         b.push(ContextKind::Behavior, "Async Subagent Orchestration (task_*):\n- `task_spawn`: launch a subagent task; fan out parallel independent subtasks.\n- `task_wait`: collect results. Timeout is per-call — re-call or use `wait_policy=\"any\"` for early wake-up.\n- `task_status`: non-blocking peek. No `task_cancel` — just let orphaned tasks finish.\n- `task_*` and `tool_*` are distinct families: don't confuse their IDs.");
+    }
+
+    if has_tool(available_tools, "agent_team") {
+        b.push(ContextKind::Behavior, "Agent Team Deliberation:\n- Use `agent_team(operation=\"start\")` for complex decisions that benefit from several roles or independent perspectives.\n- Collect the returned task_ids with `task_wait(wait_policy=\"all\")`, then pass the complete transcript into `agent_team(operation=\"challenge\")` so agents can challenge assumptions.\n- For final consensus, pass initial outputs plus challenges into `agent_team(operation=\"synthesize\")`.\n- Team communication is parent-mediated; do not expect peer agents to receive direct mailbox messages.");
     }
 
     if has_tool(available_tools, "knowledge_search")
@@ -1489,6 +1494,7 @@ mod tests {
         assert!(names.contains(&"task_spawn".to_string()));
         assert!(names.contains(&"task_wait".to_string()));
         assert!(names.contains(&"task_status".to_string()));
+        assert!(names.contains(&"agent_team".to_string()));
         // 其它非 baseline 的内置工具仍不应被无端带入白名单。
         assert!(!names.contains(&"plan".to_string()));
         assert!(!names.contains(&"read_file".to_string()));

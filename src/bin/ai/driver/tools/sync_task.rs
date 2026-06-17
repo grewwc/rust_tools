@@ -112,6 +112,7 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
     let task_agent_manifests_for_spawn = task_agent_manifests.clone();
     let prompt = prepared.prompt.clone();
     let model = prepared.model.clone();
+    let auto_model_fallback = prepared.auto_model_fallback;
 
     let spawn_driver_ctx = DriverContext::new(
         subagent_app.clone(),
@@ -142,7 +143,7 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
     let inner_fut = async move {
         let mut subagent_app = subagent_app;
         crate::ai::tools::registry::common::clear_tool_cancel();
-        let result = turn_runtime::run_turn(
+        let run = turn_runtime::run_turn(
             &mut subagent_app,
             &task_mcp_for_spawn,
             task_skill_manifests_for_spawn.as_slice(),
@@ -153,8 +154,12 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
             None,
             false,
             false,
-        )
-        .await
+        );
+        let result = if let Some(spec) = auto_model_fallback {
+            runtime_ctx::AUTO_MODEL_FALLBACK.scope(spec, run).await
+        } else {
+            run.await
+        }
         .map(|_outcome| ())
         .map_err(|e| format!("{}", e));
         let _ = tx.send(result);

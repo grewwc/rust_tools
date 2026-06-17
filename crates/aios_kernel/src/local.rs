@@ -1720,7 +1720,7 @@ impl KernelInternal for LocalOS {
             if let Some(proc) = self.processes.get_mut(pid) {
                 proc.state = ProcessState::Ready;
                 proc.mailbox.push_back(format!(
-                    "[EVENT_WAKE]\nReason: event wait condition satisfied.\nCompleted event ids: {}\nRecommended next actions:\n1. Inspect the event-producing subsystem for fresh state.\n2. If these events came from async tool work, use tool_status or tool_wait to collect results.\n3. Cancel low-value still-running branches when appropriate.\n4. If enough results are already available, continue reasoning immediately.",
+                    "[EVENT_WAKE]\nReason: event wait condition satisfied.\nCompleted event ids: {}\nRecommended next actions:\n1. If you were parked by task_wait, re-call task_wait with the same task_ids and wait_policy to collect subagent results.\n2. If these events came from async tool work, use tool_status or tool_wait to collect results.\n3. Inspect the event-producing subsystem for fresh state when unsure.\n4. Cancel low-value still-running tool branches when appropriate.\n5. If enough results are already available, continue reasoning immediately.",
                     completed_event_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ")
                 ));
                 self.enqueue_ready(*pid);

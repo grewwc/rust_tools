@@ -110,7 +110,7 @@
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,
-    "subagent_priority": 10
+    "subagent_priority": 80
   },
   {
     "key": "GLM 5.1",

@@ -614,6 +614,24 @@ pub(super) fn is_transient_error(err: &RequestError) -> bool {
     }
 }
 
+pub(super) fn should_temporarily_disable_model(err: &RequestError) -> bool {
+    match err.kind {
+        RequestErrorKind::Network => false,
+        RequestErrorKind::Status(status) => {
+            matches!(status.as_u16(), 402 | 404 | 429) || status.is_server_error()
+        }
+    }
+}
+
+pub(super) fn should_try_model_fallback(err: &RequestError) -> bool {
+    match err.kind {
+        RequestErrorKind::Network => true,
+        RequestErrorKind::Status(status) => {
+            matches!(status.as_u16(), 401 | 402 | 403 | 404 | 429) || status.is_server_error()
+        }
+    }
+}
+
 /// Resolve whether to enable thinking mode for this request.
 ///
 /// Decision order:
@@ -2568,6 +2586,25 @@ mod tests {
     use crate::ai::{cli::ParsedCli, types::AppConfig};
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
+
+    #[test]
+    fn model_fallback_and_disable_statuses_are_separate() {
+        let network = RequestError::cancelled("network timeout");
+        assert!(should_try_model_fallback(&network));
+        assert!(!should_temporarily_disable_model(&network));
+
+        let bad_request = RequestError::status(StatusCode::BAD_REQUEST, String::new());
+        assert!(!should_try_model_fallback(&bad_request));
+        assert!(!should_temporarily_disable_model(&bad_request));
+
+        let unauthorized = RequestError::status(StatusCode::UNAUTHORIZED, String::new());
+        assert!(should_try_model_fallback(&unauthorized));
+        assert!(!should_temporarily_disable_model(&unauthorized));
+
+        let billing = RequestError::status(StatusCode::PAYMENT_REQUIRED, String::new());
+        assert!(should_try_model_fallback(&billing));
+        assert!(should_temporarily_disable_model(&billing));
+    }
 
     #[test]
     fn stream_usage_accepts_anthropic_style_field_aliases() {

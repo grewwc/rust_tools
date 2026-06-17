@@ -1,44 +1,31 @@
-use crate::ai::{
-    mcp::{McpClient, SharedMcpClient},
-    models,
-    types::App,
-};
+use crate::ai::mcp::{McpClient, SharedMcpClient};
+use crate::ai::types::App;
 use serde_json::json;
 use std::path::Path;
 
 pub fn resolve_model_for_input(
     app: &App,
-    has_usable_ocr_for_images: bool,
+    _has_usable_ocr_for_images: bool,
     _question: &mut String,
 ) -> String {
     // Resolution order:
-    // 1) If there are image attachments, force a VL-capable model (unless already VL).
-    // 2) A trailing " -d" forces the default DeepSeek model (and strips the suffix).
-    // 3) A trailing " -<digit>" selects one of the built-in models (and strips the suffix).
-    // 4) Otherwise, keep the current model.
-    if let Some(model) = attachment_forced_model(
-        &app.current_model,
-        !app.attached_image_files.is_empty(),
-        &app.config.vl_default_model,
-        has_usable_ocr_for_images,
-    ) {
-        return model;
-    }
+    // 1) A trailing " -d" forces the default DeepSeek model (and strips the suffix).
+    // 2) A trailing " -<digit>" selects one of the built-in models (and strips the suffix).
+    // 3) Otherwise, keep the current model.
+    // Image attachments no longer force a VL model switch — OCR text extraction
+    // (run in driver/mod.rs before this function) provides text for the current model.
     app.current_model.clone()
 }
 
 pub fn attachment_forced_model(
-    current_model: &str,
-    has_image_files: bool,
-    vl_default_model: &str,
-    has_usable_ocr_for_images: bool,
+    _current_model: &str,
+    _has_image_files: bool,
+    _vl_default_model: &str,
+    _has_usable_ocr_for_images: bool,
 ) -> Option<String> {
-    // Many models are text-only. When there are images, we route to a VL model to avoid
-    // provider-side errors. If OCR already extracted usable text, prefer staying on the
-    // current text model instead of needlessly forcing a VL model.
-    if has_image_files && !models::is_vl_model(current_model) && !has_usable_ocr_for_images {
-        return Some(models::determine_vl_model(vl_default_model));
-    }
+    // Text-only models with image attachments stay on the current model.
+    // OCR text extraction (run in driver/mod.rs before this function) handles
+    // extracting readable text for the LLM.
     None
 }
 

@@ -249,7 +249,7 @@ async fn request_model_response(
     messages: &mut Vec<Message>,
     force_final_response: bool,
     _iteration: usize,
-) -> Result<reqwest::Response, request::RequestError> {
+) -> Result<(reqwest::Response, String), request::RequestError> {
     if force_final_response {
         messages.push(Message {
             role: "system".to_string(),
@@ -272,7 +272,34 @@ async fn request_model_response(
         None
     };
 
-    let request_result = do_request_messages(app, next_model, messages, true).await;
+    let mut actual_model = next_model.to_string();
+    let mut request_result = do_request_messages(app, next_model, messages, true).await;
+    if let Err(err) = &request_result
+        && let Some(fallback_spec) = crate::ai::driver::runtime_ctx::auto_model_fallback_spec()
+        && request::should_try_model_fallback(err)
+    {
+        if request::should_temporarily_disable_model(err) {
+            crate::ai::models::mark_model_temporarily_unavailable(next_model, &err.to_string());
+        }
+        if let Some(fallback_model) =
+            crate::ai::models::fallback_subagent_model_after_failure(next_model, fallback_spec)
+        {
+            eprintln!(
+                "[model] auto-selected model '{}' failed; retrying subagent with '{}'",
+                next_model, fallback_model
+            );
+            actual_model = fallback_model.clone();
+            request_result = do_request_messages(app, &fallback_model, messages, true).await;
+            if let Err(fallback_err) = &request_result
+                && request::should_temporarily_disable_model(fallback_err)
+            {
+                crate::ai::models::mark_model_temporarily_unavailable(
+                    &fallback_model,
+                    &fallback_err.to_string(),
+                );
+            }
+        }
+    }
 
     if let Some(saved_tools) = saved_tools
         && let Some(ctx) = app.agent_context.as_mut()
@@ -280,7 +307,7 @@ async fn request_model_response(
         ctx.tools = saved_tools;
     }
 
-    request_result
+    request_result.map(|response| (response, actual_model))
 }
 
 #[crate::ai::agent_hang_span(
@@ -422,7 +449,7 @@ pub(super) async fn execute_turn_iteration(
         }
     };
 
-    let mut response = match request_result {
+    let (mut response, actual_model) = match request_result {
         Ok(response) => response,
         Err(err) => {
             return Ok(IterationExecution::RequestFailed(handle_request_error(
@@ -448,7 +475,7 @@ pub(super) async fn execute_turn_iteration(
         ));
     }
 
-    request::print_info(app, next_model);
+    request::print_info(app, &actual_model);
     let stream_result = stream_model_response(
         app,
         &mut response,
