@@ -28,8 +28,11 @@ pub(super) enum TableAlign {
 }
 
 pub(super) fn table_preview_height(line: &str) -> usize {
+    // 数的是"原样写入终端的预览行"占多少物理行，终端按 **真实** 列宽（raw_cols）
+    // 自动折行，因此不能用保留右边距的 terminal_width，否则会高估行数、导致 cursor-up
+    // 越界清屏。
     let visible = strip_ansi_codes(line);
-    let cols = terminal_width().max(1);
+    let cols = raw_cols().max(1);
     let mut lines = 1usize;
     let mut current_col = 0usize;
 

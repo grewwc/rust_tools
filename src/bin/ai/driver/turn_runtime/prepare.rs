@@ -129,6 +129,7 @@ pub(super) async fn prepare_turn(
         let store = SessionStore::new(app.config.history_file.as_path());
         Some(store.session_assets_dir(&app.session_id))
     };
+    crate::ai::driver::runtime_ctx::publish_subagent_phase("preparing context");
     let history = build_context_history(
         history_count,
         &app.session_history_file,
@@ -142,6 +143,7 @@ pub(super) async fn prepare_turn(
         skill_runtime::prepare_skill_for_turn(app, &mc, skill_manifests, question)
     };
 
+    crate::ai::driver::runtime_ctx::publish_subagent_phase("recognizing intent");
     // LLM 意图识别 fallback：当本地 TF-IDF 把 question 划到 Casual 但内容明显
     // 不是闲聊（带代码 / 报错关键词 / 动作动词 / 长度足够）时，调用大模型
     // 二次判定。LLM 调用本身在 stderr 打印 [intent:llm] 标识，方便用户区分

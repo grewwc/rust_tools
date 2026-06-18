@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use aios_kernel::primitives::{DaemonCancelToken, FutexAddr};
@@ -11,6 +11,82 @@ static REQUEST_INTERRUPT_FUTEX: LazyLock<Mutex<Option<(usize, FutexAddr)>>> =
     LazyLock::new(|| Mutex::new(None));
 static REQUEST_INTERRUPT_FLAG: AtomicBool = AtomicBool::new(false);
 static REQUEST_INTERRUPT_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
+
+/// 当前正在前台同步执行（阻塞父 turn）的子 agent 注册表。
+///
+/// 同步 `task` 工具在 `execute_sync_task` 里阻塞父 turn 等待子 agent 完成，
+/// 期间父 agent 自身既不流式也不在迭代循环里——它“卡”在工具调用里。此时按
+/// Ctrl+C，若只看全局 shutdown/streaming 标志会直接把整个主 agent 关掉
+/// （子 agent 还卡在静默的 prepare 阶段、streaming=false，于是走 Shutdown 分支）。
+///
+/// 注册表让 SIGINT 先定向取消“最近一个前台子 agent”：第一次 Ctrl+C 只翻该子
+/// agent 自己的 cancel 标志（绝不碰全局 shutdown），父 turn 拿到子 agent 的取消
+/// 错误后继续存活；若子 agent 卡死、再次按 Ctrl+C 才落回正常的 shutdown/exit。
+///
+/// 用栈支持嵌套子 agent：定向取消总是作用于栈顶（最深、最新派发）的那个。
+struct ForegroundSubagent {
+    id: u64,
+    cancel: Arc<AtomicBool>,
+    cancel_requested: bool,
+}
+
+static FOREGROUND_SUBAGENTS: LazyLock<Mutex<Vec<ForegroundSubagent>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static FOREGROUND_SUBAGENT_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// RAII 守卫：`execute_sync_task` 派发前台子 agent 时注册其 cancel 标志，
+/// drop（含 panic / 提前 return）时自动注销，保证注册表不泄漏陈旧条目。
+pub(in crate::ai) struct ForegroundSubagentGuard {
+    id: u64,
+}
+
+impl ForegroundSubagentGuard {
+    pub(in crate::ai) fn register(cancel: Arc<AtomicBool>) -> Self {
+        let id = FOREGROUND_SUBAGENT_SEQ.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut stack) = FOREGROUND_SUBAGENTS.lock() {
+            stack.push(ForegroundSubagent {
+                id,
+                cancel,
+                cancel_requested: false,
+            });
+        }
+        Self { id }
+    }
+}
+
+impl Drop for ForegroundSubagentGuard {
+    fn drop(&mut self) {
+        if let Ok(mut stack) = FOREGROUND_SUBAGENTS.lock() {
+            stack.retain(|entry| entry.id != self.id);
+        }
+    }
+}
+
+/// 尝试把一次 SIGINT 定向到栈顶前台子 agent。
+///
+/// 返回 `true` 表示“已消费”：翻了子 agent 的 cancel 标志、发了中断通知，调用方
+/// 不应再走全局 shutdown/exit。返回 `false` 表示没有可定向的子 agent（栈空），
+/// 或栈顶子 agent 此前已被请求取消却仍未退出（判定为卡死，应升级到全局 shutdown）。
+fn try_cancel_foreground_subagent() -> bool {
+    let cancel_flag = {
+        let Ok(mut stack) = FOREGROUND_SUBAGENTS.lock() else {
+            return false;
+        };
+        let Some(top) = stack.last_mut() else {
+            return false;
+        };
+        if top.cancel_requested {
+            // 已请求过取消但子 agent 还在栈里 → 视为卡死，升级到全局 shutdown。
+            return false;
+        }
+        top.cancel_requested = true;
+        top.cancel.clone()
+    };
+    cancel_flag.store(true, Ordering::Relaxed);
+    crate::ai::tools::registry::common::request_tool_cancel();
+    signal_request_interrupt();
+    true
+}
 
 pub(in crate::ai) fn request_interrupt_notify() -> &'static Notify {
     &REQUEST_INTERRUPT_NOTIFY
@@ -28,6 +104,12 @@ pub(in crate::ai) fn handle_sigint(
     streaming: &AtomicBool,
     cancel_stream: &AtomicBool,
 ) {
+    // 若已请求过 shutdown，用户的二次 Ctrl+C 是明确的退出诉求：必须优先、无条件
+    // 退出，绝不能被“定向取消子 agent”拦截（否则关不掉）。其余情况下先尝试把这次
+    // 中断定向给前台子 agent（见 try_cancel_foreground_subagent 的语义）。
+    if !shutdown.load(Ordering::Relaxed) && try_cancel_foreground_subagent() {
+        return;
+    }
     match sigint_action(shutdown, streaming, cancel_stream) {
         SigintAction::CancelStream => {
             crate::ai::tools::registry::common::request_tool_cancel();
@@ -225,7 +307,10 @@ pub(in crate::ai) fn sigint_action(
 
 #[cfg(test)]
 mod tests {
-    use super::{SigintAction, sigint_action};
+    use super::{
+        ForegroundSubagentGuard, SigintAction, sigint_action, try_cancel_foreground_subagent,
+    };
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -276,5 +361,45 @@ mod tests {
             sigint_action(&shutdown, &streaming, &cancel_stream),
             SigintAction::Exit
         );
+    }
+
+    #[test]
+    fn first_sigint_cancels_foreground_subagent_without_shutdown() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        super::clear_request_interrupt();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let _registration = ForegroundSubagentGuard::register(cancel.clone());
+
+        // 第一次 SIGINT：定向取消子 agent，翻它自己的 cancel 标志、不碰全局 shutdown。
+        assert!(try_cancel_foreground_subagent());
+        assert!(cancel.load(Ordering::Relaxed));
+
+        // 第二次 SIGINT：子 agent 仍在栈里（卡死）→ 不再消费，升级到全局 shutdown。
+        assert!(!try_cancel_foreground_subagent());
+
+        super::clear_request_interrupt();
+    }
+
+    #[test]
+    fn sigint_with_no_foreground_subagent_falls_through() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        // 栈空时不应消费这次中断，调用方据此走正常 shutdown/exit。
+        assert!(!try_cancel_foreground_subagent());
+    }
+
+    #[test]
+    fn foreground_guard_unregisters_on_drop() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        super::clear_request_interrupt();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        {
+            let _registration = ForegroundSubagentGuard::register(cancel.clone());
+        }
+        // guard 已 drop：栈里不再有该条目，定向取消无对象可消费。
+        assert!(!try_cancel_foreground_subagent());
+
+        super::clear_request_interrupt();
     }
 }

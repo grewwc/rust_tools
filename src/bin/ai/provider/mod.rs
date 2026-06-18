@@ -2,8 +2,8 @@ mod adapter;
 
 pub(in crate::ai) use adapter::{
     COMPATIBLE_DEFAULT_ENDPOINT, OPENAI_DEFAULT_ENDPOINT, OPENCODE_DEFAULT_ENDPOINT,
-    OPENROUTER_ENDPOINT, ProviderAdapter, adapter_for, compatible_adapter, opencode_adapter,
-    openai_adapter, openrouter_adapter,
+    OPENROUTER_ENDPOINT, ProviderAdapter, ThinkingDialect, adapter_for, compatible_adapter,
+    opencode_adapter, openai_adapter, openrouter_adapter, thinking_dialect_for,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]

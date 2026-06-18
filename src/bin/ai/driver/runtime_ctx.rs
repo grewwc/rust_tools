@@ -48,6 +48,15 @@ use tokio::sync::Mutex;
 /// instead of just an "OK / FAILED" status line.
 pub(crate) type SubagentResultSlot = Arc<Mutex<Option<String>>>;
 
+/// Slot used by a sub-agent to publish its **current phase** (e.g.
+/// "preparing context" / "calling model") so the spawning `task` tool can
+/// show it on the waiting heartbeat line. Unlike `SubagentResultSlot` this
+/// is a plain `std::sync::Mutex` because it is written from the sub-agent
+/// task and read from the parent's blocking wait loop with no `.await`
+/// across the lock. The parent installs a fresh slot via
+/// `SUBAGENT_PHASE.scope(...)` before invoking `run_turn`.
+pub(crate) type SubagentPhaseSlot = Arc<std::sync::Mutex<String>>;
+
 /// Snapshot of the live runtime that a sub-agent dispatch needs.
 ///
 /// All fields are independently cloneable so that downstream consumers can
@@ -95,6 +104,10 @@ tokio::task_local! {
     /// assistant text into this slot so the spawning tool can return it
     /// to the parent agent. Absence means "no parent is interested".
     pub(crate) static SUBAGENT_RESULT_SLOT: SubagentResultSlot;
+    /// When set, `runtime_ctx::publish_subagent_phase` writes the sub-agent's
+    /// current execution phase here so the spawning `task` tool's heartbeat
+    /// line can surface it. Absence means "no parent is showing a heartbeat".
+    pub(crate) static SUBAGENT_PHASE: SubagentPhaseSlot;
     /// 当前 turn 的 (session_id, turn_id) 元组。由 driver run_loop 在每
     /// 轮调度前 enter，被 DecisionLog / 反馈写入路径读取，把工具调用结
     /// 果对回到正确的 (session, turn)。未设置时下游获取到 ("", 0)。
@@ -127,6 +140,20 @@ pub(crate) async fn publish_subagent_result(text: &str) {
     };
     let mut guard = slot.lock().await;
     *guard = Some(text.to_string());
+}
+
+/// Publish the sub-agent's current execution phase into the active phase
+/// slot if one was installed by the spawning tool. Silent no-op when no
+/// slot is set (top-level foreground turn, unit tests, …).
+pub(crate) fn publish_subagent_phase(phase: &str) {
+    let Ok(slot) = SUBAGENT_PHASE.try_with(|slot| slot.clone()) else {
+        return;
+    };
+    if let Ok(mut guard) = slot.lock() {
+        if *guard != phase {
+            *guard = phase.to_string();
+        }
+    }
 }
 
 /// Try to read the current `DRIVER_CTX`. Returns `None` when called from a

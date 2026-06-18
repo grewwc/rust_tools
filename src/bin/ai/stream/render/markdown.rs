@@ -730,17 +730,25 @@ impl MarkdownStreamRenderer {
 }
 
 fn live_preview_cursor_rows(line: &str) -> usize {
-    let cols = preview_terminal_width().max(1);
+    // 预览行是逐字符原样写入终端、由终端按 **真实** 列宽自动折行的，所以这里必须用
+    // raw_terminal_cols（而非保留右边距的 preview_terminal_width）来数物理行数。
+    // 否则窄于真实宽度的列数会把"恰好一行"的预览算成两行，cursor-up 多移一行，
+    // 越界清掉表格上方内容、或在重写后残留预览碎片。
+    // 折行规则与终端 DECAWM 一致：全角字符放不下右边一列时提前折行（col+w>cols）。
+    let cols = raw_terminal_cols().max(1);
     let visible = strip_ansi_codes(line);
-    let width: usize = visible
-        .chars()
-        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
-        .sum();
-    if width == 0 {
-        1
-    } else {
-        1 + ((width - 1) / cols)
+    let mut lines = 1usize;
+    let mut col = 0usize;
+    for ch in visible.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col > 0 && col + w > cols {
+            lines += 1;
+            col = w;
+        } else {
+            col += w;
+        }
     }
+    lines
 }
 
 /// 终端可用列数（已扣除右侧安全边距）。
@@ -1248,6 +1256,173 @@ mod tests {
             "final rewrite must move the cursor up by exactly the streamed preview height \
              ({streamed_height}); got {final_out:?}"
         );
+    }
+
+    /// 极简 VT100 网格模拟器：复现"流式预览 → cursor-up 重写"实际落到终端后的可见结果。
+    /// 仅实现本渲染器会发出的控制序列：可打印字符（含 CJK 宽度）、`\n`(CRLF)、`\r`、
+    /// CSI nA（光标上移）、CSI 0J（清到屏幕末尾）、SGR（忽略）。DECAWM 自动换行按真实
+    /// 终端语义建模：全角字符放不下右边一列时提前折到下一行（留空位）。
+    struct VtGrid {
+        width: usize,
+        rows: Vec<Vec<char>>,
+        row: usize,
+        col: usize,
+    }
+
+    impl VtGrid {
+        fn new(width: usize) -> Self {
+            Self {
+                width,
+                rows: vec![vec![' '; width]],
+                row: 0,
+                col: 0,
+            }
+        }
+
+        fn ensure_row(&mut self, r: usize) {
+            while self.rows.len() <= r {
+                self.rows.push(vec![' '; self.width]);
+            }
+        }
+
+        fn newline(&mut self) {
+            self.row += 1;
+            self.col = 0;
+            self.ensure_row(self.row);
+        }
+
+        fn put(&mut self, ch: char) {
+            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if w == 0 {
+                return;
+            }
+            if self.col + w > self.width {
+                self.newline();
+            }
+            self.ensure_row(self.row);
+            self.rows[self.row][self.col] = ch;
+            for k in 1..w {
+                if self.col + k < self.width {
+                    self.rows[self.row][self.col + k] = '\0';
+                }
+            }
+            self.col += w;
+        }
+
+        fn feed(&mut self, s: &str) {
+            let mut chars = s.chars().peekable();
+            while let Some(ch) = chars.next() {
+                match ch {
+                    '\n' => self.newline(),
+                    '\r' => self.col = 0,
+                    '\x1b' => {
+                        if chars.peek() == Some(&'[') {
+                            chars.next();
+                            let mut num = String::new();
+                            let mut final_byte = '\0';
+                            for c in chars.by_ref() {
+                                if c.is_ascii_digit() {
+                                    num.push(c);
+                                } else {
+                                    final_byte = c;
+                                    break;
+                                }
+                            }
+                            let n: usize = num.parse().unwrap_or(0);
+                            match final_byte {
+                                'A' => self.row = self.row.saturating_sub(n.max(1)),
+                                'J' => {
+                                    // 0J: 清到屏幕末尾
+                                    for c in self.col..self.width {
+                                        self.rows[self.row][c] = ' ';
+                                    }
+                                    let start = self.row + 1;
+                                    self.rows.truncate(start.max(1));
+                                    self.ensure_row(self.row);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => self.put(ch),
+                }
+            }
+        }
+
+        fn screen(&self) -> Vec<String> {
+            self.rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .filter(|c| **c != '\0')
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        }
+    }
+
+    fn render_full_stream(markdown: &str, dimmed: bool) -> String {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let mut bytes = String::new();
+        for ch in markdown.chars() {
+            let mut buf = [0u8; 4];
+            bytes.push_str(
+                &renderer
+                    .write_chunk_for_test(ch.encode_utf8(&mut buf), dimmed)
+                    .unwrap(),
+            );
+        }
+        bytes.push_str(&renderer.flush_pending_for_test().unwrap());
+        bytes
+    }
+
+    #[test]
+    fn streamed_cjk_table_has_no_residual_fragments_on_screen() {
+        let _guard = env_guard();
+
+        let md = "\
+下面是一个对照表，用来说明不同协议的默认 Endpoint 与典型后端服务的对应关系：
+| 协议 | 默认 Endpoint | 典型后端 |
+| --- | --- | --- |
+| Compatible | dashscope.aliyuncs.com/compatible-mode | 阿里云百炼（DashScope）的 OpenAI 兼容模式 |
+| OpenAi | api.openai.com/v1/chat/completions | OpenAI 官方 API |
+";
+        let para = "下面是一个对照表，用来说明不同协议的默认 Endpoint 与典型后端服务的对应关系：";
+
+        for cols in [80usize, 72, 64, 60, 56, 52, 48] {
+            unsafe { std::env::set_var("COLUMNS", cols.to_string()) };
+
+            let stream = render_full_stream(md, false);
+            let mut grid = VtGrid::new(cols);
+            grid.feed(&stream);
+            let screen = grid.screen();
+            let joined: String = screen.join("");
+
+            // 表格上方的引导段落必须完整保留（不能被 cursor-up 越界清掉）。
+            // 终端可能按列宽自动折行，所以拼接所有行后再比对去掉换行的原文。
+            let para_joined: String = para.chars().filter(|c| !c.is_whitespace()).collect();
+            let screen_joined: String = joined.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                screen_joined.contains(&para_joined),
+                "COLUMNS={cols}: leading paragraph was clobbered:\n{}",
+                screen.join("\n")
+            );
+
+            // 表格区域不得残留原始 markdown 预览碎片（裸 `|`，区别于盒框 `│`）。
+            // 残留说明 cursor-up 行数与实际渲染行数不一致，预览没被完全覆盖。
+            for line in &screen {
+                if line.is_empty() || para.contains(line.trim()) {
+                    continue;
+                }
+                assert!(
+                    !line.contains('|'),
+                    "COLUMNS={cols}: residual raw markdown pipe: {line:?}\nfull screen:\n{}",
+                    screen.join("\n")
+                );
+            }
+        }
     }
 
     #[test]

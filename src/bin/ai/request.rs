@@ -7,7 +7,7 @@ use reqwest::{Response, StatusCode};
 use rust_tools::commonw;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::{
     files,
@@ -29,8 +29,11 @@ struct RequestBody<'a> {
     model: &'a str,
     messages: &'a [Message],
     stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    enable_thinking: Option<bool>,
+    /// 思考开关的线缆字段，由 `thinking` 方言模块决定具体 key 与形状
+    /// （`enable_thinking: bool` / `thinking: {"type":...}` / 或空）。
+    /// 核心层只持有 provider 无关的 Map，wire 编码完全归属方言。
+    #[serde(flatten)]
+    thinking: Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enable_search: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -663,7 +666,13 @@ async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool 
         return false;
     }
 
-    let question = latest_user_message_text(messages).unwrap_or_default();
+    let raw_question = latest_user_message_text(messages).unwrap_or_default();
+    // 注入的 `<system-reminder>...</system-reminder>` 上下文会被拼到当前
+    // user message 最前面（见 prepare.rs / skill_runtime.rs）。它会把一句
+    // "hi" 撑成上千字符的长文本，导致本地 thinking 短路（按问题长度判定）
+    // 失效，进而落到耗时数秒的模型 gate。这里在判定前剥离这些 reminder 块，
+    // 只用用户真正输入的内容做意图与 thinking 判定。
+    let question = strip_system_reminders(&raw_question);
     let question = question.trim();
     if !question.is_empty() {
         let local_intent = intent_recognition::detect_intent_with_model_path(
@@ -698,6 +707,32 @@ fn latest_user_message_text(messages: &[Message]) -> Option<String> {
         .rev()
         .find(|message| message.role == "user")
         .and_then(extract_message_text)
+}
+
+/// 剥离注入到 user message 中的 `<system-reminder>...</system-reminder>` 块。
+///
+/// prepare.rs / skill_runtime.rs 会把上下文提醒拼到当前 user message 最前面
+/// （为保 prompt cache）。这些块体量很大，会污染意图/thinking 判定的输入，
+/// 让一句 "hi" 看起来像是长文本。判定前去掉它们，只留用户真正输入的内容。
+fn strip_system_reminders(text: &str) -> String {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + OPEN.len()..];
+        match after_open.find(CLOSE) {
+            Some(end) => rest = &after_open[end + CLOSE.len()..],
+            // 没有闭合标签：丢弃剩余内容（视为未闭合的 reminder）。
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn local_thinking_decision(
@@ -1874,9 +1909,9 @@ fn build_request_body<'a>(
     reasoning_effort: Option<&'a str>,
 ) -> RequestBody<'a> {
     let provider = models::model_provider(model);
-    // OpenRouter 与 OpenAI 的请求体字段完全一致，endpoint 维度只影响流式解析，
-    // 这里用 provider 选 adapter 即可（传空 endpoint 不会误判 OpenRouter）。
-    let adapter = super::provider::adapter_for(provider, "");
+    let endpoint = models::endpoint_for_model(model, "");
+    let adapter = super::provider::adapter_for(provider, &endpoint);
+    let thinking_dialect = super::provider::thinking_dialect_for(provider, model, &endpoint);
     // 流式请求显式索取 usage：部分 provider（DashScope compatible-mode）流式下
     // 默认不返回 usage，必须声明 stream_options.include_usage 才能统计 token。
     let stream_options = stream.then(|| json!({ "include_usage": true }));
@@ -1884,7 +1919,7 @@ fn build_request_body<'a>(
         model,
         messages,
         stream,
-        enable_thinking: adapter.enable_thinking_field(enable_thinking),
+        thinking: thinking_dialect.fields(enable_thinking),
         enable_search: adapter.enable_search_field(enable_search),
         tools,
         tool_choice,
@@ -1894,10 +1929,24 @@ fn build_request_body<'a>(
     }
 }
 
-/// 辅助（非主链路）请求是否需要显式关闭 `enable_thinking`。
-/// 由 provider adapter 决定：Compatible 返回 `Some(false)`，其余返回 `None`。
-pub(in crate::ai) fn aux_disable_thinking_for_model(model: &str) -> Option<bool> {
-    super::provider::adapter_for(models::model_provider(model), "").aux_disable_thinking()
+/// 把 provider adapter 给出的思考字段合并进辅助/后台请求体。
+///
+/// 辅助（非主链路）与后台请求固定关闭思考（`enable_thinking=false`），
+/// 由各 adapter 决定具体写哪些 key（`enable_thinking:false` /
+/// `thinking:{"type":"disabled"}` / 或空），核心层不再判别 provider。
+pub(in crate::ai) fn apply_aux_thinking_fields(model: &str, body: &mut Value) {
+    let provider = models::model_provider(model);
+    let endpoint = models::endpoint_for_model(model, "");
+    let dialect = super::provider::thinking_dialect_for(provider, model, &endpoint);
+    let fields = dialect.fields(false);
+    if fields.is_empty() {
+        return;
+    }
+    if let Some(map) = body.as_object_mut() {
+        for (key, value) in fields {
+            map.insert(key, value);
+        }
+    }
 }
 
 /// 是否开启 opt-in 的显式 prompt cache 断点注入。
@@ -1973,9 +2022,7 @@ pub async fn do_request_json(
     // 非流式辅助请求（意图识别、知识整理等）必须等整段生成完才返回响应头，
     // thinking 链一长就撑爆 60s 超时、重试也只是重复同样的慢生成。
     // 因此这里显式关闭 thinking，与后台 background_call 保持一致。
-    if let Some(disabled) = aux_disable_thinking_for_model(model) {
-        request_body["enable_thinking"] = json!(disabled);
-    }
+    apply_aux_thinking_fields(model, &mut request_body);
 
     // reasoning_effort：仅在未跳过且 provider 为 OpenAI 兼容时注入。
     if !skip_reasoning_effort {
@@ -2088,9 +2135,7 @@ pub async fn do_request_text_streaming(
     // 兼容（Qwen 等）provider 默认开启 thinking：流式下推理链以 reasoning_content
     // 分片到达，而本函数只聚合 delta.content。思考阶段会让 content 长时间为空、
     // spinner 一直转，表现为"卡死"。consolidate 是结构化 JSON 任务，关闭 thinking。
-    if let Some(disabled) = aux_disable_thinking_for_model(model) {
-        request_body["enable_thinking"] = json!(disabled);
-    }
+    apply_aux_thinking_fields(model, &mut request_body);
 
     for attempt in 1..=REQUEST_MAX_ATTEMPTS {
         let endpoint = endpoint_for_request_model(app, model);
@@ -2808,6 +2853,40 @@ mod tests {
     }
 
     #[test]
+    fn strip_system_reminders_removes_injected_block() {
+        let raw = "<system-reminder>\nlots of injected context\nmore lines\n</system-reminder>\n\nhi";
+        assert_eq!(strip_system_reminders(raw), "\n\nhi");
+    }
+
+    #[test]
+    fn strip_system_reminders_handles_multiple_and_unclosed() {
+        let raw = "<system-reminder>a</system-reminder>real<system-reminder>b</system-reminder> text";
+        assert_eq!(strip_system_reminders(raw), "real text");
+
+        let unclosed = "<system-reminder>never closed and then the question hi";
+        assert_eq!(strip_system_reminders(unclosed), "");
+    }
+
+    #[test]
+    fn strip_system_reminders_passthrough_when_absent() {
+        assert_eq!(strip_system_reminders("hi"), "hi");
+    }
+
+    #[test]
+    fn reminder_polluted_greeting_decides_locally() {
+        // 模拟被 system-reminder 撑长的 "hi"：剥离后应命中本地短路（Casual+短），
+        // 而不是落到耗时的模型 gate。
+        let polluted = format!(
+            "<system-reminder>{}</system-reminder>\n\nhi",
+            "x".repeat(2000)
+        );
+        let clean = strip_system_reminders(&polluted);
+        let clean = clean.trim();
+        let intent = UserIntent::new(CoreIntent::Casual);
+        assert_eq!(local_thinking_decision(clean, &intent), Some(false));
+    }
+
+    #[test]
     fn thinking_gate_uses_latest_user_message_only() {
         let messages = vec![
             Message {
@@ -2960,7 +3039,10 @@ mod tests {
             )
         );
 
-        // OpenAI：顶层 reasoning_effort，省略扩展字段，流式追加 stream_options。
+        // OpenAI-provider 模型在 models.json 中均走 DashScope compatible-mode
+        // 端点（deepseek-v4-pro/flash、kimi、glm），该端点用 `enable_thinking`
+        // 控制思考——即使 provider 标成 openai。因此这里断言带 enable_thinking。
+        // 纯 OpenAI 协议（无 enable_thinking）的 wire 由下方 OpenCode 段覆盖。
         let openai_model = first_openai_model_name();
         let openai = build_request_body(
             &openai_model,
@@ -2975,11 +3057,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&openai).unwrap(),
             format!(
-                r#"{{"model":"{openai_model}","messages":[{{"role":"user","content":"hi"}}],"stream":true,"reasoning_effort":"high","stream_options":{{"include_usage":true}}}}"#
+                r#"{{"model":"{openai_model}","messages":[{{"role":"user","content":"hi"}}],"stream":true,"enable_thinking":true,"reasoning_effort":"high","stream_options":{{"include_usage":true}}}}"#
             )
         );
 
         // OpenCode：与 OpenAI 兼容族字段一致（顶层 reasoning_effort、省略扩展字段）。
+        // 注意：此处取的是 models.json 中第一个 opencode 模型（非 DeepSeek），
+        // 因此不带 `thinking` 对象字段。DeepSeek 专属的 `thinking` 字段由单独的
+        // `deepseek_request_body_uses_thinking_object` 测试覆盖。
         if let Some(opencode_model) = first_model_name_for_provider(ApiProvider::OpenCode) {
             let opencode = build_request_body(
                 &opencode_model,
@@ -2998,6 +3083,143 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn deepseek_request_body_uses_thinking_object() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("hi".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        // 关闭：thinking={"type":"disabled"}
+        let disabled = build_request_body(
+            "deepseek-v4-flash-free",
+            &messages,
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        let disabled = serde_json::to_value(&disabled).unwrap();
+        assert_eq!(
+            disabled.get("thinking"),
+            Some(&json!({ "type": "disabled" }))
+        );
+        // DeepSeek 不应再发送 enable_thinking（避免与 thinking 对象冲突/无效）。
+        assert!(disabled.get("enable_thinking").is_none());
+
+        // 开启：thinking={"type":"enabled"}
+        let enabled = build_request_body(
+            "deepseek-v4-flash-free",
+            &messages,
+            false,
+            true,
+            None,
+            None,
+            None,
+            None,
+        );
+        let enabled = serde_json::to_value(&enabled).unwrap();
+        assert_eq!(enabled.get("thinking"), Some(&json!({ "type": "enabled" })));
+    }
+
+    #[test]
+    fn non_deepseek_request_body_omits_thinking_object() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("hi".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let body = build_request_body(
+            "qwen3.7-plus",
+            &messages,
+            true,
+            false,
+            None,
+            None,
+            None,
+            None,
+        );
+        let value = serde_json::to_value(&body).unwrap();
+        assert!(value.get("thinking").is_none());
+    }
+
+    /// 核心回归：DashScope compatible-mode 端点的 openai-provider 模型
+    /// （deepseek-v4-pro/flash、kimi-k2.7-code）必须按 thinking gate 决策发送
+    /// `enable_thinking`，否则「关闭」会被静默丢弃、模型仍 reasoning。
+    #[test]
+    fn dashscope_openai_provider_honors_enable_thinking_gate() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("hi".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        for model in ["deepseek-v4-pro", "deepseek-v4-flash", "kimi-k2.7-code"] {
+            // gate 关闭 → enable_thinking:false
+            let disabled = build_request_body(
+                model, &messages, false, false, None, None, None, None,
+            );
+            let disabled = serde_json::to_value(&disabled).unwrap();
+            assert_eq!(
+                disabled.get("enable_thinking").and_then(|v| v.as_bool()),
+                Some(false),
+                "{model} should emit enable_thinking:false when gate disables thinking"
+            );
+            // 走 enable_thinking 而非 deepseek 的 thinking 对象
+            assert!(disabled.get("thinking").is_none(), "{model}");
+
+            // gate 开启 → enable_thinking:true
+            let enabled = build_request_body(
+                model, &messages, false, true, None, None, None, None,
+            );
+            let enabled = serde_json::to_value(&enabled).unwrap();
+            assert_eq!(
+                enabled.get("enable_thinking").and_then(|v| v.as_bool()),
+                Some(true),
+                "{model} should emit enable_thinking:true when gate enables thinking"
+            );
+        }
+    }
+
+    /// 辅助（非主链路）请求对 DashScope 端点模型必须显式关闭 thinking，
+    /// 否则默认开启的长推理链会撑爆辅助任务超时——provider 标 openai 也不例外。
+    #[test]
+    fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
+        for model in ["qwen3.7-plus", "deepseek-v4-pro", "kimi-k2.7-code"] {
+            let mut body = json!({ "model": model, "messages": [], "stream": false });
+            apply_aux_thinking_fields(model, &mut body);
+            assert_eq!(
+                body.get("enable_thinking").and_then(|v| v.as_bool()),
+                Some(false),
+                "{model} aux request should disable thinking via enable_thinking:false"
+            );
+        }
+
+        // OpenCode 的 deepseek 不靠 enable_thinking，aux 关闭走 thinking 对象。
+        let mut deepseek = json!({ "model": "deepseek-v4-flash-free", "messages": [], "stream": false });
+        apply_aux_thinking_fields("deepseek-v4-flash-free", &mut deepseek);
+        assert_eq!(
+            deepseek.get("thinking"),
+            Some(&json!({ "type": "disabled" }))
+        );
+        assert!(deepseek.get("enable_thinking").is_none());
+
+        // MiniMax（opencode 非 deepseek）无可靠关闭开关，aux 不注入任何思考字段。
+        let mut minimax = json!({ "model": "minimax-m2.5-free", "messages": [], "stream": false });
+        apply_aux_thinking_fields("minimax-m2.5-free", &mut minimax);
+        assert!(minimax.get("thinking").is_none());
+        assert!(minimax.get("enable_thinking").is_none());
     }
 
     #[test]
@@ -3022,7 +3244,13 @@ mod tests {
         );
         let value = serde_json::to_value(&body).unwrap();
 
-        assert!(value.get("enable_thinking").is_none());
+        // OpenAI-provider 模型走 DashScope 端点，按端点应携带 enable_thinking；
+        // 但仍不发 enable_search（非 DashScope 之外的 OpenAI 兼容扩展），
+        // 且推理强度走顶层 reasoning_effort 而非嵌套 reasoning。
+        assert_eq!(
+            value.get("enable_thinking").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         assert!(value.get("enable_search").is_none());
         assert_eq!(
             value.get("reasoning_effort").and_then(|v| v.as_str()),

@@ -1215,9 +1215,7 @@ pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Optio
         "messages": messages,
         "stream": false
     });
-    if let Some(disabled) = request::aux_disable_thinking_for_model(model) {
-        body["enable_thinking"] = json!(disabled);
-    }
+    request::apply_aux_thinking_fields(model, &mut body);
     let req = request::apply_request_auth(
         BACKGROUND_HTTP_CLIENT.post(&endpoint),
         &endpoint,

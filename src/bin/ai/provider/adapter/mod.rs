@@ -6,13 +6,32 @@
 //!
 //! 主链路保持自由函数骨架不变，仅在差异点调用本模块的 hook，确保各 provider
 //! 对外的 wire 行为（请求体序列化、流式解析结果、鉴权头）逐字节一致。
+//!
+//! 本模块只承载「跨 provider 的公共契约」：[`ProviderAdapter`] trait 与
+//! [`adapter_for`] 调度。每个具体 provider 的实现各自独立成文件
+//! （`compatible` / `openai` / `openrouter` / `opencode`）。
+//!
+//! 思考开关的 wire 编码是与 provider 正交的另一根轴，独立到 [`thinking`] 子模块
+//! （[`thinking_dialect_for`]），各 provider adapter 不再参与思考字段编码。
 
-use serde_json::{Value, json};
+mod compatible;
+mod opencode;
+mod openai;
+mod openrouter;
+mod thinking;
 
-use crate::ai::config_schema::AiConfig;
+use serde_json::Value;
+
 use crate::ai::stream::{ParsedStreamPayload, try_parse_stream_chunk_loose};
 
 use super::ApiProvider;
+
+pub(in crate::ai) use thinking::{ThinkingDialect, thinking_dialect_for};
+
+use compatible::CompatibleAdapter;
+use openai::OpenAiAdapter;
+use opencode::OpenCodeAdapter;
+use openrouter::OpenRouterAdapter;
 
 pub(in crate::ai) const COMPATIBLE_DEFAULT_ENDPOINT: &str =
     "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
@@ -31,21 +50,9 @@ pub(in crate::ai) trait ProviderAdapter: Sync {
     /// 流式解析失败日志使用的标签，也用于诊断。
     fn label(&self) -> &'static str;
 
-    /// 主请求体的 `enable_thinking` 字段取值。
-    /// Compatible 显式声明 `Some(requested)`；OpenAI 兼容族不发送该字段（`None`）。
-    fn enable_thinking_field(&self, _requested: bool) -> Option<bool> {
-        None
-    }
-
     /// 主请求体的 `enable_search` 字段取值。
     /// Compatible 透传调用方传入的开关；OpenAI 兼容族不发送该字段（`None`）。
     fn enable_search_field(&self, _requested: Option<bool>) -> Option<bool> {
-        None
-    }
-
-    /// 辅助（非主链路）请求是否需要显式关闭 thinking。
-    /// Compatible 默认开启 thinking 会撑爆辅助任务超时，需 `Some(false)`。
-    fn aux_disable_thinking(&self) -> Option<bool> {
         None
     }
 
@@ -90,11 +97,6 @@ pub(in crate::ai) trait ProviderAdapter: Sync {
     }
 }
 
-pub(in crate::ai) struct CompatibleAdapter;
-pub(in crate::ai) struct OpenAiAdapter;
-pub(in crate::ai) struct OpenRouterAdapter;
-pub(in crate::ai) struct OpenCodeAdapter;
-
 static COMPATIBLE: CompatibleAdapter = CompatibleAdapter;
 static OPENAI: OpenAiAdapter = OpenAiAdapter;
 static OPENROUTER: OpenRouterAdapter = OpenRouterAdapter;
@@ -128,115 +130,5 @@ pub(in crate::ai) fn adapter_for(
         ApiProvider::Compatible => compatible_adapter(),
         ApiProvider::OpenAi => openai_adapter(),
         ApiProvider::OpenCode => opencode_adapter(),
-    }
-}
-
-impl ProviderAdapter for CompatibleAdapter {
-    fn label(&self) -> &'static str {
-        "compatible"
-    }
-
-    fn enable_thinking_field(&self, requested: bool) -> Option<bool> {
-        Some(requested)
-    }
-
-    fn enable_search_field(&self, requested: Option<bool>) -> Option<bool> {
-        requested
-    }
-
-    fn aux_disable_thinking(&self) -> Option<bool> {
-        Some(false)
-    }
-
-    fn reasoning_top_level<'a>(&self, _effort: Option<&'a str>) -> Option<&'a str> {
-        None
-    }
-
-    fn reasoning_nested(&self, effort: Option<&str>) -> Option<Value> {
-        effort.map(|effort| json!({ "effort": effort }))
-    }
-
-    fn default_endpoint(&self) -> &'static str {
-        COMPATIBLE_DEFAULT_ENDPOINT
-    }
-
-    fn api_key_candidates(&self) -> &'static [&'static str] {
-        &[
-            AiConfig::MODEL_COMPATIBLE_API_KEY,
-            AiConfig::MODEL_ALIYUN_API_KEY,
-            AiConfig::MODEL_API_KEY,
-        ]
-    }
-}
-
-impl ProviderAdapter for OpenAiAdapter {
-    fn label(&self) -> &'static str {
-        "openai"
-    }
-
-    fn default_endpoint(&self) -> &'static str {
-        OPENAI_DEFAULT_ENDPOINT
-    }
-
-    fn api_key_candidates(&self) -> &'static [&'static str] {
-        &[
-            AiConfig::MODEL_OPENROUTER_API_KEY,
-            AiConfig::MODEL_OPENAI_API_KEY,
-            AiConfig::MODEL_API_KEY,
-        ]
-    }
-}
-
-impl ProviderAdapter for OpenRouterAdapter {
-    fn label(&self) -> &'static str {
-        "openrouter"
-    }
-
-    fn default_endpoint(&self) -> &'static str {
-        OPENROUTER_ENDPOINT
-    }
-
-    fn api_key_candidates(&self) -> &'static [&'static str] {
-        &[
-            AiConfig::MODEL_OPENROUTER_API_KEY,
-            AiConfig::MODEL_OPENAI_API_KEY,
-            AiConfig::MODEL_API_KEY,
-        ]
-    }
-}
-
-impl ProviderAdapter for OpenCodeAdapter {
-    fn label(&self) -> &'static str {
-        "opencode"
-    }
-
-    fn default_endpoint(&self) -> &'static str {
-        OPENCODE_DEFAULT_ENDPOINT
-    }
-
-    fn api_key_candidates(&self) -> &'static [&'static str] {
-        &[AiConfig::MODEL_OPENCODE_API_KEY, AiConfig::MODEL_API_KEY]
-    }
-
-    fn shows_waiting_hint(&self) -> bool {
-        true
-    }
-
-    fn parse_provider_chunk(&self, payload: &str) -> ParsedStreamPayload {
-        let trimmed = payload.trim();
-        if trimmed.is_empty() || trimmed == "[DONE]" {
-            return ParsedStreamPayload::Ignore;
-        }
-        match try_parse_stream_chunk_loose(trimmed) {
-            Some(chunk) => ParsedStreamPayload::Chunk(chunk),
-            None => {
-                eprintln!(
-                    "[opencode] ignored payload, length: {}, starts_with: {:.30}",
-                    trimmed.len(),
-                    trimmed
-                );
-                ParsedStreamPayload::Ignore
-            }
-        }
     }
 }

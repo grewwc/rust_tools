@@ -453,6 +453,7 @@ pub(super) async fn execute_turn_iteration(
     let mut current_history = String::new();
     request::clear_stale_request_interrupt_before_request(app);
     let _streaming_guard = StreamingFlagGuard::new(&app.streaming);
+    crate::ai::driver::runtime_ctx::publish_subagent_phase("calling model");
 
     let shutdown = app.shutdown.clone();
     let cancel_stream = app.cancel_stream.clone();
