@@ -453,6 +453,55 @@ fn select_mcp_tools(
     filter_mcp_tools_by_allowed_servers(all_tools, &allowed_servers)
 }
 
+fn is_general_knowledge_suppressed_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "read_file"
+            | "read_file_lines"
+            | "list_directory"
+            | "search_files"
+            | "grep_search"
+            | "text_grep"
+            | "code_search"
+            | "lsp"
+            | "enable_tools"
+            | "discover_skills"
+            | "activate_skill"
+            | "task"
+            | "task_spawn"
+            | "task_wait"
+            | "task_status"
+            | "agent_team"
+    )
+}
+
+fn should_use_general_knowledge_mode(
+    question: &str,
+    intent: &UserIntent,
+    skill: Option<&SkillManifest>,
+) -> bool {
+    if skill.is_some() {
+        return false;
+    }
+    let len = question.trim().chars().count();
+    if len == 0 || len > 180 {
+        return false;
+    }
+    matches!(
+        intent.core,
+        intent_recognition::CoreIntent::QueryConcept
+            | intent_recognition::CoreIntent::SeekSolution
+            | intent_recognition::CoreIntent::Casual
+    )
+}
+
+fn filter_general_knowledge_tools(tools: Vec<ToolDef>) -> Vec<ToolDef> {
+    tools
+        .into_iter()
+        .filter(|tool| !is_general_knowledge_suppressed_tool(&tool.function.name))
+        .collect()
+}
+
 fn mcp_tools_for_turn(
     mcp_client: &McpClient,
     skill: Option<&SkillManifest>,
@@ -945,6 +994,7 @@ fn build_skill_turn_guard(
     mcp_client: &McpClient,
     skill: Option<&SkillManifest>,
     intent: UserIntent,
+    question: &str,
 ) -> SkillTurnGuard {
     super::super::tools::enable_tools::set_available_mcp_tools(mcp_client.get_all_tools());
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
@@ -953,10 +1003,21 @@ fn build_skill_turn_guard(
     let executor_active = skill.as_ref().is_some_and(|s| is_executor_skill(s))
         || active_agent.as_ref().is_some_and(is_executor_agent);
 
-    let builtin_tools = builtin_tools_for_skill(skill, active_agent.as_ref());
+    let general_knowledge_mode = should_use_general_knowledge_mode(question, &intent, skill);
+    let builtin_tools = if general_knowledge_mode {
+        filter_general_knowledge_tools(builtin_tools_for_skill(skill, active_agent.as_ref()))
+    } else {
+        builtin_tools_for_skill(skill, active_agent.as_ref())
+    };
     let mcp_tools = mcp_tools_for_turn(mcp_client, skill, active_agent.as_ref());
     let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
-    let builder = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
+    let mut builder = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
+    if general_knowledge_mode {
+        builder.push(
+            ContextKind::Policy,
+            "General knowledge mode:\n- The user is asking a general technical/knowledge question, not a question about the current repository.\n- Answer directly from general knowledge. Do not inspect the current directory, repository files, git state, or local project context unless the user explicitly asks to relate the answer to this project.\n- Examples, syntax summaries, and conceptual explanations should not trigger local file search.",
+        );
+    }
     let max_iterations = resolve_max_iterations(active_agent.as_ref(), executor_active);
     let restore_agent_context =
         activate_skill_context(app, builtin_tools, mcp_tools, max_iterations);
@@ -987,7 +1048,7 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
         preferred_skill_name,
         &app.config.skill_match_model_path,
     );
-    build_skill_turn_guard(app, mcp_client, skill, intent.clone())
+    build_skill_turn_guard(app, mcp_client, skill, intent.clone(), question)
 }
 
 /// 模型通过 `activate_skill` 工具显式请求激活某个 skill 时走这里：直接按名字
@@ -1006,7 +1067,7 @@ pub(super) fn force_activate_named_skill(
 ) -> Option<SkillTurnGuard> {
     let skill = skill_manifests.iter().find(|s| s.name == requested_name)?;
     update_cross_turn_skill_bias(app, question, Some(skill));
-    let mut guard = build_skill_turn_guard(app, mcp_client, Some(skill), intent.clone());
+    let mut guard = build_skill_turn_guard(app, mcp_client, Some(skill), intent.clone(), question);
     guard.matched_skill_name = Some(skill.name.clone());
     guard.skip_recall_by_skill = should_skip_recall_for_skill(Some(skill));
     Some(guard)
@@ -1095,7 +1156,7 @@ pub(super) fn prepare_skill_for_turn(
     update_cross_turn_skill_bias(app, question, skill);
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
     let skip_recall_by_skill = should_skip_recall_for_skill(skill);
-    let mut guard = build_skill_turn_guard(app, mcp_client, skill, intent);
+    let mut guard = build_skill_turn_guard(app, mcp_client, skill, intent, question);
     guard.matched_skill_name = matched_skill_name;
     guard.skip_recall_by_skill = skip_recall_by_skill;
     guard
@@ -1106,9 +1167,11 @@ mod tests {
     use super::{
         PreferenceStrength, build_project_instruction_prompt, build_system_prompt,
         builtin_tools_for_skill, ensure_required_baseline_tools,
-        filter_mcp_tools_by_allowed_servers, looks_like_follow_up_or_same_topic,
-        merge_with_runtime_enabled_tools, resolve_max_iterations, select_mcp_tools,
-        select_skill_with_preference, select_skill_with_preference_strength, tool_uses_mcp_server,
+        filter_general_knowledge_tools, filter_mcp_tools_by_allowed_servers,
+        looks_like_follow_up_or_same_topic, merge_with_runtime_enabled_tools,
+        resolve_max_iterations, select_mcp_tools, select_skill_with_preference,
+        select_skill_with_preference_strength, should_use_general_knowledge_mode,
+        tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
@@ -1180,6 +1243,54 @@ mod tests {
         assert!(names.iter().any(|name| name == "knowledge_save"));
         assert!(names.iter().any(|name| name == "knowledge_search"));
         assert!(!names.iter().any(|name| name == "web_search"));
+    }
+
+    #[test]
+    fn general_knowledge_mode_is_intent_gated_without_text_matching() {
+        let seek_solution = UserIntent::new(CoreIntent::SeekSolution);
+        assert!(should_use_general_knowledge_mode(
+            "kubectl rollout 示例",
+            &seek_solution,
+            None
+        ));
+        let request_action = UserIntent::new(CoreIntent::RequestAction);
+        assert!(!should_use_general_knowledge_mode(
+            "apply the requested change",
+            &request_action,
+            None
+        ));
+        assert!(!should_use_general_knowledge_mode(
+            "kubectl rollout 示例",
+            &seek_solution,
+            Some(&skill("debugger", "debug runtime issues"))
+        ));
+    }
+
+    #[test]
+    fn general_knowledge_tools_hide_repo_discovery_and_tool_enabling() {
+        let tools = vec![
+            tool("search_files"),
+            tool("code_search"),
+            tool("read_file"),
+            tool("enable_tools"),
+            tool("discover_skills"),
+            tool("task_spawn"),
+            tool("execute_command"),
+            tool("knowledge_search"),
+        ];
+        let names = filter_general_knowledge_tools(tools)
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(!names.iter().any(|name| name == "search_files"));
+        assert!(!names.iter().any(|name| name == "code_search"));
+        assert!(!names.iter().any(|name| name == "read_file"));
+        assert!(!names.iter().any(|name| name == "enable_tools"));
+        assert!(!names.iter().any(|name| name == "discover_skills"));
+        assert!(!names.iter().any(|name| name == "task_spawn"));
+        assert!(names.iter().any(|name| name == "execute_command"));
+        assert!(names.iter().any(|name| name == "knowledge_search"));
     }
 
     #[test]

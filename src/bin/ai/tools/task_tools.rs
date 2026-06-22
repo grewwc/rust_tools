@@ -1822,6 +1822,8 @@ fn format_task_result(entry: &AsyncTaskEntry, result: StoredTaskResult) -> Strin
     }
     if !result.output.trim().is_empty() {
         parts.push(result.output.trim().to_string());
+    } else {
+        parts.push("(subagent did not produce any final assistant text)".to_string());
     }
     parts.join("\n")
 }
@@ -1998,18 +2000,19 @@ fn build_selection_explanation(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentTeamMemberSpec, AgentTeamOperation, SelectedSubagent, WaitManySource,
-        append_current_process_cancel_source, build_agent_team_prompt,
-        build_agent_team_selection_prompt, build_selection_explanation, epoll_wait_many,
-        epoll_wait_many_channels, parse_agent_team_members, resolve_agent_team_model_override,
-        select_subagent, wait_sources_for_channel_and_futex,
+        AgentTeamMemberSpec, AgentTeamOperation, AsyncTaskEntry, InheritOptions, SelectedSubagent,
+        StoredTaskResult, WaitManySource, append_current_process_cancel_source,
+        build_agent_team_prompt, build_agent_team_selection_prompt, build_selection_explanation,
+        epoll_wait_many, epoll_wait_many_channels, format_task_result, parse_agent_team_members,
+        resolve_agent_team_model_override, select_subagent, wait_sources_for_channel_and_futex,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use aios_kernel::{
         kernel::{EventId, KernelInternal, Syscall, WaitPolicy},
         local::LocalOS,
-        primitives::{FutexOps, IpcOps},
+        primitives::{FutexAddr, FutexOps, IpcOps},
     };
+    use std::time::Instant;
 
     fn manifest(name: &str, description: &str, mode: AgentMode) -> AgentManifest {
         AgentManifest {
@@ -2422,6 +2425,34 @@ mod tests {
 
         let root_proc = os.get_process(root).unwrap();
         assert_eq!(root_proc.state, aios_kernel::kernel::ProcessState::Ready);
+    }
+
+    #[test]
+    fn task_wait_formats_empty_subagent_result_explicitly() {
+        let entry = AsyncTaskEntry {
+            pid: 42,
+            result_channel_id: 1,
+            completion_futex_addr: FutexAddr(1),
+            description: "verify behavior".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max".to_string(),
+            is_model_auto_selected: true,
+            auto_model_fallback: None,
+            selection_explanation: "model_reason=auto-selected".to_string(),
+            inherit: InheritOptions::default(),
+            started_at: Instant::now(),
+        };
+        let result = StoredTaskResult {
+            status: "failed".to_string(),
+            output: String::new(),
+            error: Some("request timed out waiting for response headers".to_string()),
+        };
+
+        let output = format_task_result(&entry, result);
+
+        assert!(output.contains("FAILED"));
+        assert!(output.contains("Error: request timed out waiting for response headers"));
+        assert!(output.contains("(subagent did not produce any final assistant text)"));
     }
 }
 

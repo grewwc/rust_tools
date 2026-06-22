@@ -215,7 +215,7 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
         }
     }
 
-    tokio::spawn(runtime_ctx::DRIVER_CTX.scope(spawn_driver_ctx, wrapped));
+    let subagent_handle = tokio::spawn(runtime_ctx::DRIVER_CTX.scope(spawn_driver_ctx, wrapped));
 
     // 把子 agent 的私有 cancel 标志登记到前台子 agent 注册表：Ctrl+C 时
     // SIGINT 处理器会优先定向取消栈顶子 agent（翻这个标志），而不是关掉主 agent。
@@ -241,6 +241,9 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
             SYNC_TASK_HARD_TIMEOUT,
         ))
     });
+    if join_result.is_err() {
+        subagent_handle.abort();
+    }
 
     let duration = started.elapsed();
     let elapsed_secs = duration.as_secs_f64();
@@ -251,41 +254,24 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
         .and_then(|guard| guard.clone())
         .unwrap_or_default();
 
-    match join_result {
-        Ok(Ok(())) => Ok(ToolResult {
-            tool_call_id: tool_call_id.to_string(),
-            content: format_subagent_output(
-                "COMPLETED",
-                &log_description,
-                &log_agent_name,
-                &log_model,
-                elapsed_secs,
-                &log_selection_explanation,
-                &captured_output,
-                None,
-            ),
-        }),
-        Ok(Err(err)) => Err(format_subagent_output(
-            "FAILED",
+    let (status, error) = match join_result {
+        Ok(Ok(())) => ("COMPLETED", None),
+        Ok(Err(err)) => ("FAILED", Some(err)),
+        Err(err) => (subagent_wait_error_status(&err), Some(err)),
+    };
+    Ok(ToolResult {
+        tool_call_id: tool_call_id.to_string(),
+        content: format_subagent_output(
+            status,
             &log_description,
             &log_agent_name,
             &log_model,
             elapsed_secs,
             &log_selection_explanation,
             &captured_output,
-            Some(&err),
-        )),
-        Err(err) => Err(format_subagent_output(
-            "INTERNAL_ERROR",
-            &log_description,
-            &log_agent_name,
-            &log_model,
-            elapsed_secs,
-            &log_selection_explanation,
-            &captured_output,
-            Some(&err),
-        )),
-    }
+            error.as_deref(),
+        ),
+    })
 }
 
 async fn wait_for_sync_task_completion(
@@ -433,6 +419,17 @@ fn format_subagent_output(
     parts.join("\n")
 }
 
+fn subagent_wait_error_status(err: &str) -> &'static str {
+    let err = err.to_ascii_lowercase();
+    if err.contains("hard timeout") {
+        "TIMED_OUT"
+    } else if err.contains("aborted") || err.contains("cancel") {
+        "CANCELLED"
+    } else {
+        "FAILED"
+    }
+}
+
 fn subagent_history_path(base: &std::path::Path, task_id: &str) -> PathBuf {
     let file_name = base
         .file_name()
@@ -532,5 +529,23 @@ mod tests {
             result,
             Err("subagent task exceeded hard timeout of 0s".to_string())
         );
+    }
+
+    #[test]
+    fn sync_task_formats_timeout_as_parent_visible_output() {
+        let output = format_subagent_output(
+            subagent_wait_error_status("subagent task exceeded hard timeout of 600s"),
+            "verify behavior",
+            "explore",
+            "qwen3.7-max",
+            600.0,
+            "model_reason=auto-selected",
+            "",
+            Some("subagent task exceeded hard timeout of 600s"),
+        );
+
+        assert!(output.contains("TIMED_OUT"));
+        assert!(output.contains("Error: subagent task exceeded hard timeout of 600s"));
+        assert!(output.contains("(subagent did not produce any final assistant text)"));
     }
 }

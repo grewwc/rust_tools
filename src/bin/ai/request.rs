@@ -546,8 +546,39 @@ const REQUEST_RETRY_MAX_MS: u64 = 4000;
 /// `.send().await` 会永久阻塞、CPU 占用为 0，表现为 agent 卡死。
 /// 因此对流式 `send()` 单独加一个响应头等待超时兜底。
 const STREAM_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 90;
+/// 子 agent 自动选型有 fallback 兜底，首选模型迟迟不返回时应快速让位。
+/// 显式指定模型不走 AUTO_MODEL_FALLBACK scope，仍保留常规重试策略。
+const AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 30;
+const AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS: usize = 1;
 const DEFAULT_AUTO_THINKING_THRESHOLD: f64 = 0.7;
 const DEFAULT_CONTROL_MODEL: &str = "qwen3.5-flash";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RequestRetryPolicy {
+    max_attempts: usize,
+    max_attempts_429: usize,
+    header_timeout_secs: u64,
+}
+
+fn request_retry_policy(auto_model_fallback: bool) -> RequestRetryPolicy {
+    if auto_model_fallback {
+        RequestRetryPolicy {
+            max_attempts: AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS,
+            max_attempts_429: AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS,
+            header_timeout_secs: AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS,
+        }
+    } else {
+        RequestRetryPolicy {
+            max_attempts: REQUEST_MAX_ATTEMPTS,
+            max_attempts_429: REQUEST_MAX_ATTEMPTS_429,
+            header_timeout_secs: STREAM_RESPONSE_HEADER_TIMEOUT_SECS,
+        }
+    }
+}
+
+fn request_retry_policy_for_current_context() -> RequestRetryPolicy {
+    request_retry_policy(crate::ai::driver::runtime_ctx::auto_model_fallback_spec().is_some())
+}
 
 fn config_bool_is_true(value: Option<String>) -> bool {
     value
@@ -654,6 +685,17 @@ pub(super) fn should_temporarily_disable_model(err: &RequestError) -> bool {
             matches!(status.as_u16(), 402 | 404 | 429) || status.is_server_error()
         }
     }
+}
+
+pub(super) fn should_temporarily_disable_auto_selected_model(err: &RequestError) -> bool {
+    if should_temporarily_disable_model(err) {
+        return true;
+    }
+    if !matches!(err.kind, RequestErrorKind::Network) {
+        return false;
+    }
+    let message = err.message.to_ascii_lowercase();
+    message.contains("timed out") || message.contains("timeout")
 }
 
 pub(super) fn should_try_model_fallback(err: &RequestError) -> bool {
@@ -1046,8 +1088,9 @@ pub(super) async fn do_request_messages(
         tool_choice,
         reasoning_effort,
     );
+    let retry_policy = request_retry_policy_for_current_context();
 
-    for attempt in 1..=REQUEST_MAX_ATTEMPTS_429 {
+    for attempt in 1..=retry_policy.max_attempts_429 {
         let endpoint = endpoint_for_request_model(app, model);
         let api_key = api_key_for_request_model(app, model);
         let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
@@ -1057,21 +1100,21 @@ pub(super) async fn do_request_messages(
         // 给“等待响应头”加超时兜底：connect_timeout 只覆盖握手，无法拦截
         // 服务端接受连接后迟迟不返回响应头导致的永久阻塞（CPU 0 卡死）。
         let response = match tokio::time::timeout(
-            Duration::from_secs(STREAM_RESPONSE_HEADER_TIMEOUT_SECS),
+            Duration::from_secs(retry_policy.header_timeout_secs),
             send_future,
         )
         .await
         {
             Ok(result) => result,
             Err(_) => {
-                if attempt < REQUEST_MAX_ATTEMPTS {
+                if attempt < retry_policy.max_attempts {
                     let delay = retry_delay(attempt);
                     eprintln!(
                         "[Warning] 等待响应头超时 ({}s) - sleep {} 秒后重试 (attempt {}/{})",
-                        STREAM_RESPONSE_HEADER_TIMEOUT_SECS,
+                        retry_policy.header_timeout_secs,
                         delay.as_secs_f32(),
                         attempt,
-                        REQUEST_MAX_ATTEMPTS
+                        retry_policy.max_attempts
                     );
                     if sleep_with_cancel(app, delay).await {
                         return Err(RequestError::cancelled(
@@ -1084,7 +1127,7 @@ pub(super) async fn do_request_messages(
                     kind: RequestErrorKind::Network,
                     message: format!(
                         "request timed out waiting for response headers after {} attempts",
-                        REQUEST_MAX_ATTEMPTS
+                        retry_policy.max_attempts
                     ),
                 });
             }
@@ -1102,9 +1145,9 @@ pub(super) async fn do_request_messages(
 
                 // 根据状态码确定最大重试次数
                 let max_attempts_for_status = if status_code == 429 {
-                    REQUEST_MAX_ATTEMPTS_429
+                    retry_policy.max_attempts_429
                 } else {
-                    REQUEST_MAX_ATTEMPTS
+                    retry_policy.max_attempts
                 };
 
                 if should_retry_status(status) && attempt < max_attempts_for_status {
@@ -1139,14 +1182,14 @@ pub(super) async fn do_request_messages(
             Err(err) => {
                 let retryable = is_retryable_reqwest_error(&err);
                 let err = RequestError::network(err);
-                if retryable && attempt < REQUEST_MAX_ATTEMPTS {
+                if retryable && attempt < retry_policy.max_attempts {
                     // 打印 sleep 原因
                     let delay = retry_delay(attempt);
                     eprintln!(
                         "[Warning] 网络错误 - sleep {} 秒后重试 (attempt {}/{})",
                         delay.as_secs_f32(),
                         attempt,
-                        REQUEST_MAX_ATTEMPTS
+                        retry_policy.max_attempts
                     );
                     if sleep_with_cancel(app, delay).await {
                         return Err(RequestError::cancelled(
@@ -2688,18 +2731,51 @@ mod tests {
         let network = RequestError::cancelled("network timeout");
         assert!(should_try_model_fallback(&network));
         assert!(!should_temporarily_disable_model(&network));
+        assert!(should_temporarily_disable_auto_selected_model(&network));
 
         let bad_request = RequestError::status(StatusCode::BAD_REQUEST, String::new());
         assert!(!should_try_model_fallback(&bad_request));
         assert!(!should_temporarily_disable_model(&bad_request));
+        assert!(!should_temporarily_disable_auto_selected_model(
+            &bad_request
+        ));
 
         let unauthorized = RequestError::status(StatusCode::UNAUTHORIZED, String::new());
         assert!(should_try_model_fallback(&unauthorized));
         assert!(!should_temporarily_disable_model(&unauthorized));
+        assert!(!should_temporarily_disable_auto_selected_model(
+            &unauthorized
+        ));
 
         let billing = RequestError::status(StatusCode::PAYMENT_REQUIRED, String::new());
         assert!(should_try_model_fallback(&billing));
         assert!(should_temporarily_disable_model(&billing));
+        assert!(should_temporarily_disable_auto_selected_model(&billing));
+    }
+
+    #[test]
+    fn auto_subagent_retry_policy_fails_fast_for_fallback() {
+        let regular = request_retry_policy(false);
+        assert_eq!(regular.max_attempts, REQUEST_MAX_ATTEMPTS);
+        assert_eq!(regular.max_attempts_429, REQUEST_MAX_ATTEMPTS_429);
+        assert_eq!(
+            regular.header_timeout_secs,
+            STREAM_RESPONSE_HEADER_TIMEOUT_SECS
+        );
+
+        let auto_subagent = request_retry_policy(true);
+        assert_eq!(
+            auto_subagent.max_attempts,
+            AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS
+        );
+        assert_eq!(
+            auto_subagent.max_attempts_429,
+            AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS
+        );
+        assert_eq!(
+            auto_subagent.header_timeout_secs,
+            AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS
+        );
     }
 
     #[test]

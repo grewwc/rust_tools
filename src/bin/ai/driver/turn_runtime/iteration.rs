@@ -304,7 +304,7 @@ async fn request_model_response(
         && let Some(fallback_spec) = crate::ai::driver::runtime_ctx::auto_model_fallback_spec()
         && request::should_try_model_fallback(err)
     {
-        if request::should_temporarily_disable_model(err) {
+        if request::should_temporarily_disable_auto_selected_model(err) {
             crate::ai::models::mark_model_temporarily_unavailable(next_model, &err.to_string());
         }
         if let Some(fallback_model) =
@@ -317,7 +317,7 @@ async fn request_model_response(
             actual_model = fallback_model.clone();
             request_result = do_request_messages(app, &fallback_model, messages, true).await;
             if let Err(fallback_err) = &request_result
-                && request::should_temporarily_disable_model(fallback_err)
+                && request::should_temporarily_disable_auto_selected_model(fallback_err)
             {
                 crate::ai::models::mark_model_temporarily_unavailable(
                     &fallback_model,

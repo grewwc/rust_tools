@@ -422,6 +422,24 @@ fn classify_process_outcome(os: &dyn aios_kernel::kernel::Kernel, pid: u64) -> D
     }
 }
 
+fn should_publish_subagent_task_result(
+    result_ok: bool,
+    captured_output: &str,
+    proc_state: Option<&aios_kernel::kernel::ProcessState>,
+) -> bool {
+    if !result_ok || !captured_output.trim().is_empty() {
+        return true;
+    }
+    !matches!(
+        proc_state,
+        Some(
+            aios_kernel::kernel::ProcessState::Waiting { .. }
+                | aios_kernel::kernel::ProcessState::Sleeping { .. }
+                | aios_kernel::kernel::ProcessState::Stopped
+        )
+    )
+}
+
 fn apply_priority_handoff(proc: &mut aios_kernel::kernel::Process, outcome: DispatchOutcomeTag) {
     match outcome {
         DispatchOutcomeTag::Advanced => {
@@ -2576,7 +2594,14 @@ async fn run_loop(
                     };
                     let mut os = task_os.lock().unwrap();
                     os.set_current_pid(Some(pid));
-                    if let Some(result_channel_id) = result_channel_id {
+                    let publish_task_result = should_publish_subagent_task_result(
+                        result.is_ok(),
+                        &captured_output,
+                        os.get_process(pid).map(|proc| &proc.state),
+                    );
+                    if publish_task_result
+                        && let Some(result_channel_id) = result_channel_id
+                    {
                         let payload = serde_json::json!({
                             "status": if result.is_ok() { "completed" } else { "failed" },
                             "output": captured_output,
@@ -2597,7 +2622,9 @@ async fn run_loop(
                             "task_result.producer",
                         );
                     }
-                    if let Some(addr) = completion_futex_addr {
+                    if publish_task_result
+                        && let Some(addr) = completion_futex_addr
+                    {
                         let _ = os.futex_store(addr, 1);
                     }
                     match result {
@@ -2934,14 +2961,15 @@ mod tests {
         DispatchOutcomeTag, ProcessDispatchMeta, SCHED_COOLDOWN_EPOCHS_DEFAULT,
         SCHEDULER_DISPATCH_META, background_execute_limit, background_pop_limit,
         has_pending_foreground_process, maybe_auto_route_agent, read_recent_history,
-        reset_scheduler_test_state, should_preload_mcp, update_dispatch_meta,
+        reset_scheduler_test_state, should_preload_mcp, should_publish_subagent_task_result,
+        update_dispatch_meta,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
     use crate::ai::history::{Message, append_history_messages};
     use crate::ai::skills::SkillManifest;
     use crate::ai::types::{AgentContext, App, AppConfig};
-    use aios_kernel::kernel::{EventId, ProcessState, WaitPolicy};
+    use aios_kernel::kernel::{EventId, ProcessState, WaitPolicy, WaitReason};
     use aios_kernel::primitives::ResourceLimit;
     use crate::ai::tools::task_tools::InheritOptions;
     use std::path::PathBuf;
@@ -2979,6 +3007,25 @@ mod tests {
 
         meta = update_dispatch_meta(meta, DispatchOutcomeTag::Advanced, 13);
         assert_eq!(meta.failure_streak, 0);
+    }
+
+    #[test]
+    fn subagent_task_result_stays_open_while_process_is_parked() {
+        let waiting = ProcessState::Waiting {
+            reason: WaitReason::Events {
+                event_ids: vec![EventId::new(1)],
+                policy: WaitPolicy::Any,
+                timeout_tick: None,
+            },
+        };
+        assert!(!should_publish_subagent_task_result(true, "", Some(&waiting)));
+        assert!(should_publish_subagent_task_result(
+            true,
+            "final answer",
+            Some(&waiting)
+        ));
+        assert!(should_publish_subagent_task_result(false, "", Some(&waiting)));
+        assert!(should_publish_subagent_task_result(true, "", None));
     }
 
     #[test]
