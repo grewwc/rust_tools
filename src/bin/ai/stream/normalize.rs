@@ -243,6 +243,9 @@ fn stream_chunk_with_delta(delta: StreamDelta) -> StreamChunk {
     StreamChunk {
         choices: vec![StreamChoice {
             delta,
+            message: StreamDelta::default(),
+            reasoning_content: String::new(),
+            reasoning_details: String::new(),
             finish_reason: None,
         }],
         usage: None,
@@ -413,6 +416,19 @@ mod tests {
         match parse_stream_payload(StreamProviderAdapterKind::OpenCode, payload, None) {
             ParsedStreamPayload::Chunk(chunk) => {
                 assert_eq!(chunk.choices[0].delta.content, "hi");
+            }
+            _ => panic!("expected parsed chunk"),
+        }
+    }
+
+    #[test]
+    fn opencode_payload_accepts_message_snapshot_reasoning() {
+        let payload =
+            r#"{"choices":[{"message":{"reasoning_content":"step","content":"answer"}}]}"#;
+        match parse_stream_payload(StreamProviderAdapterKind::OpenCode, payload, None) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.reasoning_content, "step");
+                assert_eq!(chunk.choices[0].delta.content, "answer");
             }
             _ => panic!("expected parsed chunk"),
         }

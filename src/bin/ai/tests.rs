@@ -2000,6 +2000,7 @@ fn thinking_chunks_are_wrapped_once() {
                 tool_calls: Vec::new(),
             },
             finish_reason: None,
+            ..Default::default()
         }],
         ..Default::default()
     };
@@ -2018,6 +2019,7 @@ fn thinking_chunks_are_wrapped_once() {
                 tool_calls: Vec::new(),
             },
             finish_reason: None,
+            ..Default::default()
         }],
         ..Default::default()
     };

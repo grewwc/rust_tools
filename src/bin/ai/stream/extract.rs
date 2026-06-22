@@ -224,6 +224,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -254,6 +255,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -290,6 +292,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -325,6 +328,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -337,6 +341,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -382,6 +387,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -394,6 +400,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,
+                ..Default::default()
             }],
             ..Default::default()
         };
@@ -442,6 +449,7 @@ mod tests {
                     tool_calls: Vec::new(),
                 },
                 finish_reason: None,
+                ..Default::default()
             }],
             ..Default::default()
         };

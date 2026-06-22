@@ -153,6 +153,23 @@ pub(crate) struct StreamCompletionTokensDetails {
 impl StreamChunk {
     pub(super) fn merge_reasoning(&mut self) {
         for choice in &mut self.choices {
+            if choice.delta.reasoning_content.is_empty()
+                && !choice.message.reasoning_content.is_empty()
+            {
+                choice.delta.reasoning_content = choice.message.reasoning_content.clone();
+            }
+            if choice.delta.content.is_empty() && !choice.message.content.is_empty() {
+                choice.delta.content = std::mem::take(&mut choice.message.content);
+            }
+            if choice.delta.tool_calls.is_empty() && !choice.message.tool_calls.is_empty() {
+                choice.delta.tool_calls = std::mem::take(&mut choice.message.tool_calls);
+            }
+            if choice.delta.reasoning_content.is_empty() && !choice.reasoning_content.is_empty() {
+                choice.delta.reasoning_content = choice.reasoning_content.clone();
+            }
+            if choice.delta.reasoning_details.is_empty() && !choice.reasoning_details.is_empty() {
+                choice.delta.reasoning_details = choice.reasoning_details.clone();
+            }
             choice.delta.reasoning_content = merge_reasoning_fragments(
                 &choice.delta.reasoning_details,
                 &choice.delta.reasoning_content,
@@ -166,6 +183,19 @@ impl StreamChunk {
 pub(super) struct StreamChoice {
     #[serde(default)]
     pub(super) delta: StreamDelta,
+    /// 少数 OpenAI-compatible 网关会把快照块放在 `message` 而不是 `delta`。
+    /// 统一折叠进 delta，后续流处理层不需要认识这种 wire 差异。
+    #[serde(default)]
+    pub(super) message: StreamDelta,
+    #[serde(
+        default,
+        alias = "reasoning",
+        alias = "reasoning_text",
+        deserialize_with = "displayable_string_or_default"
+    )]
+    pub(super) reasoning_content: String,
+    #[serde(default, deserialize_with = "reasoning_details_string_or_default")]
+    pub(super) reasoning_details: String,
     #[serde(default)]
     pub(super) finish_reason: Option<String>,
 }
@@ -1001,6 +1031,9 @@ pub(super) async fn do_request_messages(
             "[Info] thinking 已请求，但当前模型 `{}` 不支持 thinking；本轮将继续以普通模式输出。",
             model
         );
+    }
+    if enable_thinking {
+        ensure_reasoning_content_echo_for_thinking_model(model, &mut normalized_messages);
     }
     let reasoning_effort = resolve_reasoning_effort(app, model).map(|e| e.as_str());
     let request_body = build_request_body(
@@ -1926,6 +1959,28 @@ fn build_request_body<'a>(
         reasoning_effort: adapter.reasoning_top_level(reasoning_effort),
         reasoning: adapter.reasoning_nested(reasoning_effort),
         stream_options,
+    }
+}
+
+fn ensure_reasoning_content_echo_for_thinking_model(model: &str, messages: &mut [Message]) {
+    let provider = models::model_provider(model);
+    let endpoint = models::endpoint_for_model(model, "");
+    let dialect = super::provider::thinking_dialect_for(provider, model, &endpoint);
+    if !dialect.requires_reasoning_content_echo() {
+        return;
+    }
+
+    for message in messages.iter_mut() {
+        if message.role != "assistant" || message.reasoning_content.is_some() {
+            continue;
+        }
+        if message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tool_calls| !tool_calls.is_empty())
+        {
+            message.reasoning_content = Some(String::new());
+        }
     }
 }
 
@@ -3150,6 +3205,30 @@ mod tests {
         );
         let value = serde_json::to_value(&body).unwrap();
         assert!(value.get("thinking").is_none());
+    }
+
+    #[test]
+    fn deepseek_tool_call_messages_echo_empty_reasoning_content() {
+        let mut messages = vec![Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        ensure_reasoning_content_echo_for_thinking_model("deepseek-v4-flash-free", &mut messages);
+        assert_eq!(messages[0].reasoning_content.as_deref(), Some(""));
+
+        let value = serde_json::to_value(&messages[0]).unwrap();
+        assert_eq!(value.get("reasoning_content").and_then(|v| v.as_str()), Some(""));
     }
 
     /// 核心回归：DashScope compatible-mode 端点的 openai-provider 模型

@@ -22,6 +22,13 @@ use super::super::ApiProvider;
 pub(in crate::ai) trait ThinkingDialect: Sync {
     /// 把逻辑开关 `enable` 编码成请求体字段。空 Map 表示该方言不发送任何字段。
     fn fields(&self, enable: bool) -> Map<String, Value>;
+
+    /// 该方言是否要求 assistant tool-call 消息回传 `reasoning_content` 字段。
+    /// DeepSeek thinking-mode 在工具回合续写时会校验该字段，即使网关没有给出
+    /// 非空推理文本，也需要保留字段形状以通过协议校验。
+    fn requires_reasoning_content_echo(&self) -> bool {
+        false
+    }
 }
 
 /// DashScope 协议：`{"enable_thinking": bool}`。
@@ -45,6 +52,10 @@ impl ThinkingDialect for DeepSeekThinkingDialect {
         let mut map = Map::new();
         map.insert("thinking".to_string(), json!({ "type": kind }));
         map
+    }
+
+    fn requires_reasoning_content_echo(&self) -> bool {
+        true
     }
 }
 
