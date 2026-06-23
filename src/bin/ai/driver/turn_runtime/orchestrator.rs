@@ -485,7 +485,7 @@ async fn run_turn_body(
             Err(err) => break 'turn Err(err),
         };
         {
-            let mc = mcp_client.lock().unwrap();
+            let mc = mcp_client.lock().unwrap().routing_snapshot();
             let step = match handle_iteration_execution(
                 app,
                 &question,

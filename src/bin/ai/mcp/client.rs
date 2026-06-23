@@ -100,6 +100,17 @@ impl McpClient {
         }
     }
 
+    pub(in crate::ai) fn routing_snapshot(&self) -> Self {
+        Self {
+            servers: SkipMap::default(),
+            next_id: AtomicU64::new(self.next_id.load(Ordering::Relaxed)),
+            cached_tool_definitions: self.cached_tool_definitions.clone(),
+            cached_resources: self.cached_resources.clone(),
+            cached_prompts: self.cached_prompts.clone(),
+            cached_server_prefixes: self.cached_server_prefixes.clone(),
+        }
+    }
+
     pub(in crate::ai) fn connect_server(
         &mut self,
         name: &str,

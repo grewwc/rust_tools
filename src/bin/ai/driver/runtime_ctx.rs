@@ -142,6 +142,10 @@ pub(crate) async fn publish_subagent_result(text: &str) {
     *guard = Some(text.to_string());
 }
 
+pub(crate) fn has_subagent_result_slot() -> bool {
+    SUBAGENT_RESULT_SLOT.try_with(|_| ()).is_ok()
+}
+
 /// Publish the sub-agent's current execution phase into the active phase
 /// slot if one was installed by the spawning tool. Silent no-op when no
 /// slot is set (top-level foreground turn, unit tests, …).

@@ -479,6 +479,10 @@ pub(super) async fn execute_turn_iteration(
     let (mut response, actual_model) = match request_result {
         Ok(response) => response,
         Err(err) => {
+            let err_text = err.to_string();
+            if crate::ai::driver::runtime_ctx::has_subagent_result_slot() {
+                return Err(err_text.into());
+            }
             return Ok(IterationExecution::RequestFailed(handle_request_error(
                 app,
                 err,
