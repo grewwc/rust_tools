@@ -91,11 +91,11 @@
     "subagent_priority": 75
   },
   {
-    "key": "MiniMax M2.5 Free",
-    "name": "minimax-m2.5-free",
+    "key": "MiMo V2.5 Free",
+    "name": "mimo-v2.5-free",
     "provider": "opencode",
     "quality_tier": "basic",
-    "is_vl": false,
+    "is_vl": true,
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,

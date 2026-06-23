@@ -24,23 +24,24 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 ) {
     let area = f.area();
 
-    // 计算 popup 尺寸
-    let popup_height = area.height.saturating_sub(2).clamp(8, 28).min(area.height);
+    // 计算 popup 尺寸：填满整个 viewport，避免底部残留未清除的换行符
+    let popup_height = area.height.min(area.height);
     let popup_width = area.width.saturating_sub(2).clamp(40, 180).min(area.width);
 
-    // 计算 popup 位置（顶部对齐，减少与上方日志的空白间隔）
+    // 计算 popup 位置（顶部对齐，紧贴上次输出）
     let popup_x = area.x + area.width.saturating_sub(popup_width) / 2;
     let popup_y = area.y;
     let popup = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
-    // 计算内区域 - popup 的边框占据 1 格，标题占据 1 行
-    let border: u16 = 1;
-    let title_lines: u16 = 0;
+    // 计算内区域：左右各 1 列水平边距，顶部留 1 行空白作为与上次输出的视觉分隔，
+    // 底部不留 padding（避免出现多余空白行）
+    let h_margin: u16 = 1;
+    let top_margin: u16 = 1;
     let inner = Rect::new(
-        popup.x + border,
-        popup.y + border + title_lines,
-        popup.width - border * 2,
-        popup.height - border * 2,
+        popup.x + h_margin,
+        popup.y + top_margin,
+        popup.width - h_margin * 2,
+        popup.height - top_margin,
     );
 
     // 计算各区域高度

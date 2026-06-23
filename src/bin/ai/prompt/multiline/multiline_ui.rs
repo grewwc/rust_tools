@@ -55,9 +55,15 @@ impl PromptEditor {
         enable_raw_mode()?;
         let _ = execute!(io::stdout(), EnableBracketedPaste);
 
+        // viewport 高度 = 1 行顶部间距 + textarea + 2 行帮助行。
+        // 设为 8 行可提供 5 行编辑空间；补全面板弹出时会挤压 textarea 到 1 行，
+        // 面板最多可显示 2 个候选项（面板自带 2 行边框），其余候选项可通过 ↑↓ 滚动查看。
+        // 高度过大会导致 append_lines() 在终端底部产生大量换行，
+        // 不仅造成光标与上次输出之间有大段空白，还可能在终端底部覆盖掉
+        // 更多的 assistant 输出历史行。
         let viewport_height = terminal_size()
-            .map(|(_, h)| h.saturating_sub(10).clamp(12, 24))
-            .unwrap_or(18);
+            .map(|(_, h)| h.saturating_sub(2).clamp(6, 8))
+            .unwrap_or(8);
 
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = match Terminal::with_options(
