@@ -28,7 +28,7 @@ use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
 /// 适合"中段按行裁剪"的非精确概览工具。
 ///
-/// grep_search / code_search / search_files / read_file(_lines) 的每一行都可能是
+/// find_path / code_search / search_files / read_file(_lines) 的每一行都可能是
 /// agent 后续判断需要引用的精确证据，不能做有损中段抽样；这些工具只允许在
 /// 超过 inline 上限后 offload 到 session 文件，并在模型上下文里保留 path + stub。
 fn supports_line_trim(tool_name: &str) -> bool {

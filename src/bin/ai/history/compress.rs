@@ -912,7 +912,7 @@ fn is_non_compressible_tool(tool_name: &str) -> bool {
         tool_name,
         "read_file"
             | "read_file_lines"
-            | "grep_search"
+            | "find_path"
             | "text_grep"
             | "search_files"
             | "code_search"

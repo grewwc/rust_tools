@@ -1779,7 +1779,7 @@ fn context_history_summary_keeps_tool_names_and_results() {
                         id: format!("call_{i}"),
                         tool_type: "function".to_string(),
                         function: FunctionCall {
-                            name: "grep_search".to_string(),
+                            name: "find_path".to_string(),
                             arguments: format!(r#"{{"query":"issue-{i}"}}"#),
                         },
                     }]),
@@ -1815,7 +1815,7 @@ fn context_history_summary_keeps_tool_names_and_results() {
         .unwrap_or_default()
         .to_string();
     assert!(summary.contains("已知工具结论"));
-    assert!(summary.contains("grep_search"));
+    assert!(summary.contains("find_path"));
     assert!(summary.contains("issue-0"));
     assert!(summary.contains("ERROR") || summary.contains("repeated failure"));
 

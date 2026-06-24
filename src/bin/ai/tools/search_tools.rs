@@ -38,13 +38,13 @@ fn params_search_files() -> Value {
     })
 }
 
-fn params_grep_search() -> Value {
+fn params_find_path() -> Value {
     serde_json::json!({
         "type": "object",
         "properties": {
             "pattern": {
                 "type": "string",
-                "description": "Filename or glob pattern to match (e.g. \"Cargo.toml\", \"*.rs\", \"src/**\")."
+                "description": "Filename, path suffix, or glob pattern to match (e.g. \"Cargo.toml\", \"*.rs\", \"src/**\")."
             },
             "path": {
                 "type": "string",
@@ -83,10 +83,10 @@ inventory::submit!(ToolRegistration {
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
-        name: "grep_search",
-        description: "Fast file-path search under a root directory using filename match or glob. Returns paths relative to the current working directory (may include ANSI highlighting).",
-        parameters: params_grep_search,
-        execute: execute_grep_search,
+        name: "find_path",
+        description: "Fast file-path finder under a root directory using filename, path-suffix, or glob match. This locates FILES by their path, not text inside files — for full-text content search use code_search(operation=text_search). Returns paths relative to the current working directory (may include ANSI highlighting).",
+        parameters: params_find_path,
+        execute: execute_find_path,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin", "core"],
     }
@@ -214,7 +214,7 @@ fn find_first_file_by_name(root: &Path, filename: &str) -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn execute_grep_search(args: &Value) -> Result<String, String> {
+pub(crate) fn execute_find_path(args: &Value) -> Result<String, String> {
     let pattern = args["pattern"].as_str().ok_or("Missing pattern")?;
     let path = args["path"].as_str().unwrap_or(".");
     let file_pattern = args["file_pattern"].as_str();
@@ -301,23 +301,24 @@ mod tests {
     }
 
     #[test]
-    fn test_grep_search_finds_content() {
-        let dir = make_temp_dir("grep");
-        let file_path = dir.join("target.txt");
-        let unique_marker = "GREP_TEST_MARKER_42";
-        fs::write(
-            &file_path,
-            format!("some text\n{}\nmore text", unique_marker),
-        )
-        .unwrap();
+    fn test_find_path_matches_by_filename() {
+        let dir = make_temp_dir("findpath");
+        fs::write(dir.join("target.txt"), "some text").unwrap();
+        fs::write(dir.join("other.log"), "noise").unwrap();
 
         let args = serde_json::json!({
-            "pattern": unique_marker,
+            "pattern": "target.txt",
             "path": dir.to_string_lossy()
         });
-        let result = execute_grep_search(&args);
+        let result = execute_find_path(&args);
 
-        assert!(result.is_ok(), "grep should not error, got: {:?}", result);
+        assert!(result.is_ok(), "find_path should not error, got: {:?}", result);
+        let output = result.unwrap();
+        assert!(
+            output.contains("target.txt"),
+            "should find target.txt by name, got: {}",
+            output
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

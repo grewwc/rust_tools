@@ -371,7 +371,7 @@ fn is_precision_tool(tool_name: &str) -> bool {
         tool_name,
         "read_file"
             | "read_file_lines"
-            | "grep_search"
+            | "find_path"
             | "text_grep"
             | "search_files"
             | "code_search"
@@ -600,7 +600,7 @@ mod tests {
     fn context_budget_classifies_precision_tools_as_offload_only() {
         let messages = vec![
             msg("system", "s"),
-            assistant_tool_call("call-1", "grep_search"),
+            assistant_tool_call("call-1", "find_path"),
             tool_result("call-1", "src/main.rs:1: fn main()"),
             msg("user", "current"),
         ];
@@ -635,7 +635,7 @@ mod tests {
             .collect::<String>();
         let mut messages = vec![
             msg("system", "system prompt must stay exact"),
-            assistant_tool_call("call-1", "grep_search"),
+            assistant_tool_call("call-1", "find_path"),
             tool_result("call-1", exact_output.clone()),
             current_user.clone(),
         ];
@@ -649,7 +649,7 @@ mod tests {
             .find(|message| message.role == "tool")
             .and_then(|message| message.content.as_str())
             .expect("tool content");
-        assert!(tool_content.contains("Output preserved for non-compressible tool `grep_search`"));
+        assert!(tool_content.contains("Output preserved for non-compressible tool `find_path`"));
         assert!(tool_content.contains("- file_path:"));
         assert!(!tool_content.contains("tool_output_lines:"));
     }

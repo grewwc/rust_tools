@@ -8,7 +8,7 @@ tools:
   - write_file
   - read_file_lines
   - apply_patch
-  - grep_search
+  - find_path
   - search_files
   - list_directory
   - execute_command

@@ -2,32 +2,17 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    "target",
-    "__pycache__",
-    ".venv",
-    "venv",
-    ".tox",
-    "dist",
-    "build",
-    ".next",
-    ".nuxt",
-    "vendor",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".cargo",
-];
-
 const MAX_OUTPUT_CHARS: usize = 32_000;
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
 const MAX_MATCHES: usize = 200;
+const MAX_WALK_FILES: usize = 10_000;
+/// 每个文件最多保留多少条 snippet（按相关性排序后取前 N）。
+const MAX_SNIPPETS_PER_FILE: usize = 3;
 
 /// 系统级目录黑名单：搜索根落在这些前缀内一律拒绝，避免误把整个磁盘扫了。
 /// 仅列出明确的"系统/平台"目录；故意不收 `/var`、`/private`、`/tmp`，因为
@@ -79,6 +64,501 @@ pub(crate) fn validate_search_root(root: &Path, cwd: &Path) -> Result<(), String
     Ok(())
 }
 
+// ============================================================================
+// 共享内容搜索引擎
+//
+// `run_content_search` 是 text_grep 与 code_search.text_search 共用的内容搜索
+// 核心：BFS 递归收集文件 → 逐行正则匹配 → 相关性重排 → 按文件聚合（每文件
+// top-N snippet + context + `>` 标记匹配行）。
+//
+// 设计要点：
+// - 文件收集走 BFS（保留 `*.rs` 递归语义；`terminalw::glob_paths` 非递归，
+//   不能直接替代）。
+// - `extensions=None` 表示不按扩展名过滤（text_grep 的默认行为）；
+//   `Some(&[...])` 表示只搜白名单扩展名（旧 code_search 行为，但现在默认放开）。
+// - 相关性评分：whole-word 命中 > 子串命中；大小写一致优先；命中出现在
+//   文件名/路径中的文件整体加权；行内匹配靠前的优先。
+// ============================================================================
+
+/// 内容搜索的可配置项。由两个调用方各自构造。
+pub(crate) struct ContentSearchOptions<'a> {
+    /// 原始查询串（用于相关性打分时识别字面大小写、whole-word）。
+    pub(crate) query: &'a str,
+    /// 是否把 query 当正则。false 时按字面子串（已转义）匹配。
+    pub(crate) is_regex: bool,
+    /// 是否大小写敏感。
+    pub(crate) case_sensitive: bool,
+    /// 每个匹配行上下各保留多少 context 行。
+    pub(crate) context_lines: usize,
+    /// 最多返回多少条匹配行（跨所有文件）。
+    pub(crate) max_results: usize,
+    /// 可选的文件名 glob 过滤（支持逗号分隔、`*.{ts,tsx}` brace 展开）。
+    pub(crate) file_pattern: Option<&'a str>,
+    /// 可选的扩展名白名单。None=不按扩展名过滤；Some=只收这些扩展名。
+    pub(crate) extensions: Option<&'a [&'a str]>,
+    /// 展示路径时用于裁掉前缀（一般是 cwd），让输出用相对路径。
+    pub(crate) display_root: Option<&'a Path>,
+}
+
+/// 一行匹配，连同它在文件内的相关性分数。
+struct ScoredLine {
+    line_index: usize,
+    score: i64,
+}
+
+/// 单个文件的聚合结果（已按相关性排序、限流的 snippet 行）。
+struct FileHits {
+    /// 用于展示的（可能相对化的）路径字符串。
+    display_path: String,
+    /// 文件的整体相关性分数（用于文件间排序）。
+    file_score: i64,
+    /// 命中的行（line_index, score），已按相关性降序。
+    scored: Vec<ScoredLine>,
+    /// 文件全部行内容（渲染 context 用）。
+    lines: Vec<String>,
+}
+
+/// 运行共享内容搜索，返回已格式化好的结果字符串（含 truncate）。
+/// 无命中时返回 `Ok("No matches found.")`，让调用方按各自语义包装。
+pub(crate) fn run_content_search(
+    root: &Path,
+    options: &ContentSearchOptions<'_>,
+) -> Result<String, String> {
+    if options.query.is_empty() {
+        return Err("pattern must not be empty".to_string());
+    }
+
+    let regex = build_regex(options.query, options.is_regex, options.case_sensitive)?;
+    let glob_matcher = options.file_pattern.map(build_glob_matcher);
+    let files = collect_content_files(root, glob_matcher.as_ref(), options.extensions)?;
+
+    let mut file_hits: Vec<FileHits> = Vec::new();
+    let mut total_matches = 0usize;
+
+    for file_path in &files {
+        if total_matches >= options.max_results {
+            break;
+        }
+
+        let metadata = match fs::metadata(file_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if metadata.len() > MAX_FILE_SIZE {
+            continue;
+        }
+
+        let content = match fs::read_to_string(file_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
+        let display_path = display_path_for(file_path, options.display_root);
+        let name_path_bonus = path_match_bonus(&display_path, options);
+
+        let mut scored: Vec<ScoredLine> = Vec::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if total_matches >= options.max_results {
+                break;
+            }
+            if !regex.is_match(line) {
+                continue;
+            }
+            let score = score_line(line, options, &regex) + name_path_bonus;
+            scored.push(ScoredLine {
+                line_index: idx,
+                score,
+            });
+            total_matches += 1;
+        }
+
+        if scored.is_empty() {
+            continue;
+        }
+
+        // 文件分数取其命中行的最高分 + 路径命中加权，作为文件间排序键。
+        let file_score = scored.iter().map(|s| s.score).max().unwrap_or(0) + name_path_bonus;
+        // 文件内按相关性降序，再按行号升序（稳定、就近）。
+        scored.sort_by(|a, b| {
+            b.score
+                .cmp(&a.score)
+                .then_with(|| a.line_index.cmp(&b.line_index))
+        });
+        scored.truncate(MAX_SNIPPETS_PER_FILE);
+
+        file_hits.push(FileHits {
+            display_path,
+            file_score,
+            scored,
+            lines,
+        });
+    }
+
+    if file_hits.is_empty() {
+        return Ok("No matches found.".to_string());
+    }
+
+    // 文件间按相关性降序，分数相同按路径字典序稳定排列。
+    file_hits.sort_by(|a, b| {
+        b.file_score
+            .cmp(&a.file_score)
+            .then_with(|| a.display_path.cmp(&b.display_path))
+    });
+
+    let output = format_content_results(
+        &file_hits,
+        total_matches,
+        options.max_results,
+        options.context_lines,
+    );
+    Ok(truncate_output(&output, MAX_OUTPUT_CHARS))
+}
+
+fn build_regex(query: &str, is_regex: bool, case_sensitive: bool) -> Result<Regex, String> {
+    if is_regex {
+        RegexBuilder::new(query)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .map_err(|e| format!("Invalid regex: {}", e))
+    } else {
+        let escaped = regex::escape(query);
+        RegexBuilder::new(&escaped)
+            .case_insensitive(!case_sensitive)
+            .build()
+            .map_err(|e| format!("Internal regex error: {}", e))
+    }
+}
+
+/// 展示用路径：能相对化就相对化，否则用完整路径。
+fn display_path_for(file_path: &Path, display_root: Option<&Path>) -> String {
+    if let Some(root) = display_root {
+        if let Ok(rel) = file_path.strip_prefix(root) {
+            return rel.to_string_lossy().to_string();
+        }
+    }
+    file_path.to_string_lossy().to_string()
+}
+
+/// 当查询命中文件名/路径时给文件整体加权（文件名命中 +3，目录路径命中 +1）。
+fn path_match_bonus(display_path: &str, options: &ContentSearchOptions<'_>) -> i64 {
+    if options.is_regex {
+        return 0;
+    }
+    let needle = options.query;
+    let (hay, needle) = if options.case_sensitive {
+        (display_path.to_string(), needle.to_string())
+    } else {
+        (display_path.to_lowercase(), needle.to_lowercase())
+    };
+    if needle.is_empty() || !hay.contains(&needle) {
+        return 0;
+    }
+    let file_name = Path::new(&hay)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    if file_name.contains(&needle) {
+        3
+    } else {
+        1
+    }
+}
+
+/// 对单个匹配行打分：whole-word 命中 +4；字面大小写完全一致 +2；
+/// 匹配越靠近行首越优先（最多 +2）。
+fn score_line(line: &str, options: &ContentSearchOptions<'_>, regex: &Regex) -> i64 {
+    let mut score = 1; // 基础命中分
+    let Some(m) = regex.find(line) else {
+        return score;
+    };
+
+    let matched = &line[m.start()..m.end()];
+
+    // 全词命中加权。
+    let left_ok = m.start() == 0
+        || !is_identifier_byte(line.as_bytes()[m.start().saturating_sub(1)]);
+    let right_ok =
+        m.end() >= line.len() || !is_identifier_byte(line.as_bytes()[m.end()]);
+    if left_ok && right_ok {
+        score += 4;
+    }
+
+    // 字面（非正则）时，匹配片段与 query 大小写完全一致再加权。
+    if !options.is_regex && matched == options.query {
+        score += 2;
+    }
+
+    // 就近：匹配越靠前越好。
+    let lead = line[..m.start()].chars().filter(|c| !c.is_whitespace()).count();
+    score += match lead {
+        0 => 2,
+        1..=8 => 1,
+        _ => 0,
+    };
+
+    score
+}
+
+fn is_identifier_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn format_content_results(
+    file_hits: &[FileHits],
+    total_matches: usize,
+    max_results: usize,
+    context_lines: usize,
+) -> String {
+    let mut out = String::new();
+    let file_count = file_hits.len();
+
+    out.push_str(&format!(
+        "{} match(es) in {} file(s)",
+        total_matches, file_count
+    ));
+    if total_matches >= max_results {
+        out.push_str(" (limit reached, more matches may exist)");
+    }
+    out.push('\n');
+
+    for hit in file_hits {
+        out.push('\n');
+        out.push_str(&hit.display_path);
+        out.push('\n');
+
+        // snippet 行按行号升序渲染（相关性已用于截断与文件排序）。
+        let mut match_indices: Vec<usize> = hit.scored.iter().map(|s| s.line_index).collect();
+        match_indices.sort_unstable();
+
+        let ranges = merge_context_ranges(&match_indices, context_lines, hit.lines.len());
+        for range in &ranges {
+            if range.start > 0 {
+                out.push_str("...\n");
+            }
+            for idx in range.start..range.end {
+                let line_num = idx + 1;
+                let is_match = match_indices.binary_search(&idx).is_ok();
+                let prefix = if is_match { ">" } else { " " };
+                let empty = String::new();
+                let line_content = hit.lines.get(idx).unwrap_or(&empty);
+                out.push_str(&format!("{}{:>5}| {}\n", prefix, line_num, line_content));
+            }
+        }
+    }
+
+    out
+}
+
+struct LineRange {
+    start: usize,
+    end: usize,
+}
+
+fn merge_context_ranges(
+    match_indices: &[usize],
+    context: usize,
+    total_lines: usize,
+) -> Vec<LineRange> {
+    if match_indices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges: Vec<LineRange> = Vec::new();
+    for &line_index in match_indices {
+        let start = line_index.saturating_sub(context);
+        let end = (line_index + context + 1).min(total_lines);
+
+        if let Some(last) = ranges.last_mut() {
+            if start <= last.end {
+                last.end = last.end.max(end);
+                continue;
+            }
+        }
+        ranges.push(LineRange { start, end });
+    }
+
+    ranges
+}
+
+// ----------------------------------------------------------------------------
+// 文件收集 + glob 匹配
+// ----------------------------------------------------------------------------
+
+fn build_glob_matcher(pattern: &str) -> GlobMatcher {
+    let mut patterns = Vec::new();
+    // 先按"顶层逗号"（不在 `{}` 内的逗号）拆成多个 glob，再各自做 brace 展开，
+    // 否则 `*.{ts,tsx}` 会被 brace 内的逗号错误拆开。
+    for part in split_top_level_commas(pattern) {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // brace 展开：`*.{ts,tsx}` → `*.ts`, `*.tsx`
+        for expanded in expand_braces(trimmed) {
+            patterns.push(expanded);
+        }
+    }
+    GlobMatcher { patterns }
+}
+
+/// 按不在 `{}` 内的逗号拆分，使 `a,*.{ts,tsx}` → [`a`, `*.{ts,tsx}`]。
+fn split_top_level_commas(pattern: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0i32;
+    for ch in pattern.chars() {
+        match ch {
+            '{' => {
+                depth += 1;
+                current.push(ch);
+            }
+            '}' => {
+                depth -= 1;
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                parts.push(std::mem::take(&mut current));
+            }
+            _ => current.push(ch),
+        }
+    }
+    parts.push(current);
+    parts
+}
+
+/// 展开单层 `{a,b,c}` brace（仅支持一处 brace，足够覆盖 `*.{ts,tsx}` 这类）。
+fn expand_braces(pattern: &str) -> Vec<String> {
+    let (Some(open), Some(close)) = (pattern.find('{'), pattern.find('}')) else {
+        return vec![pattern.to_string()];
+    };
+    if close < open {
+        return vec![pattern.to_string()];
+    }
+    let prefix = &pattern[..open];
+    let suffix = &pattern[close + 1..];
+    let inner = &pattern[open + 1..close];
+    inner
+        .split(',')
+        .map(|alt| format!("{}{}{}", prefix, alt.trim(), suffix))
+        .collect()
+}
+
+struct GlobMatcher {
+    patterns: Vec<String>,
+}
+
+impl GlobMatcher {
+    fn matches(&self, file_name: &str) -> bool {
+        if self.patterns.is_empty() {
+            return true;
+        }
+        self.patterns
+            .iter()
+            .any(|pat| glob_match_simple(pat, file_name))
+    }
+}
+
+fn glob_match_simple(pattern: &str, name: &str) -> bool {
+    let pat = pattern.trim_start_matches("**/");
+    if pat.starts_with("*.") {
+        let ext = &pat[1..];
+        return name.ends_with(ext);
+    }
+    if pat.contains('*') || pat.contains('?') {
+        let parts: Vec<&str> = pat.split('*').collect();
+        if parts.len() == 2 {
+            return name.starts_with(parts[0]) && name.ends_with(parts[1]);
+        }
+    }
+    name == pat || name.ends_with(pat)
+}
+
+/// BFS 递归收集候选文件，跳过隐藏目录与依赖/构建目录。
+/// - `glob_matcher`：文件名 glob 过滤（None=不过滤）。
+/// - `extensions`：扩展名白名单（None=不按扩展名过滤）。
+fn collect_content_files(
+    root: &Path,
+    glob_matcher: Option<&GlobMatcher>,
+    extensions: Option<&[&str]>,
+) -> Result<Vec<PathBuf>, String> {
+    if root.is_file() {
+        return Ok(vec![root.to_path_buf()]);
+    }
+
+    let mut files = Vec::new();
+    let mut queue: VecDeque<PathBuf> = VecDeque::new();
+    queue.push_back(root.to_path_buf());
+
+    while let Some(dir) = queue.pop_front() {
+        if files.len() >= MAX_WALK_FILES {
+            break;
+        }
+
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+
+            if path.is_dir() {
+                if rust_tools::commonw::is_skip_dir(name_str.as_ref())
+                    || name_str.starts_with('.')
+                {
+                    continue;
+                }
+                queue.push_back(path);
+            } else if path.is_file() {
+                if name_str.starts_with('.') {
+                    continue;
+                }
+                if let Some(exts) = extensions {
+                    let ext_ok = path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|ext| exts.contains(&ext))
+                        .unwrap_or(false);
+                    if !ext_ok {
+                        continue;
+                    }
+                }
+                if let Some(matcher) = glob_matcher {
+                    if !matcher.matches(&name_str) {
+                        continue;
+                    }
+                }
+                files.push(path);
+            }
+        }
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+fn truncate_output(s: &str, max_chars: usize) -> String {
+    if s.len() <= max_chars {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(max_chars + 32);
+    for (i, ch) in s.chars().enumerate() {
+        if i >= max_chars {
+            break;
+        }
+        out.push(ch);
+    }
+    out.push_str("\n... (output truncated)");
+    out
+}
+
+// ============================================================================
+// text_grep 工具注册与入口
+// ============================================================================
+
 fn params_text_grep() -> Value {
     serde_json::json!({
         "type": "object",
@@ -119,7 +599,7 @@ fn params_text_grep() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "text_grep",
-        description: "Search file contents for a pattern (literal or regex) under a directory. Returns matching lines with file path, line number, and configurable context. Respects .gitignore-style skip directories. Use this when you need to find where specific text or patterns appear in source code.",
+        description: "Search file contents for a pattern (literal or regex) under a directory. Returns matching lines grouped by file with line numbers and configurable context, ranked by relevance (whole-word and filename/path hits first). Respects .gitignore-style skip directories. Use this when you need to find where specific text or patterns appear in source code.",
         parameters: params_text_grep,
         execute: execute_text_grep,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
@@ -158,272 +638,19 @@ pub(crate) fn execute_text_grep(args: &Value) -> Result<String, String> {
 
     validate_search_root(&root, &cwd)?;
 
-    let regex = if is_regex {
-        RegexBuilder::new(pattern)
-            .case_insensitive(!case_sensitive)
-            .build()
-            .map_err(|e| format!("Invalid regex: {}", e))?
-    } else {
-        let escaped = regex::escape(pattern);
-        RegexBuilder::new(&escaped)
-            .case_insensitive(!case_sensitive)
-            .build()
-            .map_err(|e| format!("Internal regex error: {}", e))?
+    let options = ContentSearchOptions {
+        query: pattern,
+        is_regex,
+        case_sensitive,
+        context_lines,
+        max_results,
+        file_pattern,
+        // text_grep 不按扩展名过滤——只受可选的 file_pattern 约束。
+        extensions: None,
+        display_root: Some(&cwd),
     };
 
-    let glob_matcher = file_pattern.map(|pat| build_glob_matcher(pat));
-
-    let files = collect_files(&root, &glob_matcher)?;
-
-    let mut results: Vec<MatchResult> = Vec::new();
-    let mut total_matches = 0usize;
-
-    for file_path in &files {
-        if total_matches >= max_results {
-            break;
-        }
-
-        let metadata = match fs::metadata(file_path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if metadata.len() > MAX_FILE_SIZE {
-            continue;
-        }
-
-        let content = match fs::read_to_string(file_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
-        let mut file_matches: Vec<LineMatch> = Vec::new();
-
-        for (idx, line) in lines.iter().enumerate() {
-            if total_matches >= max_results {
-                break;
-            }
-            if regex.is_match(line) {
-                file_matches.push(LineMatch {
-                    line_number: idx + 1,
-                    line_index: idx,
-                });
-                total_matches += 1;
-            }
-        }
-
-        if !file_matches.is_empty() {
-            let display_path = file_path
-                .strip_prefix(&cwd)
-                .unwrap_or(file_path)
-                .to_string_lossy()
-                .to_string();
-
-            results.push(MatchResult {
-                file: display_path,
-                matches: file_matches,
-                lines,
-                context_lines,
-            });
-        }
-    }
-
-    if results.is_empty() {
-        return Ok("No matches found.".to_string());
-    }
-
-    let output = format_results(&results, total_matches, max_results);
-    Ok(truncate_output(&output, MAX_OUTPUT_CHARS))
-}
-
-struct MatchResult {
-    file: String,
-    matches: Vec<LineMatch>,
-    lines: Vec<String>,
-    context_lines: usize,
-}
-
-struct LineMatch {
-    line_number: usize,
-    line_index: usize,
-}
-
-fn format_results(results: &[MatchResult], total_matches: usize, max_results: usize) -> String {
-    let mut out = String::new();
-    let file_count = results.len();
-
-    out.push_str(&format!(
-        "{} match(es) in {} file(s)",
-        total_matches, file_count
-    ));
-    if total_matches >= max_results {
-        out.push_str(" (limit reached, more matches may exist)");
-    }
-    out.push('\n');
-
-    for result in results {
-        out.push('\n');
-        out.push_str(&result.file);
-        out.push('\n');
-
-        let ranges =
-            merge_context_ranges(&result.matches, result.context_lines, result.lines.len());
-
-        for range in &ranges {
-            if range.start > 0 {
-                out.push_str("...\n");
-            }
-            for idx in range.start..range.end {
-                let line_num = idx + 1;
-                let is_match = result.matches.iter().any(|m| m.line_index == idx);
-                let prefix = if is_match { ">" } else { " " };
-                let empty = String::new();
-                let line_content = result.lines.get(idx).unwrap_or(&empty);
-                out.push_str(&format!("{}{:>5}| {}\n", prefix, line_num, line_content));
-            }
-        }
-    }
-
-    out
-}
-
-struct LineRange {
-    start: usize,
-    end: usize,
-}
-
-fn merge_context_ranges(
-    matches: &[LineMatch],
-    context: usize,
-    total_lines: usize,
-) -> Vec<LineRange> {
-    if matches.is_empty() {
-        return Vec::new();
-    }
-
-    let mut ranges: Vec<LineRange> = Vec::new();
-
-    for m in matches {
-        let start = m.line_index.saturating_sub(context);
-        let end = (m.line_index + context + 1).min(total_lines);
-
-        if let Some(last) = ranges.last_mut() {
-            if start <= last.end {
-                last.end = last.end.max(end);
-                continue;
-            }
-        }
-        ranges.push(LineRange { start, end });
-    }
-
-    ranges
-}
-
-fn build_glob_matcher(pattern: &str) -> GlobMatcher {
-    GlobMatcher {
-        patterns: pattern
-            .split(',')
-            .map(|p| p.trim().to_string())
-            .filter(|p| !p.is_empty())
-            .collect(),
-    }
-}
-
-struct GlobMatcher {
-    patterns: Vec<String>,
-}
-
-impl GlobMatcher {
-    fn matches(&self, file_name: &str) -> bool {
-        if self.patterns.is_empty() {
-            return true;
-        }
-        for pat in &self.patterns {
-            if glob_match_simple(pat, file_name) {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-fn glob_match_simple(pattern: &str, name: &str) -> bool {
-    let pat = pattern.trim_start_matches("**/");
-    if pat.starts_with("*.") {
-        let ext = &pat[1..];
-        return name.ends_with(ext);
-    }
-    if pat.contains('*') || pat.contains('?') {
-        let parts: Vec<&str> = pat.split('*').collect();
-        if parts.len() == 2 {
-            return name.starts_with(parts[0]) && name.ends_with(parts[1]);
-        }
-    }
-    name == pat || name.ends_with(pat)
-}
-
-fn collect_files(root: &Path, glob_matcher: &Option<GlobMatcher>) -> Result<Vec<PathBuf>, String> {
-    if root.is_file() {
-        return Ok(vec![root.to_path_buf()]);
-    }
-
-    let mut files = Vec::new();
-    let mut queue: VecDeque<PathBuf> = VecDeque::new();
-    queue.push_back(root.to_path_buf());
-
-    let max_files = 10_000usize;
-
-    while let Some(dir) = queue.pop_front() {
-        if files.len() >= max_files {
-            break;
-        }
-
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            if path.is_dir() {
-                if SKIP_DIRS.contains(&name_str.as_ref()) || name_str.starts_with('.') {
-                    continue;
-                }
-                queue.push_back(path);
-            } else if path.is_file() {
-                if name_str.starts_with('.') {
-                    continue;
-                }
-                if let Some(matcher) = glob_matcher {
-                    if !matcher.matches(&name_str) {
-                        continue;
-                    }
-                }
-                files.push(path);
-            }
-        }
-    }
-
-    files.sort();
-    Ok(files)
-}
-
-fn truncate_output(s: &str, max_chars: usize) -> String {
-    if s.len() <= max_chars {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(max_chars + 32);
-    for (i, ch) in s.chars().enumerate() {
-        if i >= max_chars {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push_str("\n... (output truncated)");
-    out
+    run_content_search(&root, &options)
 }
 
 #[cfg(test)]
@@ -510,6 +737,43 @@ mod tests {
     }
 
     #[test]
+    fn test_text_grep_brace_glob_expands() {
+        let dir = make_temp_dir("brace");
+        fs::write(dir.join("a.ts"), "const found = 1;\n").unwrap();
+        fs::write(dir.join("b.tsx"), "const found = 2;\n").unwrap();
+        fs::write(dir.join("c.js"), "const found = 3;\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "found",
+            "path": dir.to_string_lossy().to_string(),
+            "file_pattern": "*.{ts,tsx}"
+        });
+        let output = execute_text_grep(&args).unwrap();
+        assert!(output.contains("a.ts"), "{}", output);
+        assert!(output.contains("b.tsx"), "{}", output);
+        assert!(!output.contains("c.js"), "{}", output);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_text_grep_recurses_subdirectories() {
+        let dir = make_temp_dir("recurse");
+        fs::create_dir_all(dir.join("nested/deep")).unwrap();
+        fs::write(dir.join("nested/deep/inner.rs"), "fn needle() {}\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "needle",
+            "path": dir.to_string_lossy().to_string(),
+            "file_pattern": "*.rs"
+        });
+        let output = execute_text_grep(&args).unwrap();
+        assert!(output.contains("inner.rs"), "should recurse: {}", output);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn test_text_grep_case_insensitive() {
         let dir = make_temp_dir("case");
         fs::write(
@@ -545,6 +809,62 @@ mod tests {
         assert_eq!(result.unwrap(), "No matches found.");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_content_search_ranks_whole_word_first() {
+        let dir = make_temp_dir("rank_word");
+        // substring 命中
+        fs::write(dir.join("a_sub.rs"), "let foobar = 1;\n").unwrap();
+        // whole-word 命中——应排在前面
+        fs::write(dir.join("z_word.rs"), "let foo = 2;\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "foo",
+            "path": dir.to_string_lossy().to_string(),
+            "file_pattern": "*.rs"
+        });
+        let output = execute_text_grep(&args).unwrap();
+        let word_pos = output.find("z_word.rs").expect("word file present");
+        let sub_pos = output.find("a_sub.rs").expect("sub file present");
+        assert!(
+            word_pos < sub_pos,
+            "whole-word file should rank before substring file:\n{}",
+            output
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_content_search_ranks_filename_hit_first() {
+        let dir = make_temp_dir("rank_name");
+        fs::write(dir.join("unrelated.rs"), "// router used here\n").unwrap();
+        fs::write(dir.join("router.rs"), "// some other content\nlet router = 1;\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "router",
+            "path": dir.to_string_lossy().to_string(),
+            "file_pattern": "*.rs"
+        });
+        let output = execute_text_grep(&args).unwrap();
+        let name_pos = output.find("router.rs").expect("router.rs present");
+        let other_pos = output.find("unrelated.rs").expect("unrelated.rs present");
+        assert!(
+            name_pos < other_pos,
+            "filename hit should rank first:\n{}",
+            output
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_expand_braces_basic() {
+        let mut out = expand_braces("*.{ts,tsx}");
+        out.sort();
+        assert_eq!(out, vec!["*.ts".to_string(), "*.tsx".to_string()]);
+        assert_eq!(expand_braces("*.rs"), vec!["*.rs".to_string()]);
     }
 
     #[test]

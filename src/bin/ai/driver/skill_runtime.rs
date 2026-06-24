@@ -466,7 +466,7 @@ fn is_general_knowledge_suppressed_tool(name: &str) -> bool {
             | "read_file_lines"
             | "list_directory"
             | "search_files"
-            | "grep_search"
+            | "find_path"
             | "text_grep"
             | "code_search"
             | "lsp"

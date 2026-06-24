@@ -345,7 +345,7 @@ mod tests {
         assert!(content.chars().count() > MAX_TOOL_RESULT_LINE_TRIM_CHARS);
         assert!(content.chars().count() < MAX_TOOL_RESULT_INLINE_CHARS);
 
-        for tool_name in ["grep_search", "code_search", "search_files"] {
+        for tool_name in ["find_path", "code_search", "search_files"] {
             let prepared = prepare_tool_result(&app, tool_name, &content);
             assert_eq!(prepared.content_for_model, content);
             assert!(!prepared.content_for_model.contains("middle trimmed"));
@@ -374,7 +374,7 @@ mod tests {
             .collect::<String>();
         assert!(content.chars().count() > MAX_TOOL_RESULT_INLINE_CHARS);
 
-        let prepared = prepare_tool_result(&app, "grep_search", &content);
+        let prepared = prepare_tool_result(&app, "find_path", &content);
 
         assert!(
             prepared

@@ -443,7 +443,7 @@ fn build_code_inspection_working_memory(turn_messages: &[Message]) -> Option<Str
         );
     } else if raw_repo_tool_count >= 2 && code_search_count <= 1 {
         note.push_str(
-            "Code-navigation correction: too many raw reads/searches. Prefer one `code_search` hop plus one targeted local read instead of another `read_file_lines` or `grep_search`.\n",
+            "Code-navigation correction: too many raw reads/searches. Prefer one `code_search` hop plus one targeted local read instead of another `read_file_lines` or `find_path`.\n",
         );
     }
     Some(truncate_note(&note, 1800))
@@ -560,7 +560,7 @@ fn is_repo_inspection_tool(tool_name: &str) -> bool {
             | "read_file"
             | "read_file_lines"
             | "search_files"
-            | "grep_search"
+            | "find_path"
             | "list_directory"
             | "apply_patch"
             | "write_file"
@@ -570,7 +570,7 @@ fn is_repo_inspection_tool(tool_name: &str) -> bool {
 fn is_raw_repo_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
-        "read_file" | "read_file_lines" | "search_files" | "grep_search" | "list_directory"
+        "read_file" | "read_file_lines" | "search_files" | "find_path" | "list_directory"
     )
 }
 
@@ -633,7 +633,7 @@ fn describe_tool_call(tool_call: &ToolCall) -> String {
                 format!("(file={path})")
             }
         }
-        "grep_search" | "search_files" => {
+        "find_path" | "search_files" => {
             let query = args
                 .get("query")
                 .or_else(|| args.get("pattern"))
@@ -813,7 +813,7 @@ mod tests {
                     ),
                     tool_call(
                         "2",
-                        "grep_search",
+                        "find_path",
                         serde_json::json!({"pattern":"panic!","path":"src"}),
                     ),
                     tool_call(
@@ -857,7 +857,7 @@ mod tests {
         assert!(note.contains("read_file("));
         assert!(note.contains("\"file_path\":\"src/main.rs\""));
         assert!(note.contains("read_file_lines(file=src/lib.rs, lines=10..29)"));
-        assert!(note.contains("grep_search(query=panic!)"));
+        assert!(note.contains("find_path(query=panic!)"));
         assert!(note.contains("Code-navigation correction"));
         assert!(
             note.contains("use `code_search` first")
@@ -882,7 +882,7 @@ mod tests {
             Message {
                 role: "tool".to_string(),
                 content: Value::String(
-                    "code_search route=grep_search operation=text_search\nsrc/lib.rs:10: fn load_config() {"
+                    "code_search route=content operation=text_search\nsrc/lib.rs:10: fn load_config() {"
                         .to_string(),
                 ),
                 tool_calls: None,

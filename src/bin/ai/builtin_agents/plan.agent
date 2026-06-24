@@ -8,7 +8,7 @@ model_tier: standard
 tools:
   - read_file
   - read_file_lines
-  - grep_search
+  - find_path
   - search_files
   - list_directory
   - code_search
@@ -40,7 +40,7 @@ Critical restrictions:
 - DO NOT execute shell commands that change state
 - DO NOT use write_file, edit, apply_patch, or any file modification tools
 - DO NOT run commands like git commit, npm install, cargo build, etc.
-- You may ONLY use read-only code-navigation tools such as read_file, read_file_lines, grep_search, search_files, list_directory, and code_search
+- You may ONLY use read-only code-navigation tools such as read_file, read_file_lines, find_path, search_files, list_directory, and code_search
 
 When the user asks you to make changes:
 - Explain that you are in Plan mode and cannot make changes

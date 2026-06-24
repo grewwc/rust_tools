@@ -145,10 +145,10 @@ cargo run --bin a -- --list-mcp-tools
 - 当前实现只接了“云文档搜索”接口，返回的是文档列表（title/type/token/owner_id）。
 - 如果你想进一步“读取文档内容并做全文检索”，已支持 doc/docx 纯文本抓取与导出：
   - `mcp_feishu_docs_get_text`：给定 docs_token + docs_type（doc/docx）直接返回纯文本
-  - `mcp_feishu_docs_export_text`：导出为本地 txt 文件（默认到 `~/.config/rust_tools/feishu_docs_text/`），便于用 `grep_search` 做全文检索
+  - `mcp_feishu_docs_export_text`：导出为本地 txt 文件（默认到 `~/.config/rust_tools/feishu_docs_text/`），便于用 `code_search`（operation=text_search）做全文检索
 
 示例流程：
 
 1) 先搜索拿到 `docs_token`（比如 `dox...` / `doc...`）与 `docs_type`
 2) 导出文本：调用 `mcp_feishu_docs_export_text`
-3) 全文检索：调用内置工具 `grep_search` 在导出目录里搜关键字
+3) 全文检索：调用内置工具 `code_search`（operation=text_search）在导出目录里搜关键字

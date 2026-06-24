@@ -2227,7 +2227,7 @@ fn is_cacheable_tool_name(name: &str) -> bool {
     if mutating.iter().any(|needle| lower.contains(needle)) {
         return false;
     }
-    let reusable = ["search", "read", "get", "list", "view", "fetch", "export"];
+    let reusable = ["search", "find", "read", "get", "list", "view", "fetch", "export"];
     reusable.iter().any(|needle| lower.contains(needle))
 }
 
@@ -2355,7 +2355,7 @@ mod tests {
         let mcp = McpClient::new();
         let calls = vec![
             tool_call("read_file"),
-            tool_call("grep_search"),
+            tool_call("find_path"),
             tool_call("get_symbol_info"),
         ];
         assert!(is_parallel_safe_tool_call(&mcp, &calls[0]));
@@ -2435,7 +2435,7 @@ mod tests {
     #[test]
     fn cacheable_tool_name_prefers_read_only_tools() {
         assert!(is_cacheable_tool_name("read_file"));
-        assert!(is_cacheable_tool_name("grep_search"));
+        assert!(is_cacheable_tool_name("find_path"));
         assert!(!is_cacheable_tool_name("create_file"));
         assert!(!is_cacheable_tool_name("execute_command"));
     }

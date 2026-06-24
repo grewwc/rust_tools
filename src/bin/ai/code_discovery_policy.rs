@@ -434,7 +434,7 @@ fn default_policy() -> CodeDiscoveryPolicy {
     CodeDiscoveryPolicy {
         classification_rules: vec![
             rule(
-                &["read_file", "read_file_lines", "code_search", "grep_search"],
+                &["read_file", "read_file_lines", "code_search", "find_path"],
                 &["root cause", "caused by", "because ", "due to "],
                 &[],
                 &[],
@@ -464,7 +464,7 @@ fn default_policy() -> CodeDiscoveryPolicy {
                 CodeDiscoveryConfidence::High,
             ),
             rule(
-                &["read_file", "read_file_lines", "code_search", "grep_search"],
+                &["read_file", "read_file_lines", "code_search", "find_path"],
                 &["panic", "error", "failed", "missing"],
                 &[],
                 &[],
@@ -488,7 +488,7 @@ fn default_policy() -> CodeDiscoveryPolicy {
                 CodeDiscoveryConfidence::Medium,
             ),
             rule(
-                &["read_file", "read_file_lines", "code_search", "grep_search"],
+                &["read_file", "read_file_lines", "code_search", "find_path"],
                 &["config", "feature flag", ".toml"],
                 &[],
                 &[],
@@ -504,7 +504,7 @@ fn default_policy() -> CodeDiscoveryPolicy {
                 CodeDiscoveryConfidence::Medium,
             ),
             rule(
-                &["read_file", "read_file_lines", "grep_search"],
+                &["read_file", "read_file_lines", "find_path"],
                 &[".rs:"],
                 &[],
                 &[],

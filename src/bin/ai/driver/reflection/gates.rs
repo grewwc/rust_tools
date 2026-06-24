@@ -195,7 +195,7 @@ pub(super) fn turn_uses_repo_inspection_tools(messages: &Vec<Message>) -> bool {
         "read_file_lines",
         "list_directory",
         "search_files",
-        "grep_search",
+        "find_path",
         "execute_command",
     ];
     messages.iter().any(|message| {

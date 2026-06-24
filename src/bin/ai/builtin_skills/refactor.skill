@@ -8,7 +8,7 @@ tools:
   - write_file
   - read_file_lines
   - apply_patch
-  - grep_search
+  - find_path
   - search_files
   - list_directory
   - execute_command
@@ -34,7 +34,7 @@ system_prompt: |
 ## 🧰 工具使用约定
 
 - **读取代码**：先定位影响面；已知文件但还需要较宽上下文时用 `read_file`，只有在已定位到具体区域后再用 `read_file_lines` 做精确读取。
-- **查找影响面**：用 `search_files` 找文件，用 `grep_search` 搜路径/模式；需要对比改动时优先 `git_diff`。
+- **查找影响面**：用 `find_path` / `search_files` 按文件名定位文件，用 `code_search`（operation=text_search）搜内容/引用；需要对比改动时优先 `git_diff`。
 - **修改方式**：优先 `apply_patch` 输出最小 diff；仅在需要整体重写或创建新文件时再用 `write_file`。
 - **状态检查**：改动前用 `git_status` 确认工作区干净；改动后用 `git_diff` 确认变更范围。
 - **验证策略**：

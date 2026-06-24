@@ -1,25 +1,21 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
-use regex::RegexBuilder;
 use serde_json::Value;
 
 use crate::ai::tools::ast_structural::execute_structural_search;
 use crate::ai::tools::common::{ToolRegistration, ToolSpec};
 use crate::ai::tools::lsp_tools::execute_lsp;
 use crate::ai::tools::search_tools::execute_search_files;
+use crate::ai::tools::text_grep_tools::{ContentSearchOptions, run_content_search};
 
 const CODE_EXTENSIONS: &[&str] = &[
     "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "c", "h", "cpp", "cc", "cxx", "hpp", "rb",
     "php", "cs",
 ];
 
-const EXTRA_TEXT_EXTENSIONS: &[&str] = &["json", "yaml", "yml", "toml", "md", "txt", "sql", "sh"];
-
 const SKIP_DIRS: &[&str] = rust_tools::commonw::SKIP_DIRS;
-const MAX_TEXT_SEARCH_FILE_SIZE: u64 = 2 * 1024 * 1024;
 const MAX_WALK_FILES: usize = 10_000;
 
 fn params_code_search() -> Value {
@@ -422,132 +418,29 @@ fn execute_content_text_search(
         return Err("text_search query is empty".to_string());
     }
 
-    let pattern = if is_regex {
-        query.to_string()
-    } else {
-        regex::escape(query)
+    let cwd = crate::ai::driver::runtime_ctx::effective_cwd()
+        .map_err(|e| format!("Failed to get cwd: {}", e))?;
+
+    let options = ContentSearchOptions {
+        query,
+        is_regex,
+        case_sensitive,
+        context_lines: 2,
+        max_results: 200,
+        file_pattern,
+        // code_search 追求"最强代码搜索"：不按扩展名白名单过滤，覆盖面与
+        // text_grep 一致；调用方仍可用可选的 file_pattern 收窄范围。
+        extensions: None,
+        display_root: Some(&cwd),
     };
-    let re = RegexBuilder::new(&pattern)
-        .case_insensitive(!case_sensitive)
-        .build()
-        .map_err(|e| format!("Invalid regex pattern: {}", e))?;
 
-    let files = collect_text_search_files(target, file_pattern)?;
-
-    // Parallel text search across files
-    let max_threads = rust_tools::commonw::half_parallelism();
-    let chunk_size = (files.len() / max_threads).max(1);
-    let chunks: Vec<Vec<PathBuf>> = files.chunks(chunk_size).map(|c| c.to_vec()).collect();
-
-    let all_matches: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let found_enough: Arc<std::sync::atomic::AtomicBool> =
-        Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-    std::thread::scope(|scope| {
-        for chunk in chunks {
-            let re_ref = &re;
-            let matches_ref = Arc::clone(&all_matches);
-            let done_ref = Arc::clone(&found_enough);
-            scope.spawn(move || {
-                let mut local_matches = Vec::new();
-                for file in chunk {
-                    if done_ref.load(std::sync::atomic::Ordering::Relaxed) {
-                        break;
-                    }
-                    let Ok(metadata) = fs::metadata(&file) else {
-                        continue;
-                    };
-                    if metadata.len() > MAX_TEXT_SEARCH_FILE_SIZE {
-                        continue;
-                    }
-                    let Ok(content) = fs::read_to_string(&file) else {
-                        continue;
-                    };
-                    for (idx, line) in content.lines().enumerate() {
-                        if !re_ref.is_match(line) {
-                            continue;
-                        }
-                        local_matches.push(format!("{}:{}: {}", file.display(), idx + 1, line));
-                        if local_matches.len() >= 200 {
-                            break;
-                        }
-                    }
-                    if local_matches.len() >= 200 {
-                        done_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                        break;
-                    }
-                }
-                if !local_matches.is_empty() {
-                    let mut guard = matches_ref.lock().unwrap();
-                    guard.extend(local_matches);
-                }
-            });
-        }
-    });
-
-    let mut matches = all_matches.lock().unwrap().clone();
-    let limit_reached = matches.len() >= 200;
-    matches.truncate(200);
-
-    let mut body = matches.join("\n");
-    if limit_reached {
-        body.push_str(
-            "\n... (match limit reached: showing first 200 matches, more may exist; narrow the query or scope to a subdirectory)",
-        );
+    let result = run_content_search(target, &options)?;
+    // 共享引擎无命中时返回 "No matches found."；这里归一成空串，
+    // 让上层 `execute_code_text_search` 沿用 is_empty 判定挂 summary/guidance。
+    if result == "No matches found." {
+        return Ok(String::new());
     }
-    Ok(truncate_chars(&body, 16_000))
-}
-
-fn collect_text_search_files(
-    target: &Path,
-    file_pattern: Option<&str>,
-) -> Result<Vec<PathBuf>, String> {
-    if target.is_file() {
-        return Ok(vec![target.to_path_buf()]);
-    }
-    if !target.is_dir() {
-        return Err(format!(
-            "text_search target is neither file nor directory: {}",
-            target.display()
-        ));
-    }
-
-    if let Some(pattern) = file_pattern.filter(|value| !value.trim().is_empty()) {
-        let matches = crate::terminalw::glob_paths(pattern, &target.to_string_lossy())
-            .map_err(|e| format!("file_pattern glob failed: {}", e))?;
-        let files = matches
-            .into_iter()
-            .map(PathBuf::from)
-            .filter(|path| path.is_file() && !path_contains_skipped_dir(path))
-            .take(MAX_WALK_FILES)
-            .collect::<Vec<_>>();
-        return Ok(files);
-    }
-
-    Ok(walk_files(target, is_text_search_file))
-}
-
-fn is_text_search_file(path: &Path) -> bool {
-    let ext = match path.extension().and_then(|s| s.to_str()) {
-        Some(e) => e,
-        None => return false,
-    };
-    CODE_EXTENSIONS.contains(&ext) || EXTRA_TEXT_EXTENSIONS.contains(&ext)
-}
-
-fn truncate_chars(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(max_chars + 32);
-    for (i, ch) in s.chars().enumerate() {
-        if i >= max_chars {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push_str("\n... (truncated)");
-    out
+    Ok(result)
 }
 
 fn execute_code_workspace_symbol(args: &Value) -> Result<String, String> {
@@ -775,14 +668,6 @@ fn should_skip_dir(dir_name: &str) -> bool {
     dir_name.starts_with('.') || SKIP_DIRS.contains(&dir_name)
 }
 
-fn path_contains_skipped_dir(path: &Path) -> bool {
-    use std::path::Component;
-    path.components().any(|component| match component {
-        Component::Normal(name) => name.to_str().map(should_skip_dir).unwrap_or(false),
-        _ => false,
-    })
-}
-
 fn walk_files(root: &Path, predicate: fn(&Path) -> bool) -> Vec<PathBuf> {
     if !root.exists() || !root.is_dir() {
         return Vec::new();
@@ -892,7 +777,8 @@ mod tests {
         let result = execute_code_text_search(&args).unwrap();
 
         assert!(result.contains("route=content_search"));
-        assert!(result.contains("sample.rs:1: fn alpha() {}"));
+        assert!(result.contains("sample.rs"));
+        assert!(result.contains("fn alpha() {}"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -913,7 +799,8 @@ mod tests {
         });
         let result = execute_code_text_search(&args).unwrap();
 
-        assert!(result.contains("keep.rs:1: fn beta() {}"));
+        assert!(result.contains("keep.rs"));
+        assert!(result.contains("fn beta() {}"));
         assert!(!result.contains("skip.txt"));
 
         let _ = fs::remove_dir_all(&dir);
@@ -1001,7 +888,8 @@ mod tests {
 
         assert!(result.contains("summary: No workspace symbols matched 'alpha'"));
         assert!(result.contains("Fallback content search:"));
-        assert!(result.contains("sample.rs:1: fn alpha() {}"));
+        assert!(result.contains("sample.rs"));
+        assert!(result.contains("fn alpha() {}"));
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1039,7 +927,7 @@ mod tests {
         )
         .unwrap();
 
-        let files = walk_files(&dir, is_text_search_file);
+        let files = walk_files(&dir, is_code_file);
         let rendered = files
             .iter()
             .map(|path| path.to_string_lossy().to_string())
@@ -1062,37 +950,53 @@ mod tests {
     }
 
     #[test]
-    fn text_search_file_pattern_skips_hidden_and_dependency_dirs() {
-        let dir = make_temp_dir("glob_skip_dirs");
+    fn text_search_skips_hidden_and_dependency_dirs() {
+        let dir = make_temp_dir("content_skip_dirs");
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::create_dir_all(dir.join("target/debug")).unwrap();
         fs::create_dir_all(dir.join(".opencode/cache")).unwrap();
-        fs::write(dir.join("src/lib.rs"), "fn keep() {}\n").unwrap();
-        fs::write(dir.join("target/debug/generated.rs"), "fn generated() {}\n").unwrap();
+        fs::write(dir.join("src/lib.rs"), "fn keep_marker() {}\n").unwrap();
+        fs::write(
+            dir.join("target/debug/generated.rs"),
+            "fn keep_marker() {}\n",
+        )
+        .unwrap();
         fs::write(
             dir.join(".opencode/cache/generated.js"),
-            "function generated() {}\n",
+            "function keep_marker() {}\n",
         )
         .unwrap();
 
-        let files = collect_text_search_files(&dir, Some("**/*")).unwrap();
-        let rendered = files
-            .iter()
-            .map(|path| path.to_string_lossy().to_string())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let args = serde_json::json!({
+            "operation": "text_search",
+            "path": dir.to_string_lossy(),
+            "query": "keep_marker"
+        });
+        let result = execute_code_text_search(&args).unwrap();
 
-        assert!(rendered.contains("src/lib.rs"), "{}", rendered);
-        assert!(
-            !rendered.contains("target/debug/generated.rs"),
-            "{}",
-            rendered
-        );
-        assert!(
-            !rendered.contains(".opencode/cache/generated.js"),
-            "{}",
-            rendered
-        );
+        assert!(result.contains("src/lib.rs"), "{}", result);
+        assert!(!result.contains("target/debug"), "{}", result);
+        assert!(!result.contains(".opencode/cache"), "{}", result);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn text_search_covers_non_whitelisted_extensions() {
+        // 旧实现按 CODE_EXTENSIONS+EXTRA_TEXT 白名单过滤，覆盖面偏窄。
+        // 放开后，`.env`、`.cfg` 这类非白名单文件也应被内容搜索覆盖。
+        let dir = make_temp_dir("open_ext");
+        fs::write(dir.join("config.env"), "SECRET_TOKEN=marker_value\n").unwrap();
+
+        let args = serde_json::json!({
+            "operation": "text_search",
+            "path": dir.to_string_lossy(),
+            "query": "marker_value"
+        });
+        let result = execute_code_text_search(&args).unwrap();
+
+        assert!(result.contains("config.env"), "{}", result);
+        assert!(result.contains("marker_value"), "{}", result);
 
         let _ = fs::remove_dir_all(&dir);
     }

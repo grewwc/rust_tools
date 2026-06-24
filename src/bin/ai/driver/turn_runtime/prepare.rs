@@ -880,7 +880,7 @@ mod tests {
         let mut entries = (0..16)
             .map(|idx| {
                 memory_entry(
-                    format!("grep_search(query=todo-{idx}) => TODO item {idx}"),
+                    format!("find_path(query=todo-{idx}) => TODO item {idx}"),
                     "session:abc",
                     "todo",
                     "low",

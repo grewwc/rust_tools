@@ -8,7 +8,7 @@ model_tier: light
 tools:
   - read_file
   - read_file_lines
-  - grep_search
+  - find_path
   - search_files
   - list_directory
   - code_search
@@ -44,7 +44,7 @@ Core capabilities:
 Critical restrictions:
 - DO NOT modify, create, or delete any files
 - DO NOT execute any shell commands
-- Use only read-only tools: read_file, read_file_lines, grep_search, search_files, list_directory, code_search
+- Use only read-only tools: read_file, read_file_lines, find_path, search_files, list_directory, code_search
 
 When to use:
 - Quickly finding files by name or pattern
