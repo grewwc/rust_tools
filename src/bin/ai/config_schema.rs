@@ -18,6 +18,7 @@ impl AiConfig {
     pub const MODEL_OPENCODE_API_KEY: &str = "opencode.api_key";
     pub const MODEL_OPENROUTER_API_KEY: &str = "openrouter.api_key";
     pub const MODEL_COMPATIBLE_API_KEY: &str = "compatible.api_key";
+    pub const MODEL_ALIBABA_API_KEY: &str = "alibaba.api_key";
     pub const MODEL_ALIYUN_API_KEY: &str = "aliyun.api_key";
     pub const MODEL_OPENAI_API_KEY: &str = "openai.api_key";
     pub const MODEL_DEFAULT: &str = "ai.model.default";

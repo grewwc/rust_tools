@@ -87,19 +87,20 @@ cargo test --bin a test_xxx       # Filter tests by name
 5. **Configuration**
    - All config keys are defined as `AiConfig` constants in `config_schema.rs`. Never use raw string literals.
    - Runtime configuration is read through `configw::get_all_config()`.
-   - Model registry lives in `models.json` and tracks endpoints, quality tiers, and vision-language (VL) support.
+   - Model registry lives in `models.json` and tracks endpoints, providers, quality tiers, and vision-language (VL) support. The user-facing selector is always lowercase `name-provider` (for example `deepseek-v4-flash-alibaba` or `deepseek-v4-flash-opencode`); `name` is the provider-facing model id, so multiple providers may share the same `name`. `key` should match the selector, while `aliases` may preserve older keys for backward compatibility.
+   - Alibaba/DashScope models use provider `alibaba`; API key lookup prefers `alibaba.api_key`, then `aliyun.api_key`, then `compatible.api_key`, then the global `api_key`.
    - Automatic model selection: after a request failure, the runtime skips the unhealthy model for subsequent requests. You can also exclude known-unavailable or too-expensive model keys/names via `ai.model.disabled`, without editing `models.json`.
    - Embedding support (optional, off by default): set `ai.embedding.enable=true` and provide `aliyun.api_key` (or `ai.embedding.api_key`) to enable semantic recall via Aliyun 百炼's OpenAI-compatible `/embeddings` endpoint with `text-embedding-v4`. If embedding fails for any reason, the system gracefully degrades to BM25/lexical search — see [embedder.rs](src/bin/ai/knowledge/indexing/embedder.rs).
 
 6. **Provider adapter layer** (`src/bin/ai/provider/`)
-   - The `ApiProvider` enum (`Compatible`, `OpenAi`, `OpenCode`) and the types `ModelQualityTier`/`ReasoningEffort` are defined in `provider/mod.rs`.
+   - The `ApiProvider` enum (`Alibaba`, `Compatible`, `OpenAi`, `OpenCode`) and the types `ModelQualityTier`/`ReasoningEffort` are defined in `provider/mod.rs`.
    - `provider/adapter.rs` defines the `ProviderAdapter` trait using a template-method pattern with override hooks. It consolidates all per-provider differences into one place:
      - Request-body fields: `enable_thinking`, `enable_search`, `reasoning_effort`, nested `reasoning`.
      - Auxiliary task: disabling thinking for non-primary requests.
      - Default endpoint URL and API-key candidate chain.
      - Stream-chunk parsing logic.
      - The waiting-hint UX flag (indicates whether the provider shows a waiting hint in-stream).
-   - Zero-state static singletons: `CompatibleAdapter`, `OpenAiAdapter`, `OpenRouterAdapter`, `OpenCodeAdapter`. Dispatch is done via `adapter_for(provider, endpoint)` — OpenRouter is detected when the endpoint contains `openrouter.ai`.
+   - Zero-state static singletons: `AlibabaAdapter`, `CompatibleAdapter`, `OpenAiAdapter`, `OpenRouterAdapter`, `OpenCodeAdapter`. Dispatch is done via `adapter_for(provider, endpoint)` — OpenRouter is detected when the endpoint contains `openrouter.ai`.
    - The main pipeline (`request.rs`, `models.rs`, `stream/normalize.rs`, `stream/runtime.rs`, `driver/reflection/background.rs`) keeps free-function skeletons and only calls adapter hooks at the points where providers differ. The wire format stays byte-identical across providers (locked by per-provider `build_request_body` wire-guard tests).
 
 ## Coding Standards

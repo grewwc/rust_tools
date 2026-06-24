@@ -48,9 +48,11 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
 /// 获得结构化代码视图，而不必逐行 grep。不支持的语言或无符号时原样返回。
 fn append_symbol_outline(mut rendered: String, file_path: &str, content: &str) -> String {
     const MAX_OUTLINE_SYMBOLS: usize = 60;
-    if let Some(outline) =
-        crate::ai::tools::ast_symbols::document_symbol_outline(file_path, content, MAX_OUTLINE_SYMBOLS)
-    {
+    if let Some(outline) = crate::ai::tools::ast_symbols::document_symbol_outline(
+        file_path,
+        content,
+        MAX_OUTLINE_SYMBOLS,
+    ) {
         if !rendered.is_empty() {
             rendered.push_str("\n\n");
         }
@@ -61,7 +63,12 @@ fn append_symbol_outline(mut rendered: String, file_path: &str, content: &str) -
 
 /// 当本次读取没有覆盖到文件末尾时，追加一条明确提示，告知模型文件仍有
 /// 剩余行未显示以及如何继续读取。避免模型把"截断结果"误判为"完整文件"。
-fn append_truncation_notice(mut rendered: String, start: usize, end: usize, total: usize) -> String {
+fn append_truncation_notice(
+    mut rendered: String,
+    start: usize,
+    end: usize,
+    total: usize,
+) -> String {
     let remaining = total.saturating_sub(end);
     if remaining > 0 {
         if !rendered.is_empty() {

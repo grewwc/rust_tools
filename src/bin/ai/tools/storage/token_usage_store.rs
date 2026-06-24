@@ -92,9 +92,7 @@ fn open_store() -> Result<Connection, String> {
     .map_err(|e| format!("init token_usage schema: {e}"))?;
 
     // 渐进式迁移：为存量库添加新增列（忽略"列已存在"错误）。
-    let migrations = [
-        "ALTER TABLE token_usage ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0",
-    ];
+    let migrations = ["ALTER TABLE token_usage ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0"];
     for sql in &migrations {
         if let Err(e) = conn.execute_batch(sql) {
             let msg = e.to_string();
@@ -396,7 +394,7 @@ mod tests {
     #[test]
     fn test_format_cost() {
         assert_eq!(format_cost(0), "0");
-        assert_eq!(format_cost(5000), "0.50¢");   // 0.5¢
+        assert_eq!(format_cost(5000), "0.50¢"); // 0.5¢
         assert_eq!(format_cost(10_000), "1¢");
         assert_eq!(format_cost(15_000), "1.50¢");
         assert_eq!(format_cost(100_000), "10¢");

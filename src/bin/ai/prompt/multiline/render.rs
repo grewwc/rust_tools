@@ -14,7 +14,7 @@ use super::completion_panel::CompletionPanel;
 use crate::ai::prompt::MAX_INPUT_CHARS;
 
 /// 补全面板一次最多显示的候选行数（超出部分随选中项滚动）。
-const COMPLETION_WINDOW: usize = 8;
+const COMPLETION_WINDOW: usize = 12;
 
 pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     f: &mut ratatui::Frame<'_>,
@@ -64,8 +64,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     let min_textarea_lines: u16 = if completion_panel.is_some() { 1 } else { 3 };
     let (textarea_lines, panel_lines) = match completion_panel {
         Some(panel) => {
-            let desired_panel =
-                (panel.items.len().min(COMPLETION_WINDOW) as u16).saturating_add(2);
+            let desired_panel = (panel.items.len().min(COMPLETION_WINDOW) as u16).saturating_add(2);
             // 面板可用上限 = 总高度 - help - textarea 最小行。
             let panel_cap = inner
                 .height
@@ -142,26 +141,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             .take(window_size)
             .map(|(idx, item)| {
                 let selected = idx == panel.selected_index;
-                let style = if selected {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::LightCyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-
-                Line::from(vec![
-                    Span::styled(
-                        if selected { "▶ " } else { "  " },
-                        if selected {
-                            style
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        },
-                    ),
-                    Span::styled(&item.display, style),
-                ])
+                completion_item_line(&item.display, selected)
             })
             .collect();
 
@@ -169,13 +149,13 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             .borders(Borders::ALL)
             .border_style(
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(Color::Rgb(74, 92, 112))
                     .add_modifier(Modifier::BOLD),
             )
             .title(Span::styled(
                 " Completions ",
                 Style::default()
-                    .fg(Color::Gray)
+                    .fg(Color::Rgb(140, 190, 220))
                     .add_modifier(Modifier::BOLD),
             ));
 
@@ -214,54 +194,120 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         vec![
             Line::from(vec![
                 Span::styled("选择：", Style::default().fg(Color::DarkGray)),
-                Span::styled("", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled("关闭：", Style::default().fg(Color::DarkGray)),
-                Span::styled("Esc", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Esc",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled("取消：", Style::default().fg(Color::DarkGray)),
-                Span::styled("Ctrl+C", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Ctrl+C",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(status_info, Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(vec![
                 Span::styled("移动：", Style::default().fg(Color::DarkGray)),
-                Span::styled("↑↓", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "↑↓",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled("刷新：", Style::default().fg(Color::DarkGray)),
-                Span::styled("Tab", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Tab",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled("发送：", Style::default().fg(Color::DarkGray)),
-                Span::styled("+Alt/F2", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "+Alt/F2",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
         ]
     } else {
         vec![
             Line::from(vec![
                 Span::styled("换行：", Style::default().fg(Color::DarkGray)),
-                Span::styled("↵", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "↵",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled("发送：", Style::default().fg(Color::DarkGray)),
-                Span::styled("Alt+↵/F2", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Alt+↵/F2",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled("取消：", Style::default().fg(Color::DarkGray)),
-                Span::styled("Ctrl+C", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Ctrl+C",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(status_info, Style::default().fg(Color::DarkGray)),
             ]),
             Line::from(vec![
                 Span::styled("历史：", Style::default().fg(Color::DarkGray)),
-                Span::styled("↑↓/Ctrl+P/N", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "↑↓/Ctrl+P/N",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled("删行：", Style::default().fg(Color::DarkGray)),
-                Span::styled("⌘/Ctrl+U", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "⌘/Ctrl+U",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled("粘贴：", Style::default().fg(Color::DarkGray)),
-                Span::styled("Ctrl+V", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Ctrl+V",
+                    Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled("复制回答：", Style::default().fg(Color::DarkGray)),
-                Span::styled("F9", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "F9",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled("复制全部：", Style::default().fg(Color::DarkGray)),
-                Span::styled("F10", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "F10",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
         ]
     };
@@ -285,6 +331,60 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             f.render_widget(status_para, status_area);
         }
     }
+}
+
+fn completion_item_line(display: &str, selected: bool) -> Line<'_> {
+    let selected_bg = Color::Rgb(31, 45, 61);
+    let marker_style = if selected {
+        Style::default()
+            .fg(Color::Rgb(119, 221, 255))
+            .bg(selected_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let selector_style = if selected {
+        Style::default()
+            .fg(Color::Rgb(235, 246, 255))
+            .bg(selected_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(218, 226, 235))
+    };
+    let meta_style = if selected {
+        Style::default()
+            .fg(Color::Rgb(170, 185, 198))
+            .bg(selected_bg)
+    } else {
+        Style::default().fg(Color::Rgb(125, 137, 148))
+    };
+    let current_style = if selected {
+        Style::default()
+            .fg(Color::Rgb(138, 226, 168))
+            .bg(selected_bg)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(115, 194, 145))
+    };
+
+    let mut spans = vec![Span::styled(
+        if selected { "› " } else { "  " },
+        marker_style,
+    )];
+    for (idx, part) in display.split(" · ").enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(" · ", meta_style));
+        }
+        let style = if part == "current" {
+            current_style
+        } else if idx == 0 {
+            selector_style
+        } else {
+            meta_style
+        };
+        spans.push(Span::styled(part, style));
+    }
+    Line::from(spans)
 }
 
 fn count_trailing_blank_lines(lines: &[String]) -> usize {
@@ -370,11 +470,7 @@ mod tests {
 
     #[test]
     fn test_count_trailing_blank_lines() {
-        let lines = vec![
-            "第一行".to_string(),
-            String::new(),
-            "   ".to_string(),
-        ];
+        let lines = vec!["第一行".to_string(), String::new(), "   ".to_string()];
         assert_eq!(count_trailing_blank_lines(&lines), 2);
     }
 

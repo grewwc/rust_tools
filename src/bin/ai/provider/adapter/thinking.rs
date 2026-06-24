@@ -74,8 +74,7 @@ static DEEPSEEK_THINKING: DeepSeekThinkingDialect = DeepSeekThinkingDialect;
 static NO_THINKING: NoThinkingDialect = NoThinkingDialect;
 
 /// 端点是否为 DashScope（阿里云百炼）compatible-mode。
-/// 该端点用 `enable_thinking: bool` 控制思考，无论 provider 标成
-/// `compatible` 还是 `openai`（如 deepseek-v4-pro/flash、kimi-k2.7-code）。
+/// 该端点用 `enable_thinking: bool` 控制思考。
 fn is_dashscope_endpoint(endpoint: &str) -> bool {
     endpoint.contains("dashscope.aliyuncs.com")
 }
@@ -83,6 +82,7 @@ fn is_dashscope_endpoint(endpoint: &str) -> bool {
 /// 按网关（provider + endpoint）与 model 选出思考方言，与 provider 鉴权 /
 /// 响应消费轴解耦。分派严格镜像 [`super::adapter_for`]：
 /// - OpenRouter 端点 → 不发送（与 OpenAI 一致，仅靠 reasoning_effort）
+/// - Alibaba → `enable_thinking`
 /// - Compatible → `enable_thinking`
 /// - OpenAi → DashScope 端点用 `enable_thinking`，纯 OpenAI 端点不发送
 /// - OpenCode → DeepSeek 模型用 `thinking` 对象，其余不发送
@@ -91,10 +91,15 @@ pub(in crate::ai) fn thinking_dialect_for(
     model: &str,
     endpoint: &str,
 ) -> &'static dyn ThinkingDialect {
-    if endpoint.trim().to_ascii_lowercase().contains("openrouter.ai") {
+    if endpoint
+        .trim()
+        .to_ascii_lowercase()
+        .contains("openrouter.ai")
+    {
         return &NO_THINKING;
     }
     match provider {
+        ApiProvider::Alibaba => &ENABLE_THINKING,
         ApiProvider::Compatible => &ENABLE_THINKING,
         ApiProvider::OpenAi => {
             if is_dashscope_endpoint(endpoint) {

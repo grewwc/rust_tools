@@ -5,7 +5,8 @@ fn print_model_help() {
     println!();
     println!("  /model                              list available models");
     println!("  /model current                      show current model & effort");
-    println!("  /model <name>                       switch to a model");
+    println!("  /model <selector>                   switch to a model");
+    println!("                                      e.g. /model deepseek-v4-flash-opencode");
     println!("  /model effort                       show current reasoning effort");
     println!("  /model effort <minimal|low|medium|high>");
     println!("                                      override reasoning effort");
@@ -29,8 +30,15 @@ fn format_effort(effort: Option<ReasoningEffort>) -> &'static str {
     }
 }
 
+fn model_handle(model: &model_names::ModelDef) -> String {
+    model_names::model_handle(model)
+}
+
 fn print_model_list(app: &App) {
-    println!("Current model: {}", app.current_model);
+    println!(
+        "Current model: {}",
+        models::model_display_label(&app.current_model)
+    );
     println!(
         "Reasoning effort: {} (override: {})",
         format_effort(effective_effort(app, &app.current_model)),
@@ -42,12 +50,18 @@ fn print_model_list(app: &App) {
     );
     println!();
     println!("Available models:");
+    let current = model_names::find_by_identifier(&app.current_model)
+        .map(model_handle)
+        .unwrap_or_else(|| app.current_model.trim().to_string())
+        .to_ascii_lowercase();
     for model in model_names::all() {
-        let mark = if model.name == app.current_model {
+        let handle = model_handle(model);
+        let mark = if handle.eq_ignore_ascii_case(&current) {
             ">>>"
         } else {
             "   "
         };
+        let label = models::model_display_label(&handle);
         let flags = [
             model.is_vl.then_some("vl"),
             model.search_enabled.then_some("search"),
@@ -65,12 +79,9 @@ fn print_model_list(app: &App) {
         .collect::<Vec<_>>()
         .join(", ");
         if flags.is_empty() {
-            println!("  {} {}", mark, model.name);
+            println!("  {} {}", mark, label);
         } else {
-            println!(
-                "  {} {} [{:?} | {}]",
-                mark, model.name, model.provider, flags
-            );
+            println!("  {} {} [{:?} | {}]", mark, label, model.provider, flags);
         }
     }
     println!();
@@ -110,10 +121,18 @@ pub fn try_handle_model_command(
         return Ok(true);
     }
     if matches!(remainder, "current" | "cur") {
-        println!("Current model: {}", app.current_model);
-        if let Some(def) = model_names::find_by_name(&app.current_model) {
+        println!(
+            "Current model: {}",
+            models::model_display_label(&app.current_model)
+        );
+        if let Some(def) = model_names::find_by_identifier(&app.current_model) {
             println!("Provider: {:?}", def.provider);
             println!("Quality tier: {:?}", def.quality_tier);
+            println!("Selector: {}", model_names::model_handle(def));
+            if !def.aliases.is_empty() {
+                println!("Aliases: {}", def.aliases.join(", "));
+            }
+            println!("Model name: {}", def.name);
             println!("Vision: {}", if def.is_vl { "yes" } else { "no" });
             println!("Search: {}", if def.search_enabled { "yes" } else { "no" });
             println!(
@@ -138,7 +157,10 @@ pub fn try_handle_model_command(
                     Some(Some(e)) => e.as_str().to_string(),
                 }
             );
-            println!("Endpoint: {}", models::endpoint_for_model(&def.name, ""));
+            println!(
+                "Endpoint: {}",
+                models::endpoint_for_model(&model_handle(def), "")
+            );
         }
         return Ok(true);
     }
@@ -189,37 +211,40 @@ pub fn try_handle_model_command(
         return Ok(true);
     }
 
-    let target = if let Some(rest) = remainder.strip_prefix("use ") {
-        rest.trim()
-    } else if let Some(rest) = remainder.strip_prefix("select ") {
-        rest.trim()
-    } else if let Some(rest) = remainder.strip_prefix("switch ") {
-        rest.trim()
-    } else {
-        remainder
-    };
+    let target = remainder;
 
     if target.is_empty() {
-        println!("missing model name. try: /model <name>");
+        println!("missing model selector. try: /model <name-provider>");
         print_model_list(app);
         return Ok(true);
     }
 
-    let Some(model) = model_names::find_by_name(target) else {
+    let Some(model) = model_names::find_by_identifier(target) else {
         println!("Model not found: {}", target);
         print_model_list(app);
         return Ok(true);
     };
 
     let old_model = app.current_model.clone();
-    if old_model.eq_ignore_ascii_case(&model.name) {
-        println!("Model unchanged: {}", model.name);
+    let next_model = model_handle(model);
+    let old_handle = model_names::find_by_identifier(&old_model)
+        .map(model_handle)
+        .unwrap_or_else(|| old_model.trim().to_string());
+    if old_handle.eq_ignore_ascii_case(&next_model) {
+        println!(
+            "Model unchanged: {}",
+            models::model_display_label(&next_model)
+        );
         return Ok(true);
     }
 
-    app.current_model = model.name.clone();
-    app.cli.model = Some(model.name.clone());
-    println!("Switched model: {} -> {}", old_model, model.name);
+    app.current_model = next_model.clone();
+    app.cli.model = Some(next_model.clone());
+    println!(
+        "Switched model: {} -> {}",
+        models::model_display_label(&old_model),
+        models::model_display_label(&next_model)
+    );
     println!("Provider: {:?}", model.provider);
     println!(
         "Capabilities: {}{}{}{}",
@@ -272,9 +297,8 @@ mod tests {
             client: reqwest::Client::new(),
             current_model: crate::ai::model_names::all()
                 .first()
-                .expect("models.json is empty")
-                .name
-                .clone(),
+                .map(|m| crate::ai::model_names::model_handle(m))
+                .expect("models.json is empty"),
             current_agent: "build".to_string(),
             current_agent_manifest: None,
             pending_files: None,
@@ -303,12 +327,30 @@ mod tests {
             return;
         }
         let mut app = test_app();
-        let target = models[1].name.clone();
+        let target = crate::ai::model_names::model_handle(models[1]);
 
         let handled = try_handle_model_command(&mut app, &format!("/model {}", target)).unwrap();
 
         assert!(handled);
         assert_eq!(app.current_model, target);
         assert_eq!(app.cli.model.as_deref(), Some(app.current_model.as_str()));
+    }
+
+    #[test]
+    fn model_command_does_not_accept_removed_action_aliases() {
+        let models = crate::ai::model_names::all();
+        if models.len() < 2 {
+            return;
+        }
+        let mut app = test_app();
+        let original = app.current_model.clone();
+        let target = crate::ai::model_names::model_handle(models[1]);
+
+        let handled =
+            try_handle_model_command(&mut app, &format!("/model use {}", target)).unwrap();
+
+        assert!(handled);
+        assert_eq!(app.current_model, original);
+        assert!(app.cli.model.is_none());
     }
 }

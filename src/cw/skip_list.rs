@@ -387,7 +387,12 @@ impl<K, V> IntoIterator for SkipMap<K, V> {
     type IntoIter = IntoSkipMapIter<K, V>;
 
     fn into_iter(mut self) -> Self::IntoIter {
-        let first = self.head.forward.first().copied().unwrap_or(ptr::null_mut());
+        let first = self
+            .head
+            .forward
+            .first()
+            .copied()
+            .unwrap_or(ptr::null_mut());
         self.head.forward.fill(ptr::null_mut());
         self.len = 0;
         IntoSkipMapIter { curr_node: first }
@@ -914,7 +919,12 @@ impl<K, V> SkipMap<K, V> {
 
     /// 消耗所有元素，返回迭代器（类似 HashMap::drain）
     pub fn drain(&mut self) -> IntoSkipMapIter<K, V> {
-        let first = self.head.forward.first().copied().unwrap_or(ptr::null_mut());
+        let first = self
+            .head
+            .forward
+            .first()
+            .copied()
+            .unwrap_or(ptr::null_mut());
         self.head.forward.fill(ptr::null_mut());
         self.len = 0;
         IntoSkipMapIter { curr_node: first }
@@ -1016,11 +1026,7 @@ impl<T: Ord> SkipSet<T> {
     where
         T: Clone,
     {
-        let to_remove: Vec<T> = self
-            .iter()
-            .filter(|v| !f(v))
-            .cloned()
-            .collect();
+        let to_remove: Vec<T> = self.iter().filter(|v| !f(v)).cloned().collect();
         for v in &to_remove {
             self.remove(v);
         }

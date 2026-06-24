@@ -1,4 +1,3 @@
-use rust_tools::cw::SkipMap;
 use crate::ai::tools::storage::knowledge_cache::{
     CachedKnowledge, KnowledgeType, SessionKnowledgeCache, make_cache_key,
 };
@@ -7,13 +6,13 @@ use crate::ai::tools::storage::knowledge_types::{
     KnowledgeMetadata, KnowledgeType as NewKnowledgeType,
 };
 use crate::ai::tools::storage::memory_store::MemoryStore;
+use rust_tools::cw::SkipMap;
 /// 知识更新管理工具
 ///
 /// 提供智能的知识检索和更新策略：
 /// 1. 检查缓存是否过期
 /// 2. 如果过期，重新检索并更新
 /// 3. 根据知识类型决定更新策略
-
 use serde_json::Value;
 
 /// 检查并获取知识（自动处理缓存和过期）
@@ -148,7 +147,10 @@ fn retrieve_knowledge_for_topic(
     let store = MemoryStore::from_env_or_config();
 
     // 根据主题和上下文构建查询
-    let query = context.get_ref(&"query".to_string()).map(|s| s.as_str()).unwrap_or(topic);
+    let query = context
+        .get_ref(&"query".to_string())
+        .map(|s| s.as_str())
+        .unwrap_or(topic);
     let category = context.get_ref(&"category".to_string());
     let limit = context
         .get_ref(&"limit".to_string())

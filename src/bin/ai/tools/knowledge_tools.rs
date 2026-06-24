@@ -53,8 +53,8 @@ use serde_json::Value;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
-use chrono::Local;
 use crate::ai::tools::storage::rag_store::{RagEntry, ensure_rag_store, get_rag_store};
+use chrono::Local;
 
 /// 32 字符短指纹（取 SHA-256 前 16 字节）。
 fn short_rag_id(bytes: &[u8]) -> String {
@@ -462,7 +462,10 @@ fn execute_knowledge_consolidate(args: &Value) -> Result<String, String> {
     match action {
         "read_all" => read_all_entries(),
         "execute" => execute_consolidation(args),
-        _ => Err(format!("Unknown action '{}'. Use 'read_all' or 'execute'.", action)),
+        _ => Err(format!(
+            "Unknown action '{}'. Use 'read_all' or 'execute'.",
+            action
+        )),
     }
 }
 
@@ -474,10 +477,7 @@ fn read_all_entries() -> Result<String, String> {
         return Ok("Knowledge base is empty. Nothing to consolidate.".to_string());
     }
 
-    let mut result = format!(
-        "📚 Total knowledge entries: {}\n\n",
-        entries.len()
-    );
+    let mut result = format!("📚 Total knowledge entries: {}\n\n", entries.len());
 
     // Group by category for better readability
     let mut by_category: std::collections::BTreeMap<String, Vec<&AgentMemoryEntry>> =
@@ -490,7 +490,11 @@ fn read_all_entries() -> Result<String, String> {
     }
 
     for (cat, cat_entries) in &by_category {
-        result.push_str(&format!("── [{}] ({} entries) ──\n", cat, cat_entries.len()));
+        result.push_str(&format!(
+            "── [{}] ({} entries) ──\n",
+            cat,
+            cat_entries.len()
+        ));
         for entry in cat_entries {
             let entry_id = entry.id.as_deref().unwrap_or("N/A");
             let ts = &entry.timestamp;
@@ -498,7 +502,10 @@ fn read_all_entries() -> Result<String, String> {
             // 截断过长的内容用于预览
             let preview: String = if entry.note.chars().count() > 200 {
                 entry.note.chars().take(200).collect::<String>()
-                    + &format!("\n       …[truncated, total {} chars]", entry.note.chars().count())
+                    + &format!(
+                        "\n       …[truncated, total {} chars]",
+                        entry.note.chars().count()
+                    )
             } else {
                 entry.note.clone()
             };
@@ -517,7 +524,8 @@ fn read_all_entries() -> Result<String, String> {
 
     result.push_str("──\n");
     result.push_str("Analysis: Review the entries above. Identify which to keep, delete (obsolete/duplicate), or merge into consolidated summaries.\n");
-    result.push_str("Then call knowledge_consolidate with action=\"execute\" to apply your plan.\n");
+    result
+        .push_str("Then call knowledge_consolidate with action=\"execute\" to apply your plan.\n");
 
     Ok(result)
 }
@@ -571,9 +579,7 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
         let content = entry_val["content"]
             .as_str()
             .ok_or("Each save_entries item must have a 'content' field.")?;
-        let category = entry_val["category"]
-            .as_str()
-            .unwrap_or("user_memory");
+        let category = entry_val["category"].as_str().unwrap_or("user_memory");
         let tags: Vec<String> = entry_val["tags"]
             .as_array()
             .map(|arr| {
@@ -689,17 +695,25 @@ mod tests {
     #[test]
     fn test_knowledge_consolidate_params() {
         let params = params_knowledge_consolidate();
-        assert!(params["required"]
-            .as_array()
-            .unwrap()
-            .contains(&Value::String("action".to_string())));
+        assert!(
+            params["required"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("action".to_string()))
+        );
         assert_eq!(
-            params["properties"]["action"]["enum"].as_array().unwrap().len(),
+            params["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .len(),
             2
         );
         let actions: Vec<&str> = params["properties"]["action"]["enum"]
-            .as_array().unwrap()
-            .iter().filter_map(|v| v.as_str()).collect();
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
         assert!(actions.contains(&"read_all"));
         assert!(actions.contains(&"execute"));
     }

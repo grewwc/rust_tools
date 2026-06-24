@@ -165,8 +165,10 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 
 /// 读取 `ai.sandbox.extra_sensitive_paths`（逗号分隔，去空白）。
 fn config_extra_sensitive_substrings() -> Vec<String> {
-    let raw = crate::commonw::configw::get_all_config()
-        .get(crate::ai::config_schema::AiConfig::SANDBOX_EXTRA_SENSITIVE_PATHS, "");
+    let raw = crate::commonw::configw::get_all_config().get(
+        crate::ai::config_schema::AiConfig::SANDBOX_EXTRA_SENSITIVE_PATHS,
+        "",
+    );
     raw.split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -176,8 +178,10 @@ fn config_extra_sensitive_substrings() -> Vec<String> {
 /// 当 `ai.sandbox.allowed_roots` 非空时，文件路径必须位于其中某个根之下。
 /// 为空（默认）时不施加额外限制，保持既有行为。
 fn path_within_allowed_roots(path: &Path) -> bool {
-    let raw = crate::commonw::configw::get_all_config()
-        .get(crate::ai::config_schema::AiConfig::SANDBOX_ALLOWED_ROOTS, "");
+    let raw = crate::commonw::configw::get_all_config().get(
+        crate::ai::config_schema::AiConfig::SANDBOX_ALLOWED_ROOTS,
+        "",
+    );
     let roots: Vec<PathBuf> = raw
         .split(',')
         .map(|s| s.trim())
@@ -272,5 +276,3 @@ mod tests {
         assert!(!is_sensitive_fs_path(Path::new("/home/u/proj/src/main.rs")));
     }
 }
-
-

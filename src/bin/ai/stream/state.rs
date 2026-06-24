@@ -9,7 +9,10 @@ use crate::ai::{
 
 use super::{
     MarkdownStreamRenderer,
-    splitter::{AnthropicXmlToolCallStreamer, HermesXmlToolCallStreamer, InternalToolCallStreamer, StreamSplitter},
+    splitter::{
+        AnthropicXmlToolCallStreamer, HermesXmlToolCallStreamer, InternalToolCallStreamer,
+        StreamSplitter,
+    },
 };
 
 pub(super) const THINKING_TAG_TEXT: &str = "╭─ thinking";

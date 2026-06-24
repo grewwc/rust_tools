@@ -1006,11 +1006,8 @@ fn resolve_agent_team_model_override(model: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("agent_team member model override cannot be empty".to_string());
     }
-    if let Some(def) = model_names::find_by_key(trimmed) {
-        return Ok(def.name.clone());
-    }
-    if let Some(def) = model_names::find_by_name(trimmed) {
-        return Ok(def.name.clone());
+    if let Some(def) = model_names::find_by_identifier(trimmed) {
+        return Ok(model_names::model_handle(def));
     }
     Err(format!(
         "Unknown agent_team member model '{}'. Team model overrides require an exact model key/name to avoid accidentally selecting an expensive fallback.",
@@ -1956,6 +1953,7 @@ fn format_quality_tier(tier: crate::ai::provider::ModelQualityTier) -> &'static 
 
 fn format_provider(provider: crate::ai::provider::ApiProvider) -> &'static str {
     match provider {
+        crate::ai::provider::ApiProvider::Alibaba => "alibaba",
         crate::ai::provider::ApiProvider::Compatible => "compatible",
         crate::ai::provider::ApiProvider::OpenAi => "openai",
         _ => "opencode",
@@ -2124,20 +2122,19 @@ mod tests {
     #[test]
     fn selection_explanation_mentions_quality_tier_for_auto_model_choice() {
         // 之前这里硬编码 "qwen3-max"；该模型已经从 models.json 移除。
-        // 改为从真实条目中找一个 Compatible+flagship 的模型，确保解释里出现
-        // "flagship" 和 "compatible" 这两个 tier/provider 关键字。
+        // 改为从真实条目中找一个 Alibaba+flagship 的模型，确保解释里出现
+        // "flagship" 和 "alibaba" 这两个 tier/provider 关键字。
         use crate::ai::provider::{ApiProvider, ModelQualityTier};
         let model = crate::ai::model_names::all()
             .iter()
             .find(|m| {
-                m.provider == ApiProvider::Compatible
-                    && m.quality_tier == ModelQualityTier::Flagship
+                m.provider == ApiProvider::Alibaba && m.quality_tier == ModelQualityTier::Flagship
             })
             .map(|m| m.name.clone());
         let Some(model) = model else {
             eprintln!(
                 "[test] skipping selection_explanation_mentions_quality_tier_for_auto_model_choice: \
-                 no Compatible+Flagship model present in models.json"
+                 no Alibaba+Flagship model present in models.json"
             );
             return;
         };
@@ -2155,7 +2152,7 @@ mod tests {
         assert!(explanation.contains("routing_tags [implement, fix]"));
         assert!(explanation.contains("quality_tier"));
         assert!(explanation.contains("flagship"));
-        assert!(explanation.contains("compatible"));
+        assert!(explanation.contains("alibaba"));
     }
 
     #[test]

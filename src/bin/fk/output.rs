@@ -20,7 +20,9 @@ fn snap_up(s: &str, idx: usize) -> usize {
     if s.is_char_boundary(idx) {
         return idx;
     }
-    (idx..=s.len()).find(|&i| s.is_char_boundary(i)).unwrap_or(s.len())
+    (idx..=s.len())
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(s.len())
 }
 
 pub fn highlight_ranges(s: &str, mut ranges: Vec<(usize, usize)>) -> String {

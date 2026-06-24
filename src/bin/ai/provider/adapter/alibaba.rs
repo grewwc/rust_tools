@@ -1,4 +1,4 @@
-//! DashScope（阿里云百炼）compatible-mode 适配器。
+//! 阿里云百炼（DashScope）compatible-mode 适配器。
 //!
 //! 端点：`https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`。
 //! 推理强度走嵌套 `reasoning: { effort }`，并接受 `enable_search` 扩展字段。
@@ -8,13 +8,13 @@ use serde_json::{Value, json};
 
 use crate::ai::config_schema::AiConfig;
 
-use super::{COMPATIBLE_DEFAULT_ENDPOINT, ProviderAdapter};
+use super::{ALIBABA_DEFAULT_ENDPOINT, ProviderAdapter};
 
-pub(super) struct CompatibleAdapter;
+pub(super) struct AlibabaAdapter;
 
-impl ProviderAdapter for CompatibleAdapter {
+impl ProviderAdapter for AlibabaAdapter {
     fn label(&self) -> &'static str {
-        "compatible"
+        "alibaba"
     }
 
     fn enable_search_field(&self, requested: Option<bool>) -> Option<bool> {
@@ -30,14 +30,14 @@ impl ProviderAdapter for CompatibleAdapter {
     }
 
     fn default_endpoint(&self) -> &'static str {
-        COMPATIBLE_DEFAULT_ENDPOINT
+        ALIBABA_DEFAULT_ENDPOINT
     }
 
     fn api_key_candidates(&self) -> &'static [&'static str] {
         &[
-            AiConfig::MODEL_COMPATIBLE_API_KEY,
             AiConfig::MODEL_ALIBABA_API_KEY,
             AiConfig::MODEL_ALIYUN_API_KEY,
+            AiConfig::MODEL_COMPATIBLE_API_KEY,
             AiConfig::MODEL_API_KEY,
         ]
     }

@@ -14,12 +14,7 @@ use serde_json::Value;
 
 use aios_kernel::kernel::SharedKernel;
 
-use super::{
-    agents::AgentManifest,
-    cli::ParsedCli,
-    persona::PersonaProfile,
-    prompt::PromptEditor,
-};
+use super::{agents::AgentManifest, cli::ParsedCli, persona::PersonaProfile, prompt::PromptEditor};
 
 /// Configuration for the AI application, including API credentials,
 /// endpoint, model settings, and conversation history parameters.

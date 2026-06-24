@@ -78,11 +78,17 @@ pub(in crate::ai) fn default_persona() -> PersonaProfile {
     }
 }
 
-pub(in crate::ai) fn history_file_for_persona(base_history_file: &Path, persona_id: &str) -> PathBuf {
+pub(in crate::ai) fn history_file_for_persona(
+    base_history_file: &Path,
+    persona_id: &str,
+) -> PathBuf {
     if persona_id == DEFAULT_PERSONA_ID {
         return base_history_file.to_path_buf();
     }
-    insert_suffix_before_extension(base_history_file, &format!(".persona-{}", sanitize_path_fragment(persona_id)))
+    insert_suffix_before_extension(
+        base_history_file,
+        &format!(".persona-{}", sanitize_path_fragment(persona_id)),
+    )
 }
 
 pub(in crate::ai) fn memory_file_for_persona(persona_id: &str) -> PathBuf {
@@ -90,7 +96,10 @@ pub(in crate::ai) fn memory_file_for_persona(persona_id: &str) -> PathBuf {
     if persona_id == DEFAULT_PERSONA_ID {
         return base;
     }
-    insert_suffix_before_extension(&base, &format!(".persona-{}", sanitize_path_fragment(persona_id)))
+    insert_suffix_before_extension(
+        &base,
+        &format!(".persona-{}", sanitize_path_fragment(persona_id)),
+    )
 }
 
 pub(in crate::ai) fn cleanup_persona_storage(
@@ -211,8 +220,8 @@ impl PersonaStore {
 
     pub(in crate::ai) fn set_active_persona(&self, selector: &str) -> io::Result<PersonaProfile> {
         let mut registry = self.load_registry()?;
-        let persona = find_persona_in_registry(&registry, selector)?
-            .unwrap_or_else(default_persona);
+        let persona =
+            find_persona_in_registry(&registry, selector)?.unwrap_or_else(default_persona);
         registry.active_persona_id = if persona.is_default() {
             None
         } else {
@@ -273,7 +282,11 @@ impl PersonaStore {
         }
 
         let mut registry = self.load_registry()?;
-        let Some(persona) = registry.personas.iter_mut().find(|persona| persona.id == persona_id) else {
+        let Some(persona) = registry
+            .personas
+            .iter_mut()
+            .find(|persona| persona.id == persona_id)
+        else {
             return Ok(());
         };
         persona.last_session_id = Some(session_id.trim().to_string());
@@ -487,7 +500,10 @@ mod tests {
     fn history_path_for_named_persona_gets_isolated_suffix() {
         let base = PathBuf::from("/tmp/history.sqlite");
         let path = history_file_for_persona(&base, "persona-123");
-        assert_eq!(path, PathBuf::from("/tmp/history.persona-persona-123.sqlite"));
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/history.persona-persona-123.sqlite")
+        );
     }
 
     #[test]

@@ -1,9 +1,13 @@
 [
   {
-    "key": "DEEPSEEK_V4_PRO",
+    "key": "deepseek-v4-pro-alibaba",
+    "aliases": [
+      "DEEPSEEK_V4_PRO",
+      "deepseek-v4-pro-openai"
+    ],
     "name": "deepseek-v4-pro",
     "default_reasoning_effort": "high",
-    "provider": "openai",
+    "provider": "alibaba",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "strong",
     "is_vl": false,
@@ -13,10 +17,14 @@
     "subagent_priority": 100
   },
   {
-    "key": "DEEPSEEK_V4_FLASH",
+    "key": "deepseek-v4-flash-alibaba",
+    "aliases": [
+      "DEEPSEEK_V4_FLASH",
+      "deepseek-v4-flash-openai"
+    ],
     "name": "deepseek-v4-flash",
     "default_reasoning_effort": "high",
-    "provider": "openai",
+    "provider": "alibaba",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "strong",
     "is_vl": false,
@@ -26,11 +34,30 @@
     "subagent_priority": 100
   },
   {
-    "key": "QWEN_PLUS_LATEST",
+    "key": "deepseek-v4-flash-opencode",
+    "aliases": [
+      "DEEPSEEK_V4_FLASH_OPENCODE"
+    ],
+    "name": "deepseek-v4-flash",
+    "default_reasoning_effort": "high",
+    "provider": "opencode",
+    "quality_tier": "strong",
+    "is_vl": false,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": true,
+    "subagent_priority": 85
+  },
+  {
+    "key": "qwen3.7-plus-alibaba",
+    "aliases": [
+      "QWEN_PLUS_LATEST",
+      "qwen3.7-plus-compatible"
+    ],
     "name": "qwen3.7-plus",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "strong",
-    "provider": "compatible",
+    "provider": "alibaba",
     "is_vl": true,
     "search_enabled": true,
     "default_reasoning_effort": "high",
@@ -40,11 +67,15 @@
     "subagent_priority": 90
   },
   {
-    "key": "QWEN3_MAX",
+    "key": "qwen3.7-max-alibaba",
+    "aliases": [
+      "QWEN3_MAX",
+      "qwen3.7-max-compatible"
+    ],
     "name": "qwen3.7-max",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "flagship",
-    "provider": "compatible",
+    "provider": "alibaba",
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
@@ -54,11 +85,14 @@
     "subagent_priority": 80
   },
   {
-    "key": "KIMI",
+    "key": "kimi-k2.7-code-alibaba",
+    "aliases": [
+      "KIMI",
+      "kimi-k2.7-code-openai"
+    ],
     "name": "kimi-k2.7-code",
-    "provider": "openai",
+    "provider": "alibaba",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-    "api_key_config_key": "openrouter.api_key",
     "quality_tier": "strong",
     "is_vl": true,
     "search_enabled": true,
@@ -67,10 +101,15 @@
     "subagent_priority": 70
   },
   {
-    "key": "QWEN_VL_FLASH",
+    "key": "qwen3.6-flash-alibaba",
+    "aliases": [
+      "QWEN_VL_FLASH",
+      "qwen3.6-flash-compatible"
+    ],
     "name": "qwen3.6-flash",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "strong",
+    "provider": "alibaba",
     "is_vl": true,
     "search_enabled": false,
     "tools_default_enabled": false,
@@ -79,10 +118,15 @@
     "subagent_priority": 150
   },
   {
-    "key": "qwen-open",
+    "key": "qwen3.5-397b-a17b-alibaba",
+    "aliases": [
+      "qwen-open",
+      "qwen3.5-397b-a17b-compatible"
+    ],
     "name": "qwen3.5-397b-a17b",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "flagship",
+    "provider": "alibaba",
     "is_vl": true,
     "search_enabled": true,
     "tools_default_enabled": true,
@@ -91,7 +135,10 @@
     "subagent_priority": 75
   },
   {
-    "key": "MiMo V2.5 Free",
+    "key": "mimo-v2.5-free-opencode",
+    "aliases": [
+      "MiMo V2.5 Free"
+    ],
     "name": "mimo-v2.5-free",
     "provider": "opencode",
     "quality_tier": "basic",
@@ -102,7 +149,10 @@
     "subagent_priority": 10
   },
   {
-    "key": "DeepSeek V4 Flash Free",
+    "key": "deepseek-v4-flash-free-opencode",
+    "aliases": [
+      "DeepSeek V4 Flash Free"
+    ],
     "name": "deepseek-v4-flash-free",
     "provider": "opencode",
     "quality_tier": "basic",
@@ -113,9 +163,13 @@
     "subagent_priority": 80
   },
   {
-    "key": "GLM 5.1",
+    "key": "glm-5.1-alibaba",
+    "aliases": [
+      "GLM 5.1",
+      "glm-5.1-openai"
+    ],
     "name": "glm-5.1",
-    "provider": "openai",
+    "provider": "alibaba",
     "quality_tier": "strong",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "is_vl": false,

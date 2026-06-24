@@ -10,6 +10,8 @@ use super::provider::{ApiProvider, ModelQualityTier, ReasoningEffort};
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ModelDef {
     pub key: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub name: String,
     #[serde(default)]
     pub provider: ApiProvider,
@@ -86,8 +88,46 @@ where
 
 static USER_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_user_models);
 static BUILTIN_MODELS: LazyLock<Vec<ModelDef>> = LazyLock::new(load_builtin_models);
+static USER_BY_KEY: LazyLock<SkipMap<String, usize>> = LazyLock::new(build_user_key_index);
+static BUILTIN_BY_KEY: LazyLock<SkipMap<String, usize>> = LazyLock::new(build_builtin_key_index);
 static USER_BY_NAME: LazyLock<SkipMap<String, usize>> = LazyLock::new(build_user_name_index);
 static BUILTIN_BY_NAME: LazyLock<SkipMap<String, usize>> = LazyLock::new(build_builtin_name_index);
+
+fn lookup_key(value: &str) -> String {
+    let mut normalized = String::new();
+    let mut pending_dash = false;
+    for ch in value.trim().to_ascii_lowercase().chars() {
+        if ch.is_whitespace() {
+            if !normalized.is_empty() {
+                pending_dash = true;
+            }
+            continue;
+        }
+        if pending_dash && !normalized.ends_with('-') {
+            normalized.push('-');
+        }
+        pending_dash = false;
+        normalized.push(ch);
+    }
+    normalized.trim_matches('-').to_string()
+}
+
+fn provider_slug(provider: ApiProvider) -> &'static str {
+    match provider {
+        ApiProvider::Alibaba => "alibaba",
+        ApiProvider::Compatible => "compatible",
+        ApiProvider::OpenAi => "openai",
+        ApiProvider::OpenCode => "opencode",
+    }
+}
+
+pub fn model_handle(model: &ModelDef) -> String {
+    let name = lookup_key(&model.name);
+    if name.is_empty() {
+        return lookup_key(&model.key);
+    }
+    format!("{}-{}", name, provider_slug(model.provider))
+}
 
 fn user_config_path() -> PathBuf {
     let home = expanduser("~/.config/rust_tools/models.json");
@@ -140,10 +180,44 @@ fn load_builtin_models() -> Vec<ModelDef> {
     })
 }
 
+fn build_user_key_index() -> SkipMap<String, usize> {
+    let mut index = SkipMap::default();
+    for (i, m) in USER_MODELS.iter().enumerate() {
+        insert_model_key_aliases(&mut index, m, i);
+    }
+    index
+}
+
+fn build_builtin_key_index() -> SkipMap<String, usize> {
+    let mut index = SkipMap::default();
+    for (i, m) in BUILTIN_MODELS.iter().enumerate() {
+        insert_model_key_aliases(&mut index, m, i);
+    }
+    index
+}
+
+fn insert_key_alias(index: &mut SkipMap<String, usize>, alias: &str, i: usize) {
+    let key = lookup_key(alias);
+    if !key.is_empty() {
+        index.insert(key, i);
+    }
+}
+
+fn insert_model_key_aliases(index: &mut SkipMap<String, usize>, model: &ModelDef, i: usize) {
+    insert_key_alias(index, &model_handle(model), i);
+    insert_key_alias(index, &model.key, i);
+    for alias in &model.aliases {
+        insert_key_alias(index, alias, i);
+    }
+}
+
 fn build_user_name_index() -> SkipMap<String, usize> {
     let mut index = SkipMap::default();
     for (i, m) in USER_MODELS.iter().enumerate() {
-        index.insert(m.name.clone().to_lowercase(), i);
+        let key = lookup_key(&m.name);
+        if !key.is_empty() && !index.contains_key(&key) {
+            index.insert(key, i);
+        }
     }
     index
 }
@@ -151,7 +225,10 @@ fn build_user_name_index() -> SkipMap<String, usize> {
 fn build_builtin_name_index() -> SkipMap<String, usize> {
     let mut index = SkipMap::default();
     for (i, m) in BUILTIN_MODELS.iter().enumerate() {
-        index.insert(m.name.clone().to_lowercase(), i);
+        let key = lookup_key(&m.name);
+        if !key.is_empty() && !index.contains_key(&key) {
+            index.insert(key, i);
+        }
     }
     index
 }
@@ -161,14 +238,14 @@ pub fn all() -> Vec<&'static ModelDef> {
     let mut result = Vec::new();
 
     for m in USER_MODELS.iter() {
-        let key = m.name.to_lowercase();
+        let key = lookup_key(&model_handle(m));
         if seen.insert(key) {
             result.push(m);
         }
     }
 
     for m in BUILTIN_MODELS.iter() {
-        let key = m.name.to_lowercase();
+        let key = lookup_key(&model_handle(m));
         if seen.insert(key) {
             result.push(m);
         }
@@ -178,7 +255,7 @@ pub fn all() -> Vec<&'static ModelDef> {
 }
 
 pub fn find_by_name(name: &str) -> Option<&'static ModelDef> {
-    let name_lower = name.trim().to_lowercase();
+    let name_lower = lookup_key(name);
 
     if let Some(&i) = USER_BY_NAME.get_ref(&name_lower) {
         return Some(&USER_MODELS[i]);
@@ -190,8 +267,21 @@ pub fn find_by_name(name: &str) -> Option<&'static ModelDef> {
 }
 
 pub fn find_by_key(key: &str) -> Option<&'static ModelDef> {
-    USER_MODELS
-        .iter()
-        .find(|m| m.key == key)
-        .or_else(|| BUILTIN_MODELS.iter().find(|m| m.key == key))
+    let key_lower = lookup_key(key);
+
+    if let Some(&i) = USER_BY_KEY.get_ref(&key_lower) {
+        return Some(&USER_MODELS[i]);
+    }
+
+    BUILTIN_BY_KEY
+        .get_ref(&key_lower)
+        .map(|&i| &BUILTIN_MODELS[i])
+}
+
+pub fn find_by_identifier(identifier: &str) -> Option<&'static ModelDef> {
+    let trimmed = identifier.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    find_by_key(trimmed).or_else(|| find_by_name(trimmed))
 }

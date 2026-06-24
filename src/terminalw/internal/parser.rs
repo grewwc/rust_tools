@@ -489,11 +489,7 @@ impl Parser {
         for (k, _) in self.optional.iter() {
             buf.push_str(k);
         }
-        let aliases = self
-            .alias_map
-            .get(needle)
-            .cloned()
-            .unwrap_or_default();
+        let aliases = self.alias_map.get(needle).cloned().unwrap_or_default();
         if buf.contains(needle) {
             return true;
         }

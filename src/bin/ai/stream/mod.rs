@@ -6,8 +6,8 @@ mod runtime;
 mod splitter;
 mod state;
 
-pub(super) use render::markdown::MarkdownStreamRenderer;
 pub(in crate::ai) use normalize::try_parse_stream_chunk_loose;
+pub(super) use render::markdown::MarkdownStreamRenderer;
 pub(in crate::ai) use state::ParsedStreamPayload;
 
 use crate::ai::{

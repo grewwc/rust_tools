@@ -9,14 +9,15 @@
 //!
 //! 本模块只承载「跨 provider 的公共契约」：[`ProviderAdapter`] trait 与
 //! [`adapter_for`] 调度。每个具体 provider 的实现各自独立成文件
-//! （`compatible` / `openai` / `openrouter` / `opencode`）。
+//! （`alibaba` / `compatible` / `openai` / `openrouter` / `opencode`）。
 //!
 //! 思考开关的 wire 编码是与 provider 正交的另一根轴，独立到 [`thinking`] 子模块
 //! （[`thinking_dialect_for`]），各 provider adapter 不再参与思考字段编码。
 
+mod alibaba;
 mod compatible;
-mod opencode;
 mod openai;
+mod opencode;
 mod openrouter;
 mod thinking;
 
@@ -26,8 +27,9 @@ use crate::ai::stream::{ParsedStreamPayload, try_parse_stream_chunk_loose};
 
 use super::ApiProvider;
 
-pub(in crate::ai) use thinking::{ThinkingDialect, thinking_dialect_for};
+pub(in crate::ai) use thinking::thinking_dialect_for;
 
+use alibaba::AlibabaAdapter;
 use compatible::CompatibleAdapter;
 use openai::OpenAiAdapter;
 use opencode::OpenCodeAdapter;
@@ -35,23 +37,24 @@ use openrouter::OpenRouterAdapter;
 
 pub(in crate::ai) const COMPATIBLE_DEFAULT_ENDPOINT: &str =
     "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+pub(in crate::ai) const ALIBABA_DEFAULT_ENDPOINT: &str =
+    "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
 pub(in crate::ai) const OPENAI_DEFAULT_ENDPOINT: &str =
     "https://api.openai.com/v1/chat/completions";
 pub(in crate::ai) const OPENCODE_DEFAULT_ENDPOINT: &str =
     "https://opencode.ai/zen/v1/chat/completions";
-pub(in crate::ai) const OPENROUTER_ENDPOINT: &str =
-    "https://openrouter.ai/api/v1/chat/completions";
+pub(in crate::ai) const OPENROUTER_ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 /// 各 LLM provider 的行为差异统一抽象。所有实现均为零状态单例。
 ///
-/// 默认方法实现「OpenAI 兼容族」的通用行为；Compatible / OpenCode 通过
+/// 默认方法实现「OpenAI 兼容族」的通用行为；Alibaba / Compatible / OpenCode 通过
 /// override 表达自身差异。
 pub(in crate::ai) trait ProviderAdapter: Sync {
     /// 流式解析失败日志使用的标签，也用于诊断。
     fn label(&self) -> &'static str;
 
     /// 主请求体的 `enable_search` 字段取值。
-    /// Compatible 透传调用方传入的开关；OpenAI 兼容族不发送该字段（`None`）。
+    /// Alibaba / Compatible 透传调用方传入的开关；OpenAI 兼容族不发送该字段（`None`）。
     fn enable_search_field(&self, _requested: Option<bool>) -> Option<bool> {
         None
     }
@@ -97,11 +100,15 @@ pub(in crate::ai) trait ProviderAdapter: Sync {
     }
 }
 
+static ALIBABA: AlibabaAdapter = AlibabaAdapter;
 static COMPATIBLE: CompatibleAdapter = CompatibleAdapter;
 static OPENAI: OpenAiAdapter = OpenAiAdapter;
 static OPENROUTER: OpenRouterAdapter = OpenRouterAdapter;
 static OPENCODE: OpenCodeAdapter = OpenCodeAdapter;
 
+pub(in crate::ai) fn alibaba_adapter() -> &'static dyn ProviderAdapter {
+    &ALIBABA
+}
 pub(in crate::ai) fn compatible_adapter() -> &'static dyn ProviderAdapter {
     &COMPATIBLE
 }
@@ -123,10 +130,15 @@ pub(in crate::ai) fn adapter_for(
     provider: ApiProvider,
     endpoint: &str,
 ) -> &'static dyn ProviderAdapter {
-    if endpoint.trim().to_ascii_lowercase().contains("openrouter.ai") {
+    if endpoint
+        .trim()
+        .to_ascii_lowercase()
+        .contains("openrouter.ai")
+    {
         return openrouter_adapter();
     }
     match provider {
+        ApiProvider::Alibaba => alibaba_adapter(),
         ApiProvider::Compatible => compatible_adapter(),
         ApiProvider::OpenAi => openai_adapter(),
         ApiProvider::OpenCode => opencode_adapter(),

@@ -434,7 +434,9 @@ impl SessionKnowledgeCache {
 
     /// 获取缓存的知识
     pub fn get(&self, key: &str) -> Option<&CachedKnowledge> {
-        self.cache.get_ref(&key.to_string()).filter(|v| !v.is_expired())
+        self.cache
+            .get_ref(&key.to_string())
+            .filter(|v| !v.is_expired())
     }
 
     /// 设置缓存的知识

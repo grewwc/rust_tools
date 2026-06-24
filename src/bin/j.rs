@@ -179,10 +179,7 @@ fn parse_clipboard_json(options: jsonw::ParseOptions) -> jsonw::Json {
     expand_nested_json_strings_in_json(j, options)
 }
 
-fn expand_nested_json_strings_in_json(
-    j: jsonw::Json,
-    options: jsonw::ParseOptions,
-) -> jsonw::Json {
+fn expand_nested_json_strings_in_json(j: jsonw::Json, options: jsonw::ParseOptions) -> jsonw::Json {
     jsonw::Json::new(expand_nested_json_strings(j.raw_value().clone(), options))
 }
 
@@ -372,9 +369,7 @@ mod tests {
 
     #[test]
     fn recursively_expands_nested_array_string_fields() {
-        let value = serde_json::json!([
-            "{\"items\":[\"{\\\"id\\\":1}\",\"plain\"]}"
-        ]);
+        let value = serde_json::json!(["{\"items\":[\"{\\\"id\\\":1}\",\"plain\"]}"]);
 
         let expanded = expand_nested_json_strings(value, jsonw::ParseOptions::default());
 

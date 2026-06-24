@@ -17,6 +17,8 @@ pub(in crate::ai) use blob::{
     build_message_arr, delete_history_artifacts, replace_history_messages,
 };
 #[allow(unused_imports)]
+pub(in crate::ai) use checkpoint::{CheckpointInfo, CheckpointStore};
+#[allow(unused_imports)]
 pub(in crate::ai) use compress::compress_messages_for_context;
 #[allow(unused_imports)]
 pub(in crate::ai) use compress::value_to_string;
@@ -28,8 +30,6 @@ pub(in crate::ai) use compress::{
 pub(in crate::ai) use markdown::messages_to_markdown;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
-#[allow(unused_imports)]
-pub(in crate::ai) use checkpoint::{CheckpointInfo, CheckpointStore};
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_messages_sqlite;
 #[allow(unused_imports)]
@@ -165,10 +165,8 @@ fn try_build_context_history_sqlite_fastpath(
     let Some(start_message_id) = recent.start_message_id else {
         return Ok(None);
     };
-    let Some(summary) = sqlite::read_latest_history_summary_before_id_sqlite(
-        history_file,
-        start_message_id,
-    )?
+    let Some(summary) =
+        sqlite::read_latest_history_summary_before_id_sqlite(history_file, start_message_id)?
     else {
         return Ok(None);
     };

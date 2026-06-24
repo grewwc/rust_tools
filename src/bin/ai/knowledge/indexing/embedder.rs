@@ -195,8 +195,10 @@ impl RemoteEmbeddingProvider {
             let mut out: Vec<Vec<f32>> = Vec::with_capacity(data.len());
             for item in data {
                 let arr = item.get("embedding")?.as_array()?;
-                let vec: Vec<f32> =
-                    arr.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect();
+                let vec: Vec<f32> = arr
+                    .iter()
+                    .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                    .collect();
                 if vec.is_empty() {
                     return None;
                 }
@@ -215,12 +217,20 @@ impl RemoteEmbeddingProvider {
 impl EmbeddingProvider for RemoteEmbeddingProvider {
     fn embed(&self, text: &str) -> Option<Vec<f32>> {
         let mut v = self.request(vec![text.to_string()])?;
-        if v.is_empty() { None } else { Some(v.remove(0)) }
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.remove(0))
+        }
     }
 
     fn embed_batch(&self, texts: &[String]) -> Option<Vec<Vec<f32>>> {
         let out = self.request(texts.to_vec())?;
-        if out.len() == texts.len() { Some(out) } else { None }
+        if out.len() == texts.len() {
+            Some(out)
+        } else {
+            None
+        }
     }
 
     fn is_ready(&self) -> bool {

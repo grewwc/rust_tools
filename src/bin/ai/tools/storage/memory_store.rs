@@ -1,3 +1,4 @@
+use rustc_hash::{FxHashMap, FxHashSet};
 /// Agent 记忆存储 — 底层持久化存储系统
 ///
 /// ## 架构说明
@@ -30,7 +31,6 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use rustc_hash::{FxHashMap, FxHashSet};
 
 use super::memory_index::MemoryIndex;
 use super::with_memory_file_lock;
@@ -1066,7 +1066,9 @@ impl MemoryStore {
             let mut removed = 0usize;
             for line in content.lines() {
                 let line = line.trim();
-                if line.is_empty() { continue; }
+                if line.is_empty() {
+                    continue;
+                }
                 if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
                     if entry.id.as_deref().map_or(false, |id| id_set.contains(id)) {
                         removed += 1;
@@ -1078,7 +1080,9 @@ impl MemoryStore {
             Self::write_all_entries(&self.path, &kept)?;
             // 同步删除 SQLite 索引
             if let Some(idx) = memory_index_for(&self.path) {
-                for id in ids { let _ = idx.delete_id(id); }
+                for id in ids {
+                    let _ = idx.delete_id(id);
+                }
                 let _ = idx.refresh_signature();
             }
             Ok(removed)

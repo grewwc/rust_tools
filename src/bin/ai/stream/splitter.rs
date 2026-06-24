@@ -202,9 +202,7 @@ enum HermesXmlPhase {
     /// 已吞掉 `<function=`，正在等待函数名后的 `>`。
     AwaitingName,
     /// 已捕获函数名，正在缓冲 body 直到 `</function>`（期间不外显任何字符）。
-    InBody {
-        name: String,
-    },
+    InBody { name: String },
 }
 
 /// 流式抑制 Hermes / Qwen 风格的 XML tool call（`<function=NAME>...</function>`，
@@ -235,8 +233,8 @@ impl HermesXmlToolCallStreamer {
                         Some((pos, idx, len)) => {
                             // marker 之前的内容是正常可见文本；但紧邻 marker 的尾随
                             // 空白只是包裹/调用前的噪声，去掉以免出现多余空行。
-                            let before = self.pending[..pos]
-                                .trim_end_matches([' ', '\t', '\r', '\n']);
+                            let before =
+                                self.pending[..pos].trim_end_matches([' ', '\t', '\r', '\n']);
                             cleaned.push_str(before);
                             let after = pos + len;
                             self.pending.drain(..after);
@@ -951,7 +949,12 @@ mod tests {
         let mut s = HermesXmlToolCallStreamer::new();
         let (cleaned, events) = s.push("done.<function=list_agents></function>");
         assert_eq!(cleaned, "done.");
-        assert_eq!(events.first(), Some(&InternalToolCallStreamEvent::Begin("list_agents".to_string())));
+        assert_eq!(
+            events.first(),
+            Some(&InternalToolCallStreamEvent::Begin(
+                "list_agents".to_string()
+            ))
+        );
         // 无参数 → 空对象。
         assert!(events.contains(&InternalToolCallStreamEvent::Args("{}".to_string())));
     }
@@ -992,7 +995,10 @@ mod tests {
         let (cleaned, events) =
             s.push("<function=read_file><parameter=path>/x</parameter></function>");
         assert_eq!(cleaned, "");
-        assert_eq!(events[0], InternalToolCallStreamEvent::Begin("read_file".to_string()));
+        assert_eq!(
+            events[0],
+            InternalToolCallStreamEvent::Begin("read_file".to_string())
+        );
         let InternalToolCallStreamEvent::Args(args) = &events[1] else {
             panic!("expected args event");
         };

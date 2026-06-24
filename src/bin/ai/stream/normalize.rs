@@ -7,6 +7,7 @@ use super::state::ParsedStreamPayload;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StreamProviderAdapterKind {
+    Alibaba,
     Compatible,
     OpenAi,
     OpenRouter,
@@ -23,6 +24,7 @@ pub(super) fn resolve_adapter_kind(
     }
 
     match provider {
+        ApiProvider::Alibaba => StreamProviderAdapterKind::Alibaba,
         ApiProvider::OpenAi => StreamProviderAdapterKind::OpenAi,
         ApiProvider::OpenCode => StreamProviderAdapterKind::OpenCode,
         ApiProvider::Compatible => StreamProviderAdapterKind::Compatible,
@@ -48,6 +50,7 @@ pub(super) fn parse_stream_payload(
     }
 
     match adapter_kind {
+        StreamProviderAdapterKind::Alibaba => provider::alibaba_adapter(),
         StreamProviderAdapterKind::Compatible => provider::compatible_adapter(),
         StreamProviderAdapterKind::OpenAi => provider::openai_adapter(),
         StreamProviderAdapterKind::OpenRouter => provider::openrouter_adapter(),
@@ -399,6 +402,15 @@ mod tests {
             "https://openrouter.ai/api/v1/chat/completions",
         );
         assert_eq!(adapter, StreamProviderAdapterKind::OpenRouter);
+    }
+
+    #[test]
+    fn alibaba_provider_uses_alibaba_adapter() {
+        let adapter = resolve_adapter_kind(
+            ApiProvider::Alibaba,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        );
+        assert_eq!(adapter, StreamProviderAdapterKind::Alibaba);
     }
 
     #[test]

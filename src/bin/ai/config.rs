@@ -1,10 +1,7 @@
 use std::{fs, path::PathBuf};
 
 use crate::ai::config_schema::AiConfig;
-use crate::commonw::{
-    configw,
-    utils::expanduser,
-};
+use crate::commonw::{configw, utils::expanduser};
 
 use super::{models, types::AppConfig};
 
@@ -20,6 +17,9 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     let compatible_api_key = cfg
         .get_opt(AiConfig::MODEL_COMPATIBLE_API_KEY)
         .unwrap_or_default();
+    let alibaba_api_key = cfg
+        .get_opt(AiConfig::MODEL_ALIBABA_API_KEY)
+        .unwrap_or_default();
     let aliyun_api_key = cfg
         .get_opt(AiConfig::MODEL_ALIYUN_API_KEY)
         .unwrap_or_default();
@@ -34,11 +34,12 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         && opencode_api_key.trim().is_empty()
         && openrouter_api_key.trim().is_empty()
         && compatible_api_key.trim().is_empty()
+        && alibaba_api_key.trim().is_empty()
         && aliyun_api_key.trim().is_empty()
         && openai_api_key.trim().is_empty()
         && !models::endpoint_supports_anonymous_auth(&default_endpoint)
     {
-        return Err("set api_key / opencode.api_key / openrouter.api_key / compatible.api_key / aliyun.api_key / openai.api_key in ~/.configW".into());
+        return Err("set api_key / opencode.api_key / openrouter.api_key / compatible.api_key / alibaba.api_key / aliyun.api_key / openai.api_key in ~/.configW".into());
     }
     let history_file = cfg
         .get_opt("history_file")

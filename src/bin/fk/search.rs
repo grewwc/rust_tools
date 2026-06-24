@@ -237,7 +237,11 @@ mod tests {
             .filter_map(|&(s, e)| {
                 let s2 = s.checked_sub(trim_offset)?;
                 let e2 = e.checked_sub(trim_offset)?;
-                if e2 <= trimmed.len() { Some((s2, e2)) } else { None }
+                if e2 <= trimmed.len() {
+                    Some((s2, e2))
+                } else {
+                    None
+                }
             })
             .collect();
         assert_eq!(adjusted, vec![(17, 36)]);

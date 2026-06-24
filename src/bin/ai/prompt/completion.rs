@@ -24,19 +24,34 @@ static CURRENT_MODEL_HINT: LazyLock<RwLock<String>> = LazyLock::new(|| RwLock::n
 static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
     let mut trie = Trie::new();
     for &cmd in &[
-        "/help", ":help", "/h", ":h",
-        "/history", ":history",
-        "/usage", ":usage",
-        "/feishu-auth", ":feishu-auth",
-        "/share", ":share",
-        "/checkpoint", ":checkpoint",
-        "/cp", ":cp",
-        "/model", ":model",
-        "/agents", ":agents",
-        "/agent", ":agent",
-        "/personas", ":personas",
-        "/sessions", ":sessions",
-        "/skills", ":skills",
+        "/help",
+        ":help",
+        "/h",
+        ":h",
+        "/history",
+        ":history",
+        "/usage",
+        ":usage",
+        "/feishu-auth",
+        ":feishu-auth",
+        "/share",
+        ":share",
+        "/checkpoint",
+        ":checkpoint",
+        "/cp",
+        ":cp",
+        "/model",
+        ":model",
+        "/agents",
+        ":agents",
+        "/agent",
+        ":agent",
+        "/personas",
+        ":personas",
+        "/sessions",
+        ":sessions",
+        "/skills",
+        ":skills",
     ] {
         trie.insert(cmd);
     }
@@ -49,22 +64,35 @@ static FLAGS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
     for flag in &[
         // bool 选项
         "--clear",
-        "--list-tools", "--list-mcp-tools", "--list-skills",
-        "--list-agents", "--no-skills",
-        "--help", "-h",
+        "--list-tools",
+        "--list-mcp-tools",
+        "--list-skills",
+        "--list-agents",
+        "--no-skills",
+        "--help",
+        "-h",
         "--consolidate-knowledge",
-        "--note-search", "-ns",
+        "--note-search",
+        "-ns",
         "--generate-completions",
         // string/int 选项
-        "--model", "-m",
-        "--agent", "-a",
-        "--session", "-ss",
-        "--files", "-f",
+        "--model",
+        "-m",
+        "--agent",
+        "-a",
+        "--session",
+        "-ss",
+        "--files",
+        "-f",
         "--mcp-config",
-        "--reasoning-effort", "-re",
-        "--note", "-n",
-        "--note-delete", "-nd",
-        "--note-edit", "-ne",
+        "--reasoning-effort",
+        "-re",
+        "--note",
+        "-n",
+        "--note-delete",
+        "-nd",
+        "--note-edit",
+        "-ne",
     ] {
         trie.insert(flag);
     }
@@ -142,16 +170,39 @@ impl CommandCompleter {
             .collect()
     }
 
+    fn model_handle(model: &crate::ai::model_names::ModelDef) -> String {
+        crate::ai::model_names::model_handle(model)
+    }
+
+    fn model_replacement(model: &crate::ai::model_names::ModelDef) -> String {
+        Self::model_handle(model)
+    }
+
+    fn current_model_matches(
+        current: Option<&str>,
+        model: &crate::ai::model_names::ModelDef,
+    ) -> bool {
+        let Some(current) = current else {
+            return false;
+        };
+        let handle = Self::model_handle(model);
+        crate::ai::model_names::find_by_identifier(current)
+            .map(|def| Self::model_handle(def).eq_ignore_ascii_case(&handle))
+            .unwrap_or_else(|| {
+                current.eq_ignore_ascii_case(&model.name) || current.eq_ignore_ascii_case(&handle)
+            })
+    }
+
     fn ordered_model_names() -> Vec<String> {
-        let current = Self::current_model_hint().map(|m| m.to_lowercase());
+        let current = Self::current_model_hint();
         let mut current_first = Vec::new();
         let mut rest = Vec::new();
         for model in crate::ai::model_names::all() {
-            let name = model.name.clone();
-            if current.as_deref() == Some(&name.to_lowercase()) {
-                current_first.push(name);
+            let replacement = Self::model_replacement(model);
+            if Self::current_model_matches(current.as_deref(), model) {
+                current_first.push(replacement);
             } else {
-                rest.push(name);
+                rest.push(replacement);
             }
         }
         current_first.extend(rest);
@@ -174,40 +225,42 @@ impl CommandCompleter {
         } else {
             flags.join("/")
         };
-        format!("{} · {:?} · {}", model.name, model.provider, flags)
+        let handle = Self::model_handle(model);
+        format!("{} · {:?} · {}", handle, model.provider, flags)
     }
 
     fn model_command_candidates(prefix: &str) -> Vec<CompletionCandidate> {
-        let current = Self::current_model_hint().map(|m| m.to_lowercase());
+        let current = Self::current_model_hint();
         let mut candidates = Vec::new();
         for model in crate::ai::model_names::all() {
-            let display = if current.as_deref() == Some(&model.name.to_lowercase()) {
+            let replacement = Self::model_replacement(model);
+            let display = if Self::current_model_matches(current.as_deref(), model) {
                 format!("{} · current", Self::model_candidate_detail(model))
             } else {
                 Self::model_candidate_detail(model)
             };
             candidates.push(CompletionCandidate {
                 display,
-                replacement: format!("{prefix} {}", model.name),
+                replacement: format!("{prefix} {}", replacement),
             });
         }
         candidates
     }
 
     fn model_name_candidates() -> Vec<CompletionCandidate> {
-        let current = Self::current_model_hint().map(|m| m.to_lowercase());
+        let current = Self::current_model_hint();
         let mut candidates = Vec::new();
-        for name in Self::ordered_model_names() {
-            let model =
-                crate::ai::model_names::find_by_name(&name).expect("ordered model name must exist");
-            let display = if current.as_deref() == Some(&name.to_lowercase()) {
+        for replacement in Self::ordered_model_names() {
+            let model = crate::ai::model_names::find_by_identifier(&replacement)
+                .expect("ordered model handle must exist");
+            let display = if Self::current_model_matches(current.as_deref(), model) {
                 format!("{} · current", Self::model_candidate_detail(model))
             } else {
                 Self::model_candidate_detail(model)
             };
             candidates.push(CompletionCandidate {
                 display,
-                replacement: name,
+                replacement,
             });
         }
         candidates
@@ -221,9 +274,7 @@ impl CommandCompleter {
     /// 第二个 token；为了让 Tab 既能补出子命令也能补出模型名，
     /// `complete_for_line` 会把它们合并到候选列表中（前缀过滤）。
     fn model_subcommands() -> &'static [&'static str] {
-        &[
-            "current", "list", "help", "use", "select", "switch", "effort",
-        ]
+        &["current", "list", "help", "effort"]
     }
 
     /// `/model effort` 的第三个 token 候选：推理强度档位 + auto/off。
@@ -251,7 +302,9 @@ impl CommandCompleter {
 
     /// `/usage` 的子命令。
     fn usage_subcommands() -> &'static [&'static str] {
-        &["today", "7d", "30d", "all", "daily", "trend", "days", "help"]
+        &[
+            "today", "7d", "30d", "all", "daily", "trend", "days", "help",
+        ]
     }
 
     /// `/checkpoint` / `/cp` 的子命令。
@@ -375,31 +428,26 @@ impl CommandCompleter {
                                 .map(|candidate| (*candidate).to_string()),
                         )
                     }
-                    Some("use") | Some("select") | Some("switch") => {
-                        // `/model use <TAB>` -> 列出模型名。
-                        Self::model_name_candidates()
-                            .into_iter()
-                            .filter(|candidate| candidate.replacement.starts_with(token))
-                            .collect()
-                    }
                     _ => Vec::new(),
                 }
             } else {
                 let candidates = match first {
-                    "/skills" | ":skills" | "/skill" | ":skill" => {
-                        Self::skill_name_candidates()
-                            .into_iter()
-                            .filter(|c| c.replacement.starts_with(token))
-                        .collect()
-                    }
+                    "/skills" | ":skills" | "/skill" | ":skill" => Self::skill_name_candidates()
+                        .into_iter()
+                        .filter(|c| c.replacement.starts_with(token))
+                        .collect(),
                     _ => {
                         let sources: &[&str] = match first {
-                            "/agents" | ":agents" | "/agent" | ":agent" => Self::agent_subcommands(),
+                            "/agents" | ":agents" | "/agent" | ":agent" => {
+                                Self::agent_subcommands()
+                            }
                             "/sessions" | ":sessions" => Self::session_subcommands(),
                             "/history" | ":history" => Self::history_subcommands(),
                             "/personas" | ":personas" => Self::persona_subcommands(),
                             "/usage" | ":usage" => Self::usage_subcommands(),
-                            "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => Self::checkpoint_subcommands(),
+                            "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => {
+                                Self::checkpoint_subcommands()
+                            }
                             "/model" | ":model" => Self::model_subcommands(),
                             _ => &[],
                         };
@@ -517,7 +565,11 @@ pub(in crate::ai::prompt) fn skill_token_filters(rest: &str) -> Option<Vec<Strin
     if let Some(filter) = rest_lower.strip_prefix("skill") {
         filters.push(filter.to_string());
     }
-    if filters.is_empty() { None } else { Some(filters) }
+    if filters.is_empty() {
+        None
+    } else {
+        Some(filters)
+    }
 }
 
 /// 定位行尾的技能引用 token。要求 `@` 前是空白或行首、token 内无空白（与 `@file`
@@ -881,9 +933,8 @@ mod tests {
         let history = DefaultHistory::new();
         let model = crate::ai::model_names::all()
             .first()
-            .expect("models.json is empty")
-            .name
-            .clone();
+            .map(|m| crate::ai::model_names::model_handle(m))
+            .expect("models.json is empty");
 
         let (_, pairs) = completer
             .complete("/model", 6, &Context::new(&history))
@@ -900,9 +951,8 @@ mod tests {
     fn model_command_completion_prefers_current_model_first() {
         let current = crate::ai::model_names::all()
             .first()
-            .expect("models.json is empty")
-            .name
-            .clone();
+            .map(|m| crate::ai::model_names::model_handle(m))
+            .expect("models.json is empty");
         CommandCompleter::set_current_model_hint(&current);
 
         let (_, candidates) = CommandCompleter::complete_for_line("/model ", 7);
@@ -921,7 +971,10 @@ mod tests {
         assert!(
             candidates.iter().any(|c| c.replacement == "/usage"),
             "expected /usage for /usa, got: {:?}",
-            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+            candidates
+                .iter()
+                .map(|c| &c.replacement)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -932,7 +985,10 @@ mod tests {
         assert!(
             candidates.iter().any(|c| c.replacement == "--model"),
             "expected --model for --mod, got: {:?}",
-            candidates.iter().map(|c| &c.replacement).collect::<Vec<_>>()
+            candidates
+                .iter()
+                .map(|c| &c.replacement)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1038,9 +1094,15 @@ mod tests {
         assert_eq!(skill_token_filters("skill"), Some(vec![String::new()]));
         assert_eq!(skill_token_filters("skills"), Some(vec![String::new()]));
         // 无冒号过滤：`skillhum` → 关键字 `skill` + 前缀 `hum`。
-        assert_eq!(skill_token_filters("skillhum"), Some(vec!["hum".to_string()]));
+        assert_eq!(
+            skill_token_filters("skillhum"),
+            Some(vec!["hum".to_string()])
+        );
         // 冒号过滤。
-        assert_eq!(skill_token_filters("skills:deb"), Some(vec!["deb".to_string()]));
+        assert_eq!(
+            skill_token_filters("skills:deb"),
+            Some(vec!["deb".to_string()])
+        );
         // 太短或非前缀：不识别。
         assert_eq!(skill_token_filters("sk"), None);
         assert_eq!(skill_token_filters("skq"), None);
@@ -1050,9 +1112,8 @@ mod tests {
     fn direct_model_completion_lists_models() {
         let current = crate::ai::model_names::all()
             .first()
-            .expect("models.json is empty")
-            .name
-            .clone();
+            .map(|m| crate::ai::model_names::model_handle(m))
+            .expect("models.json is empty");
         CommandCompleter::set_current_model_hint(&current);
 
         let (_, candidates) = CommandCompleter::complete_for_line("/model ", 7);
@@ -1080,11 +1141,19 @@ mod tests {
     fn model_completion_includes_current_help_list_subcommands() {
         let (_, candidates) = CommandCompleter::complete_for_line("/model ", 7);
         let labels: Vec<_> = candidates.iter().map(|c| c.replacement.clone()).collect();
-        for sub in ["current", "list", "help", "use", "effort"] {
+        for sub in ["current", "list", "help", "effort"] {
             assert!(
                 labels.iter().any(|x| x == sub),
                 "expected subcommand `{}` in candidates: {:?}",
                 sub,
+                labels
+            );
+        }
+        for removed in ["use", "select", "switch"] {
+            assert!(
+                !labels.iter().any(|x| x == removed),
+                "did not expect removed model alias `{}` in candidates: {:?}",
+                removed,
                 labels
             );
         }
@@ -1116,18 +1185,11 @@ mod tests {
     }
 
     #[test]
-    fn model_use_completion_lists_models() {
-        let current = crate::ai::model_names::all()
-            .first()
-            .expect("models.json is empty")
-            .name
-            .clone();
-        CommandCompleter::set_current_model_hint(&current);
-
+    fn model_removed_alias_completion_lists_no_models() {
         let (_, candidates) = CommandCompleter::complete_for_line("/model use ", 11);
         assert!(
-            candidates.iter().any(|c| c.replacement == current),
-            "expected current model in `/model use ` candidates"
+            candidates.is_empty(),
+            "did not expect model candidates after removed `/model use` alias"
         );
     }
 

@@ -1207,8 +1207,9 @@ pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Optio
     {
         return None;
     }
+    let request_model = crate::ai::models::request_model_name(model);
     let mut body = json!({
-        "model": model,
+        "model": request_model,
         "messages": messages,
         "stream": false
     });

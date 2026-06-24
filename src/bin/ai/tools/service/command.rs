@@ -46,7 +46,6 @@ fn resolve_command_timeout(requested: Option<u64>, default: u64, max: u64) -> u6
     requested.unwrap_or(default).clamp(1, max)
 }
 
-
 fn truncate_chars(content: &str, max_chars: usize) -> String {
     if content.chars().count() <= max_chars {
         return content.to_string();

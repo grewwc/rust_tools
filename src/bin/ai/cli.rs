@@ -45,18 +45,32 @@ pub(super) struct ParsedCli {
 
 /// `a` 内部 "/" / ":" 命令列表，用于 shell 补全。
 const INTERNAL_COMMANDS: &[&str] = &[
-    "/help", ":help", "/h", ":h",
-    "/history", ":history",
-    "/usage", ":usage",
-    "/feishu-auth", ":feishu-auth",
-    "/share", ":share",
-    "/checkpoint", ":checkpoint",
-    "/cp", ":cp",
-    "/model", ":model",
-    "/agents", ":agents",
-    "/agent", ":agent",
-    "/personas", ":personas",
-    "/sessions", ":sessions",
+    "/help",
+    ":help",
+    "/h",
+    ":h",
+    "/history",
+    ":history",
+    "/usage",
+    ":usage",
+    "/feishu-auth",
+    ":feishu-auth",
+    "/share",
+    ":share",
+    "/checkpoint",
+    ":checkpoint",
+    "/cp",
+    ":cp",
+    "/model",
+    ":model",
+    "/agents",
+    ":agents",
+    "/agent",
+    ":agent",
+    "/personas",
+    ":personas",
+    "/sessions",
+    ":sessions",
 ];
 
 impl Default for ParsedCli {
@@ -115,11 +129,18 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         false,
         "AI-driven consolidation of all knowledge entries",
     );
-    parser.add_bool("note-search", false, "search knowledge base (memo category) and answer");
+    parser.add_bool(
+        "note-search",
+        false,
+        "search knowledge base (memo category) and answer",
+    );
     parser.alias("ns", "note-search");
     parser.alias("h", "help");
-    parser.add_bool("generate-completions", false,
-        "generate shell completion script (bash/zsh/fish) and exit");
+    parser.add_bool(
+        "generate-completions",
+        false,
+        "generate shell completion script (bash/zsh/fish) and exit",
+    );
 
     // 定义所有 string/int 选项
     parser.add_string("model", "", "model name");
@@ -140,9 +161,17 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     parser.add_string("note", "", "save text as memo to knowledge base and exit");
     parser.alias("n", "note");
-    parser.add_string("note-delete", "", "describe a memo to delete; AI matches it, confirm to delete");
+    parser.add_string(
+        "note-delete",
+        "",
+        "describe a memo to delete; AI matches it, confirm to delete",
+    );
     parser.alias("nd", "note-delete");
-    parser.add_string("note-edit", "", "describe a memo to edit; AI matches it, edit in editor and save");
+    parser.add_string(
+        "note-edit",
+        "",
+        "describe a memo to edit; AI matches it, edit in editor and save",
+    );
     parser.alias("ne", "note-edit");
 
     // 解析 argv（跳过 program name）
@@ -294,7 +323,11 @@ pub(super) fn print_help() {
         false,
         "AI-driven consolidation of all knowledge entries",
     );
-    parser.add_bool("note-search", false, "search knowledge base (memo category) and answer");
+    parser.add_bool(
+        "note-search",
+        false,
+        "search knowledge base (memo category) and answer",
+    );
     parser.alias("ns", "note-search");
     parser.alias("h", "help");
 
@@ -316,16 +349,26 @@ pub(super) fn print_help() {
 
     parser.add_string("note", "", "save text as memo to knowledge base and exit");
     parser.alias("n", "note");
-    parser.add_string("note-delete", "", "describe a memo to delete; AI matches it, confirm to delete");
+    parser.add_string(
+        "note-delete",
+        "",
+        "describe a memo to delete; AI matches it, confirm to delete",
+    );
     parser.alias("nd", "note-delete");
-    parser.add_string("note-edit", "", "describe a memo to edit; AI matches it, edit in editor and save");
+    parser.add_string(
+        "note-edit",
+        "",
+        "describe a memo to edit; AI matches it, edit in editor and save",
+    );
     parser.alias("ne", "note-edit");
 
     println!("AI CLI - Interactive AI Assistant");
     println!("Usage: a [OPTIONS] [PROMPT]");
     println!();
     println!("Quick Actions:");
-    println!("  --consolidate-knowledge  read all knowledge entries, analyze with LLM, clean up obsolete ones");
+    println!(
+        "  --consolidate-knowledge  read all knowledge entries, analyze with LLM, clean up obsolete ones"
+    );
     println!("  -n, --note <text>        save text as memo to knowledge base and exit");
     println!("  -ns, --note-search <q>   search memo category and answer with LLM");
     println!();
@@ -333,9 +376,7 @@ pub(super) fn print_help() {
     parser.print_defaults();
     println!();
     println!("Agent (CLI):");
-    println!(
-        "  --agent <name>            start with a specific agent (alias: -a)"
-    );
+    println!("  --agent <name>            start with a specific agent (alias: -a)");
     println!("  --list-agents             list available agents and exit");
     println!();
     println!("Session (CLI):");
@@ -411,7 +452,11 @@ pub fn generate_completion_script(shell: &str) {
     let mut parser = TermParser::new();
 
     // ===== bool 选项 =====
-    parser.add_bool("clear", false, "clear specified session history (use with --session)");
+    parser.add_bool(
+        "clear",
+        false,
+        "clear specified session history (use with --session)",
+    );
     parser.add_bool("list-tools", false, "list builtin tools and exit");
     parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
     parser.alias("list-mcp-servers", "list-mcp-tools");
@@ -420,12 +465,22 @@ pub fn generate_completion_script(shell: &str) {
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
     parser.alias("h", "help");
-    parser.add_bool("consolidate-knowledge", false,
-        "AI-driven consolidation of all knowledge entries");
-    parser.add_bool("note-search", false, "search knowledge base (memo category) and answer");
+    parser.add_bool(
+        "consolidate-knowledge",
+        false,
+        "AI-driven consolidation of all knowledge entries",
+    );
+    parser.add_bool(
+        "note-search",
+        false,
+        "search knowledge base (memo category) and answer",
+    );
     parser.alias("ns", "note-search");
-    parser.add_bool("generate-completions", false,
-        "generate shell completion script (bash/zsh/fish) and exit");
+    parser.add_bool(
+        "generate-completions",
+        false,
+        "generate shell completion script (bash/zsh/fish) and exit",
+    );
 
     // ===== string / int 选项 =====
     parser.add_string("model", "", "model name");
@@ -437,16 +492,25 @@ pub fn generate_completion_script(shell: &str) {
     parser.add_string("files", "", "input file names");
     parser.alias("f", "files");
     parser.add_string("mcp-config", "", "mcp config json path override");
-    parser.add_string("reasoning-effort", "",
-        "reasoning effort: minimal | low | medium | high | off");
+    parser.add_string(
+        "reasoning-effort",
+        "",
+        "reasoning effort: minimal | low | medium | high | off",
+    );
     parser.alias("re", "reasoning-effort");
     parser.add_string("note", "", "save text as memo to knowledge base and exit");
     parser.alias("n", "note");
-    parser.add_string("note-delete", "",
-        "describe a memo to delete; AI matches it, confirm to delete");
+    parser.add_string(
+        "note-delete",
+        "",
+        "describe a memo to delete; AI matches it, confirm to delete",
+    );
     parser.alias("nd", "note-delete");
-    parser.add_string("note-edit", "",
-        "describe a memo to edit; AI matches it, edit in editor and save");
+    parser.add_string(
+        "note-edit",
+        "",
+        "describe a memo to edit; AI matches it, edit in editor and save",
+    );
     parser.alias("ne", "note-edit");
 
     let info = parser.collect_completion_info();
@@ -465,6 +529,18 @@ pub fn generate_completion_script(shell: &str) {
     }
 }
 
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn model_selector_words() -> String {
+    crate::ai::model_names::all()
+        .into_iter()
+        .map(crate::ai::model_names::model_handle)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn generate_bash(
     info: &[(String, String, String, Vec<String>)],
     _is_bool: fn(&str) -> bool,
@@ -477,7 +553,11 @@ fn generate_bash(
     println!("  cur=\"${{COMP_WORDS[COMP_CWORD]}}\"");
     println!("  prev=\"${{COMP_WORDS[COMP_CWORD-1]}}\"");
     let flag_name = |name: &str| -> String {
-        if name.len() > 1 { format!("--{}", name) } else { format!("-{}", name) }
+        if name.len() > 1 {
+            format!("--{}", name)
+        } else {
+            format!("-{}", name)
+        }
     };
     let mut opts = String::new();
     for (name, _ty, _usage, aliases) in info {
@@ -501,10 +581,19 @@ fn generate_bash(
     println!(
         "  local history_sub='full user assistant tool system grep rewind undo last export copy 3 6 10 20'"
     );
-    println!("  local persona_sub='help list ls current cur create new use select switch delete del rm'");
-    println!("  local session_sub='list current new use delete clear-all export export-current export-last'");
+    println!(
+        "  local persona_sub='help list ls current cur create new use select switch delete del rm'"
+    );
+    println!(
+        "  local session_sub='list current new use delete clear-all export export-current export-last'"
+    );
     println!("  local agent_sub='help list current use auto'");
-    println!("  local model_sub='current list help use select switch effort'");
+    println!("  local model_sub='current list help effort'");
+    println!(
+        "  local model_selectors={}",
+        shell_single_quote(&model_selector_words())
+    );
+    println!("  local effort_levels='minimal low medium high auto off'");
     println!();
     // COMP_WORDS[0] 是命令名 a，内部命令位于 COMP_WORDS[1]。
     println!("  if [ \"$COMP_CWORD\" -ge 2 ]; then");
@@ -522,7 +611,17 @@ fn generate_bash(
     println!("      /personas|:personas)");
     println!("        COMPREPLY=($(compgen -W \"$persona_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /model|:model)");
-    println!("        COMPREPLY=($(compgen -W \"$model_sub\" -- \"$cur\")); return 0 ;;");
+    println!("        if [ \"$COMP_CWORD\" -eq 2 ]; then");
+    println!(
+        "          COMPREPLY=($(compgen -W \"$model_selectors $model_sub\" -- \"$cur\")); return 0"
+    );
+    println!("        fi");
+    println!(
+        "        if [ \"$COMP_CWORD\" -eq 3 ] && [ \"${{COMP_WORDS[2]}}\" = \"effort\" ]; then"
+    );
+    println!("          COMPREPLY=($(compgen -W \"$effort_levels\" -- \"$cur\")); return 0");
+    println!("        fi");
+    println!("        COMPREPLY=(); return 0 ;;");
     println!("    esac");
     println!("  fi");
     println!();
@@ -552,14 +651,23 @@ fn generate_zsh(
     };
     for (name, ty, usage, aliases) in info {
         let prefix = if name.len() > 1 { "--" } else { "-" };
-        println!("  _a_args+=({})", emit_flag(&format!("{}{}", prefix, name), ty, usage));
+        println!(
+            "  _a_args+=({})",
+            emit_flag(&format!("{}{}", prefix, name), ty, usage)
+        );
         for a in aliases {
             let a_prefix = if a.len() > 1 { "--" } else { "-" };
-            println!("  _a_args+=({})", emit_flag(&format!("{}{}", a_prefix, a), ty, usage));
+            println!(
+                "  _a_args+=({})",
+                emit_flag(&format!("{}{}", a_prefix, a), ty, usage)
+            );
         }
     }
     // 内部命令作为第一层 position args
-    println!("  local -a _a_internal_cmds=({})", INTERNAL_COMMANDS.join(" "));
+    println!(
+        "  local -a _a_internal_cmds=({})",
+        INTERNAL_COMMANDS.join(" ")
+    );
     println!();
     // 子命令映射
     println!("  local -a _a_usage_subcmds=(today 7d 30d all daily trend days help)");
@@ -567,11 +675,18 @@ fn generate_zsh(
     println!(
         "  local -a _a_history_subcmds=(full user assistant tool system grep rewind undo last export copy 3 6 10 20)"
     );
-    println!("  local -a _a_session_subcmds=(list current new use delete clear-all export export-current export-last)");
+    println!(
+        "  local -a _a_session_subcmds=(list current new use delete clear-all export export-current export-last)"
+    );
     println!("  local -a _a_agent_subcmds=(help list current use auto)");
-    println!("  local -a _a_persona_subcmds=(help list ls current cur create new use select switch delete del rm)");
-    println!("  local -a _a_model_subcmds=(current list help use select switch effort)");
+    println!(
+        "  local -a _a_persona_subcmds=(help list ls current cur create new use select switch delete del rm)"
+    );
+    println!("  local -a _a_model_subcmds=(current list help effort)");
+    println!("  local -a _a_model_selectors=({})", model_selector_words());
     println!("  local -a _a_effort_levels=(minimal low medium high auto off)");
+    println!("  local -a _a_model_entries");
+    println!("  _a_model_entries=($_a_model_selectors $_a_model_subcmds)");
     println!();
     // 若正在补全内部命令的子命令，先按子命令处理并 return，
     // 避免回落到 flags / 顶层命令补全。
@@ -607,7 +722,13 @@ fn generate_zsh(
     println!("        _describe 'persona subcommand' _a_persona_subcmds && return");
     println!("        ;;");
     println!("      /model|:model)");
-    println!("        _describe 'model subcommand or model name' _a_model_subcmds && return");
+    println!("        if (( CURRENT >= 4 )) && [[ \"$words[3]\" == \"effort\" ]]; then");
+    println!("          _describe 'reasoning effort' _a_effort_levels && return");
+    println!("        fi");
+    println!("        if (( CURRENT <= 3 )); then");
+    println!("          _describe 'model selector or subcommand' _a_model_entries && return");
+    println!("        fi");
+    println!("        return");
     println!("        ;;");
     println!("  esac");
     println!();
@@ -646,5 +767,35 @@ fn generate_fish(
     // 追加 "/" / ":" 内部命令
     for cmd in INTERNAL_COMMANDS {
         println!("complete -c a -a '{cmd}' -d 'internal command'");
+    }
+    println!(
+        "complete -c a -n '__fish_seen_subcommand_from /model :model' -a '{}' -d 'model selector'",
+        model_selector_words().replace('\'', "\\'")
+    );
+    println!(
+        "complete -c a -n '__fish_seen_subcommand_from /model :model' -a 'current list help effort' -d 'model command'"
+    );
+    println!(
+        "complete -c a -n '__fish_seen_subcommand_from effort' -a 'minimal low medium high auto off' -d 'reasoning effort'"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn model_selector_words_use_user_facing_selectors() {
+        let selectors = super::model_selector_words();
+
+        assert!(
+            selectors.contains("-alibaba") || selectors.contains("-opencode"),
+            "expected provider-qualified model selectors, got: {selectors}"
+        );
+        for removed in [" use ", " select ", " switch "] {
+            assert!(
+                !format!(" {selectors} ").contains(removed),
+                "model selector words should not include removed alias `{}`",
+                removed.trim()
+            );
+        }
     }
 }

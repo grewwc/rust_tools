@@ -184,7 +184,10 @@ impl KnowledgeMetadata {
             KnowledgeType::ExternalDependent => {
                 let check_interval = 60; // 1 分钟检查一次
                 ValidationStrategy::ExternalCheck {
-                    source: context.get_ref(&"source".to_string()).cloned().unwrap_or_default(),
+                    source: context
+                        .get_ref(&"source".to_string())
+                        .cloned()
+                        .unwrap_or_default(),
                     last_check: now,
                     check_interval,
                 }

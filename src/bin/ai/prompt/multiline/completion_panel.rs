@@ -92,10 +92,6 @@ fn should_submit_immediately(line: &str) -> bool {
     if matches!(second, "current" | "help" | "list") {
         return false;
     }
-    // `use|select|switch` 需要第三个 token (模型名) 才完整。
-    if matches!(second, "use" | "select" | "switch") {
-        return tokens.next().is_some();
-    }
     // `effort` 单独使用（查询）OK；带 level 时也 OK；
     // 但当用户只选中"effort"自身时，下一步还要选 level，
     // 所以这里要求 `effort` 后必须有第三个 token 才提交。
@@ -256,9 +252,8 @@ mod tests {
     fn model_completion_opens_popup_on_first_tab() {
         let current = crate::ai::model_names::all()
             .first()
-            .expect("models.json is empty")
-            .name
-            .clone();
+            .map(|m| crate::ai::model_names::model_handle(m))
+            .expect("models.json is empty");
         CommandCompleter::set_current_model_hint(&current);
 
         let mut textarea = TextArea::new(vec!["/model".to_string()]);
@@ -334,7 +329,7 @@ mod tests {
 
         let result = confirm_completion_selection(&mut textarea, &mut pending, &mut panel);
 
-        assert_eq!(textarea.lines(), vec!["/agent"]);  // 第一个候选 /agent（字典序 < /agents）
+        assert_eq!(textarea.lines(), vec!["/agent"]); // 第一个候选 /agent（字典序 < /agents）
         assert!(pending.is_none());
         assert!(panel.is_none());
         assert_eq!(result.submit, None);
@@ -345,9 +340,8 @@ mod tests {
     fn model_panel_confirmation_submits_immediately() {
         let current = crate::ai::model_names::all()
             .first()
-            .expect("models.json is empty")
-            .name
-            .clone();
+            .map(|m| crate::ai::model_names::model_handle(m))
+            .expect("models.json is empty");
         CommandCompleter::set_current_model_hint(&current);
 
         let mut textarea = TextArea::new(vec!["/model".to_string()]);

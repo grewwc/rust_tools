@@ -1429,7 +1429,10 @@ mod tests {
         // id 保持不变；内容被替换；条目数不变。
         assert_eq!(after.as_array().unwrap().len(), 1);
         assert_eq!(after[0]["id"].as_str().unwrap(), id);
-        assert_eq!(after[0]["note"].as_str().unwrap(), "ida 交接文档 更新后的内容");
+        assert_eq!(
+            after[0]["note"].as_str().unwrap(),
+            "ida 交接文档 更新后的内容"
+        );
 
         let _ = std::fs::remove_file(&path);
         unsafe {

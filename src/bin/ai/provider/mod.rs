@@ -1,9 +1,12 @@
 mod adapter;
 
+#[cfg(test)]
 pub(in crate::ai) use adapter::{
-    COMPATIBLE_DEFAULT_ENDPOINT, OPENAI_DEFAULT_ENDPOINT, OPENCODE_DEFAULT_ENDPOINT,
-    OPENROUTER_ENDPOINT, ProviderAdapter, ThinkingDialect, adapter_for, compatible_adapter,
-    opencode_adapter, openai_adapter, openrouter_adapter, thinking_dialect_for,
+    ALIBABA_DEFAULT_ENDPOINT, OPENCODE_DEFAULT_ENDPOINT, OPENROUTER_ENDPOINT,
+};
+pub(in crate::ai) use adapter::{
+    adapter_for, alibaba_adapter, compatible_adapter, openai_adapter, opencode_adapter,
+    openrouter_adapter, thinking_dialect_for,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]
@@ -11,16 +14,12 @@ pub(in crate::ai) use adapter::{
 pub(super) enum ApiProvider {
     #[default]
     Compatible,
+    #[serde(alias = "aliyun", alias = "dashscope")]
+    Alibaba,
     #[serde(alias = "openai")]
     OpenAi,
     #[serde(alias = "opencode")]
     OpenCode,
-}
-
-impl ApiProvider {
-    pub(super) fn is_openai(self) -> bool {
-        matches!(self, Self::OpenAi | Self::OpenCode)
-    }
 }
 
 #[derive(
@@ -110,6 +109,15 @@ mod tests {
         .unwrap();
         assert_eq!(def.provider, ApiProvider::OpenAi);
         assert_eq!(def.quality_tier, ModelQualityTier::Flagship);
+    }
+
+    #[test]
+    fn parses_alibaba_provider_alias() {
+        let def: ModelDef = serde_json::from_str(
+            r#"{"key":"X","name":"x","provider":"alibaba","quality_tier":"strong","is_vl":true,"search_enabled":false,"tools_default_enabled":true}"#,
+        )
+        .unwrap();
+        assert_eq!(def.provider, ApiProvider::Alibaba);
     }
 
     #[test]

@@ -26,7 +26,7 @@ use crate::commonw::configw;
 
 #[derive(Debug, Serialize)]
 struct RequestBody<'a> {
-    model: &'a str,
+    model: String,
     messages: &'a [Message],
     stream: bool,
     /// 思考开关的线缆字段，由 `thinking` 方言模块决定具体 key 与形状
@@ -659,7 +659,9 @@ pub(super) fn control_model_for_aux_tasks(app: &App) -> String {
         .filter(|v| !v.trim().is_empty())
         .map(models::determine_model)
         .unwrap_or_else(|| match models::model_provider(&app.current_model) {
-            ApiProvider::Compatible => models::determine_model(DEFAULT_CONTROL_MODEL),
+            ApiProvider::Alibaba | ApiProvider::Compatible => {
+                models::determine_model(DEFAULT_CONTROL_MODEL)
+            }
             _ => {
                 let current_model = app.current_model.trim();
                 if current_model.is_empty() {
@@ -1970,7 +1972,8 @@ pub(super) fn print_info(app: &App, model: &str) {
     };
     // 使用 println! 避免手动 flush 的权限问题
     println!(
-        "{ACCENT_MUTED}[{ACCENT_SUCCESS}{model}{ACCENT_MUTED} (search: {ACCENT_WARN}{search}{ACCENT_MUTED}, effort: {ACCENT_PRIMARY}{effort_label}{ACCENT_MUTED})]{RESET}",
+        "{ACCENT_MUTED}[{ACCENT_SUCCESS}{}{ACCENT_MUTED} (search: {ACCENT_WARN}{search}{ACCENT_MUTED}, effort: {ACCENT_PRIMARY}{effort_label}{ACCENT_MUTED})]{RESET}",
+        models::model_display_label(model),
     );
 }
 
@@ -1987,12 +1990,14 @@ fn build_request_body<'a>(
     let provider = models::model_provider(model);
     let endpoint = models::endpoint_for_model(model, "");
     let adapter = super::provider::adapter_for(provider, &endpoint);
-    let thinking_dialect = super::provider::thinking_dialect_for(provider, model, &endpoint);
+    let request_model = models::request_model_name(model);
+    let thinking_dialect =
+        super::provider::thinking_dialect_for(provider, &request_model, &endpoint);
     // 流式请求显式索取 usage：部分 provider（DashScope compatible-mode）流式下
     // 默认不返回 usage，必须声明 stream_options.include_usage 才能统计 token。
     let stream_options = stream.then(|| json!({ "include_usage": true }));
     RequestBody {
-        model,
+        model: request_model,
         messages,
         stream,
         thinking: thinking_dialect.fields(enable_thinking),
@@ -2008,7 +2013,8 @@ fn build_request_body<'a>(
 fn ensure_reasoning_content_echo_for_thinking_model(model: &str, messages: &mut [Message]) {
     let provider = models::model_provider(model);
     let endpoint = models::endpoint_for_model(model, "");
-    let dialect = super::provider::thinking_dialect_for(provider, model, &endpoint);
+    let request_model = models::request_model_name(model);
+    let dialect = super::provider::thinking_dialect_for(provider, &request_model, &endpoint);
     if !dialect.requires_reasoning_content_echo() {
         return;
     }
@@ -2035,7 +2041,8 @@ fn ensure_reasoning_content_echo_for_thinking_model(model: &str, messages: &mut 
 pub(in crate::ai) fn apply_aux_thinking_fields(model: &str, body: &mut Value) {
     let provider = models::model_provider(model);
     let endpoint = models::endpoint_for_model(model, "");
-    let dialect = super::provider::thinking_dialect_for(provider, model, &endpoint);
+    let request_model = models::request_model_name(model);
+    let dialect = super::provider::thinking_dialect_for(provider, &request_model, &endpoint);
     let fields = dialect.fields(false);
     if fields.is_empty() {
         return;
@@ -2113,8 +2120,9 @@ pub async fn do_request_json(
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     clear_stale_request_interrupt_before_request(app);
 
+    let request_model = models::request_model_name(model);
     let mut request_body = json!({
-        "model": model,
+        "model": request_model,
         "messages": messages,
         "stream": stream,
     });
@@ -2125,11 +2133,17 @@ pub async fn do_request_json(
     // 因此这里显式关闭 thinking，与后台 background_call 保持一致。
     apply_aux_thinking_fields(model, &mut request_body);
 
-    // reasoning_effort：仅在未跳过且 provider 为 OpenAI 兼容时注入。
+    // reasoning_effort：由 provider adapter 决定顶层或嵌套 wire 格式。
     if !skip_reasoning_effort {
         if let Some(effort) = resolve_reasoning_effort(app, model) {
-            if models::model_provider(model).is_openai() {
-                request_body["reasoning_effort"] = json!(effort.as_str());
+            let endpoint = endpoint_for_request_model(app, model);
+            let provider = models::model_provider(model);
+            let adapter = super::provider::adapter_for(provider, &endpoint);
+            if let Some(value) = adapter.reasoning_top_level(Some(effort.as_str())) {
+                request_body["reasoning_effort"] = json!(value);
+            }
+            if let Some(value) = adapter.reasoning_nested(Some(effort.as_str())) {
+                request_body["reasoning"] = value;
             }
         }
     }
@@ -2224,8 +2238,9 @@ pub async fn do_request_text_streaming(
 ) -> Result<String, Box<dyn std::error::Error>> {
     clear_stale_request_interrupt_before_request(app);
 
+    let request_model = models::request_model_name(model);
     let mut request_body = json!({
-        "model": model,
+        "model": request_model,
         "messages": messages,
         "stream": true,
         // 显式索取流式 usage：DashScope compatible-mode 流式默认不返回 usage，
@@ -2893,7 +2908,13 @@ mod tests {
 
     #[test]
     fn prompt_cache_model_support_rejects_plain_openai_model() {
-        let model = first_openai_model_name();
+        let Some(model) = first_openai_model_name() else {
+            eprintln!(
+                "[test] skipping prompt_cache_model_support_rejects_plain_openai_model: \
+                 no OpenAi model present in models.json"
+            );
+            return;
+        };
         assert!(!models::explicit_prompt_cache_enabled(&model));
     }
 
@@ -3111,12 +3132,11 @@ mod tests {
 
     /// 找一个真实存在的 OpenAi-provider 模型名做测试输入，避免硬编码
     /// 具体模型字符串导致 models.json 变更后测试失效。
-    fn first_openai_model_name() -> String {
+    fn first_openai_model_name() -> Option<String> {
         crate::ai::model_names::all()
             .iter()
             .find(|m| m.provider == crate::ai::provider::ApiProvider::OpenAi)
             .map(|m| m.name.clone())
-            .expect("models.json must contain at least one OpenAi-provider model")
     }
 
     fn first_openai_vl_model_name() -> Option<String> {
@@ -3126,10 +3146,10 @@ mod tests {
             .map(|m| m.name.clone())
     }
 
-    fn first_compatible_vl_model_name() -> Option<String> {
+    fn first_alibaba_vl_model_name() -> Option<String> {
         crate::ai::model_names::all()
             .iter()
-            .find(|m| m.provider == crate::ai::provider::ApiProvider::Compatible && m.is_vl)
+            .find(|m| m.provider == crate::ai::provider::ApiProvider::Alibaba && m.is_vl)
             .map(|m| m.name.clone())
     }
 
@@ -3155,11 +3175,11 @@ mod tests {
             reasoning_content: None,
         }];
 
-        // Compatible：嵌套 reasoning.effort + enable_thinking/enable_search，无 stream_options（非流式）。
-        let compatible_model = first_model_name_for_provider(ApiProvider::Compatible)
-            .expect("models.json must contain a Compatible model");
-        let compatible = build_request_body(
-            &compatible_model,
+        // Alibaba：嵌套 reasoning.effort + enable_thinking/enable_search，无 stream_options（非流式）。
+        let alibaba_model = first_model_name_for_provider(ApiProvider::Alibaba)
+            .expect("models.json must contain an Alibaba model");
+        let alibaba = build_request_body(
+            &alibaba_model,
             &messages,
             false,
             true,
@@ -3169,39 +3189,23 @@ mod tests {
             Some("high"),
         );
         assert_eq!(
-            serde_json::to_string(&compatible).unwrap(),
+            serde_json::to_string(&alibaba).unwrap(),
             format!(
-                r#"{{"model":"{compatible_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"enable_thinking":true,"enable_search":true,"reasoning":{{"effort":"high"}}}}"#
+                r#"{{"model":"{alibaba_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"enable_thinking":true,"enable_search":true,"reasoning":{{"effort":"high"}}}}"#
             )
         );
 
-        // OpenAI-provider 模型在 models.json 中均走 DashScope compatible-mode
-        // 端点（deepseek-v4-pro/flash、kimi、glm），该端点用 `enable_thinking`
-        // 控制思考——即使 provider 标成 openai。因此这里断言带 enable_thinking。
-        // 纯 OpenAI 协议（无 enable_thinking）的 wire 由下方 OpenCode 段覆盖。
-        let openai_model = first_openai_model_name();
-        let openai = build_request_body(
-            &openai_model,
-            &messages,
-            true,
-            true,
-            Some(true),
-            None,
-            None,
-            Some("high"),
-        );
-        assert_eq!(
-            serde_json::to_string(&openai).unwrap(),
-            format!(
-                r#"{{"model":"{openai_model}","messages":[{{"role":"user","content":"hi"}}],"stream":true,"enable_thinking":true,"reasoning_effort":"high","stream_options":{{"include_usage":true}}}}"#
-            )
-        );
-
-        // OpenCode：与 OpenAI 兼容族字段一致（顶层 reasoning_effort、省略扩展字段）。
-        // 注意：此处取的是 models.json 中第一个 opencode 模型（非 DeepSeek），
-        // 因此不带 `thinking` 对象字段。DeepSeek 专属的 `thinking` 字段由单独的
-        // `deepseek_request_body_uses_thinking_object` 测试覆盖。
-        if let Some(opencode_model) = first_model_name_for_provider(ApiProvider::OpenCode) {
+        // OpenCode 非 DeepSeek：与 OpenAI 兼容族字段一致
+        // （顶层 reasoning_effort、省略扩展字段）。DeepSeek 专属的 `thinking`
+        // 字段由单独的 `deepseek_request_body_uses_thinking_object` 测试覆盖。
+        let non_deepseek_opencode = crate::ai::model_names::all()
+            .iter()
+            .find(|m| {
+                m.provider == ApiProvider::OpenCode
+                    && !m.name.to_ascii_lowercase().contains("deepseek")
+            })
+            .map(|m| m.name.clone());
+        if let Some(opencode_model) = non_deepseek_opencode {
             let opencode = build_request_body(
                 &opencode_model,
                 &messages,
@@ -3219,6 +3223,38 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn build_request_body_sends_provider_model_name_for_key_handle() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("hi".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        let body = build_request_body(
+            "deepseek-v4-flash-opencode",
+            &messages,
+            false,
+            true,
+            Some(true),
+            None,
+            None,
+            Some("high"),
+        );
+        let json = serde_json::to_value(&body).unwrap();
+
+        assert_eq!(
+            json.get("model").and_then(|v| v.as_str()),
+            Some("deepseek-v4-flash")
+        );
+        assert_eq!(
+            json.pointer("/thinking/type").and_then(|v| v.as_str()),
+            Some("enabled")
+        );
     }
 
     #[test]
@@ -3315,11 +3351,11 @@ mod tests {
         );
     }
 
-    /// 核心回归：DashScope compatible-mode 端点的 openai-provider 模型
+    /// 核心回归：DashScope compatible-mode 端点的 Alibaba-provider 模型
     /// （deepseek-v4-pro/flash、kimi-k2.7-code）必须按 thinking gate 决策发送
     /// `enable_thinking`，否则「关闭」会被静默丢弃、模型仍 reasoning。
     #[test]
-    fn dashscope_openai_provider_honors_enable_thinking_gate() {
+    fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
         let messages = vec![Message {
             role: "user".to_string(),
             content: Value::String("hi".to_string()),
@@ -3353,7 +3389,7 @@ mod tests {
     }
 
     /// 辅助（非主链路）请求对 DashScope 端点模型必须显式关闭 thinking，
-    /// 否则默认开启的长推理链会撑爆辅助任务超时——provider 标 openai 也不例外。
+    /// 否则默认开启的长推理链会撑爆辅助任务超时。
     #[test]
     fn dashscope_aux_requests_disable_thinking_regardless_of_provider() {
         for model in ["qwen3.7-plus", "deepseek-v4-pro", "kimi-k2.7-code"] {
@@ -3376,11 +3412,11 @@ mod tests {
         );
         assert!(deepseek.get("enable_thinking").is_none());
 
-        // MiniMax（opencode 非 deepseek）无可靠关闭开关，aux 不注入任何思考字段。
-        let mut minimax = json!({ "model": "minimax-m2.5-free", "messages": [], "stream": false });
-        apply_aux_thinking_fields("minimax-m2.5-free", &mut minimax);
-        assert!(minimax.get("thinking").is_none());
-        assert!(minimax.get("enable_thinking").is_none());
+        // OpenCode 非 deepseek 无可靠关闭开关，aux 不注入任何思考字段。
+        let mut mimo = json!({ "model": "mimo-v2.5-free", "messages": [], "stream": false });
+        apply_aux_thinking_fields("mimo-v2.5-free", &mut mimo);
+        assert!(mimo.get("thinking").is_none());
+        assert!(mimo.get("enable_thinking").is_none());
     }
 
     #[test]
@@ -3392,7 +3428,13 @@ mod tests {
             tool_call_id: None,
             reasoning_content: None,
         }];
-        let model = first_openai_model_name();
+        let Some(model) = first_openai_model_name() else {
+            eprintln!(
+                "[test] skipping openai_request_body_omits_nonstandard_flags: \
+                 no OpenAi model present in models.json"
+            );
+            return;
+        };
         let body = build_request_body(
             &model,
             &messages,
@@ -3405,13 +3447,8 @@ mod tests {
         );
         let value = serde_json::to_value(&body).unwrap();
 
-        // OpenAI-provider 模型走 DashScope 端点，按端点应携带 enable_thinking；
-        // 但仍不发 enable_search（非 DashScope 之外的 OpenAI 兼容扩展），
-        // 且推理强度走顶层 reasoning_effort 而非嵌套 reasoning。
-        assert_eq!(
-            value.get("enable_thinking").and_then(|v| v.as_bool()),
-            Some(true)
-        );
+        // OpenAI-provider 不发送 DashScope 扩展字段，推理强度走顶层 reasoning_effort。
+        assert!(value.get("enable_thinking").is_none());
         assert!(value.get("enable_search").is_none());
         assert_eq!(
             value.get("reasoning_effort").and_then(|v| v.as_str()),
@@ -3425,7 +3462,7 @@ mod tests {
     }
 
     #[test]
-    fn compatible_request_body_keeps_extension_flags() {
+    fn alibaba_request_body_keeps_extension_flags() {
         let messages = vec![Message {
             role: "user".to_string(),
             content: Value::String("hello".to_string()),
@@ -3434,7 +3471,7 @@ mod tests {
             reasoning_content: None,
         }];
         let body = build_request_body(
-            "qwen",
+            "qwen3.7-plus",
             &messages,
             false,
             true,
@@ -3820,17 +3857,17 @@ mod tests {
     }
 
     #[test]
-    fn compatible_image_content_also_uses_object_image_url_shape() {
-        let Some(model) = first_compatible_vl_model_name() else {
+    fn alibaba_image_content_also_uses_object_image_url_shape() {
+        let Some(model) = first_alibaba_vl_model_name() else {
             eprintln!(
-                "[test] skipping compatible_image_content_also_uses_object_image_url_shape: \
-                 no Compatible+VL model present in models.json"
+                "[test] skipping alibaba_image_content_also_uses_object_image_url_shape: \
+                 no Alibaba+VL model present in models.json"
             );
             return;
         };
 
         let path =
-            std::env::temp_dir().join(format!("ai-compatible-image-{}.png", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("ai-alibaba-image-{}.png", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"fake").unwrap();
 
         let value =

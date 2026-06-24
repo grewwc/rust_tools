@@ -1,5 +1,8 @@
 use super::{
-    splitter::{self, AnthropicXmlToolCallStreamer, HermesXmlToolCallStreamer, InternalToolCallStreamEvent, InternalToolCallStreamer},
+    splitter::{
+        self, AnthropicXmlToolCallStreamer, HermesXmlToolCallStreamer, InternalToolCallStreamEvent,
+        InternalToolCallStreamer,
+    },
     state::{HiddenMetaParseState, InternalToolCall},
 };
 use crate::ai::request::StreamChunk;
@@ -470,7 +473,10 @@ mod tests {
             &mut anthropic_streamer,
         );
 
-        assert_eq!(events, vec![StreamTextEvent::AppendContent("prefix".to_string())]);
+        assert_eq!(
+            events,
+            vec![StreamTextEvent::AppendContent("prefix".to_string())]
+        );
         assert_eq!(tool_events.len(), 3);
         match (&tool_events[0], &tool_events[1], &tool_events[2]) {
             (

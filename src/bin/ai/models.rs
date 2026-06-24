@@ -10,47 +10,60 @@ use super::model_names::{self, ModelDef};
 use super::provider::{self, ApiProvider, ModelQualityTier, ReasoningEffort};
 use crate::commonw::configw;
 
+fn model_def(model: &str) -> Option<&'static ModelDef> {
+    model_names::find_by_identifier(model)
+}
+
+fn model_handle(model: &ModelDef) -> String {
+    model_names::model_handle(model)
+}
+
+pub(super) fn request_model_name(model: &str) -> String {
+    model_def(model)
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| model.trim().to_string())
+}
+
+pub(super) fn model_display_label(model: &str) -> String {
+    match model_def(model) {
+        Some(def) => model_names::model_handle(def),
+        None => model.trim().to_string(),
+    }
+}
+
 pub(super) fn is_vl_model(model: &str) -> bool {
-    model_names::find_by_name(model)
-        .map(|m| m.is_vl)
-        .unwrap_or(false)
+    model_def(model).map(|m| m.is_vl).unwrap_or(false)
 }
 
 pub(super) fn search_enabled(model: &str) -> bool {
-    model_names::find_by_name(model)
-        .map(|m| m.search_enabled)
-        .unwrap_or(true)
+    model_def(model).map(|m| m.search_enabled).unwrap_or(true)
 }
 
 pub(super) fn tools_enabled(model: &str) -> bool {
-    model_names::find_by_name(model)
+    model_def(model)
         .map(|m| m.tools_default_enabled)
         .unwrap_or(true)
 }
 
 pub(super) fn explicit_prompt_cache_enabled(model: &str) -> bool {
-    model_names::find_by_name(model)
+    model_def(model)
         .map(|m| m.explicit_prompt_cache)
         .unwrap_or(false)
 }
 
 pub(super) fn enable_thinking(model: &str) -> bool {
-    model_names::find_by_name(model)
-        .map(|m| m.enable_thinking)
-        .unwrap_or(false)
+    model_def(model).map(|m| m.enable_thinking).unwrap_or(false)
 }
 
 /// 返回该模型在 [models.json](../../../models.json) 中声明的默认推理强度
 /// （`reasoning_effort`）。CLI / `/model effort` 命令的覆盖会在
 /// `request::resolve_reasoning_effort` 里优先生效，此处仅给出"模型默认"。
 pub(super) fn default_reasoning_effort(model: &str) -> Option<ReasoningEffort> {
-    model_names::find_by_name(model).and_then(|m| m.reasoning_effort)
+    model_def(model).and_then(|m| m.reasoning_effort)
 }
 
 pub(super) fn model_provider(model: &str) -> ApiProvider {
-    model_names::find_by_name(model)
-        .map(|m| m.provider)
-        .unwrap_or_default()
+    model_def(model).map(|m| m.provider).unwrap_or_default()
 }
 
 fn default_endpoint_for_provider(provider: ApiProvider) -> &'static str {
@@ -62,7 +75,7 @@ fn default_api_key_config_candidates(provider: ApiProvider) -> &'static [&'stati
 }
 
 pub(super) fn endpoint_for_model(model: &str, global_fallback: &str) -> String {
-    if let Some(model_def) = model_names::find_by_name(model) {
+    if let Some(model_def) = model_def(model) {
         if let Some(endpoint) = model_def
             .endpoint
             .as_deref()
@@ -86,7 +99,7 @@ pub(super) fn endpoint_for_model(model: &str, global_fallback: &str) -> String {
 pub(super) fn api_key_for_model(model: &str, global_fallback: &str) -> String {
     let cfg = configw::get_all_config();
 
-    if let Some(config_key) = model_names::find_by_name(model)
+    if let Some(config_key) = model_def(model)
         .and_then(|m| m.api_key_config_key.as_deref())
         .map(str::trim)
         .filter(|key| !key.is_empty())
@@ -120,9 +133,7 @@ pub(super) fn endpoint_supports_anonymous_auth(endpoint: &str) -> bool {
 }
 
 pub(super) fn model_quality_tier(model: &str) -> ModelQualityTier {
-    model_names::find_by_name(model)
-        .map(|m| m.quality_tier)
-        .unwrap_or_default()
+    model_def(model).map(|m| m.quality_tier).unwrap_or_default()
 }
 
 fn default_context_window_tokens_for_tier(tier: ModelQualityTier) -> usize {
@@ -137,7 +148,7 @@ fn default_context_window_tokens_for_tier(tier: ModelQualityTier) -> usize {
 /// 返回模型上下文窗口（token）。
 /// 若 models.json 未声明，按质量档位给出保守默认值，供压缩预算动态估算使用。
 pub(super) fn context_window_tokens(model: &str) -> usize {
-    if let Some(def) = model_names::find_by_name(model) {
+    if let Some(def) = model_def(model) {
         return def
             .context_window_tokens
             .filter(|v| *v > 0)
@@ -146,15 +157,24 @@ pub(super) fn context_window_tokens(model: &str) -> usize {
     default_context_window_tokens_for_tier(model_quality_tier(model))
 }
 
-fn all_model_names() -> Vec<String> {
-    model_names::all().iter().map(|m| m.name.clone()).collect()
+fn all_model_search_candidates() -> Vec<(String, String)> {
+    model_names::all()
+        .iter()
+        .flat_map(|m| {
+            let handle = model_handle(m);
+            [(m.name.clone(), handle.clone()), (handle.clone(), handle)]
+        })
+        .collect()
 }
 
-fn vl_model_names() -> Vec<String> {
+fn vl_model_search_candidates() -> Vec<(String, String)> {
     model_names::all()
         .iter()
         .filter(|m| m.is_vl)
-        .map(|m| m.name.clone())
+        .flat_map(|m| {
+            let handle = model_handle(m);
+            [(m.name.clone(), handle.clone()), (handle.clone(), handle)]
+        })
         .collect()
 }
 
@@ -184,7 +204,14 @@ fn parse_disabled_model_tokens(raw: &str) -> Vec<String> {
 
 fn model_matches_disabled_tokens(model: &ModelDef, disabled: &[String]) -> bool {
     disabled.iter().any(|token| {
-        token.eq_ignore_ascii_case(&model.key) || token.eq_ignore_ascii_case(&model.name)
+        let handle = model_names::model_handle(model);
+        token.eq_ignore_ascii_case(&model.key)
+            || token.eq_ignore_ascii_case(&model.name)
+            || token.eq_ignore_ascii_case(&handle)
+            || model
+                .aliases
+                .iter()
+                .any(|alias| token.eq_ignore_ascii_case(alias))
     })
 }
 
@@ -213,7 +240,7 @@ pub(super) fn default_vl_model() -> String {
 
 pub(super) fn forced_deepseek_model() -> String {
     model_names::find_by_key("DEEPSEEK_V3")
-        .map(|m| m.name.as_str().to_owned())
+        .map(model_handle)
         .unwrap_or_else(default_model)
 }
 
@@ -262,15 +289,12 @@ pub(super) fn determine_model(model: &str) -> String {
     if raw.is_empty() {
         return default_model();
     }
-    if let Some(def) = super::model_names::find_by_key(raw) {
-        return def.name.as_str().to_owned();
+    if let Some(def) = model_names::find_by_identifier(raw) {
+        return model_handle(def);
     }
-    if let Some(def) = model_names::find_by_name(raw) {
-        return def.name.as_str().to_owned();
-    }
-    best_match_model_name(
+    best_match_model_handle(
         &raw.to_lowercase(),
-        all_model_names().into_iter(),
+        all_model_search_candidates().into_iter(),
         default_model(),
     )
 }
@@ -286,18 +310,22 @@ pub(super) fn determine_vl_model(model: &str) -> String {
         let all = model_names::all();
         let vl = all.iter().filter(|m| m.is_vl).nth(idx);
         if let Some(vl) = vl {
-            return vl.name.as_str().to_owned();
+            return model_handle(vl);
         }
         return default_vl_model();
     }
 
-    if let Some(def) = model_names::find_by_name(&model)
+    if let Some(def) = model_names::find_by_identifier(&model)
         && def.is_vl
     {
-        return def.name.as_str().to_owned();
+        return model_handle(def);
     }
 
-    best_match_model_name(&model, vl_model_names().into_iter(), default_vl_model())
+    best_match_model_handle(
+        &model,
+        vl_model_search_candidates().into_iter(),
+        default_vl_model(),
+    )
 }
 
 pub(super) fn supports_image_input(model: &str) -> bool {
@@ -320,11 +348,16 @@ pub(super) fn mark_model_temporarily_unavailable(model: &str, reason: &str) {
     }
     let until = Instant::now() + MODEL_RUNTIME_COOLDOWN;
     if let Ok(mut disabled) = RUNTIME_DISABLED_MODELS.lock() {
-        if let Some(def) =
-            model_names::find_by_name(trimmed).or_else(|| model_names::find_by_key(trimmed))
-        {
+        if let Some(def) = model_names::find_by_identifier(trimmed) {
             disabled.insert(normalize_model_token(&def.name), until);
             disabled.insert(normalize_model_token(&def.key), until);
+            disabled.insert(
+                normalize_model_token(&model_names::model_handle(def)),
+                until,
+            );
+            for alias in &def.aliases {
+                disabled.insert(normalize_model_token(alias), until);
+            }
         } else {
             disabled.insert(normalize_model_token(trimmed), until);
         }
@@ -341,8 +374,14 @@ fn runtime_model_disabled(model: &ModelDef) -> bool {
         return false;
     };
     disabled.retain(|_, until| *until > now);
+    let handle = model_names::model_handle(model);
     disabled.contains_key(&normalize_model_token(&model.name))
         || disabled.contains_key(&normalize_model_token(&model.key))
+        || disabled.contains_key(&normalize_model_token(&handle))
+        || model
+            .aliases
+            .iter()
+            .any(|alias| disabled.contains_key(&normalize_model_token(alias)))
 }
 
 pub(super) fn auto_subagent_model_for_agent(
@@ -505,22 +544,22 @@ fn pick_subagent_model_excluding(
 ) -> Option<String> {
     let disabled = disabled_model_tokens();
     let excluded = excluded_model.and_then(|model| {
-        model_names::find_by_name(model)
-            .or_else(|| model_names::find_by_key(model))
+        model_names::find_by_identifier(model)
             .map(|def| {
-                [
+                vec![
                     normalize_model_token(&def.name),
                     normalize_model_token(&def.key),
+                    normalize_model_token(&model_names::model_handle(def)),
                 ]
             })
-            .or_else(|| Some([normalize_model_token(model), normalize_model_token(model)]))
+            .or_else(|| Some(vec![normalize_model_token(model)]))
     });
     let mut candidates: Vec<&ModelDef> = model_names::all()
         .into_iter()
         .filter(|model| {
             model_auto_select_enabled(model, &disabled)
                 && subagent_model_eligible(model, require_thinking)
-                && !model_matches_excluded_tokens(model, excluded.as_ref())
+                && !model_matches_excluded_tokens(model, excluded.as_deref())
         })
         .collect();
 
@@ -535,7 +574,7 @@ fn pick_subagent_model_excluding(
     });
 
     if let Some(model) = candidates.first() {
-        return Some(model.name.clone());
+        return Some(model_handle(model));
     }
 
     // fallback: 放宽 thinking 要求，只要求 tools 可用
@@ -545,7 +584,7 @@ fn pick_subagent_model_excluding(
             .filter(|model| {
                 model_auto_select_enabled(model, &disabled)
                     && model.tools_default_enabled
-                    && !model_matches_excluded_tokens(model, excluded.as_ref())
+                    && !model_matches_excluded_tokens(model, excluded.as_deref())
             })
             .collect();
         tools_only.sort_by(|a, b| {
@@ -554,17 +593,24 @@ fn pick_subagent_model_excluding(
                 .then(b.quality_tier.cmp(&a.quality_tier))
         });
         if let Some(model) = tools_only.first() {
-            return Some(model.name.clone());
+            return Some(model_handle(model));
         }
     }
 
     None
 }
 
-fn model_matches_excluded_tokens(model: &ModelDef, excluded: Option<&[String; 2]>) -> bool {
+fn model_matches_excluded_tokens(model: &ModelDef, excluded: Option<&[String]>) -> bool {
     excluded.is_some_and(|tokens| {
         tokens.iter().any(|token| {
-            token.eq_ignore_ascii_case(&model.key) || token.eq_ignore_ascii_case(&model.name)
+            let handle = model_names::model_handle(model);
+            token.eq_ignore_ascii_case(&model.key)
+                || token.eq_ignore_ascii_case(&model.name)
+                || token.eq_ignore_ascii_case(&handle)
+                || model
+                    .aliases
+                    .iter()
+                    .any(|alias| token.eq_ignore_ascii_case(alias))
         })
     })
 }
@@ -590,11 +636,16 @@ fn choose_default_model_name(require_vl: bool) -> Option<String> {
         &candidates
             .iter()
             .copied()
-            .filter(|(_, model)| model.provider == ApiProvider::Compatible)
+            .filter(|(_, model)| {
+                matches!(
+                    model.provider,
+                    ApiProvider::Alibaba | ApiProvider::Compatible
+                )
+            })
             .collect::<Vec<_>>(),
     )
     .or_else(|| choose_best_default_candidate(&candidates))
-    .map(|(_, model)| model.name.clone())
+    .map(|(_, model)| model_handle(model))
 }
 
 fn choose_best_default_candidate<'a>(
@@ -630,20 +681,20 @@ fn quality_tier_satisfies_target(
     }
 }
 
-fn best_match_model_name(
+fn best_match_model_handle(
     input_lowercase: &str,
-    candidates: impl Iterator<Item = String>,
+    candidates: impl Iterator<Item = (String, String)>,
     default: String,
 ) -> String {
     let mut best = default;
     let mut best_dist = f32::MAX;
-    for candidate in candidates {
+    for (candidate, handle) in candidates {
         let candidate_lower = candidate.to_ascii_lowercase();
         let dist = levenshtein(input_lowercase.as_bytes(), candidate_lower.as_bytes()) as f32
             / (input_lowercase.len() + candidate_lower.len()) as f32;
         if dist < best_dist {
             best_dist = dist;
-            best = candidate;
+            best = handle;
         }
     }
     best
@@ -677,13 +728,13 @@ mod tests {
         determine_model, determine_vl_model, enable_thinking, endpoint_for_model,
         endpoint_supports_anonymous_auth, initial_model, merge_agent_tier_with_difficulty,
         model_matches_disabled_tokens, model_provider, model_quality_tier,
-        parse_disabled_model_tokens,
+        parse_disabled_model_tokens, request_model_name,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
     use crate::ai::config_schema::AiConfig;
     use crate::ai::provider::{
-        ApiProvider, COMPATIBLE_DEFAULT_ENDPOINT, ModelQualityTier, OPENCODE_DEFAULT_ENDPOINT,
+        ALIBABA_DEFAULT_ENDPOINT, ApiProvider, ModelQualityTier, OPENCODE_DEFAULT_ENDPOINT,
         OPENROUTER_ENDPOINT,
     };
 
@@ -747,7 +798,8 @@ mod tests {
             "Debug end-to-end failure",
             "Investigate a failing build across multiple files, implement fixes, run tests, and summarize remaining risks.",
         );
-        let def = super::model_names::find_by_name(&model).expect("selected model must exist");
+        let def =
+            super::model_names::find_by_identifier(&model).expect("selected model must exist");
         assert!(def.tools_default_enabled);
         assert!(def.enable_thinking);
         assert_eq!(def.quality_tier, ModelQualityTier::Flagship);
@@ -764,7 +816,8 @@ mod tests {
             "Plan a refactor",
             "Review the architecture, compare approaches, and propose a refactor strategy.",
         );
-        let def = super::model_names::find_by_name(&model).expect("selected model must exist");
+        let def =
+            super::model_names::find_by_identifier(&model).expect("selected model must exist");
         assert!(def.tools_default_enabled);
         assert!(def.enable_thinking);
         assert!(def.quality_tier >= ModelQualityTier::Strong);
@@ -827,41 +880,69 @@ mod tests {
         assert!(model_matches_disabled_tokens(by_key, &disabled));
     }
 
-    /// 选取一个真实存在的、provider=OpenAi 的模型名做用例输入；
+    /// 选取一个真实存在的、provider=Alibaba 的模型名做用例输入；
     /// 这样测试不会因为 models.json 增删个别条目而失效。
-    fn first_openai_model_name() -> String {
+    fn first_alibaba_model_name() -> String {
         super::model_names::all()
             .iter()
-            .find(|m| m.provider == ApiProvider::OpenAi)
+            .find(|m| m.provider == ApiProvider::Alibaba)
             .map(|m| m.name.clone())
-            .expect("models.json must contain at least one OpenAi-provider model")
+            .expect("models.json must contain at least one Alibaba-provider model")
     }
 
-    fn first_openai_vl_model_name() -> Option<String> {
+    fn first_alibaba_vl_model_name() -> Option<String> {
         super::model_names::all()
             .iter()
-            .find(|m| m.provider == ApiProvider::OpenAi && m.is_vl)
+            .find(|m| m.provider == ApiProvider::Alibaba && m.is_vl)
             .map(|m| m.name.clone())
     }
 
     #[test]
     fn known_model_entries_resolve_exactly_by_name() {
-        let openai = first_openai_model_name();
-        assert_eq!(determine_model(&openai), openai);
-        if let Some(vl) = first_openai_vl_model_name() {
-            assert_eq!(determine_vl_model(&vl), vl);
+        let alibaba = first_alibaba_model_name();
+        let alibaba_def = super::model_names::find_by_name(&alibaba).expect("model must exist");
+        assert_eq!(
+            determine_model(&alibaba),
+            super::model_names::model_handle(alibaba_def)
+        );
+        if let Some(vl) = first_alibaba_vl_model_name() {
+            let vl_def = super::model_names::find_by_name(&vl).expect("model must exist");
+            assert_eq!(
+                determine_vl_model(&vl),
+                super::model_names::model_handle(vl_def)
+            );
         }
     }
 
     #[test]
-    fn model_keys_resolve_to_model_names() {
-        // 用 models.json 中第一个真实条目反向校验 key→name 的映射，
+    fn model_keys_resolve_to_model_handles() {
+        // 用 models.json 中第一个真实条目反向校验 key→handle 的映射，
         // 而不是硬编码具体 key。
         let first = super::model_names::all()
             .first()
-            .map(|m| (m.key.clone(), m.name.clone()))
+            .map(|m| {
+                (
+                    m.key.clone(),
+                    super::model_names::model_handle(m).to_string(),
+                )
+            })
             .expect("models.json must contain at least one entry");
         assert_eq!(determine_model(&first.0), first.1);
+    }
+
+    #[test]
+    fn model_key_selects_duplicate_name_provider() {
+        let key = "deepseek-v4-flash-opencode";
+        let def = super::model_names::find_by_identifier(key)
+            .expect("models.json should contain opencode deepseek-v4-flash");
+
+        assert_eq!(def.name, "deepseek-v4-flash");
+        assert_eq!(def.provider, ApiProvider::OpenCode);
+        assert_eq!(determine_model(key), key);
+        assert_eq!(request_model_name(key), "deepseek-v4-flash");
+        assert_eq!(model_provider(key), ApiProvider::OpenCode);
+        assert_eq!(determine_model("DEEPSEEK_V4_FLASH_OPENCODE"), key);
+        assert_eq!(determine_model("deepseek-v4-flash opencode"), key);
     }
 
     #[test]
@@ -874,16 +955,15 @@ mod tests {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
         if let Some(key) = configured
-            && let Some(def) = super::model_names::find_by_key(&key)
-                .or_else(|| super::model_names::find_by_name(&key))
+            && let Some(def) = super::model_names::find_by_identifier(&key)
         {
-            assert_eq!(model, def.name);
+            assert_eq!(model, super::model_names::model_handle(def));
         }
     }
 
     #[test]
     fn known_model_entries_carry_provider_and_quality_tier() {
-        let name = first_openai_model_name();
+        let name = first_alibaba_model_name();
         let def = super::model_names::find_by_name(&name).expect("model must exist");
         assert_eq!(model_provider(&name), def.provider);
         assert_eq!(model_quality_tier(&name), def.quality_tier);
@@ -911,12 +991,12 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_for_compatible_model_prefers_model_config() {
-        // 找一个 Compatible provider 且配置了 endpoint 的模型，确保走 model 配置。
+    fn endpoint_for_alibaba_model_prefers_model_config() {
+        // 找一个 Alibaba provider 且配置了 endpoint 的模型，确保走 model 配置。
         let (name, expected) = super::model_names::all()
             .iter()
             .find_map(|m| {
-                if m.provider != ApiProvider::Compatible {
+                if m.provider != ApiProvider::Alibaba {
                     return None;
                 }
                 m.endpoint
@@ -925,15 +1005,15 @@ mod tests {
                     .filter(|e| !e.is_empty())
                     .map(|e| (m.name.clone(), e.to_string()))
             })
-            .expect("models.json must contain at least one Compatible entry with endpoint");
+            .expect("models.json must contain at least one Alibaba entry with endpoint");
         let endpoint = endpoint_for_model(&name, "");
         assert_eq!(endpoint, expected);
-        assert_eq!(endpoint, COMPATIBLE_DEFAULT_ENDPOINT);
+        assert_eq!(endpoint, ALIBABA_DEFAULT_ENDPOINT);
     }
 
     #[test]
-    fn openai_model_entries_prefer_openai_api_key_config() {
-        let name = first_openai_model_name();
+    fn alibaba_model_entries_accept_alibaba_api_key_config() {
+        let name = first_alibaba_model_name();
         let key = api_key_for_model(&name, "fallback-key");
         assert!(!key.is_empty());
     }
@@ -958,10 +1038,12 @@ mod tests {
 
     #[test]
     fn known_model_without_endpoint_uses_provider_default_before_global_fallback() {
-        let endpoint = endpoint_for_model(
-            "minimax-m2.5-free",
-            "https://example.com/v1/chat/completions",
-        );
+        let model = super::model_names::all()
+            .iter()
+            .find(|m| m.provider == ApiProvider::OpenCode && m.endpoint.is_none())
+            .map(|m| super::model_names::model_handle(m).to_string())
+            .expect("models.json must contain at least one OpenCode entry without endpoint");
+        let endpoint = endpoint_for_model(&model, "https://example.com/v1/chat/completions");
         assert_eq!(endpoint, OPENCODE_DEFAULT_ENDPOINT);
     }
 
@@ -986,12 +1068,12 @@ mod tests {
     }
 
     #[test]
-    fn default_model_prefers_high_quality_compatible_model() {
-        // default_model 在 choose_default_model_name 中先按 Compatible 过滤，
+    fn default_model_prefers_high_quality_alibaba_or_compatible_model() {
+        // default_model 在 choose_default_model_name 中先按 Alibaba / Compatible 过滤，
         // 再退回到全集，并按 quality_tier 取最高。这里把不变量直接写在断言上：
         //  1. 必须是 non-vl
         //  2. quality_tier 必须不低于所有同 provider-偏好下的候选
-        let def = super::model_names::find_by_name(&default_model())
+        let def = super::model_names::find_by_identifier(&default_model())
             .expect("default model must exist in models.json");
         assert!(!def.is_vl, "default model should be non-VL");
 

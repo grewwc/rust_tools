@@ -398,12 +398,7 @@ fn shrink_messages_to_fit_with_summary(
         return Vec::new();
     }
 
-    prepare_tool_messages_structured(
-        &mut messages,
-        480,
-        KEEP_RECENT_TOOL_MESSAGES,
-        overflow_dir,
-    );
+    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES, overflow_dir);
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
     dedup_repeated_tool_results(&mut messages);
@@ -606,9 +601,9 @@ fn truncate_first_message_to_fit(messages: &mut [Message], max_chars: usize) {
     // - 跳过 system（agent 指令不能被截断）；
     // - 跳过 user（用户原文零压缩）；
     // - 跳过图片消息（图片引用零压缩）。
-    let target_idx = messages
-        .iter()
-        .position(|m| m.role != "system" && m.role != "user" && !message_contains_image(&m.content));
+    let target_idx = messages.iter().position(|m| {
+        m.role != "system" && m.role != "user" && !message_contains_image(&m.content)
+    });
     let Some(target_idx) = target_idx else {
         return; // 全是 system，没有可截断的目标
     };
@@ -868,8 +863,8 @@ fn prepare_tool_messages_structured(
             && is_non_compressible_tool(name)
         {
             if text.chars().count() > max_chars_per_msg
-                && let Some(path) =
-                    overflow_dir.and_then(|dir| write_preserved_tool_overflow_file(dir, name, &text))
+                && let Some(path) = overflow_dir
+                    .and_then(|dir| write_preserved_tool_overflow_file(dir, name, &text))
             {
                 message.content =
                     Value::String(build_preserved_tool_overflow_stub(&path, name, &text));
@@ -1048,7 +1043,8 @@ fn first_preserved_content_spill_candidate(messages: &[Message]) -> Option<usize
         }
 
         let char_count = text.chars().count();
-        if message_contains_image(&message.content) && char_count >= IMAGE_OVERFLOW_SPILL_MIN_CHARS {
+        if message_contains_image(&message.content) && char_count >= IMAGE_OVERFLOW_SPILL_MIN_CHARS
+        {
             return Some(idx);
         }
         if message.role == "user" && char_count >= USER_OVERFLOW_SPILL_MIN_CHARS {
@@ -1120,7 +1116,8 @@ fn try_spill_preserved_message_to_stub(messages: &mut [Message], overflow_dir: &
     } else {
         "user"
     };
-    let Some(path) = write_preserved_message_overflow_file(overflow_dir, &messages[idx], kind) else {
+    let Some(path) = write_preserved_message_overflow_file(overflow_dir, &messages[idx], kind)
+    else {
         return false;
     };
     messages[idx].content = Value::String(build_preserved_message_overflow_stub(&path, kind));
@@ -2223,9 +2220,7 @@ fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
         .enumerate()
         .rev()
         .find(|(_, m)| {
-            m.role == "assistant"
-                && m.reasoning_content.is_some()
-                && m.tool_calls.is_none()
+            m.role == "assistant" && m.reasoning_content.is_some() && m.tool_calls.is_none()
         })
         .map(|(idx, _)| idx);
 

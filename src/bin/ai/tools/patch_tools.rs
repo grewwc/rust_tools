@@ -188,7 +188,10 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
         msg.push_str(&format!("  expected[{}]: {}\n", i, line));
     }
     if expected.len() > 10 {
-        msg.push_str(&format!("  ... ({} more expected lines)\n", expected.len() - 10));
+        msg.push_str(&format!(
+            "  ... ({} more expected lines)\n",
+            expected.len() - 10
+        ));
     }
 
     // 标称位置附近的实际文件内容（前后各 3 行窗口）。
@@ -269,8 +272,11 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
             let positions = all_hunk_match_positions(&orig_lines, hunk);
             let forward: Vec<usize> = positions.iter().copied().filter(|&p| p >= cursor).collect();
             if forward.len() > 1 {
-                let shown: Vec<String> =
-                    forward.iter().take(5).map(|p| (p + 1).to_string()).collect();
+                let shown: Vec<String> = forward
+                    .iter()
+                    .take(5)
+                    .map(|p| (p + 1).to_string())
+                    .collect();
                 return Err(format!(
                     "ambiguous patch: hunk context matches {} locations (1-based lines: {}{}). \
                      Add more surrounding context lines to the hunk so it uniquely identifies the target.",
