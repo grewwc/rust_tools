@@ -21,6 +21,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -47,6 +48,13 @@ const BUILTIN_SKILLS: &[(&str, &str)] = &[
 
 fn default_skill_version() -> String {
     "1.0.0".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SkillDiscoveryLevel {
+    Builtin = 0,
+    External = 1,
+    User = 2,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,34 +140,46 @@ impl SkillManifest {
 pub(super) fn load_all_skills() -> Vec<SkillManifest> {
     let dir = skills_dir();
     let _ = ensure_seeded_skills_dir(&dir);
-    let mut by_name: Box<SkipMap<String, SkillManifest>> =
+    let mut by_name: Box<SkipMap<String, (SkillDiscoveryLevel, SkillManifest)>> =
         SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
 
     for (filename, content) in BUILTIN_SKILLS {
         if let Ok(mut skill) = parse_skill_front_matter(content) {
             skill.source_path = Some(format!("builtin:{filename}"));
-            by_name.insert(skill.name.clone(), skill);
+            by_name.insert(skill.name.clone(), (SkillDiscoveryLevel::Builtin, skill));
+        }
+    }
+
+    for skill in load_external_skills() {
+        if should_insert_skill(&by_name, &skill.name, SkillDiscoveryLevel::External) {
+            by_name.insert(skill.name.clone(), (SkillDiscoveryLevel::External, skill));
         }
     }
 
     for skill in load_skills_from_dir(&dir) {
-        if let Some(existing) = by_name.get_ref(&skill.name)
-            && existing
-                .source_path
-                .as_deref()
-                .is_some_and(|p| p.starts_with("builtin:"))
-        {
-            continue;
+        if should_insert_skill(&by_name, &skill.name, SkillDiscoveryLevel::User) {
+            by_name.insert(skill.name.clone(), (SkillDiscoveryLevel::User, skill));
         }
-        by_name.insert(skill.name.clone(), skill);
     }
 
     let mut out = (&*by_name)
         .into_iter()
-        .map(|(_, v)| v.clone())
+        .map(|(_, (_, v))| v.clone())
         .collect::<Vec<_>>();
     out.sort_by(|a, b| b.priority.cmp(&a.priority).then(a.name.cmp(&b.name)));
     out
+}
+
+fn should_insert_skill(
+    by_name: &SkipMap<String, (SkillDiscoveryLevel, SkillManifest)>,
+    name: &str,
+    incoming_level: SkillDiscoveryLevel,
+) -> bool {
+    match by_name.get_ref(&name.to_string()) {
+        Some((SkillDiscoveryLevel::Builtin, _)) => false,
+        Some((level, _)) => incoming_level > *level,
+        None => true,
+    }
 }
 
 pub(super) fn skills_dir() -> PathBuf {
@@ -359,6 +379,38 @@ fn parse_skill_package_manifest(
 fn ensure_seeded_skills_dir(dir: &Path) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("failed to create skills dir: {e}"))?;
     Ok(())
+}
+
+fn load_external_skills() -> Vec<SkillManifest> {
+    discover_external_skill_dirs()
+        .into_iter()
+        .filter_map(|dir| load_skill_from_package_dir(&dir))
+        .collect()
+}
+
+fn discover_external_skill_dirs() -> Vec<PathBuf> {
+    let mut dirs = BTreeSet::new();
+    for pattern in external_skill_glob_patterns() {
+        let expanded = expanduser(pattern);
+        let Ok(paths) = glob::glob(expanded.as_ref()) else {
+            continue;
+        };
+        for entry in paths.flatten() {
+            if entry.is_dir() {
+                dirs.insert(entry);
+            }
+        }
+    }
+    dirs.into_iter().collect()
+}
+
+fn external_skill_glob_patterns() -> &'static [&'static str] {
+    &[
+        "~/.trae-cn/builtin_skills/*",
+        "~/.trae-cn/skills/*",
+        "~/.trae-cn/builtin/**/skills/*",
+        "~/.trae-cn/extensions/*/skills/*",
+    ]
 }
 
 fn load_skills_from_dir(dir: &Path) -> Vec<SkillManifest> {
@@ -757,5 +809,60 @@ Use bundled references."#,
         assert!(skill.source_path.as_deref().unwrap().contains(".zip!"));
         assert!(resource_path.join("references").join("guide.md").is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_all_skills_discovers_external_installed_skill_packages() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("rust-tools-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let old_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+
+        let trae_builtin = home.join(".trae-cn/builtin/global/skills/web-dev");
+        let trae_user = home.join(".trae-cn/skills/bits-code-guard");
+        let trae_extension = home.join(".trae-cn/extensions/pylance/skills/pylance-refactoring");
+        for (dir, name, description) in [
+            (&trae_builtin, "web-dev", "web skill"),
+            (&trae_user, "bits-code-guard", "review skill"),
+            (&trae_extension, "pylance-refactoring", "refactoring skill"),
+        ] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {description}\n---\n\nbody\n"),
+            )
+            .unwrap();
+        }
+
+        let skills = load_all_skills();
+        let names = skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>();
+        assert!(names.contains(&"web-dev"));
+        assert!(names.contains(&"bits-code-guard"));
+        assert!(names.contains(&"pylance-refactoring"));
+        let web_dev = skills.iter().find(|s| s.name == "web-dev").unwrap();
+        assert_eq!(
+            web_dev.resource_path.as_deref(),
+            Some(trae_builtin.display().to_string().as_str())
+        );
+        assert!(
+            web_dev
+                .source_path
+                .as_deref()
+                .unwrap()
+                .ends_with("SKILL.md")
+        );
+
+        match old_home {
+            Some(v) => unsafe {
+                std::env::set_var("HOME", v);
+            },
+            None => unsafe {
+                std::env::remove_var("HOME");
+            },
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

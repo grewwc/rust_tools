@@ -2,7 +2,7 @@
 
 ## Overview
 
-Rust workspace producing a core utility library and multiple CLI binaries. The primary product is `a` — an LLM-based AI Agent system (AIOS) with built-in process scheduling, Agent/Skill routing, tool registry, and MCP integration.
+This Rust workspace produces a core utility library and multiple CLI binaries. The primary product is `a`, an LLM-based AI Agent system (AIOS) featuring built-in process scheduling, Agent/Skill routing, a tool registry, and MCP integration.
 
 - **Edition**: Rust 2024
 - **Workspace**: `.` (main), `crates/rust_tools_macros`, `crates/aios_kernel`
@@ -19,8 +19,8 @@ src/
     ├── ai/                   # ★ AI Agent core (largest module)
     │   ├── driver/           # AIOS driver (run_loop, turn_runtime, thinking, reflection)
     │   ├── tools/            # Tool registry (registry/ service/ storage/ + *_tools.rs)
-    │   ├── builtin_agents/   # 5 agents: build, executor, explore, plan, prompt-skill
-    │   ├── builtin_skills/   # 3 skills: debugger, code-review, refactor
+    │   ├── builtin_agents/   # 5 built-in agents: build, executor, explore, plan, prompt-skill
+    │   ├── builtin_skills/   # 3 built-in skills: debugger, code-review, refactor
     │   ├── agents.rs skills.rs persona.rs models.rs config.rs types.rs cli.rs
     │   ├── history/ knowledge/ mcp/ prompt/ stream/ config/ provider/
     │   └── config_schema.rs  # All config key constants (AiConfig)
@@ -41,7 +41,7 @@ make all                          # Full build (all binaries)
 make install                      # Incremental install (changed binaries only)
 cargo build --release --bin a     # Build AI Agent
 cargo check --bin a               # Type-check (fast validation)
-cargo test --lib --bin a          # Run tests (955 tests)
+cargo test --lib --bin a          # Run tests (956 tests)
 cargo test --bin a test_xxx       # Filter tests by name
 ```
 
@@ -53,87 +53,92 @@ cargo test --bin a test_xxx       # Filter tests by name
    - IPC: mailbox messaging + shared memory (shm_create/read/write/delete)
 
 2. **Driver layer** (`src/bin/ai/driver/`)
-   - `run()` → `run_loop()` main event loop
-   - Each tick: schedule → background processes → foreground input → turn execution
-   - `turn_runtime/`: prepare → iterate (LLM + tools) → finalize
-   - `thinking/`: goal decomposition and verification
-   - `reflection/`: background reflection and knowledge writeback
-   - `commands/`: interactive commands (agent/feishu/session/model/share/persona)
-   - `embedding/`: document embedding index
-   - Persona system: `persona.rs` persists long-lived personas in `~/.config/rust_tools/personas.json`; switching persona rewrites the active history root and memory path so each persona keeps isolated sessions and long-term memory. `/personas` supports create/select/delete/current/list, and avatar is optional but unique when set.
-   - Agent/Skill routing: ML models (intent/agent_route/skill_match) + heuristics
+   - `run()` entry point invokes the main `run_loop()` event loop
+   - Each iteration of the event loop: schedule → background processes → foreground input → turn execution
+   - `turn_runtime/`: prepares context, then iterates through LLM calls interleaved with tool calls, then finalizes
+   - `thinking/`: decomposes the user's goal into sub-goals and verifies the decomposition against available tools
+   - `reflection/`: runs background reflection after each turn and writes knowledge back to long-term memory
+   - `commands/`: processes interactive commands (agent/feishu/session/model/share/persona)
+   - `embedding/`: builds and queries a document embedding index for semantic search
+   - Persona system: `persona.rs` persists long-lived personas in `~/.config/rust_tools/personas.json`. Switching persona rewrites the active history root and memory path, so each persona keeps isolated sessions and long-term memory. `/personas` supports create/select/delete/current/list. An avatar is optional but must be unique when set.
+   - Agent/Skill routing: uses ML models (intent/agent_route/skill_match) plus heuristic fallback rules.
 
 3. **Agent/Skill system**
-   - `.agent` files: YAML front-matter + Markdown prompt. Priority: project > workspace > user > builtin
-   - `.skill` files: YAML front-matter + prompt body. Triggered via tool calls
-   - Skill packages: user skills may also be directories or `.zip` archives containing `SKILL.md` or a top-level `.skill` manifest plus bundled resources. Zip packages are extracted into the skills cache and exposed to the active skill as a resource root.
-   - Routing: ML models (intent/agent_route/skill_match) + heuristic rules
+   - `.agent` files: YAML front-matter followed by a Markdown prompt body. Priority order: project > workspace > user > builtin.
+   - `.skill` files: YAML front-matter followed by a prompt body. Activated when a tool call triggers them.
+   - Skill packages: user skills may also be directories or `.zip` archives containing `SKILL.md` (or a top-level `.skill` manifest plus bundled resources). Zip packages are extracted into the skills cache and exposed to the active skill as a resource root.
+   - Discovery sources: skill loading merges built-in skills, the user skills directory, and packaged `SKILL.md` skills discovered from standard `~/.trae-cn` install roots (builtin/global/extension skills). Built-in skill names remain pinned if a lower-precedence source reuses the same name.
+   - Routing: uses ML models (intent/agent_route/skill_match) plus heuristic fallback rules.
 
 4. **Tool system** (`src/bin/ai/tools/`)
-   - Progressive loading: core tools enabled by default; extras via `enable_tools`
-   - Registry pattern: registry/ defines JSON Schema → service/ implements → storage/ persists
-   - MCP integration: stdio JSON-RPC transport
-   - Tool groups: core, builtin, executor, etc.
-   - `ast_symbols/`: multi-language AST extraction (Rust/Python/Java/Go/TS/JS/C/C++)
-   - Agent teams: `agent_team` launches parent-mediated multi-agent deliberation phases (`start` → `challenge` → `synthesize`) on top of existing `task_spawn` / `task_wait` kernel process, channel, and futex plumbing.
-   - Knowledge tools: `knowledge_save`, `knowledge_forget`, `knowledge_search`, `knowledge_list`, `knowledge_consolidate`
-   - `knowledge_consolidate` — two-phase AI-driven consolidation:
-     `action: "read_all"` → returns all entries for LLM analysis;
-     `action: "execute"` → batch-deletes obsolete IDs + batch-saves entries.
-     Backed by `MemoryStore::delete_by_ids` / `append_batch`.
-   - Memory tools: `memory_save`, `memory_search`, `memory_recent` (agent internal)
+   - **Progressive loading**: core tools are enabled by default; additional tools are loaded via `enable_tools`.
+   - **Registry pattern**: `registry/` defines JSON Schema → `service/` implements the logic → `storage/` persists data.
+   - **MCP integration**: communicates via stdio JSON-RPC transport.
+   - **Tool groups**: organized into groups such as core, builtin, executor, etc.
+   - **Code analysis**: `ast_symbols/` extracts AST symbols from multiple languages (Rust/Python/Java/Go/TS/JS/C/C++).
+   - **Agent teams**: `agent_team` launches parent-mediated multi-agent deliberation phases (`start` → `challenge` → `synthesize`). This sits on top of `task_spawn`/`task_wait` using the existing kernel process, channel, and futex plumbing.
+   - **Knowledge tools**: `knowledge_save`, `knowledge_forget`, `knowledge_search`, `knowledge_list`, `knowledge_consolidate`.
+     - `knowledge_consolidate` is a two-phase AI-driven consolidation tool:
+       - `action: "read_all"` — returns all entries for LLM analysis.
+       - `action: "execute"` — batch-deletes obsolete IDs and batch-saves new entries.
+       - Backed by `MemoryStore::delete_by_ids` and `append_batch`.
+   - **Memory tools**: `memory_save`, `memory_search`, `memory_recent` — these are agent-internal, not user-facing.
 
 5. **Configuration**
-   - Keys defined in `config_schema.rs` (`AiConfig` constants) — never use raw string literals
-   - Runtime config via `configw::get_all_config()`
-   - Model registry: `models.json` (endpoints, quality tiers, VL support)
-   - Automatic model selection skips runtime-unhealthy models after request failures; `ai.model.disabled` can still exclude known unavailable or too-expensive model keys/names without editing `models.json`.
-   - Embedding (optional, off by default): set `ai.embedding.enable=true` + `aliyun.api_key` (or `ai.embedding.api_key`) to enable semantic recall via Aliyun 百炼 OpenAI-compatible `/embeddings` (`text-embedding-v4`). Any failure degrades to BM25/lexical — see [embedder.rs](src/bin/ai/knowledge/indexing/embedder.rs).
+   - All config keys are defined as `AiConfig` constants in `config_schema.rs`. Never use raw string literals.
+   - Runtime configuration is read through `configw::get_all_config()`.
+   - Model registry lives in `models.json` and tracks endpoints, quality tiers, and vision-language (VL) support.
+   - Automatic model selection: after a request failure, the runtime skips the unhealthy model for subsequent requests. You can also exclude known-unavailable or too-expensive model keys/names via `ai.model.disabled`, without editing `models.json`.
+   - Embedding support (optional, off by default): set `ai.embedding.enable=true` and provide `aliyun.api_key` (or `ai.embedding.api_key`) to enable semantic recall via Aliyun 百炼's OpenAI-compatible `/embeddings` endpoint with `text-embedding-v4`. If embedding fails for any reason, the system gracefully degrades to BM25/lexical search — see [embedder.rs](src/bin/ai/knowledge/indexing/embedder.rs).
 
 6. **Provider adapter layer** (`src/bin/ai/provider/`)
-   - `ApiProvider` enum { Compatible, OpenAi, OpenCode } + `ModelQualityTier` / `ReasoningEffort` live in `provider/mod.rs`
-   - `provider/adapter.rs`: `trait ProviderAdapter` (template-method + override) collapses all per-provider behavior differences into one place — request-body fields (`enable_thinking`/`enable_search`/`reasoning_effort`/nested `reasoning`), aux-task thinking disable, default endpoint, API-key candidate chain, stream-chunk parsing, and the waiting-hint UX flag
-   - Zero-state static singletons: `CompatibleAdapter` / `OpenAiAdapter` / `OpenRouterAdapter` / `OpenCodeAdapter`; dispatch via `adapter_for(provider, endpoint)` (OpenRouter detected by endpoint containing `openrouter.ai`)
-   - Main pipeline (`request.rs` / `models.rs` / `stream/normalize.rs` / `stream/runtime.rs` / `driver/reflection/background.rs`) keeps free-function skeletons and only calls adapter hooks at difference points — wire format stays byte-identical (locked by per-provider `build_request_body` wire-guard tests)
+   - The `ApiProvider` enum (`Compatible`, `OpenAi`, `OpenCode`) and the types `ModelQualityTier`/`ReasoningEffort` are defined in `provider/mod.rs`.
+   - `provider/adapter.rs` defines the `ProviderAdapter` trait using a template-method pattern with override hooks. It consolidates all per-provider differences into one place:
+     - Request-body fields: `enable_thinking`, `enable_search`, `reasoning_effort`, nested `reasoning`.
+     - Auxiliary task: disabling thinking for non-primary requests.
+     - Default endpoint URL and API-key candidate chain.
+     - Stream-chunk parsing logic.
+     - The waiting-hint UX flag (indicates whether the provider shows a waiting hint in-stream).
+   - Zero-state static singletons: `CompatibleAdapter`, `OpenAiAdapter`, `OpenRouterAdapter`, `OpenCodeAdapter`. Dispatch is done via `adapter_for(provider, endpoint)` — OpenRouter is detected when the endpoint contains `openrouter.ai`.
+   - The main pipeline (`request.rs`, `models.rs`, `stream/normalize.rs`, `stream/runtime.rs`, `driver/reflection/background.rs`) keeps free-function skeletons and only calls adapter hooks at the points where providers differ. The wire format stays byte-identical across providers (locked by per-provider `build_request_body` wire-guard tests).
 
 ## Coding Standards
 
 ### General
 
-1. **Visibility**: Use `pub(super)` / `pub(crate)` to enforce module boundaries
-2. **Comments**: Project uses Chinese comments extensively — keep new code consistent
-3. **FastMap/FastSet**: Use `rustc-hash` FxHashMap/FxHashSet (re-exported via `commonw` and `aios_kernel::types`)
-4. **SkipMap**: Custom concurrent skip-list for ordered iteration (Agent/Skill loading)
-5. **Error handling**: Library code → `Result<T, Box<dyn Error>>`; Agent tools → `Result<String, String>`
-6. **Tests**: Inline `#[cfg(test)] mod tests` in modules; cross-crate in `tests/`; use `ENV_LOCK` for serial tests
-7. **Scope**: Do not reformat or reorder files unrelated to the task. Only modify files that need to change — no incidental formatting.
-8. **No unrelated changes**: Do not make any changes that are not required by the current task. This includes refactoring, reformatting, renaming, reorganizing, commenting, or any other modification to files, symbols, or code that is not directly relevant to the feature or fix being implemented.
- 
+1. **Visibility**: Use `pub(super)` / `pub(crate)` to enforce module boundaries.
+2. **Comments**: Project uses Chinese comments extensively — keep new code consistent.
+3. **FastMap/FastSet**: Use `rustc-hash` FxHashMap/FxHashSet (re-exported via `commonw` and `aios_kernel::types`).
+4. **SkipMap**: Custom concurrent skip-list for ordered iteration (used during Agent/Skill loading).
+5. **Error handling**: Library code uses `Result<T, Box<dyn Error>>`; Agent tools use `Result<String, String>`.
+6. **Tests**: Write inline tests with `#[cfg(test)] mod tests` inside modules. Cross-crate tests go in `tests/`. Use `ENV_LOCK` for serial tests.
+7. **Scope**: Only modify files that need to change. Do not reformat or reorder unrelated code.
+8. **No unrelated changes**: Never refactor, reformat, rename, reorganize, or comment on code that is not directly relevant to the current task.
 9. **Avoid hardcoded string rules**: Do not resort to hardcoded string-based judgment logic unless absolutely unavoidable. Prefer data-driven approaches — configuration, model-based routing, trait dispatch, or match on well-typed enums — over brittle string matching or regex-based rules.
 
 ### AI Module
 
-1. **Agent files** (`.agent`): Required: `name`/`description`. Optional: `mode`/`model`/`tools`/`tool_groups`/`mcp_servers`/`disable_mcp_tools`/`routing_tags`/`model_tier`/`color`
-2. **Skill files** (`.skill`): Required: `name`/`description`. Optional: `tools`/`tool_groups`/`triggers`/`priority`/`skip_recall`
-3. **Tool naming**: snake_case, verb-first (`read_file`, `execute_command`)
-4. **Tool registration**: Define schema in `tools/registry/`, implement in `tools/service/`
-5. **Config keys**: Add to `config_schema.rs` `AiConfig` — no scattered string literals
-6. **Knowledge consolidation**: `knowledge_consolidate` tool provides two-phase AI-driven consolidation: `read_all` returns all entries for LLM analysis; `execute` batch-deletes + batch-saves. Backed by `MemoryStore::delete_by_ids` / `append_batch`.
+1. **Agent files** (`.agent`): Required fields are `name` and `description`. Optional fields are `mode`, `model`, `tools`, `tool_groups`, `mcp_servers`, `disable_mcp_tools`, `routing_tags`, `model_tier`, and `color`.
+2. **Skill files** (`.skill`): Required fields are `name` and `description`. Optional fields are `tools`, `tool_groups`, `triggers`, `priority`, and `skip_recall`.
+3. **Tool naming**: Use snake_case with a verb-first convention (e.g., `read_file`, `execute_command`).
+4. **Tool registration**: Define the tool schema in `tools/registry/`, and implement the logic in `tools/service/`.
+5. **Config keys**: Add new keys to `config_schema.rs` as `AiConfig` constants — never scatter string literals.
+6. **Knowledge consolidation**: Use the `knowledge_consolidate` tool (two-phase AI-driven: `read_all` followed by `execute`). Backed by `MemoryStore::delete_by_ids` and `append_batch`.
 
 ### Testing
 
-- Naming: `test_feature_description` (snake_case)
-- Integration tests with `_go_compat` suffix = Go compatibility layer tests
-- Full suite: `cargo test --lib --bin a` (currently 955 tests)
-- Serial tests: guard with `test_support::ENV_LOCK`
+- **Naming**: Use snake_case: `test_feature_description`.
+- **Integration tests**: If a test has a `_go_compat` suffix, it belongs to the Go compatibility layer test suite.
+- **Full suite**: Run `cargo test --lib --bin a` (currently 956 tests).
+- **Serial tests**: Guard them with `test_support::ENV_LOCK`.
 
 ## Pitfalls
 
-1. **`include_str!`**: Agent/Skill files are compiled into the binary — editing `.agent`/`.skill` triggers recompilation
-2. **`ff_embed`**: AI Agent embeds `ff` module via `include!` — changes to `src/bin/ff/` affect `a`
-3. **Feature flags**: `agent-hang-debug` is debug-only; do not enable in normal development
-4. **Process safety**: `GLOBAL_OS` and `App.os` share `Arc<Mutex<Kernel>>`; use `with_os_kernel` or `DRIVER_CTX` task-local on hot paths
-5. **macOS-only**: `objc2*` crates compile only under `cfg(target_os = "macos")`
+1. **`include_str!`**: Agent and Skill files are compiled into the binary. This means editing a `.agent` or `.skill` file triggers recompilation.
+2. **`ff_embed`**: The AI Agent embeds the `ff` module via `include!`. Changes to `src/bin/ff/` affect `a`.
+3. **Feature flags**: `agent-hang-debug` is debug-only. Do not enable it in normal development.
+4. **Process safety**: `GLOBAL_OS` and `App.os` share an `Arc<Mutex<Kernel>>`. Use `with_os_kernel` or the `DRIVER_CTX` task-local on hot paths.
+5. **macOS-only**: `objc2*` crates compile only under `cfg(target_os = "macos")`.
 
 ## Key Dependencies
 
@@ -150,21 +155,21 @@ cargo test --bin a test_xxx       # Filter tests by name
 
 ## Project Instruction Injection
 
-When AI Agent runs in this project, it auto-discovers and loads these files as context:
-`AGENTS.md`, `Agent.md`, `CLAUDE.md` (case variants).
-Max 8,000 chars per file, 16,000 total. Project root detected via `.git`/`Cargo.toml` markers.
+When the AI Agent runs inside this project directory, it auto-discovers and loads these files as project context:
+`AGENTS.md`, `Agent.md`, `CLAUDE.md` (and case variants).
+Each file is limited to 8,000 characters, with a total limit of 16,000 characters across all files. The project root is detected by the presence of `.git` or `Cargo.toml` markers.
 
 ## Maintaining AGENTS.md
 
-**This document MUST be kept in sync whenever new features are added.** Specifically:
+**This document must be kept in sync whenever new features are added.** Specifically:
 
-1. **New modules/directories** → update the `Directory Layout` tree
-2. **New tools** → document in `Tool system` or `AI Module`
-3. **New agents/skills** → update counts and names in `builtin_agents/` / `builtin_skills/`
-4. **New dependencies** → add to the `Key Dependencies` table
-5. **New config keys** → document in `Configuration`
-6. **Architecture changes** → update the relevant `Architecture` section
-7. **Build/test changes** → update commands or test counts in `Build & Test`
-8. **New pitfalls** → add to `Pitfalls` when encountered
+1. **New modules/directories** → update the `Directory Layout` tree.
+2. **New tools** → document in the `Tool system` or `AI Module` section.
+3. **New agents/skills** → update counts and names in `builtin_agents/` / `builtin_skills/`.
+4. **New dependencies** → add to the `Key Dependencies` table.
+5. **New config keys** → document in the `Configuration` section.
+6. **Architecture changes** → update the relevant `Architecture` section.
+7. **Build/test changes** → update commands or test counts in `Build & Test`.
+8. **New pitfalls** → add to the `Pitfalls` section when encountered.
 
 > Principle: Keep AGENTS.md consistent with the actual codebase so the AI Agent always loads accurate project context.

@@ -330,7 +330,7 @@ pub fn print_skills(skill_manifests: &[SkillManifest]) {
     println!(
         "{}",
         format_section_note(&format!(
-            "register: put *.skill (or *.md) into {}",
+            "local dir: {}; packaged SKILL.md skills from standard install roots are also auto-discovered",
             dir.display()
         ))
     );
