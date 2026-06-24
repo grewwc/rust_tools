@@ -44,8 +44,19 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         popup.height - top_margin,
     );
 
+    let current_lines = textarea.lines().to_vec();
+    let trailing_blank_lines = count_trailing_blank_lines(&current_lines);
+
     // 计算各区域高度
     let help_lines: u16 = 2;
+    // 正文和底部帮助/状态栏之间预留 1 行视觉间距，但只在以下情况下启用：
+    // 1. 没有补全面板（否则可用高度太紧张）；
+    // 2. 正文末尾自己没有留空行。
+    let spacer_lines: u16 = if completion_panel.is_none() && trailing_blank_lines == 0 {
+        1
+    } else {
+        0
+    };
     // 面板激活时优先占满高度：先扣掉 help 行与 textarea 最小行，余下的尽量给面板
     // （面板期望高度 = min(候选数, COMPLETION_WINDOW) + 上下边框 2，但不超过可用空间）。
     // textarea 退让到最小 1 行（此时用户在选列表，不需要大编辑区）。
@@ -59,17 +70,23 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             let panel_cap = inner
                 .height
                 .saturating_sub(help_lines)
+                .saturating_sub(spacer_lines)
                 .saturating_sub(min_textarea_lines);
             let panel = desired_panel.min(panel_cap).max(1.min(panel_cap));
             let textarea = inner
                 .height
                 .saturating_sub(panel)
+                .saturating_sub(spacer_lines)
                 .saturating_sub(help_lines)
                 .max(min_textarea_lines);
             (textarea, panel)
         }
         None => {
-            let textarea = inner.height.saturating_sub(help_lines).max(min_textarea_lines);
+            let textarea = inner
+                .height
+                .saturating_sub(spacer_lines)
+                .saturating_sub(help_lines)
+                .max(min_textarea_lines);
             (textarea, 0)
         }
     };
@@ -79,6 +96,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         .constraints([
             Constraint::Length(textarea_lines),
             Constraint::Length(panel_lines),
+            Constraint::Length(spacer_lines),
             Constraint::Length(help_lines),
         ])
         .split(inner);
@@ -95,8 +113,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // 永久 scrollback，表现为「输入框上方堆叠多条横线」的 bug——而退出时
     // 的 `Clear(FromCursorDown)` 无法擦除光标上方的历史行。去掉装饰性横线
     // 即可根除该污染；底部 help 行已提供足够的区域分隔。
-    let _n = textarea.lines().len();
-    let current_content = textarea.lines().join("\n");
+    let current_content = current_lines.join("\n");
     let char_count = current_content.chars().count();
 
     // 设置对齐方式
@@ -248,10 +265,10 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             ]),
         ]
     };
-    f.render_widget(Paragraph::new(help_lines), chunks[2]);
+    f.render_widget(Paragraph::new(help_lines), chunks[3]);
 
     if let Some(msg) = status_msg {
-        let c2 = chunks[2];
+        let c2 = chunks[3];
         if c2.height >= 2 && c2.width > 2 {
             let status_width = (c2.width - 2) as usize;
             let status_text = truncate_with_ellipsis(msg, status_width);
@@ -268,6 +285,14 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             f.render_widget(status_para, status_area);
         }
     }
+}
+
+fn count_trailing_blank_lines(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .rev()
+        .take_while(|line| line.trim().is_empty())
+        .count()
 }
 
 /// 截断文本以适应显示宽度
@@ -308,7 +333,7 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_with_ellipsis;
+    use super::{count_trailing_blank_lines, truncate_with_ellipsis};
     use unicode_width::UnicodeWidthStr;
 
     fn display_width(s: &str) -> usize {
@@ -341,5 +366,21 @@ mod tests {
         let result = truncate_with_ellipsis("日本語テスト", 8);
         assert!(result.ends_with("..."));
         assert!(display_width(&result) <= 8);
+    }
+
+    #[test]
+    fn test_count_trailing_blank_lines() {
+        let lines = vec![
+            "第一行".to_string(),
+            String::new(),
+            "   ".to_string(),
+        ];
+        assert_eq!(count_trailing_blank_lines(&lines), 2);
+    }
+
+    #[test]
+    fn test_count_trailing_blank_lines_none() {
+        let lines = vec!["第一行".to_string(), "第二行".to_string()];
+        assert_eq!(count_trailing_blank_lines(&lines), 0);
     }
 }

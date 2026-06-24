@@ -1131,14 +1131,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
-    let prompt_editor = if cli.args.is_empty() {
-        Some(PromptEditor::new(
-            &session_id,
-            config.history_file.as_path(),
-        ))
-    } else {
-        None
-    };
+    // one-shot 模式（如 `-n/-nd/-ne`）虽然携带位置参数，但后续流程仍可能回退到
+    // 交互式多行输入/编辑；例如 `-ne` 在命中条目后需要打开预填编辑器。
+    // 因此不要把 prompt editor 绑定到“无位置参数”这一条件，否则会出现
+    // “命中条目后没有输入空间，直接被判定为取消”的问题。
+    let prompt_editor = Some(PromptEditor::new(
+        &session_id,
+        config.history_file.as_path(),
+    ));
 
     let os_arc = new_local_kernel();
     crate::ai::tools::os_tools::init_os_tools_globals(os_arc.clone());
