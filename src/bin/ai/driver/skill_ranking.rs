@@ -298,6 +298,7 @@ mod tests {
             priority: 0,
             excludes: Vec::new(),
             source_path: Some(format!("custom:{name}.skill")),
+            resource_path: None,
         }
     }
 

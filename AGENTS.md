@@ -41,7 +41,7 @@ make all                          # Full build (all binaries)
 make install                      # Incremental install (changed binaries only)
 cargo build --release --bin a     # Build AI Agent
 cargo check --bin a               # Type-check (fast validation)
-cargo test --lib --bin a          # Run tests (709 tests)
+cargo test --lib --bin a          # Run tests (955 tests)
 cargo test --bin a test_xxx       # Filter tests by name
 ```
 
@@ -66,6 +66,7 @@ cargo test --bin a test_xxx       # Filter tests by name
 3. **Agent/Skill system**
    - `.agent` files: YAML front-matter + Markdown prompt. Priority: project > workspace > user > builtin
    - `.skill` files: YAML front-matter + prompt body. Triggered via tool calls
+   - Skill packages: user skills may also be directories or `.zip` archives containing `SKILL.md` or a top-level `.skill` manifest plus bundled resources. Zip packages are extracted into the skills cache and exposed to the active skill as a resource root.
    - Routing: ML models (intent/agent_route/skill_match) + heuristic rules
 
 4. **Tool system** (`src/bin/ai/tools/`)
@@ -123,7 +124,7 @@ cargo test --bin a test_xxx       # Filter tests by name
 
 - Naming: `test_feature_description` (snake_case)
 - Integration tests with `_go_compat` suffix = Go compatibility layer tests
-- Full suite: `cargo test --lib --bin a` (currently 709 tests)
+- Full suite: `cargo test --lib --bin a` (currently 955 tests)
 - Serial tests: guard with `test_support::ENV_LOCK`
 
 ## Pitfalls
@@ -145,6 +146,7 @@ cargo test --bin a test_xxx       # Filter tests by name
 | `tree-sitter-*` | Multi-language AST analysis |
 | `crossterm` + `ratatui` | Terminal UI |
 | `inventory` | Compile-time tool registration |
+| `zip` | Read user skill package archives |
 
 ## Project Instruction Injection
 

@@ -715,6 +715,20 @@ fn build_system_prompt(
     };
     b.push(ContextKind::Identity, identity);
 
+    if let Some(resource_path) = skill
+        .and_then(|skill| skill.resource_path.as_deref())
+        .filter(|path| !path.trim().is_empty())
+    {
+        b.push_labeled(
+            ContextKind::Fact,
+            "Active Skill Resources",
+            format!(
+                "The active skill includes bundled resources at `{}`. When the skill instructions refer to bundled files, scripts, references, examples, or assets, inspect this directory with available file tools and use the relevant resources.",
+                resource_path.trim()
+            ),
+        );
+    }
+
     b.push(ContextKind::Behavior, "Response style:\n- Lead with answer or action; skip preamble, restatements, and meta-commentary.\n- Default to short, direct prose. Use lists/sections only when they materially improve clarity.\n- Be concise but not at the cost of correctness: verify facts with tools before concluding. When citing code, include file/line.\n- Do not narrate tool calls before/during execution — let their output speak. Brief status lines only at real milestones or when the plan changes.");
     b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Prefer tools over speculation: inspect code, run commands, search before concluding.\n- If the user asks to run/build/test/reproduce, use tools (execute_command / cargo_test) when available.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- Make minimal, targeted edits (apply_patch) rather than rewriting entire files.");
 
@@ -1496,6 +1510,7 @@ mod tests {
             priority: 0,
             excludes: Vec::new(),
             source_path: Some(format!("builtin:{name}.skill")),
+            resource_path: None,
         }
     }
 

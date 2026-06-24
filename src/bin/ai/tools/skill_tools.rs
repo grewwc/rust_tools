@@ -73,6 +73,7 @@ fn skill_search_haystack(skill: &SkillManifest) -> String {
         skill.name.clone(),
         skill.description.clone(),
         skill.source_path.clone().unwrap_or_default(),
+        skill.resource_path.clone().unwrap_or_default(),
     ];
     parts.extend(skill.tools.iter().cloned());
     parts.extend(skill.tool_groups.iter().cloned());
@@ -99,6 +100,11 @@ fn summarize_skill(skill: &SkillManifest, include_capabilities: bool) -> String 
         line.push_str(&format!(" | {}", skill.description.trim()));
     }
     if include_capabilities {
+        if let Some(resource_path) = skill.resource_path.as_deref()
+            && !resource_path.trim().is_empty()
+        {
+            line.push_str(&format!(" | resources={}", resource_path.trim()));
+        }
         if !skill.tools.is_empty() {
             line.push_str(&format!(" | tools={}", skill.tools.join(",")));
         }
@@ -676,9 +682,8 @@ mod tests {
     #[test]
     fn activate_skill_rejects_unknown_name() {
         let _g = ACTIVATION_TEST_GUARD.lock().unwrap();
-        let err =
-            execute_activate_skill(&serde_json::json!({"name": "definitely-not-a-skill"}))
-                .unwrap_err();
+        let err = execute_activate_skill(&serde_json::json!({"name": "definitely-not-a-skill"}))
+            .unwrap_err();
         assert!(err.contains("No skill named"));
         // 未命中不应写入待激活槽位，避免乱激活。
         assert!(take_pending_skill_activation().is_none());
@@ -694,7 +699,10 @@ mod tests {
         };
         let out = execute_activate_skill(&serde_json::json!({"name": name})).unwrap();
         assert!(out.contains(&name));
-        assert_eq!(take_pending_skill_activation().as_deref(), Some(name.as_str()));
+        assert_eq!(
+            take_pending_skill_activation().as_deref(),
+            Some(name.as_str())
+        );
         // take 应清空槽位。
         assert!(take_pending_skill_activation().is_none());
     }
@@ -717,6 +725,7 @@ mod tests {
             priority: 0,
             excludes: Vec::new(),
             source_path: None,
+            resource_path: None,
         }
     }
 }
