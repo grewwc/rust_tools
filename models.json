@@ -23,7 +23,6 @@
       "deepseek-v4-flash-openai"
     ],
     "name": "deepseek-v4-flash",
-    "default_reasoning_effort": "high",
     "provider": "alibaba",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "strong",
@@ -39,7 +38,6 @@
       "DEEPSEEK_V4_FLASH_OPENCODE"
     ],
     "name": "deepseek-v4-flash",
-    "default_reasoning_effort": "high",
     "provider": "opencode",
     "quality_tier": "strong",
     "is_vl": false,
