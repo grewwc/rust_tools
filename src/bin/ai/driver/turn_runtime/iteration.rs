@@ -4,7 +4,9 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
 
 use crate::ai::{
-    driver::{drain_response, input, print::print_assistant_banner_with_app, skill_runtime},
+    driver::{
+        drain_response, input, print::print_assistant_banner_with_app_and_skill, skill_runtime,
+    },
     history::Message,
     mcp::McpClient,
     request::{self, do_request_messages},
@@ -359,9 +361,10 @@ async fn stream_model_response(
     response: &mut reqwest::Response,
     current_history: &mut String,
     terminal_dedupe_candidate: Option<&str>,
+    active_skill_name: Option<&str>,
     _iteration: usize,
 ) -> StreamResult {
-    print_assistant_banner_with_app(Some(app));
+    print_assistant_banner_with_app_and_skill(Some(app), active_skill_name);
     let stream_ok =
         match stream::stream_response(app, response, current_history, terminal_dedupe_candidate)
             .await
@@ -448,6 +451,7 @@ pub(super) async fn execute_turn_iteration(
     should_quit: bool,
     force_final_response: bool,
     terminal_dedupe_candidate: Option<&str>,
+    active_skill_name: Option<&str>,
     iteration: usize,
 ) -> Result<IterationExecution, Box<dyn std::error::Error>> {
     let mut current_history = String::new();
@@ -512,6 +516,7 @@ pub(super) async fn execute_turn_iteration(
         &mut response,
         &mut current_history,
         terminal_dedupe_candidate,
+        active_skill_name,
         iteration,
     )
     .await;

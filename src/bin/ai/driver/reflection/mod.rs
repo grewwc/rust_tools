@@ -138,7 +138,10 @@ impl ReflectionQuality {
     }
 
     pub fn is_high_quality(&self) -> bool {
-        self.score() >= 2
+        // 长期沉淀必须满足"可执行 + 可泛化"两条底线。
+        // 仅仅具体但不可迁移的运行时实例（例如原始 tool error / 路径 / 一次性报错）
+        // 不应被晋升为长期知识或稳定 guideline。
+        self.actionable && self.generalizable
     }
 }
 

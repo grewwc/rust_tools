@@ -4,8 +4,8 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-use rustc_hash::FxHashMap;
 use rust_tools::cw::SkipMap;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -543,6 +543,7 @@ mod tests {
             tools: Vec::new(),
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),
+            disable_mcp_tools: false,
             routing_tags: routing_tags.iter().map(|tag| (*tag).to_string()).collect(),
             model_tier: Some(AgentModelTier::Heavy),
             disabled: false,

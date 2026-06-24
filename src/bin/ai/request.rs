@@ -2057,7 +2057,10 @@ fn prompt_cache_enabled_for_model(model: &str) -> bool {
 
 fn prompt_cache_config_enabled() -> bool {
     configw::get_all_config()
-        .get(crate::ai::config_schema::AiConfig::PROMPT_CACHE_ENABLE, "false")
+        .get(
+            crate::ai::config_schema::AiConfig::PROMPT_CACHE_ENABLE,
+            "false",
+        )
         .trim()
         .eq_ignore_ascii_case("true")
 }
@@ -2495,14 +2498,13 @@ pub(super) async fn summarize_history_via_model(
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send();
-    let response =
-        match tokio::time::timeout(Duration::from_secs(60), send_future).await {
-            Ok(r) => r.ok()?,
-            Err(_) => {
-                eprintln!("[summary] timeout (60s) waiting for response headers, skipping");
-                return None;
-            }
-        };
+    let response = match tokio::time::timeout(Duration::from_secs(60), send_future).await {
+        Ok(r) => r.ok()?,
+        Err(_) => {
+            eprintln!("[summary] timeout (60s) waiting for response headers, skipping");
+            return None;
+        }
+    };
     if !response.status().is_success() {
         return None;
     }
@@ -2900,6 +2902,7 @@ mod tests {
             cli: ParsedCli::default(),
             config: AppConfig {
                 api_key: String::new(),
+                base_history_file: PathBuf::new(),
                 history_file: PathBuf::new(),
                 endpoint: String::new(),
                 vl_default_model: String::new(),
@@ -2913,12 +2916,14 @@ mod tests {
             },
             session_id: String::new(),
             session_history_file: PathBuf::new(),
+            active_persona: crate::ai::persona::default_persona(),
             client: reqwest::Client::builder().build().unwrap(),
             current_model: String::new(),
             current_agent: String::new(),
             current_agent_manifest: None,
             pending_files: None,
             forced_skill: None,
+            forced_question: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
@@ -2985,13 +2990,15 @@ mod tests {
 
     #[test]
     fn strip_system_reminders_removes_injected_block() {
-        let raw = "<system-reminder>\nlots of injected context\nmore lines\n</system-reminder>\n\nhi";
+        let raw =
+            "<system-reminder>\nlots of injected context\nmore lines\n</system-reminder>\n\nhi";
         assert_eq!(strip_system_reminders(raw), "\n\nhi");
     }
 
     #[test]
     fn strip_system_reminders_handles_multiple_and_unclosed() {
-        let raw = "<system-reminder>a</system-reminder>real<system-reminder>b</system-reminder> text";
+        let raw =
+            "<system-reminder>a</system-reminder>real<system-reminder>b</system-reminder> text";
         assert_eq!(strip_system_reminders(raw), "real text");
 
         let unclosed = "<system-reminder>never closed and then the question hi";
@@ -3126,9 +3133,7 @@ mod tests {
             .map(|m| m.name.clone())
     }
 
-    fn first_model_name_for_provider(
-        provider: crate::ai::provider::ApiProvider,
-    ) -> Option<String> {
+    fn first_model_name_for_provider(provider: crate::ai::provider::ApiProvider) -> Option<String> {
         crate::ai::model_names::all()
             .iter()
             .find(|m| m.provider == provider)
@@ -3304,7 +3309,10 @@ mod tests {
         assert_eq!(messages[0].reasoning_content.as_deref(), Some(""));
 
         let value = serde_json::to_value(&messages[0]).unwrap();
-        assert_eq!(value.get("reasoning_content").and_then(|v| v.as_str()), Some(""));
+        assert_eq!(
+            value.get("reasoning_content").and_then(|v| v.as_str()),
+            Some("")
+        );
     }
 
     /// 核心回归：DashScope compatible-mode 端点的 openai-provider 模型
@@ -3322,9 +3330,8 @@ mod tests {
 
         for model in ["deepseek-v4-pro", "deepseek-v4-flash", "kimi-k2.7-code"] {
             // gate 关闭 → enable_thinking:false
-            let disabled = build_request_body(
-                model, &messages, false, false, None, None, None, None,
-            );
+            let disabled =
+                build_request_body(model, &messages, false, false, None, None, None, None);
             let disabled = serde_json::to_value(&disabled).unwrap();
             assert_eq!(
                 disabled.get("enable_thinking").and_then(|v| v.as_bool()),
@@ -3335,9 +3342,7 @@ mod tests {
             assert!(disabled.get("thinking").is_none(), "{model}");
 
             // gate 开启 → enable_thinking:true
-            let enabled = build_request_body(
-                model, &messages, false, true, None, None, None, None,
-            );
+            let enabled = build_request_body(model, &messages, false, true, None, None, None, None);
             let enabled = serde_json::to_value(&enabled).unwrap();
             assert_eq!(
                 enabled.get("enable_thinking").and_then(|v| v.as_bool()),
@@ -3362,7 +3367,8 @@ mod tests {
         }
 
         // OpenCode 的 deepseek 不靠 enable_thinking，aux 关闭走 thinking 对象。
-        let mut deepseek = json!({ "model": "deepseek-v4-flash-free", "messages": [], "stream": false });
+        let mut deepseek =
+            json!({ "model": "deepseek-v4-flash-free", "messages": [], "stream": false });
         apply_aux_thinking_fields("deepseek-v4-flash-free", &mut deepseek);
         assert_eq!(
             deepseek.get("thinking"),
@@ -3731,8 +3737,8 @@ mod tests {
         assert!(
             normalized
                 .iter()
-            .skip(1)
-            .all(|message| message.tool_calls.is_none())
+                .skip(1)
+                .all(|message| message.tool_calls.is_none())
         );
     }
 
@@ -3886,9 +3892,11 @@ mod tests {
 
         let normalized = normalize_messages_for_model(&model, &messages);
 
-        assert!(normalized
-            .iter()
-            .all(|message| !matches!(message.content, Value::Array(_))));
+        assert!(
+            normalized
+                .iter()
+                .all(|message| !matches!(message.content, Value::Array(_)))
+        );
         let content = normalized[1].content.as_str().unwrap();
         assert!(content.contains("[image omitted]"));
         assert!(content.contains("please explain"));

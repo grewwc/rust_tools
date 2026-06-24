@@ -180,7 +180,10 @@ async fn prepare_mcp_initialization_from_path_inner(
         }
     }
 
-    let server_entries: Vec<_> = loaded_servers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let server_entries: Vec<_> = loaded_servers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let mut client = McpClient::new();
     for (name, cfg) in &server_entries {
         if interruptible

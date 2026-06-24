@@ -28,27 +28,134 @@ const RECENT_MEMORY_CACHE_TTL: Duration = Duration::from_secs(60);
 static RECENT_MEMORY_CACHE: LazyLock<Mutex<Option<RecentMemoryCacheEntry>>> =
     LazyLock::new(|| Mutex::new(None));
 
-fn question_has_code_or_task_shape(question: &str) -> bool {
-    let trimmed = question.trim();
-    let chars = trimmed.chars().count();
-    let line_count = trimmed
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .count();
-    let lower = trimmed.to_ascii_lowercase();
-    chars >= 80
-        || line_count >= 2
-        || trimmed.contains("```")
-        || trimmed.contains("::")
-        || trimmed.contains('/')
-        || trimmed.contains('\\')
-        || [
-            ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", "cargo", "实现",
-            "修复", "排查", "调试", "报错", "测试", "单测", "验证", "review", "重构", "优化",
-            "架构",
-        ]
-        .iter()
-        .any(|needle| lower.contains(needle))
+#[derive(Debug, Clone, Copy, Default)]
+struct QuestionShape {
+    char_count: usize,
+    nonempty_line_count: usize,
+    artifact_token_count: usize,
+    has_code_fence: bool,
+    has_inline_code: bool,
+    has_namespace_path: bool,
+    has_list_marker: bool,
+}
+
+impl QuestionShape {
+    fn analyze(question: &str) -> Self {
+        let trimmed = question.trim();
+        let mut shape = QuestionShape {
+            char_count: trimmed.chars().count(),
+            has_code_fence: trimmed.contains("```"),
+            has_inline_code: trimmed.contains('`'),
+            has_namespace_path: trimmed.contains("::"),
+            ..QuestionShape::default()
+        };
+
+        for line in trimmed.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            shape.nonempty_line_count += 1;
+            shape.has_list_marker |= line_has_list_marker(line);
+            shape.artifact_token_count += line
+                .split_whitespace()
+                .filter(|token| is_artifact_like_token(token))
+                .count();
+        }
+
+        shape
+    }
+
+    fn has_code_or_repo_artifact(self) -> bool {
+        self.has_code_fence
+            || self.has_inline_code
+            || self.has_namespace_path
+            || self.artifact_token_count > 0
+    }
+
+    fn has_reflection_shape(self) -> bool {
+        self.has_code_or_repo_artifact()
+            || self.nonempty_line_count >= 2
+            || self.has_list_marker
+            || self.char_count >= 80
+    }
+
+    fn is_complex_task(self) -> bool {
+        if self.char_count < 12 {
+            return false;
+        }
+        self.nonempty_line_count >= 3
+            || self.has_list_marker
+            || self.char_count >= 180
+            || self.artifact_token_count >= 2
+    }
+}
+
+fn line_has_list_marker(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("- ")
+        || trimmed.starts_with("* ")
+        || trimmed.starts_with("+ ")
+        || starts_with_ordered_list_marker(trimmed)
+}
+
+fn starts_with_ordered_list_marker(line: &str) -> bool {
+    let mut chars = line.char_indices().peekable();
+    let mut digit_count = 0;
+    while let Some((_, ch)) = chars.peek().copied() {
+        if !ch.is_ascii_digit() {
+            break;
+        }
+        digit_count += 1;
+        chars.next();
+    }
+    if digit_count == 0 {
+        return false;
+    }
+    let Some((_, marker)) = chars.next() else {
+        return false;
+    };
+    if marker != '.' && marker != ')' {
+        return false;
+    }
+    chars.next().is_some_and(|(_, ch)| ch.is_ascii_whitespace())
+}
+
+fn is_artifact_like_token(token: &str) -> bool {
+    let token = trim_artifact_token(token);
+    if token.is_empty() {
+        return false;
+    }
+    if token.contains('/') || token.contains('\\') {
+        return true;
+    }
+    let path = Path::new(token);
+    let has_stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| !stem.trim().is_empty());
+    let has_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(is_probable_file_extension);
+    has_stem && has_extension
+}
+
+fn trim_artifact_token(token: &str) -> &str {
+    token.trim_matches(|ch: char| {
+        ch.is_ascii_whitespace()
+            || matches!(
+                ch,
+                '`' | '\'' | '"' | ',' | ';' | ':' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+            )
+    })
+}
+
+fn is_probable_file_extension(extension: &str) -> bool {
+    let len = extension.chars().count();
+    (1..=8).contains(&len)
+        && extension.chars().all(|ch| ch.is_ascii_alphanumeric())
+        && extension.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
 fn should_inject_integrated_reflection(
@@ -59,7 +166,7 @@ fn should_inject_integrated_reflection(
         intent.core,
         crate::ai::driver::intent_recognition::CoreIntent::RequestAction
             | crate::ai::driver::intent_recognition::CoreIntent::SeekSolution
-    ) && question_has_code_or_task_shape(question)
+    ) && QuestionShape::analyze(question).has_reflection_shape()
 }
 
 fn sync_recall_enabled() -> bool {
@@ -144,8 +251,8 @@ pub(super) async fn prepare_turn(
     };
 
     crate::ai::driver::runtime_ctx::publish_subagent_phase("recognizing intent");
-    // LLM 意图识别 fallback：当本地 TF-IDF 把 question 划到 Casual 但内容明显
-    // 不是闲聊（带代码 / 报错关键词 / 动作动词 / 长度足够）时，调用大模型
+    // LLM 意图识别 fallback：当本地 TF-IDF 把 question 划到 Casual 但内容具备
+    // 非闲聊形态（结构化文本、路径/代码片段、问句或长度足够）时，调用大模型
     // 二次判定。LLM 调用本身在 stderr 打印 [intent:llm] 标识，方便用户区分
     // "本地分类" vs "大模型分类"。
     {
@@ -347,8 +454,7 @@ pub(super) async fn prepare_turn(
     }
 
     // C3: 复杂任务自动提示（不强制激活 Thinking 引擎，仅作为软引导）
-    // 当检测到问题包含"重构/设计/架构/系统/拆分/refactor/design/architecture/multi-step"等关键词时，
-    // 注入一段 Policy 提示，鼓励 agent 自行拆解并先列出验证步骤再动手。
+    // 仅依据多行、列表、长度和多 artifact 等形态信号判断，避免词面关键词误触发。
     if detect_complex_task(question) {
         skill_turn.push_section(
             skill_runtime::ContextKind::Policy,
@@ -497,70 +603,13 @@ fn should_run_session_code_discovery_recall(
 }
 
 fn looks_like_code_or_repo_question(question: &str) -> bool {
-    let question = question.trim();
-    if question.is_empty() {
-        return false;
-    }
-
-    if question.contains("```") || question.contains('`') || question.contains("::") {
-        return true;
-    }
-
-    question.split_whitespace().any(|token| {
-        token.contains('/')
-            || token.contains('\\')
-            || token.ends_with(".rs")
-            || token.ends_with(".ts")
-            || token.ends_with(".tsx")
-            || token.ends_with(".js")
-            || token.ends_with(".jsx")
-            || token.ends_with(".py")
-            || token.ends_with(".go")
-            || token.ends_with(".java")
-            || token.ends_with(".json")
-            || token.ends_with(".yaml")
-            || token.ends_with(".yml")
-            || token.ends_with(".toml")
-    })
+    QuestionShape::analyze(question).has_code_or_repo_artifact()
 }
 
 /// C3: 复杂任务检测——仅基于结构信号的轻量启发式。
 /// 命中后只会注入一段 Policy 提示鼓励 agent 自行拆解，不强制激活 Thinking 引擎。
 fn detect_complex_task(question: &str) -> bool {
-    let q = question.trim();
-    if q.is_empty() {
-        return false;
-    }
-    // 过短的请求不视为复杂任务，避免对简单问题施加额外提示
-    if q.chars().count() < 12 {
-        return false;
-    }
-    let nonempty_lines = q.lines().filter(|line| !line.trim().is_empty()).count();
-    if nonempty_lines >= 3 {
-        return true;
-    }
-    if q.contains("\n- ") || q.contains("\n1.") {
-        return true;
-    }
-    if q.chars().count() >= 180 {
-        return true;
-    }
-    let artifact_tokens = q
-        .split_whitespace()
-        .filter(|token| {
-            token.contains('/')
-                || token.contains('\\')
-                || token.ends_with(".rs")
-                || token.ends_with(".ts")
-                || token.ends_with(".tsx")
-                || token.ends_with(".js")
-                || token.ends_with(".jsx")
-                || token.ends_with(".py")
-                || token.ends_with(".go")
-                || token.ends_with(".java")
-        })
-        .count();
-    artifact_tokens >= 2
+    QuestionShape::analyze(question).is_complex_task()
 }
 
 fn build_session_code_discovery_recall(app: &App, history: &[Message]) -> Option<String> {
@@ -719,8 +768,9 @@ fn code_discovery_record_from_memory_entry(
 mod tests {
     use super::{
         collect_session_code_discovery_records, extract_existing_code_discoveries,
-        render_session_code_discovery_recall, should_inject_integrated_reflection,
-        should_run_general_recall, should_run_session_code_discovery_recall,
+        looks_like_code_or_repo_question, render_session_code_discovery_recall,
+        should_inject_integrated_reflection, should_run_general_recall,
+        should_run_session_code_discovery_recall,
     };
     use crate::ai::code_discovery_policy::parse_record_line;
     use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
@@ -899,9 +949,30 @@ mod tests {
     fn coding_task_keeps_integrated_reflection() {
         let intent = UserIntent::new(CoreIntent::RequestAction);
         assert!(should_inject_integrated_reflection(
-            "帮我修复 cargo test 的 failure",
+            "帮我处理 `build check` 的 failure",
             &intent
         ));
+    }
+
+    #[test]
+    fn plain_action_words_do_not_trigger_reflection_without_structure() {
+        let intent = UserIntent::new(CoreIntent::RequestAction);
+        assert!(!should_inject_integrated_reflection(
+            "帮我处理这个问题",
+            &intent
+        ));
+    }
+
+    #[test]
+    fn generic_file_extension_counts_as_code_or_repo_artifact() {
+        assert!(looks_like_code_or_repo_question(
+            "看一下 schema.proto 的生成逻辑"
+        ));
+    }
+
+    #[test]
+    fn numeric_decimal_does_not_count_as_code_or_repo_artifact() {
+        assert!(!looks_like_code_or_repo_question("圆周率约等于 3.14"));
     }
 
     #[test]

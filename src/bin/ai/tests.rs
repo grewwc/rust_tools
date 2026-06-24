@@ -42,6 +42,7 @@ fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::
         cli: super::cli::ParsedCli::default(),
         config: super::types::AppConfig {
             api_key: String::new(),
+            base_history_file: PathBuf::new(),
             history_file: PathBuf::new(),
             endpoint: String::new(),
             vl_default_model: any_vl_model_name(),
@@ -58,12 +59,14 @@ fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::
         },
         session_id: String::new(),
         session_history_file: PathBuf::new(),
+        active_persona: super::persona::default_persona(),
         client: reqwest::Client::builder().build().unwrap(),
         current_model: any_model_name(),
         current_agent: "build".to_string(),
         current_agent_manifest: None,
         pending_files: None,
         forced_skill: None,
+        forced_question: None,
         attached_image_files: Vec::new(),
         shutdown: Arc::new(AtomicBool::new(false)),
         streaming: Arc::new(AtomicBool::new(false)),
@@ -103,6 +106,7 @@ fn resolve_model_is_unicode_safe() {
     let cli = super::cli::ParsedCli::default();
     let config = super::types::AppConfig {
         api_key: String::new(),
+        base_history_file: PathBuf::new(),
         history_file: PathBuf::new(),
         endpoint: String::new(),
         vl_default_model: any_vl_model_name(),
@@ -126,12 +130,14 @@ fn resolve_model_is_unicode_safe() {
         config,
         session_id: String::new(),
         session_history_file: PathBuf::new(),
+        active_persona: super::persona::default_persona(),
         client,
         current_model: any_model_name(),
         current_agent: "build".to_string(),
         current_agent_manifest: None,
         pending_files: None,
         forced_skill: None,
+        forced_question: None,
         attached_image_files: Vec::new(),
         shutdown,
         streaming,
@@ -628,7 +634,11 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
                 tool_type: "function".to_string(),
                 function: FunctionCall {
                     name: "read_file".to_string(),
-                    arguments: format!(r#"{{"filePath":"src/lib.rs","startLine":{},"endLine":{}}}"#, i + 1, i + 20),
+                    arguments: format!(
+                        r#"{{"filePath":"src/lib.rs","startLine":{},"endLine":{}}}"#,
+                        i + 1,
+                        i + 20
+                    ),
                 },
             }]),
             tool_call_id: None,
@@ -671,8 +681,10 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
 
 #[test]
 fn compression_spills_recent_non_compressible_tool_output() {
-    let overflow_dir =
-        std::env::temp_dir().join(format!("ai-preserve-overflow-recent-{}", uuid::Uuid::new_v4()));
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-preserve-overflow-recent-{}",
+        uuid::Uuid::new_v4()
+    ));
     let mut messages = vec![Message {
         role: "system".to_string(),
         content: Value::String("system prompt".to_string()),
@@ -736,8 +748,10 @@ fn extract_stub_file_path(stub: &str) -> Option<String> {
 
 #[test]
 fn compression_spills_old_user_message_to_session_temp_file() {
-    let overflow_dir =
-        std::env::temp_dir().join(format!("ai-preserve-user-overflow-{}", uuid::Uuid::new_v4()));
+    let overflow_dir = std::env::temp_dir().join(format!(
+        "ai-preserve-user-overflow-{}",
+        uuid::Uuid::new_v4()
+    ));
     let old_user = "U".repeat(20_000);
     let latest_user = "继续处理当前问题";
     let messages = vec![
@@ -1095,7 +1109,9 @@ fn large_image_does_not_evict_tool_history_from_budget() {
         },
         Message {
             role: "tool".to_string(),
-            content: Value::String("code_search 结果：found memo.rs at src/bin/re/memo".to_string()),
+            content: Value::String(
+                "code_search 结果：found memo.rs at src/bin/re/memo".to_string(),
+            ),
             tool_calls: None,
             tool_call_id: Some("call_1".to_string()),
             reasoning_content: None,
@@ -1116,11 +1132,15 @@ fn large_image_does_not_evict_tool_history_from_budget() {
         before <= 36_000,
         "image must not dominate the char budget (got {before})"
     );
-    assert_eq!(before, after, "no compression should trigger for image-only payload");
+    assert_eq!(
+        before, after,
+        "no compression should trigger for image-only payload"
+    );
 
-    let kept_tool_result = compressed
-        .iter()
-        .any(|m| m.role == "tool" && m.content.as_str() == Some("code_search 结果：found memo.rs at src/bin/re/memo"));
+    let kept_tool_result = compressed.iter().any(|m| {
+        m.role == "tool"
+            && m.content.as_str() == Some("code_search 结果：found memo.rs at src/bin/re/memo")
+    });
     assert!(
         kept_tool_result,
         "tool result (agent working memory) must survive; otherwise the agent re-explores"
@@ -1136,7 +1156,10 @@ fn large_image_does_not_evict_tool_history_from_budget() {
             .map(|u| u.len() > 100_000)
             .unwrap_or(false)
     });
-    assert!(image_intact, "image content itself must remain zero-compressed");
+    assert!(
+        image_intact,
+        "image content itself must remain zero-compressed"
+    );
 }
 
 #[test]

@@ -34,7 +34,10 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         "/model", ":model",
         "/agents", ":agents",
         "/agent", ":agent",
+        "/personas", ":personas",
+        "/persona", ":persona",
         "/sessions", ":sessions",
+        "/skills", ":skills",
     ] {
         trie.insert(cmd);
     }
@@ -117,8 +120,14 @@ impl CommandCompleter {
             ":agents",
             "/agent",
             ":agent",
+            "/personas",
+            ":personas",
+            "/persona",
+            ":persona",
             "/sessions",
             ":sessions",
+            "/skills",
+            ":skills",
         ]
     }
 
@@ -239,6 +248,10 @@ impl CommandCompleter {
         ]
     }
 
+    fn persona_subcommands() -> &'static [&'static str] {
+        &["list", "current", "create", "new", "use", "delete", "help"]
+    }
+
     /// `/usage` 的子命令。
     fn usage_subcommands() -> &'static [&'static str] {
         &["today", "7d", "30d", "all", "daily", "trend", "days", "help"]
@@ -264,6 +277,30 @@ impl CommandCompleter {
             "10",
             "20",
         ]
+    }
+
+    /// `/skills` / `/skill` 的子命令字面量。
+    fn skills_subcommands() -> &'static [&'static str] {
+        &["list", "current", "use", "help"]
+    }
+
+    /// 所有已加载 skill 的名称候选（带 display）。
+    fn skill_name_candidates() -> Vec<CompletionCandidate> {
+        let skills = crate::ai::skills::load_all_skills();
+        skills
+            .into_iter()
+            .map(|s| {
+                let display = if s.description.trim().is_empty() {
+                    s.name.clone()
+                } else {
+                    format!("{} · {}", s.name, s.description.trim())
+                };
+                CompletionCandidate {
+                    display,
+                    replacement: s.name,
+                }
+            })
+            .collect()
     }
 
     pub(super) fn complete_for_line(line: &str, pos: usize) -> (usize, Vec<CompletionCandidate>) {
@@ -351,26 +388,33 @@ impl CommandCompleter {
                     _ => Vec::new(),
                 }
             } else {
-                let source = match first {
-                    "/agents" | ":agents" | "/agent" | ":agent" => Self::agent_subcommands(),
-                    "/usage" | ":usage" => Self::usage_subcommands(),
-                    "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => {
-                        Self::checkpoint_subcommands()
+                let candidates = match first {
+                    "/skills" | ":skills" | "/skill" | ":skill" => {
+                        Self::skill_name_candidates()
+                            .into_iter()
+                            .filter(|c| c.replacement.starts_with(token))
+                        .collect()
                     }
-                    "/model" | ":model" => {
-                        // `/model` already has separate handling (model names + subcommands mixed)
-                        Self::model_subcommands()
+                    _ => {
+                        let sources: &[&str] = match first {
+                            "/agents" | ":agents" | "/agent" | ":agent" => Self::agent_subcommands(),
+                            "/sessions" | ":sessions" => Self::session_subcommands(),
+                            "/history" | ":history" => Self::history_subcommands(),
+                            "/personas" | ":personas" | "/persona" | ":persona" => Self::persona_subcommands(),
+                            "/usage" | ":usage" => Self::usage_subcommands(),
+                            "/checkpoint" | ":checkpoint" | "/cp" | ":cp" => Self::checkpoint_subcommands(),
+                            "/model" | ":model" => Self::model_subcommands(),
+                            _ => &[],
+                        };
+                        Self::plain_candidates(
+                            sources
+                                .iter()
+                                .filter(|c| c.starts_with(token))
+                                .map(|c| c.to_string()),
+                        )
                     }
-                    "/sessions" | ":sessions" => Self::session_subcommands(),
-                    "/history" | ":history" => Self::history_subcommands(),
-                    _ => &[],
                 };
-                Self::plain_candidates(
-                    source
-                        .iter()
-                        .filter(|candidate| candidate.starts_with(token))
-                        .map(|candidate| (*candidate).to_string()),
-                )
+                candidates
             }
         };
 
@@ -775,6 +819,28 @@ mod tests {
             .unwrap();
         assert_eq!(start, 8);
         assert!(pairs.iter().any(|pair| pair.replacement == "auto"));
+    }
+
+    #[test]
+    fn command_completion_expands_top_level_persona_command() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let (_, pairs) = completer
+            .complete("/pers", 5, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "/personas"));
+    }
+
+    #[test]
+    fn command_completion_lists_persona_subcommands() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let (start, pairs) = completer
+            .complete("/personas c", 11, &Context::new(&history))
+            .unwrap();
+        assert_eq!(start, 10);
+        assert!(pairs.iter().any(|pair| pair.replacement == "create"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "current"));
     }
 
     #[test]

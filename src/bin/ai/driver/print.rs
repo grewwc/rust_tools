@@ -15,9 +15,13 @@ pub fn print_assistant_banner() {
 }
 
 pub fn print_assistant_banner_with_app(app: Option<&App>) {
+    print_assistant_banner_with_app_and_skill(app, None);
+}
+
+pub fn print_assistant_banner_with_app_and_skill(app: Option<&App>, skill_name: Option<&str>) {
     println!(
         "\n{}",
-        format_assistant_banner(app.map(|a| a.current_agent.as_str()))
+        format_assistant_banner(app.map(|a| a.current_agent.as_str()), skill_name)
     );
 }
 
@@ -103,8 +107,17 @@ pub(in crate::ai) fn format_empty_state(label: &str) -> String {
     )
 }
 
-pub(in crate::ai) fn format_assistant_banner(agent_name: Option<&str>) -> String {
-    format_section_header("assistant", agent_name)
+pub(in crate::ai) fn format_assistant_banner(
+    agent_name: Option<&str>,
+    skill_name: Option<&str>,
+) -> String {
+    let detail = match (agent_name, skill_name) {
+        (Some(agent), Some(skill)) => Some(format!("{agent} · skill:{skill}")),
+        (Some(agent), None) => Some(agent.to_string()),
+        (None, Some(skill)) => Some(format!("skill:{skill}")),
+        (None, None) => None,
+    };
+    format_section_header("assistant", detail.as_deref())
 }
 
 pub(in crate::ai) fn format_tool_header(tool_name: &str) -> String {
@@ -389,8 +402,15 @@ mod tests {
 
     #[test]
     fn assistant_banner_uses_modern_single_line_label() {
-        let rendered = strip_ansi_for_test(&format_assistant_banner(Some("planner")));
+        let rendered = strip_ansi_for_test(&format_assistant_banner(Some("planner"), None));
         assert_eq!(rendered, "╭─ assistant · planner");
+    }
+
+    #[test]
+    fn assistant_banner_includes_active_skill_when_present() {
+        let rendered =
+            strip_ansi_for_test(&format_assistant_banner(Some("build"), Some("humanizer")));
+        assert_eq!(rendered, "╭─ assistant · build · skill:humanizer");
     }
 
     #[test]

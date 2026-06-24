@@ -9,7 +9,7 @@
 //   - mode: primary, subagent, or all
 //   - model: Override default model
 //   - temperature: Override default temperature
-//   - tools/tool_groups/mcp_servers: Available tools
+//   - tools/tool_groups/mcp_servers/disable_mcp_tools: Available tools
 //   - routing_tags: For ML-based routing
 //   - model_tier: light/standard/heavy preference
 //
@@ -21,8 +21,8 @@
 //   - prompt-skill: Skill creation
 // =============================================================================
 
-use serde::{Deserialize, Serialize};
 use rust_tools::cw::SkipMap;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -213,6 +213,8 @@ pub(super) struct AgentManifest {
     pub(super) tool_groups: Vec<String>,
     #[serde(default)]
     pub(super) mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub(super) disable_mcp_tools: bool,
     #[serde(default)]
     pub(super) routing_tags: Vec<String>,
     #[serde(default)]
@@ -627,6 +629,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
     let mut tools: Vec<String> = Vec::new();
     let mut tool_groups: Vec<String> = Vec::new();
     let mut mcp_servers: Vec<String> = Vec::new();
+    let mut disable_mcp_tools = false;
     let mut routing_tags: Vec<String> = Vec::new();
 
     let mut body = String::new();
@@ -698,6 +701,9 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
                 "hidden" => {
                     hidden = unquoted.eq_ignore_ascii_case("true");
                 }
+                "disable_mcp_tools" => {
+                    disable_mcp_tools = unquoted.eq_ignore_ascii_case("true");
+                }
                 "tools" => tools = parse_list_value(unquoted),
                 "tool_groups" => tool_groups = parse_list_value(unquoted),
                 "mcp_servers" => mcp_servers = parse_list_value(unquoted),
@@ -749,6 +755,7 @@ fn parse_agent_front_matter(content: &str) -> Result<AgentManifest, String> {
         tools,
         tool_groups,
         mcp_servers,
+        disable_mcp_tools,
         routing_tags,
         model_tier: agent_model_tier,
         disabled,
@@ -834,7 +841,10 @@ fn load_agents_from_dir(dir: &Path) -> Vec<AgentManifest> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentModelTier, load_project_instruction_docs_from, parse_agent_front_matter};
+    use super::{
+        AgentModelTier, BUILTIN_AGENTS, load_project_instruction_docs_from,
+        parse_agent_front_matter,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -895,6 +905,47 @@ noop
 
         let err = parse_agent_front_matter(content).unwrap_err();
         assert!(err.contains("invalid model_tier"));
+    }
+
+    #[test]
+    fn parses_disable_mcp_tools_from_front_matter() {
+        let content = r#"---
+name: build
+description: Development agent
+disable_mcp_tools: true
+---
+
+Build things.
+"#;
+
+        let agent = parse_agent_front_matter(content).unwrap();
+
+        assert!(agent.disable_mcp_tools);
+    }
+
+    #[test]
+    fn builtin_agents_do_not_mount_mcp_tools_by_default() {
+        for (filename, content) in BUILTIN_AGENTS {
+            let agent = parse_agent_front_matter(content).unwrap();
+            assert!(
+                agent.disable_mcp_tools,
+                "{filename} should use progressive MCP loading instead of mounting every MCP tool"
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_skill_builtin_uses_explicit_tools_not_whole_builtin_group() {
+        let prompt_skill = BUILTIN_AGENTS
+            .iter()
+            .find_map(|(filename, content)| {
+                (*filename == "prompt-skill.agent")
+                    .then(|| parse_agent_front_matter(content).unwrap())
+            })
+            .unwrap();
+
+        assert!(!prompt_skill.tools.is_empty());
+        assert!(prompt_skill.tool_groups.is_empty());
     }
 
     #[test]

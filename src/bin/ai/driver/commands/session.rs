@@ -74,7 +74,12 @@ pub fn try_handle_session_command(
                         .unwrap_or("-");
                     println!(
                         "{} {:<width$}  {}  {:>8}  {}",
-                        mark, s.id, time, format_size(s.size_bytes), summary, width = max_id_len
+                        mark,
+                        s.id,
+                        time,
+                        format_size(s.size_bytes),
+                        summary,
+                        width = max_id_len
                     );
                 }
             }
@@ -102,6 +107,7 @@ pub fn try_handle_session_command(
             crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
             app.session_id = new_id.clone();
             app.session_history_file = store.session_history_file(&new_id);
+            app.sync_persona_session_binding();
             println!("Switched to new session: {}", new_id);
         }
         "use" | "select" => {
@@ -113,6 +119,7 @@ pub fn try_handle_session_command(
             crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
             app.session_id = id.to_string();
             app.session_history_file = store.session_history_file(id);
+            app.sync_persona_session_binding();
             println!("Switched session: {}", id);
             // 显示 session 摘要
             let sessions = store.list_sessions().unwrap_or_default();
@@ -136,6 +143,7 @@ pub fn try_handle_session_command(
                     let new_id = Uuid::new_v4().to_string();
                     app.session_id = new_id.clone();
                     app.session_history_file = store.session_history_file(&new_id);
+                    app.sync_persona_session_binding();
                     println!(
                         "Deleted current session. Switched to new session: {}",
                         new_id
@@ -240,6 +248,7 @@ pub fn try_handle_session_command(
             let new_id = Uuid::new_v4().to_string();
             app.session_id = new_id.clone();
             app.session_history_file = store.session_history_file(&new_id);
+            app.sync_persona_session_binding();
             println!("Deleted {deleted} session(s). Switched to new session: {new_id}");
         }
         "fork" => {
@@ -263,6 +272,7 @@ pub fn try_handle_session_command(
                     crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
                     app.session_id = dst_id.clone();
                     app.session_history_file = store.session_history_file(&dst_id);
+                    app.sync_persona_session_binding();
                     if let Some(ctx) = app.agent_context.as_mut() {
                         ctx.tools.clear();
                     }
@@ -303,6 +313,7 @@ pub fn try_handle_session_command(
                 Ok(()) => {
                     app.session_id = dst_id.clone();
                     app.session_history_file = store.session_history_file(&dst_id);
+                    app.sync_persona_session_binding();
                     if let Some(ctx) = app.agent_context.as_mut() {
                         ctx.tools.clear();
                     }

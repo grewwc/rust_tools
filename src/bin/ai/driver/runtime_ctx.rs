@@ -14,13 +14,19 @@
 // sub-agent without having to plumb additional parameters through every
 // tool call.
 //
-// In addition to the parent-runtime snapshot, this module exposes two
-// finer-grained task-locals that drive the `inherit.memory` and
-// `inherit.cwd` flags of the `task` / `task_spawn` tools:
+// In addition to the parent-runtime snapshot, this module exposes several
+// finer-grained task-locals that drive persona isolation plus the
+// `inherit.memory` / `inherit.cwd` flags of the `task` / `task_spawn`
+// tools:
+//
+//   - `PERSONA_MEMORY_PATH` overrides `MemoryStore::from_env_or_config`
+//     for the whole foreground turn so each persona gets an isolated
+//     long-term memory / memo store.
 //
 //   - `SUBAGENT_MEMORY_PATH` overrides `MemoryStore::from_env_or_config`
-//     so a sub-agent that opted out of `inherit.memory` writes / reads its
-//     own jsonl file instead of the shared one.
+//     more strongly than `PERSONA_MEMORY_PATH`, so a sub-agent that opted
+//     out of `inherit.memory` writes / reads its own jsonl file instead of
+//     the persona-shared one.
 //
 //   - `SUBAGENT_CWD` overrides the project-wide `effective_cwd()` helper
 //     so tools that consult it (e.g. ripgrep / find / fingerprint) honour
@@ -89,6 +95,9 @@ impl DriverContext {
 
 tokio::task_local! {
     pub(crate) static DRIVER_CTX: Arc<DriverContext>;
+    /// 当前人格绑定的 memory 文件。前台 turn / one-shot note 流程会把它
+    /// scope 进来，让不同 persona 的长期记忆完全隔离。
+    pub(crate) static PERSONA_MEMORY_PATH: PathBuf;
     /// When set, every `MemoryStore::from_env_or_config()` inside this
     /// task scope reads/writes from this path instead of the shared
     /// `RUST_TOOLS_MEMORY_FILE` / `ai.memory.file` location. Used by
@@ -172,9 +181,12 @@ pub(crate) fn auto_model_fallback_spec() -> Option<AutoModelFallbackSpec> {
 }
 
 /// Read the optional sub-agent memory path override. `None` means
-/// "fall back to shared memory file".
+/// "fall back to persona memory file / shared memory file".
 pub(crate) fn override_memory_path() -> Option<PathBuf> {
-    SUBAGENT_MEMORY_PATH.try_with(|p| p.clone()).ok()
+    SUBAGENT_MEMORY_PATH
+        .try_with(|p| p.clone())
+        .ok()
+        .or_else(|| PERSONA_MEMORY_PATH.try_with(|p| p.clone()).ok())
 }
 
 /// Resolve the effective working directory for tools that consult the
@@ -216,6 +228,13 @@ mod tests {
     fn override_memory_path_returns_value_inside_scope() {
         let want = PathBuf::from("/tmp/agent_memory.subagent-test.jsonl");
         let got = SUBAGENT_MEMORY_PATH.sync_scope(want.clone(), || override_memory_path());
+        assert_eq!(got, Some(want));
+    }
+
+    #[test]
+    fn override_memory_path_falls_back_to_persona_scope() {
+        let want = PathBuf::from("/tmp/agent_memory.persona-test.jsonl");
+        let got = PERSONA_MEMORY_PATH.sync_scope(want.clone(), || override_memory_path());
         assert_eq!(got, Some(want));
     }
 

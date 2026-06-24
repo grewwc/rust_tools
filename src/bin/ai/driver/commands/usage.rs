@@ -196,10 +196,7 @@ pub fn try_handle_usage_command(input: &str) -> Result<bool, Box<dyn std::error:
         return Ok(true);
     }
 
-    println!(
-        "Token usage  store: {}",
-        store::store_path().display()
-    );
+    println!("Token usage  store: {}", store::store_path().display());
     if !store::is_enabled() {
         println!("  统计已关闭（ai.token_usage.enable=false）。");
         return Ok(true);

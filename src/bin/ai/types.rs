@@ -14,13 +14,19 @@ use serde_json::Value;
 
 use aios_kernel::kernel::SharedKernel;
 
-use super::{agents::AgentManifest, cli::ParsedCli, prompt::PromptEditor};
+use super::{
+    agents::AgentManifest,
+    cli::ParsedCli,
+    persona::PersonaProfile,
+    prompt::PromptEditor,
+};
 
 /// Configuration for the AI application, including API credentials,
 /// endpoint, model settings, and conversation history parameters.
 #[derive(Clone)]
 pub(super) struct AppConfig {
     pub(super) api_key: String,
+    pub(super) base_history_file: PathBuf,
     pub(super) history_file: PathBuf,
     pub(super) endpoint: String,
     pub(super) vl_default_model: String,
@@ -42,12 +48,14 @@ impl Clone for App {
             config: self.config.clone(),
             session_id: self.session_id.clone(),
             session_history_file: self.session_history_file.clone(),
+            active_persona: self.active_persona.clone(),
             client: self.client.clone(),
             current_model: self.current_model.clone(),
             current_agent: self.current_agent.clone(),
             current_agent_manifest: self.current_agent_manifest.clone(),
             pending_files: self.pending_files.clone(),
             forced_skill: self.forced_skill.clone(),
+            forced_question: self.forced_question.clone(),
             attached_image_files: self.attached_image_files.clone(),
             shutdown: self.shutdown.clone(),
             streaming: self.streaming.clone(),
@@ -75,6 +83,7 @@ pub(super) struct App {
     pub(super) config: AppConfig,
     pub(super) session_id: String,
     pub(super) session_history_file: PathBuf,
+    pub(super) active_persona: PersonaProfile,
     pub(super) client: Client,
     pub(super) current_model: String,
     pub(super) current_agent: String,
@@ -83,6 +92,8 @@ pub(super) struct App {
     /// 用户通过 `@skills:<name>` 在输入框中显式选择、仅对**本轮**生效的强制 skill。
     /// turn 准备阶段读取后强制注入该 skill，并在该 turn 结束后清空，下一轮不再强制。
     pub(super) forced_skill: Option<String>,
+    /// 当 /skills <name> <rest> 时，<rest> 作为本轮问题使用。
+    pub(super) forced_question: Option<String>,
     pub(super) attached_image_files: Vec<String>,
     pub(super) shutdown: Arc<AtomicBool>,
     pub(super) streaming: Arc<AtomicBool>,
@@ -121,6 +132,23 @@ impl App {
         let len_before = self.observers.len();
         self.observers.retain(|o| o.name() != name);
         self.observers.len() != len_before
+    }
+
+    pub(super) fn refresh_prompt_editor_for_current_session(&mut self) {
+        self.prompt_editor = Some(PromptEditor::new(
+            &self.session_id,
+            self.config.history_file.as_path(),
+        ));
+    }
+
+    pub(super) fn sync_persona_session_binding(&mut self) {
+        self.refresh_prompt_editor_for_current_session();
+        let _ = crate::ai::persona::PersonaStore::new()
+            .remember_session(&self.active_persona.id, &self.session_id);
+    }
+
+    pub(super) fn current_persona_memory_file(&self) -> PathBuf {
+        crate::ai::persona::memory_file_for_persona(&self.active_persona.id)
     }
 }
 

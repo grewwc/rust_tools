@@ -5,6 +5,14 @@ mode: all
 color: info
 hidden: false
 model_tier: light
+tools:
+  - read_file
+  - read_file_lines
+  - grep_search
+  - search_files
+  - list_directory
+  - code_search
+disable_mcp_tools: true
 routing_tags:
   - find
   - search

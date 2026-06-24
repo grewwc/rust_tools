@@ -12,6 +12,7 @@ mod knowledge;
 mod mcp;
 mod model_names;
 mod models;
+mod persona;
 mod prompt;
 mod provider;
 mod request;

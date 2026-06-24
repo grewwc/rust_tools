@@ -4,8 +4,8 @@ use std::{
     sync::{Arc, LazyLock, Mutex},
 };
 
-use rustc_hash::FxHashMap;
 use rust_tools::cw::SkipMap;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::normalize_text_for_similarity as normalize_text;

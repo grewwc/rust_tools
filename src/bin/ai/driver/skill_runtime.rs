@@ -415,7 +415,9 @@ fn resolved_mcp_servers(
             }
         }
     }
-    if let Some(agent) = active_agent {
+    if let Some(agent) = active_agent
+        && !agent.disable_mcp_tools
+    {
         for server in &agent.mcp_servers {
             let server = server.trim();
             if !server.is_empty() && !servers.iter().any(|existing| existing == server) {
@@ -442,6 +444,10 @@ fn select_mcp_tools(
     active_agent: Option<&AgentManifest>,
 ) -> Vec<ToolDef> {
     if skill.is_some_and(|skill| skill.disable_mcp_tools) {
+        return Vec::new();
+    }
+    let skill_declares_mcp_servers = skill.is_some_and(|skill| !skill.mcp_servers.is_empty());
+    if active_agent.is_some_and(|agent| agent.disable_mcp_tools) && !skill_declares_mcp_servers {
         return Vec::new();
     }
 
@@ -683,24 +689,29 @@ fn build_system_prompt(
         .map(|skill| skill.build_system_prompt())
         .filter(|s| !s.trim().is_empty());
 
-    let identity = if let Some(extra) = &agent_extra {
-        // Agent provides its own identity — use it directly, no generic fallback
-        let mut s = extra.trim().to_string();
-        if let Some(skill_text) = &skill_extra {
-            s.push_str("\n\n[Skill instructions]\n");
-            s.push_str(skill_text.trim());
-        }
-        s.push_str("\n\nEnforcement: agent/skill instructions above take precedence. On conflict, skill > agent > generic guidelines.");
-        s
-    } else if let Some(extra) = &skill_extra {
-        let mut s = String::from("You are a capable AI assistant following the active skill instructions.");
+    let identity = if let Some(skill_text) = &skill_extra {
+        let skill_name = skill.map(|skill| skill.name.as_str()).unwrap_or("unknown");
+        let mut s = format!(
+            "Active skill: {skill_name}\n\
+             You are operating under this skill for the current turn. Treat the active skill \
+             instructions as the primary behavior contract for this turn."
+        );
         s.push_str("\n\n[Skill instructions]\n");
-        s.push_str(extra.trim());
+        s.push_str(skill_text.trim());
+        if let Some(agent_text) = &agent_extra {
+            s.push_str("\n\n[Agent instructions]\n");
+            s.push_str(agent_text.trim());
+            s.push_str("\n\nEnforcement: skill instructions override agent instructions when they differ. Use agent instructions only for capabilities, workflow, and defaults not covered by the active skill.");
+        } else {
+            s.push_str("\n\nEnforcement: skill instructions override generic assistant guidelines when they differ.");
+        }
         s
     } else {
-        String::from(
-            "You are a highly capable general-purpose AI assistant. Adapt your approach to the task at hand: use code/tooling when the request is technical, and plain reasoning or research when it is not. Aim to be sharp and to the point — answer what was asked, not more.",
-        )
+        agent_extra.unwrap_or_else(|| {
+            String::from(
+                "You are a highly capable general-purpose AI assistant. Adapt your approach to the task at hand: use code/tooling when the request is technical, and plain reasoning or research when it is not. Aim to be sharp and to the point — answer what was asked, not more.",
+            )
+        })
     };
     b.push(ContextKind::Identity, identity);
 
@@ -1012,6 +1023,23 @@ fn build_skill_turn_guard(
     let mcp_tools = mcp_tools_for_turn(mcp_client, skill, active_agent.as_ref());
     let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
     let mut builder = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
+    if !app.active_persona.is_default() {
+        let mut persona_prompt = format!(
+            "Persistent persona:\n- Name: {}\n",
+            app.active_persona.name.trim()
+        );
+        if !app.active_persona.avatar.trim().is_empty() {
+            persona_prompt.push_str(&format!("- Avatar: {}\n", app.active_persona.avatar.trim()));
+        }
+        if !app.active_persona.prompt.trim().is_empty() {
+            persona_prompt.push_str("\nPersona instructions:\n");
+            persona_prompt.push_str(app.active_persona.prompt.trim());
+        }
+        persona_prompt.push_str(
+            "\n\nApply this persona consistently across turns, but never let it override higher-priority agent, skill, policy, or user instructions.",
+        );
+        builder.push(ContextKind::Identity, persona_prompt);
+    }
     if general_knowledge_mode {
         builder.push(
             ContextKind::Policy,
@@ -1101,16 +1129,24 @@ pub(super) fn prepare_skill_for_turn(
             })
         {
             let name = skill.name.clone();
-            if let Some(guard) =
-                force_activate_named_skill(app, mcp_client, skill_manifests, question, &name, &intent)
-            {
+            if let Some(guard) = force_activate_named_skill(
+                app,
+                mcp_client,
+                skill_manifests,
+                question,
+                &name,
+                &intent,
+            ) {
                 if debug {
                     eprintln!("[skills] forced via @skills: {}", name);
                 }
                 return guard;
             }
         } else if debug {
-            eprintln!("[skills] forced @skills:{} not found, falling back to auto-route", forced);
+            eprintln!(
+                "[skills] forced @skills:{} not found, falling back to auto-route",
+                forced
+            );
         }
     }
 
@@ -1166,12 +1202,11 @@ pub(super) fn prepare_skill_for_turn(
 mod tests {
     use super::{
         PreferenceStrength, build_project_instruction_prompt, build_system_prompt,
-        builtin_tools_for_skill, ensure_required_baseline_tools,
-        filter_general_knowledge_tools, filter_mcp_tools_by_allowed_servers,
-        looks_like_follow_up_or_same_topic, merge_with_runtime_enabled_tools,
-        resolve_max_iterations, select_mcp_tools, select_skill_with_preference,
-        select_skill_with_preference_strength, should_use_general_knowledge_mode,
-        tool_uses_mcp_server,
+        builtin_tools_for_skill, ensure_required_baseline_tools, filter_general_knowledge_tools,
+        filter_mcp_tools_by_allowed_servers, looks_like_follow_up_or_same_topic,
+        merge_with_runtime_enabled_tools, resolve_max_iterations, select_mcp_tools,
+        select_skill_with_preference, select_skill_with_preference_strength,
+        should_use_general_knowledge_mode, tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
@@ -1209,6 +1244,7 @@ mod tests {
             tools: Vec::new(),
             tool_groups: vec!["builtin".to_string(), "executor".to_string()],
             mcp_servers: Vec::new(),
+            disable_mcp_tools: false,
             routing_tags: Vec::new(),
             model_tier: None,
             disabled: false,
@@ -1353,6 +1389,25 @@ mod tests {
     }
 
     #[test]
+    fn active_skill_prompt_precedes_agent_prompt_and_declares_priority() {
+        let available = SkipSet::new(16);
+        let mut build_agent = agent("build", vec![]);
+        build_agent.prompt = "You are the build agent.".to_string();
+        let mut humanizer = skill("humanizer", "Rewrite text naturally");
+        humanizer.prompt = "You are a writing editor.".to_string();
+
+        let prompt =
+            build_system_prompt(Some(&build_agent), Some(&humanizer), &Box::new(available))
+                .render_system_prompt();
+
+        let skill_pos = prompt.find("Active skill: humanizer").unwrap();
+        let agent_pos = prompt.find("[Agent instructions]").unwrap();
+        assert!(skill_pos < agent_pos);
+        assert!(prompt.contains("primary behavior contract"));
+        assert!(prompt.contains("skill instructions override agent instructions"));
+    }
+
+    #[test]
     fn system_prompt_uses_knowledge_save_for_user_memory_requests() {
         let mut available = SkipSet::new(16);
         available.insert("knowledge_save".to_string());
@@ -1457,6 +1512,7 @@ mod tests {
             tools: Vec::new(),
             tool_groups: Vec::new(),
             mcp_servers: mcp_servers.into_iter().map(|s| s.to_string()).collect(),
+            disable_mcp_tools: false,
             routing_tags: Vec::new(),
             model_tier: None,
             disabled: false,
@@ -1505,6 +1561,34 @@ mod tests {
         assert!(names.contains(&"mcp_feishu_docs_search".to_string()));
         assert!(names.contains(&"mcp_ocr_extract".to_string()));
         assert!(names.contains(&"mcp_other_lookup".to_string()));
+    }
+
+    #[test]
+    fn agent_disable_mcp_tools_hides_default_mcp_tools() {
+        let all_tools = vec![tool("mcp_feishu_docs_search"), tool("mcp_ocr_extract")];
+        let mut build_agent = agent("build", vec![]);
+        build_agent.disable_mcp_tools = true;
+
+        let tools = select_mcp_tools(all_tools, None, Some(&build_agent));
+
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn skill_mcp_servers_can_opt_in_when_agent_disables_mcp_tools() {
+        let all_tools = vec![tool("mcp_feishu_docs_search"), tool("mcp_ocr_extract")];
+        let mut build_agent = agent("build", vec![]);
+        build_agent.disable_mcp_tools = true;
+        let mut s = skill("feishu-docs", "");
+        s.mcp_servers = vec!["feishu".to_string()];
+
+        let tools = select_mcp_tools(all_tools, Some(&s), Some(&build_agent));
+        let names = tools
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["mcp_feishu_docs_search".to_string()]);
     }
 
     #[test]

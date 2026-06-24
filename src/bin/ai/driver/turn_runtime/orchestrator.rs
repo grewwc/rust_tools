@@ -467,6 +467,7 @@ async fn run_turn_body(
                 &mut messages,
             );
         }
+        let active_skill_name = skill_turn.matched_skill_name().map(str::to_string);
         let execution = match execute_turn_iteration(
             app,
             &next_model,
@@ -477,6 +478,7 @@ async fn run_turn_body(
             should_quit,
             force_final_response,
             terminal_dedupe_candidate.as_deref(),
+            active_skill_name.as_deref(),
             iteration,
         )
         .await

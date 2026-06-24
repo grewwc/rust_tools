@@ -21,7 +21,7 @@ src/
     │   ├── tools/            # Tool registry (registry/ service/ storage/ + *_tools.rs)
     │   ├── builtin_agents/   # 5 agents: build, executor, explore, plan, prompt-skill
     │   ├── builtin_skills/   # 3 skills: debugger, code-review, refactor
-    │   ├── agents.rs skills.rs models.rs config.rs types.rs cli.rs
+    │   ├── agents.rs skills.rs persona.rs models.rs config.rs types.rs cli.rs
     │   ├── history/ knowledge/ mcp/ prompt/ stream/ config/ provider/
     │   └── config_schema.rs  # All config key constants (AiConfig)
     ├── ff/ fk/               # File search tools
@@ -58,8 +58,9 @@ cargo test --bin a test_xxx       # Filter tests by name
    - `turn_runtime/`: prepare → iterate (LLM + tools) → finalize
    - `thinking/`: goal decomposition and verification
    - `reflection/`: background reflection and knowledge writeback
-   - `commands/`: interactive commands (agent/feishu/session/model/share)
+   - `commands/`: interactive commands (agent/feishu/session/model/share/persona)
    - `embedding/`: document embedding index
+   - Persona system: `persona.rs` persists long-lived personas in `~/.config/rust_tools/personas.json`; switching persona rewrites the active history root and memory path so each persona keeps isolated sessions and long-term memory. `/personas` supports create/select/delete/current/list, and avatar is optional but unique when set.
    - Agent/Skill routing: ML models (intent/agent_route/skill_match) + heuristics
 
 3. **Agent/Skill system**
@@ -107,9 +108,11 @@ cargo test --bin a test_xxx       # Filter tests by name
 7. **Scope**: Do not reformat or reorder files unrelated to the task. Only modify files that need to change — no incidental formatting.
 8. **No unrelated changes**: Do not make any changes that are not required by the current task. This includes refactoring, reformatting, renaming, reorganizing, commenting, or any other modification to files, symbols, or code that is not directly relevant to the feature or fix being implemented.
  
+9. **Avoid hardcoded string rules**: Do not resort to hardcoded string-based judgment logic unless absolutely unavoidable. Prefer data-driven approaches — configuration, model-based routing, trait dispatch, or match on well-typed enums — over brittle string matching or regex-based rules.
+
 ### AI Module
 
-1. **Agent files** (`.agent`): Required: `name`/`description`. Optional: `mode`/`model`/`tools`/`tool_groups`/`routing_tags`/`model_tier`/`color`
+1. **Agent files** (`.agent`): Required: `name`/`description`. Optional: `mode`/`model`/`tools`/`tool_groups`/`mcp_servers`/`disable_mcp_tools`/`routing_tags`/`model_tier`/`color`
 2. **Skill files** (`.skill`): Required: `name`/`description`. Optional: `tools`/`tool_groups`/`triggers`/`priority`/`skip_recall`
 3. **Tool naming**: snake_case, verb-first (`read_file`, `execute_command`)
 4. **Tool registration**: Define schema in `tools/registry/`, implement in `tools/service/`

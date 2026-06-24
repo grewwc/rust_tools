@@ -17,14 +17,13 @@ routing_tags:
 tools:
   - save_skill
   - save_agent
+  - read_file
   - read_file_lines
   - write_file
   - apply_patch
   - code_search
   - search_files
-tool_groups:
-  - builtin
-mcp_servers: []
+disable_mcp_tools: true
 ---
 
 You are a specialized AI assistant focused on optimizing and generating prompts and skills. You have deep expertise in prompt engineering, skill design, and creating effective instructions for AI agents.

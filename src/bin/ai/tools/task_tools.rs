@@ -1037,19 +1037,17 @@ fn cleanup_launched_agent_team_members(launched: &[LaunchedAgentTeamMember]) {
                     member.result_channel_id, member.task_id, err
                 );
             }
-            if let Err(err) = os.channel_release_named(
-                ChannelId(member.result_channel_id),
-                "task_result.consumer",
-            ) {
+            if let Err(err) = os
+                .channel_release_named(ChannelId(member.result_channel_id), "task_result.consumer")
+            {
                 eprintln!(
                     "[agent_team] cleanup failed to release consumer holder on channel {} for task_id {}: {}",
                     member.result_channel_id, member.task_id, err
                 );
             }
-            if let Err(err) = os.channel_release_named(
-                ChannelId(member.result_channel_id),
-                "task_result.producer",
-            ) {
+            if let Err(err) = os
+                .channel_release_named(ChannelId(member.result_channel_id), "task_result.producer")
+            {
                 eprintln!(
                     "[agent_team] cleanup failed to release producer holder on channel {} for task_id {}: {}",
                     member.result_channel_id, member.task_id, err
@@ -1839,7 +1837,11 @@ fn subagent_document_text(agent: &AgentManifest) -> String {
     normalize_text_for_similarity(&parts.join("\n"))
 }
 
-fn auto_subagent_score(agent: &AgentManifest, task_text: &str, idf: &FxHashMap<String, f64>) -> f64 {
+fn auto_subagent_score(
+    agent: &AgentManifest,
+    task_text: &str,
+    idf: &FxHashMap<String, f64>,
+) -> f64 {
     let query = TextSimilarityFeatures::from_text(task_text);
     let doc = TextSimilarityFeatures::from_text(&subagent_document_text(agent));
     cosine_tfidf_similarity(&query.ngram_tf, &doc.ngram_tf, idf)
@@ -2027,6 +2029,7 @@ mod tests {
             tools: Vec::new(),
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),
+            disable_mcp_tools: false,
             routing_tags: Vec::new(),
             model_tier: Some(AgentModelTier::Standard),
             disabled: false,

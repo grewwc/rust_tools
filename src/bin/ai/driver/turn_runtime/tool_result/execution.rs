@@ -724,6 +724,7 @@ mod tests {
             cli: ParsedCli::default(),
             config: AppConfig {
                 api_key: String::new(),
+                base_history_file: PathBuf::new(),
                 history_file: PathBuf::new(),
                 endpoint: String::new(),
                 vl_default_model: String::new(),
@@ -737,12 +738,14 @@ mod tests {
             },
             session_id: "test".to_string(),
             session_history_file: PathBuf::new(),
+            active_persona: crate::ai::persona::default_persona(),
             client: reqwest::Client::builder().build().unwrap(),
             current_model: String::new(),
             current_agent: "build".to_string(),
             current_agent_manifest: None,
             pending_files: None,
             forced_skill: None,
+            forced_question: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
@@ -969,7 +972,6 @@ mod tests {
         assert!(messages.is_empty());
         assert!(turn_messages.is_empty());
     }
-
 
     #[test]
     fn auto_image_followup_uses_multimodal_message_for_vl_model() {

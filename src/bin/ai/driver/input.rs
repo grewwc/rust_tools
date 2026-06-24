@@ -1066,6 +1066,7 @@ mod tests {
             cli: crate::ai::cli::ParsedCli::default(),
             config: AppConfig {
                 api_key: String::new(),
+                base_history_file: PathBuf::new(),
                 history_file: PathBuf::new(),
                 endpoint: String::new(),
                 vl_default_model: any_vl_model_name(),
@@ -1082,12 +1083,14 @@ mod tests {
             },
             session_id: String::new(),
             session_history_file: PathBuf::new(),
+            active_persona: crate::ai::persona::default_persona(),
             client,
             current_model: any_model_name(),
             current_agent: "build".to_string(),
             current_agent_manifest: None,
             pending_files: None,
             forced_skill: None,
+            forced_question: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
@@ -1424,15 +1427,9 @@ mod tests {
         ];
         append_history_messages(&history_path, &messages).unwrap();
 
-        let before_context = history::build_context_history(
-            usize::MAX,
-            history_path.as_path(),
-            0,
-            8,
-            4000,
-            None,
-        )
-        .unwrap();
+        let before_context =
+            history::build_context_history(usize::MAX, history_path.as_path(), 0, 8, 4000, None)
+                .unwrap();
         assert!(
             before_context
                 .iter()
@@ -1454,15 +1451,9 @@ mod tests {
             searchable_history_content(&remaining[1].content),
             "first answer"
         );
-        let after_context = history::build_context_history(
-            usize::MAX,
-            history_path.as_path(),
-            0,
-            8,
-            4000,
-            None,
-        )
-        .unwrap();
+        let after_context =
+            history::build_context_history(usize::MAX, history_path.as_path(), 0, 8, 4000, None)
+                .unwrap();
         assert_eq!(after_context.len(), 2);
         assert!(!after_context.iter().any(|message| {
             let content = searchable_history_content(&message.content);

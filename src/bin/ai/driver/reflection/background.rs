@@ -1018,10 +1018,7 @@ impl LearningNoteQualityFeatures {
         let unique_token_ratio = if word_count == 0 {
             0.0
         } else {
-            let unique = tokens
-                .iter()
-                .collect::<rust_tools::cw::SkipSet<_>>()
-                .len();
+            let unique = tokens.iter().collect::<rust_tools::cw::SkipSet<_>>().len();
             unique as f32 / word_count as f32
         };
 
@@ -1216,32 +1213,19 @@ pub(super) async fn background_call(model: &str, messages: &Vec<Value>) -> Optio
         "stream": false
     });
     request::apply_aux_thinking_fields(model, &mut body);
-    let req = request::apply_request_auth(
-        BACKGROUND_HTTP_CLIENT.post(&endpoint),
-        &endpoint,
-        &api_key,
-    );
+    let req =
+        request::apply_request_auth(BACKGROUND_HTTP_CLIENT.post(&endpoint), &endpoint, &api_key);
     // 后台反射请求：60 秒超时，避免永久阻塞 daemon 任务
     let send_future = req
         .header("Content-Type", "application/json")
         .json(&body)
         .send();
     let t0 = std::time::Instant::now();
-    let resp = match tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        send_future,
-    )
-    .await
-    {
+    let resp = match tokio::time::timeout(std::time::Duration::from_secs(60), send_future).await {
         Ok(r) => r.ok()?,
         Err(_) => return None,
     };
-    let text = match tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        resp.text(),
-    )
-    .await
-    {
+    let text = match tokio::time::timeout(std::time::Duration::from_secs(30), resp.text()).await {
         Ok(r) => r.ok()?,
         Err(_) => return None,
     };

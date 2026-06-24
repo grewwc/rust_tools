@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 
 use dirs::config_dir;
-use rust_tools::cw::{SkipMap, SkipSet};
 use rust_tools::cw::LruCache;
+use rust_tools::cw::{SkipMap, SkipSet};
 
 use crate::ai::knowledge::storage::vector_store::{VectorEntry, VectorStore};
 

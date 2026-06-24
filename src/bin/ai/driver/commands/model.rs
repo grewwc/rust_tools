@@ -251,6 +251,7 @@ mod tests {
             cli: ParsedCli::default(),
             config: AppConfig {
                 api_key: String::new(),
+                base_history_file: PathBuf::new(),
                 history_file: PathBuf::new(),
                 endpoint: String::new(),
                 vl_default_model: String::new(),
@@ -267,6 +268,7 @@ mod tests {
             },
             session_id: String::new(),
             session_history_file: PathBuf::new(),
+            active_persona: crate::ai::persona::default_persona(),
             client: reqwest::Client::new(),
             current_model: crate::ai::model_names::all()
                 .first()
@@ -277,6 +279,7 @@ mod tests {
             current_agent_manifest: None,
             pending_files: None,
             forced_skill: None,
+            forced_question: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),

@@ -6,8 +6,7 @@ use regex::Regex;
 
 use crate::ai::{
     driver::print::format_section_header,
-    models,
-    provider,
+    models, provider,
     request::StreamChunk,
     theme::{ACCENT_MUTED, ACCENT_RULE, DIM, RESET},
     types::{App, StreamOutcome, StreamResult, ToolCall, take_stream_cancelled},
@@ -81,7 +80,8 @@ pub(super) async fn stream_response(
                 _ = tokio::time::sleep(Duration::from_millis(FINISH_REASON_GRACE_MS)) => break,
             }
         } else {
-            let idle_remaining = Duration::from_secs(timeout_secs).saturating_sub(last_chunk_at.elapsed());
+            let idle_remaining =
+                Duration::from_secs(timeout_secs).saturating_sub(last_chunk_at.elapsed());
             tokio::select! {
                 chunk = response.chunk() => chunk,
                 _ = wait_for_interrupt(app) => {
@@ -352,7 +352,10 @@ fn finalize_stream_response(
 /// 这里只是把它们已经上报的 `cached_tokens` 可视化出来。
 fn maybe_print_prompt_cache_metrics(usage: &crate::ai::request::StreamUsage) {
     let show = crate::commonw::configw::get_all_config()
-        .get(crate::ai::config_schema::AiConfig::PROMPT_CACHE_SHOW_METRICS, "true")
+        .get(
+            crate::ai::config_schema::AiConfig::PROMPT_CACHE_SHOW_METRICS,
+            "true",
+        )
         .trim()
         .eq_ignore_ascii_case("true");
     if !show {
@@ -463,9 +466,10 @@ fn recover_json_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
         let (name, arguments_value, id) = if let Some(func) = obj.get("function") {
             let func_obj = func.as_object()?;
             let name = func_obj.get("name")?.as_str()?.to_string();
-            let args = func_obj.get("arguments").cloned().unwrap_or_else(|| {
-                serde_json::Value::Object(serde_json::Map::new())
-            });
+            let args = func_obj
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
             let id = obj
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -473,9 +477,10 @@ fn recover_json_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
             (name, args, id)
         } else {
             let name = obj.get("name")?.as_str()?.to_string();
-            let args = obj.get("arguments").cloned().unwrap_or_else(|| {
-                serde_json::Value::Object(serde_json::Map::new())
-            });
+            let args = obj
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
             let id = obj
                 .get("id")
                 .and_then(|v| v.as_str())
@@ -539,10 +544,7 @@ fn recover_hermes_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
                 out.push(ToolCall {
                     id: format!("inline_xml_{idx}"),
                     tool_type: "function".to_string(),
-                    function: crate::ai::types::FunctionCall {
-                        name,
-                        arguments,
-                    },
+                    function: crate::ai::types::FunctionCall { name, arguments },
                 });
                 idx += 1;
             }
@@ -1368,7 +1370,10 @@ fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::Result<()> {
     }
 
     // "done thinking" 结尾标记
-    write!(out, "{ACCENT_RULE}╰─\x1b[0m {ACCENT_MUTED}done thinking\x1b[0m\n")?;
+    write!(
+        out,
+        "{ACCENT_RULE}╰─\x1b[0m {ACCENT_MUTED}done thinking\x1b[0m\n"
+    )?;
     out.flush()?;
 
     // 重置折叠状态
@@ -1429,6 +1434,7 @@ mod tests {
             cli: ParsedCli::default(),
             config: AppConfig {
                 api_key: String::new(),
+                base_history_file: PathBuf::new(),
                 history_file: PathBuf::new(),
                 endpoint: String::new(),
                 vl_default_model: String::new(),
@@ -1442,12 +1448,14 @@ mod tests {
             },
             session_id: String::new(),
             session_history_file: PathBuf::new(),
+            active_persona: crate::ai::persona::default_persona(),
             client: reqwest::Client::builder().build().unwrap(),
             current_model: String::new(),
             current_agent: String::new(),
             current_agent_manifest: None,
             pending_files: None,
             forced_skill: None,
+            forced_question: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),
@@ -1626,8 +1634,7 @@ mod tests {
 
     #[test]
     fn recover_inline_tool_calls_handles_tool_call_xml_wrapper() {
-        let raw =
-            r#"<tool_call>{"name":"read_file","arguments":{"path":"/tmp/x"}}</tool_call>"#;
+        let raw = r#"<tool_call>{"name":"read_file","arguments":{"path":"/tmp/x"}}</tool_call>"#;
         let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
         assert_eq!(calls[0].function.name, "read_file");
     }
@@ -1635,7 +1642,8 @@ mod tests {
     #[test]
     fn recover_inline_tool_calls_handles_hermes_xml_json_body() {
         // 截图中模型实际输出的 Hermes/Qwen XML 形态（body 为 JSON）。
-        let raw = "<tool_call>\n<function=read_file>\n{\"path\":\"/tmp/x\"}\n</function>\n</tool_call>";
+        let raw =
+            "<tool_call>\n<function=read_file>\n{\"path\":\"/tmp/x\"}\n</function>\n</tool_call>";
         let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read_file");
@@ -1648,8 +1656,7 @@ mod tests {
         let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read_file");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["path"], "/tmp/x");
         // 数字参数被识别为 JSON 数字而非字符串。
         assert_eq!(args["limit"], 200);
@@ -1702,9 +1709,7 @@ mod tests {
         assert!(recover_inline_tool_calls("{\"foo\":\"bar\"}").is_none());
         assert!(recover_inline_tool_calls("12345").is_none());
         // 字符串形式的 args 必须本身也是合法 JSON，否则拒绝。
-        assert!(
-            recover_inline_tool_calls(r#"{"name":"x","arguments":"not-json"}"#).is_none()
-        );
+        assert!(recover_inline_tool_calls(r#"{"name":"x","arguments":"not-json"}"#).is_none());
     }
 
     #[test]
@@ -1714,8 +1719,7 @@ mod tests {
         let calls = recover_inline_tool_calls(raw).expect("should recover tool call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "read_file");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["path"], "/tmp/x");
         assert_eq!(args["limit"], 200);
     }
@@ -2053,8 +2057,7 @@ mod tests {
         let calls = recover_inline_tool_calls(raw).expect("should recover DSML-wrapped tool calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "apply_patch");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["file_path"], "/tmp/x");
         assert_eq!(args["patch"], "---");
     }
@@ -2067,8 +2070,7 @@ mod tests {
             recover_inline_tool_calls(raw).expect("should recover fullwidth-DSML tool calls");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "apply_patch");
-        let args: serde_json::Value =
-            serde_json::from_str(&calls[0].function.arguments).unwrap();
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["file_path"], "/tmp/x");
         assert_eq!(args["patch"], "---");
     }

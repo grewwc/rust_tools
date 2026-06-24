@@ -2100,7 +2100,6 @@ fn run_parallel_readonly_batch(
     })
 }
 
-
 fn notify_tool_finished(
     observer: &mut Option<&mut dyn ToolExecutionObserver>,
     tool_call: &ToolCall,
@@ -2368,7 +2367,10 @@ mod tests {
         let mcp = McpClient::new();
         // write_file / execute_command 带副作用，不可并行，应在其处截断。
         assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("write_file")));
-        assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("execute_command")));
+        assert!(!is_parallel_safe_tool_call(
+            &mcp,
+            &tool_call("execute_command")
+        ));
         let calls = vec![tool_call("read_file"), tool_call("write_file")];
         assert_eq!(parallel_safe_batch_len(&mcp, &calls), 1);
     }
@@ -2377,8 +2379,14 @@ mod tests {
     fn parallel_batch_excludes_barriering_tools() {
         let mcp = McpClient::new();
         // search_files / list_directory / web_search 会触发 barrier，必须顺序执行。
-        assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("search_files")));
-        assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("list_directory")));
+        assert!(!is_parallel_safe_tool_call(
+            &mcp,
+            &tool_call("search_files")
+        ));
+        assert!(!is_parallel_safe_tool_call(
+            &mcp,
+            &tool_call("list_directory")
+        ));
         assert!(!is_parallel_safe_tool_call(&mcp, &tool_call("web_search")));
     }
 

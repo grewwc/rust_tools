@@ -286,9 +286,6 @@ pub(crate) fn execute_tool_call_with_args(
         }
         Err(err) => {
             record_tool_stat(name, false);
-            // Tier B2: 工具失败也作为 raw_experience 沉淀，供后续 generalization
-            // 总结成 Avoid: 经验。5 分钟节流避免噪声。
-            record_tool_failure_experience(name, &err);
             record_tool_decision_with_time(name, false, &err, elapsed_ms);
             Err(err)
         }
@@ -332,36 +329,6 @@ fn record_tool_decision_with_time(name: &str, success: bool, message: &str, elap
         }),
         execution_time_ms: Some(elapsed_ms),
     });
-}
-
-/// Tier B2：工具失败 → ingest 一条 Avoid: 体的 raw_experience。
-/// - 同名工具 5 分钟内只记一次，避免暴雨日志放大
-/// - 错误消息截断到 200 字符
-fn record_tool_failure_experience(name: &str, err: &str) {
-    use std::sync::Mutex;
-    use std::sync::OnceLock;
-    use std::time::Instant;
-    static LAST: OnceLock<Mutex<SkipMap<String, Instant>>> = OnceLock::new();
-    let map = LAST.get_or_init(|| Mutex::new(SkipMap::default()));
-    {
-        let Ok(mut g) = map.lock() else {
-            return;
-        };
-        if let Some(prev) = g.get_ref(&name.to_string())
-            && prev.elapsed() < std::time::Duration::from_secs(300)
-        {
-            return;
-        }
-        g.insert(name.to_string(), Instant::now());
-    }
-    let trimmed: String = err.chars().take(200).collect();
-    let note = format!("Avoid: tool '{}' failed: {}", name, trimmed);
-    crate::ai::driver::thinking::ingest_raw_experience_global(
-        "tool_failure",
-        &note,
-        &["tool_failure".to_string(), name.to_string()],
-        None,
-    );
 }
 
 fn record_tool_stat(name: &str, ok: bool) {

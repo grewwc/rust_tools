@@ -50,6 +50,29 @@ pub(crate) struct RawExperience {
     source: Option<String>,
 }
 
+fn note_has_structured_prefix(note: &str) -> bool {
+    let lower = note.trim_start().to_lowercase();
+    lower.starts_with("do:")
+        || lower.starts_with("avoid:")
+        || lower.starts_with("always")
+        || lower.starts_with("never")
+}
+
+fn is_model_self_note_experience(exp: &RawExperience) -> bool {
+    matches!(
+        exp.category.as_str(),
+        "self_note" | "self_note_do" | "self_note_avoid"
+    )
+}
+
+fn category_key_for_grouping(category: &str) -> &str {
+    if matches!(category, "self_note" | "self_note_do" | "self_note_avoid") {
+        "self_note"
+    } else {
+        category
+    }
+}
+
 pub struct ExperienceGeneralizer {
     principles: Vec<GeneralizedPrinciple>,
     pub(crate) experience_buffer: Vec<RawExperience>,
@@ -214,24 +237,27 @@ impl ExperienceGeneralizer {
     }
 
     pub fn try_generalize(&mut self) -> Option<GeneralizedPrinciple> {
-        if self.experience_buffer.len() < self.min_experiences_for_generalization {
+        let candidates: Vec<&RawExperience> = self
+            .experience_buffer
+            .iter()
+            // 只消费模型显式产出的 self_note 经验。tool failure / raw pipeline
+            // 噪音即使历史上残留在 store，也不参与 generalization。
+            .filter(|exp| is_model_self_note_experience(exp))
+            .collect();
+        if candidates.len() < self.min_experiences_for_generalization {
             return None;
         }
         // Fast path: if no experience carries an explicit structured prefix,
         // synthesize_principle would return None anyway — skip the grouping work.
-        let has_structured = self.experience_buffer.iter().any(|e| {
-            let lower = e.note.trim_start().to_lowercase();
-            lower.starts_with("do:")
-                || lower.starts_with("avoid:")
-                || lower.starts_with("always")
-                || lower.starts_with("never")
-        });
+        let has_structured = candidates
+            .iter()
+            .any(|exp| note_has_structured_prefix(&exp.note));
         if !has_structured {
             return None;
         }
 
         let (source_ids, domain, principle_text, source_notes) = {
-            let mut grouped = self.group_by_semantic_similarity();
+            let mut grouped = self.group_by_semantic_similarity(&candidates);
             let best_group = match grouped
                 .drain()
                 .map(|(_, v)| v)
@@ -594,10 +620,12 @@ impl ExperienceGeneralizer {
         }));
     }
 
-
-    fn group_by_semantic_similarity(&self) -> SkipMap<String, Vec<&RawExperience>> {
-        let mut groups: SkipMap<String, Vec<&RawExperience>> = SkipMap::default();
-        for exp in &self.experience_buffer {
+    fn group_by_semantic_similarity<'a>(
+        &self,
+        experiences: &[&'a RawExperience],
+    ) -> SkipMap<String, Vec<&'a RawExperience>> {
+        let mut groups: SkipMap<String, Vec<&'a RawExperience>> = SkipMap::default();
+        for exp in experiences {
             let key = self.semantic_group_key(exp);
             groups.entry(key).or_default().push(exp);
         }
@@ -605,7 +633,7 @@ impl ExperienceGeneralizer {
     }
 
     fn semantic_group_key(&self, exp: &RawExperience) -> String {
-        let category_key = exp.category.to_lowercase();
+        let category_key = category_key_for_grouping(&exp.category).to_lowercase();
         let tag_key = exp
             .tags
             .iter()
@@ -827,19 +855,19 @@ mod tests {
         // 隔离潜在的跨进程持久化残留，确保仅以本测试 ingest 的三条经验为准
         generalizer.experience_buffer.clear();
         generalizer.ingest_experience(
-            "error_handling",
+            "self_note_do",
             "Do: always check Option before unwrap in async code",
             &["async".to_string()],
             None,
         );
         generalizer.ingest_experience(
-            "error_handling",
+            "self_note_do",
             "Do: validate async results before chaining",
             &["async".to_string()],
             None,
         );
         generalizer.ingest_experience(
-            "error_handling",
+            "self_note_avoid",
             "Avoid: unwrap on async task results",
             &["async".to_string()],
             None,
@@ -949,9 +977,47 @@ mod tests {
         // 防御：跨进程持久化的 raw_experience 可能让 buffer 已经超过最小阈值，
         // 这里手动清空，确保仅以本测试 ingest 的两条经验为准。
         generalizer.experience_buffer.clear();
-        generalizer.ingest_experience("test", "one note", &[], None);
-        generalizer.ingest_experience("test", "two note", &[], None);
+        generalizer.ingest_experience("self_note", "one note", &[], None);
+        generalizer.ingest_experience("self_note", "two note", &[], None);
         assert!(generalizer.try_generalize().is_none());
+    }
+
+    #[test]
+    fn only_model_self_note_experiences_are_generalized() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "rt_generalization_tool_failure_{}_{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let mut generalizer = ExperienceGeneralizer::new();
+        generalizer.experience_buffer.clear();
+        for note in [
+            "Avoid: tool 'read_file' failed: File error /home/user/request.txt: File not found",
+            "Avoid: tool 'read_file' failed: Missing file_path",
+            "Avoid: tool 'read_file' failed: File error /Users/bytedance/rust_tools/missing.rs: File not found",
+        ] {
+            generalizer.ingest_experience(
+                "tool_failure",
+                note,
+                &["tool_failure".to_string(), "read_file".to_string()],
+                None,
+            );
+        }
+
+        assert!(
+            generalizer.try_generalize().is_none(),
+            "non-self-note experiences should not become generalized principles"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
     }
 
     #[test]

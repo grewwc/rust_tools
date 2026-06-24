@@ -55,6 +55,8 @@ const INTERNAL_COMMANDS: &[&str] = &[
     "/model", ":model",
     "/agents", ":agents",
     "/agent", ":agent",
+    "/personas", ":personas",
+    "/persona", ":persona",
     "/sessions", ":sessions",
 ];
 
@@ -368,6 +370,10 @@ pub(super) fn print_help() {
     println!("    /agents current           show current agent");
     println!("    /agents use <name>        switch to an agent");
     println!("    /agents auto              restore automatic agent routing");
+    println!();
+    println!("  Skill management:");
+    println!("    /skills                   list available skills");
+    println!("    /skills <name>            select & activate a skill");
     println!();
     println!("  Session management:");
     println!("    /sessions                 list all sessions");

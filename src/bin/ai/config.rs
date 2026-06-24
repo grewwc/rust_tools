@@ -80,9 +80,11 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
                 .display()
                 .to_string()
         });
+    let history_file = PathBuf::from(expanduser(&history_file).as_ref());
     Ok(AppConfig {
         api_key,
-        history_file: PathBuf::from(expanduser(&history_file).as_ref()),
+        base_history_file: history_file.clone(),
+        history_file,
         endpoint,
         vl_default_model,
         history_max_chars,

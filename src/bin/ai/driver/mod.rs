@@ -256,7 +256,11 @@ fn scheduler_cfg_u64(key: &str, default: u64) -> u64 {
 }
 
 fn sched_base_batch() -> usize {
-    scheduler_cfg_usize(AiConfig::SCHEDULER_BASE_BATCH, BG_DISPATCH_BASE_BATCH_DEFAULT).max(1)
+    scheduler_cfg_usize(
+        AiConfig::SCHEDULER_BASE_BATCH,
+        BG_DISPATCH_BASE_BATCH_DEFAULT,
+    )
+    .max(1)
 }
 
 fn sched_max_batch() -> usize {
@@ -265,8 +269,11 @@ fn sched_max_batch() -> usize {
 }
 
 fn sched_execute_max() -> usize {
-    scheduler_cfg_usize(AiConfig::SCHEDULER_EXECUTE_MAX, BG_DISPATCH_EXECUTE_MAX_DEFAULT)
-        .max(sched_base_batch())
+    scheduler_cfg_usize(
+        AiConfig::SCHEDULER_EXECUTE_MAX,
+        BG_DISPATCH_EXECUTE_MAX_DEFAULT,
+    )
+    .max(sched_base_batch())
 }
 
 fn sched_fail_threshold() -> u32 {
@@ -278,7 +285,11 @@ fn sched_fail_threshold() -> u32 {
 }
 
 fn sched_cooldown_epochs() -> u64 {
-    scheduler_cfg_u64(AiConfig::SCHEDULER_COOLDOWN_EPOCHS, SCHED_COOLDOWN_EPOCHS_DEFAULT).max(1)
+    scheduler_cfg_u64(
+        AiConfig::SCHEDULER_COOLDOWN_EPOCHS,
+        SCHED_COOLDOWN_EPOCHS_DEFAULT,
+    )
+    .max(1)
 }
 
 fn sched_eval_period_epochs() -> u64 {
@@ -290,7 +301,11 @@ fn sched_eval_period_epochs() -> u64 {
 }
 
 fn sched_eval_min_samples() -> usize {
-    scheduler_cfg_usize(AiConfig::SCHEDULER_EVAL_MIN_SAMPLES, SCHED_EVAL_MIN_SAMPLES_DEFAULT).max(1)
+    scheduler_cfg_usize(
+        AiConfig::SCHEDULER_EVAL_MIN_SAMPLES,
+        SCHED_EVAL_MIN_SAMPLES_DEFAULT,
+    )
+    .max(1)
 }
 
 fn sched_cost_penalty_divisor() -> u64 {
@@ -877,6 +892,8 @@ fn agent_manifests_fingerprint(agents: &[AgentManifest]) -> [u8; 32] {
             hasher.update(b",");
         }
         hasher.update(b"\0");
+        hasher.update([m.disable_mcp_tools as u8]);
+        hasher.update(b"\0");
         for tag in &m.routing_tags {
             hasher.update(tag.as_bytes());
             hasher.update(b",");
@@ -1059,8 +1076,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // --generate-completions: 生成 shell 补全脚本（纯本地，不调 LLM）
     if cli.generate_completions {
-        let shell = cli.args.first().cloned().unwrap_or_else(||
-            std::env::var("SHELL").unwrap_or_default().rsplit('/').next().unwrap_or("bash").to_string());
+        let shell = cli.args.first().cloned().unwrap_or_else(|| {
+            std::env::var("SHELL")
+                .unwrap_or_default()
+                .rsplit('/')
+                .next()
+                .unwrap_or("bash")
+                .to_string()
+        });
         cli::generate_completion_script(&shell);
         return Ok(());
     }
@@ -1086,7 +1109,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(err) = models::ensure_models_available() {
         return Err(err.into());
     }
-    let config = config::load_config()?;
+    let mut config = config::load_config()?;
+    let persona_store = crate::ai::persona::PersonaStore::new();
+    let active_persona = match persona_store.active_persona() {
+        Ok(persona) => persona,
+        Err(err) => {
+            eprintln!("[persona] failed to load personas: {}", err);
+            crate::ai::persona::default_persona()
+        }
+    };
+    config.history_file = crate::ai::persona::history_file_for_persona(
+        config.base_history_file.as_path(),
+        &active_persona.id,
+    );
     let session_store = SessionStore::new(config.history_file.as_path());
     let session_arg = cli.session.clone().unwrap_or_default();
     let session_id = if session_arg.trim().is_empty() {
@@ -1150,11 +1185,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Some(cli.files.clone())
         },
         forced_skill: None,
+        forced_question: None,
         current_model,
         current_agent: "build".to_string(),
         current_agent_manifest: None,
         session_id: session_id.clone(),
         session_history_file: session_store.session_history_file(&session_id),
+        active_persona,
         cli,
         config,
         client,
@@ -1176,30 +1213,55 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
     };
+    if let Err(err) = persona_store.remember_session(&app.active_persona.id, &app.session_id) {
+        eprintln!("[persona] failed to persist session binding: {}", err);
+    }
 
     // 处理 --note-delete / -nd：输入一段话，模型自动匹配知识库条目，确认后删除。
     if let Some(query) = app.cli.note_delete.clone() {
-        return handle_note_delete(&mut app, &query).await;
+        return runtime_ctx::PERSONA_MEMORY_PATH
+            .scope(
+                app.current_persona_memory_file(),
+                handle_note_delete(&mut app, &query),
+            )
+            .await;
     }
 
     // 处理 --note-edit / -ne：输入一段话，模型匹配知识库条目，在编辑器中改写后保存。
     if let Some(query) = app.cli.note_edit.clone() {
-        return handle_note_edit(&mut app, &query).await;
+        return runtime_ctx::PERSONA_MEMORY_PATH
+            .scope(
+                app.current_persona_memory_file(),
+                handle_note_edit(&mut app, &query),
+            )
+            .await;
     }
 
     // 处理 --note / -n：快速保存 memo 到知识库并退出。
     // 即使没有文本（只想保存剪贴板图片），只要传了 -n 也要进入保存流程。
     if app.cli.note_flag {
-        return handle_note_save(&mut app).await;
+        return runtime_ctx::PERSONA_MEMORY_PATH
+            .scope(
+                app.current_persona_memory_file(),
+                handle_note_save(&mut app),
+            )
+            .await;
     }
 
     // 处理 --note-search / -ns：只从知识库中检索 memo，不调用 LLM / 任何工具，
     // 直接打印结果并退出。
     if app.cli.note_search {
-        return handle_memo_search(&app).await;
+        return runtime_ctx::PERSONA_MEMORY_PATH
+            .scope(app.current_persona_memory_file(), handle_memo_search(&app))
+            .await;
     }
     if app.cli.consolidate_knowledge {
-        return handle_consolidate_knowledge(&app).await;
+        return runtime_ctx::PERSONA_MEMORY_PATH
+            .scope(
+                app.current_persona_memory_file(),
+                handle_consolidate_knowledge(&app),
+            )
+            .await;
     }
 
     let decision_log_path = app
@@ -1250,8 +1312,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
     use arboard::Clipboard;
-    use image::{ImageBuffer, Rgb, Rgba};
     use image::buffer::ConvertBuffer;
+    use image::{ImageBuffer, Rgb, Rgba};
     use std::fs;
 
     let store = MemoryStore::from_env_or_config();
@@ -1332,21 +1394,21 @@ async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::error::Error
     let note_content = if let Some(image_path) = &clipboard_image_path {
         // 有图片，调用视觉模型理解内容
         println!("[note] Detected image in clipboard, analyzing...");
-        
+
         let model = crate::ai::models::default_vl_model();
-        
+
         // 构建包含图片的消息
         let content = crate::ai::request::build_content(
             &model,
             "请详细描述这张图片的内容，包括关键信息、文字、数据等。用中文回答。",
             &[image_path.clone()],
         )?;
-        
+
         let messages = vec![serde_json::json!({
             "role": "user",
             "content": content,
         })];
-        
+
         // 调用模型
         match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
             Ok(response) => {
@@ -1430,7 +1492,10 @@ async fn handle_note_save(app: &mut App) -> Result<(), Box<dyn std::error::Error
     match store.append(&entry) {
         Ok(()) => {
             if let Some(image_path) = &clipboard_image_path {
-                println!("[note] Image content saved to knowledge base [memo] (image: {}):", image_path);
+                println!(
+                    "[note] Image content saved to knowledge base [memo] (image: {}):",
+                    image_path
+                );
             } else {
                 println!("[note] Saved to knowledge base [memo]:");
             }
@@ -1522,16 +1587,15 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
     let spinner = SearchSpinner::start("Searching memo");
 
     // 检索相关 memo 条目作为上下文。
-    let candidates = match crate::ai::tools::service::memory::search_memo_candidates_scored(
-        &query, 20,
-    ) {
-        Ok(c) => c,
-        Err(err) => {
-            spinner.stop();
-            eprintln!("[note-search] 检索失败: {}", err);
-            return Err(err.into());
-        }
-    };
+    let candidates =
+        match crate::ai::tools::service::memory::search_memo_candidates_scored(&query, 20) {
+            Ok(c) => c,
+            Err(err) => {
+                spinner.stop();
+                eprintln!("[note-search] 检索失败: {}", err);
+                return Err(err.into());
+            }
+        };
     if candidates.is_empty() {
         spinner.stop();
         crate::ai::stream::render_markdown_block(&format!(
@@ -1622,8 +1686,8 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
 /// 4. 用 JSON 数组格式（比文本格式更省 token）
 /// 5. 英文 system prompt（模型响应更快）
 async fn handle_consolidate_knowledge(app: &App) -> Result<(), Box<dyn std::error::Error>> {
-    use chrono::Local;
     use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
+    use chrono::Local;
     use serde_json::Value;
 
     let store = MemoryStore::from_env_or_config();
@@ -1635,7 +1699,8 @@ async fn handle_consolidate_knowledge(app: &App) -> Result<(), Box<dyn std::erro
     }
 
     // 过滤：优先级 < 200 的才分析；按时间倒序；取最近 15 条
-    let mut candidates: Vec<&AgentMemoryEntry> = all_entries.iter()
+    let mut candidates: Vec<&AgentMemoryEntry> = all_entries
+        .iter()
         .filter(|e| e.priority.unwrap_or(100) < 200)
         .collect();
     candidates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
@@ -1654,7 +1719,9 @@ async fn handle_consolidate_knowledge(app: &App) -> Result<(), Box<dyn std::erro
         let ts_short: String = entry.timestamp.chars().take(10).collect();
         let preview: String = if entry.note.chars().count() > 40 {
             entry.note.chars().take(40).collect::<String>() + "…"
-        } else { entry.note.clone() };
+        } else {
+            entry.note.clone()
+        };
         entries_json.push(serde_json::json!({
             "id": id,
             "cat": entry.category,
@@ -1671,10 +1738,14 @@ async fn handle_consolidate_knowledge(app: &App) -> Result<(), Box<dyn std::erro
         {\"reasoning\":\"1-sentence summary\",\"delete_ids\":[\"id1\",\"id2\"],\"merge_plan\":[{\"ids\":[\"id1\",\"id2\"],\"merged_content\":\"...\"}]}\n\
         Rules: delete duplicates/obsolete; merge related; keep useful. Priority>=200 already filtered out.";
 
-    let prompt = format!("Analyze these {} entries:\n{}", candidates.len(), serde_json::to_string(&entries_json).unwrap());
+    let prompt = format!(
+        "Analyze these {} entries:\n{}",
+        candidates.len(),
+        serde_json::to_string(&entries_json).unwrap()
+    );
     let messages = vec![
         serde_json::json!({"role": "system", "content": sys}),
-        serde_json::json!({"role": "user", "content": prompt})
+        serde_json::json!({"role": "user", "content": prompt}),
     ];
 
     // 知识整理用主模型（用户的默认对话模型）。走流式链路：响应头立即返回、
@@ -1709,7 +1780,10 @@ async fn handle_consolidate_knowledge(app: &App) -> Result<(), Box<dyn std::erro
         Ok(v) => v,
         Err(e) => {
             eprintln!("[consolidate] JSON parse error: {}", e);
-            eprintln!("[consolidate] Raw: {}", raw.chars().take(200).collect::<String>());
+            eprintln!(
+                "[consolidate] Raw: {}",
+                raw.chars().take(200).collect::<String>()
+            );
             return Ok(());
         }
     };
@@ -1719,10 +1793,12 @@ async fn handle_consolidate_knowledge(app: &App) -> Result<(), Box<dyn std::erro
     }
 
     let delete_ids: Vec<&str> = plan["delete_ids"]
-        .as_array().map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
     let merge_plan: Vec<&Value> = plan["merge_plan"]
-        .as_array().map(|a| a.iter().collect())
+        .as_array()
+        .map(|a| a.iter().collect())
         .unwrap_or_default();
 
     if delete_ids.is_empty() && merge_plan.is_empty() {
@@ -1744,11 +1820,14 @@ async fn handle_consolidate_knowledge(app: &App) -> Result<(), Box<dyn std::erro
         let mut merged_count = 0;
         let mut new: Vec<AgentMemoryEntry> = Vec::new();
         for item in &merge_plan {
-            let ids: Vec<&str> = item["ids"].as_array()
+            let ids: Vec<&str> = item["ids"]
+                .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
                 .unwrap_or_default();
             let content = item["merged_content"].as_str().unwrap_or("");
-            if ids.is_empty() || content.is_empty() { continue; }
+            if ids.is_empty() || content.is_empty() {
+                continue;
+            }
             merged_count += ids.len();
             new.push(AgentMemoryEntry {
                 id: None,
@@ -1758,7 +1837,9 @@ async fn handle_consolidate_knowledge(app: &App) -> Result<(), Box<dyn std::erro
                 tags: vec!["consolidated".into()],
                 source: None,
                 priority: Some(150),
-                owner_pid: None, owner_pgid: None, image_path: None,
+                owner_pid: None,
+                owner_pgid: None,
+                image_path: None,
             });
         }
         if !new.is_empty() {
@@ -1813,7 +1894,10 @@ async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn st
         }
     };
     if candidates.is_empty() {
-        println!("[note-delete] 没有找到与「{}」相关的可删除 memo 条目。", query);
+        println!(
+            "[note-delete] 没有找到与「{}」相关的可删除 memo 条目。",
+            query
+        );
         return Ok(());
     }
 
@@ -1839,17 +1923,18 @@ async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn st
         }),
     ];
 
-    let chosen = match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
-        Ok(response) => response
-            .pointer("/choices/0/message/content")
-            .and_then(|c| c.as_str())
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default(),
-        Err(err) => {
-            eprintln!("[note-delete] 模型匹配失败: {}", err);
-            String::new()
-        }
-    };
+    let chosen =
+        match crate::ai::request::do_request_json(app, &model, &messages, false, false).await {
+            Ok(response) => response
+                .pointer("/choices/0/message/content")
+                .and_then(|c| c.as_str())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default(),
+            Err(err) => {
+                eprintln!("[note-delete] 模型匹配失败: {}", err);
+                String::new()
+            }
+        };
 
     // 解析模型返回的若干编号（支持逗号 / 空格 / 顿号等分隔），去重并保持升序。
     let mut chosen_indices: Vec<usize> = Vec::new();
@@ -1878,7 +1963,9 @@ async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn st
     chosen_indices.sort_unstable();
 
     if chosen_indices.is_empty() {
-        println!("[note-delete] 模型未能从候选中确定要删除的条目，已取消。可换个更具体的描述重试。");
+        println!(
+            "[note-delete] 模型未能从候选中确定要删除的条目，已取消。可换个更具体的描述重试。"
+        );
         return Ok(());
     }
 
@@ -1901,9 +1988,7 @@ async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn st
             target.note.chars().take(500).collect::<String>()
         );
     }
-    print!(
-        "\n请输入要删除的编号（如 1,3；输入 all 删除全部，直接回车=全部，n=取消）: "
-    );
+    print!("\n请输入要删除的编号（如 1,3；输入 all 删除全部，直接回车=全部，n=取消）: ");
     std::io::stdout().flush().ok();
 
     let mut answer = String::new();
@@ -1911,43 +1996,47 @@ async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn st
     let answer = answer.trim().to_lowercase();
 
     // 解析用户选择，得到最终要删除的 targets 子集。
-    let selected: Vec<&crate::ai::tools::storage::memory_store::AgentMemoryEntry> =
-        if answer.is_empty() || answer == "y" || answer == "yes" || answer == "all" || answer == "a"
-        {
-            targets.clone()
-        } else if answer == "n" || answer == "no" || answer == "q" || answer == "cancel" {
-            println!("[note-delete] 已取消，未删除任何内容。");
-            return Ok(());
-        } else {
-            // 解析编号列表（针对上面列出的 1..=targets.len()）。
-            let mut picks: Vec<usize> = Vec::new();
-            let mut num = String::new();
-            let mut flush = |num: &mut String, out: &mut Vec<usize>| {
-                if let Ok(n) = num.parse::<usize>() {
-                    if n >= 1 && n <= targets.len() {
-                        let idx = n - 1;
-                        if !out.contains(&idx) {
-                            out.push(idx);
-                        }
+    let selected: Vec<&crate::ai::tools::storage::memory_store::AgentMemoryEntry> = if answer
+        .is_empty()
+        || answer == "y"
+        || answer == "yes"
+        || answer == "all"
+        || answer == "a"
+    {
+        targets.clone()
+    } else if answer == "n" || answer == "no" || answer == "q" || answer == "cancel" {
+        println!("[note-delete] 已取消，未删除任何内容。");
+        return Ok(());
+    } else {
+        // 解析编号列表（针对上面列出的 1..=targets.len()）。
+        let mut picks: Vec<usize> = Vec::new();
+        let mut num = String::new();
+        let mut flush = |num: &mut String, out: &mut Vec<usize>| {
+            if let Ok(n) = num.parse::<usize>() {
+                if n >= 1 && n <= targets.len() {
+                    let idx = n - 1;
+                    if !out.contains(&idx) {
+                        out.push(idx);
                     }
                 }
-                num.clear();
-            };
-            for c in answer.chars() {
-                if c.is_ascii_digit() {
-                    num.push(c);
-                } else {
-                    flush(&mut num, &mut picks);
-                }
             }
-            flush(&mut num, &mut picks);
-            picks.sort_unstable();
-            if picks.is_empty() {
-                println!("[note-delete] 未识别到有效编号，已取消，未删除任何内容。");
-                return Ok(());
-            }
-            picks.into_iter().map(|i| targets[i]).collect()
+            num.clear();
         };
+        for c in answer.chars() {
+            if c.is_ascii_digit() {
+                num.push(c);
+            } else {
+                flush(&mut num, &mut picks);
+            }
+        }
+        flush(&mut num, &mut picks);
+        picks.sort_unstable();
+        if picks.is_empty() {
+            println!("[note-delete] 未识别到有效编号，已取消，未删除任何内容。");
+            return Ok(());
+        }
+        picks.into_iter().map(|i| targets[i]).collect()
+    };
 
     let mut deleted = 0usize;
     let mut failed = 0usize;
@@ -1956,11 +2045,17 @@ async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn st
             Ok(_) => deleted += 1,
             Err(err) => {
                 failed += 1;
-                eprintln!("[note-delete] 删除失败 (时间 {}): {}", target.timestamp, err);
+                eprintln!(
+                    "[note-delete] 删除失败 (时间 {}): {}",
+                    target.timestamp, err
+                );
             }
         }
     }
-    println!("[note-delete] 完成：已删除 {} 条，失败 {} 条。", deleted, failed);
+    println!(
+        "[note-delete] 完成：已删除 {} 条，失败 {} 条。",
+        deleted, failed
+    );
     if failed > 0 && deleted == 0 {
         return Err("all deletions failed".into());
     }
@@ -2109,7 +2204,10 @@ async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std:
                 println!("    {FIELD}id:{RST} {}", id);
             }
             println!("    {FIELD}时间:{RST} {}", e.timestamp);
-            println!("    {FIELD}内容:{RST} {}", e.note.chars().take(500).collect::<String>());
+            println!(
+                "    {FIELD}内容:{RST} {}",
+                e.note.chars().take(500).collect::<String>()
+            );
         }
         print!("\n{HINT}请输入要修改的编号（只能选一条；n=取消）:{RST} ");
         std::io::stdout().flush().ok();
@@ -2292,23 +2390,27 @@ async fn run_foreground_resume(
         skill_manifests.clone(),
         agent_manifests.clone(),
     );
+    let persona_memory_path = app.current_persona_memory_file();
 
     let turn_outcome = runtime_ctx::DRIVER_CTX
         .scope(
             driver_ctx,
-            TASK_PID.scope(
-                Some(pid),
-                turn_runtime::run_turn(
-                    app,
-                    mcp_client,
-                    skill_manifests,
-                    usize::MAX,
-                    proc_question,
-                    String::new(),
-                    next_model,
-                    None,
-                    false,
-                    false,
+            runtime_ctx::PERSONA_MEMORY_PATH.scope(
+                persona_memory_path,
+                TASK_PID.scope(
+                    Some(pid),
+                    turn_runtime::run_turn(
+                        app,
+                        mcp_client,
+                        skill_manifests,
+                        usize::MAX,
+                        proc_question,
+                        String::new(),
+                        next_model,
+                        None,
+                        false,
+                        false,
+                    ),
                 ),
             ),
         )
@@ -2501,9 +2603,7 @@ async fn run_loop(
                         .as_ref()
                         .map(|goal| aios_kernel::primitives::FutexAddr(goal.completion_futex_addr)),
                     task_goal.as_ref().map(|goal| goal.task_id.clone()),
-                    task_goal
-                        .as_ref()
-                        .and_then(|goal| goal.auto_model_fallback),
+                    task_goal.as_ref().and_then(|goal| goal.auto_model_fallback),
                 ));
             }
 
@@ -2599,9 +2699,7 @@ async fn run_loop(
                         &captured_output,
                         os.get_process(pid).map(|proc| &proc.state),
                     );
-                    if publish_task_result
-                        && let Some(result_channel_id) = result_channel_id
-                    {
+                    if publish_task_result && let Some(result_channel_id) = result_channel_id {
                         let payload = serde_json::json!({
                             "status": if result.is_ok() { "completed" } else { "failed" },
                             "output": captured_output,
@@ -2622,9 +2720,7 @@ async fn run_loop(
                             "task_result.producer",
                         );
                     }
-                    if publish_task_result
-                        && let Some(addr) = completion_futex_addr
-                    {
+                    if publish_task_result && let Some(addr) = completion_futex_addr {
                         let _ = os.futex_store(addr, 1);
                     }
                     match result {
@@ -2656,6 +2752,10 @@ async fn run_loop(
                 type BoxedTaskFuture =
                     std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
                 let mut wrapped: BoxedTaskFuture = Box::pin(inner_fut);
+                let persona_memory_path = app.current_persona_memory_file();
+                wrapped = Box::pin(
+                    runtime_ctx::PERSONA_MEMORY_PATH.scope(persona_memory_path.clone(), wrapped),
+                );
                 wrapped = Box::pin(
                     runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped),
                 );
@@ -2668,13 +2768,7 @@ async fn run_loop(
                     // (is_permanent_memory) 合并回主 memory 文件，让 long-term
                     // assets 能跨 task 共享，但普通 task_event 留在私有文件，
                     // 不污染主记忆。
-                    //
-                    // 主 memory 路径在父任务作用域内解析，这里 task_local 还没装上
-                    // SUBAGENT_MEMORY_PATH，所以 from_env_or_config 拿到的是主路径。
-                    let main_path =
-                        crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config()
-                            .path()
-                            .to_path_buf();
+                    let main_path = persona_memory_path;
                     let private_for_merge = mem_path.clone();
                     wrapped = Box::pin(runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped));
                     // 这里包一层 outer future：sub-agent run 完成后 merge。
@@ -2760,11 +2854,22 @@ async fn run_loop(
             &mut manifests_loaded,
         );
 
-        if try_handle_interactive_command(app, mcp_client, &question, agent_manifests)? {
-            if handle_post_command(app, &mut should_quit) {
-                return Ok(());
+        if try_handle_interactive_command(
+            app,
+            mcp_client,
+            &question,
+            agent_manifests,
+            skill_manifests,
+        )? {
+            // /skills <name> <rest> 时，解析出的 rest 替换 question 继续问答
+            if let Some(rest) = app.forced_question.take() {
+                question = rest;
+            } else {
+                if handle_post_command(app, &mut should_quit) {
+                    return Ok(());
+                }
+                continue;
             }
-            continue;
         }
         maybe_auto_route_agent(app, &*agent_manifests, &question);
 
@@ -2838,23 +2943,27 @@ async fn run_loop(
         );
 
         hooks::run_lifecycle_hook(hooks::HookEvent::TurnStart, None, None);
+        let persona_memory_path = app.current_persona_memory_file();
 
         let turn_outcome = runtime_ctx::DRIVER_CTX
             .scope(
                 driver_ctx,
-                TASK_PID.scope(
-                    fg_pid,
-                    turn_runtime::run_turn(
-                        app,
-                        mcp_client,
-                        &*skill_manifests,
-                        history_count,
-                        question,
-                        attachments_text,
-                        next_model,
-                        precomputed_ocr,
-                        one_shot_mode,
-                        should_quit,
+                runtime_ctx::PERSONA_MEMORY_PATH.scope(
+                    persona_memory_path,
+                    TASK_PID.scope(
+                        fg_pid,
+                        turn_runtime::run_turn(
+                            app,
+                            mcp_client,
+                            &*skill_manifests,
+                            history_count,
+                            question,
+                            attachments_text,
+                            next_model,
+                            precomputed_ocr,
+                            one_shot_mode,
+                            should_quit,
+                        ),
                     ),
                 ),
             )
@@ -2924,8 +3033,9 @@ async fn run_loop(
         // 还没被调度的瞬间结束进程（子 agent 永远停在 Ready）。因此：只要本轮是
         // 让出（Continue）且仍有未终止的前台进程在等待，就继续 loop，让调度器派发
         // 子 agent、收集结果并唤醒前台续跑，直到前台真正产出最终回答后再退出。
-        let parked_awaiting_subagents = matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Continue))
-            && has_pending_foreground_process(app);
+        let parked_awaiting_subagents =
+            matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Continue))
+                && has_pending_foreground_process(app);
         if (matches!(turn_outcome, Ok(turn_runtime::TurnOutcome::Quit)) || should_quit)
             && !parked_awaiting_subagents
         {
@@ -2968,10 +3078,10 @@ mod tests {
     use crate::ai::cli::ParsedCli;
     use crate::ai::history::{Message, append_history_messages};
     use crate::ai::skills::SkillManifest;
+    use crate::ai::tools::task_tools::InheritOptions;
     use crate::ai::types::{AgentContext, App, AppConfig};
     use aios_kernel::kernel::{EventId, ProcessState, WaitPolicy, WaitReason};
     use aios_kernel::primitives::ResourceLimit;
-    use crate::ai::tools::task_tools::InheritOptions;
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
 
@@ -3018,13 +3128,21 @@ mod tests {
                 timeout_tick: None,
             },
         };
-        assert!(!should_publish_subagent_task_result(true, "", Some(&waiting)));
+        assert!(!should_publish_subagent_task_result(
+            true,
+            "",
+            Some(&waiting)
+        ));
         assert!(should_publish_subagent_task_result(
             true,
             "final answer",
             Some(&waiting)
         ));
-        assert!(should_publish_subagent_task_result(false, "", Some(&waiting)));
+        assert!(should_publish_subagent_task_result(
+            false,
+            "",
+            Some(&waiting)
+        ));
         assert!(should_publish_subagent_task_result(true, "", None));
     }
 
@@ -3094,6 +3212,7 @@ mod tests {
             tools: Vec::new(),
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),
+            disable_mcp_tools: false,
             routing_tags: routing_tags.iter().map(|tag| (*tag).to_string()).collect(),
             model_tier: Some(AgentModelTier::Heavy),
             disabled: false,
@@ -3108,6 +3227,7 @@ mod tests {
             cli: ParsedCli::default(),
             config: AppConfig {
                 api_key: String::new(),
+                base_history_file: PathBuf::new(),
                 history_file: PathBuf::new(),
                 endpoint: String::new(),
                 vl_default_model: String::new(),
@@ -3124,12 +3244,14 @@ mod tests {
             },
             session_id: String::new(),
             session_history_file: PathBuf::new(),
+            active_persona: crate::ai::persona::default_persona(),
             client: reqwest::Client::new(),
             current_model: "test-model".to_string(),
             current_agent: current_agent.to_string(),
             current_agent_manifest: None,
             pending_files: None,
             forced_skill: None,
+            forced_question: None,
             attached_image_files: Vec::new(),
             shutdown: Arc::new(AtomicBool::new(false)),
             streaming: Arc::new(AtomicBool::new(false)),

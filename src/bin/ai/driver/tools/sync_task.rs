@@ -147,8 +147,7 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
     let result_slot_for_scope = result_slot.clone();
     // Slot the sub-agent writes its current execution phase into; the wait
     // loop reads it to annotate the heartbeat line ("… · calling model").
-    let phase_slot: runtime_ctx::SubagentPhaseSlot =
-        Arc::new(std::sync::Mutex::new(String::new()));
+    let phase_slot: runtime_ctx::SubagentPhaseSlot = Arc::new(std::sync::Mutex::new(String::new()));
     let phase_slot_for_scope = phase_slot.clone();
 
     let inherit = prepared.inherit;
@@ -180,19 +179,20 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
 
     type BoxedSubagentFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
     let mut wrapped: BoxedSubagentFuture = Box::pin(inner_fut);
+    let persona_memory_path = spawn_driver_ctx.app_proto.current_persona_memory_file();
 
     // Always install the result slot scope so `finalize_turn` can publish
     // the answer back to us regardless of inherit settings. Also install the
     // phase slot so the sub-agent's `run_turn` can report its current phase.
+    wrapped =
+        Box::pin(runtime_ctx::PERSONA_MEMORY_PATH.scope(persona_memory_path.clone(), wrapped));
     wrapped = Box::pin(runtime_ctx::SUBAGENT_PHASE.scope(phase_slot_for_scope, wrapped));
     wrapped = Box::pin(runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped));
 
     if !inherit.memory {
         let mem_path = runtime_ctx::make_subagent_memory_path(&parent_history_path, &task_id);
         // sub-agent 默认私有 memory：merge 白名单条目回主文件
-        let main_path = crate::ai::tools::storage::memory_store::MemoryStore::from_env_or_config()
-            .path()
-            .to_path_buf();
+        let main_path = persona_memory_path;
         let private_for_merge = mem_path.clone();
         wrapped = Box::pin(runtime_ctx::SUBAGENT_MEMORY_PATH.scope(mem_path, wrapped));
         let inner = wrapped;
@@ -366,9 +366,7 @@ fn print_heartbeat_line(elapsed: Duration, phase: &str) {
     if phase.is_empty() {
         print!("\r\x1b[2K\x1b[2m⏳ subagent running… {secs}s (Ctrl+C to cancel)\x1b[0m");
     } else {
-        print!(
-            "\r\x1b[2K\x1b[2m⏳ subagent running… {secs}s · {phase} (Ctrl+C to cancel)\x1b[0m"
-        );
+        print!("\r\x1b[2K\x1b[2m⏳ subagent running… {secs}s · {phase} (Ctrl+C to cancel)\x1b[0m");
     }
     let _ = std::io::stdout().flush();
 }

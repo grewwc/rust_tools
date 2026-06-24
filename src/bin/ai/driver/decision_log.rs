@@ -1,7 +1,8 @@
 /// 决策日志模块 - 记录 AI Agent 的关键决策过程
 ///
 /// 用于元认知（Meta-Cognition）：追溯"为什么做了某个选择"，便于调试和优化
-use chrono::Local;use rust_tools::cw::SkipMap;
+use chrono::Local;
+use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},

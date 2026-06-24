@@ -7,9 +7,7 @@ use super::agents::{AgentManifest, AgentModelTier};
 use super::cli::ParsedCli;
 use super::config_schema::AiConfig;
 use super::model_names::{self, ModelDef};
-use super::provider::{
-    self, ApiProvider, ModelQualityTier, ReasoningEffort,
-};
+use super::provider::{self, ApiProvider, ModelQualityTier, ReasoningEffort};
 use crate::commonw::configw;
 
 pub(super) fn is_vl_model(model: &str) -> bool {
@@ -226,7 +224,9 @@ enum SubagentTaskDifficulty {
     Heavy,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) enum ModelStrengthTier {
     Light,
     Standard,
@@ -320,7 +320,9 @@ pub(super) fn mark_model_temporarily_unavailable(model: &str, reason: &str) {
     }
     let until = Instant::now() + MODEL_RUNTIME_COOLDOWN;
     if let Ok(mut disabled) = RUNTIME_DISABLED_MODELS.lock() {
-        if let Some(def) = model_names::find_by_name(trimmed).or_else(|| model_names::find_by_key(trimmed)) {
+        if let Some(def) =
+            model_names::find_by_name(trimmed).or_else(|| model_names::find_by_key(trimmed))
+        {
             disabled.insert(normalize_model_token(&def.name), until);
             disabled.insert(normalize_model_token(&def.key), until);
         } else {
@@ -372,11 +374,7 @@ pub(super) fn fallback_subagent_model_after_failure(
     failed_model: &str,
     spec: AutoModelFallbackSpec,
 ) -> Option<String> {
-    pick_subagent_model_excluding(
-        spec.require_thinking,
-        spec.target_tier,
-        Some(failed_model),
-    )
+    pick_subagent_model_excluding(spec.require_thinking, spec.target_tier, Some(failed_model))
 }
 
 fn agent_model_tier(agent: &AgentManifest) -> ModelStrengthTier {
@@ -528,10 +526,8 @@ fn pick_subagent_model_excluding(
 
     // 按 (满足 target_tier, priority, quality_tier) 降序排列
     candidates.sort_by(|a, b| {
-        let a_satisfies =
-            quality_tier_satisfies_target(a.quality_tier, target_tier) as u8;
-        let b_satisfies =
-            quality_tier_satisfies_target(b.quality_tier, target_tier) as u8;
+        let a_satisfies = quality_tier_satisfies_target(a.quality_tier, target_tier) as u8;
+        let b_satisfies = quality_tier_satisfies_target(b.quality_tier, target_tier) as u8;
         b_satisfies
             .cmp(&a_satisfies)
             .then(b.subagent_priority.cmp(&a.subagent_priority))
@@ -547,7 +543,8 @@ fn pick_subagent_model_excluding(
         let mut tools_only: Vec<&ModelDef> = model_names::all()
             .into_iter()
             .filter(|model| {
-                model_auto_select_enabled(model, &disabled) && model.tools_default_enabled
+                model_auto_select_enabled(model, &disabled)
+                    && model.tools_default_enabled
                     && !model_matches_excluded_tokens(model, excluded.as_ref())
             })
             .collect();
@@ -679,7 +676,8 @@ mod tests {
         auto_subagent_model_for_agent, classify_subagent_task_difficulty, default_model,
         determine_model, determine_vl_model, enable_thinking, endpoint_for_model,
         endpoint_supports_anonymous_auth, initial_model, merge_agent_tier_with_difficulty,
-        model_matches_disabled_tokens, model_provider, model_quality_tier, parse_disabled_model_tokens,
+        model_matches_disabled_tokens, model_provider, model_quality_tier,
+        parse_disabled_model_tokens,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
@@ -706,6 +704,7 @@ mod tests {
             tools: Vec::new(),
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),
+            disable_mcp_tools: false,
             routing_tags: Vec::new(),
             model_tier,
             disabled: false,
