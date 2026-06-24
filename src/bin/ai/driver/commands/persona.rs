@@ -26,7 +26,11 @@ pub fn try_handle_persona_command(
     let Some(cmd) = parts.next() else {
         return Ok(false);
     };
-    if cmd != "personas" && cmd != "persona" {
+    if cmd == "persona" {
+        println!("`/persona` has been removed. Use `/personas`.");
+        return Ok(true);
+    }
+    if cmd != "personas" {
         return Ok(false);
     }
     let action = parts.next().unwrap_or("list");

@@ -56,7 +56,6 @@ const INTERNAL_COMMANDS: &[&str] = &[
     "/agents", ":agents",
     "/agent", ":agent",
     "/personas", ":personas",
-    "/persona", ":persona",
     "/sessions", ":sessions",
 ];
 
@@ -364,6 +363,14 @@ pub(super) fn print_help() {
     println!("    /usage daily             show daily token usage breakdown");
     println!("    /usage help              show usage command help");
     println!();
+    println!("  Persona management:");
+    println!("    /personas                 list personas");
+    println!("    /personas current         show current persona");
+    println!("    /personas create          interactively create a persona");
+    println!("    /personas use <name|id>   switch to a persona");
+    println!("    /personas delete <name|id> delete a persona");
+    println!("    /personas help            show persona command help");
+    println!();
     println!("  Agent management:");
     println!("    /agents                   list available agents");
     println!("    /agents list              list available agents");
@@ -386,6 +393,11 @@ pub(super) fn print_help() {
     println!("    /sessions export <id> [output.md]       export session to Markdown");
     println!("    /sessions export-current [output.md]    export current session to Markdown");
     println!("    /sessions export-last [output.md]       export latest session to Markdown");
+    println!();
+    println!("  Persona quick start:");
+    println!("    1. Run `a` to enter interactive mode");
+    println!("    2. Type `/personas create`");
+    println!("    3. Fill in name/avatar, then edit the multi-line persona prompt");
     println!();
     println!("  Debug:");
     println!("    /hang                    state dump (debug)");
@@ -489,6 +501,7 @@ fn generate_bash(
     println!(
         "  local history_sub='full user assistant tool system grep rewind undo last export copy 3 6 10 20'"
     );
+    println!("  local persona_sub='help list ls current cur create new use select switch delete del rm'");
     println!("  local session_sub='list current new use delete clear-all export export-current export-last'");
     println!("  local agent_sub='help list current use auto'");
     println!("  local model_sub='current list help use select switch effort'");
@@ -506,6 +519,8 @@ fn generate_bash(
     println!("        COMPREPLY=($(compgen -W \"$session_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /agent|:agent|/agents|:agents)");
     println!("        COMPREPLY=($(compgen -W \"$agent_sub\" -- \"$cur\")); return 0 ;;");
+    println!("      /personas|:personas)");
+    println!("        COMPREPLY=($(compgen -W \"$persona_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /model|:model)");
     println!("        COMPREPLY=($(compgen -W \"$model_sub\" -- \"$cur\")); return 0 ;;");
     println!("    esac");
@@ -554,14 +569,25 @@ fn generate_zsh(
     );
     println!("  local -a _a_session_subcmds=(list current new use delete clear-all export export-current export-last)");
     println!("  local -a _a_agent_subcmds=(help list current use auto)");
+    println!("  local -a _a_persona_subcmds=(help list ls current cur create new use select switch delete del rm)");
     println!("  local -a _a_model_subcmds=(current list help use select switch effort)");
     println!("  local -a _a_effort_levels=(minimal low medium high auto off)");
     println!();
-    // 若正在补全内部命令的子命令（第 2 个词是 /usage 等，光标在第 3+ 词），
-    // 先按子命令处理并 return，避免回落到 flags 补全。
+    // 若正在补全内部命令的子命令，先按子命令处理并 return，
+    // 避免回落到 flags / 顶层命令补全。
+    //
+    // zsh 在 `a /personas <TAB>` 这种“一级命令后刚输入一个空格”的场景里，
+    // CURRENT 有时仍是 2，因此不能只依赖 `CURRENT >= 3`。这里同时兼容：
+    // - CURRENT >= 3：已经进入第三个词；
+    // - CURRENT == 2 且 LBUFFER 以空白结尾：刚输入完一级命令并跟了空格。
     // 注意：zsh 补全里 $words[1] 是命令名 a 本身，内部命令位于 $words[2]。
+    println!("  local _a_subcmd_owner=''");
     println!("  if (( CURRENT >= 3 )); then");
-    println!("    case \"$words[2]\" in");
+    println!("    _a_subcmd_owner=\"$words[2]\"");
+    println!("  elif (( CURRENT == 2 )) && [[ \"$LBUFFER\" == *[[:space:]] ]]; then");
+    println!("    _a_subcmd_owner=\"$words[2]\"");
+    println!("  fi");
+    println!("  case \"$_a_subcmd_owner\" in");
     println!("      /usage|:usage)");
     println!("        _describe 'usage subcommand' _a_usage_subcmds && return");
     println!("        ;;");
@@ -577,11 +603,13 @@ fn generate_zsh(
     println!("      /agent|:agent|/agents|:agents)");
     println!("        _describe 'agent subcommand' _a_agent_subcmds && return");
     println!("        ;;");
+    println!("      /personas|:personas)");
+    println!("        _describe 'persona subcommand' _a_persona_subcmds && return");
+    println!("        ;;");
     println!("      /model|:model)");
     println!("        _describe 'model subcommand or model name' _a_model_subcmds && return");
     println!("        ;;");
-    println!("    esac");
-    println!("  fi");
+    println!("  esac");
     println!();
     // _arguments: flags + 第一个 position arg 是内部命令。
     // 用 ($_a_internal_cmds) 展开数组成员作为候选；早期写成 (_a_internal_cmds)

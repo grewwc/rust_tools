@@ -20,8 +20,9 @@ pub fn print_interactive_help() {
     println!("    /personas                 list personas");
     println!("    /personas current         show current persona");
     println!("    /personas create          interactively create a persona");
-    println!("    /personas use <name>      switch to a persona");
-    println!("    /personas delete <name>   delete a persona");
+    println!("    /personas use <name|id>   switch to a persona");
+    println!("    /personas delete <name|id> delete a persona");
+    println!("    /personas help            show persona command help");
     println!();
     println!("  Agent management:");
     println!("    /agents                   list available agents");
@@ -48,6 +49,8 @@ pub fn print_interactive_help() {
     println!();
     println!("  Notes:");
     println!("    - Commands support both / and : prefix (e.g., /help or :help)");
+    println!("    - Use `/personas` for persona management");
+    println!("    - To create a persona: start `a`, then run `/personas create`");
     println!("    - Press Ctrl+C to interrupt streaming or exit");
     println!();
 }
