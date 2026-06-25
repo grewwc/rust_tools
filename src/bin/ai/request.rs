@@ -2236,6 +2236,27 @@ pub async fn do_request_text_streaming(
     model: &str,
     messages: &[serde_json::Value],
 ) -> Result<String, Box<dyn std::error::Error>> {
+    fn apply_stream_payload(
+        payload: &str,
+        content: &mut String,
+        pending_usage: &mut Option<(String, StreamUsage)>,
+    ) {
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            return;
+        }
+        if let Ok(chunk) = serde_json::from_str::<StreamChunk>(payload) {
+            // 捕获 usage：OpenAI 兼容流式把最终 usage 放在 choices 为空的尾包，
+            // 必须在取 choice 之前先 take 出来，否则会漏计。
+            if let Some(usage) = chunk.usage {
+                *pending_usage = Some((chunk.model.clone(), usage.normalized()));
+            }
+            if let Some(choice) = chunk.choices.into_iter().next() {
+                content.push_str(&choice.delta.content);
+            }
+        }
+    }
+
     clear_stale_request_interrupt_before_request(app);
 
     let request_model = models::request_model_name(model);
@@ -2313,6 +2334,7 @@ pub async fn do_request_text_streaming(
         // 逐 chunk 读取并聚合 delta.content。
         let mut content = String::new();
         let mut buffer: Vec<u8> = Vec::new();
+        let mut sse_event_data = String::new();
         let mut idle_timed_out = false;
         // final chunk 携带的 usage（OpenAI 兼容流式：通常在 choices 为空的尾包返回）。
         let mut pending_usage: Option<(String, StreamUsage)> = None;
@@ -2333,30 +2355,41 @@ pub async fn do_request_text_streaming(
                 }
             };
             buffer.extend_from_slice(&chunk);
-            // 按行切分，逐行解析 SSE `data:` 负载。
+            // 按 SSE 事件边界聚合 `data:` 行，兼容标准的多行 payload。
             while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
                 let line: Vec<u8> = buffer.drain(..=pos).collect();
                 let line = String::from_utf8_lossy(&line);
-                let trimmed = line.trim();
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if trimmed.is_empty() {
+                    apply_stream_payload(&sse_event_data, &mut content, &mut pending_usage);
+                    sse_event_data.clear();
+                    continue;
+                }
+                if trimmed.starts_with(':') {
+                    continue;
+                }
                 let Some(payload) = trimmed.strip_prefix("data:") else {
                     continue;
                 };
-                let payload = payload.trim();
-                if payload.is_empty() || payload == "[DONE]" {
-                    continue;
+                let payload = payload.strip_prefix(' ').unwrap_or(payload);
+                if !sse_event_data.is_empty() {
+                    sse_event_data.push('\n');
                 }
-                if let Ok(chunk) = serde_json::from_str::<StreamChunk>(payload) {
-                    // 捕获 usage：OpenAI 兼容流式把最终 usage 放在 choices 为空的尾包，
-                    // 必须在取 choice 之前先 take 出来，否则会漏计。
-                    if let Some(usage) = chunk.usage {
-                        pending_usage = Some((chunk.model.clone(), usage.normalized()));
-                    }
-                    if let Some(choice) = chunk.choices.into_iter().next() {
-                        content.push_str(&choice.delta.content);
-                    }
-                }
+                sse_event_data.push_str(payload);
             }
         }
+        if !buffer.is_empty() {
+            let line = String::from_utf8_lossy(&buffer);
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if let Some(payload) = trimmed.strip_prefix("data:") {
+                let payload = payload.strip_prefix(' ').unwrap_or(payload);
+                if !sse_event_data.is_empty() {
+                    sse_event_data.push('\n');
+                }
+                sse_event_data.push_str(payload);
+            }
+        }
+        apply_stream_payload(&sse_event_data, &mut content, &mut pending_usage);
 
         // AIOS: 把本次流式辅助请求的 usage 落账到内核 `/dev/llm`，与主链路一致。
         if let Some((echoed_model, usage)) = pending_usage {

@@ -169,13 +169,6 @@ fn should_inject_integrated_reflection(
     ) && QuestionShape::analyze(question).has_reflection_shape()
 }
 
-fn sync_recall_enabled() -> bool {
-    crate::commonw::configw::get_all_config()
-        .get_opt("ai.prepare.sync_recall")
-        .map(|value| value.trim().eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
-
 fn sync_prepare_observers_enabled() -> bool {
     crate::commonw::configw::get_all_config()
         .get_opt("ai.prepare.sync_observers")
@@ -369,13 +362,12 @@ pub(super) async fn prepare_turn(
     let recall_intent = skill_turn.intent().clone();
     let skip_recall_for_skill_context = skill_turn.skip_recall_by_skill();
     let matched_skill_name = skill_turn.matched_skill_name().map(|name| name.to_string());
-    let should_run_general_recall = sync_recall_enabled()
-        && should_run_general_recall(
-            question,
-            &recall_intent,
-            matched_skill_name.as_deref(),
-            skip_recall_for_skill_context,
-        );
+    let should_run_general_recall = should_run_general_recall(
+        question,
+        &recall_intent,
+        matched_skill_name.as_deref(),
+        skip_recall_for_skill_context,
+    );
     if should_run_general_recall {
         let recall_bundle = reflection::build_recall_bundle(question, 1200, 2000);
         if let Some(guidelines) = recall_bundle.guidelines {
@@ -432,13 +424,12 @@ pub(super) async fn prepare_turn(
         }
     }
 
-    if sync_recall_enabled()
-        && should_run_session_code_discovery_recall(
-            question,
-            &recall_intent,
-            matched_skill_name.as_deref(),
-            skip_recall_for_skill_context,
-        )
+    if should_run_session_code_discovery_recall(
+        question,
+        &recall_intent,
+        matched_skill_name.as_deref(),
+        skip_recall_for_skill_context,
+    )
         && let Some(code_discovery_recall) = build_session_code_discovery_recall(app, &history)
     {
         println!(
@@ -561,12 +552,12 @@ fn should_run_general_recall(
     if skip_recall_for_skill_context {
         return false;
     }
-    if matched_skill_name.is_some() {
-        return true;
-    }
 
     let question = question.trim();
     if question.is_empty() {
+        return false;
+    }
+    if is_short_skill_follow_up(question, intent, matched_skill_name) {
         return false;
     }
 
@@ -592,14 +583,29 @@ fn should_run_session_code_discovery_recall(
     if skip_recall_for_skill_context {
         return false;
     }
-    if matched_skill_name.is_some() {
-        return true;
+    if is_short_skill_follow_up(question, intent, matched_skill_name) {
+        return false;
     }
     matches!(
         intent.core,
         crate::ai::driver::intent_recognition::CoreIntent::RequestAction
             | crate::ai::driver::intent_recognition::CoreIntent::SeekSolution
     ) && looks_like_code_or_repo_question(question)
+}
+
+fn is_short_skill_follow_up(
+    question: &str,
+    intent: &crate::ai::driver::intent_recognition::UserIntent,
+    matched_skill_name: Option<&str>,
+) -> bool {
+    if matched_skill_name.is_none() {
+        return false;
+    }
+    let shape = QuestionShape::analyze(question);
+    shape.char_count <= 48
+        && !shape.has_reflection_shape()
+        && !looks_like_code_or_repo_question(question)
+        && !intent.is_search_query()
 }
 
 fn looks_like_code_or_repo_question(question: &str) -> bool {
@@ -1012,10 +1018,32 @@ mod tests {
     }
 
     #[test]
-    fn matched_skill_keeps_general_recall_enabled() {
+    fn short_skill_follow_up_skips_general_recall() {
         let intent = UserIntent::new(CoreIntent::Casual);
-        assert!(should_run_general_recall(
+        assert!(!should_run_general_recall(
             "简短请求",
+            &intent,
+            Some("debugger"),
+            false
+        ));
+    }
+
+    #[test]
+    fn structured_skill_turn_still_keeps_general_recall() {
+        let intent = UserIntent::new(CoreIntent::RequestAction);
+        assert!(should_run_general_recall(
+            "请帮我检查下面这个多步构建失败：\n1. cargo check 失败\n2. 错误出现在 src/main.rs",
+            &intent,
+            Some("debugger"),
+            false
+        ));
+    }
+
+    #[test]
+    fn short_skill_follow_up_skips_session_code_discovery_recall() {
+        let intent = UserIntent::new(CoreIntent::RequestAction);
+        assert!(!should_run_session_code_discovery_recall(
+            "继续",
             &intent,
             Some("debugger"),
             false

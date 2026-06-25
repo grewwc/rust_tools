@@ -148,8 +148,20 @@ pub(crate) async fn maybe_critic_and_revise(
             return None;
         }
     };
-    let critic_text = critic_resp.text().await.ok()?;
-    let critic_v: Value = serde_json::from_str(&critic_text).ok()?;
+    let critic_text = match critic_resp.text().await {
+        Ok(text) => text,
+        Err(_) => {
+            restore_tools(app, saved_tools);
+            return None;
+        }
+    };
+    let critic_v: Value = match serde_json::from_str(&critic_text) {
+        Ok(value) => value,
+        Err(_) => {
+            restore_tools(app, saved_tools);
+            return None;
+        }
+    };
     let critic = extract_content(&critic_v).unwrap_or_default();
     if critic.trim().is_empty() {
         restore_tools(app, saved_tools);

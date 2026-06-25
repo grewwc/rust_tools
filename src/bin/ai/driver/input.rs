@@ -1153,8 +1153,31 @@ mod tests {
         let question = format!("Summarize @\"{}\"", path.display());
         let ctx = finalize_question(&mut app, question, 6).unwrap();
 
+        assert!(ctx.attachments_text.contains(&format!(
+            "[Attached text file: {}]",
+            path.display()
+        )));
         assert!(ctx.attachments_text.contains("hello from file"));
         assert!(!ctx.question.contains("hello from file"));
+        assert!(!ctx.question.contains(path.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn large_text_attachment_is_truncated_with_followup_hint() {
+        let path = std::env::temp_dir().join(format!("ai-large-note-{}.rs", Uuid::new_v4()));
+        let content = (1..=400)
+            .map(|idx| format!("fn item_{idx}() {{}}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, content).unwrap();
+
+        let mut app = test_app();
+        let question = format!("Summarize @\"{}\"", path.display());
+        let ctx = finalize_question(&mut app, question, 6).unwrap();
+
+        assert!(ctx.attachments_text.contains("Attachment preview only"));
+        assert!(ctx.attachments_text.contains("read_file_lines"));
+        assert!(ctx.attachments_text.contains("Symbol outline"));
         assert!(!ctx.question.contains(path.to_string_lossy().as_ref()));
     }
 

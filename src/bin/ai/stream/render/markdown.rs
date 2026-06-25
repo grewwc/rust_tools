@@ -339,9 +339,7 @@ impl MarkdownStreamRenderer {
 
     fn emit_char(&mut self, out: &mut dyn Write, ch: char) -> io::Result<()> {
         let mut buf = [0u8; 4];
-        out.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
-        out.flush()?;
-        Ok(())
+        out.write_all(ch.encode_utf8(&mut buf).as_bytes())
     }
 
     pub(in crate::ai::stream) fn flush_pending(&mut self) -> io::Result<()> {

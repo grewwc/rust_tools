@@ -5,7 +5,10 @@ use std::io::BufReader;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 
-use crate::ai::mcp::{McpClient, connection::McpServerConnection};
+use crate::ai::mcp::{
+    McpClient,
+    connection::{McpServerConnection, spawn_stderr_drain},
+};
 use crate::ai::types::{App, McpPrompt, McpResource, McpServerConfig, McpTool};
 use rust_tools::cw::SkipMap;
 use std::process::{Command, Stdio};
@@ -336,13 +339,14 @@ fn connect_single_server(
     let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
     let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
     let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
+    let stderr_tail = spawn_stderr_drain(stderr);
 
     let mut conn = McpServerConnection {
         config: config.clone(),
         process,
         stdin,
         stdout: BufReader::new(stdout),
-        stderr: BufReader::new(stderr),
+        stderr_tail,
         request_timeout_ms: config.request_timeout_ms.max(100),
         tools: Vec::new(),
         resources: Vec::new(),

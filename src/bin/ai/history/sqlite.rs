@@ -1,4 +1,4 @@
-use std::{fs, io, path::Path};
+use std::{fs, io, path::Path, time::Duration};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
@@ -7,7 +7,7 @@ use crate::ai::types::ToolCall;
 
 use super::{
     compress::{compact_persisted_history, value_to_string},
-    types::{Message, ROLE_INTERNAL_NOTE},
+    types::{MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE},
 };
 
 pub(in crate::ai) struct RecentTurnWindow {
@@ -20,7 +20,12 @@ fn open_history_db(path: &Path) -> Result<Connection, io::Error> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    Connection::open(path).map_err(|e| io::Error::other(e.to_string()))
+    let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(conn)
 }
 
 fn init_history_schema(conn: &Connection) -> Result<(), io::Error> {
@@ -78,7 +83,7 @@ pub(in crate::ai) fn count_user_turns_sqlite(path: &Path) -> io::Result<usize> {
     if !path.exists() {
         return Ok(0);
     }
-    let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
+    let conn = open_history_db(path)?;
     // schema 可能尚未创建（全新 session），messages 表不存在时直接返 0。
     let table_exists: bool = conn
         .query_row(
@@ -142,6 +147,14 @@ pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -
             }
         }
         insert_messages(&tx, entries)?;
+    }
+    let user_turns: i64 = tx
+        .query_row("SELECT COUNT(1) FROM messages WHERE role = 'user'", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    if user_turns.max(0) as usize <= MAX_HISTORY_TURNS {
+        return tx.commit().map_err(|e| io::Error::other(e.to_string()));
     }
     let messages = read_messages_with_sql(
         &tx,
@@ -527,7 +540,7 @@ pub(in crate::ai) fn truncate_messages_sqlite(path: &Path, keep: usize) -> io::R
 }
 
 pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
-    let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
+    let conn = open_history_db(path)?;
     let meta: Option<String> = conn
         .query_row(
             "SELECT value FROM meta WHERE key='first_user_prompt' LIMIT 1",
@@ -567,7 +580,7 @@ fn decode_tool_calls(tool_calls: Option<&str>) -> Option<Vec<ToolCall>> {
 }
 
 pub(in crate::ai) fn read_all_messages_sqlite(path: &Path) -> io::Result<Vec<Message>> {
-    let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
+    let conn = open_history_db(path)?;
 
     read_messages_with_sql(
         &conn,

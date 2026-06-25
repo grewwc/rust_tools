@@ -1,10 +1,10 @@
-use std::fs;
 use std::path::PathBuf;
 
 use serde_json::Value;
 
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
+use crate::ai::tools::storage::file_store::FileStore;
 
 fn params_apply_patch() -> Value {
     serde_json::json!({
@@ -311,61 +311,20 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
     Ok(s)
 }
 
-fn is_sensitive_fs_path(path: &std::path::Path) -> bool {
-    let s = path.to_string_lossy();
-    let s = s.as_ref();
-    if s.contains("/.ssh/")
-        || s.ends_with("/.ssh")
-        || s.contains("/.gnupg/")
-        || s.ends_with("/.gnupg")
-        || s.contains("/.aws/")
-        || s.ends_with("/.aws")
-        || s.contains("/.kube/")
-        || s.ends_with("/.kube")
-        || s.contains("/.configW")
-        || s.ends_with("/.configW")
-    {
-        return true;
-    }
-    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    matches!(
-        name,
-        "id_rsa"
-            | "id_rsa.pub"
-            | "id_ed25519"
-            | "id_ed25519.pub"
-            | "authorized_keys"
-            | "known_hosts"
-            | ".netrc"
-            | ".npmrc"
-            | ".pypirc"
-            | ".git-credentials"
-            | "credentials"
-            | "config.json"
-    )
-}
-
 pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
     let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
     let patch = args["patch"].as_str().ok_or("Missing patch")?;
 
     let path = PathBuf::from(file_path);
-    if is_sensitive_fs_path(&path) {
-        return Err("Access blocked: sensitive path".to_string());
-    }
+    let store = FileStore::new(path.clone());
+    store.validate_write_access().map_err(|err| err.to_string())?;
     let original = if path.exists() {
-        fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))?
+        store.read_to_string().map_err(|err| err.to_string())?
     } else {
         String::new()
     };
     let next = apply_unified_patch(&original, patch)?;
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {}", e))?;
-    }
-    fs::write(&path, next).map_err(|e| format!("Failed to write file: {}", e))?;
+    store.write_all(&next).map_err(|err| err.to_string())?;
     Ok(format!("Successfully patched {}", file_path))
 }
 

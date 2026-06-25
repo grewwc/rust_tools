@@ -17,17 +17,22 @@ impl FileStore {
         &self.path
     }
 
-    pub(crate) fn validate_access(&self) -> Result<(), AiError> {
+    pub(crate) fn validate_read_access(&self) -> Result<(), AiError> {
         if is_sensitive_fs_path(&self.path) {
             return Err(AiError::file(
                 self.path.display().to_string(),
                 "Access blocked: sensitive path",
             ));
         }
+        Ok(())
+    }
+
+    pub(crate) fn validate_write_access(&self) -> Result<(), AiError> {
+        self.validate_read_access()?;
         if !path_within_allowed_roots(&self.path) {
             return Err(AiError::file(
                 self.path.display().to_string(),
-                "Access blocked: path is outside the sandbox allowed roots (ai.sandbox.allowed_roots)",
+                "Access blocked: path is outside the sandbox write roots (defaults to effective_cwd when ai.sandbox.allowed_roots is unset)",
             ));
         }
         Ok(())
@@ -176,24 +181,24 @@ fn config_extra_sensitive_substrings() -> Vec<String> {
 }
 
 /// 当 `ai.sandbox.allowed_roots` 非空时，文件路径必须位于其中某个根之下。
-/// 为空（默认）时不施加额外限制，保持既有行为。
+/// 为空（默认）时，退回到 `effective_cwd()` 作为单一沙箱根目录。
 fn path_within_allowed_roots(path: &Path) -> bool {
     let raw = crate::commonw::configw::get_all_config().get(
         crate::ai::config_schema::AiConfig::SANDBOX_ALLOWED_ROOTS,
         "",
     );
-    let roots: Vec<PathBuf> = raw
+    // 相对路径基于 effective_cwd 解析为绝对路径后再归一化。
+    let base =
+        crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."));
+    let mut roots: Vec<PathBuf> = raw
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| normalize_lexical(Path::new(s)))
         .collect();
     if roots.is_empty() {
-        return true;
+        roots.push(normalize_lexical(&base));
     }
-    // 相对路径基于 effective_cwd 解析为绝对路径后再归一化。
-    let base =
-        crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."));
     path_within_roots(path, &base, &roots)
 }
 
@@ -212,7 +217,11 @@ fn path_within_roots(path: &Path, base: &Path, roots: &[PathBuf]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_sensitive_fs_path, normalize_lexical, path_within_roots};
+    use super::{
+        FileStore, is_sensitive_fs_path, normalize_lexical, path_within_allowed_roots,
+        path_within_roots,
+    };
+    use crate::ai::test_support::ENV_LOCK;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -274,5 +283,76 @@ mod tests {
         assert!(is_sensitive_fs_path(Path::new("/home/u/.ssh/id_rsa")));
         assert!(is_sensitive_fs_path(Path::new("/home/u/.aws/credentials")));
         assert!(!is_sensitive_fs_path(Path::new("/home/u/proj/src/main.rs")));
+    }
+
+    #[test]
+    fn default_write_root_falls_back_to_effective_cwd() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let temp_root = std::env::temp_dir().join(format!(
+            "file-store-cwd-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(temp_root.join("inside")).unwrap();
+        let outside = temp_root
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join("outside.txt");
+
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", temp_root.join("empty.configw")) };
+        crate::commonw::configw::refresh();
+
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(
+            temp_root.clone(),
+            || {
+                (
+                    path_within_allowed_roots(&temp_root.join("inside/file.txt")),
+                    path_within_allowed_roots(&outside),
+                )
+            },
+        );
+
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+        let _ = std::fs::remove_file(temp_root.join("empty.configw"));
+        let _ = std::fs::remove_dir_all(&temp_root);
+
+        assert!(result.0);
+        assert!(!result.1);
+    }
+
+    #[test]
+    fn read_access_is_not_limited_by_effective_cwd_when_not_sensitive() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let temp_root = std::env::temp_dir().join(format!(
+            "file-store-read-cwd-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let outside = temp_root
+            .parent()
+            .unwrap_or_else(|| Path::new("/"))
+            .join(format!("outside-{}.txt", uuid::Uuid::new_v4()));
+
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", temp_root.join("empty.configw")) };
+        crate::commonw::configw::refresh();
+
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(temp_root.clone(), || {
+            FileStore::new(outside.clone()).validate_read_access()
+        });
+
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+        let _ = std::fs::remove_file(temp_root.join("empty.configw"));
+        let _ = std::fs::remove_dir_all(&temp_root);
+
+        assert!(result.is_ok(), "read access should ignore effective_cwd root");
     }
 }

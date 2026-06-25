@@ -5,6 +5,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -18,6 +19,17 @@ use serde_json::{Value, json};
 use crate::ai::types::{
     FunctionDefinition, McpPrompt, McpResource, McpServerConfig, McpTool, ToolDefinition,
 };
+
+fn reject_server_request(
+    conn: &mut McpServerConnection,
+    id: Value,
+    method: &str,
+) -> Result<(), String> {
+    let payload = unsupported_server_request_payload(id, method);
+    writeln!(conn.stdin_mut(), "{}", payload).map_err(|e| {
+        conn.decorate_transport_error(format!("Failed to reject server request: {}", e))
+    })
+}
 
 /// 发送 JSON-RPC 请求到 MCP 服务器连接（独立函数，可在任何上下文中调用）
 pub(in crate::ai) fn send_request_to_conn(
@@ -39,40 +51,59 @@ pub(in crate::ai) fn send_request_to_conn(
     writeln!(conn.stdin_mut(), "{}", request_str)
         .map_err(|e| conn.decorate_transport_error(format!("Failed to send request: {}", e)))?;
 
-    let response_line = conn.read_response_line()?;
+    let deadline = Instant::now() + Duration::from_millis(conn.request_timeout_ms);
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(conn.decorate_transport_error(format!(
+                "MCP response timeout after {} ms",
+                conn.request_timeout_ms
+            )));
+        }
+        let remaining_ms = deadline
+            .saturating_duration_since(now)
+            .as_millis()
+            .clamp(1, u64::MAX as u128) as u64;
+        let response_line = conn.read_response_line_with_timeout(remaining_ms)?;
+        match classify_inbound_jsonrpc(&response_line)? {
+            InboundJsonRpc::Notification { .. } => continue,
+            InboundJsonRpc::Request { id: request_id, method } => {
+                reject_server_request(conn, request_id, &method)?;
+                continue;
+            }
+            InboundJsonRpc::Response(response) => {
+                if let Some(resp_id) = response.id
+                    && resp_id != id
+                {
+                    return Err(format!(
+                        "MCP response id mismatch: expected {}, got {}",
+                        id, resp_id
+                    ));
+                }
 
-    let response: JsonRpcResponse = serde_json::from_str(&response_line)
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+                if let Some(error) = response.error {
+                    if let Some(data) = error.data {
+                        return Err(format!(
+                            "MCP error {}: {} ({})",
+                            error.code, error.message, data
+                        ));
+                    } else {
+                        return Err(format!("MCP error {}: {}", error.code, error.message));
+                    }
+                }
 
-    if response.jsonrpc != "2.0" {
-        return Err(format!("Invalid JSON-RPC version: {}", response.jsonrpc));
-    }
-    if let Some(resp_id) = response.id
-        && resp_id != id
-    {
-        return Err(format!(
-            "MCP response id mismatch: expected {}, got {}",
-            id, resp_id
-        ));
-    }
-
-    if let Some(error) = response.error {
-        if let Some(data) = error.data {
-            return Err(format!(
-                "MCP error {}: {} ({})",
-                error.code, error.message, data
-            ));
-        } else {
-            return Err(format!("MCP error {}: {}", error.code, error.message));
+                return response.result.ok_or("No result in response".to_string());
+            }
         }
     }
-
-    response.result.ok_or("No result in response".to_string())
 }
 
 use super::{
-    connection::McpServerConnection,
-    jsonrpc::{JsonRpcRequest, JsonRpcResponse},
+    connection::{McpServerConnection, spawn_stderr_drain},
+    jsonrpc::{
+        InboundJsonRpc, JsonRpcRequest, JsonRpcResponse, classify_inbound_jsonrpc,
+        unsupported_server_request_payload,
+    },
 };
 
 pub(in crate::ai) type SharedMcpClient = Arc<std::sync::Mutex<McpClient>>;
@@ -147,13 +178,14 @@ impl McpClient {
         let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
         let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
         let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
+        let stderr_tail = spawn_stderr_drain(stderr);
 
         let mut conn = McpServerConnection {
             config: config.clone(),
             process,
             stdin,
             stdout: BufReader::new(stdout),
-            stderr: BufReader::new(stderr),
+            stderr_tail,
             request_timeout_ms: config.request_timeout_ms.max(100),
             tools: Vec::new(),
             resources: Vec::new(),
@@ -226,11 +258,12 @@ impl McpClient {
         let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
         let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
         let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
+        let stderr_tail = spawn_stderr_drain(stderr);
 
         conn.process = process;
         conn.stdin = stdin;
         conn.stdout = BufReader::new(stdout);
-        conn.stderr = BufReader::new(stderr);
+        conn.stderr_tail = stderr_tail;
         conn.request_timeout_ms = cfg.request_timeout_ms.max(100);
         conn.tools.clear();
         conn.resources.clear();

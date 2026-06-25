@@ -1,5 +1,5 @@
 mod ast_structural;
-mod ast_symbols;
+pub(crate) mod ast_symbols;
 mod cargo_tools;
 mod code_search;
 pub(crate) mod command_tools;
