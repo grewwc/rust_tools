@@ -14,9 +14,8 @@ use super::super::{
 use super::messaging::print_tool_result_preview;
 use super::{
     messaging::{
-        append_cached_tool_results_note, append_code_inspection_working_memory,
-        append_message_pair, append_tool_result_messages, record_final_stream_response,
-        record_persistent_code_discoveries,
+        append_cached_tool_results_note, append_message_pair, append_tool_result_messages,
+        record_final_stream_response, record_tool_inspection_artifacts,
     },
     overflow::{build_model_overflow_stub, summarize_large_tool_output, write_tool_overflow_file},
     preview::{build_terminal_preview, tail_chars},
@@ -446,8 +445,7 @@ fn handle_tool_call_round(
         messages,
         turn_messages,
     );
-    append_code_inspection_working_memory(messages, turn_messages);
-    record_persistent_code_discoveries(app, messages, turn_messages);
+    record_tool_inspection_artifacts(app, messages, turn_messages);
 
     persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
 

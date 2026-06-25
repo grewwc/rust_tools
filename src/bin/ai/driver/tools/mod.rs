@@ -1531,11 +1531,18 @@ fn execute_tool_wait(
         && os.current_process_id().is_some()
     {
         let wait_sources = lookup_wait_sources(os.as_mut(), session_id, &task_ids)?;
+        // 工具层的 wait_policy（all/any）已在上方 collect_async_task_snapshot 的
+        // `satisfied` 判定里生效，并会在被唤醒后的下一次调用里重新评估。底层 park
+        // **必须** 用 WaitPolicy::Any：wait_sources 里含一个用于中断的 cancel futex，
+        // 它在正常路径下永远不会就绪；若按 All 等待，epoll_wait_many 的
+        // `pending_sources.is_empty()` 判定永远不成立 —— 即使所有真实任务都已完成，
+        // 进程也不会被唤醒（timeout_ticks 缺省时甚至永久挂起）。这与 execute_task_wait
+        // 的 park 策略保持一致。
         let wait = epoll_wait_many(
             os.as_mut(),
             &format!("tool_wait:{}:{}", session_id, task_ids.join(",")),
             &wait_sources,
-            wait_policy.clone(),
+            WaitPolicy::Any,
             timeout_ticks,
         )?;
         if wait.suspended {

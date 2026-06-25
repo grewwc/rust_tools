@@ -1462,10 +1462,28 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
     };
 
     let mut registry = TASK_REGISTRY.lock().unwrap();
-    for tid in &task_ids {
-        if !registry.contains_key(tid) {
-            return Err(format!("Unknown task_id: {}", tid));
-        }
+    // task_id 不在 registry 中，说明它在 *上一次* task_wait 调用里已经被收集并清理
+    // 掉了（ready 任务一旦读到结果就会从 registry 删除）。PARKED / BUDGET-ELAPSED
+    // 提示以及 driver 唤醒消息都让模型"用 same task_ids 继续调"，所以"已收集 +
+    // 仍 pending"混合的一组 id 是预期输入，**绝不能**整调用 hard-fail（否则多子任务
+    // 编排会在第二次 task_wait 时因 Unknown task_id 直接崩掉）。这里静默丢弃已收集
+    // 的 id，只对仍被跟踪的 id 继续等待。
+    let already_collected = task_ids
+        .iter()
+        .filter(|tid| !registry.contains_key(*tid))
+        .count();
+    let task_ids: Vec<String> = task_ids
+        .into_iter()
+        .filter(|tid| registry.contains_key(tid))
+        .collect();
+    if task_ids.is_empty() {
+        // 所有引用的 task 都已在之前的调用里收集完毕——模型其实已经拿到这些结果。
+        // 返回中性提示而非报错，让它停止重复等待、直接基于已有结果继续推理。
+        return Ok(format!(
+            "[task_wait] All {already_collected} referenced task(s) already completed and \
+             their results were delivered by an earlier task_wait call. No tasks remain to \
+             wait on; continue reasoning with the results you already collected."
+        ));
     }
 
     let mut ready = Vec::new();

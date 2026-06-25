@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
@@ -217,11 +219,27 @@ pub(super) fn append_tool_result_messages(
     }
 }
 
-pub(super) fn append_code_inspection_working_memory(
+/// 在一次工具调用轮结束后，基于本轮累计的 `turn_messages` 生成两类记账：
+/// (1) code-inspection working memory（写进 `messages`，喂给模型）；
+/// (2) 持久化的 code discoveries（写进 `messages`/`turn_messages` 并落库）。
+/// 两者都依赖对 repo-inspection 工具输出的同一次扫描——这里只扫一次并复用，
+/// 避免在长 turn 里对全量 `turn_messages` 做 O(rounds²) 的重复扫描与 content 克隆。
+pub(super) fn record_tool_inspection_artifacts(
+    app: &App,
+    messages: &mut Vec<Message>,
+    turn_messages: &mut Vec<Message>,
+) {
+    let findings = collect_repo_inspection_findings(turn_messages);
+    append_code_inspection_working_memory(messages, turn_messages, &findings);
+    record_persistent_code_discoveries(app, messages, turn_messages, &findings);
+}
+
+fn append_code_inspection_working_memory(
     messages: &mut Vec<Message>,
     turn_messages: &[Message],
+    findings: &[RepoInspectionFinding],
 ) {
-    let Some(note) = build_code_inspection_working_memory(turn_messages) else {
+    let Some(note) = build_code_inspection_working_memory(turn_messages, findings) else {
         return;
     };
 
@@ -258,12 +276,13 @@ pub(super) fn append_code_inspection_working_memory(
     });
 }
 
-pub(super) fn record_persistent_code_discoveries(
+fn record_persistent_code_discoveries(
     app: &App,
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
+    findings: &[RepoInspectionFinding],
 ) {
-    let discoveries = build_persistent_code_discoveries(turn_messages);
+    let discoveries = build_persistent_code_discoveries(findings);
     if discoveries.is_empty() {
         return;
     }
@@ -384,8 +403,10 @@ pub(super) fn record_final_stream_response(
     record_hidden_self_note(app, turn_messages, &stream_result.hidden_meta);
 }
 
-fn build_code_inspection_working_memory(turn_messages: &[Message]) -> Option<String> {
-    let findings = collect_repo_inspection_findings(turn_messages);
+fn build_code_inspection_working_memory(
+    turn_messages: &[Message],
+    findings: &[RepoInspectionFinding],
+) -> Option<String> {
     let exact_calls = collect_completed_repo_inspection_calls(turn_messages);
 
     let mut raw_repo_tool_count = 0usize;
@@ -492,10 +513,12 @@ fn normalized_tool_arguments(raw: &str) -> String {
         .unwrap_or_else(|_| raw.trim().to_string())
 }
 
-fn build_persistent_code_discoveries(turn_messages: &[Message]) -> Vec<CodeDiscoveryRecord> {
-    collect_repo_inspection_findings(turn_messages)
-        .into_iter()
-        .filter_map(|finding| classify_code_discovery(&finding))
+fn build_persistent_code_discoveries(
+    findings: &[RepoInspectionFinding],
+) -> Vec<CodeDiscoveryRecord> {
+    findings
+        .iter()
+        .filter_map(|finding| classify_code_discovery(finding))
         .rev()
         .take(persistence_limit())
         .collect::<Vec<_>>()
@@ -508,12 +531,12 @@ fn collect_repo_inspection_findings(turn_messages: &[Message]) -> Vec<RepoInspec
     let tool_outputs = turn_messages
         .iter()
         .filter_map(|message| {
-            message.tool_call_id.as_ref().and_then(|id| {
+            message.tool_call_id.as_deref().map(|id| {
                 let content = match &message.content {
-                    Value::String(content) => content.clone(),
-                    other => other.to_string(),
+                    Value::String(content) => Cow::Borrowed(content.as_str()),
+                    other => Cow::Owned(other.to_string()),
                 };
-                Some((id.clone(), content))
+                (id, content)
             })
         })
         .collect::<FxHashMap<_, _>>();
@@ -531,12 +554,12 @@ fn collect_repo_inspection_findings(turn_messages: &[Message]) -> Vec<RepoInspec
                 continue;
             }
 
-            let tool_call_id = &tool_call.id;
+            let tool_call_id = tool_call.id.as_str();
             let Some(content) = tool_outputs.get(tool_call_id) else {
                 continue;
             };
             let scope = describe_tool_call(tool_call);
-            let highlight = summarize_tool_result(tool_name, &content);
+            let highlight = summarize_tool_result(tool_name, content);
             if highlight.is_empty() {
                 continue;
             }
@@ -741,7 +764,8 @@ mod tests {
     use super::smart_truncate_to_sentence;
     use super::{
         RepoInspectionFinding, build_code_inspection_working_memory,
-        build_persistent_code_discoveries, classify_code_discovery, is_repo_inspection_tool,
+        build_persistent_code_discoveries, classify_code_discovery,
+        collect_repo_inspection_findings, is_repo_inspection_tool,
         persistent_code_discovery_already_present,
     };
     use crate::ai::code_discovery_policy::{CodeDiscoveryConfidence, CodeDiscoveryKind};
@@ -848,7 +872,9 @@ mod tests {
             },
         ];
 
-        let note = build_code_inspection_working_memory(&turn_messages).expect("note");
+        let findings = collect_repo_inspection_findings(&turn_messages);
+        let note =
+            build_code_inspection_working_memory(&turn_messages, &findings).expect("note");
         assert!(note.contains("Current code-inspection working memory"));
         assert!(note.contains("Completed exact tool calls in this turn"));
         assert!(note.contains("read_file_lines("));
@@ -891,7 +917,9 @@ mod tests {
             },
         ];
 
-        let note = build_code_inspection_working_memory(&turn_messages).expect("note");
+        let findings = collect_repo_inspection_findings(&turn_messages);
+        let note =
+            build_code_inspection_working_memory(&turn_messages, &findings).expect("note");
         assert!(note.contains("code_search(operation=text_search, query=load_config)"));
         assert!(note.contains("fn load_config()"));
         assert!(!note.contains("Code-navigation correction"));
@@ -930,7 +958,8 @@ mod tests {
             },
         ];
 
-        let discoveries = build_persistent_code_discoveries(&turn_messages);
+        let findings = collect_repo_inspection_findings(&turn_messages);
+        let discoveries = build_persistent_code_discoveries(&findings);
         assert_eq!(discoveries.len(), 1);
         assert!(discoveries[0].finding.contains("fn load_config()"));
     }

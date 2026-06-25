@@ -51,18 +51,36 @@ impl SystemPromptBuilder {
     }
 
     fn render_system_prompt(&self) -> String {
+        // 按语义类别分组渲染：同一 kind（identity/behavior/policy）的所有段落
+        // 合并进同一对 tag，组内保持插入顺序。这样 persona 等"在 build_system_prompt
+        // 之后追加"的 identity 段不会被甩到 prompt 末尾，而是与通用 identity 聚拢；
+        // behavior/policy 也不再因 push 时机裂成多簇，减少 tag 噪音、让优先级层次
+        // 对模型更清晰。Fact 段不在 system prompt 渲染（走 context reminder 注入当前
+        // user 消息），故不在白名单内、自然被排除。
+        const RENDER_ORDER: [(ContextKind, &str); 3] = [
+            (ContextKind::Identity, "identity"),
+            (ContextKind::Behavior, "behavior"),
+            (ContextKind::Policy, "policy"),
+        ];
         let mut out = String::new();
-        for (kind, _, content) in &self.sections {
-            if *kind == ContextKind::Fact {
-                continue;
+        for (group_kind, tag) in RENDER_ORDER {
+            let mut group = String::new();
+            for (kind, _, content) in &self.sections {
+                if *kind != group_kind {
+                    continue;
+                }
+                let trimmed = content.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if !group.is_empty() {
+                    group.push_str("\n\n");
+                }
+                group.push_str(trimmed);
             }
-            let tag = match kind {
-                ContextKind::Identity => "identity",
-                ContextKind::Behavior => "behavior",
-                ContextKind::Policy => "policy",
-                ContextKind::Fact => unreachable!(),
-            };
-            out.push_str(&format!("<{}>\n{}\n</{}>\n", tag, content.trim(), tag));
+            if !group.is_empty() {
+                out.push_str(&format!("<{}>\n{}\n</{}>\n", tag, group, tag));
+            }
         }
         out
     }
@@ -1216,12 +1234,13 @@ pub(super) fn prepare_skill_for_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        PreferenceStrength, build_project_instruction_prompt, build_system_prompt,
-        builtin_tools_for_skill, ensure_required_baseline_tools, filter_general_knowledge_tools,
-        filter_mcp_tools_by_allowed_servers, looks_like_follow_up_or_same_topic,
-        merge_with_runtime_enabled_tools, resolve_max_iterations, select_mcp_tools,
-        select_skill_with_preference, select_skill_with_preference_strength,
-        should_use_general_knowledge_mode, tool_uses_mcp_server,
+        ContextKind, PreferenceStrength, SystemPromptBuilder, build_project_instruction_prompt,
+        build_system_prompt, builtin_tools_for_skill, ensure_required_baseline_tools,
+        filter_general_knowledge_tools, filter_mcp_tools_by_allowed_servers,
+        looks_like_follow_up_or_same_topic, merge_with_runtime_enabled_tools,
+        resolve_max_iterations, select_mcp_tools, select_skill_with_preference,
+        select_skill_with_preference_strength, should_use_general_knowledge_mode,
+        tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
@@ -1425,6 +1444,55 @@ mod tests {
         assert!(prompt.contains("No skill is active yet"));
         assert!(prompt.contains("only when the task is specialized, tool-heavy"));
         assert!(prompt.contains("call `discover_skills` with the named keyword"));
+    }
+
+    #[test]
+    fn render_groups_same_kind_sections_into_single_tag_block() {
+        // identity/behavior/policy 各应只出现一对 tag，且按 identity→behavior→policy
+        // 排布。这保证 persona 这类"事后追加"的 identity 段不会被甩到 prompt 末尾，
+        // 而是与通用 identity 聚拢成一块。
+        let mut builder = SystemPromptBuilder::new();
+        builder.push(ContextKind::Identity, "Generic identity.");
+        builder.push(ContextKind::Behavior, "Behavior one.");
+        builder.push(ContextKind::Policy, "Policy one.");
+        builder.push(ContextKind::Behavior, "Behavior two.");
+        // 模拟 persona 在 build_system_prompt 之后追加：
+        builder.push(ContextKind::Identity, "Persona identity.");
+
+        let prompt = builder.render_system_prompt();
+
+        assert_eq!(prompt.matches("<identity>").count(), 1);
+        assert_eq!(prompt.matches("<behavior>").count(), 1);
+        assert_eq!(prompt.matches("<policy>").count(), 1);
+
+        let identity_pos = prompt.find("<identity>").unwrap();
+        let behavior_pos = prompt.find("<behavior>").unwrap();
+        let policy_pos = prompt.find("<policy>").unwrap();
+        assert!(identity_pos < behavior_pos && behavior_pos < policy_pos);
+
+        // 两段 identity 必须落在同一个 identity 块内、且保持插入顺序。
+        let generic_pos = prompt.find("Generic identity.").unwrap();
+        let persona_pos = prompt.find("Persona identity.").unwrap();
+        let identity_close = prompt.find("</identity>").unwrap();
+        assert!(generic_pos < persona_pos);
+        assert!(persona_pos < identity_close);
+
+        // 同 kind 段落之间用空行分隔，组内保持插入顺序。
+        let behavior_one = prompt.find("Behavior one.").unwrap();
+        let behavior_two = prompt.find("Behavior two.").unwrap();
+        assert!(behavior_one < behavior_two);
+    }
+
+    #[test]
+    fn render_excludes_fact_sections_from_system_prompt() {
+        let mut builder = SystemPromptBuilder::new();
+        builder.push(ContextKind::Identity, "Identity.");
+        builder.push_labeled(ContextKind::Fact, "Project Type", "Rust project.");
+
+        let prompt = builder.render_system_prompt();
+        assert!(prompt.contains("Identity."));
+        assert!(!prompt.contains("Rust project."));
+        assert!(!prompt.contains("Project Type"));
     }
 
     #[test]
