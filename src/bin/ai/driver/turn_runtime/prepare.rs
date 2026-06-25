@@ -421,12 +421,12 @@ pub(super) async fn prepare_turn(
             if recalled.high_confidence_project_memory {
                 skill_turn.push_section(
                     skill_runtime::ContextKind::Policy,
-                    "Memory-first project answer policy:\n- High-confidence project memory is available. Answer from it first when it already covers the ask.\n- Only use file/search tools for missing details, ambiguity, or explicit verification against current code.",
+                    high_confidence_project_memory_policy(),
                 );
             } else {
                 skill_turn.push_section(
                     skill_runtime::ContextKind::Policy,
-                    "Knowledge usage policy:\n- Recalled knowledge is relevant for this turn; build the answer primarily from it.\n- Use file/repo tools only when key requested details are missing; avoid full re-scan when recall is sufficient.",
+                    recalled_knowledge_usage_policy(),
                 );
             }
         }
@@ -745,6 +745,14 @@ fn render_session_code_discovery_recall(discoveries: &[CodeDiscoveryRecord]) -> 
     Some(out)
 }
 
+fn high_confidence_project_memory_policy() -> &'static str {
+    "Memory-first project answer policy:\n- High-confidence project memory is available. Answer from it first only when it already covers the ask and the answer does not depend on current repository state.\n- If the answer depends on current code, files, configs, command results, or any potentially changed runtime/project state, verify with file/search/inspection tools before concluding.\n- Only skip repo/tool verification when the recalled knowledge is sufficient and the request is not state-sensitive."
+}
+
+fn recalled_knowledge_usage_policy() -> &'static str {
+    "Knowledge usage policy:\n- Recalled knowledge is relevant for this turn; use it as context, not as a substitute for current-state verification.\n- If the answer depends on current code, files, configs, command results, or any potentially changed runtime/project state, verify with file/repo tools before concluding.\n- Use file/repo tools when key requested details are missing, ambiguous, or state-sensitive; avoid full re-scan when recall is already sufficient."
+}
+
 fn code_discovery_record_from_memory_entry(
     entry: &AgentMemoryEntry,
 ) -> Option<CodeDiscoveryRecord> {
@@ -768,7 +776,8 @@ fn code_discovery_record_from_memory_entry(
 mod tests {
     use super::{
         collect_session_code_discovery_records, extract_existing_code_discoveries,
-        looks_like_code_or_repo_question, render_session_code_discovery_recall,
+        high_confidence_project_memory_policy, looks_like_code_or_repo_question,
+        recalled_knowledge_usage_policy, render_session_code_discovery_recall,
         should_inject_integrated_reflection, should_run_general_recall,
         should_run_session_code_discovery_recall,
     };
@@ -914,6 +923,22 @@ mod tests {
         assert!(note.contains("Recent session code discoveries:"));
         assert!(note.contains("confidence=high kind=error_site"));
         assert!(note.contains("Treat these as stable findings"));
+    }
+
+    #[test]
+    fn high_confidence_project_memory_policy_requires_state_verification() {
+        let policy = high_confidence_project_memory_policy();
+        assert!(policy.contains("does not depend on current repository state"));
+        assert!(policy.contains("verify with file/search/inspection tools before concluding"));
+        assert!(policy.contains("request is not state-sensitive"));
+    }
+
+    #[test]
+    fn recalled_knowledge_usage_policy_treats_memory_as_context_not_ground_truth() {
+        let policy = recalled_knowledge_usage_policy();
+        assert!(policy.contains("use it as context, not as a substitute"));
+        assert!(policy.contains("verify with file/repo tools before concluding"));
+        assert!(policy.contains("missing, ambiguous, or state-sensitive"));
     }
 
     #[test]

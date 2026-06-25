@@ -730,7 +730,8 @@ fn build_system_prompt(
     }
 
     b.push(ContextKind::Behavior, "Response style:\n- Lead with answer or action; skip preamble, restatements, and meta-commentary.\n- Default to short, direct prose. Use lists/sections only when they materially improve clarity.\n- Be concise but not at the cost of correctness: verify facts with tools before concluding. When citing code, include file/line.\n- Do not narrate tool calls before/during execution — let their output speak. Brief status lines only at real milestones or when the plan changes.");
-    b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Prefer tools over speculation: inspect code, run commands, search before concluding.\n- If the user asks to run/build/test/reproduce, use tools (execute_command / cargo_test) when available.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- Make minimal, targeted edits (apply_patch) rather than rewriting entire files.");
+    b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Prefer tool-backed evidence over speculation: inspect the relevant sources, artifacts, or system state and use the available tools before concluding.\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
+    b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.");
 
     if let Some(project_prompt) = build_project_instruction_prompt() {
         b.push(ContextKind::Policy, project_prompt);
@@ -756,7 +757,7 @@ fn build_system_prompt(
             b.push(ContextKind::Fact, catalog);
         }
         let discovery_policy = if skill.is_none() {
-            "Tool discovery:\n- Not all tools are loaded. Use `discover_skills` for specialized workflows, or `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for specific tools.\n- If the user names a workflow/tool/domain that may have a local skill (for example an internal service, CLI, log system, or incident workflow), call `discover_skills` with the named keyword before inventing commands.\n- After `discover_skills`, if one listed skill clearly matches the task, call `activate_skill(name=...)` to load its prompt and tools. Do not activate a skill that does not clearly match.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first.\n- No skill is active yet. For non-trivial requests, prefer calling `discover_skills` before giving a freeform response."
+            "Tool discovery:\n- Not all tools are loaded. Use `discover_skills` for specialized workflows, or `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for specific tools.\n- If the user names a workflow, tool, product, or domain that likely maps to a local skill (for example an internal service, CLI, log system, or incident workflow), call `discover_skills` with the named keyword before inventing commands.\n- After `discover_skills`, if one listed skill clearly matches the task, call `activate_skill(name=...)` to load its prompt and tools. Do not activate a skill that does not clearly match.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first.\n- No skill is active yet. Prefer `discover_skills` before a freeform response only when the task is specialized, tool-heavy, or likely covered by an installed skill."
         } else {
             "Tool discovery:\n- Not all tools are loaded. If a capability is missing, use `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first."
         };
@@ -1357,6 +1358,9 @@ mod tests {
         assert!(prompt.contains("Tool discovery:"));
         assert!(!prompt.contains("Web search:"));
         assert!(!prompt.contains("Knowledge retrieval:"));
+        assert!(!prompt.contains("cargo_test"));
+        assert!(!prompt.contains("execute_command"));
+        assert!(!prompt.contains("apply_patch"));
     }
 
     #[test]
@@ -1368,6 +1372,29 @@ mod tests {
         assert!(prompt.contains("Lead with answer"));
         // 必须保留"简洁不能换错"的安全垫，避免过度精简导致错误判断
         assert!(prompt.contains("concise but not at the cost of correctness"));
+    }
+
+    #[test]
+    fn system_prompt_forbids_guessing_without_sufficient_evidence() {
+        let available = SkipSet::new(16);
+        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        assert!(prompt.contains("Correctness guardrails:"));
+        assert!(prompt.contains("Do not hallucinate"));
+        assert!(prompt.contains("gather sufficient evidence"));
+        assert!(prompt.contains("instead of guessing"));
+        assert!(prompt.contains("verified facts, working hypotheses, and open questions"));
+    }
+
+    #[test]
+    fn generic_system_prompt_does_not_hardcode_repo_specific_tool_names() {
+        let available = SkipSet::new(16);
+        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        assert!(!prompt.contains("cargo_test"));
+        assert!(!prompt.contains("execute_command / cargo_test"));
+        assert!(!prompt.contains("execute_command"));
+        assert!(!prompt.contains("apply_patch"));
+        assert!(prompt.contains("relevant tools available in this turn"));
+        assert!(prompt.contains("instead of pretending you executed it"));
     }
 
     #[test]
@@ -1396,9 +1423,7 @@ mod tests {
         let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
         assert!(prompt.contains("discover_skills"));
         assert!(prompt.contains("No skill is active yet"));
-        assert!(
-            prompt.contains("prefer calling `discover_skills` before giving a freeform response")
-        );
+        assert!(prompt.contains("only when the task is specialized, tool-heavy"));
         assert!(prompt.contains("call `discover_skills` with the named keyword"));
     }
 
