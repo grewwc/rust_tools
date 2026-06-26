@@ -73,6 +73,7 @@ cargo test --bin a test_xxx       # Filter tests by name
 4. **Tool system** (`src/bin/ai/tools/`)
    - **Progressive loading**: core tools are enabled by default; additional tools are loaded via `enable_tools`.
    - **Registry pattern**: `registry/` defines JSON Schema → `service/` implements the logic → `storage/` persists data.
+   - **File tools**: `FileStore::new` resolves relative paths against `runtime_ctx::effective_cwd()`, so sub-agent-scoped working directories apply consistently to read/write/patch flows. `apply_patch` accepts both raw unified-diff hunks and the common single-file `*** Begin Patch` envelope; it also tolerates `path` as a compatibility alias for `file_path`.
    - **MCP integration**: communicates via stdio JSON-RPC transport.
    - **Tool groups**: organized into groups such as core, builtin, executor, etc.
    - **Code analysis**: `ast_symbols/` extracts AST symbols from multiple languages (Rust/Python/Java/Go/TS/JS/C/C++).

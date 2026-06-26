@@ -911,6 +911,21 @@ fn confirm_tool_execution(tool_call: &ToolCall, args: &Value) -> Result<(), RunO
 fn remediation_hint(tool_name: &str, err: &str) -> Option<String> {
     let err_lower = err.to_lowercase();
 
+    if tool_name == "apply_patch"
+        && (err_lower.contains("no hunks found")
+            || err_lower.contains("invalid hunk")
+            || err_lower.contains("context mismatch")
+            || err_lower.contains("ambiguous patch")
+            || err_lower.contains("missing file_path")
+            || err_lower.contains("missing patch")
+            || err_lower.contains("patch target mismatch"))
+    {
+        return Some(
+            "Suggestion: `apply_patch` accepts either raw unified-diff hunks starting with `@@`, or a single-file `*** Begin Patch` envelope. Use `file_path` (or the compatibility alias `path`) for the target file, and build hunk context from raw file text only — do not copy `read_file` line numbers, truncation notices, or the Symbol outline block into the patch. If you are replacing the whole file, use `write_file` instead."
+                .to_string(),
+        );
+    }
+
     if tool_name == "mcp_feishu_docs_get_text_by_url" && err_lower.contains("unsupported url") {
         return Some(
             "Suggestion: this tool only works for supported Feishu/Lark docs URLs. Do not retry with the same URL. Use mcp_feishu_docs_search to find the document first, or ask the user for a direct Feishu docs/wiki/sheet URL.".to_string(),

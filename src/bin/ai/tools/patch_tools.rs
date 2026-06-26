@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -12,11 +12,11 @@ fn params_apply_patch() -> Value {
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "Absolute path to the file to patch (some sensitive paths are blocked)."
+                "description": "Preferred absolute path to the file to patch (some sensitive paths are blocked). The runtime also accepts `path` as a compatibility alias."
             },
             "patch": {
                 "type": "string",
-                "description": "Unified diff patch text (expects @@ hunks with context/add/remove lines)."
+                "description": "Patch text. Accepted formats: raw unified-diff hunks starting with @@, or a single-file `*** Begin Patch` envelope with `*** Update File:` / `*** Add File:`."
             }
         },
         "required": ["file_path", "patch"]
@@ -26,7 +26,7 @@ fn params_apply_patch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply a unified-diff patch to a file (absolute path). Prefer this for updating an existing document or source file with the smallest localized change instead of rewriting the entire file. Creates missing parent directories; fails if context/removals do not match.",
+        description: "Apply a localized patch to one file. Supports raw unified-diff hunks and the common single-file `*** Begin Patch` envelope. Prefer this for updating an existing document or source file with the smallest localized change instead of rewriting the entire file. Creates missing parent directories; fails if context/removals do not match.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -45,6 +45,19 @@ enum UnifiedLine {
     Context(String),
     Remove(String),
     Add(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchEnvelopeOp {
+    Update,
+    Add,
+}
+
+#[derive(Debug, Clone)]
+struct PatchEnvelope {
+    op: PatchEnvelopeOp,
+    target_path: String,
+    body_lines: Vec<String>,
 }
 
 fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
@@ -101,6 +114,142 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
         return Err("no hunks found".to_string());
     }
     Ok(hunks)
+}
+
+fn optional_file_path_arg(args: &Value) -> Option<&str> {
+    args.get("file_path")
+        .or_else(|| args.get("path"))
+        .and_then(Value::as_str)
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
+}
+
+fn effective_base_dir() -> PathBuf {
+    crate::ai::driver::runtime_ctx::effective_cwd()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+fn resolve_patch_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return normalize_lexical(path);
+    }
+    normalize_lexical(&effective_base_dir().join(path))
+}
+
+fn ensure_patch_target_matches(target_path: &Path, envelope_path: &str) -> Result<(), String> {
+    let resolved_target = resolve_patch_path(target_path);
+    let resolved_envelope = resolve_patch_path(Path::new(envelope_path));
+    if resolved_target == resolved_envelope {
+        return Ok(());
+    }
+    Err(format!(
+        "patch target mismatch: tool arg points to {}, but patch envelope points to {}. Rebuild the patch for the same file before retrying.",
+        target_path.display(),
+        envelope_path
+    ))
+}
+
+fn parse_patch_envelope(patch: &str) -> Result<Option<PatchEnvelope>, String> {
+    let mut lines = patch.lines();
+    let Some(first) = lines.find(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if first.trim() != "*** Begin Patch" {
+        return Ok(None);
+    }
+
+    let header = lines
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| "invalid patch envelope: missing file header".to_string())?;
+    let (op, target_path) = if let Some(path) = header.strip_prefix("*** Update File: ") {
+        (PatchEnvelopeOp::Update, path.trim())
+    } else if let Some(path) = header.strip_prefix("*** Add File: ") {
+        (PatchEnvelopeOp::Add, path.trim())
+    } else if header.starts_with("*** Delete File: ") {
+        return Err("apply_patch does not support Delete File envelopes".to_string());
+    } else {
+        return Err(
+            "invalid patch envelope: expected `*** Update File:` or `*** Add File:`"
+                .to_string(),
+        );
+    };
+
+    let mut body_lines = Vec::new();
+    let mut ended = false;
+    for line in lines {
+        if line == "*** End Patch" {
+            ended = true;
+            break;
+        }
+        if line == "*** End of File" {
+            continue;
+        }
+        if line.starts_with("*** Update File: ")
+            || line.starts_with("*** Add File: ")
+            || line.starts_with("*** Delete File: ")
+        {
+            return Err("multi-file patch not supported: apply_patch edits one file per call"
+                .to_string());
+        }
+        body_lines.push(line.to_string());
+    }
+    if !ended {
+        return Err("invalid patch envelope: missing `*** End Patch`".to_string());
+    }
+    Ok(Some(PatchEnvelope {
+        op,
+        target_path: target_path.to_string(),
+        body_lines,
+    }))
+}
+
+fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), String> {
+    let Some(envelope) = parse_patch_envelope(patch)? else {
+        return Ok((path.display().to_string(), patch.to_string()));
+    };
+
+    ensure_patch_target_matches(path, &envelope.target_path)?;
+    let normalized_patch = match envelope.op {
+        PatchEnvelopeOp::Update => envelope.body_lines.join("\n"),
+        PatchEnvelopeOp::Add => {
+            if path.exists() {
+                return Err(
+                    "Add File patch targets an existing file. Use Update File or write_file instead."
+                        .to_string(),
+                );
+            }
+            for line in &envelope.body_lines {
+                if !line.starts_with('+') {
+                    return Err(format!(
+                        "invalid Add File line: {}. Every content line in an Add File envelope must start with `+`.",
+                        line
+                    ));
+                }
+            }
+            let mut normalized =
+                format!("@@ -0,0 +1,{} @@", envelope.body_lines.len());
+            if !envelope.body_lines.is_empty() {
+                normalized.push('\n');
+                normalized.push_str(&envelope.body_lines.join("\n"));
+            }
+            normalized
+        }
+    };
+    Ok((envelope.target_path, normalized_patch))
 }
 
 fn lines_match(actual: &str, expected: &str) -> bool {
@@ -213,7 +362,7 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
     }
 
     msg.push_str(
-        "Hint: re-read the file with read_file to get exact current content, then rebuild the patch with matching context lines.",
+        "Hint: re-read the file with read_file/read_file_lines to get exact current content, then rebuild the patch from the raw file text only. Do not copy the leading line numbers, any truncation notice, or the Symbol outline block into the patch.",
     );
     msg
 }
@@ -312,25 +461,44 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
 }
 
 pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
-    let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
-    let patch = args["patch"].as_str().ok_or("Missing patch")?;
+    let patch = args["patch"].as_str().ok_or("missing patch")?;
+    let initial_file_path = optional_file_path_arg(args);
+    let envelope = parse_patch_envelope(patch)?;
+    let file_path = initial_file_path
+        .map(str::to_string)
+        .or_else(|| envelope.as_ref().map(|parsed| parsed.target_path.clone()))
+        .ok_or("missing file_path")?;
 
-    let path = PathBuf::from(file_path);
-    let store = FileStore::new(path.clone());
+    let store = FileStore::new(PathBuf::from(&file_path));
     store.validate_write_access().map_err(|err| err.to_string())?;
+    let path = store.path().to_path_buf();
+    let (_, normalized_patch) = if let Some(envelope) = envelope {
+        ensure_patch_target_matches(&path, &envelope.target_path)?;
+        normalize_patch_text(&path, patch)?
+    } else {
+        (file_path.clone(), patch.to_string())
+    };
     let original = if path.exists() {
         store.read_to_string().map_err(|err| err.to_string())?
     } else {
         String::new()
     };
-    let next = apply_unified_patch(&original, patch)?;
+    let next = apply_unified_patch(&original, &normalized_patch)?;
     store.write_all(&next).map_err(|err| err.to_string())?;
-    Ok(format!("Successfully patched {}", file_path))
+    Ok(format!("Successfully patched {}", path.display()))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_unified_patch, parse_unified_hunks};
+    use super::{apply_unified_patch, execute_apply_patch, parse_unified_hunks};
+    use crate::ai::test_support::ENV_LOCK;
+    use std::{fs, path::PathBuf};
+
+    fn make_temp_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ai_patch_tools_test_{}_{}", name, uuid::Uuid::new_v4()));
+        path
+    }
 
     #[test]
     fn parse_unified_hunks_rejects_empty_hunk_line_instead_of_panicking() {
@@ -365,5 +533,66 @@ mod tests {
         let patch = "@@ -9,1 +9,1 @@\n-dup\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("ambiguous patch"), "err was: {err}");
+    }
+
+    #[test]
+    fn execute_apply_patch_accepts_path_alias_and_begin_patch_envelope() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("update").with_extension("txt");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "alpha\nbeta\n").unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "path": path.to_string_lossy(),
+                "patch": format!(
+                    "*** Begin Patch\n*** Update File: {}\n@@ -1,2 +1,2 @@\n alpha\n-beta\n+changed\n*** End Patch\n",
+                    path.display()
+                )
+            });
+            execute_apply_patch(&args).expect("apply_patch should accept path alias and envelope");
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_supports_add_file_envelope_without_file_path_arg() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = make_temp_path("add_parent");
+        let path = base.join("new.txt");
+        fs::create_dir_all(&base).unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: new.txt\n+hello\n+world\n*** End Patch\n"
+            });
+            execute_apply_patch(&args).expect("apply_patch should infer target from Add File envelope");
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello\nworld");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_rejects_mismatched_envelope_target() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = make_temp_path("mismatch_parent");
+        let path = base.join("a.txt");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "alpha\n").unwrap();
+
+        let err = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "patch": "*** Begin Patch\n*** Update File: b.txt\n@@ -1,1 +1,1 @@\n-alpha\n+beta\n*** End Patch\n"
+            });
+            execute_apply_patch(&args).expect_err("mismatched target must be rejected")
+        });
+
+        assert!(err.contains("patch target mismatch"), "err was: {err}");
+        let _ = fs::remove_dir_all(base);
     }
 }

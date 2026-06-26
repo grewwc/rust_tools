@@ -10,7 +10,9 @@ pub(crate) struct FileStore {
 
 impl FileStore {
     pub(crate) fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path: resolve_effective_path(path),
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -166,6 +168,15 @@ fn normalize_lexical(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+fn resolve_effective_path(path: PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return normalize_lexical(&path);
+    }
+    let base =
+        crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."));
+    normalize_lexical(&base.join(path))
 }
 
 /// 读取 `ai.sandbox.extra_sensitive_paths`（逗号分隔，去空白）。
@@ -354,5 +365,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_root);
 
         assert!(result.is_ok(), "read access should ignore effective_cwd root");
+    }
+
+    #[test]
+    fn file_store_resolves_relative_paths_against_effective_cwd() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let temp_root = std::env::temp_dir().join(format!(
+            "file-store-relative-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(temp_root.join("nested")).unwrap();
+
+        let resolved = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
+            .sync_scope(temp_root.clone(), || {
+                FileStore::new(PathBuf::from("nested/file.txt"))
+                    .path()
+                    .to_path_buf()
+            });
+
+        assert_eq!(resolved, temp_root.join("nested/file.txt"));
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

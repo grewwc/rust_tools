@@ -79,8 +79,15 @@ fn image_read_redirect_message(file_path: &str) -> String {
     )
 }
 
+fn resolve_file_path_arg(args: &Value) -> Result<&str, String> {
+    args.get("file_path")
+        .or_else(|| args.get("path"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Missing file_path".to_string())
+}
+
 pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
-    let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
+    let file_path = resolve_file_path_arg(args)?;
     let store = FileStore::new(PathBuf::from(file_path));
     store.validate_read_access().map_err(|e| e.to_string())?;
     store.ensure_exists().map_err(|e| e.to_string())?;
@@ -158,7 +165,7 @@ fn append_truncation_notice(
 }
 
 pub(crate) fn execute_read_file_lines(args: &Value) -> Result<String, String> {
-    let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
+    let file_path = resolve_file_path_arg(args)?;
     let store = FileStore::new(PathBuf::from(file_path));
     store.validate_read_access().map_err(|e| e.to_string())?;
     store.ensure_exists().map_err(|e| e.to_string())?;
@@ -188,7 +195,7 @@ pub(crate) fn execute_read_file_lines(args: &Value) -> Result<String, String> {
 }
 
 pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
-    let file_path = args["file_path"].as_str().ok_or("Missing file_path")?;
+    let file_path = resolve_file_path_arg(args)?;
     let content = args["content"].as_str().ok_or("Missing content")?;
 
     super::super::undo_tools::snapshot_file_before_write(file_path);
@@ -439,6 +446,42 @@ mod tests {
         let output = execute_read_file_lines(&args).unwrap();
         assert!(!output.contains("Symbol outline"), "output: {output}");
         assert!(output.contains("Beta"), "output: {output}");
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_file_tools_accept_path_alias() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("path_alias").with_extension("txt");
+        let base = path.parent().unwrap().to_path_buf();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let write_args = serde_json::json!({
+                "path": path.to_string_lossy(),
+                "content": "line1\nline2\nline3"
+            });
+            execute_write_file(&write_args).expect("write_file should accept path alias");
+
+            let read_args = serde_json::json!({
+                "path": path.to_string_lossy(),
+                "offset": 1,
+                "limit": 10
+            });
+            let output = execute_read_file(&read_args).expect("read_file should accept path alias");
+            assert!(output.contains("line1"), "output: {output}");
+            assert!(output.contains("line3"), "output: {output}");
+
+            let lines_args = serde_json::json!({
+                "path": path.to_string_lossy(),
+                "offset": 2,
+                "limit": 1
+            });
+            let lines =
+                execute_read_file_lines(&lines_args).expect("read_file_lines should accept path alias");
+            assert!(lines.contains("line2"), "output: {lines}");
+            assert!(!lines.contains("line3"), "output: {lines}");
+        });
 
         let _ = fs::remove_file(&path);
     }
