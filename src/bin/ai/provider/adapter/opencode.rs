@@ -6,6 +6,7 @@
 
 use crate::ai::config_schema::AiConfig;
 use crate::ai::stream::{ParsedStreamPayload, try_parse_stream_chunk_loose};
+use serde_json::{Map, Value};
 
 use super::{OPENCODE_DEFAULT_ENDPOINT, ProviderAdapter};
 
@@ -18,6 +19,10 @@ impl ProviderAdapter for OpenCodeAdapter {
 
     fn default_endpoint(&self) -> &'static str {
         OPENCODE_DEFAULT_ENDPOINT
+    }
+
+    fn reasoning_top_level_conflicts_with_thinking(&self, thinking: &Map<String, Value>) -> bool {
+        thinking.contains_key("thinking")
     }
 
     fn api_key_candidates(&self) -> &'static [&'static str] {

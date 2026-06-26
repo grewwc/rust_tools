@@ -251,6 +251,7 @@ struct TerminalToolObserver<'a> {
     at_line_start: bool,
     streamed_any_output: bool,
     // 流式输出折叠状态
+    allow_inline_fold_updates: bool,
     fold_total_lines: usize,
 }
 
@@ -265,6 +266,9 @@ impl<'a> TerminalToolObserver<'a> {
             at_line_start: true,
             streamed_any_output: false,
             fold_total_lines: 0,
+            // `\r` / `CSI 2K` 这类原地刷新只适合真实 TTY。IDE Chat / pipe /
+            // 日志采集场景不会解释 ANSI 光标控制，原样输出后就会泄漏成 `[2K`。
+            allow_inline_fold_updates: std::io::IsTerminal::is_terminal(&std::io::stdout()),
         }
     }
 
@@ -291,23 +295,32 @@ impl<'a> TerminalToolObserver<'a> {
                     print!("\x1b[0m\n");
                     self.at_line_start = true;
                 } else if self.fold_total_lines == TOOL_OUTPUT_FOLD_MAX_VISIBLE + 1 {
-                    // 刚超限：结束当前行，切换到单行计数器模式
+                    // 刚超限：结束当前行，切换到折叠模式。真实 TTY 继续用单行计数器
+                    // 原地刷新；非 TTY 只打印一次稳定提示，避免把 `\r\x1b[2K`
+                    // 这类控制序列泄漏到 IDE Chat / 日志。
                     print!("\x1b[0m\n");
                     self.at_line_start = true;
-                    // 打印计数器行（后续会用 \r\x1b[2K 原地更新）
-                    let folded = self.fold_total_lines - TOOL_OUTPUT_FOLD_MAX_VISIBLE;
-                    print!(
-                        "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded (streaming) ···\x1b[0m"
-                    );
+                    if self.allow_inline_fold_updates {
+                        let folded = self.fold_total_lines - TOOL_OUTPUT_FOLD_MAX_VISIBLE;
+                        print!(
+                            "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded (streaming) ···\x1b[0m"
+                        );
+                    } else {
+                        println!(
+                            "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· streaming output folded until completion ···\x1b[0m"
+                        );
+                    }
                     let _ = std::io::stdout().flush();
                 } else {
-                    // 已在计数器模式：原地更新计数
-                    let folded = self.fold_total_lines - TOOL_OUTPUT_FOLD_MAX_VISIBLE;
-                    print!(
-                        "\r\x1b[2K  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded (streaming) ···\x1b[0m"
-                    );
-                    let _ = std::io::stdout().flush();
-                    self.at_line_start = false;
+                    if self.allow_inline_fold_updates {
+                        // 已在计数器模式：原地更新计数
+                        let folded = self.fold_total_lines - TOOL_OUTPUT_FOLD_MAX_VISIBLE;
+                        print!(
+                            "\r\x1b[2K  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded (streaming) ···\x1b[0m"
+                        );
+                        let _ = std::io::stdout().flush();
+                        self.at_line_start = false;
+                    }
                 }
             } else {
                 // 只在未超限时打印字符
@@ -340,11 +353,17 @@ impl<'a> TerminalToolObserver<'a> {
         self.flush_pending_utf8();
         // 如果正在计数器模式，换行结束计数器行
         if self.fold_total_lines > TOOL_OUTPUT_FOLD_MAX_VISIBLE {
-            // 把 "(streaming)" 替换为最终状态
             let folded = self.fold_total_lines - TOOL_OUTPUT_FOLD_MAX_VISIBLE;
-            print!(
-                "\r\x1b[2K  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded ···\x1b[0m\n"
-            );
+            if self.allow_inline_fold_updates {
+                // 把 "(streaming)" 替换为最终状态
+                print!(
+                    "\r\x1b[2K  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded ···\x1b[0m\n"
+                );
+            } else {
+                println!(
+                    "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded ···\x1b[0m"
+                );
+            }
             let _ = std::io::stdout().flush();
             self.at_line_start = true;
         } else if !self.at_line_start {

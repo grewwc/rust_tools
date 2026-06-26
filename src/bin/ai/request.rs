@@ -1991,8 +1991,8 @@ fn build_request_body<'a>(
     let endpoint = models::endpoint_for_model(model, "");
     let adapter = super::provider::adapter_for(provider, &endpoint);
     let request_model = models::request_model_name(model);
-    let thinking_dialect =
-        super::provider::thinking_dialect_for(provider, &request_model, &endpoint);
+    let (thinking, reasoning_effort, reasoning) =
+        resolve_reasoning_wire_controls(model, &endpoint, enable_thinking, reasoning_effort);
     // 流式请求显式索取 usage：部分 provider（DashScope compatible-mode）流式下
     // 默认不返回 usage，必须声明 stream_options.include_usage 才能统计 token。
     let stream_options = stream.then(|| json!({ "include_usage": true }));
@@ -2000,14 +2000,36 @@ fn build_request_body<'a>(
         model: request_model,
         messages,
         stream,
-        thinking: thinking_dialect.fields(enable_thinking),
+        thinking,
         enable_search: adapter.enable_search_field(enable_search),
         tools,
         tool_choice,
-        reasoning_effort: adapter.reasoning_top_level(reasoning_effort),
-        reasoning: adapter.reasoning_nested(reasoning_effort),
+        reasoning_effort,
+        reasoning,
         stream_options,
     }
+}
+
+fn resolve_reasoning_wire_controls<'a>(
+    model: &'a str,
+    endpoint: &str,
+    enable_thinking: bool,
+    reasoning_effort: Option<&'a str>,
+) -> (Map<String, Value>, Option<&'a str>, Option<Value>) {
+    let provider = models::model_provider(model);
+    let adapter = super::provider::adapter_for(provider, &endpoint);
+    let request_model = models::request_model_name(model);
+    let thinking_dialect =
+        super::provider::thinking_dialect_for(provider, &request_model, &endpoint);
+    let mut thinking = thinking_dialect.fields(enable_thinking);
+    let top_level_reasoning_effort = adapter.reasoning_top_level(reasoning_effort);
+    if top_level_reasoning_effort.is_some()
+        && adapter.reasoning_top_level_conflicts_with_thinking(&thinking)
+    {
+        thinking.clear();
+    }
+    let nested_reasoning = adapter.reasoning_nested(reasoning_effort);
+    (thinking, top_level_reasoning_effort, nested_reasoning)
 }
 
 fn ensure_reasoning_content_echo_for_thinking_model(model: &str, messages: &mut [Message]) {
@@ -2039,11 +2061,8 @@ fn ensure_reasoning_content_echo_for_thinking_model(model: &str, messages: &mut 
 /// 由各 adapter 决定具体写哪些 key（`enable_thinking:false` /
 /// `thinking:{"type":"disabled"}` / 或空），核心层不再判别 provider。
 pub(in crate::ai) fn apply_aux_thinking_fields(model: &str, body: &mut Value) {
-    let provider = models::model_provider(model);
     let endpoint = models::endpoint_for_model(model, "");
-    let request_model = models::request_model_name(model);
-    let dialect = super::provider::thinking_dialect_for(provider, &request_model, &endpoint);
-    let fields = dialect.fields(false);
+    let (fields, _, _) = resolve_reasoning_wire_controls(model, &endpoint, false, None);
     if fields.is_empty() {
         return;
     }
@@ -2127,24 +2146,26 @@ pub async fn do_request_json(
         "stream": stream,
     });
 
+    let endpoint = endpoint_for_request_model(app, model);
+    let resolved_reasoning_effort = (!skip_reasoning_effort)
+        .then(|| resolve_reasoning_effort(app, model).map(|effort| effort.as_str()))
+        .flatten();
+    let (thinking_fields, top_level_reasoning_effort, nested_reasoning) =
+        resolve_reasoning_wire_controls(model, &endpoint, false, resolved_reasoning_effort);
+
     // 兼容（Qwen 等）provider 默认开启 thinking，会生成超长推理链。
     // 非流式辅助请求（意图识别、知识整理等）必须等整段生成完才返回响应头，
     // thinking 链一长就撑爆 60s 超时、重试也只是重复同样的慢生成。
     // 因此这里显式关闭 thinking，与后台 background_call 保持一致。
-    apply_aux_thinking_fields(model, &mut request_body);
-
-    // reasoning_effort：由 provider adapter 决定顶层或嵌套 wire 格式。
-    if !skip_reasoning_effort {
-        if let Some(effort) = resolve_reasoning_effort(app, model) {
-            let endpoint = endpoint_for_request_model(app, model);
-            let provider = models::model_provider(model);
-            let adapter = super::provider::adapter_for(provider, &endpoint);
-            if let Some(value) = adapter.reasoning_top_level(Some(effort.as_str())) {
-                request_body["reasoning_effort"] = json!(value);
-            }
-            if let Some(value) = adapter.reasoning_nested(Some(effort.as_str())) {
-                request_body["reasoning"] = value;
-            }
+    if let Some(map) = request_body.as_object_mut() {
+        for (key, value) in thinking_fields {
+            map.insert(key, value);
+        }
+        if let Some(value) = top_level_reasoning_effort {
+            map.insert("reasoning_effort".to_string(), json!(value));
+        }
+        if let Some(value) = nested_reasoning {
+            map.insert("reasoning".to_string(), value);
         }
     }
 
@@ -3276,7 +3297,7 @@ mod tests {
             Some(true),
             None,
             None,
-            Some("high"),
+            None,
         );
         let json = serde_json::to_value(&body).unwrap();
 
@@ -3288,6 +3309,56 @@ mod tests {
             json.pointer("/thinking/type").and_then(|v| v.as_str()),
             Some("enabled")
         );
+    }
+
+    #[test]
+    fn opencode_deepseek_reasoning_effort_suppresses_thinking_object() {
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("hi".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        for model in [
+            "deepseek-v4-flash-opencode",
+            "deepseek-v4-flash-free-opencode",
+        ] {
+            let body = build_request_body(
+                model,
+                &messages,
+                false,
+                true,
+                Some(true),
+                None,
+                None,
+                Some("high"),
+            );
+            let json = serde_json::to_value(&body).unwrap();
+            assert_eq!(
+                json.get("reasoning_effort").and_then(|v| v.as_str()),
+                Some("high"),
+                "{model}"
+            );
+            assert!(json.get("thinking").is_none(), "{model}");
+        }
+    }
+
+    #[test]
+    fn opencode_deepseek_aux_reasoning_effort_omits_disabled_thinking_object() {
+        let endpoint = crate::ai::provider::OPENCODE_DEFAULT_ENDPOINT.to_string();
+        let (thinking, top_level_reasoning_effort, nested_reasoning) =
+            resolve_reasoning_wire_controls(
+                "deepseek-v4-flash-opencode",
+                &endpoint,
+                false,
+                Some("high"),
+            );
+
+        assert!(thinking.is_empty());
+        assert_eq!(top_level_reasoning_effort, Some("high"));
+        assert!(nested_reasoning.is_none());
     }
 
     #[test]
