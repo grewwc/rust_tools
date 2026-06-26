@@ -5,6 +5,7 @@ use std::sync::{LazyLock, RwLock};
 use serde_json::Value;
 
 use crate::ai::config_schema::AiConfig;
+use crate::ai::driver::ScoredSkill;
 use crate::ai::skills::SkillManifest;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
@@ -38,7 +39,7 @@ fn params_discover_skills() -> Value {
         "properties": {
             "query": {
                 "type": "string",
-                "description": "Optional substring filter applied to skill name, description, tool names, tool groups, MCP servers, and source path."
+                "description": "Optional relevance query (natural language, any language). Matched semantically against each skill's name, description, and capabilities — not a literal substring filter — so a Chinese query finds English-described skills and vice versa. Leave empty to list all skills."
             },
             "limit": {
                 "type": "integer",
@@ -121,51 +122,90 @@ fn summarize_skill(skill: &SkillManifest, include_capabilities: bool) -> String 
     line
 }
 
-pub(crate) fn execute_discover_skills(args: &Value) -> Result<String, String> {
-    let query = args["query"].as_str().unwrap_or("").trim();
-    let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
-    let include_capabilities = args["include_capabilities"].as_bool().unwrap_or(false);
+/// discover_skills 相关性门槛。比自动路由的 `has_skill_signal`(0.08) 更严：那是
+/// 配合 sticky/threshold 的"保留信号"，这里是独立过滤器，必须自己把噪音挡掉。
+/// embedding 关闭的降级路径里，char-ngram TF-IDF 对无关 query 也能凑出 ~0.10 的
+/// blended 噪音，故 blended 门槛取 0.12 以越过噪音天花板。
+const DISCOVER_BLENDED_FLOOR: f64 = 0.12;
+/// 预训练 skill_match 模型对该 skill 名的概率：跨语言、且 embedding 关闭时仍可用，
+/// 是中文 query 命中英文 builtin skill 的主信号。无关 query 下各 label 概率被 none
+/// 吸收（实测 < 0.09），取 0.15 作为置信下限。
+const DISCOVER_MODEL_PRIOR_FLOOR: f64 = 0.15;
 
-    let skills = crate::ai::skills::load_all_skills();
-    let filtered = skills
-        .into_iter()
-        .filter(|skill| skill_matches_query(skill, query))
-        .take(limit)
-        .collect::<Vec<_>>();
-    if filtered.is_empty() {
-        return Ok(if query.is_empty() {
-            "No skills are currently available.".to_string()
-        } else {
-            format!("No skills matched query '{}'.", query)
-        });
-    }
+/// discover_skills 的相关性判定：复用自动路由的语义打分，再叠一条词法兜底。
+/// - `lexical_hit`：原子串/token 命中，保证不弱于旧的纯子串行为；
+/// - `blended_score`：embedding 与运行时 TF-IDF 的融合分（embedding 开启时为主）；
+/// - `model_prior_score`：预训练模型给 builtin skill 的跨语言信号。
+fn skill_is_discoverable(item: &ScoredSkill<'_>, lexical_hit: bool) -> bool {
+    lexical_hit
+        || item.blended_score >= DISCOVER_BLENDED_FLOOR
+        || item.model_prior_score >= DISCOVER_MODEL_PRIOR_FLOOR
+}
 
-    let mut lines = Vec::with_capacity(filtered.len() + 2);
+fn render_discovered_skills(
+    skills: &[&SkillManifest],
+    query: &str,
+    include_capabilities: bool,
+) -> String {
+    let mut lines = Vec::with_capacity(skills.len() + 2);
     if query.is_empty() {
-        lines.push(format!("{} skills available:", filtered.len()));
+        lines.push(format!("{} skills available:", skills.len()));
     } else {
-        lines.push(format!(
-            "{} skills matched query '{}':",
-            filtered.len(),
-            query
-        ));
+        lines.push(format!("{} skills matched query '{}':", skills.len(), query));
     }
     lines.extend(
-        filtered
+        skills
             .iter()
+            .copied()
             .map(|skill| summarize_skill(skill, include_capabilities)),
     );
     lines.push(
         "This tool returns skill metadata only. Skill prompts stay unloaded until routing selects a skill.\nIf you called this during an active task, do not stop here: continue the turn by selecting the best matching skill, enabling missing tools, or answering directly if no skill is actually needed."
             .to_string(),
     );
-    Ok(lines.join("\n"))
+    lines.join("\n")
+}
+
+pub(crate) fn execute_discover_skills(args: &Value) -> Result<String, String> {
+    let query = args["query"].as_str().unwrap_or("").trim();
+    let limit = args["limit"].as_u64().unwrap_or(20).clamp(1, 100) as usize;
+    let include_capabilities = args["include_capabilities"].as_bool().unwrap_or(false);
+
+    let skills = crate::ai::skills::load_all_skills();
+
+    // 空 query：保持原行为，按加载顺序列出全部（截到 limit）。
+    if query.is_empty() {
+        let listed = skills.iter().take(limit).collect::<Vec<_>>();
+        if listed.is_empty() {
+            return Ok("No skills are currently available.".to_string());
+        }
+        return Ok(render_discovered_skills(&listed, query, include_capabilities));
+    }
+
+    // 非空 query：复用自动路由的语义打分器（embedding + 运行时 TF-IDF + 预训练
+    // skill_match 模型融合），解决纯 ASCII 子串匹配"中文 query 搜不到英文 skill"
+    // 的跨语言失效问题。embedding 失败时 rank_skills_locally 内部已 unwrap_or_default
+    // 降级为 TF-IDF/词法，无网络强依赖；结果按相关性降序，最相关的在前。
+    // 词法命中（旧子串行为）作为兜底信号纳入，故召回是旧行为的严格超集。
+    let ranked = crate::ai::driver::rank_skills_locally(&skills, query, None);
+    let matched = ranked
+        .iter()
+        .filter(|item| skill_is_discoverable(item, skill_matches_query(item.skill, query)))
+        .map(|item| item.skill)
+        .take(limit)
+        .collect::<Vec<_>>();
+
+    if matched.is_empty() {
+        return Ok(format!("No skills matched query '{}'.", query));
+    }
+
+    Ok(render_discovered_skills(&matched, query, include_capabilities))
 }
 
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "discover_skills",
-        description: "List available skills by metadata only. Use this to discover skill names, descriptions, priorities, and optional capability summaries without loading full skill prompts.",
+        description: "Search available skills by relevance, returning metadata only (names, descriptions, priorities, optional capabilities) without loading full skill prompts. The query is matched semantically across languages, so prefer a natural-language `query` describing the task (e.g. the workflow, tool, product, or domain) over guessing exact names. Call this early whenever a task might map to a specialized or installed workflow; then use `activate_skill` if a returned skill clearly fits.",
         parameters: params_discover_skills,
         execute: execute_discover_skills,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -662,6 +702,34 @@ mod tests {
     #[test]
     fn discover_query_extracts_meaningful_tokens_from_sentence() {
         assert!(query_tokens("帮我查一个 argos 日志").contains(&"argos".to_string()));
+    }
+
+    #[test]
+    fn discover_skills_matches_chinese_query_against_english_skill() {
+        // 中文 query 搜英文 builtin skill：纯子串匹配会失效，语义打分应能召回。
+        let args = serde_json::json!({
+            "query": "帮我审查一下这段代码",
+            "limit": 20
+        });
+        let out = execute_discover_skills(&args).unwrap();
+        assert!(
+            out.contains("code-review"),
+            "expected cross-lingual semantic match to surface code-review, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn discover_skills_reports_no_match_for_irrelevant_query() {
+        // 完全无关的 query 不应倾倒全部 skill 清单。
+        let args = serde_json::json!({
+            "query": "zzz_totally_unrelated_token_qwxyz",
+            "limit": 20
+        });
+        let out = execute_discover_skills(&args).unwrap();
+        assert!(
+            out.contains("No skills matched"),
+            "expected no-match message for irrelevant query, got:\n{out}"
+        );
     }
 
     #[test]

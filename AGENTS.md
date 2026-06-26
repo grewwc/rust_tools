@@ -66,7 +66,7 @@ cargo test --bin a test_xxx       # Filter tests by name
 3. **Agent/Skill system**
    - `.agent` files: YAML front-matter followed by a Markdown prompt body. Priority order: project > workspace > user > builtin.
    - `.skill` files: YAML front-matter followed by a prompt body. Activated when a tool call triggers them.
-   - Skill packages: user skills may also be directories or `.zip` archives containing `SKILL.md` (or a top-level `.skill` manifest plus bundled resources). Zip packages are extracted into the skills cache and exposed to the active skill as a resource root.
+   - Skill packages: user skills may also be directories or `.zip` archives containing `SKILL.md` (or a top-level `.skill` manifest plus bundled resources). Zip packages are extracted into the skills cache and exposed to the active skill as a resource root. A directory or zip may also be a **collection** of multiple packages (e.g. `feishu/skills/<pkg>/SKILL.md`): when the root itself is not a single package, loading recurses into nested subdirectories and registers every package found. A directory that *is* a package short-circuits and is never descended into, so its bundled `references/*.skill` resources are not mistaken for separate skills.
    - Discovery sources: skill loading merges built-in skills, the user skills directory, and packaged `SKILL.md` skills discovered from standard `~/.trae-cn` install roots (builtin/global/extension skills). Built-in skill names remain pinned if a lower-precedence source reuses the same name.
    - Routing: uses ML models (intent/agent_route/skill_match) plus heuristic fallback rules.
 

@@ -58,6 +58,34 @@ fn note_has_structured_prefix(note: &str) -> bool {
         || lower.starts_with("never")
 }
 
+/// 解析持久化 principle note 的一层 header
+/// `[domain=X] [abstraction=Y] [confidence=Z] [reinforced=W] <body>`，
+/// 返回 `(domain, abstraction, confidence, reinforced, body)`。
+///
+/// 关键点：字段之间用 `"] "`（而非 `"] ["`）切分，从而保留下一字段开头的 `[`，
+/// 这样每一步的 `strip_prefix("[xxx=")` 才能命中。`"] ["` 是旧实现的 bug 来源。
+fn split_one_principle_header(note: &str) -> Option<(&str, u8, f64, u32, &str)> {
+    let rest = note.strip_prefix(PERSIST_PREFIX_DOMAIN)?;
+    let (domain, rest) = rest.split_once("] ")?;
+
+    let rest = rest.strip_prefix(PERSIST_PREFIX_ABSTRACTION)?;
+    let (abstraction, rest) = rest.split_once("] ")?;
+
+    let rest = rest.strip_prefix(PERSIST_PREFIX_CONFIDENCE)?;
+    let (confidence, rest) = rest.split_once("] ")?;
+
+    let rest = rest.strip_prefix(PERSIST_PREFIX_REINFORCED)?;
+    let (reinforced, body) = rest.split_once("] ")?;
+
+    Some((
+        domain,
+        abstraction.parse().unwrap_or(1),
+        confidence.parse().unwrap_or(0.6),
+        reinforced.parse().unwrap_or(1),
+        body,
+    ))
+}
+
 fn is_model_self_note_experience(exp: &RawExperience) -> bool {
     matches!(
         exp.category.as_str(),
@@ -462,37 +490,26 @@ impl ExperienceGeneralizer {
             .cloned()
             .unwrap_or_else(|| "unknown".to_string());
 
-        let Some(rest) = note_text.strip_prefix(PERSIST_PREFIX_DOMAIN) else {
-            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
-        };
-        let Some((domain, rest)) = rest.split_once("] [") else {
-            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
-        };
-        let Some(rest) = rest.strip_prefix(PERSIST_PREFIX_ABSTRACTION) else {
-            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
-        };
-        let Some((abstraction, rest)) = rest.split_once("] [") else {
-            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
-        };
-        let Some(rest) = rest.strip_prefix(PERSIST_PREFIX_CONFIDENCE) else {
-            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
-        };
-        let Some((confidence, rest)) = rest.split_once("] [") else {
-            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
-        };
-        let Some(rest) = rest.strip_prefix(PERSIST_PREFIX_REINFORCED) else {
-            return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
-        };
-        let Some((reinforced, principle_body)) = rest.split_once("] ") else {
+        let Some((domain, abstraction, confidence, reinforced, mut body)) =
+            split_one_principle_header(note_text)
+        else {
             return (note_text.to_string(), fallback_domain, 1, 0.6, 1);
         };
 
+        // self-heal 历史污染：旧版本的 round-trip 解析用 `"] ["` 切分，会把下一段开头的
+        // `[` 吃掉，导致整段 header 解析失败、原样叠进正文；每次 reload+persist 再套一层，
+        // 最终堆出几十层 `[domain=...] [abstraction=...]`。这里把正文里残留的同构 header
+        // 逐层剥净，让已污染的存量数据在下一次加载时自动恢复成干净的一行。
+        while let Some((_, _, _, _, inner)) = split_one_principle_header(body) {
+            body = inner;
+        }
+
         (
-            principle_body.to_string(),
+            body.to_string(),
             domain.to_string(),
-            abstraction.parse().unwrap_or(1),
-            confidence.parse().unwrap_or(0.6),
-            reinforced.parse().unwrap_or(1),
+            abstraction,
+            confidence,
+            reinforced,
         )
     }
 
@@ -1100,6 +1117,74 @@ mod tests {
     fn parse_refined_principle_json_rejects_garbage() {
         assert!(parse_refined_principle_json("not json at all").is_none());
         assert!(parse_refined_principle_json("{\"domain\":\"x\"}").is_none()); // 缺 principle
+    }
+
+    #[test]
+    fn persisted_principle_note_round_trips() {
+        // persist 写出的格式必须能被 parse 原样读回，正文不带任何 header 残留。
+        let principle = GeneralizedPrinciple {
+            id: "p1".to_string(),
+            principle: "In api design, Do: validate inputs at boundaries".to_string(),
+            source_experiences: vec![],
+            domain: "api_design".to_string(),
+            abstraction_level: 2,
+            confidence: 0.7,
+            created_at: Local::now().to_rfc3339(),
+            last_reinforced: Local::now().to_rfc3339(),
+            reinforcement_count: 3,
+            cross_domain_links: vec![],
+        };
+        let note = format!(
+            "[domain={}] [abstraction={}] [confidence={:.2}] [reinforced={}] {}",
+            principle.domain,
+            principle.abstraction_level,
+            principle.confidence,
+            principle.reinforcement_count,
+            principle.principle
+        );
+
+        let (body, domain, abstraction, confidence, reinforced) =
+            ExperienceGeneralizer::parse_persisted_principle_note(&note, &[]);
+        assert_eq!(body, "In api design, Do: validate inputs at boundaries");
+        assert_eq!(domain, "api_design");
+        assert_eq!(abstraction, 2);
+        assert!((confidence - 0.7).abs() < 1e-9);
+        assert_eq!(reinforced, 3);
+        // 正文里不应再夹带任何 header 标记
+        assert!(!body.contains("[domain="), "body polluted: {body}");
+        assert!(!body.contains("[abstraction="), "body polluted: {body}");
+    }
+
+    #[test]
+    fn parse_persisted_principle_note_self_heals_stacked_headers() {
+        // 模拟旧 bug 产物：正文里叠了多层 header。parse 后应把它们逐层剥净，
+        // 只保留最内层真实正文，并取最外层的元数据。
+        let polluted = "[domain=robustness] [abstraction=3] [confidence=0.80] [reinforced=4] \
+             [domain=raw_experience] [abstraction=1] [confidence=0.60] [reinforced=1] \
+             [domain=raw_experience] [abstraction=1] [confidence=0.70] [reinforced=2] \
+             In robustness, Avoid: brittle exact-string matching";
+
+        let (body, domain, abstraction, confidence, reinforced) =
+            ExperienceGeneralizer::parse_persisted_principle_note(polluted, &[]);
+        assert_eq!(body, "In robustness, Avoid: brittle exact-string matching");
+        // 元数据取最外层
+        assert_eq!(domain, "robustness");
+        assert_eq!(abstraction, 3);
+        assert!((confidence - 0.80).abs() < 1e-9);
+        assert_eq!(reinforced, 4);
+        assert!(!body.contains("[domain="), "body still polluted: {body}");
+    }
+
+    #[test]
+    fn parse_persisted_principle_note_keeps_plain_body_unchanged() {
+        // 没有 header 的纯正文（老数据 / LLM 直接产出）应原样返回，domain 回退到 tag。
+        let plain = "Do: prefer structured checks over string matching";
+        let (body, domain, _a, _c, _r) = ExperienceGeneralizer::parse_persisted_principle_note(
+            plain,
+            &["generalized".to_string(), "robustness".to_string()],
+        );
+        assert_eq!(body, plain);
+        assert_eq!(domain, "robustness");
     }
 
     #[test]

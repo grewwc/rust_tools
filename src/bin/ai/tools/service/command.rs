@@ -171,6 +171,13 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
         }
         // 命令替换 `$(`
         if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            // 算术展开 `$(( ... ))` 不执行任何命令，是无害的（典型：`echo $((RANDOM % 20))`），
+            // 不应被命令替换规则误杀。跳过 `$((` 开头后继续向内扫描——这样真正内嵌的
+            // 命令替换（如 `$(( $(whoami) ))` 里的 `$(`）仍会在后续迭代被命中拦下。
+            if i + 2 < bytes.len() && bytes[i + 2] == b'(' {
+                i += 3;
+                continue;
+            }
             return Err(
                 "command substitution `$(...)` is not allowed; pass a literal command instead"
                     .to_string(),
@@ -598,6 +605,23 @@ mod tests {
         assert!(
             err.contains("command substitution"),
             "expected $(...) blocked, got: {err}"
+        );
+    }
+
+    #[test]
+    fn allows_arithmetic_expansion() {
+        // 算术展开 `$(( ... ))` 不执行命令，是无害的，应放行。
+        assert!(validate("echo $((RANDOM % 20 + 1))").is_ok());
+        assert!(validate("echo $((1 + 2 * 3))").is_ok());
+    }
+
+    #[test]
+    fn blocks_command_substitution_nested_in_arithmetic() {
+        // 算术展开内部仍内嵌真正的命令替换 `$(...)`，必须被拦下。
+        let err = validate("echo $(( $(whoami) + 1 ))").unwrap_err();
+        assert!(
+            err.contains("command substitution"),
+            "expected nested $(...) blocked, got: {err}"
         );
     }
 

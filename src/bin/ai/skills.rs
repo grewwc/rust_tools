@@ -384,7 +384,7 @@ fn ensure_seeded_skills_dir(dir: &Path) -> Result<(), String> {
 fn load_external_skills() -> Vec<SkillManifest> {
     discover_external_skill_dirs()
         .into_iter()
-        .filter_map(|dir| load_skill_from_package_dir(&dir))
+        .flat_map(|dir| load_skills_from_package_dir(&dir))
         .collect()
 }
 
@@ -428,9 +428,7 @@ fn load_skills_from_dir(dir: &Path) -> Vec<SkillManifest> {
         }
 
         if path.is_dir() {
-            if let Some(skill) = load_skill_from_package_dir(&path) {
-                out.push(skill);
-            }
+            out.extend(load_skills_from_package_dir(&path));
             continue;
         }
 
@@ -443,9 +441,7 @@ fn load_skills_from_dir(dir: &Path) -> Vec<SkillManifest> {
             .and_then(|s| s.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"))
         {
-            if let Some(skill) = load_skill_from_zip_package(&path, dir) {
-                out.push(skill);
-            }
+            out.extend(load_skills_from_zip_package(&path, dir));
             continue;
         }
 
@@ -464,32 +460,72 @@ fn load_skill_from_file(path: &Path) -> Option<SkillManifest> {
     parse_skill_front_matter_with_path(&content, path).ok()
 }
 
-fn load_skill_from_package_dir(dir: &Path) -> Option<SkillManifest> {
-    let manifest_path = find_skill_manifest_in_package_dir(dir)?;
-    parse_skill_package_manifest(&manifest_path, dir, None).ok()
+fn load_skills_from_package_dir(dir: &Path) -> Vec<SkillManifest> {
+    collect_skill_packages(dir)
+        .into_iter()
+        .filter_map(|(resource_root, manifest_path)| {
+            parse_skill_package_manifest(&manifest_path, &resource_root, None).ok()
+        })
+        .collect()
 }
 
-fn load_skill_from_zip_package(zip_path: &Path, skills_dir: &Path) -> Option<SkillManifest> {
-    let extract_root = extracted_zip_package_root(zip_path, skills_dir).ok()?;
-    let (resource_root, manifest_path) = find_skill_package_root(&extract_root)?;
-    let relative_manifest = manifest_path
-        .strip_prefix(&extract_root)
-        .unwrap_or(manifest_path.as_path());
-    let source_label = format!("{}!{}", zip_path.display(), relative_manifest.display());
-    parse_skill_package_manifest(&manifest_path, &resource_root, Some(source_label)).ok()
+fn load_skills_from_zip_package(zip_path: &Path, skills_dir: &Path) -> Vec<SkillManifest> {
+    let Ok(extract_root) = extracted_zip_package_root(zip_path, skills_dir) else {
+        return Vec::new();
+    };
+    collect_skill_packages(&extract_root)
+        .into_iter()
+        .filter_map(|(resource_root, manifest_path)| {
+            let relative_manifest = manifest_path
+                .strip_prefix(&extract_root)
+                .unwrap_or(manifest_path.as_path());
+            let source_label = format!("{}!{}", zip_path.display(), relative_manifest.display());
+            parse_skill_package_manifest(&manifest_path, &resource_root, Some(source_label)).ok()
+        })
+        .collect()
 }
 
 fn is_ignored_package_entry_name(name: &str) -> bool {
     name.starts_with('.') || name == "__MACOSX"
 }
 
-fn find_skill_package_root(root: &Path) -> Option<(PathBuf, PathBuf)> {
-    if let Some(manifest) = find_skill_manifest_in_package_dir(root) {
-        return Some((root.to_path_buf(), manifest));
-    }
+/// 集合下钻的最大目录深度。feishu 集合布局解压后最深为 `feishu/skills/<pkg>`（3 层），
+/// 取 4 留出余量，同时避免在异常深的目录树上无限递归。
+const MAX_SKILL_PACKAGE_DEPTH: usize = 4;
 
-    let mut child_matches = fs::read_dir(root)
-        .ok()?
+/// 收集 `root` 下的所有 skill 包，返回每个包的 `(resource_root, manifest_path)`。
+///
+/// - 若 `root` 自身就是一个包（直接含 manifest），只返回它本身，且**不再向下递归**：
+///   单包目录 / 单包 zip（如 argos-tools）保持原有行为，包内 `references/*.skill`
+///   等资源文件不会被误判为独立 skill。
+/// - 否则把 `root` 当作"集合"（如 feishu，其布局为 `feishu/skills/<pkg>/SKILL.md`），
+///   逐层下钻收集所有**最上层**的包；命中某个目录是包后即停止深入该目录。
+///
+/// 磁盘目录集合与解压后的 zip 集合通过同一条逻辑处理，无需对 `skills/` 之类的容器
+/// 名做硬编码判断。
+fn collect_skill_packages(root: &Path) -> Vec<(PathBuf, PathBuf)> {
+    // 单包短路：root 直接是一个包，按原语义返回单个，不下钻。
+    if let Some(manifest) = find_skill_manifest_in_package_dir(root) {
+        return vec![(root.to_path_buf(), manifest)];
+    }
+    let mut out = Vec::new();
+    collect_skill_packages_recursive(root, MAX_SKILL_PACKAGE_DEPTH, &mut out);
+    rust_tools::sortw::stable_sort_by(&mut out, |a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn collect_skill_packages_recursive(
+    dir: &Path,
+    depth_budget: usize,
+    out: &mut Vec<(PathBuf, PathBuf)>,
+) {
+    if depth_budget == 0 {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut children = rd
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
@@ -500,14 +536,17 @@ fn find_skill_package_root(root: &Path) -> Option<(PathBuf, PathBuf)> {
             if is_ignored_package_entry_name(name) {
                 return None;
             }
-            find_skill_manifest_in_package_dir(&path).map(|manifest| (path, manifest))
+            Some(path)
         })
         .collect::<Vec<_>>();
-    rust_tools::sortw::stable_sort_by(&mut child_matches, |a, b| a.0.cmp(&b.0));
-    if child_matches.len() == 1 {
-        child_matches.pop()
-    } else {
-        None
+    rust_tools::sortw::stable_sort_by(&mut children, |a, b| a.cmp(b));
+    for child in children {
+        if let Some(manifest) = find_skill_manifest_in_package_dir(&child) {
+            // child 本身是一个包：收集并停止深入（包内是资源，不再当 skill 扫）。
+            out.push((child, manifest));
+        } else {
+            collect_skill_packages_recursive(&child, depth_budget - 1, out);
+        }
     }
 }
 
@@ -864,5 +903,94 @@ Use bundled references."#,
             },
         }
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn load_skills_from_dir_supports_collection_directory() {
+        // feishu 式集合：collection/skills/<pkg>/SKILL.md，无根 manifest。
+        let dir = std::env::temp_dir().join(format!("rust-tools-skills-{}", uuid::Uuid::new_v4()));
+        let collection = dir.join("feishu");
+        for (pkg, desc) in [("lark-base", "base skill"), ("lark-im", "im skill")] {
+            let pkg_dir = collection.join("skills").join(pkg);
+            std::fs::create_dir_all(pkg_dir.join("references")).unwrap();
+            std::fs::write(
+                pkg_dir.join("SKILL.md"),
+                format!("---\nname: {pkg}\ndescription: {desc}\n---\n\nbody\n"),
+            )
+            .unwrap();
+            std::fs::write(pkg_dir.join("references").join("guide.md"), "resource").unwrap();
+        }
+
+        let skills = load_skills_from_dir(&dir);
+        let base = skills.iter().find(|s| s.name == "lark-base").unwrap();
+        let im = skills.iter().find(|s| s.name == "lark-im").unwrap();
+        assert_eq!(base.description, "base skill");
+        assert_eq!(im.description, "im skill");
+        assert_eq!(
+            base.resource_path.as_deref(),
+            Some(
+                collection
+                    .join("skills")
+                    .join("lark-base")
+                    .display()
+                    .to_string()
+                    .as_str()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skills_from_dir_single_package_dir_does_not_descend() {
+        // 单包目录内若有 references/*.skill 资源，不能被误判为额外 skill。
+        let dir = std::env::temp_dir().join(format!("rust-tools-skills-{}", uuid::Uuid::new_v4()));
+        let package_dir = dir.join("argos-tools");
+        std::fs::create_dir_all(package_dir.join("reference")).unwrap();
+        std::fs::write(
+            package_dir.join("SKILL.md"),
+            "---\nname: argos-tools\ndescription: single package\n---\n\nbody\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package_dir.join("reference").join("install.skill"),
+            "---\nname: bogus-nested\ndescription: should-not-load\n---\n\nnope\n",
+        )
+        .unwrap();
+
+        let skills = load_skills_from_dir(&dir);
+        assert_eq!(skills.iter().filter(|s| s.name == "argos-tools").count(), 1);
+        assert!(skills.iter().all(|s| s.name != "bogus-nested"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_skills_from_dir_supports_multi_package_collection_zip() {
+        let dir = std::env::temp_dir().join(format!("rust-tools-skills-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let zip_path = dir.join("feishu.zip");
+        write_zip_package(
+            &zip_path,
+            &[
+                (
+                    "feishu/skills/lark-base/SKILL.md",
+                    "---\nname: lark-base\ndescription: base skill\n---\n\nbody\n",
+                ),
+                ("feishu/skills/lark-base/references/guide.md", "resource"),
+                (
+                    "feishu/skills/lark-im/SKILL.md",
+                    "---\nname: lark-im\ndescription: im skill\n---\n\nbody\n",
+                ),
+            ],
+        );
+
+        let skills = load_skills_from_dir(&dir);
+        let base = skills.iter().find(|s| s.name == "lark-base").unwrap();
+        let im = skills.iter().find(|s| s.name == "lark-im").unwrap();
+        assert_eq!(base.description, "base skill");
+        assert_eq!(im.description, "im skill");
+        assert!(base.source_path.as_deref().unwrap().contains(".zip!"));
+        let resource_path = PathBuf::from(base.resource_path.as_deref().unwrap());
+        assert!(resource_path.join("references").join("guide.md").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1004,6 +1004,10 @@ mod tests {
 
     #[test]
     fn skill_reference_completion_lists_skills() {
+        // 该测试比较两次独立的 load_all_skills() 快照（complete_for_line 内部一次、
+        // expected 一次），而其他用例会在 ENV_LOCK 下改写全局 HOME。不持锁则 HOME
+        // 可能在两次快照之间翻转导致候选集不一致，故与之串行。
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
         let (start, candidates) = CommandCompleter::complete_for_line("@skills", 7);
         assert_eq!(start, 0);
         let expected: Vec<String> = crate::ai::skills::load_all_skills()
@@ -1021,6 +1025,8 @@ mod tests {
 
     #[test]
     fn skill_reference_completion_triggers_on_short_prefix() {
+        // 同上：比较候选数量与 load_all_skills().len() 两次快照，需与改写 HOME 的用例串行。
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
         // 输入 `@ski`（"skills" 的前缀）即应触发，列出全部 skill。
         let (start, candidates) = CommandCompleter::complete_for_line("@ski", 4);
         assert_eq!(start, 0);
