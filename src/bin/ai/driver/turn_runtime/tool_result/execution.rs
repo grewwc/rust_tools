@@ -8,8 +8,8 @@ use std::io::Write;
 
 use super::super::persistence::persist_pending_turn_messages;
 use super::super::{
-    MAX_TOOL_RESULT_INLINE_CHARS, MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
     types::{IterationExecution, PreparedToolResult, TurnLoopStep},
+    MAX_TOOL_RESULT_INLINE_CHARS, MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
 };
 use super::messaging::print_tool_result_preview;
 use super::{
@@ -220,6 +220,28 @@ fn execute_tool_calls_for_round(
     )
 }
 
+/// 前台同步工具执行（尤其是 `execute_command` 的流式输出）也属于“当前 turn 的可中断
+/// 输出阶段”。若这里不抬起 `app.streaming`，Ctrl+C 会被 SIGINT 处理器误判成
+/// `Shutdown`，直接退出主进程，而不是取消当前工具轮次。
+struct ToolExecutionStreamingGuard {
+    flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ToolExecutionStreamingGuard {
+    fn new(flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            flag: std::sync::Arc::clone(flag),
+        }
+    }
+}
+
+impl Drop for ToolExecutionStreamingGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 struct TerminalToolObserver<'a> {
     app: &'a App,
     active_stream_tool_call_id: Option<String>,
@@ -428,6 +450,7 @@ fn handle_tool_call_round(
     iteration: usize,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let mut observer = TerminalToolObserver::new(app);
+    let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
     let exec_result = execute_tool_calls_for_round(
         &app.session_id,
         mcp_client,
@@ -708,6 +731,7 @@ mod tests {
     use super::*;
     use crate::ai::{
         cli::ParsedCli,
+        driver::signal,
         types::{
             AgentContext, App, AppConfig, FunctionCall, FunctionDefinition, ToolDefinition,
             ToolResult,
@@ -715,7 +739,8 @@ mod tests {
     };
     use rust_tools::cw::SkipMap;
     use std::path::PathBuf;
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::{atomic::AtomicBool, Arc};
+    use std::time::{Duration, Instant};
 
     fn test_app_with_tools(tool_names: &[&str]) -> App {
         App {
@@ -1002,5 +1027,101 @@ mod tests {
         assert!(messages[0].content.is_array());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ctrl_c_during_foreground_tool_round_cancels_without_shutdown() {
+        let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        signal::clear_request_interrupt();
+
+        let app = test_app_with_tools(&["execute_command"]);
+        {
+            let mut os = app.os.lock().unwrap();
+            let _ = os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+        }
+        crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+
+        let streaming = app.streaming.clone();
+        let shutdown = app.shutdown.clone();
+        let cancel_stream = app.cancel_stream.clone();
+
+        let handle = std::thread::spawn(move || {
+            let mut app = app;
+            let mcp = crate::ai::mcp::McpClient::new();
+            let shared_mcp =
+                std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+            let mut messages = Vec::new();
+            let mut turn_messages = Vec::new();
+            let mut persisted_turn_messages = 0usize;
+            let start = Instant::now();
+            let result = handle_tool_call_round(
+                &mut app,
+                &mcp,
+                &shared_mcp,
+                &crate::ai::types::StreamResult {
+                    outcome: crate::ai::types::StreamOutcome::ToolCall,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "execute_command".to_string(),
+                            arguments: r#"{"command":"sleep 2"}"#.to_string(),
+                        },
+                    }],
+                    assistant_text: String::new(),
+                    hidden_meta: String::new(),
+                    reasoning_text: String::new(),
+                    skip_response_drain: true,
+                },
+                &mut messages,
+                &mut turn_messages,
+                true,
+                &mut persisted_turn_messages,
+                1,
+            );
+            (
+                result.map(|_| ()).map_err(|err| err.to_string()),
+                start.elapsed(),
+                app,
+            )
+        });
+
+        let wait_started = Instant::now();
+        while !streaming.load(std::sync::atomic::Ordering::Relaxed)
+            && wait_started.elapsed() < Duration::from_secs(1)
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            streaming.load(std::sync::atomic::Ordering::Relaxed),
+            "foreground tool round never raised streaming flag"
+        );
+
+        signal::handle_sigint(
+            shutdown.as_ref(),
+            streaming.as_ref(),
+            cancel_stream.as_ref(),
+        );
+
+        let (result, elapsed, returned_app) = handle.join().unwrap();
+
+        returned_app
+            .cancel_stream
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        crate::ai::tools::registry::common::clear_tool_cancel();
+        signal::clear_request_interrupt();
+        if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+            *guard = None;
+        }
+
+        assert!(result.is_ok());
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "tool round did not stop promptly after Ctrl+C: {elapsed:?}"
+        );
+        assert!(
+            !shutdown.load(std::sync::atomic::Ordering::Relaxed),
+            "Ctrl+C during foreground tool round should not request shutdown"
+        );
     }
 }

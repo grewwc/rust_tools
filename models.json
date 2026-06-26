@@ -44,7 +44,8 @@
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,
-    "subagent_priority": 85
+    "subagent_priority": 85,
+    "default_reasoning_effort": "high"
   },
   {
     "key": "qwen3.7-plus-alibaba",
@@ -83,22 +84,6 @@
     "subagent_priority": 80
   },
   {
-    "key": "kimi-k2.7-code-alibaba",
-    "aliases": [
-      "KIMI",
-      "kimi-k2.7-code-openai"
-    ],
-    "name": "kimi-k2.7-code",
-    "provider": "alibaba",
-    "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-    "quality_tier": "strong",
-    "is_vl": true,
-    "search_enabled": true,
-    "tools_default_enabled": true,
-    "enable_thinking": true,
-    "subagent_priority": 70
-  },
-  {
     "key": "qwen3.6-flash-alibaba",
     "aliases": [
       "QWEN_VL_FLASH",
@@ -114,23 +99,6 @@
     "explicit_prompt_cache": true,
     "enable_thinking": false,
     "subagent_priority": 150
-  },
-  {
-    "key": "qwen3.5-397b-a17b-alibaba",
-    "aliases": [
-      "qwen-open",
-      "qwen3.5-397b-a17b-compatible"
-    ],
-    "name": "qwen3.5-397b-a17b",
-    "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-    "quality_tier": "flagship",
-    "provider": "alibaba",
-    "is_vl": true,
-    "search_enabled": true,
-    "tools_default_enabled": true,
-    "explicit_prompt_cache": true,
-    "enable_thinking": true,
-    "subagent_priority": 75
   },
   {
     "key": "mimo-v2.5-free-opencode",
@@ -157,6 +125,7 @@
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
+    "default_reasoning_effort": "high",
     "enable_thinking": true,
     "subagent_priority": 80
   },
