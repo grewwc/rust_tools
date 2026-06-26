@@ -8,8 +8,8 @@ use std::io::Write;
 
 use super::super::persistence::persist_pending_turn_messages;
 use super::super::{
-    types::{IterationExecution, PreparedToolResult, TurnLoopStep},
     MAX_TOOL_RESULT_INLINE_CHARS, MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
+    types::{IterationExecution, PreparedToolResult, ToolCallExecution, TurnLoopStep},
 };
 use super::messaging::print_tool_result_preview;
 use super::{
@@ -208,6 +208,7 @@ fn execute_tool_calls_for_round(
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
     tool_calls: &[ToolCall],
+    allowed_tool_names: &rust_tools::commonw::FastSet<String>,
     observer: Option<&mut dyn tools::ToolExecutionObserver>,
     _iteration: usize,
 ) -> Result<ExecuteToolCallsResult, Box<dyn std::error::Error>> {
@@ -216,6 +217,7 @@ fn execute_tool_calls_for_round(
         mcp_client,
         shared_mcp_client,
         tool_calls,
+        Some(allowed_tool_names),
         observer,
     )
 }
@@ -442,7 +444,7 @@ fn handle_tool_call_round(
     app: &mut App,
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
-    stream_result: &crate::ai::types::StreamResult,
+    tool_call_execution: &ToolCallExecution,
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
     one_shot_mode: bool,
@@ -455,15 +457,16 @@ fn handle_tool_call_round(
         &app.session_id,
         mcp_client,
         shared_mcp_client,
-        &stream_result.tool_calls,
+        &tool_call_execution.stream_result.tool_calls,
+        &tool_call_execution.allowed_tool_names,
         Some(&mut observer),
         iteration,
     )?;
     append_cached_tool_results_note(&exec_result, messages, turn_messages);
     append_tool_result_messages(
         app,
-        &stream_result.assistant_text,
-        &stream_result.reasoning_text,
+        &tool_call_execution.stream_result.assistant_text,
+        &tool_call_execution.stream_result.reasoning_text,
         &exec_result,
         messages,
         turn_messages,
@@ -644,16 +647,17 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             );
             Ok(TurnLoopStep::Break)
         }
-        IterationExecution::ToolCall(stream_result) => {
-            let discover_skills_only =
-                no_active_skill && requested_only_discover_skills(&stream_result.tool_calls);
-            let image_read_paths =
-                extract_image_paths_from_file_read_tool_calls(&stream_result.tool_calls);
+        IterationExecution::ToolCall(tool_call_execution) => {
+            let discover_skills_only = no_active_skill
+                && requested_only_discover_skills(&tool_call_execution.stream_result.tool_calls);
+            let image_read_paths = extract_image_paths_from_file_read_tool_calls(
+                &tool_call_execution.stream_result.tool_calls,
+            );
             *terminal_dedupe_candidate = handle_tool_call_round(
                 app,
                 mcp_client,
                 shared_mcp_client,
-                &stream_result,
+                &tool_call_execution,
                 messages,
                 turn_messages,
                 one_shot_mode,
@@ -694,28 +698,50 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 *force_final_response = true;
             } else {
                 // AIOS: kernel is the authoritative source for tool-call quota.
-                // If kernel says we've exceeded rlimit.max_tool_calls even when
-                // the stale user-space `iteration` counter hasn't tripped yet,
-                // honor the kernel verdict.
-                use aios_kernel::primitives::{RlimitDim, RlimitVerdict};
+                // 当前 usage 已经超限、或下一次 tool call 会超限，都应该切到
+                // force-final，但 tool-call 配额本身不该阻断“无工具的最终回答”。
+                use aios_kernel::primitives::{ResourceUsageDelta, RlimitDim, RlimitVerdict};
                 let os = app.os.lock().unwrap();
                 if let Some(pid) = os.current_process_id() {
+                    let current_verdict = os.rlimit_check(pid, &Default::default());
+                    let next_tool_verdict = os.rlimit_check(
+                        pid,
+                        &ResourceUsageDelta {
+                            tool_calls: 1,
+                            ..Default::default()
+                        },
+                    );
+                    drop(os);
                     if let RlimitVerdict::Exceeded {
                         dimension,
                         used,
                         limit,
-                    } = os.rlimit_check(pid, &Default::default())
+                    } = current_verdict
                     {
-                        drop(os);
-                        if matches!(dimension, RlimitDim::ToolCalls | RlimitDim::Turns)
-                            && *force_final_response
-                        {
-                            *final_assistant_text = format!(
-                                "Agent exceeded kernel rlimit ({:?}: used={} limit={}).",
-                                dimension, used, limit
-                            );
-                            return Ok(TurnLoopStep::Break);
+                        match dimension {
+                            RlimitDim::Turns => {
+                                if *force_final_response {
+                                    *final_assistant_text = format!(
+                                        "Agent exceeded kernel rlimit ({:?}: used={} limit={}).",
+                                        dimension, used, limit
+                                    );
+                                    return Ok(TurnLoopStep::Break);
+                                }
+                                *force_final_response = true;
+                            }
+                            RlimitDim::ToolCalls => {
+                                *force_final_response = true;
+                            }
+                            _ => {}
                         }
+                    }
+                    if matches!(
+                        next_tool_verdict,
+                        RlimitVerdict::Exceeded {
+                            dimension: RlimitDim::ToolCalls,
+                            ..
+                        }
+                    ) {
                         *force_final_response = true;
                     }
                 }
@@ -737,9 +763,10 @@ mod tests {
             ToolResult,
         },
     };
+    use aios_kernel::primitives::ResourceLimit;
     use rust_tools::cw::SkipMap;
     use std::path::PathBuf;
-    use std::sync::{atomic::AtomicBool, Arc};
+    use std::sync::{Arc, atomic::AtomicBool};
     use std::time::{Duration, Instant};
 
     fn test_app_with_tools(tool_names: &[&str]) -> App {
@@ -997,6 +1024,93 @@ mod tests {
     }
 
     #[test]
+    fn forced_final_hallucinated_tool_call_is_rejected_without_consuming_quota() {
+        let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let mut app = test_app_with_tools(&["read_file"]);
+        let pid = {
+            let mut os = app.os.lock().unwrap();
+            let pid =
+                os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
+            let mut lim = ResourceLimit::unlimited();
+            lim.max_tool_calls = 64;
+            os.rlimit_set(pid, lim).unwrap();
+            pid
+        };
+        crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+
+        let path = std::env::temp_dir().join(format!("forced-final-{}.txt", pid));
+        std::fs::write(&path, "hello").unwrap();
+
+        let shared_mcp =
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+        let mut persisted_turn_messages = 0usize;
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut force_final_response = true;
+        let mut terminal_dedupe_candidate = None;
+
+        let step = handle_iteration_execution(
+            &mut app,
+            "summarize findings",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            IterationExecution::ToolCall(ToolCallExecution {
+                stream_result: crate::ai::types::StreamResult {
+                    outcome: crate::ai::types::StreamOutcome::ToolCall,
+                    tool_calls: vec![ToolCall {
+                        id: "call_1".to_string(),
+                        tool_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: "read_file".to_string(),
+                            arguments: format!(r#"{{"file_path":"{}"}}"#, path.to_string_lossy()),
+                        },
+                    }],
+                    assistant_text: String::new(),
+                    hidden_meta: String::new(),
+                    reasoning_text: String::new(),
+                    skip_response_drain: true,
+                },
+                allowed_tool_names: Default::default(),
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            3,
+            16,
+        )
+        .unwrap();
+
+        assert!(matches!(step, TurnLoopStep::Continue));
+        assert!(force_final_response);
+        assert!(final_assistant_text.is_empty());
+        assert!(!final_assistant_recorded);
+        {
+            let os = app.os.lock().unwrap();
+            assert_eq!(os.rusage_get(pid).unwrap().tool_calls, 0);
+        }
+        let joined = turn_messages
+            .iter()
+            .map(|msg| msg.content.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("not available in this turn's tool schema"));
+        assert!(!joined.contains("exceeded kernel rlimit"));
+
+        let _ = std::fs::remove_file(&path);
+        if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+            *guard = None;
+        }
+    }
+
+    #[test]
     fn auto_image_followup_uses_multimodal_message_for_vl_model() {
         let mut app = test_app_with_tools(&[]);
         let dir = std::env::temp_dir();
@@ -1058,20 +1172,23 @@ mod tests {
                 &mut app,
                 &mcp,
                 &shared_mcp,
-                &crate::ai::types::StreamResult {
-                    outcome: crate::ai::types::StreamOutcome::ToolCall,
-                    tool_calls: vec![ToolCall {
-                        id: "call_1".to_string(),
-                        tool_type: "function".to_string(),
-                        function: FunctionCall {
-                            name: "execute_command".to_string(),
-                            arguments: r#"{"command":"sleep 2"}"#.to_string(),
-                        },
-                    }],
-                    assistant_text: String::new(),
-                    hidden_meta: String::new(),
-                    reasoning_text: String::new(),
-                    skip_response_drain: true,
+                &ToolCallExecution {
+                    stream_result: crate::ai::types::StreamResult {
+                        outcome: crate::ai::types::StreamOutcome::ToolCall,
+                        tool_calls: vec![ToolCall {
+                            id: "call_1".to_string(),
+                            tool_type: "function".to_string(),
+                            function: FunctionCall {
+                                name: "execute_command".to_string(),
+                                arguments: r#"{"command":"sleep 2"}"#.to_string(),
+                            },
+                        }],
+                        assistant_text: String::new(),
+                        hidden_meta: String::new(),
+                        reasoning_text: String::new(),
+                        skip_response_drain: true,
+                    },
+                    allowed_tool_names: ["execute_command".to_string()].into_iter().collect(),
                 },
                 &mut messages,
                 &mut turn_messages,

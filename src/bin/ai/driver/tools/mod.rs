@@ -5,6 +5,7 @@ use aios_kernel::{
     primitives::{ChannelId, ChannelOwnerTag, FutexAddr},
 };
 use chrono::{DateTime, Duration, Local, Utc};
+use rust_tools::commonw::FastSet;
 use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -867,7 +868,19 @@ fn parse_tool_args(tool_call: &ToolCall) -> Result<Value, ToolResult> {
 fn prepare_tool_call(
     mcp_client: &McpClient,
     tool_call: &ToolCall,
+    allowed_tool_names: Option<&FastSet<String>>,
 ) -> Result<PreparedToolCall, ToolResult> {
+    if let Some(allowed_tool_names) = allowed_tool_names
+        && !allowed_tool_names.contains(&tool_call.function.name)
+    {
+        return Err(ToolResult {
+            tool_call_id: tool_call.id.clone(),
+            content: format!(
+                "Error: tool '{}' is not available in this turn's tool schema.",
+                tool_call.function.name
+            ),
+        });
+    }
     Ok(PreparedToolCall {
         route: route_tool_call(mcp_client, &tool_call.function.name),
         args: parse_tool_args(tool_call)?,
@@ -1680,6 +1693,8 @@ fn classify_tool_error(err: &str) -> ToolFailureKind {
     }
     if lower.contains("permission denied")
         || lower.contains("not in the allowed whitelist")
+        || lower.contains("not available in this turn's tool schema")
+        || lower.contains("kernel tool-call quota")
         || lower.contains("forbidden")
     {
         return ToolFailureKind::Permission;
@@ -1792,14 +1807,61 @@ fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
     }
 }
 
+fn reserve_current_process_tool_call_budget(tool_call: &ToolCall) -> Result<(), RunOneResult> {
+    use aios_kernel::primitives::{ResourceUsageDelta, RlimitDim, RlimitVerdict};
+
+    let Ok(guard) = GLOBAL_OS.lock() else {
+        return Ok(());
+    };
+    let Some(os_arc) = guard.as_ref() else {
+        return Ok(());
+    };
+    let Ok(mut os) = os_arc.lock() else {
+        return Ok(());
+    };
+    let Some(pid) = os.current_process_id() else {
+        return Ok(());
+    };
+
+    match os.rlimit_check(
+        pid,
+        &ResourceUsageDelta {
+            tool_calls: 1,
+            ..Default::default()
+        },
+    ) {
+        RlimitVerdict::Exceeded {
+            dimension: RlimitDim::ToolCalls,
+            used,
+            limit,
+        } => Err(RunOneResult {
+            tool_result: ToolResult {
+                tool_call_id: tool_call.id.clone(),
+                content: format!(
+                    "Error: tool '{}' would exceed the kernel tool-call quota (used={} limit={}).",
+                    tool_call.function.name, used, limit
+                ),
+            },
+            ok: false,
+            executed: false,
+            cached: false,
+        }),
+        _ => {
+            os.increment_tool_calls_used_for(pid);
+            Ok(())
+        }
+    }
+}
+
 fn run_one(
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
     session_id: &str,
     tool_call: &ToolCall,
+    allowed_tool_names: Option<&FastSet<String>>,
     observer: &mut Option<&mut dyn ToolExecutionObserver>,
 ) -> (ToolRoute, RunOneResult) {
-    let prepared = match prepare_tool_call(mcp_client, tool_call) {
+    let prepared = match prepare_tool_call(mcp_client, tool_call, allowed_tool_names) {
         Ok(prepared) => prepared,
         Err(tool_result) => {
             return (
@@ -1863,14 +1925,8 @@ fn run_one(
 
     println!("\n{}", format_tool_status_running(&tool_call.function.name));
 
-    if let Ok(guard) = GLOBAL_OS.lock() {
-        if let Some(os_arc) = guard.as_ref() {
-            if let Ok(mut os) = os_arc.lock() {
-                if let Some(pid) = os.current_process_id() {
-                    os.increment_tool_calls_used_for(pid);
-                }
-            }
-        }
+    if let Err(run_result) = reserve_current_process_tool_call_budget(tool_call) {
+        return (prepared.route, run_result);
     }
 
     if let Some(observer) = observer.as_deref_mut() {
@@ -1898,6 +1954,7 @@ pub(super) fn execute_tool_calls(
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
     tool_calls: &[ToolCall],
+    allowed_tool_names: Option<&FastSet<String>>,
     observer: Option<&mut dyn ToolExecutionObserver>,
 ) -> Result<ExecuteToolCallsResult, Box<dyn Error>> {
     if tokio::runtime::Handle::try_current().is_ok() {
@@ -1907,6 +1964,7 @@ pub(super) fn execute_tool_calls(
                 mcp_client,
                 shared_mcp_client,
                 tool_calls,
+                allowed_tool_names,
                 observer,
             )
         });
@@ -1916,6 +1974,7 @@ pub(super) fn execute_tool_calls(
         mcp_client,
         shared_mcp_client,
         tool_calls,
+        allowed_tool_names,
         observer,
     )
 }
@@ -1925,6 +1984,7 @@ fn execute_tool_calls_inner(
     mcp_client: &McpClient,
     shared_mcp_client: &SharedMcpClient,
     tool_calls: &[ToolCall],
+    allowed_tool_names: Option<&FastSet<String>>,
     mut observer: Option<&mut dyn ToolExecutionObserver>,
 ) -> Result<ExecuteToolCallsResult, Box<dyn Error>> {
     let mut executed_tool_calls = Vec::with_capacity(tool_calls.len());
@@ -1958,6 +2018,7 @@ fn execute_tool_calls_inner(
                 shared_mcp_client,
                 session_id,
                 batch,
+                allowed_tool_names,
                 &mut observer,
             );
             for (tool_call, (_route, run_result)) in batch.iter().zip(batch_results.into_iter()) {
@@ -1988,6 +2049,7 @@ fn execute_tool_calls_inner(
             shared_mcp_client,
             session_id,
             tool_call,
+            allowed_tool_names,
             &mut observer,
         );
         let should_barrier = barrier::should_barrier_after(
@@ -2074,6 +2136,7 @@ fn run_parallel_readonly_batch(
     shared_mcp_client: &SharedMcpClient,
     session_id: &str,
     batch: &[ToolCall],
+    allowed_tool_names: Option<&FastSet<String>>,
     observer: &mut Option<&mut dyn ToolExecutionObserver>,
 ) -> Vec<(ToolRoute, RunOneResult)> {
     // 在并发执行前，按顺序触发 on_tool_started，保持观察者看到的启动顺序稳定。
@@ -2094,6 +2157,7 @@ fn run_parallel_readonly_batch(
                         shared_mcp_client,
                         session_id,
                         tool_call,
+                        allowed_tool_names,
                         &mut no_observer,
                     )
                 })
@@ -2249,7 +2313,9 @@ fn is_cacheable_tool_name(name: &str) -> bool {
     if mutating.iter().any(|needle| lower.contains(needle)) {
         return false;
     }
-    let reusable = ["search", "find", "read", "get", "list", "view", "fetch", "export"];
+    let reusable = [
+        "search", "find", "read", "get", "list", "view", "fetch", "export",
+    ];
     reusable.iter().any(|needle| lower.contains(needle))
 }
 
@@ -2319,19 +2385,23 @@ mod tests {
         ToolCachePayload, ToolFailureKind, ToolRoute, aggregate_async_tool_pipe_messages,
         async_tool_pipe_message_from_final, async_tool_pipe_message_from_started,
         async_tool_pipe_message_from_stream, build_tool_cache_key, classify_tool_error,
-        collect_tool_cache_file_fingerprints, delete_async_tool_snapshot, execute_with_safe_retry,
-        is_cacheable_tool_name, is_parallel_safe_tool_call, is_tool_cache_entry_fresh,
-        load_async_tool_snapshot, lookup_wait_sources, parallel_safe_batch_len,
-        persist_async_tool_snapshot, send_async_tool_pipe_message, should_retry_once,
-        stream_preview_from_aggregate, tool_cache_validation_matches,
+        collect_tool_cache_file_fingerprints, delete_async_tool_snapshot, execute_tool_calls,
+        execute_with_safe_retry, is_cacheable_tool_name, is_parallel_safe_tool_call,
+        is_tool_cache_entry_fresh, load_async_tool_snapshot, lookup_wait_sources,
+        parallel_safe_batch_len, persist_async_tool_snapshot, send_async_tool_pipe_message,
+        should_retry_once, stream_preview_from_aggregate, tool_cache_validation_matches,
     };
     use crate::ai::mcp::McpClient;
     use crate::ai::tools::registry::common::current_process_tool_cancel_futex;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
     use crate::ai::tools::task_tools::WaitManySource;
     use crate::ai::types::{FunctionCall, ToolCall};
-    use aios_kernel::{kernel::EventId, primitives::ChannelId};
+    use aios_kernel::{
+        kernel::EventId,
+        primitives::{ChannelId, ResourceLimit},
+    };
     use chrono::{Duration, Utc};
+    use rust_tools::commonw::FastSet;
     use serde_json::json;
     use std::fs;
     use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -2430,6 +2500,93 @@ mod tests {
         let calls = vec![tool_call("read_file"), tool_call("write_file")];
         // 仅 1 个可并行调用，调用方应回退到顺序路径（batch_len == 1 < 2）。
         assert_eq!(parallel_safe_batch_len(&mcp, &calls), 1);
+    }
+
+    #[test]
+    fn execute_tool_calls_rejects_tools_hidden_from_current_turn_schema() {
+        let (_guard, kernel, root) = setup_async_tool_kernel();
+        let path = std::env::temp_dir().join(format!(
+            "turn-schema-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "hello").unwrap();
+
+        let mut call = tool_call("read_file");
+        call.function.arguments = format!(r#"{{"file_path":"{}"}}"#, path.to_string_lossy());
+        let allowed_tool_names: FastSet<String> = FastSet::default();
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(McpClient::new()));
+        let result = execute_tool_calls(
+            "sess-turn-schema",
+            &McpClient::new(),
+            &shared_mcp,
+            &[call],
+            Some(&allowed_tool_names),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.tool_results.len(), 1);
+        assert!(
+            result.tool_results[0]
+                .content
+                .contains("not available in this turn's tool schema")
+        );
+        assert_eq!(
+            kernel.lock().unwrap().rusage_get(root).unwrap().tool_calls,
+            0
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn execute_tool_calls_preflights_kernel_tool_quota_before_running_tool() {
+        let (_guard, kernel, root) = setup_async_tool_kernel();
+        {
+            let mut os = kernel.lock().unwrap();
+            let mut lim = ResourceLimit::unlimited();
+            lim.max_tool_calls = 0;
+            os.rlimit_set(root, lim).unwrap();
+        }
+
+        let path = std::env::temp_dir().join(format!(
+            "tool-quota-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "hello").unwrap();
+
+        let mut call = tool_call("read_file");
+        call.function.arguments = format!(r#"{{"file_path":"{}"}}"#, path.to_string_lossy());
+        let allowed_tool_names: FastSet<String> = ["read_file".to_string()].into_iter().collect();
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(McpClient::new()));
+        let result = execute_tool_calls(
+            "sess-tool-quota",
+            &McpClient::new(),
+            &shared_mcp,
+            &[call],
+            Some(&allowed_tool_names),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.tool_results.len(), 1);
+        assert!(
+            result.tool_results[0]
+                .content
+                .contains("kernel tool-call quota")
+        );
+        assert_eq!(
+            kernel.lock().unwrap().rusage_get(root).unwrap().tool_calls,
+            0
+        );
+
+        let _ = fs::remove_file(path);
     }
 
     fn sample_completed_entry(result_channel_id: Option<u64>) -> AsyncToolEntry {

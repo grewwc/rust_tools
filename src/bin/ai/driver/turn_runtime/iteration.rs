@@ -1,4 +1,5 @@
 use colored::Colorize;
+use rust_tools::commonw::FastSet;
 use serde_json::Value;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::Duration;
@@ -15,8 +16,9 @@ use crate::ai::{
 };
 
 use super::{
-    TurnOutcome, context_budget, persistence::persist_pending_turn_messages,
-    types::IterationExecution,
+    TurnOutcome, context_budget,
+    persistence::persist_pending_turn_messages,
+    types::{IterationExecution, ToolCallExecution},
 };
 
 struct StreamingFlagGuard {
@@ -36,6 +38,21 @@ impl Drop for StreamingFlagGuard {
     fn drop(&mut self) {
         self.flag.store(false, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+fn request_visible_tool_names(app: &App, force_final_response: bool) -> FastSet<String> {
+    if force_final_response {
+        return FastSet::default();
+    }
+    app.agent_context
+        .as_ref()
+        .map(|ctx| {
+            ctx.tools
+                .iter()
+                .map(|tool| tool.function.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub(super) fn refresh_skill_turn_for_iteration(
@@ -400,6 +417,7 @@ async fn finalize_stream_interaction(
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
     should_quit: bool,
+    force_final_response: bool,
 ) -> Result<IterationExecution, Box<dyn std::error::Error>> {
     input::clear_stdin_buffer();
 
@@ -436,7 +454,10 @@ async fn finalize_stream_interaction(
         .store(false, std::sync::atomic::Ordering::Relaxed);
 
     Ok(match stream_result.outcome {
-        StreamOutcome::ToolCall => IterationExecution::ToolCall(stream_result),
+        StreamOutcome::ToolCall => IterationExecution::ToolCall(ToolCallExecution {
+            stream_result,
+            allowed_tool_names: request_visible_tool_names(app, force_final_response),
+        }),
         _ => IterationExecution::FinalResponse(stream_result),
     })
 }
@@ -528,6 +549,7 @@ pub(super) async fn execute_turn_iteration(
         one_shot_mode,
         persisted_turn_messages,
         should_quit,
+        force_final_response,
     )
     .await
 }

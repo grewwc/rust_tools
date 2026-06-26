@@ -1,4 +1,5 @@
 use crate::ai::history::Message;
+use rust_tools::commonw::FastSet;
 
 pub(super) struct PreparedToolResult {
     pub(super) content_for_model: String,
@@ -20,11 +21,16 @@ pub(super) struct TurnPreparation {
     pub(super) max_iterations: usize,
 }
 
+pub(super) struct ToolCallExecution {
+    pub(super) stream_result: crate::ai::types::StreamResult,
+    pub(super) allowed_tool_names: FastSet<String>,
+}
+
 pub(super) enum IterationExecution {
     Exit(TurnOutcome),
     RequestFailed(String),
     FinalResponse(crate::ai::types::StreamResult),
-    ToolCall(crate::ai::types::StreamResult),
+    ToolCall(ToolCallExecution),
 }
 
 pub(super) enum TurnLoopStep {
