@@ -153,7 +153,7 @@ fn execute_spawn_process(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "spawn_process",
-        description: "Spawn a new background process in the Agent OS to handle a specific sub-goal or parallel task. The scheduler will execute this autonomously. Returns the PID.",
+        description: "Spawn a fire-and-forget background process in the Agent OS. Returns the PID immediately and does NOT return the process's result — the scheduler runs it autonomously and you only observe it via IPC (read_mailbox / wait_process) or its side effects. Use this for long-running background processes, two-way IPC collaboration, or work whose output you do not need to collect back. If you need the task's result returned to you, use task_spawn instead.",
         parameters: params_spawn_process,
         execute: execute_spawn_process,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

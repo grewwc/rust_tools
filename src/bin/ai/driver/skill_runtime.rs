@@ -787,7 +787,7 @@ fn build_system_prompt(
     }
 
     if has_tool(available_tools, "plan") || has_tool(available_tools, "spawn_process") {
-        b.push(ContextKind::Behavior, "Planning & Sub-process Execution:\n- Simple tasks: act directly. Complex ones: call `plan` first.\n- Use `spawn_process` for work that can run autonomously in the background.\n- Use `wait_process` to yield until a child finishes, `kill_process` to stop one, `reap_process` to collect it.\n- Use `send_ipc_message`/`read_mailbox` for cross-process communication.");
+        b.push(ContextKind::Behavior, "Planning & Sub-process Execution:\n- Simple tasks: act directly. Complex ones: call `plan` first.\n- Use `spawn_process` only for fire-and-forget background work whose result you do NOT need back (long-running processes, two-way IPC collaboration). It returns a PID, not a result.\n- If you need the delegated work's result returned to you, use `task_spawn` + `task_wait` instead — even for a single task.\n- Use `wait_process` to yield until a child finishes, `kill_process` to stop one, `reap_process` to collect it.\n- Use `send_ipc_message`/`read_mailbox` for cross-process communication.");
     }
 
     if has_tool(available_tools, "tool_spawn") || has_tool(available_tools, "tool_wait") {

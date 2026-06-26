@@ -586,7 +586,7 @@ fn params_task_spawn() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "task_spawn",
-        description: "Launch a subagent task asynchronously and return immediately with a task_id. Use this when you want to run multiple subagent tasks in parallel. The returned task_id is a long-lived handle: collect results with task_wait (re-callable until the result is consumed) or peek non-blockingly with task_status. Hitting task_wait's timeout does NOT mean the subagent is stuck — it only means the wait budget for that single call elapsed.",
+        description: "Launch a subagent task asynchronously and return immediately with a task_id. Use this whenever you need a delegated task's result returned to you — for a single task or to fan out several in parallel. Unlike spawn_process (fire-and-forget, no result), task_spawn produces a collectable structured final answer. The returned task_id is a long-lived handle: collect results with task_wait (re-callable until the result is consumed) or peek non-blockingly with task_status. Hitting task_wait's timeout does NOT mean the subagent is stuck — it only means the wait budget for that single call elapsed.",
         parameters: params_task_spawn,
         execute: execute_task_spawn,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
