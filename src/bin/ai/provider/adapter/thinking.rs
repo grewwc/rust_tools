@@ -21,7 +21,9 @@ use super::super::ApiProvider;
 /// 思考开关的线缆编码方言。零状态单例。
 pub(in crate::ai) trait ThinkingDialect: Sync {
     /// 把逻辑开关 `enable` 编码成请求体字段。空 Map 表示该方言不发送任何字段。
-    fn fields(&self, enable: bool) -> Map<String, Value>;
+    /// `top_level_reasoning_effort` 表示该请求最终是否会发送顶层
+    /// `reasoning_effort`；仅少数特殊方言需要据此调整 wire 形状。
+    fn fields(&self, enable: bool, top_level_reasoning_effort: Option<&str>) -> Map<String, Value>;
 
     /// 该方言是否要求 assistant tool-call 消息回传 `reasoning_content` 字段。
     /// DeepSeek thinking-mode 在工具回合续写时会校验该字段，即使网关没有给出
@@ -35,7 +37,11 @@ pub(in crate::ai) trait ThinkingDialect: Sync {
 pub(in crate::ai) struct EnableThinkingDialect;
 
 impl ThinkingDialect for EnableThinkingDialect {
-    fn fields(&self, enable: bool) -> Map<String, Value> {
+    fn fields(
+        &self,
+        enable: bool,
+        _top_level_reasoning_effort: Option<&str>,
+    ) -> Map<String, Value> {
         let mut map = Map::new();
         map.insert("enable_thinking".to_string(), Value::Bool(enable));
         map
@@ -44,10 +50,14 @@ impl ThinkingDialect for EnableThinkingDialect {
 
 /// DeepSeek（经 OpenCode Zen 网关）：`{"thinking": {"type": "enabled"|"disabled"}}`。
 /// DeepSeek 忽略 `enable_thinking`，只认这个对象。
+/// 但在 OpenCode 上若已走顶层 `reasoning_effort`，该对象必须省略，避免 wire 冲突。
 pub(in crate::ai) struct DeepSeekThinkingDialect;
 
 impl ThinkingDialect for DeepSeekThinkingDialect {
-    fn fields(&self, enable: bool) -> Map<String, Value> {
+    fn fields(&self, enable: bool, top_level_reasoning_effort: Option<&str>) -> Map<String, Value> {
+        if top_level_reasoning_effort.is_some() {
+            return Map::new();
+        }
         let kind = if enable { "enabled" } else { "disabled" };
         let mut map = Map::new();
         map.insert("thinking".to_string(), json!({ "type": kind }));
@@ -64,7 +74,11 @@ impl ThinkingDialect for DeepSeekThinkingDialect {
 pub(in crate::ai) struct NoThinkingDialect;
 
 impl ThinkingDialect for NoThinkingDialect {
-    fn fields(&self, _enable: bool) -> Map<String, Value> {
+    fn fields(
+        &self,
+        _enable: bool,
+        _top_level_reasoning_effort: Option<&str>,
+    ) -> Map<String, Value> {
         Map::new()
     }
 }

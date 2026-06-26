@@ -2021,13 +2021,8 @@ fn resolve_reasoning_wire_controls<'a>(
     let request_model = models::request_model_name(model);
     let thinking_dialect =
         super::provider::thinking_dialect_for(provider, &request_model, &endpoint);
-    let mut thinking = thinking_dialect.fields(enable_thinking);
     let top_level_reasoning_effort = adapter.reasoning_top_level(reasoning_effort);
-    if top_level_reasoning_effort.is_some()
-        && adapter.reasoning_top_level_conflicts_with_thinking(&thinking)
-    {
-        thinking.clear();
-    }
+    let thinking = thinking_dialect.fields(enable_thinking, top_level_reasoning_effort);
     let nested_reasoning = adapter.reasoning_nested(reasoning_effort);
     (thinking, top_level_reasoning_effort, nested_reasoning)
 }

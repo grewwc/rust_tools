@@ -21,7 +21,7 @@ mod opencode;
 mod openrouter;
 mod thinking;
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 use crate::ai::stream::{ParsedStreamPayload, try_parse_stream_chunk_loose};
 
@@ -62,12 +62,6 @@ pub(in crate::ai) trait ProviderAdapter: Sync {
     /// 顶层 `reasoning_effort` 字段取值（OpenAI / OpenRouter / OpenCode 协议）。
     fn reasoning_top_level<'a>(&self, effort: Option<&'a str>) -> Option<&'a str> {
         effort
-    }
-
-    /// 某些网关接受顶层 `reasoning_effort`，但一旦发送它，就不允许再同时发送
-    /// 方言化的 thinking 开关。默认无冲突；具体 provider 可按其 wire 约束 override。
-    fn reasoning_top_level_conflicts_with_thinking(&self, _thinking: &Map<String, Value>) -> bool {
-        false
     }
 
     /// 嵌套 `reasoning: { effort }` 字段取值（DashScope compatible 协议）。
