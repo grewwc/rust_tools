@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 use std::fs;
 use std::time::{Duration, Instant};
@@ -788,9 +789,12 @@ fn latest_user_message_text(messages: &[Message]) -> Option<String> {
 /// prepare.rs / skill_runtime.rs 会把上下文提醒拼到当前 user message 最前面
 /// （为保 prompt cache）。这些块体量很大，会污染意图/thinking 判定的输入，
 /// 让一句 "hi" 看起来像是长文本。判定前去掉它们，只留用户真正输入的内容。
-fn strip_system_reminders(text: &str) -> String {
+pub(crate) fn strip_system_reminders(text: &str) -> Cow<'_, str> {
     const OPEN: &str = "<system-reminder>";
     const CLOSE: &str = "</system-reminder>";
+    if !text.contains(OPEN) {
+        return Cow::Borrowed(text);
+    }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(start) = rest.find(OPEN) {
@@ -806,7 +810,7 @@ fn strip_system_reminders(text: &str) -> String {
         }
     }
     out.push_str(rest);
-    out
+    Cow::Owned(out)
 }
 
 fn local_thinking_decision(
@@ -907,7 +911,10 @@ fn local_thinking_decision(
 async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]) -> Option<bool> {
     let gate_start = Instant::now();
     let user_text = latest_user_message_text(messages).unwrap_or_default();
-    let question = user_text.trim();
+    // thinking gate 只需要真实用户问题，不需要 cache-preservation 用的
+    // context reminder；否则会白白烧掉辅助模型 token。
+    let question = strip_system_reminders(&user_text);
+    let question = question.trim();
     if question.is_empty() {
         crate::ai::agent_hang_debug!(
             "pre-fix",
@@ -2667,7 +2674,10 @@ pub async fn classify_intent_via_model(
 ) -> Option<crate::ai::driver::intent_recognition::CoreIntent> {
     use crate::ai::driver::intent_recognition::CoreIntent;
 
-    let q = question.trim();
+    // 意图分类只看用户原始问题，不把 system-reminder / per-turn context
+    // 当作输入，避免辅助模型额外耗 token 且被元上下文误导。
+    let q = strip_system_reminders(question);
+    let q = q.trim();
     if q.is_empty() {
         return None;
     }

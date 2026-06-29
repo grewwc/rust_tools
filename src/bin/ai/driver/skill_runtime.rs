@@ -507,7 +507,8 @@ fn should_use_general_knowledge_mode(
     if skill.is_some() {
         return false;
     }
-    let len = question.trim().chars().count();
+    let cleaned = crate::ai::request::strip_system_reminders(question);
+    let len = cleaned.trim().chars().count();
     if len == 0 || len > 180 {
         return false;
     }
@@ -691,6 +692,22 @@ fn build_project_instruction_prompt() -> Option<String> {
     Some(out)
 }
 
+fn push_project_context(builder: &mut SystemPromptBuilder) {
+    if let Some(project_prompt) = build_project_instruction_prompt() {
+        builder.push(ContextKind::Policy, project_prompt);
+    }
+
+    if let Some(kind) = crate::ai::agents::detect_project_kind_from_cwd() {
+        // 把识别出的项目类型 + 默认构建/测试约定作为 Fact 段注入，
+        // 让 LLM 不必猜测 `cargo` / `npm` / `go` 该用哪个。
+        builder.push_labeled(
+            ContextKind::Fact,
+            "Project Type",
+            kind.prompt_hint().to_string(),
+        );
+    }
+}
+
 fn build_system_prompt(
     active_agent: Option<&AgentManifest>,
     skill: Option<&SkillManifest>,
@@ -750,20 +767,6 @@ fn build_system_prompt(
     b.push(ContextKind::Behavior, "Response style:\n- Lead with answer or action; skip preamble, restatements, and meta-commentary.\n- Default to short, direct prose. Use lists/sections only when they materially improve clarity.\n- Be concise but not at the cost of correctness: verify facts with tools before concluding. When citing code, include file/line.\n- Do not narrate tool calls before/during execution — let their output speak. Brief status lines only at real milestones or when the plan changes.");
     b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Prefer tool-backed evidence over speculation: inspect the relevant sources, artifacts, or system state and use the available tools before concluding.\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
     b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.");
-
-    if let Some(project_prompt) = build_project_instruction_prompt() {
-        b.push(ContextKind::Policy, project_prompt);
-    }
-
-    if let Some(kind) = crate::ai::agents::detect_project_kind_from_cwd() {
-        // 把识别出的项目类型 + 默认构建/测试约定作为 Fact 段注入，
-        // 让 LLM 不必猜测 `cargo` / `npm` / `go` 该用哪个。
-        b.push_labeled(
-            ContextKind::Fact,
-            "Project Type",
-            kind.prompt_hint().to_string(),
-        );
-    }
 
     if has_tool(available_tools, "enable_tools") {
         // Capability catalog（如有）按 trigger→tool 给出事实性精确映射；
@@ -1095,6 +1098,9 @@ fn build_skill_turn_guard(
     let mcp_tools = mcp_tools_for_turn(mcp_client, skill, active_agent.as_ref());
     let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
     let mut builder = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
+    if !general_knowledge_mode {
+        push_project_context(&mut builder);
+    }
     if !app.active_persona.is_default() {
         let mut persona_prompt = format!(
             "Persistent persona:\n- Name: {}\n",
@@ -1276,7 +1282,7 @@ mod tests {
         ContextKind, PreferenceStrength, SystemPromptBuilder, build_project_instruction_prompt,
         build_system_prompt, builtin_tools_for_skill, ensure_required_baseline_tools,
         filter_general_knowledge_tools, filter_mcp_tools_by_allowed_servers,
-        looks_like_follow_up_or_same_topic, merge_with_runtime_enabled_tools,
+        looks_like_follow_up_or_same_topic, merge_with_runtime_enabled_tools, push_project_context,
         resolve_max_iterations, select_mcp_tools, select_skill_with_preference,
         select_skill_with_preference_strength, should_use_general_knowledge_mode,
         tool_uses_mcp_server,
@@ -1373,6 +1379,16 @@ mod tests {
             &seek_solution,
             Some(&skill("debugger", "debug runtime issues"))
         ));
+    }
+
+    #[test]
+    fn general_knowledge_mode_ignores_system_reminder_prefix_length() {
+        let polluted = format!(
+            "<system-reminder>{}</system-reminder>\n\nRust 的 trait 是什么？",
+            "repo context\n".repeat(200)
+        );
+        let intent = UserIntent::new(CoreIntent::QueryConcept);
+        assert!(should_use_general_knowledge_mode(&polluted, &intent, None));
     }
 
     #[test]
@@ -1609,6 +1625,37 @@ mod tests {
         assert!(prompt.contains("Use cargo fmt before commit."));
         assert!(prompt.contains("claude.md"));
         assert!(prompt.contains("Web app uses pnpm."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_context_is_appended_separately_from_base_prompt() {
+        let root = temp_dir("project_context");
+        let nested = root.join("apps/web/src");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("AGENTS.md"), "Use cargo fmt before commit.\n").unwrap();
+
+        let (base_prompt, enriched_prompt, reminder) =
+            SUBAGENT_CWD.sync_scope(nested.clone(), || {
+                let available = SkipSet::new(16);
+                let mut builder = build_system_prompt(None, None, &Box::new(available));
+                let base_prompt = builder.render_system_prompt();
+                push_project_context(&mut builder);
+                let enriched_prompt = builder.render_system_prompt();
+                let reminder = builder.render_context_reminder().unwrap_or_default();
+                (base_prompt, enriched_prompt, reminder)
+            });
+
+        assert!(!base_prompt.contains("Use cargo fmt before commit."));
+        assert!(enriched_prompt.contains("Use cargo fmt before commit."));
+        assert!(reminder.contains("Project Type"));
+        assert!(reminder.contains("Rust project"));
 
         let _ = fs::remove_dir_all(root);
     }

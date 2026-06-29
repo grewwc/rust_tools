@@ -725,6 +725,42 @@ impl TurnObserver for ThinkingOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::test_support::ENV_LOCK;
+    use std::path::PathBuf;
+    use std::sync::MutexGuard;
+
+    struct ScopedMemoryFile {
+        path: PathBuf,
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    impl ScopedMemoryFile {
+        fn new(prefix: &str) -> Self {
+            let guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+            let path = std::env::temp_dir().join(format!(
+                "{}_{}_{}.jsonl",
+                prefix,
+                std::process::id(),
+                uuid::Uuid::new_v4().simple()
+            ));
+            unsafe {
+                std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+            }
+            Self {
+                path,
+                _guard: guard,
+            }
+        }
+    }
+
+    impl Drop for ScopedMemoryFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            unsafe {
+                std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+            }
+        }
+    }
 
     #[test]
     fn explicit_meta_tag_activates_verification() {
@@ -838,7 +874,10 @@ mod tests {
 
     #[test]
     fn on_finalize_runs_self_learning_when_tools_were_called() {
+        let _memory_file = ScopedMemoryFile::new("rt_orch_finalize_work");
         let mut orch = ThinkingOrchestrator::new();
+        orch.generalizer.experience_buffer.clear();
+        orch.generalizer.inject_principles_for_test(Vec::new());
         orch.process_self_note("Do: always validate inputs in async handlers");
         orch.process_self_note("Do: check for None before unwrap in async code");
         orch.process_self_note("Do: verify async results before use");
@@ -849,9 +888,18 @@ mod tests {
                 .to_string(),
             had_tool_calls: true,
         });
-        let _ = output.display_lines;
-        // 工作 turn 不会被提前 return 跳过：final_text 中的 self-note 应被吸收进 buffer。
-        assert!(!orch.generalizer.experience_buffer.is_empty());
+        let retained_experience = !orch.generalizer.experience_buffer.is_empty();
+        let generalized = output
+            .display_lines
+            .iter()
+            .any(|line| line.starts_with("[Thinking] Generalized principle:"));
+        // 工作 turn 不会被提前 return 跳过：final_text 中的 self-note 要么留在 buffer，
+        // 要么被本轮 generalization 正常消费并产出 [Thinking] 行。
+        assert!(
+            retained_experience || generalized,
+            "self-learning turn should either retain buffered experience or generalize it; lines={:?}",
+            output.display_lines,
+        );
     }
 
     #[test]

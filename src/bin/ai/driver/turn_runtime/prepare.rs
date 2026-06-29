@@ -41,7 +41,8 @@ struct QuestionShape {
 
 impl QuestionShape {
     fn analyze(question: &str) -> Self {
-        let trimmed = question.trim();
+        let cleaned = request::strip_system_reminders(question);
+        let trimmed = cleaned.trim();
         let mut shape = QuestionShape {
             char_count: trimmed.chars().count(),
             has_code_fence: trimmed.contains("```"),
@@ -429,8 +430,7 @@ pub(super) async fn prepare_turn(
         &recall_intent,
         matched_skill_name.as_deref(),
         skip_recall_for_skill_context,
-    )
-        && let Some(code_discovery_recall) = build_session_code_discovery_recall(app, &history)
+    ) && let Some(code_discovery_recall) = build_session_code_discovery_recall(app, &history)
     {
         println!(
             "{} session={}",
@@ -781,11 +781,11 @@ fn code_discovery_record_from_memory_entry(
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_session_code_discovery_records, extract_existing_code_discoveries,
-        high_confidence_project_memory_policy, looks_like_code_or_repo_question,
-        recalled_knowledge_usage_policy, render_session_code_discovery_recall,
-        should_inject_integrated_reflection, should_run_general_recall,
-        should_run_session_code_discovery_recall,
+        collect_session_code_discovery_records, detect_complex_task,
+        extract_existing_code_discoveries, high_confidence_project_memory_policy,
+        looks_like_code_or_repo_question, recalled_knowledge_usage_policy,
+        render_session_code_discovery_recall, should_inject_integrated_reflection,
+        should_run_general_recall, should_run_session_code_discovery_recall,
     };
     use crate::ai::code_discovery_policy::parse_record_line;
     use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
@@ -1004,6 +1004,16 @@ mod tests {
     #[test]
     fn numeric_decimal_does_not_count_as_code_or_repo_artifact() {
         assert!(!looks_like_code_or_repo_question("圆周率约等于 3.14"));
+    }
+
+    #[test]
+    fn system_reminder_pollution_does_not_turn_greeting_into_complex_task() {
+        let polluted = format!(
+            "<system-reminder>{}</system-reminder>\n\nhi",
+            "src/bin/ai/driver/skill_runtime.rs\n".repeat(200)
+        );
+        assert!(!detect_complex_task(&polluted));
+        assert!(!looks_like_code_or_repo_question(&polluted));
     }
 
     #[test]

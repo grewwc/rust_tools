@@ -1293,12 +1293,19 @@ mod tests {
     };
     use crate::ai::test_support::ENV_LOCK;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
-    use aios_kernel::kernel::{KernelInternal, Syscall};
     use chrono::Local;
+    use std::sync::MutexGuard;
+
+    fn env_lock_guard() -> MutexGuard<'static, ()> {
+        // 这里的锁只用于串行化环境变量 / GLOBAL_OS 相关测试。
+        // 即使前一个 case 因断言失败而 poison，也不该让后续 case
+        // 失真成 PoisonError，从而掩盖真正的首发问题。
+        ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
 
     #[test]
     fn memory_save_assigns_id_and_update_rewrites_entry() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock_guard();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1349,7 +1356,7 @@ mod tests {
 
     #[test]
     fn memory_save_common_sense_defaults_to_persistent_priority_and_can_delete() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock_guard();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1360,7 +1367,7 @@ mod tests {
         }
 
         let save_args = serde_json::json!({
-            "content": "Files should end with a trailing newline",
+            "content": "Files should end with a trailing newline before write_file commits the edit",
             "category": "common_sense",
             "tags": ["editing"]
         });
@@ -1388,7 +1395,7 @@ mod tests {
 
     #[test]
     fn memo_update_preserves_id_and_replaces_note() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock_guard();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1442,7 +1449,7 @@ mod tests {
 
     #[test]
     fn memory_save_defaults_to_short_term_self_note() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock_guard();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1469,7 +1476,7 @@ mod tests {
 
     #[test]
     fn memory_save_downgrades_low_signal_long_term_entries_to_self_note() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock_guard();
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1559,9 +1566,9 @@ mod tests {
 
     #[test]
     fn memory_visibility_same_process_group() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock_guard();
         let kernel = crate::ai::driver::new_local_kernel();
-        let (root, child_a, child_b) = {
+        let (_root, child_a, child_b) = {
             let mut os = kernel.lock().unwrap();
             let root =
                 os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None);
@@ -1617,7 +1624,7 @@ mod tests {
 
     #[test]
     fn memory_visibility_ancestor_sees_descendant() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock_guard();
         let kernel = crate::ai::driver::new_local_kernel();
         let (root, child) = {
             let mut os = kernel.lock().unwrap();
@@ -1662,7 +1669,7 @@ mod tests {
 
     #[test]
     fn memory_visibility_unrelated_process_blocked() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock_guard();
         let kernel = crate::ai::driver::new_local_kernel();
         let (child_a, child_b) = {
             let mut os = kernel.lock().unwrap();

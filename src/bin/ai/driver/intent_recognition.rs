@@ -86,10 +86,15 @@ pub async fn upgrade_intent_via_model(
     if local.core != CoreIntent::Casual {
         return local;
     }
-    if !looks_non_casual(question) {
+    let clean_question = crate::ai::request::strip_system_reminders(question);
+    let clean_question = clean_question.trim();
+    if clean_question.is_empty() {
         return local;
     }
-    match crate::ai::request::classify_intent_via_model(app, question).await {
+    if !looks_non_casual(clean_question) {
+        return local;
+    }
+    match crate::ai::request::classify_intent_via_model(app, clean_question).await {
         Some(core) => UserIntent {
             core,
             modifiers: local.modifiers,
@@ -236,5 +241,16 @@ mod tests {
         assert!(!intent.is_search_query());
         assert!(intent.modifiers.target_resource.is_none());
         assert!(!intent.modifiers.negation);
+    }
+
+    #[test]
+    fn system_reminder_polluted_greeting_is_not_non_casual() {
+        let polluted = format!(
+            "<system-reminder>{}</system-reminder>\n\nhi",
+            "src/bin/ai/driver/skill_runtime.rs\n".repeat(200)
+        );
+        assert!(!looks_non_casual(
+            crate::ai::request::strip_system_reminders(&polluted).trim()
+        ));
     }
 }

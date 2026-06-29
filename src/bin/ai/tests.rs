@@ -37,6 +37,18 @@ fn any_vl_model_name() -> String {
     vl_model_name_at(0).unwrap_or_else(any_model_name)
 }
 
+fn vl_model_handle_at(index: usize) -> Option<String> {
+    super::model_names::all()
+        .iter()
+        .filter(|m| m.is_vl)
+        .nth(index)
+        .map(|m| super::model_names::model_handle(m))
+}
+
+fn any_vl_model_handle() -> String {
+    vl_model_handle_at(0).unwrap_or_else(any_model_name)
+}
+
 fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::App {
     super::types::App {
         cli: super::cli::ParsedCli::default(),
@@ -316,19 +328,19 @@ fn determine_vl_model_supports_selector_and_fuzzy_name() {
     // 两条路径并不等价，这里分别按各自的不变量来断言，避免硬编码具体模型名。
     let empty = models::determine_vl_model("");
     let zero = models::determine_vl_model("0");
-    let first_vl = any_vl_model_name();
+    let first_vl = any_vl_model_handle();
     assert_eq!(
         zero, first_vl,
         "selector \"0\" should pick first VL in models.json"
     );
     // empty 仅要求是 VL 模型即可（best-by-tier 可能与 first_vl 不同）。
     assert!(
-        super::model_names::find_by_name(&empty)
+        super::model_names::find_by_identifier(&empty)
             .map(|m| m.is_vl)
             .unwrap_or(false)
     );
 
-    if let Some(vl1) = vl_model_name_at(1) {
+    if let Some(vl1) = vl_model_handle_at(1) {
         assert_eq!(models::determine_vl_model("1"), vl1);
     } else {
         // 越界时回退到 default_vl_model
