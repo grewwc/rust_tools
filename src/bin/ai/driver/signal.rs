@@ -34,6 +34,39 @@ static FOREGROUND_SUBAGENTS: LazyLock<Mutex<Vec<ForegroundSubagent>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 static FOREGROUND_SUBAGENT_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// 前台 turn 是否正在执行。由前台 `run_turn` 通过 `ForegroundTurnGuard` 抬起，
+/// 覆盖 prepare / 思考 / 模型流 / 工具执行 / mid-turn 压缩 / 阶段切换的整个生命周期。
+///
+/// `app.streaming` 只在「模型流」和「工具执行」两个子阶段抬起，阶段之间以及
+/// prepare / 压缩 / 思考期间为 false。仅凭 streaming 判定会让这些空窗里的
+/// Ctrl+C 落入 `Shutdown` 分支、直接退出整个交互式会话。该标志补齐「当前有前台
+/// turn 在跑」这一事实，使空窗里的 Ctrl+C 也走「取消本轮」而非「退出会话」。
+///
+/// 子 agent（sync / background）各自持有私有标志，且其 `run_turn` 不抬此标志，
+/// 因此该标志只反映「前台主 turn」的活动状态。
+static FOREGROUND_TURN_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// RAII 守卫：前台 `run_turn` 进入时抬起 `FOREGROUND_TURN_ACTIVE`，
+/// drop（正常返回 / 提前 return / panic）时落下，保证标志不泄漏陈旧状态。
+pub(in crate::ai) struct ForegroundTurnGuard;
+
+impl ForegroundTurnGuard {
+    pub(in crate::ai) fn enter() -> Self {
+        FOREGROUND_TURN_ACTIVE.store(true, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ForegroundTurnGuard {
+    fn drop(&mut self) {
+        FOREGROUND_TURN_ACTIVE.store(false, Ordering::Relaxed);
+    }
+}
+
+fn foreground_turn_active() -> bool {
+    FOREGROUND_TURN_ACTIVE.load(Ordering::Relaxed)
+}
+
 /// RAII 守卫：`execute_sync_task` 派发前台子 agent 时注册其 cancel 标志，
 /// drop（含 panic / 提前 return）时自动注销，保证注册表不泄漏陈旧条目。
 pub(in crate::ai) struct ForegroundSubagentGuard {
@@ -110,7 +143,7 @@ pub(in crate::ai) fn handle_sigint(
     if !shutdown.load(Ordering::Relaxed) && try_cancel_foreground_subagent() {
         return;
     }
-    match sigint_action(shutdown, streaming, cancel_stream) {
+    match sigint_action(shutdown, streaming, cancel_stream, foreground_turn_active()) {
         SigintAction::CancelStream => {
             crate::ai::tools::registry::common::request_tool_cancel();
             cancel_stream.store(true, Ordering::Relaxed);
@@ -295,10 +328,15 @@ pub(in crate::ai) fn sigint_action(
     shutdown: &AtomicBool,
     streaming: &AtomicBool,
     _cancel_stream: &AtomicBool,
+    foreground_turn_active: bool,
 ) -> SigintAction {
     if shutdown.load(Ordering::Relaxed) {
         SigintAction::Exit
-    } else if streaming.load(Ordering::Relaxed) {
+    } else if streaming.load(Ordering::Relaxed) || foreground_turn_active {
+        // streaming：模型流 / 工具执行子阶段。
+        // foreground_turn_active：补齐 prepare / 思考 / 阶段切换 / mid-turn 压缩
+        // 等 streaming=false 的空窗——只要前台 turn 在跑，Ctrl+C 一律取消本轮，
+        // 绝不退出会话；退出语义留给「空闲态」（无 turn 在跑）的 Ctrl+C。
         SigintAction::CancelStream
     } else {
         SigintAction::Shutdown
@@ -308,7 +346,8 @@ pub(in crate::ai) fn sigint_action(
 #[cfg(test)]
 mod tests {
     use super::{
-        ForegroundSubagentGuard, SigintAction, sigint_action, try_cancel_foreground_subagent,
+        ForegroundSubagentGuard, ForegroundTurnGuard, SigintAction, foreground_turn_active,
+        sigint_action, try_cancel_foreground_subagent,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -319,7 +358,7 @@ mod tests {
         let streaming = AtomicBool::new(true);
         let cancel_stream = AtomicBool::new(false);
         assert_eq!(
-            sigint_action(&shutdown, &streaming, &cancel_stream),
+            sigint_action(&shutdown, &streaming, &cancel_stream, false),
             SigintAction::CancelStream
         );
     }
@@ -330,7 +369,7 @@ mod tests {
         let streaming = AtomicBool::new(false);
         let cancel_stream = AtomicBool::new(false);
         assert_eq!(
-            sigint_action(&shutdown, &streaming, &cancel_stream),
+            sigint_action(&shutdown, &streaming, &cancel_stream, false),
             SigintAction::Shutdown
         );
     }
@@ -341,8 +380,21 @@ mod tests {
         let streaming = AtomicBool::new(false);
         let cancel_stream = AtomicBool::new(true);
         assert_eq!(
-            sigint_action(&shutdown, &streaming, &cancel_stream),
+            sigint_action(&shutdown, &streaming, &cancel_stream, false),
             SigintAction::Shutdown
+        );
+    }
+
+    #[test]
+    fn sigint_cancels_during_non_streaming_turn_gap() {
+        // prepare / 思考 / 阶段切换 / mid-turn 压缩等空窗：streaming=false 但前台
+        // turn 仍在跑。此时 Ctrl+C 必须取消本轮、绝不退出会话。
+        let shutdown = AtomicBool::new(false);
+        let streaming = AtomicBool::new(false);
+        let cancel_stream = AtomicBool::new(false);
+        assert_eq!(
+            sigint_action(&shutdown, &streaming, &cancel_stream, true),
+            SigintAction::CancelStream
         );
     }
 
@@ -352,15 +404,26 @@ mod tests {
         let streaming = AtomicBool::new(false);
         let cancel_stream = AtomicBool::new(false);
         assert_eq!(
-            sigint_action(&shutdown, &streaming, &cancel_stream),
+            sigint_action(&shutdown, &streaming, &cancel_stream, false),
             SigintAction::Exit
         );
 
         streaming.store(true, Ordering::Relaxed);
         assert_eq!(
-            sigint_action(&shutdown, &streaming, &cancel_stream),
+            sigint_action(&shutdown, &streaming, &cancel_stream, true),
             SigintAction::Exit
         );
+    }
+
+    #[test]
+    fn foreground_turn_guard_toggles_active_flag() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        assert!(!foreground_turn_active());
+        {
+            let _turn = ForegroundTurnGuard::enter();
+            assert!(foreground_turn_active());
+        }
+        assert!(!foreground_turn_active());
     }
 
     #[test]

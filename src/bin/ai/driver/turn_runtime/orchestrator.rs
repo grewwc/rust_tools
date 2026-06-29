@@ -391,6 +391,12 @@ pub(in crate::ai::driver) async fn run_turn(
     // 进入时的 history 长度，全 session 内单调递增）。
     let session_id = app.session_id.clone();
     let turn_id = history_count;
+    // 仅前台主 turn 抬起「turn 活动」标志：子 agent（sync / background）持有私有
+    // 信号标志，且都通过 SUBAGENT_RESULT_SLOT 作用域执行，据此排除。该标志让
+    // prepare / 思考 / 阶段切换 / mid-turn 压缩等 streaming=false 的空窗里的
+    // Ctrl+C 也走「取消本轮」而非「退出会话」。guard 随本 future drop 自动落下。
+    let _foreground_turn_guard = (!crate::ai::driver::runtime_ctx::has_subagent_result_slot())
+        .then(crate::ai::driver::signal::ForegroundTurnGuard::enter);
     crate::ai::driver::runtime_ctx::TURN_IDENTITY
         .scope(
             (session_id, turn_id),
