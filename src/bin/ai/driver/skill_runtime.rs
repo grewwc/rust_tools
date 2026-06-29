@@ -931,8 +931,10 @@ fn select_skill_with_preference_strength<'a>(
     let threshold = skill_selection_threshold(intent, skill_manifests.len());
     let preferred =
         preferred_skill_name.and_then(|name| ranked.iter().find(|item| item.skill.name == name));
+    let best_is_valid = !should_abstain_from_skill(best, intent);
 
     if let Some(current) = preferred {
+        let current_is_valid = !should_abstain_from_skill(current, intent);
         let (
             sticky_bonus,
             keep_floor_delta,
@@ -955,10 +957,13 @@ fn select_skill_with_preference_strength<'a>(
                 true,
             ),
         };
-        let current_has_signal =
-            current.score >= (threshold - keep_floor_delta).max(0.0) || has_skill_signal(current);
+        let current_has_signal = current_is_valid
+            && (current.score >= (threshold - keep_floor_delta).max(0.0)
+                || has_skill_signal(current));
         if best.skill.name == current.skill.name {
-            return if keep_current_when_best || current.score >= threshold || current_has_signal {
+            return if current_is_valid
+                && (keep_current_when_best || current.score >= threshold || current_has_signal)
+            {
                 Some(current.skill)
             } else {
                 None
@@ -967,7 +972,7 @@ fn select_skill_with_preference_strength<'a>(
 
         let effective_current = current.score + sticky_bonus;
         let best_clearly_wins = best.score >= effective_current + switch_margin;
-        let best_has_positive_signal = is_positive_skill_winner(best);
+        let best_has_positive_signal = best_is_valid && is_positive_skill_winner(best);
         let allow_switch = match strength {
             PreferenceStrength::StrongSticky => best_clearly_wins && best_has_positive_signal,
             PreferenceStrength::CrossTurnBias => best_clearly_wins,
@@ -975,13 +980,13 @@ fn select_skill_with_preference_strength<'a>(
         if allow_switch {
             return Some(best.skill);
         }
-        if keep_below_threshold && best.score < threshold {
+        if keep_below_threshold && best.score < threshold && current_is_valid {
             return Some(current.skill);
         }
         if current_has_signal && !best_clearly_wins {
             return Some(current.skill);
         }
-        if best.score >= threshold {
+        if best_is_valid && best.score >= threshold {
             return Some(best.skill);
         }
         if current_has_signal {
@@ -990,7 +995,7 @@ fn select_skill_with_preference_strength<'a>(
         return None;
     }
 
-    if should_abstain_from_skill(best) {
+    if !best_is_valid {
         return None;
     }
     (best.score >= threshold).then_some(best.skill)
@@ -1000,16 +1005,50 @@ fn has_skill_signal(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
     item.embedding_score >= 0.08
         || item.fallback_semantic_score >= 0.08
         || item.blended_score >= 0.08
+        || non_identity_skill_signal(item) >= 0.08
 }
 
 fn is_positive_skill_winner(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
     item.embedding_score >= 0.30
         || item.fallback_semantic_score >= 0.15
         || item.blended_score >= 0.30
+        || non_identity_skill_signal(item) >= 0.15
 }
 
-fn should_abstain_from_skill(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
-    item.blended_score < 0.08
+fn identity_skill_signal(item: &super::skill_ranking::ScoredSkill<'_>) -> f64 {
+    item.embedding_identity_score
+        .max(item.fallback_identity_score)
+}
+
+fn non_identity_skill_signal(item: &super::skill_ranking::ScoredSkill<'_>) -> f64 {
+    item.embedding_capability_score
+        .max(item.embedding_behavior_score)
+        .max(item.fallback_capability_score)
+        .max(item.fallback_behavior_score)
+        .max(item.model_prior_score)
+}
+
+fn should_abstain_from_skill(
+    item: &super::skill_ranking::ScoredSkill<'_>,
+    intent: &UserIntent,
+) -> bool {
+    if matches!(
+        intent.core,
+        intent_recognition::CoreIntent::QueryConcept | intent_recognition::CoreIntent::Casual
+    ) {
+        return true;
+    }
+
+    let identity_signal = identity_skill_signal(item);
+    let non_identity_signal = non_identity_skill_signal(item);
+    let likely_identity_only_match = identity_signal >= 0.12
+        && non_identity_signal < 0.12
+        && non_identity_signal + 0.04 < identity_signal;
+
+    matches!(intent.core, intent_recognition::CoreIntent::SeekSolution)
+        && likely_identity_only_match
+        && item.none_score >= item.model_prior_score + 0.08
+        && non_identity_signal < 0.10
 }
 
 #[crate::ai::agent_hang_span(
@@ -1591,7 +1630,6 @@ mod tests {
             version: "1.0.0".to_string(),
             description: description.to_string(),
             author: None,
-            triggers: Vec::new(),
             tools: Vec::new(),
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),
@@ -1605,6 +1643,12 @@ mod tests {
             source_path: Some(format!("builtin:{name}.skill")),
             resource_path: None,
         }
+    }
+
+    fn skill_with_prompt(name: &str, description: &str, prompt: &str) -> SkillManifest {
+        let mut skill = skill(name, description);
+        skill.prompt = prompt.to_string();
+        skill
     }
 
     fn agent(name: &str, mcp_servers: Vec<&str>) -> AgentManifest {
@@ -1864,6 +1908,54 @@ mod tests {
             &model_path(),
         );
         assert_eq!(selected.map(|item| item.name.as_str()), Some("debugger"));
+    }
+
+    #[test]
+    fn local_selector_abstains_from_skill_metadata_lookup_even_when_name_matches() {
+        let intent = UserIntent::new(CoreIntent::QueryConcept);
+        let skills = vec![
+            skill_with_prompt(
+                "skill-creator",
+                "Create new skills and skill templates for the workspace",
+                "Use this skill when the user wants to create or add a new skill to the workspace.",
+            ),
+            skill("debugger", "Debug runtime failures and collect traces"),
+        ];
+        let selected = select_skill_with_preference(
+            &skills,
+            "skill-creator 这个 skill 在哪里？",
+            &intent,
+            None,
+            &model_path(),
+        );
+        assert!(
+            selected.is_none(),
+            "metadata lookup should not auto-activate a skill"
+        );
+    }
+
+    #[test]
+    fn local_selector_still_routes_skill_creator_like_skill_for_creation_request() {
+        let intent = UserIntent::new(CoreIntent::RequestAction);
+        let skills = vec![
+            skill_with_prompt(
+                "skill-creator",
+                "Create new skills and skill templates for the workspace",
+                "Use this skill when the user wants to create or add a new skill to the workspace.",
+            ),
+            skill("debugger", "Debug runtime failures and collect traces"),
+        ];
+        let selected = select_skill_with_preference(
+            &skills,
+            "帮我创建一个新的 CI skill 模板",
+            &intent,
+            None,
+            &model_path(),
+        );
+        assert_eq!(
+            selected.map(|item| item.name.as_str()),
+            Some("skill-creator")
+        );
     }
 
     #[test]

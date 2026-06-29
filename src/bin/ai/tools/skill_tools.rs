@@ -68,7 +68,6 @@ fn skill_matches_query(skill: &SkillManifest, query: &str) -> bool {
 }
 
 fn skill_search_haystack(skill: &SkillManifest) -> String {
-    // triggers 不再参与任何匹配/检索：关键词堆砌跨语言失效，且容易误导。
     // 检索仅基于 name/description/能力字段等真实语义来源。
     let mut parts = vec![
         skill.name.clone(),
@@ -109,9 +108,6 @@ fn summarize_skill(skill: &SkillManifest, include_capabilities: bool) -> String 
         if !skill.tools.is_empty() {
             line.push_str(&format!(" | tools={}", skill.tools.join(",")));
         }
-        if !skill.triggers.is_empty() {
-            line.push_str(&format!(" | triggers={}", skill.triggers.join(",")));
-        }
         if !skill.tool_groups.is_empty() {
             line.push_str(&format!(" | tool_groups={}", skill.tool_groups.join(",")));
         }
@@ -151,7 +147,11 @@ fn render_discovered_skills(
     if query.is_empty() {
         lines.push(format!("{} skills available:", skills.len()));
     } else {
-        lines.push(format!("{} skills matched query '{}':", skills.len(), query));
+        lines.push(format!(
+            "{} skills matched query '{}':",
+            skills.len(),
+            query
+        ));
     }
     lines.extend(
         skills
@@ -179,7 +179,11 @@ pub(crate) fn execute_discover_skills(args: &Value) -> Result<String, String> {
         if listed.is_empty() {
             return Ok("No skills are currently available.".to_string());
         }
-        return Ok(render_discovered_skills(&listed, query, include_capabilities));
+        return Ok(render_discovered_skills(
+            &listed,
+            query,
+            include_capabilities,
+        ));
     }
 
     // 非空 query：复用自动路由的语义打分器（embedding + 运行时 TF-IDF + 预训练
@@ -199,7 +203,11 @@ pub(crate) fn execute_discover_skills(args: &Value) -> Result<String, String> {
         return Ok(format!("No skills matched query '{}'.", query));
     }
 
-    Ok(render_discovered_skills(&matched, query, include_capabilities))
+    Ok(render_discovered_skills(
+        &matched,
+        query,
+        include_capabilities,
+    ))
 }
 
 inventory::submit!(ToolRegistration {
@@ -287,11 +295,6 @@ fn params_save_skill() -> Value {
             "system_prompt": {
                 "type": "string",
                 "description": "Optional additional system prompt text to include in the YAML front matter."
-            },
-            "triggers": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Trigger phrases used for matching this skill."
             },
             "tools": {
                 "type": "array",
@@ -420,7 +423,6 @@ fn build_skill_file_content(args: &Value) -> Result<String, String> {
     let version = args["version"].as_str().unwrap_or("1.0.0").trim();
     let system_prompt = args["system_prompt"].as_str().unwrap_or("").trim();
     let priority = args["priority"].as_i64().unwrap_or(0);
-    let triggers = parse_string_array(&args["triggers"]);
     let tools = parse_string_array(&args["tools"]);
     let tool_groups = parse_string_array(&args["tool_groups"]);
     let mcp_servers = parse_string_array(&args["mcp_servers"]);
@@ -439,7 +441,6 @@ fn build_skill_file_content(args: &Value) -> Result<String, String> {
     if priority != 0 {
         out.push_str(&format!("priority: {priority}\n"));
     }
-    render_string_list_field(&mut out, "triggers", &triggers);
     render_string_list_field(&mut out, "tools", &tools);
     render_string_list_field(&mut out, "tool_groups", &tool_groups);
     render_string_list_field(&mut out, "mcp_servers", &mcp_servers);
@@ -667,8 +668,8 @@ inventory::submit!(ToolRegistration {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_activate_skill, execute_discover_skills, query_tokens, skill_matches_query,
-        take_pending_skill_activation,
+        build_skill_file_content, execute_activate_skill, execute_discover_skills, query_tokens,
+        skill_matches_query, take_pending_skill_activation,
     };
     use crate::ai::skills::SkillManifest;
     use std::sync::{LazyLock, Mutex};
@@ -775,13 +776,27 @@ mod tests {
         assert!(take_pending_skill_activation().is_none());
     }
 
+    #[test]
+    fn save_skill_ignores_legacy_triggers_argument() {
+        let out = build_skill_file_content(&serde_json::json!({
+            "name": "demo-skill",
+            "description": "demo",
+            "prompt": "body",
+            "triggers": ["legacy", "exact-match"],
+            "tools": ["read_file"]
+        }))
+        .unwrap();
+        assert!(out.contains("name: \"demo-skill\""));
+        assert!(out.contains("tools:\n  - \"read_file\""));
+        assert!(!out.contains("triggers:"));
+    }
+
     fn test_skill(name: &str, description: &str) -> SkillManifest {
         SkillManifest {
             name: name.to_string(),
             version: "1.0.0".to_string(),
             description: description.to_string(),
             author: None,
-            triggers: Vec::new(),
             tools: Vec::new(),
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),

@@ -68,8 +68,6 @@ pub(super) struct SkillManifest {
     #[serde(default)]
     pub(super) author: Option<String>,
     #[serde(default)]
-    pub(super) triggers: Vec<String>,
-    #[serde(default)]
     pub(super) tools: Vec<String>,
     #[serde(default)]
     pub(super) tool_groups: Vec<String>,
@@ -118,7 +116,6 @@ impl SkillManifest {
             "version": self.version,
             "description": self.description,
             "author": self.author,
-            "triggers": self.triggers,
             "tools": self.tools,
             "tool_groups": self.tool_groups,
             "mcp_servers": self.mcp_servers,
@@ -238,7 +235,6 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
     let mut version: Option<String> = None;
     let mut description: Option<String> = None;
     let mut author: Option<String> = None;
-    let mut triggers: Vec<String> = Vec::new();
     let mut tools: Vec<String> = Vec::new();
     let mut tool_groups: Vec<String> = Vec::new();
     let mut mcp_servers: Vec<String> = Vec::new();
@@ -276,7 +272,6 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
                 }
                 match key {
                     "tools" => tools.push(v),
-                    "triggers" => triggers.push(v),
                     "tool_groups" => tool_groups.push(v),
                     "mcp_servers" => mcp_servers.push(v),
                     "excludes" => excludes.push(v),
@@ -304,7 +299,6 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
                 "version" => version = Some(unquoted.to_string()),
                 "description" => description = Some(unquoted.to_string()),
                 "author" => author = Some(unquoted.to_string()),
-                "triggers" => triggers = parse_list_value(unquoted),
                 "skip_recall" => skip_recall = parse_bool_value(unquoted).unwrap_or(false),
                 "disable_builtin_tools" => {
                     disable_builtin_tools = parse_bool_value(unquoted).unwrap_or(false)
@@ -341,7 +335,6 @@ fn parse_skill_front_matter(content: &str) -> Result<SkillManifest, String> {
         version: version.unwrap_or_else(default_skill_version),
         description: description.unwrap_or_default(),
         author: author.filter(|s| !s.trim().is_empty()),
-        triggers,
         tools,
         tool_groups,
         mcp_servers,
@@ -788,6 +781,26 @@ test prompt"#;
         assert_eq!(skill.description, "test skill for helping users");
         assert_eq!(skill.tools, vec!["read_file", "write_file"]);
         assert_eq!(skill.priority, 50);
+    }
+
+    #[test]
+    fn parse_skill_front_matter_ignores_legacy_triggers_field() {
+        let content = r#"---
+name: test-skill
+description: test skill for helping users
+triggers:
+  - exact phrase
+  - another trigger
+tools:
+  - read_file
+---
+
+test prompt"#;
+
+        let skill = parse_skill_front_matter(content).unwrap();
+        assert_eq!(skill.name, "test-skill");
+        assert_eq!(skill.description, "test skill for helping users");
+        assert_eq!(skill.tools, vec!["read_file"]);
     }
 
     #[test]

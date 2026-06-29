@@ -14,7 +14,7 @@ use super::{
         document::SkillEmbeddingDocument,
         index::{SkillEmbeddingHit, SkillEmbeddingIndex},
     },
-    intent_excludes_all_skills, normalize_text_for_similarity, skill_match_model,
+    normalize_text_for_similarity, skill_match_model,
 };
 
 const LOCAL_MODEL_SCORE_SCALE: f64 = 8.0;
@@ -33,6 +33,9 @@ pub struct ScoredSkill<'a> {
     pub embedding_capability_score: f64,
     pub embedding_behavior_score: f64,
     pub fallback_semantic_score: f64,
+    pub fallback_identity_score: f64,
+    pub fallback_capability_score: f64,
+    pub fallback_behavior_score: f64,
     pub model_prior_score: f64,
     pub blended_score: f64,
     pub none_score: f64,
@@ -54,16 +57,10 @@ pub fn rank_skills_locally<'a>(
 pub fn rank_skills_locally_with_model_path<'a>(
     skills: &'a [SkillManifest],
     input: &str,
-    intent: Option<&UserIntent>,
+    _intent: Option<&UserIntent>,
     model_path: &Path,
 ) -> Vec<ScoredSkill<'a>> {
     if input.trim().is_empty() || skills.is_empty() {
-        return Vec::new();
-    }
-
-    if let Some(intent_ref) = intent
-        && intent_excludes_all_skills(intent_ref)
-    {
         return Vec::new();
     }
 
@@ -78,8 +75,8 @@ pub fn rank_skills_locally_with_model_path<'a>(
             Some(result) => probability_for_label(result, &skill.name),
             None => 0.0,
         };
-        let fallback_semantic_score =
-            runtime_model.similarity(skill.name.as_str(), &query_features);
+        let fallback_scores = runtime_model.similarity(skill.name.as_str(), &query_features);
+        let fallback_semantic_score = fallback_scores.combined;
         let (
             embedding_score,
             embedding_identity_score,
@@ -112,6 +109,9 @@ pub fn rank_skills_locally_with_model_path<'a>(
             embedding_capability_score,
             embedding_behavior_score,
             fallback_semantic_score,
+            fallback_identity_score: fallback_scores.identity,
+            fallback_capability_score: fallback_scores.capability,
+            fallback_behavior_score: fallback_scores.behavior,
             model_prior_score,
             blended_score,
             none_score,
@@ -161,8 +161,26 @@ fn skill_embedding_routing_enabled() -> bool {
 }
 
 struct RuntimeSkillModel {
-    docs: FxHashMap<String, FxHashMap<String, f64>>,
-    idf: FxHashMap<String, f64>,
+    docs: FxHashMap<String, RuntimeSkillDocSet>,
+    combined_idf: FxHashMap<String, f64>,
+    identity_idf: FxHashMap<String, f64>,
+    capability_idf: FxHashMap<String, f64>,
+    behavior_idf: FxHashMap<String, f64>,
+}
+
+struct RuntimeSkillDocSet {
+    combined: FxHashMap<String, f64>,
+    identity: FxHashMap<String, f64>,
+    capability: FxHashMap<String, f64>,
+    behavior: FxHashMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeSkillSimilarity {
+    combined: f64,
+    identity: f64,
+    capability: f64,
+    behavior: f64,
 }
 
 impl RuntimeSkillModel {
@@ -187,23 +205,59 @@ impl RuntimeSkillModel {
     fn build(skills: &[SkillManifest]) -> Self {
         let mut docs = FxHashMap::default();
         for skill in skills {
-            let text = skill_document_text(skill);
-            let features = TextSimilarityFeatures::from_text(&text);
-            docs.insert(skill.name.clone(), features.ngram_tf);
+            let combined = TextSimilarityFeatures::from_text(&skill_document_text(skill)).ngram_tf;
+            let identity = TextSimilarityFeatures::from_text(&skill_identity_text(skill)).ngram_tf;
+            let capability =
+                TextSimilarityFeatures::from_text(&skill_capability_text(skill)).ngram_tf;
+            let behavior = TextSimilarityFeatures::from_text(&skill_behavior_text(skill)).ngram_tf;
+            docs.insert(
+                skill.name.clone(),
+                RuntimeSkillDocSet {
+                    combined,
+                    identity,
+                    capability,
+                    behavior,
+                },
+            );
         }
-        let doc_refs = docs.values().collect::<Vec<_>>();
-        let idf = build_idf_from_documents(&doc_refs);
-        Self { docs, idf }
+        let combined_refs = docs.values().map(|doc| &doc.combined).collect::<Vec<_>>();
+        let identity_refs = docs.values().map(|doc| &doc.identity).collect::<Vec<_>>();
+        let capability_refs = docs.values().map(|doc| &doc.capability).collect::<Vec<_>>();
+        let behavior_refs = docs.values().map(|doc| &doc.behavior).collect::<Vec<_>>();
+        let combined_idf = build_idf_from_documents(&combined_refs);
+        let identity_idf = build_idf_from_documents(&identity_refs);
+        let capability_idf = build_idf_from_documents(&capability_refs);
+        let behavior_idf = build_idf_from_documents(&behavior_refs);
+        Self {
+            docs,
+            combined_idf,
+            identity_idf,
+            capability_idf,
+            behavior_idf,
+        }
     }
 
-    fn similarity(&self, skill_name: &str, query: &TextSimilarityFeatures) -> f64 {
+    fn similarity(
+        &self,
+        skill_name: &str,
+        query: &TextSimilarityFeatures,
+    ) -> RuntimeSkillSimilarity {
         if query.ngram_tf.is_empty() {
-            return 0.0;
+            return RuntimeSkillSimilarity::default();
         }
         let Some(doc) = self.docs.get(skill_name) else {
-            return 0.0;
+            return RuntimeSkillSimilarity::default();
         };
-        cosine_tfidf_similarity(&query.ngram_tf, doc, &self.idf)
+        RuntimeSkillSimilarity {
+            combined: cosine_tfidf_similarity(&query.ngram_tf, &doc.combined, &self.combined_idf),
+            identity: cosine_tfidf_similarity(&query.ngram_tf, &doc.identity, &self.identity_idf),
+            capability: cosine_tfidf_similarity(
+                &query.ngram_tf,
+                &doc.capability,
+                &self.capability_idf,
+            ),
+            behavior: cosine_tfidf_similarity(&query.ngram_tf, &doc.behavior, &self.behavior_idf),
+        }
     }
 }
 
@@ -219,8 +273,8 @@ fn runtime_skill_model_cache_key(skills: &[SkillManifest]) -> String {
 fn skill_document_text(skill: &SkillManifest) -> String {
     // 匹配文档以 name + description 为主：description 是 skill 的核心语义字段，
     // 这里重复一次以提升其在 n-gram TF-IDF 中的权重，避免被其他字段稀释。
-    // 刻意不再拼接 source_path（纯路径噪音）与 triggers（关键词堆砌、跨语言失效），
-    // prompt 也只保留很短的前缀，防止长 prompt 主导 n-gram 空间。
+    // 刻意不再拼接 source_path（纯路径噪音），prompt 也只保留很短的前缀，
+    // 防止长 prompt 主导 n-gram 空间。
     let mut parts = vec![
         skill.name.clone(),
         skill.description.clone(),
@@ -241,29 +295,45 @@ fn skill_document_text(skill: &SkillManifest) -> String {
     normalize_text_for_similarity(&parts.join("\n"))
 }
 
+fn skill_identity_text(skill: &SkillManifest) -> String {
+    normalize_text_for_similarity(&skill.name)
+}
+
+fn skill_capability_text(skill: &SkillManifest) -> String {
+    let mut parts = Vec::new();
+    if !skill.description.trim().is_empty() {
+        parts.push(skill.description.clone());
+    }
+    if !skill.tools.is_empty() {
+        parts.push(skill.tools.join(" "));
+    }
+    if !skill.tool_groups.is_empty() {
+        parts.push(skill.tool_groups.join(" "));
+    }
+    if !skill.mcp_servers.is_empty() {
+        parts.push(skill.mcp_servers.join(" "));
+    }
+    normalize_text_for_similarity(&parts.join("\n"))
+}
+
+fn skill_behavior_text(skill: &SkillManifest) -> String {
+    let mut parts = Vec::new();
+    if let Some(system_prompt) = skill.system_prompt.as_deref()
+        && !system_prompt.trim().is_empty()
+    {
+        parts.push(truncate_chars(system_prompt, 200));
+    }
+    if !skill.prompt.trim().is_empty() {
+        parts.push(truncate_chars(&skill.prompt, 200));
+    }
+    normalize_text_for_similarity(&parts.join("\n"))
+}
+
 fn truncate_chars(input: &str, max_chars: usize) -> String {
     if input.chars().count() <= max_chars {
         return input.to_string();
     }
     input.chars().take(max_chars).collect::<String>()
-}
-
-fn semantic_score_for_skill(skill: &SkillManifest, input_lower: &str) -> f64 {
-    let docs = [skill_document_text(skill)];
-    let query_features = TextSimilarityFeatures::from_text(input_lower);
-    let doc_features = docs
-        .iter()
-        .map(|doc| TextSimilarityFeatures::from_text(doc))
-        .collect::<Vec<_>>();
-    let doc_refs = doc_features
-        .iter()
-        .map(|doc| &doc.ngram_tf)
-        .collect::<Vec<_>>();
-    let idf = build_idf_from_documents(&doc_refs);
-    doc_features
-        .iter()
-        .map(|doc| cosine_tfidf_similarity(&query_features.ngram_tf, &doc.ngram_tf, &idf))
-        .fold(0.0, f64::max)
 }
 
 fn probability_for_label(result: &skill_match_model::SkillMatchResult, label: &str) -> f64 {
@@ -286,7 +356,6 @@ mod tests {
             version: "1.0.0".to_string(),
             description: description.to_string(),
             author: None,
-            triggers: Vec::new(),
             tools: Vec::new(),
             tool_groups: Vec::new(),
             mcp_servers: Vec::new(),

@@ -55,13 +55,3 @@ pub fn match_skill<'a>(
         None
     }
 }
-
-/// 当用户意图本身是"列出/搜索 skill 资源"（如"有哪些 skill"）时，
-/// 不应再把任何具体 skill 路由出去——上游的 `select_skill_with_preference`
-/// 已经在更早期短路了，这里仅作为最后一道防线。
-///
-/// 函数与具体 skill 无关，只取决于意图。命名上不再带 `skill` 参数，
-/// 避免误以为有按 skill 区分的逻辑。
-pub(super) fn intent_excludes_all_skills(intent: &UserIntent) -> bool {
-    intent.is_searching_resource("skill")
-}

@@ -61,7 +61,7 @@ Guidelines for Prompt/Skill Optimization:
    - Craft descriptions that enable accurate routing
    - Define appropriate tool permissions
    - Set reasonable priority levels
-   - Include relevant triggers/tags
+   - Describe invocation scenarios in the description/body instead of keyword trigger lists
 
 5. **Optimization Process**:
    - Analyze the current prompt/skill for weaknesses
