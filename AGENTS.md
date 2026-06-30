@@ -92,6 +92,7 @@ cargo test --bin a test_xxx       # Filter tests by name
    - Alibaba/DashScope models use provider `alibaba`; API key lookup prefers `alibaba.api_key`, then `aliyun.api_key`, then `compatible.api_key`, then the global `api_key`.
    - Automatic model selection: after a request failure, the runtime skips the unhealthy model for subsequent requests. You can also exclude known-unavailable or too-expensive model keys/names via `ai.model.disabled`, without editing `models.json`.
    - Embedding support (optional, off by default): set `ai.embedding.enable=true` and provide `aliyun.api_key` (or `ai.embedding.api_key`) to enable semantic recall via Aliyun 百炼's OpenAI-compatible `/embeddings` endpoint with `text-embedding-v4`. If embedding fails for any reason, the system gracefully degrades to BM25/lexical search — see [embedder.rs](src/bin/ai/knowledge/indexing/embedder.rs).
+   - Decision-log sidecar persistence is optional: set `ai.decision_log.persist.enable=true` to write per-session `*.decision-log.jsonl`. Default is off; the in-memory `DecisionLogStore` still powers live routing/adaptation signals.
 
 6. **Provider adapter layer** (`src/bin/ai/provider/`)
    - The `ApiProvider` enum (`Alibaba`, `Compatible`, `OpenAi`, `OpenCode`) and the types `ModelQualityTier`/`ReasoningEffort` are defined in `provider/mod.rs`.

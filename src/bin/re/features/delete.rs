@@ -30,6 +30,17 @@ pub fn delete_by_tag_prefix(db: &MemoBackend, tag_ref: &str) -> bool {
     if records.is_empty() {
         return false;
     }
+
+    println!("The following {} record(s) will be deleted:", records.len());
+    for r in &records {
+        println!("  {}  {} ({})", r.id, r.title, r.tags.join(", "));
+    }
+
+    if !rust_tools::commonw::prompt::prompt_yes_or_no("Are you sure? [y/N]: ") {
+        println!("Cancelled.");
+        return false;
+    }
+
     for r in records {
         println!("deleting record. id:{}, tag:{:?}", r.id, r.tags);
         let _ = db.delete(&r.id);

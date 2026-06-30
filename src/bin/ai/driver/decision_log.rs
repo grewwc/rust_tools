@@ -101,6 +101,11 @@ impl DecisionLogStore {
         *guard = Some(path.as_ref().to_path_buf());
     }
 
+    pub fn clear_persist_path(&self) {
+        let mut guard = self.persist_path.lock().unwrap();
+        *guard = None;
+    }
+
     fn persist_log_if_enabled(&self, log: &DecisionLog) {
         let path = {
             let guard = self.persist_path.lock().unwrap();
@@ -749,6 +754,27 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_persist_path_disables_disk_write() {
+        let store = DecisionLogStore::new(100);
+        let path = temp_log_path("decision_log_disabled");
+        store.set_persist_path(&path);
+        store.clear_persist_path();
+
+        log_scheduler_dispatch(
+            &store,
+            "sess-a",
+            0,
+            "ctx",
+            vec!["a".to_string()],
+            "chosen",
+            "reason",
+            true,
+        );
+
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn test_compact_persist_file_retains_recent_tail() {
         let store = DecisionLogStore::new(100);
         let path = temp_log_path("decision_log_compact");
@@ -863,4 +889,8 @@ pub fn init_decision_log_store_with_path<P: AsRef<Path>>(
 
 pub fn set_decision_log_persist_path<P: AsRef<Path>>(path: P) {
     get_decision_log_store().set_persist_path(path);
+}
+
+pub fn clear_decision_log_persist_path() {
+    get_decision_log_store().clear_persist_path();
 }

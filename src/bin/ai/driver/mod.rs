@@ -1048,6 +1048,14 @@ fn should_preload_mcp(one_shot_mode: bool, mcp_probe: &McpConfigProbe) -> bool {
     mcp_probe.exists && !one_shot_mode
 }
 
+fn decision_log_persist_enabled() -> bool {
+    configw::get_all_config()
+        .get_opt(AiConfig::DECISION_LOG_PERSIST_ENABLE)
+        .unwrap_or_else(|| "false".to_string())
+        .trim()
+        .eq_ignore_ascii_case("true")
+}
+
 /// Main entry point for AIOS.
 /// Initializes all components and starts the run_loop.
 ///
@@ -1264,10 +1272,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await;
     }
 
-    let decision_log_path = app
-        .session_history_file
-        .with_extension("decision-log.jsonl");
-    crate::ai::driver::decision_log::set_decision_log_persist_path(decision_log_path);
+    if decision_log_persist_enabled() {
+        let decision_log_path = app
+            .session_history_file
+            .with_extension("decision-log.jsonl");
+        crate::ai::driver::decision_log::set_decision_log_persist_path(decision_log_path);
+    } else {
+        crate::ai::driver::decision_log::clear_decision_log_persist_path();
+    }
 
     let mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
 

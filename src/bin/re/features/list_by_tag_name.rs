@@ -30,7 +30,7 @@ pub fn list_by_tag_name_feature(
             .into_iter()
             .collect()
     } else {
-        let effective_reverse = !reverse;
+        let effective_reverse = reverse;
         db.list_records_by_tags(
             &tags,
             cli.r#and,
