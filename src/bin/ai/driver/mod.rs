@@ -31,6 +31,7 @@ use std::{
 };
 
 use aios_kernel::primitives::{ResourceUsageDelta, RlimitDim, RlimitVerdict};
+use rustc_hash::FxHashSet;
 use rust_tools::cw::SkipMap;
 use uuid::Uuid;
 
@@ -1229,10 +1230,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
     };
-    if let Err(err) = persona_store.remember_session(&app.active_persona.id, &app.session_id) {
-        eprintln!("[persona] failed to persist session binding: {}", err);
-    }
-
     // 处理 --note-delete / -nd：输入一段话，模型自动匹配知识库条目，确认后删除。
     if let Some(query) = app.cli.note_delete.clone() {
         return runtime_ctx::PERSONA_MEMORY_PATH
@@ -1315,6 +1312,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // 成廉价的指针 clone；reload 时整体替换 Arc 即可。
     let mut skill_manifests: Arc<Vec<SkillManifest>> = Arc::new(Vec::new());
     let mut agent_manifests: Arc<Vec<AgentManifest>> = Arc::new(Vec::new());
+
+    if let Err(err) = persona_store.remember_session(&app.active_persona.id, &app.session_id) {
+        eprintln!("[persona] failed to persist session binding: {}", err);
+    }
 
     run_loop(
         &mut app,
@@ -1839,6 +1840,44 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+// 处理 consolidate 计划里的 merge 项：只为有效 merge（ids 非空且 merged_content 非空）
+// 生成新条目，并把对应源 IDs 自动并入删除集合，避免“旧条目 + 合并条目”并存。
+fn build_consolidation_merge_entries(
+    merge_plan: &[&serde_json::Value],
+) -> (FxHashSet<String>, usize, Vec<crate::ai::tools::storage::memory_store::AgentMemoryEntry>) {
+    let mut merge_delete_ids = FxHashSet::default();
+    let mut merged_count = 0usize;
+    let mut new_entries = Vec::new();
+
+    for item in merge_plan {
+        let ids: Vec<&str> = item["ids"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        let content = item["merged_content"].as_str().unwrap_or("").trim();
+        if ids.is_empty() || content.is_empty() {
+            continue;
+        }
+
+        merged_count += ids.len();
+        merge_delete_ids.extend(ids.iter().map(|id| (*id).to_string()));
+        new_entries.push(crate::ai::tools::storage::memory_store::AgentMemoryEntry {
+            id: None,
+            timestamp: chrono::Local::now().to_rfc3339(),
+            category: "user_memory".into(),
+            note: content.to_string(),
+            tags: vec!["consolidated".into()],
+            source: None,
+            priority: Some(150),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        });
+    }
+
+    (merge_delete_ids, merged_count, new_entries)
+}
+
 /// 处理 --consolidate-knowledge：读取全部知识条目 → 模型分析 → 执行整理。
 ///
 /// **优化策略**（避免 60s 超时）：
@@ -1849,7 +1888,6 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
 /// 5. 英文 system prompt（模型响应更快）
 async fn handle_consolidate_knowledge(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
-    use chrono::Local;
     use serde_json::Value;
 
     let store = MemoryStore::from_env_or_config();
@@ -1962,53 +2000,31 @@ async fn handle_consolidate_knowledge(app: &App) -> Result<(), Box<dyn std::erro
         .as_array()
         .map(|a| a.iter().collect())
         .unwrap_or_default();
+    let (merge_delete_ids, merged_count, new_entries) = build_consolidation_merge_entries(&merge_plan);
 
-    if delete_ids.is_empty() && merge_plan.is_empty() {
+    let mut delete_id_set: FxHashSet<String> = delete_ids.iter().map(|id| (*id).to_string()).collect();
+    delete_id_set.extend(merge_delete_ids);
+
+    if delete_id_set.is_empty() && new_entries.is_empty() {
         println!("✅ Already well-organized. Nothing to change.");
         return Ok(());
     }
 
-    // 执行删除
-    if !delete_ids.is_empty() {
-        let refs: Vec<&str> = delete_ids;
-        match store.delete_by_ids(&refs) {
-            Ok(n) => println!("🗑  Deleted {} entries", n),
-            Err(e) => eprintln!("  Delete error: {}", e),
-        }
-    }
-
-    // 执行合并（merge_plan 里的每组 IDs 合并为一条）
-    if !merge_plan.is_empty() {
-        let mut merged_count = 0;
-        let mut new: Vec<AgentMemoryEntry> = Vec::new();
-        for item in &merge_plan {
-            let ids: Vec<&str> = item["ids"]
-                .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
-                .unwrap_or_default();
-            let content = item["merged_content"].as_str().unwrap_or("");
-            if ids.is_empty() || content.is_empty() {
-                continue;
+    let delete_refs: Vec<&str> = delete_id_set.iter().map(String::as_str).collect();
+    match store.apply_batch_update(&delete_refs, &new_entries) {
+        Ok(report) => {
+            if !delete_refs.is_empty() {
+                println!("🗑  Deleted {} entries", report.deleted);
             }
-            merged_count += ids.len();
-            new.push(AgentMemoryEntry {
-                id: None,
-                timestamp: Local::now().to_rfc3339(),
-                category: "user_memory".into(),
-                note: content.into(),
-                tags: vec!["consolidated".into()],
-                source: None,
-                priority: Some(150),
-                owner_pid: None,
-                owner_pgid: None,
-                image_path: None,
-            });
-        }
-        if !new.is_empty() {
-            match store.append_batch(&new) {
-                Ok(n) => println!("💾 Merged {} entries into {} new", merged_count, n),
-                Err(e) => eprintln!("  Merge save error: {}", e),
+            if !new_entries.is_empty() {
+                println!(
+                    "💾 Merged {} entries into {} new",
+                    merged_count, report.appended
+                );
             }
+        }
+        Err(e) => {
+            eprintln!("  Consolidation error: {}", e);
         }
     }
 
@@ -3243,7 +3259,8 @@ mod tests {
     use super::{
         DispatchOutcomeTag, ProcessDispatchMeta, SCHED_COOLDOWN_EPOCHS_DEFAULT,
         SCHEDULER_DISPATCH_META, background_execute_limit, background_pop_limit,
-        build_note_search_retrieval_query, has_pending_foreground_process,
+          build_consolidation_merge_entries, build_note_search_retrieval_query,
+          has_pending_foreground_process,
         maybe_auto_route_agent, one_shot_cli_mode, read_recent_history,
         reset_scheduler_test_state, should_preload_mcp, should_publish_subagent_task_result,
         update_dispatch_meta,
@@ -3502,6 +3519,33 @@ mod tests {
             .expect("assistant context should be present");
         assert!(user_pos < assistant_pos);
     }
+
+      #[test]
+      fn consolidation_merge_plan_auto_deletes_valid_merge_ids() {
+          let merge_plan = [
+              serde_json::json!({
+                  "ids": ["id_a", "id_b"],
+                  "merged_content": "合并后的内容"
+              }),
+              serde_json::json!({
+                  "ids": ["ignored"],
+                  "merged_content": ""
+              }),
+          ];
+          let merge_plan_refs: Vec<&serde_json::Value> = merge_plan.iter().collect();
+
+          let (delete_ids, merged_count, new_entries) =
+              build_consolidation_merge_entries(&merge_plan_refs);
+
+          assert_eq!(merged_count, 2);
+          assert_eq!(delete_ids.len(), 2);
+          assert!(delete_ids.contains("id_a"));
+          assert!(delete_ids.contains("id_b"));
+          assert!(!delete_ids.contains("ignored"));
+          assert_eq!(new_entries.len(), 1);
+          assert_eq!(new_entries[0].note, "合并后的内容");
+          assert_eq!(new_entries[0].tags, vec!["consolidated".to_string()]);
+      }
 
     #[test]
     fn auto_route_falls_back_to_build_instead_of_current_agent() {

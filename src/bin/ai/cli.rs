@@ -1,4 +1,7 @@
+use std::path::Path;
+
 use crate::ai::provider::ReasoningEffort;
+use crate::commonw::utils::expanduser;
 use crate::terminalw::parser::Parser as TermParser;
 
 /// 解析后的 CLI 参数结构体
@@ -76,6 +79,175 @@ const INTERNAL_COMMANDS: &[&str] = &[
     ":sessions",
 ];
 
+const FILES_USAGE: &str = "input file names (repeat -f or use comma-separated list)";
+const NOTE_SEARCH_USAGE: &str =
+    "search knowledge base (memo category) and answer using positional prompt";
+const GENERATE_COMPLETIONS_USAGE: &str =
+    "generate shell completion script (bash/zsh/fish) and exit";
+const REASONING_EFFORT_USAGE: &str = "reasoning effort: minimal | low | medium | high | off (clears default; only effective on OpenAI/OpenRouter/OpenCode providers)";
+
+fn build_cli_parser() -> TermParser {
+    let mut parser = TermParser::new();
+    register_cli_flags(&mut parser);
+    parser
+}
+
+fn register_cli_flags(parser: &mut TermParser) {
+    parser.add_bool(
+        "clear",
+        false,
+        "clear specified session history (use with --session)",
+    );
+    parser.add_bool("list-tools", false, "list builtin tools and exit");
+    parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
+    parser.alias("list-mcp-servers", "list-mcp-tools");
+    parser.add_bool("list-skills", false, "list skills and exit");
+    parser.add_bool("list-agents", false, "list available agents and exit");
+    parser.add_bool("no-skills", false, "disable loading all skills");
+    parser.add_bool("help", false, "print help");
+    parser.add_bool(
+        "interactive",
+        false,
+        "stay in REPL after the initial CLI prompt",
+    );
+    parser.add_bool(
+        "consolidate-knowledge",
+        false,
+        "AI-driven consolidation of all knowledge entries",
+    );
+    parser.add_bool("note-search", false, NOTE_SEARCH_USAGE);
+    parser.add_bool("generate-completions", false, GENERATE_COMPLETIONS_USAGE);
+    parser.alias("i", "interactive");
+    parser.alias("ns", "note-search");
+    parser.alias("h", "help");
+
+    parser.add_string("model", "", "model name");
+    parser.alias("m", "model");
+    parser.add_string("agent", "", "agent name");
+    parser.alias("a", "agent");
+    parser.add_string("session", "", "session id");
+    parser.alias("ss", "session");
+    parser.add_string("files", "", FILES_USAGE);
+    parser.alias("f", "files");
+    parser.add_string("mcp-config", "", "mcp config json path override");
+    parser.add_string("reasoning-effort", "", REASONING_EFFORT_USAGE);
+    parser.alias("re", "reasoning-effort");
+
+    parser.add_string("note", "", "save text as memo to knowledge base and exit");
+    parser.alias("n", "note");
+    parser.add_string(
+        "note-delete",
+        "",
+        "describe a memo to delete; AI matches it, confirm to delete",
+    );
+    parser.alias("nd", "note-delete");
+    parser.add_string(
+        "note-edit",
+        "",
+        "describe a memo to edit; AI matches it, edit in editor and save",
+    );
+    parser.alias("ne", "note-edit");
+}
+
+fn rewrite_legacy_session_aliases(argv: &mut [String]) {
+    for arg in argv {
+        if arg == "--ss" || arg.starts_with("--ss=") {
+            *arg = arg.replace("--ss", "--session");
+        }
+        if arg == "-ss" || arg.starts_with("-ss=") {
+            *arg = arg.replace("-ss", "--session");
+        }
+    }
+}
+
+fn file_spec_exists(raw: &str) -> bool {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.starts_with('-') {
+        return false;
+    }
+    if raw.contains(',') {
+        let mut saw_any = false;
+        for part in raw.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            saw_any = true;
+            let expanded = expanduser(part);
+            if !Path::new(expanded.as_ref()).exists() {
+                return false;
+            }
+        }
+        return saw_any;
+    }
+    let expanded = expanduser(raw);
+    Path::new(expanded.as_ref()).exists()
+}
+
+fn normalize_files_flags(argv: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(argv.len());
+    let mut collected_files: Vec<String> = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < argv.len() {
+        let arg = &argv[idx];
+        if let Some(value) = arg.strip_prefix("--files=") {
+            if !value.trim().is_empty() {
+                collected_files.push(value.to_string());
+            }
+            idx += 1;
+            while idx < argv.len() && file_spec_exists(&argv[idx]) {
+                collected_files.push(argv[idx].clone());
+                idx += 1;
+            }
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("-f=") {
+            if !value.trim().is_empty() {
+                collected_files.push(value.to_string());
+            }
+            idx += 1;
+            while idx < argv.len() && file_spec_exists(&argv[idx]) {
+                collected_files.push(argv[idx].clone());
+                idx += 1;
+            }
+            continue;
+        }
+        if arg == "--files" || arg == "-f" {
+            if let Some(value) = argv.get(idx + 1) {
+                collected_files.push(value.clone());
+                idx += 2;
+                while idx < argv.len() && file_spec_exists(&argv[idx]) {
+                    collected_files.push(argv[idx].clone());
+                    idx += 1;
+                }
+            } else {
+                normalized.push("--files".to_string());
+                idx += 1;
+            }
+            continue;
+        }
+        normalized.push(arg.clone());
+        idx += 1;
+    }
+
+    if !collected_files.is_empty() {
+        normalized.push("--files".to_string());
+        normalized.push(collected_files.join(","));
+    }
+    normalized
+}
+
+fn normalize_cli_argv(raw: &[String]) -> Vec<String> {
+    let mut argv = if raw.len() > 1 {
+        raw[1..].to_vec()
+    } else {
+        Vec::new()
+    };
+    rewrite_legacy_session_aliases(&mut argv);
+    normalize_files_flags(argv)
+}
+
 impl Default for ParsedCli {
     fn default() -> Self {
         Self {
@@ -112,94 +284,8 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         return ParsedCli::default();
     }
 
-    // 创建 terminalw parser
-    let mut parser = TermParser::new();
-
-    // 定义所有 bool 选项
-    parser.add_bool(
-        "clear",
-        false,
-        "clear specified session history (use with --session)",
-    );
-    parser.add_bool("list-tools", false, "list builtin tools and exit");
-    parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
-    parser.alias("list-mcp-servers", "list-mcp-tools");
-    parser.add_bool("list-skills", false, "list skills and exit");
-    parser.add_bool("list-agents", false, "list available agents and exit");
-    parser.add_bool("no-skills", false, "disable loading all skills");
-    parser.add_bool("help", false, "print help");
-    parser.add_bool(
-        "interactive",
-        false,
-        "stay in REPL after the initial CLI prompt",
-    );
-    parser.add_bool(
-        "consolidate-knowledge",
-        false,
-        "AI-driven consolidation of all knowledge entries",
-    );
-    parser.add_bool(
-        "note-search",
-        false,
-        "search knowledge base (memo category) and answer",
-    );
-    parser.alias("i", "interactive");
-    parser.alias("ns", "note-search");
-    parser.alias("h", "help");
-    parser.add_bool(
-        "generate-completions",
-        false,
-        "generate shell completion script (bash/zsh/fish) and exit",
-    );
-
-    // 定义所有 string/int 选项
-    parser.add_string("model", "", "model name");
-    parser.alias("m", "model");
-    parser.add_string("agent", "", "agent name");
-    parser.alias("a", "agent");
-    parser.add_string("session", "", "session id");
-    parser.alias("ss", "session");
-    parser.add_string("files", "", "input file names");
-    parser.alias("f", "files");
-    parser.add_string("mcp-config", "", "mcp config json path override");
-    parser.add_string(
-        "reasoning-effort",
-        "",
-        "reasoning effort: minimal | low | medium | high | off (clears default; only effective on OpenAI/OpenRouter/OpenCode providers)",
-    );
-    parser.alias("re", "reasoning-effort");
-
-    parser.add_string("note", "", "save text as memo to knowledge base and exit");
-    parser.alias("n", "note");
-    parser.add_string(
-        "note-delete",
-        "",
-        "describe a memo to delete; AI matches it, confirm to delete",
-    );
-    parser.alias("nd", "note-delete");
-    parser.add_string(
-        "note-edit",
-        "",
-        "describe a memo to edit; AI matches it, edit in editor and save",
-    );
-    parser.alias("ne", "note-edit");
-
-    // 解析 argv（跳过 program name）
-    let mut argv: Vec<String> = if raw.len() > 1 {
-        raw[1..].to_vec()
-    } else {
-        Vec::new()
-    };
-
-    // 预处理：将 --ss 转换为 --session，兼容历史用法。
-    for arg in &mut argv {
-        if arg == "--ss" || arg.starts_with("--ss=") {
-            *arg = arg.replace("--ss", "--session");
-        }
-        if arg == "-ss" || arg.starts_with("-ss=") {
-            *arg = arg.replace("-ss", "--session");
-        }
-    }
+    let mut parser = build_cli_parser();
+    let argv = normalize_cli_argv(&raw);
 
     // 使用 terminalw 解析参数
     parser.parse_argv(&argv, &[]);
@@ -320,77 +406,17 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
 /// 打印帮助信息
 pub(super) fn print_help() {
-    let mut parser = TermParser::new();
-
-    parser.add_bool("list-tools", false, "list builtin tools and exit");
-    parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
-    parser.alias("list-mcp-servers", "list-mcp-tools");
-    parser.add_bool("list-skills", false, "list skills and exit");
-    parser.add_bool("list-agents", false, "list available agents and exit");
-    parser.add_bool("no-skills", false, "disable loading all skills");
-    parser.add_bool("help", false, "print help");
-    parser.add_bool(
-        "interactive",
-        false,
-        "stay in REPL after the initial CLI prompt",
-    );
-    parser.add_bool(
-        "consolidate-knowledge",
-        false,
-        "AI-driven consolidation of all knowledge entries",
-    );
-    parser.add_bool(
-        "note-search",
-        false,
-        "search knowledge base (memo category) and answer",
-    );
-    parser.alias("i", "interactive");
-    parser.alias("ns", "note-search");
-    parser.alias("h", "help");
-
-    parser.add_string("model", "", "model name");
-    parser.alias("m", "model");
-    parser.add_string("agent", "", "agent name");
-    parser.alias("a", "agent");
-    parser.add_string("session", "", "session id");
-    parser.alias("ss", "session");
-    parser.add_string("files", "", "input file names");
-    parser.alias("f", "files");
-    parser.add_string("mcp-config", "", "mcp config json path override");
-    parser.add_string(
-        "reasoning-effort",
-        "",
-        "reasoning effort: minimal | low | medium | high | off (clears default; only effective on OpenAI/OpenRouter/OpenCode providers)",
-    );
-    parser.alias("re", "reasoning-effort");
-
-    parser.add_string("note", "", "save text as memo to knowledge base and exit");
-    parser.alias("n", "note");
-    parser.add_string(
-        "note-delete",
-        "",
-        "describe a memo to delete; AI matches it, confirm to delete",
-    );
-    parser.alias("nd", "note-delete");
-    parser.add_string(
-        "note-edit",
-        "",
-        "describe a memo to edit; AI matches it, edit in editor and save",
-    );
-    parser.alias("ne", "note-edit");
-
+    let parser = build_cli_parser();
     println!("AI CLI - Interactive AI Assistant");
-    println!("Usage: a [OPTIONS] [PROMPT]");
     println!();
     println!("Quick Actions:");
     println!(
         "  --consolidate-knowledge  read all knowledge entries, analyze with LLM, clean up obsolete ones"
     );
     println!("  -n, --note <text>        save text as memo to knowledge base and exit");
-    println!("  -ns, --note-search <q>   search memo category and answer with LLM");
+    println!("  -ns, --note-search       search memo category using the positional prompt");
     println!("  -i, --interactive        keep the session open for follow-up questions");
     println!();
-    println!("Options:");
     parser.print_defaults();
     println!();
     println!("Agent (CLI):");
@@ -466,77 +492,7 @@ pub(super) fn print_help() {
 /// `shell` 取值 "bash" | "zsh" | "fish"，不区分大小写。
 /// 通过 --generate-completions 触发。
 pub fn generate_completion_script(shell: &str) {
-    // 用同样的 flag 定义重建 parser（与 parse_cli_args 保持一致）
-    let mut parser = TermParser::new();
-
-    // ===== bool 选项 =====
-    parser.add_bool(
-        "clear",
-        false,
-        "clear specified session history (use with --session)",
-    );
-    parser.add_bool("list-tools", false, "list builtin tools and exit");
-    parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
-    parser.alias("list-mcp-servers", "list-mcp-tools");
-    parser.add_bool("list-skills", false, "list skills and exit");
-    parser.add_bool("list-agents", false, "list available agents and exit");
-    parser.add_bool("no-skills", false, "disable loading all skills");
-    parser.add_bool("help", false, "print help");
-    parser.alias("h", "help");
-    parser.add_bool(
-        "interactive",
-        false,
-        "stay in REPL after the initial CLI prompt",
-    );
-    parser.alias("i", "interactive");
-    parser.add_bool(
-        "consolidate-knowledge",
-        false,
-        "AI-driven consolidation of all knowledge entries",
-    );
-    parser.add_bool(
-        "note-search",
-        false,
-        "search knowledge base (memo category) and answer",
-    );
-    parser.alias("ns", "note-search");
-    parser.add_bool(
-        "generate-completions",
-        false,
-        "generate shell completion script (bash/zsh/fish) and exit",
-    );
-
-    // ===== string / int 选项 =====
-    parser.add_string("model", "", "model name");
-    parser.alias("m", "model");
-    parser.add_string("agent", "", "agent name");
-    parser.alias("a", "agent");
-    parser.add_string("session", "", "session id");
-    parser.alias("ss", "session");
-    parser.add_string("files", "", "input file names");
-    parser.alias("f", "files");
-    parser.add_string("mcp-config", "", "mcp config json path override");
-    parser.add_string(
-        "reasoning-effort",
-        "",
-        "reasoning effort: minimal | low | medium | high | off",
-    );
-    parser.alias("re", "reasoning-effort");
-    parser.add_string("note", "", "save text as memo to knowledge base and exit");
-    parser.alias("n", "note");
-    parser.add_string(
-        "note-delete",
-        "",
-        "describe a memo to delete; AI matches it, confirm to delete",
-    );
-    parser.alias("nd", "note-delete");
-    parser.add_string(
-        "note-edit",
-        "",
-        "describe a memo to edit; AI matches it, edit in editor and save",
-    );
-    parser.alias("ne", "note-edit");
-
+    let parser = build_cli_parser();
     let info = parser.collect_completion_info();
 
     let is_bool = |ty: &str| ty == "bool";
@@ -806,6 +762,79 @@ fn generate_fish(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn make_temp_file(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("ai-cli-{name}-{}.txt", uuid::Uuid::new_v4()));
+        fs::write(&path, name).unwrap();
+        path
+    }
+
+    #[test]
+    fn parse_cli_args_collects_space_separated_files_for_dash_f() {
+        let first = make_temp_file("first");
+        let second = make_temp_file("second");
+        let cli = super::parse_cli_args(
+            [
+                "a".to_string(),
+                "-f".to_string(),
+                first.to_string_lossy().to_string(),
+                second.to_string_lossy().to_string(),
+                "describe".to_string(),
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(
+            cli.files,
+            format!("{},{}", first.to_string_lossy(), second.to_string_lossy())
+        );
+        assert_eq!(cli.args, vec!["describe".to_string()]);
+
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+    }
+
+    #[test]
+    fn parse_cli_args_merges_repeated_file_flags() {
+        let first = make_temp_file("repeat-first");
+        let second = make_temp_file("repeat-second");
+        let cli = super::parse_cli_args(
+            [
+                "a".to_string(),
+                "-f".to_string(),
+                first.to_string_lossy().to_string(),
+                "--files".to_string(),
+                second.to_string_lossy().to_string(),
+                "summarize".to_string(),
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(
+            cli.files,
+            format!("{},{}", first.to_string_lossy(), second.to_string_lossy())
+        );
+        assert_eq!(cli.args, vec!["summarize".to_string()]);
+
+        let _ = fs::remove_file(first);
+        let _ = fs::remove_file(second);
+    }
+
+    #[test]
+    fn cli_parser_keeps_clear_and_completion_flags_visible() {
+        let names = super::build_cli_parser()
+            .collect_completion_info()
+            .into_iter()
+            .map(|(name, _, _, _)| name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|name| name == "clear"));
+        assert!(names.iter().any(|name| name == "generate-completions"));
+    }
+
     #[test]
     fn model_selector_words_use_user_facing_selectors() {
         let selectors = super::model_selector_words();

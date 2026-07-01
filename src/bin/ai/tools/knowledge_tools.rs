@@ -41,7 +41,7 @@
 ///   save_entries: [{ content: "合并后的内容", category: "user_memory", ... }]
 /// )
 /// ```
-/// 工具先批量删除指定 ID 的条目，再批量保存新条目（原子操作顺序：先删后增）。
+/// 工具把删除和新增合成为一次原子重写，避免“先删后增”中途失败导致丢数。
 ///
 /// ## 整理原则（Agent 自行判断）
 /// - **保留**：仍有参考价值的决策、偏好、项目信息、安全规则
@@ -556,24 +556,7 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
     let mut report = String::new();
     report.push_str("📦 Consolidation report:\n");
 
-    // 第一阶段：批量删除
-    let deleted_count = if !delete_ids.is_empty() {
-        let id_refs: Vec<&str> = delete_ids.iter().map(String::as_str).collect();
-        match store.delete_by_ids(&id_refs) {
-            Ok(n) => {
-                report.push_str(&format!("   Deleted: {} entries\n", n));
-                n
-            }
-            Err(e) => {
-                report.push_str(&format!("   Delete error: {}\n", e));
-                0
-            }
-        }
-    } else {
-        0
-    };
-
-    // 第二阶段：构建新条目
+    // 构建待保存的新条目
     let mut new_entries: Vec<AgentMemoryEntry> = Vec::new();
     for entry_val in &save_entries_raw {
         let content = entry_val["content"]
@@ -608,20 +591,21 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
         });
     }
 
-    // 第三阶段：批量保存新条目
-    let saved_count = if !new_entries.is_empty() {
-        match store.append_batch(&new_entries) {
-            Ok(n) => {
-                report.push_str(&format!("   Saved: {} new entries\n", n));
-                n
+    let id_refs: Vec<&str> = delete_ids.iter().map(String::as_str).collect();
+    let (deleted_count, saved_count) = match store.apply_batch_update(&id_refs, &new_entries) {
+        Ok(result) => {
+            if !delete_ids.is_empty() {
+                report.push_str(&format!("   Deleted: {} entries\n", result.deleted));
             }
-            Err(e) => {
-                report.push_str(&format!("   Save error: {}\n", e));
-                0
+            if !new_entries.is_empty() {
+                report.push_str(&format!("   Saved: {} new entries\n", result.appended));
             }
+            (result.deleted, result.appended)
         }
-    } else {
-        0
+        Err(e) => {
+            report.push_str(&format!("   Consolidation error: {}\n", e));
+            (0, 0)
+        }
     };
 
     if deleted_count == 0 && saved_count == 0 {
@@ -645,6 +629,9 @@ inventory::submit!(ToolRegistration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::test_support::ENV_LOCK;
+    use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_knowledge_save_params() {
@@ -716,5 +703,83 @@ mod tests {
             .collect();
         assert!(actions.contains(&"read_all"));
         assert!(actions.contains(&"execute"));
+    }
+
+    #[test]
+    fn test_execute_consolidation_applies_delete_and_save_atomically() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_knowledge_consolidate_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let seed = [
+            AgentMemoryEntry {
+                id: Some("mem_old_1".to_string()),
+                timestamp: "2025-01-01T00:00:00Z".to_string(),
+                category: "user_memory".to_string(),
+                note: "old memo 1".to_string(),
+                tags: vec!["old".to_string()],
+                source: None,
+                priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
+                image_path: None,
+            },
+            AgentMemoryEntry {
+                id: Some("mem_old_2".to_string()),
+                timestamp: "2025-01-01T00:00:01Z".to_string(),
+                category: "user_memory".to_string(),
+                note: "old memo 2".to_string(),
+                tags: vec!["old".to_string()],
+                source: None,
+                priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
+                image_path: None,
+            },
+        ];
+        let mut buf = String::new();
+        for entry in &seed {
+            buf.push_str(&serde_json::to_string(entry).unwrap());
+            buf.push('\n');
+        }
+        std::fs::write(&path, buf).unwrap();
+
+        let report = execute_consolidation(&serde_json::json!({
+            "delete_ids": ["mem_old_1", "mem_old_2"],
+            "save_entries": [{
+                "content": "merged memo",
+                "category": "user_memory",
+                "tags": ["consolidated"],
+                "priority": 150
+            }]
+        }))
+        .unwrap();
+
+        assert!(report.contains("Deleted: 2 entries"));
+        assert!(report.contains("Saved: 1 new entries"));
+
+        let entries: Vec<AgentMemoryEntry> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<AgentMemoryEntry>(line.trim()).ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].note, "merged memo");
+        assert_eq!(entries[0].category, "user_memory");
+
+        let db_path = path.with_extension("db");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
     }
 }

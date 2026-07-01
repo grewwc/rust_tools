@@ -198,6 +198,12 @@ pub(crate) struct MemoryStore {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemoryBatchUpdateReport {
+    pub(crate) deleted: usize,
+    pub(crate) appended: usize,
+}
+
 impl MemoryStore {
     pub(crate) fn from_env_or_config() -> Self {
         Self {
@@ -295,6 +301,70 @@ impl MemoryStore {
             }
 
             Ok(())
+        })
+    }
+
+    /// 批量应用“删除 + 新增”变更并一次性原子重写 JSONL。
+    /// JSONL 仍是 source of truth；SQLite 索引在成功写回后做 best-effort 全量重建。
+    pub(crate) fn apply_batch_update(
+        &self,
+        delete_ids: &[&str],
+        new_entries: &[AgentMemoryEntry],
+    ) -> Result<MemoryBatchUpdateReport, String> {
+        if delete_ids.is_empty() && new_entries.is_empty() {
+            return Ok(MemoryBatchUpdateReport {
+                deleted: 0,
+                appended: 0,
+            });
+        }
+        let id_set: FxHashSet<&str> = delete_ids.iter().copied().collect();
+        super::with_memory_file_lock(&self.path, || {
+            let content = match std::fs::read_to_string(&self.path) {
+                Ok(content) => content,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(err) => return Err(format!("Failed to read memory file: {err}")),
+            };
+
+            let mut kept = Vec::new();
+            let mut deleted = 0usize;
+            for line in content.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
+                    if entry.id.as_deref().map_or(false, |id| id_set.contains(id)) {
+                        deleted += 1;
+                        continue;
+                    }
+                    kept.push(entry);
+                }
+            }
+            kept.extend(new_entries.iter().cloned());
+
+            if let Some(parent) = self.path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| format!("Failed to create memory dir: {err}"))?;
+            }
+            Self::write_all_entries(&self.path, &kept)?;
+
+            if let Some(idx) = memory_index_for(&self.path)
+                && let Err(err) = idx.rebuild_from_source()
+            {
+                trace_memory_event(
+                    "memory.index.rebuild_failed",
+                    "MemoryIndex rebuild failed after batch rewrite; index may drift",
+                    &[
+                        ("path", self.path.display().to_string()),
+                        ("error", err),
+                    ],
+                );
+            }
+
+            Ok(MemoryBatchUpdateReport {
+                deleted,
+                appended: new_entries.len(),
+            })
         })
     }
 
@@ -771,6 +841,72 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn apply_batch_update_rewrites_delete_and_append_in_one_pass() {
+        let path = std::env::temp_dir().join(format!(
+            "rt_mem_batch_update_{}.jsonl",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let entry_with_id = |id: &str, note: &str, ts: &str| AgentMemoryEntry {
+            id: Some(id.to_string()),
+            timestamp: ts.to_string(),
+            category: "user_memory".to_string(),
+            note: note.to_string(),
+            tags: Vec::new(),
+            source: None,
+            priority: Some(150),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        };
+        let write_lines = |entries: &[AgentMemoryEntry]| {
+            let mut buf = String::new();
+            for entry in entries {
+                buf.push_str(&serde_json::to_string(entry).unwrap());
+                buf.push('\n');
+            }
+            std::fs::write(&path, buf).unwrap();
+        };
+        let read_entries = || -> Vec<AgentMemoryEntry> {
+            std::fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<AgentMemoryEntry>(line.trim()).ok())
+                .collect()
+        };
+        write_lines(&[
+            entry_with_id("mem_1", "keep me", "2025-01-01T00:00:00Z"),
+            entry_with_id("mem_2", "drop me", "2025-01-01T00:00:01Z"),
+            entry_with_id("mem_3", "merge me", "2025-01-01T00:00:02Z"),
+        ]);
+
+        let store = MemoryStore::for_tests_with_path(path.clone());
+        let merged = entry_with_id("mem_merged", "merged note", "2025-01-02T00:00:00Z");
+        let report = store
+            .apply_batch_update(&["mem_2", "mem_3"], &[merged.clone()])
+            .unwrap();
+
+        assert_eq!(
+            report,
+            MemoryBatchUpdateReport {
+                deleted: 2,
+                appended: 1
+            }
+        );
+
+        let kept = read_entries();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.iter().any(|entry| entry.id.as_deref() == Some("mem_1")));
+        assert!(kept.iter().any(|entry| entry.id.as_deref() == Some("mem_merged")));
+        assert!(!kept.iter().any(|entry| entry.id.as_deref() == Some("mem_2")));
+        assert!(!kept.iter().any(|entry| entry.id.as_deref() == Some("mem_3")));
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 fn compute_similarity(entry: &AgentMemoryEntry, query_lc: &str) -> f64 {
@@ -1058,35 +1194,8 @@ impl MemoryStore {
         if ids.is_empty() {
             return Ok(0);
         }
-        let id_set: FxHashSet<&str> = ids.iter().copied().collect();
-        super::with_memory_file_lock(&self.path, || {
-            let content = std::fs::read_to_string(&self.path)
-                .map_err(|e| format!("Failed to read memory file: {}", e))?;
-            let mut kept = Vec::new();
-            let mut removed = 0usize;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
-                    if entry.id.as_deref().map_or(false, |id| id_set.contains(id)) {
-                        removed += 1;
-                        continue;
-                    }
-                    kept.push(entry);
-                }
-            }
-            Self::write_all_entries(&self.path, &kept)?;
-            // 同步删除 SQLite 索引
-            if let Some(idx) = memory_index_for(&self.path) {
-                for id in ids {
-                    let _ = idx.delete_id(id);
-                }
-                let _ = idx.refresh_signature();
-            }
-            Ok(removed)
-        })
+        self.apply_batch_update(ids, &[])
+            .map(|report| report.deleted)
     }
 
     /// 根据 id 删除条目（返回被删除的条目）
@@ -1133,29 +1242,14 @@ impl MemoryStore {
         })
     }
 
-    /// 批量追加多条记忆（原子操作：一次序列化 → 一次写）。
-    /// 截断规则与单条 `append` 一致（每条 note 最大 4KB）。
+    /// 批量追加多条记忆；内部复用 `apply_batch_update([], entries)`，
+    /// 通过一次原子重写避免“先追加一半”这类中间态。
     pub(crate) fn append_batch(&self, entries: &[AgentMemoryEntry]) -> Result<usize, String> {
         if entries.is_empty() {
             return Ok(0);
         }
-        let mut serialized = String::new();
-        for entry in entries {
-            if let Ok(s) = serde_json::to_string(entry) {
-                serialized.push_str(&s);
-                serialized.push('\n');
-            }
-        }
-        super::with_memory_file_lock(&self.path, || {
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.path)
-                .map_err(|e| format!("Failed to open memory file: {}", e))?;
-            file.write_all(serialized.as_bytes())
-                .map_err(|e| format!("Failed to write memory entries: {}", e))?;
-            Ok(entries.len())
-        })
+        self.apply_batch_update(&[], entries)
+            .map(|report| report.appended)
     }
 
     fn cleanup_archives_auto(&self) -> Result<(), String> {
@@ -1588,6 +1682,18 @@ mod retention_tests {
             owner_pgid: None,
             image_path: None,
         }
+    }
+
+    fn entry_with_id(
+        id: &str,
+        category: &str,
+        note: &str,
+        ts: &str,
+        priority: u8,
+    ) -> AgentMemoryEntry {
+        let mut entry = entry(category, note, ts, priority);
+        entry.id = Some(id.to_string());
+        entry
     }
 
     fn write_lines(path: &Path, entries: &[AgentMemoryEntry]) {
