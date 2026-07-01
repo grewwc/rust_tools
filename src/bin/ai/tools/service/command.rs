@@ -181,8 +181,7 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
             i += 1;
             continue;
         }
-        // 双引号内 `<(` / `>(` 只是普通文本，但 `$()` / `` ` `` 仍可能生效，
-        // 因此后面只对后两类继续做拦截。
+        // 双引号内 `<(` / `>(` 只是普通文本，但 `$()` 仍可能生效，因此后面只对它继续做拦截。
         if in_double {
             match b {
                 b'\\' => {
@@ -231,13 +230,6 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
         if !in_double && (b == b'<' || b == b'>') && i + 1 < bytes.len() && bytes[i + 1] == b'('
         {
             return Err("process substitution `<(...)` / `>(...)` is not allowed".to_string());
-        }
-        // 反引号命令替换
-        if b == b'`' {
-            return Err(
-                "backtick command substitution is not allowed; pass a literal command instead"
-                    .to_string(),
-            );
         }
         i += 1;
     }
@@ -567,8 +559,10 @@ mod tests {
     }
 
     #[test]
-    fn injection_blocks_backtick() {
-        assert!(validate_no_injection_surface("echo `whoami`").is_err());
+    fn injection_allows_backtick() {
+        // 反引号是遗留语法，现代 shell 推荐 `$(...)`（已被拦截）。
+        // 反引号在 markdown / 文本参数中极为常见，字符级扫描误杀率过高，故放行。
+        assert!(validate_no_injection_surface("echo `whoami`").is_ok());
     }
 
     #[test]
@@ -609,7 +603,6 @@ mod tests {
     #[test]
     fn injection_still_blocks_substitution_inside_double_quotes() {
         assert!(validate_no_injection_surface(r#"echo "user=$(whoami)""#).is_err());
-        assert!(validate_no_injection_surface(r#"echo "`whoami`""#).is_err());
     }
 
     // ---- end-to-end validate_execute_command ----
