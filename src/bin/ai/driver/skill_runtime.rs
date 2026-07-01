@@ -283,6 +283,9 @@ fn required_baseline_tool_names() -> Vec<String> {
     vec![
         // discovery / 自助能力：让模型在白名单 skill 下仍能发现并启用更多工具。
         "discover_skills".to_string(),
+        // 读取 skill 正文（用于创建/修改/调试 skill），只读不激活；与 activate_skill
+        // 区分。常驻补回，避免 skill 用窄白名单时 agent 只能靠猜路径 read_file。
+        "load_skill".to_string(),
         "enable_tools".to_string(),
         // 基础只读 / 检索能力：读取文件、按行读取、目录浏览、路径查找、内容检索、
         // 符号检索。这些是"理解现状"的最小工具集，不改动任何状态。若某个 skill 用

@@ -291,6 +291,90 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+fn params_load_skill() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Exact name of the skill to read (as returned by discover_skills)."
+            }
+        },
+        "required": ["name"]
+    })
+}
+
+/// 渲染 load_skill 的返回：头部元信息 + skill 正文（+ 可选 bundled 资源目录）。
+fn render_loaded_skill(skill: &SkillManifest) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Skill: {}\n", skill.name));
+    if !skill.description.trim().is_empty() {
+        out.push_str(&format!("description: {}\n", skill.description.trim()));
+    }
+    out.push_str(&format!("version: {}\n", skill.version));
+    if let Some(system_prompt) = skill.system_prompt.as_deref()
+        && !system_prompt.trim().is_empty()
+    {
+        out.push_str("\n## system_prompt\n");
+        out.push_str(system_prompt.trim());
+        out.push('\n');
+    }
+    out.push_str("\n## prompt\n");
+    if skill.prompt.trim().is_empty() {
+        out.push_str("(this skill has an empty prompt body)\n");
+    } else {
+        out.push_str(&skill.prompt);
+        if !skill.prompt.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    // 只有当 skill 真带 bundled 资源时才暴露其目录。这是显式 load 单个 skill 的
+    // 合法用途（agent 需要读 references/*），与 discover_skills 刻意隐藏所有路径
+    // 的防泄漏语义不冲突。
+    if let Some(resource_path) = skill.resource_path.as_deref()
+        && !resource_path.trim().is_empty()
+    {
+        out.push_str(&format!(
+            "\n## resources\nBundled resource directory: {resource_path}\n"
+        ));
+    }
+    out
+}
+
+pub(crate) fn execute_load_skill(args: &Value) -> Result<String, String> {
+    let name = args["name"].as_str().unwrap_or("").trim();
+    if name.is_empty() {
+        return Err("load_skill requires a non-empty 'name'.".to_string());
+    }
+
+    let skills = crate::ai::skills::load_all_skills();
+    let Some(skill) = skills.iter().find(|s| s.name == name) else {
+        let available = skills
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "No skill named '{name}'. Use discover_skills first. Available skills: {available}"
+        ));
+    };
+
+    Ok(render_loaded_skill(skill))
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "load_skill",
+        description: "Read a skill's full contents (its prompt body, system prompt, and bundled resource directory if any) by name, without changing the current turn. \
+                      Use this when you need to inspect, learn from, or modify an existing skill (e.g. authoring or debugging skills) — it only returns text, it does NOT activate the skill or alter your tool set. \
+                      To actually run/apply a skill for the user's task, use activate_skill instead.",
+        parameters: params_load_skill,
+        execute: execute_load_skill,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core"],
+    }
+});
+
 fn params_save_skill() -> Value {
     serde_json::json!({
         "type": "object",
@@ -683,8 +767,9 @@ inventory::submit!(ToolRegistration {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_skill_file_content, execute_activate_skill, execute_discover_skills, query_tokens,
-        skill_matches_query, summarize_skill, take_pending_skill_activation,
+        build_skill_file_content, execute_activate_skill, execute_discover_skills,
+        execute_load_skill, query_tokens, render_loaded_skill, skill_matches_query, summarize_skill,
+        take_pending_skill_activation,
     };
     use crate::ai::skills::SkillManifest;
     use std::sync::{LazyLock, Mutex};
@@ -820,6 +905,51 @@ mod tests {
         assert!(out.contains("name: \"demo-skill\""));
         assert!(out.contains("tools:\n  - \"read_file\""));
         assert!(!out.contains("triggers:"));
+    }
+
+    #[test]
+    fn load_skill_rejects_empty_name() {
+        let err = execute_load_skill(&serde_json::json!({"name": "  "})).unwrap_err();
+        assert!(err.contains("non-empty"));
+    }
+
+    #[test]
+    fn load_skill_rejects_unknown_name() {
+        let err =
+            execute_load_skill(&serde_json::json!({"name": "definitely-not-a-skill"})).unwrap_err();
+        assert!(err.contains("No skill named"));
+        assert!(err.contains("discover_skills"));
+    }
+
+    #[test]
+    fn load_skill_returns_prompt_body_for_builtin() {
+        // 取一个真实存在、prompt 非空的 skill（builtin debugger 一定在）。
+        let out = execute_load_skill(&serde_json::json!({"name": "debugger"})).unwrap();
+        assert!(out.contains("# Skill: debugger"));
+        assert!(out.contains("## prompt"));
+    }
+
+    #[test]
+    fn render_loaded_skill_includes_body_and_resources() {
+        let mut skill = test_skill("demo", "demo description");
+        skill.prompt = "line one\nline two".to_string();
+        skill.resource_path = Some("/tmp/demo/resources".to_string());
+        let out = render_loaded_skill(&skill);
+        assert!(out.contains("# Skill: demo"));
+        assert!(out.contains("description: demo description"));
+        assert!(out.contains("## prompt"));
+        assert!(out.contains("line one\nline two"));
+        // 有 bundled 资源时才暴露目录
+        assert!(out.contains("Bundled resource directory: /tmp/demo/resources"));
+    }
+
+    #[test]
+    fn render_loaded_skill_omits_resources_when_absent() {
+        let mut skill = test_skill("demo", "demo description");
+        skill.prompt = "body".to_string();
+        let out = render_loaded_skill(&skill);
+        assert!(!out.contains("Bundled resource directory"));
+        assert!(!out.contains("## resources"));
     }
 
     fn test_skill(name: &str, description: &str) -> SkillManifest {

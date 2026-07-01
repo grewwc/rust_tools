@@ -171,6 +171,12 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 }
 
 fn resolve_effective_path(path: PathBuf) -> PathBuf {
+    // 先展开开头的 `~`：模型常按 shell 习惯给出 `~/.config/...`，但 `~` 只有
+    // shell 才会展开，Rust 里它不是绝对路径，会被错误拼到 effective_cwd 之后。
+    let path = match path.to_str() {
+        Some(s) => PathBuf::from(crate::commonw::utils::expanduser(s).as_ref()),
+        None => path,
+    };
     if path.is_absolute() {
         return normalize_lexical(&path);
     }
