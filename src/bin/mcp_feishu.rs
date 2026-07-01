@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use std::{fs, os::unix::fs::PermissionsExt};
+use std::{fs, os::unix::fs::OpenOptionsExt, os::unix::fs::PermissionsExt};
 
 use reqwest::blocking::Client;
 use rust_tools::commonw::{FastMap, configw};
@@ -222,7 +222,7 @@ fn handle_tools_list() -> Result<Value, JsonRpcErr> {
                     "type": "object",
                     "properties": {
                         "redirect_uri": { "type": "string", "description": "Redirect URI configured in Feishu console. Default: http://127.0.0.1:8711/callback" },
-                        "scope": { "type": "string", "description": "Scopes separated by space. Default: offline_access im:chat:readonly im:message:readonly docs:doc:readonly docx:document:readonly wiki:wiki:readonly sheets:spreadsheet" },
+                        "scope": { "type": "string", "description": "Optional. Space-separated scopes. If omitted, defaults to the full scope set required by this MCP server's tools (docs/docx/sheets/wiki/im/base/etc.). Only pass this to request a custom subset; a narrower set may make some tools fail." },
                         "state": { "type": "string", "description": "Opaque state string for CSRF protection" },
                         "prompt": { "type": "string", "description": "Optional. Use \"consent\" to force explicit consent UI." }
                     }
@@ -648,16 +648,16 @@ fn feishu_messages_search_with_token(
 
     while scanned_pages < max_pages && matches.len() < limit {
         let (status, text) = do_messages_list_request(
-            &client,
-            &base_url,
-            &token,
+            client,
+            base_url,
+            token,
             container_id_type,
-            &container_id,
+            container_id,
             sort_type,
             page_size,
             page_token.as_deref(),
-            start_time.as_deref(),
-            end_time.as_deref(),
+            start_time,
+            end_time,
         )?;
         if !status.is_success() {
             return Err(json_rpc_error(
@@ -926,81 +926,6 @@ fn list_recent_chats(
         all_chats.truncate(max_chats);
     }
     Ok(all_chats)
-}
-
-/// Fetch messages from a specific chat.
-fn fetch_chat_messages(
-    client: &Client,
-    base_url: &str,
-    access_token: &str,
-    chat_id: &str,
-    msgs_per_chat: u64,
-    max_pages: u64,
-) -> Result<Vec<Value>, JsonRpcErr> {
-    let mut all_messages = Vec::new();
-    let mut page_token: Option<String> = None;
-
-    for _page in 0..max_pages {
-        let (status, body_text) = do_messages_list_request(
-            client,
-            base_url,
-            access_token,
-            "chat",
-            chat_id,
-            "ByCreateTimeDesc",
-            msgs_per_chat as usize,
-            page_token.as_deref(),
-            None,
-            None,
-        )?;
-        if !status.is_success() {
-            return Err(json_rpc_error(
-                -32000,
-                "Messages list API returned error code",
-                Some(json!({
-                    "status": status.as_u16(),
-                    "body": body_text
-                })),
-            ));
-        }
-
-        let body = parse_json_response_body(
-            "messages response",
-            status,
-            Some("application/json"),
-            &body_text,
-        )?;
-
-        let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-        if code != 0 {
-            return Err(json_rpc_error(
-                -32000,
-                &format!("Messages API error: code={}", code),
-                Some(body),
-            ));
-        }
-
-        let data = body.get("data").cloned().unwrap_or_else(|| json!({}));
-        let items = data
-            .get("items")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
-
-        let is_empty = items.is_empty();
-        all_messages.extend(items);
-
-        page_token = data
-            .get("page_token")
-            .and_then(|v| v.as_str())
-            .map(|v| v.to_string())
-            .filter(|v| !v.is_empty());
-        if page_token.is_none() || is_empty {
-            break;
-        }
-    }
-
-    Ok(all_messages)
 }
 
 fn read_response_text(
@@ -1897,7 +1822,7 @@ fn infer_docs_type(token: &str) -> String {
     if t.len() < 10 {
         return "docx".to_string();
     }
-    if t.starts_with("bascn") || t.starts_with("bascnt") {
+    if t.starts_with("bascn") {
         return "sheet".to_string();
     }
     "docx".to_string()
@@ -3821,7 +3746,12 @@ fn refresh_user_access_token_and_cache(
     let _ = save_token_store(&TokenStore {
         user_access_token: Some(refreshed.user_access_token.clone()),
         user_access_token_expires_at_epoch_ms: Some(epoch_ms_from_instant(refreshed.expires_at)),
-        refresh_token: Some(refreshed.refresh_token.clone()),
+        // 飞书刷新接口不保证轮换 refresh_token；未轮换时返回空串。此处若无条件写回
+        // 会把存储里仍然有效的 refresh_token 清空，导致后续自动刷新彻底失效。故仅在
+        // 拿到非空新值时才覆盖，与 exchange_code / refresh 工具两条路径保持一致。
+        refresh_token: (!refreshed.refresh_token.is_empty())
+            .then(|| refreshed.refresh_token.clone())
+            .or_else(|| Some(refresh_token.clone())),
         refresh_token_expires_in: Some(refreshed.refresh_expires_in),
         updated_at_epoch_ms: Some(epoch_ms_now()),
     });
@@ -3986,7 +3916,12 @@ fn feishu_oauth_authorize_url(args: &Value) -> Result<String, JsonRpcErr> {
         ));
     }
 
-    let scope = FEISHU_SCOPE;
+    let scope = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(FEISHU_SCOPE);
     let state = args
         .get("state")
         .and_then(|v| v.as_str())
@@ -3994,7 +3929,7 @@ fn feishu_oauth_authorize_url(args: &Value) -> Result<String, JsonRpcErr> {
     let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
 
     let encoded_redirect = url_encode_component(&redirect_uri);
-    let encoded_scope = url_encode_component(&scope);
+    let encoded_scope = url_encode_component(scope);
     let encoded_state = url_encode_component(state);
 
     let mut url = format!(
@@ -4056,12 +3991,11 @@ fn feishu_oauth_wait_local_code(args: &Value) -> Result<String, JsonRpcErr> {
     let stop_flag = Arc::new(AtomicBool::new(false));
     let worker_stop_flag = Arc::clone(&stop_flag);
     let worker = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(timeout_sec);
+        // worker 不再自持 deadline：唯一权威超时源是主线程的 recv_timeout，
+        // 避免"两个独立倒计时叠加"——worker 曾因自身 deadline 先到而在即将
+        // send 已收到的 code 前退出、把授权码丢弃。worker 只在 stop_flag 置位时退出。
         loop {
             if worker_stop_flag.load(Ordering::Relaxed) {
-                break;
-            }
-            if Instant::now() >= deadline {
                 break;
             }
             let mut accepted: Option<TcpStream> = None;
@@ -4438,8 +4372,10 @@ fn feishu_oauth_refresh_user_access_token(args: &Value) -> Result<String, JsonRp
     let _ = save_token_store(&TokenStore {
         user_access_token: Some(refreshed.user_access_token.clone()),
         user_access_token_expires_at_epoch_ms: Some(epoch_ms_from_instant(refreshed.expires_at)),
+        // 未轮换（返回空）时保留本次使用的 refresh_token，避免把有效凭据清空。
         refresh_token: (!refreshed.refresh_token.is_empty())
-            .then_some(refreshed.refresh_token.clone()),
+            .then(|| refreshed.refresh_token.clone())
+            .or_else(|| Some(refresh_token.clone())),
         refresh_token_expires_in: Some(refreshed.refresh_expires_in),
         updated_at_epoch_ms: Some(epoch_ms_now()),
     });
@@ -4519,15 +4455,38 @@ fn save_token_store(store: &TokenStore) -> Result<(), JsonRpcErr> {
         )
     })?;
 
-    fs::write(&path, s).map_err(|e| {
+    // 原子落盘：先写到同目录的临时文件（创建时即用 0o600 打开，杜绝"先默认权限
+    // 落盘、再收权限"之间 token 短暂全局可读的窗口），再 rename 覆盖目标。
+    // rename 同一文件系统内是原子的，写到一半崩溃也不会损坏既有 token store。
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
+    let write_tmp = || -> io::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(s.as_bytes())?;
+        f.flush()?;
+        Ok(())
+    };
+    write_tmp().map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        json_rpc_error(
+            -32000,
+            "Failed to write token store",
+            Some(json!({ "path": tmp_path.display().to_string(), "error": e.to_string() })),
+        )
+    })?;
+
+    fs::rename(&tmp_path, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
         json_rpc_error(
             -32000,
             "Failed to write token store",
             Some(json!({ "path": path.display().to_string(), "error": e.to_string() })),
         )
     })?;
-
-    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     Ok(())
 }
 
@@ -7315,5 +7274,150 @@ mod tests {
         };
         let searchable = build_feishu_global_searchable_text(&item, &chat);
         assert_eq!(searchable, "hello world");
+    }
+
+    fn with_temp_token_store<F: FnOnce()>(body: F) {
+        let path = format!(
+            "/tmp/mcp_feishu_token_test_{}_{}.json",
+            std::process::id(),
+            epoch_ms_now()
+        );
+        let old = std::env::var("FEISHU_TOKEN_STORE_PATH").ok();
+        let _ = fs::remove_file(&path);
+        unsafe {
+            std::env::set_var("FEISHU_TOKEN_STORE_PATH", &path);
+        }
+        body();
+        let _ = fs::remove_file(&path);
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("FEISHU_TOKEN_STORE_PATH", v),
+                None => std::env::remove_var("FEISHU_TOKEN_STORE_PATH"),
+            }
+        }
+    }
+
+    #[test]
+    fn save_token_store_writes_atomically_with_owner_only_permissions() {
+        let _guard = env_lock().lock().unwrap();
+        with_temp_token_store(|| {
+            save_token_store(&TokenStore {
+                user_access_token: Some("u-secret".to_string()),
+                user_access_token_expires_at_epoch_ms: Some(epoch_ms_now() + 3_600_000),
+                refresh_token: Some("r-secret".to_string()),
+                refresh_token_expires_in: Some(1_000_000),
+                updated_at_epoch_ms: Some(epoch_ms_now()),
+            })
+            .unwrap();
+
+            let path = token_store_path();
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "token store must be owner-only readable/writable");
+
+            // 重写覆盖不应损坏文件，且仍保持 0o600。
+            save_token_store(&TokenStore {
+                user_access_token: Some("u-secret-2".to_string()),
+                user_access_token_expires_at_epoch_ms: Some(epoch_ms_now() + 3_600_000),
+                refresh_token: Some("r-secret-2".to_string()),
+                refresh_token_expires_in: Some(1_000_000),
+                updated_at_epoch_ms: Some(epoch_ms_now()),
+            })
+            .unwrap();
+            let mode2 = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode2, 0o600);
+            let reloaded = load_token_store().unwrap();
+            assert_eq!(reloaded.user_access_token.as_deref(), Some("u-secret-2"));
+            assert_eq!(reloaded.refresh_token.as_deref(), Some("r-secret-2"));
+        });
+    }
+
+    #[test]
+    fn refresh_response_without_rotation_preserves_existing_refresh_token() {
+        let _guard = env_lock().lock().unwrap();
+        let old_client_id = std::env::var("FEISHU_CLIENT_ID").ok();
+        let old_client_secret = std::env::var("FEISHU_CLIENT_SECRET").ok();
+        let old_base = std::env::var("FEISHU_BASE_URL").ok();
+        // 模拟飞书刷新接口：返回新的 access_token 但 refresh_token 为空（未轮换）。
+        let base = start_mock_http_server(|_req| {
+            json!({
+                "code": 0,
+                "access_token": "u-new-access",
+                "refresh_token": "",
+                "expires_in": 7200,
+                "refresh_token_expires_in": 0
+            })
+            .to_string()
+        });
+        with_temp_token_store(|| {
+            unsafe {
+                std::env::set_var("FEISHU_CLIENT_ID", "cli_test");
+                std::env::set_var("FEISHU_CLIENT_SECRET", "secret_test");
+                std::env::set_var("FEISHU_BASE_URL", &base);
+                std::env::remove_var("FEISHU_REFRESH_TOKEN");
+            }
+            save_token_store(&TokenStore {
+                user_access_token: Some("u-old".to_string()),
+                user_access_token_expires_at_epoch_ms: Some(epoch_ms_now() + 1_000),
+                refresh_token: Some("r-existing".to_string()),
+                refresh_token_expires_in: Some(1_000_000),
+                updated_at_epoch_ms: Some(epoch_ms_now()),
+            })
+            .unwrap();
+
+            let client = Client::builder().build().unwrap();
+            let token = refresh_user_access_token_and_cache(&client, &base).unwrap();
+            assert_eq!(token, "u-new-access");
+
+            let reloaded = load_token_store().unwrap();
+            assert_eq!(
+                reloaded.refresh_token.as_deref(),
+                Some("r-existing"),
+                "un-rotated refresh must keep the existing refresh_token, not wipe it"
+            );
+            assert_eq!(reloaded.user_access_token.as_deref(), Some("u-new-access"));
+        });
+
+        unsafe {
+            match old_client_id {
+                Some(v) => std::env::set_var("FEISHU_CLIENT_ID", v),
+                None => std::env::remove_var("FEISHU_CLIENT_ID"),
+            }
+            match old_client_secret {
+                Some(v) => std::env::set_var("FEISHU_CLIENT_SECRET", v),
+                None => std::env::remove_var("FEISHU_CLIENT_SECRET"),
+            }
+            match old_base {
+                Some(v) => std::env::set_var("FEISHU_BASE_URL", v),
+                None => std::env::remove_var("FEISHU_BASE_URL"),
+            }
+        }
+    }
+
+    #[test]
+    fn oauth_authorize_url_uses_custom_scope_when_provided() {
+        let _guard = env_lock().lock().unwrap();
+        let old_client_id = std::env::var("FEISHU_CLIENT_ID").ok();
+        unsafe {
+            std::env::set_var("FEISHU_CLIENT_ID", "cli_scope_test");
+        }
+        let custom = feishu_oauth_authorize_url(&json!({
+            "redirect_uri": "http://127.0.0.1:8711/callback",
+            "scope": "docx:document:readonly wiki:node:read"
+        }))
+        .unwrap();
+        assert!(custom.contains("scope=docx%3Adocument%3Areadonly%20wiki%3Anode%3Aread"));
+
+        let default_scope = feishu_oauth_authorize_url(&json!({
+            "redirect_uri": "http://127.0.0.1:8711/callback"
+        }))
+        .unwrap();
+        assert!(default_scope.contains(&url_encode_component(FEISHU_SCOPE)));
+
+        unsafe {
+            match old_client_id {
+                Some(v) => std::env::set_var("FEISHU_CLIENT_ID", v),
+                None => std::env::remove_var("FEISHU_CLIENT_ID"),
+            }
+        }
     }
 }
