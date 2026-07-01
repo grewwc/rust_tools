@@ -4,8 +4,9 @@
 /// - **Knowledge (知识库)**:
 ///   用户主动保存的项目知识、决策记录、偏好设置等
 ///   - 工具: `knowledge_save`, `knowledge_forget`, `knowledge_search`, `knowledge_list`
-///   - 用途: 用户显式管理的事实性知识，如项目结构、技术决策、用户偏好
-///   - 类别: `user_memory`, `project_info`, `architecture`, `decision_log` 等
+///   - 用途: 用户显式管理的事实性知识，以及明确要求长期记住的原则/偏好/约束
+///   - 类别: `user_memory`, `project_info`, `architecture`, `decision_log`,
+///     `common_sense`, `coding_guideline`, `preference`, `user_preference`, `safety_rules`
 ///
 /// - **Memory (记忆)**: Agent 内部自动学习的行为规则、安全策略、自我反思
 ///   - 工具: `memory_save`, `memory_search`, `memory_recent` (内部使用)
@@ -50,13 +51,18 @@
 ///
 use serde_json::Value;
 
+use crate::ai::knowledge::retrieval::recall::is_guideline_category;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
+use crate::ai::tools::service::memory::{
+    MemoryOwnerScope, next_memory_id, prepare_memory_save_entry,
+};
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
 use crate::ai::tools::storage::rag_store::{RagEntry, ensure_rag_store, get_rag_store};
 use chrono::Local;
 
-/// 32 字符短指纹（取 SHA-256 前 16 字节）。
+/// 旧版 knowledge_save 曾用 “timestamp:note” 的短哈希作为 RAG id。
+/// 新实现改用 memory entry id；这里只保留旧算法作为删除兼容兜底。
 fn short_rag_id(bytes: &[u8]) -> String {
     let digest = <sha2::Sha256 as sha2::Digest>::digest(bytes);
     let mut s = String::with_capacity(32);
@@ -64,6 +70,16 @@ fn short_rag_id(bytes: &[u8]) -> String {
         s.push_str(&format!("{:02x}", b));
     }
     s
+}
+
+fn legacy_rag_id_for_entry(entry: &AgentMemoryEntry) -> String {
+    short_rag_id(format!("{}:{}", entry.timestamp, entry.note).as_bytes())
+}
+
+fn rag_timestamp_for_entry(entry: &AgentMemoryEntry) -> u64 {
+    chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
+        .map(|dt| dt.timestamp_millis().max(0) as u64)
+        .unwrap_or_else(|_| entry.timestamp.parse().unwrap_or(0))
 }
 
 // ─── knowledge_save ──────────────────────────────────────────────────────────
@@ -78,7 +94,7 @@ fn params_knowledge_save() -> Value {
             },
             "category": {
                 "type": "string",
-                "description": "Category label (default: \"user_memory\")."
+                "description": "Category label (default: \"user_memory\"). Use `common_sense` / `coding_guideline` / `preference` / `user_preference` / `safety_rules` for durable principles or constraints; use `user_memory` / `project_info` / `architecture` / `decision_log` for factual knowledge."
             },
             "tags": {
                 "type": "array",
@@ -91,7 +107,7 @@ fn params_knowledge_save() -> Value {
             },
             "priority": {
                 "type": "integer",
-                "description": "Priority level 0-255. 255=permanent (never delete), 100-200=high, 50-99=normal, 0-49=low. Default: 150 for user-directed memory."
+                "description": "Priority level 0-255. 255=permanent (never delete), 100-200=high, 50-99=normal, 0-49=low. Default follows category semantics: `user_memory`=150, `common_sense`/`coding_guideline`/`preference`/`user_preference`=210, `safety_rules`=255."
             }
         },
         "required": ["content"]
@@ -99,35 +115,20 @@ fn params_knowledge_save() -> Value {
 }
 
 fn execute_knowledge_save(args: &Value) -> Result<String, String> {
-    let content = args["content"]
-        .as_str()
-        .ok_or("Missing 'content'. Provide the text to remember.")?;
-    let category = args["category"].as_str().unwrap_or("user_memory");
-    let tags: Vec<String> = args["tags"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let source = args["source"].as_str().map(String::from);
-    let priority = args["priority"].as_u64().map(|p| p as u8).unwrap_or(150);
-
-    let now = chrono::Local::now().to_rfc3339();
-
-    let entry = AgentMemoryEntry {
-        id: None,
-        timestamp: now,
-        category: category.to_string(),
-        note: content.to_string(),
-        tags,
-        source,
-        priority: Some(priority),
-        owner_pid: None,
-        owner_pgid: None,
-        image_path: None,
-    };
+    let prepared = prepare_memory_save_entry(
+        args,
+        "user_memory",
+        &[],
+        "knowledge_save",
+        MemoryOwnerScope::Global,
+        "knowledge_save_downgraded",
+    )?;
+    let crate::ai::tools::service::memory::PreparedMemorySave {
+        requested_category,
+        downgraded,
+        assessment: _assessment,
+        entry,
+    } = prepared;
 
     let store = MemoryStore::from_env_or_config();
     store.append(&entry)?;
@@ -136,25 +137,29 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
     if let Ok(_) = ensure_rag_store() {
         if let Ok(guard) = get_rag_store() {
             if let Some(rag) = guard.as_ref() {
-                let id = short_rag_id(format!("{}:{}", entry.timestamp, content).as_bytes());
-                let embedding_text = format!("{}: {}", entry.category, entry.note);
-                if let Ok(embeddings) = rag.embed_texts(&[embedding_text.clone()]) {
-                    if let Some(embedding) = embeddings.into_iter().next() {
-                        let _ = rag.upsert(RagEntry {
-                            id,
-                            content: embedding_text,
-                            category: entry.category.clone(),
-                            tags: entry.tags.clone(),
-                            embedding,
-                            timestamp: entry.timestamp.parse().unwrap_or(0),
-                        });
+                if let Some(id) = entry.id.clone() {
+                    let embedding_text = format!("{}: {}", entry.category, entry.note);
+                    if let Ok(embeddings) = rag.embed_texts(&[embedding_text.clone()]) {
+                        if let Some(embedding) = embeddings.into_iter().next() {
+                            let _ = rag.upsert(RagEntry {
+                                id,
+                                content: embedding_text,
+                                category: entry.category.clone(),
+                                tags: entry.tags.clone(),
+                                embedding,
+                                timestamp: rag_timestamp_for_entry(&entry),
+                            });
+                        }
                     }
                 }
             }
         }
     }
 
-    let mut result = format!("Saved to knowledge [{}]:\n  {}\n", category, content);
+    let mut result = format!("Saved to knowledge [{}]:\n  {}\n", entry.category, entry.note);
+    if let Some(id) = entry.id.as_deref() {
+        result.push_str(&format!("  ID: {}\n", id));
+    }
     if !entry.tags.is_empty() {
         result.push_str(&format!("  Tags: {}\n", entry.tags.join(", ")));
     }
@@ -162,7 +167,19 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
         result.push_str(&format!("  Source: {}\n", src));
     }
     result.push_str(&format!("  Priority: {}\n", entry.priority.unwrap_or(100)));
-    result.push_str("The agent will automatically check this knowledge in future conversations.");
+    if downgraded && entry.category == "self_note" {
+        result.push_str(&format!(
+            "  Note: requested category '{}' was downgraded to 'self_note' because the content is too generic for durable principle recall.\n",
+            requested_category
+        ));
+        result.push_str(
+            "Saved as short-term self_note; it will not enter persistent guideline recall until the note is more specific and actionable.",
+        );
+    } else if is_guideline_category(&entry.category) {
+        result.push_str("This principle will participate in persistent guideline recall.");
+    } else {
+        result.push_str("The agent will automatically check this knowledge in future conversations.");
+    }
 
     Ok(result)
 }
@@ -170,7 +187,7 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_save",
-        description: "Save user-directed content to the global knowledge base with optional category and tags. The agent automatically checks the knowledge base at the start of each conversation.",
+            description: "Save user-directed content to the global knowledge base with optional category and tags. Use guideline categories like `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` for durable principles/constraints so they participate in persistent recall.",
         parameters: params_knowledge_save,
         execute: execute_knowledge_save,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -222,8 +239,10 @@ fn execute_knowledge_forget(args: &Value) -> Result<String, String> {
     if let Ok(_) = ensure_rag_store() {
         if let Ok(guard) = get_rag_store() {
             if let Some(rag) = guard.as_ref() {
-                let rag_id =
-                    short_rag_id(format!("{}:{}", deleted.timestamp, deleted.note).as_bytes());
+                    let rag_id = deleted
+                        .id
+                        .clone()
+                        .unwrap_or_else(|| legacy_rag_id_for_entry(&deleted));
                 let _ = rag.delete(&rag_id);
             }
         }
@@ -578,7 +597,7 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
             .unwrap_or(150);
 
         new_entries.push(AgentMemoryEntry {
-            id: None,
+            id: Some(next_memory_id()),
             timestamp: Local::now().to_rfc3339(),
             category: category.to_string(),
             note: content.to_string(),
@@ -631,7 +650,29 @@ mod tests {
     use super::*;
     use crate::ai::test_support::ENV_LOCK;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
+    use std::path::Path;
+    use std::sync::MutexGuard;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn env_lock_guard() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn cleanup_memory_artifacts(path: &Path) {
+        let db_path = path.with_extension("db");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+    }
+
+    fn read_entries(path: &Path) -> Vec<AgentMemoryEntry> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<AgentMemoryEntry>(line.trim()).ok())
+            .collect()
+    }
 
     #[test]
     fn test_knowledge_save_params() {
@@ -706,8 +747,109 @@ mod tests {
     }
 
     #[test]
+    fn test_knowledge_save_assigns_id_and_forget_can_delete_it() {
+        let _guard = env_lock_guard();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_knowledge_save_forget_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let save_msg = execute_knowledge_save(&serde_json::json!({
+            "content": "Always confirm before deleting user files or sessions.",
+            "category": "common_sense",
+            "tags": ["safety", "principle"]
+        }))
+        .unwrap();
+        assert!(save_msg.contains("ID: mem_"));
+
+        let entries = read_entries(&path);
+        assert_eq!(entries.len(), 1);
+        let id = entries[0].id.clone().expect("knowledge_save should assign id");
+
+        let forget_msg = execute_knowledge_forget(&serde_json::json!({ "id": id })).unwrap();
+        assert!(forget_msg.contains("Forgotten knowledge entry"));
+        assert!(read_entries(&path).is_empty());
+
+        cleanup_memory_artifacts(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn test_knowledge_save_guideline_category_uses_persistent_priority() {
+        let _guard = env_lock_guard();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_knowledge_save_guideline_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let save_msg = execute_knowledge_save(&serde_json::json!({
+            "content": "Do: require explicit confirmation before destructive file operations.",
+            "category": "common_sense"
+        }))
+        .unwrap();
+        assert!(save_msg.contains("persistent guideline recall"));
+
+        let entries = read_entries(&path);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("mem_"))
+        );
+        assert_eq!(entries[0].category, "common_sense");
+        assert_eq!(entries[0].priority, Some(210));
+
+        cleanup_memory_artifacts(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn test_knowledge_save_downgrades_low_signal_long_term_entry() {
+        let _guard = env_lock_guard();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_knowledge_save_downgrade_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let save_msg = execute_knowledge_save(&serde_json::json!({
+            "content": "be careful",
+            "category": "common_sense"
+        }))
+        .unwrap();
+        assert!(save_msg.contains("downgraded to 'self_note'"));
+
+        let entries = read_entries(&path);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].category, "self_note");
+        assert_eq!(entries[0].priority, Some(120));
+        assert!(entries[0].tags.iter().any(|tag| tag == "auto_downgraded"));
+
+        cleanup_memory_artifacts(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
     fn test_execute_consolidation_applies_delete_and_save_atomically() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = env_lock_guard();
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -770,14 +912,16 @@ mod tests {
             .filter_map(|line| serde_json::from_str::<AgentMemoryEntry>(line.trim()).ok())
             .collect();
         assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0]
+                .id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("mem_"))
+        );
         assert_eq!(entries[0].note, "merged memo");
         assert_eq!(entries[0].category, "user_memory");
 
-        let db_path = path.with_extension("db");
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(&db_path);
-        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
-        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+        cleanup_memory_artifacts(&path);
         unsafe {
             std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
         }

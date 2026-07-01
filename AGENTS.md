@@ -55,6 +55,7 @@ cargo test --bin a test_xxx       # Filter tests by name
 2. **Driver layer** (`src/bin/ai/driver/`)
    - `run()` entry point invokes the main `run_loop()` event loop
    - Each iteration of the event loop: schedule → background processes → foreground input → turn execution
+   - One-shot knowledge maintenance CLI actions such as `--consolidate-knowledge` and `--migrate-legacy-knowledge` run against the persona-scoped memory file before entering `run_loop()`.
    - `turn_runtime/`: prepares context, then iterates through LLM calls interleaved with tool calls, then finalizes
    - `thinking/`: decomposes the user's goal into sub-goals and verifies the decomposition against available tools
    - `reflection/`: runs background reflection after each turn and writes knowledge back to long-term memory

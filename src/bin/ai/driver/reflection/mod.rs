@@ -378,6 +378,63 @@ mod tests {
         }
     }
 
+      #[test]
+      fn persistent_guidelines_include_legacy_saved_and_generalized_principles() {
+          let _guard = ENV_LOCK.lock().unwrap();
+          let ts = std::time::SystemTime::now()
+              .duration_since(std::time::UNIX_EPOCH)
+              .unwrap()
+              .as_nanos();
+          let path = std::env::temp_dir().join(format!("rt_legacy_guidelines_{ts}.jsonl"));
+          unsafe {
+              std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+          }
+
+          let store = MemoryStore::from_env_or_config();
+          let timestamp = Local::now().to_rfc3339();
+          store
+              .append(&AgentMemoryEntry {
+                  id: Some("mem_legacy_principle".to_string()),
+                  timestamp: timestamp.clone(),
+                  category: "user_memory".to_string(),
+                  note: "Do: ask for confirmation before destructive file operations.\nAvoid: deleting user data without an explicit yes.".to_string(),
+                  tags: vec!["principle".to_string()],
+                  source: Some("knowledge_save".to_string()),
+                  priority: Some(150),
+                  owner_pid: None,
+                  owner_pgid: None,
+                  image_path: None,
+              })
+              .unwrap();
+          store
+              .append(&AgentMemoryEntry {
+                  id: Some("principle_test_1".to_string()),
+                  timestamp,
+                  category: "generalized_principle".to_string(),
+                  note: "[domain=tool_safety] [abstraction=3] [confidence=0.88] [reinforced=2] In tool safety, Do: require explicit user confirmation before destructive actions.\nCross-domain links: file_ops".to_string(),
+                  tags: vec!["generalized".to_string(), "principle".to_string()],
+                  source: Some("experience_generalizer".to_string()),
+                  priority: Some(190),
+                  owner_pid: None,
+                  owner_pgid: None,
+                  image_path: None,
+              })
+              .unwrap();
+
+          let guidelines = build_persistent_guidelines("我现在要删文件", 1200).expect("guidelines");
+
+          assert!(guidelines.contains("Do: ask for confirmation before destructive file operations."));
+          assert!(guidelines.contains("Avoid: deleting user data without an explicit yes."));
+          assert!(guidelines.contains("In tool safety, Do: require explicit user confirmation before destructive actions."));
+          assert!(!guidelines.contains("[domain=tool_safety]"));
+          assert!(!guidelines.contains("Cross-domain links:"));
+
+          let _ = std::fs::remove_file(&path);
+          unsafe {
+              std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+          }
+      }
+
     #[test]
     fn repo_inspection_tools_are_detected_from_turn_messages() {
         let messages = vec![

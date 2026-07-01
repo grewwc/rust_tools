@@ -1276,6 +1276,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await;
     }
+    if app.cli.migrate_legacy_knowledge {
+        return runtime_ctx::PERSONA_MEMORY_PATH
+            .scope(
+                app.current_persona_memory_file(),
+                handle_migrate_legacy_knowledge(&app),
+            )
+            .await;
+    }
 
     if decision_log_persist_enabled() {
         let decision_log_path = app
@@ -1862,7 +1870,7 @@ fn build_consolidation_merge_entries(
         merged_count += ids.len();
         merge_delete_ids.extend(ids.iter().map(|id| (*id).to_string()));
         new_entries.push(crate::ai::tools::storage::memory_store::AgentMemoryEntry {
-            id: None,
+            id: Some(crate::ai::tools::service::memory::next_memory_id()),
             timestamp: chrono::Local::now().to_rfc3339(),
             category: "user_memory".into(),
             note: content.to_string(),
@@ -1876,6 +1884,16 @@ fn build_consolidation_merge_entries(
     }
 
     (merge_delete_ids, merged_count, new_entries)
+}
+
+async fn handle_migrate_legacy_knowledge(_app: &App) -> Result<(), Box<dyn std::error::Error>> {
+    let report = crate::ai::tools::service::memory::migrate_legacy_knowledge_entries()
+        .map_err(std::io::Error::other)?;
+    println!(
+        "{}",
+        crate::ai::tools::service::memory::format_legacy_knowledge_migration_report(&report)
+    );
+    Ok(())
 }
 
 /// 处理 --consolidate-knowledge：读取全部知识条目 → 模型分析 → 执行整理。
@@ -3543,6 +3561,12 @@ mod tests {
           assert!(delete_ids.contains("id_b"));
           assert!(!delete_ids.contains("ignored"));
           assert_eq!(new_entries.len(), 1);
+          assert!(
+              new_entries[0]
+                  .id
+                  .as_deref()
+                  .is_some_and(|id| id.starts_with("mem_"))
+          );
           assert_eq!(new_entries[0].note, "合并后的内容");
           assert_eq!(new_entries[0].tags, vec!["consolidated".to_string()]);
       }

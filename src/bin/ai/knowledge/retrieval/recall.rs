@@ -34,10 +34,10 @@ pub fn build_persistent_guidelines(
                 if score < config.thresholds.min_score_guideline {
                     continue;
                 }
-                if !e.category_enum().is_guideline() {
+                if !should_include_in_persistent_guidelines(&e) {
                     continue;
                 }
-                entries.push(e);
+                entries.push(normalize_persistent_guideline_entry(e));
             }
         }
     }
@@ -49,11 +49,27 @@ pub fn build_persistent_guidelines(
                 if score < 0.2 {
                     continue;
                 }
-                if !e.category_enum().is_guideline() {
+                if !should_include_in_persistent_guidelines(&e) {
                     continue;
                 }
-                entries.push(e);
+                entries.push(normalize_persistent_guideline_entry(e));
             }
+        }
+    }
+
+    // 兼容历史知识：
+    // 1. 旧版 knowledge_save 存进 `user_memory` 的“原则型”条目；
+    // 2. 系统内部沉淀的 `generalized_principle`。
+    // 它们不一定命中 guideline category 搜索，但仍应进入持久原则召回。
+    if let Ok(all_entries) = store.list_all() {
+        for entry in all_entries {
+            if entry.category_enum().is_guideline() {
+                continue;
+            }
+            if !should_include_in_persistent_guidelines(&entry) {
+                continue;
+            }
+            entries.push(normalize_persistent_guideline_entry(entry));
         }
     }
 
@@ -62,8 +78,9 @@ pub fn build_persistent_guidelines(
         if let Ok(recent) = store.recent(100) {
             entries = recent
                 .into_iter()
-                .filter(|e| e.category_enum().is_guideline())
+                .filter(|e| should_include_in_persistent_guidelines(e))
                 .filter(|e| e.priority_value() >= 150)
+                .map(normalize_persistent_guideline_entry)
                 .collect();
         }
     }
@@ -78,9 +95,8 @@ pub fn build_persistent_guidelines(
     // Rank and group
     let mut ranked: Vec<(u8, u8, i64, KnowledgeEntry)> = Vec::with_capacity(entries.len());
     for e in entries {
-        let cat = e.category_enum();
         let priority = e.priority_value();
-        let group = GuidelineGroup::from_category(&cat).as_u8();
+        let group = guideline_group_for_entry(&e).as_u8();
 
         if group >= 3 && priority < 200 {
             continue;
@@ -147,6 +163,82 @@ pub fn build_persistent_guidelines(
 
     if used <= "Persistent Guidelines:\n".len() {
         return None;
+    }
+    Some(out)
+}
+
+fn is_generalized_principle_category(category: &str) -> bool {
+    category.eq_ignore_ascii_case("generalized_principle")
+}
+
+fn is_legacy_user_memory_principle(entry: &KnowledgeEntry) -> bool {
+    if !matches!(entry.category_enum(), Category::UserMemory) {
+        return false;
+    }
+    if entry.priority_value() < 150 {
+        return false;
+    }
+    crate::ai::driver::reflection::assess_learning_note_quality(&entry.note).high_quality
+}
+
+fn should_include_in_persistent_guidelines(entry: &KnowledgeEntry) -> bool {
+    entry.category_enum().is_guideline()
+        || is_generalized_principle_category(&entry.category)
+        || is_legacy_user_memory_principle(entry)
+}
+
+fn guideline_group_for_entry(entry: &KnowledgeEntry) -> GuidelineGroup {
+    let cat = entry.category_enum();
+    if cat.is_guideline() {
+        return GuidelineGroup::from_category(&cat);
+    }
+    if is_generalized_principle_category(&entry.category) || is_legacy_user_memory_principle(entry)
+    {
+        return GuidelineGroup::Preferences;
+    }
+    GuidelineGroup::Other
+}
+
+fn normalize_persistent_guideline_entry(mut entry: KnowledgeEntry) -> KnowledgeEntry {
+    if is_generalized_principle_category(&entry.category)
+        && let Some(stripped) = strip_generalized_principle_note(&entry.note)
+        && !stripped.trim().is_empty()
+    {
+        entry.note = stripped;
+    }
+    entry
+}
+
+fn strip_generalized_principle_note(note: &str) -> Option<String> {
+    let mut lines = note.lines();
+    let first = lines.next()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+
+    let mut principle = first;
+    if first.starts_with("[domain=") {
+        let mut rest = first;
+        for _ in 0..4 {
+            let end = rest.find(']')?;
+            rest = rest[end + 1..].trim_start();
+        }
+        principle = rest;
+    }
+
+    let mut out = String::new();
+    if !principle.is_empty() {
+        out.push_str(principle);
+    }
+    for line in lines {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("Cross-domain links:") {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(line);
     }
     Some(out)
 }

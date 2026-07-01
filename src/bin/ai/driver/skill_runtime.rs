@@ -786,7 +786,7 @@ fn build_system_prompt(
     }
 
     if has_tool(available_tools, "knowledge_save") {
-        b.push(ContextKind::Policy, "Knowledge save:\n- If the user asks to remember or states a durable preference/constraint, call `knowledge_save`.\n- When asked about remembered info, use `knowledge_search` or `knowledge_list`.");
+        b.push(ContextKind::Policy, "Knowledge save:\n- If the user asks to remember or states a durable preference/constraint, call `knowledge_save`.\n- When saving a durable principle, preference, safety rule, or coding rule, choose a guideline category such as `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` so it participates in persistent recall.\n- Use `user_memory` / `project_info` / `architecture` / `decision_log` for factual knowledge.\n- When asked about remembered info, use `knowledge_search` or `knowledge_list`.");
     }
 
     if has_tool(available_tools, "plan") || has_tool(available_tools, "spawn_process") {
@@ -1579,6 +1579,7 @@ mod tests {
         let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
         assert!(prompt.contains("Knowledge save:"));
         assert!(prompt.contains("call `knowledge_save`"));
+          assert!(prompt.contains("`common_sense`, `coding_guideline`"));
         assert!(prompt.contains("`knowledge_search` or `knowledge_list`"));
         assert!(!prompt.contains("call `memory_save`"));
     }

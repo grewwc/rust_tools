@@ -22,6 +22,31 @@ fn current_owner_tags() -> (Option<u64>, Option<u64>) {
     (None, None)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MemoryOwnerScope {
+    Scoped,
+    Global,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedMemorySave {
+    pub(crate) requested_category: String,
+    pub(crate) downgraded: bool,
+    pub(crate) assessment: crate::ai::driver::reflection::LearningNoteAssessment,
+    pub(crate) entry: AgentMemoryEntry,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LegacyKnowledgeMigrationReport {
+    pub(crate) memory_path: std::path::PathBuf,
+    pub(crate) backup_path: Option<std::path::PathBuf>,
+    pub(crate) scanned: usize,
+    pub(crate) assigned_ids: usize,
+    pub(crate) promoted_principles: usize,
+    pub(crate) normalized_guideline_priorities: usize,
+    pub(crate) touched: bool,
+}
+
 fn is_memory_visible_to(entry: &AgentMemoryEntry, viewer_pid: Option<u64>) -> bool {
     let Some(viewer) = viewer_pid else {
         return true;
@@ -160,7 +185,7 @@ fn render_memory_entries(entries: &[AgentMemoryEntry]) -> String {
     output
 }
 
-fn next_memory_id() -> String {
+pub(crate) fn next_memory_id() -> String {
     format!("mem_{}", Uuid::new_v4().simple())
 }
 
@@ -182,6 +207,276 @@ fn default_priority_for_category(category: &str) -> u8 {
     }
 }
 
+fn append_source_marker(source: &mut Option<String>, marker: &str) {
+    match source {
+        Some(value) if value.contains(marker) => {}
+        Some(value) => {
+            value.push(':');
+            value.push_str(marker);
+        }
+        None => {
+            *source = Some(marker.to_string());
+        }
+    }
+}
+
+fn push_unique_tag(tags: &mut Vec<String>, tag: &str) {
+    if !tags.iter().any(|existing| existing == tag) {
+        tags.push(tag.to_string());
+    }
+}
+
+fn looks_like_preference_rule(note: &str) -> bool {
+    let lower = note.to_lowercase();
+    [
+        "prefer ",
+        "preferred",
+        "answer",
+        "response",
+        "tone",
+        "verbosity",
+        "format",
+        "style",
+        "偏好",
+        "喜欢",
+        "不喜欢",
+        "回答",
+        "回复",
+        "语气",
+        "风格",
+        "格式",
+        "简洁",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn looks_like_safety_rule(note: &str) -> bool {
+    let lower = note.to_lowercase();
+    [
+        "delete",
+        "destructive",
+        "danger",
+        "risky",
+        "overwrite",
+        "confirm",
+        "confirmation",
+        "unsafe",
+        "safety",
+        "删除",
+        "破坏性",
+        "危险",
+        "风险",
+        "覆盖",
+        "确认",
+        "安全",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn looks_like_coding_guideline(
+    note: &str,
+    assessment: &crate::ai::driver::reflection::LearningNoteAssessment,
+) -> bool {
+    if assessment.code_signals > 0 || assessment.artifact_signals > 0 {
+        return true;
+    }
+    let lower = note.to_lowercase();
+    [
+        "cargo ",
+        "rust",
+        "python",
+        "typescript",
+        "javascript",
+        "repo",
+        "code",
+        "function",
+        "api",
+        "build",
+        "compile",
+        "test",
+        "patch",
+        "refactor",
+        "tool",
+        "git",
+        "代码",
+        "函数",
+        "接口",
+        "仓库",
+        "构建",
+        "编译",
+        "测试",
+        "补丁",
+        "重构",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn infer_legacy_guideline_category(
+    entry: &AgentMemoryEntry,
+    assessment: &crate::ai::driver::reflection::LearningNoteAssessment,
+) -> &'static str {
+    if looks_like_safety_rule(&entry.note) {
+        "safety_rules"
+    } else if looks_like_preference_rule(&entry.note) {
+        "user_preference"
+    } else if looks_like_coding_guideline(&entry.note, assessment) {
+        "coding_guideline"
+    } else {
+        "common_sense"
+    }
+}
+
+fn should_promote_legacy_principle(
+    entry: &AgentMemoryEntry,
+    assessment: &crate::ai::driver::reflection::LearningNoteAssessment,
+) -> bool {
+    if assessment.high_quality {
+        return true;
+    }
+    if looks_like_preference_rule(&entry.note) {
+        return assessment.directive_signals > 0
+            && assessment.word_count >= 5
+            && assessment.unique_token_ratio >= 0.55;
+    }
+    if looks_like_safety_rule(&entry.note) {
+        return assessment.actionable && assessment.generalizable;
+    }
+    if looks_like_coding_guideline(&entry.note, assessment) {
+        return assessment.generalizable && assessment.directive_signals > 0;
+    }
+    false
+}
+
+fn build_legacy_migration_backup_path(path: &std::path::Path) -> std::path::PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("agent_memory");
+    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("jsonl");
+    let ts = Local::now().format("%Y%m%d%H%M%S");
+    path.with_file_name(format!("{stem}.legacy-migrate-{ts}.{ext}.bak"))
+}
+
+pub(crate) fn migrate_legacy_knowledge_entries() -> Result<LegacyKnowledgeMigrationReport, String> {
+    let store = MemoryStore::from_env_or_config();
+    let path = store.path().to_path_buf();
+
+    super::super::storage::with_memory_file_lock(&path, || {
+        if !path.exists() {
+            return Ok(LegacyKnowledgeMigrationReport {
+                memory_path: path.clone(),
+                backup_path: None,
+                scanned: 0,
+                assigned_ids: 0,
+                promoted_principles: 0,
+                normalized_guideline_priorities: 0,
+                touched: false,
+            });
+        }
+
+        let mut entries = load_memory_entries(&path)?;
+        let scanned = entries.len();
+        let mut assigned_ids = 0usize;
+        let mut promoted_principles = 0usize;
+        let mut normalized_guideline_priorities = 0usize;
+
+        for entry in &mut entries {
+            let missing_id = entry.id.as_deref().is_none_or(|id| id.trim().is_empty());
+            if missing_id {
+                entry.id = Some(next_memory_id());
+                assigned_ids += 1;
+            }
+
+            if missing_id
+                && entry.category == "user_memory"
+                && entry.priority.unwrap_or(150) >= 150
+            {
+                let assessment = crate::ai::driver::reflection::assess_learning_note_quality(&entry.note);
+                if should_promote_legacy_principle(entry, &assessment) {
+                    let target_category = infer_legacy_guideline_category(entry, &assessment);
+                    if entry.category != target_category {
+                        entry.category = target_category.to_string();
+                        entry.priority =
+                            Some(entry.priority.unwrap_or(0).max(default_priority_for_category(target_category)));
+                        push_unique_tag(&mut entry.tags, "legacy_guideline_migrated");
+                        append_source_marker(
+                            &mut entry.source,
+                            "knowledge_legacy_migrated",
+                        );
+                        promoted_principles += 1;
+                    }
+                }
+            }
+
+            if is_long_term_learning_category(&entry.category) {
+                let desired = default_priority_for_category(&entry.category);
+                let current = entry.priority.unwrap_or(0);
+                if current < desired {
+                    entry.priority = Some(desired);
+                    normalized_guideline_priorities += 1;
+                }
+            }
+        }
+
+        let touched =
+            assigned_ids > 0 || promoted_principles > 0 || normalized_guideline_priorities > 0;
+        let backup_path = if touched {
+            let backup_path = build_legacy_migration_backup_path(&path);
+            std::fs::copy(&path, &backup_path)
+                .map_err(|err| format!("Failed to create migration backup: {err}"))?;
+            write_memory_entries(&path, &entries)?;
+            crate::ai::tools::storage::memory_store::rebuild_index_for_path(&path);
+            Some(backup_path)
+        } else {
+            None
+        };
+
+        Ok(LegacyKnowledgeMigrationReport {
+            memory_path: path.clone(),
+            backup_path,
+            scanned,
+            assigned_ids,
+            promoted_principles,
+            normalized_guideline_priorities,
+            touched,
+        })
+    })
+}
+
+pub(crate) fn format_legacy_knowledge_migration_report(
+    report: &LegacyKnowledgeMigrationReport,
+) -> String {
+    if report.scanned == 0 {
+        return format!(
+            "Legacy knowledge migration: no memory file found at {}",
+            report.memory_path.display()
+        );
+    }
+    if !report.touched {
+        return format!(
+            "Legacy knowledge migration: no changes needed.\n  Path: {}\n  Scanned: {}",
+            report.memory_path.display(),
+            report.scanned
+        );
+    }
+
+    let mut out = format!(
+        "Legacy knowledge migration completed.\n  Path: {}\n  Scanned: {}\n  Assigned IDs: {}\n  Promoted principles: {}\n  Normalized guideline priorities: {}",
+        report.memory_path.display(),
+        report.scanned,
+        report.assigned_ids,
+        report.promoted_principles,
+        report.normalized_guideline_priorities,
+    );
+    if let Some(path) = &report.backup_path {
+        out.push_str(&format!("\n  Backup: {}", path.display()));
+    }
+    out
+}
+
 fn is_long_term_learning_category(category: &str) -> bool {
     matches!(
         category,
@@ -195,12 +490,13 @@ fn is_long_term_learning_category(category: &str) -> bool {
     )
 }
 
-fn maybe_downgrade_memory_save(
+fn maybe_downgrade_long_term_save(
     category: &str,
     note: &str,
     tags: &mut Vec<String>,
     source: &mut Option<String>,
     priority: Option<u8>,
+    downgrade_marker: &str,
 ) -> (
     String,
     Option<u8>,
@@ -223,11 +519,12 @@ fn maybe_downgrade_memory_save(
         tags.push("low_signal".to_string());
     }
     if let Some(src) = source.as_mut() {
-        if !src.contains("memory_save_downgraded") {
-            src.push_str(":memory_save_downgraded");
+        if !src.contains(downgrade_marker) {
+            src.push(':');
+            src.push_str(downgrade_marker);
         }
     } else {
-        *source = Some("agent_memory_save:memory_save_downgraded".to_string());
+        *source = Some(downgrade_marker.to_string());
     }
     (
         "self_note".to_string(),
@@ -266,6 +563,69 @@ fn parse_priority_arg(args: &Value, field: &str) -> Result<Option<u8>, String> {
         Some(priority) => Ok(Some(priority as u8)),
         None => Ok(None),
     }
+}
+
+pub(crate) fn prepare_memory_save_entry(
+    args: &Value,
+    fallback_category: &str,
+    default_tags: &[&str],
+    default_source: &str,
+    owner_scope: MemoryOwnerScope,
+    downgrade_marker: &str,
+) -> Result<PreparedMemorySave, String> {
+    let content = args["content"].as_str().ok_or("Missing content")?.trim();
+    if content.is_empty() {
+        return Err("content is empty".to_string());
+    }
+
+    let requested_category = normalized_category(args["category"].as_str(), fallback_category);
+    let mut tags = parse_string_array(&args["tags"]);
+    if tags.is_empty() {
+        tags = default_tags.iter().map(|tag| (*tag).to_string()).collect();
+    }
+
+    let mut source = args["source"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            (!default_source.trim().is_empty()).then(|| default_source.trim().to_string())
+        });
+
+    let requested_priority = parse_priority_arg(args, "priority")?
+        .or_else(|| Some(default_priority_for_category(&requested_category)));
+    let (category, priority, assessment) = maybe_downgrade_long_term_save(
+        &requested_category,
+        content,
+        &mut tags,
+        &mut source,
+        requested_priority,
+        downgrade_marker,
+    );
+    let downgraded = category != requested_category;
+    let (owner_pid, owner_pgid) = match owner_scope {
+        MemoryOwnerScope::Scoped => current_owner_tags(),
+        MemoryOwnerScope::Global => (None, None),
+    };
+
+    Ok(PreparedMemorySave {
+        requested_category,
+        downgraded,
+        assessment,
+        entry: AgentMemoryEntry {
+            id: Some(next_memory_id()),
+            timestamp: Local::now().to_rfc3339(),
+            category,
+            note: content.to_string(),
+            tags,
+            source,
+            priority,
+            owner_pid,
+            owner_pgid,
+            image_path: None,
+        },
+    })
 }
 
 fn load_memory_entries(path: &std::path::Path) -> Result<Vec<AgentMemoryEntry>, String> {
@@ -1219,52 +1579,21 @@ pub(crate) fn delete_memo_entry(target: &AgentMemoryEntry) -> Result<String, Str
 
 /// 用户主动保存记忆到全局 memory store
 pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
-    let content = args["content"].as_str().ok_or("Missing content")?.trim();
-    if content.is_empty() {
-        return Err("content is empty".to_string());
-    }
-
-    let requested_category = normalized_category(args["category"].as_str(), "self_note");
-    let mut tags = args["tags"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_else(|| vec!["agent".to_string(), "memory_save".to_string()]);
-
-    let mut source = args["source"]
-        .as_str()
-        .map(|s| s.trim().to_string())
-        .or(Some("agent_memory_save".to_string()));
-
-    let requested_priority = parse_priority_arg(args, "priority")?
-        .or_else(|| Some(default_priority_for_category(&requested_category)));
-    let (category, priority, assessment) = maybe_downgrade_memory_save(
-        &requested_category,
-        content,
-        &mut tags,
-        &mut source,
-        requested_priority,
-    );
-    let downgraded = category != requested_category;
-    let (owner_pid, owner_pgid) = current_owner_tags();
-    let entry = AgentMemoryEntry {
-        id: Some(next_memory_id()),
-        timestamp: Local::now().to_rfc3339(),
-        category,
-        note: content.to_string(),
-        tags,
-        source,
-        priority,
-        owner_pid,
-        owner_pgid,
-        image_path: None,
-    };
-
+    let prepared = prepare_memory_save_entry(
+        args,
+        "self_note",
+        &["agent", "memory_save"],
+        "agent_memory_save",
+        MemoryOwnerScope::Scoped,
+        "memory_save_downgraded",
+    )?;
+    let crate::ai::tools::service::memory::PreparedMemorySave {
+        requested_category,
+        downgraded,
+        assessment,
+        entry,
+    } = prepared;
+    let content = entry.note.clone();
     let store = MemoryStore::from_env_or_config();
     store.append(&entry)?;
     crate::ai::driver::decision_log::log_memory_save_assessment(
@@ -1273,7 +1602,7 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
         crate::ai::driver::runtime_ctx::current_turn_id_or_zero(),
         &requested_category,
         &entry.category,
-        content,
+        &content,
         &assessment,
         downgraded,
     );
@@ -1289,11 +1618,13 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
 mod tests {
     use super::{
         execute_memory_delete, execute_memory_list_json, execute_memory_save,
-        execute_memory_update, is_memory_visible_to, update_memo_entry,
+        execute_memory_update, is_memory_visible_to, migrate_legacy_knowledge_entries,
+        update_memo_entry,
     };
     use crate::ai::test_support::ENV_LOCK;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
     use chrono::Local;
+    use std::path::Path;
     use std::sync::MutexGuard;
 
     fn env_lock_guard() -> MutexGuard<'static, ()> {
@@ -1301,6 +1632,14 @@ mod tests {
         // 即使前一个 case 因断言失败而 poison，也不该让后续 case
         // 失真成 PoisonError，从而掩盖真正的首发问题。
         ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn cleanup_memory_artifacts(path: &Path) {
+        let db_path = path.with_extension("db");
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
     }
 
     #[test]
@@ -1505,6 +1844,107 @@ mod tests {
         assert_eq!(items[0]["priority"].as_u64().unwrap(), 120);
 
         let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn migrate_legacy_knowledge_assigns_ids_and_promotes_only_principles() {
+        let _guard = env_lock_guard();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_memory_legacy_migrate_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let entries = vec![
+            AgentMemoryEntry {
+                id: None,
+                timestamp: "2025-01-01T00:00:00Z".to_string(),
+                category: "user_memory".to_string(),
+                note: "Do: ask for confirmation before destructive file operations.\nAvoid: deleting user data without an explicit yes.".to_string(),
+                tags: vec![],
+                source: None,
+                priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
+                image_path: None,
+            },
+            AgentMemoryEntry {
+                id: None,
+                timestamp: "2025-01-01T00:00:01Z".to_string(),
+                category: "user_memory".to_string(),
+                note: "Prefer concise, information-dense answers with direct tradeoffs.".to_string(),
+                tags: vec![],
+                source: None,
+                priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
+                image_path: None,
+            },
+            AgentMemoryEntry {
+                id: None,
+                timestamp: "2025-01-01T00:00:02Z".to_string(),
+                category: "user_memory".to_string(),
+                note: "rust_tools 项目结构：src/bin 放入口，src/cw 放通用组件。".to_string(),
+                tags: vec![],
+                source: None,
+                priority: Some(150),
+                owner_pid: None,
+                owner_pgid: None,
+                image_path: None,
+            },
+        ];
+        let lines = entries
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, format!("{lines}\n")).unwrap();
+
+        let report = migrate_legacy_knowledge_entries().unwrap();
+        assert!(report.touched);
+        assert_eq!(report.scanned, 3);
+        assert_eq!(report.assigned_ids, 3);
+        assert_eq!(report.promoted_principles, 2);
+        assert_eq!(report.normalized_guideline_priorities, 0);
+        assert!(report.backup_path.as_ref().is_some_and(|backup| backup.exists()));
+
+        let list = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
+        let items: serde_json::Value = serde_json::from_str(&list).unwrap();
+        let arr = items.as_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert!(arr.iter().all(|item| {
+            item["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("mem_"))
+        }));
+        assert!(arr.iter().any(|item| {
+            item["category"].as_str() == Some("safety_rules")
+                && item["priority"].as_u64() == Some(255)
+        }));
+        assert!(arr.iter().any(|item| {
+            item["category"].as_str() == Some("user_preference")
+                && item["priority"].as_u64() == Some(210)
+        }));
+        assert!(arr.iter().any(|item| {
+            item["category"].as_str() == Some("user_memory")
+                && item["note"]
+                    .as_str()
+                    .is_some_and(|note| note.contains("rust_tools 项目结构"))
+        }));
+
+        let second = migrate_legacy_knowledge_entries().unwrap();
+        assert!(!second.touched);
+
+        if let Some(backup) = report.backup_path {
+            let _ = std::fs::remove_file(backup);
+        }
+        cleanup_memory_artifacts(&path);
         unsafe {
             std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
         }

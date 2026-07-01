@@ -77,6 +77,18 @@ fn memory_index_for(source_path: &Path) -> Option<Arc<MemoryIndex>> {
     }
 }
 
+pub(crate) fn rebuild_index_for_path(path: &Path) {
+    if let Some(idx) = memory_index_for(path)
+        && let Err(err) = idx.rebuild_from_source()
+    {
+        trace_memory_event(
+            "memory.index.rebuild_failed",
+            "MemoryIndex rebuild failed after explicit rewrite; index may drift",
+            &[("path", path.display().to_string()), ("error", err)],
+        );
+    }
+}
+
 /// 由 source jsonl 路径派生出对应的 sqlite 路径：
 /// `agent_memory.jsonl` -> `agent_memory.db`
 /// `agent_memory.subagent-xxx.jsonl` -> `agent_memory.subagent-xxx.db`
