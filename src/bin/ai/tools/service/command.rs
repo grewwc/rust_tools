@@ -76,6 +76,7 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
     let mut i = 0;
     let mut in_single = false;
     let mut in_double = false;
+    let mut pending_heredocs: Vec<HereDocSpec> = Vec::new();
     while i < bytes.len() {
         let b = bytes[i];
         if in_single {
@@ -117,6 +118,16 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                 current.push(bytes[i + 1] as char);
                 i += 2;
             }
+                b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'<' => {
+                    if let Some((end, spec)) = parse_heredoc_at(command, i) {
+                        current.push_str(&command[i..end]);
+                        pending_heredocs.push(spec);
+                        i = end;
+                    } else {
+                        current.push('<');
+                        i += 1;
+                    }
+                }
             // 双字符操作符 `&&` / `||`
             b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
                 segments.push(std::mem::take(&mut current));
@@ -127,10 +138,18 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                 i += 2;
             }
             // 单字符分隔符
-            b';' | b'|' | b'&' | b'\n' => {
+                b';' | b'|' | b'&' => {
                 segments.push(std::mem::take(&mut current));
                 i += 1;
             }
+                b'\n' => {
+                    segments.push(std::mem::take(&mut current));
+                    i += 1;
+                    if !pending_heredocs.is_empty() {
+                        i = skip_heredoc_bodies(command, i, &pending_heredocs);
+                        pending_heredocs.clear();
+                    }
+                }
             _ => {
                 current.push(b as char);
                 i += 1;
@@ -145,6 +164,594 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
         .collect()
 }
 
+#[derive(Debug, Clone)]
+struct HereDocSpec {
+    delimiter: String,
+    strip_tabs: bool,
+    literal_body: bool,
+}
+
+fn parse_heredoc_at(command: &str, start: usize) -> Option<(usize, HereDocSpec)> {
+    let bytes = command.as_bytes();
+    if bytes.get(start) != Some(&b'<') || bytes.get(start + 1) != Some(&b'<') {
+        return None;
+    }
+
+    let mut i = start + 2;
+    let mut strip_tabs = false;
+    if bytes.get(i) == Some(&b'-') {
+        strip_tabs = true;
+        i += 1;
+    }
+    while matches!(bytes.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] == b'\n' {
+        return None;
+    }
+
+    let mut delimiter = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut saw_any = false;
+    let mut literal_body = false;
+
+    while i < bytes.len() {
+        let Some(ch) = command[i..].chars().next() else {
+            break;
+        };
+        let next_i = i + ch.len_utf8();
+
+        if escaped {
+            delimiter.push(ch);
+            saw_any = true;
+            literal_body = true;
+            escaped = false;
+            i = next_i;
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                delimiter.push(ch);
+            }
+            saw_any = true;
+            literal_body = true;
+            i = next_i;
+            continue;
+        }
+        if in_double {
+            match ch {
+                '"' => {
+                    in_double = false;
+                }
+                '\\' => {
+                    escaped = true;
+                }
+                _ => delimiter.push(ch),
+            }
+            saw_any = true;
+            literal_body = true;
+            i = next_i;
+            continue;
+        }
+
+        if ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '<' | '>' | '\n') {
+            break;
+        }
+        match ch {
+            '\'' => {
+                in_single = true;
+                saw_any = true;
+                literal_body = true;
+            }
+            '"' => {
+                in_double = true;
+                saw_any = true;
+                literal_body = true;
+            }
+            '\\' => {
+                escaped = true;
+                saw_any = true;
+                literal_body = true;
+            }
+            _ => {
+                delimiter.push(ch);
+                saw_any = true;
+            }
+        }
+        i = next_i;
+    }
+
+    if !saw_any || delimiter.is_empty() {
+        return None;
+    }
+    Some((
+        i,
+        HereDocSpec {
+            delimiter,
+            strip_tabs,
+            literal_body,
+        },
+    ))
+}
+
+fn matches_heredoc_terminator(line: &str, spec: &HereDocSpec) -> bool {
+    let candidate = if spec.strip_tabs {
+        line.trim_start_matches('\t')
+    } else {
+        line
+    };
+    candidate == spec.delimiter
+}
+
+fn skip_heredoc_bodies(command: &str, mut start: usize, pending: &[HereDocSpec]) -> usize {
+    for spec in pending {
+        while start < command.len() {
+            let line_end = command[start..]
+                .find('\n')
+                .map(|offset| start + offset)
+                .unwrap_or(command.len());
+            let line = &command[start..line_end];
+            let next_start = if line_end < command.len() {
+                line_end + 1
+            } else {
+                line_end
+            };
+            start = next_start;
+            if matches_heredoc_terminator(line, spec) {
+                break;
+            }
+        }
+    }
+    start
+}
+
+fn validate_unquoted_heredoc_line(line: &str) -> Result<(), String> {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if b == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
+        if b == b'`' {
+            return Err(
+                "backtick command substitution is not allowed; pass a literal command instead"
+                    .to_string(),
+            );
+        }
+        if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+            if i + 2 < bytes.len() && bytes[i + 2] == b'(' {
+                i += 3;
+                continue;
+            }
+            return Err(
+                "command substitution `$(...)` is not allowed; pass a literal command instead"
+                    .to_string(),
+            );
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+fn validate_and_skip_heredoc_bodies(
+    command: &str,
+    mut start: usize,
+    pending: &[HereDocSpec],
+) -> Result<usize, String> {
+    for spec in pending {
+        while start < command.len() {
+            let line_end = command[start..]
+                .find('\n')
+                .map(|offset| start + offset)
+                .unwrap_or(command.len());
+            let line = &command[start..line_end];
+            let next_start = if line_end < command.len() {
+                line_end + 1
+            } else {
+                line_end
+            };
+            start = next_start;
+            if matches_heredoc_terminator(line, spec) {
+                break;
+            }
+            if !spec.literal_body {
+                validate_unquoted_heredoc_line(line)?;
+            }
+        }
+    }
+    Ok(start)
+}
+
+fn tokenize_shell_words(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut token_started = false;
+
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            token_started = true;
+            escaped = false;
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                current.push(ch);
+            }
+            token_started = true;
+            continue;
+        }
+        if in_double {
+            match ch {
+                '"' => in_double = false,
+                '\\' => escaped = true,
+                _ => current.push(ch),
+            }
+            token_started = true;
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            if token_started {
+                tokens.push(std::mem::take(&mut current));
+                token_started = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' => {
+                in_single = true;
+                token_started = true;
+            }
+            '"' => {
+                in_double = true;
+                token_started = true;
+            }
+            '\\' => {
+                escaped = true;
+                token_started = true;
+            }
+            _ => {
+                current.push(ch);
+                token_started = true;
+            }
+        }
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    if token_started {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn is_env_assignment_word(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn xargs_command_index(tokens: &[String]) -> Option<usize> {
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok == "--" {
+            return (i + 1 < tokens.len()).then_some(i + 1);
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            return Some(i);
+        }
+        let attached_value = tok.starts_with("--arg-file=")
+            || tok.starts_with("--delimiter=")
+            || tok.starts_with("--eof=")
+            || tok.starts_with("--replace=")
+            || tok.starts_with("--max-lines=")
+            || tok.starts_with("--max-args=")
+            || tok.starts_with("--max-procs=")
+            || tok.starts_with("--max-chars=")
+            || matches!(tok.chars().nth(1), Some('a' | 'd' | 'E' | 'e' | 'I' | 'i' | 'L' | 'l' | 'n' | 'P' | 's'))
+                && tok.len() > 2
+                && !tok.starts_with("--");
+        if attached_value {
+            i += 1;
+            continue;
+        }
+        let takes_value = matches!(
+            tok,
+            "-a"
+                | "--arg-file"
+                | "-d"
+                | "--delimiter"
+                | "-E"
+                | "-e"
+                | "--eof"
+                | "-I"
+                | "-i"
+                | "--replace"
+                | "-L"
+                | "-l"
+                | "--max-lines"
+                | "-n"
+                | "--max-args"
+                | "-P"
+                | "--max-procs"
+                | "-s"
+                | "--max-chars"
+        );
+        i += if takes_value { 2 } else { 1 };
+    }
+    None
+}
+
+fn env_command_index(tokens: &[String], raw_tokens: &[String]) -> Option<usize> {
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok == "--" {
+            return (i + 1 < tokens.len()).then_some(i + 1);
+        }
+        if matches!(tok, "-u" | "--unset" | "-c" | "--chdir" | "-s" | "--split-string")
+            || tok == "-a"
+        {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with("--unset=")
+            || tok.starts_with("--chdir=")
+            || tok.starts_with("--split-string=")
+            || tok.starts_with("--argv0=")
+        {
+            i += 1;
+            continue;
+        }
+        if tok.starts_with('-') && tok != "-" {
+            i += 1;
+            continue;
+        }
+        if is_env_assignment_word(&raw_tokens[i]) {
+            i += 1;
+            continue;
+        }
+        return Some(i);
+    }
+    None
+}
+
+fn first_non_option_index(tokens: &[String], start: usize, options_with_value: &[&str]) -> Option<usize> {
+    let mut i = start;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok == "--" {
+            return (i + 1 < tokens.len()).then_some(i + 1);
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            return Some(i);
+        }
+        let takes_value = options_with_value.contains(&tok);
+        i += if takes_value { 2 } else { 1 };
+    }
+    None
+}
+
+fn nice_command_index(tokens: &[String]) -> Option<usize> {
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok == "--" {
+            return (i + 1 < tokens.len()).then_some(i + 1);
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            return Some(i);
+        }
+        if tok == "-n" || tok == "--adjustment" {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with("--adjustment=")
+            || tok[1..]
+                .chars()
+                .all(|ch| ch == '+' || ch == '-' || ch.is_ascii_digit())
+        {
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn time_command_index(tokens: &[String]) -> Option<usize> {
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok == "--" {
+            return (i + 1 < tokens.len()).then_some(i + 1);
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            return Some(i);
+        }
+        if matches!(tok, "-f" | "--format" | "-o" | "--output") {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with("--format=") || tok.starts_with("--output=") {
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn timeout_command_index(tokens: &[String]) -> Option<usize> {
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok == "--" {
+            i += 1;
+            break;
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            break;
+        }
+        if matches!(tok, "-k" | "--kill-after" | "-s" | "--signal") {
+            i += 2;
+            continue;
+        }
+        if tok.starts_with("--kill-after=") || tok.starts_with("--signal=") {
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    if i >= tokens.len() {
+        return None;
+    }
+    let command_idx = i + 1;
+    (command_idx < tokens.len()).then_some(command_idx)
+}
+
+fn indirect_command_index(program: &str, tokens: &[String], raw_tokens: &[String]) -> Option<usize> {
+    match program {
+        "xargs" => xargs_command_index(tokens),
+        "env" => env_command_index(tokens, raw_tokens),
+        "nohup" | "setsid" => first_non_option_index(tokens, 1, &[]),
+        "nice" => nice_command_index(tokens),
+        "time" => time_command_index(tokens),
+        "timeout" => timeout_command_index(tokens),
+        "stdbuf" => first_non_option_index(tokens, 1, &["-i", "-o", "-e"]),
+        _ => None,
+    }
+}
+
+fn shell_c_option_present(program: &str, tokens: &[String]) -> bool {
+    if !matches!(program, "bash" | "sh" | "zsh" | "ksh" | "dash") {
+        return false;
+    }
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok == "--" {
+            return false;
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            return false;
+        }
+        if tok == "-c" || tok == "--command" {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+fn find_has_blocked_exec_semantics(tokens: &[String]) -> Option<&str> {
+    const BLOCKED_FIND_FLAGS: &[&str] = &["-delete", "-exec", "-execdir", "-ok", "-okdir"];
+    fn find_primary_arg_count(tok: &str) -> usize {
+        match tok {
+            "-amin"
+            | "-anewer"
+            | "-atime"
+            | "-cmin"
+            | "-cnewer"
+            | "-context"
+            | "-ctime"
+            | "-files0-from"
+            | "-fls"
+            | "-fprint"
+            | "-fprint0"
+            | "-fstype"
+            | "-gid"
+            | "-group"
+            | "-ilname"
+            | "-iname"
+            | "-inum"
+            | "-ipath"
+            | "-iregex"
+            | "-iwholename"
+            | "-links"
+            | "-lname"
+            | "-maxdepth"
+            | "-mindepth"
+            | "-mmin"
+            | "-mtime"
+            | "-name"
+            | "-newer"
+            | "-newerxy"
+            | "-path"
+            | "-perm"
+            | "-printf"
+            | "-regex"
+            | "-samefile"
+            | "-size"
+            | "-since"
+            | "-type"
+            | "-uid"
+            | "-used"
+            | "-user"
+            | "-wholename"
+            | "-xtype" => 1,
+            "-fprintf" => 2,
+            _ => 0,
+        }
+    }
+
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok.starts_with('-') || matches!(tok, "!" | "(" | ")" | ",") {
+            break;
+        }
+        i += 1;
+    }
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if BLOCKED_FIND_FLAGS.contains(&tok) {
+            return Some(tok);
+        }
+        if tok == "--" || matches!(tok, "!" | "(" | ")" | "," | "-a" | "-and" | "-o" | "-or") {
+            i += 1;
+            continue;
+        }
+        let arg_count = find_primary_arg_count(tok);
+        if arg_count > 0 {
+            i += 1 + arg_count;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// =========================================================================
 /// Shell 注入面检查
 /// =========================================================================
@@ -157,8 +764,8 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
 /// 当前本函数仅在 `validate_execute_command` 内部被调用，天然只作用在 shell
 /// 执行路径上。
 ///
-/// 拦截那些不被分段化策略覆盖的注入面：命令替换、
-/// 进程替换。它们在正当 dev 工作流里几乎不出现，但可以一举绕过任何
+/// 拦截那些不被分段化策略覆盖的注入面：命令替换
+/// （`$(...)` / `` `...` ``）、进程替换。它们在正当 dev 工作流里几乎不出现，但可以一举绕过任何
 /// program/参数级黑名单（典型样例：`$(echo rm) -rf /tmp/foo`）。
 fn validate_no_injection_surface(command: &str) -> Result<(), String> {
     let bytes = command.as_bytes();
@@ -166,6 +773,7 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
     let mut in_single = false;
     let mut in_double = false;
     let mut escaped = false;
+    let mut pending_heredocs: Vec<HereDocSpec> = Vec::new();
     while i < bytes.len() {
         let b = bytes[i];
         if escaped {
@@ -181,13 +789,19 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
             i += 1;
             continue;
         }
-        // 双引号内 `<(` / `>(` 只是普通文本，但 `$()` 仍可能生效，因此后面只对它继续做拦截。
+        // 双引号内 `<(` / `>(` 只是普通文本，但 `$()` / `` `...` `` 仍可能生效，因此后面继续做拦截。
         if in_double {
             match b {
                 b'\\' => {
                     escaped = true;
                     i += 1;
                     continue;
+                }
+                b'`' => {
+                    return Err(
+                        "backtick command substitution is not allowed; pass a literal command instead"
+                            .to_string(),
+                    );
                 }
                 b'"' => {
                     in_double = false;
@@ -212,6 +826,19 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
             i += 1;
             continue;
         }
+        if b == b'`' {
+            return Err(
+                "backtick command substitution is not allowed; pass a literal command instead"
+                    .to_string(),
+            );
+        }
+        if !in_double && b == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
+            if let Some((end, spec)) = parse_heredoc_at(command, i) {
+                pending_heredocs.push(spec);
+                i = end;
+                continue;
+            }
+        }
         // 命令替换 `$(`
         if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             // 算术展开 `$(( ... ))` 不执行任何命令，是无害的（典型：`echo $((RANDOM % 20))`），
@@ -230,6 +857,12 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
         if !in_double && (b == b'<' || b == b'>') && i + 1 < bytes.len() && bytes[i + 1] == b'('
         {
             return Err("process substitution `<(...)` / `>(...)` is not allowed".to_string());
+        }
+        if !in_double && b == b'\n' && !pending_heredocs.is_empty() {
+            i += 1;
+            i = validate_and_skip_heredoc_bodies(command, i, &pending_heredocs)?;
+            pending_heredocs.clear();
+            continue;
         }
         i += 1;
     }
@@ -267,12 +900,17 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         return Err("empty command".to_string());
     }
 
-    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let tokens = tokenize_shell_words(command);
     if tokens.is_empty() {
         return Err("empty command".to_string());
     }
 
-    let program = tokens[0].to_lowercase();
+    let lower_tokens = tokens
+        .iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let program = lower_tokens[0].as_str();
+    let extra_blocked = config_blocked_commands();
     let normalize_path = |path: &std::path::Path| {
         let mut normalized = std::path::PathBuf::new();
         for component in path.components() {
@@ -289,42 +927,47 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         normalized
     };
 
-    if program == "rm" || program == "mv" {
+    if matches!(program, "rm" | "mv") {
         let base_dir = crate::ai::driver::runtime_ctx::effective_cwd()
             .map_err(|err| format!("failed to resolve current directory: {err}"))?;
         let base_dir = normalize_path(&base_dir);
         let mut path_args: Vec<String> = Vec::new();
-        let mut iter = tokens.iter().skip(1).peekable();
+        let mut iter = lower_tokens.iter().zip(tokens.iter()).skip(1).peekable();
         let mut end_of_options = false;
 
         while let Some(token) = iter.next() {
+            let (lower_token, raw_token) = token;
             if !end_of_options {
-                if *token == "--" {
+                if lower_token == "--" {
                     end_of_options = true;
                     continue;
                 }
 
-                if token.starts_with('-') {
+                if lower_token.starts_with('-') {
                     if program == "mv" {
-                        let option = token.to_lowercase();
+                        let option = lower_token.as_str();
                         if option == "-t" || option == "--target-directory" {
                             let dir = iter
                                 .next()
-                                .ok_or_else(|| format!("missing target directory for '{token}'"))?;
-                            path_args.push((*dir).to_string());
+                                .ok_or_else(|| {
+                                    format!("missing target directory for '{raw_token}'")
+                                })?;
+                            path_args.push(dir.1.to_string());
                             continue;
                         }
 
-                        if let Some(dir) = option.strip_prefix("--target-directory=") {
+                        if let Some(dir) = raw_token.strip_prefix("--target-directory=") {
                             if dir.is_empty() {
-                                return Err(format!("missing target directory for '{token}'"));
+                                return Err(format!(
+                                    "missing target directory for '{raw_token}'"
+                                ));
                             }
                             path_args.push(dir.to_string());
                             continue;
                         }
 
-                        if token.starts_with("-t") && token.len() > 2 {
-                            path_args.push(token[2..].to_string());
+                        if raw_token.starts_with("-t") && raw_token.len() > 2 {
+                            path_args.push(raw_token[2..].to_string());
                             continue;
                         }
                     }
@@ -333,7 +976,7 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
                 }
             }
 
-            path_args.push((*token).to_string());
+            path_args.push(raw_token.to_string());
         }
 
         if path_args.is_empty() {
@@ -399,38 +1042,50 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         // "telnet",
         // "socat",
     ];
-    if denied_programs.contains(&program.as_str()) {
+    if denied_programs.contains(&program) {
         return Err(format!("program '{program}' is blocked"));
     }
 
     // 用户可通过 `ai.sandbox.blocked_commands` 追加自定义黑名单程序。
-    if config_blocked_commands().iter().any(|p| p == &program) {
+    if extra_blocked.iter().any(|p| p == program) {
         return Err(format!(
             "program '{program}' is blocked by sandbox policy (ai.sandbox.blocked_commands)"
         ));
     }
 
     // 拦下 `bash -c "..."` / `sh -c` / `zsh -c` 这种"二次解释"形式。
-    // 直接执行脚本（`bash script.sh`）仍然允许，避免破坏正常工作流。
-    if matches!(program.as_str(), "bash" | "sh" | "zsh" | "ksh" | "dash") {
-        for tok in tokens.iter().skip(1) {
-            let lower = tok.to_lowercase();
-            if lower == "-c" || lower == "--command" {
-                return Err(format!(
-                    "shell `{program} -c ...` re-interprets a string as shell code; \
-                     run the literal command directly instead"
-                ));
-            }
+    // 直接执行脚本（`bash script.sh`）仍然允许，避免把脚本参数里的 `-c` 误判为 shell 选项。
+    if shell_c_option_present(program, &lower_tokens) {
+        return Err(format!(
+            "shell `{program} -c ...` re-interprets a string as shell code; \
+             run the literal command directly instead"
+        ));
+    }
+
+    // `find` 的 `-delete` / `-exec*` / `-ok*` 只有在作为真正 primary 时才有危险语义。
+    // 若它们只是 `-name '-delete'` 之类 pattern 参数，不应误拦。
+    if program == "find" {
+        if let Some(flag) = find_has_blocked_exec_semantics(&lower_tokens) {
+            return Err(format!(
+                "find primary '{flag}' mutates files or executes commands and is blocked"
+            ));
         }
     }
 
-    let denied_tokens = [
-        "-delete", "--remove", "rm", "mv", "chmod", "chown", "sudo", "ssh", "scp", "rsync",
+    // 常见包装器会把后续 token 当作真正要执行的程序；只检查"将被执行的那个程序名"，
+    // 避免把普通内容参数（如 `printf '%s' rm` 里的 `rm`）误判为危险命令。
+    const DANGEROUS_PROGRAM_NAMES: &[&str] = &[
+        "rm", "mv", "chmod", "chown", "chgrp", "sudo", "su",
+        "ssh", "scp", "rsync", "dd", "kill", "pkill", "killall",
+        "shutdown", "reboot", "eval", "mount", "umount", "ln",
+        "truncate", "passwd", "launchctl", "systemctl",
     ];
-    for token in tokens.iter().skip(1) {
-        let token = token.to_lowercase();
-        if denied_tokens.contains(&token.as_str()) {
-            return Err(format!("argument '{token}' is blocked"));
+    if let Some(idx) = indirect_command_index(program, &lower_tokens, &tokens) {
+        let nested = lower_tokens[idx].as_str();
+        if DANGEROUS_PROGRAM_NAMES.contains(&nested) || extra_blocked.iter().any(|p| p == nested) {
+            return Err(format!(
+                "indirect execution of '{nested}' via '{program}' is blocked"
+            ));
         }
     }
 
@@ -495,7 +1150,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_command_timeout, split_unquoted_segments, validate_no_injection_surface};
+    use super::{
+        resolve_command_timeout, split_unquoted_segments, tokenize_shell_words,
+        validate_no_injection_surface,
+    };
 
     // ---- resolve_command_timeout ----
 
@@ -551,6 +1209,26 @@ mod tests {
         assert_eq!(segs, vec!["echo \"a | b\"".to_string(), "true".to_string()]);
     }
 
+    #[test]
+    fn split_ignores_quoted_heredoc_body_content() {
+        let segs = split_unquoted_segments("cat <<'EOF'\nrm -rf /\nEOF\nls");
+        assert_eq!(segs, vec!["cat <<'EOF'".to_string(), "ls".to_string()]);
+    }
+
+    #[test]
+    fn tokenize_shell_words_respects_single_and_double_quotes() {
+        let tokens = tokenize_shell_words(r#"printf '%s\n' "a b" '\$(literal)'"#);
+        assert_eq!(
+            tokens,
+            vec![
+                "printf".to_string(),
+                "%s\\n".to_string(),
+                "a b".to_string(),
+                "\\$(literal)".to_string()
+            ]
+        );
+    }
+
     // ---- injection surface ----
 
     #[test]
@@ -559,16 +1237,30 @@ mod tests {
     }
 
     #[test]
-    fn injection_allows_backtick() {
-        // 反引号是遗留语法，现代 shell 推荐 `$(...)`（已被拦截）。
-        // 反引号在 markdown / 文本参数中极为常见，字符级扫描误杀率过高，故放行。
-        assert!(validate_no_injection_surface("echo `whoami`").is_ok());
+    fn injection_blocks_backtick_command_substitution() {
+        assert!(validate_no_injection_surface("echo `whoami`").is_err());
     }
 
     #[test]
     fn injection_allows_heredoc_and_herestring() {
         assert!(validate_no_injection_surface("cat <<EOF").is_ok());
         assert!(validate_no_injection_surface("cat <<<\"hi\"").is_ok());
+    }
+
+    #[test]
+    fn injection_allows_command_substitution_text_inside_quoted_heredoc() {
+        assert!(
+            validate_no_injection_surface("cat <<'EOF'\n$(whoami)\nEOF").is_ok()
+        );
+        assert!(validate_no_injection_surface("cat <<'EOF'\n`whoami`\nEOF").is_ok());
+    }
+
+    #[test]
+    fn injection_blocks_command_substitution_inside_unquoted_heredoc() {
+        assert!(
+            validate_no_injection_surface("cat <<EOF\n$(whoami)\nEOF").is_err()
+        );
+        assert!(validate_no_injection_surface("cat <<EOF\n`whoami`\nEOF").is_err());
     }
 
     #[test]
@@ -585,6 +1277,7 @@ mod tests {
     fn injection_treats_single_quoted_as_literal() {
         // 整段在单引号内的 `$()` 是字面量，bash 不会展开。
         assert!(validate_no_injection_surface("echo 'price: $(100)'").is_ok());
+        assert!(validate_no_injection_surface("echo '`whoami`'").is_ok());
     }
 
     #[test]
@@ -644,6 +1337,11 @@ mod tests {
     }
 
     #[test]
+    fn allows_bash_script_arg_named_dash_c() {
+        assert!(validate("bash script.sh -c literal").is_ok());
+    }
+
+    #[test]
     fn allows_bash_running_a_script_file() {
         // `bash run.sh` 不是二次解释，正常工作流应继续允许。
         assert!(validate("bash run.sh").is_ok());
@@ -673,6 +1371,62 @@ mod tests {
             err.contains("command substitution"),
             "expected nested $(...) blocked, got: {err}"
         );
+    }
+
+    #[test]
+    fn allows_subcommand_patterns_that_resemble_blocked_programs() {
+        // `git rm` / `docker rm` / `git mv` 等：rm/mv 是子命令，不是直接调用 /bin/rm。
+        // 不应被参数级黑名单误杀。
+        assert!(validate("git rm file.txt").is_ok());
+        assert!(validate("git mv old.txt new.txt").is_ok());
+        assert!(validate("docker rm my_container").is_ok());
+        assert!(validate("docker rmi my_image").is_ok());
+        assert!(validate("npm rm some-package").is_ok());
+        assert!(validate("pip install rsync").is_ok());
+    }
+
+    #[test]
+    fn blocks_exec_flags_that_run_subsequent_args_as_commands() {
+        // find -exec/-execdir/-ok/-okdir 会将后续参数当命令执行，必须拦截
+        assert!(validate("find . -exec rm {} +").is_err());
+        assert!(validate("find . -execdir chmod 777 {} \\;").is_err());
+        assert!(validate("find /tmp -ok rm {} \\;").is_err());
+        assert!(validate("find . -okdir mv {} /tmp/ \\;").is_err());
+        // 无害的 find 用法不受影响
+        assert!(validate("find . -name '*.rs' -type f").is_ok());
+        assert!(validate("find . -delete").is_err());
+        assert!(validate("find . -empty -delete").is_err());
+        assert!(validate(r#"find . "-exec" rm {} +"#).is_err());
+        assert!(validate(r#"find . -name "-delete" -print"#).is_ok());
+        assert!(validate(r#"find . -name "-exec" -print"#).is_ok());
+        assert!(validate(r#"find . -printf "-delete\n""#).is_ok());
+        // 子命令/包名场景不受影响（这些不含危险 primary）
+        assert!(validate("git rm file.txt").is_ok());
+        assert!(validate("docker rm container").is_ok());
+        assert!(validate("npm rm pkg").is_ok());
+        assert!(validate("pip install rsync").is_ok());
+    }
+
+    #[test]
+    fn blocks_common_indirect_wrappers_but_allows_safe_payload_args() {
+        assert!(validate("xargs rm").is_err());
+        assert!(validate("env FOO=1 sudo whoami").is_err());
+        assert!(validate("nohup ssh user@host").is_err());
+        assert!(validate("nice -n 5 chmod 777 file").is_err());
+        assert!(validate("timeout --signal=KILL 10 dd if=/dev/zero of=foo").is_err());
+
+        assert!(validate(r#"xargs printf "%s\n" rm"#).is_ok());
+        assert!(validate(r#"env FOO=1 cargo test"#).is_ok());
+        assert!(validate(r#"nice -n 5 cargo check"#).is_ok());
+        assert!(validate(r#"timeout 10 cargo test"#).is_ok());
+    }
+
+    #[test]
+    fn allows_literal_dangerous_text_when_writing_files() {
+        assert!(validate(r#"printf "%s\n" "-exec" "-delete" "rm -rf /""#).is_ok());
+        assert!(validate("cat <<'EOF' > out.txt\n$(whoami)\n-exec\n-delete\nEOF").is_ok());
+        assert!(validate("cat <<'EOF' > out.txt\n`whoami`\nEOF").is_ok());
+        assert!(validate("printf '%s\n' '`whoami`'").is_ok());
     }
 
     #[test]

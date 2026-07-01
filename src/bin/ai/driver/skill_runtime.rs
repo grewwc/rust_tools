@@ -801,11 +801,13 @@ fn build_project_instruction_prompt() -> Option<String> {
     Some(out)
 }
 
-fn push_project_context(builder: &mut SystemPromptBuilder) {
+fn push_project_instruction_context(builder: &mut SystemPromptBuilder) {
     if let Some(project_prompt) = build_project_instruction_prompt() {
         builder.push(ContextKind::Policy, project_prompt);
     }
+}
 
+fn push_project_type_context(builder: &mut SystemPromptBuilder) {
     if let Some(kind) = crate::ai::agents::detect_project_kind_from_cwd() {
         // 把识别出的项目类型 + 默认构建/测试约定作为 Fact 段注入，
         // 让 LLM 不必猜测 `cargo` / `npm` / `go` 该用哪个。
@@ -817,9 +819,19 @@ fn push_project_context(builder: &mut SystemPromptBuilder) {
     }
 }
 
+fn push_project_context(builder: &mut SystemPromptBuilder) {
+    push_project_instruction_context(builder);
+    push_project_type_context(builder);
+}
+
 fn push_project_context_for_turn(builder: &mut SystemPromptBuilder, general_knowledge_mode: bool) {
+    // 项目指令文档（AGENTS.md / CLAUDE.md 等）属于当前工作目录的显式本地约束，
+    // 只要命中了项目作用域就应进入本轮 system prompt。general-knowledge 模式
+    // 仅继续抑制“项目类型/默认构建命令”这类辅助性 Fact 提示，避免用户在仓库
+    // 目录下做通用问答时完全丢失 repo-local instructions。
+    push_project_instruction_context(builder);
     if !general_knowledge_mode {
-        push_project_context(builder);
+        push_project_type_context(builder);
     }
 }
 
@@ -1873,7 +1885,7 @@ mod tests {
     }
 
     #[test]
-    fn project_context_is_skipped_in_general_knowledge_mode() {
+    fn project_instructions_remain_available_in_general_knowledge_mode() {
         let root = temp_dir("project_context_general_mode");
         let nested = root.join("apps/web/src");
         fs::create_dir_all(&nested).unwrap();
@@ -1884,16 +1896,20 @@ mod tests {
         .unwrap();
         fs::write(root.join("AGENTS.md"), "Always follow repo safety rules.\n").unwrap();
 
-        let prompt = SUBAGENT_CWD.sync_scope(nested.clone(), || {
+        let (prompt, reminder) = SUBAGENT_CWD.sync_scope(nested.clone(), || {
             let available = SkipSet::new(16);
             let mut builder = build_system_prompt(None, None, &Box::new(available));
             push_project_context_for_turn(&mut builder, true);
-            builder.render_system_prompt()
+            (
+                builder.render_system_prompt(),
+                builder.render_context_reminder().unwrap_or_default(),
+            )
         });
 
-        assert!(!prompt.contains("Project-local instructions:"));
-        assert!(!prompt.contains("Always follow repo safety rules."));
-        assert!(!prompt.contains("Rust project (Cargo.toml)"));
+        assert!(prompt.contains("Project-local instructions:"));
+        assert!(prompt.contains("Always follow repo safety rules."));
+        assert!(!reminder.contains("Project Type"));
+        assert!(!reminder.contains("Rust project"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -1917,6 +1933,35 @@ mod tests {
             assert_eq!(intent.core, CoreIntent::RequestAction);
             let general_knowledge_mode =
                 should_use_general_knowledge_mode("帮我修改这个项目下的登录功能", &intent, None);
+            push_project_context_for_turn(&mut builder, general_knowledge_mode);
+            builder.render_system_prompt()
+        });
+
+        assert!(prompt.contains("Project-local instructions:"));
+        assert!(prompt.contains("Always follow repo safety rules."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prompt_introspection_query_still_keeps_project_instructions() {
+        let root = temp_dir("project_context_prompt_query");
+        let nested = root.join("apps/web/src");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("AGENTS.md"), "Always follow repo safety rules.\n").unwrap();
+
+        let prompt = SUBAGENT_CWD.sync_scope(nested.clone(), || {
+            let available = SkipSet::new(16);
+            let mut builder = build_system_prompt(None, None, &Box::new(available));
+            let intent = UserIntent::new(CoreIntent::QueryConcept);
+            let general_knowledge_mode =
+                should_use_general_knowledge_mode("system prompt 是什么", &intent, None);
+            assert!(general_knowledge_mode);
             push_project_context_for_turn(&mut builder, general_knowledge_mode);
             builder.render_system_prompt()
         });
