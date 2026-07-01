@@ -1065,13 +1065,21 @@ fn execute_prepared_tool_call(
         ToolRoute::Mcp {
             server_name,
             tool_name,
-        } => oauth::execute_mcp_tool_call(
-            mcp_client,
-            tool_call,
-            server_name,
-            tool_name,
-            &prepared.args,
-        ),
+        } => {
+            // `mcp_client` 是 orchestrator 传入的 routing_snapshot（servers 为空，
+            // 仅用于路由/schema）。实际执行必须走共享的真实客户端，否则 call_tool
+            // 会在空的 servers map 里找不到连接而报 "Server not found"。
+            let guard = shared_mcp_client
+                .lock()
+                .map_err(|_| "Shared MCP client poisoned".to_string())?;
+            oauth::execute_mcp_tool_call(
+                &guard,
+                tool_call,
+                server_name,
+                tool_name,
+                &prepared.args,
+            )
+        }
     }
 }
 
