@@ -1048,6 +1048,14 @@ fn should_preload_mcp(one_shot_mode: bool, mcp_probe: &McpConfigProbe) -> bool {
     mcp_probe.exists && !one_shot_mode
 }
 
+fn one_shot_cli_mode(cli: &cli::ParsedCli) -> bool {
+    !cli.args.is_empty() && !cli.interactive
+}
+
+fn note_search_interactive_mode(cli: &cli::ParsedCli) -> bool {
+    cli.note_search && cli.interactive
+}
+
 fn decision_log_persist_enabled() -> bool {
     configw::get_all_config()
         .get_opt(AiConfig::DECISION_LOG_PERSIST_ENABLE)
@@ -1256,9 +1264,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await;
     }
 
-    // 处理 --note-search / -ns：只从知识库中检索 memo，不调用 LLM / 任何工具，
-    // 直接打印结果并退出。
-    if app.cli.note_search {
+    // 处理 --note-search / -ns：默认单轮 notebook 检索后直接退出；若带 `-i`
+    // 则进入交互模式，由 run_loop 在每轮输入时继续执行 notebook 检索问答。
+    if app.cli.note_search && !app.cli.interactive {
         return runtime_ctx::PERSONA_MEMORY_PATH
             .scope(app.current_persona_memory_file(), handle_memo_search(&app))
             .await;
@@ -1580,12 +1588,118 @@ impl Drop for SearchSpinner {
     }
 }
 
-/// 处理 --note-search / -ns：从知识库中检索 memo 类条目，再用模型根据检索到的
-/// 内容总结、回答用户的问题（而不是直接堆砌原始条目）。
-async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>> {
-    let query = app.cli.args.join(" ");
-    let query = query.trim().to_string();
-    if query.is_empty() {
+const NOTE_SEARCH_QUERY_HISTORY_MAX_MESSAGES: usize = 4;
+const NOTE_SEARCH_QUERY_HISTORY_MAX_CHARS: usize = 200;
+
+fn truncate_note_search_excerpt(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut out = trimmed.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+fn build_note_search_retrieval_query(
+    question: &str,
+    recent_history: &[crate::ai::history::Message],
+) -> String {
+    let question = question.trim();
+    if question.is_empty() {
+        return String::new();
+    }
+
+    let snippets = recent_history
+        .iter()
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .filter_map(|message| {
+            let content = crate::ai::history::value_to_string(&message.content);
+            let content = truncate_note_search_excerpt(&content, NOTE_SEARCH_QUERY_HISTORY_MAX_CHARS);
+            if content.is_empty() {
+                return None;
+            }
+            let role = if message.role == "user" {
+                "用户"
+            } else {
+                "助手"
+            };
+            Some(format!("{role}: {content}"))
+        })
+        .take(NOTE_SEARCH_QUERY_HISTORY_MAX_MESSAGES)
+        .collect::<Vec<_>>();
+    let mut snippets = snippets;
+    snippets.reverse();
+
+    if snippets.is_empty() {
+        return question.to_string();
+    }
+
+    format!(
+        "当前问题：{question}\n最近对话上下文：\n{}",
+        snippets.join("\n")
+    )
+}
+
+fn build_note_search_chat_history(
+    app: &App,
+    history_count: usize,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+    let overflow_dir = {
+        let store = SessionStore::new(app.config.history_file.as_path());
+        Some(store.session_assets_dir(&app.session_id))
+    };
+    let history = crate::ai::history::build_context_history(
+        history_count,
+        &app.session_history_file,
+        app.config.history_max_chars,
+        app.config.history_keep_last,
+        app.config.history_summary_max_chars,
+        overflow_dir,
+    )?;
+
+    Ok(history
+        .into_iter()
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .filter_map(|message| {
+            let content = crate::ai::history::value_to_string(&message.content);
+            let content = content.trim().to_string();
+            if content.is_empty() {
+                return None;
+            }
+            Some(serde_json::json!({
+                "role": message.role,
+                "content": content,
+            }))
+        })
+        .collect())
+}
+
+fn select_note_search_candidates<'a>(
+    candidates: &'a [crate::ai::tools::service::memory::ScoredMemo],
+) -> Vec<&'a crate::ai::tools::service::memory::ScoredMemo> {
+    if candidates.first().is_some_and(|candidate| candidate.semantic) {
+        let top = candidates[0].score.max(1e-6);
+        let threshold = top * 0.6;
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(index, candidate)| *index == 0 || candidate.score >= threshold)
+            .take(8)
+            .map(|(_, candidate)| candidate)
+            .collect()
+    } else {
+        candidates.iter().collect()
+    }
+}
+
+async fn answer_memo_search(
+    app: &App,
+    question: &str,
+    history_count: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let question = question.trim().to_string();
+    if question.is_empty() {
         eprintln!("[note-search] 用法: a -ns <查询内容>");
         return Err("note-search requires a query".into());
     }
@@ -1596,26 +1710,25 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
     crate::ai::knowledge::indexing::embedder::warm_up();
 
     // 检索 + 模型总结都可能耗时，给一个 "Searching..." 动画提示（输出前自动清除）。
-    let spinner = SearchSpinner::start("Searching memo");
+    let _spinner = SearchSpinner::start("Searching memo");
+    let retrieval_query = if note_search_interactive_mode(&app.cli) {
+        build_note_search_retrieval_query(&question, &read_recent_history(app))
+    } else {
+        question.clone()
+    };
 
     // 检索相关 memo 条目作为上下文。
     let candidates =
-        match crate::ai::tools::service::memory::search_memo_candidates_scored(&query, 20) {
+        match crate::ai::tools::service::memory::search_memo_candidates_scored(&retrieval_query, 20)
+        {
             Ok(c) => c,
             Err(err) => {
-                spinner.stop();
                 eprintln!("[note-search] 检索失败: {}", err);
                 return Err(err.into());
             }
         };
     if candidates.is_empty() {
-        spinner.stop();
-        crate::ai::stream::render_markdown_block(&format!(
-            "没有在知识库中找到与「{}」相关的内容。",
-            query
-        ))
-        .ok();
-        return Ok(());
+        return Ok(format!("没有在知识库中找到与「{}」相关的内容。", question));
     }
 
     // 按语义分数收紧喂给 LLM 的条数，进一步防止大知识库撑爆上下文。
@@ -1623,44 +1736,31 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
     // 排序可信；否则保持全部 20 条交给 LLM（与历史行为一致，不丢候选）。
     // 收紧策略：保留 top1 锚点；其余条目要求语义分数 >= top1 的 60% 才纳入，
     // 至多 8 条。这样只砍掉明显不相关的长尾，不影响真正相关的笔记。
-    let selected: Vec<&crate::ai::tools::service::memory::ScoredMemo> =
-        if candidates.first().is_some_and(|c| c.semantic) {
-            let top = candidates[0].score.max(1e-6);
-            let threshold = top * 0.6;
-            candidates
-                .iter()
-                .enumerate()
-                .filter(|(i, c)| *i == 0 || c.score >= threshold)
-                .take(8)
-                .map(|(_, c)| c)
-                .collect()
-        } else {
-            candidates.iter().collect()
-        };
+    let selected = select_note_search_candidates(&candidates);
 
     // 把检索到的条目作为上下文，让模型基于这些内容回答用户的问题。
     let mut context = String::new();
-    for (idx, c) in selected.iter().enumerate() {
-        context.push_str(&format!("[{}] {}\n", idx + 1, c.entry.note));
+    for (idx, candidate) in selected.iter().enumerate() {
+        context.push_str(&format!("[{}] {}\n", idx + 1, candidate.entry.note));
     }
 
-    let model = crate::ai::models::initial_model(&app.cli);
-    let messages = vec![
-        serde_json::json!({
+    let mut messages = vec![serde_json::json!({
             "role": "system",
-            "content": "你是一个知识库问答助手。下面会给出用户的问题，以及从用户私人知识库检索到的若干条相关笔记。\
-                        请仅基于这些笔记的内容，直接、简洁地回答用户的问题，必要时用要点组织。\
-                        如果笔记中没有足够信息回答，就如实说明。用中文回答，使用 Markdown 格式。",
-        }),
-        serde_json::json!({
+            "content": "你处于 notebook 检索问答模式。下面会给出当前问题，以及本轮从用户 notebook（memo）里检索到的若干条笔记。\
+                        每一轮都必须优先依据本轮检索结果回答。最近对话仅用于理解省略、代词和追问；如果最近对话与本轮检索结果冲突，以本轮检索结果为准。\
+                        如果检索结果里没有足够信息回答，就直接说明。用中文回答，使用 Markdown 格式。",
+        })];
+    if note_search_interactive_mode(&app.cli) {
+        messages.extend(build_note_search_chat_history(app, history_count)?);
+    }
+    messages.push(serde_json::json!({
             "role": "user",
-            "content": format!("问题：{}\n\n知识库检索结果：\n{}", query, context),
-        }),
-    ];
+            "content": format!("当前问题：{}\n\n本轮 notebook 检索结果：\n{}", question, context),
+        }));
 
-    match crate::ai::request::do_request_json(app, &model, &messages, false, true).await {
+    match crate::ai::request::do_request_json(app, &app.current_model, &messages, false, true).await
+    {
         Ok(response) => {
-            spinner.stop();
             let answer = response
                 .pointer("/choices/0/message/content")
                 .and_then(|c| c.as_str())
@@ -1669,24 +1769,74 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
                 .to_string();
             if answer.is_empty() {
                 // 模型无输出时退回展示已选中的原始条目（复用上面的检索结果，不重复检索）。
-                let raw = selected
+                Ok(selected
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| format!("{}. {}", i + 1, c.entry.note))
+                    .map(|(i, candidate)| format!("{}. {}", i + 1, candidate.entry.note))
                     .collect::<Vec<_>>()
-                    .join("\n\n");
-                crate::ai::stream::render_markdown_block(&raw).ok();
+                    .join("\n\n"))
             } else {
-                crate::ai::stream::render_markdown_block(&answer).ok();
+                Ok(answer)
             }
-            Ok(())
         }
         Err(err) => {
-            spinner.stop();
             eprintln!("[note-search] 总结失败: {}", err);
             Err(err.into())
         }
     }
+}
+
+fn persist_note_search_turn(app: &App, question: &str, answer: &str) {
+    let question = question.trim();
+    let answer = answer.trim();
+    if question.is_empty() || answer.is_empty() {
+        return;
+    }
+
+    let messages = vec![
+        crate::ai::history::Message {
+            role: "user".to_string(),
+            content: serde_json::Value::String(question.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        crate::ai::history::Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(answer.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+    if let Err(err) =
+        crate::ai::history::append_history_messages_uncompacted(&app.session_history_file, &messages)
+    {
+        eprintln!("[Warning] Failed to save notebook search history: {}", err);
+    }
+}
+
+async fn handle_note_search_interactive_turn(
+    app: &App,
+    question: &str,
+    history_count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    crate::ai::types::clear_stream_cancel(app);
+    crate::ai::tools::registry::common::clear_tool_cancel();
+    let _guard = signal::ForegroundTurnGuard::enter();
+    let answer = answer_memo_search(app, question, history_count).await?;
+    crate::ai::stream::render_markdown_block(&answer).ok();
+    persist_note_search_turn(app, question, &answer);
+    Ok(())
+}
+
+/// 处理 --note-search / -ns：从知识库中检索 memo 类条目，再用模型根据检索到的
+/// 内容总结、回答用户的问题（而不是直接堆砌原始条目）。
+async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>> {
+    let query = app.cli.args.join(" ");
+    let answer = answer_memo_search(app, &query, 0).await?;
+    crate::ai::stream::render_markdown_block(&answer).ok();
+    Ok(())
 }
 
 /// 处理 --consolidate-knowledge：读取全部知识条目 → 模型分析 → 执行整理。
@@ -2463,7 +2613,7 @@ async fn run_foreground_resume(
 ///      - run turn via turn_runtime::run_turn()
 ///   6. Termination check: exit if quit requested
 ///
-/// one_shot_mode: When CLI args provided (non-interactive)
+/// one_shot_mode: When CLI args provided and `--interactive` is not set
 ///   - runs once and exits
 ///   - deletes session after completion
 async fn run_loop(
@@ -2473,7 +2623,7 @@ async fn run_loop(
     skill_manifests: &mut Arc<Vec<SkillManifest>>,
     agent_manifests: &mut Arc<Vec<AgentManifest>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let one_shot_mode = !app.cli.args.is_empty();
+    let one_shot_mode = one_shot_cli_mode(&app.cli);
     let mut should_quit = one_shot_mode;
     let mut mcp_initialized = false;
     let mut mcp_loading_announced = false;
@@ -2883,6 +3033,17 @@ async fn run_loop(
                 continue;
             }
         }
+        if note_search_interactive_mode(&app.cli) {
+            match handle_note_search_interactive_turn(app, &question, history_count).await {
+                Ok(()) => {}
+                Err(err) => {
+                    eprintln!("[Error] 当前轮 notebook 检索失败：{}", err);
+                    eprintln!("[Info] 会话保持运行，请继续输入下一条消息。\n");
+                }
+            }
+            should_quit = false;
+            continue;
+        }
         maybe_auto_route_agent(app, &*agent_manifests, &question);
 
         if !one_shot_mode {
@@ -3082,7 +3243,8 @@ mod tests {
     use super::{
         DispatchOutcomeTag, ProcessDispatchMeta, SCHED_COOLDOWN_EPOCHS_DEFAULT,
         SCHEDULER_DISPATCH_META, background_execute_limit, background_pop_limit,
-        has_pending_foreground_process, maybe_auto_route_agent, read_recent_history,
+        build_note_search_retrieval_query, has_pending_foreground_process,
+        maybe_auto_route_agent, one_shot_cli_mode, read_recent_history,
         reset_scheduler_test_state, should_preload_mcp, should_publish_subagent_task_result,
         update_dispatch_meta,
     };
@@ -3294,6 +3456,51 @@ mod tests {
 
         assert!(!should_preload_mcp(true, &probe));
         assert!(should_preload_mcp(false, &probe));
+    }
+
+    #[test]
+    fn interactive_flag_disables_one_shot_cli_mode() {
+        let mut cli = ParsedCli::default();
+        cli.args = vec!["解释一下上次的笔记".to_string()];
+        assert!(one_shot_cli_mode(&cli));
+
+        cli.interactive = true;
+        assert!(!one_shot_cli_mode(&cli));
+    }
+
+    #[test]
+    fn note_search_followup_query_includes_recent_history() {
+        let history = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String(
+                    "第一条讲的是 trait object 和 dyn 的区别。".to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "user".to_string(),
+                content: serde_json::Value::String("帮我找 trait object 的笔记".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        let query = build_note_search_retrieval_query("再展开第一条", &history);
+        assert!(query.contains("当前问题：再展开第一条"));
+        assert!(query.contains("用户: 帮我找 trait object 的笔记"));
+        assert!(query.contains("助手: 第一条讲的是 trait object 和 dyn 的区别。"));
+
+        let user_pos = query
+            .find("用户: 帮我找 trait object 的笔记")
+            .expect("user context should be present");
+        let assistant_pos = query
+            .find("助手: 第一条讲的是 trait object 和 dyn 的区别。")
+            .expect("assistant context should be present");
+        assert!(user_pos < assistant_pos);
     }
 
     #[test]

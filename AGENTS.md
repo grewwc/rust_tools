@@ -118,6 +118,7 @@ cargo test --bin a test_xxx       # Filter tests by name
 7. **Scope**: Only modify files that need to change. Do not reformat or reorder unrelated code.
 8. **No unrelated changes**: Never refactor, reformat, rename, reorganize, or comment on code that is not directly relevant to the current task.
 9. **Avoid hardcoded string rules**: Do not resort to hardcoded string-based judgment logic unless absolutely unavoidable. Prefer data-driven approaches — configuration, model-based routing, trait dispatch, or match on well-typed enums — over brittle string matching or regex-based rules.
+10. **Favor reuse over reinvention**: Before introducing any new abstraction, dependency, or utility, first audit the existing codebase for components, traits, or tooling that can fulfill the requirement directly or with minimal extension. Preferring composition over custom implementation reduces maintenance surface area and preserves architectural coherence.
 
 ### AI Module
 

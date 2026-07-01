@@ -71,6 +71,8 @@ static FLAGS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         "--no-skills",
         "--help",
         "-h",
+        "--interactive",
+        "-i",
         "--consolidate-knowledge",
         "--note-search",
         "-ns",

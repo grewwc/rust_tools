@@ -17,6 +17,9 @@ pub(super) struct ParsedCli {
     pub(super) no_skills: bool,
     pub(super) mcp_config: String,
     pub(super) help: bool,
+    /// 是否在消费完 CLI prompt 后继续停留在交互式 REPL。
+    /// 通过 `--interactive` / `-i` 开启；与 `-ns` 联用时，后续每轮都会继续走 notebook 检索问答。
+    pub(super) interactive: bool,
     /// 用户对推理强度档位的会话级覆盖。语义说明：
     /// - `None`：未设置，遵循 [models.json](../../../models.json) 的模型默认值；
     /// - `Some(Some(level))`：强制使用该档位（minimal/low/medium/high）；
@@ -89,6 +92,7 @@ impl Default for ParsedCli {
             no_skills: false,
             mcp_config: String::new(),
             help: false,
+            interactive: false,
             reasoning_effort_override: None,
             note_search: false,
             note: None,
@@ -125,6 +129,11 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
     parser.add_bool(
+        "interactive",
+        false,
+        "stay in REPL after the initial CLI prompt",
+    );
+    parser.add_bool(
         "consolidate-knowledge",
         false,
         "AI-driven consolidation of all knowledge entries",
@@ -134,6 +143,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
         false,
         "search knowledge base (memo category) and answer",
     );
+    parser.alias("i", "interactive");
     parser.alias("ns", "note-search");
     parser.alias("h", "help");
     parser.add_bool(
@@ -199,6 +209,7 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     // 处理 help（需要特殊处理，因为它是别名）
     cli.help = parser.contains_flag_strict("help") || parser.contains_flag_strict("h");
+    cli.interactive = parser.contains_flag_strict("interactive");
 
     // 处理 model
     if parser.contains_flag_strict("model") {
@@ -319,6 +330,11 @@ pub(super) fn print_help() {
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
     parser.add_bool(
+        "interactive",
+        false,
+        "stay in REPL after the initial CLI prompt",
+    );
+    parser.add_bool(
         "consolidate-knowledge",
         false,
         "AI-driven consolidation of all knowledge entries",
@@ -328,6 +344,7 @@ pub(super) fn print_help() {
         false,
         "search knowledge base (memo category) and answer",
     );
+    parser.alias("i", "interactive");
     parser.alias("ns", "note-search");
     parser.alias("h", "help");
 
@@ -371,6 +388,7 @@ pub(super) fn print_help() {
     );
     println!("  -n, --note <text>        save text as memo to knowledge base and exit");
     println!("  -ns, --note-search <q>   search memo category and answer with LLM");
+    println!("  -i, --interactive        keep the session open for follow-up questions");
     println!();
     println!("Options:");
     parser.print_defaults();
@@ -465,6 +483,12 @@ pub fn generate_completion_script(shell: &str) {
     parser.add_bool("no-skills", false, "disable loading all skills");
     parser.add_bool("help", false, "print help");
     parser.alias("h", "help");
+    parser.add_bool(
+        "interactive",
+        false,
+        "stay in REPL after the initial CLI prompt",
+    );
+    parser.alias("i", "interactive");
     parser.add_bool(
         "consolidate-knowledge",
         false,
