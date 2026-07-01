@@ -366,10 +366,7 @@ impl MemoryStore {
                 trace_memory_event(
                     "memory.index.rebuild_failed",
                     "MemoryIndex rebuild failed after batch rewrite; index may drift",
-                    &[
-                        ("path", self.path.display().to_string()),
-                        ("error", err),
-                    ],
+                    &[("path", self.path.display().to_string()), ("error", err)],
                 );
             }
 
@@ -912,10 +909,24 @@ mod tests {
 
         let kept = read_entries();
         assert_eq!(kept.len(), 2);
-        assert!(kept.iter().any(|entry| entry.id.as_deref() == Some("mem_1")));
-        assert!(kept.iter().any(|entry| entry.id.as_deref() == Some("mem_merged")));
-        assert!(!kept.iter().any(|entry| entry.id.as_deref() == Some("mem_2")));
-        assert!(!kept.iter().any(|entry| entry.id.as_deref() == Some("mem_3")));
+        assert!(
+            kept.iter()
+                .any(|entry| entry.id.as_deref() == Some("mem_1"))
+        );
+        assert!(
+            kept.iter()
+                .any(|entry| entry.id.as_deref() == Some("mem_merged"))
+        );
+        assert!(
+            !kept
+                .iter()
+                .any(|entry| entry.id.as_deref() == Some("mem_2"))
+        );
+        assert!(
+            !kept
+                .iter()
+                .any(|entry| entry.id.as_deref() == Some("mem_3"))
+        );
 
         let _ = std::fs::remove_file(&path);
     }

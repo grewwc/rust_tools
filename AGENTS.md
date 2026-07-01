@@ -55,6 +55,7 @@ cargo test --bin a test_xxx       # Filter tests by name
 2. **Driver layer** (`src/bin/ai/driver/`)
    - `run()` entry point invokes the main `run_loop()` event loop
    - Each iteration of the event loop: schedule → background processes → foreground input → turn execution
+   - General-knowledge mode suppresses project-local context. Repository-oriented work (for example requests with local file/code artifacts or edit/debug signals tied to the current project) must stay out of general-knowledge mode so project instruction documents can be injected.
    - One-shot knowledge maintenance CLI actions such as `--consolidate-knowledge` and `--migrate-legacy-knowledge` run against the persona-scoped memory file before entering `run_loop()`.
    - `turn_runtime/`: prepares context, then iterates through LLM calls interleaved with tool calls, then finalizes
    - `thinking/`: decomposes the user's goal into sub-goals and verifies the decomposition against available tools
@@ -75,7 +76,7 @@ cargo test --bin a test_xxx       # Filter tests by name
    - **Progressive loading**: core tools are enabled by default; additional tools are loaded via `enable_tools`.
    - **Registry pattern**: `registry/` defines JSON Schema → `service/` implements the logic → `storage/` persists data.
    - **File tools**: `FileStore::new` resolves relative paths against `runtime_ctx::effective_cwd()`, so sub-agent-scoped working directories apply consistently to read/write/patch flows. `apply_patch` accepts both raw unified-diff hunks and the common single-file `*** Begin Patch` envelope; it also tolerates `path` as a compatibility alias for `file_path`.
-   - **MCP integration**: communicates via stdio JSON-RPC transport.
+   - **MCP integration**: communicates via stdio JSON-RPC transport. When an MCP config exists, preload starts before the turn and is awaited before model execution (including one-shot CLI prompts), so `enable_tools` can discover configured MCP tools on the first turn. When MCP tools stay hidden due to progressive loading, the turn prompt includes a compact hint with real configured `mcp_*` names so the model can discover and enable them.
    - **Tool groups**: organized into groups such as core, builtin, executor, etc.
    - **Code analysis**: `ast_symbols/` extracts AST symbols from multiple languages (Rust/Python/Java/Go/TS/JS/C/C++).
    - **Agent teams**: `agent_team` launches parent-mediated multi-agent deliberation phases (`start` → `challenge` → `synthesize`). This sits on top of `task_spawn`/`task_wait` using the existing kernel process, channel, and futex plumbing.

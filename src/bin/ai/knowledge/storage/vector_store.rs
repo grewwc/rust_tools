@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use rust_tools::cw::SkipMap;
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
 use super::super::indexing::{embedder, similarity};
@@ -112,6 +113,22 @@ impl VectorStore {
             .execute("DELETE FROM vec_entries WHERE id = ?1", params![id])
             .map_err(|e| format!("Failed to delete: {}", e))?;
         Ok(affected > 0)
+    }
+
+    /// Delete all vector entries whose IDs are not present in `keep_ids`.
+    pub fn delete_except_ids(&self, keep_ids: &[String]) -> Result<usize, String> {
+        let keep: FxHashSet<&str> = keep_ids.iter().map(String::as_str).collect();
+        let existing = self.list_ids()?;
+        let mut removed = 0usize;
+        for id in existing {
+            if keep.contains(id.as_str()) {
+                continue;
+            }
+            if self.delete(&id)? {
+                removed += 1;
+            }
+        }
+        Ok(removed)
     }
 
     /// Get a single entry by ID.
@@ -297,6 +314,8 @@ impl VectorStore {
             .collect();
 
         let embeddings = self.embed_texts(&texts)?;
+        let keep_ids: Vec<String> = entries.iter().map(|(id, _, _, _)| id.clone()).collect();
+        self.delete_except_ids(&keep_ids)?;
 
         let mut count = 0;
         for ((id, category, note, tags), embedding) in entries.iter().zip(embeddings.into_iter()) {
@@ -312,6 +331,75 @@ impl VectorStore {
             count += 1;
         }
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeEmbedder;
+
+    impl VectorEmbedder for FakeEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, String> {
+            Ok(vec![text.len() as f32, 1.0])
+        }
+
+        fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+            texts.iter().map(|text| self.embed(text)).collect()
+        }
+    }
+
+    fn cleanup_sqlite(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn rebuild_from_entries_deletes_stale_vector_ids() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_vector_rebuild_{ts}.db"));
+        cleanup_sqlite(&path);
+
+        let store = VectorStore::new(&path, Box::new(FakeEmbedder)).unwrap();
+        store
+            .upsert(VectorEntry {
+                id: "stale_legacy_hash".to_string(),
+                content: "old content".to_string(),
+                category: "user_memory".to_string(),
+                tags: vec![],
+                embedding: vec![1.0, 0.0],
+                timestamp: 0,
+            })
+            .unwrap();
+
+        let rebuilt = store
+            .rebuild_from_entries(&[
+                (
+                    "mem_current".to_string(),
+                    "coding_guideline".to_string(),
+                    "Do: keep tests focused.".to_string(),
+                    vec!["principle".to_string()],
+                ),
+                (
+                    "mem_other".to_string(),
+                    "user_memory".to_string(),
+                    "Project fact".to_string(),
+                    vec![],
+                ),
+            ])
+            .unwrap();
+
+        assert_eq!(rebuilt, 2);
+        assert_eq!(store.count().unwrap(), 2);
+        assert!(store.get("stale_legacy_hash").unwrap().is_none());
+        assert!(store.get("mem_current").unwrap().is_some());
+
+        cleanup_sqlite(&path);
     }
 }
 

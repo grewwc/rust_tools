@@ -44,6 +44,7 @@ pub(crate) struct LegacyKnowledgeMigrationReport {
     pub(crate) assigned_ids: usize,
     pub(crate) promoted_principles: usize,
     pub(crate) normalized_guideline_priorities: usize,
+    pub(crate) removed_legacy_rag_entries: usize,
     pub(crate) touched: bool,
 }
 
@@ -345,9 +346,22 @@ fn should_promote_legacy_principle(
         return assessment.actionable && assessment.generalizable;
     }
     if looks_like_coding_guideline(&entry.note, assessment) {
-        return assessment.generalizable && assessment.directive_signals > 0;
+        return assessment.directive_signals > 0
+            && assessment.word_count >= 6
+            && assessment.unique_token_ratio >= 0.5;
     }
     false
+}
+
+fn was_legacy_guideline_migrated(entry: &AgentMemoryEntry) -> bool {
+    entry
+        .tags
+        .iter()
+        .any(|tag| tag == "legacy_guideline_migrated")
+        || entry
+            .source
+            .as_deref()
+            .is_some_and(|source| source.contains("knowledge_legacy_migrated"))
 }
 
 fn build_legacy_migration_backup_path(path: &std::path::Path) -> std::path::PathBuf {
@@ -355,7 +369,10 @@ fn build_legacy_migration_backup_path(path: &std::path::Path) -> std::path::Path
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("agent_memory");
-    let ext = path.extension().and_then(|value| value.to_str()).unwrap_or("jsonl");
+    let ext = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("jsonl");
     let ts = Local::now().format("%Y%m%d%H%M%S");
     path.with_file_name(format!("{stem}.legacy-migrate-{ts}.{ext}.bak"))
 }
@@ -373,6 +390,7 @@ pub(crate) fn migrate_legacy_knowledge_entries() -> Result<LegacyKnowledgeMigrat
                 assigned_ids: 0,
                 promoted_principles: 0,
                 normalized_guideline_priorities: 0,
+                removed_legacy_rag_entries: 0,
                 touched: false,
             });
         }
@@ -382,30 +400,39 @@ pub(crate) fn migrate_legacy_knowledge_entries() -> Result<LegacyKnowledgeMigrat
         let mut assigned_ids = 0usize;
         let mut promoted_principles = 0usize;
         let mut normalized_guideline_priorities = 0usize;
+        let mut legacy_rag_ids_to_delete = SkipSet::new(16);
 
         for entry in &mut entries {
             let missing_id = entry.id.as_deref().is_none_or(|id| id.trim().is_empty());
+            legacy_rag_ids_to_delete.insert(
+                crate::ai::tools::storage::rag_store::legacy_rag_id_for_memory_entry(entry),
+            );
+            legacy_rag_ids_to_delete.insert(
+                crate::ai::tools::storage::rag_store::legacy_rebuild_rag_id_for_memory_entry(entry),
+            );
             if missing_id {
                 entry.id = Some(next_memory_id());
                 assigned_ids += 1;
             }
 
-            if missing_id
-                && entry.category == "user_memory"
+            if entry.category == "user_memory"
                 && entry.priority.unwrap_or(150) >= 150
+                && !was_legacy_guideline_migrated(entry)
             {
-                let assessment = crate::ai::driver::reflection::assess_learning_note_quality(&entry.note);
+                let assessment =
+                    crate::ai::driver::reflection::assess_learning_note_quality(&entry.note);
                 if should_promote_legacy_principle(entry, &assessment) {
                     let target_category = infer_legacy_guideline_category(entry, &assessment);
                     if entry.category != target_category {
                         entry.category = target_category.to_string();
-                        entry.priority =
-                            Some(entry.priority.unwrap_or(0).max(default_priority_for_category(target_category)));
-                        push_unique_tag(&mut entry.tags, "legacy_guideline_migrated");
-                        append_source_marker(
-                            &mut entry.source,
-                            "knowledge_legacy_migrated",
+                        entry.priority = Some(
+                            entry
+                                .priority
+                                .unwrap_or(0)
+                                .max(default_priority_for_category(target_category)),
                         );
+                        push_unique_tag(&mut entry.tags, "legacy_guideline_migrated");
+                        append_source_marker(&mut entry.source, "knowledge_legacy_migrated");
                         promoted_principles += 1;
                     }
                 }
@@ -421,9 +448,9 @@ pub(crate) fn migrate_legacy_knowledge_entries() -> Result<LegacyKnowledgeMigrat
             }
         }
 
-        let touched =
+        let memory_touched =
             assigned_ids > 0 || promoted_principles > 0 || normalized_guideline_priorities > 0;
-        let backup_path = if touched {
+        let backup_path = if memory_touched {
             let backup_path = build_legacy_migration_backup_path(&path);
             std::fs::copy(&path, &backup_path)
                 .map_err(|err| format!("Failed to create migration backup: {err}"))?;
@@ -433,6 +460,10 @@ pub(crate) fn migrate_legacy_knowledge_entries() -> Result<LegacyKnowledgeMigrat
         } else {
             None
         };
+        let legacy_rag_ids: Vec<String> = legacy_rag_ids_to_delete.iter().cloned().collect();
+        let removed_legacy_rag_entries =
+            crate::ai::tools::storage::rag_store::delete_ids_from_default_index(&legacy_rag_ids)
+                .unwrap_or(0);
 
         Ok(LegacyKnowledgeMigrationReport {
             memory_path: path.clone(),
@@ -441,7 +472,8 @@ pub(crate) fn migrate_legacy_knowledge_entries() -> Result<LegacyKnowledgeMigrat
             assigned_ids,
             promoted_principles,
             normalized_guideline_priorities,
-            touched,
+            removed_legacy_rag_entries,
+            touched: memory_touched || removed_legacy_rag_entries > 0,
         })
     })
 }
@@ -457,19 +489,21 @@ pub(crate) fn format_legacy_knowledge_migration_report(
     }
     if !report.touched {
         return format!(
-            "Legacy knowledge migration: no changes needed.\n  Path: {}\n  Scanned: {}",
+            "Legacy knowledge migration: no changes needed.\n  Path: {}\n  Scanned: {}\n  Removed legacy RAG entries: {}",
             report.memory_path.display(),
-            report.scanned
+            report.scanned,
+            report.removed_legacy_rag_entries
         );
     }
 
     let mut out = format!(
-        "Legacy knowledge migration completed.\n  Path: {}\n  Scanned: {}\n  Assigned IDs: {}\n  Promoted principles: {}\n  Normalized guideline priorities: {}",
+        "Legacy knowledge migration completed.\n  Path: {}\n  Scanned: {}\n  Assigned IDs: {}\n  Promoted principles: {}\n  Normalized guideline priorities: {}\n  Removed legacy RAG entries: {}",
         report.memory_path.display(),
         report.scanned,
         report.assigned_ids,
         report.promoted_principles,
         report.normalized_guideline_priorities,
+        report.removed_legacy_rag_entries,
     );
     if let Some(path) = &report.backup_path {
         out.push_str(&format!("\n  Backup: {}", path.display()));
@@ -589,9 +623,7 @@ pub(crate) fn prepare_memory_save_entry(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .or_else(|| {
-            (!default_source.trim().is_empty()).then(|| default_source.trim().to_string())
-        });
+        .or_else(|| (!default_source.trim().is_empty()).then(|| default_source.trim().to_string()));
 
     let requested_priority = parse_priority_arg(args, "priority")?
         .or_else(|| Some(default_priority_for_category(&requested_category)));
@@ -1898,6 +1930,18 @@ mod tests {
                 owner_pgid: None,
                 image_path: None,
             },
+              AgentMemoryEntry {
+                  id: Some("mem_existing_legacy_principle".to_string()),
+                  timestamp: "2025-01-01T00:00:03Z".to_string(),
+                  category: "user_memory".to_string(),
+                  note: "Do: keep Rust unit tests focused on one behavior and avoid broad fixture churn.".to_string(),
+                  tags: vec![],
+                  source: Some("knowledge_save".to_string()),
+                  priority: Some(150),
+                  owner_pid: None,
+                  owner_pgid: None,
+                  image_path: None,
+              },
         ];
         let lines = entries
             .iter()
@@ -1908,21 +1952,25 @@ mod tests {
 
         let report = migrate_legacy_knowledge_entries().unwrap();
         assert!(report.touched);
-        assert_eq!(report.scanned, 3);
+        assert_eq!(report.scanned, 4);
         assert_eq!(report.assigned_ids, 3);
-        assert_eq!(report.promoted_principles, 2);
+        assert_eq!(report.promoted_principles, 3);
         assert_eq!(report.normalized_guideline_priorities, 0);
-        assert!(report.backup_path.as_ref().is_some_and(|backup| backup.exists()));
+        assert!(
+            report
+                .backup_path
+                .as_ref()
+                .is_some_and(|backup| backup.exists())
+        );
 
         let list = execute_memory_list_json(&serde_json::json!({ "limit": 10 })).unwrap();
         let items: serde_json::Value = serde_json::from_str(&list).unwrap();
         let arr = items.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
-        assert!(arr.iter().all(|item| {
-            item["id"]
-                .as_str()
-                .is_some_and(|id| id.starts_with("mem_"))
-        }));
+        assert_eq!(arr.len(), 4);
+        assert!(
+            arr.iter()
+                .all(|item| { item["id"].as_str().is_some_and(|id| id.starts_with("mem_")) })
+        );
         assert!(arr.iter().any(|item| {
             item["category"].as_str() == Some("safety_rules")
                 && item["priority"].as_u64() == Some(255)
@@ -1936,6 +1984,14 @@ mod tests {
                 && item["note"]
                     .as_str()
                     .is_some_and(|note| note.contains("rust_tools 项目结构"))
+        }));
+        assert!(arr.iter().any(|item| {
+            item["id"].as_str() == Some("mem_existing_legacy_principle")
+                && item["category"].as_str() == Some("coding_guideline")
+                && item["tags"].as_array().is_some_and(|tags| {
+                    tags.iter()
+                        .any(|tag| tag.as_str() == Some("legacy_guideline_migrated"))
+                })
         }));
 
         let second = migrate_legacy_knowledge_entries().unwrap();

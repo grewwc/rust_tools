@@ -508,8 +508,12 @@ fn should_use_general_knowledge_mode(
         return false;
     }
     let cleaned = crate::ai::request::strip_system_reminders(question);
-    let len = cleaned.trim().chars().count();
+    let cleaned = cleaned.trim();
+    let len = cleaned.chars().count();
     if len == 0 || len > 180 {
+        return false;
+    }
+    if has_project_artifact_shape(cleaned) {
         return false;
     }
     matches!(
@@ -518,6 +522,54 @@ fn should_use_general_knowledge_mode(
             | intent_recognition::CoreIntent::SeekSolution
             | intent_recognition::CoreIntent::Casual
     )
+}
+
+fn has_project_artifact_shape(question: &str) -> bool {
+    // 这里只识别结构化 artifact 形态；动作/目标语义交给 intent model。
+    if question.contains("```") || question.contains("::") {
+        return true;
+    }
+    question.split_whitespace().any(|token| {
+        let token = token.trim_matches(|c: char| {
+            matches!(
+                c,
+                ',' | '.'
+                    | ';'
+                    | ':'
+                    | '，'
+                    | '。'
+                    | '；'
+                    | '：'
+                    | '`'
+                    | '\''
+                    | '"'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+            )
+        });
+        let lower = token.to_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return false;
+        }
+        token.contains('/')
+            || token.contains('\\')
+            || lower.ends_with(".rs")
+            || lower.ends_with(".ts")
+            || lower.ends_with(".tsx")
+            || lower.ends_with(".js")
+            || lower.ends_with(".jsx")
+            || lower.ends_with(".py")
+            || lower.ends_with(".go")
+            || lower.ends_with(".java")
+            || lower.ends_with(".json")
+            || lower.ends_with(".yaml")
+            || lower.ends_with(".yml")
+            || lower.ends_with(".toml")
+    })
 }
 
 fn filter_general_knowledge_tools(tools: Vec<ToolDef>) -> Vec<ToolDef> {
@@ -646,6 +698,48 @@ fn build_capability_catalog(available_tools: &Box<SkipSet<String>>) -> Option<St
     result
 }
 
+fn build_hidden_mcp_tool_catalog(
+    all_mcp_tools: &[ToolDef],
+    loaded_mcp_tools: &[ToolDef],
+) -> Option<String> {
+    let loaded_names = loaded_mcp_tools
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect::<Box<SkipSet<_>>>();
+    let mut hidden: Vec<String> = all_mcp_tools
+        .iter()
+        .map(|tool| tool.function.name.clone())
+        .filter(|name| !loaded_names.contains_str(name))
+        .collect();
+    if hidden.is_empty() {
+        return None;
+    }
+    rust_tools::sortw::stable_sort_by(&mut hidden, |a, b| a.cmp(b));
+    hidden.dedup();
+
+    const MAX_DISPLAY: usize = 8;
+    let displayed = hidden
+        .iter()
+        .take(MAX_DISPLAY)
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = hidden.len().saturating_sub(MAX_DISPLAY);
+
+    let mut out = format!(
+        "Configured MCP tools are available but not loaded in this turn.\n\
+         If the task needs an external system or MCP-backed capability, call `enable_tools(operation=list)` first, then \
+         `enable_tools(operation=enable, tools=[...])` with the exact names you need.\n\
+         Example available MCP tools: {}",
+        displayed
+    );
+    if remaining > 0 {
+        out.push_str(&format!(", and {remaining} more"));
+    }
+    out.push('.');
+    Some(out)
+}
+
 fn capability_catalog_cache_key(available_tools: &Box<SkipSet<String>>) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut tools: Vec<String> = available_tools.iter().map(|s| s.to_string()).collect();
@@ -705,6 +799,12 @@ fn push_project_context(builder: &mut SystemPromptBuilder) {
             "Project Type",
             kind.prompt_hint().to_string(),
         );
+    }
+}
+
+fn push_project_context_for_turn(builder: &mut SystemPromptBuilder, general_knowledge_mode: bool) {
+    if !general_knowledge_mode {
+        push_project_context(builder);
     }
 }
 
@@ -1082,7 +1182,8 @@ fn build_skill_turn_guard(
     intent: UserIntent,
     question: &str,
 ) -> SkillTurnGuard {
-    super::super::tools::enable_tools::set_available_mcp_tools(mcp_client.get_all_tools());
+    let all_mcp_tools = mcp_client.get_all_tools();
+    super::super::tools::enable_tools::set_available_mcp_tools(all_mcp_tools.clone());
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
     let skip_recall_by_skill = should_skip_recall_for_skill(skill);
     let active_agent = app.current_agent_manifest.clone();
@@ -1095,12 +1196,15 @@ fn build_skill_turn_guard(
     } else {
         builtin_tools_for_skill(skill, active_agent.as_ref())
     };
-    let mcp_tools = mcp_tools_for_turn(mcp_client, skill, active_agent.as_ref());
+    let mcp_tools = select_mcp_tools(all_mcp_tools.clone(), skill, active_agent.as_ref());
     let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
     let mut builder = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
-    if !general_knowledge_mode {
-        push_project_context(&mut builder);
+    if has_tool(&available_tools, "enable_tools")
+        && let Some(catalog) = build_hidden_mcp_tool_catalog(&all_mcp_tools, &mcp_tools)
+    {
+        builder.push(ContextKind::Fact, catalog);
     }
+    push_project_context_for_turn(&mut builder, general_knowledge_mode);
     if !app.active_persona.is_default() {
         let mut persona_prompt = format!(
             "Persistent persona:\n- Name: {}\n",
@@ -1280,15 +1384,16 @@ pub(super) fn prepare_skill_for_turn(
 mod tests {
     use super::{
         ContextKind, PreferenceStrength, SystemPromptBuilder, build_project_instruction_prompt,
-        build_system_prompt, builtin_tools_for_skill, ensure_required_baseline_tools,
-        filter_general_knowledge_tools, filter_mcp_tools_by_allowed_servers,
-        looks_like_follow_up_or_same_topic, merge_with_runtime_enabled_tools, push_project_context,
+        build_hidden_mcp_tool_catalog, build_system_prompt, builtin_tools_for_skill,
+        ensure_required_baseline_tools, filter_general_knowledge_tools,
+        filter_mcp_tools_by_allowed_servers, looks_like_follow_up_or_same_topic,
+        merge_with_runtime_enabled_tools, push_project_context, push_project_context_for_turn,
         resolve_max_iterations, select_mcp_tools, select_skill_with_preference,
         select_skill_with_preference_strength, should_use_general_knowledge_mode,
         tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
-    use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
+    use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent, detect_intent};
     use crate::ai::driver::runtime_ctx::SUBAGENT_CWD;
     use crate::ai::skills::SkillManifest;
     use crate::ai::tools::enable_tools::set_explicit_enabled_tool_names;
@@ -1361,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn general_knowledge_mode_is_intent_gated_without_text_matching() {
+    fn general_knowledge_mode_uses_intent_and_artifact_shape() {
         let seek_solution = UserIntent::new(CoreIntent::SeekSolution);
         assert!(should_use_general_knowledge_mode(
             "kubectl rollout 示例",
@@ -1378,6 +1483,11 @@ mod tests {
             "kubectl rollout 示例",
             &seek_solution,
             Some(&skill("debugger", "debug runtime issues"))
+        ));
+        assert!(!should_use_general_knowledge_mode(
+            "how to fix this panic in src/bin/a.rs",
+            &seek_solution,
+            None
         ));
     }
 
@@ -1480,6 +1590,34 @@ mod tests {
     }
 
     #[test]
+    fn hidden_mcp_tool_catalog_lists_real_available_tools() {
+        let catalog = build_hidden_mcp_tool_catalog(
+            &[
+                tool("mcp_feishu_docs_search"),
+                tool("mcp_feishu_docs_get_text_by_url"),
+                tool("mcp_pdf-extract_pdf_extract_text"),
+            ],
+            &[tool("mcp_feishu_docs_search")],
+        )
+        .unwrap();
+
+        assert!(catalog.contains("Configured MCP tools are available but not loaded"));
+        assert!(catalog.contains("enable_tools(operation=list)"));
+        assert!(catalog.contains("`mcp_feishu_docs_get_text_by_url`"));
+        assert!(catalog.contains("`mcp_pdf-extract_pdf_extract_text`"));
+        assert!(!catalog.contains("`mcp_feishu_docs_search`"));
+    }
+
+    #[test]
+    fn hidden_mcp_tool_catalog_omits_prompt_when_everything_is_loaded() {
+        let catalog = build_hidden_mcp_tool_catalog(
+            &[tool("mcp_feishu_docs_search")],
+            &[tool("mcp_feishu_docs_search")],
+        );
+        assert!(catalog.is_none());
+    }
+
+    #[test]
     fn system_prompt_reminds_model_to_check_skills_when_unsure() {
         let mut available = SkipSet::new(16);
         available.insert("enable_tools".to_string());
@@ -1579,7 +1717,7 @@ mod tests {
         let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
         assert!(prompt.contains("Knowledge save:"));
         assert!(prompt.contains("call `knowledge_save`"));
-          assert!(prompt.contains("`common_sense`, `coding_guideline`"));
+        assert!(prompt.contains("`common_sense`, `coding_guideline`"));
         assert!(prompt.contains("`knowledge_search` or `knowledge_list`"));
         assert!(!prompt.contains("call `memory_save`"));
     }
@@ -1657,6 +1795,61 @@ mod tests {
         assert!(enriched_prompt.contains("Use cargo fmt before commit."));
         assert!(reminder.contains("Project Type"));
         assert!(reminder.contains("Rust project"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_context_is_skipped_in_general_knowledge_mode() {
+        let root = temp_dir("project_context_general_mode");
+        let nested = root.join("apps/web/src");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("AGENTS.md"), "Always follow repo safety rules.\n").unwrap();
+
+        let prompt = SUBAGENT_CWD.sync_scope(nested.clone(), || {
+            let available = SkipSet::new(16);
+            let mut builder = build_system_prompt(None, None, &Box::new(available));
+            push_project_context_for_turn(&mut builder, true);
+            builder.render_system_prompt()
+        });
+
+        assert!(!prompt.contains("Project-local instructions:"));
+        assert!(!prompt.contains("Always follow repo safety rules."));
+        assert!(!prompt.contains("Rust project (Cargo.toml)"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn project_action_intent_keeps_project_context_available() {
+        let root = temp_dir("project_context_work_signal");
+        let nested = root.join("apps/web/src");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(root.join("AGENTS.md"), "Always follow repo safety rules.\n").unwrap();
+
+        let prompt = SUBAGENT_CWD.sync_scope(nested.clone(), || {
+            let available = SkipSet::new(16);
+            let mut builder = build_system_prompt(None, None, &Box::new(available));
+            let intent = detect_intent("帮我修改这个项目下的登录功能");
+            assert_eq!(intent.core, CoreIntent::RequestAction);
+            let general_knowledge_mode =
+                should_use_general_knowledge_mode("帮我修改这个项目下的登录功能", &intent, None);
+            push_project_context_for_turn(&mut builder, general_knowledge_mode);
+            builder.render_system_prompt()
+        });
+
+        assert!(prompt.contains("Project-local instructions:"));
+        assert!(prompt.contains("Always follow repo safety rules."));
 
         let _ = fs::remove_dir_all(root);
     }

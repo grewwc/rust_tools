@@ -19,59 +19,19 @@ pub struct AutoRecalledKnowledge {
 /// Build persistent guidelines for the system prompt.
 pub fn build_persistent_guidelines(
     store: &JsonlStore,
-    question: &str,
+    _question: &str,
     max_chars: usize,
     config: &KnowledgeConfig,
 ) -> Option<String> {
     let max_days = config.maintenance.guidelines_max_days;
 
-    let mut entries: Vec<KnowledgeEntry> = Vec::new();
-
-    // Search for guideline categories
-    for cat in guideline_categories() {
-        if let Ok(results) = keyword_search::keyword_search(store, cat, 80, config) {
-            for (e, score) in results {
-                if score < config.thresholds.min_score_guideline {
-                    continue;
-                }
-                if !should_include_in_persistent_guidelines(&e) {
-                    continue;
-                }
-                entries.push(normalize_persistent_guideline_entry(e));
-            }
-        }
-    }
-
-    // Search for question-relevant guidelines
-    if !question.trim().is_empty() {
-        if let Ok(results) = keyword_search::keyword_search(store, question, 60, config) {
-            for (e, score) in results {
-                if score < 0.2 {
-                    continue;
-                }
-                if !should_include_in_persistent_guidelines(&e) {
-                    continue;
-                }
-                entries.push(normalize_persistent_guideline_entry(e));
-            }
-        }
-    }
-
-    // 兼容历史知识：
-    // 1. 旧版 knowledge_save 存进 `user_memory` 的“原则型”条目；
-    // 2. 系统内部沉淀的 `generalized_principle`。
-    // 它们不一定命中 guideline category 搜索，但仍应进入持久原则召回。
-    if let Ok(all_entries) = store.list_all() {
-        for entry in all_entries {
-            if entry.category_enum().is_guideline() {
-                continue;
-            }
-            if !should_include_in_persistent_guidelines(&entry) {
-                continue;
-            }
-            entries.push(normalize_persistent_guideline_entry(entry));
-        }
-    }
+    let mut entries: Vec<KnowledgeEntry> = store
+        .list_all()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(should_include_in_persistent_guidelines)
+        .map(normalize_persistent_guideline_entry)
+        .collect();
 
     // Fallback to recent high-priority guidelines
     if entries.is_empty() {

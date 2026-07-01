@@ -23,6 +23,18 @@ fn short_hex_digest(bytes: &[u8]) -> String {
     s
 }
 
+pub(crate) fn legacy_rag_id_for_memory_entry(
+    entry: &crate::ai::tools::storage::memory_store::AgentMemoryEntry,
+) -> String {
+    short_hex_digest(format!("{}:{}", entry.timestamp, entry.note).as_bytes())
+}
+
+pub(crate) fn legacy_rebuild_rag_id_for_memory_entry(
+    entry: &crate::ai::tools::storage::memory_store::AgentMemoryEntry,
+) -> String {
+    short_hex_digest(entry.note.as_bytes())
+}
+
 /// 带向量的知识条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagEntry {
@@ -47,10 +59,14 @@ pub struct RagStore {
 }
 
 impl RagStore {
+    pub(crate) fn default_index_path() -> Result<PathBuf, String> {
+        let base = dirs::config_dir().ok_or("Cannot determine config directory")?;
+        Ok(base.join("rust_tools/rag_index"))
+    }
+
     /// 从默认路径创建 RAG Store
     pub fn new() -> Result<Self, String> {
-        let base = dirs::config_dir().ok_or("Cannot determine config directory")?;
-        let index_path = base.join("rust_tools/rag_index");
+        let index_path = Self::default_index_path()?;
         Self::with_path(&index_path)
     }
 
@@ -76,6 +92,10 @@ impl RagStore {
 
     pub fn delete(&self, id: &str) -> Result<bool, String> {
         self.store.delete(id)
+    }
+
+    pub fn delete_except_ids(&self, keep_ids: &[String]) -> Result<usize, String> {
+        self.store.delete_except_ids(keep_ids)
     }
 
     /// 语义搜索 — 余弦相似度 top-k
@@ -147,9 +167,17 @@ impl RagStore {
         let store = MemoryStore::from_env_or_config();
         let entries = store.all()?;
 
-        let texts: Vec<String> = entries
-            .iter()
+        let prepared: Vec<(
+            crate::ai::tools::storage::memory_store::AgentMemoryEntry,
+            String,
+            String,
+        )> = entries
+            .into_iter()
+            .filter(|e| !e.note.trim().is_empty())
             .map(|e| {
+                let id =
+                    e.id.clone()
+                        .unwrap_or_else(|| legacy_rag_id_for_memory_entry(&e));
                 let mut text = format!("{}: {}", e.category, e.note);
                 if !e.tags.is_empty() {
                     text.push_str(&format!(" [tags: {}]", e.tags.join(", ")));
@@ -157,18 +185,21 @@ impl RagStore {
                 if let Some(src) = &e.source {
                     text.push_str(&format!(" (source: {})", src));
                 }
-                text
+                (e, id, text)
             })
             .collect();
+        if prepared.is_empty() {
+            self.delete_except_ids(&[])?;
+            return Ok(0);
+        }
 
+        let texts: Vec<String> = prepared.iter().map(|(_, _, text)| text.clone()).collect();
         let embeddings = self.embed_texts(&texts)?;
+        let keep_ids: Vec<String> = prepared.iter().map(|(_, id, _)| id.clone()).collect();
+        self.delete_except_ids(&keep_ids)?;
 
         let mut count = 0;
-        for (entry, embedding) in entries.into_iter().zip(embeddings.into_iter()) {
-            let id = entry
-                .id
-                .clone()
-                .unwrap_or_else(|| short_hex_digest(entry.note.as_bytes()));
+        for ((entry, id, _), embedding) in prepared.into_iter().zip(embeddings.into_iter()) {
             let content = format!("{}: {}", entry.category, entry.note);
             self.upsert(RagEntry {
                 id,
@@ -238,6 +269,10 @@ impl crate::ai::knowledge::sync::knowledge_sync::VectorStoreSync for RagStore {
         self.delete(id)
     }
 
+    fn delete_entries_except(&self, ids: &[String]) -> Result<usize, String> {
+        self.delete_except_ids(ids)
+    }
+
     fn embed_text(&self, text: &str) -> Result<Vec<f32>, String> {
         self.embed_text(text)
     }
@@ -284,6 +319,38 @@ pub fn ensure_rag_store() -> Result<(), String> {
         *guard = Some(store);
     }
     Ok(())
+}
+
+pub(crate) fn delete_ids_from_default_index(ids: &[String]) -> Result<usize, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    {
+        let guard = get_rag_store()?;
+        if let Some(store) = guard.as_ref() {
+            let mut deleted = 0usize;
+            for id in ids {
+                if store.delete(id)? {
+                    deleted += 1;
+                }
+            }
+            return Ok(deleted);
+        }
+    }
+
+    let path = RagStore::default_index_path()?;
+    if !path.exists() {
+        return Ok(0);
+    }
+    let store = RagStore::with_path(&path)?;
+    let mut deleted = 0usize;
+    for id in ids {
+        if store.delete(id)? {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 #[cfg(test)]

@@ -255,7 +255,14 @@ fn project_writeback_quality_ok(content: &str) -> bool {
         .iter()
         .filter(|marker| lower.contains(**marker))
         .count();
-    uncertain_hits == 0
+    if uncertain_hits > 0 {
+        return false;
+    }
+    if crate::ai::knowledge::entry::note_has_local_env_path_leak(trimmed) {
+        return false;
+    }
+
+    super::assess_learning_note_quality(trimmed).high_quality
 }
 
 fn find_existing_project_writeback_entry(
@@ -274,6 +281,7 @@ pub(super) enum ProjectWritebackUpsert {
     Saved,
     Updated,
     Unchanged,
+    Rejected,
 }
 
 pub(super) fn upsert_project_writeback_entry(
@@ -283,6 +291,10 @@ pub(super) fn upsert_project_writeback_entry(
     tags: Vec<String>,
     priority: u8,
 ) -> Result<ProjectWritebackUpsert, String> {
+    if !project_writeback_quality_ok(content) {
+        return Ok(ProjectWritebackUpsert::Rejected);
+    }
+
     if let Some(existing) = find_existing_project_writeback_entry(store, source) {
         if existing.note.trim() == content.trim() {
             return Ok(ProjectWritebackUpsert::Unchanged);
@@ -372,9 +384,6 @@ pub(super) async fn run_project_knowledge_writeback_background(
     let Some(payload) = parse_project_writeback_payload(&content) else {
         return;
     };
-    if !project_writeback_quality_ok(&payload.content) {
-        return;
-    }
 
     let source = format!("auto_project_writeback:{project_name}");
     let store = MemoryStore::from_env_or_config();
@@ -404,6 +413,7 @@ pub(super) async fn run_project_knowledge_writeback_background(
             );
             store.maintain_after_append();
         }
+        Ok(ProjectWritebackUpsert::Rejected) => {}
         Ok(ProjectWritebackUpsert::Unchanged) => {}
         Err(_) => {}
     }

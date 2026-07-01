@@ -326,3 +326,57 @@ inventory::submit!(ToolRegistration {
         groups: &["builtin", "core"],
     }
 });
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::ai::types::FunctionDefinition;
+
+    fn reset_state_for_tests() {
+        if let Ok(mut s) = STATE.write() {
+            *s = EnableState::default();
+        }
+    }
+
+    fn tool(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: format!("{name} description"),
+                parameters: json!({"type": "object"}),
+            },
+        }
+    }
+
+    #[test]
+    fn list_includes_available_mcp_tools() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        reset_state_for_tests();
+        set_active_tool_names(vec!["enable_tools".to_string()]);
+        set_available_mcp_tools(vec![tool("mcp_feishu_docs_search")]);
+
+        let output = execute_enable_tools(&json!({"operation": "list"})).unwrap();
+
+        assert!(output.contains("mcp_feishu_docs_search"));
+    }
+
+    #[test]
+    fn enable_known_mcp_tool_queues_mcp_activation() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        reset_state_for_tests();
+        set_active_tool_names(vec!["enable_tools".to_string()]);
+        set_available_mcp_tools(vec![tool("mcp_feishu_docs_search")]);
+
+        let output = execute_enable_tools(
+            &json!({"operation": "enable", "tools": ["mcp_feishu_docs_search"]}),
+        )
+        .unwrap();
+        let pending = drain_pending_mcp_names();
+
+        assert!(output.contains("mcp_feishu_docs_search"));
+        assert_eq!(pending, vec!["mcp_feishu_docs_search".to_string()]);
+    }
+}

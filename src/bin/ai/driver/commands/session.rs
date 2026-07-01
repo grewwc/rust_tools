@@ -2,6 +2,17 @@ use uuid::Uuid;
 
 use crate::ai::{history::SessionStore, types::App};
 
+fn clear_session_local_runtime_state(app: &mut App) {
+    crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
+    if let Some(ctx) = app.agent_context.as_mut() {
+        ctx.tools.clear();
+    }
+    app.attached_image_files.clear();
+    app.forced_skill = None;
+    app.forced_question = None;
+    app.last_skill_bias = None;
+}
+
 pub fn try_handle_session_command(
     app: &mut App,
     input: &str,
@@ -104,7 +115,7 @@ pub fn try_handle_session_command(
             // 切换前清掉旧 session 的 history cache 与 explicit-enabled tools，
             // 防止下个 turn 携带跨 session 脏状态。
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
-            crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
+            clear_session_local_runtime_state(app);
             app.session_id = new_id.clone();
             app.session_history_file = store.session_history_file(&new_id);
             app.sync_persona_session_binding();
@@ -116,7 +127,7 @@ pub fn try_handle_session_command(
                 return Ok(true);
             };
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
-            crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
+            clear_session_local_runtime_state(app);
             app.session_id = id.to_string();
             app.session_history_file = store.session_history_file(id);
             app.sync_persona_session_binding();
@@ -139,7 +150,7 @@ pub fn try_handle_session_command(
             if deleted {
                 crate::ai::history::invalidate_context_history_cache_for(&deleted_path);
                 if id == app.session_id {
-                    crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
+                    clear_session_local_runtime_state(app);
                     let new_id = Uuid::new_v4().to_string();
                     app.session_id = new_id.clone();
                     app.session_history_file = store.session_history_file(&new_id);
@@ -224,10 +235,7 @@ pub fn try_handle_session_command(
             // 清掉关联的 history cache 与 explicit-enabled tools，避免下个 turn
             // 命中陈旧缓存或携带已经无意义的工具列表。
             crate::ai::history::invalidate_context_history_cache_for(&app.session_history_file);
-            crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
-            if let Some(ctx) = app.agent_context.as_mut() {
-                ctx.tools.clear();
-            }
+            clear_session_local_runtime_state(app);
             println!(
                 "Cleared history for session: {} (session preserved)",
                 app.session_id
@@ -244,7 +252,7 @@ pub fn try_handle_session_command(
 
             let deleted = store.clear_all_sessions()?;
             crate::ai::history::clear_context_history_cache();
-            crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
+            clear_session_local_runtime_state(app);
             let new_id = Uuid::new_v4().to_string();
             app.session_id = new_id.clone();
             app.session_history_file = store.session_history_file(&new_id);
@@ -269,13 +277,10 @@ pub fn try_handle_session_command(
                     crate::ai::history::invalidate_context_history_cache_for(
                         &app.session_history_file,
                     );
-                    crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
+                    clear_session_local_runtime_state(app);
                     app.session_id = dst_id.clone();
                     app.session_history_file = store.session_history_file(&dst_id);
                     app.sync_persona_session_binding();
-                    if let Some(ctx) = app.agent_context.as_mut() {
-                        ctx.tools.clear();
-                    }
                     println!(
                         "Forked '{}' -> '{}', switched to new branch.",
                         src_id, dst_id
@@ -311,12 +316,13 @@ pub fn try_handle_session_command(
             let dst_id = dst.unwrap_or_else(|| Uuid::new_v4().to_string());
             match store.branch_session(&src_id, &dst_id, keep) {
                 Ok(()) => {
+                    crate::ai::history::invalidate_context_history_cache_for(
+                        &app.session_history_file,
+                    );
+                    clear_session_local_runtime_state(app);
                     app.session_id = dst_id.clone();
                     app.session_history_file = store.session_history_file(&dst_id);
                     app.sync_persona_session_binding();
-                    if let Some(ctx) = app.agent_context.as_mut() {
-                        ctx.tools.clear();
-                    }
                     println!(
                         "Branched '{}' -> '{}' (kept first {} message(s)), switched to new branch.",
                         src_id, dst_id, keep
@@ -368,5 +374,160 @@ fn format_size(bytes: u64) -> String {
         format!("{:.1}KB", bytes as f64 / KB as f64)
     } else {
         format!("{}B", bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{
+        cli::ParsedCli,
+        history::{Message, append_history_messages},
+        types::{AgentContext, AppConfig, SkillBiasMemory},
+    };
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{Arc, atomic::AtomicBool},
+    };
+    use serde_json::Value;
+
+    fn test_history_root() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("rust_tools-session-tests-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn test_app(root: &std::path::Path) -> App {
+        let history_file = root.join("history.sqlite");
+        let session_store = SessionStore::new(history_file.as_path());
+        let session_id = "sess-old".to_string();
+        App {
+            cli: ParsedCli::default(),
+            config: AppConfig {
+                api_key: String::new(),
+                base_history_file: history_file.clone(),
+                history_file: history_file.clone(),
+                endpoint: String::new(),
+                vl_default_model: String::new(),
+                history_max_chars: 12000,
+                history_keep_last: 8,
+                history_summary_max_chars: 4000,
+                intent_model: None,
+                intent_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/bin/ai/config/intent/intent_model.json"),
+                agent_route_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/bin/ai/config/agent_route/agent_route_model.json"),
+                skill_match_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/bin/ai/config/skill_match/skill_match_model.json"),
+            },
+            session_id: session_id.clone(),
+            session_history_file: session_store.session_history_file(&session_id),
+            active_persona: crate::ai::persona::default_persona(),
+            client: reqwest::Client::new(),
+            current_model: crate::ai::model_names::all()
+                .first()
+                .map(|model| crate::ai::model_names::model_handle(model))
+                .expect("models.json is empty"),
+            current_agent: "build".to_string(),
+            current_agent_manifest: None,
+            pending_files: None,
+            forced_skill: Some("feishu-upload-md".to_string()),
+            forced_question: Some("把 markdown 发到飞书".to_string()),
+            attached_image_files: vec!["/tmp/demo.png".to_string()],
+            shutdown: Arc::new(AtomicBool::new(false)),
+            streaming: Arc::new(AtomicBool::new(false)),
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            ignore_next_prompt_interrupt: false,
+            prompt_editor: None,
+            agent_context: Some(AgentContext::default()),
+            last_skill_bias: Some(SkillBiasMemory {
+                skill_name: "feishu-upload-md".to_string(),
+                question: "把 markdown 发到飞书".to_string(),
+            }),
+            os: crate::ai::driver::new_local_kernel(),
+            agent_reload_counter: None,
+            observers: vec![Box::new(
+                crate::ai::driver::thinking::ThinkingOrchestrator::new(),
+            )],
+        }
+    }
+
+    #[test]
+    fn sessions_new_clears_session_local_runtime_state() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        if let Some(ctx) = app.agent_context.as_mut() {
+            ctx.tools.push(crate::ai::types::ToolDefinition {
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionDefinition {
+                    name: "read_file".to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                },
+            });
+        }
+        crate::ai::tools::enable_tools::set_explicit_enabled_tool_names(vec![
+            "mcp_feishu_doc_create_from_markdown".to_string(),
+        ]);
+
+        try_handle_session_command(&mut app, "/sessions new").unwrap();
+
+        assert!(app.last_skill_bias.is_none());
+        assert!(app.forced_skill.is_none());
+        assert!(app.forced_question.is_none());
+        assert!(app.attached_image_files.is_empty());
+        assert!(
+            app.agent_context
+                .as_ref()
+                .is_some_and(|ctx| ctx.tools.is_empty())
+        );
+        assert!(
+            crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sessions_branch_also_clears_stale_skill_bias_and_explicit_tools() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let root = test_history_root();
+        let mut app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+        let src_path = store.session_history_file(&app.session_id);
+        append_history_messages(
+            &src_path,
+            &[
+                Message {
+                    role: "user".to_string(),
+                    content: Value::String("u0".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+                Message {
+                    role: "assistant".to_string(),
+                    content: Value::String("a0".to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                },
+            ],
+        )
+        .unwrap();
+        crate::ai::tools::enable_tools::set_explicit_enabled_tool_names(vec![
+            "mcp_feishu_doc_create_from_markdown".to_string(),
+        ]);
+
+        try_handle_session_command(&mut app, "/sessions branch 1").unwrap();
+
+        assert!(app.last_skill_bias.is_none());
+        assert!(app.forced_skill.is_none());
+        assert!(app.forced_question.is_none());
+        assert!(
+            crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty()
+        );
+        let _ = fs::remove_dir_all(root);
     }
 }

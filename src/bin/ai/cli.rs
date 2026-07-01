@@ -426,9 +426,9 @@ pub(super) fn print_help() {
     println!(
         "  --consolidate-knowledge  read all knowledge entries, analyze with LLM, clean up obsolete ones"
     );
-      println!(
-          "  --migrate-legacy-knowledge  repair old saved knowledge so durable principles are easier to recall"
-      );
+    println!(
+        "  --migrate-legacy-knowledge  repair old saved knowledge so durable principles are easier to recall"
+    );
     println!("  -n, --note <text>        save text as memo to knowledge base and exit");
     println!("  -ns, --note-search       search memo category using the positional prompt");
     println!("  -i, --interactive        keep the session open for follow-up questions");
@@ -849,21 +849,17 @@ mod tests {
 
         assert!(names.iter().any(|name| name == "clear"));
         assert!(names.iter().any(|name| name == "generate-completions"));
-          assert!(names.iter().any(|name| name == "migrate-legacy-knowledge"));
+        assert!(names.iter().any(|name| name == "migrate-legacy-knowledge"));
     }
 
-      #[test]
-      fn parse_cli_args_reads_migrate_legacy_knowledge_flag() {
-          let cli = super::parse_cli_args(
-              [
-                  "a".to_string(),
-                  "--migrate-legacy-knowledge".to_string(),
-              ]
-              .into_iter(),
-          );
+    #[test]
+    fn parse_cli_args_reads_migrate_legacy_knowledge_flag() {
+        let cli = super::parse_cli_args(
+            ["a".to_string(), "--migrate-legacy-knowledge".to_string()].into_iter(),
+        );
 
-          assert!(cli.migrate_legacy_knowledge);
-      }
+        assert!(cli.migrate_legacy_knowledge);
+    }
 
     #[test]
     fn model_selector_words_use_user_facing_selectors() {

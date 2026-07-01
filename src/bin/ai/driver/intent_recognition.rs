@@ -230,6 +230,12 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_intent_project_work_request_action() {
+        let intent = detect_intent("帮我修改这个项目下的登录功能");
+        assert_eq!(intent.core, CoreIntent::RequestAction);
+    }
+
+    #[test]
     fn test_detect_intent_request_action_without_keyword_modifiers() {
         let intent = detect_intent("帮我找几个 review skill");
         // 关键词 modifier 已移除：核心意图完全由模型决定。

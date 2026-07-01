@@ -247,6 +247,7 @@ pub fn apply_prepared_mcp_init(
         ctx.mcp_servers = loaded_servers;
         ctx.tools.extend(mcp_client.get_all_tools());
     }
+    crate::ai::tools::enable_tools::set_available_mcp_tools(mcp_client.get_all_tools());
 
     report
 }

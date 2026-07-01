@@ -58,23 +58,11 @@ use crate::ai::tools::service::memory::{
     MemoryOwnerScope, next_memory_id, prepare_memory_save_entry,
 };
 use crate::ai::tools::storage::memory_store::{AgentMemoryEntry, MemoryStore};
-use crate::ai::tools::storage::rag_store::{RagEntry, ensure_rag_store, get_rag_store};
+use crate::ai::tools::storage::rag_store::{
+    RagEntry, ensure_rag_store, get_rag_store, legacy_rag_id_for_memory_entry,
+    legacy_rebuild_rag_id_for_memory_entry,
+};
 use chrono::Local;
-
-/// 旧版 knowledge_save 曾用 “timestamp:note” 的短哈希作为 RAG id。
-/// 新实现改用 memory entry id；这里只保留旧算法作为删除兼容兜底。
-fn short_rag_id(bytes: &[u8]) -> String {
-    let digest = <sha2::Sha256 as sha2::Digest>::digest(bytes);
-    let mut s = String::with_capacity(32);
-    for b in &digest[..16] {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
-}
-
-fn legacy_rag_id_for_entry(entry: &AgentMemoryEntry) -> String {
-    short_rag_id(format!("{}:{}", entry.timestamp, entry.note).as_bytes())
-}
 
 fn rag_timestamp_for_entry(entry: &AgentMemoryEntry) -> u64 {
     chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
@@ -156,7 +144,10 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
         }
     }
 
-    let mut result = format!("Saved to knowledge [{}]:\n  {}\n", entry.category, entry.note);
+    let mut result = format!(
+        "Saved to knowledge [{}]:\n  {}\n",
+        entry.category, entry.note
+    );
     if let Some(id) = entry.id.as_deref() {
         result.push_str(&format!("  ID: {}\n", id));
     }
@@ -173,12 +164,14 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
             requested_category
         ));
         result.push_str(
-            "Saved as short-term self_note; it will not enter persistent guideline recall until the note is more specific and actionable.",
+              "  Saved as short-term self_note; it will not enter persistent guideline recall until the note is more specific and actionable.\n",
         );
     } else if is_guideline_category(&entry.category) {
-        result.push_str("This principle will participate in persistent guideline recall.");
+        result.push_str("  This principle will participate in persistent guideline recall.\n");
     } else {
-        result.push_str("The agent will automatically check this knowledge in future conversations.");
+        result.push_str(
+            "  The agent will automatically check this knowledge in future conversations.\n",
+        );
     }
 
     Ok(result)
@@ -187,7 +180,7 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "knowledge_save",
-            description: "Save user-directed content to the global knowledge base with optional category and tags. Use guideline categories like `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` for durable principles/constraints so they participate in persistent recall.",
+        description: "Save user-directed content to the global knowledge base with optional category and tags. Use guideline categories like `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` for durable principles/constraints so they participate in persistent recall.",
         parameters: params_knowledge_save,
         execute: execute_knowledge_save,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -239,11 +232,20 @@ fn execute_knowledge_forget(args: &Value) -> Result<String, String> {
     if let Ok(_) = ensure_rag_store() {
         if let Ok(guard) = get_rag_store() {
             if let Some(rag) = guard.as_ref() {
-                    let rag_id = deleted
-                        .id
-                        .clone()
-                        .unwrap_or_else(|| legacy_rag_id_for_entry(&deleted));
+                let rag_id = deleted
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| legacy_rag_id_for_memory_entry(&deleted));
                 let _ = rag.delete(&rag_id);
+                let legacy_ids = [
+                    legacy_rag_id_for_memory_entry(&deleted),
+                    legacy_rebuild_rag_id_for_memory_entry(&deleted),
+                ];
+                for legacy_id in legacy_ids {
+                    if legacy_id != rag_id {
+                        let _ = rag.delete(&legacy_id);
+                    }
+                }
             }
         }
     }
@@ -768,7 +770,10 @@ mod tests {
 
         let entries = read_entries(&path);
         assert_eq!(entries.len(), 1);
-        let id = entries[0].id.clone().expect("knowledge_save should assign id");
+        let id = entries[0]
+            .id
+            .clone()
+            .expect("knowledge_save should assign id");
 
         let forget_msg = execute_knowledge_forget(&serde_json::json!({ "id": id })).unwrap();
         assert!(forget_msg.contains("Forgotten knowledge entry"));

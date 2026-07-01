@@ -4623,6 +4623,38 @@
       "core": "request_action"
     },
     {
+      "text": "帮我修改这个项目下的登录功能",
+      "core": "request_action"
+    },
+    {
+      "text": "请修复当前仓库里的会话恢复逻辑",
+      "core": "request_action"
+    },
+    {
+      "text": "把这个 codebase 的 MCP 工具发现修好",
+      "core": "request_action"
+    },
+    {
+      "text": "帮我把这个功能在当前项目里实现掉",
+      "core": "request_action"
+    },
+    {
+      "text": "帮我调整这个模块的工具路由",
+      "core": "request_action"
+    },
+    {
+      "text": "implement this feature in the current repo",
+      "core": "request_action"
+    },
+    {
+      "text": "fix this panic in src/bin/a.rs",
+      "core": "request_action"
+    },
+    {
+      "text": "update the agent routing logic in this workspace",
+      "core": "request_action"
+    },
+    {
       "text": "给我整理一下这个 prompt",
       "core": "request_action"
     },

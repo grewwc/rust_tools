@@ -378,21 +378,21 @@ mod tests {
         }
     }
 
-      #[test]
-      fn persistent_guidelines_include_legacy_saved_and_generalized_principles() {
-          let _guard = ENV_LOCK.lock().unwrap();
-          let ts = std::time::SystemTime::now()
-              .duration_since(std::time::UNIX_EPOCH)
-              .unwrap()
-              .as_nanos();
-          let path = std::env::temp_dir().join(format!("rt_legacy_guidelines_{ts}.jsonl"));
-          unsafe {
-              std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
-          }
+    #[test]
+    fn persistent_guidelines_include_legacy_saved_and_generalized_principles() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_legacy_guidelines_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
 
-          let store = MemoryStore::from_env_or_config();
-          let timestamp = Local::now().to_rfc3339();
-          store
+        let store = MemoryStore::from_env_or_config();
+        let timestamp = Local::now().to_rfc3339();
+        store
               .append(&AgentMemoryEntry {
                   id: Some("mem_legacy_principle".to_string()),
                   timestamp: timestamp.clone(),
@@ -406,7 +406,7 @@ mod tests {
                   image_path: None,
               })
               .unwrap();
-          store
+        store
               .append(&AgentMemoryEntry {
                   id: Some("principle_test_1".to_string()),
                   timestamp,
@@ -421,19 +421,23 @@ mod tests {
               })
               .unwrap();
 
-          let guidelines = build_persistent_guidelines("我现在要删文件", 1200).expect("guidelines");
+        let guidelines = build_persistent_guidelines("我现在要删文件", 1200).expect("guidelines");
 
-          assert!(guidelines.contains("Do: ask for confirmation before destructive file operations."));
-          assert!(guidelines.contains("Avoid: deleting user data without an explicit yes."));
-          assert!(guidelines.contains("In tool safety, Do: require explicit user confirmation before destructive actions."));
-          assert!(!guidelines.contains("[domain=tool_safety]"));
-          assert!(!guidelines.contains("Cross-domain links:"));
+        assert!(
+            guidelines.contains("Do: ask for confirmation before destructive file operations.")
+        );
+        assert!(guidelines.contains("Avoid: deleting user data without an explicit yes."));
+        assert!(guidelines.contains(
+            "In tool safety, Do: require explicit user confirmation before destructive actions."
+        ));
+        assert!(!guidelines.contains("[domain=tool_safety]"));
+        assert!(!guidelines.contains("Cross-domain links:"));
 
-          let _ = std::fs::remove_file(&path);
-          unsafe {
-              std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
-          }
-      }
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
 
     #[test]
     fn repo_inspection_tools_are_detected_from_turn_messages() {
@@ -480,7 +484,7 @@ mod tests {
         let created = upsert_project_writeback_entry(
             &store,
             source,
-            "- rust_tools 项目结构：初始版本",
+            "- rust_tools 项目结构：src/bin 放入口，src/cw 放通用组件\n- rust_tools 构建流程：优先使用 cargo check 做快速验证",
             vec!["project".to_string(), "rust_tools".to_string()],
             180,
         )
@@ -490,7 +494,7 @@ mod tests {
         let updated = upsert_project_writeback_entry(
             &store,
             source,
-            "- rust_tools 项目结构：更新版本",
+            "- rust_tools 项目结构：src/bin 放入口，src/cw 放通用组件\n- rust_tools 构建流程：优先使用 cargo test --bin a 做行为验证",
             vec![
                 "project".to_string(),
                 "rust_tools".to_string(),
@@ -508,14 +512,14 @@ mod tests {
             .filter(|entry| entry.source.as_deref() == Some(source))
             .collect::<Vec<_>>();
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].note.contains("更新版本"));
+        assert!(entries[0].note.contains("cargo test --bin a"));
         assert_eq!(entries[0].priority, Some(200));
         assert!(entries[0].tags.iter().any(|tag| tag == "structure"));
 
         let unchanged = upsert_project_writeback_entry(
             &store,
             source,
-            "- rust_tools 项目结构：更新版本",
+            "- rust_tools 项目结构：src/bin 放入口，src/cw 放通用组件\n- rust_tools 构建流程：优先使用 cargo test --bin a 做行为验证",
             vec![
                 "project".to_string(),
                 "rust_tools".to_string(),
@@ -532,6 +536,48 @@ mod tests {
             .filter(|entry| entry.source.as_deref() == Some(source))
             .collect::<Vec<_>>();
         assert_eq!(entries_after.len(), 1);
+
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn project_writeback_rejects_user_local_skill_path_note() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_project_writeback_reject_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let store = MemoryStore::from_env_or_config();
+        let source = "auto_project_writeback:main-test";
+        let rejected = upsert_project_writeback_entry(
+            &store,
+            source,
+            "- Skill 文件位置：~/.config/rust_tools/skills/feishu-upload-md.skill\n- 工作流程：读取Markdown → 调用飞书API → 返回文档链接\n- 支持的调用方式：tool_spawn 直接调用或 Python 脚本",
+            vec![
+                "project".to_string(),
+                "main-test".to_string(),
+                "skill".to_string(),
+            ],
+            180,
+        )
+        .unwrap();
+
+        assert!(matches!(rejected, ProjectWritebackUpsert::Rejected));
+        let entries = store
+            .recent(20)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.source.as_deref() == Some(source))
+            .collect::<Vec<_>>();
+        assert!(entries.is_empty());
 
         let _ = std::fs::remove_file(&path);
         unsafe {
@@ -697,5 +743,14 @@ mod tests {
         );
         assert!(assessment.high_quality);
         assert!(assessment.directive_signals > 0);
+    }
+
+    #[test]
+    fn shared_quality_pipeline_rejects_user_local_path_note() {
+        let assessment = assess_learning_note_quality(
+            "- Skill 文件位置：~/.config/rust_tools/skills/feishu-upload-md.skill\n- 工作流程：读取Markdown → 调用飞书API → 返回文档链接\n- 支持的调用方式：tool_spawn 直接调用或 Python 脚本",
+        );
+        assert!(!assessment.high_quality);
+        assert!(assessment.one_off_signals > 0);
     }
 }

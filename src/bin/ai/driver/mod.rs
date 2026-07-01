@@ -31,8 +31,8 @@ use std::{
 };
 
 use aios_kernel::primitives::{ResourceUsageDelta, RlimitDim, RlimitVerdict};
-use rustc_hash::FxHashSet;
 use rust_tools::cw::SkipMap;
+use rustc_hash::FxHashSet;
 use uuid::Uuid;
 
 use crate::ai::{
@@ -982,6 +982,50 @@ fn announce_mcp_loading_if_needed(
     *mcp_loading_announced = true;
 }
 
+fn emit_mcp_loaded_header(report: &McpInitReport, mcp_loading_announced: &mut bool) {
+    if !report.loaded {
+        return;
+    }
+
+    let header = print::format_section_header(
+        "mcp",
+        Some(&format!(
+            "{} servers, {} tools",
+            report.server_count, report.tool_count
+        )),
+    );
+    if *mcp_loading_announced {
+        print!("\r\x1b[2K{}\n", header);
+    } else {
+        println!("{header}");
+    }
+}
+
+async fn finalize_mcp_preload_task(
+    app: &mut App,
+    mcp_client: &SharedMcpClient,
+    mcp_probe: &McpConfigProbe,
+    task: tokio::task::JoinHandle<Option<PreparedMcpInit>>,
+) -> Option<McpInitReport> {
+    match task.await {
+        Ok(Some(prepared)) => Some(apply_prepared_mcp_with_shared_client(
+            app, mcp_client, prepared,
+        )),
+        Ok(None) => None,
+        Err(err) => {
+            if app.shutdown.load(Ordering::Relaxed) || signal::request_interrupt_ready() {
+                return None;
+            }
+            eprintln!("[mcp] background preload task failed: {}", err);
+            let fallback =
+                prepare_mcp_initialization_from_path(mcp_probe.config_path.clone()).await;
+            Some(apply_prepared_mcp_with_shared_client(
+                app, mcp_client, fallback,
+            ))
+        }
+    }
+}
+
 async fn try_finalize_mcp_preload(
     app: &mut App,
     mcp_client: &SharedMcpClient,
@@ -1002,34 +1046,47 @@ async fn try_finalize_mcp_preload(
     }
 
     let task = mcp_preload_task.take().unwrap();
-    let report = match task.await {
-        Ok(Some(prepared)) => apply_prepared_mcp_with_shared_client(app, mcp_client, prepared),
-        Ok(None) => return,
-        Err(err) => {
-            if app.shutdown.load(Ordering::Relaxed) || signal::request_interrupt_ready() {
-                return;
-            }
-            eprintln!("[mcp] background preload task failed: {}", err);
-            let fallback =
-                prepare_mcp_initialization_from_path(mcp_probe.config_path.clone()).await;
-            apply_prepared_mcp_with_shared_client(app, mcp_client, fallback)
-        }
+    let Some(report) = finalize_mcp_preload_task(app, mcp_client, mcp_probe, task).await else {
+        return;
     };
 
     *mcp_initialized = true;
-    if report.loaded {
-        let header = print::format_section_header(
-            "mcp",
-            Some(&format!(
-                "{} servers, {} tools",
-                report.server_count, report.tool_count
-            )),
-        );
-        if *mcp_loading_announced {
-            print!("\r\x1b[2K{}\n", header);
-        } else {
-            println!("{header}");
-        }
+    emit_mcp_loaded_header(&report, mcp_loading_announced);
+}
+
+async fn ensure_mcp_initialized_for_turn(
+    app: &mut App,
+    mcp_client: &SharedMcpClient,
+    mcp_probe: &McpConfigProbe,
+    mcp_initialized: &mut bool,
+    mcp_loading_announced: &mut bool,
+    mcp_preload_task: &mut Option<tokio::task::JoinHandle<Option<PreparedMcpInit>>>,
+    show_status: bool,
+) {
+    if *mcp_initialized || !mcp_probe.exists {
+        return;
+    }
+
+    if show_status {
+        announce_mcp_loading_if_needed(mcp_probe, *mcp_initialized, mcp_loading_announced);
+    }
+
+    let report = if let Some(task) = mcp_preload_task.take() {
+        finalize_mcp_preload_task(app, mcp_client, mcp_probe, task).await
+    } else {
+        let prepared = prepare_mcp_initialization_from_path(mcp_probe.config_path.clone()).await;
+        Some(apply_prepared_mcp_with_shared_client(
+            app, mcp_client, prepared,
+        ))
+    };
+
+    let Some(report) = report else {
+        return;
+    };
+
+    *mcp_initialized = true;
+    if show_status {
+        emit_mcp_loaded_header(&report, mcp_loading_announced);
     }
 }
 
@@ -1045,8 +1102,8 @@ fn spawn_mcp_preload_task(config_path: String) -> tokio::task::JoinHandle<Option
     })
 }
 
-fn should_preload_mcp(one_shot_mode: bool, mcp_probe: &McpConfigProbe) -> bool {
-    mcp_probe.exists && !one_shot_mode
+fn should_preload_mcp(_one_shot_mode: bool, mcp_probe: &McpConfigProbe) -> bool {
+    mcp_probe.exists
 }
 
 fn one_shot_cli_mode(cli: &cli::ParsedCli) -> bool {
@@ -1624,7 +1681,8 @@ fn build_note_search_retrieval_query(
         .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
         .filter_map(|message| {
             let content = crate::ai::history::value_to_string(&message.content);
-            let content = truncate_note_search_excerpt(&content, NOTE_SEARCH_QUERY_HISTORY_MAX_CHARS);
+            let content =
+                truncate_note_search_excerpt(&content, NOTE_SEARCH_QUERY_HISTORY_MAX_CHARS);
             if content.is_empty() {
                 return None;
             }
@@ -1687,7 +1745,10 @@ fn build_note_search_chat_history(
 fn select_note_search_candidates<'a>(
     candidates: &'a [crate::ai::tools::service::memory::ScoredMemo],
 ) -> Vec<&'a crate::ai::tools::service::memory::ScoredMemo> {
-    if candidates.first().is_some_and(|candidate| candidate.semantic) {
+    if candidates
+        .first()
+        .is_some_and(|candidate| candidate.semantic)
+    {
         let top = candidates[0].score.max(1e-6);
         let threshold = top * 0.6;
         candidates
@@ -1727,15 +1788,16 @@ async fn answer_memo_search(
     };
 
     // 检索相关 memo 条目作为上下文。
-    let candidates =
-        match crate::ai::tools::service::memory::search_memo_candidates_scored(&retrieval_query, 20)
-        {
-            Ok(c) => c,
-            Err(err) => {
-                eprintln!("[note-search] 检索失败: {}", err);
-                return Err(err.into());
-            }
-        };
+    let candidates = match crate::ai::tools::service::memory::search_memo_candidates_scored(
+        &retrieval_query,
+        20,
+    ) {
+        Ok(c) => c,
+        Err(err) => {
+            eprintln!("[note-search] 检索失败: {}", err);
+            return Err(err.into());
+        }
+    };
     if candidates.is_empty() {
         return Ok(format!("没有在知识库中找到与「{}」相关的内容。", question));
     }
@@ -1754,18 +1816,18 @@ async fn answer_memo_search(
     }
 
     let mut messages = vec![serde_json::json!({
-            "role": "system",
-            "content": "你处于 notebook 检索问答模式。下面会给出当前问题，以及本轮从用户 notebook（memo）里检索到的若干条笔记。\
-                        每一轮都必须优先依据本轮检索结果回答。最近对话仅用于理解省略、代词和追问；如果最近对话与本轮检索结果冲突，以本轮检索结果为准。\
-                        如果检索结果里没有足够信息回答，就直接说明。用中文回答，使用 Markdown 格式。",
-        })];
+        "role": "system",
+        "content": "你处于 notebook 检索问答模式。下面会给出当前问题，以及本轮从用户 notebook（memo）里检索到的若干条笔记。\
+                    每一轮都必须优先依据本轮检索结果回答。最近对话仅用于理解省略、代词和追问；如果最近对话与本轮检索结果冲突，以本轮检索结果为准。\
+                    如果检索结果里没有足够信息回答，就直接说明。用中文回答，使用 Markdown 格式。",
+    })];
     if note_search_interactive_mode(&app.cli) {
         messages.extend(build_note_search_chat_history(app, history_count)?);
     }
     messages.push(serde_json::json!({
-            "role": "user",
-            "content": format!("当前问题：{}\n\n本轮 notebook 检索结果：\n{}", question, context),
-        }));
+        "role": "user",
+        "content": format!("当前问题：{}\n\n本轮 notebook 检索结果：\n{}", question, context),
+    }));
 
     match crate::ai::request::do_request_json(app, &app.current_model, &messages, false, true).await
     {
@@ -1818,9 +1880,10 @@ fn persist_note_search_turn(app: &App, question: &str, answer: &str) {
             reasoning_content: None,
         },
     ];
-    if let Err(err) =
-        crate::ai::history::append_history_messages_uncompacted(&app.session_history_file, &messages)
-    {
+    if let Err(err) = crate::ai::history::append_history_messages_uncompacted(
+        &app.session_history_file,
+        &messages,
+    ) {
         eprintln!("[Warning] Failed to save notebook search history: {}", err);
     }
 }
@@ -1852,7 +1915,11 @@ async fn handle_memo_search(app: &App) -> Result<(), Box<dyn std::error::Error>>
 // 生成新条目，并把对应源 IDs 自动并入删除集合，避免“旧条目 + 合并条目”并存。
 fn build_consolidation_merge_entries(
     merge_plan: &[&serde_json::Value],
-) -> (FxHashSet<String>, usize, Vec<crate::ai::tools::storage::memory_store::AgentMemoryEntry>) {
+) -> (
+    FxHashSet<String>,
+    usize,
+    Vec<crate::ai::tools::storage::memory_store::AgentMemoryEntry>,
+) {
     let mut merge_delete_ids = FxHashSet::default();
     let mut merged_count = 0usize;
     let mut new_entries = Vec::new();
@@ -2018,9 +2085,11 @@ async fn handle_consolidate_knowledge(app: &App) -> Result<(), Box<dyn std::erro
         .as_array()
         .map(|a| a.iter().collect())
         .unwrap_or_default();
-    let (merge_delete_ids, merged_count, new_entries) = build_consolidation_merge_entries(&merge_plan);
+    let (merge_delete_ids, merged_count, new_entries) =
+        build_consolidation_merge_entries(&merge_plan);
 
-    let mut delete_id_set: FxHashSet<String> = delete_ids.iter().map(|id| (*id).to_string()).collect();
+    let mut delete_id_set: FxHashSet<String> =
+        delete_ids.iter().map(|id| (*id).to_string()).collect();
     delete_id_set.extend(merge_delete_ids);
 
     if delete_id_set.is_empty() && new_entries.is_empty() {
@@ -3094,6 +3163,17 @@ async fn run_loop(
             .await;
         }
 
+        ensure_mcp_initialized_for_turn(
+            app,
+            mcp_client,
+            &mcp_probe,
+            &mut mcp_initialized,
+            &mut mcp_loading_announced,
+            &mut mcp_preload_task,
+            !one_shot_mode,
+        )
+        .await;
+
         let precomputed_ocr = if !app.attached_image_files.is_empty()
             && !crate::ai::models::is_vl_model(&app.current_model)
         {
@@ -3277,11 +3357,10 @@ mod tests {
     use super::{
         DispatchOutcomeTag, ProcessDispatchMeta, SCHED_COOLDOWN_EPOCHS_DEFAULT,
         SCHEDULER_DISPATCH_META, background_execute_limit, background_pop_limit,
-          build_consolidation_merge_entries, build_note_search_retrieval_query,
-          has_pending_foreground_process,
-        maybe_auto_route_agent, one_shot_cli_mode, read_recent_history,
-        reset_scheduler_test_state, should_preload_mcp, should_publish_subagent_task_result,
-        update_dispatch_meta,
+        build_consolidation_merge_entries, build_note_search_retrieval_query,
+        has_pending_foreground_process, maybe_auto_route_agent, one_shot_cli_mode,
+        read_recent_history, reset_scheduler_test_state, should_preload_mcp,
+        should_publish_subagent_task_result, update_dispatch_meta,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
@@ -3482,14 +3561,14 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_mode_does_not_start_background_mcp_preload() {
+    fn one_shot_mode_still_preloads_mcp_before_turn() {
         let probe = super::McpConfigProbe {
             config_path: "/tmp/mcp.json".to_string(),
             exists: true,
             server_count: 1,
         };
 
-        assert!(!should_preload_mcp(true, &probe));
+        assert!(should_preload_mcp(true, &probe));
         assert!(should_preload_mcp(false, &probe));
     }
 
@@ -3538,38 +3617,38 @@ mod tests {
         assert!(user_pos < assistant_pos);
     }
 
-      #[test]
-      fn consolidation_merge_plan_auto_deletes_valid_merge_ids() {
-          let merge_plan = [
-              serde_json::json!({
-                  "ids": ["id_a", "id_b"],
-                  "merged_content": "合并后的内容"
-              }),
-              serde_json::json!({
-                  "ids": ["ignored"],
-                  "merged_content": ""
-              }),
-          ];
-          let merge_plan_refs: Vec<&serde_json::Value> = merge_plan.iter().collect();
+    #[test]
+    fn consolidation_merge_plan_auto_deletes_valid_merge_ids() {
+        let merge_plan = [
+            serde_json::json!({
+                "ids": ["id_a", "id_b"],
+                "merged_content": "合并后的内容"
+            }),
+            serde_json::json!({
+                "ids": ["ignored"],
+                "merged_content": ""
+            }),
+        ];
+        let merge_plan_refs: Vec<&serde_json::Value> = merge_plan.iter().collect();
 
-          let (delete_ids, merged_count, new_entries) =
-              build_consolidation_merge_entries(&merge_plan_refs);
+        let (delete_ids, merged_count, new_entries) =
+            build_consolidation_merge_entries(&merge_plan_refs);
 
-          assert_eq!(merged_count, 2);
-          assert_eq!(delete_ids.len(), 2);
-          assert!(delete_ids.contains("id_a"));
-          assert!(delete_ids.contains("id_b"));
-          assert!(!delete_ids.contains("ignored"));
-          assert_eq!(new_entries.len(), 1);
-          assert!(
-              new_entries[0]
-                  .id
-                  .as_deref()
-                  .is_some_and(|id| id.starts_with("mem_"))
-          );
-          assert_eq!(new_entries[0].note, "合并后的内容");
-          assert_eq!(new_entries[0].tags, vec!["consolidated".to_string()]);
-      }
+        assert_eq!(merged_count, 2);
+        assert_eq!(delete_ids.len(), 2);
+        assert!(delete_ids.contains("id_a"));
+        assert!(delete_ids.contains("id_b"));
+        assert!(!delete_ids.contains("ignored"));
+        assert_eq!(new_entries.len(), 1);
+        assert!(
+            new_entries[0]
+                .id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("mem_"))
+        );
+        assert_eq!(new_entries[0].note, "合并后的内容");
+        assert_eq!(new_entries[0].tags, vec!["consolidated".to_string()]);
+    }
 
     #[test]
     fn auto_route_falls_back_to_build_instead_of_current_agent() {

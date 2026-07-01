@@ -15,6 +15,9 @@ pub trait VectorStoreSync {
         embedding: Vec<f32>,
     ) -> Result<(), String>;
     fn delete_entry(&self, id: &str) -> Result<bool, String>;
+    fn delete_entries_except(&self, _ids: &[String]) -> Result<usize, String> {
+        Ok(0)
+    }
     fn embed_text(&self, text: &str) -> Result<Vec<f32>, String>;
 
     /// Batch embed multiple texts (default implementation calls embed_text individually)
@@ -75,17 +78,28 @@ pub fn rebuild_vector_index(
         return Ok(0);
     }
 
+    let ids: Vec<String> = valid_entries
+        .iter()
+        .map(|entry| {
+            entry
+                .id
+                .clone()
+                .unwrap_or_else(|| id_generator::generate_id(entry))
+        })
+        .collect();
+
     // Batch embed all texts at once (much faster than individual API calls)
     let texts: Vec<String> = valid_entries.iter().map(|e| e.search_text()).collect();
     let embeddings = vector_store.embed_texts(&texts)?;
+    vector_store.delete_entries_except(&ids)?;
 
     // Upsert all entries with their embeddings
     let mut count = 0;
-    for (entry, embedding) in valid_entries.iter().zip(embeddings.iter()) {
-        let id = entry
-            .id
-            .clone()
-            .unwrap_or_else(|| id_generator::generate_id(entry));
+    for ((entry, id), embedding) in valid_entries
+        .iter()
+        .zip(ids.into_iter())
+        .zip(embeddings.iter())
+    {
         let content = entry.search_text();
         if vector_store
             .upsert_entry(

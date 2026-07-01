@@ -145,18 +145,35 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
         .collect()
 }
 
-/// 对整个原始命令做"shell 注入面"层面的全局检查（独立于分段验证），
-/// 拦截那些不被分段化策略覆盖的注入面：命令替换、heredoc/herestring、
+/// =========================================================================
+/// Shell 注入面检查
+/// =========================================================================
+///
+/// 本函数是 **shell-specific** 的安全检查，只应对经 shell 解释执行的命令
+///（即 `execute_command` 工具）调用。对于非 shell 的工具（如 `write_file`、
+/// `apply_patch` 等纯字符串操作），不应应用本检查——它们是直接写入文件系统
+/// 或做文本替换，不会把参数喂给 shell 解释，`<<` / `$()` 只是普通文本。
+///
+/// 当前本函数仅在 `validate_execute_command` 内部被调用，天然只作用在 shell
+/// 执行路径上。
+///
+/// 拦截那些不被分段化策略覆盖的注入面：命令替换、
 /// 进程替换。它们在正当 dev 工作流里几乎不出现，但可以一举绕过任何
 /// program/参数级黑名单（典型样例：`$(echo rm) -rf /tmp/foo`）。
 fn validate_no_injection_surface(command: &str) -> Result<(), String> {
     let bytes = command.as_bytes();
     let mut i = 0;
     let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
     while i < bytes.len() {
         let b = bytes[i];
-        // 单引号内的所有内容都是字面量，shell 不会解析 $() / `；
-        // 双引号内 $() 与 `` 仍会被 shell 解释，因此双引号不视为安全围栏。
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        // 单引号内的所有内容都是字面量，shell 不会解析 $() / `。
         if in_single {
             if b == b'\'' {
                 in_single = false;
@@ -164,8 +181,35 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
             i += 1;
             continue;
         }
+        // 双引号内 `<(` / `>(` 只是普通文本，但 `$()` / `` ` `` 仍可能生效，
+        // 因此后面只对后两类继续做拦截。
+        if in_double {
+            match b {
+                b'\\' => {
+                    escaped = true;
+                    i += 1;
+                    continue;
+                }
+                b'"' => {
+                    in_double = false;
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if !in_double && b == b'\\' {
+            escaped = true;
+            i += 1;
+            continue;
+        }
         if b == b'\'' {
             in_single = true;
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_double = true;
             i += 1;
             continue;
         }
@@ -183,16 +227,10 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
                     .to_string(),
             );
         }
-        // 进程替换 `<(...)` / `>(...)`
-        if (b == b'<' || b == b'>') && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
+        // 进程替换 `<(...)` / `>(...)` 只在引号外有 shell 语义。
+        if !in_double && (b == b'<' || b == b'>') && i + 1 < bytes.len() && bytes[i + 1] == b'('
+        {
             return Err("process substitution `<(...)` / `>(...)` is not allowed".to_string());
-        }
-        // heredoc / herestring `<<` / `<<<`
-        if b == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'<' {
-            return Err(
-                "heredoc / herestring (`<<`, `<<<`) is not allowed; write input to a file instead"
-                    .to_string(),
-            );
         }
         // 反引号命令替换
         if b == b'`' {
@@ -212,7 +250,7 @@ pub fn validate_execute_command(command: &str) -> Result<(), String> {
         return Err("empty command".to_string());
     }
 
-    // 第一道防线：阻断 shell 注入面（命令替换 / heredoc / 进程替换）。
+    // 第一道防线：阻断 shell 注入面（命令替换 / 进程替换）。
     // 这些放过去，分段黑名单就是摆设。
     validate_no_injection_surface(command)?;
 
@@ -534,9 +572,9 @@ mod tests {
     }
 
     #[test]
-    fn injection_blocks_heredoc_and_herestring() {
-        assert!(validate_no_injection_surface("cat <<EOF").is_err());
-        assert!(validate_no_injection_surface("cat <<<\"hi\"").is_err());
+    fn injection_allows_heredoc_and_herestring() {
+        assert!(validate_no_injection_surface("cat <<EOF").is_ok());
+        assert!(validate_no_injection_surface("cat <<<\"hi\"").is_ok());
     }
 
     #[test]
@@ -553,6 +591,25 @@ mod tests {
     fn injection_treats_single_quoted_as_literal() {
         // 整段在单引号内的 `$()` 是字面量，bash 不会展开。
         assert!(validate_no_injection_surface("echo 'price: $(100)'").is_ok());
+    }
+
+    #[test]
+    fn injection_treats_double_quoted_process_substitution_like_text_as_literal() {
+        assert!(validate_no_injection_surface(r#"echo "<(literal)""#).is_ok());
+        assert!(validate_no_injection_surface(r#"echo ">(literal)""#).is_ok());
+    }
+
+    #[test]
+    fn injection_treats_escaped_substitution_markers_as_literal() {
+        assert!(validate_no_injection_surface(r#"echo \$(whoami)"#).is_ok());
+        assert!(validate_no_injection_surface(r#"echo "\$(whoami)""#).is_ok());
+        assert!(validate_no_injection_surface(r#"echo "\`whoami\`""#).is_ok());
+    }
+
+    #[test]
+    fn injection_still_blocks_substitution_inside_double_quotes() {
+        assert!(validate_no_injection_surface(r#"echo "user=$(whoami)""#).is_err());
+        assert!(validate_no_injection_surface(r#"echo "`whoami`""#).is_err());
     }
 
     // ---- end-to-end validate_execute_command ----
