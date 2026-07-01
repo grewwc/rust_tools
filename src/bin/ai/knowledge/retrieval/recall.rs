@@ -418,7 +418,11 @@ fn should_include_in_auto_recall(entry: &KnowledgeEntry) -> bool {
             | Category::Architecture
             | Category::DecisionLog
             | Category::ProjectWriteback
-    )
+    ) && !should_exclude_from_auto_recall(entry)
+}
+
+fn should_exclude_from_auto_recall(entry: &KnowledgeEntry) -> bool {
+    matches!(entry.category_enum(), Category::ProjectWriteback) && entry.has_local_env_path_leak()
 }
 
 fn deduplicate_entries(entries: &mut Vec<KnowledgeEntry>, similarity_threshold: f64) {
@@ -639,6 +643,30 @@ mod tests {
         assert!(recalled.content.contains("project structure"));
         assert!(!recalled.content.contains("read_file_lines"));
         assert_eq!(recalled.categories, vec!["user_memory".to_string()]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_recall_excludes_project_writeback_with_local_skill_path_leak() {
+        let path = test_store_path("exclude_local_skill_path");
+        let store = JsonlStore::new(path.clone());
+        append_entry(
+            &store,
+            "project_memory",
+            "- Skill 文件位置：~/.config/rust_tools/skills/feishu-upload-md.skill\n- 工作流程：读取Markdown → 调用飞书API → 返回文档链接\n- 支持的调用方式：tool_spawn 直接调用或 Python 脚本",
+            "auto_project_writeback:rust_tools",
+            180,
+        );
+
+        let recalled = build_auto_recalled_knowledge_with_project(
+            &store,
+            "Skill 文件位置 feishu-upload-md.skill",
+            1200,
+            Some("rust_tools"),
+            &KnowledgeConfig::default(),
+        );
+
+        assert!(recalled.is_none());
         let _ = std::fs::remove_file(path);
     }
 }

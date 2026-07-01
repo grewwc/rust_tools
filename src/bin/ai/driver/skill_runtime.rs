@@ -478,6 +478,11 @@ fn select_mcp_tools(
 }
 
 fn is_general_knowledge_suppressed_tool(name: &str) -> bool {
+    // 只压制"会主动翻看当前仓库/项目"的工具，以贯彻 general knowledge 模式
+    // "不要擅自读取本地项目"的语义。enable_tools/discover_skills/activate_skill
+    // 是能力发现与按需加载入口，本身不读取仓库文件，压制它们会让模型在通用模式下
+    // 彻底失去发现 MCP 及其它进阶工具的唯一通道（用户即便显式要求用 mcp 也无从调用），
+    // 因此必须保留。
     matches!(
         name,
         "read_file"
@@ -488,9 +493,6 @@ fn is_general_knowledge_suppressed_tool(name: &str) -> bool {
             | "text_grep"
             | "code_search"
             | "lsp"
-            | "enable_tools"
-            | "discover_skills"
-            | "activate_skill"
             | "task"
             | "task_spawn"
             | "task_wait"
@@ -1502,13 +1504,14 @@ mod tests {
     }
 
     #[test]
-    fn general_knowledge_tools_hide_repo_discovery_and_tool_enabling() {
+    fn general_knowledge_tools_hide_repo_discovery_but_keep_capability_entrypoints() {
         let tools = vec![
             tool("search_files"),
             tool("code_search"),
             tool("read_file"),
             tool("enable_tools"),
             tool("discover_skills"),
+            tool("activate_skill"),
             tool("task_spawn"),
             tool("execute_command"),
             tool("knowledge_search"),
@@ -1518,12 +1521,15 @@ mod tests {
             .map(|tool| tool.function.name)
             .collect::<Vec<_>>();
 
+        // 仓库探查类工具仍被压制。
         assert!(!names.iter().any(|name| name == "search_files"));
         assert!(!names.iter().any(|name| name == "code_search"));
         assert!(!names.iter().any(|name| name == "read_file"));
-        assert!(!names.iter().any(|name| name == "enable_tools"));
-        assert!(!names.iter().any(|name| name == "discover_skills"));
         assert!(!names.iter().any(|name| name == "task_spawn"));
+        // 能力发现/加载入口必须保留，否则通用模式下无法发现 MCP 等进阶工具。
+        assert!(names.iter().any(|name| name == "enable_tools"));
+        assert!(names.iter().any(|name| name == "discover_skills"));
+        assert!(names.iter().any(|name| name == "activate_skill"));
         assert!(names.iter().any(|name| name == "execute_command"));
         assert!(names.iter().any(|name| name == "knowledge_search"));
     }

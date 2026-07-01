@@ -69,16 +69,31 @@ fn skill_matches_query(skill: &SkillManifest, query: &str) -> bool {
 
 fn skill_search_haystack(skill: &SkillManifest) -> String {
     // 检索仅基于 name/description/能力字段等真实语义来源。
+    // source_path/resource_path 是实现细节和纯路径噪音，不应参与检索，
+    // 也不应把本地文件系统路径泄露给模型。
     let mut parts = vec![
         skill.name.clone(),
         skill.description.clone(),
-        skill.source_path.clone().unwrap_or_default(),
-        skill.resource_path.clone().unwrap_or_default(),
     ];
     parts.extend(skill.tools.iter().cloned());
     parts.extend(skill.tool_groups.iter().cloned());
     parts.extend(skill.mcp_servers.iter().cloned());
     parts.join("\n").to_ascii_lowercase()
+}
+
+fn skill_source_label(skill: &SkillManifest) -> &'static str {
+    let Some(source) = skill.source_path.as_deref() else {
+        return "unknown";
+    };
+    if source.starts_with("builtin:") {
+        "builtin"
+    } else if source.contains(".zip!") {
+        "package"
+    } else if source.contains("/.trae-cn/") {
+        "extension"
+    } else {
+        "user"
+    }
 }
 
 fn query_tokens(query: &str) -> Vec<String> {
@@ -91,7 +106,7 @@ fn query_tokens(query: &str) -> Vec<String> {
 }
 
 fn summarize_skill(skill: &SkillManifest, include_capabilities: bool) -> String {
-    let source = skill.source_path.as_deref().unwrap_or("unknown");
+    let source = skill_source_label(skill);
     let mut line = format!(
         "- {} | priority={} | source={}",
         skill.name, skill.priority, source
@@ -103,7 +118,7 @@ fn summarize_skill(skill: &SkillManifest, include_capabilities: bool) -> String 
         if let Some(resource_path) = skill.resource_path.as_deref()
             && !resource_path.trim().is_empty()
         {
-            line.push_str(&format!(" | resources={}", resource_path.trim()));
+            line.push_str(" | resources=bundled");
         }
         if !skill.tools.is_empty() {
             line.push_str(&format!(" | tools={}", skill.tools.join(",")));
@@ -669,7 +684,7 @@ inventory::submit!(ToolRegistration {
 mod tests {
     use super::{
         build_skill_file_content, execute_activate_skill, execute_discover_skills, query_tokens,
-        skill_matches_query, take_pending_skill_activation,
+        skill_matches_query, summarize_skill, take_pending_skill_activation,
     };
     use crate::ai::skills::SkillManifest;
     use std::sync::{LazyLock, Mutex};
@@ -734,10 +749,26 @@ mod tests {
     }
 
     #[test]
-    fn skill_query_matches_sentence_token_against_source_path() {
-        let mut skill = test_skill("argos", "Inspect Argos logs and traces");
+    fn skill_query_does_not_match_source_path_noise() {
+        let mut skill = test_skill("feishu-upload", "Upload markdown into Feishu docs");
         skill.source_path = Some("/tmp/argos.skill".to_string());
-        assert!(skill_matches_query(&skill, "帮我查一个 argos 日志"));
+        assert!(!skill_matches_query(&skill, "帮我查一个 argos 日志"));
+    }
+
+    #[test]
+    fn summarize_skill_hides_local_source_and_resource_paths() {
+        let mut skill = test_skill("feishu-upload", "Upload markdown into Feishu docs");
+        skill.source_path = Some(
+            "/Users/bytedance/.config/rust_tools/skills/feishu-upload-md.skill".to_string(),
+        );
+        skill.resource_path = Some("/tmp/feishu-upload/resources".to_string());
+
+        let out = summarize_skill(&skill, true);
+
+        assert!(out.contains("source=user"));
+        assert!(out.contains("resources=bundled"));
+        assert!(!out.contains(".config/rust_tools/skills"));
+        assert!(!out.contains("/tmp/feishu-upload/resources"));
     }
 
     #[test]

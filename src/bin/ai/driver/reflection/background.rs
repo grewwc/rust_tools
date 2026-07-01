@@ -1150,6 +1150,9 @@ fn count_artifact_signals(note: &str, tokens: &[String]) -> usize {
 
 fn count_one_off_signals(note: &str, tokens: &[String]) -> usize {
     let mut count = 0usize;
+    if crate::ai::knowledge::entry::note_has_local_env_path_leak(note) {
+        count += 1;
+    }
     if note.contains("session:") || note.contains("tmp") || note.contains("/var/") {
         count += 1;
     }

@@ -65,40 +65,67 @@ fn normalize_command(command: &str) -> io::Result<&str> {
     Ok(command)
 }
 
-/// 判断命令是否需要使用 Shell 执行
+fn is_shell_boundary(byte: Option<u8>) -> bool {
+    byte.is_none_or(|b| {
+        b.is_ascii_whitespace() || matches!(b, b'|' | b'&' | b';' | b'<' | b'>' | b'(' | b')')
+    })
+}
+
+/// 判断命令是否需要使用 Shell 执行。
 ///
-/// 检测命令中是否包含需要 Shell 解析的特殊字符：
-/// - 管道符 `|`
-/// - 重定向符 `>`, `<`
-/// - 逻辑运算符 `&&`, `||`
-/// - 分号 `;`
+/// 这里只识别“引号外确实需要 shell 解释”的语法，避免把双引号内的字面量
+/// `<` / `>` / `|` 之类误判为必须走 `sh -c`。
 ///
-/// # 参数
-///
-/// * `command` - 命令字符串
-///
-/// # 返回值
-///
-/// 如果需要使用 Shell 返回 `true`，否则返回 `false`
+/// 注意：本函数仍保守地把单引号、反斜杠等视为需要 shell，因为当前
+/// `build_no_shell_command` 只实现了双引号分组，不负责完整复刻 shell 的
+/// 转义/引用语义。
 fn should_use_shell(command: &str) -> bool {
-    command.contains('|')
-        || command.contains('>')
-        || command.contains('<')
-        || command.contains("&&")
-        || command.contains("||")
-        || command.contains(';')
-        || command.contains('\'')
-        || command.contains('`')
-        || command.contains("$(")
-        || command.contains("${")
-        || command.contains('\\')
-        || command.contains('&')
-        || command.contains('*')
-        || command.contains('?')
-        || command.contains('#')
-        || command.contains("<<")
-        || command.contains('(')
-        || command.contains(')')
+    let bytes = command.as_bytes();
+    let mut i = 0usize;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_double {
+            match b {
+                b'\\' | b'`' => return true,
+                b'"' => {
+                    in_double = false;
+                    i += 1;
+                    continue;
+                }
+                b'$' if i + 1 < bytes.len() && matches!(bytes[i + 1], b'(' | b'{') => {
+                    return true;
+                }
+                _ => {
+                    i += 1;
+                    continue;
+                }
+            }
+        }
+
+        match b {
+            b'"' => {
+                in_double = true;
+            }
+            b'\'' | b'\\' | b'`' => return true,
+            b'$' if i + 1 < bytes.len() && matches!(bytes[i + 1], b'(' | b'{') => return true,
+            b'|' | b'>' | b'<' | b';' | b'&' | b'*' | b'?' => return true,
+            b'#' if is_shell_boundary(i.checked_sub(1).map(|idx| bytes[idx])) => return true,
+            // `(` 只有在 token 起始边界上才视为 shell 分组/子 shell 语法；
+            // 普通参数里的 `foo(bar)` 不应该把命令强行送进 shell。
+            b'(' if is_shell_boundary(i.checked_sub(1).map(|idx| bytes[idx])) => {
+                return true;
+            }
+            // `)` 只有在 token 结束边界上才视为 shell 分组闭合。
+            b')' if is_shell_boundary(bytes.get(i + 1).copied()) => {
+                return true;
+            }
+            b'\n' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// 构建使用 Shell 的命令对象
@@ -175,10 +202,18 @@ fn build_no_shell_command(command: &str, opts: RunCmdOptions<'_>) -> io::Result<
     if let Some(dir) = opts.cwd {
         cmd.current_dir(dir);
     }
-    // 处理参数，展开用户路径
+    // 处理参数，展开用户路径。
+    // 非 shell 路径下，双引号只承担“分组”职责，不应作为字面量传给子进程。
+    // 这里不尝试复刻完整 shell 语义；更复杂的单引号/反斜杠转义仍由
+    // `should_use_shell` 保守地导向 shell 路径。
     iter.for_each(|arg| {
-        let new_arg = expanduser(arg);
-        if new_arg == arg {
+        let normalized_arg = if arg.contains('"') {
+            arg.replace('"', "")
+        } else {
+            arg.to_string()
+        };
+        let new_arg = expanduser(&normalized_arg);
+        if new_arg == normalized_arg {
             cmd.arg(OsString::from(new_arg.as_ref()));
         } else {
             cmd.arg(OsString::from(new_arg.into_owned()));
@@ -450,7 +485,10 @@ pub fn run_cmd(command: &str) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RunCmdOptions, run_cmd, run_cmd_output, run_cmd_output_streaming_with_timeout};
+    use super::{
+        RunCmdOptions, run_cmd, run_cmd_output, run_cmd_output_streaming_with_timeout,
+        should_use_shell,
+    };
     use std::time::{Duration, Instant};
 
     #[test]
@@ -475,6 +513,36 @@ mod tests {
             let output = run_cmd_output("echo hello", RunCmdOptions::default()).unwrap();
             assert!(output.status.success());
             assert!(output.stdout.contains(&b'h'));
+        }
+    }
+
+    #[test]
+    fn test_should_use_shell_ignores_double_quoted_literals() {
+        assert!(!should_use_shell(r#"printf "%s" "<literal>|foo(bar)#bar""#));
+        assert!(!should_use_shell(r#"printf "%s" ">(literal)""#));
+    }
+
+    #[test]
+    fn test_should_use_shell_detects_real_shell_syntax_outside_quotes() {
+        assert!(should_use_shell("cat < input.txt"));
+        assert!(should_use_shell("echo hi | wc -c"));
+        assert!(should_use_shell("diff <(echo a) <(echo b)"));
+        assert!(should_use_shell("echo foo # comment"));
+    }
+
+    #[test]
+    fn test_should_use_shell_does_not_treat_hash_in_word_as_comment() {
+        assert!(!should_use_shell("printf %s foo#bar"));
+    }
+
+    #[test]
+    fn test_run_cmd_output_preserves_double_quoted_lt_literal_without_shell() {
+        #[cfg(unix)]
+        {
+            let output =
+                run_cmd_output(r#"printf "%s" "<literal>""#, RunCmdOptions::default()).unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8_lossy(&output.stdout), "<literal>");
         }
     }
 
