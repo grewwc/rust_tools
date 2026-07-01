@@ -284,6 +284,16 @@ fn required_baseline_tool_names() -> Vec<String> {
         // discovery / 自助能力：让模型在白名单 skill 下仍能发现并启用更多工具。
         "discover_skills".to_string(),
         "enable_tools".to_string(),
+        // 基础只读 / 检索能力：读取文件、按行读取、目录浏览、路径查找、内容检索、
+        // 符号检索。这些是"理解现状"的最小工具集，不改动任何状态。若某个 skill 用
+        // 窄 tools:/tool_groups: 白名单替换工具集时不补回，主 Agent 就会失去最基本的
+        // 阅读代码能力（例如无法 read_file 用户明确点名的文件），因此常驻补回。
+        "read_file".to_string(),
+        "read_file_lines".to_string(),
+        "list_directory".to_string(),
+        "find_path".to_string(),
+        "text_grep".to_string(),
+        "code_search".to_string(),
         // 子 Agent 编排：task_* 属于 core 组的常驻能力。skill 用 tools:/tool_groups:
         // 白名单替换工具集时，若不补回，主 Agent 在 skill 激活期间就完全失去委派
         // 子 Agent 的能力（且 :685 的 has_tool 提示门也会一并消失），导致"skill
@@ -1385,10 +1395,10 @@ pub(super) fn prepare_skill_for_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextKind, PreferenceStrength, SystemPromptBuilder, build_project_instruction_prompt,
-        build_hidden_mcp_tool_catalog, build_system_prompt, builtin_tools_for_skill,
-        ensure_required_baseline_tools, filter_general_knowledge_tools,
-        filter_mcp_tools_by_allowed_servers, looks_like_follow_up_or_same_topic,
+        ContextKind, PreferenceStrength, SystemPromptBuilder, available_tool_names,
+        build_hidden_mcp_tool_catalog, build_project_instruction_prompt, build_system_prompt,
+        builtin_tools_for_skill, ensure_required_baseline_tools, filter_general_knowledge_tools,
+        filter_mcp_tools_by_allowed_servers, has_tool, looks_like_follow_up_or_same_topic,
         merge_with_runtime_enabled_tools, push_project_context, push_project_context_for_turn,
         resolve_max_iterations, select_mcp_tools, select_skill_with_preference,
         select_skill_with_preference_strength, should_use_general_knowledge_mode,
@@ -1621,6 +1631,60 @@ mod tests {
             &[tool("mcp_feishu_docs_search")],
         );
         assert!(catalog.is_none());
+    }
+
+    #[test]
+    fn narrow_skill_whitelist_still_lets_model_discover_explicitly_requested_mcp_tools() {
+        // 场景复现：用户显式要求"用 mcp 工具写飞书"，但当前 skill 用窄 tools:
+        // 白名单把工具集替换成只有一个专用工具，且默认 agent 带 disable_mcp_tools
+        // （mcp_* 不预挂载）。修复前：窄白名单会把 enable_tools 一并挤掉，hidden MCP
+        // catalog 的注入门（has_tool("enable_tools")）随之关闭，模型三条发现 MCP 的
+        // 路径全断，物理上无法响应"用 mcp 工具"。修复后：enable_tools 作为 baseline
+        // 常驻补回，catalog 注入门重新成立，模型能发现并启用 mcp_feishu_*。
+        let mut narrow_skill = skill("feishu-upload", "Upload markdown into Feishu docs");
+        narrow_skill.tools = vec!["write_file".to_string()];
+
+        // 1) 窄白名单替换工具集后，baseline 兜底仍补回发现/加载与基础只读入口。
+        let builtin_tools = builtin_tools_for_skill(Some(&narrow_skill), None);
+        let builtin_names = builtin_tools
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            builtin_names.contains(&"write_file".to_string()),
+            "skill 白名单里显式声明的工具应保留"
+        );
+        assert!(
+            builtin_names.contains(&"enable_tools".to_string()),
+            "enable_tools 必须作为 baseline 常驻补回，否则模型无法发现/启用 MCP 工具"
+        );
+        assert!(
+            builtin_names.contains(&"read_file".to_string()),
+            "read_file 应作为基础只读能力常驻，读取用户点名的 test.md"
+        );
+
+        // 2) 默认 agent disable_mcp_tools => 本轮 mcp_* 一个都没预挂载。
+        let all_mcp_tools = vec![
+            tool("mcp_feishu_doc_create_from_markdown"),
+            tool("mcp_feishu_docs_get_text_by_url"),
+            tool("mcp_pdf-extract_pdf_extract_text"),
+        ];
+        let loaded_mcp_tools: Vec<ToolDefinition> = Vec::new();
+
+        // 3) available_tools 含 enable_tools => catalog 注入门成立（生产代码里的
+        //    has_tool("enable_tools") 判断）。
+        let available_tools = available_tool_names(&builtin_tools, &loaded_mcp_tools);
+        assert!(
+            has_tool(&available_tools, "enable_tools"),
+            "catalog 注入门依赖 available_tools 里存在 enable_tools"
+        );
+
+        // 4) hidden MCP catalog 会把用户想用的 mcp_feishu_* 暴露给模型作为发现入口。
+        let catalog = build_hidden_mcp_tool_catalog(&all_mcp_tools, &loaded_mcp_tools)
+            .expect("存在未加载的 mcp_* 时必须给出发现提示");
+        assert!(catalog.contains("enable_tools(operation=list)"));
+        assert!(catalog.contains("`mcp_feishu_doc_create_from_markdown`"));
+        assert!(catalog.contains("`mcp_feishu_docs_get_text_by_url`"));
     }
 
     #[test]
@@ -2082,6 +2146,13 @@ mod tests {
         assert!(names.contains(&"enable_tools".to_string()));
         assert!(names.contains(&"discover_skills".to_string()));
         assert!(names.contains(&"code_search".to_string()));
+        // 基础只读 / 检索能力应作为 baseline 常驻补回，避免窄白名单 skill 把
+        // read_file 等最基本的阅读工具剔除，导致主 Agent 连用户点名的文件都读不了。
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"read_file_lines".to_string()));
+        assert!(names.contains(&"list_directory".to_string()));
+        assert!(names.contains(&"find_path".to_string()));
+        assert!(names.contains(&"text_grep".to_string()));
         // 子 Agent 编排能力应作为 baseline 常驻补回，避免 skill 白名单把 task_*
         // 全部剔除导致主 Agent 失去委派子 Agent 的能力。
         assert!(names.contains(&"task".to_string()));
@@ -2091,8 +2162,8 @@ mod tests {
         assert!(names.contains(&"agent_team".to_string()));
         // 其它非 baseline 的内置工具仍不应被无端带入白名单。
         assert!(!names.contains(&"plan".to_string()));
-        assert!(!names.contains(&"read_file".to_string()));
-        assert!(!names.contains(&"search_files".to_string()));
+        assert!(!names.contains(&"write_file".to_string()));
+        assert!(!names.contains(&"apply_patch".to_string()));
     }
 
     fn model_path() -> std::path::PathBuf {
