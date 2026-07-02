@@ -470,10 +470,7 @@ fn apply_history_rewind(app: &mut App, plan: HistoryRewindPlan) -> Result<(), Bo
     let history_file = active_history_path(app);
     history::replace_history_messages(&history_file, &plan.keep_messages)?;
     history::invalidate_context_history_cache_for(&history_file);
-    crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
-    if let Some(ctx) = app.agent_context.as_mut() {
-        ctx.tools.clear();
-    }
+    crate::ai::driver::commands::session::clear_session_local_runtime_state(app);
     println!(
         "[history] Rewound from u{}: {}",
         plan.user_ordinal, plan.preview
@@ -977,6 +974,7 @@ fn finalize_question(
 
 #[cfg(test)]
 mod tests {
+    use aios_kernel::primitives::{DaemonKind, DaemonState};
     use super::{
         HistoryAction, HistoryPreviewOptions, HistoryRewindTarget, HistoryRoleFilter, LocalCommand,
         apply_history_rewind, extract_at_file_references, extract_forced_skill_reference,
@@ -987,7 +985,9 @@ mod tests {
     };
     use crate::ai::{
         history::{self, Message, append_history_messages},
-        types::{App, AppConfig},
+        types::{
+            AgentContext, App, AppConfig, FunctionDefinition, SkillBiasMemory, ToolDefinition,
+        },
     };
     use serde_json::Value;
     use std::path::PathBuf;
@@ -1151,10 +1151,10 @@ mod tests {
         let question = format!("Summarize @\"{}\"", path.display());
         let ctx = finalize_question(&mut app, question, 6).unwrap();
 
-        assert!(ctx.attachments_text.contains(&format!(
-            "[Attached text file: {}]",
-            path.display()
-        )));
+        assert!(
+            ctx.attachments_text
+                .contains(&format!("[Attached text file: {}]", path.display()))
+        );
         assert!(ctx.attachments_text.contains("hello from file"));
         assert!(!ctx.question.contains("hello from file"));
         assert!(!ctx.question.contains(path.to_string_lossy().as_ref()));
@@ -1480,6 +1480,131 @@ mod tests {
             let content = searchable_history_content(&message.content);
             content.contains("bad middle") || content.contains("later user")
         }));
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn history_rewind_removes_all_following_messages_across_roles() {
+        let history_path =
+            std::env::temp_dir().join(format!("ai-history-rewind-roles-{}.sqlite", Uuid::new_v4()));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+
+        let messages = vec![
+            test_message("user", "keep user"),
+            test_message("assistant", "keep assistant"),
+            test_message("user", "rewind me"),
+            test_message("assistant", "assistant residue"),
+            test_message("tool", "tool residue"),
+            test_message("system", "system residue"),
+            test_message("assistant", "final residue"),
+        ];
+        append_history_messages(&history_path, &messages).unwrap();
+
+        let plan = plan_history_rewind(&app, HistoryRewindTarget::UserOrdinal(2)).unwrap();
+        assert_eq!(plan.removed_messages, 5);
+        apply_history_rewind(&mut app, plan).unwrap();
+
+        let remaining = history::build_message_arr(usize::MAX, history_path.as_path()).unwrap();
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|message| (message.role.as_str(), searchable_history_content(&message.content)))
+                .collect::<Vec<_>>(),
+            vec![
+                ("user", "keep user".to_string()),
+                ("assistant", "keep assistant".to_string()),
+            ]
+        );
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn history_rewind_cancels_reflection_daemons_and_clears_runtime_state() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let history_path = std::env::temp_dir().join(format!(
+            "ai-history-rewind-runtime-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+        app.session_id = "sess-rewind".to_string();
+        app.forced_skill = Some("demo-skill".to_string());
+        app.forced_question = Some("follow this branch".to_string());
+        app.attached_image_files = vec!["/tmp/demo.png".to_string()];
+        app.last_skill_bias = Some(SkillBiasMemory {
+            skill_name: "demo-skill".to_string(),
+            question: "follow this branch".to_string(),
+        });
+        app.agent_context = Some(AgentContext {
+            tools: vec![ToolDefinition {
+                tool_type: "function".to_string(),
+                function: FunctionDefinition {
+                    name: "read_file".to_string(),
+                    description: String::new(),
+                    parameters: serde_json::json!({}),
+                },
+            }],
+            ..AgentContext::default()
+        });
+        crate::ai::tools::enable_tools::set_explicit_enabled_tool_names(vec![
+            "mcp_feishu_doc_create_from_markdown".to_string(),
+        ]);
+
+        append_history_messages(
+            &history_path,
+            &[
+                test_message("user", "keep user"),
+                test_message("assistant", "keep assistant"),
+                test_message("user", "rewind user"),
+                test_message("assistant", "assistant residue"),
+            ],
+        )
+        .unwrap();
+
+        let daemon_handle = {
+            let mut os = app.os.lock().unwrap();
+            let current_pid = os.current_process_id();
+            let (handle, _token) = os.daemon_register(
+                "self_reflection:sess-rewind".to_string(),
+                DaemonKind::Reflection,
+                current_pid,
+            );
+            handle
+        };
+
+        let plan = plan_history_rewind(&app, HistoryRewindTarget::UserOrdinal(2)).unwrap();
+        apply_history_rewind(&mut app, plan).unwrap();
+
+        let daemon_state = {
+            let os = app.os.lock().unwrap();
+            os.daemon_status(daemon_handle)
+                .map(|entry| entry.state)
+                .expect("daemon should still be registered")
+        };
+        assert_eq!(daemon_state, DaemonState::Cancelled);
+        assert!(app.forced_skill.is_none());
+        assert!(app.forced_question.is_none());
+        assert!(app.attached_image_files.is_empty());
+        assert!(app.last_skill_bias.is_none());
+        assert!(
+            app.agent_context
+                .as_ref()
+                .is_some_and(|ctx| ctx.tools.is_empty())
+        );
+        assert!(crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty());
+
+        let remaining = history::build_message_arr(usize::MAX, history_path.as_path()).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|message| searchable_history_content(&message.content))
+                .collect::<Vec<_>>(),
+            vec!["keep user".to_string(), "keep assistant".to_string()]
+        );
 
         let _ = std::fs::remove_file(history_path);
     }

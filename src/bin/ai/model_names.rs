@@ -19,6 +19,10 @@ pub struct ModelDef {
     pub endpoint: Option<String>,
     #[serde(default)]
     pub api_key_config_key: Option<String>,
+    /// 可选：直接指定 API key 字面量（优先级高于 api_key_config_key）。
+    /// 用于不想走 configw 查找的场景（如临时测试、自定义 endpoint）。
+    #[serde(default)]
+    pub api_key: Option<String>,
     #[serde(default)]
     pub quality_tier: ModelQualityTier,
     pub is_vl: bool,
@@ -122,7 +126,14 @@ fn provider_slug(provider: ApiProvider) -> &'static str {
 }
 
 pub fn model_handle(model: &ModelDef) -> String {
-    let name = lookup_key(&model.name);
+    // 如果 name 是加密格式（enc: 前缀），则使用 key 作为显示名，
+    // 避免补全面板里显示乱码的 enc:xxx-compatible。
+    let is_encrypted = model.name.starts_with("enc:");
+    let name = if is_encrypted {
+        String::new()
+    } else {
+        lookup_key(&model.name)
+    };
     if name.is_empty() {
         return lookup_key(&model.key);
     }

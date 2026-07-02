@@ -56,14 +56,13 @@ impl PromptEditor {
         let _ = execute!(io::stdout(), EnableBracketedPaste);
 
         // viewport 高度 = 1 行顶部间距 + textarea + 2 行帮助行。
-        // 设为 14 行可在补全面板弹出时显示更多候选，避免模型列表只露出两三项；
-        // 渲染层仍会把 textarea 压到 1 行，因此普通输入区保持紧凑。
+        // 设为 20 行让输入框有足够的编辑空间，补全面板弹出时 textarea 会自动退让到 1 行。
         // 高度过大会导致 append_lines() 在终端底部产生大量换行，
         // 不仅造成光标与上次输出之间有大段空白，还可能在终端底部覆盖掉
         // 更多的 assistant 输出历史行。
         let viewport_height = terminal_size()
-            .map(|(_, h)| h.saturating_sub(2).clamp(10, 14))
-            .unwrap_or(14);
+            .map(|(_, h)| h.saturating_sub(2).clamp(12, 20))
+            .unwrap_or(20);
 
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = match Terminal::with_options(

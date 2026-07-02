@@ -31,9 +31,9 @@ mod tool_result;
 mod types;
 
 pub(super) use orchestrator::run_turn;
-pub(crate) use prepare::QuestionShape;
 #[cfg(test)]
 use persistence::persist_pending_turn_messages;
+pub(crate) use prepare::QuestionShape;
 #[cfg(test)]
 use tool_result::prepare_tool_result;
 pub(super) use types::TurnOutcome;
@@ -85,6 +85,21 @@ pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_hard_threshold(
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS: usize = 2;
 /// LLM 摘要文本的最大字符数。
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_MAX_CHARS: usize = 4_000;
+/// Pre-request LLM 摘要阈值：在每次发送 LLM 请求前，如果无损+弱损压缩后
+/// 仍超过此阈值，触发 LLM 摘要兜底（把早期对话压成单条 internal_note）。
+/// 取 history_max_chars * 2（默认 240K），比 mid-turn hard threshold（*3.5）
+/// 更积极——这是发送请求前的最后一道防线，避免超大上下文导致模型 4xx
+/// 或质量退化（"压不动"问题）。
+pub(in crate::ai::driver::turn_runtime) fn pre_request_llm_summary_threshold(
+    history_max_chars: usize,
+) -> usize {
+    history_max_chars
+        .saturating_mul(2)
+        .max(MID_TURN_COMPRESS_HARD_FLOOR)
+}
+/// Pre-request LLM 摘要重触发最小增量：自上次 LLM 摘要后 messages 增量
+/// 小于此值则跳过，避免摘要失败时每轮重复调用 LLM。
+pub(in crate::ai::driver::turn_runtime) const PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH: usize = 20_000;
 /// Mid-turn 压缩冷却：触发一次后至少间隔 N 轮才再次重判，避免在阈值附近徘徊
 /// 时每轮都跑一次（实际无变化）。
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_COOLDOWN_ITERATIONS: usize = 2;
@@ -221,7 +236,9 @@ mod tests {
         let path = extract_stub_path(&prepared.content_for_model).unwrap();
         assert!(path.is_absolute());
         assert!(path.exists());
-        let expected_dir = store.session_assets_dir(&app.session_id).join("tool-overflow");
+        let expected_dir = store
+            .session_assets_dir(&app.session_id)
+            .join("tool-overflow");
         let nested_dir = SessionStore::new(app.session_history_file.as_path())
             .session_assets_dir(&app.session_id)
             .join("tool-overflow");

@@ -4,6 +4,8 @@ use serde_json::Value;
 
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
+use crate::ai::tools::common::ToolStreamWriter;
+use crate::ai::tools::common::ToolStreamingRegistration;
 use crate::ai::tools::storage::file_store::FileStore;
 
 fn params_apply_patch() -> Value {
@@ -32,6 +34,11 @@ inventory::submit!(ToolRegistration {
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["executor", "builtin", "core"],
     }
+});
+
+inventory::submit!(ToolStreamingRegistration {
+    name: "apply_patch",
+    execute_streaming: execute_apply_patch_streaming,
 });
 
 #[derive(Debug, Clone)]
@@ -459,6 +466,12 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
     Ok(s)
 }
 
+fn emit_stream_line(on_chunk: &mut ToolStreamWriter<'_>, line: &str) {
+    let mut rendered = line.to_string();
+    rendered.push('\n');
+    on_chunk(rendered.as_bytes());
+}
+
 pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
     let patch = args["patch"].as_str().ok_or("missing patch")?;
     let initial_file_path = optional_file_path_arg(args);
@@ -487,6 +500,59 @@ pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
     let next = apply_unified_patch(&original, &normalized_patch)?;
     store.write_all(&next).map_err(|err| err.to_string())?;
     Ok(format!("Successfully patched {}", path.display()))
+}
+
+pub(crate) fn execute_apply_patch_streaming(
+    args: &Value,
+    on_chunk: &mut ToolStreamWriter<'_>,
+) -> Result<String, String> {
+    let patch = args["patch"].as_str().ok_or("missing patch")?;
+    emit_stream_line(on_chunk, "parsing patch envelope");
+
+    let initial_file_path = optional_file_path_arg(args);
+    let envelope = parse_patch_envelope(patch)?;
+    let file_path = initial_file_path
+        .map(str::to_string)
+        .or_else(|| envelope.as_ref().map(|parsed| parsed.target_path.clone()))
+        .ok_or("missing file_path")?;
+
+    let store = FileStore::new(PathBuf::from(&file_path));
+    emit_stream_line(on_chunk, &format!("target: {}", store.path().display()));
+    emit_stream_line(on_chunk, "validating write access");
+    store
+        .validate_write_access()
+        .map_err(|err| err.to_string())?;
+
+    let path = store.path().to_path_buf();
+    let (_, normalized_patch) = if let Some(envelope) = envelope {
+        ensure_patch_target_matches(&path, &envelope.target_path)?;
+        normalize_patch_text(&path, patch)?
+    } else {
+        (file_path.clone(), patch.to_string())
+    };
+
+    let hunk_count = normalized_patch
+        .lines()
+        .filter(|line| line.starts_with("@@"))
+        .count()
+        .max(1);
+    emit_stream_line(on_chunk, &format!("applying {hunk_count} hunk(s)"));
+
+    let original = if path.exists() {
+        emit_stream_line(on_chunk, "reading current file");
+        store.read_to_string().map_err(|err| err.to_string())?
+    } else {
+        emit_stream_line(on_chunk, "creating new file from patch");
+        String::new()
+    };
+    let next = apply_unified_patch(&original, &normalized_patch)?;
+
+    emit_stream_line(on_chunk, &format!("writing {} byte(s)", next.len()));
+    store.write_all(&next).map_err(|err| err.to_string())?;
+
+    let result = format!("Successfully patched {}", path.display());
+    emit_stream_line(on_chunk, &result);
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -580,6 +646,54 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello\nworld");
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_streaming_dispatch_emits_progress() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("streaming").with_extension("txt");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "alpha\nbeta\n").unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base, || {
+            let args = serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "patch": "@@ -2,1 +2,1 @@\n-beta\n+changed\n"
+            });
+            let mut streamed = Vec::new();
+            let mut capture = |chunk: &[u8]| streamed.extend_from_slice(chunk);
+            let result = crate::ai::tools::common::execute_tool_call_with_args_streaming(
+                "call_apply_patch_streaming",
+                "apply_patch",
+                &args,
+                &mut capture,
+            )
+            .expect("streaming apply_patch should succeed");
+
+            let streamed = String::from_utf8(streamed).expect("streamed output must be utf-8");
+            assert!(
+                streamed.contains("parsing patch envelope"),
+                "streamed: {streamed}"
+            );
+            assert!(streamed.contains("target:"), "streamed: {streamed}");
+            assert!(
+                streamed.contains("applying 1 hunk(s)"),
+                "streamed: {streamed}"
+            );
+            assert!(streamed.contains("writing "), "streamed: {streamed}");
+            assert!(
+                streamed.contains(&format!("Successfully patched {}", path.display())),
+                "streamed: {streamed}"
+            );
+            assert_eq!(
+                result.content,
+                format!("Successfully patched {}", path.display())
+            );
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\n");
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

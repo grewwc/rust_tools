@@ -147,5 +147,38 @@
     "explicit_prompt_cache": true,
     "enable_thinking": true,
     "subagent_priority": 60
+  },
+  {
+    "key": "experimental",
+    "name": "enc:8ca/kgNyRac9wYKfTguIS1qyJmO43ddio7Y+kvUz/Ep+Els=",
+    "endpoint": "enc:F+UAf7T5Mk+LuLPdH47LkllzBJa0M9fM3mz4n2m1sU+x8at2I8dHuwevDaowHc/QkrZDIXt8Tq2V",
+    "quality_tier": "standard",
+    "provider": "compatible",
+    "api_key": "enc:YKr19nKBUd3gsizpEQjSOgiaalyNLug+cWQi+vziA4ZExvd5JxgTXqTV3Bd1iEdeugm37w9E/m4=",
+    "is_vl": true,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": true,
+    "default_reasoning_effort": "high",
+    "subagent_priority": 50
+  },
+  {
+    "key": "glm5.2-super-relay",
+    "aliases": [
+      "GLM5.2",
+      "glm5.2"
+    ],
+    "name": "enc:a7v/y1ygiptBbel79DEORluwZUMGfcpovw==",
+    "endpoint": "enc:EtxSdA8BdnO8USdZWvbOKYl55kmmMxaes7ihoVgCbCbyC7jddf6ha3TzW7PweVTLA6XN9PsCLUKA",
+    "quality_tier": "strong",
+    "provider": "compatible",
+    "api_key": "enc:RarVwtMcVt9sGgaNRQiltiSwOqAt2tei/6x6BBThdeuhNC1M3j6GFKZvEO0FxfFf7pSr1Mr6o7k=",
+    "is_vl": false,
+    "search_enabled": false,
+    "tools_default_enabled": true,
+    "enable_thinking": true,
+    "default_reasoning_effort": "high",
+    "explicit_prompt_cache": true,
+    "subagent_priority": 50
   }
 ]

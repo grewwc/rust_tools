@@ -843,7 +843,12 @@ fn build_system_prompt(
         discovery_lines.push(
             "For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first.".to_string(),
         );
-        push_tool_guidance_section(&mut b, ContextKind::Policy, "Tool discovery:", discovery_lines);
+        push_tool_guidance_section(
+            &mut b,
+            ContextKind::Policy,
+            "Tool discovery:",
+            discovery_lines,
+        );
     }
 
     if has_tool(available_tools, "knowledge_save") {
@@ -887,8 +892,10 @@ fn build_system_prompt(
                 "If you need the delegated work's result returned to you, use `task_spawn` + `task_wait` instead — even for a single task.".to_string(),
             );
         }
-        let process_tools =
-            available_tool_names_in_order(available_tools, &["wait_process", "kill_process", "reap_process"]);
+        let process_tools = available_tool_names_in_order(
+            available_tools,
+            &["wait_process", "kill_process", "reap_process"],
+        );
         if !process_tools.is_empty() {
             lines.push(format!(
                 "Use {} to manage child processes.",
@@ -920,8 +927,10 @@ fn build_system_prompt(
         if has_tool(available_tools, "tool_spawn") {
             lines.push("Use `tool_spawn` for parallel independent tool calls.".to_string());
         }
-        let async_tool_controls =
-            available_tool_names_in_order(available_tools, &["tool_wait", "tool_status", "tool_cancel"]);
+        let async_tool_controls = available_tool_names_in_order(
+            available_tools,
+            &["tool_wait", "tool_status", "tool_cancel"],
+        );
         if !async_tool_controls.is_empty() {
             lines.push(format!(
                 "Use {} to join, inspect, or drop async tool branches as needed.",
@@ -959,7 +968,10 @@ fn build_system_prompt(
             || has_tool(available_tools, "tool_wait")
             || has_tool(available_tools, "tool_status")
         {
-            lines.push("`task_*` and `tool_*` are distinct families: do not confuse their IDs.".to_string());
+            lines.push(
+                "`task_*` and `tool_*` are distinct families: do not confuse their IDs."
+                    .to_string(),
+            );
         }
         push_tool_guidance_section(
             &mut b,
@@ -1016,7 +1028,10 @@ fn build_system_prompt(
     if has_tool(available_tools, "web_search") || has_tool(available_tools, "web_fetch") {
         let mut lines = Vec::new();
         if has_tool(available_tools, "web_search") {
-            lines.push("For real-time or time-sensitive topics, use `web_search` first (not memory).".to_string());
+            lines.push(
+                "For real-time or time-sensitive topics, use `web_search` first (not memory)."
+                    .to_string(),
+            );
         }
         if has_tool(available_tools, "web_fetch") {
             lines.push("Use `web_fetch` for detailed content from selected URLs.".to_string());

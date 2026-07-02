@@ -47,7 +47,7 @@ install:
 install-completions:
 	@SHELL_NAME=$$(basename "$${SHELL:-/bin/bash}"); \
 	INSTALL_DIR="$${INSTALL_DIR:-$$(pwd)/bin}"; \
-	for bin in a fk; do \
+	for bin in a fk re; do \
 		BIN="$${INSTALL_DIR}/$$bin"; \
 		if [ ! -x "$$BIN" ]; then \
 			echo "  skip completions: $$bin not found at $$BIN"; \

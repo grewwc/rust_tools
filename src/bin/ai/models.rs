@@ -20,7 +20,7 @@ fn model_handle(model: &ModelDef) -> String {
 
 pub(super) fn request_model_name(model: &str) -> String {
     model_def(model)
-        .map(|m| m.name.clone())
+        .map(|m| maybe_decrypt(&m.name))
         .unwrap_or_else(|| model.trim().to_string())
 }
 
@@ -82,23 +82,48 @@ pub(super) fn endpoint_for_model(model: &str, global_fallback: &str) -> String {
             .map(str::trim)
             .filter(|endpoint| !endpoint.is_empty())
         {
-            return endpoint.to_string();
+            return maybe_decrypt(endpoint);
         }
 
-        return default_endpoint_for_provider(model_def.provider).to_string();
+        return maybe_decrypt(default_endpoint_for_provider(model_def.provider));
     }
 
     let global_fallback = global_fallback.trim();
     if !global_fallback.is_empty() {
-        return global_fallback.to_string();
+        return maybe_decrypt(global_fallback);
     }
 
-    default_endpoint_for_provider(model_provider(model)).to_string()
+    maybe_decrypt(default_endpoint_for_provider(model_provider(model)))
+}
+
+/// 如果值以 `enc:` 开头，自动解密；否则原样返回。
+/// 解密失败时打印警告并返回原始值（避免静默失败导致请求失败）。
+fn maybe_decrypt(value: &str) -> String {
+    if !crate::commonw::secret::is_encrypted(value) {
+        return value.to_string();
+    }
+    match crate::commonw::secret::decrypt(value) {
+        Ok(plain) => plain,
+        Err(e) => {
+            eprintln!("[models] failed to decrypt api_key: {e}");
+            value.to_string()
+        }
+    }
 }
 
 pub(super) fn api_key_for_model(model: &str, global_fallback: &str) -> String {
     let cfg = configw::get_all_config();
 
+    // 1. 字面量 api_key（models.json 直接写明，最高优先级）
+    if let Some(value) = model_def(model)
+        .and_then(|m| m.api_key.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return maybe_decrypt(value);
+    }
+
+    // 2. api_key_config_key（通过 configw 查找）
     if let Some(config_key) = model_def(model)
         .and_then(|m| m.api_key_config_key.as_deref())
         .map(str::trim)
@@ -108,20 +133,22 @@ pub(super) fn api_key_for_model(model: &str, global_fallback: &str) -> String {
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
     {
-        return value;
+        return maybe_decrypt(&value);
     }
 
+    // 3. provider 默认候选 key
     for key in default_api_key_config_candidates(model_provider(model)) {
         if let Some(value) = cfg
             .get_opt(key)
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
         {
-            return value;
+            return maybe_decrypt(&value);
         }
     }
 
-    global_fallback.trim().to_string()
+    // 4. 全局回退
+    maybe_decrypt(global_fallback.trim())
 }
 
 pub(super) fn endpoint_supports_anonymous_auth(endpoint: &str) -> bool {

@@ -275,6 +275,7 @@ pub(super) fn clear_stream_cancel(app: &App) {
 pub(super) enum StreamOutcome {
     #[default]
     Completed,
+    EmptyResponse,
     Cancelled,
     ToolCall,
 }

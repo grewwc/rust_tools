@@ -39,6 +39,19 @@ pub(crate) struct ToolRegistration {
 
 inventory::collect!(ToolRegistration);
 
+pub(crate) type ToolStreamWriter<'a> = dyn FnMut(&[u8]) + 'a;
+pub(crate) type ToolStreamExecutor =
+    for<'a> fn(&Value, &mut ToolStreamWriter<'a>) -> Result<String, String>;
+
+/// 可选的流式执行注册：只给确实需要实时 terminal 反馈的 builtin tool 使用。
+/// 未注册的工具仍沿用原有同步 `execute` 路径，不需要改动现有 ToolSpec。
+pub(crate) struct ToolStreamingRegistration {
+    pub(crate) name: &'static str,
+    pub(crate) execute_streaming: ToolStreamExecutor,
+}
+
+inventory::collect!(ToolStreamingRegistration);
+
 const TOOL_CANCEL_FUTEX_ENV: &str = "__ai_tool_cancel_futex_addr";
 
 pub(crate) fn ensure_process_tool_cancel_futex(
@@ -155,6 +168,17 @@ static TOOL_INDEX: LazyLock<SkipMap<String, &'static ToolSpec>> = LazyLock::new(
         let name = reg.spec.name.to_string();
         if !index.contains_key(&name) {
             index.insert(name, &reg.spec);
+        }
+    }
+    index
+});
+
+static TOOL_STREAM_INDEX: LazyLock<SkipMap<String, ToolStreamExecutor>> = LazyLock::new(|| {
+    let mut index: SkipMap<String, ToolStreamExecutor> = SkipMap::default();
+    for reg in inventory::iter::<ToolStreamingRegistration> {
+        let name = reg.name.to_string();
+        if !index.contains_key(&name) {
+            index.insert(name, reg.execute_streaming);
         }
     }
     index
@@ -279,13 +303,40 @@ pub(crate) fn execute_tool_call_with_args(
     name: &str,
     args: &Value,
 ) -> Result<ToolResult, String> {
+    execute_tool_call_with_args_impl(tool_call_id, name, args, None)
+}
+
+pub(crate) fn execute_tool_call_with_args_streaming(
+    tool_call_id: &str,
+    name: &str,
+    args: &Value,
+    on_chunk: &mut ToolStreamWriter<'_>,
+) -> Result<ToolResult, String> {
+    execute_tool_call_with_args_impl(tool_call_id, name, args, Some(on_chunk))
+}
+
+fn execute_tool_call_with_args_impl(
+    tool_call_id: &str,
+    name: &str,
+    args: &Value,
+    on_chunk: Option<&mut ToolStreamWriter<'_>>,
+) -> Result<ToolResult, String> {
     let Some(spec) = TOOL_INDEX.get_ref(&name.to_string()).copied() else {
         record_tool_stat(name, false);
         record_tool_decision(name, false, "unknown_tool");
         return Err(format!("Unknown tool: {}", name));
     };
     let started = std::time::Instant::now();
-    let exec = (spec.execute)(args);
+    let exec = if let Some(stream_exec) = TOOL_STREAM_INDEX.get_ref(&name.to_string()).copied() {
+        let mut sink = |_chunk: &[u8]| {};
+        let writer = match on_chunk {
+            Some(writer) => writer,
+            None => &mut sink,
+        };
+        stream_exec(args, writer)
+    } else {
+        (spec.execute)(args)
+    };
     let elapsed_ms = started.elapsed().as_millis() as u64;
     match exec {
         Ok(result) => {

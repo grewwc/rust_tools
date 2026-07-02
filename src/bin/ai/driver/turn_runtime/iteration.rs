@@ -16,10 +16,20 @@ use crate::ai::{
 };
 
 use super::{
-    TurnOutcome, context_budget,
+    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
+    PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH, TurnOutcome, context_budget,
+    pre_request_llm_summary_threshold,
     persistence::persist_pending_turn_messages,
     types::{IterationExecution, ToolCallExecution},
 };
+
+/// 记录上次 pre-request LLM 摘要后的 messages 总字符数。
+/// 用于增长量守卫：摘要后上下文需增长 [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`]
+/// 以上才会再次触发，避免摘要失败（did_summarize=false）时每轮重复调用 LLM。
+/// 进程级 static——同一 agent 进程内全局生效，与 orchestrator 的 supervisor
+/// 冷却机制互补（orchestrator 管理工具调用间的压缩，此处管理请求前的兜底）。
+static LAST_PRE_REQUEST_LLM_SUMMARY_CHARS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 struct StreamingFlagGuard {
     flag: Arc<AtomicBool>,
@@ -314,6 +324,61 @@ async fn request_model_response(
         );
     }
 
+    // === Pre-request LLM 摘要兜底 ===
+    // 无损+弱损压缩后仍远超阈值时，调用 LLM 把早期对话压成摘要。
+    // 这是发送请求前的最后一道防线，避免超大上下文导致模型 4xx 或质量退化
+    // （用户报告的 "295K 压到 294K 就停了" 问题）。
+    // 阈值取 history_max_chars * 2（默认 240K），比 orchestrator 的 hard
+    // threshold（*3.5 = 420K）更积极——后者只在工具调用间隙触发，此处覆盖
+    // 每次请求前的最后检查。
+    // 增长量守卫：自上次 LLM 摘要后需增长 ≥ MIN_GROWTH 才再次触发，
+    // 避免摘要失败（无早期对话可摘要）时每轮重复调用 LLM。
+    let llm_threshold = pre_request_llm_summary_threshold(app.config.history_max_chars);
+    if budget_report.after_chars > llm_threshold {
+        let last_summary_chars = LAST_PRE_REQUEST_LLM_SUMMARY_CHARS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let growth = budget_report.after_chars.saturating_sub(last_summary_chars);
+        if last_summary_chars == 0 || growth >= PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH {
+            LAST_PRE_REQUEST_LLM_SUMMARY_CHARS
+                .store(budget_report.after_chars, std::sync::atomic::Ordering::Relaxed);
+            crate::ai::driver::print::print_tool_note_line(
+                "compress",
+                &format!(
+                    "pre-request LLM summary: {} > {} chars, requesting summary…",
+                    budget_report.after_chars, llm_threshold
+                ),
+            );
+            let drained: Vec<Message> = std::mem::take(messages);
+            let (after_msgs, llm_before, llm_after, did_summarize) =
+                crate::ai::history::mid_turn_llm_summarize(
+                    app,
+                    drained,
+                    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+                    MID_TURN_LLM_SUMMARY_MAX_CHARS,
+                )
+                .await;
+            *messages = after_msgs;
+            if did_summarize {
+                LAST_PRE_REQUEST_LLM_SUMMARY_CHARS
+                    .store(llm_after, std::sync::atomic::Ordering::Relaxed);
+                crate::ai::driver::print::print_tool_note_line(
+                    "compress",
+                    &format!(
+                        "pre-request (llm): {} → {} chars",
+                        llm_before, llm_after
+                    ),
+                );
+            } else {
+                crate::ai::driver::print::print_tool_note_line(
+                    "compress",
+                    "pre-request LLM summary skipped \
+                     (no early dialog to summarize or call failed); \
+                     agent may hit context limit",
+                );
+            }
+        }
+    }
+
     let mut actual_model = next_model.to_string();
     let mut request_result = do_request_messages(app, next_model, messages, true).await;
     if let Err(err) = &request_result
@@ -455,6 +520,7 @@ async fn finalize_stream_interaction(
             stream_result,
             allowed_tool_names: request_visible_tool_names(app, force_final_response),
         }),
+        StreamOutcome::EmptyResponse => IterationExecution::EmptyResponse,
         _ => IterationExecution::FinalResponse(stream_result),
     })
 }

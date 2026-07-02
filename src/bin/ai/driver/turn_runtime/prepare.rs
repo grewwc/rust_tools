@@ -371,9 +371,9 @@ pub(super) async fn prepare_turn(
     let suggested_tool_calls_aggregated = filter_suggested_tool_calls_for_current_schema(
         app,
         observer_outputs
-        .iter()
-        .flat_map(|o| o.suggested_tool_calls.clone())
-        .collect(),
+            .iter()
+            .flat_map(|o| o.suggested_tool_calls.clone())
+            .collect(),
     );
     if !suggested_tool_calls_aggregated.is_empty() {
         let mut block = String::from(
@@ -791,13 +791,12 @@ fn code_discovery_record_from_memory_entry(
 #[cfg(test)]
 mod tests {
     use super::{
-        QuestionShape,
-        collect_session_code_discovery_records, detect_complex_task,
-        extract_existing_code_discoveries, high_confidence_project_memory_policy,
-        filter_suggested_tool_calls_for_tool_names,
-        looks_like_code_or_repo_question, recalled_knowledge_usage_policy,
-        render_session_code_discovery_recall, should_inject_integrated_reflection,
-        should_run_general_recall, should_run_session_code_discovery_recall,
+        QuestionShape, collect_session_code_discovery_records, detect_complex_task,
+        extract_existing_code_discoveries, filter_suggested_tool_calls_for_tool_names,
+        high_confidence_project_memory_policy, looks_like_code_or_repo_question,
+        recalled_knowledge_usage_policy, render_session_code_discovery_recall,
+        should_inject_integrated_reflection, should_run_general_recall,
+        should_run_session_code_discovery_recall,
     };
     use crate::ai::code_discovery_policy::parse_record_line;
     use crate::ai::driver::observer::SuggestedToolCall;

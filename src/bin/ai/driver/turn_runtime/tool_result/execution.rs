@@ -2,16 +2,16 @@ use crate::ai::{
     driver::tools::{self, ExecuteToolCallsResult},
     history::{Message, ROLE_INTERNAL_NOTE},
     mcp::{McpClient, SharedMcpClient},
+    stream::clamp_line_to_terminal_row_with_reserve,
     types::{App, ToolCall},
 };
-use std::io::Write;
+use std::{collections::VecDeque, io::Write};
 
 use super::super::persistence::persist_pending_turn_messages;
 use super::super::{
     MAX_TOOL_RESULT_INLINE_CHARS, MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
     types::{IterationExecution, PreparedToolResult, ToolCallExecution, TurnLoopStep},
 };
-use super::messaging::print_tool_result_preview;
 use super::{
     messaging::{
         append_cached_tool_results_note, append_message_pair, append_tool_result_messages,
@@ -21,7 +21,8 @@ use super::{
     preview::{build_terminal_preview, tail_chars},
 };
 use crate::ai::driver::print::{
-    format_tool_output_prefix, print_tool_note_line, print_tool_output_block, sanitize_for_terminal,
+    format_tool_output_line, format_tool_output_prefix, print_tool_note_line,
+    print_tool_output_block, sanitize_for_terminal,
 };
 use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
@@ -253,9 +254,127 @@ struct TerminalToolObserver<'a> {
     // 流式输出折叠状态
     allow_inline_fold_updates: bool,
     fold_total_lines: usize,
+    tty_fold: TtyToolOutputFoldState,
 }
 
 const TOOL_OUTPUT_FOLD_MAX_VISIBLE: usize = 8;
+
+#[derive(Debug, Default)]
+struct TtyToolOutputFoldState {
+    recent_lines: VecDeque<String>,
+    current_line: String,
+    total_lines: usize,
+    window_rows: usize,
+}
+
+impl TtyToolOutputFoldState {
+    fn reset(&mut self) {
+        self.recent_lines.clear();
+        self.current_line.clear();
+        self.total_lines = 0;
+        self.window_rows = 0;
+    }
+
+    fn push_text(&mut self, text: &str) -> std::io::Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
+
+        for ch in text.chars() {
+            if ch == '\n' {
+                self.total_lines += 1;
+                self.recent_lines
+                    .push_back(std::mem::take(&mut self.current_line));
+                while self.recent_lines.len() > TOOL_OUTPUT_FOLD_MAX_VISIBLE {
+                    self.recent_lines.pop_front();
+                }
+            } else {
+                self.current_line.push(ch);
+            }
+        }
+        self.redraw()
+    }
+
+    fn finish(&mut self) -> std::io::Result<()> {
+        self.redraw()
+    }
+
+    fn redraw(&mut self) -> std::io::Result<()> {
+        let mut out = std::io::stdout();
+        if self.window_rows > 0 {
+            write!(out, "\x1b[{}A\r\x1b[0J", self.window_rows)?;
+        }
+
+        let (window, window_rows) = render_tty_tool_output_fold_window(self);
+        if !window.is_empty() {
+            out.write_all(window.as_bytes())?;
+            out.flush()?;
+        }
+        self.window_rows = window_rows;
+        Ok(())
+    }
+}
+
+fn tty_tool_output_hidden_count(fold: &TtyToolOutputFoldState) -> usize {
+    let current_line = usize::from(!fold.current_line.is_empty());
+    fold.total_lines
+        .saturating_add(current_line)
+        .saturating_sub(TOOL_OUTPUT_FOLD_MAX_VISIBLE)
+}
+
+fn tty_tool_output_visible_lines(fold: &TtyToolOutputFoldState) -> Vec<&str> {
+    let current_line = usize::from(!fold.current_line.is_empty());
+    let visible_completed = TOOL_OUTPUT_FOLD_MAX_VISIBLE.saturating_sub(current_line);
+    let completed_skip = fold.recent_lines.len().saturating_sub(visible_completed);
+    let mut visible = fold
+        .recent_lines
+        .iter()
+        .skip(completed_skip)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if current_line > 0 {
+        visible.push(fold.current_line.as_str());
+    }
+    visible
+}
+
+fn render_tty_tool_output_fold_window(fold: &TtyToolOutputFoldState) -> (String, usize) {
+    let hidden_count = tty_tool_output_hidden_count(fold);
+    let visible_lines = tty_tool_output_visible_lines(fold);
+    if hidden_count == 0 && visible_lines.is_empty() {
+        return (String::new(), 0);
+    }
+
+    let mut out = String::new();
+    // 每条行都被 clamp 成「最多占一个物理行」，窗口物理行数恒等于逻辑行数，
+    // cursor-up 擦除精确，不再因超长/宽字符输出行的自动折行让擦除行数算少而残留。
+    let mut rows = 0usize;
+
+    if hidden_count > 0 {
+        let marker = format!(
+            "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}{}{RESET}",
+            clamp_tool_output_body(&format!("··· {hidden_count} lines folded ···"))
+        );
+        rows += 1;
+        out.push_str(&marker);
+        out.push('\n');
+    }
+
+    for line in visible_lines {
+        let rendered = format_tool_output_line(&clamp_tool_output_body(line));
+        rows += 1;
+        out.push_str(&rendered);
+        out.push('\n');
+    }
+
+    (out, rows)
+}
+
+/// 工具输出折叠行统一带 `  │ ` 前缀（4 列），正文按终端列宽减 4 clamp 成单物理行。
+fn clamp_tool_output_body(body: &str) -> String {
+    const PREFIX_COLS: usize = 4;
+    clamp_line_to_terminal_row_with_reserve(body, PREFIX_COLS)
+}
 
 impl<'a> TerminalToolObserver<'a> {
     fn new(app: &'a App) -> Self {
@@ -269,6 +388,7 @@ impl<'a> TerminalToolObserver<'a> {
             // `\r` / `CSI 2K` 这类原地刷新只适合真实 TTY。IDE Chat / pipe /
             // 日志采集场景不会解释 ANSI 光标控制，原样输出后就会泄漏成 `[2K`。
             allow_inline_fold_updates: std::io::IsTerminal::is_terminal(&std::io::stdout()),
+            tty_fold: TtyToolOutputFoldState::default(),
         }
     }
 
@@ -278,12 +398,38 @@ impl<'a> TerminalToolObserver<'a> {
         self.at_line_start = true;
         self.streamed_any_output = false;
         self.fold_total_lines = 0;
+        self.tty_fold.reset();
+    }
+
+    fn start_stream_output(&mut self, tool_call: &ToolCall) {
+        if self.active_stream_tool_call_id.as_deref() == Some(tool_call.id.as_str()) {
+            return;
+        }
+        self.reset_stream_state();
+        self.active_stream_tool_call_id = Some(tool_call.id.clone());
+        let label = if tool_call.function.name == "execute_command" {
+            "streaming command output"
+        } else {
+            "streaming tool output"
+        };
+        print_tool_note_line("output", label);
     }
 
     fn push_stream_text(&mut self, text: &str) {
         use std::io::Write;
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         let sanitized = sanitize_for_terminal(&normalized);
+
+        if sanitized.is_empty() {
+            return;
+        }
+
+        if self.allow_inline_fold_updates {
+            let _ = self.tty_fold.push_text(&sanitized);
+            let _ = std::io::stdout().flush();
+            self.streamed_any_output = true;
+            return;
+        }
 
         for ch in sanitized.chars() {
             if ch == '\n' {
@@ -334,10 +480,16 @@ impl<'a> TerminalToolObserver<'a> {
                 // 超限后不输出任何字符内容
             }
         }
-        if !sanitized.is_empty() {
-            let _ = std::io::stdout().flush();
-            self.streamed_any_output = true;
+        let _ = std::io::stdout().flush();
+        self.streamed_any_output = true;
+    }
+
+    fn push_stream_text_for_tool(&mut self, tool_call: &ToolCall, text: &str) {
+        if text.is_empty() {
+            return;
         }
+        self.start_stream_output(tool_call);
+        self.push_stream_text(text);
     }
 
     fn flush_pending_utf8(&mut self) {
@@ -351,6 +503,10 @@ impl<'a> TerminalToolObserver<'a> {
 
     fn finish_stream_output(&mut self, newline: bool) {
         self.flush_pending_utf8();
+        if self.allow_inline_fold_updates {
+            let _ = self.tty_fold.finish();
+            return;
+        }
         // 如果正在计数器模式，换行结束计数器行
         if self.fold_total_lines > TOOL_OUTPUT_FOLD_MAX_VISIBLE {
             let folded = self.fold_total_lines - TOOL_OUTPUT_FOLD_MAX_VISIBLE;
@@ -376,31 +532,43 @@ impl<'a> TerminalToolObserver<'a> {
             let _ = std::io::stdout().flush();
         }
     }
+
+    fn print_prepared_tool_result(&mut self, prepared: &PreparedToolResult) {
+        print_tool_note_line("output", "tool result");
+        if self.allow_inline_fold_updates && !prepared.content_for_terminal.trim().is_empty() {
+            self.tty_fold.reset();
+            let _ = self.tty_fold.push_text(&prepared.content_for_terminal);
+            let _ = self.tty_fold.finish();
+            self.tty_fold.reset();
+        } else {
+            print_tool_output_block(&prepared.content_for_terminal);
+        }
+    }
+
+    fn print_captured_command_output(&mut self, prepared: &PreparedToolResult) {
+        print_tool_note_line("result", "captured command output");
+        if self.allow_inline_fold_updates && !prepared.content_for_terminal.trim().is_empty() {
+            self.tty_fold.reset();
+            let _ = self.tty_fold.push_text(&prepared.content_for_terminal);
+            let _ = self.tty_fold.finish();
+            self.tty_fold.reset();
+        } else {
+            print_tool_output_block(&prepared.content_for_terminal);
+        }
+    }
 }
 
 impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
-    fn on_tool_started(&mut self, tool_call: &ToolCall) {
-        if tool_call.function.name != "execute_command" {
-            return;
-        }
-
-        self.reset_stream_state();
-        self.active_stream_tool_call_id = Some(tool_call.id.clone());
-        print_tool_note_line("output", "streaming command output");
-    }
+    fn on_tool_started(&mut self, _tool_call: &ToolCall) {}
 
     fn on_tool_stream(&mut self, tool_call: &ToolCall, chunk: &[u8]) {
-        if self.active_stream_tool_call_id.as_deref() != Some(tool_call.id.as_str()) {
-            return;
-        }
-
         self.pending_utf8.extend_from_slice(chunk);
         loop {
             match std::str::from_utf8(&self.pending_utf8) {
                 Ok(text) => {
                     let text = text.to_string();
                     self.pending_utf8.clear();
-                    self.push_stream_text(&text);
+                    self.push_stream_text_for_tool(tool_call, &text);
                     break;
                 }
                 Err(err) => {
@@ -415,7 +583,7 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
                     let text =
                         String::from_utf8_lossy(&self.pending_utf8[..valid_up_to]).into_owned();
                     self.pending_utf8.drain(..valid_up_to);
-                    self.push_stream_text(&text);
+                    self.push_stream_text_for_tool(tool_call, &text);
 
                     if err.error_len().is_some() {
                         self.flush_pending_utf8();
@@ -426,23 +594,22 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
     }
 
     fn on_tool_finished(&mut self, tool_call: &ToolCall, run_result: &tools::RunOneResult) {
-        if tool_call.function.name == "execute_command" {
-            let is_failure = run_result.tool_result.content.starts_with("Exit code:");
+        let streamed_output = self.active_stream_tool_call_id.as_deref()
+            == Some(tool_call.id.as_str())
+            && self.streamed_any_output;
+        if streamed_output {
+            let is_failure = if tool_call.function.name == "execute_command" {
+                run_result.tool_result.content.starts_with("Exit code:")
+            } else {
+                !run_result.ok
+            };
             self.finish_stream_output(is_failure);
 
-            let prepared = prepare_tool_result(
-                self.app,
-                &tool_call.function.name,
-                &run_result.tool_result.content,
-            );
-            if !self.streamed_any_output {
-                print_tool_note_line("result", "captured command output");
-                print_tool_output_block(&prepared.content_for_terminal);
-            } else if is_failure {
+            if is_failure {
                 if let Some(exit_line) = run_result.tool_result.content.lines().next() {
                     print_tool_note_line("error", exit_line);
                 }
-            } else {
+            } else if tool_call.function.name == "execute_command" {
                 print_tool_note_line("result", "command completed");
             }
 
@@ -455,7 +622,7 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
             &tool_call.function.name,
             &run_result.tool_result.content,
         );
-        print_tool_result_preview(&tool_call.function.name, &prepared);
+        self.print_prepared_tool_result(&prepared);
     }
 }
 
@@ -665,6 +832,11 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
         IterationExecution::RequestFailed(text) => {
             *final_assistant_text = text;
             Ok(TurnLoopStep::Break)
+        }
+        IterationExecution::EmptyResponse => {
+            // 模型返回空响应（无文本、无工具调用、无思考内容），自动重试
+            let _ = writeln!(std::io::stderr(), "  ⚠ 模型返回空响应，自动重试…");
+            Ok(TurnLoopStep::Continue)
         }
         IterationExecution::FinalResponse(stream_result) => {
             let reasoning_only_completion = stream_result.assistant_text.trim().is_empty()
@@ -933,9 +1105,8 @@ mod tests {
     fn discover_skills_followup_note_is_deduplicated() {
         let mut messages = Vec::new();
         let mut turn_messages = Vec::new();
-        let allowed: rust_tools::commonw::FastSet<String> = ["enable_tools".to_string()]
-            .into_iter()
-            .collect();
+        let allowed: rust_tools::commonw::FastSet<String> =
+            ["enable_tools".to_string()].into_iter().collect();
         append_discover_skills_followup_note(&mut messages, &mut turn_messages, &allowed);
         append_discover_skills_followup_note(&mut messages, &mut turn_messages, &allowed);
         let expected = build_discover_skills_followup_note(&allowed);
@@ -969,6 +1140,85 @@ mod tests {
             extract_image_paths_from_file_read_tool_calls(&tool_calls),
             vec!["/tmp/shot.png".to_string()]
         );
+    }
+
+    #[test]
+    fn tty_tool_output_fold_window_keeps_latest_visible_lines() {
+        // 断言正文/标记原样存在；置宽 COLUMNS 以免与 COLUMNS=12 的 clamp 用例并发时
+        // 读到泄漏的窄列宽而被截断。
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("COLUMNS", "200");
+        }
+
+        let mut fold = TtyToolOutputFoldState::default();
+        fold.total_lines = TOOL_OUTPUT_FOLD_MAX_VISIBLE;
+        for idx in 1..=TOOL_OUTPUT_FOLD_MAX_VISIBLE {
+            fold.recent_lines.push_back(format!("line-{idx}"));
+        }
+        fold.current_line = format!("line-{}", TOOL_OUTPUT_FOLD_MAX_VISIBLE + 1);
+
+        let expected_owned = (2..=TOOL_OUTPUT_FOLD_MAX_VISIBLE + 1)
+            .map(|idx| format!("line-{idx}"))
+            .collect::<Vec<_>>();
+        assert_eq!(tty_tool_output_hidden_count(&fold), 1);
+        assert_eq!(
+            tty_tool_output_visible_lines(&fold),
+            expected_owned
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+
+        let (window, _) = render_tty_tool_output_fold_window(&fold);
+        assert_eq!(window.matches("lines folded").count(), 1);
+        assert!(!window.contains("line-1"));
+        assert!(window.contains("line-2"));
+        assert!(window.contains(&format!("line-{}", TOOL_OUTPUT_FOLD_MAX_VISIBLE + 1)));
+
+        unsafe {
+            std::env::remove_var("COLUMNS");
+        }
+    }
+
+    #[test]
+    fn tty_tool_output_fold_window_clamps_each_line_to_single_row() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("COLUMNS", "12");
+        }
+
+        let mut fold = TtyToolOutputFoldState::default();
+        fold.total_lines = TOOL_OUTPUT_FOLD_MAX_VISIBLE;
+        fold.recent_lines
+            .push_back("12345678901234567890".to_string());
+        for idx in 0..(TOOL_OUTPUT_FOLD_MAX_VISIBLE - 2) {
+            fold.recent_lines.push_back(format!("pad-{idx}"));
+        }
+        fold.recent_lines.push_back("abcdef".to_string());
+        fold.current_line = "ghijklmnopqrst".to_string();
+
+        let (window, rows) = render_tty_tool_output_fold_window(&fold);
+        let visible_lines = tty_tool_output_visible_lines(&fold);
+
+        // 每条渲染行被 clamp 成单物理行：窗口物理行数 == 1 折叠标记 + 可见逻辑行数。
+        assert_eq!(rows, 1 + visible_lines.len());
+        // 每条渲染行（去掉 `  │ ` 前缀与 ANSI 后）不超过终端列宽（12），cursor-up 精确。
+        for line in window.lines() {
+            let visible = crate::ai::driver::print::sanitize_for_terminal(line);
+            assert!(
+                unicode_width::UnicodeWidthStr::width(visible.as_str()) <= 12,
+                "line exceeds terminal width: {visible:?}"
+            );
+        }
+        assert!(!window.contains("12345678901234567890"));
+        assert!(window.contains("abcdef"));
+        // 超宽行被截断为省略号结尾，不再原样残留导致 cursor-up 少算行数。
+        assert!(window.contains('…'));
+
+        unsafe {
+            std::env::remove_var("COLUMNS");
+        }
     }
 
     #[test]

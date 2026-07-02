@@ -3,8 +3,8 @@ mod checkpoint;
 mod compress;
 mod markdown;
 mod sessions;
-mod suspended;
 mod sqlite;
+mod suspended;
 mod types;
 
 use std::path::{Path, PathBuf};
@@ -32,11 +32,13 @@ pub(in crate::ai) use markdown::messages_to_markdown;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
 #[allow(unused_imports)]
-pub(in crate::ai) use suspended::{SuspendedSessionEntry, SuspendedSessionStore};
-#[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_messages_sqlite;
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_turn_window_sqlite;
+#[allow(unused_imports)]
+pub(in crate::ai) use suspended::{
+    SuspendedSessionEntry, SuspendedSessionStore, format_suspended_timestamp_label,
+};
 #[allow(unused_imports)]
 pub(in crate::ai) use types::{COLON, MAX_HISTORY_TURNS, Message, NEWLINE};
 

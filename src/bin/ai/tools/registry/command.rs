@@ -1,6 +1,7 @@
 use serde_json::Value;
 
-use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::command_tools::execute_command_streaming;
+use crate::ai::tools::common::{ToolRegistration, ToolSpec, ToolStreamingRegistration};
 use crate::ai::tools::service::command::execute_command;
 
 fn params_execute_command() -> Value {
@@ -24,6 +25,13 @@ fn params_execute_command() -> Value {
     })
 }
 
+fn execute_command_streaming_registered(
+    args: &Value,
+    on_chunk: &mut crate::ai::tools::common::ToolStreamWriter<'_>,
+) -> Result<String, String> {
+    execute_command_streaming(args, |chunk| on_chunk(chunk))
+}
+
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "execute_command",
@@ -33,4 +41,9 @@ inventory::submit!(ToolRegistration {
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
+});
+
+inventory::submit!(ToolStreamingRegistration {
+    name: "execute_command",
+    execute_streaming: execute_command_streaming_registered,
 });

@@ -41,10 +41,7 @@ pub struct ScoredSkill<'a> {
     pub none_score: f64,
 }
 
-pub fn rank_skills_locally<'a>(
-    skills: &'a [SkillManifest],
-    input: &str,
-) -> Vec<ScoredSkill<'a>> {
+pub fn rank_skills_locally<'a>(skills: &'a [SkillManifest], input: &str) -> Vec<ScoredSkill<'a>> {
     if input.trim().is_empty() || skills.is_empty() {
         return Vec::new();
     }

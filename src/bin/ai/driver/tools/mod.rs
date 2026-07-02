@@ -1187,23 +1187,12 @@ fn execute_prepared_tool_call(
                 execute_tool_status(session_id, &tool_call.id, &prepared.args)
             } else if tool_call.function.name == "tool_cancel" {
                 execute_tool_cancel(session_id, &tool_call.id, &prepared.args)
-            } else if tool_call.function.name == "execute_command" {
-                builtin_tools::command_tools::execute_command_streaming(&prepared.args, |chunk| {
+            } else {
+                execute_prepared_builtin_tool_call(tool_call, prepared, |chunk| {
                     if let Some(observer) = observer.as_deref_mut() {
                         observer.on_tool_stream(tool_call, chunk);
                     }
                 })
-                .map(|content| ToolResult {
-                    tool_call_id: tool_call.id.clone(),
-                    content,
-                })
-            } else {
-                builtin_tools::execute_tool_call_with_args(
-                    &tool_call.id,
-                    &tool_call.function.name,
-                    &prepared.args,
-                )
-                .map_err(|e| e.to_string())
             }
         }
         ToolRoute::Mcp {
@@ -1216,27 +1205,25 @@ fn execute_prepared_tool_call(
             let guard = shared_mcp_client
                 .lock()
                 .map_err(|_| "Shared MCP client poisoned".to_string())?;
-            oauth::execute_mcp_tool_call(
-                &guard,
-                tool_call,
-                server_name,
-                tool_name,
-                &prepared.args,
-            )
+            oauth::execute_mcp_tool_call(&guard, tool_call, server_name, tool_name, &prepared.args)
         }
     }
 }
 
-fn execute_prepared_builtin_tool_call(
+fn execute_prepared_builtin_tool_call<F>(
     tool_call: &ToolCall,
     prepared: &PreparedToolCall,
-) -> Result<ToolResult, String> {
-    builtin_tools::execute_tool_call_with_args(
+    mut on_chunk: F,
+) -> Result<ToolResult, String>
+where
+    F: FnMut(&[u8]),
+{
+    builtin_tools::execute_tool_call_with_args_streaming(
         &tool_call.id,
         &tool_call.function.name,
         &prepared.args,
+        &mut on_chunk,
     )
-    .map_err(|e| e.to_string())
 }
 
 fn validate_spawnable_tool(target_tool_name: &str, route: &ToolRoute) -> Result<(), String> {
@@ -1389,25 +1376,13 @@ fn execute_tool_spawn(
             &prepared_for_thread.route,
             &tool_call_for_thread.function.name,
             || match &prepared_for_thread.route {
-                ToolRoute::Builtin => {
-                    if tool_call_for_thread.function.name == "execute_command" {
-                        builtin_tools::command_tools::execute_command_streaming(
-                            &prepared_for_thread.args,
-                            |chunk| {
-                                pipe_observer.on_tool_stream(&tool_call_for_thread, chunk);
-                            },
-                        )
-                        .map(|content| ToolResult {
-                            tool_call_id: tool_call_for_thread.id.clone(),
-                            content,
-                        })
-                    } else {
-                        execute_prepared_builtin_tool_call(
-                            &tool_call_for_thread,
-                            &prepared_for_thread,
-                        )
-                    }
-                }
+                ToolRoute::Builtin => execute_prepared_builtin_tool_call(
+                    &tool_call_for_thread,
+                    &prepared_for_thread,
+                    |chunk| {
+                        pipe_observer.on_tool_stream(&tool_call_for_thread, chunk);
+                    },
+                ),
                 ToolRoute::Mcp { .. } => {
                     let guard = shared_mcp_client_for_thread
                         .lock()
@@ -2561,8 +2536,8 @@ mod tests {
         collect_tool_cache_file_fingerprints, delete_async_tool_snapshot, execute_tool_calls,
         execute_with_safe_retry, is_cacheable_tool_name, is_parallel_safe_tool_call,
         is_tool_cache_entry_fresh, load_async_tool_snapshot, lookup_wait_sources,
-        parallel_safe_batch_len, persist_async_tool_snapshot, send_async_tool_pipe_message,
-        remediation_hint, should_retry_once, stream_preview_from_aggregate,
+        parallel_safe_batch_len, persist_async_tool_snapshot, remediation_hint,
+        send_async_tool_pipe_message, should_retry_once, stream_preview_from_aggregate,
         tool_cache_validation_matches,
     };
     use crate::ai::mcp::McpClient;

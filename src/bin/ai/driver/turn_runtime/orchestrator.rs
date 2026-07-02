@@ -13,6 +13,8 @@
 //   4. Return TurnOutcome (Quit, Success, or Error)
 // =============================================================================
 
+use std::io::Write;
+
 use crate::ai::{mcp::SharedMcpClient, types::App};
 
 use super::{
@@ -23,7 +25,7 @@ use super::{
     mid_turn_compress_hard_threshold, mid_turn_compress_soft_threshold,
     prepare::prepare_turn,
     tool_result::handle_iteration_execution,
-    types::{TurnLoopStep, TurnOutcome, TurnPreparation},
+    types::{IterationExecution, TurnLoopStep, TurnOutcome, TurnPreparation},
 };
 
 /// 工具调用循环检测窗口：
@@ -459,6 +461,7 @@ async fn run_turn_body(
     // 收集本 turn 实际调用过的 explicit-enabled tool 名字，turn 末用于老化未用项。
     let mut tools_used_this_turn: rust_tools::cw::SkipSet<String> =
         rust_tools::cw::SkipSet::default();
+    let mut consecutive_empty_responses: usize = 0;
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
         {
@@ -494,23 +497,24 @@ async fn run_turn_body(
         };
         {
             let mc = mcp_client.lock().unwrap().routing_snapshot();
+            // 空响应重试计数：连续 >2 次空响应则放弃，避免浪费迭代预算
+            if matches!(execution, IterationExecution::EmptyResponse) {
+                consecutive_empty_responses += 1;
+                if consecutive_empty_responses > 2 {
+                    let _ = writeln!(std::io::stderr(), "  ✗ 连续 {} 次空响应，停止重试", consecutive_empty_responses);
+                    final_assistant_text = "[模型连续返回空响应，请重试或切换模型]".to_string();
+                    break 'turn Ok(None);
+                }
+            } else {
+                consecutive_empty_responses = 0;
+            }
             let step = match handle_iteration_execution(
-                app,
-                &question,
-                &mc,
-                mcp_client,
-                execution,
-                &mut messages,
-                &mut turn_messages,
-                one_shot_mode,
-                &mut persisted_turn_messages,
-                &mut final_assistant_text,
-                &mut final_assistant_recorded,
-                &mut force_final_response,
+                app, &question, &mc, mcp_client, execution,
+                &mut messages, &mut turn_messages, one_shot_mode,
+                &mut persisted_turn_messages, &mut final_assistant_text,
+                &mut final_assistant_recorded, &mut force_final_response,
                 &mut terminal_dedupe_candidate,
-                skill_turn.matched_skill_name().is_none(),
-                iteration,
-                max_iterations,
+                skill_turn.matched_skill_name().is_none(), iteration, max_iterations,
             ) {
                 Ok(s) => s,
                 Err(err) => break 'turn Err(err),

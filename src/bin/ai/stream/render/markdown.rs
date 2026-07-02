@@ -768,7 +768,48 @@ impl MarkdownStreamRenderer {
     }
 }
 
-fn live_preview_cursor_rows(line: &str) -> usize {
+/// 把一行文本按终端 **真实** 列宽硬截断到「最多占一个物理行」，超出部分用 `…` 收尾。
+///
+/// 折叠窗口（thinking / 工具输出）用它保证每条可见行只占一个物理行，使 cursor-up
+/// 擦除的行数与逻辑行数严格相等，彻底摆脱 `live_preview_cursor_rows` 对自动折行的
+/// 预测——tab / 全角字符 / 超长行 / 终端 resize 都不会再让擦除行数算少而残留旧内容
+/// （表现为 header 反复堆叠、大段空白）。传入文本视为不含 ANSI 的纯文本。
+pub(in crate::ai) fn clamp_line_to_terminal_row(line: &str) -> String {
+    clamp_line_to_terminal_row_with_reserve(line, 0)
+}
+
+/// 同 [`clamp_line_to_terminal_row`]，但先从终端列宽预留 `reserve_cols` 列给行首装饰
+/// （如折叠行的 `  │ ` 前缀），保证「前缀 + clamp 后正文」合起来仍不超过一个物理行。
+pub(in crate::ai) fn clamp_line_to_terminal_row_with_reserve(
+    line: &str,
+    reserve_cols: usize,
+) -> String {
+    let cols = raw_terminal_cols().saturating_sub(reserve_cols).max(1);
+    let mut total = 0usize;
+    for ch in line.chars() {
+        total += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    }
+    if total <= cols {
+        return line.to_string();
+    }
+
+    // 需要截断：预留 1 列给省略号，保证含省略号后仍不超过 cols。
+    let budget = cols.saturating_sub(1).max(1);
+    let mut out = String::with_capacity(line.len());
+    let mut col = 0usize;
+    for ch in line.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if col + w > budget {
+            break;
+        }
+        out.push(ch);
+        col += w;
+    }
+    out.push('…');
+    out
+}
+
+pub(in crate::ai) fn live_preview_cursor_rows(line: &str) -> usize {
     // 预览行是逐字符原样写入终端、由终端按 **真实** 列宽自动折行的，所以这里必须用
     // raw_terminal_cols（而非保留右边距的 preview_terminal_width）来数物理行数。
     // 否则窄于真实宽度的列数会把"恰好一行"的预览算成两行，cursor-up 多移一行，

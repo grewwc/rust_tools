@@ -510,12 +510,17 @@ pub(super) fn print_help() {
     println!("    /sessions current         show current session info");
     println!("    /sessions new             create and switch to new session");
     println!("    /sessions use <id>        switch to specified session");
-    println!("    /sessions suspend         suspend current session and return to shell");
+    println!("    /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)");
+    println!("    /sessions bound           list suspended sessions bound to current terminal");
     println!("    /sessions delete <id>     delete specified session");
+    println!("    /sessions clear-bound     clear suspended sessions bound to current terminal");
+    println!("    /sessions clear-history   clear current session history (keeps session alive)");
     println!("    /sessions clear-all       delete all sessions");
     println!("    /sessions export <id> [output.md]       export session to Markdown");
     println!("    /sessions export-current [output.md]    export current session to Markdown");
     println!("    /sessions export-last [output.md]       export latest session to Markdown");
+    println!("    /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
+    println!("    /sessions branch <keep_messages> [src=<id>] [as=<id>]");
     println!();
     println!("  Persona quick start:");
     println!("    1. Run `a` to enter interactive mode");
@@ -524,8 +529,12 @@ pub(super) fn print_help() {
     println!();
     println!("  Debug:");
     println!("    /hang                    state dump (debug)");
+    println!();
+    println!("Model Encryption:");
+    println!("  models.json 中 api_key / name / endpoint 支持 enc: 前缀加密");
+    println!("  加密: secret encrypt \"<明文>\" => enc:<base64>，粘贴到 models.json");
+    println!("  示例: secret encrypt \"your-api-key\"");
 }
-
 /// 生成 shell 补全脚本并打印到 stdout。
 /// `shell` 取值 "bash" | "zsh" | "fish"，不区分大小写。
 /// 通过 --generate-completions 触发。
@@ -597,13 +606,13 @@ fn generate_bash(
     println!("  local usage_sub='today 7d 30d all daily trend days help'");
     println!("  local checkpoint_sub='save list rollback delete help'");
     println!(
-        "  local history_sub='full user assistant tool system grep rewind undo last export copy 3 6 10 20'"
+        "  local history_sub='full user assistant tool system grep rewind undo export copy help 3 6 10 20'"
     );
     println!(
         "  local persona_sub='help list ls current cur create new use select switch delete del rm'"
     );
     println!(
-        "  local session_sub='list current new use suspend delete clear-all export export-current export-last'"
+        "  local session_sub='help list current new use suspend bound delete clear-bound clear-history clear-all export export-current export-last fork branch'"
     );
     println!("  local agent_sub='help list current use auto'");
     println!("  local model_sub='current list help effort'");
@@ -691,10 +700,10 @@ fn generate_zsh(
     println!("  local -a _a_usage_subcmds=(today 7d 30d all daily trend days help)");
     println!("  local -a _a_checkpoint_subcmds=(save list rollback delete help)");
     println!(
-        "  local -a _a_history_subcmds=(full user assistant tool system grep rewind undo last export copy 3 6 10 20)"
+        "  local -a _a_history_subcmds=(full user assistant tool system grep rewind undo export copy help 3 6 10 20)"
     );
     println!(
-        "  local -a _a_session_subcmds=(list current new use suspend delete clear-all export export-current export-last)"
+        "  local -a _a_session_subcmds=(help list current new use suspend bound delete clear-bound clear-history clear-all export export-current export-last fork branch)"
     );
     println!("  local -a _a_agent_subcmds=(help list current use auto)");
     println!(

@@ -1,5 +1,7 @@
+use std::io::{self, Write};
 pub use rust_tools::cmd;
 pub use rust_tools::commonw;
+pub use rust_tools::{terminalw, cw::Trie};
 pub use rust_tools::strw;
 
 #[path = "re/memo/mod.rs"]
@@ -15,6 +17,23 @@ const DEFAULT_TXT_OUTPUT_NAME: &str = "output.txt";
 
 fn main() {
     let argv = normalize_legacy_single_dash_long_args(std::env::args());
+
+    // intercept --generate-completions (meta-operation, requires only the parser)
+    if let Some(idx) = argv.iter().position(|a| a == "--generate-completions") {
+        let shell = if let Some(val) = argv.get(idx + 1) {
+            val.clone()
+        } else if let Ok(s) = std::env::var("SHELL") {
+            s.rsplit('/')
+                .next()
+                .unwrap_or("bash")
+                .to_string()
+        } else {
+            "bash".to_string()
+        };
+        generate_completion_script(&shell);
+        return;
+    }
+
     let (mut parser, cli) = parse_cli_and_parser(argv);
 
     let db = open_backend(&cli).unwrap_or_else(|e| {
@@ -78,6 +97,94 @@ fn main() {
     });
     features::register::register_all(&mut parser, ctx);
     let _ = parser.execute_first();
+}
+
+/// Generate shell completion script for `re`.
+fn generate_completion_script(shell: &str) {
+    match shell.to_ascii_lowercase().as_str() {
+        "bash" => generate_bash_completion(),
+        "zsh" => generate_zsh_completion(),
+        _ => {
+            eprintln!("Unsupported shell: {shell}. Supported: bash, zsh.");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Build a word list of all flag names from the re parser for shell completion.
+fn build_flag_words(p: &terminalw::Parser) -> Vec<String> {
+    let info = p.collect_completion_info();
+    let mut trie = Trie::new();
+    for (name, _ty, _usage, aliases) in &info {
+        if name.len() > 1 {
+            trie.insert(&format!("--{name}"));
+        } else {
+            trie.insert(&format!("-{name}"));
+        }
+        for alias in aliases {
+            if alias.len() == 1 {
+                trie.insert(&format!("-{alias}"));
+            } else {
+                trie.insert(&format!("--{alias}"));
+            }
+        }
+    }
+    trie.words_with_prefix("")
+}
+
+/// Generate bash completion script.
+fn generate_bash_completion() {
+    let parser = features::core::build_re_parser();
+    let flags = build_flag_words(&parser);
+    let flag_list = flags.join(" ");
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let _ = writeln!(out, r#"# bash completion for re"#);
+    let _ = writeln!(out, r#"_re() {{"#);
+    let _ = writeln!(out, r#"  local cur prev words cword"#);
+    let _ = writeln!(out, r#"  _get_comp_words_by_ref -n = cur prev words cword 2>/dev/null || true"#);
+    let _ = writeln!(out);
+    let _ = writeln!(out, r#"  if [ "$prev" = "-t" ] || [ "$prev" = "--tag" ]; then"#);
+    let _ = writeln!(out, r#"    COMPREPLY=( $(compgen -W "$("${{COMP_WORDS[0]}}" --complete-tags "$cur" 2>/dev/null)" -- "$cur") )"#);
+    let _ = writeln!(out, r#"    return 0"#);
+    let _ = writeln!(out, r#"  fi"#);
+    let _ = writeln!(out);
+    let _ = writeln!(out, r#"  COMPREPLY=( $(compgen -W "{flag_list}" -- "$cur") )"#, flag_list = flag_list);
+    let _ = writeln!(out, r#"  return 0"#);
+    let _ = writeln!(out, r#"}}"#);
+    let _ = writeln!(out, r#"complete -F _re re"#);
+}
+
+/// Generate zsh completion script.
+fn generate_zsh_completion() {
+    let parser = features::core::build_re_parser();
+    let info = parser.collect_completion_info();
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let _ = writeln!(out, "#compdef re\n");
+    let _ = writeln!(out, "_re() {{");
+    let _ = writeln!(out, "  local -a _re_args");
+    for (name, ty, usage, aliases) in &info {
+        let flag_name = if name.len() > 1 { format!("--{name}") } else { format!("-{name}") };
+        let mut flags = vec![flag_name];
+        flags.extend(aliases.iter().map(|a| if a.len() > 1 { format!("--{a}") } else { format!("-{a}") }));
+        let flags = flags
+            .join(", ");
+        let desc = usage.replace('\'', "'\\''");
+        let value = if ty == "string" { format!(":{name}: ") } else { String::new() };
+        let _ = writeln!(out, "  _re_args+=('{flags}[{desc}]{value}')", flags = flags, desc = desc, value = value);
+    }
+    let _ = writeln!(out, "  if [[ $words[CURRENT-1] == -t || $words[CURRENT-1] == --tag ]]; then");
+    let _ = writeln!(out, "    local -a tags");
+    let _ = writeln!(out, "    tags=(${{(f)\"$(${{words[1]}} --complete-tags \"${{words[CURRENT]}}\" 2>/dev/null)\"}})");
+    let _ = writeln!(out, "    compadd -a tags");
+    let _ = writeln!(out, "    return");
+    let _ = writeln!(out, "  fi");
+    let _ = writeln!(out, "  _arguments -s : \"$_re_args[@]\"");
+    let _ = writeln!(out, "}}");
+    let _ = writeln!(out, "\ncompdef _re re");
 }
 
 #[cfg(test)]

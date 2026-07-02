@@ -1,8 +1,8 @@
 use serde_json::Value;
 
-use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::common::{ToolRegistration, ToolSpec, ToolStreamingRegistration};
 use crate::ai::tools::service::file::{
-    execute_read_file, execute_read_file_lines, execute_write_file,
+    execute_read_file, execute_read_file_lines, execute_write_file, execute_write_file_streaming,
 };
 
 fn params_read_file() -> Value {
@@ -95,4 +95,9 @@ inventory::submit!(ToolRegistration {
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
+});
+
+inventory::submit!(ToolStreamingRegistration {
+    name: "write_file",
+    execute_streaming: execute_write_file_streaming,
 });

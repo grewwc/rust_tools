@@ -121,7 +121,7 @@ impl CommandCompleter {
         }
     }
 
-    fn current_model_hint() -> Option<String> {
+    pub(crate) fn current_model_hint() -> Option<String> {
         CURRENT_MODEL_HINT
             .read()
             .ok()
@@ -181,7 +181,14 @@ impl CommandCompleter {
     }
 
     fn model_replacement(model: &crate::ai::model_names::ModelDef) -> String {
-        Self::model_handle(model)
+        // replacement 使用 model.key，这样 find_by_identifier 能通过 key 正确解析。
+        // 如果 key 为空，fallback 到 handle（兼容旧模型）。
+        let key = model.key.trim();
+        if key.is_empty() {
+            Self::model_handle(model)
+        } else {
+            key.to_string()
+        }
     }
 
     fn current_model_matches(
@@ -290,16 +297,22 @@ impl CommandCompleter {
 
     fn session_subcommands() -> &'static [&'static str] {
         &[
+            "help",
             "list",
             "current",
             "new",
             "use",
             "suspend",
+            "bound",
             "delete",
+            "clear-bound",
+            "clear-history",
             "clear-all",
             "export",
             "export-current",
             "export-last",
+            "fork",
+            "branch",
         ]
     }
 
@@ -327,8 +340,11 @@ impl CommandCompleter {
             "tool",
             "system",
             "grep",
+            "rewind",
+            "undo",
             "export",
             "copy",
+            "help",
             "3",
             "6",
             "10",
@@ -932,6 +948,33 @@ mod tests {
         assert!(pairs.iter().any(|pair| pair.replacement == "grep"));
         assert!(pairs.iter().any(|pair| pair.replacement == "export"));
         assert!(pairs.iter().any(|pair| pair.replacement == "copy"));
+    }
+
+    #[test]
+    fn history_command_completion_includes_rewind_but_not_rewind_target() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let (_, pairs) = completer
+            .complete("/history ", 9, &Context::new(&history))
+            .unwrap();
+
+        assert!(pairs.iter().any(|pair| pair.replacement == "rewind"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "undo"));
+        assert!(!pairs.iter().any(|pair| pair.replacement == "last"));
+    }
+
+    #[test]
+    fn session_command_completion_tracks_real_subcommands() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let (_, pairs) = completer
+            .complete("/sessions ", 10, &Context::new(&history))
+            .unwrap();
+
+        assert!(pairs.iter().any(|pair| pair.replacement == "clear-history"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "fork"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "branch"));
+        assert!(!pairs.iter().any(|pair| pair.replacement == "rewind"));
     }
 
     #[test]

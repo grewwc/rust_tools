@@ -18,6 +18,7 @@ use super::{
     MarkdownStreamRenderer,
     extract::{StreamTextEvent, extract_chunk_events_streaming},
     framing, normalize,
+    render::markdown::clamp_line_to_terminal_row,
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{StreamChunkStep, StreamMarkers, StreamProcessingState, ToolCallBuilder},
 };
@@ -66,7 +67,7 @@ pub(super) async fn stream_response(
     };
 
     while !app.shutdown.load(std::sync::atomic::Ordering::Relaxed) {
-        if let Some(result) = immediate_cancel_result(app, state.content.thinking_open) {
+        if let Some(result) = immediate_cancel_result(app, &mut state) {
             return Ok(result);
         }
 
@@ -80,7 +81,7 @@ pub(super) async fn stream_response(
             tokio::select! {
                 chunk = response.chunk() => chunk,
                 _ = wait_for_interrupt(app) => {
-                    return Ok(cancelled_stream_result(state.content.thinking_open));
+                    return Ok(cancelled_stream_result(&mut state));
                 }
                 _ = tokio::time::sleep(Duration::from_millis(FINISH_REASON_GRACE_MS)) => break,
             }
@@ -90,7 +91,7 @@ pub(super) async fn stream_response(
             tokio::select! {
                 chunk = response.chunk() => chunk,
                 _ = wait_for_interrupt(app) => {
-                    return Ok(cancelled_stream_result(state.content.thinking_open));
+                    return Ok(cancelled_stream_result(&mut state));
                 }
                 _ = tokio::time::sleep(idle_remaining) => {
                     break;
@@ -203,12 +204,20 @@ fn clear_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
     Ok(())
 }
 
-fn immediate_cancel_result(app: &App, thinking_open: bool) -> Option<StreamResult> {
-    stream_interrupt_requested(app).then(|| cancelled_stream_result(thinking_open))
+fn immediate_cancel_result(
+    app: &App,
+    state: &mut StreamProcessingState,
+) -> Option<StreamResult> {
+    stream_interrupt_requested(app).then(|| cancelled_stream_result(state))
 }
 
-fn cancelled_stream_result(thinking_open: bool) -> StreamResult {
-    if thinking_open {
+/// 取消/中断时的 thinking 折叠收尾：折叠窗口若仍活跃，必须先擦掉当前窗口并落一个
+/// `╰─ done thinking` 收口，否则半截 `╭─ thinking` 窗口会被留在屏幕上，下一轮重试
+/// 的 fresh state 会在其下方再画一个新 header——累积成「重复 header + 大段空白」。
+fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
+    if state.render.thinking_fold.active {
+        let _ = finalize_thinking_fold(state);
+    } else if state.content.thinking_open {
         print!("\x1b[0m");
         let _ = io::stdout().flush();
     }
@@ -323,7 +332,7 @@ fn finalize_stream_response(
     }
 
     if take_stream_cancelled(app) {
-        return Ok(cancelled_stream_result(false));
+        return Ok(cancelled_stream_result(&mut state));
     }
 
     // AIOS: flush any pending LLM usage to kernel `/dev/llm` before returning.
@@ -364,7 +373,16 @@ fn finalize_stream_response(
     let outcome = if !tool_calls.is_empty() {
         StreamOutcome::ToolCall
     } else {
-        StreamOutcome::Completed
+        // 检测空响应：模型返回 200 OK 但没有文本、没有工具调用、没有推理内容。
+        // 这种情况通常是 provider 端的问题（如限流、模型异常），需要触发重试
+        // 而不是静默结束 turn。
+        let has_text = !state.content.assistant_text.trim().is_empty();
+        let has_reasoning = !state.content.reasoning_text.trim().is_empty();
+        if !has_text && !has_reasoning {
+            StreamOutcome::EmptyResponse
+        } else {
+            StreamOutcome::Completed
+        }
     };
 
     Ok(StreamResult {
@@ -814,7 +832,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     );
 
     if take_stream_cancelled(app) {
-        return Some(cancelled_stream_result(state.content.thinking_open));
+        return Some(cancelled_stream_result(state));
     }
 
     if state.framing.decode_error_count <= MAX_DECODE_ERRORS {
@@ -825,7 +843,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         )
         .await
         {
-            return Some(cancelled_stream_result(state.content.thinking_open));
+            return Some(cancelled_stream_result(state));
         }
         return None;
     }
@@ -1161,7 +1179,7 @@ fn commit_visible_content(
     // 当 thinking 折叠模式活跃且遇到 end_thinking_tag 时，做最终的折叠渲染
     if !state.content.thinking_open
         && state.render.thinking_fold.active
-        && content.contains(&markers.end_thinking_tag)
+        && is_standalone_stream_marker(&content, &markers.end_thinking_tag)
     {
         finalize_thinking_fold(state)?;
         // end_thinking_tag 内容只用于视觉分隔，不需要追加到 assistant_text
@@ -1184,8 +1202,8 @@ fn commit_visible_content(
         return Ok(());
     }
 
-    let text = if content.contains(&markers.end_thinking_tag) {
-        content.replace(&markers.end_thinking_tag, "")
+    let text = if is_standalone_stream_marker(&content, &markers.end_thinking_tag) {
+        String::new()
     } else {
         content
     };
@@ -1258,9 +1276,12 @@ fn maybe_write_plain_stream_text(
     write_stream_content_to_terminal(content, &mut state.render.markdown, false)
 }
 
-/// Thinking 内容的折叠渲染：所有内容都先正常输出（进入 scrollback），
-/// 超出限制后维护一个底部滚动窗口，只覆盖最近的 N 行区域。
-/// 早期内容保留在 terminal scrollback 中，用户可以向上滚动查看。
+fn is_standalone_stream_marker(content: &str, marker: &str) -> bool {
+    content.trim_matches('\n') == marker
+}
+
+/// Thinking 内容的折叠渲染：从第一行开始维护一个可重写窗口，
+/// 始终只在 terminal 中展示最近 N 行，超出部分折叠为一条摘要。
 fn write_thinking_content_folded(
     content: &str,
     state: &mut StreamProcessingState,
@@ -1275,12 +1296,15 @@ fn write_thinking_content_folded(
         return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
     }
 
-    // 检测 thinking 标题行（╭─ thinking）—— 直接输出不参与折叠计数
-    if content.contains(&markers.thinking_tag) {
-        fold.active = true;
-        fold.header_printed = true;
-        // 让 markdown renderer 处理标题行的样式
-        return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
+    // 控制行必须是独占 marker，本身不应与正文混写。
+    if is_standalone_stream_marker(content, &markers.thinking_tag) {
+        if !fold.active {
+            if content.starts_with('\n') || state.render.markdown.has_unfinished_line() {
+                write_stream_content_to_terminal("\n", &mut state.render.markdown, false)?;
+            }
+            fold.active = true;
+        }
+        return thinking_fold_redraw(fold);
     }
 
     if !fold.active {
@@ -1291,75 +1315,34 @@ fn write_thinking_content_folded(
     for ch in content.chars() {
         if ch == '\n' {
             // 一行完成
-            fold.total_lines += 1;
             let completed_line = std::mem::take(&mut fold.current_line);
+            fold.total_lines += 1;
             fold.recent_lines.push_back(completed_line);
             // 只保留最近 max_visible_lines 行
             while fold.recent_lines.len() > fold.max_visible_lines {
                 fold.recent_lines.pop_front();
             }
-
-            if fold.total_lines <= fold.max_visible_lines {
-                // 还没超限，正常输出换行
-                print!("{DIM}\n{RESET}");
-                // terminal_rows 记录从第一个数据行开始的已打印行数
-                fold.terminal_rows += 1;
-            } else {
-                // 超限：覆盖底部滚动窗口区域
-                thinking_fold_redraw(fold)?;
-            }
         } else {
             fold.current_line.push(ch);
-            // 实时流式输出字符（无论是否在折叠模式都输出，保证实时性）
-            print!("{DIM}{ch}{RESET}");
         }
     }
-    io::stdout().flush()?;
-    Ok(())
+
+    thinking_fold_redraw(fold)
 }
 
-/// 只覆盖底部的滚动窗口区域，不触碰 header 和早期已输出内容。
-/// 窗口内容 = 折叠指示器(1行) + 最近 N 行数据。
+/// 只覆盖 thinking header 下方的固定窗口区域。
 fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
     let mut out = io::stdout();
-
-    // 计算需要回退的行数：
-    // - 首次进入折叠模式：回退 max_visible_lines 行（之前正常输出的数据行 + 刚完成的行）
-    // - 后续折叠：回退 window_rows 行（上次重绘的窗口）+ 1 行（当前刚完成的流式行）
-    let erase_rows = if fold.window_rows == 0 {
-        // 首次折叠：cursor 在刚完成行的 \n 之后（该行的字符已经用 print! 输出了）
-        // 需要回退到最初打印的数据行位置
-        // terminal_rows = 之前正常 print!(\n) 的次数 = max_visible_lines
-        // 加上当前行（字符已输出但 \n 没输出）所以当前行算 1 行
-        fold.terminal_rows + 1
-    } else {
-        // 后续折叠：回退窗口高度 + 当前流式行（字符已输出，无 \n）
-        fold.window_rows + 1
-    };
-
-    if erase_rows > 0 {
-        // 光标上移，回到行首，清除到屏幕末尾
-        write!(out, "\x1b[{}A\r\x1b[0J", erase_rows)?;
+    if fold.window_rows > 0 {
+        write!(out, "\x1b[{}A\r\x1b[0J", fold.window_rows)?;
     }
 
-    let folded_count = fold.total_lines.saturating_sub(fold.max_visible_lines);
-
-    // 折叠指示器
-    write!(
-        out,
-        "{ACCENT_MUTED}  ··· {folded_count} lines folded ···\x1b[0m\n"
-    )?;
-
-    // 输出最近的 max_visible_lines 行（全部已完成）
-    for line in &fold.recent_lines {
-        write!(out, "{DIM}{line}{RESET}\n")?;
+    let (window, window_rows) = render_thinking_fold_window(fold);
+    if !window.is_empty() {
+        out.write_all(window.as_bytes())?;
+        out.flush()?;
     }
-
-    out.flush()?;
-
-    // 更新 window_rows = 折叠指示器(1) + 可见数据行数
-    fold.window_rows = 1 + fold.recent_lines.len();
-
+    fold.window_rows = window_rows;
     Ok(())
 }
 
@@ -1371,36 +1354,13 @@ fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::Result<()> {
     }
 
     let mut out = io::stdout();
-
-    // 擦除当前底部窗口区域（如果折叠已激活）
-    let erase_rows = if fold.window_rows > 0 {
-        // 有当前不完整行时多加 1
-        fold.window_rows + if fold.current_line.is_empty() { 0 } else { 1 }
-    } else {
-        // 还没进入过折叠模式（thinking 行数 <= max_visible_lines），不需要特殊处理
-        0
-    };
-
-    if erase_rows > 0 {
-        write!(out, "\x1b[{}A\r\x1b[0J", erase_rows)?;
+    if fold.window_rows > 0 {
+        write!(out, "\x1b[{}A\r\x1b[0J", fold.window_rows)?;
     }
 
-    // 确保 "done thinking" 从新行开始：如果有未完成的当前行或之前有输出过内容
-    if !fold.current_line.is_empty() || (fold.total_lines > 0 && erase_rows == 0) {
-        write!(out, "\n")?;
-    }
-
-    if fold.total_lines > fold.max_visible_lines {
-        let folded_count = fold.total_lines.saturating_sub(fold.max_visible_lines);
-        write!(
-            out,
-            "{ACCENT_MUTED}  ··· {folded_count} lines folded ···\x1b[0m\n"
-        )?;
-
-        // 输出最近可见行
-        for line in &fold.recent_lines {
-            write!(out, "{DIM}{line}{RESET}\n")?;
-        }
+    let (window, _) = render_thinking_fold_window(fold);
+    if !window.is_empty() {
+        out.write_all(window.as_bytes())?;
     }
 
     // "done thinking" 结尾标记
@@ -1413,6 +1373,72 @@ fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::Result<()> {
     // 重置折叠状态
     fold.reset();
     Ok(())
+}
+
+fn thinking_fold_hidden_count(fold: &super::state::ThinkingFoldState) -> usize {
+    let current_line = usize::from(!fold.current_line.is_empty());
+    fold.total_lines
+        .saturating_add(current_line)
+        .saturating_sub(fold.max_visible_lines)
+}
+
+fn thinking_fold_visible_lines(
+    fold: &super::state::ThinkingFoldState,
+) -> Vec<&str> {
+    let current_line = usize::from(!fold.current_line.is_empty());
+    let visible_completed = fold.max_visible_lines.saturating_sub(current_line);
+    let completed_skip = fold.recent_lines.len().saturating_sub(visible_completed);
+    let mut visible = fold
+        .recent_lines
+        .iter()
+        .skip(completed_skip)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if current_line > 0 {
+        visible.push(fold.current_line.as_str());
+    }
+    visible
+}
+
+fn render_thinking_fold_window(
+    fold: &super::state::ThinkingFoldState,
+) -> (String, usize) {
+    let hidden_count = thinking_fold_hidden_count(fold);
+    let visible_lines = thinking_fold_visible_lines(fold);
+    if !fold.active && hidden_count == 0 && visible_lines.is_empty() {
+        return (String::new(), 0);
+    }
+
+    let mut out = String::new();
+    // 每条可见行都被 clamp 成「最多占一个物理行」，因此窗口物理行数恒等于逻辑行数。
+    // cursor-up 擦除据此精确，不再依赖对自动折行的预测（tab/CJK/超长行/resize 免疫）。
+    let mut rows = 0;
+
+    if fold.active {
+        let header = format!("{ACCENT_RULE}╭─\x1b[0m {ACCENT_MUTED}thinking\x1b[0m");
+        rows += 1;
+        out.push_str(&header);
+        out.push('\n');
+    }
+
+    if hidden_count > 0 {
+        let marker = clamp_line_to_terminal_row(&format!("  ··· {hidden_count} lines folded ···"));
+        rows += 1;
+        out.push_str(ACCENT_MUTED);
+        out.push_str(&marker);
+        out.push_str("\x1b[0m\n");
+    }
+
+    for line in visible_lines {
+        let clamped = clamp_line_to_terminal_row(line);
+        rows += 1;
+        out.push_str(DIM);
+        out.push_str(&clamped);
+        out.push_str(RESET);
+        out.push('\n');
+    }
+
+    (out, rows)
 }
 
 fn maybe_write_stream_content(
@@ -1928,6 +1954,181 @@ mod tests {
         assert_eq!(state.content.assistant_text, "final answer");
         assert!(!state.content.thinking_open);
         assert!(!state.render.thinking_fold.active);
+    }
+
+    #[test]
+    fn thinking_fold_window_counts_current_line_inside_visible_budget() {
+        // 锁定并置宽 COLUMNS：本用例断言正文/标记原样存在，须避免与 COLUMNS=12
+        // 的折行用例并发时读到被泄漏的窄列宽而触发 clamp 截断。
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("COLUMNS", "200");
+        }
+
+        let mut state = StreamProcessingState::new();
+        let fold = &mut state.render.thinking_fold;
+        fold.max_visible_lines = 3;
+        fold.total_lines = 3;
+        fold.recent_lines.push_back("line-1".to_string());
+        fold.recent_lines.push_back("line-2".to_string());
+        fold.recent_lines.push_back("line-3".to_string());
+        fold.current_line = "line-4".to_string();
+
+        assert_eq!(thinking_fold_hidden_count(fold), 1);
+        assert_eq!(
+            thinking_fold_visible_lines(fold),
+            vec!["line-2", "line-3", "line-4"]
+        );
+
+        let (window, _) = render_thinking_fold_window(fold);
+        assert_eq!(window.matches("lines folded").count(), 1);
+        assert!(!window.contains("line-1"));
+        assert!(window.contains("line-2"));
+        assert!(window.contains("line-3"));
+        assert!(window.contains("line-4"));
+
+        unsafe {
+            std::env::remove_var("COLUMNS");
+        }
+    }
+
+    #[test]
+    fn thinking_fold_window_rows_follow_wrapped_terminal_height() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("COLUMNS", "12");
+        }
+
+        let mut state = StreamProcessingState::new();
+        let fold = &mut state.render.thinking_fold;
+        fold.max_visible_lines = 2;
+        fold.total_lines = 2;
+        fold.recent_lines.push_back("12345678901234567890".to_string());
+        fold.recent_lines.push_back("abcdef".to_string());
+        fold.current_line = "ghijklmnopqrst".to_string();
+
+        let (window, rows) = render_thinking_fold_window(fold);
+
+        // 每条可见行被 clamp 成单物理行，窗口物理行数恒等于逻辑行数：
+        // 1 折叠标记 + 2 可见行 = 3。
+        assert_eq!(rows, 3);
+        // 每条渲染行都不超过终端列宽（12），确保 cursor-up 擦除精确。
+        for line in window.lines() {
+            let visible = crate::ai::stream::extract::strip_ansi_codes(line);
+            assert!(
+                unicode_width::UnicodeWidthStr::width(visible.as_str()) <= 12,
+                "line exceeds terminal width: {visible:?}"
+            );
+        }
+        // 未溢出的短行原样保留；溢出的超长行被截断为省略号结尾。
+        assert!(window.contains("abcdef"));
+        assert!(window.contains('…'));
+
+        unsafe {
+            std::env::remove_var("COLUMNS");
+        }
+    }
+
+    #[test]
+    fn thinking_fold_window_without_hidden_lines_has_no_fold_marker() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("COLUMNS", "200");
+        }
+
+        let mut state = StreamProcessingState::new();
+        let fold = &mut state.render.thinking_fold;
+        fold.max_visible_lines = 4;
+        fold.total_lines = 2;
+        fold.recent_lines.push_back("line-1".to_string());
+        fold.recent_lines.push_back("line-2".to_string());
+        fold.current_line = "line-3".to_string();
+
+        let (window, rows) = render_thinking_fold_window(fold);
+
+        // 无隐藏行、无 active header：窗口物理行数 == 可见逻辑行数（3）。
+        assert!(!window.contains("lines folded"));
+        assert!(window.contains("line-1"));
+        assert!(window.contains("line-2"));
+        assert!(window.contains("line-3"));
+        assert_eq!(rows, 3);
+
+        unsafe {
+            std::env::remove_var("COLUMNS");
+        }
+    }
+
+    #[test]
+    fn thinking_fold_active_window_includes_header_in_row_budget() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("COLUMNS", "200");
+        }
+
+        let mut state = StreamProcessingState::new();
+        let fold = &mut state.render.thinking_fold;
+        fold.active = true;
+        fold.max_visible_lines = 2;
+        fold.total_lines = 2;
+        fold.recent_lines.push_back("line-1".to_string());
+        fold.current_line = "line-2".to_string();
+
+        let (window, rows) = render_thinking_fold_window(fold);
+
+        // active header(1) + 折叠标记(1) + 可见行(1) + current(1) = 4 物理行。
+        assert!(window.contains("thinking"));
+        assert!(window.contains("lines folded"));
+        assert!(window.contains("line-1"));
+        assert!(window.contains("line-2"));
+        assert_eq!(rows, 4);
+
+        unsafe {
+            std::env::remove_var("COLUMNS");
+        }
+    }
+
+    #[test]
+    fn cancelled_stream_result_finalizes_active_thinking_fold() {
+        // 取消时若折叠窗口仍活跃，必须收口（finalize→reset），避免半截 `╭─ thinking`
+        // 残留、下一轮重试在其下叠新 header（重复 header + 大段空白的跨轮根因）。
+        let mut state = StreamProcessingState::new();
+        {
+            let fold = &mut state.render.thinking_fold;
+            fold.active = true;
+            fold.max_visible_lines = 2;
+            fold.total_lines = 1;
+            fold.recent_lines.push_back("partial".to_string());
+            fold.window_rows = 2;
+        }
+
+        let result = cancelled_stream_result(&mut state);
+
+        assert!(matches!(result.outcome, StreamOutcome::Cancelled));
+        assert!(result.skip_response_drain);
+        // finalize 后折叠状态被 reset：不再 active，窗口行数归零，无孤儿窗口残留。
+        assert!(!state.render.thinking_fold.active);
+        assert_eq!(state.render.thinking_fold.window_rows, 0);
+        assert!(state.render.thinking_fold.recent_lines.is_empty());
+    }
+
+    #[test]
+    fn standalone_stream_marker_requires_exact_control_line() {
+        assert!(is_standalone_stream_marker(
+            "\n╭─ thinking\n",
+            "╭─ thinking"
+        ));
+        assert!(is_standalone_stream_marker(
+            "\n╰─ done thinking\n",
+            "╰─ done thinking"
+        ));
+        assert!(!is_standalone_stream_marker(
+            "reasoning mentions ╭─ thinking literally",
+            "╭─ thinking"
+        ));
+        assert!(!is_standalone_stream_marker(
+            "prefix\n╰─ done thinking\nsuffix",
+            "╰─ done thinking"
+        ));
     }
 
     #[test]

@@ -40,7 +40,10 @@ use crate::ai::{
     cli::{self},
     config,
     config_schema::AiConfig,
-    history::{SessionStore, SuspendedSessionEntry, SuspendedSessionStore},
+    history::{
+        SessionStore, SuspendedSessionEntry, SuspendedSessionStore,
+        format_suspended_timestamp_label,
+    },
     mcp::{McpClient, SharedMcpClient},
     models,
     prompt::PromptEditor,
@@ -138,16 +141,6 @@ struct SuspendedSessionPreview {
     suspended_label: String,
 }
 
-fn format_suspended_timestamp_label(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return "-".to_string();
-    }
-    chrono::DateTime::parse_from_rfc3339(trimmed)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|_| trimmed.to_string())
-}
-
 fn build_suspended_session_previews(
     entries: Vec<SuspendedSessionEntry>,
     persona_store: &crate::ai::persona::PersonaStore,
@@ -198,7 +191,10 @@ fn prompt_select_suspended_session(
         return Ok(Some(0));
     }
 
-    println!("[resume] 当前 terminal 有 {} 个挂起 session：", previews.len());
+    println!(
+        "[resume] 当前 terminal 有 {} 个挂起 session：",
+        previews.len()
+    );
     for (index, preview) in previews.iter().enumerate() {
         println!(
             "  {}. {}  persona={}  modified={}  suspended={}",
@@ -208,7 +204,11 @@ fn prompt_select_suspended_session(
             preview.modified_label.as_deref().unwrap_or("-"),
             preview.suspended_label
         );
-        if let Some(summary) = preview.summary.as_deref().filter(|summary| !summary.is_empty()) {
+        if let Some(summary) = preview
+            .summary
+            .as_deref()
+            .filter(|summary| !summary.is_empty())
+        {
             println!("     {summary}");
         }
     }
@@ -354,9 +354,10 @@ where
     match suspended_store.list_current_terminal() {
         Ok(entries) if entries.is_empty() => {
             if cli.resume {
-                choice.startup_notice =
-                    Some("[resume] 当前 terminal 没有可恢复的挂起 session，已创建新 session。"
-                        .to_string());
+                choice.startup_notice = Some(
+                    "[resume] 当前 terminal 没有可恢复的挂起 session，已创建新 session。"
+                        .to_string(),
+                );
             }
         }
         Ok(entries) => {
@@ -376,13 +377,13 @@ where
             let selected = previews
                 .get(selected_index)
                 .ok_or_else(|| format!("invalid suspended session selection: {selected_index}"))?;
-            let Some(entry) = suspended_store.take_selected_current_terminal(&selected.entry)? else {
+            let Some(entry) = suspended_store.take_selected_current_terminal(&selected.entry)?
+            else {
                 if cli.resume {
                     return Err("选中的挂起 session 已不存在，请重试".into());
                 }
-                choice.startup_notice = Some(
-                    "[resume] 选中的挂起 session 已不存在，已创建新 session。".to_string(),
-                );
+                choice.startup_notice =
+                    Some("[resume] 选中的挂起 session 已不存在，已创建新 session。".to_string());
                 return Ok(choice);
             };
             choice.history_file = entry.history_file.clone();
@@ -392,8 +393,7 @@ where
             let mut persona_fallback = false;
             match persona_store.list_personas() {
                 Ok(personas) => {
-                    if let Some(persona) = personas.into_iter().find(|p| p.id == entry.persona_id)
-                    {
+                    if let Some(persona) = personas.into_iter().find(|p| p.id == entry.persona_id) {
                         choice.active_persona = persona;
                     } else {
                         persona_fallback = true;
@@ -3672,8 +3672,8 @@ mod tests {
         has_pending_foreground_process, maybe_auto_route_agent, one_shot_cli_mode,
         read_recent_history, reset_scheduler_test_state, resolve_startup_session_choice,
         resolve_startup_session_choice_with_selector, should_preload_mcp,
-        should_publish_subagent_task_result,
-        should_resume_suspended_terminal_session, update_dispatch_meta,
+        should_publish_subagent_task_result, should_resume_suspended_terminal_session,
+        update_dispatch_meta,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
@@ -3683,8 +3683,8 @@ mod tests {
     use crate::ai::types::{AgentContext, App, AppConfig};
     use aios_kernel::kernel::{EventId, ProcessState, WaitPolicy, WaitReason};
     use aios_kernel::primitives::ResourceLimit;
-    use std::{fs, path::PathBuf};
     use std::sync::{Arc, atomic::AtomicBool};
+    use std::{fs, path::PathBuf};
 
     #[test]
     fn background_dispatch_limits_scale_with_backlog() {
@@ -3951,7 +3951,12 @@ mod tests {
             .create_persona("Reviewer", None, "You are a reviewer.")
             .unwrap();
         SuspendedSessionStore::new()
-            .save_for_terminal_key("terminal:term-456", "sess-123", &suspended_history, &reviewer.id)
+            .save_for_terminal_key(
+                "terminal:term-456",
+                "sess-123",
+                &suspended_history,
+                &reviewer.id,
+            )
             .unwrap();
 
         let choice = resolve_startup_session_choice(
@@ -3997,10 +4002,14 @@ mod tests {
 
         let persona_store =
             crate::ai::persona::PersonaStore::for_tests_with_path(root.join("personas.json"));
-        let suspended_history =
-            root.join("history.persona-default.sqlite");
+        let suspended_history = root.join("history.persona-default.sqlite");
         SuspendedSessionStore::new()
-            .save_for_terminal_key("terminal:term-789", "sess-keep", &suspended_history, "default")
+            .save_for_terminal_key(
+                "terminal:term-789",
+                "sess-keep",
+                &suspended_history,
+                "default",
+            )
             .unwrap();
 
         let mut cli = ParsedCli::default();
@@ -4052,7 +4061,12 @@ mod tests {
             crate::ai::persona::PersonaStore::for_tests_with_path(root.join("personas.json"));
         let suspended_history = root.join("history.persona-default.sqlite");
         SuspendedSessionStore::new()
-            .save_for_terminal_key("terminal:term-new", "sess-keep", &suspended_history, "default")
+            .save_for_terminal_key(
+                "terminal:term-new",
+                "sess-keep",
+                &suspended_history,
+                "default",
+            )
             .unwrap();
 
         let mut cli = ParsedCli::default();

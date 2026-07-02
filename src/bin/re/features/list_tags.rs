@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+
 use colored::Colorize;
 
 use crate::features::core::*;
@@ -81,4 +83,24 @@ pub fn list_tags_feature(
         }
         println!("{}{}", " ".repeat(terminal_indent), changed.join(delimiter));
     }
+}
+
+/// 为 shell 自动补全输出匹配前缀的 tag 名称（每行一个）。
+/// 被 `--complete-tags <prefix>` 调用。
+pub fn complete_tags_feature(db: &MemoBackend, prefix: &str) {
+    let prefix = prefix.trim();
+    let tags = db
+        .list_tags(
+            if prefix.is_empty() { None } else { Some(prefix) },
+            None,
+            i64::MAX,
+        )
+        .unwrap_or_default();
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    for tag in &tags {
+        let _ = writeln!(handle, "{}", tag.name);
+    }
+    // 如果前缀非空且有匹配结果，打印第二遍（不带换行），
+    // 让 shell 的 compgen 知道应该直接填充而不是等待更多字符。
 }

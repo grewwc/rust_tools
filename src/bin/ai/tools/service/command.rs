@@ -1361,10 +1361,7 @@ mod tests {
         // 修复前：仅验 `echo`，整体放行。
         // 修复后：第二段会命中 `rm` 默认拦截。
         let err = validate("echo ok && rm -rf /").unwrap_err();
-        assert!(
-            err.contains("rm"),
-            "expected rm blocked, got: {err}"
-        );
+        assert!(err.contains("rm"), "expected rm blocked, got: {err}");
     }
 
     #[test]

@@ -68,7 +68,19 @@ pub fn register_all(parser: &mut terminalw::Parser, ctx: Arc<ReContext>) {
     register_list_by_tag_name(parser, Arc::clone(&ctx));
     register_pull(parser, Arc::clone(&ctx));
     register_push_empty(parser, Arc::clone(&ctx));
+    register_complete_tags(parser, Arc::clone(&ctx));
     register_default(parser, ctx);
+}
+
+fn register_complete_tags(parser: &mut terminalw::Parser, ctx: Arc<ReContext>) {
+    parser
+        .on({
+            let ctx = Arc::clone(&ctx);
+            move |_| ctx.cli.complete_tags.is_some()
+        })
+        .do_action(move || {
+            list_tags::complete_tags_feature(ctx.db.as_ref(), ctx.cli.complete_tags.as_deref().unwrap_or(""));
+        });
 }
 
 fn register_nf(parser: &mut terminalw::Parser, ctx: Arc<ReContext>) {

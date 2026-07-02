@@ -90,4 +90,23 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&chunks), "hello\nworld");
         assert_eq!(result.unwrap(), "hello\nworld");
     }
+
+    #[test]
+    fn test_execute_command_streaming_registry_dispatch_matches_final_output() {
+        let args = serde_json::json!({
+            "command": "printf 'hello\\nworld'"
+        });
+        let mut streamed = Vec::new();
+        let mut capture = |chunk: &[u8]| streamed.extend_from_slice(chunk);
+        let result = crate::ai::tools::common::execute_tool_call_with_args_streaming(
+            "call_execute_command_streaming",
+            "execute_command",
+            &args,
+            &mut capture,
+        )
+        .expect("registry streaming dispatch should succeed");
+
+        assert_eq!(String::from_utf8_lossy(&streamed), "hello\nworld");
+        assert_eq!(result.content, "hello\nworld");
+    }
 }

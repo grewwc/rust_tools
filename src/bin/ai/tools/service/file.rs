@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+use crate::ai::tools::common::ToolStreamWriter;
 use crate::ai::tools::storage::file_store::FileStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +85,12 @@ fn resolve_file_path_arg(args: &Value) -> Result<&str, String> {
         .or_else(|| args.get("path"))
         .and_then(Value::as_str)
         .ok_or_else(|| "Missing file_path".to_string())
+}
+
+fn emit_stream_line(on_chunk: &mut ToolStreamWriter<'_>, line: &str) {
+    let mut rendered = line.to_string();
+    rendered.push('\n');
+    on_chunk(rendered.as_bytes());
 }
 
 pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
@@ -203,6 +210,32 @@ pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
     Ok(format!("Successfully wrote to {}", store.path().display()))
 }
 
+pub(crate) fn execute_write_file_streaming(
+    args: &Value,
+    on_chunk: &mut ToolStreamWriter<'_>,
+) -> Result<String, String> {
+    let file_path = resolve_file_path_arg(args)?;
+    let content = args["content"].as_str().ok_or("Missing content")?;
+    let store = FileStore::new(PathBuf::from(file_path));
+    let target = store.path().display().to_string();
+
+    emit_stream_line(on_chunk, &format!("target: {target}"));
+    emit_stream_line(on_chunk, "snapshotting previous file state");
+    super::super::undo_tools::snapshot_file_before_write(file_path);
+
+    emit_stream_line(on_chunk, "validating write access");
+    store.validate_write_access().map_err(|e| e.to_string())?;
+
+    emit_stream_line(on_chunk, &format!("writing {} byte(s)", content.len()));
+    store.write_all(content).map_err(|e| e.to_string())?;
+
+    super::super::undo_tools::commit_change_set(&format!("write_file: {}", file_path));
+
+    let result = format!("Successfully wrote to {}", store.path().display());
+    emit_stream_line(on_chunk, &result);
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +275,48 @@ mod tests {
             assert!(output.contains("Hello, integration test!"));
             assert!(output.contains("Line 2"));
             assert!(output.contains("Line 3"));
+        });
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_write_file_streaming_dispatch_emits_progress() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("streaming");
+        let content = "Hello, streaming write!";
+        let base = path.parent().unwrap().to_path_buf();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base, || {
+            let args = serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "content": content
+            });
+            let mut streamed = Vec::new();
+            let mut capture = |chunk: &[u8]| streamed.extend_from_slice(chunk);
+            let result = crate::ai::tools::common::execute_tool_call_with_args_streaming(
+                "call_write_file_streaming",
+                "write_file",
+                &args,
+                &mut capture,
+            )
+            .expect("streaming write_file should succeed");
+
+            let streamed = String::from_utf8(streamed).expect("streamed output must be utf-8");
+            assert!(streamed.contains("target:"), "streamed: {streamed}");
+            assert!(
+                streamed.contains("validating write access"),
+                "streamed: {streamed}"
+            );
+            assert!(streamed.contains("writing "), "streamed: {streamed}");
+            assert!(
+                streamed.contains(&format!("Successfully wrote to {}", path.display())),
+                "streamed: {streamed}"
+            );
+            assert_eq!(
+                result.content,
+                format!("Successfully wrote to {}", path.display())
+            );
         });
 
         let _ = fs::remove_file(&path);

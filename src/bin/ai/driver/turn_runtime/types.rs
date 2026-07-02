@@ -29,6 +29,7 @@ pub(super) struct ToolCallExecution {
 pub(super) enum IterationExecution {
     Exit(TurnOutcome),
     RequestFailed(String),
+    EmptyResponse,
     FinalResponse(crate::ai::types::StreamResult),
     ToolCall(ToolCallExecution),
 }

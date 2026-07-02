@@ -8,6 +8,7 @@ mod state;
 
 pub(in crate::ai) use normalize::try_parse_stream_chunk_loose;
 pub(super) use render::markdown::MarkdownStreamRenderer;
+pub(in crate::ai) use render::markdown::clamp_line_to_terminal_row_with_reserve;
 pub(in crate::ai) use state::ParsedStreamPayload;
 
 use crate::ai::{

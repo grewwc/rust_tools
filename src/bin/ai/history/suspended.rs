@@ -80,6 +80,16 @@ impl SuspendedSessionStore {
         self.list_for_terminal_key(&key)
     }
 
+    pub(in crate::ai) fn clear_current_terminal(&self) -> io::Result<usize> {
+        let key = current_terminal_key().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "当前 terminal 不可识别，无法清空挂起会话",
+            )
+        })?;
+        self.clear_for_terminal_key(&key)
+    }
+
     pub(in crate::ai) fn save_for_terminal_key(
         &self,
         terminal_key: &str,
@@ -122,9 +132,7 @@ impl SuspendedSessionStore {
             persona_id: persona_id.to_string(),
             suspended_at: Local::now().to_rfc3339(),
         };
-        let mut entries = self
-            .read_entries(terminal_key)?
-            .unwrap_or_default();
+        let mut entries = self.read_entries(terminal_key)?.unwrap_or_default();
         entries.retain(|existing| !same_binding(existing, &entry));
         entries.push(entry.clone());
         self.write_entries(terminal_key, &entries)?;
@@ -173,6 +181,13 @@ impl SuspendedSessionStore {
         Ok(entries)
     }
 
+    pub(in crate::ai) fn clear_for_terminal_key(&self, terminal_key: &str) -> io::Result<usize> {
+        let entries = self.read_entries(terminal_key)?.unwrap_or_default();
+        let cleared = entries.len();
+        self.write_entries(terminal_key, &[])?;
+        Ok(cleared)
+    }
+
     pub(in crate::ai) fn take_selected_current_terminal(
         &self,
         selected: &SuspendedSessionEntry,
@@ -194,7 +209,10 @@ impl SuspendedSessionStore {
         let Some(mut entries) = self.read_entries(terminal_key)? else {
             return Ok(None);
         };
-        let Some(index) = entries.iter().rposition(|entry| same_binding(entry, selected)) else {
+        let Some(index) = entries
+            .iter()
+            .rposition(|entry| same_binding(entry, selected))
+        else {
             return Ok(None);
         };
         let entry = entries.remove(index);
@@ -220,7 +238,10 @@ impl SuspendedSessionStore {
             SuspendedSessionFile::Single(entry) => vec![entry],
             SuspendedSessionFile::Many(entries) => entries,
         };
-        if entries.iter().any(|entry| entry.terminal_key != terminal_key) {
+        if entries
+            .iter()
+            .any(|entry| entry.terminal_key != terminal_key)
+        {
             let _ = fs::remove_file(&path);
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -366,6 +387,20 @@ fn same_binding(left: &SuspendedSessionEntry, right: &SuspendedSessionEntry) -> 
         && left.persona_id == right.persona_id
 }
 
+pub(in crate::ai) fn format_suspended_timestamp_label(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "-".to_string();
+    }
+    chrono::DateTime::parse_from_rfc3339(trimmed)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| trimmed.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,10 +426,8 @@ mod tests {
 
     #[test]
     fn store_round_trips_entry_by_terminal_key() {
-        let root = std::env::temp_dir().join(format!(
-            "rust-tools-suspended-session-{}",
-            Uuid::new_v4()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("rust-tools-suspended-session-{}", Uuid::new_v4()));
         let store = SuspendedSessionStore::for_tests_with_root(root.clone());
         let history = root.join("history.sqlite");
         let entry = store
@@ -458,6 +491,34 @@ mod tests {
             .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].session_id, "sess-2");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn store_clear_for_terminal_key_removes_all_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "rust-tools-suspended-session-clear-{}",
+            Uuid::new_v4()
+        ));
+        let store = SuspendedSessionStore::for_tests_with_root(root.clone());
+        let history = root.join("history.sqlite");
+        let other = root.join("other.sqlite");
+        store
+            .save_for_terminal_key("tty:/dev/ttys003", "sess-1", &history, "default")
+            .unwrap();
+        store
+            .save_for_terminal_key("tty:/dev/ttys003", "sess-2", &other, "reviewer")
+            .unwrap();
+
+        let cleared = store.clear_for_terminal_key("tty:/dev/ttys003").unwrap();
+        assert_eq!(cleared, 2);
+        assert!(
+            store
+                .peek_entries_for_terminal_key("tty:/dev/ttys003")
+                .unwrap()
+                .is_empty()
+        );
 
         let _ = fs::remove_dir_all(root);
     }

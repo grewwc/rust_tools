@@ -117,12 +117,8 @@ pub(super) struct ThinkingFoldState {
     pub(super) current_line: String,
     /// 总完成行数（含已被折叠的）
     pub(super) total_lines: usize,
-    /// 正常输出阶段（折叠前）已打印的数据行数（\n 次数）
-    pub(super) terminal_rows: usize,
-    /// 折叠模式下滚动窗口占用的行数（折叠指示器 + 可见数据行）
+    /// 当前折叠窗口占用的 terminal 物理行数
     pub(super) window_rows: usize,
-    /// 是否已输出了 "╭─ thinking" 标题行
-    pub(super) header_printed: bool,
     /// 是否处于活跃的 thinking 折叠模式
     pub(super) active: bool,
 }
@@ -134,9 +130,7 @@ impl ThinkingFoldState {
             recent_lines: VecDeque::new(),
             current_line: String::new(),
             total_lines: 0,
-            terminal_rows: 0,
             window_rows: 0,
-            header_printed: false,
             active: false,
         }
     }
@@ -145,9 +139,7 @@ impl ThinkingFoldState {
         self.recent_lines.clear();
         self.current_line.clear();
         self.total_lines = 0;
-        self.terminal_rows = 0;
         self.window_rows = 0;
-        self.header_printed = false;
         self.active = false;
     }
 }

@@ -66,6 +66,7 @@ pub struct Cli {
     pub it: bool,
     pub ti: bool,
     pub args: Vec<String>,
+    pub complete_tags: Option<String>,
 }
 
 #[derive(Clone)]
@@ -162,7 +163,7 @@ pub fn normalize_legacy_single_dash_long_args(
     out
 }
 
-fn build_re_parser() -> terminalw::Parser {
+pub(crate) fn build_re_parser() -> terminalw::Parser {
     let mut p = terminalw::Parser::new();
 
     p.add_string(
@@ -249,6 +250,7 @@ fn build_re_parser() -> terminalw::Parser {
     p.add_bool("help", false, "print help information");
     p.add_bool("h", false, "print help information");
     p.add_bool("version", false, "print version information");
+    p.add_string("complete-tags", "", "generate tag completions (internal)");
     p
 }
 
@@ -349,6 +351,10 @@ pub fn parse_cli_and_parser(argv: Vec<String>) -> (terminalw::Parser, Cli) {
         it: p.contains_flag_strict("it"),
         ti: p.contains_flag_strict("ti"),
         args: p.positional.to_vec(),
+        complete_tags: p
+            .contains_flag_strict("complete-tags")
+            .then(|| p.flag_value_with_default("complete-tags", ""))
+            .filter(|s| !s.is_empty()),
     };
 
     maybe_parse_positional_limit(&mut cli);

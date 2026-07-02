@@ -41,12 +41,17 @@ pub fn print_interactive_help() {
     println!("    /sessions current         show current session info");
     println!("    /sessions new             create and switch to new session");
     println!("    /sessions use <id>        switch to specified session");
-    println!("    /sessions suspend         suspend current session and return to shell");
+    println!("    /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)");
+    println!("    /sessions bound           list suspended sessions bound to current terminal");
     println!("    /sessions delete <id>     delete specified session");
+    println!("    /sessions clear-bound     clear suspended sessions bound to current terminal");
+    println!("    /sessions clear-history   clear current session history (keeps session alive)");
     println!("    /sessions clear-all       delete all sessions");
     println!("    /sessions export <id> [output.md]       export session to Markdown");
     println!("    /sessions export-current [output.md]    export current session to Markdown");
     println!("    /sessions export-last [output.md]       export latest session to Markdown");
+    println!("    /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
+    println!("    /sessions branch <keep_messages> [src=<id>] [as=<id>]");
     println!();
     println!("  Notes:");
     println!("    - Commands support both / and : prefix (e.g., /help or :help)");

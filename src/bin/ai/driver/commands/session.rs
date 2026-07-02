@@ -1,11 +1,41 @@
+use aios_kernel::primitives::{DaemonKind, DaemonState};
 use uuid::Uuid;
 
 use crate::ai::{
-    history::{SessionStore, SuspendedSessionStore},
+    history::{
+        SessionStore, SuspendedSessionEntry, SuspendedSessionStore,
+        format_suspended_timestamp_label,
+    },
     types::App,
 };
 
-fn clear_session_local_runtime_state(app: &mut App) {
+pub(in crate::ai) fn cancel_current_process_reflection_daemons(app: &App) -> usize {
+    let Ok(mut os) = app.os.lock() else {
+        return 0;
+    };
+    let current_pid = os.current_process_id();
+    let handles = os
+        .list_daemons()
+        .into_iter()
+        .filter(|entry| {
+            entry.parent_pid == current_pid
+                && entry.kind == DaemonKind::Reflection
+                && entry.state == DaemonState::Running
+        })
+        .map(|entry| entry.handle)
+        .collect::<Vec<_>>();
+
+    let mut cancelled = 0usize;
+    for handle in handles {
+        if os.cancel_daemon(handle) {
+            cancelled += 1;
+        }
+    }
+    cancelled
+}
+
+pub(in crate::ai) fn clear_session_local_runtime_state(app: &mut App) {
+    cancel_current_process_reflection_daemons(app);
     crate::ai::tools::enable_tools::clear_explicitly_enabled_tools();
     if let Some(ctx) = app.agent_context.as_mut() {
         ctx.tools.clear();
@@ -14,6 +44,47 @@ fn clear_session_local_runtime_state(app: &mut App) {
     app.forced_skill = None;
     app.forced_question = None;
     app.last_skill_bias = None;
+}
+
+fn suspended_session_summary(entry: &SuspendedSessionEntry) -> Option<String> {
+    SessionStore::new(entry.history_file.as_path())
+        .list_sessions()
+        .ok()?
+        .into_iter()
+        .find(|session| session.id == entry.session_id)
+        .and_then(|session| session.summary)
+        .filter(|summary| !summary.is_empty())
+}
+
+fn print_current_terminal_suspended_sessions(entries: &[SuspendedSessionEntry]) {
+    if entries.is_empty() {
+        println!("No suspended sessions bound to the current terminal.");
+        return;
+    }
+
+    println!(
+        "Current terminal has {} suspended session(s):",
+        entries.len()
+    );
+    let max_id_len = entries
+        .iter()
+        .map(|entry| entry.session_id.len())
+        .max()
+        .unwrap_or(36);
+    for (index, entry) in entries.iter().enumerate() {
+        println!(
+            "  {}. {:<width$}  persona={}  suspended={}",
+            index + 1,
+            entry.session_id,
+            entry.persona_id,
+            format_suspended_timestamp_label(&entry.suspended_at),
+            width = max_id_len
+        );
+        if let Some(summary) = suspended_session_summary(entry) {
+            println!("     {summary}");
+        }
+        println!("     history: {}", entry.history_file.display());
+    }
 }
 
 pub fn try_handle_session_command(
@@ -35,10 +106,15 @@ pub fn try_handle_session_command(
     let Some(cmd) = parts.next() else {
         return Ok(false);
     };
-    if cmd != "sessions" && cmd != "session" && cmd != "ss" {
+    let top_level_suspend = matches!(cmd, "suspend" | "bg" | "detach" | "susp");
+    if cmd != "sessions" && cmd != "session" && cmd != "ss" && !top_level_suspend {
         return Ok(false);
     }
-    let action = parts.next().unwrap_or("list");
+    let action = if top_level_suspend {
+        "suspend"
+    } else {
+        parts.next().unwrap_or("list")
+    };
     let store = SessionStore::new(app.config.history_file.as_path());
     let _ = store.ensure_root_dir();
 
@@ -51,8 +127,14 @@ pub fn try_handle_session_command(
             println!("  /sessions current         show current session info");
             println!("  /sessions new             create and switch to new session");
             println!("  /sessions use <id>        switch to specified session");
-            println!("  /sessions suspend         suspend current session and return to shell");
+            println!("  /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)");
+            println!(
+                "  /sessions bound           list suspended sessions bound to current terminal"
+            );
             println!("  /sessions delete <id>     delete specified session");
+            println!(
+                "  /sessions clear-bound     clear suspended sessions bound to current terminal"
+            );
             println!(
                 "  /sessions clear-history   clear current session history (keeps session alive)"
             );
@@ -161,6 +243,12 @@ pub fn try_handle_session_command(
                 }
             }
         }
+        "bound" | "bindings" | "suspended" => {
+            match SuspendedSessionStore::new().list_current_terminal() {
+                Ok(entries) => print_current_terminal_suspended_sessions(&entries),
+                Err(err) => eprintln!("[sessions bound] {}", err),
+            }
+        }
         "delete" | "del" | "rm" => {
             let Some(id) = parts.next() else {
                 println!("missing session id. try: /sessions delete <id>");
@@ -185,6 +273,39 @@ pub fn try_handle_session_command(
                 }
             } else {
                 println!("Session not found: {}", id);
+            }
+        }
+        "clear-bound" | "clear_bound" | "clear-suspended" | "clear_suspended" => {
+            let suspended_store = SuspendedSessionStore::new();
+            let entries = match suspended_store.list_current_terminal() {
+                Ok(entries) => entries,
+                Err(err) => {
+                    eprintln!("[sessions clear-bound] {}", err);
+                    return Ok(true);
+                }
+            };
+            if entries.is_empty() {
+                println!("No suspended sessions bound to the current terminal.");
+                return Ok(true);
+            }
+
+            let confirm = crate::commonw::prompt::prompt_yes_or_no_interruptible(
+                "Clear ALL suspended sessions bound to the current terminal? (y/n): ",
+            );
+            if confirm != Some(true) {
+                println!("canceled by user.");
+                return Ok(true);
+            }
+
+            match suspended_store.clear_current_terminal() {
+                Ok(cleared) => {
+                    println!(
+                        "Cleared {cleared} suspended session(s) bound to the current terminal."
+                    );
+                }
+                Err(err) => {
+                    eprintln!("[sessions clear-bound] {}", err);
+                }
             }
         }
         "export" => {
@@ -406,6 +527,7 @@ mod tests {
         history::{Message, SuspendedSessionStore, append_history_messages},
         types::{AgentContext, AppConfig, SkillBiasMemory},
     };
+    use serde_json::Value;
     use std::{
         fs,
         path::PathBuf,
@@ -414,10 +536,10 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         },
     };
-    use serde_json::Value;
 
     fn test_history_root() -> PathBuf {
-        let root = std::env::temp_dir().join(format!("rust_tools-session-tests-{}", Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("rust_tools-session-tests-{}", Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         root
     }
@@ -505,9 +627,7 @@ mod tests {
                 .as_ref()
                 .is_some_and(|ctx| ctx.tools.is_empty())
         );
-        assert!(
-            crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty()
-        );
+        assert!(crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -547,9 +667,7 @@ mod tests {
         assert!(app.last_skill_bias.is_none());
         assert!(app.forced_skill.is_none());
         assert!(app.forced_question.is_none());
-        assert!(
-            crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty()
-        );
+        assert!(crate::ai::tools::enable_tools::explicit_enabled_tool_names().is_empty());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -574,6 +692,46 @@ mod tests {
         assert_eq!(entry.session_id, app.session_id);
         assert_eq!(entry.history_file, app.config.history_file);
         assert_eq!(entry.persona_id, app.active_persona.id);
+
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+            std::env::remove_var("TERM_SESSION_ID");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sessions_bound_lists_current_terminal_entries_without_consuming_them() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let root = test_history_root();
+        let suspended_root = root.join("suspended");
+        unsafe {
+            std::env::set_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR", &suspended_root);
+            std::env::set_var("TERM_SESSION_ID", "term-bound");
+        }
+
+        let mut app = test_app(&root);
+        let other_history = root.join("other.sqlite");
+        SuspendedSessionStore::new()
+            .save_for_terminal_key(
+                "terminal:term-bound",
+                &app.session_id,
+                &app.config.history_file,
+                &app.active_persona.id,
+            )
+            .unwrap();
+        SuspendedSessionStore::new()
+            .save_for_terminal_key("terminal:term-bound", "sess-2", &other_history, "reviewer")
+            .unwrap();
+
+        assert!(try_handle_session_command(&mut app, "/sessions bound").unwrap());
+
+        let entries = SuspendedSessionStore::new()
+            .peek_entries_for_terminal_key("terminal:term-bound")
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].session_id, "sess-2");
+        assert_eq!(entries[1].session_id, app.session_id);
 
         unsafe {
             std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");

@@ -149,9 +149,11 @@ pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -
         insert_messages(&tx, entries)?;
     }
     let user_turns: i64 = tx
-        .query_row("SELECT COUNT(1) FROM messages WHERE role = 'user'", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT COUNT(1) FROM messages WHERE role = 'user'",
+            [],
+            |row| row.get(0),
+        )
         .map_err(|e| io::Error::other(e.to_string()))?;
     if user_turns.max(0) as usize <= MAX_HISTORY_TURNS {
         return tx.commit().map_err(|e| io::Error::other(e.to_string()));
