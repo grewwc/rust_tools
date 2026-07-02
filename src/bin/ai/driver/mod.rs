@@ -56,8 +56,6 @@ pub mod decision_log;
 pub mod embedding;
 pub mod hooks;
 pub mod input;
-pub mod intent_model;
-pub mod intent_recognition;
 pub mod mcp_init;
 pub mod model;
 pub mod observer;
@@ -66,7 +64,6 @@ pub mod reflection;
 pub mod runtime_ctx;
 pub mod signal;
 pub mod skill_match_model;
-pub mod skill_matching;
 pub mod skill_ranking;
 pub mod skill_runtime;
 pub mod text_similarity;
@@ -77,7 +74,6 @@ pub mod turn_runtime;
 pub use commands::try_handle_interactive_command;
 pub use mcp_init::*;
 pub use model::*;
-pub use skill_matching::*;
 pub use skill_ranking::*;
 pub use text_similarity::*;
 
@@ -3523,8 +3519,6 @@ mod tests {
                 history_keep_last: 8,
                 history_summary_max_chars: 4000,
                 intent_model: None,
-                intent_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("src/bin/ai/config/intent/intent_model.json"),
                 agent_route_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("src/bin/ai/config/agent_route/agent_route_model.json"),
                 skill_match_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))

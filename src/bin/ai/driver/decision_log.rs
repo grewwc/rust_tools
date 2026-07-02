@@ -31,8 +31,6 @@ pub enum DecisionType {
     MemorySave,
     /// 反思触发
     ReflectionTrigger,
-    /// 用户意图识别
-    IntentRecognition,
     /// 调度器分发与评估
     SchedulerDispatch,
 }
@@ -499,32 +497,6 @@ pub fn log_memory_save_assessment(
             user_feedback: None,
         }),
         execution_time_ms: None,
-    });
-}
-
-/// 辅助函数：创建意图识别日志
-pub fn log_intent_recognition(
-    store: &DecisionLogStore,
-    session_id: &str,
-    turn_id: usize,
-    input: &str,
-    detected_intent: &str,
-    alternatives: Vec<&str>,
-    confidence: f64,
-    execution_time_ms: u64,
-) {
-    store.log(DecisionLog {
-        timestamp: 0, // Will be set by log()
-        session_id: session_id.to_string(),
-        turn_id,
-        decision_type: DecisionType::IntentRecognition,
-        context: input.to_string(),
-        alternatives_considered: alternatives.iter().map(|s| s.to_string()).collect(),
-        chosen_option: detected_intent.to_string(),
-        reasoning: format!("Confidence: {:.2}", confidence),
-        confidence: Some(confidence),
-        outcome: None,
-        execution_time_ms: Some(execution_time_ms),
     });
 }
 

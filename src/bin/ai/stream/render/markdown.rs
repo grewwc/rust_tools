@@ -435,28 +435,37 @@ impl MarkdownStreamRenderer {
             TableState::PendingHeader {
                 indent,
                 header_line,
-                mut preview_height,
+                preview_height,
             } => {
                 if is_table_separator(line) {
                     let raw = line.trim_end().to_string();
-                    let mut out = String::new();
-                    if !preview_emitted {
-                        out.push_str(&raw);
-                        out.push('\n');
-                    }
-                    preview_height +=
-                        self.streamed_or_measured_preview_height(&raw, preview_emitted);
-
                     let header_cells = parse_table_row(&header_line);
                     let align = parse_table_align(line, header_cells.len());
+                    let separator_preview_height =
+                        self.streamed_or_measured_preview_height(&raw, preview_emitted);
+                    let move_up = preview_height
+                        + if preview_emitted {
+                            separator_preview_height
+                        } else {
+                            0
+                        };
+                    let rendered_height =
+                        self.rendered_table_height(&indent, &header_cells, &align, &[]);
+                    let rewrite = self.rewrite_table_preview(
+                        &indent,
+                        move_up,
+                        &header_cells,
+                        &align,
+                        &[],
+                    );
                     self.table_state = TableState::InTable {
                         indent,
                         header: header_cells,
                         align,
                         rows: Vec::new(),
-                        preview_height,
+                        preview_height: rendered_height,
                     };
-                    return out;
+                    return rewrite;
                 }
 
                 let move_up = preview_height
@@ -520,10 +529,32 @@ impl MarkdownStreamRenderer {
         align: &[TableAlign],
         rows: &[Vec<String>],
     ) -> String {
+        let final_table = self.render_table_block(indent, header, align, rows);
+        if final_table.is_empty() || move_up == 0 {
+            return String::new();
+        }
+
+        let mut out = String::new();
+        if move_up > 0 {
+            out.push_str(&format!("\x1b[{move_up}A\r\x1b[0J"));
+        } else {
+            out.push_str("\r\x1b[0J");
+        }
+        out.push_str(&final_table);
+        out
+    }
+
+    fn render_table_block(
+        &self,
+        indent: &str,
+        header: &[String],
+        align: &[TableAlign],
+        rows: &[Vec<String>],
+    ) -> String {
         let cols = header
             .len()
             .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
-        if cols < 2 || move_up == 0 {
+        if cols < 2 {
             return String::new();
         }
 
@@ -537,15 +568,19 @@ impl MarkdownStreamRenderer {
             final_table.push_str(&render_table_row(indent, &row_cells, align, &widths));
         }
         final_table.push_str(&render_table_bottom(indent, &widths));
+        final_table
+    }
 
-        let mut out = String::new();
-        if move_up > 0 {
-            out.push_str(&format!("\x1b[{move_up}A\r\x1b[0J"));
-        } else {
-            out.push_str("\r\x1b[0J");
-        }
-        out.push_str(&final_table);
-        out
+    fn rendered_table_height(
+        &self,
+        indent: &str,
+        header: &[String],
+        align: &[TableAlign],
+        rows: &[Vec<String>],
+    ) -> usize {
+        self.render_table_block(indent, header, align, rows)
+            .lines()
+            .count()
     }
 
     fn rewrite_plain_preview(&mut self, line: &str, move_up: usize) -> String {
@@ -1454,7 +1489,7 @@ mod tests {
     }
 
     #[test]
-    fn table_flush_uses_streamed_preview_height_for_rewrite() {
+    fn table_confirmation_and_flush_use_streamed_preview_height_for_rewrite() {
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         renderer.bol = true;
 
@@ -1462,15 +1497,48 @@ mod tests {
         assert_eq!(renderer.consume_line("| Header | Value |", true), "");
 
         renderer.set_line_preview_height(7);
-        assert_eq!(renderer.consume_line("| --- | --- |", true), "");
+        let header_rewrite = renderer.consume_line("| --- | --- |", true);
+        assert!(
+            header_rewrite.contains("\x1b[12A\r\x1b[0J"),
+            "expected separator confirmation to rewrite using header+separator preview height; got {header_rewrite:?}"
+        );
 
         renderer.set_line_preview_height(9);
         assert_eq!(renderer.consume_line("| foo | bar |", true), "");
 
         let flushed = renderer.flush_pending_for_test().unwrap();
         assert!(
-            flushed.contains("\x1b[21A\r\x1b[0J"),
-            "expected table rewrite to clear exactly the streamed preview height; got {flushed:?}"
+            flushed.contains("\x1b[13A\r\x1b[0J"),
+            "expected final flush to clear rendered header table + streamed row preview height; got {flushed:?}"
         );
+    }
+
+    #[test]
+    fn heading_followed_by_cjk_table_leaves_no_raw_header_fragment() {
+        let _guard = env_guard();
+
+        let md = "\
+## 常用选项
+
+| 选项 | 作用 |
+| --- | --- |
+| -b a | 对所有行编号（包括空行），等价于 `cat -n` |
+| -b t | 仅对非空行编号（默认行为） |
+";
+
+        for cols in [96usize, 80, 72, 64] {
+            unsafe { std::env::set_var("COLUMNS", cols.to_string()) };
+
+            let stream = render_full_stream(md, false);
+            let mut grid = VtGrid::new(cols);
+            grid.feed(&stream);
+            let screen = grid.screen();
+
+            assert!(
+                !screen.iter().any(|line| line.contains("| 选项 | 作用 |")),
+                "COLUMNS={cols}: raw table header leaked onto final screen:\n{}",
+                screen.join("\n")
+            );
+        }
     }
 }

@@ -59,7 +59,7 @@ fn filter_suggested_tool_calls_for_current_schema(
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct QuestionShape {
+pub(crate) struct QuestionShape {
     char_count: usize,
     nonempty_line_count: usize,
     artifact_token_count: usize,
@@ -70,7 +70,7 @@ struct QuestionShape {
 }
 
 impl QuestionShape {
-    fn analyze(question: &str) -> Self {
+    pub(crate) fn analyze(question: &str) -> Self {
         let cleaned = request::strip_system_reminders(question);
         let trimmed = cleaned.trim();
         let mut shape = QuestionShape {
@@ -97,21 +97,21 @@ impl QuestionShape {
         shape
     }
 
-    fn has_code_or_repo_artifact(self) -> bool {
+    pub(crate) fn has_code_or_repo_artifact(self) -> bool {
         self.has_code_fence
             || self.has_inline_code
             || self.has_namespace_path
             || self.artifact_token_count > 0
     }
 
-    fn has_reflection_shape(self) -> bool {
+    pub(crate) fn has_reflection_shape(self) -> bool {
         self.has_code_or_repo_artifact()
             || self.nonempty_line_count >= 2
             || self.has_list_marker
             || self.char_count >= 80
     }
 
-    fn is_complex_task(self) -> bool {
+    pub(crate) fn is_complex_task(self) -> bool {
         if self.char_count < 12 {
             return false;
         }
@@ -119,6 +119,28 @@ impl QuestionShape {
             || self.has_list_marker
             || self.char_count >= 180
             || self.artifact_token_count >= 2
+    }
+
+    /// 极短、单行、无 code/repo artifact 的问句：保守近似"简单概念问答"。
+    ///
+    /// intent 移除后不再有"概念意图"信号，只能靠纯形态收紧近似；阈值取 48
+    /// 而非更宽的 120，以减少误跳过 recall（宁可多召回，不丢能力）。
+    pub(crate) fn is_lightweight_conceptual(self) -> bool {
+        self.char_count > 0
+            && self.char_count <= 48
+            && self.nonempty_line_count <= 1
+            && !self.has_code_or_repo_artifact()
+    }
+
+    /// 是否值得开启 deliberate thinking：具备 code/repo artifact、多行、
+    /// 列表、诊断形态，或长度足够。`has_diagnostic` 由调用方内联传入
+    /// （诊断形态不在 struct 字段内）。
+    pub(crate) fn needs_deliberate_thinking(self, has_diagnostic: bool) -> bool {
+        self.has_code_or_repo_artifact()
+            || self.nonempty_line_count >= 3
+            || self.has_list_marker
+            || has_diagnostic
+            || self.char_count >= 120
     }
 }
 
@@ -189,15 +211,8 @@ fn is_probable_file_extension(extension: &str) -> bool {
         && extension.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
-fn should_inject_integrated_reflection(
-    question: &str,
-    intent: &crate::ai::driver::intent_recognition::UserIntent,
-) -> bool {
-    matches!(
-        intent.core,
-        crate::ai::driver::intent_recognition::CoreIntent::RequestAction
-            | crate::ai::driver::intent_recognition::CoreIntent::SeekSolution
-    ) && QuestionShape::analyze(question).has_reflection_shape()
+fn should_inject_integrated_reflection(question: &str) -> bool {
+    QuestionShape::analyze(question).has_reflection_shape()
 }
 
 fn sync_prepare_observers_enabled() -> bool {
@@ -274,24 +289,6 @@ pub(super) async fn prepare_turn(
         skill_runtime::prepare_skill_for_turn(app, &mc, skill_manifests, question)
     };
 
-    crate::ai::driver::runtime_ctx::publish_subagent_phase("recognizing intent");
-    // LLM 意图识别 fallback：当本地 TF-IDF 把 question 划到 Casual 但内容具备
-    // 非闲聊形态（结构化文本、路径/代码片段、问句或长度足够）时，调用大模型
-    // 二次判定。LLM 调用本身在 stderr 打印 [intent:llm] 标识，方便用户区分
-    // "本地分类" vs "大模型分类"。
-    {
-        let local = skill_turn.intent().clone();
-        let upgraded = crate::ai::driver::intent_recognition::upgrade_intent_via_model(
-            app,
-            question,
-            local.clone(),
-        )
-        .await;
-        if upgraded.core != local.core {
-            skill_turn.set_intent(upgraded);
-        }
-    }
-
     {
         let now = chrono::Local::now();
         let date_str = now.format("%Y-%m-%d").to_string();
@@ -315,8 +312,7 @@ pub(super) async fn prepare_turn(
             .unwrap_or_else(|| "true".to_string())
             .trim()
             .ne("false");
-        let intent_needs_reflection =
-            should_inject_integrated_reflection(question, skill_turn.intent());
+        let intent_needs_reflection = should_inject_integrated_reflection(question);
         if (integrated || reflect_integrated) && intent_needs_reflection {
             let mut sys = String::new();
             if integrated {
@@ -393,12 +389,10 @@ pub(super) async fn prepare_turn(
         skill_turn.push_section(skill_runtime::ContextKind::Behavior, &block);
     }
 
-    let recall_intent = skill_turn.intent().clone();
     let skip_recall_for_skill_context = skill_turn.skip_recall_by_skill();
     let matched_skill_name = skill_turn.matched_skill_name().map(|name| name.to_string());
     let should_run_general_recall = should_run_general_recall(
         question,
-        &recall_intent,
         matched_skill_name.as_deref(),
         skip_recall_for_skill_context,
     );
@@ -460,7 +454,6 @@ pub(super) async fn prepare_turn(
 
     if should_run_session_code_discovery_recall(
         question,
-        &recall_intent,
         matched_skill_name.as_deref(),
         skip_recall_for_skill_context,
     ) && let Some(code_discovery_recall) = build_session_code_discovery_recall(app, &history)
@@ -578,7 +571,6 @@ pub(super) async fn prepare_turn(
 
 fn should_run_general_recall(
     question: &str,
-    intent: &crate::ai::driver::intent_recognition::UserIntent,
     matched_skill_name: Option<&str>,
     skip_recall_for_skill_context: bool,
 ) -> bool {
@@ -590,18 +582,13 @@ fn should_run_general_recall(
     if question.is_empty() {
         return false;
     }
-    if is_short_skill_follow_up(question, intent, matched_skill_name) {
+    if is_short_skill_follow_up(question, matched_skill_name) {
         return false;
     }
 
-    let question_len = question.chars().count();
-    let simple_concept_turn = question_len <= 120
-        && matches!(
-            intent.core,
-            crate::ai::driver::intent_recognition::CoreIntent::Casual
-                | crate::ai::driver::intent_recognition::CoreIntent::QueryConcept
-        )
-        && !intent.is_search_query()
+    // 无 intent 后仅靠纯形态近似"简单概念问答"：极短 + 单行 + 无 artifact。
+    // 命中则跳过 general recall，否则倒向召回（保留能力）。
+    let simple_concept_turn = QuestionShape::analyze(question).is_lightweight_conceptual()
         && !looks_like_code_or_repo_question(question);
 
     !simple_concept_turn
@@ -609,28 +596,19 @@ fn should_run_general_recall(
 
 fn should_run_session_code_discovery_recall(
     question: &str,
-    intent: &crate::ai::driver::intent_recognition::UserIntent,
     matched_skill_name: Option<&str>,
     skip_recall_for_skill_context: bool,
 ) -> bool {
     if skip_recall_for_skill_context {
         return false;
     }
-    if is_short_skill_follow_up(question, intent, matched_skill_name) {
+    if is_short_skill_follow_up(question, matched_skill_name) {
         return false;
     }
-    matches!(
-        intent.core,
-        crate::ai::driver::intent_recognition::CoreIntent::RequestAction
-            | crate::ai::driver::intent_recognition::CoreIntent::SeekSolution
-    ) && looks_like_code_or_repo_question(question)
+    looks_like_code_or_repo_question(question)
 }
 
-fn is_short_skill_follow_up(
-    question: &str,
-    intent: &crate::ai::driver::intent_recognition::UserIntent,
-    matched_skill_name: Option<&str>,
-) -> bool {
+fn is_short_skill_follow_up(question: &str, matched_skill_name: Option<&str>) -> bool {
     if matched_skill_name.is_none() {
         return false;
     }
@@ -638,7 +616,6 @@ fn is_short_skill_follow_up(
     shape.char_count <= 48
         && !shape.has_reflection_shape()
         && !looks_like_code_or_repo_question(question)
-        && !intent.is_search_query()
 }
 
 fn looks_like_code_or_repo_question(question: &str) -> bool {
@@ -814,6 +791,7 @@ fn code_discovery_record_from_memory_entry(
 #[cfg(test)]
 mod tests {
     use super::{
+        QuestionShape,
         collect_session_code_discovery_records, detect_complex_task,
         extract_existing_code_discoveries, high_confidence_project_memory_policy,
         filter_suggested_tool_calls_for_tool_names,
@@ -823,7 +801,6 @@ mod tests {
     };
     use crate::ai::code_discovery_policy::parse_record_line;
     use crate::ai::driver::observer::SuggestedToolCall;
-    use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
     use crate::ai::history::Message;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
     use serde_json::Value;
@@ -1007,10 +984,8 @@ mod tests {
 
     #[test]
     fn simple_concept_turn_skips_general_recall() {
-        let intent = UserIntent::new(CoreIntent::QueryConcept);
         assert!(!should_run_general_recall(
             "Rust 的 trait 是什么？",
-            &intent,
             None,
             false
         ));
@@ -1018,38 +993,24 @@ mod tests {
 
     #[test]
     fn simple_common_sense_turn_skips_integrated_reflection_even_if_misclassified() {
-        let intent = UserIntent::new(CoreIntent::SeekSolution);
-        assert!(!should_inject_integrated_reflection(
-            "为什么天是蓝的？",
-            &intent
-        ));
+        assert!(!should_inject_integrated_reflection("为什么天是蓝的？"));
     }
 
     #[test]
     fn simple_technical_concept_turn_skips_integrated_reflection_even_if_misclassified() {
-        let intent = UserIntent::new(CoreIntent::SeekSolution);
-        assert!(!should_inject_integrated_reflection(
-            "Rust 的函数是什么？",
-            &intent
-        ));
+        assert!(!should_inject_integrated_reflection("Rust 的函数是什么？"));
     }
 
     #[test]
     fn coding_task_keeps_integrated_reflection() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
         assert!(should_inject_integrated_reflection(
-            "帮我处理 `build check` 的 failure",
-            &intent
+            "帮我处理 `build check` 的 failure"
         ));
     }
 
     #[test]
     fn plain_action_words_do_not_trigger_reflection_without_structure() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
-        assert!(!should_inject_integrated_reflection(
-            "帮我处理这个问题",
-            &intent
-        ));
+        assert!(!should_inject_integrated_reflection("帮我处理这个问题"));
     }
 
     #[test]
@@ -1076,10 +1037,8 @@ mod tests {
 
     #[test]
     fn code_request_keeps_session_code_discovery_recall() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
         assert!(should_run_session_code_discovery_recall(
             "帮我看下 src/main.rs 这里的 panic",
-            &intent,
             None,
             false
         ));
@@ -1087,10 +1046,8 @@ mod tests {
 
     #[test]
     fn short_skill_follow_up_skips_general_recall() {
-        let intent = UserIntent::new(CoreIntent::Casual);
         assert!(!should_run_general_recall(
             "简短请求",
-            &intent,
             Some("debugger"),
             false
         ));
@@ -1098,23 +1055,46 @@ mod tests {
 
     #[test]
     fn structured_skill_turn_still_keeps_general_recall() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
         assert!(should_run_general_recall(
             "请帮我检查下面这个多步构建失败：\n1. cargo check 失败\n2. 错误出现在 src/main.rs",
-            &intent,
             Some("debugger"),
             false
         ));
     }
 
     #[test]
-    fn short_skill_follow_up_skips_session_code_discovery_recall() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
-        assert!(!should_run_session_code_discovery_recall(
-            "继续",
-            &intent,
-            Some("debugger"),
-            false
-        ));
+    fn short_plain_question_is_lightweight_conceptual() {
+        assert!(QuestionShape::analyze("Rust 的 trait 是什么？").is_lightweight_conceptual());
+    }
+
+    #[test]
+    fn code_artifact_is_not_lightweight_conceptual() {
+        assert!(!QuestionShape::analyze("`Vec::push` 是什么？").is_lightweight_conceptual());
+    }
+
+    #[test]
+    fn long_question_is_not_lightweight_conceptual() {
+        let long = "这是一个".repeat(20);
+        assert!(!QuestionShape::analyze(&long).is_lightweight_conceptual());
+    }
+
+    #[test]
+    fn empty_question_is_not_lightweight_conceptual() {
+        assert!(!QuestionShape::analyze("").is_lightweight_conceptual());
+    }
+
+    #[test]
+    fn diagnostic_flag_forces_deliberate_thinking() {
+        assert!(QuestionShape::analyze("为什么会崩溃").needs_deliberate_thinking(true));
+    }
+
+    #[test]
+    fn short_plain_question_skips_deliberate_thinking() {
+        assert!(!QuestionShape::analyze("今天几号").needs_deliberate_thinking(false));
+    }
+
+    #[test]
+    fn code_artifact_needs_deliberate_thinking() {
+        assert!(QuestionShape::analyze("看下 src/main.rs 的逻辑").needs_deliberate_thinking(false));
     }
 }

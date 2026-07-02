@@ -14,9 +14,6 @@
 //! 如果将来想再启用嵌入，建议挂一个外部 embedding HTTP 服务（OpenAI / 自部署
 //! BGE 等）通过 `set_provider` 注入；这里保留 trait + GLOBAL_PROVIDER 的形状
 //! 就是为了未来切换不动调用方。
-//!
-//! 意图识别走 `intent_model.rs` 的本地 TF-IDF，复杂场景再调 LLM——
-//! 见 `intent_model::detect_intent_async`。
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
