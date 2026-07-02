@@ -205,10 +205,11 @@ mod tests {
     fn prepare_tool_result_spills_large_output_to_session_file() {
         let history_file =
             std::env::temp_dir().join(format!("ai-tool-overflow-{}.sqlite", uuid::Uuid::new_v4()));
-        let app = test_app(history_file.clone());
+        let mut app = test_app(history_file.clone());
         let store = SessionStore::new(history_file.as_path());
         store.ensure_root_dir().unwrap();
-        std::fs::write(store.session_history_file(&app.session_id), b"test").unwrap();
+        app.session_history_file = store.session_history_file(&app.session_id);
+        std::fs::write(&app.session_history_file, b"test").unwrap();
 
         let content = "x".repeat(MAX_TOOL_RESULT_INLINE_CHARS + 256);
         let prepared = prepare_tool_result(&app, "mcp_big_payload", &content);
@@ -221,6 +222,12 @@ mod tests {
         let path = extract_stub_path(&prepared.content_for_model).unwrap();
         assert!(path.is_absolute());
         assert!(path.exists());
+        let expected_dir = store.session_assets_dir(&app.session_id).join("tool-overflow");
+        let nested_dir = SessionStore::new(app.session_history_file.as_path())
+            .session_assets_dir(&app.session_id)
+            .join("tool-overflow");
+        assert!(path.starts_with(&expected_dir));
+        assert!(!nested_dir.exists());
         let saved = std::fs::read_to_string(&path).unwrap();
         assert_eq!(saved, content);
 

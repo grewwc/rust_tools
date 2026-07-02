@@ -87,7 +87,7 @@ pub(super) fn write_tool_overflow_file(
     tool_name: &str,
     body: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let store = SessionStore::new(app.session_history_file.as_path());
+    let store = SessionStore::new(app.config.history_file.as_path());
     store.ensure_root_dir()?;
     let dir = store
         .session_assets_dir(&app.session_id)
