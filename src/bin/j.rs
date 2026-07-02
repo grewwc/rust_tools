@@ -104,9 +104,9 @@ fn main() {
         let output_fname = if fname.is_empty() {
             "_f.json".to_string()
         } else {
-            format!("{}_f.json", base_no_ext(fname))
+            fname.to_string()
         };
-        println!("write file to {output_fname}");
+        println!("write formatted json to {output_fname}");
         j.to_file(output_fname, true).unwrap();
         return;
     }

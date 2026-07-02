@@ -50,8 +50,8 @@ cargo test --lib --bin a
 cargo test --bin a test_name
 ```
 
-Run focused tests for the touched module first, then broaden only when the
-change crosses shared behavior.
+**Only test what you changed — avoid triggering the full test suite.**
+Run focused tests for the touched module first (`cargo test --bin a test_name` or `cargo test -p <package>`), then broaden only when the change crosses shared behavior. Do not run the full workspace test suite unless necessary.
 
 ## Global Engineering Rules
 
