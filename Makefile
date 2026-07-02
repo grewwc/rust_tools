@@ -19,13 +19,16 @@ RUSTFLAGS_INSTALL ?= -Awarnings
 install: export RUSTFLAGS := $(strip $(RUSTFLAGS) $(RUSTFLAGS_INSTALL))
 .PHONY: install
 install: $(INSTALLW)
-	@bins=$$($(INSTALLW) -- $(INSTALL_BINS)); \
+	$(eval REQUESTED := $(filter-out install,$(MAKECMDGOALS)))
+	$(eval BINS := $(or $(REQUESTED),$(INSTALL_BINS)))
+	@bins=$$($(INSTALLW) -- $(BINS)); \
 	if [ -n "$$bins" ]; then \
 		args=""; \
 		for b in $$bins; do args="$$args --bin $$b"; done; \
 		cargo build --release $$args; \
 	fi; \
-	sh ./move_executable.sh $(INSTALL_BINS)
+	sh ./move_executable.sh $(BINS)
+
 	@$(MAKE) install-completions
 # -- shell completions --
 .PHONY: install-completions
