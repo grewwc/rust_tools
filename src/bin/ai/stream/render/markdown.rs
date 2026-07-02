@@ -130,8 +130,8 @@ impl MarkdownStreamRenderer {
             TableState::PendingHeader {
                 indent,
                 header_line,
-                preview_height: _,
-            } => self.consume_line(&format!("{indent}{header_line}"), false),
+                preview_height,
+            } => self.rewrite_plain_preview(&format!("{indent}{header_line}"), preview_height),
             TableState::InTable {
                 indent,
                 header,
@@ -371,8 +371,8 @@ impl MarkdownStreamRenderer {
             TableState::PendingHeader {
                 indent,
                 header_line,
-                preview_height: _,
-            } => self.consume_line(&format!("{indent}{header_line}"), false),
+                preview_height,
+            } => self.rewrite_plain_preview(&format!("{indent}{header_line}"), preview_height),
             TableState::InTable {
                 indent,
                 header,
@@ -465,12 +465,9 @@ impl MarkdownStreamRenderer {
                     } else {
                         0
                     };
-                let mut out = String::new();
-                if move_up > 0 {
-                    out.push_str(&format!("\x1b[{move_up}A\r\x1b[0J"));
-                }
+                let mut out =
+                    self.rewrite_plain_preview(&format!("{indent}{header_line}"), move_up);
                 self.table_state = TableState::None;
-                out.push_str(&self.render_line_no_table(&format!("{indent}{header_line}")));
                 out.push_str(&self.consume_line(line, false));
                 out
             }
@@ -549,6 +546,15 @@ impl MarkdownStreamRenderer {
         }
         out.push_str(&final_table);
         out
+    }
+
+    fn rewrite_plain_preview(&mut self, line: &str, move_up: usize) -> String {
+        let rendered = self.render_line_no_table(line);
+        if move_up > 0 {
+            format!("\x1b[{move_up}A\r\x1b[0J{rendered}")
+        } else {
+            rendered
+        }
     }
 
     fn render_line_no_table(&mut self, line: &str) -> String {
@@ -958,21 +964,28 @@ mod tests {
     }
 
     fn strip_ansi_for_test(s: &str) -> String {
+        let bytes = s.as_bytes();
         let mut out = String::with_capacity(s.len());
-        let mut chars = s.chars().peekable();
-        while let Some(ch) = chars.next() {
-            if ch == '\x1b' {
-                if chars.peek() == Some(&'[') {
-                    let _ = chars.next();
-                    while let Some(c) = chars.next() {
-                        if c == 'm' {
-                            break;
-                        }
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    i += 1;
+                    if (b as char) >= '@' && (b as char) <= '~' {
+                        break;
                     }
-                    continue;
                 }
+                continue;
             }
-            out.push(ch);
+            let Some(ch) = s[i..].chars().next() else {
+                break;
+            };
+            if ch != '\r' {
+                out.push(ch);
+            }
+            i += ch.len_utf8();
         }
         out
     }
@@ -1006,6 +1019,23 @@ mod tests {
         let mut renderer = MarkdownStreamRenderer::new_with_tty(false);
         let _ = renderer.consume_line("| Header A | Header B |", false);
         let _ = renderer.consume_line("Not a separator", false);
+    }
+
+    #[test]
+    fn pending_header_flush_rewrites_to_plain_markdown_line() {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        renderer.bol = true;
+
+        let first = renderer
+            .write_chunk_for_test("| **Header** | Value |\n", false)
+            .unwrap();
+        assert_eq!(first, "| **Header** | Value |\n");
+
+        let flushed = renderer.flush_pending_for_test().unwrap();
+        assert!(flushed.contains("\x1b[1A\r\x1b[0J"));
+
+        let visible = strip_ansi_for_test(&flushed);
+        assert_eq!(visible, "| Header | Value |\n");
     }
 
     #[test]

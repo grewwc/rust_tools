@@ -95,7 +95,11 @@ pub(crate) fn execute_lsp(args: &Value) -> Result<String, String> {
 /// 解析 go_to_definition / find_references 的目标符号：
 /// 优先用显式 `query`，否则从 `line`/`column` 处取标识符。
 fn resolve_target_symbol(args: &Value, file_path: &str) -> Result<String, String> {
-    if let Some(query) = args["query"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(query) = args["query"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         return Ok(query.to_string());
     }
 
@@ -105,7 +109,8 @@ fn resolve_target_symbol(args: &Value, file_path: &str) -> Result<String, String
         as usize;
     let column = args["column"].as_u64().unwrap_or(1) as usize;
 
-    let content = fs::read_to_string(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let content =
+        fs::read_to_string(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
     let lines: Vec<&str> = content.lines().collect();
     if line == 0 || line > lines.len() {
         return Err(format!(
@@ -200,11 +205,7 @@ fn collect_workspace_symbols(root: &Path, query: &str, exact: bool) -> Vec<Symbo
         }
     }
 
-    hits.sort_by(|a, b| {
-        a.file
-            .cmp(&b.file)
-            .then_with(|| a.line.cmp(&b.line))
-    });
+    hits.sort_by(|a, b| a.file.cmp(&b.file).then_with(|| a.line.cmp(&b.line)));
     hits
 }
 
@@ -226,7 +227,10 @@ fn lsp_workspace_symbol(file_path: &str, query: &str) -> Result<String, String> 
     let hits = collect_workspace_symbols(&root, query, false);
 
     if hits.is_empty() {
-        return Ok(format!("No symbols matching '{}' found in workspace", query));
+        return Ok(format!(
+            "No symbols matching '{}' found in workspace",
+            query
+        ));
     }
 
     Ok(format!(
@@ -247,10 +251,7 @@ fn lsp_go_to_definition(file_path: &str, symbol: &str) -> Result<String, String>
     }
 
     if hits.is_empty() {
-        return Ok(format!(
-            "Definition for '{}' not found in project.",
-            symbol
-        ));
+        return Ok(format!("Definition for '{}' not found in project.", symbol));
     }
 
     let header = if exact {
@@ -351,9 +352,15 @@ fn lsp_hover(file_path: &str, line: usize, column: usize) -> Result<String, Stri
                 if let Some(found) = symbols.iter().find(|s| s.name == word) {
                     symbol_detail = match &found.detail {
                         Some(detail) if !detail.trim().is_empty() => {
-                            format!("\nSymbol: {} {} [{}] (line {})", found.kind, found.name, detail, found.line)
+                            format!(
+                                "\nSymbol: {} {} [{}] (line {})",
+                                found.kind, found.name, detail, found.line
+                            )
                         }
-                        _ => format!("\nSymbol: {} {} (line {})", found.kind, found.name, found.line),
+                        _ => format!(
+                            "\nSymbol: {} {} (line {})",
+                            found.kind, found.name, found.line
+                        ),
                     };
                 }
             }
@@ -627,7 +634,11 @@ mod tests {
         });
         let result = execute_lsp(&args).unwrap();
         assert!(result.contains("target_fn"), "{}", result);
-        assert!(result.contains(":1:"), "definition should be on line 1: {}", result);
+        assert!(
+            result.contains(":1:"),
+            "definition should be on line 1: {}",
+            result
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -661,7 +672,11 @@ mod tests {
     fn document_symbol_lists_python_defs() {
         let dir = make_temp_dir("docsym");
         let file = dir.join("mod.py");
-        fs::write(&file, "def first():\n    pass\n\nclass Thing:\n    def method(self):\n        pass\n").unwrap();
+        fs::write(
+            &file,
+            "def first():\n    pass\n\nclass Thing:\n    def method(self):\n        pass\n",
+        )
+        .unwrap();
 
         let result = lsp_document_symbols(&file.to_string_lossy()).unwrap();
         assert!(result.contains("first"), "{}", result);

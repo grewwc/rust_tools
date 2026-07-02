@@ -31,48 +31,60 @@ install: $(INSTALLW)
 .PHONY: install-completions
 install-completions:
 	@SHELL_NAME=$$(basename "$${SHELL:-/bin/bash}"); \
-	A_BIN="$${INSTALL_DIR:-$$(pwd)/bin}/a"; \
-	if [ ! -x "$$A_BIN" ]; then \
-		echo "  skip completions: a not found at $$A_BIN"; \
-		exit 0; \
-	fi; \
-	case "$$SHELL_NAME" in \
-	  zsh) \
-		DST="$${HOME}/.zfunc"; \
-		mkdir -p "$$DST"; \
-		"$$A_BIN" --generate-completions zsh > "$$DST/_a" && \
-		line="fpath=($$DST \$$fpath)"; \
-		if ! grep -qF "fpath=($$DST " "$${HOME}/.zshrc" 2>/dev/null; then \
-			{ echo ""; echo "# a 命令补全"; echo "$$line"; echo "autoload -U compinit && compinit"; } >> "$${HOME}/.zshrc"; \
-			echo "  added fpath to ~/.zshrc"; \
-		else \
-			echo "  ~/.zshrc already configured"; \
+	INSTALL_DIR="$${INSTALL_DIR:-$$(pwd)/bin}"; \
+	for bin in a fk; do \
+		BIN="$${INSTALL_DIR}/$$bin"; \
+		if [ ! -x "$$BIN" ]; then \
+			echo "  skip completions: $$bin not found at $$BIN"; \
+			continue; \
 		fi; \
-		echo "  completions -> $$DST/_a"; \
-		echo "  add to ~/.zshrc: $$line"; \
-		;; \
-	  fish) \
-		DST="$${HOME}/.config/fish/completions"; \
-		mkdir -p "$$DST"; \
-		"$$A_BIN" --generate-completions fish > "$$DST/a.fish"; \
-		echo "  completions -> $$DST/a.fish"; \
-		;; \
-	  bash|*) \
-		DST="$${HOME}/.bash_completion.d"; \
-		mkdir -p "$$DST"; \
-		"$$A_BIN" --generate-completions bash > "$$DST/a" && \
-		line='source '"$$DST/a"; \
-		for rc in "$${HOME}/.bashrc" "$${HOME}/.bash_profile"; do \
-			if [ -f "$$rc" ] || [ "$$rc" = "$${HOME}/.bashrc" ]; then \
-				if ! grep -qF "$$DST/a" "$$rc" 2>/dev/null; then \
-					{ echo ""; echo "# a 命令补全"; echo "$$line"; } >> "$$rc"; \
-					echo "  added source to $$rc"; \
-				else \
-					echo "  $$rc already configured"; \
+		case "$$SHELL_NAME" in \
+		  zsh) \
+			DST="$${HOME}/.zfunc"; \
+			mkdir -p "$$DST"; \
+			"$$BIN" --generate-completions zsh > "$$DST/_$$bin" && \
+			line="fpath=($$DST \$$fpath)"; \
+			if ! grep -qF "fpath=($$DST " "$${HOME}/.zshrc" 2>/dev/null; then \
+				{ echo ""; echo "# $$bin 命令补全"; echo "$$line"; echo "autoload -U compinit && compinit"; } >> "$${HOME}/.zshrc"; \
+				echo "  added fpath to ~/.zshrc for $$bin"; \
+				if ! grep -qF "rehash true" "$${HOME}/.zshrc" 2>/dev/null; then \
+					{ echo ""; echo "zstyle '"'"':completion:*'"'"' rehash true"; } >> "$${HOME}/.zshrc"; \
+					echo "  added rehash style to ~/.zshrc"; \
+				fi; \
+			else \
+				echo "  ~/.zshrc already has fpath for $$bin"; \
+				if ! grep -qF "rehash true" "$${HOME}/.zshrc" 2>/dev/null; then \
+					{ echo ""; echo "zstyle '"'"':completion:*'"'"' rehash true"; } >> "$${HOME}/.zshrc"; \
+					echo "  added rehash style to ~/.zshrc"; \
 				fi; \
 			fi; \
-		done; \
-		echo "  completions -> $$DST/a"; \
-		echo "  add to ~/.bashrc: source $$DST/a"; \
-		;; \
-	esac
+			echo "  completions -> $$DST/_$$bin"; \
+			echo "  add to ~/.zshrc: $$line"; \
+			;; \
+		  fish) \
+			DST="$${HOME}/.config/fish/completions"; \
+			mkdir -p "$$DST"; \
+			"$$BIN" --generate-completions fish > "$$DST/$$bin.fish"; \
+			echo "  completions -> $$DST/$$bin.fish"; \
+			;; \
+		  bash|*) \
+			DST="$${HOME}/.bash_completion.d"; \
+			mkdir -p "$$DST"; \
+			"$$BIN" --generate-completions bash > "$$DST/$$bin" && \
+			line='source '"$$DST/$$bin"; \
+			for rc in "$${HOME}/.bashrc" "$${HOME}/.bash_profile"; do \
+				if [ -f "$$rc" ] || [ "$$rc" = "$${HOME}/.bashrc" ]; then \
+					if ! grep -qF "$$DST/$$bin" "$$rc" 2>/dev/null; then \
+						{ echo ""; echo "# $$bin 命令补全"; echo "$$line"; } >> "$$rc"; \
+						echo "  added source to $$rc for $$bin"; \
+					else \
+						echo "  $$rc already configured for $$bin"; \
+					fi; \
+				fi; \
+			done; \
+			echo "  completions -> $$DST/$$bin"; \
+			echo "  add to ~/.bashrc: source $$DST/$$bin"; \
+			;; \
+		esac; \
+	done
+.PHONY: test test-a test-fk clean

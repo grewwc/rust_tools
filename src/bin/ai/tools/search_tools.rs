@@ -312,7 +312,11 @@ mod tests {
         });
         let result = execute_find_path(&args);
 
-        assert!(result.is_ok(), "find_path should not error, got: {:?}", result);
+        assert!(
+            result.is_ok(),
+            "find_path should not error, got: {:?}",
+            result
+        );
         let output = result.unwrap();
         assert!(
             output.contains("target.txt"),

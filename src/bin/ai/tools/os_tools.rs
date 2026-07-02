@@ -122,6 +122,11 @@ fn execute_spawn_process(args: &Value) -> Result<String, String> {
                     set.insert(tool_name.to_string());
                 }
             }
+            if !set.is_empty() {
+                for tool_name in crate::ai::tools::baseline_tool_names() {
+                    set.insert((*tool_name).to_string());
+                }
+            }
             Some(set)
         } else {
             None
@@ -1114,6 +1119,59 @@ mod tests {
             .unwrap();
             assert!(output.contains("general:mailbox"));
             assert!(output.contains("general"));
+        });
+    }
+
+    #[test]
+    fn spawn_process_whitelist_keeps_baseline_tools_available() {
+        with_test_kernel(|kernel| {
+            let root_pid = {
+                let mut os = kernel.lock().unwrap();
+                os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None)
+            };
+
+            let output = execute_spawn_process(&json!({
+                "name": "child",
+                "goal": "inspect code",
+                "allowed_tools": ["execute_command"]
+            }))
+            .expect("spawn_process should succeed");
+            assert!(output.contains("PID: 2"));
+
+            let os = kernel.lock().unwrap();
+            let child = os.get_process(2).expect("child process should exist");
+            assert_eq!(child.parent_pid, Some(root_pid));
+            assert!(child.allowed_tools.contains("execute_command"));
+            for tool_name in crate::ai::tools::baseline_tool_names() {
+                assert!(
+                    child.allowed_tools.contains(*tool_name),
+                    "baseline tool '{tool_name}' should be auto-allowed"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn spawn_process_empty_whitelist_stays_unrestricted() {
+        with_test_kernel(|kernel| {
+            {
+                let mut os = kernel.lock().unwrap();
+                os.begin_foreground("fg".to_string(), "goal".to_string(), 10, 8, None);
+            }
+
+            execute_spawn_process(&json!({
+                "name": "child",
+                "goal": "inspect code",
+                "allowed_tools": []
+            }))
+            .expect("spawn_process should succeed");
+
+            let os = kernel.lock().unwrap();
+            let child = os.get_process(2).expect("child process should exist");
+            assert!(
+                child.allowed_tools.is_empty(),
+                "empty whitelist should remain unrestricted"
+            );
         });
     }
 }

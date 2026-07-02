@@ -130,12 +130,12 @@
     "subagent_priority": 95
   },
   {
-    "key": "glm-5.1-alibaba",
+    "key": "glm-5.2-alibaba",
     "aliases": [
-      "GLM 5.1",
-      "glm-5.1-openai"
+      "GLM 5.2",
+      "glm-5.2-openai"
     ],
-    "name": "glm-5.1",
+    "name": "glm-5.2",
     "provider": "alibaba",
     "quality_tier": "strong",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",

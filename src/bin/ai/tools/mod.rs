@@ -34,3 +34,24 @@ pub(crate) use registry::common::execute_tool_call_with_args;
 pub(crate) use registry::common::{
     get_tool_definitions_by_names, tool_definitions_for_groups, tool_summaries_for_groups,
 };
+
+const BASELINE_TOOL_NAMES: &[&str] = &[
+    "discover_skills",
+    "load_skill",
+    "enable_tools",
+    "read_file",
+    "read_file_lines",
+    "list_directory",
+    "find_path",
+    "text_grep",
+    "code_search",
+    "task",
+    "task_spawn",
+    "task_wait",
+    "task_status",
+    "agent_team",
+];
+
+pub(crate) fn baseline_tool_names() -> &'static [&'static str] {
+    BASELINE_TOOL_NAMES
+}

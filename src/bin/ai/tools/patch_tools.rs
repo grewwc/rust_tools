@@ -183,8 +183,7 @@ fn parse_patch_envelope(patch: &str) -> Result<Option<PatchEnvelope>, String> {
         return Err("apply_patch does not support Delete File envelopes".to_string());
     } else {
         return Err(
-            "invalid patch envelope: expected `*** Update File:` or `*** Add File:`"
-                .to_string(),
+            "invalid patch envelope: expected `*** Update File:` or `*** Add File:`".to_string(),
         );
     };
 
@@ -202,8 +201,9 @@ fn parse_patch_envelope(patch: &str) -> Result<Option<PatchEnvelope>, String> {
             || line.starts_with("*** Add File: ")
             || line.starts_with("*** Delete File: ")
         {
-            return Err("multi-file patch not supported: apply_patch edits one file per call"
-                .to_string());
+            return Err(
+                "multi-file patch not supported: apply_patch edits one file per call".to_string(),
+            );
         }
         body_lines.push(line.to_string());
     }
@@ -240,8 +240,7 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
                     ));
                 }
             }
-            let mut normalized =
-                format!("@@ -0,0 +1,{} @@", envelope.body_lines.len());
+            let mut normalized = format!("@@ -0,0 +1,{} @@", envelope.body_lines.len());
             if !envelope.body_lines.is_empty() {
                 normalized.push('\n');
                 normalized.push_str(&envelope.body_lines.join("\n"));
@@ -470,7 +469,9 @@ pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
         .ok_or("missing file_path")?;
 
     let store = FileStore::new(PathBuf::from(&file_path));
-    store.validate_write_access().map_err(|err| err.to_string())?;
+    store
+        .validate_write_access()
+        .map_err(|err| err.to_string())?;
     let path = store.path().to_path_buf();
     let (_, normalized_patch) = if let Some(envelope) = envelope {
         ensure_patch_target_matches(&path, &envelope.target_path)?;
@@ -496,7 +497,11 @@ mod tests {
 
     fn make_temp_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("ai_patch_tools_test_{}_{}", name, uuid::Uuid::new_v4()));
+        path.push(format!(
+            "ai_patch_tools_test_{}_{}",
+            name,
+            uuid::Uuid::new_v4()
+        ));
         path
     }
 
@@ -569,7 +574,8 @@ mod tests {
             let args = serde_json::json!({
                 "patch": "*** Begin Patch\n*** Add File: new.txt\n+hello\n+world\n*** End Patch\n"
             });
-            execute_apply_patch(&args).expect("apply_patch should infer target from Add File envelope");
+            execute_apply_patch(&args)
+                .expect("apply_patch should infer target from Add File envelope");
         });
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello\nworld");

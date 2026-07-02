@@ -280,35 +280,14 @@ fn dedupe_tools_by_name(tools: Vec<ToolDef>) -> Vec<ToolDef> {
 }
 
 fn required_baseline_tool_names() -> Vec<String> {
-    vec![
-        // discovery / 自助能力：让模型在白名单 skill 下仍能发现并启用更多工具。
-        "discover_skills".to_string(),
-        // 读取 skill 正文（用于创建/修改/调试 skill），只读不激活；与 activate_skill
-        // 区分。常驻补回，避免 skill 用窄白名单时 agent 只能靠猜路径 read_file。
-        "load_skill".to_string(),
-        "enable_tools".to_string(),
-        // 基础只读 / 检索能力：读取文件、按行读取、目录浏览、路径查找、内容检索、
-        // 符号检索。这些是"理解现状"的最小工具集，不改动任何状态。若某个 skill 用
-        // 窄 tools:/tool_groups: 白名单替换工具集时不补回，主 Agent 就会失去最基本的
-        // 阅读代码能力（例如无法 read_file 用户明确点名的文件），因此常驻补回。
-        "read_file".to_string(),
-        "read_file_lines".to_string(),
-        "list_directory".to_string(),
-        "find_path".to_string(),
-        "text_grep".to_string(),
-        "code_search".to_string(),
-        // 子 Agent 编排：task_* 属于 core 组的常驻能力。skill 用 tools:/tool_groups:
-        // 白名单替换工具集时，若不补回，主 Agent 在 skill 激活期间就完全失去委派
-        // 子 Agent 的能力（且 :685 的 has_tool 提示门也会一并消失），导致"skill
-        // 用得多 → 子 Agent 用得少"。这里像 discover/enable 一样常驻补回。
-        // 注意：skill 显式 disable_builtin_tools 时 builtin_tools_for_skill 会提前
-        // 返回空集，根本不会走到这里，故该退出语义自然得到尊重。
-        "task".to_string(),
-        "task_spawn".to_string(),
-        "task_wait".to_string(),
-        "task_status".to_string(),
-        "agent_team".to_string(),
-    ]
+    // discovery / 自助能力 + 基础只读 / 检索能力 + 子 Agent 编排能力：
+    // 这些都是白名单 skill 替换工具集时也必须常驻补回的 baseline。与进程级
+    // allowed_tools whitelist 共享同一份清单，避免"schema 里可见，但执行时被
+    // whitelist 拦掉"的分叉。
+    crate::ai::tools::baseline_tool_names()
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
 }
 
 fn ensure_required_baseline_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {

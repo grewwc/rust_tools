@@ -106,10 +106,7 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     let rendered = render_line_excerpt(&content, start, end, None).text;
     let rendered = append_truncation_notice(rendered, start, end, total);
     Ok(append_symbol_outline_if_useful(
-        rendered,
-        file_path,
-        &content,
-        start,
+        rendered, file_path, &content, start,
     ))
 }
 
@@ -187,10 +184,7 @@ pub(crate) fn execute_read_file_lines(args: &Value) -> Result<String, String> {
     let rendered = render_line_excerpt(&content, start, end, None).text;
     let rendered = append_truncation_notice(rendered, start, end, total);
     Ok(append_symbol_outline_if_useful(
-        rendered,
-        file_path,
-        &content,
-        start,
+        rendered, file_path, &content, start,
     ))
 }
 
@@ -477,8 +471,8 @@ mod tests {
                 "offset": 2,
                 "limit": 1
             });
-            let lines =
-                execute_read_file_lines(&lines_args).expect("read_file_lines should accept path alias");
+            let lines = execute_read_file_lines(&lines_args)
+                .expect("read_file_lines should accept path alias");
             assert!(lines.contains("line2"), "output: {lines}");
             assert!(!lines.contains("line3"), "output: {lines}");
         });

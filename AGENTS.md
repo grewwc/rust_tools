@@ -64,6 +64,7 @@ Do not run the full workspace `cargo check`, `cargo test`, or other verification
 6. Prefer reuse over reinvention; avoid unrelated refactors and formatting churn.
 7. Avoid brittle hardcoded string rules when a typed, structural, or data-driven path exists.
 8. Keep tests close to the changed module where practical; serial tests should use `test_support::ENV_LOCK`.
+9. Do not modify code unrelated to the current task. Only change files and logic directly tied to the requirement; avoid opportunistic refactors, formatting, or "improvements" to unrelated code. If touching unrelated code is truly necessary, explain the reason first and get confirmation.
 
 ## High-Value Pitfalls
 

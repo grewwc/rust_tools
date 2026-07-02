@@ -90,7 +90,7 @@ pub(super) fn is_table_row_candidate(line: &str) -> bool {
         return false;
     }
     let cells = parse_table_row(s);
-    cells.len() >= 2
+    cells.len() >= 2 && header_candidate_has_clear_table_boundary(s, &cells)
 }
 
 pub(super) fn is_table_row(line: &str) -> bool {
@@ -171,6 +171,55 @@ pub(super) fn parse_table_align(line: &str, cols: usize) -> Vec<TableAlign> {
         });
     }
     out
+}
+
+fn header_candidate_has_clear_table_boundary(s: &str, cells: &[String]) -> bool {
+    if s.starts_with('|') {
+        return true;
+    }
+
+    let Some(first) = cells.first().map(|cell| cell.trim()) else {
+        return false;
+    };
+    let Some(last) = cells.last().map(|cell| cell.trim()) else {
+        return false;
+    };
+    if first.is_empty() || last.is_empty() {
+        return false;
+    }
+
+    if starts_with_non_table_block_prefix(first) || ends_with_sentence_punctuation(first) {
+        return false;
+    }
+
+    true
+}
+
+fn starts_with_non_table_block_prefix(s: &str) -> bool {
+    s.starts_with("> ")
+        || s.starts_with("- ")
+        || s.starts_with("* ")
+        || s.starts_with("+ ")
+        || has_ordered_list_prefix(s)
+}
+
+fn has_ordered_list_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+        if i > 4 {
+            break;
+        }
+    }
+    i > 0 && i + 1 < bytes.len() && bytes[i] == b'.' && bytes[i + 1] == b' '
+}
+
+fn ends_with_sentence_punctuation(s: &str) -> bool {
+    matches!(
+        s.chars().last(),
+        Some(':' | '：' | '。' | '，' | '；' | '！' | '？')
+    )
 }
 
 fn split_table_segments(s: &str) -> Vec<String> {
@@ -511,6 +560,23 @@ mod tests {
         assert_eq!(widths.len(), 2);
         assert!(widths[0] >= visible_width("`a|b`"));
         assert!(widths[1] >= visible_width(r#"$\frac{1}{2}$"#));
+    }
+
+    #[test]
+    fn bare_table_candidate_accepts_simple_header_without_leading_pipe() {
+        assert!(is_table_row_candidate("时间 | 线程 | 前置事件"));
+    }
+
+    #[test]
+    fn bare_table_candidate_rejects_sentence_prefixed_line() {
+        assert!(!is_table_row_candidate("两条记录对应: | 时间 | 线程 |"));
+        assert!(!is_table_row_candidate("两条记录对应：| 时间 | 线程 |"));
+    }
+
+    #[test]
+    fn bare_table_candidate_rejects_list_like_prefix() {
+        assert!(!is_table_row_candidate("- 时间 | 线程 | 前置事件"));
+        assert!(!is_table_row_candidate("1. 时间 | 线程 | 前置事件"));
     }
 
     #[test]

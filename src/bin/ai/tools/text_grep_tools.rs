@@ -258,11 +258,7 @@ fn path_match_bonus(display_path: &str, options: &ContentSearchOptions<'_>) -> i
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("");
-    if file_name.contains(&needle) {
-        3
-    } else {
-        1
-    }
+    if file_name.contains(&needle) { 3 } else { 1 }
 }
 
 /// 对单个匹配行打分：whole-word 命中 +4；字面大小写完全一致 +2；
@@ -276,10 +272,9 @@ fn score_line(line: &str, options: &ContentSearchOptions<'_>, regex: &Regex) -> 
     let matched = &line[m.start()..m.end()];
 
     // 全词命中加权。
-    let left_ok = m.start() == 0
-        || !is_identifier_byte(line.as_bytes()[m.start().saturating_sub(1)]);
-    let right_ok =
-        m.end() >= line.len() || !is_identifier_byte(line.as_bytes()[m.end()]);
+    let left_ok =
+        m.start() == 0 || !is_identifier_byte(line.as_bytes()[m.start().saturating_sub(1)]);
+    let right_ok = m.end() >= line.len() || !is_identifier_byte(line.as_bytes()[m.end()]);
     if left_ok && right_ok {
         score += 4;
     }
@@ -290,7 +285,10 @@ fn score_line(line: &str, options: &ContentSearchOptions<'_>, regex: &Regex) -> 
     }
 
     // 就近：匹配越靠前越好。
-    let lead = line[..m.start()].chars().filter(|c| !c.is_whitespace()).count();
+    let lead = line[..m.start()]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .count();
     score += match lead {
         0 => 2,
         1..=8 => 1,
@@ -506,8 +504,7 @@ fn collect_content_files(
             let name_str = name.to_string_lossy();
 
             if path.is_dir() {
-                if rust_tools::commonw::is_skip_dir(name_str.as_ref())
-                    || name_str.starts_with('.')
+                if rust_tools::commonw::is_skip_dir(name_str.as_ref()) || name_str.starts_with('.')
                 {
                     continue;
                 }
@@ -840,7 +837,11 @@ mod tests {
     fn test_content_search_ranks_filename_hit_first() {
         let dir = make_temp_dir("rank_name");
         fs::write(dir.join("unrelated.rs"), "// router used here\n").unwrap();
-        fs::write(dir.join("router.rs"), "// some other content\nlet router = 1;\n").unwrap();
+        fs::write(
+            dir.join("router.rs"),
+            "// some other content\nlet router = 1;\n",
+        )
+        .unwrap();
 
         let args = serde_json::json!({
             "pattern": "router",

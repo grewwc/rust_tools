@@ -305,10 +305,8 @@ mod tests {
     #[test]
     fn default_write_root_falls_back_to_effective_cwd() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "file-store-cwd-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let temp_root =
+            std::env::temp_dir().join(format!("file-store-cwd-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(temp_root.join("inside")).unwrap();
         let outside = temp_root
             .parent()
@@ -319,15 +317,13 @@ mod tests {
         unsafe { std::env::set_var("CONFIGW_PATH", temp_root.join("empty.configw")) };
         crate::commonw::configw::refresh();
 
-        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(
-            temp_root.clone(),
-            || {
+        let result =
+            crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(temp_root.clone(), || {
                 (
                     path_within_allowed_roots(&temp_root.join("inside/file.txt")),
                     path_within_allowed_roots(&outside),
                 )
-            },
-        );
+            });
 
         match old_cfg {
             Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
@@ -344,10 +340,8 @@ mod tests {
     #[test]
     fn read_access_is_not_limited_by_effective_cwd_when_not_sensitive() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "file-store-read-cwd-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let temp_root =
+            std::env::temp_dir().join(format!("file-store-read-cwd-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_root).unwrap();
         let outside = temp_root
             .parent()
@@ -358,9 +352,10 @@ mod tests {
         unsafe { std::env::set_var("CONFIGW_PATH", temp_root.join("empty.configw")) };
         crate::commonw::configw::refresh();
 
-        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(temp_root.clone(), || {
-            FileStore::new(outside.clone()).validate_read_access()
-        });
+        let result = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
+            .sync_scope(temp_root.clone(), || {
+                FileStore::new(outside.clone()).validate_read_access()
+            });
 
         match old_cfg {
             Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
@@ -370,20 +365,21 @@ mod tests {
         let _ = std::fs::remove_file(temp_root.join("empty.configw"));
         let _ = std::fs::remove_dir_all(&temp_root);
 
-        assert!(result.is_ok(), "read access should ignore effective_cwd root");
+        assert!(
+            result.is_ok(),
+            "read access should ignore effective_cwd root"
+        );
     }
 
     #[test]
     fn file_store_resolves_relative_paths_against_effective_cwd() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
-        let temp_root = std::env::temp_dir().join(format!(
-            "file-store-relative-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let temp_root =
+            std::env::temp_dir().join(format!("file-store-relative-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(temp_root.join("nested")).unwrap();
 
-        let resolved = crate::ai::driver::runtime_ctx::SUBAGENT_CWD
-            .sync_scope(temp_root.clone(), || {
+        let resolved =
+            crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(temp_root.clone(), || {
                 FileStore::new(PathBuf::from("nested/file.txt"))
                     .path()
                     .to_path_buf()

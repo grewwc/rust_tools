@@ -1,4 +1,4 @@
-use rust_tools::{commonw::utils::expanduser, terminalw};
+use rust_tools::{commonw::utils::expanduser, cw::Trie, terminalw};
 
 #[derive(Clone)]
 pub struct Options {
@@ -70,9 +70,32 @@ fn split_list(s: &str) -> Vec<String> {
 }
 
 pub fn parse_from_env() -> Option<Options> {
+    let argv = std::env::args().skip(1).collect::<Vec<_>>();
+
+    // handle --generate-completions (meta-operation, not a regular flag)
+    // usage: fk --generate-completions [bash|zsh|fish]
+    if argv.iter().any(|a| a == "--generate-completions") {
+        let shell = argv
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .cloned()
+            .or_else(|| {
+                std::env::var("SHELL")
+                    .ok()
+                    .and_then(|s| s.rsplit('/').next().map(|s| s.to_string()))
+            })
+            .unwrap_or_else(|| "bash".to_string());
+        let p = build_parser();
+        match shell.to_lowercase().as_str() {
+            "bash" => print_bash_completion(&p),
+            "zsh" => print_zsh_completion(&p),
+            _ => eprintln!("unsupported shell: {shell}. supported: bash, zsh"),
+        }
+        return None;
+    }
+
     println!();
 
-    let argv = std::env::args().skip(1).collect::<Vec<_>>();
     let mut p = build_parser();
     p.parse_argv(&argv, &[]);
 
@@ -138,6 +161,96 @@ pub fn parse_from_env() -> Option<Options> {
         max_len,
         num_print,
     })
+}
+
+/// Builds a word list of all flag names (short and long) from the parser's
+/// completion info, using a Trie for efficient prefix matching.
+fn build_flag_words(p: &terminalw::Parser) -> Vec<String> {
+    let info = p.collect_completion_info();
+    let mut trie = Trie::new();
+    for (name, _ty, _usage, aliases) in &info {
+        // insert all flag forms into the trie:
+        //   single-char canonical name → -x
+        //   multi-char canonical name → --xxx
+        //   aliases follow the same rule
+        if name.len() > 1 {
+            trie.insert(&format!("--{name}"));
+        } else {
+            trie.insert(&format!("-{name}"));
+        }
+        for alias in aliases {
+            if alias.len() == 1 {
+                trie.insert(&format!("-{alias}"));
+            } else {
+                trie.insert(&format!("--{alias}"));
+            }
+        }
+    }
+    trie.words_with_prefix("")
+}
+
+/// Generates a bash completion script for `fk`.
+fn print_bash_completion(p: &terminalw::Parser) {
+    let words = build_flag_words(p);
+    let word_list = words
+        .iter()
+        .map(|w| {
+            if w.contains('\'') {
+                format!("\"{}\"", w)
+            } else {
+                format!("'{}'", w)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    println!(
+        r#"# bash completion for fk
+_fk() {{
+    local cur="${{COMP_WORDS[COMP_CWORD]}}"
+    if [[ "$cur" == -* ]]; then
+        COMPREPLY=( $(compgen -W "{word_list}" -- "$cur") )
+    fi
+}}
+complete -F _fk fk
+"#
+    );
+}
+
+/// Generates a zsh completion script for `fk`.
+fn print_zsh_completion(p: &terminalw::Parser) {
+    let info = p.collect_completion_info();
+    println!("#compdef fk\n");
+    println!("_fk() {{");
+    println!("  local -a _fk_args");
+    println!();
+    for (name, ty, usage, aliases) in &info {
+        let mut forms: Vec<String> = Vec::new();
+        // single-char canonical → -x, multi-char → --xxx
+        if name.len() > 1 {
+            forms.push(format!("--{name}"));
+        } else {
+            forms.push(format!("-{name}"));
+        }
+        for alias in aliases {
+            if alias.len() == 1 {
+                forms.push(format!("-{alias}"));
+            } else {
+                forms.push(format!("--{alias}"));
+            }
+        }
+        let flags = forms.join(", ");
+        let desc = usage.replace('\'', "'\\''");
+        let value_part = match ty.as_str() {
+            "bool" => String::new(),
+            _ => format!(":{name}: "),
+        };
+        println!("  _fk_args+=('{flags}[{desc}]{value_part}')");
+    }
+    println!();
+    println!("  _arguments -s : \"$_fk_args[@]\"");
+    println!("}}");
+    println!("\ncompdef _fk fk");
 }
 
 #[cfg(test)]

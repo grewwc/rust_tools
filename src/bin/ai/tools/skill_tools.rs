@@ -71,10 +71,7 @@ fn skill_search_haystack(skill: &SkillManifest) -> String {
     // 检索仅基于 name/description/能力字段等真实语义来源。
     // source_path/resource_path 是实现细节和纯路径噪音，不应参与检索，
     // 也不应把本地文件系统路径泄露给模型。
-    let mut parts = vec![
-        skill.name.clone(),
-        skill.description.clone(),
-    ];
+    let mut parts = vec![skill.name.clone(), skill.description.clone()];
     parts.extend(skill.tools.iter().cloned());
     parts.extend(skill.tool_groups.iter().cloned());
     parts.extend(skill.mcp_servers.iter().cloned());
@@ -768,8 +765,8 @@ inventory::submit!(ToolRegistration {
 mod tests {
     use super::{
         build_skill_file_content, execute_activate_skill, execute_discover_skills,
-        execute_load_skill, query_tokens, render_loaded_skill, skill_matches_query, summarize_skill,
-        take_pending_skill_activation,
+        execute_load_skill, query_tokens, render_loaded_skill, skill_matches_query,
+        summarize_skill, take_pending_skill_activation,
     };
     use crate::ai::skills::SkillManifest;
     use std::sync::{LazyLock, Mutex};
@@ -843,9 +840,8 @@ mod tests {
     #[test]
     fn summarize_skill_hides_local_source_and_resource_paths() {
         let mut skill = test_skill("feishu-upload", "Upload markdown into Feishu docs");
-        skill.source_path = Some(
-            "/Users/bytedance/.config/rust_tools/skills/feishu-upload-md.skill".to_string(),
-        );
+        skill.source_path =
+            Some("/Users/bytedance/.config/rust_tools/skills/feishu-upload-md.skill".to_string());
         skill.resource_path = Some("/tmp/feishu-upload/resources".to_string());
 
         let out = summarize_skill(&skill, true);

@@ -118,16 +118,16 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                 current.push(bytes[i + 1] as char);
                 i += 2;
             }
-                b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'<' => {
-                    if let Some((end, spec)) = parse_heredoc_at(command, i) {
-                        current.push_str(&command[i..end]);
-                        pending_heredocs.push(spec);
-                        i = end;
-                    } else {
-                        current.push('<');
-                        i += 1;
-                    }
+            b'<' if i + 1 < bytes.len() && bytes[i + 1] == b'<' => {
+                if let Some((end, spec)) = parse_heredoc_at(command, i) {
+                    current.push_str(&command[i..end]);
+                    pending_heredocs.push(spec);
+                    i = end;
+                } else {
+                    current.push('<');
+                    i += 1;
                 }
+            }
             // 双字符操作符 `&&` / `||`
             b'&' if i + 1 < bytes.len() && bytes[i + 1] == b'&' => {
                 segments.push(std::mem::take(&mut current));
@@ -138,18 +138,18 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                 i += 2;
             }
             // 单字符分隔符
-                b';' | b'|' | b'&' => {
+            b';' | b'|' | b'&' => {
                 segments.push(std::mem::take(&mut current));
                 i += 1;
             }
-                b'\n' => {
-                    segments.push(std::mem::take(&mut current));
-                    i += 1;
-                    if !pending_heredocs.is_empty() {
-                        i = skip_heredoc_bodies(command, i, &pending_heredocs);
-                        pending_heredocs.clear();
-                    }
+            b'\n' => {
+                segments.push(std::mem::take(&mut current));
+                i += 1;
+                if !pending_heredocs.is_empty() {
+                    i = skip_heredoc_bodies(command, i, &pending_heredocs);
+                    pending_heredocs.clear();
                 }
+            }
             _ => {
                 current.push(b as char);
                 i += 1;
@@ -478,8 +478,10 @@ fn xargs_command_index(tokens: &[String]) -> Option<usize> {
             || tok.starts_with("--max-args=")
             || tok.starts_with("--max-procs=")
             || tok.starts_with("--max-chars=")
-            || matches!(tok.chars().nth(1), Some('a' | 'd' | 'E' | 'e' | 'I' | 'i' | 'L' | 'l' | 'n' | 'P' | 's'))
-                && tok.len() > 2
+            || matches!(
+                tok.chars().nth(1),
+                Some('a' | 'd' | 'E' | 'e' | 'I' | 'i' | 'L' | 'l' | 'n' | 'P' | 's')
+            ) && tok.len() > 2
                 && !tok.starts_with("--");
         if attached_value {
             i += 1;
@@ -487,8 +489,7 @@ fn xargs_command_index(tokens: &[String]) -> Option<usize> {
         }
         let takes_value = matches!(
             tok,
-            "-a"
-                | "--arg-file"
+            "-a" | "--arg-file"
                 | "-d"
                 | "--delimiter"
                 | "-E"
@@ -519,8 +520,10 @@ fn env_command_index(tokens: &[String], raw_tokens: &[String]) -> Option<usize> 
         if tok == "--" {
             return (i + 1 < tokens.len()).then_some(i + 1);
         }
-        if matches!(tok, "-u" | "--unset" | "-c" | "--chdir" | "-s" | "--split-string")
-            || tok == "-a"
+        if matches!(
+            tok,
+            "-u" | "--unset" | "-c" | "--chdir" | "-s" | "--split-string"
+        ) || tok == "-a"
         {
             i += 2;
             continue;
@@ -546,7 +549,11 @@ fn env_command_index(tokens: &[String], raw_tokens: &[String]) -> Option<usize> 
     None
 }
 
-fn first_non_option_index(tokens: &[String], start: usize, options_with_value: &[&str]) -> Option<usize> {
+fn first_non_option_index(
+    tokens: &[String],
+    start: usize,
+    options_with_value: &[&str],
+) -> Option<usize> {
     let mut i = start;
     while i < tokens.len() {
         let tok = tokens[i].as_str();
@@ -640,7 +647,11 @@ fn timeout_command_index(tokens: &[String]) -> Option<usize> {
     (command_idx < tokens.len()).then_some(command_idx)
 }
 
-fn indirect_command_index(program: &str, tokens: &[String], raw_tokens: &[String]) -> Option<usize> {
+fn indirect_command_index(
+    program: &str,
+    tokens: &[String],
+    raw_tokens: &[String],
+) -> Option<usize> {
     match program {
         "xargs" => xargs_command_index(tokens),
         "env" => env_command_index(tokens, raw_tokens),
@@ -678,48 +689,12 @@ fn find_has_blocked_exec_semantics(tokens: &[String]) -> Option<&str> {
     const BLOCKED_FIND_FLAGS: &[&str] = &["-delete", "-exec", "-execdir", "-ok", "-okdir"];
     fn find_primary_arg_count(tok: &str) -> usize {
         match tok {
-            "-amin"
-            | "-anewer"
-            | "-atime"
-            | "-cmin"
-            | "-cnewer"
-            | "-context"
-            | "-ctime"
-            | "-files0-from"
-            | "-fls"
-            | "-fprint"
-            | "-fprint0"
-            | "-fstype"
-            | "-gid"
-            | "-group"
-            | "-ilname"
-            | "-iname"
-            | "-inum"
-            | "-ipath"
-            | "-iregex"
-            | "-iwholename"
-            | "-links"
-            | "-lname"
-            | "-maxdepth"
-            | "-mindepth"
-            | "-mmin"
-            | "-mtime"
-            | "-name"
-            | "-newer"
-            | "-newerxy"
-            | "-path"
-            | "-perm"
-            | "-printf"
-            | "-regex"
-            | "-samefile"
-            | "-size"
-            | "-since"
-            | "-type"
-            | "-uid"
-            | "-used"
-            | "-user"
-            | "-wholename"
-            | "-xtype" => 1,
+            "-amin" | "-anewer" | "-atime" | "-cmin" | "-cnewer" | "-context" | "-ctime"
+            | "-files0-from" | "-fls" | "-fprint" | "-fprint0" | "-fstype" | "-gid" | "-group"
+            | "-ilname" | "-iname" | "-inum" | "-ipath" | "-iregex" | "-iwholename" | "-links"
+            | "-lname" | "-maxdepth" | "-mindepth" | "-mmin" | "-mtime" | "-name" | "-newer"
+            | "-newerxy" | "-path" | "-perm" | "-printf" | "-regex" | "-samefile" | "-size"
+            | "-since" | "-type" | "-uid" | "-used" | "-user" | "-wholename" | "-xtype" => 1,
             "-fprintf" => 2,
             _ => 0,
         }
@@ -854,8 +829,7 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
             );
         }
         // 进程替换 `<(...)` / `>(...)` 只在引号外有 shell 语义。
-        if !in_double && (b == b'<' || b == b'>') && i + 1 < bytes.len() && bytes[i + 1] == b'('
-        {
+        if !in_double && (b == b'<' || b == b'>') && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             return Err("process substitution `<(...)` / `>(...)` is not allowed".to_string());
         }
         if !in_double && b == b'\n' && !pending_heredocs.is_empty() {
@@ -947,20 +921,16 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
                     if program == "mv" {
                         let option = lower_token.as_str();
                         if option == "-t" || option == "--target-directory" {
-                            let dir = iter
-                                .next()
-                                .ok_or_else(|| {
-                                    format!("missing target directory for '{raw_token}'")
-                                })?;
+                            let dir = iter.next().ok_or_else(|| {
+                                format!("missing target directory for '{raw_token}'")
+                            })?;
                             path_args.push(dir.1.to_string());
                             continue;
                         }
 
                         if let Some(dir) = raw_token.strip_prefix("--target-directory=") {
                             if dir.is_empty() {
-                                return Err(format!(
-                                    "missing target directory for '{raw_token}'"
-                                ));
+                                return Err(format!("missing target directory for '{raw_token}'"));
                             }
                             path_args.push(dir.to_string());
                             continue;
@@ -1075,10 +1045,30 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
     // 常见包装器会把后续 token 当作真正要执行的程序；只检查"将被执行的那个程序名"，
     // 避免把普通内容参数（如 `printf '%s' rm` 里的 `rm`）误判为危险命令。
     const DANGEROUS_PROGRAM_NAMES: &[&str] = &[
-        "rm", "mv", "chmod", "chown", "chgrp", "sudo", "su",
-        "ssh", "scp", "rsync", "dd", "kill", "pkill", "killall",
-        "shutdown", "reboot", "eval", "mount", "umount", "ln",
-        "truncate", "passwd", "launchctl", "systemctl",
+        "rm",
+        "mv",
+        "chmod",
+        "chown",
+        "chgrp",
+        "sudo",
+        "su",
+        "ssh",
+        "scp",
+        "rsync",
+        "dd",
+        "kill",
+        "pkill",
+        "killall",
+        "shutdown",
+        "reboot",
+        "eval",
+        "mount",
+        "umount",
+        "ln",
+        "truncate",
+        "passwd",
+        "launchctl",
+        "systemctl",
     ];
     if let Some(idx) = indirect_command_index(program, &lower_tokens, &tokens) {
         let nested = lower_tokens[idx].as_str();
@@ -1249,17 +1239,13 @@ mod tests {
 
     #[test]
     fn injection_allows_command_substitution_text_inside_quoted_heredoc() {
-        assert!(
-            validate_no_injection_surface("cat <<'EOF'\n$(whoami)\nEOF").is_ok()
-        );
+        assert!(validate_no_injection_surface("cat <<'EOF'\n$(whoami)\nEOF").is_ok());
         assert!(validate_no_injection_surface("cat <<'EOF'\n`whoami`\nEOF").is_ok());
     }
 
     #[test]
     fn injection_blocks_command_substitution_inside_unquoted_heredoc() {
-        assert!(
-            validate_no_injection_surface("cat <<EOF\n$(whoami)\nEOF").is_err()
-        );
+        assert!(validate_no_injection_surface("cat <<EOF\n$(whoami)\nEOF").is_err());
         assert!(validate_no_injection_surface("cat <<EOF\n`whoami`\nEOF").is_err());
     }
 
