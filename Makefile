@@ -1,6 +1,10 @@
 INSTALL_BINS ?= $(sort $(patsubst src/bin/%.rs,%,$(wildcard src/bin/*.rs)))
 ALL_BINS ?= $(INSTALL_BINS) c
 
+# 允许 `make install fk` / `make install fk ff` 语法
+.PHONY: $(INSTALL_BINS)
+$(INSTALL_BINS): install
+
 RELEASE_DIR := target/release
 DEBUG_DIR := target/debug
 INSTALLW := $(DEBUG_DIR)/installw
@@ -18,15 +22,14 @@ $(INSTALLW): $(INSTALLW_DEPS)
 RUSTFLAGS_INSTALL ?= -Awarnings
 install: export RUSTFLAGS := $(strip $(RUSTFLAGS) $(RUSTFLAGS_INSTALL))
 .PHONY: install
-install: $(INSTALLW)
+install:
 	$(eval REQUESTED := $(filter-out install,$(MAKECMDGOALS)))
 	$(eval BINS := $(or $(REQUESTED),$(INSTALL_BINS)))
-	@bins=$$($(INSTALLW) -- $(BINS)); \
-	if [ -n "$$bins" ]; then \
-		args=""; \
-		for b in $$bins; do args="$$args --bin $$b"; done; \
-		cargo build --release $$args; \
-	fi; \
+	@set -e; \
+	args=""; \
+	for b in $(BINS); do args="$$args --bin $$b"; done; \
+	echo "building $$args"; \
+	cargo build --release $$args; \
 	sh ./move_executable.sh $(BINS)
 
 	@$(MAKE) install-completions
@@ -55,14 +58,11 @@ install-completions:
 					echo "  added rehash style to ~/.zshrc"; \
 				fi; \
 			else \
-				echo "  ~/.zshrc already has fpath for $$bin"; \
 				if ! grep -qF "rehash true" "$${HOME}/.zshrc" 2>/dev/null; then \
 					{ echo ""; echo "zstyle '"'"':completion:*'"'"' rehash true"; } >> "$${HOME}/.zshrc"; \
 					echo "  added rehash style to ~/.zshrc"; \
 				fi; \
 			fi; \
-			echo "  completions -> $$DST/_$$bin"; \
-			echo "  add to ~/.zshrc: $$line"; \
 			;; \
 		  fish) \
 			DST="$${HOME}/.config/fish/completions"; \
