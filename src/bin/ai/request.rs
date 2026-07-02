@@ -16,12 +16,11 @@ use super::{
         Message, ROLE_SYSTEM, is_internal_note_role, is_system_like_role, messages_to_markdown,
     },
     models,
-    provider::{ApiProvider, ReasoningEffort},
+    provider::ReasoningEffort,
     skills::SkillManifest,
     types::App,
 };
 use crate::ai::config_schema::AiConfig;
-use crate::ai::driver::intent_recognition;
 use crate::ai::theme::{ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_SUCCESS, ACCENT_WARN, RESET};
 use crate::commonw::configw;
 
@@ -552,7 +551,6 @@ const STREAM_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 90;
 const AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS: u64 = 30;
 const AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS: usize = 1;
 const DEFAULT_AUTO_THINKING_THRESHOLD: f64 = 0.7;
-const DEFAULT_CONTROL_MODEL: &str = "qwen3.5-flash";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RequestRetryPolicy {
@@ -659,19 +657,7 @@ pub(super) fn control_model_for_aux_tasks(app: &App) -> String {
         .as_deref()
         .filter(|v| !v.trim().is_empty())
         .map(models::determine_model)
-        .unwrap_or_else(|| match models::model_provider(&app.current_model) {
-            ApiProvider::Alibaba | ApiProvider::Compatible => {
-                models::determine_model(DEFAULT_CONTROL_MODEL)
-            }
-            _ => {
-                let current_model = app.current_model.trim();
-                if current_model.is_empty() {
-                    "gpt-4o-mini".to_string()
-                } else {
-                    current_model.to_string()
-                }
-            }
-        })
+        .unwrap_or_else(|| app.current_model.trim().to_string())
 }
 
 pub(super) fn is_transient_error(err: &RequestError) -> bool {
@@ -709,6 +695,58 @@ pub(super) fn should_try_model_fallback(err: &RequestError) -> bool {
         }
     }
 }
+
+// #region debug-point A:resolve-thinking-reporter
+fn report_resolve_thinking_debug(
+    run_id: &'static str,
+    hypothesis_id: &'static str,
+    location: &'static str,
+    msg: &'static str,
+    data: Value,
+) {
+    static DEBUG_TARGET: std::sync::LazyLock<Option<(String, String)>> = std::sync::LazyLock::new(
+        || {
+            let env_text = std::fs::read_to_string(".dbg/resolve-thinking-slow.env").ok()?;
+            let mut debug_server_url = "http://127.0.0.1:7777/event".to_string();
+            let mut debug_session_id = "resolve-thinking-slow".to_string();
+            for line in env_text.lines() {
+                if let Some(value) = line.strip_prefix("DEBUG_SERVER_URL=") {
+                    if !value.trim().is_empty() {
+                        debug_server_url = value.trim().to_string();
+                    }
+                } else if let Some(value) = line.strip_prefix("DEBUG_SESSION_ID=")
+                    && !value.trim().is_empty()
+                {
+                    debug_session_id = value.trim().to_string();
+                }
+            }
+            Some((debug_server_url, debug_session_id))
+        },
+    );
+
+    let Some((debug_server_url, debug_session_id)) = DEBUG_TARGET.as_ref().cloned() else {
+        return;
+    };
+
+    std::thread::spawn(move || {
+        let payload = serde_json::json!({
+            "sessionId": debug_session_id,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "msg": msg,
+            "data": data,
+            "ts": chrono::Utc::now().timestamp_millis(),
+        });
+        if let Ok(client) = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_millis(300))
+            .build()
+        {
+            let _ = client.post(debug_server_url).json(&payload).send();
+        }
+    });
+}
+// #endregion
 
 /// Resolve whether to enable thinking mode for this request.
 ///
@@ -749,28 +787,62 @@ async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool 
     // 只用用户真正输入的内容做意图与 thinking 判定。
     let question = strip_system_reminders(&raw_question);
     let question = question.trim();
+    // #region debug-point D:resolve-thinking-input
+    report_resolve_thinking_debug(
+        "pre-fix",
+        "D",
+        "request::resolve_thinking:prepared_input",
+        "[DEBUG] resolve_thinking prepared input",
+        serde_json::json!({
+            "raw_question_len": raw_question.chars().count(),
+            "clean_question_len": question.chars().count(),
+            "reminder_removed": raw_question.len() != question.len(),
+            "message_count": messages.len(),
+            "model": model,
+        }),
+    );
+    // #endregion
     if !question.is_empty() {
-        let local_intent = intent_recognition::detect_intent_with_model_path(
-            question,
-            &app.config.intent_model_path,
-        );
-        if let Some(local_decision) = local_thinking_decision(question, &local_intent) {
+        if let Some(local_decision) = local_thinking_decision(question) {
             crate::ai::agent_hang_debug!(
                 "post-fix",
                 "G",
                 "request::resolve_thinking:local_decision",
                 "[DEBUG] resolve thinking decided locally",
                 {
-                    "core": format!("{:?}", local_intent.core),
                     "question_len": question.chars().count(),
                     "decision": local_decision,
                 },
             );
+            // #region debug-point A:local-decision
+            report_resolve_thinking_debug(
+                "pre-fix",
+                "A",
+                "request::resolve_thinking:local_decision",
+                "[DEBUG] resolve_thinking decided locally",
+                serde_json::json!({
+                    "question_len": question.chars().count(),
+                    "decision": local_decision,
+                }),
+            );
+            // #endregion
             return local_decision;
         }
     }
 
     // Model-only decision path: if gate fails/uncertain, default to disabled.
+    // #region debug-point B:gate-fallback
+    report_resolve_thinking_debug(
+        "pre-fix",
+        "B",
+        "request::resolve_thinking:gate_fallback",
+        "[DEBUG] resolve_thinking fell back to model gate",
+        serde_json::json!({
+            "question_len": question.chars().count(),
+            "model": model,
+        }),
+    );
+    // #endregion
     decide_thinking_via_model(app, model, messages)
         .await
         .unwrap_or(false)
@@ -813,38 +885,20 @@ pub(crate) fn strip_system_reminders(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn local_thinking_decision(
-    question: &str,
-    intent: &intent_recognition::UserIntent,
-) -> Option<bool> {
+fn local_thinking_decision(question: &str) -> Option<bool> {
     let question = question.trim();
     if question.is_empty() {
         return Some(false);
     }
 
-    let question_len = question.chars().count();
     let nonempty_lines: Vec<&str> = question
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .collect();
     let line_count = nonempty_lines.len();
-    let has_code_like_content = question.contains("```")
-        || question.contains("::")
-        || question.split_whitespace().any(|token| {
-            token.contains('/')
-                || token.contains('\\')
-                || token.ends_with(".rs")
-                || token.ends_with(".ts")
-                || token.ends_with(".tsx")
-                || token.ends_with(".js")
-                || token.ends_with(".jsx")
-                || token.ends_with(".py")
-                || token.ends_with(".go")
-                || token.ends_with(".java")
-        });
     // 结构化诊断痕迹：后续行出现 `label: details` / 堆栈路径样式，
-    // 不依赖具体错误关键词。
+    // 不依赖具体错误关键词。QuestionShape 不覆盖此维度，内联计算后传入。
     let has_diagnostic_shape = line_count >= 2
         && nonempty_lines.iter().skip(1).any(|line| {
             line.contains(": ")
@@ -854,40 +908,16 @@ fn local_thinking_decision(
                 || line.contains('/')
                 || line.contains('\\')
         });
-    let has_multistep_shape =
-        line_count >= 3 || question.contains("\n- ") || question.contains("\n1.");
-    let looks_like_complex_solution_request =
-        matches!(intent.core, intent_recognition::CoreIntent::SeekSolution)
-            && (question_len >= 48
-                || has_code_like_content
-                || has_multistep_shape
-                || has_diagnostic_shape);
-    let looks_like_complex_action_request =
-        matches!(intent.core, intent_recognition::CoreIntent::RequestAction)
-            && (question_len >= 96 || has_code_like_content || has_multistep_shape);
 
-    if matches!(
-        intent.core,
-        intent_recognition::CoreIntent::Casual | intent_recognition::CoreIntent::QueryConcept
-    ) && question_len <= 120
-        && !has_code_like_content
-    {
-        return Some(false);
-    }
-
-    if looks_like_complex_solution_request
-        || looks_like_complex_action_request
-        || (question_len >= 220
-            && matches!(
-                intent.core,
-                intent_recognition::CoreIntent::RequestAction
-                    | intent_recognition::CoreIntent::SeekSolution
-            ))
-    {
+    let shape = crate::ai::driver::turn_runtime::QuestionShape::analyze(question);
+    if shape.needs_deliberate_thinking(has_diagnostic_shape) {
         return Some(true);
     }
 
-    None
+    // 兜底恒给决策：不再返回 None，避免 resolve_thinking 落到耗时数秒的
+    // 模型 gate。中间地带（长但无结构）倒向 false（快），复杂输入已在上面
+    // 稳定判 true。
+    Some(false)
 }
 
 /// Ask the model whether this request needs thinking mode.
@@ -933,6 +963,7 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
     } else {
         question.to_string()
     };
+    let clipped_len = clipped.chars().count();
 
     let gate_messages = vec![
         Message {
@@ -955,6 +986,19 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
     ];
 
     let control_model = control_model_for_aux_tasks(app);
+    // #region debug-point C:gate-request-prep
+    report_resolve_thinking_debug(
+        "pre-fix",
+        "C",
+        "request::decide_thinking_via_model:request_prep",
+        "[DEBUG] thinking gate request prepared",
+        serde_json::json!({
+            "control_model": control_model,
+            "question_len": question.chars().count(),
+            "clipped_len": clipped_len,
+        }),
+    );
+    // #endregion
     let request_body = build_request_body(
         &control_model,
         &gate_messages,
@@ -970,13 +1014,44 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
     let api_key = api_key_for_request_model(app, &control_model);
     // 辅助请求（thinking gate），15 秒超时兜底：主 client 无整体 timeout，
     // 仅 connect_timeout 不覆盖“连上但服务端不回响应头”的永久阻塞。
+    let send_start = Instant::now();
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
         .json(&request_body)
         .send();
     let response = match tokio::time::timeout(Duration::from_secs(15), send_future).await {
-        Ok(r) => r.ok()?,
-        Err(_) => return None,
+        Ok(r) => {
+            let outcome = if r.is_ok() { "ok" } else { "err" };
+            // #region debug-point B:gate-send
+            report_resolve_thinking_debug(
+                "pre-fix",
+                "B",
+                "request::decide_thinking_via_model:send",
+                "[DEBUG] thinking gate send finished",
+                serde_json::json!({
+                    "elapsed_ms": send_start.elapsed().as_secs_f64() * 1000.0,
+                    "outcome": outcome,
+                    "endpoint": endpoint,
+                }),
+            );
+            // #endregion
+            r.ok()?
+        }
+        Err(_) => {
+            // #region debug-point B:gate-send-timeout
+            report_resolve_thinking_debug(
+                "pre-fix",
+                "B",
+                "request::decide_thinking_via_model:send_timeout",
+                "[DEBUG] thinking gate send timed out",
+                serde_json::json!({
+                    "elapsed_ms": send_start.elapsed().as_secs_f64() * 1000.0,
+                    "endpoint": endpoint,
+                }),
+            );
+            // #endregion
+            return None;
+        }
     };
 
     if !response.status().is_success() {
@@ -992,9 +1067,38 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
         return None;
     }
 
+    let body_start = Instant::now();
     let text = match tokio::time::timeout(Duration::from_secs(15), response.text()).await {
-        Ok(r) => r.ok()?,
-        Err(_) => return None,
+        Ok(r) => {
+            let outcome = if r.is_ok() { "ok" } else { "err" };
+            // #region debug-point B:gate-body
+            report_resolve_thinking_debug(
+                "pre-fix",
+                "B",
+                "request::decide_thinking_via_model:body",
+                "[DEBUG] thinking gate body read finished",
+                serde_json::json!({
+                    "elapsed_ms": body_start.elapsed().as_secs_f64() * 1000.0,
+                    "outcome": outcome,
+                }),
+            );
+            // #endregion
+            r.ok()?
+        }
+        Err(_) => {
+            // #region debug-point B:gate-body-timeout
+            report_resolve_thinking_debug(
+                "pre-fix",
+                "B",
+                "request::decide_thinking_via_model:body_timeout",
+                "[DEBUG] thinking gate body read timed out",
+                serde_json::json!({
+                    "elapsed_ms": body_start.elapsed().as_secs_f64() * 1000.0,
+                }),
+            );
+            // #endregion
+            return None;
+        }
     };
     let v: Value = serde_json::from_str(&text).ok()?;
     let content = extract_router_content(&v)?;
@@ -1010,6 +1114,21 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
     } else {
         None
     };
+    // #region debug-point B:gate-result
+    report_resolve_thinking_debug(
+        "pre-fix",
+        "B",
+        "request::decide_thinking_via_model:result",
+        "[DEBUG] thinking gate parsed result",
+        serde_json::json!({
+            "elapsed_ms": gate_start.elapsed().as_secs_f64() * 1000.0,
+            "thinking": thinking,
+            "confidence": confidence,
+            "threshold": threshold,
+            "accepted": result.is_some(),
+        }),
+    );
+    // #endregion
     result
 }
 
@@ -1534,9 +1653,43 @@ fn line_references_unavailable_registered_tool(
             if candidate.is_empty() {
                 return None;
             }
-            crate::ai::tools::registry::common::get_tool_spec(candidate).map(|_| candidate)
+            crate::ai::tools::registry::common::is_registered_tool_name(candidate)
+                .then_some(candidate)
         })
         .any(|tool_name| !available_tool_names.contains(tool_name))
+}
+
+fn line_can_contain_unavailable_tool_hint(message: &Message, line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if !trimmed.contains('`') {
+        return false;
+    }
+
+    if message.role == ROLE_SYSTEM || is_internal_note_role(&message.role) {
+        return trimmed.starts_with("- ") || trimmed.starts_with("Code-navigation correction:");
+    }
+
+    if message.role == "tool" {
+        return trimmed.starts_with("Suggestion:");
+    }
+
+    false
+}
+
+fn message_may_need_unavailable_tool_hint_filter(message: &Message, text: &str) -> bool {
+    if !text.contains('`') {
+        return false;
+    }
+
+    if message.role == ROLE_SYSTEM || is_internal_note_role(&message.role) {
+        return text.contains("- ") || text.contains("Code-navigation correction:");
+    }
+
+    if message.role == "tool" {
+        return text.contains("Suggestion:");
+    }
+
+    false
 }
 
 fn should_drop_unavailable_tool_hint_line(
@@ -1544,12 +1697,16 @@ fn should_drop_unavailable_tool_hint_line(
     line: &str,
     available_tool_names: &rust_tools::commonw::FastSet<String>,
 ) -> bool {
+    if !line_can_contain_unavailable_tool_hint(message, line) {
+        return false;
+    }
+
     if !line_references_unavailable_registered_tool(line, available_tool_names) {
         return false;
     }
 
     let trimmed = line.trim_start();
-    if message.role == crate::ai::history::ROLE_INTERNAL_NOTE || message.role == "system" {
+    if message.role == ROLE_SYSTEM || is_internal_note_role(&message.role) {
         return trimmed.starts_with("- ") || trimmed.starts_with("Code-navigation correction:");
     }
     if message.role == "tool" {
@@ -1566,14 +1723,28 @@ fn strip_unavailable_tool_hints_from_messages(
         let Some(text) = message.content.as_str() else {
             continue;
         };
-        let filtered = text
-            .lines()
-            .filter(|line| {
-                !should_drop_unavailable_tool_hint_line(message, line, available_tool_names)
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        if filtered != text {
+        if !message_may_need_unavailable_tool_hint_filter(message, text) {
+            continue;
+        }
+
+        let mut filtered = String::new();
+        let mut removed_any = false;
+        let mut prefix_len = 0usize;
+        for raw_line in text.split_inclusive('\n') {
+            let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+            if should_drop_unavailable_tool_hint_line(message, line, available_tool_names) {
+                if !removed_any {
+                    filtered = String::with_capacity(text.len());
+                    filtered.push_str(&text[..prefix_len]);
+                    removed_any = true;
+                }
+            } else if removed_any {
+                filtered.push_str(raw_line);
+            }
+            prefix_len += raw_line.len();
+        }
+
+        if removed_any {
             message.content = Value::String(filtered);
         }
     }
@@ -2735,148 +2906,9 @@ pub(crate) fn charge_llm_usage_via_kernel(
     Some(outcome)
 }
 
-/// 通过 LLM 做用户意图识别（fallback 路径）。
-///
-/// 调用条件：本地 TF-IDF 给出 `Casual` 但问题文本看起来"非闲聊"
-/// （比如带代码块、中等长度、显式问号 + 动词等）。这种情况下旧实现
-/// 会被错分到 Casual，影响 thinking gate / skill 路由 / recall。
-///
-/// 接入要求：每次走到这里都会通过 [eprintln!] 打印 `[intent:llm]`
-/// 标识，方便用户在终端可见地区分本地分类 vs 大模型分类。
-///
-/// 返回 `Some(core)` 仅当：
-///   - HTTP 调用成功
-///   - 返回的 JSON 能解析出 `intent` 字段
-///   - confidence ≥ 0.6（与 thinking gate 一致的保守阈值）
-pub async fn classify_intent_via_model(
-    app: &App,
-    question: &str,
-) -> Option<crate::ai::driver::intent_recognition::CoreIntent> {
-    use crate::ai::driver::intent_recognition::CoreIntent;
-
-    // 意图分类只看用户原始问题，不把 system-reminder / per-turn context
-    // 当作输入，避免辅助模型额外耗 token 且被元上下文误导。
-    let q = strip_system_reminders(question);
-    let q = q.trim();
-    if q.is_empty() {
-        return None;
-    }
-    let clipped = if q.chars().count() > 800 {
-        q.chars().take(800).collect::<String>()
-    } else {
-        q.to_string()
-    };
-
-    let gate_messages = vec![
-        Message {
-            role: "system".to_string(),
-            content: Value::String(
-                "You are a user intent classifier. Output STRICT JSON only: \
-{\"intent\":\"query_concept\"|\"request_action\"|\"seek_solution\"|\"casual\",\"confidence\":0.0}\n\
-Definitions:\n\
-- query_concept: 询问概念/定义（“是什么”、“什么意思”）\n\
-- request_action: 请求执行操作（“帮我做”、“修复”、“实现”）\n\
-- seek_solution: 寻求解决方案（“怎么处理”、“如何解决”、报错诊断）\n\
-- casual: 闲聊或无明确意图\n\
-confidence ∈ [0,1]，对边界样本请给低值（<0.6）。"
-                    .to_string(),
-            ),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        },
-        Message {
-            role: "user".to_string(),
-            content: Value::String(clipped),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        },
-    ];
-
-    let control_model = control_model_for_aux_tasks(app);
-
-    // 用户可见标识：本次意图识别走的是 LLM 而非本地 TF-IDF。
-    eprintln!(
-        "[intent:llm] using model='{}' (local TF-IDF fell back to Casual on a non-trivial question)",
-        control_model
-    );
-
-    let request_body = build_request_body(
-        &control_model,
-        &gate_messages,
-        false,
-        false,
-        None,
-        None,
-        None,
-        None,
-    );
-
-    let endpoint = endpoint_for_request_model(app, &control_model);
-    let api_key = api_key_for_request_model(app, &control_model);
-
-    // 意图分类是辅助请求，给 15 秒超时足够；避免因 API 无响应卡住整个 turn
-    let request_future = async {
-        let response = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
-            .ok()?;
-        if !response.status().is_success() {
-            eprintln!("[intent:llm] http non-success status={}", response.status());
-            return None;
-        }
-        response.text().await.ok()
-    };
-    let text = match tokio::time::timeout(Duration::from_secs(15), request_future).await {
-        Ok(Some(t)) => t,
-        Ok(None) => return None,
-        Err(_) => {
-            eprintln!("[intent:llm] timeout (15s), skipping");
-            return None;
-        }
-    };
-    let v: Value = serde_json::from_str(&text).ok()?;
-    let content = extract_router_content(&v)?;
-
-    let s = strip_json_fence(&content);
-    let candidate = if let (Some(l), Some(r)) = (s.find('{'), s.rfind('}'))
-        && r >= l
-    {
-        &s[l..=r]
-    } else {
-        s
-    };
-    let parsed: Value = serde_json::from_str(candidate).ok()?;
-    let intent_str = parsed.get("intent").and_then(|v| v.as_str())?;
-    let confidence = parsed
-        .get("confidence")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0);
-    if confidence < 0.6 {
-        eprintln!(
-            "[intent:llm] low confidence ({:.2}); ignoring -> Casual",
-            confidence
-        );
-        return None;
-    }
-    let core = match intent_str.to_ascii_lowercase().as_str() {
-        "query_concept" => CoreIntent::QueryConcept,
-        "request_action" => CoreIntent::RequestAction,
-        "seek_solution" => CoreIntent::SeekSolution,
-        "casual" => CoreIntent::Casual,
-        _ => return None,
-    };
-    eprintln!("[intent:llm] -> {:?} (confidence={:.2})", core, confidence);
-    Some(core)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
     use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
     use crate::ai::{cli::ParsedCli, types::AppConfig};
     use std::path::PathBuf;
@@ -3070,7 +3102,6 @@ mod tests {
                 history_keep_last: 0,
                 history_summary_max_chars: 0,
                 intent_model: None,
-                intent_model_path: PathBuf::new(),
                 agent_route_model_path: PathBuf::new(),
                 skill_match_model_path: PathBuf::new(),
             },
@@ -3126,26 +3157,22 @@ mod tests {
 
     #[test]
     fn local_thinking_decision_skips_simple_concept_questions() {
-        let intent = UserIntent::new(CoreIntent::QueryConcept);
-        let decision = local_thinking_decision("Rust 的 trait 是什么？", &intent);
+        let decision = local_thinking_decision("Rust 的 trait 是什么？");
         assert_eq!(decision, Some(false));
     }
 
     #[test]
     fn local_thinking_decision_enables_for_debugging_requests() {
-        let intent = UserIntent::new(CoreIntent::SeekSolution);
         let decision = local_thinking_decision(
             "帮我排查这个报错，并分析可能的修复方案\npanic: index out of bounds",
-            &intent,
         );
         assert_eq!(decision, Some(true));
     }
 
     #[test]
-    fn local_thinking_decision_leaves_ambiguous_short_actions_to_gate() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
-        let decision = local_thinking_decision("帮我写个函数", &intent);
-        assert_eq!(decision, None);
+    fn local_thinking_decision_decides_false_locally() {
+        let decision = local_thinking_decision("帮我写个函数");
+        assert_eq!(decision, Some(false));
     }
 
     #[test]
@@ -3180,8 +3207,7 @@ mod tests {
         );
         let clean = strip_system_reminders(&polluted);
         let clean = clean.trim();
-        let intent = UserIntent::new(CoreIntent::Casual);
-        assert_eq!(local_thinking_decision(clean, &intent), Some(false));
+        assert_eq!(local_thinking_decision(clean), Some(false));
     }
 
     #[test]
@@ -3821,6 +3847,55 @@ mod tests {
         assert!(text.contains("Treat these findings as already-known context."));
         assert!(!text.contains("Code-navigation correction:"));
         assert!(!text.contains("`code_search`"));
+    }
+
+    #[test]
+    fn strip_unavailable_tool_hints_removes_tool_suggestion_lines() {
+        let mut messages = vec![Message {
+            role: "tool".to_string(),
+            content: Value::String(
+                "Suggestion: use `code_search` to narrow the target before another raw read.\n\
+                 Result: fallback kept."
+                    .to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: Some("call_1".to_string()),
+            reasoning_content: None,
+        }];
+
+        let available = ["read_file"]
+            .into_iter()
+            .map(|name| name.to_string())
+            .collect();
+        strip_unavailable_tool_hints_from_messages(&mut messages, &available);
+
+        let text = messages[0].content.as_str().unwrap();
+        assert!(!text.contains("Suggestion:"));
+        assert!(text.contains("Result: fallback kept."));
+    }
+
+    #[test]
+    fn strip_unavailable_tool_hints_keeps_regular_assistant_text() {
+        let mut messages = vec![Message {
+            role: "assistant".to_string(),
+            content: Value::String(
+                "你可以之后再试 `code_search`，但这不是一条内部纠偏提示。".to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        let available = ["read_file"]
+            .into_iter()
+            .map(|name| name.to_string())
+            .collect();
+        strip_unavailable_tool_hints_from_messages(&mut messages, &available);
+
+        assert_eq!(
+            messages[0].content.as_str(),
+            Some("你可以之后再试 `code_search`，但这不是一条内部纠偏提示。")
+        );
     }
 
     #[test]

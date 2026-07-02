@@ -29,7 +29,6 @@ pub(super) struct AppConfig {
     pub(super) history_keep_last: usize,
     pub(super) history_summary_max_chars: usize,
     pub(super) intent_model: Option<String>,
-    pub(super) intent_model_path: PathBuf,
     pub(super) agent_route_model_path: PathBuf,
     pub(super) skill_match_model_path: PathBuf,
 }

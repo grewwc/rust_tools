@@ -828,7 +828,6 @@ mod tests {
                 history_keep_last: 0,
                 history_summary_max_chars: 0,
                 intent_model: None,
-                intent_model_path: PathBuf::new(),
                 agent_route_model_path: PathBuf::new(),
                 skill_match_model_path: PathBuf::new(),
             },

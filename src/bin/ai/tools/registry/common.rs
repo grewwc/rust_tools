@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-use rust_tools::cw::SkipMap;
+use rust_tools::{commonw::FastSet, cw::SkipMap};
 use serde_json::Value;
 
 use crate::ai::tools::os_tools::GLOBAL_OS;
@@ -160,6 +160,14 @@ static TOOL_INDEX: LazyLock<SkipMap<String, &'static ToolSpec>> = LazyLock::new(
     index
 });
 
+static REGISTERED_TOOL_NAMES: LazyLock<FastSet<&'static str>> = LazyLock::new(|| {
+    let mut names = FastSet::default();
+    for reg in inventory::iter::<ToolRegistration> {
+        names.insert(reg.spec.name);
+    }
+    names
+});
+
 fn expanded_tool_groups<'a>(groups: &'a [&'a str]) -> Vec<&'a str> {
     let mut expanded_groups: Vec<&str> = groups.to_vec();
     if groups.contains(&"executor") && !expanded_groups.contains(&"openclaw") {
@@ -247,6 +255,10 @@ pub(crate) fn get_builtin_tool_definitions() -> Vec<ToolDefinition> {
 
 pub(crate) fn get_tool_spec(name: &str) -> Option<&'static ToolSpec> {
     TOOL_INDEX.get_ref(&name.to_string()).copied()
+}
+
+pub(crate) fn is_registered_tool_name(name: &str) -> bool {
+    REGISTERED_TOOL_NAMES.contains(name)
 }
 
 /// Executes a tool call by parsing its arguments and dispatching

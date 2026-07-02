@@ -30,7 +30,8 @@
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,
-    "subagent_priority": 100
+    "subagent_priority": 100,
+    "default_reasoning_effort": "high"
   },
   {
     "key": "deepseek-v4-flash-opencode",

@@ -69,7 +69,6 @@ pub(super) fn refresh_skill_turn_for_iteration(
     }
 
     let prev_skill = skill_turn.matched_skill_name().map(|s| s.to_string());
-    let intent = skill_turn.intent().clone();
     let inherited_restore = skill_turn.take_restore_agent_context();
 
     // 模型通过 activate_skill 工具显式请求激活某个 skill 时优先采纳：直接按名字
@@ -85,7 +84,6 @@ pub(super) fn refresh_skill_turn_for_iteration(
                 skill_manifests,
                 question,
                 name,
-                &intent,
             )
         })
         .unwrap_or_else(|| {
@@ -95,7 +93,6 @@ pub(super) fn refresh_skill_turn_for_iteration(
                 skill_manifests,
                 question,
                 prev_skill.as_deref(),
-                &intent,
             )
         });
     if inherited_restore.is_some() {

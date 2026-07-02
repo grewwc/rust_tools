@@ -203,7 +203,7 @@ pub(crate) fn execute_discover_skills(args: &Value) -> Result<String, String> {
     // 的跨语言失效问题。embedding 失败时 rank_skills_locally 内部已 unwrap_or_default
     // 降级为 TF-IDF/词法，无网络强依赖；结果按相关性降序，最相关的在前。
     // 词法命中（旧子串行为）作为兜底信号纳入，故召回是旧行为的严格超集。
-    let ranked = crate::ai::driver::rank_skills_locally(&skills, query, None);
+    let ranked = crate::ai::driver::rank_skills_locally(&skills, query);
     let matched = ranked
         .iter()
         .filter(|item| skill_is_discoverable(item, skill_matches_query(item.skill, query)))

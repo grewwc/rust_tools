@@ -9,7 +9,7 @@ use crate::ai::skills::SkillManifest;
 use crate::commonw::configw;
 
 use super::{
-    TextSimilarityFeatures, UserIntent, build_idf_from_documents, cosine_tfidf_similarity,
+    TextSimilarityFeatures, build_idf_from_documents, cosine_tfidf_similarity,
     embedding::{
         document::SkillEmbeddingDocument,
         index::{SkillEmbeddingHit, SkillEmbeddingIndex},
@@ -44,20 +44,18 @@ pub struct ScoredSkill<'a> {
 pub fn rank_skills_locally<'a>(
     skills: &'a [SkillManifest],
     input: &str,
-    intent: Option<&UserIntent>,
 ) -> Vec<ScoredSkill<'a>> {
     if input.trim().is_empty() || skills.is_empty() {
         return Vec::new();
     }
 
     let model_path = skill_match_model::default_model_path();
-    rank_skills_locally_with_model_path(skills, input, intent, &model_path)
+    rank_skills_locally_with_model_path(skills, input, &model_path)
 }
 
 pub fn rank_skills_locally_with_model_path<'a>(
     skills: &'a [SkillManifest],
     input: &str,
-    _intent: Option<&UserIntent>,
     model_path: &Path,
 ) -> Vec<ScoredSkill<'a>> {
     if input.trim().is_empty() || skills.is_empty() {
@@ -348,7 +346,6 @@ fn probability_for_label(result: &skill_match_model::SkillMatchResult, label: &s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
 
     fn skill(name: &str, description: &str) -> SkillManifest {
         SkillManifest {
@@ -383,7 +380,6 @@ mod tests {
         let ranked = rank_skills_locally_with_model_path(
             &skills,
             "帮我生成一份 PPT 幻灯片",
-            Some(&UserIntent::new(CoreIntent::RequestAction)),
             &skill_match_model::default_model_path(),
         );
         let top = ranked.first().expect("expected ranked result");
@@ -404,7 +400,6 @@ mod tests {
         let ranked = rank_skills_locally_with_model_path(
             &skills,
             "帮我做一份 ppt 汇报",
-            Some(&UserIntent::new(CoreIntent::RequestAction)),
             &skill_match_model::default_model_path(),
         );
         assert_eq!(
@@ -422,7 +417,6 @@ mod tests {
         let ranked = rank_skills_locally_with_model_path(
             &skills,
             "你好，今天天气怎么样",
-            Some(&UserIntent::new(CoreIntent::Casual)),
             &skill_match_model::default_model_path(),
         );
         assert!(!ranked.is_empty());
@@ -435,14 +429,12 @@ mod tests {
         let first = rank_skills_locally_with_model_path(
             &first_skills,
             "帮我做一份 ppt 幻灯片",
-            Some(&UserIntent::new(CoreIntent::RequestAction)),
             &skill_match_model::default_model_path(),
         );
         let second_skills = [skill("helper", "生成幻灯片 PPT 演示文稿")];
         let second = rank_skills_locally_with_model_path(
             &second_skills,
             "帮我做一份 ppt 幻灯片",
-            Some(&UserIntent::new(CoreIntent::RequestAction)),
             &skill_match_model::default_model_path(),
         );
 

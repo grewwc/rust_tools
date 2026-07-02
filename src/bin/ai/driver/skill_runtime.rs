@@ -8,7 +8,6 @@ use crate::commonw::configw;
 use rust_tools::cw::SkipSet;
 use std::sync::{LazyLock, Mutex};
 
-use super::intent_recognition::{self, UserIntent};
 use super::{
     DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS, TextSimilarityFeatures,
     jaccard_similarity_for_sets, rank_skills_locally_with_model_path, set_intersection_count,
@@ -136,7 +135,6 @@ pub(super) struct SkillTurnGuard {
     cached_system_prompt: Option<String>,
     cached_context_reminder: Option<Option<String>>,
     matched_skill_name: Option<String>,
-    intent: UserIntent,
     skip_recall_by_skill: bool,
 }
 
@@ -173,16 +171,6 @@ impl SkillTurnGuard {
 
     pub(super) fn matched_skill_name(&self) -> Option<&str> {
         self.matched_skill_name.as_deref()
-    }
-
-    pub(super) fn intent(&self) -> &UserIntent {
-        &self.intent
-    }
-
-    /// 用于 LLM intent fallback 路径：本地 TF-IDF 给 Casual 但 question
-    /// 明显不像闲聊时，turn 准备阶段会调 LLM 升级，结果通过这里回写。
-    pub(super) fn set_intent(&mut self, intent: UserIntent) {
-        self.intent = intent;
     }
 
     pub(super) fn skip_recall_by_skill(&self) -> bool {
@@ -523,110 +511,6 @@ fn select_mcp_tools(
     filter_mcp_tools_by_allowed_servers(all_tools, &allowed_servers)
 }
 
-fn is_general_knowledge_suppressed_tool(name: &str) -> bool {
-    // 只压制"会主动翻看当前仓库/项目"的工具，以贯彻 general knowledge 模式
-    // "不要擅自读取本地项目"的语义。enable_tools/discover_skills/activate_skill
-    // 是能力发现与按需加载入口，本身不读取仓库文件，压制它们会让模型在通用模式下
-    // 彻底失去发现 MCP 及其它进阶工具的唯一通道（用户即便显式要求用 mcp 也无从调用），
-    // 因此必须保留。
-    matches!(
-        name,
-        "read_file"
-            | "read_file_lines"
-            | "list_directory"
-            | "search_files"
-            | "find_path"
-            | "text_grep"
-            | "code_search"
-            | "lsp"
-            | "task"
-            | "task_spawn"
-            | "task_wait"
-            | "task_status"
-            | "agent_team"
-    )
-}
-
-fn should_use_general_knowledge_mode(
-    question: &str,
-    intent: &UserIntent,
-    skill: Option<&SkillManifest>,
-) -> bool {
-    if skill.is_some() {
-        return false;
-    }
-    let cleaned = crate::ai::request::strip_system_reminders(question);
-    let cleaned = cleaned.trim();
-    let len = cleaned.chars().count();
-    if len == 0 || len > 180 {
-        return false;
-    }
-    if has_project_artifact_shape(cleaned) {
-        return false;
-    }
-    matches!(
-        intent.core,
-        intent_recognition::CoreIntent::QueryConcept
-            | intent_recognition::CoreIntent::SeekSolution
-            | intent_recognition::CoreIntent::Casual
-    )
-}
-
-fn has_project_artifact_shape(question: &str) -> bool {
-    // 这里只识别结构化 artifact 形态；动作/目标语义交给 intent model。
-    if question.contains("```") || question.contains("::") {
-        return true;
-    }
-    question.split_whitespace().any(|token| {
-        let token = token.trim_matches(|c: char| {
-            matches!(
-                c,
-                ',' | '.'
-                    | ';'
-                    | ':'
-                    | '，'
-                    | '。'
-                    | '；'
-                    | '：'
-                    | '`'
-                    | '\''
-                    | '"'
-                    | '('
-                    | ')'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-            )
-        });
-        let lower = token.to_lowercase();
-        if lower.starts_with("http://") || lower.starts_with("https://") {
-            return false;
-        }
-        token.contains('/')
-            || token.contains('\\')
-            || lower.ends_with(".rs")
-            || lower.ends_with(".ts")
-            || lower.ends_with(".tsx")
-            || lower.ends_with(".js")
-            || lower.ends_with(".jsx")
-            || lower.ends_with(".py")
-            || lower.ends_with(".go")
-            || lower.ends_with(".java")
-            || lower.ends_with(".json")
-            || lower.ends_with(".yaml")
-            || lower.ends_with(".yml")
-            || lower.ends_with(".toml")
-    })
-}
-
-fn filter_general_knowledge_tools(tools: Vec<ToolDef>) -> Vec<ToolDef> {
-    tools
-        .into_iter()
-        .filter(|tool| !is_general_knowledge_suppressed_tool(&tool.function.name))
-        .collect()
-}
-
 fn mcp_tools_for_turn(
     mcp_client: &McpClient,
     skill: Option<&SkillManifest>,
@@ -855,17 +739,6 @@ fn push_project_type_context(builder: &mut SystemPromptBuilder) {
 fn push_project_context(builder: &mut SystemPromptBuilder) {
     push_project_instruction_context(builder);
     push_project_type_context(builder);
-}
-
-fn push_project_context_for_turn(builder: &mut SystemPromptBuilder, general_knowledge_mode: bool) {
-    // 项目指令文档（AGENTS.md / CLAUDE.md 等）属于当前工作目录的显式本地约束，
-    // 只要命中了项目作用域就应进入本轮 system prompt。general-knowledge 模式
-    // 仅继续抑制“项目类型/默认构建命令”这类辅助性 Fact 提示，避免用户在仓库
-    // 目录下做通用问答时完全丢失 repo-local instructions。
-    push_project_instruction_context(builder);
-    if !general_knowledge_mode {
-        push_project_type_context(builder);
-    }
 }
 
 fn build_system_prompt(
@@ -1158,7 +1031,7 @@ fn should_skip_recall_for_skill(skill: Option<&SkillManifest>) -> bool {
     skill.is_some_and(|skill| skill.skip_recall || is_executor_skill(skill))
 }
 
-fn skill_selection_threshold(intent: &UserIntent, skill_count: usize) -> f64 {
+fn skill_selection_threshold(skill_count: usize) -> f64 {
     let base: f64 = if skill_count > 10 {
         2.5
     } else if skill_count > 5 {
@@ -1166,12 +1039,9 @@ fn skill_selection_threshold(intent: &UserIntent, skill_count: usize) -> f64 {
     } else {
         1.75
     };
-    match intent.core {
-        intent_recognition::CoreIntent::RequestAction => base.max(2.0),
-        intent_recognition::CoreIntent::SeekSolution => base.max(1.85),
-        intent_recognition::CoreIntent::QueryConcept => base.max(2.5),
-        intent_recognition::CoreIntent::Casual => base.max(2.5),
-    }
+    // 无 intent 后统一下限取 2.0（原 RequestAction 档），避免小 skill 集阈值
+    // 反而更低导致误激活。
+    base.max(2.0)
 }
 
 fn looks_like_follow_up_or_same_topic(question: &str, previous_question: &str) -> bool {
@@ -1212,12 +1082,7 @@ fn looks_like_follow_up_or_same_topic(question: &str, previous_question: &str) -
         || (current_chars <= 24 && (token_similarity >= 0.18 || bigram_similarity >= 0.12))
 }
 
-fn cross_turn_preferred_skill_name(
-    app: &App,
-    question: &str,
-    intent: &UserIntent,
-) -> Option<String> {
-    let _ = intent;
+fn cross_turn_preferred_skill_name(app: &App, question: &str) -> Option<String> {
     let memory = app.last_skill_bias.as_ref()?;
     if looks_like_follow_up_or_same_topic(question, &memory.question) {
         Some(memory.skill_name.clone())
@@ -1236,14 +1101,12 @@ fn update_cross_turn_skill_bias(app: &mut App, question: &str, skill: Option<&Sk
 fn select_skill_with_preference<'a>(
     skill_manifests: &'a [SkillManifest],
     question: &str,
-    intent: &UserIntent,
     preferred_skill_name: Option<&str>,
     model_path: &std::path::Path,
 ) -> Option<&'a SkillManifest> {
     select_skill_with_preference_strength(
         skill_manifests,
         question,
-        intent,
         preferred_skill_name,
         PreferenceStrength::StrongSticky,
         model_path,
@@ -1253,7 +1116,6 @@ fn select_skill_with_preference<'a>(
 fn select_skill_with_preference_strength<'a>(
     skill_manifests: &'a [SkillManifest],
     question: &str,
-    intent: &UserIntent,
     preferred_skill_name: Option<&str>,
     strength: PreferenceStrength,
     model_path: &std::path::Path,
@@ -1262,18 +1124,17 @@ fn select_skill_with_preference_strength<'a>(
         return None;
     }
 
-    let ranked =
-        rank_skills_locally_with_model_path(skill_manifests, question, Some(intent), model_path);
+    let ranked = rank_skills_locally_with_model_path(skill_manifests, question, model_path);
     let Some(best) = ranked.first() else {
         return None;
     };
-    let threshold = skill_selection_threshold(intent, skill_manifests.len());
+    let threshold = skill_selection_threshold(skill_manifests.len());
     let preferred =
         preferred_skill_name.and_then(|name| ranked.iter().find(|item| item.skill.name == name));
-    let best_is_valid = !should_abstain_from_skill(best, intent);
+    let best_is_valid = !should_abstain_from_skill(best);
 
     if let Some(current) = preferred {
-        let current_is_valid = !should_abstain_from_skill(current, intent);
+        let current_is_valid = !should_abstain_from_skill(current);
         let (
             sticky_bonus,
             keep_floor_delta,
@@ -1367,56 +1228,22 @@ fn non_identity_skill_signal(item: &super::skill_ranking::ScoredSkill<'_>) -> f6
         .max(item.model_prior_score)
 }
 
-fn should_abstain_from_skill(
-    item: &super::skill_ranking::ScoredSkill<'_>,
-    intent: &UserIntent,
-) -> bool {
-    if matches!(
-        intent.core,
-        intent_recognition::CoreIntent::QueryConcept | intent_recognition::CoreIntent::Casual
-    ) {
-        return true;
-    }
-
+fn should_abstain_from_skill(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
     let identity_signal = identity_skill_signal(item);
     let non_identity_signal = non_identity_skill_signal(item);
     let likely_identity_only_match = identity_signal >= 0.12
         && non_identity_signal < 0.12
         && non_identity_signal + 0.04 < identity_signal;
 
-    matches!(intent.core, intent_recognition::CoreIntent::SeekSolution)
-        && likely_identity_only_match
+    likely_identity_only_match
         && item.none_score >= item.model_prior_score + 0.08
         && non_identity_signal < 0.10
-}
-
-#[crate::ai::agent_hang_span(
-    "pre-fix",
-    "R",
-    "skill_runtime::prepare_skill_for_turn:intent",
-    "[DEBUG] intent recognition started",
-    "[DEBUG] intent recognition finished",
-    {
-        "question_len": question.chars().count(),
-    },
-    {
-        "core": format!("{:?}", __agent_hang_result.core),
-        "elapsed_ms": __agent_hang_elapsed_ms,
-    }
-)]
-fn detect_turn_intent(
-    question: &str,
-    intent_model_path: &std::path::Path,
-) -> intent_recognition::UserIntent {
-    intent_recognition::detect_intent_with_model_path(question, intent_model_path)
 }
 
 fn build_skill_turn_guard(
     app: &mut App,
     mcp_client: &McpClient,
     skill: Option<&SkillManifest>,
-    intent: UserIntent,
-    question: &str,
 ) -> SkillTurnGuard {
     let all_mcp_tools = mcp_client.get_all_tools();
     super::super::tools::enable_tools::set_available_mcp_tools(all_mcp_tools.clone());
@@ -1426,12 +1253,7 @@ fn build_skill_turn_guard(
     let executor_active = skill.as_ref().is_some_and(|s| is_executor_skill(s))
         || active_agent.as_ref().is_some_and(is_executor_agent);
 
-    let general_knowledge_mode = should_use_general_knowledge_mode(question, &intent, skill);
-    let builtin_tools = if general_knowledge_mode {
-        filter_general_knowledge_tools(builtin_tools_for_skill(skill, active_agent.as_ref()))
-    } else {
-        builtin_tools_for_skill(skill, active_agent.as_ref())
-    };
+    let builtin_tools = builtin_tools_for_skill(skill, active_agent.as_ref());
     let mcp_tools = select_mcp_tools(all_mcp_tools.clone(), skill, active_agent.as_ref());
     let available_tools = available_tool_names(&builtin_tools, &mcp_tools);
     let mut builder = build_system_prompt(active_agent.as_ref(), skill, &available_tools);
@@ -1440,7 +1262,7 @@ fn build_skill_turn_guard(
     {
         builder.push(ContextKind::Fact, catalog);
     }
-    push_project_context_for_turn(&mut builder, general_knowledge_mode);
+    push_project_context(&mut builder);
     if !app.active_persona.is_default() {
         let mut persona_prompt = format!(
             "Persistent persona:\n- Name: {}\n",
@@ -1458,12 +1280,6 @@ fn build_skill_turn_guard(
         );
         builder.push(ContextKind::Identity, persona_prompt);
     }
-    if general_knowledge_mode {
-        builder.push(
-            ContextKind::Policy,
-            "General knowledge mode:\n- The user is asking a general technical/knowledge question, not a question about the current repository.\n- Answer directly from general knowledge. Do not inspect the current directory, repository files, git state, or local project context unless the user explicitly asks to relate the answer to this project.\n- Examples, syntax summaries, and conceptual explanations should not trigger local file search.",
-        );
-    }
     let max_iterations = resolve_max_iterations(active_agent.as_ref(), executor_active);
     let restore_agent_context =
         activate_skill_context(app, builtin_tools, mcp_tools, max_iterations);
@@ -1474,7 +1290,6 @@ fn build_skill_turn_guard(
         cached_system_prompt: None,
         cached_context_reminder: None,
         matched_skill_name,
-        intent,
         skip_recall_by_skill,
     }
 }
@@ -1485,16 +1300,14 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
     skill_manifests: &[SkillManifest],
     question: &str,
     preferred_skill_name: Option<&str>,
-    intent: &UserIntent,
 ) -> SkillTurnGuard {
     let skill = select_skill_with_preference(
         skill_manifests,
         question,
-        intent,
         preferred_skill_name,
         &app.config.skill_match_model_path,
     );
-    build_skill_turn_guard(app, mcp_client, skill, intent.clone(), question)
+    build_skill_turn_guard(app, mcp_client, skill)
 }
 
 /// 模型通过 `activate_skill` 工具显式请求激活某个 skill 时走这里：直接按名字
@@ -1509,11 +1322,10 @@ pub(super) fn force_activate_named_skill(
     skill_manifests: &[SkillManifest],
     question: &str,
     requested_name: &str,
-    intent: &UserIntent,
 ) -> Option<SkillTurnGuard> {
     let skill = skill_manifests.iter().find(|s| s.name == requested_name)?;
     update_cross_turn_skill_bias(app, question, Some(skill));
-    let mut guard = build_skill_turn_guard(app, mcp_client, Some(skill), intent.clone(), question);
+    let mut guard = build_skill_turn_guard(app, mcp_client, Some(skill));
     guard.matched_skill_name = Some(skill.name.clone());
     guard.skip_recall_by_skill = should_skip_recall_for_skill(Some(skill));
     Some(guard)
@@ -1532,8 +1344,6 @@ pub(super) fn prepare_skill_for_turn(
         .trim()
         .eq_ignore_ascii_case("true");
 
-    let intent = detect_turn_intent(question, &app.config.intent_model_path);
-
     // 用户通过 `@skills:<name>` 在输入框中显式选择的强制 skill 优先于自动路由。
     // 这是 per-turn 语义：消费后立即清空，下一轮不再强制注入。
     if let Some(forced) = app.forced_skill.take() {
@@ -1547,14 +1357,9 @@ pub(super) fn prepare_skill_for_turn(
             })
         {
             let name = skill.name.clone();
-            if let Some(guard) = force_activate_named_skill(
-                app,
-                mcp_client,
-                skill_manifests,
-                question,
-                &name,
-                &intent,
-            ) {
+            if let Some(guard) =
+                force_activate_named_skill(app, mcp_client, skill_manifests, question, &name)
+            {
                 if debug {
                     eprintln!("[skills] forced via @skills: {}", name);
                 }
@@ -1568,11 +1373,10 @@ pub(super) fn prepare_skill_for_turn(
         }
     }
 
-    let cross_turn_preference = cross_turn_preferred_skill_name(app, question, &intent);
+    let cross_turn_preference = cross_turn_preferred_skill_name(app, question);
     let skill = select_skill_with_preference_strength(
         skill_manifests,
         question,
-        &intent,
         cross_turn_preference.as_deref(),
         PreferenceStrength::CrossTurnBias,
         &app.config.skill_match_model_path,
@@ -1582,7 +1386,6 @@ pub(super) fn prepare_skill_for_turn(
         let ranked = rank_skills_locally_with_model_path(
             skill_manifests,
             question,
-            Some(&intent),
             &app.config.skill_match_model_path,
         );
         if let Some(top) = ranked.first() {
@@ -1600,7 +1403,6 @@ pub(super) fn prepare_skill_for_turn(
         if let Some(preferred) = cross_turn_preference.as_deref() {
             eprintln!("[skills] cross-turn preferred: {}", preferred);
         }
-        eprintln!("[skills] intent: {:?}", intent.core);
         if let Some(s) = skill.as_ref() {
             eprintln!("[skills] final: {}", s.name);
         } else {
@@ -1610,7 +1412,7 @@ pub(super) fn prepare_skill_for_turn(
     update_cross_turn_skill_bias(app, question, skill);
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
     let skip_recall_by_skill = should_skip_recall_for_skill(skill);
-    let mut guard = build_skill_turn_guard(app, mcp_client, skill, intent, question);
+    let mut guard = build_skill_turn_guard(app, mcp_client, skill);
     guard.matched_skill_name = matched_skill_name;
     guard.skip_recall_by_skill = skip_recall_by_skill;
     guard
@@ -1621,16 +1423,15 @@ mod tests {
     use super::{
         ContextKind, PreferenceStrength, SystemPromptBuilder, available_tool_names,
         build_hidden_mcp_tool_catalog, build_project_instruction_prompt, build_system_prompt,
-        builtin_tools_for_skill, ensure_required_baseline_tools, filter_general_knowledge_tools,
+        builtin_tools_for_skill, ensure_required_baseline_tools,
         filter_mcp_tools_by_allowed_servers, has_tool, looks_like_follow_up_or_same_topic,
-        merge_with_runtime_enabled_tools, push_project_context, push_project_context_for_turn,
-        resolve_max_iterations, select_mcp_tools, select_skill_with_preference,
-        select_skill_with_preference_strength, should_use_general_knowledge_mode,
+        merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
+        select_mcp_tools, select_skill_with_preference, select_skill_with_preference_strength,
         tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
-    use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent, detect_intent};
     use crate::ai::driver::runtime_ctx::SUBAGENT_CWD;
+    use crate::ai::driver::skill_ranking::ScoredSkill;
     use crate::ai::skills::SkillManifest;
     use crate::ai::tools::enable_tools::set_explicit_enabled_tool_names;
     use crate::ai::types::{FunctionDefinition, ToolDefinition};
@@ -1699,73 +1500,6 @@ mod tests {
         assert!(names.iter().any(|name| name == "knowledge_save"));
         assert!(names.iter().any(|name| name == "knowledge_search"));
         assert!(!names.iter().any(|name| name == "web_search"));
-    }
-
-    #[test]
-    fn general_knowledge_mode_uses_intent_and_artifact_shape() {
-        let seek_solution = UserIntent::new(CoreIntent::SeekSolution);
-        assert!(should_use_general_knowledge_mode(
-            "kubectl rollout 示例",
-            &seek_solution,
-            None
-        ));
-        let request_action = UserIntent::new(CoreIntent::RequestAction);
-        assert!(!should_use_general_knowledge_mode(
-            "apply the requested change",
-            &request_action,
-            None
-        ));
-        assert!(!should_use_general_knowledge_mode(
-            "kubectl rollout 示例",
-            &seek_solution,
-            Some(&skill("debugger", "debug runtime issues"))
-        ));
-        assert!(!should_use_general_knowledge_mode(
-            "how to fix this panic in src/bin/a.rs",
-            &seek_solution,
-            None
-        ));
-    }
-
-    #[test]
-    fn general_knowledge_mode_ignores_system_reminder_prefix_length() {
-        let polluted = format!(
-            "<system-reminder>{}</system-reminder>\n\nRust 的 trait 是什么？",
-            "repo context\n".repeat(200)
-        );
-        let intent = UserIntent::new(CoreIntent::QueryConcept);
-        assert!(should_use_general_knowledge_mode(&polluted, &intent, None));
-    }
-
-    #[test]
-    fn general_knowledge_tools_hide_repo_discovery_but_keep_capability_entrypoints() {
-        let tools = vec![
-            tool("search_files"),
-            tool("code_search"),
-            tool("read_file"),
-            tool("enable_tools"),
-            tool("discover_skills"),
-            tool("activate_skill"),
-            tool("task_spawn"),
-            tool("execute_command"),
-            tool("knowledge_search"),
-        ];
-        let names = filter_general_knowledge_tools(tools)
-            .into_iter()
-            .map(|tool| tool.function.name)
-            .collect::<Vec<_>>();
-
-        // 仓库探查类工具仍被压制。
-        assert!(!names.iter().any(|name| name == "search_files"));
-        assert!(!names.iter().any(|name| name == "code_search"));
-        assert!(!names.iter().any(|name| name == "read_file"));
-        assert!(!names.iter().any(|name| name == "task_spawn"));
-        // 能力发现/加载入口必须保留，否则通用模式下无法发现 MCP 等进阶工具。
-        assert!(names.iter().any(|name| name == "enable_tools"));
-        assert!(names.iter().any(|name| name == "discover_skills"));
-        assert!(names.iter().any(|name| name == "activate_skill"));
-        assert!(names.iter().any(|name| name == "execute_command"));
-        assert!(names.iter().any(|name| name == "knowledge_search"));
     }
 
     #[test]
@@ -2104,7 +1838,7 @@ mod tests {
     }
 
     #[test]
-    fn project_instructions_remain_available_in_general_knowledge_mode() {
+    fn project_instructions_remain_available() {
         let root = temp_dir("project_context_general_mode");
         let nested = root.join("apps/web/src");
         fs::create_dir_all(&nested).unwrap();
@@ -2115,20 +1849,15 @@ mod tests {
         .unwrap();
         fs::write(root.join("AGENTS.md"), "Always follow repo safety rules.\n").unwrap();
 
-        let (prompt, reminder) = SUBAGENT_CWD.sync_scope(nested.clone(), || {
+        let prompt = SUBAGENT_CWD.sync_scope(nested.clone(), || {
             let available = SkipSet::new(16);
             let mut builder = build_system_prompt(None, None, &Box::new(available));
-            push_project_context_for_turn(&mut builder, true);
-            (
-                builder.render_system_prompt(),
-                builder.render_context_reminder().unwrap_or_default(),
-            )
+            push_project_context(&mut builder);
+            builder.render_system_prompt()
         });
 
         assert!(prompt.contains("Project-local instructions:"));
         assert!(prompt.contains("Always follow repo safety rules."));
-        assert!(!reminder.contains("Project Type"));
-        assert!(!reminder.contains("Rust project"));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -2148,11 +1877,7 @@ mod tests {
         let prompt = SUBAGENT_CWD.sync_scope(nested.clone(), || {
             let available = SkipSet::new(16);
             let mut builder = build_system_prompt(None, None, &Box::new(available));
-            let intent = detect_intent("帮我修改这个项目下的登录功能");
-            assert_eq!(intent.core, CoreIntent::RequestAction);
-            let general_knowledge_mode =
-                should_use_general_knowledge_mode("帮我修改这个项目下的登录功能", &intent, None);
-            push_project_context_for_turn(&mut builder, general_knowledge_mode);
+            push_project_context(&mut builder);
             builder.render_system_prompt()
         });
 
@@ -2177,11 +1902,7 @@ mod tests {
         let prompt = SUBAGENT_CWD.sync_scope(nested.clone(), || {
             let available = SkipSet::new(16);
             let mut builder = build_system_prompt(None, None, &Box::new(available));
-            let intent = UserIntent::new(CoreIntent::QueryConcept);
-            let general_knowledge_mode =
-                should_use_general_knowledge_mode("system prompt 是什么", &intent, None);
-            assert!(general_knowledge_mode);
-            push_project_context_for_turn(&mut builder, general_knowledge_mode);
+            push_project_context(&mut builder);
             builder.render_system_prompt()
         });
 
@@ -2439,7 +2160,6 @@ mod tests {
 
     #[test]
     fn local_selector_chooses_review_skill_for_review_request() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
         let skills = vec![
             skill("code-review", "Review code changes and highlight bugs"),
             skill("debugger", "Debug runtime failures and collect traces"),
@@ -2447,7 +2167,6 @@ mod tests {
         let selected = select_skill_with_preference(
             &skills,
             "帮我 review 这段 Rust 代码",
-            &intent,
             None,
             &model_path(),
         );
@@ -2456,7 +2175,6 @@ mod tests {
 
     #[test]
     fn local_selector_prefers_current_skill_without_clear_winner() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
         let skills = vec![
             skill("code-review", "Review code changes and summarize defects"),
             skill(
@@ -2467,7 +2185,6 @@ mod tests {
         let selected = select_skill_with_preference(
             &skills,
             "帮我看一下这段代码哪里有问题",
-            &intent,
             Some("code-review"),
             &model_path(),
         );
@@ -2476,7 +2193,6 @@ mod tests {
 
     #[test]
     fn local_selector_switches_when_new_skill_is_significantly_better() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
         let debugger = skill(
             "debugger",
             "Debug panic crash stack trace runtime failure logs",
@@ -2488,7 +2204,6 @@ mod tests {
         let selected = select_skill_with_preference(
             &skills,
             "程序 panic 了，帮我调试这个 crash 和 stack trace",
-            &intent,
             Some("code-review"),
             &model_path(),
         );
@@ -2496,32 +2211,29 @@ mod tests {
     }
 
     #[test]
-    fn local_selector_abstains_from_skill_metadata_lookup_even_when_name_matches() {
-        let intent = UserIntent::new(CoreIntent::QueryConcept);
-        let skills = vec![
-            skill_with_prompt(
-                "skill-creator",
-                "Create new skills and skill templates for the workspace",
-                "Use this skill when the user wants to create or add a new skill to the workspace.",
-            ),
-            skill("debugger", "Debug runtime failures and collect traces"),
-        ];
-        let selected = select_skill_with_preference(
-            &skills,
-            "skill-creator 这个 skill 在哪里？",
-            &intent,
-            None,
-            &model_path(),
-        );
-        assert!(
-            selected.is_none(),
-            "metadata lookup should not auto-activate a skill"
-        );
+    fn local_selector_abstains_from_identity_only_match() {
+        // 纯 identity 命中（名字/描述里恰好出现 skill 名）但缺乏 capability/behavior
+        // 信号时应弃权：intent 移除后由 identity-only 打分门控兜底防误激活。
+        let item = ScoredSkill {
+            skill: &skill("skill-creator", "Create new skills"),
+            score: 0.0,
+            embedding_score: 0.0,
+            embedding_identity_score: 0.30,
+            embedding_capability_score: 0.02,
+            embedding_behavior_score: 0.02,
+            fallback_semantic_score: 0.0,
+            fallback_identity_score: 0.30,
+            fallback_capability_score: 0.02,
+            fallback_behavior_score: 0.02,
+            model_prior_score: 0.05,
+            blended_score: 0.0,
+            none_score: 0.20,
+        };
+        assert!(super::should_abstain_from_skill(&item));
     }
 
     #[test]
     fn local_selector_still_routes_skill_creator_like_skill_for_creation_request() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
         let skills = vec![
             skill_with_prompt(
                 "skill-creator",
@@ -2533,7 +2245,6 @@ mod tests {
         let selected = select_skill_with_preference(
             &skills,
             "帮我创建一个新的 CI skill 模板",
-            &intent,
             None,
             &model_path(),
         );
@@ -2553,7 +2264,6 @@ mod tests {
 
     #[test]
     fn cross_turn_bias_prefers_previous_skill_on_follow_up() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
         let skills = vec![
             skill("code-review", "Review code changes and summarize defects"),
             skill("debugger", "Debug runtime failures and panic stack traces"),
@@ -2561,7 +2271,6 @@ mod tests {
         let selected = select_skill_with_preference_strength(
             &skills,
             "那这个报错顺便再看一下",
-            &intent,
             Some("debugger"),
             PreferenceStrength::CrossTurnBias,
             &model_path(),
@@ -2571,7 +2280,6 @@ mod tests {
 
     #[test]
     fn cross_turn_bias_still_switches_when_new_skill_is_clearly_better() {
-        let intent = UserIntent::new(CoreIntent::RequestAction);
         let skills = vec![
             skill("code-review", "Review code changes and summarize defects"),
             skill(
@@ -2582,7 +2290,6 @@ mod tests {
         let selected = select_skill_with_preference_strength(
             &skills,
             "继续这个问题，不过现在请直接 review 这段实现有没有逻辑 bug",
-            &intent,
             Some("debugger"),
             PreferenceStrength::CrossTurnBias,
             &model_path(),

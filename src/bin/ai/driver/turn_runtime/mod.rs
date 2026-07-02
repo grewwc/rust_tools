@@ -31,6 +31,7 @@ mod tool_result;
 mod types;
 
 pub(super) use orchestrator::run_turn;
+pub(crate) use prepare::QuestionShape;
 #[cfg(test)]
 use persistence::persist_pending_turn_messages;
 #[cfg(test)]
@@ -120,8 +121,6 @@ mod tests {
                 history_keep_last: 256,
                 history_summary_max_chars: 4_000,
                 intent_model: None,
-                intent_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("src/bin/ai/config/intent/intent_model.json"),
                 agent_route_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join("src/bin/ai/config/agent_route/agent_route_model.json"),
                 skill_match_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
