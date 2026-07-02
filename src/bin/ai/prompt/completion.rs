@@ -64,6 +64,10 @@ static FLAGS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
     for flag in &[
         // bool 选项
         "--clear",
+        "--new-session",
+        "--new",
+        "--resume",
+        "-r",
         "--list-tools",
         "--list-mcp-tools",
         "--list-skills",
@@ -290,6 +294,7 @@ impl CommandCompleter {
             "current",
             "new",
             "use",
+            "suspend",
             "delete",
             "clear-all",
             "export",

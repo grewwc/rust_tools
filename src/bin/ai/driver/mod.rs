@@ -21,7 +21,7 @@
 // =============================================================================
 
 use std::{
-    io::Write,
+    io::{IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Mutex,
@@ -32,7 +32,7 @@ use std::{
 
 use aios_kernel::primitives::{ResourceUsageDelta, RlimitDim, RlimitVerdict};
 use rust_tools::cw::SkipMap;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use uuid::Uuid;
 
 use crate::ai::{
@@ -40,7 +40,7 @@ use crate::ai::{
     cli::{self},
     config,
     config_schema::AiConfig,
-    history::SessionStore,
+    history::{SessionStore, SuspendedSessionEntry, SuspendedSessionStore},
     mcp::{McpClient, SharedMcpClient},
     models,
     prompt::PromptEditor,
@@ -119,6 +119,322 @@ impl Drop for BgSubagentGuard {
 
 pub(crate) fn new_local_kernel() -> aios_kernel::kernel::SharedKernel {
     aios_kernel::kernel::new_shared_kernel(aios_kernel::local::LocalOS::new())
+}
+
+#[derive(Debug, Clone)]
+struct StartupSessionChoice {
+    active_persona: crate::ai::persona::PersonaProfile,
+    history_file: PathBuf,
+    session_id: String,
+    startup_notice: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SuspendedSessionPreview {
+    entry: SuspendedSessionEntry,
+    persona_label: String,
+    summary: Option<String>,
+    modified_label: Option<String>,
+    suspended_label: String,
+}
+
+fn format_suspended_timestamp_label(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return "-".to_string();
+    }
+    chrono::DateTime::parse_from_rfc3339(trimmed)
+        .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|_| trimmed.to_string())
+}
+
+fn build_suspended_session_previews(
+    entries: Vec<SuspendedSessionEntry>,
+    persona_store: &crate::ai::persona::PersonaStore,
+) -> Vec<SuspendedSessionPreview> {
+    let personas = persona_store.list_personas().unwrap_or_default();
+    let mut sessions_by_history: FxHashMap<PathBuf, Vec<_>> = FxHashMap::default();
+
+    entries
+        .into_iter()
+        .map(|entry| {
+            let persona_label = personas
+                .iter()
+                .find(|persona| persona.id == entry.persona_id)
+                .map(|persona| persona.name.clone())
+                .unwrap_or_else(|| entry.persona_id.clone());
+            let session_info = sessions_by_history
+                .entry(entry.history_file.clone())
+                .or_insert_with(|| {
+                    SessionStore::new(entry.history_file.as_path())
+                        .list_sessions()
+                        .unwrap_or_default()
+                })
+                .iter()
+                .find(|session| session.id == entry.session_id);
+            SuspendedSessionPreview {
+                persona_label,
+                summary: session_info.and_then(|session| session.summary.clone()),
+                modified_label: session_info.and_then(|session| {
+                    session
+                        .modified_local
+                        .as_ref()
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                }),
+                suspended_label: format_suspended_timestamp_label(&entry.suspended_at),
+                entry,
+            }
+        })
+        .collect()
+}
+
+fn prompt_select_suspended_session(
+    previews: &[SuspendedSessionPreview],
+) -> std::io::Result<Option<usize>> {
+    if previews.is_empty() {
+        return Ok(None);
+    }
+    if previews.len() == 1 || !std::io::stdin().is_terminal() {
+        return Ok(Some(0));
+    }
+
+    println!("[resume] 当前 terminal 有 {} 个挂起 session：", previews.len());
+    for (index, preview) in previews.iter().enumerate() {
+        println!(
+            "  {}. {}  persona={}  modified={}  suspended={}",
+            index + 1,
+            preview.entry.session_id,
+            preview.persona_label,
+            preview.modified_label.as_deref().unwrap_or("-"),
+            preview.suspended_label
+        );
+        if let Some(summary) = preview.summary.as_deref().filter(|summary| !summary.is_empty()) {
+            println!("     {summary}");
+        }
+    }
+
+    loop {
+        let input = crate::commonw::prompt::read_line(&format!(
+            "选择要恢复的 session [1-{}，回车=1，n=新 session]: ",
+            previews.len()
+        ));
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(Some(0));
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "n" || lower == "new" {
+            return Ok(None);
+        }
+        if let Ok(index) = trimmed.parse::<usize>()
+            && (1..=previews.len()).contains(&index)
+        {
+            return Ok(Some(index - 1));
+        }
+        eprintln!(
+            "[resume] 无效选择：请输入 1-{}，或输入 n 新建 session。",
+            previews.len()
+        );
+    }
+}
+
+fn build_resume_startup_notice(
+    session_id: &str,
+    remaining_suspended: usize,
+    persona_fallback: bool,
+) -> String {
+    let mut notice = format!("[resume] 已恢复挂起 session: {session_id}");
+    if persona_fallback {
+        notice.push_str("（原 persona 不存在，已按当前 persona 打开）");
+    }
+    if remaining_suspended > 0 {
+        notice.push_str(&format!(
+            "；当前 terminal 还有 {} 个挂起 session，运行 `a --resume` 可继续选择。",
+            remaining_suspended
+        ));
+    }
+    notice.push_str("；运行 `a --new-session` 可强制新建 session。");
+    notice
+}
+
+fn should_resume_suspended_terminal_session(cli: &cli::ParsedCli) -> bool {
+    if cli.new_session {
+        return false;
+    }
+    if cli.resume {
+        return true;
+    }
+    if cli.session.is_some() || cli.clear || !cli.args.is_empty() {
+        return false;
+    }
+    if cli.help
+        || cli.list_tools
+        || cli.list_mcp_tools
+        || cli.list_skills
+        || cli.list_agents
+        || cli.note_search
+        || cli.note_flag
+        || cli.note_delete.is_some()
+        || cli.note_edit.is_some()
+        || cli.consolidate_knowledge
+        || cli.migrate_legacy_knowledge
+        || cli.generate_completions
+    {
+        return false;
+    }
+    true
+}
+
+fn resolve_startup_session_choice_with_selector<F>(
+    cli: &cli::ParsedCli,
+    config: &crate::ai::types::AppConfig,
+    persona_store: &crate::ai::persona::PersonaStore,
+    active_persona: crate::ai::persona::PersonaProfile,
+    selector: F,
+) -> Result<StartupSessionChoice, Box<dyn std::error::Error>>
+where
+    F: FnMut(&[SuspendedSessionPreview]) -> std::io::Result<Option<usize>>,
+{
+    resolve_startup_session_choice_with_selector_inner(
+        cli,
+        config,
+        persona_store,
+        active_persona,
+        selector,
+    )
+}
+
+fn resolve_startup_session_choice_with_selector_inner<F>(
+    cli: &cli::ParsedCli,
+    config: &crate::ai::types::AppConfig,
+    persona_store: &crate::ai::persona::PersonaStore,
+    active_persona: crate::ai::persona::PersonaProfile,
+    mut selector: F,
+) -> Result<StartupSessionChoice, Box<dyn std::error::Error>>
+where
+    F: FnMut(&[SuspendedSessionPreview]) -> std::io::Result<Option<usize>>,
+{
+    if cli.resume && cli.session.is_some() {
+        return Err("`--resume` 不能和 `--session` 同时使用".into());
+    }
+    if cli.resume && cli.clear {
+        return Err("`--resume` 不能和 `--clear` 同时使用".into());
+    }
+    if cli.resume && cli.new_session {
+        return Err("`--resume` 不能和 `--new-session` 同时使用".into());
+    }
+    if cli.new_session && cli.session.is_some() {
+        return Err("`--new-session` 不能和 `--session` 同时使用".into());
+    }
+    if cli.new_session && cli.clear {
+        return Err("`--new-session` 不能和 `--clear` 同时使用".into());
+    }
+
+    let mut choice = StartupSessionChoice {
+        history_file: crate::ai::persona::history_file_for_persona(
+            config.base_history_file.as_path(),
+            &active_persona.id,
+        ),
+        active_persona,
+        session_id: cli
+            .session
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        startup_notice: None,
+    };
+
+    if !should_resume_suspended_terminal_session(cli) {
+        return Ok(choice);
+    }
+
+    let suspended_store = SuspendedSessionStore::new();
+    match suspended_store.list_current_terminal() {
+        Ok(entries) if entries.is_empty() => {
+            if cli.resume {
+                choice.startup_notice =
+                    Some("[resume] 当前 terminal 没有可恢复的挂起 session，已创建新 session。"
+                        .to_string());
+            }
+        }
+        Ok(entries) => {
+            let previews = build_suspended_session_previews(entries, persona_store);
+            let selected_index = if previews.len() == 1 && !cli.resume {
+                Some(0)
+            } else {
+                selector(&previews)?
+            };
+            let Some(selected_index) = selected_index else {
+                choice.startup_notice = Some(format!(
+                    "[resume] 已跳过当前 terminal 的 {} 个挂起 session，已创建新 session。运行 `a --resume` 可再次选择恢复。",
+                    previews.len()
+                ));
+                return Ok(choice);
+            };
+            let selected = previews
+                .get(selected_index)
+                .ok_or_else(|| format!("invalid suspended session selection: {selected_index}"))?;
+            let Some(entry) = suspended_store.take_selected_current_terminal(&selected.entry)? else {
+                if cli.resume {
+                    return Err("选中的挂起 session 已不存在，请重试".into());
+                }
+                choice.startup_notice = Some(
+                    "[resume] 选中的挂起 session 已不存在，已创建新 session。".to_string(),
+                );
+                return Ok(choice);
+            };
+            choice.history_file = entry.history_file.clone();
+            choice.session_id = entry.session_id.clone();
+
+            let remaining = previews.len().saturating_sub(1);
+            let mut persona_fallback = false;
+            match persona_store.list_personas() {
+                Ok(personas) => {
+                    if let Some(persona) = personas.into_iter().find(|p| p.id == entry.persona_id)
+                    {
+                        choice.active_persona = persona;
+                    } else {
+                        persona_fallback = true;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("[resume] failed to load personas: {}", err);
+                }
+            }
+            choice.startup_notice = Some(build_resume_startup_notice(
+                &choice.session_id,
+                remaining,
+                persona_fallback,
+            ));
+        }
+        Err(err) => {
+            if cli.resume {
+                return Err(err.into());
+            }
+            if err.kind() != std::io::ErrorKind::Unsupported {
+                eprintln!("[resume] 自动恢复已跳过：{}", err);
+            }
+        }
+    }
+
+    Ok(choice)
+}
+
+fn resolve_startup_session_choice(
+    cli: &cli::ParsedCli,
+    config: &crate::ai::types::AppConfig,
+    persona_store: &crate::ai::persona::PersonaStore,
+    active_persona: crate::ai::persona::PersonaProfile,
+) -> Result<StartupSessionChoice, Box<dyn std::error::Error>> {
+    resolve_startup_session_choice_with_selector_inner(
+        cli,
+        config,
+        persona_store,
+        active_persona,
+        prompt_select_suspended_session,
+    )
 }
 
 fn should_auto_drop_terminated(os: &dyn aios_kernel::kernel::Syscall, pid: u64) -> bool {
@@ -1188,17 +1504,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             crate::ai::persona::default_persona()
         }
     };
-    config.history_file = crate::ai::persona::history_file_for_persona(
-        config.base_history_file.as_path(),
-        &active_persona.id,
-    );
+    let startup_choice =
+        resolve_startup_session_choice(&cli, &config, &persona_store, active_persona)?;
+    let active_persona = startup_choice.active_persona;
+    config.history_file = startup_choice.history_file.clone();
     let session_store = SessionStore::new(config.history_file.as_path());
-    let session_arg = cli.session.clone().unwrap_or_default();
-    let session_id = if session_arg.trim().is_empty() {
-        Uuid::new_v4().to_string()
-    } else {
-        session_arg.trim().to_string()
-    };
+    let session_id = startup_choice.session_id.clone();
+    let startup_notice = startup_choice.startup_notice.clone();
 
     // 处理 --clear --session <id>：启动前清空指定 session 的 history
     if cli.clear {
@@ -1283,6 +1595,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
     };
+    if let Some(notice) = startup_notice {
+        println!("{notice}");
+    }
     // 处理 --note-delete / -nd：输入一段话，模型自动匹配知识库条目，确认后删除。
     if let Some(query) = app.cli.note_delete.clone() {
         return runtime_ctx::PERSONA_MEMORY_PATH
@@ -3355,18 +3670,20 @@ mod tests {
         SCHEDULER_DISPATCH_META, background_execute_limit, background_pop_limit,
         build_consolidation_merge_entries, build_note_search_retrieval_query,
         has_pending_foreground_process, maybe_auto_route_agent, one_shot_cli_mode,
-        read_recent_history, reset_scheduler_test_state, should_preload_mcp,
-        should_publish_subagent_task_result, update_dispatch_meta,
+        read_recent_history, reset_scheduler_test_state, resolve_startup_session_choice,
+        resolve_startup_session_choice_with_selector, should_preload_mcp,
+        should_publish_subagent_task_result,
+        should_resume_suspended_terminal_session, update_dispatch_meta,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
-    use crate::ai::history::{Message, append_history_messages};
+    use crate::ai::history::{Message, SuspendedSessionStore, append_history_messages};
     use crate::ai::skills::SkillManifest;
     use crate::ai::tools::task_tools::InheritOptions;
     use crate::ai::types::{AgentContext, App, AppConfig};
     use aios_kernel::kernel::{EventId, ProcessState, WaitPolicy, WaitReason};
     use aios_kernel::primitives::ResourceLimit;
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf};
     use std::sync::{Arc, atomic::AtomicBool};
 
     #[test]
@@ -3554,6 +3871,24 @@ mod tests {
         }
     }
 
+    fn test_startup_config(base_history_file: &std::path::Path) -> AppConfig {
+        AppConfig {
+            api_key: String::new(),
+            base_history_file: base_history_file.to_path_buf(),
+            history_file: base_history_file.to_path_buf(),
+            endpoint: String::new(),
+            vl_default_model: String::new(),
+            history_max_chars: 12000,
+            history_keep_last: 8,
+            history_summary_max_chars: 4000,
+            intent_model: None,
+            agent_route_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src/bin/ai/config/agent_route/agent_route_model.json"),
+            skill_match_model_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("src/bin/ai/config/skill_match/skill_match_model.json"),
+        }
+    }
+
     #[test]
     fn one_shot_mode_still_preloads_mcp_before_turn() {
         let probe = super::McpConfigProbe {
@@ -3574,6 +3909,370 @@ mod tests {
 
         cli.interactive = true;
         assert!(!one_shot_cli_mode(&cli));
+    }
+
+    #[test]
+    fn resume_predicate_requires_clean_interactive_start() {
+        let cli = ParsedCli::default();
+        assert!(should_resume_suspended_terminal_session(&cli));
+
+        let mut cli = ParsedCli::default();
+        cli.args = vec!["继续".to_string()];
+        assert!(!should_resume_suspended_terminal_session(&cli));
+
+        let mut cli = ParsedCli::default();
+        cli.session = Some(String::new());
+        assert!(!should_resume_suspended_terminal_session(&cli));
+
+        let mut cli = ParsedCli::default();
+        cli.new_session = true;
+        assert!(!should_resume_suspended_terminal_session(&cli));
+    }
+
+    #[test]
+    fn startup_choice_auto_resumes_terminal_bound_session() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "rt_startup_resume_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let suspended_root = root.join("suspended");
+        let persona_path = root.join("personas.json");
+        let base_history = root.join("history.sqlite");
+        let suspended_history = root.join("history.persona-reviewer.sqlite");
+
+        unsafe {
+            std::env::set_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR", &suspended_root);
+            std::env::set_var("TERM_SESSION_ID", "term-456");
+        }
+
+        let persona_store = crate::ai::persona::PersonaStore::for_tests_with_path(persona_path);
+        let reviewer = persona_store
+            .create_persona("Reviewer", None, "You are a reviewer.")
+            .unwrap();
+        SuspendedSessionStore::new()
+            .save_for_terminal_key("terminal:term-456", "sess-123", &suspended_history, &reviewer.id)
+            .unwrap();
+
+        let choice = resolve_startup_session_choice(
+            &ParsedCli::default(),
+            &test_startup_config(&base_history),
+            &persona_store,
+            crate::ai::persona::default_persona(),
+        )
+        .unwrap();
+
+        assert_eq!(choice.session_id, "sess-123");
+        assert_eq!(choice.history_file, suspended_history);
+        assert_eq!(choice.active_persona.id, reviewer.id);
+        assert!(choice.startup_notice.is_some());
+        assert!(
+            SuspendedSessionStore::new()
+                .take_for_terminal_key("terminal:term-456")
+                .unwrap()
+                .is_none()
+        );
+
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+            std::env::remove_var("TERM_SESSION_ID");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_choice_skips_auto_resume_when_prompt_args_exist() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "rt_startup_resume_skip_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let suspended_root = root.join("suspended");
+        let base_history = root.join("history.sqlite");
+
+        unsafe {
+            std::env::set_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR", &suspended_root);
+            std::env::set_var("TERM_SESSION_ID", "term-789");
+        }
+
+        let persona_store =
+            crate::ai::persona::PersonaStore::for_tests_with_path(root.join("personas.json"));
+        let suspended_history =
+            root.join("history.persona-default.sqlite");
+        SuspendedSessionStore::new()
+            .save_for_terminal_key("terminal:term-789", "sess-keep", &suspended_history, "default")
+            .unwrap();
+
+        let mut cli = ParsedCli::default();
+        cli.args = vec!["继续这个问题".to_string()];
+
+        let choice = resolve_startup_session_choice(
+            &cli,
+            &test_startup_config(&base_history),
+            &persona_store,
+            crate::ai::persona::default_persona(),
+        )
+        .unwrap();
+
+        assert_ne!(choice.session_id, "sess-keep");
+        assert_eq!(
+            choice.history_file,
+            crate::ai::persona::history_file_for_persona(&base_history, "default")
+        );
+        assert!(
+            SuspendedSessionStore::new()
+                .take_for_terminal_key("terminal:term-789")
+                .unwrap()
+                .is_some()
+        );
+
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+            std::env::remove_var("TERM_SESSION_ID");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_choice_skips_auto_resume_when_new_session_requested() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "rt_startup_new_session_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let suspended_root = root.join("suspended");
+        let base_history = root.join("history.sqlite");
+
+        unsafe {
+            std::env::set_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR", &suspended_root);
+            std::env::set_var("TERM_SESSION_ID", "term-new");
+        }
+
+        let persona_store =
+            crate::ai::persona::PersonaStore::for_tests_with_path(root.join("personas.json"));
+        let suspended_history = root.join("history.persona-default.sqlite");
+        SuspendedSessionStore::new()
+            .save_for_terminal_key("terminal:term-new", "sess-keep", &suspended_history, "default")
+            .unwrap();
+
+        let mut cli = ParsedCli::default();
+        cli.new_session = true;
+
+        let choice = resolve_startup_session_choice(
+            &cli,
+            &test_startup_config(&base_history),
+            &persona_store,
+            crate::ai::persona::default_persona(),
+        )
+        .unwrap();
+
+        assert_ne!(choice.session_id, "sess-keep");
+        assert_eq!(
+            choice.history_file,
+            crate::ai::persona::history_file_for_persona(&base_history, "default")
+        );
+        assert_eq!(
+            SuspendedSessionStore::new()
+                .peek_entries_for_terminal_key("terminal:term-new")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+            std::env::remove_var("TERM_SESSION_ID");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_choice_can_select_specific_suspended_session_from_multiple() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "rt_startup_resume_select_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let suspended_root = root.join("suspended");
+        let base_history = root.join("history.sqlite");
+        let history_a = root.join("history.persona-default.sqlite");
+        let history_b = root.join("history.persona-reviewer.sqlite");
+
+        unsafe {
+            std::env::set_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR", &suspended_root);
+            std::env::set_var("TERM_SESSION_ID", "term-select");
+        }
+
+        let persona_store =
+            crate::ai::persona::PersonaStore::for_tests_with_path(root.join("personas.json"));
+        SuspendedSessionStore::new()
+            .save_for_terminal_key("terminal:term-select", "sess-1", &history_a, "default")
+            .unwrap();
+        SuspendedSessionStore::new()
+            .save_for_terminal_key("terminal:term-select", "sess-2", &history_b, "default")
+            .unwrap();
+
+        let choice = resolve_startup_session_choice_with_selector(
+            &ParsedCli::default(),
+            &test_startup_config(&base_history),
+            &persona_store,
+            crate::ai::persona::default_persona(),
+            |previews| {
+                assert_eq!(previews.len(), 2);
+                assert_eq!(previews[0].entry.session_id, "sess-2");
+                assert_eq!(previews[1].entry.session_id, "sess-1");
+                Ok(Some(1))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(choice.session_id, "sess-1");
+        assert_eq!(choice.history_file, history_a);
+        let remaining = SuspendedSessionStore::new()
+            .peek_entries_for_terminal_key("terminal:term-select")
+            .unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session_id, "sess-2");
+
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+            std::env::remove_var("TERM_SESSION_ID");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_choice_can_start_new_without_consuming_suspended_stack() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "rt_startup_resume_skip_stack_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let suspended_root = root.join("suspended");
+        let base_history = root.join("history.sqlite");
+        let history_a = root.join("history.persona-default.sqlite");
+        let history_b = root.join("history.persona-reviewer.sqlite");
+
+        unsafe {
+            std::env::set_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR", &suspended_root);
+            std::env::set_var("TERM_SESSION_ID", "term-stack");
+        }
+
+        let persona_store =
+            crate::ai::persona::PersonaStore::for_tests_with_path(root.join("personas.json"));
+        SuspendedSessionStore::new()
+            .save_for_terminal_key("terminal:term-stack", "sess-1", &history_a, "default")
+            .unwrap();
+        SuspendedSessionStore::new()
+            .save_for_terminal_key("terminal:term-stack", "sess-2", &history_b, "default")
+            .unwrap();
+
+        let choice = resolve_startup_session_choice_with_selector(
+            &ParsedCli::default(),
+            &test_startup_config(&base_history),
+            &persona_store,
+            crate::ai::persona::default_persona(),
+            |_previews| Ok(None),
+        )
+        .unwrap();
+
+        assert_ne!(choice.session_id, "sess-1");
+        assert_ne!(choice.session_id, "sess-2");
+        assert_eq!(
+            choice.history_file,
+            crate::ai::persona::history_file_for_persona(&base_history, "default")
+        );
+        assert!(
+            choice
+                .startup_notice
+                .as_deref()
+                .unwrap_or_default()
+                .contains("已跳过")
+        );
+        assert_eq!(
+            SuspendedSessionStore::new()
+                .peek_entries_for_terminal_key("terminal:term-stack")
+                .unwrap()
+                .len(),
+            2
+        );
+
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
+            std::env::remove_var("TERM_SESSION_ID");
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_choice_rejects_resume_and_session_together() {
+        let base_history = PathBuf::from("/tmp/history.sqlite");
+        let persona_store = crate::ai::persona::PersonaStore::for_tests_with_path(
+            std::env::temp_dir().join(format!(
+                "rt_personas_conflict_{}.json",
+                uuid::Uuid::new_v4().simple()
+            )),
+        );
+        let mut cli = ParsedCli::default();
+        cli.resume = true;
+        cli.session = Some(String::new());
+
+        let err = resolve_startup_session_choice(
+            &cli,
+            &test_startup_config(&base_history),
+            &persona_store,
+            crate::ai::persona::default_persona(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--resume"));
+    }
+
+    #[test]
+    fn startup_choice_rejects_resume_and_clear_together() {
+        let base_history = PathBuf::from("/tmp/history.sqlite");
+        let persona_store = crate::ai::persona::PersonaStore::for_tests_with_path(
+            std::env::temp_dir().join(format!(
+                "rt_personas_clear_conflict_{}.json",
+                uuid::Uuid::new_v4().simple()
+            )),
+        );
+        let mut cli = ParsedCli::default();
+        cli.resume = true;
+        cli.clear = true;
+
+        let err = resolve_startup_session_choice(
+            &cli,
+            &test_startup_config(&base_history),
+            &persona_store,
+            crate::ai::persona::default_persona(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--resume"));
+        assert!(err.to_string().contains("--clear"));
+    }
+
+    #[test]
+    fn startup_choice_rejects_resume_and_new_session_together() {
+        let base_history = PathBuf::from("/tmp/history.sqlite");
+        let persona_store = crate::ai::persona::PersonaStore::for_tests_with_path(
+            std::env::temp_dir().join(format!(
+                "rt_personas_new_conflict_{}.json",
+                uuid::Uuid::new_v4().simple()
+            )),
+        );
+        let mut cli = ParsedCli::default();
+        cli.resume = true;
+        cli.new_session = true;
+
+        let err = resolve_startup_session_choice(
+            &cli,
+            &test_startup_config(&base_history),
+            &persona_store,
+            crate::ai::persona::default_persona(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--resume"));
+        assert!(err.to_string().contains("--new-session"));
     }
 
     #[test]

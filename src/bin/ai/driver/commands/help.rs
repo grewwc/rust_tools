@@ -41,6 +41,7 @@ pub fn print_interactive_help() {
     println!("    /sessions current         show current session info");
     println!("    /sessions new             create and switch to new session");
     println!("    /sessions use <id>        switch to specified session");
+    println!("    /sessions suspend         suspend current session and return to shell");
     println!("    /sessions delete <id>     delete specified session");
     println!("    /sessions clear-all       delete all sessions");
     println!("    /sessions export <id> [output.md]       export session to Markdown");
@@ -51,6 +52,8 @@ pub fn print_interactive_help() {
     println!("    - Commands support both / and : prefix (e.g., /help or :help)");
     println!("    - Use `/personas` for persona management");
     println!("    - To create a persona: start `a`, then run `/personas create`");
+    println!("    - Run bare `a` in the same terminal to resume/select suspended sessions");
+    println!("    - Run `a --new-session` to start fresh without consuming suspended sessions");
     println!("    - Press Ctrl+C to interrupt streaming or exit");
     println!();
 }

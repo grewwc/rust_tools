@@ -10,6 +10,8 @@ pub(super) struct ParsedCli {
     pub(super) model: Option<String>,
     pub(super) agent: Option<String>,
     pub(super) clear: bool,
+    pub(super) new_session: bool,
+    pub(super) resume: bool,
     pub(super) session: Option<String>,
     pub(super) files: String,
     pub(super) args: Vec<String>,
@@ -102,6 +104,16 @@ fn register_cli_flags(parser: &mut TermParser) {
         false,
         "clear specified session history (use with --session)",
     );
+    parser.add_bool(
+        "new-session",
+        false,
+        "force creating a new session and skip suspended-session auto resume",
+    );
+    parser.add_bool(
+        "resume",
+        false,
+        "resume the suspended session bound to the current terminal",
+    );
     parser.add_bool("list-tools", false, "list builtin tools and exit");
     parser.add_bool("list-mcp-tools", false, "list mcp tools and exit");
     parser.alias("list-mcp-servers", "list-mcp-tools");
@@ -127,6 +139,8 @@ fn register_cli_flags(parser: &mut TermParser) {
     parser.add_bool("note-search", false, NOTE_SEARCH_USAGE);
     parser.add_bool("generate-completions", false, GENERATE_COMPLETIONS_USAGE);
     parser.alias("i", "interactive");
+    parser.alias("new", "new-session");
+    parser.alias("r", "resume");
     parser.alias("ns", "note-search");
     parser.alias("h", "help");
 
@@ -263,6 +277,8 @@ impl Default for ParsedCli {
             model: None,
             agent: None,
             clear: false,
+            new_session: false,
+            resume: false,
             session: None,
             files: String::new(),
             args: Vec::new(),
@@ -325,6 +341,8 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     // 处理 clear（与 --session 联用，清空对应 session 的 history）
     cli.clear = parser.contains_flag_strict("clear");
+    cli.new_session = parser.contains_flag_strict("new-session");
+    cli.resume = parser.contains_flag_strict("resume");
 
     // 处理 session
     if parser.contains_flag_strict("session") {
@@ -441,8 +459,11 @@ pub(super) fn print_help() {
     println!();
     println!("Session (CLI):");
     println!("  默认每个进程自动创建独立 session（不会和其它窗口串 history）");
+    println!("  纯交互启动 `a` 时：若只有 1 个挂起 session 则直接恢复，若有多个则可选择");
+    println!("  --resume                 显式查看/选择当前 terminal 的挂起 session");
+    println!("  --new-session, --new     强制新建 session，跳过挂起 session 自动恢复");
     println!("  --session <id>            指定 session id");
-    println!("  --session                 不指定 id，等同于自动创建新 session");
+    println!("  --session                 不指定 id，兼容旧语义：强制自动创建新 session");
     println!("  --clear --session <id>    清空指定 session 的 history");
     println!();
     println!("Interactive Commands (use in REPL mode):");
@@ -489,6 +510,7 @@ pub(super) fn print_help() {
     println!("    /sessions current         show current session info");
     println!("    /sessions new             create and switch to new session");
     println!("    /sessions use <id>        switch to specified session");
+    println!("    /sessions suspend         suspend current session and return to shell");
     println!("    /sessions delete <id>     delete specified session");
     println!("    /sessions clear-all       delete all sessions");
     println!("    /sessions export <id> [output.md]       export session to Markdown");
@@ -581,7 +603,7 @@ fn generate_bash(
         "  local persona_sub='help list ls current cur create new use select switch delete del rm'"
     );
     println!(
-        "  local session_sub='list current new use delete clear-all export export-current export-last'"
+        "  local session_sub='list current new use suspend delete clear-all export export-current export-last'"
     );
     println!("  local agent_sub='help list current use auto'");
     println!("  local model_sub='current list help effort'");
@@ -672,7 +694,7 @@ fn generate_zsh(
         "  local -a _a_history_subcmds=(full user assistant tool system grep rewind undo last export copy 3 6 10 20)"
     );
     println!(
-        "  local -a _a_session_subcmds=(list current new use delete clear-all export export-current export-last)"
+        "  local -a _a_session_subcmds=(list current new use suspend delete clear-all export export-current export-last)"
     );
     println!("  local -a _a_agent_subcmds=(help list current use auto)");
     println!(
@@ -848,8 +870,24 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(names.iter().any(|name| name == "clear"));
+        assert!(names.iter().any(|name| name == "new-session"));
+        assert!(names.iter().any(|name| name == "resume"));
         assert!(names.iter().any(|name| name == "generate-completions"));
         assert!(names.iter().any(|name| name == "migrate-legacy-knowledge"));
+    }
+
+    #[test]
+    fn parse_cli_args_reads_new_session_flag() {
+        let cli = super::parse_cli_args(["a".to_string(), "--new-session".to_string()].into_iter());
+
+        assert!(cli.new_session);
+    }
+
+    #[test]
+    fn parse_cli_args_reads_resume_flag() {
+        let cli = super::parse_cli_args(["a".to_string(), "--resume".to_string()].into_iter());
+
+        assert!(cli.resume);
     }
 
     #[test]
