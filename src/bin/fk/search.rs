@@ -105,6 +105,10 @@ fn check_file(
     let mut buf = String::new();
     let mut lineno: usize = 0;
     while let Some(mut line) = read_line_trim_newline(&mut buf, &mut reader) {
+        // 搜索到足够的结果后，立即停止读取当前文件
+        if terminalw::COUNT.load(Ordering::Relaxed) >= terminalw::NUM_PRINT.load(Ordering::Relaxed) {
+            return;
+        }
         lineno += 1;
 
         let mut matched: Option<Hit> = None;

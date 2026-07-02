@@ -131,17 +131,14 @@ impl Default for WaitGroup {
 }
 
 fn is_probably_text_file(path: &Path) -> bool {
-    let Ok(bytes) = std::fs::read(path) else {
+    use std::io::Read;
+    let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
-    if bytes.is_empty() {
-        return true;
-    }
-    let sample = &bytes[..bytes.len().min(8192)];
-    if sample.contains(&0) {
-        return false;
-    }
-    std::str::from_utf8(sample).is_ok()
+    let mut buf = [0u8; 8192];
+    let n = file.read(&mut buf).unwrap_or(0);
+    let sample = &buf[..n];
+    n == 0 || (!sample.contains(&0) && std::str::from_utf8(sample).is_ok())
 }
 
 pub fn find<F>(root_dir: &str, task: Arc<F>, wg: Arc<WaitGroup>, level: i32)
