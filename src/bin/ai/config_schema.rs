@@ -155,6 +155,11 @@ impl AiConfig {
     /// after each request when the provider reports them. Default true.
     pub const PROMPT_CACHE_SHOW_METRICS: &str = "ai.prompt_cache.show_metrics";
 
+    // ── Output ─────────────────────────────────────────────
+    /// Thinking 流式输出在 terminal 中最多保留多少行可见窗口。默认 8。
+    /// 设为 0 可关闭折叠，恢复完整实时输出。仅影响终端展示，不影响模型上下文。
+    pub const OUTPUT_THINKING_MAX_VISIBLE_LINES: &str = "ai.output.thinking.max_visible_lines";
+
     // ── Token usage stats ──────────────────────────────────
     /// When true, persist the per-session DecisionLog sidecar JSONL file.
     /// Default false; the in-memory DecisionLogStore remains enabled.

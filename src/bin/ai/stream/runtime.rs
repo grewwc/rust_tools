@@ -5,12 +5,14 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 
 use crate::ai::{
+    config_schema::AiConfig,
     driver::print::format_section_header,
     models, provider,
     request::StreamChunk,
     theme::{ACCENT_MUTED, ACCENT_RULE, DIM, RESET},
     types::{App, StreamOutcome, StreamResult, ToolCall, take_stream_cancelled},
 };
+use crate::commonw::configw;
 
 use super::{
     MarkdownStreamRenderer,
@@ -35,6 +37,8 @@ const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
 /// 首 chunk 超时：请求已发出但服务端迟迟不发第一个字节（排队/网关卡住等）。
 /// 比 idle 超时更长，因为某些模型冷启动或排队需要时间。
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
+/// terminal 下 thinking 可见窗口的默认高度。只影响展示，不影响 reasoning 累积。
+const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 8;
 
 pub(super) async fn stream_response(
     app: &mut App,
@@ -44,6 +48,7 @@ pub(super) async fn stream_response(
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
+    configure_thinking_fold(&mut state);
     let adapter_kind = normalize::resolve_adapter_kind(
         models::model_provider(&app.current_model),
         &models::endpoint_for_model(&app.current_model, &app.config.endpoint),
@@ -143,6 +148,31 @@ fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
     io::stdout().flush()?;
     state.render.waiting_hint_active = true;
     Ok(())
+}
+
+fn configure_thinking_fold(state: &mut StreamProcessingState) {
+    state.render.thinking_fold.max_visible_lines = resolve_thinking_fold_max_visible_lines(
+        io::stdout().is_terminal(),
+        configw::get_all_config()
+            .get_opt(AiConfig::OUTPUT_THINKING_MAX_VISIBLE_LINES)
+            .as_deref(),
+    );
+}
+
+fn resolve_thinking_fold_max_visible_lines(is_tty: bool, raw: Option<&str>) -> usize {
+    if !is_tty {
+        return usize::MAX;
+    }
+
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return DEFAULT_THINKING_MAX_VISIBLE_LINES;
+    };
+
+    match raw.parse::<usize>() {
+        Ok(0) => usize::MAX,
+        Ok(lines) => lines,
+        Err(_) => DEFAULT_THINKING_MAX_VISIBLE_LINES,
+    }
 }
 
 fn upgrade_waiting_hint_for_buffering(state: &mut StreamProcessingState) -> io::Result<()> {
@@ -1241,6 +1271,10 @@ fn write_thinking_content_folded(
     }
     let fold = &mut state.render.thinking_fold;
 
+    if fold.max_visible_lines == usize::MAX {
+        return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
+    }
+
     // 检测 thinking 标题行（╭─ thinking）—— 直接输出不参与折叠计数
     if content.contains(&markers.thinking_tag) {
         fold.active = true;
@@ -1427,6 +1461,27 @@ mod tests {
         let line = format_prompt_cache_metrics(1000, 750).unwrap();
         assert!(line.contains("750/1000"));
         assert!(line.contains("75% hit"));
+    }
+
+    #[test]
+    fn thinking_fold_defaults_to_eight_lines_for_tty() {
+        assert_eq!(resolve_thinking_fold_max_visible_lines(true, None), 8);
+        assert_eq!(
+            resolve_thinking_fold_max_visible_lines(true, Some("12")),
+            12
+        );
+        assert_eq!(
+            resolve_thinking_fold_max_visible_lines(true, Some("0")),
+            usize::MAX
+        );
+        assert_eq!(
+            resolve_thinking_fold_max_visible_lines(true, Some("oops")),
+            8
+        );
+        assert_eq!(
+            resolve_thinking_fold_max_visible_lines(false, Some("12")),
+            usize::MAX
+        );
     }
 
     fn test_app() -> App {
@@ -1831,6 +1886,48 @@ mod tests {
 
         assert_eq!(current_history, "hello world");
         assert_eq!(state.content.assistant_text, "hello world");
+    }
+
+    #[test]
+    fn thinking_fold_keeps_reasoning_buffer_intact() {
+        let markers = StreamMarkers::new();
+        let mut state = StreamProcessingState::new();
+        state.render.thinking_fold.max_visible_lines = 2;
+        let mut app = test_app();
+        let mut current_history = String::new();
+
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            normalize::StreamProviderAdapterKind::OpenAi,
+            Some("response.reasoning_text.delta"),
+            r#"{"delta":"step 1\nstep 2\nstep 3"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(state.content.reasoning_text, "step 1\nstep 2\nstep 3");
+        assert!(state.content.thinking_open);
+        assert!(current_history.is_empty());
+        assert!(state.content.assistant_text.is_empty());
+
+        process_stream_payload(
+            &mut app,
+            &mut current_history,
+            &markers,
+            &mut state,
+            normalize::StreamProviderAdapterKind::OpenAi,
+            Some("response.output_text.delta"),
+            r#"{"delta":"final answer"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(state.content.reasoning_text, "step 1\nstep 2\nstep 3");
+        assert_eq!(current_history, "final answer");
+        assert_eq!(state.content.assistant_text, "final answer");
+        assert!(!state.content.thinking_open);
+        assert!(!state.render.thinking_fold.active);
     }
 
     #[test]
