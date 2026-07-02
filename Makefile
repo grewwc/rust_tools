@@ -3,7 +3,7 @@ ALL_BINS ?= $(INSTALL_BINS) c
 
 # 允许 `make install fk` / `make install fk ff` 语法
 .PHONY: $(INSTALL_BINS)
-$(INSTALL_BINS): install
+$(INSTALL_BINS): install ; @:
 
 RELEASE_DIR := target/release
 DEBUG_DIR := target/debug
@@ -26,11 +26,20 @@ install:
 	$(eval REQUESTED := $(filter-out install,$(MAKECMDGOALS)))
 	$(eval BINS := $(or $(REQUESTED),$(INSTALL_BINS)))
 	@set -e; \
-	args=""; \
-	for b in $(BINS); do args="$$args --bin $$b"; done; \
-	echo "building $$args"; \
-	cargo build --release $$args; \
-	sh ./move_executable.sh $(BINS)
+	if [ -n "$(REQUESTED)" ]; then \
+		args=""; \
+		for b in $(BINS); do args="$$args --bin $$b"; done; \
+		cargo build --release $$args; \
+		sh ./move_executable.sh --force $(BINS); \
+	else \
+		bins=$$($(INSTALLW) -- $(BINS)); \
+		if [ -n "$$bins" ]; then \
+			args=""; \
+			for b in $$bins; do args="$$args --bin $$b"; done; \
+			cargo build --release $$args; \
+		fi; \
+		sh ./move_executable.sh $(BINS); \
+	fi
 
 	@$(MAKE) install-completions
 # -- shell completions --

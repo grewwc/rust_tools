@@ -5,6 +5,12 @@ set -e
 DEFAULT_BINS="a configw his j ns oo re tt"
 INSTALL_DIR="${INSTALL_DIR:-$(pwd)/bin}"
 
+FORCE=""
+if [ "$1" = "--force" ]; then
+    FORCE="1"
+    shift
+fi
+
 if [ "$#" -gt 0 ]; then
     BINS="$*"
 else
@@ -17,14 +23,18 @@ if [ ! -d "$INSTALL_DIR" ]; then
     mkdir -p "$INSTALL_DIR"
 fi
 
-NEED="$(
-    INSTALLW_BIN="${INSTALLW_BIN:-$(pwd)/target/debug/installw}"
-    if [ -x "$INSTALLW_BIN" ]; then
-        INSTALL_DIR="$INSTALL_DIR" "$INSTALLW_BIN" --mode install -- $BINS
-    else
-        INSTALL_DIR="$INSTALL_DIR" cargo run -q --bin installw -- --mode install -- $BINS
-    fi
-)"
+if [ -n "$FORCE" ]; then
+    NEED="$BINS"
+else
+    NEED="$(
+        INSTALLW_BIN="${INSTALLW_BIN:-$(pwd)/target/debug/installw}"
+        if [ -x "$INSTALLW_BIN" ]; then
+            INSTALL_DIR="$INSTALL_DIR" "$INSTALLW_BIN" --mode install -- $BINS
+        else
+            INSTALL_DIR="$INSTALL_DIR" cargo run -q --bin installw -- --mode install -- $BINS
+        fi
+    )"
+fi
 
 for bin in $NEED; do
     src="$BIN_DIR/$bin"
