@@ -127,7 +127,7 @@
     "tools_default_enabled": true,
     "default_reasoning_effort": "high",
     "enable_thinking": true,
-    "subagent_priority": 80
+    "subagent_priority": 95
   },
   {
     "key": "glm-5.1-alibaba",
@@ -144,7 +144,7 @@
     "tools_default_enabled": true,
     "default_reasoning_effort": "high",
     "explicit_prompt_cache": true,
-    "enable_thinking": false,
+    "enable_thinking": true,
     "subagent_priority": 60
   }
 ]

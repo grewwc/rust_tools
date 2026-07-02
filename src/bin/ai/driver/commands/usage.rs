@@ -209,7 +209,7 @@ pub fn try_handle_usage_command(input: &str) -> Result<bool, Box<dyn std::error:
         print_window(Some(7 * 86_400));
         print_window(Some(86_400));
         println!();
-        print_daily_breakdown(14);
+        print_daily_breakdown(3);
     } else if matches!(arg, "daily" | "days" | "trend") || arg.ends_with("d") && arg.len() <= 4 {
         let days = parse_daily_arg(arg).unwrap_or(14);
         print_daily_breakdown(days);
