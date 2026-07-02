@@ -377,6 +377,60 @@ fn has_tool(available: &Box<SkipSet<String>>, name: &str) -> bool {
     available.contains_str(name)
 }
 
+fn push_tool_guidance_section(
+    builder: &mut SystemPromptBuilder,
+    kind: ContextKind,
+    title: &str,
+    lines: Vec<String>,
+) {
+    if lines.is_empty() {
+        return;
+    }
+
+    let mut section = String::from(title);
+    section.push('\n');
+    for line in lines {
+        section.push_str("- ");
+        section.push_str(&line);
+        section.push('\n');
+    }
+    if section.ends_with('\n') {
+        section.pop();
+    }
+    builder.push(kind, section);
+}
+
+fn backticked_tool(name: &str) -> String {
+    format!("`{name}`")
+}
+
+fn format_tool_names(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => backticked_tool(only),
+        [first, second] => format!("{} and {}", backticked_tool(first), backticked_tool(second)),
+        _ => {
+            let mut rendered = names
+                .iter()
+                .map(|name| backticked_tool(name))
+                .collect::<Vec<_>>();
+            let last = rendered.pop().unwrap_or_default();
+            format!("{}, and {}", rendered.join(", "), last)
+        }
+    }
+}
+
+fn available_tool_names_in_order<'a>(
+    available_tools: &Box<SkipSet<String>>,
+    candidates: &'a [&'a str],
+) -> Vec<&'a str> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|name| has_tool(available_tools, name))
+        .collect()
+}
+
 fn reorder_tools_by_stats(mut builtin: Vec<ToolDef>, mut mcp: Vec<ToolDef>) -> Vec<ToolDef> {
     // Tools are part of the request payload that providers hash for prompt
     // caching. Reordering on every turn (e.g. by sliding 14-day usage stats)
@@ -883,42 +937,218 @@ fn build_system_prompt(
         if let Some(catalog) = build_capability_catalog(available_tools) {
             b.push(ContextKind::Fact, catalog);
         }
-        let discovery_policy = if skill.is_none() {
-            "Tool discovery:\n- Not all tools are loaded. Use `discover_skills` for specialized workflows, or `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for specific tools.\n- If the user names a workflow, tool, product, or domain that likely maps to a local skill (for example an internal service, CLI, log system, or incident workflow), call `discover_skills` with the named keyword before inventing commands.\n- After `discover_skills`, if one listed skill clearly matches the task, call `activate_skill(name=...)` to load its prompt and tools. Do not activate a skill that does not clearly match.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first.\n- No skill is active yet. Prefer `discover_skills` before a freeform response only when the task is specialized, tool-heavy, or likely covered by an installed skill."
+        let mut discovery_lines = Vec::new();
+        if skill.is_none() {
+            if has_tool(available_tools, "discover_skills") {
+                discovery_lines.push(
+                    "Not all tools are loaded. Use `discover_skills` for specialized workflows, or `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for specific tools.".to_string(),
+                );
+                discovery_lines.push(
+                    "If the user names a workflow, tool, product, or domain that likely maps to a local skill (for example an internal service, CLI, log system, or incident workflow), call `discover_skills` with the named keyword before inventing commands.".to_string(),
+                );
+                if has_tool(available_tools, "activate_skill") {
+                    discovery_lines.push(
+                        "After `discover_skills`, if one listed skill clearly matches the task, call `activate_skill(name=...)` to load its prompt and tools. Do not activate a skill that does not clearly match.".to_string(),
+                    );
+                }
+                discovery_lines.push(
+                    "No skill is active yet. Prefer `discover_skills` before a freeform response only when the task is specialized, tool-heavy, or likely covered by an installed skill.".to_string(),
+                );
+            } else {
+                discovery_lines.push(
+                    "Not all tools are loaded. If a capability is missing, use `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.".to_string(),
+                );
+                discovery_lines.push(
+                    "No skill is active yet. Prefer enabling only the specific tools you need when the task is specialized or tool-heavy.".to_string(),
+                );
+            }
         } else {
-            "Tool discovery:\n- Not all tools are loaded. If a capability is missing, use `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.\n- For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first."
-        };
-        b.push(ContextKind::Policy, discovery_policy);
+            discovery_lines.push(
+                "Not all tools are loaded. If a capability is missing, use `enable_tools(operation=list)` then `enable_tools(operation=enable, tools=[...])` for only what you need.".to_string(),
+            );
+        }
+        discovery_lines.push(
+            "For external systems (Feishu/Lark, web, etc.), discover and enable matching `mcp_*` tools first.".to_string(),
+        );
+        push_tool_guidance_section(&mut b, ContextKind::Policy, "Tool discovery:", discovery_lines);
     }
 
     if has_tool(available_tools, "knowledge_save") {
-        b.push(ContextKind::Policy, "Knowledge save:\n- If the user asks to remember or states a durable preference/constraint, call `knowledge_save`.\n- When saving a durable principle, preference, safety rule, or coding rule, choose a guideline category such as `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` so it participates in persistent recall.\n- Use `user_memory` / `project_info` / `architecture` / `decision_log` for factual knowledge.\n- When asked about remembered info, use `knowledge_search` or `knowledge_list`.");
+        let mut lines = vec![
+            "If the user asks to remember or states a durable preference/constraint, call `knowledge_save`.".to_string(),
+            "When saving a durable principle, preference, safety rule, or coding rule, choose a guideline category such as `common_sense`, `coding_guideline`, `preference`, `user_preference`, or `safety_rules` so it participates in persistent recall.".to_string(),
+            "Use `user_memory` / `project_info` / `architecture` / `decision_log` for factual knowledge.".to_string(),
+        ];
+        let retrieval_tools =
+            available_tool_names_in_order(available_tools, &["knowledge_search", "knowledge_list"]);
+        if !retrieval_tools.is_empty() {
+            lines.push(format!(
+                "When asked about remembered info, use {}.",
+                format_tool_names(&retrieval_tools)
+            ));
+        }
+        push_tool_guidance_section(&mut b, ContextKind::Policy, "Knowledge save:", lines);
     }
 
-    if has_tool(available_tools, "plan") || has_tool(available_tools, "spawn_process") {
-        b.push(ContextKind::Behavior, "Planning & Sub-process Execution:\n- Simple tasks: act directly. Complex ones: call `plan` first.\n- Use `spawn_process` only for fire-and-forget background work whose result you do NOT need back (long-running processes, two-way IPC collaboration). It returns a PID, not a result.\n- If you need the delegated work's result returned to you, use `task_spawn` + `task_wait` instead — even for a single task.\n- Use `wait_process` to yield until a child finishes, `kill_process` to stop one, `reap_process` to collect it.\n- Use `send_ipc_message`/`read_mailbox` for cross-process communication.");
+    if has_tool(available_tools, "plan")
+        || has_tool(available_tools, "spawn_process")
+        || has_tool(available_tools, "task_spawn")
+        || has_tool(available_tools, "task_wait")
+        || has_tool(available_tools, "wait_process")
+        || has_tool(available_tools, "kill_process")
+        || has_tool(available_tools, "reap_process")
+        || has_tool(available_tools, "send_ipc_message")
+        || has_tool(available_tools, "read_mailbox")
+    {
+        let mut lines = Vec::new();
+        if has_tool(available_tools, "plan") {
+            lines.push("Simple tasks: act directly. Complex ones: call `plan` first.".to_string());
+        }
+        if has_tool(available_tools, "spawn_process") {
+            lines.push(
+                "Use `spawn_process` only for fire-and-forget background work whose result you do NOT need back (long-running processes, two-way IPC collaboration). It returns a PID, not a result.".to_string(),
+            );
+        }
+        if has_tool(available_tools, "task_spawn") && has_tool(available_tools, "task_wait") {
+            lines.push(
+                "If you need the delegated work's result returned to you, use `task_spawn` + `task_wait` instead — even for a single task.".to_string(),
+            );
+        }
+        let process_tools =
+            available_tool_names_in_order(available_tools, &["wait_process", "kill_process", "reap_process"]);
+        if !process_tools.is_empty() {
+            lines.push(format!(
+                "Use {} to manage child processes.",
+                format_tool_names(&process_tools)
+            ));
+        }
+        let ipc_tools =
+            available_tool_names_in_order(available_tools, &["send_ipc_message", "read_mailbox"]);
+        if !ipc_tools.is_empty() {
+            lines.push(format!(
+                "Use {} for cross-process communication.",
+                format_tool_names(&ipc_tools)
+            ));
+        }
+        push_tool_guidance_section(
+            &mut b,
+            ContextKind::Behavior,
+            "Planning & Sub-process Execution:",
+            lines,
+        );
     }
 
-    if has_tool(available_tools, "tool_spawn") || has_tool(available_tools, "tool_wait") {
-        b.push(ContextKind::Behavior, "Async Tool Orchestration:\n- Use `tool_spawn` for parallel independent tool calls.\n- Use `tool_wait` (all/any) to join results, `tool_status` to peek, `tool_cancel` to drop low-value branches.\n- If wake-up messages identify finished tasks, act on them immediately instead of re-querying.");
+    if has_tool(available_tools, "tool_spawn")
+        || has_tool(available_tools, "tool_wait")
+        || has_tool(available_tools, "tool_status")
+        || has_tool(available_tools, "tool_cancel")
+    {
+        let mut lines = Vec::new();
+        if has_tool(available_tools, "tool_spawn") {
+            lines.push("Use `tool_spawn` for parallel independent tool calls.".to_string());
+        }
+        let async_tool_controls =
+            available_tool_names_in_order(available_tools, &["tool_wait", "tool_status", "tool_cancel"]);
+        if !async_tool_controls.is_empty() {
+            lines.push(format!(
+                "Use {} to join, inspect, or drop async tool branches as needed.",
+                format_tool_names(&async_tool_controls)
+            ));
+        }
+        if has_tool(available_tools, "read_mailbox") {
+            lines.push(
+                "If wake-up messages identify finished tasks, act on them immediately instead of re-querying.".to_string(),
+            );
+        }
+        push_tool_guidance_section(
+            &mut b,
+            ContextKind::Behavior,
+            "Async Tool Orchestration:",
+            lines,
+        );
     }
 
-    if has_tool(available_tools, "task_spawn") || has_tool(available_tools, "task_wait") {
-        b.push(ContextKind::Behavior, "Async Subagent Orchestration (task_*):\n- `task_spawn`: launch a subagent task; fan out parallel independent subtasks.\n- `task_wait`: collect results. Timeout is per-call — re-call or use `wait_policy=\"any\"` for early wake-up.\n- `task_status`: non-blocking peek. No `task_cancel` — just let orphaned tasks finish.\n- `task_*` and `tool_*` are distinct families: don't confuse their IDs.");
+    if has_tool(available_tools, "task_spawn")
+        || has_tool(available_tools, "task_wait")
+        || has_tool(available_tools, "task_status")
+    {
+        let mut lines = Vec::new();
+        if has_tool(available_tools, "task_spawn") {
+            lines.push("Use `task_spawn` to launch a subagent task and fan out parallel independent subtasks.".to_string());
+        }
+        if has_tool(available_tools, "task_wait") {
+            lines.push("Use `task_wait` to collect results. Timeout is per-call — re-call or use `wait_policy=\"any\"` for early wake-up.".to_string());
+        }
+        if has_tool(available_tools, "task_status") {
+            lines.push("Use `task_status` for a non-blocking peek. There is no `task_cancel`; let orphaned tasks finish.".to_string());
+        }
+        if has_tool(available_tools, "tool_spawn")
+            || has_tool(available_tools, "tool_wait")
+            || has_tool(available_tools, "tool_status")
+        {
+            lines.push("`task_*` and `tool_*` are distinct families: do not confuse their IDs.".to_string());
+        }
+        push_tool_guidance_section(
+            &mut b,
+            ContextKind::Behavior,
+            "Async Subagent Orchestration (task_*):",
+            lines,
+        );
     }
 
     if has_tool(available_tools, "agent_team") {
-        b.push(ContextKind::Behavior, "Agent Team Deliberation:\n- Use `agent_team(operation=\"start\")` for complex decisions that benefit from several roles or independent perspectives.\n- Collect the returned task_ids with `task_wait(wait_policy=\"all\")`, then pass the complete transcript into `agent_team(operation=\"challenge\")` so agents can challenge assumptions.\n- For final consensus, pass initial outputs plus challenges into `agent_team(operation=\"synthesize\")`.\n- Team communication is parent-mediated; do not expect peer agents to receive direct mailbox messages.");
+        let mut lines = vec![
+            "Use `agent_team(operation=\"start\")` for complex decisions that benefit from several roles or independent perspectives.".to_string(),
+        ];
+        if has_tool(available_tools, "task_wait") {
+            lines.push(
+                "Collect the returned task_ids with `task_wait(wait_policy=\"all\")`, then pass the complete transcript into `agent_team(operation=\"challenge\")` so agents can challenge assumptions.".to_string(),
+            );
+        }
+        lines.push(
+            "For final consensus, pass initial outputs plus challenges into `agent_team(operation=\"synthesize\")`.".to_string(),
+        );
+        lines.push(
+            "Team communication is parent-mediated; do not expect peer agents to receive direct mailbox messages.".to_string(),
+        );
+        push_tool_guidance_section(
+            &mut b,
+            ContextKind::Behavior,
+            "Agent Team Deliberation:",
+            lines,
+        );
     }
 
     if has_tool(available_tools, "knowledge_search")
         || has_tool(available_tools, "knowledge_semantic_search")
+        || has_tool(available_tools, "knowledge_list")
     {
-        b.push(ContextKind::Policy, "Knowledge retrieval:\n- Before answering from memory, search with `knowledge_search`/`knowledge_semantic_search`.\n- Use `knowledge_list` when asked what is remembered.");
+        let mut lines = Vec::new();
+        let search_tools = available_tool_names_in_order(
+            available_tools,
+            &["knowledge_search", "knowledge_semantic_search"],
+        );
+        if !search_tools.is_empty() {
+            lines.push(format!(
+                "Before answering from memory, search with {}.",
+                format_tool_names(&search_tools)
+            ));
+        }
+        if has_tool(available_tools, "knowledge_list") {
+            lines.push("Use `knowledge_list` when asked what is remembered.".to_string());
+        }
+        push_tool_guidance_section(&mut b, ContextKind::Policy, "Knowledge retrieval:", lines);
     }
 
     if has_tool(available_tools, "web_search") || has_tool(available_tools, "web_fetch") {
-        b.push(ContextKind::Policy, "Web search:\n- For real-time or time-sensitive topics, use `web_search` first (not memory).\n- Use `web_fetch` for detailed content from selected URLs.");
+        let mut lines = Vec::new();
+        if has_tool(available_tools, "web_search") {
+            lines.push("For real-time or time-sensitive topics, use `web_search` first (not memory).".to_string());
+        }
+        if has_tool(available_tools, "web_fetch") {
+            lines.push("Use `web_fetch` for detailed content from selected URLs.".to_string());
+        }
+        push_tool_guidance_section(&mut b, ContextKind::Policy, "Web search:", lines);
     }
 
     b
@@ -1701,6 +1931,16 @@ mod tests {
         assert!(prompt.contains("No skill is active yet"));
         assert!(prompt.contains("only when the task is specialized, tool-heavy"));
         assert!(prompt.contains("call `discover_skills` with the named keyword"));
+    }
+
+    #[test]
+    fn system_prompt_omits_discover_skills_guidance_when_tool_is_unavailable() {
+        let mut available = SkipSet::new(16);
+        available.insert("enable_tools".to_string());
+        let prompt = build_system_prompt(None, None, &Box::new(available)).render_system_prompt();
+        assert!(prompt.contains("enable_tools(operation=list)"));
+        assert!(!prompt.contains("call `discover_skills` with the named keyword"));
+        assert!(!prompt.contains("After `discover_skills`"));
     }
 
     #[test]

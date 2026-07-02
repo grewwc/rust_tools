@@ -1060,6 +1060,8 @@ pub(super) async fn do_request_messages(
     clear_stale_request_interrupt_before_request(app);
 
     let mut normalized_messages = normalize_messages_for_model(model, messages);
+    let request_tool_names = request_tool_names_for_model(app, model);
+    strip_unavailable_tool_hints_from_messages(&mut normalized_messages, &request_tool_names);
     if prompt_cache_enabled_for_model(model) {
         apply_prompt_cache_breakpoint(&mut normalized_messages);
     }
@@ -1497,6 +1499,84 @@ fn agent_tools_for_request(app: &App, model: &str) -> (Option<Value>, Option<Val
         .as_ref()
         .map(|_| Value::String("auto".to_string()));
     (tools_value, tool_choice)
+}
+
+fn request_tool_names_for_model(app: &App, model: &str) -> rust_tools::commonw::FastSet<String> {
+    if !models::tools_enabled(model) {
+        return Default::default();
+    }
+    app.agent_context
+        .as_ref()
+        .map(|ctx| {
+            ctx.tools
+                .iter()
+                .map(|tool| tool.function.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn line_references_unavailable_registered_tool(
+    line: &str,
+    available_tool_names: &rust_tools::commonw::FastSet<String>,
+) -> bool {
+    line.split('`')
+        .enumerate()
+        .filter_map(|(idx, chunk)| {
+            if idx % 2 == 0 {
+                return None;
+            }
+            let candidate = chunk
+                .trim()
+                .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+                .next()
+                .unwrap_or("");
+            if candidate.is_empty() {
+                return None;
+            }
+            crate::ai::tools::registry::common::get_tool_spec(candidate).map(|_| candidate)
+        })
+        .any(|tool_name| !available_tool_names.contains(tool_name))
+}
+
+fn should_drop_unavailable_tool_hint_line(
+    message: &Message,
+    line: &str,
+    available_tool_names: &rust_tools::commonw::FastSet<String>,
+) -> bool {
+    if !line_references_unavailable_registered_tool(line, available_tool_names) {
+        return false;
+    }
+
+    let trimmed = line.trim_start();
+    if message.role == crate::ai::history::ROLE_INTERNAL_NOTE || message.role == "system" {
+        return trimmed.starts_with("- ") || trimmed.starts_with("Code-navigation correction:");
+    }
+    if message.role == "tool" {
+        return trimmed.starts_with("Suggestion:");
+    }
+    false
+}
+
+fn strip_unavailable_tool_hints_from_messages(
+    messages: &mut [Message],
+    available_tool_names: &rust_tools::commonw::FastSet<String>,
+) {
+    for message in messages.iter_mut() {
+        let Some(text) = message.content.as_str() else {
+            continue;
+        };
+        let filtered = text
+            .lines()
+            .filter(|line| {
+                !should_drop_unavailable_tool_hint_line(message, line, available_tool_names)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if filtered != text {
+            message.content = Value::String(filtered);
+        }
+    }
 }
 
 fn normalize_messages_for_request(messages: &[Message]) -> Vec<Message> {
@@ -3712,6 +3792,35 @@ mod tests {
         let self_note = text.find("## Self Notes").unwrap();
         assert!(wm < summary);
         assert!(summary < self_note);
+    }
+
+    #[test]
+    fn strip_unavailable_tool_hints_removes_code_search_correction_from_working_memory() {
+        let mut messages = vec![Message {
+            role: "system".to_string(),
+            content: Value::String(
+                "Current code-inspection working memory:\n\
+                 - read_file(file=src/main.rs)\n\
+                 Code-navigation correction: you have started raw inspection without `code_search`. Before another raw read, use `code_search` first to locate the relevant file/symbol/definition, then read only the specific region you need.\n\
+                 Treat these findings as already-known context."
+                    .to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        let available = ["read_file", "find_path"]
+            .into_iter()
+            .map(|name| name.to_string())
+            .collect();
+        strip_unavailable_tool_hints_from_messages(&mut messages, &available);
+
+        let text = messages[0].content.as_str().unwrap();
+        assert!(text.contains("Current code-inspection working memory:"));
+        assert!(text.contains("Treat these findings as already-known context."));
+        assert!(!text.contains("Code-navigation correction:"));
+        assert!(!text.contains("`code_search`"));
     }
 
     #[test]

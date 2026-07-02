@@ -490,20 +490,38 @@ fn handle_tool_call_round(
         messages,
         turn_messages,
     );
-    record_tool_inspection_artifacts(app, messages, turn_messages);
+    record_tool_inspection_artifacts(
+        app,
+        messages,
+        turn_messages,
+        &tool_call_execution.allowed_tool_names,
+    );
 
     persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
 
     Ok(None)
 }
 
-const DISCOVER_SKILLS_FOLLOWUP_NOTE: &str = "tool_followup:discover_skills\n\
-`discover_skills` only listed metadata and did not activate any skill.\n\
-This is not a final answer. Continue the current turn:\n\
-- if one listed skill clearly matches the user's task, call `activate_skill` with its name to load its prompt and tools;\n\
-- otherwise enable the missing tools you need;\n\
-- if no skill is actually needed, answer the user directly.\n\
-Do not end the turn immediately after only listing skills.";
+const DISCOVER_SKILLS_FOLLOWUP_PREFIX: &str = "tool_followup:discover_skills\n";
+
+fn build_discover_skills_followup_note(
+    allowed_tool_names: &rust_tools::commonw::FastSet<String>,
+) -> String {
+    let mut note = String::from(DISCOVER_SKILLS_FOLLOWUP_PREFIX);
+    note.push_str("`discover_skills` only listed metadata and did not activate any skill.\n");
+    note.push_str("This is not a final answer. Continue the current turn:\n");
+    if allowed_tool_names.contains("activate_skill") {
+        note.push_str(
+            "- if one listed skill clearly matches the user's task, call `activate_skill` with its name to load its prompt and tools;\n",
+        );
+    }
+    if allowed_tool_names.contains("enable_tools") {
+        note.push_str("- otherwise enable the missing tools you need;\n");
+    }
+    note.push_str("- if no skill is actually needed, answer the user directly.\n");
+    note.push_str("Do not end the turn immediately after only listing skills.");
+    note
+}
 
 fn requested_only_discover_skills(tool_calls: &[ToolCall]) -> bool {
     !tool_calls.is_empty()
@@ -515,10 +533,15 @@ fn requested_only_discover_skills(tool_calls: &[ToolCall]) -> bool {
 fn append_discover_skills_followup_note(
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
+    allowed_tool_names: &rust_tools::commonw::FastSet<String>,
 ) {
+    let note = build_discover_skills_followup_note(allowed_tool_names);
     let already_present = messages.iter().chain(turn_messages.iter()).any(|message| {
         message.role == ROLE_INTERNAL_NOTE
-            && message.content.as_str() == Some(DISCOVER_SKILLS_FOLLOWUP_NOTE)
+            && message
+                .content
+                .as_str()
+                .is_some_and(|content| content.starts_with(DISCOVER_SKILLS_FOLLOWUP_PREFIX))
     });
     if already_present {
         return;
@@ -528,7 +551,7 @@ fn append_discover_skills_followup_note(
         turn_messages,
         Message {
             role: ROLE_INTERNAL_NOTE.to_string(),
-            content: serde_json::Value::String(DISCOVER_SKILLS_FOLLOWUP_NOTE.to_string()),
+            content: serde_json::Value::String(note),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
@@ -685,7 +708,11 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             )?;
 
             if discover_skills_only {
-                append_discover_skills_followup_note(messages, turn_messages);
+                append_discover_skills_followup_note(
+                    messages,
+                    turn_messages,
+                    &tool_call_execution.allowed_tool_names,
+                );
             }
             append_auto_image_followup_message(
                 app,
@@ -907,15 +934,16 @@ mod tests {
     fn discover_skills_followup_note_is_deduplicated() {
         let mut messages = Vec::new();
         let mut turn_messages = Vec::new();
-        append_discover_skills_followup_note(&mut messages, &mut turn_messages);
-        append_discover_skills_followup_note(&mut messages, &mut turn_messages);
+        let allowed: rust_tools::commonw::FastSet<String> = ["enable_tools".to_string()]
+            .into_iter()
+            .collect();
+        append_discover_skills_followup_note(&mut messages, &mut turn_messages, &allowed);
+        append_discover_skills_followup_note(&mut messages, &mut turn_messages, &allowed);
+        let expected = build_discover_skills_followup_note(&allowed);
         assert_eq!(messages.len(), 1);
         assert_eq!(turn_messages.len(), 1);
         assert_eq!(messages[0].role, ROLE_INTERNAL_NOTE);
-        assert_eq!(
-            messages[0].content.as_str(),
-            Some(DISCOVER_SKILLS_FOLLOWUP_NOTE)
-        );
+        assert_eq!(messages[0].content.as_str(), Some(expected.as_str()));
     }
 
     #[test]

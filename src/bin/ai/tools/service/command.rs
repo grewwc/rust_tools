@@ -460,6 +460,18 @@ fn is_env_assignment_word(token: &str) -> bool {
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+fn command_word_index(tokens: &[String], shell_context: bool) -> Option<usize> {
+    if !shell_context {
+        return (!tokens.is_empty()).then_some(0);
+    }
+
+    let mut i = 0usize;
+    while i < tokens.len() && is_env_assignment_word(&tokens[i]) {
+        i += 1;
+    }
+    (i < tokens.len()).then_some(i)
+}
+
 fn xargs_command_index(tokens: &[String]) -> Option<usize> {
     let mut i = 1usize;
     while i < tokens.len() {
@@ -545,6 +557,47 @@ fn env_command_index(tokens: &[String], raw_tokens: &[String]) -> Option<usize> 
             continue;
         }
         return Some(i);
+    }
+    None
+}
+
+fn command_builtin_index(tokens: &[String]) -> Option<usize> {
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok == "--" {
+            return (i + 1 < tokens.len()).then_some(i + 1);
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            return Some(i);
+        }
+        if matches!(tok, "-p") {
+            i += 1;
+            continue;
+        }
+        if matches!(tok, "-v" | "-V") {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn exec_builtin_index(tokens: &[String]) -> Option<usize> {
+    let mut i = 1usize;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok == "--" {
+            return (i + 1 < tokens.len()).then_some(i + 1);
+        }
+        if !tok.starts_with('-') || tok == "-" {
+            return Some(i);
+        }
+        if matches!(tok, "-a" | "-c" | "-l") {
+            i += if tok == "-a" { 2 } else { 1 };
+            continue;
+        }
+        i += 1;
     }
     None
 }
@@ -660,6 +713,8 @@ fn indirect_command_index(
         "time" => time_command_index(tokens),
         "timeout" => timeout_command_index(tokens),
         "stdbuf" => first_non_option_index(tokens, 1, &["-i", "-o", "-e"]),
+        "command" => command_builtin_index(tokens),
+        "exec" => exec_builtin_index(tokens),
         _ => None,
     }
 }
@@ -883,7 +938,13 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         .iter()
         .map(|token| token.to_ascii_lowercase())
         .collect::<Vec<_>>();
-    let program = lower_tokens[0].as_str();
+    let shell_context = crate::cmd::run::command_requires_shell(command);
+    let Some(command_idx) = command_word_index(&tokens, shell_context) else {
+        return Ok(());
+    };
+    let command_tokens = &lower_tokens[command_idx..];
+    let raw_command_tokens = &tokens[command_idx..];
+    let program = command_tokens[0].as_str();
     let extra_blocked = config_blocked_commands();
     let normalize_path = |path: &std::path::Path| {
         let mut normalized = std::path::PathBuf::new();
@@ -901,12 +962,16 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         normalized
     };
 
-    if matches!(program, "rm" | "mv") {
+    if program == "mv" {
         let base_dir = crate::ai::driver::runtime_ctx::effective_cwd()
             .map_err(|err| format!("failed to resolve current directory: {err}"))?;
         let base_dir = normalize_path(&base_dir);
         let mut path_args: Vec<String> = Vec::new();
-        let mut iter = lower_tokens.iter().zip(tokens.iter()).skip(1).peekable();
+        let mut iter = command_tokens
+            .iter()
+            .zip(raw_command_tokens.iter())
+            .skip(1)
+            .peekable();
         let mut end_of_options = false;
 
         while let Some(token) = iter.next() {
@@ -978,6 +1043,7 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
     let denied_programs = [
         "fish",
         "jshell",
+        "rm",
         "dd",
         "chmod",
         "chown",
@@ -1025,7 +1091,7 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
 
     // 拦下 `bash -c "..."` / `sh -c` / `zsh -c` 这种"二次解释"形式。
     // 直接执行脚本（`bash script.sh`）仍然允许，避免把脚本参数里的 `-c` 误判为 shell 选项。
-    if shell_c_option_present(program, &lower_tokens) {
+    if shell_c_option_present(program, command_tokens) {
         return Err(format!(
             "shell `{program} -c ...` re-interprets a string as shell code; \
              run the literal command directly instead"
@@ -1035,7 +1101,7 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
     // `find` 的 `-delete` / `-exec*` / `-ok*` 只有在作为真正 primary 时才有危险语义。
     // 若它们只是 `-name '-delete'` 之类 pattern 参数，不应误拦。
     if program == "find" {
-        if let Some(flag) = find_has_blocked_exec_semantics(&lower_tokens) {
+        if let Some(flag) = find_has_blocked_exec_semantics(command_tokens) {
             return Err(format!(
                 "find primary '{flag}' mutates files or executes commands and is blocked"
             ));
@@ -1070,8 +1136,8 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         "launchctl",
         "systemctl",
     ];
-    if let Some(idx) = indirect_command_index(program, &lower_tokens, &tokens) {
-        let nested = lower_tokens[idx].as_str();
+    if let Some(idx) = indirect_command_index(program, command_tokens, raw_command_tokens) {
+        let nested = command_tokens[idx].as_str();
         if DANGEROUS_PROGRAM_NAMES.contains(&nested) || extra_blocked.iter().any(|p| p == nested) {
             return Err(format!(
                 "indirect execution of '{nested}' via '{program}' is blocked"
@@ -1293,12 +1359,24 @@ mod tests {
     #[test]
     fn blocks_chained_rm_after_safe_prefix() {
         // 修复前：仅验 `echo`，整体放行。
-        // 修复后：第二段会被 `rm` 路径校验或黑名单拦下。
+        // 修复后：第二段会命中 `rm` 默认拦截。
         let err = validate("echo ok && rm -rf /").unwrap_err();
         assert!(
-            err.contains("rm") || err.contains("outside the current directory"),
-            "expected rm/path block, got: {err}"
+            err.contains("rm"),
+            "expected rm blocked, got: {err}"
         );
+    }
+
+    #[test]
+    fn blocks_rm_even_within_current_directory() {
+        let err = validate("rm -rf ./target").unwrap_err();
+        assert!(err.contains("rm"), "expected rm blocked, got: {err}");
+    }
+
+    #[test]
+    fn blocks_shell_rm_with_home_and_glob_expansion() {
+        let err = validate("rm -rf ~/.zcompdump*").unwrap_err();
+        assert!(err.contains("rm"), "expected rm blocked, got: {err}");
     }
 
     #[test]
@@ -1372,6 +1450,11 @@ mod tests {
     }
 
     #[test]
+    fn shell_literal_rm_text_remains_allowed() {
+        assert!(validate("echo 'rm -rf ~/.zcompdump*'").is_ok());
+    }
+
+    #[test]
     fn blocks_exec_flags_that_run_subsequent_args_as_commands() {
         // find -exec/-execdir/-ok/-okdir 会将后续参数当命令执行，必须拦截
         assert!(validate("find . -exec rm {} +").is_err());
@@ -1397,14 +1480,23 @@ mod tests {
     fn blocks_common_indirect_wrappers_but_allows_safe_payload_args() {
         assert!(validate("xargs rm").is_err());
         assert!(validate("env FOO=1 sudo whoami").is_err());
+        assert!(validate("env FOO=1 rm -rf target").is_err());
         assert!(validate("nohup ssh user@host").is_err());
         assert!(validate("nice -n 5 chmod 777 file").is_err());
         assert!(validate("timeout --signal=KILL 10 dd if=/dev/zero of=foo").is_err());
+        assert!(validate("command rm -rf *").is_err());
+        assert!(validate("exec rm -rf *").is_err());
 
         assert!(validate(r#"xargs printf "%s\n" rm"#).is_ok());
         assert!(validate(r#"env FOO=1 cargo test"#).is_ok());
         assert!(validate(r#"nice -n 5 cargo check"#).is_ok());
         assert!(validate(r#"timeout 10 cargo test"#).is_ok());
+    }
+
+    #[test]
+    fn leading_env_assignment_only_has_shell_meaning_when_shell_is_used() {
+        assert!(validate("FOO=1 rm -rf target").is_ok());
+        assert!(validate("FOO=1 rm -rf *.tmp").is_err());
     }
 
     #[test]

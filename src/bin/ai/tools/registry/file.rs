@@ -89,7 +89,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "write_file",
-        description: "Create a new file or intentionally replace an entire file at an absolute path. For modifying an existing document or source file, prefer locating the target first, then use a precise read plus apply_patch with the smallest localized diff instead of rewriting the whole file.",
+        description: "Create a new file or intentionally replace an entire file at an absolute path. For modifying an existing document or source file, prefer locating the target first, then use a precise read plus the smallest localized edit path available instead of rewriting the whole file.",
         parameters: params_write_file,
         execute: execute_write_file,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

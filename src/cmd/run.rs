@@ -128,6 +128,13 @@ fn should_use_shell(command: &str) -> bool {
     false
 }
 
+/// 返回命令是否会走 shell 执行路径。
+///
+/// 供上层安全校验复用，确保验证语义与实际执行语义保持一致。
+pub fn command_requires_shell(command: &str) -> bool {
+    should_use_shell(command)
+}
+
 /// 构建使用 Shell 的命令对象
 ///
 /// 根据操作系统选择合适的 Shell：

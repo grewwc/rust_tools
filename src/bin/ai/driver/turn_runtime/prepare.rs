@@ -28,6 +28,36 @@ const RECENT_MEMORY_CACHE_TTL: Duration = Duration::from_secs(60);
 static RECENT_MEMORY_CACHE: LazyLock<Mutex<Option<RecentMemoryCacheEntry>>> =
     LazyLock::new(|| Mutex::new(None));
 
+fn current_request_tool_names(app: &App) -> rust_tools::commonw::FastSet<String> {
+    app.agent_context
+        .as_ref()
+        .map(|ctx| {
+            ctx.tools
+                .iter()
+                .map(|tool| tool.function.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn filter_suggested_tool_calls_for_tool_names(
+    available_tool_names: &rust_tools::commonw::FastSet<String>,
+    suggested_tool_calls: Vec<crate::ai::driver::observer::SuggestedToolCall>,
+) -> Vec<crate::ai::driver::observer::SuggestedToolCall> {
+    suggested_tool_calls
+        .into_iter()
+        .filter(|call| available_tool_names.contains(&call.tool_name))
+        .collect()
+}
+
+fn filter_suggested_tool_calls_for_current_schema(
+    app: &App,
+    suggested_tool_calls: Vec<crate::ai::driver::observer::SuggestedToolCall>,
+) -> Vec<crate::ai::driver::observer::SuggestedToolCall> {
+    let available_tool_names = current_request_tool_names(app);
+    filter_suggested_tool_calls_for_tool_names(&available_tool_names, suggested_tool_calls)
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct QuestionShape {
     char_count: usize,
@@ -342,10 +372,13 @@ pub(super) async fn prepare_turn(
             }
         }
     }
-    let suggested_tool_calls_aggregated: Vec<_> = observer_outputs
+    let suggested_tool_calls_aggregated = filter_suggested_tool_calls_for_current_schema(
+        app,
+        observer_outputs
         .iter()
         .flat_map(|o| o.suggested_tool_calls.clone())
-        .collect();
+        .collect(),
+    );
     if !suggested_tool_calls_aggregated.is_empty() {
         let mut block = String::from(
             "Thinking engine proposes the following verification-driven tool calls BEFORE answering. \
@@ -783,11 +816,13 @@ mod tests {
     use super::{
         collect_session_code_discovery_records, detect_complex_task,
         extract_existing_code_discoveries, high_confidence_project_memory_policy,
+        filter_suggested_tool_calls_for_tool_names,
         looks_like_code_or_repo_question, recalled_knowledge_usage_policy,
         render_session_code_discovery_recall, should_inject_integrated_reflection,
         should_run_general_recall, should_run_session_code_discovery_recall,
     };
     use crate::ai::code_discovery_policy::parse_record_line;
+    use crate::ai::driver::observer::SuggestedToolCall;
     use crate::ai::driver::intent_recognition::{CoreIntent, UserIntent};
     use crate::ai::history::Message;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
@@ -916,6 +951,29 @@ mod tests {
                 .iter()
                 .any(|record| { record.finding.contains("root cause: missing config") })
         );
+    }
+
+    #[test]
+    fn filter_suggested_tool_calls_drops_unavailable_tools() {
+        let available_tool_names = ["read_file".to_string()].into_iter().collect();
+        let filtered = filter_suggested_tool_calls_for_tool_names(
+            &available_tool_names,
+            vec![
+                SuggestedToolCall {
+                    tool_name: "read_file".to_string(),
+                    arguments: Value::Null,
+                    rationale: "visible".to_string(),
+                },
+                SuggestedToolCall {
+                    tool_name: "code_search".to_string(),
+                    arguments: Value::Null,
+                    rationale: "hidden".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].tool_name, "read_file");
     }
 
     #[test]

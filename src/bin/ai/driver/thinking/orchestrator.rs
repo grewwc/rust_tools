@@ -585,7 +585,7 @@ impl TurnObserver for ThinkingOrchestrator {
                 if matches!(step, VerificationStep::ExecuteTest) {
                     self.pending_suggested_tool_calls.push(
                         crate::ai::driver::observer::SuggestedToolCall {
-                            tool_name: "RunCommand".to_string(),
+                            tool_name: "execute_command".to_string(),
                             arguments: serde_json::json!({
                                 "note": "Execute the test command designed in the previous DesignTest step",
                                 "hypothesis": hypothesis,

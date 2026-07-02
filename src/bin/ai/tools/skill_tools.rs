@@ -225,7 +225,7 @@ pub(crate) fn execute_discover_skills(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "discover_skills",
-        description: "Search available skills by relevance, returning metadata only (names, descriptions, priorities, optional capabilities) without loading full skill prompts. The query is matched semantically across languages, so prefer a natural-language `query` describing the task (e.g. the workflow, tool, product, or domain) over guessing exact names. Call this early whenever a task might map to a specialized or installed workflow; then use `activate_skill` if a returned skill clearly fits.",
+        description: "Search available skills by relevance, returning metadata only (names, descriptions, priorities, optional capabilities) without loading full skill prompts. The query is matched semantically across languages, so prefer a natural-language `query` describing the task (e.g. the workflow, tool, product, or domain) over guessing exact names. Call this early whenever a task might map to a specialized or installed workflow; then use the returned metadata to decide whether a matching skill should be activated or whether the current tool set is enough.",
         parameters: params_discover_skills,
         execute: execute_discover_skills,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -239,7 +239,7 @@ fn params_activate_skill() -> Value {
         "properties": {
             "name": {
                 "type": "string",
-                "description": "Exact name of the skill to activate (as returned by discover_skills)."
+                "description": "Exact name of the skill to activate."
             }
         },
         "required": ["name"]
@@ -263,7 +263,7 @@ pub(crate) fn execute_activate_skill(args: &Value) -> Result<String, String> {
             .collect::<Vec<_>>()
             .join(", ");
         return Err(format!(
-            "No skill named '{name}'. Use discover_skills first. Available skills: {available}"
+            "No skill named '{name}'. Available skills: {available}"
         ));
     };
 
@@ -279,7 +279,7 @@ inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "activate_skill",
         description: "Activate a specific skill by name so its full prompt and tool set load into the current turn. \
-                      Only use this after discover_skills when one listed skill clearly matches the user's task. \
+                      Only use this when one specific skill clearly matches the user's task. \
                       Do not activate a skill speculatively or for tasks that need no skill.",
         parameters: params_activate_skill,
         execute: execute_activate_skill,
@@ -294,7 +294,7 @@ fn params_load_skill() -> Value {
         "properties": {
             "name": {
                 "type": "string",
-                "description": "Exact name of the skill to read (as returned by discover_skills)."
+                "description": "Exact name of the skill to read."
             }
         },
         "required": ["name"]
@@ -352,7 +352,7 @@ pub(crate) fn execute_load_skill(args: &Value) -> Result<String, String> {
             .collect::<Vec<_>>()
             .join(", ");
         return Err(format!(
-            "No skill named '{name}'. Use discover_skills first. Available skills: {available}"
+            "No skill named '{name}'. Available skills: {available}"
         ));
     };
 
@@ -364,7 +364,7 @@ inventory::submit!(ToolRegistration {
         name: "load_skill",
         description: "Read a skill's full contents (its prompt body, system prompt, and bundled resource directory if any) by name, without changing the current turn. \
                       Use this when you need to inspect, learn from, or modify an existing skill (e.g. authoring or debugging skills) — it only returns text, it does NOT activate the skill or alter your tool set. \
-                      To actually run/apply a skill for the user's task, use activate_skill instead.",
+                      Reading a skill does not change the current turn or tool set.",
         parameters: params_load_skill,
         execute: execute_load_skill,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

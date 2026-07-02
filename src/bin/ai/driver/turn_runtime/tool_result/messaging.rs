@@ -228,9 +228,10 @@ pub(super) fn record_tool_inspection_artifacts(
     app: &App,
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
+    allowed_tool_names: &rust_tools::commonw::FastSet<String>,
 ) {
     let findings = collect_repo_inspection_findings(turn_messages);
-    append_code_inspection_working_memory(messages, turn_messages, &findings);
+    append_code_inspection_working_memory(messages, turn_messages, &findings, allowed_tool_names);
     record_persistent_code_discoveries(app, messages, turn_messages, &findings);
 }
 
@@ -238,8 +239,11 @@ fn append_code_inspection_working_memory(
     messages: &mut Vec<Message>,
     turn_messages: &[Message],
     findings: &[RepoInspectionFinding],
+    allowed_tool_names: &rust_tools::commonw::FastSet<String>,
 ) {
-    let Some(note) = build_code_inspection_working_memory(turn_messages, findings) else {
+    let Some(note) =
+        build_code_inspection_working_memory(turn_messages, findings, allowed_tool_names)
+    else {
         return;
     };
 
@@ -406,6 +410,7 @@ pub(super) fn record_final_stream_response(
 fn build_code_inspection_working_memory(
     turn_messages: &[Message],
     findings: &[RepoInspectionFinding],
+    allowed_tool_names: &rust_tools::commonw::FastSet<String>,
 ) -> Option<String> {
     let exact_calls = collect_completed_repo_inspection_calls(turn_messages);
 
@@ -458,11 +463,12 @@ fn build_code_inspection_working_memory(
     note.push_str(
         "Treat these findings as already-known context. Avoid re-running the same reads unless you need verification.\n",
     );
-    if raw_repo_tool_count >= 1 && code_search_count == 0 {
+    let can_use_code_search = allowed_tool_names.contains("code_search");
+    if can_use_code_search && raw_repo_tool_count >= 1 && code_search_count == 0 {
         note.push_str(
             "Code-navigation correction: you have started raw inspection without `code_search`. Before another raw read, use `code_search` first to locate the relevant file/symbol/definition, then read only the specific region you need.\n",
         );
-    } else if raw_repo_tool_count >= 2 && code_search_count <= 1 {
+    } else if can_use_code_search && raw_repo_tool_count >= 2 && code_search_count <= 1 {
         note.push_str(
             "Code-navigation correction: too many raw reads/searches. Prefer one `code_search` hop plus one targeted local read instead of another `read_file_lines` or `find_path`.\n",
         );
@@ -784,6 +790,10 @@ mod tests {
         }
     }
 
+    fn available_tool_names(names: &[&str]) -> rust_tools::commonw::FastSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
     #[test]
     fn repo_inspection_tools_include_code_search() {
         assert!(is_repo_inspection_tool("code_search"));
@@ -873,8 +883,12 @@ mod tests {
         ];
 
         let findings = collect_repo_inspection_findings(&turn_messages);
-        let note =
-            build_code_inspection_working_memory(&turn_messages, &findings).expect("note");
+        let note = build_code_inspection_working_memory(
+            &turn_messages,
+            &findings,
+            &available_tool_names(&["code_search", "read_file", "read_file_lines", "find_path"]),
+        )
+        .expect("note");
         assert!(note.contains("Current code-inspection working memory"));
         assert!(note.contains("Completed exact tool calls in this turn"));
         assert!(note.contains("read_file_lines("));
@@ -918,11 +932,63 @@ mod tests {
         ];
 
         let findings = collect_repo_inspection_findings(&turn_messages);
-        let note =
-            build_code_inspection_working_memory(&turn_messages, &findings).expect("note");
+        let note = build_code_inspection_working_memory(
+            &turn_messages,
+            &findings,
+            &available_tool_names(&["code_search", "read_file", "find_path"]),
+        )
+        .expect("note");
         assert!(note.contains("code_search(operation=text_search, query=load_config)"));
         assert!(note.contains("fn load_config()"));
         assert!(!note.contains("Code-navigation correction"));
+    }
+
+    #[test]
+    fn working_memory_note_hides_code_search_when_unavailable() {
+        let turn_messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                tool_calls: Some(vec![
+                    tool_call(
+                        "1",
+                        "read_file_lines",
+                        serde_json::json!({"file_path":"src/lib.rs","offset":10,"limit":20}),
+                    ),
+                    tool_call(
+                        "2",
+                        "find_path",
+                        serde_json::json!({"pattern":"panic!","path":"src"}),
+                    ),
+                ]),
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Value::String("    10\tfn load_config() {".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("1".to_string()),
+                reasoning_content: None,
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Value::String("src/main.rs:42: panic!(\"boom\")".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("2".to_string()),
+                reasoning_content: None,
+            },
+        ];
+
+        let findings = collect_repo_inspection_findings(&turn_messages);
+        let note = build_code_inspection_working_memory(
+            &turn_messages,
+            &findings,
+            &available_tool_names(&["read_file", "read_file_lines", "find_path"]),
+        )
+        .expect("note");
+        assert!(!note.contains("Code-navigation correction"));
+        assert!(!note.contains("`code_search`"));
     }
 
     #[test]

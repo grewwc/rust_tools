@@ -84,7 +84,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "find_path",
-        description: "Fast file-path finder under a root directory using filename, path-suffix, or glob match. This locates FILES by their path, not text inside files — for full-text content search use code_search(operation=text_search). Returns paths relative to the current working directory (may include ANSI highlighting).",
+        description: "Fast file-path finder under a root directory using filename, path-suffix, or glob match. This locates FILES by their path, not text inside files. For full-text matches, use an available content-search tool. Returns paths relative to the current working directory (may include ANSI highlighting).",
         parameters: params_find_path,
         execute: execute_find_path,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,

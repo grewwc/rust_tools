@@ -921,7 +921,124 @@ fn confirm_tool_execution(tool_call: &ToolCall, args: &Value) -> Result<(), RunO
     })
 }
 
-fn remediation_hint(tool_name: &str, err: &str) -> Option<String> {
+#[derive(Clone, Copy)]
+struct ToolAlternative {
+    name: &'static str,
+    description: &'static str,
+}
+
+fn tool_visible_in_current_turn(
+    available_tool_names: Option<&FastSet<String>>,
+    tool_name: &str,
+) -> bool {
+    available_tool_names.is_some_and(|names| names.contains(tool_name))
+}
+
+fn format_tool_alternatives(alternatives: &[ToolAlternative]) -> String {
+    alternatives
+        .iter()
+        .map(|tool| format!("`{}` ({})", tool.name, tool.description))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn equivalent_tools(
+    tool_name: &str,
+    available_tool_names: Option<&FastSet<String>>,
+) -> Option<String> {
+    let candidates: &[ToolAlternative] = match tool_name {
+        "read_file" => &[
+            ToolAlternative {
+                name: "read_file_lines",
+                description: "line-range read",
+            },
+            ToolAlternative {
+                name: "code_search",
+                description: "locate the relevant region first",
+            },
+        ],
+        "read_file_lines" => &[
+            ToolAlternative {
+                name: "read_file",
+                description: "full-file read",
+            },
+            ToolAlternative {
+                name: "code_search",
+                description: "locate the relevant region first",
+            },
+        ],
+        "code_search" => &[
+            ToolAlternative {
+                name: "text_grep",
+                description: "regex over file contents",
+            },
+            ToolAlternative {
+                name: "search_files",
+                description: "filename or glob match",
+            },
+            ToolAlternative {
+                name: "find_path",
+                description: "path-suffix or glob match",
+            },
+        ],
+        "text_grep" => &[
+            ToolAlternative {
+                name: "code_search",
+                description: "semantic or structural search",
+            },
+            ToolAlternative {
+                name: "search_files",
+                description: "filename or glob match",
+            },
+            ToolAlternative {
+                name: "find_path",
+                description: "path-only discovery",
+            },
+        ],
+        "find_path" => &[
+            ToolAlternative {
+                name: "search_files",
+                description: "filename or glob match",
+            },
+            ToolAlternative {
+                name: "text_grep",
+                description: "content search",
+            },
+            ToolAlternative {
+                name: "code_search",
+                description: "semantic or structural search",
+            },
+        ],
+        "search_files" => &[
+            ToolAlternative {
+                name: "find_path",
+                description: "path-suffix or glob match",
+            },
+            ToolAlternative {
+                name: "text_grep",
+                description: "content search",
+            },
+            ToolAlternative {
+                name: "code_search",
+                description: "semantic or structural search",
+            },
+        ],
+        _ => &[],
+    };
+
+    let visible = candidates
+        .iter()
+        .copied()
+        .filter(|tool| tool_visible_in_current_turn(available_tool_names, tool.name))
+        .collect::<Vec<_>>();
+    (!visible.is_empty()).then(|| format_tool_alternatives(&visible))
+}
+
+fn remediation_hint(
+    tool_name: &str,
+    err: &str,
+    available_tool_names: Option<&FastSet<String>>,
+) -> Option<String> {
     let err_lower = err.to_lowercase();
 
     if tool_name == "apply_patch"
@@ -933,16 +1050,35 @@ fn remediation_hint(tool_name: &str, err: &str) -> Option<String> {
             || err_lower.contains("missing patch")
             || err_lower.contains("patch target mismatch"))
     {
-        return Some(
-            "Suggestion: `apply_patch` accepts either raw unified-diff hunks starting with `@@`, or a single-file `*** Begin Patch` envelope. Use `file_path` (or the compatibility alias `path`) for the target file, and build hunk context from raw file text only — do not copy `read_file` line numbers, truncation notices, or the Symbol outline block into the patch. If you are replacing the whole file, use `write_file` instead."
-                .to_string(),
-        );
+        let read_file_hint = if tool_visible_in_current_turn(available_tool_names, "read_file")
+            || tool_visible_in_current_turn(available_tool_names, "read_file_lines")
+        {
+            "build hunk context from raw file text only — do not copy line numbers, truncation notices, or the Symbol outline block into the patch"
+        } else {
+            "build hunk context from the exact current file text only"
+        };
+        let write_file_hint = if tool_visible_in_current_turn(available_tool_names, "write_file") {
+            " If you are replacing the whole file, use `write_file` instead."
+        } else {
+            ""
+        };
+        return Some(format!(
+            "Suggestion: `apply_patch` accepts either raw unified-diff hunks starting with `@@`, or a single-file `*** Begin Patch` envelope. Use `file_path` (or the compatibility alias `path`) for the target file, and {}.{}",
+            read_file_hint, write_file_hint
+        ));
     }
 
     if tool_name == "mcp_feishu_docs_get_text_by_url" && err_lower.contains("unsupported url") {
-        return Some(
-            "Suggestion: this tool only works for supported Feishu/Lark docs URLs. Do not retry with the same URL. Use mcp_feishu_docs_search to find the document first, or ask the user for a direct Feishu docs/wiki/sheet URL.".to_string(),
-        );
+        let discovery_hint =
+            if tool_visible_in_current_turn(available_tool_names, "mcp_feishu_docs_search") {
+                " Use `mcp_feishu_docs_search` to find the document first,"
+            } else {
+                ""
+            };
+        return Some(format!(
+            "Suggestion: this tool only works for supported Feishu/Lark docs URLs. Do not retry with the same URL.{} or ask the user for a direct Feishu docs/wiki/sheet URL.",
+            discovery_hint
+        ));
     }
 
     if err_lower.contains("failed to parse arguments") || err_lower.contains("invalid type") {
@@ -954,7 +1090,7 @@ fn remediation_hint(tool_name: &str, err: &str) -> Option<String> {
 
     if err_lower.contains("no such file") || err_lower.contains("not found") {
         // 文件类工具在 "not found" 时优先建议先用搜索类工具确认目标
-        if let Some(fallback) = equivalent_tools(tool_name) {
+        if let Some(fallback) = equivalent_tools(tool_name, available_tool_names) {
             return Some(format!(
                 "Suggestion: verify the path or identifier first. Equivalent tools you can try \
                  instead of retrying with the same args: {}.",
@@ -973,7 +1109,26 @@ fn remediation_hint(tool_name: &str, err: &str) -> Option<String> {
     }
 
     // 通用 fallback：如果工具名在等价表里，提示可改用的备选工具
-    if let Some(fallback) = equivalent_tools(tool_name) {
+    if tool_name == "execute_command" {
+        let mut fallback = Vec::new();
+        if tool_visible_in_current_turn(available_tool_names, "read_file") {
+            fallback.push("read files directly with `read_file`");
+        }
+        if tool_visible_in_current_turn(available_tool_names, "read_file_lines") {
+            fallback.push("inspect precise regions with `read_file_lines`");
+        }
+        if tool_visible_in_current_turn(available_tool_names, "list_directory") {
+            fallback.push("inspect directories with `list_directory`");
+        }
+        if !fallback.is_empty() {
+            return Some(format!(
+                "Suggestion: if this failure is intrinsic (not a transient I/O error), break the command into smaller pieces or {} instead of running shell just to inspect state.",
+                fallback.join(", ")
+            ));
+        }
+    }
+
+    if let Some(fallback) = equivalent_tools(tool_name, available_tool_names) {
         return Some(format!(
             "Suggestion: if this failure is intrinsic (not a transient I/O error), \
              try an equivalent tool instead of repeating: {}.",
@@ -984,29 +1139,16 @@ fn remediation_hint(tool_name: &str, err: &str) -> Option<String> {
     None
 }
 
-/// 当某个工具失败时，提示 LLM 可以尝试的等价工具列表。
-/// 故意只保留"语义等价 + 输入兼容"的对子，避免误导 LLM 切到不同语义的工具。
-fn equivalent_tools(tool_name: &str) -> Option<&'static str> {
-    match tool_name {
-        // 文件读取链路
-        "read_file" => Some("`read_file_lines` (line-range read), `code_search` (locate first)"),
-        "read_file_lines" => Some("`read_file` (full file)"),
-        // 代码/文本搜索链路
-        "code_search" => Some("`text_grep` (regex over files), `find_file` (filename glob)"),
-        "text_grep" => Some("`code_search` (semantic), `find_file` (filename only)"),
-        "find_file" => Some("`code_search` (semantic), `text_grep` (content)"),
-        // shell 执行类
-        "execute_command" => Some(
-            "Break the command into smaller pieces, or read files directly with `read_file` instead of running shell to inspect them.",
-        ),
-        _ => None,
-    }
-}
-
-fn format_tool_error(tool_call: &ToolCall, err: &str) -> ToolResult {
+fn format_tool_error(
+    tool_call: &ToolCall,
+    err: &str,
+    available_tool_names: Option<&FastSet<String>>,
+) -> ToolResult {
     ToolResult {
         tool_call_id: tool_call.id.clone(),
-        content: if let Some(hint) = remediation_hint(&tool_call.function.name, err) {
+        content: if let Some(hint) =
+            remediation_hint(&tool_call.function.name, err, available_tool_names)
+        {
             format!(
                 "Error: {} failed: {}\n{}",
                 tool_call.function.name, err, hint
@@ -1023,6 +1165,7 @@ fn execute_prepared_tool_call(
     shared_mcp_client: &SharedMcpClient,
     tool_call: &ToolCall,
     prepared: &PreparedToolCall,
+    allowed_tool_names: Option<&FastSet<String>>,
     observer: &mut Option<&mut dyn ToolExecutionObserver>,
 ) -> Result<ToolResult, String> {
     match &prepared.route {
@@ -1036,6 +1179,7 @@ fn execute_prepared_tool_call(
                     shared_mcp_client,
                     &tool_call.id,
                     &prepared.args,
+                    allowed_tool_names,
                 )
             } else if tool_call.function.name == "tool_wait" {
                 execute_tool_wait(session_id, &tool_call.id, &prepared.args)
@@ -1136,6 +1280,7 @@ fn execute_tool_spawn(
     shared_mcp_client: &SharedMcpClient,
     tool_call_id: &str,
     args: &Value,
+    allowed_tool_names: Option<&FastSet<String>>,
 ) -> Result<ToolResult, String> {
     let target_tool_name = args
         .get("tool_name")
@@ -1145,6 +1290,15 @@ fn execute_tool_spawn(
         .get("arguments")
         .cloned()
         .ok_or("Missing 'arguments' parameter")?;
+
+    if let Some(allowed_tool_names) = allowed_tool_names
+        && !allowed_tool_names.contains(target_tool_name)
+    {
+        return Err(format!(
+            "tool '{}' is not available in this turn's tool schema.",
+            target_tool_name
+        ));
+    }
 
     let async_task_id = next_async_tool_id();
     let synthetic_tool_call = ToolCall {
@@ -1218,6 +1372,7 @@ fn execute_tool_spawn(
     let result_channel_id_for_thread = result_channel_id;
     let completion_futex_addr_for_thread = completion_futex_addr;
     let started_at_for_thread = started_at;
+    let available_tool_names_for_thread = allowed_tool_names.cloned();
 
     thread::spawn(move || {
         let mut pipe_observer = AsyncToolPipeObserver {
@@ -1282,6 +1437,7 @@ fn execute_tool_spawn(
             &tool_call_for_thread,
             &prepared_for_thread,
             result,
+            available_tool_names_for_thread.as_ref(),
             true,
             false,
         );
@@ -1766,6 +1922,7 @@ fn finalize_execution_result(
     tool_call: &ToolCall,
     prepared: &PreparedToolCall,
     result: Result<ToolResult, String>,
+    available_tool_names: Option<&FastSet<String>>,
     executed: bool,
     cached: bool,
 ) -> RunOneResult {
@@ -1783,7 +1940,7 @@ fn finalize_execution_result(
             }
         }
         Err(err) => RunOneResult {
-            tool_result: format_tool_error(tool_call, &err),
+            tool_result: format_tool_error(tool_call, &err, available_tool_names),
             ok: false,
             executed,
             cached,
@@ -1948,11 +2105,19 @@ fn run_one(
             shared_mcp_client,
             tool_call,
             &prepared,
+            allowed_tool_names,
             observer,
         )
     });
-    let run_result =
-        finalize_execution_result(session_id, tool_call, &prepared, result, true, false);
+    let run_result = finalize_execution_result(
+        session_id,
+        tool_call,
+        &prepared,
+        result,
+        allowed_tool_names,
+        true,
+        false,
+    );
 
     (prepared.route, run_result)
 }
@@ -2397,7 +2562,8 @@ mod tests {
         execute_with_safe_retry, is_cacheable_tool_name, is_parallel_safe_tool_call,
         is_tool_cache_entry_fresh, load_async_tool_snapshot, lookup_wait_sources,
         parallel_safe_batch_len, persist_async_tool_snapshot, send_async_tool_pipe_message,
-        should_retry_once, stream_preview_from_aggregate, tool_cache_validation_matches,
+        remediation_hint, should_retry_once, stream_preview_from_aggregate,
+        tool_cache_validation_matches,
     };
     use crate::ai::mcp::McpClient;
     use crate::ai::tools::registry::common::current_process_tool_cancel_futex;
@@ -2551,6 +2717,48 @@ mod tests {
     }
 
     #[test]
+    fn tool_spawn_cannot_bypass_current_turn_schema() {
+        let (_guard, _kernel, _root) = setup_async_tool_kernel();
+        let path = std::env::temp_dir().join(format!(
+            "turn-schema-spawn-{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "hello").unwrap();
+
+        let mut call = tool_call("tool_spawn");
+        call.function.arguments = json!({
+            "tool_name": "read_file",
+            "arguments": {
+                "file_path": path.to_string_lossy(),
+            }
+        })
+        .to_string();
+        let allowed_tool_names: FastSet<String> = ["tool_spawn".to_string()].into_iter().collect();
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(McpClient::new()));
+        let result = execute_tool_calls(
+            "sess-turn-schema-spawn",
+            &McpClient::new(),
+            &shared_mcp,
+            &[call],
+            Some(&allowed_tool_names),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(result.tool_results.len(), 1);
+        assert!(
+            result.tool_results[0]
+                .content
+                .contains("tool 'read_file' is not available in this turn's tool schema")
+        );
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn execute_tool_calls_preflights_kernel_tool_quota_before_running_tool() {
         let (_guard, kernel, root) = setup_async_tool_kernel();
         {
@@ -2670,6 +2878,15 @@ mod tests {
             "read_file",
             "timeout while reading"
         ));
+    }
+
+    #[test]
+    fn remediation_hint_only_mentions_alternatives_available_in_current_turn() {
+        let available: FastSet<String> = ["read_file_lines".to_string()].into_iter().collect();
+        let hint = remediation_hint("read_file", "not found", Some(&available)).expect("hint");
+        assert!(hint.contains("`read_file_lines`"));
+        assert!(!hint.contains("`code_search`"));
+        assert!(!hint.contains("search_files"));
     }
 
     #[test]
