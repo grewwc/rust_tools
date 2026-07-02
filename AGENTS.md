@@ -50,8 +50,9 @@ cargo test --lib --bin a
 cargo test --bin a test_name
 ```
 
-**Only test what you changed — avoid triggering the full test suite.**
-Run focused tests for the touched module first (`cargo test --bin a test_name` or `cargo test -p <package>`), then broaden only when the change crosses shared behavior. Do not run the full workspace test suite unless necessary.
+**Only verify what you changed — avoid full checks.**
+Run focused checks (lint, typecheck, test) for the touched module first, then broaden only when the change crosses shared behavior.
+Do not run the full workspace `cargo check`, `cargo test`, or other verification unless necessary.
 
 ## Global Engineering Rules
 

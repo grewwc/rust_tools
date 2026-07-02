@@ -182,6 +182,7 @@ where
 
         let path = entry.path();
         let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+
         if (!FILE_NAMES_TO_CHECK.is_empty() && !FILE_NAMES_TO_CHECK.contains(name))
             || FILE_NAMES_NOT_CHECK.contains(name)
         {

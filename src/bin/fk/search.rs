@@ -31,6 +31,9 @@ pub fn configure_terminalw(opts: &crate::cli::Options) -> SkipSet<String> {
         }
     }
 
+    // always skip .git directories
+    terminalw::FILE_NAMES_NOT_CHECK.add(".git");
+
     let mut allowed: SkipSet<String> = SkipSet::new(16);
     if !opts.ext.trim().is_empty() {
         for e in terminalw::format_file_extensions(&opts.ext) {
