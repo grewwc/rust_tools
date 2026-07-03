@@ -10,12 +10,13 @@ use crate::ai::tools::storage::token_usage_store as store;
 fn print_usage_help() {
     println!("Usage commands:");
     println!();
-    println!("  /usage                 show token usage (all-time + 7d + 24h + daily trend)");
+    println!("  /usage                 show overview (all-time + 7d + 24h totals)");
+    println!("  /usage models [Nd]     per-model usage, sorted by calls desc (default 7d)");
     println!("  /usage today           show usage for the last 24 hours (by model)");
-    println!("  /usage 7d              show usage for the last 7 days");
-    println!("  /usage 30d             show usage for the last 30 days");
-    println!("  /usage all             show all-time usage");
-    println!("  /usage daily           show daily breakdown for the last 14 days");
+    println!("  /usage 7d              show usage for the last 7 days (by model)");
+    println!("  /usage 30d             show usage for the last 30 days (by model)");
+    println!("  /usage all             show all-time usage (by model)");
+    println!("  /usage daily [N]       show daily breakdown for the last N days (default 14)");
     println!("  /usage help            show this help");
     println!();
 }
@@ -102,6 +103,55 @@ fn window_label(window: Option<u64>) -> String {
         Some(secs) if secs % 86_400 == 0 => format!("last {}d", secs / 86_400),
         Some(secs) if secs % 3_600 == 0 => format!("last {}h", secs / 3_600),
         Some(secs) => format!("last {}s", secs),
+    }
+}
+
+/// 只打印某时间窗口的总量一行（精简概览用）。
+fn print_totals_only(window: Option<u64>) {
+    let label = window_label(window);
+    match store::query_totals(window) {
+        Some(t) => {
+            println!(
+                "  {:<14} calls={:>6}  in={:>7}  out={:>7}  total={:>7}",
+                format!("[{}]", label),
+                format_number(t.calls),
+                format_number(t.input),
+                format_number(t.output),
+                format_number(t.total)
+            );
+        }
+        None => {
+            println!("  [{}] (no usage store available)", label);
+        }
+    }
+}
+
+/// 按模型展示用量，调用次数（calls）逆序排列。
+fn print_models_breakdown(window: Option<u64>) {
+    let label = window_label(window);
+    match store::query_by_model(window) {
+        Some(mut rows) if !rows.is_empty() && rows.iter().any(|r| r.calls > 0) => {
+            // 按 calls 逆序排列（用户需求：模型按照调用量逆序排列）。
+            rows.sort_by(|a, b| b.calls.cmp(&a.calls));
+            println!("  [{} models]  sorted by calls ↓", label);
+            println!(
+                "      {:<24} {:>6}  {:>7}  {:>7}  {:>7}",
+                "model", "calls", "in", "out", "total"
+            );
+            for r in rows.iter().filter(|r| r.calls > 0) {
+                println!(
+                    "      {:<24} {:>6}  {:>7}  {:>7}  {:>7}",
+                    r.model,
+                    format_number(r.calls),
+                    format_number(r.input),
+                    format_number(r.output),
+                    format_number(r.total)
+                );
+            }
+        }
+        _ => {
+            println!("  [{} models] 无数据", label);
+        }
     }
 }
 
@@ -203,13 +253,29 @@ pub fn try_handle_usage_command(input: &str) -> Result<bool, Box<dyn std::error:
     }
 
     if arg.is_empty() {
-        // 默认：全部历史 + 最近 7d + 最近 24h 概览，并按模型拆分 + 近 14 天趋势。
+        // 默认：精简概览——全部历史 + 最近 7d + 最近 24h 总量 + 近 7 天每日趋势。
+        // 按模型拆分请用 /usage models [Nd]。
         println!();
-        print_window(None);
-        print_window(Some(7 * 86_400));
-        print_window(Some(86_400));
+        print_totals_only(None);
+        print_totals_only(Some(7 * 86_400));
+        print_totals_only(Some(86_400));
         println!();
-        print_daily_breakdown(3);
+        print_daily_breakdown(7);
+    } else if let Some(sub) = arg.strip_prefix("models") {
+        // /usage models [Nd|today|7d|30d|all] —— 按模型拆分，calls 逆序，默认 7d。
+        let sub = sub.trim();
+        let window = if sub.is_empty() {
+            Some(Some(7 * 86_400))
+        } else {
+            parse_window(sub)
+        };
+        match window {
+            Some(w) => print_models_breakdown(w),
+            None => {
+                println!("  无法识别的时间窗口: '{}'", sub);
+                print_usage_help();
+            }
+        }
     } else if matches!(arg, "daily" | "days" | "trend") || arg.ends_with("d") && arg.len() <= 4 {
         let days = parse_daily_arg(arg).unwrap_or(14);
         print_daily_breakdown(days);

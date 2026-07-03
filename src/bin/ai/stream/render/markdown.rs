@@ -528,24 +528,26 @@ impl MarkdownStreamRenderer {
                 header,
                 align,
                 mut rows,
-                mut preview_height,
+                preview_height,
             } => {
                 if is_table_row(line) {
                     rows.push(parse_table_row(line));
-                    let raw = line.trim_end().to_string();
-                    let mut out = String::new();
-                    if !preview_emitted {
-                        out.push_str(&raw);
-                        out.push('\n');
-                    }
-                    preview_height +=
-                        self.streamed_or_measured_preview_height(&raw, preview_emitted);
+                    let move_up = preview_height
+                        + if preview_emitted {
+                            self.line_preview_height.max(1)
+                        } else {
+                            0
+                        };
+                    let rendered_height =
+                        self.rendered_table_height(&indent, &header, &align, &rows);
+                    let out =
+                        self.rewrite_table_preview(&indent, move_up, &header, &align, &rows);
                     self.table_state = TableState::InTable {
                         indent,
                         header,
                         align,
                         rows,
-                        preview_height,
+                        preview_height: rendered_height,
                     };
                     return out;
                 }
@@ -1665,12 +1667,16 @@ mod tests {
         );
 
         renderer.set_line_preview_height(9);
-        assert_eq!(renderer.consume_line("| foo | bar |", true), "");
+        let row_rewrite = renderer.consume_line("| foo | bar |", true);
+        assert!(
+            row_rewrite.contains("\x1b[13A\r\x1b[0J"),
+            "expected streamed table row to rewrite existing table plus live row preview; got {row_rewrite:?}"
+        );
 
         let flushed = renderer.flush_pending_for_test().unwrap();
         assert!(
-            flushed.contains("\x1b[13A\r\x1b[0J"),
-            "expected final flush to clear rendered header table + streamed row preview height; got {flushed:?}"
+            flushed.contains("\x1b[5A\r\x1b[0J"),
+            "expected final flush to clear the latest rendered table height; got {flushed:?}"
         );
     }
 
@@ -1724,6 +1730,72 @@ mod tests {
         assert!(
             !joined.contains("| 函数签名 |"),
             "raw single-column markdown table leaked:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn streamed_single_column_long_json_row_rewrites_without_raw_preview_residue() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "72") };
+
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let mut stream = String::new();
+        let md = "\
+| 事件载荷 |
+| --- |
+| {\"event\":\"order.completed\",\"payload\":{\"orderId\":\"ORD-20260703-000001\",\"status\":\"paid\",\"items\":[{\"sku\":\"long-sku-code-001\",\"quantity\":2}],\"traceId\":\"trace-abcdefghijklmnopqrstuvwxyz\"}} |
+";
+
+        for ch in md.chars() {
+            let mut buf = [0u8; 4];
+            stream.push_str(
+                &renderer
+                    .write_chunk_for_test(ch.encode_utf8(&mut buf), false)
+                    .unwrap(),
+            );
+        }
+
+        let mut grid = VtGrid::new(72);
+        grid.feed(&stream);
+        let screen = grid.screen();
+        let joined = screen.join("\n");
+
+        assert!(joined.contains('┌'), "{joined}");
+        assert!(joined.contains("事件载荷"), "{joined}");
+        for line in &screen {
+            assert!(
+                !line.contains('|'),
+                "raw markdown table preview leaked after row rewrite: {line:?}\n{}",
+                screen.join("\n")
+            );
+            if line.contains("event") || line.contains("payload") || line.contains("trace") {
+                assert!(
+                    line.starts_with('│'),
+                    "JSON table content must stay inside the rendered table: {line:?}\n{}",
+                    screen.join("\n")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn confirmed_table_row_still_streams_realtime_before_newline() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "72") };
+
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let mut stream = String::new();
+        for chunk in ["| 事件载荷 |\n", "| --- |\n", "| {\"event\":\"order"] {
+            stream.push_str(&renderer.write_chunk_for_test(chunk, false).unwrap());
+        }
+
+        assert!(
+            stream.contains("{\"event\":\"order"),
+            "confirmed table rows must keep realtime raw preview before newline; got {stream:?}"
+        );
+        assert!(
+            !stream.ends_with('┘'),
+            "partial row should not wait for final table rendering before newline"
         );
     }
 

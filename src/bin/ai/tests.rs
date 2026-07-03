@@ -2098,7 +2098,10 @@ fn table_preview_lines_are_not_double_printed_after_live_emit() {
     assert!(!sep_out.contains("| --- | --- |"));
 
     let row_out = renderer.consume_line("| foo | bar |", true);
-    assert_eq!(row_out, "");
+    assert!(row_out.contains("\x1b["));
+    assert!(!row_out.contains("| foo | bar |"));
+    assert!(row_out.contains("foo"));
+    assert!(row_out.contains("bar"));
 
     let end_out = renderer.consume_line("done", false);
     assert!(end_out.contains("\x1b["));

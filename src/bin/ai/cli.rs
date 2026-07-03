@@ -481,8 +481,9 @@ pub(super) fn print_help() {
     println!("    /share [output.md]        export current session as shareable markdown");
     println!();
     println!("  Knowledge:");
-    println!("    /usage                   show token usage statistics");
-    println!("    /usage daily             show daily token usage breakdown");
+    println!("    /usage                   show token usage overview (all-time/7d/24h totals)");
+    println!("    /usage models [Nd]       show per-model usage sorted by calls desc");
+    println!("    /usage daily [N]         show daily token usage breakdown");
     println!("    /usage help              show usage command help");
     println!();
     println!("  Persona management:");

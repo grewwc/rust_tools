@@ -323,7 +323,7 @@ impl CommandCompleter {
     /// `/usage` 的子命令。
     fn usage_subcommands() -> &'static [&'static str] {
         &[
-            "today", "7d", "30d", "all", "daily", "trend", "days", "help",
+            "today", "7d", "30d", "all", "models", "daily", "trend", "days", "help",
         ]
     }
 
