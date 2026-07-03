@@ -796,9 +796,37 @@ fn value_len_chars(v: &Value) -> usize {
 }
 
 pub(in crate::ai) fn value_to_string(v: &Value) -> String {
-    v.as_str()
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| v.to_string())
+    if let Some(s) = v.as_str() {
+        return s.to_string();
+    }
+    // 多模态消息（JSON 数组）：只提取文本部分，丢弃图片 base64 数据，
+    // 避免生成摘要/标题时把巨大的 base64 内容喂给模型或显示给用户。
+    if let Some(arr) = v.as_array() {
+        let mut text_parts = Vec::new();
+        let mut has_image = false;
+        for item in arr {
+            if let Some(obj) = item.as_object() {
+                let item_type = obj.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match item_type {
+                    "text" => {
+                        if let Some(t) = obj.get("text").and_then(|t| t.as_str()) {
+                            let trimmed = t.trim();
+                            if !trimmed.is_empty() {
+                                text_parts.push(trimmed.to_string());
+                            }
+                        }
+                    }
+                    "image_url" => has_image = true,
+                    _ => {}
+                }
+            }
+        }
+        if text_parts.is_empty() && has_image {
+            return "[图片]".to_string();
+        }
+        return text_parts.join(" ");
+    }
+    v.to_string()
 }
 
 fn normalize_whitespace(s: &str) -> String {

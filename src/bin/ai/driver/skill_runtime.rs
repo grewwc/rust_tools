@@ -957,12 +957,18 @@ fn build_system_prompt(
         let mut lines = Vec::new();
         if has_tool(available_tools, "task_spawn") {
             lines.push("Use `task_spawn` to launch a subagent task and fan out parallel independent subtasks.".to_string());
+            lines.push("If N subtasks have no data dependency, spawn ALL of them in the same response (multiple task_spawn calls in one turn), then a single task_wait. Do NOT spawn-wait-spawn-wait serially.".to_string());
         }
         if has_tool(available_tools, "task_wait") {
             lines.push("Use `task_wait` to collect results. Timeout is per-call — re-call or use `wait_policy=\"any\"` for early wake-up.".to_string());
         }
         if has_tool(available_tools, "task_status") {
             lines.push("Use `task_status` for a non-blocking peek. There is no `task_cancel`; let orphaned tasks finish.".to_string());
+            lines.push("Before finishing your answer, call `task_status` to confirm no spawned subagent is still running. For every task_id you spawned, you MUST have collected its result (via task_wait or seen completed in task_status) and handled its output — including errors. Never silently drop a spawned task.".to_string());
+        }
+        if has_tool(available_tools, "task_spawn") {
+            lines.push("By default a subagent reuses your (parent) model; only override the `model` field when the subtask is clearly lighter or heavier than your own.".to_string());
+            lines.push("Give each subagent a focused context: for narrow leaf tasks prefer `inherit=\"none\"` or `inherit=\"cwd\"`; only use `inherit=\"all\"` when the subtask genuinely needs the full conversation.".to_string());
         }
         if has_tool(available_tools, "tool_spawn")
             || has_tool(available_tools, "tool_wait")

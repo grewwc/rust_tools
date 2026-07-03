@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use super::{
     files,
     history::{
-        Message, ROLE_SYSTEM, is_internal_note_role, is_system_like_role, messages_to_markdown,
+        Message, ROLE_SYSTEM, SessionStore, generate_session_summary, is_internal_note_role, is_system_like_role, messages_to_markdown,
     },
     models,
     provider::ReasoningEffort,
@@ -2233,6 +2233,23 @@ pub(super) fn print_info(app: &App, model: &str) {
         "{ACCENT_MUTED}[{ACCENT_SUCCESS}{}{ACCENT_MUTED} (search: {ACCENT_WARN}{search}{ACCENT_MUTED}, effort: {ACCENT_PRIMARY}{effort_label}{ACCENT_MUTED})]{RESET}",
         models::model_display_label(model),
     );
+
+    // 打印当前 session 摘要
+    let store = SessionStore::new(&app.config.history_file);
+    let summary = store
+        .read_session_title(&app.session_id)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            store
+                .first_user_prompt(&app.session_id)
+                .ok()
+                .flatten()
+                .map(|p| generate_session_summary(&p))
+        });
+    if let Some(s) = summary.filter(|s| !s.is_empty()) {
+        println!("{ACCENT_MUTED}[session: {ACCENT_SUCCESS}{}{ACCENT_MUTED}]{RESET}", s);
+    }
 }
 
 fn build_request_body<'a>(
@@ -2866,7 +2883,9 @@ pub(super) async fn generate_session_title_via_model(
                 "tool" => "工具",
                 _ => m.role.as_str(),
             };
-            let content = value_to_string(&m.content);
+            // 去掉图片内容，只保留文本，避免 LLM 看到 base64 数据生成无意义的标题
+            let text_only = normalize_message_content_for_text_only_model(&m.content);
+            let content = value_to_string(&text_only);
             format!("{role}: {content}")
         })
         .collect();

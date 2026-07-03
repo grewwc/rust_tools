@@ -511,7 +511,7 @@ pub(crate) fn epoll_wait_many_channels(
 }
 
 fn task_inherit_schema_description() -> &'static str {
-    "Optional inheritance control. Accepts 'all' (inherit history, memory, cwd, skills), 'none' (fresh sub-agent context), or a comma-separated list selecting some of: history, memory, cwd, skills. If omitted, defaults to history+cwd+skills with private memory (memory not inherited)."
+    "Optional inheritance control. Accepts 'all' (inherit history, memory, cwd, skills), 'none' (fresh sub-agent context), or a comma-separated list selecting some of: history, memory, cwd, skills. If omitted, defaults to history+cwd+skills with private memory (memory not inherited). For narrow leaf tasks, prefer 'none' or 'cwd' to give the subagent a focused context; only use 'all' when the subtask genuinely depends on the full conversation."
 }
 
 fn params_task() -> Value {
@@ -532,7 +532,7 @@ fn params_task() -> Value {
             },
             "model": {
                 "type": "string",
-                "description": "Optional model override for this subagent task."
+                "description": "Optional model override. By default the subagent reuses your (parent) model; only override when the subtask is clearly lighter (use a lighter model to save cost/latency) or heavier than your own."
             },
             "inherit": {
                 "type": "string",
@@ -576,7 +576,7 @@ fn params_task_spawn() -> Value {
             },
             "model": {
                 "type": "string",
-                "description": "Optional model override for this subagent task."
+                "description": "Optional model override. By default the subagent reuses your (parent) model; only override when the subtask is clearly lighter (use a lighter model to save cost/latency) or heavier than your own."
             },
             "inherit": {
                 "type": "string",
@@ -704,11 +704,10 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
 
     // 优先从 DRIVER_CTX 中拿已缓存的 agent_manifests，避免每次 task_spawn 都重读磁盘。
     // 当不在 DRIVER_CTX scope 中（极少见，例如单测），回退到 load_all_agents()。
-    let cached =
-        crate::ai::driver::runtime_ctx::try_current().map(|ctx| ctx.agent_manifests.clone());
+    let cached = crate::ai::driver::runtime_ctx::try_current();
     let owned_fallback;
-    let all_agents: &[AgentManifest] = if let Some(ref arc_vec) = cached {
-        arc_vec.as_slice()
+    let all_agents: &[AgentManifest] = if let Some(ref ctx) = cached {
+        ctx.agent_manifests.as_slice()
     } else {
         owned_fallback = agents::load_all_agents();
         &owned_fallback
@@ -718,8 +717,16 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
         if let Some(model_override) = model_override {
             (models::determine_model(model_override), false, None)
         } else {
-            let choice =
-                models::auto_subagent_model_choice_for_agent(selected.agent, description, prompt);
+            // 默认优先复用父 agent 当前模型；仅在父模型不可用时退回难度自动选择。
+            let parent_model = cached
+                .as_ref()
+                .map(|ctx| ctx.app_proto.current_model.as_str());
+            let choice = models::prefer_parent_model_for_subagent(
+                parent_model,
+                selected.agent,
+                description,
+                prompt,
+            );
             (choice.model, true, Some(choice.fallback))
         };
     let selection_explanation =

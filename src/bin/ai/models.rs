@@ -419,6 +419,32 @@ pub(super) fn auto_subagent_model_for_agent(
     auto_subagent_model_choice_for_agent(agent, description, prompt).model
 }
 
+/// 优先复用父 agent 当前模型作为子 agent 模型；仅在父模型不可用（被禁用、
+/// 不支持子任务所需 thinking）时，退回到基于难度/分级的自动选择。
+/// fallback spec 始终基于自动选择结果，保证子 agent 运行时失败后仍能降级。
+pub(super) fn prefer_parent_model_for_subagent(
+    parent_model: Option<&str>,
+    agent: &AgentManifest,
+    description: &str,
+    prompt: &str,
+) -> AutoSubagentModelChoice {
+    let auto = auto_subagent_model_choice_for_agent(agent, description, prompt);
+    if let Some(parent) = parent_model.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(def) = model_names::find_by_identifier(parent) {
+            let disabled = disabled_model_tokens();
+            if model_auto_select_enabled(def, &disabled)
+                && subagent_model_eligible(def, auto.fallback.require_thinking)
+            {
+                return AutoSubagentModelChoice {
+                    model: model_handle(def),
+                    fallback: auto.fallback,
+                };
+            }
+        }
+    }
+    auto
+}
+
 pub(super) fn auto_subagent_model_choice_for_agent(
     agent: &AgentManifest,
     description: &str,
