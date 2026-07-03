@@ -5,7 +5,8 @@
 //! 在 runtime 启动后再 fork 会导致子进程里的 runtime 残缺、死锁。
 //! 因此本模块的入口是同步函数，由 `ai::entry` 在构建 runtime 之前调用。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process;
 
 use crate::ai::cli::ParsedCli;
 use crate::ai::driver;
@@ -25,8 +26,7 @@ pub(super) fn run_background(mut cli: ParsedCli) -> Result<(), Box<dyn std::erro
         );
     }
 
-    // 如果用户已传 --session <id> 则复用（resume 场景），否则生成新 UUID。
-    // 这个 session id 同时作为日志文件名，run_with_cli 内部也会直接采用 cli.session。
+    // 生成 session id（同时作为日志文件名）。
     let session_id = cli
         .session
         .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
@@ -43,11 +43,76 @@ pub(super) fn run_background(mut cli: ParsedCli) -> Result<(), Box<dyn std::erro
 
     daemonize(&log_path)?;
 
-    // 已经在 daemon 子进程中：构建 runtime 并运行。
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-    runtime.block_on(driver::run_with_cli(cli))
+    // ---------- 以下在 daemon 子进程中执行 ----------
+
+    let pid_path = PathBuf::from(format!("{session_id}.pid"));
+    write_pid_file(&pid_path)?;
+
+    let result = {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(driver::run_with_cli(cli))
+    };
+
+    // 任务结束后清理 PID 文件（无论成功还是失败）。
+    let _ = std::fs::remove_file(&pid_path);
+
+    result
+}
+
+/// 向 `--stop <session-id>` 指定后台进程发送 SIGTERM。
+pub(super) fn stop_background(session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let pid_path = PathBuf::from(format!("{session_id}.pid"));
+
+    if !pid_path.exists() {
+        return Err(format!(
+            "PID 文件 {}.pid 不存在（session 可能已完成/从未启动）",
+            session_id
+        )
+        .into());
+    }
+
+    let pid_str = std::fs::read_to_string(&pid_path)?;
+    let pid: libc::pid_t = pid_str.trim().parse().map_err(|_| {
+        format!("PID 文件 {} 内容异常: {}", pid_path.display(), pid_str.trim())
+    })?;
+
+    // 如果进程已不存在，清理 pid 文件并优雅退出。
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    if !alive {
+        let _ = std::fs::remove_file(&pid_path);
+        return Err(format!(
+            "进程 {pid}（session {session_id}）已经不在了（可能已完成），已清理 PID 文件"
+        )
+        .into());
+    }
+
+    // 发 SIGTERM（对应 ctrl+c）。
+    eprintln!("[stop] 向 session {session_id}（PID {pid}）发送 SIGTERM...");
+    let ret = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(format!("kill({pid}, SIGTERM) 失败: {err}").into());
+    }
+
+    // 等 3 秒让进程优雅退出。
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        eprintln!("[stop] 进程 {pid} 还在运行，可能需要更强力的手段：");
+        eprintln!("       kill -9 {pid}");
+    } else {
+        let _ = std::fs::remove_file(&pid_path);
+        eprintln!("[stop] session {session_id}（PID {pid}）已停止。");
+    }
+    Ok(())
+}
+
+/// 把自己的 PID 写入 `.pid` 文件，以便 `--stop` 能找到进程。
+fn write_pid_file(pid_path: &Path) -> std::io::Result<()> {
+    let pid = process::id() as libc::pid_t;
+    std::fs::write(pid_path, pid.to_string())
 }
 
 /// 经典 double-fork + setsid 把进程变成 daemon，并把 stdout/stderr 重定向到日志文件，
@@ -62,7 +127,7 @@ fn daemonize(log_path: &Path) -> std::io::Result<()> {
     match unsafe { libc::fork() } {
         -1 => return Err(std::io::Error::last_os_error()),
         0 => {}
-        _ => std::process::exit(0),
+        _ => process::exit(0),
     }
 
     // 成为新会话组长，脱离控制终端。
@@ -74,7 +139,7 @@ fn daemonize(log_path: &Path) -> std::io::Result<()> {
     match unsafe { libc::fork() } {
         -1 => return Err(std::io::Error::last_os_error()),
         0 => {}
-        _ => std::process::exit(0),
+        _ => process::exit(0),
     }
 
     // 重定向标准流：stdin <- /dev/null，stdout/stderr -> 日志文件。

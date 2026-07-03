@@ -43,6 +43,15 @@ pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
     if cli.background {
         return background::run_background(cli);
     }
+    if let Some(ref session_id) = cli.stop_session {
+        if session_id.is_empty() {
+            return Err("--stop 需要指定 session id，例如：a --stop <session-id>".into());
+        }
+        eprintln!("[stop] 正在停止 session {session_id}...");
+        background::stop_background(session_id)?;
+        return Ok(());
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

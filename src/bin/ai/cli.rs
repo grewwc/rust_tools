@@ -55,6 +55,9 @@ pub(super) struct ParsedCli {
     /// 后台模式下会 detach 终端、把完整输出写入当前目录下 `<sessionid>.log`，
     /// 并提示 agent 在任务完成前不要停止。需要搭配位置参数（问题）使用。
     pub(super) background: bool,
+    /// --stop <session-id>：向后台任务的进程发送 SIGTERM 停止它。
+    /// 后台模式会在当前目录下写入 <sessionid>.pid 文件，--stop 读取它并 kill。
+    pub(super) stop_session: Option<String>,
 }
 
 /// `a` 内部 "/" / ":" 命令列表，用于 shell 补全。
@@ -154,6 +157,7 @@ fn register_cli_flags(parser: &mut TermParser) {
     parser.alias("ns", "note-search");
     parser.alias("h", "help");
 
+    parser.add_string("stop", "", "stop a background session by session id (e.g. a --stop <sessionid>)");
     parser.add_string("model", "", "model name");
     parser.alias("m", "model");
     parser.add_string("agent", "", "agent name");
@@ -310,6 +314,7 @@ impl Default for ParsedCli {
             migrate_legacy_knowledge: false,
             generate_completions: false,
             background: false,
+            stop_session: None,
         }
     }
 }
@@ -377,6 +382,12 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     // 处理 background / -bg
     cli.background = parser.contains_flag_strict("background");
+
+    // 处理 --stop <session-id>
+    if parser.contains_flag_strict("stop") {
+        let val = parser.flag_value_or_default("stop");
+        cli.stop_session = Some(val.trim().to_string());
+    }
 
     // 处理 list-tools
     cli.list_tools = parser.contains_flag_strict("list-tools");
@@ -465,6 +476,7 @@ pub(super) fn print_help() {
     println!("  -ns, --note-search       search memo category using the positional prompt");
     println!("  -i, --interactive        keep the session open for follow-up questions");
     println!("  -bg, --background        run the prompt in background: detach from terminal, log to <sessionid>.log");
+    println!("  --stop <session-id>      stop a background session (reads <sessionid>.pid, sends SIGTERM)");
     println!();
     parser.print_defaults();
     println!();
@@ -932,6 +944,19 @@ mod tests {
             ["a".to_string(), "fix the bug".to_string()].into_iter(),
         );
         assert!(!cli.background);
+    }
+
+    #[test]
+    fn parse_cli_args_reads_stop_flag() {
+        // --stop <sessionid>
+        let cli = super::parse_cli_args(
+            ["a".to_string(), "--stop".to_string(), "abc-123".to_string()].into_iter(),
+        );
+        assert_eq!(cli.stop_session, Some("abc-123".to_string()));
+
+        // 不带 --stop 时默认为 None
+        let cli = super::parse_cli_args(["a".to_string()].into_iter());
+        assert!(cli.stop_session.is_none());
     }
 
     #[test]
