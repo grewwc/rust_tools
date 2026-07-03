@@ -22,6 +22,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     status_msg: Option<&str>,
     completion_panel: Option<&CompletionPanel>,
     model_label: &str,
+    session_topic: Option<&str>,
 ) {
     let area = f.area();
 
@@ -111,7 +112,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // 复用 popup 顶部的 1 行空白间距区域，不占用 textarea 的可用高度。
     if !model_label.is_empty() {
         let header_area = Rect::new(popup.x, popup.y, popup.width, 1);
-        let header = Line::from(vec![
+        let mut spans = vec![
             Span::styled(" model: ", Style::default().fg(Color::Rgb(148, 163, 184))),
             Span::styled(
                 model_label,
@@ -119,7 +120,23 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                     .fg(Color::Rgb(134, 194, 166))
                     .add_modifier(Modifier::BOLD),
             ),
-        ]);
+        ];
+        // 在 model 同行展示 session 主题
+        let topic_text = match session_topic {
+            Some(t) if !t.is_empty() => t,
+            _ => "new session",
+        };
+        spans.push(Span::styled(
+            "  |  ",
+            Style::default().fg(Color::Rgb(100, 116, 139)),
+        ));
+        spans.push(Span::styled(
+            topic_text,
+            Style::default()
+                .fg(Color::Rgb(251, 191, 36))
+                .add_modifier(Modifier::ITALIC),
+        ));
+        let header = Line::from(spans);
         f.render_widget(Paragraph::new(header), header_area);
     }
 

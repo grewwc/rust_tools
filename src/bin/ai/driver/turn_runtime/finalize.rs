@@ -273,14 +273,19 @@ pub(super) async fn finalize_turn(
         let had_tool_calls = turn_messages
             .iter()
             .any(|m| m.role == "tool" || m.tool_calls.as_ref().map_or(false, |c| !c.is_empty()));
-        let compact_result = if had_tool_calls {
-            compact_session_history_with_app(app).await
-        } else {
-            compact_session_history_at_boundary_with_app(app).await
-        };
-        if let Err(err) = compact_result {
-            eprintln!("[Warning] Failed to compact persisted history: {}", err);
+        {
+            // 用块限制 compact_result 的生命周期，避免它跨越 await 导致 Send 问题
+            let compact_result = if had_tool_calls {
+                compact_session_history_with_app(app).await
+            } else {
+                compact_session_history_at_boundary_with_app(app).await
+            };
+            if let Err(err) = compact_result {
+                eprintln!("[Warning] Failed to compact persisted history: {}", err);
+            }
         }
+        // 尝试为当前对话生成 LLM 概括性标题（如果尚未生成且已有足够上下文）
+        maybe_generate_session_title(app).await;
         println!();
         maybe_spawn_critic_revise_background(app, question, final_assistant_text);
 
@@ -331,6 +336,61 @@ pub(super) async fn finalize_turn(
     } else {
         TurnOutcome::Continue
     })
+}
+
+/// 在 turn 结束后尝试用 LLM 生成 session 概括性标题。
+/// 条件：至少有 1 个 user turn 且尚未生成过标题。
+async fn maybe_generate_session_title(app: &App) {
+    use crate::ai::history::SessionStore;
+    // eprintln!("[session-title] checking: session_id={} history_file={}", app.session_id, app.session_history_file.display());
+
+    let sessions_dir = app
+        .session_history_file
+        .parent()
+        .unwrap_or_else(|| app.session_history_file.as_path());
+    let store = SessionStore::new(sessions_dir);
+    eprintln!("[session-title] sessions_dir={}", sessions_dir.display());
+
+    if store.has_generated_title(&app.session_id) {
+        eprintln!("[session-title] already has generated title, skipping");
+        return;
+    }
+
+    let all_messages = match store.read_all_messages(&app.session_id) {
+        Ok(m) if !m.is_empty() => {
+            // eprintln!("[session-title] read {} messages", m.len());
+            m
+        }
+        Ok(_) => {
+            // eprintln!("[session-title] no messages found for session {}", app.session_id);
+            return;
+        }
+        Err(e) => {
+            // eprintln!("[session-title] failed to read messages: {e}");
+            return;
+        }
+    };
+
+    // 至少需要 1 个 user turn 即可生成标题（首条消息通常已包含核心意图）
+    let user_turns = all_messages.iter().filter(|m| m.role == "user").count();
+    // eprintln!("[session-title] user_turns={user_turns}");
+    if user_turns < 1 {
+        return;
+    }
+
+    // 调用 LLM 生成标题
+    let title = crate::ai::request::generate_session_title_via_model(app, &all_messages).await;
+    // eprintln!("[session-title] LLM returned: {:?}", title.as_deref().unwrap_or("None"));
+
+    if let Some(t) = title {
+        if !t.is_empty() {
+            if let Err(err) = store.write_session_title(&app.session_id, &t) {
+                // eprintln!("[session-title] failed to save title: {}", err);
+            } else {
+                // eprintln!("[session-title] generated: {}", t);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

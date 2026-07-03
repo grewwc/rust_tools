@@ -315,6 +315,13 @@ pub(super) fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
         *cur_w = 0;
     };
 
+    let trim_trailing_spaces = |cur: &mut String, cur_w: &mut usize| {
+        while cur.ends_with(' ') {
+            cur.pop();
+            *cur_w = cur_w.saturating_sub(1);
+        }
+    };
+
     let close_line = |lines: &mut Vec<String>, cur: &mut String, bold: bool, italic: bool| {
         cur.push_str(&style_suffix(bold, italic));
         lines.push(std::mem::take(cur));
@@ -342,7 +349,25 @@ pub(super) fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
 
         if let Some((piece, next)) = take_atomic_markdown_span(s, i) {
             let piece_width = visible_width(&piece);
+            if piece_width > width {
+                if cur_w > 0 {
+                    trim_trailing_spaces(&mut cur, &mut cur_w);
+                    close_line(&mut lines, &mut cur, bold, italic);
+                    start_new_line(&mut cur, &mut cur_w, bold, italic);
+                }
+                for wrapped_piece in wrap_overlong_atomic_markdown_span(&piece, width) {
+                    if cur_w > 0 {
+                        close_line(&mut lines, &mut cur, bold, italic);
+                        start_new_line(&mut cur, &mut cur_w, bold, italic);
+                    }
+                    cur.push_str(&wrapped_piece);
+                    cur_w = visible_width(&wrapped_piece);
+                }
+                i = next;
+                continue;
+            }
             if cur_w > 0 && cur_w + piece_width > width {
+                trim_trailing_spaces(&mut cur, &mut cur_w);
                 close_line(&mut lines, &mut cur, bold, italic);
                 start_new_line(&mut cur, &mut cur_w, bold, italic);
             }
@@ -352,9 +377,25 @@ pub(super) fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
             continue;
         }
 
+        if let Some((piece, next)) = take_ascii_non_whitespace_run(s, i) {
+            let piece_width = visible_width(&piece);
+            if piece_width <= width {
+                if cur_w > 0 && cur_w + piece_width > width {
+                    trim_trailing_spaces(&mut cur, &mut cur_w);
+                    close_line(&mut lines, &mut cur, bold, italic);
+                    start_new_line(&mut cur, &mut cur_w, bold, italic);
+                }
+                cur.push_str(&piece);
+                cur_w += piece_width;
+                i = next;
+                continue;
+            }
+        }
+
         let ch = rest.chars().next().unwrap();
         let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
         if cur_w > 0 && cur_w + w > width {
+            trim_trailing_spaces(&mut cur, &mut cur_w);
             close_line(&mut lines, &mut cur, bold, italic);
             start_new_line(&mut cur, &mut cur_w, bold, italic);
         }
@@ -368,6 +409,78 @@ pub(super) fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
         lines.push(String::new());
     }
     lines
+}
+
+fn wrap_overlong_atomic_markdown_span(s: &str, width: usize) -> Vec<String> {
+    let Some((prefix, inner, suffix)) = split_atomic_markdown_span(s) else {
+        return wrap_plain_visible_text(s, width);
+    };
+    wrap_plain_visible_text(inner, width)
+        .into_iter()
+        .map(|chunk| format!("{prefix}{chunk}{suffix}"))
+        .collect()
+}
+
+fn split_atomic_markdown_span(s: &str) -> Option<(&str, &str, &str)> {
+    if s.starts_with("```") || s.starts_with("~~~") {
+        return None;
+    }
+    for delim in ["~~", "$$", "`", "$", "*"] {
+        if s.starts_with(delim) && s.ends_with(delim) && s.len() >= delim.len() * 2 {
+            let inner_start = delim.len();
+            let inner_end = s.len() - delim.len();
+            return Some((&s[..inner_start], &s[inner_start..inner_end], &s[inner_end..]));
+        }
+    }
+    None
+}
+
+fn wrap_plain_visible_text(s: &str, width: usize) -> Vec<String> {
+    if s.is_empty() {
+        return vec![String::new()];
+    }
+
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for ch in s.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cur_w > 0 && cur_w + w > width {
+            out.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push(ch);
+        cur_w += w;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+fn take_ascii_non_whitespace_run(s: &str, start: usize) -> Option<(String, usize)> {
+    let rest = &s[start..];
+    let first = rest.chars().next()?;
+    if !first.is_ascii() || first.is_ascii_whitespace() {
+        return None;
+    }
+    if matches!(first, '*' | '`' | '$' | '\\') {
+        return None;
+    }
+
+    let mut end = start;
+    for (offset, ch) in rest.char_indices() {
+        if !ch.is_ascii() || ch.is_ascii_whitespace() || matches!(ch, '*' | '`' | '$' | '\\') {
+            break;
+        }
+        end = start + offset + ch.len_utf8();
+    }
+
+    (end > start).then(|| (s[start..end].to_string(), end))
 }
 
 fn take_atomic_markdown_span(s: &str, start: usize) -> Option<(String, usize)> {
@@ -450,6 +563,39 @@ mod tests {
 
         let code = wrap_md_cell(r#"`a|b`"#, 3);
         assert_eq!(code, vec![r#"`a|b`"#]);
+    }
+
+    #[test]
+    fn wrap_md_cell_prefers_ascii_word_boundaries() {
+        let wrapped = wrap_md_cell("ANSI 失败 → clickhouse 成功", 16);
+        assert_eq!(wrapped, vec!["ANSI 失败 →", "clickhouse 成功"]);
+    }
+
+    #[test]
+    fn wrap_md_cell_splits_overlong_ascii_token_only_as_fallback() {
+        let wrapped = wrap_md_cell("supercalifragilistic", 6);
+        assert!(wrapped.len() > 1);
+        assert_eq!(wrapped.join(""), "supercalifragilistic");
+        for line in wrapped {
+            assert!(visible_width(&line) <= 6);
+        }
+    }
+
+    #[test]
+    fn wrap_md_cell_splits_overlong_code_span() {
+        let wrapped = wrap_md_cell(
+            "`async processOrder(orderId: string, options?: { timeout?: number })`",
+            18,
+        );
+
+        assert!(wrapped.len() > 1);
+        for line in wrapped {
+            assert!(
+                line.starts_with('`') && line.ends_with('`'),
+                "code styling should be preserved per wrapped line: {line:?}"
+            );
+            assert!(visible_width(&line) <= 18, "{line:?}");
+        }
     }
 
     #[test]

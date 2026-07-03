@@ -27,6 +27,8 @@ pub(super) struct PromptEditor {
     pending_prefill: Option<String>,
     /// 当前模型显示名，用于在输入框顶部展示模型提示（输入时即可看到将使用的模型）。
     current_model_label: String,
+    /// 当前 session 主题，用于在输入框顶部与模型提示同行展示。
+    session_topic: Option<String>,
 }
 
 impl PromptEditor {
@@ -51,6 +53,7 @@ impl PromptEditor {
             session_image_dir,
             pending_prefill: None,
             current_model_label: String::new(),
+            session_topic: None,
         }
     }
 
@@ -62,6 +65,11 @@ impl PromptEditor {
     /// 设置当前模型显示名，下一次 `read_multi_line` 会在输入框顶部展示。
     pub(super) fn set_current_model_label(&mut self, label: impl Into<String>) {
         self.current_model_label = label.into();
+    }
+
+    /// 设置当前 session 主题，下一次 `read_multi_line` 会在模型提示同行展示。
+    pub(super) fn set_session_topic(&mut self, topic: Option<String>) {
+        self.session_topic = topic;
     }
 
     pub(super) fn read_multi_line(&mut self) -> io::Result<Option<String>> {

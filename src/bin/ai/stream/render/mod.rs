@@ -1,4 +1,5 @@
 pub(super) mod code;
+pub(super) mod html;
 pub(super) mod inline;
 pub(super) mod markdown;
 pub(super) mod math;

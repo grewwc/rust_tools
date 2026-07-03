@@ -11,6 +11,9 @@ use crate::ai::stream::render::table::{
     render_table_bottom, render_table_header, render_table_mid, render_table_row, render_table_top,
     split_indent, table_preview_height,
 };
+use crate::ai::stream::render::html::{
+    contains_close_table_tag, contains_open_table_tag, parse_html_table, render_html_table,
+};
 use crate::ai::stream::state::{END_THINKING_TAG_TEXT, THINKING_TAG_TEXT};
 use crate::ai::theme::{
     ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS,
@@ -32,6 +35,11 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     table_state: TableState,
     dimmed: bool,
     code_preview_segment_width: usize,
+    // HTML 表格缓冲状态
+    in_html_table: bool,
+    html_table_buf: String,
+    html_table_preview_height: usize,
+    html_table_indent: String,
 }
 
 impl MarkdownStreamRenderer {
@@ -57,6 +65,10 @@ impl MarkdownStreamRenderer {
             table_state: TableState::None,
             dimmed: false,
             code_preview_segment_width: 0,
+            in_html_table: false,
+            html_table_buf: String::new(),
+            html_table_preview_height: 0,
+            html_table_indent: String::new(),
         }
     }
 
@@ -365,6 +377,28 @@ impl MarkdownStreamRenderer {
             }
         }
 
+        // 流式输出在 HTML 表格缓冲中途结束——尝试解析已有内容
+        if self.in_html_table {
+            let buf = std::mem::take(&mut self.html_table_buf);
+            let indent = std::mem::take(&mut self.html_table_indent);
+            let preview_height = std::mem::take(&mut self.html_table_preview_height);
+            self.in_html_table = false;
+
+            let rendered = parse_html_table(&buf)
+                .map(|t| render_html_table(&indent, &t))
+                .unwrap_or(buf);
+            let move_up = preview_height;
+            let final_out = if move_up > 0 {
+                format!("\x1b[{move_up}A\r\x1b[0J{rendered}")
+            } else {
+                rendered
+            };
+            if !final_out.is_empty() {
+                out.write_all(final_out.as_bytes())?;
+                self.bol = final_out.ends_with('\n');
+            }
+        }
+
         let state = std::mem::replace(&mut self.table_state, TableState::None);
         let rendered = match state {
             TableState::None => String::new(),
@@ -396,9 +430,18 @@ impl MarkdownStreamRenderer {
     }
 
     pub(in crate::ai) fn consume_line(&mut self, line: &str, preview_emitted: bool) -> String {
+        // HTML 表格缓冲：正在收集 <table>...</table> 内容
+        if self.in_html_table {
+            return self.consume_html_table_line(line, preview_emitted);
+        }
+
         let state = std::mem::replace(&mut self.table_state, TableState::None);
         match state {
             TableState::None => {
+                // 检测 HTML <table> 开标签（非代码块、非 markdown 表格上下文）
+                if !self.in_code_block && contains_open_table_tag(line) {
+                    return self.start_html_table(line, preview_emitted);
+                }
                 if !self.in_code_block && is_table_row_candidate(line) && !is_table_separator(line)
                 {
                     let mut out = String::new();
@@ -521,6 +564,83 @@ impl MarkdownStreamRenderer {
         }
     }
 
+    // ── HTML 表格缓冲 ──────────────────────────────────────────
+
+    /// 检测到 `<table>` 开标签，开始缓冲 HTML 内容。
+    fn start_html_table(&mut self, line: &str, preview_emitted: bool) -> String {
+        self.in_html_table = true;
+        self.html_table_buf = line.to_string();
+
+        let (indent, rest) = split_indent(line);
+        self.html_table_indent = indent.to_string();
+
+        // 单行表格（<table>...</table> 在同一行）
+        if contains_close_table_tag(line) {
+            return self.finalize_html_table(preview_emitted);
+        }
+
+        // 开始缓冲——记录预览高度
+        let raw = format!("{indent}{}", rest.trim_end());
+        self.html_table_preview_height =
+            self.streamed_or_measured_preview_height(&raw, preview_emitted);
+
+        if preview_emitted {
+            return String::new();
+        }
+        format!("{}\n", raw)
+    }
+
+    /// 缓冲 HTML 表格的后续行。
+    fn consume_html_table_line(&mut self, line: &str, preview_emitted: bool) -> String {
+        self.html_table_buf.push('\n');
+        self.html_table_buf.push_str(line);
+
+        // 检测 </table> 闭标签——解析并渲染最终表格
+        if contains_close_table_tag(line) {
+            return self.finalize_html_table(preview_emitted);
+        }
+
+        // 继续缓冲——累加预览高度
+        let raw = line.trim_end();
+        self.html_table_preview_height +=
+            self.streamed_or_measured_preview_height(raw, preview_emitted);
+
+        if preview_emitted {
+            return String::new();
+        }
+        format!("{}\n", raw)
+    }
+
+    /// HTML 表格缓冲完成，解析并渲染为终端表格。
+    fn finalize_html_table(&mut self, preview_emitted: bool) -> String {
+        let buf = std::mem::take(&mut self.html_table_buf);
+        let indent = std::mem::take(&mut self.html_table_indent);
+        let preview_height = std::mem::take(&mut self.html_table_preview_height);
+        self.in_html_table = false;
+
+        let table = parse_html_table(&buf);
+        let rendered = match &table {
+            Some(t) => render_html_table(&indent, t),
+            None => {
+                // 解析失败——回退为原始文本
+                buf
+            }
+        };
+
+        let move_up = preview_height
+            + if preview_emitted {
+                self.line_preview_height
+            } else {
+                0
+            };
+
+        if move_up > 0 {
+            format!("\x1b[{move_up}A\r\x1b[0J{rendered}")
+        } else {
+            rendered
+        }
+    }
+
     fn rewrite_table_preview(
         &self,
         indent: &str,
@@ -554,7 +674,7 @@ impl MarkdownStreamRenderer {
         let cols = header
             .len()
             .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
-        if cols < 2 {
+        if cols == 0 {
             return String::new();
         }
 
@@ -1579,6 +1699,64 @@ mod tests {
                 !screen.iter().any(|line| line.contains("| 选项 | 作用 |")),
                 "COLUMNS={cols}: raw table header leaked onto final screen:\n{}",
                 screen.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_single_column_table_renders_as_table() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "64") };
+
+        let md = "\
+| 函数签名 |
+| --- |
+| `processOrder(orderId: string)` |
+";
+        let stream = render_full_stream(md, false);
+        let mut grid = VtGrid::new(64);
+        grid.feed(&stream);
+        let screen = grid.screen();
+        let joined = screen.join("\n");
+
+        assert!(joined.contains('┌'), "{joined}");
+        assert!(joined.contains('│'), "{joined}");
+        assert!(
+            !joined.contains("| 函数签名 |"),
+            "raw single-column markdown table leaked:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn multi_column_table_with_overlong_code_span_stays_within_terminal_width() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "80") };
+
+        let renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let header = vec![
+            "函数签名".to_string(),
+            "说明".to_string(),
+            "返回值".to_string(),
+        ];
+        let align = vec![TableAlign::Left; 3];
+        let rows = vec![vec![
+            "`async processOrder(orderId: string, options?: { retry?: number; timeout?: number; callback?: (result: OrderResult) => void; metadata?: Record<string, string> }) => Promise<OrderResult>`".to_string(),
+            "异步处理订单。该函数会依次执行：校验订单、锁定库存、调用支付网关、写入流水、释放锁、发送通知。".to_string(),
+            "`{ success, data, error, traceId }`".to_string(),
+        ]];
+
+        let rendered = renderer.render_table_block("", &header, &align, &rows);
+        assert!(!rendered.is_empty());
+        for line in rendered.lines() {
+            let visible = crate::ai::stream::extract::strip_ansi_codes(line);
+            let width = unicode_width::UnicodeWidthStr::width(visible.as_str());
+            assert!(
+                width <= 80,
+                "rendered table line exceeds terminal width ({width}):\n{visible}"
+            );
+            assert!(
+                visible.starts_with(['┌', '├', '└', '│']),
+                "table line should not be a wrapped continuation:\n{visible}"
             );
         }
     }

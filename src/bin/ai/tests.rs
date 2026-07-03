@@ -2093,7 +2093,9 @@ fn table_preview_lines_are_not_double_printed_after_live_emit() {
     assert!(header_out.contains("| name | value |\n"));
 
     let sep_out = renderer.consume_line("| --- | --- |", true);
-    assert_eq!(sep_out, "");
+    assert!(sep_out.contains("\x1b["));
+    assert!(!sep_out.contains("| name | value |"));
+    assert!(!sep_out.contains("| --- | --- |"));
 
     let row_out = renderer.consume_line("| foo | bar |", true);
     assert_eq!(row_out, "");

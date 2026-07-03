@@ -31,6 +31,7 @@ pub(in crate::ai) use compress::{
 pub(in crate::ai) use markdown::messages_to_markdown;
 #[allow(unused_imports)]
 pub(in crate::ai) use sessions::{SessionInfo, SessionStore};
+pub(in crate::ai) use sessions::generate_session_summary;
 #[allow(unused_imports)]
 pub(in crate::ai) use sqlite::read_recent_messages_sqlite;
 #[allow(unused_imports)]

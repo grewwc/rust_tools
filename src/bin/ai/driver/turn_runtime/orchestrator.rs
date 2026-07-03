@@ -29,10 +29,10 @@ use super::{
 };
 
 /// 工具调用循环检测窗口：
-/// - soft: 连续 2 轮调用 (tool_name, normalized_args) 完全一致，先注入反思提示
-/// - hard: 连续 3 轮完全一致，直接强制收敛，不再继续工具循环
-const TOOL_LOOP_SOFT_WINDOW: usize = 2;
-const TOOL_LOOP_HARD_WINDOW: usize = 3;
+/// - soft: 连续 4 轮调用 (tool_name, normalized_args) 完全一致，先注入反思提示
+/// - hard: 连续 6 轮完全一致，直接强制收敛，不再继续工具循环
+const TOOL_LOOP_SOFT_WINDOW: usize = 4;
+const TOOL_LOOP_HARD_WINDOW: usize = 6;
 const TOOL_SIGNATURE_HISTORY_LIMIT: usize = TOOL_LOOP_HARD_WINDOW + 2;
 const TASK_ANCHOR_MAX_QUESTION_CHARS: usize = 220;
 

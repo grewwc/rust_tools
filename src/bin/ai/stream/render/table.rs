@@ -90,7 +90,8 @@ pub(super) fn is_table_row_candidate(line: &str) -> bool {
         return false;
     }
     let cells = parse_table_row(s);
-    cells.len() >= 2 && header_candidate_has_clear_table_boundary(s, &cells)
+    (cells.len() >= 2 || explicit_single_column_table_line(s, &cells))
+        && header_candidate_has_clear_table_boundary(s, &cells)
 }
 
 pub(super) fn is_table_row(line: &str) -> bool {
@@ -103,12 +104,13 @@ pub(super) fn is_table_row(line: &str) -> bool {
         return false;
     }
     let cells = parse_table_row(s);
-    cells.len() >= 2
+    cells.len() >= 2 || explicit_single_column_table_line(s, &cells)
 }
 
 pub(super) fn is_table_separator(line: &str) -> bool {
     let (_, rest) = split_indent(line);
     let mut s = rest.trim();
+    let explicit_boundary = has_explicit_table_boundaries(s);
     if s.starts_with('|') {
         s = &s[1..];
     }
@@ -128,7 +130,7 @@ pub(super) fn is_table_separator(line: &str) -> bool {
             return false;
         }
     }
-    count >= 2
+    count >= 2 || (count == 1 && explicit_boundary)
 }
 
 pub(super) fn parse_table_row(line: &str) -> Vec<String> {
@@ -175,7 +177,7 @@ pub(super) fn parse_table_align(line: &str, cols: usize) -> Vec<TableAlign> {
 
 fn header_candidate_has_clear_table_boundary(s: &str, cells: &[String]) -> bool {
     if s.starts_with('|') {
-        return true;
+        return cells.iter().any(|cell| !cell.trim().is_empty());
     }
 
     let Some(first) = cells.first().map(|cell| cell.trim()) else {
@@ -193,6 +195,15 @@ fn header_candidate_has_clear_table_boundary(s: &str, cells: &[String]) -> bool 
     }
 
     true
+}
+
+fn explicit_single_column_table_line(s: &str, cells: &[String]) -> bool {
+    cells.len() == 1 && has_explicit_table_boundaries(s)
+}
+
+fn has_explicit_table_boundaries(s: &str) -> bool {
+    let s = s.trim();
+    s.len() >= 2 && s.starts_with('|') && s.ends_with('|')
 }
 
 fn starts_with_non_table_block_prefix(s: &str) -> bool {
@@ -367,14 +378,14 @@ pub(super) fn compute_table_widths(
 
 pub(super) fn render_table_top(indent: &str, widths: &[usize]) -> String {
     let cols = widths.len();
-    if cols < 2 {
+    if cols == 0 {
         return String::new();
     }
     let mut out = String::new();
     out.push_str(indent);
     out.push('┌');
     for (i, width) in widths.iter().enumerate() {
-        out.push_str(&"─".repeat(*width + 2));
+        out.push_str(&"-".repeat(width + 2));
         out.push(if i + 1 == cols { '┐' } else { '┬' });
     }
     out.push('\n');
@@ -383,14 +394,14 @@ pub(super) fn render_table_top(indent: &str, widths: &[usize]) -> String {
 
 pub(super) fn render_table_mid(indent: &str, widths: &[usize]) -> String {
     let cols = widths.len();
-    if cols < 2 {
+    if cols == 0 {
         return String::new();
     }
     let mut out = String::new();
     out.push_str(indent);
     out.push('├');
     for (i, width) in widths.iter().enumerate() {
-        out.push_str(&"─".repeat(*width + 2));
+        out.push_str(&"-".repeat(width + 2));
         out.push(if i + 1 == cols { '┤' } else { '┼' });
     }
     out.push('\n');
@@ -399,14 +410,14 @@ pub(super) fn render_table_mid(indent: &str, widths: &[usize]) -> String {
 
 pub(super) fn render_table_bottom(indent: &str, widths: &[usize]) -> String {
     let cols = widths.len();
-    if cols < 2 {
+    if cols == 0 {
         return String::new();
     }
     let mut out = String::new();
     out.push_str(indent);
     out.push('└');
     for (i, width) in widths.iter().enumerate() {
-        out.push_str(&"─".repeat(*width + 2));
+        out.push_str(&"-".repeat(width + 2));
         out.push(if i + 1 == cols { '┘' } else { '┴' });
     }
     out.push('\n');
@@ -420,7 +431,7 @@ pub(super) fn render_table_header(
     widths: &[usize],
 ) -> String {
     let cols = widths.len();
-    if cols < 2 {
+    if cols == 0 {
         return String::new();
     }
 
@@ -465,7 +476,7 @@ pub(super) fn render_table_row(
     widths: &[usize],
 ) -> String {
     let cols = widths.len();
-    if cols < 2 {
+    if cols == 0 {
         return String::new();
     }
 
@@ -577,6 +588,14 @@ mod tests {
     fn bare_table_candidate_rejects_list_like_prefix() {
         assert!(!is_table_row_candidate("- 时间 | 线程 | 前置事件"));
         assert!(!is_table_row_candidate("1. 时间 | 线程 | 前置事件"));
+    }
+
+    #[test]
+    fn explicit_single_column_table_is_recognized() {
+        assert!(is_table_row_candidate("| 函数签名 |"));
+        assert!(is_table_separator("| --- |"));
+        assert!(is_table_row("| `processOrder()` |"));
+        assert!(!is_table_row_candidate("函数签名 |"));
     }
 
     #[test]

@@ -241,6 +241,10 @@ pub(crate) fn encode_os_task_goal(goal: &OsTaskGoal) -> Result<String, String> {
         .map_err(|err| format!("Failed to encode task goal: {err}"))
 }
 
+pub(crate) fn is_encoded_task_goal(goal: &str) -> bool {
+    goal.starts_with(TASK_GOAL_PREFIX)
+}
+
 pub(crate) fn decode_os_task_goal(goal: &str) -> Option<OsTaskGoal> {
     let payload = goal.strip_prefix(TASK_GOAL_PREFIX)?;
     serde_json::from_str(payload).ok()
@@ -821,6 +825,19 @@ pub(crate) fn spawn_subagent_kernel_task(
 pub(crate) fn with_task_entry<R>(task_id: &str, f: impl FnOnce(&AsyncTaskEntry) -> R) -> Option<R> {
     let registry = TASK_REGISTRY.lock().unwrap();
     registry.get_ref(&task_id.to_string()).map(f)
+}
+
+pub(crate) fn with_task_entry_by_pid<R>(
+    pid: u64,
+    mut f: impl FnMut(&AsyncTaskEntry) -> R,
+) -> Option<R> {
+    let registry = TASK_REGISTRY.lock().unwrap();
+    for (_task_id, entry) in registry.iter() {
+        if entry.pid == pid {
+            return Some(f(entry));
+        }
+    }
+    None
 }
 
 /// Remove a task entry from the registry. Called by the synchronous `task`
@@ -2019,10 +2036,12 @@ fn build_selection_explanation(
 mod tests {
     use super::{
         AgentTeamMemberSpec, AgentTeamOperation, AsyncTaskEntry, InheritOptions, SelectedSubagent,
-        StoredTaskResult, WaitManySource, append_current_process_cancel_source,
-        build_agent_team_prompt, build_agent_team_selection_prompt, build_selection_explanation,
-        epoll_wait_many, epoll_wait_many_channels, format_task_result, parse_agent_team_members,
-        resolve_agent_team_model_override, select_subagent, wait_sources_for_channel_and_futex,
+        StoredTaskResult, TASK_REGISTRY, WaitManySource, append_current_process_cancel_source,
+        OsTaskGoal, build_agent_team_prompt, build_agent_team_selection_prompt,
+        build_selection_explanation, encode_os_task_goal, epoll_wait_many,
+        epoll_wait_many_channels, format_task_result, is_encoded_task_goal,
+        parse_agent_team_members, remove_task_entry, resolve_agent_team_model_override,
+        select_subagent, wait_sources_for_channel_and_futex, with_task_entry_by_pid,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use aios_kernel::{
@@ -2471,6 +2490,65 @@ mod tests {
         assert!(output.contains("FAILED"));
         assert!(output.contains("Error: request timed out waiting for response headers"));
         assert!(output.contains("(subagent did not produce any final assistant text)"));
+    }
+
+    #[test]
+    fn encoded_task_goal_prefix_is_detectable_without_decoding() {
+        let goal = encode_os_task_goal(&OsTaskGoal {
+            task_id: "task_test".to_string(),
+            result_channel_id: 7,
+            completion_futex_addr: 9,
+            description: "inspect".to_string(),
+            prompt: "look around".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max-alibaba".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit agent/model override".to_string(),
+        })
+        .unwrap();
+
+        assert!(is_encoded_task_goal(&goal));
+        assert!(!is_encoded_task_goal("plain foreground goal"));
+    }
+
+    #[test]
+    fn task_entry_can_be_looked_up_by_pid() {
+        let task_id = format!("task_test_{}", uuid::Uuid::new_v4().simple());
+        {
+            let mut registry = TASK_REGISTRY.lock().unwrap();
+            registry.insert(
+                task_id.clone(),
+                AsyncTaskEntry {
+                    pid: 4242,
+                    result_channel_id: 11,
+                    completion_futex_addr: FutexAddr(13),
+                    description: "inspect".to_string(),
+                    agent_name: "explore".to_string(),
+                    model: "qwen3.7-max-alibaba".to_string(),
+                    is_model_auto_selected: false,
+                    auto_model_fallback: None,
+                    selection_explanation: "explicit override".to_string(),
+                    inherit: InheritOptions::default(),
+                    started_at: Instant::now(),
+                },
+            );
+        }
+
+        let looked_up = with_task_entry_by_pid(4242, |entry| {
+            (entry.agent_name.clone(), entry.model.clone(), entry.result_channel_id)
+        });
+
+        assert_eq!(
+            looked_up,
+            Some((
+                "explore".to_string(),
+                "qwen3.7-max-alibaba".to_string(),
+                11
+            ))
+        );
+
+        let _ = remove_task_entry(&task_id);
     }
 }
 

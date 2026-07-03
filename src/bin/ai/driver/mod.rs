@@ -48,7 +48,7 @@ use crate::ai::{
     models,
     prompt::PromptEditor,
     skills::{self, SkillManifest},
-    tools::task_tools::decode_os_task_goal,
+    tools::task_tools::{decode_os_task_goal, is_encoded_task_goal, with_task_entry_by_pid},
     types::{AgentContext, App},
 };
 use crate::commonw::configw;
@@ -129,6 +129,7 @@ struct StartupSessionChoice {
     active_persona: crate::ai::persona::PersonaProfile,
     history_file: PathBuf,
     session_id: String,
+    model: Option<String>,
     startup_notice: Option<String>,
 }
 
@@ -343,6 +344,7 @@ where
             .filter(|id| !id.is_empty())
             .map(|id| id.to_string())
             .unwrap_or_else(|| Uuid::new_v4().to_string()),
+        model: None,
         startup_notice: None,
     };
 
@@ -388,6 +390,8 @@ where
             };
             choice.history_file = entry.history_file.clone();
             choice.session_id = entry.session_id.clone();
+            // 恢复挂起时保存的模型，而非使用默认模型
+            choice.model = entry.model.clone();
 
             let remaining = previews.len().saturating_sub(1);
             let mut persona_fallback = false;
@@ -490,10 +494,10 @@ fn format_rlimit_termination_result(verdict: RlimitVerdict) -> String {
 }
 
 /// Default max LLM iterations allowed per turn (prevents infinite loops)
-const DEFAULT_MAX_ITERATIONS: usize = 1024;
+const DEFAULT_MAX_ITERATIONS: usize = 4096;
 
 /// Max iterations for subagent (executor) processes
-const EXECUTOR_MAX_ITERATIONS: usize = 64;
+const EXECUTOR_MAX_ITERATIONS: usize = 512;
 
 const BG_DISPATCH_BASE_BATCH_DEFAULT: usize = 4;
 const BG_DISPATCH_MAX_BATCH_DEFAULT: usize = 8;
@@ -766,6 +770,70 @@ fn should_publish_subagent_task_result(
                 | aios_kernel::kernel::ProcessState::Stopped
         )
     )
+}
+
+fn decode_background_process_task_goal(
+    goal: &str,
+) -> Result<Option<crate::ai::tools::task_tools::OsTaskGoal>, String> {
+    if !is_encoded_task_goal(goal) {
+        return Ok(None);
+    }
+    decode_os_task_goal(goal).map(Some).ok_or_else(|| {
+        "failed to decode encoded subagent task metadata; refusing to fall back to the parent agent/model"
+            .to_string()
+    })
+}
+
+fn resolve_background_subagent_override<'a>(
+    agent_manifests: &'a [AgentManifest],
+    agent_override: Option<&str>,
+) -> Result<Option<&'a AgentManifest>, String> {
+    let Some(agent_name) = agent_override.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(agent) = agents::find_agent_by_name(agent_manifests, agent_name) else {
+        return Err(format!(
+            "Selected subagent '{}' could not be found in runtime manifests.",
+            agent_name
+        ));
+    };
+    if agent.disabled {
+        return Err(format!("Selected subagent '{}' is disabled.", agent_name));
+    }
+    Ok(Some(agent))
+}
+
+fn publish_background_task_failure(
+    os: &mut (dyn aios_kernel::kernel::Kernel + Send),
+    pid: u64,
+    result_channel_id: Option<u64>,
+    completion_futex_addr: Option<aios_kernel::primitives::FutexAddr>,
+    error: &str,
+) {
+    os.set_current_pid(Some(pid));
+    if let Some(result_channel_id) = result_channel_id {
+        let payload = serde_json::json!({
+            "status": "failed",
+            "output": "",
+            "error": error,
+        })
+        .to_string();
+        let _ = os.channel_send(
+            Some(pid),
+            aios_kernel::primitives::ChannelId(result_channel_id),
+            payload,
+        );
+        let _ = os.channel_close(Some(pid), aios_kernel::primitives::ChannelId(result_channel_id));
+        let _ = os.channel_release_named(
+            aios_kernel::primitives::ChannelId(result_channel_id),
+            "task_result.producer",
+        );
+    }
+    if let Some(addr) = completion_futex_addr {
+        let _ = os.futex_store(addr, 1);
+    }
+    record_scheduler_outcome(os, pid, DispatchOutcomeTag::Failed);
+    terminate_and_cleanup(os, pid, format!("Failed: {}", error), true);
 }
 
 fn apply_priority_handoff(proc: &mut aios_kernel::kernel::Process, outcome: DispatchOutcomeTag) {
@@ -1544,7 +1612,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     })?;
 
-    let current_model = models::initial_model(&cli);
+    // 优先使用挂起 session 保存的模型（如果有），否则使用 CLI/配置的默认模型
+    let current_model = if let Some(ref model) = startup_choice.model
+        && !model.is_empty()
+    {
+        model.clone()
+    } else {
+        models::initial_model(&cli)
+    };
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()?;
@@ -2876,6 +2951,25 @@ fn resolve_background_subagent_context(
     (effective_history, effective_skills)
 }
 
+fn build_background_process_question(
+    pid: u64,
+    raw_goal: &str,
+    decoded_task_goal_prompt: Option<&str>,
+    mailbox_messages: &[String],
+) -> String {
+    if !mailbox_messages.is_empty() {
+        let original_goal = decoded_task_goal_prompt.unwrap_or(raw_goal);
+        return format_wakeup_prompt(pid, original_goal, mailbox_messages);
+    }
+    if let Some(prompt) = decoded_task_goal_prompt {
+        return prompt.to_string();
+    }
+    format!(
+        "[Process {}] Goal: {}\nExecute this goal autonomously and provide the final result.",
+        pid, raw_goal
+    )
+}
+
 /// 构造进程被唤醒（mailbox 非空）时的 wake-up prompt。
 /// foreground / background 路径共享同一段 prompt，避免双份硬编码漂移。
 fn format_wakeup_prompt(pid: u64, goal: &str, messages: &[String]) -> String {
@@ -3136,24 +3230,38 @@ async fn run_loop(
             )> = Vec::new();
             for proc in &background_procs {
                 let pid = proc.pid;
-                let task_goal = decode_os_task_goal(&proc.goal);
-                let proc_question = if let Some(goal) = &task_goal {
-                    goal.prompt.clone()
-                } else if !proc.mailbox.is_empty() {
-                    let messages: Vec<String> = proc.mailbox.iter().cloned().collect();
-                    {
+                let task_goal = match decode_background_process_task_goal(&proc.goal) {
+                    Ok(goal) => goal,
+                    Err(err) => {
+                        let (result_channel_id, completion_futex_addr) =
+                            with_task_entry_by_pid(pid, |entry| {
+                                (Some(entry.result_channel_id), Some(entry.completion_futex_addr))
+                            })
+                            .unwrap_or((None, None));
                         let mut os = app.os.lock().unwrap();
-                        if let Some(actual) = os.get_process_mut(pid) {
-                            actual.mailbox.clear();
-                        }
+                        publish_background_task_failure(
+                            os.as_mut(),
+                            pid,
+                            result_channel_id,
+                            completion_futex_addr,
+                            &format!("Corrupted subagent task goal for pid {}: {}", pid, err),
+                        );
+                        continue;
                     }
-                    format_wakeup_prompt(pid, &proc.goal, &messages)
-                } else {
-                    format!(
-                        "[Process {}] Goal: {}\nExecute this goal autonomously and provide the final result.",
-                        pid, proc.goal
-                    )
                 };
+                let mailbox_messages: Vec<String> = proc.mailbox.iter().cloned().collect();
+                if !mailbox_messages.is_empty() {
+                    let mut os = app.os.lock().unwrap();
+                    if let Some(actual) = os.get_process_mut(pid) {
+                        actual.mailbox.clear();
+                    }
+                }
+                let proc_question = build_background_process_question(
+                    pid,
+                    &proc.goal,
+                    task_goal.as_ref().map(|goal| goal.prompt.as_str()),
+                    &mailbox_messages,
+                );
 
                 {
                     let mut os = app.os.lock().unwrap();
@@ -3199,10 +3307,24 @@ async fn run_loop(
                 crate::ai::types::clear_stream_cancel(&task_app);
                 let task_mcp = mcp_client.clone();
                 let task_os = app.os.clone();
-                if let Some(agent_name) = &agent_override
-                    && let Some(agent) = agents::find_agent_by_name(agent_manifests, agent_name)
-                    && !agent.disabled
-                {
+                let task_agent = match resolve_background_subagent_override(
+                    agent_manifests.as_slice(),
+                    agent_override.as_deref(),
+                ) {
+                    Ok(agent) => agent,
+                    Err(err) => {
+                        let mut os = app.os.lock().unwrap();
+                        publish_background_task_failure(
+                            os.as_mut(),
+                            pid,
+                            result_channel_id,
+                            completion_futex_addr,
+                            &err,
+                        );
+                        continue;
+                    }
+                };
+                if let Some(agent) = task_agent {
                     activate_primary_agent(&mut task_app, agent);
                 }
                 let next_model = model_override.unwrap_or_else(|| app.current_model.clone());
@@ -3668,18 +3790,19 @@ mod tests {
     use super::{
         DispatchOutcomeTag, ProcessDispatchMeta, SCHED_COOLDOWN_EPOCHS_DEFAULT,
         SCHEDULER_DISPATCH_META, background_execute_limit, background_pop_limit,
-        build_consolidation_merge_entries, build_note_search_retrieval_query,
+        build_background_process_question, build_consolidation_merge_entries,
+        build_note_search_retrieval_query, decode_background_process_task_goal,
         has_pending_foreground_process, maybe_auto_route_agent, one_shot_cli_mode,
-        read_recent_history, reset_scheduler_test_state, resolve_startup_session_choice,
-        resolve_startup_session_choice_with_selector, should_preload_mcp,
-        should_publish_subagent_task_result, should_resume_suspended_terminal_session,
-        update_dispatch_meta,
+        read_recent_history, resolve_background_subagent_override,
+        resolve_startup_session_choice, resolve_startup_session_choice_with_selector,
+        reset_scheduler_test_state, should_preload_mcp, should_publish_subagent_task_result,
+        should_resume_suspended_terminal_session, update_dispatch_meta,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
     use crate::ai::history::{Message, SuspendedSessionStore, append_history_messages};
     use crate::ai::skills::SkillManifest;
-    use crate::ai::tools::task_tools::InheritOptions;
+    use crate::ai::tools::task_tools::{InheritOptions, OsTaskGoal, encode_os_task_goal};
     use crate::ai::types::{AgentContext, App, AppConfig};
     use aios_kernel::kernel::{EventId, ProcessState, WaitPolicy, WaitReason};
     use aios_kernel::primitives::ResourceLimit;
@@ -3745,6 +3868,94 @@ mod tests {
             Some(&waiting)
         ));
         assert!(should_publish_subagent_task_result(true, "", None));
+    }
+
+    #[test]
+    fn encoded_background_task_goal_rejects_corrupt_payload() {
+        let encoded = encode_os_task_goal(&OsTaskGoal {
+            task_id: "task_123".to_string(),
+            result_channel_id: 7,
+            completion_futex_addr: 9,
+            description: "inspect".to_string(),
+            prompt: "look around".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max-alibaba".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+        })
+        .unwrap();
+        assert!(decode_background_process_task_goal(&encoded).unwrap().is_some());
+
+        let corrupted = encoded.replacen('{', "", 1);
+        let err = decode_background_process_task_goal(&corrupted).unwrap_err();
+        assert!(err.contains("failed to decode"));
+        assert!(err.contains("parent agent/model"));
+    }
+
+    #[test]
+    fn background_subagent_override_requires_known_enabled_agent() {
+        let mut explore = primary_agent(
+            "explore",
+            "Read-only codebase exploration agent",
+            &["find", "search"],
+        );
+        explore.mode = AgentMode::Subagent;
+        explore.disabled = true;
+        let build = primary_agent("build", "Default agent", &["implement"]);
+
+        let err =
+            resolve_background_subagent_override(&[build.clone(), explore.clone()], Some("explore"))
+                .unwrap_err();
+        assert!(err.contains("disabled"));
+
+        let err = resolve_background_subagent_override(&[build], Some("missing")).unwrap_err();
+        assert!(err.contains("could not be found"));
+    }
+
+    #[test]
+    fn background_task_wakeup_prompt_prefers_mailbox_and_decoded_goal() {
+        let encoded = encode_os_task_goal(&OsTaskGoal {
+            task_id: "task_123".to_string(),
+            result_channel_id: 7,
+            completion_futex_addr: 9,
+            description: "inspect".to_string(),
+            prompt: "inspect codebase state".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max-alibaba".to_string(),
+            is_model_auto_selected: false,
+            auto_model_fallback: None,
+            selection_explanation: "explicit override".to_string(),
+        })
+        .unwrap();
+        let mailbox = vec![
+            "[task_wait PARKED] ...".to_string(),
+            "[mailbox] task task_123 completed".to_string(),
+        ];
+
+        let question = build_background_process_question(
+            42,
+            &encoded,
+            Some("inspect codebase state"),
+            &mailbox,
+        );
+
+        assert!(question.contains("[Process 42 Woke Up]"));
+        assert!(question.contains("Original goal: inspect codebase state"));
+        assert!(question.contains("[mailbox] task task_123 completed"));
+        assert!(!question.contains("AIOS_SUBAGENT_TASK:"));
+    }
+
+    #[test]
+    fn background_task_without_mailbox_reuses_decoded_goal_prompt() {
+        let question = build_background_process_question(
+            7,
+            "AIOS_SUBAGENT_TASK:{\"ignored\":true}",
+            Some("search the repository"),
+            &[],
+        );
+
+        assert_eq!(question, "search the repository");
     }
 
     #[test]
@@ -3956,6 +4167,7 @@ mod tests {
                 "sess-123",
                 &suspended_history,
                 &reviewer.id,
+                "test-model",
             )
             .unwrap();
 
@@ -4009,6 +4221,7 @@ mod tests {
                 "sess-keep",
                 &suspended_history,
                 "default",
+                "test-model",
             )
             .unwrap();
 
@@ -4066,6 +4279,7 @@ mod tests {
                 "sess-keep",
                 &suspended_history,
                 "default",
+                "test-model",
             )
             .unwrap();
 
@@ -4120,10 +4334,22 @@ mod tests {
         let persona_store =
             crate::ai::persona::PersonaStore::for_tests_with_path(root.join("personas.json"));
         SuspendedSessionStore::new()
-            .save_for_terminal_key("terminal:term-select", "sess-1", &history_a, "default")
+            .save_for_terminal_key(
+                "terminal:term-select",
+                "sess-1",
+                &history_a,
+                "default",
+                "model-a",
+            )
             .unwrap();
         SuspendedSessionStore::new()
-            .save_for_terminal_key("terminal:term-select", "sess-2", &history_b, "default")
+            .save_for_terminal_key(
+                "terminal:term-select",
+                "sess-2",
+                &history_b,
+                "default",
+                "model-b",
+            )
             .unwrap();
 
         let choice = resolve_startup_session_choice_with_selector(
@@ -4175,10 +4401,22 @@ mod tests {
         let persona_store =
             crate::ai::persona::PersonaStore::for_tests_with_path(root.join("personas.json"));
         SuspendedSessionStore::new()
-            .save_for_terminal_key("terminal:term-stack", "sess-1", &history_a, "default")
+            .save_for_terminal_key(
+                "terminal:term-stack",
+                "sess-1",
+                &history_a,
+                "default",
+                "model-a",
+            )
             .unwrap();
         SuspendedSessionStore::new()
-            .save_for_terminal_key("terminal:term-stack", "sess-2", &history_b, "default")
+            .save_for_terminal_key(
+                "terminal:term-stack",
+                "sess-2",
+                &history_b,
+                "default",
+                "model-b",
+            )
             .unwrap();
 
         let choice = resolve_startup_session_choice_with_selector(

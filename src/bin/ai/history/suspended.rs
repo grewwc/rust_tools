@@ -18,6 +18,8 @@ pub(in crate::ai) struct SuspendedSessionEntry {
     pub(in crate::ai) history_file: PathBuf,
     pub(in crate::ai) persona_id: String,
     #[serde(default)]
+    pub(in crate::ai) model: Option<String>,
+    #[serde(default)]
     pub(in crate::ai) suspended_at: String,
 }
 
@@ -50,6 +52,7 @@ impl SuspendedSessionStore {
         session_id: &str,
         history_file: &Path,
         persona_id: &str,
+        model: &str,
     ) -> io::Result<SuspendedSessionEntry> {
         let key = current_terminal_key().ok_or_else(|| {
             io::Error::new(
@@ -57,7 +60,7 @@ impl SuspendedSessionStore {
                 "当前 terminal 不可识别，无法挂起；可改用 `a --session <id>` 手动回到该会话",
             )
         })?;
-        self.save_for_terminal_key(&key, session_id, history_file, persona_id)
+        self.save_for_terminal_key(&key, session_id, history_file, persona_id, model)
     }
 
     pub(in crate::ai) fn take_current_terminal(&self) -> io::Result<Option<SuspendedSessionEntry>> {
@@ -96,6 +99,7 @@ impl SuspendedSessionStore {
         session_id: &str,
         history_file: &Path,
         persona_id: &str,
+        model: &str,
     ) -> io::Result<SuspendedSessionEntry> {
         let terminal_key = terminal_key.trim();
         let session_id = session_id.trim();
@@ -130,6 +134,7 @@ impl SuspendedSessionStore {
             session_id: session_id.to_string(),
             history_file: history_file.to_path_buf(),
             persona_id: persona_id.to_string(),
+            model: Some(model.to_string()),
             suspended_at: Local::now().to_rfc3339(),
         };
         let mut entries = self.read_entries(terminal_key)?.unwrap_or_default();
@@ -431,7 +436,7 @@ mod tests {
         let store = SuspendedSessionStore::for_tests_with_root(root.clone());
         let history = root.join("history.sqlite");
         let entry = store
-            .save_for_terminal_key("tty:/dev/ttys001", "sess-1", &history, "default")
+            .save_for_terminal_key("tty:/dev/ttys001", "sess-1", &history, "default", "test-model")
             .unwrap();
         assert_eq!(entry.session_id, "sess-1");
 
@@ -467,10 +472,10 @@ mod tests {
         let history = root.join("history.sqlite");
         let other = root.join("other.sqlite");
         store
-            .save_for_terminal_key("tty:/dev/ttys002", "sess-1", &history, "default")
+            .save_for_terminal_key("tty:/dev/ttys002", "sess-1", &history, "default", "model-a")
             .unwrap();
         store
-            .save_for_terminal_key("tty:/dev/ttys002", "sess-2", &other, "reviewer")
+            .save_for_terminal_key("tty:/dev/ttys002", "sess-2", &other, "reviewer", "model-b")
             .unwrap();
 
         let entries = store
@@ -505,10 +510,22 @@ mod tests {
         let history = root.join("history.sqlite");
         let other = root.join("other.sqlite");
         store
-            .save_for_terminal_key("tty:/dev/ttys003", "sess-1", &history, "default")
+            .save_for_terminal_key(
+                "tty:/dev/ttys003",
+                "sess-1",
+                &history,
+                "default",
+                "model-a",
+            )
             .unwrap();
         store
-            .save_for_terminal_key("tty:/dev/ttys003", "sess-2", &other, "reviewer")
+            .save_for_terminal_key(
+                "tty:/dev/ttys003",
+                "sess-2",
+                &other,
+                "reviewer",
+                "model-b",
+            )
             .unwrap();
 
         let cleared = store.clear_for_terminal_key("tty:/dev/ttys003").unwrap();

@@ -2843,6 +2843,158 @@ pub(super) async fn summarize_history_via_model(
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// 用 LLM 为当前对话生成一个简短的概括性标题（不超过 20 字）。
+/// 供 session 列表和输入框顶部展示使用。
+pub(super) async fn generate_session_title_via_model(
+    app: &App,
+    messages: &[crate::ai::history::Message],
+) -> Option<String> {
+    use crate::ai::history::{is_system_like_role, value_to_string};
+
+    if messages.is_empty() {
+        return None;
+    }
+
+    // 只取最近的对话内容用于生成标题（最多 8000 字符）
+    let dialog: Vec<String> = messages
+        .iter()
+        .filter(|m| !is_system_like_role(&m.role))
+        .map(|m| {
+            let role = match m.role.as_str() {
+                "user" => "用户",
+                "assistant" => "助手",
+                "tool" => "工具",
+                _ => m.role.as_str(),
+            };
+            let content = value_to_string(&m.content);
+            format!("{role}: {content}")
+        })
+        .collect();
+
+    if dialog.is_empty() {
+        return None;
+    }
+
+    let mut transcript = dialog.join("\n");
+    if transcript.chars().count() > 8000 {
+        transcript = transcript.chars().take(8000).collect();
+    }
+
+    let system_prompt = "你是一个对话标题生成器。根据下面的对话内容，生成一个不超过20个字的简短标题，概括对话的核心主题。\n\
+要求：\n\
+- 只输出标题本身，不要引号，不要解释，不要前缀。\n\
+- 标题要具体、有信息量，不要太笼统。\n\
+- 优先用名词短语或动宾短语。\n\
+- 如果是编程相关，提到关键技术或文件名。";
+
+    let user_prompt = format!("对话内容：\n\n{transcript}\n\n请生成标题：");
+
+    let title_messages = vec![
+        crate::ai::history::Message {
+            role: "system".to_string(),
+            content: serde_json::Value::String(system_prompt.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+        crate::ai::history::Message {
+            role: "user".to_string(),
+            content: serde_json::Value::String(user_prompt),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    ];
+
+    let control_model = control_model_for_aux_tasks(app);
+    let request_body = build_request_body(
+        &control_model,
+        &title_messages,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+    );
+    let endpoint = endpoint_for_request_model(app, &control_model);
+    let api_key = api_key_for_request_model(app, &control_model);
+
+    eprintln!("[session-title] requesting title from model={control_model} endpoint={endpoint}");
+    let send_future =
+        apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+            .header("Content-Type", "application/json")
+            .json(&request_body)
+            .send();
+
+    let response = match tokio::time::timeout(std::time::Duration::from_secs(30), send_future).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
+            eprintln!("[session-title] request error: {e}");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("[session-title] timeout (30s) sending request, skipping");
+            return None;
+        }
+    };
+
+    let status = response.status();
+    if !status.is_success() {
+        eprintln!("[session-title] HTTP {status}, skipping");
+        return None;
+    }
+
+    let text = match tokio::time::timeout(std::time::Duration::from_secs(15), response.text()).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
+            eprintln!("[session-title] body read error: {e}");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("[session-title] timeout (15s) reading body, skipping");
+            return None;
+        }
+    };
+
+    let v: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[session-title] JSON parse error: {e}");
+            return None;
+        }
+    };
+    let content = match extract_router_content(&v) {
+        Some(c) => c,
+        None => {
+            eprintln!("[session-title] extract_router_content returned None");
+            return None;
+        }
+    };
+    let trimmed = content.trim().to_string();
+
+    // 清理：去掉引号、去掉换行、截断到 30 字符
+    let cleaned = trimmed
+        .trim_matches(|c: char| c == '"' || c == '「' || c == '」' || c == '\'' || c.is_whitespace())
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    // 截断到 30 字符（中文一个字算一个 char）
+    let result: String = if cleaned.chars().count() > 30 {
+        cleaned.chars().take(30).collect()
+    } else {
+        cleaned
+    };
+
+    Some(result)
+}
+
 /// AIOS bridge: take a parsed OpenAI-compatible `StreamUsage` (plus the
 /// requested model name and latency) and hand it to the kernel's LLM device
 /// for accounting. This is the single chokepoint where agent-land meets

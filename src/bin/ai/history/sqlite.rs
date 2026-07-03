@@ -573,6 +573,31 @@ pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Op
     Ok(Some(combined.join("\n---\n")))
 }
 
+/// 读取 LLM 生成的 session 标题（存储在 meta 表中，key='session_title'）。
+pub(in crate::ai) fn read_session_title_sqlite(path: &Path) -> io::Result<Option<String>> {
+    let conn = open_history_db(path)?;
+    let title: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='session_title' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    Ok(title.filter(|s| !s.trim().is_empty()))
+}
+
+/// 写入 LLM 生成的 session 标题到 meta 表。
+pub(in crate::ai) fn write_session_title_sqlite(path: &Path, title: &str) -> io::Result<()> {
+    let conn = open_history_db(path)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value, created_at) VALUES ('session_title', ?1, unixepoch())",
+        rusqlite::params![title],
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(())
+}
+
 fn decode_message_content(content: &str) -> Value {
     serde_json::from_str(content).unwrap_or_else(|_| Value::String(content.to_string()))
 }

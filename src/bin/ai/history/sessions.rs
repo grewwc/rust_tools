@@ -11,7 +11,7 @@ use rust_tools::cw::SkipMap;
 use super::{
     blob::{delete_assets_dir, delete_history_artifacts},
     markdown::messages_to_markdown,
-    sqlite::{read_all_messages_sqlite, read_first_user_prompt_sqlite},
+    sqlite::{read_all_messages_sqlite, read_first_user_prompt_sqlite, read_session_title_sqlite, write_session_title_sqlite},
     types::Message,
 };
 
@@ -86,7 +86,13 @@ impl SessionStore {
             let modified_local = metadata.modified().ok().map(DateTime::<Local>::from);
             let first_user_prompt = read_first_user_prompt_sqlite(&path).unwrap_or(None);
             let id = stem.to_string();
-            let summary = first_user_prompt.as_deref().map(generate_session_summary);
+            // 优先使用 LLM 生成的标题（存储在 meta 表中），fallback 到首条消息摘要
+            let generated_title = read_session_title_sqlite(&path).unwrap_or(None);
+            let summary = if let Some(ref title) = generated_title {
+                Some(title.clone())
+            } else {
+                first_user_prompt.as_deref().map(generate_session_summary)
+            };
             let timestamp = modified_local
                 .map(|dt| dt.timestamp_millis() as u64)
                 .unwrap_or(0);
@@ -148,6 +154,25 @@ impl SessionStore {
             return Ok(None);
         }
         read_first_user_prompt_sqlite(&path)
+    }
+
+    /// 读取 LLM 生成的 session 标题。
+    pub(in crate::ai) fn read_session_title(&self, session_id: &str) -> io::Result<Option<String>> {
+        let path = self.session_history_file(session_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_session_title_sqlite(&path)
+    }
+
+    /// 写入 LLM 生成的 session 标题。
+    pub(in crate::ai) fn write_session_title(&self, session_id: &str, title: &str) -> io::Result<()> {
+        write_session_title_sqlite(&self.session_history_file(session_id), title)
+    }
+
+    /// 检查是否已有 LLM 生成的标题。
+    pub(in crate::ai) fn has_generated_title(&self, session_id: &str) -> bool {
+        self.read_session_title(session_id).ok().flatten().is_some()
     }
 
     pub(in crate::ai) fn read_all_messages(&self, session_id: &str) -> io::Result<Vec<Message>> {
@@ -265,12 +290,20 @@ fn sanitize_session_id(session_id: &str) -> String {
 }
 
 /// 从第一条用户消息生成一个简洁的 session 标题/摘要。
-/// 处理 JSON 内容（如图片数据）、长文本截断、清理空白。
-fn generate_session_summary(first_prompt: &str) -> String {
+/// 处理 JSON 内容（如图片数据），提取关键信息并生成概括性标题。
+/// 与简单截断不同，此函数会：
+/// 1. 去掉 agent/命令前缀（如 "a "、"/"）
+/// 2. 提取第一句话（到句号/问号/感叹号/换行）
+/// 3. 去掉常见的冗余前缀（"帮我"、"请"、"我想"等）
+/// 4. 控制在合理长度
+pub(in crate::ai) fn generate_session_summary(first_prompt: &str) -> String {
     let text = first_prompt.trim();
     if text.is_empty() {
         return "(空会话)".to_string();
     }
+
+    // 去掉 agent 前缀（如 "a "、"a:"、"agent:"等）
+    let text = strip_agent_prefix(text);
 
     // 处理多条消息合并的情况（用 \n---\n 分隔）
     let messages: Vec<&str> = text.split("\n---\n").collect();
@@ -311,9 +344,10 @@ fn generate_session_summary(first_prompt: &str) -> String {
         }
         // 普通文本
         else {
-            let first_line = msg.lines().next().unwrap_or(msg).trim();
-            if !first_line.is_empty() {
-                all_text_parts.push(first_line.to_string());
+            // 提取第一句话（到句号/问号/感叹号/换行）
+            let first_sentence = extract_first_sentence(msg);
+            if !first_sentence.is_empty() {
+                all_text_parts.push(first_sentence);
             }
         }
     }
@@ -326,7 +360,9 @@ fn generate_session_summary(first_prompt: &str) -> String {
     }
 
     let combined = all_text_parts.join(" ");
-    truncate_summary(&combined, 60)
+    // 去掉常见的冗余前缀，使标题更简洁概括
+    let cleaned = strip_filler_prefixes(&combined);
+    truncate_summary(&cleaned, 40)
 }
 
 /// 从 JSON 数组中提取文本部分和图片标记。
@@ -362,4 +398,94 @@ fn truncate_summary(s: &str, max_len: usize) -> String {
     let mut out: String = s.chars().take(max_len).collect();
     out.push_str("…");
     out
+}
+
+/// 去掉 agent/命令前缀（如 "a "、"a:"、"agent:"、"/" 等）。
+fn strip_agent_prefix(text: &str) -> &str {
+    let t = text.trim_start();
+    // 匹配 "a "、"a:"、"a：" 等 agent 前缀
+    if let Some(rest) = t.strip_prefix("a ") {
+        return rest.trim_start();
+    }
+    if let Some(rest) = t.strip_prefix("a:") {
+        return rest.trim_start();
+    }
+    if let Some(rest) = t.strip_prefix("a：") {
+        return rest.trim_start();
+    }
+    // 匹配 "/" 开头的命令前缀（去掉命令名，保留参数）
+    if let Some(rest) = t.strip_prefix('/') {
+        // 跳过命令名（到第一个空白）
+        if let Some(space_pos) = rest.find(|c: char| c.is_whitespace()) {
+            return rest[space_pos..].trim_start();
+        }
+        // 只有命令名没有参数，返回空
+        return "";
+    }
+    t
+}
+
+/// 提取第一句话（到句号、问号、感叹号或换行）。
+fn extract_first_sentence(text: &str) -> String {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut end = text.len();
+    for (idx, (i, ch)) in chars.iter().enumerate() {
+        match ch {
+            // 中文句号/问号/感叹号/换行 → 直接截断
+            '。' | '？' | '！' | '\n' => {
+                end = *i;
+                break;
+            }
+            // 英文句号 → 需要判断是否是句子边界还是文件名/标识符的一部分
+            '.' => {
+                let prev_is_alnum = idx > 0 && chars[idx - 1].1.is_alphanumeric();
+                let next_is_alnum = idx + 1 < chars.len() && chars[idx + 1].1.is_alphanumeric();
+                // 如果前后都是字母/数字（如 a.rs、file.txt、v2.0），不视为句子边界
+                if prev_is_alnum && next_is_alnum {
+                    continue;
+                }
+                // 如果后面是空格或字符串结束，视为句子边界
+                let next_is_space = idx + 1 < chars.len() && chars[idx + 1].1.is_whitespace();
+                let is_last = idx + 1 >= chars.len();
+                if next_is_space || is_last {
+                    end = *i;
+                    break;
+                }
+            }
+            // 英文问号/感叹号 → 直接截断
+            '?' | '!' => {
+                end = *i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    text[..end].trim().to_string()
+}
+
+/// 去掉常见的冗余前缀，使标题更简洁概括。
+fn strip_filler_prefixes(text: &str) -> String {
+    let fillers = [
+        "帮我", "请帮我", "麻烦帮我", "能不能帮我", "可以帮我",
+        "请", "麻烦", "拜托", "求",
+        "我想", "我想要", "我需要", "希望", "希望能",
+        "想问一下", "问一下", "请问", "想知道",
+        "看一下", "帮我看一下", "帮看看", "看看",
+        "如何", "怎么", "怎样",
+    ];
+    let mut t = text.trim();
+    loop {
+        let mut stripped = false;
+        for filler in &fillers {
+            if let Some(rest) = t.strip_prefix(filler) {
+                t = rest.trim_start();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    t.to_string()
 }

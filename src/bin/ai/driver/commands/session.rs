@@ -231,6 +231,8 @@ pub fn try_handle_session_command(
                 &app.session_id,
                 app.config.history_file.as_path(),
                 &app.active_persona.id,
+                // 保存当前模型，恢复时使用
+                &app.current_model,
             ) {
                 Ok(entry) => {
                     println!("Suspended session: {}", entry.session_id);
@@ -718,10 +720,11 @@ mod tests {
                 &app.session_id,
                 &app.config.history_file,
                 &app.active_persona.id,
+                "test-model",
             )
             .unwrap();
         SuspendedSessionStore::new()
-            .save_for_terminal_key("terminal:term-bound", "sess-2", &other_history, "reviewer")
+            .save_for_terminal_key("terminal:term-bound", "sess-2", &other_history, "reviewer", "other-model")
             .unwrap();
 
         assert!(try_handle_session_command(&mut app, "/sessions bound").unwrap());

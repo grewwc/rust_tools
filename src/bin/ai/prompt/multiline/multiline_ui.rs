@@ -99,6 +99,7 @@ impl PromptEditor {
                             status_msg.as_deref(),
                             completion_panel.as_ref(),
                             &self.current_model_label,
+                            self.session_topic.as_deref(),
                         );
                     })
                     .map_err(|e| io::Error::other(e.to_string()))?;

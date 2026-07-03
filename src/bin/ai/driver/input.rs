@@ -1686,6 +1686,25 @@ fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
     if let Some(editor) = app.prompt_editor.as_mut() {
         crate::ai::prompt::completion::CommandCompleter::set_current_model_hint(&app.current_model);
         editor.set_current_model_label(crate::ai::models::model_display_label(&app.current_model));
+        // 设置 session 主题：从当前 session 的首条用户消息生成概括性标题。
+        // 若 session 尚无用户消息（新 session），显示 "new session"。
+        // SessionStore 需要 session 文件所在目录（而非 history 文件本身）。
+        let sessions_dir = app
+            .session_history_file
+            .parent()
+            .unwrap_or_else(|| app.session_history_file.as_path());
+        let store = crate::ai::history::SessionStore::new(sessions_dir);
+        // 优先使用 LLM 生成的标题，fallback 到首条消息摘要
+        let topic = match store.read_session_title(&app.session_id).ok().flatten() {
+            Some(t) => Some(t),
+            None => store
+                .first_user_prompt(&app.session_id)
+                .ok()
+                .flatten()
+                .as_deref()
+                .map(crate::ai::history::generate_session_summary),
+        };
+        editor.set_session_topic(topic);
         return editor.read_multi_line();
     }
 
