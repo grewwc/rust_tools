@@ -1800,6 +1800,44 @@ mod tests {
     }
 
     #[test]
+    fn probe_user_pasted_broken_table() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "120") };
+
+        // 用户粘贴的原文：表头顶格、分隔线与数据行缩进 4 空格，且多处单元格/闭合 `|`
+        // 被折到了下一物理行。逐字符流式喂入，观察最终屏幕。
+        let md = "\
+| 风险 | 原因 | 后果 | 
+    |---|---|---| 
+    | **320 token 太少** | 注释说\"避免 sophon 默认 1500 截断\"—但 320 比 1500 更小，**会加剧截断** | 几乎 100% 走\"路径一\"，用户看到\"暂不支持该问题\"的假阴性 
+     | 
+    | **`response_no_code_retry` 也用了 320** | 第一轮失败后，重试轮同样用 320 token，形成**双重截断** | 兜底路径也失效，前端必定收到 `execCode: null` 的 
+    错误 | 
+    | **`fail_retry_with_stream` 反而没改** | 这个重试方法（执行出错后的修复）仍用 Sophon 默认值 1500 | 如果代码提取成功但执行失败，重试反而可能成功 → 结 
+    果**不稳定**（有时成功有时失败，取决于代码是否刚好在 320 token 内闭合） | 
+";
+        let stream = render_full_stream(md, false);
+        let mut grid = VtGrid::new(120);
+        grid.feed(&stream);
+        let screen = grid.screen();
+        eprintln!("=== BROKEN (as pasted) ===\n{}\n=== END ===", screen.join("\n"));
+
+        // 对照：修正为规范 markdown（统一顶格、单元格不折行）后应渲染成完整表格。
+        let fixed = "\
+| 风险 | 原因 | 后果 |
+|---|---|---|
+| **320 token 太少** | 注释说避免 sophon 默认 1500 截断—但 320 比 1500 更小会加剧截断 | 几乎 100% 走路径一用户看到假阴性 |
+| **response_no_code_retry 也用了 320** | 第一轮失败后重试轮同样用 320 token 形成双重截断 | 兜底路径也失效前端必定收到 execCode null 的错误 |
+| **fail_retry_with_stream 反而没改** | 这个重试方法仍用 Sophon 默认值 1500 | 代码提取成功但执行失败重试反而可能成功结果不稳定 |
+";
+        let stream2 = render_full_stream(fixed, false);
+        let mut grid2 = VtGrid::new(120);
+        grid2.feed(&stream2);
+        let screen2 = grid2.screen();
+        eprintln!("=== FIXED ===\n{}\n=== END ===", screen2.join("\n"));
+    }
+
+    #[test]
     fn multi_column_table_with_overlong_code_span_stays_within_terminal_width() {
         let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "80") };

@@ -385,7 +385,7 @@ pub(super) fn render_table_top(indent: &str, widths: &[usize]) -> String {
     out.push_str(indent);
     out.push('┌');
     for (i, width) in widths.iter().enumerate() {
-        out.push_str(&"-".repeat(width + 2));
+        out.push_str(&"─".repeat(width + 2));
         out.push(if i + 1 == cols { '┐' } else { '┬' });
     }
     out.push('\n');
@@ -401,7 +401,7 @@ pub(super) fn render_table_mid(indent: &str, widths: &[usize]) -> String {
     out.push_str(indent);
     out.push('├');
     for (i, width) in widths.iter().enumerate() {
-        out.push_str(&"-".repeat(width + 2));
+        out.push_str(&"─".repeat(width + 2));
         out.push(if i + 1 == cols { '┤' } else { '┼' });
     }
     out.push('\n');
@@ -417,7 +417,7 @@ pub(super) fn render_table_bottom(indent: &str, widths: &[usize]) -> String {
     out.push_str(indent);
     out.push('└');
     for (i, width) in widths.iter().enumerate() {
-        out.push_str(&"-".repeat(width + 2));
+        out.push_str(&"─".repeat(width + 2));
         out.push(if i + 1 == cols { '┘' } else { '┴' });
     }
     out.push('\n');
@@ -622,5 +622,29 @@ mod tests {
 
         assert_eq!(p1, "🌧️天气     "); // padded 5 spaces
         assert_eq!(p2, "💧湿度    "); // padded 4 spaces
+    }
+
+    #[test]
+    fn table_borders_use_box_drawing_horizontal_fill_not_ascii_hyphen() {
+        let widths = vec![4usize, 6usize];
+        for border in [
+            render_table_top("", &widths),
+            render_table_mid("", &widths),
+            render_table_bottom("", &widths),
+        ] {
+            assert!(
+                border.contains('─'),
+                "border must fill with box-drawing '─': {border:?}"
+            );
+            assert!(
+                !border.contains('-'),
+                "border must not contain ASCII hyphen: {border:?}"
+            );
+        }
+
+        // 顶部边框应连成 box-drawing 线段（┌─...─┬─...─┐），确保观感为实线而非虚线。
+        let top = render_table_top("", &widths);
+        assert!(top.contains('┌') && top.contains('┬') && top.contains('┐'), "{top:?}");
+        assert!(top.contains("┌──────"), "{top:?}");
     }
 }

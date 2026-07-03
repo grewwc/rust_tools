@@ -51,6 +51,12 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 
     // 计算各区域高度
     let help_lines: u16 = 2;
+    // 模型/主题信息行：放在底部（help 行上方）而非 viewport 顶行。inline viewport 每次
+    // 重新锚定（resize、上方有新输出、退出清屏）时，**顶行**会被推入终端永久 scrollback
+    // 且退出时的 `Clear(FromCursorDown)` 无法擦除光标上方历史行——把这行画在顶部会像
+    // 装饰性横线一样反复堆叠（表现为 `model: ... | ...` 在恢复/重绘时多次出现）。底部区域
+    // 在光标下方，随每帧重绘、退出时被 FromCursorDown 清除，不会污染 scrollback。
+    let model_header_lines: u16 = if model_label.is_empty() { 0 } else { 1 };
     // 正文和底部帮助/状态栏之间预留 1 行视觉间距，但只在以下情况下启用：
     // 1. 没有补全面板（否则可用高度太紧张）；
     // 2. 正文末尾自己没有留空行。
@@ -71,6 +77,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             let panel_cap = inner
                 .height
                 .saturating_sub(help_lines)
+                .saturating_sub(model_header_lines)
                 .saturating_sub(spacer_lines)
                 .saturating_sub(min_textarea_lines);
             let panel = desired_panel.min(panel_cap).max(1.min(panel_cap));
@@ -78,6 +85,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                 .height
                 .saturating_sub(panel)
                 .saturating_sub(spacer_lines)
+                .saturating_sub(model_header_lines)
                 .saturating_sub(help_lines)
                 .max(min_textarea_lines);
             (textarea, panel)
@@ -86,6 +94,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             let textarea = inner
                 .height
                 .saturating_sub(spacer_lines)
+                .saturating_sub(model_header_lines)
                 .saturating_sub(help_lines)
                 .max(min_textarea_lines);
             (textarea, 0)
@@ -98,6 +107,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             Constraint::Length(textarea_lines),
             Constraint::Length(panel_lines),
             Constraint::Length(spacer_lines),
+            Constraint::Length(model_header_lines),
             Constraint::Length(help_lines),
         ])
         .split(inner);
@@ -108,10 +118,11 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // 清除 popup 区域，确保 resize 后旧边框/文本不残留
     f.render_widget(Clear, popup);
 
-    // 顶部模型提示行：让用户在输入时即可看到当前将使用的模型。
-    // 复用 popup 顶部的 1 行空白间距区域，不占用 textarea 的可用高度。
-    if !model_label.is_empty() {
-        let header_area = Rect::new(popup.x, popup.y, popup.width, 1);
+    // 底部模型/主题信息行：让用户在输入时看到当前模型与 session 主题。
+    // **必须画在底部专属 chunk（chunks[3]，help 行上方）而非 viewport 顶行**：顶行会在
+    // 每次 viewport 重新锚定时被推进 scrollback 反复堆叠（见上方 model_header_lines 注释）。
+    if model_header_lines > 0 {
+        let header_area = chunks[3];
         let mut spans = vec![
             Span::styled(" model: ", Style::default().fg(Color::Rgb(148, 163, 184))),
             Span::styled(
@@ -345,10 +356,10 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             ]),
         ]
     };
-    f.render_widget(Paragraph::new(help_lines), chunks[3]);
+    f.render_widget(Paragraph::new(help_lines), chunks[4]);
 
     if let Some(msg) = status_msg {
-        let c2 = chunks[3];
+        let c2 = chunks[4];
         if c2.height >= 2 && c2.width > 2 {
             let status_width = (c2.width - 2) as usize;
             let status_text = truncate_with_ellipsis(msg, status_width);
