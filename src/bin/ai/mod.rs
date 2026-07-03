@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 mod agents;
+mod background;
 mod cli;
 mod code_discovery_policy;
 mod config;
@@ -34,7 +35,19 @@ mod test_support {
     pub(super) static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 }
 
-pub use driver::run;
+/// 同步入口：在创建 tokio runtime 之前判断是否进入后台模式。
+/// 后台模式需要先 daemonize（fork）再构建 runtime——在多线程 runtime 启动后
+/// fork 会丢失 worker 线程导致死锁，因此必须在 runtime 之前完成 detach。
+pub fn entry() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = cli::parse_cli_args(std::env::args());
+    if cli.background {
+        return background::run_background(cli);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(driver::run_with_cli(cli))
+}
 
 mod ff_embed {
     pub mod cli {

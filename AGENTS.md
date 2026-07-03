@@ -97,7 +97,8 @@ Detailed references live under:
 
 ## Maintaining Instruction Docs
 
-When architecture or behavior changes:
+When code changes would make any statement in these files stale (layout,
+invariants, build/test commands, subsystem rules, on-demand guide references):
 
 1. Update the nearest scoped `AGENTS.md` for the touched subsystem.
 2. Keep this root file limited to repo-wide overview, layout, and invariants.

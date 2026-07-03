@@ -51,6 +51,10 @@ pub(super) struct ParsedCli {
     pub(super) migrate_legacy_knowledge: bool,
     /// --generate-completions
     pub(super) generate_completions: bool,
+    /// 是否以后台模式运行（`--background` / `-bg`）。
+    /// 后台模式下会 detach 终端、把完整输出写入当前目录下 `<sessionid>.log`，
+    /// 并提示 agent 在任务完成前不要停止。需要搭配位置参数（问题）使用。
+    pub(super) background: bool,
 }
 
 /// `a` 内部 "/" / ":" 命令列表，用于 shell 补全。
@@ -138,6 +142,12 @@ fn register_cli_flags(parser: &mut TermParser) {
     );
     parser.add_bool("note-search", false, NOTE_SEARCH_USAGE);
     parser.add_bool("generate-completions", false, GENERATE_COMPLETIONS_USAGE);
+    parser.add_bool(
+        "background",
+        false,
+        "run in background: detach from terminal, log output to <sessionid>.log, and keep running after the shell exits (alias: -bg)",
+    );
+    parser.alias("bg", "background");
     parser.alias("i", "interactive");
     parser.alias("new", "new-session");
     parser.alias("r", "resume");
@@ -299,6 +309,7 @@ impl Default for ParsedCli {
             consolidate_knowledge: false,
             migrate_legacy_knowledge: false,
             generate_completions: false,
+            background: false,
         }
     }
 }
@@ -363,6 +374,9 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     // 处理 generate-completions
     cli.generate_completions = parser.contains_flag_strict("generate-completions");
+
+    // 处理 background / -bg
+    cli.background = parser.contains_flag_strict("background");
 
     // 处理 list-tools
     cli.list_tools = parser.contains_flag_strict("list-tools");
@@ -450,6 +464,7 @@ pub(super) fn print_help() {
     println!("  -n, --note <text>        save text as memo to knowledge base and exit");
     println!("  -ns, --note-search       search memo category using the positional prompt");
     println!("  -i, --interactive        keep the session open for follow-up questions");
+    println!("  -bg, --background        run the prompt in background: detach from terminal, log to <sessionid>.log");
     println!();
     parser.print_defaults();
     println!();
@@ -894,6 +909,29 @@ mod tests {
         let cli = super::parse_cli_args(["a".to_string(), "--resume".to_string()].into_iter());
 
         assert!(cli.resume);
+    }
+
+    #[test]
+    fn parse_cli_args_reads_background_flag() {
+        // 长格式 --background
+        let cli = super::parse_cli_args(
+            ["a".to_string(), "fix the bug".to_string(), "--background".to_string()].into_iter(),
+        );
+        assert!(cli.background);
+        assert_eq!(cli.args, vec!["fix the bug".to_string()]);
+
+        // 短别名 -bg
+        let cli = super::parse_cli_args(
+            ["a".to_string(), "fix the bug".to_string(), "-bg".to_string()].into_iter(),
+        );
+        assert!(cli.background);
+        assert_eq!(cli.args, vec!["fix the bug".to_string()]);
+
+        // 不带 -bg 时默认 false
+        let cli = super::parse_cli_args(
+            ["a".to_string(), "fix the bug".to_string()].into_iter(),
+        );
+        assert!(!cli.background);
     }
 
     #[test]

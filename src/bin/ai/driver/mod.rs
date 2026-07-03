@@ -1516,9 +1516,18 @@ fn decision_log_persist_enabled() -> bool {
 ///   8. Load and activate agents
 ///   9. Enter run_loop
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = cli::parse_cli_args(std::env::args());
+    run_with_cli(cli).await
+}
+
+/// 用已解析好的 CLI 参数运行 AIOS。
+/// 供 background 模式等需要预先修改 cli（注入 session id / 持久化指令）的入口复用。
+pub(in crate::ai) async fn run_with_cli(
+    cli: cli::ParsedCli,
+) -> Result<(), Box<dyn std::error::Error>> {
     aios_kernel::kernel::register_current_pid_provider(current_task_pid);
 
-    let cli = cli::parse_cli_args(std::env::args());
+    // cli 已由调用方解析完毕（run() 或 background 入口），此处直接使用。
 
     // 纯本地命令（帮助、列工具/技能/agent）不调用 LLM，必须在 ensure_models_available /
     // load_config 之前处理：否则 models.json 为空或配置损坏时，连 `a --help` 都跑不起来，
