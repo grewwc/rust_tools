@@ -18,18 +18,29 @@ use crate::ai::{
 use super::{
     MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
     PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH, TurnOutcome, context_budget,
-    pre_request_llm_summary_threshold,
     persistence::persist_pending_turn_messages,
+    pre_request_llm_summary_threshold,
     types::{IterationExecution, ToolCallExecution},
 };
 
-/// 记录上次 pre-request LLM 摘要后的 messages 总字符数。
-/// 用于增长量守卫：摘要后上下文需增长 [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`]
-/// 以上才会再次触发，避免摘要失败（did_summarize=false）时每轮重复调用 LLM。
+/// 记录上次成功 pre-request LLM 摘要后的 messages 总字符数。
+/// 用于增长量守卫：成功摘要后上下文需增长 [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`]
+/// 以上才会再次触发。失败/no-op 不能写入该游标，否则会把后续真正需要的
+/// LLM compact 静默挡掉。
 /// 进程级 static——同一 agent 进程内全局生效，与 orchestrator 的 supervisor
 /// 冷却机制互补（orchestrator 管理工具调用间的压缩，此处管理请求前的兜底）。
 static LAST_PRE_REQUEST_LLM_SUMMARY_CHARS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+
+fn should_try_pre_request_llm_summary(after_chars: usize, llm_threshold: usize) -> bool {
+    if after_chars <= llm_threshold {
+        return false;
+    }
+    let last_summary_chars =
+        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.load(std::sync::atomic::Ordering::Relaxed);
+    let growth = after_chars.saturating_sub(last_summary_chars);
+    last_summary_chars == 0 || growth >= PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH
+}
 
 struct StreamingFlagGuard {
     flag: Arc<AtomicBool>,
@@ -301,11 +312,8 @@ async fn request_model_response(
     };
 
     let budget_report = context_budget::apply_pre_request_context_budget(app, messages);
-    if budget_report.rolled_back {
-        crate::ai::driver::print::print_tool_note_line(
-            "context-budget",
-            "compression rolled back because protected system/current-user context changed",
-        );
+    if let Some(reason) = budget_report.rollback_reason {
+        crate::ai::driver::print::print_tool_note_line("context-budget", reason.note());
     } else if budget_report.changed {
         crate::ai::driver::print::print_tool_note_line(
             "context-budget",
@@ -331,51 +339,41 @@ async fn request_model_response(
     // 阈值取 history_max_chars * 2（默认 240K），比 orchestrator 的 hard
     // threshold（*3.5 = 420K）更积极——后者只在工具调用间隙触发，此处覆盖
     // 每次请求前的最后检查。
-    // 增长量守卫：自上次 LLM 摘要后需增长 ≥ MIN_GROWTH 才再次触发，
-    // 避免摘要失败（无早期对话可摘要）时每轮重复调用 LLM。
+    // 增长量守卫：自上次成功 LLM 摘要后需增长 ≥ MIN_GROWTH 才再次触发。
+    // 失败/no-op 不写游标，避免把后续真正需要的 LLM compact 静默挡掉。
     let llm_threshold = pre_request_llm_summary_threshold(app.config.history_max_chars);
-    if budget_report.after_chars > llm_threshold {
-        let last_summary_chars = LAST_PRE_REQUEST_LLM_SUMMARY_CHARS
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let growth = budget_report.after_chars.saturating_sub(last_summary_chars);
-        if last_summary_chars == 0 || growth >= PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH {
+    if should_try_pre_request_llm_summary(budget_report.after_chars, llm_threshold) {
+        crate::ai::driver::print::print_tool_note_line(
+            "compress",
+            &format!(
+                "pre-request LLM summary: {} > {} chars, requesting summary…",
+                budget_report.after_chars, llm_threshold
+            ),
+        );
+        let drained: Vec<Message> = std::mem::take(messages);
+        let (after_msgs, llm_before, llm_after, did_summarize) =
+            crate::ai::history::mid_turn_llm_summarize(
+                app,
+                drained,
+                MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+                MID_TURN_LLM_SUMMARY_MAX_CHARS,
+            )
+            .await;
+        *messages = after_msgs;
+        if did_summarize {
             LAST_PRE_REQUEST_LLM_SUMMARY_CHARS
-                .store(budget_report.after_chars, std::sync::atomic::Ordering::Relaxed);
+                .store(llm_after, std::sync::atomic::Ordering::Relaxed);
             crate::ai::driver::print::print_tool_note_line(
                 "compress",
-                &format!(
-                    "pre-request LLM summary: {} > {} chars, requesting summary…",
-                    budget_report.after_chars, llm_threshold
-                ),
+                &format!("pre-request (llm): {} → {} chars", llm_before, llm_after),
             );
-            let drained: Vec<Message> = std::mem::take(messages);
-            let (after_msgs, llm_before, llm_after, did_summarize) =
-                crate::ai::history::mid_turn_llm_summarize(
-                    app,
-                    drained,
-                    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
-                    MID_TURN_LLM_SUMMARY_MAX_CHARS,
-                )
-                .await;
-            *messages = after_msgs;
-            if did_summarize {
-                LAST_PRE_REQUEST_LLM_SUMMARY_CHARS
-                    .store(llm_after, std::sync::atomic::Ordering::Relaxed);
-                crate::ai::driver::print::print_tool_note_line(
-                    "compress",
-                    &format!(
-                        "pre-request (llm): {} → {} chars",
-                        llm_before, llm_after
-                    ),
-                );
-            } else {
-                crate::ai::driver::print::print_tool_note_line(
-                    "compress",
-                    "pre-request LLM summary skipped \
-                     (no early dialog to summarize or call failed); \
-                     agent may hit context limit",
-                );
-            }
+        } else {
+            crate::ai::driver::print::print_tool_note_line(
+                "compress",
+                "pre-request LLM summary skipped \
+                 (no early dialog to summarize or call failed); \
+                 agent may hit context limit",
+            );
         }
     }
 
@@ -619,7 +617,10 @@ pub(super) async fn execute_turn_iteration(
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamingFlagGuard, request_interrupt_pending};
+    use super::{
+        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS, StreamingFlagGuard, request_interrupt_pending,
+        should_try_pre_request_llm_summary,
+    };
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, atomic::Ordering};
 
@@ -645,5 +646,28 @@ mod tests {
         cancel_stream.store(false, std::sync::atomic::Ordering::Relaxed);
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(request_interrupt_pending(&shutdown, &cancel_stream));
+    }
+
+    #[test]
+    fn failed_pre_request_llm_summary_does_not_poison_retry_cursor() {
+        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(0, Ordering::Relaxed);
+        let threshold = 240_000;
+        let after_chars = 240_457;
+
+        assert!(should_try_pre_request_llm_summary(after_chars, threshold));
+
+        // 失败/no-op 尝试不应写入 LAST_PRE_REQUEST_LLM_SUMMARY_CHARS；否则同样
+        // 超阈值的下一次请求会被 growth < 20K 静默挡掉。
+        assert_eq!(
+            LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.load(Ordering::Relaxed),
+            0
+        );
+        assert!(should_try_pre_request_llm_summary(after_chars, threshold));
+
+        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(230_000, Ordering::Relaxed);
+        assert!(!should_try_pre_request_llm_summary(after_chars, threshold));
+        assert!(should_try_pre_request_llm_summary(251_000, threshold));
+
+        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(0, Ordering::Relaxed);
     }
 }

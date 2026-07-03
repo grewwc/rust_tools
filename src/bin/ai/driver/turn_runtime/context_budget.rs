@@ -41,6 +41,25 @@ struct ContextSegment {
     chars: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ContextBudgetRollbackReason {
+    NoAdditionalSavings,
+    ProtectedContextChanged,
+}
+
+impl ContextBudgetRollbackReason {
+    pub(super) fn note(self) -> &'static str {
+        match self {
+            ContextBudgetRollbackReason::NoAdditionalSavings => {
+                "lossy compression rolled back because it did not improve beyond lossless prepass"
+            }
+            ContextBudgetRollbackReason::ProtectedContextChanged => {
+                "compression rolled back because protected system/current-user context changed"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub(super) struct ContextBudgetReport {
     pub(super) before_chars: usize,
@@ -48,6 +67,7 @@ pub(super) struct ContextBudgetReport {
     pub(super) target_chars: usize,
     pub(super) changed: bool,
     pub(super) rolled_back: bool,
+    pub(super) rollback_reason: Option<ContextBudgetRollbackReason>,
     pub(super) critical_segments: usize,
     pub(super) offload_only_segments: usize,
     pub(super) lossy_candidate_segments: usize,
@@ -128,11 +148,23 @@ pub(super) fn apply_pre_request_context_budget(
     report.after_chars = after_chars;
     report.changed = report.changed || after_chars < after_lossless_chars;
 
-    if after_chars >= after_lossless_chars || !protected_messages_preserved(messages, &protected) {
+    let protected_preserved = protected_messages_preserved(messages, &protected);
+    let rollback_reason = if !protected_preserved {
+        Some(ContextBudgetRollbackReason::ProtectedContextChanged)
+    } else if after_chars >= after_lossless_chars {
+        Some(ContextBudgetRollbackReason::NoAdditionalSavings)
+    } else {
+        None
+    };
+
+    if let Some(reason) = rollback_reason {
         *messages = original;
         report.after_chars = after_lossless_chars;
         report.changed = report.lossless_removed_messages > 0;
         report.rolled_back = after_chars < scan.total_chars;
+        if report.rolled_back {
+            report.rollback_reason = Some(reason);
+        }
     }
     report
 }
@@ -232,6 +264,7 @@ fn summarize_segments(
         target_chars,
         changed: false,
         rolled_back: false,
+        rollback_reason: None,
         critical_segments: segments
             .iter()
             .filter(|segment| segment.priority == SegmentPriority::Critical)

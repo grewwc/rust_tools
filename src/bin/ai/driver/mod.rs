@@ -2907,7 +2907,54 @@ async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std:
         return Ok(());
     }
 
-    match crate::ai::tools::service::memory::update_memo_entry(&target, &new_note) {
+    // 在保存前用 LLM 整理用户改写后的内容：只做格式/表达上的润色，
+    // 严格禁止改变语义。整理失败则回退到用户编辑的原文，不阻塞保存。
+    let final_note = {
+        let spinner = SearchSpinner::start("整理修改内容");
+        let mut tidy_err: Option<String> = None;
+        let tidy_messages = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "你是一个知识库整理助手。用户会给出一段刚刚在编辑器里改写完的笔记内容。\
+                            请帮用户整理这段内容，使其更清晰、更易读。\
+                            \n严格约束：\n\
+                            1. 绝对不要改变内容的语义、事实或意图，只能调整格式、排版、标点和表达方式；\n\
+                            2. 不要增删任何实质性信息；\n\
+                            3. 保留原文的语言（中文保持中文，英文保持英文）；\n\
+                            4. 只输出整理后的正文，不要输出任何解释、前后缀或 markdown 代码块标记。",
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": new_note.clone(),
+            }),
+        ];
+        let result =
+            match crate::ai::request::do_request_json(app, &model, &tidy_messages, false, false).await {
+                Ok(response) => response
+                    .pointer("/choices/0/message/content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+                Err(err) => {
+                    tidy_err = Some(format!("{}", err));
+                    None
+                }
+            };
+        spinner.stop();
+        if let Some(err) = tidy_err {
+            eprintln!("{NE} 模型整理失败（将保存原文）: {}", err);
+        }
+        match result {
+            Some(tidied) if tidied != new_note => {
+                println!("{NE} 已整理修改内容（语义未变）：");
+                println!("  {FIELD}整理后:{RST} {}", tidied.chars().take(500).collect::<String>());
+                tidied
+            }
+            _ => new_note,
+        }
+    };
+
+    match crate::ai::tools::service::memory::update_memo_entry(&target, &final_note) {
         Ok(_) => {
             println!("{NE} 已更新该条目。");
             Ok(())
