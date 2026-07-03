@@ -21,6 +21,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     textarea: &mut TextArea<'_>,
     status_msg: Option<&str>,
     completion_panel: Option<&CompletionPanel>,
+    model_label: &str,
 ) {
     let area = f.area();
 
@@ -105,6 +106,22 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 
     // 清除 popup 区域，确保 resize 后旧边框/文本不残留
     f.render_widget(Clear, popup);
+
+    // 顶部模型提示行：让用户在输入时即可看到当前将使用的模型。
+    // 复用 popup 顶部的 1 行空白间距区域，不占用 textarea 的可用高度。
+    if !model_label.is_empty() {
+        let header_area = Rect::new(popup.x, popup.y, popup.width, 1);
+        let header = Line::from(vec![
+            Span::styled(" model: ", Style::default().fg(Color::Rgb(148, 163, 184))),
+            Span::styled(
+                model_label,
+                Style::default()
+                    .fg(Color::Rgb(134, 194, 166))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(header), header_area);
+    }
 
     // 注意：这里**故意不画** `Borders::TOP/BOTTOM` 全宽横线。
     // 在 ratatui inline viewport 下，每当 viewport 重新锚定（resize 突发、

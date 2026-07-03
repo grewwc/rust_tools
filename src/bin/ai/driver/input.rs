@@ -9,6 +9,7 @@ use regex::RegexBuilder;
 use crate::ai::history;
 use crate::ai::types::{App, QuestionContext};
 use crate::clipboardw::string_content;
+use crate::ai::theme::{ACCENT_MUTED, ACCENT_SUCCESS, RESET};
 
 use crate::ai::{files, prompt::trim_trailing_newline};
 use crate::pdfw::{PdfParseOptions, parse_pdf};
@@ -1684,11 +1685,18 @@ mod tests {
 fn prompt_user(app: &mut App) -> io::Result<Option<String>> {
     if let Some(editor) = app.prompt_editor.as_mut() {
         crate::ai::prompt::completion::CommandCompleter::set_current_model_hint(&app.current_model);
+        editor.set_current_model_label(crate::ai::models::model_display_label(&app.current_model));
         return editor.read_multi_line();
     }
 
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
+
+    // 无 TUI 编辑器时，在输入提示前打印一行简短的模型提示。
+    println!(
+        "  {ACCENT_MUTED}[{ACCENT_SUCCESS}{}{ACCENT_MUTED}]{RESET}",
+        crate::ai::models::model_display_label(&app.current_model),
+    );
 
     let mut lines = Vec::new();
     loop {

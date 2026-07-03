@@ -25,6 +25,8 @@ pub(super) struct PromptEditor {
     session_image_dir: PathBuf,
     /// 下一次 `read_multi_line` 的预填文本（用于编辑已有内容场景，读取后清空）。
     pending_prefill: Option<String>,
+    /// 当前模型显示名，用于在输入框顶部展示模型提示（输入时即可看到将使用的模型）。
+    current_model_label: String,
 }
 
 impl PromptEditor {
@@ -48,12 +50,18 @@ impl PromptEditor {
             history_path,
             session_image_dir,
             pending_prefill: None,
+            current_model_label: String::new(),
         }
     }
 
     /// 设置下一次多行输入的预填内容（编辑已有 memo 时用，读取一次后自动清空）。
     pub(super) fn set_prefill(&mut self, text: impl Into<String>) {
         self.pending_prefill = Some(text.into());
+    }
+
+    /// 设置当前模型显示名，下一次 `read_multi_line` 会在输入框顶部展示。
+    pub(super) fn set_current_model_label(&mut self, label: impl Into<String>) {
+        self.current_model_label = label.into();
     }
 
     pub(super) fn read_multi_line(&mut self) -> io::Result<Option<String>> {

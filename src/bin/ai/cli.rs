@@ -530,10 +530,6 @@ pub(super) fn print_help() {
     println!("  Debug:");
     println!("    /hang                    state dump (debug)");
     println!();
-    println!("Model Encryption:");
-    println!("  models.json 中 api_key / name / endpoint 支持 enc: 前缀加密");
-    println!("  加密: secret encrypt \"<明文>\" => enc:<base64>，粘贴到 models.json");
-    println!("  示例: secret encrypt \"your-api-key\"");
 }
 /// 生成 shell 补全脚本并打印到 stdout。
 /// `shell` 取值 "bash" | "zsh" | "fish"，不区分大小写。
