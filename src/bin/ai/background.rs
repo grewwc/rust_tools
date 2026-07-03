@@ -25,10 +25,12 @@ pub(super) fn run_background(mut cli: ParsedCli) -> Result<(), Box<dyn std::erro
         );
     }
 
-    // 强制新建 session：用一个确定的 session id 同时作为日志文件名，
-    // run_with_cli 内部 resolve_startup_session_choice 会直接采用这个 cli.session。
-    let session_id = uuid::Uuid::new_v4().to_string();
-    cli.session = Some(session_id.clone());
+    // 如果用户已传 --session <id> 则复用（resume 场景），否则生成新 UUID。
+    // 这个 session id 同时作为日志文件名，run_with_cli 内部也会直接采用 cli.session。
+    let session_id = cli
+        .session
+        .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone();
     // 把"不要中途停止"指令拼到用户问题里（next_question 会 join cli.args）。
     cli.args.push(BACKGROUND_DIRECTIVE.to_string());
 
