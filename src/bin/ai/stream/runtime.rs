@@ -39,7 +39,7 @@ const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
 /// 比 idle 超时更长，因为某些模型冷启动或排队需要时间。
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 90;
 /// terminal 下 thinking 可见窗口的默认高度。只影响展示，不影响 reasoning 累积。
-const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 8;
+const DEFAULT_THINKING_MAX_VISIBLE_LINES: usize = 4;
 
 pub(super) async fn stream_response(
     app: &mut App,

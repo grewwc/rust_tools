@@ -25,7 +25,7 @@ pub fn print_assistant_banner_with_app_and_skill(app: Option<&App>, skill_name: 
     );
 }
 
-const TOOL_OUTPUT_BLOCK_MAX_VISIBLE: usize = 8;
+const TOOL_OUTPUT_BLOCK_MAX_VISIBLE: usize = 4;
 
 pub fn print_tool_output_block(content: &str) {
     let lines: Vec<String> = format_tool_output_block(content);

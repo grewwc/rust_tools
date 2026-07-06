@@ -257,7 +257,7 @@ struct TerminalToolObserver<'a> {
     tty_fold: TtyToolOutputFoldState,
 }
 
-const TOOL_OUTPUT_FOLD_MAX_VISIBLE: usize = 8;
+const TOOL_OUTPUT_FOLD_MAX_VISIBLE: usize = 4;
 
 #[derive(Debug, Default)]
 struct TtyToolOutputFoldState {
