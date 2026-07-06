@@ -6,8 +6,7 @@ use regex::Regex;
 
 use crate::ai::{
     config_schema::AiConfig,
-    driver::print::format_section_header,
-    models, provider,
+    models,
     request::StreamChunk,
     theme::{ACCENT_MUTED, ACCENT_RULE, DIM, RESET},
     types::{App, StreamOutcome, StreamResult, ToolCall, take_stream_cancelled},
@@ -55,7 +54,7 @@ pub(super) async fn stream_response(
         &models::endpoint_for_model(&app.current_model, &app.config.endpoint),
     );
 
-    if should_show_opencode_waiting_hint(app) {
+    if should_show_waiting_hint(app) {
         print_waiting_hint(&mut state)?;
     }
 
@@ -126,26 +125,19 @@ pub(super) async fn stream_response(
     finalize_stream_response(app, &markers, state)
 }
 
-fn should_show_opencode_waiting_hint(app: &App) -> bool {
-    if !io::stdout().is_terminal() {
-        return false;
-    }
-    let provider = models::model_provider(&app.current_model);
-    let endpoint = models::endpoint_for_model(&app.current_model, &app.config.endpoint);
-    provider::adapter_for(provider, &endpoint).shows_waiting_hint()
+/// 是否在终端显示「等待模型输出」的紧凑状态提示。
+/// 对所有 TTY 会话生效。println! 保证提示立即可见，
+/// 收到首个可见 chunk 时用 \x1b[1A\r\x1b[2K 清掉，不残留额外行。
+fn should_show_waiting_hint(app: &App) -> bool {
+    io::stdout().is_terminal() && !app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn print_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
     if state.render.waiting_hint_active {
         return Ok(());
     }
-    println!(
-        "{}",
-        format_section_header(
-            "stream",
-            Some("waiting for first visible chunk from provider...")
-        )
-    );
+    // 独立行等待提示：println! 保证终端立即显示，首个 chunk 到达时用 \x1b[1A\r\x1b[2K 清掉
+    println!("⠋ waiting…");
     io::stdout().flush()?;
     state.render.waiting_hint_active = true;
     Ok(())
@@ -180,14 +172,9 @@ fn upgrade_waiting_hint_for_buffering(state: &mut StreamProcessingState) -> io::
     if !state.render.waiting_hint_active || state.render.waiting_hint_buffering {
         return Ok(());
     }
+    // 光标上移+清行后重新 println!，保证 buffering 状态在独立行可见
     print!("\x1b[1A\r\x1b[2K");
-    println!(
-        "{}",
-        format_section_header(
-            "stream",
-            Some("provider is alive but buffering visible output; text may arrive in one block...")
-        )
-    );
+    println!("⠋ buffering…");
     io::stdout().flush()?;
     state.render.waiting_hint_buffering = true;
     Ok(())
@@ -197,6 +184,7 @@ fn clear_waiting_hint(state: &mut StreamProcessingState) -> io::Result<()> {
     if !state.render.waiting_hint_active {
         return Ok(());
     }
+    // 光标上移一行 + \r + 清行：擦掉 println! 输出的独立提示行，让内容在原位输出
     print!("\x1b[1A\r\x1b[2K");
     io::stdout().flush()?;
     state.render.waiting_hint_active = false;
@@ -215,6 +203,7 @@ fn immediate_cancel_result(
 /// `╰─ done thinking` 收口，否则半截 `╭─ thinking` 窗口会被留在屏幕上，下一轮重试
 /// 的 fresh state 会在其下方再画一个新 header——累积成「重复 header + 大段空白」。
 fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
+    let _ = clear_waiting_hint(state);
     if state.render.thinking_fold.active {
         let _ = finalize_thinking_fold(state);
     } else if state.content.thinking_open {
@@ -2415,7 +2404,7 @@ fn process_stream_payload(
 
     if chunk.choices.is_empty() {
         state.content.empty_choice_chunks += 1;
-        if should_show_opencode_waiting_hint(app) && state.content.empty_choice_chunks >= 3 {
+        if should_show_waiting_hint(app) && state.content.empty_choice_chunks >= 3 {
             let _ = upgrade_waiting_hint_for_buffering(state);
         }
         return Ok(false);

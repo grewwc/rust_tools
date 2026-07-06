@@ -239,6 +239,7 @@ fn split_table_segments(s: &str) -> Vec<String> {
     let mut chars = s.chars().peekable();
     let mut in_code = false;
     let mut in_math = false;
+    let mut in_strike = false;
     let mut escaped = false;
 
     while let Some(ch) = chars.next() {
@@ -251,6 +252,15 @@ fn split_table_segments(s: &str) -> Vec<String> {
         if ch == '\\' {
             current.push(ch);
             escaped = true;
+            continue;
+        }
+
+        // ~~strikethrough~~：跟踪状态，避免 ~~ 内的 | 被误识别为列分隔符
+        if ch == '~' && !in_code && !in_math && chars.peek().copied() == Some('~') {
+            chars.next();
+            in_strike = !in_strike;
+            current.push('~');
+            current.push('~');
             continue;
         }
 
@@ -274,7 +284,7 @@ fn split_table_segments(s: &str) -> Vec<String> {
             continue;
         }
 
-        if ch == '|' && !in_code && !in_math {
+        if ch == '|' && !in_code && !in_math && !in_strike {
             segments.push(std::mem::take(&mut current));
             continue;
         }
@@ -559,6 +569,19 @@ mod tests {
         assert_eq!(
             parse_table_row(r#"| `a|b` | x \| y | $p|q$ |"#),
             vec!["`a|b`", r#"x \| y"#, "$p|q$"]
+        );
+    }
+
+    #[test]
+    fn parse_table_row_ignores_pipes_inside_strikethrough() {
+        assert_eq!(
+            parse_table_row(r#"| ~~a|b~~ | normal |"#),
+            vec!["~~a|b~~", "normal"]
+        );
+        // 多个 ~~ 段 + 普通文本混合
+        assert_eq!(
+            parse_table_row(r#"| ~~x|y~~ | z | ~~w|v~~ |"#),
+            vec!["~~x|y~~", "z", "~~w|v~~"]
         );
     }
 
