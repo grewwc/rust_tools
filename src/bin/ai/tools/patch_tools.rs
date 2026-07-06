@@ -238,7 +238,23 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
 
     ensure_patch_target_matches(path, &envelope.target_path)?;
     let normalized_patch = match envelope.op {
-        PatchEnvelopeOp::Update => envelope.body_lines.join("\n"),
+        PatchEnvelopeOp::Update => {
+            // *** Begin Patch 的 Update 格式允许省略 @@ hunk header（Cursor/Aider 风格），
+            // 模型常只写 +/−/space 前缀行而不带 @@。如果 body 中没有任何 @@ header，
+            // 合成一个，让 parse_unified_hunks 能识别。old_start=1 让匹配从文件开头
+            // 尝试，失败后自动回退到全文件模糊搜索。
+            let has_hunk_header = envelope.body_lines.iter().any(|l| l.starts_with("@@"));
+            if has_hunk_header {
+                envelope.body_lines.join("\n")
+            } else {
+                let mut normalized = String::from("@@ -1,0 +1,0 @@");
+                if !envelope.body_lines.is_empty() {
+                    normalized.push('\n');
+                    normalized.push_str(&envelope.body_lines.join("\n"));
+                }
+                normalized
+            }
+        }
         PatchEnvelopeOp::Add => {
             if path.exists() {
                 return Err(
@@ -681,6 +697,31 @@ mod tests {
         let _ = fs::remove_dir_all(base);
     }
 
+    #[test]
+    fn execute_apply_patch_update_envelope_without_hunk_header() {
+        // *** Begin Patch 的 Update 格式省略 @@ header（Cursor/Aider 风格），
+        // 只写 +/−/space 前缀行。模型经常这样写，不应报 "no hunks found"。
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("update_nohdr").with_extension("txt");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "path": path.to_string_lossy(),
+                "patch": format!(
+                    "*** Begin Patch\n*** Update File: {}\n alpha\n-beta\n+changed\n*** End Patch\n",
+                    path.display()
+                )
+            });
+            execute_apply_patch(&args)
+                .expect("apply_patch should accept Update envelope without @@ header");
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\ngamma\n");
+        let _ = fs::remove_dir_all(base);
+    }
     #[test]
     fn apply_unified_patch_multi_hunk_with_stale_line_numbers() {
         // 两个 hunk，标称行号都是 1（过时），但各自的目标在文件中唯一且按顺序排列。

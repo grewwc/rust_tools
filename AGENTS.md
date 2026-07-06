@@ -65,6 +65,20 @@ Do not run the full workspace `cargo check`, `cargo test`, or other verification
 7. Avoid brittle hardcoded string rules when a typed, structural, or data-driven path exists.
 8. Keep tests close to the changed module where practical; serial tests should use `test_support::ENV_LOCK`.
 9. Do not modify code unrelated to the current task. Only change files and logic directly tied to the requirement; avoid opportunistic refactors, formatting, or "improvements" to unrelated code. If touching unrelated code is truly necessary, explain the reason first and get confirmation.
+10. Prefer data-driven or registration-based extensibility over hardcoded
+    `if`/`else` chains keyed on names. When behavior varies per entity (tool,
+    agent, skill), declare it as config on that entity (e.g. an `inventory`
+    submission) and query it through a single lookup — the caller stays
+    generic. This keeps additions to a single point instead of sprinkling
+    branches across call sites. When introducing such config, preserve
+    backward compatibility: prefer an additive, optional registration over
+    modifying a shared struct that has many existing initializers.
+11. After changing code, always check whether the nearest scoped `AGENTS.md`
+    (and this root file, if repo-wide layout/invariants changed) needs a
+    matching update. This is a mandatory final step of every task, not an
+    optional afterthought. If a change touches module layout, build/test
+    commands, invariants, subsystem rules, or on-demand guide references,
+    update the corresponding `AGENTS.md` in the same task — do not defer it.
 
 ## High-Value Pitfalls
 
@@ -97,14 +111,24 @@ Detailed references live under:
 
 ## Maintaining Instruction Docs
 
-When code changes would make any statement in these files stale (layout,
-invariants, build/test commands, subsystem rules, on-demand guide references),
-or when tests need to be updated to match new behavior:
+This section is a **mandatory checklist**, not background reading. Run through
+it at the end of every code-changing task, after verification passes and before
+reporting completion.
 
-1. Update the nearest scoped `AGENTS.md` for the touched subsystem.
-2. Sync the corresponding tests and any affected `AGENTS.md` files (including those under submodules) so docs and tests stay consistent with the implementation.
-3. Keep this root file limited to repo-wide overview, layout, and invariants.
-4. Put long subsystem explanations in `docs/agent-guides/*.md`, then reference them from the nearest scoped `AGENTS.md`.
-5. Keep the top-level layout and build/test commands accurate.
+**Step 1 — Identify what changed.** For each file you touched, note whether the
+change affects any of: module layout, build/test commands, invariants,
+subsystem rules, or on-demand guide references. If none apply, stop here.
+
+**Step 2 — Update the nearest scoped `AGENTS.md`.** Add or revise the local
+rule that now describes the changed behavior. Keep it short; move long
+explanations to `docs/agent-guides/*.md` and reference them from the scoped
+file.
+
+**Step 3 — Sync this root file if needed.** If the change touches repo-wide
+layout, build/test commands, or invariants (rules in this file), update this
+file too.
+
+**Step 4 — Sync tests.** If the change alters documented behavior, update the
+corresponding tests so docs and tests stay consistent with the implementation.
 
 > Principle: root instructions should stay concise, scoped instructions should stay local, and long references should be loaded only when the task actually needs them.

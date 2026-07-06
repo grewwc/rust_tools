@@ -2,6 +2,7 @@ use serde_json::Value;
 
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
+use crate::ai::tools::common::{ToolDisplayConfig, ToolDisplayRegistration};
 
 fn params_plan() -> Value {
     serde_json::json!({
@@ -105,6 +106,15 @@ inventory::submit!(ToolRegistration {
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
+});
+
+// plan 工具的输出对用户有较高可见性价值，开启结果回显。
+inventory::submit!(ToolDisplayRegistration {
+    name: "plan",
+    config: ToolDisplayConfig {
+        print_args: false,
+        print_result: true,
+    },
 });
 
 #[cfg(test)]

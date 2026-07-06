@@ -52,6 +52,46 @@ pub(crate) struct ToolStreamingRegistration {
 
 inventory::collect!(ToolStreamingRegistration);
 
+/// 终端回显配置：控制工具调用时是否把入参 / 输出结果打印到终端。
+/// 默认全部为 `false`，仅对用户可见性价值较高的工具（如 `plan`）显式开启。
+/// 通过独立的 `ToolDisplayRegistration` 提交，不改动现有 `ToolSpec`，
+/// 保持向后兼容。
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct ToolDisplayConfig {
+    /// 是否在终端打印工具调用入参。
+    pub(crate) print_args: bool,
+    /// 是否在终端打印工具输出结果。
+    pub(crate) print_result: bool,
+}
+
+/// 可选的终端回显注册：只给需要回显入参/结果的 builtin tool 使用。
+/// 未注册的工具沿用默认配置（均不回显），不需要改动现有 `ToolSpec`。
+pub(crate) struct ToolDisplayRegistration {
+    pub(crate) name: &'static str,
+    pub(crate) config: ToolDisplayConfig,
+}
+
+inventory::collect!(ToolDisplayRegistration);
+
+static TOOL_DISPLAY_INDEX: LazyLock<SkipMap<String, ToolDisplayConfig>> = LazyLock::new(|| {
+    let mut index: SkipMap<String, ToolDisplayConfig> = SkipMap::default();
+    for reg in inventory::iter::<ToolDisplayRegistration> {
+        let name = reg.name.to_string();
+        if !index.contains_key(&name) {
+            index.insert(name, reg.config);
+        }
+    }
+    index
+});
+
+/// 查询某个工具的终端回显配置；未注册的工具返回全 `false` 默认值。
+pub(crate) fn tool_display_config(name: &str) -> ToolDisplayConfig {
+    TOOL_DISPLAY_INDEX
+        .get_ref(&name.to_string())
+        .copied()
+        .unwrap_or_default()
+}
+
 const TOOL_CANCEL_FUTEX_ENV: &str = "__ai_tool_cancel_futex_addr";
 
 pub(crate) fn ensure_process_tool_cancel_futex(

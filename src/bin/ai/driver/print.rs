@@ -230,13 +230,42 @@ pub(in crate::ai) fn format_tool_note_line(label: &str, value: &str) -> String {
     )
 }
 
-#[allow(dead_code)] // 终端不再打印工具输出，仅测试引用
 pub(in crate::ai) fn format_tool_output_block(content: &str) -> Vec<String> {
     if content.trim().is_empty() {
         return vec![format_tool_note_line("result", "no output")];
     }
 
     content.lines().map(format_tool_output_line).collect()
+}
+
+/// 若工具配置了 `print_args`，把调用入参回显到终端；否则为空操作。
+/// 是否回显由工具自身提交的 `ToolDisplayConfig` 决定，调用方无需感知具体工具名。
+pub(in crate::ai) fn echo_tool_args(tool_name: &str, args_json: &str) {
+    let config = crate::ai::tools::registry::common::tool_display_config(tool_name);
+    if !config.print_args {
+        return;
+    }
+    let trimmed = args_json.trim();
+    // 尝试美化打印 JSON；解析失败时回退到原始文本。
+    let pretty = serde_json::from_str::<serde_json::Value>(trimmed)
+        .ok()
+        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+        .unwrap_or_else(|| trimmed.to_string());
+    for line in format_tool_output_block(&pretty) {
+        println!("{line}");
+    }
+}
+
+/// 若工具配置了 `print_result`，把输出内容回显到终端；否则为空操作。
+/// 是否回显由工具自身提交的 `ToolDisplayConfig` 决定，调用方无需感知具体工具名。
+pub(in crate::ai) fn echo_tool_output(tool_name: &str, content: &str) {
+    let config = crate::ai::tools::registry::common::tool_display_config(tool_name);
+    if !config.print_result {
+        return;
+    }
+    for line in format_tool_output_block(content) {
+        println!("{line}");
+    }
 }
 
 pub(in crate::ai) fn format_ocr_summary_block(extraction: &OcrExtraction) -> Vec<String> {

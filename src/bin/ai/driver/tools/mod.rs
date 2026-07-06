@@ -22,8 +22,9 @@ use std::time::{Duration as StdDuration, Instant, UNIX_EPOCH};
 
 use crate::ai::{
     driver::print::{
-        format_tool_status_cached, format_tool_status_completed, format_tool_status_deferred,
-        format_tool_status_failed, format_tool_status_running, format_tool_status_skipped,
+        echo_tool_args, echo_tool_output, format_tool_status_cached, format_tool_status_completed,
+        format_tool_status_deferred, format_tool_status_failed, format_tool_status_running,
+        format_tool_status_skipped,
     },
     mcp::{McpClient, SharedMcpClient},
     tools as builtin_tools,
@@ -1946,6 +1947,16 @@ fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
         print!("\r\x1b[2K{}\n", format_tool_status_completed(name));
     } else {
         print!("\r\x1b[2K{}\n", format_tool_status_failed(name));
+    }
+
+    // 部分工具的输出对用户有较高可见性价值，额外把其内容回显到终端。
+    // 具体哪些工具回显由工具自身提交的 `ToolDisplayConfig` 控制，
+    // 这里不感知具体工具名，便于后续扩展。
+    if run_result.ok || run_result.cached {
+        echo_tool_args(name, &tool_call.function.arguments);
+    }
+    if run_result.ok {
+        echo_tool_output(name, &run_result.tool_result.content);
     }
 }
 
