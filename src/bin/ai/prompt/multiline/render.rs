@@ -447,12 +447,12 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
         return String::new();
     }
 
-    let total = UnicodeWidthStr::width(text);
+    let total = UnicodeWidthStr::width_cjk(text);
     if total <= max_width {
         return text.to_string();
     }
 
-    let ellipsis_w = UnicodeWidthStr::width("...");
+    let ellipsis_w = UnicodeWidthStr::width_cjk("...");
     if max_width <= ellipsis_w {
         return " ".repeat(max_width);
     }
@@ -463,7 +463,7 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
 
     for ch in text.chars() {
         // 对于 unicode-width 返回 0 的字符，保守估计为宽度 1
-        let ch_w = UnicodeWidthChar::width(ch).unwrap_or(1);
+        let ch_w = UnicodeWidthChar::width_cjk(ch).unwrap_or(1);
 
         if width + ch_w > target {
             break;
@@ -482,7 +482,7 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     fn display_width(s: &str) -> usize {
-        UnicodeWidthStr::width(s)
+        UnicodeWidthStr::width_cjk(s)
     }
 
     #[test]

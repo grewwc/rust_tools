@@ -333,7 +333,7 @@ impl MarkdownStreamRenderer {
             return Ok(());
         }
 
-        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        let ch_width = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
 
         if !self.line_preview_emitted {
             out.write_all(
@@ -955,7 +955,7 @@ pub(in crate::ai) fn clamp_line_to_terminal_row_with_reserve(
     let cols = raw_terminal_cols().saturating_sub(reserve_cols).max(1);
     let mut total = 0usize;
     for ch in line.chars() {
-        total += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        total += unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
     }
     if total <= cols {
         return line.to_string();
@@ -966,7 +966,7 @@ pub(in crate::ai) fn clamp_line_to_terminal_row_with_reserve(
     let mut out = String::with_capacity(line.len());
     let mut col = 0usize;
     for ch in line.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        let w = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
         if col + w > budget {
             break;
         }
@@ -988,7 +988,7 @@ pub(in crate::ai) fn live_preview_cursor_rows(line: &str) -> usize {
     let mut lines = 1usize;
     let mut col = 0usize;
     for ch in visible.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        let w = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
         if col > 0 && col + w > cols {
             lines += 1;
             col = w;
@@ -1080,7 +1080,7 @@ fn wrap_code_block_text(text: &str, content_width: usize) -> Vec<String> {
     let mut current_width = 0usize;
 
     for ch in text.chars() {
-        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        let ch_width = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
         if current_width > 0 && current_width + ch_width > content_width {
             lines.push(std::mem::take(&mut current));
             current_width = 0;
@@ -1601,7 +1601,7 @@ mod tests {
         }
 
         fn put(&mut self, ch: char) {
-            let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            let w = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
             if w == 0 {
                 return;
             }

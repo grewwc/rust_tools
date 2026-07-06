@@ -1121,7 +1121,11 @@ fn process_internal_tool_calls(
             InternalToolCallStreamEvent::End => {
                 if state.render.current_printing_index == Some(state.content.internal_tool_call_idx)
                 {
-                    println!("\x1b[0m");
+                    // 流式阶段不再打印工具名/参数（open_tool_call_line 与
+                    // write_tool_call_arguments_stream 均为 no-op），因此这里只需
+                    // 复位颜色即可。绝不能用 println!——那会在「done thinking」与后续
+                    // 输出之间凭空插入一行空行（外部 delta 工具路径本就不打这行）。
+                    print!("\x1b[0m");
                     state.render.current_printing_index = None;
                     let _ = io::stdout().flush();
                 }
@@ -2382,6 +2386,9 @@ fn process_stream_payload(
         match normalize::parse_stream_payload(adapter_kind, payload, event_type) {
             super::state::ParsedStreamPayload::Ignore => return Ok(false),
             super::state::ParsedStreamPayload::Done => return Ok(true),
+            super::state::ParsedStreamPayload::Error(msg) => {
+                return Err(format!("provider stream error: {msg}").into());
+            }
             super::state::ParsedStreamPayload::Chunk(chunk) => {
                 (chunk, StreamEventMergeMode::Append)
             }

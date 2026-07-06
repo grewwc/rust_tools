@@ -262,37 +262,6 @@ fn lines_match(actual: &str, expected: &str) -> bool {
     actual == expected || actual.trim_end() == expected.trim_end()
 }
 
-fn find_hunk_offset(orig_lines: &[String], hunk: &UnifiedHunk) -> Option<usize> {
-    let context_and_remove: Vec<&str> = hunk
-        .lines
-        .iter()
-        .filter_map(|line| match line {
-            UnifiedLine::Context(s) | UnifiedLine::Remove(s) => Some(s.as_str()),
-            _ => None,
-        })
-        .collect();
-    if context_and_remove.is_empty() {
-        return None;
-    }
-    let nominal = hunk.old_start.saturating_sub(1);
-    let search_radius = 50usize;
-    let start = nominal.saturating_sub(search_radius);
-    let end = (nominal + search_radius).min(orig_lines.len());
-    for candidate in start..end {
-        if candidate + context_and_remove.len() > orig_lines.len() {
-            continue;
-        }
-        let all_match = context_and_remove
-            .iter()
-            .enumerate()
-            .all(|(i, expected)| lines_match(&orig_lines[candidate + i], expected));
-        if all_match {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 /// 提取 hunk 的 context+remove 行（即"期望在原文件中匹配到"的行）。
 fn hunk_expected_lines(hunk: &UnifiedHunk) -> Vec<&str> {
     hunk.lines
@@ -440,14 +409,16 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
                     if forward.len() > 5 { ", ..." } else { "" }
                 ));
             }
-            match find_hunk_offset(&orig_lines, hunk) {
-                Some(offset) => {
-                    if offset < cursor {
-                        return Err("hunks out of order".to_string());
-                    }
-                    offset
-                }
-                None => return Err(describe_context_mismatch(&orig_lines, hunk)),
+            // forward 已经过滤了 p >= cursor，所以这里不会有 "hunks out of order"。
+            // 之前回退到 find_hunk_offset（±50 窗口）会在唯一匹配超出窗口时误报
+            // context mismatch；直接使用 forward 的唯一结果即可。
+            if let Some(&offset) = forward.first() {
+                offset
+            } else if !positions.is_empty() {
+                // 所有匹配都在 cursor 之前——hunk 顺序错误
+                return Err("hunks out of order".to_string());
+            } else {
+                return Err(describe_context_mismatch(&orig_lines, hunk));
             }
         };
 
@@ -607,6 +578,32 @@ mod tests {
     }
 
     #[test]
+    fn apply_unified_patch_finds_unique_match_beyond_search_radius() {
+        // 文件有 150 行，唯一匹配在第 130 行（0-based 129）。
+        // hunk 头标称第 1 行，nominal=0，find_hunk_offset 的 ±50 窗口搜索 [0,50)，
+        // 找不到 129 处的匹配。但 all_hunk_match_positions 能在全文件找到唯一匹配。
+        // 此前代码忽略 forward.len()==1 的结果，回退到 find_hunk_offset 导致误报
+        // "context mismatch"。
+        let mut lines: Vec<String> = (0..130).map(|i| format!("filler{i}")).collect();
+        lines.push("unique_target".to_string());
+        lines.push("after_target".to_string());
+        lines.extend((0..18).map(|i| format!("tail{i}")));
+        let original = lines.join("\n") + "\n";
+
+        let patch = "@@ -1,2 +1,2 @@\n-unique_target\n+changed\n+after_target\n";
+        // 故意用错误的标称行号(-1) 模拟 stale line numbers
+        let result = apply_unified_patch(&original, patch).unwrap_or_else(|err| {
+            panic!("apply_patch should find unique match beyond ±50 radius, but got: {err}")
+        });
+        assert!(result.contains("changed"), "result should contain changed line: {result}");
+        assert!(result.contains("after_target"), "result should preserve after_target: {result}");
+        assert!(
+            !result.contains("unique_target"),
+            "result should not contain old line: {result}"
+        );
+    }
+
+    #[test]
     fn execute_apply_patch_accepts_path_alias_and_begin_patch_envelope() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
         let path = make_temp_path("update").with_extension("txt");
@@ -627,6 +624,43 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\n");
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn apply_unified_patch_multi_hunk_with_stale_line_numbers() {
+        // 两个 hunk，标称行号都是 1（过时），但各自的目标在文件中唯一且按顺序排列。
+        // 验证 cursor 推进 + forward 过滤在多 hunk 场景下正常工作，不会把第二个
+        // hunk 误匹配到第一个 hunk 的目标位置。
+        let mut lines: Vec<String> = (0..60).map(|i| format!("filler{i}")).collect();
+        lines.push("target_a".to_string());
+        lines.push("after_a".to_string());
+        lines.extend((0..60).map(|i| format!("mid{i}")));
+        lines.push("target_b".to_string());
+        lines.push("after_b".to_string());
+        let original = lines.join("\n") + "\n";
+
+        let patch = "\
+@@ -1,2 +1,2 @@
+-target_a
++changed_a
++after_a
+@@ -1,2 +1,2 @@
+-target_b
++changed_b
++after_b
+";
+        let result = apply_unified_patch(&original, patch).unwrap_or_else(|err| {
+            panic!("multi-hunk patch should succeed with stale line numbers, but got: {err}")
+        });
+        assert!(result.contains("changed_a"), "missing changed_a: {result}");
+        assert!(result.contains("changed_b"), "missing changed_b: {result}");
+        assert!(result.contains("after_a"), "missing after_a: {result}");
+        assert!(result.contains("after_b"), "missing after_b: {result}");
+        assert!(!result.contains("target_a"), "should not contain target_a: {result}");
+        assert!(!result.contains("target_b"), "should not contain target_b: {result}");
+        // 中间填充行应保持不变
+        assert!(result.contains("filler0"), "filler0 should remain: {result}");
+        assert!(result.contains("mid0"), "mid0 should remain: {result}");
     }
 
     #[test]

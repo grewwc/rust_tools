@@ -611,7 +611,7 @@ fn generate_bash(
     }
     // 子命令映射（与 zsh 分支保持一致）。当第一个参数是内部命令时，
     // 第二个参数补全对应的子命令而不是顶层 flags/命令列表。
-    println!("  local usage_sub='today 7d 30d all daily trend days help'");
+    println!("  local usage_sub='today 7d 30d all daily trend days models help'");
     println!("  local checkpoint_sub='save list rollback delete help'");
     println!(
         "  local history_sub='full user assistant tool system grep rewind undo export copy help 3 6 10 20'"
@@ -705,7 +705,7 @@ fn generate_zsh(
     );
     println!();
     // 子命令映射
-    println!("  local -a _a_usage_subcmds=(today 7d 30d all daily trend days help)");
+    println!("  local -a _a_usage_subcmds=(today 7d 30d all daily trend days models help)");
     println!("  local -a _a_checkpoint_subcmds=(save list rollback delete help)");
     println!(
         "  local -a _a_history_subcmds=(full user assistant tool system grep rewind undo export copy help 3 6 10 20)"

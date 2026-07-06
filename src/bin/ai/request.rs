@@ -2228,11 +2228,6 @@ pub(super) fn print_info(app: &App, model: &str) {
         Some(e) => e.as_str(),
         None => "auto",
     };
-    // 使用 println! 避免手动 flush 的权限问题
-    println!(
-        "{ACCENT_MUTED}[{ACCENT_SUCCESS}{}{ACCENT_MUTED} (search: {ACCENT_WARN}{search}{ACCENT_MUTED}, effort: {ACCENT_PRIMARY}{effort_label}{ACCENT_MUTED})]{RESET}",
-        models::model_display_label(model),
-    );
 
     // 打印当前 session 摘要
     let store = SessionStore::new(&app.config.history_file);
@@ -2247,9 +2242,21 @@ pub(super) fn print_info(app: &App, model: &str) {
                 .flatten()
                 .map(|p| generate_session_summary(&p))
         });
-    if let Some(s) = summary.filter(|s| !s.is_empty()) {
-        println!("{ACCENT_MUTED}[session: {ACCENT_SUCCESS}{}{ACCENT_MUTED}]{RESET}", s);
-    }
+    let session_part = summary
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            format!(
+                "{ACCENT_MUTED} · {ACCENT_WARN}{}{RESET}",
+                s
+            )
+        })
+        .unwrap_or_default();
+
+    // 使用 println! 避免手动 flush 的权限问题；模型与 session 合并为一行。
+    println!(
+        "{ACCENT_MUTED}[{ACCENT_SUCCESS}{}{ACCENT_MUTED} (search: {ACCENT_WARN}{search}{ACCENT_MUTED}, effort: {ACCENT_PRIMARY}{effort_label}{ACCENT_MUTED}){session_part}{ACCENT_MUTED}]{RESET}",
+        models::model_display_label(model),
+    );
 }
 
 fn build_request_body<'a>(

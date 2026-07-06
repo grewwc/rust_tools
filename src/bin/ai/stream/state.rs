@@ -206,6 +206,8 @@ pub(in crate::ai) enum ParsedStreamPayload {
     Done,
     Chunk(StreamChunk),
     SnapshotChunk(StreamChunk),
+    /// provider 在流中途返回了 error 对象或 error 事件，携带可读错误信息。
+    Error(String),
 }
 
 #[derive(Default)]

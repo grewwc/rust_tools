@@ -43,6 +43,14 @@ pub(super) fn parse_stream_payload(
     if payload == "[DONE]" {
         return ParsedStreamPayload::Done;
     }
+
+    // 在调用 adapter 解析之前，先检测 provider 在流中途返回的 error 对象。
+    // StreamChunk 所有字段都是 #[serde(default)]，{"error":{...}} 会被静默反序列化
+    // 为空 chunk 然后丢弃，导致用户看到空响应且无任何错误提示。
+    if let Some(err_msg) = extract_provider_error(payload) {
+        return ParsedStreamPayload::Error(err_msg);
+    }
+
     if let Some(event_type) = event_type {
         if let Some(parsed) = parse_sse_event_payload(event_type, payload) {
             return parsed;
@@ -69,6 +77,36 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     }
     if event_type == "response.completed" {
         return Some(ParsedStreamPayload::Ignore);
+    }
+    // OpenAI Responses API 错误/不完整事件——必须显式处理，否则会 fallthrough
+    // 到 parse_provider_chunk 被当成空 chunk 静默丢弃。
+    if event_type == "response.failed" {
+        let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+        let msg = value
+            .get("response")
+            .and_then(|r| r.get("error"))
+            .and_then(extract_error_message)
+            .unwrap_or_else(|| "response failed (no error detail)".to_string());
+        return Some(ParsedStreamPayload::Error(msg));
+    }
+    if event_type == "response.incomplete" {
+        let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+        let reason = value
+            .get("response")
+            .and_then(|r| r.get("incomplete_details"))
+            .and_then(|d| d.get("reason"))
+            .and_then(|r| r.as_str())
+            .unwrap_or("unknown");
+        return Some(ParsedStreamPayload::Error(format!(
+            "response incomplete: {reason}"
+        )));
+    }
+    // 部分 provider 用 SSE event: error 携带错误对象
+    if event_type == "error" {
+        let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+        let msg = extract_error_message(&value)
+            .unwrap_or_else(|| "stream error event (no detail)".to_string());
+        return Some(ParsedStreamPayload::Error(msg));
     }
 
     let value: serde_json::Value = serde_json::from_str(payload).ok()?;
@@ -356,6 +394,56 @@ fn extract_event_text(value: &serde_json::Value, preferred_keys: &[&str]) -> Str
     }
 }
 
+/// 检测 payload JSON 顶层的 `error` 字段，提取可读错误信息。
+///
+/// StreamChunk 所有字段都是 `#[serde(default)]` 且无 `deny_unknown_fields`，
+/// 所以 `{"error":{...}}` 会被静默反序列化为空 chunk。此函数在解析前拦截
+/// 这类 provider 错误对象，返回可读错误信息。
+fn extract_provider_error(payload: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(payload).ok()?;
+    let error = value.get("error")?;
+    extract_error_message(error)
+}
+
+/// 从一个 JSON value（通常是 `error` 字段的值）提取可读错误信息。
+///
+/// 支持的格式：
+/// - `{"message": "..."}` / `{"message": "...", "type": "..."}` / `{"code": "...", "message": "..."}`
+/// - `"string message"`
+/// - 其他对象：回退到 JSON 序列化
+fn extract_error_message(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.clone())
+            }
+        }
+        serde_json::Value::Object(obj) => {
+            let msg = obj.get("message").and_then(|v| v.as_str());
+            let typ = obj
+                .get("type")
+                .and_then(|v| v.as_str())
+                .or_else(|| obj.get("code").and_then(|v| v.as_str()));
+            match (msg, typ) {
+                (Some(m), Some(t)) => Some(format!("{t}: {m}")),
+                (Some(m), None) => Some(m.to_string()),
+                (None, Some(t)) => Some(t.to_string()),
+                (None, None) => {
+                    let s = value.to_string();
+                    if s == "{}" {
+                        None
+                    } else {
+                        Some(s)
+                    }
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 fn try_parse_stream_chunk(payload: &str) -> Option<StreamChunk> {
     let mut chunk = serde_json::from_str::<StreamChunk>(payload).ok()?;
     chunk.merge_reasoning();
@@ -619,6 +707,98 @@ mod tests {
         ) {
             ParsedStreamPayload::Ignore => {}
             _ => panic!("response.completed should not terminate stream before EOF"),
+        }
+    }
+
+    #[test]
+    fn error_object_in_payload_is_not_silently_swallowed() {
+        // provider 在流中途返回 {"error":{"message":"rate limited","type":"server_error"}}
+        // 此前 StreamChunk 的 #[serde(default)] 会把它反序列化为空 chunk 静默丢弃。
+        let payload = r#"{"error":{"message":"rate limited","type":"server_error"}}"#;
+        match parse_stream_payload(StreamProviderAdapterKind::OpenAi, payload, None) {
+            ParsedStreamPayload::Error(msg) => {
+                assert!(msg.contains("rate limited"), "msg was: {msg}");
+                assert!(msg.contains("server_error"), "msg was: {msg}");
+            }
+            _ => panic!("expected Error for provider error object, got something else"),
+        }
+    }
+
+    #[test]
+    fn error_object_with_string_value_is_extracted() {
+        let payload = r#"{"error":"internal server error"}"#;
+        match parse_stream_payload(StreamProviderAdapterKind::OpenAi, payload, None) {
+            ParsedStreamPayload::Error(msg) => {
+                assert_eq!(msg, "internal server error");
+            }
+            _ => panic!("expected Error for string error"),
+        }
+    }
+
+    #[test]
+    fn error_object_with_code_and_message_is_extracted() {
+        let payload = r#"{"error":{"code":"429","message":"Too Many Requests"}}"#;
+        match parse_stream_payload(StreamProviderAdapterKind::Alibaba, payload, None) {
+            ParsedStreamPayload::Error(msg) => {
+                assert!(msg.contains("429"), "msg was: {msg}");
+                assert!(msg.contains("Too Many Requests"), "msg was: {msg}");
+            }
+            _ => panic!("expected Error for code+message error"),
+        }
+    }
+
+    #[test]
+    fn normal_chunk_without_error_field_still_parses() {
+        // 确保正常 chunk 不被 extract_provider_error 误判
+        let payload = r#"{"choices":[{"delta":{"content":"hello"}}]}"#;
+        match parse_stream_payload(StreamProviderAdapterKind::OpenAi, payload, None) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.content, "hello");
+            }
+            _ => panic!("normal chunk should parse as Chunk, not Error"),
+        }
+    }
+
+    #[test]
+    fn usage_only_chunk_without_error_field_still_ignored() {
+        // OpenAI 尾包：choices 为空但带 usage，不应被误判为 error
+        let payload = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
+        match parse_stream_payload(StreamProviderAdapterKind::OpenAi, payload, None) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                assert!(chunk.choices.is_empty());
+                assert!(chunk.usage.is_some());
+            }
+            _ => panic!("usage-only chunk should parse as Chunk, not Error"),
+        }
+    }
+
+    #[test]
+    fn response_failed_event_surfaces_error() {
+        let payload = r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"model overloaded"}}}"#;
+        match parse_stream_payload(
+            StreamProviderAdapterKind::OpenAi,
+            payload,
+            Some("response.failed"),
+        ) {
+            ParsedStreamPayload::Error(msg) => {
+                assert!(msg.contains("model overloaded"), "msg was: {msg}");
+            }
+            _ => panic!("response.failed should surface as Error"),
+        }
+    }
+
+    #[test]
+    fn response_incomplete_event_surfaces_reason() {
+        let payload = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#;
+        match parse_stream_payload(
+            StreamProviderAdapterKind::OpenAi,
+            payload,
+            Some("response.incomplete"),
+        ) {
+            ParsedStreamPayload::Error(msg) => {
+                assert!(msg.contains("max_output_tokens"), "msg was: {msg}");
+            }
+            _ => panic!("response.incomplete should surface as Error"),
         }
     }
 }

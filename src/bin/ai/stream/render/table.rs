@@ -37,7 +37,7 @@ pub(super) fn table_preview_height(line: &str) -> usize {
     let mut current_col = 0usize;
 
     for ch in visible.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        let w = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
         if current_col > 0 && current_col + w > cols {
             lines += 1;
             current_col = w;
@@ -329,7 +329,7 @@ pub(super) fn compute_table_widths(
     }
 
     let term_cols = terminal_width();
-    let indent_w = unicode_width::UnicodeWidthStr::width(indent);
+    let indent_w = unicode_width::UnicodeWidthStr::width_cjk(indent);
     let max_total = term_cols.saturating_sub(indent_w).max(20);
     let avail = max_total.saturating_sub(3 * cols + 1);
     if avail == 0 {

@@ -270,7 +270,7 @@ fn strip_inline_md_markers(s: &str) -> String {
 pub(super) fn visible_width(s: &str) -> usize {
     strip_inline_md_markers(s)
         .chars()
-        .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
+        .map(|c| unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0))
         .sum()
 }
 
@@ -393,7 +393,7 @@ pub(super) fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
         }
 
         let ch = rest.chars().next().unwrap();
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        let w = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
         if cur_w > 0 && cur_w + w > width {
             trim_trailing_spaces(&mut cur, &mut cur_w);
             close_line(&mut lines, &mut cur, bold, italic);
@@ -445,7 +445,7 @@ fn wrap_plain_visible_text(s: &str, width: usize) -> Vec<String> {
     let mut cur = String::new();
     let mut cur_w = 0usize;
     for ch in s.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        let w = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
         if cur_w > 0 && cur_w + w > width {
             out.push(std::mem::take(&mut cur));
             cur_w = 0;

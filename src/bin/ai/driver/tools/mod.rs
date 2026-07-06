@@ -2143,10 +2143,6 @@ fn execute_tool_calls_inner(
     let mut tool_results = Vec::with_capacity(tool_calls.len());
     let mut cached_hits = Vec::with_capacity(tool_calls.len());
 
-    // 在第一个工具状态前输出一个换行与 assistant 文本分开；
-    // 各工具状态行不再自带前导 \n，避免连续工具之间出现空行。
-    print!("\n");
-
     let mut idx = 0usize;
     while idx < tool_calls.len() {
         if crate::ai::tools::registry::common::is_tool_cancel_requested() {
