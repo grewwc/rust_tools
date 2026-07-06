@@ -122,6 +122,14 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
                 _ => return Err(format!("invalid hunk line: {}", l)),
             }
         }
+        // 剥离尾部空 context 行：hunk body 循环只在遇到下一个 `@@` 才结束，所以
+        // hunk 之间或 patch 末尾的空行（分隔/尾随）会被吞进当前 hunk，变成末尾的
+        // 空 context 行，凭空要求原文件对应位置也有空行，导致本能匹配的 patch
+        // 报 context mismatch。真实的中间空行后面必然还有本 hunk 的内容行，不会被
+        // 误删；只有纯尾随的空 context 行才在此剥除。
+        while matches!(lines.last(), Some(UnifiedLine::Context(s)) if s.is_empty()) {
+            lines.pop();
+        }
         hunks.push(UnifiedHunk { old_start, lines });
     }
     if hunks.is_empty() {
@@ -617,6 +625,39 @@ mod tests {
             .expect("empty CRLF context line should be tolerated");
         // 原文件是 CRLF，但 patch 的 Add 行已剥离 \r，输出统一为 LF。
         assert_eq!(result, "foo\n\nbaz\n");
+    }
+
+    #[test]
+    fn parse_unified_hunks_strips_trailing_blank_context_between_hunks() {
+        // 两个 hunk 之间用空行分隔（可读性写法）。之前空行会被吞进 hunk1 变成末尾
+        // 的空 context 行，凭空要求原文件对应位置有空行 → context mismatch。
+        // 修复后应剥离该尾随空行，hunk1 只保留 remove+add 两行。
+        let patch = "@@ -1,1 +1,1 @@\n-a\n+b\n\n@@ -5,1 +5,1 @@\n-c\n+d\n";
+        let hunks = parse_unified_hunks(patch).expect("blank separator should be tolerated");
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].lines.len(), 2, "hunk1 should not swallow the blank separator");
+    }
+
+    #[test]
+    fn apply_unified_patch_multi_hunk_separated_by_blank_line() {
+        // 复现真实高频场景：多 hunk 之间空行分隔。修复前 hunk1 末尾多一条空 context
+        // 行，导致整个 patch 报 context mismatch。
+        let original = "a\nkeep1\nkeep2\nkeep3\nc\n";
+        let patch = "@@ -1,1 +1,1 @@\n-a\n+b\n\n@@ -5,1 +5,1 @@\n-c\n+d\n";
+        let result = apply_unified_patch(original, patch)
+            .expect("multi-hunk patch separated by a blank line should apply");
+        assert_eq!(result, "b\nkeep1\nkeep2\nkeep3\nd\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_tolerates_trailing_blank_line_in_patch() {
+        // patch 末尾有多余空行（模型常见输出）。修复前末尾空行被并入最后一个 hunk
+        // 变成空 context 行 → 匹配失败。
+        let original = "line1\nline2\nline3\n";
+        let patch = "@@ -2,1 +2,1 @@\n-line2\n+changed\n\n";
+        let result = apply_unified_patch(original, patch)
+            .expect("trailing blank line in patch should be tolerated");
+        assert_eq!(result, "line1\nchanged\nline3\n");
     }
 
     #[test]
