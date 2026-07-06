@@ -328,7 +328,7 @@ fn finalize_stream_response(
     state.render.markdown.flush_pending()?;
 
     if state.render.current_printing_index.is_some() {
-        println!("\x1b[0m)");
+        println!("\x1b[0m");
     }
 
     if take_stream_cancelled(app) {
@@ -1015,37 +1015,19 @@ fn open_tool_call_line(
     function_name: &str,
 ) -> io::Result<()> {
     if state.render.current_printing_index.is_some() {
-        println!("\x1b[0m)");
+        println!("\x1b[0m");
     }
     state.render.current_printing_index = Some(index);
     print!(
-        "  {}│{} {}{}{}({}",
-        ACCENT_RULE, RESET, ACCENT_MUTED, function_name, RESET, DIM
+        "  {}│{} {}{}{}",
+        ACCENT_RULE, RESET, ACCENT_MUTED, function_name, RESET
     );
     io::stdout().flush()
 }
 
-fn write_tool_call_arguments_stream(arguments: &str) -> io::Result<()> {
-    if arguments.is_empty() {
-        return Ok(());
-    }
-
-    let mut stdout = io::stdout();
-    if stdout.is_terminal() {
-        for ch in arguments.chars() {
-            // 跳过换行符：模型可能输出 pretty-printed JSON，在终端上需要保持单行显示
-            if ch == '\n' || ch == '\r' {
-                continue;
-            }
-            let mut buf = [0u8; 4];
-            stdout.write_all(ch.encode_utf8(&mut buf).as_bytes())?;
-            stdout.flush()?;
-        }
-        return Ok(());
-    }
-
-    stdout.write_all(arguments.as_bytes())?;
-    stdout.flush()
+/// 终端不再打印工具调用参数，只保留工具名称。
+fn write_tool_call_arguments_stream(_arguments: &str) -> io::Result<()> {
+    Ok(())
 }
 
 fn process_external_tool_calls_delta(
@@ -1151,7 +1133,7 @@ fn process_internal_tool_calls(
             InternalToolCallStreamEvent::End => {
                 if state.render.current_printing_index == Some(state.content.internal_tool_call_idx)
                 {
-                    println!("\x1b[0m)");
+                    println!("\x1b[0m");
                     state.render.current_printing_index = None;
                     let _ = io::stdout().flush();
                 }

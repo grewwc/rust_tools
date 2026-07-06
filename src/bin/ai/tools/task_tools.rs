@@ -713,24 +713,32 @@ pub(crate) fn prepare_subagent_task(args: &Value) -> Result<PreparedSubagentTask
         &owned_fallback
     };
     let selected = select_subagent(all_agents, agent, description, prompt)?;
-    let (selected_model, is_model_auto_selected, auto_model_fallback) =
+    let (selected_model, is_model_auto_selected, auto_model_fallback, inherited_parent_model) =
         if let Some(model_override) = model_override {
-            (models::determine_model(model_override), false, None)
+            (models::determine_model(model_override), false, None, false)
         } else {
-            // 默认优先复用父 agent 当前模型；仅在父模型不可用时退回难度自动选择。
             let parent_model = cached
                 .as_ref()
                 .map(|ctx| ctx.app_proto.current_model.as_str());
-            let choice = models::prefer_parent_model_for_subagent(
+            let choice = models::choose_model_for_subagent(
                 parent_model,
                 selected.agent,
                 description,
                 prompt,
             );
-            (choice.model, true, Some(choice.fallback))
+            (
+                choice.model,
+                choice.is_auto_selected,
+                choice.fallback,
+                !choice.is_auto_selected,
+            )
         };
-    let selection_explanation =
-        build_selection_explanation(&selected, &selected_model, model_override);
+    let selection_explanation = build_selection_explanation(
+        &selected,
+        &selected_model,
+        model_override,
+        inherited_parent_model,
+    );
 
     Ok(PreparedSubagentTask {
         description: description.to_string(),
@@ -2006,6 +2014,7 @@ fn build_selection_explanation(
     selected: &SelectedSubagent<'_>,
     selected_model: &str,
     model_override: Option<&str>,
+    inherited_parent_model: bool,
 ) -> String {
     let agent_reason = if selected.auto_selected {
         if selected.matched_tags.is_empty() {
@@ -2027,6 +2036,8 @@ fn build_selection_explanation(
         .is_some()
     {
         "model_reason=explicit model override".to_string()
+    } else if inherited_parent_model {
+        "model_reason=inherited parent agent current model".to_string()
     } else {
         format!(
             "model_reason=auto-selected for agent_tier={} using {} provider and {} quality_tier",
@@ -2042,20 +2053,26 @@ fn build_selection_explanation(
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentTeamMemberSpec, AgentTeamOperation, AsyncTaskEntry, InheritOptions, SelectedSubagent,
-        StoredTaskResult, TASK_REGISTRY, WaitManySource, append_current_process_cancel_source,
-        OsTaskGoal, build_agent_team_prompt, build_agent_team_selection_prompt,
-        build_selection_explanation, encode_os_task_goal, epoll_wait_many,
-        epoll_wait_many_channels, format_task_result, is_encoded_task_goal,
-        parse_agent_team_members, remove_task_entry, resolve_agent_team_model_override,
-        select_subagent, wait_sources_for_channel_and_futex, with_task_entry_by_pid,
+        AgentTeamMemberSpec, AgentTeamOperation, AsyncTaskEntry, InheritOptions, OsTaskGoal,
+        SelectedSubagent, StoredTaskResult, TASK_REGISTRY, WaitManySource,
+        append_current_process_cancel_source, build_agent_team_prompt,
+        build_agent_team_selection_prompt, build_selection_explanation, encode_os_task_goal,
+        epoll_wait_many, epoll_wait_many_channels, format_task_result, is_encoded_task_goal,
+        parse_agent_team_members, prepare_subagent_task, remove_task_entry,
+        resolve_agent_team_model_override, select_subagent, wait_sources_for_channel_and_futex,
+        with_task_entry_by_pid,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
+    use crate::ai::cli::ParsedCli;
+    use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
+    use crate::ai::mcp::McpClient;
+    use crate::ai::types::{App, AppConfig};
     use aios_kernel::{
         kernel::{EventId, KernelInternal, Syscall, WaitPolicy},
         local::LocalOS,
         primitives::{FutexAddr, FutexOps, IpcOps},
     };
+    use std::sync::{Arc, atomic::AtomicBool};
     use std::time::Instant;
 
     fn manifest(name: &str, description: &str, mode: AgentMode) -> AgentManifest {
@@ -2078,6 +2095,48 @@ mod tests {
             hidden: false,
             color: None,
             source_path: None,
+        }
+    }
+
+    fn test_app_with_model(current_model: String) -> App {
+        App {
+            cli: ParsedCli::default(),
+            config: AppConfig {
+                api_key: String::new(),
+                base_history_file: std::path::PathBuf::new(),
+                history_file: std::path::PathBuf::new(),
+                endpoint: String::new(),
+                vl_default_model: String::new(),
+                history_max_chars: 12000,
+                history_keep_last: 8,
+                history_summary_max_chars: 4000,
+                intent_model: None,
+                agent_route_model_path: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/bin/ai/config/agent_route/agent_route_model.json"),
+                skill_match_model_path: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/bin/ai/config/skill_match/skill_match_model.json"),
+            },
+            session_id: String::new(),
+            session_history_file: std::path::PathBuf::new(),
+            active_persona: crate::ai::persona::default_persona(),
+            client: reqwest::Client::new(),
+            current_model,
+            current_agent: "build".to_string(),
+            current_agent_manifest: None,
+            pending_files: None,
+            forced_skill: None,
+            forced_question: None,
+            attached_image_files: Vec::new(),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            streaming: Arc::new(AtomicBool::new(false)),
+            cancel_stream: Arc::new(AtomicBool::new(false)),
+            ignore_next_prompt_interrupt: false,
+            prompt_editor: None,
+            agent_context: None,
+            last_skill_bias: None,
+            os: crate::ai::driver::new_local_kernel(),
+            agent_reload_counter: None,
+            observers: Vec::new(),
         }
     }
 
@@ -2114,6 +2173,44 @@ mod tests {
         assert_eq!(selected.agent.name, "explore");
         assert!(selected.auto_selected);
         assert!(!selected.matched_tags.is_empty());
+    }
+
+    #[test]
+    fn prepare_subagent_task_inherits_parent_model_without_auto_fallback() {
+        let parent_model = crate::ai::model_names::all()
+            .first()
+            .map(|model| crate::ai::model_names::model_handle(model))
+            .expect("models.json must contain at least one model");
+        let mut explore = manifest(
+            "explore",
+            "Read-only codebase exploration agent",
+            AgentMode::Subagent,
+        );
+        explore.routing_tags = vec!["find".to_string(), "search".to_string()];
+        let ctx = DriverContext::new(
+            test_app_with_model(parent_model.clone()),
+            Arc::new(std::sync::Mutex::new(McpClient::new())),
+            Arc::new(Vec::new()),
+            Arc::new(vec![explore]),
+        );
+        let args = serde_json::json!({
+            "description": "Locate task tool",
+            "prompt": "Find where task spawning is implemented.",
+            "agent": "explore"
+        });
+
+        let prepared = DRIVER_CTX
+            .sync_scope(ctx, || prepare_subagent_task(&args))
+            .unwrap();
+
+        assert_eq!(prepared.model, parent_model);
+        assert!(!prepared.is_model_auto_selected);
+        assert!(prepared.auto_model_fallback.is_none());
+        assert!(
+            prepared
+                .selection_explanation
+                .contains("model_reason=inherited parent agent current model")
+        );
     }
 
     #[test]
@@ -2191,7 +2288,7 @@ mod tests {
             score: 48,
         };
 
-        let explanation = build_selection_explanation(&selected, &model, None);
+        let explanation = build_selection_explanation(&selected, &model, None, false);
 
         assert!(explanation.contains("routing_tags [implement, fix]"));
         assert!(explanation.contains("quality_tier"));
@@ -2213,7 +2310,7 @@ mod tests {
             score: 0,
         };
 
-        let explanation = build_selection_explanation(&selected, "gpt-4o", Some("gpt-4o"));
+        let explanation = build_selection_explanation(&selected, "gpt-4o", Some("gpt-4o"), false);
 
         assert!(explanation.contains("explicit agent override"));
         assert!(explanation.contains("explicit model override"));
@@ -2233,7 +2330,8 @@ mod tests {
             score: 0,
         };
 
-        let explanation = build_selection_explanation(&selected, "deepseek-v4-flash", Some(" "));
+        let explanation =
+            build_selection_explanation(&selected, "deepseek-v4-flash", Some(" "), false);
 
         assert!(explanation.contains("auto-selected"));
         assert!(!explanation.contains("explicit model override"));

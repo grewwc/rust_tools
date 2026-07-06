@@ -9,7 +9,6 @@ use crate::ai::{
         priority_for_confidence, render_record, should_persist,
     },
     driver::{
-        print::{print_tool_note_line, print_tool_output_block},
         tools::ExecuteToolCallsResult,
     },
     history::{Message, ROLE_INTERNAL_NOTE, is_system_like_role},
@@ -105,8 +104,8 @@ pub(super) fn append_cached_tool_results_note(
 }
 
 pub(super) fn print_tool_result_preview(_tool_name: &str, prepared: &PreparedToolResult) {
-    print_tool_note_line("output", "tool result");
-    print_tool_output_block(&prepared.content_for_terminal);
+    // 终端不再打印工具输出内容，只保留工具调用状态行。
+    let _ = prepared;
 }
 
 /// 智能截断到最近一处句子边界（中英文兼容），并附 `…[truncated: N chars omitted]`

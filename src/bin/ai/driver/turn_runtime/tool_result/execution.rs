@@ -22,7 +22,7 @@ use super::{
 };
 use crate::ai::driver::print::{
     format_tool_output_line, format_tool_output_prefix, print_tool_note_line,
-    print_tool_output_block, sanitize_for_terminal,
+    sanitize_for_terminal,
 };
 use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
@@ -534,27 +534,13 @@ impl<'a> TerminalToolObserver<'a> {
     }
 
     fn print_prepared_tool_result(&mut self, prepared: &PreparedToolResult) {
-        print_tool_note_line("output", "tool result");
-        if self.allow_inline_fold_updates && !prepared.content_for_terminal.trim().is_empty() {
-            self.tty_fold.reset();
-            let _ = self.tty_fold.push_text(&prepared.content_for_terminal);
-            let _ = self.tty_fold.finish();
-            self.tty_fold.reset();
-        } else {
-            print_tool_output_block(&prepared.content_for_terminal);
-        }
+        // 终端不再打印工具输出内容，只保留状态行。
+        let _ = prepared;
     }
 
     fn print_captured_command_output(&mut self, prepared: &PreparedToolResult) {
-        print_tool_note_line("result", "captured command output");
-        if self.allow_inline_fold_updates && !prepared.content_for_terminal.trim().is_empty() {
-            self.tty_fold.reset();
-            let _ = self.tty_fold.push_text(&prepared.content_for_terminal);
-            let _ = self.tty_fold.finish();
-            self.tty_fold.reset();
-        } else {
-            print_tool_output_block(&prepared.content_for_terminal);
-        }
+        // 终端不再打印工具输出内容，只保留状态行。
+        let _ = prepared;
     }
 }
 

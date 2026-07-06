@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::error::Error;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::{
     LazyLock, Mutex,
@@ -1878,8 +1879,8 @@ where
     let mut result = exec();
     if let Err(err) = result.as_ref() {
         if should_retry_once(route, tool_name, err) {
-            println!(
-                "\n{} (transient error; one safe retry)",
+            print!(
+                "\r\x1b[2K{} (transient error; one safe retry)\n",
                 crate::ai::driver::print::format_tool_status(
                     "Retry",
                     tool_name,
@@ -1941,9 +1942,10 @@ fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
     } else if !run_result.executed {
         println!("\n{}", format_tool_status_skipped(name));
     } else if run_result.ok {
-        println!("\n{}", format_tool_status_completed(name));
+        // 已执行的工具：用 \r 回到行首覆盖 running 状态，保持同一行
+        print!("\r\x1b[2K{}\n", format_tool_status_completed(name));
     } else {
-        println!("\n{}", format_tool_status_failed(name));
+        print!("\r\x1b[2K{}\n", format_tool_status_failed(name));
     }
 }
 
@@ -2063,7 +2065,9 @@ fn run_one(
         );
     }
 
-    println!("\n{}", format_tool_status_running(&tool_call.function.name));
+    // 不换行，以便完成状态用 \r 覆盖在同一行
+    print!("\n{}", format_tool_status_running(&tool_call.function.name));
+    let _ = std::io::stdout().flush();
 
     if let Err(run_result) = reserve_current_process_tool_call_budget(tool_call) {
         return (prepared.route, run_result);

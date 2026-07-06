@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::Value;
 
 use crate::ai::{request, types::App};
@@ -681,13 +681,17 @@ pub(in crate::ai) fn mid_turn_compress(
     (out, before, after)
 }
 
-/// Mid-turn LLM 摘要兜底：当无损管线后仍超过 hard_threshold 时调用。
-/// 行为：
-///   - 保留 system + 最近 `keep_recent_turns` 个 user 起始的尾部窗口
-///   - 把更早的部分（仅当至少含一个 user/assistant 时）调 LLM 摘要器压缩
-///   - 摘要文本作为单条 `internal_note` 注入到尾部窗口前
-///   - 如果 LLM 调用失败或没有可摘要的早期部分，原样返回
-/// 返回 `(messages_after, before, after, did_summarize)`
+/// Mid-turn LLM 摘要兜底：无损/弱损管线之后仍超阈值时调用。两条互补路径：
+///   - Path A（跨轮摘要）：最近 `keep_recent_turns` 个 user 轮之前若还有对话，
+///     调 LLM 摘要器把那段压成单条 `internal_note` 注入到尾窗前；同时对尾窗
+///     内部较早的工具组做折叠（见 Path B），避免"臃肿全在最近一轮"时压不动。
+///   - Path B（单轮内折叠）：当没有跨轮对话可摘要（单个 user 轮里堆了数百次
+///     工具迭代），或跨轮摘要调用失败/为空时，退化为把当前轮内较早的
+///     assistant(tool_calls)+tool 组整组折叠成单行 stub（保留 user 消息与最近
+///     若干工具组逐字）。整组一起替换，不破坏 assistant.tool_calls ↔ tool 配对。
+/// 头部所有 system / internal_note（agent 指令、工具列表、全局指引）始终原样保留。
+/// 返回 `(messages_after, before, after, did_summarize)`；`did_summarize` 仅在
+/// 确有体积下降时为 true，避免调用方误存游标抑制后续重试。
 pub(in crate::ai) async fn mid_turn_llm_summarize(
     app: &App,
     messages: Vec<Message>,
@@ -695,54 +699,62 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     summary_max_chars: usize,
 ) -> (Vec<Message>, usize, usize, bool) {
     let before = messages_total_chars(&messages);
+
+    // === Path A：跨轮 LLM 摘要 ===
     let split_at = retained_turn_start(&messages, keep_recent_turns);
-    if split_at == 0 || split_at >= messages.len() {
-        return (messages, before, before, false);
+    if split_at > 0 && split_at < messages.len() {
+        // 保留头部前缀连续的 system-like 消息（agent 指令等），只摘要其后的对话
+        // 区段。早期版本直接丢弃 messages[0] 的 system prompt，会让模型立刻失去
+        // agent 行为指令，表现为"压缩后回复戛然而止 / 极短 / 跑偏"。
+        let preserved_system_end = messages[..split_at]
+            .iter()
+            .position(|m| !is_system_like_role(&m.role))
+            .unwrap_or(split_at);
+        let earlier = &messages[preserved_system_end..split_at];
+        let has_dialog = earlier
+            .iter()
+            .any(|m| m.role == "user" || m.role == "assistant");
+        if has_dialog {
+            let summary =
+                build_persisted_summary_text_with_app(app, earlier, summary_max_chars).await;
+            if !summary.trim().is_empty() {
+                let mut out =
+                    Vec::with_capacity(preserved_system_end + 1 + (messages.len() - split_at));
+                // 1. 头部 system / internal_note（agent 指令等）原样保留
+                out.extend_from_slice(&messages[..preserved_system_end]);
+                // 2. 摘要作为 internal_note 注入（normalize_messages_for_request 会把
+                //    它归类成 Summary heading 并合并进 system 消息）
+                out.push(Message {
+                    role: ROLE_INTERNAL_NOTE.to_string(),
+                    content: Value::String(format!(
+                        "[mid-turn-summary] 早期工具调用与对话已被 LLM 摘要：\n{summary}"
+                    )),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+                // 3. 尾窗：保留 user 逐字 + 最近若干工具组逐字，更早工具组折叠成 stub
+                let (tail, _) = fold_early_tool_groups(
+                    &messages[split_at..],
+                    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS,
+                );
+                out.extend(tail);
+                let after = messages_total_chars(&out);
+                return (out, before, after, true);
+            }
+        }
     }
 
-    // 关键：保留头部所有 system / internal_note 类消息（agent 指令、工具列表、
-    // 全局指引等）。早期版本直接 `out = [summary, ..messages[split_at..]]`，
-    // 把 messages[0] 的真正 system prompt 整段丢弃，模型立刻失去 agent 行为
-    // 指令，表现为"上下文压缩后回复戛然而止 / 极短 / 跑偏"。
-    // 新策略：把 [0..split_at) 区段中前缀连续的 system-like 消息原样保留，
-    // 只摘要其后的 user/assistant/tool 对话区段。
-    let preserved_system_end = messages[..split_at]
-        .iter()
-        .position(|m| !is_system_like_role(&m.role))
-        .unwrap_or(split_at);
-
-    let earlier = &messages[preserved_system_end..split_at];
-    let has_dialog = earlier
-        .iter()
-        .any(|m| m.role == "user" || m.role == "assistant");
-    if !has_dialog {
-        // 早段全是 system-like，没什么可摘要的；直接放弃压缩，避免无意义改写。
+    // === Path B：单轮内折叠 ===
+    // 没有跨轮对话可摘要（臃肿全在当前轮），或跨轮摘要失败/为空时的确定性兜底：
+    // 把较早的工具组折叠成 stub，保留 user 消息与最近若干工具组逐字。
+    let (folded, folded_groups) =
+        fold_early_tool_groups(&messages, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS);
+    let after = messages_total_chars(&folded);
+    if folded_groups == 0 || after >= before {
         return (messages, before, before, false);
     }
-
-    let summary = build_persisted_summary_text_with_app(app, earlier, summary_max_chars).await;
-    if summary.trim().is_empty() {
-        return (messages, before, before, false);
-    }
-
-    let mut out = Vec::with_capacity(preserved_system_end + 1 + (messages.len() - split_at));
-    // 1. 头部 system / internal_note（agent 指令等）原样保留
-    out.extend_from_slice(&messages[..preserved_system_end]);
-    // 2. 摘要本身作为 internal_note 注入（normalize_messages_for_request 会把它
-    //    归类成 Summary heading 并合并进 system 消息）
-    out.push(Message {
-        role: ROLE_INTERNAL_NOTE.to_string(),
-        content: Value::String(format!(
-            "[mid-turn-summary] 早期工具调用与对话已被 LLM 摘要：\n{summary}"
-        )),
-        tool_calls: None,
-        tool_call_id: None,
-        reasoning_content: None,
-    });
-    // 3. 尾部最近 keep_recent_turns 个 user 起始的窗口
-    out.extend_from_slice(&messages[split_at..]);
-    let after = messages_total_chars(&out);
-    (out, before, after, true)
+    (folded, before, after, true)
 }
 
 /// 单张图片在「字符预算」里的名义计费。
@@ -2130,12 +2142,7 @@ fn fold_tool_call_group_to_stub(messages: &[Message], group: &[usize]) -> Option
                 }
             })
             .unwrap_or_default();
-        let first_meaningful = result_text
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or("");
-        let one_liner = truncate_to_chars(&normalize_whitespace(first_meaningful), 160);
+        let one_liner = tool_result_recall_one_liner(&result_text);
         lines.push(format!("- {} => {}", tc.function.name, one_liner));
     }
     if tool_calls.len() > 8 {
@@ -2152,6 +2159,105 @@ fn fold_tool_call_group_to_stub(messages: &[Message], group: &[usize]) -> Option
         tool_call_id: None,
         reasoning_content: None,
     })
+}
+
+/// 单轮内折叠：LLM 摘要兜底时，尾窗（当前 user 轮）内部保留逐字的最近工具组数。
+/// 更早的同轮工具组折叠成单行 stub，解决"臃肿全堆在一个 user 轮内、无跨轮边界
+/// 可摘要"时压缩器空转的问题。
+const MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS: usize = 4;
+
+/// 为折叠 stub 生成"召回锚点"单行：优先提取已外溢 tool 结果里的 `file_path:`
+/// 指针（模型据此可重新 read_file），否则退回结果首个非空行。
+/// 保证折叠早期 precision 工具组时仍留下可召回的线索，避免失忆式重复检索。
+fn tool_result_recall_one_liner(result_text: &str) -> String {
+    if let Some(path_line) = result_text
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("- file_path:") || line.starts_with("file_path:"))
+    {
+        return truncate_to_chars(&normalize_whitespace(path_line), 200);
+    }
+    let first_meaningful = result_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    truncate_to_chars(&normalize_whitespace(first_meaningful), 160)
+}
+
+/// 把消息序列中较早的 `assistant(tool_calls) + 配套 tool` 组整组折叠成单条
+/// `internal_note` stub，逐字保留最近 `keep_recent_groups` 个工具组以及所有
+/// 非工具组消息（user / system / internal_note / 纯文本 assistant）。
+///
+/// 关键不变量：折叠时把 assistant 及其全部 tool 响应**整组一起**替换成一条
+/// stub，因此不会出现"留下 assistant.tool_calls 却丢掉配套 tool 响应"的配对
+/// 断裂（OpenAI 协议要求二者成对）。含 `is_non_compressible_tool` 的组也会被
+/// 折叠，但 stub 内保留其 `file_path:` 召回锚点。
+///
+/// 返回 `(folded_messages, folded_group_count)`。
+fn fold_early_tool_groups(
+    messages: &[Message],
+    keep_recent_groups: usize,
+) -> (Vec<Message>, usize) {
+    // 定位所有 assistant(tool_calls) 起始位置，作为工具组锚点。
+    let group_anchors: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, m)| {
+            let has_calls = m
+                .tool_calls
+                .as_ref()
+                .map(|calls| !calls.is_empty())
+                .unwrap_or(false);
+            (m.role == "assistant" && has_calls).then_some(idx)
+        })
+        .collect();
+    if group_anchors.len() <= keep_recent_groups {
+        return (messages.to_vec(), 0);
+    }
+    // 最近 keep_recent_groups 个工具组逐字保留；更早的折叠。
+    let fold_before_anchor = group_anchors[group_anchors.len() - keep_recent_groups];
+
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    let mut folded_groups = 0usize;
+    let mut idx = 0usize;
+    while idx < messages.len() {
+        let message = &messages[idx];
+        let has_calls = message
+            .tool_calls
+            .as_ref()
+            .map(|calls| !calls.is_empty())
+            .unwrap_or(false);
+        // 只有位于折叠区（早于最近保留窗口）的 assistant(tool_calls) 组才折叠。
+        if idx < fold_before_anchor && message.role == "assistant" && has_calls {
+            let tool_call_ids: FxHashSet<&str> = message
+                .tool_calls
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|tc| tc.id.as_str())
+                .collect();
+            // 收集紧随其后、属于本 assistant 的连续 tool 响应，构成完整组。
+            let mut group = vec![idx];
+            let mut cursor = idx + 1;
+            while cursor < messages.len() && messages[cursor].role == "tool" {
+                match messages[cursor].tool_call_id.as_deref() {
+                    Some(id) if tool_call_ids.contains(id) => group.push(cursor),
+                    _ => break,
+                }
+                cursor += 1;
+            }
+            if let Some(stub) = fold_tool_call_group_to_stub(messages, &group) {
+                out.push(stub);
+                folded_groups += 1;
+                idx = cursor;
+                continue;
+            }
+        }
+        out.push(message.clone());
+        idx += 1;
+    }
+    (out, folded_groups)
 }
 
 fn is_summary_message(message: &Message) -> bool {
@@ -2345,5 +2451,165 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
             );
             messages[idx].content = Value::String(stub);
         }
+    }
+}
+
+#[cfg(test)]
+mod fold_early_tool_groups_tests {
+    use super::*;
+    use crate::ai::types::{FunctionCall, ToolCall};
+
+    fn msg(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn assistant_call(id: &str, name: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn tool_result(id: &str, content: &str) -> Message {
+        Message {
+            role: "tool".to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: Some(id.to_string()),
+            reasoning_content: None,
+        }
+    }
+
+    /// 构造：system + user + N 个 (assistant tool_calls + tool 结果) 组，全部在
+    /// 同一个 user 轮内（只有一条 user 消息）——正是"臃肿全堆在当前轮"的场景。
+    fn single_turn_with_groups(n: usize, tool_result_chars: usize) -> Vec<Message> {
+        let mut messages = vec![msg("system", "system prompt"), msg("user", "干活")];
+        for i in 0..n {
+            let id = format!("call-{i}");
+            messages.push(assistant_call(&id, "text_grep"));
+            messages.push(tool_result(&id, &"x".repeat(tool_result_chars)));
+        }
+        messages
+    }
+
+    fn assert_tool_pairs_consistent(messages: &[Message]) {
+        let mut assistant_ids: FxHashSet<String> = FxHashSet::default();
+        for m in messages {
+            if m.role == "assistant"
+                && let Some(calls) = &m.tool_calls
+            {
+                for c in calls {
+                    assistant_ids.insert(c.id.clone());
+                }
+            }
+        }
+        let mut tool_ids: FxHashSet<String> = FxHashSet::default();
+        for m in messages {
+            if m.role == "tool"
+                && let Some(id) = &m.tool_call_id
+            {
+                tool_ids.insert(id.clone());
+            }
+        }
+        assert_eq!(
+            assistant_ids, tool_ids,
+            "every assistant.tool_calls id must have a paired tool message and vice versa"
+        );
+    }
+
+    #[test]
+    fn folds_early_groups_in_a_single_bloated_turn() {
+        let messages = single_turn_with_groups(10, 2_000);
+        let before = messages_total_chars(&messages);
+
+        let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
+
+        // 10 组里最近 4 组逐字保留，较早 6 组被折叠。
+        assert_eq!(folded_groups, 6);
+        let after = messages_total_chars(&folded);
+        assert!(
+            after < before,
+            "folding must reduce size: {after} !< {before}"
+        );
+        assert_tool_pairs_consistent(&folded);
+    }
+
+    #[test]
+    fn preserves_user_message_verbatim() {
+        let messages = single_turn_with_groups(8, 1_500);
+        let (folded, _) = fold_early_tool_groups(&messages, 4);
+
+        let user = folded
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("user message must survive");
+        assert_eq!(value_to_string(&user.content), "干活");
+    }
+
+    #[test]
+    fn keeps_recent_groups_verbatim() {
+        let messages = single_turn_with_groups(8, 1_500);
+        let (folded, _) = fold_early_tool_groups(&messages, 4);
+
+        // 最近 4 组的 tool 结果应原样保留（未被折叠成 stub）。
+        let full_tool_results = folded
+            .iter()
+            .filter(|m| m.role == "tool" && value_to_string(&m.content) == "x".repeat(1_500))
+            .count();
+        assert_eq!(full_tool_results, 4);
+    }
+
+    #[test]
+    fn no_op_when_group_count_within_keep_window() {
+        let messages = single_turn_with_groups(3, 1_000);
+        let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
+
+        assert_eq!(folded_groups, 0);
+        assert_eq!(folded.len(), messages.len());
+    }
+
+    #[test]
+    fn stub_preserves_file_path_recall_anchor() {
+        let mut messages = vec![msg("system", "s"), msg("user", "干活")];
+        // 早期一组：read_file 结果已外溢，含 file_path 指针，必须在 stub 中保留。
+        messages.push(assistant_call("call-old", "read_file"));
+        messages.push(tool_result(
+            "call-old",
+            "Output preserved for non-compressible tool `read_file`.\n- file_path: /tmp/session/xyz.txt\n- use read_file to inspect exact content.",
+        ));
+        // 追加足够多的近端组把上面那组挤进折叠区。
+        for i in 0..6 {
+            let id = format!("call-{i}");
+            messages.push(assistant_call(&id, "text_grep"));
+            messages.push(tool_result(&id, "recent"));
+        }
+
+        let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
+        assert!(folded_groups >= 1);
+        let stub_text: String = folded
+            .iter()
+            .filter(|m| m.role == ROLE_INTERNAL_NOTE)
+            .map(|m| value_to_string(&m.content))
+            .collect();
+        assert!(
+            stub_text.contains("/tmp/session/xyz.txt"),
+            "folded stub must retain the file_path recall anchor, got: {stub_text}"
+        );
     }
 }

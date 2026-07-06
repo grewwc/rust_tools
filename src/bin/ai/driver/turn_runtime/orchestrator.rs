@@ -33,12 +33,45 @@ use super::{
 /// - hard: 连续 6 轮完全一致，直接强制收敛，不再继续工具循环
 const TOOL_LOOP_SOFT_WINDOW: usize = 4;
 const TOOL_LOOP_HARD_WINDOW: usize = 6;
+/// 近似循环窗口：连续 N 轮对「同一目标资源」调用同一工具（忽略 offset/limit
+/// 等翻页参数）即命中。用于抓字节精确检测漏掉的「同文件反复翻页 / 仅微调分页
+/// 参数的重复检索」这类真实膨胀。仅注入一次软提示，不强制收敛。
+const TOOL_LOOP_COARSE_WINDOW: usize = 5;
 const TOOL_SIGNATURE_HISTORY_LIMIT: usize = TOOL_LOOP_HARD_WINDOW + 2;
 const TASK_ANCHOR_MAX_QUESTION_CHARS: usize = 220;
+
+/// 计算 coarse 签名时需剥离的「易变翻页/窗口」参数键。剥离后同一文件的不同
+/// 分页、同一检索的不同结果上限会折叠成同一 coarse 签名。
+const VOLATILE_ARG_KEYS: &[&str] = &["offset", "limit", "page", "cursor", "max_results"];
+
+/// 中段断路器绝对上限：单轮工具迭代达到该值即注入一次收敛提示，远早于
+/// max_iterations 硬上限，用于治理「合法但低效」的工具刷屏。
+const TOOL_ITERATION_SOFT_LIMIT: usize = 96;
+
+/// 单轮工具迭代软阈值：取 max_iterations 的一半与绝对上限的较小值，保证一定
+/// 早于硬上限触发；对超大 ceiling 也能在中段就提醒收敛。
+fn tool_iteration_soft_limit(max_iterations: usize) -> usize {
+    (max_iterations / 2).max(1).min(TOOL_ITERATION_SOFT_LIMIT)
+}
 
 /// 提取最近一轮 assistant 消息中的 (tool_name, args_json) 签名集合。
 /// 任何一个签名与窗口内某轮完全一致即认为有循环倾向。
 fn extract_round_tool_signatures(messages: &[crate::ai::history::Message]) -> Option<Vec<String>> {
+    extract_round_tool_signatures_inner(messages, false)
+}
+
+/// 提取「粗粒度」签名：剥离 offset/limit/page 等易变翻页参数后再归一化。
+/// 用于抓字节精确检测漏掉的同文件翻页 / 仅微调分页参数的重复检索。
+fn extract_round_tool_signatures_coarse(
+    messages: &[crate::ai::history::Message],
+) -> Option<Vec<String>> {
+    extract_round_tool_signatures_inner(messages, true)
+}
+
+fn extract_round_tool_signatures_inner(
+    messages: &[crate::ai::history::Message],
+    coarse: bool,
+) -> Option<Vec<String>> {
     use serde_json::Value;
     let last_assistant = messages.iter().rev().find(|m| m.role == "assistant")?;
     let tool_calls = last_assistant.tool_calls.as_ref()?;
@@ -49,14 +82,29 @@ fn extract_round_tool_signatures(messages: &[crate::ai::history::Message]) -> Op
     for tc in tool_calls.iter() {
         let name = tc.function.name.as_str();
         let args_raw = tc.function.arguments.as_str();
-        // 归一化 args：解析为 Value 后再 to_string，去掉空白噪音
+        // 归一化 args：解析为 Value 后再 to_string，去掉空白噪音。
+        // coarse 模式下先剥离易变翻页参数，让同一目标资源的不同分页折叠为同一签名。
         let args_norm = serde_json::from_str::<Value>(args_raw)
-            .map(|v| v.to_string())
+            .map(|mut v| {
+                if coarse {
+                    strip_volatile_args(&mut v);
+                }
+                v.to_string()
+            })
             .unwrap_or_else(|_| args_raw.to_string());
         sigs.push(format!("{name}::{args_norm}"));
     }
     sigs.sort();
     Some(sigs)
+}
+
+/// 从 args Value（若为 object）中移除翻页/窗口类易变键。
+fn strip_volatile_args(value: &mut serde_json::Value) {
+    if let Some(map) = value.as_object_mut() {
+        for key in VOLATILE_ARG_KEYS {
+            map.remove(*key);
+        }
+    }
 }
 
 fn detect_tool_loop(history: &[Vec<String>], window: usize) -> bool {
@@ -110,15 +158,20 @@ struct TurnSupervisor {
     iteration: usize,
     loop_breaker_injected: bool,
     hard_loop_stop_injected: bool,
+    coarse_loop_note_injected: bool,
+    iteration_soft_limit_note_injected: bool,
     iteration_limit_note_injected: bool,
     task_anchor_injected: bool,
     last_compress_iteration: usize,
     last_compress_after_chars: usize,
     tool_signature_history: Vec<Vec<String>>,
+    tool_signature_history_coarse: Vec<Vec<String>>,
 }
 
 enum ToolLoopSignal {
     None,
+    /// 近似循环：同一工具反复命中同一目标资源（忽略翻页参数）。软提示一次。
+    Coarse,
     Soft,
     Hard,
 }
@@ -156,6 +209,13 @@ impl TurnSupervisor {
             let drop = self.tool_signature_history.len() - TOOL_SIGNATURE_HISTORY_LIMIT;
             self.tool_signature_history.drain(0..drop);
         }
+        if let Some(coarse) = extract_round_tool_signatures_coarse(messages) {
+            self.tool_signature_history_coarse.push(coarse);
+            if self.tool_signature_history_coarse.len() > TOOL_SIGNATURE_HISTORY_LIMIT {
+                let drop = self.tool_signature_history_coarse.len() - TOOL_SIGNATURE_HISTORY_LIMIT;
+                self.tool_signature_history_coarse.drain(0..drop);
+            }
+        }
         if !self.hard_loop_stop_injected
             && detect_tool_loop(&self.tool_signature_history, TOOL_LOOP_HARD_WINDOW)
         {
@@ -168,7 +228,35 @@ impl TurnSupervisor {
             self.loop_breaker_injected = true;
             return ToolLoopSignal::Soft;
         }
+        // 字节精确的 soft/hard 均未命中时，再看粗粒度：同一目标资源反复翻页/微调
+        // 检索参数的膨胀会在这里被抓到。仅提示一次，且让位于精确检测。
+        if !self.coarse_loop_note_injected
+            && !self.loop_breaker_injected
+            && detect_tool_loop(&self.tool_signature_history_coarse, TOOL_LOOP_COARSE_WINDOW)
+        {
+            self.coarse_loop_note_injected = true;
+            return ToolLoopSignal::Coarse;
+        }
         ToolLoopSignal::None
+    }
+
+    /// 中段断路器：单轮迭代到达软阈值时注入一次收敛提示（远早于 max_iterations
+    /// 硬上限），治理「合法但低效」的工具刷屏。仅注入一次。
+    fn maybe_inject_iteration_soft_limit_note(
+        &mut self,
+        messages: &mut Vec<crate::ai::history::Message>,
+        max_iterations: usize,
+    ) -> bool {
+        if self.iteration_soft_limit_note_injected {
+            return false;
+        }
+        let soft_limit = tool_iteration_soft_limit(max_iterations);
+        if self.iteration < soft_limit {
+            return false;
+        }
+        self.iteration_soft_limit_note_injected = true;
+        inject_iteration_soft_limit_note(messages, self.iteration);
+        true
     }
 
     fn maybe_inject_iteration_limit_note(
@@ -237,6 +325,45 @@ fn inject_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
     });
 }
 
+/// 近似循环命中：同一工具反复命中同一目标资源（仅翻页/检索参数在变）。提醒
+/// agent 一次性读大块或收敛检索，而非逐页刷屏。软提示，不强制收敛。
+fn inject_coarse_loop_note(messages: &mut Vec<crate::ai::history::Message>) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let note = "[loop-approx] 你最近多轮都在对同一目标反复调用同一工具，只是翻页/检索参数在微调，效率很低。\n\
+        请改为：(a) 一次读取更大的行范围（提高 read_file 的 limit）或用检索工具一次定位，而不是逐页翻；\n\
+        (b) 复用已读到的内容，不要重复读同一文件同一段；(c) 若已够回答就直接作答。";
+    messages.push(Message {
+        role: "system".to_string(),
+        content: Value::String(note.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+/// 中段断路器：单轮迭代到达软阈值（远早于 max_iterations）时的一次性收敛提示。
+fn inject_iteration_soft_limit_note(
+    messages: &mut Vec<crate::ai::history::Message>,
+    iteration: usize,
+) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let note = format!(
+        "[iteration-soft-limit] 你已经在本轮内迭代 {iteration} 次工具调用，明显偏多。\n\
+        请先停下来复盘：(a) 总结目前已确认的事实与还差什么；(b) 明确下一步唯一动作；\n\
+        (c) 优先用批量/大范围读取与精准检索收敛，避免继续碎片化地翻页或反复搜索；\n\
+        (d) 若已经足够回答，就直接给出结论。"
+    );
+    messages.push(Message {
+        role: "system".to_string(),
+        content: Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
 /// max_iterations 触发后的自反思 prompt（替代纯 force_final 举手投降）。
 fn inject_iteration_limit_reflect_note(
     messages: &mut Vec<crate::ai::history::Message>,
@@ -266,10 +393,13 @@ mod tests {
     fn detect_tool_loop_triggers_after_window_of_identical_signatures() {
         let sig = vec!["read_file::{\"path\":\"a.rs\"}".to_string()];
         // 不足窗口
-        let history = vec![sig.clone(), sig.clone()];
+        let history = vec![sig.clone(); TOOL_LOOP_SOFT_WINDOW - 1];
+        assert!(!detect_tool_loop(&history, TOOL_LOOP_SOFT_WINDOW));
+        // 满 soft 窗口触发，但尚不满 hard 窗口
+        let history = vec![sig.clone(); TOOL_LOOP_SOFT_WINDOW];
         assert!(detect_tool_loop(&history, TOOL_LOOP_SOFT_WINDOW));
         assert!(!detect_tool_loop(&history, TOOL_LOOP_HARD_WINDOW));
-        // 满窗口且完全相同
+        // 满 hard 窗口且完全相同
         let history = vec![sig.clone(); TOOL_LOOP_HARD_WINDOW];
         assert!(detect_tool_loop(&history, TOOL_LOOP_HARD_WINDOW));
         // 满窗口但有一轮不同
@@ -304,19 +434,25 @@ mod tests {
             reasoning_content: None,
         };
 
-        messages.push(assistant_with_same_read("tc-1"));
+        // 收集每一轮的信号：前 SOFT_WINDOW-1 轮不触发，第 SOFT_WINDOW 轮触发 Soft，
+        // 第 HARD_WINDOW 轮触发 Hard。
+        let mut signals = Vec::new();
+        for i in 0..TOOL_LOOP_HARD_WINDOW {
+            messages.push(assistant_with_same_read(&format!("tc-{i}")));
+            signals.push(supervisor.record_tool_signatures(&messages));
+        }
+        assert!(
+            signals[..TOOL_LOOP_SOFT_WINDOW - 1]
+                .iter()
+                .all(|s| matches!(s, ToolLoopSignal::None)),
+            "should stay quiet before the soft window fills"
+        );
         assert!(matches!(
-            supervisor.record_tool_signatures(&messages),
-            ToolLoopSignal::None
-        ));
-        messages.push(assistant_with_same_read("tc-2"));
-        assert!(matches!(
-            supervisor.record_tool_signatures(&messages),
+            signals[TOOL_LOOP_SOFT_WINDOW - 1],
             ToolLoopSignal::Soft
         ));
-        messages.push(assistant_with_same_read("tc-3"));
         assert!(matches!(
-            supervisor.record_tool_signatures(&messages),
+            signals[TOOL_LOOP_HARD_WINDOW - 1],
             ToolLoopSignal::Hard
         ));
     }
@@ -351,6 +487,115 @@ mod tests {
         assert!(text.contains("[task-anchor]"));
         assert!(text.contains("iteration=5"));
         assert!(text.contains("…"));
+    }
+
+    #[test]
+    fn strip_volatile_args_removes_paging_keys() {
+        let mut v = serde_json::json!({
+            "path": "src/main.rs",
+            "offset": 100,
+            "limit": 80,
+            "page": 2,
+            "cursor": "abc",
+            "max_results": 50,
+            "keep": "yes"
+        });
+        strip_volatile_args(&mut v);
+        let obj = v.as_object().unwrap();
+        assert!(obj.contains_key("path"));
+        assert!(obj.contains_key("keep"));
+        for key in VOLATILE_ARG_KEYS {
+            assert!(
+                !obj.contains_key(*key),
+                "volatile key {key} should be stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn turn_supervisor_emits_coarse_signal_for_same_file_paging() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let assistant_paging_read = |id: &str, offset: usize| crate::ai::history::Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: format!(
+                        "{{\"path\":\"src/main.rs\",\"offset\":{offset},\"limit\":80}}"
+                    ),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+
+        // 每轮 offset 递增：字节精确签名各不相同 → soft/hard 不触发；
+        // 剥离 offset/limit 后 coarse 签名一致 → 满 COARSE_WINDOW 后触发 Coarse。
+        let mut signals = Vec::new();
+        for i in 0..TOOL_LOOP_COARSE_WINDOW {
+            messages.push(assistant_paging_read(&format!("tc-{i}"), i * 80));
+            signals.push(supervisor.record_tool_signatures(&messages));
+        }
+        assert!(
+            signals[..TOOL_LOOP_COARSE_WINDOW - 1]
+                .iter()
+                .all(|s| matches!(s, ToolLoopSignal::None)),
+            "exact paging must not trip soft/hard before coarse window fills"
+        );
+        assert!(matches!(signals.last().unwrap(), ToolLoopSignal::Coarse));
+        assert!(supervisor.coarse_loop_note_injected);
+
+        // coarse 只提示一次：继续同样翻页不再返回 Coarse。
+        messages.push(assistant_paging_read(
+            "tc-extra",
+            TOOL_LOOP_COARSE_WINDOW * 80,
+        ));
+        assert!(matches!(
+            supervisor.record_tool_signatures(&messages),
+            ToolLoopSignal::None
+        ));
+    }
+
+    #[test]
+    fn tool_iteration_soft_limit_clamps_to_absolute_ceiling() {
+        assert_eq!(tool_iteration_soft_limit(0), 1);
+        assert_eq!(tool_iteration_soft_limit(1), 1);
+        assert_eq!(tool_iteration_soft_limit(10), 5);
+        assert_eq!(tool_iteration_soft_limit(512), TOOL_ITERATION_SOFT_LIMIT);
+        assert_eq!(
+            tool_iteration_soft_limit(100_000),
+            TOOL_ITERATION_SOFT_LIMIT
+        );
+    }
+
+    #[test]
+    fn iteration_soft_limit_note_injected_once() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let max_iterations = 10; // soft_limit = 5
+        // 未到软阈值不注入
+        supervisor.iteration = 4;
+        assert!(!supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
+        assert!(messages.is_empty());
+        // 到达软阈值注入一次
+        supervisor.iteration = 5;
+        assert!(supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .as_str()
+                .unwrap_or_default()
+                .contains("[iteration-soft-limit]")
+        );
+        // 再次调用不重复注入
+        supervisor.iteration = 8;
+        assert!(!supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
+        assert_eq!(messages.len(), 1);
     }
 }
 
@@ -500,7 +745,7 @@ async fn run_turn_body(
             // 空响应重试计数：连续 >2 次空响应则放弃，避免浪费迭代预算
             if matches!(execution, IterationExecution::EmptyResponse) {
                 consecutive_empty_responses += 1;
-                if consecutive_empty_responses > 2 {
+                if consecutive_empty_responses > 5 {
                     let _ = writeln!(std::io::stderr(), "  ✗ 连续 {} 次空响应，停止重试", consecutive_empty_responses);
                     final_assistant_text = "[模型连续返回空响应，请重试或切换模型]".to_string();
                     break 'turn Ok(None);
@@ -626,6 +871,13 @@ async fn run_turn_body(
         // === 工具循环检测 ===
         match supervisor.record_tool_signatures(&messages) {
             ToolLoopSignal::None => {}
+            ToolLoopSignal::Coarse => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    "approx tool-loop detected (same target, paging only): injecting converge prompt",
+                );
+                inject_coarse_loop_note(&mut messages);
+            }
             ToolLoopSignal::Soft => {
                 crate::ai::driver::print::print_tool_note_line(
                     "agent-health",
@@ -648,6 +900,16 @@ async fn run_turn_body(
                 );
                 force_final_response = true;
             }
+        }
+
+        // === 中段迭代断路器 ===
+        // 远早于 max_iterations 硬上限：单轮迭代到达软阈值时注入一次收敛提示，
+        // 治理「合法但低效」的工具刷屏（翻页、碎片检索），不强制收敛。
+        if supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations) {
+            crate::ai::driver::print::print_tool_note_line(
+                "agent-health",
+                "tool-iteration soft limit reached: injecting converge prompt",
+            );
         }
 
         // === Iteration limit 自反思 ===

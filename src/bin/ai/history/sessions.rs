@@ -156,6 +156,18 @@ impl SessionStore {
         read_first_user_prompt_sqlite(&path)
     }
 
+    /// 判断 session 是否为空（没有任何用户消息）。
+    /// 用于交互模式下用户直接 Ctrl+C 退出时清理空 session。
+    /// 文件不存在或 messages 表中没有 role='user' 的记录均视为空。
+    pub(in crate::ai) fn is_empty_session(&self, session_id: &str) -> io::Result<bool> {
+        let path = self.session_history_file(session_id);
+        if !path.exists() {
+            return Ok(true);
+        }
+        let count = super::sqlite::count_user_turns_sqlite(&path)?;
+        Ok(count == 0)
+    }
+
     /// 读取 LLM 生成的 session 标题。
     pub(in crate::ai) fn read_session_title(&self, session_id: &str) -> io::Result<Option<String>> {
         let path = self.session_history_file(session_id);

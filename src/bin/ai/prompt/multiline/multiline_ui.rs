@@ -20,11 +20,12 @@ use crate::ai::prompt::{PromptEditor, interrupted_error};
 /// 处理 `Event::Resize` 连续触发的情况：终端窗口拖动时 Resize 事件会快速连发，
 /// 如果每次都重绘 inline viewport，会导致"画面撕裂"或闪烁。
 /// 本函数先 drain 掉后续堆积的 Resize 事件，再做一次 full redraw。
-///
-/// 注意：某些 VS Code 终端 / 终端模拟器对 ratatui inline viewport
-/// 支持不完善，`Borders::TOP/BOTTOM` 可能污染 scrollback 历史记录，
-/// 这是已知的终端兼容性问题。
-fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
+/// `viewport_height` 用于精确控制光标上移行数，避免上移过多进入 scrollback
+/// 区域导致光标块残留。
+fn handle_resize_burst<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    viewport_height: u16,
+) -> io::Result<()> {
     // 1) drain 掉所有后续的 Resize 事件，避免重复触发重绘
     while event::poll(Duration::ZERO).unwrap_or(false) {
         match event::read() {
@@ -35,11 +36,9 @@ fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>)
         }
     }
 
-    // 2) 清除整个 viewport 区域。ratatui inline viewport 在 resize 时
-    //    旧的 Borders::TOP 可能残留在光标上方，仅 FromCursorDown 不够。
-    //    使用实际终端高度而非 viewport 高度来上移光标，确保行回绕后仍然
-    //    能覆盖到旧边框位置。
-    let clear_rows = terminal_size().map(|(_, h)| h).unwrap_or(40);
+    // 2) 清除 viewport 区域。使用 viewport_height + 小余量而非整个终端高度，
+    //    避免光标上移过多进入 scrollback 导致残留光标块。
+    let clear_rows = viewport_height.saturating_add(3);
     let _ = execute!(
         io::stdout(),
         crossterm::cursor::MoveUp(clear_rows),
@@ -106,7 +105,7 @@ impl PromptEditor {
 
                 let event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
                 if let Event::Resize(_, _) = &event {
-                    handle_resize_burst(&mut terminal)?;
+                    handle_resize_burst(&mut terminal, viewport_height)?;
                 }
 
                 match handle_multiline_event(

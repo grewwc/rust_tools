@@ -25,25 +25,9 @@ pub fn print_assistant_banner_with_app_and_skill(app: Option<&App>, skill_name: 
     );
 }
 
-const TOOL_OUTPUT_BLOCK_MAX_VISIBLE: usize = 4;
-
-pub fn print_tool_output_block(content: &str) {
-    let lines: Vec<String> = format_tool_output_block(content);
-    if lines.len() <= TOOL_OUTPUT_BLOCK_MAX_VISIBLE {
-        for line in lines {
-            println!("{line}");
-        }
-    } else {
-        // 折叠：显示最后 N 行 + 折叠指示器
-        let folded_count = lines.len() - TOOL_OUTPUT_BLOCK_MAX_VISIBLE;
-        println!(
-            "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded_count} lines folded ···{RESET}"
-        );
-        for line in &lines[lines.len() - TOOL_OUTPUT_BLOCK_MAX_VISIBLE..] {
-            println!("{line}");
-        }
-    }
-}
+/// 终端不再打印工具输出内容，只保留工具调用状态行。
+/// 工具结果仍会写入 messages 供模型使用，不影响 agent 效果。
+pub fn print_tool_output_block(_content: &str) {}
 
 pub fn print_tool_output_line(line: &str) {
     println!("{}", format_tool_output_line(line));
@@ -129,33 +113,33 @@ pub(in crate::ai) fn format_tool_header(tool_name: &str) -> String {
 
 pub(in crate::ai) fn format_tool_status(status: &str, tool_name: &str, accent: &str) -> String {
     format!(
-        "{}[{}{}{}]{} {}{}{}",
-        ACCENT_MUTED, accent, status, ACCENT_MUTED, RESET, ACCENT_PRIMARY, tool_name, RESET
+        "{}{}{} {}{}{}",
+        accent, status, RESET, ACCENT_PRIMARY, tool_name, RESET
     )
 }
 
 pub(in crate::ai) fn format_tool_status_running(tool_name: &str) -> String {
-    format_tool_status("Running", tool_name, ACCENT_PRIMARY)
+    format_tool_status("→", tool_name, ACCENT_PRIMARY)
 }
 
 pub(in crate::ai) fn format_tool_status_cached(tool_name: &str) -> String {
-    format_tool_status("Cached", tool_name, ACCENT_SECONDARY)
+    format_tool_status("✓", tool_name, ACCENT_SECONDARY)
 }
 
 pub(in crate::ai) fn format_tool_status_skipped(tool_name: &str) -> String {
-    format_tool_status("Skipped", tool_name, ACCENT_WARN)
+    format_tool_status("⊘", tool_name, ACCENT_WARN)
 }
 
 pub(in crate::ai) fn format_tool_status_completed(tool_name: &str) -> String {
-    format_tool_status("Completed", tool_name, ACCENT_SUCCESS)
+    format_tool_status("✓", tool_name, ACCENT_SUCCESS)
 }
 
 pub(in crate::ai) fn format_tool_status_failed(tool_name: &str) -> String {
-    format_tool_status("Failed", tool_name, ACCENT_DANGER)
+    format_tool_status("✗", tool_name, ACCENT_DANGER)
 }
 
 pub(in crate::ai) fn format_tool_status_deferred(tool_name: &str) -> String {
-    format_tool_status("Deferred", tool_name, ACCENT_WARN)
+    format_tool_status("⏸", tool_name, ACCENT_WARN)
 }
 
 pub(in crate::ai) fn format_tool_output_prefix() -> String {
@@ -246,6 +230,7 @@ pub(in crate::ai) fn format_tool_note_line(label: &str, value: &str) -> String {
     )
 }
 
+#[allow(dead_code)] // 终端不再打印工具输出，仅测试引用
 pub(in crate::ai) fn format_tool_output_block(content: &str) -> Vec<String> {
     if content.trim().is_empty() {
         return vec![format_tool_note_line("result", "no output")];
