@@ -3380,11 +3380,31 @@ mod tests {
     }
 
     #[test]
-    fn auto_route_falls_back_to_build_instead_of_current_agent() {
+    fn auto_route_switches_to_build_for_code_question_when_enabled() {
+        // auto-routing 默认禁用（见 auto_agent_routing_enabled）。这里通过临时
+        // config 打开 heuristic 策略，验证一个明显匹配 build 的代码问题会从
+        // 当前 prompt-skill agent 切到 build。
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+
+        let cfg_path = std::env::temp_dir().join(format!(
+            "rt_auto_route_{}.configw",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(
+            &cfg_path,
+            "ai.agents.auto_route.enable = true\nai.agents.auto_route.strategy = heuristic\n",
+        )
+        .unwrap();
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", &cfg_path) };
+        crate::commonw::configw::refresh();
+
         let build = primary_agent(
             "build",
             "Default agent for development work",
-            &["fix", "debug"],
+            &["fix", "debug", "build", "compile", "test"],
         );
         let prompt_skill = primary_agent(
             "prompt-skill",
@@ -3396,8 +3416,16 @@ mod tests {
         maybe_auto_route_agent(
             &mut app,
             &[build.clone(), prompt_skill.clone()],
-            "这个问题为什么会这样？",
+            "帮我 fix 这个 bug，debug 一下编译错误",
         );
+
+        // 恢复 config，避免污染其它测试。
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        crate::commonw::configw::refresh();
+        let _ = std::fs::remove_file(&cfg_path);
 
         assert_eq!(app.current_agent, "build");
         assert_eq!(

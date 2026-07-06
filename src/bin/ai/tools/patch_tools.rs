@@ -103,11 +103,18 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
             if l.starts_with("\\ No newline at end of file") {
                 continue;
             }
+            // 空行（含 CRLF 下只剩 \r 的行）：模型常把空 context 行写成完全没有
+            // 前导空格的空行。按空 context 行处理，与 `git apply` 的宽容一致。
+            if l == "" || l == "\r" {
+                lines.push(UnifiedLine::Context(String::new()));
+                continue;
+            }
             let mut chars = l.chars();
             let prefix = chars
                 .next()
                 .ok_or_else(|| "invalid hunk line: empty".to_string())?;
-            let body = chars.as_str();
+            // 容忍 CRLF：剥离行尾 \r，避免 Add 行把 \r 写入文件内容。
+            let body = chars.as_str().strip_suffix('\r').unwrap_or(chars.as_str());
             match prefix {
                 ' ' => lines.push(UnifiedLine::Context(body.to_string())),
                 '-' => lines.push(UnifiedLine::Remove(body.to_string())),
@@ -239,7 +246,19 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
                         .to_string(),
                 );
             }
-            for line in &envelope.body_lines {
+            // 空行代表新增文件中的空行，补上 + 前缀以便 parse_unified_hunks 识别为 Add 行。
+            let normalized_body: Vec<String> = envelope
+                .body_lines
+                .iter()
+                .map(|line| {
+                    if line.is_empty() {
+                        "+".to_string()
+                    } else {
+                        line.clone()
+                    }
+                })
+                .collect();
+            for line in &normalized_body {
                 if !line.starts_with('+') {
                     return Err(format!(
                         "invalid Add File line: {}. Every content line in an Add File envelope must start with `+`.",
@@ -247,10 +266,10 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
                     ));
                 }
             }
-            let mut normalized = format!("@@ -0,0 +1,{} @@", envelope.body_lines.len());
-            if !envelope.body_lines.is_empty() {
+            let mut normalized = format!("@@ -0,0 +1,{} @@", normalized_body.len());
+            if !normalized_body.is_empty() {
                 normalized.push('\n');
-                normalized.push_str(&envelope.body_lines.join("\n"));
+                normalized.push_str(&normalized_body.join("\n"));
             }
             normalized
         }
@@ -543,9 +562,45 @@ mod tests {
     }
 
     #[test]
-    fn parse_unified_hunks_rejects_empty_hunk_line_instead_of_panicking() {
-        let patch = "@@ -1,1 +1,1 @@\n\n-foo\n+bar\n";
-        assert!(parse_unified_hunks(patch).is_err());
+    fn parse_unified_hunks_treats_empty_hunk_line_as_context() {
+        // 模型常把空 context 行写成完全没有前导空格的空行，应当作空 context 行处理，
+        // 而不是报错。这与 `git apply` 对空 context 行的宽容一致。
+        let patch = "@@ -1,3 +1,3 @@\n foo\n\n bar\n";
+        let hunks =
+            parse_unified_hunks(patch).expect("empty hunk line should be treated as context");
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn apply_unified_patch_tolerates_empty_context_line() {
+        // 模型常把空 context 行写成空字符串（无前导空格），apply_patch 应正常匹配。
+        let original = "foo\n\nbar\n";
+        let patch = "@@ -1,3 +1,3 @@\n foo\n\n-bar\n+baz\n";
+        let result = apply_unified_patch(original, patch)
+            .expect("empty context line should be tolerated");
+        assert_eq!(result, "foo\n\nbaz\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_strips_trailing_cr_from_crlf_patch() {
+        // CRLF patch：Add 行尾的 \r 不应写入文件内容。
+        let original = "foo\nbar\n";
+        let patch = "@@ -2,1 +2,1 @@\r\n-bar\r\n+baz\r\n";
+        let result = apply_unified_patch(original, patch)
+            .expect("CRLF patch should be tolerated");
+        assert_eq!(result, "foo\nbaz\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_tolerates_empty_context_line_in_crlf_patch() {
+        // CRLF patch 中的空 context 行（只剩 \r 的行）也应被当作空 context 行。
+        let original = "foo\r\n\r\nbar\r\n";
+        let patch = "@@ -1,3 +1,3 @@\r\n foo\r\n\r\r\n-bar\r\n+baz\r\n";
+        let result = apply_unified_patch(original, patch)
+            .expect("empty CRLF context line should be tolerated");
+        // 原文件是 CRLF，但 patch 的 Add 行已剥离 \r，输出统一为 LF。
+        assert_eq!(result, "foo\n\nbaz\n");
     }
 
     #[test]
@@ -679,6 +734,25 @@ mod tests {
         });
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "hello\nworld");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_add_file_tolerates_empty_lines() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let base = make_temp_path("add_empty");
+        let path = base.join("new.txt");
+        fs::create_dir_all(&base).unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "patch": "*** Begin Patch\n*** Add File: new.txt\n+hello\n\n+world\n*** End Patch\n"
+            });
+            execute_apply_patch(&args)
+                .expect("apply_patch should tolerate empty lines in Add File envelope");
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello\n\nworld");
         let _ = fs::remove_dir_all(base);
     }
 

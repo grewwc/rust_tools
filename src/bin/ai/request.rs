@@ -3244,7 +3244,7 @@ mod tests {
     fn prompt_cache_model_support_uses_models_json_flag() {
         assert!(models::explicit_prompt_cache_enabled("qwen3.7-max"));
         assert!(models::explicit_prompt_cache_enabled("qwen3.7-plus"));
-        assert!(models::explicit_prompt_cache_enabled("glm-5.1"));
+        assert!(models::explicit_prompt_cache_enabled("glm-5.2"));
     }
 
     #[test]

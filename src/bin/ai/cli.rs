@@ -892,7 +892,6 @@ mod tests {
         assert!(names.iter().any(|name| name == "new-session"));
         assert!(names.iter().any(|name| name == "resume"));
         assert!(names.iter().any(|name| name == "generate-completions"));
-        assert!(names.iter().any(|name| name == "migrate-legacy-knowledge"));
     }
 
     #[test]

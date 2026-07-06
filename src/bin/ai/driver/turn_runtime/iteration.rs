@@ -519,6 +519,7 @@ async fn finalize_stream_interaction(
             allowed_tool_names: request_visible_tool_names(app, force_final_response),
         }),
         StreamOutcome::EmptyResponse => IterationExecution::EmptyResponse,
+        StreamOutcome::Truncated => IterationExecution::Truncated(stream_result),
         _ => IterationExecution::FinalResponse(stream_result),
     })
 }

@@ -1519,7 +1519,9 @@ mod tests {
         assert!(prompt.contains("Knowledge save:"));
         assert!(prompt.contains("call `knowledge_save`"));
         assert!(prompt.contains("`common_sense`, `coding_guideline`"));
-        assert!(prompt.contains("`knowledge_search` or `knowledge_list`"));
+        assert!(prompt.contains("Knowledge retrieval:"));
+        assert!(prompt.contains("search with `knowledge_search`"));
+        assert!(prompt.contains("Use `knowledge_list` when asked what is remembered"));
         assert!(!prompt.contains("call `memory_save`"));
     }
 

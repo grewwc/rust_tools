@@ -153,6 +153,14 @@ pub(super) struct StreamContentState {
     pub(super) thinking_open: bool,
     pub(super) empty_choice_chunks: usize,
     pub(super) finish_reason_seen: bool,
+    /// 最近一个非空 `finish_reason` 的具体值（如 `stop` / `length` / `tool_calls`）。
+    /// `length` 表示服务端因输出上限截断，是比"工具 JSON 解析失败"更早、更准的
+    /// 截断信号，用于把本轮 outcome 升级为可重试的 `Truncated`。
+    pub(super) finish_reason_value: Option<String>,
+    /// 本轮是否发生过「因 arguments JSON 不完整而丢弃工具调用」。大文件 `write_file`
+    /// 撞上输出上限被截断时最典型：JSON 半截 → 被丢弃 → 本轮无有效工具调用。
+    /// 若仅凭"无工具调用 + 有文本"会被误判为正常完成而静默结束。
+    pub(super) dropped_malformed_tool_call: bool,
     pub(super) saw_reasoning_output: bool,
     pub(super) tool_calls_map: SkipMap<usize, ToolCallBuilder>,
     pub(super) assistant_text: String,
@@ -174,6 +182,8 @@ impl StreamContentState {
             thinking_open: false,
             empty_choice_chunks: 0,
             finish_reason_seen: false,
+            finish_reason_value: None,
+            dropped_malformed_tool_call: false,
             saw_reasoning_output: false,
             tool_calls_map: SkipMap::default(),
             assistant_text: String::new(),

@@ -239,6 +239,9 @@ mod tests {
         let expected_dir = store
             .session_assets_dir(&app.session_id)
             .join("tool-overflow");
+        // macOS 上 /tmp 是 /private/tmp 的符号链接；overflow 文件路径经过
+        // canonicalize，比较前需对 expected_dir 做同样处理，否则 starts_with 失败。
+        let expected_dir = expected_dir.canonicalize().unwrap_or(expected_dir);
         let nested_dir = SessionStore::new(app.session_history_file.as_path())
             .session_assets_dir(&app.session_id)
             .join("tool-overflow");

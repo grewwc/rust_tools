@@ -276,6 +276,10 @@ pub(super) enum StreamOutcome {
     #[default]
     Completed,
     EmptyResponse,
+    /// 本轮响应被截断：服务端回 `finish_reason=length`（撞输出上限），或有工具调用
+    /// 因 arguments JSON 不完整被丢弃、导致本轮无有效工具调用。两者都不应被当成
+    /// 正常完成静默结束，而应自动重试并提示模型收缩单次输出（分块写文件等）。
+    Truncated,
     Cancelled,
     ToolCall,
 }

@@ -332,7 +332,9 @@ fn finalize_stream_response(
         maybe_print_prompt_cache_metrics(&usage);
     }
 
-    let mut tool_calls = collect_valid_tool_calls(&mut state.content.tool_calls_map);
+    let (mut tool_calls, dropped_malformed) =
+        collect_valid_tool_calls(&mut state.content.tool_calls_map);
+    state.content.dropped_malformed_tool_call = dropped_malformed;
 
     // Fallback：部分 provider（已知 qwen3.7-max thinking 模式）会把 function call
     // 以纯 content JSON 的形式输出而不走 delta.tool_calls[]，导致 turn 在打印完
@@ -358,12 +360,23 @@ fn finalize_stream_response(
     let outcome = if !tool_calls.is_empty() {
         StreamOutcome::ToolCall
     } else {
-        // 检测空响应：模型返回 200 OK 但没有文本、没有工具调用、没有推理内容。
-        // 这种情况通常是 provider 端的问题（如限流、模型异常），需要触发重试
-        // 而不是静默结束 turn。
         let has_text = !state.content.assistant_text.trim().is_empty();
         let has_reasoning = !state.content.reasoning_text.trim().is_empty();
-        if !has_text && !has_reasoning {
+        // 截断优先判定：本轮无有效工具调用，但要么有工具调用被丢弃（arguments JSON
+        // 半截），要么服务端明确回 finish_reason=length（撞输出上限）。这类"想干活
+        // 但被切断"的情况若按 Completed 静默结束，会让大文件 write_file 等操作凭空
+        // 消失。升级为可重试的 Truncated，由上层注入收缩提示后自动重试。
+        let truncated_by_length = state
+            .content
+            .finish_reason_value
+            .as_deref()
+            .is_some_and(|reason| reason.eq_ignore_ascii_case("length"));
+        if state.content.dropped_malformed_tool_call || truncated_by_length {
+            StreamOutcome::Truncated
+        } else if !has_text && !has_reasoning {
+            // 检测空响应：模型返回 200 OK 但没有文本、没有工具调用、没有推理内容。
+            // 这种情况通常是 provider 端的问题（如限流、模型异常），需要触发重试
+            // 而不是静默结束 turn。
             StreamOutcome::EmptyResponse
         } else {
             StreamOutcome::Completed
@@ -847,9 +860,19 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
 
     let _ = state.render.markdown.flush_pending();
 
+    let (tool_calls, dropped_malformed) =
+        collect_valid_tool_calls(&mut state.content.tool_calls_map);
+    // 解码错误兜底路径本身就是流被中途切断的产物；若还伴随工具调用被丢弃，
+    // 明确标记为截断以触发上层自动重试，而非静默按完成收尾。
+    let outcome = if dropped_malformed {
+        StreamOutcome::Truncated
+    } else {
+        StreamOutcome::Completed
+    };
+
     Some(StreamResult {
-        outcome: StreamOutcome::Completed,
-        tool_calls: collect_valid_tool_calls(&mut state.content.tool_calls_map),
+        outcome,
+        tool_calls,
         assistant_text: std::mem::take(&mut state.content.assistant_text),
         hidden_meta: String::new(),
         reasoning_text: std::mem::take(&mut state.content.reasoning_text),
@@ -920,13 +943,18 @@ fn find_json_object_end(s: &str) -> Option<usize> {
     None
 }
 
+/// 收集本轮有效工具调用。返回 `(工具调用列表, 是否发生过丢弃)`：当某个工具调用
+/// 的 arguments JSON 不完整（典型：大文件 `write_file` 撞输出上限被截断）而无法
+/// 修复时会被丢弃并返回 `dropped=true`，供上层区分"截断"与"正常无工具调用"。
 fn collect_valid_tool_calls(
     builders: &mut rust_tools::cw::SkipMap<usize, ToolCallBuilder>,
-) -> Vec<ToolCall> {
-    builders
+) -> (Vec<ToolCall>, bool) {
+    let mut dropped = false;
+    let tool_calls = builders
         .drain()
         .filter_map(|(_, mut builder)| {
             let Some(arguments) = normalize_tool_call_arguments(&builder.arguments) else {
+                dropped = true;
                 eprintln!(
                     "[Warning] dropping malformed tool call '{}' due to incomplete JSON arguments",
                     builder.function_name
@@ -936,7 +964,8 @@ fn collect_valid_tool_calls(
             builder.arguments = arguments;
             Some(builder.build())
         })
-        .collect()
+        .collect();
+    (tool_calls, dropped)
 }
 
 fn ensure_tool_calls_section_open(
@@ -1658,6 +1687,41 @@ mod tests {
     }
 
     #[test]
+    fn collect_valid_tool_calls_reports_drop_on_incomplete_arguments() {
+        let mut builders: rust_tools::cw::SkipMap<usize, ToolCallBuilder> =
+            rust_tools::cw::SkipMap::default();
+        // 模拟大文件 write_file 撞输出上限：arguments JSON 半截、无法修复。
+        builders.insert(
+            0,
+            ToolCallBuilder {
+                function_name: "write_file".to_string(),
+                arguments: "{\"path\":\"/tmp/x\",\"content\":\"aaa".to_string(),
+                ..Default::default()
+            },
+        );
+        let (calls, dropped) = collect_valid_tool_calls(&mut builders);
+        assert!(calls.is_empty(), "半截 JSON 应被丢弃");
+        assert!(dropped, "发生丢弃时应返回 dropped=true");
+    }
+
+    #[test]
+    fn collect_valid_tool_calls_no_drop_on_valid_arguments() {
+        let mut builders: rust_tools::cw::SkipMap<usize, ToolCallBuilder> =
+            rust_tools::cw::SkipMap::default();
+        builders.insert(
+            0,
+            ToolCallBuilder {
+                function_name: "read_file".to_string(),
+                arguments: "{\"path\":\"/tmp/x\"}".to_string(),
+                ..Default::default()
+            },
+        );
+        let (calls, dropped) = collect_valid_tool_calls(&mut builders);
+        assert_eq!(calls.len(), 1);
+        assert!(!dropped, "合法 JSON 不应触发 dropped");
+    }
+
+    #[test]
     fn recover_inline_tool_calls_handles_bare_object() {
         // 模拟 qwen3.7-max 把 tool call 当成 content 输出的情况。
         let raw = r#"{"name":"read_file","arguments":{"path":"/tmp/x"}}"#;
@@ -2268,6 +2332,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_response_marks_length_finish_reason_as_truncated() {
+        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request_buf = [0u8; 1024];
+            let _ = stream.read(&mut request_buf);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .unwrap();
+            // 有可见文本但服务端因输出上限截断：finish_reason=length。
+            write_http_chunk(
+                &mut stream,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial output\"}}]}\n\n",
+            )
+            .unwrap();
+            write_http_chunk(
+                &mut stream,
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+            )
+            .unwrap();
+            let _ = done_rx.recv_timeout(Duration::from_secs(2));
+        });
+
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let mut response = client
+            .post(format!("http://{addr}/chat"))
+            .send()
+            .await
+            .unwrap();
+        let mut app = test_app();
+        init_os_tools_globals(app.os.clone());
+        crate::ai::driver::signal::clear_request_interrupt();
+        let mut current_history = String::new();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            stream_response(&mut app, &mut response, &mut current_history, None),
+        )
+        .await
+        .expect("stream_response should return after finish_reason grace window")
+        .unwrap();
+
+        // 关键断言：有文本但 finish_reason=length 时升级为 Truncated（可重试），
+        // 而不是被当成 Completed 静默结束。
+        assert_eq!(result.outcome, StreamOutcome::Truncated);
+        assert_eq!(result.assistant_text, "partial output");
+
+        drop(response);
+        let _ = done_tx.send(());
+        server.join().unwrap();
+        crate::ai::driver::signal::clear_request_interrupt();
+        if let Ok(mut guard) = GLOBAL_OS.lock() {
+            *guard = None;
+        }
+    }
+
+    #[tokio::test]
     async fn stream_response_keeps_reading_delayed_chunks_after_finish_reason() {
         let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2400,6 +2526,18 @@ fn process_stream_payload(
             .is_some_and(|reason| !reason.trim().is_empty())
     }) {
         state.content.finish_reason_seen = true;
+    }
+
+    // 记录最近一个非空 finish_reason 的具体值。`length` 表示服务端因输出上限
+    // 截断，是把本轮升级为可重试 Truncated 的关键信号。
+    if let Some(reason) = chunk.choices.iter().find_map(|choice| {
+        choice
+            .finish_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|reason| !reason.is_empty())
+    }) {
+        state.content.finish_reason_value = Some(reason.to_string());
     }
 
     if chunk.choices.is_empty() {

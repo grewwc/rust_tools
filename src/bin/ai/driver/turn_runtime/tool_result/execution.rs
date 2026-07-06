@@ -629,6 +629,68 @@ fn requested_only_discover_skills(tool_calls: &[ToolCall]) -> bool {
             .all(|tool_call| tool_call.function.name == "discover_skills")
 }
 
+const TRUNCATION_RETRY_NOTE_PREFIX: &str = "tool_followup:output_truncated\n";
+
+/// 在检测到本轮响应被截断后，把已产出的可见文本（若有）作为部分进展保留，并追加
+/// 一条收缩重写提示，指导模型下一轮缩小单次输出规模后重发被截断的操作。
+///
+/// 幂等：同一条提示不会重复注入，避免连续截断时堆叠多份相同 note。
+fn append_truncation_retry_note(
+    stream_result: &crate::ai::types::StreamResult,
+    messages: &mut Vec<Message>,
+    turn_messages: &mut Vec<Message>,
+) {
+    use serde_json::Value;
+
+    // 保留模型已输出的可见文本作为"部分进展"，让重试时不至于完全丢失上下文。
+    // 截断场景下这段文本往往是半截的意图说明，仅作参考，不当作最终回答。
+    let partial = stream_result.assistant_text.trim();
+    if !partial.is_empty() {
+        append_message_pair(
+            messages,
+            turn_messages,
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String(partial.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        );
+    }
+
+    let already_present = messages.iter().chain(turn_messages.iter()).any(|message| {
+        message.role == ROLE_INTERNAL_NOTE
+            && message
+                .content
+                .as_str()
+                .is_some_and(|content| content.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))
+    });
+    if already_present {
+        return;
+    }
+
+    let mut note = String::from(TRUNCATION_RETRY_NOTE_PREFIX);
+    note.push_str("上一轮响应在生成中途被截断（疑似撞到输出长度上限），未能完成。\n");
+    note.push_str("这不是最终回答。请继续当前任务，并显著缩小单次输出规模：\n");
+    note.push_str(
+        "- 若在写文件：把大文件拆成多次调用（先创建骨架，再分块 append/edit），单次 write 控制在几百行以内；\n",
+    );
+    note.push_str("- 优先用小步、多次的工具调用，而不是一次性产出超大内容；\n");
+    note.push_str("- 只重发被截断的那个操作，不要重复已经成功完成的步骤。");
+    append_message_pair(
+        messages,
+        turn_messages,
+        Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(note),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        },
+    );
+}
+
 fn append_discover_skills_followup_note(
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
@@ -768,6 +830,17 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
         IterationExecution::EmptyResponse => {
             // 模型返回空响应（无文本、无工具调用、无思考内容），自动重试
             let _ = writeln!(std::io::stderr(), "  ⚠ 模型返回空响应，自动重试…");
+            Ok(TurnLoopStep::Continue)
+        }
+        IterationExecution::Truncated(stream_result) => {
+            // 响应被截断（撞输出上限或工具调用 arguments JSON 半截）。保留已产出的
+            // 可见文本作为上下文，并注入一条收缩重写提示后自动重试，避免大文件
+            // write_file 等操作因半截 JSON 被静默丢弃、turn 凭空结束。
+            let _ = writeln!(
+                std::io::stderr(),
+                "  ⚠ 模型响应被截断（疑似输出上限），提示收缩后自动重试…"
+            );
+            append_truncation_retry_note(&stream_result, messages, turn_messages);
             Ok(TurnLoopStep::Continue)
         }
         IterationExecution::FinalResponse(stream_result) => {
@@ -1249,6 +1322,114 @@ mod tests {
         assert!(!final_assistant_recorded);
         assert!(messages.is_empty());
         assert!(turn_messages.is_empty());
+    }
+
+    #[test]
+    fn truncated_response_retries_and_injects_shrink_note() {
+        let mut app = test_app_with_tools(&["write_file"]);
+        let mcp = crate::ai::mcp::McpClient::new();
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+        let mut persisted_turn_messages = 0usize;
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut force_final_response = false;
+        let mut terminal_dedupe_candidate = None;
+
+        let step = handle_iteration_execution(
+            &mut app,
+            "write a big script",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            IterationExecution::Truncated(crate::ai::types::StreamResult {
+                outcome: crate::ai::types::StreamOutcome::Truncated,
+                tool_calls: Vec::new(),
+                assistant_text: "现在让我来编写一个综合脚本".to_string(),
+                hidden_meta: String::new(),
+                reasoning_text: String::new(),
+                skip_response_drain: true,
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            1,
+            16,
+        )
+        .unwrap();
+
+        // 截断应自动重试（Continue），不得静默完成。
+        assert!(matches!(step, TurnLoopStep::Continue));
+        assert!(final_assistant_text.is_empty());
+        assert!(!final_assistant_recorded);
+        // 部分可见文本被保留为 assistant 上下文。
+        assert!(messages.iter().any(|m| m.role == "assistant"
+            && m.content.as_str() == Some("现在让我来编写一个综合脚本")));
+        // 注入了一条收缩重写提示。
+        assert!(messages.iter().any(|m| m.role == ROLE_INTERNAL_NOTE
+            && m.content
+                .as_str()
+                .is_some_and(|c| c.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))));
+    }
+
+    #[test]
+    fn truncation_retry_note_is_idempotent() {
+        let mut app = test_app_with_tools(&["write_file"]);
+        let mcp = crate::ai::mcp::McpClient::new();
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+        let mut persisted_turn_messages = 0usize;
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut force_final_response = false;
+        let mut terminal_dedupe_candidate = None;
+
+        for _ in 0..2 {
+            handle_iteration_execution(
+                &mut app,
+                "write a big script",
+                &shared_mcp.lock().unwrap(),
+                &shared_mcp,
+                IterationExecution::Truncated(crate::ai::types::StreamResult {
+                    outcome: crate::ai::types::StreamOutcome::Truncated,
+                    tool_calls: Vec::new(),
+                    assistant_text: String::new(),
+                    hidden_meta: String::new(),
+                    reasoning_text: String::new(),
+                    skip_response_drain: true,
+                }),
+                &mut messages,
+                &mut turn_messages,
+                false,
+                &mut persisted_turn_messages,
+                &mut final_assistant_text,
+                &mut final_assistant_recorded,
+                &mut force_final_response,
+                &mut terminal_dedupe_candidate,
+                true,
+                1,
+                16,
+            )
+            .unwrap();
+        }
+
+        let note_count = messages
+            .iter()
+            .filter(|m| {
+                m.role == ROLE_INTERNAL_NOTE
+                    && m.content
+                        .as_str()
+                        .is_some_and(|c| c.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))
+            })
+            .count();
+        assert_eq!(note_count, 1, "重复截断不应堆叠多份相同提示");
     }
 
     #[test]

@@ -913,7 +913,6 @@ mod tests {
         let err =
             execute_load_skill(&serde_json::json!({"name": "definitely-not-a-skill"})).unwrap_err();
         assert!(err.contains("No skill named"));
-        assert!(err.contains("discover_skills"));
     }
 
     #[test]

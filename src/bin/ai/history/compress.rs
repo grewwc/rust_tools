@@ -1082,7 +1082,14 @@ fn first_preserved_content_spill_candidate(messages: &[Message]) -> Option<usize
             continue;
         }
 
-        let char_count = text.chars().count();
+        // value_to_string 会把图片 base64 折叠成 "[图片]"，无法反映真实体量。
+        // 对图片消息改用原始 content 的序列化长度判断是否需要外溢，与「把大图
+        // 搬到会话临时文件」的意图一致；普通文本消息仍按 value_to_string 计费。
+        let char_count = if message_contains_image(&message.content) {
+            message.content.to_string().chars().count()
+        } else {
+            text.chars().count()
+        };
         if message_contains_image(&message.content) && char_count >= IMAGE_OVERFLOW_SPILL_MIN_CHARS
         {
             return Some(idx);

@@ -30,6 +30,9 @@ pub(super) enum IterationExecution {
     Exit(TurnOutcome),
     RequestFailed(String),
     EmptyResponse,
+    /// 本轮响应被截断（服务端 finish_reason=length，或工具调用 arguments JSON
+    /// 不完整被丢弃）。应注入"收缩单次输出"提示后自动重试，而非静默完成。
+    Truncated(crate::ai::types::StreamResult),
     FinalResponse(crate::ai::types::StreamResult),
     ToolCall(ToolCallExecution),
 }

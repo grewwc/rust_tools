@@ -707,6 +707,7 @@ async fn run_turn_body(
     let mut tools_used_this_turn: rust_tools::cw::SkipSet<String> =
         rust_tools::cw::SkipSet::default();
     let mut consecutive_empty_responses: usize = 0;
+    let mut consecutive_truncations: usize = 0;
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
         {
@@ -752,6 +753,24 @@ async fn run_turn_body(
                 }
             } else {
                 consecutive_empty_responses = 0;
+            }
+            // 截断重试计数：连续多次被截断（输出上限/工具 JSON 半截）仍无法收敛时
+            // 放弃，避免无限重试烧预算。阈值取 3：给模型两次收缩重写的机会。
+            if matches!(execution, IterationExecution::Truncated(_)) {
+                consecutive_truncations += 1;
+                if consecutive_truncations > 3 {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  ✗ 连续 {} 次响应被截断，停止重试",
+                        consecutive_truncations
+                    );
+                    final_assistant_text =
+                        "[模型输出多次被截断，请缩小单次操作规模（如分块写文件）或切换模型]"
+                            .to_string();
+                    break 'turn Ok(None);
+                }
+            } else {
+                consecutive_truncations = 0;
             }
             let step = match handle_iteration_execution(
                 app, &question, &mc, mcp_client, execution,
