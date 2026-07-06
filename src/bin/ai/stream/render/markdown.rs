@@ -35,6 +35,10 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     table_state: TableState,
     dimmed: bool,
     code_preview_segment_width: usize,
+    // 已缓存但尚未落地的纯空行数。正文/收尾常带尾随空行，逐行直出会在屏幕上
+    // 堆叠成多余空白（尤其在正文结束到工具状态行之间）。缓存后：有真实内容跟进
+    // 就照数补回（段间空行不受影响），若直到 flush 仍无内容则作为尾随空行丢弃。
+    deferred_blank_lines: usize,
     // HTML 表格缓冲状态
     in_html_table: bool,
     html_table_buf: String,
@@ -65,6 +69,7 @@ impl MarkdownStreamRenderer {
             table_state: TableState::None,
             dimmed: false,
             code_preview_segment_width: 0,
+            deferred_blank_lines: 0,
             in_html_table: false,
             html_table_buf: String::new(),
             html_table_preview_height: 0,
@@ -115,6 +120,9 @@ impl MarkdownStreamRenderer {
     #[cfg(test)]
     fn flush_pending_for_test(&mut self) -> io::Result<String> {
         let mut out = Vec::new();
+
+        // 收尾时残留的缓存空行属于尾随空行，直接丢弃（不落地）。
+        self.deferred_blank_lines = 0;
 
         if !self.line_buf.is_empty() {
             if self.line_preview_emitted {
@@ -201,6 +209,23 @@ impl MarkdownStreamRenderer {
         }
 
         let line = std::mem::take(&mut self.line_buf);
+
+        // 纯空行且不在代码块/数学块/表格上下文：先缓存，不立即落地。等真实内容跟进
+        // 时照数补回（段间空行不受影响）；若直到 flush 仍无内容，则作为尾随空行丢弃，
+        // 避免正文结束到工具状态行之间堆叠出多余空白。
+        if !self.line_preview_emitted
+            && line.trim().is_empty()
+            && !self.in_code_block
+            && !self.in_math_block
+            && !self.in_html_table
+            && matches!(self.table_state, TableState::None)
+        {
+            self.deferred_blank_lines += 1;
+            self.line_preview_height = 0;
+            self.code_preview_segment_width = 0;
+            return Ok(());
+        }
+
         let rendered = self.consume_line(&line, self.line_preview_emitted);
 
         self.line_preview_emitted = false;
@@ -208,6 +233,7 @@ impl MarkdownStreamRenderer {
         self.code_preview_segment_width = 0;
 
         if !rendered.is_empty() {
+            self.flush_deferred_blank_lines(out)?;
             out.write_all(rendered.as_bytes())?;
             out.flush()?;
             self.bol = rendered.ends_with('\n');
@@ -215,7 +241,24 @@ impl MarkdownStreamRenderer {
         Ok(())
     }
 
+    /// 把缓存的纯空行照数补回（有真实内容跟进时调用），保证段落间的空行不受影响。
+    fn flush_deferred_blank_lines(&mut self, out: &mut dyn Write) -> io::Result<()> {
+        if self.deferred_blank_lines == 0 {
+            return Ok(());
+        }
+        for _ in 0..self.deferred_blank_lines {
+            out.write_all(b"\n")?;
+        }
+        self.deferred_blank_lines = 0;
+        self.bol = true;
+        Ok(())
+    }
+
     fn handle_char(&mut self, out: &mut dyn Write, ch: char) -> io::Result<()> {
+        // 真实内容行的第一个字符到达：把此前缓存的纯空行照数补回，再输出该行。
+        if self.deferred_blank_lines > 0 && self.line_buf.chars().count() == 1 {
+            self.flush_deferred_blank_lines(out)?;
+        }
         if self.should_emit_table_preview_live() {
             self.handle_table_preview(out, ch)
         } else {
@@ -356,6 +399,9 @@ impl MarkdownStreamRenderer {
 
     pub(in crate::ai::stream) fn flush_pending(&mut self) -> io::Result<()> {
         let mut out = io::stdout();
+
+        // 收尾时残留的缓存空行属于尾随空行，直接丢弃（不落地）。
+        self.deferred_blank_lines = 0;
 
         if !self.line_buf.is_empty() {
             if self.line_preview_emitted {
@@ -1221,6 +1267,8 @@ mod tests {
 
     #[test]
     fn pending_header_flush_rewrites_to_plain_markdown_line() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "80") };
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         renderer.bol = true;
 
@@ -1234,6 +1282,41 @@ mod tests {
 
         let visible = strip_ansi_for_test(&flushed);
         assert_eq!(visible, "| Header | Value |\n");
+    }
+
+    #[test]
+    fn trailing_blank_lines_are_dropped_on_flush() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "40") };
+        let stream = render_full_stream("done\n\n\n", false);
+        let mut grid = VtGrid::new(40);
+        grid.feed(&stream);
+        let non_empty: Vec<String> = grid
+            .screen()
+            .into_iter()
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(non_empty, vec!["done".to_string()]);
+    }
+
+    #[test]
+    fn interior_blank_lines_are_preserved_when_content_follows() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "40") };
+        let stream = render_full_stream("first\n\nsecond\n", false);
+        let mut grid = VtGrid::new(40);
+        grid.feed(&stream);
+        let screen = grid.screen();
+        let trimmed: Vec<&String> = screen
+            .iter()
+            .rev()
+            .skip_while(|line| line.is_empty())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let joined: Vec<&str> = trimmed.iter().map(|s| s.as_str()).collect();
+        assert_eq!(joined, vec!["first", "", "second"]);
     }
 
     #[test]

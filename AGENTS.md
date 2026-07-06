@@ -98,11 +98,13 @@ Detailed references live under:
 ## Maintaining Instruction Docs
 
 When code changes would make any statement in these files stale (layout,
-invariants, build/test commands, subsystem rules, on-demand guide references):
+invariants, build/test commands, subsystem rules, on-demand guide references),
+or when tests need to be updated to match new behavior:
 
 1. Update the nearest scoped `AGENTS.md` for the touched subsystem.
-2. Keep this root file limited to repo-wide overview, layout, and invariants.
-3. Put long subsystem explanations in `docs/agent-guides/*.md`, then reference them from the nearest scoped `AGENTS.md`.
-4. Keep the top-level layout and build/test commands accurate.
+2. Sync the corresponding tests and any affected `AGENTS.md` files (including those under submodules) so docs and tests stay consistent with the implementation.
+3. Keep this root file limited to repo-wide overview, layout, and invariants.
+4. Put long subsystem explanations in `docs/agent-guides/*.md`, then reference them from the nearest scoped `AGENTS.md`.
+5. Keep the top-level layout and build/test commands accurate.
 
 > Principle: root instructions should stay concise, scoped instructions should stay local, and long references should be loaded only when the task actually needs them.
