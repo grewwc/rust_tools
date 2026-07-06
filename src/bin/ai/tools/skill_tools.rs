@@ -130,8 +130,7 @@ fn summarize_skill(skill: &SkillManifest, include_capabilities: bool) -> String 
     line
 }
 
-/// discover_skills 相关性门槛。比自动路由的 `has_skill_signal`(0.08) 更严：那是
-/// 配合 sticky/threshold 的"保留信号"，这里是独立过滤器，必须自己把噪音挡掉。
+/// discover_skills 相关性门槛。作为独立过滤器，必须自己把噪音挡掉。
 /// embedding 关闭的降级路径里，char-ngram TF-IDF 对无关 query 也能凑出 ~0.10 的
 /// blended 噪音，故 blended 门槛取 0.12 以越过噪音天花板。
 const DISCOVER_BLENDED_FLOOR: f64 = 0.12;

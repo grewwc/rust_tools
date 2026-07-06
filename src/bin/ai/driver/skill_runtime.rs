@@ -2,16 +2,13 @@ use crate::ai::{
     agents::{AgentManifest, load_project_instruction_docs},
     mcp::McpClient,
     skills::SkillManifest,
-    types::{App, SkillBiasMemory, ToolDefinition},
+    types::{App, ToolDefinition},
 };
 use crate::commonw::configw;
 use rust_tools::cw::SkipSet;
 use std::sync::{LazyLock, Mutex};
 
-use super::{
-    DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS, TextSimilarityFeatures,
-    jaccard_similarity_for_sets, set_intersection_count,
-};
+use super::{DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS};
 
 type ToolDef = ToolDefinition;
 
@@ -1039,60 +1036,6 @@ fn should_skip_recall_for_skill(skill: Option<&SkillManifest>) -> bool {
     skill.is_some_and(|skill| skill.skip_recall || is_executor_skill(skill))
 }
 
-fn looks_like_follow_up_or_same_topic(question: &str, previous_question: &str) -> bool {
-    let current = question.trim();
-    let previous = previous_question.trim();
-    if current.is_empty() || previous.is_empty() {
-        return false;
-    }
-
-    let current_features = TextSimilarityFeatures::from_text(current);
-    let previous_features = TextSimilarityFeatures::from_text(previous);
-    let token_similarity =
-        jaccard_similarity_for_sets(&current_features.token_set, &previous_features.token_set);
-    if token_similarity >= 0.34 {
-        return true;
-    }
-
-    let bigram_similarity = jaccard_similarity_for_sets(
-        &current_features.char_bigrams,
-        &previous_features.char_bigrams,
-    );
-    if bigram_similarity >= 0.2 {
-        return true;
-    }
-
-    if current_features.token_set.is_empty() || previous_features.token_set.is_empty() {
-        return false;
-    }
-
-    let overlap = set_intersection_count(&current_features.token_set, &previous_features.token_set);
-    let new_tokens = current_features.token_set.len().saturating_sub(overlap);
-    let new_token_ratio = new_tokens as f64 / current_features.token_set.len().max(1) as f64;
-    let current_chars = current.chars().count();
-    let previous_chars = previous.chars().count();
-
-    (current_chars <= 64 && overlap >= 1 && new_token_ratio <= 0.5)
-        || (current_chars <= 32 && current_chars <= previous_chars && overlap >= 1)
-        || (current_chars <= 24 && (token_similarity >= 0.18 || bigram_similarity >= 0.12))
-}
-
-fn cross_turn_preferred_skill_name(app: &App, question: &str) -> Option<String> {
-    let memory = app.last_skill_bias.as_ref()?;
-    if looks_like_follow_up_or_same_topic(question, &memory.question) {
-        Some(memory.skill_name.clone())
-    } else {
-        None
-    }
-}
-
-fn update_cross_turn_skill_bias(app: &mut App, question: &str, skill: Option<&SkillManifest>) {
-    app.last_skill_bias = skill.map(|selected| SkillBiasMemory {
-        skill_name: selected.name.clone(),
-        question: question.trim().to_string(),
-    });
-}
-
 fn build_skill_turn_guard(
     app: &mut App,
     mcp_client: &McpClient,
@@ -1171,11 +1114,10 @@ pub(super) fn force_activate_named_skill(
     app: &mut App,
     mcp_client: &McpClient,
     skill_manifests: &[SkillManifest],
-    question: &str,
+    _question: &str,
     requested_name: &str,
 ) -> Option<SkillTurnGuard> {
     let skill = skill_manifests.iter().find(|s| s.name == requested_name)?;
-    update_cross_turn_skill_bias(app, question, Some(skill));
     let mut guard = build_skill_turn_guard(app, mcp_client, Some(skill));
     guard.matched_skill_name = Some(skill.name.clone());
     guard.skip_recall_by_skill = should_skip_recall_for_skill(Some(skill));
@@ -1218,26 +1160,20 @@ pub(super) fn prepare_skill_for_turn(
             }
         } else if debug {
             eprintln!(
-                "[skills] forced @skills:{} not found, falling back to cross-turn sticky",
+                "[skills] forced @skills:{} not found, no auto-activation",
                 forced
             );
         }
     }
 
-    // 不再做 TF-IDF 自动预路由：交给 LLM 在需要时通过 discover_skills /
-    // activate_skill 自主选择。仅保留 cross-turn sticky，让上一轮激活的
-    // skill 在追问场景下保持连续性。
-    let skill = cross_turn_preferred_skill_name(app, question)
-        .and_then(|name| skill_manifests.iter().find(|s| s.name == name));
+    // 不做任何自动 skill 激活：交给 LLM 在需要时通过 discover_skills /
+    // activate_skill 自主选择。cross-turn sticky 也已移除——浅层 Jaccard
+    // 匹配无法区分"追问同一 skill"与"恰好共享 token 的不同话题"。
+    let skill: Option<&SkillManifest> = None;
 
     if debug {
-        if let Some(s) = skill.as_ref() {
-            eprintln!("[skills] cross-turn sticky: {}", s.name);
-        } else {
-            eprintln!("[skills] no pre-route; LLM may discover_skills if needed");
-        }
+        eprintln!("[skills] no auto-activation; LLM may discover_skills if needed");
     }
-    update_cross_turn_skill_bias(app, question, skill);
     let matched_skill_name = skill.as_ref().map(|s| s.name.clone());
     let skip_recall_by_skill = should_skip_recall_for_skill(skill);
     let mut guard = build_skill_turn_guard(app, mcp_client, skill);
@@ -1252,7 +1188,7 @@ mod tests {
         ContextKind, SystemPromptBuilder, available_tool_names,
         build_hidden_mcp_tool_catalog, build_project_instruction_prompt, build_system_prompt,
         builtin_tools_for_skill, ensure_required_baseline_tools,
-        filter_mcp_tools_by_allowed_servers, has_tool, looks_like_follow_up_or_same_topic,
+        filter_mcp_tools_by_allowed_servers, has_tool,
         merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
         select_mcp_tools,
         tool_uses_mcp_server,
@@ -1983,13 +1919,5 @@ mod tests {
 
     fn model_path() -> std::path::PathBuf {
         crate::ai::driver::skill_match_model::default_model_path()
-    }
-
-    #[test]
-    fn follow_up_detector_recognizes_short_continuation_question() {
-        assert!(looks_like_follow_up_or_same_topic(
-            "那这个 panic 呢？",
-            "帮我调试一下这个 Rust panic"
-        ));
     }
 }

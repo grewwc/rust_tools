@@ -7,12 +7,12 @@ use crate::ai::stream::render::code::{
 use crate::ai::stream::render::html::{
     contains_close_table_tag, contains_open_table_tag, parse_html_table, render_html_table,
 };
-use crate::ai::stream::render::inline::render_inline_md;
+use crate::ai::stream::render::inline::{render_inline_md, terminal_cell_width};
 use crate::ai::stream::render::table::{
     TableAlign, TableState, compute_table_widths, is_table_row, is_table_row_candidate,
     is_table_separator, line_looks_like_table_preview, parse_table_align, parse_table_row,
     render_table_bottom, render_table_header, render_table_mid, render_table_row, render_table_top,
-    split_indent, table_preview_height,
+    split_indent, table_column_ranges, table_preview_height,
 };
 use crate::ai::stream::state::{END_THINKING_TAG_TEXT, THINKING_TAG_TEXT};
 use crate::ai::theme::{
@@ -333,7 +333,7 @@ impl MarkdownStreamRenderer {
             return Ok(());
         }
 
-        let ch_width = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
+        let ch_width = terminal_cell_width(ch);
 
         if !self.line_preview_emitted {
             out.write_all(
@@ -720,14 +720,55 @@ impl MarkdownStreamRenderer {
             return String::new();
         }
 
-        let widths = compute_table_widths(indent, header, rows);
+        let ranges = table_column_ranges(indent, cols);
+        if ranges.len() > 1 {
+            let mut final_table = String::new();
+            for (idx, range) in ranges.into_iter().enumerate() {
+                if idx > 0 {
+                    final_table.push('\n');
+                }
+                final_table
+                    .push_str(&self.render_table_column_block(indent, header, align, rows, range));
+            }
+            return final_table;
+        }
+
+        self.render_table_column_block(indent, header, align, rows, 0..cols)
+    }
+
+    fn render_table_column_block(
+        &self,
+        indent: &str,
+        header: &[String],
+        align: &[TableAlign],
+        rows: &[Vec<String>],
+        range: std::ops::Range<usize>,
+    ) -> String {
+        let header = range
+            .clone()
+            .map(|idx| header.get(idx).cloned().unwrap_or_default())
+            .collect::<Vec<_>>();
+        let align = range
+            .clone()
+            .map(|idx| align.get(idx).copied().unwrap_or(TableAlign::Left))
+            .collect::<Vec<_>>();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                range
+                    .clone()
+                    .map(|idx| row.get(idx).cloned().unwrap_or_default())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let widths = compute_table_widths(indent, &header, &rows);
         let mut final_table = String::new();
         final_table.push_str(&render_table_top(indent, &widths));
-        final_table.push_str(&render_table_header(indent, header, align, &widths));
+        final_table.push_str(&render_table_header(indent, &header, &align, &widths));
         final_table.push_str(&render_table_mid(indent, &widths));
-        for row in rows {
-            let row_cells = row.to_vec();
-            final_table.push_str(&render_table_row(indent, &row_cells, align, &widths));
+        for row in &rows {
+            final_table.push_str(&render_table_row(indent, row, &align, &widths));
         }
         final_table.push_str(&render_table_bottom(indent, &widths));
         final_table
@@ -997,21 +1038,6 @@ pub(in crate::ai) fn live_preview_cursor_rows(line: &str) -> usize {
     lines
 }
 
-fn terminal_cell_width(ch: char) -> usize {
-    if is_single_width_terminal_symbol(ch) {
-        return 1;
-    }
-    unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0)
-}
-
-fn is_single_width_terminal_symbol(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{2500}'..='\u{259f}' // box drawing + block elements
-            | '\u{2800}'..='\u{28ff}' // braille patterns
-    )
-}
-
 /// 终端可用列数（已扣除右侧安全边距）。
 ///
 /// 大多数终端开启 DECAWM（auto-margin）：当输出列号 == 列数时会触发隐式换行，
@@ -1093,7 +1119,7 @@ fn wrap_code_block_text(text: &str, content_width: usize) -> Vec<String> {
     let mut current_width = 0usize;
 
     for ch in text.chars() {
-        let ch_width = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
+        let ch_width = terminal_cell_width(ch);
         if current_width > 0 && current_width + ch_width > content_width {
             lines.push(std::mem::take(&mut current));
             current_width = 0;
@@ -1214,6 +1240,7 @@ fn split_list_prefix(line: &str) -> Option<(&str, &str, Option<bool>, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::stream::render::inline::terminal_display_width;
     use crate::ai::test_support::ENV_LOCK;
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -1874,10 +1901,11 @@ mod tests {
         let screen = grid.screen();
         let joined = screen.join("\n");
         let table_count = joined.matches('┌').count();
+        let expected_table_count = table_column_ranges("", 3).len();
 
         assert_eq!(
-            table_count, 1,
-            "table rewrite should leave exactly one table on screen, got {table_count}:\n{joined}"
+            table_count, expected_table_count,
+            "table rewrite should leave exactly the expected split tables on screen, got {table_count}, expected {expected_table_count}:\n{joined}"
         );
     }
 
@@ -2006,7 +2034,7 @@ mod tests {
         assert!(!rendered.is_empty());
         for line in rendered.lines() {
             let visible = crate::ai::stream::extract::strip_ansi_codes(line);
-            let width = unicode_width::UnicodeWidthStr::width(visible.as_str());
+            let width = terminal_display_width(visible.as_str());
             assert!(
                 width <= 80,
                 "rendered table line exceeds terminal width ({width}):\n{visible}"
@@ -2014,6 +2042,51 @@ mod tests {
             assert!(
                 visible.starts_with(['┌', '├', '└', '│']),
                 "table line should not be a wrapped continuation:\n{visible}"
+            );
+        }
+    }
+
+    #[test]
+    fn overwide_table_splits_into_column_blocks_that_fit_terminal_width() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "80") };
+
+        let renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let header = (0..20).map(|idx| format!("列{idx}")).collect::<Vec<_>>();
+        let align = vec![TableAlign::Left; 20];
+        let rows = vec![vec![
+            "alpha beta gamma".to_string(),
+            "delta epsilon zeta".to_string(),
+            "eta theta iota".to_string(),
+            "kappa lambda mu".to_string(),
+            "nu xi omicron".to_string(),
+            "pi rho sigma".to_string(),
+            "tau upsilon phi".to_string(),
+            "chi psi omega".to_string(),
+            "一二三四五六".to_string(),
+            "七八九十十一".to_string(),
+            "long-token-abcdefghij".to_string(),
+            "long-token-klmnopqrst".to_string(),
+            "long-token-uvwxyz".to_string(),
+            "markdown `code span`".to_string(),
+            "**bold value**".to_string(),
+            "plain value".to_string(),
+            "another value".to_string(),
+            "more value".to_string(),
+            "tail value".to_string(),
+            "final value".to_string(),
+        ]];
+
+        let rendered = renderer.render_table_block("", &header, &align, &rows);
+        let top_count = rendered.matches('┌').count();
+
+        assert!(top_count > 1, "overwide table should be split:\n{rendered}");
+        for line in rendered.lines().filter(|line| !line.is_empty()) {
+            let visible = crate::ai::stream::extract::strip_ansi_codes(line);
+            let width = terminal_display_width(visible.as_str());
+            assert!(
+                width <= 80,
+                "split table line exceeds terminal width ({width}):\n{visible}\n\n{rendered}"
             );
         }
     }

@@ -1,5 +1,26 @@
 use crate::ai::stream::render::code::{MONOKAI_BG, MONOKAI_FG};
 
+/// 终端里 box-drawing/block/braille 符号按单列渲染；`width_cjk` 会把其中一部分
+/// ambiguous 字符算成 2 列，导致表格边框和 cursor-up 高度漂移。
+pub(super) fn terminal_cell_width(ch: char) -> usize {
+    if is_single_width_terminal_symbol(ch) {
+        return 1;
+    }
+    unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0)
+}
+
+pub(super) fn terminal_display_width(s: &str) -> usize {
+    s.chars().map(terminal_cell_width).sum()
+}
+
+fn is_single_width_terminal_symbol(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2500}'..='\u{259f}' // box drawing + block elements
+            | '\u{2800}'..='\u{28ff}' // braille patterns
+    )
+}
+
 pub(super) fn render_inline_md(s: &str, base: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = String::new();
@@ -268,10 +289,7 @@ fn strip_inline_md_markers(s: &str) -> String {
 }
 
 pub(super) fn visible_width(s: &str) -> usize {
-    strip_inline_md_markers(s)
-        .chars()
-        .map(|c| unicode_width::UnicodeWidthChar::width_cjk(c).unwrap_or(0))
-        .sum()
+    terminal_display_width(&strip_inline_md_markers(s))
 }
 
 pub(super) fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
@@ -393,7 +411,7 @@ pub(super) fn wrap_md_cell(s: &str, width: usize) -> Vec<String> {
         }
 
         let ch = rest.chars().next().unwrap();
-        let w = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
+        let w = terminal_cell_width(ch);
         if cur_w > 0 && cur_w + w > width {
             trim_trailing_spaces(&mut cur, &mut cur_w);
             close_line(&mut lines, &mut cur, bold, italic);
@@ -429,7 +447,11 @@ fn split_atomic_markdown_span(s: &str) -> Option<(&str, &str, &str)> {
         if s.starts_with(delim) && s.ends_with(delim) && s.len() >= delim.len() * 2 {
             let inner_start = delim.len();
             let inner_end = s.len() - delim.len();
-            return Some((&s[..inner_start], &s[inner_start..inner_end], &s[inner_end..]));
+            return Some((
+                &s[..inner_start],
+                &s[inner_start..inner_end],
+                &s[inner_end..],
+            ));
         }
     }
     None
@@ -445,7 +467,7 @@ fn wrap_plain_visible_text(s: &str, width: usize) -> Vec<String> {
     let mut cur = String::new();
     let mut cur_w = 0usize;
     for ch in s.chars() {
-        let w = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
+        let w = terminal_cell_width(ch);
         if cur_w > 0 && cur_w + w > width {
             out.push(std::mem::take(&mut cur));
             cur_w = 0;
@@ -599,6 +621,13 @@ mod tests {
     }
 
     #[test]
+    fn terminal_width_counts_box_drawing_as_single_width() {
+        assert_eq!(terminal_display_width("┌────┬────┐"), 11);
+        assert_eq!(visible_width("────"), 4);
+        assert_eq!(wrap_md_cell("──────", 4), vec!["────", "──"]);
+    }
+
+    #[test]
     fn inline_code_uses_monokai_colors() {
         let rendered = render_inline_md("use `cargo test` please", "");
         assert!(rendered.contains(MONOKAI_BG));
@@ -663,5 +692,4 @@ mod tests {
         assert!(!rendered.contains("\x1b[95m"));
         assert!(rendered.contains("$5 USD"));
     }
-
 }

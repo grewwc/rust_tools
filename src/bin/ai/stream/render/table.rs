@@ -1,7 +1,11 @@
 use crate::ai::stream::{
     extract::strip_ansi_codes,
-    render::inline::{render_inline_md, visible_width, wrap_md_cell},
+    render::inline::{
+        render_inline_md, terminal_cell_width, terminal_display_width, visible_width, wrap_md_cell,
+    },
 };
+
+const MIN_TABLE_CELL_WIDTH: usize = 6;
 
 #[derive(Clone)]
 pub(super) enum TableState {
@@ -37,7 +41,7 @@ pub(super) fn table_preview_height(line: &str) -> usize {
     let mut current_col = 0usize;
 
     for ch in visible.chars() {
-        let w = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
+        let w = terminal_cell_width(ch);
         if current_col > 0 && current_col + w > cols {
             lines += 1;
             current_col = w;
@@ -318,7 +322,7 @@ fn pad_cell(s: &str, width: usize, align: TableAlign) -> String {
 fn render_and_pad_cell(cell_line: &str, width: usize, align: TableAlign, base: &str) -> String {
     let rendered = render_inline_md(cell_line, base);
     let ansi_stripped = strip_ansi_codes(&rendered);
-    let actual_w = unicode_width::UnicodeWidthStr::width_cjk(ansi_stripped.as_str());
+    let actual_w = terminal_display_width(ansi_stripped.as_str());
     let pad = width.saturating_sub(actual_w);
     match align {
         TableAlign::Left => format!("{rendered}{}", " ".repeat(pad)),
@@ -356,31 +360,18 @@ pub(super) fn compute_table_widths(
         }
     }
     for w in &mut widths {
-        *w = (*w).max(3);
+        *w = (*w).max(MIN_TABLE_CELL_WIDTH);
     }
 
-    let term_cols = terminal_width();
-    let indent_w = unicode_width::UnicodeWidthStr::width_cjk(indent);
-    let max_total = term_cols.saturating_sub(indent_w).max(20);
+    let max_total = table_available_width(indent);
     let avail = max_total.saturating_sub(3 * cols + 1);
-    if avail == 0 {
-        return widths;
-    }
 
-    let min_w = 3usize;
+    let min_w = if avail >= MIN_TABLE_CELL_WIDTH * cols {
+        MIN_TABLE_CELL_WIDTH
+    } else {
+        avail / cols
+    };
     let sum = widths.iter().sum::<usize>();
-    if avail < min_w * cols {
-        let base = (avail / cols).max(1);
-        let mut rem = avail.saturating_sub(base * cols);
-        for w in &mut widths {
-            *w = base;
-            if rem > 0 {
-                *w += 1;
-                rem -= 1;
-            }
-        }
-        return widths;
-    }
 
     if sum > avail {
         let mut excess = sum - avail;
@@ -405,6 +396,36 @@ pub(super) fn compute_table_widths(
     }
 
     widths
+}
+
+pub(super) fn table_column_ranges(indent: &str, cols: usize) -> Vec<std::ops::Range<usize>> {
+    if cols == 0 {
+        return Vec::new();
+    }
+    let max_cols = max_columns_per_table_block(indent).max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0usize;
+    while start < cols {
+        let end = (start + max_cols).min(cols);
+        ranges.push(start..end);
+        start = end;
+    }
+    ranges
+}
+
+fn max_columns_per_table_block(indent: &str) -> usize {
+    let max_total = table_available_width(indent);
+    max_total
+        .saturating_sub(1)
+        .checked_div(MIN_TABLE_CELL_WIDTH + 3)
+        .unwrap_or(0)
+        .max(1)
+}
+
+fn table_available_width(indent: &str) -> usize {
+    terminal_width()
+        .saturating_sub(terminal_display_width(indent))
+        .max(1)
 }
 
 pub(super) fn render_table_top(indent: &str, widths: &[usize]) -> String {
@@ -620,6 +641,39 @@ mod tests {
     }
 
     #[test]
+    fn compute_table_widths_respects_remaining_content_budget() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::set_var("COLUMNS", "40") };
+
+        let header = (0..10)
+            .map(|idx| format!("very_long_column_name_{idx}"))
+            .collect::<Vec<_>>();
+        let widths = compute_table_widths("", &header, &[]);
+
+        assert_eq!(widths.len(), 10);
+        assert!(
+            widths.iter().sum::<usize>() <= 5,
+            "content widths must not exceed the remaining budget: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn table_column_ranges_split_overwide_tables() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::set_var("COLUMNS", "80") };
+
+        let ranges = table_column_ranges("", 20);
+
+        assert!(ranges.len() > 1, "{ranges:?}");
+        assert!(
+            ranges.iter().all(|range| range.len() <= 8),
+            "each split table should keep readable minimum width: {ranges:?}"
+        );
+        assert_eq!(ranges.first().unwrap().start, 0);
+        assert_eq!(ranges.last().unwrap().end, 20);
+    }
+
+    #[test]
     fn bare_table_candidate_accepts_simple_header_without_leading_pipe() {
         assert!(is_table_row_candidate("时间 | 线程 | 前置事件"));
     }
@@ -690,7 +744,10 @@ mod tests {
 
         // 顶部边框应连成 box-drawing 线段（┌─...─┬─...─┐），确保观感为实线而非虚线。
         let top = render_table_top("", &widths);
-        assert!(top.contains('┌') && top.contains('┬') && top.contains('┐'), "{top:?}");
+        assert!(
+            top.contains('┌') && top.contains('┬') && top.contains('┐'),
+            "{top:?}"
+        );
         assert!(top.contains("┌──────"), "{top:?}");
     }
 
@@ -700,11 +757,10 @@ mod tests {
         // 导致渲染后的实际显示宽度 > visible_width 预估值。
         // render_and_pad_cell 必须基于渲染后的实际宽度补空格。
         use crate::ai::stream::extract::strip_ansi_codes;
-        use unicode_width::UnicodeWidthStr;
 
         fn rendered_display_width(s: &str) -> usize {
             let visible = strip_ansi_codes(s);
-            UnicodeWidthStr::width_cjk(visible.as_str())
+            terminal_display_width(visible.as_str())
         }
 
         // 目标宽度 10；未闭合反引号：visible_width 剥离 `，但 render_inline_md 原样输出
@@ -740,4 +796,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn render_and_pad_cell_treats_box_drawing_as_single_width() {
+        use crate::ai::stream::extract::strip_ansi_codes;
+
+        let padded = render_and_pad_cell("────", 6, TableAlign::Left, "");
+        let visible = strip_ansi_codes(&padded);
+
+        assert_eq!(terminal_display_width(visible.as_str()), 6);
+        assert_eq!(visible, "────  ");
+    }
 }
