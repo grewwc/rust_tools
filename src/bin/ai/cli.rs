@@ -47,8 +47,6 @@ pub(super) struct ParsedCli {
     pub(super) note_edit: Option<String>,
     /// AI 驱动的知识库整理：读取全部条目 → 模型分析 → 执行整理。
     pub(super) consolidate_knowledge: bool,
-    /// 修复历史 knowledge_save 条目：补 stable id，并把明显的旧原则迁到 guideline 类别。
-    pub(super) migrate_legacy_knowledge: bool,
     /// --generate-completions
     pub(super) generate_completions: bool,
     /// 是否以后台模式运行（`--background` / `-bg`）。
@@ -95,8 +93,6 @@ const NOTE_SEARCH_USAGE: &str =
     "search knowledge base (memo category) and answer using positional prompt";
 const GENERATE_COMPLETIONS_USAGE: &str =
     "generate shell completion script (bash/zsh/fish) and exit";
-const MIGRATE_LEGACY_KNOWLEDGE_USAGE: &str =
-    "repair historical knowledge entries (assign ids and promote durable principles)";
 const REASONING_EFFORT_USAGE: &str = "reasoning effort: minimal | low | medium | high | off (clears default; only effective on OpenAI/OpenRouter/OpenCode providers)";
 
 fn build_cli_parser() -> TermParser {
@@ -137,11 +133,6 @@ fn register_cli_flags(parser: &mut TermParser) {
         "consolidate-knowledge",
         false,
         "AI-driven consolidation of all knowledge entries",
-    );
-    parser.add_bool(
-        "migrate-legacy-knowledge",
-        false,
-        MIGRATE_LEGACY_KNOWLEDGE_USAGE,
     );
     parser.add_bool("note-search", false, NOTE_SEARCH_USAGE);
     parser.add_bool("generate-completions", false, GENERATE_COMPLETIONS_USAGE);
@@ -311,7 +302,6 @@ impl Default for ParsedCli {
             note_delete: None,
             note_edit: None,
             consolidate_knowledge: false,
-            migrate_legacy_knowledge: false,
             generate_completions: false,
             background: false,
             stop_session: None,
@@ -373,9 +363,6 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 
     // 处理 consolidate-knowledge
     cli.consolidate_knowledge = parser.contains_flag_strict("consolidate-knowledge");
-
-    // 处理 migrate-legacy-knowledge
-    cli.migrate_legacy_knowledge = parser.contains_flag_strict("migrate-legacy-knowledge");
 
     // 处理 generate-completions
     cli.generate_completions = parser.contains_flag_strict("generate-completions");
@@ -468,9 +455,6 @@ pub(super) fn print_help() {
     println!("Quick Actions:");
     println!(
         "  --consolidate-knowledge  read all knowledge entries, analyze with LLM, clean up obsolete ones"
-    );
-    println!(
-        "  --migrate-legacy-knowledge  repair old saved knowledge so durable principles are easier to recall"
     );
     println!("  -n, --note <text>        save text as memo to knowledge base and exit");
     println!("  -ns, --note-search       search memo category using the positional prompt");
@@ -957,15 +941,6 @@ mod tests {
         // 不带 --stop 时默认为 None
         let cli = super::parse_cli_args(["a".to_string()].into_iter());
         assert!(cli.stop_session.is_none());
-    }
-
-    #[test]
-    fn parse_cli_args_reads_migrate_legacy_knowledge_flag() {
-        let cli = super::parse_cli_args(
-            ["a".to_string(), "--migrate-legacy-knowledge".to_string()].into_iter(),
-        );
-
-        assert!(cli.migrate_legacy_knowledge);
     }
 
     #[test]

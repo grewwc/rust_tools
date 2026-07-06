@@ -365,7 +365,7 @@ async fn maybe_generate_session_title(app: &App) {
             // eprintln!("[session-title] no messages found for session {}", app.session_id);
             return;
         }
-        Err(e) => {
+        Err(_) => {
             // eprintln!("[session-title] failed to read messages: {e}");
             return;
         }
@@ -384,7 +384,7 @@ async fn maybe_generate_session_title(app: &App) {
 
     if let Some(t) = title {
         if !t.is_empty() {
-            if let Err(err) = store.write_session_title(&app.session_id, &t) {
+            if let Err(_) = store.write_session_title(&app.session_id, &t) {
                 // eprintln!("[session-title] failed to save title: {}", err);
             } else {
                 // eprintln!("[session-title] generated: {}", t);

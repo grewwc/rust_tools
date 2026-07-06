@@ -321,38 +321,6 @@ pub fn ensure_rag_store() -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn delete_ids_from_default_index(ids: &[String]) -> Result<usize, String> {
-    if ids.is_empty() {
-        return Ok(0);
-    }
-
-    {
-        let guard = get_rag_store()?;
-        if let Some(store) = guard.as_ref() {
-            let mut deleted = 0usize;
-            for id in ids {
-                if store.delete(id)? {
-                    deleted += 1;
-                }
-            }
-            return Ok(deleted);
-        }
-    }
-
-    let path = RagStore::default_index_path()?;
-    if !path.exists() {
-        return Ok(0);
-    }
-    let store = RagStore::with_path(&path)?;
-    let mut deleted = 0usize;
-    for id in ids {
-        if store.delete(id)? {
-            deleted += 1;
-        }
-    }
-    Ok(deleted)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

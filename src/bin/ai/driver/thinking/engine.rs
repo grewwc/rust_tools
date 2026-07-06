@@ -394,7 +394,7 @@ mod tests {
     fn ucb_select_prefers_unexplored() {
         let mut tree = ThoughtTree::new("test", 3, 3);
         let b1 = tree.add_branch(0, "A".into(), "rA".into());
-        let b2 = tree.add_branch(0, "B".into(), "rB".into());
+        let _b2 = tree.add_branch(0, "B".into(), "rB".into());
         tree.score_node(b1, 0.9);
         let selected = tree.ucb_select(1.414);
         assert!(selected.is_some());
@@ -408,7 +408,7 @@ mod tests {
         tree.score_node(b1, 0.9);
         tree.score_node(b2, 0.1);
         tree.prune_branch(b2);
-        let result = tree.decide_next();
+        let _result = tree.decide_next();
         assert!(!tree.get_node(b2).unwrap().pruned == false);
     }
 

@@ -278,7 +278,6 @@ fn should_resume_suspended_terminal_session(cli: &cli::ParsedCli) -> bool {
         || cli.note_delete.is_some()
         || cli.note_edit.is_some()
         || cli.consolidate_knowledge
-        || cli.migrate_legacy_knowledge
         || cli.generate_completions
     {
         return false;
@@ -1728,14 +1727,6 @@ pub(in crate::ai) async fn run_with_cli(
             )
             .await;
     }
-    if app.cli.migrate_legacy_knowledge {
-        return runtime_ctx::PERSONA_MEMORY_PATH
-            .scope(
-                app.current_persona_memory_file(),
-                handle_migrate_legacy_knowledge(&app),
-            )
-            .await;
-    }
 
     if decision_log_persist_enabled() {
         let decision_log_path = app
@@ -2348,16 +2339,6 @@ fn build_consolidation_merge_entries(
     (merge_delete_ids, merged_count, new_entries)
 }
 
-async fn handle_migrate_legacy_knowledge(_app: &App) -> Result<(), Box<dyn std::error::Error>> {
-    let report = crate::ai::tools::service::memory::migrate_legacy_knowledge_entries()
-        .map_err(std::io::Error::other)?;
-    println!(
-        "{}",
-        crate::ai::tools::service::memory::format_legacy_knowledge_migration_report(&report)
-    );
-    Ok(())
-}
-
 /// 处理 --consolidate-knowledge：读取全部知识条目 → 模型分析 → 执行整理。
 ///
 /// **优化策略**（避免 60s 超时）：
@@ -2600,7 +2581,7 @@ async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn st
     let mut chosen_indices: Vec<usize> = Vec::new();
     {
         let mut num = String::new();
-        let mut flush = |num: &mut String, out: &mut Vec<usize>| {
+        let flush = |num: &mut String, out: &mut Vec<usize>| {
             if let Ok(n) = num.parse::<usize>() {
                 if n >= 1 && n <= candidates.len() {
                     let idx = n - 1;
@@ -2671,7 +2652,7 @@ async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn st
         // 解析编号列表（针对上面列出的 1..=targets.len()）。
         let mut picks: Vec<usize> = Vec::new();
         let mut num = String::new();
-        let mut flush = |num: &mut String, out: &mut Vec<usize>| {
+        let flush = |num: &mut String, out: &mut Vec<usize>| {
             if let Ok(n) = num.parse::<usize>() {
                 if n >= 1 && n <= targets.len() {
                     let idx = n - 1;
@@ -2823,7 +2804,7 @@ async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std:
     let parse_indices = |s: &str, max: usize| -> Vec<usize> {
         let mut out: Vec<usize> = Vec::new();
         let mut num = String::new();
-        let mut flush = |num: &mut String, out: &mut Vec<usize>| {
+        let flush = |num: &mut String, out: &mut Vec<usize>| {
             if let Ok(n) = num.parse::<usize>() {
                 if n >= 1 && n <= max {
                     let idx = n - 1;
@@ -4016,7 +3997,7 @@ mod tests {
 
     #[test]
     fn finalize_turn_quota_charges_turn_usage_once() {
-        let mut app = test_app("build");
+        let app = test_app("build");
         let pid = {
             let mut os = app.os.lock().unwrap();
             os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None)
@@ -4049,7 +4030,7 @@ mod tests {
     #[test]
     fn terminate_and_cleanup_removes_scheduler_meta_entry() {
         reset_scheduler_test_state();
-        let mut app = test_app("build");
+        let app = test_app("build");
         let pid = {
             let mut os = app.os.lock().unwrap();
             os.begin_foreground("fg".to_string(), "goal".to_string(), 10, usize::MAX, None)
@@ -4721,7 +4702,7 @@ mod tests {
 
     #[test]
     fn pending_foreground_process_blocks_new_prompt() {
-        let mut app = test_app("build");
+        let app = test_app("build");
 
         {
             let mut os = app.os.lock().unwrap();
@@ -4740,7 +4721,7 @@ mod tests {
 
     #[test]
     fn terminated_foreground_process_does_not_block_new_prompt() {
-        let mut app = test_app("build");
+        let app = test_app("build");
 
         {
             let mut os = app.os.lock().unwrap();

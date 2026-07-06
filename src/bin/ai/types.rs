@@ -155,45 +155,45 @@ pub(super) struct SkillBiasMemory {
 /// Schema definition for a tool that can be offered to the AI model,
 /// wrapping a function definition with a type discriminator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct ToolDefinition {
+pub(crate) struct ToolDefinition {
     #[serde(rename = "type")]
-    pub(super) tool_type: String,
-    pub(super) function: FunctionDefinition,
+    pub(crate) tool_type: String,
+    pub(crate) function: FunctionDefinition,
 }
 
 /// Describes a callable function: its name, human-readable description,
 /// and JSON Schema for parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct FunctionDefinition {
-    pub(super) name: String,
-    pub(super) description: String,
-    pub(super) parameters: Value,
+pub(crate) struct FunctionDefinition {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) parameters: Value,
 }
 
 /// A request from the AI model to invoke a specific tool,
 /// identified by a unique call ID and containing the function name and arguments.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct ToolCall {
-    pub(super) id: String,
+pub(crate) struct ToolCall {
+    pub(crate) id: String,
     #[serde(rename = "type")]
-    pub(super) tool_type: String,
-    pub(super) function: FunctionCall,
+    pub(crate) tool_type: String,
+    pub(crate) function: FunctionCall,
 }
 
 /// The function invocation details within a `ToolCall`,
 /// containing the function name and a JSON-encoded argument string.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct FunctionCall {
-    pub(super) name: String,
-    pub(super) arguments: String,
+pub(crate) struct FunctionCall {
+    pub(crate) name: String,
+    pub(crate) arguments: String,
 }
 
 /// The output produced after executing a tool call,
 /// linking back to the original call ID with the result content.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(super) struct ToolResult {
-    pub(super) tool_call_id: String,
-    pub(super) content: String,
+pub(crate) struct ToolResult {
+    pub(crate) tool_call_id: String,
+    pub(crate) content: String,
 }
 
 /// Runtime context for an agent, containing its available tools,
