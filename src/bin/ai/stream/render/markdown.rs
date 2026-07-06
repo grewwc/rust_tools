@@ -4,15 +4,15 @@ use crate::ai::stream::extract::strip_ansi_codes;
 use crate::ai::stream::render::code::{
     MONOKAI_BG, MONOKAI_DIM, highlight_code_line, parse_code_block_language,
 };
+use crate::ai::stream::render::html::{
+    contains_close_table_tag, contains_open_table_tag, parse_html_table, render_html_table,
+};
 use crate::ai::stream::render::inline::render_inline_md;
 use crate::ai::stream::render::table::{
     TableAlign, TableState, compute_table_widths, is_table_row, is_table_row_candidate,
     is_table_separator, line_looks_like_table_preview, parse_table_align, parse_table_row,
     render_table_bottom, render_table_header, render_table_mid, render_table_row, render_table_top,
     split_indent, table_preview_height,
-};
-use crate::ai::stream::render::html::{
-    contains_close_table_tag, contains_open_table_tag, parse_html_table, render_html_table,
 };
 use crate::ai::stream::state::{END_THINKING_TAG_TEXT, THINKING_TAG_TEXT};
 use crate::ai::theme::{
@@ -540,13 +540,8 @@ impl MarkdownStreamRenderer {
                         };
                     let rendered_height =
                         self.rendered_table_height(&indent, &header_cells, &align, &[]);
-                    let rewrite = self.rewrite_table_preview(
-                        &indent,
-                        move_up,
-                        &header_cells,
-                        &align,
-                        &[],
-                    );
+                    let rewrite =
+                        self.rewrite_table_preview(&indent, move_up, &header_cells, &align, &[]);
                     self.table_state = TableState::InTable {
                         indent,
                         header: header_cells,
@@ -586,8 +581,7 @@ impl MarkdownStreamRenderer {
                         };
                     let rendered_height =
                         self.rendered_table_height(&indent, &header, &align, &rows);
-                    let out =
-                        self.rewrite_table_preview(&indent, move_up, &header, &align, &rows);
+                    let out = self.rewrite_table_preview(&indent, move_up, &header, &align, &rows);
                     self.table_state = TableState::InTable {
                         indent,
                         header,
@@ -746,9 +740,13 @@ impl MarkdownStreamRenderer {
         align: &[TableAlign],
         rows: &[Vec<String>],
     ) -> usize {
+        // cursor-up 擦除的是终端物理行；表格逻辑行一旦被终端自动折行，
+        // 只数 `.lines()` 会漏擦旧表，表现为 header/旧行反复堆叠。
         self.render_table_block(indent, header, align, rows)
             .lines()
-            .count()
+            .map(live_preview_cursor_rows)
+            .sum::<usize>()
+            .max(1)
     }
 
     fn rewrite_plain_preview(&mut self, line: &str, move_up: usize) -> String {
@@ -955,7 +953,7 @@ pub(in crate::ai) fn clamp_line_to_terminal_row_with_reserve(
     let cols = raw_terminal_cols().saturating_sub(reserve_cols).max(1);
     let mut total = 0usize;
     for ch in line.chars() {
-        total += unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
+        total += terminal_cell_width(ch);
     }
     if total <= cols {
         return line.to_string();
@@ -966,7 +964,7 @@ pub(in crate::ai) fn clamp_line_to_terminal_row_with_reserve(
     let mut out = String::with_capacity(line.len());
     let mut col = 0usize;
     for ch in line.chars() {
-        let w = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
+        let w = terminal_cell_width(ch);
         if col + w > budget {
             break;
         }
@@ -988,7 +986,7 @@ pub(in crate::ai) fn live_preview_cursor_rows(line: &str) -> usize {
     let mut lines = 1usize;
     let mut col = 0usize;
     for ch in visible.chars() {
-        let w = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
+        let w = terminal_cell_width(ch);
         if col > 0 && col + w > cols {
             lines += 1;
             col = w;
@@ -997,6 +995,21 @@ pub(in crate::ai) fn live_preview_cursor_rows(line: &str) -> usize {
         }
     }
     lines
+}
+
+fn terminal_cell_width(ch: char) -> usize {
+    if is_single_width_terminal_symbol(ch) {
+        return 1;
+    }
+    unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0)
+}
+
+fn is_single_width_terminal_symbol(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2500}'..='\u{259f}' // box drawing + block elements
+            | '\u{2800}'..='\u{28ff}' // braille patterns
+    )
 }
 
 /// 终端可用列数（已扣除右侧安全边距）。
@@ -1444,6 +1457,15 @@ mod tests {
     }
 
     #[test]
+    fn live_preview_cursor_rows_counts_box_drawing_as_single_width() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "20") };
+
+        assert_eq!(live_preview_cursor_rows("─".repeat(20).as_str()), 1);
+        assert_eq!(live_preview_cursor_rows("─".repeat(21).as_str()), 2);
+    }
+
+    #[test]
     fn exact_width_cjk_preview_updates_renderer_height_to_one_row() {
         let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "20") };
@@ -1601,7 +1623,7 @@ mod tests {
         }
 
         fn put(&mut self, ch: char) {
-            let w = unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0);
+            let w = terminal_cell_width(ch);
             if w == 0 {
                 return;
             }
@@ -1667,6 +1689,24 @@ mod tests {
                         .collect::<String>()
                         .trim_end()
                         .to_string()
+                })
+                .collect()
+        }
+
+        fn border_columns_by_row(&self) -> Vec<Vec<usize>> {
+            self.rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .enumerate()
+                        .filter_map(|(idx, ch)| {
+                            matches!(
+                                ch,
+                                '┌' | '┬' | '┐' | '├' | '┼' | '┤' | '└' | '┴' | '┘' | '│'
+                            )
+                            .then_some(idx)
+                        })
+                        .collect()
                 })
                 .collect()
         }
@@ -1814,6 +1854,68 @@ mod tests {
             !joined.contains("| 函数签名 |"),
             "raw single-column markdown table leaked:\n{joined}"
         );
+    }
+
+    #[test]
+    fn streamed_table_rewrite_clears_terminal_wrapped_previous_render() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "24") };
+
+        let md = "\
+        | 时间 | 代码位置 | 动作 |
+        | --- | --- | --- |
+        | 45.059 | aida/tools/data/df_to_chart.py:620 SimpleDfToChartTool.run | jinja 触发，goal=render_to_chart |
+        | 45.060-081 | aeolus_llm/service/ada/renderers/viz_data.py:300 | 推断列类型，自动划分 dimension/metric |
+";
+
+        let stream = render_full_stream(md, false);
+        let mut grid = VtGrid::new(24);
+        grid.feed(&stream);
+        let screen = grid.screen();
+        let joined = screen.join("\n");
+        let table_count = joined.matches('┌').count();
+
+        assert_eq!(
+            table_count, 1,
+            "table rewrite should leave exactly one table on screen, got {table_count}:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn streamed_comparison_table_keeps_border_columns_aligned() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "96") };
+
+        let md = "\
+| | Skill 路由（已修复） | Agent 路由（你看到的问题） |
+| --- | --- | --- |
+| 代码机制 | skill_runtime.rs -> prepare_skill_for_turn TF-IDF 预激活 skill ✅ 已移除 ✅ 能，via discover_skills + activate_skill | agent_router.rs -> maybe_auto_route_agent TF-IDF + logistic regression 自动切换 agent ❌ 仍在 ❌ 不能，没有 activate_agent 工具 build prompt-skill 因为 \"Skill\" 命中了 prompt-skill agent 的 routing_tags |
+";
+
+        let stream = render_full_stream(md, false);
+        let mut grid = VtGrid::new(96);
+        grid.feed(&stream);
+        let screen = grid.screen();
+        let table_border_cols = grid
+            .border_columns_by_row()
+            .into_iter()
+            .filter(|cols| !cols.is_empty())
+            .collect::<Vec<_>>();
+        let expected_border_cols = table_border_cols.first().expect("table top border").clone();
+
+        assert!(
+            table_border_cols.len() >= 4,
+            "expected rendered table lines:\n{}",
+            screen.join("\n")
+        );
+        for border_cols in table_border_cols {
+            assert_eq!(
+                border_cols,
+                expected_border_cols,
+                "table border columns drifted:\nfull screen:\n{}",
+                screen.join("\n")
+            );
+        }
     }
 
     #[test]

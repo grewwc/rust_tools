@@ -310,6 +310,27 @@ fn pad_cell(s: &str, width: usize, align: TableAlign) -> String {
     }
 }
 
+/// 先渲染 inline markdown，再按渲染后的实际显示宽度补空格。
+///
+/// 不能用 `pad_cell` + `render_inline_md(padded)` 的顺序：`pad_cell` 基于
+/// `visible_width`（会剥离未闭合的 `、**、* 标记），但 `render_inline_md` 遇到
+/// 未闭合标记会原样输出为字面字符，导致实际宽度 > 预期，表格边框错位。
+fn render_and_pad_cell(cell_line: &str, width: usize, align: TableAlign, base: &str) -> String {
+    let rendered = render_inline_md(cell_line, base);
+    let ansi_stripped = strip_ansi_codes(&rendered);
+    let actual_w = unicode_width::UnicodeWidthStr::width_cjk(ansi_stripped.as_str());
+    let pad = width.saturating_sub(actual_w);
+    match align {
+        TableAlign::Left => format!("{rendered}{}", " ".repeat(pad)),
+        TableAlign::Right => format!("{}{rendered}", " ".repeat(pad)),
+        TableAlign::Center => {
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{rendered}{}", " ".repeat(left), " ".repeat(right))
+        }
+    }
+}
+
 pub(super) fn compute_table_widths(
     indent: &str,
     header: &[String],
@@ -462,14 +483,15 @@ pub(super) fn render_table_header(
                 .and_then(|ls| ls.get(line_idx))
                 .map(|s| s.as_str())
                 .unwrap_or("");
-            let padded = pad_cell(
+            let padded = render_and_pad_cell(
                 cell_line,
                 *width,
                 align.get(i).copied().unwrap_or(TableAlign::Left),
+                "",
             );
             out.push(' ');
             out.push_str("\x1b[1m\x1b[36m");
-            out.push_str(&render_inline_md(&padded, "\x1b[1m\x1b[36m"));
+            out.push_str(&padded);
             out.push_str("\x1b[0m");
             out.push(' ');
             out.push('│');
@@ -507,13 +529,14 @@ pub(super) fn render_table_row(
                 .and_then(|ls| ls.get(line_idx))
                 .map(|s| s.as_str())
                 .unwrap_or("");
-            let padded = pad_cell(
+            let padded = render_and_pad_cell(
                 cell_line,
                 *width,
                 align.get(i).copied().unwrap_or(TableAlign::Left),
+                "",
             );
             out.push(' ');
-            out.push_str(&render_inline_md(&padded, ""));
+            out.push_str(&padded);
             out.push(' ');
             out.push('│');
         }
@@ -670,4 +693,51 @@ mod tests {
         assert!(top.contains('┌') && top.contains('┬') && top.contains('┐'), "{top:?}");
         assert!(top.contains("┌──────"), "{top:?}");
     }
+
+    #[test]
+    fn render_and_pad_cell_compensates_for_unclosed_marker_literal_output() {
+        // 未闭合的 `、**、* 标记会被 render_inline_md 当字面字符输出（而非剥离），
+        // 导致渲染后的实际显示宽度 > visible_width 预估值。
+        // render_and_pad_cell 必须基于渲染后的实际宽度补空格。
+        use crate::ai::stream::extract::strip_ansi_codes;
+        use unicode_width::UnicodeWidthStr;
+
+        fn rendered_display_width(s: &str) -> usize {
+            let visible = strip_ansi_codes(s);
+            UnicodeWidthStr::width_cjk(visible.as_str())
+        }
+
+        // 目标宽度 10；未闭合反引号：visible_width 剥离 `，但 render_inline_md 原样输出
+        let padded = render_and_pad_cell("`foo", 10, TableAlign::Left, "");
+        let actual_w = rendered_display_width(&padded);
+        assert_eq!(
+            actual_w, 10,
+            "unclosed backtick: padded width should be 10, got {actual_w}, padded={padded:?}"
+        );
+
+        // 未闭合 **：visible_width 剥离 **，但 render_inline_md 原样输出（+2 列）
+        let padded = render_and_pad_cell("**foo", 10, TableAlign::Left, "");
+        let actual_w = rendered_display_width(&padded);
+        assert_eq!(
+            actual_w, 10,
+            "unclosed **: padded width should be 10, got {actual_w}, padded={padded:?}"
+        );
+
+        // 未闭合 *：visible_width 剥离 *，但 render_inline_md 原样输出（+1 列）
+        let padded = render_and_pad_cell("*foo", 10, TableAlign::Left, "");
+        let actual_w = rendered_display_width(&padded);
+        assert_eq!(
+            actual_w, 10,
+            "unclosed *: padded width should be 10, got {actual_w}, padded={padded:?}"
+        );
+
+        // 闭合标记应该正常工作
+        let padded = render_and_pad_cell("`foo`", 10, TableAlign::Left, "");
+        let actual_w = rendered_display_width(&padded);
+        assert_eq!(
+            actual_w, 10,
+            "closed backtick: padded width should be 10, got {actual_w}, padded={padded:?}"
+        );
+    }
+
 }

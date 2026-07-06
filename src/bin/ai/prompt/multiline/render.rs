@@ -162,8 +162,16 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 
     // 设置对齐方式
     textarea.set_alignment(Alignment::Left);
+    // tui-textarea 默认用 REVERSED 空格把 cursor 画进 buffer；在 ratatui inline
+    // viewport 下，resize 重锚会把这块"画出来的 cursor"推进 scrollback，表现为
+    // 每次侧栏展开/收回都多一个白色 cursor 残影。这里禁用 buffer cursor，改用
+    // ratatui 的真实终端 cursor（见下方 set_cursor_position），它不会成为可持久化内容。
+    textarea.set_cursor_style(Style::default());
 
     f.render_widget(&*textarea, textarea_area);
+    if let Some((cursor_x, cursor_y)) = textarea_terminal_cursor(textarea, textarea_area) {
+        f.set_cursor_position((cursor_x, cursor_y));
+    }
 
     // 渲染 completion panel
     if let Some(panel) = completion_panel {
@@ -474,6 +482,41 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
 
     out.push_str("...");
     out
+}
+
+fn textarea_terminal_cursor(textarea: &TextArea<'_>, area: Rect) -> Option<(u16, u16)> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+
+    let (cursor_row, cursor_col) = textarea.cursor();
+    let rows = textarea.lines().len();
+    if rows == 0 {
+        return Some((area.x, area.y));
+    }
+
+    let visible_rows = area.height as usize;
+    let top_row = cursor_row.saturating_sub(visible_rows.saturating_sub(1));
+    let y = area.y + cursor_row.saturating_sub(top_row).min(visible_rows - 1) as u16;
+
+    let line = textarea
+        .lines()
+        .get(cursor_row)
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let cursor_col_width = line
+        .chars()
+        .take(cursor_col)
+        .map(|ch| unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0))
+        .sum::<usize>();
+    let visible_cols = area.width as usize;
+    let left_col = cursor_col_width.saturating_sub(visible_cols.saturating_sub(1));
+    let x = area.x
+        + cursor_col_width
+            .saturating_sub(left_col)
+            .min(visible_cols - 1) as u16;
+
+    Some((x, y))
 }
 
 #[cfg(test)]

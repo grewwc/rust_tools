@@ -10,7 +10,7 @@ use std::sync::{LazyLock, Mutex};
 
 use super::{
     DEFAULT_MAX_ITERATIONS, EXECUTOR_MAX_ITERATIONS, TextSimilarityFeatures,
-    jaccard_similarity_for_sets, rank_skills_locally_with_model_path, set_intersection_count,
+    jaccard_similarity_for_sets, set_intersection_count,
 };
 
 type ToolDef = ToolDefinition;
@@ -116,19 +116,6 @@ impl SystemPromptBuilder {
 }
 
 const DEFAULT_TURN_TOOL_GROUPS: &[&str] = &["core"];
-const CURRENT_SKILL_STICKY_BONUS: f64 = 0.7;
-const CURRENT_SKILL_KEEP_FLOOR_DELTA: f64 = 0.4;
-const SKILL_SWITCH_MARGIN: f64 = 0.8;
-const CROSS_TURN_SKILL_STICKY_BONUS: f64 = 0.2;
-const CROSS_TURN_SKILL_KEEP_FLOOR_DELTA: f64 = 0.15;
-const CROSS_TURN_SKILL_SWITCH_MARGIN: f64 = 0.35;
-
-#[derive(Clone, Copy)]
-enum PreferenceStrength {
-    StrongSticky,
-    CrossTurnBias,
-}
-
 pub(super) struct SkillTurnGuard {
     restore_agent_context: Option<(Vec<ToolDef>, usize)>,
     builder: SystemPromptBuilder,
@@ -1052,19 +1039,6 @@ fn should_skip_recall_for_skill(skill: Option<&SkillManifest>) -> bool {
     skill.is_some_and(|skill| skill.skip_recall || is_executor_skill(skill))
 }
 
-fn skill_selection_threshold(skill_count: usize) -> f64 {
-    let base: f64 = if skill_count > 10 {
-        2.5
-    } else if skill_count > 5 {
-        2.0
-    } else {
-        1.75
-    };
-    // 无 intent 后统一下限取 2.0（原 RequestAction 档），避免小 skill 集阈值
-    // 反而更低导致误激活。
-    base.max(2.0)
-}
-
 fn looks_like_follow_up_or_same_topic(question: &str, previous_question: &str) -> bool {
     let current = question.trim();
     let previous = previous_question.trim();
@@ -1117,148 +1091,6 @@ fn update_cross_turn_skill_bias(app: &mut App, question: &str, skill: Option<&Sk
         skill_name: selected.name.clone(),
         question: question.trim().to_string(),
     });
-}
-
-fn select_skill_with_preference<'a>(
-    skill_manifests: &'a [SkillManifest],
-    question: &str,
-    preferred_skill_name: Option<&str>,
-    model_path: &std::path::Path,
-) -> Option<&'a SkillManifest> {
-    select_skill_with_preference_strength(
-        skill_manifests,
-        question,
-        preferred_skill_name,
-        PreferenceStrength::StrongSticky,
-        model_path,
-    )
-}
-
-fn select_skill_with_preference_strength<'a>(
-    skill_manifests: &'a [SkillManifest],
-    question: &str,
-    preferred_skill_name: Option<&str>,
-    strength: PreferenceStrength,
-    model_path: &std::path::Path,
-) -> Option<&'a SkillManifest> {
-    if question.trim().is_empty() || skill_manifests.is_empty() {
-        return None;
-    }
-
-    let ranked = rank_skills_locally_with_model_path(skill_manifests, question, model_path);
-    let Some(best) = ranked.first() else {
-        return None;
-    };
-    let threshold = skill_selection_threshold(skill_manifests.len());
-    let preferred =
-        preferred_skill_name.and_then(|name| ranked.iter().find(|item| item.skill.name == name));
-    let best_is_valid = !should_abstain_from_skill(best);
-
-    if let Some(current) = preferred {
-        let current_is_valid = !should_abstain_from_skill(current);
-        let (
-            sticky_bonus,
-            keep_floor_delta,
-            switch_margin,
-            keep_current_when_best,
-            keep_below_threshold,
-        ) = match strength {
-            PreferenceStrength::StrongSticky => (
-                CURRENT_SKILL_STICKY_BONUS,
-                CURRENT_SKILL_KEEP_FLOOR_DELTA,
-                SKILL_SWITCH_MARGIN,
-                true,
-                true,
-            ),
-            PreferenceStrength::CrossTurnBias => (
-                CROSS_TURN_SKILL_STICKY_BONUS,
-                CROSS_TURN_SKILL_KEEP_FLOOR_DELTA,
-                CROSS_TURN_SKILL_SWITCH_MARGIN,
-                true,
-                true,
-            ),
-        };
-        let current_has_signal = current_is_valid
-            && (current.score >= (threshold - keep_floor_delta).max(0.0)
-                || has_skill_signal(current));
-        if best.skill.name == current.skill.name {
-            return if current_is_valid
-                && (keep_current_when_best || current.score >= threshold || current_has_signal)
-            {
-                Some(current.skill)
-            } else {
-                None
-            };
-        }
-
-        let effective_current = current.score + sticky_bonus;
-        let best_clearly_wins = best.score >= effective_current + switch_margin;
-        let best_has_positive_signal = best_is_valid && is_positive_skill_winner(best);
-        let allow_switch = match strength {
-            PreferenceStrength::StrongSticky => best_clearly_wins && best_has_positive_signal,
-            PreferenceStrength::CrossTurnBias => best_clearly_wins,
-        };
-        if allow_switch {
-            return Some(best.skill);
-        }
-        if keep_below_threshold && best.score < threshold && current_is_valid {
-            return Some(current.skill);
-        }
-        if current_has_signal && !best_clearly_wins {
-            return Some(current.skill);
-        }
-        if best_is_valid && best.score >= threshold {
-            return Some(best.skill);
-        }
-        if current_has_signal {
-            return Some(current.skill);
-        }
-        return None;
-    }
-
-    if !best_is_valid {
-        return None;
-    }
-    (best.score >= threshold).then_some(best.skill)
-}
-
-fn has_skill_signal(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
-    item.embedding_score >= 0.08
-        || item.fallback_semantic_score >= 0.08
-        || item.blended_score >= 0.08
-        || non_identity_skill_signal(item) >= 0.08
-}
-
-fn is_positive_skill_winner(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
-    item.embedding_score >= 0.30
-        || item.fallback_semantic_score >= 0.15
-        || item.blended_score >= 0.30
-        || non_identity_skill_signal(item) >= 0.15
-}
-
-fn identity_skill_signal(item: &super::skill_ranking::ScoredSkill<'_>) -> f64 {
-    item.embedding_identity_score
-        .max(item.fallback_identity_score)
-}
-
-fn non_identity_skill_signal(item: &super::skill_ranking::ScoredSkill<'_>) -> f64 {
-    item.embedding_capability_score
-        .max(item.embedding_behavior_score)
-        .max(item.fallback_capability_score)
-        .max(item.fallback_behavior_score)
-        .max(item.model_prior_score)
-}
-
-fn should_abstain_from_skill(item: &super::skill_ranking::ScoredSkill<'_>) -> bool {
-    let identity_signal = identity_skill_signal(item);
-    let non_identity_signal = non_identity_skill_signal(item);
-    let likely_identity_only_match = identity_signal >= 0.12
-        && non_identity_signal < 0.12
-        && non_identity_signal + 0.04 < identity_signal;
-
-    likely_identity_only_match
-        && item.none_score >= item.model_prior_score + 0.08
-        && non_identity_signal < 0.10
 }
 
 fn build_skill_turn_guard(
@@ -1319,15 +1151,13 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
     app: &mut App,
     mcp_client: &McpClient,
     skill_manifests: &[SkillManifest],
-    question: &str,
+    _question: &str,
     preferred_skill_name: Option<&str>,
 ) -> SkillTurnGuard {
-    let skill = select_skill_with_preference(
-        skill_manifests,
-        question,
-        preferred_skill_name,
-        &app.config.skill_match_model_path,
-    );
+    // 不再做 TF-IDF 重路由：iteration > 1 时仅按名字保持上一轮的 skill。
+    // 模型如需切换可通过 activate_skill 显式请求。
+    let skill = preferred_skill_name
+        .and_then(|name| skill_manifests.iter().find(|s| s.name == name));
     build_skill_turn_guard(app, mcp_client, skill)
 }
 
@@ -1365,7 +1195,7 @@ pub(super) fn prepare_skill_for_turn(
         .trim()
         .eq_ignore_ascii_case("true");
 
-    // 用户通过 `@skills:<name>` 在输入框中显式选择的强制 skill 优先于自动路由。
+    // 用户通过 `@skills:<name>` 在输入框中显式选择的强制 skill 最高优先。
     // 这是 per-turn 语义：消费后立即清空，下一轮不再强制注入。
     if let Some(forced) = app.forced_skill.take() {
         if let Some(skill) = skill_manifests
@@ -1388,46 +1218,23 @@ pub(super) fn prepare_skill_for_turn(
             }
         } else if debug {
             eprintln!(
-                "[skills] forced @skills:{} not found, falling back to auto-route",
+                "[skills] forced @skills:{} not found, falling back to cross-turn sticky",
                 forced
             );
         }
     }
 
-    let cross_turn_preference = cross_turn_preferred_skill_name(app, question);
-    let skill = select_skill_with_preference_strength(
-        skill_manifests,
-        question,
-        cross_turn_preference.as_deref(),
-        PreferenceStrength::CrossTurnBias,
-        &app.config.skill_match_model_path,
-    );
+    // 不再做 TF-IDF 自动预路由：交给 LLM 在需要时通过 discover_skills /
+    // activate_skill 自主选择。仅保留 cross-turn sticky，让上一轮激活的
+    // skill 在追问场景下保持连续性。
+    let skill = cross_turn_preferred_skill_name(app, question)
+        .and_then(|name| skill_manifests.iter().find(|s| s.name == name));
 
     if debug {
-        let ranked = rank_skills_locally_with_model_path(
-            skill_manifests,
-            question,
-            &app.config.skill_match_model_path,
-        );
-        if let Some(top) = ranked.first() {
-            eprintln!(
-                "[skills] local top: {} total={:.3} embed={:.3} prior={:.3} fallback={:.3} blend={:.3} none={:.3}",
-                top.skill.name,
-                top.score,
-                top.embedding_score,
-                top.model_prior_score,
-                top.fallback_semantic_score,
-                top.blended_score,
-                top.none_score
-            );
-        }
-        if let Some(preferred) = cross_turn_preference.as_deref() {
-            eprintln!("[skills] cross-turn preferred: {}", preferred);
-        }
         if let Some(s) = skill.as_ref() {
-            eprintln!("[skills] final: {}", s.name);
+            eprintln!("[skills] cross-turn sticky: {}", s.name);
         } else {
-            eprintln!("[skills] final: <none>");
+            eprintln!("[skills] no pre-route; LLM may discover_skills if needed");
         }
     }
     update_cross_turn_skill_bias(app, question, skill);
@@ -1442,17 +1249,16 @@ pub(super) fn prepare_skill_for_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextKind, PreferenceStrength, SystemPromptBuilder, available_tool_names,
+        ContextKind, SystemPromptBuilder, available_tool_names,
         build_hidden_mcp_tool_catalog, build_project_instruction_prompt, build_system_prompt,
         builtin_tools_for_skill, ensure_required_baseline_tools,
         filter_mcp_tools_by_allowed_servers, has_tool, looks_like_follow_up_or_same_topic,
         merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
-        select_mcp_tools, select_skill_with_preference, select_skill_with_preference_strength,
+        select_mcp_tools,
         tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::runtime_ctx::SUBAGENT_CWD;
-    use crate::ai::driver::skill_ranking::ScoredSkill;
     use crate::ai::skills::SkillManifest;
     use crate::ai::tools::enable_tools::set_explicit_enabled_tool_names;
     use crate::ai::types::{FunctionDefinition, ToolDefinition};
@@ -2180,141 +1986,10 @@ mod tests {
     }
 
     #[test]
-    fn local_selector_chooses_review_skill_for_review_request() {
-        let skills = vec![
-            skill("code-review", "Review code changes and highlight bugs"),
-            skill("debugger", "Debug runtime failures and collect traces"),
-        ];
-        let selected = select_skill_with_preference(
-            &skills,
-            "帮我 review 这段 Rust 代码",
-            None,
-            &model_path(),
-        );
-        assert_eq!(selected.map(|item| item.name.as_str()), Some("code-review"));
-    }
-
-    #[test]
-    fn local_selector_prefers_current_skill_without_clear_winner() {
-        let skills = vec![
-            skill("code-review", "Review code changes and summarize defects"),
-            skill(
-                "debugger",
-                "Debug runtime failures, panic, and stack traces",
-            ),
-        ];
-        let selected = select_skill_with_preference(
-            &skills,
-            "帮我看一下这段代码哪里有问题",
-            Some("code-review"),
-            &model_path(),
-        );
-        assert_eq!(selected.map(|item| item.name.as_str()), Some("code-review"));
-    }
-
-    #[test]
-    fn local_selector_switches_when_new_skill_is_significantly_better() {
-        let debugger = skill(
-            "debugger",
-            "Debug panic crash stack trace runtime failure logs",
-        );
-        let skills = vec![
-            skill("code-review", "Review code changes and summarize defects"),
-            debugger,
-        ];
-        let selected = select_skill_with_preference(
-            &skills,
-            "程序 panic 了，帮我调试这个 crash 和 stack trace",
-            Some("code-review"),
-            &model_path(),
-        );
-        assert_eq!(selected.map(|item| item.name.as_str()), Some("debugger"));
-    }
-
-    #[test]
-    fn local_selector_abstains_from_identity_only_match() {
-        // 纯 identity 命中（名字/描述里恰好出现 skill 名）但缺乏 capability/behavior
-        // 信号时应弃权：intent 移除后由 identity-only 打分门控兜底防误激活。
-        let item = ScoredSkill {
-            skill: &skill("skill-creator", "Create new skills"),
-            score: 0.0,
-            embedding_score: 0.0,
-            embedding_identity_score: 0.30,
-            embedding_capability_score: 0.02,
-            embedding_behavior_score: 0.02,
-            fallback_semantic_score: 0.0,
-            fallback_identity_score: 0.30,
-            fallback_capability_score: 0.02,
-            fallback_behavior_score: 0.02,
-            model_prior_score: 0.05,
-            blended_score: 0.0,
-            none_score: 0.20,
-        };
-        assert!(super::should_abstain_from_skill(&item));
-    }
-
-    #[test]
-    fn local_selector_still_routes_skill_creator_like_skill_for_creation_request() {
-        let skills = vec![
-            skill_with_prompt(
-                "skill-creator",
-                "Create new skills and skill templates for the workspace",
-                "Use this skill when the user wants to create or add a new skill to the workspace.",
-            ),
-            skill("debugger", "Debug runtime failures and collect traces"),
-        ];
-        let selected = select_skill_with_preference(
-            &skills,
-            "帮我创建一个新的 CI skill 模板",
-            None,
-            &model_path(),
-        );
-        assert_eq!(
-            selected.map(|item| item.name.as_str()),
-            Some("skill-creator")
-        );
-    }
-
-    #[test]
     fn follow_up_detector_recognizes_short_continuation_question() {
         assert!(looks_like_follow_up_or_same_topic(
             "那这个 panic 呢？",
             "帮我调试一下这个 Rust panic"
         ));
-    }
-
-    #[test]
-    fn cross_turn_bias_prefers_previous_skill_on_follow_up() {
-        let skills = vec![
-            skill("code-review", "Review code changes and summarize defects"),
-            skill("debugger", "Debug runtime failures and panic stack traces"),
-        ];
-        let selected = select_skill_with_preference_strength(
-            &skills,
-            "那这个报错顺便再看一下",
-            Some("debugger"),
-            PreferenceStrength::CrossTurnBias,
-            &model_path(),
-        );
-        assert_eq!(selected.map(|item| item.name.as_str()), Some("debugger"));
-    }
-
-    #[test]
-    fn cross_turn_bias_still_switches_when_new_skill_is_clearly_better() {
-        let skills = vec![
-            skill("code-review", "Review code changes and summarize defects"),
-            skill(
-                "debugger",
-                "Debug panic crash stack trace runtime failure logs",
-            ),
-        ];
-        let selected = select_skill_with_preference_strength(
-            &skills,
-            "继续这个问题，不过现在请直接 review 这段实现有没有逻辑 bug",
-            Some("debugger"),
-            PreferenceStrength::CrossTurnBias,
-            &model_path(),
-        );
-        assert_eq!(selected.map(|item| item.name.as_str()), Some("code-review"));
     }
 }

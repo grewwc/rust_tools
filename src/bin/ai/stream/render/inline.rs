@@ -663,4 +663,5 @@ mod tests {
         assert!(!rendered.contains("\x1b[95m"));
         assert!(rendered.contains("$5 USD"));
     }
+
 }

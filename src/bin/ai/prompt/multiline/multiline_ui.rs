@@ -36,6 +36,7 @@ fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>)
     //    viewport_height 是启动时的快照，resize 后手动 MoveUp 的行数
     //    与 ratatui 内部光标状态不一致，导致 clear() 清错区域，旧
     //    viewport 内容（包括 cursor 块 ▌）残留在 scrollback 中反复堆叠。
+    let _ = terminal.hide_cursor();
     let _ = terminal.autoresize();
     let _ = terminal.clear();
     Ok(())

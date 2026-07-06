@@ -458,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "documents skill routing false-positive; pending abstention gate fix"]
+    #[ignore = "known TF-IDF ranking false-positive; no longer affects skill selection since pre-routing was removed — TF-IDF now only sorts discover_skills results, LLM makes the final call"]
     fn markdown_fix_query_does_not_route_to_feishu_export_skill() {
         let skills = vec![
             skill(

@@ -1108,10 +1108,15 @@ fn has_pending_foreground_process(app: &App) -> bool {
 
 /// Check if auto-agent routing is enabled in config.
 /// Auto-routing selects the best agent based on the question content.
+///
+/// 默认禁用：TF-IDF + logistic regression 的浅层文本匹配误报率高（如问题中
+/// 出现 "skill" 就切到 prompt-skill agent），且 agent 切换会改变 system
+/// prompt / 工具集 / model tier，影响整轮对话。用户可通过 `-a <agent>`
+/// 手动指定，或配置 `ai.agents.auto_route.enable = true` 重新启用。
 fn auto_agent_routing_enabled() -> bool {
     !configw::get_all_config()
         .get_opt("ai.agents.auto_route.enable")
-        .unwrap_or_else(|| "true".to_string())
+        .unwrap_or_else(|| "false".to_string())
         .trim()
         .eq_ignore_ascii_case("false")
 }
