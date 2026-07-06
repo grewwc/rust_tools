@@ -174,7 +174,7 @@
     "provider": "compatible",
     "api_key": "enc:RarVwtMcVt9sGgaNRQiltiSwOqAt2tei/6x6BBThdeuhNC1M3j6GFKZvEO0FxfFf7pSr1Mr6o7k=",
     "is_vl": false,
-    "search_enabled": false,
+    "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,
     "default_reasoning_effort": "high",
