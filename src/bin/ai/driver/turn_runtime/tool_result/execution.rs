@@ -456,8 +456,40 @@ impl<'a> TerminalToolObserver<'a> {
     }
 }
 
+/// 把 `execute_command` 等命令类工具的 arguments 渲染成单行可读的命令文本，
+/// 用于工具开始时在终端打印「输入」。多行命令折叠为单行，过长则截断。
+/// 解析失败（缺 `command` 字段或非法 JSON）时返回 None。
+fn format_command_input(arguments: &str) -> Option<String> {
+    let args: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    let command = args.get("command")?.as_str()?;
+    // 折叠换行，避免一条命令在终端占多行打乱状态行布局
+    let mut line = command.replace('\n', " ⏎ ").replace('\r', "");
+    const MAX_CHARS: usize = 200;
+    if line.chars().count() > MAX_CHARS {
+        let kept: String = line.chars().take(MAX_CHARS.saturating_sub(1)).collect();
+        line = format!("{kept}…");
+    }
+    if let Some(cwd) = args.get("cwd").and_then(serde_json::Value::as_str) {
+        if !cwd.is_empty() {
+            line.push_str(&format!("  (cwd: {cwd})"));
+        }
+    }
+    Some(line)
+}
+
 impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
-    fn on_tool_started(&mut self, _tool_call: &ToolCall) {}
+    fn on_tool_started(&mut self, tool_call: &ToolCall) {
+        // 命令类工具：在终端打印其输入（命令行），输出仍按既定策略忽略。
+        // 其它工具保持「只显示状态行」的既有行为。
+        if matches!(
+            tool_call.function.name.as_str(),
+            "execute_command" | "run_command" | "shell" | "bash"
+        ) {
+            if let Some(line) = format_command_input(&tool_call.function.arguments) {
+                print_tool_note_line("cmd", &line);
+            }
+        }
+    }
 
     fn on_tool_stream(&mut self, tool_call: &ToolCall, chunk: &[u8]) {
         self.pending_utf8.extend_from_slice(chunk);
