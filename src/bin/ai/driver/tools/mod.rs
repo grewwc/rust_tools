@@ -1938,9 +1938,9 @@ fn finalize_execution_result(
 fn print_run_status(tool_call: &ToolCall, run_result: &RunOneResult) {
     let name = &tool_call.function.name;
     if run_result.cached {
-        println!("\n{}", format_tool_status_cached(name));
+        println!("{}", format_tool_status_cached(name));
     } else if !run_result.executed {
-        println!("\n{}", format_tool_status_skipped(name));
+        println!("{}", format_tool_status_skipped(name));
     } else if run_result.ok {
         // 已执行的工具：用 \r 回到行首覆盖 running 状态，保持同一行
         print!("\r\x1b[2K{}\n", format_tool_status_completed(name));
@@ -2066,7 +2066,7 @@ fn run_one(
     }
 
     // 不换行，以便完成状态用 \r 覆盖在同一行
-    print!("\n{}", format_tool_status_running(&tool_call.function.name));
+    print!("{}", format_tool_status_running(&tool_call.function.name));
     let _ = std::io::stdout().flush();
 
     if let Err(run_result) = reserve_current_process_tool_call_budget(tool_call) {
@@ -2143,11 +2143,15 @@ fn execute_tool_calls_inner(
     let mut tool_results = Vec::with_capacity(tool_calls.len());
     let mut cached_hits = Vec::with_capacity(tool_calls.len());
 
+    // 在第一个工具状态前输出一个换行与 assistant 文本分开；
+    // 各工具状态行不再自带前导 \n，避免连续工具之间出现空行。
+    print!("\n");
+
     let mut idx = 0usize;
     while idx < tool_calls.len() {
         if crate::ai::tools::registry::common::is_tool_cancel_requested() {
             for deferred in &tool_calls[idx..] {
-                println!("\n{}", format_tool_status_deferred(&deferred.function.name));
+                println!("{}", format_tool_status_deferred(&deferred.function.name));
             }
             break;
         }
@@ -2224,14 +2228,14 @@ fn execute_tool_calls_inner(
 
         if should_barrier && !is_last {
             for deferred in &tool_calls[idx + 1..] {
-                println!("\n{}", format_tool_status_deferred(&deferred.function.name));
+                println!("{}", format_tool_status_deferred(&deferred.function.name));
             }
             break;
         }
 
         if crate::ai::tools::registry::common::is_tool_cancel_requested() {
             for deferred in &tool_calls[idx + 1..] {
-                println!("\n{}", format_tool_status_deferred(&deferred.function.name));
+                println!("{}", format_tool_status_deferred(&deferred.function.name));
             }
             break;
         }

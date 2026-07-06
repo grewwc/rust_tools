@@ -20,12 +20,7 @@ use crate::ai::prompt::{PromptEditor, interrupted_error};
 /// 处理 `Event::Resize` 连续触发的情况：终端窗口拖动时 Resize 事件会快速连发，
 /// 如果每次都重绘 inline viewport，会导致"画面撕裂"或闪烁。
 /// 本函数先 drain 掉后续堆积的 Resize 事件，再做一次 full redraw。
-/// `viewport_height` 用于精确控制光标上移行数，避免上移过多进入 scrollback
-/// 区域导致光标块残留。
-fn handle_resize_burst<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-    viewport_height: u16,
-) -> io::Result<()> {
+fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     // 1) drain 掉所有后续的 Resize 事件，避免重复触发重绘
     while event::poll(Duration::ZERO).unwrap_or(false) {
         match event::read() {
@@ -36,15 +31,12 @@ fn handle_resize_burst<B: ratatui::backend::Backend>(
         }
     }
 
-    // 2) 清除 viewport 区域。使用 viewport_height + 小余量而非整个终端高度，
-    //    避免光标上移过多进入 scrollback 导致残留光标块。
-    let clear_rows = viewport_height.saturating_add(3);
-    let _ = execute!(
-        io::stdout(),
-        crossterm::cursor::MoveUp(clear_rows),
-        crossterm::cursor::MoveToColumn(0),
-        Clear(ClearType::FromCursorDown)
-    );
+    // 2) 通知 ratatui 终端尺寸已变化（宽度变化影响文本折行），
+    //    然后清除 inline viewport。不再手动 MoveUp + Clear：
+    //    viewport_height 是启动时的快照，resize 后手动 MoveUp 的行数
+    //    与 ratatui 内部光标状态不一致，导致 clear() 清错区域，旧
+    //    viewport 内容（包括 cursor 块 ▌）残留在 scrollback 中反复堆叠。
+    let _ = terminal.autoresize();
     let _ = terminal.clear();
     Ok(())
 }
@@ -105,7 +97,7 @@ impl PromptEditor {
 
                 let event = event::read().map_err(|e| io::Error::other(e.to_string()))?;
                 if let Event::Resize(_, _) = &event {
-                    handle_resize_burst(&mut terminal, viewport_height)?;
+                    handle_resize_burst(&mut terminal)?;
                 }
 
                 match handle_multiline_event(

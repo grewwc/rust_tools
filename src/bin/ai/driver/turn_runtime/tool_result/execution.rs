@@ -21,8 +21,7 @@ use super::{
     preview::{build_terminal_preview, tail_chars},
 };
 use crate::ai::driver::print::{
-    format_tool_output_line, format_tool_output_prefix, print_tool_note_line,
-    sanitize_for_terminal,
+    format_tool_output_line, print_tool_note_line,
 };
 use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
@@ -416,72 +415,11 @@ impl<'a> TerminalToolObserver<'a> {
     }
 
     fn push_stream_text(&mut self, text: &str) {
-        use std::io::Write;
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        let sanitized = sanitize_for_terminal(&normalized);
-
-        if sanitized.is_empty() {
-            return;
-        }
-
-        if self.allow_inline_fold_updates {
-            let _ = self.tty_fold.push_text(&sanitized);
-            let _ = std::io::stdout().flush();
+        // 终端不再打印流式工具输出内容，只保留状态行。
+        // 仍需标记 streamed_any_output 以便 on_tool_finished 输出完成状态。
+        if !text.is_empty() {
             self.streamed_any_output = true;
-            return;
         }
-
-        for ch in sanitized.chars() {
-            if ch == '\n' {
-                // 完成一行
-                self.fold_total_lines += 1;
-
-                if self.fold_total_lines <= TOOL_OUTPUT_FOLD_MAX_VISIBLE {
-                    // 还没超限，正常输出换行
-                    print!("\x1b[0m\n");
-                    self.at_line_start = true;
-                } else if self.fold_total_lines == TOOL_OUTPUT_FOLD_MAX_VISIBLE + 1 {
-                    // 刚超限：结束当前行，切换到折叠模式。真实 TTY 继续用单行计数器
-                    // 原地刷新；非 TTY 只打印一次稳定提示，避免把 `\r\x1b[2K`
-                    // 这类控制序列泄漏到 IDE Chat / 日志。
-                    print!("\x1b[0m\n");
-                    self.at_line_start = true;
-                    if self.allow_inline_fold_updates {
-                        let folded = self.fold_total_lines - TOOL_OUTPUT_FOLD_MAX_VISIBLE;
-                        print!(
-                            "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded (streaming) ···\x1b[0m"
-                        );
-                    } else {
-                        println!(
-                            "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· streaming output folded until completion ···\x1b[0m"
-                        );
-                    }
-                    let _ = std::io::stdout().flush();
-                } else {
-                    if self.allow_inline_fold_updates {
-                        // 已在计数器模式：原地更新计数
-                        let folded = self.fold_total_lines - TOOL_OUTPUT_FOLD_MAX_VISIBLE;
-                        print!(
-                            "\r\x1b[2K  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded (streaming) ···\x1b[0m"
-                        );
-                        let _ = std::io::stdout().flush();
-                        self.at_line_start = false;
-                    }
-                }
-            } else {
-                // 只在未超限时打印字符
-                if self.fold_total_lines < TOOL_OUTPUT_FOLD_MAX_VISIBLE {
-                    if self.at_line_start {
-                        print!("{}", format_tool_output_prefix());
-                        self.at_line_start = false;
-                    }
-                    print!("{ch}");
-                }
-                // 超限后不输出任何字符内容
-            }
-        }
-        let _ = std::io::stdout().flush();
-        self.streamed_any_output = true;
     }
 
     fn push_stream_text_for_tool(&mut self, tool_call: &ToolCall, text: &str) {
@@ -502,35 +440,9 @@ impl<'a> TerminalToolObserver<'a> {
     }
 
     fn finish_stream_output(&mut self, newline: bool) {
-        self.flush_pending_utf8();
-        if self.allow_inline_fold_updates {
-            let _ = self.tty_fold.finish();
-            return;
-        }
-        // 如果正在计数器模式，换行结束计数器行
-        if self.fold_total_lines > TOOL_OUTPUT_FOLD_MAX_VISIBLE {
-            let folded = self.fold_total_lines - TOOL_OUTPUT_FOLD_MAX_VISIBLE;
-            if self.allow_inline_fold_updates {
-                // 把 "(streaming)" 替换为最终状态
-                print!(
-                    "\r\x1b[2K  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded ···\x1b[0m\n"
-                );
-            } else {
-                println!(
-                    "  {ACCENT_RULE}│{RESET} {ACCENT_MUTED}··· {folded} lines folded ···\x1b[0m"
-                );
-            }
-            let _ = std::io::stdout().flush();
-            self.at_line_start = true;
-        } else if !self.at_line_start {
-            if newline {
-                print!("\x1b[0m\n");
-                self.at_line_start = true;
-            } else {
-                print!("\x1b[0m");
-            }
-            let _ = std::io::stdout().flush();
-        }
+        // 终端不再打印流式工具输出内容，finish 也无需输出可见内容。
+        let _ = newline;
+        self.pending_utf8.clear();
     }
 
     fn print_prepared_tool_result(&mut self, prepared: &PreparedToolResult) {
@@ -597,6 +509,8 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
                 }
             } else if tool_call.function.name == "execute_command" {
                 print_tool_note_line("result", "command completed");
+            } else {
+                print_tool_note_line("result", "tool completed");
             }
 
             self.reset_stream_state();

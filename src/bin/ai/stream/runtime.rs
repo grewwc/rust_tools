@@ -327,10 +327,6 @@ fn finalize_stream_response(
 
     state.render.markdown.flush_pending()?;
 
-    if state.render.current_printing_index.is_some() {
-        println!("\x1b[0m");
-    }
-
     if take_stream_cancelled(app) {
         return Ok(cancelled_stream_result(&mut state));
     }
@@ -979,7 +975,6 @@ fn ensure_tool_calls_section_open(
         state.content.thinking_open = false;
     }
     let _ = state.render.markdown.flush_pending();
-    println!("{}", format_section_header("tool calls", None));
     state.render.printed_tool_calls_header = true;
 }
 
@@ -1012,17 +1007,10 @@ fn take_tool_call_render_chunk(
 fn open_tool_call_line(
     state: &mut StreamProcessingState,
     index: usize,
-    function_name: &str,
+    _function_name: &str,
 ) -> io::Result<()> {
-    if state.render.current_printing_index.is_some() {
-        println!("\x1b[0m");
-    }
     state.render.current_printing_index = Some(index);
-    print!(
-        "  {}│{} {}{}{}",
-        ACCENT_RULE, RESET, ACCENT_MUTED, function_name, RESET
-    );
-    io::stdout().flush()
+    Ok(())
 }
 
 /// 终端不再打印工具调用参数，只保留工具名称。
@@ -1281,7 +1269,7 @@ fn write_thinking_content_folded(
     // 控制行必须是独占 marker，本身不应与正文混写。
     if is_standalone_stream_marker(content, &markers.thinking_tag) {
         if !fold.active {
-            if content.starts_with('\n') || state.render.markdown.has_unfinished_line() {
+            if state.render.markdown.has_unfinished_line() {
                 write_stream_content_to_terminal("\n", &mut state.render.markdown, false)?;
             }
             fold.active = true;
@@ -1298,11 +1286,16 @@ fn write_thinking_content_folded(
         if ch == '\n' {
             // 一行完成
             let completed_line = std::mem::take(&mut fold.current_line);
-            fold.total_lines += 1;
-            fold.recent_lines.push_back(completed_line);
-            // 只保留最近 max_visible_lines 行
-            while fold.recent_lines.len() > fold.max_visible_lines {
-                fold.recent_lines.pop_front();
+            // 折叠视图内跳过空行（无论开头还是段间）：模型推理常用空行分段，
+            // 但紧凑折叠窗口里空行纯属噪音，会平白占一行可见预算。原文仍完整
+            // 保留在 reasoning_text，不影响回传后端。
+            if !completed_line.trim().is_empty() {
+                fold.total_lines += 1;
+                fold.recent_lines.push_back(completed_line);
+                // 只保留最近 max_visible_lines 行
+                while fold.recent_lines.len() > fold.max_visible_lines {
+                    fold.recent_lines.pop_front();
+                }
             }
         } else {
             fold.current_line.push(ch);
@@ -1472,8 +1465,11 @@ mod tests {
     }
 
     #[test]
-    fn thinking_fold_defaults_to_eight_lines_for_tty() {
-        assert_eq!(resolve_thinking_fold_max_visible_lines(true, None), 8);
+    fn thinking_fold_defaults_to_configured_lines_for_tty() {
+        assert_eq!(
+            resolve_thinking_fold_max_visible_lines(true, None),
+            DEFAULT_THINKING_MAX_VISIBLE_LINES
+        );
         assert_eq!(
             resolve_thinking_fold_max_visible_lines(true, Some("12")),
             12
@@ -1484,7 +1480,7 @@ mod tests {
         );
         assert_eq!(
             resolve_thinking_fold_max_visible_lines(true, Some("oops")),
-            8
+            DEFAULT_THINKING_MAX_VISIBLE_LINES
         );
         assert_eq!(
             resolve_thinking_fold_max_visible_lines(false, Some("12")),
@@ -1936,6 +1932,24 @@ mod tests {
         assert_eq!(state.content.assistant_text, "final answer");
         assert!(!state.content.thinking_open);
         assert!(!state.render.thinking_fold.active);
+    }
+
+    #[test]
+    fn thinking_fold_drops_interior_blank_lines() {
+        let markers = StreamMarkers::new();
+        let mut state = StreamProcessingState::new();
+        state.render.thinking_fold.max_visible_lines = 8;
+        state.render.thinking_fold.active = true;
+
+        // 模型常用空行分段：段间空行不应占用折叠窗口的可见行。
+        write_thinking_content_folded("para 1\n\npara 2\n", &mut state, &markers).unwrap();
+
+        let fold = &state.render.thinking_fold;
+        assert_eq!(
+            fold.recent_lines.iter().collect::<Vec<_>>(),
+            vec!["para 1", "para 2"]
+        );
+        assert_eq!(fold.total_lines, 2);
     }
 
     #[test]
@@ -2497,7 +2511,10 @@ fn unseen_suffix(existing: &str, incoming: &str) -> String {
 
     for overlap_chars in (1..boundaries.len()).rev() {
         let split_idx = boundaries[overlap_chars];
-        if existing.ends_with(&incoming[..split_idx]) {
+        let overlap = &incoming[..split_idx];
+        // 纯空白（如 \n）的重叠几乎总是伪匹配——模型常以 \n 开始新段落，
+        // 而 assistant_text 也常以 \n 结尾。只有含可见字符的重叠才视为真正的重复。
+        if existing.ends_with(overlap) && overlap.chars().any(|c| !c.is_whitespace()) {
             return incoming[split_idx..].to_string();
         }
     }

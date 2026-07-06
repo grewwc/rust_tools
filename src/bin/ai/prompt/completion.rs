@@ -344,6 +344,7 @@ impl CommandCompleter {
             "undo",
             "export",
             "copy",
+            "replay",
             "help",
             "3",
             "6",

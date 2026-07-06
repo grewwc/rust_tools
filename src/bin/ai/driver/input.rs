@@ -24,7 +24,7 @@ const HISTORY_GREP_HIGHLIGHT_END: &str = "\x1b[0m";
 
 fn print_history_help() {
     println!(
-        "/history usage:\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history grep <keyword>  Search messages\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history export [path] Export to file\n  /history copy          Copy to clipboard\n  /history help            Show this help",
+        "/history usage:\n  /history [N]           Show last N messages (default: {})\n  /history full          Show full messages\n  /history user/assistant/tool/system\n                         Filter by role\n  /history grep <keyword>  Search messages\n  /history rewind u<N>   Remove user message u<N> and everything after it\n  /history rewind last   Remove latest user message and everything after it\n  /history rewind grep <keyword>\n                         Rewind the only user message matching keyword\n  /history export [path] Export to file\n  /history copy          Copy to clipboard\n  /history replay        Replay the last turn's assistant conclusion (text only)\n  /history help            Show this help",
         HISTORY_PREVIEW_DEFAULT_COUNT
     );
 }
@@ -119,6 +119,7 @@ enum LocalCommand {
     ExportHistory(HistoryPreviewOptions, Option<PathBuf>),
     CopyHistory(HistoryPreviewOptions),
     RewindHistory(HistoryRewindTarget),
+    ReplayHistory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +170,9 @@ fn handle_local_command_inner(app: &mut App, input: &str) -> Result<bool, Box<dy
     match command {
         LocalCommand::ShowHistory(options) => {
             println!("{}", render_history_preview(app, options)?);
+        }
+        LocalCommand::ReplayHistory => {
+            println!("{}", render_history_replay(app)?);
         }
         LocalCommand::HelpHistory => {
             print_history_help();
@@ -230,6 +234,13 @@ fn parse_history_local_command(args: &[&str]) -> Result<Option<LocalCommand>, Bo
     if args.first().copied() == Some("rewind") || args.first().copied() == Some("undo") {
         return parse_history_rewind_command(&args[1..])
             .map(|target| Some(LocalCommand::RewindHistory(target)));
+    }
+    // `/history replay`：回放最后一轮模型的结论文本（不含 tool/thinking）。
+    if args.first().copied() == Some("replay") {
+        if args.len() > 1 {
+            return Err("`/history replay` takes no arguments".into());
+        }
+        return Ok(Some(LocalCommand::ReplayHistory));
     }
     let (options, action) = parse_history_preview_options(args)?;
     Ok(Some(match action {
@@ -393,6 +404,36 @@ fn render_history_preview(
         ));
     }
     Ok(out.trim_end().to_string())
+}
+
+/// 渲染 `/history replay` 的输出：只取最后一轮 assistant 的结论文本，
+/// 跳过 tool_calls（工具调用步骤）与 reasoning_content（thinking）。
+fn render_history_replay(app: &App) -> Result<String, Box<dyn Error>> {
+    let history_file = active_history_path(app);
+    let messages = history::build_message_arr(usize::MAX, &history_file)?;
+    // 从末尾向前找最后一条「结论型」assistant 消息：
+    // 没有 tool_calls（即不是工具调用中间步骤）且 content 非空。
+    let conclusion = messages.iter().rev().find_map(|message| {
+        if message.role != "assistant" {
+            return None;
+        }
+        let has_tool_calls = message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty());
+        if has_tool_calls {
+            return None;
+        }
+        let text = searchable_history_content(&message.content);
+        if text.trim().is_empty() {
+            return None;
+        }
+        Some(text)
+    });
+    Ok(match conclusion {
+        Some(text) => text,
+        None => "[history] No assistant conclusion found in recent history.".to_string(),
+    })
 }
 
 fn collect_history_messages(
@@ -980,7 +1021,7 @@ mod tests {
         HistoryAction, HistoryPreviewOptions, HistoryRewindTarget, HistoryRoleFilter, LocalCommand,
         apply_history_rewind, extract_at_file_references, extract_forced_skill_reference,
         finalize_question, highlight_history_keyword, parse_history_preview_options,
-        parse_local_command, plan_history_rewind, render_history_preview,
+        parse_local_command, plan_history_rewind, render_history_preview, render_history_replay,
         resolve_inline_image_path, searchable_history_content, summarize_history_content,
         truncate_for_terminal,
     };
@@ -1429,6 +1470,82 @@ mod tests {
         assert!(rendered.contains("[user] second user"));
         assert!(rendered.contains("(u2)"));
         assert!(!rendered.contains("assistant reply"));
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn render_history_replay_returns_last_assistant_conclusion() {
+        let history_path =
+            std::env::temp_dir().join(format!("ai-history-replay-{}.sqlite", Uuid::new_v4()));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+
+        // 第一轮：工具调用步骤（带 tool_calls、空 content）+ 最终结论。
+        let tool_step = Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: Some("thinking about the file".to_string()),
+        };
+        let messages = vec![
+            test_message("user", "please check the file"),
+            tool_step,
+            test_message("tool", "file contents here"),
+            test_message("assistant", "the final answer is 42"),
+            test_message("user", "follow up question"),
+            test_message("assistant", "and the follow-up answer"),
+        ];
+        append_history_messages(&history_path, &messages).unwrap();
+
+        let replayed = render_history_replay(&app).unwrap();
+        assert_eq!(replayed, "and the follow-up answer");
+
+        let _ = std::fs::remove_file(history_path);
+    }
+
+    #[test]
+    fn render_history_replay_skips_tool_call_steps_and_picks_prior_conclusion() {
+        let history_path = std::env::temp_dir().join(format!(
+            "ai-history-replay-prior-{}.sqlite",
+            Uuid::new_v4()
+        ));
+        let mut app = test_app();
+        app.session_history_file = history_path.clone();
+
+        // 最后一轮只到工具调用步骤（尚未产出结论），replay 应回退到上一轮结论。
+        let tool_step = Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: "call_1".to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+        let messages = vec![
+            test_message("user", "first question"),
+            test_message("assistant", "first conclusion"),
+            test_message("user", "second question"),
+            tool_step,
+        ];
+        append_history_messages(&history_path, &messages).unwrap();
+
+        let replayed = render_history_replay(&app).unwrap();
+        assert_eq!(replayed, "first conclusion");
 
         let _ = std::fs::remove_file(history_path);
     }
