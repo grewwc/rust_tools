@@ -51,7 +51,9 @@ pub(super) struct ParsedCli {
     pub(super) generate_completions: bool,
     /// 是否以后台模式运行（`--background` / `-bg`）。
     /// 后台模式下会 detach 终端、把完整输出写入当前目录下 `<sessionid>.log`，
-    /// 并提示 agent 在任务完成前不要停止。需要搭配位置参数（问题）使用。
+    /// 并提示 agent 在任务完成前不要停止。
+    /// 可搭配位置参数（任务描述）使用；若未提供位置参数，则会在 daemonize 之前
+    /// 交互式读取多行输入作为任务描述。
     pub(super) background: bool,
     /// --stop <session-id>：向后台任务的进程发送 SIGTERM 停止它。
     /// 后台模式会在当前目录下写入 <sessionid>.pid 文件，--stop 读取它并 kill。
@@ -459,7 +461,7 @@ pub(super) fn print_help() {
     println!("  -n, --note <text>        save text as memo to knowledge base and exit");
     println!("  -ns, --note-search       search memo category using the positional prompt");
     println!("  -i, --interactive        keep the session open for follow-up questions");
-    println!("  -bg, --background        run the prompt in background: detach from terminal, log to <sessionid>.log");
+    println!("  -bg, --background [task]  run in background: detach from terminal, log to <sessionid>.log; without a task, prompts for multi-line input");
     println!("  --stop <session-id>      stop a background session (reads <sessionid>.pid, sends SIGTERM)");
     println!();
     parser.print_defaults();
