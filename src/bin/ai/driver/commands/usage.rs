@@ -219,6 +219,35 @@ fn print_daily_breakdown(days: u64) {
     }
 }
 
+/// 打印最近有数据的 N 天（不限时间窗口，跳过无数据的空天）。
+fn print_recent_days(limit: usize) {
+    match store::query_recent_days(limit) {
+        Some(rows) if rows.is_empty() => {
+            println!("  [daily recent {}d] 无数据", limit);
+        }
+        Some(rows) => {
+            println!("  [daily recent {}d]", limit);
+            println!(
+                "      {:<12} {:>6}  {:>7}  {:>7}  {:>7}",
+                "date", "calls", "in", "out", "total"
+            );
+            for r in &rows {
+                println!(
+                    "      {:<12} {:>6}  {:>7}  {:>7}  {:>7}",
+                    r.day,
+                    format_number(r.calls),
+                    format_number(r.input),
+                    format_number(r.output),
+                    format_number(r.total)
+                );
+            }
+        }
+        None => {
+            println!("  [daily] (no usage store available)");
+        }
+    }
+}
+
 pub fn try_handle_usage_command(input: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -253,14 +282,14 @@ pub fn try_handle_usage_command(input: &str) -> Result<bool, Box<dyn std::error:
     }
 
     if arg.is_empty() {
-        // 默认：精简概览——全部历史 + 最近 3d + 最近 24h 总量 + 近 3 天每日趋势。
+        // 默认：精简概览——全部历史 + 最近 3d + 最近 24h 总量 + 最近有数 3 天趋势。
         // 按模型拆分请用 /usage models [Nd]。
         println!();
         print_totals_only(None);
         print_totals_only(Some(3 * 86_400));
         print_totals_only(Some(86_400));
         println!();
-        print_daily_breakdown(3);
+        print_recent_days(3);
     } else if let Some(sub) = arg.strip_prefix("models") {
         // /usage models [Nd|today|7d|30d|all] —— 按模型拆分，calls 逆序，默认 7d。
         let sub = sub.trim();

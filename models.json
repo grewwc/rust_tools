@@ -14,7 +14,8 @@
     "search_enabled": true,
     "tools_default_enabled": true,
     "enable_thinking": true,
-    "subagent_priority": 100
+    "subagent_priority": 100,
+    "max_output_tokens": 393216
   },
   {
     "key": "deepseek-v4-flash-alibaba",
@@ -31,7 +32,8 @@
     "tools_default_enabled": true,
     "enable_thinking": true,
     "subagent_priority": 100,
-    "default_reasoning_effort": "high"
+    "default_reasoning_effort": "high",
+    "max_output_tokens": 393216
   },
   {
     "key": "deepseek-v4-flash-opencode",
@@ -46,7 +48,8 @@
     "tools_default_enabled": true,
     "enable_thinking": true,
     "subagent_priority": 85,
-    "default_reasoning_effort": "high"
+    "default_reasoning_effort": "high",
+    "max_output_tokens": 393216
   },
   {
     "key": "qwen3.7-plus-alibaba",
@@ -64,7 +67,8 @@
     "tools_default_enabled": true,
     "explicit_prompt_cache": true,
     "enable_thinking": true,
-    "subagent_priority": 90
+    "subagent_priority": 90,
+    "max_output_tokens": 65536
   },
   {
     "key": "qwen3.7-max-alibaba",
@@ -82,7 +86,8 @@
     "explicit_prompt_cache": true,
     "enable_thinking": true,
     "default_reasoning_effort": "high",
-    "subagent_priority": 80
+    "subagent_priority": 80,
+    "max_output_tokens": 65536
   },
   {
     "key": "qwen3.6-flash-alibaba",
@@ -99,7 +104,8 @@
     "tools_default_enabled": false,
     "explicit_prompt_cache": true,
     "enable_thinking": false,
-    "subagent_priority": 150
+    "subagent_priority": 150,
+    "max_output_tokens": 65536
   },
   {
     "key": "mimo-v2.5-free-opencode",
@@ -128,7 +134,8 @@
     "tools_default_enabled": true,
     "default_reasoning_effort": "high",
     "enable_thinking": true,
-    "subagent_priority": 95
+    "subagent_priority": 95,
+    "max_output_tokens": 32768
   },
   {
     "key": "glm-5.2-alibaba",
@@ -146,7 +153,8 @@
     "default_reasoning_effort": "high",
     "explicit_prompt_cache": true,
     "enable_thinking": true,
-    "subagent_priority": 60
+    "subagent_priority": 60,
+    "max_output_tokens": 32768
   },
   {
     "key": "experimental",
@@ -160,7 +168,8 @@
     "tools_default_enabled": true,
     "enable_thinking": true,
     "default_reasoning_effort": "high",
-    "subagent_priority": 50
+    "subagent_priority": 50,
+    "max_output_tokens": 32768
   },
   {
     "key": "glm5.2-super-relay",
@@ -179,6 +188,7 @@
     "enable_thinking": true,
     "default_reasoning_effort": "high",
     "explicit_prompt_cache": true,
-    "subagent_priority": 50
+    "subagent_priority": 50,
+    "max_output_tokens": 32768
   }
 ]

@@ -2279,6 +2279,11 @@ fn is_summary_message(message: &Message) -> bool {
 
 const KEEP_RECENT_TOOL_MESSAGES: usize = 6;
 
+/// 带 tool_calls 的 assistant 消息中，保留完整 reasoning_content 的最近轮数。
+/// 更早的 tool-call reasoning 置 None（DeepSeek 由 echo 兜底补空字符串占位），
+/// 防止历史 reasoning 文本在长 session 里单调累积，拖慢响应并挤占上下文预算。
+const KEEP_RECENT_TOOL_CALL_REASONING: usize = 3;
+
 fn tool_message_indices(messages: &[Message]) -> Vec<usize> {
     messages
         .iter()
@@ -2350,7 +2355,10 @@ fn dedup_adjacent(messages: &mut Vec<Message>) {
 /// 其 assistant 消息的 reasoning_content 必须在后续所有请求中原样回传**，否则
 /// 会返回 `400 invalid_request_error: The reasoning_content in the thinking mode
 /// must be passed back to the API`。因此这里的策略是：
-/// - 带 `tool_calls` 的 assistant 消息：一律保留 reasoning_content（DeepSeek 强制）；
+/// - 带 `tool_calls` 的 assistant 消息：只保留最近 `KEEP_RECENT_TOOL_CALL_REASONING`
+///   轮的完整 reasoning_content，更早的置 None——DeepSeek 所需的字段形状由
+///   `ensure_reasoning_content_echo_for_thinking_model` 用空字符串占位补齐，既满足
+///   协议校验又避免历史 reasoning 文本在长 session 里单调累积、拖慢并"变蠢"；
 /// - 不带 tool_calls 的纯回答 assistant 消息：只保留最近一条的 reasoning_content，
 ///   其余置 None（OpenAI 等仅要求与最近一次 tool_call 同回合的 reasoning 配对，
 ///   旧的纯回答 reasoning 可安全丢弃）。
@@ -2365,12 +2373,29 @@ fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
         })
         .map(|(idx, _)| idx);
 
+    // 带 tool_calls 的 assistant reasoning 跨轮滑窗：只保留最近 N 条的完整文本，
+    // 更早的置 None（DeepSeek 会由 echo 兜底补空字符串占位）。
+    let tool_call_reasoning_count = messages
+        .iter()
+        .filter(|m| {
+            m.role == "assistant" && m.reasoning_content.is_some() && m.tool_calls.is_some()
+        })
+        .count();
+    let drop_tool_call_reasoning_before =
+        tool_call_reasoning_count.saturating_sub(KEEP_RECENT_TOOL_CALL_REASONING);
+    let mut seen_tool_call_reasoning = 0usize;
+
     for (idx, m) in messages.iter_mut().enumerate() {
         if m.role != "assistant" || m.reasoning_content.is_none() {
             continue;
         }
-        // 带 tool_calls 的回合：DeepSeek 要求必须回传，保留。
+        // 带 tool_calls 的回合：仅保留最近 N 条完整 reasoning，其余置 None。
         if m.tool_calls.is_some() {
+            let rank = seen_tool_call_reasoning;
+            seen_tool_call_reasoning += 1;
+            if rank < drop_tool_call_reasoning_before {
+                m.reasoning_content = None;
+            }
             continue;
         }
         // 纯回答回合：只保留最近一条。
@@ -2617,6 +2642,87 @@ mod fold_early_tool_groups_tests {
         assert!(
             stub_text.contains("/tmp/session/xyz.txt"),
             "folded stub must retain the file_path recall anchor, got: {stub_text}"
+        );
+    }
+
+    fn assistant_call_with_reasoning(id: &str, name: &str, reasoning: &str) -> Message {
+        let mut m = assistant_call(id, name);
+        m.reasoning_content = Some(reasoning.to_string());
+        m
+    }
+
+    fn assistant_plain_with_reasoning(reasoning: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("答复".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: Some(reasoning.to_string()),
+        }
+    }
+
+    /// 跨轮滑窗：带 tool_calls 的 assistant reasoning 只保留最近
+    /// `KEEP_RECENT_TOOL_CALL_REASONING` 条，更早的置 None；纯回答 reasoning 只留最近一条。
+    #[test]
+    fn keeps_only_recent_tool_call_reasoning_across_turns() {
+        assert_eq!(KEEP_RECENT_TOOL_CALL_REASONING, 3);
+
+        let mut messages = vec![
+            msg("system", "s"),
+            msg("user", "干活"),
+            // 早期纯回答 reasoning：非最近一条，应被丢弃。
+            assistant_plain_with_reasoning("early-plain"),
+        ];
+        // 5 组带 tool_calls 的 reasoning：rank 0/1 应丢弃，rank 2/3/4 保留。
+        for i in 0..5 {
+            let id = format!("call-{i}");
+            messages.push(assistant_call_with_reasoning(
+                &id,
+                "text_grep",
+                &format!("tc-{i}"),
+            ));
+            messages.push(tool_result(&id, "r"));
+        }
+        // 最近一条纯回答 reasoning：应保留。
+        messages.push(assistant_plain_with_reasoning("final-plain"));
+
+        keep_only_recent_reasoning_content(&mut messages);
+
+        // 用 tool_call id 定位 tool-call reasoning。
+        let tc_reasoning = |id: &str| -> Option<String> {
+            messages
+                .iter()
+                .find(|m| {
+                    m.tool_calls
+                        .as_ref()
+                        .map(|calls| calls.iter().any(|c| c.id == id))
+                        .unwrap_or(false)
+                })
+                .and_then(|m| m.reasoning_content.clone())
+        };
+        assert_eq!(
+            tc_reasoning("call-0"),
+            None,
+            "rank 0 tool-call reasoning must be dropped"
+        );
+        assert_eq!(
+            tc_reasoning("call-1"),
+            None,
+            "rank 1 tool-call reasoning must be dropped"
+        );
+        assert_eq!(tc_reasoning("call-2").as_deref(), Some("tc-2"));
+        assert_eq!(tc_reasoning("call-3").as_deref(), Some("tc-3"));
+        assert_eq!(tc_reasoning("call-4").as_deref(), Some("tc-4"));
+
+        // 纯回答 reasoning：只保留最近一条（final-plain），早期一条置 None。
+        let plain_reasonings: Vec<Option<String>> = messages
+            .iter()
+            .filter(|m| m.role == "assistant" && m.tool_calls.is_none())
+            .map(|m| m.reasoning_content.clone())
+            .collect();
+        assert_eq!(
+            plain_reasonings,
+            vec![None, Some("final-plain".to_string())]
         );
     }
 }

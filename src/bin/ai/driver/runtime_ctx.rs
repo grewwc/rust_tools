@@ -199,6 +199,34 @@ pub(crate) fn effective_cwd() -> std::io::Result<PathBuf> {
     std::env::current_dir()
 }
 
+// =============================================================================
+// Per-session temp directory + persistent temp-file registry
+// =============================================================================
+// agent 在执行任务时常需要写临时/中间文件（脚本、片段输出、转储等）。
+// `temp_dir()` 提供一个统一的、按 session 隔离的临时目录，路径为
+// `<effective_cwd>/.agent_tmp/<session>/`，按需创建。
+//
+// 通过 `write_file(temp=true)` 写入此目录的文件会被记录在持久化注册表
+// （`storage::temp_registry`）中，只有注册表中的文件才能被 `delete_path`
+// 删除——未经 agent 创建的文件一律拒绝，杜绝误删源码/配置。
+// 注册表以 JSON 文件持久化，会话终止后重启仍可读取。
+// =============================================================================
+
+/// 返回当前 session 的临时目录路径，按需创建目录。供 `write_file(temp=true)`
+/// 等需要写入临时文件的场景使用。路径为 `<effective_cwd>/.agent_tmp/<session>/`。
+pub(crate) fn temp_dir() -> std::io::Result<PathBuf> {
+    let cwd = effective_cwd()?;
+    let session = current_session_id_or_empty();
+    let session_part = if session.is_empty() {
+        "default".to_string()
+    } else {
+        session
+    };
+    let dir = cwd.join(".agent_tmp").join(session_part);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
 /// Build a default scratch workspace path for a sub-agent that opted out
 /// of `inherit.cwd`. The directory is created on demand. Returns `None`
 /// if the directory cannot be created (caller should fall back to

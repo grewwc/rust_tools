@@ -568,6 +568,7 @@ fn handle_tool_call_round(
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
     iteration: usize,
+    turn_had_tool_error: &mut bool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let mut observer = TerminalToolObserver::new(app);
     let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
@@ -580,6 +581,7 @@ fn handle_tool_call_round(
         Some(&mut observer),
         iteration,
     )?;
+    *turn_had_tool_error |= exec_result.had_error;
     append_cached_tool_results_note(&exec_result, messages, turn_messages);
     append_tool_result_messages(
         app,
@@ -659,7 +661,7 @@ fn append_truncation_retry_note(
         );
     }
 
-    let already_present = messages.iter().chain(turn_messages.iter()).any(|message| {
+    let already_present = messages.iter().any(|message| {
         message.role == ROLE_INTERNAL_NOTE
             && message
                 .content
@@ -678,26 +680,25 @@ fn append_truncation_retry_note(
     );
     note.push_str("- 优先用小步、多次的工具调用，而不是一次性产出超大内容；\n");
     note.push_str("- 只重发被截断的那个操作，不要重复已经成功完成的步骤。");
-    append_message_pair(
-        messages,
-        turn_messages,
-        Message {
-            role: ROLE_INTERNAL_NOTE.to_string(),
-            content: Value::String(note),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        },
-    );
+    // 过程性纠偏提示：仅在本 turn 内下发给 LLM，不写入 turn_messages 持久化轨道。
+    // 该提示只在"刚发生截断的下一轮"有意义；若持久化会在后续每个 turn 反复重放，
+    // 让模型永久性地畏手畏脚、输出规模受限——正是"一次变蠢后持续变蠢"的根因之一。
+    messages.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
 }
 
 fn append_discover_skills_followup_note(
     messages: &mut Vec<Message>,
-    turn_messages: &mut Vec<Message>,
+    _turn_messages: &mut Vec<Message>,
     allowed_tool_names: &rust_tools::commonw::FastSet<String>,
 ) {
     let note = build_discover_skills_followup_note(allowed_tool_names);
-    let already_present = messages.iter().chain(turn_messages.iter()).any(|message| {
+    let already_present = messages.iter().any(|message| {
         message.role == ROLE_INTERNAL_NOTE
             && message
                 .content
@@ -707,17 +708,15 @@ fn append_discover_skills_followup_note(
     if already_present {
         return;
     }
-    append_message_pair(
-        messages,
-        turn_messages,
-        Message {
-            role: ROLE_INTERNAL_NOTE.to_string(),
-            content: serde_json::Value::String(note),
-            tool_calls: None,
-            tool_call_id: None,
-            reasoning_content: None,
-        },
-    );
+    // 过程性提示：仅在本 turn 内下发给 LLM，引导模型在只 list 了 skills 后继续行动。
+    // 属于"仅当前回合有效"的纠偏提示，不写入 turn_messages 持久化轨道，避免跨 turn 重放。
+    messages.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
 }
 
 fn extract_image_paths_from_file_read_tool_calls(tool_calls: &[ToolCall]) -> Vec<String> {
@@ -820,6 +819,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     no_active_skill: bool,
     iteration: usize,
     max_iterations: usize,
+    turn_had_tool_error: &mut bool,
 ) -> Result<TurnLoopStep, Box<dyn std::error::Error>> {
     match execution {
         IterationExecution::Exit(outcome) => Ok(TurnLoopStep::Return(outcome)),
@@ -882,6 +882,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 one_shot_mode,
                 persisted_turn_messages,
                 iteration,
+                turn_had_tool_error,
             )?;
 
             if discover_skills_only {
@@ -1064,6 +1065,7 @@ mod tests {
                 content: "1\n2\n3\n".to_string(),
             }],
             cached_hits: vec![false],
+            had_error: false,
         };
 
         assert_eq!(exec_result.executed_tool_calls.len(), 1);
@@ -1116,7 +1118,8 @@ mod tests {
         append_discover_skills_followup_note(&mut messages, &mut turn_messages, &allowed);
         let expected = build_discover_skills_followup_note(&allowed);
         assert_eq!(messages.len(), 1);
-        assert_eq!(turn_messages.len(), 1);
+        // 过程性提示只进 messages（本 turn 内可见），不写入 turn_messages 持久化轨道。
+        assert!(turn_messages.is_empty());
         assert_eq!(messages[0].role, ROLE_INTERNAL_NOTE);
         assert_eq!(messages[0].content.as_str(), Some(expected.as_str()));
     }
@@ -1263,6 +1266,7 @@ mod tests {
             true,
             1,
             16,
+                &mut false,
         )
         .unwrap();
 
@@ -1311,6 +1315,7 @@ mod tests {
             true,
             2,
             16,
+                &mut false,
         )
         .unwrap();
 
@@ -1361,6 +1366,7 @@ mod tests {
             true,
             1,
             16,
+                &mut false,
         )
         .unwrap();
 
@@ -1416,6 +1422,7 @@ mod tests {
                 true,
                 1,
                 16,
+                &mut false,
             )
             .unwrap();
         }
@@ -1494,6 +1501,7 @@ mod tests {
             true,
             3,
             16,
+                &mut false,
         )
         .unwrap();
 
@@ -1576,6 +1584,7 @@ mod tests {
             let mut messages = Vec::new();
             let mut turn_messages = Vec::new();
             let mut persisted_turn_messages = 0usize;
+            let mut turn_had_tool_error = false;
             let start = Instant::now();
             let result = handle_tool_call_round(
                 &mut app,
@@ -1604,6 +1613,7 @@ mod tests {
                 true,
                 &mut persisted_turn_messages,
                 1,
+                &mut turn_had_tool_error,
             );
             (
                 result.map(|_| ()).map_err(|err| err.to_string()),

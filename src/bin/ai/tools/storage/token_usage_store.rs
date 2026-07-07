@@ -305,17 +305,42 @@ pub(crate) fn query_by_model(window_secs: Option<u64>) -> Option<Vec<UsageByMode
     Some(rows.filter_map(|r| r.ok()).collect())
 }
 
-/// 查询最近 N 天的按天聚合用量（每天一行），从最新一天开始降序。
+/// 查询最近 N 个自然日的按天聚合用量（每天一行），从最新一天开始降序。
 pub(crate) fn query_daily_breakdown(days: u64) -> Option<Vec<DailyUsage>> {
+    query_daily_impl(days, None)
+}
+
+/// 查询最近有数据的 N 天（每天一行），从最新一天开始降序。
+/// 与 [`query_daily_breakdown`] 的区别：后者按自然日窗口截断；本函数不限时间窗口，
+/// 只取有数据的前 `limit` 天，适合"默认概览只看最近有数几天"的场景。
+pub(crate) fn query_recent_days(limit: usize) -> Option<Vec<DailyUsage>> {
+    query_daily_impl(0, Some(limit as i64))
+}
+
+/// 按天聚合用量的内部实现。
+///
+/// - `days > 0`：只统计最近 `days` 个自然日（`cutoff = now - days*86400`）。
+/// - `limit > 0`：只保留有数据的前 `limit` 天（`ORDER BY day DESC LIMIT limit`）。
+fn query_daily_impl(days: u64, limit: Option<i64>) -> Option<Vec<DailyUsage>> {
     let store = STORE.as_ref()?;
     let conn = match store.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
     };
-    let cutoff = now_secs().saturating_sub(days * 86_400) as i64;
+    // days=0 表示不限时间窗口（cutoff=0）；否则只取最近 days 个自然日。
+    let cutoff = if days == 0 {
+        0i64
+    } else {
+        now_secs().saturating_sub(days * 86_400) as i64
+    };
+    let limit_clause = match limit {
+        Some(n) if n > 0 => format!("LIMIT {n}"),
+        _ => String::new(),
+    };
     // 用 'localtime' 把 UTC epoch 秒转成本地日期再分组，否则 UTC+8 凌晨的调用
     // 会被归到前一天，导致"今天的用量"显示为昨天。
-    let sql = "\
+    let sql = format!(
+        "\
         SELECT DATE(created_at, 'unixepoch', 'localtime') AS day, \
                COUNT(*), \
                COALESCE(SUM(input_tokens),0), \
@@ -325,8 +350,9 @@ pub(crate) fn query_daily_breakdown(days: u64) -> Option<Vec<DailyUsage>> {
         FROM token_usage \
         WHERE created_at >= ?1 \
         GROUP BY day \
-        ORDER BY day DESC";
-    let mut stmt = match conn.prepare(sql) {
+        ORDER BY day DESC {limit_clause}"
+    );
+    let mut stmt = match conn.prepare(&sql) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("[TokenUsage] prepare daily query failed: {e}");

@@ -51,6 +51,10 @@ struct RequestBody<'a> {
     /// 必须显式声明，否则 token 用量无法统计、`/usage` 会漏计。非流式时为 None。
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<Value>,
+    /// 单次响应最大输出 token 数（来自 models.json 的 `max_output_tokens`）。
+    /// 缺省不下发，沿用 provider 默认补全上限；显式指定可缓解长输出被截断。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2278,6 +2282,7 @@ fn build_request_body<'a>(
     // 流式请求显式索取 usage：部分 provider（DashScope compatible-mode）流式下
     // 默认不返回 usage，必须声明 stream_options.include_usage 才能统计 token。
     let stream_options = stream.then(|| json!({ "include_usage": true }));
+    let max_tokens = models::max_output_tokens(model);
     RequestBody {
         model: request_model,
         messages,
@@ -2289,6 +2294,7 @@ fn build_request_body<'a>(
         reasoning_effort,
         reasoning,
         stream_options,
+        max_tokens,
     }
 }
 

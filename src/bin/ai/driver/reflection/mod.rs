@@ -27,8 +27,9 @@ pub(super) async fn maybe_append_self_reflection(
     question: &str,
     answer: &str,
     turn_messages: &mut Vec<Message>,
+    had_tool_error: bool,
 ) {
-    background::maybe_append_self_reflection(app, model, question, answer, turn_messages).await
+    background::maybe_append_self_reflection(app, model, question, answer, turn_messages, had_tool_error).await
 }
 
 pub(super) async fn maybe_critic_and_revise(
@@ -56,6 +57,7 @@ pub(super) async fn run_self_reflection_background(
     question: String,
     answer: String,
     had_tool: bool,
+    had_tool_error: bool,
 ) {
     background::run_self_reflection_background(
         history_path,
@@ -64,6 +66,7 @@ pub(super) async fn run_self_reflection_background(
         question,
         answer,
         had_tool,
+        had_tool_error,
     )
     .await
 }

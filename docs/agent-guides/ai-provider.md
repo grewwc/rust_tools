@@ -27,6 +27,11 @@ Long-form reference for `src/bin/ai/provider/**`.
 - generic history shaping
 - unrelated business logic
 - duplicated request-building logic that can stay in the common pipeline
+- `max_tokens`: sourced from the model's `max_output_tokens` in `models.json`
+  (accessor `models::max_output_tokens`) and set once in `build_request_body`.
+  It is provider-agnostic common-pipeline logic — do not move it into an adapter
+  hook. Omitted (not serialized) when the model declares no value, preserving
+  the historical "let the provider default decide" behavior.
 
 ## Editing rules
 

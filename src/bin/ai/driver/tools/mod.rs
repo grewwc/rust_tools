@@ -71,6 +71,10 @@ pub(super) struct ExecuteToolCallsResult {
     pub(super) executed_tool_calls: Vec<ToolCall>,
     pub(super) tool_results: Vec<ToolResult>,
     pub(super) cached_hits: Vec<bool>,
+    /// 本轮是否有任何工具执行失败（`RunOneResult.ok == false`）。
+    /// 结构化信号，供下游 reflection/evolution 判定 turn 质量时使用，
+    /// 替代旧版扫描 assistant 答案文本找 "error"/"failed" 的脆弱做法。
+    pub(super) had_error: bool,
 }
 
 pub(super) struct RunOneResult {
@@ -2153,6 +2157,7 @@ fn execute_tool_calls_inner(
     let mut executed_tool_calls = Vec::with_capacity(tool_calls.len());
     let mut tool_results = Vec::with_capacity(tool_calls.len());
     let mut cached_hits = Vec::with_capacity(tool_calls.len());
+    let mut had_error = false;
 
     let mut idx = 0usize;
     while idx < tool_calls.len() {
@@ -2195,6 +2200,7 @@ fn execute_tool_calls_inner(
                     Some(run_result.ok),
                 );
                 tool_results.push(run_result.tool_result);
+                had_error |= !run_result.ok;
             }
             idx += batch_len;
             continue;
@@ -2232,6 +2238,7 @@ fn execute_tool_calls_inner(
             Some(run_result.ok),
         );
         tool_results.push(run_result.tool_result);
+        had_error |= !run_result.ok;
 
         if should_barrier && !is_last {
             for deferred in &tool_calls[idx + 1..] {
@@ -2253,6 +2260,7 @@ fn execute_tool_calls_inner(
         executed_tool_calls,
         tool_results,
         cached_hits,
+        had_error,
     })
 }
 

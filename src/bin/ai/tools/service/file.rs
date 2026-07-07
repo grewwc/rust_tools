@@ -198,14 +198,32 @@ pub(crate) fn execute_read_file_lines(args: &Value) -> Result<String, String> {
 pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
     let file_path = resolve_file_path_arg(args)?;
     let content = args["content"].as_str().ok_or("Missing content")?;
+    let is_temp = args["temp"].as_bool().unwrap_or(false);
 
-    super::super::undo_tools::snapshot_file_before_write(file_path);
+    let resolved_path = if is_temp {
+        let temp_dir = crate::ai::driver::runtime_ctx::temp_dir()
+            .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+        temp_dir.join(file_path)
+    } else {
+        PathBuf::from(file_path)
+    };
 
-    let store = FileStore::new(PathBuf::from(file_path));
+    super::super::undo_tools::snapshot_file_before_write(&resolved_path.to_string_lossy());
+
+    let store = FileStore::new(resolved_path);
     store.validate_write_access().map_err(|e| e.to_string())?;
     store.write_all(content).map_err(|e| e.to_string())?;
 
-    super::super::undo_tools::commit_change_set(&format!("write_file: {}", file_path));
+    // temp 文件写入成功后注册到持久化注册表，使其可被 delete_path 清理。
+    if is_temp {
+        let abs_path = store.path().display().to_string();
+        super::super::storage::temp_registry::register(&abs_path)?;
+    }
+
+    super::super::undo_tools::commit_change_set(&format!(
+        "write_file: {}",
+        store.path().display()
+    ));
 
     Ok(format!("Successfully wrote to {}", store.path().display()))
 }
@@ -216,18 +234,32 @@ pub(crate) fn execute_write_file_streaming(
 ) -> Result<String, String> {
     let file_path = resolve_file_path_arg(args)?;
     let content = args["content"].as_str().ok_or("Missing content")?;
-    let store = FileStore::new(PathBuf::from(file_path));
+    let is_temp = args["temp"].as_bool().unwrap_or(false);
+    let resolved_path = if is_temp {
+        let temp_dir = crate::ai::driver::runtime_ctx::temp_dir()
+            .map_err(|e| format!("Failed to create temp dir: {}", e))?;
+        temp_dir.join(file_path)
+    } else {
+        PathBuf::from(file_path)
+    };
+    let store = FileStore::new(resolved_path);
     let target = store.path().display().to_string();
 
     emit_stream_line(on_chunk, &format!("target: {target}"));
     emit_stream_line(on_chunk, "snapshotting previous file state");
-    super::super::undo_tools::snapshot_file_before_write(file_path);
+    super::super::undo_tools::snapshot_file_before_write(&target);
 
     emit_stream_line(on_chunk, "validating write access");
     store.validate_write_access().map_err(|e| e.to_string())?;
 
     emit_stream_line(on_chunk, &format!("writing {} byte(s)", content.len()));
     store.write_all(content).map_err(|e| e.to_string())?;
+
+    // temp 文件写入成功后注册到持久化注册表，使其可被 delete_path 清理。
+    if is_temp {
+        let abs_path = store.path().display().to_string();
+        super::super::storage::temp_registry::register(&abs_path)?;
+    }
 
     super::super::undo_tools::commit_change_set(&format!("write_file: {}", file_path));
 

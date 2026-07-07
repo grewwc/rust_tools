@@ -708,6 +708,12 @@ async fn run_turn_body(
         rust_tools::cw::SkipSet::default();
     let mut consecutive_empty_responses: usize = 0;
     let mut consecutive_truncations: usize = 0;
+    let mut turn_had_tool_error = false;
+    // 保存进入本 turn 时的 reasoning effort 覆盖值（可能是用户 `/model effort` 的
+    // 显式选择，或 None=用模型默认）。截断重试时会临时把它降到 Low，把输出 token
+    // 预算从 reasoning 让给实际内容；turn 结束后（含所有 break 出口）统一恢复，
+    // 不污染用户的会话级设置。
+    let saved_effort_override = app.cli.reasoning_effort_override;
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
         {
@@ -758,6 +764,12 @@ async fn run_turn_body(
             // 放弃，避免无限重试烧预算。阈值取 3：给模型两次收缩重写的机会。
             if matches!(execution, IterationExecution::Truncated(_)) {
                 consecutive_truncations += 1;
+                // 把本 turn 后续请求的 reasoning effort 降到 Low：high-effort 下模型
+                // 会先产出大量 reasoning token，挤占输出预算，是长文档/大文件写入被
+                // 截断的常见诱因。降档把预算让给实际内容，配合收缩提示提升收敛概率。
+                // resolve_reasoning_effort 每次迭代实时读该字段，改了立即对下一次生效。
+                app.cli.reasoning_effort_override =
+                    Some(Some(crate::ai::provider::ReasoningEffort::Low));
                 if consecutive_truncations > 3 {
                     let _ = writeln!(
                         std::io::stderr(),
@@ -779,6 +791,7 @@ async fn run_turn_body(
                 &mut final_assistant_recorded, &mut force_final_response,
                 &mut terminal_dedupe_candidate,
                 skill_turn.matched_skill_name().is_none(), iteration, max_iterations,
+                &mut turn_had_tool_error,
             ) {
                 Ok(s) => s,
                 Err(err) => break 'turn Err(err),
@@ -946,6 +959,11 @@ async fn run_turn_body(
         }
     };
 
+    // 恢复进入本 turn 前的 reasoning effort 覆盖值：截断重试可能把它临时降到了
+    // Low，这里统一还原（覆盖所有 break 'turn 出口），避免把降档泄漏到后续 turn
+    // 污染用户的会话级设置。
+    app.cli.reasoning_effort_override = saved_effort_override;
+
     // 老化未在本 turn 使用的 explicit-enabled tool。
     // 连续 N 个 turn 闲置就 demote，避免"启用一次永久焊接"。
     crate::ai::tools::enable_tools::age_unused_explicit_tools(tools_used_this_turn.iter());
@@ -967,6 +985,7 @@ async fn run_turn_body(
                 one_shot_mode,
                 &mut persisted_turn_messages,
                 should_quit,
+                turn_had_tool_error,
             )
             .await
         }

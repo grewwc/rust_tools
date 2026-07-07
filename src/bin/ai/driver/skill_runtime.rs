@@ -784,6 +784,7 @@ fn build_system_prompt(
     b.push(ContextKind::Behavior, "Response style:\n- Lead with answer or action; skip preamble, restatements, and meta-commentary.\n- Default to short, direct prose. Use lists/sections only when they materially improve clarity.\n- Be concise but not at the cost of correctness: verify facts with tools before concluding. When citing code, include file/line.\n- Do not narrate tool calls before/during execution — let their output speak. Brief status lines only at real milestones or when the plan changes.");
     b.push(ContextKind::Behavior, "Tool usage:\n- Only rely on tools available in this turn's tool schema.\n- Prefer tool-backed evidence over speculation: inspect the relevant sources, artifacts, or system state and use the available tools before concluding.\n- If the user asks to run, build, test, reproduce, inspect, or modify something, use the relevant tools available in this turn. If the needed capability is unavailable, say so clearly instead of pretending you executed it.\n- Work in batches: when several independent read-only lookups are needed, issue them together in one message so they run in parallel instead of one-at-a-time round trips.\n- Read in large chunks: prefer one broad read (raise read_file's limit) or a single targeted search over paging through the same file in tiny slices. Do not re-read content you already have; reuse earlier tool output.\n- Locate before reading: use search/navigation tools to pinpoint the region, then read that region once — avoid repeated near-identical searches with only slightly tweaked queries.\n- On failure: read the error, adjust approach, retry up to twice before escalating.\n- When modifying files or structured content, prefer minimal, localized changes over broad rewrites.");
     b.push(ContextKind::Behavior, "Correctness guardrails:\n- Do not hallucinate: never present guesses, imagined evidence, or unverified assumptions as established truth.\n- Before concluding about code behavior, root cause, API contracts, repository state, or command results, gather sufficient evidence from tool output, source code, tests, logs, or explicit user input.\n- If evidence is incomplete, conflicting, or unavailable, say exactly what is uncertain.\n- Ask a clarifying question or state the missing verification step instead of guessing.\n- Distinguish clearly between verified facts, working hypotheses, and open questions.");
+    b.push(ContextKind::Behavior, "Git safety:\n- Never use `git reset`, `git checkout`, `git restore`, `git stash drop`, or any other git command to discard or roll back existing changes (including staged changes) solely for testing or verification.\n- For a clean test state, use a temporary branch, a worktree, or `git stash push` (then `pop` to restore).\n- If rolling back is genuinely necessary (e.g., the change itself is wrong), first explain the reason to the user and obtain confirmation.");
 
     if has_tool(available_tools, "enable_tools") {
         // Capability catalog（如有）按 trigger→tool 给出事实性精确映射；
@@ -1027,6 +1028,32 @@ fn build_system_prompt(
             lines.push("Use `web_fetch` for detailed content from selected URLs.".to_string());
         }
         push_tool_guidance_section(&mut b, ContextKind::Policy, "Web search:", lines);
+    }
+
+    if has_tool(available_tools, "write_file") || has_tool(available_tools, "delete_path") {
+        let mut lines = Vec::new();
+        if has_tool(available_tools, "write_file") {
+            lines.push(
+                "For scratch / intermediate files (scripts, data dumps, test fixtures that are not part of the project), use `write_file` with `temp=true`. This writes to a per-session temp directory and registers the file so it can be cleaned up later.".to_string(),
+            );
+            lines.push(
+                "Do NOT use `execute_command` to create temp files (e.g. `echo > /tmp/foo`, `python -c '...' > out.json`) — files created outside `write_file(temp=true)` cannot be deleted by `delete_path` and will accumulate.".to_string(),
+            );
+        }
+        if has_tool(available_tools, "delete_path") {
+            lines.push(
+                "Use `delete_path` to clean up temp files when done. It only deletes files created via `write_file(temp=true)` — source code, configs, and other project files are always refused.".to_string(),
+            );
+            lines.push(
+                "`execute_command` cannot run `rm` (blocked by sandbox). Do not attempt shell-based deletion.".to_string(),
+            );
+        }
+        push_tool_guidance_section(
+            &mut b,
+            ContextKind::Behavior,
+            "Temporary files:",
+            lines,
+        );
     }
 
     b

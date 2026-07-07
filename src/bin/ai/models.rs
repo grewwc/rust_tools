@@ -62,6 +62,13 @@ pub(super) fn default_reasoning_effort(model: &str) -> Option<ReasoningEffort> {
     model_def(model).and_then(|m| m.reasoning_effort)
 }
 
+/// 返回该模型在 [models.json](../../../models.json) 中声明的单次响应最大输出
+/// token 数（`max_output_tokens`）。缺省时为 `None`，请求不下发 `max_tokens`，
+/// 沿用 provider 默认补全上限。
+pub(super) fn max_output_tokens(model: &str) -> Option<u32> {
+    model_def(model).and_then(|m| m.max_output_tokens)
+}
+
 pub(super) fn model_provider(model: &str) -> ApiProvider {
     model_def(model).map(|m| m.provider).unwrap_or_default()
 }

@@ -301,8 +301,24 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
     Ok((envelope.target_path, normalized_patch))
 }
 
-fn lines_match(actual: &str, expected: &str) -> bool {
-    actual == expected || actual.trim_end() == expected.trim_end()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchMode {
+    /// 精确匹配（允许行尾空白差异），默认使用。
+    Strict,
+    /// 忽略前导缩进差异，仅在严格匹配全文件都定位不到时作为兜底。
+    /// 对齐 `git apply --ignore-whitespace`：模型对 markdown/嵌套列表/代码块
+    /// 的缩进常常复刻不准，导致严格匹配整块失配报 context mismatch。
+    IgnoreIndent,
+}
+
+fn lines_match(actual: &str, expected: &str, mode: MatchMode) -> bool {
+    if actual == expected || actual.trim_end() == expected.trim_end() {
+        return true;
+    }
+    match mode {
+        MatchMode::Strict => false,
+        MatchMode::IgnoreIndent => actual.trim() == expected.trim(),
+    }
 }
 
 /// 提取 hunk 的 context+remove 行（即"期望在原文件中匹配到"的行）。
@@ -318,7 +334,11 @@ fn hunk_expected_lines(hunk: &UnifiedHunk) -> Vec<&str> {
 
 /// 在全文件范围内统计 hunk 的 context+remove 块能匹配到的位置（0-based 行号）。
 /// 用于检测"多处匹配"歧义，避免静默改错地方。
-fn all_hunk_match_positions(orig_lines: &[String], hunk: &UnifiedHunk) -> Vec<usize> {
+fn all_hunk_match_positions(
+    orig_lines: &[String],
+    hunk: &UnifiedHunk,
+    mode: MatchMode,
+) -> Vec<usize> {
     let expected = hunk_expected_lines(hunk);
     if expected.is_empty() {
         return Vec::new();
@@ -329,7 +349,7 @@ fn all_hunk_match_positions(orig_lines: &[String], hunk: &UnifiedHunk) -> Vec<us
         let all_match = expected
             .iter()
             .enumerate()
-            .all(|(i, exp)| lines_match(&orig_lines[candidate + i], exp));
+            .all(|(i, exp)| lines_match(&orig_lines[candidate + i], exp, mode));
         if all_match {
             positions.push(candidate);
         }
@@ -389,6 +409,7 @@ fn try_apply_hunk_at(
     orig_lines: &[String],
     hunk: &UnifiedHunk,
     start: usize,
+    mode: MatchMode,
 ) -> Option<(Vec<String>, usize)> {
     let mut out = Vec::new();
     let mut idx = start;
@@ -396,7 +417,7 @@ fn try_apply_hunk_at(
         match line {
             UnifiedLine::Context(s) => {
                 let cur = orig_lines.get(idx)?;
-                if !lines_match(cur, s) {
+                if !lines_match(cur, s, mode) {
                     return None;
                 }
                 out.push(cur.clone());
@@ -404,7 +425,7 @@ fn try_apply_hunk_at(
             }
             UnifiedLine::Remove(s) => {
                 let cur = orig_lines.get(idx)?;
-                if !lines_match(cur, s) {
+                if !lines_match(cur, s, mode) {
                     return None;
                 }
                 idx += 1;
@@ -417,6 +438,50 @@ fn try_apply_hunk_at(
     Some((out, idx))
 }
 
+/// 在给定匹配模式下定位一个 hunk 的应用起点（0-based）。
+/// 返回 `Ok(Some(pos))` 表示唯一定位成功；`Ok(None)` 表示全文件都匹配不到
+/// （调用方可用更宽松的模式重试）；`Err` 表示定位到但存在歧义或顺序错误。
+fn locate_hunk(
+    orig_lines: &[String],
+    hunk: &UnifiedHunk,
+    cursor: usize,
+    mode: MatchMode,
+) -> Result<Option<usize>, String> {
+    let nominal = hunk.old_start.saturating_sub(1);
+    let nominal_ok = nominal <= orig_lines.len()
+        && nominal >= cursor
+        && try_apply_hunk_at(orig_lines, hunk, nominal, mode).is_some();
+    if nominal_ok {
+        return Ok(Some(nominal));
+    }
+
+    // 标称位置匹配不上时，先检查全文件范围内有多少处能匹配：
+    // 多处匹配说明 hunk 的 context 不足以唯一定位，强行用第一处会改错地方。
+    let positions = all_hunk_match_positions(orig_lines, hunk, mode);
+    let forward: Vec<usize> = positions.iter().copied().filter(|&p| p >= cursor).collect();
+    if forward.len() > 1 {
+        let shown: Vec<String> = forward.iter().take(5).map(|p| (p + 1).to_string()).collect();
+        return Err(format!(
+            "ambiguous patch: hunk context matches {} locations (1-based lines: {}{}). \
+             Add more surrounding context lines to the hunk so it uniquely identifies the target.",
+            forward.len(),
+            shown.join(", "),
+            if forward.len() > 5 { ", ..." } else { "" }
+        ));
+    }
+    // forward 已经过滤了 p >= cursor，所以这里不会有 "hunks out of order"。
+    // 之前回退到 find_hunk_offset（±50 窗口）会在唯一匹配超出窗口时误报
+    // context mismatch；直接使用 forward 的唯一结果即可。
+    if let Some(&offset) = forward.first() {
+        Ok(Some(offset))
+    } else if !positions.is_empty() {
+        // 所有匹配都在 cursor 之前——hunk 顺序错误
+        Err("hunks out of order".to_string())
+    } else {
+        Ok(None)
+    }
+}
+
 fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
     let had_trailing_newline = original.ends_with('\n');
     let hunks = parse_unified_hunks(patch)?;
@@ -426,47 +491,19 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
     let mut cursor = 0usize;
 
     for hunk in &hunks {
-        let nominal = hunk.old_start.saturating_sub(1);
-        let nominal_ok = nominal <= orig_lines.len()
-            && nominal >= cursor
-            && try_apply_hunk_at(&orig_lines, hunk, nominal).is_some();
-
-        let apply_at = if nominal_ok {
-            nominal
-        } else {
-            // 标称位置匹配不上时，先检查全文件范围内有多少处能匹配：
-            // 多处匹配说明 hunk 的 context 不足以唯一定位，强行用第一处会改错地方。
-            let positions = all_hunk_match_positions(&orig_lines, hunk);
-            let forward: Vec<usize> = positions.iter().copied().filter(|&p| p >= cursor).collect();
-            if forward.len() > 1 {
-                let shown: Vec<String> = forward
-                    .iter()
-                    .take(5)
-                    .map(|p| (p + 1).to_string())
-                    .collect();
-                return Err(format!(
-                    "ambiguous patch: hunk context matches {} locations (1-based lines: {}{}). \
-                     Add more surrounding context lines to the hunk so it uniquely identifies the target.",
-                    forward.len(),
-                    shown.join(", "),
-                    if forward.len() > 5 { ", ..." } else { "" }
-                ));
-            }
-            // forward 已经过滤了 p >= cursor，所以这里不会有 "hunks out of order"。
-            // 之前回退到 find_hunk_offset（±50 窗口）会在唯一匹配超出窗口时误报
-            // context mismatch；直接使用 forward 的唯一结果即可。
-            if let Some(&offset) = forward.first() {
-                offset
-            } else if !positions.is_empty() {
-                // 所有匹配都在 cursor 之前——hunk 顺序错误
-                return Err("hunks out of order".to_string());
-            } else {
-                return Err(describe_context_mismatch(&orig_lines, hunk));
-            }
+        // 先做严格匹配（仅容忍行尾空白）。严格匹配全文件都定位不到时，再用忽略
+        // 前导缩进的宽松模式兜底一次——对齐 `git apply --ignore-whitespace`，
+        // 解决模型对 markdown/嵌套列表/代码块缩进复刻不准导致的 context mismatch。
+        let (apply_at, mode) = match locate_hunk(&orig_lines, hunk, cursor, MatchMode::Strict)? {
+            Some(at) => (at, MatchMode::Strict),
+            None => match locate_hunk(&orig_lines, hunk, cursor, MatchMode::IgnoreIndent)? {
+                Some(at) => (at, MatchMode::IgnoreIndent),
+                None => return Err(describe_context_mismatch(&orig_lines, hunk)),
+            },
         };
 
         out.extend_from_slice(&orig_lines[cursor..apply_at]);
-        let (hunk_out, new_idx) = try_apply_hunk_at(&orig_lines, hunk, apply_at)
+        let (hunk_out, new_idx) = try_apply_hunk_at(&orig_lines, hunk, apply_at, mode)
             .ok_or_else(|| describe_context_mismatch(&orig_lines, hunk))?;
         out.extend(hunk_out);
         cursor = new_idx;
@@ -713,6 +750,52 @@ mod tests {
             !result.contains("unique_target"),
             "result should not contain old line: {result}"
         );
+    }
+
+    #[test]
+    fn apply_unified_patch_tolerates_leading_indent_mismatch() {
+        // 真实高频失败场景：markdown/嵌套列表里，模型复刻的 context 行缩进与原文件
+        // 不一致（这里 patch 少了 2 个前导空格）。修复前 lines_match 只做 trim_end，
+        // 前导空白零容忍 → 全文件定位不到 → "context mismatch: patch hunk could not
+        // be located"。修复后严格匹配失败会用忽略缩进的兜底模式唯一定位并应用。
+        let original = "# Title\n\n  - item one\n  - item two\n";
+        // 前导空格=context 前缀；context 内容 "- item one"、remove 内容 "- item two"
+        // 都比原文件少了 2 个缩进空格。
+        let patch = "@@ -3,2 +3,2 @@\n - item one\n-- item two\n+- item two changed\n";
+        let result = apply_unified_patch(original, patch).unwrap_or_else(|err| {
+            panic!("indent-insensitive fallback should locate the hunk, got: {err}")
+        });
+        // 保留原文件缩进的 context 行，只替换 remove/add 目标行。
+        assert_eq!(result, "# Title\n\n  - item one\n- item two changed\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_indent_fallback_still_detects_ambiguity() {
+        // 兜底的忽略缩进模式不能牺牲安全性：若忽略缩进后有多处匹配，仍应报歧义，
+        // 而不是静默改错地方。
+        let original = "  dup\nmid\n    dup\ntail\n";
+        let patch = "@@ -9,1 +9,1 @@\n-dup\n+changed\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("ambiguous patch"), "err was: {err}");
+    }
+
+    #[test]
+    fn apply_unified_patch_strict_match_preferred_over_indent_fallback() {
+        // 当严格匹配能唯一定位时，必须使用严格匹配的结果，保持原文件精确内容，
+        // 不因存在缩进变体而误走兜底。
+        let original = "    exact\nother\n";
+        let patch = "@@ -1,1 +1,1 @@\n-    exact\n+    replaced\n";
+        let result = apply_unified_patch(original, patch).unwrap();
+        assert_eq!(result, "    replaced\nother\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_indent_fallback_reports_context_mismatch_when_absent() {
+        // 即便忽略缩进，内容本身不存在时仍应报 context mismatch（回显实际内容）。
+        let original = "alpha\nbeta\ngamma\n";
+        let patch = "@@ -2,1 +2,1 @@\n-  not_present\n+changed\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("context mismatch"), "err was: {err}");
     }
 
     #[test]

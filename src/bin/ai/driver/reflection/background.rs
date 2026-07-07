@@ -20,6 +20,7 @@ pub(crate) async fn maybe_append_self_reflection(
     question: &str,
     answer: &str,
     turn_messages: &mut Vec<Message>,
+    had_tool_error: bool,
 ) {
     let q = question.trim();
     let a = answer.trim();
@@ -63,7 +64,7 @@ pub(crate) async fn maybe_append_self_reflection(
                 Some(cancel_token.clone()),
                 interrupt_futex,
             ) => {}
-            _ = run_self_reflection_background(history_path, session_id, model_s, q_s, a_s, had_tool) => {}
+            _ = run_self_reflection_background(history_path, session_id, model_s, q_s, a_s, had_tool, had_tool_error) => {}
         }
         let mut os = match kernel_arc.lock() {
             Ok(g) => g,
@@ -283,6 +284,7 @@ pub(crate) async fn run_self_reflection_background(
     question: String,
     answer: String,
     had_tool: bool,
+    had_tool_error: bool,
 ) {
     use tokio::time::{Duration, timeout};
     let cfg = configw::get_all_config();
@@ -384,7 +386,7 @@ pub(crate) async fn run_self_reflection_background(
     let _ = store.append(&entry);
 
     // 用真实 turn 信号更新进化策略健康度（pass/fail），驱动 canary 升级与回滚。
-    apply_evolution_feedback(&store, q, a, had_tool);
+    apply_evolution_feedback(&store, a, had_tool, had_tool_error);
 
     // 若新 note 与当前激活的进化 guideline 明显冲突，回滚到上一版稳定策略。
     maybe_rollback_promoted_guideline(&store, note);
@@ -472,8 +474,8 @@ fn maybe_promote_stable_self_note(
     let _ = store.append(&promoted);
 }
 
-fn apply_evolution_feedback(store: &MemoryStore, question: &str, answer: &str, had_tool: bool) {
-    let signal = evaluate_turn_feedback(question, answer, had_tool);
+fn apply_evolution_feedback(store: &MemoryStore, answer: &str, _had_tool: bool, had_tool_error: bool) {
+    let signal = evaluate_turn_feedback(answer, had_tool_error);
 
     let guidelines = reflection_evolution_guidelines(store);
     let target = current_canary_evolution_guideline_from(&guidelines)
@@ -533,57 +535,23 @@ enum EvolutionFeedback {
     Fail,
 }
 
-fn evaluate_turn_feedback(question: &str, answer: &str, had_tool: bool) -> EvolutionFeedback {
-    let q = question.to_lowercase();
-    let a = answer.to_lowercase();
-
-    if question_looks_like_user_correction(q.as_str()) {
+/// 基于 turn 结构化信号判定 evolution feedback。
+///
+/// 旧实现用字符串匹配（`question_looks_like_user_correction` 扫用户输入猜"纠正"，
+/// `failure_markers` 扫 assistant 答案找 "error"/"failed"）——两者都是从原始文本
+/// 形态猜语义，本质上不可靠。此处改用结构化信号：
+/// - `had_tool_error`：本轮是否有工具执行失败（来自 `RunOneResult.ok`，经
+///   `ExecuteToolCallsResult.had_error` 逐层传递），直接判定 Fail。
+/// - `answer` 为空：模型未产出有效回答，判定 Fail。
+/// 其余情况 Pass。
+fn evaluate_turn_feedback(answer: &str, had_tool_error: bool) -> EvolutionFeedback {
+    if had_tool_error {
         return EvolutionFeedback::Fail;
     }
-
-    let failure_markers = [
-        "error",
-        "failed",
-        "failure",
-        "panic",
-        "exception",
-        "traceback",
-        "exit code",
-        "超时",
-        "失败",
-        "报错",
-        "异常",
-        "未找到",
-        "permission denied",
-    ];
-    if had_tool && failure_markers.iter().any(|m| a.contains(m)) {
-        return EvolutionFeedback::Fail;
-    }
-
-    if a.trim().is_empty() {
+    if answer.trim().is_empty() {
         return EvolutionFeedback::Fail;
     }
     EvolutionFeedback::Pass
-}
-
-fn question_looks_like_user_correction(lower_q: &str) -> bool {
-    const CORRECTION_MARKERS: &[&str] = &[
-        "你错",
-        "不对",
-        "还是不对",
-        "请重试",
-        "重试一下",
-        "重新回答",
-        "重新生成",
-        "纠正一下",
-        "改正一下",
-        "wrong answer",
-        "incorrect",
-        "not correct",
-        "try again",
-        "redo",
-    ];
-    CORRECTION_MARKERS.iter().any(|m| lower_q.contains(m))
 }
 
 fn maybe_activate_canary(
@@ -1348,26 +1316,39 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_turn_feedback_flags_tool_failures() {
-        let feedback =
-            evaluate_turn_feedback("继续执行", "Error: command failed with exit code 1", true);
-        assert_eq!(feedback, EvolutionFeedback::Fail);
-    }
-
-    #[test]
-    fn evaluate_turn_feedback_flags_user_corrections() {
-        let feedback = evaluate_turn_feedback("这个不对，请重试并修复", "我会继续处理", false);
-        assert_eq!(feedback, EvolutionFeedback::Fail);
-    }
-
-    #[test]
-    fn evaluate_turn_feedback_keeps_normal_fix_requests_as_pass() {
-        let feedback = evaluate_turn_feedback(
-            "请帮我 fix 这个 rust 编译错误",
-            "可以，我先定位报错并修复",
-            false,
+    fn evaluate_turn_feedback_fails_on_tool_error() {
+        // 结构化信号：工具执行失败 → Fail，不再扫描答案文本找 "error"。
+        assert_eq!(
+            evaluate_turn_feedback("Error: command failed with exit code 1", true),
+            EvolutionFeedback::Fail
         );
-        assert_eq!(feedback, EvolutionFeedback::Pass);
+    }
+
+    #[test]
+    fn evaluate_turn_feedback_fails_on_empty_answer() {
+        assert_eq!(evaluate_turn_feedback("", false), EvolutionFeedback::Fail);
+        assert_eq!(evaluate_turn_feedback("   ", false), EvolutionFeedback::Fail);
+    }
+
+    #[test]
+    fn evaluate_turn_feedback_passes_on_normal_answer() {
+        // 答案中含 "error" 等词但工具未失败 → Pass（旧实现会误判为 Fail）。
+        assert_eq!(
+            evaluate_turn_feedback("可以，我先定位报错并修复", false),
+            EvolutionFeedback::Pass
+        );
+        assert_eq!(
+            evaluate_turn_feedback("the incorrect path case is handled", false),
+            EvolutionFeedback::Pass
+        );
+    }
+
+    #[test]
+    fn evaluate_turn_feedback_passes_when_tool_succeeded() {
+        assert_eq!(
+            evaluate_turn_feedback("done, file written", false),
+            EvolutionFeedback::Pass
+        );
     }
 
     #[test]

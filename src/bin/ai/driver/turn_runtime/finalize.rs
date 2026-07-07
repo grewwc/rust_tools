@@ -132,6 +132,7 @@ async fn maybe_append_post_turn_reflection(
     question: &str,
     final_assistant_text: &str,
     turn_messages: &mut Vec<Message>,
+    had_tool_error: bool,
 ) {
     let integrated_reflect = crate::commonw::configw::get_all_config()
         .get_opt("ai.reflection.integrated")
@@ -145,6 +146,7 @@ async fn maybe_append_post_turn_reflection(
             question,
             final_assistant_text,
             turn_messages,
+            had_tool_error,
         )
         .await;
     }
@@ -236,6 +238,7 @@ pub(super) async fn finalize_turn(
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
     should_quit: bool,
+    had_tool_error: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
     if !final_assistant_text.trim().is_empty() {
         // Publish to the optional sub-agent result slot before doing the
@@ -256,6 +259,7 @@ pub(super) async fn finalize_turn(
             question,
             final_assistant_text,
             turn_messages,
+            had_tool_error,
         )
         .await;
         write_post_turn_project_knowledge(

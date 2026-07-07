@@ -205,4 +205,34 @@ mod tests {
         );
         assert!(bad.is_err());
     }
+
+    #[test]
+    fn model_def_max_output_tokens_field_optional() {
+        // 不带字段时默认为 None，请求不下发 max_tokens（沿用历史行为）。
+        let def: ModelDef = serde_json::from_str(
+            r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true}"#,
+        )
+        .unwrap();
+        assert!(def.max_output_tokens.is_none());
+
+        // 规范字段名。
+        let def2: ModelDef = serde_json::from_str(
+            r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"max_output_tokens":32768}"#,
+        )
+        .unwrap();
+        assert_eq!(def2.max_output_tokens, Some(32768));
+
+        // 兼容别名 max_tokens / max_completion_tokens。
+        let def3: ModelDef = serde_json::from_str(
+            r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"max_tokens":16000}"#,
+        )
+        .unwrap();
+        assert_eq!(def3.max_output_tokens, Some(16000));
+
+        let def4: ModelDef = serde_json::from_str(
+            r#"{"key":"X","name":"x","provider":"openai","is_vl":false,"search_enabled":false,"tools_default_enabled":true,"max_completion_tokens":8192}"#,
+        )
+        .unwrap();
+        assert_eq!(def4.max_output_tokens, Some(8192));
+    }
 }

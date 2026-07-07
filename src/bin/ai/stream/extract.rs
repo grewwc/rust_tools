@@ -45,18 +45,23 @@ pub(super) fn extract_chunk_events_with_tools(
     };
     let delta = &choice.delta;
 
-    if delta.content.is_empty() && !delta.reasoning_content.is_empty() {
-        let (cleaned, tool_calls) = splitter::extract_internal_tool_calls(&delta.reasoning_content);
+    let mut events = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    // reasoning 段独立于 content 处理：部分 provider 会把 message 快照折叠成
+    // “同一 chunk 同时带 content 与 reasoning_content”。若按内容/推理互斥分支处理，
+    // 这类 chunk 的 thinking 显示会被整段丢弃（数据仍在 reasoning_text 缓冲，但
+    // 界面上完全看不到思考过程）。
+    if !delta.reasoning_content.is_empty() {
+        let (cleaned, reasoning_tool_calls) =
+            splitter::extract_internal_tool_calls(&delta.reasoning_content);
         let cleaned = normalize_stream_text(cleaned);
-        if cleaned.is_empty() && tool_calls.is_empty() {
-            return (Vec::new(), Vec::new());
-        }
-        let mut events = Vec::new();
-        if !*thinking_open {
-            *thinking_open = true;
-            events.push(StreamTextEvent::OpenThinking);
-        }
+        tool_calls.extend(reasoning_tool_calls);
         if !cleaned.is_empty() {
+            if !*thinking_open {
+                *thinking_open = true;
+                events.push(StreamTextEvent::OpenThinking);
+            }
             push_text_with_hidden_meta(
                 &mut events,
                 cleaned,
@@ -66,15 +71,13 @@ pub(super) fn extract_chunk_events_with_tools(
                 hidden_meta_parse,
             );
         }
-        return (events, tool_calls);
     }
 
-    let mut events = Vec::new();
-    if *thinking_open {
-        *thinking_open = false;
-        events.push(StreamTextEvent::CloseThinking);
-    }
     if !delta.content.is_empty() {
+        if *thinking_open {
+            *thinking_open = false;
+            events.push(StreamTextEvent::CloseThinking);
+        }
         let content = normalize_stream_text(delta.content.clone());
         push_text_with_hidden_meta(
             &mut events,
@@ -85,7 +88,7 @@ pub(super) fn extract_chunk_events_with_tools(
             hidden_meta_parse,
         );
     }
-    (events, Vec::new())
+    (events, tool_calls)
 }
 
 /// Stateful streaming variant that incrementally emits internal tool call
@@ -106,13 +109,17 @@ pub(super) fn extract_chunk_events_streaming(
     };
     let delta = &choice.delta;
 
-    if delta.content.is_empty() && !delta.reasoning_content.is_empty() {
-        let (cleaned, tool_events) = streamer.push(&delta.reasoning_content);
+    let mut events = Vec::new();
+    let mut tool_events = Vec::new();
+
+    // reasoning 段独立于 content 处理：部分 provider 会把 message 快照折叠成
+    // “同一 chunk 同时带 content 与 reasoning_content”。若按内容/推理互斥分支处理，
+    // 这类 chunk 的 thinking 显示会被整段丢弃（数据仍在 reasoning_text 缓冲，但
+    // 界面上完全看不到思考过程）。
+    if !delta.reasoning_content.is_empty() {
+        let (cleaned, reasoning_tool_events) = streamer.push(&delta.reasoning_content);
         let cleaned = normalize_stream_text(cleaned);
-        if cleaned.is_empty() && tool_events.is_empty() {
-            return (Vec::new(), Vec::new());
-        }
-        let mut events = Vec::new();
+        tool_events.extend(reasoning_tool_events);
         if !cleaned.is_empty() {
             if !*thinking_open {
                 *thinking_open = true;
@@ -127,15 +134,13 @@ pub(super) fn extract_chunk_events_streaming(
                 hidden_meta_parse,
             );
         }
-        return (events, tool_events);
     }
 
-    let mut events = Vec::new();
-    if *thinking_open {
-        *thinking_open = false;
-        events.push(StreamTextEvent::CloseThinking);
-    }
     if !delta.content.is_empty() {
+        if *thinking_open {
+            *thinking_open = false;
+            events.push(StreamTextEvent::CloseThinking);
+        }
         let normalized = super::runtime::normalize_inline_tool_call_markup(&delta.content);
         let (cleaned, mut hermes_events) = hermes_streamer.push(&normalized);
         // 再把 Hermes 抽离后的可见文本交给 Anthropic（`<invoke name=...>`）解析器，
@@ -153,9 +158,9 @@ pub(super) fn extract_chunk_events_streaming(
                 hidden_meta_parse,
             );
         }
-        return (events, hermes_events);
+        tool_events.extend(hermes_events);
     }
-    (events, Vec::new())
+    (events, tool_events)
 }
 
 pub(super) fn render_stream_text_events(
@@ -490,6 +495,53 @@ mod tests {
             }
             other => panic!("unexpected tool events: {other:?}"),
         }
+    }
+
+    #[test]
+    fn streaming_extract_emits_thinking_even_when_chunk_also_carries_content() {
+        // 复现「有时完全不输出 thinking」：部分 provider 的 message 快照经
+        // merge_reasoning 折叠后，单个 chunk 会同时带 content 与 reasoning_content。
+        // 旧的互斥分支会整段丢掉 thinking 显示；修复后二者都应被输出。
+        let chunk = StreamChunk {
+            choices: vec![StreamChoice {
+                delta: StreamDelta {
+                    content: "answer".to_string(),
+                    reasoning_content: "step one".to_string(),
+                    reasoning_details: String::new(),
+                    tool_calls: Vec::new(),
+                },
+                finish_reason: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut thinking_open = false;
+        let mut hidden_meta_parse = HiddenMetaParseState::default();
+        let mut streamer = InternalToolCallStreamer::new();
+        let mut hermes_streamer = HermesXmlToolCallStreamer::new();
+        let mut anthropic_streamer = AnthropicXmlToolCallStreamer::new();
+        let (events, _) = extract_chunk_events_streaming(
+            &chunk,
+            "<meta:self_note>",
+            "</meta:self_note>",
+            &mut thinking_open,
+            &mut hidden_meta_parse,
+            &mut streamer,
+            &mut hermes_streamer,
+            &mut anthropic_streamer,
+        );
+
+        assert_eq!(
+            events,
+            vec![
+                StreamTextEvent::OpenThinking,
+                StreamTextEvent::AppendThinking("step one".to_string()),
+                StreamTextEvent::CloseThinking,
+                StreamTextEvent::AppendContent("answer".to_string()),
+            ]
+        );
+        assert!(!thinking_open);
     }
 }
 

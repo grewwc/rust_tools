@@ -1,3 +1,12 @@
+7. Temporary / scratch files the agent creates during a task should use
+   `write_file(temp=true)`, which writes under `runtime_ctx::temp_dir()`
+   (per-session: `<effective_cwd>/.agent_tmp/<session>/`) AND registers
+   the file in a persistent JSON registry (`storage::temp_registry`).
+   `delete_path` ONLY deletes files in this registry — unregistered files
+   (source code, configs, user data) are always refused. The registry
+   survives session restarts, enabling cross-session temp cleanup. Never
+   rely on `execute_command` for deletion — `rm` is blocked by the sandbox
+   and intentionally not relaxed.
 # Tools Guide
 
 ## Scope
@@ -25,6 +34,13 @@ execution policy, sandboxing, path resolution, or progressive loading.
    mirrors the `ToolStreamingRegistration` compatibility pattern. Query via
    `tool_display_config(name)`; never hardcode tool names in `print_run_status`
    or `driver/print.rs`.
+7. Temporary / scratch files the agent creates during a task should use the
+   per-turn temp directory: pass `temp: true` to `write_file` (resolves
+   `file_path` under `runtime_ctx::temp_dir()`, auto-cleaned at turn end by
+   `orchestrator::run_turn_body`). For manual cleanup of files outside the
+   temp dir, use `delete_path` (structured deletion with sandbox + protected-
+   dir checks). Never rely on `execute_command` for deletion — `rm` is
+   blocked by the sandbox and intentionally not relaxed.
 
 ## Related detailed guide
 

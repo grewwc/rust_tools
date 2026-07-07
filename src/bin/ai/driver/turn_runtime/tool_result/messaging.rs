@@ -78,7 +78,7 @@ pub(super) fn record_hidden_self_note(
 pub(super) fn append_cached_tool_results_note(
     exec_result: &ExecuteToolCallsResult,
     messages: &mut Vec<Message>,
-    turn_messages: &mut Vec<Message>,
+    _turn_messages: &mut Vec<Message>,
 ) {
     if !exec_result.cached_hits.iter().any(|hit| *hit) {
         return;
@@ -100,7 +100,10 @@ pub(super) fn append_cached_tool_results_note(
         tool_call_id: None,
         reasoning_content: None,
     };
-    append_message_pair(messages, turn_messages, cache_note);
+    // 过程性提示：仅在本 turn 内下发给 LLM，不写入 turn_messages 持久化轨道。
+    // 缓存命中是"仅当前回合有效"的上下文，若持久化会在后续每个 turn 反复重放，
+    // 且没有跨 turn 去重，属于单调膨胀的历史污染。
+    messages.push(cache_note);
 }
 
 pub(super) fn print_tool_result_preview(_tool_name: &str, prepared: &PreparedToolResult) {

@@ -38,6 +38,12 @@ pub struct ModelDef {
     /// 用于 driver 的动态压缩预算估算；缺省时按 quality_tier 回退。
     #[serde(default, alias = "context_window", alias = "max_context_tokens")]
     pub context_window_tokens: Option<usize>,
+    /// 可选：单次响应的最大输出 token 数，作为请求的 `max_tokens` 下发。
+    /// 许多 OpenAI 兼容 provider 在客户端不指定时会用一个偏保守的补全上限，
+    /// 导致大文件 `write_file` / 长文档生成被中途截断。显式声明一个接近模型
+    /// 真实上限的值可缓解截断；缺省（None）时不下发 `max_tokens`，沿用历史行为。
+    #[serde(default, alias = "max_tokens", alias = "max_completion_tokens")]
+    pub max_output_tokens: Option<u32>,
     /// 子 agent 模型选择优先级（越大越优先）。同 tier 内按此值降序排列。
     /// 缺省为 0，用户可在 ~/.config/rust_tools/models.json 中覆盖以调整偏好，
     /// 无需重新编译。

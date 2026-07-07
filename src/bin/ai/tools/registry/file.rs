@@ -1,6 +1,7 @@
 use serde_json::Value;
 
 use crate::ai::tools::common::{ToolRegistration, ToolSpec, ToolStreamingRegistration};
+use crate::ai::tools::service::delete::execute_delete_path;
 use crate::ai::tools::service::file::{
     execute_read_file, execute_read_file_lines, execute_write_file, execute_write_file_streaming,
 };
@@ -58,6 +59,10 @@ fn params_write_file() -> Value {
             "content": {
                 "type": "string",
                 "description": "Full file content to write (overwrites existing file)."
+            },
+            "temp": {
+                "type": "boolean",
+                "description": "When true, treat file_path as relative to the per-session temp directory and write there. The file is registered in a persistent registry so it can be cleaned up later via delete_path. Use this for scratch/intermediate files. Files not created with temp=true cannot be deleted by delete_path. (default: false)"
             }
         },
         "required": ["file_path", "content"]
@@ -89,7 +94,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "write_file",
-        description: "Create a new file or intentionally replace an entire file at an absolute path. For modifying an existing document or source file, prefer locating the target first, then use a precise read plus the smallest localized edit path available instead of rewriting the whole file.",
+        description: "Create a new file or intentionally replace an entire file at an absolute path. For modifying an existing document or source file, prefer locating the target first, then use a precise read plus the smallest localized edit path available instead of rewriting the whole file. For scratch/intermediate files, pass temp=true to write under the per-session temp directory and register the file so it can be cleaned up later via delete_path.",
         parameters: params_write_file,
         execute: execute_write_file,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -100,4 +105,32 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolStreamingRegistration {
     name: "write_file",
     execute_streaming: execute_write_file_streaming,
+});
+
+fn params_delete_path() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to the file or directory to delete. Relative paths resolve against the working directory; absolute paths must stay within the sandbox."
+            },
+            "recursive": {
+                "type": "boolean",
+                "description": "When true, delete a directory and all its contents. Required for directories; regular files can be deleted without it. (default: false)"
+            }
+        },
+        "required": ["path"]
+    })
+}
+
+inventory::submit!(ToolRegistration {
+    spec: ToolSpec {
+        name: "delete_path",
+        description: "Delete a temporary file or directory that was created via write_file(temp=true). Only files registered in the persistent temp-file registry can be deleted — source code, configs, and other project files are always refused. Use this to clean up scratch/intermediate files when done. Files created with write_file(temp=true) are tracked in a JSON registry that survives session restarts. Single-file deletes are undoable; recursive directory deletes are not.",
+        parameters: params_delete_path,
+        execute: execute_delete_path,
+        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
+        groups: &["builtin", "core"],
+    }
 });
