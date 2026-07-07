@@ -1,12 +1,14 @@
 use crate::ai::stream::render::code::{MONOKAI_BG, MONOKAI_FG};
 
-/// 终端里 box-drawing/block/braille 符号按单列渲染；`width_cjk` 会把其中一部分
-/// ambiguous 字符算成 2 列，导致表格边框和 cursor-up 高度漂移。
+/// 终端默认把 East-Asian **Ambiguous** 宽度字符（箭头 `→`、数学符号 `× ± ≤ ≥ ≠`、
+/// box-drawing、braille 等）按单列渲染，只有真正的 Wide/全角字符（CJK 等）才占 2 列。
+/// `width_cjk` 会把所有 ambiguous 字符算成 2 列，导致表格边框、cursor-up 高度整体漂移
+/// （尤其是含 `→` 的单元格右边框被逐行拉偏）。因此这里统一用 `width`（ambiguous=1）。
 pub(super) fn terminal_cell_width(ch: char) -> usize {
     if is_single_width_terminal_symbol(ch) {
         return 1;
     }
-    unicode_width::UnicodeWidthChar::width_cjk(ch).unwrap_or(0)
+    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 pub(super) fn terminal_display_width(s: &str) -> usize {
@@ -625,6 +627,25 @@ mod tests {
         assert_eq!(terminal_display_width("┌────┬────┐"), 11);
         assert_eq!(visible_width("────"), 4);
         assert_eq!(wrap_md_cell("──────", 4), vec!["────", "──"]);
+    }
+
+    #[test]
+    fn terminal_width_counts_ambiguous_symbols_as_single_width() {
+        // 箭头/数学符号是 East-Asian Ambiguous 宽度：终端按 1 列渲染。
+        // 若按 width_cjk 算成 2 列，含 `→` 的表格单元格右边框会被逐行拉偏。
+        for ch in ['→', '←', '↔', '×', '±', '≤', '≥', '≠', '∈', '⊂'] {
+            assert_eq!(
+                terminal_cell_width(ch),
+                1,
+                "ambiguous-width symbol {ch:?} must render as a single terminal column"
+            );
+        }
+        // 真正的全角/CJK 字符仍占 2 列，不受影响。
+        for ch in ['中', '文', '你', '好'] {
+            assert_eq!(terminal_cell_width(ch), 2, "CJK char {ch:?} stays double-width");
+        }
+        // 含箭头的结果单元格：3 个可见字符（→ 空格 x）应为 3 列，而非 4。
+        assert_eq!(terminal_display_width("→ x"), 3);
     }
 
     #[test]
