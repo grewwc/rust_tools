@@ -217,6 +217,7 @@ fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
         hidden_meta: String::new(),
         reasoning_text: String::new(),
         skip_response_drain: true,
+        truncated_by_length: false,
     }
 }
 
@@ -365,26 +366,35 @@ fn finalize_stream_response(
         }
     }
 
+    let truncated_by_length = state
+        .content
+        .finish_reason_value
+        .as_deref()
+        .is_some_and(|reason| reason.eq_ignore_ascii_case("length"));
+
     let outcome = if !tool_calls.is_empty() {
         StreamOutcome::ToolCall
     } else {
         let has_text = !state.content.assistant_text.trim().is_empty();
         let has_reasoning = !state.content.reasoning_text.trim().is_empty();
-        // 截断优先判定：本轮无有效工具调用，但要么有工具调用被丢弃（arguments JSON
-        // 半截），要么服务端明确回 finish_reason=length（撞输出上限）。这类"想干活
-        // 但被切断"的情况若按 Completed 静默结束，会让大文件 write_file 等操作凭空
-        // 消失。升级为可重试的 Truncated，由上层注入收缩提示后自动重试。
-        let truncated_by_length = state
-            .content
-            .finish_reason_value
-            .as_deref()
-            .is_some_and(|reason| reason.eq_ignore_ascii_case("length"));
-        if state.content.dropped_malformed_tool_call || truncated_by_length {
+        // 截断优先判定：本轮无有效工具调用，但有工具调用被丢弃（arguments JSON 半截）。
+        // 这类"想干活但被切断"的情况若按 Completed 静默结束，会让大文件 write_file
+        // 等操作凭空消失。升级为可重试的 Truncated，由上层注入收缩提示后自动重试。
+        //
+        // 注意：finish_reason=length（撞输出上限）本身并不触发 Truncated，因为推理模型
+        // 经常在 reasoning token 占满输出预算后返回 finish_reason=length，但可展示的
+        // assistant_text 实际上已完整。若同时有可见文本和 finish_reason=length，按
+        // Completed 处理，避免无意义的重试循环。只有在完全没有可见输出时，length 截断
+        // 才作为 Truncated 重试（此时模型可能刚开始输出就被掐断）。
+        if state.content.dropped_malformed_tool_call {
+            StreamOutcome::Truncated
+        } else if truncated_by_length && !has_text {
+            // finish_reason=length 且没有可见文本：模型可能只产出了 reasoning
+            // 就被掐断，或根本没输出。降 effort 重试，把预算让给实际内容。
             StreamOutcome::Truncated
         } else if !has_text && !has_reasoning {
-            // 检测空响应：模型返回 200 OK 但没有文本、没有工具调用、没有推理内容。
-            // 这种情况通常是 provider 端的问题（如限流、模型异常），需要触发重试
-            // 而不是静默结束 turn。
+            // 检测空响应：模型没有文本、没有工具调用、没有推理内容。
+            // 通常是 provider 端的问题（如限流、模型异常），触发重试。
             StreamOutcome::EmptyResponse
         } else {
             StreamOutcome::Completed
@@ -398,6 +408,7 @@ fn finalize_stream_response(
         hidden_meta: state.content.hidden_meta,
         reasoning_text: state.content.reasoning_text,
         skip_response_drain: true,
+        truncated_by_length,
     })
 }
 
@@ -885,6 +896,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         hidden_meta: String::new(),
         reasoning_text: std::mem::take(&mut state.content.reasoning_text),
         skip_response_drain: true,
+        truncated_by_length: false,
     })
 }
 
@@ -2387,9 +2399,12 @@ mod tests {
         .expect("stream_response should return after finish_reason grace window")
         .unwrap();
 
-        // 关键断言：有文本但 finish_reason=length 时升级为 Truncated（可重试），
-        // 而不是被当成 Completed 静默结束。
-        assert_eq!(result.outcome, StreamOutcome::Truncated);
+        // 关键断言：有文本但 finish_reason=length 时按 Completed 处理。推理模型
+        // 的 reasoning token 经常占满输出预算导致 finish_reason=length，但可见的
+        // assistant_text 实际已完整。继续重试只会无意义地反复截断。只有 tool call
+        // arguments JSON 被截断（dropped_malformed_tool_call）或完全没有可见输出
+        // 时，才应升级为 Truncated 触发重试。
+        assert_eq!(result.outcome, StreamOutcome::Completed);
         assert_eq!(result.assistant_text, "partial output");
 
         drop(response);

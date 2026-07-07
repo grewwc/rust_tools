@@ -294,6 +294,9 @@ pub(super) struct StreamResult {
     /// 用于多轮请求时按服务端要求回传给后端。
     pub(super) reasoning_text: String,
     pub(super) skip_response_drain: bool,
+    /// 服务端返回 finish_reason=length（撞输出上限）。即使 outcome 是 Completed
+    /// （有可见文本），该标志仍保留，供上层决定是否注入"输出可能不完整"提示。
+    pub(super) truncated_by_length: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

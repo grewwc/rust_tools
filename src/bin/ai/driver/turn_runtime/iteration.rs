@@ -465,6 +465,7 @@ async fn stream_model_response(
             hidden_meta: String::new(),
             reasoning_text: String::new(),
             skip_response_drain: false,
+            truncated_by_length: false,
         },
     };
     stream_result

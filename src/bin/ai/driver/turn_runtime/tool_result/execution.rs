@@ -856,6 +856,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 *force_final_response = true;
                 return Ok(TurnLoopStep::Continue);
             }
+            let was_truncated_by_length = stream_result.truncated_by_length;
             record_final_stream_response(
                 app,
                 stream_result,
@@ -864,6 +865,22 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 final_assistant_text,
                 final_assistant_recorded,
             );
+            // finish_reason=length 但有可见文本：按 Completed 接受，但注入一条轻量
+            // 提示让模型知道输出可能不完整。不触发重试（避免推理模型 reasoning
+            // 占满预算时无意义循环），只在下轮请求里提醒模型自行检查/补全。
+            if was_truncated_by_length {
+                let note = "self_note:output_length_warning\n\
+                            上一轮响应触发了输出长度上限（finish_reason=length）。\n\
+                            已保留可见文本作为本轮回答。若你判断内容可能不完整（如文件写入中途被截断），\n\
+                            请在下一步主动检查并补全；若内容已完整则忽略此提示。";
+                messages.push(Message {
+                    role: ROLE_INTERNAL_NOTE.to_string(),
+                    content: serde_json::Value::String(note.to_string()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    reasoning_content: None,
+                });
+            }
             Ok(TurnLoopStep::Break)
         }
         IterationExecution::ToolCall(tool_call_execution) => {
@@ -1254,6 +1271,7 @@ mod tests {
                 hidden_meta: String::new(),
                 reasoning_text: "I should read both files first.".to_string(),
                 skip_response_drain: true,
+                truncated_by_length: false,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1303,6 +1321,7 @@ mod tests {
                 hidden_meta: String::new(),
                 reasoning_text: "I should read both files first.".to_string(),
                 skip_response_drain: true,
+                truncated_by_length: false,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1354,6 +1373,7 @@ mod tests {
                 hidden_meta: String::new(),
                 reasoning_text: String::new(),
                 skip_response_drain: true,
+                truncated_by_length: false,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1410,6 +1430,7 @@ mod tests {
                     hidden_meta: String::new(),
                     reasoning_text: String::new(),
                     skip_response_drain: true,
+                truncated_by_length: false,
                 }),
                 &mut messages,
                 &mut turn_messages,
@@ -1487,6 +1508,7 @@ mod tests {
                     hidden_meta: String::new(),
                     reasoning_text: String::new(),
                     skip_response_drain: true,
+                truncated_by_length: false,
                 },
                 allowed_tool_names: Default::default(),
             }),
@@ -1605,6 +1627,7 @@ mod tests {
                         hidden_meta: String::new(),
                         reasoning_text: String::new(),
                         skip_response_drain: true,
+                truncated_by_length: false,
                     },
                     allowed_tool_names: ["execute_command".to_string()].into_iter().collect(),
                 },
