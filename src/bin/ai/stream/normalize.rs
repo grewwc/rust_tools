@@ -295,10 +295,25 @@ fn stream_chunk_with_delta(delta: StreamDelta) -> StreamChunk {
 }
 
 fn extract_output_index(value: &serde_json::Value) -> usize {
-    value
+    // 优先使用 provider 显式提供的 output_index
+    if let Some(idx) = value
         .get("output_index")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0) as usize
+    {
+        return idx as usize;
+    }
+    // output_index 缺失时，使用 call_id/item_id 的哈希作为合成索引，
+    // 避免多个并行工具调用全部碰撞到 index 0 互相覆盖。
+    // 哈希值映射到 [10000, usize::MAX) 区间，不与真实 output_index（通常 0-9）冲突。
+    let id = extract_call_identifier(value);
+    if !id.is_empty() {
+        let mut hash = 10000u64;
+        for byte in id.bytes() {
+            hash = hash.wrapping_mul(31).wrapping_add(byte as u64);
+        }
+        return hash as usize;
+    }
+    0
 }
 
 fn extract_function_call_item(

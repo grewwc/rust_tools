@@ -1149,13 +1149,18 @@ pub(crate) fn execute_memory_update(args: &Value) -> Result<String, String> {
 
         let mut entries = load_memory_entries(&path)?;
 
-        let Some(entry) = entries
-            .iter_mut()
-            .rev()
-            .find(|entry| entry.id.as_deref() == Some(id))
-        else {
-            return Err(format!("memory id not found: {id}"));
+        let viewer = ViewerContext::current();
+        let idx = match entries
+            .iter()
+            .rposition(|entry| entry.id.as_deref() == Some(id))
+        {
+            Some(idx) => idx,
+            None => return Err(format!("memory id not found: {id}")),
         };
+        if !viewer.can_see(&entries[idx]) {
+            return Err("Permission denied: entry owned by another agent".to_string());
+        }
+        let entry = &mut entries[idx];
 
         if let Some(content) = new_content.as_ref() {
             entry.note = content.clone();
@@ -1194,6 +1199,15 @@ pub(crate) fn execute_memory_delete(args: &Value) -> Result<String, String> {
         }
 
         let mut entries = load_memory_entries(&path)?;
+        let viewer = ViewerContext::current();
+        let denied = match entries.iter().find(|entry| entry.id.as_deref() == Some(id)) {
+            Some(entry) => !viewer.can_see(entry),
+            None => return Err(format!("memory id not found: {id}")),
+        };
+        if denied {
+            return Err("Permission denied: entry owned by another agent".to_string());
+        }
+
         let before_len = entries.len();
         entries.retain(|entry| entry.id.as_deref() != Some(id));
         if entries.len() == before_len {

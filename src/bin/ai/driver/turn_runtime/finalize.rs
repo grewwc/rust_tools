@@ -353,10 +353,8 @@ async fn maybe_generate_session_title(app: &App) {
         .parent()
         .unwrap_or_else(|| app.session_history_file.as_path());
     let store = SessionStore::new(sessions_dir);
-    eprintln!("[session-title] sessions_dir={}", sessions_dir.display());
 
     if store.has_generated_title(&app.session_id) {
-        eprintln!("[session-title] already has generated title, skipping");
         return;
     }
 

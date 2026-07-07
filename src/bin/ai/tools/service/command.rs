@@ -720,7 +720,13 @@ fn indirect_command_index(
 }
 
 fn shell_c_option_present(program: &str, tokens: &[String]) -> bool {
-    if !matches!(program, "bash" | "sh" | "zsh" | "ksh" | "dash") {
+    let is_shell = matches!(program, "bash" | "sh" | "zsh" | "ksh" | "dash");
+    // 脚本解释器同样支持 `-c` / `-e` 直接传入并执行代码字符串，会绕过分段黑名单验证。
+    let is_interpreter = matches!(
+        program,
+        "python" | "python3" | "perl" | "ruby" | "node" | "php" | "awk" | "lua"
+    );
+    if !is_shell && !is_interpreter {
         return false;
     }
     let mut i = 1usize;
@@ -732,7 +738,10 @@ fn shell_c_option_present(program: &str, tokens: &[String]) -> bool {
         if !tok.starts_with('-') || tok == "-" {
             return false;
         }
-        if tok == "-c" || tok == "--command" {
+        if is_shell && (tok == "-c" || tok == "--command") {
+            return true;
+        }
+        if is_interpreter && (tok == "-c" || tok == "-e") {
             return true;
         }
         i += 1;
@@ -887,6 +896,14 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
         if !in_double && (b == b'<' || b == b'>') && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             return Err("process substitution `<(...)` / `>(...)` is not allowed".to_string());
         }
+        // 未引用的 `(` / `)` / `{` / `}` 开启子 shell 或命令分组（如 `(rm -rf /tmp)`、
+        // `{ rm -rf /tmp; }`），会绕过分段黑名单验证。
+        // `$(` / `$((` / `<(` / `>(` 已在上方单独处理，此处拦截裸 `(` / `)` / `{` / `}`。
+        if !in_double && matches!(b, b'(' | b')' | b'{' | b'}') {
+            return Err(
+                "unquoted shell metacharacters `(` `)` `{` `}` start a subshell or command group and bypass command validation; run the command directly instead".to_string(),
+            );
+        }
         if !in_double && b == b'\n' && !pending_heredocs.is_empty() {
             i += 1;
             i = validate_and_skip_heredoc_bodies(command, i, &pending_heredocs)?;
@@ -945,6 +962,13 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
     let command_tokens = &lower_tokens[command_idx..];
     let raw_command_tokens = &tokens[command_idx..];
     let program = command_tokens[0].as_str();
+    // 对程序路径取 basename，防止 `/bin/rm`、`./rm` 等绝对/相对路径绕过黑名单。
+    let program_basename = std::path::Path::new(program)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(program);
+    // 后续所有比较统一使用 basename，确保 `/bin/rm` 与 `rm` 被同等对待。
+    let program = program_basename;
     let extra_blocked = config_blocked_commands();
     let normalize_path = |path: &std::path::Path| {
         let mut normalized = std::path::PathBuf::new();
@@ -1069,14 +1093,14 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         // 绕过手段：`eval` / `source` / `.` 会把后续字符串当 shell 代码再次
         // 解释，等于把验证完全 bypass 掉。
         "eval",
-        // "source",
-        // ".",
+        "source",
+        ".",
         // 反向 shell / 网络监听工具，正当 dev 流程几乎不会用，留着风险大于收益。
-        // "nc",
-        // "ncat",
-        // "netcat",
-        // "telnet",
-        // "socat",
+        "nc",
+        "ncat",
+        "netcat",
+        "telnet",
+        "socat",
     ];
     if denied_programs.contains(&program) {
         return Err(format!("program '{program}' is blocked"));
@@ -1186,7 +1210,7 @@ where
     let timeout = resolve_command_timeout(args["timeout"].as_u64(), default_timeout, max_timeout);
 
     if let Err(reason) = validate_execute_command(command) {
-        return Ok(format!("Command blocked: {reason}"));
+        return Err(format!("Command blocked: {reason}"));
     }
 
     let output = command_runner::run_command_streaming(command, cwd, timeout, on_chunk)?;

@@ -21,8 +21,8 @@ impl ProviderAdapter for OpenAiAdapter {
 
     fn api_key_candidates(&self) -> &'static [&'static str] {
         &[
-            AiConfig::MODEL_OPENROUTER_API_KEY,
             AiConfig::MODEL_OPENAI_API_KEY,
+            AiConfig::MODEL_OPENROUTER_API_KEY,
             AiConfig::MODEL_API_KEY,
         ]
     }

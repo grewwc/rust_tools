@@ -621,6 +621,35 @@ fn execute_consolidation(args: &Value) -> Result<String, String> {
             if !new_entries.is_empty() {
                 report.push_str(&format!("   Saved: {} new entries\n", result.appended));
             }
+            // Sync RAG vector index: delete vectors for removed ids, upsert embeddings for new entries.
+            // apply_batch_update only rewrites JSONL + rebuilds SQLite/FTS5, so the vector store
+            // must be synced separately to avoid orphaned/missing embeddings.
+            if let Ok(_) = ensure_rag_store() {
+                if let Ok(guard) = get_rag_store() {
+                    if let Some(rag) = guard.as_ref() {
+                        for id in &delete_ids {
+                            let _ = rag.delete(id);
+                        }
+                        for entry in &new_entries {
+                            if let Some(id) = entry.id.clone() {
+                                let embedding_text = format!("{}: {}", entry.category, entry.note);
+                                if let Ok(embeddings) = rag.embed_texts(&[embedding_text.clone()]) {
+                                    if let Some(embedding) = embeddings.into_iter().next() {
+                                        let _ = rag.upsert(RagEntry {
+                                            id,
+                                            content: embedding_text,
+                                            category: entry.category.clone(),
+                                            tags: entry.tags.clone(),
+                                            embedding,
+                                            timestamp: rag_timestamp_for_entry(entry),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             (result.deleted, result.appended)
         }
         Err(e) => {

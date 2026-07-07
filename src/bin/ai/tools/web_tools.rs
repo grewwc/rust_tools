@@ -160,16 +160,20 @@ pub(crate) fn execute_web_search(args: &Value) -> Result<String, String> {
     // Try search with retries
     let result = search_with_retries(query, region, time_range, limit);
 
-    // Cache the result (LruCache handles TTL internally)
-    if let Ok(mut cache) = SEARCH_CACHE.lock() {
-        cache.put(cache_key, result.clone());
+    // 仅缓存成功且非空的结果，避免临时错误毒化缓存
+    if let Ok(ref hits) = result {
+        if !hits.is_empty() {
+            if let Ok(mut cache) = SEARCH_CACHE.lock() {
+                cache.put(cache_key, result.clone());
+            }
+        }
     }
 
     match result {
         Ok(hits) => {
             if hits.is_empty() {
                 eprintln!("[web_search] No results for query: {}", query);
-                Err(format!(
+                Ok(format!(
                     "No results found for: {}. Try different keywords or check spelling.",
                     query
                 ))
@@ -383,9 +387,11 @@ fn remaining_search_timeout(deadline: std::time::Instant) -> Option<Duration> {
     Some(remaining.min(HTTP_SEARCH_TIMEOUT))
 }
 
-pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
-    let url = args["url"].as_str().ok_or("Missing url")?;
-    let extract_content = args["extract_content"].as_bool().unwrap_or(false);
+
+/// 验证 URL 是否安全（防止 SSRF 攻击）。
+/// 检查 scheme、hostname、以及 DNS 解析后的 IP 地址。
+fn validate_ssrf_url(url: &str) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
     let parsed = reqwest::Url::parse(url).map_err(|_| "Invalid url".to_string())?;
     let scheme = parsed.scheme();
     if scheme != "http" && scheme != "https" {
@@ -398,22 +404,73 @@ pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
     if host_lc == "localhost" || host_lc.ends_with(".localhost") || host_lc.ends_with(".local") {
         return Err("Blocked url host".to_string());
     }
+    // 检查字面 IP
     if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        let blocked = match ip {
-            std::net::IpAddr::V4(v4) => {
-                v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_multicast()
-            }
-            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unique_local(),
-        };
-        if blocked {
+        if is_blocked_ip(&ip) {
             return Err("Blocked url host".to_string());
         }
+    } else {
+        // 域名：解析 DNS 并检查所有解析到的 IP
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let socket_addrs = format!("{host}:{port}");
+        match socket_addrs.to_socket_addrs() {
+            Ok(addrs) => {
+                let mut found_any = false;
+                for addr in addrs {
+                    found_any = true;
+                    if is_blocked_ip(&addr.ip()) {
+                        return Err("Blocked url host (DNS resolves to private IP)".to_string());
+                    }
+                }
+                if !found_any {
+                    return Err("Blocked url host (DNS resolution returned no addresses)".to_string());
+                }
+            }
+            Err(_) => {
+                return Err("Blocked url host (DNS resolution failed)".to_string());
+            }
+        }
     }
+    Ok(())
+}
+
+/// 检查 IP 地址是否属于应被阻止的范围（私有/环回/链路本地/多播/未指定）。
+fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unique_local()
+                || v6.is_multicast()
+                || v6.is_unspecified()
+                // 检查 IPv4-mapped IPv6 地址（如 ::ffff:127.0.0.1）
+                || v6.to_ipv4().map(|v4| is_blocked_ip(&std::net::IpAddr::V4(v4))).unwrap_or(false)
+        }
+    }
+}
+
+pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
+    let url = args["url"].as_str().ok_or("Missing url")?;
+    let extract_content = args["extract_content"].as_bool().unwrap_or(false);
+    validate_ssrf_url(url)?;
 
     let client = reqwest::blocking::Client::builder()
         .timeout(HTTP_TOOL_TIMEOUT)
         .connect_timeout(Duration::from_secs(5))
         .user_agent(USER_AGENTS[0])
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            match validate_ssrf_url(attempt.url().as_str()) {
+                Ok(()) => attempt.follow(),
+                Err(_) => attempt.stop(),
+            }
+        }))
         .build()
         .map_err(|e| format!("Failed to build http client: {}", e))?;
 

@@ -46,38 +46,41 @@ pub(super) fn extract_chunk_events_with_tools(
     let delta = &choice.delta;
 
     let mut events = Vec::new();
-    let mut tool_calls = Vec::new();
+    let mut all_tool_calls = Vec::new();
 
-    // reasoning 段独立于 content 处理：部分 provider 会把 message 快照折叠成
-    // “同一 chunk 同时带 content 与 reasoning_content”。若按内容/推理互斥分支处理，
-    // 这类 chunk 的 thinking 显示会被整段丢弃（数据仍在 reasoning_text 缓冲，但
-    // 界面上完全看不到思考过程）。
+    // 先处理 reasoning_content（即使 content 也非空，两者可共存于同一 chunk）
     if !delta.reasoning_content.is_empty() {
-        let (cleaned, reasoning_tool_calls) =
-            splitter::extract_internal_tool_calls(&delta.reasoning_content);
+        let (cleaned, tool_calls) = splitter::extract_internal_tool_calls(&delta.reasoning_content);
         let cleaned = normalize_stream_text(cleaned);
-        tool_calls.extend(reasoning_tool_calls);
-        if !cleaned.is_empty() {
-            if !*thinking_open {
-                *thinking_open = true;
-                events.push(StreamTextEvent::OpenThinking);
+        if !cleaned.is_empty() || !tool_calls.is_empty() {
+            if !cleaned.is_empty() {
+                if !*thinking_open {
+                    *thinking_open = true;
+                    events.push(StreamTextEvent::OpenThinking);
+                }
+                push_text_with_hidden_meta(
+                    &mut events,
+                    cleaned,
+                    true,
+                    hidden_begin,
+                    hidden_end,
+                    hidden_meta_parse,
+                );
             }
-            push_text_with_hidden_meta(
-                &mut events,
-                cleaned,
-                true,
-                hidden_begin,
-                hidden_end,
-                hidden_meta_parse,
-            );
+            all_tool_calls = tool_calls;
+        }
+        // content 为空时保持 thinking 开启并返回
+        if delta.content.is_empty() {
+            return (events, all_tool_calls);
         }
     }
 
+    // 处理 content（先关闭 thinking 标签）
+    if *thinking_open {
+        *thinking_open = false;
+        events.push(StreamTextEvent::CloseThinking);
+    }
     if !delta.content.is_empty() {
-        if *thinking_open {
-            *thinking_open = false;
-            events.push(StreamTextEvent::CloseThinking);
-        }
         let content = normalize_stream_text(delta.content.clone());
         push_text_with_hidden_meta(
             &mut events,
@@ -88,7 +91,7 @@ pub(super) fn extract_chunk_events_with_tools(
             hidden_meta_parse,
         );
     }
-    (events, tool_calls)
+    (events, all_tool_calls)
 }
 
 /// Stateful streaming variant that incrementally emits internal tool call
@@ -110,37 +113,41 @@ pub(super) fn extract_chunk_events_streaming(
     let delta = &choice.delta;
 
     let mut events = Vec::new();
-    let mut tool_events = Vec::new();
+    let mut all_tool_events = Vec::new();
 
-    // reasoning 段独立于 content 处理：部分 provider 会把 message 快照折叠成
-    // “同一 chunk 同时带 content 与 reasoning_content”。若按内容/推理互斥分支处理，
-    // 这类 chunk 的 thinking 显示会被整段丢弃（数据仍在 reasoning_text 缓冲，但
-    // 界面上完全看不到思考过程）。
+    // 先处理 reasoning_content（即使 content 也非空，两者可共存于同一 chunk）
     if !delta.reasoning_content.is_empty() {
-        let (cleaned, reasoning_tool_events) = streamer.push(&delta.reasoning_content);
+        let (cleaned, tool_events) = streamer.push(&delta.reasoning_content);
         let cleaned = normalize_stream_text(cleaned);
-        tool_events.extend(reasoning_tool_events);
-        if !cleaned.is_empty() {
-            if !*thinking_open {
-                *thinking_open = true;
-                events.push(StreamTextEvent::OpenThinking);
+        if !cleaned.is_empty() || !tool_events.is_empty() {
+            if !cleaned.is_empty() {
+                if !*thinking_open {
+                    *thinking_open = true;
+                    events.push(StreamTextEvent::OpenThinking);
+                }
+                push_text_with_hidden_meta(
+                    &mut events,
+                    cleaned,
+                    true,
+                    hidden_begin,
+                    hidden_end,
+                    hidden_meta_parse,
+                );
             }
-            push_text_with_hidden_meta(
-                &mut events,
-                cleaned,
-                true,
-                hidden_begin,
-                hidden_end,
-                hidden_meta_parse,
-            );
+            all_tool_events = tool_events;
+        }
+        // content 为空时保持 thinking 开启并返回
+        if delta.content.is_empty() {
+            return (events, all_tool_events);
         }
     }
 
+    // 处理 content（先关闭 thinking 标签）
+    if *thinking_open {
+        *thinking_open = false;
+        events.push(StreamTextEvent::CloseThinking);
+    }
     if !delta.content.is_empty() {
-        if *thinking_open {
-            *thinking_open = false;
-            events.push(StreamTextEvent::CloseThinking);
-        }
         let normalized = super::runtime::normalize_inline_tool_call_markup(&delta.content);
         let (cleaned, mut hermes_events) = hermes_streamer.push(&normalized);
         // 再把 Hermes 抽离后的可见文本交给 Anthropic（`<invoke name=...>`）解析器，
@@ -158,9 +165,10 @@ pub(super) fn extract_chunk_events_streaming(
                 hidden_meta_parse,
             );
         }
-        tool_events.extend(hermes_events);
+        all_tool_events.extend(hermes_events);
+        return (events, all_tool_events);
     }
-    (events, tool_events)
+    (events, all_tool_events)
 }
 
 pub(super) fn render_stream_text_events(

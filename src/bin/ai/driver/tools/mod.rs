@@ -1367,6 +1367,26 @@ fn execute_tool_spawn(
     let started_at_for_thread = started_at;
     let available_tool_names_for_thread = allowed_tool_names.cloned();
 
+   // Insert the Running registry entry BEFORE spawning the worker thread.
+   // If the worker completes quickly, it will try to update the entry to
+   // Completed — the entry must already exist or the completion is lost and
+   // the task is stuck in Running forever.
+   {
+       let mut registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
+       registry.insert(
+           async_task_id.clone(),
+           AsyncToolEntry {
+               result_channel_id,
+               completion_futex_addr,
+               session_id: session_id_for_registry.clone(),
+               tool_name: tool_name.clone(),
+               started_at,
+               state: AsyncToolState::Running,
+           },
+       );
+       prune_completed_async_tools(&mut registry);
+   }
+
     thread::spawn(move || {
         let mut pipe_observer = AsyncToolPipeObserver {
             task_id: async_task_id_for_thread.clone(),
@@ -1433,20 +1453,6 @@ fn execute_tool_spawn(
             }
         }
     });
-
-    let mut registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
-    registry.insert(
-        async_task_id.clone(),
-        AsyncToolEntry {
-            result_channel_id,
-            completion_futex_addr,
-            session_id: session_id_for_registry,
-            tool_name,
-            started_at,
-            state: AsyncToolState::Running,
-        },
-    );
-    prune_completed_async_tools(&mut registry);
 
     Ok(ToolResult {
         tool_call_id: tool_call_id.to_string(),
@@ -2336,13 +2342,14 @@ fn run_parallel_readonly_batch(
             .collect();
         handles
             .into_iter()
-            .map(|h| {
-                h.join().unwrap_or_else(|_| {
+           .zip(batch.iter())
+           .map(|(h, tool_call)| {
+               h.join().unwrap_or_else(|_| {
                     (
                         ToolRoute::Builtin,
                         RunOneResult {
                             tool_result: ToolResult {
-                                tool_call_id: String::new(),
+                               tool_call_id: tool_call.id.clone(),
                                 content: "Error: parallel tool execution thread panicked"
                                     .to_string(),
                             },

@@ -1,4 +1,6 @@
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -86,6 +88,8 @@ fn cargo_common_args(args: &Value) -> (String, bool, bool, Option<String>) {
 
 fn execute_cargo_command(subcommand: &str, args: &Value) -> Result<String, String> {
     let (cwd, workspace, all_features, package) = cargo_common_args(args);
+    const CARGO_TIMEOUT_SECS: u64 = 300; // 5 分钟超时
+    const MAX_CARGO_OUTPUT_BYTES: usize = 512 * 1024; // 512KB 输出上限
 
     let mut cmd = Command::new("cargo");
     cmd.arg(subcommand);
@@ -98,10 +102,70 @@ fn execute_cargo_command(subcommand: &str, args: &Value) -> Result<String, Strin
     if let Some(pkg) = package {
         cmd.args(["-p", &pkg]);
     }
-    let output = cmd
-        .current_dir(cwd)
-        .output()
+
+    let mut child = cmd
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("Failed to execute cargo: {}", e))?;
+
+    // 读取 stdout/stderr 到缓冲区，同时检查超时
+    let deadline = Instant::now() + Duration::from_secs(CARGO_TIMEOUT_SECS);
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // 在单独线程中读取 stdout/stderr，避免阻塞
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stdout {
+            let _ = s.by_ref().take((MAX_CARGO_OUTPUT_BYTES + 1) as u64).read_to_end(&mut buf);
+        }
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stderr {
+            let _ = s.by_ref().take((MAX_CARGO_OUTPUT_BYTES + 1) as u64).read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    // 轮询等待子进程，超时则 kill
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "cargo {} timed out after {} seconds",
+                        subcommand, CARGO_TIMEOUT_SECS
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(format!("Failed to wait for cargo: {}", e)),
+        }
+    };
+
+    let stdout_raw = stdout_handle.join().unwrap_or_default();
+    let stderr_raw = stderr_handle.join().unwrap_or_default();
+    let stdout_truncated = stdout_raw.len() > MAX_CARGO_OUTPUT_BYTES;
+    let stderr_truncated = stderr_raw.len() > MAX_CARGO_OUTPUT_BYTES;
+    let stdout = String::from_utf8_lossy(&stdout_raw[..stdout_raw.len().min(MAX_CARGO_OUTPUT_BYTES)]).to_string();
+    let stderr = String::from_utf8_lossy(&stderr_raw[..stderr_raw.len().min(MAX_CARGO_OUTPUT_BYTES)]).to_string();
+    let stdout = if stdout_truncated { format!("{}\n... (output truncated, {} bytes total)", stdout.trim(), stdout_raw.len()) } else { stdout };
+    let stderr = if stderr_truncated { format!("{}\n... (output truncated, {} bytes total)", stderr.trim(), stderr_raw.len()) } else { stderr };
+
+    // 构造模拟 Output 对象
+    let output = std::process::Output {
+        status,
+        stdout: stdout.into_bytes(),
+        stderr: stderr.into_bytes(),
+    };
 
     let (stdout, stderr) = output_to_strings(&output);
     if output.status.success() {

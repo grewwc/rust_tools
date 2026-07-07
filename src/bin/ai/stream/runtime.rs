@@ -277,6 +277,14 @@ async fn process_pending_tail(
     adapter_kind: normalize::StreamProviderAdapterKind,
 ) -> Result<Option<StreamResult>, Box<dyn std::error::Error>> {
     if state.framing.pending.is_empty() {
+        // pending 为空时，仍需检查 sse_event_data 是否有未 flush 的最后一个事件。
+        // 部分 provider 在关闭连接前不发送最终空行（\n\n），导致最后一个 SSE 事件被丢弃。
+        if !state.framing.sse_event_data.trim().is_empty() {
+            if flush_sse_event(app, current_history, markers, state, adapter_kind)? {
+                let final_state = std::mem::replace(state, StreamProcessingState::new());
+                return Ok(Some(finalize_stream_response(app, markers, final_state)?));
+            }
+        }
         return Ok(None);
     }
 

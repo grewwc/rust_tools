@@ -627,6 +627,16 @@ fn retry_delay(attempt: usize) -> Duration {
     Duration::from_millis(backoff.min(REQUEST_RETRY_MAX_MS))
 }
 
+/// 解析 HTTP `Retry-After` 响应头，返回建议的等待时长。
+/// 支持秒数格式（`120`）。HTTP 日期格式暂不支持。
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let val = headers.get(reqwest::header::RETRY_AFTER)?;
+    let s = val.to_str().ok()?;
+    if let Ok(secs) = s.trim().parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    None
+}
 fn should_abort_retry_wait(app: &App) -> bool {
     app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
         || app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed)
@@ -1274,6 +1284,12 @@ pub(super) async fn do_request_messages(
                 }
                 let status = response.status();
                 let status_code = status.as_u16();
+                // 在消费 body 前读取 Retry-After 头
+                let retry_after_delay = if status_code == 429 {
+                    parse_retry_after(response.headers())
+                } else {
+                    None
+                };
                 let body = (response.text().await).unwrap_or_default();
                 let err = RequestError::status(status, body);
 
@@ -1286,7 +1302,7 @@ pub(super) async fn do_request_messages(
 
                 if should_retry_status(status) && attempt < max_attempts_for_status {
                     // 打印 sleep 原因
-                    let delay = retry_delay(attempt);
+                    let delay = retry_after_delay.unwrap_or_else(|| retry_delay(attempt));
 
                     if status_code == 429 {
                         eprintln!(
@@ -2495,10 +2511,17 @@ pub async fn do_request_json(
                     return Ok(json);
                 }
                 let status = response.status();
+                let status_code = status.as_u16();
+                // 在消费 body 前读取 Retry-After 头
+                let retry_after_delay = if status_code == 429 {
+                    parse_retry_after(response.headers())
+                } else {
+                    None
+                };
                 let body = (response.text().await).unwrap_or_default();
                 let err = RequestError::status(status, body);
                 if should_retry_status(status) && attempt < REQUEST_MAX_ATTEMPTS {
-                    let delay = retry_delay(attempt);
+                    let delay = retry_after_delay.unwrap_or_else(|| retry_delay(attempt));
                     if sleep_with_cancel(app, delay).await {
                         return Err(Box::new(RequestError::cancelled(
                             "request canceled by user during retry wait",

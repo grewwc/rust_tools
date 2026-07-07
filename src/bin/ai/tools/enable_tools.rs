@@ -220,10 +220,10 @@ fn execute_enable_tools(args: &Value) -> Result<String, String> {
             let mut lines = Vec::with_capacity(available.len() + 1);
             lines.push(format!("{} additional tools available:", available.len()));
             for (name, desc) in available {
-                let short = if desc.len() > 80 {
-                    desc[..80].to_string()
+                let short = if desc.chars().count() > 80 {
+                    desc.chars().take(80).collect::<String>()
                 } else {
-                    desc
+                    desc.to_string()
                 };
                 lines.push(format!("  - {}: {}", name, short));
             }

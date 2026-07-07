@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 /// 按字符边界安全截断字符串，避免 `&s[..n]` 在 UTF-8 多字节字符中间 panic。
 /// `max_bytes` 是字节预算上限：截断后不会超过该字节数。
-fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+pub(super) fn safe_truncate(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
