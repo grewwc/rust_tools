@@ -54,7 +54,7 @@ fn params_write_file() -> Value {
         "properties": {
             "file_path": {
                 "type": "string",
-                "description": "Absolute path to the file to write. Parent directories are created if missing."
+                "description": "Path to the file to write. When temp=false (default), an absolute path; parent directories are created if missing. When temp=true, a relative filename only (e.g. `script.py`) written under the per-session temp directory — an absolute path is rejected."
             },
             "content": {
                 "type": "string",
@@ -62,7 +62,7 @@ fn params_write_file() -> Value {
             },
             "temp": {
                 "type": "boolean",
-                "description": "When true, treat file_path as relative to the per-session temp directory and write there. The file is registered in a persistent registry so it can be cleaned up later via delete_path. Use this for scratch/intermediate files. Files not created with temp=true cannot be deleted by delete_path. (default: false)"
+                "description": "When true, write file_path (a relative filename) under the per-session temp directory and register it so it can be cleaned up later via delete_path. Use this for scratch/intermediate files (scripts, data dumps, test fixtures). An absolute path is rejected. Files not created with temp=true cannot be deleted by delete_path. (default: false)"
             }
         },
         "required": ["file_path", "content"]
@@ -94,7 +94,7 @@ inventory::submit!(ToolRegistration {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "write_file",
-        description: "Create a new file or intentionally replace an entire file at an absolute path. For modifying an existing document or source file, prefer locating the target first, then use a precise read plus the smallest localized edit path available instead of rewriting the whole file. For scratch/intermediate files, pass temp=true to write under the per-session temp directory and register the file so it can be cleaned up later via delete_path.",
+        description: "Write a file. For scratch/intermediate files (scripts, data dumps, test fixtures that are not part of the project), pass temp=true with a relative filename to write under the per-session temp directory; the file is registered so it can be cleaned up later via delete_path. Without temp=true, this creates a new file or intentionally replaces an entire file at an absolute path — for modifying an existing project file, prefer apply_patch or a minimal localized edit instead of a full rewrite.",
         parameters: params_write_file,
         execute: execute_write_file,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

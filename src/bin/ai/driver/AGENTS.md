@@ -28,6 +28,12 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
    discover_skills followups) are turn-scoped: push them to `messages` only,
    never via `append_message_pair`, so they are not persisted into
    `turn_messages` and cannot accumulate across turns.
+8. `turn_runtime/persistence.rs` skips persisting turn messages only for
+   *ephemeral* one-shot runs (`one_shot_mode && cli.session.is_none()`), i.e.
+   the runs `cleanup_one_shot` will delete right after. Background mode
+   (`a -bg`) and explicit `--session` one-shot (`a -ss <id> "q"`) keep the
+   session, so they MUST persist — otherwise `/sessions` title and `/history`
+   come up empty.
 
 ## Related detailed guide
 

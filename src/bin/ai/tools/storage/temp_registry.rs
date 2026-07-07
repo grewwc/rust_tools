@@ -7,7 +7,7 @@
 //
 // 注册表以 JSON 文件持久化在 `<temp_dir>/temp_registry.json`
 // （`temp_dir` 优先为 `~/.history_file.sessions/<session>.assets/tmp/`，
-// 与 tool-overflow 同源，落在项目外），会话终止后重启仍可读取。
+// 与 tool-overflow 同源，落在项目外；fallback 为系统临时目录），会话终止后重启仍可读取。
 // =============================================================================
 
 use std::path::PathBuf;

@@ -1034,18 +1034,21 @@ fn build_system_prompt(
         let mut lines = Vec::new();
         if has_tool(available_tools, "write_file") {
             lines.push(
-                "For scratch / intermediate files (scripts, data dumps, test fixtures that are not part of the project), use `write_file` with `temp=true`. This writes to a per-session temp directory and registers the file so it can be cleaned up later.".to_string(),
+                "When you need to run a script, dump intermediate data, or write a test fixture, create it with `write_file(temp=true)` first, then run it with `execute_command`. Prefer this over inline `python -c '...'` whenever the code is more than a few lines or you need to inspect/edit the file.".to_string(),
             );
             lines.push(
-                "Do NOT use `execute_command` to create temp files (e.g. `echo > /tmp/foo`, `python -c '...' > out.json`) — files created outside `write_file(temp=true)` cannot be deleted by `delete_path` and will accumulate.".to_string(),
+                "`write_file(temp=true)` writes to the per-session temp directory and registers the file so it can be cleaned up later via `delete_path`. When `temp=true`, pass a relative filename only (e.g. `script.py`); an absolute path is rejected to avoid accidentally writing into the project tree.".to_string(),
+            );
+            lines.push(
+                "Do NOT use `execute_command` to create temp files (e.g. `echo > /tmp/foo`, `python -c '...' > out.json`) — files created outside `write_file(temp=true)` cannot be deleted by `delete_path` and will accumulate. `execute_command` cannot run `rm` either (blocked by sandbox).".to_string(),
+            );
+            lines.push(
+                "When modifying an existing project file, do NOT use `write_file` with `temp=true` — use `apply_patch` for localized edits, or `write_file` without `temp` only when a full rewrite is genuinely necessary.".to_string(),
             );
         }
         if has_tool(available_tools, "delete_path") {
             lines.push(
                 "Use `delete_path` to clean up temp files when done. It only deletes files created via `write_file(temp=true)` — source code, configs, and other project files are always refused.".to_string(),
-            );
-            lines.push(
-                "`execute_command` cannot run `rm` (blocked by sandbox). Do not attempt shell-based deletion.".to_string(),
             );
         }
         push_tool_guidance_section(

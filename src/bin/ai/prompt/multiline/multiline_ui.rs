@@ -23,6 +23,14 @@ const VIEWPORT_CHROME_LINES: u16 = 5; // top margin + model line + spacer + help
 const MIN_TEXTAREA_LINES: u16 = 3;
 const MAX_PREFILL_TEXTAREA_LINES: u16 = 12;
 
+/// 补全面板激活时，除面板外需要保留的固定行数：
+/// top_margin(1) + textarea 最小行(1) + model(1) + help(2) = 5。
+/// 与 `render::popup_layout_config` 在 `has_completion_panel` 分支下的口径保持一致
+/// （面板激活时 spacer=0、min_textarea_lines=1）。
+const PANEL_CHROME_LINES: u16 = 5;
+/// 补全面板一次最多显示的候选行数，与 `render::COMPLETION_WINDOW` 对齐。
+const PANEL_COMPLETION_WINDOW: u16 = 12;
+
 /// `Terminal::clear()` 在 inline viewport 下会先把真实终端 cursor 挪到 viewport 顶部
 /// 再执行 `FromCursorDown`。如果 resize 突发期间又立刻来一轮 autoresize，ratatui 会
 /// 以这个被挪到顶部的 cursor 重新计算 viewport 锚点，导致输入框/光标跳到 terminal
@@ -55,6 +63,54 @@ fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
         .saturating_add(VIEWPORT_CHROME_LINES);
     let desired = COMPACT_VIEWPORT_HEIGHT.max(prefill_viewport_height);
     desired.min(MAX_VIEWPORT_HEIGHT).min(available_rows)
+}
+
+/// 补全面板激活时所需的 viewport 高度：在保持输入框（textarea）行数不变的前提下，
+/// 额外为面板腾出空间。面板期望行数 = min(候选数, PANEL_COMPLETION_WINDOW) + 上下边框(2)，
+/// 再加上 PANEL_CHROME_LINES（top_margin + textarea 最小行 + model + help）。
+/// 未超过 base_height（无面板时的高度）时直接用 base_height，避免面板很小反而缩了 viewport。
+fn viewport_height_with_completion(
+    terminal_rows: u16,
+    base_height: u16,
+    completion_items: Option<usize>,
+) -> u16 {
+    let available_rows = terminal_rows.saturating_sub(2).max(1);
+    let base = base_height.min(available_rows);
+    let Some(items) = completion_items else {
+        return base;
+    };
+    let visible = (items.min(PANEL_COMPLETION_WINDOW as usize) as u16).max(1);
+    let panel_lines = visible.saturating_add(2); // 上下边框
+    let desired = panel_lines.saturating_add(PANEL_CHROME_LINES);
+    desired
+        .max(base)
+        .min(MAX_VIEWPORT_HEIGHT)
+        .min(available_rows)
+}
+
+type MultilineTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+fn build_inline_terminal(height: u16) -> io::Result<MultilineTerminal> {
+    let backend = CrosstermBackend::new(io::stdout());
+    Terminal::with_options(
+        backend,
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Inline(height.max(1)),
+        },
+    )
+    .map_err(|err| io::Error::other(err.to_string()))
+}
+
+/// 补全面板开/关时，inline viewport 需要的高度会变化，而 ratatui 的 inline viewport
+/// 高度在创建时固定、无法原地修改。这里通过“清屏归位光标 -> 用新高度重建 Terminal”
+/// 完成切换：`clear()` 会把光标移回 viewport 顶部并擦除其下内容，重建时 ratatui 以同一
+/// 顶部锚点向下 `append_lines` 展开，因此放大/收回都不会污染 scrollback。
+/// 输入框（textarea）的行数不受影响——多出/收回的高度只作用于补全面板区域。
+fn resize_inline_viewport(terminal: &mut MultilineTerminal, new_height: u16) -> io::Result<()> {
+    let _ = terminal.hide_cursor();
+    let _ = terminal.clear();
+    *terminal = build_inline_terminal(new_height)?;
+    Ok(())
 }
 
 /// 处理 `Event::Resize` 连续触发的情况：终端窗口拖动时 Resize 事件会快速连发，
@@ -90,21 +146,15 @@ impl PromptEditor {
         // Inline viewport 初始化会通过 append_lines() 真实撑开终端区域。空输入默认保持
         // 紧凑，避免每轮回答后和下一轮光标之间出现大段空白；编辑已有内容时再按预填行数
         // 放大，给 textarea 保留足够空间。
-        let viewport_height = terminal_size()
+        let base_viewport_height = terminal_size()
             .map(|(_, h)| multiline_viewport_height(h, self.pending_prefill.as_deref()))
             .unwrap_or(COMPACT_VIEWPORT_HEIGHT);
 
-        let backend = CrosstermBackend::new(io::stdout());
-        let mut terminal = match Terminal::with_options(
-            backend,
-            ratatui::TerminalOptions {
-                viewport: ratatui::Viewport::Inline(viewport_height),
-            },
-        ) {
+        let mut terminal = match build_inline_terminal(base_viewport_height) {
             Ok(terminal) => terminal,
             Err(err) => {
                 let _ = disable_raw_mode();
-                return Err(io::Error::other(err.to_string()));
+                return Err(err);
             }
         };
 
@@ -119,8 +169,25 @@ impl PromptEditor {
             let mut pending_tab_completion: Option<PendingTabCompletion> = None;
             let mut completion_panel: Option<CompletionPanel> = None;
             let mut recent_text_input: Option<RecentTextInput> = None;
+            // 记录当前 viewport 已适配的补全候选数：None 表示无面板（base 高度）。
+            // 面板出现/消失/候选数变化时，据此重建 viewport 让面板获得足够高度，
+            // 而输入框行数保持不变。
+            let mut fitted_completion_items: Option<usize> = None;
 
             loop {
+                // 面板状态变化时，重建 inline viewport 以匹配面板所需高度。
+                let current_items = completion_panel.as_ref().map(|p| p.items.len());
+                if current_items != fitted_completion_items {
+                    let terminal_rows = terminal_size().map(|(_, h)| h).unwrap_or(0);
+                    let new_height = viewport_height_with_completion(
+                        terminal_rows,
+                        base_viewport_height,
+                        current_items,
+                    );
+                    resize_inline_viewport(&mut terminal, new_height)?;
+                    fitted_completion_items = current_items;
+                }
+
                 terminal
                     .draw(|f| {
                         render_multiline_popup(
@@ -186,7 +253,10 @@ impl PromptEditor {
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_inline_viewport_preserving_cursor, multiline_viewport_height};
+    use super::{
+        clear_inline_viewport_preserving_cursor, multiline_viewport_height,
+        viewport_height_with_completion,
+    };
     use ratatui::{
         Terminal, TerminalOptions, Viewport,
         backend::TestBackend,
@@ -246,5 +316,26 @@ mod tests {
         assert_eq!(multiline_viewport_height(10, Some(&prefill)), 8);
         assert_eq!(multiline_viewport_height(4, Some(&prefill)), 2);
         assert_eq!(multiline_viewport_height(4, None), 2);
+    }
+
+    #[test]
+    fn completion_viewport_grows_with_candidates_without_shrinking_base() {
+        // 无面板：保持 base 高度（8）。
+        assert_eq!(viewport_height_with_completion(30, 8, None), 8);
+        // 1 个候选：面板需要 1+2(边框)+5(chrome)=8，不小于 base，仍是 8。
+        assert_eq!(viewport_height_with_completion(30, 8, Some(1)), 8);
+        // 3 个候选：3+2+5=10 > base，viewport 撑高到 10，多出的 2 行全给面板。
+        assert_eq!(viewport_height_with_completion(30, 8, Some(3)), 10);
+        // 大量候选：受 PANEL_COMPLETION_WINDOW(12) 与 MAX_VIEWPORT_HEIGHT(20) 双重封顶。
+        // 12+2+5=19 <= 20，取 19。
+        assert_eq!(viewport_height_with_completion(30, 8, Some(50)), 19);
+    }
+
+    #[test]
+    fn completion_viewport_capped_by_available_terminal_rows() {
+        // 终端只有 12 行时 available=10，即便面板想要更高也不能超过 10。
+        assert_eq!(viewport_height_with_completion(12, 8, Some(50)), 10);
+        // base 本身也受 available 约束。
+        assert_eq!(viewport_height_with_completion(6, 8, None), 4);
     }
 }

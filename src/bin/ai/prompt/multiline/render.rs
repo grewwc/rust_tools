@@ -34,7 +34,8 @@ fn popup_layout_config(
     has_model_label: bool,
 ) -> PopupLayoutConfig {
     let compact_empty = !has_completion_panel && !has_status_msg && current_content.is_empty();
-    let top_margin: u16 = if compact_empty { 0 } else { 1 };
+    // 始终保留 1 行顶部边距，避免空输入 → 有内容时 textarea 整体下移一行的视觉跳变。
+    let top_margin: u16 = 1;
     let help_lines = 2;
     let model_header_lines = if has_model_label { 1 } else { 0 };
     let spacer_lines = if compact_empty {
@@ -625,9 +626,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_prompt_removes_top_gap_without_changing_bottom_chrome() {
+    fn empty_prompt_keeps_consistent_top_margin() {
         let layout = popup_layout_config(8, "", 0, false, false, true);
-        assert_eq!(layout.top_margin, 0);
+        assert_eq!(layout.top_margin, 1);
         assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
         assert_eq!(layout.spacer_lines, 0);
@@ -645,12 +646,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_prompt_cursor_renders_at_first_row_of_viewport() {
-        let backend = TestBackend::new(80, 6);
+    fn empty_prompt_cursor_renders_below_top_margin() {
+        let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::with_options(
             backend,
             TerminalOptions {
-                viewport: Viewport::Inline(4),
+                viewport: Viewport::Inline(8),
             },
         )
         .unwrap();
@@ -670,7 +671,7 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        let expected = Position::new(popup_x + 1, viewport_area.y);
+        let expected = Position::new(popup_x + 1, viewport_area.y + 1);
         terminal.backend_mut().assert_cursor_position(expected);
     }
 }

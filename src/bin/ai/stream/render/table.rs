@@ -928,14 +928,18 @@ mod tests {
         let w2 = visible_width("💧湿度");
         let w3 = visible_width("🍃空气质量");
 
-        assert_eq!(w1, 5); // 1 + 2 + 2
-        assert_eq!(w2, 6); // 2 + 2 + 2
-        assert_eq!(w3, 10); // 2 + 2 + 2 + 2 + 2
+        // 宽度模型对 U+FE0F 一律 +1，把需要 VS16 才呈现成 emoji 的 base 撑到 2 列，
+        // 与真实终端一致。🌧️ = U+1F327(unicode-width=1) + U+FE0F(+1) = 2 列，
+        // "天气" 4 列，合计 6。旧代码把 VS16 当 0 列，🌧️ 只算 1 列，比终端窄 1 列，
+        // 正是表格被硬折行、表头残留堆叠的根因。
+        assert_eq!(w1, 6);
+        assert_eq!(w2, 6); // 💧(2) + 湿(2) + 度(2)
+        assert_eq!(w3, 10); // 🍃(2) + 空气质量(8)
 
         let p1 = pad_cell("🌧️天气", 10, TableAlign::Left);
         let p2 = pad_cell("💧湿度", 10, TableAlign::Left);
 
-        assert_eq!(p1, "🌧️天气     "); // padded 5 spaces
+        assert_eq!(p1, "🌧️天气    "); // padded 4 spaces
         assert_eq!(p2, "💧湿度    "); // padded 4 spaces
     }
 

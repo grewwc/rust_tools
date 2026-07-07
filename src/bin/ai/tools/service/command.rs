@@ -791,6 +791,42 @@ fn find_has_blocked_exec_semantics(tokens: &[String]) -> Option<&str> {
     None
 }
 
+/// 解析 `git` 子命令：跳过出现在子命令之前的 git 全局选项，返回子命令 token
+/// 在 `command_tokens`（首元素为 `git` 本身）中的索引。
+///
+/// 部分 git 全局选项会消费紧随其后的一个参数：`-C <path>`、`-c <name>=<value>`、
+/// `--git-dir <path>`、`--work-tree <path>`、`--namespace <name>`、`--exec-path <path>`。
+/// `=` 附着形式（如 `--git-dir=/repo`、`-C/repo`）不额外消费 token。
+/// `--` 之后的第一个 token 视为子命令。
+fn git_subcommand_index(command_tokens: &[String]) -> Option<usize> {
+    const VALUE_CONSUMING_LONG: &[&str] =
+        &["--git-dir", "--work-tree", "--namespace", "--exec-path"];
+    let mut i = 1usize;
+    while i < command_tokens.len() {
+        let tok = command_tokens[i].as_str();
+        if tok == "--" {
+            return command_tokens.get(i + 1).map(|_| i + 1);
+        }
+        // 非 option token 即为子命令。
+        if !tok.starts_with('-') || tok == "-" {
+            return Some(i);
+        }
+        // `=` 附着形式自带值，无需额外消费下一 token。
+        if tok.contains('=') {
+            i += 1;
+            continue;
+        }
+        let lower = tok.to_ascii_lowercase();
+        // `-C` / `-c` 都消费下一参数（lower 后二者均为 `-c`）。
+        if lower == "-c" || VALUE_CONSUMING_LONG.contains(&lower.as_str()) {
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    None
+}
+
 /// =========================================================================
 /// Shell 注入面检查
 /// =========================================================================
@@ -1113,6 +1149,17 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         ));
     }
 
+    // 安全策略：拦截 `git push`，避免 agent 把本地提交推送到远端仓库。
+    // `git` 本身不在 denied_programs 里（status/log/diff 等子命令无害且必要），
+    // 只对 `push` 子命令硬拦。全局选项变体（`git -C /repo push`）同样命中。
+    if program == "git" {
+        if let Some(idx) = git_subcommand_index(command_tokens) {
+            if command_tokens[idx].eq_ignore_ascii_case("push") {
+                return Err("git push is blocked by sandbox policy".to_string());
+            }
+        }
+    }
+
     // 拦下 `bash -c "..."` / `sh -c` / `zsh -c` 这种"二次解释"形式。
     // 直接执行脚本（`bash script.sh`）仍然允许，避免把脚本参数里的 `-c` 误判为 shell 选项。
     if shell_c_option_present(program, command_tokens) {
@@ -1166,6 +1213,15 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
             return Err(format!(
                 "indirect execution of '{nested}' via '{program}' is blocked"
             ));
+        }
+        // 间接执行 `git push`（如 `env git push`、`xargs git push`）同样需要拦截，
+        // 否则可借包装器绕过直接的 `git push` 检查。
+        if nested == "git" {
+            if let Some(sub_idx) = git_subcommand_index(&command_tokens[idx..]) {
+                if command_tokens[idx + sub_idx].eq_ignore_ascii_case("push") {
+                    return Err("git push is blocked by sandbox policy".to_string());
+                }
+            }
         }
     }
 
@@ -1468,6 +1524,53 @@ mod tests {
         assert!(validate("docker rmi my_image").is_ok());
         assert!(validate("npm rm some-package").is_ok());
         assert!(validate("pip install rsync").is_ok());
+    }
+
+    #[test]
+    fn blocks_git_push_in_all_common_forms() {
+        // 直接调用
+        assert!(validate("git push").is_err());
+        assert!(validate("git push origin main").is_err());
+        assert!(validate("git push --force").is_err());
+        assert!(validate("git push --force-with-lease origin").is_err());
+        assert!(validate("git push -u origin main").is_err());
+        assert!(validate("git push origin --tags").is_err());
+        // 全局选项变体（-C / -c / --git-dir 等）不应绕过检查
+        assert!(validate("git -C /repo push").is_err());
+        assert!(validate("git -C /repo push origin main").is_err());
+        assert!(validate("git -c user.email=a@b.c push").is_err());
+        assert!(validate("git --git-dir=/repo push").is_err());
+        assert!(validate("git --git-dir /repo push").is_err());
+        assert!(validate("git --no-pager push").is_err());
+        // 大小写不敏感
+        assert!(validate("git PUSH origin").is_err());
+        // 绝对/相对路径仍按 basename 识别
+        assert!(validate("/usr/bin/git push").is_err());
+        // 链式命令中的 push 段也要被拦
+        assert!(validate("git status && git push").is_err());
+        assert!(validate("git push && echo done").is_err());
+        // 间接包装器执行 git push 同样拦截
+        assert!(validate("env git push").is_err());
+        assert!(validate("env FOO=1 git push origin main").is_err());
+        assert!(validate("xargs git push").is_err());
+        assert!(validate("nohup git push").is_err());
+        assert!(validate("command git push").is_err());
+    }
+
+    #[test]
+    fn git_non_push_subcommands_remain_allowed() {
+        // 只有 push 被拦，其余 git 子命令保持可用
+        assert!(validate("git status").is_ok());
+        assert!(validate("git log --oneline -5").is_ok());
+        assert!(validate("git diff").is_ok());
+        assert!(validate("git diff --cached").is_ok());
+        assert!(validate("git -C /repo status").is_ok());
+        assert!(validate("git -C /repo log --oneline").is_ok());
+        assert!(validate("git add -A").is_ok());
+        assert!(validate("git commit -m msg").is_ok());
+        // `push` 作为普通文本参数（非子命令）不应误拦
+        assert!(validate("echo git push").is_ok());
+        assert!(validate("printf '%s' push").is_ok());
     }
 
     #[test]

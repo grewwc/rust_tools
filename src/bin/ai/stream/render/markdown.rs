@@ -1910,6 +1910,46 @@ mod tests {
     }
 
     #[test]
+    fn streamed_table_with_emoji_presentation_does_not_duplicate_header() {
+        let _guard = env_guard();
+
+        let md = "\
+## 与 master / 线上兼容性评估
+
+| 改动 | 兼容性 | 风险 |
+| --- | --- | --- |
+| _escape_sql_identifier_inner (v2) | ✅ 向后兼容 | 极低。正常字段名/ID 输出不变，只有包含特殊字符时才转义 |
+| parse_where_clause | ✅ 向后兼容 | 低。仅在解析失败时回退，不影响正常路径 |
+| build_query 组装逻辑 | ⚠️ 需回归 | 中。列顺序变化可能影响依赖隐式顺序的调用方 |
+";
+        for cols in [120usize, 110, 100, 96, 90, 88, 84, 80, 76, 72, 68, 64, 60, 56, 52, 48, 44, 40] {
+            unsafe { std::env::set_var("COLUMNS", cols.to_string()) };
+            let stream = render_full_stream(md, false);
+            let mut grid = VtGrid::new(cols);
+            grid.feed(&stream);
+            let screen = grid.screen();
+            let joined = screen.join("\n");
+
+            let header_count = screen
+                .iter()
+                .filter(|line| {
+                    line.contains("改动") && line.contains("兼容性") && line.contains("风险")
+                })
+                .count();
+            let top_border_count = joined.matches('┌').count();
+            let expected_tables = table_column_ranges("", 3).len();
+            assert_eq!(
+                header_count, expected_tables,
+                "COLUMNS={cols}: header should appear once per split table (expected {expected_tables}), got {header_count}:\n{joined}"
+            );
+            assert_eq!(
+                top_border_count, expected_tables,
+                "COLUMNS={cols}: expected {expected_tables} top borders, got {top_border_count}:\n{joined}"
+            );
+        }
+    }
+
+    #[test]
     fn streamed_comparison_table_keeps_border_columns_aligned() {
         let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "96") };

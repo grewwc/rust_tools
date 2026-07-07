@@ -87,6 +87,24 @@ fn resolve_file_path_arg(args: &Value) -> Result<&str, String> {
         .ok_or_else(|| "Missing file_path".to_string())
 }
 
+/// temp=true 时规范化 file_path：拒绝绝对路径与越界的父目录引用，只保留文件名。
+///
+/// 这样避免 `PathBuf::join` 遇到绝对路径时整体替换 base，把文件误写到项目源码
+/// 目录却仍被注册进 temp registry。模型只需传相对文件名（如 `script.py`）。
+fn temp_file_name(file_path: &str) -> Result<std::path::PathBuf, String> {
+    let p = std::path::Path::new(file_path);
+    if p.is_absolute() {
+        return Err(format!(
+            "temp=true requires a relative filename, got absolute path: {file_path}"
+        ));
+    }
+    // 只取文件名，丢弃任何目录部分，确保落点始终在 per-session temp dir 内。
+    let name = p
+        .file_name()
+        .ok_or_else(|| format!("temp=true requires a file name, got: {file_path}"))?;
+    Ok(std::path::PathBuf::from(name))
+}
+
 fn emit_stream_line(on_chunk: &mut ToolStreamWriter<'_>, line: &str) {
     let mut rendered = line.to_string();
     rendered.push('\n');
@@ -201,9 +219,10 @@ pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
     let is_temp = args["temp"].as_bool().unwrap_or(false);
 
     let resolved_path = if is_temp {
+        let name = temp_file_name(file_path)?;
         let temp_dir = crate::ai::driver::runtime_ctx::temp_dir()
             .map_err(|e| format!("Failed to create temp dir: {}", e))?;
-        temp_dir.join(file_path)
+        temp_dir.join(name)
     } else {
         PathBuf::from(file_path)
     };
@@ -211,7 +230,11 @@ pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
     super::super::undo_tools::snapshot_file_before_write(&resolved_path.to_string_lossy());
 
     let store = FileStore::new(resolved_path);
-    store.validate_write_access().map_err(|e| e.to_string())?;
+    // temp 文件落在 runtime 控制的临时目录（session assets 或系统 temp），不属于
+    // 用户项目空间，跳过沙箱写权限检查（与 tool-overflow 行为一致）。
+    if !is_temp {
+        store.validate_write_access().map_err(|e| e.to_string())?;
+    }
     store.write_all(content).map_err(|e| e.to_string())?;
 
     // temp 文件写入成功后注册到持久化注册表，使其可被 delete_path 清理。
@@ -236,9 +259,10 @@ pub(crate) fn execute_write_file_streaming(
     let content = args["content"].as_str().ok_or("Missing content")?;
     let is_temp = args["temp"].as_bool().unwrap_or(false);
     let resolved_path = if is_temp {
+        let name = temp_file_name(file_path)?;
         let temp_dir = crate::ai::driver::runtime_ctx::temp_dir()
             .map_err(|e| format!("Failed to create temp dir: {}", e))?;
-        temp_dir.join(file_path)
+        temp_dir.join(name)
     } else {
         PathBuf::from(file_path)
     };
@@ -249,8 +273,11 @@ pub(crate) fn execute_write_file_streaming(
     emit_stream_line(on_chunk, "snapshotting previous file state");
     super::super::undo_tools::snapshot_file_before_write(&target);
 
-    emit_stream_line(on_chunk, "validating write access");
-    store.validate_write_access().map_err(|e| e.to_string())?;
+    // temp 文件落在 runtime 控制的临时目录，不属于用户项目空间，跳过沙箱写权限检查。
+    if !is_temp {
+        emit_stream_line(on_chunk, "validating write access");
+        store.validate_write_access().map_err(|e| e.to_string())?;
+    }
 
     emit_stream_line(on_chunk, &format!("writing {} byte(s)", content.len()));
     store.write_all(content).map_err(|e| e.to_string())?;
@@ -272,6 +299,7 @@ pub(crate) fn execute_write_file_streaming(
 mod tests {
     use super::*;
     use crate::ai::test_support::ENV_LOCK;
+    use crate::ai::tools::storage::temp_registry;
     use std::fs;
 
     fn make_temp_path(name: &str) -> PathBuf {
@@ -492,6 +520,69 @@ mod tests {
         assert_eq!(read_back, content);
 
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_temp_file_name_rejects_absolute_path() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let abs = make_temp_path("abs_reject");
+
+        let args = serde_json::json!({
+            "file_path": abs.to_string_lossy(),
+            "content": "x",
+            "temp": true
+        });
+        let result = execute_write_file(&args);
+        assert!(
+            result.is_err(),
+            "temp=true must reject absolute path, got: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("relative filename"),
+            "error should explain relative filename requirement: {err}"
+        );
+        assert!(!abs.exists(), "file must not be created at absolute path");
+    }
+
+    #[test]
+    fn test_temp_file_name_strips_directory_components() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        // 模型可能传 "subdir/script.py"；应只保留文件名，落在 temp dir 根下。
+        let args = serde_json::json!({
+            "file_path": "subdir/script.py",
+            "content": "print('hi')\n",
+            "temp": true
+        });
+        let result = execute_write_file(&args);
+        assert!(result.is_ok(), "write failed: {:?}", result);
+
+        let temp_dir = crate::ai::driver::runtime_ctx::temp_dir().unwrap();
+        let written = temp_dir.join("script.py");
+        assert!(written.exists(), "file should exist at {written:?}");
+        let read_back = fs::read_to_string(&written).unwrap();
+        assert_eq!(read_back, "print('hi')\n");
+        let _ = temp_registry::unregister(&written.display().to_string());
+        let _ = fs::remove_file(&written);
+    }
+
+    #[test]
+    fn test_write_file_temp_relative_filename_writes_to_temp_dir() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let args = serde_json::json!({
+            "file_path": "fixture.json",
+            "content": "{\"k\":1}",
+            "temp": true
+        });
+        let result = execute_write_file(&args);
+        assert!(result.is_ok(), "write failed: {:?}", result);
+
+        let temp_dir = crate::ai::driver::runtime_ctx::temp_dir().unwrap();
+        let written = temp_dir.join("fixture.json");
+        assert!(written.exists(), "file should exist at {written:?}");
+        let _ = temp_registry::unregister(&written.display().to_string());
+        let _ = fs::remove_file(&written);
     }
 
     #[test]

@@ -5,6 +5,14 @@ use crate::ai::stream::render::code::{MONOKAI_BG, MONOKAI_FG};
 /// `width_cjk` 会把所有 ambiguous 字符算成 2 列，导致表格边框、cursor-up 高度整体漂移
 /// （尤其是含 `→` 的单元格右边框被逐行拉偏）。因此这里统一用 `width`（ambiguous=1）。
 pub(super) fn terminal_cell_width(ch: char) -> usize {
+    // Emoji variation selector（U+FE0F）本身宽度 0，但它把前一个 base 符号从
+    // 文本呈现（1 列）强制成 emoji 呈现（2 列）。真实终端据此渲染，例如 `⚠️`
+    // （U+26A0 + U+FE0F）占 2 列。若按 unicode-width 的 0 计算，表格/预览会比
+    // 终端实际显示窄 1 列，导致行被硬折行、cursor-up 擦除行数算少、旧表头残留
+    // 堆叠。这里把 VS16 计为 1 列，等价于给 base 补上被撑开的那一列。
+    if ch == '\u{fe0f}' {
+        return 1;
+    }
     if is_single_width_terminal_symbol(ch) {
         return 1;
     }
@@ -646,6 +654,20 @@ mod tests {
         }
         // 含箭头的结果单元格：3 个可见字符（→ 空格 x）应为 3 列，而非 4。
         assert_eq!(terminal_display_width("→ x"), 3);
+    }
+
+    #[test]
+    fn terminal_width_counts_emoji_presentation_as_double_width() {
+        // 带 emoji variation selector（U+FE0F）的符号，真实终端按 emoji 呈现占 2 列。
+        // `⚠️` = U+26A0 + U+FE0F：base 是 ambiguous(1) + VS16(补 1) = 2 列。
+        assert_eq!(terminal_display_width("⚠️"), 2);
+        // 单独 base（无 VS16）仍是 ambiguous 单列。
+        assert_eq!(terminal_display_width("⚠"), 1);
+        // 本身即 emoji-presentation 的字符（unicode-width 判为 2）不受影响。
+        assert_eq!(terminal_display_width("✅"), 2);
+        assert_eq!(terminal_display_width("❌"), 2);
+        // VS16 单独出现时贡献 1 列（等价于给紧邻 base 补足被撑开的那一列）。
+        assert_eq!(terminal_cell_width('\u{fe0f}'), 1);
     }
 
     #[test]

@@ -208,7 +208,7 @@ pub(crate) fn effective_cwd() -> std::io::Result<PathBuf> {
 // 优先使用 session assets 目录（与 tool-overflow 同源），路径为
 // `~/.history_file.sessions/<session>.assets/tmp/`——落在项目外、按 session
 // 隔离，不污染工作区。当 DRIVER_CTX 不可用（测试 / 一次性调用）时，回退到
-// `<effective_cwd>/.agent_tmp/<session>/`。
+// `<std::env::temp_dir()/.agent_tmp/<session>/`（系统临时目录，不污染项目）。
 //
 // 通过 `write_file(temp=true)` 写入此目录的文件会被记录在持久化注册表
 // （`storage::temp_registry`）中，只有注册表中的文件才能被 `delete_path`
@@ -220,7 +220,7 @@ pub(crate) fn effective_cwd() -> std::io::Result<PathBuf> {
 /// 等需要写入临时文件的场景使用。
 ///
 /// 优先返回 `<sessions_root>/<session>.assets/tmp/`（与 tool-overflow 同源，
-/// 落在项目外），`DRIVER_CTX` 不可用时回退到 `<effective_cwd>/.agent_tmp/<session>/`。
+/// 落在项目外），`DRIVER_CTX` 不可用时回退到 `<std::env::temp_dir()/.agent_tmp/<session>/`。
 pub(crate) fn temp_dir() -> std::io::Result<PathBuf> {
     // 优先使用 session assets 目录（与 tool-overflow 同源），让临时文件
     // 落在项目外、按 session 隔离的 ~/.history_file.sessions/<id>.assets/tmp/。
@@ -234,15 +234,16 @@ pub(crate) fn temp_dir() -> std::io::Result<PathBuf> {
         return Ok(dir);
     }
 
-    // fallback：无 DRIVER_CTX（测试 / 一次性调用）时沿用 effective_cwd 下的 .agent_tmp。
-    let cwd = effective_cwd()?;
+    // fallback：无 DRIVER_CTX（测试 / 一次性调用）时使用系统临时目录，
+    // 不落到 effective_cwd 下，避免污染项目工作区。
+    let base = std::env::temp_dir();
     let session = current_session_id_or_empty();
     let session_part = if session.is_empty() {
         "default".to_string()
     } else {
         session
     };
-    let dir = cwd.join(".agent_tmp").join(session_part);
+    let dir = base.join(".agent_tmp").join(session_part);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
