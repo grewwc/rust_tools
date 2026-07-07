@@ -313,8 +313,10 @@ pub(crate) fn query_daily_breakdown(days: u64) -> Option<Vec<DailyUsage>> {
         Err(p) => p.into_inner(),
     };
     let cutoff = now_secs().saturating_sub(days * 86_400) as i64;
+    // 用 'localtime' 把 UTC epoch 秒转成本地日期再分组，否则 UTC+8 凌晨的调用
+    // 会被归到前一天，导致"今天的用量"显示为昨天。
     let sql = "\
-        SELECT DATE(created_at, 'unixepoch') AS day, \
+        SELECT DATE(created_at, 'unixepoch', 'localtime') AS day, \
                COUNT(*), \
                COALESCE(SUM(input_tokens),0), \
                COALESCE(SUM(output_tokens),0), \

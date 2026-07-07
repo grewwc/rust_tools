@@ -253,14 +253,14 @@ pub fn try_handle_usage_command(input: &str) -> Result<bool, Box<dyn std::error:
     }
 
     if arg.is_empty() {
-        // 默认：精简概览——全部历史 + 最近 7d + 最近 24h 总量 + 近 7 天每日趋势。
+        // 默认：精简概览——全部历史 + 最近 3d + 最近 24h 总量 + 近 3 天每日趋势。
         // 按模型拆分请用 /usage models [Nd]。
         println!();
         print_totals_only(None);
-        print_totals_only(Some(7 * 86_400));
+        print_totals_only(Some(3 * 86_400));
         print_totals_only(Some(86_400));
         println!();
-        print_daily_breakdown(7);
+        print_daily_breakdown(3);
     } else if let Some(sub) = arg.strip_prefix("models") {
         // /usage models [Nd|today|7d|30d|all] —— 按模型拆分，calls 逆序，默认 7d。
         let sub = sub.trim();
