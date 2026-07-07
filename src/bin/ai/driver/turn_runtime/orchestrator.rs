@@ -762,7 +762,7 @@ async fn run_turn_body(
             }
             // 截断重试计数：连续多次被截断（输出上限/工具 JSON 半截）仍无法收敛时
             // 放弃，避免无限重试烧预算。阈值取 3：给模型两次收缩重写的机会。
-            if matches!(execution, IterationExecution::Truncated(_)) {
+            if let IterationExecution::Truncated(stream_result) = &execution {
                 consecutive_truncations += 1;
                 // 把本 turn 后续请求的 reasoning effort 降到 Low：high-effort 下模型
                 // 会先产出大量 reasoning token，挤占输出预算，是长文档/大文件写入被
@@ -770,15 +770,35 @@ async fn run_turn_body(
                 // resolve_reasoning_effort 每次迭代实时读该字段，改了立即对下一次生效。
                 app.cli.reasoning_effort_override =
                     Some(Some(crate::ai::provider::ReasoningEffort::Low));
+                let partial_text = stream_result.assistant_text.trim();
+                let has_visible_text = !partial_text.is_empty();
+
+                // 模型已产出可见文本但仍撞长度上限（典型：推理模型 reasoning 占满
+                // 预算）。继续重试通常无帮助——模型会反复产出同样长度的内容。
+                // 给一次降档重试机会后即接受部分文本作为最终回答。
+                if has_visible_text && consecutive_truncations >= 8 {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  ▲ 连续 {} 次输出被截断，保留已产出的部分文本",
+                        consecutive_truncations
+                    );
+                    final_assistant_text = partial_text.to_string();
+                    break 'turn Ok(None);
+                }
+
                 if consecutive_truncations > 3 {
                     let _ = writeln!(
                         std::io::stderr(),
                         "  ✗ 连续 {} 次响应被截断，停止重试",
                         consecutive_truncations
                     );
-                    final_assistant_text =
+                    // 保留模型已产出的部分文本（若有），比直接丢弃更有价值。
+                    final_assistant_text = if has_visible_text {
+                        partial_text.to_string()
+                    } else {
                         "[模型输出多次被截断，请缩小单次操作规模（如分块写文件）或切换模型]"
-                            .to_string();
+                            .to_string()
+                    };
                     break 'turn Ok(None);
                 }
             } else {
