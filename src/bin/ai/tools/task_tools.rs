@@ -218,15 +218,43 @@ fn prune_completed_tasks(registry: &mut SkipMap<String, AsyncTaskEntry>) {
     if registry.len() <= MAX_TASK_REGISTRY_SIZE {
         return;
     }
-    // 收集 (key, started_at) 后按时间排序，一次性删除最老的 N 个，
-    // 避免每次循环都做 O(n) 的 min_by_key 全量扫描造成的 O(n²) 复杂度。
-    let mut entries: Vec<(String, Instant)> = registry
-        .iter()
-        .map(|(k, v)| (k.clone(), v.started_at))
-        .collect();
-    entries.sort_by_key(|(_, t)| *t);
-    let to_remove = registry.len() - MAX_TASK_REGISTRY_SIZE;
-    for (key, _) in entries.into_iter().take(to_remove) {
+    // 仅驱逐已完成的任务（process 已终止），绝不驱逐仍在运行的任务。
+    // 注意：这里只从注册表中移除条目，内核 channel/futex 的释放由 task_wait /
+    // task_status 的正常收集路径完成。如果 process 已终止但结果未被收集，
+    // 下次 task_wait 会进入失败路径并释放 channel/futex（包括 producer holder）。
+    // 按时间排序避免 O(n²) 全量扫描。
+    let now = Instant::now();
+    let mut candidates: Vec<(String, Instant)> = Vec::new();
+    for (key, entry) in registry.iter() {
+        // 通过 kernel 检查进程是否已终止；若无法访问 kernel 则保守跳过。
+        let terminated = with_os_kernel(|os| {
+            match os.get_process(entry.pid) {
+                None => Ok(true),  // 进程不存在 → 已终止
+                Some(proc) => Ok(matches!(
+                    proc.state,
+                    ProcessState::Terminated
+                )),
+            }
+        }).unwrap_or(false);
+        if terminated {
+            candidates.push((key.clone(), entry.started_at));
+        }
+    }
+    candidates.sort_by_key(|(_, t)| *t);
+    let to_remove = candidates.len().min(registry.len().saturating_sub(MAX_TASK_REGISTRY_SIZE));
+    let _ = now; // suppress unused
+    for (key, _) in candidates.into_iter().take(to_remove) {
+        // 在移除注册表条目前，尝试释放内核资源（best-effort）。
+        if let Some(entry) = registry.get_ref(&key) {
+            let _ = with_os_kernel(|os| {
+                let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
+                let _ = os.channel_release_named(ChannelId(entry.result_channel_id), "task_result.consumer");
+                let _ = os.channel_release_named(ChannelId(entry.result_channel_id), "task_result.producer");
+                let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
+                let _ = os.futex_destroy(entry.completion_futex_addr);
+                Ok::<(), String>(())
+            });
+        }
         registry.remove(&key);
     }
 }
@@ -1556,11 +1584,18 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 // Process is no longer pending and never wrote a result.
                 // Treat as failed-without-output and free the kernel
                 // resources so we do not leak channels/futexes.
+               // 子 agent 进程终止但未发布结果时，它不会运行自己的清理代码
+               // 来释放 producer holder，因此这里必须同时释放 consumer 和 producer，
+               // 否则 channel_destroy 因 ref_count != 0 失败，channel + futex 永久泄漏。
                 let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
                 let _ = os.channel_release_named(
                     ChannelId(entry.result_channel_id),
                     "task_result.consumer",
                 );
+               let _ = os.channel_release_named(
+                   ChannelId(entry.result_channel_id),
+                   "task_result.producer",
+               );
                 let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
                 let _ = os.futex_destroy(entry.completion_futex_addr);
                 ready.push(format!(
@@ -1589,45 +1624,10 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 WaitPolicy::Any,
                 timeout_ticks,
             )?;
-            if wait.suspended {
-                // 当前进程是 **协作式让出（suspend）**：kernel 已把前台进程置为
-                // Waiting 并交还调度权，好让后台 subagent 真正获得 CPU 去跑。等
-                // subagent 把结果写回 channel / 触发 futex 后，调度器会重新唤醒本
-                // 进程；被唤醒后应重新调用 task_wait 收集 channel 中的结果。
-                //
-                // ⚠️ 这里 **绝不能** 用 "BUDGET ELAPSED" 之类的终态措辞：suspend 是
-                // 毫秒级同步返回的（不是真的等满 timeout_secs），如果告诉模型
-                // "等待预算已耗尽、子任务仍在后台" ，模型会把"刚发起等待就超时"
-                // 误判成"子任务卡住"，从而提前放弃并转手动分析（本 bug 的根因）。
-                // 所以这里只透出已收集到的结果（如有），并用中性的 "PARKED" 措辞
-                // 说明这是正常的调度让出。
-                let mut parts = Vec::new();
-                if !ready.is_empty() {
-                    parts.push(ready.join("\n\n---\n\n"));
-                }
-                let policy_label = match wait_policy {
-                    WaitPolicy::Any => "any",
-                    WaitPolicy::All => "all",
-                };
-                parts.push(format!(
-                    "[task_wait PARKED] Yielded CPU so {} pending subagent task(s) can run. \
-                    This is normal cooperative scheduling, NOT a timeout and NOT a stall — the wait budget \
-                    ({timeout_secs}s, wait_policy={policy_label}) has NOT elapsed. The scheduler will wake this \
-                    agent as soon as a result is ready. \
-                    Pending task_ids: [{}]. event_ids={}. \
-                    Do NOT assume the subagents are stuck and do NOT abandon them to work around this; \
-                    when woken, re-call `task_wait` with the same task_ids to collect results, or use \
-                    `task_status` for a non-blocking snapshot.",
-                    pending_ids.len(),
-                    pending_ids.join(", "),
-                    wait.event_ids
-                        .iter()
-                        .map(|id| id.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-                return Ok(Some(parts.join("\n\n---\n\n")));
-            }
+            // 无论 epoll_wait_many 是否 suspended，都先 re-scan 收集在等待期间
+            // 变为就绪的结果。如果 suspended 且所有任务都已完成，直接返回结果
+            // （而不是 PARKED），避免 wait_policy=all 时模型被迫反复调用 task_wait。
+            // 仅当 re-scan 后仍有 pending 且确为 suspended 时才返回 PARKED。
             pending.clear();
             for tid in &pending_ids {
                 let entry = registry.get_ref(tid).expect("validated after wait");
@@ -1649,6 +1649,10 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                         ChannelId(entry.result_channel_id),
                         "task_result.consumer",
                     );
+                   let _ = os.channel_release_named(
+                       ChannelId(entry.result_channel_id),
+                       "task_result.producer",
+                   );
                     let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
                     let _ = os.futex_destroy(entry.completion_futex_addr);
                     ready.push(format!(
@@ -1657,6 +1661,41 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                     ));
                     finished.push(tid.clone());
                 }
+            }
+            // Re-scan 后仍有 pending 且确为 suspend（协作式让出，非预算耗尽），
+            // 返回 PARKED 并附带已收集的部分结果。这里 **绝不能** 用
+            // "BUDGET ELAPSED" 之类的终态措辞：suspend 是毫秒级同步返回的（不是
+            // 真的等满 timeout_secs），否则模型会把"刚发起等待就超时"误判成
+            // "子任务卡住"，从而提前放弃并转手动分析。
+            if !pending.is_empty() && wait.suspended {
+                let mut parts = Vec::new();
+                if !ready.is_empty() {
+                    parts.push(ready.join("\n\n---\n\n"));
+                }
+                let policy_label = match wait_policy {
+                    WaitPolicy::Any => "any",
+                    WaitPolicy::All => "all",
+                };
+                let still_pending: Vec<&str> =
+                    pending.iter().map(|(tid, _)| tid.as_str()).collect();
+                parts.push(format!(
+                    "[task_wait PARKED] Yielded CPU so {} pending subagent task(s) can run. \
+                    This is normal cooperative scheduling, NOT a timeout and NOT a stall — the wait budget \
+                    ({timeout_secs}s, wait_policy={policy_label}) has NOT elapsed. The scheduler will wake this \
+                    agent as soon as a result is ready. \
+                    Pending task_ids: [{}]. event_ids={}. \
+                    Do NOT assume the subagents are stuck and do NOT abandon them to work around this; \
+                    when woken, re-call `task_wait` with the same task_ids to collect results, or use \
+                    `task_status` for a non-blocking snapshot.",
+                    still_pending.len(),
+                    still_pending.join(", "),
+                    wait.event_ids
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                return Ok(Some(parts.join("\n\n---\n\n")));
             }
         }
         Ok(None)
