@@ -156,6 +156,7 @@ fn inject_task_anchor_note(
 #[derive(Default)]
 struct TurnSupervisor {
     iteration: usize,
+    skip_tool_signature_rounds: usize,
     loop_breaker_injected: bool,
     hard_loop_stop_injected: bool,
     coarse_loop_note_injected: bool,
@@ -197,10 +198,33 @@ impl TurnSupervisor {
         self.last_compress_after_chars = after_chars;
     }
 
+    /// 截断重试时重置工具循环检测状态：截断是外部约束（输出上限 / 模型可用性波动），
+    /// 重试时重复调用相同工具属于预期行为，不应计入循环检测窗口。
+    /// 截断本身已有独立的 `consecutive_truncations` 上限兜底，不需要循环检测再叠加。
+    ///
+    /// 清空历史 + 跳过当前迭代的签名记录，使截断重试不被误判为循环。
+    /// 重置所有一次性标志：截断清空历史后，soft/coarse/hard 的完整升级阶梯
+    /// 应从零重新开始，否则截断恢复后形成的新循环会跳过 soft 提示直接到 hard-stop。
+    fn mark_truncation_skip(&mut self) {
+        self.tool_signature_history.clear();
+        self.tool_signature_history_coarse.clear();
+        self.skip_tool_signature_rounds += 1;
+        self.hard_loop_stop_injected = false;
+        self.loop_breaker_injected = false;
+        self.coarse_loop_note_injected = false;
+    }
+
     fn record_tool_signatures(
         &mut self,
         messages: &[crate::ai::history::Message],
     ) -> ToolLoopSignal {
+        // 截断重试跳过：清空历史后不记录本轮签名，避免截断重试
+        // 被误判为工具循环。`skip_tool_signature_rounds` 由
+        // `mark_truncation_skip()` 递增，每跳过一次递减。
+        if self.skip_tool_signature_rounds > 0 {
+            self.skip_tool_signature_rounds -= 1;
+            return ToolLoopSignal::None;
+        }
         let Some(sigs) = extract_round_tool_signatures(messages) else {
             return ToolLoopSignal::None;
         };
@@ -455,6 +479,76 @@ mod tests {
             signals[TOOL_LOOP_HARD_WINDOW - 1],
             ToolLoopSignal::Hard
         ));
+    }
+
+    #[test]
+    fn mark_truncation_skip_resets_full_loop_detection_ladder() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let assistant_with_read = |id: &str| crate::ai::history::Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: "{\"path\":\"src/main.rs\"}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+
+        // 第一轮：积累到 soft 触发。
+        for i in 0..TOOL_LOOP_SOFT_WINDOW {
+            messages.push(assistant_with_read(&format!("tc-{i}")));
+            supervisor.record_tool_signatures(&messages);
+        }
+        // 验证 soft 已触发，flag 已设置。
+        assert!(supervisor.loop_breaker_injected);
+        assert!(!supervisor.hard_loop_stop_injected);
+
+        // 截断触发标记：历史清空，skip +1，所有 flag 重置。
+        supervisor.mark_truncation_skip();
+        assert!(supervisor.tool_signature_history.is_empty());
+        assert!(supervisor.tool_signature_history_coarse.is_empty());
+        assert_eq!(supervisor.skip_tool_signature_rounds, 1);
+        // 关键验证：所有一次性标志都被重置。
+        assert!(!supervisor.hard_loop_stop_injected);
+        assert!(!supervisor.loop_breaker_injected);
+        assert!(!supervisor.coarse_loop_note_injected);
+
+        // 截断迭代：跳过签名记录。
+        messages.push(assistant_with_read("tc-skip"));
+        let signal = supervisor.record_tool_signatures(&messages);
+        assert!(matches!(signal, ToolLoopSignal::None));
+        assert!(supervisor.tool_signature_history.is_empty());
+        assert_eq!(supervisor.skip_tool_signature_rounds, 0);
+
+        // 第二轮：恢复后重新积累，验证 soft 能再次触发。
+        for i in 0..TOOL_LOOP_SOFT_WINDOW {
+            messages.push(assistant_with_read(&format!("tc2-{i}")));
+            let signal = supervisor.record_tool_signatures(&messages);
+            if i == TOOL_LOOP_SOFT_WINDOW - 1 {
+                // 第 4 次应触发 soft。
+                assert!(matches!(signal, ToolLoopSignal::Soft));
+                assert!(supervisor.loop_breaker_injected);
+            } else {
+                assert!(matches!(signal, ToolLoopSignal::None));
+            }
+        }
+
+        // 继续积累到 hard 触发，验证完整升级阶梯恢复。
+        for i in 0..(TOOL_LOOP_HARD_WINDOW - TOOL_LOOP_SOFT_WINDOW) {
+            messages.push(assistant_with_read(&format!("tc3-{i}")));
+            let signal = supervisor.record_tool_signatures(&messages);
+            if i == (TOOL_LOOP_HARD_WINDOW - TOOL_LOOP_SOFT_WINDOW - 1) {
+                // 第 6 次应触发 hard。
+                assert!(matches!(signal, ToolLoopSignal::Hard));
+                assert!(supervisor.hard_loop_stop_injected);
+            }
+        }
     }
 
     #[test]
@@ -764,6 +858,9 @@ async fn run_turn_body(
             // 放弃，避免无限重试烧预算。阈值取 3：给模型两次收缩重写的机会。
             if let IterationExecution::Truncated(stream_result) = &execution {
                 consecutive_truncations += 1;
+                // 重置工具循环检测：截断重试期间的重复调用是预期行为，
+                // 不应被误判为工具死循环并触发 hard-stop 强制收敛。
+                supervisor.mark_truncation_skip();
                 // 把本 turn 后续请求的 reasoning effort 降到 Low：high-effort 下模型
                 // 会先产出大量 reasoning token，挤占输出预算，是长文档/大文件写入被
                 // 截断的常见诱因。降档把预算让给实际内容，配合收缩提示提升收敛概率。

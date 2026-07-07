@@ -79,6 +79,12 @@ Do not run the full workspace `cargo check`, `cargo test`, or other verification
     optional afterthought. If a change touches module layout, build/test
     commands, invariants, subsystem rules, or on-demand guide references,
     update the corresponding `AGENTS.md` in the same task — do not defer it.
+12. Instruction docs are living documents, not append-only logs. When updating
+    any `AGENTS.md`, actively review and **delete or revise** content that has
+    become stale, superseded, or redundant — do not merely add new text on top.
+    Outdated rules that contradict current behavior are worse than missing rules:
+    they mislead and dilute the signal. If a rule no longer applies, remove it;
+    if it partially applies, rewrite it. Keep every file lean.
 
 ## High-Value Pitfalls
 
@@ -120,7 +126,8 @@ change affects any of: module layout, build/test commands, invariants,
 subsystem rules, or on-demand guide references. If none apply, stop here.
 
 **Step 2 — Update the nearest scoped `AGENTS.md`.** Add or revise the local
-rule that now describes the changed behavior. Keep it short; move long
+rule that now describes the changed behavior. **Remove or rewrite rules that no
+longer match current behavior** — do not leave stale text. Keep it short; move long
 explanations to `docs/agent-guides/*.md` and reference them from the scoped
 file.
 
