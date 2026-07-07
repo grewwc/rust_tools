@@ -8,17 +8,29 @@ use tui_textarea::{CursorMove, Input, TextArea};
 use uuid::Uuid;
 
 use super::{
-    completion_panel::{
-        apply_multiline_completion, confirm_completion_selection, dismiss_completion_panel,
-        move_completion_selection, CompletionPanel, PendingTabCompletion,
-    },
     MultilineHistoryState,
+    completion_panel::{
+        CompletionPanel, PendingTabCompletion, apply_multiline_completion,
+        confirm_completion_selection, dismiss_completion_panel, move_completion_selection,
+    },
 };
 use crate::clipboardw::{image_content, string_content};
 
 pub(in crate::ai::prompt::multiline) enum EventLoopAction {
     Continue,
     Submit(Option<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::ai::prompt::multiline) enum RecentTextInputSource {
+    KeyPress,
+    Paste,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::ai::prompt::multiline) struct RecentTextInput {
+    text: String,
+    source: RecentTextInputSource,
 }
 
 pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
@@ -28,13 +40,22 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
     status_msg: &mut Option<String>,
     pending_tab_completion: &mut Option<PendingTabCompletion>,
     completion_panel: &mut Option<CompletionPanel>,
+    recent_text_input: &mut Option<RecentTextInput>,
     session_image_dir: &Path,
 ) -> io::Result<EventLoopAction> {
     match event {
         Event::Paste(pasted) => {
+            if should_skip_duplicate_text_input(
+                recent_text_input,
+                &pasted,
+                RecentTextInputSource::Paste,
+            ) {
+                return Ok(EventLoopAction::Continue);
+            }
             dismiss_completion_panel(pending_tab_completion, completion_panel);
             match save_clipboard_images(session_image_dir) {
                 Ok(paths) if !paths.is_empty() => {
+                    recent_text_input.take();
                     for path in paths {
                         let placeholder = image_placeholder(&path);
                         insert_text(textarea, &placeholder);
@@ -49,6 +70,9 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
         Event::Key(key) => {
             *status_msg = None;
             if matches!(key.kind, KeyEventKind::Release) {
+                return Ok(EventLoopAction::Continue);
+            }
+            if should_skip_non_ascii_repeat_or_duplicate_press(recent_text_input, key) {
                 return Ok(EventLoopAction::Continue);
             }
             if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
@@ -224,17 +248,109 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
                         return Ok(EventLoopAction::Continue);
                     }
 
+                    remember_trackable_key_press(recent_text_input, key);
                     textarea.input(Input::from(key));
                     Ok(EventLoopAction::Continue)
                 }
             }
         }
         Event::Resize(_, _) => {
+            recent_text_input.take();
             *completion_panel = None;
             Ok(EventLoopAction::Continue)
         }
-        _ => Ok(EventLoopAction::Continue),
+        _ => {
+            recent_text_input.take();
+            Ok(EventLoopAction::Continue)
+        }
     }
+}
+
+fn normalize_trackable_text_input(text: &str) -> Option<String> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let char_count = normalized.chars().count();
+    if normalized.is_empty()
+        || normalized.contains('\n')
+        || char_count > 16
+        || !normalized.chars().any(|ch| !ch.is_ascii())
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+fn should_skip_duplicate_text_input(
+    recent_text_input: &mut Option<RecentTextInput>,
+    text: &str,
+    source: RecentTextInputSource,
+) -> bool {
+    let Some(normalized) = normalize_trackable_text_input(text) else {
+        recent_text_input.take();
+        return false;
+    };
+
+    if recent_text_input
+        .as_ref()
+        .map(|last| last.text == normalized && last.source != source)
+        .unwrap_or(false)
+    {
+        recent_text_input.take();
+        return true;
+    }
+
+    *recent_text_input = Some(RecentTextInput {
+        text: normalized,
+        source,
+    });
+    false
+}
+
+fn should_skip_non_ascii_repeat_or_duplicate_press(
+    recent_text_input: &mut Option<RecentTextInput>,
+    key: KeyEvent,
+) -> bool {
+    let KeyCode::Char(ch) = key.code else {
+        recent_text_input.take();
+        return false;
+    };
+    let Some(normalized) = normalize_trackable_text_input(&ch.to_string()) else {
+        recent_text_input.take();
+        return false;
+    };
+
+    if matches!(key.kind, KeyEventKind::Repeat) {
+        return true;
+    }
+
+    if matches!(key.kind, KeyEventKind::Press)
+        && recent_text_input
+            .as_ref()
+            .map(|last| last.text == normalized && last.source == RecentTextInputSource::Paste)
+            .unwrap_or(false)
+    {
+        recent_text_input.take();
+        return true;
+    }
+
+    false
+}
+
+fn remember_trackable_key_press(recent_text_input: &mut Option<RecentTextInput>, key: KeyEvent) {
+    let KeyCode::Char(ch) = key.code else {
+        recent_text_input.take();
+        return;
+    };
+    if !matches!(key.kind, KeyEventKind::Press) {
+        return;
+    }
+    let Some(normalized) = normalize_trackable_text_input(&ch.to_string()) else {
+        recent_text_input.take();
+        return;
+    };
+    *recent_text_input = Some(RecentTextInput {
+        text: normalized,
+        source: RecentTextInputSource::KeyPress,
+    });
 }
 
 fn textarea_content(textarea: &TextArea<'_>) -> String {
@@ -329,18 +445,23 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn apply_key(textarea: &mut TextArea<'_>, key: KeyEvent) {
+    fn apply_event(
+        textarea: &mut TextArea<'_>,
+        recent_text_input: &mut Option<RecentTextInput>,
+        event: Event,
+    ) {
         let mut history = MultilineHistoryState::new(Vec::new());
         let mut status_msg = None;
         let mut pending_tab_completion = None;
         let mut completion_panel = None;
         let action = handle_multiline_event(
-            Event::Key(key),
+            event,
             textarea,
             &mut history,
             &mut status_msg,
             &mut pending_tab_completion,
             &mut completion_panel,
+            recent_text_input,
             Path::new("/tmp"),
         )
         .unwrap();
@@ -362,40 +483,128 @@ mod tests {
     #[test]
     fn chinese_ime_press_release_does_not_insert_twice() {
         let mut textarea = TextArea::default();
+        let mut recent_text_input = None;
 
-        apply_key(
+        apply_event(
             &mut textarea,
-            KeyEvent::new_with_kind(KeyCode::Char('中'), KeyModifiers::NONE, KeyEventKind::Press),
+            &mut recent_text_input,
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('中'),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )),
         );
-        apply_key(
+        apply_event(
             &mut textarea,
-            KeyEvent::new_with_kind(
+            &mut recent_text_input,
+            Event::Key(KeyEvent::new_with_kind(
                 KeyCode::Char('中'),
                 KeyModifiers::NONE,
                 KeyEventKind::Release,
-            ),
+            )),
         );
 
         assert_eq!(textarea.lines(), &["中".to_string()]);
     }
 
     #[test]
-    fn key_repeat_still_inserts_repeated_character() {
+    fn non_ascii_key_repeat_is_ignored_to_avoid_ime_duplicates() {
         let mut textarea = TextArea::default();
+        let mut recent_text_input = None;
 
-        apply_key(
+        apply_event(
             &mut textarea,
-            KeyEvent::new_with_kind(KeyCode::Char('哈'), KeyModifiers::NONE, KeyEventKind::Press),
+            &mut recent_text_input,
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('哈'),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )),
         );
-        apply_key(
+        apply_event(
             &mut textarea,
-            KeyEvent::new_with_kind(
+            &mut recent_text_input,
+            Event::Key(KeyEvent::new_with_kind(
                 KeyCode::Char('哈'),
                 KeyModifiers::NONE,
                 KeyEventKind::Repeat,
-            ),
+            )),
         );
 
-        assert_eq!(textarea.lines(), &["哈哈".to_string()]);
+        assert_eq!(textarea.lines(), &["哈".to_string()]);
+    }
+
+    #[test]
+    fn ascii_key_repeat_still_inserts_repeated_character() {
+        let mut textarea = TextArea::default();
+        let mut recent_text_input = None;
+
+        apply_event(
+            &mut textarea,
+            &mut recent_text_input,
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )),
+        );
+        apply_event(
+            &mut textarea,
+            &mut recent_text_input,
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            )),
+        );
+
+        assert_eq!(textarea.lines(), &["aa".to_string()]);
+    }
+
+    #[test]
+    fn chinese_paste_then_key_press_is_deduped() {
+        let mut textarea = TextArea::default();
+        let mut recent_text_input = None;
+
+        assert!(!should_skip_duplicate_text_input(
+            &mut recent_text_input,
+            "中",
+            RecentTextInputSource::Paste,
+        ));
+        insert_text(&mut textarea, "中");
+        apply_event(
+            &mut textarea,
+            &mut recent_text_input,
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('中'),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )),
+        );
+
+        assert_eq!(textarea.lines(), &["中".to_string()]);
+    }
+
+    #[test]
+    fn chinese_key_press_then_paste_is_deduped() {
+        let mut textarea = TextArea::default();
+        let mut recent_text_input = None;
+
+        apply_event(
+            &mut textarea,
+            &mut recent_text_input,
+            Event::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('中'),
+                KeyModifiers::NONE,
+                KeyEventKind::Press,
+            )),
+        );
+        assert!(should_skip_duplicate_text_input(
+            &mut recent_text_input,
+            "中",
+            RecentTextInputSource::Paste,
+        ));
+
+        assert_eq!(textarea.lines(), &["中".to_string()]);
     }
 }

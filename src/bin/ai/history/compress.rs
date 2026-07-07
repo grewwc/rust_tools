@@ -681,24 +681,40 @@ pub(in crate::ai) fn mid_turn_compress(
     (out, before, after)
 }
 
-/// Mid-turn LLM 摘要兜底：无损/弱损管线之后仍超阈值时调用。两条互补路径：
+/// LLM 摘要"有效压缩"的最小净下降量（字符）。低于此值视为 no-op，
+/// `did_summarize` 返回 false，避免调用方误存游标抑制后续重试。
+/// 取 `summary_max_chars` 同量级：若净下降还不如注入的摘要文本大，
+/// 说明压缩器空转（典型症状："295K 压到 294K 就停了"）。
+const MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS: usize = 4_000;
+
+/// Path C 兜底：对尾窗内单个超大非 system 消息做 head+tail 截断时的单条上限。
+/// 仅在渐进式折叠后仍超 `hard_target` 时触发——宁可截断也不能让模型 4xx。
+const PATH_C_PER_MSG_CAP: usize = 8_000;
+
+/// Mid-turn LLM 摘要兜底：无损/弱损管线之后仍超阈值时调用。三条互补路径：
 ///   - Path A（跨轮摘要）：最近 `keep_recent_turns` 个 user 轮之前若还有对话，
 ///     调 LLM 摘要器把那段压成单条 `internal_note` 注入到尾窗前；同时对尾窗
-///     内部较早的工具组做折叠（见 Path B），避免"臃肿全在最近一轮"时压不动。
-///   - Path B（单轮内折叠）：当没有跨轮对话可摘要（单个 user 轮里堆了数百次
-///     工具迭代），或跨轮摘要调用失败/为空时，退化为把当前轮内较早的
-///     assistant(tool_calls)+tool 组整组折叠成单行 stub（保留 user 消息与最近
-///     若干工具组逐字）。整组一起替换，不破坏 assistant.tool_calls ↔ tool 配对。
+///     内部较早的工具组做折叠，避免"臃肿全在最近一轮"时压不动。
+///   - Path B+C（渐进式折叠）：从 `keep_recent=4` 开始（等价于原 Path B），
+///     逐步缩小保护窗口到 2→1→0，直到有效压缩或降至 `hard_target` 以下。
+///     解决"臃肿全在保护尾窗内、早期历史已压无可压"时压缩器空转的问题。
+///   - Path C 兜底（per-message 截断）：渐进式折叠后仍超 `hard_target` 时，
+///     对尾窗内单个超大非 system 消息做 head+tail 截断。这是绝对最后手段。
 /// 头部所有 system / internal_note（agent 指令、工具列表、全局指引）始终原样保留。
 /// 返回 `(messages_after, before, after, did_summarize)`；`did_summarize` 仅在
-/// 确有体积下降时为 true，避免调用方误存游标抑制后续重试。
+/// 净下降 ≥ [`MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS`] 时为 true，避免调用方误存
+/// 游标抑制后续重试。
 pub(in crate::ai) async fn mid_turn_llm_summarize(
     app: &App,
     messages: Vec<Message>,
     keep_recent_turns: usize,
     summary_max_chars: usize,
+    hard_target: usize,
 ) -> (Vec<Message>, usize, usize, bool) {
     let before = messages_total_chars(&messages);
+    // best 追踪迄今为止体积最小的结果；None 表示仍使用原始 messages。
+    let mut best: Option<Vec<Message>> = None;
+    let mut best_after = before;
 
     // === Path A：跨轮 LLM 摘要 ===
     let split_at = retained_turn_start(&messages, keep_recent_turns);
@@ -740,23 +756,92 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 );
                 out.extend(tail);
                 let after = messages_total_chars(&out);
-                if after < before {
-                    return (out, before, after, true);
+                if after < best_after {
+                    best = Some(out);
+                    best_after = after;
+                }
+                // 有效压缩且达标 → 直接返回
+                if before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS
+                    && best_after <= hard_target
+                {
+                    return (best.unwrap(), before, best_after, true);
                 }
             }
         }
     }
 
-    // === Path B：单轮内折叠 ===
-    // 没有跨轮对话可摘要（臃肿全在当前轮），或跨轮摘要失败/为空时的确定性兜底：
-    // 把较早的工具组折叠成 stub，保留 user 消息与最近若干工具组逐字。
-    let (folded, folded_groups) =
-        fold_early_tool_groups(&messages, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS);
-    let after = messages_total_chars(&folded);
-    if folded_groups == 0 || after >= before {
-        return (messages, before, before, false);
+    // === Path B+C：渐进式工具组折叠 ===
+    // 从 keep_recent=4（等价于原 Path B）开始，逐步缩小保护窗口到 2→1→0，
+    // 直到有效压缩或降至 hard_target 以下。解决"臃肿全在保护尾窗内"时空转。
+    // 在 best（Path A 结果或原始 messages）上链式折叠：已折叠的组变成 stub
+    //（internal_note），不会被 fold_early_tool_groups 再次匹配，因此每次迭代
+    // 只会折叠上一轮保留的组，逐步释放保护尾窗。
+    for &keep_recent in &[
+        MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS,
+        2,
+        1,
+        0,
+    ] {
+        if best_after <= hard_target {
+            break;
+        }
+        let current = best.as_ref().unwrap_or(&messages);
+        let (folded, folded_groups) = fold_early_tool_groups(current, keep_recent);
+        if folded_groups == 0 {
+            continue;
+        }
+        let after = messages_total_chars(&folded);
+        if after < best_after {
+            best = Some(folded);
+            best_after = after;
+        }
     }
-    (folded, before, after, true)
+
+    // 有效压缩 → 返回（无论是否达标 hard_target，只要净下降够大就算成功）
+    if before.saturating_sub(best_after) >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS {
+        return (best.unwrap_or(messages), before, best_after, true);
+    }
+
+    // === Path C 兜底：per-message 截断 ===
+    // 渐进式折叠后仍超 hard_target 且未达有效压缩：对尾窗内单个超大非 system
+    // 消息做 head+tail 截断。典型场景：最近一轮对话本身就很大（巨型 user 消息
+    // 或大量近期工具结果），早期历史已压无可压，臃肿全在保护尾窗内。
+    // 这是绝对最后手段——宁可截断也不能让模型 4xx。
+    if best_after > hard_target {
+        let current = best.unwrap_or(messages);
+        let capped = cap_oversized_non_system_messages(current, PATH_C_PER_MSG_CAP);
+        let after = messages_total_chars(&capped);
+        let savings = before.saturating_sub(after);
+        return (capped, before, after, savings >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS);
+    }
+
+    // 所有路径均未达到有效压缩：返回最佳结果，did_summarize=false
+    let result = best.unwrap_or(messages);
+    (result, before, best_after, false)
+}
+
+/// Path C 兜底：对序列中单个超大非 system 消息做 head+tail 截断。
+/// 仅在渐进式折叠后仍超 `hard_target` 时由 [`mid_turn_llm_summarize`] 调用。
+/// system / agent 指令永不截断；图片按名义计费（≤ PATH_C_PER_MSG_CAP）天然跳过。
+fn cap_oversized_non_system_messages(
+    mut messages: Vec<Message>,
+    per_msg_cap: usize,
+) -> Vec<Message> {
+    for message in &mut messages {
+        if is_system_like_role(&message.role) {
+            continue;
+        }
+        let chars = value_len_chars(&message.content);
+        if chars <= per_msg_cap {
+            continue;
+        }
+        let text = value_to_string(&message.content);
+        let capped = keep_ends_by_chars(&text, per_msg_cap);
+        message.content = Value::String(format!(
+            "[context-overflow-truncated] 原文 {chars} 字符已截断为 head+tail 预览：\n{capped}"
+        ));
+    }
+    messages
 }
 
 /// 单张图片在「字符预算」里的名义计费。

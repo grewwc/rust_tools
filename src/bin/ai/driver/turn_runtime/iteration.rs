@@ -357,6 +357,7 @@ async fn request_model_response(
                 drained,
                 MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
                 MID_TURN_LLM_SUMMARY_MAX_CHARS,
+                app.config.history_max_chars,
             )
             .await;
         *messages = after_msgs;

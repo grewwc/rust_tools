@@ -885,6 +885,7 @@ async fn run_turn_body(
                         drained,
                         MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
                         MID_TURN_LLM_SUMMARY_MAX_CHARS,
+                        history_max_chars,
                     )
                     .await;
                 messages = after_msgs;

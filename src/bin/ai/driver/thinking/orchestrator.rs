@@ -410,7 +410,7 @@ fn maybe_spawn_llm_refine(result: &GeneralizeResult) {
     // 默认开启；显式设为 false 时关闭。
     let enabled = cfg
         .get_opt(AiConfig::GENERALIZE_LLM_REFINE_ENABLE)
-        .map(|v| !v.trim().eq_ignore_ascii_case("false"))
+        .map(|v| !v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(true);
     if !enabled {
         return;

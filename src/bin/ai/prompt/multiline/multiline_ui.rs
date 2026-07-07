@@ -4,18 +4,18 @@ use std::time::Duration;
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size, Clear, ClearType},
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size as terminal_size},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use tui_textarea::TextArea;
 
 use super::{
-    completion_panel::{CompletionPanel, PendingTabCompletion},
-    events::{handle_multiline_event, EventLoopAction},
-    render::render_multiline_popup,
     MultilineHistoryState,
+    completion_panel::{CompletionPanel, PendingTabCompletion},
+    events::{EventLoopAction, RecentTextInput, handle_multiline_event},
+    render::render_multiline_popup,
 };
-use crate::ai::prompt::{interrupted_error, PromptEditor};
+use crate::ai::prompt::{PromptEditor, interrupted_error};
 
 const COMPACT_VIEWPORT_HEIGHT: u16 = 8;
 const MAX_VIEWPORT_HEIGHT: u16 = 20;
@@ -40,6 +40,12 @@ fn clear_inline_viewport_preserving_cursor<B: ratatui::backend::Backend>(
 
 fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
     let available_rows = terminal_rows.saturating_sub(2).max(1);
+    if prefill.is_none_or(str::is_empty) {
+        // inline viewport 高度在创建时一次性固定，之后不随打字增长。空输入若给太小
+        // （如 4 行），一旦开始输入，完整编辑器布局需要 8 行 chrome，textarea 会被挤没，
+        // 导致“看不到输入文本”。因此空输入也必须给足能容纳编辑器的高度。
+        return COMPACT_VIEWPORT_HEIGHT.min(available_rows);
+    }
     let prefill_rows = prefill
         .map(|text| text.lines().count().max(1))
         .unwrap_or(1)
@@ -112,6 +118,7 @@ impl PromptEditor {
             let mut status_msg: Option<String> = None;
             let mut pending_tab_completion: Option<PendingTabCompletion> = None;
             let mut completion_panel: Option<CompletionPanel> = None;
+            let mut recent_text_input: Option<RecentTextInput> = None;
 
             loop {
                 terminal
@@ -139,6 +146,7 @@ impl PromptEditor {
                     &mut status_msg,
                     &mut pending_tab_completion,
                     &mut completion_panel,
+                    &mut recent_text_input,
                     &self.session_image_dir,
                 )? {
                     EventLoopAction::Continue => {}
@@ -180,10 +188,10 @@ impl PromptEditor {
 mod tests {
     use super::{clear_inline_viewport_preserving_cursor, multiline_viewport_height};
     use ratatui::{
+        Terminal, TerminalOptions, Viewport,
         backend::TestBackend,
         layout::{Position, Rect},
         widgets::{Paragraph, Widget},
-        Terminal, TerminalOptions, Viewport,
     };
 
     #[test]
@@ -237,5 +245,6 @@ mod tests {
         assert_eq!(multiline_viewport_height(40, Some(&prefill)), 17);
         assert_eq!(multiline_viewport_height(10, Some(&prefill)), 8);
         assert_eq!(multiline_viewport_height(4, Some(&prefill)), 2);
+        assert_eq!(multiline_viewport_height(4, None), 2);
     }
 }

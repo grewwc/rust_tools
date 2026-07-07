@@ -18,7 +18,7 @@ fn params_apply_patch() -> Value {
             },
             "patch": {
                 "type": "string",
-                "description": "Patch text. Accepted formats: raw unified-diff hunks starting with @@, or a single-file `*** Begin Patch` envelope with `*** Update File:` / `*** Add File:`."
+                "description": "Patch text. Accepted formats: raw unified-diff hunks starting with @@, or a single-file `*** Begin Patch` envelope with `*** Update File:` / `*** Add File:`. In unified-diff hunks every content line MUST start with a prefix: ` ` (space) for context, `-` for removal, `+` for addition; do NOT wrap the patch in a code fence and do NOT copy line-number prefixes from read tools."
             }
         },
         "required": ["file_path", "patch"]
@@ -119,7 +119,12 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
                 ' ' => lines.push(UnifiedLine::Context(body.to_string())),
                 '-' => lines.push(UnifiedLine::Remove(body.to_string())),
                 '+' => lines.push(UnifiedLine::Add(body.to_string())),
-                _ => return Err(format!("invalid hunk line: {}", l)),
+                _ => {
+                    return Err(format!(
+                        "invalid hunk line: every line in a hunk must start with ` ` (context), `-` (remove), or `+` (add), but got: {:?}",
+                        l
+                    ))
+                }
             }
         }
         // 剥离尾部空 context 行：hunk body 循环只在遇到下一个 `@@` 才结束，所以
@@ -523,10 +528,30 @@ fn emit_stream_line(on_chunk: &mut ToolStreamWriter<'_>, line: &str) {
     on_chunk(rendered.as_bytes());
 }
 
+/// 剥离模型常给 patch 外层包裹的代码围栏（```...``` 或 ~~~...~~~）。
+/// 仅当整体 patch 被一对围栏包裹（首行开围栏、末行裸闭围栏）时才剥离；
+/// 围栏出现在 patch 内部内容中时不处理，避免误伤真正的 patch 内容。
+fn strip_code_fence(patch: &str) -> String {
+    let lines: Vec<&str> = patch.lines().collect();
+    if lines.len() < 3 {
+        return patch.to_string();
+    }
+    let first = lines.first().unwrap().trim();
+    let last = lines.last().unwrap().trim();
+    let is_open_fence = first.starts_with("```") || first.starts_with("~~~");
+    let is_close_fence = last == "```" || last == "~~~";
+    if !is_open_fence || !is_close_fence {
+        return patch.to_string();
+    }
+    // 剥离首尾围栏行，保留中间内容并去掉多余首尾空白。
+    lines[1..lines.len() - 1].join("\n").trim().to_string()
+}
+
 pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
-    let patch = args["patch"].as_str().ok_or("missing patch")?;
+    let raw_patch = args["patch"].as_str().ok_or("missing patch")?;
+    let patch = strip_code_fence(raw_patch);
     let initial_file_path = optional_file_path_arg(args);
-    let envelope = parse_patch_envelope(patch)?;
+    let envelope = parse_patch_envelope(&patch)?;
     let file_path = initial_file_path
         .map(str::to_string)
         .or_else(|| envelope.as_ref().map(|parsed| parsed.target_path.clone()))
@@ -539,9 +564,9 @@ pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
     let path = store.path().to_path_buf();
     let (_, normalized_patch) = if let Some(envelope) = envelope {
         ensure_patch_target_matches(&path, &envelope.target_path)?;
-        normalize_patch_text(&path, patch)?
+        normalize_patch_text(&path, &patch)?
     } else {
-        (file_path.clone(), patch.to_string())
+        (file_path.clone(), patch.clone())
     };
     let original = if path.exists() {
         store.read_to_string().map_err(|err| err.to_string())?
@@ -557,11 +582,12 @@ pub(crate) fn execute_apply_patch_streaming(
     args: &Value,
     on_chunk: &mut ToolStreamWriter<'_>,
 ) -> Result<String, String> {
-    let patch = args["patch"].as_str().ok_or("missing patch")?;
+    let raw_patch = args["patch"].as_str().ok_or("missing patch")?;
+    let patch = strip_code_fence(raw_patch);
     emit_stream_line(on_chunk, "parsing patch envelope");
 
     let initial_file_path = optional_file_path_arg(args);
-    let envelope = parse_patch_envelope(patch)?;
+    let envelope = parse_patch_envelope(&patch)?;
     let file_path = initial_file_path
         .map(str::to_string)
         .or_else(|| envelope.as_ref().map(|parsed| parsed.target_path.clone()))
@@ -577,9 +603,9 @@ pub(crate) fn execute_apply_patch_streaming(
     let path = store.path().to_path_buf();
     let (_, normalized_patch) = if let Some(envelope) = envelope {
         ensure_patch_target_matches(&path, &envelope.target_path)?;
-        normalize_patch_text(&path, patch)?
+        normalize_patch_text(&path, &patch)?
     } else {
-        (file_path.clone(), patch.to_string())
+        (file_path.clone(), patch.clone())
     };
 
     let hunk_count = normalized_patch
@@ -608,7 +634,7 @@ pub(crate) fn execute_apply_patch_streaming(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_unified_patch, execute_apply_patch, parse_unified_hunks};
+    use super::{apply_unified_patch, execute_apply_patch, parse_unified_hunks, strip_code_fence};
     use crate::ai::test_support::ENV_LOCK;
     use std::{fs, path::PathBuf};
 
@@ -987,5 +1013,84 @@ mod tests {
 
         assert!(err.contains("patch target mismatch"), "err was: {err}");
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn strip_code_fence_removes_backtick_wrapper() {
+        let fenced = "```diff\n@@ -1,1 +1,1 @@\n-line2\n+changed\n```";
+        assert_eq!(
+            strip_code_fence(fenced),
+            "@@ -1,1 +1,1 @@\n-line2\n+changed"
+        );
+        // ~~~ 围栏同样剥离。
+        let fenced_tilde = "~~~\n@@ -1,1 +1,1 @@\n-x\n+y\n~~~";
+        assert_eq!(strip_code_fence(fenced_tilde), "@@ -1,1 +1,1 @@\n-x\n+y");
+    }
+
+    #[test]
+    fn strip_code_fence_leaves_unfenced_patch_untouched() {
+        let raw = "@@ -1,1 +1,1 @@\n-x\n+y";
+        assert_eq!(strip_code_fence(raw), raw);
+        // 闭围栏缺失时不剥离，避免误伤内容以 ``` 开头的真实 patch。
+        let no_close = "```diff\n@@ -1,1 +1,1 @@\n-x\n+y";
+        assert_eq!(strip_code_fence(no_close), no_close);
+        // 行数太少不处理。
+        assert_eq!(strip_code_fence("```\n```"), "```\n```");
+    }
+
+    #[test]
+    fn execute_apply_patch_strips_code_fence_around_unified_diff() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("fence_unified").with_extension("txt");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "line1\nline2\nline3\n").unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "patch": "```diff\n@@ -1,3 +1,3 @@\n line1\n-line2\n+changed\n line3\n```"
+            });
+            execute_apply_patch(&args)
+                .expect("apply_patch should strip code fence around unified diff");
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "line1\nchanged\nline3\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn execute_apply_patch_strips_code_fence_around_envelope() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("fence_envelope").with_extension("txt");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "line1\nline2\nline3\n").unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "file_path": path.to_string_lossy(),
+                "patch": format!(
+                    "```\n*** Begin Patch\n*** Update File: {}\n line1\n-line2\n+changed\n line3\n*** End Patch\n```",
+                    path.display()
+                )
+            });
+            execute_apply_patch(&args)
+                .expect("apply_patch should strip code fence around envelope");
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "line1\nchanged\nline3\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn parse_unified_hunks_error_message_names_expected_prefixes() {
+        // context 行漏前导空格时，错误信息应明确指出期望的前缀。
+        let err = parse_unified_hunks("@@ -1,3 +1,3 @@\nline1\n-line2\n+changed\n line3")
+            .expect_err("missing leading space on context line must error");
+        assert!(
+            err.contains("must start with") && err.contains("context"),
+            "err was: {err}"
+        );
     }
 }

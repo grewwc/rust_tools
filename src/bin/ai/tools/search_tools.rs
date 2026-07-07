@@ -48,7 +48,7 @@ fn params_find_path() -> Value {
             },
             "path": {
                 "type": "string",
-                "description": "Root directory to search in (default: \".\")."
+                "description": "Root directory to search in (default: \".\"). Common build/cache/VCS dirs are skipped during recursion; pass such a dir explicitly as path to search inside it."
             },
             "file_pattern": {
                 "type": "string",
@@ -244,6 +244,24 @@ pub(crate) fn execute_find_path(args: &Value) -> Result<String, String> {
         .unwrap_or_else(|| {
             crate::ai::driver::runtime_ctx::effective_cwd().unwrap_or_else(|_| PathBuf::from("."))
         });
+
+    // 快速路径：精确文件名（非 glob 模式）直接 BFS 命中即返回，
+    // 避免每次都拉起 ff_embed 多线程 runtime 全量遍历
+    if !glob_mode {
+        if let Some(found) = find_first_file_by_name(Path::new(&root_pat), target) {
+            let abs = fs::canonicalize(&found).unwrap_or(found);
+            let match_base = abs
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            crate::ai::ff_embed::output::begin_capture();
+            let _ = crate::ai::ff_embed::output::print_match(&abs, &wd, &match_base, true, false, false);
+            let results = crate::ai::ff_embed::output::finish_capture();
+            return Ok(truncate_chars(results.join("\n").trim(), 16_000));
+        }
+        return Ok(String::new());
+    }
 
     let opts = crate::ai::ff_embed::cli::Options {
         verbose: false,

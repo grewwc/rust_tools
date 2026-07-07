@@ -243,8 +243,63 @@ fn split_table_segments(s: &str) -> Vec<String> {
     let mut chars = s.chars().peekable();
     let mut in_code = false;
     let mut in_math = false;
+    let mut math_delim = ""; // "$" or "$$"，记录进入数学段时的分隔符
     let mut in_strike = false;
     let mut escaped = false;
+
+    /// 向前查找未转义的目标字符。用于判断分隔符是否有配对，
+    /// 避免未闭合的 `、$ 把 in_code/in_math 卡死在 true，
+    /// 导致后续 | 无法被识别为列分隔符。
+    fn has_matching_delim(
+        chars: &std::iter::Peekable<std::str::Chars>,
+        target: char,
+    ) -> bool {
+        let mut la = chars.clone();
+        let mut esc = false;
+        while let Some(c) = la.next() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            if c == '\\' {
+                esc = true;
+                continue;
+            }
+            if c == target {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 向前查找未转义的双字符分隔符（用于 ~~ 和 $$）。
+    fn has_matching_delim_pair(
+        chars: &std::iter::Peekable<std::str::Chars>,
+        first: char,
+        second: char,
+    ) -> bool {
+        let mut la = chars.clone();
+        // 跳过当前 peek 位置的字符——它是开分隔符的一部分（如 $$ 的第二个 $），
+        // 不能把它和后面的字符凑成"闭合对"。例如 $$$ 中，开分隔符占前两个 $，
+        // 如果不跳过，lookahead 会把第 2、3 个 $ 误判为闭合 $$，
+        // 导致错误地进入数学模式而永远无法退出。
+        la.next();
+        let mut esc = false;
+        while let Some(c) = la.next() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            if c == '\\' {
+                esc = true;
+                continue;
+            }
+            if c == first && la.peek().copied() == Some(second) {
+                return true;
+            }
+        }
+        false
+    }
 
     while let Some(ch) = chars.next() {
         if escaped {
@@ -261,31 +316,81 @@ fn split_table_segments(s: &str) -> Vec<String> {
 
         // ~~strikethrough~~：跟踪状态，避免 ~~ 内的 | 被误识别为列分隔符
         if ch == '~' && !in_code && !in_math && chars.peek().copied() == Some('~') {
-            chars.next();
-            in_strike = !in_strike;
-            current.push('~');
-            current.push('~');
-            continue;
+            if in_strike {
+                // 已在删除线内：这是闭合 ~~
+                chars.next();
+                in_strike = false;
+                current.push('~');
+                current.push('~');
+                continue;
+            }
+            // 不在删除线内：检查是否有配对的 ~~
+            if has_matching_delim_pair(&chars, '~', '~') {
+                chars.next();
+                in_strike = true;
+                current.push('~');
+                current.push('~');
+                continue;
+            }
         }
 
-        if ch == '`' && !in_math {
-            in_code = !in_code;
-            current.push(ch);
-            continue;
+        if ch == '`' {
+            if in_code {
+                // 已在代码段内：这是闭合反引号
+                in_code = false;
+                current.push(ch);
+                continue;
+            }
+            if !in_math && has_matching_delim(&chars, '`') {
+                // 不在代码段内且能找到配对反引号：进入代码段
+                in_code = true;
+                current.push(ch);
+                continue;
+            }
         }
 
         if ch == '$' && !in_code {
+            if in_math {
+                // 已在数学段内：按进入时的分隔符类型决定是否闭合
+                match math_delim {
+                    "$$" if chars.peek().copied() == Some('$') => {
+                        // $$ 段遇到 $$ 对：闭合
+                        chars.next();
+                        in_math = false;
+                        math_delim = "";
+                        current.push('$');
+                        current.push('$');
+                        continue;
+                    }
+                    "$" => {
+                        // $ 段遇到单个 $：闭合（即使后面跟着 $）
+                        in_math = false;
+                        math_delim = "";
+                        current.push(ch);
+                        continue;
+                    }
+                    _ => {
+                        // $$ 段内的单个 $（peek 不是 $），或未知状态：
+                        // 按字面量处理，不闭合，fall through 到 current.push(ch)
+                    }
+                }
+            }
+            // 不在数学段内：检查配对
             if chars.peek().copied() == Some('$') {
-                chars.next();
-                in_math = !in_math;
-                current.push('$');
-                current.push('$');
+                if has_matching_delim_pair(&chars, '$', '$') {
+                    chars.next();
+                    in_math = true;
+                    math_delim = "$$";
+                    current.push('$');
+                    current.push('$');
+                    continue;
+                }
+            } else if has_matching_delim(&chars, '$') {
+                in_math = true;
+                math_delim = "$";
+                current.push(ch);
                 continue;
             }
-
-            in_math = !in_math;
-            current.push(ch);
-            continue;
         }
 
         if ch == '|' && !in_code && !in_math && !in_strike {
@@ -614,6 +719,116 @@ mod tests {
             parse_table_row(r#"| `a|b` | x \| y | $p|q$ |"#),
             vec!["`a|b`", r#"x \| y"#, "$p|q$"]
         );
+    }
+
+    #[test]
+    fn parse_table_row_handles_unpaired_backticks() {
+        // 三个反引号（奇数）不应把 in_code 卡死在 true，否则尾随 | 无法被识别为列分隔符。
+        // 修复前：split_table_segments 每遇到一个 ` 就翻转 in_code，
+        //   ``` 后 in_code=true，后续 | 被当字面量，整行只解析出 1 个 cell。
+        // 修复后：只有找到配对反引号才进入 in_code，未配对的 ` 按字面量处理。
+        assert_eq!(
+            parse_table_row("| context 行漏前导空格 | ❌ invalid hunk line: ``` |"),
+            vec!["context 行漏前导空格", "❌ invalid hunk line: ```"]
+        );
+        // 单个未闭合反引号也应按字面量处理
+        assert_eq!(
+            parse_table_row("| foo `bar | baz |"),
+            vec!["foo `bar", "baz"]
+        );
+    }
+
+    #[test]
+    fn parse_table_row_handles_unpaired_dollar() {
+        // 未配对的 $ 不应把 in_math 卡死在 true
+        assert_eq!(
+            parse_table_row("| foo $bar | baz |"),
+            vec!["foo $bar", "baz"]
+        );
+        // 三个 $（奇数）也应正确处理
+        assert_eq!(
+            parse_table_row("| a $$$ b | c |"),
+            vec!["a $$$ b", "c"]
+        );
+    }
+
+    #[test]
+    fn parse_table_row_dollar_inside_code_is_literal() {
+        // $ 在反引号代码段内不触发数学模式
+        assert_eq!(
+            parse_table_row("| `a$b` | c |"),
+            vec!["`a$b`", "c"]
+        );
+    }
+
+    #[test]
+    fn parse_table_row_single_dollar_math_closes_at_single_dollar() {
+        // 用单 $ 进入的数学段，遇到 $$ 时应在第一个 $ 处闭合，
+        // 第二个 $ 按字面量处理（可能开启新的数学段）。
+        // 关键：$a$$b$ 中，$a$ 是一个数学段，$b$ 是另一个。
+        let cells = parse_table_row("| $a$$b$ | c |");
+        // 两个 cell：第一个含 "$a$$b$"（两个相邻数学段），第二个是 "c"
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[1], "c");
+        // 第一个 cell 的内容应包含所有 $ 符号
+        assert!(cells[0].contains("$$b$"));
+    }
+
+    #[test]
+    fn parse_table_row_double_dollar_math_requires_double_dollar_to_close() {
+        // 用 $$ 进入的数学段，单个 $ 不应触发闭合
+        let cells = parse_table_row("| $$a$b$$ | c |");
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[1], "c");
+        // $$a$b$$ 中，$ 是 $$ 段内的字面量，整段是一个数学 span
+        assert_eq!(cells[0], "$$a$b$$");
+    }
+
+    #[test]
+    fn parse_table_row_handles_unpaired_strikethrough() {
+        // 未配对的 ~~ 应按字面量处理，不应把 in_strike 卡死
+        assert_eq!(
+            parse_table_row("| ~~a | b |"),
+            vec!["~~a", "b"]
+        );
+        // 三个 ~~ 序列（奇数）也应正确处理
+        assert_eq!(
+            parse_table_row("| ~~a~~b~~ | c |"),
+            vec!["~~a~~b~~", "c"]
+        );
+    }
+
+    #[test]
+    fn parse_table_row_escaped_delimiters() {
+        // 转义的反引号不应触发代码段
+        assert_eq!(
+            parse_table_row(r#"| \`a\` | b |"#),
+            vec![r#"\`a\`"#, "b"]
+        );
+        // 转义的 $ 不应触发数学段
+        assert_eq!(
+            parse_table_row(r#"| \$a\$ | b |"#),
+            vec![r#"\$a\$"#, "b"]
+        );
+    }
+
+    #[test]
+    fn parse_table_row_pipe_inside_math_is_literal() {
+        // $ 段内的 | 应被当作字面量
+        assert_eq!(
+            parse_table_row("| $a|b$ | c |"),
+            vec!["$a|b$", "c"]
+        );
+    }
+
+    #[test]
+    fn parse_table_row_adjacent_code_spans() {
+        // 相邻的反引号代码段：`a`b`c` 应被解析为 `a` + `c` 两个代码段
+        // 中间的 b 是普通文本，| 不应被误吞
+        let cells = parse_table_row("| `a`b`c` | d |");
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[1], "d");
+        assert_eq!(cells[0], "`a`b`c`");
     }
 
     #[test]

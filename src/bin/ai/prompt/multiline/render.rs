@@ -16,6 +16,49 @@ use crate::ai::prompt::MAX_INPUT_CHARS;
 /// 补全面板一次最多显示的候选行数（超出部分随选中项滚动）。
 const COMPLETION_WINDOW: usize = 12;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PopupLayoutConfig {
+    top_margin: u16,
+    help_lines: u16,
+    model_header_lines: u16,
+    spacer_lines: u16,
+    min_textarea_lines: u16,
+}
+
+fn popup_layout_config(
+    _area_height: u16,
+    current_content: &str,
+    trailing_blank_lines: usize,
+    has_completion_panel: bool,
+    has_status_msg: bool,
+    has_model_label: bool,
+) -> PopupLayoutConfig {
+    let compact_empty = !has_completion_panel && !has_status_msg && current_content.is_empty();
+    let top_margin: u16 = if compact_empty { 0 } else { 1 };
+    let help_lines = 2;
+    let model_header_lines = if has_model_label { 1 } else { 0 };
+    let spacer_lines = if compact_empty {
+        0
+    } else if !has_completion_panel && trailing_blank_lines == 0 {
+        1
+    } else {
+        0
+    };
+    let min_textarea_lines = if has_completion_panel || compact_empty {
+        1
+    } else {
+        3
+    };
+
+    PopupLayoutConfig {
+        top_margin,
+        help_lines,
+        model_header_lines,
+        spacer_lines,
+        min_textarea_lines,
+    }
+}
+
 pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     f: &mut ratatui::Frame<'_>,
     textarea: &mut TextArea<'_>,
@@ -25,9 +68,21 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     session_topic: Option<&str>,
 ) {
     let area = f.area();
+    let current_lines = textarea.lines().to_vec();
+    let current_content = current_lines.join("\n");
+    let trailing_blank_lines = count_trailing_blank_lines(&current_lines);
+    let layout = popup_layout_config(
+        area.height,
+        &current_content,
+        trailing_blank_lines,
+        completion_panel.is_some(),
+        status_msg.is_some(),
+        !model_label.is_empty(),
+    );
 
-    // 计算 popup 尺寸：填满整个 viewport，避免底部残留未清除的换行符
-    let popup_height = area.height.min(area.height);
+    // 计算 popup 尺寸：始终填满当前 inline viewport。空输入场景的留白通过更小的
+    // viewport 高度和去掉顶部间距解决，而不是在 viewport 内再造未使用区域。
+    let popup_height = area.height;
     let popup_width = area.width.saturating_sub(2).clamp(40, 180).min(area.width);
 
     // 计算 popup 位置（顶部对齐，紧贴上次输出）
@@ -38,7 +93,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // 计算内区域：左右各 1 列水平边距，顶部留 1 行空白作为与上次输出的视觉分隔，
     // 底部不留 padding（避免出现多余空白行）
     let h_margin: u16 = 1;
-    let top_margin: u16 = 1;
+    let top_margin = layout.top_margin;
     let inner = Rect::new(
         popup.x + h_margin,
         popup.y + top_margin,
@@ -46,30 +101,23 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         popup.height - top_margin,
     );
 
-    let current_lines = textarea.lines().to_vec();
-    let trailing_blank_lines = count_trailing_blank_lines(&current_lines);
-
     // 计算各区域高度
-    let help_lines: u16 = 2;
+    let help_lines = layout.help_lines;
     // 模型/主题信息行：放在底部（help 行上方）而非 viewport 顶行。inline viewport 每次
     // 重新锚定（resize、上方有新输出、退出清屏）时，**顶行**会被推入终端永久 scrollback
     // 且退出时的 `Clear(FromCursorDown)` 无法擦除光标上方历史行——把这行画在顶部会像
     // 装饰性横线一样反复堆叠（表现为 `model: ... | ...` 在恢复/重绘时多次出现）。底部区域
     // 在光标下方，随每帧重绘、退出时被 FromCursorDown 清除，不会污染 scrollback。
-    let model_header_lines: u16 = if model_label.is_empty() { 0 } else { 1 };
+    let model_header_lines = layout.model_header_lines;
     // 正文和底部帮助/状态栏之间预留 1 行视觉间距，但只在以下情况下启用：
     // 1. 没有补全面板（否则可用高度太紧张）；
     // 2. 正文末尾自己没有留空行。
-    let spacer_lines: u16 = if completion_panel.is_none() && trailing_blank_lines == 0 {
-        1
-    } else {
-        0
-    };
+    let spacer_lines = layout.spacer_lines;
     // 面板激活时优先占满高度：先扣掉 help 行与 textarea 最小行，余下的尽量给面板
     // （面板期望高度 = min(候选数, COMPLETION_WINDOW) + 上下边框 2，但不超过可用空间）。
     // textarea 退让到最小 1 行（此时用户在选列表，不需要大编辑区）。
     // 无面板时 textarea 至少保留 3 行。
-    let min_textarea_lines: u16 = if completion_panel.is_some() { 1 } else { 3 };
+    let min_textarea_lines = layout.min_textarea_lines;
     let (textarea_lines, panel_lines) = match completion_panel {
         Some(panel) => {
             let desired_panel = (panel.items.len().min(COMPLETION_WINDOW) as u16).saturating_add(2);
@@ -157,7 +205,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // 永久 scrollback，表现为「输入框上方堆叠多条横线」的 bug——而退出时
     // 的 `Clear(FromCursorDown)` 无法擦除光标上方的历史行。去掉装饰性横线
     // 即可根除该污染；底部 help 行已提供足够的区域分隔。
-    let current_content = current_lines.join("\n");
     let char_count = current_content.chars().count();
 
     // 设置对齐方式
@@ -521,7 +568,16 @@ fn textarea_terminal_cursor(textarea: &TextArea<'_>, area: Rect) -> Option<(u16,
 
 #[cfg(test)]
 mod tests {
-    use super::{count_trailing_blank_lines, truncate_with_ellipsis};
+    use super::{
+        count_trailing_blank_lines, popup_layout_config, render_multiline_popup,
+        truncate_with_ellipsis,
+    };
+    use ratatui::{
+        Terminal, TerminalOptions, Viewport,
+        backend::TestBackend,
+        layout::{Position, Rect},
+    };
+    use tui_textarea::TextArea;
     use unicode_width::UnicodeWidthStr;
 
     fn display_width(s: &str) -> usize {
@@ -566,5 +622,55 @@ mod tests {
     fn test_count_trailing_blank_lines_none() {
         let lines = vec!["第一行".to_string(), "第二行".to_string()];
         assert_eq!(count_trailing_blank_lines(&lines), 0);
+    }
+
+    #[test]
+    fn empty_prompt_removes_top_gap_without_changing_bottom_chrome() {
+        let layout = popup_layout_config(8, "", 0, false, false, true);
+        assert_eq!(layout.top_margin, 0);
+        assert_eq!(layout.help_lines, 2);
+        assert_eq!(layout.model_header_lines, 1);
+        assert_eq!(layout.spacer_lines, 0);
+        assert_eq!(layout.min_textarea_lines, 1);
+    }
+
+    #[test]
+    fn non_empty_prompt_keeps_full_editor_layout() {
+        let layout = popup_layout_config(8, "hello", 0, false, false, true);
+        assert_eq!(layout.top_margin, 1);
+        assert_eq!(layout.help_lines, 2);
+        assert_eq!(layout.model_header_lines, 1);
+        assert_eq!(layout.spacer_lines, 1);
+        assert_eq!(layout.min_textarea_lines, 3);
+    }
+
+    #[test]
+    fn empty_prompt_cursor_renders_at_first_row_of_viewport() {
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(4),
+            },
+        )
+        .unwrap();
+        let mut textarea = TextArea::default();
+        let mut viewport_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                render_multiline_popup(f, &mut textarea, None, None, "glm-5.2-super-relay", None);
+            })
+            .unwrap();
+
+        let popup_width = viewport_area
+            .width
+            .saturating_sub(2)
+            .clamp(40, 180)
+            .min(viewport_area.width);
+        let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
+        let expected = Position::new(popup_x + 1, viewport_area.y);
+        terminal.backend_mut().assert_cursor_position(expected);
     }
 }

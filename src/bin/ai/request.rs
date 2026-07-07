@@ -561,6 +561,28 @@ struct RequestRetryPolicy {
     max_attempts: usize,
     max_attempts_429: usize,
     header_timeout_secs: u64,
+    /// hedged backup 最大发送次数（含 primary）。超过则最后一次不再设内部超时，
+    /// 交给外层 `header_timeout_secs` 兜底。
+    hedged_max_sends: usize,
+}
+
+impl RequestRetryPolicy {
+    /// 对冲请求（hedged backup）触发阈值：primary 请求在这段时间内没收到响应头
+    /// 就立即发起一次完全相同的 backup 请求并 drop 掉 primary。
+    /// 取 header_timeout 的 1/9，clamp 到 [3, 15] 秒。
+    ///
+    /// 这样在服务端偶发长尾（连接已建立但迟迟不返回响应头）时，不必等满 90s
+    /// 再重试，而是在 ~10s 就自动发起新请求，显著降低尾延迟。
+    fn hedged_backup_after_secs(&self) -> u64 {
+        (self.header_timeout_secs / 9).clamp(3, 15)
+    }
+
+    /// 主请求 hedged backup 总发送次数。
+    /// 服务端长尾偶尔会连续命中坏实例，多一次 backup 能进一步压低尾延迟，
+    /// 同时保持顺序 drop（不会堆积并发连接）。
+    fn hedged_max_sends(&self) -> usize {
+        self.hedged_max_sends
+    }
 }
 
 fn request_retry_policy(auto_model_fallback: bool) -> RequestRetryPolicy {
@@ -569,12 +591,14 @@ fn request_retry_policy(auto_model_fallback: bool) -> RequestRetryPolicy {
             max_attempts: AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS,
             max_attempts_429: AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS,
             header_timeout_secs: AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS,
+            hedged_max_sends: 2, // 子 agent 超时短（30s），1 primary + 1 backup 足够
         }
     } else {
         RequestRetryPolicy {
             max_attempts: REQUEST_MAX_ATTEMPTS,
             max_attempts_429: REQUEST_MAX_ATTEMPTS_429,
             header_timeout_secs: STREAM_RESPONSE_HEADER_TIMEOUT_SECS,
+            hedged_max_sends: 3, // 主请求 1 primary + 2 backup
         }
     }
 }
@@ -637,6 +661,53 @@ fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     }
     None
 }
+
+/// 对冲请求（hedged backup request）。
+///
+/// 先发起 primary 请求，如果在 `backup_after_secs` 内没收到响应头，就立即发起
+/// 一次完全相同的 backup 请求并 drop 掉 primary（取消对它的等待）。
+///
+/// 支持多次 backup（`max_sends` 含 primary）：每轮给 `backup_after_secs` 宽限期，
+/// 超时则 drop 当前请求并发起下一轮。最后一轮不再设内部超时，交给外层
+/// `header_timeout_secs` 兜底。全程顺序发送 + drop 旧的，不堆积并发连接。
+///
+/// 典型场景：服务端接受了 TCP 连接但因内部排队迟迟不返回响应头，primary 请求
+/// 会卡在 `.send().await` 上等满 90s 才超时。hedged backup 在 ~10s 就主动发起
+/// 新连接，新请求通常能立即被处理（命中不同的后端实例或脱离原队列），
+/// 从而把尾延迟从 90s+ 降到 10s+。
+///
+/// 注意：drop 旧请求的 future 只取消客户端的等待，服务端可能仍在处理原请求。
+/// 但 LLM chat completions 是幂等的读操作，重复一次不会产生副作用。
+async fn send_with_hedged_backup(
+    build_request: impl Fn() -> reqwest::RequestBuilder,
+    backup_after_secs: u64,
+    max_sends: usize,
+) -> Result<Response, reqwest::Error> {
+    let max_sends = max_sends.max(1);
+    for round in 1..=max_sends {
+        let is_last = round == max_sends;
+        // 最后一轮不设内部超时，交给外层 header_timeout 兜底
+        if is_last {
+            return build_request().send().await;
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(backup_after_secs),
+            build_request().send(),
+        )
+        .await
+        {
+            Ok(result) => return result, // 本轮及时返回了
+            Err(_) => {
+                eprintln!(
+                    "[Info] 第 {round} 次请求 {}s 内未返回响应头，发起 hedged backup",
+                    backup_after_secs
+                );
+            }
+        }
+    }
+    unreachable!()
+}
+
 fn should_abort_retry_wait(app: &App) -> bool {
     app.shutdown.load(std::sync::atomic::Ordering::Relaxed)
         || app.cancel_stream.load(std::sync::atomic::Ordering::Relaxed)
@@ -1237,15 +1308,16 @@ pub(super) async fn do_request_messages(
     for attempt in 1..=retry_policy.max_attempts_429 {
         let endpoint = endpoint_for_request_model(app, model);
         let api_key = api_key_for_request_model(app, model);
-        let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send();
+        let build_request = || {
+            apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+        };
         // 给“等待响应头”加超时兜底：connect_timeout 只覆盖握手，无法拦截
         // 服务端接受连接后迟迟不返回响应头导致的永久阻塞（CPU 0 卡死）。
         let response = match tokio::time::timeout(
             Duration::from_secs(retry_policy.header_timeout_secs),
-            send_future,
+            send_with_hedged_backup(build_request, retry_policy.hedged_backup_after_secs(), retry_policy.hedged_max_sends()),
         )
         .await
         {
@@ -2604,14 +2676,17 @@ pub async fn do_request_text_streaming(
     for attempt in 1..=REQUEST_MAX_ATTEMPTS {
         let endpoint = endpoint_for_request_model(app, model);
         let api_key = api_key_for_request_model(app, model);
-        let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send();
+        let build_request = || {
+            apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+        };
+        let retry_policy = request_retry_policy_for_current_context();
         // 等待响应头：握手 + 服务端开始返回。流式下这一步很快。
+        // 使用 hedged backup：如果 primary 在短时间内没响应，自动发 backup 请求。
         let mut response = match tokio::time::timeout(
             Duration::from_secs(STREAM_RESPONSE_HEADER_TIMEOUT_SECS),
-            send_future,
+            send_with_hedged_backup(build_request, retry_policy.hedged_backup_after_secs(), retry_policy.hedged_max_sends()),
         )
         .await
         {

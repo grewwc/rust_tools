@@ -164,7 +164,12 @@ fn scan_dir_blocking(
     for entry in entries.flatten() {
         let p = entry.path();
         if p.is_dir() {
-            subdirs.push(p);
+            // 跳过 .git / target / node_modules 等巨型目录，避免全量递归
+            // 根目录自身不经过此检查，用户可显式传 path="target" 搜索其内部
+            let name = entry.file_name();
+            if !rust_tools::commonw::is_skip_dir(&name.to_string_lossy()) {
+                subdirs.push(p);
+            }
         }
     }
     (matches, subdirs)
