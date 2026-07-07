@@ -19,8 +19,10 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
    and sub-agents.
 5. One-shot knowledge maintenance flows run before the interactive `run_loop()`.
 6. `runtime_ctx::temp_dir()` is per-session
-   (`<effective_cwd>/.agent_tmp/<session>/`) and persists across turns. There
-   is no auto-cleanup; the agent explicitly deletes temp files via `delete_path`
+   (`<sessions_root>/<session>.assets/tmp/`, co-located with tool-overflow,
+   outside the project dir; falls back to `<effective_cwd>/.agent_tmp/<session>/`
+   when DRIVER_CTX is unavailable) and persists across turns. There is no
+   auto-cleanup; the agent explicitly deletes temp files via `delete_path`
    (which only works on files registered via `write_file(temp=true)`).
 7. Process/correction notes (truncation-retry hints, cache-hit notes,
    discover_skills followups) are turn-scoped: push them to `messages` only,

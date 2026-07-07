@@ -4,18 +4,52 @@ use std::time::Duration;
 use crossterm::{
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
-    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size as terminal_size},
+    terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size, Clear, ClearType},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use tui_textarea::TextArea;
 
 use super::{
-    MultilineHistoryState,
     completion_panel::{CompletionPanel, PendingTabCompletion},
-    events::{EventLoopAction, handle_multiline_event},
+    events::{handle_multiline_event, EventLoopAction},
     render::render_multiline_popup,
+    MultilineHistoryState,
 };
-use crate::ai::prompt::{PromptEditor, interrupted_error};
+use crate::ai::prompt::{interrupted_error, PromptEditor};
+
+const COMPACT_VIEWPORT_HEIGHT: u16 = 8;
+const MAX_VIEWPORT_HEIGHT: u16 = 20;
+const VIEWPORT_CHROME_LINES: u16 = 5; // top margin + model line + spacer + help(2)
+const MIN_TEXTAREA_LINES: u16 = 3;
+const MAX_PREFILL_TEXTAREA_LINES: u16 = 12;
+
+/// `Terminal::clear()` 在 inline viewport 下会先把真实终端 cursor 挪到 viewport 顶部
+/// 再执行 `FromCursorDown`。如果 resize 突发期间又立刻来一轮 autoresize，ratatui 会
+/// 以这个被挪到顶部的 cursor 重新计算 viewport 锚点，导致输入框/光标跳到 terminal
+/// 顶部。这里清屏后把 cursor 放回清屏前的位置，只让它承担“清屏”职责，不污染下一轮
+/// viewport 定位基准。
+fn clear_inline_viewport_preserving_cursor<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+) {
+    let cursor_before_clear = terminal.get_cursor_position().ok();
+    let _ = terminal.clear();
+    if let Some(cursor_before_clear) = cursor_before_clear {
+        let _ = terminal.set_cursor_position(cursor_before_clear);
+    }
+}
+
+fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
+    let available_rows = terminal_rows.saturating_sub(2).max(1);
+    let prefill_rows = prefill
+        .map(|text| text.lines().count().max(1))
+        .unwrap_or(1)
+        .min(u16::MAX as usize) as u16;
+    let prefill_viewport_height = prefill_rows
+        .clamp(MIN_TEXTAREA_LINES, MAX_PREFILL_TEXTAREA_LINES)
+        .saturating_add(VIEWPORT_CHROME_LINES);
+    let desired = COMPACT_VIEWPORT_HEIGHT.max(prefill_viewport_height);
+    desired.min(MAX_VIEWPORT_HEIGHT).min(available_rows)
+}
 
 /// 处理 `Event::Resize` 连续触发的情况：终端窗口拖动时 Resize 事件会快速连发，
 /// 如果每次都重绘 inline viewport，会导致"画面撕裂"或闪烁。
@@ -38,7 +72,7 @@ fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>)
     //    viewport 内容（包括 cursor 块 ▌）残留在 scrollback 中反复堆叠。
     let _ = terminal.hide_cursor();
     let _ = terminal.autoresize();
-    let _ = terminal.clear();
+    clear_inline_viewport_preserving_cursor(terminal);
     Ok(())
 }
 
@@ -47,14 +81,12 @@ impl PromptEditor {
         enable_raw_mode()?;
         let _ = execute!(io::stdout(), EnableBracketedPaste);
 
-        // viewport 高度 = 1 行顶部间距 + textarea + 2 行帮助行。
-        // 设为 20 行让输入框有足够的编辑空间，补全面板弹出时 textarea 会自动退让到 1 行。
-        // 高度过大会导致 append_lines() 在终端底部产生大量换行，
-        // 不仅造成光标与上次输出之间有大段空白，还可能在终端底部覆盖掉
-        // 更多的 assistant 输出历史行。
+        // Inline viewport 初始化会通过 append_lines() 真实撑开终端区域。空输入默认保持
+        // 紧凑，避免每轮回答后和下一轮光标之间出现大段空白；编辑已有内容时再按预填行数
+        // 放大，给 textarea 保留足够空间。
         let viewport_height = terminal_size()
-            .map(|(_, h)| h.saturating_sub(2).clamp(12, 20))
-            .unwrap_or(20);
+            .map(|(_, h)| multiline_viewport_height(h, self.pending_prefill.as_deref()))
+            .unwrap_or(COMPACT_VIEWPORT_HEIGHT);
 
         let backend = CrosstermBackend::new(io::stdout());
         let mut terminal = match Terminal::with_options(
@@ -77,7 +109,6 @@ impl PromptEditor {
                 None => TextArea::default(),
             };
             let mut history = MultilineHistoryState::new(self.multiline_history_entries());
-            let mut accept_release = false;
             let mut status_msg: Option<String> = None;
             let mut pending_tab_completion: Option<PendingTabCompletion> = None;
             let mut completion_panel: Option<CompletionPanel> = None;
@@ -105,7 +136,6 @@ impl PromptEditor {
                     event,
                     &mut textarea,
                     &mut history,
-                    &mut accept_release,
                     &mut status_msg,
                     &mut pending_tab_completion,
                     &mut completion_panel,
@@ -143,5 +173,69 @@ impl PromptEditor {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clear_inline_viewport_preserving_cursor, multiline_viewport_height};
+    use ratatui::{
+        backend::TestBackend,
+        layout::{Position, Rect},
+        widgets::{Paragraph, Widget},
+        Terminal, TerminalOptions, Viewport,
+    };
+
+    #[test]
+    fn clear_inline_viewport_preserves_existing_cursor_anchor() {
+        let backend = TestBackend::new(24, 8);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+
+        terminal
+            .insert_before(2, |buf| {
+                Paragraph::new(vec!["line 1".into(), "line 2".into()]).render(buf.area, buf);
+            })
+            .unwrap();
+
+        let mut viewport_area = Rect::ZERO;
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                f.render_widget(Paragraph::new("prompt"), f.area());
+                f.set_cursor_position((viewport_area.x + 4, viewport_area.y + 1));
+            })
+            .unwrap();
+
+        let expected = Position::new(viewport_area.x + 4, viewport_area.y + 1);
+        terminal.backend_mut().assert_cursor_position(expected);
+
+        clear_inline_viewport_preserving_cursor(&mut terminal);
+
+        terminal.backend_mut().assert_cursor_position(expected);
+    }
+
+    #[test]
+    fn multiline_viewport_height_stays_compact_for_empty_prompt() {
+        assert_eq!(multiline_viewport_height(30, None), 8);
+        assert_eq!(multiline_viewport_height(30, Some("")), 8);
+        assert_eq!(multiline_viewport_height(30, Some("one line")), 8);
+    }
+
+    #[test]
+    fn multiline_viewport_height_expands_for_prefill_but_caps_to_available_rows() {
+        let prefill = (0..20)
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(multiline_viewport_height(40, Some(&prefill)), 17);
+        assert_eq!(multiline_viewport_height(10, Some(&prefill)), 8);
+        assert_eq!(multiline_viewport_height(4, Some(&prefill)), 2);
     }
 }

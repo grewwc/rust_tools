@@ -114,6 +114,10 @@ struct FileHits {
     file_score: i64,
     /// 命中的行（line_index, score），已按相关性降序。
     scored: Vec<ScoredLine>,
+    /// 文件内**全部**命中行号（升序），用于在渲染时正确标记 `>`。
+    /// 注意 `scored` 仅保留 top-N snippet，但落到 context 窗口内的
+    /// 其余命中行也应以 `>` 标注，否则会被误显示为普通 context 行。
+    all_match_indices: Vec<usize>,
     /// 文件全部行内容（渲染 context 用）。
     lines: Vec<String>,
 }
@@ -177,6 +181,9 @@ pub(crate) fn run_content_search(
             continue;
         }
 
+        // 在 truncate 前收集全部命中行号（升序），供渲染时标注 `>`。
+        let all_match_indices: Vec<usize> = scored.iter().map(|s| s.line_index).collect();
+
         // 文件分数取其命中行的最高分 + 路径命中加权，作为文件间排序键。
         let file_score = scored.iter().map(|s| s.score).max().unwrap_or(0) + name_path_bonus;
         // 文件内按相关性降序，再按行号升序（稳定、就近）。
@@ -191,6 +198,7 @@ pub(crate) fn run_content_search(
             display_path,
             file_score,
             scored,
+            all_match_indices,
             lines,
         });
     }
@@ -336,7 +344,9 @@ fn format_content_results(
             }
             for idx in range.start..range.end {
                 let line_num = idx + 1;
-                let is_match = match_indices.binary_search(&idx).is_ok();
+                // 用全部命中行号标注 `>`，避免被截断的命中行落入 context 窗口时
+                // 被误显示为普通 context 行。
+                let is_match = hit.all_match_indices.binary_search(&idx).is_ok();
                 let prefix = if is_match { ">" } else { " " };
                 let empty = String::new();
                 let line_content = hit.lines.get(idx).unwrap_or(&empty);
@@ -459,17 +469,35 @@ impl GlobMatcher {
 
 fn glob_match_simple(pattern: &str, name: &str) -> bool {
     let pat = pattern.trim_start_matches("**/");
-    if pat.starts_with("*.") {
-        let ext = &pat[1..];
-        return name.ends_with(ext);
-    }
-    if pat.contains('*') || pat.contains('?') {
-        let parts: Vec<&str> = pat.split('*').collect();
-        if parts.len() == 2 {
-            return name.starts_with(parts[0]) && name.ends_with(parts[1]);
+    // 经典两指针 + 回溯的 glob 匹配，正确支持 `*`（匹配任意长度，含空）与
+    // `?`（匹配恰好一个字符）。不含通配符时退化为精确匹配，避免旧实现里
+    // `name.ends_with(pat)` 把 `Cargo.toml` 误匹配到 `my_cargo.toml`。
+    let p: Vec<char> = pat.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let mut pi = 0usize;
+    let mut ni = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ni = 0usize;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            star_ni = ni;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ni += 1;
+            ni = star_ni;
+        } else {
+            return false;
         }
     }
-    name == pat || name.ends_with(pat)
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// BFS 递归收集候选文件，跳过隐藏目录与依赖/构建目录。
@@ -901,5 +929,56 @@ mod tests {
         assert!(result.is_err(), "expected error for path=/");
         let msg = result.unwrap_err();
         assert!(msg.contains("Refusing to search"), "{}", msg);
+    }
+
+    // Bug 1 回归：单文件命中超过 MAX_SNIPPETS_PER_FILE(3) 时，落入 context 窗口
+    // 的被截断命中行也必须以 `>` 标注，而非被误显示为普通 context 行。
+    #[test]
+    fn test_text_grep_truncated_match_marked_in_context() {
+        let dir = make_temp_dir("trunc");
+        // 5 条连续命中，context_lines 默认 2，top-3 的窗口会覆盖全部 5 行。
+        fs::write(
+            dir.join("f.txt"),
+            "match a\nmatch b\nmatch c\nmatch d\nmatch e\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "pattern": "match",
+            "path": dir.to_string_lossy().to_string(),
+        });
+        let out = execute_text_grep(&args).unwrap();
+        // header 计数应为 5
+        assert!(out.contains("5 match(es)"), "{}", out);
+        // 全部 5 行命中都应以 `>` 标注
+        let marked = out.lines().filter(|l| l.starts_with('>')).count();
+        assert_eq!(marked, 5, "all 5 matches should be marked `>`:\n{}", out);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // Bug 2 回归：无通配符的字面 file_pattern 必须精确匹配，不得走 ends_with。
+    #[test]
+    fn test_glob_literal_pattern_exact_only() {
+        // `Cargo.toml` 不应匹配 `my_cargo.toml`
+        assert!(glob_match_simple("Cargo.toml", "Cargo.toml"));
+        assert!(!glob_match_simple("Cargo.toml", "my_cargo.toml"));
+        // `main.rs` 不应匹配 `domain.rs`
+        assert!(glob_match_simple("main.rs", "main.rs"));
+        assert!(!glob_match_simple("main.rs", "domain.rs"));
+        // `*.rs` 仍应按后缀匹配
+        assert!(glob_match_simple("*.rs", "foo.rs"));
+        assert!(!glob_match_simple("*.rs", "foo.txt"));
+    }
+
+    // Bug 3 回归：`?` 通配符匹配恰好一个字符。
+    #[test]
+    fn test_glob_question_mark_single_char() {
+        assert!(glob_match_simple("foo?bar", "fooXbar"));
+        assert!(glob_match_simple("foo?bar", "foo_bar"));
+        assert!(!glob_match_simple("foo?bar", "foobar")); // ? 至少匹配一个字符
+        assert!(!glob_match_simple("foo?bar", "fooXYbar")); // ? 恰好一个字符
+        // 与 `*` 组合
+        assert!(glob_match_simple("?at.rs", "cat.rs"));
+        assert!(!glob_match_simple("?at.rs", "at.rs"));
+        assert!(glob_match_simple("?.rs", "a.rs"));
     }
 }

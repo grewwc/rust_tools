@@ -1499,6 +1499,38 @@ fn session_delete_cleans_up_overflow_history_file() {
     let _ = std::fs::remove_dir_all(store.session_assets_dir("__cleanup__"));
 }
 
+/// `temp_dir()` 现在与 tool-overflow 同源，落在 `session_assets_dir/tmp/` 下。
+/// 验证 `delete_session` 会连同 `tmp/temp_registry.json` 一起递归清理。
+#[test]
+fn session_delete_cleans_up_temp_registry() {
+    let session_id = format!("test-{}", uuid::Uuid::new_v4());
+    let history_file = std::env::temp_dir().join(format!(
+        "ai-temp-cleanup-{}.sqlite",
+        uuid::Uuid::new_v4()
+    ));
+    let store = SessionStore::new(&history_file);
+    store.ensure_root_dir().unwrap();
+
+    let db = store.session_history_file(&session_id);
+    let assets = store.session_assets_dir(&session_id);
+    let tmp_dir = assets.join("tmp");
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    // 模拟 write_file(temp=true) 写入的临时文件 + 注册表
+    std::fs::write(tmp_dir.join("scratch.rs"), "fn main() {}").unwrap();
+    std::fs::write(tmp_dir.join("temp_registry.json"), r#"["scratch.rs"]"#).unwrap();
+    std::fs::write(&db, b"test").unwrap();
+
+    assert!(tmp_dir.join("temp_registry.json").exists());
+    assert!(tmp_dir.join("scratch.rs").exists());
+
+    store.delete_session(&session_id).unwrap();
+
+    assert!(!assets.exists(), "assets dir (including tmp/) should be deleted");
+    assert!(!db.exists(), "sqlite file should be deleted");
+
+    let _ = std::fs::remove_dir_all(store.session_assets_dir("__cleanup__"));
+}
+
 fn structured_history_messages() -> Vec<Message> {
     vec![
         Message {

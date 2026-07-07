@@ -740,7 +740,9 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
                 );
                 out.extend(tail);
                 let after = messages_total_chars(&out);
-                return (out, before, after, true);
+                if after < before {
+                    return (out, before, after, true);
+                }
             }
         }
     }
@@ -858,6 +860,47 @@ fn normalize_whitespace(s: &str) -> String {
     out.trim().to_string()
 }
 
+fn automatic_summary_body(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    for prefix in [
+        "历史摘要（自动压缩，以下为更早对话的简短语义）：",
+        "对话摘要（自动压缩，以下为早期对话要点）：",
+        "长期记忆摘要（压缩保留）:",
+        "长期记忆摘要（压缩保留）：",
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return Some(rest.trim());
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("[mid-turn-summary]") {
+        let rest = rest
+            .trim_start()
+            .strip_prefix("早期工具调用与对话已被 LLM 摘要：")
+            .unwrap_or_else(|| rest.trim_start());
+        return Some(rest.trim());
+    }
+
+    None
+}
+
+fn strip_nested_prior_summary_prefixes(text: &str) -> String {
+    let mut current = normalize_whitespace(text);
+    for _ in 0..8 {
+        let trimmed = current.trim_start();
+        let rest = trimmed
+            .strip_prefix("- 更早摘要:")
+            .or_else(|| trimmed.strip_prefix("更早摘要:"))
+            .or_else(|| trimmed.strip_prefix("- 更早摘要："))
+            .or_else(|| trimmed.strip_prefix("更早摘要："));
+        let Some(rest) = rest else {
+            break;
+        };
+        current = normalize_whitespace(rest);
+    }
+    current
+}
+
 async fn build_persisted_summary_text_with_app(
     app: &App,
     messages: &[Message],
@@ -867,6 +910,7 @@ async fn build_persisted_summary_text_with_app(
     prepare_tool_messages_structured(&mut prepared, 360, KEEP_RECENT_TOOL_MESSAGES, None);
     redact_images_except_last(&mut prepared, 0);
     dedup_adjacent(&mut prepared);
+    normalize_internal_notes_for_summary_model(&mut prepared);
 
     if let Some(summary) = request::summarize_history_via_model(app, &prepared, max_chars).await {
         let summary = normalize_whitespace(&summary);
@@ -876,6 +920,39 @@ async fn build_persisted_summary_text_with_app(
     }
 
     build_persisted_summary_text(messages, max_chars)
+}
+
+fn normalize_internal_notes_for_summary_model(messages: &mut Vec<Message>) {
+    let mut out = Vec::with_capacity(messages.len());
+    let mut seen_auto_summary = false;
+
+    for mut message in messages.drain(..) {
+        if message.role == ROLE_INTERNAL_NOTE {
+            let text = value_to_string(&message.content);
+            if let Some(body) = automatic_summary_body(&text) {
+                if seen_auto_summary {
+                    continue;
+                }
+                let body = strip_nested_prior_summary_prefixes(body);
+                if !body.is_empty() {
+                    message.content = Value::String(format!(
+                        "已有历史摘要（供本次压缩吸收，不要逐字复制）：\n{}",
+                        summarize_text(&body, 2_000)
+                    ));
+                    out.push(message);
+                    seen_auto_summary = true;
+                }
+                continue;
+            }
+
+            // 普通 internal_note 多为过程性提示、cache/loop 状态或 self_note 的
+            // inline 副本。它们不应被当成长期历史事实交给摘要模型反复吸收。
+            continue;
+        }
+        out.push(message);
+    }
+
+    *messages = out;
 }
 
 fn prepare_tool_messages_structured(
@@ -1425,19 +1502,6 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
         count: usize,
     }
 
-    fn strip_summary_header(text: &str) -> String {
-        let trimmed = text.trim();
-        for prefix in [
-            "历史摘要（自动压缩，以下为更早对话的简短语义）：",
-            "对话摘要（自动压缩，以下为早期对话要点）：",
-        ] {
-            if let Some(rest) = trimmed.strip_prefix(prefix) {
-                return rest.trim().to_string();
-            }
-        }
-        trimmed.to_string()
-    }
-
     fn normalize_semantic_key(s: &str) -> String {
         let mut out = String::new();
         for ch in s.chars() {
@@ -1753,21 +1817,20 @@ fn build_persisted_summary_text(messages: &[Message], max_chars: usize) -> Strin
     for message in messages {
         let text = normalize_whitespace(&value_to_string(&message.content));
         match message.role.as_str() {
-            role if is_system_like_role(role) => {
-                let normalized = strip_summary_header(&text);
-                if normalized.is_empty() || normalized.starts_with("self_note:") {
-                    continue;
-                }
-                if normalized.contains("历史摘要") || normalized.contains("对话摘要") {
-                    pre_summary_lines
-                        .push(format!("- 更早摘要: {}", summarize_text(&normalized, 400)));
-                    continue;
-                }
-                let normalized = summarize_text(&normalized, 400);
-                if !normalized.is_empty() {
-                    pre_summary_lines.push(format!("- 更早摘要: {normalized}"));
+            role if role == ROLE_INTERNAL_NOTE => {
+                if let Some(body) = automatic_summary_body(&text) {
+                    let normalized =
+                        summarize_text(&strip_nested_prior_summary_prefixes(body), 400);
+                    if !normalized.is_empty() {
+                        push_unique_limited(
+                            &mut pre_summary_lines,
+                            format!("- 更早摘要: {normalized}"),
+                            3,
+                        );
+                    }
                 }
             }
+            role if is_system_like_role(role) => {}
             "user" => {
                 finalize_turn(&mut turns, &mut current);
                 if initial_goal.is_empty() {
@@ -2724,5 +2787,53 @@ mod fold_early_tool_groups_tests {
             plain_reasonings,
             vec![None, Some("final-plain".to_string())]
         );
+    }
+
+    #[test]
+    fn persisted_summary_absorbs_prior_summary_without_nested_prefix() {
+        let messages = vec![
+            msg(
+                ROLE_INTERNAL_NOTE,
+                "历史摘要（自动压缩，以下为更早对话的简短语义）：\n- 更早摘要: 初始目标: 修复压缩\n- 已知结论: 保留路径",
+            ),
+            msg("user", "继续排查 compress.rs"),
+            msg("assistant", "发现摘要递归污染"),
+        ];
+
+        let summary = build_persisted_summary_text(&messages, 2_000);
+
+        assert!(summary.contains("初始目标: 修复压缩"), "{summary}");
+        assert!(
+            !summary.contains("更早摘要: - 更早摘要:"),
+            "summary should not recursively wrap prior summaries: {summary}"
+        );
+    }
+
+    #[test]
+    fn summary_model_input_drops_ephemeral_internal_notes() {
+        let mut messages = vec![
+            msg("user", "修复问题"),
+            msg(ROLE_INTERNAL_NOTE, "self_note:\n一次性观察"),
+            msg(ROLE_INTERNAL_NOTE, "tool_followup:output_truncated"),
+            msg(
+                ROLE_INTERNAL_NOTE,
+                "对话摘要（自动压缩，以下为早期对话要点）：\n初始目标: 保留",
+            ),
+            msg(
+                ROLE_INTERNAL_NOTE,
+                "历史摘要（自动压缩，以下为更早对话的简短语义）：\n初始目标: 应去重",
+            ),
+        ];
+
+        normalize_internal_notes_for_summary_model(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        let note = value_to_string(&messages[1].content);
+        assert!(note.contains("已有历史摘要"), "{note}");
+        assert!(note.contains("初始目标: 保留"), "{note}");
+        assert!(!note.contains("self_note"), "{note}");
+        assert!(!note.contains("tool_followup"), "{note}");
+        assert!(!note.contains("应去重"), "{note}");
     }
 }

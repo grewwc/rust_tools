@@ -8,11 +8,11 @@ use tui_textarea::{CursorMove, Input, TextArea};
 use uuid::Uuid;
 
 use super::{
-    MultilineHistoryState,
     completion_panel::{
-        CompletionPanel, PendingTabCompletion, apply_multiline_completion,
-        confirm_completion_selection, dismiss_completion_panel, move_completion_selection,
+        apply_multiline_completion, confirm_completion_selection, dismiss_completion_panel,
+        move_completion_selection, CompletionPanel, PendingTabCompletion,
     },
+    MultilineHistoryState,
 };
 use crate::clipboardw::{image_content, string_content};
 
@@ -25,7 +25,6 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
     event: Event,
     textarea: &mut TextArea<'_>,
     history: &mut MultilineHistoryState,
-    accept_release: &mut bool,
     status_msg: &mut Option<String>,
     pending_tab_completion: &mut Option<PendingTabCompletion>,
     completion_panel: &mut Option<CompletionPanel>,
@@ -47,15 +46,12 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
             }
             Ok(EventLoopAction::Continue)
         }
-        Event::Key(mut key) => {
+        Event::Key(key) => {
             *status_msg = None;
-            if key.kind == KeyEventKind::Release {
-                *accept_release = true;
-                key.kind = KeyEventKind::Press;
-            } else if key.kind != KeyEventKind::Press
-                && key.kind != KeyEventKind::Repeat
-                && !*accept_release
-            {
+            if matches!(key.kind, KeyEventKind::Release) {
+                return Ok(EventLoopAction::Continue);
+            }
+            if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 return Ok(EventLoopAction::Continue);
             }
 
@@ -331,6 +327,25 @@ fn is_submit_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    fn apply_key(textarea: &mut TextArea<'_>, key: KeyEvent) {
+        let mut history = MultilineHistoryState::new(Vec::new());
+        let mut status_msg = None;
+        let mut pending_tab_completion = None;
+        let mut completion_panel = None;
+        let action = handle_multiline_event(
+            Event::Key(key),
+            textarea,
+            &mut history,
+            &mut status_msg,
+            &mut pending_tab_completion,
+            &mut completion_panel,
+            Path::new("/tmp"),
+        )
+        .unwrap();
+        assert!(matches!(action, EventLoopAction::Continue));
+    }
 
     #[test]
     fn submit_key_recognizes_ctrl_d() {
@@ -342,5 +357,45 @@ mod tests {
     fn submit_key_recognizes_esc() {
         assert!(is_submit_key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!is_submit_key(KeyCode::Esc, KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn chinese_ime_press_release_does_not_insert_twice() {
+        let mut textarea = TextArea::default();
+
+        apply_key(
+            &mut textarea,
+            KeyEvent::new_with_kind(KeyCode::Char('中'), KeyModifiers::NONE, KeyEventKind::Press),
+        );
+        apply_key(
+            &mut textarea,
+            KeyEvent::new_with_kind(
+                KeyCode::Char('中'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ),
+        );
+
+        assert_eq!(textarea.lines(), &["中".to_string()]);
+    }
+
+    #[test]
+    fn key_repeat_still_inserts_repeated_character() {
+        let mut textarea = TextArea::default();
+
+        apply_key(
+            &mut textarea,
+            KeyEvent::new_with_kind(KeyCode::Char('哈'), KeyModifiers::NONE, KeyEventKind::Press),
+        );
+        apply_key(
+            &mut textarea,
+            KeyEvent::new_with_kind(
+                KeyCode::Char('哈'),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            ),
+        );
+
+        assert_eq!(textarea.lines(), &["哈哈".to_string()]);
     }
 }

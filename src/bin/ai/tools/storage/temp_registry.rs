@@ -5,8 +5,9 @@
 // `delete_path` 只允许删除注册表中存在的路径——未经 agent 创建的文件一律
 // 拒绝删除，从根上杜绝误删源码 / 配置 / 用户数据。
 //
-// 注册表以 JSON 文件持久化在 `<temp_dir>/temp_registry.json`，会话终止后
-// 重启仍可读取，让 agent 在后续会话中清理残留临时文件。
+// 注册表以 JSON 文件持久化在 `<temp_dir>/temp_registry.json`
+// （`temp_dir` 优先为 `~/.history_file.sessions/<session>.assets/tmp/`，
+// 与 tool-overflow 同源，落在项目外），会话终止后重启仍可读取。
 // =============================================================================
 
 use std::path::PathBuf;

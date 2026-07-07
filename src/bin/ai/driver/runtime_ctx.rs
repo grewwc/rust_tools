@@ -203,8 +203,12 @@ pub(crate) fn effective_cwd() -> std::io::Result<PathBuf> {
 // Per-session temp directory + persistent temp-file registry
 // =============================================================================
 // agent 在执行任务时常需要写临时/中间文件（脚本、片段输出、转储等）。
-// `temp_dir()` 提供一个统一的、按 session 隔离的临时目录，路径为
-// `<effective_cwd>/.agent_tmp/<session>/`，按需创建。
+// `temp_dir()` 提供一个统一的、按 session 隔离的临时目录，按需创建。
+//
+// 优先使用 session assets 目录（与 tool-overflow 同源），路径为
+// `~/.history_file.sessions/<session>.assets/tmp/`——落在项目外、按 session
+// 隔离，不污染工作区。当 DRIVER_CTX 不可用（测试 / 一次性调用）时，回退到
+// `<effective_cwd>/.agent_tmp/<session>/`。
 //
 // 通过 `write_file(temp=true)` 写入此目录的文件会被记录在持久化注册表
 // （`storage::temp_registry`）中，只有注册表中的文件才能被 `delete_path`
@@ -213,8 +217,24 @@ pub(crate) fn effective_cwd() -> std::io::Result<PathBuf> {
 // =============================================================================
 
 /// 返回当前 session 的临时目录路径，按需创建目录。供 `write_file(temp=true)`
-/// 等需要写入临时文件的场景使用。路径为 `<effective_cwd>/.agent_tmp/<session>/`。
+/// 等需要写入临时文件的场景使用。
+///
+/// 优先返回 `<sessions_root>/<session>.assets/tmp/`（与 tool-overflow 同源，
+/// 落在项目外），`DRIVER_CTX` 不可用时回退到 `<effective_cwd>/.agent_tmp/<session>/`。
 pub(crate) fn temp_dir() -> std::io::Result<PathBuf> {
+    // 优先使用 session assets 目录（与 tool-overflow 同源），让临时文件
+    // 落在项目外、按 session 隔离的 ~/.history_file.sessions/<id>.assets/tmp/。
+    if let Some(ctx) = try_current() {
+        let history_file = ctx.app_proto.config.history_file.clone();
+        let session_id = ctx.app_proto.session_id.clone();
+        let store = crate::ai::history::SessionStore::new(&history_file);
+        store.ensure_root_dir()?;
+        let dir = store.session_assets_dir(&session_id).join("tmp");
+        std::fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
+
+    // fallback：无 DRIVER_CTX（测试 / 一次性调用）时沿用 effective_cwd 下的 .agent_tmp。
     let cwd = effective_cwd()?;
     let session = current_session_id_or_empty();
     let session_part = if session.is_empty() {
