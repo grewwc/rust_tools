@@ -786,7 +786,7 @@ async fn run_turn_body(
                     break 'turn Ok(None);
                 }
 
-                if consecutive_truncations > 3 {
+                if consecutive_truncations > 8 {
                     let _ = writeln!(
                         std::io::stderr(),
                         "  ✗ 连续 {} 次响应被截断，停止重试",
