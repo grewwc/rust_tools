@@ -69,6 +69,17 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
      the turn (critical for background tasks whose `max_iterations` is
      `usize::MAX`). Only `truncated_by_length` truncations (genuine output-limit
      hits) get the progressive-escalation treatment.
+   - **Root-cause guard (prevention, not just retry):** `max_tokens` is clamped
+     per request by remaining window — `min(model.max_output_tokens,
+     context_window_tokens - est_prompt_tokens - margin)` in
+     `request::clamp_max_tokens_for_prompt` (only emitted when the model
+     declares `max_output_tokens`). Prompt tokens are estimated conservatively
+     (~2 chars/token). Compression thresholds
+     (`mid_turn_compress_soft/hard_threshold`, `pre_request_llm_summary_threshold`)
+     are additionally capped by `token_window_char_ceiling(model)` (window * 2 *
+     0.6 chars), so a high-occupancy prompt triggers compression before it
+     approaches the real token window — fixing the char-vs-token unit mismatch
+     that let GLM prompts overflow without ever tripping the char-only threshold.
 10. Foreground resume turns (process woke up by mailbox events) must persist
    their wake-up prompt as `internal_note` (not `user`). The
    `runtime_ctx::IS_RESUME_TURN` task-local is scoped by
