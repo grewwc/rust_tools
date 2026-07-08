@@ -88,6 +88,8 @@ const INTERNAL_COMMANDS: &[&str] = &[
     ":personas",
     "/sessions",
     ":sessions",
+    "/ss",
+    ":ss",
     "/proc",
     ":proc",
 ];
@@ -528,7 +530,7 @@ pub(super) fn print_help() {
     println!("    /sessions use <id>        switch to specified session");
     println!("    /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)");
     println!("    /sessions bound           list suspended sessions bound to current terminal");
-    println!("    /sessions delete <id>     delete specified session");
+    println!("    /sessions delete <id> [more...]     delete one or more sessions");
     println!("    /sessions clear-bound     clear suspended sessions bound to current terminal");
     println!("    /sessions clear-history   clear current session history (keeps session alive)");
     println!("    /sessions clear-all       delete all sessions");
@@ -647,7 +649,7 @@ fn generate_bash(
     println!("        COMPREPLY=($(compgen -W \"$checkpoint_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /history|:history)");
     println!("        COMPREPLY=($(compgen -W \"$history_sub\" -- \"$cur\")); return 0 ;;");
-    println!("      /sessions|:sessions)");
+    println!("      /sessions|:sessions|/ss|:ss)");
     println!("        COMPREPLY=($(compgen -W \"$session_sub\" -- \"$cur\")); return 0 ;;");
     println!("      /agent|:agent|/agents|:agents)");
     println!("        COMPREPLY=($(compgen -W \"$agent_sub\" -- \"$cur\")); return 0 ;;");
@@ -755,7 +757,7 @@ fn generate_zsh(
     println!("      /history|:history)");
     println!("        _describe 'history subcommand' _a_history_subcmds && return");
     println!("        ;;");
-    println!("      /sessions|:sessions)");
+    println!("      /sessions|:sessions|/ss|:ss)");
     println!("        _describe 'session subcommand' _a_session_subcmds && return");
     println!("        ;;");
     println!("      /agent|:agent|/agents|:agents)");

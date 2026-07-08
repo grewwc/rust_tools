@@ -140,7 +140,7 @@ pub fn try_handle_session_command(
             println!(
                 "  /sessions bound           list suspended sessions bound to current terminal"
             );
-            println!("  /sessions delete <id>     delete specified session");
+            println!("  /sessions delete <id> [more...]     delete one or more sessions");
             println!(
                 "  /sessions clear-bound     clear suspended sessions bound to current terminal"
             );
@@ -284,29 +284,41 @@ pub fn try_handle_session_command(
             }
         }
         "delete" | "del" | "rm" => {
-            let Some(id) = parts.next() else {
-                println!("missing session id. try: /sessions delete <id>");
+            let ids: Vec<&str> = parts.collect();
+            if ids.is_empty() {
+                println!("missing session id(s). try: /sessions delete <id1> [<id2> ...]");
                 return Ok(true);
             };
-            let deleted_path = store.session_history_file(id);
-            let deleted = store.delete_session(id)?;
-            if deleted {
-                crate::ai::history::invalidate_context_history_cache_for(&deleted_path);
-                if id == app.session_id {
-                    clear_session_local_runtime_state(app);
-                    let new_id = Uuid::new_v4().to_string();
-                    app.session_id = new_id.clone();
-                    app.session_history_file = store.session_history_file(&new_id);
-                    app.sync_persona_session_binding();
-                    println!(
-                        "Deleted current session. Switched to new session: {}",
-                        new_id
-                    );
-                } else {
+            let mut deleted_count = 0;
+            let mut not_found_count = 0;
+            let mut deleted_current = false;
+            for id in &ids {
+                let deleted_path = store.session_history_file(id);
+                let deleted = store.delete_session(id)?;
+                if deleted {
+                    crate::ai::history::invalidate_context_history_cache_for(&deleted_path);
+                    deleted_count += 1;
+                    if *id == app.session_id {
+                        deleted_current = true;
+                    }
                     println!("Deleted session: {}", id);
+                } else {
+                    not_found_count += 1;
+                    println!("Session not found: {}", id);
                 }
-            } else {
-                println!("Session not found: {}", id);
+            }
+            if ids.len() > 1 {
+                println!(
+                    "Summary: {deleted_count} deleted, {not_found_count} not found."
+                );
+            }
+            if deleted_current {
+                clear_session_local_runtime_state(app);
+                let new_id = Uuid::new_v4().to_string();
+                app.session_id = new_id.clone();
+                app.session_history_file = store.session_history_file(&new_id);
+                app.sync_persona_session_binding();
+                println!("Switched to new session: {}", new_id);
             }
         }
         "clear-bound" | "clear_bound" | "clear-suspended" | "clear_suspended" => {

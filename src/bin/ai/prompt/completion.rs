@@ -50,6 +50,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":personas",
         "/sessions",
         ":sessions",
+        "/ss",
+        ":ss",
         "/close",
         ":close",
         "/proc",
@@ -161,6 +163,8 @@ impl CommandCompleter {
             ":personas",
             "/sessions",
             ":sessions",
+            "/ss",
+            ":ss",
             "/close",
             ":close",
             "/proc",
@@ -473,7 +477,7 @@ impl CommandCompleter {
                             "/agents" | ":agents" | "/agent" | ":agent" => {
                                 Self::agent_subcommands()
                             }
-                            "/sessions" | ":sessions" => Self::session_subcommands(),
+                            "/sessions" | ":sessions" | "/ss" | ":ss" => Self::session_subcommands(),
                             "/history" | ":history" => Self::history_subcommands(),
                             "/personas" | ":personas" => Self::persona_subcommands(),
                             "/usage" | ":usage" => Self::usage_subcommands(),

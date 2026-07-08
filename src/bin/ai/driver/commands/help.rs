@@ -46,7 +46,7 @@ pub fn print_interactive_help() {
     println!("    /sessions use <id>        switch to specified session");
     println!("    /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)");
     println!("    /sessions bound           list suspended sessions bound to current terminal");
-    println!("    /sessions delete <id>     delete specified session");
+    println!("    /sessions delete <id> [more...]     delete one or more sessions");
     println!("    /sessions clear-bound     clear suspended sessions bound to current terminal");
     println!("    /sessions clear-history   clear current session history (keeps session alive)");
     println!("    /sessions clear-all       delete all sessions");
