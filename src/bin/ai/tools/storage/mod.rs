@@ -13,6 +13,7 @@ pub(crate) mod knowledge_fingerprint;
 pub(crate) mod knowledge_types;
 pub(crate) mod memory_index;
 pub(crate) mod memory_store;
+pub(crate) mod process_registry;
 pub(crate) mod rag_store;
 pub(crate) mod temp_registry;
 pub(crate) mod token_usage_store;

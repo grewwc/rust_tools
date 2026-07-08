@@ -1985,6 +1985,9 @@ async fn run_loop(
     };
 
     let cleanup_one_shot = |app: &App| {
+        // 会话结束：清理本会话遗留的后台进程组（如 `python app.py &` 派生的
+        // 常驻服务）。在所有退出路径都会经过本闭包，故此处统一兜底。
+        let _ = crate::ai::tools::storage::process_registry::kill_session(&app.session_id);
         // one-shot 模式（且非恢复指定 session）：总是删除 session。
         // 交互模式：如果未恢复已有 session 且当前 session 无任何用户消息
         // （用户直接 Ctrl+C 退出，从未输入有效内容），也删除空 session。

@@ -161,6 +161,13 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
                     );
                     Ok(EventLoopAction::Continue)
                 }
+                (KeyCode::F(8), _) => {
+                    // F8：一键清空输入框中的所有内容。
+                    replace_textarea_content(textarea, "");
+                    recent_text_input.take();
+                    *status_msg = Some("Cleared all input.".to_string());
+                    Ok(EventLoopAction::Continue)
+                }
                 (KeyCode::F(9), _) => {
                     let lines = textarea.lines();
                     let mut last_answer_start = None;
@@ -191,6 +198,18 @@ pub(in crate::ai::prompt::multiline) fn handle_multiline_event(
                     if modifiers.contains(KeyModifiers::SUPER) =>
                 {
                     delete_current_line(textarea);
+                    Ok(EventLoopAction::Continue)
+                }
+                (KeyCode::Backspace, modifiers) if modifiers.is_empty() => {
+                    // 显式处理 Backspace：按字符（而非字节）删除前一个字符，
+                    // 确保 CJK 等多字节 Unicode 字符能正确删除。
+                    // tui-textarea-2 v0.10.2 在某些终端/IME 组合下对中文退格可能失效。
+                    backspace_delete_char(textarea);
+                    Ok(EventLoopAction::Continue)
+                }
+                (KeyCode::Delete, modifiers) if modifiers.is_empty() => {
+                    // 显式处理 Delete 键：按字符删除光标后一个字符。
+                    delete_char_forward(textarea);
                     Ok(EventLoopAction::Continue)
                 }
                 (KeyCode::Char('u'), modifiers)
@@ -374,6 +393,57 @@ fn delete_current_line(textarea: &mut TextArea<'_>) {
     let new_row = remove_at.min(lines.len() - 1);
     let new_col = col.min(lines[new_row].len());
     textarea.set_lines(lines, (new_row, new_col));
+}
+
+/// 显式处理 Backspace：按字符（而非字节）删除光标前一个字符。
+/// 使用 chars() 操作确保 CJK 等多字节 Unicode 字符正确删除，
+/// 绕过 tui-textarea-2 v0.10.2 在某些终端/IME 组合下对中文退格失效的问题。
+fn backspace_delete_char(textarea: &mut TextArea<'_>) {
+    let (row, col) = textarea.cursor();
+    let mut lines = textarea.lines().to_vec();
+
+    if col > 0 {
+        // 删除当前行中光标前的一个字符（按字符索引，非字节）
+        let line = &mut lines[row];
+        let mut chars: Vec<char> = line.chars().collect();
+        if col <= chars.len() {
+            chars.remove(col - 1);
+            *line = chars.into_iter().collect();
+            textarea.set_lines(lines, (row, col - 1));
+        }
+    } else if row > 0 {
+        // 光标在行首，合并到上一行末尾
+        // 注意：textarea 的 cursor 列是字符索引，不是字节索引。
+        // 必须用 chars().count() 而非 len()（后者返回字节数）。
+        let prev_line_char_count = lines[row - 1].chars().count();
+        let merged = format!("{}{}", lines[row - 1], lines[row]);
+        lines[row - 1] = merged;
+        lines.remove(row);
+        let new_row = row - 1;
+        let new_col = prev_line_char_count;
+        textarea.set_lines(lines, (new_row, new_col));
+    }
+}
+
+/// 显式处理 Delete 键：按字符删除光标后一个字符。
+fn delete_char_forward(textarea: &mut TextArea<'_>) {
+    let (row, col) = textarea.cursor();
+    let mut lines = textarea.lines().to_vec();
+    let line_len = lines[row].chars().count();
+
+    if col < line_len {
+        // 删除光标后的一个字符
+        let line = &mut lines[row];
+        let mut chars: Vec<char> = line.chars().collect();
+        chars.remove(col);
+        *line = chars.into_iter().collect();
+        textarea.set_lines(lines, (row, col));
+    } else if row + 1 < lines.len() {
+        // 光标在行尾，合并下一行
+        let next_line = lines.remove(row + 1);
+        lines[row].push_str(&next_line);
+        textarea.set_lines(lines, (row, col));
+    }
 }
 
 fn insert_text(textarea: &mut TextArea<'_>, text: &str) {
@@ -606,5 +676,49 @@ mod tests {
         ));
 
         assert_eq!(textarea.lines(), &["中".to_string()]);
+    }
+
+    #[test]
+    fn backspace_deletes_cjk_char_correctly() {
+        let mut textarea = TextArea::from(vec!["你好世界".to_string()]);
+        textarea.set_lines(vec!["你好世界".to_string()], (0, 2)); // 光标在 "好" 和 "世" 之间
+
+        backspace_delete_char(&mut textarea);
+
+        assert_eq!(textarea.lines(), &["你世界".to_string()]);
+        assert_eq!(textarea.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn backspace_at_line_start_merges_with_previous_line() {
+        let mut textarea = TextArea::from(vec!["第一行".to_string(), "第二行".to_string()]);
+        textarea.set_lines(vec!["第一行".to_string(), "第二行".to_string()], (1, 0)); // 光标在第二行行首
+
+        backspace_delete_char(&mut textarea);
+
+        assert_eq!(textarea.lines(), &["第一行第二行".to_string()]);
+        assert_eq!(textarea.cursor(), (0, 3));
+    }
+
+    #[test]
+    fn delete_forward_removes_cjk_char_after_cursor() {
+        let mut textarea = TextArea::from(vec!["你好世界".to_string()]);
+        textarea.set_lines(vec!["你好世界".to_string()], (0, 1)); // 光标在 "你" 和 "好" 之间
+
+        delete_char_forward(&mut textarea);
+
+        assert_eq!(textarea.lines(), &["你世界".to_string()]);
+        assert_eq!(textarea.cursor(), (0, 1));
+    }
+
+    #[test]
+    fn backspace_event_deletes_mixed_text() {
+        let mut textarea = TextArea::from(vec!["hello你好world".to_string()]);
+        textarea.set_lines(vec!["hello你好world".to_string()], (0, 7)); // 光标在 "好" 和 "w" 之间
+
+        backspace_delete_char(&mut textarea);
+
+        assert_eq!(textarea.lines(), &["hello你world".to_string()]);
+        assert_eq!(textarea.cursor(), (0, 6));
     }
 }

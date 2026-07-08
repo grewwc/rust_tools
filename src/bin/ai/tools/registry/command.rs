@@ -10,7 +10,7 @@ fn params_execute_command() -> Value {
         "properties": {
             "command": {
                 "type": "string",
-                "description": "Shell command to execute. Destructive/network/escalation commands are blocked."
+                "description": "Shell command to execute. Destructive/network/escalation commands are blocked. To start a long-running server (e.g. `flask`/`python app.py`/`npm run dev`), background it and redirect its output to a log file, otherwise it will block until timeout: `python app.py > /tmp/app.log 2>&1 & sleep 2 && curl -s localhost:5566/...`. Never run a foreground server directly."
             },
             "cwd": {
                 "type": "string",

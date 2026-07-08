@@ -50,6 +50,19 @@ execution policy, sandboxing, path resolution, or progressive loading.
    `delete_path` (structured deletion with sandbox + protected-dir checks).
    Never rely on `execute_command` for deletion — `rm` is blocked by the
    sandbox and intentionally not relaxed.
+8. `execute_command` runs each command via `setsid` in its own process group.
+   If the command backgrounds a long-lived process (e.g. `python app.py &`),
+   the foreground call returns and the surviving process-group pgid is recorded
+   in an **in-memory, process-global** registry keyed by `session_id`
+   (`storage::process_registry`) — `kill_session` `killpg`s them (SIGTERM then
+   SIGKILL) at session teardown via `cleanup_one_shot` in `driver/mod.rs`. Do
+   NOT persist pgids to disk (they get recycled across restarts and would
+   mis-kill), and do NOT key this registry off `runtime_ctx::temp_dir()`
+   (register-time is inside a turn, kill-time is outside — the paths differ).
+   The lib-crate spawner (`cmd::run`) reports pgids outward via the
+   `on_background_group` callback of
+   `run_cmd_output_streaming_with_timeout_tracked`; it cannot reference the
+   binary-side registry directly.
 
 ## Related detailed guide
 

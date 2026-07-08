@@ -8,7 +8,7 @@ use std::{
     ffi::OsString,
     io::{self, Read},
     process::{Child, Command, Output, Stdio},
-    sync::mpsc::{self, RecvTimeoutError, Sender},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender},
     thread,
     time::{Duration, Instant},
 };
@@ -258,6 +258,22 @@ fn terminate_child(child: &mut Child) {
     let _ = child.kill();
 }
 
+/// 前台命令退出后，检测其进程组内是否仍有存活成员（典型：命令用 `&` 派生的
+/// 常驻服务，如 `python app.py &`）。`kill(-pgid, 0)` 不发送信号，仅用于探测：
+/// 返回 0 表示进程组仍存在成员，`ESRCH` 表示已无成员。
+///
+/// 因为子进程通过 `setsid` 成为组长，`child.id()` 即该进程组的 pgid；即使前台
+/// 组长已被 reap，只要还有后台成员存活，pgid 就不会被回收，此探测是安全的。
+#[cfg(unix)]
+fn background_group_alive(pgid: u32) -> bool {
+    unsafe { libc::kill(-(pgid as libc::pid_t), 0) == 0 }
+}
+
+#[cfg(not(unix))]
+fn background_group_alive(_pgid: u32) -> bool {
+    false
+}
+
 /// 执行命令并返回输出
 ///
 /// 执行命令并捕获标准输出和标准错误。
@@ -332,50 +348,132 @@ pub fn run_cmd_output_with_timeout(
     run_cmd_output_streaming_with_timeout(command, opts, timeout, |_| {}, || false)
 }
 
-fn spawn_pipe_reader<R>(
-    mut reader: R,
-    tx: Sender<Vec<u8>>,
-) -> thread::JoinHandle<io::Result<Vec<u8>>>
+#[derive(Clone, Copy)]
+enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
+/// 读取线程：把读到的数据按流类型打标签后经 channel 送回主线程累积。
+///
+/// 关键：不再在线程内累积并通过 `join` 回收。因为命令若在后台派生常驻进程
+/// （如 `python app.py &` 启动的 Flask），该子进程会继承同一个 stdout/stderr
+/// 管道写端 fd，导致 `read()` 永远等不到 EOF、线程永不退出。主线程一旦 `join`
+/// 这样的线程就会死锁。改为纯 channel 汇报后，主线程可在前台命令结束时直接
+/// 返回、把读取线程作为 daemon 泄漏（其阻塞在无害的管道读上，进程退出即回收）。
+fn spawn_pipe_reader<R>(mut reader: R, kind: StreamKind, tx: Sender<(StreamKind, Vec<u8>)>)
 where
     R: Read + Send + 'static,
 {
     thread::spawn(move || {
-        let mut collected = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(read) => {
-                    collected.extend_from_slice(&buf[..read]);
-                    if tx.send(buf[..read].to_vec()).is_err() {
+                    if tx.send((kind, buf[..read].to_vec())).is_err() {
                         break;
                     }
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(err),
+                Err(err) => {
+                    let _ = err;
+                    break;
+                }
             }
         }
-        Ok(collected)
-    })
+    });
 }
 
-fn join_pipe_reader(handle: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
-    match handle.join() {
-        Ok(result) => result,
-        Err(_) => Err(io::Error::other("command output reader thread panicked")),
+/// 前台命令退出后，给读取线程一个短暂的宽限期把「已经缓冲在管道里」的尾部
+/// 输出排空，然后返回。若命令派生了继承管道的后台进程，channel 永远不会
+/// `Disconnected`，因此必须用固定宽限期兜底，绝不能无限等待。
+const DRAIN_GRACE: Duration = Duration::from_millis(100);
+
+fn drain_channel<F>(
+    rx: &Receiver<(StreamKind, Vec<u8>)>,
+    stdout_buf: &mut Vec<u8>,
+    stderr_buf: &mut Vec<u8>,
+    on_chunk: &mut F,
+    grace: Duration,
+) where
+    F: FnMut(&[u8]),
+{
+    let deadline = Instant::now() + grace;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            // 仍尽量取走已就绪的数据，但不再等待。
+            while let Ok((kind, chunk)) = rx.try_recv() {
+                accumulate_chunk(kind, &chunk, stdout_buf, stderr_buf, on_chunk);
+            }
+            break;
+        }
+        match rx.recv_timeout(remaining) {
+            Ok((kind, chunk)) => accumulate_chunk(kind, &chunk, stdout_buf, stderr_buf, on_chunk),
+            Err(RecvTimeoutError::Timeout) => break,
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
+}
+
+fn accumulate_chunk<F>(
+    kind: StreamKind,
+    chunk: &[u8],
+    stdout_buf: &mut Vec<u8>,
+    stderr_buf: &mut Vec<u8>,
+    on_chunk: &mut F,
+) where
+    F: FnMut(&[u8]),
+{
+    match kind {
+        StreamKind::Stdout => stdout_buf.extend_from_slice(chunk),
+        StreamKind::Stderr => stderr_buf.extend_from_slice(chunk),
+    }
+    on_chunk(chunk);
 }
 
 pub fn run_cmd_output_streaming_with_timeout<F, C>(
     command: &str,
     opts: RunCmdOptions<'_>,
     timeout: Duration,
-    mut on_chunk: F,
+    on_chunk: F,
     should_cancel: C,
 ) -> io::Result<Output>
 where
     F: FnMut(&[u8]),
     C: Fn() -> bool,
+{
+    run_cmd_output_streaming_with_timeout_tracked(
+        command,
+        opts,
+        timeout,
+        on_chunk,
+        should_cancel,
+        |_| {},
+    )
+}
+
+/// 与 [`run_cmd_output_streaming_with_timeout`] 相同，但额外接收
+/// `on_background_group` 回调：当前台命令正常退出后，如果其进程组内仍有存活
+/// 成员（命令用 `&` 派生了常驻服务，如 `python app.py &`），会以该进程组的
+/// pgid 调用一次回调。上层可据此把 pgid 登记到会话级注册表，在会话结束时统一
+/// 清理，避免遗留孤儿进程。
+///
+/// 注意：pgid 仅在当前进程存活期间有意义，不应持久化到磁盘——重启后同一数值
+/// 可能被无关进程复用，届时 `killpg` 会误杀。
+pub fn run_cmd_output_streaming_with_timeout_tracked<F, C, G>(
+    command: &str,
+    opts: RunCmdOptions<'_>,
+    timeout: Duration,
+    mut on_chunk: F,
+    should_cancel: C,
+    mut on_background_group: G,
+) -> io::Result<Output>
+where
+    F: FnMut(&[u8]),
+    C: Fn() -> bool,
+    G: FnMut(u32),
 {
     let mut cmd = build_command(command, opts)?;
 
@@ -385,6 +483,7 @@ where
     configure_child_process_group(&mut cmd);
 
     let mut child = cmd.spawn()?;
+    let pgid = child.id();
     let stdout = child
         .stdout
         .take()
@@ -393,42 +492,53 @@ where
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("missing stderr pipe"))?;
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    let stdout_handle = spawn_pipe_reader(stdout, tx.clone());
-    let stderr_handle = spawn_pipe_reader(stderr, tx.clone());
+    let (tx, rx) = mpsc::channel::<(StreamKind, Vec<u8>)>();
+    spawn_pipe_reader(stdout, StreamKind::Stdout, tx.clone());
+    spawn_pipe_reader(stderr, StreamKind::Stderr, tx.clone());
     drop(tx);
+
+    let mut stdout_buf = Vec::new();
+    let mut stderr_buf = Vec::new();
 
     let deadline = Instant::now() + timeout;
     let status = loop {
-        while let Ok(chunk) = rx.try_recv() {
-            on_chunk(&chunk);
+        while let Ok((kind, chunk)) = rx.try_recv() {
+            accumulate_chunk(kind, &chunk, &mut stdout_buf, &mut stderr_buf, &mut on_chunk);
         }
 
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
                 if should_cancel() {
+                    // 取消：杀掉整个进程组（含后台派生进程），管道随之关闭，读取线程退出。
                     terminate_child(&mut child);
                     let _ = child.wait();
-                    let _ = join_pipe_reader(stdout_handle);
-                    let _ = join_pipe_reader(stderr_handle);
-                    while let Ok(chunk) = rx.try_recv() {
-                        on_chunk(&chunk);
-                    }
+                    drain_channel(
+                        &rx,
+                        &mut stdout_buf,
+                        &mut stderr_buf,
+                        &mut on_chunk,
+                        DRAIN_GRACE,
+                    );
                     return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
                 }
                 if Instant::now() >= deadline {
+                    // 超时：同样杀掉整个进程组，避免后台进程继续持有管道。
                     terminate_child(&mut child);
                     let _ = child.wait();
-                    let _ = join_pipe_reader(stdout_handle);
-                    let _ = join_pipe_reader(stderr_handle);
-                    while let Ok(chunk) = rx.try_recv() {
-                        on_chunk(&chunk);
-                    }
+                    drain_channel(
+                        &rx,
+                        &mut stdout_buf,
+                        &mut stderr_buf,
+                        &mut on_chunk,
+                        DRAIN_GRACE,
+                    );
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout"));
                 }
                 match rx.recv_timeout(Duration::from_millis(20)) {
-                    Ok(chunk) => on_chunk(&chunk),
+                    Ok((kind, chunk)) => {
+                        accumulate_chunk(kind, &chunk, &mut stdout_buf, &mut stderr_buf, &mut on_chunk)
+                    }
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => {}
                 }
@@ -437,16 +547,25 @@ where
         }
     };
 
-    let stdout = join_pipe_reader(stdout_handle)?;
-    let stderr = join_pipe_reader(stderr_handle)?;
-    while let Ok(chunk) = rx.try_recv() {
-        on_chunk(&chunk);
+    // 前台命令已退出。若它派生了继承管道的后台进程（如 `flask &`），channel
+    // 不会 Disconnected，这里用固定宽限期排空尾部输出后返回，绝不 join 读取线程。
+    drain_channel(
+        &rx,
+        &mut stdout_buf,
+        &mut stderr_buf,
+        &mut on_chunk,
+        DRAIN_GRACE,
+    );
+
+    // 前台组长已退出，但若进程组内仍有后台成员存活，上报 pgid 以便会话级清理。
+    if background_group_alive(pgid) {
+        on_background_group(pgid);
     }
 
     Ok(Output {
         status,
-        stdout,
-        stderr,
+        stdout: stdout_buf,
+        stderr: stderr_buf,
     })
 }
 
@@ -591,6 +710,89 @@ mod tests {
             assert!(
                 started.elapsed() < Duration::from_secs(2),
                 "timeout waited for shell descendant to exit"
+            );
+        }
+    }
+
+    #[test]
+    fn test_returns_promptly_when_command_backgrounds_a_long_lived_process() {
+        // 回归：前台命令结束、但后台派生进程继承了 stdout/stderr 管道。
+        // 旧实现会 join 永不退出的读取线程而死锁；新实现应在宽限期后返回。
+        #[cfg(unix)]
+        {
+            let started = Instant::now();
+            let mut streamed = Vec::new();
+            let output = run_cmd_output_streaming_with_timeout(
+                "sh -c 'sleep 30 & echo ready'",
+                RunCmdOptions::default(),
+                Duration::from_secs(10),
+                |chunk| streamed.extend_from_slice(chunk),
+                || false,
+            )
+            .expect("should return without hanging");
+
+            assert!(output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("ready"),
+                "expected foreground output to be captured"
+            );
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "hung waiting for backgrounded descendant to close pipes"
+            );
+        }
+    }
+
+    #[test]
+    fn test_reports_pgid_when_background_group_survives() {
+        // 派生一个后台常驻进程后前台立即返回：应上报存活进程组的 pgid，
+        // 供上层登记会话级清理。上报后测试自行杀掉该组，避免泄漏。
+        #[cfg(unix)]
+        {
+            let mut reported: Vec<u32> = Vec::new();
+            let output = super::run_cmd_output_streaming_with_timeout_tracked(
+                "sh -c 'sleep 30 & echo up'",
+                RunCmdOptions::default(),
+                Duration::from_secs(10),
+                |_| {},
+                || false,
+                |pgid| reported.push(pgid),
+            )
+            .expect("should return without hanging");
+
+            assert!(output.status.success());
+            assert_eq!(reported.len(), 1, "expected exactly one surviving group");
+            let pgid = reported[0];
+            assert!(pgid > 0);
+            // 该进程组应确实存活。
+            assert_eq!(unsafe { libc::kill(-(pgid as libc::pid_t), 0) }, 0);
+            // 清理：杀掉整个组。
+            unsafe {
+                let _ = libc::kill(-(pgid as libc::pid_t), libc::SIGKILL);
+            }
+        }
+    }
+
+    #[test]
+    fn test_does_not_report_pgid_for_clean_foreground_command() {
+        // 纯前台命令退出后进程组内无成员，不应上报 pgid。
+        #[cfg(unix)]
+        {
+            let mut reported: Vec<u32> = Vec::new();
+            let output = super::run_cmd_output_streaming_with_timeout_tracked(
+                "echo hello",
+                RunCmdOptions::default(),
+                Duration::from_secs(5),
+                |_| {},
+                || false,
+                |pgid| reported.push(pgid),
+            )
+            .expect("should succeed");
+
+            assert!(output.status.success());
+            assert!(
+                reported.is_empty(),
+                "clean foreground command should not report a surviving group, got {reported:?}"
             );
         }
     }

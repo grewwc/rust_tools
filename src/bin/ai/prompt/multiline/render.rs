@@ -28,6 +28,7 @@ struct PopupLayoutConfig {
 fn popup_layout_config(
     _area_height: u16,
     current_content: &str,
+    content_lines: usize,
     trailing_blank_lines: usize,
     has_completion_panel: bool,
     has_status_msg: bool,
@@ -48,7 +49,7 @@ fn popup_layout_config(
     let min_textarea_lines = if has_completion_panel || compact_empty {
         1
     } else {
-        3
+        (content_lines.max(2)).min(6) as u16
     };
 
     PopupLayoutConfig {
@@ -75,6 +76,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     let layout = popup_layout_config(
         area.height,
         &current_content,
+        current_lines.len(),
         trailing_blank_lines,
         completion_panel.is_some(),
         status_msg.is_some(),
@@ -394,6 +396,14 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
+                Span::styled("清空：", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "F8",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
                 Span::styled("复制回答：", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     "F9",
@@ -627,7 +637,7 @@ mod tests {
 
     #[test]
     fn empty_prompt_keeps_consistent_top_margin() {
-        let layout = popup_layout_config(8, "", 0, false, false, true);
+        let layout = popup_layout_config(8, "", 1, 0, false, false, true);
         assert_eq!(layout.top_margin, 1);
         assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
@@ -637,12 +647,12 @@ mod tests {
 
     #[test]
     fn non_empty_prompt_keeps_full_editor_layout() {
-        let layout = popup_layout_config(8, "hello", 0, false, false, true);
+        let layout = popup_layout_config(8, "hello", 1, 0, false, false, true);
         assert_eq!(layout.top_margin, 1);
         assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
         assert_eq!(layout.spacer_lines, 1);
-        assert_eq!(layout.min_textarea_lines, 3);
+        assert_eq!(layout.min_textarea_lines, 2);
     }
 
     #[test]
