@@ -58,6 +58,15 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
      reasoning_effort degradation or shrink-note injection — the model didn't
      output too much, the stream broke. Only `truncated_by_length` truncations
      (genuine output-limit hits) get the progressive-escalation treatment.
+10. Foreground resume turns (process woke up by mailbox events) must persist
+   their wake-up prompt as `internal_note` (not `user`). The
+   `runtime_ctx::IS_RESUME_TURN` task-local is scoped by
+   `run_foreground_resume`; `prepare_turn` reads it and sets the
+   `turn_messages` message role accordingly. The `messages` array sent to the
+   API keeps `role: "user"` for provider compatibility. This prevents
+   synthetic wake-up prompts from polluting `/history user`, inflating
+   compression's user-turn count, or being misread by the model as repeated
+   user questions.
 
 ## Related detailed guide
 

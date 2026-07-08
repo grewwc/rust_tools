@@ -12,7 +12,7 @@ use crate::ai::{
         recall_rank, render_record,
     },
     driver::{print::print_ocr_summary, reflection, skill_runtime},
-    history::{Message, build_context_history},
+    history::{Message, ROLE_INTERNAL_NOTE, build_context_history},
     request,
     tools::storage::memory_store::{AgentMemoryEntry, MemoryStore},
     types::App,
@@ -551,7 +551,19 @@ pub(super) async fn prepare_turn(
     };
     messages.push(request_user_message);
     let mut turn_messages = Vec::with_capacity(8);
-    turn_messages.push(user_message);
+    // 唤醒恢复 turn 的 prompt 是系统生成的通知，不是用户主动输入。
+    // 用 internal_note 持久化，使其在 /history user、history 压缩的
+    // user-turn 计数中被跳过，并在后续 turn 加载时被 normalize 为
+    // system 角色而非 user，避免模型误读为用户重复提问。
+    // 注意：发给 API 的 messages 数组仍保留 role:user（兼容性），
+    // 这里只改持久化轨道（turn_messages）的角色。
+    if crate::ai::driver::runtime_ctx::is_resume_turn() {
+        let mut resume_note = user_message;
+        resume_note.role = ROLE_INTERNAL_NOTE.to_string();
+        turn_messages.push(resume_note);
+    } else {
+        turn_messages.push(user_message);
+    }
 
     let max_iterations = app
         .agent_context

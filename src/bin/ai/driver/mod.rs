@@ -1920,17 +1920,20 @@ async fn run_foreground_resume(
                 persona_memory_path,
                 TASK_PID.scope(
                     Some(pid),
-                    turn_runtime::run_turn(
-                        app,
-                        mcp_client,
-                        skill_manifests,
-                        usize::MAX,
-                        proc_question,
-                        String::new(),
-                        next_model,
-                        None,
-                        false,
-                        false,
+                    runtime_ctx::IS_RESUME_TURN.scope(
+                        true,
+                        turn_runtime::run_turn(
+                            app,
+                            mcp_client,
+                            skill_manifests,
+                            usize::MAX,
+                            proc_question,
+                            String::new(),
+                            next_model,
+                            None,
+                            false,
+                            false,
+                        ),
                     ),
                 ),
             ),
@@ -2091,6 +2094,7 @@ async fn run_loop(
                 Option<aios_kernel::primitives::FutexAddr>,
                 Option<String>,
                 Option<crate::ai::models::AutoModelFallbackSpec>,
+                bool,
             )> = Vec::new();
             for proc in &background_procs {
                 let pid = proc.pid;
@@ -2114,6 +2118,9 @@ async fn run_loop(
                     }
                 };
                 let mailbox_messages: Vec<String> = proc.mailbox.iter().cloned().collect();
+                // mailbox 非空时 build_background_process_question 走 format_wakeup_prompt，
+                // 生成的是系统调度通知（非用户输入），持久化时应标记为 internal_note。
+                let is_resume_wakeup = !mailbox_messages.is_empty();
                 if !mailbox_messages.is_empty() {
                     let mut os = app.os.lock().unwrap();
                     if let Some(actual) = os.get_process_mut(pid) {
@@ -2152,6 +2159,7 @@ async fn run_loop(
                         .map(|goal| aios_kernel::primitives::FutexAddr(goal.completion_futex_addr)),
                     task_goal.as_ref().map(|goal| goal.task_id.clone()),
                     task_goal.as_ref().and_then(|goal| goal.auto_model_fallback),
+                    is_resume_wakeup,
                 ));
             }
 
@@ -2165,6 +2173,7 @@ async fn run_loop(
                 completion_futex_addr,
                 task_id,
                 auto_model_fallback,
+                is_resume_wakeup,
             ) in task_specs
             {
                 let mut task_app = app.clone();
@@ -2227,17 +2236,20 @@ async fn run_loop(
 
                 let inner_fut = TASK_PID.scope(Some(pid), async move {
                     crate::ai::tools::registry::common::clear_tool_cancel();
-                    let run = turn_runtime::run_turn(
-                        &mut task_app,
-                        &task_mcp,
-                        &task_skills,
-                        usize::MAX,
-                        proc_question,
-                        String::new(),
-                        next_model,
-                        None,
-                        false,
-                        false,
+                    let run = runtime_ctx::IS_RESUME_TURN.scope(
+                        is_resume_wakeup,
+                        turn_runtime::run_turn(
+                            &mut task_app,
+                            &task_mcp,
+                            &task_skills,
+                            usize::MAX,
+                            proc_question,
+                            String::new(),
+                            next_model,
+                            None,
+                            false,
+                            false,
+                        ),
                     );
                     let result = if let Some(spec) = auto_model_fallback {
                         runtime_ctx::AUTO_MODEL_FALLBACK.scope(spec, run).await

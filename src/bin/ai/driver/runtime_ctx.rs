@@ -122,6 +122,12 @@ tokio::task_local! {
     /// 果对回到正确的 (session, turn)。未设置时下游获取到 ("", 0)。
     pub(crate) static TURN_IDENTITY: (String, usize);
     pub(crate) static AUTO_MODEL_FALLBACK: AutoModelFallbackSpec;
+    /// 当设置时，标识当前 turn 是 foreground 进程被唤醒后的恢复执行
+    /// （而非用户主动输入）。`prepare_turn` 据此将持久化的 question 消息
+    /// 标记为 `internal_note` 而非 `user`，避免唤醒 prompt 被计入
+    /// `/history user`、history 压缩的 user-turn 计数、以及被模型误读为
+    /// 用户重复提问。
+    pub(crate) static IS_RESUME_TURN: bool;
 }
 
 /// 读取当前 turn 的 session_id；未在 turn 内调用时返回空串。
@@ -134,6 +140,11 @@ pub(crate) fn current_session_id_or_empty() -> String {
 /// 读取当前 turn 的 turn_id；未在 turn 内调用时返回 0。
 pub(crate) fn current_turn_id_or_zero() -> usize {
     TURN_IDENTITY.try_with(|(_, t)| *t).unwrap_or(0)
+}
+
+/// 返回当前 turn 是否是 foreground 进程唤醒后的恢复执行。
+pub(crate) fn is_resume_turn() -> bool {
+    IS_RESUME_TURN.try_with(|v| *v).unwrap_or(false)
 }
 
 /// Publish the sub-agent's final assistant text into the active result
@@ -330,5 +341,16 @@ mod tests {
         assert!(got.starts_with(&base));
         assert!(got.ends_with("subagent-cwd-tid"));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn is_resume_turn_defaults_false_outside_scope() {
+        assert!(!is_resume_turn());
+    }
+
+    #[test]
+    fn is_resume_turn_true_inside_scope() {
+        let got = IS_RESUME_TURN.sync_scope(true, || is_resume_turn());
+        assert!(got);
     }
 }
