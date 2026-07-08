@@ -37,13 +37,27 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
 7. Process/correction notes (truncation-retry hints, cache-hit notes,
    discover_skills followups) are turn-scoped: push them to `messages` only,
    never via `append_message_pair`, so they are not persisted into
-   `turn_messages` and cannot accumulate across turns.
+   `turn_messages` and cannot accumulate across turns. This also applies to
+   **partial assistant text from truncated responses**: it is a half-finished
+   artifact, not a valid conversation record — persisting it pollutes the
+   history file and crowds out real dialog under `history_max_chars`.
 8. `turn_runtime/persistence.rs` skips persisting turn messages only for
    *ephemeral* one-shot runs (`one_shot_mode && cli.session.is_none()`), i.e.
    the runs `cleanup_one_shot` will delete right after. Background mode
    (`a -bg`) and explicit `--session` one-shot (`a -ss <id> "q"`) keep the
    session, so they MUST persist — otherwise `/sessions` title and `/history`
    come up empty.
+9. Truncation retry uses **progressive escalation**, not a flat retry:
+   - `reasoning_effort` degrades 1st truncation to Low, 2nd to Minimal,
+     3rd+ to disabled (frees output budget for actual content).
+   - The shrink note is **replaced** each truncation (not idempotent) and
+     carries the consecutive count, so the model gets escalating feedback
+     instead of flying blind after the first attempt.
+   - **Stream-error truncations** (`StreamResult::stream_error`, caused by
+     decode errors / dropped malformed tool calls) are retried **without**
+     reasoning_effort degradation or shrink-note injection — the model didn't
+     output too much, the stream broke. Only `truncated_by_length` truncations
+     (genuine output-limit hits) get the progressive-escalation treatment.
 
 ## Related detailed guide
 

@@ -218,6 +218,7 @@ fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
         reasoning_text: String::new(),
         skip_response_drain: true,
         truncated_by_length: false,
+        stream_error: false,
     }
 }
 
@@ -409,6 +410,7 @@ fn finalize_stream_response(
         reasoning_text: state.content.reasoning_text,
         skip_response_drain: true,
         truncated_by_length,
+        stream_error: false,
     })
 }
 
@@ -539,6 +541,8 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         reasoning_text: std::mem::take(&mut state.content.reasoning_text),
         skip_response_drain: true,
         truncated_by_length: false,
+        // 流读取失败导致的截断，不是模型输出过长。
+        stream_error: true,
     })
 }
 

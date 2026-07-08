@@ -66,6 +66,7 @@ pub mod observer;
 pub mod print;
 pub mod reflection;
 pub mod runtime_ctx;
+pub mod session_pid;
 pub mod signal;
 pub mod skill_match_model;
 pub mod skill_ranking;
@@ -497,10 +498,10 @@ fn format_rlimit_termination_result(verdict: RlimitVerdict) -> String {
 /// 4096 过高：在「字节完全重复才停」与「跑满上限」之间缺乏中段治理，单轮可
 /// 堆出数十万字符上下文。中段断路器（orchestrator 的 iteration soft limit）
 /// 已负责及时收敛，这里作为硬上限收敛到更合理的量级即可。
-const DEFAULT_MAX_ITERATIONS: usize = 512;
+const DEFAULT_MAX_ITERATIONS: usize = 2048;
 
 /// Max iterations for subagent (executor) processes
-const EXECUTOR_MAX_ITERATIONS: usize = 512;
+const EXECUTOR_MAX_ITERATIONS: usize = 2048;
 
 const BG_DISPATCH_BASE_BATCH_DEFAULT: usize = 4;
 const BG_DISPATCH_MAX_BATCH_DEFAULT: usize = 8;
@@ -1588,6 +1589,14 @@ pub(in crate::ai) async fn run_with_cli(
     if let Err(err) = session_store.ensure_root_dir() {
         eprintln!("[Warning] Failed to create sessions dir: {}", err);
     }
+
+    // 注册当前进程的 PID 到 sessions 目录，供 `/proc` 命令发现活跃 session。
+    // guard 在函数退出（正常返回 / panic）时自动删除 PID 文件；
+    // 即使被 SIGKILL 杀死，`/proc` 也会通过 PID 存活探测清理残留。
+    let _session_pid_guard = session_pid::SessionPidGuard::register(
+        session_store.sessions_root(),
+        &session_id,
+    );
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let streaming = Arc::new(AtomicBool::new(false));

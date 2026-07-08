@@ -297,6 +297,10 @@ pub(super) struct StreamResult {
     /// 服务端返回 finish_reason=length（撞输出上限）。即使 outcome 是 Completed
     /// （有可见文本），该标志仍保留，供上层决定是否注入"输出可能不完整"提示。
     pub(super) truncated_by_length: bool,
+    /// 截断由流读取错误（网络抖动 / 服务端异常断流）导致，而非模型撞输出上限。
+    /// 此时 outcome 为 Truncated，但降 reasoning_effort、注入收缩提示均无意义——
+    /// 模型并没有输出太多，是服务端断了。上层应做简单重试而非收缩重写。
+    pub(super) stream_error: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

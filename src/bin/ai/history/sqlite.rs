@@ -76,6 +76,15 @@ pub(in crate::ai) fn read_data_version(path: &Path) -> Option<i64> {
         .ok()
 }
 
+/// 对 SQLite 数据库执行 WAL checkpoint（TRUNCATE），把 -wal 日志合并进主库。
+/// 用于导出归档前确保主库文件包含全部数据，避免跨机器迁移时丢失未 checkpoint 的 WAL。
+pub(in crate::ai) fn checkpoint_wal(path: &Path) -> io::Result<()> {
+    let conn = Connection::open(path).map_err(|e| io::Error::other(e.to_string()))?;
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(())
+}
+
 /// 廉价查询当前 history DB 中 role='user' 的消息数。
 /// 用于 boundary compact 在 hot path 上"先 count 再决定是否全量读"，
 /// 避免每个 turn 收尾都把几万条消息（含大块 tool 输出）反序列化一遍。

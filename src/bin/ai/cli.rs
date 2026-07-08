@@ -88,6 +88,8 @@ const INTERNAL_COMMANDS: &[&str] = &[
     ":personas",
     "/sessions",
     ":sessions",
+    "/proc",
+    ":proc",
 ];
 
 const FILES_USAGE: &str = "input file names (repeat -f or use comma-separated list)";
@@ -533,6 +535,10 @@ pub(super) fn print_help() {
     println!("    /sessions export <id> [output.md]       export session to Markdown");
     println!("    /sessions export-current [output.md]    export current session to Markdown");
     println!("    /sessions export-last [output.md]       export latest session to Markdown");
+    println!("    /sessions export-archive <id> [output.zip]       full session archive for migration");
+    println!("    /sessions export-archive-current [output.zip]    archive current session");
+    println!("    /sessions export-archive-last [output.zip]       archive latest session");
+    println!("    /sessions import <file.zip> [as=<id>]           import session from archive");
     println!("    /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
     println!("    /sessions branch <keep_messages> [src=<id>] [as=<id>]");
     println!();

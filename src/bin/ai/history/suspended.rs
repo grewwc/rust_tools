@@ -186,6 +186,42 @@ impl SuspendedSessionStore {
         Ok(entries)
     }
 
+    /// 列出所有终端下挂起的 session（跨终端全局视图）。
+    /// 用于 `/proc` 等需要展示全局活跃 session 概览的命令。
+    pub(in crate::ai) fn list_all(&self) -> io::Result<Vec<SuspendedSessionEntry>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(v) => v,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
+        };
+        let mut all = Vec::new();
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let content = match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let parsed: SuspendedSessionFile = match serde_json::from_str(&content) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            match parsed {
+                SuspendedSessionFile::Single(entry) => all.push(entry),
+                SuspendedSessionFile::Many(entries) => all.extend(entries),
+            }
+        }
+        // 按挂起时间倒序排列（新的在前）。
+        all.sort_by(|a, b| b.suspended_at.cmp(&a.suspended_at));
+        Ok(all)
+    }
+
     pub(in crate::ai) fn clear_for_terminal_key(&self, terminal_key: &str) -> io::Result<usize> {
         let entries = self.read_entries(terminal_key)?.unwrap_or_default();
         let cleared = entries.len();
@@ -536,6 +572,37 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn list_all_aggregates_entries_across_terminals() {
+        let root = std::env::temp_dir().join(format!(
+            "rust-tools-suspended-session-listall-{}",
+            Uuid::new_v4()
+        ));
+        let store = SuspendedSessionStore::for_tests_with_root(root.clone());
+        let history_a = root.join("a.sqlite");
+        let history_b = root.join("b.sqlite");
+        store
+            .save_for_terminal_key("tty:/dev/ttys010", "sess-a", &history_a, "default", "model-a")
+            .unwrap();
+        store
+            .save_for_terminal_key("tty:/dev/ttys011", "sess-b", &history_b, "reviewer", "model-b")
+            .unwrap();
+
+        let all = store.list_all().unwrap();
+        assert_eq!(all.len(), 2, "should aggregate across two terminals");
+        let ids: Vec<&str> = all.iter().map(|e| e.session_id.as_str()).collect();
+        assert!(ids.contains(&"sess-a"));
+        assert!(ids.contains(&"sess-b"));
+
+        // 清空一个终端后，list_all 只剩另一个的条目。
+        store.clear_for_terminal_key("tty:/dev/ttys010").unwrap();
+        let remaining = store.list_all().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].session_id, "sess-b");
 
         let _ = fs::remove_dir_all(root);
     }

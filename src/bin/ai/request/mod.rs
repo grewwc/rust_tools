@@ -60,6 +60,16 @@ pub(crate) use error::{
     should_temporarily_disable_model, should_try_model_fallback, sleep_with_cancel, is_retryable_stream_error,
 };
 
+/// 并发请求（前台 turn + 各子代理）各自独立重试，`attempt N/M` 计数互相
+/// 交错、无法区分归属。用 aios 调度 pid 作为作用域标签把每条重试日志绑定到
+/// 具体进程；无 pid（无 TASK_PID 作用域）时返回空串，日志退化为原样。
+fn retry_scope_tag() -> String {
+    match aios_kernel::kernel::current_task_pid() {
+        Some(pid) => format!("[pid {pid}] "),
+        None => String::new(),
+    }
+}
+
 #[commonw::debug_measure_time("do_request_message")]
 pub(super) async fn do_request_messages(
     app: &mut App,
@@ -132,7 +142,8 @@ pub(super) async fn do_request_messages(
                 if attempt < retry_policy.max_attempts {
                     let delay = retry_delay(attempt);
                     eprintln!(
-                        "[Warning] 等待响应头超时 ({}s) - sleep {} 秒后重试 (attempt {}/{})",
+                        "[Warning] {}等待响应头超时 ({}s) - sleep {} 秒后重试 (attempt {}/{})",
+                        retry_scope_tag(),
                         retry_policy.header_timeout_secs,
                         delay.as_secs_f32(),
                         attempt,
@@ -184,14 +195,16 @@ pub(super) async fn do_request_messages(
 
                     if status_code == 429 {
                         eprintln!(
-                            "[Warning] 429 Too Many Requests - 配额超限，sleep {} 秒后重试 (attempt {}/{})",
+                            "[Warning] {}429 Too Many Requests - 配额超限，sleep {} 秒后重试 (attempt {}/{})",
+                            retry_scope_tag(),
                             delay.as_secs_f32(),
                             attempt,
                             max_attempts_for_status
                         );
                     } else {
                         eprintln!(
-                            "[Warning] {} - sleep {} 秒后重试 (attempt {}/{})",
+                            "[Warning] {}{} - sleep {} 秒后重试 (attempt {}/{})",
+                            retry_scope_tag(),
                             status,
                             delay.as_secs_f32(),
                             attempt,
@@ -214,7 +227,8 @@ pub(super) async fn do_request_messages(
                     // 打印 sleep 原因
                     let delay = retry_delay(attempt);
                     eprintln!(
-                        "[Warning] 网络错误 - sleep {} 秒后重试 (attempt {}/{})",
+                        "[Warning] {}网络错误 - sleep {} 秒后重试 (attempt {}/{})",
+                        retry_scope_tag(),
                         delay.as_secs_f32(),
                         attempt,
                         retry_policy.max_attempts
@@ -513,8 +527,8 @@ pub async fn do_request_json(
             Err(_) => {
                 if attempt < REQUEST_MAX_ATTEMPTS {
                     eprintln!(
-                        "[Warning] do_request_json timeout (60s), retrying (attempt {}/{})",
-                        attempt, REQUEST_MAX_ATTEMPTS
+                        "[Warning] {}do_request_json timeout (60s), retrying (attempt {}/{})",
+                        retry_scope_tag(), attempt, REQUEST_MAX_ATTEMPTS
                     );
                     continue;
                 }
@@ -681,8 +695,8 @@ pub async fn do_request_text_streaming(
             Err(_) => {
                 if attempt < REQUEST_MAX_ATTEMPTS {
                     eprintln!(
-                        "[Warning] do_request_text_streaming 等待响应头超时 ({}s), retrying (attempt {}/{})",
-                        retry_policy.header_timeout_secs, attempt, REQUEST_MAX_ATTEMPTS
+                        "[Warning] {}do_request_text_streaming 等待响应头超时 ({}s), retrying (attempt {}/{})",
+                        retry_scope_tag(), retry_policy.header_timeout_secs, attempt, REQUEST_MAX_ATTEMPTS
                     );
                     continue;
                 }
@@ -763,8 +777,8 @@ pub async fn do_request_text_streaming(
 
         if idle_timed_out && content.is_empty() && attempt < REQUEST_MAX_ATTEMPTS {
             eprintln!(
-                "[Warning] do_request_text_streaming chunk 空闲超时 ({}s) 且无内容, retrying (attempt {}/{})",
-                STREAM_RESPONSE_HEADER_TIMEOUT_SECS, attempt, REQUEST_MAX_ATTEMPTS
+                "[Warning] {}do_request_text_streaming chunk 空闲超时 ({}s) 且无内容, retrying (attempt {}/{})",
+                retry_scope_tag(), STREAM_RESPONSE_HEADER_TIMEOUT_SECS, attempt, REQUEST_MAX_ATTEMPTS
             );
             continue;
         }

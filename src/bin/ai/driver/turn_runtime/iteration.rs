@@ -679,6 +679,7 @@ pub(super) async fn execute_turn_iteration(
                     reasoning_text: String::new(),
                     skip_response_drain: false,
                     truncated_by_length: false,
+                    stream_error: false,
                 };
                 return finalize_stream_interaction(
                     app,

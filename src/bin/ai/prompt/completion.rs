@@ -52,6 +52,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":sessions",
         "/close",
         ":close",
+        "/proc",
+        ":proc",
         "/skills",
         ":skills",
     ] {
@@ -161,6 +163,8 @@ impl CommandCompleter {
             ":sessions",
             "/close",
             ":close",
+            "/proc",
+            ":proc",
             "/skills",
             ":skills",
         ]

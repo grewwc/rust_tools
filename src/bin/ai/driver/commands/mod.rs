@@ -4,6 +4,7 @@ pub mod feishu;
 pub mod help;
 pub mod model;
 pub mod persona;
+pub mod proc;
 pub mod session;
 pub mod share;
 pub mod skills;
@@ -19,6 +20,7 @@ pub use feishu::try_handle_feishu_auth_command;
 pub use help::try_handle_help_command;
 pub use model::try_handle_model_command;
 pub use persona::try_handle_persona_command;
+pub use proc::try_handle_proc_command;
 pub use session::try_handle_session_command;
 pub use share::try_handle_share_command;
 pub use skills::try_handle_skills_command;
@@ -44,6 +46,9 @@ pub fn try_handle_interactive_command(
         return Ok(true);
     }
     if try_handle_session_command(app, input)? {
+        return Ok(true);
+    }
+    if try_handle_proc_command(app, input)? {
         return Ok(true);
     }
     if try_handle_checkpoint_command(app, input)? {

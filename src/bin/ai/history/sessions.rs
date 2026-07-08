@@ -1,17 +1,18 @@
 use std::{
     fs::File,
     fs::{self},
-    io,
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
 use chrono::{DateTime, Local};
+use serde_json::json;
 use rust_tools::cw::SkipMap;
 
 use super::{
     blob::{delete_assets_dir, delete_history_artifacts},
     markdown::messages_to_markdown,
-    sqlite::{read_all_messages_sqlite, read_first_user_prompt_sqlite, read_session_title_sqlite, write_session_title_sqlite},
+    sqlite::{checkpoint_wal, read_all_messages_sqlite, read_first_user_prompt_sqlite, read_session_title_sqlite, write_session_title_sqlite},
     types::Message,
 };
 
@@ -38,6 +39,10 @@ impl SessionStore {
 
     pub(in crate::ai) fn ensure_root_dir(&self) -> io::Result<()> {
         fs::create_dir_all(&self.root)
+    }
+
+    pub(in crate::ai) fn sessions_root(&self) -> &Path {
+        &self.root
     }
 
     pub(in crate::ai) fn session_history_file(&self, session_id: &str) -> PathBuf {
@@ -272,6 +277,164 @@ impl SessionStore {
 
         Ok(())
     }
+
+    /// 将 session 完整打包为 zip 归档（SQLite + assets），用于跨机器迁移。
+    /// 归档结构：
+    ///   manifest.json   — 版本号 + 原始 session id + 创建时间
+    ///   session.sqlite  — 完整的 SQLite 数据库（已 checkpoint，含全部消息/标题/摘要）
+    ///   assets/...      — assets 目录内容（若存在）
+    pub(in crate::ai) fn export_session_archive(
+        &self,
+        session_id: &str,
+        output_path: &Path,
+    ) -> io::Result<()> {
+        let sqlite_path = self.session_history_file(session_id);
+        if !sqlite_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("session '{session_id}' not found"),
+            ));
+        }
+
+        // WAL checkpoint：把 -wal 中的数据合并进主库，确保 zip 里的 .sqlite 是完整的。
+        let _ = checkpoint_wal(&sqlite_path);
+
+        if let Some(parent) = output_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let file = File::create(output_path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+
+        // manifest.json
+        let manifest = json!({
+            "version": 1u32,
+            "session_id": session_id,
+            "created_at": Local::now().to_rfc3339(),
+        });
+        zip.start_file("manifest.json", options)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        zip.write_all(serde_json::to_vec_pretty(&manifest)?.as_slice())?;
+
+        // session.sqlite
+        zip.start_file("session.sqlite", options)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut sqlite_file = File::open(&sqlite_path)?;
+        std::io::copy(&mut sqlite_file, &mut zip)?;
+
+        // assets/（可选）
+        let assets_dir = self.session_assets_dir(session_id);
+        if assets_dir.is_dir() {
+            add_dir_to_zip(&mut zip, &assets_dir, "assets", options)?;
+        }
+
+        zip.finish()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 从 zip 归档导入 session。
+    /// `dst_id` 指定导入后的 session id（已存在则报错）。
+    /// 返回导入后的 session id。
+    pub(in crate::ai) fn import_session_archive(
+        &self,
+        archive_path: &Path,
+        dst_id: &str,
+    ) -> io::Result<String> {
+        let file = File::open(archive_path)?;
+        let mut archive = zip::ZipArchive::new(file)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+
+        // 读取 manifest（可选，仅用于校验）
+        let manifest = {
+            let mut buf = Vec::new();
+            match archive.by_name("manifest.json") {
+                Ok(mut entry) => {
+                    std::io::copy(&mut entry, &mut buf)?;
+                    serde_json::from_slice::<serde_json::Value>(&buf).ok()
+                }
+                Err(_) => None,
+            }
+        };
+        let _ = manifest; // 仅用于校验，不强制使用原 id
+
+        let dst_sqlite = self.session_history_file(dst_id);
+        if dst_sqlite.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("destination session '{dst_id}' already exists"),
+            ));
+        }
+
+        self.ensure_root_dir()?;
+
+        // 解压 session.sqlite
+        {
+            let mut entry = archive
+                .by_name("session.sqlite")
+                .map_err(|e| io::Error::other(format!("session.sqlite not found in archive: {e}")))?;
+            let mut out = File::create(&dst_sqlite)?;
+            std::io::copy(&mut entry, &mut out)?;
+        }
+
+        // 解压 assets/（如果存在）
+        let dst_assets = self.session_assets_dir(dst_id);
+        for i in 0..archive.len() {
+            let mut entry = archive
+                .by_index(i)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let name = entry.name().to_string();
+            if name == "manifest.json" || name == "session.sqlite" {
+                continue;
+            }
+            // 只处理 assets/ 前缀的条目
+            let Some(rel) = name.strip_prefix("assets/") else {
+                continue;
+            };
+            if rel.is_empty() || rel.ends_with('/') {
+                continue;
+            }
+            let out_path = dst_assets.join(rel);
+            if entry.is_dir() {
+                fs::create_dir_all(&out_path)?;
+                continue;
+            }
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut out = File::create(&out_path)?;
+            std::io::copy(&mut entry, &mut out)?;
+        }
+
+        Ok(dst_id.to_string())
+    }
+}
+
+/// 递归地把目录内容添加到 zip 归档中。
+fn add_dir_to_zip(
+    zip: &mut zip::ZipWriter<File>,
+    dir: &Path,
+    prefix: &str,
+    options: zip::write::SimpleFileOptions,
+) -> io::Result<()> {
+    let entries = fs::read_dir(dir)?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        let zip_name = format!("{prefix}/{name}");
+        if path.is_dir() {
+            add_dir_to_zip(zip, &path, &zip_name, options)?;
+        } else {
+            zip.start_file(&zip_name, options)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            let mut f = File::open(&path)?;
+            std::io::copy(&mut f, zip)?;
+        }
+    }
+    Ok(())
 }
 
 fn sessions_root_from_history_file(history_file: &Path) -> PathBuf {

@@ -640,39 +640,49 @@ const TRUNCATION_RETRY_NOTE_PREFIX: &str = "tool_followup:output_truncated\n";
 fn append_truncation_retry_note(
     stream_result: &crate::ai::types::StreamResult,
     messages: &mut Vec<Message>,
-    turn_messages: &mut Vec<Message>,
+    consecutive_truncations: usize,
 ) {
     use serde_json::Value;
 
     // 保留模型已输出的可见文本作为"部分进展"，让重试时不至于完全丢失上下文。
     // 截断场景下这段文本往往是半截的意图说明，仅作参考，不当作最终回答。
+    //
+    // 仅写入内存 messages（本 turn 内可见），不写入 turn_messages 持久化轨道。
+    // 原因：partial text 是半截文本，不是有效的对话记录。连续截断时会累积
+    // 多条大体积 partial text，持久化后污染历史文件，下个 turn 加载时占据
+    // 大量字符预算，导致 compress_messages_for_context 压缩/丢弃正常对话历史，
+    // 表现为"历史清空"。与 truncation note 保持一致：过程性内容不持久化。
     let partial = stream_result.assistant_text.trim();
     if !partial.is_empty() {
-        append_message_pair(
-            messages,
-            turn_messages,
-            Message {
-                role: "assistant".to_string(),
-                content: Value::String(partial.to_string()),
-                tool_calls: None,
-                tool_call_id: None,
-                reasoning_content: None,
-            },
-        );
+        messages.push(Message {
+            role: "assistant".to_string(),
+            content: Value::String(partial.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
     }
 
-    let already_present = messages.iter().any(|message| {
-        message.role == ROLE_INTERNAL_NOTE
+    // 移除上一轮的截断提示（如有），替换为携带最新计数的新提示。
+    // 早期版本是幂等的——只注入一次后跳过。但连续截断时模型得不到
+    // "已再次截断"的反馈，只看到和上次一样的上下文，大概率产出相似
+    // 长度的内容再被截断，陷入盲循环。改为每次更新计数，让模型感知
+    // 到严重程度在递增。
+    messages.retain(|message| {
+        !(message.role == ROLE_INTERNAL_NOTE
             && message
                 .content
                 .as_str()
-                .is_some_and(|content| content.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))
+                .is_some_and(|content| content.starts_with(TRUNCATION_RETRY_NOTE_PREFIX)))
     });
-    if already_present {
-        return;
-    }
 
     let mut note = String::from(TRUNCATION_RETRY_NOTE_PREFIX);
+    if consecutive_truncations > 1 {
+        note.push_str(&format!(
+            "（已连续第 {} 次被截断，上次的收缩幅度不够，请进一步大幅缩小单次输出规模）\n",
+            consecutive_truncations
+        ));
+    }
     note.push_str("上一轮响应在生成中途被截断（疑似撞到输出长度上限），未能完成。\n");
     note.push_str("这不是最终回答。请继续当前任务，并显著缩小单次输出规模：\n");
     note.push_str(
@@ -819,6 +829,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
     no_active_skill: bool,
     iteration: usize,
     max_iterations: usize,
+    consecutive_truncations: usize,
     turn_had_tool_error: &mut bool,
 ) -> Result<TurnLoopStep, Box<dyn std::error::Error>> {
     match execution {
@@ -833,15 +844,25 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             Ok(TurnLoopStep::Continue)
         }
         IterationExecution::Truncated(stream_result) => {
-            // 响应被截断（撞输出上限或工具调用 arguments JSON 半截）。保留已产出的
-            // 可见文本作为上下文，并注入一条收缩重写提示后自动重试，避免大文件
-            // write_file 等操作因半截 JSON 被静默丢弃、turn 凭空结束。
-            let _ = writeln!(
-                std::io::stderr(),
-                "  ⚠ 模型响应被截断（疑似输出上限），提示收缩后自动重试…"
-            );
-            append_truncation_retry_note(&stream_result, messages, turn_messages);
-            Ok(TurnLoopStep::Continue)
+            if stream_result.stream_error {
+                // 流读取错误（服务端不稳定）导致的截断：不注入收缩提示，
+                // 不保留 partial text（流中断时的 partial 不可靠），
+                // 简单重试即可。日志已在 orchestrator 层打印。
+                Ok(TurnLoopStep::Continue)
+            } else {
+                // 真截断：模型撞输出上限或工具 JSON 半截。保留已产出的
+                // 可见文本作为上下文，并注入一条收缩重写提示后自动重试。
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "  ⚠ 模型响应被截断（疑似输出上限），提示收缩后自动重试…"
+                );
+                append_truncation_retry_note(
+                    &stream_result,
+                    messages,
+                    consecutive_truncations,
+                );
+                Ok(TurnLoopStep::Continue)
+            }
         }
         IterationExecution::FinalResponse(stream_result) => {
             let reasoning_only_completion = stream_result.assistant_text.trim().is_empty()
@@ -996,6 +1017,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use crate::ai::{
         cli::ParsedCli,
         driver::signal,
@@ -1272,6 +1294,7 @@ mod tests {
                 reasoning_text: "I should read both files first.".to_string(),
                 skip_response_drain: true,
                 truncated_by_length: false,
+                stream_error: false,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1284,6 +1307,7 @@ mod tests {
             true,
             1,
             16,
+            0,
                 &mut false,
         )
         .unwrap();
@@ -1322,6 +1346,7 @@ mod tests {
                 reasoning_text: "I should read both files first.".to_string(),
                 skip_response_drain: true,
                 truncated_by_length: false,
+                stream_error: false,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1334,6 +1359,7 @@ mod tests {
             true,
             2,
             16,
+            0,
                 &mut false,
         )
         .unwrap();
@@ -1374,6 +1400,7 @@ mod tests {
                 reasoning_text: String::new(),
                 skip_response_drain: true,
                 truncated_by_length: false,
+                stream_error: false,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1386,6 +1413,7 @@ mod tests {
             true,
             1,
             16,
+            1,
                 &mut false,
         )
         .unwrap();
@@ -1397,6 +1425,13 @@ mod tests {
         // 部分可见文本被保留为 assistant 上下文。
         assert!(messages.iter().any(|m| m.role == "assistant"
             && m.content.as_str() == Some("现在让我来编写一个综合脚本")));
+        // partial text 不得写入 turn_messages 持久化轨道——连续截断时多条
+        // 大体积半截文本会污染历史文件，导致下个 turn 正常历史被压缩丢弃。
+        assert!(
+            !turn_messages.iter().any(|m| m.role == "assistant"
+                && m.content.as_str() == Some("现在让我来编写一个综合脚本")),
+            "partial text must not leak into turn_messages (persistence track)"
+        );
         // 注入了一条收缩重写提示。
         assert!(messages.iter().any(|m| m.role == ROLE_INTERNAL_NOTE
             && m.content
@@ -1405,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn truncation_retry_note_is_idempotent() {
+    fn truncation_retry_note_replaces_with_updated_count() {
         let mut app = test_app_with_tools(&["write_file"]);
         let mcp = crate::ai::mcp::McpClient::new();
         let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
@@ -1417,7 +1452,7 @@ mod tests {
         let mut force_final_response = false;
         let mut terminal_dedupe_candidate = None;
 
-        for _ in 0..2 {
+        for consecutive in 1..=2 {
             handle_iteration_execution(
                 &mut app,
                 "write a big script",
@@ -1431,6 +1466,7 @@ mod tests {
                     reasoning_text: String::new(),
                     skip_response_drain: true,
                 truncated_by_length: false,
+                stream_error: false,
                 }),
                 &mut messages,
                 &mut turn_messages,
@@ -1443,6 +1479,7 @@ mod tests {
                 true,
                 1,
                 16,
+                consecutive,
                 &mut false,
             )
             .unwrap();
@@ -1457,7 +1494,90 @@ mod tests {
                         .is_some_and(|c| c.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))
             })
             .count();
-        assert_eq!(note_count, 1, "重复截断不应堆叠多份相同提示");
+        // 旧 note 被移除、新 note 被注入，始终只有 1 条（而非堆叠 2 条）。
+        assert_eq!(note_count, 1, "重复截断应替换旧 note 而非堆叠");
+        // 第 2 次截断的 note 应携带计数 "2"，让模型感知严重程度递增。
+        let note = messages.iter().find(|m| {
+            m.role == ROLE_INTERNAL_NOTE
+                && m.content
+                    .as_str()
+                    .is_some_and(|c| c.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))
+        });
+        assert!(
+            note.and_then(|m| m.content.as_str())
+                .is_some_and(|c| c.contains("第 2 次")),
+            "第 2 次截断的 note 应包含计数"
+        );
+    }
+
+    #[test]
+    fn stream_error_truncation_skips_shrink_note_and_partial_text() {
+        let mut app = test_app_with_tools(&["write_file"]);
+        let mcp = crate::ai::mcp::McpClient::new();
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(mcp));
+        let mut messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("write a big script".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let mut turn_messages = Vec::new();
+        let mut persisted_turn_messages = 0;
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut force_final_response = false;
+        let mut terminal_dedupe_candidate: Option<String> = None;
+
+        let step = handle_iteration_execution(
+            &mut app,
+            "write a big script",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            IterationExecution::Truncated(crate::ai::types::StreamResult {
+                outcome: crate::ai::types::StreamOutcome::Truncated,
+                tool_calls: Vec::new(),
+                assistant_text: "partial content from broken stream".to_string(),
+                hidden_meta: String::new(),
+                reasoning_text: String::new(),
+                skip_response_drain: true,
+                truncated_by_length: false,
+                stream_error: true,
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            1,
+            16,
+            1,
+            &mut false,
+        )
+        .unwrap();
+
+        // 应该继续重试
+        assert!(matches!(step, TurnLoopStep::Continue));
+        // 不应注入收缩提示——流错误和输出大小无关
+        let has_shrink_note = messages.iter().any(|m| {
+            m.role == ROLE_INTERNAL_NOTE
+                && m.content
+                    .as_str()
+                    .is_some_and(|c| c.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))
+        });
+        assert!(!has_shrink_note, "stream_error 截断不应注入收缩提示");
+        // 不应保留 partial text——流中断时的 partial 不可靠
+        let has_partial = messages.iter().any(|m| {
+            m.role == "assistant"
+                && m.content
+                    .as_str()
+                    .is_some_and(|c| c.contains("partial content from broken stream"))
+        });
+        assert!(!has_partial, "stream_error 截断不应保留 partial text");
     }
 
     #[test]
@@ -1509,6 +1629,7 @@ mod tests {
                     reasoning_text: String::new(),
                     skip_response_drain: true,
                 truncated_by_length: false,
+                stream_error: false,
                 },
                 allowed_tool_names: Default::default(),
             }),
@@ -1523,6 +1644,7 @@ mod tests {
             true,
             3,
             16,
+            0,
                 &mut false,
         )
         .unwrap();
@@ -1628,6 +1750,7 @@ mod tests {
                         reasoning_text: String::new(),
                         skip_response_drain: true,
                 truncated_by_length: false,
+                stream_error: false,
                     },
                     allowed_tool_names: ["execute_command".to_string()].into_iter().collect(),
                 },

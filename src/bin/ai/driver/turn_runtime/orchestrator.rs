@@ -46,7 +46,7 @@ const VOLATILE_ARG_KEYS: &[&str] = &["offset", "limit", "page", "cursor", "max_r
 
 /// 中段断路器绝对上限：单轮工具迭代达到该值即注入一次收敛提示，远早于
 /// max_iterations 硬上限，用于治理「合法但低效」的工具刷屏。
-const TOOL_ITERATION_SOFT_LIMIT: usize = 96;
+const TOOL_ITERATION_SOFT_LIMIT: usize = 384;
 
 /// 单轮工具迭代软阈值：取 max_iterations 的一半与绝对上限的较小值，保证一定
 /// 早于硬上限触发；对超大 ceiling 也能在中段就提醒收敛。
@@ -659,7 +659,7 @@ mod tests {
         assert_eq!(tool_iteration_soft_limit(0), 1);
         assert_eq!(tool_iteration_soft_limit(1), 1);
         assert_eq!(tool_iteration_soft_limit(10), 5);
-        assert_eq!(tool_iteration_soft_limit(512), TOOL_ITERATION_SOFT_LIMIT);
+        assert_eq!(tool_iteration_soft_limit(768), TOOL_ITERATION_SOFT_LIMIT);
         assert_eq!(
             tool_iteration_soft_limit(100_000),
             TOOL_ITERATION_SOFT_LIMIT
@@ -861,19 +861,39 @@ async fn run_turn_body(
                 // 重置工具循环检测：截断重试期间的重复调用是预期行为，
                 // 不应被误判为工具死循环并触发 hard-stop 强制收敛。
                 supervisor.mark_truncation_skip();
-                // 把本 turn 后续请求的 reasoning effort 降到 Low：high-effort 下模型
-                // 会先产出大量 reasoning token，挤占输出预算，是长文档/大文件写入被
-                // 截断的常见诱因。降档把预算让给实际内容，配合收缩提示提升收敛概率。
-                // resolve_reasoning_effort 每次迭代实时读该字段，改了立即对下一次生效。
-                app.cli.reasoning_effort_override =
-                    Some(Some(crate::ai::provider::ReasoningEffort::Low));
+
+                if stream_result.stream_error {
+                    // 流读取错误（网络抖动 / 服务端异常断流）导致的截断。
+                    // 模型并没有输出太多，降 reasoning_effort 和注入收缩提示都无意义。
+                    // 只重置计数（不累积——这不是模型的错），简单重试即可。
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  ⚠ 响应流读取中断（疑似服务端不稳定），自动重试…"
+                    );
+                    consecutive_truncations = 0;
+                } else {
+                    // 真截断：模型撞输出上限或工具 JSON 半截。
+                    // 渐进式 reasoning effort 降档，把输出预算从 reasoning 让给实际内容。
+                    // resolve_reasoning_effort 每次迭代实时读该字段，改了立即对下一次生效。
+                    //
+                    // 1 次截断 → Low（减半推理开销）
+                    // 2 次截断 → Minimal（仅保留最低推理）
+                    // 3 次以上 → 完全禁用 reasoning（把全部输出预算让给可见内容）
+                    app.cli.reasoning_effort_override = Some(match consecutive_truncations {
+                        1 => Some(crate::ai::provider::ReasoningEffort::Low),
+                        2 => Some(crate::ai::provider::ReasoningEffort::Minimal),
+                        _ => None, // Some(None) = 禁用 reasoning，不下发 effort 字段
+                    });
+                }
+
                 let partial_text = stream_result.assistant_text.trim();
                 let has_visible_text = !partial_text.is_empty();
 
-                // 模型已产出可见文本但仍撞长度上限（典型：推理模型 reasoning 占满
+                // 模型已产出可见文本但仍连续撞长度上限（典型：推理模型 reasoning 占满
                 // 预算）。继续重试通常无帮助——模型会反复产出同样长度的内容。
                 // 给一次降档重试机会后即接受部分文本作为最终回答。
-                if has_visible_text && consecutive_truncations >= 8 {
+                // 但 stream_error 场景不计入 consecutive_truncations，不会触发此分支。
+                if has_visible_text && consecutive_truncations >= 8 && !stream_result.stream_error {
                     let _ = writeln!(
                         std::io::stderr(),
                         "  ▲ 连续 {} 次输出被截断，保留已产出的部分文本",
@@ -883,7 +903,8 @@ async fn run_turn_body(
                     break 'turn Ok(None);
                 }
 
-                if consecutive_truncations > 8 {
+                // stream_error 已在上面重置 consecutive_truncations=0，不会进入此分支。
+                if consecutive_truncations > 8 && !stream_result.stream_error {
                     let _ = writeln!(
                         std::io::stderr(),
                         "  ✗ 连续 {} 次响应被截断，停止重试",
@@ -908,6 +929,7 @@ async fn run_turn_body(
                 &mut final_assistant_recorded, &mut force_final_response,
                 &mut terminal_dedupe_candidate,
                 skill_turn.matched_skill_name().is_none(), iteration, max_iterations,
+                consecutive_truncations,
                 &mut turn_had_tool_error,
             ) {
                 Ok(s) => s,

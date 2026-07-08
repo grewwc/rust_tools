@@ -153,6 +153,10 @@ pub fn try_handle_session_command(
                 "  /sessions export-current [output.md]    export current session to Markdown"
             );
             println!("  /sessions export-last [output.md]       export latest session to Markdown");
+            println!("  /sessions export-archive <id> [output.zip]       full session archive for migration");
+            println!("  /sessions export-archive-current [output.zip]    archive current session");
+            println!("  /sessions export-archive-last [output.zip]       archive latest session");
+            println!("  /sessions import <file.zip> [as=<id>]           import session from archive");
             println!("  /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
             println!("  /sessions branch <keep_messages> [src=<id>] [as=<id>]");
             println!(
@@ -391,6 +395,97 @@ pub fn try_handle_session_command(
                 }
                 Err(err) => {
                     eprintln!("Failed to export session: {}", err);
+                }
+            }
+        }
+        "export-archive" | "export-bundle" | "pack" => {
+            let Some(id) = parts.next() else {
+                println!("missing session id. try: /sessions export-archive <id> [output.zip]");
+                return Ok(true);
+            };
+            let output_path = parts.next().unwrap_or("session_archive.zip");
+            let output_path = std::path::Path::new(output_path);
+
+            match store.export_session_archive(id, output_path) {
+                Ok(()) => {
+                    println!(
+                        "Archived session '{}' to '{}'",
+                        id,
+                        output_path.display()
+                    );
+                }
+                Err(err) => {
+                    eprintln!("Failed to export archive: {}", err);
+                }
+            }
+        }
+        "export-archive-current" | "export-bundle-current" | "pack-current" | "pack-cur" => {
+            let output_path = parts.next().unwrap_or("session_archive.zip");
+            let output_path = std::path::Path::new(output_path);
+
+            match store.export_session_archive(&app.session_id, output_path) {
+                Ok(()) => {
+                    println!(
+                        "Archived current session '{}' to '{}'",
+                        app.session_id,
+                        output_path.display()
+                    );
+                }
+                Err(err) => {
+                    eprintln!("Failed to export archive: {}", err);
+                }
+            }
+        }
+        "export-archive-last" | "export-bundle-last" | "pack-last" | "pack-latest" => {
+            let sessions = store.list_sessions()?;
+            let Some(last) = sessions.first() else {
+                println!("No sessions found to archive.");
+                return Ok(true);
+            };
+            let output_path = parts.next().unwrap_or("session_archive.zip");
+            let output_path = std::path::Path::new(output_path);
+
+            match store.export_session_archive(&last.id, output_path) {
+                Ok(()) => {
+                    println!(
+                        "Archived latest session '{}' to '{}'",
+                        last.id,
+                        output_path.display()
+                    );
+                }
+                Err(err) => {
+                    eprintln!("Failed to export archive: {}", err);
+                }
+            }
+        }
+        "import" | "import-archive" | "unpack" => {
+            let Some(file) = parts.next() else {
+                println!("missing archive file. try: /sessions import <file.zip> [as=<id>]");
+                return Ok(true);
+            };
+            let archive_path = std::path::Path::new(file);
+            // 可选 as=<id> 指定导入后的 session id
+            let mut dst: Option<String> = None;
+            for arg in parts.by_ref() {
+                if let Some(v) = arg.strip_prefix("as=") {
+                    dst = Some(v.to_string());
+                }
+            }
+            let dst_id = dst.unwrap_or_else(|| Uuid::new_v4().to_string());
+
+            match store.import_session_archive(archive_path, &dst_id) {
+                Ok(id) => {
+                    crate::ai::history::invalidate_context_history_cache_for(
+                        &app.session_history_file,
+                    );
+                    clear_session_local_runtime_state(app);
+                    app.session_id = id.clone();
+                    app.session_history_file = store.session_history_file(&id);
+                    app.sync_persona_session_binding();
+                    println!("Imported session from '{}' -> '{}', switched to it.", file, id);
+                }
+                Err(err) => {
+                    eprintln!("Failed to import session: {}", err);
                 }
             }
         }
@@ -768,6 +863,62 @@ mod tests {
             std::env::remove_var("RUST_TOOLS_SUSPENDED_SESSIONS_DIR");
             std::env::remove_var("TERM_SESSION_ID");
         }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn export_import_archive_roundtrip_preserves_messages() {
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let root = test_history_root();
+        let app = test_app(&root);
+        let store = SessionStore::new(app.config.history_file.as_path());
+
+        // 写入测试消息
+        let src_path = store.session_history_file(&app.session_id);
+        let original_messages = [
+            Message {
+                role: "user".to_string(),
+                content: Value::String("hello world".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String("hi there".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+        append_history_messages(&src_path, &original_messages).unwrap();
+
+        // 导出到 zip
+        let archive_path = root.join("export.zip");
+        store
+            .export_session_archive(&app.session_id, &archive_path)
+            .expect("export should succeed");
+        assert!(archive_path.exists(), "archive file should exist");
+
+        // 导入为新 session
+        let dst_id = "imported-session".to_string();
+        let result = store.import_session_archive(&archive_path, &dst_id);
+        assert!(result.is_ok(), "import should succeed: {:?}", result.err());
+
+        // 验证导入后的消息与原始消息一致
+        let imported_messages = store.read_all_messages(&dst_id).unwrap();
+        assert_eq!(imported_messages.len(), original_messages.len());
+        assert_eq!(imported_messages[0].role, "user");
+        assert_eq!(
+            imported_messages[0].content,
+            Value::String("hello world".to_string())
+        );
+        assert_eq!(imported_messages[1].role, "assistant");
+        assert_eq!(
+            imported_messages[1].content,
+            Value::String("hi there".to_string())
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 }

@@ -827,6 +827,28 @@ fn git_subcommand_index(command_tokens: &[String]) -> Option<usize> {
     None
 }
 
+/// 被安全策略硬拦的 `git` 子命令及其拒绝原因。
+///
+/// `git` 本身不在 `denied_programs` 里（status/log/diff 等子命令无害且必要），
+/// 只对下列子命令硬拦。全局选项变体（如 `git -C /repo push`）同样命中。
+const BLOCKED_GIT_SUBCOMMANDS: &[(&str, &str)] = &[
+    // 避免把本地提交推送到远端仓库。
+    ("push", "git push is blocked by sandbox policy"),
+    // `git stash`（含 pop/drop/clear 等子动作）会暂存甚至丢弃工作区改动，
+    // 容易丢失未提交的工作，禁止 agent 自主调用。
+    ("stash", "git stash is blocked by sandbox policy"),
+];
+
+/// 若 `git` 子命令命中拦截名单，返回对应的拒绝原因。
+fn blocked_git_subcommand(command_tokens: &[String]) -> Option<&'static str> {
+    let idx = git_subcommand_index(command_tokens)?;
+    let sub = command_tokens[idx].to_ascii_lowercase();
+    BLOCKED_GIT_SUBCOMMANDS
+        .iter()
+        .find(|(name, _)| *name == sub)
+        .map(|(_, reason)| *reason)
+}
+
 /// =========================================================================
 /// Shell 注入面检查
 /// =========================================================================
@@ -1149,14 +1171,12 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         ));
     }
 
-    // 安全策略：拦截 `git push`，避免 agent 把本地提交推送到远端仓库。
+    // 安全策略：拦截有破坏性/越权风险的 `git` 子命令（见 `BLOCKED_GIT_SUBCOMMANDS`）。
     // `git` 本身不在 denied_programs 里（status/log/diff 等子命令无害且必要），
-    // 只对 `push` 子命令硬拦。全局选项变体（`git -C /repo push`）同样命中。
+    // 只对名单内的子命令硬拦。全局选项变体（`git -C /repo push`）同样命中。
     if program == "git" {
-        if let Some(idx) = git_subcommand_index(command_tokens) {
-            if command_tokens[idx].eq_ignore_ascii_case("push") {
-                return Err("git push is blocked by sandbox policy".to_string());
-            }
+        if let Some(reason) = blocked_git_subcommand(command_tokens) {
+            return Err(reason.to_string());
         }
     }
 
@@ -1214,13 +1234,11 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
                 "indirect execution of '{nested}' via '{program}' is blocked"
             ));
         }
-        // 间接执行 `git push`（如 `env git push`、`xargs git push`）同样需要拦截，
-        // 否则可借包装器绕过直接的 `git push` 检查。
+        // 间接执行被拦的 `git` 子命令（如 `env git push`、`xargs git stash`）同样需要拦截，
+        // 否则可借包装器绕过直接的检查。
         if nested == "git" {
-            if let Some(sub_idx) = git_subcommand_index(&command_tokens[idx..]) {
-                if command_tokens[idx + sub_idx].eq_ignore_ascii_case("push") {
-                    return Err("git push is blocked by sandbox policy".to_string());
-                }
+            if let Some(reason) = blocked_git_subcommand(&command_tokens[idx..]) {
+                return Err(reason.to_string());
             }
         }
     }
@@ -1571,6 +1589,37 @@ mod tests {
         // `push` 作为普通文本参数（非子命令）不应误拦
         assert!(validate("echo git push").is_ok());
         assert!(validate("printf '%s' push").is_ok());
+    }
+
+    #[test]
+    fn blocks_git_stash_in_all_common_forms() {
+        // 直接调用（含 stash 的各种子动作）
+        assert!(validate("git stash").is_err());
+        assert!(validate("git stash list").is_err());
+        assert!(validate("git stash pop").is_err());
+        assert!(validate("git stash drop").is_err());
+        assert!(validate("git stash clear").is_err());
+        assert!(validate("git stash push -m wip").is_err());
+        // 全局选项变体（-C / -c / --git-dir 等）不应绕过检查
+        assert!(validate("git -C /repo stash").is_err());
+        assert!(validate("git -c user.email=a@b.c stash").is_err());
+        assert!(validate("git --git-dir=/repo stash").is_err());
+        assert!(validate("git --no-pager stash").is_err());
+        // 大小写不敏感
+        assert!(validate("git STASH").is_err());
+        // 绝对/相对路径仍按 basename 识别
+        assert!(validate("/usr/bin/git stash").is_err());
+        // 链式命令中的 stash 段也要被拦
+        assert!(validate("git status && git stash").is_err());
+        assert!(validate("git stash && echo done").is_err());
+        // 间接包装器执行 git stash 同样拦截
+        assert!(validate("env git stash").is_err());
+        assert!(validate("xargs git stash").is_err());
+        assert!(validate("nohup git stash").is_err());
+        assert!(validate("command git stash").is_err());
+        // `stash` 作为普通文本参数（非子命令）不应误拦
+        assert!(validate("echo git stash").is_ok());
+        assert!(validate("printf '%s' stash").is_ok());
     }
 
     #[test]
