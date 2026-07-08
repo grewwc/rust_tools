@@ -2,6 +2,7 @@ mod extract;
 mod framing;
 mod normalize;
 mod render;
+mod inline_recovery;
 mod runtime;
 mod splitter;
 mod state;

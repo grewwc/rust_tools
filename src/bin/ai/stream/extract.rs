@@ -148,7 +148,7 @@ pub(super) fn extract_chunk_events_streaming(
         events.push(StreamTextEvent::CloseThinking);
     }
     if !delta.content.is_empty() {
-        let normalized = super::runtime::normalize_inline_tool_call_markup(&delta.content);
+        let normalized = super::inline_recovery::normalize_inline_tool_call_markup(&delta.content);
         let (cleaned, mut hermes_events) = hermes_streamer.push(&normalized);
         // 再把 Hermes 抽离后的可见文本交给 Anthropic（`<invoke name=...>`）解析器，
         // 兼容 deepseek-v4-flash 等用该格式输出工具调用的模型。

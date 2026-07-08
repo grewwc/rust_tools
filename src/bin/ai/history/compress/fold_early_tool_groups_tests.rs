@@ -1,0 +1,286 @@
+    use super::*;
+    use rustc_hash::FxHashSet;
+    use crate::ai::types::{FunctionCall, ToolCall};
+
+    fn msg(role: &str, content: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn assistant_call(id: &str, name: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn tool_result(id: &str, content: &str) -> Message {
+        Message {
+            role: "tool".to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: Some(id.to_string()),
+            reasoning_content: None,
+        }
+    }
+
+    /// 构造：system + user + N 个 (assistant tool_calls + tool 结果) 组，全部在
+    /// 同一个 user 轮内（只有一条 user 消息）——正是"臃肿全堆在当前轮"的场景。
+    fn single_turn_with_groups(n: usize, tool_result_chars: usize) -> Vec<Message> {
+        let mut messages = vec![msg("system", "system prompt"), msg("user", "干活")];
+        for i in 0..n {
+            let id = format!("call-{i}");
+            messages.push(assistant_call(&id, "text_grep"));
+            messages.push(tool_result(&id, &"x".repeat(tool_result_chars)));
+        }
+        messages
+    }
+
+    fn assert_tool_pairs_consistent(messages: &[Message]) {
+        let mut assistant_ids: FxHashSet<String> = FxHashSet::default();
+        for m in messages {
+            if m.role == "assistant"
+                && let Some(calls) = &m.tool_calls
+            {
+                for c in calls {
+                    assistant_ids.insert(c.id.clone());
+                }
+            }
+        }
+        let mut tool_ids: FxHashSet<String> = FxHashSet::default();
+        for m in messages {
+            if m.role == "tool"
+                && let Some(id) = &m.tool_call_id
+            {
+                tool_ids.insert(id.clone());
+            }
+        }
+        assert_eq!(
+            assistant_ids, tool_ids,
+            "every assistant.tool_calls id must have a paired tool message and vice versa"
+        );
+    }
+
+    #[test]
+    fn folds_early_groups_in_a_single_bloated_turn() {
+        let messages = single_turn_with_groups(10, 2_000);
+        let before = messages_total_chars(&messages);
+
+        let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
+
+        // 10 组里最近 4 组逐字保留，较早 6 组被折叠。
+        assert_eq!(folded_groups, 6);
+        let after = messages_total_chars(&folded);
+        assert!(
+            after < before,
+            "folding must reduce size: {after} !< {before}"
+        );
+        assert_tool_pairs_consistent(&folded);
+    }
+
+    #[test]
+    fn preserves_user_message_verbatim() {
+        let messages = single_turn_with_groups(8, 1_500);
+        let (folded, _) = fold_early_tool_groups(&messages, 4);
+
+        let user = folded
+            .iter()
+            .find(|m| m.role == "user")
+            .expect("user message must survive");
+        assert_eq!(value_to_string(&user.content), "干活");
+    }
+
+    #[test]
+    fn keeps_recent_groups_verbatim() {
+        let messages = single_turn_with_groups(8, 1_500);
+        let (folded, _) = fold_early_tool_groups(&messages, 4);
+
+        // 最近 4 组的 tool 结果应原样保留（未被折叠成 stub）。
+        let full_tool_results = folded
+            .iter()
+            .filter(|m| m.role == "tool" && value_to_string(&m.content) == "x".repeat(1_500))
+            .count();
+        assert_eq!(full_tool_results, 4);
+    }
+
+    #[test]
+    fn no_op_when_group_count_within_keep_window() {
+        let messages = single_turn_with_groups(3, 1_000);
+        let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
+
+        assert_eq!(folded_groups, 0);
+        assert_eq!(folded.len(), messages.len());
+    }
+
+    #[test]
+    fn stub_preserves_file_path_recall_anchor() {
+        let mut messages = vec![msg("system", "s"), msg("user", "干活")];
+        // 早期一组：read_file 结果已外溢，含 file_path 指针，必须在 stub 中保留。
+        messages.push(assistant_call("call-old", "read_file"));
+        messages.push(tool_result(
+            "call-old",
+            "Output preserved for non-compressible tool `read_file`.\n- file_path: /tmp/session/xyz.txt\n- use read_file to inspect exact content.",
+        ));
+        // 追加足够多的近端组把上面那组挤进折叠区。
+        for i in 0..6 {
+            let id = format!("call-{i}");
+            messages.push(assistant_call(&id, "text_grep"));
+            messages.push(tool_result(&id, "recent"));
+        }
+
+        let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
+        assert!(folded_groups >= 1);
+        let stub_text: String = folded
+            .iter()
+            .filter(|m| m.role == ROLE_INTERNAL_NOTE)
+            .map(|m| value_to_string(&m.content))
+            .collect();
+        assert!(
+            stub_text.contains("/tmp/session/xyz.txt"),
+            "folded stub must retain the file_path recall anchor, got: {stub_text}"
+        );
+    }
+
+    fn assistant_call_with_reasoning(id: &str, name: &str, reasoning: &str) -> Message {
+        let mut m = assistant_call(id, name);
+        m.reasoning_content = Some(reasoning.to_string());
+        m
+    }
+
+    fn assistant_plain_with_reasoning(reasoning: &str) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String("答复".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: Some(reasoning.to_string()),
+        }
+    }
+
+    /// 跨轮滑窗：带 tool_calls 的 assistant reasoning 只保留最近
+    /// `KEEP_RECENT_TOOL_CALL_REASONING` 条，更早的置 None；纯回答 reasoning 只留最近一条。
+    #[test]
+    fn keeps_only_recent_tool_call_reasoning_across_turns() {
+        assert_eq!(KEEP_RECENT_TOOL_CALL_REASONING, 3);
+
+        let mut messages = vec![
+            msg("system", "s"),
+            msg("user", "干活"),
+            // 早期纯回答 reasoning：非最近一条，应被丢弃。
+            assistant_plain_with_reasoning("early-plain"),
+        ];
+        // 5 组带 tool_calls 的 reasoning：rank 0/1 应丢弃，rank 2/3/4 保留。
+        for i in 0..5 {
+            let id = format!("call-{i}");
+            messages.push(assistant_call_with_reasoning(
+                &id,
+                "text_grep",
+                &format!("tc-{i}"),
+            ));
+            messages.push(tool_result(&id, "r"));
+        }
+        // 最近一条纯回答 reasoning：应保留。
+        messages.push(assistant_plain_with_reasoning("final-plain"));
+
+        keep_only_recent_reasoning_content(&mut messages);
+
+        // 用 tool_call id 定位 tool-call reasoning。
+        let tc_reasoning = |id: &str| -> Option<String> {
+            messages
+                .iter()
+                .find(|m| {
+                    m.tool_calls
+                        .as_ref()
+                        .map(|calls| calls.iter().any(|c| c.id == id))
+                        .unwrap_or(false)
+                })
+                .and_then(|m| m.reasoning_content.clone())
+        };
+        assert_eq!(
+            tc_reasoning("call-0"),
+            None,
+            "rank 0 tool-call reasoning must be dropped"
+        );
+        assert_eq!(
+            tc_reasoning("call-1"),
+            None,
+            "rank 1 tool-call reasoning must be dropped"
+        );
+        assert_eq!(tc_reasoning("call-2").as_deref(), Some("tc-2"));
+        assert_eq!(tc_reasoning("call-3").as_deref(), Some("tc-3"));
+        assert_eq!(tc_reasoning("call-4").as_deref(), Some("tc-4"));
+
+        // 纯回答 reasoning：只保留最近一条（final-plain），早期一条置 None。
+        let plain_reasonings: Vec<Option<String>> = messages
+            .iter()
+            .filter(|m| m.role == "assistant" && m.tool_calls.is_none())
+            .map(|m| m.reasoning_content.clone())
+            .collect();
+        assert_eq!(
+            plain_reasonings,
+            vec![None, Some("final-plain".to_string())]
+        );
+    }
+
+    #[test]
+    fn persisted_summary_absorbs_prior_summary_without_nested_prefix() {
+        let messages = vec![
+            msg(
+                ROLE_INTERNAL_NOTE,
+                "历史摘要（自动压缩，以下为更早对话的简短语义）：\n- 更早摘要: 初始目标: 修复压缩\n- 已知结论: 保留路径",
+            ),
+            msg("user", "继续排查 compress.rs"),
+            msg("assistant", "发现摘要递归污染"),
+        ];
+
+        let summary = build_persisted_summary_text(&messages, 2_000);
+
+        assert!(summary.contains("初始目标: 修复压缩"), "{summary}");
+        assert!(
+            !summary.contains("更早摘要: - 更早摘要:"),
+            "summary should not recursively wrap prior summaries: {summary}"
+        );
+    }
+
+    #[test]
+    fn summary_model_input_drops_ephemeral_internal_notes() {
+        let mut messages = vec![
+            msg("user", "修复问题"),
+            msg(ROLE_INTERNAL_NOTE, "self_note:\n一次性观察"),
+            msg(ROLE_INTERNAL_NOTE, "tool_followup:output_truncated"),
+            msg(
+                ROLE_INTERNAL_NOTE,
+                "对话摘要（自动压缩，以下为早期对话要点）：\n初始目标: 保留",
+            ),
+            msg(
+                ROLE_INTERNAL_NOTE,
+                "历史摘要（自动压缩，以下为更早对话的简短语义）：\n初始目标: 应去重",
+            ),
+        ];
+
+        normalize_internal_notes_for_summary_model(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        let note = value_to_string(&messages[1].content);
+        assert!(note.contains("已有历史摘要"), "{note}");
+        assert!(note.contains("初始目标: 保留"), "{note}");
+        assert!(!note.contains("self_note"), "{note}");
+        assert!(!note.contains("tool_followup"), "{note}");
+        assert!(!note.contains("应去重"), "{note}");
+    }

@@ -1,5 +1,15 @@
 # Driver Guide
 
+## Module layout
+
+- `mod.rs`: main run loop, session management, background dispatch, MCP init
+- `tests.rs`: driver-level integration tests
+- `tools/`: tool execution subsystem
+  - `mod.rs`: tool routing, execution, retry, parallel batches, tool cache
+  - `async_pipe.rs`: async tool pipe system (task_spawn/task_status/task_wait lifecycle, channel/futex, snapshot persistence)
+  - `tests.rs`: tool execution tests
+  - `barrier.rs`, `oauth.rs`, `sync_task.rs`: specialized submodules
+
 ## Scope
 
 Applies to `src/bin/ai/driver/**`.

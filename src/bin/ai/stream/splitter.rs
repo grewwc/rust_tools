@@ -281,7 +281,7 @@ impl HermesXmlToolCallStreamer {
                         self.pending.drain(..after);
                         let name = name.clone();
                         if !name.is_empty() {
-                            let args = super::runtime::parse_hermes_function_body(&body)
+                            let args = super::inline_recovery::parse_hermes_function_body(&body)
                                 .unwrap_or_else(|| "{}".to_string());
                             events.push(InternalToolCallStreamEvent::Begin(name));
                             events.push(InternalToolCallStreamEvent::Args(args));

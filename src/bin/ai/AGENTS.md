@@ -9,10 +9,15 @@ actually touches that subsystem.
 ## Layout
 
 - `driver/`: run loop, turn preparation/runtime, prompt building, thinking, reflection
+  - `driver/tools/`: tool execution, async tool pipe, tool cache, barrier/oauth/sync_task submodules
+- `request/`: LLM request execution (error/retry, thinking mode, skill routing, message normalization, stream types)
 - `tools/`: tool registry, service implementations, storage helpers, progressive loading
+  - `tools/task_tools/`: task_spawn/task_wait lifecycle + agent team orchestration + tests
 - `knowledge/`: memory/knowledge storage, recall, indexing, embedding
 - `mcp/`: stdio MCP client/init/connection/routing
 - `provider/`: provider adapters and request/stream differences
+- `stream/`: streaming response processing (inline_recovery, runtime, extract, splitter, render)
+- `history/compress/`: history compression (text_utils, tool_groups, tool_overflow, tests)
 - `builtin_agents/`, `builtin_skills/`: compiled-in prompt assets
 - core manifests: `agents.rs`, `skills.rs`, `persona.rs`, `models.rs`, `types.rs`, `config_schema.rs`
 
