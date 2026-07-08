@@ -16,6 +16,7 @@ pub fn print_interactive_help() {
     println!("    /history replay              replay the last turn's assistant conclusion (text only)");
     println!("    /feishu-auth              authenticate with Feishu");
     println!("    /share [output.md]        export current session as shareable markdown");
+    println!("    /close                    close and delete current session, then exit");
     println!();
     println!("  Persona management:");
     println!("    /personas                 list personas");

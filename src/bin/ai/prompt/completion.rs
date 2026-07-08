@@ -50,6 +50,8 @@ static COMMANDS_TRIE: LazyLock<Trie> = LazyLock::new(|| {
         ":personas",
         "/sessions",
         ":sessions",
+        "/close",
+        ":close",
         "/skills",
         ":skills",
     ] {
@@ -157,6 +159,8 @@ impl CommandCompleter {
             ":personas",
             "/sessions",
             ":sessions",
+            "/close",
+            ":close",
             "/skills",
             ":skills",
         ]
@@ -881,6 +885,20 @@ mod tests {
             .complete("/agen", 5, &Context::new(&history))
             .unwrap();
         assert!(pairs.iter().any(|pair| pair.replacement == "/agents"));
+    }
+    #[test]
+    fn command_completion_expands_top_level_close_command() {
+        let completer = CommandCompleter;
+        let history = DefaultHistory::new();
+        let (_, pairs) = completer
+            .complete("/clo", 4, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == "/close"));
+        // ":" 前缀同样可用
+        let (_, pairs) = completer
+            .complete(":clo", 4, &Context::new(&history))
+            .unwrap();
+        assert!(pairs.iter().any(|pair| pair.replacement == ":close"));
     }
 
     #[test]

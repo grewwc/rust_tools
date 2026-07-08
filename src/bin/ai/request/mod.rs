@@ -57,7 +57,7 @@ pub(crate) use error::{
     is_transient_error, parse_retry_after, request_retry_policy,
     request_retry_policy_for_current_context, retry_delay, send_with_hedged_backup,
     should_abort_retry_wait, should_retry_status, should_temporarily_disable_auto_selected_model,
-    should_temporarily_disable_model, should_try_model_fallback, sleep_with_cancel,
+    should_temporarily_disable_model, should_try_model_fallback, sleep_with_cancel, is_retryable_stream_error,
 };
 
 #[commonw::debug_measure_time("do_request_message")]
@@ -639,8 +639,10 @@ pub async fn do_request_text_streaming(
         let retry_policy = request_retry_policy_for_current_context();
         // 等待响应头：握手 + 服务端开始返回。流式下这一步很快。
         // 使用 hedged backup：如果 primary 在短时间内没响应，自动发 backup 请求。
+        // 与非流式路径一致，header 等待超时取自 retry_policy.header_timeout_secs
+        // （auto 子 agent 走 30s 而非硬编码 90s），chunk 空闲超时仍用固定常量。
         let mut response = match tokio::time::timeout(
-            Duration::from_secs(STREAM_RESPONSE_HEADER_TIMEOUT_SECS),
+            Duration::from_secs(retry_policy.header_timeout_secs),
             send_with_hedged_backup(build_request, retry_policy.hedged_backup_after_secs(), retry_policy.hedged_max_sends()),
         )
         .await
@@ -680,7 +682,7 @@ pub async fn do_request_text_streaming(
                 if attempt < REQUEST_MAX_ATTEMPTS {
                     eprintln!(
                         "[Warning] do_request_text_streaming 等待响应头超时 ({}s), retrying (attempt {}/{})",
-                        STREAM_RESPONSE_HEADER_TIMEOUT_SECS, attempt, REQUEST_MAX_ATTEMPTS
+                        retry_policy.header_timeout_secs, attempt, REQUEST_MAX_ATTEMPTS
                     );
                     continue;
                 }

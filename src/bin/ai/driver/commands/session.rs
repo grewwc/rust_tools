@@ -107,11 +107,19 @@ pub fn try_handle_session_command(
         return Ok(false);
     };
     let top_level_suspend = matches!(cmd, "suspend" | "bg" | "detach" | "susp");
-    if cmd != "sessions" && cmd != "session" && cmd != "ss" && !top_level_suspend {
+    let top_level_close = cmd == "close";
+    if cmd != "sessions"
+        && cmd != "session"
+        && cmd != "ss"
+        && !top_level_suspend
+        && !top_level_close
+    {
         return Ok(false);
     }
     let action = if top_level_suspend {
         "suspend"
+    } else if top_level_close {
+        "close"
     } else {
         parts.next().unwrap_or("list")
     };
@@ -128,6 +136,7 @@ pub fn try_handle_session_command(
             println!("  /sessions new             create and switch to new session");
             println!("  /sessions use <id>        switch to specified session");
             println!("  /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)");
+            println!("  /close                    close and delete current session, then exit (or :close)");
             println!(
                 "  /sessions bound           list suspended sessions bound to current terminal"
             );
@@ -244,6 +253,25 @@ pub fn try_handle_session_command(
                     eprintln!("[suspend] {}", err);
                 }
             }
+        }
+        "close" => {
+            // /close：删除当前 session 后退出交互式对话（与 /suspend 的"保留并回到 shell"
+            // 相反，这里直接销毁 session）。复用 store（已在上方构造）。
+            let current_id = app.session_id.clone();
+            let deleted_path = app.session_history_file.clone();
+            match store.delete_session(&current_id) {
+                Ok(true) => {
+                    crate::ai::history::invalidate_context_history_cache_for(&deleted_path);
+                    println!("Closed and deleted session: {}", current_id);
+                }
+                Ok(false) => {
+                    println!("Session already removed: {}", current_id);
+                }
+                Err(err) => {
+                    eprintln!("[close] failed to delete session: {}", err);
+                }
+            }
+            crate::ai::driver::signal::request_shutdown(app.shutdown.as_ref());
         }
         "bound" | "bindings" | "suspended" => {
             match SuspendedSessionStore::new().list_current_terminal() {

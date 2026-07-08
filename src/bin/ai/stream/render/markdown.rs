@@ -33,6 +33,10 @@ pub(in crate::ai) struct MarkdownStreamRenderer {
     line_preview_emitted: bool,
     line_preview_height: usize,
     table_state: TableState,
+    // 表格缓冲期已在屏幕上显示了一行占位提示（“⋯ 生成表格中”）。表格就绪一次性
+    // 渲染时需先用确定的 `\x1b[1A\r\x1b[0J` 上移恰好 1 行清掉它——占位强制单行且
+    // 短于终端宽，故这个“1 行”不依赖任何折行预测，不会重现残像叠表。
+    table_placeholder_shown: bool,
     dimmed: bool,
     code_preview_segment_width: usize,
     // 已缓存但尚未落地的纯空行数。正文/收尾常带尾随空行，逐行直出会在屏幕上
@@ -67,6 +71,7 @@ impl MarkdownStreamRenderer {
             line_preview_emitted: false,
             line_preview_height: 0,
             table_state: TableState::None,
+            table_placeholder_shown: false,
             dimmed: false,
             code_preview_segment_width: 0,
             deferred_blank_lines: 0,
@@ -145,21 +150,24 @@ impl MarkdownStreamRenderer {
         }
 
         let state = std::mem::replace(&mut self.table_state, TableState::None);
-        let rendered = match state {
+        // 收尾前先清掉可能残留的表格占位提示（上移量恒为 1，不依赖折行预测）。
+        let mut rendered = self.clear_table_placeholder();
+        rendered.push_str(&match state {
             TableState::None => String::new(),
+            // 表头行后流已结束、始终没等到分隔行——它只是含 `|` 的普通文本行。
+            // 全程未 echo，直接当普通行渲染即可。
             TableState::PendingHeader {
                 indent,
                 header_line,
-                preview_height,
-            } => self.rewrite_plain_preview(&format!("{indent}{header_line}"), preview_height),
+            } => self.render_buffered_plain(&indent, &header_line),
+            // 表格在流结束时收尾：一次性画出成品盒框表，无 cursor-up。
             TableState::InTable {
                 indent,
                 header,
                 align,
                 rows,
-                preview_height,
-            } => self.rewrite_table_preview(&indent, preview_height, &header, &align, &rows),
-        };
+            } => self.render_table_block(&indent, &header, &align, &rows),
+        });
         if !rendered.is_empty() {
             out.write_all(rendered.as_bytes())?;
             self.bol = rendered.ends_with('\n');
@@ -259,27 +267,14 @@ impl MarkdownStreamRenderer {
         if self.deferred_blank_lines > 0 && self.line_buf.chars().count() == 1 {
             self.flush_deferred_blank_lines(out)?;
         }
-        if self.should_emit_table_preview_live() {
-            self.handle_table_preview(out, ch)
-        } else {
-            self.handle_realtime_output(out, ch)
+        // 表格上下文（含潜在表头行）一律静默缓冲，不逐字 echo，也不做 cursor-up
+        // 覆盖重画——等表格结束时由 consume_line/flush 一次性画出成品盒框表。字符已在
+        // write_chunk_to 里 push 进 line_buf，这里什么都不做即可完成缓冲。彻底移除了
+        // "预测终端折行行数"这一残像/叠表根因。
+        if self.should_buffer_table_line() {
+            return Ok(());
         }
-    }
-
-    fn handle_table_preview(&mut self, out: &mut dyn Write, ch: char) -> io::Result<()> {
-        if !self.line_preview_emitted {
-            if self.dimmed {
-                out.write_all(b"\x1b[2m")?;
-            }
-            out.write_all(self.line_buf.as_bytes())?;
-            out.flush()?;
-            self.line_preview_emitted = true;
-            self.line_preview_height = self.current_line_preview_height();
-        } else {
-            self.emit_char(out, ch)?;
-            self.line_preview_height = self.current_line_preview_height();
-        }
-        Ok(())
+        self.handle_realtime_output(out, ch)
     }
 
     fn handle_realtime_output(&mut self, out: &mut dyn Write, ch: char) -> io::Result<()> {
@@ -446,21 +441,24 @@ impl MarkdownStreamRenderer {
         }
 
         let state = std::mem::replace(&mut self.table_state, TableState::None);
-        let rendered = match state {
+        // 收尾前先清掉可能残留的表格占位提示（上移量恒为 1，不依赖折行预测）。
+        let mut rendered = self.clear_table_placeholder();
+        rendered.push_str(&match state {
             TableState::None => String::new(),
+            // 表头行后流已结束、始终没等到分隔行——它只是含 `|` 的普通文本行。
+            // 全程未 echo，直接当普通行渲染即可。
             TableState::PendingHeader {
                 indent,
                 header_line,
-                preview_height,
-            } => self.rewrite_plain_preview(&format!("{indent}{header_line}"), preview_height),
+            } => self.render_buffered_plain(&indent, &header_line),
+            // 表格在流结束时收尾：一次性画出成品盒框表，无 cursor-up。
             TableState::InTable {
                 indent,
                 header,
                 align,
                 rows,
-                preview_height,
-            } => self.rewrite_table_preview(&indent, preview_height, &header, &align, &rows),
-        };
+            } => self.render_table_block(&indent, &header, &align, &rows),
+        });
         if !rendered.is_empty() {
             out.write_all(rendered.as_bytes())?;
             self.bol = rendered.ends_with('\n');
@@ -468,11 +466,21 @@ impl MarkdownStreamRenderer {
         out.flush()
     }
 
-    fn should_emit_table_preview_live(&self) -> bool {
-        matches!(
+    fn should_buffer_table_line(&self) -> bool {
+        // 已在表格上下文（表头待确认 / 表格中）：后续所有行都静默缓冲。
+        if matches!(
             self.table_state,
             TableState::PendingHeader { .. } | TableState::InTable { .. }
-        ) && line_looks_like_table_preview(&self.line_buf)
+        ) {
+            return true;
+        }
+        // 尚未进入表格，但当前这行看起来像表格行（含 `|`）：乐观缓冲，不逐字 echo。
+        // 若整行落定后并非表格，consume_line 会按普通行渲染它（从未 echo，无残留）。
+        // `!line_preview_emitted` 保证：一旦本行已经开始实时 echo（如首 token 不含
+        // `|` 的裸表头），就不再中途切换到缓冲，避免半 echo 半缓冲的错位。
+        !self.in_code_block
+            && !self.line_preview_emitted
+            && line_looks_like_table_preview(&self.line_buf)
     }
 
     pub(in crate::ai) fn consume_line(&mut self, line: &str, preview_emitted: bool) -> String {
@@ -490,29 +498,14 @@ impl MarkdownStreamRenderer {
                 }
                 if !self.in_code_block && is_table_row_candidate(line) && !is_table_separator(line)
                 {
-                    let mut out = String::new();
-                    if !self.bol {
-                        out.push('\n');
-                        self.bol = true;
-                    }
+                    // 表头行落定：记录状态并显示单行占位提示（表格生成期不再空窗）。
                     let (indent, rest) = split_indent(line);
-                    let raw = format!("{indent}{}", rest.trim_end());
-                    let mut preview_height =
-                        self.streamed_or_measured_preview_height(&raw, preview_emitted);
-                    if out.starts_with('\n') {
-                        preview_height += 1;
-                    }
+                    let placeholder = self.table_placeholder_line(indent);
                     self.table_state = TableState::PendingHeader {
                         indent: indent.to_string(),
                         header_line: rest.trim_end().to_string(),
-                        preview_height,
                     };
-                    if preview_emitted {
-                        return String::new();
-                    }
-                    out.push_str(&raw);
-                    out.push('\n');
-                    return out;
+                    return placeholder;
                 }
                 let rendered = self.render_line_no_table(line);
                 if preview_emitted && !line.is_empty() {
@@ -524,42 +517,24 @@ impl MarkdownStreamRenderer {
             TableState::PendingHeader {
                 indent,
                 header_line,
-                preview_height,
             } => {
                 if is_table_separator(line) {
-                    let raw = line.trim_end().to_string();
+                    // 分隔行确认这是真表格：进入 InTable，继续静默缓冲，占位保留。
                     let header_cells = parse_table_row(&header_line);
                     let align = parse_table_align(line, header_cells.len());
-                    let separator_preview_height =
-                        self.streamed_or_measured_preview_height(&raw, preview_emitted);
-                    let move_up = preview_height
-                        + if preview_emitted {
-                            separator_preview_height
-                        } else {
-                            0
-                        };
-                    let rendered_height =
-                        self.rendered_table_height(&indent, &header_cells, &align, &[]);
-                    let rewrite =
-                        self.rewrite_table_preview(&indent, move_up, &header_cells, &align, &[]);
                     self.table_state = TableState::InTable {
                         indent,
                         header: header_cells,
                         align,
                         rows: Vec::new(),
-                        preview_height: rendered_height,
                     };
-                    return rewrite;
+                    return String::new();
                 }
 
-                let move_up = preview_height
-                    + if preview_emitted {
-                        self.line_preview_height
-                    } else {
-                        0
-                    };
-                let mut out =
-                    self.rewrite_plain_preview(&format!("{indent}{header_line}"), move_up);
+                // 表头行后并非分隔行——说明先前那行只是含 `|` 的普通文本。先清掉占位
+                // 提示，再把它当普通行渲染，最后处理当前行。
+                let mut out = self.clear_table_placeholder();
+                out.push_str(&self.render_buffered_plain(&indent, &header_line));
                 self.table_state = TableState::None;
                 out.push_str(&self.consume_line(line, false));
                 out
@@ -569,37 +544,22 @@ impl MarkdownStreamRenderer {
                 header,
                 align,
                 mut rows,
-                preview_height,
             } => {
                 if is_table_row(line) {
+                    // 表格数据行：累积到缓冲，暂不输出（等表格结束一次性画出）。
                     rows.push(parse_table_row(line));
-                    let move_up = preview_height
-                        + if preview_emitted {
-                            self.line_preview_height.max(1)
-                        } else {
-                            0
-                        };
-                    let rendered_height =
-                        self.rendered_table_height(&indent, &header, &align, &rows);
-                    let out = self.rewrite_table_preview(&indent, move_up, &header, &align, &rows);
                     self.table_state = TableState::InTable {
                         indent,
                         header,
                         align,
                         rows,
-                        preview_height: rendered_height,
                     };
-                    return out;
+                    return String::new();
                 }
 
-                let mut out = String::new();
-                let move_up = preview_height
-                    + if preview_emitted {
-                        self.line_preview_height
-                    } else {
-                        0
-                    };
-                out.push_str(&self.rewrite_table_preview(&indent, move_up, &header, &align, &rows));
+                // 遇到非表格行：先清占位，一次性画出成品盒框表，再处理当前行。
+                let mut out = self.clear_table_placeholder();
+                out.push_str(&self.render_table_block(&indent, &header, &align, &rows));
                 out.push_str(&self.consume_line(line, false));
                 out
             }
@@ -683,29 +643,6 @@ impl MarkdownStreamRenderer {
         }
     }
 
-    fn rewrite_table_preview(
-        &self,
-        indent: &str,
-        move_up: usize,
-        header: &[String],
-        align: &[TableAlign],
-        rows: &[Vec<String>],
-    ) -> String {
-        let final_table = self.render_table_block(indent, header, align, rows);
-        if final_table.is_empty() || move_up == 0 {
-            return String::new();
-        }
-
-        let mut out = String::new();
-        if move_up > 0 {
-            out.push_str(&format!("\x1b[{move_up}A\r\x1b[0J"));
-        } else {
-            out.push_str("\r\x1b[0J");
-        }
-        out.push_str(&final_table);
-        out
-    }
-
     fn render_table_block(
         &self,
         indent: &str,
@@ -726,14 +663,62 @@ impl MarkdownStreamRenderer {
             for (idx, range) in ranges.into_iter().enumerate() {
                 if idx > 0 {
                     final_table.push('\n');
+                    final_table.push_str(&self.render_table_column_block_continuation(
+                        indent,
+                        header,
+                        align,
+                        rows,
+                        range,
+                    ));
+                } else {
+                    final_table.push_str(&self.render_table_column_block(indent, header, align, rows, range));
                 }
-                final_table
-                    .push_str(&self.render_table_column_block(indent, header, align, rows, range));
             }
             return final_table;
         }
 
         self.render_table_column_block(indent, header, align, rows, 0..cols)
+    }
+
+    /// 续接列块：不画顶部边框，用 mid separator 衔接上一块，避免宽表分列时
+    /// 每块都像独立新表（header 反复出现）。
+    fn render_table_column_block_continuation(
+        &self,
+        indent: &str,
+        header: &[String],
+        align: &[TableAlign],
+        rows: &[Vec<String>],
+        range: std::ops::Range<usize>,
+    ) -> String {
+        let header = range
+            .clone()
+            .map(|idx| header.get(idx).cloned().unwrap_or_default())
+            .collect::<Vec<_>>();
+        let align = range
+            .clone()
+            .map(|idx| align.get(idx).copied().unwrap_or(TableAlign::Left))
+            .collect::<Vec<_>>();
+        let rows = rows
+            .iter()
+            .map(|row| {
+                range
+                    .clone()
+                    .map(|idx| row.get(idx).cloned().unwrap_or_default())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        let widths = compute_table_widths(indent, &header, &rows);
+        let mut out = String::new();
+        // 续接块：用 mid 代替 top border，视觉上表示"承接上一块"
+        out.push_str(&render_table_mid(indent, &widths));
+        out.push_str(&render_table_header(indent, &header, &align, &widths));
+        out.push_str(&render_table_mid(indent, &widths));
+        for row in &rows {
+            out.push_str(&render_table_row(indent, row, &align, &widths));
+        }
+        out.push_str(&render_table_bottom(indent, &widths));
+        out
     }
 
     fn render_table_column_block(
@@ -774,29 +759,30 @@ impl MarkdownStreamRenderer {
         final_table
     }
 
-    fn rendered_table_height(
-        &self,
-        indent: &str,
-        header: &[String],
-        align: &[TableAlign],
-        rows: &[Vec<String>],
-    ) -> usize {
-        // cursor-up 擦除的是终端物理行；表格逻辑行一旦被终端自动折行，
-        // 只数 `.lines()` 会漏擦旧表，表现为 header/旧行反复堆叠。
-        self.render_table_block(indent, header, align, rows)
-            .lines()
-            .map(live_preview_cursor_rows)
-            .sum::<usize>()
-            .max(1)
+    /// 渲染一整行静默缓冲的普通文本（此前被当作潜在表头，最终未成表）。
+    /// 因全程未 echo，无需 cursor-up，直接走通用渲染即可。
+    fn render_buffered_plain(&mut self, indent: &str, rest: &str) -> String {
+        self.render_line_no_table(&format!("{indent}{rest}"))
     }
 
-    fn rewrite_plain_preview(&mut self, line: &str, move_up: usize) -> String {
-        let rendered = self.render_line_no_table(line);
-        if move_up > 0 {
-            format!("\x1b[{move_up}A\r\x1b[0J{rendered}")
-        } else {
-            rendered
+    /// 表格缓冲期的单行占位提示。仅在 tty 且尚未显示时返回一行短提示并置位标志。
+    /// 强制单行、短于终端宽，保证只占 1 个物理行，清除时上移量恒为 1。
+    fn table_placeholder_line(&mut self, indent: &str) -> String {
+        if !self.tty || self.table_placeholder_shown {
+            return String::new();
         }
+        self.table_placeholder_shown = true;
+        format!("{indent}{ACCENT_MUTED}⋯ 生成表格中\x1b[0m\n")
+    }
+
+    /// 若占位提示正显示在屏幕上，返回清除它的确定序列（上移 1 行并清到屏末）。
+    /// 上移量恒为 1，不依赖任何折行预测，故不会重现残像叠表。
+    fn clear_table_placeholder(&mut self) -> String {
+        if !self.table_placeholder_shown {
+            return String::new();
+        }
+        self.table_placeholder_shown = false;
+        "\x1b[1A\r\x1b[0J".to_string()
     }
 
     fn render_line_no_table(&mut self, line: &str) -> String {
@@ -1312,13 +1298,27 @@ mod tests {
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         renderer.bol = true;
 
+        // 新契约：疑似表头行进入缓冲并显示单行占位提示（不 echo 原始 markdown）。
         let first = renderer
             .write_chunk_for_test("| **Header** | Value |\n", false)
             .unwrap();
-        assert_eq!(first, "| **Header** | Value |\n");
+        assert!(
+            strip_ansi_for_test(&first).contains("生成表格中"),
+            "suspected header should emit the placeholder; got {first:?}"
+        );
 
+        // 流结束仍未等到分隔行——它只是含 `|` 的普通文本。flush 先用确定的 1 行
+        // cursor-up 清掉占位，再按普通行落地；除占位清除外无任何 cursor-up 重写。
         let flushed = renderer.flush_pending_for_test().unwrap();
-        assert!(flushed.contains("\x1b[1A\r\x1b[0J"));
+        assert!(
+            flushed.starts_with("\x1b[1A\r\x1b[0J"),
+            "flush must first clear the 1-line placeholder; got {flushed:?}"
+        );
+        let after_clear = &flushed["\x1b[1A\r\x1b[0J".len()..];
+        assert!(
+            !after_clear.contains("A\r\x1b[0J"),
+            "buffered plain line must not use table-height cursor-up rewrite; got {flushed:?}"
+        );
 
         let visible = strip_ansi_for_test(&flushed);
         assert_eq!(visible, "| Header | Value |\n");
@@ -1802,31 +1802,74 @@ mod tests {
     }
 
     #[test]
-    fn table_confirmation_and_flush_use_streamed_preview_height_for_rewrite() {
+    fn table_placeholder_shows_while_buffering_then_clears_on_final_screen() {
+        let _guard = env_guard();
+
+        let md = "\
+前言。
+| 协议 | 默认 Endpoint |
+| --- | --- |
+| OpenAi | api.openai.com |
+后记。
+";
+        for cols in [80usize, 60, 48] {
+            unsafe { std::env::set_var("COLUMNS", cols.to_string()) };
+
+            let stream = render_full_stream(md, false);
+            // 缓冲期占位提示必须出现在原始输出流里（表格生成期不空窗）。
+            assert!(
+                stream.contains("生成表格中"),
+                "COLUMNS={cols}: placeholder should appear in the raw stream"
+            );
+
+            // 但经终端渲染后的最终屏幕上，占位必须被完全清除、不得残留。
+            let mut grid = VtGrid::new(cols);
+            grid.feed(&stream);
+            let screen = grid.screen();
+            for line in &screen {
+                assert!(
+                    !line.contains("生成表格中"),
+                    "COLUMNS={cols}: placeholder leaked onto final screen: {line:?}\n{}",
+                    screen.join("\n")
+                );
+            }
+            // 成品盒框表与前后文都在。
+            let joined = screen.join("\n");
+            assert!(joined.contains('│'), "COLUMNS={cols}: missing box table");
+            assert!(joined.contains("后记"), "COLUMNS={cols}: trailing text lost");
+        }
+    }
+
+    #[test]
+    fn table_is_buffered_silently_and_flushed_once_without_cursor_up() {
         let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
         renderer.bol = true;
 
-        renderer.set_line_preview_height(5);
-        assert_eq!(renderer.consume_line("| Header | Value |", true), "");
-
-        renderer.set_line_preview_height(7);
-        let header_rewrite = renderer.consume_line("| --- | --- |", true);
+        // 新契约：表头行返回单行占位提示；分隔行、数据行静默缓冲返回空。
+        let header = renderer.consume_line("| Header | Value |", false);
         assert!(
-            header_rewrite.contains("\x1b[12A\r\x1b[0J"),
-            "expected separator confirmation to rewrite using header+separator preview height; got {header_rewrite:?}"
+            strip_ansi_for_test(&header).contains("生成表格中"),
+            "header row should emit the single-line placeholder; got {header:?}"
         );
+        assert_eq!(renderer.consume_line("| --- | --- |", false), "");
+        assert_eq!(renderer.consume_line("| foo | bar |", false), "");
 
-        renderer.set_line_preview_height(9);
-        let row_rewrite = renderer.consume_line("| foo | bar |", true);
-        assert!(
-            row_rewrite.contains("\x1b[13A\r\x1b[0J"),
-            "expected streamed table row to rewrite existing table plus live row preview; got {row_rewrite:?}"
-        );
-
+        // 流结束：先用确定的 1 行 cursor-up 清掉占位，再一次性画出成品盒框表。
+        // 唯一允许的 cursor-up 是 `\x1b[1A`（占位清除），绝无按表高的多行重写。
         let flushed = renderer.flush_pending_for_test().unwrap();
         assert!(
-            flushed.contains("\x1b[5A\r\x1b[0J"),
-            "expected final flush to clear the latest rendered table height; got {flushed:?}"
+            flushed.starts_with("\x1b[1A\r\x1b[0J"),
+            "flush must first clear the 1-line placeholder deterministically; got {flushed:?}"
+        );
+        let after_clear = &flushed["\x1b[1A\r\x1b[0J".len()..];
+        assert!(
+            !after_clear.contains("A\r\x1b[0J"),
+            "table itself must be rendered once, not via cursor-up rewrite; got {flushed:?}"
+        );
+        let visible = strip_ansi_for_test(&flushed);
+        assert!(
+            visible.contains("Header") && visible.contains("foo") && visible.contains('│'),
+            "flushed output must contain the full box-drawn table; got {visible:?}"
         );
     }
 
@@ -1900,12 +1943,13 @@ mod tests {
         grid.feed(&stream);
         let screen = grid.screen();
         let joined = screen.join("\n");
-        let table_count = joined.matches('┌').count();
+        // 续接列块用 ├ 代替 ┌ 顶边框，所以用 └ 底边框来计数列块数
+        let table_count = joined.matches('└').count();
         let expected_table_count = table_column_ranges("", 3).len();
 
         assert_eq!(
             table_count, expected_table_count,
-            "table rewrite should leave exactly the expected split tables on screen, got {table_count}, expected {expected_table_count}:\n{joined}"
+            "table rewrite should leave exactly the expected split column blocks on screen, got {table_count}, expected {expected_table_count}:\n{joined}"
         );
     }
 
@@ -2007,6 +2051,8 @@ mod tests {
                     .unwrap(),
             );
         }
+        // 表格是最后一段内容，需 flush 才会一次性画出成品盒框表。
+        stream.push_str(&renderer.flush_pending_for_test().unwrap());
 
         let mut grid = VtGrid::new(72);
         grid.feed(&stream);
@@ -2032,7 +2078,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_table_row_still_streams_realtime_before_newline() {
+    fn confirmed_table_row_is_buffered_not_streamed_before_newline() {
         let _guard = env_guard();
         unsafe { std::env::set_var("COLUMNS", "72") };
 
@@ -2042,14 +2088,20 @@ mod tests {
             stream.push_str(&renderer.write_chunk_for_test(chunk, false).unwrap());
         }
 
-        assert!(
-            stream.contains("{\"event\":\"order"),
-            "confirmed table rows must keep realtime raw preview before newline; got {stream:?}"
-        );
-        assert!(
-            !stream.ends_with('┘'),
-            "partial row should not wait for final table rendering before newline"
-        );
+        // 新契约：表格行全程静默缓冲，未落定的分块不得出现在屏幕上——不再逐字实时预览。
+        let mut grid = VtGrid::new(72);
+        grid.feed(&stream);
+        let screen = grid.screen();
+        for line in &screen {
+            assert!(
+                !line.contains("event"),
+                "partial table row must stay buffered, not streamed to screen: {line:?}"
+            );
+            assert!(
+                !line.contains('|'),
+                "no raw markdown pipe preview should reach the screen: {line:?}"
+            );
+        }
     }
 
     #[test]
@@ -2118,9 +2170,10 @@ mod tests {
         ]];
 
         let rendered = renderer.render_table_block("", &header, &align, &rows);
-        let top_count = rendered.matches('┌').count();
+        // 续接列块用 ├ 代替 ┌ 顶边框，用 └ 底边框确认分列
+        let bottom_count = rendered.matches('└').count();
 
-        assert!(top_count > 1, "overwide table should be split:\n{rendered}");
+        assert!(bottom_count > 1, "overwide table should be split into multiple column blocks:\n{rendered}");
         for line in rendered.lines().filter(|line| !line.is_empty()) {
             let visible = crate::ai::stream::extract::strip_ansi_codes(line);
             let width = terminal_display_width(visible.as_str());

@@ -94,7 +94,7 @@ pub(crate) struct RequestRetryPolicy {
 
 impl RequestRetryPolicy {
     /// 对冲请求（hedged backup）触发阈值：primary 请求在这段时间内没收到响应头
-    /// 就立即发起一次完全相同的 backup 请求并 drop 掉 primary。
+    /// 就并发发起一次完全相同的 backup 请求，二者竞速，落败者被 drop。
     /// 取 header_timeout 的 1/9，clamp 到 [3, 15] 秒。
     ///
     /// 这样在服务端偶发长尾（连接已建立但迟迟不返回响应头）时，不必等满 90s
@@ -105,7 +105,7 @@ impl RequestRetryPolicy {
 
     /// 主请求 hedged backup 总发送次数。
     /// 服务端长尾偶尔会连续命中坏实例，多一次 backup 能进一步压低尾延迟，
-    /// 同时保持顺序 drop（不会堆积并发连接）。
+    /// 注意：真正的并发对冲下，长尾场景最多会有 `hedged_max_sends` 个并发连接。
     pub(crate) fn hedged_max_sends(&self) -> usize {
         self.hedged_max_sends
     }
@@ -190,48 +190,55 @@ pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<
 
 /// 对冲请求（hedged backup request）。
 ///
-/// 先发起 primary 请求，如果在 `backup_after_secs` 内没收到响应头，就立即发起
-/// 一次完全相同的 backup 请求并 drop 掉 primary（取消对它的等待）。
-///
-/// 支持多次 backup（`max_sends` 含 primary）：每轮给 `backup_after_secs` 宽限期，
-/// 超时则 drop 当前请求并发起下一轮。最后一轮不再设内部超时，交给外层
-/// `header_timeout_secs` 兜底。全程顺序发送 + drop 旧的，不堆积并发连接。
+/// 先发起 primary 请求；若在 `backup_after_secs` 内未收到响应头，则【不丢弃 primary】，
+/// 并发发起一个完全相同的 backup 请求，让二者竞速——谁先返回响应头谁赢，落败者被
+/// drop（仅取消客户端等待，服务端可能仍在处理）。若 `max_sends > 2`，则继续按
+/// `backup_after_secs` 间隔逐步追加并发请求（最多 `max_sends` 个同时在飞），任一返回
+/// 即作为结果，其余被 drop。所有请求发完仍无返回时，等待首个完成（由外层
+/// `header_timeout_secs` 兜底）。
 ///
 /// 典型场景：服务端接受了 TCP 连接但因内部排队迟迟不返回响应头，primary 请求
-/// 会卡在 `.send().await` 上等满 90s 才超时。hedged backup 在 ~10s 就主动发起
+/// 会卡在 `.send().await` 上等满 90s 才超时。hedged backup 在 ~10s 就并发发起
 /// 新连接，新请求通常能立即被处理（命中不同的后端实例或脱离原队列），
-/// 从而把尾延迟从 90s+ 降到 10s+。
+/// 从而把尾延迟从 90s+ 降到 10s+。与"先 drop 再顺序重发"不同，真正的并发对冲
+/// 不会浪费"只差一点就能返回"的 primary——它仍有机会赢得竞速。
 ///
-/// 注意：drop 旧请求的 future 只取消客户端的等待，服务端可能仍在处理原请求。
-/// 但 LLM chat completions 是幂等的读操作，重复一次不会产生副作用。
+/// 注意：竞速中落败的请求会被 drop，只取消客户端的等待，服务端可能仍在处理。
+/// 但 LLM chat completions 是幂等的读操作，重复请求不会产生副作用。代价是长尾
+/// 场景下最多会有 `max_sends` 个并发连接（原"顺序 drop"实现为 1 个）。
 pub(crate) async fn send_with_hedged_backup(
     build_request: impl Fn() -> reqwest::RequestBuilder,
     backup_after_secs: u64,
     max_sends: usize,
 ) -> Result<Response, reqwest::Error> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
     let max_sends = max_sends.max(1);
+    let hedge = Duration::from_secs(backup_after_secs);
+    // 所有在飞的请求；任一返回响应头即作为结果，其余被 drop（取消等待）。
+    let mut in_flight = FuturesUnordered::new();
     for round in 1..=max_sends {
-        let is_last = round == max_sends;
-        // 最后一轮不设内部超时，交给外层 header_timeout 兜底
-        if is_last {
-            return build_request().send().await;
-        }
-        match tokio::time::timeout(
-            Duration::from_secs(backup_after_secs),
-            build_request().send(),
-        )
-        .await
-        {
-            Ok(result) => return result, // 本轮及时返回了
-            Err(_) => {
-                eprintln!(
-                    "[Info] 第 {round} 次请求 {}s 内未返回响应头，发起 hedged backup",
-                    backup_after_secs
-                );
+        in_flight.push(build_request().send());
+        // 竞速：集合中首个响应头返回 vs hedge 计时器
+        tokio::select! {
+            // 集合中首个 future 完成（返回即移出集合），其余继续在飞
+            result = in_flight.next() => return result.expect("in_flight 非空"),
+            _ = tokio::time::sleep(hedge) => {
+                // hedge 窗口内无任何响应头到达：若还有配额则追加一个并发请求，
+                // 否则落到循环后的最终竞速（由外层 header_timeout 兜底）。
+                if round < max_sends {
+                    eprintln!(
+                        "[Info] 第 {round} 次请求 {}s 内未返回响应头，发起 hedged backup",
+                        backup_after_secs
+                    );
+                }
             }
         }
     }
-    unreachable!()
+    // 已发起全部 max_sends 个请求且仍在飞行中：等待首个完成（由外层 header_timeout 兜底）
+    in_flight
+        .next()
+        .await
+        .expect("in_flight 必非空：至少发起过一次请求")
 }
 
 pub(crate) fn should_abort_retry_wait(app: &App) -> bool {
@@ -305,4 +312,30 @@ pub(crate) fn should_try_model_fallback(err: &RequestError) -> bool {
             matches!(status.as_u16(), 401 | 402 | 403 | 404 | 429) || status.is_server_error()
         }
     }
+}
+
+/// 判断流式响应中途出现的错误是否值得重试。
+///
+/// 流式错误（`provider stream error: ...`）发生在响应头已返回、body 传输过程中，
+/// 通常是服务端瞬态问题（后端取消、上游 RPC 失败、内部错误等）。对这些错误重试
+/// 一次整条请求+流可以显著降低用户感知到的失败率。
+pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("server_error")
+        || lower.contains("cancelled")
+        || lower.contains("canceled")
+        || lower.contains("upstream")
+        || lower.contains("rpc error")
+        || lower.contains("internal")
+        || lower.contains("overloaded")
+        || lower.contains("timeout")
+        || lower.contains("timed out")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("try again")
+        || lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("unexpected eof")
+        || lower.contains("502")
+        || lower.contains("503")
+        || lower.contains("504")
 }

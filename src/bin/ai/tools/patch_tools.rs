@@ -70,8 +70,16 @@ struct PatchEnvelope {
 fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
     let mut hunks = Vec::new();
     let mut iter = patch.lines().peekable();
+    let mut saw_content_before_header = false;
     while let Some(line) = iter.next() {
         let Some(rest) = line.strip_prefix("@@") else {
+            if hunks.is_empty()
+                && (line.starts_with('+')
+                    || line.starts_with('-')
+                    || (line.starts_with(' ') && !line.trim().is_empty()))
+            {
+                saw_content_before_header = true;
+            }
             continue;
         };
         let rest = rest.trim();
@@ -138,6 +146,9 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
         hunks.push(UnifiedHunk { old_start, lines });
     }
     if hunks.is_empty() {
+        if saw_content_before_header {
+            return Err("no hunk header found: patch contains content lines but no hunk header. Prepend a hunk header before the content lines, or use a Begin Patch envelope.".to_string());
+        }
         return Err("no hunks found".to_string());
     }
     Ok(hunks)
@@ -252,18 +263,36 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
     ensure_patch_target_matches(path, &envelope.target_path)?;
     let normalized_patch = match envelope.op {
         PatchEnvelopeOp::Update => {
-            // *** Begin Patch 的 Update 格式允许省略 @@ hunk header（Cursor/Aider 风格），
-            // 模型常只写 +/−/space 前缀行而不带 @@。如果 body 中没有任何 @@ header，
-            // 合成一个，让 parse_unified_hunks 能识别。old_start=1 让匹配从文件开头
-            // 尝试，失败后自动回退到全文件模糊搜索。
+            // *** Begin Patch 的 Update 格式允许省略 hunk header（Cursor/Aider 风格），
+            // 模型常只写 +/−/space 前缀行而不带 hunk header。如果 body 中没有任何
+            // hunk header，合成一个，让 parse_unified_hunks 能识别。old_start=0 表示
+            // 无标称位置，locate_hunk 会跳过标称匹配直接全文件搜索。
             let has_hunk_header = envelope.body_lines.iter().any(|l| l.starts_with("@@"));
             if has_hunk_header {
                 envelope.body_lines.join("\n")
             } else {
-                let mut normalized = String::from("@@ -1,0 +1,0 @@");
+                // 对不以 +/-/ 开头的行补上空格前缀（当作 context 行），
+                // 避免 parse_unified_hunks 报 "invalid hunk line"。
+                let normalized_body: Vec<String> = envelope
+                    .body_lines
+                    .iter()
+                    .map(|line| {
+                        if line.is_empty() {
+                            String::new()
+                        } else if line.starts_with('+')
+                            || line.starts_with('-')
+                            || line.starts_with(' ')
+                        {
+                            line.clone()
+                        } else {
+                            format!(" {}", line)
+                        }
+                    })
+                    .collect();
+                let mut normalized = String::from("@@ -0,0 +1,0 @@");
                 if !envelope.body_lines.is_empty() {
                     normalized.push('\n');
-                    normalized.push_str(&envelope.body_lines.join("\n"));
+                    normalized.push_str(&normalized_body.join("\n"));
                 }
                 normalized
             }
@@ -316,13 +345,46 @@ enum MatchMode {
     IgnoreIndent,
 }
 
+/// 剥离 read_file/read_file_lines 输出的行号前缀（如 `   42| ` 或 `42: `）。
+/// 模型有时会不小心把行号前缀复制进 patch 的 context/remove 行中。
+/// 仅匹配 `digits + 分隔符` 模式，避免误剥真正的代码行。
+fn strip_line_number_prefix(s: &str) -> &str {
+    let trimmed = s.trim_start();
+    let digits_end = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(0);
+    if digits_end == 0 {
+        return s;
+    }
+    // read_file_lines 输出的行号格式为 `digits| ` 或 `digits: `。
+    // 分隔符后一定有空格，所以 `80:80`（`80` + `:` + `80`）不会被误匹配。
+    // 不匹配的无空格分隔符（如 `80:80` 中的 `:`）不是有效行号前缀。
+    let after_digits = &trimmed[digits_end..];
+    if let Some(rest) = after_digits.strip_prefix("| ") {
+        return rest;
+    }
+    if let Some(rest) = after_digits.strip_prefix(": ") {
+        return rest;
+    }
+    s
+}
+
 fn lines_match(actual: &str, expected: &str, mode: MatchMode) -> bool {
     if actual == expected || actual.trim_end() == expected.trim_end() {
         return true;
     }
     match mode {
         MatchMode::Strict => false,
-        MatchMode::IgnoreIndent => actual.trim() == expected.trim(),
+        MatchMode::IgnoreIndent => {
+            if actual.trim() == expected.trim() {
+                return true;
+            }
+            // 兜底：模型可能从 read_file_lines 输出中复制了行号前缀（如 `   42| `），
+            // 剥离行号前缀后再比较。actual 来自文件（无行号），expected 来自 patch（可能有）。
+            let actual_stripped = strip_line_number_prefix(actual);
+            let expected_stripped = strip_line_number_prefix(expected);
+            actual_stripped.trim() == expected_stripped.trim()
+        }
     }
 }
 
@@ -537,14 +599,22 @@ fn strip_code_fence(patch: &str) -> String {
         return patch.to_string();
     }
     let first = lines.first().unwrap().trim();
-    let last = lines.last().unwrap().trim();
     let is_open_fence = first.starts_with("```") || first.starts_with("~~~");
+    if !is_open_fence {
+        return patch.to_string();
+    }
+    // 从末尾向前找第一个非空行作为闭围栏候选——模型常在闭围栏后多输出空行。
+    let last_nonempty = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .unwrap_or(0);
+    let last = lines.get(last_nonempty).unwrap().trim();
     let is_close_fence = last == "```" || last == "~~~";
-    if !is_open_fence || !is_close_fence {
+    if !is_close_fence || last_nonempty < 2 {
         return patch.to_string();
     }
     // 剥离首尾围栏行，保留中间内容并去掉多余首尾空白。
-    lines[1..lines.len() - 1].join("\n").trim().to_string()
+    lines[1..last_nonempty].join("\n").trim().to_string()
 }
 
 pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
@@ -1092,5 +1162,148 @@ mod tests {
             err.contains("must start with") && err.contains("context"),
             "err was: {err}"
         );
+    }
+
+    // ── Fix 1: strip_code_fence 应容忍闭围栏后的尾随空行 ──
+
+    #[test]
+    fn strip_code_fence_tolerates_trailing_blank_lines() {
+        // 模型常在闭围栏后多输出一个或多个空行，之前 strip_code_fence 把最后一行
+        // 空行当作 last，判断不是闭围栏就放弃剥离，导致整个 patch 被代码围栏包裹
+        // 送入解析器报错。
+        let fenced = "```diff\n@@ -1,1 +1,1 @@\n-line2\n+changed\n```\n";
+        assert_eq!(
+            strip_code_fence(fenced),
+            "@@ -1,1 +1,1 @@\n-line2\n+changed"
+        );
+        // 多个尾随空行也应容忍
+        let fenced_multi = "```\n*** Begin Patch\n*** End Patch\n```\n\n\n";
+        assert_eq!(
+            strip_code_fence(fenced_multi),
+            "*** Begin Patch\n*** End Patch"
+        );
+    }
+
+    // ── Fix 2: 缺少 hunk header 时给出明确错误 ──
+
+    #[test]
+    fn parse_unified_hunks_missing_header_gives_clear_error() {
+        // patch 内容行存在但没有 hunk header，应给出比 "no hunks found" 更明确的错误。
+        let err = parse_unified_hunks(" line1\n-line2\n+changed\n line3")
+            .expect_err("patch without hunk header must error");
+        assert!(
+            err.contains("no hunk header found"),
+            "err was: {err}"
+        );
+        assert!(err.contains("content lines"), "err was: {err}");
+    }
+
+    // ── Fix 3: envelope Update 合成 header 使用 old_start=0 ──
+
+    #[test]
+    fn execute_apply_patch_update_envelope_without_header_does_not_match_at_line_1() {
+        // 当文件开头恰好与 hunk context 行匹配时，old_start=1 的标称匹配可能误命中
+        // 文件开头而非模型真正想改的位置。old_start=0 虽然给出同样的 nominal=0，
+        // 但语义更清晰：无标称位置，依赖全文件搜索唯一定位。
+        // 这里验证一个不在文件开头的唯一匹配能正确定位。
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("update_nohdr_mid").with_extension("txt");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "filler\nalpha\nbeta\ngamma\n").unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "path": path.to_string_lossy(),
+                "patch": format!(
+                    "*** Begin Patch\n*** Update File: {}\n alpha\n-beta\n+changed\n*** End Patch\n",
+                    path.display()
+                )
+            });
+            execute_apply_patch(&args)
+                .expect("envelope without header should locate unique match mid-file");
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "filler\nalpha\nchanged\ngamma\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    // ── Fix 4: envelope Update 无 hunk header 时补全裸行前缀 ──
+
+    #[test]
+    fn execute_apply_patch_update_envelope_tolerates_bare_lines() {
+        // 模型在 envelope Update 格式（无 hunk header）中写了不带 +/-/ 前缀的裸行，
+        // 应自动补空格前缀当作 context 行，而不是报 "invalid hunk line"。
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("update_bare").with_extension("txt");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "path": path.to_string_lossy(),
+                "patch": format!(
+                    "*** Begin Patch\n*** Update File: {}\nalpha\n-beta\n+changed\n*** End Patch\n",
+                    path.display()
+                )
+            });
+            execute_apply_patch(&args)
+                .expect("envelope with bare context line should be tolerated");
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\ngamma\n");
+        let _ = fs::remove_dir_all(base);
+    }
+
+    // ── Fix 5: context 行容忍行号前缀 ──
+
+    #[test]
+    fn apply_unified_patch_tolerates_line_number_prefix_in_context() {
+        // 模型从 read_file_lines 输出复制了带行号前缀的 context 行（如 `   42| `），
+        // IgnoreIndent 兜底模式应剥离行号前缀后匹配成功。
+        let original = "line1\nline2\nline3\n";
+        // context 行 " line1" 被模型误写为带行号前缀的 " 1| line1"
+        let patch = "@@ -1,3 +1,3 @@\n 1| line1\n-line2\n+changed\n line3\n";
+        let result = apply_unified_patch(original, patch)
+            .expect("line number prefix in context should be tolerated by indent fallback");
+        // context 行应保留原文件内容（不含行号前缀）
+        assert_eq!(result, "line1\nchanged\nline3\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_tolerates_line_number_prefix_in_remove() {
+        // remove 行也带了行号前缀，应同样被容忍。
+        let original = "line1\ntarget\nline3\n";
+        let patch = "@@ -1,3 +1,3 @@\n line1\n-2| target\n+changed\n line3\n";
+        let result = apply_unified_patch(original, patch)
+            .expect("line number prefix in remove line should be tolerated");
+        assert_eq!(result, "line1\nchanged\nline3\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_line_number_prefix_still_detects_ambiguity() {
+        // 行号前缀容忍不应牺牲安全性：忽略行号后若仍有多处匹配，应报歧义。
+        let original = "dup\ndup\ndup\n";
+        // 标称位置故意写错，迫使走全文件搜索；剥离行号后 context+remove = ["dup","dup"] 匹配多处
+        let patch = "@@ -9,2 +9,2 @@\n 1| dup\n-dup\n+changed\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("ambiguous patch"), "err was: {err}");
+    }
+
+    #[test]
+    fn strip_line_number_prefix_does_not_strip_code_lines() {
+        // 以数字开头的代码行不应被误剥（如 `80:80` 是配置值），
+        // 但 ` 42| foo` 或 `42: foo` 格式的行号前缀应被剥离。
+        use super::strip_line_number_prefix;
+        // 标准行号格式应被剥离
+        assert_eq!(strip_line_number_prefix("   42| hello"), "hello");
+        assert_eq!(strip_line_number_prefix("42: hello"), "hello");
+        // `80:80`（冒号后无空格）不是行号前缀，不应被剥离
+        assert_eq!(strip_line_number_prefix("80:80"), "80:80");
+        // 纯数字行不应被剥离（没有分隔符）
+        assert_eq!(strip_line_number_prefix("42"), "42");
+        // 不以数字开头的行不应被剥离
+        assert_eq!(strip_line_number_prefix("hello"), "hello");
     }
 }

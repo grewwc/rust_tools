@@ -16,11 +16,30 @@ pub(super) fn terminal_cell_width(ch: char) -> usize {
     if is_single_width_terminal_symbol(ch) {
         return 1;
     }
+    // 现代 macOS 终端把 Miscellaneous Symbols（U+2600-U+26FF）、
+    // Miscellaneous Technical（U+2300-U+23FF）、Dingbats（U+2700-U+27BF）
+    // 等块中的 ambiguous-width 符号当作 emoji 渲染为 2 列。unicode-width
+    // 对这些字符返回 1（ambiguous），但终端实际占 2 列。若不修正，含 ⚠ ☎ ✂
+    // 等符号的单元格右边框会被逐行拉偏。
+    if is_ambiguous_emoji_block_char(ch) {
+        return 2;
+    }
     unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
 pub(super) fn terminal_display_width(s: &str) -> usize {
-    s.chars().map(terminal_cell_width).sum()
+    let mut total = 0;
+    let mut prev_was_emoji_block = false;
+    for ch in s.chars() {
+        if ch == '\u{fe0f}' && prev_was_emoji_block {
+            // 前一个字符已经是 emoji 块字符（按 2 列计算），VS16 不额外占宽
+            prev_was_emoji_block = false;
+            continue;
+        }
+        total += terminal_cell_width(ch);
+        prev_was_emoji_block = is_ambiguous_emoji_block_char(ch);
+    }
+    total
 }
 
 fn is_single_width_terminal_symbol(ch: char) -> bool {
@@ -28,6 +47,24 @@ fn is_single_width_terminal_symbol(ch: char) -> bool {
         ch,
         '\u{2500}'..='\u{259f}' // box drawing + block elements
             | '\u{2800}'..='\u{28ff}' // braille patterns
+    )
+}
+
+/// 判断字符是否属于"终端按 emoji 渲染为 2 列"的 Unicode 块。
+///
+/// 这些块里的字符在 Unicode 里是 East Asian Ambiguous 宽度（unicode-width 返回 1），
+/// 但现代 macOS 终端用 Apple Color Emoji 字体渲染它们，实际占 2 列。
+/// 本身就是 Wide 的 emoji（✅ ❌ 等）已由 unicode-width 正确返回 2，无需处理。
+fn is_ambiguous_emoji_block_char(ch: char) -> bool {
+    let c = ch as u32;
+    matches!(
+        c,
+        // Miscellaneous Technical: ⌚ ⌛ ⏰ 等
+        0x2300..=0x23FF
+            // Miscellaneous Symbols: ☀ ☁ ⚠ ☎ ⚡ 等
+            | 0x2600..=0x26FF
+            // Dingbats: ✂ ✆ ✈ ✉ ✌ ✍ ✎ ✏ ✓ ✔ ✨ 等
+            | 0x2700..=0x27BF
     )
 }
 
@@ -654,6 +691,16 @@ mod tests {
         }
         // 含箭头的结果单元格：3 个可见字符（→ 空格 x）应为 3 列，而非 4。
         assert_eq!(terminal_display_width("→ x"), 3);
+        // emoji 块的 ambiguous 字符（⚠ ☎ ✂）现代终端按 2 列渲染。
+        for ch in ['⚠', '☎', '✂', '☀', '✈'] {
+            assert_eq!(
+                terminal_cell_width(ch),
+                2,
+                "emoji-block symbol {ch:?} must render as double width"
+            );
+        }
+        // emoji 块字符 + 数字 = 3 列（emoji 2 + 数字 1）。
+        assert_eq!(terminal_display_width("⚠1"), 3);
     }
 
     #[test]
@@ -661,8 +708,9 @@ mod tests {
         // 带 emoji variation selector（U+FE0F）的符号，真实终端按 emoji 呈现占 2 列。
         // `⚠️` = U+26A0 + U+FE0F：base 是 ambiguous(1) + VS16(补 1) = 2 列。
         assert_eq!(terminal_display_width("⚠️"), 2);
-        // 单独 base（无 VS16）仍是 ambiguous 单列。
-        assert_eq!(terminal_display_width("⚠"), 1);
+        // 现代 macOS 终端把 Miscellaneous Symbols 块的字符当作 emoji 渲染为 2 列，
+        // 即使没有 VS16。⚠（U+26A0）属于此块。
+        assert_eq!(terminal_display_width("⚠"), 2);
         // 本身即 emoji-presentation 的字符（unicode-width 判为 2）不受影响。
         assert_eq!(terminal_display_width("✅"), 2);
         assert_eq!(terminal_display_width("❌"), 2);

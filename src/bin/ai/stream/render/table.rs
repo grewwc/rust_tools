@@ -13,14 +13,12 @@ pub(super) enum TableState {
     PendingHeader {
         indent: String,
         header_line: String,
-        preview_height: usize,
     },
     InTable {
         indent: String,
         header: Vec<String>,
         align: Vec<TableAlign>,
         rows: Vec<Vec<String>>,
-        preview_height: usize,
     },
 }
 

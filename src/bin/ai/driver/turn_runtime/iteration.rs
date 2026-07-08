@@ -427,9 +427,10 @@ async fn request_model_response(
     },
     {
         "iteration": _iteration,
-        "outcome": format!("{:?}", __agent_hang_result.outcome),
-        "assistant_chars": __agent_hang_result.assistant_text.chars().count(),
-        "tool_calls": __agent_hang_result.tool_calls.len(),
+        "ok": __agent_hang_result.is_ok(),
+        "outcome": format!("{:?}", __agent_hang_result.as_ref().ok().map(|r| r.outcome)),
+        "assistant_chars": __agent_hang_result.as_ref().map(|r| r.assistant_text.chars().count()).unwrap_or(0),
+        "tool_calls": __agent_hang_result.as_ref().map(|r| r.tool_calls.len()).unwrap_or(0),
         "history_chars": current_history.chars().count(),
         "elapsed_ms": __agent_hang_elapsed_ms,
     }
@@ -441,34 +442,16 @@ async fn stream_model_response(
     terminal_dedupe_candidate: Option<&str>,
     active_skill_name: Option<&str>,
     _iteration: usize,
-) -> StreamResult {
+) -> Result<StreamResult, String> {
     print_assistant_banner_with_app_and_skill(Some(app), active_skill_name);
-    let stream_ok =
-        match stream::stream_response(app, response, current_history, terminal_dedupe_candidate)
-            .await
-        {
-            Ok(result) => Some(result),
-            Err(err) => {
-                app.streaming
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-                eprintln!("\n[Error] 流式响应处理失败：{}", err);
-                eprintln!("[Info] 尝试继续对话...");
-                None
-            }
-        };
-    let stream_result = match stream_ok {
-        Some(result) => result,
-        None => StreamResult {
-            outcome: StreamOutcome::Completed,
-            tool_calls: Vec::new(),
-            assistant_text: "[响应解析失败，请重试]".to_string(),
-            hidden_meta: String::new(),
-            reasoning_text: String::new(),
-            skip_response_drain: false,
-            truncated_by_length: false,
-        },
-    };
-    stream_result
+    match stream::stream_response(app, response, current_history, terminal_dedupe_candidate).await {
+        Ok(result) => Ok(result),
+        Err(err) => {
+            app.streaming
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            Err(err.to_string())
+        }
+    }
 }
 
 async fn finalize_stream_interaction(
@@ -595,27 +578,122 @@ pub(super) async fn execute_turn_iteration(
         ));
     }
 
-    request::print_info(app, &actual_model);
-    let stream_result = stream_model_response(
-        app,
-        &mut response,
-        &mut current_history,
-        terminal_dedupe_candidate,
-        active_skill_name,
-        iteration,
-    )
-    .await;
-    finalize_stream_interaction(
-        app,
-        &mut response,
-        stream_result,
-        turn_messages,
-        one_shot_mode,
-        persisted_turn_messages,
-        should_quit,
-        force_final_response,
-    )
-    .await
+    // 流式响应中途可能因后端瞬态错误（如 "Cancelled by backend"）中断，
+    // 对这类可重试错误重试整条请求+流，避免直接放弃整轮对话。
+    const MAX_STREAM_RETRIES: usize = 8;
+    let mut stream_attempt = 0usize;
+    loop {
+        request::print_info(app, &actual_model);
+        match stream_model_response(
+            app,
+            &mut response,
+            &mut current_history,
+            terminal_dedupe_candidate,
+            active_skill_name,
+            iteration,
+        )
+        .await
+        {
+            Ok(stream_result) => {
+                return finalize_stream_interaction(
+                    app,
+                    &mut response,
+                    stream_result,
+                    turn_messages,
+                    one_shot_mode,
+                    persisted_turn_messages,
+                    should_quit,
+                    force_final_response,
+                )
+                .await;
+            }
+            Err(err_msg) => {
+                if stream_attempt < MAX_STREAM_RETRIES
+                    && request::is_retryable_stream_error(&err_msg)
+                {
+                    stream_attempt += 1;
+                    eprintln!(
+                        "\n[Info] 流式响应中断（{}），第 {}/{} 次重试...",
+                        err_msg, stream_attempt, MAX_STREAM_RETRIES
+                    );
+                    current_history.clear();
+                    app.streaming
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+
+                    if request::should_abort_retry_wait(app) {
+                        return Ok(interrupted_iteration_execution(
+                            app,
+                            one_shot_mode,
+                            turn_messages,
+                            persisted_turn_messages,
+                            should_quit,
+                        ));
+                    }
+                    if request::sleep_with_cancel(
+                        app,
+                        request::retry_delay(stream_attempt),
+                    )
+                    .await
+                    {
+                        return Ok(interrupted_iteration_execution(
+                            app,
+                            one_shot_mode,
+                            turn_messages,
+                            persisted_turn_messages,
+                            should_quit,
+                        ));
+                    }
+
+                    request::clear_stale_request_interrupt_before_request(app);
+                    match do_request_messages(app, &actual_model, messages, true).await {
+                        Ok(new_response) => {
+                            response = new_response;
+                        }
+                        Err(retry_err) => {
+                            let err_text = retry_err.to_string();
+                            if crate::ai::driver::runtime_ctx::has_subagent_result_slot() {
+                                return Err(err_text.into());
+                            }
+                            return Ok(IterationExecution::RequestFailed(
+                                handle_request_error(
+                                    app,
+                                    retry_err,
+                                    one_shot_mode,
+                                    turn_messages,
+                                    persisted_turn_messages,
+                                ),
+                            ));
+                        }
+                    }
+                    continue;
+                }
+
+                // 不可重试或已用完重试次数——回退到旧行为，继续对话
+                eprintln!("\n[Error] 流式响应处理失败：{}", err_msg);
+                eprintln!("[Info] 尝试继续对话...");
+                let stream_result = StreamResult {
+                    outcome: StreamOutcome::Completed,
+                    tool_calls: Vec::new(),
+                    assistant_text: "[响应解析失败，请重试]".to_string(),
+                    hidden_meta: String::new(),
+                    reasoning_text: String::new(),
+                    skip_response_drain: false,
+                    truncated_by_length: false,
+                };
+                return finalize_stream_interaction(
+                    app,
+                    &mut response,
+                    stream_result,
+                    turn_messages,
+                    one_shot_mode,
+                    persisted_turn_messages,
+                    should_quit,
+                    force_final_response,
+                )
+                .await;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
