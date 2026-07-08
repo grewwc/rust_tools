@@ -59,26 +59,35 @@ pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_HARD_FLOOR: usiz
 
 /// 软阈值：min 36K，否则取 history_max_chars * 1.5。
 /// history_max_chars 默认 120K，对应软阈值 180K。
+///
+/// 但字符阈值与模型的 token 窗口是两套单位：一个高占用 prompt 可能远未触及
+/// 180K 字符阈值，却已逼近模型 token 窗口。[`token_window_char_ceiling`] 给出
+/// 该模型「安全字符预算」，二者取 min，确保接近 token 窗口时压缩必然更早触发。
 pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_soft_threshold(
+    model: &str,
     history_max_chars: usize,
 ) -> usize {
     history_max_chars
         .saturating_mul(3)
         .saturating_div(2)
         .max(MID_TURN_COMPRESS_SOFT_FLOOR)
+        .min(token_window_char_ceiling(model))
 }
 
 /// 硬阈值：min 80K，否则取 history_max_chars * 3.5。
 /// history_max_chars 默认 120K，对应硬阈值 420K（远超模型 context window，
 /// 实际硬阈值会被模型 4xx 之前的 normalize_messages_for_request 拦截）。
 /// 但相对软阈值留出明显 gap，避免软阈值边界连续触发 LLM summary。
+/// 同样按 token 窗口字符上限收口，避免字符/token 单位错配下压不动。
 pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_hard_threshold(
+    model: &str,
     history_max_chars: usize,
 ) -> usize {
     history_max_chars
         .saturating_mul(7)
         .saturating_div(2)
         .max(MID_TURN_COMPRESS_HARD_FLOOR)
+        .min(token_window_char_ceiling(model))
 }
 /// LLM 摘要兜底时保留尾部窗口的 user 起始轮数。早期超过此窗口的对话被压成
 /// 一条 internal_note 摘要插入到尾部窗口前。
@@ -89,13 +98,29 @@ pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_MAX_CHARS: us
 /// 仍超过此阈值，触发 LLM 摘要兜底（把早期对话压成单条 internal_note）。
 /// 取 history_max_chars * 2（默认 240K），比 mid-turn hard threshold（*3.5）
 /// 更积极——这是发送请求前的最后一道防线，避免超大上下文导致模型 4xx
-/// 或质量退化（"压不动"问题）。
+/// 或质量退化（"压不动"问题）。同样按 token 窗口字符上限收口。
 pub(in crate::ai::driver::turn_runtime) fn pre_request_llm_summary_threshold(
+    model: &str,
     history_max_chars: usize,
 ) -> usize {
     history_max_chars
         .saturating_mul(2)
         .max(MID_TURN_COMPRESS_HARD_FLOOR)
+        .min(token_window_char_ceiling(model))
+}
+
+/// 模型 token 窗口换算出的「安全字符预算」：`window * chars_per_token * fraction`。
+/// - `chars_per_token = 2`：与 [`request`] 侧 max_tokens 钳制保持同一保守换算。
+/// - `fraction = 0.6`：只用窗口的 ~60% 给历史 prompt，剩余留给系统 prompt、
+///   本轮 user、工具 schema 以及模型输出，避免压缩阈值本身贴着窗口上沿。
+pub(in crate::ai::driver::turn_runtime) fn token_window_char_ceiling(model: &str) -> usize {
+    const CHARS_PER_TOKEN: usize = 2;
+    let window = crate::ai::models::context_window_tokens(model);
+    window
+        .saturating_mul(CHARS_PER_TOKEN)
+        .saturating_mul(3)
+        .saturating_div(5)
+        .max(MID_TURN_COMPRESS_SOFT_FLOOR)
 }
 /// Pre-request LLM 摘要重触发最小增量：自上次 LLM 摘要后 messages 增量
 /// 小于此值则跳过，避免摘要失败时每轮重复调用 LLM。

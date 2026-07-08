@@ -154,6 +154,7 @@
     "explicit_prompt_cache": true,
     "enable_thinking": true,
     "subagent_priority": 60,
+    "context_window_tokens": 262144,
     "max_output_tokens": 32768
   },
   {
@@ -189,6 +190,7 @@
     "default_reasoning_effort": "high",
     "explicit_prompt_cache": true,
     "subagent_priority": 50,
+    "context_window_tokens": 262144,
     "max_output_tokens": 131072
   }
 ]

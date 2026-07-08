@@ -48,6 +48,10 @@ const VOLATILE_ARG_KEYS: &[&str] = &["offset", "limit", "page", "cursor", "max_r
 /// max_iterations 硬上限，用于治理「合法但低效」的工具刷屏。
 const TOOL_ITERATION_SOFT_LIMIT: usize = 384;
 
+/// 连续「流读取中断型」截断（stream_error）的重试上限。超过即放弃本 turn，
+/// 避免服务端持续断流时无限重试（尤其后台任务的 max_iterations = usize::MAX）。
+const MAX_STREAM_ERROR_RETRIES: usize = 16;
+
 /// 单轮工具迭代软阈值：取 max_iterations 的一半与绝对上限的较小值，保证一定
 /// 早于硬上限触发；对超大 ceiling 也能在中段就提醒收敛。
 fn tool_iteration_soft_limit(max_iterations: usize) -> usize {
@@ -802,12 +806,19 @@ async fn run_turn_body(
         rust_tools::cw::SkipSet::default();
     let mut consecutive_empty_responses: usize = 0;
     let mut consecutive_truncations: usize = 0;
+    // 独立统计"流读取中断型"截断（stream_error）。它与模型输出过长无关（网络抖动 /
+    // 服务端断流），因此不参与 reasoning 降档，也不累加 consecutive_truncations；
+    // 但持续断流仍需有上限兜底，否则 usize::MAX 迭代预算的后台任务会无限重试。
+    let mut consecutive_stream_errors: usize = 0;
     let mut turn_had_tool_error = false;
     // 保存进入本 turn 时的 reasoning effort 覆盖值（可能是用户 `/model effort` 的
     // 显式选择，或 None=用模型默认）。截断重试时会临时把它降到 Low，把输出 token
     // 预算从 reasoning 让给实际内容；turn 结束后（含所有 break 出口）统一恢复，
     // 不污染用户的会话级设置。
     let saved_effort_override = app.cli.reasoning_effort_override;
+    // 同理保存 thinking 兜底开关：截断重试可能置位它以强制关闭 always-thinking
+    // 模型的思考链，turn 末统一恢复，不污染后续 turn。
+    let saved_thinking_disabled = app.cli.thinking_disabled_override;
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
         {
@@ -865,14 +876,28 @@ async fn run_turn_body(
                 if stream_result.stream_error {
                     // 流读取错误（网络抖动 / 服务端异常断流）导致的截断。
                     // 模型并没有输出太多，降 reasoning_effort 和注入收缩提示都无意义。
-                    // 只重置计数（不累积——这不是模型的错），简单重试即可。
+                    // 不累积 consecutive_truncations（这不是模型的错），但用独立计数
+                    // consecutive_stream_errors 兜底，避免服务端持续断流时无限重试。
+                    consecutive_truncations = 0;
+                    consecutive_stream_errors += 1;
+                    if consecutive_stream_errors > MAX_STREAM_ERROR_RETRIES {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "  ✗ 连续 {} 次响应流读取中断，停止重试",
+                            consecutive_stream_errors
+                        );
+                        final_assistant_text =
+                            "[响应流多次读取中断，疑似服务端不稳定，请稍后重试或切换模型]"
+                                .to_string();
+                        break 'turn Ok(None);
+                    }
                     let _ = writeln!(
                         std::io::stderr(),
                         "  ⚠ 响应流读取中断（疑似服务端不稳定），自动重试…"
                     );
-                    consecutive_truncations = 0;
                 } else {
                     // 真截断：模型撞输出上限或工具 JSON 半截。
+                    consecutive_stream_errors = 0;
                     // 渐进式 reasoning effort 降档，把输出预算从 reasoning 让给实际内容。
                     // resolve_reasoning_effort 每次迭代实时读该字段，改了立即对下一次生效。
                     //
@@ -884,6 +909,13 @@ async fn run_turn_body(
                         2 => Some(crate::ai::provider::ReasoningEffort::Minimal),
                         _ => None, // Some(None) = 禁用 reasoning，不下发 effort 字段
                     });
+                    // always-thinking 模型（如 GLM 走 enable_thinking）单纯降 effort
+                    // 无法抑制思考链——它由独立的 enable_thinking 开关控制。降档到第 3 次
+                    // 仍截断，说明 reasoning 降档对该模型无效，直接强制关闭 thinking，
+                    // 把整个输出预算让给可见内容。
+                    if consecutive_truncations >= 3 {
+                        app.cli.thinking_disabled_override = true;
+                    }
                 }
 
                 let partial_text = stream_result.assistant_text.trim();
@@ -893,7 +925,7 @@ async fn run_turn_body(
                 // 预算）。继续重试通常无帮助——模型会反复产出同样长度的内容。
                 // 给一次降档重试机会后即接受部分文本作为最终回答。
                 // 但 stream_error 场景不计入 consecutive_truncations，不会触发此分支。
-                if has_visible_text && consecutive_truncations >= 8 && !stream_result.stream_error {
+                if has_visible_text && consecutive_truncations >= 16 && !stream_result.stream_error {
                     let _ = writeln!(
                         std::io::stderr(),
                         "  ▲ 连续 {} 次输出被截断，保留已产出的部分文本",
@@ -904,7 +936,7 @@ async fn run_turn_body(
                 }
 
                 // stream_error 已在上面重置 consecutive_truncations=0，不会进入此分支。
-                if consecutive_truncations > 8 && !stream_result.stream_error {
+                if consecutive_truncations >= 16 && !stream_result.stream_error {
                     let _ = writeln!(
                         std::io::stderr(),
                         "  ✗ 连续 {} 次响应被截断，停止重试",
@@ -984,8 +1016,8 @@ async fn run_turn_body(
         // 阈值按 history_max_chars 动态计算（floor 兜底），避免用户调整
         // history_max_chars 后 mid-turn 阈值依旧死锁在 36K/80K。
         let history_max_chars = app.config.history_max_chars;
-        let mid_turn_soft = mid_turn_compress_soft_threshold(history_max_chars);
-        let mid_turn_hard = mid_turn_compress_hard_threshold(history_max_chars);
+        let mid_turn_soft = mid_turn_compress_soft_threshold(&next_model, history_max_chars);
+        let mid_turn_hard = mid_turn_compress_hard_threshold(&next_model, history_max_chars);
         let total_chars = crate::ai::history::messages_total_chars_pub(&messages);
         if supervisor.should_try_mid_turn_compress(total_chars, mid_turn_soft) {
             // 与跨 turn 压缩（prepare.rs）一致地解析会话 overflow 目录：mid-turn
@@ -1103,6 +1135,7 @@ async fn run_turn_body(
     // Low，这里统一还原（覆盖所有 break 'turn 出口），避免把降档泄漏到后续 turn
     // 污染用户的会话级设置。
     app.cli.reasoning_effort_override = saved_effort_override;
+    app.cli.thinking_disabled_override = saved_thinking_disabled;
 
     // 老化未在本 turn 使用的 explicit-enabled tool。
     // 连续 N 个 turn 闲置就 demote，避免"启用一次永久焊接"。

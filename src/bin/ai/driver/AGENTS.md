@@ -50,14 +50,25 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
 9. Truncation retry uses **progressive escalation**, not a flat retry:
    - `reasoning_effort` degrades 1st truncation to Low, 2nd to Minimal,
      3rd+ to disabled (frees output budget for actual content).
+   - **Always-thinking models** (e.g. GLM via `enable_thinking`) ignore
+     `reasoning_effort` degradation — their thinking is gated by a separate
+     `enable_thinking` switch. On the 3rd+ truncation, `thinking_disabled_override`
+     (an `App.cli` flag read by `request::resolve_thinking`) is set to force
+     thinking off entirely. Both this flag and `reasoning_effort_override` are
+     saved on turn entry and restored at every `break 'turn` exit, so the
+     downgrade never leaks into later turns.
    - The shrink note is **replaced** each truncation (not idempotent) and
      carries the consecutive count, so the model gets escalating feedback
      instead of flying blind after the first attempt.
    - **Stream-error truncations** (`StreamResult::stream_error`, caused by
      decode errors / dropped malformed tool calls) are retried **without**
      reasoning_effort degradation or shrink-note injection — the model didn't
-     output too much, the stream broke. Only `truncated_by_length` truncations
-     (genuine output-limit hits) get the progressive-escalation treatment.
+     output too much, the stream broke. They use an **independent counter**
+     (`consecutive_stream_errors`, capped by `MAX_STREAM_ERROR_RETRIES`) rather
+     than `consecutive_truncations`, so persistent disconnects still terminate
+     the turn (critical for background tasks whose `max_iterations` is
+     `usize::MAX`). Only `truncated_by_length` truncations (genuine output-limit
+     hits) get the progressive-escalation treatment.
 10. Foreground resume turns (process woke up by mailbox events) must persist
    their wake-up prompt as `internal_note` (not `user`). The
    `runtime_ctx::IS_RESUME_TURN` task-local is scoped by

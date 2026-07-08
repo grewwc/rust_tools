@@ -311,7 +311,7 @@ async fn request_model_response(
         None
     };
 
-    let budget_report = context_budget::apply_pre_request_context_budget(app, messages);
+    let budget_report = context_budget::apply_pre_request_context_budget(app, next_model, messages);
     if let Some(reason) = budget_report.rollback_reason {
         crate::ai::driver::print::print_tool_note_line("context-budget", reason.note());
     } else if budget_report.changed {
@@ -341,7 +341,7 @@ async fn request_model_response(
     // 每次请求前的最后检查。
     // 增长量守卫：自上次成功 LLM 摘要后需增长 ≥ MIN_GROWTH 才再次触发。
     // 失败/no-op 不写游标，避免把后续真正需要的 LLM compact 静默挡掉。
-    let llm_threshold = pre_request_llm_summary_threshold(app.config.history_max_chars);
+    let llm_threshold = pre_request_llm_summary_threshold(next_model, app.config.history_max_chars);
     if should_try_pre_request_llm_summary(budget_report.after_chars, llm_threshold) {
         crate::ai::driver::print::print_tool_note_line(
             "compress",
@@ -580,7 +580,7 @@ pub(super) async fn execute_turn_iteration(
 
     // 流式响应中途可能因后端瞬态错误（如 "Cancelled by backend"）中断，
     // 对这类可重试错误重试整条请求+流，避免直接放弃整轮对话。
-    const MAX_STREAM_RETRIES: usize = 8;
+    const MAX_STREAM_RETRIES: usize = 16;
     let mut stream_attempt = 0usize;
     loop {
         request::print_info(app, &actual_model);

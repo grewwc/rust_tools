@@ -228,6 +228,21 @@
     }
 
     #[test]
+    fn thinking_disabled_override_forces_thinking_off() {
+        // 截断兜底置位 thinking_disabled_override 后，即使模型支持 thinking，
+        // resolve_thinking 也必须短路返回 false —— 这是压制 always-thinking 模型
+        // （GLM 走 enable_thinking）思考链的最终手段。
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut app = test_app();
+        app.cli.thinking_disabled_override = true;
+        let enabled = rt.block_on(super::resolve_thinking(&app, "glm-5.2", &[]));
+        assert!(!enabled, "override 置位时 thinking 必须关闭");
+    }
+
+    #[test]
     fn test_parse_thinking_gate_output_string_bool() {
         let s = r#"{"thinking":"false","confidence":0.8}"#;
         assert_eq!(parse_thinking_gate_output(s), Some((false, 0.8)));
@@ -443,10 +458,13 @@
             None,
             Some("high"),
         );
+        // max_tokens 现按剩余上下文窗口钳制；仅当模型声明 max_output_tokens 时下发。
+        // 期望值由同一钳制函数推导，保持 wire 断言随模型配置变化仍成立。
+        let alibaba_max_tokens_field = expected_max_tokens_field(&alibaba_model, &messages);
         assert_eq!(
             serde_json::to_string(&alibaba).unwrap(),
             format!(
-                r#"{{"model":"{alibaba_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"enable_thinking":true,"enable_search":true,"reasoning":{{"effort":"high"}}}}"#
+                r#"{{"model":"{alibaba_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"enable_thinking":true,"enable_search":true,"reasoning":{{"effort":"high"}}{alibaba_max_tokens_field}}}"#
             )
         );
 
@@ -471,12 +489,25 @@
                 None,
                 Some("medium"),
             );
+            let opencode_max_tokens_field = expected_max_tokens_field(&opencode_model, &messages);
             assert_eq!(
                 serde_json::to_string(&opencode).unwrap(),
                 format!(
-                    r#"{{"model":"{opencode_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"reasoning_effort":"medium"}}"#
+                    r#"{{"model":"{opencode_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"reasoning_effort":"medium"{opencode_max_tokens_field}}}"#
                 )
             );
+        }
+    }
+
+    /// 复用生产钳制逻辑，构造 wire 断言里 `max_tokens` 字段的期望片段：
+    /// 模型声明 max_output_tokens 时为 `,"max_tokens":N`，否则为空串。
+    fn expected_max_tokens_field(model: &str, messages: &[Message]) -> String {
+        match super::super::models::max_output_tokens(model) {
+            Some(model_max) => {
+                let clamped = clamp_max_tokens_for_prompt(model, messages, model_max);
+                format!(r#","max_tokens":{clamped}"#)
+            }
+            None => String::new(),
         }
     }
 

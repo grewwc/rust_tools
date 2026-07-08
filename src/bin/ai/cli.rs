@@ -32,6 +32,11 @@ pub(super) struct ParsedCli {
     ///
     /// `/model effort <x>` 与 `--reasoning-effort` 都写入此字段。
     pub(super) reasoning_effort_override: Option<Option<ReasoningEffort>>,
+    /// 截断重试的兜底开关：为 `true` 时本轮请求强制关闭 thinking，忽略模型默认与
+    /// 自动判定。对 always-thinking 模型（如 GLM 走 `enable_thinking`），单纯降
+    /// `reasoning_effort` 无法抑制思考链占满输出预算；连续多次截断后置位此字段，
+    /// 把整个思考预算让给可见内容。仅在 turn 内临时生效，turn 末统一恢复。
+    pub(super) thinking_disabled_override: bool,
     /// 是否只搜索 memo 类别的记录。
     /// 通过 `--note-search` / `-ns` 开启，用于快速查找用户手动记录的内容（如截图、笔记等）。
     /// 默认 false，即走正常的知识召回流程。
@@ -302,6 +307,7 @@ impl Default for ParsedCli {
             help: false,
             interactive: false,
             reasoning_effort_override: None,
+            thinking_disabled_override: false,
             note_search: false,
             note: None,
             note_flag: false,

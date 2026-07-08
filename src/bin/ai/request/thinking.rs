@@ -87,6 +87,12 @@ fn report_resolve_thinking_debug(
 /// 4. Auto-detect based on question complexity
 #[commonw::debug_measure_time("resolve_thinking")]
 pub(super) async fn resolve_thinking(app: &App, model: &str, messages: &[Message]) -> bool {
+    // 截断重试兜底：连续多次截断后强制关闭 thinking，优先级高于一切（含
+    // force_thinking），把输出预算完全让给可见内容。turn 末由 orchestrator 恢复。
+    if app.cli.thinking_disabled_override {
+        return false;
+    }
+
     let cfg = configw::get_all_config();
     let force_thinking = config_bool_is_true(cfg.get_opt(AiConfig::MODEL_THINKING));
 

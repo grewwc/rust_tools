@@ -99,9 +99,10 @@ impl From<&Message> for ProtectedMessage {
 
 pub(super) fn apply_pre_request_context_budget(
     app: &App,
+    model: &str,
     messages: &mut Vec<Message>,
 ) -> ContextBudgetReport {
-    let target_chars = mid_turn_compress_soft_threshold(app.config.history_max_chars);
+    let target_chars = mid_turn_compress_soft_threshold(model, app.config.history_max_chars);
     let scan = quick_scan(messages);
     let mut report = ContextBudgetReport {
         before_chars: scan.total_chars,
@@ -583,7 +584,7 @@ mod tests {
             current_user.clone(),
         ];
 
-        let report = apply_pre_request_context_budget(&app, &mut messages);
+        let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
 
         assert!(report.before_chars > report.target_chars);
         assert_eq!(messages[0], system);
@@ -610,7 +611,7 @@ mod tests {
             current_user.clone(),
         ];
 
-        let report = apply_pre_request_context_budget(&app, &mut messages);
+        let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
 
         assert!(report.changed);
         assert_eq!(report.lossless_removed_messages, 2);
@@ -671,7 +672,7 @@ mod tests {
             current_user.clone(),
         ];
 
-        let report = apply_pre_request_context_budget(&app, &mut messages);
+        let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
 
         assert!(report.changed);
         assert_eq!(messages.last().unwrap(), &current_user);

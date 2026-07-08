@@ -285,9 +285,15 @@ pub(super) fn print_info(app: &App, model: &str) {
     } else {
         "false"
     };
-    let effort_label = match resolve_reasoning_effort(app, model) {
-        Some(e) => e.as_str(),
-        None => "auto",
+    let effort_label = if app.cli.thinking_disabled_override {
+        // 截断兜底已强制关闭 thinking（对 always-thinking 模型降 effort 无效时的
+        // 最终手段），显式标注，避免与"auto/模型默认"混淆。
+        "off"
+    } else {
+        match resolve_reasoning_effort(app, model) {
+            Some(e) => e.as_str(),
+            None => "auto",
+        }
     };
 
     // 打印当前 session 摘要
@@ -339,7 +345,12 @@ fn build_request_body<'a>(
     // 流式请求显式索取 usage：部分 provider（DashScope compatible-mode）流式下
     // 默认不返回 usage，必须声明 stream_options.include_usage 才能统计 token。
     let stream_options = stream.then(|| json!({ "include_usage": true }));
-    let max_tokens = models::max_output_tokens(model);
+    // 仅在模型声明了 max_output_tokens 时下发 max_tokens；并按「剩余上下文窗口」
+    // 钳制，避免 prompt + 请求的输出上限一起挤爆 token 窗口（GLM 长上下文下反复
+    // 截断 → 重试死循环的根因）。未声明 max_output_tokens 的模型保持不下发字段，
+    // wire 行为不变。
+    let max_tokens =
+        models::max_output_tokens(model).map(|model_max| clamp_max_tokens_for_prompt(model, messages, model_max));
     RequestBody {
         model: request_model,
         messages,
@@ -353,6 +364,40 @@ fn build_request_body<'a>(
         stream_options,
         max_tokens,
     }
+}
+
+/// 中英文 + 代码混合语料下的保守「字符 → token」换算：每 token 约 2 个字符。
+/// 偏保守（高估 prompt 占用），宁可提前钳小输出上限，也不让 prompt + 输出一起
+/// 撞爆窗口。
+const CHARS_PER_TOKEN_CONSERVATIVE: usize = 2;
+/// 钳制后为输出保留的最小 token 数：即便 prompt 已接近窗口，也保证有一段可见
+/// 输出空间，避免下发一个过小甚至为 0 的 max_tokens 反而立刻截断。
+const MIN_OUTPUT_TOKENS_FLOOR: u32 = 1_024;
+/// 为 provider 的隐性开销（模板 token、role 分隔符、思考链预留等）预留的安全余量。
+const CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS: usize = 2_048;
+
+/// 估算 messages 的 prompt token 数（保守：高估）。无服务端 usage 反馈时以字符
+/// 数近似（每 token ~2 字符）。
+fn estimate_prompt_tokens(messages: &[Message]) -> usize {
+    let chars: usize = messages
+        .iter()
+        .map(|m| super::history::value_to_string(&m.content).chars().count())
+        .sum();
+    chars.div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
+}
+
+/// 按「剩余上下文窗口」钳制单次请求的输出上限：
+/// `min(model_max, window - est_prompt - safety_margin)`，并 floor 到
+/// [`MIN_OUTPUT_TOKENS_FLOOR`]。这样即使模型声明了很大的 max_output_tokens，
+/// 在高占用 prompt 下也不会 prompt + 输出一起超过 token 窗口。
+fn clamp_max_tokens_for_prompt(model: &str, messages: &[Message], model_max: u32) -> u32 {
+    let window = models::context_window_tokens(model);
+    let est_prompt = estimate_prompt_tokens(messages);
+    let remaining = window
+        .saturating_sub(est_prompt)
+        .saturating_sub(CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS);
+    let remaining = u32::try_from(remaining).unwrap_or(u32::MAX);
+    model_max.min(remaining).max(MIN_OUTPUT_TOKENS_FLOOR)
 }
 
 fn resolve_reasoning_wire_controls<'a>(
