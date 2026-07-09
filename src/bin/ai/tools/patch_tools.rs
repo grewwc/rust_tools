@@ -425,6 +425,106 @@ fn all_hunk_match_positions(
     positions
 }
 
+/// 大块替换（hunk 含大量 context/remove 行）时，全有或全无的精确匹配极易因个别行
+/// 复刻不准而整体失败。此处先做一次 best-effort 部分匹配扫描：在全文件范围内找到
+/// 匹配行数最多的起点，并精确报告哪些行不一致（expected vs actual），让模型只需
+/// 修正出错的几行而非重新猜测整块。
+struct BestPartialMatch {
+    /// 最佳匹配起点（0-based）
+    pos: usize,
+    /// 匹配的行数
+    matches: usize,
+    /// 检查的总行数
+    total: usize,
+    /// 不一致的行：(1-based 文件行号, 期望内容, 实际内容)
+    mismatches: Vec<(usize, String, String)>,
+}
+
+/// 在全文件范围内找到 hunk 期望行块匹配度最高的起点。
+/// 仅在精确匹配失败后的错误路径调用，用 IgnoreIndent 模式以容忍缩进差异、
+/// 聚焦内容差异。返回 None 表示文件中没有任何行能匹配期望块——块完全不存在。
+fn find_best_partial_match(
+    orig_lines: &[String],
+    hunk: &UnifiedHunk,
+    mode: MatchMode,
+) -> Option<BestPartialMatch> {
+    let expected = hunk_expected_lines(hunk);
+    if expected.is_empty() || orig_lines.is_empty() {
+        return None;
+    }
+
+    // 用首行做快速过滤：只在首行能匹配的候选位置做完整对齐检查，避免大文件上的
+    // O(N*M) 全扫描。大块替换中最常见的失败是首行正确、后续个别行有误。
+    let mut candidates: Vec<usize> = (0..orig_lines.len())
+        .filter(|&i| lines_match(&orig_lines[i], expected[0], mode))
+        .collect();
+
+    // 首行匹配不到时，用末行做锚点：末行匹配位置 i 对应起点 i - (len-1)。
+    if candidates.is_empty() && expected.len() > 1 {
+        let last = expected.len() - 1;
+        candidates = (last..orig_lines.len())
+            .filter(|&i| lines_match(&orig_lines[i], expected[last], mode))
+            .map(|i| i - last)
+            .collect();
+    }
+
+    // 首尾都匹配不到时，用每一条期望行做锚点，取匹配行最多的候选。
+    // 这是最后的兜底，覆盖期望块中间行正确但首尾行有误的情况。
+    if candidates.is_empty() {
+        for (ei, exp) in expected.iter().enumerate() {
+            for (fi, line) in orig_lines.iter().enumerate() {
+                if lines_match(line, exp, mode) {
+                    let start = fi.saturating_sub(ei);
+                    if start < orig_lines.len() {
+                        candidates.push(start);
+                    }
+                }
+            }
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+    }
+
+    // 限制候选数量，避免极端情况下的性能问题。
+    candidates.truncate(500);
+
+    let mut best: Option<BestPartialMatch> = None;
+    for &start in &candidates {
+        let available = orig_lines.len().saturating_sub(start);
+        let check_count = expected.len().min(available);
+        if check_count == 0 {
+            continue;
+        }
+        let mut matches = 0usize;
+        let mut mismatches = Vec::new();
+        for i in 0..check_count {
+            let act = &orig_lines[start + i];
+            if lines_match(act, expected[i], mode) {
+                matches += 1;
+            } else {
+                mismatches.push((start + i + 1, expected[i].to_string(), act.clone()));
+            }
+        }
+        let is_better = match &best {
+            None => true,
+            Some(b) => matches > b.matches,
+        };
+        if is_better {
+            best = Some(BestPartialMatch {
+                pos: start,
+                matches,
+                total: check_count,
+                mismatches,
+            });
+        }
+        // 完美匹配不应出现在错误路径，但保留提前退出以保安全。
+        if matches == expected.len() {
+            break;
+        }
+    }
+    best.filter(|b| b.matches > 0)
+}
+
 /// 构造带上下文的 "context mismatch" 错误：列出 patch 期望匹配的行，以及原文件
 /// 在标称位置附近的实际行，帮助模型快速自我修正，而不是只看到一句 "context mismatch"。
 fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> String {
@@ -437,33 +537,68 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
         hunk.old_start, hunk.old_start
     ));
 
-    msg.push_str("Patch expected these lines (context/removed):\n");
-    for (i, line) in expected.iter().take(10).enumerate() {
-        msg.push_str(&format!("  expected[{}]: {}\n", i, line));
-    }
-    if expected.len() > 10 {
+    // 先尝试 best-effort 部分匹配，精确定位不一致的行。大块替换中最常见的失败是
+    // 整块只有个别行复刻不准，部分匹配能告诉模型"第 X 行期望 A 但实际是 B"。
+    if let Some(best) = find_best_partial_match(orig_lines, hunk, MatchMode::IgnoreIndent) {
         msg.push_str(&format!(
-            "  ... ({} more expected lines)\n",
-            expected.len() - 10
+            "Best partial match at line {} ({}/{} lines matched).\n",
+            best.pos + 1,
+            best.matches,
+            best.total
         ));
-    }
-
-    // 标称位置附近的实际文件内容（前后各 3 行窗口）。
-    let win_start = nominal.saturating_sub(3);
-    let win_end = (nominal + expected.len().max(1) + 3).min(orig_lines.len());
-    if win_start < win_end {
-        msg.push_str(&format!(
-            "Actual file content around line {} (1-based):\n",
-            win_start + 1
-        ));
-        for (offset, line) in orig_lines[win_start..win_end].iter().enumerate() {
-            msg.push_str(&format!("  {:>6}: {}\n", win_start + offset + 1, line));
+        if best.mismatches.is_empty() {
+            msg.push_str(
+                "All expected lines matched at this position — \
+                 the mismatch may be due to hunk ordering or a missing trailing line.\n",
+            );
+        } else {
+            let show = best.mismatches.len().min(10);
+            msg.push_str(&format!(
+                "Mismatched lines (showing {} of {}):\n",
+                show,
+                best.mismatches.len()
+            ));
+            for (file_line, exp, act) in best.mismatches.iter().take(10) {
+                msg.push_str(&format!(
+                    "  line {}: expected {:?}, found {:?}\n",
+                    file_line, exp, act
+                ));
+            }
+            if best.mismatches.len() > 10 {
+                msg.push_str(&format!(
+                    "  ... ({} more mismatches)\n",
+                    best.mismatches.len() - 10
+                ));
+            }
         }
     } else {
-        msg.push_str(&format!(
-            "File has {} line(s); declared position is out of range.\n",
-            orig_lines.len()
-        ));
+        // 文件中找不到任何部分匹配——块完全不存在。回显期望行和标称位置附近实际内容。
+        msg.push_str("Patch expected these lines (context/removed):\n");
+        for (i, line) in expected.iter().take(20).enumerate() {
+            msg.push_str(&format!("  expected[{}]: {}\n", i, line));
+        }
+        if expected.len() > 20 {
+            msg.push_str(&format!(
+                "  ... ({} more expected lines)\n",
+                expected.len() - 20
+            ));
+        }
+        let win_start = nominal.saturating_sub(3);
+        let win_end = (nominal + expected.len().max(1) + 3).min(orig_lines.len());
+        if win_start < win_end {
+            msg.push_str(&format!(
+                "Actual file content around line {} (1-based):\n",
+                win_start + 1
+            ));
+            for (offset, line) in orig_lines[win_start..win_end].iter().enumerate() {
+                msg.push_str(&format!("  {:>6}: {}\n", win_start + offset + 1, line));
+            }
+        } else {
+            msg.push_str(&format!(
+                "File has {} line(s); declared position is out of range.\n",
+                orig_lines.len()
+            ));
+        }
     }
 
     msg.push_str(
@@ -1305,5 +1440,58 @@ mod tests {
         assert_eq!(strip_line_number_prefix("42"), "42");
         // 不以数字开头的行不应被剥离
         assert_eq!(strip_line_number_prefix("hello"), "hello");
+    }
+
+    // ── 大块替换：best-effort 部分匹配精确定位不一致行 ──
+
+    #[test]
+    fn apply_unified_patch_large_block_mismatch_pinpoints_wrong_line() {
+        // 大块替换中只有一行内容复刻不准，错误信息应精确定位哪一行不一致
+        // （expected vs actual），而不是只给一句 "context mismatch"。
+        let original = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n";
+        // remove 块 6 行，其中 line4 被模型误写为 lineX
+        let patch = "@@ -2,6 +2,3 @@\n-line2\n-line3\n-lineX\n-line5\n-line6\n-line7\n+new2\n+new3\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("context mismatch"), "err was: {err}");
+        // 应报告最佳匹配位置和匹配数
+        assert!(err.contains("Best partial match"), "err was: {err}");
+        assert!(err.contains("5/6 lines matched"), "err was: {err}");
+        // 应精确指出不一致的行：期望 lineX 但实际是 line4
+        assert!(err.contains("lineX"), "err should mention wrong expected line: {err}");
+        assert!(err.contains("line4"), "err should mention actual file line: {err}");
+    }
+
+    #[test]
+    fn apply_unified_patch_absent_block_falls_back_to_nominal_window() {
+        // 期望的块在文件中完全不存在（没有任何行能部分匹配），应回显期望行和
+        // 标称位置附近实际内容，而不是走 partial match 分支。
+        let original = "alpha\nbeta\ngamma\n";
+        let patch = "@@ -2,1 +2,1 @@\n-not_present\n+changed\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("context mismatch"), "err was: {err}");
+        // 块完全不存在时不会有 "Best partial match"
+        assert!(!err.contains("Best partial match"), "err was: {err}");
+        // 应回显期望行
+        assert!(err.contains("not_present"), "err was: {err}");
+        // 应显示标称位置附近的实际内容
+        assert!(err.contains("beta"), "err was: {err}");
+    }
+
+    #[test]
+    fn apply_unified_patch_partial_match_uses_middle_line_anchor() {
+        // 期望块的首行复刻有误，但中间行正确。应通过中间行锚点找到最佳匹配位置，
+        // 并报告首行的不一致。
+        let original = "aaa\nbbb\nccc\nddd\neee\n";
+        // 首行 "wrong" 不在文件中，但 "ccc"、"ddd" 在
+        let patch = "@@ -1,3 +1,1 @@\n-wrong\n-ccc\nddd\n+changed\n";
+        let patch = "@@ -1,3 +1,1 @@\n-wrong\n-ccc\n ddd\n+changed\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("context mismatch"), "err was: {err}");
+        // 应通过 "ccc" 或 "ddd" 找到部分匹配
+        assert!(err.contains("Best partial match"), "err was: {err}");
+        assert!(err.contains("2/3 lines matched"), "err was: {err}");
+        // 应指出首行不匹配：期望 "wrong" 但实际是 "bbb"
+        assert!(err.contains("wrong"), "err should mention wrong expected line: {err}");
+        assert!(err.contains("bbb"), "err should mention actual file line: {err}");
     }
 }
