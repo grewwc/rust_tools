@@ -78,7 +78,13 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
      context_window_tokens - est_prompt_tokens - margin)` in
      `request::clamp_max_tokens_for_prompt` (only emitted when the model
      declares `max_output_tokens`). Prompt tokens are estimated conservatively
-     (~2 chars/token). Compression thresholds
+     (~2 chars/token). When a server-reported `known_prompt_tokens` is passed, it
+     is capped at `2×` the char estimate: after a compression turn the prompt
+     drops sharply but the carried-over `known` is still the pre-compression high
+     value — using it verbatim would mis-clamp `remaining` to the floor (1024),
+     which an always-thinking model (GLM) burns entirely on reasoning → zero
+     visible text → length-truncation retry storm. The cap falls back to this
+     turn's char estimate on compression turns. Compression thresholds
      (`mid_turn_compress_soft/hard_threshold`, `pre_request_llm_summary_threshold`)
      are additionally capped by `token_window_char_ceiling(model)` (window * 2 *
      0.6 chars), so a high-occupancy prompt triggers compression before it

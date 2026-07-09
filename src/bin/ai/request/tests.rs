@@ -426,11 +426,15 @@
             .map(|m| m.name.clone())
     }
 
-    fn first_model_name_for_provider(provider: crate::ai::provider::ApiProvider) -> Option<String> {
+    /// 返回该 provider 下第一个模型的 **唯一 key**（而非 `name`）。生产链路
+    /// 用 key 定位模型（日志里模型标识形如 `glm-5.2-opencode`），而 `name`
+    /// （如 `glm-5.2`）可能被多个 provider 的条目共享，按 name 查找会命中歧义
+    /// 条目、解析出错误的 provider 方言。测试必须与生产一致用 key。
+    fn first_model_key_for_provider(provider: crate::ai::provider::ApiProvider) -> Option<String> {
         crate::ai::model_names::all()
             .iter()
             .find(|m| m.provider == provider)
-            .map(|m| m.name.clone())
+            .map(|m| m.key.clone())
     }
 
     /// 逐字节 wire guard：锁死各 provider 的 `build_request_body` 序列化结果，
@@ -449,7 +453,8 @@
         }];
 
         // Alibaba：嵌套 reasoning.effort + enable_thinking/enable_search，无 stream_options（非流式）。
-        let alibaba_model = first_model_name_for_provider(ApiProvider::Alibaba)
+        // 用唯一 key 定位模型（生产链路一致），避免共享 name 命中歧义条目。
+        let alibaba_model = first_model_key_for_provider(ApiProvider::Alibaba)
             .expect("models.json must contain an Alibaba model");
         let alibaba = build_request_body(
             &alibaba_model,
@@ -463,13 +468,16 @@
         None,
             None,
         );
+        // wire 里的 model 字段是解析后的 request_model_name（provider 实际模型名），
+        // 与用于定位的 key 可能不同。
+        let alibaba_wire_model = super::super::models::request_model_name(&alibaba_model);
         // max_tokens 现按剩余上下文窗口钳制；仅当模型声明 max_output_tokens 时下发。
         // 期望值由同一钳制函数推导，保持 wire 断言随模型配置变化仍成立。
         let alibaba_max_tokens_field = expected_max_tokens_field(&alibaba_model, &messages);
         assert_eq!(
             serde_json::to_string(&alibaba).unwrap(),
             format!(
-                r#"{{"model":"{alibaba_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"enable_thinking":true,"enable_search":true,"reasoning":{{"effort":"high"}}{alibaba_max_tokens_field}}}"#
+                r#"{{"model":"{alibaba_wire_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"enable_thinking":true,"enable_search":true,"reasoning":{{"effort":"high"}}{alibaba_max_tokens_field}}}"#
             )
         );
 
@@ -482,7 +490,7 @@
                 m.provider == ApiProvider::OpenCode
                     && !m.name.to_ascii_lowercase().contains("deepseek")
             })
-            .map(|m| m.name.clone());
+            .map(|m| m.key.clone());
         if let Some(opencode_model) = non_deepseek_opencode {
             let opencode = build_request_body(
                 &opencode_model,
@@ -496,11 +504,12 @@
             None,
                 None,
             );
+            let opencode_wire_model = super::super::models::request_model_name(&opencode_model);
             let opencode_max_tokens_field = expected_max_tokens_field(&opencode_model, &messages);
             assert_eq!(
                 serde_json::to_string(&opencode).unwrap(),
                 format!(
-                    r#"{{"model":"{opencode_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"reasoning_effort":"medium"{opencode_max_tokens_field}}}"#
+                    r#"{{"model":"{opencode_wire_model}","messages":[{{"role":"user","content":"hi"}}],"stream":false,"reasoning_effort":"medium"{opencode_max_tokens_field}}}"#
                 )
             );
         }
@@ -516,6 +525,38 @@
             }
             None => String::new(),
         }
+    }
+
+    /// 回归：历史压缩后 `known_prompt_tokens`（上一轮服务端回填的高值）不能
+    /// 盖过本轮实际消息量。否则 clamp 会以为 prompt 仍占满窗口，remaining 触底
+    /// 到 MIN_OUTPUT_TOKENS_FLOOR，always-thinking 模型的输出预算被 reasoning
+    /// 吃光 → 零可见文本截断重试死循环。
+    #[test]
+    fn clamp_ignores_stale_high_known_prompt_after_compression() {
+        let model = "glm-5.2-opencode";
+        let Some(model_max) = super::super::models::max_output_tokens(model) else {
+            return;
+        };
+        // 本轮消息很短（压缩后），字符估算 ~个位数 token。
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: Value::String("short message after compression".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        // 陈旧的高 known（压缩前 ~满窗）不应触底。
+        let stale_high = clamp_max_tokens_for_prompt(model, &messages, model_max, Some(259_000));
+        assert!(
+            stale_high > MIN_OUTPUT_TOKENS_FLOOR,
+            "stale-high known_prompt_tokens should not clamp output to the floor, got {stale_high}"
+        );
+
+        // 合理的 known（与本轮估算同量级）仍被采纳：结果与不传 known 接近。
+        let fresh = clamp_max_tokens_for_prompt(model, &messages, model_max, Some(20));
+        let no_known = clamp_max_tokens_for_prompt(model, &messages, model_max, None);
+        assert_eq!(fresh, no_known);
     }
 
     #[test]

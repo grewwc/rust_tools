@@ -20,6 +20,7 @@ use super::{
 };
 use crate::ai::theme::{ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_SUCCESS, ACCENT_WARN, RESET};
 use crate::commonw::configw;
+use super::provider::adapter_for;
 
 mod types;
 mod thinking;
@@ -55,7 +56,7 @@ pub(crate) use error::{
     clear_stale_request_interrupt_before_request, config_bool_is_true, config_forces_thinking,
     control_model_for_aux_tasks, endpoint_for_request_model, is_retryable_reqwest_error,
     is_retryable_status_with_body, is_transient_error, parse_retry_after, request_retry_policy,
-    request_retry_policy_for_current_context, retry_delay, send_with_hedged_backup, should_rotate_opencode_key,
+    request_retry_policy_for_current_context, retry_delay, send_with_hedged_backup, should_rotate_key,
     should_abort_retry_wait, should_retry_status, should_temporarily_disable_auto_selected_model,
     should_temporarily_disable_model, should_try_model_fallback, sleep_with_cancel, is_retryable_stream_error,
 };
@@ -68,6 +69,140 @@ fn retry_scope_tag() -> String {
         Some(pid) => format!("[pid {pid}] "),
         None => String::new(),
     }
+}
+
+/// Try a single API key for `do_request_messages`, with full retry logic
+/// (header timeout, 429 backoff, hedging, network errors).
+/// Returns `Ok` on success or `Err` after exhausting per-key retries.
+/// Caller decides whether to try another key based on the error kind.
+async fn request_messages_with_key(
+    app: &mut App,
+    api_key: &str,
+    request_body: &RequestBody<'_>,
+    retry_policy: &RequestRetryPolicy,
+    endpoint: &str,
+) -> Result<Response, RequestError> {
+    for attempt in 1..=retry_policy.max_attempts_429 {
+        let build_request = || {
+            apply_request_auth(app.client.post(endpoint), endpoint, api_key)
+                .header("Content-Type", "application/json")
+                .json(request_body)
+        };
+        let response = match tokio::time::timeout(
+            Duration::from_secs(retry_policy.header_timeout_secs),
+            send_with_hedged_backup(
+                build_request,
+                retry_policy.hedged_backup_after_secs(),
+                retry_policy.hedged_max_sends(),
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                if attempt < retry_policy.max_attempts {
+                    let delay = retry_delay(attempt);
+                    eprintln!(
+                        "[Warning] {}等待响应头超时 ({}s) - sleep {} 秒后重试 (attempt {}/{})",
+                        retry_scope_tag(),
+                        retry_policy.header_timeout_secs,
+                        delay.as_secs_f32(),
+                        attempt,
+                        retry_policy.max_attempts
+                    );
+                    if sleep_with_cancel(app, delay).await {
+                        return Err(RequestError::cancelled(
+                            "request canceled by user during retry wait",
+                        ));
+                    }
+                    continue;
+                }
+                return Err(RequestError {
+                    kind: RequestErrorKind::Network,
+                    message: format!(
+                        "request timed out waiting for response headers after {} attempts",
+                        retry_policy.max_attempts
+                    ),
+                });
+            }
+        };
+
+        match response {
+            Ok(response) => {
+                if response.status().is_success() {
+                    return Ok(response);
+                }
+                let status = response.status();
+                let status_code = status.as_u16();
+                let retry_after_delay = if status_code == 429 {
+                    parse_retry_after(response.headers())
+                } else {
+                    None
+                };
+                let body = (response.text().await).unwrap_or_default();
+                let err = RequestError::status(status, body);
+
+                let max_attempts_for_status = if status_code == 429 {
+                    retry_policy.max_attempts_429
+                } else {
+                    retry_policy.max_attempts
+                };
+
+                if is_retryable_status_with_body(status, &err.message)
+                    && attempt < max_attempts_for_status
+                {
+                    let delay = retry_after_delay.unwrap_or_else(|| retry_delay(attempt));
+                    if status_code == 429 {
+                        eprintln!(
+                            "[Warning] {}429 Too Many Requests - 配额超限，sleep {} 秒后重试 (attempt {}/{})",
+                            retry_scope_tag(),
+                            delay.as_secs_f32(),
+                            attempt,
+                            max_attempts_for_status
+                        );
+                    } else {
+                        eprintln!(
+                            "[Warning] {}{} - sleep {} 秒后重试 (attempt {}/{})",
+                            retry_scope_tag(),
+                            status,
+                            delay.as_secs_f32(),
+                            attempt,
+                            max_attempts_for_status
+                        );
+                    }
+                    if sleep_with_cancel(app, delay).await {
+                        return Err(RequestError::cancelled(
+                            "request canceled by user during retry wait",
+                        ));
+                    }
+                    continue;
+                }
+                return Err(err);
+            }
+            Err(err) => {
+                let retryable = is_retryable_reqwest_error(&err);
+                let err = RequestError::network(err);
+                if retryable && attempt < retry_policy.max_attempts {
+                    let delay = retry_delay(attempt);
+                    eprintln!(
+                        "[Warning] {}网络错误 - sleep {} 秒后重试 (attempt {}/{})",
+                        retry_scope_tag(),
+                        delay.as_secs_f32(),
+                        attempt,
+                        retry_policy.max_attempts
+                    );
+                    if sleep_with_cancel(app, delay).await {
+                        return Err(RequestError::cancelled(
+                            "request canceled by user during retry wait",
+                        ));
+                    }
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+    unreachable!("retry loop always returns or breaks")
 }
 
 #[commonw::debug_measure_time("do_request_message")]
@@ -123,171 +258,36 @@ pub(super) async fn do_request_messages(
     );
     let retry_policy = request_retry_policy_for_current_context();
 
-    // === OpenCode key rotation ===
-    let is_opencode =
-        models::model_provider(model) == crate::ai::provider::ApiProvider::OpenCode;
+    // --- Key collection & rotation (via ProviderAdapter) ---
+    let endpoint = endpoint_for_request_model(app, model);
     let primary_key = api_key_for_request_model(app, model);
-    let keys_to_try: Vec<String> = if is_opencode {
-        let mut keys = vec![primary_key.clone()];
-        for (k, v) in configw::get_all_config().entries() {
-            if k.starts_with("opencode.api_key") && k != "opencode.api_key" && !v.trim().is_empty()
-            {
-                let trimmed = v.trim().to_string();
-                if trimmed != primary_key && !keys.contains(&trimmed) {
-                    keys.push(trimmed);
-                }
-            }
-        }
-        keys
-    } else {
-        vec![primary_key]
-    };
+    let adapter = adapter_for(models::model_provider(model), &endpoint);
+    let keys_to_try = adapter.collect_api_keys(&primary_key);
     let total_keys = keys_to_try.len();
-    let mut last_key_err: Option<RequestError> = None;
 
+    let mut last_key_err: Option<RequestError> = None;
     for (key_idx, api_key) in keys_to_try.iter().enumerate() {
         if key_idx > 0 {
             eprintln!(
-                "[opencode] key #{} failed, trying next key ({} remaining)",
+                "[{}] key #{} failed, trying next key ({} remaining)",
+                adapter.label(),
                 key_idx,
                 total_keys - key_idx
             );
         }
-    for attempt in 1..=retry_policy.max_attempts_429 {
-        let endpoint = endpoint_for_request_model(app, model);
-        let build_request = || {
-            apply_request_auth(app.client.post(&endpoint), &endpoint, api_key)
-                .header("Content-Type", "application/json")
-                .json(&request_body)
-        };
-        // 给“等待响应头”加超时兜底：connect_timeout 只覆盖握手，无法拦截
-        // 服务端接受连接后迟迟不返回响应头导致的永久阻塞（CPU 0 卡死）。
-        let response = match tokio::time::timeout(
-            Duration::from_secs(retry_policy.header_timeout_secs),
-            send_with_hedged_backup(build_request, retry_policy.hedged_backup_after_secs(), retry_policy.hedged_max_sends()),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => {
-                if attempt < retry_policy.max_attempts {
-                    let delay = retry_delay(attempt);
-                    eprintln!(
-                        "[Warning] {}等待响应头超时 ({}s) - sleep {} 秒后重试 (attempt {}/{})",
-                        retry_scope_tag(),
-                        retry_policy.header_timeout_secs,
-                        delay.as_secs_f32(),
-                        attempt,
-                        retry_policy.max_attempts
-                    );
-                    if sleep_with_cancel(app, delay).await {
-                        return Err(RequestError::cancelled(
-                            "request canceled by user during retry wait",
-                        ));
-                    }
-                    continue;
-                }
-                return Err(RequestError {
-                    kind: RequestErrorKind::Network,
-                    message: format!(
-                        "request timed out waiting for response headers after {} attempts",
-                        retry_policy.max_attempts
-                    ),
-                });
+        match request_messages_with_key(app, api_key, &request_body, &retry_policy, &endpoint).await {
+            Ok(response) => return Ok(response),
+            Err(err) if should_rotate_key(&err) && key_idx + 1 < total_keys => {
+                last_key_err = Some(err);
             }
-        };
-
-        match response {
-            Ok(response) => {
-                if response.status().is_success() {
-                    return Ok(response);
-                }
-                let status = response.status();
-                let status_code = status.as_u16();
-                // 在消费 body 前读取 Retry-After 头
-                let retry_after_delay = if status_code == 429 {
-                    parse_retry_after(response.headers())
-                } else {
-                    None
-                };
-                let body = (response.text().await).unwrap_or_default();
-                let err = RequestError::status(status, body);
-
-                // 根据状态码确定最大重试次数
-                let max_attempts_for_status = if status_code == 429 {
-                    retry_policy.max_attempts_429
-                } else {
-                    retry_policy.max_attempts
-                };
-
-                if is_retryable_status_with_body(status, &err.message) && attempt < max_attempts_for_status {
-                    // 打印 sleep 原因
-                    let delay = retry_after_delay.unwrap_or_else(|| retry_delay(attempt));
-
-                    if status_code == 429 {
-                        eprintln!(
-                            "[Warning] {}429 Too Many Requests - 配额超限，sleep {} 秒后重试 (attempt {}/{})",
-                            retry_scope_tag(),
-                            delay.as_secs_f32(),
-                            attempt,
-                            max_attempts_for_status
-                        );
-                    } else {
-                        eprintln!(
-                            "[Warning] {}{} - sleep {} 秒后重试 (attempt {}/{})",
-                            retry_scope_tag(),
-                            status,
-                            delay.as_secs_f32(),
-                            attempt,
-                            max_attempts_for_status
-                        );
-                    }
-                    if sleep_with_cancel(app, delay).await {
-                        return Err(RequestError::cancelled(
-                            "request canceled by user during retry wait",
-                        ));
-                    }
-                    continue;
-                }
-                if should_rotate_opencode_key(&err) && key_idx + 1 < total_keys {
-                    last_key_err = Some(err);
-                    break;
-                }
-                return Err(err);
-            }
-            Err(err) => {
-                let retryable = is_retryable_reqwest_error(&err);
-                let err = RequestError::network(err);
-                if retryable && attempt < retry_policy.max_attempts {
-                    // 打印 sleep 原因
-                    let delay = retry_delay(attempt);
-                    eprintln!(
-                        "[Warning] {}网络错误 - sleep {} 秒后重试 (attempt {}/{})",
-                        retry_scope_tag(),
-                        delay.as_secs_f32(),
-                        attempt,
-                        retry_policy.max_attempts
-                    );
-                    if sleep_with_cancel(app, delay).await {
-                        return Err(RequestError::cancelled(
-                            "request canceled by user during retry wait",
-                        ));
-                    }
-                    continue;
-                }
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         }
     }
-
-    }
-    Err(last_key_err.unwrap_or_else(|| RequestError {
-        kind: RequestErrorKind::Network,
-        message: if is_opencode {
-            "all opencode keys exhausted".to_string()
-        } else {
-            "request failed".to_string()
-        },
+    Err(last_key_err.unwrap_or_else(|| {
+        RequestError {
+            kind: RequestErrorKind::Network,
+            message: adapter.keys_exhausted_message().to_string(),
+        }
     }))
 }
 
@@ -446,10 +446,20 @@ fn clamp_max_tokens_for_prompt(
     known_prompt_tokens: Option<u64>,
 ) -> u32 {
     let window = models::context_window_tokens(model);
-    // 优先使用服务端返回的实际 prompt_tokens，比字符估算精确得多。
-    let est_prompt = known_prompt_tokens
-        .map(|p| p as usize)
-        .unwrap_or_else(|| estimate_prompt_tokens(messages));
+    // 本轮实际消息量的字符估算（保守：每 token ~2 字符，仅计 messages 不含 tools）。
+    let est_prompt = estimate_prompt_tokens(messages);
+    // 优先使用服务端返回的实际 prompt_tokens，比字符估算精确得多。但该值来自
+    // *上一轮* 请求：若这一轮刚发生历史压缩，prompt 骤降，而回填的 known 仍是
+    // 压缩前的高值——直接用它会把 remaining 误算成接近 0，clamp 触底到
+    // MIN_OUTPUT_TOKENS_FLOOR(1024)。always-thinking 模型(GLM)拿 1024 预算会被
+    // reasoning 全部吃光 → completion=0 可见文本 → 截断重试死循环。
+    // 因此对 known 设上界：正常轮 known ≈ est + tools(~1.2x est)，压缩轮 known 会
+    // 远超 est(数倍)。超过 2×est 判定为陈旧，回退到本轮字符估算。
+    let est_prompt = match known_prompt_tokens.map(|p| p as usize) {
+        Some(known) if est_prompt > 0 => known.min(est_prompt.saturating_mul(2)),
+        Some(known) => known,
+        None => est_prompt,
+    };
     let remaining = window
         .saturating_sub(est_prompt)
         .saturating_sub(CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS);

@@ -327,9 +327,9 @@ pub(crate) fn should_try_model_fallback(err: &RequestError) -> bool {
 }
 
 /// Returns `true` if the error indicates an auth or quota issue with the API key
-/// (401 Unauthorized, 403 Forbidden, 429 Too Many Requests), which should trigger
-/// key rotation when alternative OpenCode keys are available.
-pub(crate) fn should_rotate_opencode_key(err: &RequestError) -> bool {
+/// (401 Unauthorized, 403 Forbidden, 429 Too Many Requests),
+/// which should trigger key rotation when alternative keys are available.
+pub(crate) fn should_rotate_key(err: &RequestError) -> bool {
     matches!(
         err.kind,
         RequestErrorKind::Status(status) if matches!(status.as_u16(), 401 | 403 | 429)

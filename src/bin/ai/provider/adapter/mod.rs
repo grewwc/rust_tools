@@ -75,6 +75,19 @@ pub(in crate::ai) trait ProviderAdapter: Sync {
     /// 读取 API key 时的配置键候选链（按优先级）。
     fn api_key_candidates(&self) -> &'static [&'static str];
 
+    /// 收集该 provider 可用的所有 API key（含轮换候选）。
+    /// 默认只返回主 key；覆写以提供多个备选 key（如 OpenCode 的配置 entries）。
+    /// `primary_key` 是当前模型解析出的主 key。
+    fn collect_api_keys(&self, primary_key: &str) -> Vec<String> {
+        vec![primary_key.to_string()]
+    }
+
+    /// 所有 API key 用尽时使用的错误消息。
+    /// 各 provider 可以覆写为有辨识度的文案（如 OpenCode 的 "all opencode keys exhausted"）。
+    fn keys_exhausted_message(&self) -> &'static str {
+        "request failed"
+    }
+
     /// 是否在等待首个可见 chunk 时打印提示（OpenCode 首 token 较慢）。
     fn shows_waiting_hint(&self) -> bool {
         false

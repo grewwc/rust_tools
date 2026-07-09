@@ -24,6 +24,26 @@ impl ProviderAdapter for OpenCodeAdapter {
         &[AiConfig::MODEL_OPENCODE_API_KEY, AiConfig::MODEL_API_KEY]
     }
 
+    fn collect_api_keys(&self, primary_key: &str) -> Vec<String> {
+        let mut keys = vec![primary_key.to_string()];
+        for (k, v) in crate::commonw::configw::get_all_config().entries() {
+            if k.starts_with("opencode.api_key")
+                && k != "opencode.api_key"
+                && !v.trim().is_empty()
+            {
+                let trimmed = v.trim().to_string();
+                if trimmed != primary_key && !keys.contains(&trimmed) {
+                    keys.push(trimmed);
+                }
+            }
+        }
+        keys
+    }
+
+    fn keys_exhausted_message(&self) -> &'static str {
+        "all opencode keys exhausted"
+    }
+
     fn shows_waiting_hint(&self) -> bool {
         true
     }
