@@ -124,12 +124,18 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
 `/goal` slash command 启动 goal 模式：agent 自动持续推进目标直到完成。
 
 - **状态存储**: `App::goal_mode` — `None`=未启用；`Some("")`=等待用户输入目标；
-  `Some(goal)`=目标已设定，自动推进。`goal_iterations` 记录已推进轮数，
-  `goal_last_turn_had_tool_calls` 标记上一轮是否有工具调用。
+  `Some(goal)`=目标已设定，自动推进。`App::last_turn_had_tool_calls` 标记上一轮
+  是否有工具调用；`App::last_turn_interrupted` 标记上一轮是否被 Ctrl+C 打断
+  （每次 `run_turn` 入口清零，仅 `finish_interrupted_turn` 置位）。
 - **交互方式**: `/goal` 后可直接跟目标文本，也可只输入 `/goal` 再在下一轮输入目标。
   `/goal off` 退出 goal 模式。
-- **自动推进**: `run_loop` 在 goal 模式下跳过用户输入，注入 `"[goal: ...] 继续推进目标"` 作为下一轮输入；
-  若上一轮无工具调用且已有 >1 轮，认为目标完成，自动退出。`/done` 也可手动退出。
+- **自动推进**: `run_loop` 在 goal 模式下，若上一轮调用过工具，则跳过用户输入、
+  注入 continuation prompt 驱动下一轮。
+- **收尾判定**: 上一轮无工具调用时由 `commands::goal::should_exit_goal_on_idle`
+  决策——**自然完成**（未打断）视为目标达成，打印 `Goal achieved` 并退出；
+  **被 Ctrl+C 打断**则保留 goal 模式、静默回落到等待用户输入，不误报达成。
+  二者都会把 `last_turn_had_tool_calls` 置 false，故必须靠 `last_turn_interrupted`
+  区分，不能仅凭前者判定。
 
 ## Related detailed guide
 
