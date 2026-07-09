@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use std::{fs, os::unix::fs::OpenOptionsExt, os::unix::fs::PermissionsExt};
 
 use reqwest::blocking::Client;
-use rust_tools::commonw::{FastMap, configw};
+use rust_tools::commonw::{FastMap, FastSet, configw};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -5525,7 +5525,7 @@ fn md_node_to_block_ops(node: MdNode, id_counter: &mut usize) -> Vec<BlockOp> {
             if children.is_empty() {
                 return vec![BlockOp::Simple(json!({
                     "block_type": 15,
-                    "quote": { "elements": [make_text_element("", false, false, false)] }
+                    "quote": {}
                 }))];
             }
             let quote_id = alloc_id(id_counter);
@@ -5541,7 +5541,7 @@ fn md_node_to_block_ops(node: MdNode, id_counter: &mut usize) -> Vec<BlockOp> {
             let quote_block = json!({
                 "block_id": quote_id,
                 "block_type": 15,
-                "quote": { "elements": [make_text_element("", false, false, false)] },
+                "quote": {},
                 "children": child_ids
             });
             let mut descendants = vec![quote_block];
@@ -5686,7 +5686,7 @@ fn md_node_to_descendant_blocks(node: MdNode, id_counter: &mut usize) -> (Vec<St
             let quote_block = json!({
                 "block_id": quote_id,
                 "block_type": 15,
-                "quote": { "elements": [make_text_element("", false, false, false)] },
+                "quote": {},
                 "children": child_ids
             });
             let mut result = vec![quote_block];
@@ -6260,6 +6260,45 @@ fn create_children_batch(
     Ok(())
 }
 
+/// 飞书 descendant API 要求每个 descendant block 必须包含 parent_id 字段。
+/// block 构造阶段不知道 document_id，因此在此处统一注入 parent_id：
+/// - children_id 中的根级 block，parent_id = document_id
+/// - 其余 block，通过遍历各 block 的 children 数组反查父 block_id
+fn inject_descendant_parent_ids(
+    descendants: &[Value],
+    children_id: &[String],
+    document_id: &str,
+) -> Vec<Value> {
+    let mut parent_map: FastMap<String, String> = FastMap::default();
+    for desc in descendants {
+        if let Some(block_id) = desc.get("block_id").and_then(|v| v.as_str()) {
+            if let Some(children) = desc.get("children").and_then(|v| v.as_array()) {
+                for child in children {
+                    if let Some(child_id) = child.as_str() {
+                        parent_map.insert(child_id.to_string(), block_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let children_set: FastSet<String> = children_id.iter().cloned().collect();
+    descendants
+        .iter()
+        .map(|desc| {
+            let mut d = desc.clone();
+            if let Some(block_id) = d.get("block_id").and_then(|v| v.as_str()) {
+                let parent = if children_set.contains(block_id) {
+                    document_id.to_string()
+                } else {
+                    parent_map.get(block_id).cloned().unwrap_or_default()
+                };
+                d["parent_id"] = json!(parent);
+            }
+            d
+        })
+        .collect()
+}
+
 fn create_descendant_batch(
     client: &Client,
     base_url: &str,
@@ -6269,6 +6308,7 @@ fn create_descendant_batch(
     descendants: &[Value],
     index: i64,
 ) -> Result<(), JsonRpcErr> {
+    let enriched_descendants = inject_descendant_parent_ids(descendants, children_id, document_id);
     let url = format!(
         "{}/open-apis/docx/v1/documents/{}/blocks/{}/descendant",
         base_url.trim_end_matches('/'),
@@ -6278,7 +6318,7 @@ fn create_descendant_batch(
     let body = json!({
         "index": index,
         "children_id": children_id,
-        "descendants": descendants
+        "descendants": enriched_descendants
     });
 
     let resp = client
@@ -7417,6 +7457,65 @@ mod tests {
             match old_client_id {
                 Some(v) => std::env::set_var("FEISHU_CLIENT_ID", v),
                 None => std::env::remove_var("FEISHU_CLIENT_ID"),
+            }
+        }
+    }
+
+    #[test]
+    fn inject_parent_ids_for_blockquote_descendants() {
+        let descendants = vec![
+            json!({ "block_id": "blk_1", "block_type": 15, "quote": {}, "children": ["blk_2"] }),
+            json!({ "block_id": "blk_2", "block_type": 2, "text": { "elements": [] }, "children": [] }),
+        ];
+        let enriched = inject_descendant_parent_ids(&descendants, &["blk_1".to_string()], "doc123");
+        assert_eq!(enriched[0]["parent_id"], "doc123");
+        assert_eq!(enriched[1]["parent_id"], "blk_1");
+    }
+
+    #[test]
+    fn inject_parent_ids_for_table_descendants() {
+        let descendants = vec![
+            json!({ "block_id": "blk_1", "block_type": 31, "table": { "property": { "row_size": 2, "column_size": 2, "header_row": true } }, "children": ["blk_2", "blk_4"] }),
+            json!({ "block_id": "blk_2", "block_type": 32, "table_cell": {}, "children": ["blk_3"] }),
+            json!({ "block_id": "blk_3", "block_type": 2, "text": { "elements": [] }, "children": [] }),
+            json!({ "block_id": "blk_4", "block_type": 32, "table_cell": {}, "children": ["blk_5"] }),
+            json!({ "block_id": "blk_5", "block_type": 2, "text": { "elements": [] }, "children": [] }),
+        ];
+        let enriched = inject_descendant_parent_ids(&descendants, &["blk_1".to_string()], "doc456");
+        assert_eq!(enriched[0]["parent_id"], "doc456");
+        assert_eq!(enriched[1]["parent_id"], "blk_1");
+        assert_eq!(enriched[2]["parent_id"], "blk_2");
+        assert_eq!(enriched[3]["parent_id"], "blk_1");
+        assert_eq!(enriched[4]["parent_id"], "blk_4");
+    }
+
+    #[test]
+    fn inject_parent_ids_for_multiple_root_blocks() {
+        let descendants = vec![
+            json!({ "block_id": "blk_1", "block_type": 15, "quote": {}, "children": ["blk_2"] }),
+            json!({ "block_id": "blk_2", "block_type": 2, "text": { "elements": [] }, "children": [] }),
+            json!({ "block_id": "blk_3", "block_type": 15, "quote": {}, "children": ["blk_4"] }),
+            json!({ "block_id": "blk_4", "block_type": 2, "text": { "elements": [] }, "children": [] }),
+        ];
+        let enriched = inject_descendant_parent_ids(&descendants, &["blk_1".to_string(), "blk_3".to_string()], "doc789");
+        assert_eq!(enriched[0]["parent_id"], "doc789");
+        assert_eq!(enriched[1]["parent_id"], "blk_1");
+        assert_eq!(enriched[2]["parent_id"], "doc789");
+        assert_eq!(enriched[3]["parent_id"], "blk_3");
+    }
+
+    #[test]
+    fn convert_markdown_quote_uses_empty_quote_container() {
+        let ops = convert_markdown_to_docx_blocks("> 测试引用");
+        match &ops[0] {
+            BlockOp::Descendant { descendants, .. } => {
+                let quote_block = &descendants[0];
+                assert_eq!(quote_block["block_type"], 15);
+                assert!(quote_block["quote"].as_object().unwrap().is_empty());
+            }
+            BlockOp::Simple(block) => {
+                assert_eq!(block["block_type"], 15);
+                assert!(block["quote"].as_object().unwrap().is_empty());
             }
         }
     }
