@@ -342,6 +342,15 @@ fn connect_single_server(
     let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
     let stderr_tail = spawn_stderr_drain(stderr);
 
+    // 设置 stdout 管道为非阻塞模式，使 BufReader::fill_buf 在管道
+    // 暂无数据时返回 WouldBlock 而非无限阻塞
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        super::super::mcp::set_fd_nonblocking(stdout.as_raw_fd())
+            .map_err(|e| format!("Failed to set nonblocking mode: {}", e))?;
+    }
+
     let mut conn = McpServerConnection {
         config: config.clone(),
         process,
@@ -370,7 +379,7 @@ fn initialize_server(
     conn: &mut McpServerConnection,
     next_id: &std::sync::atomic::AtomicU64,
 ) -> Result<(), String> {
-    use crate::ai::mcp::send_request_to_conn;
+    use crate::ai::mcp::{send_notification_to_conn, send_request_to_conn};
     use serde_json::json;
 
     let params = json!({
@@ -388,14 +397,8 @@ fn initialize_server(
 
     let id1 = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     send_request_to_conn(conn, id1, "initialize", Some(params))?;
-    let id2 = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    if let Err(err) = send_request_to_conn(conn, id2, "notifications/initialized", None) {
-        let is_method_not_found = err.contains("-32601")
-            && (err.contains("notifications/initialized") || err.contains("initialized"));
-        if !is_method_not_found {
-            return Err(err);
-        }
-    }
+    // notifications/initialized 是通知（无 id，不等待响应），不能用请求形式发送
+    send_notification_to_conn(conn, "notifications/initialized", None)?;
     Ok(())
 }
 
@@ -405,13 +408,24 @@ fn list_tools(
 ) -> Result<Vec<McpTool>, String> {
     use crate::ai::mcp::send_request_to_conn;
     let id = next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let result = send_request_to_conn(conn, id, "tools/list", None)?;
+    let result = match send_request_to_conn(conn, id, "tools/list", None) {
+        Ok(v) => v,
+        Err(err) => {
+            let is_method_not_found = err.contains("-32601") && err.contains("tools/list");
+            if is_method_not_found {
+                return Ok(Vec::new());
+            }
+            return Err(err);
+        }
+    };
     let tools = result["tools"]
         .as_array()
-        .ok_or("Invalid tools response")?
-        .iter()
-        .filter_map(|t| serde_json::from_value(t.clone()).ok())
-        .collect();
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| serde_json::from_value(t.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(tools)
 }
 

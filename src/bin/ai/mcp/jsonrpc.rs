@@ -129,4 +129,22 @@ mod tests {
                 .contains("sampling/createMessage")
         );
     }
+
+    #[test]
+    fn classify_response_with_null_id() {
+        // 部分 MCP 服务器（如 mcp_ocr）会对 notifications/initialized 通知
+        // 发送冗余确认响应 {"jsonrpc":"2.0","id":null,"result":{}}。
+        // 该响应应被分类为 Response 且 id 为 None，以便 send_request_to_conn 跳过。
+        let inbound = classify_inbound_jsonrpc(
+            r#"{"jsonrpc":"2.0","id":null,"result":{}}"#,
+        )
+        .unwrap();
+        match inbound {
+            InboundJsonRpc::Response(resp) => {
+                assert!(resp.id.is_none(), "id should be None for null id");
+                assert!(resp.result.is_some());
+            }
+            other => panic!("expected Response, got {:?}", other),
+        }
+    }
 }

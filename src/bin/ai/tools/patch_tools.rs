@@ -83,23 +83,19 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
             continue;
         };
         let rest = rest.trim();
-        let Some(rest) = rest.strip_prefix('-') else {
-            return Err("invalid hunk header".to_string());
-        };
-        let mut parts = rest.split_whitespace();
-        let old_part = parts.next().ok_or("invalid hunk header")?;
-        let _new_part = parts.next().ok_or("invalid hunk header")?;
-
-        let old_start = old_part
-            .split(',')
-            .next()
-            .ok_or("invalid hunk header")?
-            .parse::<isize>()
-            .map_err(|_| "invalid hunk header")?;
-        let old_start = if old_start <= 0 {
-            0
-        } else {
-            old_start as usize
+        // 规范的 `*** Begin Patch` 信封（Codex/OpenAI 风格）用裸 `@@` 或
+        // `@@ <上下文标题> @@` 作为 hunk 分隔符，不带 `-N,M +N,M` 行号。仅当
+        // header 形如 `-N` 时解析标称行号；否则 old_start=0，交给 locate_hunk
+        // 的全文件搜索唯一定位，避免对规范信封格式报 "invalid hunk header"。
+        let old_start = match rest.strip_prefix('-') {
+            Some(after) => after
+                .split_whitespace()
+                .next()
+                .and_then(|part| part.split(',').next())
+                .and_then(|num| num.parse::<isize>().ok())
+                .map(|n| if n <= 0 { 0 } else { n as usize })
+                .unwrap_or(0),
+            None => 0,
         };
 
         let mut lines = Vec::new();
@@ -1493,5 +1489,62 @@ mod tests {
         // 应指出首行不匹配：期望 "wrong" 但实际是 "bbb"
         assert!(err.contains("wrong"), "err should mention wrong expected line: {err}");
         assert!(err.contains("bbb"), "err should mention actual file line: {err}");
+    }
+
+    // ── 规范 *** Begin Patch 信封：裸 @@ / @@ heading @@ 无行号 header ──
+
+    #[test]
+    fn parse_unified_hunks_accepts_bare_at_header() {
+        // 规范信封格式用裸 `@@` 分隔 hunk，不带 `-N,M +N,M` 行号。
+        // 修复前会报 "invalid hunk header"。
+        let patch = "@@\n foo\n-bar\n+baz\n";
+        let hunks = parse_unified_hunks(patch).expect("bare @@ header should be accepted");
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_start, 0);
+    }
+
+    #[test]
+    fn parse_unified_hunks_accepts_at_header_with_heading() {
+        // `@@ <上下文标题> @@` 也应被接受，标称行号视为 0（依赖全文件搜索定位）。
+        let patch = "@@ fn foo() @@\n foo\n-bar\n+baz\n";
+        let hunks =
+            parse_unified_hunks(patch).expect("@@ heading @@ header should be accepted");
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_start, 0);
+    }
+
+    #[test]
+    fn apply_unified_patch_applies_bare_at_header_hunk() {
+        // 端到端：裸 @@ header 的 hunk 应能通过全文件搜索唯一定位并应用。
+        let original = "alpha\nbeta\ngamma\n";
+        let patch = "@@\n alpha\n-beta\n+changed\n";
+        let result =
+            apply_unified_patch(original, patch).expect("bare @@ hunk should apply");
+        assert_eq!(result, "alpha\nchanged\ngamma\n");
+    }
+
+    #[test]
+    fn execute_apply_patch_envelope_with_bare_at_header() {
+        // 复现用户报告：规范 *** Begin Patch 信封 + 裸 @@ header。
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = make_temp_path("envelope_bare_at").with_extension("txt");
+        let base = path.parent().unwrap().to_path_buf();
+        fs::create_dir_all(&base).unwrap();
+        fs::write(&path, "alpha\nbeta\ngamma\n").unwrap();
+
+        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+            let args = serde_json::json!({
+                "path": path.to_string_lossy(),
+                "patch": format!(
+                    "*** Begin Patch\n*** Update File: {}\n@@\n alpha\n-beta\n+changed\n*** End Patch\n",
+                    path.display()
+                )
+            });
+            execute_apply_patch(&args)
+                .expect("envelope with bare @@ header should apply");
+        });
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\ngamma\n");
+        let _ = fs::remove_dir_all(base);
     }
 }

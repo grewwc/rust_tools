@@ -1,5 +1,5 @@
 use std::{
-    io::BufRead,
+    io::{BufRead, ErrorKind},
     process::ChildStdout,
     time::{Duration, Instant},
 };
@@ -7,7 +7,29 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 
+#[cfg(unix)]
+use libc;
+
 const MCP_POLL_SLICE_MS: u64 = 100;
+
+/// 将文件描述符设置为非阻塞模式。
+///
+/// 这样 `BufReader::fill_buf()` 在管道暂无数据时返回 `WouldBlock`
+/// 而非无限阻塞，使 `read_line_with_timeout_buf` 能先检查内部缓冲区
+/// 是否已有完整一行（之前 fill_buf 可能已将多行数据读入缓冲区），
+/// 再决定是否需要 `wait_fd_readable` 等待新数据。
+#[cfg(unix)]
+pub(in crate::ai) fn set_fd_nonblocking(fd: i32) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
 
 fn tool_cancel_error() -> String {
     "MCP request canceled by user".to_string()
@@ -93,32 +115,46 @@ pub(super) fn read_line_with_timeout_buf<R: std::io::Read>(
         if tool_cancel_requested() {
             return Err(tool_cancel_error());
         }
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(format!("MCP response timeout after {} ms", timeout_ms));
+
+        // 先尝试从 BufReader 内部缓冲区读取。
+        // 当之前 fill_buf 已将多行数据读入内部缓冲区时（例如
+        // id:null 冗余确认和 tools/list 响应同时到达），fd 不再
+        // 可读，wait_fd_readable 会不必要地阻塞/超时。
+        // fd 已设为非阻塞模式，fill_buf 在管道暂无数据时返回
+        // WouldBlock 而非无限阻塞。
+        match stdout.fill_buf() {
+            Ok(available) if available.is_empty() => {
+                return Err("MCP server closed the stream unexpectedly".to_string());
+            }
+            Ok(available) => {
+                if let Some(pos) = available.iter().position(|b| *b == b'\n') {
+                    buf.extend_from_slice(&available[..=pos]);
+                    stdout.consume(pos + 1);
+                    let line = String::from_utf8(buf)
+                        .map_err(|e| format!("MCP response is not valid UTF-8: {}", e))?;
+                    return Ok(line);
+                }
+                // 缓冲区有数据但不完整（没有换行符），复制到 buf 后继续
+                buf.extend_from_slice(available);
+                let consumed = available.len();
+                stdout.consume(consumed);
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // 管道暂无新数据，等待 fd 可读
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(format!("MCP response timeout after {} ms", timeout_ms));
+                }
+                let remaining = deadline
+                    .saturating_duration_since(now)
+                    .as_millis()
+                    .max(1) as u64;
+                wait_fd_readable(fd, remaining)?;
+            }
+            Err(e) => {
+                return Err(format!("Failed to read response: {}", e));
+            }
         }
-        let remaining = deadline.saturating_duration_since(now).as_millis().max(1) as u64;
-
-        wait_fd_readable(fd, remaining)?;
-
-        let available = stdout
-            .fill_buf()
-            .map_err(|e| format!("Failed to read response: {}", e))?;
-        if available.is_empty() {
-            return Err("MCP server closed the stream unexpectedly".to_string());
-        }
-
-        if let Some(pos) = available.iter().position(|b| *b == b'\n') {
-            buf.extend_from_slice(&available[..=pos]);
-            stdout.consume(pos + 1);
-            let line = String::from_utf8(buf)
-                .map_err(|e| format!("MCP response is not valid UTF-8: {}", e))?;
-            return Ok(line);
-        }
-
-        buf.extend_from_slice(available);
-        let consumed = available.len();
-        stdout.consume(consumed);
     }
 }
 

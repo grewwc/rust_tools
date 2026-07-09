@@ -52,6 +52,23 @@
     "max_output_tokens": 393216
   },
   {
+    "key": "glm-5.2-opencode",
+    "aliases": [
+      "GLM_5.2_OPENCODE"
+    ],
+    "name": "glm-5.2",
+    "provider": "opencode",
+    "quality_tier": "strong",
+    "is_vl": false,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": true,
+    "subagent_priority": 85,
+    "default_reasoning_effort": "high",
+    "context_window_tokens": 262144,
+    "max_output_tokens": 131072
+  },
+  {
     "key": "qwen3.7-plus-alibaba",
     "aliases": [
       "QWEN_PLUS_LATEST",

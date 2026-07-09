@@ -72,9 +72,15 @@ pub(in crate::ai) fn send_request_to_conn(
                 continue;
             }
             InboundJsonRpc::Response(response) => {
-                if let Some(resp_id) = response.id
-                    && resp_id != id
-                {
+                // 跳过无 id 的响应（id 为 null 或缺失）。
+                // 部分 MCP 服务器（如 mcp_ocr）会对 notifications/initialized
+                // 通知发送冗余确认响应 {"jsonrpc":"2.0","id":null,"result":{}}。
+                // 若不跳过，该响应会被错误地当作下一个请求的响应消费，
+                // 导致真正的响应滞留在缓冲区，引发 id mismatch 错误。
+                let Some(resp_id) = response.id else {
+                    continue;
+                };
+                if resp_id != id {
                     return Err(format!(
                         "MCP response id mismatch: expected {}, got {}",
                         id, resp_id
@@ -98,10 +104,38 @@ pub(in crate::ai) fn send_request_to_conn(
     }
 }
 
+/// 发送 JSON-RPC 通知到 MCP 服务器连接（无 id，不等待响应）。
+///
+/// MCP 协议中 `notifications/initialized` 等消息是通知而非请求：
+/// 不携带 `id` 字段，服务器不应返回响应。若错误地以请求形式发送
+/// （带 `id` 并等待响应），部分 MCP 服务器（如 Feishu）会因协议
+/// 违规而直接关闭 stdio 流，导致 "MCP server closed the stream
+/// unexpectedly" 错误。
+pub(in crate::ai) fn send_notification_to_conn(
+    conn: &mut McpServerConnection,
+    method: &str,
+    params: Option<Value>,
+) -> Result<(), String> {
+    let mut payload = json!({
+        "jsonrpc": "2.0",
+        "method": method,
+    });
+    if let Some(p) = params {
+        payload["params"] = p;
+    }
+    let payload_str = serde_json::to_string(&payload)
+        .map_err(|e| format!("Failed to serialize notification: {}", e))?;
+
+    writeln!(conn.stdin_mut(), "{}", payload_str).map_err(|e| {
+        conn.decorate_transport_error(format!("Failed to send notification: {}", e))
+    })?;
+    Ok(())
+}
+
 use super::{
     connection::{McpServerConnection, spawn_stderr_drain},
     jsonrpc::{
-        InboundJsonRpc, JsonRpcRequest, JsonRpcResponse, classify_inbound_jsonrpc,
+        InboundJsonRpc, JsonRpcRequest, classify_inbound_jsonrpc,
         unsupported_server_request_payload,
     },
 };
@@ -178,6 +212,13 @@ impl McpClient {
         let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
         let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
         let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            super::io::set_fd_nonblocking(stdout.as_raw_fd())
+                .map_err(|e| format!("Failed to set nonblocking mode: {}", e))?;
+        }
         let stderr_tail = spawn_stderr_drain(stderr);
 
         let mut conn = McpServerConnection {
@@ -258,6 +299,13 @@ impl McpClient {
         let stdin = process.stdin.take().ok_or("Failed to get stdin")?;
         let stdout = process.stdout.take().ok_or("Failed to get stdout")?;
         let stderr = process.stderr.take().ok_or("Failed to get stderr")?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            super::io::set_fd_nonblocking(stdout.as_raw_fd())
+                .map_err(|e| format!("Failed to set nonblocking mode: {}", e))?;
+        }
         let stderr_tail = spawn_stderr_drain(stderr);
 
         conn.process = process;
@@ -359,22 +407,39 @@ impl McpClient {
         writeln!(conn.stdin_mut(), "{}", request_str)
             .map_err(|e| conn.decorate_transport_error(format!("Failed to send request: {}", e)))?;
 
-        let response_line = conn.read_response_line()?;
-
-        let response: JsonRpcResponse = serde_json::from_str(&response_line)
-            .map_err(|e| format!("Failed to parse response: {}", e))?;
-
-        if response.jsonrpc != "2.0" {
-            return Err(format!("Invalid JSON-RPC version: {}", response.jsonrpc));
-        }
-        if let Some(resp_id) = response.id
-            && resp_id != id
-        {
-            return Err(format!(
-                "MCP response id mismatch: expected {}, got {}",
-                id, resp_id
-            ));
-        }
+        let deadline = Instant::now() + Duration::from_millis(conn.request_timeout_ms);
+        let response = loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(conn.decorate_transport_error(format!(
+                    "MCP response timeout after {} ms",
+                    conn.request_timeout_ms
+                )));
+            }
+            let remaining_ms = deadline
+                .saturating_duration_since(now)
+                .as_millis()
+                .clamp(1, u64::MAX as u128) as u64;
+            let response_line = conn.read_response_line_with_timeout(remaining_ms)?;
+            match classify_inbound_jsonrpc(&response_line)? {
+                InboundJsonRpc::Notification { .. } => continue,
+                InboundJsonRpc::Request { id: request_id, method } => {
+                    reject_server_request(conn, request_id, &method)?;
+                    continue;
+                }
+                InboundJsonRpc::Response(resp) => {
+                    // 跳过无 id 的响应（id 为 null 或缺失）
+                    let Some(resp_id) = resp.id else { continue; };
+                    if resp_id != id {
+                        return Err(format!(
+                            "MCP response id mismatch: expected {}, got {}",
+                            id, resp_id
+                        ));
+                    }
+                    break resp;
+                }
+            }
+        };
 
         if let Some(error) = response.error {
             if let Some(data) = error.data {
@@ -415,26 +480,31 @@ impl McpClient {
 
         let id1 = self.next_request_id();
         Self::send_request_to_conn(conn, id1, "initialize", Some(params))?;
-        let id2 = self.next_request_id();
-        if let Err(err) = Self::send_request_to_conn(conn, id2, "notifications/initialized", None) {
-            let is_method_not_found = err.contains("-32601")
-                && (err.contains("notifications/initialized") || err.contains("initialized"));
-            if !is_method_not_found {
-                return Err(err);
-            }
-        }
+        // notifications/initialized 是通知（无 id，不等待响应），不能用请求形式发送
+        send_notification_to_conn(conn, "notifications/initialized", None)?;
         Ok(())
     }
 
     fn list_tools(&self, conn: &mut McpServerConnection) -> Result<Vec<McpTool>, String> {
-        let result = self.send_request(conn, "tools/list", None)?;
+        let result = match self.send_request(conn, "tools/list", None) {
+            Ok(v) => v,
+            Err(err) => {
+                let is_method_not_found = err.contains("-32601") && err.contains("tools/list");
+                if is_method_not_found {
+                    return Ok(Vec::new());
+                }
+                return Err(err);
+            }
+        };
 
         let tools = result["tools"]
             .as_array()
-            .ok_or("Invalid tools response")?
-            .iter()
-            .filter_map(|t| serde_json::from_value(t.clone()).ok())
-            .collect();
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| serde_json::from_value(t.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Ok(tools)
     }
