@@ -11,6 +11,9 @@ pub(super) struct LargeToolSummary {
     pub(super) summary: String,
     pub(super) top_level_keys: Vec<String>,
     pub(super) field_samples: Vec<String>,
+    /// 文本内容的结构化关键行（函数/类型定义、错误行等），
+    /// 为首次 overflow stub 提供召回锚点，让模型判断是否需要重新 read_file。
+    pub(super) key_lines: Vec<String>,
 }
 
 pub(super) struct TurnPreparation {

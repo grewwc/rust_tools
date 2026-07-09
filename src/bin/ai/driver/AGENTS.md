@@ -93,6 +93,15 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
    compression's user-turn count, or being misread by the model as repeated
    user questions.
 
+10. Tool-result overflow (`turn_runtime/tool_result/`): single tool results are
+   inline up to `max_tool_result_inline_chars(model)` (model-aware: 32K floor,
+   ~12.5% of context window, 64K cap). Beyond that the full content is written
+   to a session file and replaced by a stub. The stub includes summary +
+   key_lines (structural lines: fn/struct/trait/enum/error) + head_preview +
+   tail_preview, giving the model recall anchors so it can decide whether a
+   re-read is needed without blindly re-calling `read_file`. `is_non_compressible_tool`
+   (read_file/code_search/text_grep/etc.) never goes through lossy `line_trim_middle`.
+
 ## Related detailed guide
 
 - `docs/agent-guides/ai-driver.md`

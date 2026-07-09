@@ -9,7 +9,7 @@ use std::{collections::VecDeque, io::Write};
 
 use super::super::persistence::persist_pending_turn_messages;
 use super::super::{
-    MAX_TOOL_RESULT_INLINE_CHARS, MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS,
+    MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS, max_tool_result_inline_chars,
     types::{IterationExecution, PreparedToolResult, ToolCallExecution, TurnLoopStep},
 };
 use super::{
@@ -123,6 +123,7 @@ pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
     tool_name: &str,
     content: &str,
 ) -> PreparedToolResult {
+    let inline_limit = max_tool_result_inline_chars(&app.current_model);
     let char_count = content.chars().count();
     if char_count <= MAX_TOOL_RESULT_LINE_TRIM_CHARS {
         return PreparedToolResult {
@@ -131,7 +132,7 @@ pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
         };
     }
 
-    if char_count <= MAX_TOOL_RESULT_INLINE_CHARS && supports_line_trim(tool_name) {
+    if char_count <= inline_limit && supports_line_trim(tool_name) {
         let trimmed = line_trim_middle(content);
         // 复用 trimmed 的字节长度做廉价短路：trimmed 是从 content 里挑选若干行
         // 拼接出来的（可能改动；保留 ASCII / UTF-8 不变），如果字节更短就一定是
@@ -144,7 +145,7 @@ pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
         }
     }
 
-    if char_count <= MAX_TOOL_RESULT_INLINE_CHARS {
+    if char_count <= inline_limit {
         return PreparedToolResult {
             content_for_model: content.to_string(),
             content_for_terminal: build_terminal_preview(tool_name, content),

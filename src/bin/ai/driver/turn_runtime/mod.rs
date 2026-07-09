@@ -40,10 +40,29 @@ pub(super) use types::TurnOutcome;
 
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;
 const TOOL_OVERFLOW_PREVIEW_CHARS: usize = 800;
+/// 首次 overflow stub 中的 head 预览字符数。
+/// 与 mid-turn 压缩 stub 的 head 8 行预览保持一致的信息密度。
+const TOOL_OVERFLOW_HEAD_CHARS: usize = 800;
 /// 中等大输出阈值：超过此值但未到 overflow 阈值的工具结果，仅对非精确概览类
 /// 工具走"头 + 关键命中 + 尾"的按行裁剪，避免完整 32KB 全部进上下文。
 /// grep/code_search/search_files/read_file(_lines) 等精确证据工具不走该有损路径。
 const MAX_TOOL_RESULT_LINE_TRIM_CHARS: usize = 8_000;
+
+/// 单条工具结果 inline（不 offload 到文件）的字符上限，按模型 context window 动态计算。
+///
+/// - 基准 32K（`MAX_TOOL_RESULT_INLINE_CHARS`），适合 128K token 窗口的模型。
+/// - 大窗口模型按比例放宽：`context_window * chars_per_token / 8`，即窗口的 ~12.5%
+///   预留给单条工具结果。256K token 模型 → 64K 字符，200K → 50K，128K → 32K。
+/// - 上限 64K：避免单条工具结果占用过多上下文，即使模型窗口很大。
+/// - 下限 32K：不小于基准值，确保小窗口模型也不会频繁 offload。
+pub(in crate::ai::driver::turn_runtime) fn max_tool_result_inline_chars(model: &str) -> usize {
+    const CHARS_PER_TOKEN: usize = 2;
+    let window = crate::ai::models::context_window_tokens(model);
+    window
+        .saturating_mul(CHARS_PER_TOKEN)
+        .saturating_div(8)
+        .clamp(MAX_TOOL_RESULT_INLINE_CHARS, 64_000)
+}
 
 /// Mid-turn 渐进式压缩：messages 总字符数超过该阈值时，在 iteration loop 内
 /// 复用跨 turn 压缩管线，避免单 turn 长链工具调用把上下文撑爆。
