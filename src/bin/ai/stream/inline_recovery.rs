@@ -454,11 +454,14 @@ pub(super) fn collect_valid_tool_calls(
                 // arguments 可能很大（大文件 write_file），只显示头尾各 300 字符。
                 let raw = &builder.arguments;
                 let snippet = if raw.len() > 600 {
+                    // 按字符边界截取，避免在多字节 UTF-8 字符（如中文）中间切片导致 panic。
+                    let head: String = raw.chars().take(300).collect();
+                    let tail: String = raw.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
                     format!(
                         "{}…[截断，共 {} 字符]…{}",
-                        &raw[..300],
+                        head,
                         raw.len(),
-                        &raw[raw.len() - 300..]
+                        tail
                     )
                 } else {
                     raw.to_string()
