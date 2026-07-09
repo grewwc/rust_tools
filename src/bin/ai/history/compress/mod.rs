@@ -818,7 +818,10 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // === Path C 兜底：per-message 截断 ===
     // 渐进式折叠后仍超 hard_target 且未达有效压缩：对尾窗内单个超大非 system
     // 消息做 head+tail 截断。典型场景：最近一轮对话本身就很大（巨型 user 消息
-    // 或大量近期工具结果），早期历史已压无可压，臃肿全在保护尾窗内。
+    // 或大量近期工具结果），早期历史已压无可压，臃肿全在保护尾窗内。user 消息
+    // 承载任务指令，head+tail 截断会让 agent 丢失任务目标，因此永不截断——
+    // 宁可让该轮带超大 user 超限发请求（由 normalize_messages_for_request 兜底
+    // 或 provider 4xx 后重试），也不能把任务指令截成预览碎片。
     // 这是绝对最后手段——宁可截断也不能让模型 4xx。
     if best_after > hard_target {
         let current = best.unwrap_or(messages);
@@ -835,13 +838,14 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
 
 /// Path C 兜底：对序列中单个超大非 system 消息做 head+tail 截断。
 /// 仅在渐进式折叠后仍超 `hard_target` 时由 [`mid_turn_llm_summarize`] 调用。
-/// system / agent 指令永不截断；图片按名义计费（≤ PATH_C_PER_MSG_CAP）天然跳过。
+/// system / agent 指令 / user 消息永不截断；图片按名义计费（≤ PATH_C_PER_MSG_CAP）天然跳过。
+/// user 消息承载任务指令，截断成 head+tail 预览会导致 agent 丢失任务目标。
 fn cap_oversized_non_system_messages(
     mut messages: Vec<Message>,
     per_msg_cap: usize,
 ) -> Vec<Message> {
     for message in &mut messages {
-        if is_system_like_role(&message.role) {
+        if is_system_like_role(&message.role) || message.role == "user" {
             continue;
         }
         let chars = value_len_chars(&message.content);

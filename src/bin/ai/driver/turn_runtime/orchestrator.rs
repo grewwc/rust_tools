@@ -819,12 +819,12 @@ async fn run_turn_body(
     // 同理保存 thinking 兜底开关：截断重试可能置位它以强制关闭 always-thinking
     // 模型的思考链，turn 末统一恢复，不污染后续 turn。
     let saved_thinking_disabled = app.cli.thinking_disabled_override;
-   // 同理保存 max_tokens 自适应覆盖：零输出截断时自动降 max_tokens 重试。
-   let saved_max_tokens_override = app.cli.max_tokens_override;
-   // 记住服务端已接受过的最大 max_tokens 值。零输出截断降级后，一旦服务端
-   // 接受了某个值，就记下来；后续恢复时恢复到这个已验证的值而非原始配置值，
-   // 避免反复从原始（过大）值开始试错。turn 内有效，turn 末随 override 一起恢复。
-   let mut accepted_max_tokens: Option<u32> = None;
+    // 同理保存 max_tokens 自适应覆盖：零输出截断时自动降 max_tokens 重试。
+    // 降级是临时的：一旦有正常输出（正常完成或正常截断）就恢复原始值，
+    // 因为原始值本身是合理的（首次请求能成功）。turn 末兜底恢复。
+    let saved_max_tokens_override = app.cli.max_tokens_override;
+    // 当前是否处于零输出降级状态。
+    let mut mt_downgraded = false;
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
         {
@@ -940,6 +940,12 @@ async fn run_turn_body(
                             current_max, halved
                         );
                         app.cli.max_tokens_override = Some(halved);
+                        mt_downgraded = true;
+                    } else if mt_downgraded {
+                        // 正常截断（有输出但被打断）：服务端接受了当前 max_tokens，
+                        // 恢复原始值给后续迭代更大输出预算。
+                        app.cli.max_tokens_override = saved_max_tokens_override;
+                        mt_downgraded = false;
                     }
 
                     // 该模型降 reasoning_effort 是否真能缩短思考链。
@@ -1012,21 +1018,11 @@ async fn run_turn_body(
                 }
             } else {
                 consecutive_truncations = 0;
-               // 服务端接受了当前 max_tokens（非零输出）。
-               // 记住这个已验证的值，后续恢复时恢复到它而非原始（可能过大）值。
-               // 这样零输出降级后不会再反复从原始值开始试错。
-               if let Some(override_val) = app.cli.max_tokens_override {
-                   accepted_max_tokens = Some(override_val);
-                   let _ = writeln!(
-                       std::io::stderr(),
-                       "  ✓ 服务端接受 max_tokens={}，后续请求沿用此值",
-                       override_val
-                   );
-                   // 不清除 override —— 保持已验证的值，避免下一轮又用原始过大值
-               } else if accepted_max_tokens.is_some() {
-                   // override 已为 None（原始值），且之前有已验证值，
-                   // 说明当前用的是原始 max_tokens 且服务端接受，无需变更。
-               }
+                // 非截断：恢复因零输出降级的 max_tokens。
+                if mt_downgraded {
+                    app.cli.max_tokens_override = saved_max_tokens_override;
+                    mt_downgraded = false;
+                }
             }
             let step = match handle_iteration_execution(
                 app, &question, &mc, mcp_client, execution,

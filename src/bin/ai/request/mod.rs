@@ -54,7 +54,7 @@ pub(crate) use error::{
     STREAM_RESPONSE_HEADER_TIMEOUT_SECS, apply_request_auth, api_key_for_request_model,
     clear_stale_request_interrupt_before_request, config_bool_is_true, config_forces_thinking,
     control_model_for_aux_tasks, endpoint_for_request_model, is_retryable_reqwest_error,
-    is_transient_error, parse_retry_after, request_retry_policy,
+    is_retryable_status_with_body, is_transient_error, parse_retry_after, request_retry_policy,
     request_retry_policy_for_current_context, retry_delay, send_with_hedged_backup,
     should_abort_retry_wait, should_retry_status, should_temporarily_disable_auto_selected_model,
     should_temporarily_disable_model, should_try_model_fallback, sleep_with_cancel, is_retryable_stream_error,
@@ -191,7 +191,7 @@ pub(super) async fn do_request_messages(
                     retry_policy.max_attempts
                 };
 
-                if should_retry_status(status) && attempt < max_attempts_for_status {
+                if is_retryable_status_with_body(status, &err.message) && attempt < max_attempts_for_status {
                     // 打印 sleep 原因
                     let delay = retry_after_delay.unwrap_or_else(|| retry_delay(attempt));
 

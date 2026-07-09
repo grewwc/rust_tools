@@ -78,7 +78,8 @@ pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_soft_threshold(
 /// history_max_chars 默认 120K，对应硬阈值 420K（远超模型 context window，
 /// 实际硬阈值会被模型 4xx 之前的 normalize_messages_for_request 拦截）。
 /// 但相对软阈值留出明显 gap，避免软阈值边界连续触发 LLM summary。
-/// 同样按 token 窗口字符上限收口，避免字符/token 单位错配下压不动。
+/// 按 LLM 摘要字符阈值收口——LLM 摘要只在上下文接近模型实际 context window
+/// 时触发（见 [`llm_summary_char_threshold`]），而非 60% 窗口处过早触发。
 pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_hard_threshold(
     model: &str,
     history_max_chars: usize,
@@ -87,7 +88,7 @@ pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_hard_threshold(
         .saturating_mul(7)
         .saturating_div(2)
         .max(MID_TURN_COMPRESS_HARD_FLOOR)
-        .min(token_window_char_ceiling(model))
+        .min(llm_summary_char_threshold(model))
 }
 /// LLM 摘要兜底时保留尾部窗口的 user 起始轮数。早期超过此窗口的对话被压成
 /// 一条 internal_note 摘要插入到尾部窗口前。
@@ -96,9 +97,9 @@ pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_KEEP_RECENT_T
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_LLM_SUMMARY_MAX_CHARS: usize = 4_000;
 /// Pre-request LLM 摘要阈值：在每次发送 LLM 请求前，如果无损+弱损压缩后
 /// 仍超过此阈值，触发 LLM 摘要兜底（把早期对话压成单条 internal_note）。
-/// 取 history_max_chars * 2（默认 240K），比 mid-turn hard threshold（*3.5）
-/// 更积极——这是发送请求前的最后一道防线，避免超大上下文导致模型 4xx
-/// 或质量退化（"压不动"问题）。同样按 token 窗口字符上限收口。
+/// 按 LLM 摘要字符阈值收口——LLM 摘要只在上下文接近模型实际 context window
+/// 时触发，避免在远低于窗口上限时就频繁调用 LLM 摘要（旧设计用 0.6 窗口
+/// 收口导致小窗口模型在 76K 字符处就不停触发 LLM 摘要却压不动）。
 pub(in crate::ai::driver::turn_runtime) fn pre_request_llm_summary_threshold(
     model: &str,
     history_max_chars: usize,
@@ -106,7 +107,22 @@ pub(in crate::ai::driver::turn_runtime) fn pre_request_llm_summary_threshold(
     history_max_chars
         .saturating_mul(2)
         .max(MID_TURN_COMPRESS_HARD_FLOOR)
-        .min(token_window_char_ceiling(model))
+        .min(llm_summary_char_threshold(model))
+}
+
+/// LLM 摘要字符阈值：`context_window_tokens * CHARS_PER_TOKEN`。
+///
+/// 与 [`token_window_char_ceiling`]（0.6 窗口，用于无损压缩提前裁剪）不同，
+/// 此阈值代表「history 已撑满模型实际 context window」——此时 LLM 摘要
+///（昂贵，需额外调用一次模型）才真正必要。默认 100K token 模型 → 200K 字符。
+///
+/// `CHARS_PER_TOKEN = 2` 本身已偏保守（中文约 1-2 字符/token，英文约 3-4），
+/// 不再额外乘 fraction，避免小窗口模型阈值过低导致 LLM 摘要空转。
+pub(in crate::ai::driver::turn_runtime) fn llm_summary_char_threshold(model: &str) -> usize {
+    const CHARS_PER_TOKEN: usize = 2;
+    crate::ai::models::context_window_tokens(model)
+        .saturating_mul(CHARS_PER_TOKEN)
+        .max(MID_TURN_COMPRESS_HARD_FLOOR)
 }
 
 /// 模型 token 窗口换算出的「安全字符预算」：`window * chars_per_token * fraction`。

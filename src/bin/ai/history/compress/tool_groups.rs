@@ -217,7 +217,13 @@ pub(super) fn fold_early_tool_groups(
         return (messages.to_vec(), 0);
     }
     // 最近 keep_recent_groups 个工具组逐字保留；更早的折叠。
-    let fold_before_anchor = group_anchors[group_anchors.len() - keep_recent_groups];
+    // keep_recent_groups=0 时折叠全部工具组（fold_before_anchor 取消息末尾），
+    // 避免 group_anchors[len - 0] 越界 panic。
+    let fold_before_anchor = if keep_recent_groups == 0 {
+        messages.len()
+    } else {
+        group_anchors[group_anchors.len() - keep_recent_groups]
+    };
 
     let mut out: Vec<Message> = Vec::with_capacity(messages.len());
     let mut folded_groups = 0usize;

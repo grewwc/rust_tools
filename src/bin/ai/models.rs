@@ -173,9 +173,10 @@ pub(super) fn model_quality_tier(model: &str) -> ModelQualityTier {
 fn default_context_window_tokens_for_tier(tier: ModelQualityTier) -> usize {
     match tier {
         ModelQualityTier::Flagship => 256_000,
-        ModelQualityTier::Strong => 128_000,
-        ModelQualityTier::Standard => 96_000,
-        ModelQualityTier::Basic => 64_000,
+        ModelQualityTier::Strong => 200_000,
+        ModelQualityTier::Standard => 128_000,
+        // Basic → 100K token = 200K 字符（CHARS_PER_TOKEN=2），作为 LLM 摘要默认阈值。
+        ModelQualityTier::Basic => 100_000,
     }
 }
 

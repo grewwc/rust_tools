@@ -167,6 +167,18 @@ pub(crate) fn should_retry_status(status: StatusCode) -> bool {
     status.as_u16() == 429 || status.is_server_error()
 }
 
+/// 判断 HTTP 状态码 + 响应体是否值得重试。
+/// 在 `should_retry_status` 基础上额外覆盖：400 + body 含 "upstream" ——
+/// relay/兼容层把上游瞬态失败（如上游 RPC 错误、内部异常）包成了 400，
+/// 实际是瞬态错误，重试可恢复。与 `is_retryable_stream_error` 的 "upstream"
+/// 判定保持一致。
+pub(crate) fn is_retryable_status_with_body(status: StatusCode, body: &str) -> bool {
+    if should_retry_status(status) {
+        return true;
+    }
+    status.as_u16() == 400 && body.to_ascii_lowercase().contains("upstream")
+}
+
 pub(crate) fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     err.is_timeout() || err.is_connect() || err.is_request()
 }
@@ -281,7 +293,7 @@ pub(crate) fn control_model_for_aux_tasks(app: &App) -> String {
 pub(crate) fn is_transient_error(err: &RequestError) -> bool {
     match err.kind {
         RequestErrorKind::Network => true,
-        RequestErrorKind::Status(status) => should_retry_status(status),
+        RequestErrorKind::Status(status) => is_retryable_status_with_body(status, &err.message),
     }
 }
 

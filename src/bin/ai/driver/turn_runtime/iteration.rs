@@ -23,10 +23,12 @@ use super::{
     types::{IterationExecution, ToolCallExecution},
 };
 
-/// 记录上次成功 pre-request LLM 摘要后的 messages 总字符数。
-/// 用于增长量守卫：成功摘要后上下文需增长 [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`]
-/// 以上才会再次触发。失败/no-op 不能写入该游标，否则会把后续真正需要的
-/// LLM compact 静默挡掉。
+/// 记录上次 pre-request LLM 摘要**尝试**后的 messages 总字符数。
+/// 用于增长量守卫：上次尝试后上下文需增长 [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`]
+/// 以上才会再次触发。**无论成功与否都写入该游标**——成功时记录压缩后大小，
+/// 失败/no-op（结构上无法压缩：Path A 无早期对话、Path B 折叠后仍 <
+/// MIN_EFFECTIVE、Path C 未触发）时也记录实际尝试后大小，避免 cursor 停在 0
+/// 导致 growth 始终 ≥ MIN_GROWTH、pre-request LLM summary 每轮空转重试。
 /// 进程级 static——同一 agent 进程内全局生效，与 orchestrator 的 supervisor
 /// 冷却机制互补（orchestrator 管理工具调用间的压缩，此处管理请求前的兜底）。
 static LAST_PRE_REQUEST_LLM_SUMMARY_CHARS: std::sync::atomic::AtomicUsize =
@@ -362,8 +364,6 @@ async fn request_model_response(
             .await;
         *messages = after_msgs;
         if did_summarize {
-            LAST_PRE_REQUEST_LLM_SUMMARY_CHARS
-                .store(llm_after, std::sync::atomic::Ordering::Relaxed);
             crate::ai::driver::print::print_tool_note_line(
                 "compress",
                 &format!("pre-request (llm): {} → {} chars", llm_before, llm_after),
@@ -376,6 +376,10 @@ async fn request_model_response(
                  agent may hit context limit",
             );
         }
+        // 无论成功与否都写入游标（见 static 注释）。失败时也记录，避免
+        // 结构上无法压缩时每轮空转重试；MIN_GROWTH 保证真正增长后再次尝试。
+        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS
+            .store(llm_after, std::sync::atomic::Ordering::Relaxed);
     }
 
     let mut actual_model = next_model.to_string();
@@ -735,20 +739,20 @@ mod tests {
     }
 
     #[test]
-    fn failed_pre_request_llm_summary_does_not_poison_retry_cursor() {
+    fn pre_request_llm_summary_cursor_backoff_after_attempt() {
         LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(0, Ordering::Relaxed);
         let threshold = 240_000;
         let after_chars = 240_457;
 
         assert!(should_try_pre_request_llm_summary(after_chars, threshold));
 
-        // 失败/no-op 尝试不应写入 LAST_PRE_REQUEST_LLM_SUMMARY_CHARS；否则同样
-        // 超阈值的下一次请求会被 growth < 20K 静默挡掉。
-        assert_eq!(
-            LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.load(Ordering::Relaxed),
-            0
-        );
-        assert!(should_try_pre_request_llm_summary(after_chars, threshold));
+        // 调用方在每次尝试后（无论成功与否）都写入游标。模拟失败/no-op 后
+        // 写入实际尝试后大小，确保下一次同样大小的请求被 growth 守卫挡掉，
+        // 避免结构上无法压缩时每轮空转重试。
+        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(after_chars, Ordering::Relaxed);
+        assert!(!should_try_pre_request_llm_summary(after_chars, threshold));
+        // 增长 ≥ MIN_GROWTH(20K) 后才再次触发
+        assert!(should_try_pre_request_llm_summary(after_chars + 20_000, threshold));
 
         LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(230_000, Ordering::Relaxed);
         assert!(!should_try_pre_request_llm_summary(after_chars, threshold));
