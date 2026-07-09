@@ -49,7 +49,8 @@
     "enable_thinking": true,
     "subagent_priority": 85,
     "default_reasoning_effort": "high",
-    "max_output_tokens": 393216
+    "max_output_tokens": 393216,
+    "endpoint": "https://opencode.ai/zen/go/v1/chat/completions"
   },
   {
     "key": "glm-5.2-opencode",
@@ -66,7 +67,8 @@
     "subagent_priority": 85,
     "default_reasoning_effort": "high",
     "context_window_tokens": 262144,
-    "max_output_tokens": 131072
+    "max_output_tokens": 131072,
+    "endpoint": "https://opencode.ai/zen/go/v1/chat/completions"
   },
   {
     "key": "qwen3.7-plus-alibaba",
@@ -188,26 +190,5 @@
     "default_reasoning_effort": "high",
     "subagent_priority": 50,
     "max_output_tokens": 32768
-  },
-  {
-    "key": "glm5.2-super-relay",
-    "aliases": [
-      "GLM5.2",
-      "glm5.2"
-    ],
-    "name": "enc:a7v/y1ygiptBbel79DEORluwZUMGfcpovw==",
-    "endpoint": "enc:EtxSdA8BdnO8USdZWvbOKYl55kmmMxaes7ihoVgCbCbyC7jddf6ha3TzW7PweVTLA6XN9PsCLUKA",
-    "quality_tier": "strong",
-    "provider": "compatible",
-    "api_key": "enc:RarVwtMcVt9sGgaNRQiltiSwOqAt2tei/6x6BBThdeuhNC1M3j6GFKZvEO0FxfFf7pSr1Mr6o7k=",
-    "is_vl": false,
-    "search_enabled": true,
-    "tools_default_enabled": true,
-    "enable_thinking": true,
-    "default_reasoning_effort": "high",
-    "explicit_prompt_cache": true,
-    "subagent_priority": 50,
-    "context_window_tokens": 262144,
-    "max_output_tokens": 131072
   }
 ]
