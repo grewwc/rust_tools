@@ -774,6 +774,8 @@ async fn run_turn_body(
     one_shot_mode: bool,
     should_quit: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
+    // 每轮开始清除上一轮的打断标记，确保它只反映「本轮」是否被 Ctrl+C 打断。
+    app.last_turn_interrupted = false;
     let TurnPreparation {
         mut skill_turn,
         mut messages,
@@ -876,7 +878,11 @@ async fn run_turn_body(
             if matches!(execution, IterationExecution::EmptyResponse) {
                 consecutive_empty_responses += 1;
                 if consecutive_empty_responses > 5 {
-                    let _ = writeln!(std::io::stderr(), "  ✗ 连续 {} 次空响应，停止重试", consecutive_empty_responses);
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  ✗ 连续 {} 次空响应，停止重试",
+                        consecutive_empty_responses
+                    );
                     final_assistant_text = "[模型连续返回空响应，请重试或切换模型]".to_string();
                     break 'turn Ok(None);
                 }
@@ -937,7 +943,8 @@ async fn run_turn_body(
                         let _ = writeln!(
                             std::io::stderr(),
                             "  ⚠ 零输出截断（completion=0），max_tokens {} → {} 自动降级重试",
-                            current_max, halved
+                            current_max,
+                            halved
                         );
                         app.cli.max_tokens_override = Some(halved);
                         mt_downgraded = true;
@@ -956,7 +963,9 @@ async fn run_turn_body(
                     let provider = crate::ai::models::model_provider(&next_model);
                     let request_model = crate::ai::models::request_model_name(&next_model);
                     let effort_helps = crate::ai::provider::reasoning_effort_reduces_thinking_for(
-                        provider, &request_model, &endpoint,
+                        provider,
+                        &request_model,
+                        &endpoint,
                     );
 
                     if effort_helps {
@@ -990,7 +999,8 @@ async fn run_turn_body(
                 // 预算）。继续重试通常无帮助——模型会反复产出同样长度的内容。
                 // 给一次降档重试机会后即接受部分文本作为最终回答。
                 // 但 stream_error 场景不计入 consecutive_truncations，不会触发此分支。
-                if has_visible_text && consecutive_truncations >= 16 && !stream_result.stream_error {
+                if has_visible_text && consecutive_truncations >= 16 && !stream_result.stream_error
+                {
                     let _ = writeln!(
                         std::io::stderr(),
                         "  ▲ 连续 {} 次输出被截断，保留已产出的部分文本",
@@ -1025,12 +1035,22 @@ async fn run_turn_body(
                 }
             }
             let step = match handle_iteration_execution(
-                app, &question, &mc, mcp_client, execution,
-                &mut messages, &mut turn_messages, one_shot_mode,
-                &mut persisted_turn_messages, &mut final_assistant_text,
-                &mut final_assistant_recorded, &mut force_final_response,
+                app,
+                &question,
+                &mc,
+                mcp_client,
+                execution,
+                &mut messages,
+                &mut turn_messages,
+                one_shot_mode,
+                &mut persisted_turn_messages,
+                &mut final_assistant_text,
+                &mut final_assistant_recorded,
+                &mut force_final_response,
                 &mut terminal_dedupe_candidate,
-                skill_turn.matched_skill_name().is_none(), iteration, max_iterations,
+                skill_turn.matched_skill_name().is_none(),
+                iteration,
+                max_iterations,
                 consecutive_truncations,
                 &mut turn_had_tool_error,
             ) {
@@ -1206,7 +1226,7 @@ async fn run_turn_body(
     // 污染用户的会话级设置。
     app.cli.reasoning_effort_override = saved_effort_override;
     app.cli.thinking_disabled_override = saved_thinking_disabled;
-   app.cli.max_tokens_override = saved_max_tokens_override;
+    app.cli.max_tokens_override = saved_max_tokens_override;
 
     // 老化未在本 turn 使用的 explicit-enabled tool。
     // 连续 N 个 turn 闲置就 demote，避免"启用一次永久焊接"。

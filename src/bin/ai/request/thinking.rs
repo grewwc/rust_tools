@@ -14,15 +14,13 @@ use crate::ai::config_schema::AiConfig;
 use crate::ai::history::Message;
 use crate::ai::models;
 use crate::ai::types::App;
-use rust_tools::commonw;
 use crate::commonw::configw;
+use rust_tools::commonw;
 
-use super::{
-    build_request_body,
-};
+use super::build_request_body;
 use super::error::{
-    api_key_for_request_model, apply_request_auth, config_bool_is_true,
-    control_model_for_aux_tasks, endpoint_for_request_model, DEFAULT_AUTO_THINKING_THRESHOLD,
+    DEFAULT_AUTO_THINKING_THRESHOLD, api_key_for_request_model, apply_request_auth,
+    config_bool_is_true, control_model_for_aux_tasks, endpoint_for_request_model,
 };
 use super::routing::{extract_router_content, strip_json_fence};
 
@@ -34,8 +32,8 @@ fn report_resolve_thinking_debug(
     msg: &'static str,
     data: Value,
 ) {
-    static DEBUG_TARGET: std::sync::LazyLock<Option<(String, String)>> = std::sync::LazyLock::new(
-        || {
+    static DEBUG_TARGET: std::sync::LazyLock<Option<(String, String)>> =
+        std::sync::LazyLock::new(|| {
             let env_text = std::fs::read_to_string(".dbg/resolve-thinking-slow.env").ok()?;
             let mut debug_server_url = "http://127.0.0.1:7777/event".to_string();
             let mut debug_session_id = "resolve-thinking-slow".to_string();
@@ -51,8 +49,7 @@ fn report_resolve_thinking_debug(
                 }
             }
             Some((debug_server_url, debug_session_id))
-        },
-    );
+        });
 
     let Some((debug_server_url, debug_session_id)) = DEBUG_TARGET.as_ref().cloned() else {
         return;
@@ -344,8 +341,8 @@ async fn decide_thinking_via_model(app: &App, _model: &str, messages: &[Message]
         None,
         None,
         None,
-       None,
-       None,
+        None,
+        None,
     );
 
     let endpoint = endpoint_for_request_model(app, &control_model);

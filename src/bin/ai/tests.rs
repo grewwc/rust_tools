@@ -93,6 +93,7 @@ fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::
         last_known_prompt_tokens: None,
         goal_mode: None,
         last_turn_had_tool_calls: false,
+        last_turn_interrupted: false,
     }
 }
 
@@ -177,6 +178,7 @@ fn resolve_model_is_unicode_safe() {
         last_known_prompt_tokens: None,
         goal_mode: None,
         last_turn_had_tool_calls: false,
+        last_turn_interrupted: false,
     };
 
     let mut question = "a 什么是rust的一个crate？".to_string();
@@ -1514,10 +1516,8 @@ fn session_delete_cleans_up_overflow_history_file() {
 #[test]
 fn session_delete_cleans_up_temp_registry() {
     let session_id = format!("test-{}", uuid::Uuid::new_v4());
-    let history_file = std::env::temp_dir().join(format!(
-        "ai-temp-cleanup-{}.sqlite",
-        uuid::Uuid::new_v4()
-    ));
+    let history_file =
+        std::env::temp_dir().join(format!("ai-temp-cleanup-{}.sqlite", uuid::Uuid::new_v4()));
     let store = SessionStore::new(&history_file);
     store.ensure_root_dir().unwrap();
 
@@ -1535,7 +1535,10 @@ fn session_delete_cleans_up_temp_registry() {
 
     store.delete_session(&session_id).unwrap();
 
-    assert!(!assets.exists(), "assets dir (including tmp/) should be deleted");
+    assert!(
+        !assets.exists(),
+        "assets dir (including tmp/) should be deleted"
+    );
     assert!(!db.exists(), "sqlite file should be deleted");
 
     let _ = std::fs::remove_dir_all(store.session_assets_dir("__cleanup__"));

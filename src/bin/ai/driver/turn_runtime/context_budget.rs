@@ -532,6 +532,7 @@ mod tests {
             last_known_prompt_tokens: None,
             goal_mode: None,
             last_turn_had_tool_calls: false,
+            last_turn_interrupted: false,
         }
     }
 

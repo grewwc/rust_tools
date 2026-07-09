@@ -177,7 +177,7 @@ impl Goal {
              Use empty array for depends_on_indices if no dependencies. \
              depends_on_indices uses 0-based index of previously listed sub-goals.",
             self.description,
-           super::verification::safe_truncate(&self.context, 1000),
+            super::verification::safe_truncate(&self.context, 1000),
             self.strategy.as_deref().unwrap_or("none"),
             self.max_depth
         )

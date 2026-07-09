@@ -20,9 +20,7 @@ use super::{
     overflow::{build_model_overflow_stub, summarize_large_tool_output, write_tool_overflow_file},
     preview::{build_terminal_preview, tail_chars},
 };
-use crate::ai::driver::print::{
-    format_tool_output_line, print_tool_note_line,
-};
+use crate::ai::driver::print::{format_tool_output_line, print_tool_note_line};
 use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
 /// 适合"中段按行裁剪"的非精确概览工具。
@@ -926,11 +924,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 // 打印服务端返回的 finish_reason 原始值和 usage 统计，
                 // 用于排查"reasoning token 耗尽预算导致零输出截断"等根因。
                 if let Some(ref reason) = stream_result.finish_reason_value {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "  ├─ finish_reason = {:?}",
-                        reason
-                    );
+                    let _ = writeln!(std::io::stderr(), "  ├─ finish_reason = {:?}", reason);
                 }
                 if stream_result.usage_prompt_tokens > 0
                     || stream_result.usage_completion_tokens > 0
@@ -944,17 +938,10 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                         stream_result.usage_reasoning_tokens,
                     );
                 } else {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "  ├─ usage: 服务端未返回 token 统计"
-                    );
+                    let _ = writeln!(std::io::stderr(), "  ├─ usage: 服务端未返回 token 统计");
                 }
                 let _ = writeln!(std::io::stderr(), "  └─ （诊断结束）");
-                append_truncation_retry_note(
-                    &stream_result,
-                    messages,
-                    consecutive_truncations,
-                );
+                append_truncation_retry_note(&stream_result, messages, consecutive_truncations);
                 Ok(TurnLoopStep::Continue)
             }
         }
@@ -1111,7 +1098,6 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
     use crate::ai::{
         cli::ParsedCli,
         driver::signal,
@@ -1122,6 +1108,7 @@ mod tests {
     };
     use aios_kernel::primitives::ResourceLimit;
     use rust_tools::cw::SkipMap;
+    use serde_json::Value;
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
     use std::time::{Duration, Instant};
@@ -1182,6 +1169,7 @@ mod tests {
             last_known_prompt_tokens: None,
             goal_mode: None,
             last_turn_had_tool_calls: false,
+            last_turn_interrupted: false,
         }
     }
 
@@ -1392,10 +1380,10 @@ mod tests {
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
-            finish_reason_value: None,
-            usage_prompt_tokens: 0,
-            usage_completion_tokens: 0,
-            usage_reasoning_tokens: 0,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1409,7 +1397,7 @@ mod tests {
             1,
             16,
             0,
-                &mut false,
+            &mut false,
         )
         .unwrap();
 
@@ -1448,10 +1436,10 @@ mod tests {
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
-            finish_reason_value: None,
-            usage_prompt_tokens: 0,
-            usage_completion_tokens: 0,
-            usage_reasoning_tokens: 0,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1465,7 +1453,7 @@ mod tests {
             2,
             16,
             0,
-                &mut false,
+            &mut false,
         )
         .unwrap();
 
@@ -1506,10 +1494,10 @@ mod tests {
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
-            finish_reason_value: None,
-            usage_prompt_tokens: 0,
-            usage_completion_tokens: 0,
-            usage_reasoning_tokens: 0,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1523,7 +1511,7 @@ mod tests {
             1,
             16,
             1,
-                &mut false,
+            &mut false,
         )
         .unwrap();
 
@@ -1532,8 +1520,10 @@ mod tests {
         assert!(final_assistant_text.is_empty());
         assert!(!final_assistant_recorded);
         // 部分可见文本被保留为 assistant 上下文。
-        assert!(messages.iter().any(|m| m.role == "assistant"
-            && m.content.as_str() == Some("现在让我来编写一个综合脚本")));
+        assert!(
+            messages.iter().any(|m| m.role == "assistant"
+                && m.content.as_str() == Some("现在让我来编写一个综合脚本"))
+        );
         // partial text 不得写入 turn_messages 持久化轨道——连续截断时多条
         // 大体积半截文本会污染历史文件，导致下个 turn 正常历史被压缩丢弃。
         assert!(
@@ -1542,10 +1532,12 @@ mod tests {
             "partial text must not leak into turn_messages (persistence track)"
         );
         // 注入了一条收缩重写提示。
-        assert!(messages.iter().any(|m| m.role == ROLE_INTERNAL_NOTE
-            && m.content
-                .as_str()
-                .is_some_and(|c| c.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))));
+        assert!(messages.iter().any(|m| {
+            m.role == ROLE_INTERNAL_NOTE
+                && m.content
+                    .as_str()
+                    .is_some_and(|c| c.starts_with(TRUNCATION_RETRY_NOTE_PREFIX))
+        }));
     }
 
     #[test]
@@ -1574,12 +1566,12 @@ mod tests {
                     hidden_meta: String::new(),
                     reasoning_text: String::new(),
                     skip_response_drain: true,
-                truncated_by_length: false,
-                stream_error: false,
-                finish_reason_value: None,
-                usage_prompt_tokens: 0,
-                usage_completion_tokens: 0,
-                usage_reasoning_tokens: 0,
+                    truncated_by_length: false,
+                    stream_error: false,
+                    finish_reason_value: None,
+                    usage_prompt_tokens: 0,
+                    usage_completion_tokens: 0,
+                    usage_reasoning_tokens: 0,
                 }),
                 &mut messages,
                 &mut turn_messages,
@@ -1656,10 +1648,10 @@ mod tests {
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: true,
-            finish_reason_value: None,
-            usage_prompt_tokens: 0,
-            usage_completion_tokens: 0,
-            usage_reasoning_tokens: 0,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1745,12 +1737,12 @@ mod tests {
                     hidden_meta: String::new(),
                     reasoning_text: String::new(),
                     skip_response_drain: true,
-                truncated_by_length: false,
-                stream_error: false,
-                finish_reason_value: None,
-                usage_prompt_tokens: 0,
-                usage_completion_tokens: 0,
-                usage_reasoning_tokens: 0,
+                    truncated_by_length: false,
+                    stream_error: false,
+                    finish_reason_value: None,
+                    usage_prompt_tokens: 0,
+                    usage_completion_tokens: 0,
+                    usage_reasoning_tokens: 0,
                 },
                 allowed_tool_names: Default::default(),
             }),
@@ -1766,7 +1758,7 @@ mod tests {
             3,
             16,
             0,
-                &mut false,
+            &mut false,
         )
         .unwrap();
 
@@ -1870,12 +1862,12 @@ mod tests {
                         hidden_meta: String::new(),
                         reasoning_text: String::new(),
                         skip_response_drain: true,
-                truncated_by_length: false,
-                stream_error: false,
-                finish_reason_value: None,
-                usage_prompt_tokens: 0,
-                usage_completion_tokens: 0,
-                usage_reasoning_tokens: 0,
+                        truncated_by_length: false,
+                        stream_error: false,
+                        finish_reason_value: None,
+                        usage_prompt_tokens: 0,
+                        usage_completion_tokens: 0,
+                        usage_reasoning_tokens: 0,
                     },
                     allowed_tool_names: ["execute_command".to_string()].into_iter().collect(),
                 },

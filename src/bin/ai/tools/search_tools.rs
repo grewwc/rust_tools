@@ -256,7 +256,14 @@ pub(crate) fn execute_find_path(args: &Value) -> Result<String, String> {
                 .unwrap_or("")
                 .to_string();
             crate::ai::ff_embed::output::begin_capture();
-            let _ = crate::ai::ff_embed::output::print_match(&abs, &wd, &match_base, true, false, false);
+            let _ = crate::ai::ff_embed::output::print_match(
+                &abs,
+                &wd,
+                &match_base,
+                true,
+                false,
+                false,
+            );
             let results = crate::ai::ff_embed::output::finish_capture();
             return Ok(truncate_chars(results.join("\n").trim(), 16_000));
         }

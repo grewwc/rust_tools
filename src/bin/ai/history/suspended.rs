@@ -472,7 +472,13 @@ mod tests {
         let store = SuspendedSessionStore::for_tests_with_root(root.clone());
         let history = root.join("history.sqlite");
         let entry = store
-            .save_for_terminal_key("tty:/dev/ttys001", "sess-1", &history, "default", "test-model")
+            .save_for_terminal_key(
+                "tty:/dev/ttys001",
+                "sess-1",
+                &history,
+                "default",
+                "test-model",
+            )
             .unwrap();
         assert_eq!(entry.session_id, "sess-1");
 
@@ -546,22 +552,10 @@ mod tests {
         let history = root.join("history.sqlite");
         let other = root.join("other.sqlite");
         store
-            .save_for_terminal_key(
-                "tty:/dev/ttys003",
-                "sess-1",
-                &history,
-                "default",
-                "model-a",
-            )
+            .save_for_terminal_key("tty:/dev/ttys003", "sess-1", &history, "default", "model-a")
             .unwrap();
         store
-            .save_for_terminal_key(
-                "tty:/dev/ttys003",
-                "sess-2",
-                &other,
-                "reviewer",
-                "model-b",
-            )
+            .save_for_terminal_key("tty:/dev/ttys003", "sess-2", &other, "reviewer", "model-b")
             .unwrap();
 
         let cleared = store.clear_for_terminal_key("tty:/dev/ttys003").unwrap();
@@ -586,10 +580,22 @@ mod tests {
         let history_a = root.join("a.sqlite");
         let history_b = root.join("b.sqlite");
         store
-            .save_for_terminal_key("tty:/dev/ttys010", "sess-a", &history_a, "default", "model-a")
+            .save_for_terminal_key(
+                "tty:/dev/ttys010",
+                "sess-a",
+                &history_a,
+                "default",
+                "model-a",
+            )
             .unwrap();
         store
-            .save_for_terminal_key("tty:/dev/ttys011", "sess-b", &history_b, "reviewer", "model-b")
+            .save_for_terminal_key(
+                "tty:/dev/ttys011",
+                "sess-b",
+                &history_b,
+                "reviewer",
+                "model-b",
+            )
             .unwrap();
 
         let all = store.list_all().unwrap();

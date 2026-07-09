@@ -29,7 +29,10 @@ pub(crate) fn register(session_id: &str, pgid: u32) {
         return;
     }
     let mut guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-    guard.entry(session_id.to_string()).or_default().insert(pgid);
+    guard
+        .entry(session_id.to_string())
+        .or_default()
+        .insert(pgid);
 }
 
 /// 清理指定会话登记的所有后台进程组：先 `SIGTERM` 给存活组一次优雅退出的机会，

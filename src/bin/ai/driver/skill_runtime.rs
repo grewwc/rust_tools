@@ -1045,12 +1045,7 @@ fn build_system_prompt(
                 "Use `delete_path` to clean up temp files when done. It only deletes files created via `write_file(temp=true)` — source code, configs, and other project files are always refused.".to_string(),
             );
         }
-        push_tool_guidance_section(
-            &mut b,
-            ContextKind::Behavior,
-            "Temporary files:",
-            lines,
-        );
+        push_tool_guidance_section(&mut b, ContextKind::Behavior, "Temporary files:", lines);
     }
 
     b
@@ -1123,8 +1118,8 @@ pub(super) fn rebuild_skill_turn_with_existing_selection(
 ) -> SkillTurnGuard {
     // 不再做 TF-IDF 重路由：iteration > 1 时仅按名字保持上一轮的 skill。
     // 模型如需切换可通过 activate_skill 显式请求。
-    let skill = preferred_skill_name
-        .and_then(|name| skill_manifests.iter().find(|s| s.name == name));
+    let skill =
+        preferred_skill_name.and_then(|name| skill_manifests.iter().find(|s| s.name == name));
     build_skill_turn_guard(app, mcp_client, skill)
 }
 
@@ -1209,13 +1204,11 @@ pub(super) fn prepare_skill_for_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextKind, SystemPromptBuilder, available_tool_names,
-        build_hidden_mcp_tool_catalog, build_project_instruction_prompt, build_system_prompt,
-        builtin_tools_for_skill, ensure_required_baseline_tools,
-        filter_mcp_tools_by_allowed_servers, has_tool,
+        ContextKind, SystemPromptBuilder, available_tool_names, build_hidden_mcp_tool_catalog,
+        build_project_instruction_prompt, build_system_prompt, builtin_tools_for_skill,
+        ensure_required_baseline_tools, filter_mcp_tools_by_allowed_servers, has_tool,
         merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
-        select_mcp_tools,
-        tool_uses_mcp_server,
+        select_mcp_tools, tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::runtime_ctx::SUBAGENT_CWD;

@@ -76,8 +76,7 @@ pub(crate) fn execute_delete_path(args: &Value) -> Result<String, String> {
 
     // 删除普通文件 / 符号链接：先做 undo 快照，再删除。
     super::super::undo_tools::snapshot_file_before_write(&registered_path);
-    std::fs::remove_file(&resolved)
-        .map_err(|e| format!("Failed to remove file: {e}"))?;
+    std::fs::remove_file(&resolved).map_err(|e| format!("Failed to remove file: {e}"))?;
     super::super::undo_tools::commit_change_set(&format!("delete_path: {abs_path_str}"));
     temp_registry::unregister(&registered_path)?;
 
@@ -92,8 +91,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn make_temp_base() -> PathBuf {
-        let path = std::env::temp_dir()
-            .join(format!("ai_delete_test_{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("ai_delete_test_{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&path).unwrap();
         path
     }

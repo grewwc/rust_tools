@@ -29,7 +29,15 @@ pub(super) async fn maybe_append_self_reflection(
     turn_messages: &mut Vec<Message>,
     had_tool_error: bool,
 ) {
-    background::maybe_append_self_reflection(app, model, question, answer, turn_messages, had_tool_error).await
+    background::maybe_append_self_reflection(
+        app,
+        model,
+        question,
+        answer,
+        turn_messages,
+        had_tool_error,
+    )
+    .await
 }
 
 pub(super) async fn maybe_critic_and_revise(

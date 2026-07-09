@@ -61,7 +61,8 @@ pub(crate) fn register(abs_path: &str) -> Result<(), String> {
     let _guard = REGISTRY_LOCK
         .lock()
         .map_err(|e| format!("Failed to lock temp registry: {e}"))?;
-    let (_, registry_path) = registry_paths().map_err(|e| format!("Failed to get temp dir: {e}"))?;
+    let (_, registry_path) =
+        registry_paths().map_err(|e| format!("Failed to get temp dir: {e}"))?;
     let mut paths = load_paths(&registry_path)?;
     paths.insert(abs_path.to_string());
     save_paths(&registry_path, &paths)
@@ -86,7 +87,8 @@ pub(crate) fn unregister(abs_path: &str) -> Result<(), String> {
     let _guard = REGISTRY_LOCK
         .lock()
         .map_err(|e| format!("Failed to lock temp registry: {e}"))?;
-    let (_, registry_path) = registry_paths().map_err(|e| format!("Failed to get temp dir: {e}"))?;
+    let (_, registry_path) =
+        registry_paths().map_err(|e| format!("Failed to get temp dir: {e}"))?;
     let mut paths = load_paths(&registry_path)?;
     paths.remove(abs_path);
     save_paths(&registry_path, &paths)
@@ -118,10 +120,7 @@ mod tests {
     #[test]
     fn register_and_check() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::temp_dir().join(format!(
-            "temp_reg_test_{}",
-            uuid::Uuid::new_v4()
-        ));
+        let base = std::env::temp_dir().join(format!("temp_reg_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
 
         crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
@@ -148,8 +147,7 @@ mod tests {
         // 独占一个注册表文件，避免与其他并发测试 / 历史遗留条目共用
         // `~/.agent_tmp/default/temp_registry.json` 造成计数污染。
         let session_id = format!("temp_reg_persist_{}", uuid::Uuid::new_v4());
-        crate::ai::driver::runtime_ctx::TURN_IDENTITY
-            .sync_scope((session_id, 0usize), || {
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY.sync_scope((session_id, 0usize), || {
             register("/tmp/a.txt").unwrap();
             register("/tmp/b.txt").unwrap();
             // 重新加载后仍在
@@ -157,6 +155,6 @@ mod tests {
             assert!(is_registered("/tmp/b.txt"));
             let all = list_registered();
             assert_eq!(all.len(), 2);
-            });
+        });
     }
 }

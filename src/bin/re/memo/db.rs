@@ -424,11 +424,9 @@ fn upsert_tags_and_record_tags(
 
 fn upsert_tag(tx: &rusqlite::Transaction<'_>, name: &str, now: i64) -> rusqlite::Result<()> {
     let existing: Option<String> = tx
-        .query_row(
-            "SELECT id FROM tags WHERE name=?1",
-            params![name],
-            |row| Ok(row.get(0)?),
-        )
+        .query_row("SELECT id FROM tags WHERE name=?1", params![name], |row| {
+            Ok(row.get(0)?)
+        })
         .optional()?;
     if let Some(id) = existing {
         tx.execute(

@@ -91,7 +91,11 @@ pub fn complete_tags_feature(db: &MemoBackend, prefix: &str) {
     let prefix = prefix.trim();
     let tags = db
         .list_tags(
-            if prefix.is_empty() { None } else { Some(prefix) },
+            if prefix.is_empty() {
+                None
+            } else {
+                Some(prefix)
+            },
             None,
             i64::MAX,
         )

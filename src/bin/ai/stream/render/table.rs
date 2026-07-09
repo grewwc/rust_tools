@@ -248,10 +248,7 @@ fn split_table_segments(s: &str) -> Vec<String> {
     /// 向前查找未转义的目标字符。用于判断分隔符是否有配对，
     /// 避免未闭合的 `、$ 把 in_code/in_math 卡死在 true，
     /// 导致后续 | 无法被识别为列分隔符。
-    fn has_matching_delim(
-        chars: &std::iter::Peekable<std::str::Chars>,
-        target: char,
-    ) -> bool {
+    fn has_matching_delim(chars: &std::iter::Peekable<std::str::Chars>, target: char) -> bool {
         let mut la = chars.clone();
         let mut esc = false;
         while let Some(c) = la.next() {
@@ -744,19 +741,13 @@ mod tests {
             vec!["foo $bar", "baz"]
         );
         // 三个 $（奇数）也应正确处理
-        assert_eq!(
-            parse_table_row("| a $$$ b | c |"),
-            vec!["a $$$ b", "c"]
-        );
+        assert_eq!(parse_table_row("| a $$$ b | c |"), vec!["a $$$ b", "c"]);
     }
 
     #[test]
     fn parse_table_row_dollar_inside_code_is_literal() {
         // $ 在反引号代码段内不触发数学模式
-        assert_eq!(
-            parse_table_row("| `a$b` | c |"),
-            vec!["`a$b`", "c"]
-        );
+        assert_eq!(parse_table_row("| `a$b` | c |"), vec!["`a$b`", "c"]);
     }
 
     #[test]
@@ -785,38 +776,23 @@ mod tests {
     #[test]
     fn parse_table_row_handles_unpaired_strikethrough() {
         // 未配对的 ~~ 应按字面量处理，不应把 in_strike 卡死
-        assert_eq!(
-            parse_table_row("| ~~a | b |"),
-            vec!["~~a", "b"]
-        );
+        assert_eq!(parse_table_row("| ~~a | b |"), vec!["~~a", "b"]);
         // 三个 ~~ 序列（奇数）也应正确处理
-        assert_eq!(
-            parse_table_row("| ~~a~~b~~ | c |"),
-            vec!["~~a~~b~~", "c"]
-        );
+        assert_eq!(parse_table_row("| ~~a~~b~~ | c |"), vec!["~~a~~b~~", "c"]);
     }
 
     #[test]
     fn parse_table_row_escaped_delimiters() {
         // 转义的反引号不应触发代码段
-        assert_eq!(
-            parse_table_row(r#"| \`a\` | b |"#),
-            vec![r#"\`a\`"#, "b"]
-        );
+        assert_eq!(parse_table_row(r#"| \`a\` | b |"#), vec![r#"\`a\`"#, "b"]);
         // 转义的 $ 不应触发数学段
-        assert_eq!(
-            parse_table_row(r#"| \$a\$ | b |"#),
-            vec![r#"\$a\$"#, "b"]
-        );
+        assert_eq!(parse_table_row(r#"| \$a\$ | b |"#), vec![r#"\$a\$"#, "b"]);
     }
 
     #[test]
     fn parse_table_row_pipe_inside_math_is_literal() {
         // $ 段内的 | 应被当作字面量
-        assert_eq!(
-            parse_table_row("| $a|b$ | c |"),
-            vec!["$a|b$", "c"]
-        );
+        assert_eq!(parse_table_row("| $a|b$ | c |"), vec!["$a|b$", "c"]);
     }
 
     #[test]

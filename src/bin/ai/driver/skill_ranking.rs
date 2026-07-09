@@ -465,7 +465,10 @@ mod tests {
                 "md-to-feishu-doc",
                 "当用户需要将本地的 Markdown 文件内容导入到飞书文档（Feishu Docx）时使用。用户可能说\"把 markdown 写到飞书\"、\"导入到飞书文档\"、\"上传到飞书\"、\"用 mcp 写到飞书 doc\"等。",
             ),
-            skill("debugger", "Debug source code issues including compile errors, runtime bugs, test failures, panics, crashes, and exceptions. Locate root cause, apply minimal fix, and verify the solution."),
+            skill(
+                "debugger",
+                "Debug source code issues including compile errors, runtime bugs, test failures, panics, crashes, and exceptions. Locate root cause, apply minimal fix, and verify the solution.",
+            ),
         ];
         let query = "修复一个 markdown 的问题";
         let ranked = rank_skills_locally_with_model_path(
@@ -476,8 +479,13 @@ mod tests {
         let top = ranked.first().expect("expected ranked result");
         eprintln!(
             "[md-fix-case] top={} score={:.3} blend={:.3} embed={:.3} fallback={:.3} prior={:.3} none={:.3}",
-            top.skill.name, top.score, top.blended_score, top.embedding_score,
-            top.fallback_semantic_score, top.model_prior_score, top.none_score
+            top.skill.name,
+            top.score,
+            top.blended_score,
+            top.embedding_score,
+            top.fallback_semantic_score,
+            top.model_prior_score,
+            top.none_score
         );
         assert_ne!(
             top.skill.name, "md-to-feishu-doc",

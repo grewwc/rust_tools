@@ -4,7 +4,9 @@ use serde_json::Value;
 
 use crate::ai::{history::SessionStore, types::App};
 
-use super::super::{TOOL_OVERFLOW_HEAD_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS, types::LargeToolSummary};
+use super::super::{
+    TOOL_OVERFLOW_HEAD_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS, types::LargeToolSummary,
+};
 use super::preview::{tail_chars, truncate_chars};
 
 pub(super) fn summarize_large_tool_output(content: &str) -> LargeToolSummary {

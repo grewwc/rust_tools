@@ -25,28 +25,24 @@ fn main() {
     let value = &args[2];
 
     match command.as_str() {
-        "encrypt" | "enc" | "e" => {
-            match secret::encrypt(value) {
-                Ok(encrypted) => {
-                    println!("{}", encrypted);
-                }
-                Err(e) => {
-                    eprintln!("加密失败: {}", e);
-                    process::exit(1);
-                }
+        "encrypt" | "enc" | "e" => match secret::encrypt(value) {
+            Ok(encrypted) => {
+                println!("{}", encrypted);
             }
-        }
-        "decrypt" | "dec" | "d" => {
-            match secret::decrypt(value) {
-                Ok(plaintext) => {
-                    println!("{}", plaintext);
-                }
-                Err(e) => {
-                    eprintln!("解密失败: {}", e);
-                    process::exit(1);
-                }
+            Err(e) => {
+                eprintln!("加密失败: {}", e);
+                process::exit(1);
             }
-        }
+        },
+        "decrypt" | "dec" | "d" => match secret::decrypt(value) {
+            Ok(plaintext) => {
+                println!("{}", plaintext);
+            }
+            Err(e) => {
+                eprintln!("解密失败: {}", e);
+                process::exit(1);
+            }
+        },
         _ => {
             eprintln!("未知命令: {}", command);
             print_usage();

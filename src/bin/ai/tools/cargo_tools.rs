@@ -120,14 +120,20 @@ fn execute_cargo_command(subcommand: &str, args: &Value) -> Result<String, Strin
     let stdout_handle = std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut s) = stdout {
-            let _ = s.by_ref().take((MAX_CARGO_OUTPUT_BYTES + 1) as u64).read_to_end(&mut buf);
+            let _ = s
+                .by_ref()
+                .take((MAX_CARGO_OUTPUT_BYTES + 1) as u64)
+                .read_to_end(&mut buf);
         }
         buf
     });
     let stderr_handle = std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(mut s) = stderr {
-            let _ = s.by_ref().take((MAX_CARGO_OUTPUT_BYTES + 1) as u64).read_to_end(&mut buf);
+            let _ = s
+                .by_ref()
+                .take((MAX_CARGO_OUTPUT_BYTES + 1) as u64)
+                .read_to_end(&mut buf);
         }
         buf
     });
@@ -155,10 +161,30 @@ fn execute_cargo_command(subcommand: &str, args: &Value) -> Result<String, Strin
     let stderr_raw = stderr_handle.join().unwrap_or_default();
     let stdout_truncated = stdout_raw.len() > MAX_CARGO_OUTPUT_BYTES;
     let stderr_truncated = stderr_raw.len() > MAX_CARGO_OUTPUT_BYTES;
-    let stdout = String::from_utf8_lossy(&stdout_raw[..stdout_raw.len().min(MAX_CARGO_OUTPUT_BYTES)]).to_string();
-    let stderr = String::from_utf8_lossy(&stderr_raw[..stderr_raw.len().min(MAX_CARGO_OUTPUT_BYTES)]).to_string();
-    let stdout = if stdout_truncated { format!("{}\n... (output truncated, {} bytes total)", stdout.trim(), stdout_raw.len()) } else { stdout };
-    let stderr = if stderr_truncated { format!("{}\n... (output truncated, {} bytes total)", stderr.trim(), stderr_raw.len()) } else { stderr };
+    let stdout =
+        String::from_utf8_lossy(&stdout_raw[..stdout_raw.len().min(MAX_CARGO_OUTPUT_BYTES)])
+            .to_string();
+    let stderr =
+        String::from_utf8_lossy(&stderr_raw[..stderr_raw.len().min(MAX_CARGO_OUTPUT_BYTES)])
+            .to_string();
+    let stdout = if stdout_truncated {
+        format!(
+            "{}\n... (output truncated, {} bytes total)",
+            stdout.trim(),
+            stdout_raw.len()
+        )
+    } else {
+        stdout
+    };
+    let stderr = if stderr_truncated {
+        format!(
+            "{}\n... (output truncated, {} bytes total)",
+            stderr.trim(),
+            stderr_raw.len()
+        )
+    } else {
+        stderr
+    };
 
     // 构造模拟 Output 对象
     let output = std::process::Output {

@@ -32,13 +32,8 @@ pub(super) struct JsonRpcError {
 #[derive(Debug, PartialEq)]
 pub(super) enum InboundJsonRpc {
     Response(JsonRpcResponse),
-    Notification {
-        method: String,
-    },
-    Request {
-        id: Value,
-        method: String,
-    },
+    Notification { method: String },
+    Request { id: Value, method: String },
 }
 
 pub(super) fn classify_inbound_jsonrpc(line: &str) -> Result<InboundJsonRpc, String> {
@@ -82,9 +77,7 @@ pub(super) fn unsupported_server_request_payload(id: Value, method: &str) -> Val
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        InboundJsonRpc, classify_inbound_jsonrpc, unsupported_server_request_payload,
-    };
+    use super::{InboundJsonRpc, classify_inbound_jsonrpc, unsupported_server_request_payload};
     use serde_json::json;
 
     #[test]
@@ -135,10 +128,8 @@ mod tests {
         // 部分 MCP 服务器（如 mcp_ocr）会对 notifications/initialized 通知
         // 发送冗余确认响应 {"jsonrpc":"2.0","id":null,"result":{}}。
         // 该响应应被分类为 Response 且 id 为 None，以便 send_request_to_conn 跳过。
-        let inbound = classify_inbound_jsonrpc(
-            r#"{"jsonrpc":"2.0","id":null,"result":{}}"#,
-        )
-        .unwrap();
+        let inbound =
+            classify_inbound_jsonrpc(r#"{"jsonrpc":"2.0","id":null,"result":{}}"#).unwrap();
         match inbound {
             InboundJsonRpc::Response(resp) => {
                 assert!(resp.id.is_none(), "id should be None for null id");

@@ -474,7 +474,12 @@ fn maybe_promote_stable_self_note(
     let _ = store.append(&promoted);
 }
 
-fn apply_evolution_feedback(store: &MemoryStore, answer: &str, _had_tool: bool, had_tool_error: bool) {
+fn apply_evolution_feedback(
+    store: &MemoryStore,
+    answer: &str,
+    _had_tool: bool,
+    had_tool_error: bool,
+) {
     let signal = evaluate_turn_feedback(answer, had_tool_error);
 
     let guidelines = reflection_evolution_guidelines(store);
@@ -1327,7 +1332,10 @@ mod tests {
     #[test]
     fn evaluate_turn_feedback_fails_on_empty_answer() {
         assert_eq!(evaluate_turn_feedback("", false), EvolutionFeedback::Fail);
-        assert_eq!(evaluate_turn_feedback("   ", false), EvolutionFeedback::Fail);
+        assert_eq!(
+            evaluate_turn_feedback("   ", false),
+            EvolutionFeedback::Fail
+        );
     }
 
     #[test]

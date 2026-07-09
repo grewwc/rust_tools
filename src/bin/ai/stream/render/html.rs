@@ -4,7 +4,10 @@
 //! 复用 `table.rs` 中已有的渲染函数（`render_table_top/header/mid/row/bottom`）
 //! 在终端中绘制对齐的表格。支持 `rowspan` / `colspan` 合并单元格。
 
-use super::table::{TableAlign, compute_table_widths, render_table_bottom, render_table_header, render_table_mid, render_table_row, render_table_top};
+use super::table::{
+    TableAlign, compute_table_widths, render_table_bottom, render_table_header, render_table_mid,
+    render_table_row, render_table_top,
+};
 
 /// 解析后的 HTML 表格。
 pub(super) struct HtmlTable {
@@ -51,7 +54,10 @@ pub(super) fn parse_html_table(html: &str) -> Option<HtmlTable> {
         .iter()
         .all(|c| c.is_header || c.text.trim().is_empty());
     let (header, data_rows) = if first_row_all_header && rows[0].iter().any(|c| c.is_header) {
-        let header = grid[0].iter().map(|c| c.clone().unwrap_or_default()).collect();
+        let header = grid[0]
+            .iter()
+            .map(|c| c.clone().unwrap_or_default())
+            .collect();
         let rows: Vec<Vec<String>> = grid[1..]
             .iter()
             .map(|r| r.iter().map(|c| c.clone().unwrap_or_default()).collect())
@@ -69,7 +75,10 @@ pub(super) fn parse_html_table(html: &str) -> Option<HtmlTable> {
         return None;
     }
 
-    Some(HtmlTable { header, rows: data_rows })
+    Some(HtmlTable {
+        header,
+        rows: data_rows,
+    })
 }
 
 /// 渲染 HTML 表格为终端文本（复用 table.rs 的渲染函数）。
@@ -274,10 +283,7 @@ fn strip_html_tags(html: &str) -> String {
     }
 
     // 合并连续空白，去除首尾空白
-    result
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    result.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// 解码常见 HTML 实体。
@@ -426,10 +432,7 @@ mod tests {
 </table>"#;
         let table = parse_html_table(html).unwrap();
         assert_eq!(table.header, vec!["Name", "Info", "Info"]);
-        assert_eq!(
-            table.rows,
-            vec![vec!["Alice", "30", "Engineer"]]
-        );
+        assert_eq!(table.rows, vec![vec!["Alice", "30", "Engineer"]]);
     }
 
     #[test]

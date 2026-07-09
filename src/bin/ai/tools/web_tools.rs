@@ -387,7 +387,6 @@ fn remaining_search_timeout(deadline: std::time::Instant) -> Option<Duration> {
     Some(remaining.min(HTTP_SEARCH_TIMEOUT))
 }
 
-
 /// 验证 URL 是否安全（防止 SSRF 攻击）。
 /// 检查 scheme、hostname、以及 DNS 解析后的 IP 地址。
 fn validate_ssrf_url(url: &str) -> Result<(), String> {
@@ -423,7 +422,9 @@ fn validate_ssrf_url(url: &str) -> Result<(), String> {
                     }
                 }
                 if !found_any {
-                    return Err("Blocked url host (DNS resolution returned no addresses)".to_string());
+                    return Err(
+                        "Blocked url host (DNS resolution returned no addresses)".to_string()
+                    );
                 }
             }
             Err(_) => {
@@ -465,12 +466,12 @@ pub(crate) fn execute_web_fetch(args: &Value) -> Result<String, String> {
         .timeout(HTTP_TOOL_TIMEOUT)
         .connect_timeout(Duration::from_secs(5))
         .user_agent(USER_AGENTS[0])
-        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
-            match validate_ssrf_url(attempt.url().as_str()) {
+        .redirect(reqwest::redirect::Policy::custom(
+            move |attempt| match validate_ssrf_url(attempt.url().as_str()) {
                 Ok(()) => attempt.follow(),
                 Err(_) => attempt.stop(),
-            }
-        }))
+            },
+        ))
         .build()
         .map_err(|e| format!("Failed to build http client: {}", e))?;
 

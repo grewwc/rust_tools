@@ -67,7 +67,10 @@ pub(in crate::ai) fn send_request_to_conn(
         let response_line = conn.read_response_line_with_timeout(remaining_ms)?;
         match classify_inbound_jsonrpc(&response_line)? {
             InboundJsonRpc::Notification { .. } => continue,
-            InboundJsonRpc::Request { id: request_id, method } => {
+            InboundJsonRpc::Request {
+                id: request_id,
+                method,
+            } => {
                 reject_server_request(conn, request_id, &method)?;
                 continue;
             }
@@ -423,13 +426,18 @@ impl McpClient {
             let response_line = conn.read_response_line_with_timeout(remaining_ms)?;
             match classify_inbound_jsonrpc(&response_line)? {
                 InboundJsonRpc::Notification { .. } => continue,
-                InboundJsonRpc::Request { id: request_id, method } => {
+                InboundJsonRpc::Request {
+                    id: request_id,
+                    method,
+                } => {
                     reject_server_request(conn, request_id, &method)?;
                     continue;
                 }
                 InboundJsonRpc::Response(resp) => {
                     // 跳过无 id 的响应（id 为 null 或缺失）
-                    let Some(resp_id) = resp.id else { continue; };
+                    let Some(resp_id) = resp.id else {
+                        continue;
+                    };
                     if resp_id != id {
                         return Err(format!(
                             "MCP response id mismatch: expected {}, got {}",

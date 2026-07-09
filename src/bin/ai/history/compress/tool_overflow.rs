@@ -16,12 +16,12 @@ use crate::ai::{request, types::App};
 use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start};
 use super::text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 use super::{
-    automatic_summary_body, dedup_adjacent, keep_recent_user_turns_when_trimming, message_contains_image,
-    normalize_whitespace, tool_message_indices,
-    redact_images_except_last, strip_nested_prior_summary_prefixes, value_to_string,
     IMAGE_OVERFLOW_SPILL_MIN_CHARS, KEEP_RECENT_TOOL_MESSAGES, PRESERVED_CONTENT_STUB_PREFIX,
     PRESERVED_IMAGE_OVERFLOW_DIR, PRESERVED_TOOL_OVERFLOW_DIR, PRESERVED_USER_OVERFLOW_DIR,
-    USER_OVERFLOW_SPILL_MIN_CHARS,
+    USER_OVERFLOW_SPILL_MIN_CHARS, automatic_summary_body, dedup_adjacent,
+    keep_recent_user_turns_when_trimming, message_contains_image, normalize_whitespace,
+    redact_images_except_last, strip_nested_prior_summary_prefixes, tool_message_indices,
+    value_to_string,
 };
 
 pub(super) async fn build_persisted_summary_text_with_app(
@@ -361,7 +361,10 @@ fn build_preserved_message_overflow_stub(path: &Path, kind: &str) -> String {
     format!("{PRESERVED_CONTENT_STUB_PREFIX}{payload}")
 }
 
-pub(super) fn try_spill_preserved_message_to_stub(messages: &mut [Message], overflow_dir: &Path) -> bool {
+pub(super) fn try_spill_preserved_message_to_stub(
+    messages: &mut [Message],
+    overflow_dir: &Path,
+) -> bool {
     let Some(idx) = first_preserved_content_spill_candidate(messages) else {
         return false;
     };

@@ -13,9 +13,11 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::ai::types::{App, ToolCall};
-use super::runtime::{clear_waiting_hint, finalize_thinking_fold, format_end_thinking_line, write_stream_content};
+use super::runtime::{
+    clear_waiting_hint, finalize_thinking_fold, format_end_thinking_line, write_stream_content,
+};
 use super::state::{StreamMarkers, StreamProcessingState, ToolCallBuilder};
+use crate::ai::types::{App, ToolCall};
 
 type InlineToolCallParser = fn(&str) -> Option<Vec<ToolCall>>;
 
@@ -457,13 +459,15 @@ pub(super) fn collect_valid_tool_calls(
                 let snippet = if char_count > 600 {
                     // 按字符边界截取，避免在多字节 UTF-8 字符（如中文）中间切片导致 panic。
                     let head: String = raw.chars().take(300).collect();
-                    let tail: String = raw.chars().rev().take(300).collect::<Vec<_>>().into_iter().rev().collect();
-                    format!(
-                        "{}…[截断，共 {} 字符]…{}",
-                        head,
-                        char_count,
-                        tail
-                    )
+                    let tail: String = raw
+                        .chars()
+                        .rev()
+                        .take(300)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
+                    format!("{}…[截断，共 {} 字符]…{}", head, char_count, tail)
                 } else {
                     raw.to_string()
                 };

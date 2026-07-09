@@ -366,7 +366,7 @@ impl ThoughtTree {
              Output STRICT JSON: {{\"score\":0.8,\"reason\":\"...\"}}",
             node.hypothesis,
             node.reasoning,
-           super::verification::safe_truncate(tool_results, 2000)
+            super::verification::safe_truncate(tool_results, 2000)
         )
     }
 }

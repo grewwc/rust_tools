@@ -6,13 +6,16 @@ use std::{
 };
 
 use chrono::{DateTime, Local};
-use serde_json::json;
 use rust_tools::cw::SkipMap;
+use serde_json::json;
 
 use super::{
     blob::{delete_assets_dir, delete_history_artifacts},
     markdown::messages_to_markdown,
-    sqlite::{checkpoint_wal, read_all_messages_sqlite, read_first_user_prompt_sqlite, read_session_title_sqlite, write_session_title_sqlite},
+    sqlite::{
+        checkpoint_wal, read_all_messages_sqlite, read_first_user_prompt_sqlite,
+        read_session_title_sqlite, write_session_title_sqlite,
+    },
     types::Message,
 };
 
@@ -183,7 +186,11 @@ impl SessionStore {
     }
 
     /// 写入 LLM 生成的 session 标题。
-    pub(in crate::ai) fn write_session_title(&self, session_id: &str, title: &str) -> io::Result<()> {
+    pub(in crate::ai) fn write_session_title(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> io::Result<()> {
         write_session_title_sqlite(&self.session_history_file(session_id), title)
     }
 
@@ -330,8 +337,7 @@ impl SessionStore {
             add_dir_to_zip(&mut zip, &assets_dir, "assets", options)?;
         }
 
-        zip.finish()
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        zip.finish().map_err(|e| io::Error::other(e.to_string()))?;
         Ok(())
     }
 
@@ -344,8 +350,8 @@ impl SessionStore {
         dst_id: &str,
     ) -> io::Result<String> {
         let file = File::open(archive_path)?;
-        let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|e| io::Error::other(e.to_string()))?;
 
         // 读取 manifest（可选，仅用于校验）
         let manifest = {
@@ -372,9 +378,9 @@ impl SessionStore {
 
         // 解压 session.sqlite
         {
-            let mut entry = archive
-                .by_name("session.sqlite")
-                .map_err(|e| io::Error::other(format!("session.sqlite not found in archive: {e}")))?;
+            let mut entry = archive.by_name("session.sqlite").map_err(|e| {
+                io::Error::other(format!("session.sqlite not found in archive: {e}"))
+            })?;
             let mut out = File::create(&dst_sqlite)?;
             std::io::copy(&mut entry, &mut out)?;
         }
@@ -641,12 +647,31 @@ fn extract_first_sentence(text: &str) -> String {
 /// 去掉常见的冗余前缀，使标题更简洁概括。
 fn strip_filler_prefixes(text: &str) -> String {
     let fillers = [
-        "帮我", "请帮我", "麻烦帮我", "能不能帮我", "可以帮我",
-        "请", "麻烦", "拜托", "求",
-        "我想", "我想要", "我需要", "希望", "希望能",
-        "想问一下", "问一下", "请问", "想知道",
-        "看一下", "帮我看一下", "帮看看", "看看",
-        "如何", "怎么", "怎样",
+        "帮我",
+        "请帮我",
+        "麻烦帮我",
+        "能不能帮我",
+        "可以帮我",
+        "请",
+        "麻烦",
+        "拜托",
+        "求",
+        "我想",
+        "我想要",
+        "我需要",
+        "希望",
+        "希望能",
+        "想问一下",
+        "问一下",
+        "请问",
+        "想知道",
+        "看一下",
+        "帮我看一下",
+        "帮看看",
+        "看看",
+        "如何",
+        "怎么",
+        "怎样",
     ];
     let mut t = text.trim();
     loop {

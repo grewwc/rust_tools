@@ -8,6 +8,7 @@ use reqwest::StatusCode;
 use rust_tools::commonw;
 use serde_json::{Map, Value, json};
 
+use super::provider::adapter_for;
 use super::{
     files,
     history::{
@@ -20,45 +21,46 @@ use super::{
 };
 use crate::ai::theme::{ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_SUCCESS, ACCENT_WARN, RESET};
 use crate::commonw::configw;
-use super::provider::adapter_for;
 
-mod types;
-mod thinking;
-mod routing;
 mod error;
 mod normalize;
+mod routing;
+mod thinking;
+mod types;
 
+#[allow(unused_imports)]
+pub(crate) use error::{
+    AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS, AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS,
+    REQUEST_MAX_ATTEMPTS, REQUEST_MAX_ATTEMPTS_429, RequestError, RequestErrorKind,
+    RequestRetryPolicy, STREAM_RESPONSE_HEADER_TIMEOUT_SECS, api_key_for_request_model,
+    apply_request_auth, clear_stale_request_interrupt_before_request, config_bool_is_true,
+    config_forces_thinking, control_model_for_aux_tasks, endpoint_for_request_model,
+    is_retryable_reqwest_error, is_retryable_status_with_body, is_retryable_stream_error,
+    is_transient_error, parse_retry_after, request_retry_policy,
+    request_retry_policy_for_current_context, retry_delay, send_with_hedged_backup,
+    should_abort_retry_wait, should_retry_status, should_rotate_key,
+    should_temporarily_disable_auto_selected_model, should_temporarily_disable_model,
+    should_try_model_fallback, sleep_with_cancel,
+};
 #[allow(unused_imports)]
 use normalize::{
     agent_tools_for_request, normalize_message_content_for_text_only_model,
-    normalize_messages_for_request,
-    normalize_messages_for_model, request_tool_names_for_model,
+    normalize_messages_for_model, normalize_messages_for_request, request_tool_names_for_model,
     strip_unavailable_tool_hints_from_messages,
 };
-#[cfg(test)]
-pub(crate) use thinking::{latest_user_message_text, local_thinking_decision, parse_thinking_gate_output};
 #[allow(unused_imports)]
 pub(crate) use routing::{extract_router_content, strip_json_fence};
 use thinking::resolve_thinking;
 pub(crate) use thinking::strip_system_reminders;
+#[cfg(test)]
+pub(crate) use thinking::{
+    latest_user_message_text, local_thinking_decision, parse_thinking_gate_output,
+};
 use types::RequestBody;
 #[allow(unused_imports)]
 pub(crate) use types::{
-    StreamChunk, StreamChoice, StreamDelta, StreamFunctionCall, StreamToolCall, StreamUsage,
+    StreamChoice, StreamChunk, StreamDelta, StreamFunctionCall, StreamToolCall, StreamUsage,
     merge_reasoning_fragments,
-};
-#[allow(unused_imports)]
-pub(crate) use error::{
-    RequestError, RequestErrorKind, RequestRetryPolicy, REQUEST_MAX_ATTEMPTS,
-    REQUEST_MAX_ATTEMPTS_429, AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS,
-    AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS,
-    STREAM_RESPONSE_HEADER_TIMEOUT_SECS, apply_request_auth, api_key_for_request_model,
-    clear_stale_request_interrupt_before_request, config_bool_is_true, config_forces_thinking,
-    control_model_for_aux_tasks, endpoint_for_request_model, is_retryable_reqwest_error,
-    is_retryable_status_with_body, is_transient_error, parse_retry_after, request_retry_policy,
-    request_retry_policy_for_current_context, retry_delay, send_with_hedged_backup, should_rotate_key,
-    should_abort_retry_wait, should_retry_status, should_temporarily_disable_auto_selected_model,
-    should_temporarily_disable_model, should_try_model_fallback, sleep_with_cancel, is_retryable_stream_error,
 };
 
 /// 并发请求（前台 turn + 各子代理）各自独立重试，`attempt N/M` 计数互相
@@ -254,8 +256,8 @@ pub(super) async fn do_request_messages(
         tools_value,
         tool_choice,
         reasoning_effort,
-       app.cli.max_tokens_override,
-      app.last_known_prompt_tokens,
+        app.cli.max_tokens_override,
+        app.last_known_prompt_tokens,
     );
     let retry_policy = request_retry_policy_for_current_context();
 
@@ -277,7 +279,8 @@ pub(super) async fn do_request_messages(
                 total_keys - key_idx
             );
         }
-        match request_messages_with_key(app, api_key, &request_body, &retry_policy, &endpoint).await {
+        match request_messages_with_key(app, api_key, &request_body, &retry_policy, &endpoint).await
+        {
             Ok(response) => return Ok(response),
             Err(err) if should_rotate_key(&err) && key_idx + 1 < total_keys => {
                 last_key_err = Some(err);
@@ -285,11 +288,9 @@ pub(super) async fn do_request_messages(
             Err(err) => return Err(err),
         }
     }
-    Err(last_key_err.unwrap_or_else(|| {
-        RequestError {
-            kind: RequestErrorKind::Network,
-            message: adapter.keys_exhausted_message().to_string(),
-        }
+    Err(last_key_err.unwrap_or_else(|| RequestError {
+        kind: RequestErrorKind::Network,
+        message: adapter.keys_exhausted_message().to_string(),
     }))
 }
 
@@ -353,12 +354,7 @@ pub(super) fn print_info(app: &App, model: &str) {
         });
     let session_part = summary
         .filter(|s| !s.is_empty())
-        .map(|s| {
-            format!(
-                "{ACCENT_MUTED} · {ACCENT_WARN}{}{RESET}",
-                s
-            )
-        })
+        .map(|s| format!("{ACCENT_MUTED} · {ACCENT_WARN}{}{RESET}", s))
         .unwrap_or_default();
 
     // 使用 println! 避免手动 flush 的权限问题；模型与 session 合并为一行。
@@ -393,15 +389,16 @@ fn build_request_body<'a>(
     // 钳制，避免 prompt + 请求的输出上限一起挤爆 token 窗口（GLM 长上下文下反复
     // 截断 → 重试死循环的根因）。未声明 max_output_tokens 的模型保持不下发字段，
     // wire 行为不变。
-    let max_tokens =
-        models::max_output_tokens(model).map(|model_max| clamp_max_tokens_for_prompt(model, messages, model_max, known_prompt_tokens));
-   // 零输出截断自适应：当上一轮检测到 completion=0 + finish_reason=length 时，
-   // orchestrator 会把 max_tokens_override 设为更小的值。此处用该值替换 clamp 结果，
-   // 让下一轮请求发送更小的 max_tokens，绕过服务端对超大 max_tokens 的空响应拒绝。
-   let max_tokens = match (max_tokens, max_tokens_override) {
-       (Some(_), Some(override_val)) => Some(override_val),
-       (mt, _) => mt,
-   };
+    let max_tokens = models::max_output_tokens(model).map(|model_max| {
+        clamp_max_tokens_for_prompt(model, messages, model_max, known_prompt_tokens)
+    });
+    // 零输出截断自适应：当上一轮检测到 completion=0 + finish_reason=length 时，
+    // orchestrator 会把 max_tokens_override 设为更小的值。此处用该值替换 clamp 结果，
+    // 让下一轮请求发送更小的 max_tokens，绕过服务端对超大 max_tokens 的空响应拒绝。
+    let max_tokens = match (max_tokens, max_tokens_override) {
+        (Some(_), Some(override_val)) => Some(override_val),
+        (mt, _) => mt,
+    };
     RequestBody {
         model: request_model,
         messages,
@@ -642,7 +639,9 @@ pub async fn do_request_json(
                 if attempt < REQUEST_MAX_ATTEMPTS {
                     eprintln!(
                         "[Warning] {}do_request_json timeout (60s), retrying (attempt {}/{})",
-                        retry_scope_tag(), attempt, REQUEST_MAX_ATTEMPTS
+                        retry_scope_tag(),
+                        attempt,
+                        REQUEST_MAX_ATTEMPTS
                     );
                     continue;
                 }
@@ -771,7 +770,11 @@ pub async fn do_request_text_streaming(
         // （auto 子 agent 走 30s 而非硬编码 90s），chunk 空闲超时仍用固定常量。
         let mut response = match tokio::time::timeout(
             Duration::from_secs(retry_policy.header_timeout_secs),
-            send_with_hedged_backup(build_request, retry_policy.hedged_backup_after_secs(), retry_policy.hedged_max_sends()),
+            send_with_hedged_backup(
+                build_request,
+                retry_policy.hedged_backup_after_secs(),
+                retry_policy.hedged_max_sends(),
+            ),
         )
         .await
         {
@@ -810,7 +813,10 @@ pub async fn do_request_text_streaming(
                 if attempt < REQUEST_MAX_ATTEMPTS {
                     eprintln!(
                         "[Warning] {}do_request_text_streaming 等待响应头超时 ({}s), retrying (attempt {}/{})",
-                        retry_scope_tag(), retry_policy.header_timeout_secs, attempt, REQUEST_MAX_ATTEMPTS
+                        retry_scope_tag(),
+                        retry_policy.header_timeout_secs,
+                        attempt,
+                        REQUEST_MAX_ATTEMPTS
                     );
                     continue;
                 }
@@ -892,7 +898,10 @@ pub async fn do_request_text_streaming(
         if idle_timed_out && content.is_empty() && attempt < REQUEST_MAX_ATTEMPTS {
             eprintln!(
                 "[Warning] {}do_request_text_streaming chunk 空闲超时 ({}s) 且无内容, retrying (attempt {}/{})",
-                retry_scope_tag(), STREAM_RESPONSE_HEADER_TIMEOUT_SECS, attempt, REQUEST_MAX_ATTEMPTS
+                retry_scope_tag(),
+                STREAM_RESPONSE_HEADER_TIMEOUT_SECS,
+                attempt,
+                REQUEST_MAX_ATTEMPTS
             );
             continue;
         }
@@ -1022,8 +1031,8 @@ pub(super) async fn summarize_history_via_model(
         None,
         None,
         None,
-       None,
-       None,
+        None,
+        None,
     );
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
@@ -1133,20 +1142,20 @@ pub(super) async fn generate_session_title_via_model(
         None,
         None,
         None,
-       None,
-       None,
+        None,
+        None,
     );
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
 
     eprintln!("[session-title] requesting title from model={control_model} endpoint={endpoint}");
-    let send_future =
-        apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .send();
+    let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+        .header("Content-Type", "application/json")
+        .json(&request_body)
+        .send();
 
-    let response = match tokio::time::timeout(std::time::Duration::from_secs(30), send_future).await {
+    let response = match tokio::time::timeout(std::time::Duration::from_secs(30), send_future).await
+    {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             eprintln!("[session-title] request error: {e}");
@@ -1164,7 +1173,8 @@ pub(super) async fn generate_session_title_via_model(
         return None;
     }
 
-    let text = match tokio::time::timeout(std::time::Duration::from_secs(15), response.text()).await {
+    let text = match tokio::time::timeout(std::time::Duration::from_secs(15), response.text()).await
+    {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
             eprintln!("[session-title] body read error: {e}");
@@ -1194,7 +1204,9 @@ pub(super) async fn generate_session_title_via_model(
 
     // 清理：去掉引号、去掉换行、截断到 30 字符
     let cleaned = trimmed
-        .trim_matches(|c: char| c == '"' || c == '「' || c == '」' || c == '\'' || c.is_whitespace())
+        .trim_matches(|c: char| {
+            c == '"' || c == '「' || c == '」' || c == '\'' || c.is_whitespace()
+        })
         .lines()
         .next()
         .unwrap_or("")

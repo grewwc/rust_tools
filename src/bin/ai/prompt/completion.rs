@@ -477,7 +477,9 @@ impl CommandCompleter {
                             "/agents" | ":agents" | "/agent" | ":agent" => {
                                 Self::agent_subcommands()
                             }
-                            "/sessions" | ":sessions" | "/ss" | ":ss" => Self::session_subcommands(),
+                            "/sessions" | ":sessions" | "/ss" | ":ss" => {
+                                Self::session_subcommands()
+                            }
                             "/history" | ":history" => Self::history_subcommands(),
                             "/personas" | ":personas" => Self::persona_subcommands(),
                             "/usage" | ":usage" => Self::usage_subcommands(),

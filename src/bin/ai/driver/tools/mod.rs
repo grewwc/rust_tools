@@ -10,9 +10,7 @@ use std::error::Error;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
-use std::sync::{
-    LazyLock, Mutex,
-};
+use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration as StdDuration, Instant, UNIX_EPOCH};
 
@@ -24,17 +22,15 @@ use crate::ai::{
     },
     mcp::{McpClient, SharedMcpClient},
     tools as builtin_tools,
-    tools::task_tools::{
-        epoll_wait_many,
-    },
+    tools::task_tools::epoll_wait_many,
     types::{ToolCall, ToolResult},
 };
 use crate::commonw::prompt::prompt_yes_or_no_interruptible;
 
+mod async_pipe;
 mod barrier;
 mod oauth;
 mod sync_task;
-mod async_pipe;
 
 #[allow(unused_imports)]
 use async_pipe::*;
@@ -629,25 +625,25 @@ fn execute_tool_spawn(
     let started_at_for_thread = started_at;
     let available_tool_names_for_thread = allowed_tool_names.cloned();
 
-   // Insert the Running registry entry BEFORE spawning the worker thread.
-   // If the worker completes quickly, it will try to update the entry to
-   // Completed — the entry must already exist or the completion is lost and
-   // the task is stuck in Running forever.
-   {
-       let mut registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
-       registry.insert(
-           async_task_id.clone(),
-           AsyncToolEntry {
-               result_channel_id,
-               completion_futex_addr,
-               session_id: session_id_for_registry.clone(),
-               tool_name: tool_name.clone(),
-               started_at,
-               state: AsyncToolState::Running,
-           },
-       );
-       prune_completed_async_tools(&mut registry);
-   }
+    // Insert the Running registry entry BEFORE spawning the worker thread.
+    // If the worker completes quickly, it will try to update the entry to
+    // Completed — the entry must already exist or the completion is lost and
+    // the task is stuck in Running forever.
+    {
+        let mut registry = ASYNC_TOOL_REGISTRY.lock().unwrap();
+        registry.insert(
+            async_task_id.clone(),
+            AsyncToolEntry {
+                result_channel_id,
+                completion_futex_addr,
+                session_id: session_id_for_registry.clone(),
+                tool_name: tool_name.clone(),
+                started_at,
+                state: AsyncToolState::Running,
+            },
+        );
+        prune_completed_async_tools(&mut registry);
+    }
 
     thread::spawn(move || {
         let mut pipe_observer = AsyncToolPipeObserver {
@@ -1604,14 +1600,14 @@ fn run_parallel_readonly_batch(
             .collect();
         handles
             .into_iter()
-           .zip(batch.iter())
-           .map(|(h, tool_call)| {
-               h.join().unwrap_or_else(|_| {
+            .zip(batch.iter())
+            .map(|(h, tool_call)| {
+                h.join().unwrap_or_else(|_| {
                     (
                         ToolRoute::Builtin,
                         RunOneResult {
                             tool_result: ToolResult {
-                               tool_call_id: tool_call.id.clone(),
+                                tool_call_id: tool_call.id.clone(),
                                 content: "Error: parallel tool execution thread panicked"
                                     .to_string(),
                             },

@@ -48,7 +48,10 @@ fn load_or_create_secret() -> io::Result<Vec<u8>> {
         // 文件存在但格式不对，报错
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("secret file {} has invalid format (expected 32-byte base64)", path.display()),
+            format!(
+                "secret file {} has invalid format (expected 32-byte base64)",
+                path.display()
+            ),
         ));
     }
 
@@ -121,9 +124,12 @@ pub fn decrypt(encoded: &str) -> io::Result<String> {
         .strip_prefix("enc:")
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing 'enc:' prefix"))?;
 
-    let payload = B64
-        .decode(payload_b64)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("base64 decode error: {e}")))?;
+    let payload = B64.decode(payload_b64).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("base64 decode error: {e}"),
+        )
+    })?;
 
     if payload.len() < 8 {
         return Err(io::Error::new(

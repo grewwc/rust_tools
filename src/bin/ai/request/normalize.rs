@@ -9,15 +9,13 @@
 
 use serde_json::Value;
 
-use crate::ai::history::{
-    Message, is_internal_note_role, is_system_like_role, ROLE_SYSTEM,
-};
+use crate::ai::history::{Message, ROLE_SYSTEM, is_internal_note_role, is_system_like_role};
 use crate::ai::models;
 use crate::ai::types::App;
 
-use super::types::extract_displayable_text;
 #[allow(unused_imports)]
 use super::error::config_bool_is_true;
+use super::types::extract_displayable_text;
 #[allow(unused_imports)]
 use crate::ai::config_schema::AiConfig;
 #[allow(unused_imports)]
@@ -40,7 +38,10 @@ pub(super) fn agent_tools_for_request(app: &App, model: &str) -> (Option<Value>,
     (tools_value, tool_choice)
 }
 
-pub(super) fn request_tool_names_for_model(app: &App, model: &str) -> rust_tools::commonw::FastSet<String> {
+pub(super) fn request_tool_names_for_model(
+    app: &App,
+    model: &str,
+) -> rust_tools::commonw::FastSet<String> {
     if !models::tools_enabled(model) {
         return Default::default();
     }

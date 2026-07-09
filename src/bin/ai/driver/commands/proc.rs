@@ -16,11 +16,7 @@
 
 use std::process;
 
-use crate::ai::{
-    driver::session_pid,
-    history::SessionStore,
-    types::App,
-};
+use crate::ai::{driver::session_pid, history::SessionStore, types::App};
 
 /// 从 SessionStore 查找指定 session 的摘要信息。
 fn lookup_session_info(
@@ -48,10 +44,7 @@ struct ActiveSession {
     source: &'static str, // "pid-file" / "lsof"
 }
 
-pub fn try_handle_proc_command(
-    app: &App,
-    input: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
+pub fn try_handle_proc_command(app: &App, input: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Ok(false);
@@ -87,7 +80,8 @@ pub fn try_handle_proc_command(
     let sessions_root = store.sessions_root();
 
     // ---- 收集活跃 session（三重探测）----
-    let mut by_sid: std::collections::BTreeMap<String, ActiveSession> = std::collections::BTreeMap::new();
+    let mut by_sid: std::collections::BTreeMap<String, ActiveSession> =
+        std::collections::BTreeMap::new();
 
     // 1) PID 文件（扫描基目录及所有 *.sessions 子目录）
     for (sid, pid, alive) in session_pid::scan_all_session_pids(sessions_root)? {
@@ -110,10 +104,7 @@ pub fn try_handle_proc_command(
     }
 
     // 排除当前进程自身——`a /proc` 是一次性查询，不是真正的活跃 session。
-    let sessions: Vec<&ActiveSession> = by_sid
-        .values()
-        .filter(|s| s.pid != current_pid)
-        .collect();
+    let sessions: Vec<&ActiveSession> = by_sid.values().filter(|s| s.pid != current_pid).collect();
     let identified = sessions.len();
 
     // 3) pgrep 计数（减去自身）
@@ -159,9 +150,7 @@ pub fn try_handle_proc_command(
     // 提示未识别的进程
     if total_a > identified {
         let diff = total_a - identified;
-        println!(
-            "Note: {diff} additional `a` process(es) running but session not identified"
-        );
+        println!("Note: {diff} additional `a` process(es) running but session not identified");
         println!("      (likely started with an older version without pid-file support)");
         println!();
     }

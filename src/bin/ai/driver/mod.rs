@@ -827,7 +827,10 @@ fn publish_background_task_failure(
             aios_kernel::primitives::ChannelId(result_channel_id),
             payload,
         );
-        let _ = os.channel_close(Some(pid), aios_kernel::primitives::ChannelId(result_channel_id));
+        let _ = os.channel_close(
+            Some(pid),
+            aios_kernel::primitives::ChannelId(result_channel_id),
+        );
         let _ = os.channel_release_named(
             aios_kernel::primitives::ChannelId(result_channel_id),
             "task_result.producer",
@@ -1593,10 +1596,8 @@ pub(in crate::ai) async fn run_with_cli(
     // 注册当前进程的 PID 到 sessions 目录，供 `/proc` 命令发现活跃 session。
     // guard 在函数退出（正常返回 / panic）时自动删除 PID 文件；
     // 即使被 SIGKILL 杀死，`/proc` 也会通过 PID 存活探测清理残留。
-    let _session_pid_guard = session_pid::SessionPidGuard::register(
-        session_store.sessions_root(),
-        &session_id,
-    );
+    let _session_pid_guard =
+        session_pid::SessionPidGuard::register(session_store.sessions_root(), &session_id);
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let streaming = Arc::new(AtomicBool::new(false));
@@ -1672,6 +1673,7 @@ pub(in crate::ai) async fn run_with_cli(
         last_known_prompt_tokens: None,
         goal_mode: None,
         last_turn_had_tool_calls: false,
+        last_turn_interrupted: false,
     };
     if let Some(notice) = startup_notice {
         println!("{notice}");
@@ -1711,7 +1713,10 @@ pub(in crate::ai) async fn run_with_cli(
     // 则进入交互模式，由 run_loop 在每轮输入时继续执行 notebook 检索问答。
     if app.cli.note_search && !app.cli.interactive {
         return runtime_ctx::PERSONA_MEMORY_PATH
-            .scope(app.current_persona_memory_file(), note_search::handle_memo_search(&app))
+            .scope(
+                app.current_persona_memory_file(),
+                note_search::handle_memo_search(&app),
+            )
             .await;
     }
     if app.cli.consolidate_knowledge {
@@ -2106,7 +2111,10 @@ async fn run_loop(
                     Err(err) => {
                         let (result_channel_id, completion_futex_addr) =
                             with_task_entry_by_pid(pid, |entry| {
-                                (Some(entry.result_channel_id), Some(entry.completion_futex_addr))
+                                (
+                                    Some(entry.result_channel_id),
+                                    Some(entry.completion_futex_addr),
+                                )
                             })
                             .unwrap_or((None, None));
                         let mut os = app.os.lock().unwrap();
@@ -2414,19 +2422,23 @@ async fn run_loop(
                 .goal_mode
                 .as_ref()
                 .filter(|g| !g.is_empty() && app.last_turn_had_tool_calls && !one_shot_mode)
-                .map(|g| {
-                    commands::goal::build_goal_continuation_prompt(g)
-                });
+                .map(|g| commands::goal::build_goal_continuation_prompt(g));
 
             if let Some(cont) = goal_continuation {
                 question = cont;
                 attachments_text = String::new();
                 history_count = 0;
             } else {
-                // goal 激活但上一轮无工具调用 → 目标已达成，退出 goal 模式
-                if app.goal_mode.as_ref().map_or(false, |g| !g.is_empty())
-                    && !one_shot_mode
-                {
+                // goal 激活但上一轮无工具调用：
+                // - 若是被 Ctrl+C 打断（last_turn_interrupted），保留 goal 模式，
+                //   静默回落到等待用户输入，不误报「Goal achieved」；
+                // - 否则视为目标已达成，打印提示并退出 goal 模式。
+                let goal_active = app.goal_mode.as_ref().map_or(false, |g| !g.is_empty());
+                if commands::goal::should_exit_goal_on_idle(
+                    goal_active,
+                    one_shot_mode,
+                    app.last_turn_interrupted,
+                ) {
                     use colored::Colorize;
                     println!(
                         "{} Goal achieved. Exiting goal mode.",
@@ -2435,17 +2447,17 @@ async fn run_loop(
                     app.goal_mode = None;
                 }
 
-            let Some(ctx) = input::next_question(app)? else {
-                cleanup_one_shot(app);
-                return Ok(());
-            };
-            if ctx.question.trim().is_empty() {
-                should_quit = false;
-                continue;
-            }
-            question = ctx.question;
-            attachments_text = ctx.attachments_text;
-            history_count = ctx.history_count;
+                let Some(ctx) = input::next_question(app)? else {
+                    cleanup_one_shot(app);
+                    return Ok(());
+                };
+                if ctx.question.trim().is_empty() {
+                    should_quit = false;
+                    continue;
+                }
+                question = ctx.question;
+                attachments_text = ctx.attachments_text;
+                history_count = ctx.history_count;
             }
         }
 
@@ -2488,7 +2500,9 @@ async fn run_loop(
         }
 
         if note_search::note_search_interactive_mode(&app.cli) {
-            match note_search::handle_note_search_interactive_turn(app, &question, history_count).await {
+            match note_search::handle_note_search_interactive_turn(app, &question, history_count)
+                .await
+            {
                 Ok(()) => {}
                 Err(err) => {
                     eprintln!("[Error] 当前轮 notebook 检索失败：{}", err);

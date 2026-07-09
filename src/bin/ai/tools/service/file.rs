@@ -243,10 +243,7 @@ pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
         super::super::storage::temp_registry::register(&abs_path)?;
     }
 
-    super::super::undo_tools::commit_change_set(&format!(
-        "write_file: {}",
-        store.path().display()
-    ));
+    super::super::undo_tools::commit_change_set(&format!("write_file: {}", store.path().display()));
 
     Ok(format!("Successfully wrote to {}", store.path().display()))
 }

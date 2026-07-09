@@ -13,12 +13,16 @@ pub fn print_interactive_help() {
     println!("    /history rewind u<N>|last    remove a user input and all following messages");
     println!("    /history export [file.txt]   export current preview to a file");
     println!("    /history copy                copy current preview to clipboard");
-    println!("    /history replay              replay the last turn's assistant conclusion (text only)");
+    println!(
+        "    /history replay              replay the last turn's assistant conclusion (text only)"
+    );
     println!("    /feishu-auth              authenticate with Feishu");
     println!("    /share [output.md]        export current session as shareable markdown");
     println!("    /close                    close and delete current session, then exit");
     println!("    /proc                     show running sessions (interactive + background)");
-    println!("    /goal [target]            enter goal mode: agent persists until the goal is done");
+    println!(
+        "    /goal [target]            enter goal mode: agent persists until the goal is done"
+    );
     println!();
     println!("  Persona management:");
     println!("    /personas                 list personas");
@@ -45,7 +49,9 @@ pub fn print_interactive_help() {
     println!("    /sessions current         show current session info");
     println!("    /sessions new             create and switch to new session");
     println!("    /sessions use <id>        switch to specified session");
-    println!("    /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)");
+    println!(
+        "    /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)"
+    );
     println!("    /sessions bound           list suspended sessions bound to current terminal");
     println!("    /sessions delete <id> [more...]     delete one or more sessions");
     println!("    /sessions clear-bound     clear suspended sessions bound to current terminal");
@@ -54,7 +60,9 @@ pub fn print_interactive_help() {
     println!("    /sessions export <id> [output.md]       export session to Markdown");
     println!("    /sessions export-current [output.md]    export current session to Markdown");
     println!("    /sessions export-last [output.md]       export latest session to Markdown");
-    println!("    /sessions export-archive <id> [output.zip]       full session archive for migration");
+    println!(
+        "    /sessions export-archive <id> [output.zip]       full session archive for migration"
+    );
     println!("    /sessions export-archive-current [output.zip]    archive current session");
     println!("    /sessions export-archive-last [output.zip]       archive latest session");
     println!("    /sessions import <file.zip> [as=<id>]           import session from archive");

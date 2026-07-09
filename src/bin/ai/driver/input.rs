@@ -7,9 +7,9 @@ use std::sync::atomic::Ordering;
 use regex::RegexBuilder;
 
 use crate::ai::history;
+use crate::ai::theme::{ACCENT_MUTED, ACCENT_SUCCESS, RESET};
 use crate::ai::types::{App, QuestionContext};
 use crate::clipboardw::string_content;
-use crate::ai::theme::{ACCENT_MUTED, ACCENT_SUCCESS, RESET};
 
 use crate::ai::{files, prompt::trim_trailing_newline};
 use crate::pdfw::{PdfParseOptions, parse_pdf};
@@ -1016,7 +1016,6 @@ fn finalize_question(
 
 #[cfg(test)]
 mod tests {
-    use aios_kernel::primitives::{DaemonKind, DaemonState};
     use super::{
         HistoryAction, HistoryPreviewOptions, HistoryRewindTarget, HistoryRoleFilter, LocalCommand,
         apply_history_rewind, extract_at_file_references, extract_forced_skill_reference,
@@ -1031,6 +1030,7 @@ mod tests {
             AgentContext, App, AppConfig, FunctionDefinition, SkillBiasMemory, ToolDefinition,
         },
     };
+    use aios_kernel::primitives::{DaemonKind, DaemonState};
     use serde_json::Value;
     use std::path::PathBuf;
     use std::sync::{Arc, atomic::AtomicBool};
@@ -1147,6 +1147,7 @@ mod tests {
             last_known_prompt_tokens: None,
             goal_mode: None,
             last_turn_had_tool_calls: false,
+            last_turn_interrupted: false,
         }
     }
 
@@ -1517,10 +1518,8 @@ mod tests {
 
     #[test]
     fn render_history_replay_skips_tool_call_steps_and_picks_prior_conclusion() {
-        let history_path = std::env::temp_dir().join(format!(
-            "ai-history-replay-prior-{}.sqlite",
-            Uuid::new_v4()
-        ));
+        let history_path =
+            std::env::temp_dir().join(format!("ai-history-replay-prior-{}.sqlite", Uuid::new_v4()));
         let mut app = test_app();
         app.session_history_file = history_path.clone();
 
@@ -1631,7 +1630,10 @@ mod tests {
         assert_eq!(
             remaining
                 .iter()
-                .map(|message| (message.role.as_str(), searchable_history_content(&message.content)))
+                .map(|message| (
+                    message.role.as_str(),
+                    searchable_history_content(&message.content)
+                ))
                 .collect::<Vec<_>>(),
             vec![
                 ("user", "keep user".to_string()),

@@ -229,27 +229,33 @@ fn prune_completed_tasks(registry: &mut SkipMap<String, AsyncTaskEntry>) {
         // 通过 kernel 检查进程是否已终止；若无法访问 kernel 则保守跳过。
         let terminated = with_os_kernel(|os| {
             match os.get_process(entry.pid) {
-                None => Ok(true),  // 进程不存在 → 已终止
-                Some(proc) => Ok(matches!(
-                    proc.state,
-                    ProcessState::Terminated
-                )),
+                None => Ok(true), // 进程不存在 → 已终止
+                Some(proc) => Ok(matches!(proc.state, ProcessState::Terminated)),
             }
-        }).unwrap_or(false);
+        })
+        .unwrap_or(false);
         if terminated {
             candidates.push((key.clone(), entry.started_at));
         }
     }
     candidates.sort_by_key(|(_, t)| *t);
-    let to_remove = candidates.len().min(registry.len().saturating_sub(MAX_TASK_REGISTRY_SIZE));
+    let to_remove = candidates
+        .len()
+        .min(registry.len().saturating_sub(MAX_TASK_REGISTRY_SIZE));
     let _ = now; // suppress unused
     for (key, _) in candidates.into_iter().take(to_remove) {
         // 在移除注册表条目前，尝试释放内核资源（best-effort）。
         if let Some(entry) = registry.get_ref(&key) {
             let _ = with_os_kernel(|os| {
                 let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
-                let _ = os.channel_release_named(ChannelId(entry.result_channel_id), "task_result.consumer");
-                let _ = os.channel_release_named(ChannelId(entry.result_channel_id), "task_result.producer");
+                let _ = os.channel_release_named(
+                    ChannelId(entry.result_channel_id),
+                    "task_result.consumer",
+                );
+                let _ = os.channel_release_named(
+                    ChannelId(entry.result_channel_id),
+                    "task_result.producer",
+                );
                 let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
                 let _ = os.futex_destroy(entry.completion_futex_addr);
                 Ok::<(), String>(())
@@ -919,7 +925,6 @@ pub(crate) fn execute_task_spawn(args: &Value) -> Result<String, String> {
     ))
 }
 
-
 fn params_task_wait() -> Value {
     serde_json::json!({
         "type": "object",
@@ -1194,18 +1199,18 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                 // Process is no longer pending and never wrote a result.
                 // Treat as failed-without-output and free the kernel
                 // resources so we do not leak channels/futexes.
-               // 子 agent 进程终止但未发布结果时，它不会运行自己的清理代码
-               // 来释放 producer holder，因此这里必须同时释放 consumer 和 producer，
-               // 否则 channel_destroy 因 ref_count != 0 失败，channel + futex 永久泄漏。
+                // 子 agent 进程终止但未发布结果时，它不会运行自己的清理代码
+                // 来释放 producer holder，因此这里必须同时释放 consumer 和 producer，
+                // 否则 channel_destroy 因 ref_count != 0 失败，channel + futex 永久泄漏。
                 let _ = os.channel_close(None, ChannelId(entry.result_channel_id));
                 let _ = os.channel_release_named(
                     ChannelId(entry.result_channel_id),
                     "task_result.consumer",
                 );
-               let _ = os.channel_release_named(
-                   ChannelId(entry.result_channel_id),
-                   "task_result.producer",
-               );
+                let _ = os.channel_release_named(
+                    ChannelId(entry.result_channel_id),
+                    "task_result.producer",
+                );
                 let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
                 let _ = os.futex_destroy(entry.completion_futex_addr);
                 ready.push(format!(
@@ -1259,10 +1264,10 @@ pub(crate) fn execute_task_wait(args: &Value) -> Result<String, String> {
                         ChannelId(entry.result_channel_id),
                         "task_result.consumer",
                     );
-                   let _ = os.channel_release_named(
-                       ChannelId(entry.result_channel_id),
-                       "task_result.producer",
-                   );
+                    let _ = os.channel_release_named(
+                        ChannelId(entry.result_channel_id),
+                        "task_result.producer",
+                    );
                     let _ = os.channel_destroy(None, ChannelId(entry.result_channel_id));
                     let _ = os.futex_destroy(entry.completion_futex_addr);
                     ready.push(format!(
@@ -1704,9 +1709,8 @@ mod agent_team;
 use agent_team::execute_agent_team;
 #[cfg(test)]
 pub(crate) use agent_team::{
-    AgentTeamMemberSpec, AgentTeamOperation,
-    build_agent_team_prompt, build_agent_team_selection_prompt,
-    parse_agent_team_members, resolve_agent_team_model_override,
+    AgentTeamMemberSpec, AgentTeamOperation, build_agent_team_prompt,
+    build_agent_team_selection_prompt, parse_agent_team_members, resolve_agent_team_model_override,
 };
 
 #[cfg(test)]

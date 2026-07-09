@@ -687,7 +687,11 @@ mod tests {
         }
         // 真正的全角/CJK 字符仍占 2 列，不受影响。
         for ch in ['中', '文', '你', '好'] {
-            assert_eq!(terminal_cell_width(ch), 2, "CJK char {ch:?} stays double-width");
+            assert_eq!(
+                terminal_cell_width(ch),
+                2,
+                "CJK char {ch:?} stays double-width"
+            );
         }
         // 含箭头的结果单元格：3 个可见字符（→ 空格 x）应为 3 列，而非 4。
         assert_eq!(terminal_display_width("→ x"), 3);

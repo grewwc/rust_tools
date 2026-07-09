@@ -414,11 +414,7 @@ fn extract_error_message(value: &serde_json::Value) -> Option<String> {
                 (None, Some(t)) => Some(t.to_string()),
                 (None, None) => {
                     let s = value.to_string();
-                    if s == "{}" {
-                        None
-                    } else {
-                        Some(s)
-                    }
+                    if s == "{}" { None } else { Some(s) }
                 }
             }
         }
@@ -757,11 +753,7 @@ mod tests {
     #[test]
     fn response_failed_event_surfaces_error() {
         let payload = r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"model overloaded"}}}"#;
-        match parse_stream_payload(
-            provider::openai_adapter(),
-            payload,
-            Some("response.failed"),
-        ) {
+        match parse_stream_payload(provider::openai_adapter(), payload, Some("response.failed")) {
             ParsedStreamPayload::Error(msg) => {
                 assert!(msg.contains("model overloaded"), "msg was: {msg}");
             }

@@ -5,14 +5,14 @@
 // =============================================================================
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use rustc_hash::FxHashSet;
 
 use crate::ai::cli::ParsedCli;
-use crate::ai::types::{clear_stream_cancel, App};
+use crate::ai::types::{App, clear_stream_cancel};
 
 use super::signal::ForegroundTurnGuard;
 
@@ -762,7 +762,10 @@ pub(super) async fn handle_consolidate_knowledge(
 
 /// 处理 --note-delete / -nd <一段话>：用模型在知识库中匹配最相关的 memo 条目，
 /// 找到对应 id，删除前请用户确认。
-pub(super) async fn handle_note_delete(app: &mut App, query: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) async fn handle_note_delete(
+    app: &mut App,
+    query: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
     // 拼接查询：flag 的值 + 其余位置参数；都为空时进入多行输入框。
@@ -971,7 +974,10 @@ pub(super) async fn handle_note_delete(app: &mut App, query: &str) -> Result<(),
 
 /// 处理 --note-edit / -ne <一段话>：用模型在知识库中匹配相关 memo 条目，
 /// 匹配到多条时让用户选定一条，在编辑器中预填原文改写后保存（保留 id、更新时间戳）。
-pub(super) async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub(super) async fn handle_note_edit(
+    app: &mut App,
+    query: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
 
     // 状态行着色：与黑底白字的 note 正文区分开。
@@ -1185,7 +1191,9 @@ pub(super) async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), B
             }),
         ];
         let result =
-            match crate::ai::request::do_request_json(app, &model, &tidy_messages, false, false).await {
+            match crate::ai::request::do_request_json(app, &model, &tidy_messages, false, false)
+                .await
+            {
                 Ok(response) => response
                     .pointer("/choices/0/message/content")
                     .and_then(|c| c.as_str())
@@ -1203,7 +1211,10 @@ pub(super) async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), B
         match result {
             Some(tidied) if tidied != new_note => {
                 println!("{NE} 已整理修改内容（语义未变）：");
-                println!("  {FIELD}整理后:{RST} {}", tidied.chars().take(500).collect::<String>());
+                println!(
+                    "  {FIELD}整理后:{RST} {}",
+                    tidied.chars().take(500).collect::<String>()
+                );
                 tidied
             }
             _ => new_note,
@@ -1221,7 +1232,6 @@ pub(super) async fn handle_note_edit(app: &mut App, query: &str) -> Result<(), B
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

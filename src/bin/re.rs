@@ -1,8 +1,8 @@
-use std::io::{self, Write};
 pub use rust_tools::cmd;
 pub use rust_tools::commonw;
-pub use rust_tools::{terminalw, cw::Trie};
 pub use rust_tools::strw;
+pub use rust_tools::{cw::Trie, terminalw};
+use std::io::{self, Write};
 
 #[path = "re/memo/mod.rs"]
 mod memo;
@@ -23,10 +23,7 @@ fn main() {
         let shell = if let Some(val) = argv.get(idx + 1) {
             val.clone()
         } else if let Ok(s) = std::env::var("SHELL") {
-            s.rsplit('/')
-                .next()
-                .unwrap_or("bash")
-                .to_string()
+            s.rsplit('/').next().unwrap_or("bash").to_string()
         } else {
             "bash".to_string()
         };
@@ -143,14 +140,27 @@ fn generate_bash_completion() {
     let _ = writeln!(out, r#"# bash completion for re"#);
     let _ = writeln!(out, r#"_re() {{"#);
     let _ = writeln!(out, r#"  local cur prev words cword"#);
-    let _ = writeln!(out, r#"  _get_comp_words_by_ref -n = cur prev words cword 2>/dev/null || true"#);
+    let _ = writeln!(
+        out,
+        r#"  _get_comp_words_by_ref -n = cur prev words cword 2>/dev/null || true"#
+    );
     let _ = writeln!(out);
-    let _ = writeln!(out, r#"  if [ "$prev" = "-t" ] || [ "$prev" = "--tag" ]; then"#);
-    let _ = writeln!(out, r#"    COMPREPLY=( $(compgen -W "$("${{COMP_WORDS[0]}}" --complete-tags "$cur" 2>/dev/null)" -- "$cur") )"#);
+    let _ = writeln!(
+        out,
+        r#"  if [ "$prev" = "-t" ] || [ "$prev" = "--tag" ]; then"#
+    );
+    let _ = writeln!(
+        out,
+        r#"    COMPREPLY=( $(compgen -W "$("${{COMP_WORDS[0]}}" --complete-tags "$cur" 2>/dev/null)" -- "$cur") )"#
+    );
     let _ = writeln!(out, r#"    return 0"#);
     let _ = writeln!(out, r#"  fi"#);
     let _ = writeln!(out);
-    let _ = writeln!(out, r#"  COMPREPLY=( $(compgen -W "{flag_list}" -- "$cur") )"#, flag_list = flag_list);
+    let _ = writeln!(
+        out,
+        r#"  COMPREPLY=( $(compgen -W "{flag_list}" -- "$cur") )"#,
+        flag_list = flag_list
+    );
     let _ = writeln!(out, r#"  return 0"#);
     let _ = writeln!(out, r#"}}"#);
     let _ = writeln!(out, r#"complete -F _re re"#);
@@ -167,18 +177,43 @@ fn generate_zsh_completion() {
     let _ = writeln!(out, "_re() {{");
     let _ = writeln!(out, "  local -a _re_args");
     for (name, ty, usage, aliases) in &info {
-        let flag_name = if name.len() > 1 { format!("--{name}") } else { format!("-{name}") };
+        let flag_name = if name.len() > 1 {
+            format!("--{name}")
+        } else {
+            format!("-{name}")
+        };
         let mut flags = vec![flag_name];
-        flags.extend(aliases.iter().map(|a| if a.len() > 1 { format!("--{a}") } else { format!("-{a}") }));
-        let flags = flags
-            .join(", ");
+        flags.extend(aliases.iter().map(|a| {
+            if a.len() > 1 {
+                format!("--{a}")
+            } else {
+                format!("-{a}")
+            }
+        }));
+        let flags = flags.join(", ");
         let desc = usage.replace('\'', "'\\''");
-        let value = if ty == "string" { format!(":{name}: ") } else { String::new() };
-        let _ = writeln!(out, "  _re_args+=('{flags}[{desc}]{value}')", flags = flags, desc = desc, value = value);
+        let value = if ty == "string" {
+            format!(":{name}: ")
+        } else {
+            String::new()
+        };
+        let _ = writeln!(
+            out,
+            "  _re_args+=('{flags}[{desc}]{value}')",
+            flags = flags,
+            desc = desc,
+            value = value
+        );
     }
-    let _ = writeln!(out, "  if [[ $words[CURRENT-1] == -t || $words[CURRENT-1] == --tag ]]; then");
+    let _ = writeln!(
+        out,
+        "  if [[ $words[CURRENT-1] == -t || $words[CURRENT-1] == --tag ]]; then"
+    );
     let _ = writeln!(out, "    local -a tags");
-    let _ = writeln!(out, "    tags=(${{(f)\"$(${{words[1]}} --complete-tags \"${{words[CURRENT]}}\" 2>/dev/null)\"}})");
+    let _ = writeln!(
+        out,
+        "    tags=(${{(f)\"$(${{words[1]}} --complete-tags \"${{words[CURRENT]}}\" 2>/dev/null)\"}})"
+    );
     let _ = writeln!(out, "    compadd -a tags");
     let _ = writeln!(out, "    return");
     let _ = writeln!(out, "  fi");

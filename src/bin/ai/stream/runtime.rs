@@ -1,7 +1,7 @@
-use std::io::{self, IsTerminal, Write};
 use super::inline_recovery::{
     collect_valid_tool_calls, ensure_tool_calls_section_open, recover_inline_tool_calls,
 };
+use std::io::{self, IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use crate::ai::{
@@ -193,10 +193,7 @@ pub(super) fn clear_waiting_hint(state: &mut StreamProcessingState) -> io::Resul
     Ok(())
 }
 
-fn immediate_cancel_result(
-    app: &App,
-    state: &mut StreamProcessingState,
-) -> Option<StreamResult> {
+fn immediate_cancel_result(app: &App, state: &mut StreamProcessingState) -> Option<StreamResult> {
     stream_interrupt_requested(app).then(|| cancelled_stream_result(state))
 }
 
@@ -579,8 +576,6 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
     })
 }
 
-
-
 struct ToolCallRenderChunk {
     function_name: String,
     arguments: String,
@@ -793,7 +788,10 @@ fn commit_visible_content(
     Ok(())
 }
 
-pub(super) fn format_end_thinking_line(markers: &StreamMarkers, markdown: &MarkdownStreamRenderer) -> String {
+pub(super) fn format_end_thinking_line(
+    markers: &StreamMarkers,
+    markdown: &MarkdownStreamRenderer,
+) -> String {
     let mut content = format!("{}\n", markers.end_thinking_tag);
     normalize_end_thinking_boundary(&mut content, markers, markdown);
     content
@@ -964,9 +962,7 @@ fn thinking_fold_hidden_count(fold: &super::state::ThinkingFoldState) -> usize {
         .saturating_sub(fold.max_visible_lines)
 }
 
-fn thinking_fold_visible_lines(
-    fold: &super::state::ThinkingFoldState,
-) -> Vec<&str> {
+fn thinking_fold_visible_lines(fold: &super::state::ThinkingFoldState) -> Vec<&str> {
     let current_line = usize::from(!fold.current_line.is_empty());
     let visible_completed = fold.max_visible_lines.saturating_sub(current_line);
     let completed_skip = fold.recent_lines.len().saturating_sub(visible_completed);
@@ -982,9 +978,7 @@ fn thinking_fold_visible_lines(
     visible
 }
 
-fn render_thinking_fold_window(
-    fold: &super::state::ThinkingFoldState,
-) -> (String, usize) {
+fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState) -> (String, usize) {
     let hidden_count = thinking_fold_hidden_count(fold);
     let visible_lines = thinking_fold_visible_lines(fold);
     if !fold.active && hidden_count == 0 && visible_lines.is_empty() {
@@ -1057,20 +1051,17 @@ fn process_stream_payload(
     event_type: Option<&str>,
     payload: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    let (chunk, merge_mode) =
-        match normalize::parse_stream_payload(adapter, payload, event_type) {
-            super::state::ParsedStreamPayload::Ignore => return Ok(false),
-            super::state::ParsedStreamPayload::Done => return Ok(true),
-            super::state::ParsedStreamPayload::Error(msg) => {
-                return Err(format!("provider stream error: {msg}").into());
-            }
-            super::state::ParsedStreamPayload::Chunk(chunk) => {
-                (chunk, StreamEventMergeMode::Append)
-            }
-            super::state::ParsedStreamPayload::SnapshotChunk(chunk) => {
-                (chunk, StreamEventMergeMode::AppendMissingSuffix)
-            }
-        };
+    let (chunk, merge_mode) = match normalize::parse_stream_payload(adapter, payload, event_type) {
+        super::state::ParsedStreamPayload::Ignore => return Ok(false),
+        super::state::ParsedStreamPayload::Done => return Ok(true),
+        super::state::ParsedStreamPayload::Error(msg) => {
+            return Err(format!("provider stream error: {msg}").into());
+        }
+        super::state::ParsedStreamPayload::Chunk(chunk) => (chunk, StreamEventMergeMode::Append),
+        super::state::ParsedStreamPayload::SnapshotChunk(chunk) => {
+            (chunk, StreamEventMergeMode::AppendMissingSuffix)
+        }
+    };
 
     // AIOS: capture usage block from whichever chunk carries it. OpenAI emits
     // the final `usage` on a chunk with `choices: []`, so we must pull it *before*

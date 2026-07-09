@@ -112,7 +112,11 @@ pub(super) fn stop_background(session_id: &str) -> Result<(), Box<dyn std::error
 
     let pid_str = std::fs::read_to_string(&pid_path)?;
     let pid: libc::pid_t = pid_str.trim().parse().map_err(|_| {
-        format!("PID 文件 {} 内容异常: {}", pid_path.display(), pid_str.trim())
+        format!(
+            "PID 文件 {} 内容异常: {}",
+            pid_path.display(),
+            pid_str.trim()
+        )
     })?;
 
     // 如果进程已不存在，清理 pid 文件并优雅退出。

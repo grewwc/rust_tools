@@ -9,18 +9,21 @@ use super::types::{
 };
 
 mod text_utils;
-mod tool_overflow;
 mod tool_groups;
+mod tool_overflow;
 
 use text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
-use tool_groups::{first_tool_call_group, first_trim_candidate, fold_early_tool_groups, fold_tool_call_group_to_stub, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS};
-use tool_overflow::{
-    build_persisted_summary_text, build_persisted_summary_text_with_app,
-    is_non_compressible_tool, prepare_tool_messages_structured,
-    spill_oversized_preserved_messages, tool_line_signature, try_spill_preserved_message_to_stub,
+use tool_groups::{
+    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, first_tool_call_group, first_trim_candidate,
+    fold_early_tool_groups, fold_tool_call_group_to_stub,
 };
 #[cfg(test)]
 use tool_overflow::normalize_internal_notes_for_summary_model;
+use tool_overflow::{
+    build_persisted_summary_text, build_persisted_summary_text_with_app, is_non_compressible_tool,
+    prepare_tool_messages_structured, spill_oversized_preserved_messages, tool_line_signature,
+    try_spill_preserved_message_to_stub,
+};
 
 const PERSISTED_HISTORY_KEEP_RECENT_TURNS: usize = 160;
 /// 压缩兜底（first_trim_candidate）时保护最近 user 起始尾窗的动态上下限。
@@ -789,12 +792,7 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
     // 在 best（Path A 结果或原始 messages）上链式折叠：已折叠的组变成 stub
     //（internal_note），不会被 fold_early_tool_groups 再次匹配，因此每次迭代
     // 只会折叠上一轮保留的组，逐步释放保护尾窗。
-    for &keep_recent in &[
-        MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS,
-        2,
-        1,
-        0,
-    ] {
+    for &keep_recent in &[MID_TURN_LLM_SUMMARY_KEEP_RECENT_TOOL_GROUPS, 2, 1, 0] {
         if best_after <= hard_target {
             break;
         }
@@ -828,7 +826,12 @@ pub(in crate::ai) async fn mid_turn_llm_summarize(
         let capped = cap_oversized_non_system_messages(current, PATH_C_PER_MSG_CAP);
         let after = messages_total_chars(&capped);
         let savings = before.saturating_sub(after);
-        return (capped, before, after, savings >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS);
+        return (
+            capped,
+            before,
+            after,
+            savings >= MIN_EFFECTIVE_LLM_SUMMARY_SAVINGS,
+        );
     }
 
     // 所有路径均未达到有效压缩：返回最佳结果，did_summarize=false

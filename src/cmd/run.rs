@@ -503,7 +503,13 @@ where
     let deadline = Instant::now() + timeout;
     let status = loop {
         while let Ok((kind, chunk)) = rx.try_recv() {
-            accumulate_chunk(kind, &chunk, &mut stdout_buf, &mut stderr_buf, &mut on_chunk);
+            accumulate_chunk(
+                kind,
+                &chunk,
+                &mut stdout_buf,
+                &mut stderr_buf,
+                &mut on_chunk,
+            );
         }
 
         match child.try_wait() {
@@ -536,9 +542,13 @@ where
                     return Err(io::Error::new(io::ErrorKind::TimedOut, "timeout"));
                 }
                 match rx.recv_timeout(Duration::from_millis(20)) {
-                    Ok((kind, chunk)) => {
-                        accumulate_chunk(kind, &chunk, &mut stdout_buf, &mut stderr_buf, &mut on_chunk)
-                    }
+                    Ok((kind, chunk)) => accumulate_chunk(
+                        kind,
+                        &chunk,
+                        &mut stdout_buf,
+                        &mut stderr_buf,
+                        &mut on_chunk,
+                    ),
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => {}
                 }

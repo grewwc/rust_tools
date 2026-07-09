@@ -145,10 +145,7 @@ pub(super) fn read_line_with_timeout_buf<R: std::io::Read>(
                 if now >= deadline {
                     return Err(format!("MCP response timeout after {} ms", timeout_ms));
                 }
-                let remaining = deadline
-                    .saturating_duration_since(now)
-                    .as_millis()
-                    .max(1) as u64;
+                let remaining = deadline.saturating_duration_since(now).as_millis().max(1) as u64;
                 wait_fd_readable(fd, remaining)?;
             }
             Err(e) => {

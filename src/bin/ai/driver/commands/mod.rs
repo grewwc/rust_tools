@@ -1,7 +1,7 @@
 pub mod agent;
 pub mod checkpoint;
-pub mod goal;
 pub mod feishu;
+pub mod goal;
 pub mod help;
 pub mod model;
 pub mod persona;
@@ -17,8 +17,8 @@ use crate::ai::{agents::AgentManifest, mcp::SharedMcpClient, skills::SkillManife
 
 pub use agent::try_handle_agent_command;
 pub use checkpoint::try_handle_checkpoint_command;
-pub use goal::try_handle_goal_command;
 pub use feishu::try_handle_feishu_auth_command;
+pub use goal::try_handle_goal_command;
 pub use help::try_handle_help_command;
 pub use model::try_handle_model_command;
 pub use persona::try_handle_persona_command;

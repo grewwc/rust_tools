@@ -1349,8 +1349,7 @@ pub(crate) fn execute_memory_save(args: &Value) -> Result<String, String> {
 mod tests {
     use super::{
         execute_memory_delete, execute_memory_list_json, execute_memory_save,
-        execute_memory_update, is_memory_visible_to,
-        update_memo_entry,
+        execute_memory_update, is_memory_visible_to, update_memo_entry,
     };
     use crate::ai::test_support::ENV_LOCK;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;

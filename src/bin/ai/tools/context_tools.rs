@@ -60,7 +60,7 @@ pub(crate) fn execute_compact_context(args: &Value) -> Result<String, String> {
     }
 
     Ok(format!(
-       "Context compaction is handled automatically by the runtime when the token budget is exceeded. \
+        "Context compaction is handled automatically by the runtime when the token budget is exceeded. \
         Manual compaction parameters (keep_recent_turns={}, summary_max_chars={}) are noted but \
         not applied — the runtime uses its own mid-turn summarization strategy. \
         To reduce context usage, try ending the session and starting a new one, or avoid repeating \

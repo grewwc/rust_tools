@@ -40,14 +40,13 @@ impl McpServerConnection {
         self.read_response_line_with_timeout(self.request_timeout_ms)
     }
 
-    pub(super) fn read_response_line_with_timeout(&mut self, timeout_ms: u64) -> Result<String, String> {
+    pub(super) fn read_response_line_with_timeout(
+        &mut self,
+        timeout_ms: u64,
+    ) -> Result<String, String> {
         let mut response_line = String::new();
-        read_line_with_timeout_process(
-            &mut self.stdout,
-            timeout_ms,
-            &mut response_line,
-        )
-        .map_err(|err| self.decorate_transport_error(err))?;
+        read_line_with_timeout_process(&mut self.stdout, timeout_ms, &mut response_line)
+            .map_err(|err| self.decorate_transport_error(err))?;
         Ok(response_line)
     }
 

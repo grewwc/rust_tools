@@ -24,8 +24,14 @@ pub(super) fn classify_file_reference(parsed: &mut FileParseResult, raw: &str) {
         return;
     }
     if parsed.text_files.iter().any(|candidate| candidate == &file)
-        || parsed.image_files.iter().any(|candidate| candidate == &file)
-        || parsed.binary_files.iter().any(|candidate| candidate == &file)
+        || parsed
+            .image_files
+            .iter()
+            .any(|candidate| candidate == &file)
+        || parsed
+            .binary_files
+            .iter()
+            .any(|candidate| candidate == &file)
     {
         return;
     }
@@ -158,14 +164,8 @@ mod tests {
         ])
         .unwrap();
 
-        assert!(rendered.contains(&format!(
-            "[Attached text file: {}]",
-            first.display()
-        )));
-        assert!(rendered.contains(&format!(
-            "[Attached text file: {}]",
-            second.display()
-        )));
+        assert!(rendered.contains(&format!("[Attached text file: {}]", first.display())));
+        assert!(rendered.contains(&format!("[Attached text file: {}]", second.display())));
         assert!(rendered.contains("[/Attached text file]"));
 
         let _ = fs::remove_file(first);
@@ -183,7 +183,10 @@ mod tests {
 
         let rendered = render_text_attachment_block(path.to_string_lossy().as_ref()).unwrap();
 
-        assert!(rendered.contains("Attachment preview only"), "rendered: {rendered}");
+        assert!(
+            rendered.contains("Attachment preview only"),
+            "rendered: {rendered}"
+        );
         assert!(rendered.contains("read_file_lines"), "rendered: {rendered}");
         assert!(rendered.contains("Symbol outline"), "rendered: {rendered}");
 

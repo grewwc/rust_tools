@@ -64,6 +64,7 @@ impl Clone for App {
             last_known_prompt_tokens: self.last_known_prompt_tokens,
             goal_mode: self.goal_mode.clone(),
             last_turn_had_tool_calls: self.last_turn_had_tool_calls,
+            last_turn_interrupted: self.last_turn_interrupted,
         }
     }
 }
@@ -111,6 +112,11 @@ pub(super) struct App {
     /// 上一轮 turn 是否调用了工具。goal 模式下用于判定目标是否完成：
     /// 若一轮结束时未调用任何工具，视为 agent 已交付最终结果。
     pub(super) last_turn_had_tool_calls: bool,
+    /// 上一轮 turn 是否被 Ctrl+C 打断。打断与「自然无工具完成」都会把
+    /// `last_turn_had_tool_calls` 置 false，但语义相反：前者不代表目标达成。
+    /// goal 模式据此区分——被打断时保留 goal_mode 并回落到等待用户输入，
+    /// 不打印「Goal achieved」误导信息。
+    pub(super) last_turn_interrupted: bool,
 }
 
 impl App {

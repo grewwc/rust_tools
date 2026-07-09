@@ -9,9 +9,7 @@ use serde_json::Value;
 use super::super::types::{Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start};
 use super::text_utils::truncate_to_chars;
 use super::tool_overflow::{is_non_compressible_tool, is_preserved_user_or_image_stub};
-use super::{
-    keep_recent_user_turns_when_trimming, normalize_whitespace, value_to_string,
-};
+use super::{keep_recent_user_turns_when_trimming, normalize_whitespace, value_to_string};
 
 pub(super) fn first_tool_call_group(messages: &[Message]) -> Option<Vec<usize>> {
     let assistant_idx = messages.iter().position(|m| {
@@ -113,7 +111,10 @@ pub(super) fn first_trim_candidate(messages: &[Message]) -> Option<usize> {
 /// 渐进式卸载：把一个 (assistant tool_calls + 配套 tool 结果) 整组折叠成单条
 /// `internal_note`，保留"工具列表 + 每个工具结果首句"，便于后续轮次知道
 /// 之前发生过什么、避免重复劳动；同时大幅压缩 token 占用。
-pub(super) fn fold_tool_call_group_to_stub(messages: &[Message], group: &[usize]) -> Option<Message> {
+pub(super) fn fold_tool_call_group_to_stub(
+    messages: &[Message],
+    group: &[usize],
+) -> Option<Message> {
     if group.is_empty() {
         return None;
     }

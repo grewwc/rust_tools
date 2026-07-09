@@ -12,19 +12,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
 
+use super::ToolExecutionObserver;
+use crate::ai::tools::os_tools::GLOBAL_OS;
+use crate::ai::tools::task_tools::{
+    WaitManySource, append_current_process_cancel_source, wait_sources_for_channel_and_futex,
+};
+use crate::ai::types::ToolCall;
+use aios_kernel::kernel::EventId;
+use aios_kernel::kernel::WaitPolicy;
+use aios_kernel::primitives::{ChannelId, ChannelOwnerTag, FutexAddr};
 use rust_tools::cw::SkipMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use aios_kernel::primitives::{ChannelId, ChannelOwnerTag, FutexAddr};
-use aios_kernel::kernel::EventId;
-use super::ToolExecutionObserver;
-use crate::ai::tools::os_tools::GLOBAL_OS;
-use aios_kernel::kernel::WaitPolicy;
-use crate::ai::tools::task_tools::{
-    WaitManySource, append_current_process_cancel_source,
-    wait_sources_for_channel_and_futex,
-};
-use crate::ai::types::ToolCall;
 
 use super::{RunOneResult, ToolRoute};
 
@@ -182,7 +181,10 @@ pub(super) fn async_tool_event_id(entry: &AsyncToolEntry) -> Option<EventId> {
     os.channel_event_id(ChannelId(channel_id))
 }
 
-pub(super) fn async_tool_snapshot_from_entry(task_id: &str, entry: &AsyncToolEntry) -> AsyncToolSnapshot {
+pub(super) fn async_tool_snapshot_from_entry(
+    task_id: &str,
+    entry: &AsyncToolEntry,
+) -> AsyncToolSnapshot {
     let event_id = async_tool_event_id(entry)
         .map(|id| id.to_string())
         .unwrap_or_else(|| "evt_unavailable".to_string());
@@ -380,7 +382,9 @@ pub(super) fn drain_async_tool_pipe_messages(entry: &AsyncToolEntry) -> Vec<Asyn
     parse_async_tool_pipe_messages(&payloads)
 }
 
-pub(super) fn aggregate_async_tool_pipe_messages(messages: &[AsyncToolPipeMessage]) -> AsyncToolPipeAggregate {
+pub(super) fn aggregate_async_tool_pipe_messages(
+    messages: &[AsyncToolPipeMessage],
+) -> AsyncToolPipeAggregate {
     let mut agg = AsyncToolPipeAggregate::default();
     for msg in messages {
         match msg.kind {

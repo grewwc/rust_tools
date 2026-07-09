@@ -14,13 +14,11 @@ use crate::ai::history::Message;
 use crate::ai::types::App;
 use crate::commonw::configw;
 
-use super::{
-    SkillManifest, build_request_body,
-};
 use super::error::{
     api_key_for_request_model, apply_request_auth, control_model_for_aux_tasks,
     endpoint_for_request_model,
 };
+use super::{SkillManifest, build_request_body};
 
 pub(crate) fn strip_json_fence(s: &str) -> &str {
     let trimmed = s.trim();
@@ -146,8 +144,8 @@ Skills:
         None,
         None,
         None,
-       None,
-       None,
+        None,
+        None,
     );
 
     let endpoint = endpoint_for_request_model(app, &control_model);

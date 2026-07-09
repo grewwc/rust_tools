@@ -36,7 +36,10 @@ impl SessionPidGuard {
         match fs::write(&path, pid.to_string()) {
             Ok(()) => Self { path: Some(path) },
             Err(err) => {
-                eprintln!("[Warning] 无法写入 session PID 文件 ({}): {err}", path.display());
+                eprintln!(
+                    "[Warning] 无法写入 session PID 文件 ({}): {err}",
+                    path.display()
+                );
                 Self { path: None }
             }
         }
@@ -88,7 +91,8 @@ fn dir_has_sqlite_files(dir: &std::path::Path) -> bool {
     let Ok(entries) = fs::read_dir(dir) else {
         return false;
     };
-    entries.flatten()
+    entries
+        .flatten()
         .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("sqlite"))
 }
 
@@ -173,9 +177,7 @@ pub(in crate::ai) fn scan_all_session_pids(
 /// 对于空闲等待输入的旧版本 session，此方法可能漏报。
 ///
 /// 返回 (session_id, pid) 列表，已按 session_id 去重。
-pub(in crate::ai) fn discover_lsof_sessions(
-    sessions_root: &std::path::Path,
-) -> Vec<(String, i32)> {
+pub(in crate::ai) fn discover_lsof_sessions(sessions_root: &std::path::Path) -> Vec<(String, i32)> {
     // 扫描基目录（覆盖所有 persona / config 的 sessions 目录）
     let base = resolve_sessions_base(sessions_root);
     discover_lsof_in_dir(&base)
@@ -295,14 +297,18 @@ mod tests {
 
     #[test]
     fn guard_writes_and_removes_pid_file() {
-        let dir = std::env::temp_dir().join(format!("rust-tools-pid-guard-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("rust-tools-pid-guard-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
         let sid = "test-session-001";
 
         {
             let _guard = SessionPidGuard::register(&dir, sid);
             let pid_path = dir.join(format!("{sid}.pid"));
-            assert!(pid_path.exists(), "PID file should exist while guard is alive");
+            assert!(
+                pid_path.exists(),
+                "PID file should exist while guard is alive"
+            );
             let content = fs::read_to_string(&pid_path).unwrap();
             let pid: i32 = content.trim().parse().unwrap();
             assert_eq!(pid as u32, std::process::id());
@@ -317,7 +323,8 @@ mod tests {
 
     #[test]
     fn scan_finds_registered_pids() {
-        let dir = std::env::temp_dir().join(format!("rust-tools-pid-scan-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("rust-tools-pid-scan-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
 
         let _g1 = SessionPidGuard::register(&dir, "session-a");
@@ -341,10 +348,8 @@ mod tests {
     #[test]
     fn scan_all_finds_pids_across_subdirectories() {
         // 模拟真实布局：base/ 下有 .pid 文件，base/persona.sessions/ 下也有 .pid 文件
-        let base = std::env::temp_dir().join(format!(
-            "rust-tools-pid-scanall-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("rust-tools-pid-scanall-{}", uuid::Uuid::new_v4()));
         let sub = base.join("persona-x.sessions");
         fs::create_dir_all(&sub).unwrap();
 
@@ -356,7 +361,10 @@ mod tests {
         // 从子目录视角调用 scan_all_session_pids，应发现两个目录的 PID 文件
         let results = scan_all_session_pids(&sub).unwrap();
         let ids: Vec<&str> = results.iter().map(|(id, _, _)| id.as_str()).collect();
-        assert!(ids.contains(&"session-top"), "should find PID in parent dir");
+        assert!(
+            ids.contains(&"session-top"),
+            "should find PID in parent dir"
+        );
         assert!(ids.contains(&"session-sub"), "should find PID in sub dir");
 
         let _ = fs::remove_dir_all(&base);
@@ -364,17 +372,18 @@ mod tests {
 
     #[test]
     fn resolve_sessions_base_finds_parent() {
-        let base = std::env::temp_dir().join(format!(
-            "rust-tools-pid-base-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("rust-tools-pid-base-{}", uuid::Uuid::new_v4()));
         let sub = base.join("persona.sessions");
         fs::create_dir_all(&sub).unwrap();
         // 在 base 放一个 .sqlite 文件，让 dir_has_sqlite_files 返回 true
         fs::write(base.join("dummy.sqlite"), "").unwrap();
 
         let resolved = resolve_sessions_base(&sub);
-        assert_eq!(resolved, base, "should resolve to parent when sub has no .sessions subdirs");
+        assert_eq!(
+            resolved, base,
+            "should resolve to parent when sub has no .sessions subdirs"
+        );
 
         let _ = fs::remove_dir_all(&base);
     }

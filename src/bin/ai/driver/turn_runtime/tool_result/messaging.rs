@@ -8,9 +8,7 @@ use crate::ai::{
         CodeDiscoveryRecord, classify_finding, confidence_label, kind_label, persistence_limit,
         priority_for_confidence, render_record, should_persist,
     },
-    driver::{
-        tools::ExecuteToolCallsResult,
-    },
+    driver::tools::ExecuteToolCallsResult,
     history::{Message, ROLE_INTERNAL_NOTE, is_system_like_role},
     types::App,
     types::ToolCall,

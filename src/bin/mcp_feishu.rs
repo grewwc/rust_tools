@@ -7352,7 +7352,10 @@ mod tests {
 
             let path = token_store_path();
             let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "token store must be owner-only readable/writable");
+            assert_eq!(
+                mode, 0o600,
+                "token store must be owner-only readable/writable"
+            );
 
             // 重写覆盖不应损坏文件，且仍保持 0o600。
             save_token_store(&TokenStore {
@@ -7497,7 +7500,11 @@ mod tests {
             json!({ "block_id": "blk_3", "block_type": 15, "quote": {}, "children": ["blk_4"] }),
             json!({ "block_id": "blk_4", "block_type": 2, "text": { "elements": [] }, "children": [] }),
         ];
-        let enriched = inject_descendant_parent_ids(&descendants, &["blk_1".to_string(), "blk_3".to_string()], "doc789");
+        let enriched = inject_descendant_parent_ids(
+            &descendants,
+            &["blk_1".to_string(), "blk_3".to_string()],
+            "doc789",
+        );
         assert_eq!(enriched[0]["parent_id"], "doc789");
         assert_eq!(enriched[1]["parent_id"], "blk_1");
         assert_eq!(enriched[2]["parent_id"], "doc789");

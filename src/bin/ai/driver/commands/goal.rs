@@ -28,6 +28,20 @@ pub(crate) fn build_goal_continuation_prompt(goal: &str) -> String {
     )
 }
 
+/// goal 模式在「本轮未触发 continuation」时的收尾决策。
+///
+/// run_loop 每轮开始时，若 goal 已设定且上一轮调用过工具，会注入 continuation
+/// prompt 继续推进（不进入本函数）。否则由本函数判定：上一轮无工具调用意味着
+/// 要么 agent 已交付最终结果（目标达成），要么本轮被 Ctrl+C 打断。二者都会把
+/// `had_tool_calls` 置 false，但语义相反——打断不代表达成，必须保留 goal 模式。
+pub(crate) fn should_exit_goal_on_idle(
+    goal_active: bool,
+    one_shot_mode: bool,
+    interrupted: bool,
+) -> bool {
+    goal_active && !one_shot_mode && !interrupted
+}
+
 /// 处理 `/goal` 交互式命令。
 ///
 /// 用法：
@@ -50,15 +64,10 @@ pub fn try_handle_goal_command(
     if rest.eq_ignore_ascii_case("status") {
         match &app.goal_mode {
             None => println!("Goal mode: {}", "off".dimmed()),
-            Some(g) if g.is_empty() => println!(
-                "Goal mode: {} (waiting for goal input)",
-                "pending".yellow()
-            ),
-            Some(g) => println!(
-                "Goal mode: {}\n  Goal: {}",
-                "active".green().bold(),
-                g
-            ),
+            Some(g) if g.is_empty() => {
+                println!("Goal mode: {} (waiting for goal input)", "pending".yellow())
+            }
+            Some(g) => println!("Goal mode: {}\n  Goal: {}", "active".green().bold(), g),
         }
         return Ok(true);
     }
@@ -154,6 +163,7 @@ mod tests {
             last_known_prompt_tokens: None,
             goal_mode: None,
             last_turn_had_tool_calls: false,
+            last_turn_interrupted: false,
         }
     }
 
@@ -179,7 +189,12 @@ mod tests {
         assert!(try_handle_goal_command(&mut app, "/goal refactor the auth module").unwrap());
         assert_eq!(app.goal_mode.as_deref(), Some("refactor the auth module"));
         assert!(app.forced_question.is_some());
-        assert!(app.forced_question.as_ref().unwrap().contains("refactor the auth module"));
+        assert!(
+            app.forced_question
+                .as_ref()
+                .unwrap()
+                .contains("refactor the auth module")
+        );
     }
 
     #[test]
@@ -232,5 +247,17 @@ mod tests {
         let prompt = build_goal_continuation_prompt("test goal");
         assert!(prompt.contains("test goal"));
         assert!(prompt.contains("GOAL MODE"));
+    }
+
+    #[test]
+    fn idle_goal_exits_only_on_natural_completion() {
+        // 自然完成（未打断）→ 退出 goal 模式并提示。
+        assert!(should_exit_goal_on_idle(true, false, false));
+        // 被 Ctrl+C 打断 → 保留 goal 模式，不误报达成。
+        assert!(!should_exit_goal_on_idle(true, false, true));
+        // goal 未激活 → 无操作。
+        assert!(!should_exit_goal_on_idle(false, false, false));
+        // one-shot 模式 → 不管理 goal 生命周期。
+        assert!(!should_exit_goal_on_idle(true, true, false));
     }
 }

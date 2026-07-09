@@ -167,7 +167,11 @@ fn register_cli_flags(parser: &mut TermParser) {
     parser.alias("ns", "note-search");
     parser.alias("h", "help");
 
-    parser.add_string("stop", "", "stop a background session by session id (e.g. a --stop <sessionid>)");
+    parser.add_string(
+        "stop",
+        "",
+        "stop a background session by session id (e.g. a --stop <sessionid>)",
+    );
     parser.add_string("model", "", "model name");
     parser.alias("m", "model");
     parser.add_string("agent", "", "agent name");
@@ -316,7 +320,7 @@ impl Default for ParsedCli {
             interactive: false,
             reasoning_effort_override: None,
             thinking_disabled_override: false,
-           max_tokens_override: None,
+            max_tokens_override: None,
             note_search: false,
             note: None,
             note_flag: false,
@@ -480,8 +484,12 @@ pub(super) fn print_help() {
     println!("  -n, --note <text>        save text as memo to knowledge base and exit");
     println!("  -ns, --note-search       search memo category using the positional prompt");
     println!("  -i, --interactive        keep the session open for follow-up questions");
-    println!("  -bg, --background [task]  run in background: detach from terminal, log to <sessionid>.log; without a task, prompts for multi-line input");
-    println!("  --stop <session-id>      stop a background session (reads <sessionid>.pid, sends SIGTERM)");
+    println!(
+        "  -bg, --background [task]  run in background: detach from terminal, log to <sessionid>.log; without a task, prompts for multi-line input"
+    );
+    println!(
+        "  --stop <session-id>      stop a background session (reads <sessionid>.pid, sends SIGTERM)"
+    );
     println!();
     parser.print_defaults();
     println!();
@@ -543,7 +551,9 @@ pub(super) fn print_help() {
     println!("    /sessions current         show current session info");
     println!("    /sessions new             create and switch to new session");
     println!("    /sessions use <id>        switch to specified session");
-    println!("    /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)");
+    println!(
+        "    /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)"
+    );
     println!("    /sessions bound           list suspended sessions bound to current terminal");
     println!("    /sessions delete <id> [more...]     delete one or more sessions");
     println!("    /sessions clear-bound     clear suspended sessions bound to current terminal");
@@ -552,7 +562,9 @@ pub(super) fn print_help() {
     println!("    /sessions export <id> [output.md]       export session to Markdown");
     println!("    /sessions export-current [output.md]    export current session to Markdown");
     println!("    /sessions export-last [output.md]       export latest session to Markdown");
-    println!("    /sessions export-archive <id> [output.zip]       full session archive for migration");
+    println!(
+        "    /sessions export-archive <id> [output.zip]       full session archive for migration"
+    );
     println!("    /sessions export-archive-current [output.zip]    archive current session");
     println!("    /sessions export-archive-last [output.zip]       archive latest session");
     println!("    /sessions import <file.zip> [as=<id>]           import session from archive");
@@ -935,22 +947,30 @@ mod tests {
     fn parse_cli_args_reads_background_flag() {
         // 长格式 --background
         let cli = super::parse_cli_args(
-            ["a".to_string(), "fix the bug".to_string(), "--background".to_string()].into_iter(),
+            [
+                "a".to_string(),
+                "fix the bug".to_string(),
+                "--background".to_string(),
+            ]
+            .into_iter(),
         );
         assert!(cli.background);
         assert_eq!(cli.args, vec!["fix the bug".to_string()]);
 
         // 短别名 -bg
         let cli = super::parse_cli_args(
-            ["a".to_string(), "fix the bug".to_string(), "-bg".to_string()].into_iter(),
+            [
+                "a".to_string(),
+                "fix the bug".to_string(),
+                "-bg".to_string(),
+            ]
+            .into_iter(),
         );
         assert!(cli.background);
         assert_eq!(cli.args, vec!["fix the bug".to_string()]);
 
         // 不带 -bg 时默认 false
-        let cli = super::parse_cli_args(
-            ["a".to_string(), "fix the bug".to_string()].into_iter(),
-        );
+        let cli = super::parse_cli_args(["a".to_string(), "fix the bug".to_string()].into_iter());
         assert!(!cli.background);
     }
 

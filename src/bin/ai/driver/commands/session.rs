@@ -135,8 +135,12 @@ pub fn try_handle_session_command(
             println!("  /sessions current         show current session info");
             println!("  /sessions new             create and switch to new session");
             println!("  /sessions use <id>        switch to specified session");
-            println!("  /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)");
-            println!("  /close                    close and delete current session, then exit (or :close)");
+            println!(
+                "  /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)"
+            );
+            println!(
+                "  /close                    close and delete current session, then exit (or :close)"
+            );
             println!(
                 "  /sessions bound           list suspended sessions bound to current terminal"
             );
@@ -153,10 +157,14 @@ pub fn try_handle_session_command(
                 "  /sessions export-current [output.md]    export current session to Markdown"
             );
             println!("  /sessions export-last [output.md]       export latest session to Markdown");
-            println!("  /sessions export-archive <id> [output.zip]       full session archive for migration");
+            println!(
+                "  /sessions export-archive <id> [output.zip]       full session archive for migration"
+            );
             println!("  /sessions export-archive-current [output.zip]    archive current session");
             println!("  /sessions export-archive-last [output.zip]       archive latest session");
-            println!("  /sessions import <file.zip> [as=<id>]           import session from archive");
+            println!(
+                "  /sessions import <file.zip> [as=<id>]           import session from archive"
+            );
             println!("  /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
             println!("  /sessions branch <keep_messages> [src=<id>] [as=<id>]");
             println!(
@@ -308,9 +316,7 @@ pub fn try_handle_session_command(
                 }
             }
             if ids.len() > 1 {
-                println!(
-                    "Summary: {deleted_count} deleted, {not_found_count} not found."
-                );
+                println!("Summary: {deleted_count} deleted, {not_found_count} not found.");
             }
             if deleted_current {
                 clear_session_local_runtime_state(app);
@@ -420,11 +426,7 @@ pub fn try_handle_session_command(
 
             match store.export_session_archive(id, output_path) {
                 Ok(()) => {
-                    println!(
-                        "Archived session '{}' to '{}'",
-                        id,
-                        output_path.display()
-                    );
+                    println!("Archived session '{}' to '{}'", id, output_path.display());
                 }
                 Err(err) => {
                     eprintln!("Failed to export archive: {}", err);
@@ -494,7 +496,10 @@ pub fn try_handle_session_command(
                     app.session_id = id.clone();
                     app.session_history_file = store.session_history_file(&id);
                     app.sync_persona_session_binding();
-                    println!("Imported session from '{}' -> '{}', switched to it.", file, id);
+                    println!(
+                        "Imported session from '{}' -> '{}', switched to it.",
+                        file, id
+                    );
                 }
                 Err(err) => {
                     eprintln!("Failed to import session: {}", err);
@@ -734,6 +739,7 @@ mod tests {
             last_known_prompt_tokens: None,
             goal_mode: None,
             last_turn_had_tool_calls: false,
+            last_turn_interrupted: false,
         }
     }
 
@@ -862,7 +868,13 @@ mod tests {
             )
             .unwrap();
         SuspendedSessionStore::new()
-            .save_for_terminal_key("terminal:term-bound", "sess-2", &other_history, "reviewer", "other-model")
+            .save_for_terminal_key(
+                "terminal:term-bound",
+                "sess-2",
+                &other_history,
+                "reviewer",
+                "other-model",
+            )
             .unwrap();
 
         assert!(try_handle_session_command(&mut app, "/sessions bound").unwrap());

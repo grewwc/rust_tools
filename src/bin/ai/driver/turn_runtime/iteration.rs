@@ -195,6 +195,9 @@ fn finish_interrupted_turn(
     // （例如 shutdown/request-level interrupt）的全局中断位。
     let _ = crate::ai::types::take_stream_cancelled(app);
     app.ignore_next_prompt_interrupt = true;
+    // 标记本轮被打断：run_loop 的 goal 续推逻辑据此区分「打断」与「自然完成」，
+    // 打断时保留 goal_mode 并回落到等待用户输入，不误报「Goal achieved」。
+    app.last_turn_interrupted = true;
     persist_pending_turn_messages(app, one_shot_mode, turn_messages, persisted_turn_messages);
     println!("\nInterrupted.");
     continue_or_quit(should_quit)
@@ -378,8 +381,7 @@ async fn request_model_response(
         }
         // 无论成功与否都写入游标（见 static 注释）。失败时也记录，避免
         // 结构上无法压缩时每轮空转重试；MIN_GROWTH 保证真正增长后再次尝试。
-        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS
-            .store(llm_after, std::sync::atomic::Ordering::Relaxed);
+        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(llm_after, std::sync::atomic::Ordering::Relaxed);
     }
 
     let mut actual_model = next_model.to_string();
@@ -633,12 +635,7 @@ pub(super) async fn execute_turn_iteration(
                             should_quit,
                         ));
                     }
-                    if request::sleep_with_cancel(
-                        app,
-                        request::retry_delay(stream_attempt),
-                    )
-                    .await
-                    {
+                    if request::sleep_with_cancel(app, request::retry_delay(stream_attempt)).await {
                         return Ok(interrupted_iteration_execution(
                             app,
                             one_shot_mode,
@@ -658,15 +655,13 @@ pub(super) async fn execute_turn_iteration(
                             if crate::ai::driver::runtime_ctx::has_subagent_result_slot() {
                                 return Err(err_text.into());
                             }
-                            return Ok(IterationExecution::RequestFailed(
-                                handle_request_error(
-                                    app,
-                                    retry_err,
-                                    one_shot_mode,
-                                    turn_messages,
-                                    persisted_turn_messages,
-                                ),
-                            ));
+                            return Ok(IterationExecution::RequestFailed(handle_request_error(
+                                app,
+                                retry_err,
+                                one_shot_mode,
+                                turn_messages,
+                                persisted_turn_messages,
+                            )));
                         }
                     }
                     continue;
@@ -752,7 +747,10 @@ mod tests {
         LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(after_chars, Ordering::Relaxed);
         assert!(!should_try_pre_request_llm_summary(after_chars, threshold));
         // 增长 ≥ MIN_GROWTH(20K) 后才再次触发
-        assert!(should_try_pre_request_llm_summary(after_chars + 20_000, threshold));
+        assert!(should_try_pre_request_llm_summary(
+            after_chars + 20_000,
+            threshold
+        ));
 
         LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(230_000, Ordering::Relaxed);
         assert!(!should_try_pre_request_llm_summary(after_chars, threshold));

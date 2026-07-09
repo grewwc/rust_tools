@@ -127,7 +127,7 @@ fn parse_unified_hunks(patch: &str) -> Result<Vec<UnifiedHunk>, String> {
                     return Err(format!(
                         "invalid hunk line: every line in a hunk must start with ` ` (context), `-` (remove), or `+` (add), but got: {:?}",
                         l
-                    ))
+                    ));
                 }
             }
         }
@@ -346,9 +346,7 @@ enum MatchMode {
 /// 仅匹配 `digits + 分隔符` 模式，避免误剥真正的代码行。
 fn strip_line_number_prefix(s: &str) -> &str {
     let trimmed = s.trim_start();
-    let digits_end = trimmed
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(0);
+    let digits_end = trimmed.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
     if digits_end == 0 {
         return s;
     }
@@ -658,7 +656,11 @@ fn locate_hunk(
     let positions = all_hunk_match_positions(orig_lines, hunk, mode);
     let forward: Vec<usize> = positions.iter().copied().filter(|&p| p >= cursor).collect();
     if forward.len() > 1 {
-        let shown: Vec<String> = forward.iter().take(5).map(|p| (p + 1).to_string()).collect();
+        let shown: Vec<String> = forward
+            .iter()
+            .take(5)
+            .map(|p| (p + 1).to_string())
+            .collect();
         return Err(format!(
             "ambiguous patch: hunk context matches {} locations (1-based lines: {}{}). \
              Add more surrounding context lines to the hunk so it uniquely identifies the target.",
@@ -865,8 +867,8 @@ mod tests {
         // 模型常把空 context 行写成空字符串（无前导空格），apply_patch 应正常匹配。
         let original = "foo\n\nbar\n";
         let patch = "@@ -1,3 +1,3 @@\n foo\n\n-bar\n+baz\n";
-        let result = apply_unified_patch(original, patch)
-            .expect("empty context line should be tolerated");
+        let result =
+            apply_unified_patch(original, patch).expect("empty context line should be tolerated");
         assert_eq!(result, "foo\n\nbaz\n");
     }
 
@@ -875,8 +877,7 @@ mod tests {
         // CRLF patch：Add 行尾的 \r 不应写入文件内容。
         let original = "foo\nbar\n";
         let patch = "@@ -2,1 +2,1 @@\r\n-bar\r\n+baz\r\n";
-        let result = apply_unified_patch(original, patch)
-            .expect("CRLF patch should be tolerated");
+        let result = apply_unified_patch(original, patch).expect("CRLF patch should be tolerated");
         assert_eq!(result, "foo\nbaz\n");
     }
 
@@ -899,7 +900,11 @@ mod tests {
         let patch = "@@ -1,1 +1,1 @@\n-a\n+b\n\n@@ -5,1 +5,1 @@\n-c\n+d\n";
         let hunks = parse_unified_hunks(patch).expect("blank separator should be tolerated");
         assert_eq!(hunks.len(), 2);
-        assert_eq!(hunks[0].lines.len(), 2, "hunk1 should not swallow the blank separator");
+        assert_eq!(
+            hunks[0].lines.len(),
+            2,
+            "hunk1 should not swallow the blank separator"
+        );
     }
 
     #[test]
@@ -971,8 +976,14 @@ mod tests {
         let result = apply_unified_patch(&original, patch).unwrap_or_else(|err| {
             panic!("apply_patch should find unique match beyond ±50 radius, but got: {err}")
         });
-        assert!(result.contains("changed"), "result should contain changed line: {result}");
-        assert!(result.contains("after_target"), "result should preserve after_target: {result}");
+        assert!(
+            result.contains("changed"),
+            "result should contain changed line: {result}"
+        );
+        assert!(
+            result.contains("after_target"),
+            "result should preserve after_target: {result}"
+        );
         assert!(
             !result.contains("unique_target"),
             "result should not contain old line: {result}"
@@ -1070,7 +1081,10 @@ mod tests {
                 .expect("apply_patch should accept Update envelope without @@ header");
         });
 
-        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\ngamma\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "alpha\nchanged\ngamma\n"
+        );
         let _ = fs::remove_dir_all(base);
     }
     #[test]
@@ -1103,10 +1117,19 @@ mod tests {
         assert!(result.contains("changed_b"), "missing changed_b: {result}");
         assert!(result.contains("after_a"), "missing after_a: {result}");
         assert!(result.contains("after_b"), "missing after_b: {result}");
-        assert!(!result.contains("target_a"), "should not contain target_a: {result}");
-        assert!(!result.contains("target_b"), "should not contain target_b: {result}");
+        assert!(
+            !result.contains("target_a"),
+            "should not contain target_a: {result}"
+        );
+        assert!(
+            !result.contains("target_b"),
+            "should not contain target_b: {result}"
+        );
         // 中间填充行应保持不变
-        assert!(result.contains("filler0"), "filler0 should remain: {result}");
+        assert!(
+            result.contains("filler0"),
+            "filler0 should remain: {result}"
+        );
         assert!(result.contains("mid0"), "mid0 should remain: {result}");
     }
 
@@ -1256,7 +1279,10 @@ mod tests {
                 .expect("apply_patch should strip code fence around unified diff");
         });
 
-        assert_eq!(fs::read_to_string(&path).unwrap(), "line1\nchanged\nline3\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "line1\nchanged\nline3\n"
+        );
         let _ = fs::remove_dir_all(base);
     }
 
@@ -1280,7 +1306,10 @@ mod tests {
                 .expect("apply_patch should strip code fence around envelope");
         });
 
-        assert_eq!(fs::read_to_string(&path).unwrap(), "line1\nchanged\nline3\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "line1\nchanged\nline3\n"
+        );
         let _ = fs::remove_dir_all(base);
     }
 
@@ -1322,10 +1351,7 @@ mod tests {
         // patch 内容行存在但没有 hunk header，应给出比 "no hunks found" 更明确的错误。
         let err = parse_unified_hunks(" line1\n-line2\n+changed\n line3")
             .expect_err("patch without hunk header must error");
-        assert!(
-            err.contains("no hunk header found"),
-            "err was: {err}"
-        );
+        assert!(err.contains("no hunk header found"), "err was: {err}");
         assert!(err.contains("content lines"), "err was: {err}");
     }
 
@@ -1355,7 +1381,10 @@ mod tests {
                 .expect("envelope without header should locate unique match mid-file");
         });
 
-        assert_eq!(fs::read_to_string(&path).unwrap(), "filler\nalpha\nchanged\ngamma\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "filler\nalpha\nchanged\ngamma\n"
+        );
         let _ = fs::remove_dir_all(base);
     }
 
@@ -1383,7 +1412,10 @@ mod tests {
                 .expect("envelope with bare context line should be tolerated");
         });
 
-        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\ngamma\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "alpha\nchanged\ngamma\n"
+        );
         let _ = fs::remove_dir_all(base);
     }
 
@@ -1446,15 +1478,22 @@ mod tests {
         // （expected vs actual），而不是只给一句 "context mismatch"。
         let original = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n";
         // remove 块 6 行，其中 line4 被模型误写为 lineX
-        let patch = "@@ -2,6 +2,3 @@\n-line2\n-line3\n-lineX\n-line5\n-line6\n-line7\n+new2\n+new3\n";
+        let patch =
+            "@@ -2,6 +2,3 @@\n-line2\n-line3\n-lineX\n-line5\n-line6\n-line7\n+new2\n+new3\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("context mismatch"), "err was: {err}");
         // 应报告最佳匹配位置和匹配数
         assert!(err.contains("Best partial match"), "err was: {err}");
         assert!(err.contains("5/6 lines matched"), "err was: {err}");
         // 应精确指出不一致的行：期望 lineX 但实际是 line4
-        assert!(err.contains("lineX"), "err should mention wrong expected line: {err}");
-        assert!(err.contains("line4"), "err should mention actual file line: {err}");
+        assert!(
+            err.contains("lineX"),
+            "err should mention wrong expected line: {err}"
+        );
+        assert!(
+            err.contains("line4"),
+            "err should mention actual file line: {err}"
+        );
     }
 
     #[test]
@@ -1487,8 +1526,14 @@ mod tests {
         assert!(err.contains("Best partial match"), "err was: {err}");
         assert!(err.contains("2/3 lines matched"), "err was: {err}");
         // 应指出首行不匹配：期望 "wrong" 但实际是 "bbb"
-        assert!(err.contains("wrong"), "err should mention wrong expected line: {err}");
-        assert!(err.contains("bbb"), "err should mention actual file line: {err}");
+        assert!(
+            err.contains("wrong"),
+            "err should mention wrong expected line: {err}"
+        );
+        assert!(
+            err.contains("bbb"),
+            "err should mention actual file line: {err}"
+        );
     }
 
     // ── 规范 *** Begin Patch 信封：裸 @@ / @@ heading @@ 无行号 header ──
@@ -1507,8 +1552,7 @@ mod tests {
     fn parse_unified_hunks_accepts_at_header_with_heading() {
         // `@@ <上下文标题> @@` 也应被接受，标称行号视为 0（依赖全文件搜索定位）。
         let patch = "@@ fn foo() @@\n foo\n-bar\n+baz\n";
-        let hunks =
-            parse_unified_hunks(patch).expect("@@ heading @@ header should be accepted");
+        let hunks = parse_unified_hunks(patch).expect("@@ heading @@ header should be accepted");
         assert_eq!(hunks.len(), 1);
         assert_eq!(hunks[0].old_start, 0);
     }
@@ -1518,8 +1562,7 @@ mod tests {
         // 端到端：裸 @@ header 的 hunk 应能通过全文件搜索唯一定位并应用。
         let original = "alpha\nbeta\ngamma\n";
         let patch = "@@\n alpha\n-beta\n+changed\n";
-        let result =
-            apply_unified_patch(original, patch).expect("bare @@ hunk should apply");
+        let result = apply_unified_patch(original, patch).expect("bare @@ hunk should apply");
         assert_eq!(result, "alpha\nchanged\ngamma\n");
     }
 
@@ -1544,7 +1587,10 @@ mod tests {
                 .expect("envelope with bare @@ header should apply");
         });
 
-        assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nchanged\ngamma\n");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "alpha\nchanged\ngamma\n"
+        );
         let _ = fs::remove_dir_all(base);
     }
 }

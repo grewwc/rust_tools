@@ -13,9 +13,8 @@ use crate::ai::model_names;
 use aios_kernel::{ChannelId, FutexAddr};
 
 use super::{
-    InheritOptions, PreparedSubagentTask,
-    MAX_AGENT_TEAM_MEMBERS, prepare_subagent_task, remove_task_entry,
-    spawn_subagent_kernel_task, with_os_kernel,
+    InheritOptions, MAX_AGENT_TEAM_MEMBERS, PreparedSubagentTask, prepare_subagent_task,
+    remove_task_entry, spawn_subagent_kernel_task, with_os_kernel,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

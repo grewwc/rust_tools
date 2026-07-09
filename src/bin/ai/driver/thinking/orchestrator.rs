@@ -37,7 +37,7 @@ pub struct ThinkingOrchestrator {
     pub poisoned: bool,
     pub pending_suggested_tool_calls: Vec<crate::ai::driver::observer::SuggestedToolCall>,
     pub protocol_injected: bool,
-   pub stagnation_turns: usize,
+    pub stagnation_turns: usize,
 }
 
 #[cfg(not(test))]
@@ -65,7 +65,7 @@ impl ThinkingOrchestrator {
             poisoned: false,
             pending_suggested_tool_calls: Vec::new(),
             protocol_injected: false,
-           stagnation_turns: 0,
+            stagnation_turns: 0,
         }
     }
 
@@ -215,7 +215,7 @@ impl ThinkingOrchestrator {
         if text.contains("<meta:reset_thinking/>") || text.contains("<meta:reset_thinking />") {
             self.thought_tree = None;
             self.verification = None;
-           self.stagnation_turns = 0;
+            self.stagnation_turns = 0;
             self.active_modes.clear();
             self.current_tree_node_id = None;
         }
@@ -225,7 +225,7 @@ impl ThinkingOrchestrator {
             if self.thought_tree.is_none() {
                 self.thought_tree = Some(ThoughtTree::new(&root_thought, 4, 3));
             }
-           self.stagnation_turns = 0;
+            self.stagnation_turns = 0;
             self.active_modes.insert(ThinkingMode::TreeOfThoughts);
         }
 
@@ -234,7 +234,7 @@ impl ThinkingOrchestrator {
             if self.verification.is_none() {
                 self.verification = Some(VerificationWorkflow::new(hypothesis));
             }
-           self.stagnation_turns = 0;
+            self.stagnation_turns = 0;
             self.active_modes.insert(ThinkingMode::VerificationLoop);
         }
 
@@ -244,7 +244,7 @@ impl ThinkingOrchestrator {
                 let goal_id = self.goal_manager.create_goal(goal_desc);
                 self.goal_manager.activate_goal(&goal_id);
             }
-           self.stagnation_turns = 0;
+            self.stagnation_turns = 0;
             self.active_modes.insert(ThinkingMode::GoalDirected);
         }
     }
@@ -640,24 +640,24 @@ impl TurnObserver for ThinkingOrchestrator {
         // because the LLM emits them in its reply, not in the user question.
         self.apply_meta_tags(&ctx.final_text);
 
-       // 防死循环：思维子系统（验证/思维树/目标分解）的 on_finalize 不解析 LLM 的 JSON 回复，
-       // 因此 advance_step / add_branch / decompose_active 从未被调用，工作流永久卡在初始状态。
-       // 这里通过 stagnation_turns 计数器跟踪连续未进展的轮次，超过阈值后自动重置，
-       // 防止每轮重复注入同一 prompt 浪费 token。
-       const MAX_STAGNATION_TURNS: usize = 3;
-       if !self.active_modes.is_empty() {
-           self.stagnation_turns += 1;
-           if self.stagnation_turns > MAX_STAGNATION_TURNS {
-               display_lines.push("[Thinking] Auto-reset: thinking modes stagnated — clearing state to prevent dead loop.".to_string());
-               self.thought_tree = None;
-               self.verification = None;
-               self.active_modes.clear();
-               self.current_tree_node_id = None;
-               self.stagnation_turns = 0;
-           }
-       } else {
-           self.stagnation_turns = 0;
-       }
+        // 防死循环：思维子系统（验证/思维树/目标分解）的 on_finalize 不解析 LLM 的 JSON 回复，
+        // 因此 advance_step / add_branch / decompose_active 从未被调用，工作流永久卡在初始状态。
+        // 这里通过 stagnation_turns 计数器跟踪连续未进展的轮次，超过阈值后自动重置，
+        // 防止每轮重复注入同一 prompt 浪费 token。
+        const MAX_STAGNATION_TURNS: usize = 3;
+        if !self.active_modes.is_empty() {
+            self.stagnation_turns += 1;
+            if self.stagnation_turns > MAX_STAGNATION_TURNS {
+                display_lines.push("[Thinking] Auto-reset: thinking modes stagnated — clearing state to prevent dead loop.".to_string());
+                self.thought_tree = None;
+                self.verification = None;
+                self.active_modes.clear();
+                self.current_tree_node_id = None;
+                self.stagnation_turns = 0;
+            }
+        } else {
+            self.stagnation_turns = 0;
+        }
 
         // 自我学习（吸收 self-note → 泛化 → 展示 [Thinking] 行）只应发生在"确实做了
         // 事"的 turn 上：本轮调用过工具，或当前有激活的思考模式（目标/验证/思维树）。

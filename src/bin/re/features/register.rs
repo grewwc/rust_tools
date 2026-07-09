@@ -79,7 +79,10 @@ fn register_complete_tags(parser: &mut terminalw::Parser, ctx: Arc<ReContext>) {
             move |_| ctx.cli.complete_tags.is_some()
         })
         .do_action(move || {
-            list_tags::complete_tags_feature(ctx.db.as_ref(), ctx.cli.complete_tags.as_deref().unwrap_or(""));
+            list_tags::complete_tags_feature(
+                ctx.db.as_ref(),
+                ctx.cli.complete_tags.as_deref().unwrap_or(""),
+            );
         });
 }
 

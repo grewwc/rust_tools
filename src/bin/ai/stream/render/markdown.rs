@@ -664,14 +664,12 @@ impl MarkdownStreamRenderer {
                 if idx > 0 {
                     final_table.push('\n');
                     final_table.push_str(&self.render_table_column_block_continuation(
-                        indent,
-                        header,
-                        align,
-                        rows,
-                        range,
+                        indent, header, align, rows, range,
                     ));
                 } else {
-                    final_table.push_str(&self.render_table_column_block(indent, header, align, rows, range));
+                    final_table.push_str(
+                        &self.render_table_column_block(indent, header, align, rows, range),
+                    );
                 }
             }
             return final_table;
@@ -1836,7 +1834,10 @@ mod tests {
             // 成品盒框表与前后文都在。
             let joined = screen.join("\n");
             assert!(joined.contains('│'), "COLUMNS={cols}: missing box table");
-            assert!(joined.contains("后记"), "COLUMNS={cols}: trailing text lost");
+            assert!(
+                joined.contains("后记"),
+                "COLUMNS={cols}: trailing text lost"
+            );
         }
     }
 
@@ -1966,7 +1967,9 @@ mod tests {
 | parse_where_clause | ✅ 向后兼容 | 低。仅在解析失败时回退，不影响正常路径 |
 | build_query 组装逻辑 | ⚠️ 需回归 | 中。列顺序变化可能影响依赖隐式顺序的调用方 |
 ";
-        for cols in [120usize, 110, 100, 96, 90, 88, 84, 80, 76, 72, 68, 64, 60, 56, 52, 48, 44, 40] {
+        for cols in [
+            120usize, 110, 100, 96, 90, 88, 84, 80, 76, 72, 68, 64, 60, 56, 52, 48, 44, 40,
+        ] {
             unsafe { std::env::set_var("COLUMNS", cols.to_string()) };
             let stream = render_full_stream(md, false);
             let mut grid = VtGrid::new(cols);
@@ -2173,7 +2176,10 @@ mod tests {
         // 续接列块用 ├ 代替 ┌ 顶边框，用 └ 底边框确认分列
         let bottom_count = rendered.matches('└').count();
 
-        assert!(bottom_count > 1, "overwide table should be split into multiple column blocks:\n{rendered}");
+        assert!(
+            bottom_count > 1,
+            "overwide table should be split into multiple column blocks:\n{rendered}"
+        );
         for line in rendered.lines().filter(|line| !line.is_empty()) {
             let visible = crate::ai::stream::extract::strip_ansi_codes(line);
             let width = terminal_display_width(visible.as_str());
