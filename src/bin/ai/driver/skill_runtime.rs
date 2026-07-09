@@ -194,19 +194,13 @@ fn activate_skill_context(
         let prev_max_iterations = std::mem::replace(&mut ctx.max_iterations, max_iterations);
         restore = Some((prev_tools, prev_max_iterations));
     }
-    // AIOS: mirror the user-space max_iterations into kernel rlimit so that
-    // quota enforcement lives in one place (kernel), not scattered across driver.
-    // We map max_iterations -> ResourceLimit.max_tool_calls since each iteration
-    // typically issues <= 1 tool call batch.
-    {
-        use aios_kernel::primitives::ResourceLimit;
-        let mut os = app.os.lock().unwrap();
-        if let Some(pid) = os.current_process_id() {
-            let mut lim = os.rlimit_get(pid).unwrap_or_else(ResourceLimit::unlimited);
-            lim.max_tool_calls = max_iterations as u64;
-            let _ = os.rlimit_set(pid, lim);
-        }
-    }
+    // max_iterations 是「每轮」迭代上限（TurnSupervisor.iteration 每轮从 0 重置），
+    // 而 kernel 的 max_tool_calls 是「进程生命周期累计」的（tool_calls_used 永不重置）。
+    // 把 per-turn 的 max_iterations 映射到累计的 max_tool_calls 会导致长会话中累计
+    // 工具调用数先触顶（build=2048 / executor=128），即使没有任何单轮超限也会被
+    // 强制收尾，表现为 "已达到本轮工具上限"。per-turn 迭代上限已由 execution.rs
+    // 的 `iteration >= max_iterations` 检查正确执行，进程级 turn 上限已由 max_turns
+    // （来自 quota_turns）执行，因此这里不再覆盖 max_tool_calls，保持 unlimited。
     restore
 }
 

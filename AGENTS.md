@@ -50,9 +50,7 @@ cargo test --lib --bin a
 cargo test --bin a test_name
 ```
 
-**Only verify what you changed — avoid full checks.**
-Run focused checks (lint, typecheck, test) for the touched module first, then broaden only when the change crosses shared behavior.
-Do not run the full workspace `cargo check`, `cargo test`, or other verification unless necessary.
+**Only verify what you changed.** Run focused checks for the touched module first; broaden only when the change crosses shared behavior. Avoid full-workspace checks unless necessary.
 
 ## Global Engineering Rules
 
@@ -62,24 +60,25 @@ Do not run the full workspace `cargo check`, `cargo test`, or other verification
 4. Add AI config keys only in `src/bin/ai/config_schema.rs`; never scatter raw keys.
 5. For AI tools, keep schema/registration in `src/bin/ai/tools/registry/` and logic in `src/bin/ai/tools/service/`.
 6. Prefer reuse over reinvention; avoid unrelated refactors and formatting churn.
-7. Avoid brittle hardcoded string rules when a typed, structural, or data-driven path exists.
-8. Keep tests close to the changed module where practical; serial tests should use `test_support::ENV_LOCK`.
-9. Do not modify code unrelated to the current task. Only change files and logic directly tied to the requirement; avoid opportunistic refactors, formatting, or "improvements" to unrelated code. If touching unrelated code is truly necessary, explain the reason first and get confirmation.
-10. Prefer data-driven or registration-based extensibility over hardcoded
-    `if`/`else` chains keyed on names. When behavior varies per entity (tool,
-    agent, skill), declare it as config on that entity (e.g. an `inventory`
-    submission) and query it through a single lookup — the caller stays
-    generic. This keeps additions to a single point instead of sprinkling
-    branches across call sites. When introducing such config, preserve
-    backward compatibility: prefer an additive, optional registration over
-    modifying a shared struct that has many existing initializers.
-11. After changing code, always check whether the nearest scoped `AGENTS.md`
+7. Keep tests close to the changed module where practical; serial tests should use `test_support::ENV_LOCK`.
+8. Prefer data-driven or registration-based extensibility over hardcoded
+   `if`/`else` chains keyed on names. When behavior varies per entity (tool,
+   agent, skill), declare it as config on that entity (e.g. an `inventory`
+   submission) and query it through a single lookup — the caller stays
+   generic. This keeps additions to a single point instead of sprinkling
+   branches across call sites. When introducing such config, preserve
+   backward compatibility: prefer an additive, optional registration over
+   modifying a shared struct that has many existing initializers.
+9. Do not modify code unrelated to the current task; avoid opportunistic
+   refactors or "improvements" to unrelated code. If truly necessary,
+   explain first and get confirmation.
+10. After changing code, always check whether the nearest scoped `AGENTS.md`
     (and this root file, if repo-wide layout/invariants changed) needs a
     matching update. This is a mandatory final step of every task, not an
     optional afterthought. If a change touches module layout, build/test
     commands, invariants, subsystem rules, or on-demand guide references,
     update the corresponding `AGENTS.md` in the same task — do not defer it.
-12. Instruction docs are living documents, not append-only logs. When updating
+11. Instruction docs are living documents, not append-only logs. When updating
     any `AGENTS.md`, actively review and **delete or revise** content that has
     become stale, superseded, or redundant — do not merely add new text on top.
     Outdated rules that contradict current behavior are worse than missing rules:
@@ -90,9 +89,11 @@ Do not run the full workspace `cargo check`, `cargo test`, or other verification
 
 1. `.agent` / `.skill` files are compiled with `include_str!`; editing them recompiles `a`.
 2. `src/bin/ff/` is embedded into `a` via `include!`; changes there affect the agent binary.
-3. MCP servers are stdio subprocesses, not HTTP services.
-4. `runtime_ctx::effective_cwd()` is the working-directory authority for tools and sub-agents.
-5. `objc2*` dependencies are macOS-only.
+3. `runtime_ctx::effective_cwd()` is the working-directory authority for tools and sub-agents.
+4. `objc2*` dependencies are macOS-only.
+
+> Subsystem-specific pitfalls (MCP stdio, temp-dir lifecycle, etc.) live in
+> their scoped `AGENTS.md` — check the nearest one.
 
 ## Instruction Layering
 

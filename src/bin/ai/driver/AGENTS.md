@@ -25,38 +25,41 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
 3. `push_project_context()` must keep repo-local instruction docs available for
    repo-scoped work; it should not silently drop the actual scoped instruction
    docs.
-4. `runtime_ctx::effective_cwd()` is the working-directory authority for tools
-   and sub-agents.
-5. One-shot knowledge maintenance flows run before the interactive `run_loop()`.
-6. `runtime_ctx::temp_dir()` is per-session
+4. One-shot knowledge maintenance flows run before the interactive `run_loop()`.
+5. `runtime_ctx::temp_dir()` is per-session
    (`<sessions_root>/<session>.assets/tmp/`, co-located with tool-overflow,
    outside the project dir; falls back to `<effective_cwd>/.agent_tmp/<session>/`
    when DRIVER_CTX is unavailable) and persists across turns. There is no
    auto-cleanup; the agent explicitly deletes temp files via `delete_path`
    (which only works on files registered via `write_file(temp=true)`).
-7. Process/correction notes (truncation-retry hints, cache-hit notes,
+6. Process/correction notes (truncation-retry hints, cache-hit notes,
    discover_skills followups) are turn-scoped: push them to `messages` only,
    never via `append_message_pair`, so they are not persisted into
    `turn_messages` and cannot accumulate across turns. This also applies to
    **partial assistant text from truncated responses**: it is a half-finished
    artifact, not a valid conversation record — persisting it pollutes the
    history file and crowds out real dialog under `history_max_chars`.
-8. `turn_runtime/persistence.rs` skips persisting turn messages only for
+7. `turn_runtime/persistence.rs` skips persisting turn messages only for
    *ephemeral* one-shot runs (`one_shot_mode && cli.session.is_none()`), i.e.
    the runs `cleanup_one_shot` will delete right after. Background mode
    (`a -bg`) and explicit `--session` one-shot (`a -ss <id> "q"`) keep the
    session, so they MUST persist — otherwise `/sessions` title and `/history`
    come up empty.
-9. Truncation retry uses **progressive escalation**, not a flat retry:
-   - `reasoning_effort` degrades 1st truncation to Low, 2nd to Minimal,
-     3rd+ to disabled (frees output budget for actual content).
-   - **Always-thinking models** (e.g. GLM via `enable_thinking`) ignore
-     `reasoning_effort` degradation — their thinking is gated by a separate
-     `enable_thinking` switch. On the 3rd+ truncation, `thinking_disabled_override`
-     (an `App.cli` flag read by `request::resolve_thinking`) is set to force
-     thinking off entirely. Both this flag and `reasoning_effort_override` are
-     saved on turn entry and restored at every `break 'turn` exit, so the
-     downgrade never leaks into later turns.
+8. Truncation retry uses **progressive escalation**, not a flat retry:
+   - Escalation is **dialect-aware**: `provider::reasoning_effort_reduces_thinking_for`
+     decides whether degrading `reasoning_effort` can actually shrink the thinking
+     chain for this model.
+   - For **top-level `reasoning_effort` models** (OpenAI-compatible family),
+     effort degrades 1st truncation to Low, 2nd to Minimal, 3rd+ to disabled
+     (frees output budget for actual content).
+   - For **`enable_thinking`-switch models** (e.g. GLM via `EnableThinkingDialect`),
+     effort degradation is a **no-op** — the request body carries no `effort`
+     field at all. So the ladder is skipped: the **1st** genuine truncation sets
+     `thinking_disabled_override` (an `App.cli` flag read by
+     `request::resolve_thinking`) to force thinking off entirely, instead of
+     wasting two retry rounds on an ineffective effort ladder. Both this flag and
+     `reasoning_effort_override` are saved on turn entry and restored at every
+     `break 'turn` exit, so the downgrade never leaks into later turns.
    - The shrink note is **replaced** each truncation (not idempotent) and
      carries the consecutive count, so the model gets escalating feedback
      instead of flying blind after the first attempt.
@@ -80,7 +83,7 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
      0.6 chars), so a high-occupancy prompt triggers compression before it
      approaches the real token window — fixing the char-vs-token unit mismatch
      that let GLM prompts overflow without ever tripping the char-only threshold.
-10. Foreground resume turns (process woke up by mailbox events) must persist
+9. Foreground resume turns (process woke up by mailbox events) must persist
    their wake-up prompt as `internal_note` (not `user`). The
    `runtime_ctx::IS_RESUME_TURN` task-local is scoped by
    `run_foreground_resume`; `prepare_turn` reads it and sets the

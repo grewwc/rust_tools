@@ -406,6 +406,17 @@ fn finalize_stream_response(
             // finish_reason=length 且没有可见文本：模型可能只产出了 reasoning
             // 就被掐断，或根本没输出。降 effort 重试，把预算让给实际内容。
             StreamOutcome::Truncated
+        } else if has_reasoning && !has_text && !state.content.finish_reason_seen {
+            // reasoning-only 早停：只吐了思考、没有可见文本、也**没收到任何
+            // finish_reason** 就断流（idle 超时 / 提前 EOF，常见于 GLM 等
+            // enable_thinking 模型憋着思考链迟迟不产出可见内容，撞上 idle 超时
+            // 被掐断）。这类"思考到一半被切断"若按 Completed 静默结束，会让本轮
+            // 回答凭空为空。升级为可重试 Truncated，由上层降档 / 关 thinking 后重试。
+            //
+            // 与上面的 length 分支互补：length 是服务端显式报截断；这里是流早停、
+            // 根本没等到结束标记。区别于「正常 finish_reason=stop 的 reasoning-only
+            // 响应」——那种 finish_reason_seen=true，不进本分支，仍按 Completed。
+            StreamOutcome::Truncated
         } else if !has_text && !has_reasoning {
             // 检测空响应：模型没有文本、没有工具调用、没有推理内容。
             // 通常是 provider 端的问题（如限流、模型异常），触发重试。

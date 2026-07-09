@@ -31,6 +31,16 @@ pub(in crate::ai) trait ThinkingDialect: Sync {
     fn requires_reasoning_content_echo(&self) -> bool {
         false
     }
+
+    /// 降低 `reasoning_effort` 是否能实际缩短该方言下的思考链长度。
+    ///
+    /// 顶层 `reasoning_effort` 方言（OpenAI 兼容族）返回 `true`：降档能压缩推理
+    /// 预算。而 [`EnableThinkingDialect`] 这类「思考仅由 `enable_thinking` 布尔
+    /// 开关控制、忽略 effort」的方言返回 `false`——对它们降 effort 是空操作，
+    /// 截断重试必须直接关 thinking 才能把输出预算让给可见内容。
+    fn reasoning_effort_reduces_thinking(&self) -> bool {
+        true
+    }
 }
 
 /// DashScope 协议：`{"enable_thinking": bool}`。
@@ -45,6 +55,12 @@ impl ThinkingDialect for EnableThinkingDialect {
         let mut map = Map::new();
         map.insert("enable_thinking".to_string(), Value::Bool(enable));
         map
+    }
+
+    fn reasoning_effort_reduces_thinking(&self) -> bool {
+        // 思考仅由 `enable_thinking` 布尔开关控制，请求体里根本不带 effort，
+        // 降 effort 对思考链长度零影响。
+        false
     }
 }
 
@@ -129,5 +145,47 @@ pub(in crate::ai) fn thinking_dialect_for(
                 &NO_THINKING
             }
         }
+    }
+}
+
+/// 对指定模型，降 `reasoning_effort` 是否能实际缩短思考链。
+///
+/// `enable_thinking` 布尔开关方言（DashScope / compatible，如 GLM）返回 `false`：
+/// 截断重试阶梯里的 effort 降档对它是空操作，必须直接关 thinking 才能收敛。
+pub(in crate::ai) fn reasoning_effort_reduces_thinking_for(
+    provider: ApiProvider,
+    model: &str,
+    endpoint: &str,
+) -> bool {
+    thinking_dialect_for(provider, model, endpoint).reasoning_effort_reduces_thinking()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enable_thinking_dialect_effort_is_noop() {
+        // GLM 等 compatible provider 走 enable_thinking 开关，降 effort 无效。
+        assert!(!reasoning_effort_reduces_thinking_for(
+            ApiProvider::Compatible,
+            "glm5.2-super-relay",
+            "https://example.com/compatible-mode/v1/chat/completions",
+        ));
+        assert!(!reasoning_effort_reduces_thinking_for(
+            ApiProvider::Alibaba,
+            "qwen-max",
+            super::super::ALIBABA_DEFAULT_ENDPOINT,
+        ));
+    }
+
+    #[test]
+    fn openai_family_effort_reduces_thinking() {
+        // 顶层 reasoning_effort 方言：降档能压缩推理预算。
+        assert!(reasoning_effort_reduces_thinking_for(
+            ApiProvider::OpenAi,
+            "gpt-5",
+            super::super::OPENAI_DEFAULT_ENDPOINT,
+        ));
     }
 }

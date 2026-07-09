@@ -27,11 +27,6 @@ actually touches that subsystem.
    preload in `src/bin/a.rs` is cache warmup only.
 2. `load_skill` reads skill contents only; `activate_skill` changes turn behavior
    and tool availability.
-3. Add new config keys only in `config_schema.rs`.
-4. Preserve `runtime_ctx::effective_cwd()` semantics; tools, file resolution,
-   recall, and sub-agents all depend on it.
-5. Keep prompt-loaded `AGENTS.md` files concise. Long explanations belong in
-   `docs/agent-guides/*.md`.
 
 ## On-Demand Guides
 

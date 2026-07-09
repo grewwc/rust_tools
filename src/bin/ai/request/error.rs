@@ -227,7 +227,7 @@ pub(crate) async fn send_with_hedged_backup(
                 // 否则落到循环后的最终竞速（由外层 header_timeout 兜底）。
                 if round < max_sends {
                     eprintln!(
-                        "[Info] 第 {round} 次请求 {}s 内未返回响应头，发起 hedged backup",
+                        "[Info] 第 {round} 次请求 {}s 内未返回响应头，发起 hedged backup request",
                         backup_after_secs
                     );
                 }
