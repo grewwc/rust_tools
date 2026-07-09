@@ -82,7 +82,8 @@ async fn request_messages_with_key(
     retry_policy: &RequestRetryPolicy,
     endpoint: &str,
 ) -> Result<Response, RequestError> {
-    for attempt in 1..=retry_policy.max_attempts_429 {
+    let loop_max = retry_policy.max_attempts_429.max(retry_policy.max_attempts);
+    for attempt in 1..=loop_max {
         let build_request = || {
             apply_request_auth(app.client.post(endpoint), endpoint, api_key)
                 .header("Content-Type", "application/json")
@@ -269,8 +270,9 @@ pub(super) async fn do_request_messages(
     for (key_idx, api_key) in keys_to_try.iter().enumerate() {
         if key_idx > 0 {
             eprintln!(
-                "[{}] key #{} failed, trying next key ({} remaining)",
+                "[{}] key #{} failed, trying next key #{} ({} remaining)",
                 adapter.label(),
+                key_idx - 1,
                 key_idx,
                 total_keys - key_idx
             );
