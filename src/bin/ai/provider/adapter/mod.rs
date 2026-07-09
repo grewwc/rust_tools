@@ -27,7 +27,7 @@ use crate::ai::stream::{ParsedStreamPayload, try_parse_stream_chunk_loose};
 
 use super::ApiProvider;
 
-pub(in crate::ai) use thinking::thinking_dialect_for;
+pub(in crate::ai) use thinking::{reasoning_effort_reduces_thinking_for, thinking_dialect_for};
 
 use alibaba::AlibabaAdapter;
 use compatible::CompatibleAdapter;

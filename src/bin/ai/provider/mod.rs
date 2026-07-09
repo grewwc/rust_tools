@@ -6,7 +6,7 @@ pub(in crate::ai) use adapter::{
 };
 pub(in crate::ai) use adapter::{
     adapter_for, alibaba_adapter, compatible_adapter, openai_adapter, opencode_adapter,
-    openrouter_adapter, thinking_dialect_for,
+    openrouter_adapter, reasoning_effort_reduces_thinking_for, thinking_dialect_for,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, Default)]

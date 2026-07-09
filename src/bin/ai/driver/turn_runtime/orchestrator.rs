@@ -898,22 +898,33 @@ async fn run_turn_body(
                 } else {
                     // 真截断：模型撞输出上限或工具 JSON 半截。
                     consecutive_stream_errors = 0;
-                    // 渐进式 reasoning effort 降档，把输出预算从 reasoning 让给实际内容。
-                    // resolve_reasoning_effort 每次迭代实时读该字段，改了立即对下一次生效。
-                    //
-                    // 1 次截断 → Low（减半推理开销）
-                    // 2 次截断 → Minimal（仅保留最低推理）
-                    // 3 次以上 → 完全禁用 reasoning（把全部输出预算让给可见内容）
-                    app.cli.reasoning_effort_override = Some(match consecutive_truncations {
-                        1 => Some(crate::ai::provider::ReasoningEffort::Low),
-                        2 => Some(crate::ai::provider::ReasoningEffort::Minimal),
-                        _ => None, // Some(None) = 禁用 reasoning，不下发 effort 字段
-                    });
-                    // always-thinking 模型（如 GLM 走 enable_thinking）单纯降 effort
-                    // 无法抑制思考链——它由独立的 enable_thinking 开关控制。降档到第 3 次
-                    // 仍截断，说明 reasoning 降档对该模型无效，直接强制关闭 thinking，
-                    // 把整个输出预算让给可见内容。
-                    if consecutive_truncations >= 3 {
+
+                    // 该模型降 reasoning_effort 是否真能缩短思考链。
+                    // enable_thinking 布尔开关方言（GLM 等）请求体里根本不带
+                    // effort，降档是空操作——必须直接关 thinking 才能腾出输出预算。
+                    // dialect 分派与请求层一致：用 request_model_name + endpoint。
+                    let endpoint = crate::ai::models::endpoint_for_model(&next_model, "");
+                    let provider = crate::ai::models::model_provider(&next_model);
+                    let request_model = crate::ai::models::request_model_name(&next_model);
+                    let effort_helps = crate::ai::provider::reasoning_effort_reduces_thinking_for(
+                        provider, &request_model, &endpoint,
+                    );
+
+                    if effort_helps {
+                        // 渐进式 reasoning effort 降档，把输出预算从 reasoning 让给实际内容。
+                        // resolve_reasoning_effort 每次迭代实时读该字段，改了立即对下一次生效。
+                        //
+                        // 1 次截断 → Low（减半推理开销）
+                        // 2 次截断 → Minimal（仅保留最低推理）
+                        // 3 次以上 → 完全禁用 reasoning（把全部输出预算让给可见内容）
+                        app.cli.reasoning_effort_override = Some(match consecutive_truncations {
+                            1 => Some(crate::ai::provider::ReasoningEffort::Low),
+                            2 => Some(crate::ai::provider::ReasoningEffort::Minimal),
+                            _ => None, // Some(None) = 禁用 reasoning，不下发 effort 字段
+                        });
+                    } else {
+                        // 降 effort 对该方言无效：不浪费重试轮次走无效阶梯，
+                        // 首次真截断即强制关闭 thinking，把整个输出预算让给可见内容。
                         app.cli.thinking_disabled_override = true;
                     }
                 }

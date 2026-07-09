@@ -1,17 +1,3 @@
-7. Temporary / scratch files the agent creates during a task should use
-   `write_file(temp=true)`, which writes under `runtime_ctx::temp_dir()`
-   (per-session: `<sessions_root>/<session>.assets/tmp/`, co-located with
-   tool-overflow, outside the project dir; falls back to
-   `<std::env::temp_dir()>/.agent_tmp/<session>/` when DRIVER_CTX is unavailable,
-   never inside the project dir)
-   AND registers the file in a persistent JSON registry
-   (`storage::temp_registry`). When `temp=true`, `file_path` MUST be a
-   relative filename only (e.g. `script.py`); absolute paths and directory
-   components are stripped/rejected so the file always lands inside the temp
-   dir. `delete_path` ONLY deletes files in this
-   registry — unregistered files (source code, configs, user data) are
-   always refused. Never rely on `execute_command` for deletion — `rm` is
-   blocked by the sandbox and intentionally not relaxed.
 # Tools Guide
 
 ## Scope
@@ -39,17 +25,13 @@ execution policy, sandboxing, path resolution, or progressive loading.
    mirrors the `ToolStreamingRegistration` compatibility pattern. Query via
    `tool_display_config(name)`; never hardcode tool names in `print_run_status`
    or `driver/print.rs`.
-7. Temporary / scratch files the agent creates during a task should use the
-   per-turn temp directory: pass `temp: true` to `write_file` (resolves
-   `file_path` under `runtime_ctx::temp_dir()`, which is co-located with
-   tool-overflow in `<sessions_root>/<session>.assets/tmp/`, outside the
-   project dir). `file_path` must be a relative filename only — absolute
-   paths are rejected and directory components are stripped to `file_name()`
-   so the file never escapes the temp dir. For manual cleanup of files in the
-   temp dir, use
-   `delete_path` (structured deletion with sandbox + protected-dir checks).
-   Never rely on `execute_command` for deletion — `rm` is blocked by the
-   sandbox and intentionally not relaxed.
+7. Temporary / scratch files should use `write_file(temp=true)`, which writes
+   under `runtime_ctx::temp_dir()` (per-session, co-located with tool-overflow,
+   outside the project dir) AND registers the file in a persistent JSON registry
+   (`storage::temp_registry`). `file_path` must be a relative filename only;
+   absolute paths and directory components are stripped/rejected. `delete_path`
+   ONLY deletes files in this registry — unregistered files are always refused.
+   Never rely on `execute_command` for deletion — `rm` is blocked by the sandbox.
 8. `execute_command` runs each command via `setsid` in its own process group.
    If the command backgrounds a long-lived process (e.g. `python app.py &`),
    the foreground call returns and the surviving process-group pgid is recorded
