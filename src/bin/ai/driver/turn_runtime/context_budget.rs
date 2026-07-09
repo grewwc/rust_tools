@@ -529,6 +529,7 @@ mod tests {
             os: crate::ai::driver::new_local_kernel(),
             agent_reload_counter: None,
             observers: Vec::new(),
+            last_known_prompt_tokens: None,
         }
     }
 

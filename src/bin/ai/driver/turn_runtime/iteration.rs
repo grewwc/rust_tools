@@ -680,6 +680,10 @@ pub(super) async fn execute_turn_iteration(
                     skip_response_drain: false,
                     truncated_by_length: false,
                     stream_error: false,
+                    finish_reason_value: None,
+                    usage_prompt_tokens: 0,
+                    usage_completion_tokens: 0,
+                    usage_reasoning_tokens: 0,
                 };
                 return finalize_stream_interaction(
                     app,

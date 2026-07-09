@@ -864,6 +864,31 @@ fn blocked_git_subcommand(command_tokens: &[String]) -> Option<&'static str> {
 /// 拦截那些不被分段化策略覆盖的注入面：命令替换
 /// （`$(...)` / `` `...` ``）、进程替换。它们在正当 dev 工作流里几乎不出现，但可以一举绕过任何
 /// program/参数级黑名单（典型样例：`$(echo rm) -rf /tmp/foo`）。
+/// `(` 是否紧跟在被转义的 `$` 之后（`\$(`）。`\$` 把 `$` 转义为字面量后，
+/// `$(...)` 不再构成命令替换；残留的 `(` 在 bash 里只会触发语法错误（不会执行子
+/// shell），因此不视为注入面。判断方式：`(` 前一字符是 `$`，且紧贴 `$` 之前的
+/// 连续反斜杠数为奇数（奇数 ⇒ `$` 被转义）。
+fn paren_follows_escaped_dollar(bytes: &[u8], i: usize) -> bool {
+    // bytes[i] == b'('；需要前一字符是 `$`。
+    if i < 2 || bytes[i - 1] != b'$' {
+        return false;
+    }
+    let mut k = i - 2;
+    let mut backslashes = 0u32;
+    loop {
+        match bytes.get(k) {
+            Some(&b'\\') => {
+                backslashes += 1;
+                if k == 0 {
+                    break;
+                }
+                k -= 1;
+            }
+            _ => break,
+        }
+    }
+    backslashes % 2 == 1
+}
 fn validate_no_injection_surface(command: &str) -> Result<(), String> {
     let bytes = command.as_bytes();
     let mut i = 0;
@@ -871,6 +896,8 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
     let mut in_double = false;
     let mut escaped = false;
     let mut pending_heredocs: Vec<HereDocSpec> = Vec::new();
+    let mut arith_depth: u32 = 0;
+    let mut literal_paren_depth: u32 = 0;
     while i < bytes.len() {
         let b = bytes[i];
         if escaped {
@@ -939,9 +966,11 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
         // 命令替换 `$(`
         if b == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'(' {
             // 算术展开 `$(( ... ))` 不执行任何命令，是无害的（典型：`echo $((RANDOM % 20))`），
-            // 不应被命令替换规则误杀。跳过 `$((` 开头后继续向内扫描——这样真正内嵌的
-            // 命令替换（如 `$(( $(whoami) ))` 里的 `$(`）仍会在后续迭代被命中拦下。
+            // 不应被命令替换规则误杀。压入算术深度后继续向内扫描——这样真正内嵌的
+            // 命令替换（如 `$(( $(whoami) ))` 里的 `$(`）仍会在后续迭代被命中拦下，
+            // 而结尾的 `))` 与内部分组括号由下方的 arith_depth 分支正确放行。
             if i + 2 < bytes.len() && bytes[i + 2] == b'(' {
+                arith_depth += 1;
                 i += 3;
                 continue;
             }
@@ -957,7 +986,33 @@ fn validate_no_injection_surface(command: &str) -> Result<(), String> {
         // 未引用的 `(` / `)` / `{` / `}` 开启子 shell 或命令分组（如 `(rm -rf /tmp)`、
         // `{ rm -rf /tmp; }`），会绕过分段黑名单验证。
         // `$(` / `$((` / `<(` / `>(` 已在上方单独处理，此处拦截裸 `(` / `)` / `{` / `}`。
+        // 但算术展开 `$(( ... ))` 内部的 `(` / `)` 只是分组括号、`))` 用于闭合算术展开，
+        // 都不构成子 shell；`\$(` 中 `$` 已被转义为字面量，残留 `(` 只是 bash 语法错误，
+        // 同样不执行子 shell——这两种情况都要放行。
         if !in_double && matches!(b, b'(' | b')' | b'{' | b'}') {
+            if arith_depth > 0 && matches!(b, b'(' | b')') {
+                if b == b')' && i + 1 < bytes.len() && bytes[i + 1] == b')' {
+                    arith_depth -= 1;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+            if b == b'(' && paren_follows_escaped_dollar(bytes, i) {
+                literal_paren_depth = 1;
+                i += 1;
+                continue;
+            }
+            if literal_paren_depth > 0 && matches!(b, b'(' | b')') {
+                if b == b'(' {
+                    literal_paren_depth += 1;
+                } else {
+                    literal_paren_depth -= 1;
+                }
+                i += 1;
+                continue;
+            }
             return Err(
                 "unquoted shell metacharacters `(` `)` `{` `}` start a subshell or command group and bypass command validation; run the command directly instead".to_string(),
             );

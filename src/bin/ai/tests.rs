@@ -90,6 +90,7 @@ fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::
         observers: vec![Box::new(
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
+        last_known_prompt_tokens: None,
     }
 }
 
@@ -171,6 +172,7 @@ fn resolve_model_is_unicode_safe() {
         observers: vec![Box::new(
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
+        last_known_prompt_tokens: None,
     };
 
     let mut question = "a 什么是rust的一个crate？".to_string();
@@ -2121,22 +2123,32 @@ fn multiline_history_navigation_restores_draft() {
 fn table_preview_lines_are_not_double_printed_after_live_emit() {
     let mut renderer = stream::MarkdownStreamRenderer::new_with_tty(true);
 
+    // 流式表格渲染：表头行进入静默缓冲（等待分隔行确认是否成表），缓冲期间
+    // 输出"生成表格中"占位预览，不直接 echo 原始文本——否则最终成表时会与
+    // 渲染后的表头重复打印。
     let header_out = renderer.consume_line("| name | value |", false);
-    assert!(header_out.contains("| name | value |\n"));
+    assert!(header_out.contains("\x1b["));
+    assert!(!header_out.contains("| name | value |"));
 
+    // 分隔行确认成表后，表内容继续静默缓冲（不再 echo 原始行）。
     let sep_out = renderer.consume_line("| --- | --- |", true);
-    assert!(sep_out.contains("\x1b["));
-    assert!(!sep_out.contains("| name | value |"));
-    assert!(!sep_out.contains("| --- | --- |"));
-
+    assert_eq!(sep_out, "");
     let row_out = renderer.consume_line("| foo | bar |", true);
-    assert!(row_out.contains("\x1b["));
-    assert!(!row_out.contains("| foo | bar |"));
-    assert!(row_out.contains("foo"));
-    assert!(row_out.contains("bar"));
+    assert_eq!(row_out, "");
 
+    // 表格结束（非表格行 "done"）时，先清除占位预览，再一次性渲染完整表格。
     let end_out = renderer.consume_line("done", false);
-    assert!(end_out.contains("\x1b["));
+    // 清除占位预览的 ANSI 序列
+    assert!(end_out.contains("\x1b[1A"));
+    // 渲染后的表格包含表头与数据，但原始 markdown 文本不单独出现
+    assert!(end_out.contains("name"));
+    assert!(end_out.contains("value"));
+    assert!(end_out.contains("foo"));
+    assert!(end_out.contains("bar"));
+    assert!(!end_out.contains("| name | value |"));
+    assert!(!end_out.contains("| --- | --- |"));
+    assert!(!end_out.contains("| foo | bar |"));
+    // 表格后的普通文本正常输出
     assert!(end_out.contains("done"));
 }
 

@@ -818,8 +818,10 @@ mod tests {
     #[test]
     fn discover_skills_reports_no_match_for_irrelevant_query() {
         // 完全无关的 query 不应倾倒全部 skill 清单。
+        // 注意：query 不得含有任何真实单词（如 "token"），否则 char-ngram 语义打分
+        // 会因与某 skill 描述的子串重合而误召回。用纯无意义 token 确保零命中。
         let args = serde_json::json!({
-            "query": "zzz_totally_unrelated_token_qwxyz",
+            "query": "zzz qwxyz snorfle blarg",
             "limit": 20
         });
         let out = execute_discover_skills(&args).unwrap();

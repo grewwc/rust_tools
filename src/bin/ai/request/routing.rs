@@ -146,6 +146,8 @@ Skills:
         None,
         None,
         None,
+       None,
+       None,
     );
 
     let endpoint = endpoint_for_request_model(app, &control_model);

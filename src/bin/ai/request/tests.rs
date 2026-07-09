@@ -218,6 +218,7 @@
             observers: vec![Box::new(
                 crate::ai::driver::thinking::ThinkingOrchestrator::new(),
             )],
+            last_known_prompt_tokens: None,
         }
     }
 
@@ -457,6 +458,8 @@
             None,
             None,
             Some("high"),
+        None,
+            None,
         );
         // max_tokens 现按剩余上下文窗口钳制；仅当模型声明 max_output_tokens 时下发。
         // 期望值由同一钳制函数推导，保持 wire 断言随模型配置变化仍成立。
@@ -488,6 +491,8 @@
                 None,
                 None,
                 Some("medium"),
+            None,
+                None,
             );
             let opencode_max_tokens_field = expected_max_tokens_field(&opencode_model, &messages);
             assert_eq!(
@@ -504,7 +509,7 @@
     fn expected_max_tokens_field(model: &str, messages: &[Message]) -> String {
         match super::super::models::max_output_tokens(model) {
             Some(model_max) => {
-                let clamped = clamp_max_tokens_for_prompt(model, messages, model_max);
+                let clamped = clamp_max_tokens_for_prompt(model, messages, model_max, None);
                 format!(r#","max_tokens":{clamped}"#)
             }
             None => String::new(),
@@ -529,6 +534,8 @@
             Some(true),
             None,
             None,
+            None,
+        None,
             None,
         );
         let json = serde_json::to_value(&body).unwrap();
@@ -566,6 +573,8 @@
                 None,
                 None,
                 Some("high"),
+            None,
+                None,
             );
             let json = serde_json::to_value(&body).unwrap();
             assert_eq!(
@@ -613,6 +622,8 @@
             None,
             None,
             None,
+        None,
+            None,
         );
         let disabled = serde_json::to_value(&disabled).unwrap();
         assert_eq!(
@@ -631,6 +642,8 @@
             None,
             None,
             None,
+            None,
+        None,
             None,
         );
         let enabled = serde_json::to_value(&enabled).unwrap();
@@ -654,6 +667,8 @@
             None,
             None,
             None,
+            None,
+        None,
             None,
         );
         let value = serde_json::to_value(&body).unwrap();
@@ -703,7 +718,7 @@
         for model in ["deepseek-v4-pro", "deepseek-v4-flash", "kimi-k2.7-code"] {
             // gate 关闭 → enable_thinking:false
             let disabled =
-                build_request_body(model, &messages, false, false, None, None, None, None);
+                build_request_body(model, &messages, false, false, None, None, None, None, None, None);
             let disabled = serde_json::to_value(&disabled).unwrap();
             assert_eq!(
                 disabled.get("enable_thinking").and_then(|v| v.as_bool()),
@@ -714,7 +729,7 @@
             assert!(disabled.get("thinking").is_none(), "{model}");
 
             // gate 开启 → enable_thinking:true
-            let enabled = build_request_body(model, &messages, false, true, None, None, None, None);
+            let enabled = build_request_body(model, &messages, false, true, None, None, None, None, None, None);
             let enabled = serde_json::to_value(&enabled).unwrap();
             assert_eq!(
                 enabled.get("enable_thinking").and_then(|v| v.as_bool()),
@@ -780,6 +795,8 @@
             None,
             None,
             Some("high"),
+        None,
+            None,
         );
         let value = serde_json::to_value(&body).unwrap();
 
@@ -815,6 +832,8 @@
             None,
             None,
             Some("high"),
+        None,
+            None,
         );
         let value = serde_json::to_value(&body).unwrap();
 

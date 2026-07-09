@@ -856,6 +856,99 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                     std::io::stderr(),
                     "  ⚠ 模型响应被截断（疑似输出上限），提示收缩后自动重试…"
                 );
+                // 打印截断诊断信息，便于排查截断原因。
+                let partial = stream_result.assistant_text.trim();
+                let reasoning = stream_result.reasoning_text.trim();
+                // 截断原因诊断
+                if stream_result.truncated_by_length && partial.is_empty() {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  ├─ 截断原因: finish_reason=length，无可见文本输出"
+                    );
+                    if !reasoning.is_empty() {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "  ├─ reasoning 已产出 {} 字符（可能 reasoning 耗尽了 token 预算）",
+                            stream_result.reasoning_text.len()
+                        );
+                        let r_snippet = if reasoning.len() > 600 {
+                            format!(
+                                "{}…[共 {} 字符]…{}",
+                                &reasoning[..300],
+                                reasoning.len(),
+                                &reasoning[reasoning.len() - 300..]
+                            )
+                        } else {
+                            reasoning.to_string()
+                        };
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "  ├─ reasoning 片段:\n{}\n  ├─ （结束）",
+                            r_snippet
+                        );
+                    } else {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "  ├─ 无 reasoning 输出（模型可能刚开始就被掐断）"
+                        );
+                    }
+                } else if !partial.is_empty() {
+                    let snippet = if partial.len() > 600 {
+                        format!(
+                            "{}…[截断，共 {} 字符]…{}",
+                            &partial[..300],
+                            partial.len(),
+                            &partial[partial.len() - 300..]
+                        )
+                    } else {
+                        partial.to_string()
+                    };
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  ├─ 已产出的部分文本（{} 字符）:\n{}\n  ├─ （结束）",
+                        partial.len(),
+                        snippet
+                    );
+                    if !reasoning.is_empty() {
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "  ├─ reasoning 内容已产出 {} 字符",
+                            stream_result.reasoning_text.len()
+                        );
+                    }
+                } else {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  ├─ 无可见文本、无 reasoning（可能 tool call JSON 被截断丢弃）"
+                    );
+                }
+                // 打印服务端返回的 finish_reason 原始值和 usage 统计，
+                // 用于排查"reasoning token 耗尽预算导致零输出截断"等根因。
+                if let Some(ref reason) = stream_result.finish_reason_value {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  ├─ finish_reason = {:?}",
+                        reason
+                    );
+                }
+                if stream_result.usage_prompt_tokens > 0
+                    || stream_result.usage_completion_tokens > 0
+                    || stream_result.usage_reasoning_tokens > 0
+                {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  ├─ usage: prompt={}, completion={} (reasoning={})",
+                        stream_result.usage_prompt_tokens,
+                        stream_result.usage_completion_tokens,
+                        stream_result.usage_reasoning_tokens,
+                    );
+                } else {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "  ├─ usage: 服务端未返回 token 统计"
+                    );
+                }
+                let _ = writeln!(std::io::stderr(), "  └─ （诊断结束）");
                 append_truncation_retry_note(
                     &stream_result,
                     messages,
@@ -1085,6 +1178,7 @@ mod tests {
             observers: vec![Box::new(
                 crate::ai::driver::thinking::ThinkingOrchestrator::new(),
             )],
+            last_known_prompt_tokens: None,
         }
     }
 
@@ -1295,6 +1389,10 @@ mod tests {
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
+            finish_reason_value: None,
+            usage_prompt_tokens: 0,
+            usage_completion_tokens: 0,
+            usage_reasoning_tokens: 0,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1347,6 +1445,10 @@ mod tests {
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
+            finish_reason_value: None,
+            usage_prompt_tokens: 0,
+            usage_completion_tokens: 0,
+            usage_reasoning_tokens: 0,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1401,6 +1503,10 @@ mod tests {
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
+            finish_reason_value: None,
+            usage_prompt_tokens: 0,
+            usage_completion_tokens: 0,
+            usage_reasoning_tokens: 0,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1467,6 +1573,10 @@ mod tests {
                     skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
                 }),
                 &mut messages,
                 &mut turn_messages,
@@ -1543,6 +1653,10 @@ mod tests {
                 skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: true,
+            finish_reason_value: None,
+            usage_prompt_tokens: 0,
+            usage_completion_tokens: 0,
+            usage_reasoning_tokens: 0,
             }),
             &mut messages,
             &mut turn_messages,
@@ -1630,6 +1744,10 @@ mod tests {
                     skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
                 },
                 allowed_tool_names: Default::default(),
             }),
@@ -1751,6 +1869,10 @@ mod tests {
                         skip_response_drain: true,
                 truncated_by_length: false,
                 stream_error: false,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
                     },
                     allowed_tool_names: ["execute_command".to_string()].into_iter().collect(),
                 },

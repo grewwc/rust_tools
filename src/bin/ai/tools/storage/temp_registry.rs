@@ -144,13 +144,12 @@ mod tests {
     #[test]
     fn registry_persists_across_loads() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let base = std::env::temp_dir().join(format!(
-            "temp_reg_persist_{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&base).unwrap();
-
-        crate::ai::driver::runtime_ctx::SUBAGENT_CWD.sync_scope(base.clone(), || {
+        // temp_dir() 回退路径按 session_id（TURN_IDENTITY）隔离；用唯一 session
+        // 独占一个注册表文件，避免与其他并发测试 / 历史遗留条目共用
+        // `~/.agent_tmp/default/temp_registry.json` 造成计数污染。
+        let session_id = format!("temp_reg_persist_{}", uuid::Uuid::new_v4());
+        crate::ai::driver::runtime_ctx::TURN_IDENTITY
+            .sync_scope((session_id, 0usize), || {
             register("/tmp/a.txt").unwrap();
             register("/tmp/b.txt").unwrap();
             // 重新加载后仍在
@@ -158,8 +157,6 @@ mod tests {
             assert!(is_registered("/tmp/b.txt"));
             let all = list_registered();
             assert_eq!(all.len(), 2);
-        });
-
-        let _ = std::fs::remove_dir_all(&base);
+            });
     }
 }

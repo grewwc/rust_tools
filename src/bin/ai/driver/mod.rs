@@ -1669,6 +1669,7 @@ pub(in crate::ai) async fn run_with_cli(
         observers: vec![Box::new(
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
+        last_known_prompt_tokens: None,
     };
     if let Some(notice) = startup_notice {
         println!("{notice}");

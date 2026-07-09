@@ -219,6 +219,10 @@ fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
         skip_response_drain: true,
         truncated_by_length: false,
         stream_error: false,
+        finish_reason_value: None,
+        usage_prompt_tokens: 0,
+        usage_completion_tokens: 0,
+        usage_reasoning_tokens: 0,
     }
 }
 
@@ -332,6 +336,15 @@ fn finalize_stream_response(
 
     // AIOS: flush any pending LLM usage to kernel `/dev/llm` before returning.
     // Prefer the model echoed by the provider; fall back to what we requested.
+    // 先快照 usage 统计，供 StreamResult 截断诊断使用（take 会消费）。
+    let usage_snapshot = state.pending_llm_usage.as_ref().map(|(_, u)| {
+        let reasoning = u
+            .completion_tokens_details
+            .as_ref()
+            .map(|d| d.reasoning_tokens)
+            .unwrap_or(0);
+        (u.prompt_tokens, u.completion_tokens, reasoning)
+    });
     if let Some((echoed_model, usage)) = state.pending_llm_usage.take() {
         let model_for_pricing = if echoed_model.is_empty() {
             app.current_model.clone()
@@ -411,6 +424,10 @@ fn finalize_stream_response(
         skip_response_drain: true,
         truncated_by_length,
         stream_error: false,
+        finish_reason_value: state.content.finish_reason_value.clone(),
+        usage_prompt_tokens: usage_snapshot.map(|(p, _, _)| p).unwrap_or(0),
+        usage_completion_tokens: usage_snapshot.map(|(_, c, _)| c).unwrap_or(0),
+        usage_reasoning_tokens: usage_snapshot.map(|(_, _, r)| r).unwrap_or(0),
     })
 }
 
@@ -543,6 +560,10 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         truncated_by_length: false,
         // 流读取失败导致的截断，不是模型输出过长。
         stream_error: true,
+        finish_reason_value: state.content.finish_reason_value.clone(),
+        usage_prompt_tokens: 0,
+        usage_completion_tokens: 0,
+        usage_reasoning_tokens: 0,
     })
 }
 

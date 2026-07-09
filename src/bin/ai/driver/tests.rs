@@ -290,6 +290,7 @@
             observers: vec![Box::new(
                 crate::ai::driver::thinking::ThinkingOrchestrator::new(),
             )],
+            last_known_prompt_tokens: None,
         }
     }
 

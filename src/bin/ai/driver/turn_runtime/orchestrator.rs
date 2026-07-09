@@ -819,6 +819,12 @@ async fn run_turn_body(
     // 同理保存 thinking 兜底开关：截断重试可能置位它以强制关闭 always-thinking
     // 模型的思考链，turn 末统一恢复，不污染后续 turn。
     let saved_thinking_disabled = app.cli.thinking_disabled_override;
+   // 同理保存 max_tokens 自适应覆盖：零输出截断时自动降 max_tokens 重试。
+   let saved_max_tokens_override = app.cli.max_tokens_override;
+   // 记住服务端已接受过的最大 max_tokens 值。零输出截断降级后，一旦服务端
+   // 接受了某个值，就记下来；后续恢复时恢复到这个已验证的值而非原始配置值，
+   // 避免反复从原始（过大）值开始试错。turn 内有效，turn 末随 override 一起恢复。
+   let mut accepted_max_tokens: Option<u32> = None;
     let loop_result = 'turn: loop {
         let iteration = supervisor.next_iteration();
         {
@@ -854,6 +860,18 @@ async fn run_turn_body(
         };
         {
             let mc = mcp_client.lock().unwrap().routing_snapshot();
+            // 用服务端返回的实际 prompt_tokens 校正后续请求的 max_tokens clamp。
+            // 字符估算偏保守（高估），服务端的实际值更准确，能减少不必要的钳小。
+            let usage_prompt = match &execution {
+                IterationExecution::Truncated(sr) | IterationExecution::FinalResponse(sr) => {
+                    Some(sr.usage_prompt_tokens)
+                }
+                IterationExecution::ToolCall(tce) => Some(tce.stream_result.usage_prompt_tokens),
+                _ => None,
+            };
+            if let Some(pt) = usage_prompt.filter(|&v| v > 0) {
+                app.last_known_prompt_tokens = Some(pt);
+            }
             // 空响应重试计数：连续 >2 次空响应则放弃，避免浪费迭代预算
             if matches!(execution, IterationExecution::EmptyResponse) {
                 consecutive_empty_responses += 1;
@@ -898,6 +916,32 @@ async fn run_turn_body(
                 } else {
                     // 真截断：模型撞输出上限或工具 JSON 半截。
                     consecutive_stream_errors = 0;
+
+                    // 零输出截断检测：completion=0 + finish_reason=length 说明服务端
+                    // 拒绝了 max_tokens 值（典型：relay/兼容层对超大 max_tokens 返回
+                    // 空响应而非报错）。此时降 reasoning_effort / 禁 thinking 都无济于事
+                    // ——问题不在模型输出太多，而在 max_tokens 本身被服务端拒绝。
+                    // 策略：将 max_tokens 减半后重试，直到服务端接受。
+                    let is_zero_completion = stream_result.usage_completion_tokens == 0
+                        && stream_result
+                            .finish_reason_value
+                            .as_deref()
+                            .is_some_and(|r| r == "length");
+                    if is_zero_completion {
+                        let current_max = app
+                            .cli
+                            .max_tokens_override
+                            .or_else(|| crate::ai::models::max_output_tokens(&app.current_model))
+                            .unwrap_or(32768);
+                        let halved = (current_max / 2).max(4096);
+                        let _ = writeln!(
+                            std::io::stderr(),
+                            "  ⚠ 零输出截断（completion=0），max_tokens {} → {} 自动降级重试",
+                            current_max, halved
+                        );
+                        app.cli.max_tokens_override = Some(halved);
+                    }
+
                     // 渐进式 reasoning effort 降档，把输出预算从 reasoning 让给实际内容。
                     // resolve_reasoning_effort 每次迭代实时读该字段，改了立即对下一次生效。
                     //
@@ -953,6 +997,21 @@ async fn run_turn_body(
                 }
             } else {
                 consecutive_truncations = 0;
+               // 服务端接受了当前 max_tokens（非零输出）。
+               // 记住这个已验证的值，后续恢复时恢复到它而非原始（可能过大）值。
+               // 这样零输出降级后不会再反复从原始值开始试错。
+               if let Some(override_val) = app.cli.max_tokens_override {
+                   accepted_max_tokens = Some(override_val);
+                   let _ = writeln!(
+                       std::io::stderr(),
+                       "  ✓ 服务端接受 max_tokens={}，后续请求沿用此值",
+                       override_val
+                   );
+                   // 不清除 override —— 保持已验证的值，避免下一轮又用原始过大值
+               } else if accepted_max_tokens.is_some() {
+                   // override 已为 None（原始值），且之前有已验证值，
+                   // 说明当前用的是原始 max_tokens 且服务端接受，无需变更。
+               }
             }
             let step = match handle_iteration_execution(
                 app, &question, &mc, mcp_client, execution,
@@ -1136,6 +1195,7 @@ async fn run_turn_body(
     // 污染用户的会话级设置。
     app.cli.reasoning_effort_override = saved_effort_override;
     app.cli.thinking_disabled_override = saved_thinking_disabled;
+   app.cli.max_tokens_override = saved_max_tokens_override;
 
     // 老化未在本 turn 使用的 explicit-enabled tool。
     // 连续 N 个 turn 闲置就 demote，避免"启用一次永久焊接"。

@@ -61,6 +61,7 @@ impl Clone for App {
             os: self.os.clone(),
             agent_reload_counter: self.agent_reload_counter,
             observers: Vec::new(),
+            last_known_prompt_tokens: self.last_known_prompt_tokens,
         }
     }
 }
@@ -99,6 +100,9 @@ pub(super) struct App {
     pub(super) os: SharedKernel,
     pub(super) agent_reload_counter: Option<usize>,
     pub(super) observers: Vec<Box<dyn crate::ai::driver::observer::TurnObserver>>,
+    /// 上一次请求服务端返回的实际 prompt_tokens（来自 usage 统计）。
+    /// 用于在下一次请求的 max_tokens clamp 中替代字符估算，提高精度。
+    pub(super) last_known_prompt_tokens: Option<u64>,
 }
 
 impl App {
@@ -301,6 +305,17 @@ pub(super) struct StreamResult {
     /// 此时 outcome 为 Truncated，但降 reasoning_effort、注入收缩提示均无意义——
     /// 模型并没有输出太多，是服务端断了。上层应做简单重试而非收缩重写。
     pub(super) stream_error: bool,
+    /// 服务端返回的 finish_reason 原始值（如 `stop` / `length` / `tool_calls`）。
+    /// 用于截断诊断，区分"撞输出上限"与其他原因。
+    pub(super) finish_reason_value: Option<String>,
+    /// 服务端 usage 统计：prompt tokens（已 normalize）。
+    pub(super) usage_prompt_tokens: u64,
+    /// 服务端 usage 统计：completion tokens（已 normalize，含 reasoning）。
+    pub(super) usage_completion_tokens: u64,
+    /// 服务端 usage 统计：reasoning tokens（来自 completion_tokens_details）。
+    /// 部分 provider（GLM thinking 模式）会把 reasoning token 单独上报，
+    /// 这是排查"reasoning 耗尽预算导致零输出截断"的关键指标。
+    pub(super) usage_reasoning_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

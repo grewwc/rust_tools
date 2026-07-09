@@ -118,6 +118,8 @@ pub(super) async fn do_request_messages(
         tools_value,
         tool_choice,
         reasoning_effort,
+       app.cli.max_tokens_override,
+      app.last_known_prompt_tokens,
     );
     let retry_policy = request_retry_policy_for_current_context();
 
@@ -335,6 +337,8 @@ fn build_request_body<'a>(
     tools: Option<Value>,
     tool_choice: Option<Value>,
     reasoning_effort: Option<&'a str>,
+    max_tokens_override: Option<u32>,
+    known_prompt_tokens: Option<u64>,
 ) -> RequestBody<'a> {
     let provider = models::model_provider(model);
     let endpoint = models::endpoint_for_model(model, "");
@@ -350,7 +354,14 @@ fn build_request_body<'a>(
     // 截断 → 重试死循环的根因）。未声明 max_output_tokens 的模型保持不下发字段，
     // wire 行为不变。
     let max_tokens =
-        models::max_output_tokens(model).map(|model_max| clamp_max_tokens_for_prompt(model, messages, model_max));
+        models::max_output_tokens(model).map(|model_max| clamp_max_tokens_for_prompt(model, messages, model_max, known_prompt_tokens));
+   // 零输出截断自适应：当上一轮检测到 completion=0 + finish_reason=length 时，
+   // orchestrator 会把 max_tokens_override 设为更小的值。此处用该值替换 clamp 结果，
+   // 让下一轮请求发送更小的 max_tokens，绕过服务端对超大 max_tokens 的空响应拒绝。
+   let max_tokens = match (max_tokens, max_tokens_override) {
+       (Some(_), Some(override_val)) => Some(override_val),
+       (mt, _) => mt,
+   };
     RequestBody {
         model: request_model,
         messages,
@@ -390,9 +401,17 @@ fn estimate_prompt_tokens(messages: &[Message]) -> usize {
 /// `min(model_max, window - est_prompt - safety_margin)`，并 floor 到
 /// [`MIN_OUTPUT_TOKENS_FLOOR`]。这样即使模型声明了很大的 max_output_tokens，
 /// 在高占用 prompt 下也不会 prompt + 输出一起超过 token 窗口。
-fn clamp_max_tokens_for_prompt(model: &str, messages: &[Message], model_max: u32) -> u32 {
+fn clamp_max_tokens_for_prompt(
+    model: &str,
+    messages: &[Message],
+    model_max: u32,
+    known_prompt_tokens: Option<u64>,
+) -> u32 {
     let window = models::context_window_tokens(model);
-    let est_prompt = estimate_prompt_tokens(messages);
+    // 优先使用服务端返回的实际 prompt_tokens，比字符估算精确得多。
+    let est_prompt = known_prompt_tokens
+        .map(|p| p as usize)
+        .unwrap_or_else(|| estimate_prompt_tokens(messages));
     let remaining = window
         .saturating_sub(est_prompt)
         .saturating_sub(CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS);
@@ -953,6 +972,8 @@ pub(super) async fn summarize_history_via_model(
         None,
         None,
         None,
+       None,
+       None,
     );
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
@@ -1062,6 +1083,8 @@ pub(super) async fn generate_session_title_via_model(
         None,
         None,
         None,
+       None,
+       None,
     );
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);

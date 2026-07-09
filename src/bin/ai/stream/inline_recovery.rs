@@ -450,9 +450,23 @@ pub(super) fn collect_valid_tool_calls(
         .filter_map(|(_, mut builder)| {
             let Some(arguments) = normalize_tool_call_arguments(&builder.arguments) else {
                 dropped = true;
+                // 打印被截断的 arguments 片段，便于排查"为什么被截断"。
+                // arguments 可能很大（大文件 write_file），只显示头尾各 300 字符。
+                let raw = &builder.arguments;
+                let snippet = if raw.len() > 600 {
+                    format!(
+                        "{}…[截断，共 {} 字符]…{}",
+                        &raw[..300],
+                        raw.len(),
+                        &raw[raw.len() - 300..]
+                    )
+                } else {
+                    raw.to_string()
+                };
                 eprintln!(
-                    "[Warning] dropping malformed tool call '{}' due to incomplete JSON arguments",
-                    builder.function_name
+                    "[Warning] dropping malformed tool call '{}' due to incomplete JSON arguments\n\
+                     └─ 截断的 arguments 片段:\n{}",
+                    builder.function_name, snippet
                 );
                 return None;
             };

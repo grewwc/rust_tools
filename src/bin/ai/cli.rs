@@ -37,6 +37,14 @@ pub(super) struct ParsedCli {
     /// `reasoning_effort` 无法抑制思考链占满输出预算；连续多次截断后置位此字段，
     /// 把整个思考预算让给可见内容。仅在 turn 内临时生效，turn 末统一恢复。
     pub(super) thinking_disabled_override: bool,
+    /// 截断重试时的 `max_tokens` 自适应覆盖。当检测到「零输出截断」
+    /// （`completion=0` + `finish_reason=length`）时，说明服务端拒绝了当前
+    /// `max_tokens` 值（典型：relay/兼容层对超大 max_tokens 返回空响应）。
+    /// 此时将 max_tokens 减半写入此字段，下一轮请求使用更小的值重试，
+    /// 直到服务端接受。仅在 turn 内临时生效，turn 末统一恢复。
+    /// - `None`：未设置，使用 `clamp_max_tokens_for_prompt` 的正常计算值；
+    /// - `Some(n)`：用 `n` 作为 max_tokens 上限（仍受 clamp 的剩余窗口约束）。
+    pub(super) max_tokens_override: Option<u32>,
     /// 是否只搜索 memo 类别的记录。
     /// 通过 `--note-search` / `-ns` 开启，用于快速查找用户手动记录的内容（如截图、笔记等）。
     /// 默认 false，即走正常的知识召回流程。
@@ -308,6 +316,7 @@ impl Default for ParsedCli {
             interactive: false,
             reasoning_effort_override: None,
             thinking_disabled_override: false,
+           max_tokens_override: None,
             note_search: false,
             note: None,
             note_flag: false,
