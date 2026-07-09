@@ -62,6 +62,8 @@ impl Clone for App {
             agent_reload_counter: self.agent_reload_counter,
             observers: Vec::new(),
             last_known_prompt_tokens: self.last_known_prompt_tokens,
+            goal_mode: self.goal_mode.clone(),
+            last_turn_had_tool_calls: self.last_turn_had_tool_calls,
         }
     }
 }
@@ -103,6 +105,12 @@ pub(super) struct App {
     /// 上一次请求服务端返回的实际 prompt_tokens（来自 usage 统计）。
     /// 用于在下一次请求的 max_tokens clamp 中替代字符估算，提高精度。
     pub(super) last_known_prompt_tokens: Option<u64>,
+    /// Goal 模式状态。`None` = 未启用；`Some("")` = 等待用户输入目标；
+    /// `Some(goal)` = 目标已设定，agent 自动持续推进直到完成。
+    pub(super) goal_mode: Option<String>,
+    /// 上一轮 turn 是否调用了工具。goal 模式下用于判定目标是否完成：
+    /// 若一轮结束时未调用任何工具，视为 agent 已交付最终结果。
+    pub(super) last_turn_had_tool_calls: bool,
 }
 
 impl App {

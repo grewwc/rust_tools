@@ -87,6 +87,8 @@
                 crate::ai::driver::thinking::ThinkingOrchestrator::new(),
             )],
             last_known_prompt_tokens: None,
+            goal_mode: None,
+            last_turn_had_tool_calls: false,
         }
     }
 
@@ -465,7 +467,7 @@
             &mut current_history,
             &markers,
             &mut state,
-            normalize::StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             Some("response.completed"),
             r#"{"status":"completed"}"#,
         )
@@ -477,7 +479,7 @@
             &mut current_history,
             &markers,
             &mut state,
-            normalize::StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             Some("response.output_text.done"),
             r#"{"text":"hello world"}"#,
         )
@@ -500,7 +502,7 @@
             &mut current_history,
             &markers,
             &mut state,
-            normalize::StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             Some("response.reasoning_text.delta"),
             r#"{"delta":"step 1\nstep 2\nstep 3"}"#,
         )
@@ -516,7 +518,7 @@
             &mut current_history,
             &markers,
             &mut state,
-            normalize::StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             Some("response.output_text.delta"),
             r#"{"delta":"final answer"}"#,
         )
@@ -734,7 +736,7 @@
             &mut current_history,
             &markers,
             &mut state,
-            normalize::StreamProviderAdapterKind::OpenCode,
+            provider::opencode_adapter(),
             Some("response.output_text.delta"),
             r#"{"delta":"hello wor"}"#,
         )
@@ -745,7 +747,7 @@
             &mut current_history,
             &markers,
             &mut state,
-            normalize::StreamProviderAdapterKind::OpenCode,
+            provider::opencode_adapter(),
             Some("response.output_text.done"),
             r#"{"text":"hello world"}"#,
         )
@@ -767,7 +769,7 @@
             &mut current_history,
             &markers,
             &mut state,
-            normalize::StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             Some("response.output_item.added"),
             r#"{"output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"write_file","arguments":""}}"#,
         )
@@ -778,7 +780,7 @@
             &mut current_history,
             &markers,
             &mut state,
-            normalize::StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             Some("response.function_call_arguments.delta"),
             r#"{"output_index":0,"delta":"{\"path\":\"a"}"#,
         )
@@ -789,7 +791,7 @@
             &mut current_history,
             &markers,
             &mut state,
-            normalize::StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             Some("response.function_call_arguments.done"),
             r#"{"output_index":0,"arguments":"{\"path\":\"abc\"}"}"#,
         )

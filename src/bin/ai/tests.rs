@@ -91,6 +91,8 @@ fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
         last_known_prompt_tokens: None,
+        goal_mode: None,
+        last_turn_had_tool_calls: false,
     }
 }
 
@@ -173,6 +175,8 @@ fn resolve_model_is_unicode_safe() {
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
         last_known_prompt_tokens: None,
+        goal_mode: None,
+        last_turn_had_tool_calls: false,
     };
 
     let mut question = "a 什么是rust的一个crate？".to_string();
@@ -702,7 +706,11 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
 }
 
 #[test]
-fn compression_spills_recent_non_compressible_tool_output() {
+fn compression_keeps_recent_non_compressible_tool_output_verbatim() {
+    // 回归测试：最近 KEEP_RECENT_TOOL_MESSAGES 条 read_file 等「不可压缩」工具
+    // 结果必须逐字保留，绝不能外溢成 stub。否则模型在下一轮请求里看到的是
+    // 「已卸载，请重读」而非文件内容，会立刻再发一次同样的 read_file——在会话
+    // 超软阈值、每轮都跑压缩时表现为无限重读（用户报告的"不停 read_file"）。
     let overflow_dir = std::env::temp_dir().join(format!(
         "ai-preserve-overflow-recent-{}",
         uuid::Uuid::new_v4()
@@ -715,6 +723,7 @@ fn compression_spills_recent_non_compressible_tool_output() {
         reasoning_content: None,
     }];
 
+    let recent_output = "y".repeat(12_000);
     messages.push(Message {
         role: "assistant".to_string(),
         content: Value::String(String::new()),
@@ -731,7 +740,7 @@ fn compression_spills_recent_non_compressible_tool_output() {
     });
     messages.push(Message {
         role: "tool".to_string(),
-        content: Value::String("y".repeat(12_000)),
+        content: Value::String(recent_output.clone()),
         tool_calls: None,
         tool_call_id: Some("call_recent".to_string()),
         reasoning_content: None,
@@ -740,22 +749,21 @@ fn compression_spills_recent_non_compressible_tool_output() {
     let compressed =
         compress_messages_for_context(messages, 32_000, 256, 400, Some(overflow_dir.clone()));
 
-    let stub = compressed
-        .iter()
-        .find_map(|m| {
-            let text = m.content.as_str()?;
-            text.contains("Output preserved for non-compressible tool `read_file`")
-                .then_some(text.to_string())
-        })
-        .expect("expected preserved read_file overflow stub for recent tool output");
-
-    let file_path = stub
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("- file_path: "))
-        .expect("stub should contain overflow file path");
+    // 最近这条 read_file 结果既不应被外溢成 stub，也不应被裁剪：逐字可见。
     assert!(
-        std::path::Path::new(file_path).exists(),
-        "recent overflow file path from stub should exist: {file_path}"
+        compressed.iter().all(|m| {
+            m.content
+                .as_str()
+                .map(|s| !s.contains("Output preserved for non-compressible tool"))
+                .unwrap_or(true)
+        }),
+        "recent non-compressible tool output must not be spilled to a stub"
+    );
+    assert!(
+        compressed
+            .iter()
+            .any(|m| m.content.as_str() == Some(recent_output.as_str())),
+        "recent read_file output must remain verbatim in context"
     );
 
     let _ = std::fs::remove_dir_all(&overflow_dir);

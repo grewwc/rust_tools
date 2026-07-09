@@ -86,6 +86,8 @@
             agent_reload_counter: None,
             observers: Vec::new(),
             last_known_prompt_tokens: None,
+            goal_mode: None,
+            last_turn_had_tool_calls: false,
         }
     }
 

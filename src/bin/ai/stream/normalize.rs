@@ -1,38 +1,12 @@
 use crate::ai::{
-    provider::{self, ApiProvider},
+    provider::ProviderAdapter,
     request::{StreamChoice, StreamChunk, StreamDelta, StreamFunctionCall, StreamToolCall},
 };
 
 use super::state::ParsedStreamPayload;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum StreamProviderAdapterKind {
-    Alibaba,
-    Compatible,
-    OpenAi,
-    OpenRouter,
-    OpenCode,
-}
-
-pub(super) fn resolve_adapter_kind(
-    provider: ApiProvider,
-    endpoint: &str,
-) -> StreamProviderAdapterKind {
-    let endpoint = endpoint.trim().to_ascii_lowercase();
-    if endpoint.contains("openrouter.ai") {
-        return StreamProviderAdapterKind::OpenRouter;
-    }
-
-    match provider {
-        ApiProvider::Alibaba => StreamProviderAdapterKind::Alibaba,
-        ApiProvider::OpenAi => StreamProviderAdapterKind::OpenAi,
-        ApiProvider::OpenCode => StreamProviderAdapterKind::OpenCode,
-        ApiProvider::Compatible => StreamProviderAdapterKind::Compatible,
-    }
-}
-
 pub(super) fn parse_stream_payload(
-    adapter_kind: StreamProviderAdapterKind,
+    adapter: &'static dyn ProviderAdapter,
     payload: &str,
     event_type: Option<&str>,
 ) -> ParsedStreamPayload {
@@ -57,14 +31,7 @@ pub(super) fn parse_stream_payload(
         }
     }
 
-    match adapter_kind {
-        StreamProviderAdapterKind::Alibaba => provider::alibaba_adapter(),
-        StreamProviderAdapterKind::Compatible => provider::compatible_adapter(),
-        StreamProviderAdapterKind::OpenAi => provider::openai_adapter(),
-        StreamProviderAdapterKind::OpenRouter => provider::openrouter_adapter(),
-        StreamProviderAdapterKind::OpenCode => provider::opencode_adapter(),
-    }
-    .parse_provider_chunk(payload)
+    adapter.parse_provider_chunk(payload)
 }
 
 fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStreamPayload> {
@@ -484,13 +451,13 @@ pub(in crate::ai) fn try_parse_stream_chunk_loose(payload: &str) -> Option<Strea
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamProviderAdapterKind, parse_stream_payload, resolve_adapter_kind};
-    use crate::ai::{provider::ApiProvider, stream::state::ParsedStreamPayload};
+    use super::parse_stream_payload;
+    use crate::ai::{provider, stream::state::ParsedStreamPayload};
 
     #[test]
     fn parse_stream_payload_accepts_plain_json_payload() {
         let payload = r#"{"choices":[{"delta":{"content":"hello"}}]}"#;
-        match parse_stream_payload(StreamProviderAdapterKind::OpenAi, payload, None) {
+        match parse_stream_payload(provider::openai_adapter(), payload, None) {
             ParsedStreamPayload::Chunk(chunk) => {
                 assert_eq!(chunk.choices[0].delta.content, "hello");
             }
@@ -500,35 +467,35 @@ mod tests {
 
     #[test]
     fn openrouter_endpoint_uses_openrouter_adapter() {
-        let adapter = resolve_adapter_kind(
-            ApiProvider::OpenAi,
+        let adapter = provider::adapter_for(
+            crate::ai::provider::ApiProvider::OpenAi,
             "https://openrouter.ai/api/v1/chat/completions",
         );
-        assert_eq!(adapter, StreamProviderAdapterKind::OpenRouter);
+        assert_eq!(adapter.label(), "openrouter");
     }
 
     #[test]
     fn alibaba_provider_uses_alibaba_adapter() {
-        let adapter = resolve_adapter_kind(
-            ApiProvider::Alibaba,
+        let adapter = provider::adapter_for(
+            crate::ai::provider::ApiProvider::Alibaba,
             "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
         );
-        assert_eq!(adapter, StreamProviderAdapterKind::Alibaba);
+        assert_eq!(adapter.label(), "alibaba");
     }
 
     #[test]
     fn opencode_provider_uses_opencode_adapter() {
-        let adapter = resolve_adapter_kind(
-            ApiProvider::OpenCode,
+        let adapter = provider::adapter_for(
+            crate::ai::provider::ApiProvider::OpenCode,
             "https://opencode.ai/zen/v1/chat/completions",
         );
-        assert_eq!(adapter, StreamProviderAdapterKind::OpenCode);
+        assert_eq!(adapter.label(), "opencode");
     }
 
     #[test]
     fn opencode_payload_accepts_structured_content_chunks() {
         let payload = r#"{"id":"chatcmpl-1","choices":[{"delta":{"content":[{"type":"output_text","text":"hi"}]}}]}"#;
-        match parse_stream_payload(StreamProviderAdapterKind::OpenCode, payload, None) {
+        match parse_stream_payload(provider::opencode_adapter(), payload, None) {
             ParsedStreamPayload::Chunk(chunk) => {
                 assert_eq!(chunk.choices[0].delta.content, "hi");
             }
@@ -540,7 +507,7 @@ mod tests {
     fn opencode_payload_accepts_message_snapshot_reasoning() {
         let payload =
             r#"{"choices":[{"message":{"reasoning_content":"step","content":"answer"}}]}"#;
-        match parse_stream_payload(StreamProviderAdapterKind::OpenCode, payload, None) {
+        match parse_stream_payload(provider::opencode_adapter(), payload, None) {
             ParsedStreamPayload::Chunk(chunk) => {
                 assert_eq!(chunk.choices[0].delta.reasoning_content, "step");
                 assert_eq!(chunk.choices[0].delta.content, "answer");
@@ -552,7 +519,7 @@ mod tests {
     #[test]
     fn opencode_payload_with_wrapped_json_still_parses() {
         let payload = r#"noise {"choices":[{"delta":{"content":"hello"}}]} trailing"#;
-        match parse_stream_payload(StreamProviderAdapterKind::OpenCode, payload, None) {
+        match parse_stream_payload(provider::opencode_adapter(), payload, None) {
             ParsedStreamPayload::Chunk(chunk) => {
                 assert_eq!(chunk.choices[0].delta.content, "hello");
             }
@@ -564,7 +531,7 @@ mod tests {
     fn reasoning_event_delta_maps_to_reasoning_chunk() {
         let payload = r#"{"delta":"step one"}"#;
         match parse_stream_payload(
-            StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             payload,
             Some("response.reasoning_text.delta"),
         ) {
@@ -580,7 +547,7 @@ mod tests {
     fn output_text_event_delta_maps_to_content_chunk() {
         let payload = r#"{"delta":"hello"}"#;
         match parse_stream_payload(
-            StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             payload,
             Some("response.output_text.delta"),
         ) {
@@ -596,7 +563,7 @@ mod tests {
     fn output_text_done_event_maps_to_snapshot_chunk() {
         let payload = r#"{"text":"hello world"}"#;
         match parse_stream_payload(
-            StreamProviderAdapterKind::OpenCode,
+            provider::opencode_adapter(),
             payload,
             Some("response.output_text.done"),
         ) {
@@ -612,7 +579,7 @@ mod tests {
     fn function_call_arguments_delta_maps_to_tool_call_chunk() {
         let payload = r#"{"output_index":2,"item_id":"fc_item_1","delta":"{\"path\":\"a"}"#;
         match parse_stream_payload(
-            StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             payload,
             Some("response.function_call_arguments.delta"),
         ) {
@@ -631,7 +598,7 @@ mod tests {
     fn function_call_arguments_done_maps_to_snapshot_tool_call_chunk() {
         let payload = r#"{"output_index":2,"arguments":"{\"path\":\"abc\"}"}"#;
         match parse_stream_payload(
-            StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             payload,
             Some("response.function_call_arguments.done"),
         ) {
@@ -648,7 +615,7 @@ mod tests {
     fn output_item_added_maps_function_call_metadata() {
         let payload = r#"{"output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"write_file","arguments":""}}"#;
         match parse_stream_payload(
-            StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             payload,
             Some("response.output_item.added"),
         ) {
@@ -667,7 +634,7 @@ mod tests {
     fn output_item_done_maps_final_function_call_snapshot() {
         let payload = r#"{"output_index":1,"item":{"type":"function_call","call_id":"call_1","name":"write_file","arguments":"{\"path\":\"a.rs\"}"}}"#;
         match parse_stream_payload(
-            StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             payload,
             Some("response.output_item.done"),
         ) {
@@ -686,7 +653,7 @@ mod tests {
     fn content_part_added_event_maps_to_content_chunk() {
         let payload = r#"{"part":{"type":"output_text","text":"hello"}}"#;
         match parse_stream_payload(
-            StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             payload,
             Some("response.content_part.added"),
         ) {
@@ -701,7 +668,7 @@ mod tests {
     fn refusal_done_event_maps_to_snapshot_content_chunk() {
         let payload = r#"{"refusal":"cannot comply"}"#;
         match parse_stream_payload(
-            StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             payload,
             Some("response.refusal.done"),
         ) {
@@ -716,7 +683,7 @@ mod tests {
     fn response_completed_event_is_not_treated_as_immediate_stop() {
         let payload = r#"{"status":"completed"}"#;
         match parse_stream_payload(
-            StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             payload,
             Some("response.completed"),
         ) {
@@ -730,7 +697,7 @@ mod tests {
         // provider 在流中途返回 {"error":{"message":"rate limited","type":"server_error"}}
         // 此前 StreamChunk 的 #[serde(default)] 会把它反序列化为空 chunk 静默丢弃。
         let payload = r#"{"error":{"message":"rate limited","type":"server_error"}}"#;
-        match parse_stream_payload(StreamProviderAdapterKind::OpenAi, payload, None) {
+        match parse_stream_payload(provider::openai_adapter(), payload, None) {
             ParsedStreamPayload::Error(msg) => {
                 assert!(msg.contains("rate limited"), "msg was: {msg}");
                 assert!(msg.contains("server_error"), "msg was: {msg}");
@@ -742,7 +709,7 @@ mod tests {
     #[test]
     fn error_object_with_string_value_is_extracted() {
         let payload = r#"{"error":"internal server error"}"#;
-        match parse_stream_payload(StreamProviderAdapterKind::OpenAi, payload, None) {
+        match parse_stream_payload(provider::openai_adapter(), payload, None) {
             ParsedStreamPayload::Error(msg) => {
                 assert_eq!(msg, "internal server error");
             }
@@ -753,7 +720,7 @@ mod tests {
     #[test]
     fn error_object_with_code_and_message_is_extracted() {
         let payload = r#"{"error":{"code":"429","message":"Too Many Requests"}}"#;
-        match parse_stream_payload(StreamProviderAdapterKind::Alibaba, payload, None) {
+        match parse_stream_payload(provider::alibaba_adapter(), payload, None) {
             ParsedStreamPayload::Error(msg) => {
                 assert!(msg.contains("429"), "msg was: {msg}");
                 assert!(msg.contains("Too Many Requests"), "msg was: {msg}");
@@ -766,7 +733,7 @@ mod tests {
     fn normal_chunk_without_error_field_still_parses() {
         // 确保正常 chunk 不被 extract_provider_error 误判
         let payload = r#"{"choices":[{"delta":{"content":"hello"}}]}"#;
-        match parse_stream_payload(StreamProviderAdapterKind::OpenAi, payload, None) {
+        match parse_stream_payload(provider::openai_adapter(), payload, None) {
             ParsedStreamPayload::Chunk(chunk) => {
                 assert_eq!(chunk.choices[0].delta.content, "hello");
             }
@@ -778,7 +745,7 @@ mod tests {
     fn usage_only_chunk_without_error_field_still_ignored() {
         // OpenAI 尾包：choices 为空但带 usage，不应被误判为 error
         let payload = r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#;
-        match parse_stream_payload(StreamProviderAdapterKind::OpenAi, payload, None) {
+        match parse_stream_payload(provider::openai_adapter(), payload, None) {
             ParsedStreamPayload::Chunk(chunk) => {
                 assert!(chunk.choices.is_empty());
                 assert!(chunk.usage.is_some());
@@ -791,7 +758,7 @@ mod tests {
     fn response_failed_event_surfaces_error() {
         let payload = r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"model overloaded"}}}"#;
         match parse_stream_payload(
-            StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             payload,
             Some("response.failed"),
         ) {
@@ -806,7 +773,7 @@ mod tests {
     fn response_incomplete_event_surfaces_reason() {
         let payload = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#;
         match parse_stream_payload(
-            StreamProviderAdapterKind::OpenAi,
+            provider::openai_adapter(),
             payload,
             Some("response.incomplete"),
         ) {

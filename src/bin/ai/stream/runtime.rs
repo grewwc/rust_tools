@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use crate::ai::{
     config_schema::AiConfig,
     models,
+    provider::{self, ProviderAdapter},
     request::StreamChunk,
     theme::{ACCENT_MUTED, ACCENT_RULE, DIM, RESET},
     types::{App, StreamOutcome, StreamResult, take_stream_cancelled},
@@ -49,7 +50,7 @@ pub(super) async fn stream_response(
     let markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     configure_thinking_fold(&mut state);
-    let adapter_kind = normalize::resolve_adapter_kind(
+    let adapter = provider::adapter_for(
         models::model_provider(&app.current_model),
         &models::endpoint_for_model(&app.current_model, &app.config.endpoint),
     );
@@ -103,7 +104,7 @@ pub(super) async fn stream_response(
             current_history,
             &markers,
             &mut state,
-            adapter_kind,
+            adapter,
             chunk_result,
         )
         .await?
@@ -117,7 +118,7 @@ pub(super) async fn stream_response(
     }
 
     if let Some(result) =
-        process_pending_tail(app, current_history, &markers, &mut state, adapter_kind).await?
+        process_pending_tail(app, current_history, &markers, &mut state, adapter).await?
     {
         return Ok(result);
     }
@@ -231,14 +232,14 @@ async fn process_chunk_result<T: AsRef<[u8]>>(
     current_history: &mut String,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
-    adapter_kind: normalize::StreamProviderAdapterKind,
+    adapter: &'static dyn ProviderAdapter,
     chunk_result: Result<Option<T>, reqwest::Error>,
 ) -> Result<StreamChunkStep, Box<dyn std::error::Error>> {
     match chunk_result {
         Ok(Some(chunk)) => {
             framing::push_chunk(&mut state.framing, chunk.as_ref());
             state.framing.decode_error_count = 0;
-            consume_pending_complete_lines(app, current_history, markers, state, adapter_kind).await
+            consume_pending_complete_lines(app, current_history, markers, state, adapter).await
         }
         Ok(None) => Ok(StreamChunkStep::Stop),
         Err(err) => {
@@ -256,14 +257,14 @@ async fn consume_pending_complete_lines(
     current_history: &mut String,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
-    adapter_kind: normalize::StreamProviderAdapterKind,
+    adapter: &'static dyn ProviderAdapter,
 ) -> Result<StreamChunkStep, Box<dyn std::error::Error>> {
     // Move the pending buffer out so line slices can borrow from it while `state`
     // remains available for mutation inside `process_stream_line()`.
     let lines = framing::take_complete_lines(&mut state.framing);
     let mut should_stop = false;
     for line in lines {
-        if process_stream_line(app, current_history, markers, state, adapter_kind, &line)? {
+        if process_stream_line(app, current_history, markers, state, adapter, &line)? {
             should_stop = true;
             break;
         }
@@ -280,13 +281,13 @@ async fn process_pending_tail(
     current_history: &mut String,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
-    adapter_kind: normalize::StreamProviderAdapterKind,
+    adapter: &'static dyn ProviderAdapter,
 ) -> Result<Option<StreamResult>, Box<dyn std::error::Error>> {
     if state.framing.pending.is_empty() {
         // pending 为空时，仍需检查 sse_event_data 是否有未 flush 的最后一个事件。
         // 部分 provider 在关闭连接前不发送最终空行（\n\n），导致最后一个 SSE 事件被丢弃。
         if !state.framing.sse_event_data.trim().is_empty() {
-            if flush_sse_event(app, current_history, markers, state, adapter_kind)? {
+            if flush_sse_event(app, current_history, markers, state, adapter)? {
                 let final_state = std::mem::replace(state, StreamProcessingState::new());
                 return Ok(Some(finalize_stream_response(app, markers, final_state)?));
             }
@@ -298,9 +299,9 @@ async fn process_pending_tail(
         return Ok(None);
     };
     if !line.is_empty() {
-        let _ = process_stream_line(app, current_history, markers, state, adapter_kind, &line)?;
+        let _ = process_stream_line(app, current_history, markers, state, adapter, &line)?;
     }
-    if flush_sse_event(app, current_history, markers, state, adapter_kind)? {
+    if flush_sse_event(app, current_history, markers, state, adapter)? {
         let final_state = std::mem::replace(state, StreamProcessingState::new());
         return Ok(Some(finalize_stream_response(app, markers, final_state)?));
     }
@@ -1052,12 +1053,12 @@ fn process_stream_payload(
     current_history: &mut String,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
-    adapter_kind: normalize::StreamProviderAdapterKind,
+    adapter: &'static dyn ProviderAdapter,
     event_type: Option<&str>,
     payload: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let (chunk, merge_mode) =
-        match normalize::parse_stream_payload(adapter_kind, payload, event_type) {
+        match normalize::parse_stream_payload(adapter, payload, event_type) {
             super::state::ParsedStreamPayload::Ignore => return Ok(false),
             super::state::ParsedStreamPayload::Done => return Ok(true),
             super::state::ParsedStreamPayload::Error(msg) => {
@@ -1220,7 +1221,7 @@ fn flush_sse_event(
     current_history: &mut String,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
-    adapter_kind: normalize::StreamProviderAdapterKind,
+    adapter: &'static dyn ProviderAdapter,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let Some(event) = framing::flush_sse_event(&mut state.framing) else {
         return Ok(false);
@@ -1230,7 +1231,7 @@ fn flush_sse_event(
         current_history,
         markers,
         state,
-        adapter_kind,
+        adapter,
         event.event_type.as_deref(),
         &event.payload,
     )
@@ -1241,7 +1242,7 @@ fn process_stream_line(
     current_history: &mut String,
     markers: &StreamMarkers,
     state: &mut StreamProcessingState,
-    adapter_kind: normalize::StreamProviderAdapterKind,
+    adapter: &'static dyn ProviderAdapter,
     line: &str,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if let Some(event) = framing::consume_sse_line(&mut state.framing, line) {
@@ -1250,7 +1251,7 @@ fn process_stream_line(
             current_history,
             markers,
             state,
-            adapter_kind,
+            adapter,
             event.event_type.as_deref(),
             &event.payload,
         );

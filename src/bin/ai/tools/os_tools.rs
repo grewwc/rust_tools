@@ -162,7 +162,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_spawn_process,
         execute: execute_spawn_process,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -201,7 +201,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_sleep_process,
         execute: execute_sleep_process,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -245,7 +245,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_wait_process,
         execute: execute_wait_process,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -293,7 +293,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_kill_process,
         execute: execute_kill_process,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -341,7 +341,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_send_ipc,
         execute: execute_send_ipc,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -380,7 +380,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_reap_process,
         execute: execute_reap_process,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -415,7 +415,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_read_mailbox,
         execute: execute_read_mailbox,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -452,7 +452,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_set_env,
         execute: execute_set_env,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -525,7 +525,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_ps_processes,
         execute: execute_ps_processes,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -625,7 +625,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_ps_ipc,
         execute: execute_ps_ipc,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -689,7 +689,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_signal_process,
         execute: execute_signal_process,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -726,7 +726,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_set_process_group,
         execute: execute_set_process_group,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -777,7 +777,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_signal_process_group,
         execute: execute_signal_process_group,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -814,7 +814,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_shm_create,
         execute: execute_shm_create,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -879,7 +879,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_shm_read,
         execute: execute_shm_read,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -914,7 +914,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_shm_write,
         execute: execute_shm_write,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -947,7 +947,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_shm_delete,
         execute: execute_shm_delete,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -982,7 +982,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_set_working_dir,
         execute: execute_set_working_dir,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 
@@ -1037,7 +1037,7 @@ inventory::submit!(ToolRegistration {
         parameters: params_spawn_daemon,
         execute: execute_spawn_daemon,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core", "executor"],
+        groups: &["builtin", "executor"],
     }
 });
 

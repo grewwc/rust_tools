@@ -530,6 +530,8 @@ mod tests {
             agent_reload_counter: None,
             observers: Vec::new(),
             last_known_prompt_tokens: None,
+            goal_mode: None,
+            last_turn_had_tool_calls: false,
         }
     }
 
@@ -666,12 +668,19 @@ mod tests {
                 )
             })
             .collect::<String>();
+        // 大体量 find_path 结果必须位于「最近 6 条工具结果」保护窗之外才会被外溢，
+        // 否则近端窗口会逐字保留（防止刚检索到的内容被卸载导致模型重复检索）。
         let mut messages = vec![
             msg("system", "system prompt must stay exact"),
             assistant_tool_call("call-1", "find_path"),
             tool_result("call-1", exact_output.clone()),
-            current_user.clone(),
         ];
+        for i in 0..6usize {
+            let id = format!("recent-{i}");
+            messages.push(assistant_tool_call(&id, "list_directory"));
+            messages.push(tool_result(&id, format!("recent tool output {i}")));
+        }
+        messages.push(current_user.clone());
 
         let report = apply_pre_request_context_budget(&app, &app.current_model, &mut messages);
 
@@ -679,7 +688,9 @@ mod tests {
         assert_eq!(messages.last().unwrap(), &current_user);
         let tool_content = messages
             .iter()
-            .find(|message| message.role == "tool")
+            .find(|message| {
+                message.role == "tool" && message.tool_call_id.as_deref() == Some("call-1")
+            })
             .and_then(|message| message.content.as_str())
             .expect("tool content");
         assert!(tool_content.contains("Output preserved for non-compressible tool `find_path`"));

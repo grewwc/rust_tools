@@ -489,7 +489,7 @@ fn prompt_cache_config_enabled() -> bool {
     configw::get_all_config()
         .get(
             crate::ai::config_schema::AiConfig::PROMPT_CACHE_ENABLE,
-            "false",
+            "true",
         )
         .trim()
         .eq_ignore_ascii_case("true")

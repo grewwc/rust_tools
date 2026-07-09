@@ -277,6 +277,9 @@ pub(super) async fn finalize_turn(
         let had_tool_calls = turn_messages
             .iter()
             .any(|m| m.role == "tool" || m.tool_calls.as_ref().map_or(false, |c| !c.is_empty()));
+        // goal 模式下，run_loop 通过此标志判定目标是否完成：
+        // 一轮结束时没有调用任何工具 = agent 已交付最终结果。
+        app.last_turn_had_tool_calls = had_tool_calls;
         {
             // 用块限制 compact_result 的生命周期，避免它跨越 await 导致 Send 问题
             let compact_result = if had_tool_calls {
@@ -333,6 +336,7 @@ pub(super) async fn finalize_turn(
         let _ = poisoned;
     } else {
         println!("{}", format_empty_state("no response"));
+        app.last_turn_had_tool_calls = false;
     }
 
     Ok(if should_quit {

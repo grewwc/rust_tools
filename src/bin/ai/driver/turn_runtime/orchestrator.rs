@@ -1217,7 +1217,10 @@ async fn run_turn_body(
     let loop_result = loop_result.map_err(|e: Box<dyn std::error::Error>| e.to_string());
 
     match loop_result {
-        Ok(Some(outcome)) => Ok(outcome),
+        Ok(Some(outcome)) => {
+            app.last_turn_had_tool_calls = false;
+            Ok(outcome)
+        }
         Ok(_) => {
             finalize_turn(
                 app,

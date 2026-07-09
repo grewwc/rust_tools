@@ -9,6 +9,7 @@
   - `async_pipe.rs`: async tool pipe system (task_spawn/task_status/task_wait lifecycle, channel/futex, snapshot persistence)
   - `tests.rs`: tool execution tests
   - `barrier.rs`, `oauth.rs`, `sync_task.rs`: specialized submodules
+- `commands/goal.rs`: `/goal` slash command — activates goal mode (persistent auto-continuation until goal achieved)
 
 ## Scope
 
@@ -101,6 +102,25 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
    tail_preview, giving the model recall anchors so it can decide whether a
    re-read is needed without blindly re-calling `read_file`. `is_non_compressible_tool`
    (read_file/code_search/text_grep/etc.) never goes through lossy `line_trim_middle`.
+   Pre-request budget offload (`prepare_tool_messages_structured`) additionally
+   **protects the most recent `KEEP_RECENT_TOOL_MESSAGES` tool results from
+   spilling** — including non-compressible ones. Offloading the *just-read*
+   file/search output to a stub makes the model see "moved to disk, re-read it"
+   instead of content, so it re-issues the same `read_file` every turn (amnesia
+   loop, seen as `offload_only` climbing +1/turn while total chars keep growing).
+   Only precision results *outside* the recent window spill to disk.
+
+## Goal 模式
+
+`/goal` slash command 启动 goal 模式：agent 自动持续推进目标直到完成。
+
+- **状态存储**: `App::goal_mode` — `None`=未启用；`Some("")`=等待用户输入目标；
+  `Some(goal)`=目标已设定，自动推进。`goal_iterations` 记录已推进轮数，
+  `goal_last_turn_had_tool_calls` 标记上一轮是否有工具调用。
+- **交互方式**: `/goal` 后可直接跟目标文本，也可只输入 `/goal` 再在下一轮输入目标。
+  `/goal off` 退出 goal 模式。
+- **自动推进**: `run_loop` 在 goal 模式下跳过用户输入，注入 `"[goal: ...] 继续推进目标"` 作为下一轮输入；
+  若上一轮无工具调用且已有 >1 轮，认为目标完成，自动退出。`/done` 也可手动退出。
 
 ## Related detailed guide
 

@@ -1670,6 +1670,8 @@ pub(in crate::ai) async fn run_with_cli(
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
         last_known_prompt_tokens: None,
+        goal_mode: None,
+        last_turn_had_tool_calls: false,
     };
     if let Some(notice) = startup_notice {
         println!("{notice}");
@@ -2405,6 +2407,34 @@ async fn run_loop(
         }
 
         {
+            // ── Goal 模式自动续推 ──
+            // 当 goal 已设定且上一轮调用了工具时，跳过用户输入，直接注入
+            // continuation prompt 让 agent 继续推进目标。
+            let goal_continuation = app
+                .goal_mode
+                .as_ref()
+                .filter(|g| !g.is_empty() && app.last_turn_had_tool_calls && !one_shot_mode)
+                .map(|g| {
+                    commands::goal::build_goal_continuation_prompt(g)
+                });
+
+            if let Some(cont) = goal_continuation {
+                question = cont;
+                attachments_text = String::new();
+                history_count = 0;
+            } else {
+                // goal 激活但上一轮无工具调用 → 目标已达成，退出 goal 模式
+                if app.goal_mode.as_ref().map_or(false, |g| !g.is_empty())
+                    && !one_shot_mode
+                {
+                    use colored::Colorize;
+                    println!(
+                        "{} Goal achieved. Exiting goal mode.",
+                        "[goal]".green().bold()
+                    );
+                    app.goal_mode = None;
+                }
+
             let Some(ctx) = input::next_question(app)? else {
                 cleanup_one_shot(app);
                 return Ok(());
@@ -2416,6 +2446,7 @@ async fn run_loop(
             question = ctx.question;
             attachments_text = ctx.attachments_text;
             history_count = ctx.history_count;
+            }
         }
 
         if !one_shot_mode {
@@ -2446,6 +2477,16 @@ async fn run_loop(
                 continue;
             }
         }
+
+        // ── Goal 模式等待状态 ──
+        // 用户输入 `/goal` 后，下一条非 slash 消息作为目标内容。
+        // 将目标包装成 goal prompt 发送给 LLM，同时更新 goal_mode。
+        if app.goal_mode.as_ref().map_or(false, |g| g.is_empty()) {
+            let goal_text = question.clone();
+            app.goal_mode = Some(goal_text.clone());
+            question = commands::goal::build_goal_prompt(&goal_text);
+        }
+
         if note_search::note_search_interactive_mode(&app.cli) {
             match note_search::handle_note_search_interactive_turn(app, &question, history_count).await {
                 Ok(()) => {}

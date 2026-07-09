@@ -18,6 +18,7 @@ pub fn print_interactive_help() {
     println!("    /share [output.md]        export current session as shareable markdown");
     println!("    /close                    close and delete current session, then exit");
     println!("    /proc                     show running sessions (interactive + background)");
+    println!("    /goal [target]            enter goal mode: agent persists until the goal is done");
     println!();
     println!("  Persona management:");
     println!("    /personas                 list personas");

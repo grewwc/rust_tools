@@ -102,7 +102,12 @@ pub(super) fn prepare_tool_messages_structured(
         if let Some(name) = tool_name
             && is_non_compressible_tool(name)
         {
-            if text.chars().count() > max_chars_per_msg
+            // 最近 keep_recent 条不外溢：刚读到的文件/检索结果必须在下一轮请求里
+            // 完整可见，否则模型看到的是「已卸载，请重读」stub，会立刻再发一次
+            // 同样的 read_file——在会话超软阈值、每轮都跑压缩时表现为无限重读。
+            // 只有保护尾窗之外的旧 precision 结果才零压缩外溢到磁盘。
+            if rank < protect_from
+                && text.chars().count() > max_chars_per_msg
                 && let Some(path) = overflow_dir
                     .and_then(|dir| write_preserved_tool_overflow_file(dir, name, &text))
             {

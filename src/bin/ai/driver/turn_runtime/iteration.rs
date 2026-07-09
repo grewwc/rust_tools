@@ -338,8 +338,8 @@ async fn request_model_response(
     // 无损+弱损压缩后仍远超阈值时，调用 LLM 把早期对话压成摘要。
     // 这是发送请求前的最后一道防线，避免超大上下文导致模型 4xx 或质量退化
     // （用户报告的 "295K 压到 294K 就停了" 问题）。
-    // 阈值取 history_max_chars * 2（默认 240K），比 orchestrator 的 hard
-    // threshold（*3.5 = 420K）更积极——后者只在工具调用间隙触发，此处覆盖
+    // 阈值取 history_max_chars * 2（默认 180K），比 orchestrator 的 hard
+    // threshold（*3.5 = 315K）更积极——后者只在工具调用间隙触发，此处覆盖
     // 每次请求前的最后检查。
     // 增长量守卫：自上次成功 LLM 摘要后需增长 ≥ MIN_GROWTH 才再次触发。
     // 失败/no-op 不写游标，避免把后续真正需要的 LLM compact 静默挡掉。

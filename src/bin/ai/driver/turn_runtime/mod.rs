@@ -77,7 +77,7 @@ pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_SOFT_FLOOR: usiz
 pub(in crate::ai::driver::turn_runtime) const MID_TURN_COMPRESS_HARD_FLOOR: usize = 80_000;
 
 /// 软阈值：min 36K，否则取 history_max_chars * 1.5。
-/// history_max_chars 默认 120K，对应软阈值 180K。
+/// history_max_chars 默认 90K，对应软阈值 135K。
 ///
 /// 但字符阈值与模型的 token 窗口是两套单位：一个高占用 prompt 可能远未触及
 /// 180K 字符阈值，却已逼近模型 token 窗口。[`token_window_char_ceiling`] 给出
@@ -94,7 +94,7 @@ pub(in crate::ai::driver::turn_runtime) fn mid_turn_compress_soft_threshold(
 }
 
 /// 硬阈值：min 80K，否则取 history_max_chars * 3.5。
-/// history_max_chars 默认 120K，对应硬阈值 420K（远超模型 context window，
+/// history_max_chars 默认 90K，对应硬阈值 315K（远超模型 context window，
 /// 实际硬阈值会被模型 4xx 之前的 normalize_messages_for_request 拦截）。
 /// 但相对软阈值留出明显 gap，避免软阈值边界连续触发 LLM summary。
 /// 按 LLM 摘要字符阈值收口——LLM 摘要只在上下文接近模型实际 context window
@@ -225,6 +225,8 @@ mod tests {
                 crate::ai::driver::thinking::ThinkingOrchestrator::new(),
             )],
             last_known_prompt_tokens: None,
+            goal_mode: None,
+            last_turn_had_tool_calls: false,
         }
     }
 

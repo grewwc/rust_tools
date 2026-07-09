@@ -14,7 +14,13 @@ execution policy, sandboxing, path resolution, or progressive loading.
 2. Tool names use verb-first snake_case.
 3. Relative file paths must resolve against `runtime_ctx::effective_cwd()`.
 4. Baseline/progressive-loading behavior should stay explicit; do not silently
-   hide required entry-point tools.
+   hide required entry-point tools. The default per-turn tool set is the `core`
+   group (`DEFAULT_TURN_TOOL_GROUPS` in `driver/skill_runtime.rs`); tools tagged
+   only `builtin` (not `core`) are lazy — surfaced by name via `enable_tools` and
+   aged out when idle. The `os_tools` process/IPC/shm suite is intentionally
+   `builtin`+`executor` only (NOT `core`): it stays available to executor agents
+   and on-demand activation, but is kept out of the default request payload to
+   cut per-turn input tokens. Do not re-add `core` to bulk low-frequency tools.
 5. Prefer structural parsing over brittle string matching in validation paths.
 6. Tool display behavior (whether to echo call args and/or result to the
    terminal) is declared per-tool via an optional `ToolDisplayRegistration`
