@@ -326,6 +326,16 @@ pub(crate) fn should_try_model_fallback(err: &RequestError) -> bool {
     }
 }
 
+/// Returns `true` if the error indicates an auth or quota issue with the API key
+/// (401 Unauthorized, 403 Forbidden, 429 Too Many Requests), which should trigger
+/// key rotation when alternative OpenCode keys are available.
+pub(crate) fn should_rotate_opencode_key(err: &RequestError) -> bool {
+    matches!(
+        err.kind,
+        RequestErrorKind::Status(status) if matches!(status.as_u16(), 401 | 403 | 429)
+    )
+}
+
 /// 判断流式响应中途出现的错误是否值得重试。
 ///
 /// 流式错误（`provider stream error: ...`）发生在响应头已返回、body 传输过程中，

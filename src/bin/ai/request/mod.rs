@@ -55,7 +55,7 @@ pub(crate) use error::{
     clear_stale_request_interrupt_before_request, config_bool_is_true, config_forces_thinking,
     control_model_for_aux_tasks, endpoint_for_request_model, is_retryable_reqwest_error,
     is_retryable_status_with_body, is_transient_error, parse_retry_after, request_retry_policy,
-    request_retry_policy_for_current_context, retry_delay, send_with_hedged_backup,
+    request_retry_policy_for_current_context, retry_delay, send_with_hedged_backup, should_rotate_opencode_key,
     should_abort_retry_wait, should_retry_status, should_temporarily_disable_auto_selected_model,
     should_temporarily_disable_model, should_try_model_fallback, sleep_with_cancel, is_retryable_stream_error,
 };
@@ -123,11 +123,40 @@ pub(super) async fn do_request_messages(
     );
     let retry_policy = request_retry_policy_for_current_context();
 
+    // === OpenCode key rotation ===
+    let is_opencode =
+        models::model_provider(model) == crate::ai::provider::ApiProvider::OpenCode;
+    let primary_key = api_key_for_request_model(app, model);
+    let keys_to_try: Vec<String> = if is_opencode {
+        let mut keys = vec![primary_key.clone()];
+        for (k, v) in configw::get_all_config().entries() {
+            if k.starts_with("opencode.api_key") && k != "opencode.api_key" && !v.trim().is_empty()
+            {
+                let trimmed = v.trim().to_string();
+                if trimmed != primary_key && !keys.contains(&trimmed) {
+                    keys.push(trimmed);
+                }
+            }
+        }
+        keys
+    } else {
+        vec![primary_key]
+    };
+    let total_keys = keys_to_try.len();
+    let mut last_key_err: Option<RequestError> = None;
+
+    for (key_idx, api_key) in keys_to_try.iter().enumerate() {
+        if key_idx > 0 {
+            eprintln!(
+                "[opencode] key #{} failed, trying next key ({} remaining)",
+                key_idx,
+                total_keys - key_idx
+            );
+        }
     for attempt in 1..=retry_policy.max_attempts_429 {
         let endpoint = endpoint_for_request_model(app, model);
-        let api_key = api_key_for_request_model(app, model);
         let build_request = || {
-            apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+            apply_request_auth(app.client.post(&endpoint), &endpoint, api_key)
                 .header("Content-Type", "application/json")
                 .json(&request_body)
         };
@@ -220,6 +249,10 @@ pub(super) async fn do_request_messages(
                     }
                     continue;
                 }
+                if should_rotate_opencode_key(&err) && key_idx + 1 < total_keys {
+                    last_key_err = Some(err);
+                    break;
+                }
                 return Err(err);
             }
             Err(err) => {
@@ -247,10 +280,15 @@ pub(super) async fn do_request_messages(
         }
     }
 
-    Err(RequestError {
+    }
+    Err(last_key_err.unwrap_or_else(|| RequestError {
         kind: RequestErrorKind::Network,
-        message: "request failed".to_string(),
-    })
+        message: if is_opencode {
+            "all opencode keys exhausted".to_string()
+        } else {
+            "request failed".to_string()
+        },
+    }))
 }
 
 pub(super) fn build_content(

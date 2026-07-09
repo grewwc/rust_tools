@@ -101,7 +101,10 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
    key_lines (structural lines: fn/struct/trait/enum/error) + head_preview +
    tail_preview, giving the model recall anchors so it can decide whether a
    re-read is needed without blindly re-calling `read_file`. `is_non_compressible_tool`
-   (read_file/code_search/text_grep/etc.) never goes through lossy `line_trim_middle`.
+   (read_file/code_search/text_grep/web_search/**plan**/etc.) never goes through
+   lossy `line_trim_middle` or whole-group folding — `plan` is the multi-step
+   roadmap anchor: small in size but losing it makes the model forget the task
+   mid-flight, so it is preserved verbatim like retrieval results.
    Pre-request budget offload (`prepare_tool_messages_structured`) additionally
    **protects the most recent `KEEP_RECENT_TOOL_MESSAGES` tool results from
    spilling** — including non-compressible ones. Offloading the *just-read*

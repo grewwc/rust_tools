@@ -161,8 +161,10 @@ pub(super) fn is_non_compressible_tool(tool_name: &str) -> bool {
             | "text_grep"
             | "search_files"
             | "code_search"
-            | "web_search"
-            | "web_fetch"
+            // plan 是多步任务的路线图锚点，体量小但价值高。一旦被 lossy 裁剪或
+            // 整组折叠成 stub，模型就会丢失当前任务的步骤规划，表现为中途"忘了
+            // 在做什么"而原地打转。保留全文成本可忽略，故列入不可压缩集合。
+            | "plan"
     )
 }
 
