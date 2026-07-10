@@ -141,7 +141,18 @@ fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>)
 impl PromptEditor {
     pub(in crate::ai::prompt) fn read_multi_line_tui(&mut self) -> io::Result<Option<String>> {
         enable_raw_mode()?;
-        let _ = execute!(io::stdout(), EnableBracketedPaste);
+
+        // SSH 下禁用 bracketed paste：终端截获 Ctrl+V 后，如果剪贴板内容是图片（二进制），
+        // 无法通过 bracketed paste 传输，导致 paste event 为空或不触发。
+        // 禁用后 Ctrl+V 直接产生 Event::Key(Ctrl+V)，由 handler 通过 OSC52 通路读取剪贴板。
+        let is_ssh = std::env::var("SSH_CONNECTION").is_ok()
+            || std::env::var("SSH_CLIENT").is_ok()
+            || std::env::var("SSH_TTY").is_ok();
+        if is_ssh {
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
+        } else {
+            let _ = execute!(io::stdout(), EnableBracketedPaste);
+        }
 
         // Inline viewport 初始化会通过 append_lines() 真实撑开终端区域。空输入默认保持
         // 紧凑，避免每轮回答后和下一轮光标之间出现大段空白；编辑已有内容时再按预填行数
