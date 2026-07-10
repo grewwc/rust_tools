@@ -143,6 +143,19 @@
     "subagent_priority": 10
   },
   {
+    "key": "hy3-free",
+    "name": "hy3-free",
+    "provider": "opencode",
+    "quality_tier": "basic",
+    "is_vl": false,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "default_reasoning_effort": "high",
+    "enable_thinking": true,
+    "subagent_priority": 95,
+    "max_output_tokens": 32768
+  },
+  {
     "key": "deepseek-v4-flash-free-opencode",
     "aliases": [
       "DeepSeek V4 Flash Free"

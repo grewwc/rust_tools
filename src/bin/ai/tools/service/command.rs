@@ -849,6 +849,131 @@ fn blocked_git_subcommand(command_tokens: &[String]) -> Option<&'static str> {
         .map(|(_, reason)| *reason)
 }
 
+/// `git` 子命令中「会不可逆地丢弃或删除未提交工作」的判定。
+///
+/// 与 `BLOCKED_GIT_SUBCOMMANDS`（push/stash 这类全局禁止）不同，下面这些子命令在
+/// 部分参数组合下是无害的（如 `git switch` 分支切换、`git restore --staged` 取消暂存），
+/// 因此只在「确实会销毁未提交改动（工作树/暂存区改动、未跟踪文件）」时才拦截，避免误伤
+/// 正常流程。命中返回拒绝原因。
+///
+/// 覆盖用户要求的「禁止 `git checkout --` 以及任何会把当前未提交文件删掉且无法回滚的命令」。
+fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'static str> {
+    let idx = git_subcommand_index(command_tokens)?;
+    // 子命令名大小写不敏感，统一小写后匹配。
+    let sub = command_tokens[idx].to_ascii_lowercase();
+    let rest = &command_tokens[idx + 1..];
+    match sub.as_str() {
+        // `git checkout <branch>`（无 `--`、无 `--force`/`-B`）由 git 自身保护未提交改动，
+        // 冲突时直接报错，放行；其余会丢弃工作树改动的形态一律拦截。
+        // 注意：短选项区分大小写，`-B`(force-create/重置分支) 与 `-b`(创建分支) 不同，
+        // 必须区分；`-f`/`--force` 强切分支同样会丢改动。
+        "checkout" => {
+            if rest.iter().any(|t| t == "--") {
+                return Some("git checkout -- <path> discards uncommitted working-tree changes");
+            }
+            if rest.iter().any(|t| {
+                t == "-f"
+                    || t.eq_ignore_ascii_case("--force")
+                    || t == "-B"
+                    || t.eq_ignore_ascii_case("--force-create")
+            }) {
+                return Some(
+                    "git checkout --force/-B discards uncommitted changes when switching branches",
+                );
+            }
+            // 无 `--`、无 force 的情况下，用启发式判断是否为文件路径：
+            // 1. `.`/`..`/`./`/`../` 明显是路径形态，直接拦截。
+            // 2. 参数末尾含有文件扩展名（如 `src/main.rs`、`package.json`），
+            //    大概率是文件路径而非分支名；分支名/标签的 `.` 后缀通常是数字
+            //   （如 `v1.2.3`），不会全是字母，不会误拦。
+            let looks_like_path = rest.iter().any(|t| {
+                if t.starts_with('-') {
+                    return false;
+                }
+                t == "."
+                    || t == ".."
+                    || t.starts_with("./")
+                    || t.starts_with("../")
+                    || t.rfind('.').map_or(false, |pos| {
+                        // 跳过 `.` 开头的隐藏文件（.gitignore 等），已在上面覆盖。
+                        pos > 0 && {
+                            let ext = &t[pos + 1..];
+                            !ext.is_empty()
+                                && ext.len() <= 12
+                                && ext.chars().all(|c| c.is_ascii_alphabetic())
+                        }
+                    })
+            });
+            if looks_like_path {
+                return Some("git checkout <path> discards uncommitted working-tree changes");
+            }
+            None
+        }
+        // `git switch -f`/`--force`/`--discard-changes` 强制切分支会丢弃未提交改动；
+        // `-C`/`--force-create` 在分支已存在时强制重置并切分支，同样丢弃。创建新分支
+        //（`-c`/`--create`，不带 force）是安全操作，放行。短选项区分大小写：`-C` ≠ `-c`。
+        "switch" => {
+            if rest.iter().any(|t| {
+                t == "-f"
+                    || t.eq_ignore_ascii_case("--force")
+                    || t.eq_ignore_ascii_case("--discard-changes")
+                    || t == "-C"
+                    || t.eq_ignore_ascii_case("--force-create")
+            }) {
+                return Some(
+                    "git switch --force/-C discards uncommitted changes when switching branches",
+                );
+            }
+            None
+        }
+        // `git restore` 默认恢复工作树，会丢弃未提交的工作树改动；仅「只 `--staged`」是
+        // 安全的取消暂存（工作树不动、可回滚）。
+        "restore" => {
+            if rest.iter().any(|t| t == "--worktree") {
+                return Some("git restore --worktree discards uncommitted working-tree changes");
+            }
+            let has_staged = rest.iter().any(|t| t == "--staged");
+            let has_source = rest
+                .iter()
+                .any(|t| t == "--source" || t.starts_with("--source="));
+            if has_source && !has_staged {
+                return Some(
+                    "git restore --source=... discards uncommitted working-tree changes",
+                );
+            }
+            if has_staged {
+                // 仅取消暂存、工作树不动，可回滚，放行。
+                return None;
+            }
+            Some("git restore discards uncommitted working-tree changes")
+        }
+        // `git reset --hard`/`--merge`/`--keep` 会丢弃工作树/暂存区改动；
+        // `--soft` 与默认（mixed）保留工作树，放行。
+        "reset" => {
+            if rest
+                .iter()
+                .any(|t| matches!(t.as_str(), "--hard" | "--merge" | "--keep"))
+            {
+                return Some("git reset --hard/--merge/--keep discards uncommitted changes");
+            }
+            None
+        }
+        // `git clean -f` 删除未跟踪文件，不可回滚；`-n`(dry-run) 等不实际删除，放行。
+        "clean" => {
+            if rest.iter().any(|t| {
+                t == "-f"
+                    || t == "--force"
+                    // 合并短选项（如 `-fd` 即 `-f -d`）里包含 `-f`，同样会真正删除文件。
+                    || (t.starts_with('-') && !t.starts_with("--") && t.contains('f'))
+            }) {
+                return Some("git clean -f deletes untracked files irreversibly");
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 /// =========================================================================
 /// Shell 注入面检查
 /// =========================================================================
@@ -1233,6 +1358,10 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         if let Some(reason) = blocked_git_subcommand(command_tokens) {
             return Err(reason.to_string());
         }
+        // 用原始大小写 token 调用，以区分 `-B`/`-b`、`-C`/`-c` 这类大小写敏感的短选项。
+        if let Some(reason) = blocked_git_destructive(raw_command_tokens) {
+            return Err(reason.to_string());
+        }
     }
 
     // 拦下 `bash -c "..."` / `sh -c` / `zsh -c` 这种"二次解释"形式。
@@ -1293,6 +1422,9 @@ fn validate_single_segment(command: &str) -> Result<(), String> {
         // 否则可借包装器绕过直接的检查。
         if nested == "git" {
             if let Some(reason) = blocked_git_subcommand(&command_tokens[idx..]) {
+                return Err(reason.to_string());
+            }
+            if let Some(reason) = blocked_git_destructive(&raw_command_tokens[idx..]) {
                 return Err(reason.to_string());
             }
         }

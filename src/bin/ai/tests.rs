@@ -2230,6 +2230,71 @@ fn execute_command_blocks_dangerous_programs() {
 }
 
 #[test]
+fn execute_command_blocks_git_destructive_to_uncommitted() {
+    // checkout：会丢弃工作树改动
+    assert!(tools::validate_execute_command("git checkout -- src/main.rs").is_err());
+    assert!(tools::validate_execute_command("git checkout -- .").is_err());
+    assert!(tools::validate_execute_command("git checkout .").is_err());
+    assert!(tools::validate_execute_command("git checkout -f main").is_err());
+    assert!(tools::validate_execute_command("git checkout --force main").is_err());
+    assert!(tools::validate_execute_command("git -C /repo checkout -- x").is_err());
+    // checkout：纯分支切换，git 会保护未提交改动，放行
+    assert!(tools::validate_execute_command("git checkout main").is_ok());
+    assert!(tools::validate_execute_command("git checkout -b feature/x").is_ok());
+    // checkout：-B 会强制重置并切分支，丢弃未提交改动
+    assert!(tools::validate_execute_command("git checkout -B main").is_err());
+    assert!(tools::validate_execute_command("git checkout --force-create main").is_err());
+    // checkout：无 -- 但路径启发式判定为文件（含扩展名）
+    assert!(tools::validate_execute_command("git checkout src/main.rs").is_err());
+    assert!(tools::validate_execute_command("git checkout README.md").is_err());
+    assert!(tools::validate_execute_command("git checkout main.rs").is_err());
+    assert!(tools::validate_execute_command("git checkout archive.tar.gz").is_err());
+    // checkout：不含扩展名的参数不误拦（分支/tag 形态）
+    assert!(tools::validate_execute_command("git checkout main").is_ok());
+    assert!(tools::validate_execute_command("git checkout v1.2.3").is_ok());
+    assert!(tools::validate_execute_command("git checkout feature/x").is_ok());
+
+    // restore：默认恢复工作树会丢弃未提交改动
+    assert!(tools::validate_execute_command("git restore src/main.rs").is_err());
+    assert!(tools::validate_execute_command("git restore --worktree src/main.rs").is_err());
+    assert!(tools::validate_execute_command("git restore --source=HEAD~1 src/main.rs").is_err());
+    // restore：仅取消暂存，工作树不动，放行
+    assert!(tools::validate_execute_command("git restore --staged src/main.rs").is_ok());
+    assert!(tools::validate_execute_command("git restore --staged --source=HEAD src/main.rs").is_ok());
+
+    // reset：--hard/--merge/--keep 丢弃未提交改动
+    assert!(tools::validate_execute_command("git reset --hard").is_err());
+    assert!(tools::validate_execute_command("git reset --hard HEAD~1").is_err());
+    assert!(tools::validate_execute_command("git reset --merge").is_err());
+    assert!(tools::validate_execute_command("git reset --keep").is_err());
+    // reset：--soft / 默认(mixed) 保留工作树，放行
+    assert!(tools::validate_execute_command("git reset --soft HEAD~1").is_ok());
+    assert!(tools::validate_execute_command("git reset").is_ok());
+    assert!(tools::validate_execute_command("git reset HEAD~1").is_ok());
+
+    // clean：-f 删除未跟踪文件，不可回滚
+    assert!(tools::validate_execute_command("git clean -f").is_err());
+    assert!(tools::validate_execute_command("git clean -fd").is_err());
+    assert!(tools::validate_execute_command("git clean --force").is_err());
+    // clean：dry-run 等不实际删除，放行
+    assert!(tools::validate_execute_command("git clean -n").is_ok());
+
+    // switch：force 切分支会丢弃未提交改动
+    assert!(tools::validate_execute_command("git switch -f main").is_err());
+    assert!(tools::validate_execute_command("git switch --force main").is_err());
+    assert!(tools::validate_execute_command("git switch --discard-changes main").is_err());
+    assert!(tools::validate_execute_command("git switch -C fix").is_err());
+    assert!(tools::validate_execute_command("git switch --force-create fix").is_err());
+    // switch：纯创建/切换分支，git 保护未提交改动，放行
+    assert!(tools::validate_execute_command("git switch main").is_ok());
+    assert!(tools::validate_execute_command("git switch -c feature/x").is_ok());
+
+    // 经间接包装器（env/xargs）也需拦截
+    assert!(tools::validate_execute_command("env git checkout -- x").is_err());
+    assert!(tools::validate_execute_command("xargs git reset --hard").is_err());
+}
+
+#[test]
 fn execute_command_allows_common_shell_syntax() {
     assert!(tools::validate_execute_command("ls | wc").is_ok());
     assert!(tools::validate_execute_command("ls && pwd").is_ok());

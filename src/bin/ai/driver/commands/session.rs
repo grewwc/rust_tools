@@ -153,6 +153,7 @@ pub fn try_handle_session_command(
             );
             println!("  /sessions clear-all       delete all sessions");
             println!("  /sessions export <id> [output.md]       export session to Markdown");
+            println!("  /sessions dump-history <id>                dump session history to JSON (<id>-history.json)");
             println!(
                 "  /sessions export-current [output.md]    export current session to Markdown"
             );
@@ -374,6 +375,28 @@ pub fn try_handle_session_command(
                 }
                 Err(err) => {
                     eprintln!("Failed to export session: {}", err);
+                }
+            }
+        }
+        "dump-history" | "dump" => {
+            let Some(id) = parts.next() else {
+                println!("missing session id. try: /sessions dump-history <id>");
+                return Ok(true);
+            };
+            let output_path = format!("{}-history.json", id);
+            let output_path = std::path::Path::new(&output_path);
+
+            match store.read_all_messages(id) {
+                Ok(messages) => {
+                    let json = serde_json::to_string_pretty(&messages)?;
+                    if let Some(parent) = output_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(output_path, json)?;
+                    println!("Dumped history of session '{}' to '{}'", id, output_path.display());
+                }
+                Err(err) => {
+                    eprintln!("Failed to dump history: {}", err);
                 }
             }
         }

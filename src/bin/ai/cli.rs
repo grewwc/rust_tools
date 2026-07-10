@@ -657,7 +657,7 @@ fn generate_bash(
         "  local persona_sub='help list ls current cur create new use select switch delete del rm'"
     );
     println!(
-        "  local session_sub='help list current new use suspend bound delete clear-bound clear-history clear-all export export-current export-last fork branch'"
+        "  local session_sub='help list current new use suspend bound delete clear-bound clear-history clear-all dump-history dump export export-current export-last fork branch'"
     );
     println!("  local agent_sub='help list current use auto'");
     println!("  local model_sub='current list help effort'");
@@ -748,7 +748,7 @@ fn generate_zsh(
         "  local -a _a_history_subcmds=(full user assistant tool system grep rewind undo export copy help 3 6 10 20)"
     );
     println!(
-        "  local -a _a_session_subcmds=(help list current new use suspend bound delete clear-bound clear-history clear-all export export-current export-last fork branch)"
+        "  local -a _a_session_subcmds=(help list current new use suspend bound delete clear-bound clear-history clear-all dump-history dump export export-current export-last fork branch)"
     );
     println!("  local -a _a_agent_subcmds=(help list current use auto)");
     println!(

@@ -42,6 +42,26 @@ pub(super) fn terminal_display_width(s: &str) -> usize {
     total
 }
 
+/// Strip redundant U+FE0F (VS16) from visible text.
+///
+/// When VS16 follows an `is_ambiguous_emoji_block_char` (e.g. ⚠ U+26A0), the base
+/// already renders as 2-column emoji without VS16. Keeping VS16 in the string causes
+/// `render_and_pad_cell` to undercount by 1 column (VS16 takes 1 cell in the terminal
+/// but `terminal_display_width` skips it), shifting table borders right.
+pub(super) fn strip_redundant_vs16(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_was_emoji_block = false;
+    for ch in s.chars() {
+        if ch == '\u{fe0f}' && prev_was_emoji_block {
+            prev_was_emoji_block = false;
+            continue; // drop redundant VS16
+        }
+        out.push(ch);
+        prev_was_emoji_block = is_ambiguous_emoji_block_char(ch);
+    }
+    out
+}
+
 fn is_single_width_terminal_symbol(ch: char) -> bool {
     matches!(
         ch,
