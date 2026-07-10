@@ -12,7 +12,7 @@ use crate::ai::{
         recall_rank, render_record,
     },
     driver::{print::print_ocr_summary, reflection, skill_runtime},
-    history::{compress::llm_prune, Message, ROLE_INTERNAL_NOTE, build_context_history},
+    history::{Message, ROLE_INTERNAL_NOTE, build_context_history, compress::llm_prune},
     request,
     tools::storage::memory_store::{AgentMemoryEntry, MemoryStore},
     types::App,
@@ -491,14 +491,27 @@ pub(super) async fn prepare_turn(
     });
     // LLM 引导裁剪：在历史消息发送给模型前，静默替换已被连续标记为低价值的 tool 结果内容。
     // 不删除消息、不改变数组长度，仅替换 content 字段为占位符。
-    llm_prune::apply_pruning(&mut history, &app.prune_marks);
+    let prune_report = llm_prune::apply_pruning(&mut history, &app.prune_marks);
+    if prune_report.pruned_count > 0 {
+        let tools = if prune_report.tools.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", prune_report.tools.join(", "))
+        };
+        println!(
+            "{}",
+            format!(
+                "[context pruned: {} tool result(s){}, ~{} chars freed]",
+                prune_report.pruned_count, tools, prune_report.freed_chars
+            )
+            .dimmed()
+        );
+    }
     // 当历史足够长时，在系统 prompt 后追加裁剪协议提示（不影响用户可见 prompt）。
     if llm_prune::should_inject_prune_prompt(history.len()) {
         messages.push(Message {
             role: "system".to_string(),
-            content: Value::String(
-                llm_prune::PRUNE_PROTOCOL_PROMPT.to_string(),
-            ),
+            content: Value::String(llm_prune::PRUNE_PROTOCOL_PROMPT.to_string()),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,

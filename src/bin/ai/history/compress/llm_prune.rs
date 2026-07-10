@@ -184,24 +184,38 @@ fn protected_tool_call_ids(messages: &[Message]) -> FxHashSet<String> {
     protected
 }
 
+/// 单次 `apply_pruning` 的裁剪统计，供调用方打印终端简讯。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct PruneReport {
+    /// 本次被替换为占位符的 tool 结果条数。
+    pub(crate) pruned_count: usize,
+    /// 净释放的字符数（原内容长度减去占位符长度之和）。
+    pub(crate) freed_chars: usize,
+    /// 涉及的工具名（去重、按首次出现顺序）。
+    pub(crate) tools: Vec<String>,
+}
+
 /// 对 messages 数组应用裁剪。
 ///
 /// 将计数 >= PRUNE_THRESHOLD 的 tool 消息内容替换为占位符。
 /// 不删除消息、不改变数组长度。
-/// 始终保护最近一条 tool 消息（避免误裁剪当前轮所需结果）。
+/// 受 `protected_tool_call_ids` 保护的消息（最近 `KEEP_RECENT_TOOL_MESSAGES`
+/// 条 tool 结果、以及 `is_non_compressible_tool` 精确读取/检索/plan 工具）
+/// 永不被裁剪，避免误裁剪当前轮所需结果或高价值检索。
 ///
-/// 返回被裁剪的消息数量。
+/// 返回本次裁剪的统计报告（供调用方打印终端简讯）。
 pub(crate) fn apply_pruning(
     messages: &mut [Message],
     prune_marks: &FxHashMap<String, u8>,
-) -> usize {
+) -> PruneReport {
+    let mut report = PruneReport::default();
     if prune_marks.is_empty() {
-        return 0;
+        return report;
     }
 
+    let id_to_tool_name = build_tool_call_name_index(messages);
     let protected_ids = protected_tool_call_ids(messages);
 
-    let mut pruned_count = 0;
     for msg in messages.iter_mut() {
         if !is_prunable_message(msg) {
             continue;
@@ -217,16 +231,23 @@ pub(crate) fn apply_pruning(
 
         if let Some(&count) = prune_marks.get(tool_call_id) {
             if count >= PRUNE_THRESHOLD {
+                let freed = msg.content.as_str().map(|s| s.chars().count()).unwrap_or(0);
+                if let Some(name) = id_to_tool_name.get(tool_call_id) {
+                    if !report.tools.contains(name) {
+                        report.tools.push(name.clone());
+                    }
+                }
                 // 替换内容为占位符，保留消息结构
                 let placeholder =
                     format!("[pruned: tool result marked as outdated {} times]", count);
+                report.freed_chars += freed.saturating_sub(placeholder.chars().count());
                 msg.content = Value::String(placeholder);
-                pruned_count += 1;
+                report.pruned_count += 1;
             }
         }
     }
 
-    pruned_count
+    report
 }
 
 /// 判断当前历史长度是否值得注入裁剪提示。
@@ -442,7 +463,7 @@ mod tests {
 
         let pruned = apply_pruning(&mut messages, &marks);
 
-        assert_eq!(pruned, 1);
+        assert_eq!(pruned.pruned_count, 1);
         // call_old 内容被替换
         assert!(messages[0].content.as_str().unwrap().contains("[pruned"));
         // call_keep 内容不变（计数 < threshold）
@@ -472,7 +493,7 @@ mod tests {
         let pruned = apply_pruning(&mut messages, &marks);
 
         // call_last 是最后一条 tool，受保护，不被裁剪
-        assert_eq!(pruned, 0);
+        assert_eq!(pruned.pruned_count, 0);
         assert_eq!(messages[1].content.as_str().unwrap(), "most recent result");
     }
 
@@ -481,7 +502,7 @@ mod tests {
         let mut messages = vec![make_tool_message("call_1", "result")];
 
         let pruned = apply_pruning(&mut messages, &FxHashMap::default());
-        assert_eq!(pruned, 0);
+        assert_eq!(pruned.pruned_count, 0);
         assert_eq!(messages[0].content.as_str().unwrap(), "result");
     }
 
@@ -506,7 +527,7 @@ mod tests {
 
         let pruned = apply_pruning(&mut messages, &marks);
 
-        assert_eq!(pruned, 1);
+        assert_eq!(pruned.pruned_count, 1);
         assert_eq!(
             messages[0].content.as_str().unwrap(),
             "important user question"
@@ -574,7 +595,7 @@ mod tests {
 
         let pruned = apply_pruning(&mut messages, &marks);
 
-        assert_eq!(pruned, 1);
+        assert_eq!(pruned.pruned_count, 1);
         assert_eq!(messages[1].content.as_str().unwrap(), "task plan");
         assert!(messages[3].content.as_str().unwrap().contains("[pruned"));
     }
@@ -619,6 +640,6 @@ mod tests {
         let len_after = messages.len();
 
         assert_eq!(len_before, len_after);
-        assert_eq!(pruned, 3); // 最近 6 条 tool 受保护
+        assert_eq!(pruned.pruned_count, 3); // 最近 6 条 tool 受保护
     }
 }
