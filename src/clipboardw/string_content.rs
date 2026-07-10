@@ -6,7 +6,7 @@
 use std::{
     fmt::Display,
     fs,
-    io::{self, Error, Read, Write},
+    io::{self, Error, Write},
     time::Duration,
 };
 
@@ -105,24 +105,15 @@ fn stdout_is_tty() -> bool {
 /// - 会临时修改终端设置为非规范模式
 /// - 超时时间为 1.5 秒
 fn read_osc52_bytes() -> Option<Vec<u8>> {
-    use std::os::unix::io::AsRawFd;
-
     if !stdin_is_tty() || !stdout_is_tty() {
         return None;
     }
 
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-
-    // 发送查询请求
-    stdout.write_all(b"\x1b]52;c;?\x07").ok()?;
-    stdout.flush().ok()?;
-
-    let stdin = io::stdin();
-    let mut stdin = stdin.lock();
+    // 使用原始文件描述符直接读写，绕过 Rust stdio 缓冲层，
+    // 避免与 crossterm 的 stdin/stdout 管理冲突。
 
     // 保存原始终端设置
-    let fd = stdin.as_raw_fd();
+    let fd = libc::STDIN_FILENO;
     let mut original_termios: libc::termios = unsafe { std::mem::zeroed() };
     if unsafe { libc::tcgetattr(fd, &mut original_termios) } != 0 {
         return None;
@@ -138,25 +129,47 @@ fn read_osc52_bytes() -> Option<Vec<u8>> {
         return None;
     }
 
-    // 读取响应
+    // 使用 libc::write 发送 OSC52 查询（绕过 stdout 缓冲）
+    let query = b"\x1b]52;c;?\x07";
+    let write_result = unsafe {
+        libc::write(libc::STDOUT_FILENO, query.as_ptr() as *const libc::c_void, query.len())
+    };
+    if write_result < 0 {
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original_termios) };
+        return None;
+    }
+
+    // 使用 libc::read 读取响应（绕过 stdin 缓冲）
+    let timeout_ms: libc::c_int = 1500;
     let result = (|| {
         let mut response = Vec::new();
         let mut buf = [0u8; 1024];
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_millis(1500);
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms as u64);
 
-        while start.elapsed() < timeout {
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    response.extend_from_slice(&buf[..n]);
-                    // 检查响应结束标记
-                    if response.contains(&b'\x07') || response.windows(2).any(|w| w == b"\x1b\\") {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    std::thread::sleep(Duration::from_millis(10));
+        while std::time::Instant::now() < deadline {
+            // 使用 poll 等待数据可读，避免忙等
+            let mut pollfd = libc::pollfd {
+                fd: libc::STDIN_FILENO,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let remaining = deadline
+                .duration_since(std::time::Instant::now())
+                .as_millis() as i32;
+            let poll_timeout = remaining.min(200).max(1);
+            let n_ready = unsafe { libc::poll(&mut pollfd, 1, poll_timeout) };
+            if n_ready <= 0 {
+                continue;
+            }
+            let n = unsafe {
+                libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+            };
+            if n > 0 {
+                let n = n as usize;
+                response.extend_from_slice(&buf[..n]);
+                // 检查响应结束标记
+                if response.contains(&b'\x07') || response.windows(2).any(|w| w == b"\x1b\\") {
+                    break;
                 }
             }
         }
