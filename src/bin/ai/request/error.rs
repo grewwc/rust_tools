@@ -346,11 +346,27 @@ pub(crate) fn should_try_model_fallback(err: &RequestError) -> bool {
 /// Returns `true` if the error indicates an auth or quota issue with the API key
 /// (401 Unauthorized, 403 Forbidden, 429 Too Many Requests),
 /// which should trigger key rotation when alternative keys are available.
+///
+/// 扩展：对于其他 HTTP 错误（如 400），若响应体中包含账号级错误信号
+/// （如 OpenCode/Xiaomi 返回的 `code:"441"` / `type:"risk_control"`），
+/// 也应触发 key 轮换，尝试使用下一个可用的 API key。
 pub(crate) fn should_rotate_key(err: &RequestError) -> bool {
-    matches!(
-        err.kind,
-        RequestErrorKind::Status(status) if matches!(status.as_u16(), 401 | 403 | 429)
-    )
+    match err.kind {
+        RequestErrorKind::Status(status) => {
+            if matches!(status.as_u16(), 401 | 403 | 429) {
+                return true;
+            }
+            // 非标准 HTTP 状态码也检查 body 中的账号级错误信号
+            is_account_error_body(&err.message)
+        }
+        RequestErrorKind::Network => false,
+    }
+}
+
+/// 检查错误消息体中是否包含账号级错误信号（如 code 441、type risk_control 等）。
+fn is_account_error_body(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("risk_control") || lower.contains("\"code\":\"441\"")
 }
 
 /// 判断流式响应中途出现的错误是否值得重试。
@@ -377,4 +393,5 @@ pub(crate) fn is_retryable_stream_error(err: &str) -> bool {
         || lower.contains("502")
         || lower.contains("503")
         || lower.contains("504")
+        || lower.contains("risk_control")
 }

@@ -351,10 +351,14 @@ fn shrink_messages_to_fit(
         return Vec::new();
     }
 
-    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES, overflow_dir);
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
+    // dedup 必须在 offload 之前：offload 会把超阈值的旧 read_file 全文搬到磁盘并
+    // 替换成带**唯一临时路径**的 stub，一旦如此，逐字节相同的重复副本就因路径不同
+    // 而无法再折叠。先做内容级 dedup，把冗余全文折叠成回指 stub，再对真正需要保留
+    // 的少数版本做 offload。
     dedup_repeated_tool_results(&mut messages);
+    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES, overflow_dir);
 
     if messages_total_chars(&messages) <= max_chars {
         return messages;
@@ -415,10 +419,12 @@ fn shrink_messages_to_fit_with_summary(
         return Vec::new();
     }
 
-    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES, overflow_dir);
     redact_images_except_last(&mut messages, 1);
     dedup_adjacent(&mut messages);
+    // dedup 先于 offload：理由同 shrink_messages_to_fit——避免逐字节相同的重复
+    // read_file 全文各自被 offload 成唯一临时路径 stub 而失去折叠机会。
     dedup_repeated_tool_results(&mut messages);
+    prepare_tool_messages_structured(&mut messages, 480, KEEP_RECENT_TOOL_MESSAGES, overflow_dir);
 
     // 先无条件外溢体量过大的旧 user/图片消息（最新一轮保护尾窗除外）。
     // 图片在预算里只按名义成本计费，单张大图不再触发超预算循环，因此必须
@@ -1151,7 +1157,8 @@ fn keep_only_recent_reasoning_content(messages: &mut [Message]) {
 /// 仅压缩内容，不删除消息，避免 assistant tool_calls 与 tool 响应的配对断裂。
 /// 最近 KEEP_RECENT_TOOL_MESSAGES 条 tool 消息一律保留全文。
 fn dedup_repeated_tool_results(messages: &mut [Message]) {
-    use rustc_hash::FxHashMap;
+    use rustc_hash::{FxHashMap, FxHasher};
+    use std::hash::{Hash, Hasher};
 
     // 收集 (tool_name, args_signature) → 出现次数与索引
     // 通过 assistant.tool_calls 关联 tool_call_id → (name, args)
@@ -1177,7 +1184,14 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
     }
     let protected_from = tool_indices.len().saturating_sub(KEEP_RECENT_TOOL_MESSAGES);
 
+    // (name, args) → 该签名下"首个保留全文"的 tool 消息序号，用于在折叠时回指。
     let mut seen: FxHashMap<(String, String), usize> = FxHashMap::default();
+    // (name, args, content_hash) → 首个出现该内容版本的 tool 消息序号。
+    // 内容级去重是断开"重复整篇重读"失忆环的关键：对 read_file 等
+    // non-compressible 工具，同一 (文件, 参数) 被反复读取时往往返回**逐字节
+    // 相同**的全文（实测占全部 tool 字节的 ~52%）。这些冗余副本可无损折叠，
+    // 而内容确实变化的版本（如被编辑过的文件）因 hash 不同得以完整保留。
+    let mut seen_content: FxHashMap<(String, String, u64), usize> = FxHashMap::default();
     for (rank, &idx) in tool_indices.iter().enumerate() {
         let signature = messages[idx]
             .tool_call_id
@@ -1213,6 +1227,27 @@ fn dedup_repeated_tool_results(messages: &mut [Message]) {
             continue;
         }
         if is_non_compressible_tool(&signature.0) {
+            // read_file/检索类工具**内容不同的版本**必须零压缩保留（Invariant：
+            // precision 结果不做 lossy 裁剪）。但**逐字节相同**的重复副本是纯冗余，
+            // 折叠它们不丢失任何信息，且能直接消除"旧全文堆积 + 近端 offload 触发
+            // 重读"的失忆环。用内容 hash 区分二者：hash 首见 → 保留全文并登记；
+            // hash 重现 → 折叠为回指首个全文的 stub（保留 tool_call_id 以维持协议）。
+            let text = value_to_string(&messages[idx].content);
+            let mut hasher = FxHasher::default();
+            text.hash(&mut hasher);
+            let content_key = (signature.0.clone(), signature.1.clone(), hasher.finish());
+            match seen_content.get(&content_key).copied() {
+                None => {
+                    seen_content.insert(content_key, idx);
+                }
+                Some(_) => {
+                    let stub = format!(
+                        "[deduped: byte-identical `{}` result already present verbatim earlier in this conversation; content unchanged since then. No need to re-read — reuse the earlier full result.]",
+                        signature.0
+                    );
+                    messages[idx].content = Value::String(stub);
+                }
+            }
             continue;
         }
         // 保留首次出现，把后续重复的旧 tool 结果折叠为 stub

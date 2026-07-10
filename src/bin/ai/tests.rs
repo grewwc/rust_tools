@@ -711,10 +711,6 @@ fn compression_spills_non_compressible_read_file_outputs_to_session_temp_files()
 
 #[test]
 fn compression_keeps_recent_non_compressible_tool_output_verbatim() {
-    // 回归测试：最近 KEEP_RECENT_TOOL_MESSAGES 条 read_file 等「不可压缩」工具
-    // 结果必须逐字保留，绝不能外溢成 stub。否则模型在下一轮请求里看到的是
-    // 「已卸载，请重读」而非文件内容，会立刻再发一次同样的 read_file——在会话
-    // 超软阈值、每轮都跑压缩时表现为无限重读（用户报告的"不停 read_file"）。
     let overflow_dir = std::env::temp_dir().join(format!(
         "ai-preserve-overflow-recent-{}",
         uuid::Uuid::new_v4()
@@ -779,6 +775,122 @@ fn extract_stub_file_path(stub: &str) -> Option<String> {
     let value = serde_json::from_str::<Value>(payload).ok()?;
     value.get("file_path")?.as_str().map(str::to_string)
 }
+
+fn read_file_call_pair(id: &str, path: &str, content: &str) -> (Message, Message) {
+    let assistant = Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![ToolCall {
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: "read_file".to_string(),
+                arguments: format!(r#"{{"filePath":"{path}"}}"#),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: None,
+    };
+    let tool = Message {
+        role: "tool".to_string(),
+        content: Value::String(content.to_string()),
+        tool_calls: None,
+        tool_call_id: Some(id.to_string()),
+        reasoning_content: None,
+    };
+    (assistant, tool)
+}
+
+#[test]
+fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_versions() {
+    // 回归测试：断开"重复整篇重读"失忆环。
+    // 同一文件被反复 read_file 且**内容逐字节相同**时，只应保留一份全文，
+    // 其余冗余副本折叠为回指 stub（无损）。而内容确实变化的版本（文件被编辑）
+    // 必须每个都完整保留——绝不能因签名相同而误折叠成 stub 丢失真实差异。
+    let identical = format!("// agent_adapter.py\n{}", "A".repeat(6_000));
+    let changed_v1 = format!("// controller.py v1\n{}", "B".repeat(6_000));
+    let changed_v2 = format!("// controller.py v2 EDITED\n{}", "C".repeat(6_000));
+
+    let mut messages = vec![Message {
+        role: "system".to_string(),
+        content: Value::String("system prompt".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    // 6 次读取同一文件、内容完全相同（模拟失忆环里的重复整篇重读）。
+    for i in 0..6 {
+        let (a, t) = read_file_call_pair(
+            &format!("call_same_{i}"),
+            "/repo/agent_adapter.py",
+            &identical,
+        );
+        messages.push(a);
+        messages.push(t);
+    }
+    // 同一文件被编辑，产生两个内容不同的版本，各读一次。
+    let (a1, t1) = read_file_call_pair("call_ctrl_1", "/repo/controller.py", &changed_v1);
+    messages.push(a1);
+    messages.push(t1);
+    let (a2, t2) = read_file_call_pair("call_ctrl_2", "/repo/controller.py", &changed_v2);
+    messages.push(a2);
+    messages.push(t2);
+
+    // 末尾追加足够多的"近端"tool 消息，把上面所有读取推出 KEEP_RECENT 保护窗，
+    // 确保 dedup 真正作用到它们身上。每条内容/路径都唯一，避免自身被 dedup 折叠。
+    for i in 0..8 {
+        let (a, t) = read_file_call_pair(
+            &format!("call_pad_{i}"),
+            &format!("/repo/pad_{i}.py"),
+            &format!("padding-{i}"),
+        );
+        messages.push(a);
+        messages.push(t);
+    }
+
+    // overflow_dir=None：隔离 dedup 行为，避免保留下来的那一份全文再被 offload
+    // 到磁盘 stub（offload 阈值 480 字符是另一条正交路径，已有专门测试覆盖）。
+    let compressed = compress_messages_for_context(messages, 200_000, 256, 400, None);
+
+    let full_identical = compressed
+        .iter()
+        .filter(|m| m.content.as_str() == Some(identical.as_str()))
+        .count();
+    assert_eq!(
+        full_identical, 1,
+        "byte-identical repeated read_file must collapse to exactly one full copy"
+    );
+
+    let dedup_stubs = compressed
+        .iter()
+        .filter(|m| {
+            m.content
+                .as_str()
+                .map(|s| s.contains("byte-identical") && s.contains("No need to re-read"))
+                .unwrap_or(false)
+        })
+        .count();
+    assert_eq!(
+        dedup_stubs, 5,
+        "the other five identical reads must become re-read-suppressing dedup stubs"
+    );
+
+    // 两个内容不同的版本都必须完整保留，绝不因签名相同而被折叠。
+    assert!(
+        compressed
+            .iter()
+            .any(|m| m.content.as_str() == Some(changed_v1.as_str())),
+        "changed file version 1 must be preserved verbatim"
+    );
+    assert!(
+        compressed
+            .iter()
+            .any(|m| m.content.as_str() == Some(changed_v2.as_str())),
+        "changed file version 2 must be preserved verbatim"
+    );
+}
+
 
 #[test]
 fn compression_spills_old_user_message_to_session_temp_file() {

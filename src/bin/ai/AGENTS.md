@@ -35,6 +35,13 @@ actually touches that subsystem.
    tool messages are ignored even if marked. Injected in `prepare_turn`; marks are
    parsed from both tool-call and final-response model turns. Does not delete messages
    or alter existing compression logic.
+4. Non-compressible tool results (`read_file` etc.) keep every **distinct** content
+   version verbatim, but `dedup_repeated_tool_results` collapses **byte-identical**
+   repeats (same name+args+content hash) into a re-read-suppressing stub. This breaks
+   the "repeated full re-read" amnesia loop losslessly. Invariant: dedup MUST run
+   **before** `prepare_tool_messages_structured` (offload) in every compression path —
+   offload rewrites identical results into stubs with unique temp-file paths, which
+   would defeat content-hash matching.
 
 ## On-Demand Guides
 
