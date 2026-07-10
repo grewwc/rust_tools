@@ -564,7 +564,7 @@ pub(crate) fn search_memo_candidates_scored(
     let store = MemoryStore::from_env_or_config();
     // 只加载 memo 类别条目即可：memo 是用户手工记录的类别，量很小。
     // category 写入恒为小写 "memo"。
-    let results = store.entries_by_category("memo", 100_000)?;
+    let results = store.entries_by_category("memo", 100_000, true)?;
     let viewer = ViewerContext::current();
     let qlc = query.to_lowercase();
 

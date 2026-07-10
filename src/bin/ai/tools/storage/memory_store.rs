@@ -396,7 +396,7 @@ impl MemoryStore {
         }))
     }
 
-    fn memory_files_to_scan(&self) -> Result<Vec<PathBuf>, String> {
+    fn memory_files_to_scan(&self, include_archives: bool) -> Result<Vec<PathBuf>, String> {
         let cfg = configw::get_all_config();
         let search_archives = cfg
             .get_opt("ai.memory.search_archives.enable")
@@ -409,7 +409,7 @@ impl MemoryStore {
             .unwrap_or(3);
 
         let mut files: Vec<PathBuf> = Vec::new();
-        if search_archives {
+        if search_archives || include_archives {
             if let Some(parent) = self.path.parent() {
                 let base = self
                     .path
@@ -446,13 +446,14 @@ impl MemoryStore {
         &self,
         category: &str,
         limit: usize,
+        include_archives: bool,
     ) -> Result<Vec<AgentMemoryEntry>, String> {
         if limit == 0 {
             return Ok(Vec::new());
         }
 
         let mut window: VecDeque<AgentMemoryEntry> = VecDeque::new();
-        for path in self.memory_files_to_scan()? {
+        for path in self.memory_files_to_scan(include_archives)? {
             if !path.exists() {
                 continue;
             }
@@ -503,7 +504,7 @@ impl MemoryStore {
             });
 
         let mut docs: Vec<(AgentMemoryEntry, String, Vec<String>)> = Vec::new();
-        for p in self.memory_files_to_scan()? {
+        for p in self.memory_files_to_scan(false)? {
             if !p.exists() {
                 continue;
             }

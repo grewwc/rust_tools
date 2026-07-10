@@ -624,10 +624,10 @@ pub(super) async fn handle_consolidate_knowledge(
         return Ok(());
     }
 
-    // 过滤：优先级 < 200 的才分析；按时间倒序；取最近 15 条
+    // 过滤：优先级 < 200 的才分析；排除 memo（用户记事本，不应被自动删除/合并）；按时间倒序；取最近 15 条
     let mut candidates: Vec<&AgentMemoryEntry> = all_entries
         .iter()
-        .filter(|e| e.priority.unwrap_or(100) < 200)
+        .filter(|e| e.priority.unwrap_or(100) < 200 && e.category != "memo")
         .collect();
     candidates.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     candidates.truncate(15);

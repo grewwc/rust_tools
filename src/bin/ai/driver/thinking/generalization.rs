@@ -132,7 +132,7 @@ impl ExperienceGeneralizer {
             Ok(s) => s,
             Err(_) => return,
         };
-        if let Ok(entries) = store.entries_by_category("generalized_principle", 200) {
+        if let Ok(entries) = store.entries_by_category("generalized_principle", 200, false) {
             let mut deduped = SkipMap::default();
             for entry in entries {
                 let principle = Self::decode_persisted_principle(&entry);
@@ -158,7 +158,7 @@ impl ExperienceGeneralizer {
             Ok(s) => s,
             Err(_) => return,
         };
-        if let Ok(entries) = store.entries_by_category("raw_experience", self.max_buffer_size) {
+        if let Ok(entries) = store.entries_by_category("raw_experience", self.max_buffer_size, false) {
             for entry in entries {
                 // 优先从专门标签 `cat:<原 category>` 还原真实 category；
                 // 老数据兼容：回退到 tags 中第一个非内置标签；再不行用 "general"
