@@ -108,9 +108,10 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     }
 
-    match Clipboard::new() {
-        Ok(mut clipboard) => {
-            if let Ok(image) = clipboard.get_image() {
+    // 尝试通过 arboard 读取本地剪贴板图片
+    if let Ok(mut clipboard) = Clipboard::new() {
+        if let Ok(image) = clipboard.get_image() {
+            let save_result = (|| -> Result<(), Box<dyn std::error::Error>> {
                 let data = image.bytes;
                 let image = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(
                     image.width as u32,
@@ -121,26 +122,27 @@ pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
                 let image: ImageBuffer<Rgb<u8>, Vec<u8>> = image.convert();
                 image.save(fname.as_str())?;
                 Ok(())
+            })();
+            if save_result.is_ok() {
+                return Ok(());
+            }
+            // arboard 保存失败，继续尝试 OSC52（SSH 场景）
+        }
+    }
+
+    // 回退：通过 OSC52 从远端终端读取剪贴板图片
+    // 支持两种格式：
+    //   1. 原生图片复制：终端返回 base64(原始图片字节)
+    //   2. oo -c 桥接复制：终端返回 base64(base64(图片字节))
+    match try_osc52_save(&fname) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if is_ssh_session() {
+                Err(e)
             } else {
-                // Try fallback if arboard works but has no image
-                match try_osc52_save(&fname) {
-                    Ok(_) => Ok(()),
-                    Err(_) => Err(Box::new(io::Error::other(
-                        "no image found (local or remote)",
-                    ))),
-                }
+                Err(Box::new(io::Error::other("no image")))
             }
         }
-        Err(_) => match try_osc52_save(&fname) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                if is_ssh_session() {
-                    Err(e)
-                } else {
-                    Err(Box::new(io::Error::other("no image")))
-                }
-            }
-        },
     }
 }
 

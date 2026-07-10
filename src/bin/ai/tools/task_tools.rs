@@ -40,8 +40,10 @@ const MAX_AGENT_TEAM_MEMBERS: usize = 8;
 /// LLM + 多个工具调用就需要 2~5 分钟。提高到 600s 让等待与正常运行时长更匹配。
 const DEFAULT_TASK_WAIT_TIMEOUT_SECS: u64 = 600;
 /// `task_wait.timeout_secs` 的硬上限，避免模型把 timeout 设成天文数字时彻底
-/// 阻塞 driver。
-const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 600;
+/// 阻塞 driver。上限高于默认值，允许模型在确有需要时显式等待更久（与
+/// `params_task_wait` schema 中标称的 `[1, 900]` 保持一致）。超时只表示本次调用
+/// 没等到、subagent 仍在跑，因此单次阻塞不宜过长，以保证对中断/事件的响应性。
+const MAX_TASK_WAIT_TIMEOUT_SECS: u64 = 900;
 
 /// Granular control over which slices of the parent agent's execution
 /// context are inherited by a spawned sub-agent. Defaults are
@@ -936,7 +938,7 @@ fn params_task_wait() -> Value {
             },
             "timeout_secs": {
                 "type": "integer",
-                "description": "Wait budget for THIS call (clamped to [1, 1800], default 600). Hitting this budget does NOT cancel or stall the subagent — it only means the wait policy was not satisfied within this call. The subagent keeps running, its result channel/futex stay alive, and you can call task_wait again with the same task_ids to keep waiting (or use task_status for a non-blocking snapshot)."
+                "description": "Wait budget for THIS call (clamped to [1, 900], default 600). Hitting this budget does NOT cancel or stall the subagent — it only means the wait policy was not satisfied within this call. The subagent keeps running, its result channel/futex stay alive, and you can call task_wait again with the same task_ids to keep waiting (or use task_status for a non-blocking snapshot)."
             },
             "wait_policy": {
                 "type": "string",

@@ -9,9 +9,12 @@ use serde_json::Value;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
 
-const HTTP_TOOL_TIMEOUT: Duration = Duration::from_secs(5);
-const HTTP_SEARCH_TIMEOUT: Duration = Duration::from_secs(5);
-const HTTP_SEARCH_TOTAL_BUDGET: Duration = Duration::from_secs(5);
+const HTTP_TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_SEARCH_TIMEOUT: Duration = Duration::from_secs(8);
+// 必须严格大于 HTTP_SEARCH_TIMEOUT，否则单次跑满 per-attempt 超时后
+// `started_at.elapsed() >= HTTP_SEARCH_TOTAL_BUDGET` 会立即 break，使
+// MAX_SEARCH_RETRIES 形同虚设。留出足够预算让第二次尝试真正能够发起。
+const HTTP_SEARCH_TOTAL_BUDGET: Duration = Duration::from_secs(15);
 const MAX_SEARCH_RETRIES: usize = 2;
 const MAX_PUBLIC_SEARXNG_INSTANCES_PER_ATTEMPT: usize = 1;
 const DEFAULT_NUM_RESULTS: usize = 10;

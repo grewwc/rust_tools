@@ -121,28 +121,11 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
     let store = MemoryStore::from_env_or_config();
     store.append(&entry)?;
 
-    // Sync to RAG vector index
-    if let Ok(_) = ensure_rag_store() {
-        if let Ok(guard) = get_rag_store() {
-            if let Some(rag) = guard.as_ref() {
-                if let Some(id) = entry.id.clone() {
-                    let embedding_text = format!("{}: {}", entry.category, entry.note);
-                    if let Ok(embeddings) = rag.embed_texts(&[embedding_text.clone()]) {
-                        if let Some(embedding) = embeddings.into_iter().next() {
-                            let _ = rag.upsert(RagEntry {
-                                id,
-                                content: embedding_text,
-                                category: entry.category.clone(),
-                                tags: entry.tags.clone(),
-                                embedding,
-                                timestamp: rag_timestamp_for_entry(&entry),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // Sync to RAG vector index. Failure here is non-fatal (the entry is already
+    // persisted to the JSONL store above), but it must not be silent: if the
+    // vector upsert fails the entry won't be reachable via semantic search, so
+    // surface a warning to the model rather than pretending it succeeded.
+    let rag_warning = sync_entry_to_rag(&entry);
 
     let mut result = format!(
         "Saved to knowledge [{}]:\n  {}\n",
@@ -174,7 +157,53 @@ fn execute_knowledge_save(args: &Value) -> Result<String, String> {
         );
     }
 
+    if let Some(warning) = rag_warning {
+        result.push_str(&format!(
+            "  ⚠️ Warning: vector index sync failed ({warning}); this entry may not be retrievable via semantic knowledge_search until re-synced.\n"
+        ));
+    }
+
     Ok(result)
+}
+
+/// 把知识条目同步进 RAG 向量索引。成功返回 `None`；任一步骤失败返回
+/// `Some(reason)`，由调用方决定如何提示模型。条目此前已落 JSONL 主存储，
+/// 因此这里的失败是非致命的，但不能静默——否则模型会误以为该条目可被语义检索。
+fn sync_entry_to_rag(entry: &AgentMemoryEntry) -> Option<String> {
+    let Some(id) = entry.id.clone() else {
+        // 没有 id 的条目无法进 RAG（也无法后续定位），但这属于上游生成问题，
+        // 不在此处报错，交由主存储语义处理。
+        return None;
+    };
+    if let Err(e) = ensure_rag_store() {
+        return Some(format!("rag store unavailable: {e}"));
+    }
+    let guard = match get_rag_store() {
+        Ok(guard) => guard,
+        Err(e) => return Some(format!("rag store lock poisoned: {e}")),
+    };
+    let Some(rag) = guard.as_ref() else {
+        return Some("rag store not initialized".to_string());
+    };
+    let embedding_text = format!("{}: {}", entry.category, entry.note);
+    let embedding = match rag.embed_texts(&[embedding_text.clone()]) {
+        Ok(embeddings) => match embeddings.into_iter().next() {
+            Some(embedding) => embedding,
+            None => return Some("embedding provider returned no vector".to_string()),
+        },
+        Err(e) => return Some(format!("embedding failed: {e}")),
+    };
+    if let Err(e) = rag.upsert(RagEntry {
+        id,
+        content: embedding_text,
+        category: entry.category.clone(),
+        tags: entry.tags.clone(),
+        embedding,
+        timestamp: rag_timestamp_for_entry(entry),
+    }) {
+        return Some(format!("vector upsert failed: {e}"));
+    }
+    None
 }
 
 inventory::submit!(ToolRegistration {
@@ -383,17 +412,26 @@ fn execute_knowledge_list(args: &Value) -> Result<String, String> {
         fs::read_to_string(&path).map_err(|e| format!("Failed to read memory file: {e}"))?;
 
     let mut entries: Vec<AgentMemoryEntry> = Vec::new();
+    let mut skipped_lines = 0usize;
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if let Ok(entry) = serde_json::from_str::<AgentMemoryEntry>(line) {
-            entries.push(entry);
+        match serde_json::from_str::<AgentMemoryEntry>(line) {
+            Ok(entry) => entries.push(entry),
+            // 坏行不能静默吞掉——否则模型会把"部分列表"当成"完整列表"。累计计数后
+            // 在结果里明确提示，避免其基于不完整数据做决策。
+            Err(_) => skipped_lines += 1,
         }
     }
 
     if entries.is_empty() {
+        if skipped_lines > 0 {
+            return Ok(format!(
+                "Knowledge base has no readable entries, but {skipped_lines} line(s) were unparseable and skipped. The memory file may be corrupted."
+            ));
+        }
         return Ok("Knowledge base is empty. Use knowledge_save to add entries.".to_string());
     }
 
@@ -424,6 +462,12 @@ fn execute_knowledge_list(args: &Value) -> Result<String, String> {
         result.push_str(&format!(
             "  Priority: {}\n\n",
             entry.priority.unwrap_or(100)
+        ));
+    }
+
+    if skipped_lines > 0 {
+        result.push_str(&format!(
+            "\n⚠️ Note: {skipped_lines} line(s) in the memory file were unparseable and skipped; this listing may be incomplete.\n"
         ));
     }
 
