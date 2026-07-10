@@ -320,6 +320,8 @@ impl CommandCompleter {
             "clear-bound",
             "clear-history",
             "clear-all",
+            "dump-history",
+            "dump",
             "export",
             "export-current",
             "export-last",
