@@ -75,7 +75,7 @@ impl fmt::Display for RequestError {
 
 impl std::error::Error for RequestError {}
 
-pub(crate) const REQUEST_MAX_ATTEMPTS: usize = 6;
+pub(crate) const REQUEST_MAX_ATTEMPTS: usize = 12;
 pub(crate) const REQUEST_MAX_ATTEMPTS_429: usize = 32; // 429 错误重试 32 次
 pub(crate) const REQUEST_RETRY_BASE_MS: u64 = 500;
 pub(crate) const REQUEST_RETRY_MAX_MS: u64 = 16000;
