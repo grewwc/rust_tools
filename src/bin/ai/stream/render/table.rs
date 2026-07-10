@@ -1,7 +1,8 @@
 use crate::ai::stream::{
     extract::strip_ansi_codes,
     render::inline::{
-        render_inline_md, terminal_cell_width, terminal_display_width, visible_width, wrap_md_cell,
+        render_inline_md, strip_redundant_vs16, terminal_cell_width, terminal_display_width,
+        visible_width, wrap_md_cell,
     },
 };
 
@@ -421,6 +422,10 @@ fn pad_cell(s: &str, width: usize, align: TableAlign) -> String {
 /// 未闭合标记会原样输出为字面字符，导致实际宽度 > 预期，表格边框错位。
 fn render_and_pad_cell(cell_line: &str, width: usize, align: TableAlign, base: &str) -> String {
     let rendered = render_inline_md(cell_line, base);
+    // Strip redundant VS16 from the rendered text. When VS16 follows an
+    // is_ambiguous_emoji_block_char, the base already renders as 2-col emoji;
+    // keeping VS16 in the string would add an extra column in the terminal.
+    let rendered = strip_redundant_vs16(&rendered);
     let ansi_stripped = strip_ansi_codes(&rendered);
     let actual_w = terminal_display_width(ansi_stripped.as_str());
     let pad = width.saturating_sub(actual_w);
@@ -998,5 +1003,81 @@ mod tests {
 
         assert_eq!(terminal_display_width(visible.as_str()), 6);
         assert_eq!(visible, "────  ");
+    }
+
+    /// Reproduce the exact table from the screenshot: 3 columns, emoji in first
+    /// column of each data row. Verify that every `│` separator sits at the same
+    /// column position across all rendered lines (header + data rows).
+    #[test]
+    fn screenshot_table_borders_align_with_emoji_first_column() {
+        let header = vec![
+            "严重度".to_string(),
+            "问题".to_string(),
+            "状态".to_string(),
+        ];
+        let align = vec![TableAlign::Left, TableAlign::Left, TableAlign::Left];
+        let rows = vec![
+            vec![
+                "🐛 上次 #1: switch -f 遗漏".to_string(),
+                "已修复".to_string(),
+                "✅".to_string(),
+            ],
+            vec![
+                "⚠️ 标签值测试 v1.2.3".to_string(),
+                "正确放行".to_string(),
+                "✅".to_string(),
+            ],
+            vec![
+                "📝 无扩展名文件的路径 checkout 局限".to_string(),
+                "有注释，合理取舍".to_string(),
+                "✅".to_string(),
+            ],
+        ];
+
+        let widths = compute_table_widths("", &header, &rows);
+        let top = render_table_top("", &widths);
+        let mid = render_table_mid("", & widths);
+        let hdr = render_table_header("", &header, &align, &widths);
+        let bot = render_table_bottom("", &widths);
+
+        let mut all_lines = Vec::new();
+        all_lines.push(top);
+        all_lines.push(hdr);
+        all_lines.push(mid);
+        for row in &rows {
+            all_lines.push(render_table_row("", row, &align, &widths));
+        }
+        all_lines.push(bot);
+
+        // Find the byte-offset of every `│` in each line and verify they all
+        // occupy the same visual column positions.
+        let mut separator_positions: Option<Vec<usize>> = None;
+        for line in &all_lines {
+            let stripped = strip_ansi_codes(line);
+            let positions: Vec<usize> = stripped
+                .char_indices()
+                .filter(|&(_, ch)| ch == '│')
+                .map(|(byte_idx, _)| {
+                    // Convert byte index to visual column by summing widths of
+                    // all preceding characters.
+                    stripped[..byte_idx]
+                        .chars()
+                        .map(|c| terminal_cell_width(c))
+                        .sum()
+                })
+                .collect();
+            if positions.is_empty() {
+                continue; // border-only lines (┌─┐, ├─┤, └─┘) have no │
+            }
+            if let Some(expected) = &separator_positions {
+                assert_eq!(
+                    &positions, expected,
+                    "│ column positions differ on line: {stripped:?}"
+                );
+            } else {
+                separator_positions = Some(positions);
+            }
+        }
+
     }
 }
