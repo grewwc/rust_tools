@@ -8,6 +8,7 @@ use std::{
 
 use reqwest::Client;
 use rust_tools::cw::SkipMap;
+use rustc_hash::FxHashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,6 +66,7 @@ impl Clone for App {
             goal_mode: self.goal_mode.clone(),
             last_turn_had_tool_calls: self.last_turn_had_tool_calls,
             last_turn_interrupted: self.last_turn_interrupted,
+            prune_marks: self.prune_marks.clone(),
         }
     }
 }
@@ -117,6 +119,9 @@ pub(super) struct App {
     /// goal 模式据此区分——被打断时保留 goal_mode 并回落到等待用户输入，
     /// 不打印「Goal achieved」误导信息。
     pub(super) last_turn_interrupted: bool,
+
+    /// LLM 引导的上下文裁剪计数表（tool_call_id → 连续被标记次数）
+    pub(super) prune_marks: FxHashMap<String, u8>,
 }
 
 impl App {

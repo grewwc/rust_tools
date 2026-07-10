@@ -33,6 +33,39 @@ fn model_fallback_and_disable_statuses_are_separate() {
 }
 
 #[test]
+fn parse_retry_after_caps_oversized_server_value() {
+    use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+    let mut headers = HeaderMap::new();
+    // 服务端返回极大的 Retry-After（模拟到下个配额窗口的秒数），必须被钳制。
+    headers.insert(RETRY_AFTER, HeaderValue::from_static("243749"));
+    let delay = parse_retry_after(&headers).expect("should parse numeric retry-after");
+    assert_eq!(delay, Duration::from_millis(REQUEST_RETRY_429_MAX_MS));
+
+    // 小于上限的值原样返回。
+    let mut small = HeaderMap::new();
+    small.insert(RETRY_AFTER, HeaderValue::from_static("3"));
+    assert_eq!(
+        parse_retry_after(&small),
+        Some(Duration::from_secs(3))
+    );
+
+    assert!(parse_retry_after(&HeaderMap::new()).is_none());
+}
+
+#[test]
+fn is_rate_limited_only_true_for_429() {
+    let too_many = RequestError::status(StatusCode::TOO_MANY_REQUESTS, String::new());
+    assert!(too_many.is_rate_limited());
+
+    let unauthorized = RequestError::status(StatusCode::UNAUTHORIZED, String::new());
+    assert!(!unauthorized.is_rate_limited());
+
+    let network = RequestError::cancelled("boom");
+    assert!(!network.is_rate_limited());
+}
+
+#[test]
 fn auto_subagent_retry_policy_fails_fast_for_fallback() {
     let regular = request_retry_policy(false);
     assert_eq!(regular.max_attempts, REQUEST_MAX_ATTEMPTS);
@@ -223,6 +256,7 @@ fn test_app() -> App {
         goal_mode: None,
         last_turn_had_tool_calls: false,
         last_turn_interrupted: false,
+        prune_marks: Default::default(),
     }
 }
 

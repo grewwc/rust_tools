@@ -17,7 +17,7 @@ actually touches that subsystem.
 - `mcp/`: stdio MCP client/init/connection/routing
 - `provider/`: provider adapters and request/stream differences
 - `stream/`: streaming response processing (inline_recovery, runtime, extract, splitter, render)
-- `history/compress/`: history compression (text_utils, tool_groups, tool_overflow, tests)
+- `history/compress/`: history compression (text_utils, tool_groups, tool_overflow, llm_prune, tests)
 - `builtin_agents/`, `builtin_skills/`: compiled-in prompt assets
 - core manifests: `agents.rs`, `skills.rs`, `persona.rs`, `models.rs`, `types.rs`, `config_schema.rs`
 
@@ -27,6 +27,14 @@ actually touches that subsystem.
    preload in `src/bin/a.rs` is cache warmup only.
 2. `load_skill` reads skill contents only; `activate_skill` changes turn behavior
    and tool availability.
+3. LLM-guided pruning (`history/compress/llm_prune.rs`): the model marks outdated
+   tool results via `<meta:self_note>prune:id1,id2</meta:self_note>`; after
+   `PRUNE_THRESHOLD` (3) consecutive marks the content is replaced with a
+   placeholder. It must reuse the existing tool-result protection policy:
+   `is_non_compressible_tool` results and the most recent `KEEP_RECENT_TOOL_MESSAGES`
+   tool messages are ignored even if marked. Injected in `prepare_turn`; marks are
+   parsed from both tool-call and final-response model turns. Does not delete messages
+   or alter existing compression logic.
 
 ## On-Demand Guides
 

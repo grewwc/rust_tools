@@ -27,6 +27,9 @@ pub(crate) enum RequestErrorKind {
 pub(crate) struct RequestError {
     pub(crate) kind: RequestErrorKind,
     pub(crate) message: String,
+    /// 429 场景下服务端建议的重试等待时长（已在 `parse_retry_after` 中钳制）。
+    /// 供 key 轮换/退避的上层逻辑读取；其它错误为 `None`。
+    pub(crate) retry_after: Option<Duration>,
 }
 
 impl RequestError {
@@ -34,6 +37,7 @@ impl RequestError {
         Self {
             kind: RequestErrorKind::Network,
             message: err.to_string(),
+            retry_after: None,
         }
     }
 
@@ -41,6 +45,7 @@ impl RequestError {
         Self {
             kind: RequestErrorKind::Network,
             message: message.into(),
+            retry_after: None,
         }
     }
 
@@ -52,7 +57,13 @@ impl RequestError {
             } else {
                 format!("request failed: {} {}", status, body)
             },
+            retry_after: None,
         }
+    }
+
+    /// 是否为 429（配额/限流）错误。
+    pub(crate) fn is_rate_limited(&self) -> bool {
+        matches!(self.kind, RequestErrorKind::Status(status) if status.as_u16() == 429)
     }
 }
 
@@ -68,6 +79,10 @@ pub(crate) const REQUEST_MAX_ATTEMPTS: usize = 6;
 pub(crate) const REQUEST_MAX_ATTEMPTS_429: usize = 32; // 429 错误重试 32 次
 pub(crate) const REQUEST_RETRY_BASE_MS: u64 = 500;
 pub(crate) const REQUEST_RETRY_MAX_MS: u64 = 16000;
+/// 429（配额超限）单次退避等待上限。服务端可能在 `Retry-After` 里返回极大的值
+/// （到下个配额窗口的秒数，可达数万秒），若原样 sleep 会让进程长时间“卡死”。
+/// 统一钳制到该上限，配合 key 轮换快速让位。
+pub(crate) const REQUEST_RETRY_429_MAX_MS: u64 = 10_000;
 /// 流式请求等待响应头（首字节）的超时。
 ///
 /// 主 `app.client` 仅保留 `connect_timeout`（不设置整体 `.timeout()`，
@@ -191,11 +206,13 @@ pub(crate) fn retry_delay(attempt: usize) -> Duration {
 
 /// 解析 HTTP `Retry-After` 响应头，返回建议的等待时长。
 /// 支持秒数格式（`120`）。HTTP 日期格式暂不支持。
+/// 返回值钳制到 `REQUEST_RETRY_429_MAX_MS`，避免服务端返回超大值把进程睡死。
 pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
     let val = headers.get(reqwest::header::RETRY_AFTER)?;
     let s = val.to_str().ok()?;
     if let Ok(secs) = s.trim().parse::<u64>() {
-        return Some(Duration::from_secs(secs));
+        let capped = secs.saturating_mul(1000).min(REQUEST_RETRY_429_MAX_MS);
+        return Some(Duration::from_millis(capped));
     }
     None
 }

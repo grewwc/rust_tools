@@ -73,6 +73,23 @@ pub(super) fn record_hidden_self_note(
     store.maintain_after_append();
 }
 
+pub(super) fn parse_prune_meta_and_update_marks(
+    app: &mut App,
+    messages: &[Message],
+    hidden_meta: &str,
+) -> String {
+    let (prune_ids, remaining_meta) =
+        crate::ai::history::compress::llm_prune::parse_prune_from_hidden_meta(hidden_meta);
+    let active_tool_ids =
+        crate::ai::history::compress::llm_prune::active_prunable_tool_ids(messages);
+    crate::ai::history::compress::llm_prune::update_prune_marks(
+        &mut app.prune_marks,
+        &prune_ids,
+        &active_tool_ids,
+    );
+    remaining_meta
+}
+
 pub(super) fn append_cached_tool_results_note(
     exec_result: &ExecuteToolCallsResult,
     messages: &mut Vec<Message>,
@@ -386,13 +403,17 @@ fn merge_into_existing_code_discovery(messages: &mut [Message], new_body: &str) 
 }
 
 pub(super) fn record_final_stream_response(
-    app: &App,
+    app: &mut App,
     stream_result: crate::ai::types::StreamResult,
     messages: &mut Vec<Message>,
     turn_messages: &mut Vec<Message>,
     final_assistant_text: &mut String,
     final_assistant_recorded: &mut bool,
 ) {
+    // 解析模型在 hidden_meta 中的 prune 标记，更新连续裁剪计数表，并剥离
+    // prune 行，避免把裁剪协议持久化成普通 self_note。
+    let remaining_meta =
+        parse_prune_meta_and_update_marks(app, messages, &stream_result.hidden_meta);
     let assistant_msg = Message {
         role: "assistant".to_string(),
         content: Value::String(stream_result.assistant_text.clone()),
@@ -404,7 +425,7 @@ pub(super) fn record_final_stream_response(
     append_message_pair(messages, turn_messages, assistant_msg);
     *final_assistant_text = stream_result.assistant_text;
     *final_assistant_recorded = true;
-    record_hidden_self_note(app, turn_messages, &stream_result.hidden_meta);
+    record_hidden_self_note(app, turn_messages, &remaining_meta);
 }
 
 fn build_code_inspection_working_memory(

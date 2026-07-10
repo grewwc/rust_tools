@@ -1,6 +1,6 @@
 mod blob;
 mod checkpoint;
-mod compress;
+pub(crate) mod compress;
 mod markdown;
 mod sessions;
 mod sqlite;

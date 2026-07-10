@@ -94,6 +94,7 @@ fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::
         goal_mode: None,
         last_turn_had_tool_calls: false,
         last_turn_interrupted: false,
+        prune_marks: Default::default(),
     }
 }
 
@@ -179,6 +180,7 @@ fn resolve_model_is_unicode_safe() {
         goal_mode: None,
         last_turn_had_tool_calls: false,
         last_turn_interrupted: false,
+        prune_marks: Default::default(),
     };
 
     let mut question = "a 什么是rust的一个crate？".to_string();

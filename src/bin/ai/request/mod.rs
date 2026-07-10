@@ -31,8 +31,9 @@ mod types;
 #[allow(unused_imports)]
 pub(crate) use error::{
     AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS, AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS,
-    REQUEST_MAX_ATTEMPTS, REQUEST_MAX_ATTEMPTS_429, RequestError, RequestErrorKind,
-    RequestRetryPolicy, STREAM_RESPONSE_HEADER_TIMEOUT_SECS, api_key_for_request_model,
+    REQUEST_MAX_ATTEMPTS, REQUEST_MAX_ATTEMPTS_429, REQUEST_RETRY_429_MAX_MS, RequestError,
+    RequestErrorKind, RequestRetryPolicy, STREAM_RESPONSE_HEADER_TIMEOUT_SECS,
+    api_key_for_request_model,
     apply_request_auth, clear_stale_request_interrupt_before_request, config_bool_is_true,
     config_forces_thinking, control_model_for_aux_tasks, endpoint_for_request_model,
     is_retryable_reqwest_error, is_retryable_status_with_body, is_retryable_stream_error,
@@ -73,10 +74,12 @@ fn retry_scope_tag() -> String {
     }
 }
 
-/// Try a single API key for `do_request_messages`, with full retry logic
-/// (header timeout, 429 backoff, hedging, network errors).
+/// Try a single API key for `do_request_messages`, with retry logic for
+/// header timeout, network errors, and retryable server statuses (5xx / 400+upstream).
+///
+/// 429（配额/限流）**不**在此内部退避重试：直接携带（已钳制的）`retry_after`
+/// 返回，交由上层 `do_request_messages` 先轮换其它 key，再决定是否退避重试。
 /// Returns `Ok` on success or `Err` after exhausting per-key retries.
-/// Caller decides whether to try another key based on the error kind.
 async fn request_messages_with_key(
     app: &mut App,
     api_key: &str,
@@ -84,8 +87,7 @@ async fn request_messages_with_key(
     retry_policy: &RequestRetryPolicy,
     endpoint: &str,
 ) -> Result<Response, RequestError> {
-    let loop_max = retry_policy.max_attempts_429.max(retry_policy.max_attempts);
-    for attempt in 1..=loop_max {
+    for attempt in 1..=retry_policy.max_attempts {
         let build_request = || {
             apply_request_auth(app.client.post(endpoint), endpoint, api_key)
                 .header("Content-Type", "application/json")
@@ -126,6 +128,7 @@ async fn request_messages_with_key(
                         "request timed out waiting for response headers after {} attempts",
                         retry_policy.max_attempts
                     ),
+                    retry_after: None,
                 });
             }
         };
@@ -143,36 +146,27 @@ async fn request_messages_with_key(
                     None
                 };
                 let body = (response.text().await).unwrap_or_default();
-                let err = RequestError::status(status, body);
+                let mut err = RequestError::status(status, body);
 
-                let max_attempts_for_status = if status_code == 429 {
-                    retry_policy.max_attempts_429
-                } else {
-                    retry_policy.max_attempts
-                };
+                // 429（配额/限流）不在单 key 内退避：携带钳制后的 retry_after 立即返回，
+                // 让上层先轮换其它 key，key 用尽后再由上层决定退避重试。
+                if status_code == 429 {
+                    err.retry_after = retry_after_delay;
+                    return Err(err);
+                }
 
                 if is_retryable_status_with_body(status, &err.message)
-                    && attempt < max_attempts_for_status
+                    && attempt < retry_policy.max_attempts
                 {
-                    let delay = retry_after_delay.unwrap_or_else(|| retry_delay(attempt));
-                    if status_code == 429 {
-                        eprintln!(
-                            "[Warning] {}429 Too Many Requests - 配额超限，sleep {} 秒后重试 (attempt {}/{})",
-                            retry_scope_tag(),
-                            delay.as_secs_f32(),
-                            attempt,
-                            max_attempts_for_status
-                        );
-                    } else {
-                        eprintln!(
-                            "[Warning] {}{} - sleep {} 秒后重试 (attempt {}/{})",
-                            retry_scope_tag(),
-                            status,
-                            delay.as_secs_f32(),
-                            attempt,
-                            max_attempts_for_status
-                        );
-                    }
+                    let delay = retry_delay(attempt);
+                    eprintln!(
+                        "[Warning] {}{} - sleep {} 秒后重试 (attempt {}/{})",
+                        retry_scope_tag(),
+                        status,
+                        delay.as_secs_f32(),
+                        attempt,
+                        retry_policy.max_attempts
+                    );
                     if sleep_with_cancel(app, delay).await {
                         return Err(RequestError::cancelled(
                             "request canceled by user during retry wait",
@@ -261,7 +255,10 @@ pub(super) async fn do_request_messages(
     );
     let retry_policy = request_retry_policy_for_current_context();
 
-    // --- Key collection & rotation (via ProviderAdapter) ---
+    // --- Key rotation + 429 backoff ---
+    // 每一轮先轮换尝试所有 key；只有当全部 key 都因 429（配额/限流）失败时，
+    // 才整轮退避重试（最多 max_attempts_429 轮）。其它可轮换错误（401/403）
+    // 轮换 key 后仍失败则直接返回，重试无意义。
     let endpoint = endpoint_for_request_model(app, model);
     let primary_key = api_key_for_request_model(app, model);
     let adapter = adapter_for(models::model_provider(model), &endpoint);
@@ -269,28 +266,58 @@ pub(super) async fn do_request_messages(
     let total_keys = keys_to_try.len();
 
     let mut last_key_err: Option<RequestError> = None;
-    for (key_idx, api_key) in keys_to_try.iter().enumerate() {
-        if key_idx > 0 {
-            eprintln!(
-                "[{}] key #{} failed, trying next key #{} ({} remaining)",
-                adapter.label(),
-                key_idx - 1,
-                key_idx,
-                total_keys - key_idx
-            );
-        }
-        match request_messages_with_key(app, api_key, &request_body, &retry_policy, &endpoint).await
-        {
-            Ok(response) => return Ok(response),
-            Err(err) if should_rotate_key(&err) && key_idx + 1 < total_keys => {
-                last_key_err = Some(err);
+    for attempt in 1..=retry_policy.max_attempts_429 {
+        let mut all_rate_limited = true;
+        let mut round_retry_after: Option<Duration> = None;
+        for (key_idx, api_key) in keys_to_try.iter().enumerate() {
+            if key_idx > 0 {
+                eprintln!(
+                    "[{}] key #{} failed, trying next key #{} ({} remaining)",
+                    adapter.label(),
+                    key_idx - 1,
+                    key_idx,
+                    total_keys - key_idx
+                );
             }
-            Err(err) => return Err(err),
+            match request_messages_with_key(app, api_key, &request_body, &retry_policy, &endpoint)
+                .await
+            {
+                Ok(response) => return Ok(response),
+                Err(err) if should_rotate_key(&err) => {
+                    if err.is_rate_limited() {
+                        round_retry_after = err.retry_after.or(round_retry_after);
+                    } else {
+                        all_rate_limited = false;
+                    }
+                    last_key_err = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        // 所有 key 均失败。仅当全部为 429 限流且仍有重试额度时才整轮退避重试。
+        if !all_rate_limited || attempt >= retry_policy.max_attempts_429 {
+            break;
+        }
+        let delay = round_retry_after.unwrap_or_else(|| retry_delay(attempt));
+        eprintln!(
+            "[Warning] {}429 Too Many Requests - {} 个 key 均配额超限，sleep {} 秒后重试 (attempt {}/{})",
+            retry_scope_tag(),
+            total_keys,
+            delay.as_secs_f32(),
+            attempt,
+            retry_policy.max_attempts_429
+        );
+        if sleep_with_cancel(app, delay).await {
+            return Err(RequestError::cancelled(
+                "request canceled by user during retry wait",
+            ));
         }
     }
     Err(last_key_err.unwrap_or_else(|| RequestError {
         kind: RequestErrorKind::Network,
         message: adapter.keys_exhausted_message().to_string(),
+        retry_after: None,
     }))
 }
 

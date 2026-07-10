@@ -12,7 +12,7 @@ use crate::ai::{
         recall_rank, render_record,
     },
     driver::{print::print_ocr_summary, reflection, skill_runtime},
-    history::{Message, ROLE_INTERNAL_NOTE, build_context_history},
+    history::{compress::llm_prune, Message, ROLE_INTERNAL_NOTE, build_context_history},
     request,
     tools::storage::memory_store::{AgentMemoryEntry, MemoryStore},
     types::App,
@@ -276,7 +276,7 @@ pub(super) async fn prepare_turn(
         Some(store.session_assets_dir(&app.session_id))
     };
     crate::ai::driver::runtime_ctx::publish_subagent_phase("preparing context");
-    let history = build_context_history(
+    let mut history = build_context_history(
         history_count,
         &app.session_history_file,
         app.config.history_max_chars,
@@ -489,6 +489,21 @@ pub(super) async fn prepare_turn(
         tool_call_id: None,
         reasoning_content: None,
     });
+    // LLM 引导裁剪：在历史消息发送给模型前，静默替换已被连续标记为低价值的 tool 结果内容。
+    // 不删除消息、不改变数组长度，仅替换 content 字段为占位符。
+    llm_prune::apply_pruning(&mut history, &app.prune_marks);
+    // 当历史足够长时，在系统 prompt 后追加裁剪协议提示（不影响用户可见 prompt）。
+    if llm_prune::should_inject_prune_prompt(history.len()) {
+        messages.push(Message {
+            role: "system".to_string(),
+            content: Value::String(
+                llm_prune::PRUNE_PROTOCOL_PROMPT.to_string(),
+            ),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        });
+    }
     messages.extend(history);
     // Per-turn context reminder (Current Date / Recalled Knowledge / Code
     // Discovery, …) used to be injected as a synthetic user+assistant pair

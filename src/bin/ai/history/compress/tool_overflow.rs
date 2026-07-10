@@ -129,7 +129,7 @@ pub(super) fn prepare_tool_messages_structured(
     }
 }
 
-fn build_tool_call_name_index(messages: &[Message]) -> FxHashMap<String, String> {
+pub(super) fn build_tool_call_name_index(messages: &[Message]) -> FxHashMap<String, String> {
     let mut out = FxHashMap::default();
     for message in messages {
         let Some(tool_calls) = &message.tool_calls else {

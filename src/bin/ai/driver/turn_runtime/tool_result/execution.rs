@@ -15,7 +15,8 @@ use super::super::{
 use super::{
     messaging::{
         append_cached_tool_results_note, append_message_pair, append_tool_result_messages,
-        record_final_stream_response, record_tool_inspection_artifacts,
+        parse_prune_meta_and_update_marks, record_final_stream_response,
+        record_tool_inspection_artifacts,
     },
     overflow::{build_model_overflow_stub, summarize_large_tool_output, write_tool_overflow_file},
     preview::{build_terminal_preview, tail_chars},
@@ -569,6 +570,11 @@ fn handle_tool_call_round(
     iteration: usize,
     turn_had_tool_error: &mut bool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let _remaining_meta = parse_prune_meta_and_update_marks(
+        app,
+        messages,
+        &tool_call_execution.stream_result.hidden_meta,
+    );
     let mut observer = TerminalToolObserver::new(app);
     let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
     let exec_result = execute_tool_calls_for_round(
@@ -1170,6 +1176,7 @@ mod tests {
             goal_mode: None,
             last_turn_had_tool_calls: false,
             last_turn_interrupted: false,
+            prune_marks: Default::default(),
         }
     }
 
