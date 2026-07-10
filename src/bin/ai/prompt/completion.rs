@@ -390,7 +390,12 @@ impl CommandCompleter {
     }
 
     pub(super) fn complete_for_line(line: &str, pos: usize) -> (usize, Vec<CompletionCandidate>) {
-        let pos = pos.min(line.len());
+        // `pos` 是字节偏移的光标位置，可能落在多字节 UTF-8 字符内部（如中文），
+        // 直接 `&line[..pos]` 切片会 panic。向下对齐到最近的字符边界。
+        let mut pos = pos.min(line.len());
+        while pos > 0 && !line.is_char_boundary(pos) {
+            pos -= 1;
+        }
         let before = &line[..pos];
         // `@skills` / `@skill[:prefix]` 触发技能补全，必须先于普通 `@file` 补全，
         // 否则 `complete_file_reference` 会把 `@skills` 当成文件路径片段处理。
@@ -1079,6 +1084,16 @@ mod tests {
         // --h → --help 也匹配
         let (_, candidates) = CommandCompleter::complete_for_line("--h", 3);
         assert!(candidates.iter().any(|c| c.replacement == "--help"));
+    }
+
+    #[test]
+    fn completion_pos_inside_multibyte_char_does_not_panic() {
+        // 光标字节偏移落在多字节 UTF-8 字符内部（如中文'能'）时，
+        // 直接切片会 panic。向下对齐到字符边界后应安全返回。
+        let line = "帮我给a.rs 这个 agent 增加一个dump 功能";
+        for pos in 0..=line.len() {
+            let _ = CommandCompleter::complete_for_line(line, pos);
+        }
     }
 
     #[test]
