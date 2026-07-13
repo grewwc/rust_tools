@@ -33,9 +33,10 @@ use super::{
 /// - hard: 连续 6 轮完全一致，直接强制收敛，不再继续工具循环
 const TOOL_LOOP_SOFT_WINDOW: usize = 4;
 const TOOL_LOOP_HARD_WINDOW: usize = 6;
-/// 近似循环窗口：连续 N 轮对「同一目标资源」调用同一工具（忽略 offset/limit
-/// 等翻页参数）即命中。用于抓字节精确检测漏掉的「同文件反复翻页 / 仅微调分页
-/// 参数的重复检索」这类真实膨胀。仅注入一次软提示，不强制收敛。
+/// 近似低收益重复窗口：连续 N 轮对「同一目标资源」调用同一工具（忽略
+/// offset/limit 等翻页参数）即命中。用于抓字节精确检测漏掉的「同文件反复
+/// 翻页 / 仅微调分页参数的重复检索」这类真实膨胀。仅注入一次温和提示，
+/// 提醒模型判断是否该收敛；不把它直接视为硬性的 loop。
 const TOOL_LOOP_COARSE_WINDOW: usize = 5;
 const TOOL_SIGNATURE_HISTORY_LIMIT: usize = TOOL_LOOP_HARD_WINDOW + 2;
 const TASK_ANCHOR_MAX_QUESTION_CHARS: usize = 220;
@@ -175,7 +176,7 @@ struct TurnSupervisor {
 
 enum ToolLoopSignal {
     None,
-    /// 近似循环：同一工具反复命中同一目标资源（忽略翻页参数）。软提示一次。
+    /// 近似低收益重复：同一工具反复命中同一目标资源（忽略翻页参数）。温和提示一次。
     Coarse,
     Soft,
     Hard,
@@ -353,14 +354,16 @@ fn inject_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
     });
 }
 
-/// 近似循环命中：同一工具反复命中同一目标资源（仅翻页/检索参数在变）。提醒
-/// agent 一次性读大块或收敛检索，而非逐页刷屏。软提示，不强制收敛。
+/// 近似低收益重复命中：同一工具反复命中同一目标资源（仅翻页/检索参数在变）。
+/// 提醒 agent 判断这些调用是否真的在推进问题；若只是碎片化翻页则收敛，
+/// 若各轮服务于不同且明确的子问题则允许继续。软提示，不强制收敛。
 fn inject_coarse_loop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
-    let note = "[loop-approx] 你最近多轮都在对同一目标反复调用同一工具，只是翻页/检索参数在微调，效率很低。\n\
-        请改为：(a) 一次读取更大的行范围（提高 read_file 的 limit）或用检索工具一次定位，而不是逐页翻；\n\
-        (b) 复用已读到的内容，不要重复读同一文件同一段；(c) 若已够回答就直接作答。";
+    let note = "[low-yield-repetition] 你最近多轮都在对同一目标调用同一工具，主要变化只是翻页/检索窗口参数。\n\
+        这常常意味着低收益重复，但不一定是错误：如果这些调用分别服务于不同且明确的子问题，可以继续；\n\
+        否则请优先：(a) 一次读取更大的行范围（提高 read_file 的 limit）或用检索工具一次定位；\n\
+        (b) 复用已读到的内容，不要重复读同一文件同一段；(c) 若信息已足够，就直接作答。";
     messages.push(Message {
         role: "system".to_string(),
         content: Value::String(note.to_string()),
@@ -656,6 +659,16 @@ mod tests {
             supervisor.record_tool_signatures(&messages),
             ToolLoopSignal::None
         ));
+    }
+
+    #[test]
+    fn coarse_loop_note_allows_distinct_sub_questions() {
+        let mut messages = Vec::new();
+        inject_coarse_loop_note(&mut messages);
+        let text = messages[0].content.as_str().unwrap_or_default().to_string();
+        assert!(text.contains("[low-yield-repetition]"));
+        assert!(text.contains("不同且明确的子问题"));
+        assert!(text.contains("不一定是错误"));
     }
 
     #[test]
@@ -1168,7 +1181,7 @@ async fn run_turn_body(
             ToolLoopSignal::Coarse => {
                 crate::ai::driver::print::print_tool_note_line(
                     "agent-health",
-                    "approx tool-loop detected (same target, paging only): injecting converge prompt",
+                    "possible low-yield repetition detected (same target, paging only): injecting converge hint",
                 );
                 inject_coarse_loop_note(&mut messages);
             }
