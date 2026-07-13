@@ -18,12 +18,12 @@ use super::{
 };
 use crate::ai::prompt::{PromptEditor, interrupted_error};
 
-/// viewport 最大高度（textarea + chrome），随终端尺寸动态缩放，上限 10 行。
-const MAX_VIEWPORT_HEIGHT: u16 = 10;
-/// textarea 最大行数 = MAX_VIEWPORT_HEIGHT - VIEWPORT_CHROME_LINES。
+/// viewport 最大高度（textarea + chrome），随终端尺寸动态缩放，上限 12 行。
+const MAX_VIEWPORT_HEIGHT: u16 = 12;
+/// textarea 最大行数上限（大终端下的舒适值）。
 const MAX_TEXTAREA_LINES: u16 = 7;
-/// chrome 固定行数：model(1) + help(2)，top_margin=0 且无 spacer。
-const VIEWPORT_CHROME_LINES: u16 = 3;
+/// chrome 固定行数：top_rule(1) + model(1) + help(2) + bottom_rule(1)。
+const VIEWPORT_CHROME_LINES: u16 = 5;
 /// textarea 最小行数，用于 clamp 计算。
 const MIN_TEXTAREA_LINES: u16 = 2;
 /// 空输入时保持更紧凑：只保留 1 行输入区 + 固定 chrome，减少上一轮输出与
@@ -33,7 +33,7 @@ const EMPTY_VIEWPORT_HEIGHT: u16 = 1 + VIEWPORT_CHROME_LINES;
 /// 补全面板一次最多显示的候选行数，与 `render::COMPLETION_WINDOW` 对齐。
 const PANEL_COMPLETION_WINDOW: u16 = 12;
 /// 补全面板激活时的保底 chrome：textarea 最小行(1) + 压缩后的帮助行(1) = 2。
-/// 补全态会隐藏 model/session 行，优先把高度让给候选列表。
+/// 补全态会隐藏 model/session 与上下分隔线，优先把高度让给候选列表。
 const PANEL_CHROME_LINES: u16 = 2;
 /// 补全态允许比普通编辑态更高的 inline viewport，这样大终端里可以一次看到更多候选。
 const MAX_COMPLETION_VIEWPORT_HEIGHT: u16 = PANEL_CHROME_LINES + PANEL_COMPLETION_WINDOW + 2;
@@ -360,15 +360,15 @@ mod tests {
 
     #[test]
     fn multiline_viewport_height_scales_with_terminal() {
-        // 空输入：更紧凑，viewport = 1 行输入区 + chrome(3) = 4
-        assert_eq!(multiline_viewport_height(30, None), 4);
-        assert_eq!(multiline_viewport_height(30, Some("")), 4);
+        // 空输入：更紧凑，viewport = 1 行输入区 + chrome(5) = 6
+        assert_eq!(multiline_viewport_height(30, None), 6);
+        assert_eq!(multiline_viewport_height(30, Some("")), 6);
         // 有预填但内容短于 base：保持 base 大小
-        assert_eq!(multiline_viewport_height(30, Some("one line")), 10);
-        // 小终端：terminal=12, available=10，空输入仍保持 4 行紧凑 viewport
-        assert_eq!(multiline_viewport_height(12, None), 4);
+        assert_eq!(multiline_viewport_height(30, Some("one line")), 12);
+        // 小终端：terminal=12, available=10，空输入仍保持 6 行紧凑 viewport
+        assert_eq!(multiline_viewport_height(12, None), 6);
         // 大终端下空输入仍保持紧凑
-        assert_eq!(multiline_viewport_height(40, None), 4);
+        assert_eq!(multiline_viewport_height(40, None), 6);
     }
 
     #[test]
@@ -378,8 +378,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // terminal=40: available=38, base_textarea=8, content=20→clamp(8,8)=8, viewport=10
-        assert_eq!(multiline_viewport_height(40, Some(&prefill)), 10);
+        // terminal=40: available=38, base_textarea=7, content=20→clamp(7,7)=7, viewport=12
+        assert_eq!(multiline_viewport_height(40, Some(&prefill)), 12);
         assert_eq!(multiline_viewport_height(10, Some(&prefill)), 8);
         assert_eq!(multiline_viewport_height(4, Some(&prefill)), 2);
         assert_eq!(multiline_viewport_height(4, None), 2); // available=2，仍受可用行数约束

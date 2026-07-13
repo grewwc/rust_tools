@@ -19,9 +19,11 @@ const COMPLETION_WINDOW: usize = 12;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PopupLayoutConfig {
     top_margin: u16,
+    top_rule_lines: u16,
     help_lines: u16,
     model_header_lines: u16,
     spacer_lines: u16,
+    bottom_rule_lines: u16,
     min_textarea_lines: u16,
 }
 
@@ -34,9 +36,10 @@ fn popup_layout_config(
     _has_status_msg: bool,
     has_model_label: bool,
 ) -> PopupLayoutConfig {
-    // top_margin 始终保持 0。非补全态保留两行帮助；补全态把帮助压成 1 行，
-    // 并隐藏 model/session 行，尽量把空间让给候选列表。
+    // top_margin 始终保持 0。普通输入态上下各保留 1 行细分隔线；补全态隐藏这两条
+    // 装饰线，把高度尽量让给候选列表，避免在矮终端里只剩 1 条候选可见。
     let top_margin: u16 = 0;
+    let top_rule_lines: u16 = if has_completion_panel { 0 } else { 1 };
     // 补全面板激活时，把底部帮助压缩为 1 行并隐藏 model/session 信息，
     // 优先把高度让给候选列表；小终端里这能显著减少"只能看到 1 个候选"的情况。
     let help_lines: u16 = if has_completion_panel { 1 } else { 2 };
@@ -46,6 +49,7 @@ fn popup_layout_config(
         1
     };
     let spacer_lines = 0;
+    let bottom_rule_lines: u16 = if has_completion_panel { 0 } else { 1 };
     let min_textarea_lines = if has_completion_panel {
         1
     } else {
@@ -54,9 +58,11 @@ fn popup_layout_config(
 
     PopupLayoutConfig {
         top_margin,
+        top_rule_lines,
         help_lines,
         model_header_lines,
         spacer_lines,
+        bottom_rule_lines,
         min_textarea_lines,
     }
 }
@@ -105,6 +111,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     );
 
     // 计算各区域高度
+    let top_rule_lines = layout.top_rule_lines;
     let help_lines = layout.help_lines;
     // 模型/主题信息行：放在底部（help 行上方）而非 viewport 顶行。inline viewport 每次
     // 重新锚定（resize、上方有新输出、退出清屏）时，**顶行**会被推入终端永久 scrollback
@@ -116,6 +123,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // 1. 没有补全面板（否则可用高度太紧张）；
     // 2. 正文末尾自己没有留空行。
     let spacer_lines = layout.spacer_lines;
+    let bottom_rule_lines = layout.bottom_rule_lines;
     // 面板激活时优先占满高度：先扣掉 help 行与 textarea 最小行，余下的尽量给面板
     // （面板期望高度 = min(候选数, COMPLETION_WINDOW) + 上下边框 2，但不超过可用空间）。
     // textarea 退让到最小 1 行（此时用户在选列表，不需要大编辑区）。
@@ -127,26 +135,32 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             // 面板可用上限 = 总高度 - help - textarea 最小行。
             let panel_cap = inner
                 .height
+                .saturating_sub(top_rule_lines)
                 .saturating_sub(help_lines)
                 .saturating_sub(model_header_lines)
                 .saturating_sub(spacer_lines)
+                .saturating_sub(bottom_rule_lines)
                 .saturating_sub(min_textarea_lines);
             let panel = desired_panel.min(panel_cap).max(1.min(panel_cap));
             let textarea = inner
                 .height
+                .saturating_sub(top_rule_lines)
                 .saturating_sub(panel)
                 .saturating_sub(spacer_lines)
                 .saturating_sub(model_header_lines)
                 .saturating_sub(help_lines)
+                .saturating_sub(bottom_rule_lines)
                 .max(min_textarea_lines);
             (textarea, panel)
         }
         None => {
             let textarea = inner
                 .height
+                .saturating_sub(top_rule_lines)
                 .saturating_sub(spacer_lines)
                 .saturating_sub(model_header_lines)
                 .saturating_sub(help_lines)
+                .saturating_sub(bottom_rule_lines)
                 .max(min_textarea_lines);
             (textarea, 0)
         }
@@ -155,25 +169,31 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(top_rule_lines),
             Constraint::Length(textarea_lines),
             Constraint::Length(panel_lines),
             Constraint::Length(spacer_lines),
             Constraint::Length(model_header_lines),
             Constraint::Length(help_lines),
+            Constraint::Length(bottom_rule_lines),
         ])
         .split(inner);
 
     // textarea 的渲染区域
-    let textarea_area = chunks[0];
+    let textarea_area = chunks[1];
 
     // 清除 popup 区域，确保 resize 后旧边框/文本不残留
     f.render_widget(Clear, popup);
+
+    if top_rule_lines > 0 {
+        f.render_widget(Paragraph::new(divider_line(chunks[0].width)), chunks[0]);
+    }
 
     // 底部模型/主题信息行：让用户在输入时看到当前模型与 session 主题。
     // **必须画在底部专属 chunk（chunks[3]，help 行上方）而非 viewport 顶行**：顶行会在
     // 每次 viewport 重新锚定时被推进 scrollback 反复堆叠（见上方 model_header_lines 注释）。
     if model_header_lines > 0 {
-        let header_area = chunks[3];
+        let header_area = chunks[4];
         let mut spans = vec![
             Span::styled(" model: ", Style::default().fg(Color::Rgb(148, 163, 184))),
             Span::styled(
@@ -202,12 +222,9 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         f.render_widget(Paragraph::new(header), header_area);
     }
 
-    // 注意：这里**故意不画** `Borders::TOP/BOTTOM` 全宽横线。
-    // 在 ratatui inline viewport 下，每当 viewport 重新锚定（resize 突发、
-    // 上方有新输出、退出清屏）时，顶部/底部的全宽横线会被推入终端的
-    // 永久 scrollback，表现为「输入框上方堆叠多条横线」的 bug——而退出时
-    // 的 `Clear(FromCursorDown)` 无法擦除光标上方的历史行。去掉装饰性横线
-    // 即可根除该污染；底部 help 行已提供足够的区域分隔。
+    // 这里用单独 chunk 画“细分隔线”，而不是粗边框。样式上保留上下边缘，
+    // 但仍交给 multiline_ui 的退出清理与 viewport 重建逻辑统一擦除，
+    // 避免旧版全宽边框那种厚重、易残留的观感。
     let char_count = current_content.chars().count();
 
     // 设置对齐方式
@@ -229,7 +246,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         // 而不是固定 COMPLETION_WINDOW：在矮终端下 layout 会把面板挤压成
         // 比 COMPLETION_WINDOW 更少的行，若仍按固定值算 `start`，选中项一旦
         // 越过可见区就会落到屏幕外，表现为"卡在前几项、无法滚动"。
-        let visible_rows = (chunks[1].height as usize).saturating_sub(2).max(1);
+        let visible_rows = (chunks[2].height as usize).saturating_sub(2).max(1);
         let window_size = visible_rows.min(panel.items.len()).max(1);
         let start = panel
             .selected_index
@@ -262,7 +279,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                     .add_modifier(Modifier::BOLD),
             ));
 
-        f.render_widget(Paragraph::new(items).block(panel_block), chunks[1]);
+        f.render_widget(Paragraph::new(items).block(panel_block), chunks[2]);
     }
 
     // 获取光标位置
@@ -418,10 +435,10 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             ]),
         ]
     };
-    f.render_widget(Paragraph::new(help_lines), chunks[4]);
+    f.render_widget(Paragraph::new(help_lines), chunks[5]);
 
     if let Some(msg) = status_msg {
-        let c2 = chunks[4];
+        let c2 = chunks[5];
         if c2.height >= 2 && c2.width > 2 {
             let status_width = (c2.width - 2) as usize;
             let status_text = truncate_with_ellipsis(msg, status_width);
@@ -438,6 +455,28 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             f.render_widget(status_para, status_area);
         }
     }
+
+    if bottom_rule_lines > 0 {
+        f.render_widget(Paragraph::new(divider_line(chunks[6].width)), chunks[6]);
+    }
+}
+
+fn divider_line(width: u16) -> Line<'static> {
+    if width <= 2 {
+        return Line::from(Span::styled(
+            "─".repeat(width as usize),
+            Style::default().fg(Color::Rgb(71, 85, 105)),
+        ));
+    }
+    let body_width = width.saturating_sub(2) as usize;
+    Line::from(vec![
+        Span::styled("╶", Style::default().fg(Color::Rgb(100, 116, 139))),
+        Span::styled(
+            "─".repeat(body_width),
+            Style::default().fg(Color::Rgb(71, 85, 105)),
+        ),
+        Span::styled("╴", Style::default().fg(Color::Rgb(100, 116, 139))),
+    ])
 }
 
 fn completion_item_line(display: &str, selected: bool) -> Line<'_> {
@@ -576,13 +615,13 @@ fn textarea_terminal_cursor(textarea: &TextArea<'_>, area: Rect) -> Option<(u16,
 #[cfg(test)]
 mod tests {
     use super::{
-        count_trailing_blank_lines, popup_layout_config, render_multiline_popup,
+        count_trailing_blank_lines, divider_line, popup_layout_config, render_multiline_popup,
         truncate_with_ellipsis,
     };
     use ratatui::{
+        Terminal, TerminalOptions, Viewport,
         backend::TestBackend,
         layout::{Position, Rect},
-        Terminal, TerminalOptions, Viewport,
     };
     use tui_textarea::TextArea;
     use unicode_width::UnicodeWidthStr;
@@ -634,11 +673,13 @@ mod tests {
     #[test]
     fn empty_prompt_keeps_consistent_top_margin() {
         let layout = popup_layout_config(8, "", 1, 0, false, false, true);
-        // 紧凑空输入：top_margin=0, help=2，最大限度减少空白行
+        // 紧凑空输入：top_margin=0，上下各 1 条细分隔线，help=2
         assert_eq!(layout.top_margin, 0);
+        assert_eq!(layout.top_rule_lines, 1);
         assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
         assert_eq!(layout.spacer_lines, 0);
+        assert_eq!(layout.bottom_rule_lines, 1);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
@@ -647,9 +688,11 @@ mod tests {
         let layout = popup_layout_config(8, "hello", 1, 0, false, false, true);
         // 统一 chrome 布局：与空输入一致，避免空→非空切换时 textarea 行数跳变
         assert_eq!(layout.top_margin, 0);
+        assert_eq!(layout.top_rule_lines, 1);
         assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
         assert_eq!(layout.spacer_lines, 0);
+        assert_eq!(layout.bottom_rule_lines, 1);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
@@ -657,9 +700,11 @@ mod tests {
     fn completion_panel_prioritizes_candidate_rows_over_chrome() {
         let layout = popup_layout_config(8, "/model", 1, 0, true, true, true);
         assert_eq!(layout.top_margin, 0);
+        assert_eq!(layout.top_rule_lines, 0);
         assert_eq!(layout.help_lines, 1);
         assert_eq!(layout.model_header_lines, 0);
         assert_eq!(layout.spacer_lines, 0);
+        assert_eq!(layout.bottom_rule_lines, 0);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
@@ -689,8 +734,14 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        // 紧凑模式 top_margin=0，光标紧贴 viewport 顶部
-        let expected = Position::new(popup_x + 1, viewport_area.y);
+        // 紧凑模式下顶部分隔线占 1 行，光标应落在其下一行
+        let expected = Position::new(popup_x + 1, viewport_area.y + 1);
         terminal.backend_mut().assert_cursor_position(expected);
+    }
+
+    #[test]
+    fn divider_line_spans_requested_width() {
+        let rendered = divider_line(12);
+        assert_eq!(rendered.width(), 12);
     }
 }

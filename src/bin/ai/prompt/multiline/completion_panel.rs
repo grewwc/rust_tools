@@ -113,8 +113,8 @@ pub(in crate::ai::prompt::multiline) fn move_completion_selection(
         panel.selected_index = 0;
         return;
     }
-    let last = panel.items.len().saturating_sub(1) as isize;
-    panel.selected_index = (panel.selected_index as isize + delta).clamp(0, last) as usize;
+    let item_count = panel.items.len() as isize;
+    panel.selected_index = (panel.selected_index as isize + delta).rem_euclid(item_count) as usize;
 }
 
 pub(in crate::ai::prompt::multiline) fn confirm_completion_selection(
@@ -313,8 +313,11 @@ mod tests {
         move_completion_selection(&mut panel, 10);
         assert_eq!(panel.as_ref().map(|panel| panel.selected_index), Some(2));
 
-        move_completion_selection(&mut panel, -10);
+        move_completion_selection(&mut panel, 1);
         assert_eq!(panel.as_ref().map(|panel| panel.selected_index), Some(0));
+
+        move_completion_selection(&mut panel, -1);
+        assert_eq!(panel.as_ref().map(|panel| panel.selected_index), Some(2));
     }
 
     #[test]
