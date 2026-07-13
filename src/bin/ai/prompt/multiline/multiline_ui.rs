@@ -2,6 +2,7 @@ use std::io;
 use std::time::Duration;
 
 use crossterm::{
+    cursor,
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
     terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size as terminal_size},

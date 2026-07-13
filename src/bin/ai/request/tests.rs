@@ -552,7 +552,7 @@ fn build_request_body_wire_format_is_byte_stable_per_provider() {
 fn expected_max_tokens_field(model: &str, messages: &[Message]) -> String {
     match super::super::models::max_output_tokens(model) {
         Some(model_max) => {
-            let clamped = clamp_max_tokens_for_prompt(model, messages, model_max, None);
+            let clamped = clamp_max_tokens_for_prompt(model, messages, None, model_max, None);
             format!(r#","max_tokens":{clamped}"#)
         }
         None => String::new(),
@@ -579,15 +579,15 @@ fn clamp_ignores_stale_high_known_prompt_after_compression() {
     }];
 
     // 陈旧的高 known（压缩前 ~满窗）不应触底。
-    let stale_high = clamp_max_tokens_for_prompt(model, &messages, model_max, Some(259_000));
+    let stale_high = clamp_max_tokens_for_prompt(model, &messages, None, model_max, Some(259_000));
     assert!(
         stale_high > MIN_OUTPUT_TOKENS_FLOOR,
         "stale-high known_prompt_tokens should not clamp output to the floor, got {stale_high}"
     );
 
     // 合理的 known（与本轮估算同量级）仍被采纳：结果与不传 known 接近。
-    let fresh = clamp_max_tokens_for_prompt(model, &messages, model_max, Some(20));
-    let no_known = clamp_max_tokens_for_prompt(model, &messages, model_max, None);
+    let fresh = clamp_max_tokens_for_prompt(model, &messages, None, model_max, Some(20));
+    let no_known = clamp_max_tokens_for_prompt(model, &messages, None, model_max, None);
     assert_eq!(fresh, no_known);
 }
 

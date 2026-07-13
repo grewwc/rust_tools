@@ -5,7 +5,7 @@
 //! 常驻的 `-wal`/`-shm`）。因此「保存检查点」= 复制该 sqlite 文件，「回滚」=
 //! 把检查点文件复制回 session 文件即可，简单且健壮。
 //!
-//! context-history 缓存以文件 len/mtime/`PRAGMA data_version` 作为失效键，
+//! context-history 缓存以文件 len/mtime 与 `meta.history_revision` 作为失效键，
 //! 复制文件会改变这些值，从而自动让缓存失效，回滚后能读到正确历史。
 
 use std::fs;

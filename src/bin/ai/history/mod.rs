@@ -61,11 +61,12 @@ struct ContextHistoryCacheKey {
     overflow_dir: Option<PathBuf>,
     file_len: Option<u64>,
     modified_unix_ms: Option<u128>,
-    /// SQLite `PRAGMA data_version`：每次 DB 被修改后递增。
-    /// WAL 模式下主文件 len/mtime 可能长时间不变，单独依赖文件元数据
-    /// 会让 cache 错误命中已删/已改的历史；data_version 是 SQLite
-    /// 内建的强失效信号。
-    sqlite_data_version: Option<i64>,
+    /// history DB 的写入版本号（`meta.history_revision`）：每次写事务内递增。
+    /// WAL 模式下主文件 len/mtime 可能长时间不变，单独依赖文件元数据会让 cache
+    /// 错误命中已删/已改的历史。该版本号是**跨连接**可见的强失效信号，
+    /// 取代不可靠的 `PRAGMA data_version`（后者是连接局部值，新连接读到的初值
+    /// 不随外部写入而变）。
+    history_revision: Option<i64>,
 }
 
 struct ContextHistoryCacheEntry {
@@ -203,8 +204,8 @@ fn context_history_cache_key(
         .as_ref()
         .and_then(|m| m.modified().ok())
         .and_then(system_time_millis);
-    let sqlite_data_version = if blob::is_sqlite_path(history_file) {
-        sqlite::read_data_version(history_file)
+    let history_revision = if blob::is_sqlite_path(history_file) {
+        sqlite::read_history_revision(history_file)
     } else {
         None
     };
@@ -217,7 +218,7 @@ fn context_history_cache_key(
         overflow_dir: overflow_dir.map(Path::to_path_buf),
         file_len,
         modified_unix_ms,
-        sqlite_data_version,
+        history_revision,
     }
 }
 

@@ -67,13 +67,40 @@ fn add_column_if_missing(
     }
 }
 
-/// 读取 SQLite 的 `PRAGMA data_version`：每次该 DB 被任何连接修改后递增，
-/// 不依赖文件 mtime/len（WAL 模式下主文件可能长时间不变）。
-/// 用于 CONTEXT_HISTORY_CACHE 失效判定，比文件元数据可靠。
-pub(in crate::ai) fn read_data_version(path: &Path) -> Option<i64> {
+/// 读取 history DB 的写入版本号（存于 meta 表 key='history_revision'）。
+/// 每次消息写入/删除/替换都会在同一事务内 `bump_history_revision` 递增该值，
+/// 因此它是一个**跨连接**单调递增的全局信号，可靠地反映"库内容是否变化"。
+///
+/// 不能用 `PRAGMA data_version` 代替：它是**连接局部**的比较值——每个新开的
+/// `Connection` 只把它当作"自本连接打开以来是否被其他连接改过"的基准，新连接
+/// 读到的初值不随外部写入而变（实测新连接恒返回 2），因此无法作为跨连接缓存
+/// 失效依据。缺失（老库尚未写入过 revision）时返回 0，与"从未修改"一致。
+pub(in crate::ai) fn read_history_revision(path: &Path) -> Option<i64> {
     let conn = Connection::open(path).ok()?;
-    conn.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
-        .ok()
+    // meta 表可能尚未创建（全新库）或尚未写入过 revision：两种情况都视为 0
+    // （"从未修改"），保证返回值稳定可比。只有连接本身打不开才返回 None。
+    let value: Option<i64> = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM meta WHERE key='history_revision' LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    Some(value.unwrap_or(0))
+}
+
+/// 在写事务内递增 `meta.history_revision`。所有会改变 messages 内容的写路径
+/// （append / replace / clear / truncate）都必须调用它，使 `read_history_revision`
+/// 能被跨连接观察到变化。
+fn bump_history_revision(conn: &Connection) -> io::Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('history_revision', '1')
+         ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1",
+        [],
+    )
+    .map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(())
 }
 
 /// 对 SQLite 数据库执行 WAL checkpoint（TRUNCATE），把 -wal 日志合并进主库。
@@ -165,6 +192,7 @@ pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -
         )
         .map_err(|e| io::Error::other(e.to_string()))?;
     if user_turns.max(0) as usize <= MAX_HISTORY_TURNS {
+        bump_history_revision(&tx)?;
         return tx.commit().map_err(|e| io::Error::other(e.to_string()));
     }
     let messages = read_messages_with_sql(
@@ -180,6 +208,7 @@ pub(in crate::ai) fn append_history_sqlite(path: &Path, entries: Vec<Message>) -
             .map_err(|e| io::Error::other(e.to_string()))?;
         insert_messages(&tx, compacted)?;
     }
+    bump_history_revision(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
@@ -227,6 +256,7 @@ pub(in crate::ai) fn append_history_sqlite_uncompacted(
         }
         insert_messages(&tx, entries)?;
     }
+    bump_history_revision(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
@@ -245,6 +275,7 @@ pub(in crate::ai) fn replace_all_messages_sqlite(
         .map_err(|e| io::Error::other(e.to_string()))?;
     insert_messages(&tx, messages.to_vec())?;
     refresh_first_user_prompt_meta(&tx, messages)?;
+    bump_history_revision(&tx)?;
     tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
@@ -507,35 +538,51 @@ pub(in crate::ai) fn read_latest_history_summary_before_id_sqlite(
 }
 
 pub(in crate::ai) fn clear_session_history_sqlite(path: &Path) -> io::Result<()> {
-    let conn = match open_history_db(path) {
+    let mut conn = match open_history_db(path) {
         Ok(c) => c,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
     init_history_schema(&conn)?;
-    conn.execute("DELETE FROM messages", [])
+    // 事务包裹：DELETE messages / DELETE meta / bump revision 必须原子提交，
+    // 否则中途崩溃会留下"messages 已清空但 revision 未变"的不一致状态，
+    // 导致 context 缓存误判为未变化而继续供应旧历史。
+    let tx = conn
+        .transaction()
         .map_err(|e| io::Error::other(e.to_string()))?;
-    conn.execute("DELETE FROM meta", [])
+    tx.execute("DELETE FROM messages", [])
         .map_err(|e| io::Error::other(e.to_string()))?;
-    Ok(())
+    // 保留 history_revision 行：它是缓存失效计数器，须跨 clear **单调递增**。
+    // 若连同它一起删掉，bump 会从 1 重新开始，版本号回退后可能与早期缓存
+    // 条目的 revision 撞车，反而让已失效的旧历史被误命中。
+    tx.execute("DELETE FROM meta WHERE key != 'history_revision'", [])
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    bump_history_revision(&tx)?;
+    tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
 /// 把 messages 表保留到前 `keep` 条（按 id 升序）。用于 session branch：
 /// 复制完整 sqlite 后再回滚到指定消息数。`keep == 0` 等价于 clear。
 pub(in crate::ai) fn truncate_messages_sqlite(path: &Path, keep: usize) -> io::Result<()> {
-    let conn = match open_history_db(path) {
+    let mut conn = match open_history_db(path) {
         Ok(c) => c,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err),
     };
     init_history_schema(&conn)?;
+    // 事务包裹：DELETE + bump revision 原子提交，避免中途崩溃留下
+    // "已删消息但 revision 未变"的不一致状态（context 缓存供应错误的空结果）。
+    let tx = conn
+        .transaction()
+        .map_err(|e| io::Error::other(e.to_string()))?;
     if keep == 0 {
-        conn.execute("DELETE FROM messages", [])
+        tx.execute("DELETE FROM messages", [])
             .map_err(|e| io::Error::other(e.to_string()))?;
-        return Ok(());
+        bump_history_revision(&tx)?;
+        return tx.commit().map_err(|e| io::Error::other(e.to_string()));
     }
     // 取前 `keep` 条的最大 id，删掉其后的所有行。
-    let cutoff: Option<i64> = conn
+    let cutoff: Option<i64> = tx
         .query_row(
             "SELECT id FROM messages ORDER BY id ASC LIMIT 1 OFFSET ?1",
             params![(keep as i64) - 1],
@@ -544,10 +591,11 @@ pub(in crate::ai) fn truncate_messages_sqlite(path: &Path, keep: usize) -> io::R
         .optional()
         .map_err(|e| io::Error::other(e.to_string()))?;
     if let Some(cutoff_id) = cutoff {
-        conn.execute("DELETE FROM messages WHERE id > ?1", params![cutoff_id])
+        tx.execute("DELETE FROM messages WHERE id > ?1", params![cutoff_id])
             .map_err(|e| io::Error::other(e.to_string()))?;
     }
-    Ok(())
+    bump_history_revision(&tx)?;
+    tx.commit().map_err(|e| io::Error::other(e.to_string()))
 }
 
 pub(in crate::ai) fn read_first_user_prompt_sqlite(path: &Path) -> io::Result<Option<String>> {
@@ -657,4 +705,65 @@ fn read_messages_since_id(
         });
     }
     Ok(messages)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn msg(role: &str, text: &str) -> Message {
+        Message {
+            role: role.to_string(),
+            content: Value::String(text.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    /// P1 回归：`read_history_revision` 必须**跨连接**观察到写入递增。
+    /// 每次写路径都开新连接读版本号，模拟 build_context_history 的缓存失效判定。
+    /// 旧实现用连接局部的 `PRAGMA data_version`，新连接恒返回固定值，无法失效缓存。
+    #[test]
+    fn history_revision_increments_across_fresh_connections() {
+        let dir = std::env::temp_dir().join(format!(
+            "hist_rev_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+
+        // 全新库尚未写入过 revision：视为 0（"从未修改"）。
+        assert_eq!(read_history_revision(&path), Some(0));
+
+        append_history_sqlite(&path, vec![msg("user", "hi")]).unwrap();
+        let r1 = read_history_revision(&path).unwrap();
+        assert!(r1 > 0, "append should bump revision, got {r1}");
+
+        append_history_sqlite(&path, vec![msg("assistant", "hello")]).unwrap();
+        let r2 = read_history_revision(&path).unwrap();
+        assert!(r2 > r1, "second append should bump again: {r1} -> {r2}");
+
+        replace_all_messages_sqlite(&path, &[msg("user", "reset")]).unwrap();
+        let r3 = read_history_revision(&path).unwrap();
+        assert!(r3 > r2, "replace should bump: {r2} -> {r3}");
+
+        truncate_messages_sqlite(&path, 0).unwrap();
+        let r4 = read_history_revision(&path).unwrap();
+        assert!(r4 > r3, "truncate should bump: {r3} -> {r4}");
+
+        // clear 会 DELETE meta 后再 bump，结构与其它写路径不同，需单独覆盖。
+        append_history_sqlite(&path, vec![msg("user", "again")]).unwrap();
+        let r5 = read_history_revision(&path).unwrap();
+        clear_session_history_sqlite(&path).unwrap();
+        let r6 = read_history_revision(&path).unwrap();
+        assert!(r6 > r5, "clear should bump even after wiping meta: {r5} -> {r6}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -417,7 +417,7 @@ fn build_request_body<'a>(
     // 截断 → 重试死循环的根因）。未声明 max_output_tokens 的模型保持不下发字段，
     // wire 行为不变。
     let max_tokens = models::max_output_tokens(model).map(|model_max| {
-        clamp_max_tokens_for_prompt(model, messages, model_max, known_prompt_tokens)
+        clamp_max_tokens_for_prompt(model, messages, tools.as_ref(), model_max, known_prompt_tokens)
     });
     // 零输出截断自适应：当上一轮检测到 completion=0 + finish_reason=length 时，
     // orchestrator 会把 max_tokens_override 设为更小的值。此处用该值替换 clamp 结果，
@@ -461,6 +461,19 @@ fn estimate_prompt_tokens(messages: &[Message]) -> usize {
     chars.div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
 }
 
+/// 估算工具 schema 的 prompt token 数。工具定义（name/description/JSON Schema）
+/// 会随每次请求发送并计入 prompt 占用；启用大量工具/MCP 时体积可观。以序列化后
+/// 的字符数按同一保守换算折算。`None` / 空工具集贡献 0。
+fn estimate_tools_tokens(tools: Option<&Value>) -> usize {
+    let Some(tools) = tools else {
+        return 0;
+    };
+    let chars = serde_json::to_string(tools)
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+    chars.div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
+}
+
 /// 按「剩余上下文窗口」钳制单次请求的输出上限：
 /// `min(model_max, window - est_prompt - safety_margin)`，并 floor 到
 /// [`MIN_OUTPUT_TOKENS_FLOOR`]。这样即使模型声明了很大的 max_output_tokens，
@@ -468,12 +481,15 @@ fn estimate_prompt_tokens(messages: &[Message]) -> usize {
 fn clamp_max_tokens_for_prompt(
     model: &str,
     messages: &[Message],
+    tools: Option<&Value>,
     model_max: u32,
     known_prompt_tokens: Option<u64>,
 ) -> u32 {
     let window = models::context_window_tokens(model);
-    // 本轮实际消息量的字符估算（保守：每 token ~2 字符，仅计 messages 不含 tools）。
-    let est_prompt = estimate_prompt_tokens(messages);
+    // 本轮实际消息量的字符估算（保守：每 token ~2 字符）。工具 schema 也会随请求
+    // 一起发送、占用 prompt 窗口，故把其序列化长度折算进 prompt token——启用大量
+    // 工具/MCP 时不计入会显著高估可用输出预算，导致 prompt+输出撞爆窗口。
+    let est_prompt = estimate_prompt_tokens(messages) + estimate_tools_tokens(tools);
     // 优先使用服务端返回的实际 prompt_tokens，比字符估算精确得多。但该值来自
     // *上一轮* 请求：若这一轮刚发生历史压缩，prompt 骤降，而回填的 known 仍是
     // 压缩前的高值——直接用它会把 remaining 误算成接近 0，clamp 触底到

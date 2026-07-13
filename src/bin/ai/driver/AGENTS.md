@@ -78,7 +78,10 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
      context_window_tokens - est_prompt_tokens - margin)` in
      `request::clamp_max_tokens_for_prompt` (only emitted when the model
      declares `max_output_tokens`). Prompt tokens are estimated conservatively
-     (~2 chars/token). When a server-reported `known_prompt_tokens` is passed, it
+     (~2 chars/token) and **include the serialized tool schema** (`tools` JSON),
+     since tool/MCP definitions ship with every request and occupy the prompt
+     window — omitting them over-estimates the available output budget. When a
+     server-reported `known_prompt_tokens` is passed, it
      is capped at `2×` the char estimate: after a compression turn the prompt
      drops sharply but the carried-over `known` is still the pre-compression high
      value — using it verbatim would mis-clamp `remaining` to the floor (1024),

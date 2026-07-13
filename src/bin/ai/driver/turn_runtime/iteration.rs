@@ -23,23 +23,43 @@ use super::{
     types::{IterationExecution, ToolCallExecution},
 };
 
-/// 记录上次 pre-request LLM 摘要**尝试**后的 messages 总字符数。
+/// 记录每个 session 上次 pre-request LLM 摘要**尝试**后的 messages 总字符数。
 /// 用于增长量守卫：上次尝试后上下文需增长 [`PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH`]
 /// 以上才会再次触发。**无论成功与否都写入该游标**——成功时记录压缩后大小，
 /// 失败/no-op（结构上无法压缩：Path A 无早期对话、Path B 折叠后仍 <
 /// MIN_EFFECTIVE、Path C 未触发）时也记录实际尝试后大小，避免 cursor 停在 0
 /// 导致 growth 始终 ≥ MIN_GROWTH、pre-request LLM summary 每轮空转重试。
-/// 进程级 static——同一 agent 进程内全局生效，与 orchestrator 的 supervisor
-/// 冷却机制互补（orchestrator 管理工具调用间的压缩，此处管理请求前的兜底）。
-static LAST_PRE_REQUEST_LLM_SUMMARY_CHARS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+/// 按 `session_id` 分桶——多 session / sub-agent 并存时各自独立，避免进程级
+/// 全局游标造成的跨会话状态串扰（A 会话的大上下文抬高游标，B 会话据此误判为
+/// "增长不足"而跳过本该触发的摘要）。与 orchestrator 的 supervisor 冷却机制
+/// 互补（orchestrator 管理工具调用间的压缩，此处管理请求前的兜底）。
+static LAST_PRE_REQUEST_LLM_SUMMARY_CHARS: std::sync::LazyLock<
+    std::sync::Mutex<rust_tools::commonw::FastMap<String, usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(rust_tools::commonw::FastMap::default()));
 
-fn should_try_pre_request_llm_summary(after_chars: usize, llm_threshold: usize) -> bool {
+fn load_last_pre_request_summary_chars(session_id: &str) -> usize {
+    LAST_PRE_REQUEST_LLM_SUMMARY_CHARS
+        .lock()
+        .ok()
+        .and_then(|map| map.get(session_id).copied())
+        .unwrap_or(0)
+}
+
+fn store_last_pre_request_summary_chars(session_id: &str, chars: usize) {
+    if let Ok(mut map) = LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.lock() {
+        map.insert(session_id.to_string(), chars);
+    }
+}
+
+fn should_try_pre_request_llm_summary(
+    session_id: &str,
+    after_chars: usize,
+    llm_threshold: usize,
+) -> bool {
     if after_chars <= llm_threshold {
         return false;
     }
-    let last_summary_chars =
-        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.load(std::sync::atomic::Ordering::Relaxed);
+    let last_summary_chars = load_last_pre_request_summary_chars(session_id);
     let growth = after_chars.saturating_sub(last_summary_chars);
     last_summary_chars == 0 || growth >= PRE_REQUEST_LLM_SUMMARY_MIN_GROWTH
 }
@@ -347,7 +367,8 @@ async fn request_model_response(
     // 增长量守卫：自上次成功 LLM 摘要后需增长 ≥ MIN_GROWTH 才再次触发。
     // 失败/no-op 不写游标，避免把后续真正需要的 LLM compact 静默挡掉。
     let llm_threshold = pre_request_llm_summary_threshold(next_model, app.config.history_max_chars);
-    if should_try_pre_request_llm_summary(budget_report.after_chars, llm_threshold) {
+    let session_id = app.session_id.clone();
+    if should_try_pre_request_llm_summary(&session_id, budget_report.after_chars, llm_threshold) {
         crate::ai::driver::print::print_tool_note_line(
             "compress",
             &format!(
@@ -355,11 +376,13 @@ async fn request_model_response(
                 budget_report.after_chars, llm_threshold
             ),
         );
-        let drained: Vec<Message> = std::mem::take(messages);
+        // 取消安全：传入 messages 的 **clone** 而非 `mem::take`。若本次摘要 await
+        // 期间被 Ctrl+C 中断，请求 future 被 drop，`messages` 仍保有原始完整内容，
+        // 不会退化成空 Vec 导致后续请求发出空上下文 / 丢失消息状态。
         let (after_msgs, llm_before, llm_after, did_summarize) =
             crate::ai::history::mid_turn_llm_summarize(
                 app,
-                drained,
+                messages.clone(),
                 MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
                 MID_TURN_LLM_SUMMARY_MAX_CHARS,
                 app.config.history_max_chars,
@@ -381,7 +404,7 @@ async fn request_model_response(
         }
         // 无论成功与否都写入游标（见 static 注释）。失败时也记录，避免
         // 结构上无法压缩时每轮空转重试；MIN_GROWTH 保证真正增长后再次尝试。
-        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(llm_after, std::sync::atomic::Ordering::Relaxed);
+        store_last_pre_request_summary_chars(&session_id, llm_after);
     }
 
     let mut actual_model = next_model.to_string();
@@ -703,8 +726,8 @@ pub(super) async fn execute_turn_iteration(
 #[cfg(test)]
 mod tests {
     use super::{
-        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS, StreamingFlagGuard, request_interrupt_pending,
-        should_try_pre_request_llm_summary,
+        StreamingFlagGuard, request_interrupt_pending, should_try_pre_request_llm_summary,
+        store_last_pre_request_summary_chars,
     };
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, atomic::Ordering};
@@ -735,27 +758,33 @@ mod tests {
 
     #[test]
     fn pre_request_llm_summary_cursor_backoff_after_attempt() {
-        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(0, Ordering::Relaxed);
+        let sid = "test-session-cursor-backoff";
+        store_last_pre_request_summary_chars(sid, 0);
         let threshold = 240_000;
         let after_chars = 240_457;
 
-        assert!(should_try_pre_request_llm_summary(after_chars, threshold));
+        assert!(should_try_pre_request_llm_summary(sid, after_chars, threshold));
 
         // 调用方在每次尝试后（无论成功与否）都写入游标。模拟失败/no-op 后
         // 写入实际尝试后大小，确保下一次同样大小的请求被 growth 守卫挡掉，
         // 避免结构上无法压缩时每轮空转重试。
-        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(after_chars, Ordering::Relaxed);
-        assert!(!should_try_pre_request_llm_summary(after_chars, threshold));
+        store_last_pre_request_summary_chars(sid, after_chars);
+        assert!(!should_try_pre_request_llm_summary(sid, after_chars, threshold));
         // 增长 ≥ MIN_GROWTH(20K) 后才再次触发
         assert!(should_try_pre_request_llm_summary(
+            sid,
             after_chars + 20_000,
             threshold
         ));
 
-        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(230_000, Ordering::Relaxed);
-        assert!(!should_try_pre_request_llm_summary(after_chars, threshold));
-        assert!(should_try_pre_request_llm_summary(251_000, threshold));
+        store_last_pre_request_summary_chars(sid, 230_000);
+        assert!(!should_try_pre_request_llm_summary(sid, after_chars, threshold));
+        assert!(should_try_pre_request_llm_summary(sid, 251_000, threshold));
 
-        LAST_PRE_REQUEST_LLM_SUMMARY_CHARS.store(0, Ordering::Relaxed);
+        // 不同 session 之间互不串扰：另一个 session 游标仍为 0，应独立触发。
+        let other = "test-session-cursor-isolation";
+        assert!(should_try_pre_request_llm_summary(other, after_chars, threshold));
+
+        store_last_pre_request_summary_chars(sid, 0);
     }
 }
