@@ -34,12 +34,17 @@ fn popup_layout_config(
     _has_status_msg: bool,
     has_model_label: bool,
 ) -> PopupLayoutConfig {
-    // 所有状态使用统一的 chrome 布局（top_margin=0, help=1），避免空→非空切换时
-    // textarea 行数变化导致视觉跳变。viewport 高度在创建时固定，chrome 变化会挤压
-    // textarea 或触发 resize 跳变。
+    // top_margin 始终保持 0。非补全态保留两行帮助；补全态把帮助压成 1 行，
+    // 并隐藏 model/session 行，尽量把空间让给候选列表。
     let top_margin: u16 = 0;
-    let help_lines: u16 = 2; // 两行快捷键：换行/发送/取消 + 历史/删行/粘贴/F8/F9/F10
-    let model_header_lines = if has_model_label { 1 } else { 0 };
+    // 补全面板激活时，把底部帮助压缩为 1 行并隐藏 model/session 信息，
+    // 优先把高度让给候选列表；小终端里这能显著减少"只能看到 1 个候选"的情况。
+    let help_lines: u16 = if has_completion_panel { 1 } else { 2 };
+    let model_header_lines = if has_completion_panel || !has_model_label {
+        0
+    } else {
+        1
+    };
     let spacer_lines = 0;
     let min_textarea_lines = if has_completion_panel {
         1
@@ -88,8 +93,8 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     let popup_y = area.y;
     let popup = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
-    // 计算内区域：左右各 1 列水平边距，顶部留 1 行空白作为与上次输出的视觉分隔，
-    // 底部不留 padding（避免出现多余空白行）
+    // 计算内区域：左右各 1 列水平边距，不额外增加顶部/底部 padding，
+    // 避免在 inline viewport 里制造多余空白行。
     let h_margin: u16 = 1;
     let top_margin = layout.top_margin;
     let inner = Rect::new(
@@ -114,7 +119,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // 面板激活时优先占满高度：先扣掉 help 行与 textarea 最小行，余下的尽量给面板
     // （面板期望高度 = min(候选数, COMPLETION_WINDOW) + 上下边框 2，但不超过可用空间）。
     // textarea 退让到最小 1 行（此时用户在选列表，不需要大编辑区）。
-    // 无面板时 textarea 至少保留 3 行。
+    // 无面板时按当前内容与 viewport 高度自适应。
     let min_textarea_lines = layout.min_textarea_lines;
     let (textarea_lines, panel_lines) = match completion_panel {
         Some(panel) => {
@@ -251,7 +256,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                     .add_modifier(Modifier::BOLD),
             )
             .title(Span::styled(
-                " Completions ",
+                format!(" Completions {} ", panel.items.len()),
                 Style::default()
                     .fg(Color::Rgb(140, 190, 220))
                     .add_modifier(Modifier::BOLD),
@@ -289,57 +294,53 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
 
     // 渲染帮助行
     let help_lines = if completion_panel.is_some() {
-        vec![
-            Line::from(vec![
-                Span::styled("选择：", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "",
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("关闭：", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "Esc",
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("取消：", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "Ctrl+C",
-                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(status_info, Style::default().fg(Color::DarkGray)),
-            ]),
-            Line::from(vec![
-                Span::styled("移动：", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "↑↓",
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("刷新：", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "Tab",
-                    Style::default()
-                        .fg(Color::Blue)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled("发送：", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    "+Alt/F2",
-                    Style::default()
-                        .fg(Color::Green)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-        ]
+        vec![Line::from(vec![
+            Span::styled("移动：", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "↑↓",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("选择：", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Enter",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("关闭：", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("取消：", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Ctrl+C",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(status_info, Style::default().fg(Color::DarkGray)),
+            Span::styled("刷新：", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Tab",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("发送：", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "+Alt/F2",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])]
     } else {
         vec![
             Line::from(vec![
@@ -579,9 +580,9 @@ mod tests {
         truncate_with_ellipsis,
     };
     use ratatui::{
-        Terminal, TerminalOptions, Viewport,
         backend::TestBackend,
         layout::{Position, Rect},
+        Terminal, TerminalOptions, Viewport,
     };
     use tui_textarea::TextArea;
     use unicode_width::UnicodeWidthStr;
@@ -648,6 +649,16 @@ mod tests {
         assert_eq!(layout.top_margin, 0);
         assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
+        assert_eq!(layout.spacer_lines, 0);
+        assert_eq!(layout.min_textarea_lines, 1);
+    }
+
+    #[test]
+    fn completion_panel_prioritizes_candidate_rows_over_chrome() {
+        let layout = popup_layout_config(8, "/model", 1, 0, true, true, true);
+        assert_eq!(layout.top_margin, 0);
+        assert_eq!(layout.help_lines, 1);
+        assert_eq!(layout.model_header_lines, 0);
         assert_eq!(layout.spacer_lines, 0);
         assert_eq!(layout.min_textarea_lines, 1);
     }

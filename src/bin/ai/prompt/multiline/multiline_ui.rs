@@ -5,18 +5,18 @@ use crossterm::{
     cursor,
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
-    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size as terminal_size},
+    terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size, Clear, ClearType},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use tui_textarea::TextArea;
 
 use super::{
-    MultilineHistoryState,
     completion_panel::{CompletionPanel, PendingTabCompletion},
-    events::{EventLoopAction, RecentTextInput, handle_multiline_event},
+    events::{handle_multiline_event, EventLoopAction, RecentTextInput},
     render::render_multiline_popup,
+    MultilineHistoryState,
 };
-use crate::ai::prompt::{PromptEditor, interrupted_error};
+use crate::ai::prompt::{interrupted_error, PromptEditor};
 
 /// viewport 最大高度（textarea + chrome），随终端尺寸动态缩放，上限 10 行。
 const MAX_VIEWPORT_HEIGHT: u16 = 10;
@@ -27,12 +27,13 @@ const VIEWPORT_CHROME_LINES: u16 = 3;
 /// textarea 最小行数，用于 clamp 计算。
 const MIN_TEXTAREA_LINES: u16 = 2;
 
-/// 补全面板激活时，除面板外需要保留的固定行数：
-/// top_margin(0) + textarea 最小行(1) + model(1) + help(2) = 4。
-/// 统一 chrome 布局（top_margin=0, help=2），面板激活时 spacer=0、min_textarea_lines=1。
-const PANEL_CHROME_LINES: u16 = 4;
 /// 补全面板一次最多显示的候选行数，与 `render::COMPLETION_WINDOW` 对齐。
 const PANEL_COMPLETION_WINDOW: u16 = 12;
+/// 补全面板激活时的保底 chrome：textarea 最小行(1) + 压缩后的帮助行(1) = 2。
+/// 补全态会隐藏 model/session 行，优先把高度让给候选列表。
+const PANEL_CHROME_LINES: u16 = 2;
+/// 补全态允许比普通编辑态更高的 inline viewport，这样大终端里可以一次看到更多候选。
+const MAX_COMPLETION_VIEWPORT_HEIGHT: u16 = PANEL_CHROME_LINES + PANEL_COMPLETION_WINDOW + 2;
 
 /// `Terminal::clear()` 在 inline viewport 下会先把真实终端 cursor 挪到 viewport 顶部
 /// 再执行 `FromCursorDown`。如果 resize 突发期间又立刻来一轮 autoresize，ratatui 会
@@ -58,9 +59,7 @@ fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
         return base_viewport.min(available_rows).min(MAX_VIEWPORT_HEIGHT);
     }
     // 有预填内容时，textarea 行数不小于 base 且能容纳内容，最多 MAX_TEXTAREA_LINES
-    let content_rows = prefill
-        .map(|text| text.lines().count().max(1))
-        .unwrap_or(1) as u16;
+    let content_rows = prefill.map(|text| text.lines().count().max(1)).unwrap_or(1) as u16;
     let textarea = content_rows.clamp(base_textarea, MAX_TEXTAREA_LINES);
     let viewport = textarea.saturating_add(VIEWPORT_CHROME_LINES);
     viewport.min(available_rows).min(MAX_VIEWPORT_HEIGHT)
@@ -68,7 +67,7 @@ fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
 
 /// 补全面板激活时所需的 viewport 高度：在保持输入框（textarea）行数不变的前提下，
 /// 额外为面板腾出空间。面板期望行数 = min(候选数, PANEL_COMPLETION_WINDOW) + 上下边框(2)，
-/// 再加上 PANEL_CHROME_LINES（top_margin + textarea 最小行 + model + help）。
+/// 再加上 PANEL_CHROME_LINES（textarea 最小行 + 压缩后的帮助行）。
 /// 未超过 base_height（无面板时的高度）时直接用 base_height，避免面板很小反而缩了 viewport。
 fn viewport_height_with_completion(
     terminal_rows: u16,
@@ -85,7 +84,7 @@ fn viewport_height_with_completion(
     let desired = panel_lines.saturating_add(PANEL_CHROME_LINES);
     desired
         .max(base)
-        .min(MAX_VIEWPORT_HEIGHT)
+        .min(MAX_COMPLETION_VIEWPORT_HEIGHT)
         .min(available_rows)
 }
 
@@ -296,10 +295,10 @@ mod tests {
         viewport_height_with_completion,
     };
     use ratatui::{
-        Terminal, TerminalOptions, Viewport,
         backend::TestBackend,
         layout::{Position, Rect},
         widgets::{Paragraph, Widget},
+        Terminal, TerminalOptions, Viewport,
     };
 
     #[test]
@@ -368,13 +367,12 @@ mod tests {
     fn completion_viewport_grows_with_candidates_without_shrinking_base() {
         // 无面板：保持 base 高度（4）。
         assert_eq!(viewport_height_with_completion(30, 4, None), 4);
-        // 1 个候选：面板需要 1+2(边框)=3 + 4(chrome)=7，大于 base，撑到 7。
-        assert_eq!(viewport_height_with_completion(30, 4, Some(1)), 7);
-        // 3 个候选：3+2+4=9 > base，viewport 撑高到 9，多出的 5 行给面板。
-        assert_eq!(viewport_height_with_completion(30, 4, Some(3)), 9);
-        // 大量候选：受 PANEL_COMPLETION_WINDOW(12) 与 MAX_VIEWPORT_HEIGHT(10) 双重封顶。
-        // 12+2+4=18 > 10，被封顶到 10。
-        assert_eq!(viewport_height_with_completion(30, 4, Some(50)), 10);
+        // 1 个候选：面板需要 1+2(边框)=3 + 2(chrome)=5，大于 base，撑到 5。
+        assert_eq!(viewport_height_with_completion(30, 4, Some(1)), 5);
+        // 3 个候选：3+2+2=7 > base，viewport 撑高到 7，多出的 3 行给面板。
+        assert_eq!(viewport_height_with_completion(30, 4, Some(3)), 7);
+        // 大量候选：补全态上限单独放宽到 16，可容纳 12 行候选 + 边框 + 压缩 chrome。
+        assert_eq!(viewport_height_with_completion(30, 4, Some(50)), 16);
     }
 
     #[test]
