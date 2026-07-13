@@ -249,26 +249,15 @@ pub fn try_handle_model_command(
     app.current_model = next_model.clone();
     app.cli.model = Some(next_model.clone());
     println!(
-        "Switched model: {} -> {}",
+        "Switched model: {} -> {}\nPlatform: {} | Adapter: {} | Capabilities: {}{}{}{}",
         models::model_display_label(&old_model),
-        models::model_display_label(&next_model)
-    );
-    println!("Platform: {}", model_names::platform_label(model));
-    println!("Adapter: {}", model_names::adapter_slug(model.adapter));
-    println!(
-        "Capabilities: {}{}{}{}",
+        models::model_display_label(&next_model),
+        model_names::platform_label(model),
+        model_names::adapter_slug(model.adapter),
         if model.is_vl { "vl " } else { "" },
         if model.search_enabled { "search " } else { "" },
-        if model.tools_default_enabled {
-            "tools "
-        } else {
-            ""
-        },
-        if model.enable_thinking {
-            "thinking"
-        } else {
-            ""
-        },
+        if model.tools_default_enabled { "tools " } else { "" },
+        if model.enable_thinking { "thinking" } else { "" },
     );
     Ok(true)
 }

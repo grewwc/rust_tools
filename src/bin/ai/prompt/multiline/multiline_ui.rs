@@ -22,7 +22,7 @@ use crate::ai::prompt::{PromptEditor, interrupted_error};
 const MAX_VIEWPORT_HEIGHT: u16 = 11;
 /// textarea 最大行数上限（大终端下的舒适值）。
 const MAX_TEXTAREA_LINES: u16 = 7;
-/// chrome 固定行数：top_rule(1) + model(1) + help(2)。
+/// 普通编辑态的 chrome 固定行数：footer 上方 divider(1) + model(1) + help(2)。
 const VIEWPORT_CHROME_LINES: u16 = 4;
 /// textarea 最小行数，用于 clamp 计算。
 const MIN_TEXTAREA_LINES: u16 = 2;

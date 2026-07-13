@@ -35,11 +35,12 @@ fn popup_layout_config(
     _has_status_msg: bool,
     has_model_label: bool,
 ) -> PopupLayoutConfig {
-    // top_margin 始终保持 0。普通输入态只保留顶部 1 行细分隔线，作为和上一轮输出的
-    // 视觉分界；底部不再额外画线，避免面板上下同时出现横线显得重复。补全态隐藏这条
-    // 装饰线，把高度尽量让给候选列表，避免在矮终端里只剩 1 条候选可见。
+    // top_margin 始终保持 0。不要在 inline viewport 的**顶行**放稳定装饰元素：
+    // 终端 resize / reflow 时，顶行内容会被推入 scrollback，恢复宽度后就会像
+    // “多出一条横线”一样不断堆叠。把分隔线移到 footer 上方的 spacer 行里，
+    // 既保留视觉收口，又避免顶行残影。
     let top_margin: u16 = 0;
-    let top_rule_lines: u16 = if has_completion_panel { 0 } else { 1 };
+    let top_rule_lines: u16 = 0;
     // 补全面板激活时，把底部帮助压缩为 1 行并隐藏 model/session 信息，
     // 优先把高度让给候选列表；小终端里这能显著减少"只能看到 1 个候选"的情况。
     let help_lines: u16 = if has_completion_panel { 1 } else { 2 };
@@ -48,7 +49,7 @@ fn popup_layout_config(
     } else {
         1
     };
-    let spacer_lines = 0;
+    let spacer_lines = if has_completion_panel { 0 } else { 1 };
     let min_textarea_lines = if has_completion_panel {
         1
     } else {
@@ -178,10 +179,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // 清除 popup 区域，确保 resize 后旧边框/文本不残留
     f.render_widget(Clear, popup);
 
-    if top_rule_lines > 0 {
-        f.render_widget(Paragraph::new(divider_line(chunks[0].width)), chunks[0]);
-    }
-
     // 底部模型/主题信息行：让用户在输入时看到当前模型与 session 主题。
     // **必须画在底部专属 chunk（chunks[4]，help 行上方）而非 viewport 顶行**：顶行会在
     // 每次 viewport 重新锚定时被推进 scrollback 反复堆叠（见上方 model_header_lines 注释）。
@@ -215,8 +212,12 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         f.render_widget(Paragraph::new(header), header_area);
     }
 
-    // 这里用单独 chunk 画“细分隔线”，而不是粗边框。现在只保留顶部这条：
-    // 既能和上方输出做分界，又不会像上下双线那样显得重复。
+    // 这里用单独 chunk 画“细分隔线”，而不是粗边框。分隔线放在 footer 上方的
+    // spacer 行中，避免顶行在 resize/reflow 时被推进 scrollback 后留下横线残影。
+    if spacer_lines > 0 {
+        f.render_widget(Paragraph::new(divider_line(chunks[3].width)), chunks[3]);
+    }
+
     let char_count = current_content.chars().count();
 
     // 设置对齐方式
@@ -618,6 +619,23 @@ mod tests {
         UnicodeWidthStr::width_cjk(s)
     }
 
+    fn buffer_row(
+        backend: &TestBackend,
+        y: u16,
+        x_start: u16,
+        width: u16,
+    ) -> String {
+        (x_start..x_start.saturating_add(width))
+            .map(|x| {
+                backend
+                    .buffer()
+                    .cell((x, y))
+                    .map(|cell| cell.symbol())
+                    .unwrap_or(" ")
+            })
+            .collect()
+    }
+
     #[test]
     fn test_truncate_cjk() {
         // 测试中文截断
@@ -661,24 +679,24 @@ mod tests {
     #[test]
     fn empty_prompt_keeps_consistent_top_margin() {
         let layout = popup_layout_config(8, "", 1, 0, false, false, true);
-        // 紧凑空输入：top_margin=0，仅保留顶部 1 条细分隔线，help=2
+        // 紧凑空输入：顶行不再放 divider，普通编辑态把收口线放到 footer 上方 spacer。
         assert_eq!(layout.top_margin, 0);
-        assert_eq!(layout.top_rule_lines, 1);
+        assert_eq!(layout.top_rule_lines, 0);
         assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
-        assert_eq!(layout.spacer_lines, 0);
+        assert_eq!(layout.spacer_lines, 1);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
     #[test]
     fn non_empty_prompt_keeps_full_editor_layout() {
         let layout = popup_layout_config(8, "hello", 1, 0, false, false, true);
-        // 统一 chrome 布局：与空输入一致，避免空→非空切换时 textarea 行数跳变
+        // 普通编辑态统一 chrome 布局：divider 在 spacer 行，避免 resize 时顶行残影。
         assert_eq!(layout.top_margin, 0);
-        assert_eq!(layout.top_rule_lines, 1);
+        assert_eq!(layout.top_rule_lines, 0);
         assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
-        assert_eq!(layout.spacer_lines, 0);
+        assert_eq!(layout.spacer_lines, 1);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
@@ -719,9 +737,45 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        // 紧凑模式下顶部分隔线占 1 行，光标应落在其下一行
-        let expected = Position::new(popup_x + 1, viewport_area.y + 1);
+        // 顶部分隔线已移走，空输入时光标应直接落在 textarea 首行。
+        let expected = Position::new(popup_x + 1, viewport_area.y);
         terminal.backend_mut().assert_cursor_position(expected);
+    }
+
+    #[test]
+    fn normal_editor_divider_renders_in_footer_spacer_instead_of_top_row() {
+        let backend = TestBackend::new(80, 12);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(8),
+            },
+        )
+        .unwrap();
+        let mut textarea = TextArea::from(vec!["hello".to_string()]);
+        let mut viewport_area = Rect::ZERO;
+
+        terminal
+            .draw(|f| {
+                viewport_area = f.area();
+                render_multiline_popup(f, &mut textarea, None, None, "glm-5.2-super-relay", None);
+            })
+            .unwrap();
+
+        let popup_width = viewport_area
+            .width
+            .saturating_sub(2)
+            .clamp(40, 180)
+            .min(viewport_area.width);
+        let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
+        let inner_x = popup_x + 1;
+        let inner_width = popup_width.saturating_sub(2);
+
+        let top_row = buffer_row(terminal.backend(), viewport_area.y, inner_x, inner_width);
+        let spacer_row = buffer_row(terminal.backend(), viewport_area.y + 4, inner_x, inner_width);
+
+        assert!(!top_row.starts_with('╶'));
+        assert!(spacer_row.starts_with('╶'));
     }
 
     #[test]

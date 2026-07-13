@@ -57,6 +57,10 @@ actually touches that subsystem.
    and API-key fallback behavior; `platform` drives model handle suffixes, UI/log
    labels, and platform-specific config semantics. Keep `provider` only as a
    backward-compatible alias when reading old config, not as the canonical field.
+7. Multiline inline viewport chrome must not place stable decorative rows on the
+   viewport top line. During resize/reflow, top-line content is pushed into
+   terminal scrollback and can accumulate as duplicate divider/header artifacts;
+   keep divider/model chrome below the textarea top row instead.
 
 ## On-Demand Guides
 
