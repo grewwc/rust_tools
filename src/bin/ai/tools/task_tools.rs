@@ -1657,15 +1657,6 @@ fn format_quality_tier(tier: crate::ai::provider::ModelQualityTier) -> &'static 
     }
 }
 
-fn format_provider(provider: crate::ai::provider::ApiProvider) -> &'static str {
-    match provider {
-        crate::ai::provider::ApiProvider::Alibaba => "alibaba",
-        crate::ai::provider::ApiProvider::Compatible => "compatible",
-        crate::ai::provider::ApiProvider::OpenAi => "openai",
-        _ => "opencode",
-    }
-}
-
 fn build_selection_explanation(
     selected: &SelectedSubagent<'_>,
     selected_model: &str,
@@ -1696,9 +1687,10 @@ fn build_selection_explanation(
         "model_reason=inherited parent agent current model".to_string()
     } else {
         format!(
-            "model_reason=auto-selected for agent_tier={} using {} provider and {} quality_tier",
+            "model_reason=auto-selected for agent_tier={} using {} platform via {} adapter and {} quality_tier",
             format_agent_model_tier(selected.agent),
-            format_provider(models::model_provider(selected_model)),
+            models::model_platform_label(selected_model),
+            crate::ai::model_names::adapter_slug(models::model_adapter(selected_model)),
             format_quality_tier(models::model_quality_tier(selected_model))
         )
     };

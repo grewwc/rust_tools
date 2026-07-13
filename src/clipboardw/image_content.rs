@@ -100,7 +100,9 @@ pub fn watch_clipboard_bridge() -> Result<(), Box<dyn std::error::Error>> {
     // own write, which bumps changeCount (sometimes with a lag that makes the
     // next poll look like a fresh change).
     let mut last_sig: Option<[u8; 32]> = None;
-    println!("oo --watch: monitoring clipboard; copied images are bridged for SSH paste. Ctrl+C to stop.");
+    println!(
+        "oo --watch: monitoring clipboard; copied images are bridged for SSH paste. Ctrl+C to stop."
+    );
 
     loop {
         thread::sleep(Duration::from_millis(500));

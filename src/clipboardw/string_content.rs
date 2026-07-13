@@ -132,7 +132,11 @@ fn read_osc52_bytes() -> Option<Vec<u8>> {
     // 使用 libc::write 发送 OSC52 查询（绕过 stdout 缓冲）
     let query = b"\x1b]52;c;?\x07";
     let write_result = unsafe {
-        libc::write(libc::STDOUT_FILENO, query.as_ptr() as *const libc::c_void, query.len())
+        libc::write(
+            libc::STDOUT_FILENO,
+            query.as_ptr() as *const libc::c_void,
+            query.len(),
+        )
     };
     if write_result < 0 {
         unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original_termios) };
@@ -162,7 +166,11 @@ fn read_osc52_bytes() -> Option<Vec<u8>> {
                 continue;
             }
             let n = unsafe {
-                libc::read(libc::STDIN_FILENO, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                libc::read(
+                    libc::STDIN_FILENO,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
             };
             if n > 0 {
                 let n = n as usize;

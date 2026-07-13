@@ -81,7 +81,14 @@ fn print_model_list(app: &App) {
         if flags.is_empty() {
             println!("  {} {}", mark, label);
         } else {
-            println!("  {} {} [{:?} | {}]", mark, label, model.provider, flags);
+            println!(
+                "  {} {} [platform:{} adapter:{} | {}]",
+                mark,
+                label,
+                model_names::platform_label(model),
+                model_names::adapter_slug(model.adapter),
+                flags
+            );
         }
     }
     println!();
@@ -126,7 +133,8 @@ pub fn try_handle_model_command(
             models::model_display_label(&app.current_model)
         );
         if let Some(def) = model_names::find_by_identifier(&app.current_model) {
-            println!("Provider: {:?}", def.provider);
+            println!("Platform: {}", model_names::platform_label(def));
+            println!("Adapter: {}", model_names::adapter_slug(def.adapter));
             println!("Quality tier: {:?}", def.quality_tier);
             println!("Selector: {}", model_names::model_handle(def));
             if !def.aliases.is_empty() {
@@ -214,7 +222,7 @@ pub fn try_handle_model_command(
     let target = remainder;
 
     if target.is_empty() {
-        println!("missing model selector. try: /model <name-provider>");
+        println!("missing model selector. try: /model <name-platform>");
         print_model_list(app);
         return Ok(true);
     }
@@ -245,7 +253,8 @@ pub fn try_handle_model_command(
         models::model_display_label(&old_model),
         models::model_display_label(&next_model)
     );
-    println!("Provider: {:?}", model.provider);
+    println!("Platform: {}", model_names::platform_label(model));
+    println!("Adapter: {}", model_names::adapter_slug(model.adapter));
     println!(
         "Capabilities: {}{}{}{}",
         if model.is_vl { "vl " } else { "" },

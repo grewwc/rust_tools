@@ -937,9 +937,7 @@ fn blocked_git_destructive(command_tokens: &[String]) -> Option<&'static str> {
                 .iter()
                 .any(|t| t == "--source" || t.starts_with("--source="));
             if has_source && !has_staged {
-                return Some(
-                    "git restore --source=... discards uncommitted working-tree changes",
-                );
+                return Some("git restore --source=... discards uncommitted working-tree changes");
             }
             if has_staged {
                 // 仅取消暂存、工作树不动，可回滚，放行。

@@ -20,6 +20,9 @@ fn check_emoji_widths() {
     for (ch, name) in test_chars {
         let uw = UnicodeWidthChar::width(ch);
         let uw_cjk = UnicodeWidthChar::width_cjk(ch);
-        println!("{} {} U+{:04X}: unicode_width={:?}, unicode_width_cjk={:?}", name, ch, ch as u32, uw, uw_cjk);
+        println!(
+            "{} {} U+{:04X}: unicode_width={:?}, unicode_width_cjk={:?}",
+            name, ch, ch as u32, uw, uw_cjk
+        );
     }
 }

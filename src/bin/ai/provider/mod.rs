@@ -84,12 +84,12 @@ mod tests {
     use crate::ai::model_names::ModelDef;
 
     #[test]
-    fn provider_defaults_to_compatible() {
+    fn adapter_defaults_to_compatible() {
         let def: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","is_vl":false,"search_enabled":true,"tools_default_enabled":true}"#,
         )
         .unwrap();
-        assert_eq!(def.provider, ApiProvider::Compatible);
+        assert_eq!(def.adapter, ApiProvider::Compatible);
     }
 
     #[test]
@@ -102,31 +102,41 @@ mod tests {
     }
 
     #[test]
-    fn parses_openai_provider_and_flagship_tier() {
+    fn parses_openai_adapter_and_flagship_tier() {
         let def: ModelDef = serde_json::from_str(
-            r#"{"key":"X","name":"x","provider":"openai","quality_tier":"flagship","is_vl":true,"search_enabled":false,"tools_default_enabled":true}"#,
+            r#"{"key":"X","name":"x","adapter":"openai","quality_tier":"flagship","is_vl":true,"search_enabled":false,"tools_default_enabled":true}"#,
         )
         .unwrap();
-        assert_eq!(def.provider, ApiProvider::OpenAi);
+        assert_eq!(def.adapter, ApiProvider::OpenAi);
         assert_eq!(def.quality_tier, ModelQualityTier::Flagship);
     }
 
     #[test]
-    fn parses_alibaba_provider_alias() {
+    fn parses_provider_alias_into_adapter() {
         let def: ModelDef = serde_json::from_str(
             r#"{"key":"X","name":"x","provider":"alibaba","quality_tier":"strong","is_vl":true,"search_enabled":false,"tools_default_enabled":true}"#,
         )
         .unwrap();
-        assert_eq!(def.provider, ApiProvider::Alibaba);
+        assert_eq!(def.adapter, ApiProvider::Alibaba);
     }
 
     #[test]
-    fn parses_opencode_provider_alias() {
+    fn parses_opencode_adapter_alias() {
         let def: ModelDef = serde_json::from_str(
-            r#"{"key":"X","name":"x","provider":"opencode","quality_tier":"basic","is_vl":false,"search_enabled":false,"tools_default_enabled":true}"#,
+            r#"{"key":"X","name":"x","adapter":"opencode","quality_tier":"basic","is_vl":false,"search_enabled":false,"tools_default_enabled":true}"#,
         )
         .unwrap();
-        assert_eq!(def.provider, ApiProvider::OpenCode);
+        assert_eq!(def.adapter, ApiProvider::OpenCode);
+    }
+
+    #[test]
+    fn parses_platform_independently_from_adapter() {
+        let def: ModelDef = serde_json::from_str(
+            r#"{"key":"X","name":"x","platform":"volcano","adapter":"compatible","is_vl":false,"search_enabled":true,"tools_default_enabled":true}"#,
+        )
+        .unwrap();
+        assert_eq!(def.adapter, ApiProvider::Compatible);
+        assert_eq!(def.platform.as_deref(), Some("volcano"));
     }
 
     #[test]

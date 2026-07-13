@@ -13,8 +13,14 @@ pub struct ModelDef {
     #[serde(default)]
     pub aliases: Vec<String>,
     pub name: String,
+    /// 请求 wire-profile 适配器。决定请求体/流式解析/鉴权候选链等行为。
+    /// 新配置推荐使用 `adapter`；保留 `provider` 作为向后兼容别名。
+    #[serde(default, alias = "provider")]
+    pub adapter: ApiProvider,
+    /// 平台标识，仅用于展示名、selector 后缀、日志与配置语义。
+    /// 缺省时回退到 `adapter` 的 slug（如 `compatible` / `openai`）。
     #[serde(default)]
-    pub provider: ApiProvider,
+    pub platform: Option<String>,
     #[serde(default, alias = "base_url")]
     pub endpoint: Option<String>,
     #[serde(default)]
@@ -122,8 +128,8 @@ fn lookup_key(value: &str) -> String {
     normalized.trim_matches('-').to_string()
 }
 
-fn provider_slug(provider: ApiProvider) -> &'static str {
-    match provider {
+pub fn adapter_slug(adapter: ApiProvider) -> &'static str {
+    match adapter {
         ApiProvider::Alibaba => "alibaba",
         ApiProvider::Compatible => "compatible",
         ApiProvider::OpenAi => "openai",
@@ -131,9 +137,24 @@ fn provider_slug(provider: ApiProvider) -> &'static str {
     }
 }
 
+pub fn platform_slug(model: &ModelDef) -> String {
+    model
+        .platform
+        .as_deref()
+        .map(str::trim)
+        .filter(|platform| !platform.is_empty())
+        .map(lookup_key)
+        .filter(|platform| !platform.is_empty())
+        .unwrap_or_else(|| adapter_slug(model.adapter).to_string())
+}
+
+pub fn platform_label(model: &ModelDef) -> String {
+    platform_slug(model)
+}
+
 pub fn model_handle(model: &ModelDef) -> String {
     // 如果 name 是加密格式（enc: 前缀），则使用 key 作为显示名，
-    // 避免补全面板里显示乱码的 enc:xxx-compatible。
+    // 避免补全面板里显示乱码的 enc:xxx-<platform>。
     let is_encrypted = model.name.starts_with("enc:");
     let name = if is_encrypted {
         String::new()
@@ -143,7 +164,24 @@ pub fn model_handle(model: &ModelDef) -> String {
     if name.is_empty() {
         return lookup_key(&model.key);
     }
-    format!("{}-{}", name, provider_slug(model.provider))
+    format!("{}-{}", name, platform_slug(model))
+}
+
+pub fn legacy_adapter_handle(model: &ModelDef) -> Option<String> {
+    let is_encrypted = model.name.starts_with("enc:");
+    if is_encrypted {
+        return None;
+    }
+    let name = lookup_key(&model.name);
+    if name.is_empty() {
+        return None;
+    }
+    let legacy = format!("{}-{}", name, adapter_slug(model.adapter));
+    if legacy.eq_ignore_ascii_case(&model_handle(model)) {
+        None
+    } else {
+        Some(legacy)
+    }
 }
 
 fn user_config_path() -> PathBuf {
@@ -222,6 +260,9 @@ fn insert_key_alias(index: &mut SkipMap<String, usize>, alias: &str, i: usize) {
 
 fn insert_model_key_aliases(index: &mut SkipMap<String, usize>, model: &ModelDef, i: usize) {
     insert_key_alias(index, &model_handle(model), i);
+    if let Some(legacy) = legacy_adapter_handle(model) {
+        insert_key_alias(index, &legacy, i);
+    }
     insert_key_alias(index, &model.key, i);
     for alias in &model.aliases {
         insert_key_alias(index, alias, i);

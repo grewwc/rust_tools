@@ -1010,11 +1010,7 @@ mod tests {
     /// column position across all rendered lines (header + data rows).
     #[test]
     fn screenshot_table_borders_align_with_emoji_first_column() {
-        let header = vec![
-            "严重度".to_string(),
-            "问题".to_string(),
-            "状态".to_string(),
-        ];
+        let header = vec!["严重度".to_string(), "问题".to_string(), "状态".to_string()];
         let align = vec![TableAlign::Left, TableAlign::Left, TableAlign::Left];
         let rows = vec![
             vec![
@@ -1036,7 +1032,7 @@ mod tests {
 
         let widths = compute_table_widths("", &header, &rows);
         let top = render_table_top("", &widths);
-        let mid = render_table_mid("", & widths);
+        let mid = render_table_mid("", &widths);
         let hdr = render_table_header("", &header, &align, &widths);
         let bot = render_table_bottom("", &widths);
 
@@ -1078,6 +1074,5 @@ mod tests {
                 separator_positions = Some(positions);
             }
         }
-
     }
 }

@@ -762,7 +762,10 @@ mod tests {
         let r5 = read_history_revision(&path).unwrap();
         clear_session_history_sqlite(&path).unwrap();
         let r6 = read_history_revision(&path).unwrap();
-        assert!(r6 > r5, "clear should bump even after wiping meta: {r5} -> {r6}");
+        assert!(
+            r6 > r5,
+            "clear should bump even after wiping meta: {r5} -> {r6}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

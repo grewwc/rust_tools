@@ -33,11 +33,10 @@ pub(crate) use error::{
     AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS, AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS,
     REQUEST_MAX_ATTEMPTS, REQUEST_MAX_ATTEMPTS_429, REQUEST_RETRY_429_MAX_MS, RequestError,
     RequestErrorKind, RequestRetryPolicy, STREAM_RESPONSE_HEADER_TIMEOUT_SECS,
-    api_key_for_request_model,
-    apply_request_auth, clear_stale_request_interrupt_before_request, config_bool_is_true,
-    config_forces_thinking, control_model_for_aux_tasks, endpoint_for_request_model,
-    is_retryable_reqwest_error, is_retryable_status_with_body, is_retryable_stream_error,
-    is_transient_error, parse_retry_after, request_retry_policy,
+    api_key_for_request_model, apply_request_auth, clear_stale_request_interrupt_before_request,
+    config_bool_is_true, config_forces_thinking, control_model_for_aux_tasks,
+    endpoint_for_request_model, is_retryable_reqwest_error, is_retryable_status_with_body,
+    is_retryable_stream_error, is_transient_error, parse_retry_after, request_retry_policy,
     request_retry_policy_for_current_context, retry_delay, send_with_hedged_backup,
     should_abort_retry_wait, should_retry_status, should_rotate_key,
     should_temporarily_disable_auto_selected_model, should_temporarily_disable_model,
@@ -261,7 +260,7 @@ pub(super) async fn do_request_messages(
     // 轮换 key 后仍失败则直接返回，重试无意义。
     let endpoint = endpoint_for_request_model(app, model);
     let primary_key = api_key_for_request_model(app, model);
-    let adapter = adapter_for(models::model_provider(model), &endpoint);
+    let adapter = adapter_for(models::model_adapter(model), &endpoint);
     let keys_to_try = adapter.collect_api_keys(&primary_key);
     let total_keys = keys_to_try.len();
 
@@ -403,13 +402,13 @@ fn build_request_body<'a>(
     max_tokens_override: Option<u32>,
     known_prompt_tokens: Option<u64>,
 ) -> RequestBody<'a> {
-    let provider = models::model_provider(model);
+    let adapter_kind = models::model_adapter(model);
     let endpoint = models::endpoint_for_model(model, "");
-    let adapter = super::provider::adapter_for(provider, &endpoint);
+    let adapter = super::provider::adapter_for(adapter_kind, &endpoint);
     let request_model = models::request_model_name(model);
     let (thinking, reasoning_effort, reasoning) =
         resolve_reasoning_wire_controls(model, &endpoint, enable_thinking, reasoning_effort);
-    // 流式请求显式索取 usage：部分 provider（DashScope compatible-mode）流式下
+    // 流式请求显式索取 usage：部分 adapter（DashScope compatible-mode）流式下
     // 默认不返回 usage，必须声明 stream_options.include_usage 才能统计 token。
     let stream_options = stream.then(|| json!({ "include_usage": true }));
     // 仅在模型声明了 max_output_tokens 时下发 max_tokens；并按「剩余上下文窗口」
@@ -417,7 +416,13 @@ fn build_request_body<'a>(
     // 截断 → 重试死循环的根因）。未声明 max_output_tokens 的模型保持不下发字段，
     // wire 行为不变。
     let max_tokens = models::max_output_tokens(model).map(|model_max| {
-        clamp_max_tokens_for_prompt(model, messages, tools.as_ref(), model_max, known_prompt_tokens)
+        clamp_max_tokens_for_prompt(
+            model,
+            messages,
+            tools.as_ref(),
+            model_max,
+            known_prompt_tokens,
+        )
     });
     // 零输出截断自适应：当上一轮检测到 completion=0 + finish_reason=length 时，
     // orchestrator 会把 max_tokens_override 设为更小的值。此处用该值替换 clamp 结果，
@@ -515,11 +520,11 @@ fn resolve_reasoning_wire_controls<'a>(
     enable_thinking: bool,
     reasoning_effort: Option<&'a str>,
 ) -> (Map<String, Value>, Option<&'a str>, Option<Value>) {
-    let provider = models::model_provider(model);
-    let adapter = super::provider::adapter_for(provider, &endpoint);
+    let adapter_kind = models::model_adapter(model);
+    let adapter = super::provider::adapter_for(adapter_kind, &endpoint);
     let request_model = models::request_model_name(model);
     let thinking_dialect =
-        super::provider::thinking_dialect_for(provider, &request_model, &endpoint);
+        super::provider::thinking_dialect_for(adapter_kind, &request_model, &endpoint);
     let top_level_reasoning_effort = adapter.reasoning_top_level(reasoning_effort);
     let thinking = thinking_dialect.fields(enable_thinking, top_level_reasoning_effort);
     let nested_reasoning = adapter.reasoning_nested(reasoning_effort);
@@ -527,10 +532,10 @@ fn resolve_reasoning_wire_controls<'a>(
 }
 
 fn ensure_reasoning_content_echo_for_thinking_model(model: &str, messages: &mut [Message]) {
-    let provider = models::model_provider(model);
+    let adapter_kind = models::model_adapter(model);
     let endpoint = models::endpoint_for_model(model, "");
     let request_model = models::request_model_name(model);
-    let dialect = super::provider::thinking_dialect_for(provider, &request_model, &endpoint);
+    let dialect = super::provider::thinking_dialect_for(adapter_kind, &request_model, &endpoint);
     if !dialect.requires_reasoning_content_echo() {
         return;
     }

@@ -993,7 +993,7 @@ mod tests {
 
         assert!(
             selectors.contains("-alibaba") || selectors.contains("-opencode"),
-            "expected provider-qualified model selectors, got: {selectors}"
+            "expected user-facing model selectors with a platform suffix, got: {selectors}"
         );
         for removed in [" use ", " select ", " switch "] {
             assert!(

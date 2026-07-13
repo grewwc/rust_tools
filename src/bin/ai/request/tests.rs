@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
 use crate::ai::{cli::ParsedCli, types::AppConfig};
@@ -45,10 +44,7 @@ fn parse_retry_after_caps_oversized_server_value() {
     // 小于上限的值原样返回。
     let mut small = HeaderMap::new();
     small.insert(RETRY_AFTER, HeaderValue::from_static("3"));
-    assert_eq!(
-        parse_retry_after(&small),
-        Some(Duration::from_secs(3))
-    );
+    assert_eq!(parse_retry_after(&small), Some(Duration::from_secs(3)));
 
     assert!(parse_retry_after(&HeaderMap::new()).is_none());
 }
@@ -436,45 +432,45 @@ fn clears_stale_interrupt_for_new_request_but_keeps_active_cancel() {
     }
 }
 
-/// 找一个真实存在的 OpenAi-provider 模型名做测试输入，避免硬编码
+/// 找一个真实存在的 OpenAi-adapter 模型名做测试输入，避免硬编码
 /// 具体模型字符串导致 models.json 变更后测试失效。
 fn first_openai_model_name() -> Option<String> {
     crate::ai::model_names::all()
         .iter()
-        .find(|m| m.provider == crate::ai::provider::ApiProvider::OpenAi)
+        .find(|m| m.adapter == crate::ai::provider::ApiProvider::OpenAi)
         .map(|m| m.name.clone())
 }
 
 fn first_openai_vl_model_name() -> Option<String> {
     crate::ai::model_names::all()
         .iter()
-        .find(|m| m.provider == crate::ai::provider::ApiProvider::OpenAi && m.is_vl)
+        .find(|m| m.adapter == crate::ai::provider::ApiProvider::OpenAi && m.is_vl)
         .map(|m| m.name.clone())
 }
 
 fn first_alibaba_vl_model_name() -> Option<String> {
     crate::ai::model_names::all()
         .iter()
-        .find(|m| m.provider == crate::ai::provider::ApiProvider::Alibaba && m.is_vl)
+        .find(|m| m.adapter == crate::ai::provider::ApiProvider::Alibaba && m.is_vl)
         .map(|m| m.name.clone())
 }
 
-/// 返回该 provider 下第一个模型的 **唯一 key**（而非 `name`）。生产链路
+/// 返回该 adapter 下第一个模型的 **唯一 key**（而非 `name`）。生产链路
 /// 用 key 定位模型（日志里模型标识形如 `glm-5.2-opencode`），而 `name`
-/// （如 `glm-5.2`）可能被多个 provider 的条目共享，按 name 查找会命中歧义
-/// 条目、解析出错误的 provider 方言。测试必须与生产一致用 key。
-fn first_model_key_for_provider(provider: crate::ai::provider::ApiProvider) -> Option<String> {
+/// （如 `glm-5.2`）可能被多个 adapter/platform 的条目共享，按 name 查找会命中歧义
+/// 条目、解析出错误的 adapter 方言。测试必须与生产一致用 key。
+fn first_model_key_for_adapter(adapter: crate::ai::provider::ApiProvider) -> Option<String> {
     crate::ai::model_names::all()
         .iter()
-        .find(|m| m.provider == provider)
+        .find(|m| m.adapter == adapter)
         .map(|m| m.key.clone())
 }
 
-/// 逐字节 wire guard：锁死各 provider 的 `build_request_body` 序列化结果，
-/// 作为 provider adapter 重构「不破坏对外 wire 行为」的可执行回归网。
+/// 逐字节 wire guard：锁死各 adapter 的 `build_request_body` 序列化结果，
+/// 作为 adapter 重构「不破坏对外 wire 行为」的可执行回归网。
 /// 字段顺序由 [`RequestBody`] 声明顺序决定，serde 输出稳定可断言整串。
 #[test]
-fn build_request_body_wire_format_is_byte_stable_per_provider() {
+fn build_request_body_wire_format_is_byte_stable_per_adapter() {
     use crate::ai::provider::ApiProvider;
 
     let messages = vec![Message {
@@ -487,7 +483,7 @@ fn build_request_body_wire_format_is_byte_stable_per_provider() {
 
     // Alibaba：嵌套 reasoning.effort + enable_thinking/enable_search，无 stream_options（非流式）。
     // 用唯一 key 定位模型（生产链路一致），避免共享 name 命中歧义条目。
-    let alibaba_model = first_model_key_for_provider(ApiProvider::Alibaba)
+    let alibaba_model = first_model_key_for_adapter(ApiProvider::Alibaba)
         .expect("models.json must contain an Alibaba model");
     let alibaba = build_request_body(
         &alibaba_model,
@@ -520,7 +516,7 @@ fn build_request_body_wire_format_is_byte_stable_per_provider() {
     let non_deepseek_opencode = crate::ai::model_names::all()
         .iter()
         .find(|m| {
-            m.provider == ApiProvider::OpenCode && !m.name.to_ascii_lowercase().contains("deepseek")
+            m.adapter == ApiProvider::OpenCode && !m.name.to_ascii_lowercase().contains("deepseek")
         })
         .map(|m| m.key.clone());
     if let Some(opencode_model) = non_deepseek_opencode {

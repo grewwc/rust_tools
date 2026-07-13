@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::ai::types::{FunctionCall, ToolCall};
 use rustc_hash::FxHashSet;

@@ -8,10 +8,10 @@ use super::types::{
     MAX_HISTORY_TURNS, Message, ROLE_INTERNAL_NOTE, is_system_like_role, retained_turn_start,
 };
 
+pub(crate) mod llm_prune;
 mod text_utils;
 mod tool_groups;
 mod tool_overflow;
-pub(crate) mod llm_prune;
 
 use text_utils::{keep_ends_by_chars, summarize_text, truncate_to_chars};
 use tool_groups::{

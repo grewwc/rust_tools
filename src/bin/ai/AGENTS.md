@@ -48,6 +48,15 @@ actually touches that subsystem.
    `prepare_tool_messages_structured` (offload) in every compression path —
    offload rewrites identical results into stubs with unique temp-file paths, which
    would defeat content-hash matching.
+5. `models.json` may declare per-model `api_key_config_key` for compatible/openai-style
+   gateways with provider-specific config names. Startup validation in `config.rs`
+   must honor that field for the default model; do not assume only the built-in
+   global keys (`compatible.api_key`, `openai.api_key`, etc.) can unlock startup.
+6. `models.json` separates request `adapter` from display/config `platform`.
+   `adapter` drives request serialization, stream normalization, default endpoint,
+   and API-key fallback behavior; `platform` drives model handle suffixes, UI/log
+   labels, and platform-specific config semantics. Keep `provider` only as a
+   backward-compatible alias when reading old config, not as the canonical field.
 
 ## On-Demand Guides
 

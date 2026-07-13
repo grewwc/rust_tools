@@ -891,7 +891,6 @@ fn compression_collapses_byte_identical_repeated_read_file_but_keeps_changed_ver
     );
 }
 
-
 #[test]
 fn compression_spills_old_user_message_to_session_temp_file() {
     let overflow_dir = std::env::temp_dir().join(format!(
@@ -2372,7 +2371,9 @@ fn execute_command_blocks_git_destructive_to_uncommitted() {
     assert!(tools::validate_execute_command("git restore --source=HEAD~1 src/main.rs").is_err());
     // restore：仅取消暂存，工作树不动，放行
     assert!(tools::validate_execute_command("git restore --staged src/main.rs").is_ok());
-    assert!(tools::validate_execute_command("git restore --staged --source=HEAD src/main.rs").is_ok());
+    assert!(
+        tools::validate_execute_command("git restore --staged --source=HEAD src/main.rs").is_ok()
+    );
 
     // reset：--hard/--merge/--keep 丢弃未提交改动
     assert!(tools::validate_execute_command("git reset --hard").is_err());

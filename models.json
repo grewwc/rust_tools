@@ -8,7 +8,7 @@
     "name": "deepseek-v4-pro",
     "default_reasoning_effort": "high",
     "explicit_prompt_cache": true,
-    "provider": "alibaba",
+    "adapter": "alibaba",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "strong",
     "is_vl": false,
@@ -25,7 +25,7 @@
       "deepseek-v4-flash-openai"
     ],
     "name": "deepseek-v4-flash",
-    "provider": "alibaba",
+    "adapter": "alibaba",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "strong",
     "is_vl": false,
@@ -43,7 +43,7 @@
       "DEEPSEEK_V4_FLASH_OPENCODE"
     ],
     "name": "deepseek-v4-flash",
-    "provider": "opencode",
+    "adapter": "opencode",
     "quality_tier": "strong",
     "is_vl": false,
     "search_enabled": true,
@@ -60,7 +60,7 @@
       "GLM_5.2_OPENCODE"
     ],
     "name": "glm-5.2",
-    "provider": "opencode",
+    "adapter": "opencode",
     "quality_tier": "strong",
     "is_vl": false,
     "search_enabled": true,
@@ -81,7 +81,7 @@
     "name": "qwen3.7-plus",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "strong",
-    "provider": "alibaba",
+    "adapter": "alibaba",
     "is_vl": true,
     "search_enabled": true,
     "default_reasoning_effort": "high",
@@ -100,7 +100,7 @@
     "name": "qwen3.7-max",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "flagship",
-    "provider": "alibaba",
+    "adapter": "alibaba",
     "is_vl": false,
     "search_enabled": true,
     "tools_default_enabled": true,
@@ -119,7 +119,7 @@
     "name": "qwen3.6-flash",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "quality_tier": "strong",
-    "provider": "alibaba",
+    "adapter": "alibaba",
     "is_vl": true,
     "search_enabled": false,
     "tools_default_enabled": false,
@@ -134,7 +134,7 @@
       "MiMo V2.5 Free"
     ],
     "name": "mimo-v2.5-free",
-    "provider": "opencode",
+    "adapter": "opencode",
     "quality_tier": "basic",
     "is_vl": true,
     "search_enabled": true,
@@ -145,7 +145,7 @@
   {
     "key": "mimo-v2.5-pro",
     "name": "mimo-v2.5-pro",
-    "provider": "opencode",
+    "adapter": "opencode",
     "quality_tier": "strong",
     "is_vl": true,
     "search_enabled": true,
@@ -157,7 +157,7 @@
   {
     "key": "mimo-v2.5",
     "name": "mimo-v2.5",
-    "provider": "opencode",
+    "adapter": "opencode",
     "quality_tier": "basic",
     "is_vl": true,
     "search_enabled": true,
@@ -169,7 +169,7 @@
   {
     "key": "hy3-free",
     "name": "hy3-free",
-    "provider": "opencode",
+    "adapter": "opencode",
     "quality_tier": "basic",
     "is_vl": false,
     "search_enabled": true,
@@ -185,7 +185,7 @@
       "DeepSeek V4 Flash Free"
     ],
     "name": "deepseek-v4-flash-free",
-    "provider": "opencode",
+    "adapter": "opencode",
     "quality_tier": "basic",
     "is_vl": false,
     "search_enabled": true,
@@ -202,7 +202,7 @@
       "glm-5.2-openai"
     ],
     "name": "glm-5.2",
-    "provider": "alibaba",
+    "adapter": "alibaba",
     "quality_tier": "strong",
     "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
     "is_vl": false,
@@ -220,7 +220,7 @@
     "name": "enc:8ca/kgNyRac9wYKfTguIS1qyJmO43ddio7Y+kvUz/Ep+Els=",
     "endpoint": "enc:F+UAf7T5Mk+LuLPdH47LkllzBJa0M9fM3mz4n2m1sU+x8at2I8dHuwevDaowHc/QkrZDIXt8Tq2V",
     "quality_tier": "standard",
-    "provider": "compatible",
+    "adapter": "compatible",
     "api_key": "enc:YKr19nKBUd3gsizpEQjSOgiaalyNLug+cWQi+vziA4ZExvd5JxgTXqTV3Bd1iEdeugm37w9E/m4=",
     "is_vl": true,
     "search_enabled": true,
@@ -229,5 +229,21 @@
     "default_reasoning_effort": "high",
     "subagent_priority": 50,
     "max_output_tokens": 32768
+  },
+  {
+    "key": "glm-5.2-volcano",
+    "name": "glm-5.2",
+    "endpoint": "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
+    "api_key_config_key": "volcano.api_key",
+    "quality_tier": "strong",
+    "platform": "volcano",
+    "adapter": "compatible",
+    "is_vl": false,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": true,
+    "default_reasoning_effort": "high",
+    "subagent_priority": 50,
+    "max_output_tokens": 128000
   }
 ]

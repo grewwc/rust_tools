@@ -763,13 +763,21 @@ mod tests {
         let threshold = 240_000;
         let after_chars = 240_457;
 
-        assert!(should_try_pre_request_llm_summary(sid, after_chars, threshold));
+        assert!(should_try_pre_request_llm_summary(
+            sid,
+            after_chars,
+            threshold
+        ));
 
         // 调用方在每次尝试后（无论成功与否）都写入游标。模拟失败/no-op 后
         // 写入实际尝试后大小，确保下一次同样大小的请求被 growth 守卫挡掉，
         // 避免结构上无法压缩时每轮空转重试。
         store_last_pre_request_summary_chars(sid, after_chars);
-        assert!(!should_try_pre_request_llm_summary(sid, after_chars, threshold));
+        assert!(!should_try_pre_request_llm_summary(
+            sid,
+            after_chars,
+            threshold
+        ));
         // 增长 ≥ MIN_GROWTH(20K) 后才再次触发
         assert!(should_try_pre_request_llm_summary(
             sid,
@@ -778,12 +786,20 @@ mod tests {
         ));
 
         store_last_pre_request_summary_chars(sid, 230_000);
-        assert!(!should_try_pre_request_llm_summary(sid, after_chars, threshold));
+        assert!(!should_try_pre_request_llm_summary(
+            sid,
+            after_chars,
+            threshold
+        ));
         assert!(should_try_pre_request_llm_summary(sid, 251_000, threshold));
 
         // 不同 session 之间互不串扰：另一个 session 游标仍为 0，应独立触发。
         let other = "test-session-cursor-isolation";
-        assert!(should_try_pre_request_llm_summary(other, after_chars, threshold));
+        assert!(should_try_pre_request_llm_summary(
+            other,
+            after_chars,
+            threshold
+        ));
 
         store_last_pre_request_summary_chars(sid, 0);
     }

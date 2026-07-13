@@ -69,16 +69,22 @@ pub(super) fn max_output_tokens(model: &str) -> Option<u32> {
     model_def(model).and_then(|m| m.max_output_tokens)
 }
 
-pub(super) fn model_provider(model: &str) -> ApiProvider {
-    model_def(model).map(|m| m.provider).unwrap_or_default()
+pub(super) fn model_adapter(model: &str) -> ApiProvider {
+    model_def(model).map(|m| m.adapter).unwrap_or_default()
 }
 
-fn default_endpoint_for_provider(provider: ApiProvider) -> &'static str {
-    provider::adapter_for(provider, "").default_endpoint()
+pub(super) fn model_platform_label(model: &str) -> String {
+    model_def(model)
+        .map(model_names::platform_label)
+        .unwrap_or_else(|| model.trim().to_string())
 }
 
-fn default_api_key_config_candidates(provider: ApiProvider) -> &'static [&'static str] {
-    provider::adapter_for(provider, "").api_key_candidates()
+fn default_endpoint_for_adapter(adapter: ApiProvider) -> &'static str {
+    provider::adapter_for(adapter, "").default_endpoint()
+}
+
+fn default_api_key_config_candidates(adapter: ApiProvider) -> &'static [&'static str] {
+    provider::adapter_for(adapter, "").api_key_candidates()
 }
 
 pub(super) fn endpoint_for_model(model: &str, global_fallback: &str) -> String {
@@ -92,7 +98,7 @@ pub(super) fn endpoint_for_model(model: &str, global_fallback: &str) -> String {
             return maybe_decrypt(endpoint);
         }
 
-        return maybe_decrypt(default_endpoint_for_provider(model_def.provider));
+        return maybe_decrypt(default_endpoint_for_adapter(model_def.adapter));
     }
 
     let global_fallback = global_fallback.trim();
@@ -100,7 +106,7 @@ pub(super) fn endpoint_for_model(model: &str, global_fallback: &str) -> String {
         return maybe_decrypt(global_fallback);
     }
 
-    maybe_decrypt(default_endpoint_for_provider(model_provider(model)))
+    maybe_decrypt(default_endpoint_for_adapter(model_adapter(model)))
 }
 
 /// 如果值以 `enc:` 开头，自动解密；否则原样返回。
@@ -143,8 +149,8 @@ pub(super) fn api_key_for_model(model: &str, global_fallback: &str) -> String {
         return maybe_decrypt(&value);
     }
 
-    // 3. provider 默认候选 key
-    for key in default_api_key_config_candidates(model_provider(model)) {
+    // 3. adapter 默认候选 key
+    for key in default_api_key_config_candidates(model_adapter(model)) {
         if let Some(value) = cfg
             .get_opt(key)
             .map(|value| value.trim().to_string())
@@ -706,7 +712,7 @@ fn choose_default_model_name(require_vl: bool) -> Option<String> {
             .copied()
             .filter(|(_, model)| {
                 matches!(
-                    model.provider,
+                    model.adapter,
                     ApiProvider::Alibaba | ApiProvider::Compatible
                 )
             })
@@ -795,7 +801,7 @@ mod tests {
         auto_subagent_model_for_agent, classify_subagent_task_difficulty, default_model,
         determine_model, determine_vl_model, enable_thinking, endpoint_for_model,
         endpoint_supports_anonymous_auth, initial_model, merge_agent_tier_with_difficulty,
-        model_matches_disabled_tokens, model_provider, model_quality_tier,
+        model_adapter, model_matches_disabled_tokens, model_platform_label, model_quality_tier,
         parse_disabled_model_tokens, request_model_name,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
@@ -948,20 +954,20 @@ mod tests {
         assert!(model_matches_disabled_tokens(by_key, &disabled));
     }
 
-    /// 选取一个真实存在的、provider=Alibaba 的模型名做用例输入；
+    /// 选取一个真实存在的、adapter=Alibaba 的模型名做用例输入；
     /// 这样测试不会因为 models.json 增删个别条目而失效。
     fn first_alibaba_model_name() -> String {
         super::model_names::all()
             .iter()
-            .find(|m| m.provider == ApiProvider::Alibaba)
+            .find(|m| m.adapter == ApiProvider::Alibaba)
             .map(|m| m.name.clone())
-            .expect("models.json must contain at least one Alibaba-provider model")
+            .expect("models.json must contain at least one Alibaba-adapter model")
     }
 
     fn first_alibaba_vl_model_name() -> Option<String> {
         super::model_names::all()
             .iter()
-            .find(|m| m.provider == ApiProvider::Alibaba && m.is_vl)
+            .find(|m| m.adapter == ApiProvider::Alibaba && m.is_vl)
             .map(|m| m.name.clone())
     }
 
@@ -1005,12 +1011,22 @@ mod tests {
             .expect("models.json should contain opencode deepseek-v4-flash");
 
         assert_eq!(def.name, "deepseek-v4-flash");
-        assert_eq!(def.provider, ApiProvider::OpenCode);
+        assert_eq!(def.adapter, ApiProvider::OpenCode);
         assert_eq!(determine_model(key), key);
         assert_eq!(request_model_name(key), "deepseek-v4-flash");
-        assert_eq!(model_provider(key), ApiProvider::OpenCode);
+        assert_eq!(model_adapter(key), ApiProvider::OpenCode);
         assert_eq!(determine_model("DEEPSEEK_V4_FLASH_OPENCODE"), key);
         assert_eq!(determine_model("deepseek-v4-flash opencode"), key);
+    }
+
+    #[test]
+    fn platform_changes_model_handle_but_legacy_adapter_handle_still_resolves() {
+        let volcano = "glm-5.2-volcano";
+        let def = super::model_names::find_by_identifier(volcano)
+            .expect("models.json should contain volcano glm-5.2");
+        assert_eq!(super::model_names::model_handle(def), volcano);
+        assert_eq!(determine_model("glm-5.2-compatible"), volcano);
+        assert_eq!(model_platform_label(volcano), "volcano");
     }
 
     #[test]
@@ -1030,10 +1046,10 @@ mod tests {
     }
 
     #[test]
-    fn known_model_entries_carry_provider_and_quality_tier() {
+    fn known_model_entries_carry_adapter_and_quality_tier() {
         let name = first_alibaba_model_name();
         let def = super::model_names::find_by_name(&name).expect("model must exist");
-        assert_eq!(model_provider(&name), def.provider);
+        assert_eq!(model_adapter(&name), def.adapter);
         assert_eq!(model_quality_tier(&name), def.quality_tier);
     }
 
@@ -1060,11 +1076,11 @@ mod tests {
 
     #[test]
     fn endpoint_for_alibaba_model_prefers_model_config() {
-        // 找一个 Alibaba provider 且配置了 endpoint 的模型，确保走 model 配置。
+        // 找一个 Alibaba adapter 且配置了 endpoint 的模型，确保走 model 配置。
         let (name, expected) = super::model_names::all()
             .iter()
             .find_map(|m| {
-                if m.provider != ApiProvider::Alibaba {
+                if m.adapter != ApiProvider::Alibaba {
                     return None;
                 }
                 m.endpoint
@@ -1108,7 +1124,7 @@ mod tests {
     fn known_model_without_endpoint_uses_provider_default_before_global_fallback() {
         let model = super::model_names::all()
             .iter()
-            .find(|m| m.provider == ApiProvider::OpenCode && m.endpoint.is_none())
+            .find(|m| m.adapter == ApiProvider::OpenCode && m.endpoint.is_none())
             .map(|m| super::model_names::model_handle(m).to_string())
             .expect("models.json must contain at least one OpenCode entry without endpoint");
         let endpoint = endpoint_for_model(&model, "https://example.com/v1/chat/completions");
@@ -1137,10 +1153,10 @@ mod tests {
 
     #[test]
     fn default_model_prefers_high_quality_alibaba_or_compatible_model() {
-        // default_model 在 choose_default_model_name 中先按 Alibaba / Compatible 过滤，
+        // default_model 在 choose_default_model_name 中先按 Alibaba / Compatible adapter 过滤，
         // 再退回到全集，并按 quality_tier 取最高。这里把不变量直接写在断言上：
         //  1. 必须是 non-vl
-        //  2. quality_tier 必须不低于所有同 provider-偏好下的候选
+        //  2. quality_tier 必须不低于所有同 adapter-偏好下的候选
         let def = super::model_names::find_by_identifier(&default_model())
             .expect("default model must exist in models.json");
         assert!(!def.is_vl, "default model should be non-VL");
@@ -1162,7 +1178,7 @@ mod tests {
         // 不会再让本测试失效，但仍然能守住"不要把 false 误读成 true"的不变量。
         let candidate = super::model_names::all()
             .iter()
-            .find(|m| m.provider == ApiProvider::OpenCode && !m.enable_thinking)
+            .find(|m| m.adapter == ApiProvider::OpenCode && !m.enable_thinking)
             .map(|m| m.name.clone());
         if let Some(name) = candidate {
             assert!(!enable_thinking(&name));

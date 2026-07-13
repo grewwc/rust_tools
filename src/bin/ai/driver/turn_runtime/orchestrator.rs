@@ -973,10 +973,10 @@ async fn run_turn_body(
                     // effort，降档是空操作——必须直接关 thinking 才能腾出输出预算。
                     // dialect 分派与请求层一致：用 request_model_name + endpoint。
                     let endpoint = crate::ai::models::endpoint_for_model(&next_model, "");
-                    let provider = crate::ai::models::model_provider(&next_model);
+                    let adapter = crate::ai::models::model_adapter(&next_model);
                     let request_model = crate::ai::models::request_model_name(&next_model);
                     let effort_helps = crate::ai::provider::reasoning_effort_reduces_thinking_for(
-                        provider,
+                        adapter,
                         &request_model,
                         &endpoint,
                     );

@@ -1,4 +1,3 @@
-
 use super::{
     AgentTeamMemberSpec, AgentTeamOperation, AsyncTaskEntry, InheritOptions, OsTaskGoal,
     SelectedSubagent, StoredTaskResult, TASK_REGISTRY, WaitManySource,
@@ -218,13 +217,11 @@ fn routing_tags_drive_auto_selection_without_name_special_cases() {
 fn selection_explanation_mentions_quality_tier_for_auto_model_choice() {
     // 之前这里硬编码 "qwen3-max"；该模型已经从 models.json 移除。
     // 改为从真实条目中找一个 Alibaba+flagship 的模型，确保解释里出现
-    // "flagship" 和 "alibaba" 这两个 tier/provider 关键字。
+    // "flagship" 和 "alibaba" 这两个 tier/adapter 关键字。
     use crate::ai::provider::{ApiProvider, ModelQualityTier};
     let model = crate::ai::model_names::all()
         .iter()
-        .find(|m| {
-            m.provider == ApiProvider::Alibaba && m.quality_tier == ModelQualityTier::Flagship
-        })
+        .find(|m| m.adapter == ApiProvider::Alibaba && m.quality_tier == ModelQualityTier::Flagship)
         .map(|m| m.name.clone());
     let Some(model) = model else {
         eprintln!(

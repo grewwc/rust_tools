@@ -251,7 +251,13 @@ impl CommandCompleter {
             flags.join("/")
         };
         let handle = Self::model_handle(model);
-        format!("{} · {:?} · {}", handle, model.provider, flags)
+        format!(
+            "{} · {}/{} · {}",
+            handle,
+            crate::ai::model_names::platform_label(model),
+            crate::ai::model_names::adapter_slug(model.adapter),
+            flags
+        )
     }
 
     fn model_command_candidates(prefix: &str) -> Vec<CompletionCandidate> {

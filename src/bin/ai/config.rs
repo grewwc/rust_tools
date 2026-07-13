@@ -30,6 +30,7 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
     let default_model =
         models::determine_model(&cfg.get_opt(AiConfig::MODEL_DEFAULT).unwrap_or_default());
     let default_endpoint = models::endpoint_for_model(&default_model, &endpoint);
+    let default_model_api_key = models::api_key_for_model(&default_model, &api_key);
     if api_key.trim().is_empty()
         && opencode_api_key.trim().is_empty()
         && openrouter_api_key.trim().is_empty()
@@ -37,9 +38,10 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
         && alibaba_api_key.trim().is_empty()
         && aliyun_api_key.trim().is_empty()
         && openai_api_key.trim().is_empty()
+        && default_model_api_key.trim().is_empty()
         && !models::endpoint_supports_anonymous_auth(&default_endpoint)
     {
-        return Err("set api_key / opencode.api_key / openrouter.api_key / compatible.api_key / alibaba.api_key / aliyun.api_key / openai.api_key in ~/.configW".into());
+        return Err("set api_key / opencode.api_key / openrouter.api_key / compatible.api_key / alibaba.api_key / aliyun.api_key / openai.api_key or the default model's `api_key_config_key` in ~/.configW".into());
     }
     let history_file = cfg
         .get_opt("history_file")
@@ -94,4 +96,47 @@ pub(super) fn load_config() -> Result<AppConfig, Box<dyn std::error::Error>> {
 #[allow(dead_code)]
 pub(super) fn clear_history_file(path: &PathBuf) {
     let _ = fs::remove_file(path);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::env;
+
+    use super::load_config;
+    use crate::ai::{models, test_support::ENV_LOCK};
+    use crate::commonw::configw;
+
+    #[test]
+    fn load_config_accepts_default_model_specific_api_key_config_key() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+
+        let cfg_path = std::env::temp_dir().join(format!(
+            "rt_volcano_model_{}.configw",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::write(
+            &cfg_path,
+            "ai.model.default = glm-5.2-volcano\nvolcano.api_key = test-volcano-key\n",
+        )
+        .unwrap();
+        let old_cfg = env::var_os("CONFIGW_PATH");
+        unsafe { env::set_var("CONFIGW_PATH", &cfg_path) };
+        configw::refresh();
+
+        let loaded = load_config();
+        let resolved_key = match loaded.as_ref() {
+            Ok(app) => Some(models::api_key_for_model("glm-5.2-volcano", &app.api_key)),
+            Err(_) => None,
+        };
+
+        match old_cfg {
+            Some(value) => unsafe { env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { env::remove_var("CONFIGW_PATH") },
+        }
+        configw::refresh();
+        let _ = std::fs::remove_file(&cfg_path);
+
+        loaded.expect("default model specific api key should pass startup validation");
+        assert_eq!(resolved_key.as_deref(), Some("test-volcano-key"));
+    }
 }

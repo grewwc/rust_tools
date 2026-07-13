@@ -153,7 +153,9 @@ pub fn try_handle_session_command(
             );
             println!("  /sessions clear-all       delete all sessions");
             println!("  /sessions export <id> [output.md]       export session to Markdown");
-            println!("  /sessions dump-history <id>                dump session history to JSON (<id>-history.json)");
+            println!(
+                "  /sessions dump-history <id>                dump session history to JSON (<id>-history.json)"
+            );
             println!(
                 "  /sessions export-current [output.md]    export current session to Markdown"
             );
@@ -393,7 +395,11 @@ pub fn try_handle_session_command(
                         std::fs::create_dir_all(parent)?;
                     }
                     std::fs::write(output_path, json)?;
-                    println!("Dumped history of session '{}' to '{}'", id, output_path.display());
+                    println!(
+                        "Dumped history of session '{}' to '{}'",
+                        id,
+                        output_path.display()
+                    );
                 }
                 Err(err) => {
                     eprintln!("Failed to dump history: {}", err);

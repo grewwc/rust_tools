@@ -51,7 +51,7 @@ pub(super) async fn stream_response(
     let mut state = StreamProcessingState::new();
     configure_thinking_fold(&mut state);
     let adapter = provider::adapter_for(
-        models::model_provider(&app.current_model),
+        models::model_adapter(&app.current_model),
         &models::endpoint_for_model(&app.current_model, &app.config.endpoint),
     );
 

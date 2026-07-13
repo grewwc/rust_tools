@@ -568,7 +568,10 @@ fn describe_aligned_block_first_mismatch(
     start: usize,
 ) -> Option<String> {
     for (offset, expected) in expected_lines.iter().enumerate() {
-        let actual = actual_lines.get(start + offset).map(String::as_str).unwrap_or("");
+        let actual = actual_lines
+            .get(start + offset)
+            .map(String::as_str)
+            .unwrap_or("");
         if expected == &actual {
             continue;
         }
@@ -659,7 +662,8 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
                 orig_lines.len()
             ));
         }
-        if let Some(detail) = describe_aligned_block_first_mismatch(&expected, orig_lines, nominal) {
+        if let Some(detail) = describe_aligned_block_first_mismatch(&expected, orig_lines, nominal)
+        {
             msg.push_str(&detail);
         }
     }
