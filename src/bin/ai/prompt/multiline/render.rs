@@ -38,7 +38,7 @@ fn popup_layout_config(
     // textarea 行数变化导致视觉跳变。viewport 高度在创建时固定，chrome 变化会挤压
     // textarea 或触发 resize 跳变。
     let top_margin: u16 = 0;
-    let help_lines: u16 = 1;
+    let help_lines: u16 = 2; // 两行快捷键：换行/发送/取消 + 历史/删行/粘贴/F8/F9/F10
     let model_header_lines = if has_model_label { 1 } else { 0 };
     let spacer_lines = 0;
     let min_textarea_lines = if has_completion_panel {
@@ -633,9 +633,9 @@ mod tests {
     #[test]
     fn empty_prompt_keeps_consistent_top_margin() {
         let layout = popup_layout_config(8, "", 1, 0, false, false, true);
-        // 紧凑空输入：top_margin=0, help=1，最大限度减少空白行
+        // 紧凑空输入：top_margin=0, help=2，最大限度减少空白行
         assert_eq!(layout.top_margin, 0);
-        assert_eq!(layout.help_lines, 1);
+        assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
         assert_eq!(layout.spacer_lines, 0);
         assert_eq!(layout.min_textarea_lines, 1);
@@ -646,7 +646,7 @@ mod tests {
         let layout = popup_layout_config(8, "hello", 1, 0, false, false, true);
         // 统一 chrome 布局：与空输入一致，避免空→非空切换时 textarea 行数跳变
         assert_eq!(layout.top_margin, 0);
-        assert_eq!(layout.help_lines, 1);
+        assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
         assert_eq!(layout.spacer_lines, 0);
         assert_eq!(layout.min_textarea_lines, 1);

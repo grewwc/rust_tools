@@ -50,7 +50,8 @@ cargo test --lib --bin a
 cargo test --bin a test_name
 ```
 
-**Only verify what you changed.** Run focused checks for the touched module first; broaden only when the change crosses shared behavior. Avoid full-workspace checks unless necessary.
+**Only verify what you changed.** Run focused checks for the touched module first; broaden only when the change crosses shared behavior.
+**Never run full-workspace tests (e.g. `cargo test` without `--bin`/`--lib`/`-p`) or full-workspace builds (e.g. `cargo build --release` without `--bin`) just to verify a partial change.** Running `cargo build --release` without `--bin` force-rebuilds every binary in the workspace, wasting time; running `cargo test --workspace` or bare `cargo test` runs all tests including unrelated ones. Use `--bin`, `--lib`, `-p`, or a specific test name to scope the command.
 
 ## Global Engineering Rules
 
@@ -84,6 +85,10 @@ cargo test --bin a test_name
     Outdated rules that contradict current behavior are worse than missing rules:
     they mislead and dilute the signal. If a rule no longer applies, remove it;
     if it partially applies, rewrite it. Keep every file lean.
+
+12. When verifying a change, scope the command to the affected package or binary.
+    **Never run full-workspace tests or builds just to check a partial change.**
+    Use `--bin <name>`, `--lib`, `-p <package>`, or a specific test name — never bare `cargo test` / `cargo build --release`.
 
 ## High-Value Pitfalls
 

@@ -21,16 +21,16 @@ use crate::ai::prompt::{PromptEditor, interrupted_error};
 /// viewport 最大高度（textarea + chrome），随终端尺寸动态缩放，上限 10 行。
 const MAX_VIEWPORT_HEIGHT: u16 = 10;
 /// textarea 最大行数 = MAX_VIEWPORT_HEIGHT - VIEWPORT_CHROME_LINES。
-const MAX_TEXTAREA_LINES: u16 = 8;
-/// chrome 固定行数：model(1) + help(1)，top_margin=0 且无 spacer。
-const VIEWPORT_CHROME_LINES: u16 = 2;
+const MAX_TEXTAREA_LINES: u16 = 7;
+/// chrome 固定行数：model(1) + help(2)，top_margin=0 且无 spacer。
+const VIEWPORT_CHROME_LINES: u16 = 3;
 /// textarea 最小行数，用于 clamp 计算。
 const MIN_TEXTAREA_LINES: u16 = 2;
 
 /// 补全面板激活时，除面板外需要保留的固定行数：
-/// top_margin(0) + textarea 最小行(1) + model(1) + help(1) = 3。
-/// 统一 chrome 布局（top_margin=0, help=1），面板激活时 spacer=0、min_textarea_lines=1。
-const PANEL_CHROME_LINES: u16 = 3;
+/// top_margin(0) + textarea 最小行(1) + model(1) + help(2) = 4。
+/// 统一 chrome 布局（top_margin=0, help=2），面板激活时 spacer=0、min_textarea_lines=1。
+const PANEL_CHROME_LINES: u16 = 4;
 /// 补全面板一次最多显示的候选行数，与 `render::COMPLETION_WINDOW` 对齐。
 const PANEL_COMPLETION_WINDOW: u16 = 12;
 
@@ -338,15 +338,15 @@ mod tests {
 
     #[test]
     fn multiline_viewport_height_scales_with_terminal() {
-        // 空输入：viewport = textarea(available/4, clamp 2-8) + chrome(2)
-        // terminal=30: available=28, textarea=7, viewport=9
-        assert_eq!(multiline_viewport_height(30, None), 9);
-        assert_eq!(multiline_viewport_height(30, Some("")), 9);
+        // 空输入：viewport = textarea(available/4, clamp 2-7) + chrome(3)
+        // terminal=30: available=28, textarea=7, viewport=10
+        assert_eq!(multiline_viewport_height(30, None), 10);
+        assert_eq!(multiline_viewport_height(30, Some("")), 10);
         // 有预填但内容短于 base：保持 base 大小
-        assert_eq!(multiline_viewport_height(30, Some("one line")), 9);
-        // 小终端：terminal=12, available=10, textarea=2, viewport=4
-        assert_eq!(multiline_viewport_height(12, None), 4);
-        // 大终端：terminal=40, available=38, textarea=8, viewport=10
+        assert_eq!(multiline_viewport_height(30, Some("one line")), 10);
+        // 小终端：terminal=12, available=10, textarea=2, viewport=5
+        assert_eq!(multiline_viewport_height(12, None), 5);
+        // 大终端：terminal=40, available=38, textarea=7, viewport=10
         assert_eq!(multiline_viewport_height(40, None), 10);
     }
 
@@ -368,12 +368,12 @@ mod tests {
     fn completion_viewport_grows_with_candidates_without_shrinking_base() {
         // 无面板：保持 base 高度（4）。
         assert_eq!(viewport_height_with_completion(30, 4, None), 4);
-        // 1 个候选：面板需要 1+2(边框)=3 + 3(chrome)=6，大于 base，撑到 6。
-        assert_eq!(viewport_height_with_completion(30, 4, Some(1)), 6);
-        // 3 个候选：3+2+3=8 > base，viewport 撑高到 8，多出的 4 行给面板。
-        assert_eq!(viewport_height_with_completion(30, 4, Some(3)), 8);
+        // 1 个候选：面板需要 1+2(边框)=3 + 4(chrome)=7，大于 base，撑到 7。
+        assert_eq!(viewport_height_with_completion(30, 4, Some(1)), 7);
+        // 3 个候选：3+2+4=9 > base，viewport 撑高到 9，多出的 5 行给面板。
+        assert_eq!(viewport_height_with_completion(30, 4, Some(3)), 9);
         // 大量候选：受 PANEL_COMPLETION_WINDOW(12) 与 MAX_VIEWPORT_HEIGHT(10) 双重封顶。
-        // 12+2+3=17 > 10，被封顶到 10。
+        // 12+2+4=18 > 10，被封顶到 10。
         assert_eq!(viewport_height_with_completion(30, 4, Some(50)), 10);
     }
 
