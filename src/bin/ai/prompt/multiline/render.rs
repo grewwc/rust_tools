@@ -27,31 +27,24 @@ struct PopupLayoutConfig {
 
 fn popup_layout_config(
     _area_height: u16,
-    current_content: &str,
+    _current_content: &str,
     content_lines: usize,
-    trailing_blank_lines: usize,
+    _trailing_blank_lines: usize,
     has_completion_panel: bool,
-    has_status_msg: bool,
+    _has_status_msg: bool,
     has_model_label: bool,
 ) -> PopupLayoutConfig {
-    let compact_empty = !has_completion_panel && !has_status_msg && current_content.is_empty();
-    // 紧凑空输入场景去掉顶部边距，让光标紧贴上次输出底部，最大限度减少空白行；
-    // 编辑态保留 1 行顶部边距，避免 textarea 整体下移的视觉跳变。
-    let top_margin: u16 = if compact_empty { 0 } else { 1 };
-    // 紧凑空输入只保留 1 行 help（节省垂直空间），编辑态恢复 2 行完整帮助。
-    let help_lines: u16 = if compact_empty { 1 } else { 2 };
+    // 所有状态使用统一的 chrome 布局（top_margin=0, help=1），避免空→非空切换时
+    // textarea 行数变化导致视觉跳变。viewport 高度在创建时固定，chrome 变化会挤压
+    // textarea 或触发 resize 跳变。
+    let top_margin: u16 = 0;
+    let help_lines: u16 = 1;
     let model_header_lines = if has_model_label { 1 } else { 0 };
-    let spacer_lines = if compact_empty {
-        0
-    } else if !has_completion_panel && trailing_blank_lines == 0 {
+    let spacer_lines = 0;
+    let min_textarea_lines = if has_completion_panel {
         1
     } else {
-        0
-    };
-    let min_textarea_lines = if has_completion_panel || compact_empty {
-        1
-    } else {
-        (content_lines.max(2)).min(6) as u16
+        (content_lines.max(1)).min(6) as u16
     };
 
     PopupLayoutConfig {
@@ -651,11 +644,12 @@ mod tests {
     #[test]
     fn non_empty_prompt_keeps_full_editor_layout() {
         let layout = popup_layout_config(8, "hello", 1, 0, false, false, true);
-        assert_eq!(layout.top_margin, 1);
-        assert_eq!(layout.help_lines, 2);
+        // 统一 chrome 布局：与空输入一致，避免空→非空切换时 textarea 行数跳变
+        assert_eq!(layout.top_margin, 0);
+        assert_eq!(layout.help_lines, 1);
         assert_eq!(layout.model_header_lines, 1);
-        assert_eq!(layout.spacer_lines, 1);
-        assert_eq!(layout.min_textarea_lines, 2);
+        assert_eq!(layout.spacer_lines, 0);
+        assert_eq!(layout.min_textarea_lines, 1);
     }
 
     #[test]

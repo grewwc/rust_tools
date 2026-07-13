@@ -18,22 +18,19 @@ use super::{
 };
 use crate::ai::prompt::{PromptEditor, interrupted_error};
 
-/// 空输入时的紧凑 viewport 高度：textarea(1) + model(1) + help(1) = 3。
-/// 用户开始输入后会 resize 到 `ACTIVE_VIEWPORT_HEIGHT`，确保 textarea 有足够编辑空间。
-const COMPACT_VIEWPORT_HEIGHT: u16 = 3;
-/// 有内容时的 viewport 高度：top_margin(1) + textarea(4) + model(1) + help(2) = 8。
-/// 空→非空首次输入时由事件循环触发 resize 从 COMPACT_VIEWPORT_HEIGHT 切换到此值。
-const ACTIVE_VIEWPORT_HEIGHT: u16 = 8;
-const MAX_VIEWPORT_HEIGHT: u16 = 20;
-const VIEWPORT_CHROME_LINES: u16 = 5; // top margin + model line + spacer + help(2)
-const MIN_TEXTAREA_LINES: u16 = 3;
-const MAX_PREFILL_TEXTAREA_LINES: u16 = 12;
+/// viewport 最大高度（textarea + chrome），随终端尺寸动态缩放，上限 10 行。
+const MAX_VIEWPORT_HEIGHT: u16 = 10;
+/// textarea 最大行数 = MAX_VIEWPORT_HEIGHT - VIEWPORT_CHROME_LINES。
+const MAX_TEXTAREA_LINES: u16 = 8;
+/// chrome 固定行数：model(1) + help(1)，top_margin=0 且无 spacer。
+const VIEWPORT_CHROME_LINES: u16 = 2;
+/// textarea 最小行数，用于 clamp 计算。
+const MIN_TEXTAREA_LINES: u16 = 2;
 
 /// 补全面板激活时，除面板外需要保留的固定行数：
-/// top_margin(1) + textarea 最小行(1) + model(1) + help(2) = 5。
-/// 与 `render::popup_layout_config` 在 `has_completion_panel` 分支下的口径保持一致
-/// （面板激活时 spacer=0、min_textarea_lines=1）。
-const PANEL_CHROME_LINES: u16 = 5;
+/// top_margin(0) + textarea 最小行(1) + model(1) + help(1) = 3。
+/// 统一 chrome 布局（top_margin=0, help=1），面板激活时 spacer=0、min_textarea_lines=1。
+const PANEL_CHROME_LINES: u16 = 3;
 /// 补全面板一次最多显示的候选行数，与 `render::COMPLETION_WINDOW` 对齐。
 const PANEL_COMPLETION_WINDOW: u16 = 12;
 
@@ -54,20 +51,19 @@ fn clear_inline_viewport_preserving_cursor<B: ratatui::backend::Backend>(
 
 fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
     let available_rows = terminal_rows.saturating_sub(2).max(1);
+    // textarea 基础行数：取 terminal 可用行数的 1/4，至少 MIN、最多 MAX
+    let base_textarea = (available_rows / 4).clamp(MIN_TEXTAREA_LINES, MAX_TEXTAREA_LINES);
+    let base_viewport = base_textarea.saturating_add(VIEWPORT_CHROME_LINES);
     if prefill.is_none_or(str::is_empty) {
-        // 空输入先用紧凑 viewport（COMPACT_VIEWPORT_HEIGHT），用户首次输入时
-        // 事件循环会 resize 到 ACTIVE_VIEWPORT_HEIGHT，确保 textarea 有足够编辑空间。
-        return COMPACT_VIEWPORT_HEIGHT.min(available_rows);
+        return base_viewport.min(available_rows).min(MAX_VIEWPORT_HEIGHT);
     }
-    let prefill_rows = prefill
+    // 有预填内容时，textarea 行数不小于 base 且能容纳内容，最多 MAX_TEXTAREA_LINES
+    let content_rows = prefill
         .map(|text| text.lines().count().max(1))
-        .unwrap_or(1)
-        .min(u16::MAX as usize) as u16;
-    let prefill_viewport_height = prefill_rows
-        .clamp(MIN_TEXTAREA_LINES, MAX_PREFILL_TEXTAREA_LINES)
-        .saturating_add(VIEWPORT_CHROME_LINES);
-    let desired = COMPACT_VIEWPORT_HEIGHT.max(prefill_viewport_height);
-    desired.min(MAX_VIEWPORT_HEIGHT).min(available_rows)
+        .unwrap_or(1) as u16;
+    let textarea = content_rows.clamp(base_textarea, MAX_TEXTAREA_LINES);
+    let viewport = textarea.saturating_add(VIEWPORT_CHROME_LINES);
+    viewport.min(available_rows).min(MAX_VIEWPORT_HEIGHT)
 }
 
 /// 补全面板激活时所需的 viewport 高度：在保持输入框（textarea）行数不变的前提下，
@@ -164,7 +160,7 @@ impl PromptEditor {
         // 放大，给 textarea 保留足够空间。
         let mut base_viewport_height = terminal_size()
             .map(|(_, h)| multiline_viewport_height(h, self.pending_prefill.as_deref()))
-            .unwrap_or(COMPACT_VIEWPORT_HEIGHT);
+            .unwrap_or(6);
 
         let mut terminal = match build_inline_terminal(base_viewport_height) {
             Ok(terminal) => terminal,
@@ -191,21 +187,8 @@ impl PromptEditor {
             // 面板出现/消失/候选数变化时，据此重建 viewport 让面板获得足够高度，
             // 而输入框行数保持不变。
             let mut fitted_completion_items: Option<usize> = None;
-            // 空→非空首次输入时，将 viewport 从紧凑高度 resize 到编辑高度。
-            let mut resized_for_content = false;
 
             loop {
-                // 空→非空：首次输入时将 viewport 从 COMPACT 放大到 ACTIVE，
-                // 给 textarea 腾出足够编辑空间；后续输入不再重复 resize。
-                let has_content = !textarea.lines().join("").is_empty();
-                if has_content && !resized_for_content {
-                    let target = ACTIVE_VIEWPORT_HEIGHT
-                        .min(terminal_size().map(|(_, h)| h.saturating_sub(2)).unwrap_or(ACTIVE_VIEWPORT_HEIGHT).max(1));
-                    resize_inline_viewport(&mut terminal, target)?;
-                    base_viewport_height = target;
-                    resized_for_content = true;
-                }
-
                 // 面板状态变化时，重建 inline viewport 以匹配面板所需高度。
                 let current_items = completion_panel.as_ref().map(|p| p.items.len());
                 if current_items != fitted_completion_items {
@@ -217,6 +200,22 @@ impl PromptEditor {
                     );
                     resize_inline_viewport(&mut terminal, new_height)?;
                     fitted_completion_items = current_items;
+                }
+
+                // 内容超出 textarea 容量时自动扩展 viewport（只扩不缩，避免频繁闪烁）。
+                let content_lines = textarea.lines().len() as u16;
+                let textarea_capacity = base_viewport_height.saturating_sub(VIEWPORT_CHROME_LINES);
+                if content_lines > textarea_capacity && base_viewport_height < MAX_VIEWPORT_HEIGHT {
+                    let terminal_rows = terminal_size().map(|(_, h)| h).unwrap_or(0);
+                    let available = terminal_rows.saturating_sub(2).max(1);
+                    let new_height = content_lines
+                        .saturating_add(VIEWPORT_CHROME_LINES)
+                        .min(MAX_VIEWPORT_HEIGHT)
+                        .min(available);
+                    if new_height > base_viewport_height {
+                        resize_inline_viewport(&mut terminal, new_height)?;
+                        base_viewport_height = new_height;
+                    }
                 }
 
                 terminal
@@ -253,13 +252,9 @@ impl PromptEditor {
             }
         })();
 
-        // 退出 TUI：清除 ratatui 的 inline viewport 残留内容。
-        // `terminal.clear()` 会把光标挪到 viewport 顶部再 FromCursorDown，
-        // 但如果 resize 事件导致内部锚点漂移，clear() 可能未覆盖完整区域，
-        // 旧内容残留在 scrollback 中——用户会看到输入被渲染两次。
-        // 因此先调 terminal.clear()，再用创建 viewport 时保存的锚点坐标
-        // 显式 MoveTo + FromCursorDown 做兜底清除。
-        let _ = terminal.clear();
+        // 退出 TUI：先 drop terminal 让 ratatui 清理 inline viewport，
+        // 再用创建 viewport 时保存的锚点坐标做兜底清除，确保无残留空白行。
+        drop(terminal);
         if let Some(pos) = viewport_top_pos {
             let _ = execute!(
                 io::stdout(),
@@ -269,7 +264,7 @@ impl PromptEditor {
         } else {
             let _ = execute!(io::stdout(), Clear(ClearType::FromCursorDown));
         }
-        let _ = terminal.show_cursor();
+        let _ = execute!(io::stdout(), cursor::Show);
         let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = disable_raw_mode();
 
@@ -342,11 +337,17 @@ mod tests {
     }
 
     #[test]
-    fn multiline_viewport_height_stays_compact_for_empty_prompt() {
-        // 空输入返回 COMPACT_VIEWPORT_HEIGHT（3），有预填内容时扩大到能容纳编辑器的高度
-        assert_eq!(multiline_viewport_height(30, None), 3);
-        assert_eq!(multiline_viewport_height(30, Some("")), 3);
-        assert_eq!(multiline_viewport_height(30, Some("one line")), 8);
+    fn multiline_viewport_height_scales_with_terminal() {
+        // 空输入：viewport = textarea(available/4, clamp 2-8) + chrome(2)
+        // terminal=30: available=28, textarea=7, viewport=9
+        assert_eq!(multiline_viewport_height(30, None), 9);
+        assert_eq!(multiline_viewport_height(30, Some("")), 9);
+        // 有预填但内容短于 base：保持 base 大小
+        assert_eq!(multiline_viewport_height(30, Some("one line")), 9);
+        // 小终端：terminal=12, available=10, textarea=2, viewport=4
+        assert_eq!(multiline_viewport_height(12, None), 4);
+        // 大终端：terminal=40, available=38, textarea=8, viewport=10
+        assert_eq!(multiline_viewport_height(40, None), 10);
     }
 
     #[test]
@@ -356,29 +357,30 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert_eq!(multiline_viewport_height(40, Some(&prefill)), 17);
+        // terminal=40: available=38, base_textarea=8, content=20→clamp(8,8)=8, viewport=10
+        assert_eq!(multiline_viewport_height(40, Some(&prefill)), 10);
         assert_eq!(multiline_viewport_height(10, Some(&prefill)), 8);
         assert_eq!(multiline_viewport_height(4, Some(&prefill)), 2);
-        assert_eq!(multiline_viewport_height(4, None), 2);
+        assert_eq!(multiline_viewport_height(4, None), 2); // available=2
     }
 
     #[test]
     fn completion_viewport_grows_with_candidates_without_shrinking_base() {
-        // 无面板：保持 base 高度（8）。
-        assert_eq!(viewport_height_with_completion(30, 8, None), 8);
-        // 1 个候选：面板需要 1+2(边框)+5(chrome)=8，不小于 base，仍是 8。
-        assert_eq!(viewport_height_with_completion(30, 8, Some(1)), 8);
-        // 3 个候选：3+2+5=10 > base，viewport 撑高到 10，多出的 2 行全给面板。
-        assert_eq!(viewport_height_with_completion(30, 8, Some(3)), 10);
-        // 大量候选：受 PANEL_COMPLETION_WINDOW(12) 与 MAX_VIEWPORT_HEIGHT(20) 双重封顶。
-        // 12+2+5=19 <= 20，取 19。
-        assert_eq!(viewport_height_with_completion(30, 8, Some(50)), 19);
+        // 无面板：保持 base 高度（4）。
+        assert_eq!(viewport_height_with_completion(30, 4, None), 4);
+        // 1 个候选：面板需要 1+2(边框)=3 + 3(chrome)=6，大于 base，撑到 6。
+        assert_eq!(viewport_height_with_completion(30, 4, Some(1)), 6);
+        // 3 个候选：3+2+3=8 > base，viewport 撑高到 8，多出的 4 行给面板。
+        assert_eq!(viewport_height_with_completion(30, 4, Some(3)), 8);
+        // 大量候选：受 PANEL_COMPLETION_WINDOW(12) 与 MAX_VIEWPORT_HEIGHT(10) 双重封顶。
+        // 12+2+3=17 > 10，被封顶到 10。
+        assert_eq!(viewport_height_with_completion(30, 4, Some(50)), 10);
     }
 
     #[test]
     fn completion_viewport_capped_by_available_terminal_rows() {
         // 终端只有 12 行时 available=10，即便面板想要更高也不能超过 10。
-        assert_eq!(viewport_height_with_completion(12, 8, Some(50)), 10);
+        assert_eq!(viewport_height_with_completion(12, 4, Some(50)), 10);
         // base 本身也受 available 约束。
         assert_eq!(viewport_height_with_completion(6, 8, None), 4);
     }
