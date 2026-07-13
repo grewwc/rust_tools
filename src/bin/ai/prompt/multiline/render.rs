@@ -23,7 +23,6 @@ struct PopupLayoutConfig {
     help_lines: u16,
     model_header_lines: u16,
     spacer_lines: u16,
-    bottom_rule_lines: u16,
     min_textarea_lines: u16,
 }
 
@@ -36,7 +35,8 @@ fn popup_layout_config(
     _has_status_msg: bool,
     has_model_label: bool,
 ) -> PopupLayoutConfig {
-    // top_margin 始终保持 0。普通输入态上下各保留 1 行细分隔线；补全态隐藏这两条
+    // top_margin 始终保持 0。普通输入态只保留顶部 1 行细分隔线，作为和上一轮输出的
+    // 视觉分界；底部不再额外画线，避免面板上下同时出现横线显得重复。补全态隐藏这条
     // 装饰线，把高度尽量让给候选列表，避免在矮终端里只剩 1 条候选可见。
     let top_margin: u16 = 0;
     let top_rule_lines: u16 = if has_completion_panel { 0 } else { 1 };
@@ -49,7 +49,6 @@ fn popup_layout_config(
         1
     };
     let spacer_lines = 0;
-    let bottom_rule_lines: u16 = if has_completion_panel { 0 } else { 1 };
     let min_textarea_lines = if has_completion_panel {
         1
     } else {
@@ -62,7 +61,6 @@ fn popup_layout_config(
         help_lines,
         model_header_lines,
         spacer_lines,
-        bottom_rule_lines,
         min_textarea_lines,
     }
 }
@@ -123,7 +121,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // 1. 没有补全面板（否则可用高度太紧张）；
     // 2. 正文末尾自己没有留空行。
     let spacer_lines = layout.spacer_lines;
-    let bottom_rule_lines = layout.bottom_rule_lines;
     // 面板激活时优先占满高度：先扣掉 help 行与 textarea 最小行，余下的尽量给面板
     // （面板期望高度 = min(候选数, COMPLETION_WINDOW) + 上下边框 2，但不超过可用空间）。
     // textarea 退让到最小 1 行（此时用户在选列表，不需要大编辑区）。
@@ -139,7 +136,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                 .saturating_sub(help_lines)
                 .saturating_sub(model_header_lines)
                 .saturating_sub(spacer_lines)
-                .saturating_sub(bottom_rule_lines)
                 .saturating_sub(min_textarea_lines);
             let panel = desired_panel.min(panel_cap).max(1.min(panel_cap));
             let textarea = inner
@@ -149,7 +145,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                 .saturating_sub(spacer_lines)
                 .saturating_sub(model_header_lines)
                 .saturating_sub(help_lines)
-                .saturating_sub(bottom_rule_lines)
                 .max(min_textarea_lines);
             (textarea, panel)
         }
@@ -160,7 +155,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                 .saturating_sub(spacer_lines)
                 .saturating_sub(model_header_lines)
                 .saturating_sub(help_lines)
-                .saturating_sub(bottom_rule_lines)
                 .max(min_textarea_lines);
             (textarea, 0)
         }
@@ -175,7 +169,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             Constraint::Length(spacer_lines),
             Constraint::Length(model_header_lines),
             Constraint::Length(help_lines),
-            Constraint::Length(bottom_rule_lines),
         ])
         .split(inner);
 
@@ -190,7 +183,7 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     }
 
     // 底部模型/主题信息行：让用户在输入时看到当前模型与 session 主题。
-    // **必须画在底部专属 chunk（chunks[3]，help 行上方）而非 viewport 顶行**：顶行会在
+    // **必须画在底部专属 chunk（chunks[4]，help 行上方）而非 viewport 顶行**：顶行会在
     // 每次 viewport 重新锚定时被推进 scrollback 反复堆叠（见上方 model_header_lines 注释）。
     if model_header_lines > 0 {
         let header_area = chunks[4];
@@ -222,9 +215,8 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         f.render_widget(Paragraph::new(header), header_area);
     }
 
-    // 这里用单独 chunk 画“细分隔线”，而不是粗边框。样式上保留上下边缘，
-    // 但仍交给 multiline_ui 的退出清理与 viewport 重建逻辑统一擦除，
-    // 避免旧版全宽边框那种厚重、易残留的观感。
+    // 这里用单独 chunk 画“细分隔线”，而不是粗边框。现在只保留顶部这条：
+    // 既能和上方输出做分界，又不会像上下双线那样显得重复。
     let char_count = current_content.chars().count();
 
     // 设置对齐方式
@@ -455,10 +447,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             f.render_widget(status_para, status_area);
         }
     }
-
-    if bottom_rule_lines > 0 {
-        f.render_widget(Paragraph::new(divider_line(chunks[6].width)), chunks[6]);
-    }
 }
 
 fn divider_line(width: u16) -> Line<'static> {
@@ -673,13 +661,12 @@ mod tests {
     #[test]
     fn empty_prompt_keeps_consistent_top_margin() {
         let layout = popup_layout_config(8, "", 1, 0, false, false, true);
-        // 紧凑空输入：top_margin=0，上下各 1 条细分隔线，help=2
+        // 紧凑空输入：top_margin=0，仅保留顶部 1 条细分隔线，help=2
         assert_eq!(layout.top_margin, 0);
         assert_eq!(layout.top_rule_lines, 1);
         assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
         assert_eq!(layout.spacer_lines, 0);
-        assert_eq!(layout.bottom_rule_lines, 1);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
@@ -692,7 +679,6 @@ mod tests {
         assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
         assert_eq!(layout.spacer_lines, 0);
-        assert_eq!(layout.bottom_rule_lines, 1);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
@@ -704,7 +690,6 @@ mod tests {
         assert_eq!(layout.help_lines, 1);
         assert_eq!(layout.model_header_lines, 0);
         assert_eq!(layout.spacer_lines, 0);
-        assert_eq!(layout.bottom_rule_lines, 0);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 

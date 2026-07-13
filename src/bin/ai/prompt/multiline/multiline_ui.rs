@@ -18,12 +18,12 @@ use super::{
 };
 use crate::ai::prompt::{PromptEditor, interrupted_error};
 
-/// viewport 最大高度（textarea + chrome），随终端尺寸动态缩放，上限 12 行。
-const MAX_VIEWPORT_HEIGHT: u16 = 12;
+/// viewport 最大高度（textarea + chrome），随终端尺寸动态缩放，上限 11 行。
+const MAX_VIEWPORT_HEIGHT: u16 = 11;
 /// textarea 最大行数上限（大终端下的舒适值）。
 const MAX_TEXTAREA_LINES: u16 = 7;
-/// chrome 固定行数：top_rule(1) + model(1) + help(2) + bottom_rule(1)。
-const VIEWPORT_CHROME_LINES: u16 = 5;
+/// chrome 固定行数：top_rule(1) + model(1) + help(2)。
+const VIEWPORT_CHROME_LINES: u16 = 4;
 /// textarea 最小行数，用于 clamp 计算。
 const MIN_TEXTAREA_LINES: u16 = 2;
 /// 空输入时保持更紧凑：只保留 1 行输入区 + 固定 chrome，减少上一轮输出与
@@ -360,15 +360,15 @@ mod tests {
 
     #[test]
     fn multiline_viewport_height_scales_with_terminal() {
-        // 空输入：更紧凑，viewport = 1 行输入区 + chrome(5) = 6
-        assert_eq!(multiline_viewport_height(30, None), 6);
-        assert_eq!(multiline_viewport_height(30, Some("")), 6);
+        // 空输入：更紧凑，viewport = 1 行输入区 + chrome(4) = 5
+        assert_eq!(multiline_viewport_height(30, None), 5);
+        assert_eq!(multiline_viewport_height(30, Some("")), 5);
         // 有预填但内容短于 base：保持 base 大小
-        assert_eq!(multiline_viewport_height(30, Some("one line")), 12);
-        // 小终端：terminal=12, available=10，空输入仍保持 6 行紧凑 viewport
-        assert_eq!(multiline_viewport_height(12, None), 6);
+        assert_eq!(multiline_viewport_height(30, Some("one line")), 11);
+        // 小终端：terminal=12, available=10，空输入仍保持 5 行紧凑 viewport
+        assert_eq!(multiline_viewport_height(12, None), 5);
         // 大终端下空输入仍保持紧凑
-        assert_eq!(multiline_viewport_height(40, None), 6);
+        assert_eq!(multiline_viewport_height(40, None), 5);
     }
 
     #[test]
@@ -378,8 +378,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        // terminal=40: available=38, base_textarea=7, content=20→clamp(7,7)=7, viewport=12
-        assert_eq!(multiline_viewport_height(40, Some(&prefill)), 12);
+        // terminal=40: available=38, base_textarea=7, content=20→clamp(7,7)=7, viewport=11
+        assert_eq!(multiline_viewport_height(40, Some(&prefill)), 11);
         assert_eq!(multiline_viewport_height(10, Some(&prefill)), 8);
         assert_eq!(multiline_viewport_height(4, Some(&prefill)), 2);
         assert_eq!(multiline_viewport_height(4, None), 2); // available=2，仍受可用行数约束
