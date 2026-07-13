@@ -170,6 +170,8 @@ impl PromptEditor {
             }
         };
 
+        let viewport_top_pos = terminal.get_cursor_position().ok();
+
         let result: io::Result<Option<String>> = (|| {
             // 预填内容（编辑已有 memo 场景）：按行载入 textarea，读取后清空。
             let mut textarea: TextArea = match self.pending_prefill.take() {
@@ -234,10 +236,22 @@ impl PromptEditor {
             }
         })();
 
-        // 退出 TUI：清除 ratatui 的 inline viewport 残留内容，
-        // `FromCursorDown` 确保光标以下的区域干净，不污染 scrollback。
+        // 退出 TUI：清除 ratatui 的 inline viewport 残留内容。
+        // `terminal.clear()` 会把光标挪到 viewport 顶部再 FromCursorDown，
+        // 但如果 resize 事件导致内部锚点漂移，clear() 可能未覆盖完整区域，
+        // 旧内容残留在 scrollback 中——用户会看到输入被渲染两次。
+        // 因此先调 terminal.clear()，再用创建 viewport 时保存的锚点坐标
+        // 显式 MoveTo + FromCursorDown 做兜底清除。
         let _ = terminal.clear();
-        let _ = execute!(io::stdout(), Clear(ClearType::FromCursorDown));
+        if let Some(pos) = viewport_top_pos {
+            let _ = execute!(
+                io::stdout(),
+                cursor::MoveTo(pos.x, pos.y),
+                Clear(ClearType::FromCursorDown),
+            );
+        } else {
+            let _ = execute!(io::stdout(), Clear(ClearType::FromCursorDown));
+        }
         let _ = terminal.show_cursor();
         let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = disable_raw_mode();

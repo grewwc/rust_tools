@@ -19,6 +19,13 @@ struct Cli {
         help = "bridge: encode image clipboard as base64 text clipboard (run on LOCAL machine so remote `oo -p` can retrieve it via OSC52)"
     )]
     bridge: bool,
+
+    #[arg(
+        short = 'w',
+        long,
+        help = "watch: run on LOCAL machine; auto-bridge any copied image (keeps original image + adds base64 text) so remote SSH paste just works. Ctrl+C to stop"
+    )]
+    watch: bool,
 }
 
 fn stdin_is_tty() -> bool {
@@ -102,6 +109,13 @@ const DEFAULT_FILE_NAME: &str = "output";
 
 fn main() {
     let cli = Cli::parse();
+
+    if cli.watch {
+        if let Err(e) = clipboardw::image_content::watch_clipboard_bridge() {
+            eprintln!("oo --watch failed: {e}");
+        }
+        return;
+    }
 
     if cli.bridge {
         match clipboardw::image_content::bridge_image_to_text_clipboard() {

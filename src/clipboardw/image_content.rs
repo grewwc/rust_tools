@@ -70,6 +70,148 @@ pub fn bridge_image_to_text_clipboard() -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// Convert an arboard image into a `DynamicImage`.
+#[cfg(target_os = "macos")]
+fn arboard_image_to_dynamic(
+    image: arboard::ImageData,
+) -> Result<image::DynamicImage, Box<dyn std::error::Error>> {
+    let width = image.width as u32;
+    let height = image.height as u32;
+    let data = image.bytes.into_owned();
+    let img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(width, height, data)
+        .ok_or("failed to create image buffer")?;
+    Ok(image::DynamicImage::ImageRgba8(img_buf))
+}
+
+/// Watch the LOCAL clipboard and, whenever a new image is copied, add a base64
+/// text representation alongside the original image (dual-representation).
+///
+/// This lets a remote SSH `a`/`oo -p` retrieve the image via OSC52 (text-only)
+/// while the untouched image representation is still available for local paste.
+///
+/// Runs in the foreground until interrupted (Ctrl+C). Polling `changeCount` is
+/// a cheap integer message send, so the loop stays lightweight.
+#[cfg(target_os = "macos")]
+pub fn watch_clipboard_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    use std::{thread, time::Duration};
+
+    let mut last_seen = pasteboard_change_count();
+    // Signature of the last image we bridged. Guards against reprocessing our
+    // own write, which bumps changeCount (sometimes with a lag that makes the
+    // next poll look like a fresh change).
+    let mut last_sig: Option<[u8; 32]> = None;
+    println!("oo --watch: monitoring clipboard; copied images are bridged for SSH paste. Ctrl+C to stop.");
+
+    loop {
+        thread::sleep(Duration::from_millis(500));
+
+        let current = pasteboard_change_count();
+        if current == last_seen {
+            continue;
+        }
+        last_seen = current;
+
+        // Only act on images; text/other content is left untouched so local
+        // text paste is unaffected.
+        let image = match Clipboard::new().and_then(|mut c| c.get_image()) {
+            Ok(image) => image,
+            Err(_) => continue,
+        };
+
+        let sig = image_signature(&image);
+        if Some(sig) == last_sig {
+            // This is the image we just bridged; nothing new to do.
+            continue;
+        }
+
+        let dynamic = match arboard_image_to_dynamic(image) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("oo --watch: skip (decode failed): {e}");
+                continue;
+            }
+        };
+
+        match write_image_with_text_representation(&dynamic) {
+            Ok(new_count) => {
+                last_seen = new_count;
+                last_sig = Some(sig);
+                println!("oo --watch: bridged image to clipboard (ready for remote paste).");
+            }
+            Err(e) => eprintln!("oo --watch: bridge failed: {e}"),
+        }
+    }
+}
+
+/// Stable signature of a clipboard image (dimensions + raw-byte hash).
+#[cfg(target_os = "macos")]
+fn image_signature(image: &arboard::ImageData) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update((image.width as u64).to_le_bytes());
+    hasher.update((image.height as u64).to_le_bytes());
+    hasher.update(image.bytes.as_ref());
+    hasher.finalize().into()
+}
+
+/// Read the current NSPasteboard `changeCount` (cheap integer message send).
+#[cfg(target_os = "macos")]
+fn pasteboard_change_count() -> isize {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    unsafe {
+        let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+        if pb.is_null() {
+            return 0;
+        }
+        msg_send![pb, changeCount]
+    }
+}
+
+/// Write the image to NSPasteboard with BOTH a PNG image representation and a
+/// base64 text representation. Returns the new `changeCount`.
+#[cfg(target_os = "macos")]
+fn write_image_with_text_representation(
+    dynamic: &image::DynamicImage,
+) -> Result<isize, Box<dyn std::error::Error>> {
+    use objc2::{class, msg_send, runtime::AnyObject};
+    use objc2_foundation::{NSData, NSString};
+
+    let mut png = Vec::new();
+    dynamic.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    let b64 = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(&png)
+    };
+
+    unsafe {
+        let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+        if pb.is_null() {
+            return Err("failed to access general pasteboard".into());
+        }
+
+        let _: isize = msg_send![pb, clearContents];
+
+        let nsdata = NSData::dataWithBytes_length(png.as_ptr().cast(), png.len());
+        let png_type = NSString::from_str("public.png");
+        let png_ok: bool = msg_send![pb, setData: &*nsdata, forType: &*png_type];
+
+        let nstext = NSString::from_str(&b64);
+        let text_type = NSString::from_str("public.utf8-plain-text");
+        let text_ok: bool = msg_send![pb, setString: &*nstext, forType: &*text_type];
+
+        if !png_ok || !text_ok {
+            return Err("failed to write clipboard representations".into());
+        }
+
+        Ok(msg_send![pb, changeCount])
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn watch_clipboard_bridge() -> Result<(), Box<dyn std::error::Error>> {
+    Err("oo --watch is only supported on macOS (run it on your local machine)".into())
+}
+
 pub fn save_to_file(fname: &str) -> Result<(), Box<dyn std::error::Error>> {
     let fname: String = add_suffix(fname, ".jpg", || !fname.contains('.'));
 
