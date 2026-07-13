@@ -6,6 +6,9 @@ use serde_json::Value;
 
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
+use crate::ai::tools::common::{
+    ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
+};
 use crate::commonw::utils::expanduser;
 
 fn params_list_directory() -> Value {
@@ -90,6 +93,24 @@ inventory::submit!(ToolRegistration {
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin", "core"],
     }
+});
+
+// search_files / find_path 是检索类结果：复现代价高，禁止有损压缩（只能零压缩
+// 外溢）；但过时的旧检索结果允许被 LLM 裁剪释放上下文。
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "search_files",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Allow,
+    },
+});
+
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "find_path",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Allow,
+    },
 });
 
 pub(crate) fn execute_list_directory(args: &Value) -> Result<String, String> {

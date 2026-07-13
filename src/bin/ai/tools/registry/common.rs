@@ -92,6 +92,82 @@ pub(crate) fn tool_display_config(name: &str) -> ToolDisplayConfig {
         .unwrap_or_default()
 }
 
+/// 有损压缩策略：控制该工具结果是否允许被行裁剪 / 折叠 / 摘要等有损压缩。
+/// `Never` 表示 precision 结果，压缩路径只能零压缩外溢到磁盘并留指针 stub。
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) enum ToolLossyCompressPolicy {
+    /// 默认：允许有损压缩（普通工具结果，如 `execute_command`）。
+    #[default]
+    Allow,
+    /// 禁止有损压缩：内容复现代价高（如 `read_file` / 检索类 / `plan`），
+    /// 一旦被裁剪模型会反复重跑同一次操作，表现为失忆/原地打转。
+    Never,
+}
+
+/// LLM 引导裁剪策略：控制该工具结果是否允许被模型标记后裁剪成占位符。
+/// 与有损压缩正交——「不可有损压缩」不等于「不可裁剪」：`read_file` 的旧
+/// 版本一旦被模型连续判定过时，就应允许裁剪以释放上下文，而 `plan` 作为
+/// 任务路线图锚点则永不裁剪。
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) enum ToolPrunePolicy {
+    /// 默认：允许被 LLM 引导裁剪（仍受最近窗口保护与连续标记阈值约束）。
+    #[default]
+    Allow,
+    /// 永不裁剪（如 `plan`）。
+    Never,
+}
+
+/// 工具的历史保留策略：把「有损压缩」与「LLM 裁剪」两个正交维度合并声明。
+/// 通过独立的 `ToolHistoryPolicyRegistration` 提交，不改动 `ToolSpec`，
+/// 未注册的工具取默认值（两维度均 `Allow`）。
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) struct ToolHistoryPolicy {
+    pub(crate) lossy_compress: ToolLossyCompressPolicy,
+    pub(crate) prune: ToolPrunePolicy,
+}
+
+impl ToolHistoryPolicy {
+    /// 是否允许对该工具结果做有损压缩（行裁剪/折叠/摘要）。
+    pub(crate) fn allows_lossy_compress(&self) -> bool {
+        matches!(self.lossy_compress, ToolLossyCompressPolicy::Allow)
+    }
+
+    /// 是否允许该工具结果被 LLM 引导裁剪。
+    pub(crate) fn allows_prune(&self) -> bool {
+        matches!(self.prune, ToolPrunePolicy::Allow)
+    }
+}
+
+/// 可选的历史保留策略注册：只给需要偏离默认（`Allow`/`Allow`）的工具使用。
+/// 未注册的工具沿用默认策略，不需要改动现有 `ToolSpec`，与
+/// `ToolDisplayRegistration` / `ToolStreamingRegistration` 的兼容模式一致。
+pub(crate) struct ToolHistoryPolicyRegistration {
+    pub(crate) name: &'static str,
+    pub(crate) policy: ToolHistoryPolicy,
+}
+
+inventory::collect!(ToolHistoryPolicyRegistration);
+
+static TOOL_HISTORY_POLICY_INDEX: LazyLock<SkipMap<String, ToolHistoryPolicy>> =
+    LazyLock::new(|| {
+        let mut index: SkipMap<String, ToolHistoryPolicy> = SkipMap::default();
+        for reg in inventory::iter::<ToolHistoryPolicyRegistration> {
+            let name = reg.name.to_string();
+            if !index.contains_key(&name) {
+                index.insert(name, reg.policy);
+            }
+        }
+        index
+    });
+
+/// 查询某个工具的历史保留策略；未注册的工具返回默认值（两维度均 `Allow`）。
+pub(crate) fn tool_history_policy(name: &str) -> ToolHistoryPolicy {
+    TOOL_HISTORY_POLICY_INDEX
+        .get_ref(&name.to_string())
+        .copied()
+        .unwrap_or_default()
+}
+
 const TOOL_CANCEL_FUTEX_ENV: &str = "__ai_tool_cancel_futex_addr";
 
 pub(crate) fn ensure_process_tool_cancel_futex(
@@ -484,4 +560,42 @@ pub(crate) fn execute_tool_call_with_permissions(
     }
 
     execute_tool_call(tool_call)
+}
+
+#[cfg(test)]
+mod history_policy_tests {
+    use super::*;
+
+    #[test]
+    fn plan_is_never_compressed_and_never_pruned() {
+        let policy = tool_history_policy("plan");
+        assert!(!policy.allows_lossy_compress());
+        assert!(!policy.allows_prune());
+    }
+
+    #[test]
+    fn read_and_search_tools_block_lossy_but_allow_prune() {
+        for name in [
+            "read_file",
+            "read_file_lines",
+            "search_files",
+            "find_path",
+            "text_grep",
+            "code_search",
+        ] {
+            let policy = tool_history_policy(name);
+            assert!(
+                !policy.allows_lossy_compress(),
+                "{name} should block lossy compression"
+            );
+            assert!(policy.allows_prune(), "{name} should allow LLM pruning");
+        }
+    }
+
+    #[test]
+    fn unregistered_tool_defaults_to_allow_both() {
+        let policy = tool_history_policy("execute_command");
+        assert!(policy.allows_lossy_compress());
+        assert!(policy.allows_prune());
+    }
 }

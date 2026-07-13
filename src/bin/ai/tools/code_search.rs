@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::ai::tools::ast_structural::execute_structural_search;
-use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::common::{
+    ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
+    ToolRegistration, ToolSpec,
+};
 use crate::ai::tools::lsp_tools::execute_lsp;
 use crate::ai::tools::search_tools::execute_search_files;
 use crate::ai::tools::text_grep_tools::{ContentSearchOptions, run_content_search};
@@ -118,6 +121,15 @@ inventory::submit!(ToolRegistration {
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin", "core"],
     }
+});
+
+// code_search 是检索类结果：复现代价高，禁止有损压缩；过时旧结果允许被 LLM 裁剪。
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "code_search",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Allow,
+    },
 });
 
 pub(crate) fn execute_code_search(args: &Value) -> Result<String, String> {

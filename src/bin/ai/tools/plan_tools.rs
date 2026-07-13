@@ -3,6 +3,9 @@ use serde_json::Value;
 use crate::ai::tools::common::ToolRegistration;
 use crate::ai::tools::common::ToolSpec;
 use crate::ai::tools::common::{ToolDisplayConfig, ToolDisplayRegistration};
+use crate::ai::tools::common::{
+    ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
+};
 
 fn params_plan() -> Value {
     serde_json::json!({
@@ -114,6 +117,16 @@ inventory::submit!(ToolDisplayRegistration {
     config: ToolDisplayConfig {
         print_args: false,
         print_result: true,
+    },
+});
+
+// plan 是多步任务的路线图锚点：既不做有损压缩，也永不被 LLM 裁剪。
+// 一旦丢失，模型会忘记当前任务的步骤规划而原地打转。
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "plan",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Never,
     },
 });
 

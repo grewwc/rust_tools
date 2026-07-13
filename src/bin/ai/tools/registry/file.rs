@@ -1,6 +1,9 @@
 use serde_json::Value;
 
-use crate::ai::tools::common::{ToolRegistration, ToolSpec, ToolStreamingRegistration};
+use crate::ai::tools::common::{
+    ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
+    ToolRegistration, ToolSpec, ToolStreamingRegistration,
+};
 use crate::ai::tools::service::delete::execute_delete_path;
 use crate::ai::tools::service::file::{
     execute_read_file, execute_read_file_lines, execute_write_file, execute_write_file_streaming,
@@ -89,6 +92,25 @@ inventory::submit!(ToolRegistration {
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["executor", "builtin", "core"],
     }
+});
+
+// read_file / read_file_lines 是高精度 grounding 结果：内容复现代价高，禁止
+// 有损压缩（只能零压缩外溢到磁盘留指针）；但旧版本一旦被模型连续判定过时，
+// 就允许 LLM 裁剪释放上下文——「不可有损压缩」不等于「不可裁剪」。
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "read_file",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Allow,
+    },
+});
+
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "read_file_lines",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Allow,
+    },
 });
 
 inventory::submit!(ToolRegistration {

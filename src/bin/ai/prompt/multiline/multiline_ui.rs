@@ -18,7 +18,12 @@ use super::{
 };
 use crate::ai::prompt::{PromptEditor, interrupted_error};
 
-const COMPACT_VIEWPORT_HEIGHT: u16 = 8;
+/// 空输入时的紧凑 viewport 高度：textarea(1) + model(1) + help(1) = 3。
+/// 用户开始输入后会 resize 到 `ACTIVE_VIEWPORT_HEIGHT`，确保 textarea 有足够编辑空间。
+const COMPACT_VIEWPORT_HEIGHT: u16 = 3;
+/// 有内容时的 viewport 高度：top_margin(1) + textarea(4) + model(1) + help(2) = 8。
+/// 空→非空首次输入时由事件循环触发 resize 从 COMPACT_VIEWPORT_HEIGHT 切换到此值。
+const ACTIVE_VIEWPORT_HEIGHT: u16 = 8;
 const MAX_VIEWPORT_HEIGHT: u16 = 20;
 const VIEWPORT_CHROME_LINES: u16 = 5; // top margin + model line + spacer + help(2)
 const MIN_TEXTAREA_LINES: u16 = 3;
@@ -50,9 +55,8 @@ fn clear_inline_viewport_preserving_cursor<B: ratatui::backend::Backend>(
 fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
     let available_rows = terminal_rows.saturating_sub(2).max(1);
     if prefill.is_none_or(str::is_empty) {
-        // inline viewport 高度在创建时一次性固定，之后不随打字增长。空输入若给太小
-        // （如 4 行），一旦开始输入，完整编辑器布局需要 8 行 chrome，textarea 会被挤没，
-        // 导致“看不到输入文本”。因此空输入也必须给足能容纳编辑器的高度。
+        // 空输入先用紧凑 viewport（COMPACT_VIEWPORT_HEIGHT），用户首次输入时
+        // 事件循环会 resize 到 ACTIVE_VIEWPORT_HEIGHT，确保 textarea 有足够编辑空间。
         return COMPACT_VIEWPORT_HEIGHT.min(available_rows);
     }
     let prefill_rows = prefill
@@ -158,7 +162,7 @@ impl PromptEditor {
         // Inline viewport 初始化会通过 append_lines() 真实撑开终端区域。空输入默认保持
         // 紧凑，避免每轮回答后和下一轮光标之间出现大段空白；编辑已有内容时再按预填行数
         // 放大，给 textarea 保留足够空间。
-        let base_viewport_height = terminal_size()
+        let mut base_viewport_height = terminal_size()
             .map(|(_, h)| multiline_viewport_height(h, self.pending_prefill.as_deref()))
             .unwrap_or(COMPACT_VIEWPORT_HEIGHT);
 
@@ -187,8 +191,21 @@ impl PromptEditor {
             // 面板出现/消失/候选数变化时，据此重建 viewport 让面板获得足够高度，
             // 而输入框行数保持不变。
             let mut fitted_completion_items: Option<usize> = None;
+            // 空→非空首次输入时，将 viewport 从紧凑高度 resize 到编辑高度。
+            let mut resized_for_content = false;
 
             loop {
+                // 空→非空：首次输入时将 viewport 从 COMPACT 放大到 ACTIVE，
+                // 给 textarea 腾出足够编辑空间；后续输入不再重复 resize。
+                let has_content = !textarea.lines().join("").is_empty();
+                if has_content && !resized_for_content {
+                    let target = ACTIVE_VIEWPORT_HEIGHT
+                        .min(terminal_size().map(|(_, h)| h.saturating_sub(2)).unwrap_or(ACTIVE_VIEWPORT_HEIGHT).max(1));
+                    resize_inline_viewport(&mut terminal, target)?;
+                    base_viewport_height = target;
+                    resized_for_content = true;
+                }
+
                 // 面板状态变化时，重建 inline viewport 以匹配面板所需高度。
                 let current_items = completion_panel.as_ref().map(|p| p.items.len());
                 if current_items != fitted_completion_items {
@@ -326,8 +343,9 @@ mod tests {
 
     #[test]
     fn multiline_viewport_height_stays_compact_for_empty_prompt() {
-        assert_eq!(multiline_viewport_height(30, None), 8);
-        assert_eq!(multiline_viewport_height(30, Some("")), 8);
+        // 空输入返回 COMPACT_VIEWPORT_HEIGHT（3），有预填内容时扩大到能容纳编辑器的高度
+        assert_eq!(multiline_viewport_height(30, None), 3);
+        assert_eq!(multiline_viewport_height(30, Some("")), 3);
         assert_eq!(multiline_viewport_height(30, Some("one line")), 8);
     }
 

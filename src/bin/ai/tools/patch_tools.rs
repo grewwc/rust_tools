@@ -519,6 +519,69 @@ fn find_best_partial_match(
     best.filter(|b| b.matches > 0)
 }
 
+fn format_char_with_code_point(ch: char) -> String {
+    format!("{ch:?} (U+{:04X})", ch as u32)
+}
+
+/// 描述两行文本首个不同字符的位置与 Unicode code point，便于快速发现
+/// 智能引号/全半角等"看起来像一样"的字符差异。
+fn describe_first_char_mismatch(expected: &str, actual: &str) -> Option<String> {
+    let mut column = 1usize;
+    let mut expected_chars = expected.chars();
+    let mut actual_chars = actual.chars();
+
+    loop {
+        match (expected_chars.next(), actual_chars.next()) {
+            (Some(exp), Some(act)) if exp == act => {
+                column += 1;
+            }
+            (Some(exp), Some(act)) => {
+                return Some(format!(
+                    "column {}: expected {}, found {}",
+                    column,
+                    format_char_with_code_point(exp),
+                    format_char_with_code_point(act)
+                ));
+            }
+            (Some(exp), None) => {
+                return Some(format!(
+                    "column {}: expected {}, found end of line",
+                    column,
+                    format_char_with_code_point(exp)
+                ));
+            }
+            (None, Some(act)) => {
+                return Some(format!(
+                    "column {}: expected end of line, found {}",
+                    column,
+                    format_char_with_code_point(act)
+                ));
+            }
+            (None, None) => return None,
+        }
+    }
+}
+
+fn describe_aligned_block_first_mismatch(
+    expected_lines: &[&str],
+    actual_lines: &[String],
+    start: usize,
+) -> Option<String> {
+    for (offset, expected) in expected_lines.iter().enumerate() {
+        let actual = actual_lines.get(start + offset).map(String::as_str).unwrap_or("");
+        if expected == &actual {
+            continue;
+        }
+        let detail = describe_first_char_mismatch(expected, actual)?;
+        let line_no = start + offset + 1;
+        return Some(format!(
+            "First differing char near declared position is on line {} at {}.\n",
+            line_no, detail
+        ));
+    }
+    None
+}
+
 /// 构造带上下文的 "context mismatch" 错误：列出 patch 期望匹配的行，以及原文件
 /// 在标称位置附近的实际行，帮助模型快速自我修正，而不是只看到一句 "context mismatch"。
 fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> String {
@@ -553,9 +616,12 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
                 best.mismatches.len()
             ));
             for (file_line, exp, act) in best.mismatches.iter().take(10) {
+                let first_diff = describe_first_char_mismatch(exp, act)
+                    .map(|detail| format!("; first differing char at {detail}"))
+                    .unwrap_or_default();
                 msg.push_str(&format!(
-                    "  line {}: expected {:?}, found {:?}\n",
-                    file_line, exp, act
+                    "  line {}: expected {:?}, found {:?}{}\n",
+                    file_line, exp, act, first_diff
                 ));
             }
             if best.mismatches.len() > 10 {
@@ -592,6 +658,9 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
                 "File has {} line(s); declared position is out of range.\n",
                 orig_lines.len()
             ));
+        }
+        if let Some(detail) = describe_aligned_block_first_mismatch(&expected, orig_lines, nominal) {
+            msg.push_str(&detail);
         }
     }
 
@@ -947,6 +1016,16 @@ mod tests {
         // 错误里应回显期望行与实际文件内容，便于模型自我修正。
         assert!(err.contains("not_present"), "err was: {err}");
         assert!(err.contains("beta"), "err was: {err}");
+    }
+
+    #[test]
+    fn apply_unified_patch_context_mismatch_reports_unicode_code_points() {
+        let original = "let quote = \"hi\";\n";
+        let patch = "@@ -1,1 +1,1 @@\n-let quote = “hi”;\n+let quote = \"changed\";\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("context mismatch"), "err was: {err}");
+        assert!(err.contains("U+201C"), "err was: {err}");
+        assert!(err.contains("U+0022"), "err was: {err}");
     }
 
     #[test]
@@ -1518,7 +1597,6 @@ mod tests {
         // 并报告首行的不一致。
         let original = "aaa\nbbb\nccc\nddd\neee\n";
         // 首行 "wrong" 不在文件中，但 "ccc"、"ddd" 在
-        let patch = "@@ -1,3 +1,1 @@\n-wrong\n-ccc\nddd\n+changed\n";
         let patch = "@@ -1,3 +1,1 @@\n-wrong\n-ccc\n ddd\n+changed\n";
         let err = apply_unified_patch(original, patch).unwrap_err();
         assert!(err.contains("context mismatch"), "err was: {err}");

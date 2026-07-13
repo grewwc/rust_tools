@@ -31,14 +31,27 @@ execution policy, sandboxing, path resolution, or progressive loading.
    mirrors the `ToolStreamingRegistration` compatibility pattern. Query via
    `tool_display_config(name)`; never hardcode tool names in `print_run_status`
    or `driver/print.rs`.
-7. Temporary / scratch files should use `write_file(temp=true)`, which writes
+7. Tool history-retention behavior is declared per-tool via an optional
+   `ToolHistoryPolicyRegistration` inventory submission in the tool's own file
+   (same bypass pattern as rule 6), **not** by hardcoding name lists in the
+   compression code. `ToolHistoryPolicy` has two **orthogonal** dimensions:
+   `lossy_compress` (`Allow`/`Never`) gates line-trimming/folding/summarizing;
+   `prune` (`Allow`/`Never`) gates LLM-guided pruning of superseded results.
+   Both default to `Allow` (unregistered tools). `plan` is `Never`/`Never`;
+   `read_file`/`read_file_lines`/`search_files`/`find_path`/`text_grep`/
+   `code_search` are `Never`/`Allow` (precision results are never lossy-compressed
+   but may still be pruned once superseded). Query via `tool_history_policy(name)`;
+   the compression side wraps it as `is_non_compressible_tool` (lossy dimension)
+   and `is_prune_protected_tool` (prune dimension). Do not reintroduce name-keyed
+   `if`/`match` chains in `history/compress/`.
+8. Temporary / scratch files should use `write_file(temp=true)`, which writes
    under `runtime_ctx::temp_dir()` (per-session, co-located with tool-overflow,
    outside the project dir) AND registers the file in a persistent JSON registry
    (`storage::temp_registry`). `file_path` must be a relative filename only;
    absolute paths and directory components are stripped/rejected. `delete_path`
    ONLY deletes files in this registry — unregistered files are always refused.
    Never rely on `execute_command` for deletion — `rm` is blocked by the sandbox.
-8. `execute_command` runs each command via `setsid` in its own process group.
+9. `execute_command` runs each command via `setsid` in its own process group.
    If the command backgrounds a long-lived process (e.g. `python app.py &`),
    the foreground call returns and the surviving process-group pgid is recorded
    in an **in-memory, process-global** registry keyed by `session_id`

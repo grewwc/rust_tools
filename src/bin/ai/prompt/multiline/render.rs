@@ -35,9 +35,11 @@ fn popup_layout_config(
     has_model_label: bool,
 ) -> PopupLayoutConfig {
     let compact_empty = !has_completion_panel && !has_status_msg && current_content.is_empty();
-    // 始终保留 1 行顶部边距，避免空输入 → 有内容时 textarea 整体下移一行的视觉跳变。
-    let top_margin: u16 = 1;
-    let help_lines = 2;
+    // 紧凑空输入场景去掉顶部边距，让光标紧贴上次输出底部，最大限度减少空白行；
+    // 编辑态保留 1 行顶部边距，避免 textarea 整体下移的视觉跳变。
+    let top_margin: u16 = if compact_empty { 0 } else { 1 };
+    // 紧凑空输入只保留 1 行 help（节省垂直空间），编辑态恢复 2 行完整帮助。
+    let help_lines: u16 = if compact_empty { 1 } else { 2 };
     let model_header_lines = if has_model_label { 1 } else { 0 };
     let spacer_lines = if compact_empty {
         0
@@ -638,8 +640,9 @@ mod tests {
     #[test]
     fn empty_prompt_keeps_consistent_top_margin() {
         let layout = popup_layout_config(8, "", 1, 0, false, false, true);
-        assert_eq!(layout.top_margin, 1);
-        assert_eq!(layout.help_lines, 2);
+        // 紧凑空输入：top_margin=0, help=1，最大限度减少空白行
+        assert_eq!(layout.top_margin, 0);
+        assert_eq!(layout.help_lines, 1);
         assert_eq!(layout.model_header_lines, 1);
         assert_eq!(layout.spacer_lines, 0);
         assert_eq!(layout.min_textarea_lines, 1);
@@ -681,7 +684,8 @@ mod tests {
             .clamp(40, 180)
             .min(viewport_area.width);
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
-        let expected = Position::new(popup_x + 1, viewport_area.y + 1);
+        // 紧凑模式 top_margin=0，光标紧贴 viewport 顶部
+        let expected = Position::new(popup_x + 1, viewport_area.y);
         terminal.backend_mut().assert_cursor_position(expected);
     }
 }

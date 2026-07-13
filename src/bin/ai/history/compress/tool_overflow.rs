@@ -146,26 +146,13 @@ pub(super) fn build_tool_call_name_index(messages: &[Message]) -> FxHashMap<Stri
 /// 超阈值时只做"零压缩外溢到会话文件 + 留指针 stub"。这类输出复现代价高，
 /// 一旦被压掉模型就会反复重跑同一次检索（典型失忆/原地打转症状）。
 ///
-/// 注意：这里的名字必须与本 agent **实际注册**的工具名一致
-/// （见 `src/bin/ai/tools/`）。早期版本误用了 VS Code Copilot 的工具名
-/// （`file_search` / `semantic_search` / `fetch_webpage` / `read_page` /
-/// `read_notebook_cell_output`）——这些工具在本 agent 里根本不存在，导致
-/// `code_search` / `search_files` / `web_search` / `web_fetch` / `text_grep`
-/// 等真正昂贵的检索结果统统被当作可压缩内容裁掉，引发重复检索。
+/// 现在改为查询工具自身声明的历史保留策略
+/// （`ToolHistoryPolicyRegistration`，见各工具注册文件），而非在此硬编码
+/// 工具名列表。默认未注册的工具允许有损压缩；只有显式声明
+/// `lossy_compress: Never` 的工具（`read_file` / 检索类 / `plan`）返回 true。
+/// 注意：这与「是否允许 LLM 裁剪」是正交维度——见 `llm_prune.rs`。
 pub(super) fn is_non_compressible_tool(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "read_file"
-            | "read_file_lines"
-            | "find_path"
-            | "text_grep"
-            | "search_files"
-            | "code_search"
-            // plan 是多步任务的路线图锚点，体量小但价值高。一旦被 lossy 裁剪或
-            // 整组折叠成 stub，模型就会丢失当前任务的步骤规划，表现为中途"忘了
-            // 在做什么"而原地打转。保留全文成本可忽略，故列入不可压缩集合。
-            | "plan"
-    )
+    !crate::ai::tools::registry::common::tool_history_policy(tool_name).allows_lossy_compress()
 }
 
 fn write_preserved_tool_overflow_file(

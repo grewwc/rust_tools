@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use regex::{Regex, RegexBuilder};
 use serde_json::Value;
 
-use crate::ai::tools::common::{ToolRegistration, ToolSpec};
+use crate::ai::tools::common::{
+    ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
+    ToolRegistration, ToolSpec,
+};
 
 const MAX_OUTPUT_CHARS: usize = 32_000;
 const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
@@ -630,6 +633,15 @@ inventory::submit!(ToolRegistration {
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["builtin", "core"],
     }
+});
+
+// text_grep 是检索类结果：复现代价高，禁止有损压缩；过时旧结果允许被 LLM 裁剪。
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "text_grep",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Allow,
+    },
 });
 
 pub(crate) fn execute_text_grep(args: &Value) -> Result<String, String> {

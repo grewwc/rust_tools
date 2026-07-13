@@ -11,8 +11,9 @@
 //! - user / system / plan / assistant / internal_note 等角色即
 //!   使被标记也永远不会被裁剪（见 `is_protected_role`）。
 //! - 仅 `role == "tool"` 且拥有 `tool_call_id` 的消息才可能被裁剪。
-//! - `read_file` / `code_search` / `text_grep` / `plan` 等不可压缩工具结果
-//!   永远不会被裁剪。
+//! - 工具自身通过 `ToolHistoryPolicyRegistration` 声明 `prune: Never` 的结果
+//!   （如 `plan`）永远不会被裁剪；`read_file` / 检索类结果虽「不可有损压缩」，
+//!   但**允许**在过时后被 LLM 裁剪（两个维度正交）。
 //! - 连续被标记 **PRUNE_THRESHOLD** 次后，消息内容被替换为简短占位符
 //!   （保留消息结构、不删除，避免破坏 tool_call ↔ tool_response 配对）。
 //! - 如果某条消息在某轮未被标记，其计数重置为 0（"连续"语义）。
@@ -29,7 +30,15 @@ use serde_json::Value;
 
 use crate::ai::history::types::Message;
 
-use super::tool_overflow::{build_tool_call_name_index, is_non_compressible_tool};
+use super::tool_overflow::build_tool_call_name_index;
+
+/// 判断某工具结果是否被其注册策略标记为「永不 LLM 裁剪」。
+/// 查询工具自身声明的 [`ToolHistoryPolicy`]（见各工具注册文件），
+/// 而非硬编码工具名。默认（未注册）允许裁剪；只有显式声明
+/// `prune: Never` 的工具（如 `plan`）返回 true。
+fn is_prune_protected_tool(tool_name: &str) -> bool {
+    !crate::ai::tools::registry::common::tool_history_policy(tool_name).allows_prune()
+}
 
 /// 连续被标记多少次后才裁剪。
 pub(crate) const PRUNE_THRESHOLD: u8 = 3;
@@ -40,14 +49,16 @@ pub(crate) const PRUNE_PROMPT_MIN_MESSAGES: usize = 20;
 /// 系统提示中注入的裁剪协议说明。
 /// 保持简短，避免占用过多 token。
 pub(crate) const PRUNE_PROTOCOL_PROMPT: &str = "\n## Context Management Protocol\n\
-You can mark outdated tool results that are no longer needed for the current task.\n\
-To do so, include a hidden self-note in your response with the tool_call_ids to prune:\n\
+When your context holds outdated tool results, actively reclaim space by marking them.\n\
+Include a hidden self-note listing the tool_call_ids to prune:\n\
 `<meta:self_note>prune:call_abc,call_xyz</meta:self_note>`\n\
+Mark any tool result that is now superseded or no longer needed — including old file\n\
+reads and code/search results whose content you have already used, that you have since\n\
+re-read, or that describe code you have already edited.\n\
 Rules:\n\
-- Only mark ordinary tool results you are certain are no longer needed.\n\
-- Never mark user messages, system instructions, assistant messages, plans, file reads, code/search results, or recent tool results.\n\
-- Marking is advisory: the system may ignore marks for important messages.\n\
-- If also writing a normal self_note, put `prune:` on its own line inside the same hidden note.";
+- Never mark user messages, system instructions, assistant messages, plans, or the most recent tool results.\n\
+- Marking is advisory and reversible: the system keeps a result until you mark it on several consecutive turns, and always protects recent results and plans.\n\
+- Put the `prune:` directive on its own line; if you also write a normal self_note, keep it in the same hidden note.";
 
 /// 判断该角色的消息是否受保护（永不被裁剪）。
 fn is_protected_role(role: &str) -> bool {
@@ -137,9 +148,10 @@ pub(crate) fn update_prune_marks(
 
 /// 收集当前上下文中允许被 LLM 引导裁剪的 tool_call_id。
 ///
-/// 这里复用既有 tool 压缩保护策略：
+/// 保护策略：
 /// - 最近 `KEEP_RECENT_TOOL_MESSAGES` 条 tool 结果保留全文。
-/// - `is_non_compressible_tool` 标记的精确读取/检索/plan 工具保留全文。
+/// - 工具注册策略声明 `prune: Never` 的结果（如 `plan`）永不裁剪。
+///   注意 `read_file` / 检索类虽「不可有损压缩」但**允许**裁剪。
 pub(crate) fn active_prunable_tool_ids(messages: &[Message]) -> FxHashSet<String> {
     let protected_ids = protected_tool_call_ids(messages);
     messages
@@ -176,7 +188,7 @@ fn protected_tool_call_ids(messages: &[Message]) -> FxHashSet<String> {
         }
         if id_to_tool_name
             .get(tool_call_id)
-            .is_some_and(|name| is_non_compressible_tool(name))
+            .is_some_and(|name| is_prune_protected_tool(name))
         {
             protected.insert(tool_call_id.clone());
         }
@@ -200,8 +212,8 @@ pub(crate) struct PruneReport {
 /// 将计数 >= PRUNE_THRESHOLD 的 tool 消息内容替换为占位符。
 /// 不删除消息、不改变数组长度。
 /// 受 `protected_tool_call_ids` 保护的消息（最近 `KEEP_RECENT_TOOL_MESSAGES`
-/// 条 tool 结果、以及 `is_non_compressible_tool` 精确读取/检索/plan 工具）
-/// 永不被裁剪，避免误裁剪当前轮所需结果或高价值检索。
+/// 条 tool 结果、以及注册策略声明 `prune: Never` 的工具，如 `plan`）
+/// 永不被裁剪，避免误裁剪当前轮所需结果或任务路线图锚点。
 ///
 /// 返回本次裁剪的统计报告（供调用方打印终端简讯）。
 pub(crate) fn apply_pruning(
@@ -566,6 +578,38 @@ mod tests {
         assert!(ids.contains("call_old"));
         assert!(!ids.contains("call_plan"));
         assert!(!ids.contains("call_recent_1"));
+    }
+
+    /// 解耦不变量：`read_file` 声明 `lossy_compress: Never` 但 `prune: Allow`，
+    /// 因此虽然「不可有损压缩」，其过时旧结果仍可被 LLM 裁剪。而 `plan`
+    /// 声明 `prune: Never`，永不进入裁剪候选。
+    #[test]
+    fn test_active_prunable_allows_read_file_but_protects_plan() {
+        let messages = vec![
+            make_assistant_tool_call("call_plan", "plan"),
+            make_tool_message("call_plan", "task plan"),
+            make_assistant_tool_call("call_read", "read_file"),
+            make_tool_message("call_read", "old file contents already used"),
+            make_assistant_tool_call("call_recent_1", "execute_command"),
+            make_tool_message("call_recent_1", "recent 1"),
+            make_assistant_tool_call("call_recent_2", "execute_command"),
+            make_tool_message("call_recent_2", "recent 2"),
+            make_assistant_tool_call("call_recent_3", "execute_command"),
+            make_tool_message("call_recent_3", "recent 3"),
+            make_assistant_tool_call("call_recent_4", "execute_command"),
+            make_tool_message("call_recent_4", "recent 4"),
+            make_assistant_tool_call("call_recent_5", "execute_command"),
+            make_tool_message("call_recent_5", "recent 5"),
+            make_assistant_tool_call("call_recent_6", "execute_command"),
+            make_tool_message("call_recent_6", "recent 6"),
+        ];
+
+        let ids = active_prunable_tool_ids(&messages);
+
+        // read_file 现在允许裁剪（旧行为下会被排除）。
+        assert!(ids.contains("call_read"));
+        // plan 仍受注册策略保护，永不裁剪。
+        assert!(!ids.contains("call_plan"));
     }
 
     #[test]

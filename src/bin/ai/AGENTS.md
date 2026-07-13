@@ -30,16 +30,22 @@ actually touches that subsystem.
 3. LLM-guided pruning (`history/compress/llm_prune.rs`): the model marks outdated
    tool results via `<meta:self_note>prune:id1,id2</meta:self_note>`; after
    `PRUNE_THRESHOLD` (3) consecutive marks the content is replaced with a
-   placeholder. It must reuse the existing tool-result protection policy:
-   `is_non_compressible_tool` results and the most recent `KEEP_RECENT_TOOL_MESSAGES`
-   tool messages are ignored even if marked. Injected in `prepare_turn`; marks are
-   parsed from both tool-call and final-response model turns. Does not delete messages
-   or alter existing compression logic.
+   placeholder. Prune protection is driven by each tool's registered
+   `ToolHistoryPolicy.prune` (see rule 6 in `tools/AGENTS.md`), **not** by
+   `is_non_compressible_tool`: only tools declaring `prune: Never` (e.g. `plan`)
+   plus the most recent `KEEP_RECENT_TOOL_MESSAGES` tool messages are ignored
+   even if marked. Crucially, `read_file`/search results are lossy-incompressible
+   yet **prunable** once superseded — the two dimensions are orthogonal. Injected
+   in `prepare_turn`; marks are parsed from both tool-call and final-response model
+   turns. Does not delete messages or alter existing compression logic.
 4. Non-compressible tool results (`read_file` etc.) keep every **distinct** content
    version verbatim, but `dedup_repeated_tool_results` collapses **byte-identical**
    repeats (same name+args+content hash) into a re-read-suppressing stub. This breaks
-   the "repeated full re-read" amnesia loop losslessly. Invariant: dedup MUST run
-   **before** `prepare_tool_messages_structured` (offload) in every compression path —
+   the "repeated full re-read" amnesia loop losslessly. "Non-compressible" is decided
+   by each tool's registered `ToolHistoryPolicy.lossy_compress == Never`, queried via
+   `is_non_compressible_tool` (a thin wrapper over `tool_history_policy`), not a
+   hardcoded name list. Invariant: dedup MUST run **before**
+   `prepare_tool_messages_structured` (offload) in every compression path —
    offload rewrites identical results into stubs with unique temp-file paths, which
    would defeat content-hash matching.
 
