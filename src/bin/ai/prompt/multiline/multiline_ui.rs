@@ -5,18 +5,18 @@ use crossterm::{
     cursor,
     event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size, Clear, ClearType},
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size as terminal_size},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use tui_textarea::TextArea;
 
 use super::{
-    completion_panel::{CompletionPanel, PendingTabCompletion},
-    events::{handle_multiline_event, EventLoopAction, RecentTextInput},
-    render::render_multiline_popup,
     MultilineHistoryState,
+    completion_panel::{CompletionPanel, PendingTabCompletion},
+    events::{EventLoopAction, RecentTextInput, handle_multiline_event},
+    render::render_multiline_popup,
 };
-use crate::ai::prompt::{interrupted_error, PromptEditor};
+use crate::ai::prompt::{PromptEditor, interrupted_error};
 
 /// viewport 最大高度（textarea + chrome），随终端尺寸动态缩放，上限 10 行。
 const MAX_VIEWPORT_HEIGHT: u16 = 10;
@@ -26,6 +26,9 @@ const MAX_TEXTAREA_LINES: u16 = 7;
 const VIEWPORT_CHROME_LINES: u16 = 3;
 /// textarea 最小行数，用于 clamp 计算。
 const MIN_TEXTAREA_LINES: u16 = 2;
+/// 空输入时保持更紧凑：只保留 1 行输入区 + 固定 chrome，减少上一轮输出与
+/// model/help 区之间的空白。
+const EMPTY_VIEWPORT_HEIGHT: u16 = 1 + VIEWPORT_CHROME_LINES;
 
 /// 补全面板一次最多显示的候选行数，与 `render::COMPLETION_WINDOW` 对齐。
 const PANEL_COMPLETION_WINDOW: u16 = 12;
@@ -52,12 +55,14 @@ fn clear_inline_viewport_preserving_cursor<B: ratatui::backend::Backend>(
 
 fn multiline_viewport_height(terminal_rows: u16, prefill: Option<&str>) -> u16 {
     let available_rows = terminal_rows.saturating_sub(2).max(1);
+    // 空输入默认保持紧凑，避免把 cursor 放在一个很高的空白 textarea 左上角。
+    if prefill.is_none_or(str::is_empty) {
+        return EMPTY_VIEWPORT_HEIGHT
+            .min(available_rows)
+            .min(MAX_VIEWPORT_HEIGHT);
+    }
     // textarea 基础行数：取 terminal 可用行数的 1/4，至少 MIN、最多 MAX
     let base_textarea = (available_rows / 4).clamp(MIN_TEXTAREA_LINES, MAX_TEXTAREA_LINES);
-    let base_viewport = base_textarea.saturating_add(VIEWPORT_CHROME_LINES);
-    if prefill.is_none_or(str::is_empty) {
-        return base_viewport.min(available_rows).min(MAX_VIEWPORT_HEIGHT);
-    }
     // 有预填内容时，textarea 行数不小于 base 且能容纳内容，最多 MAX_TEXTAREA_LINES
     let content_rows = prefill.map(|text| text.lines().count().max(1)).unwrap_or(1) as u16;
     let textarea = content_rows.clamp(base_textarea, MAX_TEXTAREA_LINES);
@@ -138,6 +143,24 @@ fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>)
     Ok(())
 }
 
+fn submitted_input_preview_lines(content: &str) -> Vec<String> {
+    let mut rendered = Vec::new();
+    let mut lines = content.lines();
+    if let Some(first) = lines.next() {
+        rendered.push(format!("\x1b[2m> {first}\x1b[0m"));
+        for line in lines {
+            rendered.push(format!("\x1b[2m  {line}\x1b[0m"));
+        }
+    }
+    rendered
+}
+
+fn print_submitted_input_preview(content: &str) {
+    for line in submitted_input_preview_lines(content) {
+        println!("{line}");
+    }
+}
+
 impl PromptEditor {
     pub(in crate::ai::prompt) fn read_multi_line_tui(&mut self) -> io::Result<Option<String>> {
         enable_raw_mode()?;
@@ -169,7 +192,9 @@ impl PromptEditor {
             }
         };
 
-        let viewport_top_pos = terminal.get_cursor_position().ok();
+        // 退出时按“最后一次实际渲染到哪里”来清理 viewport；不能依赖创建 Terminal
+        // 那一刻的 cursor 位置，因为补全面板/textarea 扩容会重建 inline viewport。
+        let mut last_viewport_top_row: Option<u16> = None;
 
         let result: io::Result<Option<String>> = (|| {
             // 预填内容（编辑已有 memo 场景）：按行载入 textarea，读取后清空。
@@ -219,6 +244,7 @@ impl PromptEditor {
 
                 terminal
                     .draw(|f| {
+                        last_viewport_top_row = Some(f.area().y);
                         render_multiline_popup(
                             f,
                             &mut textarea,
@@ -251,13 +277,16 @@ impl PromptEditor {
             }
         })();
 
-        // 退出 TUI：先 drop terminal 让 ratatui 清理 inline viewport，
-        // 再用创建 viewport 时保存的锚点坐标做兜底清除，确保无残留空白行。
+        // 退出 TUI：先让 ratatui 按“当前实际 viewport 状态”清一次，
+        // 再用最后一次渲染时记录的顶行做兜底清除，确保补全面板/扩容 textarea
+        // 都不会留下残影。
+        let _ = terminal.hide_cursor();
+        let _ = terminal.clear();
         drop(terminal);
-        if let Some(pos) = viewport_top_pos {
+        if let Some(top_row) = last_viewport_top_row {
             let _ = execute!(
                 io::stdout(),
-                cursor::MoveTo(pos.x, pos.y),
+                cursor::MoveTo(0, top_row),
                 Clear(ClearType::FromCursorDown),
             );
         } else {
@@ -276,13 +305,7 @@ impl PromptEditor {
         };
         if let Some(content) = &result {
             self.save_history_entry(content);
-            let mut lines = content.lines();
-            if let Some(first) = lines.next() {
-                println!("\x1b[2m> {first}\x1b[0m");
-            }
-            for line in lines {
-                println!("\x1b[2m  {line}\x1b[0m");
-            }
+            print_submitted_input_preview(content);
         }
         Ok(result)
     }
@@ -292,13 +315,13 @@ impl PromptEditor {
 mod tests {
     use super::{
         clear_inline_viewport_preserving_cursor, multiline_viewport_height,
-        viewport_height_with_completion,
+        submitted_input_preview_lines, viewport_height_with_completion,
     };
     use ratatui::{
+        Terminal, TerminalOptions, Viewport,
         backend::TestBackend,
         layout::{Position, Rect},
         widgets::{Paragraph, Widget},
-        Terminal, TerminalOptions, Viewport,
     };
 
     #[test]
@@ -337,16 +360,15 @@ mod tests {
 
     #[test]
     fn multiline_viewport_height_scales_with_terminal() {
-        // 空输入：viewport = textarea(available/4, clamp 2-7) + chrome(3)
-        // terminal=30: available=28, textarea=7, viewport=10
-        assert_eq!(multiline_viewport_height(30, None), 10);
-        assert_eq!(multiline_viewport_height(30, Some("")), 10);
+        // 空输入：更紧凑，viewport = 1 行输入区 + chrome(3) = 4
+        assert_eq!(multiline_viewport_height(30, None), 4);
+        assert_eq!(multiline_viewport_height(30, Some("")), 4);
         // 有预填但内容短于 base：保持 base 大小
         assert_eq!(multiline_viewport_height(30, Some("one line")), 10);
-        // 小终端：terminal=12, available=10, textarea=2, viewport=5
-        assert_eq!(multiline_viewport_height(12, None), 5);
-        // 大终端：terminal=40, available=38, textarea=7, viewport=10
-        assert_eq!(multiline_viewport_height(40, None), 10);
+        // 小终端：terminal=12, available=10，空输入仍保持 4 行紧凑 viewport
+        assert_eq!(multiline_viewport_height(12, None), 4);
+        // 大终端下空输入仍保持紧凑
+        assert_eq!(multiline_viewport_height(40, None), 4);
     }
 
     #[test]
@@ -360,7 +382,7 @@ mod tests {
         assert_eq!(multiline_viewport_height(40, Some(&prefill)), 10);
         assert_eq!(multiline_viewport_height(10, Some(&prefill)), 8);
         assert_eq!(multiline_viewport_height(4, Some(&prefill)), 2);
-        assert_eq!(multiline_viewport_height(4, None), 2); // available=2
+        assert_eq!(multiline_viewport_height(4, None), 2); // available=2，仍受可用行数约束
     }
 
     #[test]
@@ -381,5 +403,20 @@ mod tests {
         assert_eq!(viewport_height_with_completion(12, 4, Some(50)), 10);
         // base 本身也受 available 约束。
         assert_eq!(viewport_height_with_completion(6, 8, None), 4);
+    }
+
+    #[test]
+    fn submitted_input_preview_formats_single_and_multi_line_content() {
+        assert_eq!(
+            submitted_input_preview_lines("hello"),
+            vec!["\u{1b}[2m> hello\u{1b}[0m".to_string()]
+        );
+        assert_eq!(
+            submitted_input_preview_lines("hello\nworld"),
+            vec![
+                "\u{1b}[2m> hello\u{1b}[0m".to_string(),
+                "\u{1b}[2m  world\u{1b}[0m".to_string()
+            ]
+        );
     }
 }
