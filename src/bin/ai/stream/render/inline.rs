@@ -18,9 +18,10 @@ pub(super) fn terminal_cell_width(ch: char) -> usize {
     }
     // 现代 macOS 终端把 Miscellaneous Symbols（U+2600-U+26FF）、
     // Miscellaneous Technical（U+2300-U+23FF）、Dingbats（U+2700-U+27BF）
-    // 等块中的 ambiguous-width 符号当作 emoji 渲染为 2 列。unicode-width
+    // 以及部分 Geometric Shapes 里的评分/涨跌标记（△▽▲▼）等块中的
+    // ambiguous-width 符号当作 emoji 渲染为 2 列。unicode-width
     // 对这些字符返回 1（ambiguous），但终端实际占 2 列。若不修正，含 ⚠ ☎ ✂
-    // 等符号的单元格右边框会被逐行拉偏。
+    // 或 `4.0→4.0 △` 这类涨跌标记的单元格右边框会被逐行拉偏。
     if is_ambiguous_emoji_block_char(ch) {
         return 2;
     }
@@ -85,6 +86,8 @@ fn is_ambiguous_emoji_block_char(ch: char) -> bool {
             | 0x2600..=0x26FF
             // Dingbats: ✂ ✆ ✈ ✉ ✌ ✍ ✎ ✏ ✓ ✔ ✨ 等
             | 0x2700..=0x27BF
+            // Geometric Shapes 中常见的涨跌/评分三角标记：△ ▲ ▽ ▼
+            | 0x25B2 | 0x25B3 | 0x25BC | 0x25BD
     )
 }
 
@@ -738,6 +741,11 @@ mod tests {
         // 本身即 emoji-presentation 的字符（unicode-width 判为 2）不受影响。
         assert_eq!(terminal_display_width("✅"), 2);
         assert_eq!(terminal_display_width("❌"), 2);
+        // macOS 终端里的涨跌/评分三角标记也会占 2 列。
+        assert_eq!(terminal_display_width("△"), 2);
+        assert_eq!(terminal_display_width("▲"), 2);
+        assert_eq!(terminal_display_width("▽"), 2);
+        assert_eq!(terminal_display_width("▼"), 2);
         // VS16 单独出现时贡献 1 列（等价于给紧邻 base 补足被撑开的那一列）。
         assert_eq!(terminal_cell_width('\u{fe0f}'), 1);
     }

@@ -61,6 +61,14 @@ actually touches that subsystem.
    viewport top line. During resize/reflow, top-line content is pushed into
    terminal scrollback and can accumulate as duplicate divider/header artifacts;
    keep divider/model chrome below the textarea top row instead.
+8. Terminal markdown/table width math must follow real macOS terminal cell widths,
+   not raw Unicode ambiguity defaults: emoji-style symbol blocks and score-delta
+   markers such as `△▽▲▼` can render double-width and must be counted that way
+   to avoid wrapped table borders and right-edge residue.
+9. Session-title generation is a post-turn background-quality task, not a
+   foreground UX path. Its model request/body timeouts may be longer than the
+   interactive defaults (currently 90s / 45s) so slow control-model responses
+   still have a chance to land without delaying the visible answer stream.
 
 ## On-Demand Guides
 

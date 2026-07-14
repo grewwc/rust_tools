@@ -2,8 +2,7 @@ mod adapter;
 
 #[cfg(test)]
 pub(in crate::ai) use adapter::{
-    ALIBABA_DEFAULT_ENDPOINT, OPENCODE_DEFAULT_ENDPOINT, OPENROUTER_ENDPOINT, alibaba_adapter,
-    compatible_adapter, openai_adapter, opencode_adapter, openrouter_adapter,
+    ALIBABA_DEFAULT_ENDPOINT, OPENCODE_DEFAULT_ENDPOINT, OPENROUTER_ENDPOINT, alibaba_adapter, openai_adapter, opencode_adapter,
 };
 pub(in crate::ai) use adapter::{
     ProviderAdapter, adapter_for, reasoning_effort_reduces_thinking_for, thinking_dialect_for,

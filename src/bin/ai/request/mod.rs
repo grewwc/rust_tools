@@ -63,6 +63,9 @@ pub(crate) use types::{
     merge_reasoning_fragments,
 };
 
+const SESSION_TITLE_REQUEST_TIMEOUT_SECS: u64 = 90;
+const SESSION_TITLE_BODY_TIMEOUT_SECS: u64 = 45;
+
 /// 并发请求（前台 turn + 各子代理）各自独立重试，`attempt N/M` 计数互相
 /// 交错、无法区分归属。用 aios 调度 pid 作为作用域标签把每条重试日志绑定到
 /// 具体进程；无 pid（无 TASK_PID 作用域）时返回空串，日志退化为原样。
@@ -1202,7 +1205,11 @@ pub(super) async fn generate_session_title_via_model(
         .json(&request_body)
         .send();
 
-    let response = match tokio::time::timeout(std::time::Duration::from_secs(30), send_future).await
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(SESSION_TITLE_REQUEST_TIMEOUT_SECS),
+        send_future,
+    )
+    .await
     {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
@@ -1210,7 +1217,10 @@ pub(super) async fn generate_session_title_via_model(
             return None;
         }
         Err(_) => {
-            eprintln!("[session-title] timeout (30s) sending request, skipping");
+            eprintln!(
+                "[session-title] timeout ({}s) sending request, skipping",
+                SESSION_TITLE_REQUEST_TIMEOUT_SECS
+            );
             return None;
         }
     };
@@ -1221,7 +1231,11 @@ pub(super) async fn generate_session_title_via_model(
         return None;
     }
 
-    let text = match tokio::time::timeout(std::time::Duration::from_secs(15), response.text()).await
+    let text = match tokio::time::timeout(
+        std::time::Duration::from_secs(SESSION_TITLE_BODY_TIMEOUT_SECS),
+        response.text(),
+    )
+    .await
     {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
@@ -1229,7 +1243,10 @@ pub(super) async fn generate_session_title_via_model(
             return None;
         }
         Err(_) => {
-            eprintln!("[session-title] timeout (15s) reading body, skipping");
+            eprintln!(
+                "[session-title] timeout ({}s) reading body, skipping",
+                SESSION_TITLE_BODY_TIMEOUT_SECS
+            );
             return None;
         }
     };

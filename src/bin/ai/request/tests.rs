@@ -5,6 +5,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
 
 #[test]
+fn session_title_generation_timeouts_are_relaxed_for_background_work() {
+    assert_eq!(SESSION_TITLE_REQUEST_TIMEOUT_SECS, 90);
+    assert_eq!(SESSION_TITLE_BODY_TIMEOUT_SECS, 45);
+}
+
+#[test]
 fn model_fallback_and_disable_statuses_are_separate() {
     let network = RequestError::cancelled("network timeout");
     assert!(should_try_model_fallback(&network));

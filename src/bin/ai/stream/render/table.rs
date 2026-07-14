@@ -1075,4 +1075,57 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn score_delta_triangle_markers_do_not_push_right_border_past_terminal_width() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        unsafe { std::env::set_var("COLUMNS", "80") };
+
+        let header = vec![
+            "#".to_string(),
+            "query".to_string(),
+            "fast->slow".to_string(),
+            "增量".to_string(),
+            "倍率".to_string(),
+            "得分变化".to_string(),
+        ];
+        let align = vec![TableAlign::Left; header.len()];
+        let rows = vec![
+            vec![
+                "1".to_string(),
+                "对十二个客户对应多个销售的情况, 不一致的比例有多高".to_string(),
+                "148.0→419.4".to_string(),
+                "+271.4s".to_string(),
+                "2.83x".to_string(),
+                "4.0→4.0 △".to_string(),
+            ],
+            vec![
+                "2".to_string(),
+                "帮我计算下载后删除被速率影响均值".to_string(),
+                "119.9→192.6".to_string(),
+                "+72.8s".to_string(),
+                "1.61x".to_string(),
+                "4.0→4.0 ▲".to_string(),
+            ],
+        ];
+
+        let widths = compute_table_widths("", &header, &rows);
+        let mut rendered = String::new();
+        rendered.push_str(&render_table_top("", &widths));
+        rendered.push_str(&render_table_header("", &header, &align, &widths));
+        rendered.push_str(&render_table_mid("", &widths));
+        for row in &rows {
+            rendered.push_str(&render_table_row("", row, &align, &widths));
+        }
+        rendered.push_str(&render_table_bottom("", &widths));
+
+        for line in rendered.lines() {
+            let visible = strip_ansi_codes(line);
+            let width = terminal_display_width(visible.as_str());
+            assert!(
+                width <= 80,
+                "triangle score-delta table line exceeds terminal width ({width}):\n{visible}"
+            );
+        }
+    }
 }
