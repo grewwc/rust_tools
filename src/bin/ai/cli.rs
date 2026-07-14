@@ -514,6 +514,8 @@ pub(super) fn print_help() {
     println!("                                (minimal|low|medium|high|off|auto)");
     println!("    /history [user|N]         show recent session messages");
     println!("    /history user             show user inputs with u<N> markers");
+    println!("    /history last             replay the last assistant message with markdown rendering");
+    println!("    /history replay           replay the last assistant conclusion as plain text");
     println!("    /history rewind u<N>      remove user input u<N> and everything after it");
     println!("    /history rewind last      remove latest user input and everything after it");
     println!("    /history rewind grep <q>  rewind the only user input matching keyword");
@@ -651,7 +653,7 @@ fn generate_bash(
     println!("  local usage_sub='today 7d 30d all daily trend days models help'");
     println!("  local checkpoint_sub='save list rollback delete help'");
     println!(
-        "  local history_sub='full user assistant tool system grep rewind undo export copy help 3 6 10 20'"
+        "  local history_sub='full user assistant tool system grep rewind undo export copy last replay help 3 6 10 20'"
     );
     println!(
         "  local persona_sub='help list ls current cur create new use select switch delete del rm'"
@@ -745,7 +747,7 @@ fn generate_zsh(
     println!("  local -a _a_usage_subcmds=(today 7d 30d all daily trend days models help)");
     println!("  local -a _a_checkpoint_subcmds=(save list rollback delete help)");
     println!(
-        "  local -a _a_history_subcmds=(full user assistant tool system grep rewind undo export copy help 3 6 10 20)"
+        "  local -a _a_history_subcmds=(full user assistant tool system grep rewind undo export copy last replay help 3 6 10 20)"
     );
     println!(
         "  local -a _a_session_subcmds=(help list current new use suspend bound delete clear-bound clear-history clear-all dump-history dump export export-current export-last fork branch)"

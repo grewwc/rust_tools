@@ -364,6 +364,7 @@ impl CommandCompleter {
             "undo",
             "export",
             "copy",
+            "last",
             "replay",
             "help",
             "3",
@@ -993,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn history_command_completion_includes_rewind_but_not_rewind_target() {
+    fn history_command_completion_includes_rewind_and_last_shortcut() {
         let completer = CommandCompleter;
         let history = DefaultHistory::new();
         let (_, pairs) = completer
@@ -1002,7 +1003,7 @@ mod tests {
 
         assert!(pairs.iter().any(|pair| pair.replacement == "rewind"));
         assert!(pairs.iter().any(|pair| pair.replacement == "undo"));
-        assert!(!pairs.iter().any(|pair| pair.replacement == "last"));
+        assert!(pairs.iter().any(|pair| pair.replacement == "last"));
     }
 
     #[test]
