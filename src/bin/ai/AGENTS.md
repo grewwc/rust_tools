@@ -69,6 +69,21 @@ actually touches that subsystem.
    foreground UX path. Its model request/body timeouts may be longer than the
    interactive defaults (currently 90s / 45s) so slow control-model responses
    still have a chance to land without delaying the visible answer stream.
+10. For DeepSeek/OpenCode continuation requests, `reasoning_content` echo on
+    assistant tool-call messages is determined by the model's wire dialect, not
+    by the current turn's `enable_thinking` decision. Mid-turn compression may
+    clear older reasoning text to `None`; request preparation must still restore
+    empty-string placeholders before sending or the provider can reject the
+    continued conversation with a stable 400.
+11. The streaming thinking-fold (`stream/runtime.rs`) must anchor its
+    `╭─ thinking` header: print it exactly once on activation (`header_drawn`),
+    then never retrace it. Per-chunk redraw (`\x1b[{window_rows}A\r\x1b[0J`) may
+    only erase the bounded body region (fold summary + ≤`max_visible_lines`
+    rows); `window_rows` counts body physical rows only, excluding the header.
+    Rationale: a redraw window that spans the header can scroll into scrollback
+    where cursor-up can't reach, leaving orphan headers that stack across chunks.
+    Keeping the header outside the erased region makes a second header
+    structurally impossible even if body erase ever slips.
 
 ## On-Demand Guides
 

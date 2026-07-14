@@ -910,23 +910,38 @@ fn write_thinking_content_folded(
     thinking_fold_redraw(fold)
 }
 
-/// 只覆盖 thinking header 下方的固定窗口区域。
+/// 只覆盖 thinking 正文窗口（折叠摘要 + 最近可见行），header 不在此列。
+///
+/// header（`╭─ thinking`）在折叠激活时打印一次并锚定在正文之上，之后每次重画都只
+/// 擦除并重写正文。正文行数上限为 `max_visible_lines + 1`（折叠摘要），恒定落在可视
+/// 视口内，因此 `\x1b[{window_rows}A` 相对擦除永远够得着，不会随窗口滚入 scrollback
+/// 而失步——即便失步，也无法再生出第二个 header，从根上杜绝「孤儿 header 叠加」。
 fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
     let mut out = io::stdout();
+    // 只擦除上一次的正文区域；header 已锚定在其上方，绝不触碰。
     if fold.window_rows > 0 {
         write!(out, "\x1b[{}A\r\x1b[0J", fold.window_rows)?;
     }
-
-    let (window, window_rows) = render_thinking_fold_window(fold);
-    if !window.is_empty() {
-        out.write_all(window.as_bytes())?;
-        out.flush()?;
+    if fold.active && !fold.header_drawn {
+        write_thinking_fold_header(&mut out)?;
+        fold.header_drawn = true;
     }
-    fold.window_rows = window_rows;
+
+    let (body, body_rows) = render_thinking_fold_window(fold);
+    if !body.is_empty() {
+        out.write_all(body.as_bytes())?;
+    }
+    out.flush()?;
+    fold.window_rows = body_rows;
     Ok(())
 }
 
-/// Thinking 结束时的最终渲染：覆盖底部窗口，输出最终折叠摘要 + "done thinking"。
+/// 打印锚定的折叠 header。只应在折叠激活后被调用一次。
+fn write_thinking_fold_header(out: &mut impl Write) -> io::Result<()> {
+    write!(out, "{ACCENT_RULE}╭─\x1b[0m {ACCENT_MUTED}thinking\x1b[0m\n")
+}
+
+/// Thinking 结束时的最终渲染：覆盖正文窗口，输出最终折叠摘要 + "done thinking"。
 pub(super) fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::Result<()> {
     let fold = &mut state.render.thinking_fold;
     if !fold.active {
@@ -937,10 +952,15 @@ pub(super) fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::R
     if fold.window_rows > 0 {
         write!(out, "\x1b[{}A\r\x1b[0J", fold.window_rows)?;
     }
+    // 若正文从未渲染过（header 尚未落地），补一个 header 以保证块结构完整。
+    if !fold.header_drawn {
+        write_thinking_fold_header(&mut out)?;
+        fold.header_drawn = true;
+    }
 
-    let (window, _) = render_thinking_fold_window(fold);
-    if !window.is_empty() {
-        out.write_all(window.as_bytes())?;
+    let (body, _) = render_thinking_fold_window(fold);
+    if !body.is_empty() {
+        out.write_all(body.as_bytes())?;
     }
 
     // "done thinking" 结尾标记
@@ -978,10 +998,13 @@ fn thinking_fold_visible_lines(fold: &super::state::ThinkingFoldState) -> Vec<&s
     visible
 }
 
+/// 渲染折叠窗口的**正文**（折叠摘要 + 最近可见行），不含 header。
+/// header 由 `write_thinking_fold_header` 单独锚定打印。返回的行数即正文物理行数，
+/// 供 `\x1b[{n}A` 精确擦除；正文行数上限为 `max_visible_lines + 1`，恒在视口内。
 fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState) -> (String, usize) {
     let hidden_count = thinking_fold_hidden_count(fold);
     let visible_lines = thinking_fold_visible_lines(fold);
-    if !fold.active && hidden_count == 0 && visible_lines.is_empty() {
+    if hidden_count == 0 && visible_lines.is_empty() {
         return (String::new(), 0);
     }
 
@@ -989,13 +1012,6 @@ fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState) -> (Strin
     // 每条可见行都被 clamp 成「最多占一个物理行」，因此窗口物理行数恒等于逻辑行数。
     // cursor-up 擦除据此精确，不再依赖对自动折行的预测（tab/CJK/超长行/resize 免疫）。
     let mut rows = 0;
-
-    if fold.active {
-        let header = format!("{ACCENT_RULE}╭─\x1b[0m {ACCENT_MUTED}thinking\x1b[0m");
-        rows += 1;
-        out.push_str(&header);
-        out.push('\n');
-    }
 
     if hidden_count > 0 {
         let marker = clamp_line_to_terminal_row(&format!("  ··· {hidden_count} lines folded ···"));

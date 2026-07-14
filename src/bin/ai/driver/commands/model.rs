@@ -256,8 +256,16 @@ pub fn try_handle_model_command(
         model_names::adapter_slug(model.adapter),
         if model.is_vl { "vl " } else { "" },
         if model.search_enabled { "search " } else { "" },
-        if model.tools_default_enabled { "tools " } else { "" },
-        if model.enable_thinking { "thinking" } else { "" },
+        if model.tools_default_enabled {
+            "tools "
+        } else {
+            ""
+        },
+        if model.enable_thinking {
+            "thinking"
+        } else {
+            ""
+        },
     );
     Ok(true)
 }

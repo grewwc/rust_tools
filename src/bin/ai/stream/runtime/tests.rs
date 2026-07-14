@@ -653,7 +653,10 @@ fn thinking_fold_window_without_hidden_lines_has_no_fold_marker() {
 }
 
 #[test]
-fn thinking_fold_active_window_includes_header_in_row_budget() {
+fn thinking_fold_window_body_excludes_anchored_header() {
+    // header 已从正文渲染中剥离并单独锚定：`render_thinking_fold_window` 只产出正文
+    // （折叠摘要 + 可见行），绝不含 header。这是「孤儿 header 叠加」修复的核心不变量——
+    // 正文可被 cursor-up 反复擦除重画，header 只落地一次、永不被擦除。
     let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
     unsafe {
         std::env::set_var("COLUMNS", "200");
@@ -669,12 +672,43 @@ fn thinking_fold_active_window_includes_header_in_row_budget() {
 
     let (window, rows) = render_thinking_fold_window(fold);
 
-    // active header(1) + 折叠标记(1) + 可见行(1) + current(1) = 4 物理行。
-    assert!(window.contains("thinking"));
+    // 折叠标记(1) + 可见行(1) + current(1) = 3 物理行，header 不在此列。
+    assert!(!window.contains("thinking"));
     assert!(window.contains("lines folded"));
     assert!(window.contains("line-1"));
     assert!(window.contains("line-2"));
-    assert_eq!(rows, 4);
+    assert_eq!(rows, 3);
+
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
+
+#[test]
+fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
+    // 「孤儿 header 叠加」回归：header 只在首次重画时落地（header_drawn=true），
+    // 之后无论重画多少次都不再重打；window_rows 只记录正文物理行数（不含 header），
+    // 因此 cursor-up 擦除永远只作用于可视的正文区，不会因窗口滚入 scrollback 而失步。
+    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    unsafe {
+        std::env::set_var("COLUMNS", "200");
+    }
+
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    state.render.thinking_fold.max_visible_lines = 2;
+    state.render.thinking_fold.active = true;
+
+    write_thinking_content_folded("line-1\n", &mut state, &markers).unwrap();
+    assert!(state.render.thinking_fold.header_drawn);
+    // 1 可见行，无折叠 → 正文 1 行。
+    assert_eq!(state.render.thinking_fold.window_rows, 1);
+
+    write_thinking_content_folded("line-2\nline-3\nline-4\n", &mut state, &markers).unwrap();
+    // header 仍只落地一次，绝不重打。
+    assert!(state.render.thinking_fold.header_drawn);
+    // 4 行完成、可见 2 行 → 折叠标记(1) + 可见(2) = 正文 3 行，header 不计入。
+    assert_eq!(state.render.thinking_fold.window_rows, 3);
 
     unsafe {
         std::env::remove_var("COLUMNS");

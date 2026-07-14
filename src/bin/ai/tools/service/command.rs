@@ -1511,8 +1511,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_command_timeout, split_unquoted_segments, tokenize_shell_words,
-        truncate_chars, validate_no_injection_surface, MAX_COMMAND_OUTPUT_CHARS,
+        MAX_COMMAND_OUTPUT_CHARS, resolve_command_timeout, split_unquoted_segments,
+        tokenize_shell_words, truncate_chars, validate_no_injection_surface,
     };
 
     // ---- truncate_chars ----
@@ -1529,7 +1529,10 @@ mod tests {
         let content: String = (0..1000).map(|i| format!("line{i}\n")).collect();
         let out = truncate_chars(&content, 100);
         // 不再是无信息的 "... (truncated)"，而是带总量/已显示/分页提示。
-        assert!(out.contains("truncated: showing first 100 of"), "out tail: {out}");
+        assert!(
+            out.contains("truncated: showing first 100 of"),
+            "out tail: {out}"
+        );
         assert!(out.contains("of 1000 lines"), "out tail: {out}");
         assert!(
             out.contains("may simply be in the cut-off tail, not absent"),

@@ -122,6 +122,27 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
    loop, seen as `offload_only` climbing +1/turn while total chars keep growing).
    Only precision results *outside* the recent window spill to disk.
 
+11. Coarse tool-loop detection must also normalize low-yield
+   `execute_command` shell variants, not just JSON paging args. Collapse pure
+   result-window / noise differences such as trailing `| head -N`,
+   `2>/dev/null`, and `ls -la/-lt` flag churn when the command is still probing
+   the same target path, so repeated log-directory listing triggers the
+   `[low-yield-repetition]` note. If the same coarse `execute_command` target
+   keeps repeating across a longer window, escalate to a **no-tool handoff
+   mode** instead of waiting for the generic iteration soft-limit. This mode is
+   not a `Ctrl+C`-style abort: the current stream is not cancelled; the next
+   request keeps tool schemas visible for grounding, but the execution layer
+   rejects any new tool call and asks the model to produce a stage summary /
+   current conclusion / remaining work / next-step handoff. Preserve substantive
+   anchors such as search patterns / target paths so distinct sub-questions can
+   still differ.
+
+12. Single-turn iteration soft-limit is an early converge prompt, not a last-ditch
+   warning. With the default `max_iterations=2048`, cap the soft prompt at `128`
+   rounds (not several hundred), and inject a `task-anchor` together with the
+   `[iteration-soft-limit]` note so long exploratory runs get pulled back to the
+   user goal before they spend another hundred tool calls drifting.
+
 ## Goal 模式
 
 `/goal` slash command 启动 goal 模式：agent 自动持续推进目标直到完成。

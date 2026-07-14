@@ -35,10 +35,12 @@ const TOOL_LOOP_SOFT_WINDOW: usize = 4;
 const TOOL_LOOP_HARD_WINDOW: usize = 6;
 /// 近似低收益重复窗口：连续 N 轮对「同一目标资源」调用同一工具（忽略
 /// offset/limit 等翻页参数）即命中。用于抓字节精确检测漏掉的「同文件反复
-/// 翻页 / 仅微调分页参数的重复检索」这类真实膨胀。仅注入一次温和提示，
-/// 提醒模型判断是否该收敛；不把它直接视为硬性的 loop。
+/// 翻页 / 仅微调分页参数的重复检索」这类真实膨胀。先注入一次温和提示；
+/// 若继续长时间刷同一 coarse 目标（尤其 `execute_command` 的目录探测类命令），
+/// 则升级为 hard-stop，避免白跑上百轮。
 const TOOL_LOOP_COARSE_WINDOW: usize = 5;
-const TOOL_SIGNATURE_HISTORY_LIMIT: usize = TOOL_LOOP_HARD_WINDOW + 2;
+const TOOL_LOOP_COARSE_HARD_WINDOW: usize = 8;
+const TOOL_SIGNATURE_HISTORY_LIMIT: usize = TOOL_LOOP_COARSE_HARD_WINDOW + 2;
 const TASK_ANCHOR_MAX_QUESTION_CHARS: usize = 220;
 
 /// 计算 coarse 签名时需剥离的「易变翻页/窗口」参数键。剥离后同一文件的不同
@@ -47,14 +49,16 @@ const VOLATILE_ARG_KEYS: &[&str] = &["offset", "limit", "page", "cursor", "max_r
 
 /// 中段断路器绝对上限：单轮工具迭代达到该值即注入一次收敛提示，远早于
 /// max_iterations 硬上限，用于治理「合法但低效」的工具刷屏。
-const TOOL_ITERATION_SOFT_LIMIT: usize = 384;
+/// 默认 turn 预算是 2048；若把软提示 cap 放到几百轮，像日志排查这类探索型
+/// 问题会先空转一两百轮才被提醒收敛，明显过晚。
+const TOOL_ITERATION_SOFT_LIMIT: usize = 128;
 
 /// 连续「流读取中断型」截断（stream_error）的重试上限。超过即放弃本 turn，
 /// 避免服务端持续断流时无限重试（尤其后台任务的 max_iterations = usize::MAX）。
 const MAX_STREAM_ERROR_RETRIES: usize = 16;
 
 /// 单轮工具迭代软阈值：取 max_iterations 的一半与绝对上限的较小值，保证一定
-/// 早于硬上限触发；对超大 ceiling 也能在中段就提醒收敛。
+/// 早于硬上限触发；对默认 2048 这类超大 ceiling，也要在明显失控前提醒收敛。
 fn tool_iteration_soft_limit(max_iterations: usize) -> usize {
     (max_iterations / 2).max(1).min(TOOL_ITERATION_SOFT_LIMIT)
 }
@@ -67,6 +71,8 @@ fn extract_round_tool_signatures(messages: &[crate::ai::history::Message]) -> Op
 
 /// 提取「粗粒度」签名：剥离 offset/limit/page 等易变翻页参数后再归一化。
 /// 用于抓字节精确检测漏掉的同文件翻页 / 仅微调分页参数的重复检索。
+/// 对 `execute_command` 额外折叠 shell 中的低收益变体（如 `| head -20/-30`、
+/// `2>/dev/null`、`ls -la/-lt` 的细微差异），让同目标资源的反复试探能命中。
 fn extract_round_tool_signatures_coarse(
     messages: &[crate::ai::history::Message],
 ) -> Option<Vec<String>> {
@@ -93,6 +99,7 @@ fn extract_round_tool_signatures_inner(
             .map(|mut v| {
                 if coarse {
                     strip_volatile_args(&mut v);
+                    normalize_coarse_tool_args(name, &mut v);
                 }
                 v.to_string()
             })
@@ -112,6 +119,320 @@ fn strip_volatile_args(value: &mut serde_json::Value) {
     }
 }
 
+fn normalize_coarse_tool_args(tool_name: &str, value: &mut serde_json::Value) {
+    if tool_name != "execute_command" {
+        return;
+    }
+    let Some(map) = value.as_object_mut() else {
+        return;
+    };
+    let cwd = map
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .map(normalize_path_like_token);
+    let Some(command) = map
+        .get("command")
+        .and_then(|v| v.as_str())
+        .map(coarse_execute_command_signature)
+    else {
+        return;
+    };
+    map.clear();
+    map.insert("command".to_string(), serde_json::Value::String(command));
+    if let Some(cwd) = cwd {
+        map.insert("cwd".to_string(), serde_json::Value::String(cwd));
+    }
+}
+
+fn coarse_execute_command_signature(command: &str) -> String {
+    let mut parts = Vec::new();
+    for segment in split_shell_segments_for_coarse(command) {
+        if let Some(sig) = coarse_shell_segment_signature(&segment) {
+            if parts.last() != Some(&sig) {
+                parts.push(sig);
+            }
+        }
+    }
+    if parts.is_empty() {
+        return truncate_chars(command.trim(), 160);
+    }
+    parts.join(" | ")
+}
+
+fn split_shell_segments_for_coarse(command: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut chars = command.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if !in_single => {
+                current.push(ch);
+                escaped = true;
+            }
+            '\'' if !in_double => {
+                in_single = !in_single;
+                current.push(ch);
+            }
+            '"' if !in_single => {
+                in_double = !in_double;
+                current.push(ch);
+            }
+            ';' | '|' | '&' if !in_single && !in_double => {
+                let trimmed = current.trim();
+                if !trimmed.is_empty() {
+                    segments.push(trimmed.to_string());
+                }
+                current.clear();
+                if matches!(ch, '|' | '&') && chars.peek() == Some(&ch) {
+                    chars.next();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    let trimmed = current.trim();
+    if !trimmed.is_empty() {
+        segments.push(trimmed.to_string());
+    }
+    segments
+}
+
+fn tokenize_shell_words_for_coarse(command: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut token_started = false;
+
+    for ch in command.chars() {
+        if escaped {
+            current.push(ch);
+            token_started = true;
+            escaped = false;
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                current.push(ch);
+            }
+            token_started = true;
+            continue;
+        }
+        if in_double {
+            match ch {
+                '"' => in_double = false,
+                '\\' => escaped = true,
+                _ => current.push(ch),
+            }
+            token_started = true;
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            if token_started {
+                tokens.push(std::mem::take(&mut current));
+                token_started = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' => {
+                in_single = true;
+                token_started = true;
+            }
+            '"' => {
+                in_double = true;
+                token_started = true;
+            }
+            '\\' => {
+                escaped = true;
+                token_started = true;
+            }
+            _ => {
+                current.push(ch);
+                token_started = true;
+            }
+        }
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+    if token_started {
+        tokens.push(current);
+    }
+    tokens
+}
+
+fn coarse_shell_segment_signature(segment: &str) -> Option<String> {
+    let tokens = tokenize_shell_words_for_coarse(segment);
+    let program = tokens.first()?.to_ascii_lowercase();
+    if is_window_only_shell_segment(&program, &tokens) {
+        return None;
+    }
+    match program.as_str() {
+        "ls" => Some(normalize_ls_segment(&tokens)),
+        "grep" | "rg" => Some(normalize_search_segment(&program, &tokens)),
+        _ => Some(normalize_generic_shell_segment(&program, &tokens)),
+    }
+}
+
+fn is_window_only_shell_segment(program: &str, tokens: &[String]) -> bool {
+    match program {
+        "head" | "tail" => tokens[1..]
+            .iter()
+            .all(|token| token.starts_with('-') || token.chars().all(|ch| ch.is_ascii_digit())),
+        "wc" => tokens[1..].iter().all(|token| token.starts_with('-')),
+        _ => false,
+    }
+}
+
+fn normalize_ls_segment(tokens: &[String]) -> String {
+    let mut paths = collect_shell_target_tokens(tokens, 1, false);
+    if paths.is_empty() {
+        paths.push(".".to_string());
+    }
+    format!("ls:{}", paths.join(","))
+}
+
+fn normalize_search_segment(program: &str, tokens: &[String]) -> String {
+    let mut pattern = None;
+    let mut paths = Vec::new();
+    let mut expect_option_value = false;
+    let mut after_double_dash = false;
+    for token in tokens.iter().skip(1) {
+        if should_skip_shell_token(token) {
+            continue;
+        }
+        if expect_option_value {
+            if !token.chars().all(|ch| ch.is_ascii_digit()) && pattern.is_none() {
+                pattern = Some(token.to_string());
+            }
+            expect_option_value = false;
+            continue;
+        }
+        if !after_double_dash && token == "--" {
+            after_double_dash = true;
+            continue;
+        }
+        if !after_double_dash && token.starts_with('-') {
+            if matches!(
+                token.as_str(),
+                "-e" | "--regexp" | "-f" | "--file" | "-g" | "--glob" | "--iglob"
+            ) {
+                expect_option_value = true;
+            }
+            continue;
+        }
+        if looks_like_path_token(token) {
+            paths.push(normalize_path_like_token(token));
+            continue;
+        }
+        if pattern.is_none() {
+            pattern = Some(token.to_string());
+        }
+    }
+    if paths.is_empty() {
+        paths.push("<stdin>".to_string());
+    }
+    match pattern {
+        Some(pattern) => format!("{program}:{}#{pattern}", paths.join(",")),
+        None => format!("{program}:{}", paths.join(",")),
+    }
+}
+
+fn normalize_generic_shell_segment(program: &str, tokens: &[String]) -> String {
+    let mut paths = collect_shell_target_tokens(tokens, 1, true);
+    if paths.is_empty() {
+        program.to_string()
+    } else {
+        paths.sort();
+        paths.dedup();
+        format!("{program}:{}", paths.join(","))
+    }
+}
+
+fn collect_shell_target_tokens(tokens: &[String], start: usize, keep_literals: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut skip_next = false;
+    for token in tokens.iter().skip(start) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if should_skip_shell_token(token) {
+            continue;
+        }
+        if token == ">" || token == ">>" || token == "<" || token == "<<" {
+            skip_next = true;
+            continue;
+        }
+        if token.starts_with('-') {
+            continue;
+        }
+        if looks_like_path_token(token) {
+            out.push(normalize_path_like_token(token));
+            continue;
+        }
+        if keep_literals && !token.chars().all(|ch| ch.is_ascii_digit()) {
+            out.push(token.to_string());
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn should_skip_shell_token(token: &str) -> bool {
+    matches!(token, "|" | ";" | "&&" | "||" | "&")
+        || token.starts_with("2>")
+        || token.starts_with("1>")
+        || token.starts_with(">")
+        || token.starts_with("<")
+}
+
+fn looks_like_path_token(token: &str) -> bool {
+    token == "."
+        || token == ".."
+        || token.starts_with('/')
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with("~/")
+        || token.contains('/')
+}
+
+fn normalize_path_like_token(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    let mut prev_slash = false;
+    for ch in token.trim().chars() {
+        if ch == '/' {
+            if !prev_slash {
+                out.push(ch);
+            }
+            prev_slash = true;
+        } else {
+            out.push(ch);
+            prev_slash = false;
+        }
+    }
+    while out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    out
+}
+
 fn detect_tool_loop(history: &[Vec<String>], window: usize) -> bool {
     if window == 0 || history.len() < window {
         return false;
@@ -122,6 +443,21 @@ fn detect_tool_loop(history: &[Vec<String>], window: usize) -> bool {
         return false;
     }
     tail.iter().all(|sigs| sigs == first)
+}
+
+fn signature_set_is_execute_command_only(sigs: &[String]) -> bool {
+    !sigs.is_empty()
+        && sigs
+            .iter()
+            .all(|sig| sig.starts_with("execute_command::"))
+}
+
+fn detect_execute_command_coarse_loop(history: &[Vec<String>], window: usize) -> bool {
+    if !detect_tool_loop(history, window) {
+        return false;
+    }
+    let tail = &history[history.len() - window..];
+    signature_set_is_execute_command_only(&tail[0])
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -178,6 +514,8 @@ enum ToolLoopSignal {
     None,
     /// 近似低收益重复：同一工具反复命中同一目标资源（忽略翻页参数）。温和提示一次。
     Coarse,
+    /// `execute_command` 在同一 coarse 目标上长时间空转，直接强制收敛。
+    CoarseHard,
     Soft,
     Hard,
 }
@@ -256,6 +594,15 @@ impl TurnSupervisor {
         {
             self.loop_breaker_injected = true;
             return ToolLoopSignal::Soft;
+        }
+        if !self.hard_loop_stop_injected
+            && detect_execute_command_coarse_loop(
+                &self.tool_signature_history_coarse,
+                TOOL_LOOP_COARSE_HARD_WINDOW,
+            )
+        {
+            self.hard_loop_stop_injected = true;
+            return ToolLoopSignal::CoarseHard;
         }
         // 字节精确的 soft/hard 均未命中时，再看粗粒度：同一目标资源反复翻页/微调
         // 检索参数的膨胀会在这里被抓到。仅提示一次，且让位于精确检测。
@@ -343,8 +690,8 @@ fn inject_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
     use crate::ai::history::Message;
     use serde_json::Value;
     let note = "[loop-hard-stop] 你已连续 3 轮用相同参数调用相同工具，判定为无效循环。\n\
-        从现在起不要再发起任何工具调用：请基于已有信息直接回答用户；\n\
-        如果信息仍不足，明确说明缺口与建议的下一步。";
+        从现在起进入无工具收口模式：不要再发起任何工具调用；\n\
+        请基于已有信息给出阶段总结与当前结论；若任务仍未完成，明确说明缺口、剩余工作与建议的下一步。";
     messages.push(Message {
         role: "system".to_string(),
         content: Value::String(note.to_string()),
@@ -364,6 +711,23 @@ fn inject_coarse_loop_note(messages: &mut Vec<crate::ai::history::Message>) {
         这常常意味着低收益重复，但不一定是错误：如果这些调用分别服务于不同且明确的子问题，可以继续；\n\
         否则请优先：(a) 一次读取更大的行范围（提高 read_file 的 limit）或用检索工具一次定位；\n\
         (b) 复用已读到的内容，不要重复读同一文件同一段；(c) 若信息已足够，就直接作答。";
+    messages.push(Message {
+        role: "system".to_string(),
+        content: Value::String(note.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+/// 低收益的 `execute_command` 粗粒度重复升级到 hard-stop：在同一 coarse 目标上
+/// 连续多轮只改窗口/排序细节，基本可判定为无效探索。
+fn inject_coarse_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let note = "[low-yield-hard-stop] 你已连续多轮对同一目标重复调用 `execute_command`，变化主要只是窗口/排序细节，判定为无效探索。\n\
+        从现在起进入无工具收口模式：不要再发起任何工具调用；\n\
+        请基于已有信息给出阶段总结与当前结论；若任务仍未完成，明确说明当前缺口、剩余工作与建议的下一步。";
     messages.push(Message {
         role: "system".to_string(),
         content: Value::String(note.to_string()),
@@ -444,6 +808,24 @@ mod tests {
         let history = vec![Vec::<String>::new(); TOOL_LOOP_HARD_WINDOW];
         assert!(!detect_tool_loop(&history, TOOL_LOOP_SOFT_WINDOW));
         assert!(!detect_tool_loop(&history, TOOL_LOOP_HARD_WINDOW));
+    }
+
+    #[test]
+    fn detect_execute_command_coarse_loop_requires_execute_command_only_signatures() {
+        let execute_sig = vec!["execute_command::{\"command\":\"ls:/tmp\"}".to_string()];
+        let read_sig = vec!["read_file::{\"path\":\"src/main.rs\"}".to_string()];
+        let history = vec![execute_sig.clone(); TOOL_LOOP_COARSE_HARD_WINDOW];
+        assert!(detect_execute_command_coarse_loop(
+            &history,
+            TOOL_LOOP_COARSE_HARD_WINDOW
+        ));
+
+        let mut mixed = vec![execute_sig; TOOL_LOOP_COARSE_HARD_WINDOW];
+        mixed[0] = read_sig;
+        assert!(!detect_execute_command_coarse_loop(
+            &mixed,
+            TOOL_LOOP_COARSE_HARD_WINDOW
+        ));
     }
 
     #[test]
@@ -614,6 +996,24 @@ mod tests {
     }
 
     #[test]
+    fn coarse_execute_command_signature_collapses_log_listing_window_variants() {
+        let a = coarse_execute_command_signature("ls -lt /data01/dataagent_be/logs/ | head -20");
+        let b = coarse_execute_command_signature("ls -la /data01/dataagent_be/logs/ | head -30");
+        let c = coarse_execute_command_signature("ls /data01/dataagent_be/logs/ 2>/dev/null");
+        assert_eq!(a, "ls:/data01/dataagent_be/logs");
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn coarse_execute_command_signature_keeps_search_pattern_and_path() {
+        let sig = coarse_execute_command_signature(
+            "grep -rl \"24394294\" /data01/dataagent_be/logs/ 2>/dev/null | head -10",
+        );
+        assert_eq!(sig, "grep:/data01/dataagent_be/logs#24394294");
+    }
+
+    #[test]
     fn turn_supervisor_emits_coarse_signal_for_same_file_paging() {
         let mut supervisor = TurnSupervisor::default();
         let mut messages = Vec::new();
@@ -662,6 +1062,95 @@ mod tests {
     }
 
     #[test]
+    fn turn_supervisor_emits_coarse_signal_for_execute_command_log_listing_variants() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let commands = [
+            "ls -la /data01/dataagent_be/logs/ | head -30",
+            "ls -lt /data01/dataagent_be/logs/ | head -20",
+            "ls /data01/dataagent_be/logs/ | head -30",
+            "ls -lt /data01/dataagent_be/logs/ 2>/dev/null | head -40",
+            "ls -la /data01/dataagent_be/logs/ | head -50",
+        ];
+        for (i, command) in commands.iter().enumerate() {
+            messages.push(crate::ai::history::Message {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String(String::new()),
+                tool_calls: Some(vec![crate::ai::types::ToolCall {
+                    id: format!("tc-{i}"),
+                    tool_type: "function".to_string(),
+                    function: crate::ai::types::FunctionCall {
+                        name: "execute_command".to_string(),
+                        arguments: serde_json::json!({ "command": command }).to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+            let signal = supervisor.record_tool_signatures(&messages);
+            if i < TOOL_LOOP_COARSE_WINDOW - 1 {
+                assert!(matches!(signal, ToolLoopSignal::None));
+            } else {
+                assert!(matches!(signal, ToolLoopSignal::Coarse));
+            }
+        }
+        assert!(supervisor.coarse_loop_note_injected);
+    }
+
+    #[test]
+    fn turn_supervisor_escalates_execute_command_coarse_loop_to_hard_stop() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let commands = [
+            "ls -la /data01/dataagent_be/logs/ | head -30",
+            "ls -lt /data01/dataagent_be/logs/ | head -20",
+            "ls /data01/dataagent_be/logs/ | head -30",
+            "ls -lt /data01/dataagent_be/logs/ 2>/dev/null | head -40",
+            "ls -la /data01/dataagent_be/logs/ | head -50",
+            "ls -lt /data01/dataagent_be/logs/ | head -10",
+            "ls -la /data01/dataagent_be/logs/ 2>/dev/null | head -25",
+            "ls -lt /data01/dataagent_be/logs/ | head -60",
+        ];
+        let mut signals = Vec::new();
+        for (i, command) in commands.iter().enumerate() {
+            messages.push(crate::ai::history::Message {
+                role: "assistant".to_string(),
+                content: serde_json::Value::String(String::new()),
+                tool_calls: Some(vec![crate::ai::types::ToolCall {
+                    id: format!("tc-hard-{i}"),
+                    tool_type: "function".to_string(),
+                    function: crate::ai::types::FunctionCall {
+                        name: "execute_command".to_string(),
+                        arguments: serde_json::json!({ "command": command }).to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: None,
+            });
+            signals.push(supervisor.record_tool_signatures(&messages));
+        }
+        assert!(
+            signals[..TOOL_LOOP_COARSE_WINDOW - 1]
+                .iter()
+                .all(|s| matches!(s, ToolLoopSignal::None))
+        );
+        assert!(matches!(
+            signals[TOOL_LOOP_COARSE_WINDOW - 1],
+            ToolLoopSignal::Coarse
+        ));
+        assert!(
+            signals[TOOL_LOOP_COARSE_WINDOW..TOOL_LOOP_COARSE_HARD_WINDOW - 1]
+                .iter()
+                .all(|s| matches!(s, ToolLoopSignal::None))
+        );
+        assert!(matches!(
+            signals[TOOL_LOOP_COARSE_HARD_WINDOW - 1],
+            ToolLoopSignal::CoarseHard
+        ));
+        assert!(supervisor.hard_loop_stop_injected);
+    }
+
+    #[test]
     fn coarse_loop_note_allows_distinct_sub_questions() {
         let mut messages = Vec::new();
         inject_coarse_loop_note(&mut messages);
@@ -676,7 +1165,8 @@ mod tests {
         assert_eq!(tool_iteration_soft_limit(0), 1);
         assert_eq!(tool_iteration_soft_limit(1), 1);
         assert_eq!(tool_iteration_soft_limit(10), 5);
-        assert_eq!(tool_iteration_soft_limit(768), TOOL_ITERATION_SOFT_LIMIT);
+        assert_eq!(tool_iteration_soft_limit(256), TOOL_ITERATION_SOFT_LIMIT);
+        assert_eq!(tool_iteration_soft_limit(2048), TOOL_ITERATION_SOFT_LIMIT);
         assert_eq!(
             tool_iteration_soft_limit(100_000),
             TOOL_ITERATION_SOFT_LIMIT
@@ -1185,6 +1675,19 @@ async fn run_turn_body(
                 );
                 inject_coarse_loop_note(&mut messages);
             }
+            ToolLoopSignal::CoarseHard => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    "low-yield execute_command repetition hard-stop: switching to no-tool handoff",
+                );
+                inject_coarse_hard_loop_stop_note(&mut messages);
+                supervisor.maybe_inject_task_anchor(
+                    &mut messages,
+                    &question,
+                    "low-yield-hard-stop",
+                );
+                force_final_response = true;
+            }
             ToolLoopSignal::Soft => {
                 crate::ai::driver::print::print_tool_note_line(
                     "agent-health",
@@ -1197,7 +1700,7 @@ async fn run_turn_body(
             ToolLoopSignal::Hard => {
                 crate::ai::driver::print::print_tool_note_line(
                     "agent-health",
-                    "tool-loop hard-stop: forcing final response",
+                    "tool-loop hard-stop: switching to no-tool handoff",
                 );
                 inject_hard_loop_stop_note(&mut messages);
                 supervisor.maybe_inject_task_anchor(
@@ -1217,6 +1720,7 @@ async fn run_turn_body(
                 "agent-health",
                 "tool-iteration soft limit reached: injecting converge prompt",
             );
+            supervisor.maybe_inject_task_anchor(&mut messages, &question, "iteration-soft-limit");
         }
 
         // === Iteration limit 自反思 ===

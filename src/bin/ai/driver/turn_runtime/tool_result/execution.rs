@@ -222,6 +222,25 @@ fn execute_tool_calls_for_round(
     )
 }
 
+fn reject_tool_calls_for_no_tool_handoff(tool_calls: &[ToolCall]) -> ExecuteToolCallsResult {
+    ExecuteToolCallsResult {
+        executed_tool_calls: tool_calls.to_vec(),
+        tool_results: tool_calls
+            .iter()
+            .map(|tool_call| crate::ai::types::ToolResult {
+                tool_call_id: tool_call.id.clone(),
+                content: format!(
+                    "Error: tool calls are disabled in no-tool handoff mode for this turn. \
+Do not call '{}' again; instead summarize confirmed facts, answer what you can, and explain the remaining work / blockers / next steps.",
+                    tool_call.function.name
+                ),
+            })
+            .collect(),
+        cached_hits: vec![false; tool_calls.len()],
+        had_error: true,
+    }
+}
+
 /// 前台同步工具执行（尤其是 `execute_command` 的流式输出）也属于“当前 turn 的可中断
 /// 输出阶段”。若这里不抬起 `app.streaming`，Ctrl+C 会被 SIGINT 处理器误判成
 /// `Shutdown`，直接退出主进程，而不是取消当前工具轮次。
@@ -568,6 +587,7 @@ fn handle_tool_call_round(
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
     iteration: usize,
+    reject_tool_calls: bool,
     turn_had_tool_error: &mut bool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let _remaining_meta = parse_prune_meta_and_update_marks(
@@ -575,17 +595,21 @@ fn handle_tool_call_round(
         messages,
         &tool_call_execution.stream_result.hidden_meta,
     );
-    let mut observer = TerminalToolObserver::new(app);
-    let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
-    let exec_result = execute_tool_calls_for_round(
-        &app.session_id,
-        mcp_client,
-        shared_mcp_client,
-        &tool_call_execution.stream_result.tool_calls,
-        &tool_call_execution.allowed_tool_names,
-        Some(&mut observer),
-        iteration,
-    )?;
+    let exec_result = if reject_tool_calls {
+        reject_tool_calls_for_no_tool_handoff(&tool_call_execution.stream_result.tool_calls)
+    } else {
+        let mut observer = TerminalToolObserver::new(app);
+        let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
+        execute_tool_calls_for_round(
+            &app.session_id,
+            mcp_client,
+            shared_mcp_client,
+            &tool_call_execution.stream_result.tool_calls,
+            &tool_call_execution.allowed_tool_names,
+            Some(&mut observer),
+            iteration,
+        )?
+    };
     *turn_had_tool_error |= exec_result.had_error;
     append_cached_tool_results_note(&exec_result, messages, turn_messages);
     append_tool_result_messages(
@@ -1007,6 +1031,7 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 one_shot_mode,
                 persisted_turn_messages,
                 iteration,
+                *force_final_response,
                 turn_had_tool_error,
             )?;
 
@@ -1751,7 +1776,7 @@ mod tests {
                     usage_completion_tokens: 0,
                     usage_reasoning_tokens: 0,
                 },
-                allowed_tool_names: Default::default(),
+                allowed_tool_names: ["read_file".to_string()].into_iter().collect(),
             }),
             &mut messages,
             &mut turn_messages,
@@ -1782,7 +1807,7 @@ mod tests {
             .map(|msg| msg.content.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("not available in this turn's tool schema"));
+        assert!(joined.contains("disabled in no-tool handoff mode"));
         assert!(!joined.contains("exceeded kernel rlimit"));
 
         let _ = std::fs::remove_file(&path);
@@ -1883,6 +1908,7 @@ mod tests {
                 true,
                 &mut persisted_turn_messages,
                 1,
+                false,
                 &mut turn_had_tool_error,
             );
             (

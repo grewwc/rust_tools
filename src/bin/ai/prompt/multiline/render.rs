@@ -619,12 +619,7 @@ mod tests {
         UnicodeWidthStr::width_cjk(s)
     }
 
-    fn buffer_row(
-        backend: &TestBackend,
-        y: u16,
-        x_start: u16,
-        width: u16,
-    ) -> String {
+    fn buffer_row(backend: &TestBackend, y: u16, x_start: u16, width: u16) -> String {
         (x_start..x_start.saturating_add(width))
             .map(|x| {
                 backend
@@ -772,7 +767,12 @@ mod tests {
         let inner_width = popup_width.saturating_sub(2);
 
         let top_row = buffer_row(terminal.backend(), viewport_area.y, inner_x, inner_width);
-        let spacer_row = buffer_row(terminal.backend(), viewport_area.y + 4, inner_x, inner_width);
+        let spacer_row = buffer_row(
+            terminal.backend(),
+            viewport_area.y + 4,
+            inner_x,
+            inner_width,
+        );
 
         assert!(!top_row.starts_with('╶'));
         assert!(spacer_row.starts_with('╶'));

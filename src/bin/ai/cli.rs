@@ -514,7 +514,9 @@ pub(super) fn print_help() {
     println!("                                (minimal|low|medium|high|off|auto)");
     println!("    /history [user|N]         show recent session messages");
     println!("    /history user             show user inputs with u<N> markers");
-    println!("    /history last             replay the last assistant message with markdown rendering");
+    println!(
+        "    /history last             replay the last assistant message with markdown rendering"
+    );
     println!("    /history replay           replay the last assistant conclusion as plain text");
     println!("    /history rewind u<N>      remove user input u<N> and everything after it");
     println!("    /history rewind last      remove latest user input and everything after it");

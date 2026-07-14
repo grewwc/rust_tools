@@ -117,10 +117,14 @@ pub(super) struct ThinkingFoldState {
     pub(super) current_line: String,
     /// 总完成行数（含已被折叠的）
     pub(super) total_lines: usize,
-    /// 当前折叠窗口占用的 terminal 物理行数
+    /// 当前折叠窗口（仅正文，不含 header）占用的 terminal 物理行数
     pub(super) window_rows: usize,
     /// 是否处于活跃的 thinking 折叠模式
     pub(super) active: bool,
+    /// header（`╭─ thinking`）是否已落地。header 只打印一次并被锚定在重画区域之上，
+    /// 绝不随正文一起被 cursor-up 擦除重画——这样即便正文擦除失步也无法再生出第二个
+    /// header，从根上杜绝「孤儿 header 叠加」的渲染 bug。
+    pub(super) header_drawn: bool,
 }
 
 impl ThinkingFoldState {
@@ -132,6 +136,7 @@ impl ThinkingFoldState {
             total_lines: 0,
             window_rows: 0,
             active: false,
+            header_drawn: false,
         }
     }
 
@@ -141,6 +146,7 @@ impl ThinkingFoldState {
         self.total_lines = 0;
         self.window_rows = 0;
         self.active = false;
+        self.header_drawn = false;
     }
 }
 

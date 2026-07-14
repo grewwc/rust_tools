@@ -83,10 +83,7 @@ impl Drop for StreamingFlagGuard {
     }
 }
 
-fn request_visible_tool_names(app: &App, force_final_response: bool) -> FastSet<String> {
-    if force_final_response {
-        return FastSet::default();
-    }
+fn request_visible_tool_names(app: &App) -> FastSet<String> {
     app.agent_context
         .as_ref()
         .map(|ctx| {
@@ -290,6 +287,15 @@ async fn wait_for_request_interrupt(shutdown: Arc<AtomicBool>, cancel_stream: Ar
     }
 }
 
+fn no_tool_handoff_note() -> &'static str {
+    "进入无工具收口模式：本 turn 不要再调用任何工具。\n\
+请基于已经收集到的信息输出一条收口/交接回复：\n\
+1. 先总结已确认事实与当前结论；\n\
+2. 能直接回答用户的部分就直接回答；\n\
+3. 若任务仍未完成，明确说明剩余工作、阻塞点和建议的下一步；\n\
+4. 不要把未完成任务伪装成已完成。"
+}
+
 #[crate::ai::agent_hang_span(
     "pre-fix",
     "B",
@@ -317,24 +323,12 @@ async fn request_model_response(
     if force_final_response {
         messages.push(Message {
             role: "system".to_string(),
-            content: Value::String(
-                "Tool limit reached. Do not call any more tools. Provide the best possible final answer using the information already collected.".to_string(),
-            ),
+            content: Value::String(no_tool_handoff_note().to_string()),
             tool_calls: None,
             tool_call_id: None,
             reasoning_content: None,
         });
     }
-
-    let saved_tools = if force_final_response {
-        if let Some(ctx) = app.agent_context.as_mut() {
-            Some(std::mem::replace(&mut ctx.tools, Vec::new()))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
 
     let budget_report = context_budget::apply_pre_request_context_budget(app, next_model, messages);
     if let Some(reason) = budget_report.rollback_reason {
@@ -436,12 +430,6 @@ async fn request_model_response(
         }
     }
 
-    if let Some(saved_tools) = saved_tools
-        && let Some(ctx) = app.agent_context.as_mut()
-    {
-        ctx.tools = saved_tools;
-    }
-
     request_result.map(|response| (response, actual_model))
 }
 
@@ -491,7 +479,7 @@ async fn finalize_stream_interaction(
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
     should_quit: bool,
-    force_final_response: bool,
+    _force_final_response: bool,
 ) -> Result<IterationExecution, Box<dyn std::error::Error>> {
     input::clear_stdin_buffer();
 
@@ -530,7 +518,7 @@ async fn finalize_stream_interaction(
     Ok(match stream_result.outcome {
         StreamOutcome::ToolCall => IterationExecution::ToolCall(ToolCallExecution {
             stream_result,
-            allowed_tool_names: request_visible_tool_names(app, force_final_response),
+            allowed_tool_names: request_visible_tool_names(app),
         }),
         StreamOutcome::EmptyResponse => IterationExecution::EmptyResponse,
         StreamOutcome::Truncated => IterationExecution::Truncated(stream_result),
@@ -726,7 +714,8 @@ pub(super) async fn execute_turn_iteration(
 #[cfg(test)]
 mod tests {
     use super::{
-        StreamingFlagGuard, request_interrupt_pending, should_try_pre_request_llm_summary,
+        StreamingFlagGuard, no_tool_handoff_note, request_interrupt_pending,
+        should_try_pre_request_llm_summary,
         store_last_pre_request_summary_chars,
     };
     use std::sync::atomic::AtomicBool;
@@ -754,6 +743,15 @@ mod tests {
         cancel_stream.store(false, std::sync::atomic::Ordering::Relaxed);
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         assert!(request_interrupt_pending(&shutdown, &cancel_stream));
+    }
+
+    #[test]
+    fn no_tool_handoff_note_requires_summary_and_next_steps() {
+        let note = no_tool_handoff_note();
+        assert!(note.contains("不要再调用任何工具"));
+        assert!(note.contains("总结已确认事实与当前结论"));
+        assert!(note.contains("剩余工作、阻塞点和建议的下一步"));
+        assert!(note.contains("不要把未完成任务伪装成已完成"));
     }
 
     #[test]

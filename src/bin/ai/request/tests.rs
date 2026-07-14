@@ -778,6 +778,59 @@ fn deepseek_tool_call_messages_echo_empty_reasoning_content() {
     );
 }
 
+#[test]
+fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
+    let mut messages = vec![Message {
+        role: "assistant".to_string(),
+        content: Value::String(String::new()),
+        tool_calls: Some(vec![crate::ai::types::ToolCall {
+            id: "call_1".to_string(),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall {
+                name: "read_file".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    // 回归：OpenCode DeepSeek 默认会下发顶层 reasoning_effort，
+    // 此时请求体不会再带 `thinking` 对象；但历史 tool-call assistant
+    // 仍必须补齐空 reasoning_content，否则压缩后续写会稳定 400。
+    ensure_reasoning_content_echo_for_thinking_model(
+        "deepseek-v4-flash-free-opencode",
+        &mut messages,
+    );
+    assert_eq!(messages[0].reasoning_content.as_deref(), Some(""));
+
+    let body = build_request_body(
+        "deepseek-v4-flash-free-opencode",
+        &messages,
+        false,
+        false,
+        None,
+        None,
+        None,
+        Some("high"),
+        None,
+        None,
+    );
+    let value = serde_json::to_value(&body).unwrap();
+    assert_eq!(
+        value.get("reasoning_effort").and_then(|v| v.as_str()),
+        Some("high")
+    );
+    assert!(value.get("thinking").is_none());
+    let echoed = value
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .and_then(|items| items.first())
+        .and_then(|msg| msg.get("reasoning_content"))
+        .and_then(|v| v.as_str());
+    assert_eq!(echoed, Some(""));
+}
+
 /// 核心回归：DashScope compatible-mode 端点的 Alibaba-provider 模型
 /// （deepseek-v4-pro/flash、kimi-k2.7-code）必须按 thinking gate 决策发送
 /// `enable_thinking`，否则「关闭」会被静默丢弃、模型仍 reasoning。
