@@ -81,6 +81,10 @@ actually touches that subsystem.
     then never retrace it. Per-chunk redraw (`\x1b[{window_rows}A\r\x1b[0J`) may
     only erase the bounded body region (fold summary + ≤`max_visible_lines`
     rows); `window_rows` counts body physical rows only, excluding the header.
+    When the terminal is resized, previously rendered body lines can be reflowed
+    by the terminal into more physical rows than the cached `window_rows`, so
+    erase distance must be recomputed from the last rendered body under the
+    **current** terminal width rather than trusting the cached row count alone.
     Rationale: a redraw window that spans the header can scroll into scrollback
     where cursor-up can't reach, leaving orphan headers that stack across chunks.
     Keeping the header outside the erased region makes a second header

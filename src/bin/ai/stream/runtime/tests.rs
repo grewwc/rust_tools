@@ -720,6 +720,35 @@ fn thinking_fold_window_body_excludes_anchored_header() {
 }
 
 #[test]
+fn thinking_fold_erase_rows_follow_current_terminal_reflow_of_previous_body() {
+    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let mut state = StreamProcessingState::new();
+    let fold = &mut state.render.thinking_fold;
+    fold.window_rows = 2;
+    fold.rendered_body_lines = vec![
+        "  ··· 103 lines folded ···".to_string(),
+        "Actually, looking more carefully:".to_string(),
+    ];
+
+    unsafe {
+        std::env::set_var("COLUMNS", "80");
+    }
+    assert_eq!(thinking_fold_rendered_body_rows(fold), 2);
+
+    unsafe {
+        std::env::set_var("COLUMNS", "12");
+    }
+    assert!(
+        thinking_fold_rendered_body_rows(fold) > fold.window_rows,
+        "narrow terminal should reflow previous body beyond cached window_rows"
+    );
+
+    unsafe {
+        std::env::remove_var("COLUMNS");
+    }
+}
+
+#[test]
 fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
     // 「孤儿 header 叠加」回归：header 只在首次重画时落地（header_drawn=true），
     // 之后无论重画多少次都不再重打；window_rows 只记录正文物理行数（不含 header），
@@ -738,12 +767,14 @@ fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
     assert!(state.render.thinking_fold.header_drawn);
     // 1 可见行，无折叠 → 正文 1 行。
     assert_eq!(state.render.thinking_fold.window_rows, 1);
+    assert_eq!(state.render.thinking_fold.rendered_body_lines.len(), 1);
 
     write_thinking_content_folded("line-2\nline-3\nline-4\n", &mut state, &markers).unwrap();
     // header 仍只落地一次，绝不重打。
     assert!(state.render.thinking_fold.header_drawn);
     // 4 行完成、可见 2 行 → 折叠标记(1) + 可见(2) = 正文 3 行，header 不计入。
     assert_eq!(state.render.thinking_fold.window_rows, 3);
+    assert_eq!(state.render.thinking_fold.rendered_body_lines.len(), 3);
 
     unsafe {
         std::env::remove_var("COLUMNS");

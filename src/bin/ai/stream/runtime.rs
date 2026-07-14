@@ -18,7 +18,7 @@ use super::{
     MarkdownStreamRenderer,
     extract::{StreamTextEvent, extract_chunk_events_streaming},
     framing, normalize,
-    render::markdown::clamp_line_to_terminal_row,
+    render::markdown::{clamp_line_to_terminal_row, live_preview_cursor_rows},
     splitter::{InternalToolCallStreamEvent, StreamSplitSegment},
     state::{StreamChunkStep, StreamMarkers, StreamProcessingState, ToolCallBuilder},
 };
@@ -919,20 +919,25 @@ fn write_thinking_content_folded(
 fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
     let mut out = io::stdout();
     // 只擦除上一次的正文区域；header 已锚定在其上方，绝不触碰。
-    if fold.window_rows > 0 {
-        write!(out, "\x1b[{}A\r\x1b[0J", fold.window_rows)?;
+    // 注意：terminal 缩窄后，旧正文会被终端按当前宽度自动 reflow 成更多物理行；
+    // 这里不能只信缓存的 window_rows，而要按"上次正文在当前宽度下会占几行"重算。
+    let erase_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
+    if erase_rows > 0 {
+        write!(out, "\x1b[{}A\r\x1b[0J", erase_rows)?;
     }
     if fold.active && !fold.header_drawn {
         write_thinking_fold_header(&mut out)?;
         fold.header_drawn = true;
     }
 
-    let (body, body_rows) = render_thinking_fold_window(fold);
+    let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
+    let (body, body_rows) = render_thinking_fold_window_lines(&body_lines, marker_lines);
     if !body.is_empty() {
         out.write_all(body.as_bytes())?;
     }
     out.flush()?;
     fold.window_rows = body_rows;
+    fold.rendered_body_lines = body_lines;
     Ok(())
 }
 
@@ -949,8 +954,9 @@ pub(super) fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::R
     }
 
     let mut out = io::stdout();
-    if fold.window_rows > 0 {
-        write!(out, "\x1b[{}A\r\x1b[0J", fold.window_rows)?;
+    let erase_rows = thinking_fold_rendered_body_rows(fold).max(fold.window_rows);
+    if erase_rows > 0 {
+        write!(out, "\x1b[{}A\r\x1b[0J", erase_rows)?;
     }
     // 若正文从未渲染过（header 尚未落地），补一个 header 以保证块结构完整。
     if !fold.header_drawn {
@@ -958,10 +964,13 @@ pub(super) fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::R
         fold.header_drawn = true;
     }
 
-    let (body, _) = render_thinking_fold_window(fold);
+    let (body_lines, marker_lines) = thinking_fold_window_lines(fold);
+    let (body, body_rows) = render_thinking_fold_window_lines(&body_lines, marker_lines);
     if !body.is_empty() {
         out.write_all(body.as_bytes())?;
     }
+    fold.window_rows = body_rows;
+    fold.rendered_body_lines = body_lines;
 
     // "done thinking" 结尾标记
     write!(
@@ -998,36 +1007,61 @@ fn thinking_fold_visible_lines(fold: &super::state::ThinkingFoldState) -> Vec<&s
     visible
 }
 
+fn thinking_fold_rendered_body_rows(fold: &super::state::ThinkingFoldState) -> usize {
+    fold.rendered_body_lines
+        .iter()
+        .map(|line| live_preview_cursor_rows(line))
+        .sum()
+}
+
+fn thinking_fold_window_lines(fold: &super::state::ThinkingFoldState) -> (Vec<String>, usize) {
+    let hidden_count = thinking_fold_hidden_count(fold);
+    let visible_lines = thinking_fold_visible_lines(fold);
+    if hidden_count == 0 && visible_lines.is_empty() {
+        return (Vec::new(), 0);
+    }
+
+    let mut lines = Vec::with_capacity(visible_lines.len() + usize::from(hidden_count > 0));
+    let marker_lines = usize::from(hidden_count > 0);
+    if hidden_count > 0 {
+        lines.push(clamp_line_to_terminal_row(&format!(
+            "  ··· {hidden_count} lines folded ···"
+        )));
+    }
+    for line in visible_lines {
+        lines.push(clamp_line_to_terminal_row(line));
+    }
+    (lines, marker_lines)
+}
+
 /// 渲染折叠窗口的**正文**（折叠摘要 + 最近可见行），不含 header。
 /// header 由 `write_thinking_fold_header` 单独锚定打印。返回的行数即正文物理行数，
 /// 供 `\x1b[{n}A` 精确擦除；正文行数上限为 `max_visible_lines + 1`，恒在视口内。
 fn render_thinking_fold_window(fold: &super::state::ThinkingFoldState) -> (String, usize) {
-    let hidden_count = thinking_fold_hidden_count(fold);
-    let visible_lines = thinking_fold_visible_lines(fold);
-    if hidden_count == 0 && visible_lines.is_empty() {
+    let (lines, marker_lines) = thinking_fold_window_lines(fold);
+    render_thinking_fold_window_lines(&lines, marker_lines)
+}
+
+fn render_thinking_fold_window_lines(lines: &[String], marker_lines: usize) -> (String, usize) {
+    if lines.is_empty() {
         return (String::new(), 0);
     }
-
     let mut out = String::new();
     // 每条可见行都被 clamp 成「最多占一个物理行」，因此窗口物理行数恒等于逻辑行数。
     // cursor-up 擦除据此精确，不再依赖对自动折行的预测（tab/CJK/超长行/resize 免疫）。
-    let mut rows = 0;
+    let rows = lines.len();
 
-    if hidden_count > 0 {
-        let marker = clamp_line_to_terminal_row(&format!("  ··· {hidden_count} lines folded ···"));
-        rows += 1;
-        out.push_str(ACCENT_MUTED);
-        out.push_str(&marker);
-        out.push_str("\x1b[0m\n");
-    }
-
-    for line in visible_lines {
-        let clamped = clamp_line_to_terminal_row(line);
-        rows += 1;
-        out.push_str(DIM);
-        out.push_str(&clamped);
-        out.push_str(RESET);
-        out.push('\n');
+    for (idx, line) in lines.iter().enumerate() {
+        if idx < marker_lines {
+            out.push_str(ACCENT_MUTED);
+            out.push_str(line);
+            out.push_str("\x1b[0m\n");
+        } else {
+            out.push_str(DIM);
+            out.push_str(line);
+            out.push_str(RESET);
+            out.push('\n');
+        }
     }
 
     (out, rows)

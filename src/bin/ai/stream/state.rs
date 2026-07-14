@@ -119,6 +119,9 @@ pub(super) struct ThinkingFoldState {
     pub(super) total_lines: usize,
     /// 当前折叠窗口（仅正文，不含 header）占用的 terminal 物理行数
     pub(super) window_rows: usize,
+    /// 上次真正写到 terminal 的正文纯文本行（不含 ANSI / header），用于在 terminal
+    /// resize 后按**当前**列宽重算旧窗口会占多少物理行，避免 cursor-up 擦不干净。
+    pub(super) rendered_body_lines: Vec<String>,
     /// 是否处于活跃的 thinking 折叠模式
     pub(super) active: bool,
     /// header（`╭─ thinking`）是否已落地。header 只打印一次并被锚定在重画区域之上，
@@ -135,6 +138,7 @@ impl ThinkingFoldState {
             current_line: String::new(),
             total_lines: 0,
             window_rows: 0,
+            rendered_body_lines: Vec::new(),
             active: false,
             header_drawn: false,
         }
@@ -145,6 +149,7 @@ impl ThinkingFoldState {
         self.current_line.clear();
         self.total_lines = 0;
         self.window_rows = 0;
+        self.rendered_body_lines.clear();
         self.active = false;
         self.header_drawn = false;
     }
