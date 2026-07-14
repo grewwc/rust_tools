@@ -57,10 +57,11 @@ actually touches that subsystem.
    and API-key fallback behavior; `platform` drives model handle suffixes, UI/log
    labels, and platform-specific config semantics. Keep `provider` only as a
    backward-compatible alias when reading old config, not as the canonical field.
-7. Multiline inline viewport chrome must not place stable decorative rows on the
-   viewport top line. During resize/reflow, top-line content is pushed into
-   terminal scrollback and can accumulate as duplicate divider/header artifacts;
-   keep divider/model chrome below the textarea top row instead.
+7. Multiline inline viewport chrome must avoid stable decorative rule rows
+   entirely. During resize/reflow/re-anchor, full-width divider lines are prone
+   to being pushed into terminal scrollback and can accumulate as duplicate
+   horizontal artifacts. Keep only essential model/help chrome, and keep it
+   below the textarea top row instead of drawing a persistent divider.
 8. Terminal markdown/table width math must follow real macOS terminal cell widths,
    not raw Unicode ambiguity defaults: emoji-style symbol blocks and score-delta
    markers such as `△▽▲▼` can render double-width and must be counted that way

@@ -22,7 +22,6 @@ struct PopupLayoutConfig {
     top_rule_lines: u16,
     help_lines: u16,
     model_header_lines: u16,
-    spacer_lines: u16,
     min_textarea_lines: u16,
 }
 
@@ -35,10 +34,10 @@ fn popup_layout_config(
     _has_status_msg: bool,
     has_model_label: bool,
 ) -> PopupLayoutConfig {
-    // top_margin 始终保持 0。不要在 inline viewport 的**顶行**放稳定装饰元素：
-    // 终端 resize / reflow 时，顶行内容会被推入 scrollback，恢复宽度后就会像
-    // “多出一条横线”一样不断堆叠。把分隔线移到 footer 上方的 spacer 行里，
-    // 既保留视觉收口，又避免顶行残影。
+    // top_margin 始终保持 0。不要在 inline viewport 里放稳定的装饰性横线：
+    // 终端 resize / reflow / 重新锚定时，这类整行装饰很容易被推入 scrollback，
+    // 恢复宽度后就会像“多出几条横线”一样不断堆叠。这里彻底去掉 divider，
+    // 只保留必要的 model/help 信息，避免残影。
     let top_margin: u16 = 0;
     let top_rule_lines: u16 = 0;
     // 补全面板激活时，把底部帮助压缩为 1 行并隐藏 model/session 信息，
@@ -49,7 +48,6 @@ fn popup_layout_config(
     } else {
         1
     };
-    let spacer_lines = if has_completion_panel { 0 } else { 1 };
     let min_textarea_lines = if has_completion_panel {
         1
     } else {
@@ -61,7 +59,6 @@ fn popup_layout_config(
         top_rule_lines,
         help_lines,
         model_header_lines,
-        spacer_lines,
         min_textarea_lines,
     }
 }
@@ -118,10 +115,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     // 装饰性横线一样反复堆叠（表现为 `model: ... | ...` 在恢复/重绘时多次出现）。底部区域
     // 在光标下方，随每帧重绘、退出时被 FromCursorDown 清除，不会污染 scrollback。
     let model_header_lines = layout.model_header_lines;
-    // 正文和底部帮助/状态栏之间预留 1 行视觉间距，但只在以下情况下启用：
-    // 1. 没有补全面板（否则可用高度太紧张）；
-    // 2. 正文末尾自己没有留空行。
-    let spacer_lines = layout.spacer_lines;
     // 面板激活时优先占满高度：先扣掉 help 行与 textarea 最小行，余下的尽量给面板
     // （面板期望高度 = min(候选数, COMPLETION_WINDOW) + 上下边框 2，但不超过可用空间）。
     // textarea 退让到最小 1 行（此时用户在选列表，不需要大编辑区）。
@@ -136,14 +129,12 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
                 .saturating_sub(top_rule_lines)
                 .saturating_sub(help_lines)
                 .saturating_sub(model_header_lines)
-                .saturating_sub(spacer_lines)
                 .saturating_sub(min_textarea_lines);
             let panel = desired_panel.min(panel_cap).max(1.min(panel_cap));
             let textarea = inner
                 .height
                 .saturating_sub(top_rule_lines)
                 .saturating_sub(panel)
-                .saturating_sub(spacer_lines)
                 .saturating_sub(model_header_lines)
                 .saturating_sub(help_lines)
                 .max(min_textarea_lines);
@@ -153,7 +144,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             let textarea = inner
                 .height
                 .saturating_sub(top_rule_lines)
-                .saturating_sub(spacer_lines)
                 .saturating_sub(model_header_lines)
                 .saturating_sub(help_lines)
                 .max(min_textarea_lines);
@@ -167,7 +157,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             Constraint::Length(top_rule_lines),
             Constraint::Length(textarea_lines),
             Constraint::Length(panel_lines),
-            Constraint::Length(spacer_lines),
             Constraint::Length(model_header_lines),
             Constraint::Length(help_lines),
         ])
@@ -180,10 +169,10 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
     f.render_widget(Clear, popup);
 
     // 底部模型/主题信息行：让用户在输入时看到当前模型与 session 主题。
-    // **必须画在底部专属 chunk（chunks[4]，help 行上方）而非 viewport 顶行**：顶行会在
+    // **必须画在底部专属 chunk（chunks[3]，help 行上方）而非 viewport 顶行**：顶行会在
     // 每次 viewport 重新锚定时被推进 scrollback 反复堆叠（见上方 model_header_lines 注释）。
     if model_header_lines > 0 {
-        let header_area = chunks[4];
+        let header_area = chunks[3];
         let mut spans = vec![
             Span::styled(" model: ", Style::default().fg(Color::Rgb(148, 163, 184))),
             Span::styled(
@@ -210,12 +199,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
         ));
         let header = Line::from(spans);
         f.render_widget(Paragraph::new(header), header_area);
-    }
-
-    // 这里用单独 chunk 画“细分隔线”，而不是粗边框。分隔线放在 footer 上方的
-    // spacer 行中，避免顶行在 resize/reflow 时被推进 scrollback 后留下横线残影。
-    if spacer_lines > 0 {
-        f.render_widget(Paragraph::new(divider_line(chunks[3].width)), chunks[3]);
     }
 
     let char_count = current_content.chars().count();
@@ -428,10 +411,10 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             ]),
         ]
     };
-    f.render_widget(Paragraph::new(help_lines), chunks[5]);
+    f.render_widget(Paragraph::new(help_lines), chunks[4]);
 
     if let Some(msg) = status_msg {
-        let c2 = chunks[5];
+        let c2 = chunks[4];
         if c2.height >= 2 && c2.width > 2 {
             let status_width = (c2.width - 2) as usize;
             let status_text = truncate_with_ellipsis(msg, status_width);
@@ -448,24 +431,6 @@ pub(in crate::ai::prompt::multiline) fn render_multiline_popup(
             f.render_widget(status_para, status_area);
         }
     }
-}
-
-fn divider_line(width: u16) -> Line<'static> {
-    if width <= 2 {
-        return Line::from(Span::styled(
-            "─".repeat(width as usize),
-            Style::default().fg(Color::Rgb(71, 85, 105)),
-        ));
-    }
-    let body_width = width.saturating_sub(2) as usize;
-    Line::from(vec![
-        Span::styled("╶", Style::default().fg(Color::Rgb(100, 116, 139))),
-        Span::styled(
-            "─".repeat(body_width),
-            Style::default().fg(Color::Rgb(71, 85, 105)),
-        ),
-        Span::styled("╴", Style::default().fg(Color::Rgb(100, 116, 139))),
-    ])
 }
 
 fn completion_item_line(display: &str, selected: bool) -> Line<'_> {
@@ -604,7 +569,7 @@ fn textarea_terminal_cursor(textarea: &TextArea<'_>, area: Rect) -> Option<(u16,
 #[cfg(test)]
 mod tests {
     use super::{
-        count_trailing_blank_lines, divider_line, popup_layout_config, render_multiline_popup,
+        count_trailing_blank_lines, popup_layout_config, render_multiline_popup,
         truncate_with_ellipsis,
     };
     use ratatui::{
@@ -674,24 +639,22 @@ mod tests {
     #[test]
     fn empty_prompt_keeps_consistent_top_margin() {
         let layout = popup_layout_config(8, "", 1, 0, false, false, true);
-        // 紧凑空输入：顶行不再放 divider，普通编辑态把收口线放到 footer 上方 spacer。
+        // 紧凑空输入：不再放任何装饰性 divider，避免 resize 后横线残影。
         assert_eq!(layout.top_margin, 0);
         assert_eq!(layout.top_rule_lines, 0);
         assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
-        assert_eq!(layout.spacer_lines, 1);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
     #[test]
     fn non_empty_prompt_keeps_full_editor_layout() {
         let layout = popup_layout_config(8, "hello", 1, 0, false, false, true);
-        // 普通编辑态统一 chrome 布局：divider 在 spacer 行，避免 resize 时顶行残影。
+        // 普通编辑态也不再画 divider，避免 resize/re-anchor 后装饰线堆入 scrollback。
         assert_eq!(layout.top_margin, 0);
         assert_eq!(layout.top_rule_lines, 0);
         assert_eq!(layout.help_lines, 2);
         assert_eq!(layout.model_header_lines, 1);
-        assert_eq!(layout.spacer_lines, 1);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
@@ -702,7 +665,6 @@ mod tests {
         assert_eq!(layout.top_rule_lines, 0);
         assert_eq!(layout.help_lines, 1);
         assert_eq!(layout.model_header_lines, 0);
-        assert_eq!(layout.spacer_lines, 0);
         assert_eq!(layout.min_textarea_lines, 1);
     }
 
@@ -738,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_editor_divider_renders_in_footer_spacer_instead_of_top_row() {
+    fn normal_editor_renders_without_decorative_divider_rows() {
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::with_options(
             backend,
@@ -765,22 +727,12 @@ mod tests {
         let popup_x = viewport_area.x + viewport_area.width.saturating_sub(popup_width) / 2;
         let inner_x = popup_x + 1;
         let inner_width = popup_width.saturating_sub(2);
-
-        let top_row = buffer_row(terminal.backend(), viewport_area.y, inner_x, inner_width);
-        let spacer_row = buffer_row(
-            terminal.backend(),
-            viewport_area.y + 4,
-            inner_x,
-            inner_width,
-        );
-
-        assert!(!top_row.starts_with('╶'));
-        assert!(spacer_row.starts_with('╶'));
-    }
-
-    #[test]
-    fn divider_line_spans_requested_width() {
-        let rendered = divider_line(12);
-        assert_eq!(rendered.width(), 12);
+        for y in viewport_area.y..viewport_area.bottom() {
+            let row = buffer_row(terminal.backend(), y, inner_x, inner_width);
+            assert!(
+                !row.starts_with('╶'),
+                "viewport row {y} still contains a decorative divider: {row:?}"
+            );
+        }
     }
 }
