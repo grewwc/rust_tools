@@ -1280,7 +1280,7 @@ fn normalize_messages_keeps_contiguous_tool_call_blocks() {
 }
 
 #[test]
-fn normalize_messages_preserves_tool_evidence_when_malformed_tool_calls_are_dropped() {
+fn normalize_messages_preserves_tool_result_when_tool_call_args_are_malformed() {
     let messages = vec![
         Message {
             role: "system".to_string(),
@@ -1328,20 +1328,29 @@ fn normalize_messages_preserves_tool_evidence_when_malformed_tool_calls_are_drop
 
     let normalized = normalize_messages_for_request(&messages);
 
-    assert_eq!(normalized.len(), 4);
-    assert_eq!(normalized[2].role, "internal_note");
-    let note = normalized[2].content.as_str().unwrap_or_default();
-    assert!(note.contains("preserved unmatched tool outputs"));
-    assert!(note.contains("failed to parse arguments"));
-    assert_eq!(normalized[3].role, "assistant");
-    assert_eq!(normalized[3].content.as_str(), Some("later answer"));
-    assert!(normalized.iter().all(|message| message.role != "tool"));
-    assert!(
-        normalized
-            .iter()
-            .skip(1)
-            .all(|message| message.tool_calls.is_none())
+    // 坏 JSON args 不再导致 tool_call 被丢弃降级：assistant 的 tool_call 与真实
+    // tool 结果都必须保留，args 被修复成合法 JSON 对象（保住原始文本）以过
+    // provider 校验。这样模型仍能看到真实执行结果，不会误判需要重跑同一工具。
+    assert_eq!(normalized.len(), 5);
+    assert_eq!(normalized[2].role, "assistant");
+    let calls = normalized[2].tool_calls.as_ref().expect("tool_calls kept");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].id, "call_1");
+    // args 必须是合法 JSON，且原始坏文本被完整保留。
+    let parsed: Value = serde_json::from_str(&calls[0].function.arguments)
+        .expect("repaired args must be valid JSON");
+    assert_eq!(
+        parsed.get("_malformed_arguments").and_then(Value::as_str),
+        Some("{\"command\":")
     );
+    assert_eq!(normalized[3].role, "tool");
+    assert_eq!(normalized[3].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(
+        normalized[3].content.as_str(),
+        Some("Error: failed to parse arguments")
+    );
+    assert_eq!(normalized[4].role, "assistant");
+    assert_eq!(normalized[4].content.as_str(), Some("later answer"));
 }
 
 #[test]

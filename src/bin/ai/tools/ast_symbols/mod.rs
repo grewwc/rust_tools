@@ -37,7 +37,7 @@ impl SymbolEntry {
 }
 
 /// 按扩展名推断 AST 支持的语言；不支持的返回 None。
-/// 与 lsp_tools::detect_language 不同，这里只覆盖 ast_symbols 真正能解析的 8 种语言，
+/// 与 code_search 内 LSP 实现的 detect_language 不同，这里只覆盖 ast_symbols 真正能解析的 8 种语言，
 /// 供 read_file 等路径判断是否值得生成符号大纲。
 pub(crate) fn language_for_path(file_path: &str) -> Option<&'static str> {
     let ext = std::path::Path::new(file_path)

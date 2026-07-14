@@ -539,16 +539,6 @@ const CAPABILITY_CATALOG: &[CapabilityEntry] = &[
         hint: "For Feishu/Lark docs or sheets, enable the relevant MCP tools before proceeding.",
     },
     CapabilityEntry {
-        use_case: "Inspect repository status or diffs.",
-        tools: &["git_status", "git_diff"],
-        hint: "",
-    },
-    CapabilityEntry {
-        use_case: "Build, compile, or run Rust test workflows.",
-        tools: &["cargo_check", "cargo_test"],
-        hint: "",
-    },
-    CapabilityEntry {
         use_case: "Undo or redo prior editor changes.",
         tools: &["undo", "redo"],
         hint: "",
@@ -1919,7 +1909,6 @@ mod tests {
         // 基础只读 / 检索能力应作为 baseline 常驻补回，避免窄白名单 skill 把
         // read_file 等最基本的阅读工具剔除，导致主 Agent 连用户点名的文件都读不了。
         assert!(names.contains(&"read_file".to_string()));
-        assert!(names.contains(&"read_file_lines".to_string()));
         assert!(names.contains(&"list_directory".to_string()));
         assert!(names.contains(&"find_path".to_string()));
         assert!(names.contains(&"text_grep".to_string()));

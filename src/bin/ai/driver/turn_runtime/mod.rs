@@ -35,7 +35,7 @@ pub(super) use orchestrator::run_turn;
 use persistence::persist_pending_turn_messages;
 pub(crate) use prepare::QuestionShape;
 #[cfg(test)]
-use tool_result::prepare_tool_result;
+use tool_result::{prepare_recent_tool_result, prepare_tool_result};
 pub(super) use types::TurnOutcome;
 
 const MAX_TOOL_RESULT_INLINE_CHARS: usize = 32_000;
@@ -320,6 +320,32 @@ mod tests {
     }
 
     #[test]
+    fn prepare_recent_tool_result_keeps_large_output_raw_for_model() {
+        let history_file = std::env::temp_dir().join(format!(
+            "ai-tool-overflow-recent-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let mut app = test_app(history_file.clone());
+        let store = SessionStore::new(history_file.as_path());
+        store.ensure_root_dir().unwrap();
+        app.session_history_file = store.session_history_file(&app.session_id);
+        std::fs::write(&app.session_history_file, b"test").unwrap();
+
+        let content = "x".repeat(MAX_TOOL_RESULT_INLINE_CHARS + 256);
+        let prepared = prepare_recent_tool_result(&app, "mcp_big_payload", &content);
+
+        assert_eq!(prepared.content_for_model, content);
+        assert!(
+            prepared
+                .content_for_terminal
+                .contains("Saved full output to"),
+            "terminal preview should still keep overflow ergonomics"
+        );
+
+        let _ = store.delete_session(&app.session_id);
+    }
+
+    #[test]
     fn prepare_tool_result_json_stub_includes_keys_and_samples() {
         let history_file = std::env::temp_dir().join(format!(
             "ai-tool-overflow-json-{}.sqlite",
@@ -393,7 +419,7 @@ mod tests {
     #[test]
     fn read_file_lines_uses_shorter_terminal_preview_policy() {
         let history_file = std::env::temp_dir().join(format!(
-            "ai-tool-preview-read-file-lines-{}.sqlite",
+            "ai-tool-preview-read-file-{}.sqlite",
             uuid::Uuid::new_v4()
         ));
         let app = test_app(history_file);
@@ -403,7 +429,7 @@ mod tests {
             content.push_str(&format!("{}→{}\n", i, "x".repeat(100)));
         }
 
-        let prepared = prepare_tool_result(&app, "read_file_lines", &content);
+        let prepared = prepare_tool_result(&app, "read_file", &content);
 
         assert_eq!(prepared.content_for_model, content);
         assert!(

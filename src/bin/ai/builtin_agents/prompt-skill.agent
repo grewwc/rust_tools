@@ -18,7 +18,6 @@ tools:
   - save_skill
   - save_agent
   - read_file
-  - read_file_lines
   - write_file
   - apply_patch
   - code_search

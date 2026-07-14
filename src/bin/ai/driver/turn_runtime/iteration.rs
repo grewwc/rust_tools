@@ -715,8 +715,7 @@ pub(super) async fn execute_turn_iteration(
 mod tests {
     use super::{
         StreamingFlagGuard, no_tool_handoff_note, request_interrupt_pending,
-        should_try_pre_request_llm_summary,
-        store_last_pre_request_summary_chars,
+        should_try_pre_request_llm_summary, store_last_pre_request_summary_chars,
     };
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, atomic::Ordering};

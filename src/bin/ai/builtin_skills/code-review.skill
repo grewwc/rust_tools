@@ -5,17 +5,12 @@ author: system
 version: 3.0
 tools:
   - read_file
-  - read_file_lines
   - write_file
   - apply_patch
   - find_path
   - search_files
   - list_directory
   - execute_command
-  - git_status
-  - git_diff
-  - cargo_check
-  - cargo_test
   - web_search
   - web_fetch
 priority: 70
@@ -28,10 +23,10 @@ skip_recall: true
 
 ## 🧰 工具使用约定
 
-- 读取代码：先用 `find_path` / `search_files` 按文件名定位，或用 `code_search` 搜符号/内容；已知文件但还需要较宽上下文时用 `read_file`，只有在已定位到具体区域后再用 `read_file_lines` 做精确读取。
-- 搜索定位：用 `find_path` / `search_files` 按文件名/路径找文件；用 `code_search`（operation=text_search）做内容/引用检索；变更对比优先用 `git_status`/`git_diff`。
+- 读取代码：先用 `find_path` / `search_files` 按文件名定位，或用 `code_search` 搜符号/内容；已知文件但还需要较宽上下文时用 `read_file` 给较大 limit，只有在已定位到具体区域后再用 `read_file` 给小 limit 做精确读取。
+- 搜索定位：用 `find_path` / `search_files` 按文件名/路径找文件；用 `code_search`（operation=text_search）做内容/引用检索；变更对比用 `execute_command` 跑 `git status` / `git diff`（大 diff 用 `| sed -n` 分页或 pathspec 缩窄）。
 - 修改方式：默认只给建议；当用户明确要求"直接改代码"时，优先用 `apply_patch` 做最小改动，必要时再用 `write_file` 覆盖写入。
-- 验证：Rust 项目优先 `cargo_check`/`cargo_test`；其他项目用 `execute_command` 跑现有的 lint/test 命令（注意危险命令会被拦截，输出也会截断）。
+- 验证：用 `execute_command` 跑验证命令，Rust 项目优先范围限定的 `cargo check --bin a` / `cargo test --bin a <test>`（勿跑全 workspace）；其他项目用现有的 lint/test 命令（注意危险命令会被拦截，输出也会截断）。
 
 ## 🎯 核心能力
 

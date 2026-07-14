@@ -83,8 +83,10 @@ fn folds_early_groups_in_a_single_bloated_turn() {
 
     let (folded, folded_groups) = fold_early_tool_groups(&messages, 4);
 
-    // 10 组里最近 4 组逐字保留，较早 6 组被折叠。
-    assert_eq!(folded_groups, 6);
+    // 10 组各 1 条 tool 结果 → 10 条 tool 消息。虽然 keep_recent_groups=4，但
+    // 折叠必须尊重统一的「最近 KEEP_RECENT_TOOL_MESSAGES(6) 条 tool 结果」保护窗口，
+    // 因此实际只折叠最早 4 组，保留最近 6 组逐字。
+    assert_eq!(folded_groups, 4);
     let after = messages_total_chars(&folded);
     assert!(
         after < before,
@@ -110,12 +112,14 @@ fn keeps_recent_groups_verbatim() {
     let messages = single_turn_with_groups(8, 1_500);
     let (folded, _) = fold_early_tool_groups(&messages, 4);
 
-    // 最近 4 组的 tool 结果应原样保留（未被折叠成 stub）。
+    // 8 组各 1 条 tool 结果。keep_recent_groups=4 会想折叠最早 4 组，但统一的
+    // 最近 6 条 tool 结果保护窗口把折叠边界夹到只允许折叠最早 2 组，故保留
+    // 最近 6 组的 tool 结果逐字。
     let full_tool_results = folded
         .iter()
         .filter(|m| m.role == "tool" && value_to_string(&m.content) == "x".repeat(1_500))
         .count();
-    assert_eq!(full_tool_results, 4);
+    assert_eq!(full_tool_results, 6);
 }
 
 #[test]
@@ -125,6 +129,31 @@ fn no_op_when_group_count_within_keep_window() {
 
     assert_eq!(folded_groups, 0);
     assert_eq!(folded.len(), messages.len());
+}
+
+/// 统一保护窗口不变量：即使调用方要求最激进的 `keep_recent_groups=0`（折叠全部
+/// 工具组），折叠也必须尊重与 dedup/offload/prune 一致的「最近
+/// KEEP_RECENT_TOOL_MESSAGES 条 tool 结果」保护窗口，绝不把近端 tool 结果折成
+/// stub。否则近端结果被弱化，模型会误以为需要重跑同一工具（read_file /
+/// execute_command 重复调用的根因）。
+#[test]
+fn fold_never_crosses_recent_tool_message_protection_window() {
+    let messages = single_turn_with_groups(10, 1_200);
+
+    // keep_recent_groups=0 表面上要折叠全部 10 组。
+    let (folded, folded_groups) = fold_early_tool_groups(&messages, 0);
+
+    // 每组 1 条 tool 结果 → 只允许折叠最早 4 组，保留最近 6 组逐字。
+    assert_eq!(folded_groups, 4);
+    let full_tool_results = folded
+        .iter()
+        .filter(|m| m.role == "tool" && value_to_string(&m.content) == "x".repeat(1_200))
+        .count();
+    assert_eq!(
+        full_tool_results, KEEP_RECENT_TOOL_MESSAGES,
+        "最近 KEEP_RECENT_TOOL_MESSAGES 条 tool 结果必须逐字保留，不受激进折叠影响"
+    );
+    assert_tool_pairs_consistent(&folded);
 }
 
 #[test]

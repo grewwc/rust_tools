@@ -128,8 +128,19 @@ pub(crate) fn execute_read_file(args: &Value) -> Result<String, String> {
     let start = offset.saturating_sub(1).min(total);
     let end = (start + limit).min(total);
 
-    let rendered = render_line_excerpt(&content, start, end, None).text;
-    let rendered = append_truncation_notice(rendered, start, end, total);
+    let excerpt = render_line_excerpt(&content, start, end, Some(MAX_READ_FILE_RESULT_CHARS));
+    // 用实际渲染行数计算续读锚点：字符上限可能在请求的 `end` 之前就截断，
+    // 若沿用 `end` 会让续读 offset 跳过未显示的行（静默丢数据）。
+    let shown_end = start + excerpt.shown_lines;
+    let size_capped = shown_end < end || excerpt.truncated_mid_line;
+    let rendered = append_truncation_notice(
+        excerpt.text,
+        start,
+        shown_end,
+        total,
+        size_capped,
+        excerpt.truncated_mid_line,
+    );
     Ok(append_symbol_outline_if_useful(
         rendered, file_path, &content, start,
     ))
@@ -161,56 +172,62 @@ fn append_symbol_outline_if_useful(
     rendered
 }
 
+/// 单次 read_file / read_file_lines 结果的字符硬上限。
+///
+/// 行分页（offset/limit）只约束"行数"，无法约束"字符量"：minified JS/JSON、
+/// 单行几十万字符的病理文件即使只读 1 行也能产出 MB 级结果，raw 进入 messages
+/// 会瞬间撑爆上下文。此上限把单条读取结果钳到与 inline 预算同量级（64K），
+/// 超出部分通过统一的 offset 续读契约让模型分页取回，而不是静默丢弃。
+const MAX_READ_FILE_RESULT_CHARS: usize = 64_000;
+
 /// 当本次读取没有覆盖到文件末尾时，追加一条明确提示，告知模型文件仍有
 /// 剩余行未显示以及如何继续读取。避免模型把"截断结果"误判为"完整文件"。
+///
+/// `shown_end` 必须是**实际渲染到的行号**（`start + shown_lines`），不能用请求的
+/// `limit` 推算——否则字符上限提前截断时，续读 `offset` 会指向错误位置，导致中间
+/// 若干行被静默跳过。`size_capped` 表示本次截断是由字符上限触发（而非行数用尽），
+/// `truncated_mid_line` 表示最后一行因体积在行中被截断（其余部分已丢弃）。
 fn append_truncation_notice(
     mut rendered: String,
     start: usize,
-    end: usize,
+    shown_end: usize,
     total: usize,
+    size_capped: bool,
+    truncated_mid_line: bool,
 ) -> String {
-    let remaining = total.saturating_sub(end);
-    if remaining > 0 {
-        if !rendered.is_empty() {
-            rendered.push('\n');
+    let remaining = total.saturating_sub(shown_end);
+    if remaining == 0 && !truncated_mid_line {
+        return rendered;
+    }
+    if !rendered.is_empty() {
+        rendered.push('\n');
+    }
+    let continue_offset = shown_end + 1;
+    if size_capped {
+        rendered.push_str(&format!(
+            "... [truncated: output capped at {MAX_READ_FILE_RESULT_CHARS} chars; showing lines {}-{} of {}; {} more line(s) not shown. Continue with offset={} to read the rest.]",
+            start + 1,
+            shown_end,
+            total,
+            remaining,
+            continue_offset
+        ));
+        if truncated_mid_line {
+            rendered.push_str(&format!(
+                "\n... [note: line {shown_end} was truncated mid-line due to size; the remainder of that line is omitted.]"
+            ));
         }
+    } else {
         rendered.push_str(&format!(
             "... [truncated: showing lines {}-{} of {}; {} more line(s) not shown. Continue with offset={} to read the rest.]",
             start + 1,
-            end,
+            shown_end,
             total,
             remaining,
-            end + 1
+            continue_offset
         ));
     }
     rendered
-}
-
-pub(crate) fn execute_read_file_lines(args: &Value) -> Result<String, String> {
-    let file_path = resolve_file_path_arg(args)?;
-    let store = FileStore::new(PathBuf::from(file_path));
-    store.validate_read_access().map_err(|e| e.to_string())?;
-    store.ensure_exists().map_err(|e| e.to_string())?;
-    if crate::ai::files::is_image_path(file_path) {
-        return Ok(image_read_redirect_message(file_path));
-    }
-
-    let offset = args["offset"].as_u64().unwrap_or(1).max(1) as usize;
-    let limit = args["limit"].as_u64().unwrap_or(200).clamp(1, 400) as usize;
-    let content = store.read_to_string().map_err(|e| e.to_string())?;
-    // 用 lines() 统计总行数，避免按 '\n' 计数在"末尾无换行符"时漏掉最后一行。
-    let total = content.lines().count();
-    let start = offset.saturating_sub(1);
-    if start >= total {
-        return Ok(String::new());
-    }
-    let end = (start + limit).min(total);
-
-    let rendered = render_line_excerpt(&content, start, end, None).text;
-    let rendered = append_truncation_notice(rendered, start, end, total);
-    Ok(append_symbol_outline_if_useful(
-        rendered, file_path, &content, start,
-    ))
 }
 
 pub(crate) fn execute_write_file(args: &Value) -> Result<String, String> {
@@ -421,6 +438,70 @@ mod tests {
     }
 
     #[test]
+    fn test_read_file_size_cap_uses_actual_shown_lines_for_continue_offset() {
+        // 病理文件：每行很宽，行数远少于请求的 limit，但字符量超过硬上限。
+        // 关键回归点：截断提示的续读 offset 必须基于"实际渲染的行数"，
+        // 而不是请求的 limit——否则中间若干行会被静默跳过。
+        let path = make_temp_path("bigchars");
+        let wide_line = "x".repeat(2_000);
+        let content = (0..100)
+            .map(|_| wide_line.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, &content).unwrap();
+
+        let read_args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": 1,
+            "limit": 1000
+        });
+        let output = execute_read_file(&read_args).unwrap();
+
+        // 必须提示"因体积截断"，且明确标注字符上限。
+        assert!(output.contains("output capped at"), "output: {output}");
+        assert!(output.contains("truncated"), "output: {output}");
+        // 输出不得超过硬上限太多（渲染行前缀 + 提示，留合理余量）。
+        assert!(
+            output.chars().count() <= MAX_READ_FILE_RESULT_CHARS + 2_000,
+            "output len {} exceeds cap",
+            output.chars().count()
+        );
+
+        // 从提示里解析续读 offset，验证它指向"实际显示的最后一行的下一行"，
+        // 且续读能拿到紧接着的内容（不跳行）。
+        let marker = "Continue with offset=";
+        let idx = output.find(marker).expect("continue offset present");
+        let rest = &output[idx + marker.len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let continue_offset: usize = digits.parse().expect("offset is a number");
+        assert!(
+            continue_offset > 1,
+            "offset should advance: {continue_offset}"
+        );
+
+        // 用续读 offset 再读一次，第一行行号必须正好等于 continue_offset，
+        // 证明没有静默跳过任何行。
+        let next_args = serde_json::json!({
+            "file_path": path.to_string_lossy(),
+            "offset": continue_offset,
+            "limit": 1
+        });
+        let next = execute_read_file(&next_args).unwrap();
+        let first_line_no: usize = next
+            .lines()
+            .next()
+            .and_then(|l| l.split('\t').next())
+            .and_then(|n| n.trim().parse().ok())
+            .expect("first rendered line number");
+        assert_eq!(
+            first_line_no, continue_offset,
+            "continue offset must not skip lines"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_read_file_lines_reads_last_line_without_trailing_newline() {
         // 文件末尾无换行符时，旧实现按 '\n' 计数会漏掉最后一行。
         let path = make_temp_path("lastline");
@@ -431,7 +512,7 @@ mod tests {
             "offset": 1,
             "limit": 100
         });
-        let output = execute_read_file_lines(&read_args).unwrap();
+        let output = execute_read_file(&read_args).unwrap();
         assert!(output.contains("third"), "output: {output}");
 
         let _ = fs::remove_file(&path);
@@ -451,7 +532,7 @@ mod tests {
             "offset": 5,
             "limit": 6
         });
-        let result = execute_read_file_lines(&args);
+        let result = execute_read_file(&args);
         assert!(result.is_ok(), "read failed: {:?}", result);
 
         let output = result.unwrap();
@@ -632,7 +713,7 @@ mod tests {
             "offset": 3,
             "limit": 2
         });
-        let output = execute_read_file_lines(&args).unwrap();
+        let output = execute_read_file(&args).unwrap();
         assert!(!output.contains("Symbol outline"), "output: {output}");
         assert!(output.contains("Beta"), "output: {output}");
 
@@ -666,8 +747,8 @@ mod tests {
                 "offset": 2,
                 "limit": 1
             });
-            let lines = execute_read_file_lines(&lines_args)
-                .expect("read_file_lines should accept path alias");
+            let lines = execute_read_file(&lines_args)
+                .expect("read_file should accept path alias");
             assert!(lines.contains("line2"), "output: {lines}");
             assert!(!lines.contains("line3"), "output: {lines}");
         });

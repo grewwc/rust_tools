@@ -292,13 +292,20 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
 
     fn sanitize_tool_call_for_request(
         tool_call: &crate::ai::types::ToolCall,
-    ) -> Option<crate::ai::types::ToolCall> {
+    ) -> crate::ai::types::ToolCall {
         let raw_args = tool_call.function.arguments.trim();
+        // args 必须是合法 JSON 对象字符串才能过 provider 校验。但绝不能因为
+        // args 坏了就丢弃整个 tool_call：该工具此时早已执行完并产生了真实结果，
+        // 丢 tool_call 会破坏 assistant/tool 配对，导致真实 tool 结果被降级成
+        // 预览 note（read_file/execute_command 结果被弱化 → 模型误判
+        // 要重跑同一工具的根因之一）。坏 JSON 时修复成合法对象并原样保留原始
+        // 文本，既满足 provider 校验又保住配对与结果。
         let normalized_arguments = if raw_args.is_empty() {
             "{}".to_string()
-        } else {
-            serde_json::from_str::<Value>(raw_args).ok()?;
+        } else if serde_json::from_str::<Value>(raw_args).is_ok() {
             raw_args.to_string()
+        } else {
+            serde_json::json!({ "_malformed_arguments": raw_args }).to_string()
         };
 
         let mut sanitized = tool_call.clone();
@@ -307,7 +314,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
         if sanitized.tool_type.is_empty() {
             sanitized.tool_type = "function".to_string();
         }
-        Some(sanitized)
+        sanitized
     }
 
     fn sanitize_tool_message_sequence(messages: Vec<Message>) -> Vec<Message> {
@@ -380,30 +387,9 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
 
             let sanitized_tool_calls = tool_calls
                 .iter()
-                .filter_map(sanitize_tool_call_for_request)
+                .map(sanitize_tool_call_for_request)
                 .collect::<Vec<_>>();
             let mut scan = idx + 1;
-
-            if sanitized_tool_calls.is_empty() {
-                let mut raw_tool_messages = Vec::new();
-                while scan < messages.len() && messages[scan].role == "tool" {
-                    raw_tool_messages.push(messages[scan].clone());
-                    scan += 1;
-                }
-                let mut assistant_only = message.clone();
-                assistant_only.tool_calls = None;
-                if !content_is_effectively_empty(&assistant_only.content) {
-                    out.push(assistant_only);
-                }
-                if let Some(note) = build_unpaired_tool_evidence_note(
-                    "tool_calls dropped because arguments failed request sanitization",
-                    &raw_tool_messages,
-                ) {
-                    out.push(note);
-                }
-                idx = scan.max(idx + 1);
-                continue;
-            }
 
             let expected_ids = sanitized_tool_calls
                 .iter()

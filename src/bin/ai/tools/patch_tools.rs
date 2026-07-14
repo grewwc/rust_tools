@@ -28,7 +28,7 @@ fn params_apply_patch() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "apply_patch",
-        description: "Apply a localized patch to one file. Supports raw unified-diff hunks and the common single-file `*** Begin Patch` envelope. Prefer this for updating an existing document or source file with the smallest localized change instead of rewriting the entire file. Creates missing parent directories; fails if context/removals do not match.",
+        description: "Apply a localized patch to one file. Supports raw unified-diff hunks and the common single-file `*** Begin Patch` envelope. Prefer this for updating an existing document or source file with the smallest localized change instead of rewriting the entire file. Creates missing parent directories; removals must match, while context may be fuzzed only when removals uniquely anchor the hunk.",
         parameters: params_apply_patch,
         execute: execute_apply_patch,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -341,6 +341,14 @@ enum MatchMode {
     IgnoreIndent,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextPolicy {
+    /// context 行必须匹配，remove 行也必须匹配。
+    Require,
+    /// context 行只作为定位参考；应用时保留文件中的实际 context，remove 行仍必须匹配。
+    Fuzz,
+}
+
 /// 剥离 read_file/read_file_lines 输出的行号前缀（如 `   42| ` 或 `42: `）。
 /// 模型有时会不小心把行号前缀复制进 patch 的 context/remove 行中。
 /// 仅匹配 `digits + 分隔符` 模式，避免误剥真正的代码行。
@@ -417,6 +425,184 @@ fn all_hunk_match_positions(
         candidate += 1;
     }
     positions
+}
+
+fn hunk_old_line_count(hunk: &UnifiedHunk) -> usize {
+    hunk.lines
+        .iter()
+        .filter(|line| matches!(line, UnifiedLine::Context(_) | UnifiedLine::Remove(_)))
+        .count()
+}
+
+fn hunk_remove_offsets(hunk: &UnifiedHunk) -> Vec<(usize, &str)> {
+    let mut old_offset = 0usize;
+    let mut offsets = Vec::new();
+    for line in &hunk.lines {
+        match line {
+            UnifiedLine::Context(_) => old_offset += 1,
+            UnifiedLine::Remove(s) => {
+                offsets.push((old_offset, s.as_str()));
+                old_offset += 1;
+            }
+            UnifiedLine::Add(_) => {}
+        }
+    }
+    offsets
+}
+
+fn remove_lines_match_at(
+    orig_lines: &[String],
+    remove_offsets: &[(usize, &str)],
+    start: usize,
+    mode: MatchMode,
+) -> bool {
+    remove_offsets.iter().all(|(offset, expected)| {
+        orig_lines
+            .get(start + offset)
+            .is_some_and(|actual| lines_match(actual, expected, mode))
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FuzzyContextMatch {
+    pos: usize,
+    context_matches: usize,
+    context_total: usize,
+}
+
+fn score_context_matches(
+    orig_lines: &[String],
+    hunk: &UnifiedHunk,
+    start: usize,
+    mode: MatchMode,
+) -> (usize, usize) {
+    let mut old_offset = 0usize;
+    let mut matches = 0usize;
+    let mut total = 0usize;
+    for line in &hunk.lines {
+        match line {
+            UnifiedLine::Context(expected) => {
+                total += 1;
+                if orig_lines
+                    .get(start + old_offset)
+                    .is_some_and(|actual| lines_match(actual, expected, mode))
+                {
+                    matches += 1;
+                }
+                old_offset += 1;
+            }
+            UnifiedLine::Remove(_) => old_offset += 1,
+            UnifiedLine::Add(_) => {}
+        }
+    }
+    (matches, total)
+}
+
+fn fuzzy_context_candidates(
+    orig_lines: &[String],
+    hunk: &UnifiedHunk,
+    cursor: usize,
+    mode: MatchMode,
+) -> Vec<FuzzyContextMatch> {
+    let old_len = hunk_old_line_count(hunk);
+    let remove_offsets = hunk_remove_offsets(hunk);
+    if old_len == 0 || remove_offsets.is_empty() || old_len > orig_lines.len() {
+        return Vec::new();
+    }
+
+    let (first_remove_offset, first_remove) = remove_offsets[0];
+    let Some(first_scan_line) = cursor.checked_add(first_remove_offset) else {
+        return Vec::new();
+    };
+    if first_scan_line >= orig_lines.len() {
+        return Vec::new();
+    }
+
+    let mut candidates = Vec::new();
+    for file_line in first_scan_line..orig_lines.len() {
+        if !lines_match(&orig_lines[file_line], first_remove, mode) {
+            continue;
+        }
+        let Some(start) = file_line.checked_sub(first_remove_offset) else {
+            continue;
+        };
+        if start < cursor || start + old_len > orig_lines.len() {
+            continue;
+        }
+        if !remove_lines_match_at(orig_lines, &remove_offsets, start, mode) {
+            continue;
+        }
+        let (context_matches, context_total) = score_context_matches(orig_lines, hunk, start, mode);
+        candidates.push(FuzzyContextMatch {
+            pos: start,
+            context_matches,
+            context_total,
+        });
+    }
+
+    candidates.sort_by_key(|candidate| candidate.pos);
+    candidates.dedup_by_key(|candidate| candidate.pos);
+    candidates
+}
+
+/// context 行是定位辅助，不应在 remove 行已经精确锚定时导致硬失败。
+/// 但为了避免把常见 remove 行（如 `}`）改错位置，只有候选唯一，或剩余 context
+/// 能唯一打分时才允许 fuzz 应用。
+fn locate_hunk_with_fuzzy_context(
+    orig_lines: &[String],
+    hunk: &UnifiedHunk,
+    cursor: usize,
+    mode: MatchMode,
+) -> Result<Option<FuzzyContextMatch>, String> {
+    let candidates = fuzzy_context_candidates(orig_lines, hunk, cursor, mode);
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    if candidates.len() == 1 {
+        return Ok(candidates.first().copied());
+    }
+
+    let best_score = candidates
+        .iter()
+        .map(|candidate| candidate.context_matches)
+        .max()
+        .unwrap_or(0);
+    let best: Vec<FuzzyContextMatch> = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| candidate.context_matches == best_score)
+        .collect();
+    if best.len() == 1 && best_score > 0 {
+        return Ok(best.first().copied());
+    }
+
+    let nominal = hunk.old_start.saturating_sub(1);
+    if hunk.old_start > 0
+        && best_score > 0
+        && let Some(candidate) = best.iter().find(|candidate| candidate.pos == nominal)
+    {
+        return Ok(Some(*candidate));
+    }
+
+    let shown: Vec<String> = candidates
+        .iter()
+        .take(5)
+        .map(|candidate| {
+            format!(
+                "{} (context {}/{})",
+                candidate.pos + 1,
+                candidate.context_matches,
+                candidate.context_total
+            )
+        })
+        .collect();
+    Err(format!(
+        "ambiguous patch: remove lines match {} locations under context-fuzz mode (1-based lines: {}{}). \
+         Re-read the file and include more exact surrounding context, or split the hunk around a more unique removed line.",
+        candidates.len(),
+        shown.join(", "),
+        if candidates.len() > 5 { ", ..." } else { "" }
+    ))
 }
 
 /// 大块替换（hunk 含大量 context/remove 行）时，全有或全无的精确匹配极易因个别行
@@ -679,6 +865,7 @@ fn try_apply_hunk_at(
     hunk: &UnifiedHunk,
     start: usize,
     mode: MatchMode,
+    context_policy: ContextPolicy,
 ) -> Option<(Vec<String>, usize)> {
     let mut out = Vec::new();
     let mut idx = start;
@@ -686,7 +873,7 @@ fn try_apply_hunk_at(
         match line {
             UnifiedLine::Context(s) => {
                 let cur = orig_lines.get(idx)?;
-                if !lines_match(cur, s, mode) {
+                if context_policy == ContextPolicy::Require && !lines_match(cur, s, mode) {
                     return None;
                 }
                 out.push(cur.clone());
@@ -719,7 +906,7 @@ fn locate_hunk(
     let nominal = hunk.old_start.saturating_sub(1);
     let nominal_ok = nominal <= orig_lines.len()
         && nominal >= cursor
-        && try_apply_hunk_at(orig_lines, hunk, nominal, mode).is_some();
+        && try_apply_hunk_at(orig_lines, hunk, nominal, mode, ContextPolicy::Require).is_some();
     if nominal_ok {
         return Ok(Some(nominal));
     }
@@ -767,17 +954,37 @@ fn apply_unified_patch(original: &str, patch: &str) -> Result<String, String> {
         // 先做严格匹配（仅容忍行尾空白）。严格匹配全文件都定位不到时，再用忽略
         // 前导缩进的宽松模式兜底一次——对齐 `git apply --ignore-whitespace`，
         // 解决模型对 markdown/嵌套列表/代码块缩进复刻不准导致的 context mismatch。
-        let (apply_at, mode) = match locate_hunk(&orig_lines, hunk, cursor, MatchMode::Strict)? {
-            Some(at) => (at, MatchMode::Strict),
-            None => match locate_hunk(&orig_lines, hunk, cursor, MatchMode::IgnoreIndent)? {
-                Some(at) => (at, MatchMode::IgnoreIndent),
-                None => return Err(describe_context_mismatch(&orig_lines, hunk)),
-            },
-        };
+        let (apply_at, mode, context_policy) =
+            match locate_hunk(&orig_lines, hunk, cursor, MatchMode::Strict)? {
+                Some(at) => (at, MatchMode::Strict, ContextPolicy::Require),
+                None => match locate_hunk(&orig_lines, hunk, cursor, MatchMode::IgnoreIndent)? {
+                    Some(at) => (at, MatchMode::IgnoreIndent, ContextPolicy::Require),
+                    None => match locate_hunk_with_fuzzy_context(
+                        &orig_lines,
+                        hunk,
+                        cursor,
+                        MatchMode::Strict,
+                    )? {
+                        Some(candidate) => (candidate.pos, MatchMode::Strict, ContextPolicy::Fuzz),
+                        None => match locate_hunk_with_fuzzy_context(
+                            &orig_lines,
+                            hunk,
+                            cursor,
+                            MatchMode::IgnoreIndent,
+                        )? {
+                            Some(candidate) => {
+                                (candidate.pos, MatchMode::IgnoreIndent, ContextPolicy::Fuzz)
+                            }
+                            None => return Err(describe_context_mismatch(&orig_lines, hunk)),
+                        },
+                    },
+                },
+            };
 
         out.extend_from_slice(&orig_lines[cursor..apply_at]);
-        let (hunk_out, new_idx) = try_apply_hunk_at(&orig_lines, hunk, apply_at, mode)
-            .ok_or_else(|| describe_context_mismatch(&orig_lines, hunk))?;
+        let (hunk_out, new_idx) =
+            try_apply_hunk_at(&orig_lines, hunk, apply_at, mode, context_policy)
+                .ok_or_else(|| describe_context_mismatch(&orig_lines, hunk))?;
         out.extend(hunk_out);
         cursor = new_idx;
     }
@@ -1108,6 +1315,59 @@ mod tests {
         let patch = "@@ -1,1 +1,1 @@\n-    exact\n+    replaced\n";
         let result = apply_unified_patch(original, patch).unwrap();
         assert_eq!(result, "    replaced\nother\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_fuzzes_stale_context_when_remove_lines_are_unique() {
+        // 真实循环根因：模型把 context 行写成了过时/目标态内容，但 remove 行仍然
+        // 精确锚定目标。context 不应在这种情况下把 patch 硬拒绝。
+        let original = "alpha current\nold target\nomega current\n";
+        let patch = "\
+@@ -1,3 +1,3 @@
+ alpha stale
+-old target
++new target
+ omega stale
+";
+        let result = apply_unified_patch(original, patch).unwrap_or_else(|err| {
+            panic!("unique remove anchor should tolerate stale context, got: {err}")
+        });
+        assert_eq!(result, "alpha current\nnew target\nomega current\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_fuzzy_context_uses_remaining_context_to_disambiguate() {
+        // remove 行出现两次时，fuzz 仍可使用其他 context 行打分；只有唯一最高分
+        // 才能应用，避免退化成“改第一个相同 remove 行”。
+        let original = "alpha current\nold target\ntail one\nbeta current\nold target\ntail two\n";
+        let patch = "\
+@@ -1,3 +1,3 @@
+ stale head
+-old target
++new target
+ tail one
+";
+        let result = apply_unified_patch(original, patch).unwrap_or_else(|err| {
+            panic!("tail context should disambiguate fuzzy candidate, got: {err}")
+        });
+        assert_eq!(
+            result,
+            "alpha current\nnew target\ntail one\nbeta current\nold target\ntail two\n"
+        );
+    }
+
+    #[test]
+    fn apply_unified_patch_rejects_fuzzy_context_when_remove_anchor_is_ambiguous() {
+        let original = "alpha current\nold target\nbeta current\nold target\n";
+        let patch = "\
+@@ -1,2 +1,2 @@
+ stale context
+-old target
++new target
+";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("ambiguous patch"), "err was: {err}");
+        assert!(err.contains("context-fuzz"), "err was: {err}");
     }
 
     #[test]

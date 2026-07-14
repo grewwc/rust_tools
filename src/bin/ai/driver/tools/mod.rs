@@ -213,20 +213,6 @@ fn equivalent_tools(
     let candidates: &[ToolAlternative] = match tool_name {
         "read_file" => &[
             ToolAlternative {
-                name: "read_file_lines",
-                description: "line-range read",
-            },
-            ToolAlternative {
-                name: "code_search",
-                description: "locate the relevant region first",
-            },
-        ],
-        "read_file_lines" => &[
-            ToolAlternative {
-                name: "read_file",
-                description: "full-file read",
-            },
-            ToolAlternative {
                 name: "code_search",
                 description: "locate the relevant region first",
             },
@@ -314,9 +300,7 @@ fn remediation_hint(
             || err_lower.contains("missing patch")
             || err_lower.contains("patch target mismatch"))
     {
-        let read_file_hint = if tool_visible_in_current_turn(available_tool_names, "read_file")
-            || tool_visible_in_current_turn(available_tool_names, "read_file_lines")
-        {
+        let read_file_hint = if tool_visible_in_current_turn(available_tool_names, "read_file") {
             "build hunk context from raw file text only — do not copy line numbers, truncation notices, or the Symbol outline block into the patch"
         } else {
             "build hunk context from the exact current file text only"
@@ -376,10 +360,7 @@ fn remediation_hint(
     if tool_name == "execute_command" {
         let mut fallback = Vec::new();
         if tool_visible_in_current_turn(available_tool_names, "read_file") {
-            fallback.push("read files directly with `read_file`");
-        }
-        if tool_visible_in_current_turn(available_tool_names, "read_file_lines") {
-            fallback.push("inspect precise regions with `read_file_lines`");
+            fallback.push("read files (whole or precise line ranges) with `read_file`");
         }
         if tool_visible_in_current_turn(available_tool_names, "list_directory") {
             fallback.push("inspect directories with `list_directory`");

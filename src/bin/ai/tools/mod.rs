@@ -1,14 +1,11 @@
 mod ast_structural;
 pub(crate) mod ast_symbols;
-mod cargo_tools;
 mod code_search;
 pub(crate) mod command_tools;
 mod common;
 mod context_tools;
 pub(crate) mod enable_tools;
-mod git_tools;
 mod knowledge_tools;
-mod lsp_tools;
 pub mod os_tools;
 mod patch_tools;
 mod permissions;
@@ -40,7 +37,6 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
     "load_skill",
     "enable_tools",
     "read_file",
-    "read_file_lines",
     "list_directory",
     "find_path",
     "text_grep",

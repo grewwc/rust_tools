@@ -6,16 +6,11 @@ version: 3.0
 tools:
   - read_file
   - write_file
-  - read_file_lines
   - apply_patch
   - find_path
   - search_files
   - list_directory
   - execute_command
-  - git_status
-  - git_diff
-  - cargo_check
-  - cargo_test
 priority: 80
 skip_recall: true
 ---
@@ -86,7 +81,7 @@ examples:
     - 描述：修复编译错误并清理
       步骤：
         - 读取编译错误，定位问题
-        - read_file_lines 查看相关代码
+        - read_file 查看相关代码
         - apply_patch 应用最小修复
         - cargo build 验证
         - ls *.backup *.bak 确认无遗留文件

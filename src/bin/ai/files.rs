@@ -123,7 +123,7 @@ fn render_text_attachment_block(file: &str) -> io::Result<String> {
         preview.shown_lines.saturating_add(1).max(1)
     };
     out.push_str(&format!(
-        "\n[Attachment preview only: showing lines 1-{} of {} ({} chars total). If more detail is needed, call read_file_lines(file_path=\"{}\", offset={}, limit=200).]\n",
+        "\n[Attachment preview only: showing lines 1-{} of {} ({} chars total). If more detail is needed, call read_file(file_path=\"{}\", offset={}, limit=200).]\n",
         preview.shown_lines.max(1),
         total_lines,
         total_chars,
@@ -173,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn attachment_block_truncates_large_files_and_points_to_read_file_lines() {
+    fn attachment_block_truncates_large_files_and_points_to_read_file() {
         let path = make_temp_path("large", "rs");
         let content = (1..=400)
             .map(|idx| format!("fn item_{idx}() {{}}"))
@@ -187,7 +187,7 @@ mod tests {
             rendered.contains("Attachment preview only"),
             "rendered: {rendered}"
         );
-        assert!(rendered.contains("read_file_lines"), "rendered: {rendered}");
+        assert!(rendered.contains("read_file("), "rendered: {rendered}");
         assert!(rendered.contains("Symbol outline"), "rendered: {rendered}");
 
         let _ = fs::remove_file(path);

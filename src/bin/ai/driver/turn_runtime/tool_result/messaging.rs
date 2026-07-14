@@ -15,7 +15,7 @@ use crate::ai::{
 };
 
 use super::super::types::PreparedToolResult;
-use super::execution::prepare_tool_result;
+use super::execution::prepare_recent_tool_result;
 
 const CODE_INSPECTION_MEMORY_PREFIX: &str = "Current code-inspection working memory:";
 const CODE_DISCOVERY_PREFIX: &str = "code_discovery:";
@@ -187,7 +187,7 @@ pub(super) fn append_tool_result_messages(
         .iter()
         .zip(exec_result.tool_results.iter())
     {
-        let prepared = prepare_tool_result(app, &tool_call.function.name, &result.content);
+        let prepared = prepare_recent_tool_result(app, &tool_call.function.name, &result.content);
         for obs in app.observers.iter_mut() {
             if obs.is_poisoned() {
                 continue;
@@ -608,6 +608,7 @@ fn is_repo_inspection_tool(tool_name: &str) -> bool {
         tool_name,
         "code_search"
             | "read_file"
+            // 兼容旧会话历史里残留的 read_file_lines（已并入 read_file）。
             | "read_file_lines"
             | "search_files"
             | "find_path"

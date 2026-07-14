@@ -327,10 +327,10 @@ fn should_retry_once_only_for_safe_builtin_read_only_tools() {
 
 #[test]
 fn remediation_hint_only_mentions_alternatives_available_in_current_turn() {
-    let available: FastSet<String> = ["read_file_lines".to_string()].into_iter().collect();
+    // read_file 现在唯一的等价备选是 code_search（read_file_lines 已并入 read_file）。
+    let available: FastSet<String> = ["code_search".to_string()].into_iter().collect();
     let hint = remediation_hint("read_file", "not found", Some(&available)).expect("hint");
-    assert!(hint.contains("`read_file_lines`"));
-    assert!(!hint.contains("`code_search`"));
+    assert!(hint.contains("`code_search`"));
     assert!(!hint.contains("search_files"));
 }
 

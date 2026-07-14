@@ -21,7 +21,9 @@ use super::{
     overflow::{build_model_overflow_stub, summarize_large_tool_output, write_tool_overflow_file},
     preview::{build_terminal_preview, tail_chars},
 };
-use crate::ai::driver::print::{format_tool_output_line, print_tool_note_line};
+use crate::ai::driver::print::{
+    format_tool_output_line, print_tool_command_line, print_tool_note_line,
+};
 use crate::ai::theme::{ACCENT_MUTED, ACCENT_RULE, RESET};
 
 /// 适合"中段按行裁剪"的非精确概览工具。
@@ -172,6 +174,23 @@ pub(in crate::ai::driver::turn_runtime) fn prepare_tool_result(
 
     PreparedToolResult {
         content_for_model,
+        content_for_terminal,
+    }
+}
+
+/// 当前轮刚产出的 tool result 需要先以 raw content 进入 messages，
+/// 让“最近 N 条工具结果保留原文”的保护从入口就成立，而不是先在这里被
+/// stub/summary 弱化，再指望后面的 `KEEP_RECENT_TOOL_MESSAGES` 兜底。
+///
+/// 终端侧仍沿用原有 preview / overflow 文件逻辑，避免把超大结果整块刷到屏幕。
+pub(in crate::ai::driver::turn_runtime) fn prepare_recent_tool_result(
+    app: &App,
+    tool_name: &str,
+    content: &str,
+) -> PreparedToolResult {
+    let content_for_terminal = prepare_tool_result(app, tool_name, content).content_for_terminal;
+    PreparedToolResult {
+        content_for_model: content.to_string(),
         content_for_terminal,
     }
 }
@@ -505,7 +524,7 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
             "execute_command" | "run_command" | "shell" | "bash"
         ) {
             if let Some(line) = format_command_input(&tool_call.function.arguments) {
-                print_tool_note_line("cmd", &line);
+                print_tool_command_line(&line);
             }
         }
     }
@@ -568,7 +587,7 @@ impl tools::ToolExecutionObserver for TerminalToolObserver<'_> {
             return;
         }
 
-        let prepared = prepare_tool_result(
+        let prepared = prepare_recent_tool_result(
             self.app,
             &tool_call.function.name,
             &run_result.tool_result.content,

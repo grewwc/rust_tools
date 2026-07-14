@@ -103,24 +103,28 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
    compression's user-turn count, or being misread by the model as repeated
    user questions.
 
-10. Tool-result overflow (`turn_runtime/tool_result/`): single tool results are
-   inline up to `max_tool_result_inline_chars(model)` (model-aware: 32K floor,
-   ~12.5% of context window, 64K cap). Beyond that the full content is written
-   to a session file and replaced by a stub. The stub includes summary +
-   key_lines (structural lines: fn/struct/trait/enum/error) + head_preview +
-   tail_preview, giving the model recall anchors so it can decide whether a
-   re-read is needed without blindly re-calling `read_file`. `is_non_compressible_tool`
+10. Tool-result overflow (`turn_runtime/tool_result/`): **newly produced**
+   tool results must enter `messages` as raw model content first. Do not let
+   the ingress formatter weaken the current round's result into an overflow
+   stub / summary before the "recent tool results stay verbatim" protection has
+   a chance to apply; otherwise `KEEP_RECENT_TOOL_MESSAGES` only preserves an
+   already-weakened placeholder and the model behaves as if the tool result was
+   never really returned. The terminal preview may still use overflow files /
+   summaries for UX, but the model-side content for the current round stays raw.
+   Historical / non-recent tool results still use the existing overflow path:
+   single tool results are inline up to `max_tool_result_inline_chars(model)`
+   (model-aware: 32K floor, ~12.5% of context window, 64K cap), and older large
+   results may spill to a session file stub that includes summary + `key_lines`
+   + head/tail preview as recall anchors. `is_non_compressible_tool`
    (read_file/code_search/text_grep/web_search/**plan**/etc.) never goes through
    lossy `line_trim_middle` or whole-group folding — `plan` is the multi-step
    roadmap anchor: small in size but losing it makes the model forget the task
    mid-flight, so it is preserved verbatim like retrieval results.
-   Pre-request budget offload (`prepare_tool_messages_structured`) additionally
-   **protects the most recent `KEEP_RECENT_TOOL_MESSAGES` tool results from
-   spilling** — including non-compressible ones. Offloading the *just-read*
-   file/search output to a stub makes the model see "moved to disk, re-read it"
-   instead of content, so it re-issues the same `read_file` every turn (amnesia
-   loop, seen as `offload_only` climbing +1/turn while total chars keep growing).
-   Only precision results *outside* the recent window spill to disk.
+   Pre-request budget offload (`prepare_tool_messages_structured`) is therefore
+   the **second** line of defense: it additionally protects the most recent
+   `KEEP_RECENT_TOOL_MESSAGES` tool results from spilling, including
+   non-compressible ones. Only precision results *outside* the recent window
+   spill to disk.
 
 11. Coarse tool-loop detection must also normalize low-yield
    `execute_command` shell variants, not just JSON paging args. Collapse pure

@@ -6,7 +6,7 @@ use crate::ai::tools::common::{
 };
 use crate::ai::tools::service::delete::execute_delete_path;
 use crate::ai::tools::service::file::{
-    execute_read_file, execute_read_file_lines, execute_write_file, execute_write_file_streaming,
+    execute_read_file, execute_write_file, execute_write_file_streaming,
 };
 
 fn params_read_file() -> Value {
@@ -23,28 +23,7 @@ fn params_read_file() -> Value {
             },
             "limit": {
                 "type": "integer",
-                "description": "Requested number of lines to read for a broad local excerpt. Prefer this when you already know the file and need more than a tiny snippet."
-            }
-        },
-        "required": ["file_path"]
-    })
-}
-
-fn params_read_file_lines() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "file_path": {
-                "type": "string",
-                "description": "Absolute path to a regular file to read (directories are not supported; some sensitive paths are blocked)."
-            },
-            "offset": {
-                "type": "integer",
-                "description": "1-based line number to start reading from (default: 1)."
-            },
-            "limit": {
-                "type": "integer",
-                "description": "Number of lines to return (1-400; default: 200). Use this after you have already located the relevant line range or symbol."
+                "description": "Number of lines to read (default: 1000). During discovery, use a large limit for a broad overview; once you have located the relevant region (a symbol or line range), pass a small limit (e.g. 20-40) to read just that slice and avoid pulling unrelated lines. Very large results are additionally capped by a per-read character limit; when that happens the output ends with a truncation notice telling you the exact offset to continue from."
             }
         },
         "required": ["file_path"]
@@ -75,38 +54,19 @@ fn params_write_file() -> Value {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "read_file",
-        description: "Read a line-numbered excerpt from a local file (regular files only; directories are not supported; absolute paths only). Prefer this when you already know the file and want a broader local chunk before deciding whether a narrower follow-up read is necessary.",
+        description: "Read a line-numbered excerpt from a local file (regular files only; directories are not supported; absolute paths only). Use offset/limit to page: a large limit for a broad overview during discovery, a small limit for a precise line-range read once you know the region you need.",
         parameters: params_read_file,
         execute: execute_read_file,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
-        groups: &["builtin", "core"],
-    }
-});
-
-inventory::submit!(ToolRegistration {
-    spec: ToolSpec {
-        name: "read_file_lines",
-        description: "Read line-numbered text from a local file with configurable offset/limit (limit capped at 400). Prefer this only when you already know the relevant region and need a precise line-range read for inspection or patching.",
-        parameters: params_read_file_lines,
-        execute: execute_read_file_lines,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::Spawnable,
         groups: &["executor", "builtin", "core"],
     }
 });
 
-// read_file / read_file_lines 是高精度 grounding 结果：内容复现代价高，禁止
-// 有损压缩（只能零压缩外溢到磁盘留指针）；但旧版本一旦被模型连续判定过时，
-// 就允许 LLM 裁剪释放上下文——「不可有损压缩」不等于「不可裁剪」。
+// read_file 是高精度 grounding 结果：内容复现代价高，禁止有损压缩（只能零压缩
+// 外溢到磁盘留指针）；但旧版本一旦被模型连续判定过时，就允许 LLM 裁剪释放上下文
+// ——「不可有损压缩」不等于「不可裁剪」。
 inventory::submit!(ToolHistoryPolicyRegistration {
     name: "read_file",
-    policy: ToolHistoryPolicy {
-        lossy_compress: ToolLossyCompressPolicy::Never,
-        prune: ToolPrunePolicy::Allow,
-    },
-});
-
-inventory::submit!(ToolHistoryPolicyRegistration {
-    name: "read_file_lines",
     policy: ToolHistoryPolicy {
         lossy_compress: ToolLossyCompressPolicy::Never,
         prune: ToolPrunePolicy::Allow,

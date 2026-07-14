@@ -47,7 +47,22 @@ actually touches that subsystem.
    hardcoded name list. Invariant: dedup MUST run **before**
    `prepare_tool_messages_structured` (offload) in every compression path —
    offload rewrites identical results into stubs with unique temp-file paths, which
-   would defeat content-hash matching.
+   would defeat content-hash matching. **Unified recent-window invariant:** every
+   lossy path must protect the same tail — the most recent `KEEP_RECENT_TOOL_MESSAGES`
+   *tool messages*. `dedup`, offload, and `apply_pruning` already key off that count;
+   `fold_early_tool_groups` counts by *tool group* instead, so it additionally clamps
+   its fold boundary via `recent_tool_message_protection_anchor` so folding can never
+   cross the shared window even at `keep_recent_groups=0`. Do NOT re-introduce a
+   group-only fold window: a unit mismatch silently weakens a recent tool result that
+   the other paths swear to keep, and the model re-runs the tool (the `read_file`/`execute_command` repeat-call loop). Ingress protection
+   is the first line (`prepare_recent_tool_result` keeps the current turn's result raw
+   instead of stubbing it); these compression windows are the second. **Request-time
+   final line:** `sanitize_tool_call_for_request` (in `request/normalize.rs`) must NEVER
+   drop a tool_call just because its `arguments` are not valid JSON — the tool already
+   ran and produced a real result, so dropping the call breaks assistant/tool pairing
+   and degrades the real `tool` result into a 240-char preview note. Repair malformed
+   args into a valid object (`{"_malformed_arguments": "<raw>"}`) so pairing and the
+   real result survive.
 5. `models.json` may declare per-model `api_key_config_key` for compatible/openai-style
    gateways with provider-specific config names. Startup validation in `config.rs`
    must honor that field for the default model; do not assume only the built-in

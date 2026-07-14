@@ -38,7 +38,7 @@ execution policy, sandboxing, path resolution, or progressive loading.
    `lossy_compress` (`Allow`/`Never`) gates line-trimming/folding/summarizing;
    `prune` (`Allow`/`Never`) gates LLM-guided pruning of superseded results.
    Both default to `Allow` (unregistered tools). `plan` is `Never`/`Never`;
-   `read_file`/`read_file_lines`/`search_files`/`find_path`/`text_grep`/
+   `read_file`/`search_files`/`find_path`/`text_grep`/
    `code_search` are `Never`/`Allow` (precision results are never lossy-compressed
    but may still be pruned once superseded). Query via `tool_history_policy(name)`;
    the compression side wraps it as `is_non_compressible_tool` (lossy dimension)
@@ -64,18 +64,54 @@ execution policy, sandboxing, path resolution, or progressive loading.
    `on_background_group` callback of
    `run_cmd_output_streaming_with_timeout_tracked`; it cannot reference the
    binary-side registry directly.
-10. `execute_command` output (`service/command.rs::format_command_output`) must
-    stay self-describing so the model can tell "done" from "incomplete" without
-    re-running. Invariants: (a) success with empty output returns an explicit
+10. Any tool that truncates output must stay self-describing so the model can
+    tell "done" from "incomplete" without re-running. Canonical impl:
+    `execute_command` (`service/command.rs::format_command_output`). Invariants:
+    (a) success with empty output returns an explicit
     "succeeded with exit code 0 and produced no output" sentinel, never `""`;
     (b) failure prefixes `Exit code: N`; (c) truncation (`truncate_chars`, cap
     `MAX_COMMAND_OUTPUT_CHARS`) appends shown-vs-total char/line counts plus a
     warning that unseen matches may be in the cut-off tail and a hint to
     narrow/page instead of retrying variants. This exists because bare
     `... (truncated)` + silent-empty output previously drove strong models into
-    long near-identical grep retry loops (they couldn't tell if their target was
-    cut off or truly absent). Do not revert to an information-free truncation
-    marker.
+    long near-identical retry loops (they couldn't tell if their target was
+    cut off or truly absent — observed for both `execute_command` grep retries
+    and the now-removed `git_diff` tool). Do not add a tool that emits an
+    information-free truncation marker; if a tool caps output, its notice must
+    carry shown-vs-total counts and a concrete narrow/page path. Git and cargo
+    inspection are intentionally NOT separate tools — the model runs `git
+    status`/`git diff`/`cargo check`/`cargo test` through `execute_command`,
+    which already provides the self-describing truncation contract.
+11. `apply_patch` hunk matching uses remove lines as the hard anchor and context
+    lines as positioning evidence. Keep strict matching first, then tolerate
+    stale context only when the remove lines uniquely identify the target or the
+    remaining context gives a single best candidate. Ambiguous remove anchors
+    must fail instead of silently editing the first match.
+12. `read_file` (`service/file.rs`) paginates by **lines**
+    (`offset`/`limit`), but line paging cannot bound **characters**: a minified
+    or single-huge-line file produces an MB-scale result even at 1 line, which
+    would blow the context window once it enters `messages` raw. The reader
+    therefore also applies a character cap (`MAX_READ_FILE_RESULT_CHARS`, 64K) via
+    `render_line_excerpt(..., Some(cap))`. The truncation notice MUST compute the
+    continue-`offset` from the **actually rendered line count**
+    (`start + excerpt.shown_lines`), never from the requested `limit` — using
+    `limit` would point the model past unshown lines and silently drop the gap.
+    When the cut is size-triggered, the notice says so explicitly (`output capped
+    at N chars`) so the model knows to page on rather than assume EOF. Do not
+    revert the reader to `render_line_excerpt(..., None)`. The former separate
+    `read_file_lines` tool has been merged into `read_file` (offset/limit cover
+    both overview and precision reads); `registry/common.rs::canonical_tool_name`
+    maps the legacy `read_file_lines` name to `read_file` for old-session replay.
+13. `code_search` is the single code-navigation entry point; there is no separate
+    `lsp` tool. `code_search`'s six LSP operations (`go_to_definition`,
+    `find_references`, `hover`, `document_symbol`, `workspace_symbol`,
+    `diagnostics`) delegate to `execute_lsp` (a `pub(crate)` fn now living in
+    `code_search.rs`), and it adds `find_file`/`text_search`/`structural`,
+    no-match fallbacks, guidance, and path guards on top — a strict superset. The
+    tree-sitter-backed LSP implementation and its tests were moved out of the
+    deleted `lsp_tools.rs` into `code_search.rs`. `canonical_tool_name` maps the
+    legacy `lsp` name to `code_search` for old-session replay (same
+    `operation`/`file_path` arg shape).
 
 ## Related detailed guide
 

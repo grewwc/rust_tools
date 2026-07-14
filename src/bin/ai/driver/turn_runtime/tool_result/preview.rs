@@ -19,7 +19,7 @@ struct ToolTerminalPreviewPolicy {
 
 fn terminal_preview_policy(tool_name: &str) -> ToolTerminalPreviewPolicy {
     match tool_name {
-        "read_file_lines" | "read_file" => ToolTerminalPreviewPolicy {
+        "read_file" => ToolTerminalPreviewPolicy {
             max_chars: READ_FILE_TERMINAL_PREVIEW_MAX_CHARS,
             max_lines: READ_FILE_TERMINAL_PREVIEW_MAX_LINES,
             head_lines: READ_FILE_TERMINAL_PREVIEW_HEAD_LINES,

@@ -4,8 +4,8 @@ use crate::ai::{
     mcp::McpClient,
     skills::SkillManifest,
     theme::{
-        ACCENT_DANGER, ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY, ACCENT_SUCCESS,
-        ACCENT_WARN, BOLD, DIM, RESET,
+        ACCENT_COMMAND, ACCENT_DANGER, ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE,
+        ACCENT_SECONDARY, ACCENT_SUCCESS, ACCENT_WARN, BOLD, DIM, RESET,
     },
     types::App,
 };
@@ -35,6 +35,10 @@ pub fn print_tool_output_line(line: &str) {
 
 pub fn print_tool_note_line(label: &str, value: &str) {
     println!("{}", format_tool_note_line(label, value));
+}
+
+pub fn print_tool_command_line(command: &str) {
+    println!("{}", format_tool_command_line(command));
 }
 
 pub fn print_ocr_summary(extraction: &OcrExtraction) {
@@ -230,6 +234,13 @@ pub(in crate::ai) fn format_tool_note_line(label: &str, value: &str) -> String {
     )
 }
 
+pub(in crate::ai) fn format_tool_command_line(command: &str) -> String {
+    format!(
+        "  {}│{} {}{}cmd:{} {}{}{}",
+        ACCENT_RULE, RESET, BOLD, ACCENT_MUTED, RESET, ACCENT_COMMAND, command, RESET
+    )
+}
+
 pub(in crate::ai) fn format_tool_output_block(content: &str) -> Vec<String> {
     if content.trim().is_empty() {
         return vec![format_tool_note_line("result", "no output")];
@@ -390,10 +401,11 @@ pub fn print_mcp_tools(report: &McpInitReport, mcp_client: &McpClient) {
 mod tests {
     use super::{
         format_assistant_banner, format_empty_state, format_ocr_summary_block,
-        format_section_header, format_section_item, format_section_note, format_tool_header,
-        format_tool_output_block, format_tool_output_line, format_tool_output_prefix,
-        sanitize_for_terminal,
+        format_section_header, format_section_item, format_section_note, format_tool_command_line,
+        format_tool_header, format_tool_output_block, format_tool_output_line,
+        format_tool_output_prefix, sanitize_for_terminal,
     };
+    use crate::ai::theme::ACCENT_COMMAND;
     use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};
 
     fn strip_ansi_for_test(s: &str) -> String {
@@ -507,6 +519,14 @@ mod tests {
     fn tool_output_prefix_formats_gutter_without_closing_line() {
         let visible = strip_ansi_for_test(&format_tool_output_prefix());
         assert_eq!(visible, "  │ ");
+    }
+
+    #[test]
+    fn tool_command_line_keeps_text_stable_and_uses_distinct_accent() {
+        let rendered = format_tool_command_line("cargo check --bin a");
+        let visible = strip_ansi_for_test(&rendered);
+        assert_eq!(visible, "  │ cmd: cargo check --bin a");
+        assert!(rendered.contains(ACCENT_COMMAND));
     }
 
     #[test]

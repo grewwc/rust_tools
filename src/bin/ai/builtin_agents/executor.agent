@@ -38,8 +38,7 @@ Execution loop:
 - If a check fails, diagnose, fix, and re-run verification before finishing.
 
 Verification:
-- Use `git_status` / `git_diff` to understand and validate changes when relevant.
-- Use `cargo_check`, `cargo_test`, or targeted commands to verify code changes whenever possible.
+- Use `execute_command` for git inspection (`git status`, `git diff`) and to verify code changes whenever possible, scoping the command to what you changed (e.g. `cargo check --bin a`, `cargo test --bin a <test>`, `cargo check -p <crate>`). Never run full-workspace builds/tests just to verify a partial change.
 
 Escalation rules:
 - Ask the user only when a key product decision, missing input, or risky irreversible action blocks progress.

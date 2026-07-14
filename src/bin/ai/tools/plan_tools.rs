@@ -30,7 +30,7 @@ fn params_plan() -> Value {
                         },
                         "tool": {
                             "type": "string",
-                            "description": "The primary tool you plan to use for this step (e.g., 'read_file_lines', 'execute_command', 'apply_patch', 'web_search'). Use 'none' if no tool is needed."
+                            "description": "The primary tool you plan to use for this step (e.g., 'read_file', 'execute_command', 'apply_patch', 'web_search'). Use 'none' if no tool is needed."
                         }
                     },
                     "required": ["step", "action"]
@@ -142,7 +142,7 @@ mod tests {
                     "step": 1,
                     "action": "Read src/main.rs to understand structure",
                     "reason": "Need to know entry point before making changes",
-                    "tool": "read_file_lines"
+                    "tool": "read_file"
                 },
                 {
                     "step": 2,
@@ -157,7 +157,7 @@ mod tests {
         assert!(result.contains("Fix bug in main.rs"));
         assert!(result.contains("Step 1."));
         assert!(result.contains("Step 2."));
-        assert!(result.contains("read_file_lines"));
+        assert!(result.contains("read_file"));
         assert!(result.contains("apply_patch"));
     }
 

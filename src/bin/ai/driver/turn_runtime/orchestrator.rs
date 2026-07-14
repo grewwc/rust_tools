@@ -364,7 +364,11 @@ fn normalize_generic_shell_segment(program: &str, tokens: &[String]) -> String {
     }
 }
 
-fn collect_shell_target_tokens(tokens: &[String], start: usize, keep_literals: bool) -> Vec<String> {
+fn collect_shell_target_tokens(
+    tokens: &[String],
+    start: usize,
+    keep_literals: bool,
+) -> Vec<String> {
     let mut out = Vec::new();
     let mut skip_next = false;
     for token in tokens.iter().skip(start) {
@@ -446,10 +450,7 @@ fn detect_tool_loop(history: &[Vec<String>], window: usize) -> bool {
 }
 
 fn signature_set_is_execute_command_only(sigs: &[String]) -> bool {
-    !sigs.is_empty()
-        && sigs
-            .iter()
-            .all(|sig| sig.starts_with("execute_command::"))
+    !sigs.is_empty() && sigs.iter().all(|sig| sig.starts_with("execute_command::"))
 }
 
 fn detect_execute_command_coarse_loop(history: &[Vec<String>], window: usize) -> bool {

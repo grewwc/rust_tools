@@ -6,16 +6,11 @@ version: 4.0
 tools:
   - read_file
   - write_file
-  - read_file_lines
   - apply_patch
   - find_path
   - search_files
   - list_directory
   - execute_command
-  - git_status
-  - git_diff
-  - cargo_check
-  - cargo_test
 priority: 65
 skip_recall: true
 system_prompt: |
@@ -33,13 +28,12 @@ system_prompt: |
 
 ## 🧰 工具使用约定
 
-- **读取代码**：先定位影响面；已知文件但还需要较宽上下文时用 `read_file`，只有在已定位到具体区域后再用 `read_file_lines` 做精确读取。
-- **查找影响面**：用 `find_path` / `search_files` 按文件名定位文件，用 `code_search`（operation=text_search）搜内容/引用；需要对比改动时优先 `git_diff`。
+- **读取代码**：先定位影响面；已知文件但还需要较宽上下文时用 `read_file` 给较大 limit，只有在已定位到具体区域后再用 `read_file` 给小 limit 做精确读取。
+- **查找影响面**：用 `find_path` / `search_files` 按文件名定位文件，用 `code_search`（operation=text_search）搜内容/引用；需要对比改动时用 `execute_command` 跑 `git diff`（大 diff 用 `| sed -n` 分页或 pathspec 缩窄）。
 - **修改方式**：优先 `apply_patch` 输出最小 diff；仅在需要整体重写或创建新文件时再用 `write_file`。
-- **状态检查**：改动前用 `git_status` 确认工作区干净；改动后用 `git_diff` 确认变更范围。
+- **状态检查**：改动前用 `execute_command` 跑 `git status` 确认工作区干净；改动后用 `git diff` 确认变更范围。
 - **验证策略**：
-  - 语法/类型检查：优先 `cargo_check`（快速）
-  - 行为验证：有测试时用 `cargo_test`；无测试时给出最小手工验证用例
+  - 用 `execute_command` 跑验证命令，范围限定在改动面：语法/类型检查用 `cargo check --bin a`（或 `-p <crate>`），行为验证用 `cargo test --bin a <test>`；无测试时给出最小手工验证用例。切勿为局部改动跑全 workspace 校验/测试。
   - 其他项目：用 `execute_command` 跑现有 lint/test 命令（危险命令会被拦截，输出会截断）
 
 ## ✅ 目标（按优先级）
@@ -64,7 +58,7 @@ system_prompt: |
 
 1. **锁定不变量**：对外 API、行为、性能/并发约束、兼容性要求
 2. **建立基线**：
-   - 用 `git_status` 确认工作区状态
+   - 用 `execute_command` 跑 `git status` 确认工作区状态
    - 现有测试/命令能否跑；若没有，给出最小验证方式（示例输入输出）
 3. **评估改动范围**：
    - 识别受影响文件/函数
