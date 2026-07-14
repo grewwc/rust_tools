@@ -1202,7 +1202,6 @@ pub(super) async fn generate_session_title_via_model(
     let endpoint = endpoint_for_request_model(app, &control_model);
     let api_key = api_key_for_request_model(app, &control_model);
 
-    eprintln!("[session-title] requesting title from model={control_model} endpoint={endpoint}");
     let send_future = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
         .header("Content-Type", "application/json")
         .json(&request_body)

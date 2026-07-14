@@ -7,13 +7,17 @@ use crate::ai::{
     types::App,
 };
 use colored::Colorize;
+use rust_tools::commonw::FastSet;
 use serde_json::Value;
+use std::sync::{LazyLock, Mutex};
 
 use super::{TurnOutcome, persistence::persist_pending_turn_messages};
 
 const SUBAGENT_TOOL_EVIDENCE_MAX_CALLS: usize = 8;
 const SUBAGENT_TOOL_EVIDENCE_MAX_CHARS_PER_RESULT: usize = 700;
 const SUBAGENT_TOOL_EVIDENCE_MAX_BLOCK_CHARS: usize = 4_000;
+static SESSION_TITLE_IN_FLIGHT: LazyLock<Mutex<FastSet<String>>> =
+    LazyLock::new(|| Mutex::new(FastSet::default()));
 
 fn ensure_final_assistant_recorded(
     final_assistant_text: &str,
@@ -228,6 +232,24 @@ fn maybe_spawn_critic_revise_background(app: &App, question: &str, final_assista
     });
 }
 
+fn should_generate_session_title_in_background(one_shot_mode: bool, should_quit: bool) -> bool {
+    !one_shot_mode && !should_quit
+}
+
+fn mark_session_title_generation_started(session_id: &str) -> bool {
+    let mut in_flight = SESSION_TITLE_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    in_flight.insert(session_id.to_string())
+}
+
+fn mark_session_title_generation_finished(session_id: &str) {
+    let mut in_flight = SESSION_TITLE_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    in_flight.remove(session_id);
+}
+
 pub(super) async fn finalize_turn(
     app: &mut App,
     next_model: &str,
@@ -291,8 +313,13 @@ pub(super) async fn finalize_turn(
                 eprintln!("[Warning] Failed to compact persisted history: {}", err);
             }
         }
-        // 尝试为当前对话生成 LLM 概括性标题（如果尚未生成且已有足够上下文）
-        maybe_generate_session_title(app).await;
+        // 尝试为当前对话生成 LLM 概括性标题（如果尚未生成且已有足够上下文）。
+        // 交互式前台 turn 不应在这里等待一个后台质量任务。
+        maybe_generate_session_title(
+            app,
+            should_generate_session_title_in_background(one_shot_mode, should_quit),
+        )
+        .await;
         println!();
         maybe_spawn_critic_revise_background(app, question, final_assistant_text);
 
@@ -348,7 +375,26 @@ pub(super) async fn finalize_turn(
 
 /// 在 turn 结束后尝试用 LLM 生成 session 概括性标题。
 /// 条件：至少有 1 个 user turn 且尚未生成过标题。
-async fn maybe_generate_session_title(app: &App) {
+async fn maybe_generate_session_title(app: &App, run_in_background: bool) {
+    if !mark_session_title_generation_started(&app.session_id) {
+        return;
+    }
+
+    if run_in_background {
+        let task_app = app.clone();
+        let session_id = task_app.session_id.clone();
+        tokio::spawn(async move {
+            generate_session_title_if_missing(&task_app).await;
+            mark_session_title_generation_finished(&session_id);
+        });
+        return;
+    }
+
+    generate_session_title_if_missing(app).await;
+    mark_session_title_generation_finished(&app.session_id);
+}
+
+async fn generate_session_title_if_missing(app: &App) {
     use crate::ai::history::SessionStore;
     // eprintln!("[session-title] checking: session_id={} history_file={}", app.session_id, app.session_history_file.display());
 
@@ -390,6 +436,9 @@ async fn maybe_generate_session_title(app: &App) {
 
     if let Some(t) = title {
         if !t.is_empty() {
+            if store.has_generated_title(&app.session_id) {
+                return;
+            }
             if let Err(_) = store.write_session_title(&app.session_id, &t) {
                 // eprintln!("[session-title] failed to save title: {}", err);
             } else {
@@ -484,5 +533,13 @@ mod tests {
         assert!(output.contains("pub mod ai;"));
         assert!(output.contains("[Subagent final answer]\n"));
         assert!(output.ends_with(&long_final));
+    }
+
+    #[test]
+    fn session_title_background_policy_only_backgrounds_live_interactive_turns() {
+        assert!(should_generate_session_title_in_background(false, false));
+        assert!(!should_generate_session_title_in_background(true, false));
+        assert!(!should_generate_session_title_in_background(false, true));
+        assert!(!should_generate_session_title_in_background(true, true));
     }
 }

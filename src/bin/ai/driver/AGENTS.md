@@ -142,6 +142,13 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
    rounds (not several hundred), and inject a `task-anchor` together with the
    `[iteration-soft-limit]` note so long exploratory runs get pulled back to the
    user goal before they spend another hundred tool calls drifting.
+13. Session-title generation is a post-turn quality task, not part of the
+   foreground interaction critical path. In live interactive foreground turns,
+   `finalize_turn()` must schedule it in the background instead of awaiting the
+   model call before returning to `run_loop()`. Keep inline generation only for
+   paths that are about to exit immediately (ephemeral one-shot / explicit quit),
+   and guard with a per-session in-flight latch so repeated turns do not launch
+   duplicate title jobs.
 
 ## Goal 模式
 
