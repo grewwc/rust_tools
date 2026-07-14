@@ -37,19 +37,23 @@ fn params_cargo_test() -> Value {
         "properties": {
             "cwd": {
                 "type": "string",
-                "description": "Working directory for the cargo command (default: \".\")."
+                "description": "Working directory for the cargo command. Defaults to \".\" (current directory)."
             },
             "workspace": {
                 "type": "boolean",
-                "description": "If true (default), run for the whole workspace (--workspace)."
+                "description": "If true, run tests for the whole workspace (--workspace). Defaults to false. When false, only the specified package or current crate is tested."
             },
             "all_features": {
                 "type": "boolean",
-                "description": "If true, enable all features (--all-features)."
+                "description": "If true, enable all features (--all-features). Defaults to false."
             },
             "package": {
                 "type": "string",
-                "description": "Optional package name to target (-p <name>)."
+                "description": "Optional package name to target (-p <name>). When omitted and workspace is false, tests the current crate."
+            },
+            "timeout_secs": {
+                "type": "integer",
+                "description": "Maximum seconds to wait for cargo to finish. The process is killed after this duration. Defaults to 300 (5 minutes)."
             }
         }
     })
@@ -77,18 +81,20 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-fn cargo_common_args(args: &Value) -> (String, bool, bool, Option<String>) {
+fn cargo_common_args(args: &Value, default_workspace: bool) -> (String, bool, bool, Option<String>) {
     let cwd = args["cwd"].as_str().unwrap_or(".").to_string();
-    let workspace = args["workspace"].as_bool().unwrap_or(true);
+    let workspace = args["workspace"].as_bool().unwrap_or(default_workspace);
     let all_features = args["all_features"].as_bool().unwrap_or(false);
     let package = args["package"].as_str().map(|s| s.trim().to_string());
     let package = package.filter(|s| !s.is_empty());
     (cwd, workspace, all_features, package)
 }
 
-fn execute_cargo_command(subcommand: &str, args: &Value) -> Result<String, String> {
-    let (cwd, workspace, all_features, package) = cargo_common_args(args);
-    const CARGO_TIMEOUT_SECS: u64 = 300; // 5 分钟超时
+fn execute_cargo_command(subcommand: &str, args: &Value, default_timeout_secs: u64, default_workspace: bool) -> Result<String, String> {
+    let (cwd, workspace, all_features, package) = cargo_common_args(args, default_workspace);
+    let timeout_secs = args["timeout_secs"]
+        .as_u64()
+        .unwrap_or(default_timeout_secs);
     const MAX_CARGO_OUTPUT_BYTES: usize = 512 * 1024; // 512KB 输出上限
 
     let mut cmd = Command::new("cargo");
@@ -112,7 +118,7 @@ fn execute_cargo_command(subcommand: &str, args: &Value) -> Result<String, Strin
         .map_err(|e| format!("Failed to execute cargo: {}", e))?;
 
     // 读取 stdout/stderr 到缓冲区，同时检查超时
-    let deadline = Instant::now() + Duration::from_secs(CARGO_TIMEOUT_SECS);
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
@@ -148,7 +154,7 @@ fn execute_cargo_command(subcommand: &str, args: &Value) -> Result<String, Strin
                     let _ = child.wait();
                     return Err(format!(
                         "cargo {} timed out after {} seconds",
-                        subcommand, CARGO_TIMEOUT_SECS
+                        subcommand, timeout_secs
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(100));
@@ -220,9 +226,9 @@ fn format_exit_code_output(output: &std::process::Output, stdout: &str, stderr: 
 }
 
 pub(crate) fn execute_cargo_check(args: &Value) -> Result<String, String> {
-    execute_cargo_command("check", args)
+    execute_cargo_command("check", args, 300, true)
 }
 
 pub(crate) fn execute_cargo_test(args: &Value) -> Result<String, String> {
-    execute_cargo_command("test", args)
+    execute_cargo_command("test", args, 300, false)
 }
