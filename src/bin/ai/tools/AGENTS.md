@@ -64,6 +64,18 @@ execution policy, sandboxing, path resolution, or progressive loading.
    `on_background_group` callback of
    `run_cmd_output_streaming_with_timeout_tracked`; it cannot reference the
    binary-side registry directly.
+10. `execute_command` output (`service/command.rs::format_command_output`) must
+    stay self-describing so the model can tell "done" from "incomplete" without
+    re-running. Invariants: (a) success with empty output returns an explicit
+    "succeeded with exit code 0 and produced no output" sentinel, never `""`;
+    (b) failure prefixes `Exit code: N`; (c) truncation (`truncate_chars`, cap
+    `MAX_COMMAND_OUTPUT_CHARS`) appends shown-vs-total char/line counts plus a
+    warning that unseen matches may be in the cut-off tail and a hint to
+    narrow/page instead of retrying variants. This exists because bare
+    `... (truncated)` + silent-empty output previously drove strong models into
+    long near-identical grep retry loops (they couldn't tell if their target was
+    cut off or truly absent). Do not revert to an information-free truncation
+    marker.
 
 ## Related detailed guide
 

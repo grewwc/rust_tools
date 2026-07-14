@@ -35,7 +35,7 @@ fn execute_command_streaming_registered(
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "execute_command",
-        description: "Run a shell command with an optional working directory and timeout. Destructive/network/escalation commands are blocked; output is truncated and includes an exit code on failure.",
+        description: "Run a shell command with an optional working directory and timeout. Destructive/network/escalation commands are blocked. Output is truncated past a char cap; when truncated the result states how much was shown vs. total and warns that unseen matches may be in the cut-off tail (narrow/page instead of re-running variants). Failures include the exit code.",
         parameters: params_execute_command,
         execute: execute_command,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,

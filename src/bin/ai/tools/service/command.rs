@@ -46,18 +46,32 @@ fn resolve_command_timeout(requested: Option<u64>, default: u64, max: u64) -> u6
     requested.unwrap_or(default).clamp(1, max)
 }
 
+/// 截断过长输出，并在结尾附带**可操作的元信息**：总量、已显示量，以及一句
+/// 明确警告——被截断的部分可能包含调用方要找的行，"没看到"不等于"不存在"。
+///
+/// 根因背景：`execute_command` 成功路径此前只裸截断加 `... (truncated)`，模型
+/// 无法判断它要找的匹配是否被砍在了未显示部分，于是不断换姿势重试同一条
+/// grep（history.json 的重复调用即源于此）。带上计数与分页提示后，重试动机
+/// 从"信息不全的猜测"变成"有依据的收敛"。
 fn truncate_chars(content: &str, max_chars: usize) -> String {
-    if content.chars().count() <= max_chars {
+    let total_chars = content.chars().count();
+    if total_chars <= max_chars {
         return content.to_string();
     }
-    let mut output = String::with_capacity(max_chars + 32);
+    let total_lines = content.lines().count();
+    let mut output = String::with_capacity(max_chars + 256);
     for (idx, ch) in content.chars().enumerate() {
         if idx >= max_chars {
             break;
         }
         output.push(ch);
     }
-    output.push_str("\n... (truncated)");
+    let shown_lines = output.lines().count();
+    output.push_str(&format!(
+        "\n... [truncated: showing first {max_chars} of {total_chars} chars (~{shown_lines} of {total_lines} lines). \
+The remaining output is NOT shown — matches you expect but don't see here may simply be in the cut-off tail, not absent. \
+Do not re-run near-identical variants; instead narrow the result first (e.g. `grep -c` to count, a more specific pattern, or `sed -n 'START,ENDp'` / `| tail -n +N` to page through the rest).]"
+    ));
     output
 }
 
@@ -1445,7 +1459,14 @@ fn format_command_output(output: Output) -> String {
         } else {
             format!("{stdout_trimmed}\n{stderr_trimmed}")
         };
-        truncate_chars(combined.trim(), MAX_COMMAND_OUTPUT_CHARS)
+        let combined = combined.trim();
+        // 空输出但成功退出：显式说明，避免模型把"命令成功、零匹配"误读为
+        // "调用没生效"而反复重试同一条 grep。
+        if combined.is_empty() {
+            "(command succeeded with exit code 0 and produced no output)".to_string()
+        } else {
+            truncate_chars(combined, MAX_COMMAND_OUTPUT_CHARS)
+        }
     } else {
         truncate_chars(
             &format!(
@@ -1491,8 +1512,34 @@ where
 mod tests {
     use super::{
         resolve_command_timeout, split_unquoted_segments, tokenize_shell_words,
-        validate_no_injection_surface,
+        truncate_chars, validate_no_injection_surface, MAX_COMMAND_OUTPUT_CHARS,
     };
+
+    // ---- truncate_chars ----
+
+    #[test]
+    fn truncate_passthrough_when_within_limit() {
+        let s = "short output";
+        assert_eq!(truncate_chars(s, MAX_COMMAND_OUTPUT_CHARS), s);
+    }
+
+    #[test]
+    fn truncate_emits_actionable_metadata_when_over_limit() {
+        // 1000 行，每行较短，整体远超小上限，触发截断。
+        let content: String = (0..1000).map(|i| format!("line{i}\n")).collect();
+        let out = truncate_chars(&content, 100);
+        // 不再是无信息的 "... (truncated)"，而是带总量/已显示/分页提示。
+        assert!(out.contains("truncated: showing first 100 of"), "out tail: {out}");
+        assert!(out.contains("of 1000 lines"), "out tail: {out}");
+        assert!(
+            out.contains("may simply be in the cut-off tail, not absent"),
+            "must warn that missing matches may be cut, not absent"
+        );
+        assert!(
+            out.contains("Do not re-run near-identical variants"),
+            "must steer the model away from blind retries"
+        );
+    }
 
     // ---- resolve_command_timeout ----
 
