@@ -401,6 +401,16 @@ fn recover_inline_tool_calls_handles_anthropic_xml_parallel_calls() {
 }
 
 #[test]
+fn recover_inline_tool_calls_handles_bare_registered_xml_with_raw_string_body() {
+    let raw = r#"<execute_command>cd /tmp && pwd</execute_command>"#;
+    let calls = recover_inline_tool_calls(raw).expect("should recover bare xml tool call");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "execute_command");
+    let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+    assert_eq!(args["command"], "cd /tmp && pwd");
+}
+
+#[test]
 fn anthropic_xml_streamer_suppresses_markup_and_emits_events() {
     let mut streamer = super::super::splitter::AnthropicXmlToolCallStreamer::new();
     let (cleaned, events) = streamer.push(
@@ -487,6 +497,31 @@ fn response_completed_event_does_not_block_late_snapshot_text() {
 
     assert_eq!(current_history, "hello world");
     assert_eq!(state.content.assistant_text, "hello world");
+}
+
+#[test]
+fn process_stream_payload_suppresses_bare_registered_xml_tool_markup() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.delta"),
+        r#"{"delta":"先确认一下。<execute_command>pwd</execute_command>"}"#,
+    )
+    .unwrap();
+
+    assert_eq!(current_history, "先确认一下。");
+    assert_eq!(state.content.assistant_text, "先确认一下。");
+    let builder = state.content.tool_calls_map.get_ref(&0).unwrap();
+    assert_eq!(builder.function_name, "execute_command");
+    assert_eq!(builder.arguments, r#"{"command":"pwd"}"#);
 }
 
 #[test]

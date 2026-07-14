@@ -1,7 +1,7 @@
 use super::{
     splitter::{
-        self, AnthropicXmlToolCallStreamer, HermesXmlToolCallStreamer, InternalToolCallStreamEvent,
-        InternalToolCallStreamer,
+        self, AnthropicXmlToolCallStreamer, BareXmlToolCallStreamer,
+        HermesXmlToolCallStreamer, InternalToolCallStreamEvent, InternalToolCallStreamer,
     },
     state::{HiddenMetaParseState, InternalToolCall},
 };
@@ -106,6 +106,7 @@ pub(super) fn extract_chunk_events_streaming(
     streamer: &mut InternalToolCallStreamer,
     hermes_streamer: &mut HermesXmlToolCallStreamer,
     anthropic_streamer: &mut AnthropicXmlToolCallStreamer,
+    bare_xml_streamer: &mut BareXmlToolCallStreamer,
 ) -> (Vec<StreamTextEvent>, Vec<InternalToolCallStreamEvent>) {
     let Some(choice) = chunk.choices.first() else {
         return (Vec::new(), Vec::new());
@@ -153,7 +154,9 @@ pub(super) fn extract_chunk_events_streaming(
         // 再把 Hermes 抽离后的可见文本交给 Anthropic（`<invoke name=...>`）解析器，
         // 兼容 deepseek-v4-flash 等用该格式输出工具调用的模型。
         let (cleaned, anthropic_events) = anthropic_streamer.push(&cleaned);
+        let (cleaned, bare_xml_events) = bare_xml_streamer.push(&cleaned);
         hermes_events.extend(anthropic_events);
+        hermes_events.extend(bare_xml_events);
         if !cleaned.is_empty() {
             let content = normalize_stream_text(cleaned);
             push_text_with_hidden_meta(
@@ -475,6 +478,7 @@ mod tests {
         let mut streamer = InternalToolCallStreamer::new();
         let mut hermes_streamer = HermesXmlToolCallStreamer::new();
         let mut anthropic_streamer = AnthropicXmlToolCallStreamer::new();
+        let mut bare_xml_streamer = BareXmlToolCallStreamer::new();
         let (events, tool_events) = extract_chunk_events_streaming(
             &chunk,
             "<meta:self_note>",
@@ -484,6 +488,7 @@ mod tests {
             &mut streamer,
             &mut hermes_streamer,
             &mut anthropic_streamer,
+            &mut bare_xml_streamer,
         );
 
         assert_eq!(
@@ -529,6 +534,7 @@ mod tests {
         let mut streamer = InternalToolCallStreamer::new();
         let mut hermes_streamer = HermesXmlToolCallStreamer::new();
         let mut anthropic_streamer = AnthropicXmlToolCallStreamer::new();
+        let mut bare_xml_streamer = BareXmlToolCallStreamer::new();
         let (events, _) = extract_chunk_events_streaming(
             &chunk,
             "<meta:self_note>",
@@ -538,6 +544,7 @@ mod tests {
             &mut streamer,
             &mut hermes_streamer,
             &mut anthropic_streamer,
+            &mut bare_xml_streamer,
         );
 
         assert_eq!(
@@ -550,6 +557,59 @@ mod tests {
             ]
         );
         assert!(!thinking_open);
+    }
+
+    #[test]
+    fn streaming_extract_suppresses_bare_registered_xml_tool_markup() {
+        let chunk = StreamChunk {
+            choices: vec![StreamChoice {
+                delta: StreamDelta {
+                    content: "先看一下。<execute_command>pwd</execute_command>".to_string(),
+                    reasoning_content: String::new(),
+                    reasoning_details: String::new(),
+                    tool_calls: Vec::new(),
+                },
+                finish_reason: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut thinking_open = false;
+        let mut hidden_meta_parse = HiddenMetaParseState::default();
+        let mut streamer = InternalToolCallStreamer::new();
+        let mut hermes_streamer = HermesXmlToolCallStreamer::new();
+        let mut anthropic_streamer = AnthropicXmlToolCallStreamer::new();
+        let mut bare_xml_streamer = BareXmlToolCallStreamer::new();
+        let (events, tool_events) = extract_chunk_events_streaming(
+            &chunk,
+            "<meta:self_note>",
+            "</meta:self_note>",
+            &mut thinking_open,
+            &mut hidden_meta_parse,
+            &mut streamer,
+            &mut hermes_streamer,
+            &mut anthropic_streamer,
+            &mut bare_xml_streamer,
+        );
+
+        assert_eq!(
+            events,
+            vec![StreamTextEvent::AppendContent("先看一下。".to_string())]
+        );
+        assert_eq!(tool_events.len(), 3);
+        match (&tool_events[0], &tool_events[1], &tool_events[2]) {
+            (
+                InternalToolCallStreamEvent::Begin(name),
+                InternalToolCallStreamEvent::Args(args),
+                InternalToolCallStreamEvent::End,
+            ) => {
+                assert_eq!(name, "execute_command");
+                let v: serde_json::Value = serde_json::from_str(args).unwrap();
+                assert_eq!(v["command"], "pwd");
+            }
+            other => panic!("unexpected tool events: {other:?}"),
+        }
     }
 }
 

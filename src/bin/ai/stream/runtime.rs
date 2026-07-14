@@ -1138,6 +1138,7 @@ fn process_stream_payload(
         &mut state.content.internal_tool_call_streamer,
         &mut state.content.hermes_tool_call_streamer,
         &mut state.content.anthropic_tool_call_streamer,
+        &mut state.content.bare_xml_tool_call_streamer,
     );
     process_internal_tool_calls(app, markers, state, internal_tool_call_events);
 

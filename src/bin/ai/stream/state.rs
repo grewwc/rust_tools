@@ -10,8 +10,8 @@ use crate::ai::{
 use super::{
     MarkdownStreamRenderer,
     splitter::{
-        AnthropicXmlToolCallStreamer, HermesXmlToolCallStreamer, InternalToolCallStreamer,
-        StreamSplitter,
+        AnthropicXmlToolCallStreamer, BareXmlToolCallStreamer, HermesXmlToolCallStreamer,
+        InternalToolCallStreamer, StreamSplitter,
     },
 };
 
@@ -180,6 +180,7 @@ pub(super) struct StreamContentState {
     pub(super) internal_tool_call_streamer: InternalToolCallStreamer,
     pub(super) hermes_tool_call_streamer: HermesXmlToolCallStreamer,
     pub(super) anthropic_tool_call_streamer: AnthropicXmlToolCallStreamer,
+    pub(super) bare_xml_tool_call_streamer: BareXmlToolCallStreamer,
 }
 
 impl StreamContentState {
@@ -200,6 +201,7 @@ impl StreamContentState {
             internal_tool_call_streamer: InternalToolCallStreamer::new(),
             hermes_tool_call_streamer: HermesXmlToolCallStreamer::new(),
             anthropic_tool_call_streamer: AnthropicXmlToolCallStreamer::new(),
+            bare_xml_tool_call_streamer: BareXmlToolCallStreamer::new(),
         }
     }
 }

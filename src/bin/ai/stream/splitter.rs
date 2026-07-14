@@ -510,6 +510,98 @@ impl AnthropicXmlToolCallStreamer {
     }
 }
 
+#[derive(Default)]
+enum BareXmlPhase {
+    #[default]
+    Idle,
+    InBody { name: String },
+}
+
+/// 裸工具名 XML：`<execute_command>pwd</execute_command>`。
+/// 仅在标签名本身就是已注册工具名时生效；否则原样透传，避免误伤普通 HTML/XML。
+#[derive(Default)]
+pub(super) struct BareXmlToolCallStreamer {
+    pending: String,
+    phase: BareXmlPhase,
+}
+
+impl BareXmlToolCallStreamer {
+    pub(super) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(super) fn push(&mut self, chunk: &str) -> (String, Vec<InternalToolCallStreamEvent>) {
+        self.pending.push_str(chunk);
+        let mut cleaned = String::new();
+        let mut events = Vec::new();
+
+        loop {
+            match &self.phase {
+                BareXmlPhase::Idle => {
+                    let Some(lt) = self.pending.find('<') else {
+                        cleaned.push_str(&self.pending);
+                        self.pending.clear();
+                        break;
+                    };
+                    let before = self.pending[..lt].to_string();
+
+                    let Some(gt_rel) = self.pending[lt..].find('>') else {
+                        if could_be_tag_name_prefix(&self.pending[lt..]) {
+                            if lt > 0 {
+                                cleaned.push_str(&before);
+                                self.pending.drain(..lt);
+                            }
+                            break;
+                        }
+                        cleaned.push_str(&before);
+                        cleaned.push('<');
+                        self.pending.drain(..lt + '<'.len_utf8());
+                        continue;
+                    };
+
+                    let tag_end = lt + gt_rel;
+                    let tag = self.pending[lt..=tag_end].to_string();
+                    if let Some(name) = super::inline_recovery::parse_bare_xml_open_tag(&tag) {
+                        let trimmed = before.trim_end_matches([' ', '\t', '\r', '\n']);
+                        cleaned.push_str(trimmed);
+                        self.pending.drain(..=tag_end);
+                        self.phase = BareXmlPhase::InBody { name };
+                        continue;
+                    }
+
+                    cleaned.push_str(&before);
+                    cleaned.push_str(&tag);
+                    self.pending.drain(..=tag_end);
+                    continue;
+                }
+                BareXmlPhase::InBody { name } => {
+                    let close_tag = format!("</{name}>");
+                    if let Some(pos) = self.pending.find(&close_tag) {
+                        let body = self.pending[..pos].to_string();
+                        let after = pos + close_tag.len();
+                        self.pending.drain(..after);
+                        let name = name.clone();
+                        if let Some(args) =
+                            super::inline_recovery::parse_bare_xml_tool_body(&name, &body)
+                        {
+                            events.push(InternalToolCallStreamEvent::Begin(name));
+                            events.push(InternalToolCallStreamEvent::Args(args));
+                            events.push(InternalToolCallStreamEvent::End);
+                        } else {
+                            cleaned.push_str(&format!("<{name}>{body}</{name}>"));
+                        }
+                        self.phase = BareXmlPhase::Idle;
+                        continue;
+                    }
+                    break;
+                }
+            }
+        }
+
+        (cleaned, events)
+    }
+}
+
 fn emit_anthropic_invoke(
     events: &mut Vec<InternalToolCallStreamEvent>,
     name: String,
@@ -923,9 +1015,9 @@ fn parse_tool_call_args(s: &str) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HermesXmlToolCallStreamer, InternalToolCallStreamEvent, InternalToolCallStreamer,
-        StreamSplitSegment, StreamSplitter, WrappedSplitSegment, extract_internal_tool_calls,
-        split_wrapped_markers,
+        BareXmlToolCallStreamer, HermesXmlToolCallStreamer, InternalToolCallStreamEvent,
+        InternalToolCallStreamer, StreamSplitSegment, StreamSplitter, WrappedSplitSegment,
+        extract_internal_tool_calls, split_wrapped_markers,
     };
 
     #[test]
@@ -1004,6 +1096,47 @@ mod tests {
         };
         let parsed: serde_json::Value = serde_json::from_str(args).unwrap();
         assert_eq!(parsed["path"], "/x");
+    }
+
+    #[test]
+    fn bare_xml_streamer_suppresses_registered_tool_markup_and_emits_events() {
+        let mut s = BareXmlToolCallStreamer::new();
+        let (cleaned, events) = s.push("让我检查一下。<execute_command>pwd</execute_command>");
+        assert_eq!(cleaned, "让我检查一下。");
+        assert_eq!(
+            events,
+            vec![
+                InternalToolCallStreamEvent::Begin("execute_command".to_string()),
+                InternalToolCallStreamEvent::Args("{\"command\":\"pwd\"}".to_string()),
+                InternalToolCallStreamEvent::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn bare_xml_streamer_leaves_unregistered_tags_visible() {
+        let mut s = BareXmlToolCallStreamer::new();
+        let (cleaned, events) = s.push("a <div>demo</div> b");
+        assert_eq!(cleaned, "a <div>demo</div> b");
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn bare_xml_streamer_handles_split_chunks() {
+        let mut s = BareXmlToolCallStreamer::new();
+        let mut all_cleaned = String::new();
+        let mut all_events = Vec::new();
+        for chunk in ["前缀 <", "execute_command>", "pwd</execute_", "command> 后缀"] {
+            let (cleaned, events) = s.push(chunk);
+            all_cleaned.push_str(&cleaned);
+            all_events.extend(events);
+        }
+        assert_eq!(all_cleaned, "前缀  后缀");
+        assert_eq!(all_events.len(), 3);
+        assert_eq!(
+            all_events[0],
+            InternalToolCallStreamEvent::Begin("execute_command".to_string())
+        );
     }
 
     #[test]

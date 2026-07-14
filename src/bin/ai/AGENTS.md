@@ -84,6 +84,15 @@ actually touches that subsystem.
     where cursor-up can't reach, leaving orphan headers that stack across chunks.
     Keeping the header outside the erased region makes a second header
     structurally impossible even if body erase ever slips.
+12. Inline tool-call recovery in `stream/` must also recognize bare registered
+    XML tool tags whose tag name is the tool name itself, such as
+    `<execute_command>...</execute_command>`. This support is two-part: the
+    streaming suppressors must strip the raw tag from visible output as soon as
+    it appears, and finalize fallback must recover it into a structured tool
+    call if the assistant text is pure markup. For raw-text bodies, only coerce
+    them into arguments when the target tool has exactly one required `string`
+    parameter (for example `execute_command.command`); otherwise leave the
+    markup visible rather than guessing a schema.
 
 ## On-Demand Guides
 

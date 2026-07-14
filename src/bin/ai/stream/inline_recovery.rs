@@ -4,7 +4,8 @@
 //! - `InlineToolCallParser` / `INLINE_PARSERS`：注册的解析器列表
 //! - `normalize_inline_tool_call_markup`：归一化命名空间前缀 XML 标签
 //! - `recover_inline_tool_calls`：从纯文本中恢复工具调用
-//! - `recover_json_tool_calls` / `recover_hermes_xml_tool_calls` / `recover_anthropic_xml_tool_calls`：各格式解析器
+//! - `recover_json_tool_calls` / `recover_hermes_xml_tool_calls` / `recover_anthropic_xml_tool_calls`
+//!   / `recover_bare_xml_tool_calls`：各格式解析器
 //! - `strip_inline_tool_call_wrappers`：移除工具调用包装标签
 //! - `normalize_tool_call_arguments` / `find_json_object_end`：参数验证
 //! - `collect_valid_tool_calls` / `ensure_tool_calls_section_open`：工具调用收集与渲染
@@ -24,6 +25,7 @@ type InlineToolCallParser = fn(&str) -> Option<Vec<ToolCall>>;
 const INLINE_PARSERS: &[InlineToolCallParser] = &[
     recover_hermes_xml_tool_calls,
     recover_anthropic_xml_tool_calls,
+    recover_bare_xml_tool_calls,
     recover_json_tool_calls,
 ];
 
@@ -238,6 +240,45 @@ fn recover_anthropic_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
+/// 解析裸工具名 XML：`<execute_command>pwd</execute_command>`。
+/// 仅对白名单里的已注册工具名生效，避免把普通 HTML/XML 标签误当工具调用。
+/// 与 Hermes / Anthropic 不同，这里标签名本身就是工具名，body 既可能是 JSON
+/// arguments，也可能是像 `execute_command` 这样只有一个必填字符串参数的原始文本。
+fn recover_bare_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    let stripped = strip_inline_tool_call_wrappers(text);
+    let mut rest = stripped.trim();
+    if rest.is_empty() {
+        return None;
+    }
+
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while !rest.is_empty() {
+        let Some(open_end) = rest.find('>') else {
+            return None;
+        };
+        let Some(name) = parse_bare_xml_open_tag(&rest[..=open_end]) else {
+            return None;
+        };
+        let body_start = open_end + 1;
+        let close_tag = format!("</{name}>");
+        let Some(close_rel) = rest[body_start..].find(&close_tag) else {
+            return None;
+        };
+        let body_end = body_start + close_rel;
+        let arguments = parse_bare_xml_tool_body(&name, &rest[body_start..body_end])?;
+        out.push(ToolCall {
+            id: format!("inline_bare_xml_{idx}"),
+            tool_type: "function".to_string(),
+            function: crate::ai::types::FunctionCall { name, arguments },
+        });
+        idx += 1;
+        rest = rest[body_end + close_tag.len()..].trim_start();
+    }
+
+    if out.is_empty() { None } else { Some(out) }
+}
+
 /// 把 `<invoke>` body 里的 `<parameter name="key">value</parameter>` 解析为 JSON
 /// arguments 字符串；无参数返回 `{}`。
 fn parse_anthropic_invoke_body(body: &str) -> String {
@@ -295,6 +336,56 @@ fn parse_anthropic_xml_name_attr(open_tag: &str) -> String {
     match body.find(quote) {
         Some(end) => body[..end].to_string(),
         None => String::new(),
+    }
+}
+
+/// 解析裸 XML 开标签，要求标签名本身是已注册工具名，且不带属性。
+pub(super) fn parse_bare_xml_open_tag(tag: &str) -> Option<String> {
+    let inner = tag.trim();
+    if !inner.starts_with('<') || !inner.ends_with('>') {
+        return None;
+    }
+    let inner = inner[1..inner.len() - 1].trim();
+    if inner.is_empty() || inner.starts_with('/') || inner.ends_with('/') {
+        return None;
+    }
+    if inner.contains(char::is_whitespace) {
+        return None;
+    }
+    crate::ai::tools::registry::common::is_registered_tool_name(inner)
+        .then(|| inner.to_string())
+}
+
+/// 解析裸 XML 工具体。优先接受 JSON object / Hermes parameter 标签；
+/// 若 body 只是原始文本，则仅对“恰好一个必填 string 参数”的工具做安全降级，
+/// 例如 `<execute_command>pwd</execute_command>` → `{"command":"pwd"}`。
+pub(super) fn parse_bare_xml_tool_body(tool_name: &str, body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return Some("{}".to_string());
+    }
+    if let Some(args) = parse_hermes_function_body(trimmed) {
+        return Some(args);
+    }
+
+    let key = single_required_string_argument_key(tool_name)?;
+    Some(serde_json::json!({ key: trimmed }).to_string())
+}
+
+fn single_required_string_argument_key(tool_name: &str) -> Option<String> {
+    let spec = crate::ai::tools::registry::common::get_tool_spec(tool_name)?;
+    let schema = (spec.parameters)();
+    let schema = schema.as_object()?;
+    let required = schema.get("required")?.as_array()?;
+    if required.len() != 1 {
+        return None;
+    }
+    let key = required.first()?.as_str()?;
+    let props = schema.get("properties")?.as_object()?;
+    let prop = props.get(key)?.as_object()?;
+    match prop.get("type")?.as_str() {
+        Some("string") => Some(key.to_string()),
+        _ => None,
     }
 }
 
