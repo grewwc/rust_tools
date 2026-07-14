@@ -99,6 +99,11 @@ impl MarkdownStreamRenderer {
         self.write_chunk_to(&mut out, chunk, dimmed)
     }
 
+    pub(in crate::ai) fn write_block(&mut self, text: &str, dimmed: bool) -> io::Result<()> {
+        let mut out = io::stdout();
+        self.write_block_to(&mut out, text, dimmed)
+    }
+
     fn write_chunk_to(&mut self, out: &mut dyn Write, chunk: &str, dimmed: bool) -> io::Result<()> {
         self.dimmed = dimmed;
         for ch in chunk.chars() {
@@ -115,10 +120,31 @@ impl MarkdownStreamRenderer {
         Ok(())
     }
 
+    fn write_block_to(&mut self, out: &mut dyn Write, text: &str, dimmed: bool) -> io::Result<()> {
+        self.dimmed = dimmed;
+        for segment in text.split_inclusive('\n') {
+            if let Some(line) = segment.strip_suffix('\n') {
+                self.line_buf.push_str(line);
+                self.handle_newline(out)?;
+            } else {
+                self.line_buf.push_str(segment);
+            }
+        }
+        out.flush()?;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub fn write_chunk_for_test(&mut self, chunk: &str, dimmed: bool) -> io::Result<String> {
         let mut out = Vec::new();
         self.write_chunk_to(&mut out, chunk, dimmed)?;
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    #[cfg(test)]
+    fn write_block_for_test(&mut self, text: &str, dimmed: bool) -> io::Result<String> {
+        let mut out = Vec::new();
+        self.write_block_to(&mut out, text, dimmed)?;
         Ok(String::from_utf8_lossy(&out).into_owned())
     }
 
@@ -1752,6 +1778,13 @@ mod tests {
         bytes
     }
 
+    fn render_full_block(markdown: &str, dimmed: bool) -> String {
+        let mut renderer = MarkdownStreamRenderer::new_with_tty(true);
+        let mut bytes = renderer.write_block_for_test(markdown, dimmed).unwrap();
+        bytes.push_str(&renderer.flush_pending_for_test().unwrap());
+        bytes
+    }
+
     #[test]
     fn streamed_cjk_table_has_no_residual_fragments_on_screen() {
         let _guard = env_guard();
@@ -1924,6 +1957,39 @@ mod tests {
         assert!(
             !joined.contains("| 函数签名 |"),
             "raw single-column markdown table leaked:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn block_render_bare_table_without_leading_pipe_uses_box_table() {
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "96") };
+
+        let md = "\
+对，除了模型层面的差异，其他全部一致。我逐项确认过：
+
+维度 | 是否一致 | 说明
+--- | --- | ---
+tracing/telemetry 上报 | 一致 | 同一批 telemetry publisher
+make_llm_call_publisher | 一致 | 同一条 on_call complete callback
+";
+
+        let stream = render_full_block(md, false);
+        let mut grid = VtGrid::new(96);
+        grid.feed(&stream);
+        let screen = grid.screen();
+        let joined = screen.join("\n");
+
+        assert!(joined.contains('┌'), "{joined}");
+        assert!(joined.contains('│'), "{joined}");
+        assert!(joined.contains("tracing/telemetry 上报"), "{joined}");
+        assert!(
+            !joined.contains("维度 | 是否一致 | 说明"),
+            "raw bare-table header leaked:\n{joined}"
+        );
+        assert!(
+            !joined.contains("--- | --- | ---"),
+            "raw bare-table separator leaked:\n{joined}"
         );
     }
 

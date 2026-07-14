@@ -22,7 +22,7 @@ pub(crate) fn render_markdown_block(text: &str) -> std::io::Result<()> {
     use std::io::IsTerminal;
     let tty = std::io::stdout().is_terminal();
     let mut renderer = MarkdownStreamRenderer::new_with_tty(tty);
-    renderer.write_chunk(text, false)?;
+    renderer.write_block(text, false)?;
     renderer.flush_pending()
 }
 
