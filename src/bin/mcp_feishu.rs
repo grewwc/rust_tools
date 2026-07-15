@@ -108,69 +108,6 @@ fn handle_tools_list() -> Result<Value, JsonRpcErr> {
     Ok(json!({
         "tools": [
             {
-                "name": "docs_search",
-                "description": "Search Feishu cloud docs by keyword (requires user_access_token; supports OAuth + local token store for auto refresh)",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "search_key": { "type": "string", "description": "Search keyword" },
-                        "count": { "type": "integer", "description": "Number of results (0-50)" },
-                        "offset": { "type": "integer", "description": "Offset (offset + count < 200)" },
-                        "owner_ids": { "type": "array", "items": { "type": "string" }, "description": "Owner open_ids" },
-                        "chat_ids": { "type": "array", "items": { "type": "string" }, "description": "Chat IDs" },
-                        "docs_types": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "doc/sheet/slides/bitable/mindnote/file"
-                        }
-                    },
-                    "required": ["search_key"]
-                }
-            },
-            {
-                "name": "messages_search",
-                "description": "Search Feishu chat or thread messages by keyword from the authorized user's perspective. This works on Feishu IM messages, not docs. Requires user_access_token.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "search_key": { "type": "string", "description": "Keyword to search in message content" },
-                        "chat_id": { "type": "string", "description": "Target chat_id. Use this for normal group/private chats." },
-                        "thread_id": { "type": "string", "description": "Target thread/topic id. Use this instead of chat_id when searching a thread." },
-                        "start_time": { "type": "string", "description": "Optional start time in milliseconds" },
-                        "end_time": { "type": "string", "description": "Optional end time in milliseconds" },
-                        "msg_types": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Optional message type filter, e.g. text/post/interactive/file/image/media/audio/sticker/share_chat/share_user/system"
-                        },
-                        "sort_order": { "type": "string", "description": "desc or asc. Default: desc" },
-                        "page_size": { "type": "integer", "description": "Messages fetched per API call. Default 50, max 50" },
-                        "max_pages": { "type": "integer", "description": "How many pages to scan at most. Default 5, max 20" },
-                        "limit": { "type": "integer", "description": "Maximum matched messages to return. Default 20, max 100" }
-                    },
-                    "required": ["search_key"]
-                }
-            },
-            {
-                "name": "messages_global_search",
-                "description": "Search Feishu IM messages across chats visible to the authorized user, without needing a specific chat_id. Supports substring, regex, and fuzzy matching modes. Requires user_access_token.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "search_key": { "type": "string", "description": "Keyword or pattern to search in message content" },
-                        "max_chats": { "type": "integer", "description": "Maximum number of recent chats to scan. Default 50, max 200" },
-                        "msgs_per_chat": { "type": "integer", "description": "Max messages per API page per chat. Default 50, max 50" },
-                        "max_pages": { "type": "integer", "description": "Max pages to fetch per chat. Default 10, max 50. Total messages per chat = msgs_per_chat * max_pages" },
-                        "msg_types": { "type": "array", "items": { "type": "string" }, "description": "Optional message type filter, e.g. text/post/interactive/file/image/media/audio/sticker/share_chat/share_user/system" },
-                        "limit": { "type": "integer", "description": "Maximum matched messages to return. Default 20, max 100" },
-                        "include_p2p": { "type": "boolean", "description": "Include 1-on-1 chats. Default true" },
-                        "include_group": { "type": "boolean", "description": "Include group chats. Default true" },
-                        "search_mode": { "type": "string", "enum": ["substring", "regex", "fuzzy"], "description": "Search mode: substring (default, case-insensitive), regex (Rust regex), fuzzy (edit distance <= 2)" }
-                    },
-                    "required": ["search_key"]
-                }
-            },
-            {
                 "name": "docs_get_text",
                 "description": "Fetch plain text content for a Feishu doc/docx/wiki/sheet. Supports wiki (auto-resolves to underlying object) and sheet (preview). Requires user_access_token.",
                 "inputSchema": {
@@ -304,30 +241,6 @@ fn handle_tools_call(params: Option<Value>) -> Result<Value, JsonRpcErr> {
         .unwrap_or_else(|| json!({}));
 
     match name.as_str() {
-        "docs_search" => {
-            let text = feishu_docs_search(&args)?;
-            Ok(json!({
-                "content": [
-                    { "type": "text", "text": text }
-                ]
-            }))
-        }
-        "messages_search" => {
-            let text = feishu_messages_search(&args)?;
-            Ok(json!({
-                "content": [
-                    { "type": "text", "text": text }
-                ]
-            }))
-        }
-        "messages_global_search" => {
-            let text = feishu_messages_global_search(&args)?;
-            Ok(json!({
-                "content": [
-                    { "type": "text", "text": text }
-                ]
-            }))
-        }
         "docs_get_text" => {
             let text = feishu_docs_get_text(&args)?;
             Ok(json!({

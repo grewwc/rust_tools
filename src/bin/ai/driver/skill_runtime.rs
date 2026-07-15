@@ -532,7 +532,6 @@ const CAPABILITY_CATALOG: &[CapabilityEntry] = &[
     CapabilityEntry {
         use_case: "Work with Feishu/Lark documents, wikis, sheets, or doc exports.",
         tools: &[
-            "mcp_feishu_docs_search",
             "mcp_feishu_docs_get_text_by_url",
             "mcp_feishu_doc_create_from_markdown",
         ],
@@ -1337,11 +1336,11 @@ mod tests {
     fn hidden_mcp_tool_catalog_lists_real_available_tools() {
         let catalog = build_hidden_mcp_tool_catalog(
             &[
-                tool("mcp_feishu_docs_search"),
                 tool("mcp_feishu_docs_get_text_by_url"),
+                tool("mcp_feishu_doc_create_from_markdown"),
                 tool("mcp_pdf-extract_pdf_extract_text"),
             ],
-            &[tool("mcp_feishu_docs_search")],
+            &[tool("mcp_feishu_doc_create_from_markdown")],
         )
         .unwrap();
 
@@ -1349,14 +1348,14 @@ mod tests {
         assert!(catalog.contains("enable_tools(operation=list)"));
         assert!(catalog.contains("`mcp_feishu_docs_get_text_by_url`"));
         assert!(catalog.contains("`mcp_pdf-extract_pdf_extract_text`"));
-        assert!(!catalog.contains("`mcp_feishu_docs_search`"));
+        assert!(!catalog.contains("`mcp_feishu_doc_create_from_markdown`"));
     }
 
     #[test]
     fn hidden_mcp_tool_catalog_omits_prompt_when_everything_is_loaded() {
         let catalog = build_hidden_mcp_tool_catalog(
-            &[tool("mcp_feishu_docs_search")],
-            &[tool("mcp_feishu_docs_search")],
+            &[tool("mcp_feishu_docs_get_text_by_url")],
+            &[tool("mcp_feishu_docs_get_text_by_url")],
         );
         assert!(catalog.is_none());
     }

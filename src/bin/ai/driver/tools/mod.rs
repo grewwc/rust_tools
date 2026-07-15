@@ -316,18 +316,7 @@ fn remediation_hint(
         ));
     }
 
-    if tool_name == "mcp_feishu_docs_get_text_by_url" && err_lower.contains("unsupported url") {
-        let discovery_hint =
-            if tool_visible_in_current_turn(available_tool_names, "mcp_feishu_docs_search") {
-                " Use `mcp_feishu_docs_search` to find the document first,"
-            } else {
-                ""
-            };
-        return Some(format!(
-            "Suggestion: this tool only works for supported Feishu/Lark docs URLs. Do not retry with the same URL.{} or ask the user for a direct Feishu docs/wiki/sheet URL.",
-            discovery_hint
-        ));
-    }
+    // Note: mcp_feishu_docs_search has been removed; users must provide direct Feishu URLs.
 
     if err_lower.contains("failed to parse arguments") || err_lower.contains("invalid type") {
         return Some(
