@@ -526,12 +526,20 @@ impl MarkdownStreamRenderer {
                 {
                     // 表头行落定：记录状态并显示单行占位提示（表格生成期不再空窗）。
                     let (indent, rest) = split_indent(line);
-                    let placeholder = self.table_placeholder_line(indent);
+                    // 裸表头（无前导 `|`）或带缩进的表头，其行首在识别为表头之前已被逐字
+                    // echo（首 token 不含 `|`，should_buffer_table_line 拒绝中途切缓冲）。
+                    // 若不回收这些已 echo 的物理行，原始 markdown 会泄漏在成品表格上方。
+                    let mut out = String::new();
+                    if preview_emitted && !line.is_empty() {
+                        let preview_height = self.line_preview_height.max(1);
+                        out.push_str(&format!("\x1b[{preview_height}A\r\x1b[0J"));
+                    }
+                    out.push_str(&self.table_placeholder_line(indent));
                     self.table_state = TableState::PendingHeader {
                         indent: indent.to_string(),
                         header_line: rest.trim_end().to_string(),
                     };
-                    return placeholder;
+                    return out;
                 }
                 let rendered = self.render_line_no_table(line);
                 if preview_emitted && !line.is_empty() {
@@ -1991,6 +1999,49 @@ make_llm_call_publisher | 一致 | 同一条 on_call complete callback
             !joined.contains("--- | --- | ---"),
             "raw bare-table separator leaked:\n{joined}"
         );
+    }
+
+    #[test]
+    fn streamed_bare_table_without_leading_pipe_leaves_no_raw_header() {
+        // 复现截图 bug：无前导 `|` 的裸表头在流式路径下，行首（不含 `|` 的 token）会先被
+        // 逐字 echo，等换行识别成表头时若不回收这些物理行，原始 markdown 会泄漏在成品表
+        // 上方。修复后 consume_line 在切 PendingHeader 前用 cursor-up 回收已 echo 的行。
+        let _guard = env_guard();
+        unsafe { std::env::set_var("COLUMNS", "96") };
+
+        let md = "\
+对，除了模型层面的差异，其他全部一致。我逐项确认过：
+
+维度 | 是否一致 | 说明
+--- | --- | ---
+tracing/telemetry 上报 | 一致 | 同一批 telemetry publisher
+make_llm_call_publisher | 一致 | 同一条 on_call complete callback
+";
+
+        let stream = render_full_stream(md, false);
+        let mut grid = VtGrid::new(96);
+        grid.feed(&stream);
+        let screen = grid.screen();
+        let joined = screen.join("\n");
+
+        assert!(joined.contains('┌'), "{joined}");
+        assert!(joined.contains('│'), "{joined}");
+        assert!(joined.contains("tracing/telemetry 上报"), "{joined}");
+        // 引导段落必须保留。
+        assert!(
+            joined.contains("其他全部一致"),
+            "leading paragraph clobbered:\n{joined}"
+        );
+        // 裸表头/分隔行的原始 markdown（裸 `|`）不得残留在屏幕上。
+        for line in &screen {
+            if line.is_empty() || line.contains('│') {
+                continue;
+            }
+            assert!(
+                !line.contains('|'),
+                "residual raw markdown pipe in streamed bare table: {line:?}\nfull screen:\n{joined}"
+            );
+        }
     }
 
     #[test]
