@@ -533,14 +533,29 @@ fn collect_content_files(
             let path = entry.path();
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
 
-            if path.is_dir() {
+            if file_type.is_symlink() {
+                // 不递归目录符号链接；否则可能重复扫描，甚至在目录环上失控。
+                let meta = match fs::metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(_) => continue,
+                };
+                if !meta.is_file() {
+                    continue;
+                }
+            }
+
+            if file_type.is_dir() {
                 if rust_tools::commonw::is_skip_dir(name_str.as_ref()) || name_str.starts_with('.')
                 {
                     continue;
                 }
                 queue.push_back(path);
-            } else if path.is_file() {
+            } else if file_type.is_file() || file_type.is_symlink() {
                 if name_str.starts_with('.') {
                     continue;
                 }
@@ -569,7 +584,7 @@ fn collect_content_files(
 }
 
 fn truncate_output(s: &str, max_chars: usize) -> String {
-    if s.len() <= max_chars {
+    if s.chars().count() <= max_chars {
         return s.to_string();
     }
     let mut out = String::with_capacity(max_chars + 32);
@@ -693,6 +708,8 @@ pub(crate) fn execute_text_grep(args: &Value) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     fn make_temp_dir(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -992,5 +1009,29 @@ mod tests {
         assert!(glob_match_simple("?at.rs", "cat.rs"));
         assert!(!glob_match_simple("?at.rs", "at.rs"));
         assert!(glob_match_simple("?.rs", "a.rs"));
+    }
+
+    #[test]
+    fn test_truncate_output_counts_chars_consistently() {
+        let content = "你".repeat(20_000);
+        let out = truncate_output(&content, 32_000);
+        assert_eq!(out, content, "should not truncate under char budget");
+        assert!(!out.contains("output truncated"), "{}", out);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_content_files_skips_symlink_dirs() {
+        let dir = make_temp_dir("symlink_dir");
+        let real_dir = dir.join("real");
+        fs::create_dir_all(&real_dir).unwrap();
+        fs::write(real_dir.join("needle.rs"), "fn needle() {}\n").unwrap();
+        symlink(&real_dir, dir.join("alias")).unwrap();
+
+        let files = collect_content_files(&dir, None, None).unwrap();
+        assert_eq!(files.len(), 1, "symlink dir should not duplicate scan");
+        assert_eq!(files[0], real_dir.join("needle.rs"));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

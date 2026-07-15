@@ -144,7 +144,12 @@ pub(super) fn build_responses_request_body(request: &RequestBody<'_>) -> Value {
         object.insert("tool_choice".to_string(), tool_choice.clone());
     }
     if let Some(effort) = request.reasoning_effort {
-        object.insert("reasoning".to_string(), json!({ "effort": effort }));
+        // Responses API 默认不会返回推理文本；显式索取 reasoning summary，
+        // provider 才会发送 response.reasoning_summary_text.* 事件。
+        object.insert(
+            "reasoning".to_string(),
+            json!({ "effort": effort, "summary": "auto" }),
+        );
     } else if let Some(reasoning) = &request.reasoning {
         object.insert("reasoning".to_string(), reasoning.clone());
     }

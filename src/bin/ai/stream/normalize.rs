@@ -195,9 +195,18 @@ fn parse_content_part_event(
     }
 
     let part = value.get("part").unwrap_or(value);
+    let part_type = part
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     let text = extract_event_text(part, &["delta", "text", "content"]);
     if text.is_empty() {
         return Some(ParsedStreamPayload::Ignore);
+    }
+    if part_type == "summary_text" {
+        return Some(textual_event_chunk(event_type, "", &text));
     }
     Some(textual_event_chunk(event_type, &text, ""))
 }
@@ -683,6 +692,22 @@ mod tests {
                 assert_eq!(chunk.choices[0].delta.content, "hello");
             }
             _ => panic!("expected content-part chunk"),
+        }
+    }
+
+    #[test]
+    fn content_part_summary_text_maps_to_reasoning_chunk() {
+        let payload = r#"{"part":{"type":"summary_text","text":"step summary"}}"#;
+        match parse_stream_payload(
+            provider::openai_adapter(),
+            payload,
+            Some("response.content_part.added"),
+        ) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.content, "");
+                assert_eq!(chunk.choices[0].delta.reasoning_content, "step summary");
+            }
+            _ => panic!("expected reasoning content-part chunk"),
         }
     }
 

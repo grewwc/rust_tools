@@ -277,21 +277,21 @@ pub(crate) async fn generate_session_title_via_model(
     {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
-            eprintln!("[session-title] request error: {e}");
+            // eprintln!("[session-title] request error: {e}");
             return None;
         }
         Err(_) => {
-            eprintln!(
-                "[session-title] timeout ({}s) sending request, skipping",
-                SESSION_TITLE_REQUEST_TIMEOUT_SECS
-            );
+            // eprintln!(
+                // "[session-title] timeout ({}s) sending request, skipping",
+                // SESSION_TITLE_REQUEST_TIMEOUT_SECS
+            // );
             return None;
         }
     };
 
     let status = response.status();
     if !status.is_success() {
-        eprintln!("[session-title] HTTP {status}, skipping");
+        // eprintln!("[session-title] HTTP {status}, skipping");
         return None;
     }
 
@@ -303,14 +303,14 @@ pub(crate) async fn generate_session_title_via_model(
     {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
-            eprintln!("[session-title] body read error: {e}");
+            // eprintln!("[session-title] body read error: {e}");
             return None;
         }
         Err(_) => {
-            eprintln!(
-                "[session-title] timeout ({}s) reading body, skipping",
-                SESSION_TITLE_BODY_TIMEOUT_SECS
-            );
+            // eprintln!(
+                // "[session-title] timeout ({}s) reading body, skipping",
+                // SESSION_TITLE_BODY_TIMEOUT_SECS
+            // );
             return None;
         }
     };
@@ -318,14 +318,14 @@ pub(crate) async fn generate_session_title_via_model(
     let v: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("[session-title] JSON parse error: {e}");
+            // eprintln!("[session-title] JSON parse error: {e}");
             return None;
         }
     };
     let content = match extract_router_content(&v) {
         Some(c) => c,
         None => {
-            eprintln!("[session-title] extract_router_content returned None");
+            // eprintln!("[session-title] extract_router_content returned None");
             return None;
         }
     };

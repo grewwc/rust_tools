@@ -816,6 +816,7 @@ fn responses_request_body_uses_function_tools_and_nested_reasoning() {
 
     let body = super::builder::build_responses_request_body(&request);
     assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["reasoning"]["summary"], "auto");
     assert_eq!(body["tools"][0]["type"], "function");
     assert_eq!(body["tools"][0]["name"], "get_weather");
     assert!(body.get("messages").is_none());
