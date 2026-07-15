@@ -17,7 +17,7 @@ use crate::ai::types::App;
 use crate::commonw::configw;
 use rust_tools::commonw;
 
-use super::build_request_body;
+use super::builder::build_request_body;
 use super::error::{
     DEFAULT_AUTO_THINKING_THRESHOLD, api_key_for_request_model, apply_request_auth,
     config_bool_is_true, control_model_for_aux_tasks, endpoint_for_request_model,

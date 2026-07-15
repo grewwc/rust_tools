@@ -9,8 +9,11 @@ actually touches that subsystem.
 ## Layout
 
 - `driver/`: run loop, turn preparation/runtime, prompt building, thinking, reflection
+  - `driver/background_dispatch.rs`: background process dispatch (select, decode, spawn)
   - `driver/tools/`: tool execution, async tool pipe, tool cache, barrier/oauth/sync_task submodules
-- `request/`: LLM request execution (error/retry, thinking mode, skill routing, message normalization, stream types)
+- `request/`: LLM request execution
+  - `request/transport.rs`: HTTP transport layer (send, retry, timeout, auth) - extracted from `mod.rs`
+  - `request/` submodules: error/retry, thinking mode, skill routing, message normalization, stream types, builder, reasoning
 - `tools/`: tool registry, service implementations, storage helpers, progressive loading
   - `tools/task_tools/`: task_spawn/task_wait lifecycle + agent team orchestration + tests
 - `knowledge/`: memory/knowledge storage, recall, indexing, embedding

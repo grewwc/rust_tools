@@ -1,4 +1,6 @@
 use super::*;
+use super::builder::MIN_OUTPUT_TOKENS_FLOOR;
+use serde_json::Value;
 use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
 use crate::ai::{cli::ParsedCli, types::AppConfig};
 use std::path::PathBuf;
@@ -391,7 +393,7 @@ fn thinking_gate_uses_latest_user_message_only() {
 
 #[tokio::test]
 async fn sleep_with_cancel_observes_request_interrupt_source() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let app = test_app();
     init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();
@@ -414,7 +416,7 @@ async fn sleep_with_cancel_observes_request_interrupt_source() {
 
 #[test]
 fn clears_stale_interrupt_for_new_request_but_keeps_active_cancel() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let app = test_app();
     init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();

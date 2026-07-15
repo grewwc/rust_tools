@@ -1700,7 +1700,7 @@ mod tests {
 
     #[test]
     fn history_rewind_cancels_reflection_daemons_and_clears_runtime_state() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let history_path = std::env::temp_dir().join(format!(
             "ai-history-rewind-runtime-{}.sqlite",
             Uuid::new_v4()

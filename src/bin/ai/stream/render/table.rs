@@ -1010,6 +1010,8 @@ mod tests {
     /// column position across all rendered lines (header + data rows).
     #[test]
     fn screenshot_table_borders_align_with_emoji_first_column() {
+       let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+       unsafe { std::env::set_var("COLUMNS", "120") };
         let header = vec!["严重度".to_string(), "问题".to_string(), "状态".to_string()];
         let align = vec![TableAlign::Left, TableAlign::Left, TableAlign::Left];
         let rows = vec![

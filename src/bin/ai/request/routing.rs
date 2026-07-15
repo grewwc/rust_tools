@@ -18,7 +18,8 @@ use super::error::{
     api_key_for_request_model, apply_request_auth, control_model_for_aux_tasks,
     endpoint_for_request_model,
 };
-use super::{SkillManifest, build_request_body};
+use super::builder::build_request_body;
+use crate::ai::skills::SkillManifest;
 
 pub(crate) fn strip_json_fence(s: &str) -> &str {
     let trimmed = s.trim();

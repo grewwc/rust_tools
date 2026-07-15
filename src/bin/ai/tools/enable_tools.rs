@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn list_includes_available_mcp_tools() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         reset_state_for_tests();
         set_active_tool_names(vec!["enable_tools".to_string()]);
         set_available_mcp_tools(vec![tool("mcp_feishu_docs_search")]);
@@ -365,7 +365,7 @@ mod tests {
 
     #[test]
     fn enable_known_mcp_tool_queues_mcp_activation() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         reset_state_for_tests();
         set_active_tool_names(vec!["enable_tools".to_string()]);
         set_available_mcp_tools(vec![tool("mcp_feishu_docs_search")]);

@@ -96,7 +96,7 @@ fn test_app() -> App {
 
 #[tokio::test]
 async fn wait_for_interrupt_observes_request_interrupt_source() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let app = test_app();
     init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();
@@ -116,7 +116,7 @@ async fn wait_for_interrupt_observes_request_interrupt_source() {
 
 #[tokio::test]
 async fn wait_for_interrupt_or_timeout_returns_true_on_request_interrupt() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let app = test_app();
     init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();
@@ -588,7 +588,7 @@ fn thinking_fold_drops_interior_blank_lines() {
 fn thinking_fold_window_counts_current_line_inside_visible_budget() {
     // 锁定并置宽 COLUMNS：本用例断言正文/标记原样存在，须避免与 COLUMNS=12
     // 的折行用例并发时读到被泄漏的窄列宽而触发 clamp 截断。
-    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     unsafe {
         std::env::set_var("COLUMNS", "200");
     }
@@ -622,7 +622,7 @@ fn thinking_fold_window_counts_current_line_inside_visible_budget() {
 
 #[test]
 fn thinking_fold_window_rows_follow_wrapped_terminal_height() {
-    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     unsafe {
         std::env::set_var("COLUMNS", "12");
     }
@@ -660,7 +660,7 @@ fn thinking_fold_window_rows_follow_wrapped_terminal_height() {
 
 #[test]
 fn thinking_fold_window_without_hidden_lines_has_no_fold_marker() {
-    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     unsafe {
         std::env::set_var("COLUMNS", "200");
     }
@@ -692,7 +692,7 @@ fn thinking_fold_window_body_excludes_anchored_header() {
     // header 已从正文渲染中剥离并单独锚定：`render_thinking_fold_window` 只产出正文
     // （折叠摘要 + 可见行），绝不含 header。这是「孤儿 header 叠加」修复的核心不变量——
     // 正文可被 cursor-up 反复擦除重画，header 只落地一次、永不被擦除。
-    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     unsafe {
         std::env::set_var("COLUMNS", "200");
     }
@@ -721,7 +721,7 @@ fn thinking_fold_window_body_excludes_anchored_header() {
 
 #[test]
 fn thinking_fold_erase_rows_follow_current_terminal_reflow_of_previous_body() {
-    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let mut state = StreamProcessingState::new();
     let fold = &mut state.render.thinking_fold;
     fold.window_rows = 2;
@@ -753,7 +753,7 @@ fn thinking_fold_header_anchored_once_and_window_rows_track_body_only() {
     // 「孤儿 header 叠加」回归：header 只在首次重画时落地（header_drawn=true），
     // 之后无论重画多少次都不再重打；window_rows 只记录正文物理行数（不含 header），
     // 因此 cursor-up 擦除永远只作用于可视的正文区，不会因窗口滚入 scrollback 而失步。
-    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     unsafe {
         std::env::set_var("COLUMNS", "200");
     }
@@ -913,7 +913,7 @@ fn write_http_chunk(stream: &mut std::net::TcpStream, payload: &str) -> std::io:
 
 #[tokio::test]
 async fn stream_response_returns_after_finish_reason_without_eof() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (done_tx, done_rx) = mpsc::channel::<()>();
@@ -974,7 +974,7 @@ async fn stream_response_returns_after_finish_reason_without_eof() {
 
 #[tokio::test]
 async fn stream_response_marks_length_finish_reason_as_truncated() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (done_tx, done_rx) = mpsc::channel::<()>();
@@ -1039,7 +1039,7 @@ async fn stream_response_marks_length_finish_reason_as_truncated() {
 
 #[tokio::test]
 async fn stream_response_marks_reasoning_only_early_stop_as_truncated() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
@@ -1101,7 +1101,7 @@ async fn stream_response_marks_reasoning_only_early_stop_as_truncated() {
 
 #[tokio::test]
 async fn stream_response_keeps_reading_delayed_chunks_after_finish_reason() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let (done_tx, done_rx) = mpsc::channel::<()>();

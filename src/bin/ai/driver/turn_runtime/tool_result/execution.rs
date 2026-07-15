@@ -1329,7 +1329,7 @@ mod tests {
     fn tty_tool_output_fold_window_keeps_latest_visible_lines() {
         // 断言正文/标记原样存在；置宽 COLUMNS 以免与 COLUMNS=12 的 clamp 用例并发时
         // 读到泄漏的窄列宽而被截断。
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::set_var("COLUMNS", "200");
         }
@@ -1366,7 +1366,7 @@ mod tests {
 
     #[test]
     fn tty_tool_output_fold_window_clamps_each_line_to_single_row() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         unsafe {
             std::env::set_var("COLUMNS", "12");
         }
@@ -1742,7 +1742,7 @@ mod tests {
 
     #[test]
     fn forced_final_hallucinated_tool_call_is_rejected_without_consuming_quota() {
-        let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let mut app = test_app_with_tools(&["read_file"]);
         let pid = {
             let mut os = app.os.lock().unwrap();
@@ -1870,7 +1870,7 @@ mod tests {
 
     #[test]
     fn ctrl_c_during_foreground_tool_round_cancels_without_shutdown() {
-        let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let _env_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         signal::clear_request_interrupt();
 
         let app = test_app_with_tools(&["execute_command"]);

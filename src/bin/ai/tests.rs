@@ -197,7 +197,7 @@ fn image_files_keep_text_model() {
 
 #[test]
 fn take_stream_cancelled_clears_request_interrupt_futex() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let cancel_stream = Arc::new(AtomicBool::new(true));
     let app = test_app_with_cancel_stream(cancel_stream.clone());
     crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
@@ -219,7 +219,7 @@ fn take_stream_cancelled_clears_request_interrupt_futex() {
 
 #[test]
 fn request_shutdown_sets_request_interrupt_futex() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
     crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();
@@ -236,7 +236,7 @@ fn request_shutdown_sets_request_interrupt_futex() {
 
 #[tokio::test]
 async fn wait_for_interrupt_sources_returns_after_shutdown_request() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
     crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();
@@ -257,7 +257,7 @@ async fn wait_for_interrupt_sources_returns_after_shutdown_request() {
 
 #[tokio::test]
 async fn wait_for_interrupt_sources_returns_after_daemon_cancel() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
     let app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
     crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();

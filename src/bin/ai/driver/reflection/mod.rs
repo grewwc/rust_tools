@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn persistent_guidelines_include_safety_rules_and_high_priority_entries() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn auto_recalled_knowledge_uses_project_hint_for_this_project_queries() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn persistent_guidelines_include_legacy_saved_and_generalized_principles() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn project_writeback_replaces_existing_entry_by_source() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn project_writeback_rejects_user_local_skill_path_note() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

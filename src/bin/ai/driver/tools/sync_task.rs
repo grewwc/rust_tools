@@ -475,7 +475,7 @@ mod tests {
 
     #[tokio::test]
     async fn sync_task_wait_wakes_on_cancel_notify() {
-        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap();
+        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
         crate::ai::driver::signal::clear_request_interrupt();
         let (shutdown, cancel) = flags();
         let streaming = Arc::new(AtomicBool::new(false));

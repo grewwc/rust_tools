@@ -2,7 +2,23 @@
 
 ## Module layout
 
-- `mod.rs`: main run loop, session management, background dispatch, MCP init
+- `mod.rs`: main run loop, session management, MCP init
+- `background_dispatch.rs`: background process dispatch - select ready
+  processes, decode task goals, build questions, clone app context, spawn
+  tokio tasks with scope chain. Extracted from `run_loop` in `mod.rs`.
+- `scheduler.rs`: background process scheduler - epoch management, dispatch
+  scoring, cooldown / circuit-breaker, batch selection. Extracted from `mod.rs`;
+  re-exported via `use scheduler::*` so existing call sites stay unqualified.
+- `session.rs`: startup session choice, suspended session preview/selection,
+  resume logic. Extracted from `mod.rs`; re-exported via `use session::*`.
+- `agent_routing.rs`: skill manifest loading, primary agent activation,
+  auto-routing, hot-reload, runtime manifest init. Extracted from `mod.rs`;
+  re-exported via `use agent_routing::*`.
+- `mcp_lifecycle.rs`: MCP preload, initialization, status display. Extracted
+  from `mod.rs`; re-exported via `use mcp_lifecycle::*`.
+- `process_context.rs`: history path generation, background subagent context
+  resolution, wake-up prompt, turn quota finalization. Extracted from `mod.rs`;
+  re-exported via `use process_context::*`.
 - `tests.rs`: driver-level integration tests
 - `tools/`: tool execution subsystem
   - `mod.rs`: tool routing, execution, retry, parallel batches, tool cache
