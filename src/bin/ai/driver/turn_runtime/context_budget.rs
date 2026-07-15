@@ -152,7 +152,7 @@ pub(super) fn apply_pre_request_context_budget(
     let protected_preserved = protected_messages_preserved(messages, &protected);
     let rollback_reason = if !protected_preserved {
         Some(ContextBudgetRollbackReason::ProtectedContextChanged)
-    } else if after_chars >= after_lossless_chars {
+    } else if after_chars > after_lossless_chars {
         Some(ContextBudgetRollbackReason::NoAdditionalSavings)
     } else {
         None

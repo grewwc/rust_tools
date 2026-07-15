@@ -322,7 +322,7 @@ async fn request_model_response(
 ) -> Result<(reqwest::Response, String), request::RequestError> {
     if force_final_response {
         messages.push(Message {
-            role: "system".to_string(),
+            role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
             content: Value::String(no_tool_handoff_note().to_string()),
             tool_calls: None,
             tool_call_id: None,

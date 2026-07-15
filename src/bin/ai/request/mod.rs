@@ -8,6 +8,7 @@ mod reasoning;
 mod routing;
 mod aux;
 mod thinking;
+mod token_budget;
 mod types;
 mod transport;
 

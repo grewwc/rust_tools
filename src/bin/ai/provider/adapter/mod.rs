@@ -15,11 +15,11 @@
 //! （[`thinking_dialect_for`]），各 provider adapter 不再参与思考字段编码。
 
 mod alibaba;
-mod compatible;
 mod openai;
 mod opencode;
 mod openrouter;
 mod thinking;
+pub(in crate::ai) mod compatible;
 
 use serde_json::Value;
 
@@ -28,6 +28,7 @@ use crate::ai::stream::{ParsedStreamPayload, try_parse_stream_chunk_loose};
 use super::ApiProvider;
 
 pub(in crate::ai) use thinking::{reasoning_effort_reduces_thinking_for, thinking_dialect_for};
+pub(in crate::ai) use compatible::compatible_wire_shapes;
 
 use alibaba::AlibabaAdapter;
 use compatible::CompatibleAdapter;

@@ -276,9 +276,16 @@ fn ensure_required_baseline_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
 fn manifest_tool_definitions(tool_groups: &[String], tools: &[String]) -> Option<Vec<ToolDef>> {
     if !tool_groups.is_empty() {
         let groups: Vec<&str> = tool_groups.iter().map(|s| s.as_str()).collect();
-        return Some(ensure_required_baseline_tools(
-            super::super::tools::tool_definitions_for_groups(&groups),
-        ));
+        // 按 tool_groups 展开时剔除「按需加载的重执行原语」（executor/openclaw 组
+        // 内、非 core 的进程/IPC/shm/env 原语）：它们 schema 大、使用频率低，默认不
+        // 随每轮请求常驻，改由模型经 `enable_tools` 按需启用，压缩每轮 tools token。
+        // 显式 `tools:` 点名的工具走下面分支、不做剔除（点名即常驻）。core∩executor
+        // 的 apply_patch / write_file 因同属 core 不被剔除，编辑能力零损失。
+        let expanded = super::super::tools::tool_definitions_for_groups(&groups)
+            .into_iter()
+            .filter(|tool| !super::super::tools::tool_defers_eager_load(&tool.function.name))
+            .collect::<Vec<_>>();
+        return Some(ensure_required_baseline_tools(expanded));
     }
     if !tools.is_empty() {
         return Some(ensure_required_baseline_tools(
@@ -299,6 +306,24 @@ fn is_executor_skill(skill: &SkillManifest) -> bool {
     skill.tool_groups.iter().any(|group| {
         group.eq_ignore_ascii_case("executor") || group.eq_ignore_ascii_case("openclaw")
     })
+}
+
+/// 该 skill / agent 是否声明了 executor / openclaw tool group（与 `is_executor_*`
+/// 不同：这里 mode-agnostic，`build` 这种 `mode: all` 但带 executor 组的 agent 也算）。
+/// 用于判定「本轮工具集里那些重执行原语被 manifest_tool_definitions 剔除过」，
+/// 从而只对这类 agent 追加「按需加载」提示，避免 plan/explore 等只读 agent 收到
+/// 不相关的进程/IPC 提示。
+fn declares_executor_group(
+    skill: Option<&SkillManifest>,
+    active_agent: Option<&AgentManifest>,
+) -> bool {
+    let has_executor = |groups: &[String]| {
+        groups
+            .iter()
+            .any(|g| g.eq_ignore_ascii_case("executor") || g.eq_ignore_ascii_case("openclaw"))
+    };
+    skill.is_some_and(|s| has_executor(&s.tool_groups))
+        || active_agent.is_some_and(|a| has_executor(&a.tool_groups))
 }
 
 fn resolve_max_iterations(active_agent: Option<&AgentManifest>, executor_active: bool) -> usize {
@@ -483,7 +508,15 @@ fn select_mcp_tools(
 
     let allowed_servers = resolved_mcp_servers(skill, active_agent);
     if allowed_servers.is_empty() {
-        return all_tools;
+        // 默认懒加载：不把全部 MCP 工具的 schema 预挂载到每轮请求里（每个 schema
+        // 几百~上千 token，全量 MCP 工具是每轮 tools 数组里最大且最可削减的一块，
+        // 直接撞 TPM 上限）。模型仍能感知这些工具——`build_hidden_mcp_tool_catalog`
+        // 会在 system prompt 里列出未加载的 MCP 工具名，模型按需通过
+        // `enable_tools(operation=list/enable)` 加载；已启用的工具经
+        // `explicit_enabled_tool_names` + `merge_with_runtime_enabled_tools` 跨轮保留。
+        // 只有当 skill / agent 显式声明了 `mcp_servers` 白名单时才走下面的
+        // eager 分支，把命中的 server 工具直接挂上。
+        return Vec::new();
     }
 
     filter_mcp_tools_by_allowed_servers(all_tools, &allowed_servers)
@@ -630,6 +663,48 @@ fn build_hidden_mcp_tool_catalog(
          If the task needs an external system or MCP-backed capability, call `enable_tools(operation=list)` first, then \
          `enable_tools(operation=enable, tools=[...])` with the exact names you need.\n\
          Example available MCP tools: {}",
+        displayed
+    );
+    if remaining > 0 {
+        out.push_str(&format!(", and {remaining} more"));
+    }
+    out.push('.');
+    Some(out)
+}
+
+fn build_hidden_execution_primitive_catalog(
+    available_tools: &Box<SkipSet<String>>,
+) -> Option<String> {
+    // 「按需加载的重执行原语」（进程 / IPC / 共享内存 / 环境原语）默认不随每轮请求
+    // 常驻。这里在 system prompt 里列出「已注册但本轮未加载」的这类工具名，保证模型
+    // 对它们可感知：需要时经 `enable_tools(operation=enable, tools=[...])` 按需启用。
+    // 与 MCP hidden catalog 同构（同样的 MAX_DISPLAY 截断 / 全部已加载则不提示）。
+    let mut hidden: Vec<String> = super::super::tools::deferred_eager_load_tool_summaries()
+        .into_iter()
+        .map(|(name, _desc)| name)
+        .filter(|name| !available_tools.contains_str(name))
+        .collect();
+    if hidden.is_empty() {
+        return None;
+    }
+    rust_tools::sortw::stable_sort_by(&mut hidden, |a, b| a.cmp(b));
+    hidden.dedup();
+
+    const MAX_DISPLAY: usize = 8;
+    let displayed = hidden
+        .iter()
+        .take(MAX_DISPLAY)
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = hidden.len().saturating_sub(MAX_DISPLAY);
+
+    let mut out = format!(
+        "Process / IPC / shared-memory primitives are available but not loaded this turn.\n\
+         For multi-process orchestration, background daemons, cross-process IPC, shared memory, \
+         or per-process env/working-dir control, call `enable_tools(operation=enable, tools=[...])` \
+         with the exact names you need.\n\
+         Example available tools: {}",
         displayed
     );
     if remaining > 0 {
@@ -1071,6 +1146,14 @@ fn build_skill_turn_guard(
     {
         builder.push(ContextKind::Fact, catalog);
     }
+    // executor/openclaw agent 的重执行原语被 manifest_tool_definitions 剔除出常驻集，
+    // 这里补一条「可 enable」提示保证模型可感知（其它只读 agent 不声明该组、不注入）。
+    if has_tool(&available_tools, "enable_tools")
+        && declares_executor_group(skill, active_agent.as_ref())
+        && let Some(catalog) = build_hidden_execution_primitive_catalog(&available_tools)
+    {
+        builder.push(ContextKind::Fact, catalog);
+    }
     push_project_context(&mut builder);
     if !app.active_persona.is_default() {
         let mut persona_prompt = format!(
@@ -1198,10 +1281,11 @@ pub(super) fn prepare_skill_for_turn(
 #[cfg(test)]
 mod tests {
     use super::{
-        ContextKind, SystemPromptBuilder, available_tool_names, build_hidden_mcp_tool_catalog,
+        ContextKind, SystemPromptBuilder, available_tool_names,
+        build_hidden_execution_primitive_catalog, build_hidden_mcp_tool_catalog,
         build_project_instruction_prompt, build_system_prompt, builtin_tools_for_skill,
-        ensure_required_baseline_tools, filter_mcp_tools_by_allowed_servers, has_tool,
-        merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
+        declares_executor_group, ensure_required_baseline_tools, filter_mcp_tools_by_allowed_servers,
+        has_tool, merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
         select_mcp_tools, tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
@@ -1275,6 +1359,185 @@ mod tests {
         assert!(names.iter().any(|name| name == "knowledge_search"));
         assert!(!names.iter().any(|name| name == "web_search"));
     }
+
+    fn executor_group_agent(name: &str) -> AgentManifest {
+        let mut agent = agent(name, Vec::new());
+        agent.mode = AgentMode::All;
+        agent.tool_groups = vec!["core".to_string(), "executor".to_string()];
+        agent.disable_mcp_tools = true;
+        agent
+    }
+
+    #[test]
+    fn executor_group_defers_process_primitives_but_keeps_core_editing() {
+        // build/executor 用 tool_groups: [core, executor]。执行原语（进程/IPC/shm/env）
+        // 默认懒加载，不进入常驻工具集；但 core∩executor 的 apply_patch/write_file 保留，
+        // 编辑能力零损失。
+        let build_agent = executor_group_agent("build");
+        let tools = builtin_tools_for_skill(None, Some(&build_agent));
+        let names = tools
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        // 常驻：core 编辑/检索能力
+        assert!(names.iter().any(|n| n == "apply_patch"));
+        assert!(names.iter().any(|n| n == "write_file"));
+        assert!(names.iter().any(|n| n == "read_file"));
+        assert!(names.iter().any(|n| n == "code_search"));
+        // 常驻：baseline 自助/编排能力
+        assert!(names.iter().any(|n| n == "enable_tools"));
+        assert!(names.iter().any(|n| n == "task_spawn"));
+
+        // 懒加载：重执行原语不常驻
+        for deferred in [
+            "spawn_process",
+            "spawn_daemon",
+            "send_ipc_message",
+            "read_mailbox",
+            "shm_create",
+            "shm_read",
+            "shm_write",
+            "shm_delete",
+            "signal_process",
+            "kill_process",
+            "wait_process",
+            "reap_process",
+            "set_env",
+            "set_working_dir",
+            "set_process_group",
+            "signal_process_group",
+            "sleep_process",
+            "ps_processes",
+            "ps_ipc",
+        ] {
+            assert!(
+                !names.iter().any(|n| n == deferred),
+                "executor primitive `{deferred}` should be lazy-loaded, not eagerly mounted"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_tools_list_is_not_filtered_by_lazy_load() {
+        // 显式 `tools:` 点名的工具即常驻：即便点名一个执行原语也不剔除。
+        let mut agent = agent("custom", Vec::new());
+        agent.tool_groups = Vec::new();
+        agent.tools = vec!["read_file".to_string(), "spawn_process".to_string()];
+
+        let tools = builtin_tools_for_skill(None, Some(&agent));
+        let names = tools
+            .into_iter()
+            .map(|tool| tool.function.name)
+            .collect::<Vec<_>>();
+
+        assert!(names.iter().any(|n| n == "read_file"));
+        assert!(
+            names.iter().any(|n| n == "spawn_process"),
+            "explicitly named executor primitive must stay eager"
+        );
+    }
+
+    #[test]
+    fn hidden_execution_primitive_catalog_advertises_deferred_tools() {
+        // 懒加载后模型仍需可感知：本轮未加载这些原语时，catalog 必须列出它们
+        // 并给出 enable_tools 的启用路径。
+        let mut available = SkipSet::new(16);
+        available.insert("read_file".to_string());
+        available.insert("enable_tools".to_string());
+
+        let catalog = build_hidden_execution_primitive_catalog(&Box::new(available))
+            .expect("deferred primitives should produce a catalog");
+        assert!(catalog.contains("enable_tools(operation=enable"));
+        // catalog 按名称排序后只展示前 MAX_DISPLAY(8) 个，其余折叠为 "and N more"。
+        // `kill_process` 字典序最靠前，必在展示区内；断言它而非 `spawn_process`
+        // （后者排在末尾、落在截断之外）。
+        assert!(catalog.contains("kill_process"));
+        assert!(catalog.contains("more."));
+    }
+
+    #[test]
+    fn hidden_execution_primitive_catalog_suppressed_when_all_loaded() {
+        // 若所有执行原语都已加载（例如显式点名全量），则不再重复提示。
+        let mut available = SkipSet::new(16);
+        for (name, _desc) in crate::ai::tools::deferred_eager_load_tool_summaries() {
+            available.insert(name);
+        }
+        assert!(build_hidden_execution_primitive_catalog(&Box::new(available)).is_none());
+    }
+
+    #[test]
+    fn declares_executor_group_only_true_for_executor_agents() {
+        let build_agent = executor_group_agent("build");
+        assert!(declares_executor_group(None, Some(&build_agent)));
+
+        // plan/explore 用显式 tools 列表、无 executor 组
+        let mut plan_agent = agent("plan", Vec::new());
+        plan_agent.mode = AgentMode::All;
+        plan_agent.tool_groups = Vec::new();
+        plan_agent.tools = vec!["read_file".to_string(), "code_search".to_string()];
+        assert!(!declares_executor_group(None, Some(&plan_agent)));
+
+        assert!(!declares_executor_group(None, None));
+    }
+
+    #[test]
+    fn lazy_load_measurably_shrinks_build_agent_tool_payload() {
+        // 用生产序列化路径量化「懒加载剔除执行原语」对每轮请求 tools token 的实际
+        // 削减：请求体里 tools 就是 Vec<ToolDefinition> 的紧凑 JSON，request/builder.rs
+        // 的 estimate_tools_tokens 按 serde_json::to_string 的字符数 / 2（保守换算，
+        // CHARS_PER_TOKEN_CONSERVATIVE）计入每轮 prompt。这里对比：
+        //   baseline = executor 组按 tool_groups 全量展开（懒加载前的行为）
+        //   optimized = 现行 builtin_tools_for_skill（懒加载后，剔除 deferred 原语）
+        const CHARS_PER_TOKEN_CONSERVATIVE: usize = 2;
+        let build_agent = executor_group_agent("build");
+
+        // baseline：直接展开 [core, executor]，不做 deferred 过滤（还原优化前口径）。
+        let groups = ["core", "executor"];
+        let baseline_tools = ensure_required_baseline_tools(
+            crate::ai::tools::tool_definitions_for_groups(&groups),
+        );
+        // optimized：现行生产路径（manifest_tool_definitions 会剔除 deferred 原语）。
+        let optimized_tools = builtin_tools_for_skill(None, Some(&build_agent));
+
+        let ser = |tools: &[ToolDefinition]| -> usize {
+            serde_json::to_string(tools).map(|s| s.chars().count()).unwrap_or(0)
+        };
+        let baseline_chars = ser(&baseline_tools);
+        let optimized_chars = ser(&optimized_tools);
+        let saved_chars = baseline_chars.saturating_sub(optimized_chars);
+        let saved_tokens = saved_chars.div_ceil(CHARS_PER_TOKEN_CONSERVATIVE);
+        let pct = (saved_chars as f64 / baseline_chars as f64) * 100.0;
+
+        eprintln!(
+            "[lazy-load measurement] build agent tools: baseline={} tools / {} chars (~{} tok), \
+             optimized={} tools / {} chars (~{} tok), saved={} chars (~{} tok, {:.1}%)",
+            baseline_tools.len(),
+            baseline_chars,
+            baseline_chars.div_ceil(CHARS_PER_TOKEN_CONSERVATIVE),
+            optimized_tools.len(),
+            optimized_chars,
+            optimized_chars.div_ceil(CHARS_PER_TOKEN_CONSERVATIVE),
+            saved_chars,
+            saved_tokens,
+            pct,
+        );
+
+        // 优化必须真实削减 payload：剔除的原语数 == deferred 目录大小；且节省 token
+        // 量级显著（保守下界 800 tok/轮，实测约 1.1~1.2k）。若哪天有人把这些原语加回
+        // core 或删掉过滤，这个断言会立刻红。
+        let deferred_count = crate::ai::tools::deferred_eager_load_tool_summaries().len();
+        assert_eq!(
+            baseline_tools.len() - optimized_tools.len(),
+            deferred_count,
+            "optimized set must drop exactly the deferred executor primitives"
+        );
+        assert!(
+            saved_tokens >= 800,
+            "expected >=800 tokens saved per turn, got {saved_tokens}"
+        );
+    }
+
 
     #[test]
     fn system_prompt_only_mentions_tools_available_this_turn() {
@@ -1771,7 +2034,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_without_mcp_servers_field_exposes_all_mcp_tools() {
+    fn agent_without_mcp_servers_field_lazy_loads_mcp_tools() {
+        // 无 mcp_servers 白名单时默认懒加载：不预挂载任何 MCP 工具 schema，
+        // 模型经 hidden MCP catalog + enable_tools 按需加载。
         let all_tools = vec![
             tool("mcp_feishu_docs_search"),
             tool("mcp_ocr_extract"),
@@ -1780,14 +2045,8 @@ mod tests {
         let build_agent = agent("build", vec![]);
 
         let tools = select_mcp_tools(all_tools, None, Some(&build_agent));
-        let names = tools
-            .into_iter()
-            .map(|tool| tool.function.name)
-            .collect::<Vec<_>>();
 
-        assert!(names.contains(&"mcp_feishu_docs_search".to_string()));
-        assert!(names.contains(&"mcp_ocr_extract".to_string()));
-        assert!(names.contains(&"mcp_other_lookup".to_string()));
+        assert!(tools.is_empty());
     }
 
     #[test]
@@ -1819,18 +2078,14 @@ mod tests {
     }
 
     #[test]
-    fn no_active_agent_or_skill_falls_back_to_all_mcp_tools() {
+    fn no_active_agent_or_skill_lazy_loads_mcp_tools() {
+        // 既无 skill 也无 agent 白名单时同样默认懒加载：返回空，交由
+        // hidden MCP catalog + enable_tools 按需加载。
         let all_tools = vec![tool("mcp_feishu_docs_search"), tool("mcp_other_lookup")];
 
         let tools = select_mcp_tools(all_tools, None, None);
-        let names = tools
-            .into_iter()
-            .map(|tool| tool.function.name)
-            .collect::<Vec<_>>();
 
-        assert_eq!(names.len(), 2);
-        assert!(names.contains(&"mcp_feishu_docs_search".to_string()));
-        assert!(names.contains(&"mcp_other_lookup".to_string()));
+        assert!(tools.is_empty());
     }
 
     #[test]

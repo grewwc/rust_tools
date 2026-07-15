@@ -14,7 +14,7 @@ use crate::ai::{
     files,
     history::Message,
     models,
-    provider::adapter_for,
+    provider::{adapter_for, compatible_wire_shapes},
 };
 use super::reasoning::resolve_reasoning_wire_controls;
 use super::RequestBody;
@@ -82,6 +82,16 @@ fn estimate_tools_tokens(tools: Option<&Value>) -> usize {
     chars.div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
 }
 
+/// 估算本次请求的输入 token：messages + tools schema。
+/// request 传输层的 TPM preflight gate 与 max_tokens clamp 共用这条路径，避免
+/// "窗口预算"与"速率预算"使用两套不同估算导致判断分叉。
+pub(super) fn estimate_request_prompt_tokens(
+    messages: &[Message],
+    tools: Option<&Value>,
+) -> usize {
+    estimate_prompt_tokens(messages) + estimate_tools_tokens(tools)
+}
+
 /// 按「剩余上下文窗口」钳制单次请求的输出上限：
 /// `min(model_max, window - est_prompt - safety_margin)`，并 floor 到
 /// [`MIN_OUTPUT_TOKENS_FLOOR`]。这样即使模型声明了很大的 max_output_tokens，
@@ -97,7 +107,7 @@ pub(crate) fn clamp_max_tokens_for_prompt(
     // 本轮实际消息量的字符估算（保守：每 token ~2 字符）。工具 schema 也会随请求
     // 一起发送、占用 prompt 窗口，故把其序列化长度折算进 prompt token--启用大量
     // 工具/MCP 时不计入会显著高估可用输出预算，导致 prompt+输出撞爆窗口。
-    let est_prompt = estimate_prompt_tokens(messages) + estimate_tools_tokens(tools);
+    let est_prompt = estimate_request_prompt_tokens(messages, tools);
     // 优先使用服务端返回的实际 prompt_tokens，比字符估算精确得多。但该值来自
     // *上一轮* 请求：若这一轮刚发生历史压缩，prompt 骤降，而回填的 known 仍是
     // 压缩前的高值--直接用它会把 remaining 误算成接近 0，clamp 触底到
@@ -138,6 +148,14 @@ pub(super) fn build_request_body<'a>(
     let request_model = models::request_model_name(model);
     let (thinking, reasoning_effort, reasoning) =
         resolve_reasoning_wire_controls(model, &endpoint, enable_thinking, reasoning_effort);
+    // compatible 端点里非 DashScope 的纯 OpenAI 兼容网关不认识 enable_search，
+    // 由 compatible_wire_shapes 判定是否下发；其他 adapter 走默认 hook。
+    let enable_search = if adapter_kind == crate::ai::provider::ApiProvider::Compatible {
+        let (es, _, _) = compatible_wire_shapes(&endpoint, enable_search, None);
+        es
+    } else {
+        adapter.enable_search_field(enable_search)
+    };
     // 流式请求显式索取 usage：部分 adapter（DashScope compatible-mode）流式下
     // 默认不返回 usage，必须声明 stream_options.include_usage 才能统计 token。
     let stream_options = stream.then(|| json!({ "include_usage": true }));
@@ -166,7 +184,7 @@ pub(super) fn build_request_body<'a>(
         messages,
         stream,
         thinking,
-        enable_search: adapter.enable_search_field(enable_search),
+        enable_search,
         tools,
         tool_choice,
         reasoning_effort,

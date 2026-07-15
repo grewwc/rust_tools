@@ -18,14 +18,14 @@ use super::super::{
 use crate::ai::theme::{ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_SUCCESS, ACCENT_WARN, RESET};
 
 use super::aux::charge_llm_usage_to_kernel;
-use super::builder::build_request_body;
+use super::builder::{build_request_body, estimate_request_prompt_tokens};
 use super::error::{
     REQUEST_MAX_ATTEMPTS, STREAM_RESPONSE_HEADER_TIMEOUT_SECS, RequestError, RequestErrorKind,
     RequestRetryPolicy, api_key_for_request_model, apply_request_auth,
     clear_stale_request_interrupt_before_request, config_forces_thinking,
     endpoint_for_request_model, is_retryable_reqwest_error, is_retryable_status_with_body,
     parse_retry_after, request_retry_policy_for_current_context, retry_delay,
-    send_with_hedged_backup, should_retry_status, should_rotate_key, sleep_with_cancel,
+    retry_delay_429, should_retry_status, should_rotate_key, sleep_with_cancel,
 };
 use super::normalize::{
     agent_tools_for_request, normalize_messages_for_model, request_tool_names_for_model,
@@ -37,6 +37,7 @@ use super::reasoning::{
     resolve_reasoning_effort, resolve_reasoning_wire_controls,
 };
 use super::thinking::resolve_thinking;
+use super::token_budget;
 use super::types::{RequestBody, StreamChunk, StreamUsage};
 
 /// 并发请求（前台 turn + 各子代理）各自独立重试，`attempt N/M` 计数互相
@@ -46,6 +47,57 @@ fn retry_scope_tag() -> String {
     match aios_kernel::kernel::current_task_pid() {
         Some(pid) => format!("[pid {pid}] "),
         None => String::new(),
+    }
+}
+
+/// 带 TPM 预检的 hedged send。
+///
+/// 预算必须按 actual physical send 计，而不是按 logical request 计：hedged backup
+/// 未触发时只占一次；长尾触发 backup 时，每个追加请求都会在发送前重新占一次。
+/// 这样既避免 429，又不会因为按 `hedged_max_sends` 一次性预占而把正常吞吐压低 3 倍。
+async fn send_with_budgeted_hedged_backup(
+    app: &App,
+    endpoint: &str,
+    request_model: &str,
+    estimated_prompt_tokens: usize,
+    build_request: impl Fn() -> reqwest::RequestBuilder,
+    backup_after_secs: u64,
+    max_sends: usize,
+) -> Result<Response, RequestError> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+
+    let max_sends = max_sends.max(1);
+    let hedge = Duration::from_secs(backup_after_secs);
+    let mut in_flight = FuturesUnordered::new();
+
+    for round in 1..=max_sends {
+        token_budget::wait_for_request_budget(app, endpoint, request_model, estimated_prompt_tokens, 1)
+            .await?;
+        in_flight.push(build_request().send());
+        tokio::select! {
+            result = in_flight.next() => {
+                return result
+                    .expect("in_flight 非空")
+                    .map_err(RequestError::network);
+            }
+            _ = tokio::time::sleep(hedge) => {
+                if round < max_sends {
+                    eprintln!(
+                        "[Info] 第 {round} 次请求 {}s 内未返回响应头，发起 hedged backup request",
+                        backup_after_secs
+                    );
+                }
+            }
+        }
+    }
+
+    match in_flight.next().await {
+        Some(result) => result.map_err(RequestError::network),
+        None => Err(RequestError {
+            kind: RequestErrorKind::Network,
+            message: "hedged request set unexpectedly empty".to_string(),
+            retry_after: None,
+        }),
     }
 }
 
@@ -62,15 +114,22 @@ async fn request_messages_with_key(
     retry_policy: &RequestRetryPolicy,
     endpoint: &str,
 ) -> Result<Response, RequestError> {
+    let estimated_prompt_tokens =
+        estimate_request_prompt_tokens(request_body.messages, request_body.tools.as_ref());
     for attempt in 1..=retry_policy.max_attempts {
+        let client = app.client.clone();
         let build_request = || {
-            apply_request_auth(app.client.post(endpoint), endpoint, api_key)
+            apply_request_auth(client.post(endpoint), endpoint, api_key)
                 .header("Content-Type", "application/json")
                 .json(request_body)
         };
         let response = match tokio::time::timeout(
             Duration::from_secs(retry_policy.header_timeout_secs),
-            send_with_hedged_backup(
+            send_with_budgeted_hedged_backup(
+                app,
+                endpoint,
+                &request_body.model,
+                estimated_prompt_tokens,
                 build_request,
                 retry_policy.hedged_backup_after_secs(),
                 retry_policy.hedged_max_sends(),
@@ -152,8 +211,10 @@ async fn request_messages_with_key(
                 return Err(err);
             }
             Err(err) => {
-                let retryable = is_retryable_reqwest_error(&err);
-                let err = RequestError::network(err);
+                let retryable = match &err.kind {
+                    RequestErrorKind::Network => true,
+                    _ => false,
+                };
                 if retryable && attempt < retry_policy.max_attempts {
                     let delay = retry_delay(attempt);
                     eprintln!(
@@ -277,7 +338,7 @@ pub(crate) async fn do_request_messages(
         if !all_rate_limited || attempt >= retry_policy.max_attempts_429 {
             break;
         }
-        let delay = round_retry_after.unwrap_or_else(|| retry_delay(attempt));
+        let delay = round_retry_after.unwrap_or_else(|| retry_delay_429(attempt));
         eprintln!(
             "[Warning] {}429 Too Many Requests - {} 个 key 均配额超限，sleep {} 秒后重试 (attempt {}/{})",
             retry_scope_tag(),
@@ -390,6 +451,15 @@ pub async fn do_request_json(
         let endpoint = endpoint_for_request_model(app, model);
         let api_key = api_key_for_request_model(app, model);
         let t0 = Instant::now();
+        token_budget::wait_for_request_budget(
+            app,
+            &endpoint,
+            &request_model,
+            token_budget::estimate_json_request_tokens(&request_body),
+            1,
+        )
+        .await
+        .map_err(|err| -> Box<dyn std::error::Error> { Box::new(err) })?;
         // 非流式辅助请求：每次尝试 60 秒超时
         let send_future = async {
             let resp = apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
@@ -524,19 +594,25 @@ pub async fn do_request_text_streaming(
     for attempt in 1..=REQUEST_MAX_ATTEMPTS {
         let endpoint = endpoint_for_request_model(app, model);
         let api_key = api_key_for_request_model(app, model);
+        let retry_policy = request_retry_policy_for_current_context();
+        let estimated_prompt_tokens = token_budget::estimate_json_request_tokens(&request_body);
+        let client = app.client.clone();
         let build_request = || {
-            apply_request_auth(app.client.post(&endpoint), &endpoint, &api_key)
+            apply_request_auth(client.post(&endpoint), &endpoint, &api_key)
                 .header("Content-Type", "application/json")
                 .json(&request_body)
         };
-        let retry_policy = request_retry_policy_for_current_context();
         // 等待响应头：握手 + 服务端开始返回。流式下这一步很快。
         // 使用 hedged backup：如果 primary 在短时间内没响应，自动发 backup 请求。
         // 与非流式路径一致，header 等待超时取自 retry_policy.header_timeout_secs
         // （auto 子 agent 走 30s 而非硬编码 90s），chunk 空闲超时仍用固定常量。
         let mut response = match tokio::time::timeout(
             Duration::from_secs(retry_policy.header_timeout_secs),
-            send_with_hedged_backup(
+            send_with_budgeted_hedged_backup(
+                app,
+                &endpoint,
+                &request_model,
+                estimated_prompt_tokens,
                 build_request,
                 retry_policy.hedged_backup_after_secs(),
                 retry_policy.hedged_max_sends(),
@@ -564,7 +640,8 @@ pub async fn do_request_text_streaming(
                 }
             }
             Ok(Err(err)) => {
-                if is_retryable_reqwest_error(&err) && attempt < REQUEST_MAX_ATTEMPTS {
+                let retryable = matches!(&err.kind, RequestErrorKind::Network);
+                if retryable && attempt < REQUEST_MAX_ATTEMPTS {
                     let delay = retry_delay(attempt);
                     if sleep_with_cancel(app, delay).await {
                         return Err(Box::new(RequestError::cancelled(
@@ -573,7 +650,7 @@ pub async fn do_request_text_streaming(
                     }
                     continue;
                 }
-                return Err(err.into());
+                return Err(Box::new(err));
             }
             Err(_) => {
                 if attempt < REQUEST_MAX_ATTEMPTS {

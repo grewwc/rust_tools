@@ -70,6 +70,55 @@ fn is_rate_limited_only_true_for_429() {
 }
 
 #[test]
+fn tpm_budget_waits_until_old_reservations_leave_window() {
+    let mut bucket = token_budget::TokenBudgetBucket::default();
+    let now = Instant::now();
+    let window = Duration::from_secs(60);
+
+    assert!(matches!(
+        bucket.reserve_or_delay(now, 100, 80, window),
+        token_budget::BudgetDecision::Reserved
+    ));
+    match bucket.reserve_or_delay(now + Duration::from_secs(1), 100, 30, window) {
+        token_budget::BudgetDecision::Wait(delay) => {
+            assert!(delay >= Duration::from_secs(58));
+            assert!(delay <= Duration::from_secs(60));
+        }
+        token_budget::BudgetDecision::Reserved => panic!("second reservation should wait"),
+    }
+    assert!(matches!(
+        bucket.reserve_or_delay(now + Duration::from_secs(61), 100, 30, window),
+        token_budget::BudgetDecision::Reserved
+    ));
+}
+
+#[test]
+fn tpm_budget_allows_oversized_single_request_after_bucket_drains() {
+    let mut bucket = token_budget::TokenBudgetBucket::default();
+    let now = Instant::now();
+    let window = Duration::from_secs(60);
+
+    assert!(matches!(
+        bucket.reserve_or_delay(now, 100, 80, window),
+        token_budget::BudgetDecision::Reserved
+    ));
+    assert!(matches!(
+        bucket.reserve_or_delay(now + Duration::from_secs(1), 100, 150, window),
+        token_budget::BudgetDecision::Wait(_)
+    ));
+    assert!(matches!(
+        bucket.reserve_or_delay(now + Duration::from_secs(61), 100, 150, window),
+        token_budget::BudgetDecision::Reserved
+    ));
+}
+
+#[test]
+fn tpm_budget_reservation_charges_safety_margin_and_physical_sends() {
+    assert_eq!(token_budget::test_reservation_tokens(10_000, 1), 12_000);
+    assert_eq!(token_budget::test_reservation_tokens(10_000, 3), 36_000);
+}
+
+#[test]
 fn auto_subagent_retry_policy_fails_fast_for_fallback() {
     let regular = request_retry_policy(false);
     assert_eq!(regular.max_attempts, REQUEST_MAX_ATTEMPTS);

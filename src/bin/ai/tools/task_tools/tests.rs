@@ -560,6 +560,7 @@ fn encoded_task_goal_prefix_is_detectable_without_decoding() {
         is_model_auto_selected: false,
         auto_model_fallback: None,
         selection_explanation: "explicit agent/model override".to_string(),
+        spawn_depth: 0,
     })
     .unwrap();
 

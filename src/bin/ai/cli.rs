@@ -475,114 +475,34 @@ pub(super) fn parse_cli_args(args: impl Iterator<Item = String>) -> ParsedCli {
 /// 打印帮助信息
 pub(super) fn print_help() {
     let parser = build_cli_parser();
-    println!("AI CLI - Interactive AI Assistant");
-    println!();
-    println!("Quick Actions:");
-    println!(
-        "  --consolidate-knowledge  read all knowledge entries, analyze with LLM, clean up obsolete ones"
-    );
-    println!("  -n, --note <text>        save text as memo to knowledge base and exit");
-    println!("  -ns, --note-search       search memo category using the positional prompt");
-    println!("  -i, --interactive        keep the session open for follow-up questions");
-    println!(
-        "  -bg, --background [task]  run in background: detach from terminal, log to <sessionid>.log; without a task, prompts for multi-line input"
-    );
-    println!(
-        "  --stop <session-id>      stop a background session (reads <sessionid>.pid, sends SIGTERM)"
-    );
-    println!();
+    println!("AI CLI - Interactive AI Assistant\n");
+
+    // ── Quick Start ──────────────────────────────────────────────
+    println!("USAGE:");
+    println!("  a [OPTIONS] <prompt>          Run a one-shot prompt and exit");
+    println!("  a [OPTIONS]                   Start interactive REPL\n");
+
+    println!("QUICK START:");
+    println!("  a fix the bug in main.rs      One-shot prompt");
+    println!("  a -i \"explain this code\"      Start REPL after prompt");
+    println!("  a -bg refactor the auth       Run in background (logs to <id>.log)");
+    println!("  a --stop <session-id>         Stop a background session");
+    println!("  a -n \"TODO: remember this\"    Save a memo and exit");
+    println!("  a -ns \"meeting notes\"         Search memos with AI\n");
+
+    // ── Options ──────────────────────────────────────────────────
     parser.print_defaults();
-    println!();
-    println!("Agent (CLI):");
-    println!("  --agent <name>            start with a specific agent (alias: -a)");
-    println!("  --list-agents             list available agents and exit");
-    println!();
-    println!("Session (CLI):");
-    println!("  默认每个进程自动创建独立 session（不会和其它窗口串 history）");
-    println!("  纯交互启动 `a` 时：若只有 1 个挂起 session 则直接恢复，若有多个则可选择");
-    println!("  --resume                 显式查看/选择当前 terminal 的挂起 session");
-    println!("  --new-session, --new     强制新建 session，跳过挂起 session 自动恢复");
-    println!("  --session <id>            指定 session id");
-    println!("  --session                 不指定 id，兼容旧语义：强制自动创建新 session");
-    println!("  --clear --session <id>    清空指定 session 的 history");
-    println!();
-    println!("Interactive Commands (use in REPL mode):");
-    println!("  General:");
-    println!("    /help, /h                 show this help message");
-    println!("    /model [name]             list or switch models");
-    println!("    /model effort [<value>]   show or override reasoning effort");
-    println!("                                (minimal|low|medium|high|off|auto)");
-    println!("    /history [user|N]         show recent session messages");
-    println!("    /history user             show user inputs with u<N> markers");
-    println!(
-        "    /history last             replay the last assistant message with markdown rendering"
-    );
-    println!("    /history replay           replay the last assistant conclusion as plain text");
-    println!("    /history rewind u<N>      remove user input u<N> and everything after it");
-    println!("    /history rewind last      remove latest user input and everything after it");
-    println!("    /history rewind grep <q>  rewind the only user input matching keyword");
-    println!("    /feishu-auth              authenticate with Feishu");
-    println!("    /share [output.md]        export current session as shareable markdown");
-    println!();
-    println!("  Knowledge:");
-    println!("    /usage                   show token usage overview (all-time/7d/24h totals)");
-    println!("    /usage models [Nd]       show per-model usage sorted by calls desc");
-    println!("    /usage daily [N]         show daily token usage breakdown");
-    println!("    /usage help              show usage command help");
-    println!();
-    println!("  Persona management:");
-    println!("    /personas                 list personas");
-    println!("    /personas current         show current persona");
-    println!("    /personas create          interactively create a persona");
-    println!("    /personas use <name|id>   switch to a persona");
-    println!("    /personas delete <name|id> delete a persona");
-    println!("    /personas help            show persona command help");
-    println!();
-    println!("  Agent management:");
-    println!("    /agents                   list available agents");
-    println!("    /agents list              list available agents");
-    println!("    /agents current           show current agent");
-    println!("    /agents use <name>        switch to an agent");
-    println!("    /agents auto              restore automatic agent routing");
-    println!();
-    println!("  Skill management:");
-    println!("    /skills                   list available skills");
-    println!("    /skills <name>            select & activate a skill");
-    println!();
-    println!("  Session management:");
-    println!("    /sessions                 list all sessions");
-    println!("    /sessions list            list all sessions");
-    println!("    /sessions current         show current session info");
-    println!("    /sessions new             create and switch to new session");
-    println!("    /sessions use <id>        switch to specified session");
-    println!(
-        "    /sessions suspend         suspend current session and return to shell (or /suspend, /bg, /detach, /susp)"
-    );
-    println!("    /sessions bound           list suspended sessions bound to current terminal");
-    println!("    /sessions delete <id> [more...]     delete one or more sessions");
-    println!("    /sessions clear-bound     clear suspended sessions bound to current terminal");
-    println!("    /sessions clear-history   clear current session history (keeps session alive)");
-    println!("    /sessions clear-all       delete all sessions");
-    println!("    /sessions export <id> [output.md]       export session to Markdown");
-    println!("    /sessions export-current [output.md]    export current session to Markdown");
-    println!("    /sessions export-last [output.md]       export latest session to Markdown");
-    println!(
-        "    /sessions export-archive <id> [output.zip]       full session archive for migration"
-    );
-    println!("    /sessions export-archive-current [output.zip]    archive current session");
-    println!("    /sessions export-archive-last [output.zip]       archive latest session");
-    println!("    /sessions import <file.zip> [as=<id>]           import session from archive");
-    println!("    /sessions fork [src=<id>] [as=<id>]      copy session to a new branch");
-    println!("    /sessions branch <keep_messages> [src=<id>] [as=<id>]");
-    println!();
-    println!("  Persona quick start:");
-    println!("    1. Run `a` to enter interactive mode");
-    println!("    2. Type `/personas create`");
-    println!("    3. Fill in name/avatar, then edit the multi-line persona prompt");
-    println!();
-    println!("  Debug:");
-    println!("    /hang                    state dump (debug)");
-    println!();
+
+    // ── Session Behavior ─────────────────────────────────────────
+    println!("\nSESSION BEHAVIOR:");
+    println!("  Each process auto-creates a dedicated session (no shared history).");
+    println!("  Launching `a` interactively resumes the sole suspended session, or");
+    println!("  lets you choose when multiple are available.");
+    println!("  Use --resume / --new-session / --session to control this.\n");
+
+    // ── REPL ─────────────────────────────────────────────────────
+    println!("REPL COMMANDS:");
+    println!("  In interactive mode, type /help to see all available commands.\n");
 }
 /// 生成 shell 补全脚本并打印到 stdout。
 /// `shell` 取值 "bash" | "zsh" | "fish"，不区分大小写。

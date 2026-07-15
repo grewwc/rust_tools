@@ -23,8 +23,13 @@ client routing, transport error handling, OAuth flows, or timeout semantics.
    buffer and causing an id mismatch on the subsequent call.
 5. Request timeouts and restart logic can kill long-running flows such as OAuth
    waits; treat timeout changes as behavior changes.
-6. When MCP tool visibility is gated by progressive loading, prompt hints and
-   enablement behavior must stay consistent with real configured tool names.
+6. MCP tools are **lazy-loaded by default**: `skill_runtime::select_mcp_tools`
+   ships no MCP tool schemas in the per-turn `tools` array unless a skill/agent
+   declares an explicit `mcp_servers` whitelist (schemas are the largest, most
+   compressible slice of per-turn tokens and blow the TPM cap). The model still
+   perceives them via the hidden MCP catalog (`build_hidden_mcp_tool_catalog`)
+   and loads on demand through `enable_tools`. Prompt hints and enablement
+   behavior must stay consistent with real configured tool names.
 
 ## Related detailed guide
 

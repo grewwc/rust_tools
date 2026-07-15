@@ -279,7 +279,22 @@
   },
   {
     "key": "gpt-5.5",
-    "name": "enc:bKoW6lzg20NLjeOPR9F2cs/HMLBXLdcoxX4B",
+    "name": "enc:EzbTB6nRyICQM6RdHBEdimefLugA5d9FW8s=",
+    "endpoint": "enc:p+KSErWuX7vgotSWpnySa5SXS0VbZczgTPhl6Sv6+kkBjfSadd0RHPgQKyYTKdDQAwYfBtICkMhRHqve2bivOINp",
+    "api_key_config_key": "enc:FyzsH6+ZM0rHA5RrHRnUcoVGSJ8TnwI=",
+    "quality_tier": "flagship",
+    "adapter": "compatible",
+    "is_vl": true,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": true,
+    "default_reasoning_effort": "high",
+    "subagent_priority": 50,
+    "max_output_tokens": 128000
+  },
+  {
+    "key": "gpt-5.6-sol",
+    "name": "enc:cdQZG4zNvEb7TV9OcEyJnlEuNA==",
     "endpoint": "enc:p+KSErWuX7vgotSWpnySa5SXS0VbZczgTPhl6Sv6+kkBjfSadd0RHPgQKyYTKdDQAwYfBtICkMhRHqve2bivOINp",
     "api_key_config_key": "enc:FyzsH6+ZM0rHA5RrHRnUcoVGSJ8TnwI=",
     "quality_tier": "flagship",

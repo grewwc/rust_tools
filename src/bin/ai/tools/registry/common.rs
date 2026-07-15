@@ -393,6 +393,39 @@ pub(crate) fn get_builtin_tool_definitions() -> Vec<ToolDefinition> {
     tool_definitions_for_groups(&["builtin"])
 }
 
+/// 判断一组 group 归属是否代表「按需加载的重执行原语」：隶属 executor/openclaw
+/// 组但不属于 core 组。这类工具（进程 / IPC / 共享内存 / 环境原语）schema 体积大、
+/// 使用频率低，默认不随每轮请求常驻，改由模型经 `enable_tools` 按需启用，压缩每轮
+/// 发送的 tools schema token。core∩executor 的工具（如 apply_patch / write_file /
+/// read_file）因同属 core 仍然常驻，不受影响。
+fn groups_defer_eager_load(groups: &[&str]) -> bool {
+    let in_executor = groups.contains(&"executor") || groups.contains(&"openclaw");
+    in_executor && !groups.contains(&"core")
+}
+
+/// 某个已注册工具是否为「按需加载的重执行原语」。turn 级工具集在按 tool_groups
+/// 展开时用它剔除这些工具；显式 `tools:` 点名的工具不走这里（点名即常驻）。
+pub(crate) fn tool_defers_eager_load(name: &str) -> bool {
+    TOOL_INDEX
+        .get_ref(&name.to_string())
+        .copied()
+        .map(|spec| groups_defer_eager_load(spec.groups))
+        .unwrap_or(false)
+}
+
+/// 全部「按需加载的重执行原语」（名称 + 描述），按名称排序。用于在 system prompt
+/// 里生成「未加载但可 enable」的能力目录，保证模型对这些工具可感知、可按需启用。
+pub(crate) fn deferred_eager_load_tool_summaries() -> Vec<(String, String)> {
+    let mut tools: Box<SkipMap<String, String>> =
+        SkipMap::new(16, |a: &String, b: &String| a.cmp(b) as i32);
+    for reg in inventory::iter::<ToolRegistration> {
+        if groups_defer_eager_load(reg.spec.groups) {
+            tools.insert(reg.spec.name.to_string(), reg.spec.description.to_string());
+        }
+    }
+    tools.into_iter().collect()
+}
+
 pub(crate) fn get_tool_spec(name: &str) -> Option<&'static ToolSpec> {
     TOOL_INDEX.get_ref(&name.to_string()).copied()
 }

@@ -104,18 +104,22 @@ static DEEPSEEK_THINKING: DeepSeekThinkingDialect = DeepSeekThinkingDialect;
 static NO_THINKING: NoThinkingDialect = NoThinkingDialect;
 
 /// 端点是否为 DashScope（阿里云百炼）compatible-mode。
-/// 该端点用 `enable_thinking: bool` 控制思考。
-fn is_dashscope_endpoint(endpoint: &str) -> bool {
-    endpoint.contains("dashscope.aliyuncs.com")
-}
+/// 该端点用 `enable_thinking: bool` 控制思考。具体判定逻辑见
+/// [`super::compatible::is_dashscope_endpoint`]——复用同一实现以保持与 compatible
+/// 模块的 wire 形状判定一致（大小写 / 空白 trim）。
+use super::compatible::is_dashscope_endpoint;
 
 /// 按网关（provider + endpoint）与 model 选出思考方言，与 provider 鉴权 /
 /// 响应消费轴解耦。分派严格镜像 [`super::adapter_for`]：
 /// - OpenRouter 端点 → 不发送（与 OpenAI 一致，仅靠 reasoning_effort）
-/// - Alibaba → `enable_thinking`
-/// - Compatible → `enable_thinking`
+/// - Alibaba → `enable_thinking`（DashScope compatible-mode）
+/// - Compatible → 端点为 DashScope 时走 `enable_thinking`，其余（如内部 modelhub、
+///   其他 OpenAI 兼容网关）不发送思考字段，仅靠顶层 `reasoning_effort`
 /// - OpenAi → DashScope 端点用 `enable_thinking`，纯 OpenAI 端点不发送
 /// - OpenCode → DeepSeek 模型用 `thinking` 对象，其余不发送
+///
+/// 历史上 `Compatible` 全量走 DashScope 方言，导致挂在 compatible provider 下的
+/// 纯 OpenAI 兼容端点（如内部 modelhub）收到未知参数 `enable_thinking` 报 400。
 pub(in crate::ai) fn thinking_dialect_for(
     provider: ApiProvider,
     model: &str,
@@ -130,7 +134,13 @@ pub(in crate::ai) fn thinking_dialect_for(
     }
     match provider {
         ApiProvider::Alibaba => &ENABLE_THINKING,
-        ApiProvider::Compatible => &ENABLE_THINKING,
+        ApiProvider::Compatible => {
+            if is_dashscope_endpoint(endpoint) {
+                &ENABLE_THINKING
+            } else {
+                &NO_THINKING
+            }
+        }
         ApiProvider::OpenAi => {
             if is_dashscope_endpoint(endpoint) {
                 &ENABLE_THINKING
@@ -166,16 +176,27 @@ mod tests {
 
     #[test]
     fn enable_thinking_dialect_effort_is_noop() {
-        // GLM 等 compatible provider 走 enable_thinking 开关，降 effort 无效。
+        // DashScope compatible 端点走 enable_thinking 开关，降 effort 无效。
         assert!(!reasoning_effort_reduces_thinking_for(
             ApiProvider::Compatible,
             "glm5.2-super-relay",
-            "https://example.com/compatible-mode/v1/chat/completions",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
         ));
         assert!(!reasoning_effort_reduces_thinking_for(
             ApiProvider::Alibaba,
             "qwen-max",
             super::super::ALIBABA_DEFAULT_ENDPOINT,
+        ));
+    }
+
+    #[test]
+    fn non_dashscope_compatible_uses_openai_dialect() {
+        // 字节 modelhub / Ollama / 自部署 vLLM 等真正 OpenAI 兼容端点，
+        // 即使走 `compatible` provider，也应按 OpenAI 方言处理（reasoning_effort 生效，不发 enable_thinking）。
+        assert!(reasoning_effort_reduces_thinking_for(
+            ApiProvider::Compatible,
+            "Kimi-K2.5",
+            "https://dataagent-dev-llm.bytedance.net/api/chat/completions",
         ));
     }
 

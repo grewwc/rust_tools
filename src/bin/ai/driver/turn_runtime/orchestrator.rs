@@ -21,7 +21,8 @@ use crate::ai::{mcp::SharedMcpClient, types::App};
 
 use super::{
     MID_TURN_COMPRESS_COOLDOWN_ITERATIONS, MID_TURN_COMPRESS_DELTA_THRESHOLD,
-    MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS, MID_TURN_LLM_SUMMARY_MAX_CHARS,
+    MID_TURN_COMPRESS_SOFT_FLOOR, MID_TURN_LLM_SUMMARY_KEEP_RECENT_TURNS,
+    MID_TURN_LLM_SUMMARY_MAX_CHARS,
     finalize::finalize_turn,
     iteration::{execute_turn_iteration, refresh_skill_turn_for_iteration},
     mid_turn_compress_hard_threshold, mid_turn_compress_soft_threshold,
@@ -58,6 +59,20 @@ const TOOL_ITERATION_SOFT_LIMIT: usize = 128;
 /// 连续「流读取中断型」截断（stream_error）的重试上限。超过即放弃本 turn，
 /// 避免服务端持续断流时无限重试（尤其后台任务的 max_iterations = usize::MAX）。
 const MAX_STREAM_ERROR_RETRIES: usize = 16;
+
+/// === 长循环感知的中段压缩 ===
+/// 中段压缩的软阈值按模型 token 窗口换算（flagship 256K → ~135K 字符）。对
+/// 「历史体积中等、但工具迭代轮次很多」的长循环 turn，历史峰值可能长期低于该
+/// 阈值 → 压缩全程不触发 → 每轮把「截至当前的完整历史 + 全部 tool schema」重发
+/// 一遍，累计发送量随迭代轮次 O(n²) 膨胀，几分钟内撞破 TPM 限流（真实案例：
+/// 一个 provider 重构会话单 turn 56 轮迭代，历史峰值仅 ~120K < 135K 阈值，
+/// turn 内累计发送 ~2.8M token 撞破 380K TPM 约 7 倍）。
+///
+/// 治理：一旦单 turn 工具迭代轮次达到该阈值，即认定进入「长循环」，把中段压缩的
+/// 有效软阈值下调到 [`MID_TURN_COMPRESS_SOFT_FLOOR`]（36K），让内容级去重
+/// （byte-identical 重读折叠）与旧结果裁剪尽早介入，遏制 O(n²) 累积。短 turn
+/// （迭代轮次未达阈值）保持原窗口比例阈值，不影响正常单轮大任务的探索空间。
+const LONG_LOOP_COMPRESS_ITERATION_THRESHOLD: usize = 12;
 
 /// === Progress Budget（意图感知的进展预算）===
 /// 这是叠加在 exact / coarse 循环检测之上的第三层，用于治理「参数每轮都变、
@@ -622,7 +637,7 @@ fn inject_task_anchor_note(
 请优先保持目标连续性：\n- 先总结目前已确认事实\n- 明确下一步唯一动作\n- 若信息不足，说明阻塞点并停止重复工具调用"
     );
     messages.push(Message {
-        role: "system".to_string(),
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note),
         tool_calls: None,
         tool_call_id: None,
@@ -711,6 +726,22 @@ impl TurnSupervisor {
         total_chars > soft_threshold
             && cooldown_passed
             && (self.last_compress_after_chars == 0 || delta_significant)
+    }
+
+    /// 本轮实际生效的中段压缩软阈值。
+    ///
+    /// 长循环（工具迭代轮次 >= [`LONG_LOOP_COMPRESS_ITERATION_THRESHOLD`]）时把
+    /// 阈值下调到 [`MID_TURN_COMPRESS_SOFT_FLOOR`]，让内容级去重与旧结果裁剪尽早
+    /// 介入，遏制 O(n²) 累积重发；短 turn 保持按窗口换算的基准阈值，不影响正常
+    /// 单轮大任务。门控与实际 [`mid_turn_compress`](crate::ai::history::mid_turn_compress)
+    /// 调用必须共用本方法返回值——后者内部有 `before <= soft_threshold` 的 no-op
+    /// 早退，若两处阈值不一致会「门开了却压不动」。
+    fn effective_mid_turn_soft_threshold(&self, base_soft: usize) -> usize {
+        if self.iteration >= LONG_LOOP_COMPRESS_ITERATION_THRESHOLD {
+            base_soft.min(MID_TURN_COMPRESS_SOFT_FLOOR)
+        } else {
+            base_soft
+        }
     }
 
     fn mark_compress(&mut self, after_chars: usize) {
@@ -947,7 +978,7 @@ fn inject_loop_breaker_note(messages: &mut Vec<crate::ai::history::Message>) {
         请立刻：(a) 停止该工具调用 (b) 总结已收集到的信息并直接回答用户 \
         (c) 如果信息确实不足，向用户说明卡住的原因。";
     messages.push(Message {
-        role: "system".to_string(),
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
         tool_calls: None,
         tool_call_id: None,
@@ -962,7 +993,7 @@ fn inject_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
         从现在起进入无工具收口模式：不要再发起任何工具调用；\n\
         请基于已有信息给出阶段总结与当前结论；若任务仍未完成，明确说明缺口、剩余工作与建议的下一步。";
     messages.push(Message {
-        role: "system".to_string(),
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
         tool_calls: None,
         tool_call_id: None,
@@ -981,7 +1012,7 @@ fn inject_coarse_loop_note(messages: &mut Vec<crate::ai::history::Message>) {
         否则请优先：(a) 一次读取更大的行范围（提高 read_file 的 limit）或用检索工具一次定位；\n\
         (b) 复用已读到的内容，不要重复读同一文件同一段；(c) 若信息已足够，就直接作答。";
     messages.push(Message {
-        role: "system".to_string(),
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
         tool_calls: None,
         tool_call_id: None,
@@ -998,7 +1029,7 @@ fn inject_coarse_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Mess
         从现在起进入无工具收口模式：不要再发起任何工具调用；\n\
         请基于已有信息给出阶段总结与当前结论；若任务仍未完成，明确说明当前缺口、剩余工作与建议的下一步。";
     messages.push(Message {
-        role: "system".to_string(),
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
         tool_calls: None,
         tool_call_id: None,
@@ -1019,7 +1050,7 @@ fn inject_low_progress_soft_note(messages: &mut Vec<crate::ai::history::Message>
         (b) 若确需继续探索，请显式写下你正在权衡的 A/B 候选分支及当前倾向——这不是惩罚，\n\
         而是帮你把『无意识的打转』变成『有方向的探索』。";
     messages.push(Message {
-        role: "system".to_string(),
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
         tool_calls: None,
         tool_call_id: None,
@@ -1040,7 +1071,7 @@ fn inject_progress_ledger_note(messages: &mut Vec<crate::ai::history::Message>) 
         4) 基于所选分支的下一步唯一动作\n\
         写完后，直接执行该动作；不要再做与该动作无关的探索性读取/检索。";
     messages.push(Message {
-        role: "system".to_string(),
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
         tool_calls: None,
         tool_call_id: None,
@@ -1057,7 +1088,7 @@ fn inject_low_progress_hard_stop_note(messages: &mut Vec<crate::ai::history::Mes
         请基于已收集到的信息给出阶段结论：已确认了什么、还差什么、\n\
         以及若要完成任务建议的下一步（若是变更类任务，直接说明应改哪些文件、怎么改）。";
     messages.push(Message {
-        role: "system".to_string(),
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
         tool_calls: None,
         tool_call_id: None,
@@ -1079,7 +1110,7 @@ fn inject_iteration_soft_limit_note(
         (d) 若已经足够回答，就直接给出结论。"
     );
     messages.push(Message {
-        role: "system".to_string(),
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note),
         tool_calls: None,
         tool_call_id: None,
@@ -1100,7 +1131,7 @@ fn inject_iteration_limit_reflect_note(
         缺什么资料、建议下一步怎么做——不要再发起任何工具调用。"
     );
     messages.push(Message {
-        role: "system".to_string(),
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note),
         tool_calls: None,
         tool_call_id: None,
@@ -1287,6 +1318,35 @@ mod tests {
             s.last_compress_after_chars + MID_TURN_COMPRESS_DELTA_THRESHOLD,
             SOFT,
         ));
+    }
+
+    /// 长循环感知：短 turn 保持基准软阈值不变；一旦迭代轮次达阈值，有效软阈值
+    /// 被下调到 SOFT_FLOOR，让内容级去重尽早介入，遏制 O(n²) 累积重发。
+    /// 这是 aefa66f2 那类「历史中等(~120K) + 56 轮迭代」撞 TPM 的直接修复：
+    /// 基准阈值 135K 永不触发，下调到 36K 后长循环中段即开始压缩。
+    #[test]
+    fn long_loop_lowers_effective_mid_turn_soft_threshold() {
+        const FLOOR: usize = super::super::MID_TURN_COMPRESS_SOFT_FLOOR;
+        // flagship 大窗口模型的基准软阈值远高于 FLOOR（模拟 135K）。
+        let base = 135_000usize;
+        assert!(base > FLOOR, "precondition: base threshold above floor");
+
+        let mut s = TurnSupervisor::default();
+
+        // 短 turn（未达长循环阈值）：有效阈值 == 基准，不误伤正常单轮大任务。
+        s.iteration = LONG_LOOP_COMPRESS_ITERATION_THRESHOLD - 1;
+        assert_eq!(s.effective_mid_turn_soft_threshold(base), base);
+        // 此时 ~120K 历史（< 135K 基准）不触发压缩——正是旧行为的空窗。
+        assert!(!s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base)));
+
+        // 长循环（达阈值）：有效阈值降到 FLOOR，同样 ~120K 历史立即触发压缩。
+        s.iteration = LONG_LOOP_COMPRESS_ITERATION_THRESHOLD;
+        assert_eq!(s.effective_mid_turn_soft_threshold(base), FLOOR);
+        assert!(s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base)));
+
+        // 若基准本就低于 FLOOR（history_max_chars 很小的场景），min() 保证不抬高阈值。
+        let tiny_base = FLOOR / 2;
+        assert_eq!(s.effective_mid_turn_soft_threshold(tiny_base), tiny_base);
     }
 
     #[test]
@@ -2118,7 +2178,11 @@ async fn run_turn_body(
         // 阈值按 history_max_chars 动态计算（floor 兜底），避免用户调整
         // history_max_chars 后 mid-turn 阈值依旧死锁在 36K/80K。
         let history_max_chars = app.config.history_max_chars;
-        let mid_turn_soft = mid_turn_compress_soft_threshold(&next_model, history_max_chars);
+        let mid_turn_soft_base = mid_turn_compress_soft_threshold(&next_model, history_max_chars);
+        // 长循环时把软阈值下调到 SOFT_FLOOR，遏制 O(n²) 累积重发（详见
+        // [`LONG_LOOP_COMPRESS_ITERATION_THRESHOLD`]）。门控与下面的实际
+        // mid_turn_compress 调用共用同一 `mid_turn_soft`，避免「门开了却 no-op」。
+        let mid_turn_soft = supervisor.effective_mid_turn_soft_threshold(mid_turn_soft_base);
         let mid_turn_hard = mid_turn_compress_hard_threshold(&next_model, history_max_chars);
         let total_chars = crate::ai::history::messages_total_chars_pub(&messages);
         if supervisor.should_try_mid_turn_compress(total_chars, mid_turn_soft) {

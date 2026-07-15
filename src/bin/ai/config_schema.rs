@@ -167,6 +167,11 @@ impl AiConfig {
     /// When false, disable recording LLM token usage to the SQLite stats
     /// table. Default true.
     pub const TOKEN_USAGE_ENABLE: &str = "ai.token_usage.enable";
+    /// Preflight request prompt-token-per-minute budget. Before each physical
+    /// LLM HTTP send, the request layer estimates prompt+tool-schema tokens and
+    /// waits when the last 60s would exceed this limit. Default 380000; set 0
+    /// to disable.
+    pub const REQUEST_TPM_LIMIT: &str = "ai.request.tpm_limit";
     /// SQLite database path for token usage stats. Defaults to
     /// `~/.config/rust_tools/token_usage.db`.
     pub const TOKEN_USAGE_DB: &str = "ai.token_usage.db";

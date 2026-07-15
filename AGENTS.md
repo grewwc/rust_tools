@@ -2,28 +2,19 @@
 
 ## Scope
 
-This root file is the repository-wide overview for the `rust_tools` workspace.
-Keep it short. Do not put long subsystem playbooks here.
-
-Detailed subsystem guidance is layered:
-
-- root `AGENTS.md`: repo-wide overview and invariants only
-- scoped `AGENTS.md` files under important subdirectories: short local rules
-- `docs/agent-guides/*.md`: long-form references that should be loaded on demand
-
-Only `AGENTS.md` / `Agent.md` / `CLAUDE.md` case variants are auto-discovered as
-project instruction docs. Files under `docs/agent-guides/` are **not**
-auto-injected into every prompt.
+Root-level overview and repo-wide invariants only. Subsystem details belong in
+scoped `AGENTS.md` files (under important subdirectories) or
+`docs/agent-guides/*.md` (long-form, loaded on demand). Only `AGENTS.md` /
+`Agent.md` / `CLAUDE.md` are auto-discovered; `docs/agent-guides/` are **not**.
 
 ## Overview
 
-This Rust workspace provides a utility library plus several CLI binaries. The
-primary product is `a`, an LLM-based AI agent runtime (AIOS) with built-in
-process scheduling, agent/skill routing, a tool registry, and MCP integration.
+Rust 2024 workspace: utility library + CLI binaries. Primary product is `a`,
+an LLM-based AI agent runtime (AIOS) with process scheduling, agent/skill
+routing, tool registry, and MCP integration.
 
-- **Edition**: Rust 2024
 - **Workspace members**: root crate, `crates/rust_tools_macros`, `crates/aios_kernel`
-- **Platform**: macOS-first (`objc2` deps); core library remains cross-platform
+- **Platform**: macOS-first (`objc2` deps); core library cross-platform
 
 ## Top-Level Layout
 
@@ -42,53 +33,32 @@ docs/agent-guides/          # long-form on-demand subsystem docs
 ## Build / Test
 
 ```bash
-make all
-make install
-cargo build --release --bin a
-cargo check --bin a
-cargo test --lib --bin a
-cargo test --bin a test_name
+cargo check --bin a          # fast type-check
+cargo test --lib --bin a     # run lib + a's tests
+cargo test --bin a test_name # run one test
 ```
 
-**Only verify what you changed.** Run focused checks for the touched module first; broaden only when the change crosses shared behavior.
-**Never run full-workspace tests (e.g. `cargo test` without `--bin`/`--lib`/`-p`) or full-workspace builds (e.g. `cargo build --release` without `--bin`) just to verify a partial change.** Running `cargo build --release` without `--bin` force-rebuilds every binary in the workspace, wasting time; running `cargo test --workspace` or bare `cargo test` runs all tests including unrelated ones. Use `--bin`, `--lib`, `-p`, or a specific test name to scope the command.
+**Only verify what you changed.** Always scope with `--bin`, `--lib`, `-p`, or a
+specific test name. Never bare `cargo test` / `cargo build --release`.
 
 ## Global Engineering Rules
 
-1. Use `pub(super)` / `pub(crate)` to enforce module boundaries.
-2. Keep comments consistent with the surrounding Chinese comment style.
-3. Prefer `rustc-hash` FxHashMap/FxHashSet via existing re-exports.
-4. Add AI config keys only in `src/bin/ai/config_schema.rs`; never scatter raw keys.
-5. For AI tools, keep schema/registration in `src/bin/ai/tools/registry/` and logic in `src/bin/ai/tools/service/`.
-6. Prefer reuse over reinvention; avoid unrelated refactors and formatting churn.
-7. Keep tests close to the changed module where practical; serial tests should use `test_support::ENV_LOCK`.
-8. Prefer data-driven or registration-based extensibility over hardcoded
-   `if`/`else` chains keyed on names. When behavior varies per entity (tool,
-   agent, skill), declare it as config on that entity (e.g. an `inventory`
-   submission) and query it through a single lookup — the caller stays
-   generic. This keeps additions to a single point instead of sprinkling
-   branches across call sites. When introducing such config, preserve
-   backward compatibility: prefer an additive, optional registration over
-   modifying a shared struct that has many existing initializers.
-9. Do not modify code unrelated to the current task; avoid opportunistic
-   refactors or "improvements" to unrelated code. If truly necessary,
-   explain first and get confirmation.
-10. After changing code, always check whether the nearest scoped `AGENTS.md`
-    (and this root file, if repo-wide layout/invariants changed) needs a
-    matching update. This is a mandatory final step of every task, not an
-    optional afterthought. If a change touches module layout, build/test
-    commands, invariants, subsystem rules, or on-demand guide references,
-    update the corresponding `AGENTS.md` in the same task — do not defer it.
-11. Instruction docs are living documents, not append-only logs. When updating
-    any `AGENTS.md`, actively review and **delete or revise** content that has
-    become stale, superseded, or redundant — do not merely add new text on top.
-    Outdated rules that contradict current behavior are worse than missing rules:
-    they mislead and dilute the signal. If a rule no longer applies, remove it;
-    if it partially applies, rewrite it. Keep every file lean.
-
-12. When verifying a change, scope the command to the affected package or binary.
-    **Never run full-workspace tests or builds just to check a partial change.**
-    Use `--bin <name>`, `--lib`, `-p <package>`, or a specific test name — never bare `cargo test` / `cargo build --release`.
+1. **Module boundaries**: use `pub(super)` / `pub(crate)`.
+2. **Chinese comments** to match surrounding style.
+3. **Collections**: prefer `rustc-hash` FxHashMap/FxHashSet via existing re-exports.
+4. **Config keys**: add only in `src/bin/ai/config_schema.rs`.
+5. **AI tools**: schema/registration in `tools/registry/`, logic in `tools/service/`.
+6. **Focused changes**: do not modify unrelated code. Avoid opportunistic refactors
+   or formatting churn — if truly necessary, explain first and get confirmation.
+7. **Tests**: keep close to the changed module; serial tests use `test_support::ENV_LOCK`.
+8. **Extensibility**: prefer data-driven/registration-based design over hardcoded
+   `if`/`else` chains. Additive, optional registration over modifying shared structs.
+9. **AGENTS.md maintenance**: after every code change, check whether the nearest
+   scoped `AGENTS.md` (or this root file for repo-wide invariants) needs updating.
+   **Delete or revise** stale content — do not merely append. Outdated rules that
+   contradict current behavior are worse than missing rules.
+10. **Git safety**: never `git stash` / `git stash drop` someone else's uncommitted
+    changes. Use a temporary branch, worktree, or stash only your own (and pop back).
 
 ## High-Value Pitfalls
 
@@ -97,51 +67,4 @@ cargo test --bin a test_name
 3. `runtime_ctx::effective_cwd()` is the working-directory authority for tools and sub-agents.
 4. `objc2*` dependencies are macOS-only.
 
-> Subsystem-specific pitfalls (MCP stdio, temp-dir lifecycle, etc.) live in
-> their scoped `AGENTS.md` — check the nearest one.
-
-## Instruction Layering
-
-When work moves into a scoped subsystem, the closer `AGENTS.md` should carry the
-local rules and point to long-form references only when needed.
-
-Current scoped entry points:
-
-- `src/bin/ai/AGENTS.md`
-- `src/bin/ai/driver/AGENTS.md`
-- `src/bin/ai/tools/AGENTS.md`
-- `src/bin/ai/mcp/AGENTS.md`
-- `src/bin/ai/provider/AGENTS.md`
-- `src/bin/ai/knowledge/AGENTS.md`
-
-Detailed references live under:
-
-- `docs/agent-guides/ai-driver.md`
-- `docs/agent-guides/ai-tools.md`
-- `docs/agent-guides/ai-mcp.md`
-- `docs/agent-guides/ai-provider.md`
-
-## Maintaining Instruction Docs
-
-This section is a **mandatory checklist**, not background reading. Run through
-it at the end of every code-changing task, after verification passes and before
-reporting completion.
-
-**Step 1 — Identify what changed.** For each file you touched, note whether the
-change affects any of: module layout, build/test commands, invariants,
-subsystem rules, or on-demand guide references. If none apply, stop here.
-
-**Step 2 — Update the nearest scoped `AGENTS.md`.** Add or revise the local
-rule that now describes the changed behavior. **Remove or rewrite rules that no
-longer match current behavior** — do not leave stale text. Keep it short; move long
-explanations to `docs/agent-guides/*.md` and reference them from the scoped
-file.
-
-**Step 3 — Sync this root file if needed.** If the change touches repo-wide
-layout, build/test commands, or invariants (rules in this file), update this
-file too.
-
-**Step 4 — Sync tests.** If the change alters documented behavior, update the
-corresponding tests so docs and tests stay consistent with the implementation.
-
-> Principle: root instructions should stay concise, scoped instructions should stay local, and long references should be loaded only when the task actually needs them.
+> Subsystem-specific pitfalls live in their scoped `AGENTS.md`.

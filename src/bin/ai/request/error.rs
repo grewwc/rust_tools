@@ -79,6 +79,10 @@ pub(crate) const REQUEST_MAX_ATTEMPTS: usize = 12;
 pub(crate) const REQUEST_MAX_ATTEMPTS_429: usize = 32; // 429 错误重试 32 次
 pub(crate) const REQUEST_RETRY_BASE_MS: u64 = 500;
 pub(crate) const REQUEST_RETRY_MAX_MS: u64 = 16000;
+/// 429（配额超限）退避起始值。所有 key 均返回 429 时，首次等待 4 秒再重试，
+/// 而非走通用退避的 0.5s——配额限流通常需要等待服务端窗口刷新，起步太短只会白白
+/// 消耗请求次数。
+pub(crate) const REQUEST_RETRY_429_BASE_MS: u64 = 4_000;
 /// 429（配额超限）单次退避等待上限。服务端可能在 `Retry-After` 里返回极大的值
 /// （到下个配额窗口的秒数，可达数万秒），若原样 sleep 会让进程长时间“卡死”。
 /// 统一钳制到该上限，配合 key 轮换快速让位。
@@ -201,6 +205,14 @@ pub(crate) fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
 pub(crate) fn retry_delay(attempt: usize) -> Duration {
     let shift = attempt.saturating_sub(1).min(4) as u32;
     let backoff = REQUEST_RETRY_BASE_MS.saturating_mul(1u64 << shift);
+    Duration::from_millis(backoff.min(REQUEST_RETRY_MAX_MS))
+}
+
+/// 429 专用退避：base 4s，指数递增到 `REQUEST_RETRY_MAX_MS`（16s）。
+/// 与通用 `retry_delay` 共享上界，但起始值更高，适配配额窗口刷新场景。
+pub(crate) fn retry_delay_429(attempt: usize) -> Duration {
+    let shift = attempt.saturating_sub(1).min(4) as u32;
+    let backoff = REQUEST_RETRY_429_BASE_MS.saturating_mul(1u64 << shift);
     Duration::from_millis(backoff.min(REQUEST_RETRY_MAX_MS))
 }
 
