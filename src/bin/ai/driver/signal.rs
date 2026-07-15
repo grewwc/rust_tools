@@ -417,7 +417,9 @@ mod tests {
 
     #[test]
     fn foreground_turn_guard_toggles_active_flag() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         assert!(!foreground_turn_active());
         {
             let _turn = ForegroundTurnGuard::enter();
@@ -428,7 +430,9 @@ mod tests {
 
     #[test]
     fn first_sigint_cancels_foreground_subagent_without_shutdown() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         super::clear_request_interrupt();
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -446,14 +450,18 @@ mod tests {
 
     #[test]
     fn sigint_with_no_foreground_subagent_falls_through() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         // 栈空时不应消费这次中断，调用方据此走正常 shutdown/exit。
         assert!(!try_cancel_foreground_subagent());
     }
 
     #[test]
     fn foreground_guard_unregisters_on_drop() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         super::clear_request_interrupt();
 
         let cancel = Arc::new(AtomicBool::new(false));

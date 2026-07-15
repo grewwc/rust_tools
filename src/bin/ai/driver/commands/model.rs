@@ -322,6 +322,7 @@ mod tests {
                 crate::ai::driver::thinking::ThinkingOrchestrator::new(),
             )],
             last_known_prompt_tokens: None,
+            last_known_cached_prompt_tokens: None,
             goal_mode: None,
             last_turn_had_tool_calls: false,
             last_turn_interrupted: false,

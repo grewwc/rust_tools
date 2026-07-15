@@ -352,8 +352,7 @@ pub(super) fn parse_bare_xml_open_tag(tag: &str) -> Option<String> {
     if inner.contains(char::is_whitespace) {
         return None;
     }
-    crate::ai::tools::registry::common::is_registered_tool_name(inner)
-        .then(|| inner.to_string())
+    crate::ai::tools::registry::common::is_registered_tool_name(inner).then(|| inner.to_string())
 }
 
 /// 解析裸 XML 工具体。优先接受 JSON object / Hermes parameter 标签；

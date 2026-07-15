@@ -7,13 +7,13 @@
 //! - prompt cache 断点注入（cache_control）
 //! - reasoning_effort 档位解析
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::super::{
-    history::{is_system_like_role, Message},
+    history::{Message, is_system_like_role},
     models,
     provider::{
-        adapter_for, compatible_wire_shapes, thinking_dialect_for, ApiProvider, ReasoningEffort,
+        ApiProvider, ReasoningEffort, adapter_for, compatible_wire_shapes, thinking_dialect_for,
     },
     types::App,
 };
@@ -34,24 +34,22 @@ pub(super) fn resolve_reasoning_wire_controls<'a>(
     let adapter_kind = models::model_adapter(model);
     let adapter = adapter_for(adapter_kind, &endpoint);
     let request_model = models::request_model_name(model);
-    let thinking_dialect =
-        thinking_dialect_for(adapter_kind, &request_model, &endpoint);
+    let thinking_dialect = thinking_dialect_for(adapter_kind, &request_model, &endpoint);
     // `enable_search` 的用户请求在 builder 里传入；此处仅关心 reasoning/thinking 三元组，
     // 所以传入 `None` 占位——我们并不依赖这里返回的 enable_search。
-    let (_, top_level_reasoning_effort, nested_reasoning) = if adapter_kind
-        == ApiProvider::Compatible
-    {
-        // compatible provider 按 endpoint 分流：DashScope 走 DashScope 形状，
-        // 其他纯 OpenAI 兼容端点（如内部 modelhub）走 OpenAI 形状。
-        // 不能直接用 adapter.reasoning_*() 默认值，因为 trait 单例看不到 endpoint。
-        compatible_wire_shapes(endpoint, None, reasoning_effort)
-    } else {
-        (
-            None,
-            adapter.reasoning_top_level(reasoning_effort),
-            adapter.reasoning_nested(reasoning_effort),
-        )
-    };
+    let (_, top_level_reasoning_effort, nested_reasoning) =
+        if adapter_kind == ApiProvider::Compatible {
+            // compatible provider 按 endpoint 分流：DashScope 走 DashScope 形状，
+            // 其他纯 OpenAI 兼容端点（如内部 modelhub）走 OpenAI 形状。
+            // 不能直接用 adapter.reasoning_*() 默认值，因为 trait 单例看不到 endpoint。
+            compatible_wire_shapes(endpoint, None, reasoning_effort)
+        } else {
+            (
+                None,
+                adapter.reasoning_top_level(reasoning_effort),
+                adapter.reasoning_nested(reasoning_effort),
+            )
+        };
     let thinking = thinking_dialect.fields(enable_thinking, top_level_reasoning_effort);
     (thinking, top_level_reasoning_effort, nested_reasoning)
 }

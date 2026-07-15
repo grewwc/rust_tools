@@ -20,12 +20,12 @@ use crate::ai::theme::{ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_SUCCESS, ACCENT_WARN
 use super::aux::charge_llm_usage_to_kernel;
 use super::builder::{build_request_body, estimate_request_prompt_tokens};
 use super::error::{
-    REQUEST_MAX_ATTEMPTS, STREAM_RESPONSE_HEADER_TIMEOUT_SECS, RequestError, RequestErrorKind,
-    RequestRetryPolicy, api_key_for_request_model, apply_request_auth,
+    REQUEST_MAX_ATTEMPTS, RequestError, RequestErrorKind, RequestRetryPolicy,
+    STREAM_RESPONSE_HEADER_TIMEOUT_SECS, api_key_for_request_model, apply_request_auth,
     clear_stale_request_interrupt_before_request, config_forces_thinking,
     endpoint_for_request_model, is_retryable_reqwest_error, is_retryable_status_with_body,
-    parse_retry_after, request_retry_policy_for_current_context, retry_delay,
-    retry_delay_429, should_retry_status, should_rotate_key, sleep_with_cancel,
+    parse_retry_after, request_retry_policy_for_current_context, retry_delay, retry_delay_429,
+    should_retry_status, should_rotate_key, sleep_with_cancel,
 };
 use super::normalize::{
     agent_tools_for_request, normalize_messages_for_model, request_tool_names_for_model,
@@ -57,8 +57,10 @@ fn retry_scope_tag() -> String {
 /// 这样既避免 429，又不会因为按 `hedged_max_sends` 一次性预占而把正常吞吐压低 3 倍。
 async fn send_with_budgeted_hedged_backup(
     app: &App,
+    model: &str,
     endpoint: &str,
-    request_model: &str,
+    request_model_label: &str,
+    api_key: &str,
     estimated_prompt_tokens: usize,
     build_request: impl Fn() -> reqwest::RequestBuilder,
     backup_after_secs: u64,
@@ -71,8 +73,16 @@ async fn send_with_budgeted_hedged_backup(
     let mut in_flight = FuturesUnordered::new();
 
     for round in 1..=max_sends {
-        token_budget::wait_for_request_budget(app, endpoint, request_model, estimated_prompt_tokens, 1)
-            .await?;
+        token_budget::wait_for_request_budget(
+            app,
+            model,
+            endpoint,
+            request_model_label,
+            api_key,
+            estimated_prompt_tokens,
+            1,
+        )
+        .await?;
         in_flight.push(build_request().send());
         tokio::select! {
             result = in_flight.next() => {
@@ -109,26 +119,40 @@ async fn send_with_budgeted_hedged_backup(
 /// Returns `Ok` on success or `Err` after exhausting per-key retries.
 async fn request_messages_with_key(
     app: &mut App,
+    model: &str,
     api_key: &str,
     request_body: &RequestBody<'_>,
     retry_policy: &RequestRetryPolicy,
     endpoint: &str,
 ) -> Result<Response, RequestError> {
-    let estimated_prompt_tokens =
-        estimate_request_prompt_tokens(request_body.messages, request_body.tools.as_ref());
+    let responses_body = endpoint
+        .trim_end_matches('/')
+        .ends_with("/v1/responses")
+        .then(|| super::builder::build_responses_request_body(request_body));
+    let estimated_prompt_tokens = token_budget::calibrate_prompt_tokens_for_budget(
+        estimate_request_prompt_tokens(request_body.messages, request_body.tools.as_ref()),
+        app.last_known_prompt_tokens,
+        app.last_known_cached_prompt_tokens,
+    );
     for attempt in 1..=retry_policy.max_attempts {
         let client = app.client.clone();
         let build_request = || {
-            apply_request_auth(client.post(endpoint), endpoint, api_key)
-                .header("Content-Type", "application/json")
-                .json(request_body)
+            let request = apply_request_auth(client.post(endpoint), endpoint, api_key)
+                .header("Content-Type", "application/json");
+            if let Some(body) = &responses_body {
+                request.json(body)
+            } else {
+                request.json(request_body)
+            }
         };
         let response = match tokio::time::timeout(
             Duration::from_secs(retry_policy.header_timeout_secs),
             send_with_budgeted_hedged_backup(
                 app,
+                model,
                 endpoint,
                 &request_body.model,
+                api_key,
                 estimated_prompt_tokens,
                 build_request,
                 retry_policy.hedged_backup_after_secs(),
@@ -280,6 +304,18 @@ pub(crate) async fn do_request_messages(
     // 也可能仍因默认 `reasoning_effort` / 历史续写约束要求回传空字符串占位。
     ensure_reasoning_content_echo_for_thinking_model(model, &mut normalized_messages);
     let reasoning_effort = resolve_reasoning_effort(app, model).map(|e| e.as_str());
+    // 部分网关（如 bytedance modelhub）在 /v1/chat/completions 上拒绝
+    // `tools` + `reasoning_effort` 同时出现（返回 400）。当模型声明了
+    // `reasoning_effort_conflicts_with_tools` 且本轮请求携带 tools 时，
+    // 自动省略 reasoning_effort 以避免 400；无 tools 时保留以维持 thinking。
+    let reasoning_effort = if reasoning_effort.is_some()
+        && tools_value.is_some()
+        && models::reasoning_effort_conflicts_with_tools(model)
+    {
+        None
+    } else {
+        reasoning_effort
+    };
     let request_body = build_request_body(
         model,
         &normalized_messages,
@@ -318,8 +354,15 @@ pub(crate) async fn do_request_messages(
                     total_keys - key_idx
                 );
             }
-            match request_messages_with_key(app, api_key, &request_body, &retry_policy, &endpoint)
-                .await
+            match request_messages_with_key(
+                app,
+                model,
+                api_key,
+                &request_body,
+                &retry_policy,
+                &endpoint,
+            )
+            .await
             {
                 Ok(response) => return Ok(response),
                 Err(err) if should_rotate_key(&err) => {
@@ -359,7 +402,6 @@ pub(crate) async fn do_request_messages(
         retry_after: None,
     }))
 }
-
 
 pub(crate) fn print_info(app: &App, model: &str) {
     let search = if models::search_enabled(model) {
@@ -402,7 +444,6 @@ pub(crate) fn print_info(app: &App, model: &str) {
         models::model_display_label(model),
     );
 }
-
 
 /// 使用 LLM 进行 JSON 格式的请求（用于意图识别、知识库问答等场景）。
 ///
@@ -453,9 +494,15 @@ pub async fn do_request_json(
         let t0 = Instant::now();
         token_budget::wait_for_request_budget(
             app,
+            model,
             &endpoint,
             &request_model,
-            token_budget::estimate_json_request_tokens(&request_body),
+            &api_key,
+            token_budget::calibrate_prompt_tokens_for_budget(
+                token_budget::estimate_json_request_tokens(&request_body),
+                app.last_known_prompt_tokens,
+                app.last_known_cached_prompt_tokens,
+            ),
             1,
         )
         .await
@@ -610,8 +657,10 @@ pub async fn do_request_text_streaming(
             Duration::from_secs(retry_policy.header_timeout_secs),
             send_with_budgeted_hedged_backup(
                 app,
+                model,
                 &endpoint,
                 &request_model,
+                &api_key,
                 estimated_prompt_tokens,
                 build_request,
                 retry_policy.hedged_backup_after_secs(),

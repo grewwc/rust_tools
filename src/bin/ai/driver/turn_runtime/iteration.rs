@@ -692,6 +692,7 @@ pub(super) async fn execute_turn_iteration(
                     stream_error: false,
                     finish_reason_value: None,
                     usage_prompt_tokens: 0,
+                    usage_cached_prompt_tokens: 0,
                     usage_completion_tokens: 0,
                     usage_reasoning_tokens: 0,
                 };

@@ -62,7 +62,8 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
             "Subagent nesting depth {} exceeds maximum {}. \
              The current agent is already a nested subagent; further delegation \
              would risk unbounded recursion. Execute the work directly instead.",
-            child_depth, task_tools::MAX_SUBAGENT_SPAWN_DEPTH,
+            child_depth,
+            task_tools::MAX_SUBAGENT_SPAWN_DEPTH,
         ));
     }
     let prepared = task_tools::prepare_subagent_task(args)?;
@@ -200,7 +201,7 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
         Box::pin(runtime_ctx::PERSONA_MEMORY_PATH.scope(persona_memory_path.clone(), wrapped));
     wrapped = Box::pin(runtime_ctx::SUBAGENT_PHASE.scope(phase_slot_for_scope, wrapped));
     wrapped = Box::pin(runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped));
-   wrapped = Box::pin(runtime_ctx::SUBAGENT_DEPTH.scope(child_depth, wrapped));
+    wrapped = Box::pin(runtime_ctx::SUBAGENT_DEPTH.scope(child_depth, wrapped));
 
     if !inherit.memory {
         let mem_path = runtime_ctx::make_subagent_memory_path(&parent_history_path, &task_id);
@@ -488,7 +489,9 @@ mod tests {
 
     #[tokio::test]
     async fn sync_task_wait_wakes_on_cancel_notify() {
-        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _signal_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         crate::ai::driver::signal::clear_request_interrupt();
         let (shutdown, cancel) = flags();
         let streaming = Arc::new(AtomicBool::new(false));

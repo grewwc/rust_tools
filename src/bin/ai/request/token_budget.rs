@@ -5,23 +5,18 @@
 //! 超预算就可取消等待，预算释放后再发送。这样不裁剪工具、不硬砍迭代，只控制发送速率。
 
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 use serde_json::Value;
 
-use crate::ai::{config_schema::AiConfig, types::App};
-use rust_tools::commonw::configw;
+use crate::ai::{models, types::App};
 
 use super::error::{RequestError, sleep_with_cancel};
 
-const DEFAULT_REQUEST_TPM_LIMIT: u64 = 380_000;
 const TPM_WINDOW: Duration = Duration::from_secs(60);
-/// 预占时给字符估算留 20% 安全余量，覆盖中英文比例、wire 模板、hedged backup 等
-/// 估算误差。宁可稍微多等，也不要把请求打到 429 后再重试。
-const ESTIMATE_SAFETY_NUMERATOR: u64 = 6;
-const ESTIMATE_SAFETY_DENOMINATOR: u64 = 5;
 
 #[derive(Clone, Copy)]
 struct TokenReservation {
@@ -47,34 +42,63 @@ pub(super) enum BudgetDecision {
 static STATE: LazyLock<Mutex<TokenBudgetState>> =
     LazyLock::new(|| Mutex::new(TokenBudgetState::default()));
 
-fn configured_tpm_limit() -> Option<u64> {
-    let raw = configw::get_all_config().get_opt(AiConfig::REQUEST_TPM_LIMIT);
-    let Some(raw) = raw else {
-        return Some(DEFAULT_REQUEST_TPM_LIMIT);
-    };
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Some(DEFAULT_REQUEST_TPM_LIMIT);
-    }
-    match trimmed.parse::<u64>() {
-        Ok(0) => None,
-        Ok(limit) => Some(limit),
-        Err(_) => Some(DEFAULT_REQUEST_TPM_LIMIT),
-    }
+fn configured_tpm_limit(model: &str) -> Option<u64> {
+    models::request_tpm_limit(model)
 }
 
 fn reservation_tokens(estimated_prompt_tokens: usize, physical_sends: usize) -> u64 {
     let estimate = u64::try_from(estimated_prompt_tokens).unwrap_or(u64::MAX / 2);
     let sends = u64::try_from(physical_sends.max(1)).unwrap_or(u64::MAX / 2);
-    estimate
-        .saturating_mul(ESTIMATE_SAFETY_NUMERATOR)
-        .div_ceil(ESTIMATE_SAFETY_DENOMINATOR)
-        .saturating_mul(sends)
-        .max(1)
+    estimate.saturating_mul(sends).max(1)
 }
 
-fn budget_key(endpoint: &str, request_model: &str) -> String {
-    format!("{}|{}", endpoint.trim(), request_model.trim())
+/// 用服务端上一轮返回的真实 prompt_tokens 校准字符估算。
+///
+/// 字符估算按 2 chars/token 折算，对英文代码和 JSON schema 会显著高估；截图里的
+/// 真实案例是服务端报告 25,875 prompt tokens，而字符估算路径预占 55,610。
+/// 这种高估会让普通工具循环过早 sleep，表现为"还没真正接近 TPM 就卡住"。
+/// 若上一轮还有 `cached_tokens`，则预算优先按"未缓存尾巴 + 本轮新增部分"估算，
+/// 避免 prompt cache 100% hit 时仍按整段 prompt 预占。
+///
+/// 但上一轮 usage 也可能因为本轮新增大工具结果而偏低，因此不直接全信 known：
+/// - known 低于字符估算一半时，按字符估算的一半作为地板；
+/// - known 高于字符估算时，按字符估算作为上界，避免历史压缩后沿用旧高值。
+pub(super) fn calibrate_prompt_tokens_for_budget(
+    estimated_prompt_tokens: usize,
+    known_prompt_tokens: Option<u64>,
+    known_cached_prompt_tokens: Option<u64>,
+) -> usize {
+    let Some(known) = known_prompt_tokens.and_then(|v| usize::try_from(v).ok()) else {
+        return estimated_prompt_tokens.max(1);
+    };
+    if estimated_prompt_tokens == 0 {
+        return known.max(1);
+    }
+    let known_cached = known_cached_prompt_tokens
+        .and_then(|v| usize::try_from(v).ok())
+        .unwrap_or(0)
+        .min(known);
+    if known_cached > 0 {
+        let known_uncached = known.saturating_sub(known_cached).max(1);
+        let reusable_cache = known_cached.min(estimated_prompt_tokens);
+        return estimated_prompt_tokens
+            .saturating_sub(reusable_cache)
+            .max(known_uncached);
+    }
+    let floor = estimated_prompt_tokens.div_ceil(2).max(1);
+    known.clamp(floor, estimated_prompt_tokens.max(floor))
+}
+
+fn budget_key(endpoint: &str, request_model: &str, api_key: &str) -> String {
+    let mut hasher = rustc_hash::FxHasher::default();
+    api_key.trim().hash(&mut hasher);
+    let key_fp = hasher.finish();
+    format!(
+        "{}|{}|{:016x}",
+        endpoint.trim(),
+        request_model.trim(),
+        key_fp
+    )
 }
 
 impl TokenBudgetBucket {
@@ -108,14 +132,16 @@ impl TokenBudgetBucket {
         // 单次请求估算已超过窗口时，等待旧账清空后放行，避免永远无法发送。
         if tokens >= limit {
             if used == 0 {
-                self.reservations.push_back(TokenReservation { at: now, tokens });
+                self.reservations
+                    .push_back(TokenReservation { at: now, tokens });
                 return BudgetDecision::Reserved;
             }
             return BudgetDecision::Wait(self.next_release_delay(now, window));
         }
 
         if used.saturating_add(tokens) <= limit {
-            self.reservations.push_back(TokenReservation { at: now, tokens });
+            self.reservations
+                .push_back(TokenReservation { at: now, tokens });
             BudgetDecision::Reserved
         } else {
             BudgetDecision::Wait(self.next_release_delay(now, window))
@@ -147,16 +173,18 @@ pub(super) fn estimate_json_request_tokens(value: &Value) -> usize {
 
 pub(super) async fn wait_for_request_budget(
     app: &App,
+    model: &str,
     endpoint: &str,
-    request_model: &str,
+    request_model_label: &str,
+    api_key: &str,
     estimated_prompt_tokens: usize,
     physical_sends: usize,
 ) -> Result<(), RequestError> {
-    let Some(limit) = configured_tpm_limit() else {
+    let Some(limit) = configured_tpm_limit(model) else {
         return Ok(());
     };
     let tokens = reservation_tokens(estimated_prompt_tokens, physical_sends);
-    let key = budget_key(endpoint, request_model);
+    let key = budget_key(endpoint, request_model_label, api_key);
 
     loop {
         let decision = {
@@ -171,7 +199,7 @@ pub(super) async fn wait_for_request_budget(
             BudgetDecision::Reserved => return Ok(()),
             BudgetDecision::Wait(delay) => {
                 eprintln!(
-                    "[Info] request TPM budget reached for `{request_model}`; waiting {:.1}s before next send (reserved {} / limit {} tokens, key-scoped 60s window)",
+                    "[Info] request TPM budget reached for `{request_model_label}`; waiting {:.1}s before next send (reserved {} / model limit {} tokens, key-scoped 60s window)",
                     delay.as_secs_f32(),
                     tokens,
                     limit
@@ -187,6 +215,14 @@ pub(super) async fn wait_for_request_budget(
 }
 
 #[cfg(test)]
-pub(super) fn test_reservation_tokens(estimated_prompt_tokens: usize, physical_sends: usize) -> u64 {
+pub(super) fn test_reservation_tokens(
+    estimated_prompt_tokens: usize,
+    physical_sends: usize,
+) -> u64 {
     reservation_tokens(estimated_prompt_tokens, physical_sends)
+}
+
+#[cfg(test)]
+pub(super) fn test_budget_key(endpoint: &str, request_model: &str, api_key: &str) -> String {
+    budget_key(endpoint, request_model, api_key)
 }

@@ -251,8 +251,7 @@ impl ExperienceGeneralizer {
         const DEDUP_SIMILARITY_THRESHOLD: f64 = 0.7;
         for existing in &self.experience_buffer {
             if existing.category == category
-                && self.compute_text_similarity(&existing.note, note)
-                    >= DEDUP_SIMILARITY_THRESHOLD
+                && self.compute_text_similarity(&existing.note, note) >= DEDUP_SIMILARITY_THRESHOLD
             {
                 return;
             }
@@ -761,10 +760,7 @@ impl ExperienceGeneralizer {
         // 保留首次出现的一条。最后每极性最多保留 3 条，保证 principle 简洁可读。
         const MAX_ITEMS_PER_POLARITY: usize = 3;
         const SYNTH_DEDUP_THRESHOLD: f64 = 0.6;
-        fn dedup_and_cap(
-            generalizer: &ExperienceGeneralizer,
-            items: Vec<String>,
-        ) -> Vec<String> {
+        fn dedup_and_cap(generalizer: &ExperienceGeneralizer, items: Vec<String>) -> Vec<String> {
             let mut kept: Vec<String> = Vec::new();
             for item in items {
                 let is_dup = kept.iter().any(|k| {

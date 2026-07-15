@@ -7,16 +7,16 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use super::builder::build_request_body;
+use super::types::StreamUsage;
+use super::{
+    api_key_for_request_model, apply_request_auth, control_model_for_aux_tasks,
+    endpoint_for_request_model, extract_router_content,
+};
 use crate::ai::{
     history::{Message, messages_to_markdown},
     types::App,
 };
-use super::types::StreamUsage;
-use super::{
-    api_key_for_request_model, apply_request_auth,
-    control_model_for_aux_tasks, endpoint_for_request_model, extract_router_content,
-};
-use super::builder::build_request_body;
 
 /// 会话标题请求的超时（秒）。后台辅助任务，用宽松超时避免阻塞主流程。
 pub(super) const SESSION_TITLE_REQUEST_TIMEOUT_SECS: u64 = 90;
@@ -206,7 +206,8 @@ pub(crate) async fn generate_session_title_via_model(
                 _ => m.role.as_str(),
             };
             // 去掉图片内容，只保留文本，避免 LLM 看到 base64 数据生成无意义的标题
-            let text_only = super::normalize::normalize_message_content_for_text_only_model(&m.content);
+            let text_only =
+                super::normalize::normalize_message_content_for_text_only_model(&m.content);
             let content = value_to_string(&text_only);
             format!("{role}: {content}")
         })

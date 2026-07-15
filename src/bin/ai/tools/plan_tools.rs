@@ -103,16 +103,8 @@ fn execute_plan(args: &Value) -> Result<String, String> {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let prefix = if parallelizable {
-            "  ‖ "
-        } else {
-            ""
-        };
-        let tags = if delegate {
-            " [delegate]"
-        } else {
-            ""
-        };
+        let prefix = if parallelizable { "  ‖ " } else { "" };
+        let tags = if delegate { " [delegate]" } else { "" };
         formatted.push_str(&format!(
             "{}Step {}. [{}]{} {}\n",
             prefix, step_num, tool, tags, action
@@ -134,10 +126,7 @@ fn execute_plan(args: &Value) -> Result<String, String> {
         .filter(|&b| b)
         .count();
 
-    formatted.push_str(&format!(
-        "\n---\n{} step(s) planned.",
-        steps.len()
-    ));
+    formatted.push_str(&format!("\n---\n{} step(s) planned.", steps.len()));
     if delegate_count > 0 {
         formatted.push_str(&format!(
             " {} step(s) marked for delegation.",
@@ -145,10 +134,7 @@ fn execute_plan(args: &Value) -> Result<String, String> {
         ));
     }
     if parallel_count > 0 {
-        formatted.push_str(&format!(
-            " {} step(s) can run in parallel.",
-            parallel_count
-        ));
+        formatted.push_str(&format!(" {} step(s) can run in parallel.", parallel_count));
     }
     if delegate_count > 0 {
         formatted.push_str(" Launch delegated steps via task_spawn in parallel, then task_wait to collect results.");

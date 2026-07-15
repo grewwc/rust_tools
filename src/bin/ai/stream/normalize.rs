@@ -92,7 +92,17 @@ fn parse_sse_event_payload(event_type: &str, payload: &str) -> Option<ParsedStre
     if event_type.contains("reasoning")
         && (event_type.ends_with(".delta") || event_type.ends_with(".done"))
     {
-        let text = extract_event_text(&value, &["delta", "text", "summary_text", "content"]);
+        let text = extract_event_text(
+            &value,
+            &[
+                "delta",
+                "text",
+                "summary_text",
+                "content",
+                "summary",
+                "reasoning",
+            ],
+        );
         if text.is_empty() {
             return Some(ParsedStreamPayload::Ignore);
         }
@@ -533,6 +543,22 @@ mod tests {
         ) {
             ParsedStreamPayload::Chunk(chunk) => {
                 assert_eq!(chunk.choices[0].delta.reasoning_content, "step one");
+                assert_eq!(chunk.choices[0].delta.content, "");
+            }
+            _ => panic!("expected reasoning chunk"),
+        }
+    }
+
+    #[test]
+    fn reasoning_event_with_summary_array_maps_to_reasoning_chunk() {
+        let payload = r#"{"summary":[{"text":"step 1"},{"text":" step 2"}]}"#;
+        match parse_stream_payload(
+            provider::openai_adapter(),
+            payload,
+            Some("response.reasoning_summary_text.delta"),
+        ) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.reasoning_content, "step 1 step 2");
                 assert_eq!(chunk.choices[0].delta.content, "");
             }
             _ => panic!("expected reasoning chunk"),

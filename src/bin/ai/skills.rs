@@ -695,7 +695,9 @@ mod tests {
 
     #[test]
     fn load_all_skills_includes_builtin_even_when_user_has_custom_skill() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let home = std::env::temp_dir()
             .join(format!("rust-tools-home-{}", uuid::Uuid::new_v4()))
             .display()
@@ -865,7 +867,9 @@ Use bundled references."#,
 
     #[test]
     fn load_all_skills_discovers_external_installed_skill_packages() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let home = std::env::temp_dir().join(format!("rust-tools-home-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&home).unwrap();
         let old_home = std::env::var("HOME").ok();

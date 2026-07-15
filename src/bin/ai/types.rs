@@ -63,6 +63,7 @@ impl Clone for App {
             agent_reload_counter: self.agent_reload_counter,
             observers: Vec::new(),
             last_known_prompt_tokens: self.last_known_prompt_tokens,
+            last_known_cached_prompt_tokens: self.last_known_cached_prompt_tokens,
             goal_mode: self.goal_mode.clone(),
             last_turn_had_tool_calls: self.last_turn_had_tool_calls,
             last_turn_interrupted: self.last_turn_interrupted,
@@ -108,6 +109,10 @@ pub(super) struct App {
     /// 上一次请求服务端返回的实际 prompt_tokens（来自 usage 统计）。
     /// 用于在下一次请求的 max_tokens clamp 中替代字符估算，提高精度。
     pub(super) last_known_prompt_tokens: Option<u64>,
+    /// 上一次请求服务端返回的 prompt cache 命中 token 数。
+    /// 用于在下一次请求的 TPM 预算预估中扣除可复用前缀，避免 100% cache hit
+    /// 仍按整段 prompt 记账而误触发等待。
+    pub(super) last_known_cached_prompt_tokens: Option<u64>,
     /// Goal 模式状态。`None` = 未启用；`Some("")` = 等待用户输入目标；
     /// `Some(goal)` = 目标已设定，agent 自动持续推进直到完成。
     pub(super) goal_mode: Option<String>,
@@ -329,6 +334,8 @@ pub(super) struct StreamResult {
     pub(super) finish_reason_value: Option<String>,
     /// 服务端 usage 统计：prompt tokens（已 normalize）。
     pub(super) usage_prompt_tokens: u64,
+    /// 服务端 usage 统计：本次 prompt 中命中的 cached_tokens。
+    pub(super) usage_cached_prompt_tokens: u64,
     /// 服务端 usage 统计：completion tokens（已 normalize，含 reasoning）。
     pub(super) usage_completion_tokens: u64,
     /// 服务端 usage 统计：reasoning tokens（来自 completion_tokens_details）。

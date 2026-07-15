@@ -8,16 +8,151 @@
 use std::fs;
 
 use base64::Engine as _;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
+use super::RequestBody;
+use super::reasoning::resolve_reasoning_wire_controls;
 use crate::ai::{
     files,
     history::Message,
     models,
     provider::{adapter_for, compatible_wire_shapes},
 };
-use super::reasoning::resolve_reasoning_wire_controls;
-use super::RequestBody;
+
+fn responses_content_type_for_role(role: &str) -> &'static str {
+    if role.eq_ignore_ascii_case("assistant") {
+        "output_text"
+    } else {
+        "input_text"
+    }
+}
+
+fn responses_message_content(role: &str, content: &Value) -> Value {
+    let Some(items) = content.as_array() else {
+        return match content {
+            Value::String(text) => Value::Array(vec![json!({
+                "type": responses_content_type_for_role(role),
+                "text": text,
+            })]),
+            _ => content.clone(),
+        };
+    };
+
+    Value::Array(
+        items
+            .iter()
+            .map(|item| {
+                let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+                if matches!(
+                    item_type,
+                    "input_text"
+                        | "input_image"
+                        | "output_text"
+                        | "refusal"
+                        | "input_file"
+                        | "computer_screenshot"
+                        | "summary_text"
+                        | "tether_browsing_display"
+                ) {
+                    return item.clone();
+                }
+
+                if let Some(url) = item
+                    .get("image_url")
+                    .and_then(|v| v.get("url").or(Some(v)))
+                    .and_then(|v| v.as_str())
+                {
+                    return json!({
+                        "type": "input_image",
+                        "image_url": url,
+                    });
+                }
+
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    return json!({
+                        "type": responses_content_type_for_role(role),
+                        "text": text,
+                    });
+                }
+
+                item.clone()
+            })
+            .collect(),
+    )
+}
+
+fn responses_input(messages: &[Message]) -> Vec<Value> {
+    let mut input = Vec::new();
+    for message in messages {
+        if let Some(tool_calls) = &message.tool_calls {
+            for tool_call in tool_calls {
+                input.push(json!({
+                    "type": "function_call",
+                    "call_id": tool_call.id,
+                    "name": tool_call.function.name,
+                    "arguments": tool_call.function.arguments,
+                }));
+            }
+        } else if message.role == "tool" {
+            if let Some(call_id) = &message.tool_call_id {
+                input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": message.content,
+                }));
+            }
+        } else {
+            input.push(json!({
+                "role": message.role,
+                "content": responses_message_content(&message.role, &message.content),
+            }));
+        }
+    }
+    input
+}
+
+fn responses_tools(tools: &Value) -> Value {
+    Value::Array(
+        tools
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|tool| {
+                let function = tool.get("function").unwrap_or(tool);
+                json!({
+                    "type": "function",
+                    "name": function.get("name").cloned().unwrap_or(Value::Null),
+                    "description": function.get("description").cloned().unwrap_or(Value::Null),
+                    "parameters": function.get("parameters").cloned().unwrap_or(Value::Null),
+                })
+            })
+            .collect(),
+    )
+}
+
+pub(super) fn build_responses_request_body(request: &RequestBody<'_>) -> Value {
+    let mut body = json!({
+        "model": request.model,
+        "input": responses_input(request.messages),
+        "stream": request.stream,
+    });
+    let object = body.as_object_mut().expect("responses body is an object");
+    if let Some(tools) = &request.tools {
+        object.insert("tools".to_string(), responses_tools(tools));
+    }
+    if let Some(tool_choice) = &request.tool_choice {
+        object.insert("tool_choice".to_string(), tool_choice.clone());
+    }
+    if let Some(effort) = request.reasoning_effort {
+        object.insert("reasoning".to_string(), json!({ "effort": effort }));
+    } else if let Some(reasoning) = &request.reasoning {
+        object.insert("reasoning".to_string(), reasoning.clone());
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        object.insert("max_output_tokens".to_string(), max_tokens.into());
+    }
+    body
+}
 
 /// 构建消息 content：纯文本模型或无图片时返回字符串；多模态模型返回
 /// `[{image_url}, {text}]` 数组。图片以 base64 data URI 内联。
@@ -64,7 +199,11 @@ const CONTEXT_WINDOW_SAFETY_MARGIN_TOKENS: usize = 2_048;
 fn estimate_prompt_tokens(messages: &[Message]) -> usize {
     let chars: usize = messages
         .iter()
-        .map(|m| super::super::history::value_to_string(&m.content).chars().count())
+        .map(|m| {
+            super::super::history::value_to_string(&m.content)
+                .chars()
+                .count()
+        })
         .sum();
     chars.div_ceil(CHARS_PER_TOKEN_CONSERVATIVE)
 }
@@ -85,10 +224,7 @@ fn estimate_tools_tokens(tools: Option<&Value>) -> usize {
 /// 估算本次请求的输入 token：messages + tools schema。
 /// request 传输层的 TPM preflight gate 与 max_tokens clamp 共用这条路径，避免
 /// "窗口预算"与"速率预算"使用两套不同估算导致判断分叉。
-pub(super) fn estimate_request_prompt_tokens(
-    messages: &[Message],
-    tools: Option<&Value>,
-) -> usize {
+pub(super) fn estimate_request_prompt_tokens(messages: &[Message], tools: Option<&Value>) -> usize {
     estimate_prompt_tokens(messages) + estimate_tools_tokens(tools)
 }
 

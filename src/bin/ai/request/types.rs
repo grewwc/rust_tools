@@ -181,7 +181,7 @@ pub(crate) struct StreamChoice {
         default,
         alias = "reasoning",
         alias = "reasoning_text",
-        deserialize_with = "displayable_string_or_default"
+        deserialize_with = "reasoning_content_string_or_default"
     )]
     pub(crate) reasoning_content: String,
     #[serde(default, deserialize_with = "reasoning_details_string_or_default")]
@@ -198,7 +198,7 @@ pub(crate) struct StreamDelta {
         default,
         alias = "reasoning",
         alias = "reasoning_text",
-        deserialize_with = "displayable_string_or_default"
+        deserialize_with = "reasoning_content_string_or_default"
     )]
     pub(crate) reasoning_content: String,
     #[serde(default, deserialize_with = "reasoning_details_string_or_default")]
@@ -258,6 +258,17 @@ where
 }
 
 fn reasoning_details_string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(value
+        .as_ref()
+        .map(extract_reasoning_details_text)
+        .unwrap_or_default())
+}
+
+fn reasoning_content_string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
 {

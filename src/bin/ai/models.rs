@@ -62,11 +62,29 @@ pub(super) fn default_reasoning_effort(model: &str) -> Option<ReasoningEffort> {
     model_def(model).and_then(|m| m.reasoning_effort)
 }
 
+/// 返回该模型是否声明了 `reasoning_effort` 与 `tools` 不兼容。
+/// 若为 true，请求层在携带 tools 时会自动省略 `reasoning_effort` 字段，
+/// 避免部分网关（如 bytedance modelhub）返回 400。
+/// 无 tools 的请求不受影响，仍正常发送 `reasoning_effort` 以保留 thinking。
+pub(super) fn reasoning_effort_conflicts_with_tools(model: &str) -> bool {
+    model_def(model)
+        .map(|m| m.reasoning_effort_conflicts_with_tools)
+        .unwrap_or(false)
+}
+
 /// 返回该模型在 [models.json](../../../models.json) 中声明的单次响应最大输出
 /// token 数（`max_output_tokens`）。缺省时为 `None`，请求不下发 `max_tokens`，
 /// 沿用 provider 默认补全上限。
 pub(super) fn max_output_tokens(model: &str) -> Option<u32> {
     model_def(model).and_then(|m| m.max_output_tokens)
+}
+
+/// 返回该模型在 [models.json](../../../models.json) 中声明的请求层 TPM 预检预算。
+/// 仅当显式配置了正整数时返回 `Some(limit)`；未配置或为 0 都视为关闭预检等待。
+pub(super) fn request_tpm_limit(model: &str) -> Option<u64> {
+    model_def(model)
+        .and_then(|m| m.request_tpm_limit)
+        .filter(|limit| *limit > 0)
 }
 
 pub(super) fn model_adapter(model: &str) -> ApiProvider {
@@ -809,10 +827,12 @@ mod tests {
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
     use crate::ai::config_schema::AiConfig;
+    use crate::ai::model_names::ModelDef;
     use crate::ai::provider::{
         ALIBABA_DEFAULT_ENDPOINT, ApiProvider, ModelQualityTier, OPENCODE_DEFAULT_ENDPOINT,
         OPENROUTER_ENDPOINT,
     };
+    use serde_json::json;
 
     fn manifest(
         name: &str,
@@ -927,6 +947,39 @@ mod tests {
             Some(AgentModelTier::Heavy),
         );
         assert_eq!(agent_model_tier(&agent), ModelStrengthTier::Heavy);
+    }
+
+    #[test]
+    fn model_def_parses_request_tpm_limit_when_present() {
+        let def: ModelDef = serde_json::from_value(json!({
+            "key": "demo",
+            "name": "demo-model",
+            "adapter": "compatible",
+            "quality_tier": "strong",
+            "is_vl": false,
+            "search_enabled": true,
+            "tools_default_enabled": true,
+            "enable_thinking": false,
+            "request_tpm_limit": 123456
+        }))
+        .unwrap();
+        assert_eq!(def.request_tpm_limit, Some(123456));
+    }
+
+    #[test]
+    fn model_def_defaults_request_tpm_limit_to_none() {
+        let def: ModelDef = serde_json::from_value(json!({
+            "key": "demo",
+            "name": "demo-model",
+            "adapter": "compatible",
+            "quality_tier": "strong",
+            "is_vl": false,
+            "search_enabled": true,
+            "tools_default_enabled": true,
+            "enable_thinking": false
+        }))
+        .unwrap();
+        assert_eq!(def.request_tpm_limit, None);
     }
 
     #[test]
@@ -1203,7 +1256,9 @@ mod tests {
             if !secret::is_encrypted(enc) {
                 return None;
             }
-            secret::decrypt(enc).ok().map(|plain| (m.key.clone(), plain))
+            secret::decrypt(enc)
+                .ok()
+                .map(|plain| (m.key.clone(), plain))
         });
 
         let Some((model_key, config_key_name)) = target else {
@@ -1223,10 +1278,8 @@ mod tests {
         };
 
         // 创建临时目录，将密钥文件复制过去（保持解密能力）
-        let temp_dir = std::env::temp_dir().join(format!(
-            "rt_enc_test_{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let temp_dir =
+            std::env::temp_dir().join(format!("rt_enc_test_{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let temp_secret = temp_dir.join(".configW.secret");
         std::fs::copy(&real_secret_path, &temp_secret).unwrap();

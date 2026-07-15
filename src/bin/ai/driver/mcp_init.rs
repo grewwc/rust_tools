@@ -269,7 +269,9 @@ mod tests {
 
     #[tokio::test]
     async fn interruptible_prepare_mcp_init_stops_before_connecting_servers() {
-        let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _signal_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let kernel = crate::ai::driver::new_local_kernel();
         init_os_tools_globals(kernel.clone());
         crate::ai::driver::signal::clear_request_interrupt();

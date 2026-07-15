@@ -33,7 +33,7 @@ Read `docs/agent-guides/ai-driver.md` before changing the run loop, turn prepara
 
 4. **Subagent spawn depth.** `runtime_ctx::SUBAGENT_DEPTH` (task-local) tracks nesting; `MAX_SUBAGENT_SPAWN_DEPTH` (=2) caps the chain. Subagent at depth ≥2 calling `task`/`task_spawn` gets an error. Depth carried in `OsTaskGoal.spawn_depth`, scoped by both dispatch paths.
 
-5. **Background dispatch notes.** Process/correction notes (truncation-retry hints, cache-hit notes, `discover_skills` followups) are turn-scoped: push to `messages` only, never via `append_message_pair`, so they don't persist into `turn_messages` and can't accumulate across turns.
+5. **Background dispatch notes.** Process/correction notes (truncation-retry hints, cache-hit notes, `discover_skills` followups) are turn-scoped: push to `messages` only, never via `append_message_pair`, so they don't persist into `turn_messages` and can't accumulate across turns. 同理，assistant 的 tool-call narration / `reasoning_content` 仅保留在本 turn 的 `messages` 轨道；写入 `turn_messages` 时必须使用瘦身后的持久化副本（tool-call assistant 置空 content、移除 reasoning），避免单个 user turn 把历史污染成数百条过程消息。
 
 6. **Session-title generation.** Post-turn background task, not critical path. In foreground turns, `finalize_turn()` schedules in background. Inline only for paths exiting immediately. Guard with per-session in-flight latch.
 
@@ -51,7 +51,7 @@ Read `docs/agent-guides/ai-driver.md` before changing the run loop, turn prepara
 
 13. **Progress budget.** Third loop-defense layer (`TurnSupervisor::assess_progress`) after exact-byte and coarse detection. Catches "args change but task never advances" loops. Billed by intent-alignment (`classify_task_intent`: Mutation vs ReadOnly), not action count. Escalation: free-explore → `LowProgressSoft` → `LowProgressLedger` → `LowProgressHard` (no-tool handoff). Thresholds are hardcoded `const`.
 
-14. **Multi-agent delegation nudges.** `ThinkingOrchestrator::on_prepare_rich` injects optional Context Budget (P3, `turn_index >= 12`) and Task Decomposition Hint (P4, `detect_decomposition_signals`) sections. Both advisory, one-shot latched, gated on `task_spawn` availability.
+14. **Multi-agent delegation nudge.** `ThinkingOrchestrator::on_prepare_rich` injects an optional Context Budget section (P3, `turn_index >= 12`) when `task_spawn` is available. Advisory, one-shot latched.
 
 15. **Context-budget rollback.** Condition 2 uses strict `>` (not `>=`): `after_chars > after_lossless_chars` triggers rollback only when lossy is strictly worse. On tie, lossy kept for better structure.
 

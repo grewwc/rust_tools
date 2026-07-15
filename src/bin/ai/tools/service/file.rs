@@ -747,8 +747,7 @@ mod tests {
                 "offset": 2,
                 "limit": 1
             });
-            let lines = execute_read_file(&lines_args)
-                .expect("read_file should accept path alias");
+            let lines = execute_read_file(&lines_args).expect("read_file should accept path alias");
             assert!(lines.contains("line2"), "output: {lines}");
             assert!(!lines.contains("line3"), "output: {lines}");
         });

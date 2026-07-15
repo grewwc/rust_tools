@@ -9,11 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::ai::{
-    agents::AgentManifest,
-    mcp::SharedMcpClient,
-    skills::SkillManifest,
-    tools::task_tools::with_task_entry_by_pid,
-    types::App,
+    agents::AgentManifest, mcp::SharedMcpClient, skills::SkillManifest,
+    tools::task_tools::with_task_entry_by_pid, types::App,
 };
 
 use super::agent_routing::{activate_primary_agent, ensure_runtime_manifests_loaded};
@@ -52,12 +49,7 @@ pub(super) fn dispatch_background_batch(
         return;
     }
 
-    ensure_runtime_manifests_loaded(
-        app,
-        skill_manifests,
-        agent_manifests,
-        manifests_loaded,
-    );
+    ensure_runtime_manifests_loaded(app, skill_manifests, agent_manifests, manifests_loaded);
 
     use colored::Colorize;
     for proc in &background_procs {
@@ -81,7 +73,7 @@ pub(super) fn dispatch_background_batch(
         Option<aios_kernel::primitives::FutexAddr>,
         Option<String>,
         Option<crate::ai::models::AutoModelFallbackSpec>,
-       usize,
+        usize,
         bool,
     )> = Vec::new();
     for proc in &background_procs {
@@ -130,8 +122,7 @@ pub(super) fn dispatch_background_batch(
             os.set_current_pid(Some(pid));
             if let Some(p) = os.get_process_mut(pid) {
                 if p.history_file.is_none() {
-                    p.history_file =
-                        Some(process_history_path(&original_history_file, pid));
+                    p.history_file = Some(process_history_path(&original_history_file, pid));
                 }
                 let _ = os.process_pending_signals();
             }
@@ -150,7 +141,7 @@ pub(super) fn dispatch_background_batch(
                 .map(|goal| aios_kernel::primitives::FutexAddr(goal.completion_futex_addr)),
             task_goal.as_ref().map(|goal| goal.task_id.clone()),
             task_goal.as_ref().and_then(|goal| goal.auto_model_fallback),
-           task_goal.as_ref().map(|goal| goal.spawn_depth).unwrap_or(0),
+            task_goal.as_ref().map(|goal| goal.spawn_depth).unwrap_or(0),
             is_resume_wakeup,
         ));
     }
@@ -165,7 +156,7 @@ pub(super) fn dispatch_background_batch(
         completion_futex_addr,
         task_id,
         auto_model_fallback,
-       spawn_depth,
+        spawn_depth,
         is_resume_wakeup,
     ) in task_specs
     {
@@ -197,9 +188,7 @@ pub(super) fn dispatch_background_batch(
 
         let inherit = task_id
             .as_deref()
-            .and_then(|tid| {
-                crate::ai::tools::task_tools::with_task_entry(tid, |e| e.inherit)
-            })
+            .and_then(|tid| crate::ai::tools::task_tools::with_task_entry(tid, |e| e.inherit))
             .unwrap_or_default();
         let (effective_history, task_skills) = resolve_background_subagent_context(
             history_path,
@@ -306,31 +295,20 @@ pub(super) fn dispatch_background_batch(
                 }
                 Err(err) => {
                     record_scheduler_outcome(os.as_mut(), pid, DispatchOutcomeTag::Failed);
-                    terminate_and_cleanup(
-                        os.as_mut(),
-                        pid,
-                        format!("Failed: {}", err),
-                        true,
-                    );
+                    terminate_and_cleanup(os.as_mut(), pid, format!("Failed: {}", err), true);
                 }
             }
         });
 
-        type BoxedTaskFuture =
-            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+        type BoxedTaskFuture = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
         let mut wrapped: BoxedTaskFuture = Box::pin(inner_fut);
         let persona_memory_path = app.current_persona_memory_file();
-        wrapped = Box::pin(
-            runtime_ctx::PERSONA_MEMORY_PATH.scope(persona_memory_path.clone(), wrapped),
-        );
-        wrapped = Box::pin(
-            runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped),
-        );
+        wrapped =
+            Box::pin(runtime_ctx::PERSONA_MEMORY_PATH.scope(persona_memory_path.clone(), wrapped));
+        wrapped = Box::pin(runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped));
         if !inherit.memory {
-            let mem_path = runtime_ctx::make_subagent_memory_path(
-                &parent_history_for_scopes,
-                &scope_task_id,
-            );
+            let mem_path =
+                runtime_ctx::make_subagent_memory_path(&parent_history_for_scopes, &scope_task_id);
             // sub-agent 默认私有 memory：finalize 后把白名单条目
             // (is_permanent_memory) 合并回主 memory 文件，让 long-term
             // assets 能跨 task 共享，但普通 task_event 留在私有文件，
@@ -356,15 +334,13 @@ pub(super) fn dispatch_background_batch(
                 .parent()
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| PathBuf::from("."));
-            if let Some(scratch) =
-                runtime_ctx::make_subagent_cwd(&scratch_base, &scope_task_id)
-            {
+            if let Some(scratch) = runtime_ctx::make_subagent_cwd(&scratch_base, &scope_task_id) {
                 wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
             }
         }
-       // 设置子代理嵌套深度，供 `task_spawn` / `task` 在子代理内部
-       // 检测递归扇出时使用。
-       wrapped = Box::pin(runtime_ctx::SUBAGENT_DEPTH.scope(spawn_depth, wrapped));
+        // 设置子代理嵌套深度，供 `task_spawn` / `task` 在子代理内部
+        // 检测递归扇出时使用。
+        wrapped = Box::pin(runtime_ctx::SUBAGENT_DEPTH.scope(spawn_depth, wrapped));
 
         // 计入在途后台子 agent：guard 随 spawned future 一同 move 进任务，
         // 任务结束（正常 / 错误 / panic）时 Drop 自动 dec，避免输入框被永久门控。

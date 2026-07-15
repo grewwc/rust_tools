@@ -1,17 +1,23 @@
 #[cfg(test)]
 use reqwest::StatusCode;
 
-mod error;
+mod aux;
 mod builder;
+mod error;
 mod normalize;
 mod reasoning;
 mod routing;
-mod aux;
 mod thinking;
 mod token_budget;
-mod types;
 mod transport;
+mod types;
 
+#[cfg(test)]
+use aux::{SESSION_TITLE_BODY_TIMEOUT_SECS, SESSION_TITLE_REQUEST_TIMEOUT_SECS};
+pub(crate) use aux::{
+    charge_llm_usage_to_kernel, charge_llm_usage_via_kernel, generate_session_title_via_model,
+    summarize_history_via_model,
+};
 #[allow(unused_imports)]
 pub(crate) use error::{
     AUTO_SUBAGENT_REQUEST_MAX_ATTEMPTS, AUTO_SUBAGENT_RESPONSE_HEADER_TIMEOUT_SECS,
@@ -26,12 +32,6 @@ pub(crate) use error::{
     should_temporarily_disable_auto_selected_model, should_temporarily_disable_model,
     should_try_model_fallback, sleep_with_cancel,
 };
-pub(crate) use aux::{
-    charge_llm_usage_to_kernel, charge_llm_usage_via_kernel, generate_session_title_via_model,
-    summarize_history_via_model,
-};
-#[cfg(test)]
-use aux::{SESSION_TITLE_BODY_TIMEOUT_SECS, SESSION_TITLE_REQUEST_TIMEOUT_SECS};
 #[allow(unused_imports)]
 pub(crate) use routing::{extract_router_content, strip_json_fence};
 pub(crate) use thinking::strip_system_reminders;
@@ -51,8 +51,8 @@ pub(crate) use reasoning::apply_aux_thinking_fields;
 pub(crate) use builder::{build_content, clamp_max_tokens_for_prompt};
 
 // 传输层：HTTP 请求发送、重试、超时、鉴权
-pub(super) use transport::{do_request_messages, print_info};
 pub use transport::{do_request_json, do_request_text_streaming};
+pub(super) use transport::{do_request_messages, print_info};
 
 // ── 以下 private use 仅供 `tests` 子模块通过 `use super::*;` 访问 ──
 // 函数体已迁移至 `transport.rs`，mod.rs 本身不再直接使用这些项。

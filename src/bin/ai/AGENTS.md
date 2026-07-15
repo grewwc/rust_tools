@@ -40,7 +40,10 @@ in `driver/thinking/orchestrator.rs` reinforce this.
    threshold-gated, governed by `ToolHistoryPolicy.prune`). Dedup of byte-identical
    tool results MUST run **before** offload (`prepare_tool_messages_structured`) in
    every compression path — offload rewrites results into stubs with unique temp-file
-   paths, which defeats content-hash matching.
+   paths, which defeats content-hash matching. Persisted history is a **sanitized**
+   track, not a raw replay log: assistant `reasoning_content` is stripped on persist/load,
+   and assistant messages with `tool_calls` keep the structured call metadata but must
+   not retain process narration text.
 4. `models.json` may declare per-model `api_key_config_key` for compatible gateways.
    **Encryption invariant:** `api_key_config_key` (like `name` and `endpoint`) may be
    encrypted (`enc:...`); `api_key_for_model` must decrypt before config lookup.
@@ -50,9 +53,18 @@ in `driver/thinking/orchestrator.rs` reinforce this.
    only as a backward-compatible alias.
 6. Request-layer 429 prevention lives in `request/token_budget.rs`: every physical
    LLM HTTP send pre-reserves estimated prompt+tool-schema tokens in a per
-   endpoint/model 60s TPM bucket before transport. Do not rely on history
-   compression or turn-loop limits as the primary rate-limit guard; those only
-   reduce token volume, while the request budget controls send rate.
+   endpoint/model/key 60s TPM bucket before transport. Budgeting must be
+   prompt-cache-aware: if the previous response reports `cached_tokens`, carry
+   that through `StreamResult` / `App` and discount reusable prompt prefix
+   instead of charging the whole prompt again. **Enable this only when the
+   model explicitly declares `request_tpm_limit` in `models.json`; unconfigured
+   models must skip waiting entirely rather than guessing a global default.**
+   Do not rely on history compression or turn-loop limits as the primary
+   rate-limit guard; those only reduce token volume, while the request budget
+   controls send rate.
+7. Responses API wire differs from chat-completions for multimodal content:
+   internal `{"type":"text"}` / `{"type":"image_url"}` items must be remapped
+   to Responses `input_text` / `input_image` shapes before send.
 
 ## On-Demand Guides
 

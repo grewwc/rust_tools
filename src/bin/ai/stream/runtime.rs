@@ -219,6 +219,7 @@ fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
         stream_error: false,
         finish_reason_value: None,
         usage_prompt_tokens: 0,
+        usage_cached_prompt_tokens: 0,
         usage_completion_tokens: 0,
         usage_reasoning_tokens: 0,
     }
@@ -336,12 +337,17 @@ fn finalize_stream_response(
     // Prefer the model echoed by the provider; fall back to what we requested.
     // 先快照 usage 统计，供 StreamResult 截断诊断使用（take 会消费）。
     let usage_snapshot = state.pending_llm_usage.as_ref().map(|(_, u)| {
+        let cached = u
+            .prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
         let reasoning = u
             .completion_tokens_details
             .as_ref()
             .map(|d| d.reasoning_tokens)
             .unwrap_or(0);
-        (u.prompt_tokens, u.completion_tokens, reasoning)
+        (u.prompt_tokens, cached, u.completion_tokens, reasoning)
     });
     if let Some((echoed_model, usage)) = state.pending_llm_usage.take() {
         let model_for_pricing = if echoed_model.is_empty() {
@@ -434,9 +440,10 @@ fn finalize_stream_response(
         truncated_by_length,
         stream_error: false,
         finish_reason_value: state.content.finish_reason_value.clone(),
-        usage_prompt_tokens: usage_snapshot.map(|(p, _, _)| p).unwrap_or(0),
-        usage_completion_tokens: usage_snapshot.map(|(_, c, _)| c).unwrap_or(0),
-        usage_reasoning_tokens: usage_snapshot.map(|(_, _, r)| r).unwrap_or(0),
+        usage_prompt_tokens: usage_snapshot.map(|(p, _, _, _)| p).unwrap_or(0),
+        usage_cached_prompt_tokens: usage_snapshot.map(|(_, cp, _, _)| cp).unwrap_or(0),
+        usage_completion_tokens: usage_snapshot.map(|(_, _, c, _)| c).unwrap_or(0),
+        usage_reasoning_tokens: usage_snapshot.map(|(_, _, _, r)| r).unwrap_or(0),
     })
 }
 
@@ -571,6 +578,7 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         stream_error: true,
         finish_reason_value: state.content.finish_reason_value.clone(),
         usage_prompt_tokens: 0,
+        usage_cached_prompt_tokens: 0,
         usage_completion_tokens: 0,
         usage_reasoning_tokens: 0,
     })
@@ -943,7 +951,10 @@ fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Resul
 
 /// 打印锚定的折叠 header。只应在折叠激活后被调用一次。
 fn write_thinking_fold_header(out: &mut impl Write) -> io::Result<()> {
-    write!(out, "{ACCENT_RULE}╭─\x1b[0m {ACCENT_MUTED}thinking\x1b[0m\n")
+    write!(
+        out,
+        "{ACCENT_RULE}╭─\x1b[0m {ACCENT_MUTED}thinking\x1b[0m\n"
+    )
 }
 
 /// Thinking 结束时的最终渲染：覆盖正文窗口，输出最终折叠摘要 + "done thinking"。

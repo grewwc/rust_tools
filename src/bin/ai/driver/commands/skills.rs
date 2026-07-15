@@ -155,8 +155,7 @@ pub fn try_handle_skills_command(
                 Some(name) => {
                     if has_rest {
                         // /skills <name> <rest>：提取 rest 作为本轮问题
-                        let rest =
-                            extract_rest_after_skill_name(&normalized_for_rest);
+                        let rest = extract_rest_after_skill_name(&normalized_for_rest);
                         app.forced_skill = Some(name);
                         app.forced_question = rest;
                         return Ok(true);
@@ -225,18 +224,14 @@ mod tests {
     #[test]
     fn rest_after_simple_skill_name() {
         // /skill code-review 帮我review
-        let r = extract_rest_after_skill_name(
-            "skill code-review 帮我review",
-        );
+        let r = extract_rest_after_skill_name("skill code-review 帮我review");
         assert_eq!(r.as_deref(), Some("帮我review"));
     }
 
     #[test]
     fn rest_after_no_question() {
         // /skill code-review
-        let r = extract_rest_after_skill_name(
-            "skill code-review",
-        );
+        let r = extract_rest_after_skill_name("skill code-review");
         assert_eq!(r, None);
     }
 
@@ -244,9 +239,7 @@ mod tests {
     fn rest_preserved_when_question_starts_with_skill_name() {
         // 之前会返回 None 的场景：用户问题以 skill 名开头
         // /skill code-review code-review帮我review
-        let r = extract_rest_after_skill_name(
-            "skill code-review code-review帮我review",
-        );
+        let r = extract_rest_after_skill_name("skill code-review code-review帮我review");
         assert_eq!(r.as_deref(), Some("code-review帮我review"));
     }
 
@@ -254,21 +247,14 @@ mod tests {
     fn rest_with_mixed_case_action() {
         // action 与 skill_name 大小写不同
         // /skill Code-Review帮我review  → action="Code-Review"
-        let r = extract_rest_after_skill_name(
-            "skill Code-Review帮我review",
-        );
+        let r = extract_rest_after_skill_name("skill Code-Review帮我review");
         assert_eq!(r.as_deref(), Some("帮我review"));
     }
 
     #[test]
     fn rest_with_multi_word_question() {
         // /skill code-review 帮我review 这段代码 并给出建议
-        let r = extract_rest_after_skill_name(
-            "skill code-review 帮我review 这段代码 并给出建议",
-        );
-        assert_eq!(
-            r.as_deref(),
-            Some("帮我review 这段代码 并给出建议")
-        );
+        let r = extract_rest_after_skill_name("skill code-review 帮我review 这段代码 并给出建议");
+        assert_eq!(r.as_deref(), Some("帮我review 这段代码 并给出建议"));
     }
 }

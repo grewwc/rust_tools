@@ -1284,9 +1284,9 @@ mod tests {
         ContextKind, SystemPromptBuilder, available_tool_names,
         build_hidden_execution_primitive_catalog, build_hidden_mcp_tool_catalog,
         build_project_instruction_prompt, build_system_prompt, builtin_tools_for_skill,
-        declares_executor_group, ensure_required_baseline_tools, filter_mcp_tools_by_allowed_servers,
-        has_tool, merge_with_runtime_enabled_tools, push_project_context, resolve_max_iterations,
-        select_mcp_tools, tool_uses_mcp_server,
+        declares_executor_group, ensure_required_baseline_tools,
+        filter_mcp_tools_by_allowed_servers, has_tool, merge_with_runtime_enabled_tools,
+        push_project_context, resolve_max_iterations, select_mcp_tools, tool_uses_mcp_server,
     };
     use crate::ai::agents::{AgentManifest, AgentMode};
     use crate::ai::driver::runtime_ctx::SUBAGENT_CWD;
@@ -1494,14 +1494,15 @@ mod tests {
 
         // baseline：直接展开 [core, executor]，不做 deferred 过滤（还原优化前口径）。
         let groups = ["core", "executor"];
-        let baseline_tools = ensure_required_baseline_tools(
-            crate::ai::tools::tool_definitions_for_groups(&groups),
-        );
+        let baseline_tools =
+            ensure_required_baseline_tools(crate::ai::tools::tool_definitions_for_groups(&groups));
         // optimized：现行生产路径（manifest_tool_definitions 会剔除 deferred 原语）。
         let optimized_tools = builtin_tools_for_skill(None, Some(&build_agent));
 
         let ser = |tools: &[ToolDefinition]| -> usize {
-            serde_json::to_string(tools).map(|s| s.chars().count()).unwrap_or(0)
+            serde_json::to_string(tools)
+                .map(|s| s.chars().count())
+                .unwrap_or(0)
         };
         let baseline_chars = ser(&baseline_tools);
         let optimized_chars = ser(&optimized_tools);
@@ -1537,7 +1538,6 @@ mod tests {
             "expected >=800 tokens saved per turn, got {saved_tokens}"
         );
     }
-
 
     #[test]
     fn system_prompt_only_mentions_tools_available_this_turn() {

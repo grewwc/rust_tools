@@ -5,12 +5,12 @@
 
 use std::sync::Arc;
 
+use super::{agent_router, note_search};
 use crate::ai::{
     agents::{self, AgentManifest},
     skills::{self, SkillManifest},
     types::App,
 };
-use super::{agent_router, note_search};
 use crate::commonw::configw;
 
 #[crate::ai::agent_hang_span(
@@ -89,7 +89,11 @@ pub(super) fn auto_route_strategy() -> String {
 /// Uses either:
 ///   - model strategy: Use ML model to predict best agent
 ///   - heuristic strategy: Rule-based routing
-pub(super) fn maybe_auto_route_agent(app: &mut App, agent_manifests: &[AgentManifest], question: &str) {
+pub(super) fn maybe_auto_route_agent(
+    app: &mut App,
+    agent_manifests: &[AgentManifest],
+    question: &str,
+) {
     if app.cli.agent.is_some() || !auto_agent_routing_enabled() {
         return;
     }

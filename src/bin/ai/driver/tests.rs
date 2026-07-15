@@ -293,6 +293,7 @@ fn test_app(current_agent: &str) -> App {
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
         last_known_prompt_tokens: None,
+        last_known_cached_prompt_tokens: None,
         goal_mode: None,
         last_turn_had_tool_calls: false,
         last_turn_interrupted: false,
@@ -360,7 +361,9 @@ fn resume_predicate_requires_clean_interactive_start() {
 
 #[test]
 fn startup_choice_auto_resumes_terminal_bound_session() {
-    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let root = std::env::temp_dir().join(format!(
         "rt_startup_resume_{}",
         uuid::Uuid::new_v4().simple()
@@ -417,7 +420,9 @@ fn startup_choice_auto_resumes_terminal_bound_session() {
 
 #[test]
 fn startup_choice_skips_auto_resume_when_prompt_args_exist() {
-    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let root = std::env::temp_dir().join(format!(
         "rt_startup_resume_skip_{}",
         uuid::Uuid::new_v4().simple()
@@ -475,7 +480,9 @@ fn startup_choice_skips_auto_resume_when_prompt_args_exist() {
 
 #[test]
 fn startup_choice_skips_auto_resume_when_new_session_requested() {
-    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let root = std::env::temp_dir().join(format!(
         "rt_startup_new_session_{}",
         uuid::Uuid::new_v4().simple()
@@ -534,7 +541,9 @@ fn startup_choice_skips_auto_resume_when_new_session_requested() {
 
 #[test]
 fn startup_choice_can_select_specific_suspended_session_from_multiple() {
-    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let root = std::env::temp_dir().join(format!(
         "rt_startup_resume_select_{}",
         uuid::Uuid::new_v4().simple()
@@ -601,7 +610,9 @@ fn startup_choice_can_select_specific_suspended_session_from_multiple() {
 
 #[test]
 fn startup_choice_can_start_new_without_consuming_suspended_stack() {
-    let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let root = std::env::temp_dir().join(format!(
         "rt_startup_resume_skip_stack_{}",
         uuid::Uuid::new_v4().simple()

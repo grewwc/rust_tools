@@ -5,15 +5,12 @@
 use std::io::Write;
 use std::sync::atomic::Ordering;
 
-use crate::ai::{
-    mcp::SharedMcpClient,
-    types::App,
-};
 use super::{
-    apply_prepared_mcp_init, prepare_mcp_initialization_from_path,
-    prepare_mcp_initialization_from_path_interruptible,
-    print, signal, McpConfigProbe, McpInitReport, PreparedMcpInit,
+    McpConfigProbe, McpInitReport, PreparedMcpInit, apply_prepared_mcp_init,
+    prepare_mcp_initialization_from_path, prepare_mcp_initialization_from_path_interruptible,
+    print, signal,
 };
+use crate::ai::{mcp::SharedMcpClient, types::App};
 
 pub(super) fn apply_prepared_mcp_with_shared_client(
     app: &mut App,
@@ -154,7 +151,9 @@ pub(super) async fn ensure_mcp_initialized_for_turn(
     }
 }
 
-pub(super) fn spawn_mcp_preload_task(config_path: String) -> tokio::task::JoinHandle<Option<PreparedMcpInit>> {
+pub(super) fn spawn_mcp_preload_task(
+    config_path: String,
+) -> tokio::task::JoinHandle<Option<PreparedMcpInit>> {
     tokio::spawn(async move {
         let interrupt_futex = signal::alloc_interrupt_futex("mcp_preload_interrupt");
         let prepared =

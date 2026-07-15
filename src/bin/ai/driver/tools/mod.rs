@@ -211,12 +211,10 @@ fn equivalent_tools(
     available_tool_names: Option<&FastSet<String>>,
 ) -> Option<String> {
     let candidates: &[ToolAlternative] = match tool_name {
-        "read_file" => &[
-            ToolAlternative {
-                name: "code_search",
-                description: "locate the relevant region first",
-            },
-        ],
+        "read_file" => &[ToolAlternative {
+            name: "code_search",
+            description: "locate the relevant region first",
+        }],
         "code_search" => &[
             ToolAlternative {
                 name: "text_grep",

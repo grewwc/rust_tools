@@ -1,43 +1,5 @@
 [
   {
-    "key": "deepseek-v4-pro-alibaba",
-    "aliases": [
-      "DEEPSEEK_V4_PRO",
-      "deepseek-v4-pro-openai"
-    ],
-    "name": "deepseek-v4-pro",
-    "default_reasoning_effort": "high",
-    "explicit_prompt_cache": true,
-    "adapter": "alibaba",
-    "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-    "quality_tier": "strong",
-    "is_vl": false,
-    "search_enabled": true,
-    "tools_default_enabled": true,
-    "enable_thinking": true,
-    "subagent_priority": 100,
-    "max_output_tokens": 393216
-  },
-  {
-    "key": "deepseek-v4-flash-alibaba",
-    "aliases": [
-      "DEEPSEEK_V4_FLASH",
-      "deepseek-v4-flash-openai"
-    ],
-    "name": "deepseek-v4-flash",
-    "adapter": "alibaba",
-    "endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-    "quality_tier": "strong",
-    "is_vl": false,
-    "search_enabled": true,
-    "tools_default_enabled": true,
-    "enable_thinking": true,
-    "subagent_priority": 100,
-    "default_reasoning_effort": "high",
-    "explicit_prompt_cache": true,
-    "max_output_tokens": 393216
-  },
-  {
     "key": "deepseek-v4-flash-opencode",
     "aliases": [
       "DEEPSEEK_V4_FLASH_OPENCODE"
@@ -275,13 +237,13 @@
     "enable_thinking": true,
     "default_reasoning_effort": "high",
     "subagent_priority": 50,
-    "max_output_tokens": 128000
+    "max_output_tokens": 400000
   },
   {
     "key": "gpt-5.5",
-    "name": "enc:EzbTB6nRyICQM6RdHBEdimefLugA5d9FW8s=",
-    "endpoint": "enc:p+KSErWuX7vgotSWpnySa5SXS0VbZczgTPhl6Sv6+kkBjfSadd0RHPgQKyYTKdDQAwYfBtICkMhRHqve2bivOINp",
-    "api_key_config_key": "enc:FyzsH6+ZM0rHA5RrHRnUcoVGSJ8TnwI=",
+    "name": "enc:IKeEnDgBgytuFsfzJM6c+5qXyVOcgZu1L4s=",
+    "endpoint": "enc:Lh51RHWUngr1mKckIbMUVi3ERzAEh7tTCaVSnQSYA3xW70azwJjgEIAFGxPtDRdXHKSCjZK6CNsLiek=",
+    "api_key_config_key": "enc:SCFOXKeZe4sUmK9SqBGBdX6vHNsQ1Po=",
     "quality_tier": "flagship",
     "adapter": "compatible",
     "is_vl": true,
@@ -289,14 +251,16 @@
     "tools_default_enabled": true,
     "enable_thinking": true,
     "default_reasoning_effort": "high",
+    "reasoning_effort_conflicts_with_tools": false,
     "subagent_priority": 50,
-    "max_output_tokens": 128000
+    "max_output_tokens": 128000,
+    "request_tpm_limit": 500000
   },
   {
     "key": "gpt-5.6-sol",
     "name": "enc:cdQZG4zNvEb7TV9OcEyJnlEuNA==",
-    "endpoint": "enc:p+KSErWuX7vgotSWpnySa5SXS0VbZczgTPhl6Sv6+kkBjfSadd0RHPgQKyYTKdDQAwYfBtICkMhRHqve2bivOINp",
-    "api_key_config_key": "enc:FyzsH6+ZM0rHA5RrHRnUcoVGSJ8TnwI=",
+    "endpoint": "enc:Lh51RHWUngr1mKckIbMUVi3ERzAEh7tTCaVSnQSYA3xW70azwJjgEIAFGxPtDRdXHKSCjZK6CNsLiek=",
+    "api_key_config_key": "enc:0VoPeL7SIkt4/aNkQ0jN/MAAsHK2h1Y=",
     "quality_tier": "flagship",
     "adapter": "compatible",
     "is_vl": true,
@@ -304,7 +268,9 @@
     "tools_default_enabled": true,
     "enable_thinking": true,
     "default_reasoning_effort": "high",
+    "reasoning_effort_conflicts_with_tools": false,
     "subagent_priority": 50,
-    "max_output_tokens": 128000
+    "max_output_tokens": 128000,
+    "request_tpm_limit": 550000
   }
 ]

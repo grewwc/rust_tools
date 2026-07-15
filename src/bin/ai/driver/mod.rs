@@ -45,24 +45,24 @@ use crate::ai::{
 use crate::commonw::configw;
 
 pub mod agent_router;
+mod agent_routing;
+mod background_dispatch;
 pub mod commands;
 pub mod decision_log;
 pub mod embedding;
 pub mod hooks;
 pub mod input;
 pub mod mcp_init;
+mod mcp_lifecycle;
 pub mod model;
 pub mod note_search;
 pub mod observer;
 pub mod print;
+mod process_context;
 pub mod reflection;
+pub mod runtime_ctx;
 mod scheduler;
 mod session;
-mod agent_routing;
-mod mcp_lifecycle;
-mod process_context;
-mod background_dispatch;
-pub mod runtime_ctx;
 pub mod session_pid;
 pub mod signal;
 pub mod skill_match_model;
@@ -73,17 +73,17 @@ pub mod thinking;
 pub mod tools;
 pub mod turn_runtime;
 
+use agent_routing::*;
+use background_dispatch::dispatch_background_batch;
 pub use commands::try_handle_interactive_command;
 pub use mcp_init::*;
+use mcp_lifecycle::*;
 pub use model::*;
-pub use skill_ranking::*;
-pub use text_similarity::*;
+use process_context::*;
 use scheduler::*;
 use session::*;
-use agent_routing::*;
-use mcp_lifecycle::*;
-use process_context::*;
-use background_dispatch::dispatch_background_batch;
+pub use skill_ranking::*;
+pub use text_similarity::*;
 
 tokio::task_local! {
     pub(super) static TASK_PID: Option<u64>;
@@ -128,7 +128,6 @@ impl Drop for BgSubagentGuard {
 pub(crate) fn new_local_kernel() -> aios_kernel::kernel::SharedKernel {
     aios_kernel::kernel::new_shared_kernel(aios_kernel::local::LocalOS::new())
 }
-
 
 fn should_auto_drop_terminated(os: &dyn aios_kernel::kernel::Syscall, pid: u64) -> bool {
     os.get_process(pid)
@@ -186,13 +185,10 @@ pub(super) fn format_rlimit_termination_result(verdict: RlimitVerdict) -> String
 /// 4096 过高：在「字节完全重复才停」与「跑满上限」之间缺乏中段治理，单轮可
 /// 堆出数十万字符上下文。中段断路器（orchestrator 的 iteration soft limit）
 /// 已负责及时收敛，这里作为硬上限收敛到更合理的量级即可。
-const DEFAULT_MAX_ITERATIONS: usize = 2048;
+const DEFAULT_MAX_ITERATIONS: usize = 64;
 
 /// Max iterations for subagent (executor) processes
-const EXECUTOR_MAX_ITERATIONS: usize = 2048;
-
-
-
+const EXECUTOR_MAX_ITERATIONS: usize = 64;
 
 fn one_shot_cli_mode(cli: &cli::ParsedCli) -> bool {
     !cli.args.is_empty() && !cli.interactive
@@ -389,6 +385,7 @@ pub(in crate::ai) async fn run_with_cli(
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
         last_known_prompt_tokens: None,
+        last_known_cached_prompt_tokens: None,
         goal_mode: None,
         last_turn_had_tool_calls: false,
         last_turn_interrupted: false,
@@ -496,7 +493,6 @@ pub(in crate::ai) async fn run_with_cli(
     )
     .await
 }
-
 
 /// 处理一个 foreground ready 进程的恢复执行：构造 wake-up prompt、跑一轮 run_turn、
 /// 然后根据结果走 quota / 终止 / 失败收尾流程。

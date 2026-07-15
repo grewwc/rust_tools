@@ -14,11 +14,11 @@ use crate::ai::history::Message;
 use crate::ai::types::App;
 use crate::commonw::configw;
 
+use super::builder::build_request_body;
 use super::error::{
     api_key_for_request_model, apply_request_auth, control_model_for_aux_tasks,
     endpoint_for_request_model,
 };
-use super::builder::build_request_body;
 use crate::ai::skills::SkillManifest;
 
 pub(crate) fn strip_json_fence(s: &str) -> &str {

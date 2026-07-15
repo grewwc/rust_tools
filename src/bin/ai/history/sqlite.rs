@@ -367,6 +367,11 @@ pub(in crate::ai) fn build_message_arr_sqlite(
          FROM messages
          ORDER BY id ASC",
     )?;
+    let compacted = compact_persisted_history(messages.clone());
+    if compacted != messages {
+        replace_all_messages_sqlite(history_file, &compacted)?;
+    }
+    let messages = compacted;
     if history_count >= messages.len() {
         return Ok(messages);
     }

@@ -3,16 +3,18 @@
 //!
 //! Extracted from `driver/mod.rs` (review Finding #1, Phase 2).
 
-use std::path::PathBuf;
 use std::io::IsTerminal;
+use std::path::PathBuf;
 
 use rustc_hash::FxHashMap;
 use uuid::Uuid;
 
 use crate::ai::{
     cli,
-    history::{SessionStore, SuspendedSessionEntry, SuspendedSessionStore,
-              format_suspended_timestamp_label},
+    history::{
+        SessionStore, SuspendedSessionEntry, SuspendedSessionStore,
+        format_suspended_timestamp_label,
+    },
 };
 
 #[derive(Debug, Clone)]

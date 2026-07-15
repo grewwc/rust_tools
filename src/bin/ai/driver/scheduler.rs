@@ -4,8 +4,8 @@
 //! Extracted from `driver/mod.rs` to establish a clear boundary between
 //! the scheduler and the main run loop (review Finding #1, Phase 2).
 
-use std::sync::{LazyLock, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use rust_tools::cw::SkipMap;
 
@@ -241,7 +241,10 @@ pub(super) fn update_dispatch_meta(
     meta
 }
 
-pub(super) fn maybe_promote_half_open(meta: ProcessDispatchMeta, epoch: u64) -> ProcessDispatchMeta {
+pub(super) fn maybe_promote_half_open(
+    meta: ProcessDispatchMeta,
+    epoch: u64,
+) -> ProcessDispatchMeta {
     if meta.cooldown_until_epoch > 0 && epoch >= meta.cooldown_until_epoch {
         ProcessDispatchMeta {
             cooldown_until_epoch: 0,
@@ -253,7 +256,10 @@ pub(super) fn maybe_promote_half_open(meta: ProcessDispatchMeta, epoch: u64) -> 
     }
 }
 
-pub(super) fn classify_process_outcome(os: &dyn aios_kernel::kernel::Kernel, pid: u64) -> DispatchOutcomeTag {
+pub(super) fn classify_process_outcome(
+    os: &dyn aios_kernel::kernel::Kernel,
+    pid: u64,
+) -> DispatchOutcomeTag {
     let Some(proc) = os.get_process(pid) else {
         return DispatchOutcomeTag::Advanced;
     };
@@ -354,7 +360,10 @@ pub(super) fn publish_background_task_failure(
     super::terminate_and_cleanup(os, pid, format!("Failed: {}", error), true);
 }
 
-pub(super) fn apply_priority_handoff(proc: &mut aios_kernel::kernel::Process, outcome: DispatchOutcomeTag) {
+pub(super) fn apply_priority_handoff(
+    proc: &mut aios_kernel::kernel::Process,
+    outcome: DispatchOutcomeTag,
+) {
     match outcome {
         DispatchOutcomeTag::Advanced => {
             proc.priority = proc.priority.saturating_sub(1);
@@ -457,12 +466,12 @@ pub(super) fn maybe_emit_scheduler_eval(epoch: u64, session_id: &str) {
     let blocked_rate = blocked as f64 / total as f64;
     let healthy = failing_rate < 0.35 && cooling_rate < 0.20;
 
-    crate::ai::driver::print::print_tool_note_line(
-        "scheduler-eval",
-        &format!(
-            "epoch={epoch} total={total} failing={failing} cooling={cooling} blocked={blocked}"
-        ),
-    );
+    // crate::ai::driver::print::print_tool_note_line(
+    //     "scheduler-eval",
+    //     &format!(
+    //         "epoch={epoch} total={total} failing={failing} cooling={cooling} blocked={blocked}"
+    //     ),
+    // );
     log_scheduler_decision(
         session_id,
         epoch,

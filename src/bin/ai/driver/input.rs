@@ -1171,6 +1171,7 @@ mod tests {
                 crate::ai::driver::thinking::ThinkingOrchestrator::new(),
             )],
             last_known_prompt_tokens: None,
+            last_known_cached_prompt_tokens: None,
             goal_mode: None,
             last_turn_had_tool_calls: false,
             last_turn_interrupted: false,
@@ -1700,7 +1701,9 @@ mod tests {
 
     #[test]
     fn history_rewind_cancels_reflection_daemons_and_clears_runtime_state() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let history_path = std::env::temp_dir().join(format!(
             "ai-history-rewind-runtime-{}.sqlite",
             Uuid::new_v4()

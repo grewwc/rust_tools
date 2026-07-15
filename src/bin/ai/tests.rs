@@ -91,6 +91,7 @@ fn test_app_with_cancel_stream(cancel_stream: Arc<AtomicBool>) -> super::types::
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
         last_known_prompt_tokens: None,
+        last_known_cached_prompt_tokens: None,
         goal_mode: None,
         last_turn_had_tool_calls: false,
         last_turn_interrupted: false,
@@ -177,6 +178,7 @@ fn resolve_model_is_unicode_safe() {
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
         last_known_prompt_tokens: None,
+        last_known_cached_prompt_tokens: None,
         goal_mode: None,
         last_turn_had_tool_calls: false,
         last_turn_interrupted: false,
@@ -197,7 +199,9 @@ fn image_files_keep_text_model() {
 
 #[test]
 fn take_stream_cancelled_clears_request_interrupt_futex() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let cancel_stream = Arc::new(AtomicBool::new(true));
     let app = test_app_with_cancel_stream(cancel_stream.clone());
     crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
@@ -219,7 +223,9 @@ fn take_stream_cancelled_clears_request_interrupt_futex() {
 
 #[test]
 fn request_shutdown_sets_request_interrupt_futex() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
     crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();
@@ -236,7 +242,9 @@ fn request_shutdown_sets_request_interrupt_futex() {
 
 #[tokio::test]
 async fn wait_for_interrupt_sources_returns_after_shutdown_request() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
     crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();
@@ -257,7 +265,9 @@ async fn wait_for_interrupt_sources_returns_after_shutdown_request() {
 
 #[tokio::test]
 async fn wait_for_interrupt_sources_returns_after_daemon_cancel() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let app = test_app_with_cancel_stream(Arc::new(AtomicBool::new(false)));
     crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();
@@ -461,6 +471,67 @@ fn history_file_parsing_sqlite_round_trips_structured_messages() {
     assert_eq!(loaded, messages);
 
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn history_file_loading_sanitizes_persisted_assistant_reasoning_and_tool_call_narration() {
+    for ext in ["txt", "sqlite"] {
+        let path =
+            std::env::temp_dir().join(format!("ai-history-{}.{}", uuid::Uuid::new_v4(), ext));
+        let messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: Value::String("inspect this".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String("我先看一下这个文件。".to_string()),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: r#"{"file_path":"src/main.rs"}"#.to_string(),
+                    },
+                }]),
+                tool_call_id: None,
+                reasoning_content: Some("step by step".to_string()),
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Value::String("fn main() {}".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("call_1".to_string()),
+                reasoning_content: None,
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String("done".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: Some("final hidden reasoning".to_string()),
+            },
+        ];
+
+        append_history_messages(&path, &messages).unwrap();
+
+        let loaded = build_message_arr(10, &path).unwrap();
+        assert_eq!(loaded.len(), 4);
+        assert_eq!(loaded[1].content, Value::String(String::new()));
+        assert_eq!(loaded[1].reasoning_content, None);
+        assert_eq!(
+            loaded[1].tool_calls.as_ref().map(|calls| calls.len()),
+            Some(1)
+        );
+        assert_eq!(loaded[2].content, Value::String("fn main() {}".to_string()));
+        assert_eq!(loaded[3].content, Value::String("done".to_string()));
+        assert_eq!(loaded[3].reasoning_content, None);
+
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[test]
@@ -2485,6 +2556,13 @@ fn stream_chunk_extracts_nested_reasoning_delta_text() {
     let payload = r#"{"choices":[{"delta":{"content":"","reasoning":{"type":"reasoning_text","delta":"No"}}}]}"#;
     let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
     assert_eq!(parsed.choices[0].delta.reasoning_content, "No");
+}
+
+#[test]
+fn stream_chunk_extracts_reasoning_summary_object() {
+    let payload = r#"{"choices":[{"delta":{"content":"","reasoning":{"type":"summary","summary":[{"text":"step 1"},{"text":" step 2"}]}}}]}"#;
+    let parsed: StreamChunk = serde_json::from_str(payload).unwrap();
+    assert_eq!(parsed.choices[0].delta.reasoning_content, "step 1 step 2");
 }
 
 #[test]

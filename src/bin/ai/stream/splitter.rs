@@ -514,7 +514,9 @@ impl AnthropicXmlToolCallStreamer {
 enum BareXmlPhase {
     #[default]
     Idle,
-    InBody { name: String },
+    InBody {
+        name: String,
+    },
 }
 
 /// 裸工具名 XML：`<execute_command>pwd</execute_command>`。
@@ -1126,7 +1128,12 @@ mod tests {
         let mut s = BareXmlToolCallStreamer::new();
         let mut all_cleaned = String::new();
         let mut all_events = Vec::new();
-        for chunk in ["前缀 <", "execute_command>", "pwd</execute_", "command> 后缀"] {
+        for chunk in [
+            "前缀 <",
+            "execute_command>",
+            "pwd</execute_",
+            "command> 后缀",
+        ] {
             let (cleaned, events) = s.push(chunk);
             all_cleaned.push_str(&cleaned);
             all_events.extend(events);

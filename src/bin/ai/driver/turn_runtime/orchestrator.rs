@@ -516,10 +516,32 @@ enum TaskIntent {
 /// 免费额度仍有 `PROGRESS_FREE_EXPLORE_ROUNDS` 轮兜底，误判代价只是「稍早一点
 /// 被提醒收敛」，而漏判会让真正的只读风暴逃逸。
 const MUTATION_INTENT_KEYWORDS: &[&str] = &[
-    "去掉", "删除", "删掉", "移除", "修改", "改成", "改为", "新增", "添加",
-    "重构", "修复", "实现", "替换", "加上", "加个", "去除",
-    "remove", "delete", "modify", "refactor", "implement", "replace",
-    "add ", "fix", "rename", "migrate",
+    "去掉",
+    "删除",
+    "删掉",
+    "移除",
+    "修改",
+    "改成",
+    "改为",
+    "新增",
+    "添加",
+    "重构",
+    "修复",
+    "实现",
+    "替换",
+    "加上",
+    "加个",
+    "去除",
+    "remove",
+    "delete",
+    "modify",
+    "refactor",
+    "implement",
+    "replace",
+    "add ",
+    "fix",
+    "rename",
+    "migrate",
 ];
 
 /// 从用户问题粗分类任务意图。空 / 未命中关键词 → ReadOnly（保守，保留自由）。
@@ -563,7 +585,9 @@ fn extract_round_targets(messages: &[crate::ai::history::Message]) -> Vec<String
         let Ok(args) = serde_json::from_str::<Value>(tc.function.arguments.as_str()) else {
             continue;
         };
-        let Some(map) = args.as_object() else { continue };
+        let Some(map) = args.as_object() else {
+            continue;
+        };
         for key in ["path", "file_path", "pattern", "query"] {
             if let Some(s) = map.get(key).and_then(|v| v.as_str()) {
                 targets.push(format!("{}:{}", tc.function.name, s.trim()));
@@ -587,9 +611,7 @@ fn content_fingerprint(s: &str) -> u64 {
 
 /// 提取最近一轮 assistant 的 reasoning 指纹（若有）。软提示后 reasoning 指纹
 /// 变化视为「给出了新理由」，触发 grace 宽限。
-fn extract_round_reasoning_fingerprint(
-    messages: &[crate::ai::history::Message],
-) -> Option<u64> {
+fn extract_round_reasoning_fingerprint(messages: &[crate::ai::history::Message]) -> Option<u64> {
     let last_assistant = messages.iter().rev().find(|m| m.role == "assistant")?;
     let reasoning = last_assistant.reasoning_content.as_ref()?;
     if reasoning.trim().is_empty() {
@@ -1211,7 +1233,11 @@ mod tests {
         let mut signals = Vec::new();
         for i in 0..TOOL_LOOP_HARD_WINDOW {
             messages.push(assistant_with_same_read(&format!("tc-{i}")));
-            signals.push(supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS));
+            signals.push(supervisor.record_tool_signatures(
+                &messages,
+                "",
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            ));
         }
         assert!(
             signals[..TOOL_LOOP_SOFT_WINDOW - 1]
@@ -1277,7 +1303,8 @@ mod tests {
         // 第二轮：恢复后重新积累，验证 soft 能再次触发。
         for i in 0..TOOL_LOOP_SOFT_WINDOW {
             messages.push(assistant_with_read(&format!("tc2-{i}")));
-            let signal = supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
+            let signal =
+                supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
             if i == TOOL_LOOP_SOFT_WINDOW - 1 {
                 // 第 4 次应触发 soft。
                 assert!(matches!(signal, ToolLoopSignal::Soft));
@@ -1290,7 +1317,8 @@ mod tests {
         // 继续积累到 hard 触发，验证完整升级阶梯恢复。
         for i in 0..(TOOL_LOOP_HARD_WINDOW - TOOL_LOOP_SOFT_WINDOW) {
             messages.push(assistant_with_read(&format!("tc3-{i}")));
-            let signal = supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
+            let signal =
+                supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
             if i == (TOOL_LOOP_HARD_WINDOW - TOOL_LOOP_SOFT_WINDOW - 1) {
                 // 第 6 次应触发 hard。
                 assert!(matches!(signal, ToolLoopSignal::Hard));
@@ -1337,7 +1365,9 @@ mod tests {
         s.iteration = LONG_LOOP_COMPRESS_ITERATION_THRESHOLD - 1;
         assert_eq!(s.effective_mid_turn_soft_threshold(base), base);
         // 此时 ~120K 历史（< 135K 基准）不触发压缩——正是旧行为的空窗。
-        assert!(!s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base)));
+        assert!(
+            !s.should_try_mid_turn_compress(120_000, s.effective_mid_turn_soft_threshold(base))
+        );
 
         // 长循环（达阈值）：有效阈值降到 FLOOR，同样 ~120K 历史立即触发压缩。
         s.iteration = LONG_LOOP_COMPRESS_ITERATION_THRESHOLD;
@@ -1427,7 +1457,11 @@ mod tests {
         let mut signals = Vec::new();
         for i in 0..TOOL_LOOP_COARSE_WINDOW {
             messages.push(assistant_paging_read(&format!("tc-{i}"), i * 80));
-            signals.push(supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS));
+            signals.push(supervisor.record_tool_signatures(
+                &messages,
+                "",
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            ));
         }
         assert!(
             signals[..TOOL_LOOP_COARSE_WINDOW - 1]
@@ -1475,7 +1509,8 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
             });
-            let signal = supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
+            let signal =
+                supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
             if i < TOOL_LOOP_COARSE_WINDOW - 1 {
                 assert!(matches!(signal, ToolLoopSignal::None));
             } else {
@@ -1515,7 +1550,11 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
             });
-            signals.push(supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS));
+            signals.push(supervisor.record_tool_signatures(
+                &messages,
+                "",
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            ));
         }
         assert!(
             signals[..TOOL_LOOP_COARSE_WINDOW - 1]
@@ -1938,13 +1977,17 @@ async fn run_turn_body(
             // 字符估算偏保守（高估），服务端的实际值更准确，能减少不必要的钳小。
             let usage_prompt = match &execution {
                 IterationExecution::Truncated(sr) | IterationExecution::FinalResponse(sr) => {
-                    Some(sr.usage_prompt_tokens)
+                    Some((sr.usage_prompt_tokens, sr.usage_cached_prompt_tokens))
                 }
-                IterationExecution::ToolCall(tce) => Some(tce.stream_result.usage_prompt_tokens),
+                IterationExecution::ToolCall(tce) => Some((
+                    tce.stream_result.usage_prompt_tokens,
+                    tce.stream_result.usage_cached_prompt_tokens,
+                )),
                 _ => None,
             };
-            if let Some(pt) = usage_prompt.filter(|&v| v > 0) {
+            if let Some((pt, cached)) = usage_prompt.filter(|(pt, _)| *pt > 0) {
                 app.last_known_prompt_tokens = Some(pt);
+                app.last_known_cached_prompt_tokens = Some(cached.min(pt));
             }
             // 空响应重试计数：连续 >2 次空响应则放弃，避免浪费迭代预算
             if matches!(execution, IterationExecution::EmptyResponse) {
@@ -2297,7 +2340,11 @@ async fn run_turn_body(
                     "progress-budget: still no progress, requesting explicit decision ledger",
                 );
                 inject_progress_ledger_note(&mut messages);
-                supervisor.maybe_inject_task_anchor(&mut messages, &question, "low-progress-ledger");
+                supervisor.maybe_inject_task_anchor(
+                    &mut messages,
+                    &question,
+                    "low-progress-ledger",
+                );
             }
             ToolLoopSignal::LowProgressHard => {
                 crate::ai::driver::print::print_tool_note_line(
@@ -2305,7 +2352,11 @@ async fn run_turn_body(
                     "progress-budget hard-stop: switching to no-tool handoff",
                 );
                 inject_low_progress_hard_stop_note(&mut messages);
-                supervisor.maybe_inject_task_anchor(&mut messages, &question, "low-progress-hard-stop");
+                supervisor.maybe_inject_task_anchor(
+                    &mut messages,
+                    &question,
+                    "low-progress-hard-stop",
+                );
                 force_final_response = true;
             }
         }

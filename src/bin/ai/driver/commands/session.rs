@@ -794,6 +794,7 @@ mod tests {
                 crate::ai::driver::thinking::ThinkingOrchestrator::new(),
             )],
             last_known_prompt_tokens: None,
+            last_known_cached_prompt_tokens: None,
             goal_mode: None,
             last_turn_had_tool_calls: false,
             last_turn_interrupted: false,
@@ -803,7 +804,9 @@ mod tests {
 
     #[test]
     fn sessions_new_clears_session_local_runtime_state() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let root = test_history_root();
         let mut app = test_app(&root);
         if let Some(ctx) = app.agent_context.as_mut() {
@@ -837,7 +840,9 @@ mod tests {
 
     #[test]
     fn sessions_branch_also_clears_stale_skill_bias_and_explicit_tools() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let root = test_history_root();
         let mut app = test_app(&root);
         let store = SessionStore::new(app.config.history_file.as_path());
@@ -877,7 +882,9 @@ mod tests {
 
     #[test]
     fn sessions_suspend_persists_entry_and_requests_shutdown() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let root = test_history_root();
         let suspended_root = root.join("suspended");
         unsafe {
@@ -906,7 +913,9 @@ mod tests {
 
     #[test]
     fn sessions_bound_lists_current_terminal_entries_without_consuming_them() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let root = test_history_root();
         let suspended_root = root.join("suspended");
         unsafe {
@@ -953,7 +962,9 @@ mod tests {
 
     #[test]
     fn export_import_archive_roundtrip_preserves_messages() {
-        let _guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        let _guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let root = test_history_root();
         let app = test_app(&root);
         let store = SessionStore::new(app.config.history_file.as_path());

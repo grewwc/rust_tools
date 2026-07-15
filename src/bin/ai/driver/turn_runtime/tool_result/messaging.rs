@@ -180,7 +180,9 @@ pub(super) fn append_tool_result_messages(
         reasoning_content: (!stream_reasoning_text.is_empty())
             .then(|| stream_reasoning_text.to_string()),
     };
-    append_message_pair(messages, turn_messages, assistant_msg);
+    messages.push(assistant_msg.clone());
+    turn_messages
+        .push(crate::ai::history::compress::sanitize_message_for_persisted_history(&assistant_msg));
 
     for (tool_call, result) in exec_result
         .executed_tool_calls
@@ -422,7 +424,9 @@ pub(super) fn record_final_stream_response(
         reasoning_content: (!stream_result.reasoning_text.is_empty())
             .then(|| stream_result.reasoning_text.clone()),
     };
-    append_message_pair(messages, turn_messages, assistant_msg);
+    messages.push(assistant_msg.clone());
+    turn_messages
+        .push(crate::ai::history::compress::sanitize_message_for_persisted_history(&assistant_msg));
     *final_assistant_text = stream_result.assistant_text;
     *final_assistant_recorded = true;
     record_hidden_self_note(app, turn_messages, &remaining_meta);

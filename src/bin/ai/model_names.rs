@@ -50,6 +50,11 @@ pub struct ModelDef {
     /// 真实上限的值可缓解截断；缺省（None）时不下发 `max_tokens`，沿用历史行为。
     #[serde(default, alias = "max_tokens", alias = "max_completion_tokens")]
     pub max_output_tokens: Option<u32>,
+    /// 可选：请求层的 prompt-token-per-minute 预检预算。仅当 `models.json`
+    /// 显式配置此字段时，请求层才会在发送前等待；未配置（或为 0）则完全跳过
+    /// TPM 预检，避免用错误的默认值误伤不同 provider / key。
+    #[serde(default)]
+    pub request_tpm_limit: Option<u64>,
     /// 子 agent 模型选择优先级（越大越优先）。同 tier 内按此值降序排列。
     /// 缺省为 0，用户可在 ~/.config/rust_tools/models.json 中覆盖以调整偏好，
     /// 无需重新编译。
@@ -71,6 +76,15 @@ pub struct ModelDef {
         deserialize_with = "deserialize_default_reasoning_effort"
     )]
     pub reasoning_effort: Option<ReasoningEffort>,
+
+    /// 该模型的 `reasoning_effort` 与请求体中的 `tools` 参数不兼容。
+    /// 部分网关（如 bytedance modelhub）在 `/v1/chat/completions` 上拒绝
+    /// 二者同时出现，返回 400 "Function tools with reasoning_effort are not
+    /// supported"。设为 true 时，请求层在检测到 tools 非空时自动省略
+    /// `reasoning_effort` 字段以避免 400；无 tools 的请求仍正常携带该字段，
+    /// 保留 thinking 能力。
+    #[serde(default)]
+    pub reasoning_effort_conflicts_with_tools: bool,
 }
 
 /// 从字符串反序列化推理强度档位；接受 `auto` / `none` / `off` 等字面量作为

@@ -79,7 +79,10 @@ pub(super) fn format_wakeup_prompt(pid: u64, goal: &str, messages: &[String]) ->
 /// 返回 `(should_terminate, termination_result)`，由调用方决定是否真的调用
 /// `terminate_and_cleanup`，从而保留 foreground / background 各自后续的特殊处理
 /// （如 round-robin requeue 等）。
-pub(super) fn finalize_turn_quota(os: &mut dyn aios_kernel::kernel::Kernel, pid: u64) -> (bool, String) {
+pub(super) fn finalize_turn_quota(
+    os: &mut dyn aios_kernel::kernel::Kernel,
+    pid: u64,
+) -> (bool, String) {
     let verdict = os.rusage_charge(
         pid,
         ResourceUsageDelta {

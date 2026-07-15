@@ -1,8 +1,8 @@
-use super::*;
 use super::builder::MIN_OUTPUT_TOKENS_FLOOR;
-use serde_json::Value;
+use super::*;
 use crate::ai::tools::os_tools::{GLOBAL_OS, init_os_tools_globals};
 use crate::ai::{cli::ParsedCli, types::AppConfig};
+use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::{Arc, atomic::AtomicBool};
 
@@ -113,9 +113,51 @@ fn tpm_budget_allows_oversized_single_request_after_bucket_drains() {
 }
 
 #[test]
-fn tpm_budget_reservation_charges_safety_margin_and_physical_sends() {
-    assert_eq!(token_budget::test_reservation_tokens(10_000, 1), 12_000);
-    assert_eq!(token_budget::test_reservation_tokens(10_000, 3), 36_000);
+fn tpm_budget_reservation_charges_physical_sends_without_extra_multiplier() {
+    assert_eq!(token_budget::test_reservation_tokens(10_000, 1), 10_000);
+    assert_eq!(token_budget::test_reservation_tokens(10_000, 3), 30_000);
+}
+
+#[test]
+fn tpm_budget_calibrates_overestimated_char_count_with_server_prompt_usage() {
+    // 字符估算常会高估英文代码/schema token；服务端上一轮 usage 可把预算拉回真实区间。
+    assert_eq!(
+        token_budget::calibrate_prompt_tokens_for_budget(46_342, Some(25_875), None),
+        25_875
+    );
+    // 但 known 太低时仍保留字符估算的一半作为地板，避免本轮新增大工具结果后低估。
+    assert_eq!(
+        token_budget::calibrate_prompt_tokens_for_budget(46_342, Some(10_000), None),
+        23_171
+    );
+    // known 太高通常来自压缩前旧值，不应让限速继续按旧高值误等待。
+    assert_eq!(
+        token_budget::calibrate_prompt_tokens_for_budget(46_342, Some(120_000), None),
+        46_342
+    );
+}
+
+#[test]
+fn tpm_budget_discount_cached_prompt_tokens_from_previous_request() {
+    // 上一轮 77,370 prompt token 里有 77,184 命中 cache，本轮预算应主要计新增尾巴。
+    assert_eq!(
+        token_budget::calibrate_prompt_tokens_for_budget(81_370, Some(77_370), Some(77_184)),
+        4_186
+    );
+    // 若当前估算比上一轮更短，至少保留上一轮未缓存部分，避免估成 0。
+    assert_eq!(
+        token_budget::calibrate_prompt_tokens_for_budget(40_000, Some(77_370), Some(77_184)),
+        186
+    );
+}
+
+#[test]
+fn tpm_budget_bucket_key_distinguishes_api_keys_without_exposing_plaintext() {
+    let a = token_budget::test_budget_key("https://api.example.com", "model-x", "key-a");
+    let b = token_budget::test_budget_key("https://api.example.com", "model-x", "key-b");
+    assert_ne!(a, b);
+    assert!(!a.contains("key-a"));
+    assert!(!b.contains("key-b"));
 }
 
 #[test]
@@ -306,6 +348,7 @@ fn test_app() -> App {
             crate::ai::driver::thinking::ThinkingOrchestrator::new(),
         )],
         last_known_prompt_tokens: None,
+        last_known_cached_prompt_tokens: None,
         goal_mode: None,
         last_turn_had_tool_calls: false,
         last_turn_interrupted: false,
@@ -442,7 +485,9 @@ fn thinking_gate_uses_latest_user_message_only() {
 
 #[tokio::test]
 async fn sleep_with_cancel_observes_request_interrupt_source() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let app = test_app();
     init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();
@@ -465,7 +510,9 @@ async fn sleep_with_cancel_observes_request_interrupt_source() {
 
 #[test]
 fn clears_stale_interrupt_for_new_request_but_keeps_active_cancel() {
-    let _signal_guard = crate::ai::test_support::ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+    let _signal_guard = crate::ai::test_support::ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
     let app = test_app();
     init_os_tools_globals(app.os.clone());
     crate::ai::driver::signal::clear_request_interrupt();
@@ -727,6 +774,55 @@ fn opencode_deepseek_aux_reasoning_effort_omits_disabled_thinking_object() {
     assert!(thinking.is_empty());
     assert_eq!(top_level_reasoning_effort, Some("high"));
     assert!(nested_reasoning.is_none());
+}
+
+#[test]
+fn modelhub_models_support_reasoning_with_tools_via_responses() {
+    for model in ["gpt-5.5", "gpt-5.6-sol"] {
+        assert!(!models::reasoning_effort_conflicts_with_tools(model));
+        assert!(models::endpoint_for_model(model, "").ends_with("/v1/responses"));
+    }
+}
+
+#[test]
+fn responses_request_body_uses_function_tools_and_nested_reasoning() {
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("hi".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let tools = json!([{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {"type": "object"}
+        }
+    }]);
+    let request = build_request_body(
+        "gpt-5.5",
+        &messages,
+        false,
+        false,
+        None,
+        Some(tools),
+        None,
+        Some("high"),
+        None,
+        None,
+    );
+
+    let body = super::builder::build_responses_request_body(&request);
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(body["tools"][0]["name"], "get_weather");
+    assert!(body.get("messages").is_none());
+    assert!(body.get("reasoning_effort").is_none());
+    assert_eq!(body["input"][0]["role"], "user");
+    assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    assert_eq!(body["input"][0]["content"][0]["text"], "hi");
 }
 
 #[test]
@@ -1506,6 +1602,66 @@ fn alibaba_image_content_also_uses_object_image_url_shape() {
             .and_then(|v| v.as_str())
             .map(|s| s.starts_with("data:image/png;base64,"))
             .unwrap_or(false)
+    );
+}
+
+#[test]
+fn responses_request_body_converts_chat_multimodal_content_to_input_items() {
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::Array(vec![
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": "data:image/png;base64,AAAA" }
+            }),
+            serde_json::json!({
+                "type": "text",
+                "text": "please explain"
+            }),
+        ]),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    let request = RequestBody {
+        model: "gpt-test".to_string(),
+        messages: &messages,
+        stream: false,
+        thinking: serde_json::Map::new(),
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: None,
+        reasoning: None,
+        stream_options: None,
+        max_tokens: None,
+    };
+
+    let body = super::builder::build_responses_request_body(&request);
+    let content = body
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("content"))
+        .and_then(Value::as_array)
+        .expect("responses body should contain array content");
+
+    assert_eq!(
+        content[0].get("type").and_then(Value::as_str),
+        Some("input_image")
+    );
+    assert_eq!(
+        content[0].get("image_url").and_then(Value::as_str),
+        Some("data:image/png;base64,AAAA")
+    );
+    assert_eq!(
+        content[1].get("type").and_then(Value::as_str),
+        Some("input_text")
+    );
+    assert_eq!(
+        content[1].get("text").and_then(Value::as_str),
+        Some("please explain")
     );
 }
 

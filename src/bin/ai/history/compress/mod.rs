@@ -245,7 +245,38 @@ pub(in crate::ai) fn compress_messages_for_context(
     shrink_messages_to_fit_with_summary(out, max_chars, summary_max_chars, overflow_dir.as_deref())
 }
 
+pub(in crate::ai) fn sanitize_message_for_persisted_history(message: &Message) -> Message {
+    let mut sanitized = message.clone();
+    if sanitized.role != "assistant" {
+        return sanitized;
+    }
+
+    // 持久化历史只保留跨 turn 真正需要的 assistant 事实：
+    // - `reasoning_content` 对后续请求没有必要保留原文，provider 需要字段形状时
+    //   由 request 层统一补空字符串；
+    // - 带 tool_calls 的 assistant narration 属于"本轮过程性话术"，真正的地面真相
+    //   是结构化 tool_calls + tool 结果，持久化该 narration 会让单个 user turn
+    //   膨胀成几十/几百条低价值 assistant 噪音。
+    sanitized.reasoning_content = None;
+    if sanitized
+        .tool_calls
+        .as_ref()
+        .is_some_and(|tool_calls| !tool_calls.is_empty())
+    {
+        sanitized.content = Value::String(String::new());
+    }
+    sanitized
+}
+
+fn sanitize_persisted_history_messages(messages: Vec<Message>) -> Vec<Message> {
+    messages
+        .into_iter()
+        .map(|message| sanitize_message_for_persisted_history(&message))
+        .collect()
+}
+
 pub(in crate::ai) fn compact_persisted_history(messages: Vec<Message>) -> Vec<Message> {
+    let messages = sanitize_persisted_history_messages(messages);
     let user_turns = messages
         .iter()
         .filter(|message| message.role == "user")
@@ -302,6 +333,7 @@ async fn compact_persisted_history_with_app_inner(
     messages: Vec<Message>,
     threshold_turns: usize,
 ) -> Vec<Message> {
+    let messages = sanitize_persisted_history_messages(messages);
     let user_turns = messages
         .iter()
         .filter(|message| message.role == "user")

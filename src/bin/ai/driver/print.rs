@@ -4,8 +4,8 @@ use crate::ai::{
     mcp::McpClient,
     skills::SkillManifest,
     theme::{
-        ACCENT_COMMAND, ACCENT_DANGER, ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE,
-        ACCENT_SECONDARY, ACCENT_SUCCESS, ACCENT_WARN, BOLD, DIM, RESET,
+        ACCENT_COMMAND, ACCENT_DANGER, ACCENT_MUTED, ACCENT_PRIMARY, ACCENT_RULE, ACCENT_SECONDARY,
+        ACCENT_SUCCESS, ACCENT_WARN, BOLD, DIM, RESET,
     },
     types::App,
 };
@@ -405,8 +405,8 @@ mod tests {
         format_tool_header, format_tool_output_block, format_tool_output_line,
         format_tool_output_prefix, sanitize_for_terminal,
     };
-    use crate::ai::theme::ACCENT_COMMAND;
     use crate::ai::driver::model::{OcrExtraction, OcrImageSummary};
+    use crate::ai::theme::ACCENT_COMMAND;
 
     fn strip_ansi_for_test(s: &str) -> String {
         let mut out = String::with_capacity(s.len());
