@@ -15,6 +15,8 @@
 
 use std::io::Write;
 
+use rustc_hash::FxHashSet;
+
 use crate::ai::{mcp::SharedMcpClient, types::App};
 
 use super::{
@@ -56,6 +58,28 @@ const TOOL_ITERATION_SOFT_LIMIT: usize = 128;
 /// 连续「流读取中断型」截断（stream_error）的重试上限。超过即放弃本 turn，
 /// 避免服务端持续断流时无限重试（尤其后台任务的 max_iterations = usize::MAX）。
 const MAX_STREAM_ERROR_RETRIES: usize = 16;
+
+/// === Progress Budget（意图感知的进展预算）===
+/// 这是叠加在 exact / coarse 循环检测之上的第三层，用于治理「参数每轮都变、
+/// 但整体不推进任务」的发散型 loop——前两层按「签名重复」判定，结构上抓不到
+/// 每轮都在搜新符号 / 读新文件却始终零收敛的膨胀（真实案例：一个「删除方法」
+/// 的变更请求连续 60+ 轮只 read_file/text_grep、零 apply_patch）。
+///
+/// 核心理念：不按「动作次数」计费，按「信息增益 / 意图对齐度」计费。早期探索
+/// 几乎免费；越往后，「继续但没进展」越要付出显式理由。惩罚对象是「说不出理由
+/// 的无进展重复」，而非探索本身。
+///
+/// 免费探索轮数：达到该轮次前，即使连续无进展也完全不打扰（删代码前先定位、
+/// 陌生代码库先摸索都是正常的）。
+const PROGRESS_FREE_EXPLORE_ROUNDS: usize = 20;
+/// 宽限窗口：软提示后，若模型给出了「实质不同的理由」（新目标 / reasoning 指纹
+/// 变化），则在该窗口内不升级，给它继续探索的空间。
+const PROGRESS_GRACE_WINDOW: usize = 6;
+/// 从「软提示 / 记账」升级到「硬停收口」额外需要的连续无进展轮数。
+const PROGRESS_NO_PROGRESS_HARD_MARGIN: usize = 3;
+/// 变更类工具：对 Mutation 意图的任务，只有这些动作（或产出 final text）才算
+/// 「任务收敛」，纯读取 / 检索无论目标多新都不计进展。
+const MUTATION_TOOL_NAMES: &[&str] = &["apply_patch", "write_file", "delete_path"];
 
 /// 单轮工具迭代软阈值：取 max_iterations 的一半与绝对上限的较小值，保证一定
 /// 早于硬上限触发；对默认 2048 这类超大 ceiling，也要在明显失控前提醒收敛。
@@ -461,6 +485,117 @@ fn detect_execute_command_coarse_loop(history: &[Vec<String>], window: usize) ->
     signature_set_is_execute_command_only(&tail[0])
 }
 
+/// 用户请求的粗粒度意图。决定「进展」怎么计费：Mutation 任务只有真正改动了
+/// 世界（或给出结论）才算收敛，纯读取不算；ReadOnly 任务按信息增益宽松判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum TaskIntent {
+    /// 需要改代码 / 改世界（去掉、删除、修改、新增、重构、修复……）。
+    Mutation,
+    /// 解释 / 分析 / 查找 / 只读问答。默认归入此类，保留最大探索自由。
+    #[default]
+    ReadOnly,
+}
+
+/// Mutation 意图关键词（中英）。命中任意一个即判为变更类任务。
+/// 只做粗分类：宁可把个别 ReadOnly 误判为 Mutation 也不反向——因为 Mutation 的
+/// 免费额度仍有 `PROGRESS_FREE_EXPLORE_ROUNDS` 轮兜底，误判代价只是「稍早一点
+/// 被提醒收敛」，而漏判会让真正的只读风暴逃逸。
+const MUTATION_INTENT_KEYWORDS: &[&str] = &[
+    "去掉", "删除", "删掉", "移除", "修改", "改成", "改为", "新增", "添加",
+    "重构", "修复", "实现", "替换", "加上", "加个", "去除",
+    "remove", "delete", "modify", "refactor", "implement", "replace",
+    "add ", "fix", "rename", "migrate",
+];
+
+/// 从用户问题粗分类任务意图。空 / 未命中关键词 → ReadOnly（保守，保留自由）。
+fn classify_task_intent(question: &str) -> TaskIntent {
+    let q = question.to_lowercase();
+    if MUTATION_INTENT_KEYWORDS
+        .iter()
+        .any(|kw| q.contains(&kw.to_lowercase()))
+    {
+        TaskIntent::Mutation
+    } else {
+        TaskIntent::ReadOnly
+    }
+}
+
+/// 判断最近一轮 assistant 是否调用了变更类工具（apply_patch/write_file/delete_path）。
+fn round_has_mutation(messages: &[crate::ai::history::Message]) -> bool {
+    let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
+        return false;
+    };
+    let Some(tool_calls) = last_assistant.tool_calls.as_ref() else {
+        return false;
+    };
+    tool_calls
+        .iter()
+        .any(|tc| MUTATION_TOOL_NAMES.contains(&tc.function.name.as_str()))
+}
+
+/// 提取最近一轮 assistant 触碰的「目标资源」集合：文件路径 / 检索 pattern /
+/// 命令首 token。用于 ReadOnly 任务判定「是否碰了新目标」= 信息增益。
+fn extract_round_targets(messages: &[crate::ai::history::Message]) -> Vec<String> {
+    use serde_json::Value;
+    let Some(last_assistant) = messages.iter().rev().find(|m| m.role == "assistant") else {
+        return Vec::new();
+    };
+    let Some(tool_calls) = last_assistant.tool_calls.as_ref() else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for tc in tool_calls.iter() {
+        let Ok(args) = serde_json::from_str::<Value>(tc.function.arguments.as_str()) else {
+            continue;
+        };
+        let Some(map) = args.as_object() else { continue };
+        for key in ["path", "file_path", "pattern", "query"] {
+            if let Some(s) = map.get(key).and_then(|v| v.as_str()) {
+                targets.push(format!("{}:{}", tc.function.name, s.trim()));
+            }
+        }
+        if let Some(cmd) = map.get("command").and_then(|v| v.as_str()) {
+            let head = cmd.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+            targets.push(format!("{}:{}", tc.function.name, head));
+        }
+    }
+    targets
+}
+
+/// 稳定的 64-bit 内容指纹（用于判定 reasoning / 结果是否实质变化）。
+fn content_fingerprint(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    s.trim().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// 提取最近一轮 assistant 的 reasoning 指纹（若有）。软提示后 reasoning 指纹
+/// 变化视为「给出了新理由」，触发 grace 宽限。
+fn extract_round_reasoning_fingerprint(
+    messages: &[crate::ai::history::Message],
+) -> Option<u64> {
+    let last_assistant = messages.iter().rev().find(|m| m.role == "assistant")?;
+    let reasoning = last_assistant.reasoning_content.as_ref()?;
+    if reasoning.trim().is_empty() {
+        return None;
+    }
+    Some(content_fingerprint(reasoning))
+}
+
+/// 递减的「无进展」软阈值：越往后越严。免费探索区内返回 usize::MAX（永不触发）。
+fn no_progress_soft_threshold(iteration: usize, free_explore_rounds: usize) -> usize {
+    if iteration <= free_explore_rounds {
+        return usize::MAX;
+    }
+    let over = iteration - free_explore_rounds;
+    match over {
+        0..=20 => 5,
+        21..=40 => 3,
+        _ => 2,
+    }
+}
+
 fn truncate_chars(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
@@ -509,6 +644,7 @@ struct TurnSupervisor {
     last_compress_after_chars: usize,
     tool_signature_history: Vec<Vec<String>>,
     tool_signature_history_coarse: Vec<Vec<String>>,
+    progress: ProgressLedger,
 }
 
 enum ToolLoopSignal {
@@ -519,6 +655,46 @@ enum ToolLoopSignal {
     CoarseHard,
     Soft,
     Hard,
+    /// Progress Budget 第一级：连续多轮无信息增益 / 意图不对齐（Mutation 任务
+    /// 只读不写），注入反思式软提示，不阻断工具。
+    LowProgressSoft,
+    /// Progress Budget 第二级：软提示后仍无进展，要求写下轻量决策账本
+    /// （已确认事实 / 待解决问题 / 候选与已排除分支），仍不硬阻断。
+    LowProgressLedger,
+    /// Progress Budget 第三级：软提示 + 记账后仍连续无进展，切换无工具收口模式。
+    LowProgressHard,
+}
+
+/// Progress Budget 的运行时状态。挂在 `TurnSupervisor` 上，按「信息增益 /
+/// 意图对齐度」而非动作次数计费；只惩罚「说不出理由的无进展重复」。
+#[derive(Default)]
+struct ProgressLedger {
+    /// 本 turn 的任务意图（首轮由 `classify_task_intent` 定，后续沿用）。
+    intent: TaskIntent,
+    intent_initialized: bool,
+    /// 累计触碰过的目标资源（ReadOnly 任务的「新目标 = 信息增益」判定）。
+    seen_targets: FxHashSet<String>,
+    /// 连续无进展轮数。任意一轮判定为 Progress 即清零。
+    consecutive_no_progress: usize,
+    /// 上一轮 reasoning 指纹（软提示后指纹变化 → 视为给出新理由 → grace 宽限）。
+    last_reasoning_fp: Option<u64>,
+    /// grace 宽限截止迭代号：在此之前不升级，给模型继续探索的空间。
+    grace_until_iteration: usize,
+    soft_injected: bool,
+    ledger_injected: bool,
+    hard_injected: bool,
+}
+
+impl ProgressLedger {
+    fn reset_for_truncation(&mut self) {
+        // 截断重试期间的重复读取是预期行为，清空无进展计数与一次性标志，
+        // 与 exact/coarse 检测的 mark_truncation_skip 语义保持一致。
+        self.consecutive_no_progress = 0;
+        self.soft_injected = false;
+        self.ledger_injected = false;
+        self.hard_injected = false;
+        self.grace_until_iteration = 0;
+    }
 }
 
 impl TurnSupervisor {
@@ -556,11 +732,14 @@ impl TurnSupervisor {
         self.hard_loop_stop_injected = false;
         self.loop_breaker_injected = false;
         self.coarse_loop_note_injected = false;
+        self.progress.reset_for_truncation();
     }
 
     fn record_tool_signatures(
         &mut self,
         messages: &[crate::ai::history::Message],
+        question: &str,
+        free_explore_rounds: usize,
     ) -> ToolLoopSignal {
         // 截断重试跳过：清空历史后不记录本轮签名，避免截断重试
         // 被误判为工具循环。`skip_tool_signature_rounds` 由
@@ -613,6 +792,95 @@ impl TurnSupervisor {
         {
             self.coarse_loop_note_injected = true;
             return ToolLoopSignal::Coarse;
+        }
+        // exact/coarse 均未命中「签名重复」型循环时，交给 Progress Budget 补位：
+        // 抓「参数每轮都变、但整体不推进任务」的发散型 loop。
+        self.assess_progress(messages, question, free_explore_rounds)
+    }
+
+    /// Progress Budget 判定（意图感知）：按「信息增益 / 意图对齐度」而非动作次数
+    /// 计费。只在 exact/coarse 签名检测未命中时补位调用。
+    ///
+    /// - Mutation 任务：只有变更类动作（apply_patch/write_file/delete_path）才算
+    ///   收敛；纯读取 / 检索无论目标多新都不计进展。
+    /// - ReadOnly 任务：触碰到新目标资源即算信息增益，保留最大探索自由。
+    ///
+    /// 免费探索区（iteration <= free_explore_rounds）内完全不计费；退出后按递减
+    /// 阈值升级：软提示 → 记账 → 硬停。软提示后若模型给出「实质不同的理由」
+    /// （reasoning 指纹变化）则进入 grace 宽限，不升级。
+    fn assess_progress(
+        &mut self,
+        messages: &[crate::ai::history::Message],
+        question: &str,
+        free_explore_rounds: usize,
+    ) -> ToolLoopSignal {
+        if !self.progress.intent_initialized {
+            self.progress.intent = classify_task_intent(question);
+            self.progress.intent_initialized = true;
+        }
+
+        // 本轮是否推进了任务（意图相关）。
+        let made_progress = match self.progress.intent {
+            TaskIntent::Mutation => round_has_mutation(messages),
+            TaskIntent::ReadOnly => {
+                let targets = extract_round_targets(messages);
+                let mut novel = false;
+                for t in targets {
+                    if self.progress.seen_targets.insert(t) {
+                        novel = true;
+                    }
+                }
+                novel
+            }
+        };
+
+        let reasoning_fp = extract_round_reasoning_fingerprint(messages);
+        if made_progress {
+            self.progress.consecutive_no_progress = 0;
+            self.progress.last_reasoning_fp = reasoning_fp;
+            return ToolLoopSignal::None;
+        }
+
+        // 免费探索区：探索完全免费，不计费也不升级（删代码前先定位、陌生代码库
+        // 先摸索都属正常）。仅更新 reasoning 指纹基线。
+        if self.iteration <= free_explore_rounds {
+            self.progress.last_reasoning_fp = reasoning_fp;
+            return ToolLoopSignal::None;
+        }
+
+        self.progress.consecutive_no_progress += 1;
+
+        // grace 出口：软提示后，若模型给出「实质不同的理由」（reasoning 指纹变化），
+        // 视为有效响应，延长宽限窗口，不升级——这是「我需要更多空间」的正当出口。
+        let reasoning_changed =
+            reasoning_fp.is_some() && reasoning_fp != self.progress.last_reasoning_fp;
+        self.progress.last_reasoning_fp = reasoning_fp;
+        if self.progress.soft_injected && reasoning_changed {
+            self.progress.grace_until_iteration = self.iteration + PROGRESS_GRACE_WINDOW;
+        }
+        if self.iteration < self.progress.grace_until_iteration {
+            return ToolLoopSignal::None;
+        }
+
+        let soft_threshold = no_progress_soft_threshold(self.iteration, free_explore_rounds);
+        if self.progress.consecutive_no_progress < soft_threshold {
+            return ToolLoopSignal::None;
+        }
+
+        // 升级阶梯严格按 软提示 → 记账 → 硬停 推进，每级一次性。硬停额外要求
+        // 连续无进展达到 soft_threshold + margin，避免越过软层直接收口。
+        if !self.progress.soft_injected {
+            self.progress.soft_injected = true;
+            return ToolLoopSignal::LowProgressSoft;
+        }
+        if !self.progress.ledger_injected {
+            self.progress.ledger_injected = true;
+            return ToolLoopSignal::LowProgressLedger;
+        }
+        let hard_threshold = soft_threshold + PROGRESS_NO_PROGRESS_HARD_MARGIN;
+        if self.progress.consecutive_no_progress >= hard_threshold && !self.progress.hard_injected {
+            self.progress.hard_injected = true;
+            return ToolLoopSignal::LowProgressHard;
         }
         ToolLoopSignal::None
     }
@@ -738,6 +1006,65 @@ fn inject_coarse_hard_loop_stop_note(messages: &mut Vec<crate::ai::history::Mess
     });
 }
 
+/// Progress Budget 第一级（软反思）：连续多轮无信息增益 / 意图不对齐。反思式
+/// 提示，不阻断工具——给模型解释「为什么还要继续同方向」和继续探索的权利。
+fn inject_low_progress_soft_note(messages: &mut Vec<crate::ai::history::Message>) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let note = "[low-progress] 你已连续多轮调用工具，但任务没有可见的推进：\n\
+        - 若这是「修改/删除/新增代码」类任务，你一直在读取/检索却还没提交任何 apply_patch/write_file/delete_path；\n\
+        - 若是探索类任务，最近几轮没有触及新的目标资源，也没有排除掉候选分支。\n\
+        请先停下来回答自己：上一步得到了什么『新信息』？如果说不出，就不要再沿同一方向重复。\n\
+        然后二选一：(a) 若信息已足够，立即执行下一步实质动作（提交修改 / 给出结论）；\n\
+        (b) 若确需继续探索，请显式写下你正在权衡的 A/B 候选分支及当前倾向——这不是惩罚，\n\
+        而是帮你把『无意识的打转』变成『有方向的探索』。";
+    messages.push(Message {
+        role: "system".to_string(),
+        content: Value::String(note.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+/// Progress Budget 第二级（记账）：软提示后仍无进展，要求写下轻量决策账本，
+/// 逼模型意识到自己在摇摆。仍不硬阻断工具。
+fn inject_progress_ledger_note(messages: &mut Vec<crate::ai::history::Message>) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let note = "[low-progress-ledger] 软提示后你仍在原地打转。现在请在继续任何工具调用之前，\n\
+        先用不超过 6 行写出一份决策账本，强制自己收敛：\n\
+        1) 已确认事实（bullet，最多 3 条）\n\
+        2) 仍待解决的唯一关键问题\n\
+        3) 候选分支 A / B 及你现在选哪个、为什么\n\
+        4) 基于所选分支的下一步唯一动作\n\
+        写完后，直接执行该动作；不要再做与该动作无关的探索性读取/检索。";
+    messages.push(Message {
+        role: "system".to_string(),
+        content: Value::String(note.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+/// Progress Budget 第三级（硬停）：软提示 + 记账后仍连续无进展，切换无工具收口。
+fn inject_low_progress_hard_stop_note(messages: &mut Vec<crate::ai::history::Message>) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let note = "[low-progress-hard-stop] 经软提示与记账后你仍未取得任何可见进展，判定为无效循环。\n\
+        从现在起进入无工具收口模式：不要再发起任何工具调用；\n\
+        请基于已收集到的信息给出阶段结论：已确认了什么、还差什么、\n\
+        以及若要完成任务建议的下一步（若是变更类任务，直接说明应改哪些文件、怎么改）。";
+    messages.push(Message {
+        role: "system".to_string(),
+        content: Value::String(note.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
 /// 中段断路器：单轮迭代到达软阈值（远早于 max_iterations）时的一次性收敛提示。
 fn inject_iteration_soft_limit_note(
     messages: &mut Vec<crate::ai::history::Message>,
@@ -853,7 +1180,7 @@ mod tests {
         let mut signals = Vec::new();
         for i in 0..TOOL_LOOP_HARD_WINDOW {
             messages.push(assistant_with_same_read(&format!("tc-{i}")));
-            signals.push(supervisor.record_tool_signatures(&messages));
+            signals.push(supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS));
         }
         assert!(
             signals[..TOOL_LOOP_SOFT_WINDOW - 1]
@@ -893,7 +1220,7 @@ mod tests {
         // 第一轮：积累到 soft 触发。
         for i in 0..TOOL_LOOP_SOFT_WINDOW {
             messages.push(assistant_with_read(&format!("tc-{i}")));
-            supervisor.record_tool_signatures(&messages);
+            supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
         }
         // 验证 soft 已触发，flag 已设置。
         assert!(supervisor.loop_breaker_injected);
@@ -911,7 +1238,7 @@ mod tests {
 
         // 截断迭代：跳过签名记录。
         messages.push(assistant_with_read("tc-skip"));
-        let signal = supervisor.record_tool_signatures(&messages);
+        let signal = supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
         assert!(matches!(signal, ToolLoopSignal::None));
         assert!(supervisor.tool_signature_history.is_empty());
         assert_eq!(supervisor.skip_tool_signature_rounds, 0);
@@ -919,7 +1246,7 @@ mod tests {
         // 第二轮：恢复后重新积累，验证 soft 能再次触发。
         for i in 0..TOOL_LOOP_SOFT_WINDOW {
             messages.push(assistant_with_read(&format!("tc2-{i}")));
-            let signal = supervisor.record_tool_signatures(&messages);
+            let signal = supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
             if i == TOOL_LOOP_SOFT_WINDOW - 1 {
                 // 第 4 次应触发 soft。
                 assert!(matches!(signal, ToolLoopSignal::Soft));
@@ -932,7 +1259,7 @@ mod tests {
         // 继续积累到 hard 触发，验证完整升级阶梯恢复。
         for i in 0..(TOOL_LOOP_HARD_WINDOW - TOOL_LOOP_SOFT_WINDOW) {
             messages.push(assistant_with_read(&format!("tc3-{i}")));
-            let signal = supervisor.record_tool_signatures(&messages);
+            let signal = supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
             if i == (TOOL_LOOP_HARD_WINDOW - TOOL_LOOP_SOFT_WINDOW - 1) {
                 // 第 6 次应触发 hard。
                 assert!(matches!(signal, ToolLoopSignal::Hard));
@@ -1040,7 +1367,7 @@ mod tests {
         let mut signals = Vec::new();
         for i in 0..TOOL_LOOP_COARSE_WINDOW {
             messages.push(assistant_paging_read(&format!("tc-{i}"), i * 80));
-            signals.push(supervisor.record_tool_signatures(&messages));
+            signals.push(supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS));
         }
         assert!(
             signals[..TOOL_LOOP_COARSE_WINDOW - 1]
@@ -1057,7 +1384,7 @@ mod tests {
             TOOL_LOOP_COARSE_WINDOW * 80,
         ));
         assert!(matches!(
-            supervisor.record_tool_signatures(&messages),
+            supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS),
             ToolLoopSignal::None
         ));
     }
@@ -1088,7 +1415,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
             });
-            let signal = supervisor.record_tool_signatures(&messages);
+            let signal = supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS);
             if i < TOOL_LOOP_COARSE_WINDOW - 1 {
                 assert!(matches!(signal, ToolLoopSignal::None));
             } else {
@@ -1128,7 +1455,7 @@ mod tests {
                 tool_call_id: None,
                 reasoning_content: None,
             });
-            signals.push(supervisor.record_tool_signatures(&messages));
+            signals.push(supervisor.record_tool_signatures(&messages, "", PROGRESS_FREE_EXPLORE_ROUNDS));
         }
         assert!(
             signals[..TOOL_LOOP_COARSE_WINDOW - 1]
@@ -1198,6 +1525,187 @@ mod tests {
         supervisor.iteration = 8;
         assert!(!supervisor.maybe_inject_iteration_soft_limit_note(&mut messages, max_iterations));
         assert_eq!(messages.len(), 1);
+    }
+
+    // ===== Progress Budget（意图感知进展预算）测试 =====
+    // 这些用例都刻意让每轮工具签名各不相同（不同 path），从而绕过 exact/coarse
+    // 「签名重复」检测，专门验证第三层 assess_progress 的「意图对齐度」判定。
+
+    fn pb_read_msg(path: &str, id: &str) -> crate::ai::history::Message {
+        crate::ai::history::Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "read_file".to_string(),
+                    arguments: format!("{{\"path\":\"{path}\"}}"),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn pb_read_msg_reasoning(path: &str, id: &str, reasoning: &str) -> crate::ai::history::Message {
+        let mut m = pb_read_msg(path, id);
+        m.reasoning_content = Some(reasoning.to_string());
+        m
+    }
+
+    fn pb_apply_patch_msg(id: &str) -> crate::ai::history::Message {
+        crate::ai::history::Message {
+            role: "assistant".to_string(),
+            content: serde_json::Value::String(String::new()),
+            tool_calls: Some(vec![crate::ai::types::ToolCall {
+                id: id.to_string(),
+                tool_type: "function".to_string(),
+                function: crate::ai::types::FunctionCall {
+                    name: "apply_patch".to_string(),
+                    arguments: "{\"file_path\":\"src/foo.rs\",\"patch\":\"@@\\n-old\\n+new\"}"
+                        .to_string(),
+                },
+            }]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn progress_budget_mutation_pure_reading_triggers_soft_after_free_rounds() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let question = "帮我删除 foo_method 这个方法";
+        let mut signals = Vec::new();
+        // iteration 1..=25：免费区（<=20）全静默；21 起累加无进展，
+        // 25 轮时 consecutive=5 达到 soft_threshold(25)=5，触发软提示。
+        for i in 1..=25 {
+            supervisor.next_iteration();
+            messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("tc-{i}")));
+            signals.push(supervisor.record_tool_signatures(
+                &messages,
+                question,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            ));
+        }
+        assert!(
+            signals[..24]
+                .iter()
+                .all(|s| matches!(s, ToolLoopSignal::None)),
+            "should stay silent through free-explore + sub-threshold rounds"
+        );
+        assert!(matches!(signals[24], ToolLoopSignal::LowProgressSoft));
+        assert!(supervisor.progress.soft_injected);
+    }
+
+    #[test]
+    fn progress_budget_readonly_novel_targets_never_trigger() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let question = "解释一下这个模块的整体架构";
+        for i in 1..=30 {
+            supervisor.next_iteration();
+            messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("tc-{i}")));
+            let signal = supervisor.record_tool_signatures(
+                &messages,
+                question,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+            assert!(
+                matches!(signal, ToolLoopSignal::None),
+                "read-only exploration with fresh targets must never be penalized (round {i})"
+            );
+        }
+        assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+    }
+
+    #[test]
+    fn progress_budget_mutation_action_resets_no_progress() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let question = "修复登录接口的空指针 bug";
+        // 固定在计费区（iteration=30 → soft_threshold=5）。
+        supervisor.iteration = 30;
+        for i in 0..4 {
+            messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("r-{i}")));
+            let signal = supervisor.record_tool_signatures(
+                &messages,
+                question,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+            assert!(matches!(signal, ToolLoopSignal::None));
+        }
+        assert_eq!(supervisor.progress.consecutive_no_progress, 4);
+        // 一次真正的变更动作：无进展计数清零。
+        messages.push(pb_apply_patch_msg("patch-1"));
+        let signal =
+            supervisor.record_tool_signatures(&messages, question, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(matches!(signal, ToolLoopSignal::None));
+        assert_eq!(supervisor.progress.consecutive_no_progress, 0);
+    }
+
+    #[test]
+    fn progress_budget_escalates_soft_then_ledger_then_hard() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let question = "重构这个函数拆成多个小函数";
+        // 固定 iteration=50 → over=30 → soft_threshold=3, hard_threshold=6。
+        supervisor.iteration = 50;
+        let mut signals = Vec::new();
+        for i in 0..6 {
+            messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("r-{i}")));
+            signals.push(supervisor.record_tool_signatures(
+                &messages,
+                question,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            ));
+        }
+        // consecutive 递增 1..6：round2 触发 Soft，round3 触发 Ledger，
+        // round4（5<hard=6）静默，round5（6>=6）触发 Hard。
+        assert!(matches!(signals[0], ToolLoopSignal::None));
+        assert!(matches!(signals[1], ToolLoopSignal::None));
+        assert!(matches!(signals[2], ToolLoopSignal::LowProgressSoft));
+        assert!(matches!(signals[3], ToolLoopSignal::LowProgressLedger));
+        assert!(matches!(signals[4], ToolLoopSignal::None));
+        assert!(matches!(signals[5], ToolLoopSignal::LowProgressHard));
+        assert!(supervisor.progress.hard_injected);
+    }
+
+    #[test]
+    fn progress_budget_grace_window_pauses_escalation_on_new_reasoning() {
+        let mut supervisor = TurnSupervisor::default();
+        let mut messages = Vec::new();
+        let question = "去掉这个废弃的配置项";
+        // 固定 iteration=30 → soft_threshold=5。
+        supervisor.iteration = 30;
+        let mut last = ToolLoopSignal::None;
+        for i in 0..5 {
+            messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("r-{i}")));
+            last = supervisor.record_tool_signatures(
+                &messages,
+                question,
+                PROGRESS_FREE_EXPLORE_ROUNDS,
+            );
+        }
+        assert!(matches!(last, ToolLoopSignal::LowProgressSoft));
+        assert!(supervisor.progress.soft_injected);
+
+        // 第 6 轮给出「实质不同的理由」（reasoning 指纹变化）→ 进入 grace 宽限，
+        // 不立即升级到 ledger，给模型继续探索的空间。
+        messages.push(pb_read_msg_reasoning(
+            "src/g.rs",
+            "r-grace",
+            "换一个思路：先看调用方再决定删除策略",
+        ));
+        let signal =
+            supervisor.record_tool_signatures(&messages, question, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(
+            matches!(signal, ToolLoopSignal::None),
+            "new reasoning should buy a grace window instead of immediate ledger"
+        );
+        assert!(!supervisor.progress.ledger_injected);
+        assert!(supervisor.progress.grace_until_iteration > supervisor.iteration);
     }
 }
 
@@ -1667,7 +2175,8 @@ async fn run_turn_body(
         }
 
         // === 工具循环检测 ===
-        match supervisor.record_tool_signatures(&messages) {
+        match supervisor.record_tool_signatures(&messages, &question, PROGRESS_FREE_EXPLORE_ROUNDS)
+        {
             ToolLoopSignal::None => {}
             ToolLoopSignal::Coarse => {
                 crate::ai::driver::print::print_tool_note_line(
@@ -1709,6 +2218,30 @@ async fn run_turn_body(
                     &question,
                     "tool-loop-hard-stop",
                 );
+                force_final_response = true;
+            }
+            ToolLoopSignal::LowProgressSoft => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    "progress-budget: no measurable progress, injecting self-reflect prompt",
+                );
+                inject_low_progress_soft_note(&mut messages);
+            }
+            ToolLoopSignal::LowProgressLedger => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    "progress-budget: still no progress, requesting explicit decision ledger",
+                );
+                inject_progress_ledger_note(&mut messages);
+                supervisor.maybe_inject_task_anchor(&mut messages, &question, "low-progress-ledger");
+            }
+            ToolLoopSignal::LowProgressHard => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    "progress-budget hard-stop: switching to no-tool handoff",
+                );
+                inject_low_progress_hard_stop_note(&mut messages);
+                supervisor.maybe_inject_task_anchor(&mut messages, &question, "low-progress-hard-stop");
                 force_final_response = true;
             }
         }

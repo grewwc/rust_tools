@@ -156,7 +156,7 @@ pub fn try_handle_skills_command(
                     if has_rest {
                         // /skills <name> <rest>：提取 rest 作为本轮问题
                         let rest =
-                            extract_rest_after_skill_name(&normalized_for_rest, &name, &action);
+                            extract_rest_after_skill_name(&normalized_for_rest);
                         app.forced_skill = Some(name);
                         app.forced_question = rest;
                         return Ok(true);
@@ -191,28 +191,84 @@ pub fn try_handle_skills_command(
 
 /// 从 /skills <name> <rest...> 中提取 <rest...> 部分。
 /// normalized 形如 "skills name rest rest..."
-fn extract_rest_after_skill_name(
-    normalized: &str,
-    skill_name: &str,
-    action: &str,
-) -> Option<String> {
-    // 按空格分割，找到 skill 名称后面的部分
-    let after_prefix = normalized
-        .strip_prefix("skills ")
-        .or_else(|| normalized.strip_prefix("skill "))?;
+fn extract_rest_after_skill_name(normalized: &str) -> Option<String> {
+    // 跳过前导 "skill"/"skills"，下一个 token 承载 skill 名。skill 名是 kebab-case
+    // 标识符（ASCII 字母/数字/`-`/`_`）；该 token 中第一个非标识符字符起，即 skill 名
+    // 后「无空格粘连」的问题正文（如 `/skill Code-Review帮我review`）。若无粘连，问题
+    // 正文是随后的其余 token。用字符集边界而非 strip_prefix，既能剥出粘连问题，又不会
+    // 误伤「问题恰好以 skill 名开头」的场景（如 `/skill code-review code-review帮我review`
+    // 要完整保留 `code-review帮我review`）。
+    let mut tokens = normalized.split_whitespace();
+    tokens.next()?; // "skill" / "skills"
+    let name_token = tokens.next()?; // 承载 skill 名的 token
+    let trailing: String = tokens.collect::<Vec<&str>>().join(" ");
 
-    // 去掉匹配到的 skill 名称本身
-    let after_skill_name = if let Some(rest) = after_prefix.strip_prefix(action) {
-        rest.trim()
-    } else if let Some(rest) = after_prefix.strip_prefix(skill_name) {
-        rest.trim()
-    } else {
-        return None;
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let glued = name_token
+        .find(|c: char| !is_ident(c))
+        .map(|pos| &name_token[pos..])
+        .unwrap_or("");
+
+    let rest = match (glued.is_empty(), trailing.is_empty()) {
+        (true, true) => return None,
+        (true, false) => trailing,
+        (false, true) => glued.to_string(),
+        (false, false) => format!("{glued} {trailing}"),
     };
+    Some(rest)
+}
 
-    if after_skill_name.is_empty() {
-        None
-    } else {
-        Some(after_skill_name.to_string())
+#[cfg(test)]
+mod tests {
+    use super::extract_rest_after_skill_name;
+
+    #[test]
+    fn rest_after_simple_skill_name() {
+        // /skill code-review 帮我review
+        let r = extract_rest_after_skill_name(
+            "skill code-review 帮我review",
+        );
+        assert_eq!(r.as_deref(), Some("帮我review"));
+    }
+
+    #[test]
+    fn rest_after_no_question() {
+        // /skill code-review
+        let r = extract_rest_after_skill_name(
+            "skill code-review",
+        );
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn rest_preserved_when_question_starts_with_skill_name() {
+        // 之前会返回 None 的场景：用户问题以 skill 名开头
+        // /skill code-review code-review帮我review
+        let r = extract_rest_after_skill_name(
+            "skill code-review code-review帮我review",
+        );
+        assert_eq!(r.as_deref(), Some("code-review帮我review"));
+    }
+
+    #[test]
+    fn rest_with_mixed_case_action() {
+        // action 与 skill_name 大小写不同
+        // /skill Code-Review帮我review  → action="Code-Review"
+        let r = extract_rest_after_skill_name(
+            "skill Code-Review帮我review",
+        );
+        assert_eq!(r.as_deref(), Some("帮我review"));
+    }
+
+    #[test]
+    fn rest_with_multi_word_question() {
+        // /skill code-review 帮我review 这段代码 并给出建议
+        let r = extract_rest_after_skill_name(
+            "skill code-review 帮我review 这段代码 并给出建议",
+        );
+        assert_eq!(
+            r.as_deref(),
+            Some("帮我review 这段代码 并给出建议")
+        );
     }
 }

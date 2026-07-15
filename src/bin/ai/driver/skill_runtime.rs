@@ -849,6 +849,9 @@ fn build_system_prompt(
         let mut lines = Vec::new();
         if has_tool(available_tools, "plan") {
             lines.push("Simple tasks: act directly. Complex ones: call `plan` first.".to_string());
+            if has_tool(available_tools, "task_spawn") {
+                lines.push("When planning, identify steps that are independent and can be delegated to subagents in parallel - mark them with `delegate: true` and `parallelizable: true` in the plan.".to_string());
+            }
         }
         if has_tool(available_tools, "spawn_process") {
             lines.push(
@@ -926,6 +929,8 @@ fn build_system_prompt(
         if has_tool(available_tools, "task_spawn") {
             lines.push("Use `task_spawn` to launch a subagent task and fan out parallel independent subtasks.".to_string());
             lines.push("If N subtasks have no data dependency, spawn ALL of them in the same response (multiple task_spawn calls in one turn), then a single task_wait. Do NOT spawn-wait-spawn-wait serially.".to_string());
+            lines.push("Proactive delegation: when a task has 2+ independent sub-parts (different files, different modules, different concerns), decompose and delegate to subagents via task_spawn instead of doing everything sequentially yourself.".to_string());
+            lines.push("Delegation test: ask 'can this part run independently with its own focused context?' If yes, delegate it. This saves your context budget and enables parallelism.".to_string());
         }
         if has_tool(available_tools, "task_wait") {
             lines.push("Use `task_wait` to collect results. Timeout is per-call — re-call or use `wait_policy=\"any\"` for early wake-up.".to_string());

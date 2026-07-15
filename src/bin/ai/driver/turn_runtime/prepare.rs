@@ -327,6 +327,13 @@ pub(super) async fn prepare_turn(
         }
     }
 
+    // 提前收集可用工具名，供 observer 做上下文预算/委派决策。
+    let available_tool_names: Vec<String> = app
+        .agent_context
+        .as_ref()
+        .map(|ac| ac.tools.iter().map(|t| t.function.name.clone()).collect())
+        .unwrap_or_default();
+
     let observer_outputs: Vec<crate::ai::driver::observer::PrepareOutput> =
         if sync_prepare_observers_enabled() {
             app.observers.iter_mut().filter_map(|obs| {
@@ -335,6 +342,8 @@ pub(super) async fn prepare_turn(
             }
             let ctx = crate::ai::driver::observer::PrepareContext {
                 question: question.to_string(),
+                turn_index: history_count,
+                available_tool_names: available_tool_names.clone(),
             };
             let obs_name = obs.name().to_string();
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

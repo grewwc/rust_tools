@@ -1,7 +1,7 @@
 ---
 name: plan
 description: Read-only agent for planning and analysis without making changes
-mode: primary
+mode: all
 color: warning
 disabled: false
 model_tier: standard

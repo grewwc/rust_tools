@@ -117,6 +117,11 @@ tokio::task_local! {
     /// current execution phase here so the spawning `task` tool's heartbeat
     /// line can surface it. Absence means "no parent is showing a heartbeat".
     pub(crate) static SUBAGENT_PHASE: SubagentPhaseSlot;
+    /// 子代理嵌套深度。顶层 agent 未设置（等价于 0）；每 spawn 一层
+    /// 子代理时递增。用于防止 `mode: all` 的 heavy agent 递归扇出
+    /// 导致资源耗尽——`task_spawn` / `task` 在超过 `MAX_SUBAGENT_SPAWN_DEPTH`
+    /// 时拒绝继续委派。
+    pub(crate) static SUBAGENT_DEPTH: usize;
     /// 当前 turn 的 (session_id, turn_id) 元组。由 driver run_loop 在每
     /// 轮调度前 enter，被 DecisionLog / 反馈写入路径读取，把工具调用结
     /// 果对回到正确的 (session, turn)。未设置时下游获取到 ("", 0)。
@@ -189,6 +194,12 @@ pub(crate) fn try_current() -> Option<Arc<DriverContext>> {
 
 pub(crate) fn auto_model_fallback_spec() -> Option<AutoModelFallbackSpec> {
     AUTO_MODEL_FALLBACK.try_with(|value| *value).ok()
+}
+
+/// Read the current sub-agent nesting depth. `0` means top-level agent
+/// (no `SUBAGENT_DEPTH` task-local set). Each spawn level increments by 1.
+pub(crate) fn current_subagent_depth() -> usize {
+    SUBAGENT_DEPTH.try_with(|d| *d).unwrap_or(0)
 }
 
 /// Read the optional sub-agent memory path override. `None` means

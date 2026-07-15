@@ -24,6 +24,22 @@ actually touches that subsystem.
 - `builtin_agents/`, `builtin_skills/`: compiled-in prompt assets
 - core manifests: `agents.rs`, `skills.rs`, `persona.rs`, `models.rs`, `types.rs`, `config_schema.rs`
 
+## Multi-Agent Delegation
+
+`build`, `plan`, and `explore` agents are `mode: all` — they can serve as
+both primary and subagent. This gives `select_subagent` (TF-IDF routing in
+`tools/task_tools.rs`) a 3-member pool so the main agent can actually delegate
+implementation, planning, and exploration tasks. The system prompt in
+`driver/skill_runtime.rs` instructs the model to proactively decompose tasks
+with 2+ independent sub-parts and delegate via `task_spawn`. Two observer-driven
+nudges in `driver/thinking/orchestrator.rs` reinforce this: a context-budget
+nudge (fires after `CONTEXT_BUDGET_TURN_THRESHOLD` turns when `task_spawn` is
+available) and a decomposition-signal detector (fires when the user's question
+mentions multiple files/modules or uses separator keywords like "同时"/"分别").
+The `plan` tool (`tools/plan_tools.rs`) supports `parallelizable` and `delegate`
+boolean fields per step; steps flagged `delegate` trigger a delegation hint
+instead of the default "Proceed to execute" footer.
+
 ## Core rules
 
 1. Project instruction injection is decided in `driver/skill_runtime.rs`; startup
@@ -70,6 +86,10 @@ actually touches that subsystem.
    gateways with provider-specific config names. Startup validation in `config.rs`
    must honor that field for the default model; do not assume only the built-in
    global keys (`compatible.api_key`, `openai.api_key`, etc.) can unlock startup.
+   **Encryption invariant:** `api_key_config_key`, like `name` and `endpoint`, may be
+   encrypted (`enc:...`) in `models.json`. `api_key_for_model` must decrypt it before
+   using it as a configw lookup key; otherwise the encrypted string is used as-is,
+   the lookup fails, and the resolver silently falls through to the global `api_key`.
 6. `models.json` separates request `adapter` from display/config `platform`.
    `adapter` drives request serialization, stream normalization, default endpoint,
    and API-key fallback behavior; `platform` drives model handle suffixes, UI/log

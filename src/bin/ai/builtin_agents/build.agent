@@ -1,7 +1,7 @@
 ---
 name: build
 description: Default agent for development work with progressive tool loading
-mode: primary
+mode: all
 color: success
 model_tier: heavy
 routing_tags:

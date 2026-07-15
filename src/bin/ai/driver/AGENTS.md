@@ -169,6 +169,69 @@ preparation, prompt assembly, thinking, reflection, or runtime context.
    paths that are about to exit immediately (ephemeral one-shot / explicit quit),
    and guard with a per-session in-flight latch so repeated turns do not launch
    duplicate title jobs.
+14. **Progress Budget is the third loop-defense layer** (after exact-byte and
+   coarse signature detection), living in `turn_runtime/orchestrator.rs`
+   (`TurnSupervisor::assess_progress`, `ProgressLedger`). It catches the loop
+   shape the first two structurally miss: **args change every round but the task
+   never advances** (real case: a "delete this method" request ran 60+ rounds of
+   `read_file`/`text_grep` with zero `apply_patch`). It is billed by
+   **intent-alignment, not action count** — never by novelty of targets, because
+   distinct-but-aimless searches (75 distinct `text_grep` patterns in that trace)
+   look like progress under a novelty metric.
+   - `classify_task_intent(question)` splits `Mutation` (去掉/删除/修改/新增/重构/修复/
+     remove/delete/fix… keywords) vs `ReadOnly` (default, keeps max exploration
+     freedom). For **Mutation**, only a `MUTATION_TOOL_NAMES` call
+     (`apply_patch`/`write_file`/`delete_path`) or a final text answer counts as
+     progress — pure reading never does. For **ReadOnly**, touching a *new* target
+     resource counts as information gain.
+   - It is invoked **only after** exact/coarse signature checks miss (`assess_progress`
+     is the tail of `record_tool_signatures`), so existing dead-loop detection keeps
+     priority. `record_tool_signatures(messages, question, free_explore_rounds)`
+     carries the question for intent classification.
+   - Escalation ladder (each once): free-explore zone (`iteration <=
+     PROGRESS_FREE_EXPLORE_ROUNDS`, silent) → `LowProgressSoft` (reflect) →
+     `LowProgressLedger` (force a 6-line decision ledger + task-anchor) →
+     `LowProgressHard` (no-tool handoff + `force_final_response`, needs
+     `consecutive_no_progress >= soft_threshold + PROGRESS_NO_PROGRESS_HARD_MARGIN`).
+     The soft threshold *decreases* with iteration (`no_progress_soft_threshold`).
+   - **Grace exit:** after the soft note, a changed reasoning fingerprint
+     (`extract_round_reasoning_fingerprint`) buys a `PROGRESS_GRACE_WINDOW` pause —
+     this is the "I need more room" escape hatch, so genuine exploration with new
+     rationale is never punished.
+   - All thresholds are hardcoded `const` (like the sibling `TOOL_LOOP_*` /
+     `TOOL_ITERATION_SOFT_LIMIT` windows), **not** `config_schema.rs` keys — keep
+     them local for subsystem consistency. `reset_for_truncation()` clears the
+     ledger on truncation retry, mirroring `mark_truncation_skip`.
+
+15. **Multi-agent delegation nudges** (P3/P4): `PrepareContext` carries
+   `turn_index` (from `history_count`) and `available_tool_names` (from
+   `agent_context.tools`). `ThinkingOrchestrator::on_prepare_rich` uses these
+   to inject two optional Behavior sections, both gated on `task_spawn` being
+   available:
+   - **Context Budget** (P3): when `turn_index >= 12`, remind the model to
+     delegate remaining independent sub-tasks to keep its context focused.
+    One-shot: latched by `context_budget_nudge_injected` — injected at most
+    once per `ThinkingOrchestrator` lifetime, not every turn past threshold.
+   - **Task Decomposition Hint** (P4): lightweight heuristics
+     (`detect_decomposition_signals`) detect multi-file references,
+    task-separator keywords, batch-processing keywords, or 3+ action verbs
+    (word-boundary matched, not bare substring) in the user question; if any
+    signal fires, inject a structured prompt encouraging parallel delegation
+    via `task_spawn`. One-shot: latched by `decomposition_hint_injected` —
+    injected at most once per `ThinkingOrchestrator` lifetime.
+   Both are advisory nudges -- they suggest, never force. Thresholds are
+   hardcoded `const` on `ThinkingOrchestrator`, not config keys.
+
+16. **Subagent spawn depth guard**: `runtime_ctx::SUBAGENT_DEPTH` (task-local)
+   tracks the nesting level of `task`/`task_spawn` delegation. The top-level
+   agent runs at depth 0; each child increments by 1.
+   `MAX_SUBAGENT_SPAWN_DEPTH` (const, =2) caps the chain: a subagent at depth
+   ≥2 that calls `task`/`task_spawn` gets an error instead of a grandchild
+   process. This prevents unbounded recursion when `mode: all` agents (e.g.
+   `build`) are spawned as subagents but still hold `task_spawn` in their
+   `core` tool group. The depth is carried in `OsTaskGoal.spawn_depth` and
+   scoped by both dispatch paths (`background_dispatch.rs` for async
+   `task_spawn`, `sync_task.rs` for synchronous `task`).
 
 ## Goal 模式
 

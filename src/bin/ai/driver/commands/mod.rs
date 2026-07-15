@@ -24,6 +24,7 @@ pub use model::try_handle_model_command;
 pub use persona::try_handle_persona_command;
 pub use proc::try_handle_proc_command;
 pub use session::try_handle_session_command;
+pub use session::try_handle_clear_command;
 pub use share::try_handle_share_command;
 pub use skills::try_handle_skills_command;
 pub use usage::try_handle_usage_command;
@@ -36,6 +37,9 @@ pub fn try_handle_interactive_command(
     skill_manifests: &mut Arc<Vec<SkillManifest>>,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     if try_handle_help_command(input) {
+        return Ok(true);
+    }
+    if try_handle_clear_command(input) {
         return Ok(true);
     }
     if try_handle_goal_command(app, input)? {

@@ -87,6 +87,34 @@ fn print_current_terminal_suspended_sessions(entries: &[SuspendedSessionEntry]) 
     }
 }
 
+/// `/clear`：仅清屏（清除终端显示），不触及任何对话历史或会话状态。
+pub fn try_handle_clear_command(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let normalized = if let Some(rest) = trimmed.strip_prefix('/') {
+        rest
+    } else if let Some(rest) = trimmed.strip_prefix(':') {
+        rest
+    } else {
+        return false;
+    };
+    let mut parts = normalized.split_whitespace();
+    let Some(cmd) = parts.next() else {
+        return false;
+    };
+    if cmd != "clear" {
+        return false;
+    }
+
+    // 清屏：ANSI escape - 清除整屏 + 光标回到左上角
+    use std::io::Write;
+    print!("\x1b[2J\x1b[H");
+    let _ = std::io::stdout().flush();
+    true
+}
+
 pub fn try_handle_session_command(
     app: &mut App,
     input: &str,

@@ -31,6 +31,14 @@ fn params_plan() -> Value {
                         "tool": {
                             "type": "string",
                             "description": "The primary tool you plan to use for this step (e.g., 'read_file', 'execute_command', 'apply_patch', 'web_search'). Use 'none' if no tool is needed."
+                        },
+                        "parallelizable": {
+                            "type": "boolean",
+                            "description": "Whether this step can run in parallel with the previous step (no data dependency). Default: false."
+                        },
+                        "delegate": {
+                            "type": "boolean",
+                            "description": "Whether this step should be delegated to a subagent via task_spawn (independent enough to run with its own focused context). Default: false."
                         }
                     },
                     "required": ["step", "action"]
@@ -86,16 +94,68 @@ fn execute_plan(args: &Value) -> Result<String, String> {
             .and_then(|v| v.as_str())
             .unwrap_or("unspecified");
 
-        formatted.push_str(&format!("Step {}. [{}] {}\n", step_num, tool, action));
+        let parallelizable = step_obj
+            .get("parallelizable")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let delegate = step_obj
+            .get("delegate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let prefix = if parallelizable {
+            "  ‖ "
+        } else {
+            ""
+        };
+        let tags = if delegate {
+            " [delegate]"
+        } else {
+            ""
+        };
+        formatted.push_str(&format!(
+            "{}Step {}. [{}]{} {}\n",
+            prefix, step_num, tool, tags, action
+        ));
         if !reason.is_empty() {
             formatted.push_str(&format!("  Reason: {}\n", reason));
         }
     }
 
+    // 统计可委派/可并行步骤，在 summary 中提示
+    let delegate_count: usize = steps
+        .iter()
+        .filter_map(|s| s.get("delegate").and_then(|v| v.as_bool()))
+        .filter(|&b| b)
+        .count();
+    let parallel_count: usize = steps
+        .iter()
+        .filter_map(|s| s.get("parallelizable").and_then(|v| v.as_bool()))
+        .filter(|&b| b)
+        .count();
+
     formatted.push_str(&format!(
-        "\n---\n{} step(s) planned. Proceed to execute.\n",
+        "\n---\n{} step(s) planned.",
         steps.len()
     ));
+    if delegate_count > 0 {
+        formatted.push_str(&format!(
+            " {} step(s) marked for delegation.",
+            delegate_count
+        ));
+    }
+    if parallel_count > 0 {
+        formatted.push_str(&format!(
+            " {} step(s) can run in parallel.",
+            parallel_count
+        ));
+    }
+    if delegate_count > 0 {
+        formatted.push_str(" Launch delegated steps via task_spawn in parallel, then task_wait to collect results.");
+    } else {
+        formatted.push_str(" Proceed to execute.");
+    }
+    formatted.push('\n');
 
     Ok(formatted)
 }
@@ -103,7 +163,7 @@ fn execute_plan(args: &Value) -> Result<String, String> {
 inventory::submit!(ToolRegistration {
     spec: ToolSpec {
         name: "plan",
-        description: "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. Simple tasks (read one file, answer a question, run one command) do NOT need a plan — just act directly.",
+        description: "Create a step-by-step plan for complex tasks. Use this BEFORE executing tools when a task has multiple steps, involves unfamiliar code, or requires coordination across files/systems. Each step should specify what to do, why, and which tool to use. Mark independent steps as `parallelizable: true` and steps suitable for subagent delegation as `delegate: true` to enable parallel execution. Simple tasks (read one file, answer a question, run one command) do NOT need a plan - just act directly.",
         parameters: params_plan,
         execute: execute_plan,
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
@@ -178,5 +238,35 @@ mod tests {
         });
         let result = execute_plan(&args);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_plan_with_parallel_and_delegate() {
+        let args = serde_json::json!({
+            "summary": "Parallel fix across two modules",
+            "steps": [
+                {
+                    "step": 1,
+                    "action": "Fix module A",
+                    "tool": "apply_patch",
+                    "parallelizable": true,
+                    "delegate": true
+                },
+                {
+                    "step": 2,
+                    "action": "Fix module B",
+                    "tool": "apply_patch",
+                    "parallelizable": true,
+                    "delegate": true
+                }
+            ]
+        });
+        let result = execute_plan(&args).unwrap();
+        assert!(result.contains("‖"));
+        assert!(result.contains("[delegate]"));
+        assert!(result.contains("2 step(s) marked for delegation."));
+        assert!(result.contains("2 step(s) can run in parallel."));
+        assert!(result.contains("task_spawn"));
+        assert!(!result.contains("Proceed to execute."));
     }
 }

@@ -30,6 +30,9 @@ use uuid::Uuid;
 const MAX_TASK_REGISTRY_SIZE: usize = 100;
 const DEFAULT_TASK_PRIORITY: u8 = 20;
 const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
+/// 子代理最大嵌套深度。depth=1 是顶层 agent 直接 spawn 的子代理，
+/// depth=2 是子代理再 spawn 的孙代理。超过此值拒绝继续委派。
+pub(crate) const MAX_SUBAGENT_SPAWN_DEPTH: usize = 2;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
 const MAX_AGENT_TEAM_MEMBERS: usize = 8;
 /// 单次 `task_wait` 调用的默认等待预算（秒）。这只是 **本次调用的最长阻塞时间**，
@@ -214,6 +217,9 @@ pub(crate) struct OsTaskGoal {
     #[serde(default)]
     pub(crate) auto_model_fallback: Option<models::AutoModelFallbackSpec>,
     pub(crate) selection_explanation: String,
+    /// 子代理嵌套深度：顶层 spawn 为 1，逐层递增。用于防止递归扇出。
+    #[serde(default)]
+    pub(crate) spawn_depth: usize,
 }
 
 fn prune_completed_tasks(registry: &mut SkipMap<String, AsyncTaskEntry>) {
@@ -802,6 +808,16 @@ pub(crate) struct SpawnedSubagentTask {
 pub(crate) fn spawn_subagent_kernel_task(
     prepared: &PreparedSubagentTask,
 ) -> Result<SpawnedSubagentTask, String> {
+    let parent_depth = crate::ai::driver::runtime_ctx::current_subagent_depth();
+    let child_depth = parent_depth + 1;
+    if child_depth > MAX_SUBAGENT_SPAWN_DEPTH {
+        return Err(format!(
+            "Subagent nesting depth {} exceeds maximum {}. \
+             The current agent is already a nested subagent; further delegation \
+             would risk unbounded recursion. Execute the work directly instead.",
+            child_depth, MAX_SUBAGENT_SPAWN_DEPTH,
+        ));
+    }
     let task_id = next_task_id();
     let (pid, result_channel_id, completion_futex_addr) = with_os_kernel(|os| {
         let parent_pid = os
@@ -829,6 +845,7 @@ pub(crate) fn spawn_subagent_kernel_task(
             is_model_auto_selected: prepared.is_model_auto_selected,
             auto_model_fallback: prepared.auto_model_fallback,
             selection_explanation: prepared.selection_explanation.clone(),
+            spawn_depth: child_depth,
         })?;
         let pid = os.spawn(
             Some(parent_pid),

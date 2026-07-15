@@ -37,6 +37,8 @@ pub struct ThinkingOrchestrator {
     pub poisoned: bool,
     pub pending_suggested_tool_calls: Vec<crate::ai::driver::observer::SuggestedToolCall>,
     pub protocol_injected: bool,
+    pub decomposition_hint_injected: bool,
+    pub context_budget_nudge_injected: bool,
     pub stagnation_turns: usize,
 }
 
@@ -65,6 +67,8 @@ impl ThinkingOrchestrator {
             poisoned: false,
             pending_suggested_tool_calls: Vec::new(),
             protocol_injected: false,
+            decomposition_hint_injected: false,
+            context_budget_nudge_injected: false,
             stagnation_turns: 0,
         }
     }
@@ -386,6 +390,137 @@ impl ThinkingOrchestrator {
             Some(parts.join("\n"))
         }
     }
+
+    // ── P3: 上下文预算感知的委派提醒 ──────────────────────────────
+    //
+    // 当对话已经很长（turn_index 超过阈值）且 agent 拥有 task_spawn 工具时，
+    // 注入一条提醒，鼓励把剩余独立子任务委派给 subagent，避免主 agent 上下文
+    // 继续膨胀导致注意力分散和 token 浪费。
+    const CONTEXT_BUDGET_TURN_THRESHOLD: usize = 12;
+
+    fn build_context_budget_nudge(
+        &self,
+        turn_index: usize,
+        available_tool_names: &[String],
+    ) -> Option<String> {
+        if turn_index < Self::CONTEXT_BUDGET_TURN_THRESHOLD {
+            return None;
+        }
+        if !available_tool_names.iter().any(|n| n == "task_spawn") {
+            return None;
+        }
+        Some(format!(
+            "[Context Budget] This conversation has been going for {}+ turns. \
+             Your context is growing large, which can disperse attention and waste tokens. \
+             If the remaining work has independent sub-parts, delegate them to subagents \
+             via task_spawn so each sub-task gets its own focused context. \
+             Reserve your context for orchestration and synthesis.",
+            turn_index,
+        ))
+    }
+
+    // ── P4: 轻量级任务拆解信号检测 ────────────────────────────────
+    //
+    // 通过简单的启发式规则检测用户问题是否包含多个可并行的独立子任务，
+    // 如果检测到，注入一条"考虑并行委派"的结构化提示。
+    // 这不是自动拆解，而是给模型一个信号去主动思考拆解可能性。
+    fn build_decomposition_hint(
+        &self,
+        question: &str,
+        available_tool_names: &[String],
+    ) -> Option<String> {
+        if !available_tool_names.iter().any(|n| n == "task_spawn") {
+            return None;
+        }
+        let signals = Self::detect_decomposition_signals(question);
+        if signals.is_empty() {
+            return None;
+        }
+        let signal_list: Vec<String> = signals
+            .iter()
+            .map(|s| format!("  - {}", s))
+            .collect();
+        Some(format!(
+            "[Task Decomposition] This request shows signs of being decomposable into \
+             independent parallel sub-tasks:\n{}\n\
+             Consider decomposing it and delegating independent parts to subagents via \
+             task_spawn (spawn all independent parts in one response, then task_wait). \
+             This enables parallelism and gives each sub-task its own focused context.",
+            signal_list.join("\n"),
+        ))
+    }
+
+    /// 轻量级启发式：检测问题中暗示"可并行拆解"的信号。
+    /// 返回检测到的信号描述列表；空列表表示未检测到。
+    fn detect_decomposition_signals(question: &str) -> Vec<&'static str> {
+        let q = question.to_lowercase();
+        let mut signals: Vec<&'static str> = Vec::new();
+
+        /// 整词匹配：避免 "add" 命中 "address"、"test" 命中 "latest" 等裸子串误报。
+        /// 对中文同样适用——中文字符不是 ASCII 字母，天然构成边界。
+        fn contains_word(haystack: &str, needle: &str) -> bool {
+            let mut start = 0usize;
+            let bytes = haystack.as_bytes();
+            while let Some(pos) = haystack[start..].find(needle) {
+                let abs = start + pos;
+                let before_ok = abs == 0 || !bytes[abs - 1].is_ascii_alphabetic();
+                let after = abs + needle.len();
+                let after_ok = after >= bytes.len() || !bytes[after].is_ascii_alphabetic();
+                if before_ok && after_ok {
+                    return true;
+                }
+                start = abs + 1;
+            }
+            false
+        }
+
+        // 信号 1：提及多个文件路径（不同文件通常可独立处理）
+        let suffixes = [".rs", ".py", ".ts", ".tsx", ".go", ".js", ".jsx", ".toml", ".md", ".json"];
+        let file_count = suffixes.iter().filter(|s| question.contains(*s)).count();
+        if file_count >= 2 {
+            signals.push("Multiple file paths mentioned (different files can often be processed independently)");
+        }
+
+        // 信号 2：任务分隔关键词（"然后"/"同时"/"另外"/"还要"/"以及"等）
+        let separators = [
+            "然后", "同时", "另外", "还要", "以及", "接着",
+            "and then", "also", "additionally", "next", "after that", "as well as",
+            "step 1", "step 2", "第一步", "第二步",
+        ];
+        let separator_hits: Vec<&str> = separators
+            .iter()
+           .filter(|s| contains_word(&q, s))
+            .copied()
+            .collect();
+        if !separator_hits.is_empty() {
+            signals.push("Task-separator keywords detected (suggests sequential or parallel sub-tasks)");
+        }
+
+        // 信号 3：提及"每个"/"所有"/"多个"等批量处理暗示
+        let batch_keywords = [
+            "每个", "所有", "多个", "这些", "那些",
+            "each ", "all ", "every ", "multiple ", "these ",
+        ];
+        if batch_keywords.iter().any(|k| q.contains(k)) {
+            signals.push("Batch-processing keywords detected (each item may be an independent sub-task)");
+        }
+
+        // 信号 4：多个祈使句动词（"读取"/"修改"/"修复"/"添加"/"删除"等）
+        let action_verbs = [
+            "读取", "修改", "修复", "添加", "删除", "实现", "重构", "测试", "检查", "创建",
+            "read", "write", "fix", "update", "implement", "refactor", "test", "check", "create", "add",
+        ];
+        let verb_hits: Vec<&str> = action_verbs
+            .iter()
+           .filter(|v| contains_word(&q, v))
+            .copied()
+            .collect();
+        if verb_hits.len() >= 3 {
+            signals.push("Multiple action verbs detected (3+ distinct actions may be parallelizable)");
+        }
+
+        signals
+    }
 }
 
 pub struct GeneralizeResult {
@@ -625,6 +760,31 @@ impl TurnObserver for ThinkingOrchestrator {
             ));
         }
 
+        // P4: 轻量级任务拆解信号检测 -- 当问题包含多个可并行子任务的信号时，
+        // 注入结构化提示鼓励模型主动思考拆解并委派。
+        if !self.decomposition_hint_injected {
+        if let Some(hint) = self.build_decomposition_hint(&ctx.question, &ctx.available_tool_names) {
+            self.decomposition_hint_injected = true;
+            sections.push((
+                SectionKind::Behavior,
+                "Task Decomposition Hint".to_string(),
+                hint,
+            ));
+        }
+        }
+
+        // P3: 上下文预算感知 -- 当对话轮次超过阈值时，提醒模型委派剩余独立子任务。
+        if !self.context_budget_nudge_injected {
+        if let Some(nudge) = self.build_context_budget_nudge(ctx.turn_index, &ctx.available_tool_names) {
+            self.context_budget_nudge_injected = true;
+            sections.push((
+                SectionKind::Behavior,
+                "Context Budget".to_string(),
+                nudge,
+            ));
+        }
+        }
+
         let suggested_tool_calls = std::mem::take(&mut self.pending_suggested_tool_calls);
         PrepareOutput {
             sections,
@@ -677,9 +837,12 @@ impl TurnObserver for ThinkingOrchestrator {
 
         let generalized = self.try_generalize();
         if let Some(result) = &generalized {
+            // 不向用户暴露原始拼接的 principle 文本——它是内部学习产物，直接展示会
+            // 产生"奇怪的自我总结"。principle 已持久化到 MemoryStore，后续通过
+            // auto-recall / evolution 系统参与行为。此处只给一条简短确认。
             display_lines.push(format!(
-                "[Thinking] Generalized principle: {}",
-                result.principle_text
+                "[Thinking] Self-learning: synthesized a principle from {} experiences.",
+                result.source_notes.len()
             ));
             // 同步拼接出的 principle 缺乏真正抽象。若开启 LLM 二次提炼，则在后台用 LLM 把
             // 参与本次泛化的原始经验提炼成更高层、可复用的原则，并按同 id 覆写持久化。
@@ -917,9 +1080,9 @@ mod tests {
         let generalized = output
             .display_lines
             .iter()
-            .any(|line| line.starts_with("[Thinking] Generalized principle:"));
+            .any(|line| line.starts_with("[Thinking] Self-learning:"));
         // 工作 turn 不会被提前 return 跳过：final_text 中的 self-note 要么留在 buffer，
-        // 要么被本轮 generalization 正常消费并产出 [Thinking] 行。
+        // 要么被本轮 generalization 正常消费并产出 [Thinking] Self-learning 行。
         assert!(
             retained_experience || generalized,
             "self-learning turn should either retain buffered experience or generalize it; lines={:?}",
@@ -977,5 +1140,43 @@ mod tests {
         assert!(orch.goal_manager.active_goal().is_some());
         orch.on_conversation_end();
         assert!(orch.goal_manager.active_goal().is_none());
+    }
+
+    // ── P3/P4 单元测试 ──────────────────────────────────────────
+
+    #[test]
+    fn detect_decomposition_signals_multiple_files() {
+        // 提及两个不同文件后缀 → 信号 1 触发
+        let signals = ThinkingOrchestrator::detect_decomposition_signals(
+            "请读取 a.rs 和 b.py，然后告诉我它们的区别",
+        );
+        assert!(signals.iter().any(|s| s.contains("Multiple file paths")));
+    }
+
+    #[test]
+    fn detect_decomposition_signals_separator_keywords() {
+        // 包含"然后"分隔词 → 信号 2 触发
+        let signals = ThinkingOrchestrator::detect_decomposition_signals(
+            "先做任务A，然后做任务B",
+        );
+        assert!(signals.iter().any(|s| s.contains("Task-separator")));
+    }
+
+    #[test]
+    fn detect_decomposition_signals_no_signal_for_simple_question() {
+        let signals = ThinkingOrchestrator::detect_decomposition_signals("你好");
+        assert!(signals.is_empty());
+    }
+
+    #[test]
+    fn context_budget_nudge_only_after_threshold() {
+        let orch = ThinkingOrchestrator::new();
+        let tools = vec!["task_spawn".to_string()];
+        // 低于阈值 → 不注入
+        assert!(orch.build_context_budget_nudge(5, &tools).is_none());
+        // 达到阈值且拥有 task_spawn → 注入
+        assert!(orch.build_context_budget_nudge(15, &tools).is_some());
+        // 达到阈值但没有 task_spawn → 不注入
+        assert!(orch.build_context_budget_nudge(15, &[]).is_none());
     }
 }

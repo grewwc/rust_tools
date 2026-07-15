@@ -245,6 +245,19 @@ impl ExperienceGeneralizer {
         tags: &[String],
         source: Option<&str>,
     ) {
+        // 去重：若 buffer 中已存在高度相似的经验（token Jaccard ≥ 0.7），跳过本次
+        // 入栈。避免 buffer 被"同一个教训换几个措辞"的近重复填满，导致泛化时拼出
+        // 冗长且重复的 principle。
+        const DEDUP_SIMILARITY_THRESHOLD: f64 = 0.7;
+        for existing in &self.experience_buffer {
+            if existing.category == category
+                && self.compute_text_similarity(&existing.note, note)
+                    >= DEDUP_SIMILARITY_THRESHOLD
+            {
+                return;
+            }
+        }
+
         const MAX_NOTE_CHARS: usize = 2000;
         let truncated_note: String = if note.chars().count() > MAX_NOTE_CHARS {
             note.chars().take(MAX_NOTE_CHARS).collect::<String>() + "...[truncated]"
@@ -695,6 +708,14 @@ impl ExperienceGeneralizer {
             && !first.category.is_empty()
             && first.category != "raw_experience"
         {
+            // self_note 系列分类是管线内部标签，作为 domain 毫无语义。
+            // 映射到 "self-reflection"，使 principle 文本可读。
+            if matches!(
+                first.category.as_str(),
+                "self_note" | "self_note_do" | "self_note_avoid"
+            ) {
+                return "self_reflection".to_string();
+            }
             return first.category.clone();
         }
         "general_engineering".to_string()
@@ -734,6 +755,33 @@ impl ExperienceGeneralizer {
             })
             .map(|n| strip_polarity_prefix(n))
             .collect();
+
+        // 去重 + 截断：同极性的条目之间可能仍有措辞近重复（ingest 时的阈值是 0.7，
+        // 但分组后仍可能聚到一起）。用 token Jaccard 做二次去重，相似度 ≥ 0.6 的只
+        // 保留首次出现的一条。最后每极性最多保留 3 条，保证 principle 简洁可读。
+        const MAX_ITEMS_PER_POLARITY: usize = 3;
+        const SYNTH_DEDUP_THRESHOLD: f64 = 0.6;
+        fn dedup_and_cap(
+            generalizer: &ExperienceGeneralizer,
+            items: Vec<String>,
+        ) -> Vec<String> {
+            let mut kept: Vec<String> = Vec::new();
+            for item in items {
+                let is_dup = kept.iter().any(|k| {
+                    generalizer.compute_text_similarity(k, &item) >= SYNTH_DEDUP_THRESHOLD
+                });
+                if !is_dup {
+                    kept.push(item);
+                }
+                if kept.len() >= MAX_ITEMS_PER_POLARITY {
+                    break;
+                }
+            }
+            kept
+        }
+
+        let do_items = dedup_and_cap(self, do_items);
+        let avoid_items = dedup_and_cap(self, avoid_items);
 
         if do_items.is_empty() && avoid_items.is_empty() {
             return None;
@@ -1232,6 +1280,67 @@ mod tests {
         assert_eq!(p.domain, "robustness");
         assert_eq!(p.abstraction_level, 2, "抽象层级应提升一档");
         assert!((p.confidence - 0.9).abs() < f64::EPSILON);
+
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+    use crate::ai::test_support::ENV_LOCK;
+
+    #[test]
+    fn ingest_dedup_skips_near_duplicates() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+        let path = std::env::temp_dir().join(format!(
+            "rt_generalization_dedup_{}_{}.jsonl",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        let mut generalizer = ExperienceGeneralizer::new();
+        generalizer.experience_buffer.clear();
+
+        generalizer.ingest_experience(
+            "self_note_do",
+            "Do: always validate inputs before processing in async handlers",
+            &["async".to_string()],
+            None,
+        );
+        assert_eq!(generalizer.experience_buffer.len(), 1);
+
+        // 高度相似措辞应被去重跳过
+        generalizer.ingest_experience(
+            "self_note_do",
+            "Do: always validate inputs before processing in async handlers before use",
+            &["async".to_string()],
+            None,
+        );
+        assert_eq!(
+            generalizer.experience_buffer.len(),
+            1,
+            "near-duplicate experience should be deduped"
+        );
+
+        // 不同分类不受去重影响
+        generalizer.ingest_experience(
+            "self_note_avoid",
+            "Avoid: always validate inputs before processing in async handlers before use",
+            &["async".to_string()],
+            None,
+        );
+        assert_eq!(
+            generalizer.experience_buffer.len(),
+            2,
+            "different category should not be deduped"
+        );
 
         let _ = std::fs::remove_file(&path);
         unsafe {

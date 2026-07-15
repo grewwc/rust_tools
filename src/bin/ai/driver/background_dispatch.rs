@@ -81,6 +81,7 @@ pub(super) fn dispatch_background_batch(
         Option<aios_kernel::primitives::FutexAddr>,
         Option<String>,
         Option<crate::ai::models::AutoModelFallbackSpec>,
+       usize,
         bool,
     )> = Vec::new();
     for proc in &background_procs {
@@ -149,6 +150,7 @@ pub(super) fn dispatch_background_batch(
                 .map(|goal| aios_kernel::primitives::FutexAddr(goal.completion_futex_addr)),
             task_goal.as_ref().map(|goal| goal.task_id.clone()),
             task_goal.as_ref().and_then(|goal| goal.auto_model_fallback),
+           task_goal.as_ref().map(|goal| goal.spawn_depth).unwrap_or(0),
             is_resume_wakeup,
         ));
     }
@@ -163,6 +165,7 @@ pub(super) fn dispatch_background_batch(
         completion_futex_addr,
         task_id,
         auto_model_fallback,
+       spawn_depth,
         is_resume_wakeup,
     ) in task_specs
     {
@@ -359,6 +362,9 @@ pub(super) fn dispatch_background_batch(
                 wrapped = Box::pin(runtime_ctx::SUBAGENT_CWD.scope(scratch, wrapped));
             }
         }
+       // 设置子代理嵌套深度，供 `task_spawn` / `task` 在子代理内部
+       // 检测递归扇出时使用。
+       wrapped = Box::pin(runtime_ctx::SUBAGENT_DEPTH.scope(spawn_depth, wrapped));
 
         // 计入在途后台子 agent：guard 随 spawned future 一同 move 进任务，
         // 任务结束（正常 / 错误 / panic）时 Drop 自动 dec，避免输入框被永久门控。

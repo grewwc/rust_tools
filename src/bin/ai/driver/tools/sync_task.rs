@@ -53,6 +53,18 @@ const SYNC_TASK_HARD_TIMEOUT: Duration = Duration::from_secs(600);
 const SUBAGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(2);
 
 pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<ToolResult, String> {
+    // 递归深度守卫：防止 mode:all 的 heavy agent 通过同步 `task`
+    // 无限嵌套委派。与 `spawn_subagent_kernel_task` 中的检查保持一致。
+    let parent_depth = runtime_ctx::current_subagent_depth();
+    let child_depth = parent_depth + 1;
+    if child_depth > task_tools::MAX_SUBAGENT_SPAWN_DEPTH {
+        return Err(format!(
+            "Subagent nesting depth {} exceeds maximum {}. \
+             The current agent is already a nested subagent; further delegation \
+             would risk unbounded recursion. Execute the work directly instead.",
+            child_depth, task_tools::MAX_SUBAGENT_SPAWN_DEPTH,
+        ));
+    }
     let prepared = task_tools::prepare_subagent_task(args)?;
     let ctx = runtime_ctx::try_current().ok_or_else(|| {
         "task tool requires an active driver turn (DRIVER_CTX is not set)".to_string()
@@ -188,6 +200,7 @@ pub(super) fn execute_sync_task(tool_call_id: &str, args: &Value) -> Result<Tool
         Box::pin(runtime_ctx::PERSONA_MEMORY_PATH.scope(persona_memory_path.clone(), wrapped));
     wrapped = Box::pin(runtime_ctx::SUBAGENT_PHASE.scope(phase_slot_for_scope, wrapped));
     wrapped = Box::pin(runtime_ctx::SUBAGENT_RESULT_SLOT.scope(result_slot_for_scope, wrapped));
+   wrapped = Box::pin(runtime_ctx::SUBAGENT_DEPTH.scope(child_depth, wrapped));
 
     if !inherit.memory {
         let mem_path = runtime_ctx::make_subagent_memory_path(&parent_history_path, &task_id);

@@ -139,6 +139,8 @@ pub(super) fn api_key_for_model(model: &str, global_fallback: &str) -> String {
     // 2. api_key_config_key（通过 configw 查找）
     if let Some(config_key) = model_def(model)
         .and_then(|m| m.api_key_config_key.as_deref())
+        .map(|k| maybe_decrypt(k))
+        .as_deref()
         .map(str::trim)
         .filter(|key| !key.is_empty())
         && let Some(value) = cfg
@@ -1183,5 +1185,76 @@ mod tests {
         if let Some(name) = candidate {
             assert!(!enable_thinking(&name));
         }
+    }
+
+    #[test]
+    /// 回归测试：api_key_config_key 字段在 models.json 中可能是加密的（enc:...），
+    /// api_key_for_model 必须先解密再作为 key 名去 configw 查找。
+    /// 修复前：加密字符串直接作为 key 名查找 -> 查不到 -> fallthrough 到全局 api_key -> 401。
+    fn api_key_config_key_decrypts_before_configw_lookup() {
+        use crate::ai::test_support::ENV_LOCK;
+        use crate::commonw::{configw, secret};
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner());
+
+        // 在 models.json 中找一个 api_key_config_key 加密的模型
+        let target = super::model_names::all().iter().find_map(|m| {
+            let enc = m.api_key_config_key.as_deref()?;
+            if !secret::is_encrypted(enc) {
+                return None;
+            }
+            secret::decrypt(enc).ok().map(|plain| (m.key.clone(), plain))
+        });
+
+        let Some((model_key, config_key_name)) = target else {
+            // 没有加密的 api_key_config_key 条目，无法测试此场景
+            return;
+        };
+
+        // secret_path() 依赖 config_path()，改变 CONFIGW_PATH 会导致密钥文件路径变化。
+        // 必须在改变 CONFIGW_PATH 之前读取真实密钥文件，并复制到临时目录。
+        let real_secret_path = configw::config_path()
+            .parent()
+            .map(|p| p.join(".configW.secret"))
+            .filter(|p| p.exists());
+        let Some(real_secret_path) = real_secret_path else {
+            eprintln!("skip: secret key file not found");
+            return;
+        };
+
+        // 创建临时目录，将密钥文件复制过去（保持解密能力）
+        let temp_dir = std::env::temp_dir().join(format!(
+            "rt_enc_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let temp_secret = temp_dir.join(".configW.secret");
+        std::fs::copy(&real_secret_path, &temp_secret).unwrap();
+
+        // 写入临时配置文件
+        let cfg_path = temp_dir.join("configw");
+        let test_value = "test-encrypted-key-resolution-value";
+        std::fs::write(&cfg_path, format!("{config_key_name} = {test_value}\n")).unwrap();
+
+        let old_cfg = std::env::var_os("CONFIGW_PATH");
+        unsafe { std::env::set_var("CONFIGW_PATH", &cfg_path) };
+        configw::refresh();
+
+        // global_fallback 故意设成一个不可能正确的值，确保不会 fallthrough
+        let resolved = api_key_for_model(&model_key, "GLOBAL_FALLBACK_SHOULD_NOT_BE_USED");
+
+        // 恢复环境
+        match old_cfg {
+            Some(value) => unsafe { std::env::set_var("CONFIGW_PATH", value) },
+            None => unsafe { std::env::remove_var("CONFIGW_PATH") },
+        }
+        configw::refresh();
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        assert_eq!(
+            resolved, test_value,
+            "api_key_config_key (encrypted) should decrypt to '{config_key_name}' \
+             and resolve from configw, not fall through to global fallback"
+        );
     }
 }

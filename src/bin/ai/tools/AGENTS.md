@@ -112,6 +112,14 @@ execution policy, sandboxing, path resolution, or progressive loading.
     deleted `lsp_tools.rs` into `code_search.rs`. `canonical_tool_name` maps the
     legacy `lsp` name to `code_search` for old-session replay (same
     `operation`/`file_path` arg shape).
+14. **Subagent spawn depth guard**: `task_spawn` and `task` (sync) both call
+    `spawn_subagent_kernel_task`, which reads `runtime_ctx::current_subagent_depth()`
+    and rejects spawning when `child_depth > MAX_SUBAGENT_SPAWN_DEPTH` (2). The
+    depth is propagated via `OsTaskGoal.spawn_depth` and scoped as
+    `runtime_ctx::SUBAGENT_DEPTH` in both dispatch paths
+    (`background_dispatch.rs`, `tools/sync_task.rs`). This prevents unbounded
+    recursive fanout when `mode: all` agents (e.g. `build`) are spawned as
+    subagents and themselves hold `task_spawn`.
 
 ## Related detailed guide
 
