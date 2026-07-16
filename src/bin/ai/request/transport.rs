@@ -263,15 +263,44 @@ pub(crate) async fn do_request_messages(
     messages: &[Message],
     stream: bool,
 ) -> Result<Response, RequestError> {
+    do_request_messages_with_tool_mode(app, model, messages, stream, true).await
+}
+
+/// 发起不暴露任何工具的请求。
+///
+/// 用于工具循环或迭代上限后的收口轮次。这里必须在 wire request 层移除
+/// `tools`，而不能只依赖 prompt 要求模型停止调用工具。
+pub(crate) async fn do_request_messages_without_tools(
+    app: &mut App,
+    model: &str,
+    messages: &[Message],
+    stream: bool,
+) -> Result<Response, RequestError> {
+    do_request_messages_with_tool_mode(app, model, messages, stream, false).await
+}
+
+async fn do_request_messages_with_tool_mode(
+    app: &mut App,
+    model: &str,
+    messages: &[Message],
+    stream: bool,
+    tools_enabled: bool,
+) -> Result<Response, RequestError> {
     clear_stale_request_interrupt_before_request(app);
 
     let mut normalized_messages = normalize_messages_for_model(model, messages);
-    let request_tool_names = request_tool_names_for_model(app, model);
+    let request_tool_names = tools_enabled
+        .then(|| request_tool_names_for_model(app, model))
+        .unwrap_or_default();
     strip_unavailable_tool_hints_from_messages(&mut normalized_messages, &request_tool_names);
     if prompt_cache_enabled_for_model(model) {
         apply_prompt_cache_breakpoint(&mut normalized_messages);
     }
-    let (tools_value, tool_choice) = agent_tools_for_request(app, model);
+    let (tools_value, tool_choice) = if tools_enabled {
+        agent_tools_for_request(app, model)
+    } else {
+        (None, None)
+    };
     let thinking_start = Instant::now();
     let force_thinking_requested = config_forces_thinking();
     let enable_thinking = resolve_thinking(app, model, &normalized_messages).await;

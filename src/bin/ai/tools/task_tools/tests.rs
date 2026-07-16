@@ -1,16 +1,17 @@
 use super::{
-    AsyncTaskEntry, InheritOptions, OsTaskGoal,
-    SelectedSubagent, StoredTaskResult, TASK_REGISTRY,
+    AsyncTaskEntry, InheritOptions, OsTaskGoal, SUBAGENT_PARENT_SUMMARY_REMINDER,
+    OutstandingTaskSnapshot, SelectedSubagent, StoredTaskResult, TASK_REGISTRY, WaitManySource,
     append_current_process_cancel_source, build_selection_explanation, encode_os_task_goal,
-    format_task_result, is_encoded_task_goal, prepare_subagent_task, remove_task_entry,
-    select_subagent, wait_sources_for_channel_and_futex,
-    with_task_entry_by_pid,
+    epoll_wait_many, epoll_wait_many_channels, format_task_result, is_encoded_task_goal,
+    prepare_subagent_task, remove_task_entry, render_outstanding_task_anchor, select_subagent,
+    wait_sources_for_channel_and_futex, with_task_entry_by_pid,
 };
 use super::{ToolRegistration, ToolSpec};
 use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
 use crate::ai::cli::ParsedCli;
 use crate::ai::driver::runtime_ctx::{DRIVER_CTX, DriverContext};
 use crate::ai::mcp::McpClient;
+use crate::ai::tools::registry::common::tool_history_policy;
 use crate::ai::types::{App, AppConfig};
 use aios_kernel::{
     kernel::{EventId, KernelInternal, Syscall, WaitPolicy},
@@ -458,6 +459,8 @@ fn task_wait_low_level_wait_wakes_on_task_result_even_with_cancel_source() {
 #[test]
 fn task_wait_formats_empty_subagent_result_explicitly() {
     let entry = AsyncTaskEntry {
+        session_id: String::new(),
+        result_observed: false,
         pid: 42,
         result_channel_id: 1,
         completion_futex_addr: FutexAddr(1),
@@ -481,6 +484,22 @@ fn task_wait_formats_empty_subagent_result_explicitly() {
     assert!(output.contains("FAILED"));
     assert!(output.contains("Error: request timed out waiting for response headers"));
     assert!(output.contains("(subagent did not produce any final assistant text)"));
+    assert!(output.contains(SUBAGENT_PARENT_SUMMARY_REMINDER));
+}
+
+#[test]
+fn subagent_result_tools_are_never_lossy_or_pruned() {
+    for name in ["task", "task_wait", "task_status"] {
+        let policy = tool_history_policy(name);
+        assert!(
+            !policy.allows_lossy_compress(),
+            "{name} result must not be lossy-compressed"
+        );
+        assert!(
+            !policy.allows_prune(),
+            "{name} result must not be LLM-pruned"
+        );
+    }
 }
 
 #[test]
@@ -512,6 +531,8 @@ fn task_entry_can_be_looked_up_by_pid() {
         registry.insert(
             task_id.clone(),
             AsyncTaskEntry {
+                session_id: String::new(),
+                result_observed: false,
                 pid: 4242,
                 result_channel_id: 11,
                 completion_futex_addr: FutexAddr(13),
@@ -541,6 +562,32 @@ fn task_entry_can_be_looked_up_by_pid() {
     );
 
     let _ = remove_task_entry(&task_id);
+}
+
+#[test]
+fn outstanding_task_anchor_lists_ids_and_required_follow_up() {
+    let note = render_outstanding_task_anchor(&[
+        OutstandingTaskSnapshot {
+            task_id: "task_alpha".to_string(),
+            status: "running".to_string(),
+            agent_name: "explore".to_string(),
+            model: "qwen3.7-max".to_string(),
+            description: "inspect parser".to_string(),
+        },
+        OutstandingTaskSnapshot {
+            task_id: "task_beta".to_string(),
+            status: "completed".to_string(),
+            agent_name: "build".to_string(),
+            model: "gpt-5.5".to_string(),
+            description: "verify fix".to_string(),
+        },
+    ]);
+
+    assert!(note.contains("[pending-subagent-tasks]"));
+    assert!(note.contains("Outstanding task_ids: [task_alpha, task_beta]"));
+    assert!(note.contains("task_id=task_alpha status=running"));
+    assert!(note.contains("task_id=task_beta status=completed"));
+    assert!(note.contains("use `task_wait` with the same task_ids"));
 }
 
 fn params_question() -> Value {

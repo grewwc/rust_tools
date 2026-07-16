@@ -122,9 +122,7 @@ fn resize_inline_viewport(terminal: &mut MultilineTerminal, new_height: u16) -> 
 /// 处理 `Event::Resize` 连续触发的情况：终端窗口拖动时 Resize 事件会快速连发，
 /// 如果每次都重绘 inline viewport，会导致"画面撕裂"或闪烁。
 /// 本函数先 drain 掉后续堆积的 Resize 事件，再做一次 full redraw。
-fn handle_resize_burst<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
-) -> io::Result<()> {
+fn handle_resize_burst<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> io::Result<()> {
     // 1) drain 掉所有后续的 Resize 事件，避免重复触发重绘
     while event::poll(Duration::ZERO).unwrap_or(false) {
         match event::read() {

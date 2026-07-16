@@ -9,7 +9,7 @@
 ///     `common_sense`, `coding_guideline`, `preference`, `user_preference`, `safety_rules`
 ///
 /// - **Memory (记忆)**: Agent 内部自动学习的行为规则、安全策略、自我反思
-///   - 工具: `memory_save`, `memory_search`, `memory_recent` (内部使用)
+///   - 已废弃对外工具，功能并入 `knowledge_save`/`knowledge_search`
 ///   - 用途: Agent 自动积累的行为指导，如安全规则、编码规范、自我反思笔记
 ///   - 类别: `safety_rules`, `coding_guideline`, `self_note`, `common_sense` 等
 ///
@@ -323,18 +323,25 @@ fn execute_knowledge_search(args: &Value) -> Result<String, String> {
     let query = args["query"]
         .as_str()
         .ok_or("Missing 'query'. Provide a search term.")?;
-    let category = args["category"].as_str();
+    let category = args["category"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let limit = args["limit"].as_u64().map(|v| v as usize).unwrap_or(10);
 
     let store = MemoryStore::from_env_or_config();
-    let search_query = if let Some(cat) = category {
-        format!("{} {}", query, cat)
-    } else {
-        query.to_string()
-    };
-
-    let results = store.search(&search_query, limit)?;
-    let entries: Vec<_> = results.into_iter().map(|(e, _score)| e).collect();
+    // category 是硬过滤，不再拼进 query 里做“软提示”。默认搜索也不返回
+    // tool_cache：这类条目通常包含某个项目的工具输出/绝对路径，跨项目召回会污染上下文。
+    // 用户显式传 category=tool_cache 时仍可查询。
+    let fetch_limit = limit.saturating_mul(10).min(100).max(limit);
+    let results = store.search(query, fetch_limit)?;
+    let entries: Vec<_> = results
+        .into_iter()
+        .filter_map(|(entry, _score)| {
+            knowledge_search_entry_visible(&entry, category).then_some(entry)
+        })
+        .take(limit)
+        .collect();
 
     if entries.is_empty() {
         return Ok(format!("No knowledge entries found for query: '{}'", query));
@@ -365,6 +372,14 @@ fn execute_knowledge_search(args: &Value) -> Result<String, String> {
     }
 
     Ok(result)
+}
+
+fn knowledge_search_entry_visible(entry: &AgentMemoryEntry, category: Option<&str>) -> bool {
+    if let Some(category) = category {
+        return entry.category == category;
+    }
+
+    entry.category != "tool_cache"
 }
 
 inventory::submit!(ToolRegistration {
@@ -426,10 +441,12 @@ fn execute_knowledge_list(args: &Value) -> Result<String, String> {
         }
     }
 
+    entries.retain(|entry| knowledge_search_entry_visible(entry, None));
+
     if entries.is_empty() {
         if skipped_lines > 0 {
             return Ok(format!(
-                "Knowledge base has no readable entries, but {skipped_lines} line(s) were unparseable and skipped. The memory file may be corrupted."
+                "Knowledge base has no visible entries, but {skipped_lines} line(s) were unparseable and skipped. The memory file may be corrupted."
             ));
         }
         return Ok("Knowledge base is empty. Use knowledge_save to add entries.".to_string());
@@ -749,6 +766,30 @@ mod tests {
             .collect()
     }
 
+    fn write_entries(path: &Path, entries: &[AgentMemoryEntry]) {
+        let mut buf = String::new();
+        for entry in entries {
+            buf.push_str(&serde_json::to_string(entry).unwrap());
+            buf.push('\n');
+        }
+        std::fs::write(path, buf).unwrap();
+    }
+
+    fn test_entry(category: &str, note: &str) -> AgentMemoryEntry {
+        AgentMemoryEntry {
+            id: Some(format!("mem_{}", category)),
+            timestamp: "2025-01-01T00:00:00Z".to_string(),
+            category: category.to_string(),
+            note: note.to_string(),
+            tags: Vec::new(),
+            source: None,
+            priority: Some(100),
+            owner_pid: None,
+            owner_pgid: None,
+            image_path: None,
+        }
+    }
+
     #[test]
     fn test_knowledge_save_params() {
         let params = params_knowledge_save();
@@ -784,6 +825,81 @@ mod tests {
     }
 
     #[test]
+    fn test_knowledge_search_hides_tool_cache_by_default() {
+        let _guard = env_lock_guard();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_knowledge_search_tool_cache_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        write_entries(
+            &path,
+            &[
+                test_entry(
+                    "tool_cache",
+                    "needle cached tool result from /tmp/unrelated_project/src/lib.rs",
+                ),
+                test_entry("user_memory", "needle durable user preference"),
+            ],
+        );
+
+        let default_result =
+            execute_knowledge_search(&serde_json::json!({ "query": "needle" })).unwrap();
+        assert!(default_result.contains("needle durable user preference"));
+        assert!(!default_result.contains("cached tool result"));
+        assert!(!default_result.contains("[tool_cache]"));
+
+        let tool_cache_result = execute_knowledge_search(
+            &serde_json::json!({ "query": "needle", "category": "tool_cache" }),
+        )
+        .unwrap();
+        assert!(tool_cache_result.contains("cached tool result"));
+        assert!(!tool_cache_result.contains("durable user preference"));
+
+        cleanup_memory_artifacts(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
+    fn test_knowledge_search_category_is_hard_filter() {
+        let _guard = env_lock_guard();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_knowledge_search_category_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        write_entries(
+            &path,
+            &[
+                test_entry("user_memory", "needle user-scoped fact"),
+                test_entry("common_sense", "needle durable rule"),
+            ],
+        );
+
+        let result = execute_knowledge_search(
+            &serde_json::json!({ "query": "needle", "category": "common_sense" }),
+        )
+        .unwrap();
+        assert!(result.contains("needle durable rule"));
+        assert!(!result.contains("user-scoped fact"));
+
+        cleanup_memory_artifacts(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
+    }
+
+    #[test]
     fn test_knowledge_list_params() {
         let params = params_knowledge_list();
         // limit is optional, so no required
@@ -793,6 +909,40 @@ mod tests {
                 .map(|a| a.is_empty())
                 .unwrap_or(true)
         );
+    }
+
+    #[test]
+    fn test_knowledge_list_hides_tool_cache_by_default() {
+        let _guard = env_lock_guard();
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rt_knowledge_list_tool_cache_{ts}.jsonl"));
+        unsafe {
+            std::env::set_var("RUST_TOOLS_MEMORY_FILE", &path);
+        }
+
+        write_entries(
+            &path,
+            &[
+                test_entry(
+                    "tool_cache",
+                    "cached tool result from /tmp/unrelated_project/src/lib.rs",
+                ),
+                test_entry("user_memory", "durable user preference"),
+            ],
+        );
+
+        let result = execute_knowledge_list(&serde_json::json!({ "limit": 10 })).unwrap();
+        assert!(result.contains("durable user preference"));
+        assert!(!result.contains("cached tool result"));
+        assert!(!result.contains("[tool_cache]"));
+
+        cleanup_memory_artifacts(&path);
+        unsafe {
+            std::env::remove_var("RUST_TOOLS_MEMORY_FILE");
+        }
     }
 
     #[test]

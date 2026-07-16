@@ -23,6 +23,8 @@ pub(super) struct StreamMarkers {
     pub(super) end_thinking_tag: String,
     pub(super) hidden_begin: &'static str,
     pub(super) hidden_end: &'static str,
+    pub(super) subagent_fold_header: Option<String>,
+    pub(super) subagent_fold_footer: Option<String>,
 }
 
 impl StreamMarkers {
@@ -32,7 +34,24 @@ impl StreamMarkers {
             end_thinking_tag: END_THINKING_TAG_TEXT.to_string(),
             hidden_begin: "<meta:self_note>",
             hidden_end: "</meta:self_note>",
+            subagent_fold_header: None,
+            subagent_fold_footer: None,
         }
+    }
+
+    pub(super) fn enable_subagent_preview(&mut self, agent_name: &str) {
+        let agent_name = agent_name.trim();
+        let suffix = if agent_name.is_empty() {
+            String::new()
+        } else {
+            format!(" {agent_name}")
+        };
+        self.subagent_fold_header = Some(format!("subagent{suffix}"));
+        self.subagent_fold_footer = Some(format!("done subagent{suffix}"));
+    }
+
+    pub(super) fn subagent_preview_enabled(&self) -> bool {
+        self.subagent_fold_header.is_some() && self.subagent_fold_footer.is_some()
     }
 }
 
@@ -89,6 +108,7 @@ pub(super) struct StreamRenderState {
     pub(super) terminal_dedupe: Option<TerminalDedupeState>,
     pub(super) terminal_splitter: StreamSplitter,
     pub(super) thinking_fold: ThinkingFoldState,
+    pub(super) subagent_fold: ThinkingFoldState,
 }
 
 impl StreamRenderState {
@@ -102,6 +122,7 @@ impl StreamRenderState {
             terminal_dedupe: None,
             terminal_splitter: StreamSplitter::new(),
             thinking_fold: ThinkingFoldState::new(),
+            subagent_fold: ThinkingFoldState::new_with_labels("subagent", "done subagent", false),
         }
     }
 }
@@ -128,10 +149,24 @@ pub(super) struct ThinkingFoldState {
     /// 绝不随正文一起被 cursor-up 擦除重画——这样即便正文擦除失步也无法再生出第二个
     /// header，从根上杜绝「孤儿 header 叠加」的渲染 bug。
     pub(super) header_drawn: bool,
+    /// 折叠块 header 文案（如 `thinking` / `subagent explore`）。
+    pub(super) header_label: String,
+    /// 折叠块 footer 文案（如 `done thinking` / `done subagent explore`）。
+    pub(super) footer_label: String,
+    /// 是否在折叠窗口里跳过空白行。thinking 适合紧凑展示；subagent 正文保持原样。
+    pub(super) skip_blank_lines: bool,
 }
 
 impl ThinkingFoldState {
     pub(super) fn new() -> Self {
+        Self::new_with_labels("thinking", "done thinking", true)
+    }
+
+    pub(super) fn new_with_labels(
+        header_label: impl Into<String>,
+        footer_label: impl Into<String>,
+        skip_blank_lines: bool,
+    ) -> Self {
         Self {
             max_visible_lines: usize::MAX,
             recent_lines: VecDeque::new(),
@@ -141,7 +176,19 @@ impl ThinkingFoldState {
             rendered_body_lines: Vec::new(),
             active: false,
             header_drawn: false,
+            header_label: header_label.into(),
+            footer_label: footer_label.into(),
+            skip_blank_lines,
         }
+    }
+
+    pub(super) fn set_labels(
+        &mut self,
+        header_label: impl Into<String>,
+        footer_label: impl Into<String>,
+    ) {
+        self.header_label = header_label.into();
+        self.footer_label = footer_label.into();
     }
 
     pub(super) fn reset(&mut self) {

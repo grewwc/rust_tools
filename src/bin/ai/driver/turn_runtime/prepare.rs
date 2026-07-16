@@ -58,6 +58,22 @@ fn filter_suggested_tool_calls_for_current_schema(
     filter_suggested_tool_calls_for_tool_names(&available_tool_names, suggested_tool_calls)
 }
 
+fn persisted_user_turn_message(
+    user_message: Message,
+    persisted_question_text: &str,
+    resume_turn: bool,
+) -> Message {
+    if !resume_turn {
+        return user_message;
+    }
+
+    Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(persisted_question_text.to_string()),
+        ..user_message
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct QuestionShape {
     char_count: usize,
@@ -538,30 +554,32 @@ pub(super) async fn prepare_turn(
     // The `turn_messages` list (what gets persisted to long-term history)
     // intentionally keeps the original user question without the reminder.
     let context_reminder = skill_turn.context_reminder();
+    let (user_content, persisted_question_text) = {
+        let has_images = !app.attached_image_files.is_empty();
+        let mut final_question = if attachments_text.is_empty() {
+            question.to_string()
+        } else if attachments_text.ends_with('\n') {
+            format!("{}{}", attachments_text, question)
+        } else {
+            format!("{}\n{}", attachments_text, question)
+        };
+        if has_images
+            && !crate::ai::models::supports_image_input(next_model)
+            && let Some(ocr) = precomputed_ocr
+            && ocr.has_usable_text()
+        {
+            print_ocr_summary(&ocr);
+            final_question = format!(
+                "{}\n\n[Auto OCR From Attached Images via {}]\n{}",
+                final_question, ocr.tool_name, ocr.content
+            );
+        }
+        let content = request::build_content(next_model, &final_question, &app.attached_image_files)?;
+        (content, final_question)
+    };
     let user_message = Message {
         role: "user".to_string(),
-        content: {
-            let has_images = !app.attached_image_files.is_empty();
-            let mut final_question = if attachments_text.is_empty() {
-                question.to_string()
-            } else if attachments_text.ends_with('\n') {
-                format!("{}{}", attachments_text, question)
-            } else {
-                format!("{}\n{}", attachments_text, question)
-            };
-            if has_images
-                && !crate::ai::models::supports_image_input(next_model)
-                && let Some(ocr) = precomputed_ocr
-                && ocr.has_usable_text()
-            {
-                print_ocr_summary(&ocr);
-                final_question = format!(
-                    "{}\n\n[Auto OCR From Attached Images via {}]\n{}",
-                    final_question, ocr.tool_name, ocr.content
-                );
-            }
-            request::build_content(next_model, &final_question, &app.attached_image_files)?
-        },
+        content: user_content,
         tool_calls: None,
         tool_call_id: None,
         reasoning_content: None,
@@ -594,13 +612,11 @@ pub(super) async fn prepare_turn(
     // system 角色而非 user，避免模型误读为用户重复提问。
     // 注意：发给 API 的 messages 数组仍保留 role:user（兼容性），
     // 这里只改持久化轨道（turn_messages）的角色。
-    if crate::ai::driver::runtime_ctx::is_resume_turn() {
-        let mut resume_note = user_message;
-        resume_note.role = ROLE_INTERNAL_NOTE.to_string();
-        turn_messages.push(resume_note);
-    } else {
-        turn_messages.push(user_message);
-    }
+    turn_messages.push(persisted_user_turn_message(
+        user_message,
+        &persisted_question_text,
+        crate::ai::driver::runtime_ctx::is_resume_turn(),
+    ));
 
     let max_iterations = app
         .agent_context
@@ -843,11 +859,13 @@ mod tests {
         QuestionShape, collect_session_code_discovery_records, detect_complex_task,
         extract_existing_code_discoveries, filter_suggested_tool_calls_for_tool_names,
         high_confidence_project_memory_policy, looks_like_code_or_repo_question,
+        persisted_user_turn_message,
         recalled_knowledge_usage_policy, render_session_code_discovery_recall,
         should_inject_integrated_reflection, should_run_general_recall,
         should_run_session_code_discovery_recall,
     };
     use crate::ai::code_discovery_policy::parse_record_line;
+    use crate::ai::history::ROLE_INTERNAL_NOTE;
     use crate::ai::driver::observer::SuggestedToolCall;
     use crate::ai::history::Message;
     use crate::ai::tools::storage::memory_store::AgentMemoryEntry;
@@ -975,6 +993,58 @@ mod tests {
             lines
                 .iter()
                 .any(|record| { record.finding.contains("root cause: missing config") })
+        );
+    }
+
+    #[test]
+    fn persisted_user_turn_message_keeps_multimodal_user_content_for_normal_turn() {
+        let user_message = Message {
+            role: "user".to_string(),
+            content: Value::Array(vec![
+                serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": "data:image/png;base64,AAAA" }
+                }),
+                serde_json::json!({
+                    "type": "text",
+                    "text": "describe this"
+                }),
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+
+        let persisted = persisted_user_turn_message(user_message.clone(), "wake up", false);
+        assert_eq!(persisted.role, "user");
+        assert_eq!(persisted.content, user_message.content);
+    }
+
+    #[test]
+    fn persisted_user_turn_message_drops_images_for_resume_turn() {
+        let user_message = Message {
+            role: "user".to_string(),
+            content: Value::Array(vec![
+                serde_json::json!({
+                    "type": "image_url",
+                    "image_url": { "url": "data:image/png;base64,AAAA" }
+                }),
+                serde_json::json!({
+                    "type": "text",
+                    "text": "describe this"
+                }),
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        };
+
+        let persisted =
+            persisted_user_turn_message(user_message, "[Process 1 Woke Up] resume", true);
+        assert_eq!(persisted.role, ROLE_INTERNAL_NOTE);
+        assert_eq!(
+            persisted.content,
+            Value::String("[Process 1 Woke Up] resume".to_string())
         );
     }
 

@@ -3,69 +3,45 @@
 ## Scope
 
 Applies to `src/bin/ai/tools/**`.
-
 Read `docs/agent-guides/ai-tools.md` before changing tool registration,
-execution policy, sandboxing, path resolution, or progressive loading.
+execution policy, sandboxing, path resolution, history/display policy, or
+progressive loading.
 
 ## Key invariants
 
-1. **Layer separation**: schema/metadata in `registry/`, execution in
-   `service/`, shared helpers/state in `storage/`.
-2. **Naming**: tool names use verb-first snake_case.
-3. **Paths**: relative file paths must resolve against
-   `runtime_ctx::effective_cwd()`.
-4. **Progressive loading**: the default per-turn tool set is `core`
-   (`DEFAULT_TURN_TOOL_GROUPS` in `driver/skill_runtime.rs`). Tools tagged
-   only `builtin` (not `core`) are lazy — surfaced via `enable_tools` and
-   aged out when idle. The `os_tools` process/IPC/shm/env suite is
-   `builtin`+`executor` only (NOT `core`), so it is **deferred even for
-   executor agents** — filtered via `groups_defer_eager_load`. Explicit
-   `tools:` name lists are never filtered (naming pins eager).
-5. **Validation**: prefer structural parsing over brittle string matching.
-6. **ToolDisplayRegistration**: display behavior declared per-tool via
-   optional `ToolDisplayRegistration` inventory submission, **not** by adding
-   fields to `ToolSpec`. Defaults to all-`false`. Query via
-   `tool_display_config(name)`.
-7. **ToolHistoryPolicy**: retention declared per-tool via
-   `ToolHistoryPolicyRegistration` (same pattern as rule 6). Two
-   **orthogonal** dimensions: `lossy_compress` (`Allow`/`Never`) gates
-   trimming/folding; `prune` (`Allow`/`Never`) gates LLM-guided pruning.
-   Both default `Allow`. `plan`=`Never`/`Never`;
-   `read_file`/`code_search`=`Never`/`Allow`. Query via
-   `tool_history_policy(name)`. Do not reintroduce name-keyed `if`/`match`
-   chains in `history/compress/`.
-8. **Temp files**: use `write_file(temp=true)`, which writes under
-   `runtime_ctx::temp_dir()` (per-session, outside project dir) and
-   registers in a JSON registry. `file_path` must be relative; absolute
-   paths rejected. `delete_path` only deletes registered files.
-9. **Process groups**: `execute_command` runs via `setsid` in its own process
-   group. Backgrounded pgids recorded in-memory keyed by `session_id`
-   (`storage::process_registry`); `kill_session` `killpg`s at teardown. Do
-   NOT persist pgids to disk (recycled across restarts) or key off
-   `runtime_ctx::temp_dir()`.
-10. **Self-describing truncation**: any truncating tool must let the model
-    distinguish "done" from "incomplete". Canonical: `execute_command`
-    (`format_command_output`). (a) Empty success returns explicit sentinel,
-    never `""`; (b) failure prefixes `Exit code: N`; (c) truncation appends
-    shown-vs-total counts and a narrow/page hint. Do not emit information-free
-    truncation markers. Git/cargo run through `execute_command`.
-11. **Patch hunk matching**: `apply_patch` anchors on remove lines, uses
-    context lines for positioning. Strict match first; stale context tolerated
-    only when removes uniquely identify the target.
-12. **read_file dual cap**: paginates by lines (`offset`/`limit`) but also
-    applies a character cap (`MAX_READ_FILE_RESULT_CHARS`, 64K). Truncation
-    notice computes continue-`offset` from **actually rendered lines**, never
-    from requested `limit`. When size-triggered, says so explicitly.
-    Do not revert to `render_line_excerpt(..., None)`.
-13. **code_search is the single navigation entry point**: wraps six LSP ops
-    (`go_to_definition`, `find_references`, `hover`, `document_symbol`,
-    `workspace_symbol`, `diagnostics`) plus `find_file`/`text_search`/
-    `structural`. Legacy `lsp` maps to `code_search` via
-    `canonical_tool_name`.
-14. **Subagent spawn depth**: `task_spawn`/`task` reject when
-    `child_depth > MAX_SUBAGENT_SPAWN_DEPTH` (1). Only the top-level agent may
-    delegate to a child subagent; child subagents must do work directly and do
-    not see task orchestration tools in their visible tool set.
+1. **Layer separation.** Keep schema/metadata in `registry/`, execution in
+   `service/`, and shared helpers/state in `storage/`.
+2. **Names and paths.** Tool names are verb-first `snake_case`; relative paths
+   resolve through `runtime_ctx::effective_cwd()`.
+3. **Progressive loading.** The default per-turn group is `core`
+   (`DEFAULT_TURN_TOOL_GROUPS` in `driver/skill_runtime.rs`). Tools tagged only
+   `builtin` are lazy-loaded via `enable_tools`. `os_tools` process/IPC/shm/env
+   tools are `builtin` + `executor` only and stay deferred even for executor
+   agents. Explicit `tools:` name lists pin eager visibility.
+4. **Registry-driven metadata.** Display behavior uses
+   `ToolDisplayRegistration`; history retention uses
+   `ToolHistoryPolicyRegistration`. Do not add broad fields to `ToolSpec` or
+   reintroduce name-keyed policy chains in `history/compress/`.
+5. **History policy semantics.** `lossy_compress` and `prune` are orthogonal.
+   Preserve truth for `plan`, `read_file`, `code_search`, and subagent task
+   tools with explicit overflow stubs/file pointers instead of lossy summaries.
+6. **Temp files.** `write_file(temp=true)` writes under `runtime_ctx::temp_dir()`
+   and registers a relative path in the JSON temp registry. `delete_path` only
+   deletes registered temp files.
+7. **Process groups.** `execute_command` runs in its own process group. Keep
+   background pgids in the in-memory session registry and kill by process group
+   at teardown; do not persist pgids across restarts.
+8. **Self-describing truncation.** Truncating tools must distinguish complete,
+   failed, and incomplete output. Include shown-vs-total counts and a concrete
+   narrow/page hint when output is cut.
+9. **Patch/read/search contracts.** `apply_patch` anchors on remove lines and
+   tolerates stale context only when the removal is unique. `read_file` paginates
+   by line and by character cap, computing continuation offsets from rendered
+   lines. `code_search` is the single entry point for LSP, file, text, and
+   structural navigation.
+10. **Subagent tools.** `task`/`task_spawn` enforce the depth cap, results are
+    session-scoped, and surfaced child outputs must remind the parent to produce
+    its own summary.
 
 ## Related detailed guide
 

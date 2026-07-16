@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::ai::{
     config_schema::AiConfig,
+    driver::runtime_ctx,
     models,
     provider::{self, ProviderAdapter},
     request::StreamChunk,
@@ -47,9 +48,10 @@ pub(super) async fn stream_response(
     current_history: &mut String,
     _terminal_dedupe_candidate: Option<&str>,
 ) -> Result<StreamResult, Box<dyn std::error::Error>> {
-    let markers = StreamMarkers::new();
+    let mut markers = StreamMarkers::new();
     let mut state = StreamProcessingState::new();
     configure_thinking_fold(&mut state);
+    configure_subagent_preview_fold(app, &mut state, &mut markers);
     let adapter = provider::adapter_for(
         models::model_adapter(&app.current_model),
         &models::endpoint_for_model(&app.current_model, &app.config.endpoint),
@@ -153,6 +155,31 @@ fn configure_thinking_fold(state: &mut StreamProcessingState) {
     );
 }
 
+fn configure_subagent_preview_fold(
+    app: &App,
+    state: &mut StreamProcessingState,
+    markers: &mut StreamMarkers,
+) {
+    if !io::stdout().is_terminal() || runtime_ctx::current_subagent_depth() == 0 {
+        state.render.subagent_fold.max_visible_lines = usize::MAX;
+        return;
+    }
+
+    state.render.subagent_fold.max_visible_lines = resolve_thinking_fold_max_visible_lines(
+        true,
+        configw::get_all_config()
+            .get_opt(AiConfig::OUTPUT_THINKING_MAX_VISIBLE_LINES)
+            .as_deref(),
+    );
+    markers.enable_subagent_preview(&app.current_agent);
+    if let (Some(header), Some(footer)) = (
+        markers.subagent_fold_header.as_deref(),
+        markers.subagent_fold_footer.as_deref(),
+    ) {
+        state.render.subagent_fold.set_labels(header, footer);
+    }
+}
+
 fn resolve_thinking_fold_max_visible_lines(is_tty: bool, raw: Option<&str>) -> usize {
     if !is_tty {
         return usize::MAX;
@@ -204,6 +231,8 @@ fn cancelled_stream_result(state: &mut StreamProcessingState) -> StreamResult {
     let _ = clear_waiting_hint(state);
     if state.render.thinking_fold.active {
         let _ = finalize_thinking_fold(state);
+    } else if state.render.subagent_fold.active {
+        let _ = finalize_subagent_preview_fold(state);
     } else if state.content.thinking_open {
         print!("\x1b[0m");
         let _ = io::stdout().flush();
@@ -324,6 +353,10 @@ fn finalize_stream_response(
                 false,
             )?;
         }
+    }
+
+    if state.render.subagent_fold.active {
+        finalize_subagent_preview_fold(&mut state)?;
     }
 
     flush_terminal_splitter(&mut state, markers)?;
@@ -555,6 +588,9 @@ async fn handle_stream_decode_error<E: std::fmt::Display>(
         print!("\x1b[0m");
         let _ = io::stdout().flush();
     }
+    if state.render.subagent_fold.active {
+        let _ = finalize_subagent_preview_fold(state);
+    }
 
     let _ = state.render.markdown.flush_pending();
 
@@ -775,12 +811,16 @@ fn commit_visible_content(
         return Ok(());
     }
 
-    maybe_write_stream_content(
-        content.as_str(),
-        state,
-        markers,
-        state.content.thinking_open,
-    )?;
+    if markers.subagent_preview_enabled() {
+        write_subagent_content_folded(content.as_str(), state)?;
+    } else {
+        maybe_write_stream_content(
+            content.as_str(),
+            state,
+            markers,
+            state.content.thinking_open,
+        )?;
+    }
     if state.content.thinking_open {
         return Ok(());
     }
@@ -897,28 +937,51 @@ fn write_thinking_content_folded(
         return write_stream_content_to_terminal(content, &mut state.render.markdown, true);
     }
 
-    // 逐字符处理
+    append_fold_content(fold, content);
+
+    thinking_fold_redraw(fold)
+}
+
+fn write_subagent_content_folded(
+    content: &str,
+    state: &mut StreamProcessingState,
+) -> io::Result<()> {
+    if content.is_empty() {
+        return Ok(());
+    }
+
+    let fold = &mut state.render.subagent_fold;
+    if fold.max_visible_lines == usize::MAX {
+        return write_stream_content_to_terminal(content, &mut state.render.markdown, false);
+    }
+
+    if !fold.active {
+        if state.render.markdown.has_unfinished_line() {
+            write_stream_content_to_terminal("\n", &mut state.render.markdown, false)?;
+        }
+        fold.active = true;
+    }
+
+    append_fold_content(fold, content);
+    thinking_fold_redraw(fold)
+}
+
+fn append_fold_content(fold: &mut super::state::ThinkingFoldState, content: &str) {
     for ch in content.chars() {
         if ch == '\n' {
-            // 一行完成
             let completed_line = std::mem::take(&mut fold.current_line);
-            // 折叠视图内跳过空行（无论开头还是段间）：模型推理常用空行分段，
-            // 但紧凑折叠窗口里空行纯属噪音，会平白占一行可见预算。原文仍完整
-            // 保留在 reasoning_text，不影响回传后端。
-            if !completed_line.trim().is_empty() {
-                fold.total_lines += 1;
-                fold.recent_lines.push_back(completed_line);
-                // 只保留最近 max_visible_lines 行
-                while fold.recent_lines.len() > fold.max_visible_lines {
-                    fold.recent_lines.pop_front();
-                }
+            if fold.skip_blank_lines && completed_line.trim().is_empty() {
+                continue;
+            }
+            fold.total_lines += 1;
+            fold.recent_lines.push_back(completed_line);
+            while fold.recent_lines.len() > fold.max_visible_lines {
+                fold.recent_lines.pop_front();
             }
         } else {
             fold.current_line.push(ch);
         }
     }
-
-    thinking_fold_redraw(fold)
 }
 
 /// 只覆盖 thinking 正文窗口（折叠摘要 + 最近可见行），header 不在此列。
@@ -937,7 +1000,7 @@ fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Resul
         write!(out, "\x1b[{}A\r\x1b[0J", erase_rows)?;
     }
     if fold.active && !fold.header_drawn {
-        write_thinking_fold_header(&mut out)?;
+        write_fold_header(&mut out, fold)?;
         fold.header_drawn = true;
     }
 
@@ -953,16 +1016,27 @@ fn thinking_fold_redraw(fold: &mut super::state::ThinkingFoldState) -> io::Resul
 }
 
 /// 打印锚定的折叠 header。只应在折叠激活后被调用一次。
-fn write_thinking_fold_header(out: &mut impl Write) -> io::Result<()> {
+fn write_fold_header(
+    out: &mut impl Write,
+    fold: &super::state::ThinkingFoldState,
+) -> io::Result<()> {
     write!(
         out,
-        "{ACCENT_RULE}╭─\x1b[0m {ACCENT_MUTED}thinking\x1b[0m\n"
+        "{ACCENT_RULE}╭─\x1b[0m {ACCENT_MUTED}{}\x1b[0m\n",
+        fold.header_label
     )
 }
 
 /// Thinking 结束时的最终渲染：覆盖正文窗口，输出最终折叠摘要 + "done thinking"。
 pub(super) fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::Result<()> {
-    let fold = &mut state.render.thinking_fold;
+    finalize_fold(&mut state.render.thinking_fold)
+}
+
+fn finalize_subagent_preview_fold(state: &mut StreamProcessingState) -> io::Result<()> {
+    finalize_fold(&mut state.render.subagent_fold)
+}
+
+fn finalize_fold(fold: &mut super::state::ThinkingFoldState) -> io::Result<()> {
     if !fold.active {
         return Ok(());
     }
@@ -974,7 +1048,7 @@ pub(super) fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::R
     }
     // 若正文从未渲染过（header 尚未落地），补一个 header 以保证块结构完整。
     if !fold.header_drawn {
-        write_thinking_fold_header(&mut out)?;
+        write_fold_header(&mut out, fold)?;
         fold.header_drawn = true;
     }
 
@@ -989,7 +1063,8 @@ pub(super) fn finalize_thinking_fold(state: &mut StreamProcessingState) -> io::R
     // "done thinking" 结尾标记
     write!(
         out,
-        "{ACCENT_RULE}╰─\x1b[0m {ACCENT_MUTED}done thinking\x1b[0m\n"
+        "{ACCENT_RULE}╰─\x1b[0m {ACCENT_MUTED}{}\x1b[0m\n",
+        fold.footer_label
     )?;
     out.flush()?;
 
@@ -1259,6 +1334,21 @@ fn stream_text_event_to_content(
     merge_mode: StreamEventMergeMode,
     assistant_text: &str,
 ) -> Option<String> {
+    if markers.subagent_preview_enabled() {
+        return match event {
+            StreamTextEvent::OpenThinking | StreamTextEvent::CloseThinking => None,
+            StreamTextEvent::AppendThinking(text) => (!text.is_empty()).then(|| text.clone()),
+            StreamTextEvent::AppendContent(text) => match merge_mode {
+                StreamEventMergeMode::Append => (!text.is_empty()).then(|| text.clone()),
+                StreamEventMergeMode::AppendMissingSuffix => {
+                    let suffix = unseen_suffix(assistant_text, text);
+                    (!suffix.is_empty()).then_some(suffix)
+                }
+            },
+            StreamTextEvent::AppendHiddenMeta(_) => None,
+        };
+    }
+
     match event {
         StreamTextEvent::OpenThinking => Some(format!("\n{}\n", markers.thinking_tag)),
         StreamTextEvent::AppendThinking(text) => (!text.is_empty()).then(|| text.clone()),
@@ -1279,6 +1369,31 @@ fn unseen_suffix(existing: &str, incoming: &str) -> String {
         return String::new();
     }
 
+    let leading_ws_len = incoming
+        .char_indices()
+        .find_map(|(idx, c)| (!c.is_whitespace()).then_some(idx))
+        .unwrap_or(incoming.len());
+    if leading_ws_len > 0 {
+        let trimmed = &incoming[leading_ws_len..];
+        if trimmed.is_empty() || existing.ends_with(trimmed) {
+            return String::new();
+        }
+        if let Some(suffix) = unseen_suffix_after_visible_overlap(existing, trimmed) {
+            return suffix;
+        }
+    }
+
+    if let Some(suffix) = unseen_suffix_after_visible_overlap(existing, incoming) {
+        return suffix;
+    }
+
+    if let Some(suffix) = unseen_suffix_whitespace_tolerant(existing, incoming) {
+        return suffix;
+    }
+    incoming.to_string()
+}
+
+fn unseen_suffix_after_visible_overlap(existing: &str, incoming: &str) -> Option<String> {
     let boundaries = incoming
         .char_indices()
         .map(|(idx, _)| idx)
@@ -1291,11 +1406,73 @@ fn unseen_suffix(existing: &str, incoming: &str) -> String {
         // 纯空白（如 \n）的重叠几乎总是伪匹配——模型常以 \n 开始新段落，
         // 而 assistant_text 也常以 \n 结尾。只有含可见字符的重叠才视为真正的重复。
         if existing.ends_with(overlap) && overlap.chars().any(|c| !c.is_whitespace()) {
-            return incoming[split_idx..].to_string();
+            return Some(incoming[split_idx..].to_string());
         }
     }
 
-    incoming.to_string()
+    None
+}
+
+/// 空白容忍的后缀去重。
+///
+/// `commit_visible_content` 会对每段内容做 `trim_matches('\n')`，纯空白 delta
+/// 也不会累积进 `assistant_text`，因此 `assistant_text` 相对 `response.output_text.done`
+/// 快照会丢失段间换行。此时精确的 `ends_with` 与 `unseen_suffix_after_visible_overlap`
+/// 都会失败，导致整段已流式输出的快照被当作新内容重复输出。
+///
+/// 这里按"空白可跳过"的方式逐字符对齐 existing 与 incoming，找出 incoming 中已被
+/// existing 覆盖的前缀，返回 incoming 剩余的（保留原始空白）尾部。若 incoming 的可见
+/// 字符已全部被覆盖则返回 `Some("")`；若两者在可见字符上无法对齐则返回 `None`。
+fn unseen_suffix_whitespace_tolerant(existing: &str, incoming: &str) -> Option<String> {
+    let e: Vec<(usize, char)> = existing.char_indices().collect();
+    let i: Vec<(usize, char)> = incoming.char_indices().collect();
+    let (mut ei, mut ii) = (0usize, 0usize);
+
+    // 跳过 incoming 开头的空白（快照常以换行开头，而 assistant_text 没有）
+    while ii < i.len() && i[ii].1.is_whitespace() {
+        ii += 1;
+    }
+
+    // last_matched_ii 记录 incoming 中最后一个被匹配上的可见字符之后的 Vec 下标，
+    // 用于在结束时定位"剩余未覆盖尾部"在 incoming 中的字节起点。
+    let mut last_matched_ii = ii;
+
+    while ei < e.len() && ii < i.len() {
+        let (ec, ic) = (e[ei].1, i[ii].1);
+        if ec.is_whitespace() && ic.is_whitespace() {
+            while ei < e.len() && e[ei].1.is_whitespace() {
+                ei += 1;
+            }
+            while ii < i.len() && i[ii].1.is_whitespace() {
+                ii += 1;
+            }
+            continue;
+        }
+        if ec.is_whitespace() {
+            ei += 1;
+            continue;
+        }
+        if ic.is_whitespace() {
+            ii += 1;
+            continue;
+        }
+        // 两侧都是可见字符：必须相等才算对齐
+        if ec == ic {
+            last_matched_ii = ii + 1;
+            ei += 1;
+            ii += 1;
+        } else {
+            return None;
+        }
+    }
+
+    // existing 已耗尽；incoming 中 last_matched_ii 之后的字节即为剩余（未覆盖）尾部。
+    // 若 incoming 也已全部匹配则 start_byte == incoming.len()，返回空串。
+    let start_byte = i
+        .get(last_matched_ii)
+        .map(|(b, _)| *b)
+        .unwrap_or(incoming.len());
+    Some(incoming[start_byte..].to_string())
 }
 
 fn flush_sse_event(

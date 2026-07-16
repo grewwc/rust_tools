@@ -203,21 +203,25 @@ pub(crate) struct StreamChoice {
     pub(crate) finish_reason: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default)]
 pub(crate) struct StreamDelta {
-    #[serde(default, deserialize_with = "displayable_string_or_default")]
     pub(crate) content: String,
-    #[serde(
-        default,
-        alias = "reasoning",
-        alias = "reasoning_text",
-        deserialize_with = "reasoning_content_string_or_default"
-    )]
     pub(crate) reasoning_content: String,
-    #[serde(default, deserialize_with = "reasoning_details_string_or_default")]
     pub(crate) reasoning_details: String,
-    #[serde(default, deserialize_with = "vec_or_default")]
     pub(crate) tool_calls: Vec<StreamToolCall>,
+}
+
+impl<'de> Deserialize<'de> for StreamDelta {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Option::<Value>::deserialize(deserializer)?;
+        Ok(value
+            .as_ref()
+            .map(stream_delta_from_value)
+            .unwrap_or_default())
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -259,17 +263,6 @@ where
         .unwrap_or_default())
 }
 
-fn displayable_string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<Value>::deserialize(deserializer)?;
-    Ok(value
-        .as_ref()
-        .map(extract_displayable_text)
-        .unwrap_or_default())
-}
-
 fn reasoning_details_string_or_default<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -303,6 +296,90 @@ pub(super) fn extract_displayable_text(value: &Value) -> String {
             .collect::<Vec<_>>()
             .join(""),
         Value::Object(map) => extract_text_from_object(map, &["text", "content", "delta"]),
+    }
+}
+
+fn stream_delta_from_value(value: &Value) -> StreamDelta {
+    let Some(map) = value.as_object() else {
+        return StreamDelta {
+            content: extract_displayable_text(value),
+            ..Default::default()
+        };
+    };
+
+    let (content, reasoning_from_content) = map
+        .get("content")
+        .map(extract_structured_stream_content_channels)
+        .unwrap_or_default();
+    let reasoning_content = [
+        "reasoning_content",
+        "reasoning",
+        "reasoning_text",
+        "summary_text",
+        "summary",
+    ]
+    .iter()
+    .filter_map(|key| map.get(*key))
+    .map(extract_reasoning_details_text)
+    .find(|text| !text.is_empty())
+    .unwrap_or_default();
+    let reasoning_content = merge_reasoning_fragments(&reasoning_content, &reasoning_from_content);
+
+    let reasoning_details = map
+        .get("reasoning_details")
+        .map(extract_reasoning_details_text)
+        .unwrap_or_default();
+    let tool_calls = map
+        .get("tool_calls")
+        .and_then(|value| serde_json::from_value::<Vec<StreamToolCall>>(value.clone()).ok())
+        .unwrap_or_default();
+
+    StreamDelta {
+        content,
+        reasoning_content,
+        reasoning_details,
+        tool_calls,
+    }
+}
+
+fn extract_structured_stream_content_channels(value: &Value) -> (String, String) {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => (String::new(), String::new()),
+        Value::String(s) => (s.clone(), String::new()),
+        Value::Array(items) => {
+            let mut content = String::new();
+            let mut reasoning = String::new();
+            for item in items {
+                let (item_content, item_reasoning) =
+                    extract_structured_stream_content_channels(item);
+                content.push_str(&item_content);
+                reasoning.push_str(&item_reasoning);
+            }
+            (content, reasoning)
+        }
+        Value::Object(map) => {
+            let item_type = map
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if matches!(
+                item_type.as_str(),
+                "summary_text" | "reasoning" | "reasoning_text" | "reasoning_content"
+            ) {
+                return (String::new(), extract_reasoning_details_text(value));
+            }
+            for key in ["text", "content", "delta", "refusal"] {
+                if let Some(inner) = map.get(key) {
+                    let (content, _) = extract_structured_stream_content_channels(inner);
+                    if !content.is_empty() {
+                        return (content, String::new());
+                    }
+                }
+            }
+            (String::new(), String::new())
+        }
     }
 }
 

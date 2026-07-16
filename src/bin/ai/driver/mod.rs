@@ -185,10 +185,10 @@ pub(super) fn format_rlimit_termination_result(verdict: RlimitVerdict) -> String
 /// 4096 过高：在「字节完全重复才停」与「跑满上限」之间缺乏中段治理，单轮可
 /// 堆出数十万字符上下文。中段断路器（orchestrator 的 iteration soft limit）
 /// 已负责及时收敛，这里作为硬上限收敛到更合理的量级即可。
-const DEFAULT_MAX_ITERATIONS: usize = 64;
+const DEFAULT_MAX_ITERATIONS: usize = 64 * 16;
 
 /// Max iterations for subagent (executor) processes
-const EXECUTOR_MAX_ITERATIONS: usize = 64;
+const EXECUTOR_MAX_ITERATIONS: usize = 64 * 16;
 
 fn one_shot_cli_mode(cli: &cli::ParsedCli) -> bool {
     !cli.args.is_empty() && !cli.interactive

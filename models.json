@@ -275,6 +275,25 @@
     "reasoning_encrypted_replay": true,
     "subagent_priority": 50,
     "max_output_tokens": 128000,
-    "request_tpm_limit": 650000
+    "request_tpm_limit": 750000
+  },
+  {
+    "key": "gpt-5.6-terra",
+    "name": "enc:kjE9AWXjozBdf55K2wRejx8Z3iiP",
+    "endpoint": "enc:Lh51RHWUngr1mKckIbMUVi3ERzAEh7tTCaVSnQSYA3xW70azwJjgEIAFGxPtDRdXHKSCjZK6CNsLiek=",
+    "api_key_config_key": "enc:0VoPeL7SIkt4/aNkQ0jN/MAAsHK2h1Y=",
+    "quality_tier": "flagship",
+    "adapter": "compatible",
+    "is_vl": true,
+    "search_enabled": true,
+    "tools_default_enabled": true,
+    "enable_thinking": true,
+    "request_protocol": "responses",
+    "default_reasoning_effort": "high",
+    "reasoning_effort_conflicts_with_tools": false,
+    "reasoning_encrypted_replay": true,
+    "subagent_priority": 50,
+    "max_output_tokens": 128000,
+    "request_tpm_limit": 750000
   }
 ]

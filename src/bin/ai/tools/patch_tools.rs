@@ -264,27 +264,25 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
             // hunk header，合成一个，让 parse_unified_hunks 能识别。old_start=0 表示
             // 无标称位置，locate_hunk 会跳过标称匹配直接全文件搜索。
             let has_hunk_header = envelope.body_lines.iter().any(|l| l.starts_with("@@"));
+            // 即便已有 hunk header，模型也常把 context 行写成裸文本；在 envelope
+            // 内将这类裸行补成 context 行，避免无意义的 invalid hunk line 失败。
+            let normalized_body: Vec<String> = envelope
+                .body_lines
+                .iter()
+                .map(|line| {
+                    if line.starts_with("@@") || line.is_empty() {
+                        line.clone()
+                    } else if line.starts_with('+') || line.starts_with('-') || line.starts_with(' ')
+                    {
+                        line.clone()
+                    } else {
+                        format!(" {}", line)
+                    }
+                })
+                .collect();
             if has_hunk_header {
-                envelope.body_lines.join("\n")
+                normalized_body.join("\n")
             } else {
-                // 对不以 +/-/ 开头的行补上空格前缀（当作 context 行），
-                // 避免 parse_unified_hunks 报 "invalid hunk line"。
-                let normalized_body: Vec<String> = envelope
-                    .body_lines
-                    .iter()
-                    .map(|line| {
-                        if line.is_empty() {
-                            String::new()
-                        } else if line.starts_with('+')
-                            || line.starts_with('-')
-                            || line.starts_with(' ')
-                        {
-                            line.clone()
-                        } else {
-                            format!(" {}", line)
-                        }
-                    })
-                    .collect();
                 let mut normalized = String::from("@@ -0,0 +1,0 @@");
                 if !envelope.body_lines.is_empty() {
                     normalized.push('\n');
@@ -315,8 +313,10 @@ fn normalize_patch_text(path: &Path, patch: &str) -> Result<(String, String), St
             for line in &normalized_body {
                 if !line.starts_with('+') {
                     return Err(format!(
-                        "invalid Add File line: {}. Every content line in an Add File envelope must start with `+`.",
-                        line
+                        "invalid Add File line: {:?}. Every content line in an Add File envelope must \
+                         start with `+`. Hint: prefix each file line with `+`, or use `*** Update File` \
+                         with a unified diff hunk instead.",
+                         line
                     ));
                 }
             }
@@ -376,16 +376,21 @@ fn lines_match(actual: &str, expected: &str, mode: MatchMode) -> bool {
         return true;
     }
     match mode {
-        MatchMode::Strict => false,
-        MatchMode::IgnoreIndent => {
-            if actual.trim() == expected.trim() {
+        MatchMode::Strict => {
+            // 模型经常从 read_file 输出中复制 `   42| ` 格式的行号前缀，
+            // 在严格匹配前先剥离行号前缀再比较，避免无谓的 Strict→IgnoreIndent 降级。
+            let expected_stripped = strip_line_number_prefix(expected);
+            let actual_stripped = strip_line_number_prefix(actual);
+            if actual_stripped == expected_stripped
+                || actual_stripped.trim_end() == expected_stripped.trim_end()
+            {
                 return true;
             }
-            // 兜底：模型可能从 read_file_lines 输出中复制了行号前缀（如 `   42| `），
-            // 剥离行号前缀后再比较。actual 来自文件（无行号），expected 来自 patch（可能有）。
-            let actual_stripped = strip_line_number_prefix(actual);
-            let expected_stripped = strip_line_number_prefix(expected);
-            actual_stripped.trim() == expected_stripped.trim()
+            false
+        }
+        MatchMode::IgnoreIndent => {
+            // 同样剥离行号前缀再 trim，覆盖缩进+行号双重差异的场景。
+            strip_line_number_prefix(actual).trim() == strip_line_number_prefix(expected).trim()
         }
     }
 }
@@ -798,13 +803,14 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
                  the mismatch may be due to hunk ordering or a missing trailing line.\n",
             );
         } else {
+            // 展示前 10 个不匹配行：完整偏移模式比精简字数对模型修 patch 更重要
             let show = best.mismatches.len().min(10);
             msg.push_str(&format!(
                 "Mismatched lines (showing {} of {}):\n",
                 show,
                 best.mismatches.len()
             ));
-            for (file_line, exp, act) in best.mismatches.iter().take(10) {
+            for (file_line, exp, act) in best.mismatches.iter().take(show) {
                 let first_diff = describe_first_char_mismatch(exp, act)
                     .map(|detail| format!("; first differing char at {detail}"))
                     .unwrap_or_default();
@@ -813,23 +819,23 @@ fn describe_context_mismatch(orig_lines: &[String], hunk: &UnifiedHunk) -> Strin
                     file_line, exp, act, first_diff
                 ));
             }
-            if best.mismatches.len() > 10 {
+            if best.mismatches.len() > show {
                 msg.push_str(&format!(
                     "  ... ({} more mismatches)\n",
-                    best.mismatches.len() - 10
+                    best.mismatches.len() - show
                 ));
             }
         }
     } else {
         // 文件中找不到任何部分匹配——块完全不存在。回显期望行和标称位置附近实际内容。
         msg.push_str("Patch expected these lines (context/removed):\n");
-        for (i, line) in expected.iter().take(20).enumerate() {
+        for (i, line) in expected.iter().take(10).enumerate() {
             msg.push_str(&format!("  expected[{}]: {}\n", i, line));
         }
-        if expected.len() > 20 {
+        if expected.len() > 10 {
             msg.push_str(&format!(
                 "  ... ({} more expected lines)\n",
-                expected.len() - 20
+                expected.len() - 10
             ));
         }
         let win_start = nominal.saturating_sub(3);
@@ -903,8 +909,25 @@ fn locate_hunk(
     cursor: usize,
     mode: MatchMode,
 ) -> Result<Option<usize>, String> {
+    let old_len = hunk_old_line_count(hunk);
+    if old_len == 0 {
+        if hunk.old_start == 0 {
+            return Ok(Some(cursor));
+        }
+        let nominal = hunk.old_start.saturating_sub(1);
+        if nominal < cursor {
+            return Err("hunks out of order".to_string());
+        }
+        return if nominal <= orig_lines.len() {
+            Ok(Some(nominal))
+        } else {
+            Ok(None)
+        };
+    }
+
     let nominal = hunk.old_start.saturating_sub(1);
-    let nominal_ok = nominal <= orig_lines.len()
+    let nominal_ok = hunk.old_start > 0
+        && nominal <= orig_lines.len()
         && nominal >= cursor
         && try_apply_hunk_at(orig_lines, hunk, nominal, mode, ContextPolicy::Require).is_some();
     if nominal_ok {
@@ -1031,14 +1054,31 @@ fn strip_code_fence(patch: &str) -> String {
 }
 
 pub(crate) fn execute_apply_patch(args: &Value) -> Result<String, String> {
-    let raw_patch = args["patch"].as_str().ok_or("missing patch")?;
+    let raw_patch = args["patch"].as_str().ok_or_else(|| {
+        let actual = match args.get("patch") {
+            None => "missing".to_string(),
+            Some(Value::String(_)) => "string (should not happen)".to_string(),
+            Some(Value::Object(_)) => "object".to_string(),
+            Some(Value::Array(_)) => "array".to_string(),
+            Some(Value::Number(_)) => "number".to_string(),
+            Some(Value::Bool(_)) => "boolean".to_string(),
+            Some(Value::Null) => "null".to_string(),
+        };
+        format!(
+            "patch parameter has wrong type ({actual}): expected a string. \
+             Pass the patch text as a string value, not a JSON object or array."
+        )
+    })?;
     let patch = strip_code_fence(raw_patch);
     let initial_file_path = optional_file_path_arg(args);
     let envelope = parse_patch_envelope(&patch)?;
     let file_path = initial_file_path
         .map(str::to_string)
         .or_else(|| envelope.as_ref().map(|parsed| parsed.target_path.clone()))
-        .ok_or("missing file_path")?;
+        .ok_or(
+            "missing file_path: provide `file_path` (or `path`) arg, \
+             or wrap the patch in a `*** Begin Patch` / `*** Update File: <path>` envelope.",
+        )?;
 
     let store = FileStore::new(PathBuf::from(&file_path));
     store
@@ -1065,7 +1105,21 @@ pub(crate) fn execute_apply_patch_streaming(
     args: &Value,
     on_chunk: &mut ToolStreamWriter<'_>,
 ) -> Result<String, String> {
-    let raw_patch = args["patch"].as_str().ok_or("missing patch")?;
+    let raw_patch = args["patch"].as_str().ok_or_else(|| {
+        let actual = match args.get("patch") {
+            None => "missing".to_string(),
+            Some(Value::String(_)) => "string (should not happen)".to_string(),
+            Some(Value::Object(_)) => "object".to_string(),
+            Some(Value::Array(_)) => "array".to_string(),
+            Some(Value::Number(_)) => "number".to_string(),
+            Some(Value::Bool(_)) => "boolean".to_string(),
+            Some(Value::Null) => "null".to_string(),
+        };
+        format!(
+            "patch parameter has wrong type ({actual}): expected a string. \
+             Pass the patch text as a string value, not a JSON object or array."
+        )
+    })?;
     let patch = strip_code_fence(raw_patch);
     emit_stream_line(on_chunk, "parsing patch envelope");
 
@@ -1074,7 +1128,10 @@ pub(crate) fn execute_apply_patch_streaming(
     let file_path = initial_file_path
         .map(str::to_string)
         .or_else(|| envelope.as_ref().map(|parsed| parsed.target_path.clone()))
-        .ok_or("missing file_path")?;
+        .ok_or(
+            "missing file_path: provide `file_path` (or `path`) arg, \
+             or wrap the patch in a `*** Begin Patch` / `*** Update File: <path>` envelope.",
+        )?;
 
     let store = FileStore::new(PathBuf::from(&file_path));
     emit_stream_line(on_chunk, &format!("target: {}", store.path().display()));
@@ -1906,6 +1963,17 @@ mod tests {
         let patch = "@@\n alpha\n-beta\n+changed\n";
         let result = apply_unified_patch(original, patch).expect("bare @@ hunk should apply");
         assert_eq!(result, "alpha\nchanged\ngamma\n");
+    }
+
+    #[test]
+    fn apply_unified_patch_bare_at_header_requires_unique_match() {
+        // 裸 @@ header 没有标称行号，不能把 old_start=0 当成第 1 行的强锚点。
+        // 如果上下文在文件中出现多次，应要求模型补充更多上下文，避免静默改错首个位置。
+        let original = "alpha\nbeta\ngamma\nalpha\nbeta\ngamma\n";
+        let patch = "@@\n alpha\n-beta\n+changed\n";
+        let err = apply_unified_patch(original, patch).unwrap_err();
+        assert!(err.contains("ambiguous patch"), "err was: {err}");
+        assert!(err.contains("1-based lines: 1, 4"), "err was: {err}");
     }
 
     #[test]

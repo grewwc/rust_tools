@@ -66,7 +66,7 @@ impl Category {
     /// 路径写入），带有 `source="session:{id}"` 的会话血缘。如果把它当作全局
     /// guideline 召回，旧 session 的反思会污染新 session 的 system prompt，
     /// 表现为模型在新窗口"自言自语"接续旧话题。条目仍持久化到 jsonl，可通过
-    /// `memory_search` 等工具按需查询，但不再自动注入。
+    /// `knowledge_search` 等工具按需查询，但不再自动注入。
     pub fn is_guideline(&self) -> bool {
         matches!(
             self,

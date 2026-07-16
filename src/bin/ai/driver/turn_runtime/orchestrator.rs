@@ -52,9 +52,9 @@ const VOLATILE_ARG_KEYS: &[&str] = &["offset", "limit", "page", "cursor", "max_r
 
 /// 中段断路器绝对上限：单轮工具迭代达到该值即注入一次收敛提示，远早于
 /// max_iterations 硬上限，用于治理「合法但低效」的工具刷屏。
-/// 默认 turn 预算是 2048；若把软提示 cap 放到几百轮，像日志排查这类探索型
-/// 问题会先空转一两百轮才被提醒收敛，明显过晚。
-const TOOL_ITERATION_SOFT_LIMIT: usize = 128;
+/// 默认 turn 预算是 1024；软提示应足够早，给模型留出整理证据并主动收口的空间，
+/// 但它只提醒、不禁用工具，不压缩复杂任务的硬预算。
+const TOOL_ITERATION_SOFT_LIMIT: usize = 24;
 
 /// 连续「流读取中断型」截断（stream_error）的重试上限。超过即放弃本 turn，
 /// 避免服务端持续断流时无限重试（尤其后台任务的 max_iterations = usize::MAX）。
@@ -87,6 +87,10 @@ const LONG_LOOP_COMPRESS_ITERATION_THRESHOLD: usize = 12;
 /// 免费探索轮数：达到该轮次前，即使连续无进展也完全不打扰（删代码前先定位、
 /// 陌生代码库先摸索都是正常的）。
 const PROGRESS_FREE_EXPLORE_ROUNDS: usize = 20;
+/// 只读任务允许充分探索；但如果已经触达大量不同目标仍未收口，说明可能从
+/// 「补关键证据」滑向「不断扩分支」。此阈值只注入一次非阻断式广度检查，
+/// 不把新目标判成无进展，避免压缩大型排查任务的正当探索空间。
+const READ_ONLY_BREADTH_CHECK_TARGETS: usize = 32;
 /// 宽限窗口：软提示后，若模型给出了「实质不同的理由」（新目标 / reasoning 指纹
 /// 变化），则在该窗口内不升级，给它继续探索的空间。
 const PROGRESS_GRACE_WINDOW: usize = 6;
@@ -684,6 +688,7 @@ struct TurnSupervisor {
     progress: ProgressLedger,
 }
 
+#[derive(Debug)]
 enum ToolLoopSignal {
     None,
     /// 近似低收益重复：同一工具反复命中同一目标资源（忽略翻页参数）。温和提示一次。
@@ -700,6 +705,8 @@ enum ToolLoopSignal {
     LowProgressLedger,
     /// Progress Budget 第三级：软提示 + 记账后仍连续无进展，切换无工具收口模式。
     LowProgressHard,
+    /// ReadOnly 任务已覆盖大量不同目标，提醒先汇总当前证据和唯一关键缺口。
+    ReadOnlyBreadth,
 }
 
 /// Progress Budget 的运行时状态。挂在 `TurnSupervisor` 上，按「信息增益 /
@@ -717,9 +724,12 @@ struct ProgressLedger {
     last_reasoning_fp: Option<u64>,
     /// grace 宽限截止迭代号：在此之前不升级，给模型继续探索的空间。
     grace_until_iteration: usize,
+    /// reasoning 变化每个 turn 最多换取一次 grace，避免靠逐轮改写理由无限续期。
+    grace_consumed: bool,
     soft_injected: bool,
     ledger_injected: bool,
     hard_injected: bool,
+    read_only_breadth_injected: bool,
 }
 
 impl ProgressLedger {
@@ -731,6 +741,7 @@ impl ProgressLedger {
         self.ledger_injected = false;
         self.hard_injected = false;
         self.grace_until_iteration = 0;
+        self.grace_consumed = false;
     }
 }
 
@@ -891,6 +902,14 @@ impl TurnSupervisor {
         if made_progress {
             self.progress.consecutive_no_progress = 0;
             self.progress.last_reasoning_fp = reasoning_fp;
+            if matches!(self.progress.intent, TaskIntent::ReadOnly)
+                && !self.progress.read_only_breadth_injected
+                && self.iteration > free_explore_rounds
+                && self.progress.seen_targets.len() >= READ_ONLY_BREADTH_CHECK_TARGETS
+            {
+                self.progress.read_only_breadth_injected = true;
+                return ToolLoopSignal::ReadOnlyBreadth;
+            }
             return ToolLoopSignal::None;
         }
 
@@ -903,13 +922,14 @@ impl TurnSupervisor {
 
         self.progress.consecutive_no_progress += 1;
 
-        // grace 出口：软提示后，若模型给出「实质不同的理由」（reasoning 指纹变化），
-        // 视为有效响应，延长宽限窗口，不升级——这是「我需要更多空间」的正当出口。
+        // grace 出口：软提示后，若模型首次给出「实质不同的理由」（reasoning 指纹
+        // 变化），给予一次固定宽限。后续 reasoning 变化不得滚动续期。
         let reasoning_changed =
             reasoning_fp.is_some() && reasoning_fp != self.progress.last_reasoning_fp;
         self.progress.last_reasoning_fp = reasoning_fp;
-        if self.progress.soft_injected && reasoning_changed {
+        if self.progress.soft_injected && reasoning_changed && !self.progress.grace_consumed {
             self.progress.grace_until_iteration = self.iteration + PROGRESS_GRACE_WINDOW;
+            self.progress.grace_consumed = true;
         }
         if self.iteration < self.progress.grace_until_iteration {
             return ToolLoopSignal::None;
@@ -1071,6 +1091,26 @@ fn inject_low_progress_soft_note(messages: &mut Vec<crate::ai::history::Message>
         然后二选一：(a) 若信息已足够，立即执行下一步实质动作（提交修改 / 给出结论）；\n\
         (b) 若确需继续探索，请显式写下你正在权衡的 A/B 候选分支及当前倾向——这不是惩罚，\n\
         而是帮你把『无意识的打转』变成『有方向的探索』。";
+    messages.push(Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(note.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+}
+
+/// ReadOnly 广度检查：新目标仍算信息增益；这里只在目标面过宽时提醒先归纳，
+/// 不阻断工具，避免把大型排查任务误判为低进展。
+fn inject_read_only_breadth_note(messages: &mut Vec<crate::ai::history::Message>) {
+    use crate::ai::history::Message;
+    use serde_json::Value;
+    let note = "[read-only-breadth-check] 你已在只读分析中覆盖了大量不同目标资源，\n\
+        这可能是必要的广泛排查，也可能已经从『补关键证据』滑向『不断扩分支』。\n\
+        工具仍然可用；但在继续前，请先用不超过 6 行写下：\n\
+        1) 已确认事实（最多 3 条）；2) 当前结论或最可能解释；\n\
+        3) 仍缺的唯一关键证据；4) 下一步唯一工具动作。\n\
+        如果已经足够回答，请直接给出结论，不要为了再次确认而继续扩展搜索面。";
     messages.push(Message {
         role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
         content: Value::String(note.to_string()),
@@ -1589,6 +1629,7 @@ mod tests {
 
     #[test]
     fn tool_iteration_soft_limit_clamps_to_absolute_ceiling() {
+        assert_eq!(TOOL_ITERATION_SOFT_LIMIT, 24);
         assert_eq!(tool_iteration_soft_limit(0), 1);
         assert_eq!(tool_iteration_soft_limit(1), 1);
         assert_eq!(tool_iteration_soft_limit(10), 5);
@@ -1699,11 +1740,13 @@ mod tests {
     }
 
     #[test]
-    fn progress_budget_readonly_novel_targets_never_trigger() {
+    fn progress_budget_readonly_novel_targets_warn_once_after_breadth_threshold() {
         let mut supervisor = TurnSupervisor::default();
         let mut messages = Vec::new();
         let question = "解释一下这个模块的整体架构";
-        for i in 1..=30 {
+        let rounds = READ_ONLY_BREADTH_CHECK_TARGETS.max(PROGRESS_FREE_EXPLORE_ROUNDS) + 2;
+        let mut breadth_warnings = 0;
+        for i in 1..=rounds {
             supervisor.next_iteration();
             messages.push(pb_read_msg(&format!("src/f{i}.rs"), &format!("tc-{i}")));
             let signal = supervisor.record_tool_signatures(
@@ -1711,11 +1754,17 @@ mod tests {
                 question,
                 PROGRESS_FREE_EXPLORE_ROUNDS,
             );
-            assert!(
-                matches!(signal, ToolLoopSignal::None),
-                "read-only exploration with fresh targets must never be penalized (round {i})"
-            );
+            match signal {
+                ToolLoopSignal::ReadOnlyBreadth => {
+                    breadth_warnings += 1;
+                    assert!(i > PROGRESS_FREE_EXPLORE_ROUNDS);
+                    assert!(i >= READ_ONLY_BREADTH_CHECK_TARGETS);
+                }
+                ToolLoopSignal::None => {}
+                _ => panic!("fresh read-only targets must not trigger no-progress signal"),
+            }
         }
+        assert_eq!(breadth_warnings, 1);
         assert_eq!(supervisor.progress.consecutive_no_progress, 0);
     }
 
@@ -1805,6 +1854,20 @@ mod tests {
         );
         assert!(!supervisor.progress.ledger_injected);
         assert!(supervisor.progress.grace_until_iteration > supervisor.iteration);
+        assert!(supervisor.progress.grace_consumed);
+
+        // grace 到期后即使 reasoning 再变化，也不能继续滚动续期。
+        let grace_until = supervisor.progress.grace_until_iteration;
+        supervisor.iteration = grace_until;
+        messages.push(pb_read_msg_reasoning(
+            "src/h.rs",
+            "r-after-grace",
+            "再换一个思路：检查配置加载顺序",
+        ));
+        let signal =
+            supervisor.record_tool_signatures(&messages, question, PROGRESS_FREE_EXPLORE_ROUNDS);
+        assert!(matches!(signal, ToolLoopSignal::LowProgressLedger));
+        assert_eq!(supervisor.progress.grace_until_iteration, grace_until);
     }
 }
 
@@ -2348,6 +2411,13 @@ async fn run_turn_body(
                     &question,
                     "low-progress-ledger",
                 );
+            }
+            ToolLoopSignal::ReadOnlyBreadth => {
+                crate::ai::driver::print::print_tool_note_line(
+                    "agent-health",
+                    "read-only analysis breadth is high: requesting evidence summary before expanding further",
+                );
+                inject_read_only_breadth_note(&mut messages);
             }
             ToolLoopSignal::LowProgressHard => {
                 crate::ai::driver::print::print_tool_note_line(

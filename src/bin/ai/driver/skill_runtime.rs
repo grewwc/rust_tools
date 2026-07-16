@@ -273,12 +273,7 @@ fn ensure_required_baseline_tools(mut tools: Vec<ToolDef>) -> Vec<ToolDef> {
     dedupe_tools_by_name(tools)
 }
 
-const SUBAGENT_HIDDEN_TASK_TOOLS: &[&str] = &[
-    "task",
-    "task_spawn",
-    "task_wait",
-    "task_status",
-];
+const SUBAGENT_HIDDEN_TASK_TOOLS: &[&str] = &["task", "task_spawn", "task_wait", "task_status"];
 
 fn should_hide_task_tools_for_subagent() -> bool {
     super::runtime_ctx::current_subagent_depth() > 0
@@ -1024,8 +1019,8 @@ fn build_system_prompt(
         if has_tool(available_tools, "task_spawn") {
             lines.push("Use `task_spawn` to launch a subagent task and fan out parallel independent subtasks.".to_string());
             lines.push("If N subtasks have no data dependency, spawn ALL of them in the same response (multiple task_spawn calls in one turn), then a single task_wait. Do NOT spawn-wait-spawn-wait serially.".to_string());
-            lines.push("Proactive delegation: when a task has 2+ independent sub-parts (different files, different modules, different concerns), decompose and delegate to subagents via task_spawn instead of doing everything sequentially yourself.".to_string());
-            lines.push("Delegation test: ask 'can this part run independently with its own focused context?' If yes, delegate it. This saves your context budget and enables parallelism.".to_string());
+            lines.push("Delegate only when the task is genuinely complex and the expected parallelism benefit clearly exceeds subagent startup and coordination cost. Do not delegate simple tasks, single-file changes, or work you can finish directly with a few tool calls.".to_string());
+            lines.push("Delegation test: ask both 'can this part run independently?' and 'will delegation materially reduce latency or context pressure?' Delegate only when both answers are yes.".to_string());
         }
         if has_tool(available_tools, "task_wait") {
             lines.push("Use `task_wait` to collect results. Timeout is per-call — re-call or use `wait_policy=\"any\"` for early wake-up.".to_string());
@@ -1054,7 +1049,6 @@ fn build_system_prompt(
             lines,
         );
     }
-
 
     if has_tool(available_tools, "knowledge_search")
         || has_tool(available_tools, "knowledge_semantic_search")

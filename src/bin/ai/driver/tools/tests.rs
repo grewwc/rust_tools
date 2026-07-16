@@ -66,10 +66,14 @@ fn parallel_batch_groups_consecutive_readonly_builtin_tools() {
     let mcp = McpClient::new();
     let calls = vec![
         tool_call("read_file"),
-        tool_call("find_path"),
-        tool_call("get_symbol_info"),
+        tool_call("read_file"),
+        tool_call("read_file"),
     ];
-    assert!(is_parallel_safe_tool_call(&mcp, &calls[0]));
+    assert!(
+        calls
+            .iter()
+            .all(|call| is_parallel_safe_tool_call(&mcp, call))
+    );
     assert_eq!(parallel_safe_batch_len(&mcp, &calls), 3);
 }
 

@@ -2,34 +2,30 @@
 
 ## Scope
 
-Applies to `src/bin/ai/mcp/**` and nearby MCP-related execution glue.
-
+Applies to `src/bin/ai/mcp/**` and nearby MCP execution glue.
 Read `docs/agent-guides/ai-mcp.md` before changing server initialization,
-client routing, transport error handling, OAuth flows, or timeout semantics.
+client routing, transport error handling, OAuth flows, schema loading, or timeout
+semantics.
 
 ## Key invariants
 
-1. MCP servers are stdio JSON-RPC subprocesses, not HTTP services.
-2. `routing_snapshot()` is for metadata/routing; real tool execution must use
-   the live shared client/connection set.
-3. `notifications/initialized` is a JSON-RPC **notification** (no `id`, no
-   response expected). Send it via `send_notification_to_conn`, never
-   `send_request_to_conn` — sending it as a request causes some servers
-   (e.g. Feishu) to close the stdio stream.
-4. `send_request_to_conn` must skip responses with `id: null` or missing `id`.
-   Some servers (e.g. `mcp_ocr`) send a spurious `{"id":null,"result":{}}`
-   acknowledgment after `notifications/initialized`. If accepted, it consumes
-   the response slot for the next request, leaving the real response in the
-   buffer and causing an id mismatch on the subsequent call.
-5. Request timeouts and restart logic can kill long-running flows such as OAuth
-   waits; treat timeout changes as behavior changes.
-6. MCP tools are **lazy-loaded by default**: `skill_runtime::select_mcp_tools`
-   ships no MCP tool schemas in the per-turn `tools` array unless a skill/agent
-   declares an explicit `mcp_servers` whitelist (schemas are the largest, most
-   compressible slice of per-turn tokens and blow the TPM cap). The model still
-   perceives them via the hidden MCP catalog (`build_hidden_mcp_tool_catalog`)
-   and loads on demand through `enable_tools`. Prompt hints and enablement
-   behavior must stay consistent with real configured tool names.
+1. **Transport model.** MCP servers are stdio JSON-RPC subprocesses, not HTTP
+   services.
+2. **Routing vs execution.** `routing_snapshot()` is metadata for discovery and
+   routing; real tool execution must use the live shared client/connection set.
+3. **Initialized notification.** `notifications/initialized` is a JSON-RPC
+   notification: no `id`, no response expected. Send it with
+   `send_notification_to_conn`, never `send_request_to_conn`.
+4. **Response matching.** `send_request_to_conn` must ignore responses with
+   missing or `null` ids; some servers emit spurious initialized acknowledgments
+   that otherwise consume the next request's response slot.
+5. **Timeouts are behavior.** Request timeouts and restart logic can interrupt
+   long-running flows such as OAuth waits; treat changes as user-visible.
+6. **Lazy MCP schemas.** Per-turn tool schemas include MCP tools only when a
+   skill/agent declares an explicit `mcp_servers` allowlist. Otherwise expose the
+   hidden MCP catalog and load tools on demand through `enable_tools`.
+7. **Name consistency.** Prompt hints, hidden catalogs, and enablement behavior
+   must stay consistent with the real configured MCP tool names.
 
 ## Related detailed guide
 

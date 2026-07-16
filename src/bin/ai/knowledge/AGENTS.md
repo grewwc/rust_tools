@@ -7,14 +7,14 @@ Keep this file brief; inspect the touched module directly before broad refactors
 
 ## Key invariants
 
-1. User-facing persistence uses `knowledge_*` tools; `memory_*` tools are
-   agent-internal.
-2. `knowledge_consolidate` is a two-phase flow (`read_all` -> `execute`); keep
-   that contract intact.
-3. Embedding is optional and must degrade gracefully to lexical/BM25 recall on
-   failure.
-4. Keep retrieval, indexing, and storage responsibilities separated unless the
-   change genuinely crosses those boundaries.
+1. **Public vs internal tools.** User-facing persistence uses `knowledge_*`
+   tools; `memory_*` tools are agent-internal.
+2. **Consolidation contract.** `knowledge_consolidate` is a two-phase flow:
+   `read_all` then `execute`.
+3. **Graceful recall fallback.** Embedding is optional and must degrade to
+   lexical/BM25 recall when unavailable or failing.
+4. **Separated responsibilities.** Keep retrieval, indexing, storage, and sync
+   responsibilities separated unless a change genuinely crosses those boundaries.
 
 ## Related code areas
 

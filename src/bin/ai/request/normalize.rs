@@ -13,6 +13,49 @@ use crate::ai::history::{Message, ROLE_SYSTEM, is_internal_note_role, is_system_
 use crate::ai::models;
 use crate::ai::types::App;
 
+const IMAGE_PLACEHOLDER: &str = "[image omitted]";
+
+fn flatten_multimodal_content_to_text(content: &Value) -> Option<String> {
+    match content {
+        Value::Array(items) => {
+            let mut segments = Vec::new();
+            for item in items {
+                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
+                    if !text.trim().is_empty() {
+                        segments.push(text.to_string());
+                    }
+                    continue;
+                }
+
+                if item.get("image_url").is_some()
+                    || item.get("type").and_then(|v| v.as_str()) == Some("image_url")
+                {
+                    segments.push(IMAGE_PLACEHOLDER.to_string());
+                    continue;
+                }
+
+                let fallback = extract_displayable_text(item);
+                if !fallback.trim().is_empty() {
+                    segments.push(fallback);
+                }
+            }
+
+            Some(if segments.is_empty() {
+                IMAGE_PLACEHOLDER.to_string()
+            } else {
+                segments.join("\n")
+            })
+        }
+        _ => None,
+    }
+}
+
+fn normalize_system_like_content_for_request(content: &Value) -> Value {
+    flatten_multimodal_content_to_text(content)
+        .map(Value::String)
+        .unwrap_or_else(|| content.clone())
+}
+
 #[allow(unused_imports)]
 use super::error::config_bool_is_true;
 use super::types::extract_displayable_text;
@@ -495,6 +538,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
 
     let mut merged_first = messages[first_system_idx].clone();
     merged_first.role = ROLE_SYSTEM.to_string();
+    merged_first.content = normalize_system_like_content_for_request(&merged_first.content);
     if let Some(base) = merged_first.content.as_str() {
         let mut content = base.to_string();
         if !merged_notes.is_empty() {
@@ -524,7 +568,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
             // Already folded into merged_first above.
             continue;
         }
-        if is_internal_note_role(&message.role) {
+        if is_system_like_role(&message.role) {
             // Keep the note in-place but normalize the role so the API
             // accepts it. Stable position preserves prompt-cache prefix:
             // older notes don't move when newer ones get appended.
@@ -540,6 +584,7 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
                         Value::String(truncate_note_text(text, MERGED_SINGLE_NOTE_MAX_CHARS));
                 }
             }
+            promoted.content = normalize_system_like_content_for_request(&promoted.content);
             out.push(promoted);
             continue;
         }
@@ -549,40 +594,9 @@ pub(super) fn normalize_messages_for_request(messages: &[Message]) -> Vec<Messag
 }
 
 pub(super) fn normalize_message_content_for_text_only_model(content: &Value) -> Value {
-    const IMAGE_PLACEHOLDER: &str = "[image omitted]";
-
-    match content {
-        Value::Array(items) => {
-            let mut segments = Vec::new();
-            for item in items {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    if !text.trim().is_empty() {
-                        segments.push(text.to_string());
-                    }
-                    continue;
-                }
-
-                if item.get("image_url").is_some()
-                    || item.get("type").and_then(|v| v.as_str()) == Some("image_url")
-                {
-                    segments.push(IMAGE_PLACEHOLDER.to_string());
-                    continue;
-                }
-
-                let fallback = extract_displayable_text(item);
-                if !fallback.trim().is_empty() {
-                    segments.push(fallback);
-                }
-            }
-
-            if segments.is_empty() {
-                Value::String(IMAGE_PLACEHOLDER.to_string())
-            } else {
-                Value::String(segments.join("\n"))
-            }
-        }
-        _ => content.clone(),
-    }
+    flatten_multimodal_content_to_text(content)
+        .map(Value::String)
+        .unwrap_or_else(|| content.clone())
 }
 
 pub(super) fn normalize_messages_for_model(model: &str, messages: &[Message]) -> Vec<Message> {

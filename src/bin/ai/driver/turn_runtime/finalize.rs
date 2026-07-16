@@ -130,6 +130,14 @@ fn format_subagent_result_for_parent(
     output
 }
 
+fn subagent_result_payload_for_parent(
+    final_assistant_text: &str,
+    turn_messages: &[Message],
+) -> Option<String> {
+    let output = format_subagent_result_for_parent(final_assistant_text, turn_messages);
+    (!output.trim().is_empty()).then_some(output)
+}
+
 async fn maybe_append_post_turn_reflection(
     app: &mut App,
     next_model: &str,
@@ -262,14 +270,16 @@ pub(super) async fn finalize_turn(
     should_quit: bool,
     had_tool_error: bool,
 ) -> Result<TurnOutcome, Box<dyn std::error::Error>> {
-    if !final_assistant_text.trim().is_empty() {
-        // Publish to the optional sub-agent result slot before doing the
-        // (potentially long) post-turn work below, so a parent that is
-        // waiting on us can race ahead even if reflection / writeback take
-        // a while.
-        let subagent_output_for_parent =
-            format_subagent_result_for_parent(final_assistant_text, turn_messages);
+    if let Some(subagent_output_for_parent) =
+        subagent_result_payload_for_parent(final_assistant_text, turn_messages)
+    {
+        // 尽早发布给父 agent：即便本轮没有最终 assistant 正文，只要留下了可复用的
+        // subagent 证据（如 read_file / code_search 结果），父 agent 也必须感知。
+        // 这样同步 `task` 与异步 `task_wait` 都能拿到同一份父侧 payload。
         crate::ai::driver::runtime_ctx::publish_subagent_result(&subagent_output_for_parent).await;
+    }
+
+    if !final_assistant_text.trim().is_empty() {
         ensure_final_assistant_recorded(
             final_assistant_text,
             final_assistant_recorded,
@@ -500,6 +510,42 @@ mod tests {
     fn subagent_parent_result_without_tools_is_plain_final_text() {
         let output = format_subagent_result_for_parent("done", &[]);
         assert_eq!(output, "done");
+    }
+
+    #[test]
+    fn subagent_result_payload_for_parent_uses_tool_evidence_without_final_text() {
+        let turn_messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: Value::String(String::new()),
+                tool_calls: Some(vec![tool_call(
+                    "call-1",
+                    "read_file",
+                    serde_json::json!({"file_path":"src/lib.rs"}),
+                )]),
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+            Message {
+                role: "tool".to_string(),
+                content: Value::String("pub mod ai;".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("call-1".to_string()),
+                reasoning_content: None,
+            },
+        ];
+
+        let output = subagent_result_payload_for_parent("", &turn_messages)
+            .expect("tool evidence should still publish to parent");
+        assert!(output.starts_with("[Subagent tool evidence]"));
+        assert!(output.contains("read_file("));
+        assert!(output.contains("pub mod ai;"));
+        assert!(!output.contains("[Subagent final answer]"));
+    }
+
+    #[test]
+    fn subagent_result_payload_for_parent_is_none_when_completely_empty() {
+        assert!(subagent_result_payload_for_parent("", &[]).is_none());
     }
 
     #[test]

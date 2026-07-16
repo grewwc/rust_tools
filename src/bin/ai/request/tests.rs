@@ -837,6 +837,28 @@ fn responses_request_body_uses_function_tools_and_nested_reasoning() {
 }
 
 #[test]
+fn no_tool_request_bodies_omit_tools_and_tool_choice() {
+    let messages = vec![Message {
+        role: "user".to_string(),
+        content: Value::String("summarize the completed work".to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+    let request = build_request_body(
+        "gpt-5.5", &messages, false, false, None, None, None, None, None, None, None,
+    );
+
+    let chat_body = serde_json::to_value(&request).expect("request body should serialize");
+    assert!(chat_body.get("tools").is_none());
+    assert!(chat_body.get("tool_choice").is_none());
+
+    let responses_body = super::build_responses_request_body(&request);
+    assert!(responses_body.get("tools").is_none());
+    assert!(responses_body.get("tool_choice").is_none());
+}
+
+#[test]
 fn responses_protocol_dialect_infers_from_endpoint_when_unspecified() {
     assert_eq!(
         RequestProtocolDialect::infer_from_endpoint("https://api.example.com/v1/chat/completions"),
@@ -1285,9 +1307,9 @@ fn opencode_deepseek_tool_call_messages_echo_even_without_thinking_gate() {
     assert_eq!(echoed, Some(""));
 }
 
-/// 核心回归：DashScope compatible-mode 端点的 Alibaba-provider 模型
-/// （deepseek-v4-pro/flash、kimi-k2.7-code）必须按 thinking gate 决策发送
-/// `enable_thinking`，否则「关闭」会被静默丢弃、模型仍 reasoning。
+/// 核心回归：DashScope compatible-mode 端点的 Alibaba-provider 模型必须按
+/// thinking gate 决策发送 `enable_thinking`，否则「关闭」会被静默丢弃、模型仍
+/// reasoning。模型注册表会变动，因此从其中选择一个实际的 Alibaba 模型。
 #[test]
 fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
     let messages = vec![Message {
@@ -1298,31 +1320,32 @@ fn dashscope_alibaba_provider_honors_enable_thinking_gate() {
         reasoning_content: None,
     }];
 
-    for model in ["deepseek-v4-pro", "deepseek-v4-flash", "kimi-k2.7-code"] {
-        // gate 关闭 → enable_thinking:false
-        let disabled = build_request_body(
-            model, &messages, false, false, None, None, None, None, None, None, None,
-        );
-        let disabled = serde_json::to_value(&disabled).unwrap();
-        assert_eq!(
-            disabled.get("enable_thinking").and_then(|v| v.as_bool()),
-            Some(false),
-            "{model} should emit enable_thinking:false when gate disables thinking"
-        );
-        // 走 enable_thinking 而非 deepseek 的 thinking 对象
-        assert!(disabled.get("thinking").is_none(), "{model}");
+    let model = first_model_key_for_adapter(crate::ai::provider::ApiProvider::Alibaba)
+        .expect("models.json must contain at least one Alibaba-adapter model");
 
-        // gate 开启 → enable_thinking:true
-        let enabled = build_request_body(
-            model, &messages, false, true, None, None, None, None, None, None, None,
-        );
-        let enabled = serde_json::to_value(&enabled).unwrap();
-        assert_eq!(
-            enabled.get("enable_thinking").and_then(|v| v.as_bool()),
-            Some(true),
-            "{model} should emit enable_thinking:true when gate enables thinking"
-        );
-    }
+    // gate 关闭 → enable_thinking:false
+    let disabled = build_request_body(
+        &model, &messages, false, false, None, None, None, None, None, None, None,
+    );
+    let disabled = serde_json::to_value(&disabled).unwrap();
+    assert_eq!(
+        disabled.get("enable_thinking").and_then(|v| v.as_bool()),
+        Some(false),
+        "{model} should emit enable_thinking:false when gate disables thinking"
+    );
+    // 走 enable_thinking 而非 deepseek 的 thinking 对象
+    assert!(disabled.get("thinking").is_none(), "{model}");
+
+    // gate 开启 → enable_thinking:true
+    let enabled = build_request_body(
+        &model, &messages, false, true, None, None, None, None, None, None, None,
+    );
+    let enabled = serde_json::to_value(&enabled).unwrap();
+    assert_eq!(
+        enabled.get("enable_thinking").and_then(|v| v.as_bool()),
+        Some(true),
+        "{model} should emit enable_thinking:true when gate enables thinking"
+    );
 }
 
 /// 辅助（非主链路）请求对 DashScope 端点模型必须显式关闭 thinking，
@@ -1973,6 +1996,90 @@ fn responses_request_body_converts_chat_multimodal_content_to_input_items() {
     assert_eq!(
         content[1].get("text").and_then(Value::as_str),
         Some("please explain")
+    );
+}
+
+#[test]
+fn normalize_messages_flattens_internal_note_multimodal_content_to_text_only_system_note() {
+    let messages = vec![Message {
+        role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::Array(vec![
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": "data:image/png;base64,AAAA" }
+            }),
+            serde_json::json!({
+                "type": "text",
+                "text": "[Process 1 Woke Up] resume now"
+            }),
+        ]),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    let normalized = normalize_messages_for_request(&messages);
+    assert_eq!(normalized.len(), 1);
+    assert_eq!(normalized[0].role, "system");
+    assert_eq!(
+        normalized[0].content,
+        Value::String("[image omitted]\n[Process 1 Woke Up] resume now".to_string())
+    );
+}
+
+#[test]
+fn responses_request_body_does_not_emit_input_image_for_system_multimodal_content() {
+    let messages = vec![Message {
+        role: "system".to_string(),
+        content: Value::Array(vec![
+            serde_json::json!({
+                "type": "image_url",
+                "image_url": { "url": "data:image/png;base64,AAAA" }
+            }),
+            serde_json::json!({
+                "type": "text",
+                "text": "resume instructions"
+            }),
+        ]),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    }];
+
+    let normalized = normalize_messages_for_request(&messages);
+    let request = RequestBody {
+        model: "gpt-test".to_string(),
+        messages: &normalized,
+        stream: false,
+        thinking: serde_json::Map::new(),
+        enable_search: None,
+        tools: None,
+        tool_choice: None,
+        reasoning_effort: None,
+        reasoning: None,
+        stream_options: None,
+        max_tokens: None,
+        reasoning_items: None,
+        reasoning_encrypted_replay: false,
+    };
+
+    let body = super::build_responses_request_body(&request);
+    let content = body
+        .get("input")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("content"))
+        .and_then(Value::as_array)
+        .expect("responses body should contain array content");
+
+    assert_eq!(content.len(), 1);
+    assert_eq!(
+        content[0].get("type").and_then(Value::as_str),
+        Some("input_text")
+    );
+    assert_eq!(
+        content[0].get("text").and_then(Value::as_str),
+        Some("[image omitted]\nresume instructions")
     );
 }
 

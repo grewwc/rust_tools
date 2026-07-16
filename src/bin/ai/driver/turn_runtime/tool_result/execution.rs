@@ -3,13 +3,18 @@ use crate::ai::{
     history::{Message, ROLE_INTERNAL_NOTE},
     mcp::{McpClient, SharedMcpClient},
     stream::clamp_line_to_terminal_row_with_reserve,
+    tools::task_tools,
     types::{App, ToolCall},
 };
-use std::{collections::VecDeque, io::Write};
+use std::{
+    collections::{BTreeSet, VecDeque},
+    io::Write,
+};
 
 use super::super::persistence::persist_pending_turn_messages;
 use super::super::{
     MAX_TOOL_RESULT_LINE_TRIM_CHARS, TOOL_OVERFLOW_PREVIEW_CHARS, max_tool_result_inline_chars,
+    iteration::no_tool_handoff_note,
     types::{IterationExecution, PreparedToolResult, ToolCallExecution, TurnLoopStep},
 };
 use super::{
@@ -241,23 +246,117 @@ fn execute_tool_calls_for_round(
     )
 }
 
-fn reject_tool_calls_for_no_tool_handoff(tool_calls: &[ToolCall]) -> ExecuteToolCallsResult {
+#[derive(Clone, Copy)]
+enum ToolCallRejectionReason {
+    NoToolHandoff,
+    RepeatedReadOnlyCall,
+}
+
+fn reject_tool_calls(
+    tool_calls: &[ToolCall],
+    reason: ToolCallRejectionReason,
+) -> ExecuteToolCallsResult {
     ExecuteToolCallsResult {
         executed_tool_calls: tool_calls.to_vec(),
         tool_results: tool_calls
             .iter()
             .map(|tool_call| crate::ai::types::ToolResult {
                 tool_call_id: tool_call.id.clone(),
-                content: format!(
-                    "Error: tool calls are disabled in no-tool handoff mode for this turn. \
-Do not call '{}' again; instead summarize confirmed facts, answer what you can, and explain the remaining work / blockers / next steps.",
-                    tool_call.function.name
-                ),
+                content: rejected_tool_call_message(&tool_call.function.name, reason),
             })
             .collect(),
         cached_hits: vec![false; tool_calls.len()],
         had_error: true,
     }
+}
+
+fn rejected_tool_call_message(tool_name: &str, reason: ToolCallRejectionReason) -> String {
+    match reason {
+        ToolCallRejectionReason::NoToolHandoff => format!(
+            "Error: tool calls are disabled in no-tool handoff mode for this turn. \
+Do not call '{tool_name}' again; instead summarize confirmed facts, answer what you can, and explain the remaining work / blockers / next steps."
+        ),
+        ToolCallRejectionReason::RepeatedReadOnlyCall => format!(
+            "Error: this exact repeated read-only tool call was suppressed. \
+Tools remain available, but do not call '{tool_name}' again with the same arguments. Reuse the previous result; if more evidence is necessary, call a different tool or change arguments so the next tool call can produce new information."
+        ),
+    }
+}
+
+fn repeated_read_only_tool_request(messages: &[Message], tool_calls: &[ToolCall]) -> bool {
+    let Some(current) = read_only_tool_signature_set(tool_calls) else {
+        return false;
+    };
+    if current.is_empty() {
+        return false;
+    }
+
+    for message in messages.iter().rev() {
+        if message.role == "user" {
+            return false;
+        }
+        let Some(previous_tool_calls) = message.tool_calls.as_ref() else {
+            continue;
+        };
+        if let Some(previous) = read_only_tool_signature_set(previous_tool_calls) {
+            return previous == current;
+        }
+    }
+
+    false
+}
+
+fn read_only_tool_signature_set(tool_calls: &[ToolCall]) -> Option<BTreeSet<String>> {
+    let mut signatures = BTreeSet::new();
+    for tool_call in tool_calls {
+        signatures.insert(read_only_tool_signature(tool_call)?);
+    }
+    Some(signatures)
+}
+
+fn read_only_tool_signature(tool_call: &ToolCall) -> Option<String> {
+    if !repeat_guarded_read_only_tool_name(&tool_call.function.name) {
+        return None;
+    }
+
+    let args: serde_json::Value = serde_json::from_str(&tool_call.function.arguments)
+        .unwrap_or_else(|_| serde_json::Value::String(tool_call.function.arguments.clone()));
+    let args_json = serde_json::to_string(&args).unwrap_or_else(|_| args.to_string());
+    Some(format!("{}\n{}", tool_call.function.name, args_json))
+}
+
+fn repeat_guarded_read_only_tool_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    let mutating = [
+        "create",
+        "delete",
+        "remove",
+        "update",
+        "write",
+        "save",
+        "append",
+        "insert",
+        "rename",
+        "move",
+        "install",
+        "run",
+        "execute",
+        "oauth",
+        "open_browser",
+        "report_event",
+        "memory",
+        "kill_terminal",
+        "edit",
+        "apply_patch",
+    ];
+    if mutating.iter().any(|needle| lower.contains(needle)) {
+        return false;
+    }
+
+    let reusable = [
+        "search", "find", "read", "get", "list", "view", "fetch", "export",
+    ];
+    reusable.iter().any(|needle| lower.contains(needle))
 }
 
 /// 前台同步工具执行（尤其是 `execute_command` 的流式输出）也属于“当前 turn 的可中断
@@ -606,7 +705,7 @@ fn handle_tool_call_round(
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
     iteration: usize,
-    reject_tool_calls: bool,
+    rejection_reason: Option<ToolCallRejectionReason>,
     turn_had_tool_error: &mut bool,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
     let _remaining_meta = parse_prune_meta_and_update_marks(
@@ -614,8 +713,8 @@ fn handle_tool_call_round(
         messages,
         &tool_call_execution.stream_result.hidden_meta,
     );
-    let exec_result = if reject_tool_calls {
-        reject_tool_calls_for_no_tool_handoff(&tool_call_execution.stream_result.tool_calls)
+    let exec_result = if let Some(reason) = rejection_reason {
+        reject_tool_calls(&tool_call_execution.stream_result.tool_calls, reason)
     } else {
         let mut observer = TerminalToolObserver::new(app);
         let _streaming_guard = ToolExecutionStreamingGuard::new(&app.streaming);
@@ -653,6 +752,7 @@ fn handle_tool_call_round(
 }
 
 const DISCOVER_SKILLS_FOLLOWUP_PREFIX: &str = "tool_followup:discover_skills\n";
+const PENDING_SUBAGENT_TASKS_FOLLOWUP_PREFIX: &str = "tool_followup:pending_subagent_tasks\n";
 
 fn build_discover_skills_followup_note(
     allowed_tool_names: &rust_tools::commonw::FastSet<String>,
@@ -671,6 +771,63 @@ fn build_discover_skills_followup_note(
     note.push_str("- if no skill is actually needed, answer the user directly.\n");
     note.push_str("Do not end the turn immediately after only listing skills.");
     note
+}
+
+fn clear_pending_subagent_tasks_followup(messages: &mut Vec<Message>) {
+    messages.retain(|message| {
+        !(message.role == ROLE_INTERNAL_NOTE
+            && matches!(
+                &message.content,
+                serde_json::Value::String(text)
+                    if text.starts_with(PENDING_SUBAGENT_TASKS_FOLLOWUP_PREFIX)
+            ))
+    });
+}
+
+fn clear_no_tool_handoff_note(messages: &mut Vec<Message>) {
+    let note = no_tool_handoff_note();
+    messages.retain(|message| {
+        !(message.role == ROLE_INTERNAL_NOTE
+            && matches!(&message.content, serde_json::Value::String(text) if text == note))
+    });
+}
+
+fn reopen_turn_for_outstanding_subagent_tasks(messages: &mut Vec<Message>, session_id: &str) -> bool {
+    let outstanding_anchor = match task_tools::build_outstanding_task_anchor(session_id) {
+        Ok(Some(note)) => note,
+        Ok(None) => return false,
+        Err(err) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "  [task-anchor] failed to inspect outstanding subagent tasks: {err}"
+            );
+            return false;
+        }
+    };
+
+    clear_pending_subagent_tasks_followup(messages);
+    clear_no_tool_handoff_note(messages);
+
+    let mut note = String::from(PENDING_SUBAGENT_TASKS_FOLLOWUP_PREFIX);
+    note.push_str(
+        "The previous assistant response tried to finish the turn while spawned subagent tasks were still outstanding.\n",
+    );
+    note.push_str("This is not a final answer. Continue the current turn now.\n");
+    note.push_str(
+        "Temporarily lift no-tool handoff if it was active, but only so you can collect or inspect the outstanding subagent results.\n",
+    );
+    note.push_str(
+        "Immediate next step: call `task_wait` or `task_status` for the outstanding task_ids below. Do not answer the user until every listed task has been handled.\n\n",
+    );
+    note.push_str(&outstanding_anchor);
+    messages.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: serde_json::Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
+    true
 }
 
 fn requested_only_discover_skills(tool_calls: &[ToolCall]) -> bool {
@@ -996,6 +1153,17 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
             }
         }
         IterationExecution::FinalResponse(stream_result) => {
+            // 收尾 veto：仍有未收口的 subagent task 时，打回一轮强制收集结果。
+            // 但必须尊重迭代硬上限——否则子任务永不到终态且模型拒绝 task_wait 时
+            // 会无限活锁，而且每轮重置 force_final_response 还会反复顶掉 orchestrator
+            // 的安全刹车（tool-loop / progress-budget / iteration-limit hard-stop）。
+            // 到达硬上限后放行收尾，让 max_iterations 保持为权威天花板。
+            if iteration < max_iterations
+                && reopen_turn_for_outstanding_subagent_tasks(messages, &app.session_id)
+            {
+                *force_final_response = false;
+                return Ok(TurnLoopStep::Continue);
+            }
             let reasoning_only_completion = stream_result.assistant_text.trim().is_empty()
                 && !stream_result.reasoning_text.trim().is_empty()
                 && stream_result.tool_calls.is_empty();
@@ -1038,9 +1206,25 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
         IterationExecution::ToolCall(tool_call_execution) => {
             let discover_skills_only = no_active_skill
                 && requested_only_discover_skills(&tool_call_execution.stream_result.tool_calls);
-            let image_read_paths = extract_image_paths_from_file_read_tool_calls(
-                &tool_call_execution.stream_result.tool_calls,
-            );
+            let repeated_read_only_call = !*force_final_response
+                && repeated_read_only_tool_request(
+                    messages,
+                    &tool_call_execution.stream_result.tool_calls,
+                );
+            let rejection_reason = if *force_final_response {
+                Some(ToolCallRejectionReason::NoToolHandoff)
+            } else if repeated_read_only_call {
+                Some(ToolCallRejectionReason::RepeatedReadOnlyCall)
+            } else {
+                None
+            };
+            let image_read_paths = if rejection_reason.is_none() {
+                extract_image_paths_from_file_read_tool_calls(
+                    &tool_call_execution.stream_result.tool_calls,
+                )
+            } else {
+                Vec::new()
+            };
             *terminal_dedupe_candidate = handle_tool_call_round(
                 app,
                 mcp_client,
@@ -1051,10 +1235,9 @@ pub(in crate::ai::driver::turn_runtime) fn handle_iteration_execution(
                 one_shot_mode,
                 persisted_turn_messages,
                 iteration,
-                *force_final_response,
+                rejection_reason,
                 turn_had_tool_error,
             )?;
-
             if discover_skills_only {
                 append_discover_skills_followup_note(
                     messages,
@@ -1225,6 +1408,170 @@ mod tests {
             prune_marks: Default::default(),
             turn_reasoning_items: Default::default(),
         }
+    }
+
+    fn test_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            tool_type: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    fn assistant_tool_call_message(tool_call: ToolCall) -> Message {
+        Message {
+            role: "assistant".to_string(),
+            content: Value::String(String::new()),
+            tool_calls: Some(vec![tool_call]),
+            tool_call_id: None,
+            reasoning_content: None,
+        }
+    }
+
+    fn tool_result_message(id: &str, content: &str) -> Message {
+        Message {
+            role: "tool".to_string(),
+            content: Value::String(content.to_string()),
+            tool_calls: None,
+            tool_call_id: Some(id.to_string()),
+            reasoning_content: None,
+        }
+    }
+
+    #[test]
+    fn repeated_read_only_tool_request_ignores_call_id_but_matches_payload() {
+        let args = serde_json::json!({ "file_path": "/tmp/demo.txt", "offset": 1 });
+        let previous = test_tool_call("call_previous", "read_file", args.clone());
+        let current = test_tool_call("call_current", "read_file", args);
+        let messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message("call_previous", "previous result"),
+        ];
+
+        assert!(repeated_read_only_tool_request(&messages, &[current]));
+    }
+
+    #[test]
+    fn repeated_read_only_tool_request_does_not_cross_user_boundary() {
+        let args = serde_json::json!({ "file_path": "/tmp/demo.txt" });
+        let previous = test_tool_call("call_previous", "read_file", args.clone());
+        let current = test_tool_call("call_current", "read_file", args);
+        let messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message("call_previous", "previous result"),
+            Message {
+                role: "user".to_string(),
+                content: Value::String("read it again".to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                reasoning_content: None,
+            },
+        ];
+
+        assert!(!repeated_read_only_tool_request(&messages, &[current]));
+    }
+
+    #[test]
+    fn repeated_mutating_tool_request_is_not_suppressed() {
+        let args = serde_json::json!({ "command": "cargo check" });
+        let previous = test_tool_call("call_previous", "execute_command", args.clone());
+        let current = test_tool_call("call_current", "execute_command", args);
+        let messages = vec![
+            assistant_tool_call_message(previous),
+            tool_result_message("call_previous", "previous result"),
+        ];
+
+        assert!(!repeated_read_only_tool_request(&messages, &[current]));
+    }
+
+    #[test]
+    fn repeated_read_only_tool_call_is_rejected_without_forcing_final_response() {
+        let mut app = test_app_with_tools(&["read_file"]);
+        let shared_mcp_client = Arc::new(std::sync::Mutex::new(McpClient::new()));
+        let current_call = test_tool_call(
+            "call_current",
+            "read_file",
+            serde_json::json!({ "file_path": "/tmp/demo.txt" }),
+        );
+        let mut messages = vec![
+            assistant_tool_call_message(test_tool_call(
+                "call_previous",
+                "read_file",
+                serde_json::json!({ "file_path": "/tmp/demo.txt" }),
+            )),
+            tool_result_message("call_previous", "previous result"),
+        ];
+        let mut turn_messages = Vec::new();
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut terminal_dedupe_candidate = None;
+        let consecutive_truncations = 0;
+        let mut force_final_response = false;
+        let mut persisted_turn_messages = 0;
+        let mut turn_had_tool_error = false;
+
+        let step = handle_iteration_execution(
+            &mut app,
+            "read the file",
+            &shared_mcp_client.lock().unwrap(),
+            &shared_mcp_client,
+            IterationExecution::ToolCall(ToolCallExecution {
+                stream_result: crate::ai::types::StreamResult {
+                    tool_calls: vec![current_call],
+                    ..Default::default()
+                },
+                allowed_tool_names: rust_tools::commonw::FastSet::from_iter([
+                    "read_file".to_string()
+                ]),
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            false,
+            1,
+            16,
+            consecutive_truncations,
+            &mut turn_had_tool_error,
+        )
+        .unwrap();
+
+        assert!(matches!(step, TurnLoopStep::Continue));
+        assert!(!force_final_response);
+        assert!(turn_had_tool_error);
+        let rejected_tool_result = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == "tool")
+            .expect("rejection should append a tool result");
+        assert!(
+            rejected_tool_result
+                .content
+                .as_str()
+                .unwrap_or_default()
+                .contains("exact repeated read-only tool call was suppressed")
+        );
+        assert!(
+            rejected_tool_result
+                .content
+                .as_str()
+                .unwrap_or_default()
+                .contains("Tools remain available")
+        );
+        assert!(
+            rejected_tool_result
+                .content
+                .as_str()
+                .unwrap_or_default()
+                .contains("call a different tool or change arguments")
+        );
     }
 
     #[test]
@@ -1527,6 +1874,216 @@ mod tests {
         assert!(!final_assistant_recorded);
         assert!(messages.is_empty());
         assert!(turn_messages.is_empty());
+    }
+
+    #[test]
+    fn final_response_with_outstanding_subagent_task_reopens_turn_and_clears_no_tool_handoff() {
+        let _env_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut app = test_app_with_tools(&["task_wait", "task_status"]);
+        app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+        crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+
+        let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+        let (pid, result_channel_id) = {
+            let mut os = app.os.lock().unwrap();
+            let pid =
+                os.begin_foreground("child".to_string(), "goal".to_string(), 10, usize::MAX, None);
+            let channel = os.channel_create(Some(pid), 1, "task-result".to_string());
+            (pid, channel.raw())
+        };
+        crate::ai::tools::task_tools::insert_task_entry_for_test(
+            task_id.clone(),
+            crate::ai::tools::task_tools::AsyncTaskEntry {
+                session_id: app.session_id.clone(),
+                result_observed: false,
+                pid,
+                result_channel_id,
+                completion_futex_addr: aios_kernel::primitives::FutexAddr(1),
+                description: "inspect parser".to_string(),
+                agent_name: "explore".to_string(),
+                model: "qwen3.7-max".to_string(),
+                is_model_auto_selected: false,
+                auto_model_fallback: None,
+                selection_explanation: "explicit override".to_string(),
+                inherit: crate::ai::tools::task_tools::InheritOptions::default(),
+                started_at: Instant::now(),
+            },
+        );
+
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+        let mut messages = vec![Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(no_tool_handoff_note().to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+        let mut turn_messages = Vec::new();
+        let mut persisted_turn_messages = 0usize;
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut force_final_response = true;
+        let mut terminal_dedupe_candidate = None;
+
+        let step = handle_iteration_execution(
+            &mut app,
+            "wrap up",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+                outcome: crate::ai::types::StreamOutcome::Completed,
+                tool_calls: Vec::new(),
+                assistant_text: "done".to_string(),
+                hidden_meta: String::new(),
+                reasoning_text: String::new(),
+                reasoning_items: Vec::new(),
+                skip_response_drain: true,
+                truncated_by_length: false,
+                stream_error: false,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_cached_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            2,
+            16,
+            0,
+            &mut false,
+        )
+        .unwrap();
+
+        assert!(matches!(step, TurnLoopStep::Continue));
+        assert!(!force_final_response);
+        assert!(final_assistant_text.is_empty());
+        assert!(!final_assistant_recorded);
+        assert!(turn_messages.is_empty());
+        let joined = messages
+            .iter()
+            .map(|message| message.content.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains(PENDING_SUBAGENT_TASKS_FOLLOWUP_PREFIX.trim_end()));
+        assert!(joined.contains(&task_id));
+        assert!(joined.contains("Immediate next step: call `task_wait` or `task_status`"));
+        assert!(!joined.contains(no_tool_handoff_note()));
+
+        let _ = crate::ai::tools::task_tools::remove_task_entry(&task_id);
+        if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+            *guard = None;
+        }
+    }
+
+    #[test]
+    fn final_response_at_iteration_ceiling_finishes_despite_outstanding_task() {
+        // 迭代硬上限是权威天花板：即使还有未收口的 subagent task，也不能无限
+        // 打回收尾（否则子任务永不到终态时会活锁，并反复顶掉安全刹车）。
+        let _env_guard = crate::ai::test_support::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut app = test_app_with_tools(&["task_wait", "task_status"]);
+        app.session_id = format!("test-session-{}", uuid::Uuid::new_v4().simple());
+        crate::ai::tools::os_tools::init_os_tools_globals(app.os.clone());
+
+        let task_id = format!("task_{}", uuid::Uuid::new_v4().simple());
+        let (pid, result_channel_id) = {
+            let mut os = app.os.lock().unwrap();
+            let pid =
+                os.begin_foreground("child".to_string(), "goal".to_string(), 10, usize::MAX, None);
+            let channel = os.channel_create(Some(pid), 1, "task-result".to_string());
+            (pid, channel.raw())
+        };
+        crate::ai::tools::task_tools::insert_task_entry_for_test(
+            task_id.clone(),
+            crate::ai::tools::task_tools::AsyncTaskEntry {
+                session_id: app.session_id.clone(),
+                result_observed: false,
+                pid,
+                result_channel_id,
+                completion_futex_addr: aios_kernel::primitives::FutexAddr(1),
+                description: "inspect parser".to_string(),
+                agent_name: "explore".to_string(),
+                model: "qwen3.7-max".to_string(),
+                is_model_auto_selected: false,
+                auto_model_fallback: None,
+                selection_explanation: "explicit override".to_string(),
+                inherit: crate::ai::tools::task_tools::InheritOptions::default(),
+                started_at: Instant::now(),
+            },
+        );
+
+        let shared_mcp = std::sync::Arc::new(std::sync::Mutex::new(crate::ai::mcp::McpClient::new()));
+        let mut messages = Vec::new();
+        let mut turn_messages = Vec::new();
+        let mut persisted_turn_messages = 0usize;
+        let mut final_assistant_text = String::new();
+        let mut final_assistant_recorded = false;
+        let mut force_final_response = true;
+        let mut terminal_dedupe_candidate = None;
+
+        let max_iterations = 16;
+        let step = handle_iteration_execution(
+            &mut app,
+            "wrap up",
+            &shared_mcp.lock().unwrap(),
+            &shared_mcp,
+            IterationExecution::FinalResponse(crate::ai::types::StreamResult {
+                outcome: crate::ai::types::StreamOutcome::Completed,
+                tool_calls: Vec::new(),
+                assistant_text: "done".to_string(),
+                hidden_meta: String::new(),
+                reasoning_text: String::new(),
+                reasoning_items: Vec::new(),
+                skip_response_drain: true,
+                truncated_by_length: false,
+                stream_error: false,
+                finish_reason_value: None,
+                usage_prompt_tokens: 0,
+                usage_cached_prompt_tokens: 0,
+                usage_completion_tokens: 0,
+                usage_reasoning_tokens: 0,
+            }),
+            &mut messages,
+            &mut turn_messages,
+            false,
+            &mut persisted_turn_messages,
+            &mut final_assistant_text,
+            &mut final_assistant_recorded,
+            &mut force_final_response,
+            &mut terminal_dedupe_candidate,
+            true,
+            max_iterations,
+            max_iterations,
+            0,
+            &mut false,
+        )
+        .unwrap();
+
+        // 到达硬上限：不再打回，允许收尾。
+        assert!(matches!(step, TurnLoopStep::Break));
+        assert_eq!(final_assistant_text, "done");
+        let joined = messages
+            .iter()
+            .map(|message| message.content.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!joined.contains(PENDING_SUBAGENT_TASKS_FOLLOWUP_PREFIX.trim_end()));
+
+        let _ = crate::ai::tools::task_tools::remove_task_entry(&task_id);
+        if let Ok(mut guard) = crate::ai::tools::os_tools::GLOBAL_OS.lock() {
+            *guard = None;
+        }
     }
 
     #[test]
@@ -1906,6 +2463,12 @@ mod tests {
         let streaming = app.streaming.clone();
         let shutdown = app.shutdown.clone();
         let cancel_stream = app.cancel_stream.clone();
+        let started_marker = std::env::temp_dir().join(format!(
+            "a_ctrl_c_foreground_tool_{}_{}",
+            std::process::id(),
+            Instant::now().elapsed().as_nanos()
+        ));
+        let command_marker = started_marker.to_string_lossy().replace('\'', "'\\''");
 
         let handle = std::thread::spawn(move || {
             let mut app = app;
@@ -1929,7 +2492,10 @@ mod tests {
                             tool_type: "function".to_string(),
                             function: FunctionCall {
                                 name: "execute_command".to_string(),
-                                arguments: r#"{"command":"sleep 2"}"#.to_string(),
+                                arguments: serde_json::json!({
+                                    "command": format!("touch '{command_marker}'; sleep 2"),
+                                })
+                                .to_string(),
                             },
                         }],
                         assistant_text: String::new(),
@@ -1952,7 +2518,7 @@ mod tests {
                 true,
                 &mut persisted_turn_messages,
                 1,
-                false,
+                None,
                 &mut turn_had_tool_error,
             );
             (
@@ -1963,14 +2529,12 @@ mod tests {
         });
 
         let wait_started = Instant::now();
-        while !streaming.load(std::sync::atomic::Ordering::Relaxed)
-            && wait_started.elapsed() < Duration::from_secs(1)
-        {
+        while !started_marker.exists() && wait_started.elapsed() < Duration::from_secs(1) {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            streaming.load(std::sync::atomic::Ordering::Relaxed),
-            "foreground tool round never raised streaming flag"
+            started_marker.exists(),
+            "foreground tool command never started"
         );
 
         signal::handle_sigint(
@@ -1980,6 +2544,7 @@ mod tests {
         );
 
         let (result, elapsed, returned_app) = handle.join().unwrap();
+        let _ = std::fs::remove_file(&started_marker);
 
         returned_app
             .cancel_stream

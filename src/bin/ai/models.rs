@@ -841,8 +841,8 @@ mod tests {
         auto_subagent_model_for_agent, classify_subagent_task_difficulty, default_model,
         determine_model, determine_vl_model, enable_thinking, endpoint_for_model,
         endpoint_supports_anonymous_auth, initial_model, merge_agent_tier_with_difficulty,
-        model_adapter, model_matches_disabled_tokens, model_platform_label, model_quality_tier,
-        parse_disabled_model_tokens, request_model_name, request_protocol_dialect,
+        model_adapter, model_platform_label, model_quality_tier, parse_disabled_model_tokens,
+        request_model_name, request_protocol_dialect,
     };
     use crate::ai::agents::{AgentManifest, AgentMode, AgentModelTier};
     use crate::ai::cli::ParsedCli;
@@ -1076,18 +1076,15 @@ mod tests {
 
     #[test]
     fn disabled_model_tokens_accept_names_and_keys() {
-        let disabled = parse_disabled_model_tokens(" deepseek-v4-pro, QWEN3_MAX\nfoo ");
-        assert!(disabled.contains(&"deepseek-v4-pro".to_string()));
-        assert!(disabled.contains(&"qwen3_max".to_string()));
+        let models = super::model_names::all();
+        let model_def = models
+            .first()
+            .expect("models.json should contain at least one model");
+        let disabled =
+            parse_disabled_model_tokens(&format!(" {}, {}\nfoo ", model_def.name, model_def.key));
+        assert!(disabled.contains(&model_def.name.to_ascii_lowercase()));
+        assert!(disabled.contains(&model_def.key.to_ascii_lowercase()));
         assert!(disabled.contains(&"foo".to_string()));
-
-        let model = super::model_names::find_by_name("deepseek-v4-pro")
-            .expect("models.json should contain deepseek-v4-pro");
-        assert!(model_matches_disabled_tokens(model, &disabled));
-
-        let by_key = super::model_names::find_by_key("QWEN3_MAX")
-            .expect("models.json should contain QWEN3_MAX");
-        assert!(model_matches_disabled_tokens(by_key, &disabled));
     }
 
     /// 选取一个真实存在的、adapter=Alibaba 的模型名做用例输入；

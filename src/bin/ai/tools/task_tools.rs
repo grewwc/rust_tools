@@ -11,6 +11,9 @@ use crate::ai::{
         normalize_text_for_similarity,
     },
     models,
+    tools::common::{
+        ToolHistoryPolicy, ToolHistoryPolicyRegistration, ToolLossyCompressPolicy, ToolPrunePolicy,
+    },
     tools::common::{ToolRegistration, ToolSpec},
     tools::registry::common::current_process_tool_cancel_futex,
 };
@@ -34,6 +37,10 @@ const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
 /// 子代理不允许继续 spawn 孙代理，避免递归扇出与结果无人收集。
 pub(crate) const MAX_SUBAGENT_SPAWN_DEPTH: usize = 1;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
+/// 子代理结果只是主 agent 的证据输入，不是最终对用户的直接回答。
+/// 主 agent 拿到 payload 后仍需自行汇总结论、风险与下一步，再面向用户输出。
+pub(crate) const SUBAGENT_PARENT_SUMMARY_REMINDER: &str =
+    "Parent-agent follow-up: summarize the confirmed subagent conclusions in your own response to the user. Do not rely on the raw subagent transcript or terminal fold as the final user-facing answer.";
 /// 单次 `task_wait` 调用的默认等待预算（秒）。这只是 **本次调用的最长阻塞时间**，
 /// 不是 subagent 的总寿命：超时仅意味着"这次没等到结果"，主 agent 可以继续调
 /// `task_wait` 续等，subagent 仍在后台运行，channel/futex 也不会被销毁。
@@ -172,6 +179,8 @@ impl InheritOptions {
 /// 进程；如果 kernel 端进程被 reap，此注册表里的对应条目应在
 /// `prune_completed_tasks`（容量上限）或 `task_wait` 完成时被移除。
 pub(crate) struct AsyncTaskEntry {
+    pub(crate) session_id: String,
+    pub(crate) result_observed: bool,
     /// 与 kernel `Process.pid` 一致；agent 端额外保存便于通过 task_id 反查 pid。
     pub(crate) pid: u64,
     pub(crate) result_channel_id: u64,
@@ -199,6 +208,17 @@ pub(crate) struct AsyncTaskEntry {
 /// / `take_task_entry` 等 helper 函数来读写这里，避免直接持有 lock guard。
 static TASK_REGISTRY: LazyLock<Mutex<SkipMap<String, AsyncTaskEntry>>> =
     LazyLock::new(|| Mutex::new(SkipMap::default()));
+
+const OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX: &str = "[pending-subagent-tasks]";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutstandingTaskSnapshot {
+    task_id: String,
+    status: String,
+    agent_name: String,
+    model: String,
+    description: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OsTaskGoal {
@@ -593,6 +613,18 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+// `task` / `task_wait` / `task_status` 都可能承载 subagent 的唯一可见结果。
+// 这些结果一旦被有损压缩或 LLM prune，主 agent 就可能失去对已完成子任务的
+// grounding 感知。统一禁止 lossy 与 prune；若内容过大，交给 overflow stub +
+// file_path 承接，而不是删成不可复原的摘要。
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "task",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Never,
+    },
+});
+
 pub(crate) fn execute_task(_args: &Value) -> Result<String, String> {
     Err("task is handled by the runtime".to_string())
 }
@@ -636,7 +668,6 @@ inventory::submit!(ToolRegistration {
         groups: &["builtin", "core"],
     }
 });
-
 
 /// Pre-flight subagent task spec produced from a `task` / `task_spawn` tool
 /// call before the kernel actually spawns the new process.
@@ -799,6 +830,8 @@ pub(crate) fn spawn_subagent_kernel_task(
         registry.insert(
             task_id.clone(),
             AsyncTaskEntry {
+                session_id: crate::ai::driver::runtime_ctx::current_session_id_or_empty(),
+                result_observed: false,
                 pid,
                 result_channel_id,
                 completion_futex_addr,
@@ -848,6 +881,12 @@ pub(crate) fn with_task_entry_by_pid<R>(
 pub(crate) fn remove_task_entry(task_id: &str) -> Option<AsyncTaskEntry> {
     let mut registry = TASK_REGISTRY.lock().unwrap();
     registry.take(&task_id.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn insert_task_entry_for_test(task_id: String, entry: AsyncTaskEntry) {
+    let mut registry = TASK_REGISTRY.lock().unwrap();
+    registry.insert(task_id, entry);
 }
 /// channel. Re-exported for the synchronous `task` interception so that both
 /// paths produce identical output.
@@ -990,6 +1029,14 @@ inventory::submit!(ToolRegistration {
         async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
         groups: &["builtin", "core"],
     }
+});
+
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "task_wait",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Never,
+    },
 });
 
 inventory::submit!(ToolRegistration {
@@ -1331,9 +1378,23 @@ inventory::submit!(ToolRegistration {
     }
 });
 
+inventory::submit!(ToolHistoryPolicyRegistration {
+    name: "task_status",
+    policy: ToolHistoryPolicy {
+        lossy_compress: ToolLossyCompressPolicy::Never,
+        prune: ToolPrunePolicy::Never,
+    },
+});
+
 pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
+    let current_session_id = crate::ai::driver::runtime_ctx::current_session_id_or_empty();
     let registry = TASK_REGISTRY.lock().unwrap();
-    if registry.is_empty() {
+    let tracked = registry
+        .iter()
+        .filter(|(_, entry)| entry.session_id == current_session_id)
+        .map(|(tid, entry)| (tid.clone(), entry))
+        .collect::<Vec<_>>();
+    if tracked.is_empty() {
         return Ok("No async tasks currently tracked.".to_string());
     }
 
@@ -1347,8 +1408,9 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     // 拿不到结果"的踢皮球，是诱发"子任务卡住"误判的次要原因。peek 不消费消息，
     // 后续 task_wait 仍能正常 consume 并清理资源。
     let mut completed_outputs: Vec<String> = Vec::new();
+    let mut observed_ids: Vec<String> = Vec::new();
     with_os_kernel(|os| {
-        for (tid, entry) in registry.iter() {
+        for (tid, entry) in &tracked {
             let state_str = task_state_string(os, entry.result_channel_id, entry.pid)?;
             let short_id = if tid.len() > 19 { &tid[..19] } else { tid };
             lines.push(format!(
@@ -1357,10 +1419,19 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
             ));
             if let Some(result) = read_task_result(os, entry.result_channel_id, false)? {
                 completed_outputs.push(format_task_result(entry, result));
+                observed_ids.push(tid.clone());
             }
         }
         Ok(())
     })?;
+    if !observed_ids.is_empty() {
+        let mut registry = TASK_REGISTRY.lock().unwrap();
+        for task_id in &observed_ids {
+            if let Some(entry) = registry.get_mut(task_id) {
+                entry.result_observed = true;
+            }
+        }
+    }
 
     if !completed_outputs.is_empty() {
         lines.push(String::new());
@@ -1372,6 +1443,88 @@ pub(crate) fn execute_task_status(_args: &Value) -> Result<String, String> {
     }
 
     Ok(lines.join("\n"))
+}
+
+fn collect_outstanding_task_snapshots(session_id: &str) -> Result<Vec<OutstandingTaskSnapshot>, String> {
+    let registry = TASK_REGISTRY.lock().unwrap();
+    let tracked = registry
+        .iter()
+        .filter(|(_, entry)| entry.session_id == session_id && !entry.result_observed)
+        .map(|(tid, entry)| {
+            (
+                tid.clone(),
+                entry.result_channel_id,
+                entry.pid,
+                entry.agent_name.clone(),
+                entry.model.clone(),
+                entry.description.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    drop(registry);
+
+    if tracked.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    with_os_kernel(|os| {
+        let mut snapshots = Vec::with_capacity(tracked.len());
+        for (task_id, result_channel_id, pid, agent_name, model, description) in &tracked {
+            snapshots.push(OutstandingTaskSnapshot {
+                task_id: task_id.clone(),
+                status: task_state_string(os, *result_channel_id, *pid)?,
+                agent_name: agent_name.clone(),
+                model: model.clone(),
+                description: description.clone(),
+            });
+        }
+        Ok(snapshots)
+    })
+}
+
+fn render_outstanding_task_anchor(snapshots: &[OutstandingTaskSnapshot]) -> String {
+    let mut lines = vec![
+        OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX.to_string(),
+        format!(
+            "You still have {} spawned subagent task(s) tracked in this session. Do not silently forget them or finish the user-facing answer before handling them.",
+            snapshots.len()
+        ),
+        format!(
+            "Outstanding task_ids: [{}]",
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.task_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    ];
+    for snapshot in snapshots {
+        lines.push(format!(
+            "- task_id={} status={} agent={} model={} desc={}",
+            snapshot.task_id,
+            snapshot.status,
+            snapshot.agent_name,
+            snapshot.model,
+            snapshot.description
+        ));
+    }
+    lines.push(
+        "Required next step: use `task_wait` with the same task_ids to collect results, or `task_status` for a non-blocking snapshot. Before ending the turn, ensure every listed task_id has been handled — including failures."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+pub(crate) fn build_outstanding_task_anchor(session_id: &str) -> Result<Option<String>, String> {
+    let snapshots = collect_outstanding_task_snapshots(session_id)?;
+    if snapshots.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(render_outstanding_task_anchor(&snapshots)))
+}
+
+pub(crate) fn outstanding_task_anchor_prefix() -> &'static str {
+    OUTSTANDING_SUBAGENT_TASKS_NOTE_PREFIX
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1478,6 +1631,7 @@ fn format_task_result(entry: &AsyncTaskEntry, result: StoredTaskResult) -> Strin
     } else {
         parts.push("(subagent did not produce any final assistant text)".to_string());
     }
+    parts.push(SUBAGENT_PARENT_SUMMARY_REMINDER.to_string());
     parts.join("\n")
 }
 

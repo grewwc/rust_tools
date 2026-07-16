@@ -912,7 +912,7 @@ fn has_polarity_conflict(a: &[String], b: &[String]) -> bool {
 
 /// 共享的学习/反思质量评估：
 /// - 不是简单的单一 substring 命中，而是融合多类信号
-/// - 同时服务于 background reflection 和 memory_save 长期记忆门禁
+/// - 同时服务于 background reflection 和 knowledge_save 长期记忆门禁
 pub(crate) fn assess_learning_note_quality(note: &str) -> super::LearningNoteAssessment {
     let features = LearningNoteQualityFeatures::from_note(note);
     let actionable = features.directive_signals > 0

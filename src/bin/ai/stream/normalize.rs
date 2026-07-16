@@ -534,6 +534,18 @@ mod tests {
     }
 
     #[test]
+    fn structured_content_summary_text_stays_in_reasoning_channel() {
+        let payload = r#"{"choices":[{"delta":{"content":[{"type":"summary_text","text":"先检查测试配置。"},{"type":"output_text","text":"结论：这是陈旧测试。"}]}}]}"#;
+        match parse_stream_payload(provider::openai_adapter(), payload, None) {
+            ParsedStreamPayload::Chunk(chunk) => {
+                assert_eq!(chunk.choices[0].delta.reasoning_content, "先检查测试配置。");
+                assert_eq!(chunk.choices[0].delta.content, "结论：这是陈旧测试。");
+            }
+            _ => panic!("expected parsed chunk"),
+        }
+    }
+
+    #[test]
     fn opencode_payload_accepts_message_snapshot_reasoning() {
         let payload =
             r#"{"choices":[{"message":{"reasoning_content":"step","content":"answer"}}]}"#;

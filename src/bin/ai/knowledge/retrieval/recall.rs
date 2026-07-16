@@ -373,7 +373,7 @@ pub fn build_auto_recalled_knowledge_with_project(
 /// 注意：`self_note` 故意不在此列表中。
 /// self_note 是会话内自我反思（带 `source="session:{id}"`），如被当成全局
 /// guideline 召回会污染下一会话的 system prompt（"自言自语"问题）。
-/// 条目仍持久化到 jsonl，可通过 `memory_search` 等显式工具按需查询。
+/// 条目仍持久化到 jsonl，可通过 `knowledge_search` 等显式工具按需查询。
 pub fn guideline_categories() -> &'static [&'static str] {
     &[
         "safety_rules",

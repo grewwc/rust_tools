@@ -53,7 +53,7 @@ pub(crate) use builder::{build_content, clamp_max_tokens_for_prompt};
 
 // 传输层：HTTP 请求发送、重试、超时、鉴权
 pub use transport::{do_request_json, do_request_text_streaming};
-pub(super) use transport::{do_request_messages, print_info};
+pub(super) use transport::{do_request_messages, do_request_messages_without_tools, print_info};
 
 // ── 以下 private use 仅供 `tests` 子模块通过 `use super::*;` 访问 ──
 // 函数体已迁移至 `transport.rs`，mod.rs 本身不再直接使用这些项。

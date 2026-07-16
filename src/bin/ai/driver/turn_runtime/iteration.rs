@@ -8,10 +8,11 @@ use crate::ai::{
     driver::{
         drain_response, input, print::print_assistant_banner_with_app_and_skill, skill_runtime,
     },
-    history::Message,
+    history::{Message, ROLE_INTERNAL_NOTE},
     mcp::McpClient,
-    request::{self, do_request_messages},
+    request::{self, do_request_messages, do_request_messages_without_tools},
     stream,
+    tools::task_tools,
     types::{App, StreamOutcome, StreamResult},
 };
 
@@ -287,13 +288,35 @@ async fn wait_for_request_interrupt(shutdown: Arc<AtomicBool>, cancel_stream: Ar
     }
 }
 
-fn no_tool_handoff_note() -> &'static str {
+pub(in crate::ai::driver::turn_runtime) fn no_tool_handoff_note() -> &'static str {
     "进入无工具收口模式：本 turn 不要再调用任何工具。\n\
 请基于已经收集到的信息输出一条收口/交接回复：\n\
 1. 先总结已确认事实与当前结论；\n\
 2. 能直接回答用户的部分就直接回答；\n\
 3. 若任务仍未完成，明确说明剩余工作、阻塞点和建议的下一步；\n\
 4. 不要把未完成任务伪装成已完成。"
+}
+
+fn clear_outstanding_task_anchor(messages: &mut Vec<Message>) {
+    let prefix = task_tools::outstanding_task_anchor_prefix();
+    messages.retain(|message| {
+        !(message.role == ROLE_INTERNAL_NOTE
+            && matches!(&message.content, Value::String(text) if text.starts_with(prefix)))
+    });
+}
+
+fn refresh_outstanding_task_anchor(messages: &mut Vec<Message>, session_id: &str) {
+    clear_outstanding_task_anchor(messages);
+    let Ok(Some(note)) = task_tools::build_outstanding_task_anchor(session_id) else {
+        return;
+    };
+    messages.push(Message {
+        role: ROLE_INTERNAL_NOTE.to_string(),
+        content: Value::String(note),
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning_content: None,
+    });
 }
 
 #[crate::ai::agent_hang_span(
@@ -320,6 +343,11 @@ async fn request_model_response(
     force_final_response: bool,
     _iteration: usize,
 ) -> Result<(reqwest::Response, String), request::RequestError> {
+    if force_final_response {
+        clear_outstanding_task_anchor(messages);
+    } else {
+        refresh_outstanding_task_anchor(messages, &app.session_id);
+    }
     if force_final_response {
         messages.push(Message {
             role: crate::ai::history::ROLE_INTERNAL_NOTE.to_string(),
@@ -402,7 +430,11 @@ async fn request_model_response(
     }
 
     let mut actual_model = next_model.to_string();
-    let mut request_result = do_request_messages(app, next_model, messages, true).await;
+    let mut request_result = if force_final_response {
+        do_request_messages_without_tools(app, next_model, messages, true).await
+    } else {
+        do_request_messages(app, next_model, messages, true).await
+    };
     if let Err(err) = &request_result
         && let Some(fallback_spec) = crate::ai::driver::runtime_ctx::auto_model_fallback_spec()
         && request::should_try_model_fallback(err)
@@ -418,7 +450,11 @@ async fn request_model_response(
                 next_model, fallback_model
             );
             actual_model = fallback_model.clone();
-            request_result = do_request_messages(app, &fallback_model, messages, true).await;
+            request_result = if force_final_response {
+                do_request_messages_without_tools(app, &fallback_model, messages, true).await
+            } else {
+                do_request_messages(app, &fallback_model, messages, true).await
+            };
             if let Err(fallback_err) = &request_result
                 && request::should_temporarily_disable_auto_selected_model(fallback_err)
             {
@@ -479,7 +515,7 @@ async fn finalize_stream_interaction(
     one_shot_mode: bool,
     persisted_turn_messages: &mut usize,
     should_quit: bool,
-    _force_final_response: bool,
+    force_final_response: bool,
 ) -> Result<IterationExecution, Box<dyn std::error::Error>> {
     input::clear_stdin_buffer();
 
@@ -516,6 +552,18 @@ async fn finalize_stream_interaction(
         .store(false, std::sync::atomic::Ordering::Relaxed);
 
     Ok(match stream_result.outcome {
+        StreamOutcome::ToolCall if force_final_response => {
+            // 即使上游错误地在没有 tools 的请求中返回 tool call，也不能再把它送入
+            // 工具执行路径，否则 no-tool handoff 会退化成一次无意义的报错循环。
+            let mut stream_result = stream_result;
+            stream_result.outcome = StreamOutcome::Completed;
+            stream_result.tool_calls.clear();
+            if stream_result.assistant_text.trim().is_empty() {
+                stream_result.assistant_text =
+                    "工具调用已停止；基于已获得的信息，无法继续验证。".to_string();
+            }
+            IterationExecution::FinalResponse(stream_result)
+        }
         StreamOutcome::ToolCall => IterationExecution::ToolCall(ToolCallExecution {
             stream_result,
             allowed_tool_names: request_visible_tool_names(app),
@@ -657,7 +705,12 @@ pub(super) async fn execute_turn_iteration(
                     }
 
                     request::clear_stale_request_interrupt_before_request(app);
-                    match do_request_messages(app, &actual_model, messages, true).await {
+                    let retry_request = if force_final_response {
+                        do_request_messages_without_tools(app, &actual_model, messages, true).await
+                    } else {
+                        do_request_messages(app, &actual_model, messages, true).await
+                    };
+                    match retry_request {
                         Ok(new_response) => {
                             response = new_response;
                         }
@@ -716,9 +769,12 @@ pub(super) async fn execute_turn_iteration(
 #[cfg(test)]
 mod tests {
     use super::{
-        StreamingFlagGuard, no_tool_handoff_note, request_interrupt_pending,
-        should_try_pre_request_llm_summary, store_last_pre_request_summary_chars,
+        StreamingFlagGuard, no_tool_handoff_note, refresh_outstanding_task_anchor,
+        request_interrupt_pending, should_try_pre_request_llm_summary,
+        store_last_pre_request_summary_chars,
     };
+    use crate::ai::history::{Message, ROLE_INTERNAL_NOTE};
+    use serde_json::Value;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, atomic::Ordering};
 
@@ -753,6 +809,24 @@ mod tests {
         assert!(note.contains("总结已确认事实与当前结论"));
         assert!(note.contains("剩余工作、阻塞点和建议的下一步"));
         assert!(note.contains("不要把未完成任务伪装成已完成"));
+    }
+
+    #[test]
+    fn refresh_outstanding_task_anchor_replaces_stale_anchor_note() {
+        let mut messages = vec![Message {
+            role: ROLE_INTERNAL_NOTE.to_string(),
+            content: Value::String(format!(
+                "{}\nstale",
+                crate::ai::tools::task_tools::outstanding_task_anchor_prefix()
+            )),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        }];
+
+        refresh_outstanding_task_anchor(&mut messages, "session-without-tasks");
+
+        assert!(messages.is_empty());
     }
 
     #[test]

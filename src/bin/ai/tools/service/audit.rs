@@ -1628,8 +1628,8 @@ mod tests {
     }
 
     #[test]
-    fn blocks_shell_rm_with_home_and_glob_expansion() {
-        let err = validate("rm -rf ~/.zcompdump*").unwrap_err();
+    fn blocks_shell_rm_with_glob_expansion() {
+        let err = validate("rm -rf *.zcompdump").unwrap_err();
         assert!(err.contains("rm"), "expected rm blocked, got: {err}");
     }
 

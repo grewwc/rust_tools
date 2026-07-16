@@ -272,20 +272,28 @@ fn remediation_hint(
             || err_lower.contains("missing patch")
             || err_lower.contains("patch target mismatch"))
     {
-        let read_file_hint = if tool_visible_in_current_turn(available_tool_names, "read_file") {
-            "build hunk context from raw file text only — do not copy line numbers, truncation notices, or the Symbol outline block into the patch"
+        // 根据具体错误类型给出差异化建议，避免模型收到泛化提示后仍然反复犯同类错误
+        let specific_hint = if err_lower.contains("context mismatch") {
+            "Hunk context does not match the file. Re-read the file with `read_file` first, then build hunk context from the EXACT raw text (no line numbers, no truncation notices)."
+        } else if err_lower.contains("ambiguous patch") {
+            "Multiple locations match. Add more unique surrounding context lines (2–4 extra) so the tool can pin the exact location."
+        } else if err_lower.contains("no hunks found") || err_lower.contains("invalid hunk") {
+            "Patch could not be parsed. Use raw unified-diff format starting with `@@ -old_start,old_count +new_start,new_count @@` or the `*** Begin Patch` / `*** Update File:` envelope."
+        } else if err_lower.contains("missing file_path") {
+            "Provide `file_path` as a parameter, or wrap the patch in a `*** Begin Patch` / `*** Update File: <path>` envelope."
+        } else if err_lower.contains("missing patch") {
+            "`patch` must be a string, not a JSON object or array. Pass the patch text as a string value."
+        } else if err_lower.contains("patch target mismatch") {
+            "The `file_path` arg does not match the target in the envelope. Use consistent file paths, or omit `file_path` and let the envelope specify the target."
         } else {
-            "build hunk context from the exact current file text only"
+            "Use raw unified-diff hunks or the `*** Begin Patch` envelope format. Re-read the file before building hunk context."
         };
         let write_file_hint = if tool_visible_in_current_turn(available_tool_names, "write_file") {
-            " If you are replacing the whole file, use `write_file` instead."
+            " If replacing the whole file, use `write_file` instead."
         } else {
             ""
         };
-        return Some(format!(
-            "Suggestion: `apply_patch` accepts either raw unified-diff hunks starting with `@@`, or a single-file `*** Begin Patch` envelope. Use `file_path` (or the compatibility alias `path`) for the target file, and {}.{}",
-            read_file_hint, write_file_hint
-        ));
+        return Some(format!("Suggestion: {}", specific_hint) + write_file_hint);
     }
 
     // Note: mcp_feishu_docs_search has been removed; users must provide direct Feishu URLs.

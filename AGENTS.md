@@ -41,6 +41,11 @@ cargo test --bin a test_name # run one test
 **Only verify what you changed.** Always scope with `--bin`, `--lib`, `-p`, or a
 specific test name. Never bare `cargo test` / `cargo build --release`.
 
+**Non-essential, no `cargo test`.** Do not run `cargo test` as a verification
+step unless the change is specifically about test logic or the test is needed
+to confirm correctness. Prefer `cargo check` for type-checking. Never run
+the same `cargo test` command repeatedly without a code change in between.
+
 ## Global Engineering Rules
 
 1. **Module boundaries**: use `pub(super)` / `pub(crate)`.
@@ -59,6 +64,10 @@ specific test name. Never bare `cargo test` / `cargo build --release`.
    contradict current behavior are worse than missing rules.
 10. **Git safety**: never `git stash` / `git stash drop` someone else's uncommitted
     changes. Use a temporary branch, worktree, or stash only your own (and pop back).
+11. **Architecture-first, no excessive fallback logic**: Do not pile on defensive
+    `if`/`else` fallbacks to work around a design problem. If a code path needs many
+    layers of fallback to function correctly, the abstraction or data flow is wrong —
+    refactor the design first so the happy path is clean and straightforward.
 
 ## High-Value Pitfalls
 

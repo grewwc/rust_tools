@@ -428,6 +428,7 @@ fn format_subagent_output(
     } else {
         parts.push("(subagent did not produce any final assistant text)".to_string());
     }
+    parts.push(task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER.to_string());
     parts.join("\n")
 }
 
@@ -561,5 +562,6 @@ mod tests {
         assert!(output.contains("TIMED_OUT"));
         assert!(output.contains("Error: subagent task exceeded hard timeout of 600s"));
         assert!(output.contains("(subagent did not produce any final assistant text)"));
+        assert!(output.contains(task_tools::SUBAGENT_PARENT_SUMMARY_REMINDER));
     }
 }

@@ -47,6 +47,49 @@ fn thinking_fold_defaults_to_configured_lines_for_tty() {
     );
 }
 
+#[test]
+fn subagent_preview_suppresses_thinking_markers_and_reuses_visible_text() {
+    let mut markers = StreamMarkers::new();
+    markers.enable_subagent_preview("explore");
+
+    assert_eq!(
+        stream_text_event_to_content(
+            &StreamTextEvent::OpenThinking,
+            &markers,
+            StreamEventMergeMode::Append,
+            "",
+        ),
+        None
+    );
+    assert_eq!(
+        stream_text_event_to_content(
+            &StreamTextEvent::AppendThinking("step one".to_string()),
+            &markers,
+            StreamEventMergeMode::Append,
+            "",
+        ),
+        Some("step one".to_string())
+    );
+    assert_eq!(
+        stream_text_event_to_content(
+            &StreamTextEvent::AppendContent("final answer".to_string()),
+            &markers,
+            StreamEventMergeMode::Append,
+            "",
+        ),
+        Some("final answer".to_string())
+    );
+    assert_eq!(
+        stream_text_event_to_content(
+            &StreamTextEvent::CloseThinking,
+            &markers,
+            StreamEventMergeMode::Append,
+            "",
+        ),
+        None
+    );
+}
+
 fn test_app() -> App {
     App {
         cli: ParsedCli::default(),
@@ -201,6 +244,8 @@ fn tool_call_boundary_closes_thinking_on_a_fresh_line() {
 fn snapshot_content_only_appends_missing_suffix() {
     assert_eq!(unseen_suffix("hello wor", "hello world"), "ld");
     assert_eq!(unseen_suffix("hello world", "hello world"), "");
+    assert_eq!(unseen_suffix("hello world", "\n\nhello world"), "");
+    assert_eq!(unseen_suffix("hello world", "\n\nhello world!"), "!");
     assert_eq!(unseen_suffix("prefix", "suffix"), "suffix");
 }
 
@@ -503,6 +548,103 @@ fn response_completed_event_does_not_block_late_snapshot_text() {
 
     assert_eq!(current_history, "hello world");
     assert_eq!(state.content.assistant_text, "hello world");
+}
+
+#[test]
+fn output_text_done_snapshot_with_leading_whitespace_does_not_duplicate_answer() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.delta"),
+        r#"{"delta":"结论：history 文件结构本身正常。"}"#,
+    )
+    .unwrap();
+
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.done"),
+        r#"{"text":"\n\n结论：history 文件结构本身正常。"}"#,
+    )
+    .unwrap();
+
+    assert_eq!(current_history, "结论：history 文件结构本身正常。");
+    assert_eq!(
+        state.content.assistant_text,
+        "结论：history 文件结构本身正常。"
+    );
+}
+
+#[test]
+fn output_text_done_snapshot_does_not_duplicate_when_inter_paragraph_newlines_dropped() {
+    let markers = StreamMarkers::new();
+    let mut state = StreamProcessingState::new();
+    let mut app = test_app();
+    let mut current_history = String::new();
+
+    // responses 协议分段输出：正文 -> 纯换行 -> 下一段。纯换行 delta 会被丢弃，
+    // commit_visible_content 还会 trim 掉每段换行，使 assistant_text 相对最终 .done
+    // 快照缺少段间换行。此前会整段重复输出，修复后应只保留已流式渲染的内容。
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.delta"),
+        r#"{"delta":"有问题，而且问题不在 a.rs 本身。"}"#,
+    )
+    .unwrap();
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.delta"),
+        r#"{"delta":"\n\n"}"#,
+    )
+    .unwrap();
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.delta"),
+        r#"{"delta":"核心是 Agent 的收敛机制过于宽松。"}"#,
+    )
+    .unwrap();
+    process_stream_payload(
+        &mut app,
+        &mut current_history,
+        &markers,
+        &mut state,
+        provider::openai_adapter(),
+        Some("response.output_text.done"),
+        r#"{"text":"有问题，而且问题不在 a.rs 本身。\n\n核心是 Agent 的收敛机制过于宽松。"}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        current_history,
+        "有问题，而且问题不在 a.rs 本身。核心是 Agent 的收敛机制过于宽松。"
+    );
+    assert_eq!(
+        state.content.assistant_text,
+        "有问题，而且问题不在 a.rs 本身。核心是 Agent 的收敛机制过于宽松。"
+    );
 }
 
 #[test]
@@ -869,6 +1011,26 @@ fn cancelled_stream_result_finalizes_active_thinking_fold() {
     assert!(!state.render.thinking_fold.active);
     assert_eq!(state.render.thinking_fold.window_rows, 0);
     assert!(state.render.thinking_fold.recent_lines.is_empty());
+}
+
+#[test]
+fn cancelled_stream_result_finalizes_active_subagent_fold() {
+    let mut state = StreamProcessingState::new();
+    {
+        let fold = &mut state.render.subagent_fold;
+        fold.active = true;
+        fold.max_visible_lines = 2;
+        fold.total_lines = 1;
+        fold.recent_lines.push_back("partial answer".to_string());
+        fold.window_rows = 2;
+    }
+
+    let result = cancelled_stream_result(&mut state);
+
+    assert!(matches!(result.outcome, StreamOutcome::Cancelled));
+    assert!(!state.render.subagent_fold.active);
+    assert_eq!(state.render.subagent_fold.window_rows, 0);
+    assert!(state.render.subagent_fold.recent_lines.is_empty());
 }
 
 #[test]
