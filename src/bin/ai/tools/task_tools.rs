@@ -34,7 +34,6 @@ const DEFAULT_TASK_QUOTA_TURNS: usize = 10;
 /// 子代理不允许继续 spawn 孙代理，避免递归扇出与结果无人收集。
 pub(crate) const MAX_SUBAGENT_SPAWN_DEPTH: usize = 1;
 const TASK_GOAL_PREFIX: &str = "AIOS_SUBAGENT_TASK:";
-const MAX_AGENT_TEAM_MEMBERS: usize = 8;
 /// 单次 `task_wait` 调用的默认等待预算（秒）。这只是 **本次调用的最长阻塞时间**，
 /// 不是 subagent 的总寿命：超时仅意味着"这次没等到结果"，主 agent 可以继续调
 /// `task_wait` 续等，subagent 仍在后台运行，channel/futex 也不会被销毁。
@@ -638,68 +637,6 @@ inventory::submit!(ToolRegistration {
     }
 });
 
-fn params_agent_team() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "operation": {
-                "type": "string",
-                "enum": ["start", "challenge", "synthesize"],
-                "description": "Team phase to launch. 'start' fans out independent members. 'challenge' asks members to critique a transcript. 'synthesize' asks one or more members to produce a final conclusion from a transcript."
-            },
-            "goal": {
-                "type": "string",
-                "description": "Shared objective for the team deliberation."
-            },
-            "members": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "role": {
-                            "type": "string",
-                            "description": "Role name for this team member, for example implementer, reviewer, skeptic, domain expert, synthesizer."
-                        },
-                        "prompt": {
-                            "type": "string",
-                            "description": "Role-specific instructions. For start, this is the member's investigation brief. For challenge/synthesize, this describes the critique or synthesis angle."
-                        },
-                        "agent": {
-                            "type": "string",
-                            "description": "Optional subagent name. Leave empty to auto-select."
-                        },
-                        "model": {
-                            "type": "string",
-                            "description": "Optional model override for this member."
-                        }
-                    },
-                    "required": ["role"]
-                },
-                "description": "Team members to launch in this phase. Use 2-8 members for start; challenge/synthesize may use 1-8."
-            },
-            "transcript": {
-                "type": "string",
-                "description": "Collected outputs from prior team phases. Required for challenge/synthesize so no agent relies on direct peer messaging."
-            },
-            "inherit": {
-                "type": "string",
-                "description": task_inherit_schema_description()
-            }
-        },
-        "required": ["operation", "goal", "members"]
-    })
-}
-
-inventory::submit!(ToolRegistration {
-    spec: ToolSpec {
-        name: "agent_team",
-        description: "Launch a parent-mediated multi-agent team phase over the existing task_spawn/task_wait substrate. Use operation='start' to fan out multiple members, then task_wait to collect all outputs; use operation='challenge' with that transcript to have agents challenge assumptions; use operation='synthesize' with the updated transcript for final consensus. Team members do NOT message each other directly: the parent passes full transcripts between phases, avoiding mailbox/drain/routing bugs while reusing AIOS kernel processes, result channels, futex wakeups, and task_wait.",
-        parameters: params_agent_team,
-        execute: execute_agent_team,
-        async_policy: crate::ai::tools::common::ToolAsyncPolicy::SyncOnly,
-        groups: &["builtin", "core"],
-    }
-});
 
 /// Pre-flight subagent task spec produced from a `task` / `task_spawn` tool
 /// call before the kernel actually spawns the new process.
@@ -1712,15 +1649,6 @@ fn build_selection_explanation(
 
     format!("{agent_reason}\n{model_reason}")
 }
-
-mod agent_team;
-
-use agent_team::execute_agent_team;
-#[cfg(test)]
-pub(crate) use agent_team::{
-    AgentTeamMemberSpec, AgentTeamOperation, build_agent_team_prompt,
-    build_agent_team_selection_prompt, parse_agent_team_members, resolve_agent_team_model_override,
-};
 
 #[cfg(test)]
 mod tests;

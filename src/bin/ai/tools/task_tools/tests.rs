@@ -1,11 +1,9 @@
 use super::{
-    AgentTeamMemberSpec, AgentTeamOperation, AsyncTaskEntry, InheritOptions, OsTaskGoal,
-    SelectedSubagent, StoredTaskResult, TASK_REGISTRY, WaitManySource,
-    append_current_process_cancel_source, build_agent_team_prompt,
-    build_agent_team_selection_prompt, build_selection_explanation, encode_os_task_goal,
-    epoll_wait_many, epoll_wait_many_channels, format_task_result, is_encoded_task_goal,
-    parse_agent_team_members, prepare_subagent_task, remove_task_entry,
-    resolve_agent_team_model_override, select_subagent, wait_sources_for_channel_and_futex,
+    AsyncTaskEntry, InheritOptions, OsTaskGoal,
+    SelectedSubagent, StoredTaskResult, TASK_REGISTRY,
+    append_current_process_cancel_source, build_selection_explanation, encode_os_task_goal,
+    format_task_result, is_encoded_task_goal, prepare_subagent_task, remove_task_entry,
+    select_subagent, wait_sources_for_channel_and_futex,
     with_task_entry_by_pid,
 };
 use super::{ToolRegistration, ToolSpec};
@@ -287,70 +285,6 @@ fn blank_model_override_is_treated_as_auto_selection() {
 
     assert!(explanation.contains("auto-selected"));
     assert!(!explanation.contains("explicit model override"));
-}
-
-#[test]
-fn agent_team_start_requires_multiple_members() {
-    let args = serde_json::json!({
-        "operation": "start",
-        "goal": "Decide the safest implementation",
-        "members": [
-            { "role": "reviewer" }
-        ]
-    });
-
-    let err = parse_agent_team_members(&args, AgentTeamOperation::Start).unwrap_err();
-
-    assert!(err.contains("requires at least 2"));
-}
-
-#[test]
-fn agent_team_challenge_prompt_uses_parent_mediated_transcript() {
-    let member = AgentTeamMemberSpec {
-        role: "skeptic".to_string(),
-        prompt: "Focus on concurrency and missing evidence.".to_string(),
-        agent: None,
-        model: None,
-    };
-
-    let prompt = build_agent_team_prompt(
-        AgentTeamOperation::Challenge,
-        "Review the design",
-        &member,
-        "member A: looks safe\nmember B: maybe races",
-    );
-
-    assert!(prompt.contains("Do not wait for direct messages from peer agents"));
-    assert!(prompt.contains("parent agent coordinates"));
-    assert!(prompt.contains("Phase: challenge"));
-    assert!(prompt.contains("member A: looks safe"));
-    assert!(prompt.contains("concurrency"));
-}
-
-#[test]
-fn agent_team_selection_prompt_stays_cost_aware() {
-    let member = AgentTeamMemberSpec {
-        role: "skeptic".to_string(),
-        prompt: "Focus on assumptions and risks.".to_string(),
-        agent: None,
-        model: None,
-    };
-
-    let selection_prompt =
-        build_agent_team_selection_prompt(AgentTeamOperation::Challenge, &member);
-
-    assert!(selection_prompt.contains("agent_team phase: challenge"));
-    assert!(selection_prompt.contains("role: skeptic"));
-    assert!(!selection_prompt.contains("Prior team transcript"));
-    assert!(!selection_prompt.contains("Team goal"));
-}
-
-#[test]
-fn agent_team_model_override_requires_exact_match() {
-    let err = resolve_agent_team_model_override("__missing_model_for_team__").unwrap_err();
-
-    assert!(err.contains("exact model key/name"));
-    assert!(err.contains("expensive fallback"));
 }
 
 #[test]

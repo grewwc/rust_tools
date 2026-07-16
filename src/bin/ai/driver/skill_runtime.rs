@@ -278,7 +278,6 @@ const SUBAGENT_HIDDEN_TASK_TOOLS: &[&str] = &[
     "task_spawn",
     "task_wait",
     "task_status",
-    "agent_team",
 ];
 
 fn should_hide_task_tools_for_subagent() -> bool {
@@ -1056,28 +1055,6 @@ fn build_system_prompt(
         );
     }
 
-    if has_tool(available_tools, "agent_team") {
-        let mut lines = vec![
-            "Use `agent_team(operation=\"start\")` for complex decisions that benefit from several roles or independent perspectives.".to_string(),
-        ];
-        if has_tool(available_tools, "task_wait") {
-            lines.push(
-                "Collect the returned task_ids with `task_wait(wait_policy=\"all\")`, then pass the complete transcript into `agent_team(operation=\"challenge\")` so agents can challenge assumptions.".to_string(),
-            );
-        }
-        lines.push(
-            "For final consensus, pass initial outputs plus challenges into `agent_team(operation=\"synthesize\")`.".to_string(),
-        );
-        lines.push(
-            "Team communication is parent-mediated; do not expect peer agents to receive direct mailbox messages.".to_string(),
-        );
-        push_tool_guidance_section(
-            &mut b,
-            ContextKind::Behavior,
-            "Agent Team Deliberation:",
-            lines,
-        );
-    }
 
     if has_tool(available_tools, "knowledge_search")
         || has_tool(available_tools, "knowledge_semantic_search")
@@ -1391,7 +1368,7 @@ mod tests {
                     .map(|tool| tool.function.name)
                     .collect::<Box<SkipSet<_>>>();
 
-                for hidden in ["task", "task_spawn", "task_wait", "task_status", "agent_team"] {
+                for hidden in ["task", "task_spawn", "task_wait", "task_status"] {
                     assert!(!names.contains_str(hidden), "{hidden} should be hidden");
                 }
                 assert!(names.contains_str("read_file"));
@@ -2217,7 +2194,6 @@ mod tests {
         assert!(names.contains(&"task_spawn".to_string()));
         assert!(names.contains(&"task_wait".to_string()));
         assert!(names.contains(&"task_status".to_string()));
-        assert!(names.contains(&"agent_team".to_string()));
         // 其它非 baseline 的内置工具仍不应被无端带入白名单。
         assert!(!names.contains(&"plan".to_string()));
         assert!(!names.contains(&"write_file".to_string()));

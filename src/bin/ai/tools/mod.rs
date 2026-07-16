@@ -46,7 +46,6 @@ const BASELINE_TOOL_NAMES: &[&str] = &[
     "task_spawn",
     "task_wait",
     "task_status",
-    "agent_team",
 ];
 
 pub(crate) fn baseline_tool_names() -> &'static [&'static str] {
